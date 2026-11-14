@@ -1173,6 +1173,10 @@ pub struct Supdb {
     /// probes (`Options::read_lines_ahead` off): `supdb-readnoahead` and
     /// `supdb-ingestreadnoahead`.
     readnoahead: bool,
+    /// A burst's batch filed in the commit building the forms its settle
+    /// filed into (`Options::forms_settle_builds_filed` on):
+    /// `supdb-settlebuildsfiled` and `supdb-ingestsettlebuildsfiled`.
+    settlebuildsfiled: bool,
     /// A cursor's walk decoding the groups after its first into its own
     /// buffer (`Options::zpages_walk_owns_decodes` on): `supdb-zwalkowns`.
     zwalkowns: bool,
@@ -2292,6 +2296,8 @@ struct Policy {
     readhashes: bool,
     /// No sources' lines asked ahead of the point read: `...readnoahead`.
     readnoahead: bool,
+    /// A filed burst's builds in the commit: `...settlebuildsfiled`.
+    settlebuildsfiled: bool,
     /// The walk's own decodes: `supdb-zwalkowns`.
     zwalkowns: bool,
     /// A page view an open: `supdb-zviewperopen`.
@@ -2714,6 +2720,7 @@ impl Default for Policy {
             settlegated: false,
             readhashes: false,
             readnoahead: false,
+            settlebuildsfiled: false,
             zwalkowns: false,
             zviewperopen: false,
             znogroupahead: false,
@@ -8136,6 +8143,7 @@ impl Supdb {
             settlegated,
             readhashes,
             readnoahead,
+            settlebuildsfiled,
             zwalkowns,
             zviewperopen,
             znogroupahead,
@@ -8689,6 +8697,7 @@ impl Supdb {
             forms_settle_past_llc: settlegated,
             read_hash_once: !readhashes,
             read_lines_ahead: !readnoahead,
+            forms_settle_builds_filed: settlebuildsfiled,
             zpages_rewarm_quiet_ms: if zrewarmwait {
                 supdb::db::REWARM_QUIET_BEFORE_MS
             } else {
@@ -8976,6 +8985,7 @@ impl Supdb {
             settlegated,
             readhashes,
             readnoahead,
+            settlebuildsfiled,
             zwalkowns,
             zviewperopen,
             znogroupahead,
@@ -9668,6 +9678,13 @@ impl Engine for Supdb {
                 "supdb-readnoahead"
             } else {
                 "supdb-ingestreadnoahead"
+            };
+        }
+        if self.settlebuildsfiled {
+            return if self.partition {
+                "supdb-settlebuildsfiled"
+            } else {
+                "supdb-ingestsettlebuildsfiled"
             };
         }
         if self.walsync {
@@ -11776,6 +11793,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestreadhashes"
         | "supdb-readnoahead"
         | "supdb-ingestreadnoahead"
+        | "supdb-settlebuildsfiled"
+        | "supdb-ingestsettlebuildsfiled"
         | "supdb-scanrawpaced"
         | "supdb-noscanrawahead"
         | "supdb-zseekseed"
@@ -12223,6 +12242,32 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         noscanrawahead: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settlebuildsfiled" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settlebuildsfiled: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestsettlebuildsfiled" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        settlebuildsfiled: true,
                         ..Policy::default()
                     },
                 )
@@ -14791,6 +14836,20 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.read_lines_ahead && b.read_lines_ahead);
                 assert!(o.read_hash_once);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("settlebuildsfiled"),
+                    Policy {
+                        settlebuildsfiled: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-settlebuildsfiled");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.forms_settle_builds_filed && !b.forms_settle_builds_filed);
             }
             {
                 let z = Supdb::with_policy(

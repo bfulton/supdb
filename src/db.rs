@@ -1245,7 +1245,9 @@ pub struct Options {
     /// the scrambled D read 1.24-1.37x in the second sitting, the
     /// scrambled B, C and F 1.07-1.25x, D 1.12-1.30x and the read pass
     /// level to 1.14x, with the loads and scans the options cannot reach
-    /// leaning the other way where they leaned. The first sitting, with
+    /// leaning the other way where they leaned (`pair.sh supdb-ingest
+    /// supdb-ingestreadhashes 300000 --reps 8`, and at 100000, at
+    /// `4eb6172`). The first sitting, with
     /// the partition's slot asked for on every read, read the read pass
     /// at 0.94x at three hundred thousand keys, which callgrind put at 44
     /// instructions a read (`read_lines_ahead`). `supdb-readhashes` and
@@ -1264,7 +1266,8 @@ pub struct Options {
     /// hundred thousand keys). Taken away alone on the buffered arm, two
     /// sittings of eight pairs at three hundred thousand keys, D read
     /// 0.90-0.95x without it in both and the scrambled D 0.95-0.97x, the
-    /// read pass and the cells with no piece level. Needs
+    /// read pass and the cells with no piece level (`pair.sh supdb-ingest
+    /// supdb-ingestreadnoahead 300000 --reps 8`, at `4eb6172`). Needs
     /// `read_hash_once`, whose word names the lines. `supdb-readnoahead`
     /// and `supdb-ingestreadnoahead` ask for the memtable's slot alone.
     pub read_lines_ahead: bool,
@@ -3223,6 +3226,35 @@ pub struct Options {
     /// without the two.
     #[doc(hidden)]
     pub forms_settle_builds: bool,
+    /// EXPERIMENT: a commit that files the first batch after a scan on the
+    /// writer's own path (`Options::upkeep_inline_bursts`, `Hand::File`)
+    /// runs the settle's builds (`forms_settle_builds`) and the commit's
+    /// fill as well; off, it files the batch into the forms that stand and
+    /// leaves the blocks with none to the walks that meet them, as the
+    /// settle leaves them with no room, and the table incomplete for the
+    /// next fill. The batches of a burst after its first, filed in the
+    /// commit for being over the pace's share, fill as before: skipped at
+    /// every one of them, the full rewrite's thirty commits at thirty
+    /// thousand keys built nothing and its pass read 0.66x. A burst of one
+    /// commit at thirty thousand keys -- the lag sweep's one-percent point,
+    /// three hundred writes -- spent half of its 0.4-0.8 ms in the commit's
+    /// own settle and fill, a form for each of 212 overlaid blocks, for a
+    /// pass whose scans walk a third of the store. Paired on the buffered
+    /// arm in both orders, the one-percent burst read 1.19-1.25x off at
+    /// thirty thousand keys, 1.35-1.46x at a hundred thousand and 1.05-1.08x
+    /// at three hundred, and the pass after it 0.75-0.81x at the first two
+    /// and level at the third, with the other points within the lean of
+    /// the point no option here reaches (the lag sweep's first, 3-6%); the
+    /// ten-percent burst at ten thousand keys, one commit of a thousand,
+    /// read 1.00-1.04x. The work moves from the burst to the scans after
+    /// it, the one-percent point's burst and twice its pass 0.88x at thirty
+    /// thousand keys, and every cell of both stays ahead of the
+    /// comparators (`pair.sh supdb-ingest supdb-ingestsettlebuildsfiled
+    /// 30000 --reps 12`, the same at 10000, and at 100000 and 300000 with
+    /// `--reps 8`). `supdb-settlebuildsfiled` and
+    /// `supdb-ingestsettlebuildsfiled` build in the commit.
+    #[doc(hidden)]
+    pub forms_settle_builds_filed: bool,
     /// EXPERIMENT: `forms_settle_every` and `forms_settle_builds` apply only
     /// where the partitions' key and value bytes pass the last-level cache
     /// (`llc_bytes`), as `scan_raw_ahead` does. They were priced at three
@@ -5645,6 +5677,7 @@ impl Default for Options {
             forms_settle_backlog_pct: 2,
             forms_settle_every: true,
             forms_settle_builds: true,
+            forms_settle_builds_filed: false,
             forms_settle_past_llc: false,
             forms_settle_room_pressure: true,
             forms_settle_sheds_unbound: false,
@@ -18431,6 +18464,9 @@ pub struct Reader {
     /// The upkeep thread's pass files everything whatever the commit's
     /// own rules say; see `Upkeep::Background`.
     force_due: std::cell::Cell<bool>,
+    /// The commit is filing a burst's batch on the writer's own path
+    /// (`Hand::File`); see `Options::forms_settle_builds_filed`.
+    filing: std::cell::Cell<bool>,
     /// The upkeep this handle keeps for its range reads: the block
     /// tables, the scan snapshot, and the log position both are
     /// current to. See `FormsState`.
@@ -19257,6 +19293,9 @@ pub struct Db {
     /// What the commit in progress does with its batch, decided when it
     /// hands the upkeep over: see `Hand`.
     upkeep_hand: Hand,
+    /// The batch `Hand::File` files is the first after a scan, whose
+    /// builds the scans after it are left (`Options::forms_settle_builds_filed`).
+    upkeep_file_first: bool,
     /// The store's lock, the last field so that it is the last thing the
     /// close gives up: `Drop` joins every thread that writes the directory
     /// and the fields before this one drop after it, and a second open
@@ -26572,9 +26611,15 @@ impl Reader {
             let cache = self.fs().scan_keys.borrow();
             let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
             self.install_ahead(unsealed)?;
+            // The first batch after a scan filed in the commit leaves the
+            // blocks it filed into with no form to the first walk that
+            // meets them, which builds a block over its filed keys as it
+            // builds any (`Options::forms_settle_builds_filed`); the next
+            // settle starts the list afresh.
             if moved
                 && self.opts.forms_settle_builds
                 && self.settle_at_write()
+                && (self.opts.forms_settle_builds_filed || !self.filing.get())
                 && !self.abandon_pending()
             {
                 let blocks = std::mem::take(&mut *self.fs().settle_blocks.borrow_mut());
@@ -26606,10 +26651,13 @@ impl Reader {
         // the writer, or bounded by `upkeep_pass_pct` -- fills nothing: the
         // fill builds from the sources as they stand, and belongs after
         // the settle that brings the tables to them.
+        // Nor does it fill: the table stays incomplete and the walks
+        // after build what they meet (`Options::forms_settle_builds_filed`).
         if self.opts.commit_forms_build
             && !self.cache_binds()
             && !self.fs().tables_complete.get()
             && !self.fs().log_short.get()
+            && (self.opts.forms_settle_builds_filed || !self.filing.get())
         {
             if self.opts.scan_cache_ahead && self.fs().ahead.borrow().is_none() {
                 self.start_ahead();
@@ -31343,6 +31391,7 @@ impl Db {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
+            filing: std::cell::Cell::new(false),
         };
         let maint = MaintHome::Here(Box::new(Maint::new(
             r.maint_reader()?,
@@ -31382,6 +31431,7 @@ impl Db {
             upkeep_floor: 0,
             upkeep_big: 0,
             upkeep_hand: Hand::Lend,
+            upkeep_file_first: false,
             unsynced: 0,
             lag_writes: usize::MAX,
             lag_log: (0, 0),
@@ -31938,6 +31988,7 @@ impl Db {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
+            filing: std::cell::Cell::new(false),
         };
         let maint = MaintHome::Here(Box::new(Maint::new(
             r.maint_reader()?,
@@ -31977,6 +32028,7 @@ impl Db {
             upkeep_floor: 0,
             upkeep_big: 0,
             upkeep_hand: Hand::Lend,
+            upkeep_file_first: false,
             unsynced: 0,
             lag_writes: usize::MAX,
             lag_log: (0, 0),
@@ -34420,6 +34472,7 @@ impl Reader {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
+            filing: std::cell::Cell::new(false),
         })
     }
 
@@ -34466,6 +34519,7 @@ impl Reader {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
+            filing: std::cell::Cell::new(false),
         })
     }
 
@@ -34519,6 +34573,7 @@ impl Reader {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
+            filing: std::cell::Cell::new(false),
         })
     }
 }
@@ -37349,6 +37404,7 @@ impl Reader {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
+            filing: std::cell::Cell::new(false),
             fs: FormsCell::empty(),
         }
     }
@@ -37764,6 +37820,7 @@ impl Db {
             // thread, the hand set once the batch is lent below.
             if batch as u64 > share || self.upkeep_since_scan == 0 {
                 self.upkeep_hand = Hand::File;
+                self.upkeep_file_first = self.upkeep_since_scan == 0;
                 return;
             }
             pace = true;
@@ -37937,7 +37994,11 @@ impl Db {
             Hand::Inline => self.maintain_forms().map(|()| false),
             Hand::File => {
                 self.r.force_due.set(true);
+                self.r
+                    .filing
+                    .set(std::mem::take(&mut self.upkeep_file_first));
                 let filed = self.maintain_forms();
+                self.r.filing.set(false);
                 self.r.force_due.set(false);
                 filed.map(|()| false)
             }

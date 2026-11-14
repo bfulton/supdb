@@ -623,7 +623,10 @@ partitions' data passes the last-level cache
 hashing its key in each source it consults (`Options::read_hash_once`
 off), and `supdb-readnoahead` and `supdb-ingestreadnoahead` with it asking
 for the memtable's slot alone ahead of its probes
-(`Options::read_lines_ahead` off); `supdb-zhotresident` is `supdb` with the hot-raw fill asking for the
+(`Options::read_lines_ahead` off); `supdb-settlebuildsfiled` and
+`supdb-ingestsettlebuildsfiled` are `supdb` and `supdb-ingest` with a
+burst's batch filed in the commit building the forms its settle filed into
+(`Options::forms_settle_builds_filed`); `supdb-zhotresident` is `supdb` with the hot-raw fill asking for the
 partitions the reads have not skewed by how much of their records the cache
 holds, most first (`Options::zpages_hot_fill_resident_first`);
 `supdb-zrewarminstall` is `supdb` with the controller's install making a

@@ -10125,6 +10125,115 @@ fn a_buffered_commit_near_reads_files_its_burst_and_lends_a_small_batch() {
     drop(live);
 }
 
+/// The first batch after a scan, filed in the commit on the writer's own
+/// path, files into the forms that stand and builds nothing -- neither the
+/// settle's builds nor the commit's fill -- for the walks after it to build
+/// (`Options::forms_settle_builds_filed` off); with the option on the
+/// commit builds them. Every write reads back through the writer and
+/// through a handle, after it and after the batches that follow.
+#[test]
+fn a_burst_filed_in_the_commit_leaves_its_builds_to_the_walk() {
+    for filed in [false, true] {
+        let d = dir(&format!("settle-builds-filed-{filed}"));
+        let opts = Options {
+            upkeep: supdb::Upkeep::Background(1),
+            upkeep_inline_bursts: true,
+            sync: supdb::SyncPolicy::EveryN(u32::MAX),
+            partition_bytes: Some(256 << 10),
+            seal_max_pct: 0,
+            forms_settle_builds_filed: filed,
+            ..Options::default()
+        };
+        assert!(opts.forms_settle_every && opts.forms_settle_builds);
+        let mut db = Db::create(&d, opts).unwrap();
+        let keys = 20_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+        let live = db.reader().unwrap();
+        let mut want: HashMap<u32, String> = HashMap::new();
+        let check = |db: &Db, want: &HashMap<u32, String>, when: &str| {
+            let verify = |k: &[u8], v: &[u8], who: &str| {
+                let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                let got = std::str::from_utf8(v).unwrap();
+                let expect = want.get(&kn).map_or("0", |s| s.as_str());
+                assert_eq!(got, expect, "key {kn} {when} through {who}, filed {filed}");
+            };
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    verify(k, v, "the writer");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "every key {when} through the writer");
+            let r = db.reader().unwrap();
+            let mut seen = 0u32;
+            r.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    verify(k, v, "a handle");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "every key {when} through a handle");
+        };
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut write = |db: &mut Db, want: &mut HashMap<u32, String>, n: usize, v: &str| {
+            for _ in 0..n {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), v.as_bytes());
+                want.insert(k, v.to_string());
+            }
+            db.commit().unwrap();
+        };
+        // Reads around, and nothing unsealed: the first batch after the
+        // scan is filed in the commit, into blocks none of which holds a
+        // form.
+        check(&db, &want, "before any write");
+        let built = (db.settle_built(), db.blocks_built().1);
+        let passes = db.upkeep_counts()[0];
+        write(&mut db, &mut want, 300, "a");
+        assert_eq!(
+            db.upkeep_counts()[0],
+            passes,
+            "no pass of the thread filed it"
+        );
+        let by_commit = (db.settle_built() - built.0) + (db.blocks_built().1 - built.1);
+        if filed {
+            assert!(by_commit > 0, "the commit built the blocks it filed into");
+        } else {
+            assert_eq!(
+                by_commit, 0,
+                "the commit built none of the blocks it filed into"
+            );
+        }
+        // A batch after scans over forms, and two with no scan between
+        // them, the second over the pace's share and filed in the commit
+        // with its builds.
+        check(&db, &want, "after the first batch");
+        write(&mut db, &mut want, 300, "b");
+        check(&db, &want, "after the second batch");
+        write(&mut db, &mut want, 300, "c");
+        write(&mut db, &mut want, 300, "d");
+        check(&db, &want, "after a burst of two");
+        drop(live);
+        db.close().unwrap();
+    }
+}
+
 /// A commit that syncs lends the same burst, option or no option: the
 /// thread works through the fsync, and holds for nothing. The forms stand
 /// at the commit's position once the thread has run. The pace a syncing
