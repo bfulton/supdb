@@ -1653,6 +1653,37 @@ impl<B: Bytes> Blob<B> {
             .unwrap_or(Ok(0))
     }
 
+    /// `read_all` for a key whose index hash (`flatindex::key_hash`) the
+    /// caller has taken: a point read over a partition and its pieces
+    /// hashes the key once for all of them.
+    pub fn read_all_hashed<F: FnMut(&[u8])>(&self, key: &[u8], h: u64, f: F) -> Result<u64> {
+        let Some((sec, idx)) = self.flat() else {
+            return self.read_all(key, f);
+        };
+        idx.with_lookup_hashed(sec, key, h, |exts, tail| self.read_exts(exts, tail, f))
+            .unwrap_or(Ok(0))
+    }
+
+    /// `lookup` for a key whose index hash the caller has taken.
+    pub fn lookup_hashed(&self, key: &[u8], h: u64) -> Option<Exts<'_>> {
+        let Some((sec, idx)) = self.flat() else {
+            return self.lookup(key);
+        };
+        idx.lookup_full_hashed(sec, key, h).map(|(e, _)| e)
+    }
+
+    /// A hint to fetch the line of the first hash slot a lookup of index
+    /// hash `h` reads; nothing is read.
+    #[cfg(not(target_family = "wasm"))]
+    #[inline]
+    pub fn prefetch_slot(&self, h: u64) {
+        if let Some((sec, idx)) = self.flat() {
+            if let Some(at) = idx.slot_pos(sec.len(), h) {
+                crate::db::prefetch_lines(sec[at..].as_ptr(), 8);
+            }
+        }
+    }
+
     /// EXPERIMENT: `read_all` through `lookup_full`, the extents returned
     /// by value: the shape before `with_lookup`, kept to price it
     /// (`Options::exts_by_value`).
@@ -1822,6 +1853,15 @@ impl<B: Bytes> Blob<B> {
     /// extent record with format v5, for four bytes an extent.
     pub fn count(&self, key: &[u8]) -> Result<u64> {
         let Some(exts) = self.lookup(key) else {
+            return Ok(0);
+        };
+        Ok(exts.iter().map(|e| u64::from(e.records())).sum())
+    }
+
+    /// `count` for a key whose index hash (`flatindex::key_hash`) the
+    /// caller has taken.
+    pub fn count_hashed(&self, key: &[u8], h: u64) -> Result<u64> {
+        let Some(exts) = self.lookup_hashed(key, h) else {
             return Ok(0);
         };
         Ok(exts.iter().map(|e| u64::from(e.records())).sum())
@@ -2030,6 +2070,32 @@ impl<B: Bytes> Blob<B> {
         limit: usize,
         f: F,
     ) -> Result<usize> {
+        self.scan_at_with::<false, F>(from_rank, limit, 0, f)
+    }
+
+    /// `scan_at`, asking for the records `lead` bytes ahead of the one
+    /// being read as the walk goes: the first `lead` bytes at the start,
+    /// then each line as the walk comes within `lead` of it, so the fetch
+    /// runs beside the walk rather than before it. A hint, nothing waited
+    /// for; the common record shape only, as the walk's fast loop is.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn scan_at_paced<F: FnMut(&[u8], &[u8])>(
+        &self,
+        from_rank: usize,
+        limit: usize,
+        lead: usize,
+        f: F,
+    ) -> Result<usize> {
+        self.scan_at_with::<true, F>(from_rank, limit, lead, f)
+    }
+
+    fn scan_at_with<const PACE: bool, F: FnMut(&[u8], &[u8])>(
+        &self,
+        from_rank: usize,
+        limit: usize,
+        lead: usize,
+        f: F,
+    ) -> Result<usize> {
         let mut f = f;
         let mut rank = from_rank;
         let mut seen = 0usize;
@@ -2089,8 +2155,25 @@ impl<B: Bytes> Blob<B> {
                 .unwrap_or(&[])
                 .as_chunks::<4>()
                 .0;
+            // The next byte of the records not yet asked for, under `PACE`;
+            // the engine's prefetch is not built for wasm, and neither is a
+            // caller that paces.
+            #[cfg(not(target_family = "wasm"))]
+            let mut asked = 0usize;
+            #[cfg(target_family = "wasm")]
+            let _ = lead;
             for w in words {
                 let off = u32::from_le_bytes(*w) as usize;
+                #[cfg(not(target_family = "wasm"))]
+                if PACE {
+                    let want = off.saturating_add(lead).min(recs.len());
+                    let from = asked.max(off);
+                    if from < want {
+                        // SAFETY: `[from, want)` lies inside `recs`.
+                        crate::db::prefetch_lines(unsafe { recs.as_ptr().add(from) }, want - from);
+                        asked = want;
+                    }
+                }
                 let Some(h) = recs.get(off..off + 4) else {
                     break;
                 };

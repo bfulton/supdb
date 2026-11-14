@@ -1887,19 +1887,23 @@ struct OrdFixture {
 }
 
 fn ord_fixture(name: &str, shape: OrdShape, via_ord: bool) -> OrdFixture {
-    // The first flush makes the store's partition, whole, under its own
-    // name. The second step is a seal and not a flush: a flush drains, and
-    // a drain merges every piece into its partition, tombstones with them,
-    // where a lone seal leaves its piece beside the partition until
-    // `l0_trigger` of them pile up.
-    let mut db = Db::create(
-        &dir(name),
+    ord_fixture_with(
+        name,
+        shape,
         Options {
             point_via_ord: via_ord,
             ..Options::default()
         },
     )
-    .unwrap();
+}
+
+fn ord_fixture_with(name: &str, shape: OrdShape, opts: Options) -> OrdFixture {
+    // The first flush makes the store's partition, whole, under its own
+    // name. The second step is a seal and not a flush: a flush drains, and
+    // a drain merges every piece into its partition, tombstones with them,
+    // where a lone seal leaves its piece beside the partition until
+    // `l0_trigger` of them pile up.
+    let mut db = Db::create(&dir(name), opts).unwrap();
     let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
     let mut masked = BTreeSet::new();
     let key = |k: u32| ord_key(shape, k);
@@ -2020,6 +2024,82 @@ fn ord_probes(shape: OrdShape) -> Vec<Vec<u8>> {
         v.push(k.to_vec());
     }
     v
+}
+
+/// `Options::read_hash_once` and `Options::read_lines_ahead` change how a
+/// point read hashes its key and what it asks for ahead, and nothing it
+/// returns: the fixture's store -- a partition, a piece with tombstones and
+/// a live table over both -- with a table frozen in a held seal between
+/// the piece and the live table, read with each of the four settings
+/// through the writer and through a handle, answers every probe as the
+/// model does, held and after the seal lands; and the count with it.
+#[test]
+fn a_point_read_hashed_once_answers_as_one_hashed_per_source() {
+    let d = Options::default();
+    assert!(d.read_hash_once && d.read_lines_ahead, "the default");
+    for shape in [
+        OrdShape::Short,
+        OrdShape::Mixed,
+        OrdShape::Wide,
+        OrdShape::Binary,
+    ] {
+        for (once, ahead) in [(true, true), (true, false), (false, true), (false, false)] {
+            let name = format!("hashonce-{shape:?}-{once}-{ahead}");
+            let mut fx = ord_fixture_with(
+                &name,
+                shape,
+                Options {
+                    read_hash_once: once,
+                    read_lines_ahead: ahead,
+                    ..Options::default()
+                },
+            );
+            let key = |k: u32| ord_key(shape, k);
+            // The table the fixture left live, frozen in a seal that does
+            // not land, and a live table over it with tombstones over all
+            // four sources and values after some.
+            fx.db.hold_seal_landing(true);
+            fx.db.seal().unwrap();
+            assert!(fx.db.frozen_tables() >= 1, "{name}: a frozen table");
+            for k in (1u32..4_010).step_by(9) {
+                if k.is_multiple_of(2) {
+                    fx.db.delete(&key(k));
+                    fx.model.insert(key(k), Vec::new());
+                } else {
+                    let v = format!("v4-{k}").into_bytes();
+                    fx.db.append(&key(k), &v);
+                    fx.model.entry(key(k)).or_default().push(v);
+                }
+            }
+            fx.db.commit().unwrap();
+            let show = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
+            let probes = ord_probes(shape);
+            let check = |fx: &OrdFixture, when: &str| {
+                let h = fx.db.reader().unwrap();
+                for p in &probes {
+                    let want = fx.model.get(p).cloned().unwrap_or_default();
+                    assert_eq!(read_vec(&fx.db, p), want, "{name} {when}: {}", show(p));
+                    assert_eq!(
+                        read_vec(&h, p),
+                        want,
+                        "{name} {when}, a handle: {}",
+                        show(p)
+                    );
+                    assert_eq!(
+                        fx.db.count(p).unwrap(),
+                        want.len() as u64,
+                        "{name} {when}: the count of {}",
+                        show(p)
+                    );
+                }
+            };
+            check(&fx, "with the seal held");
+            fx.db.hold_seal_landing(false);
+            fx.db.settle().unwrap();
+            check(&fx, "after the landing");
+            fx.db.close().unwrap();
+        }
+    }
 }
 
 /// The same store read with the option and without answers every key as
@@ -10042,6 +10122,115 @@ fn a_buffered_commit_near_reads_files_its_burst_and_lends_a_small_batch() {
     assert!(passes(&db) > p, "the thread took the small batch");
     check(&db, &want, "after the three commits");
     drop(live);
+}
+
+/// The first batch after a scan, filed in the commit on the writer's own
+/// path, files into the forms that stand and builds nothing -- neither the
+/// settle's builds nor the commit's fill -- for the walks after it to build
+/// (`Options::forms_settle_builds_filed` off); with the option on the
+/// commit builds them. Every write reads back through the writer and
+/// through a handle, after it and after the batches that follow.
+#[test]
+fn a_burst_filed_in_the_commit_leaves_its_builds_to_the_walk() {
+    for filed in [false, true] {
+        let d = dir(&format!("settle-builds-filed-{filed}"));
+        let opts = Options {
+            upkeep: supdb::Upkeep::Background(1),
+            upkeep_inline_bursts: true,
+            sync: supdb::SyncPolicy::EveryN(u32::MAX),
+            partition_bytes: Some(256 << 10),
+            seal_max_pct: 0,
+            forms_settle_builds_filed: filed,
+            ..Options::default()
+        };
+        assert!(opts.forms_settle_every && opts.forms_settle_builds);
+        let mut db = Db::create(&d, opts).unwrap();
+        let keys = 20_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+        let live = db.reader().unwrap();
+        let mut want: HashMap<u32, String> = HashMap::new();
+        let check = |db: &Db, want: &HashMap<u32, String>, when: &str| {
+            let verify = |k: &[u8], v: &[u8], who: &str| {
+                let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                let got = std::str::from_utf8(v).unwrap();
+                let expect = want.get(&kn).map_or("0", |s| s.as_str());
+                assert_eq!(got, expect, "key {kn} {when} through {who}, filed {filed}");
+            };
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    verify(k, v, "the writer");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "every key {when} through the writer");
+            let r = db.reader().unwrap();
+            let mut seen = 0u32;
+            r.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    verify(k, v, "a handle");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "every key {when} through a handle");
+        };
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut write = |db: &mut Db, want: &mut HashMap<u32, String>, n: usize, v: &str| {
+            for _ in 0..n {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), v.as_bytes());
+                want.insert(k, v.to_string());
+            }
+            db.commit().unwrap();
+        };
+        // Reads around, and nothing unsealed: the first batch after the
+        // scan is filed in the commit, into blocks none of which holds a
+        // form.
+        check(&db, &want, "before any write");
+        let built = (db.settle_built(), db.blocks_built().1);
+        let passes = db.upkeep_counts()[0];
+        write(&mut db, &mut want, 300, "a");
+        assert_eq!(
+            db.upkeep_counts()[0],
+            passes,
+            "no pass of the thread filed it"
+        );
+        let by_commit = (db.settle_built() - built.0) + (db.blocks_built().1 - built.1);
+        if filed {
+            assert!(by_commit > 0, "the commit built the blocks it filed into");
+        } else {
+            assert_eq!(
+                by_commit, 0,
+                "the commit built none of the blocks it filed into"
+            );
+        }
+        // A batch after scans over forms, and two with no scan between
+        // them, the second over the pace's share and filed in the commit
+        // with its builds.
+        check(&db, &want, "after the first batch");
+        write(&mut db, &mut want, 300, "b");
+        check(&db, &want, "after the second batch");
+        write(&mut db, &mut want, 300, "c");
+        write(&mut db, &mut want, 300, "d");
+        check(&db, &want, "after a burst of two");
+        drop(live);
+        db.close().unwrap();
+    }
 }
 
 /// A commit that syncs lends the same burst, option or no option: the

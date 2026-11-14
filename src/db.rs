@@ -1279,6 +1279,47 @@ pub struct Options {
     /// `Blob::lookup_full`, the shape before `Blob::with_lookup` lent them
     /// on the index's frame; kept to price it. `supdb-extsval`.
     pub exts_by_value: bool,
+    /// A point read or a count hashes its key once, the index's FNV word
+    /// (`flatindex::key_hash`), and takes every source's hash from it:
+    /// the memtables' slot (`mem_hash_of`), the partition's index and each
+    /// level-0 piece's index and filter (`BlockedBloom::finalize`). Off,
+    /// each source hashed the key itself, a byte at a time and a multiply
+    /// a byte, three times over a read that met a piece: the scrambled D
+    /// mix, which reads the newest inserts in a store the scrambled write
+    /// mixes left a piece in, put a fifth of its thread on the piece's
+    /// `may_hold` at a hundred and three hundred thousand keys, where the
+    /// unscrambled D, with no piece, put a twenty-fifth. Paired on the
+    /// buffered arm, both options against neither, two sittings of eight
+    /// pairs in both orders at a hundred and three hundred thousand keys,
+    /// the scrambled D read 1.24-1.37x in the second sitting, the
+    /// scrambled B, C and F 1.07-1.25x, D 1.12-1.30x and the read pass
+    /// level to 1.14x, with the loads and scans the options cannot reach
+    /// leaning the other way where they leaned (`pair.sh supdb-ingest
+    /// supdb-ingestreadhashes 300000 --reps 8`, and at 100000, at
+    /// `4eb6172`). The first sitting, with
+    /// the partition's slot asked for on every read, read the read pass
+    /// at 0.94x at three hundred thousand keys, which callgrind put at 44
+    /// instructions a read (`read_lines_ahead`). `supdb-readhashes` and
+    /// `supdb-ingestreadhashes` hash per source.
+    pub read_hash_once: bool,
+    /// A point read or a count asks for the lines its later sources'
+    /// first probes will load as soon as it has the key's hash, before it
+    /// reads the earlier ones: each level-0 piece's filter block
+    /// (`BlockedBloom::prefetch_fnv`), beside the memtable's slot it asked
+    /// for already, so the filter's miss overlaps the partition's read
+    /// where it was taken after it; and the partition's first hash slot
+    /// (`Blob::prefetch_slot`) only where the tombstone pass reads the
+    /// newer sources first, since with no pass the lookup follows the ask
+    /// at once and the ask was 44 instructions a read of the read pass
+    /// for nothing (callgrind over `bench/examples/read_only.rs` at three
+    /// hundred thousand keys). Taken away alone on the buffered arm, two
+    /// sittings of eight pairs at three hundred thousand keys, D read
+    /// 0.90-0.95x without it in both and the scrambled D 0.95-0.97x, the
+    /// read pass and the cells with no piece level (`pair.sh supdb-ingest
+    /// supdb-ingestreadnoahead 300000 --reps 8`, at `4eb6172`). Needs
+    /// `read_hash_once`, whose word names the lines. `supdb-readnoahead`
+    /// and `supdb-ingestreadnoahead` ask for the memtable's slot alone.
+    pub read_lines_ahead: bool,
     /// EXPERIMENT: a point read of a partition whose ordered index holds
     /// whole keys (`OrdIndex::uniform`: every key one length, no longer
     /// than the common prefix and eight bytes) finds its rank through the
@@ -1599,6 +1640,16 @@ pub struct Options {
     /// bytes following the one being walked, which the core's prefetcher
     /// already fetches. `supdb-zbulkaheadwithin` is the arm.
     pub zpages_bulk_ahead_within: bool,
+    /// The bulk walk takes the fence's next entry where it ran to the end
+    /// of one, and asks the memo for a group once: the entry after a page's
+    /// last record is the next one in the fence, found before by a binary
+    /// search over the fence's first ranks at every page, and a group the
+    /// memo was just found not to hold (`ZMemo::holds`) was asked for again
+    /// at its open. The search's dependent loads were a sixth of the walk's
+    /// own time in a profile of the threaded scans at ten million keys under
+    /// 1.25 GiB. `supdb-zbulksearch` searches and asks twice, the shape
+    /// before.
+    pub zpages_bulk_steps: bool,
     /// EXPERIMENT: the bulk walk's own decode of the group it ends inside
     /// -- a first touch, decoded into the thread's buffer
     /// (`zpages_bulk_admit`) -- goes only as far as the records it reads,
@@ -2111,9 +2162,9 @@ pub struct Options {
     /// cache, against `supdb-cache64tofitzpages`.
     #[doc(hidden)]
     pub zpages_raw_tails: bool,
-    /// EXPERIMENT: the block coding's groups written by the engine's
-    /// parsing encoder (`db::zlz4`, `zlz4::Effort::SHIPPED`) and not
-    /// `lz4_flex`'s greedy one: the same block format, which any LZ4
+    /// The block coding's groups written by the engine's parsing encoder
+    /// (`db::zlz4`, its search `zpages_parse_chains`) and not `lz4_flex`'s
+    /// greedy one: the same block format, which any LZ4
     /// decoder reads, in fewer and longer sequences -- a hash-chain search
     /// for the longest match at each position and a shortest path over
     /// the group priced in the bytes it writes. On the form's own groups it
@@ -2136,12 +2187,16 @@ pub struct Options {
     /// --ops-div 10 --reps 2`, and `--passes load,lag`, at `c9599c2`). The
     /// encoder's price is its search and not its inserts:
     /// `zlz4::Effort::sparse` took 8.7 µs a group to 6.3 against the greedy
-    /// encoder's 2. The record coding's tails keep `lz4_flex`.
+    /// encoder's 2. The record coding's tails keep `lz4_flex`. On, at the
+    /// controller's builds alone and over four chain positions
+    /// (`zpages_parse_finish` off, `zpages_parse_chains` at four), which is
+    /// the search the builds can afford beside the load; `supdb-zgreedy` is
+    /// the greedy encoder everywhere, the shape before.
     #[doc(hidden)]
     pub zpages_parse: bool,
-    /// EXPERIMENT: under `zpages_parse`, the form files a merge's outputs
-    /// are given at their finish (`zpages_build_at_finish`) written by the
-    /// parsing encoder as well. Off, those builds keep the greedy encoder
+    /// Under `zpages_parse`, the form files a merge's outputs are given at
+    /// their finish (`zpages_build_at_finish`) written by the parsing
+    /// encoder as well. Off, those builds keep the greedy encoder
     /// and the parse is the controller's builds' alone -- the builds ahead
     /// and the bought builds, which carry the load's partitions -- since
     /// the finish's builds are on the merge chain's path, and the chain
@@ -2160,6 +2215,31 @@ pub struct Options {
     /// --ops-div 10 --reps 2`, and `--passes load,lag`).
     #[doc(hidden)]
     pub zpages_parse_finish: bool,
+    /// Under `zpages_parse`, the parse's search: zero the lazy parse over
+    /// sixteen positions of each chain (`zlz4::Effort::SHIPPED`), else a
+    /// greedy parse over that many (`zlz4::Effort::of_chains`). The parse
+    /// buys its decode in fewer sequences and pays in the builder's CPU,
+    /// which is what put the install behind the load: the greedy parse over
+    /// four positions writes 0.91 of the greedy encoder's sequences in 2.2
+    /// times its encode, where the lazy one writes 0.84 in 4.2
+    /// (`bench/examples/zdecode.rs --rhc N:0:8:1:0:1`), and the form's
+    /// pages at 0.973 and 0.957 of the greedy encoder's
+    /// (`bench/examples/zsize.rs --parse N`). Paired at ten million keys
+    /// with four reps a sitting in both orders, four positions against the
+    /// greedy encoder read the three-thread scans 1.03-1.04x under 1.25 GiB
+    /// in all eight pairs and 1.07-1.08x under 1 GiB, the two-thread scans
+    /// 1.05-1.15x, the threaded scans beside the mixes 1.02-1.07x and the
+    /// scrambled E 1.02-1.05x, the single-threaded reads level, and the
+    /// ordered load under 1 GiB 0.96-0.98x in seven pairs of eight, the
+    /// builder's CPU (1.19x) beside it; the lazy parse at the same builds
+    /// read the single-threaded reads 0.78-0.84x with two to five times the
+    /// faults and the load 0.92-0.93x, the install behind the load
+    /// (`pair.sh supdb supdb-zparsestart 10000000 --bound 1342177280
+    /// --passes load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+    /// --ops-div 10 --reps 4`). Four; `supdb-zparsestart` is the lazy
+    /// parse at the same builds.
+    #[doc(hidden)]
+    pub zpages_parse_chains: u32,
     /// The form's block-coded groups decoded by the engine's own LZ4 decoder
     /// (`db::zlz4::decompress_in`) and not `lz4_flex`'s: the same bytes for
     /// every block, by liblz4's fast loop in Rust -- a run of fewer than
@@ -2205,6 +2285,18 @@ pub struct Options {
     /// `supdb-znoflat` is the fast loop alone.
     #[doc(hidden)]
     pub zpages_flat_decode: bool,
+    /// Under `zpages_flat_decode`, a group decoded into its buffer with the
+    /// room the flat loop runs to the group's end in (`zlz4::FLAT_SLACK`,
+    /// `Dec::FlatEnd`). The buffer is a whole page and a group a few
+    /// kibibytes, so the room was there and only the slack the decoder was
+    /// lent stopped the flat loop a turn short of the end, the last
+    /// sequences of every group going the fast loop's branchy way: a
+    /// seventh of the decoder's time in a profile of the threaded scans at
+    /// ten million keys under 1.25 GiB. The same bytes and the same
+    /// refusals. `supdb-zflatshort` lends the fast loop's slack alone, the
+    /// shape before.
+    #[doc(hidden)]
+    pub zpages_flat_slack: bool,
     /// EXPERIMENT: the allocator trimmed once (`malloc_trim`) at the end of
     /// `zpages_settle`, after every partition has its form file: what the
     /// builds' threads and the load left free in their arenas is given back
@@ -2737,7 +2829,14 @@ pub struct Options {
     /// at three hundred thousand keys, where the store is past the
     /// cache, the lag passes read 0.80-0.93x and E 0.97x without them,
     /// 12/12 and 11/12. So they stay; `supdb-noprefetch` and
-    /// `supdb-ingestnoprefetch` are the arm that priced them.
+    /// `supdb-ingestnoprefetch` are the arm that priced them. The scrambled
+    /// E mix's profile puts a sixth of its thread on the prefetch's own
+    /// instructions at thirty thousand keys, three times the unscrambled
+    /// E's, and those samples are the lines arriving: without the prefetch
+    /// the buffered arm read the scrambled E 0.84x and 0.95x there and
+    /// 0.69x and 0.65x at three hundred thousand, E 0.83x and 0.82x and the
+    /// threaded scans beside the mixes 0.75x at the larger store (`pair.sh
+    /// supdb-ingest supdb-ingestnoprefetch 300000 --reps 8`, at `c703ab1`).
     pub scan_prefetch: bool,
     /// How far into the partition's records a walk's prefetch reaches,
     /// in bytes from the walk's first record: the lines are asked for at
@@ -2992,7 +3091,14 @@ pub struct Options {
     /// entries of reading. A write to a block drops its copy and halves
     /// its count, which is the hysteresis: a block the writes own never
     /// holds one, and a block the reads own has it back after half the
-    /// entries.
+    /// entries. Priced again in core on the scrambled E, whose scans walk
+    /// the write mixes' few-delta blocks as sparse forms over the raw
+    /// records (6,900 sparse walks to 1,300 copies at thirty thousand
+    /// keys, where the unscrambled E walks copies): at 256 entries the
+    /// buffered arm read the scrambled E 0.69x and 0.77x at thirty thousand
+    /// keys and 0.64x and 0.61x at a hundred thousand, and E 0.83-0.92x
+    /// (`pair.sh supdb-ingest supdb-ingestpromote 100000 --reps 8`, at
+    /// `577c932`). Zero, and `supdb-ingestpromote` is the buffered arm.
     pub promote_entries: usize,
     /// EXPERIMENT: under the form file, a scan that starts in a block scans
     /// have started in this many times holds the blocks it walks as merged
@@ -3176,6 +3282,58 @@ pub struct Options {
     /// without the two.
     #[doc(hidden)]
     pub forms_settle_builds: bool,
+    /// EXPERIMENT: a commit that files the first batch after a scan on the
+    /// writer's own path (`Options::upkeep_inline_bursts`, `Hand::File`)
+    /// runs the settle's builds (`forms_settle_builds`) and the commit's
+    /// fill as well; off, it files the batch into the forms that stand and
+    /// leaves the blocks with none to the walks that meet them, as the
+    /// settle leaves them with no room, and the table incomplete for the
+    /// next fill. The batches of a burst after its first, filed in the
+    /// commit for being over the pace's share, fill as before: skipped at
+    /// every one of them, the full rewrite's thirty commits at thirty
+    /// thousand keys built nothing and its pass read 0.66x. A burst of one
+    /// commit at thirty thousand keys -- the lag sweep's one-percent point,
+    /// three hundred writes -- spent half of its 0.4-0.8 ms in the commit's
+    /// own settle and fill, a form for each of 212 overlaid blocks, for a
+    /// pass whose scans walk a third of the store. Paired on the buffered
+    /// arm in both orders, the one-percent burst read 1.19-1.25x off at
+    /// thirty thousand keys, 1.35-1.46x at a hundred thousand and 1.05-1.08x
+    /// at three hundred, and the pass after it 0.75-0.81x at the first two
+    /// and level at the third, with the other points within the lean of
+    /// the point no option here reaches (the lag sweep's first, 3-6%); the
+    /// ten-percent burst at ten thousand keys, one commit of a thousand,
+    /// read 1.00-1.04x. The work moves from the burst to the scans after
+    /// it, the one-percent point's burst and twice its pass 0.88x at thirty
+    /// thousand keys, and every cell of both stays ahead of the
+    /// comparators (`pair.sh supdb-ingest supdb-ingestsettlebuildsfiled
+    /// 30000 --reps 12`, the same at 10000, and at 100000 and 300000 with
+    /// `--reps 8`). `supdb-settlebuildsfiled` and
+    /// `supdb-ingestsettlebuildsfiled` build in the commit.
+    #[doc(hidden)]
+    pub forms_settle_builds_filed: bool,
+    /// EXPERIMENT: `forms_settle_every` and `forms_settle_builds` apply only
+    /// where the partitions' key and value bytes pass the last-level cache
+    /// (`llc_bytes`), as `scan_raw_ahead` does. They were priced at three
+    /// million keys and up, where a scan's first settle of the write mixes'
+    /// keys is misses; in a store the cache holds that settle is cheap and
+    /// the filing is the writer's cost alone: the buffered arm's one-percent
+    /// burst at thirty thousand keys read 0.73x and 0.79x of the shape
+    /// without them and its ten-percent burst at ten thousand 0.86x and
+    /// 0.84x, with the passes after level (`pair.sh supdb-ingestsettlelate
+    /// supdb-ingest 30000 --passes load,lag --reps 16`, at `84d4ce4`).
+    /// Paired against the default at every rung of the quick scale, the
+    /// gate gave back what the filing costs and took what it buys: the
+    /// buffered arm's A and F read 1.04-1.18x and the one-percent burst
+    /// 1.06-1.23x, and E 0.76-0.94x in both orders at ten, thirty, a
+    /// hundred and three hundred thousand keys, the durable arm's E 0.87x
+    /// and 0.89x at three hundred thousand (`pair.sh supdb-ingest
+    /// supdb-ingestsettlegated SIZE --reps 8`, and `supdb
+    /// supdb-settlegated`, at `200bbd5`). The cells it buys stand two and
+    /// three times the comparators' but for the bursts at ten and thirty
+    /// thousand; E is a cell the comparators contest at every rung. Off;
+    /// `supdb-settlegated` and `supdb-ingestsettlegated` turn it on.
+    #[doc(hidden)]
+    pub forms_settle_past_llc: bool,
     /// What "the group's refaults hold still" is for `forms_settle_builds`'s
     /// room (`SettleRoom`): the group refaulting under the line the
     /// controller's pressure term is drawn at
@@ -5146,6 +5304,95 @@ pub struct Options {
     /// `supdb-znohotfill` is the shape before it.
     #[doc(hidden)]
     pub zpages_hot_fill: bool,
+    /// EXPERIMENT: under the fill (`zpages_hot_fill`), the candidates the
+    /// reads have not skewed are asked for by how much of their records the
+    /// cache holds, most first, after the skewed ones by heat. Under the
+    /// uniform read pass every partition's heat is the same but for noise,
+    /// so the fill released seven to nine partitions as the noise ranked
+    /// them, at ten million keys under 1.25 GiB, most of each read from the
+    /// device inside the pass -- the background threads read about a
+    /// gigabyte in the slow read passes and 0.4 in the fast -- while the
+    /// load had left a few hundred megabytes of raw records in the cache.
+    /// Run beside the default in one process (`bench ab --arms
+    /// supdb,supdb-zhotresident --size 10000000 --bound 1342177280 --passes
+    /// load,read,read-threaded,scan,scan-threaded,mixes --ops-div 10 --reps
+    /// 6`, at `84d4ce4`) the read pass read in two shapes under both arms,
+    /// 3.1-3.3 s or 4.4-5.4, the default in its fast shape once in six and
+    /// the arm three times, with the same seven to ten partitions released
+    /// a pass: the order of the asks does not decide the shape. Off;
+    /// `supdb-zhotresident` turns it on.
+    #[doc(hidden)]
+    pub zpages_hot_fill_resident_first: bool,
+    /// EXPERIMENT: under the fill (`zpages_hot_fill`), a quiet look --
+    /// nothing committed since the last and no merge in flight -- fills
+    /// the room with the growth share in it (`zpages_hot_growth_pct`), the
+    /// share kept for a write mix's growth and so idle while nothing
+    /// writes. A census at the threaded scan pass at ten million keys
+    /// under 1.25 GiB read 917 MB of page cache and 139 MB of process
+    /// memory under the limit's 1,342, the fill stopped a partition short
+    /// of the room past the share and the reserve: seven partitions raw of
+    /// twenty-nine, the threaded scans a quarter raw and the rest decoded.
+    /// When writes come the room is measured past the share again and a
+    /// look short of half of it sends the raw partition read least back.
+    /// Paired in the row's whole order (`pair.sh supdb supdb-zhotfillquiet
+    /// 10000000 --bound 1342177280 --passes
+    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+    /// --ops-div 10 --reps 4`, at `5e58056`) it held twelve partitions raw
+    /// through the threaded scans where the default held eight, and the
+    /// three-thread scans read 1.03x and 1.01x: on three threads a raw
+    /// entry cost most of a decoded one, its walk stalled on the record
+    /// lines (`scan_raw_ahead`); the threaded reads read 1.11x and 1.15x,
+    /// and F 0.83x and 0.87x for the give-backs the write mixes take. Off;
+    /// `supdb-zhotfillquiet` turns it on.
+    #[doc(hidden)]
+    pub zpages_hot_fill_quiet: bool,
+    /// A walk of a partition's raw records in one run -- the drained
+    /// store's one walk from the seek (`cache_scan`) and a run of the merge
+    /// path's walk (`part_scan_z`) where no form file serves -- asks for the
+    /// run's records ahead of it (`Blob::prefetch_ranks`, at most
+    /// `SCAN_RAW_AHEAD_CAP` bytes), as a block walk asks for the next
+    /// block's, where the records are past the cache
+    /// (`scan_raw_ahead_past_llc`). The walk asked for nothing: on three
+    /// threads at ten million keys under 1.25 GiB two thirds of its samples
+    /// were on the load of a record's header, and a raw entry cost 55 ns
+    /// against a decoded one's 65. Paired there in the row's whole order
+    /// (`pair.sh supdb supdb-scanrawahead 10000000 --bound 1342177280
+    /// --passes
+    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+    /// --ops-div 10 --reps 4`, at `0b89622`) the threaded scans read
+    /// 1.03-1.07x with the cells it cannot reach leaning 3-5% the other way
+    /// in one sitting; in core at three million keys (`pair.sh supdb
+    /// supdb-scanrawahead 3000000 --reps 6`) the scan passes read
+    /// 1.31-1.48x and the drained store's lag point 1.35x and 1.56x. At
+    /// three hundred thousand keys, whose records the cache holds, the
+    /// threaded scans read 0.84-0.90x: the asks waited for fill buffers on
+    /// lines the walk would have found in the cache. Paced through the walk
+    /// (`scan_raw_ahead_lead`) it read no better. `supdb-noscanrawahead`
+    /// walks without it.
+    #[doc(hidden)]
+    pub scan_raw_ahead: bool,
+    /// Under `scan_raw_ahead`, ask only where the partitions' key and value
+    /// bytes pass the last-level cache the platform reports (`llc_bytes`,
+    /// read once): within it the records a walk reads are the cache's, and
+    /// asked for they cost the threaded scans at three hundred thousand
+    /// keys a tenth. `supdb-scanrawahead` asks whatever the store's size.
+    #[doc(hidden)]
+    pub scan_raw_ahead_past_llc: bool,
+    /// EXPERIMENT: under `scan_raw_ahead`, the records asked for as the
+    /// walk goes, this many bytes ahead of the record being read
+    /// (`Blob::scan_at_paced`), where zero asks for the run's whole span
+    /// at its start. Asked all at once, the run's two hundred lines waited
+    /// for fill buffers before the walk began: a third of the time the
+    /// ask saved, on three threads at ten million keys under 1.25 GiB.
+    /// Paced a kilobyte ahead against the run asked at its start (`pair.sh
+    /// supdb-scanrawahead supdb-scanrawpaced 10000000 --bound 1342177280`
+    /// in the row's whole order, at `f933e14`) the three-thread scans read
+    /// 0.98x and 1.03x with the cells it cannot reach leaning 2% and 7%
+    /// its way, and the one-thread scan pass 0.85x and 0.90x: the check and
+    /// the ask on every record cost what the wait they spread had. Zero;
+    /// `supdb-scanrawpaced` sets a kilobyte.
+    #[doc(hidden)]
+    pub scan_raw_ahead_lead: usize,
     /// The hot-raw policy's way back -- a raw partition's form file attached
     /// again, at the fill, a swap or the cold way back -- in the release's
     /// two steps: the form file's pages asked of the kernel at one look
@@ -5242,6 +5489,25 @@ pub struct Options {
     /// --reps 2`, and `--bound 1073741824 --passes load,lag --reps 3`).
     /// Off; `supdb-zrewarmbeside` asks beside the merges.
     pub zpages_rewarm_beside_merges: bool,
+    /// EXPERIMENT: the controller's install makes a rewarm due
+    /// (`zpages_rewarm_scans`), so the form files under nine tenths
+    /// resident are asked for whole once no merge is in flight. A store
+    /// opened past the line installs its form at its first reads with
+    /// whatever of the files the cache kept, and the rewarm waits for scans
+    /// that a pass of point reads never makes: at ten million keys under
+    /// 1.25 GiB the read pass after the load, in a process of its own, met
+    /// the form files whole in some reps and 48-180 MB of 543 short in
+    /// others, and those took 28,000-41,000 major faults against 4,000-
+    /// 7,000, a 4 KB fault for each cold page under the random advice.
+    /// The rewarm it makes due found every form file resident at the
+    /// install (`of_all 1.000` on the `zrewarm` line) in six traced reps
+    /// of six, the slow ones among them, so the cold pages are the pass's
+    /// own churn and not the install's; paired in the row's whole order the
+    /// read pass read 0.97x and 1.01x (`pair.sh supdb supdb-zrewarminstall
+    /// 10000000 --bound 1342177280 --ops-div 10 --reps 4`, at `6694659`).
+    /// Off; `supdb-zrewarminstall` turns it on.
+    #[doc(hidden)]
+    pub zpages_rewarm_at_install: bool,
     /// The stretch without a scan after which the scans that come back
     /// have the cold form files asked for (`zpages_rewarm_scans`), in
     /// milliseconds: a quarter of a second. It was a second
@@ -5338,6 +5604,8 @@ impl Default for Options {
             writer_pins: true,
             asym_pins: false,
             exts_by_value: false,
+            read_hash_once: true,
+            read_lines_ahead: true,
             point_via_ord: false,
             zpages: ZPages::Auto,
             zpages_min_bytes: zfile::ZMIN_RECS,
@@ -5369,6 +5637,7 @@ impl Default for Options {
             zpages_bulk_ahead: true,
             zpages_bulk_part: false,
             zpages_bulk_ahead_within: false,
+            zpages_bulk_steps: true,
             zpages_walk_part: true,
             zpages_cursor_view: true,
             zpages_group_ahead: true,
@@ -5397,10 +5666,12 @@ impl Default for Options {
             zpages_record_coding: false,
             zpages_store_all: false,
             zpages_raw_tails: false,
-            zpages_parse: false,
-            zpages_parse_finish: true,
+            zpages_parse: true,
+            zpages_parse_finish: false,
+            zpages_parse_chains: 4,
             zpages_own_decoder: true,
             zpages_flat_decode: true,
+            zpages_flat_slack: true,
             zpages_trim_install: false,
             upkeep_trim_look: false,
             trim_by_resident: false,
@@ -5462,6 +5733,8 @@ impl Default for Options {
             forms_settle_backlog_pct: 2,
             forms_settle_every: true,
             forms_settle_builds: true,
+            forms_settle_builds_filed: false,
+            forms_settle_past_llc: false,
             forms_settle_room_pressure: true,
             forms_settle_sheds_unbound: false,
             forms_settle_keys_all: false,
@@ -5571,6 +5844,11 @@ impl Default for Options {
             zpages_hot_raw_slack: true,
             zpages_hot_ask_idle: false,
             zpages_hot_growth_pct: 10,
+            zpages_hot_fill_quiet: false,
+            zpages_hot_fill_resident_first: false,
+            scan_raw_ahead: true,
+            scan_raw_ahead_past_llc: true,
+            scan_raw_ahead_lead: 0,
             zpages_seek_seeds: false,
             sweep_remembers_pin: true,
             copy_prefetch_whole: false,
@@ -5588,6 +5866,7 @@ impl Default for Options {
             zpages_hot_fill: true,
             zpages_hot_back_ask: true,
             zpages_rewarm_scans: true,
+            zpages_rewarm_at_install: false,
             zpages_settle_joins_asks: true,
             zpages_rewarm_trims: false,
             zpages_rewarm_beside_merges: false,
@@ -6596,6 +6875,13 @@ impl BlockedBloom {
     /// `maybe_contains` for a key whose hash (`BlockedBloom::hash`) the
     /// caller has: a point read through a form file hashes its key once
     /// for the key table and for this.
+    /// `maybe_contains` for a key whose FNV word (`key_hash`) the caller
+    /// has (`Options::read_hash_once`).
+    #[inline]
+    fn maybe_contains_fnv(&self, fnv: u64) -> bool {
+        self.maybe_contains_hash(BlockedBloom::finalize(fnv))
+    }
+
     #[inline]
     fn maybe_contains_hash(&self, h: u64) -> bool {
         let (bi, probes) = self.slots_of(h);
@@ -10663,6 +10949,33 @@ impl Seg {
         self.bloom.as_ref().is_none_or(|b| b.maybe_contains(key))
     }
 
+    /// `may_hold` for a key whose FNV word (`flatindex::key_hash`) the
+    /// caller has taken (`Options::read_hash_once`).
+    #[inline]
+    fn may_hold_fnv(&self, key: &[u8], fnv: u64) -> bool {
+        if self.below_lo(key) {
+            return false;
+        }
+        if self.hi.as_ref().is_some_and(|h| key >= h.as_slice()) {
+            return false;
+        }
+        self.bloom
+            .as_ref()
+            .is_none_or(|b| b.maybe_contains_fnv(fnv))
+    }
+
+    /// A hint to fetch the lines a point read of the key with FNV word
+    /// `fnv` will load first here: the filter's block, where the segment
+    /// has a filter, else the index's first hash slot
+    /// (`Options::read_lines_ahead`). Nothing is read.
+    #[inline]
+    fn prefetch_probe(&self, fnv: u64) {
+        match &self.bloom {
+            Some(b) => b.prefetch_fnv(fnv),
+            None => self.raw().prefetch_slot(fnv),
+        }
+    }
+
     /// Could this segment hold anything at or after `from`?
     #[inline]
     fn may_reach(&self, from: &[u8]) -> bool {
@@ -11002,11 +11315,15 @@ const SEE_ALL: u64 = u64::MAX;
 fn mem_hash(key: &[u8]) -> u64 {
     // FNV-1a, then a splitmix finish; the std SipHash was part of what the
     // memtable's decomposition priced.
-    let mut h = 0xcbf29ce484222325u64;
-    for &b in key {
-        h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
-    }
-    h = (h ^ (h >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    mem_hash_of(crate::flatindex::key_hash(key))
+}
+
+/// The memtable's hash from the key's FNV word (`flatindex::key_hash`), the
+/// word the segments' indexes and filters are hashed from too, so a read
+/// over every source hashes the key once (`Options::read_hash_once`).
+#[inline]
+fn mem_hash_of(fnv: u64) -> u64 {
+    let h = (fnv ^ (fnv >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
     h | 1 // 0 marks a vacant slot
 }
 
@@ -13402,7 +13719,11 @@ impl MemTable {
     /// while the line comes in. At thirty million keys the slot and the
     /// entry behind it are both misses, and this hides the first.
     fn prefetch(&self, key: &[u8]) -> u64 {
-        let hash = mem_hash(key);
+        self.prefetch_hashed(mem_hash(key))
+    }
+
+    /// `prefetch` for a key whose hash (`mem_hash`) the caller has.
+    fn prefetch_hashed(&self, hash: u64) -> u64 {
         if let Some(idx) = self.index() {
             let i = (hash as usize) & idx.mask;
             prefetch_lines(idx.slots[i..].as_ptr() as *const u8, 64);
@@ -16760,6 +17081,105 @@ const SETTLE_PLANS: usize = 16;
 /// few pages.
 const WILLNEED_CAP: usize = 64 << 10;
 
+/// Whether a raw walk asks for its records ahead of it, for a store whose
+/// partitions hold `data_bytes` of keys and values (`Shared::raw_ahead`).
+fn raw_ahead_on(opts: &Options, data_bytes: u64) -> bool {
+    opts.scan_raw_ahead && (!opts.scan_raw_ahead_past_llc || data_bytes > llc_bytes())
+}
+
+/// Whether write-time filing applies to a store whose partitions hold
+/// `data_bytes` of keys and values (`Shared::settle_write`).
+fn settle_write_on(opts: &Options, data_bytes: u64) -> bool {
+    !opts.forms_settle_past_llc || data_bytes > llc_bytes()
+}
+
+/// The last-level cache's bytes as the platform reports them, read once:
+/// the line `Options::scan_raw_ahead_past_llc` draws, past which a raw
+/// walk's records come from memory rather than the cache. The size of the
+/// highest-level data or unified cache under
+/// `/sys/devices/system/cpu/cpu0/cache`, and 32 MiB where nothing says.
+fn llc_bytes() -> u64 {
+    static LLC: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LLC.get_or_init(|| {
+        let mut best: Option<(u32, u64)> = None;
+        for i in 0..16 {
+            let dir = format!("/sys/devices/system/cpu/cpu0/cache/index{i}");
+            let read = |f: &str| std::fs::read_to_string(format!("{dir}/{f}")).ok();
+            let Some(level) = read("level").and_then(|s| s.trim().parse::<u32>().ok()) else {
+                break;
+            };
+            if read("type").is_some_and(|t| t.trim() == "Instruction") {
+                continue;
+            }
+            let Some(bytes) = read("size").and_then(|s| cache_size_bytes(s.trim())) else {
+                continue;
+            };
+            if best.is_none_or(|(l, _)| level > l) {
+                best = Some((level, bytes));
+            }
+        }
+        best.map_or(32 << 20, |(_, b)| b)
+    })
+}
+
+/// A cache size as sysfs writes it -- `48K`, `2048K`, `32M` -- in bytes.
+fn cache_size_bytes(s: &str) -> Option<u64> {
+    let (num, mul) = match s.as_bytes().last()? {
+        b'K' => (&s[..s.len() - 1], 1u64 << 10),
+        b'M' => (&s[..s.len() - 1], 1 << 20),
+        b'G' => (&s[..s.len() - 1], 1 << 30),
+        _ => (s, 1),
+    };
+    num.parse::<u64>().ok().map(|n| n * mul)
+}
+
+#[cfg(test)]
+mod raw_ahead_tests {
+    use super::*;
+
+    /// The sizes sysfs writes, and what is not one.
+    #[test]
+    fn a_cache_size_reads_as_sysfs_writes_it() {
+        assert_eq!(cache_size_bytes("48K"), Some(48 << 10));
+        assert_eq!(cache_size_bytes("2048K"), Some(2 << 20));
+        assert_eq!(cache_size_bytes("266240K"), Some(272_629_760));
+        assert_eq!(cache_size_bytes("32M"), Some(32 << 20));
+        assert_eq!(cache_size_bytes("1G"), Some(1 << 30));
+        assert_eq!(cache_size_bytes("4096"), Some(4096));
+        assert_eq!(cache_size_bytes(""), None);
+        assert_eq!(cache_size_bytes("K"), None);
+        assert_eq!(cache_size_bytes("lots"), None);
+        assert!(llc_bytes() > 0);
+    }
+
+    /// The ask is the option's, and past the cache only where the option
+    /// for the line says so: a store within the cache walks without it.
+    #[test]
+    fn a_raw_walk_asks_ahead_only_past_the_cache() {
+        let o = Options::default();
+        assert!(o.scan_raw_ahead && o.scan_raw_ahead_past_llc);
+        assert!(!raw_ahead_on(&o, 0));
+        assert!(!raw_ahead_on(&o, llc_bytes()));
+        assert!(raw_ahead_on(&o, llc_bytes() + 1));
+        let always = Options {
+            scan_raw_ahead_past_llc: false,
+            ..Options::default()
+        };
+        assert!(raw_ahead_on(&always, 0));
+        let never = Options {
+            scan_raw_ahead: false,
+            scan_raw_ahead_past_llc: false,
+            ..Options::default()
+        };
+        assert!(!raw_ahead_on(&never, u64::MAX));
+    }
+}
+
+/// The most of a raw walk's records `Options::scan_raw_ahead` asks for at
+/// its start: a scan of a hundred of the suite's records is thirteen
+/// kilobytes, and a walk past this much has the hardware's own stream.
+const SCAN_RAW_AHEAD_CAP: usize = 16 << 10;
+
 /// What a reader reads: the store as of a publish. The writer builds a
 /// new one at every seal, join, merge or freeze and swaps it in whole,
 /// so a reader that loaded the old one keeps it, unchanged, until its
@@ -17121,6 +17541,18 @@ struct Shared {
     retired: RetireList<Box<State>>,
     /// Which form a read takes (`ZGate`).
     zgate: ZGate,
+    /// Whether a raw walk asks for its records ahead of it
+    /// (`Options::scan_raw_ahead`): the option, and the partitions' key and
+    /// value bytes past the last-level cache where
+    /// `Options::scan_raw_ahead_past_llc` says so. Set at the open and at
+    /// every segment publish, beside `State::data_bytes`, and read relaxed:
+    /// a hint a walk takes or leaves.
+    raw_ahead: std::sync::atomic::AtomicBool,
+    /// Whether a commit files its batch and builds what it filed into at
+    /// the write (`Options::forms_settle_every`, `forms_settle_builds`) for
+    /// a store of this size: everywhere, or past the last-level cache where
+    /// `Options::forms_settle_past_llc` says so. Set beside `raw_ahead`.
+    settle_write: std::sync::atomic::AtomicBool,
     /// The out-of-core asks' counts (`AskCounts`), on a line of their own.
     asks: AskCounts,
     /// Which mode the segment mappings are in: `true` is `MADV_RANDOM`.
@@ -18344,6 +18776,9 @@ pub struct Reader {
     /// The upkeep thread's pass files everything whatever the commit's
     /// own rules say; see `Upkeep::Background`.
     force_due: std::cell::Cell<bool>,
+    /// The commit is filing a burst's batch on the writer's own path
+    /// (`Hand::File`); see `Options::forms_settle_builds_filed`.
+    filing: std::cell::Cell<bool>,
     /// The upkeep this handle keeps for its range reads: the block
     /// tables, the scan snapshot, and the log position both are
     /// current to. See `FormsState`.
@@ -19174,6 +19609,9 @@ pub struct Db {
     /// What the commit in progress does with its batch, decided when it
     /// hands the upkeep over: see `Hand`.
     upkeep_hand: Hand,
+    /// The batch `Hand::File` files is the first after a scan, whose
+    /// builds the scans after it are left (`Options::forms_settle_builds_filed`).
+    upkeep_file_first: bool,
     /// The store's lock, the last field so that it is the last thing the
     /// close gives up: `Drop` joins every thread that writes the directory
     /// and the fields before this one drop after it, and a second open
@@ -22583,11 +23021,7 @@ impl Reader {
         n: usize,
         f: &mut F,
     ) -> Result<usize> {
-        let raw = |rank: usize, n: usize, f: &mut F| {
-            seg.raw()
-                .scan_at(rank, n, &mut *f)
-                .map_err(|e| err(&format!("segment scan: {e}")))
-        };
+        let raw = |rank: usize, n: usize, f: &mut F| self.raw_scan(seg, rank, n, f);
         if !self.z_on() {
             return raw(rank, n, f);
         }
@@ -22751,9 +23185,7 @@ impl Reader {
             self.part_scan_z(seg, rank, n, f)?
         } else {
             seg.hot_scan(n);
-            seg.raw()
-                .scan_at(rank, n, &mut *f)
-                .map_err(|e| err(&format!("segment scan: {e}")))?
+            self.raw_scan(seg, rank, n, f)?
         };
         if got < n {
             return Err(err(
@@ -22761,6 +23193,39 @@ impl Reader {
             ));
         }
         Ok(got)
+    }
+
+    /// Whether a commit files at the write for this store's size
+    /// (`Shared::settle_write`).
+    #[inline]
+    fn settle_at_write(&self) -> bool {
+        self.shared.settle_write.load(AtomicOrdering::Relaxed)
+    }
+
+    /// A walk of `n` of the partition's raw records from `rank`, with its
+    /// records asked for ahead of it where `Options::scan_raw_ahead` says
+    /// so: paced through the walk at `scan_raw_ahead_lead` bytes, or the
+    /// run's span at its start, at most `SCAN_RAW_AHEAD_CAP` bytes.
+    #[inline]
+    fn raw_scan<F: FnMut(&[u8], &[u8])>(
+        &self,
+        seg: &Seg,
+        rank: usize,
+        n: usize,
+        f: &mut F,
+    ) -> Result<usize> {
+        let blob = seg.raw();
+        let r = if n > 1 && self.shared.raw_ahead.load(AtomicOrdering::Relaxed) {
+            if self.opts.scan_raw_ahead_lead > 0 {
+                blob.scan_at_paced(rank, n, self.opts.scan_raw_ahead_lead, &mut *f)
+            } else {
+                blob.prefetch_ranks(rank, n, SCAN_RAW_AHEAD_CAP);
+                blob.scan_at(rank, n, &mut *f)
+            }
+        } else {
+            blob.scan_at(rank, n, &mut *f)
+        };
+        r.map_err(|e| err(&format!("segment scan: {e}")))
     }
 
     /// `Blob::values_at` for the block cache: the values of the record at
@@ -23164,11 +23629,52 @@ impl Reader {
         let st = self.state();
         let (segs, mem) = (&st.segs, &*st.mem);
         let mem_empty = mem.is_empty();
-        let hash = if mem_empty { 0 } else { mem.prefetch(key) };
+        // The key's FNV word once, every source's hash taken from it
+        // (`Options::read_hash_once`); zero where each source hashes.
+        let once = self.opts.read_hash_once;
+        let fnv = if once {
+            crate::flatindex::key_hash(key)
+        } else {
+            0
+        };
+        let mem_h = |k: &[u8]| if once { mem_hash_of(fnv) } else { mem_hash(k) };
+        let hash = if mem_empty {
+            0
+        } else {
+            mem.prefetch_hashed(mem_h(key))
+        };
         let np = segs.partition_point(|s| s.level > 0);
         let at = segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
-        let part = segs[..np].get(at).filter(|s| s.may_hold(key));
+        let holds = |s: &Seg| {
+            if once {
+                s.may_hold_fnv(key, fnv)
+            } else {
+                s.may_hold(key)
+            }
+        };
+        let part = segs[..np].get(at).filter(|s| holds(s));
         let l0 = st.pieces_over(np, at);
+        // The form's dispatch under either option that may serve the
+        // partition, and only with the gate at the form (below).
+        let part_z = self.opts.zpages != ZPages::Off && self.z_on();
+        // The first lines the later sources' probes load, asked for before
+        // the earlier ones are read (`Options::read_lines_ahead`): each
+        // piece's filter block, which the partition's read is the lead
+        // for, and the partition's first hash slot only where the
+        // tombstone pass reads the newer sources ahead of it -- with no
+        // pass the lookup follows the ask at once, and the ask was 44
+        // instructions a read of the read pass for nothing.
+        let tombs = st.has_tombstones();
+        if once && self.opts.read_lines_ahead && (!l0.is_empty() || tombs) {
+            for seg in l0 {
+                seg.prefetch_probe(fnv);
+            }
+            if !part_z && tombs {
+                if let Some(seg) = part {
+                    seg.raw().prefetch_slot(fnv);
+                }
+            }
+        }
         if np == 0 {
             self.count_unshaped();
         }
@@ -23186,7 +23692,7 @@ impl Reader {
         let fr_ix = 1 + l0.len();
         let mem_ix = fr_ix + st.frozen.len();
         let mut start = 0usize;
-        if st.has_tombstones() {
+        if tombs {
             if !mem_empty {
                 if let Some(e) = mem.get_with(hash, key, self.len_bound.get()) {
                     if mem.has_tomb(e, self.wm()) {
@@ -23199,7 +23705,7 @@ impl Reader {
                 // tombstone is the cut.
                 for (i, fr) in st.frozen.iter().enumerate().rev() {
                     if fr
-                        .get(key, MemTable::ALL)
+                        .get_with(mem_h(key), key, MemTable::ALL)
                         .is_some_and(|e| fr.has_tomb(e, SEE_ALL))
                     {
                         start = fr_ix + i;
@@ -23209,10 +23715,15 @@ impl Reader {
             }
             if start == 0 {
                 for (i, seg) in l0.iter().enumerate().rev() {
-                    if !seg.tombs || !seg.may_hold(key) {
+                    if !seg.tombs || !holds(seg) {
                         continue;
                     }
-                    if let Some(exts) = seg.raw().lookup(key) {
+                    let exts = if once {
+                        seg.raw().lookup_hashed(key, fnv)
+                    } else {
+                        seg.raw().lookup(key)
+                    };
+                    if let Some(exts) = exts {
                         if exts.iter().any(|e| e.is_tombstone()) {
                             start = 1 + i;
                             break;
@@ -23228,6 +23739,8 @@ impl Reader {
         let seg_read = |seg: &Seg, f: &mut F| {
             if by_value {
                 seg.raw().read_all_by_value(key, f)
+            } else if once {
+                seg.raw().read_all_hashed(key, fnv, f)
             } else {
                 seg.raw().read_all(key, f)
             }
@@ -23245,7 +23758,7 @@ impl Reader {
                 // the raw read. The dispatch asked for `Always` here for as
                 // long as only `Always` was tested through it: a store
                 // under `Auto` in COMPACT read every key raw.
-                if self.opts.zpages != ZPages::Off && self.z_on() {
+                if part_z {
                     // The partition from its form file, or from the raw form
                     // and counted where it has none in service.
                     n += self.part_read_z(seg, key, &mut f, seg_read)?;
@@ -23266,7 +23779,7 @@ impl Reader {
             }
         }
         for (i, seg) in l0.iter().enumerate() {
-            if 1 + i < start || !seg.may_hold(key) {
+            if 1 + i < start || !holds(seg) {
                 continue;
             }
             n += seg_read(seg, &mut f)?;
@@ -23275,7 +23788,7 @@ impl Reader {
             if fr_ix + i < start {
                 continue;
             }
-            if let Some(e) = fr.get(key, MemTable::ALL) {
+            if let Some(e) = fr.get_with(mem_h(key), key, MemTable::ALL) {
                 let (offs, _) = fr.live_chain(e, SEE_ALL);
                 n += offs.len() as u64;
                 for off in offs {
@@ -26213,8 +26726,9 @@ impl Reader {
         // it files into (`SettleRoom`): filing alone cost F and D a tenth
         // and bought E nothing, and with no room to build that is all a
         // commit's filing would be.
-        let every =
-            self.opts.forms_settle_every && (!self.opts.forms_settle_builds || self.settle_room());
+        let every = self.opts.forms_settle_every
+            && self.settle_at_write()
+            && (!self.opts.forms_settle_builds || self.settle_room());
         let bound = if every {
             1
         } else if self.opts.forms_settle_backlog_pct == 0 {
@@ -26413,7 +26927,17 @@ impl Reader {
             let cache = self.fs().scan_keys.borrow();
             let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
             self.install_ahead(unsealed)?;
-            if moved && self.opts.forms_settle_builds && !self.abandon_pending() {
+            // The first batch after a scan filed in the commit leaves the
+            // blocks it filed into with no form to the first walk that
+            // meets them, which builds a block over its filed keys as it
+            // builds any (`Options::forms_settle_builds_filed`); the next
+            // settle starts the list afresh.
+            if moved
+                && self.opts.forms_settle_builds
+                && self.settle_at_write()
+                && (self.opts.forms_settle_builds_filed || !self.filing.get())
+                && !self.abandon_pending()
+            {
                 let blocks = std::mem::take(&mut *self.fs().settle_blocks.borrow_mut());
                 if !blocks.is_empty() && self.settle_room() {
                     self.build_settled(&blocks, unsealed)?;
@@ -26443,10 +26967,13 @@ impl Reader {
         // the writer, or bounded by `upkeep_pass_pct` -- fills nothing: the
         // fill builds from the sources as they stand, and belongs after
         // the settle that brings the tables to them.
+        // Nor does it fill: the table stays incomplete and the walks
+        // after build what they meet (`Options::forms_settle_builds_filed`).
         if self.opts.commit_forms_build
             && !self.cache_binds()
             && !self.fs().tables_complete.get()
             && !self.fs().log_short.get()
+            && (self.opts.forms_settle_builds_filed || !self.filing.get())
         {
             if self.opts.scan_cache_ahead && self.fs().ahead.borrow().is_none() {
                 self.start_ahead();
@@ -27791,6 +28318,7 @@ impl Reader {
             // A block the settle filed into and nothing formed, for the
             // fill to build (`Options::forms_settle_builds`).
             if self.opts.forms_settle_builds
+                && self.settle_at_write()
                 && i + 1 == group_end
                 && table.slots.get(b).is_some_and(|s| s.is_none())
             {
@@ -30444,15 +30972,56 @@ impl Reader {
         let st = self.state();
         let (segs, mem) = (&st.segs, &*st.mem);
         let mem_empty = mem.is_empty();
-        let hash = if mem_empty { 0 } else { mem.prefetch(key) };
+        // One hash for every source and their first lines asked for
+        // together, as the read takes them (`Options::read_hash_once`,
+        // `Options::read_lines_ahead`).
+        let once = self.opts.read_hash_once;
+        let fnv = if once {
+            crate::flatindex::key_hash(key)
+        } else {
+            0
+        };
+        let mem_h = |k: &[u8]| if once { mem_hash_of(fnv) } else { mem_hash(k) };
+        let hash = if mem_empty {
+            0
+        } else {
+            mem.prefetch_hashed(mem_h(key))
+        };
         let np = segs.partition_point(|s| s.level > 0);
         let at = segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
-        let part = segs[..np].get(at).filter(|s| s.may_hold(key));
+        let holds = |s: &Seg| {
+            if once {
+                s.may_hold_fnv(key, fnv)
+            } else {
+                s.may_hold(key)
+            }
+        };
+        let raw_count = |s: &Seg| {
+            if once {
+                s.raw().count_hashed(key, fnv)
+            } else {
+                s.raw().count(key)
+            }
+            .map_err(|e| err(&format!("segment count: {e}")))
+        };
+        let part = segs[..np].get(at).filter(|s| holds(s));
         let l0 = st.pieces_over(np, at);
+        let part_z = self.opts.zpages != ZPages::Off && self.z_on();
+        let tombs = st.has_tombstones();
+        if once && self.opts.read_lines_ahead && (!l0.is_empty() || tombs) {
+            for seg in l0 {
+                seg.prefetch_probe(fnv);
+            }
+            if !part_z && tombs {
+                if let Some(seg) = part {
+                    seg.raw().prefetch_slot(fnv);
+                }
+            }
+        }
         let fr_ix = 1 + l0.len();
         let mem_ix = fr_ix + st.frozen.len();
         let mut start = 0usize;
-        if st.has_tombstones() {
+        if tombs {
             if !mem_empty {
                 if let Some(e) = mem.get_with(hash, key, self.len_bound.get()) {
                     if mem.has_tomb(e, self.wm()) {
@@ -30465,7 +31034,7 @@ impl Reader {
                 // tombstone is the cut.
                 for (i, fr) in st.frozen.iter().enumerate().rev() {
                     if fr
-                        .get(key, MemTable::ALL)
+                        .get_with(mem_h(key), key, MemTable::ALL)
                         .is_some_and(|e| fr.has_tomb(e, SEE_ALL))
                     {
                         start = fr_ix + i;
@@ -30475,10 +31044,15 @@ impl Reader {
             }
             if start == 0 {
                 for (i, seg) in l0.iter().enumerate().rev() {
-                    if !seg.tombs || !seg.may_hold(key) {
+                    if !seg.tombs || !holds(seg) {
                         continue;
                     }
-                    if let Some(exts) = seg.raw().lookup(key) {
+                    let exts = if once {
+                        seg.raw().lookup_hashed(key, fnv)
+                    } else {
+                        seg.raw().lookup(key)
+                    };
+                    if let Some(exts) = exts {
                         if exts.iter().any(|e| e.is_tombstone()) {
                             start = 1 + i;
                             break;
@@ -30492,30 +31066,24 @@ impl Reader {
             if let Some(seg) = part {
                 // As the read's dispatch: the gate asked here, so that the
                 // raw gate takes the raw count without the call.
-                if self.opts.zpages != ZPages::Off && self.z_on() {
+                if part_z {
                     n += self.part_count_z(seg, key)?;
                 } else {
-                    n += seg
-                        .raw()
-                        .count(key)
-                        .map_err(|e| err(&format!("segment count: {e}")))?;
+                    n += raw_count(seg)?;
                 }
             }
         }
         for (i, seg) in l0.iter().enumerate() {
-            if 1 + i < start || !seg.may_hold(key) {
+            if 1 + i < start || !holds(seg) {
                 continue;
             }
-            n += seg
-                .raw()
-                .count(key)
-                .map_err(|e| err(&format!("segment count: {e}")))?;
+            n += raw_count(seg)?;
         }
         for (i, fr) in st.frozen.iter().enumerate() {
             if fr_ix + i < start {
                 continue;
             }
-            if let Some(e) = fr.get(key, MemTable::ALL) {
+            if let Some(e) = fr.get_with(mem_h(key), key, MemTable::ALL) {
                 n += u64::from(e.count);
             }
         }
@@ -30996,6 +31564,8 @@ impl Db {
             state: AtomicPtr::new(Box::into_raw(Box::new(state))),
             readers: Readers::new(opts.asym_pins, opts.sweep_remembers_pin),
             retired: RetireList::new(),
+            raw_ahead: std::sync::atomic::AtomicBool::new(raw_ahead_on(&opts, data_bytes)),
+            settle_write: std::sync::atomic::AtomicBool::new(settle_write_on(&opts, data_bytes)),
             advice_random: std::sync::atomic::AtomicBool::new(starts_random),
             retired_forms: RetireList::new(),
             retired_snaps: RetireList::new(),
@@ -31139,7 +31709,8 @@ impl Db {
                     opts.zpages_bulk_ahead,
                     opts.zpages_bulk_part,
                 )
-                .bulk_within(opts.zpages_bulk_ahead_within),
+                .bulk_within(opts.zpages_bulk_ahead_within)
+                .bulk_steps(opts.zpages_bulk_steps),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -31159,6 +31730,7 @@ impl Db {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
+            filing: std::cell::Cell::new(false),
         };
         let maint = MaintHome::Here(Box::new(Maint::new(
             r.maint_reader()?,
@@ -31199,6 +31771,7 @@ impl Db {
             upkeep_floor: 0,
             upkeep_big: 0,
             upkeep_hand: Hand::Lend,
+            upkeep_file_first: false,
             unsynced: 0,
             lag_writes: usize::MAX,
             lag_log: (0, 0),
@@ -31544,7 +32117,8 @@ impl Db {
                         opts.zpages_inplace_walk,
                         opts.zpages_drop_raw,
                         opts.z_times_decodes(),
-                        zpages::Dec::of(opts.zpages_own_decoder, opts.zpages_flat_decode),
+                        zpages::Dec::of(opts.zpages_own_decoder, opts.zpages_flat_decode)
+                            .with_slack(opts.zpages_flat_slack),
                         opts.zpages_cursor_view,
                         opts.zpages_group_ahead,
                         opts.zpages_walk_owns_decodes,
@@ -31705,6 +32279,8 @@ impl Db {
             state: AtomicPtr::new(Box::into_raw(Box::new(state))),
             readers,
             retired: RetireList::new(),
+            raw_ahead: std::sync::atomic::AtomicBool::new(raw_ahead_on(&opts, data_bytes)),
+            settle_write: std::sync::atomic::AtomicBool::new(settle_write_on(&opts, data_bytes)),
             advice_random: std::sync::atomic::AtomicBool::new(starts_random),
             retired_forms: RetireList::new(),
             retired_snaps: RetireList::new(),
@@ -31848,7 +32424,8 @@ impl Db {
                     opts.zpages_bulk_ahead,
                     opts.zpages_bulk_part,
                 )
-                .bulk_within(opts.zpages_bulk_ahead_within),
+                .bulk_within(opts.zpages_bulk_ahead_within)
+                .bulk_steps(opts.zpages_bulk_steps),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -31868,6 +32445,7 @@ impl Db {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
+            filing: std::cell::Cell::new(false),
         };
         let maint = MaintHome::Here(Box::new(Maint::new(
             r.maint_reader()?,
@@ -31908,6 +32486,7 @@ impl Db {
             upkeep_floor: 0,
             upkeep_big: 0,
             upkeep_hand: Hand::Lend,
+            upkeep_file_first: false,
             unsynced: 0,
             lag_writes: usize::MAX,
             lag_log: (0, 0),
@@ -33499,6 +34078,29 @@ impl Db {
         self.join_upkeep();
         self.maint_request(MaintAsk::Settle)?;
         self.join_ahead();
+        // The arm that builds ahead at every publish
+        // (`Options::build_ahead_on_publish`): a builder the writer started
+        // over a state the segment work has since replaced -- a seal's
+        // freeze, whose landing publishes after it -- built forms the next
+        // install drops, and the builder for the state that stands started
+        // only at the next commit, after the commit had lent its upkeep, so
+        // whether the commit's pass installed its forms was a race the
+        // builder lost one run in sixty. The stale one goes, and the one
+        // for the state as it stands is started and joined here.
+        if self.opts.build_ahead_on_publish {
+            let gen = self.state().gen;
+            if self
+                .fs()
+                .ahead
+                .borrow()
+                .as_ref()
+                .is_some_and(|a| a.gen != gen)
+            {
+                self.stop_ahead();
+            }
+            self.build_ahead_if_due();
+            self.join_ahead();
+        }
         self.settle_keeper();
         Ok(())
     }
@@ -34593,7 +35195,8 @@ impl Reader {
                     self.opts.zpages_bulk_ahead,
                     self.opts.zpages_bulk_part,
                 )
-                .bulk_within(self.opts.zpages_bulk_ahead_within),
+                .bulk_within(self.opts.zpages_bulk_ahead_within)
+                .bulk_steps(self.opts.zpages_bulk_steps),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -34611,6 +35214,7 @@ impl Reader {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
+            filing: std::cell::Cell::new(false),
         })
     }
 
@@ -34638,7 +35242,8 @@ impl Reader {
                     self.opts.zpages_bulk_ahead,
                     self.opts.zpages_bulk_part,
                 )
-                .bulk_within(self.opts.zpages_bulk_ahead_within),
+                .bulk_within(self.opts.zpages_bulk_ahead_within)
+                .bulk_steps(self.opts.zpages_bulk_steps),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -34656,6 +35261,7 @@ impl Reader {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
+            filing: std::cell::Cell::new(false),
         })
     }
 
@@ -34690,7 +35296,8 @@ impl Reader {
                     self.opts.zpages_bulk_ahead,
                     self.opts.zpages_bulk_part,
                 )
-                .bulk_within(self.opts.zpages_bulk_ahead_within),
+                .bulk_within(self.opts.zpages_bulk_ahead_within)
+                .bulk_steps(self.opts.zpages_bulk_steps),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -34708,6 +35315,7 @@ impl Reader {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
+            filing: std::cell::Cell::new(false),
         })
     }
 }
@@ -35648,6 +36256,7 @@ impl Db {
                 side.time_decodes = lines.4;
                 side.own_decoder = lines.5.own();
                 side.flat_decoder = lines.5.flat();
+                side.flat_slack = lines.5 == zpages::Dec::FlatEnd;
                 side.cursor_view = lines.6;
                 side.group_ahead = lines.7;
                 side.walk_owns = lines.8;
@@ -35708,7 +36317,8 @@ impl Db {
                     self.opts.zpages_inplace_walk,
                     z_drop_now(&self.opts, &self.shared),
                     self.opts.z_times_decodes(),
-                    zpages::Dec::of(self.opts.zpages_own_decoder, self.opts.zpages_flat_decode),
+                    zpages::Dec::of(self.opts.zpages_own_decoder, self.opts.zpages_flat_decode)
+                        .with_slack(self.opts.zpages_flat_slack),
                     self.opts.zpages_cursor_view,
                     self.opts.zpages_group_ahead,
                     self.opts.zpages_walk_owns_decodes,
@@ -35731,6 +36341,7 @@ impl Db {
                 plan.store_all = self.opts.zpages_store_all;
                 plan.raw_tails = self.opts.zpages_raw_tails;
                 plan.parse = self.opts.zpages_parse;
+                plan.parse_chains = self.opts.zpages_parse_chains;
                 plan.own_decode = self.opts.zpages_own_decoder;
                 plan
             })
@@ -35760,6 +36371,7 @@ impl Db {
                         side.time_decodes = self.opts.z_times_decodes();
                         side.own_decoder = self.opts.zpages_own_decoder;
                         side.flat_decoder = self.opts.zpages_flat_decode;
+                        side.flat_slack = self.opts.zpages_flat_slack;
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
                         side.walk_owns = self.opts.zpages_walk_owns_decodes;
@@ -37526,7 +38138,8 @@ impl Reader {
                     self.opts.zpages_bulk_ahead,
                     self.opts.zpages_bulk_part,
                 )
-                .bulk_within(self.opts.zpages_bulk_ahead_within),
+                .bulk_within(self.opts.zpages_bulk_ahead_within)
+                .bulk_steps(self.opts.zpages_bulk_steps),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -37545,6 +38158,7 @@ impl Reader {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
+            filing: std::cell::Cell::new(false),
             fs: FormsCell::empty(),
         }
     }
@@ -37960,6 +38574,7 @@ impl Db {
             // thread, the hand set once the batch is lent below.
             if batch as u64 > share || self.upkeep_since_scan == 0 {
                 self.upkeep_hand = Hand::File;
+                self.upkeep_file_first = self.upkeep_since_scan == 0;
                 return;
             }
             pace = true;
@@ -38133,7 +38748,11 @@ impl Db {
             Hand::Inline => self.maintain_forms().map(|()| false),
             Hand::File => {
                 self.r.force_due.set(true);
+                self.r
+                    .filing
+                    .set(std::mem::take(&mut self.upkeep_file_first));
                 let filed = self.maintain_forms();
+                self.r.filing.set(false);
                 self.r.force_due.set(false);
                 filed.map(|()| false)
             }
@@ -41233,6 +41852,10 @@ const ASK_JOIN_CAP: std::time::Duration = std::time::Duration::from_secs(20);
 /// keeps.
 pub const REWARM_QUIET_BEFORE_MS: u32 = 1000;
 const HOT_RAW_ASK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// The share of a form file's pages under which an install's rewarm asks for
+/// it (`Options::zpages_rewarm_at_install`): short of whole, since a pass of
+/// point reads over a form touches every page of it.
+const INSTALL_REWARM_RESIDENT: f64 = 0.995;
 const HOT_RAW_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The share of a partition's records the page cache must hold for a build
@@ -41598,6 +42221,9 @@ struct Maint {
     z_rewarm_life: u64,
     z_rewarm_quiet: Option<std::time::Duration>,
     z_rewarm_due: bool,
+    /// The rewarm due is an install's (`Options::zpages_rewarm_at_install`),
+    /// which asks for every form file short of whole.
+    z_rewarm_whole: bool,
     z_rewarm: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -42214,6 +42840,7 @@ impl Maint {
             z_rewarm_life: 0,
             z_rewarm_quiet: None,
             z_rewarm_due: false,
+            z_rewarm_whole: false,
             z_rewarm: None,
         }
     }
@@ -42846,6 +43473,14 @@ impl Maint {
         let mean_key_bytes = Db::mean_key_bytes_of(&segs);
         let store_bytes = Db::store_bytes_of(&self.dir, &segs);
         let data_bytes = Db::data_bytes_of(&segs);
+        self.shared.raw_ahead.store(
+            raw_ahead_on(&self.opts, data_bytes),
+            AtomicOrdering::Relaxed,
+        );
+        self.shared.settle_write.store(
+            settle_write_on(&self.opts, data_bytes),
+            AtomicOrdering::Relaxed,
+        );
         let l0_aligned = Db::l0_aligned_of(&segs);
         let segs_tombs = segs.iter().any(|s| s.tombs);
         loop {
@@ -44724,6 +45359,16 @@ impl Maint {
             };
             let wrote = self.z_hot_fill_writes.replace(writes) != Some(writes);
             let quiet = !wrote && self.compacting.is_empty() && self.tiering.is_none();
+            // A quiet look's room with the growth share in it
+            // (`Options::zpages_hot_fill_quiet`): the share is kept for a
+            // write mix's growth, and a stretch with no writes has none to
+            // keep it for; the first look after writes come measures the
+            // room past it again and gives back what the writes take.
+            let room = if quiet && self.opts.zpages_hot_fill_quiet {
+                slack.unwrap_or(room)
+            } else {
+                room
+            };
             // The asks in flight: each released once its pages are in, or
             // its wait has run out with half of them in and the room still
             // there; the rest of the bytes still to come counted against
@@ -44816,6 +45461,20 @@ impl Maint {
                 })
                 .collect();
             cands.sort_by(|a, b| per_key(b).total_cmp(&per_key(a)));
+            // The skewed first, and among the rest the one whose records
+            // the cache holds most of (`Options::zpages_hot_fill_resident_first`):
+            // a release of resident records reads nothing from the device.
+            if self.opts.zpages_hot_fill_resident_first {
+                let mut keyed: Vec<(&Part, bool, u64)> = cands
+                    .iter()
+                    .map(|p| {
+                        let need = (p.raw_bytes as f64 * (1.0 - p.seg.records_resident())) as u64;
+                        (*p, per_key(p) >= HOT_RAW_SKEW * median, need)
+                    })
+                    .collect();
+                keyed.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
+                cands = keyed.into_iter().map(|(p, _, _)| p).collect();
+            }
             let reserve = cands.iter().map(|p| p.raw_bytes).max().unwrap_or(0);
             let mut avail = room.saturating_sub(pending);
             let mut fill_avail = avail.saturating_sub(reserve);
@@ -45115,9 +45774,19 @@ impl Maint {
             return;
         }
         self.z_rewarm_due = false;
+        // An install's rewarm asks for every file short of whole: the point
+        // reads after it touch every page of the form many times over, so
+        // each cold page is a fault where a scan's walk has the next group
+        // asked for ahead of it.
+        let line = if std::mem::take(&mut self.z_rewarm_whole) {
+            INSTALL_REWARM_RESIDENT
+        } else {
+            HOT_RAW_RESIDENT
+        };
         if self.zsel.counts().installs == 0 || self.shared.zgate.load() == zselect::GATE_RAW {
             return;
         }
+        let mut whole = (0.0f64, 0u64);
         let paths: Vec<(PathBuf, f64, u64)> = {
             let _op = self.op();
             self.segs()
@@ -45130,7 +45799,9 @@ impl Maint {
                 .filter_map(|s| {
                     let z = s.z.get()?;
                     let resident = z.pages_resident();
-                    if resident >= HOT_RAW_RESIDENT {
+                    whole.0 += resident * z.file_bytes() as f64;
+                    whole.1 += z.file_bytes();
+                    if resident >= line {
                         return None;
                     }
                     let (id, end) = (Db::name_id(&s.name)?, Db::name_end_seq(&s.name)?);
@@ -45149,9 +45820,11 @@ impl Maint {
                 .collect();
             let room = zfile::read_budget().and_then(|b| b.slack());
             eprintln!(
-                "zrewarm t={:.1} files {} life {life} merging {merging} room_mb {} resident {}",
+                "zrewarm t={:.1} files {} line {line} of_all {:.3}/{} life {life} merging {merging} room_mb {} resident {}",
                 now.as_secs_f64(),
                 paths.len(),
+                whole.0 / whole.1.max(1) as f64,
+                whole.1 >> 20,
                 room.map_or("-".to_string(), |r| (r >> 20).to_string()),
                 shares.join(",")
             );
@@ -45475,6 +46148,13 @@ impl Maint {
         self.z_leaves_raw =
             heads_left_raw(self.z_leaves_raw, &d, model.as_ref().map(|m| m.phi_raw));
         self.z_apply(&d, model.as_ref(), &input);
+        // The form installed is the form every read is served from, so its
+        // files' cold pages are asked for now and not a fault at a time
+        // under the reads (`Options::zpages_rewarm_at_install`).
+        if self.opts.zpages_rewarm_at_install && matches!(d.event, Some(zselect::Event::Install)) {
+            self.z_rewarm_due = true;
+            self.z_rewarm_whole = true;
+        }
         self.z_drive(&d);
     }
 
@@ -45617,6 +46297,7 @@ impl Maint {
         let store_all = self.opts.zpages_store_all;
         let raw_tails = self.opts.zpages_raw_tails;
         let parse = self.opts.zpages_parse;
+        let parse_chains = self.opts.zpages_parse_chains;
         let own_decode = self.opts.zpages_own_decoder;
         // Where the selector chooses the coding, the raw-tail record coding
         // is sized beside the options' (`zselect::choose_coding`).
@@ -45627,6 +46308,7 @@ impl Maint {
                 store_all: false,
                 raw_tails: true,
                 parse,
+                parse_chains,
                 own_decode,
             },
         );
@@ -45659,6 +46341,7 @@ impl Maint {
                             store_all,
                             raw_tails,
                             parse,
+                            parse_chains,
                             own_decode,
                         });
                         let r2 = second.map(take);
@@ -46722,6 +47405,7 @@ impl Maint {
         plan.store_all = self.opts.zpages_store_all;
         plan.raw_tails = raw_tails;
         plan.parse = self.opts.zpages_parse && self.opts.zpages_parse_finish;
+        plan.parse_chains = self.opts.zpages_parse_chains;
         plan.own_decode = self.opts.zpages_own_decoder;
         plan.hold = Some(self.shared.zbuild_hold.clone());
         Some(std::sync::Arc::new(ZFinish {
@@ -47490,7 +48174,8 @@ impl Maint {
                     self.opts.zpages_inplace_walk,
                     z_drop_now(&self.opts, &self.shared),
                     self.opts.z_times_decodes(),
-                    zpages::Dec::of(self.opts.zpages_own_decoder, self.opts.zpages_flat_decode),
+                    zpages::Dec::of(self.opts.zpages_own_decoder, self.opts.zpages_flat_decode)
+                        .with_slack(self.opts.zpages_flat_slack),
                     self.opts.zpages_cursor_view,
                     self.opts.zpages_group_ahead,
                     self.opts.zpages_walk_owns_decodes,
@@ -47652,6 +48337,13 @@ impl Maint {
                 .insert(zfile::zpg_name(id, end), raw_tails);
         }
         plan.parse = self.opts.zpages_parse || reparse;
+        // A re-parse is the shipped lazy parse whatever the builds' search,
+        // since it is bought for the decode alone.
+        plan.parse_chains = if reparse {
+            0
+        } else {
+            self.opts.zpages_parse_chains
+        };
         plan.own_decode = self.opts.zpages_own_decoder;
         if raw_tails {
             zfile::ZEvents::add(&ev.builds_raw_tails, 1);
@@ -47834,6 +48526,7 @@ impl Maint {
                         side.time_decodes = self.opts.z_times_decodes();
                         side.own_decoder = self.opts.zpages_own_decoder;
                         side.flat_decoder = self.opts.zpages_flat_decode;
+                        side.flat_slack = self.opts.zpages_flat_slack;
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
                         side.walk_owns = self.opts.zpages_walk_owns_decodes;
@@ -47885,6 +48578,7 @@ impl Maint {
                         side.time_decodes = self.opts.z_times_decodes();
                         side.own_decoder = self.opts.zpages_own_decoder;
                         side.flat_decoder = self.opts.zpages_flat_decode;
+                        side.flat_slack = self.opts.zpages_flat_slack;
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
                         side.walk_owns = self.opts.zpages_walk_owns_decodes;
@@ -47963,6 +48657,7 @@ impl Maint {
                             side.time_decodes = self.opts.z_times_decodes();
                             side.own_decoder = self.opts.zpages_own_decoder;
                             side.flat_decoder = self.opts.zpages_flat_decode;
+                            side.flat_slack = self.opts.zpages_flat_slack;
                             side.cursor_view = self.opts.zpages_cursor_view;
                             side.group_ahead = self.opts.zpages_group_ahead;
                             side.walk_owns = self.opts.zpages_walk_owns_decodes;

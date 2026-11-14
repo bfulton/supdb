@@ -210,6 +210,27 @@ fn ours_flat5(p: &Page, out: &mut [u8]) -> usize {
     ours_flat_on(supdb::db::zlz4::FlatIsa::Avx512, p, out)
 }
 
+/// The flat loop (AVX-512) with the room it runs to the group's end in
+/// (`zlz4::FLAT_SLACK`, `Options::zpages_flat_slack`), the engine's shape.
+fn ours_flat5_end(p: &Page, out: &mut [u8]) -> usize {
+    supdb::db::zlz4::decompress_in_flat_on(
+        supdb::db::zlz4::FlatIsa::Avx512,
+        &p.padded,
+        p.payload.len(),
+        &mut out[..p.ulen + supdb::db::zlz4::FLAT_SLACK],
+    )
+    .expect("the engine's own decoder, flat to the end")
+}
+
+#[inline(never)]
+fn decode_all_flat5_end(pages: &[Page], out: &mut [u8]) -> usize {
+    let mut n = 0;
+    for p in pages {
+        n += ours_flat5_end(black_box(p), out);
+    }
+    n
+}
+
 #[inline(never)]
 fn decode_all_flat(isa: supdb::db::zlz4::FlatIsa, pages: &[Page], out: &mut [u8]) -> usize {
     let mut n = 0;
@@ -774,8 +795,8 @@ fn main() {
         seqs as f64 / pages.len() as f64
     );
     let ulen_max = pages.iter().map(|p| p.ulen).max().unwrap();
-    let mut a = vec![0u8; ulen_max + supdb::db::zlz4::DECODE_SLACK];
-    let mut b = vec![0u8; ulen_max + supdb::db::zlz4::DECODE_SLACK];
+    let mut a = vec![0u8; ulen_max + supdb::db::zlz4::FLAT_SLACK];
+    let mut b = vec![0u8; ulen_max + supdb::db::zlz4::FLAT_SLACK];
 
     // Agreement first: both decoders, every group, byte for byte and in
     // length.
@@ -794,6 +815,7 @@ fn main() {
             ours_flat,
             ours_flat2,
             ours_flat5,
+            ours_flat5_end,
         ] {
             assert_eq!(
                 dec(p, &mut b),
@@ -829,10 +851,11 @@ fn main() {
     let (mut cyc_f, mut cyc_c) = (Vec::new(), Vec::new());
     let (mut cyc_o, mut cyc_r) = (Vec::new(), Vec::new());
     let (mut cyc_flat, mut cyc_flat2, mut cyc_flat5) = (Vec::new(), Vec::new(), Vec::new());
+    let mut cyc_flat5_end = Vec::new();
     for r in 0..rounds {
-        // The seven decoders in an order rotated a place each round.
-        for k in 0..7 {
-            let which = (k + r) % 7;
+        // The eight decoders in an order rotated a place each round.
+        for k in 0..8 {
+            let which = (k + r) % 8;
             let t = Instant::now();
             use supdb::db::zlz4::FlatIsa;
             let n = match which {
@@ -842,7 +865,8 @@ fn main() {
                 3 => decode_all_roomy(&pages, &mut a),
                 4 => decode_all_flat(FlatIsa::Base, &pages, &mut a),
                 5 => decode_all_flat(FlatIsa::Avx2, &pages, &mut a),
-                _ => decode_all_flat(FlatIsa::Avx512, &pages, &mut a),
+                6 => decode_all_flat(FlatIsa::Avx512, &pages, &mut a),
+                _ => decode_all_flat5_end(&pages, &mut a),
             };
             let d = t.elapsed().as_nanos() as f64 / pages.len() as f64;
             assert_eq!(n, total_u);
@@ -854,6 +878,7 @@ fn main() {
                 &mut cyc_flat,
                 &mut cyc_flat2,
                 &mut cyc_flat5,
+                &mut cyc_flat5_end,
             ][which]
                 .push(d);
         }
@@ -915,6 +940,7 @@ fn main() {
     let hot_flat = hot(&ours_flat, &mut a);
     let hot_flat2 = hot(&ours_flat2, &mut a);
     let hot_flat5 = hot(&ours_flat5, &mut a);
+    let hot_flat5_end = hot(&ours_flat5_end, &mut a);
     let bytes = total_u as f64 / pages.len() as f64;
     let (mf, mc) = (median(&mut cyc_f), median(&mut cyc_c));
     let (mo, mr) = (median(&mut cyc_o), median(&mut cyc_r));
@@ -922,6 +948,7 @@ fn main() {
         ("base", &mut cyc_flat, hot_flat),
         ("avx2", &mut cyc_flat2, hot_flat2),
         ("avx512", &mut cyc_flat5, hot_flat5),
+        ("avx512, to the end", &mut cyc_flat5_end, hot_flat5_end),
     ] {
         let m = median(cyc);
         println!(

@@ -109,6 +109,26 @@ impl Effort {
         sparse: false,
         greedy: false,
     };
+
+    /// The search a build asks for by its chain depth
+    /// (`Options::zpages_parse_chains`): zero the shipped lazy parse
+    /// ([`Effort::SHIPPED`]), else the greedy parse over `chains` positions
+    /// of each position's chain. Priced on the form's own groups
+    /// (`bench/examples/zdecode.rs`, `--rhc N:0:8:1:0:1`): at two and four
+    /// positions 0.93 and 0.91 of the greedy encoder's sequences in about
+    /// 2.1 and 2.2 times its encode, where the shipped parse writes 0.84 in
+    /// 4.2.
+    pub fn of_chains(chains: u32) -> Effort {
+        if chains == 0 {
+            Effort::SHIPPED
+        } else {
+            Effort {
+                attempts: chains,
+                greedy: true,
+                ..Effort::SHIPPED
+            }
+        }
+    }
 }
 
 /// The encoder's tables and scratch, kept across groups so that a group's
@@ -677,6 +697,16 @@ pub struct DecodeError;
 /// output cut at the decoded length leaves the last 64 bytes to the
 /// careful loop. The bytes written there are not the block's.
 pub const DECODE_SLACK: usize = 64;
+
+/// The output past a block's decoded end the flat loop runs to the block's
+/// end in (`Dec::FlatEnd`): a flat turn writes up to `FLAT_OUT` bytes
+/// from where it starts and the fast loop's `FAST_OUT` after it, so with
+/// `DECODE_SLACK` alone the flat loop stopped a turn's room short of the
+/// end and the block's last sequences went the fast loop's branchy way --
+/// a seventh of the decoder's time in a profile of the threaded scans at
+/// ten million keys under 1.25 GiB, for the last few dozen bytes of each
+/// group. The bytes written there are not the block's.
+pub const FLAT_SLACK: usize = FLAT_OUT + FAST_OUT;
 
 /// The input a fast turn may read from its token: the token, a move of
 /// sixteen literals, and an offset after fewer than fifteen of them, which
@@ -2030,7 +2060,12 @@ mod tests {
                     for tail in [0usize, 17, 18, 63, 64, 200] {
                         let mut src = b.clone();
                         src.extend((0..tail).map(|i| (i * 131 + 7) as u8));
-                        for room in [c.len(), c.len() + DECODE_SLACK, c.len() + 4096] {
+                        for room in [
+                            c.len(),
+                            c.len() + DECODE_SLACK,
+                            c.len() + FLAT_SLACK,
+                            c.len() + 4096,
+                        ] {
                             for flat in [false, true] {
                                 decodes_in_parts(flat, &src, b.len(), &c, room, step);
                             }
@@ -2147,6 +2182,7 @@ mod tests {
                         (*ulen, false),
                         (ulen + DECODE_SLACK, false),
                         (ulen + DECODE_SLACK, true),
+                        (ulen + FLAT_SLACK, true),
                         (ulen + 300, true),
                     ] {
                         let mut whole = vec![0u8; room];

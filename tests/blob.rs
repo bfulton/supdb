@@ -669,6 +669,43 @@ fn a_walk_over_a_compressed_block_decompresses_each_chunk_once() {
 }
 
 #[test]
+fn a_paced_walk_hands_out_what_the_plain_walk_does() {
+    // `scan_at_paced` asks for the records ahead of its walk and is
+    // otherwise `scan_at`: held to it at every seventh start, over the
+    // record shapes the fast loop takes and the ones it leaves to the
+    // general loop, at leads short of a record, longer than one, and past
+    // the record region's end.
+    for compact in [false, true] {
+        let path = scratch(if compact { "paced-compact" } else { "paced" });
+        build_opts(&path, 300, false, 256, compact);
+        let blob = Blob::open(MmapBytes::open(&path).expect("map")).expect("open");
+        let keys = blob.keys();
+        assert!(keys > 100);
+        for from in (0..=keys).step_by(7) {
+            for limit in [1usize, 5, 100, usize::MAX] {
+                let mut plain = Vec::new();
+                let n = blob
+                    .scan_at(from, limit, |k, v| plain.push((k.to_vec(), v.to_vec())))
+                    .expect("scan");
+                for lead in [0usize, 64, 1000, 1 << 20] {
+                    let mut paced = Vec::new();
+                    let m = blob
+                        .scan_at_paced(from, limit, lead, |k, v| {
+                            paced.push((k.to_vec(), v.to_vec()))
+                        })
+                        .expect("paced");
+                    assert_eq!(
+                        (m, &paced),
+                        (n, &plain),
+                        "compact={compact} from={from} limit={limit} lead={lead}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn a_scan_hands_out_the_bytes_read_all_does() {
     // Every scan test before this one counted: pairs, or values a key. A
     // fast path that walks the record region and returns the right NUMBER

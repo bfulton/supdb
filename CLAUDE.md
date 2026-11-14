@@ -1478,7 +1478,15 @@ on one line; the divider's latency is what it cost. The rule: in a
 loop measured in cycles an entry, read the assembly for the
 instructions whose cost is not their count -- a divide, a call through
 a pointer, a store the next load depends on -- and give the common
-shape a path without them.
+shape a path without them. It came again where the compact form's walk
+was given the raw walk's fast path: the check that a fixed run's length
+is a whole number of its values divided by the count, a sixteen-bit
+divide with its remainder tested at once, for a count that is one in
+the common record -- a twentieth of the threaded scan pass over the
+compact form at ten million keys under 1.25 GiB, every sample on the
+test after the divide (`perf annotate` of the scan threads' window, cut
+by `SUPDB_LAG_MARK`'s phase marks). A fast path copied from another walk
+is read for its divides again, since its guards came with it.
 
 **A value built a field at a time and handed back whole.** The scan
 snapshot's cursor, generalised to a base a frozen table, folded each
@@ -1945,9 +1953,20 @@ of a piece kept across a merge bet that a merge of four hundred thousand
 keys would outlast a seal of twenty, and the bet lost once under the
 gate's load, with a guard naming the case not reached; it holds the
 merge's landing now (`hold_merge_landing`) until the piece has published.
-The rule: a test that
+And as a builder: the test that a publish's builder has its forms
+installed by the next commit under the upkeep thread passed, in most
+runs, because the commit's fill built the blocks -- the builder had
+started at the seal's freeze, its forms were dropped as another
+generation's once the landing published, and the builder for the landed
+state started at the commit after the hand-over, installed only where
+its post beat the thread's pass, which it lost one run in sixty. The
+engine's counters printed at the assertion (`forms_events`) told the
+three shapes apart, and `settle` now starts and joins the builder for
+the state that stands under that arm. The rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
-thing it bets against gets faster.
+thing it bets against gets faster; and a test that passes is read for
+the path that passed it, since a fallback that does the same work
+passes it too.
 
 **A test whose answer was a function of the clock, or of a thread's
 turn.** The superblock records the second a segment finished in, in each
@@ -4930,6 +4949,29 @@ that drops between two rows is read against its own history on the row's
 host class before it is read as the engine's; and a measured room is a
 reading of a moment, so an ask that the next writer will take the room
 from is not made into it.
+
+**A key hashed by every source it was looked up in.** A point read
+consults the partition, each level-0 piece over its range, the frozen
+tables and the live one, and each hashed the key itself, the same FNV a
+byte and a multiply at a time, and only once the source before it had
+been read: the piece's filter probe, its fence and the hash in front of
+it were a fifth of the scrambled D mix's thread at a hundred and three
+hundred thousand keys, the whole of the gap to LMDB, because the
+scrambled write mixes leave a piece below the merge trigger and the
+unscrambled ones leave none. The read takes the index's FNV word once
+and every source's hash from it, and asks for each piece's filter block
+before it reads the partition (`Options::read_hash_once`,
+`Options::read_lines_ahead`). The first shape of the asks also asked for
+the partition's first slot on every read, an ask the lookup followed at
+once: callgrind over the read pass counted it at 44 instructions a read,
+and the pairing read the pass 0.94x for it while the mixes with a piece
+gained a fifth. The rules: a quantity every source derives from the key
+is derived once by the caller; an ask ahead is made only where there is
+work between it and the load it is for, and its instructions are counted
+on the path that has none; and a mix family that leaves a different
+store shape -- a piece standing, a frozen table -- is read for which
+sources its operations consult before its cells are compared with the
+family that leaves none.
 
 ## Standing limitations
 
