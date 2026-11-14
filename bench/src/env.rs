@@ -78,10 +78,10 @@ pub fn ram_backed_device(path: &std::path::Path) -> Option<String> {
 /// The kernel files a device-mapper volume and an md array as virtual
 /// too, and those are the devices under them, which their `slaves`
 /// directory names. The first version asked for the virtual link alone,
-/// and a hosted runner whose work disk was an LVM volume (`dm-0`) was
-/// refused as RAM-backed: the test that runs a pass in a process of its
-/// own failed on it with the engine and the suite unchanged, where the
-/// same job on the runner beside it passed.
+/// and a hosted runner whose work disk was a device-mapper volume
+/// (`dm-0`) was refused as RAM-backed: the test that runs a pass in a
+/// process of its own failed on it with the engine and the suite
+/// unchanged, where the same job on the runner beside it passed.
 fn virtual_block_device(sys_block: &std::path::Path, dev: &str) -> bool {
     no_disk_under(&sys_block.join(dev), 0)
 }
@@ -170,9 +170,15 @@ mod tests {
         symlink("../../zram0", virt.join("dm-3/slaves/zram0")).unwrap();
         assert!(!virtual_block_device(&block, "vda"));
         assert!(virtual_block_device(&block, "zram0"));
-        assert!(!virtual_block_device(&block, "dm-0"), "a volume over a disk");
+        assert!(
+            !virtual_block_device(&block, "dm-0"),
+            "a volume over a disk"
+        );
         assert!(virtual_block_device(&block, "dm-1"), "a volume over zram");
-        assert!(!virtual_block_device(&block, "dm-2"), "a volume over a volume");
+        assert!(
+            !virtual_block_device(&block, "dm-2"),
+            "a volume over a volume"
+        );
         assert!(virtual_block_device(&block, "dm-3"), "a volume over both");
         let _ = std::fs::remove_dir_all(&root);
     }

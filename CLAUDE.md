@@ -5064,6 +5064,47 @@ ascending run of inserts into an empty table opens a direct run, whose close
 drops every block table, which read as the form being dropped until a
 backtrace on its drop named `close_direct`.
 
+**A recovery that made again what it had been left, and that nobody had
+timed.** The open made a piece of a run a killed writer left by reading
+the run's file whole, copying every key and every value out of it into
+vectors of their own, feeding each back through a segment writer into a
+new file, syncing that and removing the old one, and then opened the
+piece and walked its records again for a Bloom. The log beside it was
+read whole into a buffer before a frame of it was parsed, and the store's
+greatest key was found by a walk of the table the replay had just filled.
+Nothing was wrong, and the open of a store of three hundred thousand keys
+took a fifth of a second: the suite had opened no store until the
+recovery workloads, their first rows read supdb's open of an ordered
+load level with RocksDB's replay of its log and two hundred times
+LMDB's, which recovers nothing, and were read as what a recovery costs,
+and the profile of one open was taken only when somebody asked what
+there was to do while a pull request waited (`bench/examples/reopen.rs`; the counts are
+in `docs/engine.md`, crash injection). A third of the ordered open's
+instructions were the allocator's and most of the rest the second
+writing of bytes the file already held in the form a segment keeps them.
+The open finishes the run's file where it lies now, by the finish its
+close would have run (`SegmentWriter::resume_run`), over a walk that
+keeps offsets and copies nothing; the log is parsed through a mapping,
+and the greatest key kept as the records go by. A recovery that edits
+the file it recovers has crash windows the file never had, since an open
+cut short leaves the writer's file with part of an index, or whole, or
+linked, or named: `tests/runlog.rs` builds each, and holds the finished
+piece to the segment a clean close of the same commits makes, byte for
+byte. One line written beside the change was a hazard: a removal of
+whatever stood under the piece's name before the link, against a stale
+name an earlier open might have left. A mutant without it passed every
+test, and reading for a state that reaches it found the open's sweep of
+unnamed files ahead of it -- so the only file that could stand there was
+one the manifest names, and the removal would have unlinked it. The
+rules: a recovery path is a path, profiled when a workload first takes
+it and never excused as rare or as the design's price; in one, look
+first for work that reproduces what is already on disk in the form the
+format keeps; a recovery that writes into what it recovers is tested at
+each of its own crash windows, built from the states before and after
+it; and a defensive step that no test can reach is read for what it
+would do in the state that could reach it, before it is kept as
+harmless.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

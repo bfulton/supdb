@@ -618,6 +618,25 @@ crash may take and what a process's may -- and a group is matched on
 each one a user could mean, by a workload that kills something, since
 an axis nobody tested is matched by assumption.
 
+**A device filed as virtual that was a disk's.** `run` refuses a
+RAM-backed device under its stores, and asked whether the device's entry
+in sysfs lies under the kernel's virtual devices, where zram, brd and
+loop devices are filed. A device-mapper volume and an md array are filed
+there too, and are the disks under them. A hosted x86 runner whose work
+disk was a device-mapper volume (`dm-0`) was refused as RAM-backed, and
+`tests/fresh_process.rs` failed there with the engine and the suite
+unchanged, in a job the ARM runner beside it passed. A mapped volume is
+judged by the devices its `slaves` directory names now, each link
+resolved before it is read, since a slave beside its volume is linked as
+`../../zram0` and names no directory on the way
+(`env::virtual_block_device`); the test builds sysfs's tree, a volume
+over a partition, over zram, over another volume and over both. The
+rule: a class read off where the kernel files a thing is held to
+everything else filed there, so the directory's other members are listed
+before its name is trusted; and a refusal that guards the series is run
+on the hosts the series' CI runs on, where the first one to differ finds
+it.
+
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`
