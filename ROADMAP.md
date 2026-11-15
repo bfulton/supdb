@@ -358,7 +358,7 @@ off (`docs/engine.md`, "Out of core: the second form").
 ## Security
 
 What a review of the store as something that parses bytes it did not
-write asked for, before encryption at rest was built. None is done.
+write asked for, before encryption at rest was built. One is begun.
 
 - [ ] **A threat model, written down.** A `SECURITY.md`: how to report,
   who is trusted (the embedding process and the live store's directory)
@@ -372,8 +372,16 @@ write asked for, before encryption at rest was built. None is done.
   `SparseBlob` and the wasm ABI exist to parse objects fetched from
   elsewhere, and a CRC stops an accident, not an author. The damage tests
   flip bytes, which the checksum refuses before any deeper check runs.
-  Done when a fuzz that recomputes the checksums over the segment's
-  sections holds every reader to an error or a defined answer.
+  The key section is done (`tests/forged.rs`): its header, hash slots,
+  directory and records changed and its row computed again, every reader
+  of `Blob` through a source that lends and one that copies, and
+  `SparseBlob`'s plans and walk, held to no panic and no read without
+  end; thirty thousand forgeries by hand, eighteen thousand of which
+  opened under their rows, broke none, and an unchecked slice put into
+  the record parser on purpose broke one in seventeen. Still to forge
+  under their own checksums: the block table, a block's chunks, and the
+  superblock's two slots; and the wasm ABI is not driven at all. Done
+  when each of those is, with a known-red run for each.
 - [ ] **The safe LZ4 decoder on the path an untrusted blob reaches.**
   `lz4_flex` is built without its checked decoder, and `src/block.rs`
   decodes blocks of a file the reader did not write. Priced with the suite
