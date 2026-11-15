@@ -1142,9 +1142,23 @@ profiling section names, built at the commit before and at this one. The
 first count read twenty-two instructions a point read more, and the
 annotation named `Blob::flat`, out of line where it had been inlined: one
 arm of the match it reads through built an error. With that arm out of
-line the count is five more in eight hundred and fifty, the one test of
-whether the store has a pager, where a read under a cipher leaves for a
-path of its own (`Reader::read_all_paged`), out of line. That path takes
+line the count is six more in eight hundred and fifty, and the two
+builds' instructions side by side say which (`--dump-instr=yes`, the
+addresses a read executes in each function disassembled and diffed). Four
+are the test of whether the store has a cache: the handle's shared state
+loaded, its pager loaded, a test and a branch, at the top of `read_all`,
+where a read under a cipher leaves for a path of its own
+(`Reader::read_all_paged`), out of line. Three are the key section's
+kind: `Sec` has a third, the section lent by the piece, its tag is a
+niche in a vector's capacity, and telling three apart is a constant, an
+exclusive or and a conditional move where telling two apart was a
+compare. The rest is the compiler's: two values more on the stack in the
+function that holds the read, which keeps the other path's arguments
+now, and three instructions fewer in the operation's end and the value's
+read. This sentence said five at first, and "the one test": the five was
+an earlier build's count and the attribution was never looked at, which
+is this file's rule about a per-key cost written down from a guess, and
+the first reader to ask what the five were found neither held. That path takes
 its callback as the plain one does, generic: handed it behind a pointer,
 to be compiled once, a scan paid twenty-five instructions an entry for
 the call. The same count under the cipher read 450 more than its twin in
