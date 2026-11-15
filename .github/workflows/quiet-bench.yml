@@ -42,7 +42,7 @@ jobs:
   pickup-watchdog:
     needs: [check]
     if: needs.check.outputs.runner == 'self-hosted'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Wait for a self-hosted runner to claim the run
         env:
@@ -83,7 +83,7 @@ jobs:
   require-quiet-machine:
     needs: [check]
     if: needs.check.outputs.runner != 'self-hosted'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Refuse to measure on a hosted runner
         env:

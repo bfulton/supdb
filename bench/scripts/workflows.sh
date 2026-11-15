@@ -13,13 +13,23 @@
 # start, and the only thing that would ever have said so was a dispatch on a
 # day the runner was down -- the day the watchdog is the thing you need.
 #
-# Two rules, then:
+# Three rules, then:
 #
 #   1. Every `run:` block parses as bash.
 #   2. No `run:` block contains a `${{ }}` expression. GitHub substitutes
 #      those into the script as text before the shell sees them, so a value
 #      carrying a quote ends the string it landed in and the rest of it runs.
 #      Pass values through `env:` and read them as variables.
+#   3. No job runs on `ubuntu-latest`. The label is whichever image GitHub
+#      says it is that week: it moved to Ubuntu 26.04 between two runs of one
+#      afternoon, where `scripts/libclang.sh` finds no libclang after
+#      installing it and `qemu-user-static` is no longer a package, and three
+#      jobs of `ci` failed in their set-up on a tree that had not changed.
+#      `ci` was given its image by name that day and the five workflows that
+#      run by hand or after a merge were left with the label, to fail the
+#      same way on the day somebody needed one. A Linux job names its image,
+#      and moving to a newer one is a change made in the workflow, with the
+#      scripts it needs. A comment may say the label; nothing else may.
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -81,9 +91,16 @@ for wf in ../.github/workflows/*.yml; do
       status=1
     fi
   done < "$work"/index
+
+  # The third rule, over the file's lines that are not comments.
+  if floating=$(grep -n 'ubuntu-latest' "$wf" | grep -v '^[0-9]*:[[:space:]]*#'); then
+    echo "$wf: a job runs on ubuntu-latest; name the image (ubuntu-24.04)" >&2
+    echo "$floating" | sed 's/^/    /' >&2
+    status=1
+  fi
 done
 
 if [ "$status" -ne 0 ]; then
   exit 1
 fi
-echo "workflows: every run block parses, none interpolates ($total blocks)"
+echo "workflows: every run block parses, none interpolates ($total blocks); every Linux job names its image"
