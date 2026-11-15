@@ -750,6 +750,72 @@ fn absent_keys_are_absent_through_the_form_file() {
 }
 
 #[test]
+fn the_filter_asked_ahead_turns_away_what_the_filter_asked_first_does() {
+    // Asked ahead of the fence (`Options::zpages_filter_ahead`), the
+    // filter turns away the same absent keys as the filter asked first,
+    // so every answer and every decode is the same; without a filter
+    // (`Options::zpages_point_filter` off) every answer is the same and
+    // the absent keys in range are found absent at their page, which
+    // decodes. The decode counts hold the order change to asking the
+    // filter at all: a path that skipped it would decode as the third does.
+    let n = 6000;
+    let mut decodes = Vec::new();
+    for (name, filter, ahead) in [
+        ("first", true, false),
+        ("ahead", true, true),
+        ("none", false, false),
+    ] {
+        let dir = scratch(&format!("filter-{name}"));
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.partition_bytes = Some(160 << 10);
+                o.zpages_point_filter = filter;
+                o.zpages_filter_ahead = ahead;
+            }),
+        )
+        .unwrap();
+        let model = ordered_load(&mut db, n, 0xF17E);
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert!(c.partitions >= 3 && c.form_files == c.partitions, "{c:?}");
+        // The absent keys first, one a group (fifty records apart, a
+        // group holds about fourteen), so none is answered from a group a
+        // read before it put in the memo; then the present keys.
+        let mut absent: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"a".to_vec(),
+            b"zzz".to_vec(),
+            format!("key-{:08}", n * 3 + 1).into_bytes(),
+        ];
+        absent.extend(
+            (0..n)
+                .step_by(50)
+                .map(|i| format!("key-{:08}", i * 3 + 1).into_bytes()),
+        );
+        assert!(absent.iter().all(|k| !model.contains_key(k)));
+        let present: Vec<Vec<u8>> = (25..n).step_by(50).map(spaced_key).collect();
+        let before = db.zpage_counts();
+        check(&db, &model, &absent, name);
+        let after = db.zpage_counts();
+        decodes.push(after.decodes - before.decodes);
+        check(&db, &model, &present, name);
+        let after = db.zpage_counts();
+        assert_eq!(after.rawserves + after.fallbacks, 0, "{name}: {after:?}");
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert_eq!(
+        decodes[0], decodes[1],
+        "{decodes:?}: the same keys turned away"
+    );
+    assert!(
+        decodes[2] > decodes[0],
+        "{decodes:?}: the filter turns keys away"
+    );
+}
+
+#[test]
 fn a_run_of_every_shape_reads_the_same() {
     // One value, two, seventeen, two hundred and fifteen hundred; a fixed
     // width and a prefixed run; zero-length values; a key deleted, and a key
