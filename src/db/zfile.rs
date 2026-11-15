@@ -2707,7 +2707,7 @@ impl ZFile {
                 // for exactly them. One that stops short is the raw form's
                 // own damage, which the caller's raw walk meets again and
                 // names.
-                let n = raw.scan_at(rank, want, &mut *f)?;
+                let n = raw.scan_either(rank, want, f)?;
                 out.nopage += 1;
                 out.seen += n;
                 rank += n;

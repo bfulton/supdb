@@ -516,7 +516,11 @@ impl OrdIndex {
             "head {i} of an ordered index of {}",
             self.n
         );
-        0
+        let at = (HEADER + i * HEAD) as u64;
+        match self.map.slice_at(at, HEAD) {
+            Some(b) => u64::from_be_bytes(b.try_into().expect("eight bytes")),
+            None => 0,
+        }
     }
 
     /// Every key of one length no more than the prefix plus eight bytes,
@@ -666,8 +670,12 @@ impl OrdIndex {
 
     #[inline]
     fn head(&self, i: usize) -> u64 {
+        // Out of the mapping as it lies, by one range check: all of a
+        // mapped file, and nothing of a mapping read by the piece, whose
+        // heads are asked for out of line. Asked through `slice_at` for
+        // both, a seek over a mapped file paid an instruction a head.
         let at = HEADER + i * HEAD;
-        match self.map.slice_at(at as u64, HEAD) {
+        match self.map.as_slice().get(at..at + HEAD) {
             Some(b) => u64::from_be_bytes(b.try_into().expect("eight bytes")),
             None => self.head_absent(i),
         }

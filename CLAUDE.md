@@ -1121,8 +1121,8 @@ them. `Blob` borrowed its key section whole at every lookup and
 `flatindex` addressed into the borrow, which over a mapped file is the
 kernel's paging and over anything else is the section made present whole.
 A source now says that it lends by the piece (`Bytes::piecewise`); `Blob`
-holds such a source's sections by offset (`Sec::Pieces`); and
-`flatindex`'s readers take any `Sect`, the slice, over which they are the
+holds such a source's sections by their place and borrows none of them
+(`Blob::pieces`); and `flatindex`'s readers take any `Sect`, the slice, over which they are the
 code they were, or `Pieces`, each read of which is a `slice_at` of the
 range it wants. The record parsers are not generic and there is still one
 of each: a section by the piece hands them a window that holds the
@@ -1136,37 +1136,114 @@ is a `MmapBytes` whose lendable length is zero, so its every `slice_at`
 fails the bounds check a mapped file's passes and goes round by the pager
 (`slice_slow`), and nothing in `db.rs` knows which it holds.
 
-The plain store's price was counted, not assumed: `bench/examples/
-read_only.rs supdb 100000 1 n-none` under callgrind with the toggle the
-profiling section names, built at the commit before and at this one. The
-first count read twenty-two instructions a point read more, and the
-annotation named `Blob::flat`, out of line where it had been inlined: one
-arm of the match it reads through built an error. With that arm out of
-line the count is six more in eight hundred and fifty, and the two
-builds' instructions side by side say which (`--dump-instr=yes`, the
-addresses a read executes in each function disassembled and diffed). Four
-are the test of whether the store has a cache: the handle's shared state
-loaded, its pager loaded, a test and a branch, at the top of `read_all`,
-where a read under a cipher leaves for a path of its own
-(`Reader::read_all_paged`), out of line. Three are the key section's
-kind: `Sec` has a third, the section lent by the piece, its tag is a
-niche in a vector's capacity, and telling three apart is a constant, an
-exclusive or and a conditional move where telling two apart was a
-compare. The rest is the compiler's: two values more on the stack in the
-function that holds the read, which keeps the other path's arguments
-now, and three instructions fewer in the operation's end and the value's
-read. This sentence said five at first, and "the one test": the five was
-an earlier build's count and the attribution was never looked at, which
-is this file's rule about a per-key cost written down from a guess, and
-the first reader to ask what the five were found neither held. That path takes
-its callback as the plain one does, generic: handed it behind a pointer,
-to be compiled once, a scan paid twenty-five instructions an entry for
-the call. The same count under the cipher read 450 more than its twin in
-the clear and then 230: a page-size `sysconf` on every read, inside the
+The plain store's price was counted, and for a commit it was called
+small where it had to be nothing. The first count read twenty-two
+instructions a point read more, `Blob::flat` out of line where it had
+been inlined; then six in eight hundred and fifty, written here as the
+feature's price with their attribution -- four for a test of whether the
+store has a cache at the top of `read_all`, three for a third kind of
+`Sec` -- beside eighty-eight a scan, a count and a test a key of every
+merge, a counter raised and lowered at every write, and a call a block
+of every builder's look. Six is under what any pairing resolves, which
+is how it was let stand, and it was every store without a cipher paying
+for one. A store in the clear pays nothing an operation now, and the
+count is what holds that: `bench/examples/read_only.rs supdb 100000 1
+n-none` and `lag0_probe.rs supdb 100000 1` under callgrind with the
+toggles the profiling section names, `work_probe.rs 100000 whole` for a
+writer's whole round and `merge_walk.rs 100000 4 1` for a merge, each
+built at `origin/main` from this tree's example sources and at the tree,
+and read by function (`callgrind_annotate`, the functions' own
+instructions side by side), never by the total alone. They read under
+the main line's: the point read seventeen instructions of 848, the scan
+fifty-five a scan of a hundred entries, the round 1.3%, the merge 4.4%.
+What it took, each a shape:
+
+The question rides a test the operation already makes. Every read looks
+at two bytes of its handle at its start and its end, for the compact
+form's census; the cipher's bit is in both (`ATTN_PAGED`, set where the
+handle is made), so a store under none makes the tests it made, and what
+a read under one does there -- the wait for a cache far past its budget,
+a snapshot's word, the failure its answer is replaced by (`paged_begin`,
+`end_slow`) -- is behind them and out of line. The end's look is made
+with the answer in hand (`Entered::finish`), and `leave` with no look in
+it is where the read came out ahead. Whether an operation is the
+writer's own is its depth (`WRITER_OP`), where it was a counter; a
+merge's rests are a type (`MergeRest`, `NoRest` for a plain store, which
+compiles to no step counted); the forms' word for "nobody has asked"
+is another under a cipher (`REST_HERE`), and the builder ahead's stop
+word has a third value (`AHEAD_REST`), so the one compare each look
+made sends a store under a cipher to its rest and a plain store on.
+
+The reader's kind is found in the refusal. `Sec` is two kinds again: a
+section of a source that lends by the piece is held by its place, as a
+lent one is, and `Bytes::lend_at` refuses it whole -- for the mapped
+file, by the bound check it always made, against a lendable length of
+zero -- so `Blob::flat` is the function it was and the reader by the
+piece is where it answers `None`. A scan's walk refuses such a source
+before it walks (`Blob::scan_whole`), and the engine takes the walk by
+the piece up in the branch a failed walk takes anyway (`scan_either`);
+`Blob::scan_at`, the caller's, asks the kind only of a type whose values
+can be of it in a caller's hands (`Bytes::ASK_PIECES`).
+
+Naming the second walk inside the first cost the first. `return
+self.scan_pieces(..)` on a branch no plain scan takes was three to four
+instructions an entry of the fixed loop, the callback handed on by
+value, by `&mut` or inside a closure alike; an arm by the piece moved
+behind a closure in every reader (`by_piece(move || ..)`) cost the walk
+of the unsealed keys two an entry and the point read seven. What the
+compiler does with a callback that has a second taker is not something
+a branch's coldness undoes, and the count of each shape was the only
+way to know: six shapes of `scan_at` were built and counted before one
+read level.
+
+And a count that moved by one in a function nobody touched was worth
+the look. `emit_unsealed`, whose source and whose callees' sources were
+the main line's, read one to two instructions an entry over it in every
+build, block placement and a spill, moving with each unrelated change.
+The function held a `RefCell` borrow of the snapshot's stale list from
+its first line to its last, across the caller's callback: taken for the
+one look it is for, the walk of the unsealed keys is sixteen
+instructions an entry under the main line, and a callback that reads
+through the handle no longer runs under a borrow of the handle's state.
+
+What a plain store is still asked is where something is made or waited
+for, never in an operation's path a key, an entry, a block or a step: a
+handle made (`paged_bits`), a snapshot taken or released, a file
+operation (the `vault::` door's counter), a wait on the device or
+another thread (`unlent`, `unlend`), a merge's start and its end
+(`vault::hold`, `check`), a fill's start (`look_mask`). Each is a load
+and a branch beside a syscall, a thread's park or a pass.
+
+Seventeen mutants of the new paths, four of which outlived the tests
+there were: a fill that looks every sixty-four blocks under a cipher,
+which only a store of wide values could tell from one that looks at
+each; the forms' word left the plain one after the forms were given up;
+the writer's own fill not resting, which no test ran, since the
+builders' test filed its burst on the store's thread; and a read that
+does not wait for a cache far past its budget, which had no test since
+the wait was written. Each has one now, and a snapshot under a cipher
+has its first: nothing had read through one, and four of the seventeen
+were its. The last of those tests hung under its own mutant where it
+should have failed, a reader parked in a callback and the failure path
+holding the end that lets it go, so the test moves that end into the
+scope it can fail in. And the tests that hold a cache to its budget run
+one at a time (`one_at_a_time`): four of them at once on four cores
+were each other's stalls, and the larger store's peak read 3% over its
+bound in one run of the file, with nothing of the engine's changed.
+
+The rules: a cost with the option off is nothing or it is a cost, and
+"under what a pairing resolves" is not nothing -- it is counted, by
+function, against the commit before the option existed; a question a
+path must ask is put where the path already asks one; a branch that
+names a second callee for a callback is priced on the first callee's
+loop; and a function whose count moved with no change to its source is
+read for what it keeps live before the move is called the compiler's;
+and a test that parks a thread lets it go on its own failure, or a red
+run of it is a hung one.
+The same count under the cipher read 450 more than its twin in the
+clear and then 230: a page-size `sysconf` on every read, inside the
 test of whether the cache is crowded, and a divide by a field where the
-divisor is a constant. The rule is this file's already: a path "behind a
-flag" is counted with the flag off before it is called free, and with it
-on before it is called cheap.
+divisor is a constant.
 
 The cache (`src/db/pager.rs`) is a file as a shared mapping of a memory
 file its plaintext's length, a state a chunk, and the envelope the chunks
@@ -1440,21 +1517,33 @@ with the threaded passes unresolved; the scan passes at 0.89-0.94x and
 0.80-0.90x threaded; the lag sweep's scans at 0.84-0.86x over the drained
 store, 0.65-0.80x after the one- and the ten-percent burst and 0.80-0.82x
 after the full rewrite; the threaded scan mix at 0.78-0.87x; E at
-0.83-0.90x; and the other mixes level or unresolved. The count named the point read's share: 229 instructions
-over its twin's 841 (`bench/examples/read_only.rs supdb-cipher 100000 1
-n-none` beside `supdb-cipherbase`, the toggle as above), spread over the
-asks -- each a call through the source's pointer and a load of a chunk's
-state -- the window a record is parsed in, the look at whether the cache
-is crowded and the look at whether a read failed, with no one of them a
-fifth of it. The scans were at 0.25-0.45x of the twin before they were
+0.83-0.90x; and the other mixes level or unresolved. The count named
+the point read's share: 229 instructions over its twin's 841
+(`bench/examples/read_only.rs supdb-cipher 100000 1 n-none` beside
+`supdb-cipherbase`, the toggle as above), spread over the asks -- each a
+call through the source's pointer and a load of a chunk's state -- the
+window a record is parsed in, the look at whether the cache is crowded
+and the look at whether a read failed, with no one of them a fifth of
+it. It is 339 over a twin of 818 since the plain store was made to pay
+nothing: what a read under a cipher does at its start and its end is
+two calls out of line where it was one wrapper, and its first ask is
+for the section whole, refused with an error made and dropped
+(`not_lent`), ninety-five instructions of it in all. Two cheaper shapes
+of each were counted and each cost the plain read three or four
+instructions -- the end's look answered as a verdict and the answer
+replaced in line, and `Blob::flat` asking through an `Option` -- so
+they stay as they are, and the read under a cipher is an open item in
+`ROADMAP.md`. The scans were at 0.25-0.45x of the twin before they were
 given a window of their own: a scan by the piece asked for each record's
 key, its extents and its values apiece, and it asks for sixty-four
 records' span at once now and walks the window with the loop a slice is
-walked by (`Blob::scan_windows`, `walk_fixed!`). The window's loop had to
+walked by (`Blob::scan_pieces`, `walk_fixed!`). The window's loop had to
 be a function out of line: written into `scan_at` beside the slice's, it
 cost the plain scan five instructions an entry, by what the optimizer
-then left out of line, and out of it the plain scan counts 0.7% over the
-commit before. What reads by the rank still asks by the record -- the
+then left out of line, and named there as a function to call it cost
+three to four, which is why the plain walk refuses the source and the
+engine takes the other up (the plain store's price, above). What reads
+by the rank still asks by the record -- the
 sparse forms' walks, the merge path, the cursor -- and that is the
 bursts' cells and E, and an open item in `ROADMAP.md`.
 

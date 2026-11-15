@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use supdb::{Db, Encryption, Options, StoreCipher};
+use supdb::{Db, Encryption, Options, StoreCipher, Upkeep};
 
 mod common;
 use common::{kv, vf, Gcm};
@@ -42,6 +42,19 @@ fn small() -> Options {
         l0_trigger: 2,
         ..Options::default()
     }
+}
+
+/// One at a time, for the tests that hold a cache to its budget and a
+/// slack: what the cache holds past its budget is what its readers read
+/// while the thread that gives back was off its core, and four of these
+/// at once on four cores are each other's reason for that. Alone the
+/// larger store's peak sat under its bound in every run, and with three
+/// more of its kind beside it, 3% over in one.
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static QUIET: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    QUIET
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -357,6 +370,7 @@ fn stored_bytes(dir: &Path) -> u64 {
 /// for none of its files.
 #[test]
 fn a_store_larger_than_its_cache_reads_as_itself_within_it() {
+    let _quiet = one_at_a_time();
     let n = 150_000;
     let cache: u64 = 2 << 20;
     let opts = || Options {
@@ -493,6 +507,212 @@ fn a_store_larger_than_its_cache_reads_as_itself_within_it() {
     );
 }
 
+/// A snapshot under a cipher holds a state and nothing of the cache. Its
+/// handle is pinned for the snapshot's life, and the cache of plaintext
+/// gives nothing back that a pinned reader could have been lent, so the
+/// handle says at each read from where it holds anything and at each
+/// read's end that it holds nothing: with a snapshot standing, unread and
+/// then between its reads, the store read through by its writer turns the
+/// cache over within its budget. The snapshot reads the store as it was,
+/// by the key and in one scan of the whole of it, several times its
+/// cache; released, the handle reads the store as it is.
+#[test]
+fn a_snapshot_under_a_cipher_holds_its_state_and_none_of_the_cache() {
+    let _quiet = one_at_a_time();
+    let n = 100_000;
+    let cache: u64 = 2 << 20;
+    let slack: u64 = 8 << 20;
+    let dir = scratch("snapshot");
+    let mut db = Db::create(
+        &dir,
+        Options {
+            encryption: Encryption::Cipher(cipher(11).cache_bytes(cache)),
+            ..small()
+        },
+    )
+    .unwrap();
+    fill(&mut db, n);
+    let size = stored_bytes(&dir);
+    assert!(
+        size > 4 * cache,
+        "the store is {size} bytes, not several times its cache of {cache}"
+    );
+    // The store read through by the writer, and the cache back within its
+    // budget after: it gave back since `before`, and never held more than
+    // a read in flight is lent beyond the budget.
+    let through = |db: &Db, what: &str| {
+        let before = db.cipher_counts().unwrap().cache.evicted_units;
+        let mut seen = 0u32;
+        db.scan(b"", usize::MAX, kv(&mut |_k, _v| seen += 1))
+            .unwrap();
+        assert_eq!(seen, n, "{what}");
+        let t = std::time::Instant::now();
+        let c = loop {
+            let c = db.cipher_counts().unwrap().cache;
+            if c.held <= c.budget {
+                break c;
+            }
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(20),
+                "{what}: the cache stayed over its budget with nothing reading: {c:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!(
+            c.evicted_units > before,
+            "{what}: nothing was given back: {c:?}"
+        );
+        assert!(
+            c.peak < cache + slack,
+            "{what}: the cache held {} bytes of a budget of {cache}: {c:?}",
+            c.peak
+        );
+    };
+    let was = |i: u32| v(i, u32::from((n - 1 - i).is_multiple_of(3)));
+    let snap = db.reader().unwrap();
+    snap.snapshot();
+    // Every other key rewritten past the snapshot, and the rewrite merged.
+    for i in (0..n).step_by(2) {
+        db.put(&k(i), &v(i, 5));
+        if i % 1000 == 0 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    through(&db, "with a snapshot standing unread");
+    // The snapshot's reads: the store as it was.
+    for i in (0..n).step_by(11) {
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        snap.read_all(&k(i), vf(&mut |x| got.push(x.to_vec())))
+            .unwrap();
+        assert_eq!(got, [was(i)], "key {i} through the snapshot");
+    }
+    let mut seen = 0u32;
+    let mut newer = 0u32;
+    snap.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |key, val| {
+            let i: u32 = std::str::from_utf8(&key[KEY_MARK.len()..])
+                .unwrap()
+                .parse()
+                .unwrap();
+            newer += u32::from(val != was(i).as_slice());
+            seen += 1;
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        (seen, newer),
+        (n, 0),
+        "the snapshot's scan of the whole store"
+    );
+    through(&db, "with a snapshot standing between its reads");
+    // Released: the store as it is, through the same handle.
+    snap.release();
+    for i in (0..n).step_by(13) {
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        snap.read_all(&k(i), vf(&mut |x| got.push(x.to_vec())))
+            .unwrap();
+        let want = if i % 2 == 0 { v(i, 5) } else { was(i) };
+        assert_eq!(got, [want], "key {i} after the release");
+    }
+    let mut seen = 0u32;
+    snap.scan(b"", usize::MAX, kv(&mut |_k, _v| seen += 1))
+        .unwrap();
+    assert_eq!(seen, n);
+    through(&db, "after the release");
+}
+
+/// A caller's read waits a little for a cache far past its budget, and
+/// then reads. The cache gives nothing back that a reader pinned before
+/// could have been lent, so one reader parked inside its scan's callback
+/// holds the cache open, and reads from another handle fill it past any
+/// line: each of those waits a breath at its start, holding nothing, for
+/// the cache to come back, and goes on when it has not -- the wait is a
+/// brake and not a bound, since the reader it waits for may be the
+/// caller's own. Let go, the parked scan ends and the cache comes back to
+/// its budget.
+#[test]
+fn a_read_waits_a_breath_for_a_cache_far_past_its_budget() {
+    let _quiet = one_at_a_time();
+    let n = 150_000;
+    let cache: u64 = 2 << 20;
+    let dir = scratch("swamped");
+    let mut db = Db::create(
+        &dir,
+        Options {
+            encryption: Encryption::Cipher(cipher(13).cache_bytes(cache)),
+            ..small()
+        },
+    )
+    .unwrap();
+    fill(&mut db, n);
+    assert!(stored_bytes(&dir) > 6 * cache);
+    let parked = db.reader().unwrap();
+    let (inside, entered) = std::sync::mpsc::channel::<()>();
+    let (release, go) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let mut first = true;
+            parked
+                .scan(
+                    &k(0),
+                    2,
+                    kv(&mut |_k, _v| {
+                        if std::mem::take(&mut first) {
+                            inside.send(()).unwrap();
+                            // Until it is let go, or the test has failed
+                            // and dropped its end.
+                            let _ = go.recv();
+                        }
+                    }),
+                )
+                .unwrap();
+        });
+        // Moved in, so that a failure below lets the parked reader go.
+        let release = release;
+        entered.recv().unwrap();
+        let before = db.cipher_counts().unwrap().cache;
+        let mut read = 0u32;
+        for i in (0..n).step_by(3) {
+            let mut got: Vec<Vec<u8>> = Vec::new();
+            db.read_all(&k(i), vf(&mut |x| got.push(x.to_vec())))
+                .unwrap();
+            let round = u32::from((n - 1 - i).is_multiple_of(3));
+            assert_eq!(got, [v(i, round)], "key {i}");
+            read += 1;
+            if db.cipher_counts().unwrap().cache.breaths >= before.breaths + 3 {
+                break;
+            }
+        }
+        let c = db.cipher_counts().unwrap().cache;
+        assert!(
+            c.breaths > before.breaths,
+            "{read} reads beside a parked reader, and none waited: {c:?}"
+        );
+        assert!(
+            c.held > c.budget,
+            "the parked reader held nothing open: {c:?}"
+        );
+        release.send(()).unwrap();
+    });
+    let t = std::time::Instant::now();
+    loop {
+        let c = db.cipher_counts().unwrap().cache;
+        if c.held <= c.budget {
+            break;
+        }
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(20),
+            "the cache stayed over its budget with nothing reading: {c:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// The block cache's builders build through a cache the store does not
 /// fit. A burst over every block of a store several times its cache is
 /// filed into the block cache's forms by the store's own thread, block by
@@ -504,10 +724,52 @@ fn a_store_larger_than_its_cache_reads_as_itself_within_it() {
 /// walked it, built through the cache's misses.
 #[test]
 fn the_block_caches_builders_build_through_a_cache_the_store_does_not_fit() {
-    let n = 120_000u32;
+    builders_build_through_a_small_cache(Upkeep::default(), "builders", 120_000, 0, 8 << 20);
+}
+
+/// And with values of two kilobytes, where sixty-four keys are an eighth
+/// of a megabyte: the fill rests at every block under a cipher, where a
+/// plain store's looks are sixty-four blocks apart, since sixty-four of
+/// these blocks built between two rests are eight megabytes the cache
+/// could not give back, four times this one.
+#[test]
+fn the_builders_rest_at_every_block_of_a_store_of_wide_values() {
+    builders_build_through_a_small_cache(
+        Upkeep::default(),
+        "builders-wide",
+        12_000,
+        2_000,
+        4 << 20,
+    );
+}
+
+/// The same burst filed by the writer itself (`Upkeep::Inline`): the
+/// commit builds every block of the store inside its one operation, and
+/// rests between two as the store's thread does, since a commit that read
+/// the store under its one pin is the store held in the cache.
+#[test]
+fn the_writers_own_fill_builds_through_a_cache_the_store_does_not_fit() {
+    builders_build_through_a_small_cache(Upkeep::Inline, "builders-inline", 120_000, 0, 8 << 20);
+}
+
+/// `n` keys, each value `pad` bytes longer than `v`'s, and the cache held
+/// to its budget and `slack`.
+fn builders_build_through_a_small_cache(
+    upkeep: Upkeep,
+    name: &str,
+    n: u32,
+    pad: usize,
+    slack: u64,
+) {
+    let _quiet = one_at_a_time();
+    let inline = matches!(upkeep, Upkeep::Inline);
     let cache: u64 = 2 << 20;
-    let slack: u64 = 8 << 20;
-    let dir = scratch("builders");
+    let dir = scratch(name);
+    let v = |i: u32, round: u32| {
+        let mut x = v(i, round);
+        x.resize(x.len() + pad, b'w');
+        x
+    };
     // `sealing` off is a memtable that takes the whole burst: no seal at a
     // share of the store, and none for a store being read.
     let opts = |sealing: bool| Options {
@@ -515,6 +777,7 @@ fn the_block_caches_builders_build_through_a_cache_the_store_does_not_fit() {
         seal_bytes: if sealing { 256 << 10 } else { 64 << 20 },
         seal_max_pct: if sealing { small().seal_max_pct } else { 0 },
         seal_idle: sealing && small().seal_idle,
+        upkeep,
         ..small()
     };
     {
@@ -552,17 +815,26 @@ fn the_block_caches_builders_build_through_a_cache_the_store_does_not_fit() {
     for i in 0..n {
         db.append(&k(i), &v(i, 2));
     }
+    let before = db.blocks_built().1;
     db.commit().unwrap();
     db.settle().unwrap();
     let ev = db.forms_events();
     let blocks = u64::from(n) / 64;
     let c = db.cipher_counts().unwrap().cache;
-    assert!(
-        ev[0] + ev[10] >= blocks * 9 / 10,
-        "the store's own threads built {} forms and {} ahead for a burst over {blocks} blocks: {c:?}",
-        ev[0],
-        ev[10]
-    );
+    if inline {
+        let built = db.blocks_built().1 - before;
+        assert!(
+            built >= blocks * 9 / 10,
+            "the commit built {built} forms for a burst over {blocks} blocks: {c:?}"
+        );
+    } else {
+        assert!(
+            ev[0] + ev[10] >= blocks * 9 / 10,
+            "the store's own threads built {} forms and {} ahead for a burst over {blocks} blocks: {c:?}",
+            ev[0],
+            ev[10]
+        );
+    }
     assert!(c.evicted_units > 0, "nothing was given back: {c:?}");
     assert!(
         c.peak < cache + slack,

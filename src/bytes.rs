@@ -68,6 +68,21 @@ pub trait Bytes {
         None
     }
 
+    /// A section lent whole, for a reader that borrows it once and
+    /// addresses into it: `slice_at` for a source that lends whole, and
+    /// nothing for one that lends by the piece, where the borrow would be
+    /// the section made present whole. A reader asks this of its key
+    /// section at every lookup and goes by the piece where it is refused
+    /// (`flatindex::Pieces`), so for a mapped file it is the one range
+    /// check it always was.
+    #[inline]
+    fn lend_at(&self, off: u64, len: usize) -> Option<&[u8]> {
+        if self.piecewise() {
+            return None;
+        }
+        self.slice_at(off, len)
+    }
+
     /// Whether this source lends by the piece: `slice_at` answers, and what
     /// it lends is made present by the asking, so a reader asks for the
     /// bytes it is about to read and for no more. A reader over a source
@@ -79,6 +94,15 @@ pub trait Bytes {
     fn piecewise(&self) -> bool {
         false
     }
+
+    /// Whether a reader that has not been told has to ask `piecewise` of a
+    /// source of this type. Every type says yes but the mapped file, whose
+    /// kind that lends by the piece is made by the engine alone
+    /// (`MmapBytes::paged`) and read by it through the entry that finds
+    /// the kind out for nothing (`Blob::scan_either`): asked at
+    /// `Blob::scan_at`, the question was three instructions a scan of a
+    /// mapped file that no caller's mapped file can answer yes to.
+    const ASK_PIECES: bool = true;
 
     /// Where the piece holding `off` ends, for a source that lends by the
     /// piece: a reader that does not know how long the thing at `off` is
@@ -326,7 +350,7 @@ impl MmapBytes {
 
     /// A paged mapping: nothing of it is lent but through `pager`.
     #[doc(hidden)]
-    pub fn paged(pager: std::sync::Arc<dyn Paging>) -> MmapBytes {
+    pub(crate) fn paged(pager: std::sync::Arc<dyn Paging>) -> MmapBytes {
         MmapBytes {
             ptr: pager.base(),
             lend: 0,
@@ -427,9 +451,22 @@ impl Bytes for MmapBytes {
         // which `own` keeps for this value's life.
         Some(unsafe { std::slice::from_raw_parts(self.ptr.add(off as usize), len) })
     }
+    /// A paged mapping lends no byte without being asked for it, and its
+    /// lendable length is zero: the range check a mapped file passes is
+    /// the refusal, with no test of which kind this is.
+    #[inline]
+    fn lend_at(&self, off: u64, len: usize) -> Option<&[u8]> {
+        let end = off.checked_add(len as u64)?;
+        if end > self.lend {
+            return None;
+        }
+        // SAFETY: as `slice_at`.
+        Some(unsafe { std::slice::from_raw_parts(self.ptr.add(off as usize), len) })
+    }
     fn piecewise(&self) -> bool {
         matches!(self.own, Own::Paged(_))
     }
+    const ASK_PIECES: bool = false;
     fn piece_end(&self, off: u64) -> u64 {
         match &self.own {
             Own::Map(_) => off.saturating_add(4096).min(self.len),

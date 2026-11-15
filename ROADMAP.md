@@ -233,9 +233,13 @@ What an engine picker would hit, roughly in order.
   scan passes further, and furthest where a walk reads by the rank, which
   is the scans after a burst and the scan mix. The scan over a partition
   asks for a window of records at a time already. Done when the walks by
-  rank do too, and a point read asks once for each piece it touches.
-  `bench/scripts/pair.sh supdb-cipher supdb-cipherbase 300000` is the
-  pairing.
+  rank do too, a point read asks once for each piece it touches, and what
+  a read does at its start and its end under a cipher is a look and not
+  two calls. `bench/scripts/pair.sh supdb-cipher supdb-cipherbase 300000`
+  is the pairing, and `bench/examples/read_only.rs supdb-cipher 100000 1
+  n-none` under callgrind beside `supdb-cipherbase` the count; a shape
+  that takes an instruction from the read under a cipher is counted on
+  the plain read before it is kept.
 - [ ] **A store under a key, priced on a kernel with hardware AES.** The
   pairings of `supdb-dirkey` against `supdb` ran where the kernel has no
   AES instructions built in (`/proc/crypto` names `aes-fixed-time`): reads,
@@ -295,6 +299,42 @@ off (`docs/engine.md`, "Out of core: the second form").
   its flag). The in-core rows banked after it carry the controller
   under `supdb`, as the bounded rows do, and the first of each is a
   definition step banked on its controls (`bench/CLAUDE.md`).
+
+## Security
+
+What a review of the store as something that parses bytes it did not
+write asked for, before encryption at rest was built. None is done.
+
+- [ ] **A threat model, written down.** A `SECURITY.md`: how to report,
+  who is trusted (the embedding process and the live store's directory)
+  and who is not (keys and values through the API, any file handed to the
+  read-only readers or the wasm module), what counts as a vulnerability
+  and what does not, what an embedder has to do, and what the format
+  promises a reader that meets a file it does not understand. Two
+  decisions come first: the reporting channel, and whether `Db::open` on a
+  store copied from elsewhere is in scope.
+- [ ] **The read-only parsers fuzzed behind a valid checksum.** `Blob`,
+  `SparseBlob` and the wasm ABI exist to parse objects fetched from
+  elsewhere, and a CRC stops an accident, not an author. The damage tests
+  flip bytes, which the checksum refuses before any deeper check runs.
+  Done when a fuzz that recomputes the checksums over the segment's
+  sections holds every reader to an error or a defined answer.
+- [ ] **The safe LZ4 decoder on the path an untrusted blob reaches.**
+  `lz4_flex` is built without its checked decoder, and `src/block.rs`
+  decodes blocks of a file the reader did not write. Priced with the suite
+  first, since it costs decode speed.
+- [ ] **No key or value can panic or stall the store, as a contract.** The
+  differential fuzz found the empty key and the long common prefix; the
+  guarantee is not stated, and the fuzz is what would hold it. Done when
+  it is stated and the fuzz draws from the whole of the key and value
+  space under it.
+- [ ] **One writer a directory.** A process lock and a store format
+  version, written and waiting in pull request #21.
+- [ ] **Said, not fixed:** the index hash is unkeyed, so a caller's own
+  users can choose keys that collide; a published blob is replaced by
+  rename and never rewritten in place, since a reader's mapping of a file
+  truncated under it is a fault and not an error; and the browser's
+  credentials for object storage are short-lived and read-only.
 
 ## Housekeeping
 

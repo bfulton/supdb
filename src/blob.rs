@@ -480,14 +480,16 @@ const SCAN_WINDOW_BYTES: usize = 4 << 20;
 enum Sec {
     Lent { off: u64, len: usize },
     Owned(Vec<u8>, u64),
-    Pieces { off: u64, len: usize },
 }
 
 impl Sec {
     fn read<B: Bytes>(src: &B, off: u64, len: usize) -> Result<Sec> {
+        // A source that lends by the piece holds the section by its place,
+        // as one that lends whole does, and is asked for none of it here:
+        // which of the two it is, its `lend_at` says at each borrow.
         if src.piecewise() {
             return match off.checked_add(len as u64) {
-                Some(end) if end <= src.len() => Ok(Sec::Pieces { off, len }),
+                Some(end) if end <= src.len() => Ok(Sec::Lent { off, len }),
                 _ => Err(short(off, len, src.len())),
             };
         }
@@ -502,24 +504,9 @@ impl Sec {
     fn get<'a, B: Bytes>(&'a self, src: &'a B) -> Result<&'a [u8]> {
         match self {
             Sec::Lent { off, len } => src
-                .slice_at(*off, *len)
-                .ok_or_else(|| short(*off, *len, src.len())),
+                .lend_at(*off, *len)
+                .ok_or_else(|| not_lent(src, *off, *len)),
             Sec::Owned(v, _) => Ok(v),
-            Sec::Pieces { .. } => Err(by_the_piece()),
-        }
-    }
-
-    /// The section whole, where the reader holds it so: `get` with no
-    /// error made for the reader that does not, which every lookup asks
-    /// through (`Blob::flat`) and which, with an error built in one of its
-    /// arms, the compiler stopped inlining there -- twenty-nine
-    /// instructions a point read for a call that had been none.
-    #[inline(always)]
-    fn lent<'a, B: Bytes>(&'a self, src: &'a B) -> Option<&'a [u8]> {
-        match self {
-            Sec::Lent { off, len } => src.slice_at(*off, *len),
-            Sec::Owned(v, _) => Some(v),
-            Sec::Pieces { .. } => None,
         }
     }
 
@@ -527,14 +514,14 @@ impl Sec {
     /// so.
     fn pieces<'a, B: Bytes>(&self, src: &'a B) -> Option<Pieces<'a, B>> {
         match self {
-            Sec::Pieces { off, len } => Some(Pieces::new(src, *off, *len)),
+            Sec::Lent { off, len } if src.piecewise() => Some(Pieces::new(src, *off, *len)),
             _ => None,
         }
     }
 
     fn off(&self) -> u64 {
         match self {
-            Sec::Lent { off, .. } | Sec::Pieces { off, .. } => *off,
+            Sec::Lent { off, .. } => *off,
             Sec::Owned(v, off) => {
                 let _ = v;
                 *off
@@ -544,21 +531,32 @@ impl Sec {
 
     fn len(&self) -> usize {
         match self {
-            Sec::Lent { len, .. } | Sec::Pieces { len, .. } => *len,
+            Sec::Lent { len, .. } => *len,
             Sec::Owned(v, _) => v.len(),
         }
     }
 }
 
-/// What `Sec::get` answers for a section held by the piece: made out of
-/// line, since the arm that makes it is on no read's path.
+/// What `scan_at` answers over a source that lends by the piece.
 #[cold]
 #[inline(never)]
 fn by_the_piece() -> Error {
-    Error::new(
-        ErrorKind::Unsupported,
-        "a section held by the piece is not borrowed whole",
-    )
+    Error::from(ErrorKind::Unsupported)
+}
+
+/// What `Sec::get` answers for a section its source did not lend whole:
+/// one that lends by the piece, or a range past the source's end. Made
+/// out of line, since the arm that makes it is on no read's path.
+#[cold]
+#[inline(never)]
+fn not_lent<B: Bytes>(src: &B, off: u64, len: usize) -> Error {
+    // No message: a reader by the piece is answered this at every lookup,
+    // which asks for the section whole first (`Blob::flat`), and an error
+    // with one is an allocation.
+    if src.piecewise() {
+        return Error::from(ErrorKind::Unsupported);
+    }
+    short(off, len, src.len())
 }
 
 /// Everything `Blob::open` and `SparseBlob::open` check before either reads
@@ -873,6 +871,66 @@ macro_rules! walk_fixed {
     };
 }
 
+/// The values of one record, each handed to `$f` with the record's key
+/// `$k`: the body of a scan's general walk, which reads a record of any
+/// shape -- an inline run out of the record's tail, a run in a block lent
+/// in place and kept in `$cached` for the keys after it, and anything else
+/// through the extent's reader. A macro, since two walks have it: the one
+/// over a key section held whole and the one over a section lent by the
+/// piece (`Blob::scan_pieces`), which is a function of its own so that the
+/// first is what it was.
+macro_rules! emit_record {
+    ($self:ident, $f:ident, $cached:ident, $k:ident, $exts:ident, $tail:ident) => {
+        for e in $exts.iter() {
+            // An inline run is right here in the record the walk is
+            // already on: no block, no cache, no fetch.
+            if e.is_inline() {
+                $self.with_run(*e, $tail, |run| {
+                    crate::index::each_value(run, e, &mut |v| $f($k, v)).map_err(corrupt)
+                })?;
+                continue;
+            }
+            // The fast path wants a lending source and a plain block:
+            // anything else falls back, because a decompressed block
+            // lives in a buffer this loop cannot hold across keys.
+            let run = match $cached {
+                Some((id, bytes)) if id == e.block => Some(bytes),
+                _ => match $self.loc_of(e.block) {
+                    Ok(loc) if loc.is_plain() => {
+                        match $self.src.slice_at(loc.off, loc.stored as usize) {
+                            Some(bytes) => {
+                                $self.verify(e.block, loc, bytes, 0, 0, bytes.len())?;
+                                $cached = Some((e.block, bytes));
+                                Some(bytes)
+                            }
+                            None => None,
+                        }
+                    }
+                    _ => None,
+                },
+            };
+            match run {
+                Some(bytes) => {
+                    let (a, b) = (
+                        e.off as usize,
+                        (e.off as usize).saturating_add(e.len as usize),
+                    );
+                    if b > bytes.len() {
+                        return Err(corrupt("extent runs past its block"));
+                    }
+                    let run = &bytes[a..b];
+                    crate::index::each_value(run, e, &mut |v| $f($k, v)).map_err(corrupt)?;
+                }
+                None => {
+                    $self.with_extent(*e, |run| {
+                        crate::index::each_value(run, e, &mut |v| $f($k, v)).map_err(corrupt)
+                    })?;
+                }
+            }
+        }
+    };
+}
+
 /// `$body` over the key index as this reader holds it, `$sec` the section
 /// and `$idx` its parsed form: the section whole where the reader holds it
 /// so (`Blob::flat`), by the piece where the source lends by the piece
@@ -885,6 +943,9 @@ macro_rules! indexed {
         if let Some(($sec, $idx)) = $self.flat() {
             $body
         } else if let Some(($sec, $idx)) = $self.pieces() {
+            // Off the path of a reader that holds its section whole, and
+            // said to be.
+            core::hint::cold_path();
             $body
         } else {
             $none
@@ -954,10 +1015,9 @@ impl<B: Bytes> Blob<B> {
     /// The whole key index and its parsed form, or `None` for a sparse
     /// reader, which never reaches these paths from outside because
     /// `SparseBlob` does not expose them.
-    #[inline(always)]
     fn flat(&self) -> Option<(&[u8], &FlatIndex)> {
         match &self.index {
-            Index::Flat { key, idx } => Some((key.lent(&self.src)?, idx)),
+            Index::Flat { key, idx } => Some((key.get(&self.src).ok()?, idx)),
             Index::Sparse(_) => None,
         }
     }
@@ -1088,7 +1148,7 @@ impl<B: Bytes> Blob<B> {
         matches!(
             &self.index,
             Index::Flat {
-                key: Sec::Lent { .. } | Sec::Pieces { .. },
+                key: Sec::Lent { .. },
                 ..
             }
         )
@@ -1393,19 +1453,41 @@ impl<B: Bytes> Blob<B> {
     /// read must not pay, and it is the whole difference between a scan
     /// and a sequence of lookups.
     pub fn values_at<F: FnMut(&[u8])>(&self, rank: usize, mut f: F) -> Result<u64> {
-        let read = indexed!(
-            self,
-            |sec, idx| idx.with_record_at(sec, rank, |exts, tail| -> Result<u64> {
-                let mut n = 0u64;
-                for e in exts {
-                    n += self.with_run(*e, tail, |run| {
-                        crate::index::each_value(run, e, &mut |v| f(v)).map_err(corrupt)
-                    })?;
-                }
-                Ok(n)
-            }),
-            None
-        );
+        // The reader by the piece through a call of its own, and not as
+        // `indexed`'s second arm: this is inlined into the engine's scans
+        // several times over, and with that arm written into it the walk
+        // of the unsealed keys paid an instruction an entry in spills.
+        let Some((sec, idx)) = self.flat() else {
+            return self.values_at_pieces(rank, f);
+        };
+        let read = idx.with_record_at(sec, rank, |exts, tail| -> Result<u64> {
+            let mut n = 0u64;
+            for e in exts {
+                n += self.with_run(*e, tail, |run| {
+                    crate::index::each_value(run, e, &mut |v| f(v)).map_err(corrupt)
+                })?;
+            }
+            Ok(n)
+        });
+        read.unwrap_or(Ok(0))
+    }
+
+    /// `values_at` for a reader that does not hold its key section whole.
+    #[cold]
+    #[inline(never)]
+    fn values_at_pieces<F: FnMut(&[u8])>(&self, rank: usize, mut f: F) -> Result<u64> {
+        let Some((sec, idx)) = self.pieces() else {
+            return Ok(0);
+        };
+        let read = idx.with_record_at(sec, rank, |exts, tail| -> Result<u64> {
+            let mut n = 0u64;
+            for e in exts {
+                n += self.with_run(*e, tail, |run| {
+                    crate::index::each_value(run, e, &mut |v| f(v)).map_err(corrupt)
+                })?;
+            }
+            Ok(n)
+        });
         read.unwrap_or(Ok(0))
     }
 
@@ -1505,9 +1587,11 @@ impl<B: Bytes> Blob<B> {
         // straight out of a damaged file panicked the calling process.
         match self.blk_sec() {
             Ok(sec) => self.blocks.get(sec, id as usize),
-            Err(_) => self
-                .blk_pieces()
-                .and_then(|sec| self.blocks.get(sec, id as usize)),
+            Err(_) => {
+                core::hint::cold_path();
+                self.blk_pieces()
+                    .and_then(|sec| self.blocks.get(sec, id as usize))
+            }
         }
         .ok_or_else(|| {
             corrupt(&format!(
@@ -1615,7 +1699,10 @@ impl<B: Bytes> Blob<B> {
         let sec = self.blk_sec().ok();
         let by_piece = match sec {
             Some(_) => None,
-            None => self.blk_pieces(),
+            None => {
+                core::hint::cold_path();
+                self.blk_pieces()
+            }
         };
         if sec.is_none() && by_piece.is_none() {
             return whole(self);
@@ -2127,21 +2214,23 @@ impl<B: Bytes> Blob<B> {
     /// store under a cipher scanned at 0.25-0.45x of the same store in the
     /// clear, whose scan that loop is. Records ascend with rank in a
     /// segment; a window that does not hold one of its records stops the
-    /// walk there, and the caller's general walk reads on by the record.
-    /// The keys walked, and the rank the walk stopped at.
+    /// walk there, and the general walk reads on from it by the record,
+    /// as `scan_at`'s does. The keys walked.
     #[inline(never)]
-    fn scan_windows<F: FnMut(&[u8], &[u8])>(
+    fn scan_pieces<F: FnMut(&[u8], &[u8])>(
         &self,
         mut rank: usize,
         limit: usize,
-        f: &mut F,
-    ) -> Result<(usize, usize)> {
+        mut f: F,
+    ) -> Result<usize> {
         let mut seen = 0usize;
-        let Some((recs, dir, nkeys)) = self
+        let cached: Option<(u32, &[u8])> = None;
+        let windows = self
             .pieces()
-            .and_then(|(sec, idx)| idx.regions(sec).map(|(r, d)| (r, d, idx.len())))
-        else {
-            return Ok((seen, rank));
+            .and_then(|(sec, idx)| idx.regions(sec).map(|(r, d)| (r, d, idx.len())));
+        let (recs, dir, nkeys) = match windows {
+            Some(w) => w,
+            None => return self.scan_records(seen, rank, limit, f, cached),
         };
         while seen < limit && rank < nkeys {
             let n = (limit - seen).min(nkeys - rank).min(SCAN_WINDOW);
@@ -2182,7 +2271,28 @@ impl<B: Bytes> Blob<B> {
                 break;
             }
         }
-        Ok((seen, rank))
+        self.scan_records(seen, rank, limit, f, cached)
+    }
+
+    /// A scan's general walk from `rank`, record by record through
+    /// `exts_at_full`, for a reader with no key section held whole.
+    fn scan_records<'a, F: FnMut(&[u8], &[u8])>(
+        &'a self,
+        mut seen: usize,
+        mut rank: usize,
+        limit: usize,
+        mut f: F,
+        mut cached: Option<(u32, &'a [u8])>,
+    ) -> Result<usize> {
+        while seen < limit {
+            let Some((k, exts, tail)) = self.exts_at_full(rank) else {
+                break;
+            };
+            emit_record!(self, f, cached, k, exts, tail);
+            seen += 1;
+            rank += 1;
+        }
+        Ok(seen)
     }
 
     /// `scan`, from a rank a caller already has.
@@ -2190,7 +2300,70 @@ impl<B: Bytes> Blob<B> {
     /// `db::Db` has one out of its ordered index and would otherwise pay for
     /// the seek twice. The rank is a position, not a promise: a rank past the
     /// end walks nothing, exactly as a `from` above every key does.
+    ///
+    /// Over a source that lends by the piece the walk is `scan_pieces`,
+    /// and which of the two it is, is asked here only of a type that may
+    /// lend so to a reader that has not been told (`Bytes::ASK_PIECES`):
+    /// for every other this is `scan_whole` and nothing before it.
+    #[inline(always)]
     pub fn scan_at<F: FnMut(&[u8], &[u8])>(
+        &self,
+        rank: usize,
+        limit: usize,
+        f: F,
+    ) -> Result<usize> {
+        if B::ASK_PIECES && self.src.piecewise() {
+            return self.scan_pieces(rank, limit, f);
+        }
+        self.scan_whole(rank, limit, f)
+    }
+
+    /// `scan_at` for a caller that keeps its callback, whatever the source
+    /// lends by: the walk of a reader that holds its key section whole,
+    /// and where that walk refuses a source that lends by the piece
+    /// (`by_the_piece`), the walk by the piece from the same rank. The
+    /// engine's, whose segments are of the one type under a cipher and in
+    /// the clear: which kind a segment is, is found in the refusal, on the
+    /// branch a failed walk takes anyway, and a plain segment's scan makes
+    /// no test for it.
+    #[inline(always)]
+    pub(crate) fn scan_either<F: FnMut(&[u8], &[u8])>(
+        &self,
+        rank: usize,
+        limit: usize,
+        f: &mut F,
+    ) -> Result<usize> {
+        match self.scan_whole(rank, limit, &mut *f) {
+            Err(e) => self.scan_refused(rank, limit, f, e),
+            walked => walked,
+        }
+    }
+
+    /// `scan_either`'s other walk, or the error the first one met.
+    #[cold]
+    #[inline(never)]
+    fn scan_refused<F: FnMut(&[u8], &[u8])>(
+        &self,
+        rank: usize,
+        limit: usize,
+        f: &mut F,
+        e: Error,
+    ) -> Result<usize> {
+        // The refusal is made before a record is walked, so the walk by
+        // the piece starts where this one was asked to.
+        if self.src.piecewise() && e.kind() == ErrorKind::Unsupported {
+            return self.scan_pieces(rank, limit, f);
+        }
+        Err(e)
+    }
+
+    /// `scan_at`'s walk for a reader that holds its key section whole. A
+    /// source that lends by the piece is refused (`by_the_piece`) before
+    /// anything is walked: its walk is `scan_pieces`, and naming that walk
+    /// here, on a branch no plain scan takes, cost the loop below three
+    /// to four instructions an entry by what the compiler then kept of
+    /// the callback in memory.
+    pub(crate) fn scan_whole<F: FnMut(&[u8], &[u8])>(
         &self,
         from_rank: usize,
         limit: usize,
@@ -2267,12 +2440,7 @@ impl<B: Bytes> Blob<B> {
                 let off = u32::from_le_bytes(*w) as usize
             );
         } else if self.src.piecewise() {
-            // A reader that holds its sections by the piece walks the
-            // same records a window at a time, in a function of its own
-            // (`scan_windows`): written into this one, the second copy
-            // of the loop cost the first four instructions an entry, the
-            // callback no longer inlined where it had been.
-            (seen, rank) = self.scan_windows(rank, limit, &mut f)?;
+            return Err(by_the_piece());
         }
         while seen < limit {
             let Some((k, exts, tail)) = (match walk {
@@ -2281,53 +2449,7 @@ impl<B: Bytes> Blob<B> {
             }) else {
                 break;
             };
-            for e in exts.iter() {
-                // An inline run is right here in the record the walk is
-                // already on: no block, no cache, no fetch.
-                if e.is_inline() {
-                    self.with_run(*e, tail, |run| {
-                        crate::index::each_value(run, e, &mut |v| f(k, v)).map_err(corrupt)
-                    })?;
-                    continue;
-                }
-                // The fast path wants a lending source and a plain block:
-                // anything else falls back, because a decompressed block
-                // lives in a buffer this loop cannot hold across keys.
-                let run = match cached {
-                    Some((id, bytes)) if id == e.block => Some(bytes),
-                    _ => match self.loc_of(e.block) {
-                        Ok(loc) if loc.is_plain() => {
-                            match self.src.slice_at(loc.off, loc.stored as usize) {
-                                Some(bytes) => {
-                                    self.verify(e.block, loc, bytes, 0, 0, bytes.len())?;
-                                    cached = Some((e.block, bytes));
-                                    Some(bytes)
-                                }
-                                None => None,
-                            }
-                        }
-                        _ => None,
-                    },
-                };
-                match run {
-                    Some(bytes) => {
-                        let (a, b) = (
-                            e.off as usize,
-                            (e.off as usize).saturating_add(e.len as usize),
-                        );
-                        if b > bytes.len() {
-                            return Err(corrupt("extent runs past its block"));
-                        }
-                        let run = &bytes[a..b];
-                        crate::index::each_value(run, e, &mut |v| f(k, v)).map_err(corrupt)?;
-                    }
-                    None => {
-                        self.with_extent(*e, |run| {
-                            crate::index::each_value(run, e, &mut |v| f(k, v)).map_err(corrupt)
-                        })?;
-                    }
-                }
-            }
+            emit_record!(self, f, cached, k, exts, tail);
             seen += 1;
             rank += 1;
         }

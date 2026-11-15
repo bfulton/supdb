@@ -1815,7 +1815,7 @@ pub(crate) fn hold(dir: impl AsRef<Path>) -> Option<pager::Hold> {
 }
 
 #[cfg(all(test, target_os = "linux"))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A cipher for the tests: a keystream and a tag that are functions of
@@ -1871,7 +1871,9 @@ mod tests {
         }
     }
 
-    fn cipher(key: u8) -> StoreCipher {
+    /// A store's cipher over the stand-in, for this module's tests and for
+    /// the engine's own (`db::cipher_looks`).
+    pub(crate) fn cipher(key: u8) -> StoreCipher {
         StoreCipher::new(Toy::of(&[key; KEY]), Toy::of).key_id(u64::from(key))
     }
 

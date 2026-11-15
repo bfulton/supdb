@@ -9939,6 +9939,11 @@ impl Readers {
         self.slots[slot].page.store(to, AtomicOrdering::SeqCst);
     }
 
+    /// Whether `slot` says it holds nothing of any file (`page_idle`).
+    fn page_is_idle(&self, slot: usize) -> bool {
+        self.slots[slot].page.load(AtomicOrdering::Relaxed) == u64::MAX
+    }
+
     /// `slot`'s reader holds nothing it was lent, for a wait or a step
     /// that reads no file, until `page_back`. Under debug assertions the
     /// thread counts as unpinned meanwhile, so a read of a file inside
@@ -11860,8 +11865,48 @@ fn compact_job(plan: MergePlan) -> Result<Vec<String>> {
     // reader table: under a cipher it holds the store's cache for them
     // (`pager::Hold`), and rests where its walk holds nothing it will not
     // ask for again (`merge_ranks`, `merge_keys`).
-    let held = vault::hold(&plan.dir);
-    compact_run(plan, held.as_ref())
+    //
+    // Which of the two a merge is, is asked here once, and the merge is
+    // compiled for each (`MergeRest`): asked at each step of its walks,
+    // it was a count and a test a key of every plain store's merge.
+    match vault::hold(&plan.dir) {
+        Some(held) => compact_run(plan, &held),
+        None => compact_run(plan, NoRest),
+    }
+}
+
+/// What a merge's walk does at each of its steps about the cache its
+/// inputs are read through (`merge_ranks`): nothing, for a plain store's,
+/// whose inputs are the page cache's; a rest of its hold every
+/// `MERGE_REST` steps, for a store's under a cipher (`pager::Hold`). A
+/// type and not a value, so the walk a plain store's merge runs has no
+/// step counted and nothing asked.
+trait MergeRest: Copy {
+    /// The walk's `steps`th step: whether it rested, after which whatever
+    /// the walk was lent before is asked for again.
+    fn step(self, steps: usize) -> bool;
+}
+
+/// A plain store's merge: no rest.
+#[derive(Clone, Copy)]
+struct NoRest;
+
+impl MergeRest for NoRest {
+    #[inline(always)]
+    fn step(self, _steps: usize) -> bool {
+        false
+    }
+}
+
+impl MergeRest for &pager::Hold {
+    #[inline(always)]
+    fn step(self, steps: usize) -> bool {
+        if steps.is_multiple_of(MERGE_REST) {
+            self.rest();
+            return true;
+        }
+        false
+    }
 }
 
 /// Cut the ranks `[from, to)`, whose keys lie in the fence `(lo, hi)`, at
@@ -12140,15 +12185,15 @@ impl<'a> Slicer<'a> {
 /// input's key is read again at every step, an input count's reads a key
 /// where the inputs a step advanced need one each.
 ///
-/// `held` is the merge's hold on a cache its inputs are read through
-/// (`pager::Hold`, a store under a cipher): every `MERGE_REST` steps the
-/// walk rests it, which lets the cache give back what the steps before
-/// read, and asks again for the one thing it holds across a step, each
-/// input's key.
-fn merge_ranks(
+/// `rest` is the merge's hold on a cache its inputs are read through
+/// (`MergeRest`; `pager::Hold`, for a store under a cipher): every
+/// `MERGE_REST` steps the walk rests it, which lets the cache give back
+/// what the steps before read, and asks again for the one thing it holds
+/// across a step, each input's key.
+fn merge_ranks<R: MergeRest>(
     blobs: &[&Blob<MmapBytes>],
     cached: bool,
-    held: Option<&pager::Hold>,
+    rest: R,
     mut f: impl FnMut(&[u8], &[(usize, usize)]) -> Result<()>,
 ) -> Result<()> {
     let n: Vec<usize> = blobs.iter().map(|b| b.keys()).collect();
@@ -12170,13 +12215,7 @@ fn merge_ranks(
     let mut steps = 0usize;
     loop {
         steps += 1;
-        let rested = match held {
-            Some(h) if steps.is_multiple_of(MERGE_REST) => {
-                h.rest();
-                true
-            }
-            _ => false,
-        };
+        let rested = rest.step(steps);
         if !cached || rested {
             for (i, c) in cur.iter_mut().enumerate() {
                 *c = key(i, rank[i])?;
@@ -12226,13 +12265,13 @@ fn merge_ranks(
 /// stand while another's is written; with `cached` a buffer is filled
 /// once a rank, at its input's advance, as `merge_ranks` keeps its keys,
 /// and without, every input's at the head of every step.
-/// The buffers are the walk's own, so a rest of `held` (`merge_ranks`)
-/// has nothing to ask for again.
-fn merge_keys(
+/// The buffers are the walk's own, so a rest (`merge_ranks`) has nothing
+/// to ask for again.
+fn merge_keys<R: MergeRest>(
     blobs: &[&Blob<MmapBytes>],
     ords: &[Option<&crate::ordindex::OrdIndex>],
     cached: bool,
-    held: Option<&pager::Hold>,
+    rest: R,
     mut f: impl FnMut(&[u8], &[(usize, usize)]) -> Result<()>,
 ) -> Result<()> {
     let n: Vec<usize> = blobs.iter().map(|b| b.keys()).collect();
@@ -12263,11 +12302,7 @@ fn merge_keys(
     let mut steps = 0usize;
     loop {
         steps += 1;
-        if let Some(h) = held {
-            if steps.is_multiple_of(MERGE_REST) {
-                h.rest();
-            }
-        }
+        let _ = rest.step(steps);
         if !cached {
             for i in 0..blobs.len() {
                 have[i] = fill(i, rank[i], &mut bufs[i])?;
@@ -12483,7 +12518,7 @@ impl Emitter<'_> {
     }
 }
 
-fn compact_run(plan: MergePlan, held: Option<&pager::Hold>) -> Result<Vec<String>> {
+fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<Vec<String>> {
     let MergePlan {
         dir,
         inputs,
@@ -12547,7 +12582,7 @@ fn compact_run(plan: MergePlan, held: Option<&pager::Hold>) -> Result<Vec<String
     // holds only what the slices are taken from (`Slicer`).
     let mut slicer = Slicer::new(fences.as_deref(), parts, max_keys);
     let all: Vec<Vec<u8>> = if cursors {
-        merge_keys(&blobs, &ords, walk_cached, held, |k, _| {
+        merge_keys(&blobs, &ords, walk_cached, rest, |k, _| {
             slicer.push(k);
             Ok(())
         })?;
@@ -12658,7 +12693,7 @@ fn compact_run(plan: MergePlan, held: Option<&pager::Hold>) -> Result<Vec<String
         dropped_to[i] = to;
     };
     if cursors {
-        merge_ranks(&blobs, walk_cached, held, |k, tied| {
+        merge_ranks(&blobs, walk_cached, rest, |k, tied| {
             let mut start = 0usize;
             let mut live = 0u64;
             for (j, &(i, rank)) in tied.iter().enumerate() {
@@ -12687,11 +12722,7 @@ fn compact_run(plan: MergePlan, held: Option<&pager::Hold>) -> Result<Vec<String
     } else {
         for (n, k) in all.iter().enumerate() {
             // Nothing read for the key before is read again.
-            if let Some(h) = held {
-                if n.is_multiple_of(MERGE_REST) {
-                    h.rest();
-                }
-            }
+            let _ = rest.step(n);
             let k = k.as_slice();
             let mut found: Vec<(usize, crate::index::Exts<'_>, &[u8])> =
                 Vec::with_capacity(blobs.len());
@@ -12811,8 +12842,13 @@ fn merge_open_inputs(
 /// writes for a deleted key.
 fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
     // As `compact_job` holds the store's cache for a partition merge.
-    let held = vault::hold(&plan.dir);
-    let held = held.as_ref();
+    match vault::hold(&plan.dir) {
+        Some(held) => tier_walk(plan, &held),
+        None => tier_walk(plan, NoRest),
+    }
+}
+
+fn tier_walk<R: MergeRest>(plan: TierPlan, rest: R) -> Result<Vec<String>> {
     let TierPlan {
         dir,
         inputs,
@@ -12834,7 +12870,7 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
     let opened = merge_open_inputs(&dir, &inputs, &opts, verify_inputs, "tier")?;
     let blobs: Vec<&Blob<MmapBytes>> = opened.iter().collect();
     let mut total = 0usize;
-    merge_ranks(&blobs, walk_cached, held, |_, _| {
+    merge_ranks(&blobs, walk_cached, rest, |_, _| {
         total += 1;
         Ok(())
     })?;
@@ -12866,7 +12902,7 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         w: None,
         out: Vec::new(),
     };
-    merge_ranks(&blobs, walk_cached, held, |k, tied| {
+    merge_ranks(&blobs, walk_cached, rest, |k, tied| {
         let mut start = 0usize;
         let mut live = 0u64;
         let mut tomb = false;
@@ -15375,6 +15411,10 @@ pub struct Reader {
     /// maintenance regime counts; the writer's own and the builder's are
     /// the engine's and are not.
     counted: bool,
+    /// What this handle's looks for an ask to give the forms up are to do
+    /// (`abandon_asked`): nothing, the understudy's, or a rest alone, the
+    /// writer's in a store under a cipher.
+    looks: u8,
     /// Whether this handle is the upkeep thread's understudy, for the
     /// counts that tell its builds from the writer's own.
     understudy: bool,
@@ -15405,10 +15445,6 @@ pub struct Reader {
     /// (`pin_at`, the keeper's tick) read under their pin throughout and
     /// leave this off.
     page_snap: std::cell::Cell<bool>,
-    /// The writer's operations this handle is inside (`Db::op`): no
-    /// caller's callback runs under one, so a builder's look inside one
-    /// is a rest (`Reader::build_rest`).
-    writer_ops: std::cell::Cell<u32>,
     /// The state pinned by `snapshot`, or null: what `state` answers
     /// instead of the writer's latest while it is held. An atomic only
     /// so the handle is `Send`; one thread touches it.
@@ -15459,17 +15495,49 @@ pub struct Reader {
     zmemo: zfile::ZMemo,
     /// The census's window in progress (`ZPages::Auto`): see `ZWindow`.
     zwin: std::cell::Cell<ZWindow>,
-    /// Whether a census window is open on this handle: the one word the
-    /// inlined hooks read, beside the gate, so that an operation under the
-    /// raw gate pays a byte's load and a branch and never the window's
-    /// copy out of its cell (`zcensus_begin`). Set where the window opens
-    /// and cleared where it closes or is abandoned, and nowhere else.
-    zwin_open: std::cell::Cell<bool>,
-    /// Whether this handle runs the census at all: a counted handle of a
-    /// store under `Auto` where the controller runs. Decided once, so a
-    /// read under `Off` or `Always` pays one load and a branch for it.
-    zcensus: bool,
+    /// What an operation's start and end have to look at beyond the read
+    /// itself, a bit each (`ATTN_OPEN`, `ATTN_PAGED`): whether a census
+    /// window is open on this handle, set where the window opens and
+    /// cleared where it closes or is abandoned; and, for the handle's
+    /// life, whether its store reads its files through a cache of its own
+    /// (`Encryption::Cipher`). The one byte the inlined hooks read, beside
+    /// the gate, so that an operation under the raw gate pays a byte's
+    /// load and a branch and never the window's copy out of its cell
+    /// (`zcensus_begin`). The cipher's bit is in the byte the census had,
+    /// and not a test of its own: a test of its own was four instructions
+    /// on every read of a store that has no cipher.
+    attn_open: std::cell::Cell<u8>,
+    /// Whether this handle has anything to look at in `attn_open` at all,
+    /// a bit each, decided once: `ATTN_CENSUS` for a counted handle of a
+    /// store under `Auto` where the controller runs, `ATTN_PAGED` for a
+    /// handle of a store under a cipher. Zero for a read under `Off` or
+    /// `Always` in the clear, which pays one load and a branch for it.
+    attn: u8,
 }
+
+/// `Reader::attn`'s census bit, and `Reader::attn_open`'s open window.
+const ATTN_CENSUS: u8 = 1;
+const ATTN_OPEN: u8 = 1;
+/// The cipher's bit in both.
+const ATTN_PAGED: u8 = 2;
+
+/// `Reader::looks`: a handle whose fills look for no ask; the upkeep
+/// thread's understudy; the writer's own handle in a store under a
+/// cipher, whose looks are rests.
+const LOOKS_NONE: u8 = 0;
+const LOOKS_UNDERSTUDY: u8 = 1;
+const LOOKS_WRITER_RESTS: u8 = 2;
+
+/// `FormsState::abandoned` for "not asked" in a store under a cipher,
+/// where it is `u64::MAX` in one in the clear: every look of a fill finds
+/// it and is a rest (`Reader::abandon_slow`). Below it, the scan count an
+/// ask was noted at.
+const REST_HERE: u64 = u64::MAX - 1;
+
+/// The builder ahead's word (`Ahead::stop`): told to stop; and, in a store
+/// under a cipher, to rest at each block until it is.
+const AHEAD_STOP: u8 = 1;
+const AHEAD_REST: u8 = 2;
 
 /// The census's window on a handle (`zselect` S2, design 4.3). What the
 /// engine cannot see is that a read blocked: the first touch of lent
@@ -16167,6 +16235,35 @@ struct Entered<'a> {
     r: &'a Reader,
 }
 
+impl Entered<'_> {
+    /// The read's end with its answer in hand, for a read that ran to its
+    /// end: the look `leave` makes at the handle's two bytes made here,
+    /// inline, and the rest of `leave` after it. The look is the census's
+    /// and, in a store under a cipher, the one that turns the answer into
+    /// the failure a file of the store met while it was read
+    /// (`Reader::end_slow`); made inside `leave`, it could not reach the
+    /// answer, and a test of its own for the cipher was a test on every
+    /// read of a store without one. A read that leaves early, by an
+    /// error, is ended by the guard as it always was.
+    #[inline(always)]
+    fn finish<T>(self, r: Result<T>) -> Result<T> {
+        let rd = self.r;
+        std::mem::forget(self);
+        let r = if rd.attn != 0 && rd.attn_open.get() != 0 {
+            rd.end_slow(r)
+        } else {
+            r
+        };
+        rd.leave_looked();
+        r
+    }
+}
+
+/// How much deeper than a read one of the writer's own operations stands
+/// in `Reader::depth` (`Reader::enter_writer`): above any depth reads
+/// nested in callbacks reach.
+const WRITER_OP: u32 = 1 << 16;
+
 /// One of the writer's operations in progress: its slot pinned and the
 /// state held from here until the guard drops. A pointer and not a
 /// borrow, so the operation keeps `&mut` of the store; the store outlives
@@ -16182,7 +16279,7 @@ impl Drop for Op {
 
 /// `Op` for an operation of the writer's own (`Db::op`): a write, a
 /// commit, a flush, a settle. No caller's callback runs under one, which
-/// the handle is told for its length (`Reader::writer_ops`): the fill a
+/// the handle knows by its depth for the operation's length (`WRITER_OP`): the fill a
 /// commit makes itself rests between two blocks as the upkeep thread's
 /// does, where the same fill inside a scan, which may be a scan inside
 /// another scan's callback, does not.
@@ -16191,9 +16288,7 @@ struct WriterOp(*const Reader);
 impl Drop for WriterOp {
     fn drop(&mut self) {
         // SAFETY: as `Op`.
-        let r = unsafe { &*self.0 };
-        r.writer_ops.set(r.writer_ops.get() - 1);
-        r.leave();
+        unsafe { &*self.0 }.leave_writer();
     }
 }
 
@@ -17787,8 +17882,20 @@ impl Reader {
     /// and holds nothing: it publishes nothing while a borrow of itself
     /// is out. The guard ends the read.
     fn enter(&self) -> Entered<'_> {
+        self.enter_by(1)
+    }
+
+    /// `enter` for one of the writer's own operations (`Db::op`): deeper
+    /// by `WRITER_OP`, which is how the handle knows it is in one, at the
+    /// cost of the constant it adds and nothing counted beside it.
+    fn enter_writer(&self) -> Entered<'_> {
+        self.enter_by(1 + WRITER_OP)
+    }
+
+    #[inline(always)]
+    fn enter_by(&self, by: u32) -> Entered<'_> {
         let depth = self.depth.get();
-        self.depth.set(depth + 1);
+        self.depth.set(depth + by);
         if depth > 0 {
             return Entered { r: self };
         }
@@ -17802,15 +17909,10 @@ impl Reader {
         if let Some(slot) = self.slot {
             match self.isolation.get() {
                 // The state was pinned when the snapshot was taken, and
-                // stays so; what this read may be lent of the store's
-                // files it is lent from here (`Slot::page`), where there
-                // is a cache that would otherwise wait for the snapshot
-                // to end before it gave anything back.
-                Isolation::Snapshot => {
-                    if self.page_snap.get() {
-                        self.shared.readers.page_pin(slot);
-                    }
-                }
+                // stays so. What a read through it may be lent of the
+                // files of a store under a cipher it says at its start
+                // and its end, out of line (`paged_begin`, `end_slow`).
+                Isolation::Snapshot => {}
                 Isolation::Latest => {
                     self.shared.readers.pin(slot);
                     let p = self.shared.state.load(AtomicOrdering::Acquire);
@@ -17842,8 +17944,29 @@ impl Reader {
         Entered { r: self }
     }
 
+    /// The end of an operation the guard ends (`Entered`, `Op`).
     fn leave(&self) {
-        let depth = self.depth.get() - 1;
+        self.leave_by(1, true);
+    }
+
+    /// `leave` for a read that has made the end's look itself, inline,
+    /// since the look may change what the read answers (`Entered::finish`).
+    fn leave_looked(&self) {
+        self.leave_by(1, false);
+    }
+
+    /// `leave` for one of the writer's own operations (`Db::op`), which
+    /// stands deeper by `WRITER_OP` so that the handle knows it is in one.
+    fn leave_writer(&self) {
+        self.leave_by(1 + WRITER_OP, true);
+    }
+
+    /// An operation's end, `by` deep, with the census's look at an open
+    /// window where `census` says it is still to make. Inlined into each
+    /// of the three, so neither is a test at run time.
+    #[inline(always)]
+    fn leave_by(&self, by: u32, census: bool) {
+        let depth = self.depth.get() - by;
         self.depth.set(depth);
         if depth > 0 {
             return;
@@ -17881,18 +18004,139 @@ impl Reader {
                 self.sweep_at_leave();
             }
         }
-        if self.zcensus && self.zwin_open.get() {
-            self.zcensus_end();
+        if census && self.attn != 0 && self.attn_open.get() != 0 {
+            self.leave_slow();
         }
         if let Some(slot) = self.slot {
             if self.isolation.get() != Isolation::Snapshot {
                 self.held
                     .store(std::ptr::null_mut(), AtomicOrdering::Relaxed);
                 self.shared.readers.unpin(slot);
-            } else if self.page_snap.get() {
-                // Between a snapshot's reads nothing of a file is held.
-                self.shared.readers.page_set(slot, u64::MAX);
             }
+        }
+    }
+
+    /// The slow half of a read's end, behind the two bytes
+    /// (`Entered::finish`): the outermost operation's (`leave_slow`),
+    /// where it has anything to do, and, in a store under a cipher, what
+    /// the read's answer is to be -- the failure a file of the store has
+    /// met, if one has (`pager::Pager::check`). A chunk that fails its tag
+    /// reads as bytes that are not there, which to the index is a key that
+    /// is not there, and an answer built on that is not one to give, at
+    /// any depth.
+    ///
+    /// The answer goes through here and comes back: asked for a verdict
+    /// alone and left to replace the answer itself, the read's end cost a
+    /// plain store's read three instructions for a branch it never takes.
+    #[inline(never)]
+    fn end_slow<T>(&self, r: Result<T>) -> Result<T> {
+        if self.depth.get() == 1 && (self.page_snap.get() || self.attn_open.get() & ATTN_OPEN != 0)
+        {
+            self.leave_slow();
+        }
+        match self.shared.pager.as_ref() {
+            Some(p) => p.check().and(r),
+            None => r,
+        }
+    }
+
+    /// The slow half of the outermost operation's end, behind the two
+    /// bytes: the census's note of a window still counting, and, in a
+    /// store under a cipher, a snapshot's handle saying that it holds
+    /// nothing of a file again (`Slot::page`), pinned as it is for its
+    /// life. Only where its read said that it held something
+    /// (`paged_begin`), which the slot's own word says.
+    #[inline(never)]
+    fn leave_slow(&self) {
+        if self.attn & ATTN_CENSUS != 0 && self.attn_open.get() & ATTN_OPEN != 0 {
+            self.zcensus_end();
+        }
+        if self.page_snap.get() {
+            if let Some(slot) = self.slot {
+                if !self.shared.readers.page_is_idle(slot) {
+                    self.shared.readers.page_idle(slot);
+                }
+            }
+        }
+    }
+
+    /// The cipher's half of an operation's start, for the outermost read
+    /// of a store under one, where there is anything to do (`begin_slow`):
+    /// a snapshot's handle says from where it may be lent anything
+    /// (`Slot::page`), and where the cache the store reads through is far
+    /// past its budget (`pager::Pager::swamped`) the read waits a little
+    /// for it first, holding nothing. Far past, and not at the line the
+    /// store's own work waits at (`crowded`): a read waited there too at
+    /// first, and every scan of a pass beside a merge slept through the
+    /// merge's overshoot.
+    #[cold]
+    #[inline(never)]
+    fn paged_begin(&self, p: &pager::Pager, snap: bool) {
+        let slot = self
+            .slot
+            .or(self.pin_slot.filter(|_| self.opts.writer_pins));
+        let Some(slot) = slot else {
+            return;
+        };
+        // A handle that is not a snapshot's holds from its pin, which its
+        // slot's word has to leave to say: a word left at "nothing" by a
+        // snapshot since released would have the cache give back under
+        // this read.
+        debug_assert!(
+            snap || !self.shared.readers.page_is_idle(slot),
+            "a read begins with its slot saying it holds nothing"
+        );
+        if p.swamped() {
+            if !snap {
+                self.shared.readers.page_idle(slot);
+            }
+            p.breathe_swamped();
+            self.shared.readers.page_back(slot);
+        } else if snap {
+            self.shared.readers.page_back(slot);
+        }
+    }
+
+    /// A handle's two bytes with the cipher's bit, where its store is
+    /// under one: at each constructor's end.
+    fn paged_bits(mut self) -> Reader {
+        if self.shared.pager.is_some() {
+            self.attn |= ATTN_PAGED;
+            self.attn_open.set(self.attn_open.get() | ATTN_PAGED);
+        }
+        self
+    }
+
+    /// The writer's own handle, after `paged_bits`: in a store under a
+    /// cipher its fills' looks are rests, and so are the understudy's,
+    /// which is lent the same forms (`REST_HERE`).
+    fn writer_rests(mut self) -> Reader {
+        if self.attn & ATTN_PAGED != 0 {
+            self.looks = LOOKS_WRITER_RESTS;
+            self.fs().abandoned.set(REST_HERE);
+        }
+        self
+    }
+
+    /// The forms' word for no ask to give them up (`FormsState::abandoned`).
+    fn not_asked(&self) -> u64 {
+        if self.attn & ATTN_PAGED != 0 {
+            REST_HERE
+        } else {
+            u64::MAX
+        }
+    }
+
+    /// The blocks between two looks of a fill, as a mask of the block's
+    /// number: sixty-four, and every block under a cipher, where the look
+    /// is the fill's rest (`build_rest`) and sixty-four blocks built
+    /// between two rests were sixty-four blocks' records the cache could
+    /// not give back.
+    fn look_mask(&self) -> usize {
+        if self.attn & ATTN_PAGED != 0 {
+            0
+        } else {
+            63
         }
     }
 
@@ -17902,7 +18146,7 @@ impl Reader {
     /// two forms; otherwise a window due to close is closed, one is opened
     /// where none is, and the operation is counted by its class.
     #[inline(always)]
-    fn zcensus_begin(&self, scan: bool) {
+    fn zcensus_begin(&self, scan: bool) -> bool {
         // The flag, the open word and the gate inlined into the operation
         // and the rest out of line: grown past what the compiler inlines,
         // the whole hook cost a read through the form seventeen
@@ -17915,9 +18159,48 @@ impl Reader {
         // 830 by callgrind, and the end's hook 38 more. Under the raw gate
         // the slow path is entered only to abandon a window still open
         // from a gate that has changed.
-        if self.zcensus && (self.zwin_open.get() || self.shared.zgate.load() != zselect::GATE_RAW) {
+        //
+        // The answer is the cipher's (`paged_begin`): whether this is the
+        // outermost read of a store under one, which a scan asks so as to
+        // walk with rests where it is long. Behind the same two bytes, so
+        // a store under none is asked nothing more than it was.
+        self.attn != 0
+            && (self.attn_open.get() != 0 || self.shared.zgate.load() != zselect::GATE_RAW)
+            && self.begin_slow(scan)
+    }
+
+    /// The slow half of an operation's start: the cipher's, whose answer
+    /// this is -- whether this is the outermost read of a store under one
+    /// (`paged_begin`) -- and the census's.
+    #[inline(never)]
+    fn begin_slow(&self, scan: bool) -> bool {
+        // A read inside another holds what that one does, and neither
+        // waits nor says anything; and the outermost has nothing to say
+        // but for a snapshot's handle or a cache far past its budget,
+        // which two loads tell.
+        let mut outer = false;
+        if self.attn & ATTN_PAGED != 0 && self.depth.get() == 1 {
+            outer = true;
+            if let Some(p) = self.shared.pager.as_ref() {
+                let snap = self.page_snap.get();
+                if snap || p.swamped() {
+                    self.paged_begin(p, snap);
+                }
+                #[cfg(debug_assertions)]
+                if !snap {
+                    if let Some(slot) = self.slot {
+                        debug_assert!(
+                            !self.shared.readers.page_is_idle(slot),
+                            "a read begins with its slot saying it holds nothing"
+                        );
+                    }
+                }
+            }
+        }
+        if self.attn & ATTN_CENSUS != 0 {
             self.zcensus_begin_slow(scan);
         }
+        outer
     }
 
     #[inline(never)]
@@ -17934,8 +18217,8 @@ impl Reader {
             // window itself is not read, since FITS is the in-memory regime
             // and an operation under it reaches this only with a window to
             // abandon.
-            if self.zwin_open.get() {
-                self.zwin_open.set(false);
+            if self.attn_open.get() & ATTN_OPEN != 0 {
+                self.attn_open.set(self.attn_open.get() & !ATTN_OPEN);
                 self.zfootprint_track(false);
             }
             return;
@@ -17944,7 +18227,7 @@ impl Reader {
         // E2's footprint: kept while the form serves and dropped, with the
         // word the tick reads, when it stops.
         self.zfootprint_track(gate == zselect::GATE_Z);
-        if self.zwin_open.get() {
+        if self.attn_open.get() & ATTN_OPEN != 0 {
             let ticks = self
                 .shared
                 .z
@@ -17955,7 +18238,7 @@ impl Reader {
                 self.zwindow_close(&mut w, gate);
             }
         }
-        if !self.zwin_open.get() {
+        if self.attn_open.get() & ATTN_OPEN == 0 {
             self.zwindow_open(&mut w, gate);
         }
         if scan {
@@ -17990,7 +18273,8 @@ impl Reader {
     /// (`Options::zpages_writer_census`).
     #[inline]
     fn zcensus_slot(&self) -> Option<usize> {
-        self.slot.or(self.pin_slot.filter(|_| self.zcensus))
+        self.slot
+            .or(self.pin_slot.filter(|_| self.attn & ATTN_CENSUS != 0))
     }
 
     /// The thread's major faults, from the seam where a test injects them
@@ -18006,7 +18290,7 @@ impl Reader {
     /// Opens a window at this operation: the readings before it.
     fn zwindow_open(&self, w: &mut ZWindow, gate: u8) {
         let now = std::time::Instant::now();
-        self.zwin_open.set(true);
+        self.attn_open.set(self.attn_open.get() | ATTN_OPEN);
         w.down = w.n;
         w.reads = 0;
         w.scans = 0;
@@ -18043,7 +18327,7 @@ impl Reader {
     /// The census's note of a scan's emitted keys, onto the window.
     #[inline(always)]
     fn zcensus_scanned(&self, n: usize) {
-        if self.zcensus && self.zwin_open.get() {
+        if self.attn & ATTN_CENSUS != 0 && self.attn_open.get() & ATTN_OPEN != 0 {
             self.zcensus_scanned_slow(n);
         }
     }
@@ -18060,7 +18344,7 @@ impl Reader {
     /// next window's length is this one's resized toward
     /// `ZWINDOW_TARGET` of wall.
     fn zwindow_close(&self, w: &mut ZWindow, gate: u8) {
-        self.zwin_open.set(false);
+        self.attn_open.set(self.attn_open.get() & !ATTN_OPEN);
         let Some(slot) = self.zcensus_slot() else {
             return;
         };
@@ -18184,9 +18468,9 @@ impl Reader {
         // As the store's cache of plaintext is to see it (`Slot::page`):
         // holding nothing of any file until its next read. Not for a
         // snapshot taken inside a read, which is lent what that read is.
-        if self.shared.pager.is_some() && self.depth.get() == 0 {
+        if self.attn & ATTN_PAGED != 0 && self.depth.get() == 0 {
             self.page_snap.set(true);
-            self.shared.readers.page_set(slot, u64::MAX);
+            self.shared.readers.page_idle(slot);
         }
     }
 
@@ -18224,9 +18508,14 @@ impl Reader {
         self.held
             .store(std::ptr::null_mut(), AtomicOrdering::Relaxed);
         self.isolation.set(Isolation::Latest);
+        let snap = self.attn & ATTN_PAGED != 0 && self.page_snap.replace(false);
+        if snap && self.shared.readers.page_is_idle(slot) {
+            // The count the idle took back, for the unpin to take.
+            pager::debug_pinned(true);
+        }
         self.shared.readers.unpin(slot);
         // After the unpin: the slot's pin says it all again.
-        if self.page_snap.replace(false) {
+        if snap {
             self.shared.readers.page_set(slot, 0);
         }
     }
@@ -19365,7 +19654,7 @@ impl Reader {
     ) -> Result<usize> {
         let raw = |rank: usize, n: usize, f: &mut F| {
             seg.raw()
-                .scan_at(rank, n, &mut *f)
+                .scan_either(rank, n, f)
                 .map_err(|e| err(&format!("segment scan: {e}")))
         };
         if !self.z_on() {
@@ -19529,7 +19818,7 @@ impl Reader {
             self.part_scan_z(seg, rank, n, f)?
         } else {
             seg.raw()
-                .scan_at(rank, n, &mut *f)
+                .scan_either(rank, n, f)
                 .map_err(|e| err(&format!("segment scan: {e}")))?
         };
         if got < n {
@@ -19805,46 +20094,13 @@ impl Reader {
     }
 
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], f: F) -> Result<u64> {
-        if let Some(p) = &self.shared.pager {
-            return self.read_all_paged(p, key, f);
-        }
-        self.read_all_in(key, f)
-    }
-
-    /// `read_all` in a store under a cipher: a wait for a crowded cache
-    /// before the read (`breathe`), and after it the failure a file of the
-    /// store has met, if one has (`pager::Pager::check`) -- a chunk that
-    /// fails its tag reads as bytes that are not there, which to the index
-    /// is a key that is not there, and an answer built on that is not one
-    /// to give. Out of line, so a plain store's read is the read and the
-    /// one test that sent it there. Generic over the callback as the read
-    /// is: taken behind a pointer, to compile this path once, every value
-    /// read cost a call through it, twenty-five instructions an entry of
-    /// a scan whose whole walk is a hundred and thirty.
-    #[inline(never)]
-    fn read_all_paged<F: FnMut(&[u8])>(&self, p: &pager::Pager, key: &[u8], f: F) -> Result<u64> {
-        self.breathe(p);
+        let entered = self.enter();
         let r = self.read_all_in(key, f);
-        p.check().and(r)
-    }
-
-    /// A read of a store under a cipher, about to begin: where the cache
-    /// it reads through is far past its budget (`pager::Pager::swamped`),
-    /// a short wait for it first, unless this handle is inside a read
-    /// already and so holds what the evictor would be waiting for. Far
-    /// past, and not at the line the store's own work waits at
-    /// (`crowded`): a read waited there too at first, and every scan of a
-    /// pass beside a merge slept through the merge's overshoot.
-    #[inline]
-    fn breathe(&self, p: &pager::Pager) {
-        if p.swamped() && self.depth.get() == 0 {
-            p.breathe_swamped();
-        }
+        entered.finish(r)
     }
 
     #[inline(always)]
     fn read_all_in<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
-        let _entered = self.enter();
         self.advise(true);
         self.note_read(false);
         self.zcensus_begin(false);
@@ -20205,29 +20461,9 @@ impl Reader {
     }
 
     pub fn scan<F: FnMut(&[u8], &[u8])>(&self, from: &[u8], limit: usize, f: F) -> Result<usize> {
-        if let Some(p) = &self.shared.pager {
-            return self.scan_paged(p, from, limit, f);
-        }
-        self.scan_in(from, limit, f)
-    }
-
-    /// `scan` in a store under a cipher, as `read_all_paged` is `read_all`
-    /// there, and walked with rests where it is long (`scan_rested`).
-    #[inline(never)]
-    fn scan_paged<F: FnMut(&[u8], &[u8])>(
-        &self,
-        p: &pager::Pager,
-        from: &[u8],
-        limit: usize,
-        f: F,
-    ) -> Result<usize> {
-        self.breathe(p);
-        let r = if limit > SCAN_REST {
-            self.scan_rested(from, limit, f)
-        } else {
-            self.scan_in(from, limit, f)
-        };
-        p.check().and(r)
+        let entered = self.enter();
+        let r = self.scan_in(from, limit, f);
+        entered.finish(r)
     }
 
     /// `wait` run with nothing of the store's files lent to this handle's
@@ -20366,7 +20602,6 @@ impl Reader {
         limit: usize,
         mut f: F,
     ) -> Result<usize> {
-        let _entered = self.enter();
         let slot = self
             .slot
             .or(self.pin_slot.filter(|_| self.opts.writer_pins));
@@ -20378,7 +20613,7 @@ impl Reader {
         let mut last: Vec<u8> = Vec::new();
         loop {
             let want = (limit - seen).min(SCAN_REST);
-            let n = self.scan_in(&next, want, |k, v| {
+            let n = self.scan_body(&next, want, |k, v| {
                 if last.as_slice() != k {
                     last.clear();
                     last.extend_from_slice(k);
@@ -20408,15 +20643,25 @@ impl Reader {
     }
 
     #[inline(always)]
-    fn scan_in<F: FnMut(&[u8], &[u8])>(
+    fn scan_in<F: FnMut(&[u8], &[u8])>(&self, from: &[u8], limit: usize, f: F) -> Result<usize> {
+        self.note_read(true);
+        // The outermost scan of a store under a cipher is walked with
+        // rests where it is long; a scan inside another read is lent what
+        // that read is, and a rest of its own would be the other's.
+        if self.zcensus_begin(true) && limit > SCAN_REST {
+            return self.scan_rested(from, limit, f);
+        }
+        self.scan_body(from, limit, f)
+    }
+
+    /// A scan's walk, inside the operation `scan` entered.
+    #[inline(always)]
+    fn scan_body<F: FnMut(&[u8], &[u8])>(
         &self,
         from: &[u8],
         limit: usize,
         mut f: F,
     ) -> Result<usize> {
-        let _entered = self.enter();
-        self.note_read(true);
-        self.zcensus_begin(true);
         self.advise(!self.scan_wants_readahead(limit));
         // `Prefetch` never changes mode, so `advise` above is a no-op for it.
         // Instead the segments are told exactly which value bytes this scan
@@ -21329,22 +21574,70 @@ impl Reader {
             && self.shared.upkeep.state.load(AtomicOrdering::Acquire) & LEND_WANT != 0
     }
 
+    ///
+    /// In a store under a cipher every look is a rest as well
+    /// (`abandon_slow`), and neither of the two tests a plain store's look
+    /// makes is one more for it: a handle that looks for nothing says so
+    /// in the byte the understudy's test read (`Reader::looks`), and the
+    /// forms' own word for "not asked" is another under a cipher
+    /// (`REST_HERE`), which sends the look out of line where an ask found
+    /// does.
+    ///
+    /// The byte is asked where the look is made and the rest is a call: a
+    /// handle that looks for nothing, the writer's in a plain store at
+    /// every look of its own fills, pays the one test and no call.
+    #[inline]
     fn abandon_asked(&self) -> bool {
+        self.looks != LOOKS_NONE && self.abandon_look()
+    }
+
+    /// `abandon_asked` for a handle that looks.
+    #[inline(never)]
+    fn abandon_look(&self) -> bool {
+        if self.fs().abandoned.get() != u64::MAX {
+            return self.abandon_slow();
+        }
+        let now = self.shared.scans_all();
+        self.abandon_by_writer(now) || self.abandon_by_pin(now)
+    }
+
+    /// `abandon_asked` where the forms' word is not "not asked": an ask a
+    /// step noted before, which still holds, or the word of a store under
+    /// a cipher (`REST_HERE`), where the look is a rest (`build_rest`).
+    /// The writer's own fill, inside one of its operations, rests and
+    /// gives nothing up: a commit of a batch over every block, filed by
+    /// the commit, was otherwise the store read into the cache under the
+    /// commit's one pin. The thread's pass rests between the writer's ask
+    /// and its own pin's, and a cache crowded past the rest and a wait is
+    /// one something else holds: the pass gives its forms up as it does
+    /// for the tables behind its pin. Every look is between two blocks or
+    /// two keys of the pass, where it holds nothing it was lent.
+    #[cold]
+    #[inline(never)]
+    fn abandon_slow(&self) -> bool {
+        if self.fs().abandoned.get() < REST_HERE {
+            return true;
+        }
         if !self.understudy {
-            // The writer's own fill, inside one of its operations: its
-            // looks are rests as the thread's are, and it gives nothing
-            // up. A commit of a batch over every block, filed by the
-            // commit, was otherwise the store read into the cache under
-            // the commit's one pin.
-            if self.writer_ops.get() > 0 {
+            if self.depth.get() >= WRITER_OP {
                 let _ = self.build_rest();
             }
             return false;
         }
-        if self.fs().abandoned.get() != u64::MAX {
+        let now = self.shared.scans_all();
+        if self.abandon_by_writer(now) {
             return true;
         }
-        let now = self.shared.scans_all();
+        if self.build_rest() {
+            self.fs().abandoned.set(now);
+            return true;
+        }
+        self.abandon_by_pin(now)
+    }
+
+    /// The writer's ask, where no scan has made it stale (`abandon_asked`).
+    #[inline(always)]
+    fn abandon_by_writer(&self, now: u64) -> bool {
         let at = self.shared.abandon_at.load(AtomicOrdering::Acquire);
         if at != u64::MAX {
             if at == now {
@@ -21358,17 +21651,32 @@ impl Reader {
                 AtomicOrdering::Relaxed,
             );
         }
-        // A third asker, for a store under a cipher: the cache of
-        // plaintext well past its budget with this pass resting
-        // (`build_rest`). Every look here is between two blocks or two
-        // keys of the pass, where it holds nothing it was lent, so the
-        // look is the pass's rest; a cache crowded past the rest and a
-        // wait is one something else holds, and the pass gives its forms
-        // up as it does for the tables behind its pin.
-        if self.build_rest() {
-            self.fs().abandoned.set(now);
-            return true;
-        }
+        false
+    }
+
+    /// What a table landed behind the pass's pin costs, taken once a pass
+    /// from the tables standing (`FormsState::pass_unit`). Out of line: it
+    /// is asked once a pass, and written into the look it was a frame and
+    /// a register the look paid for at every block.
+    #[cold]
+    #[inline(never)]
+    fn pass_unit_measured(&self) -> u64 {
+        let st = self.state();
+        let unit = st
+            .frozen
+            .iter()
+            .chain(std::iter::once(&st.mem))
+            .map(|t| t.kept_bytes())
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        self.fs().pass_unit.set(unit);
+        unit
+    }
+
+    /// The pass's own pin's ask (`abandon_asked`).
+    #[inline(always)]
+    fn abandon_by_pin(&self, now: u64) -> bool {
         if !self.opts.upkeep_abandons || self.shared.keep_bytes == u64::MAX {
             return false;
         }
@@ -21382,16 +21690,7 @@ impl Reader {
         }
         let mut unit = self.fs().pass_unit.get();
         if unit == 0 {
-            let st = self.state();
-            unit = st
-                .frozen
-                .iter()
-                .chain(std::iter::once(&st.mem))
-                .map(|t| t.kept_bytes())
-                .max()
-                .unwrap_or(0)
-                .max(1);
-            self.fs().pass_unit.set(unit);
+            unit = self.pass_unit_measured();
         }
         if landed.saturating_mul(unit) > self.shared.keep_bytes {
             self.fs().abandoned.set(now);
@@ -21417,7 +21716,7 @@ impl Reader {
     /// Whether a step has found the ask and the forms are still to be
     /// given up: every caller up to the pass returns.
     fn abandon_pending(&self) -> bool {
-        self.fs().abandoned.get() != u64::MAX
+        self.fs().abandoned.get() < REST_HERE
     }
 
     /// The forms given up on the ask a step noted, if one did, with
@@ -21428,10 +21727,11 @@ impl Reader {
     /// scan count the ask was made at, which nothing files into forms
     /// past until a scan moves it. Whether it did.
     fn abandon_forms(&self) -> bool {
-        let at = self.fs().abandoned.replace(u64::MAX);
-        if at == u64::MAX {
+        let at = self.fs().abandoned.get();
+        if at >= REST_HERE {
             return false;
         }
+        self.fs().abandoned.set(self.not_asked());
         self.stop_ahead();
         *self.fs().scan_keys.borrow_mut() = None;
         self.fs().snap_added.borrow_mut().clear();
@@ -23219,6 +23519,7 @@ impl Reader {
     /// declined (too small) or has not reached.
     fn complete_forms(&self, unsealed: &Snapshot) -> Result<()> {
         let mut converted = 0usize;
+        let every = self.look_mask();
         let np = self.segs().partition_point(|s| s.level > 0);
         let l0 = &self.segs()[np..];
         let ctx = self.build_ctx();
@@ -23250,13 +23551,8 @@ impl Reader {
                 copy_dense: true,
                 ..self.build_ctx()
             };
-            // Under a cipher the look is at every block: it is the pass's
-            // rest (`build_rest`), and sixty-four blocks built between two
-            // rests were sixty-four blocks' records the cache could not
-            // give back.
-            let paged = self.shared.pager.is_some();
             for b in 0..table.slots.len() {
-                if b % 64 == 63 || paged {
+                if b & every == every {
                     if self.abandon_asked() {
                         return Ok(());
                     }
@@ -26131,8 +26427,13 @@ impl Reader {
         let frozen = self.frozen();
         debug_assert_eq!(snap.bases.len(), frozen.len(), "a base a frozen table");
         let nf = frozen.len();
-        let stale = self.fs().snap_stale.borrow();
-        let live_run = uk.mem != u32::MAX && uk.lrun != NO_RUN && !stale.contains(&uk.mem);
+        // The stale list is borrowed for the one look and no longer: held
+        // to the function's end it stood across the caller's callback,
+        // which may read through this handle, and it was a value kept
+        // live through every value this emits.
+        let live_run = uk.mem != u32::MAX
+            && uk.lrun != NO_RUN
+            && !self.fs().snap_stale.borrow().contains(&uk.mem);
         let mut start = 0usize;
         if tombs {
             let live_tomb = if uk.mem == u32::MAX {
@@ -26412,23 +26713,13 @@ impl Reader {
     /// each extent carries its record count (`Ext::count`, format v5), so no
     /// block is read. The memtable keeps a live count per key.
     pub fn count(&self, key: &[u8]) -> Result<u64> {
-        if let Some(p) = &self.shared.pager {
-            return self.count_paged(p, key);
-        }
-        self.count_in(key)
-    }
-
-    /// `count` in a store under a cipher (`read_all_paged`).
-    #[inline(never)]
-    fn count_paged(&self, p: &pager::Pager, key: &[u8]) -> Result<u64> {
-        self.breathe(p);
+        let entered = self.enter();
         let r = self.count_in(key);
-        p.check().and(r)
+        entered.finish(r)
     }
 
     #[inline(always)]
     fn count_in(&self, key: &[u8]) -> Result<u64> {
-        let _entered = self.enter();
         // A count resolves one key, so it is a point read for advice
         // purposes even though it returns no bytes (`F28`: 94 ns, a lookup).
         self.advise(true);
@@ -27071,21 +27362,21 @@ impl Db {
             shared,
             counted: false,
             understudy: false,
+            looks: LOOKS_NONE,
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
-            zwin_open: std::cell::Cell::new(false),
-            zcensus: opts.zpages_writer_census
-                && opts.zpages == ZPages::Auto
-                && !z_auto_inert(&opts),
+            attn_open: std::cell::Cell::new(0),
+            attn: u8::from(
+                opts.zpages_writer_census && opts.zpages == ZPages::Auto && !z_auto_inert(&opts),
+            ),
             slot: None,
             pin_slot,
             depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Dirty),
             page_snap: std::cell::Cell::new(false),
-            writer_ops: std::cell::Cell::new(0),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts,
@@ -27095,7 +27386,9 @@ impl Db {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
-        };
+        }
+        .paged_bits()
+        .writer_rests();
         let maint = MaintHome::Here(Box::new(Maint::new(
             r.maint_reader()?,
             dir,
@@ -27666,21 +27959,21 @@ impl Db {
             shared,
             counted: false,
             understudy: false,
+            looks: LOOKS_NONE,
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
-            zwin_open: std::cell::Cell::new(false),
-            zcensus: opts.zpages_writer_census
-                && opts.zpages == ZPages::Auto
-                && !z_auto_inert(&opts),
+            attn_open: std::cell::Cell::new(0),
+            attn: u8::from(
+                opts.zpages_writer_census && opts.zpages == ZPages::Auto && !z_auto_inert(&opts),
+            ),
             slot: None,
             pin_slot,
             depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Dirty),
             page_snap: std::cell::Cell::new(false),
-            writer_ops: std::cell::Cell::new(0),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts,
@@ -27690,7 +27983,9 @@ impl Db {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
-        };
+        }
+        .paged_bits()
+        .writer_rests();
         let maint = MaintHome::Here(Box::new(Maint::new(
             r.maint_reader()?,
             dir,
@@ -29964,19 +30259,19 @@ impl Reader {
             shared: self.shared.clone(),
             counted: false,
             understudy: false,
+            looks: LOOKS_NONE,
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
-            zwin_open: std::cell::Cell::new(false),
-            zcensus: false,
+            attn_open: std::cell::Cell::new(0),
+            attn: 0,
             slot: None,
             pin_slot,
             depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Dirty),
             page_snap: std::cell::Cell::new(false),
-            writer_ops: std::cell::Cell::new(0),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts: self.opts.clone(),
@@ -29986,7 +30281,8 @@ impl Reader {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
-        })
+        }
+        .paged_bits())
     }
 
     /// A handle for the seal thread, which publishes the frozen table's
@@ -29997,33 +30293,36 @@ impl Reader {
     /// are taken, and the seal publishes nothing.
     fn seal_reader(&self) -> Option<Reader> {
         let slot = self.shared.readers.claim_engine()?;
-        Some(Reader {
-            shared: self.shared.clone(),
-            counted: false,
-            understudy: false,
-            scan_ns: std::cell::Cell::new([0; 6]),
-            ord_served: std::cell::Cell::new(0),
-            ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
-            zwin: std::cell::Cell::new(ZWindow::closed()),
-            zwin_open: std::cell::Cell::new(false),
-            zcensus: false,
-            slot: Some(slot),
-            pin_slot: None,
-            depth: std::cell::Cell::new(0),
-            isolation: std::cell::Cell::new(Isolation::Dirty),
-            page_snap: std::cell::Cell::new(false),
-            writer_ops: std::cell::Cell::new(0),
-            held: AtomicPtr::new(std::ptr::null_mut()),
-            wm: std::cell::Cell::new(SEE_ALL),
-            opts: self.opts.clone(),
-            fs: FormsCell::new(),
-            signalled: std::cell::Cell::new((0, usize::MAX)),
-            mode_note: std::cell::Cell::new(ModeNote::default()),
-            log_bound: std::cell::Cell::new(usize::MAX),
-            len_bound: std::cell::Cell::new(usize::MAX),
-            force_due: std::cell::Cell::new(false),
-        })
+        Some(
+            Reader {
+                shared: self.shared.clone(),
+                counted: false,
+                understudy: false,
+                looks: LOOKS_NONE,
+                scan_ns: std::cell::Cell::new([0; 6]),
+                ord_served: std::cell::Cell::new(0),
+                ord_declined: std::cell::Cell::new(0),
+                zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
+                zwin: std::cell::Cell::new(ZWindow::closed()),
+                attn_open: std::cell::Cell::new(0),
+                attn: 0,
+                slot: Some(slot),
+                pin_slot: None,
+                depth: std::cell::Cell::new(0),
+                isolation: std::cell::Cell::new(Isolation::Dirty),
+                page_snap: std::cell::Cell::new(false),
+                held: AtomicPtr::new(std::ptr::null_mut()),
+                wm: std::cell::Cell::new(SEE_ALL),
+                opts: self.opts.clone(),
+                fs: FormsCell::new(),
+                signalled: std::cell::Cell::new((0, usize::MAX)),
+                mode_note: std::cell::Cell::new(ModeNote::default()),
+                log_bound: std::cell::Cell::new(usize::MAX),
+                len_bound: std::cell::Cell::new(usize::MAX),
+                force_due: std::cell::Cell::new(false),
+            }
+            .paged_bits(),
+        )
     }
 
     /// A handle for the engine's own use -- the builder ahead's -- which
@@ -30045,19 +30344,21 @@ impl Reader {
             shared: self.shared.clone(),
             counted,
             understudy: false,
+            looks: LOOKS_NONE,
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
-            zwin_open: std::cell::Cell::new(false),
-            zcensus: counted && self.opts.zpages == ZPages::Auto && !z_auto_inert(&self.opts),
+            attn_open: std::cell::Cell::new(0),
+            attn: u8::from(
+                counted && self.opts.zpages == ZPages::Auto && !z_auto_inert(&self.opts),
+            ),
             slot: Some(slot),
             pin_slot: None,
             depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Latest),
             page_snap: std::cell::Cell::new(false),
-            writer_ops: std::cell::Cell::new(0),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts: self.opts.clone(),
@@ -30067,7 +30368,8 @@ impl Reader {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
-        })
+        }
+        .paged_bits())
     }
 }
 
@@ -30239,7 +30541,7 @@ impl Reader {
                 gen,
                 handle: None,
                 rx,
-                stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                stop: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(AHEAD_STOP)),
                 from: self.commit_at().0,
                 since: std::cell::RefCell::new(Since::default()),
                 done: std::cell::Cell::new(true),
@@ -30298,7 +30600,15 @@ impl Reader {
                     .unwrap_or_default()
             })
             .collect();
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The builder's word (`AHEAD_STOP`): to go on, or, under a cipher,
+        // to rest at each block.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            if self.attn & ATTN_PAGED != 0 {
+                AHEAD_REST
+            } else {
+                0
+            },
+        ));
         let posted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
         let flag = stop.clone();
@@ -30327,10 +30637,24 @@ impl Reader {
         });
     }
 
+    /// The builder ahead's look between two blocks where its word is not
+    /// to go on: told to stop, or, under a cipher (`AHEAD_REST`), a rest,
+    /// holding nothing of a file -- the forms it has built are copies and
+    /// the table's bounds positions -- and a stop where the cache of
+    /// plaintext is crowded past the rest (`build_rest`). Whether to stop.
+    #[cold]
+    #[inline(never)]
+    fn ahead_look(&self, word: u8, stop: &std::sync::atomic::AtomicU8) -> bool {
+        word == AHEAD_STOP
+            || self
+                .build_rest_unless(|| stop.load(std::sync::atomic::Ordering::Relaxed) == AHEAD_STOP)
+    }
+
     /// PROTOTYPE: the builder told to stop and joined, its forms dropped.
     fn stop_ahead(&self) {
         if let Some(mut a) = self.fs().ahead.borrow_mut().take() {
-            a.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            a.stop
+                .store(AHEAD_STOP, std::sync::atomic::Ordering::Relaxed);
             if let Some(h) = a.handle.take() {
                 if !h.is_finished() {
                     self.shared.forms_events[2].fetch_add(1, AtomicOrdering::Relaxed);
@@ -30356,8 +30680,7 @@ impl Db {
     /// The guard of one of the writer's operations: see `Op`, and
     /// `WriterOp` for what this one says besides.
     fn op(&self) -> WriterOp {
-        std::mem::forget(self.r.enter());
-        self.r.writer_ops.set(self.r.writer_ops.get() + 1);
+        std::mem::forget(self.r.enter_writer());
         WriterOp(&self.r)
     }
 
@@ -31634,7 +31957,8 @@ type PieceRanks = Vec<Option<std::sync::Arc<Vec<u32>>>>;
 struct Ahead {
     handle: Option<std::thread::JoinHandle<()>>,
     rx: std::sync::mpsc::Receiver<Built>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The builder's word: zero to go on, `AHEAD_STOP`, or `AHEAD_REST`.
+    stop: std::sync::Arc<std::sync::atomic::AtomicU8>,
     /// The generation it builds over: its forms are of that state alone.
     gen: u64,
     /// The write log's length at the commit the builder took its
@@ -31814,7 +32138,7 @@ impl Reader {
     fn build_ahead_job(
         &self,
         at: AtCommit,
-        stop: &std::sync::atomic::AtomicBool,
+        stop: &std::sync::atomic::AtomicU8,
         tx: &std::sync::mpsc::Sender<Built>,
         posted: &std::sync::atomic::AtomicBool,
         held: &[Vec<u8>],
@@ -31888,14 +32212,11 @@ impl Reader {
                 if b == nblocks {
                     break;
                 }
-                // Under a cipher the builder rests between two blocks,
-                // holding nothing of a file: the forms it has built are
-                // copies, and the table's bounds are positions. It stops
-                // where the cache of plaintext is crowded past the rest
-                // (`Reader::build_rest`).
-                if stop.load(std::sync::atomic::Ordering::Relaxed)
-                    || self.build_rest_unless(|| stop.load(std::sync::atomic::Ordering::Relaxed))
-                {
+                // The one word a block: to stop, or, under a cipher, to
+                // rest, which is asked out of line where the word is not
+                // to go on (`ahead_look`).
+                let word = stop.load(std::sync::atomic::Ordering::Relaxed);
+                if word != 0 && self.ahead_look(word, stop) {
                     return Ok(());
                 }
                 // A block the writer holds a form for, or one published
@@ -32737,13 +33058,14 @@ impl Reader {
             shared: self.shared.clone(),
             counted: false,
             understudy: true,
+            looks: LOOKS_UNDERSTUDY,
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
-            zwin_open: std::cell::Cell::new(false),
-            zcensus: false,
+            attn_open: std::cell::Cell::new(0),
+            attn: 0,
             slot: None,
             // A slot of its own for the passes, which pin it as the
             // writer's operations pin the writer's.
@@ -32751,7 +33073,6 @@ impl Reader {
             depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Dirty),
             page_snap: std::cell::Cell::new(false),
-            writer_ops: std::cell::Cell::new(0),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts: self.opts.clone(),
@@ -32762,6 +33083,7 @@ impl Reader {
             force_due: std::cell::Cell::new(false),
             fs: FormsCell::empty(),
         }
+        .paged_bits()
     }
 
     /// The upkeep thread's loop, on an understudy: see `Lend`.
@@ -41582,6 +41904,54 @@ mod snap_arena {
             for (off, bytes) in h.join().unwrap() {
                 assert_eq!(a.slice(off, 4), &bytes[..]);
             }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod cipher_looks {
+    use super::*;
+
+    /// The forms' word for "nobody has asked for them to be given up" is
+    /// the cipher's own in a store under one, and the looks of the
+    /// writer's fills are rests there: at the store's making, and again
+    /// once the forms were given up on an ask, which writes the word
+    /// afresh. A plain store's word and its writer's looks are what they
+    /// were, which is what makes its every look the two tests it was.
+    #[test]
+    fn the_forms_word_under_a_cipher_is_a_rest_and_stays_one() {
+        for paged in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "supdb-next-cipher-looks-{paged}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let opts = Options {
+                encryption: if paged {
+                    Encryption::Cipher(vault::tests::cipher(3))
+                } else {
+                    Encryption::None
+                },
+                ..Options::default()
+            };
+            let db = Db::create(&dir, opts).unwrap();
+            let (word, looks) = if paged {
+                (REST_HERE, LOOKS_WRITER_RESTS)
+            } else {
+                (u64::MAX, LOOKS_NONE)
+            };
+            let _op = db.op();
+            assert_eq!(db.r.looks, looks, "paged {paged}");
+            assert_eq!(db.r.fs().abandoned.get(), word, "paged {paged}");
+            assert!(!db.r.abandon_pending());
+            assert!(!db.r.abandon_forms(), "nothing was asked");
+            assert_eq!(db.r.fs().abandoned.get(), word);
+            // An ask noted, at a scan count: pending until the forms go.
+            db.r.fs().abandoned.set(7);
+            assert!(db.r.abandon_pending());
+            assert!(db.r.abandon_forms());
+            assert_eq!(db.r.fs().abandoned.get(), word, "after the forms went");
+            assert!(!db.r.abandon_pending());
         }
     }
 }
