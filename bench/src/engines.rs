@@ -731,6 +731,10 @@ pub struct Supdb {
     /// A point read through a form file asks no filter
     /// (`Options::zpages_point_filter` off): `supdb-nocachezpagesnofilter`.
     znopointfilter: bool,
+    /// The filter's block asked for at a point read's start, the fence
+    /// searched while it comes in (`Options::zpages_filter_ahead` on):
+    /// `supdb-zfilterahead`.
+    zfilterahead: bool,
     /// Every decode of a walk through a form file put in the memo, no
     /// first touch decoded into the cursor's own buffer
     /// (`Options::zpages_scan_admit` off): `supdb-zscanputs`.
@@ -1945,6 +1949,10 @@ struct Policy {
     /// A point read through a form file asks no filter
     /// (`Options::zpages_point_filter` off): `supdb-nocachezpagesnofilter`.
     znopointfilter: bool,
+    /// The filter's block asked for at a point read's start, the fence
+    /// searched while it comes in (`Options::zpages_filter_ahead` on):
+    /// `supdb-zfilterahead`.
+    zfilterahead: bool,
     /// Every decode of a walk through a form file put in the memo, no
     /// first touch decoded into the cursor's own buffer
     /// (`Options::zpages_scan_admit` off): `supdb-zscanputs`.
@@ -2755,6 +2763,7 @@ impl Default for Policy {
             zpointwhole: false,
             znopointkeys: false,
             znopointfilter: false,
+            zfilterahead: false,
             zscanputs: false,
             zwalkwhole: false,
             zbulkmemo: false,
@@ -3412,6 +3421,33 @@ impl Supdb {
             path,
             Policy {
                 zhotgrowth5: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose point reads through a form file ask for the filter's
+    /// block at their start and search the fence while it comes in
+    /// (`Options::zpages_filter_ahead` on).
+    pub fn create_zfilterahead(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zfilterahead: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-nocachezpages` with the filter asked ahead of the fence
+    /// (`Options::zpages_filter_ahead` on).
+    pub fn create_nocache_zpages_filterahead(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                block_cache: false,
+                zpages: true,
+                zfilterahead: true,
                 ..Policy::default()
             },
         )
@@ -8263,6 +8299,7 @@ impl Supdb {
             zpointwhole,
             znopointkeys,
             znopointfilter,
+            zfilterahead,
             zscanputs,
             zwalkwhole,
             zbulkmemo,
@@ -8731,6 +8768,7 @@ impl Supdb {
             zpages_point_part: !zpointwhole,
             zpages_point_keys: !znopointkeys,
             zpages_point_filter: !znopointfilter,
+            zpages_filter_ahead: zfilterahead,
             zpages_scan_admit: !zscanputs,
             zpages_walk_part: !zwalkwhole,
             zpages_bulk_admit: !zbulkmemo,
@@ -9153,6 +9191,7 @@ impl Supdb {
             zpointwhole,
             znopointkeys,
             znopointfilter,
+            zfilterahead,
             zscanputs,
             zwalkwhole,
             zbulkmemo,
@@ -10339,8 +10378,14 @@ impl Engine for Supdb {
         if self.zpages && !self.block_cache && self.znopointfilter {
             return "supdb-nocachezpagesnofilter";
         }
+        if self.zpages && !self.block_cache && self.zfilterahead {
+            return "supdb-nocachezpagesfilterahead";
+        }
         if self.znopointfilter {
             return "supdb-znofilter";
+        }
+        if self.zfilterahead {
+            return "supdb-zfilterahead";
         }
         if self.zpointwhole && self.znopointkeys && self.zscanputs {
             return "supdb-zmemoplain";
@@ -11997,6 +12042,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocachezpagesnopointkeys"
         | "supdb-nocachezpagesnofilter"
         | "supdb-znofilter"
+        | "supdb-zfilterahead"
+        | "supdb-nocachezpagesfilterahead"
         | "supdb-nocachezpagessettle"
         | "supdb-autozpages"
         | "supdb-nozpages"
@@ -12547,6 +12594,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         }
         "supdb-nocachezpagesnofilter" => supdb_arm(Supdb::create_nocache_zpages_nofilter, dir)?,
         "supdb-znofilter" => supdb_arm(Supdb::create_znofilter, dir)?,
+        "supdb-zfilterahead" => supdb_arm(Supdb::create_zfilterahead, dir)?,
+        "supdb-nocachezpagesfilterahead" => {
+            supdb_arm(Supdb::create_nocache_zpages_filterahead, dir)?
+        }
         "supdb-nocachezpagessettle" => supdb_arm(Supdb::create_nocache_zpages_settle, dir)?,
         "supdb-autozpages" => supdb_arm(Supdb::create_auto_zpages, dir)?,
         "supdb-nozpages" => supdb_arm(Supdb::create_nozpages, dir)?,
@@ -15888,6 +15939,13 @@ mod tests {
                 assert!(!o.scan_raw_ahead_past_llc && b.scan_raw_ahead_lead == 0);
             }
             {
+                let z = Supdb::create_zfilterahead(&dir("zfilterahead")).unwrap();
+                assert_eq!(z.name(), "supdb-zfilterahead");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_filter_ahead && !b.zpages_filter_ahead);
+            }
+            {
                 let z = Supdb::create_znofilter(&dir("znofilter")).unwrap();
                 assert_eq!(z.name(), "supdb-znofilter");
                 assert_eq!(z.features(), base.features());
@@ -17424,6 +17482,11 @@ mod tests {
                 "nofilter",
             ),
             (
+                "supdb-nocachezpagesfilterahead",
+                Supdb::create_nocache_zpages_filterahead,
+                "filterahead",
+            ),
+            (
                 "supdb-nocachezpagescheckedviews",
                 Supdb::create_nocache_zpages_checkedviews,
                 "checkedviews",
@@ -17466,6 +17529,7 @@ mod tests {
             assert_eq!(arm.zrawtails, arm_dir == "recordraw");
             assert_eq!(arm.znopointkeys, arm_dir == "nopointkeys");
             assert_eq!(arm.znopointfilter, arm_dir == "nofilter");
+            assert_eq!(arm.zfilterahead, arm_dir == "filterahead");
             assert_eq!(
                 arm.db.as_ref().unwrap().options().zpages_point_filter,
                 arm_dir != "nofilter"

@@ -2344,6 +2344,9 @@ pub(super) struct ZMemo {
     /// A point read asks the form file's filter before its fence
     /// (`Options::zpages_point_filter`); on in a memo made without it.
     point_filter: bool,
+    /// The filter's block asked for at the read's start and the fence
+    /// searched before the filter is (`Options::zpages_filter_ahead`).
+    filter_ahead: bool,
     /// A walk's first touch of a group is decoded into the cursor's own
     /// buffer and the memo takes it at its second
     /// (`Options::zpages_scan_admit`).
@@ -2397,6 +2400,7 @@ impl ZMemo {
             point_part: false,
             point_keys: false,
             point_filter: true,
+            filter_ahead: false,
             scan_admit: false,
             walk_part: false,
             bulk_admit: false,
@@ -2455,6 +2459,13 @@ impl ZMemo {
     /// (`Options::zpages_point_filter`).
     pub(super) fn point_filter(mut self, on: bool) -> ZMemo {
         self.point_filter = on;
+        self
+    }
+
+    /// The memo with the filter asked ahead of the fence
+    /// (`Options::zpages_filter_ahead`).
+    pub(super) fn filter_ahead(mut self, on: bool) -> ZMemo {
+        self.filter_ahead = on;
         self
     }
 
@@ -3361,11 +3372,22 @@ impl ZFile {
         // alone, and a group's bytes do not change under an identity, so a
         // place put for this identity is a record's start for good.
         let keyed = memo.point_keys && self.memo && !key.is_empty();
-        let kh = if keyed {
+        // The filter's block asked for now and the fence searched while it
+        // comes in (`Options::zpages_filter_ahead`): the probe was a line
+        // the core's cache did not hold for a cold key, waited for alone.
+        let filter = self.filter.as_ref().filter(|_| memo.point_filter);
+        let ahead = memo.filter_ahead && filter.is_some();
+        let hashed = keyed || ahead;
+        let kh = if hashed {
             super::BlockedBloom::hash(key)
         } else {
             0
         };
+        if ahead {
+            if let Some(f) = filter {
+                f.prefetch_hash(kh);
+            }
+        }
         if keyed {
             if let Some((page, index, off)) = memo.key_at(self.id, kh) {
                 if let Some((g, n)) = memo.peek(self.id, page, index, self.memo_hashed) {
@@ -3383,22 +3405,25 @@ impl ZFile {
             }
         }
         // A key the filter does not hold is not in the partition: answered
-        // from the heap, no page touched.
-        if memo.point_filter
-            && self.filter.as_ref().is_some_and(|f| {
-                if keyed {
-                    !f.maybe_contains_hash(kh)
-                } else {
-                    !f.maybe_contains(key)
-                }
-            })
-        {
+        // from the heap, no page touched. Asked ahead, the fence is searched
+        // first and the filter after it, the same answers in another order.
+        let filtered_out = |f: &super::BlockedBloom| {
+            if hashed {
+                !f.maybe_contains_hash(kh)
+            } else {
+                !f.maybe_contains(key)
+            }
+        };
+        if !ahead && filter.is_some_and(filtered_out) {
             return Locate::Absent { decoded: false };
         }
         // A key below the first key is not in the partition.
         let Some(e) = self.fence.entry_of(key) else {
             return Locate::Absent { decoded: false };
         };
+        if ahead && filter.is_some_and(filtered_out) {
+            return Locate::Absent { decoded: false };
+        }
         let Some(p) = self.fence.page(e) else {
             return Locate::Fallback;
         };

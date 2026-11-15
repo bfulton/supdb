@@ -1628,6 +1628,17 @@ pub struct Options {
     /// the forced form without it.
     #[doc(hidden)]
     pub zpages_point_filter: bool,
+    /// A point read through a form file asks for its filter's block at
+    /// the read's start and searches the fence while the line comes in,
+    /// the filter asked after the fence where it was asked before it: the
+    /// filter's probe was a line the core's cache did not hold, waited for
+    /// on its own at every read of a cold key. The answers are the same,
+    /// an absent key answered with no page touched either way. Off: the
+    /// filter first, the shape before; `supdb-nocachezpagesfilterahead`
+    /// prices it on the forced form and `supdb-zfilterahead` on the
+    /// default.
+    #[doc(hidden)]
+    pub zpages_filter_ahead: bool,
     /// EXPERIMENT: a walk's first touch of a group through a form file is
     /// decoded into its cursor's own buffer and put nowhere, and the
     /// handle's memo takes a group at its second touch while the first's
@@ -5927,6 +5938,7 @@ impl Default for Options {
             zpages_point_part: true,
             zpages_point_keys: true,
             zpages_point_filter: true,
+            zpages_filter_ahead: false,
             zpages_scan_admit: true,
             zpages_bulk_admit: true,
             zpages_bulk_ahead: true,
@@ -7366,6 +7378,14 @@ impl BlockedBloom {
     #[inline]
     fn maybe_contains_fnv(&self, fnv: u64) -> bool {
         self.maybe_contains_hash(BlockedBloom::finalize(fnv))
+    }
+
+    /// A hint to fetch the block `maybe_contains_hash(h)` reads; nothing
+    /// is read.
+    #[inline]
+    fn prefetch_hash(&self, h: u64) {
+        let bi = (h >> 32) as usize % self.blocks.len();
+        prefetch_lines(self.blocks[bi].as_ptr() as *const u8, 64);
     }
 
     #[inline]
@@ -32878,6 +32898,7 @@ impl Db {
             zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes)
                 .point(opts.zpages_point_part, opts.zpages_point_keys)
                 .point_filter(opts.zpages_point_filter)
+                .filter_ahead(opts.zpages_filter_ahead)
                 .scans(opts.zpages_scan_admit, opts.zpages_walk_part)
                 .bulk(
                     opts.zpages_bulk_admit,
@@ -33676,6 +33697,7 @@ impl Db {
             zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes)
                 .point(opts.zpages_point_part, opts.zpages_point_keys)
                 .point_filter(opts.zpages_point_filter)
+                .filter_ahead(opts.zpages_filter_ahead)
                 .scans(opts.zpages_scan_admit, opts.zpages_walk_part)
                 .bulk(
                     opts.zpages_bulk_admit,
@@ -36538,6 +36560,7 @@ impl Reader {
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
                 .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
                 .point_filter(self.opts.zpages_point_filter)
+                .filter_ahead(self.opts.zpages_filter_ahead)
                 .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
                 .bulk(
                     self.opts.zpages_bulk_admit,
@@ -36586,6 +36609,7 @@ impl Reader {
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
                 .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
                 .point_filter(self.opts.zpages_point_filter)
+                .filter_ahead(self.opts.zpages_filter_ahead)
                 .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
                 .bulk(
                     self.opts.zpages_bulk_admit,
@@ -36641,6 +36665,7 @@ impl Reader {
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
                 .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
                 .point_filter(self.opts.zpages_point_filter)
+                .filter_ahead(self.opts.zpages_filter_ahead)
                 .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
                 .bulk(
                     self.opts.zpages_bulk_admit,
@@ -39680,6 +39705,7 @@ impl Reader {
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
                 .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
                 .point_filter(self.opts.zpages_point_filter)
+                .filter_ahead(self.opts.zpages_filter_ahead)
                 .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
                 .bulk(
                     self.opts.zpages_bulk_admit,
