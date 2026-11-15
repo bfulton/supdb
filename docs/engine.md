@@ -7962,6 +7962,27 @@ The comparators' check, registered before its first run. The suite's comparator 
   ms inside a pass of thirteen that visits a ninth of them, and in some
   reps of both arms the first scan waits 2-9 ms for the upkeep's pass in
   flight. Both are open.
+  Taking the megabyte off the buying commit's path was built and refuted
+  (`Options::wal_ahead_beside`; `supdb-walaheadbeside` is the arm): the
+  commit appends and syncs its frames, then a helper writes the reach in
+  zeros and syncs them, and the log's next write joins the helper first.
+  The helper's megabyte is about three milliseconds of writes and an
+  fdatasync of its own here, and a write mix commits every few hundred
+  microseconds, so the next commit waits out nearly all of it, where
+  inline the zeros cost their writes and ride the buying commit's one
+  flush. Paired at the commit that brought the option (`SUPDB_MIX_KINDS=1
+  SUPDB_MIX_COUNTERS=1 SUPDB_MIX_EVENTS=1 bench ab --arms
+  supdb-walaheadbeside,supdb --size N --reps 12` and the arms the other way,
+  at ten, thirty and a hundred thousand keys), the writer's wait for the
+  reaches (`wal_ahead_wait_us`, the inline arm's zeros or the helper's
+  joins) read 18.3-18.4 ms beside against 2.8-3.0 inline at a hundred
+  thousand keys, six reaches in each arm, and 3.2-3.3 against 0.55 at
+  thirty, one reach each, in both orders; at a hundred thousand the cells
+  that write read for the inline shape in both orders (the load 1.05x and
+  1.12x, the shuffled load 1.07x and 1.05x, A 1.06x and 1.08x, B 1.14x and
+  1.08x) and the rest moved with the order. At ten thousand neither arm
+  bought a reach, so that sitting is the noise floor: the two arms ran the
+  same code and their cells moved 3-25%, D at twelve pairs of twelve.
 - **Group commit** — whether concurrent writers share a barrier; matters
   only after P-D.
 - **Read and write concurrency** — being built, readers first, in the

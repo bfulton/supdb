@@ -2731,6 +2731,26 @@ pub struct Options {
     /// thousand writes (`CLAUDE.md`). `supdb-walaheadflat` is that shape.
     #[doc(hidden)]
     pub wal_ahead_small_runs: bool,
+    /// The log's pre-write made beside the commit that buys it, on a
+    /// helper thread, and not ahead of the commit's frames on the writer's
+    /// path (`wal_ahead_bytes`): the commit appends its frames and syncs
+    /// them, and only then is the reach handed to a helper, which writes it
+    /// in zeros and syncs them. The log's next write joins the helper
+    /// before it writes, so the two never write the file at once and the
+    /// reach counts as pre-written only once its zeros are synced; an
+    /// error the helper's sync met is that write's, since the helper's
+    /// handle shares the file's description and the error is reported
+    /// once to it. Refuted, and off: the helper's zeros and its own
+    /// fdatasync take about three milliseconds a mebibyte here, a write
+    /// mix commits every few hundred microseconds, and the next commit
+    /// waits out the whole of it at the join, where inline the zeros ride
+    /// the buying commit's one flush -- the writer's wait for the reaches
+    /// read 18 ms against 3 at a hundred thousand keys and 3.2 against 0.55
+    /// at thirty, the same reaches bought in both, in both orders
+    /// (`docs/engine.md`, the log's pre-write). `supdb-walaheadbeside` is
+    /// the arm.
+    #[doc(hidden)]
+    pub wal_ahead_beside: bool,
     /// The ordered scan's merge over unrouted sources. `true` is the merge
     /// that replaced the original: one cursor over the disjoint partitions
     /// in order rather than one per partition, each cursor's key resolved
@@ -5922,6 +5942,7 @@ impl Default for Options {
             wal_recycle_pads: true,
             wal_ahead_bytes: 1 << 20,
             wal_ahead_small_runs: true,
+            wal_ahead_beside: false,
             read_advice: ReadAdvice::default(),
             scan_readahead_bytes: 256 << 10,
             scan_merge: true,
@@ -6228,6 +6249,20 @@ struct Wal {
     ahead_runs: bool,
     ahead_run: u64,
     cap: u64,
+    /// The pre-write made on a helper after the commit's sync
+    /// (`Options::wal_ahead_beside`): the reach a write found due, handed
+    /// to the helper at the sync after it, and the helper in flight, which
+    /// answers the end it pre-wrote and is joined before the file is
+    /// written or synced again.
+    beside: bool,
+    zero_due: Option<(u64, u64)>,
+    zeroing: Option<std::thread::JoinHandle<std::io::Result<u64>>>,
+    /// A test's failure for the next helper (`Db::fail_next_wal_zeroing`).
+    zero_fail: bool,
+    /// The pre-writes this file made, and the time the writer spent on
+    /// them: writing the zeros inline, or waiting at a join beside.
+    ahead_writes: u64,
+    ahead_wait_ns: u64,
 }
 
 /// The pre-write ahead of the log's tail and the length it stops at, where
@@ -6328,6 +6363,18 @@ const WAL_PUT: u8 = 0;
 const WAL_DEL: u8 = 1;
 const WAL_COMMIT: u8 = 2;
 
+/// A helper still writing the reach joined at the file's close, since a
+/// closed file is a spare to recycle, and a helper still writing zeros into
+/// a recycled file would write them over its next life's frames
+/// (`Options::wal_ahead_beside`).
+impl Drop for Wal {
+    fn drop(&mut self) {
+        if let Some(h) = self.zeroing.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 impl Wal {
     fn create(path: &Path, id: u64, kind: u8) -> Result<Wal> {
         let mut file = OpenOptions::new()
@@ -6353,6 +6400,12 @@ impl Wal {
             ahead_runs: false,
             ahead_run: 0,
             cap: 0,
+            beside: false,
+            zero_due: None,
+            zeroing: None,
+            zero_fail: false,
+            ahead_writes: 0,
+            ahead_wait_ns: 0,
         })
     }
 
@@ -6419,6 +6472,12 @@ impl Wal {
             ahead_runs: false,
             ahead_run: 0,
             cap: 0,
+            beside: false,
+            zero_due: None,
+            zeroing: None,
+            zero_fail: false,
+            ahead_writes: 0,
+            ahead_wait_ns: 0,
         };
         Ok(wal)
     }
@@ -6429,9 +6488,10 @@ impl Wal {
     /// once its run of small writes has written `ahead`
     /// (`Options::wal_ahead_small_runs`); without, whenever a write comes
     /// within half of `ahead` of what is pre-written.
-    fn set_ahead(&mut self, ahead: u64, runs: bool, cap: u64, pads: bool) {
+    fn set_ahead(&mut self, ahead: u64, runs: bool, cap: u64, pads: bool, beside: bool) {
         self.ahead = ahead;
         self.ahead_runs = runs;
+        self.beside = beside;
         self.cap = cap;
         self.pads = pads;
         self.extent = self.extent.max(self.written);
@@ -6512,6 +6572,12 @@ impl Wal {
             ahead_runs: false,
             ahead_run: 0,
             cap: 0,
+            beside: false,
+            zero_due: None,
+            zeroing: None,
+            zero_fail: false,
+            ahead_writes: 0,
+            ahead_wait_ns: 0,
         })
     }
 
@@ -6580,6 +6646,7 @@ impl Wal {
         if self.pending.is_empty() {
             return Ok(());
         }
+        self.join_zeroing()?;
         let end = self.written + self.pending.len() as u64;
         let grow = if self.ahead == 0 {
             false
@@ -6598,9 +6665,25 @@ impl Wal {
             self.ahead_run += self.pending.len() as u64;
             end > self.extent && self.ahead_run >= self.ahead
         };
+        let mut due = None;
         if grow && self.extent < self.cap {
             let to = ((end + self.ahead).min(self.cap) + zselect::PAGE - 1) & !(zselect::PAGE - 1);
-            self.extend_to(end, to)?;
+            if self.beside {
+                // Handed to a helper once this write's frames are synced;
+                // none for a write that reaches the rotation's size (the
+                // stop less a reach, `wal_ahead`), since the log rotates
+                // behind it, the reach would serve no frame, and the
+                // file's close would wait for the helper on the commit's
+                // path.
+                if end + self.ahead < self.cap {
+                    due = Some((end, to));
+                }
+            } else {
+                let t = std::time::Instant::now();
+                self.extend_to(end, to)?;
+                self.ahead_writes += 1;
+                self.ahead_wait_ns += t.elapsed().as_nanos() as u64;
+            }
         }
         // Inside a pre-written or recycled file, the write runs to its last
         // page's end in zeros, so that page is written whole and never read
@@ -6621,12 +6704,89 @@ impl Wal {
         }
         self.written = end;
         self.pending.clear();
+        // A reach bought by an earlier write and not yet handed over is
+        // this write's to buy again or to leave, so a reach handed over is
+        // always the last write's and starts at the tail: a large write
+        // that ends the run leaves it, as it would have found it
+        // pre-written inline and bought nothing (`Options::wal_ahead_beside`).
+        self.zero_due = due;
         Ok(())
     }
 
     fn sync(&mut self) -> Result<()> {
+        self.join_zeroing()?;
         self.file.sync_data()?;
         self.synced = self.written;
+        if let Some((end, to)) = self.zero_due.take() {
+            self.launch_zeroing(end, to);
+        }
+        Ok(())
+    }
+
+    /// The reach a write found due written in zeros and synced on a helper
+    /// (`Options::wal_ahead_beside`), from what is pre-written or the page
+    /// after `end` out to `to`, in page-sized writes as `extend_to` writes
+    /// them, at their offsets: the helper's handle shares the file's
+    /// description and its cursor, which a positioned write leaves where
+    /// the writer put it. A handle or a thread that cannot be had leaves
+    /// the reach unwritten, as a pre-write is only ever a saving.
+    fn launch_zeroing(&mut self, end: u64, to: u64) {
+        // The reach is the last write's, since every write takes back what
+        // an earlier one bought (`Wal::write`), so it starts at the tail as
+        // the sync finds it; and from the tail all the same, since zeros
+        // laid from an earlier write's end would lie over the frames
+        // written since.
+        debug_assert_eq!(end, self.written, "a reach handed over is the last write's");
+        let end = end.max(self.written);
+        let page_end = (end + zselect::PAGE - 1) & !(zselect::PAGE - 1);
+        let from = self.extent.max(page_end);
+        if from >= to {
+            return;
+        }
+        let Ok(file) = self.file.try_clone() else {
+            return;
+        };
+        let fail = std::mem::take(&mut self.zero_fail);
+        let spawned = std::thread::Builder::new()
+            .name("supdb-walzero".into())
+            .spawn(move || -> std::io::Result<u64> {
+                use std::os::unix::fs::FileExt;
+                let zeros = [0u8; 4096];
+                let mut at = from;
+                while at < to {
+                    let n = (zeros.len() as u64).min(to - at) as usize;
+                    file.write_all_at(&zeros[..n], at)?;
+                    at += n as u64;
+                }
+                if fail {
+                    return Err(std::io::Error::other(
+                        "an injected failure of the log's pre-write",
+                    ));
+                }
+                file.sync_data()?;
+                Ok(to)
+            });
+        if let Ok(h) = spawned {
+            self.zeroing = Some(h);
+            self.ahead_writes += 1;
+        }
+    }
+
+    /// The helper in flight joined, the reach it pre-wrote counted as
+    /// pre-written, and its error, which its sync took from the file's
+    /// description, answered as the caller's (`Options::wal_ahead_beside`).
+    fn join_zeroing(&mut self) -> Result<()> {
+        let Some(h) = self.zeroing.take() else {
+            return Ok(());
+        };
+        let t = std::time::Instant::now();
+        let joined = h.join();
+        self.ahead_wait_ns += t.elapsed().as_nanos() as u64;
+        let to = match joined {
+            Ok(r) => r?,
+            Err(_) => return Err(std::io::Error::other("the log's pre-write panicked")),
+        };
+        self.extent = self.extent.max(to);
         Ok(())
     }
 
@@ -20237,6 +20397,9 @@ pub struct Db {
     upkeep_since_scan: u64,
     /// The runs of commits between scans (`Options::upkeep_pace_syncs_model`).
     pace_runs: PaceRuns,
+    /// The pre-writes the log's closed files made and the writer's time on
+    /// them (`Wal::ahead_writes`), for `Db::wal_ahead_counts`.
+    wal_ahead_done: (u64, u64),
     /// `Options::scan_forms_off_stale_writes`: the writes made in small
     /// commits, with the forms given up, since the store's last scan or
     /// the last batch of a burst; and what the count is taken against, the
@@ -32097,6 +32260,8 @@ impl Db {
         new_wal.seq = self.wal.seq;
         let old_wal = std::mem::replace(&mut self.wal, new_wal);
         self.wal_id += 1;
+        self.wal_ahead_done.0 += old_wal.ahead_writes;
+        self.wal_ahead_done.1 += old_wal.ahead_wait_ns;
         SealCounts::add(
             &self.shared.seal_counts.rotated_unsynced,
             old_wal.written - old_wal.synced.min(old_wal.written),
@@ -32302,14 +32467,26 @@ impl Db {
             if let Some(spare) = self.shared.take_spare() {
                 let mut wal = Wal::recycle(&spare, &path, id, kind, self.opts.wal_recycle_pads)?;
                 if let Some((ahead, runs, cap)) = ahead {
-                    wal.set_ahead(ahead, runs, cap, self.opts.wal_recycle_pads);
+                    wal.set_ahead(
+                        ahead,
+                        runs,
+                        cap,
+                        self.opts.wal_recycle_pads,
+                        self.opts.wal_ahead_beside,
+                    );
                 }
                 return Ok(wal);
             }
             let mut wal = Wal::create(&path, id, kind)?;
             match ahead {
                 Some((ahead, runs, cap)) => {
-                    wal.set_ahead(ahead, runs, cap, self.opts.wal_recycle_pads);
+                    wal.set_ahead(
+                        ahead,
+                        runs,
+                        cap,
+                        self.opts.wal_recycle_pads,
+                        self.opts.wal_ahead_beside,
+                    );
                     // A run of small commits goes on across the rotation
                     // (`Options::wal_ahead_small_runs`).
                     wal.ahead_run = self.wal.ahead_run;
@@ -32441,7 +32618,13 @@ impl Db {
         if let Some((ahead, runs, cap)) = wal_ahead(&opts) {
             // Pre-written as the commits reach it, and no spare until a
             // retired file is one.
-            wal.set_ahead(ahead, runs, cap, opts.wal_recycle_pads);
+            wal.set_ahead(
+                ahead,
+                runs,
+                cap,
+                opts.wal_recycle_pads,
+                opts.wal_ahead_beside,
+            );
         } else if opts.recycle_wal && opts.wal_ahead_bytes == 0 {
             // The live file and one spare, both written through, so the
             // first rotation recycles too and no rotation ever pays the
@@ -32705,6 +32888,7 @@ impl Db {
             upkeep_life: 0,
             upkeep_since_scan: 0,
             pace_runs: PaceRuns::default(),
+            wal_ahead_done: (0, 0),
             forms_off_quiet: 0,
             forms_off_log: (0, 0),
             forms_off_life: 0,
@@ -33242,7 +33426,13 @@ impl Db {
         }
         let mut wal = Wal::open_append(&wal_path, wal_id, from)?;
         if let Some((ahead, runs, cap)) = wal_ahead(&opts) {
-            wal.set_ahead(ahead, runs, cap, opts.wal_recycle_pads);
+            wal.set_ahead(
+                ahead,
+                runs,
+                cap,
+                opts.wal_recycle_pads,
+                opts.wal_ahead_beside,
+            );
         }
         let next_seg = seg_ids.iter().map(|&(n, _)| n + 1).max().unwrap_or(0);
         let spare_wal = spare_wals
@@ -33499,6 +33689,7 @@ impl Db {
             upkeep_life: 0,
             upkeep_since_scan: 0,
             pace_runs: PaceRuns::default(),
+            wal_ahead_done: (0, 0),
             forms_off_quiet: 0,
             forms_off_log: (0, 0),
             forms_off_life: 0,
@@ -37219,6 +37410,32 @@ impl Db {
         (self.wal.path.clone(), self.wal.synced, self.wal.written)
     }
 
+    /// The log's pre-writes and the writer's time on them in nanoseconds:
+    /// the zeros' writes inline, or its joins' waits beside
+    /// (`Options::wal_ahead_beside`).
+    pub fn wal_ahead_counts(&self) -> (u64, u64) {
+        (
+            self.wal_ahead_done.0 + self.wal.ahead_writes,
+            self.wal_ahead_done.1 + self.wal.ahead_wait_ns,
+        )
+    }
+
+    /// A test's: the log's pre-write in flight joined, and the length of
+    /// the live file after it (`Options::wal_ahead_beside`).
+    #[doc(hidden)]
+    pub fn wal_join_ahead(&mut self) -> Result<u64> {
+        self.wal.join_zeroing()?;
+        Ok(self.wal.file.metadata()?.len())
+    }
+
+    /// A test's: the log's next pre-write beside fails after its zeros are
+    /// written and before its sync, as a sync that met an error would
+    /// (`Options::wal_ahead_beside`).
+    #[doc(hidden)]
+    pub fn fail_next_wal_zeroing(&mut self) {
+        self.wal.zero_fail = true;
+    }
+
     /// A test's: whether the run of ordered ingest in progress holds
     /// commits no sync has covered, none where no run is open; and the
     /// count of runs that closed so and that no sync by policy has
@@ -37251,7 +37468,15 @@ impl Db {
     /// keeps the lock, and the reopen is refused as a second open.
     #[doc(hidden)]
     pub fn crash(self) {
-        std::mem::ManuallyDrop::new(self).lock.release();
+        let mut me = std::mem::ManuallyDrop::new(self);
+        // A dead process's threads write nothing after it, and a helper
+        // still writing the log's reach would write over what a reopen
+        // appends; joined, it leaves zeros past the tail, which a crash
+        // inside its writes leaves too (`Options::wal_ahead_beside`).
+        if let Some(h) = me.wal.zeroing.take() {
+            let _ = h.join();
+        }
+        me.lock.release();
     }
 
     /// Commit what is pending, seal the rest. Close is a convenience, not a

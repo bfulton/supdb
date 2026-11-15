@@ -284,7 +284,12 @@ hints them, an fdatasync costs a third of a millisecond and then about
 is free and a sync issued while the CPU has a millisecond of work ahead
 of it is a millisecond of device time hidden (`Options::close_presync`,
 the records synced by the waiting writer while the seal thread composes
-the trailer); a write to the file under a concurrent fdatasync stalls
+the trailer), and a sync handed to a helper is hidden only while nothing
+needs the file before it ends: the log's pre-write moved to a helper
+after the buying commit's sync was waited out whole by the next commit,
+which a write mix makes a few hundred microseconds later, where inline
+its zeros had ridden the commit's own flush (`Options::wal_ahead_beside`,
+refuted); a write to the file under a concurrent fdatasync stalls
 until the journal's commit is through, in some reps and not others, so
 the overlap is read in the drain's stamps and not assumed. So price a
 sync by who issues the fsync and when, not by how much is dirty, and
