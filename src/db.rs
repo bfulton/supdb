@@ -5337,6 +5337,15 @@ pub struct Options {
     /// partition read thinly still sums as many looks as it needs, up to
     /// the window. Off: the whole window, the shape before;
     /// `supdb-zhotfast` prices it with `zpages_hot_release_resident`.
+    /// Priced on C at ten million keys under 1.25 GiB it asked for the
+    /// Zipfian head a look sooner and read C level (1.02x in three pairs
+    /// of three): C divided is a third of a second, the head's raw pages
+    /// are not resident at its start, and a look to see the skew and a
+    /// device read of the partition land the release at C's end in every
+    /// rep (`bench ab --arms supdb,supdb-zhotfast --size 10000000 --bound
+    /// 1342177280 --passes
+    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+    /// --ops-div 10 --reps 3` with `SUPDB_ZPAGES_TRACE=1`, at `96cb2af`).
     #[doc(hidden)]
     pub zpages_hot_raw_evidence: bool,
     /// A fill's ask for a partition whose raw records the cache already

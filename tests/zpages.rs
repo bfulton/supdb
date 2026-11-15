@@ -11683,6 +11683,98 @@ fn the_hot_raw_policy_rates_a_partitions_skew_over_the_windows_looks() {
     }
 }
 
+/// Under `Options::zpages_hot_raw_evidence` a partition's skew is read
+/// over the shortest run of the latest looks whose sampled events reach
+/// the floor: a burst that passes the floor in one look is rated on that
+/// look, where the window of `HOT_RAW_WINDOW` looks averaged it with the
+/// looks before it. Every partition read alike for a window, half the
+/// floor's events a look each, and then one look of four times that on one
+/// of them: over the window it reads 1.375 times the median, under the
+/// bar, and over the look that passes the floor four times the median's
+/// rate a look, over it.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_hot_raw_policy_rates_a_burst_on_the_looks_that_pass_the_floor() {
+    for on in [true, false] {
+        let what = format!("hot raw evidence {on}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-hotevidence-{on}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_hot_raw = true;
+                o.zpages_hot_raw_slack = true;
+                o.zpages_hot_raw_evidence = on;
+                o.zpages_hot_fill = false;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        let c = db.zpage_counts();
+        assert!(c.form_files >= 5, "{what}: partitions to choose from: {c:?}");
+        let (partitions, total) = (c.partitions, c.file_bytes);
+        inject.set_budget(total * 4);
+        inject.set_slack(total * 4);
+        let parts: Vec<Vec<Vec<u8>>> = (0..partitions as usize)
+            .map(|i| keys_of_partition(&db, &model, i))
+            .collect();
+        // Half the floor's sampled events a look on the mean partition,
+        // every partition read alike a key: one decode a read with the
+        // memo off, one event in sixteen sampled.
+        let half = usize::try_from(supdb::db::HOT_RAW_MIN_SAMPLES).unwrap() * 16 / 2;
+        let mean = parts.iter().map(Vec::len).sum::<usize>() / parts.len();
+        let alike = |p: &Vec<Vec<u8>>| half * p.len() / mean;
+        for _ in 0..supdb::db::HOT_RAW_WINDOW {
+            for p in &parts {
+                heat_up(&db, p, alike(p));
+            }
+            hot_look(&db, std::time::Duration::from_millis(200));
+        }
+        let c = db.zpage_counts();
+        assert_eq!(c.hot_asks, 0, "{what}: read alike, nothing asked: {c:?}");
+        for (i, p) in parts.iter().enumerate() {
+            heat_up(&db, p, if i == 2 { 4 * alike(p) } else { alike(p) });
+        }
+        hot_look(&db, std::time::Duration::from_millis(200));
+        let c = db.zpage_counts();
+        if on {
+            assert_eq!(c.hot_asks, 1, "{what}: the burst rated on its look: {c:?}");
+            assert!(
+                hot_until(&db, 10, |c| c.hot_raw >= 1),
+                "{what}: the partition released: {:?}",
+                db.zpage_counts()
+            );
+        } else {
+            assert_eq!(
+                (c.hot_asks, c.hot_raw),
+                (0, 0),
+                "{what}: the burst averaged under the bar: {c:?}"
+            );
+        }
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// A raw partition's scans count toward its heat as the groups the form
 /// file's walk of them would open, not one a scan (`Seg::hot_scan`): the
 /// policy holds a raw partition's reads against the form files' opens, so
