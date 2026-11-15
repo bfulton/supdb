@@ -199,6 +199,14 @@ impl StoreCipher {
     /// limit or the machine's, less what the process already holds), and
     /// sixty-four mebibytes at least; the other half is for the kernel's
     /// cache of the store's files, which is what a miss is read from.
+    ///
+    /// The budget is of the files' plaintext, and it is where the cache
+    /// gives back, not a line it never passes: a file being written is in
+    /// memory whole until it is sealed into the directory, a read holds
+    /// what it was lent until it ends or rests, and the store's own work
+    /// waits for a cache past its budget before a caller's read does. The
+    /// memtables and the block cache are not in it, as they are not in
+    /// the page cache for a plain store (`Options::scan_cache_bytes`).
     pub fn cache_bytes(mut self, bytes: u64) -> StoreCipher {
         self.cache = Some(bytes);
         self
@@ -623,22 +631,6 @@ fn reopen(mem: &File, write: bool, append: bool) -> Result<File> {
     }
 }
 
-/// The pages of a file the process will not read again, out of the page
-/// cache: an envelope just written or just decrypted, whose plaintext is
-/// what the store holds.
-fn drop_cache(file: &File) {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd;
-        // SAFETY: advice on a descriptor this function borrows.
-        unsafe {
-            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = file;
-}
-
 /// An envelope's file as it is written, each piece handed to the device as
 /// soon as it is in the page cache (`sync_file_range`, a hint that waits
 /// for nothing): the device writes the pieces behind while the cipher
@@ -996,22 +988,16 @@ impl Vault {
     /// and synced where `sync` says so.
     ///
     /// Through the page cache, each piece handed to the device behind the
-    /// cipher (`Ahead`), and with `drop` the cache's copy of the ciphertext
-    /// dropped once it is synced: where the store's own cache has taken
-    /// the plaintext whole (`settled`), the ciphertext is read again when
-    /// a chunk of it has been given back and not before, and where it has
-    /// not, the ciphertext is what the file's first reads are of. Written
+    /// cipher (`Ahead`), and left there: the kernel's cache of the
+    /// ciphertext is what a chunk is decrypted from when the store's own
+    /// cache has given it back, and it is the kernel's to reclaim. The
+    /// first version dropped it once it was synced, where the store's
+    /// cache had taken the plaintext whole, and a store larger than its
+    /// cache read every chunk it had given back from the device. Written
     /// past the cache instead (`O_DIRECT`, a megabyte at a time), the same
     /// envelope took half as long again: each piece waits for the device
     /// where the cached pieces go to it together.
-    fn write_envelope(
-        &self,
-        mem: &File,
-        disk: &Disk,
-        key: &Key,
-        sync: bool,
-        drop: bool,
-    ) -> Result<u64> {
+    fn write_envelope(&self, mem: &File, disk: &Disk, key: &Key, sync: bool) -> Result<u64> {
         let aead = (self.data)(&key.0);
         let len = mem.metadata()?.len();
         // Under a key of the file's own, which has no name of the caller's.
@@ -1032,9 +1018,6 @@ impl Vault {
         let out = out.file;
         if sync {
             out.sync_all()?;
-            if drop {
-                drop_cache(&out);
-            }
         }
         Counts::add(&self.counts.persisted, 1);
         Counts::add(&self.counts.persisted_bytes, len);
@@ -1169,7 +1152,7 @@ impl Vault {
                         ord: false,
                     };
                     let keep = self.keeps(&mem);
-                    self.write_envelope(&mem, &disk, &key, true, keep)?;
+                    self.write_envelope(&mem, &disk, &key, true)?;
                     made = true;
                     let mut files = lock(&self.files);
                     // Every name over the same memory file: a link made
@@ -1209,7 +1192,7 @@ impl Vault {
                         ..disk.clone()
                     };
                     let keep = self.keeps(&mem);
-                    self.write_envelope(&mem, &odisk, &key, false, false)?;
+                    self.write_envelope(&mem, &odisk, &key, false)?;
                     made = true;
                     let mut files = lock(&self.files);
                     let mut held = false;

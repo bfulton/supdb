@@ -48,6 +48,24 @@
 //! at the same place: a reader that rests (`Hold::rest`) may keep a borrow
 //! across it as long as it asks for the range again before it reads it.
 //!
+//! ## Who waits
+//!
+//! The evictor waits for readers, so a cache can run past its budget for
+//! as long as some reader holds what it was lent, and two lines past the
+//! budget say who waits for it in turn. Past the first (`crowded`, a
+//! sixteenth of the budget over it) the store's own work does: a merge and
+//! a builder of the block cache at their rests, each for a breath at most,
+//! and a builder stops if the cache is crowded still. Past the second
+//! (`swamped`, half the budget over it) a caller's read does, before it
+//! begins. Both are drawn against what the cache could give back: a file
+//! being written is in memory whole until it has its envelope, counted in
+//! what the cache holds, and no wait is for it.
+//!
+//! A reader that waits for another thread, or for the device, says for the
+//! length of the wait that it holds nothing (`db::Reader::unlent`): pinned
+//! and silent, it would hold the evictor for a wait in which it reads
+//! nothing.
+//!
 //! ## What can go wrong
 //!
 //! A chunk that fails its tag, or an envelope that is not what its header
@@ -264,8 +282,14 @@ pub(crate) struct Pager {
     /// Where the cache is `crowded`: its budget and the slack past it,
     /// worked out once, since every read of the store asks.
     hard: u64,
+    /// Where it is `swamped`.
+    swamp: u64,
     limit: AtomicU64,
     held: AtomicU64,
+    /// Of `held`, what is in files with no envelope yet: a file just
+    /// written, taken whole, of which nothing can be given back until
+    /// there is somewhere to read it again from.
+    unbacked: AtomicU64,
     peak: AtomicU64,
     files: Mutex<Vec<Weak<Paged>>>,
     /// The era the holds stand in (`Hold`), and the holds.
@@ -279,6 +303,8 @@ pub(crate) struct Pager {
     poison: Mutex<Option<String>>,
     /// The evictor's wait: true while a wake is owed.
     wake: Mutex<bool>,
+    /// Whether the evictor has been told since it last looked (`nudge`).
+    told: AtomicBool,
     woken: Condvar,
     stop: AtomicBool,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -292,8 +318,11 @@ impl Pager {
         let unit = (unit_chunks() * CHUNK) as u64;
         let p = Arc::new(Pager {
             hard: limit.saturating_add((limit / 16).max(4 * unit)),
+            swamp: limit.saturating_add((limit / 2).max(6 * unit)),
+            told: AtomicBool::new(false),
             limit: AtomicU64::new(limit),
             held: AtomicU64::new(0),
+            unbacked: AtomicU64::new(0),
             peak: AtomicU64::new(0),
             files: Mutex::new(Vec::new()),
             era: AtomicU64::new(1),
@@ -437,7 +466,16 @@ impl Pager {
         self.held.fetch_sub(bytes, Ordering::Relaxed);
     }
 
+    /// Tell the evictor there is something to give back: once a look of
+    /// its own, by the flag it clears before it looks. Every fill of a
+    /// cache at its budget tells it, and the first version took the
+    /// evictor's lock for each: three threads filling beside one another
+    /// -- a scan, a merge, a builder -- slept on that lock a few thousand
+    /// times a pass of ten thousand scans.
     fn nudge(&self) {
+        if self.told.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let mut owed = lock(&self.wake);
         if !*owed {
             *owed = true;
@@ -453,11 +491,51 @@ impl Pager {
     /// sixteenth of it, or four units where that is more. Past here
     /// whoever reads through it waits a little for the evictor before
     /// reading on (`breathe`), and whoever reads in bulk for something the
-    /// store can do without stops (`Reader::abandon_asked`,
-    /// `Db::same_blocks`).
+    /// store can do without rests, and stops if it is crowded still
+    /// (`Reader::build_rest`, `Db::same_blocks`).
     #[inline]
     pub(crate) fn crowded(&self) -> bool {
-        self.held() > self.hard
+        self.could_give() > self.hard
+    }
+
+    /// What the cache holds that it could give back: all of it but the
+    /// files with no envelope yet. The lines a reader waits at are drawn
+    /// against this, since a wait is for the evictor and the evictor can
+    /// do nothing about a file being written: counted whole, a seal's
+    /// output in flight read as a cache past every line for as long as the
+    /// seal took to sync, each merge beside it slept a breath at every
+    /// rest, and the builders gave their forms up.
+    #[inline]
+    fn could_give(&self) -> u64 {
+        self.held()
+            .saturating_sub(self.unbacked.load(Ordering::Relaxed))
+    }
+
+    /// Whether the cache holds far more than it may: past its budget by
+    /// half of it, or six units where that is more. `crowded` is where the
+    /// store's own work waits -- a merge, a builder of the block cache --
+    /// and this is where a caller's read does: a thread descheduled with a
+    /// pin for one timeslice of a busy machine holds the evictor for ten
+    /// milliseconds, the readers beside it fill past the first line in
+    /// that time, and a read that waited there slept twenty milliseconds
+    /// for an overshoot of megabytes.
+    #[inline]
+    pub(crate) fn swamped(&self) -> bool {
+        self.could_give() > self.swamp
+    }
+
+    /// `breathe` for a caller's read: a wait for a cache that is `swamped`
+    /// to be so no longer, or for a breath.
+    pub(crate) fn breathe_swamped(&self) {
+        if !self.swamped() {
+            return;
+        }
+        Counts::bump(&self.counts.breaths);
+        let began = std::time::Instant::now();
+        while self.swamped() && began.elapsed() < BREATH {
+            self.nudge();
+            std::thread::sleep(Duration::from_micros(200));
+        }
     }
 
     /// A reader's wait, holding nothing it was lent, for a cache that is
@@ -471,12 +549,18 @@ impl Pager {
     /// reader reads between two waits, a breath apart, and not by what the
     /// cipher can decrypt.
     pub(crate) fn breathe(&self) {
+        self.breathe_unless(|| false);
+    }
+
+    /// `breathe` for a waiter someone may be waiting for in turn: the
+    /// wait ends as well where `leave` says so, looked at between naps.
+    pub(crate) fn breathe_unless(&self, leave: impl Fn() -> bool) {
         if !self.crowded() {
             return;
         }
         Counts::bump(&self.counts.breaths);
         let began = std::time::Instant::now();
-        while self.crowded() && began.elapsed() < BREATH {
+        while self.crowded() && began.elapsed() < BREATH && !leave() {
             self.nudge();
             std::thread::sleep(Duration::from_micros(200));
         }
@@ -492,6 +576,9 @@ impl Pager {
             if p.stop.load(Ordering::SeqCst) {
                 return;
             }
+            // Cleared before the look: a fill counted before this is in
+            // what the look reads, and one after it tells again (`nudge`).
+            p.told.store(false, Ordering::Release);
             let idle = p.over() == 0 || !p.pass();
             if idle {
                 // Nothing to give back, or nothing that may be: wait to be
@@ -765,6 +852,7 @@ impl Paged {
         });
         if first != EMPTY {
             pager.counts.adopted_bytes.fetch_add(len, Ordering::Relaxed);
+            pager.unbacked.fetch_add(len, Ordering::Relaxed);
             pager.add(len);
         }
         lock(&pager.files).push(Arc::downgrade(&p));
@@ -848,7 +936,9 @@ impl Paged {
                 ),
             ));
         }
-        let _ = self.back.set(back);
+        if self.back.set(back).is_ok() {
+            self.pager.unbacked.fetch_sub(self.len, Ordering::Relaxed);
+        }
         self.pager.nudge();
         Ok(())
     }
@@ -1125,6 +1215,10 @@ impl Drop for Paged {
             lock(&VIEWED).remove(&ino);
         }
         self.pager.sub(self.present_bytes());
+        if !self.backed() {
+            // Taken whole and gone before it had an envelope.
+            self.pager.unbacked.fetch_sub(self.len, Ordering::Relaxed);
+        }
         if self.mapped > 0 {
             // SAFETY: the mapping made in `make`, and nothing borrows from
             // a file whose last holder is going.

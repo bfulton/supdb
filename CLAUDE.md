@@ -35,7 +35,7 @@ of the change that produced the text.
 | `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`) -- the module's own docs |
 | `src/db/dirkey.rs` | a live store's directory under a key, encrypted by the kernel (`Encryption::Kernel`): the requests of Linux's file encryption, what `create` and `open` hold a directory to, and `lock`, with no cipher and no byte of a read path in it -- the module's own docs, and `scripts/fscrypt.sh` for a filesystem to test it on |
 | `src/db/vault.rs` | a live store under a cipher the caller supplies (`Encryption::Cipher`): the door every file operation of the engine goes through, which is the standard library's call for a plain store; a file as a memory file while it is written and as its envelope in the directory after; the marker and the keys, the caller's wrapping the store's and the store's wrapping a key a file; the manifest's slot and the log's record sealed, with no cipher in the crate -- the module's own docs, `tests/cipher.rs`, and `ZFUZZ_CIPHER=1` for the differential fuzz |
-| `src/db/pager.rs` | the cache a store under a cipher reads its files through: a file as address space its plaintext's length, a chunk of it decrypted where it is first asked for and a megabyte given back at a time once the cache is past its budget and no reader could hold it; the holds and rests of the threads that read with no slot of the reader table, the wait of a crowded cache, and the failure a read remembers, with no cipher in it and no reader of the format -- the module's own docs, and `tests/cipher.rs` for a store several times its cache |
+| `src/db/pager.rs` | the cache a store under a cipher reads its files through: a file as address space its plaintext's length, a chunk of it decrypted where it is first asked for and a megabyte given back at a time once the cache is past its budget and no reader could hold it; the holds and rests of the threads that read with no slot of the reader table, the two lines past the budget at which the store's own work and then a caller's read wait, and the failure a read remembers, with no cipher in it and no reader of the format -- the module's own docs, and `tests/cipher.rs` for a store several times its cache |
 | `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, and the replays that hold it -- the module's own docs |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
 | `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index -- `docs/index-theory.md` |
@@ -1192,8 +1192,9 @@ a hundred bytes is most of the pages of both, read on the segment work's
 one pin -- the store read into a cache an eighth of its size in fifty
 milliseconds, at every merge -- so it rests as it goes and answers no
 once the cache is crowded; the block cache's builders read every block a
-burst dirtied under one pin, and give their forms up there
-(`Reader::abandon_asked`); and merges read their inputs in order at the
+burst dirtied under one pin, and gave their forms up there
+(`Reader::abandon_asked`) until the first pairing out of the cache showed
+what that cost, below; and merges read their inputs in order at the
 cipher's rate, hundreds of megabytes a second, so whatever stalled the
 evictor for a few milliseconds, they had filled the cache by then, and a
 reader past the crowding line waits for the evictor, briefly and with an
@@ -1249,6 +1250,9 @@ times its cache through a load, a scan of the whole of it, four reader
 threads beside a writer that flushes, and a reopen, with the cache's peak
 held to its budget and a fixed slack throughout, the open held to a
 handful of chunks a file, and the process to no descriptor for a file;
+`the_block_caches_builders_build_through_a_cache_the_store_does_not_fit`,
+a burst over every block filed by the store's own thread under a cache a
+sixth of the store, held to two mutants;
 and the differential fuzz under a cache of sixteen kilobytes
 (`fuzz_range_under_a_cipher_that_does_not_fit_its_cache` in the gate,
 `ZFUZZ_CIPHER=1 ZFUZZ_CIPHERCACHE=16384` by hand, with `ZFUZZ_CACHE=all
@@ -1416,13 +1420,13 @@ segment; both went with that shape.
 
 What the second shape costs was read the same way, and in core it costs
 more than the first, which is the trade: `pair.sh supdb-cipher
-supdb-cipherbase 300000` read, in both sittings, the loads where they
-were, 0.85-0.88x; the single-threaded pass of point reads at 0.92x with
-the threaded passes unresolved; the scan passes at 0.84-0.96x and
-0.87-0.89x threaded; the lag sweep's scans at 0.85-0.91x over the drained
-store, 0.73-0.77x after the one- and the ten-percent burst and level to
-0.89x after the full rewrite; E at 0.80-0.83x; and the other mixes level
-or unresolved. The count named the point read's share: 229 instructions
+supdb-cipherbase 300000` read, across its two sittings, the loads where
+they were, 0.84-0.92x; the single-threaded pass of point reads at 0.92x
+with the threaded passes unresolved; the scan passes at 0.89-0.94x and
+0.80-0.90x threaded; the lag sweep's scans at 0.84-0.86x over the drained
+store, 0.65-0.80x after the one- and the ten-percent burst and 0.80-0.82x
+after the full rewrite; the threaded scan mix at 0.78-0.87x; E at
+0.83-0.90x; and the other mixes level or unresolved. The count named the point read's share: 229 instructions
 over its twin's 841 (`bench/examples/read_only.rs supdb-cipher 100000 1
 n-none` beside `supdb-cipherbase`, the toggle as above), spread over the
 asks -- each a call through the source's pointer and a load of a chunk's
@@ -1442,35 +1446,145 @@ bursts' cells and E, and an open item in `ROADMAP.md`.
 
 Out of its cache it was priced against itself: `pair.sh supdb-cipher64
 supdb-cipher 1000000 --reps 4`, a million keys under a cache of 64 MiB
-against the same store under a cache that holds it. Point reads 0.10-0.16x,
-the scan passes 0.15-0.27x, the mixes that read 0.23-0.57x and A and F
-0.69-0.88x, the shuffled load 0.76-0.80x and the ordered load level, and
-the pass after the full rewrite at a twentieth. That last cell is the
-block cache's builders giving their forms up under a crowded cache, and
-the counters say so (`SUPDB_LAG_COUNTERS=1 SUPDB_SCAN_OPS=1 bench ab
---arms supdb-cipher64,supdb-cipher --size 1000000 --passes load,lag
---reps 1`, the `lagcounters` line and the `lagcounterscipher` line under
-it): over the rewriting burst the upkeep thread built eighty blocks
-where its twin's built fifteen thousand, so the pass's scans built
-twelve thousand themselves, each from the partition and three pieces,
-136,000 first touches on the scanning thread against 25-33,000 at the
-points before, beside a merge turning the same cache over. A miss in
-those cells is a chunk copied out of the
-envelope's mapping, decrypted in place into a fresh page of the memory
-file, and a megabyte given back behind it. At the points before the
-full rewrite the envelope is in the kernel's page cache (`lagdev` reads
-nothing from the device) and the cells price a decryption and a first
-touch a miss, five microseconds a point read here; in the pass after it
-the process read 53 MB back from the device, a sleep a scan, since an
-envelope whose plaintext the cache took whole is dropped from the page
-cache where it is written and the cache had given the plaintext back
-since. The budget is of the files' plaintext. The block cache held more than the
-64 MiB at that pairing's end (`cache_bytes_at_end`), as it holds what it
-holds beside a plain store, under its own bound (`scan_cache_bytes`),
-and a caller who sets one budget for a store's memory has to set both.
+against the same store under a cache that holds it. Point reads 0.17x on
+one thread and 0.11-0.13x on two and three, the scan passes 0.26x and
+0.15-0.20x threaded, the lag sweep's scans 0.23-0.39x before the full
+rewrite and 0.11-0.19x after it, the mixes that read 0.23-0.66x and A and
+F 0.75-0.92x, the ordered load level and the shuffled within a tenth and
+unresolved in four pairs a sitting. A miss is a chunk copied out of the
+envelope's mapping, which the kernel's page cache holds, and decrypted in
+place into a fresh page of the memory file, with a megabyte given back
+behind it: four microseconds, of which the
+kernel's fault on the fresh page is over half, the copy a fifth and the
+cipher a tenth (`perf record -e cpu-clock --call-graph dwarf` over `cargo
+run --release --example cipher_store 1000000 64`, the samples under
+`Paged::slow` by their leaf). That is a fault a page where a plain store
+out of memory pays a device's answer, and a store larger than memory pays
+both; a run of chunks populated and decrypted as one is the open item.
+The budget is of the files' plaintext. A file being written is in memory
+whole until it has its envelope, a seal's output or a merge's piece,
+which the cache counts and cannot give back; and the block cache held
+more than the 64 MiB at that pairing's end (`cache_bytes_at_end`), as it
+does beside a plain store, under its own bound (`scan_cache_bytes`).
 `cargo run --release --example cipher_store` prints an open's time and
-the cache's counts through a pass of reads and a scan, for a cache of
-any size.
+the cache's counts through a pass of reads and a scan, for a cache of any
+size.
+
+The first pairing out of the cache read the pass after the full rewrite
+at a twentieth, 1.3 s for a pass of 45-60 ms in the cache, and six things
+were under it, each found by a count and none by reading. The suite
+carries the cache's counts for that (`SUPDB_LAG_COUNTERS=1`, the
+`lagcounterscipher` line under `lagcounters`), beside the scanning
+thread's CPU and sleeps (`SUPDB_SCAN_OPS=1`, `lagops`) and the device's
+bytes (`lagdev`).
+
+The store dropped its own ciphertext. `lagdev` read 53 MB from the device
+in that pass and nothing in the passes before it, and the scanning thread
+slept once a scan: an envelope whose plaintext the cache took whole was
+dropped from the page cache where it was written (`POSIX_FADV_DONTNEED`),
+which was right for as long as a store held its plaintext for life and
+wrong from the day the cache gave any of it back. The kernel's cache of
+the ciphertext is what a miss is read from, and the kernel's to reclaim.
+The rule: what one shape made free is priced again when the shape goes;
+the drop came through the redesign unread, because nothing failed.
+
+The builders gave up. Over the rewriting burst the upkeep thread built
+eighty blocks where its twin in the cache built fifteen thousand, so the
+pass's scans built twelve thousand themselves, 136,000 first touches on
+the scanning thread against 25-33,000 at the points before: a builder
+that found the cache crowded gave its forms up, having no way to let the
+cache give back under its one pin. A builder rests between two blocks now
+(`Reader::build_rest`), where every local it holds is a copy, a position
+or a table. The argument is by the loop's top at each site and by who
+runs the loop -- the upkeep thread, the builder ahead, and the writer
+inside one of its own operations (`WriterOp`), never a read that may be
+nested in a scan's callback, which would rest the scan that lent the
+callback its bytes -- and what holds the argument is the fuzz under a
+cache of sixteen kilobytes with the block cache on, where a borrow read
+past a rest is read out of pages already given back.
+
+The evictor waited eighty milliseconds for one reader
+(`PagerCounts::longest_wait_us`), and the instrument that named the
+reader was built for the hunt and is not in the tree: a thread id a slot,
+written at the pin; the evictor printing the name of the thread it had
+waited eight milliseconds for (`/proc/self/task/<tid>/comm`) and running
+`gdb -p <pid> -batch -ex 'thread apply all bt 16'` on its own process at
+that moment; and a stamp at every pin and rest that printed the stack
+where a stretch of eight milliseconds without one ended. gdb's first
+capture had the writer in `Wal::sync` inside `commit`, pinned, and the
+upkeep thread and a merge asleep in `breathe` behind it: a durable
+store's every commit held the cache shut for the length of its fdatasync,
+which reads nothing of the store's files (`Db::sync_wal` under
+`Reader::unlend`). The stamps split the rest three ways: the fill's
+sixty-four blocks between two looks, a look a block under a cipher now;
+waits on another thread; and stretches of eight to fifteen milliseconds
+in appends that read no file and take a fifth of one, which is a thread
+descheduled with its pin, on four cores with seven threads to run.
+Nothing annotates a timeslice away, so the wait for a cache past its
+budget has two lines: the store's own work waits at the first
+(`Pager::crowded`), a merge and a builder at their rests, and a caller's
+read at the second, half the budget past it (`swamped`). A read waited at
+the first before, twenty milliseconds for an overshoot of megabytes.
+
+Every fill of a cache at its budget took the evictor's lock to tell it
+so, and with three threads filling the scanning thread slept on that lock
+two thousand times a pass (`lagops`, `vcsw`, where its wall was its CPU
+plus a tenth): a flag the evictor clears before it looks, and the lock
+for the first to set it (`Pager::nudge`).
+
+And two that the suite did not show and the builders' test did. A file
+with no envelope yet is counted in what the cache holds and cannot be
+given back, so a seal's output in flight read as a cache past every line
+for as long as its sync took, and each merge beside it slept a breath at
+every rest: the lines are drawn against what could be given back
+(`Pager::could_give`). And `settle` waited for the upkeep thread's pass
+pinned: the pass filled the cache, the evictor waited for the settle's
+pin, and the pass waited a breath for the evictor and gave its forms up,
+three waits in a ring that a timeout ended, every time (`join_upkeep`,
+`hold_within`, `hold_for_upkeep`, each wait under `unlent`).
+
+With the six the pass after the full rewrite reads 0.11-0.19x where it
+read a twentieth, 140-510 ms in the probe's reps for 1.3 s, in two shapes
+by whether the upkeep thread had built the burst's blocks when the pass
+began, and what is left of it is the misses under the blocks the scans
+still build; E went from 0.53-0.57x to 0.66x and the shuffled load from
+0.76-0.80x to within a tenth. The cells that are a miss an operation did
+not move, as they should not.
+
+The builders' test
+(`the_block_caches_builders_build_through_a_cache_the_store_does_not_fit`)
+took five shapes to say anything. With commits of a thousand over the
+store's small files nothing crowded, and the old code passed it. A burst
+that rewrote every key built its blocks without reading one, since a
+rewritten key's record is masked: the burst adds a value to every key
+instead. A seal followed the burst and ended the pass (`seal_max_pct`,
+`seal_idle`, off for it). Then the assertion failed on the old code at
+some eight hundred blocks of nineteen hundred, which was read as the test
+telling the two apart, and it failed on the fixed code at the same count:
+the settle's wait above. It is held to two mutants now, the look without
+the rest and the settle's wait left pinned. A fifth was mine: a script
+that sliced the test file between two markers found the second marker
+before the first, replaced the empty string, and wrote the insertion
+between every two characters of the file. The rules: a test is run
+against the fix before a mutant's failure is read as anything, since a
+red mutant and a red fix at one count are a bug the test found and the
+fix did not have; and an edit by markers asserts the markers' order.
+
+One seed of the fuzz outside the gate's range fails on the main line as
+it does here (`ZFUZZ_CACHE=all ZFUZZ_OPTVARY=1 ZFUZZ_SEEDS=1179 cargo test
+--profile checked --test fuzz fuzz_range -- --exact`, a plain store with
+the upkeep inline: "a copy's identity entry disagrees with its search").
+It was found by running ranges the gate does not, and attributed by
+building the main line's head and running the seed there before reading
+it as this change's; it is an open item in `ROADMAP.md`.
+
+The rules of the hunt: a wait under a pin is a pin, and so is a
+timeslice; a wait is drawn against what its remedy can move, and at
+different lines for work that can wait and a read that cannot; a count
+that includes what cannot be given back fires the wait for nothing; and
+the instrument that names who is waited for is built before the first
+guess, as it was the first time, and was taken out both times.
+
 The rules: a second way to hold the same bytes is priced on the first
 operation of every pass as well as on its rate, since a mapping's first
 touch is where two kinds of memory differ; a write slower than its cipher

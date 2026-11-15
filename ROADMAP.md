@@ -194,13 +194,23 @@ What an engine picker would hit, roughly in order.
   values outrun the cache holds the cache past its budget for the length
   of that read. Done when a walk of one key's runs rests between blocks,
   asking again for the extents it walks by.
-- [ ] **The block cache's builders under a crowded cache.** The upkeep
-  thread's pass and the builder ahead read every block they build a form
-  for under one pin; where the store's cache of plaintext is well past
-  its budget they give their forms up, as they do for the tables behind
-  a pin, and the scans build what they read. Done when they rest between
-  blocks instead, which wants each block's build to hold nothing of a
-  file across the next.
+- [x] **The block cache's builders under a cache the store does not fit.**
+  The upkeep thread's pass, the builder ahead and the fill a commit makes
+  itself rest between two blocks, holding nothing of a file, so the cache
+  gives back what the blocks before were read from; they give their forms
+  up only where the cache is past its budget after a rest and a wait.
+- [ ] **A miss at less than a fault.** A chunk read into the cache is a
+  fresh page of a memory file: the kernel's fault on it is over half of a
+  miss, the copy of the ciphertext a fifth, and the cipher a tenth. A run
+  of chunks read in order could be populated in one call and decrypted as
+  one, which wants the cache to know a run when it sees one.
+- [ ] **A copy's entry found by its rank, wrong.** One seed of the
+  differential fuzz, outside the gate's range, trips the block cache's
+  check that a copy's entry taken by rank is the entry a search finds
+  (`ZFUZZ_CACHE=all ZFUZZ_OPTVARY=1 ZFUZZ_SEEDS=1179 cargo test --profile
+  checked --test fuzz fuzz_range -- --exact`), in a plain store with the
+  upkeep inline. A release build has no check there and patches the entry
+  the rank names.
 - [ ] **Ordered ingest and the compact form under a cipher.** Both are
   off there: ordered ingest's run is a segment synced at every commit,
   which a file that reaches the directory once, as its envelope, cannot

@@ -270,9 +270,14 @@ past `cache_bytes` and the chunk has not been read lately. A store runs in
 the cache it is given whatever its size, at the rate of its misses, and an
 `open` decrypts what an open reads of each file, not the store. Unset, the
 cache is half of the memory the process may use; the kernel's own cache
-holds the ciphertext a miss is read from. What the cache does not count is
-what any store holds in the process: its unsealed writes and the block
-cache.
+holds the ciphertext a miss is read from. A file being written is in memory
+whole until it is sealed into the directory, so beside the cache the store
+holds what it has in flight, a seal's or a merge's output
+(`Options::seal_bytes`, `partition_bytes`). The store's own work waits for a
+cache that has run past its budget, and a read of yours waits only for one
+half as large again. What the cache does not count is what any store holds
+in the process: its unsealed writes and the block cache, which has a bound
+of its own (`Options::scan_cache_bytes`).
 
 A file's bytes are checked where they are decrypted. A byte changed in the
 marker, a manifest or a file's header is refused at the `open`, a byte

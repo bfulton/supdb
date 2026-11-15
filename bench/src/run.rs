@@ -568,12 +568,15 @@ fn counters_line(
     // beside the most it has held. Printed for the arms that have one.
     if get(c1, "cipher_peak") > 0.0 {
         eprintln!(
-            "{tag}cipher {arm} {point} fills {:.0} evicted_units {:.0} rescues {:.0} breaths {:.0} evictor_waited_ms {:.1} held_mb {:.0} peak_mb {:.0}",
+            "{tag}cipher {arm} {point} fills {:.0} evicted_units {:.0} rescues {:.0} waits {:.0} breaths {:.0} evictor passes {:.0} waited_ms {:.1} longest_ever_ms {:.1} held_mb {:.0} peak_mb {:.0}",
             d("cipher_fills"),
             d("cipher_evicted_units"),
             d("cipher_rescues"),
+            d("cipher_waits"),
             d("cipher_breaths"),
+            d("cipher_evictor_passes"),
             d("cipher_evictor_waited_us") / 1e3,
+            get(c1, "cipher_evictor_longest_wait_us") / 1e3,
             get(c1, "cipher_held_at_end") / (1u64 << 20) as f64,
             get(c1, "cipher_peak") / (1u64 << 20) as f64,
         );

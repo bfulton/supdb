@@ -493,6 +493,107 @@ fn a_store_larger_than_its_cache_reads_as_itself_within_it() {
     );
 }
 
+/// The block cache's builders build through a cache the store does not
+/// fit. A burst over every block of a store several times its cache is
+/// filed into the block cache's forms by the store's own thread, block by
+/// block, with a rest between two so that the cache may give back what the
+/// blocks before were read from. The builders gave their forms up at the
+/// first look that found the cache well past its budget, at first, with
+/// no rest, and a pass reads every block it builds under the one pin it
+/// holds: every block of such a burst was left to the scan that first
+/// walked it, built through the cache's misses.
+#[test]
+fn the_block_caches_builders_build_through_a_cache_the_store_does_not_fit() {
+    let n = 120_000u32;
+    let cache: u64 = 2 << 20;
+    let slack: u64 = 8 << 20;
+    let dir = scratch("builders");
+    // `sealing` off is a memtable that takes the whole burst: no seal at a
+    // share of the store, and none for a store being read.
+    let opts = |sealing: bool| Options {
+        encryption: Encryption::Cipher(cipher(12).cache_bytes(cache)),
+        seal_bytes: if sealing { 256 << 10 } else { 64 << 20 },
+        seal_max_pct: if sealing { small().seal_max_pct } else { 0 },
+        seal_idle: sealing && small().seal_idle,
+        ..small()
+    };
+    {
+        let mut db = Db::create(&dir, opts(true)).unwrap();
+        for i in 0..n {
+            db.append(&k(i), &v(i, 0));
+            if i % 1000 == 999 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+    }
+    let size = stored_bytes(&dir);
+    assert!(
+        size > 4 * cache,
+        "the store is {size} bytes, not several times its cache of {cache}"
+    );
+    // Opened again with a memtable the burst stays in: the store's files
+    // are a quarter megabyte each, small beside the cache, and none is
+    // written from here on, so what the cache holds is what was read.
+    let mut db = Db::open(&dir, opts(false)).unwrap();
+    // Scans, so that the store is one that is scanned: the forms are kept
+    // for readers who are there.
+    for from in (0..n).step_by(n as usize / 50) {
+        let mut seen = 0u32;
+        db.scan(&k(from), 100, kv(&mut |_k, _v| seen += 1)).unwrap();
+        assert_eq!(seen, 100.min(n - from));
+    }
+    // The burst: a value added to every key, in one commit, so that filing
+    // it is one pass over every block of the store, each built from its
+    // records and the new values. A key rewritten would not do: its old
+    // record is masked, and its block is built without being read.
+    for i in 0..n {
+        db.append(&k(i), &v(i, 2));
+    }
+    db.commit().unwrap();
+    db.settle().unwrap();
+    let ev = db.forms_events();
+    let blocks = u64::from(n) / 64;
+    let c = db.cipher_counts().unwrap().cache;
+    assert!(
+        ev[0] + ev[10] >= blocks * 9 / 10,
+        "the store's own threads built {} forms and {} ahead for a burst over {blocks} blocks: {c:?}",
+        ev[0],
+        ev[10]
+    );
+    assert!(c.evicted_units > 0, "nothing was given back: {c:?}");
+    assert!(
+        c.peak < cache + slack,
+        "the cache held {} bytes of a budget of {cache}: {c:?}",
+        c.peak
+    );
+    // And what the forms answer is the store: every key with both its
+    // values, by scans of a hundred keys.
+    let mut seen = 0u32;
+    for from in (0..n).step_by(100) {
+        let mut at = from;
+        let mut second = false;
+        db.scan(
+            &k(from),
+            100,
+            kv(&mut |key, val| {
+                assert_eq!(key, k(at).as_slice());
+                let round = if second { 2 } else { 0 };
+                assert_eq!(val, v(at, round).as_slice(), "key {at}");
+                if second {
+                    at += 1;
+                    seen += 1;
+                }
+                second = !second;
+            }),
+        )
+        .unwrap();
+    }
+    assert_eq!(seen, n);
+}
+
 /// A byte changed anywhere in the directory is refused, or is where the
 /// log ends: what the store answers afterwards is a state it
 /// acknowledged, the last or one before it, and never anything else.

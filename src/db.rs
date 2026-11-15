@@ -9939,6 +9939,22 @@ impl Readers {
         self.slots[slot].page.store(to, AtomicOrdering::SeqCst);
     }
 
+    /// `slot`'s reader holds nothing it was lent, for a wait or a step
+    /// that reads no file, until `page_back`. Under debug assertions the
+    /// thread counts as unpinned meanwhile, so a read of a file inside
+    /// what was called a wait panics (`pager::debug_pinned`) where in a
+    /// release build it would read pages the cache may be giving back.
+    fn page_idle(&self, slot: usize) {
+        pager::debug_pinned(false);
+        self.page_set(slot, u64::MAX);
+    }
+
+    /// The end of `page_idle`: what the reader is lent from here it holds.
+    fn page_back(&self, slot: usize) {
+        self.page_pin(slot);
+        pager::debug_pinned(true);
+    }
+
     /// `oldest_pinned` for a sweep whose lowest tag is `lowest`: where the
     /// sweep fences for the pins (`asym`), the slots are read once without
     /// the barrier first, and a pin seen at an epoch below every tag means
@@ -12298,7 +12314,7 @@ struct Unlent(Option<(std::sync::Arc<Shared>, usize)>);
 impl Drop for Unlent {
     fn drop(&mut self) {
         if let Some((shared, slot)) = &self.0 {
-            shared.readers.page_pin(*slot);
+            shared.readers.page_back(*slot);
         }
     }
 }
@@ -15389,6 +15405,10 @@ pub struct Reader {
     /// (`pin_at`, the keeper's tick) read under their pin throughout and
     /// leave this off.
     page_snap: std::cell::Cell<bool>,
+    /// The writer's operations this handle is inside (`Db::op`): no
+    /// caller's callback runs under one, so a builder's look inside one
+    /// is a rest (`Reader::build_rest`).
+    writer_ops: std::cell::Cell<u32>,
     /// The state pinned by `snapshot`, or null: what `state` answers
     /// instead of the writer's latest while it is held. An atomic only
     /// so the handle is `Send`; one thread touches it.
@@ -16157,6 +16177,23 @@ impl Drop for Op {
     fn drop(&mut self) {
         // SAFETY: see the type.
         unsafe { &*self.0 }.leave();
+    }
+}
+
+/// `Op` for an operation of the writer's own (`Db::op`): a write, a
+/// commit, a flush, a settle. No caller's callback runs under one, which
+/// the handle is told for its length (`Reader::writer_ops`): the fill a
+/// commit makes itself rests between two blocks as the upkeep thread's
+/// does, where the same fill inside a scan, which may be a scan inside
+/// another scan's callback, does not.
+struct WriterOp(*const Reader);
+
+impl Drop for WriterOp {
+    fn drop(&mut self) {
+        // SAFETY: as `Op`.
+        let r = unsafe { &*self.0 };
+        r.writer_ops.set(r.writer_ops.get() - 1);
+        r.leave();
     }
 }
 
@@ -19792,13 +19829,16 @@ impl Reader {
     }
 
     /// A read of a store under a cipher, about to begin: where the cache
-    /// it reads through is well past its budget, a short wait for it
-    /// first (`pager::Pager::breathe`), unless this handle is inside a
-    /// read already and so holds what the evictor would be waiting for.
+    /// it reads through is far past its budget (`pager::Pager::swamped`),
+    /// a short wait for it first, unless this handle is inside a read
+    /// already and so holds what the evictor would be waiting for. Far
+    /// past, and not at the line the store's own work waits at
+    /// (`crowded`): a read waited there too at first, and every scan of a
+    /// pass beside a merge slept through the merge's overshoot.
     #[inline]
     fn breathe(&self, p: &pager::Pager) {
-        if p.crowded() && self.depth.get() == 0 {
-            p.breathe();
+        if p.swamped() && self.depth.get() == 0 {
+            p.breathe_swamped();
         }
     }
 
@@ -20210,9 +20250,9 @@ impl Reader {
             .or(self.pin_slot.filter(|_| self.opts.writer_pins));
         match (&self.shared.pager, slot) {
             (Some(_), Some(slot)) if self.depth.get() > 0 && !self.page_snap.get() => {
-                self.shared.readers.page_set(slot, u64::MAX);
+                self.shared.readers.page_idle(slot);
                 let r = wait();
-                self.shared.readers.page_pin(slot);
+                self.shared.readers.page_back(slot);
                 r
             }
             _ => wait(),
@@ -20238,6 +20278,58 @@ impl Reader {
         }
     }
 
+    /// A builder's rest between two blocks, in a store under a cipher: a
+    /// point where the handle holds nothing it was lent of the store's
+    /// files, said so (`Slot::page`), so that the cache may give back what
+    /// the blocks before were read from; and, where the cache is well past
+    /// its budget even so, a wait for it, holding nothing, that ends when
+    /// the cache has come back, when the writer wants its upkeep from this
+    /// thread, or after a breath (`pager::Pager::breathe`). True where the
+    /// cache is crowded still, which is something else holding it and the
+    /// builder's cue to stop: a form is work the store can do without.
+    /// Nothing, and false, for a plain store.
+    ///
+    /// Only where no caller's callback is running -- on the upkeep
+    /// thread's handle, on the builder ahead's, and on the writer's inside
+    /// one of its own operations (`WriterOp`) -- and at a point of the
+    /// walk where every local is a copy, a position or a table: a rest
+    /// inside a read nested in a scan's callback would rest the scan that
+    /// lent the callback its bytes.
+    ///
+    /// The builders gave up at the first crowded look, without resting,
+    /// for as long as the cache had no other way to be given back under
+    /// them: a pass reads every block it builds under the one pin it
+    /// holds. A burst over every block of a store several times its cache
+    /// then left every block to the scans after it, each built through
+    /// the cache's misses on the scanning thread.
+    fn build_rest(&self) -> bool {
+        self.build_rest_unless(|| {
+            self.understudy
+                && self.shared.upkeep.state.load(AtomicOrdering::Acquire) & LEND_WANT != 0
+        })
+    }
+
+    /// `build_rest` whose wait ends as well where `leave` says so.
+    fn build_rest_unless(&self, leave: impl Fn() -> bool) -> bool {
+        let Some(p) = self.shared.pager.as_ref() else {
+            return false;
+        };
+        let slot = self
+            .slot
+            .or(self.pin_slot.filter(|_| self.opts.writer_pins));
+        let Some(slot) = slot.filter(|_| !self.page_snap.get()) else {
+            return p.crowded();
+        };
+        self.shared.readers.page_pin(slot);
+        if !p.crowded() {
+            return false;
+        }
+        self.shared.readers.page_idle(slot);
+        p.breathe_unless(leave);
+        self.shared.readers.page_back(slot);
+        p.crowded()
+    }
+
     /// `unlent` as a guard, for a step that is all file operations and
     /// takes the handle's owner by `&mut`: a manifest written and synced,
     /// names unlinked. Each is a wait on the device, milliseconds, pinned
@@ -20248,7 +20340,7 @@ impl Reader {
             .or(self.pin_slot.filter(|_| self.opts.writer_pins));
         match (&self.shared.pager, slot) {
             (Some(_), Some(slot)) if self.depth.get() > 0 && !self.page_snap.get() => {
-                self.shared.readers.page_set(slot, u64::MAX);
+                self.shared.readers.page_idle(slot);
                 Unlent(Some((self.shared.clone(), slot)))
             }
             _ => Unlent(None),
@@ -20300,11 +20392,13 @@ impl Reader {
             if let Some(slot) = slot {
                 // And a wait for the cache where the scan has read it
                 // well past its budget, holding nothing.
-                if let Some(p) = self.shared.pager.as_ref().filter(|p| p.crowded()) {
-                    self.shared.readers.page_set(slot, u64::MAX);
-                    p.breathe();
+                if let Some(p) = self.shared.pager.as_ref().filter(|p| p.swamped()) {
+                    self.shared.readers.page_idle(slot);
+                    p.breathe_swamped();
+                    self.shared.readers.page_back(slot);
+                } else {
+                    self.shared.readers.page_pin(slot);
                 }
-                self.shared.readers.page_pin(slot);
             }
             // The least key above the last: the last with a zero after it.
             next.clear();
@@ -21237,6 +21331,14 @@ impl Reader {
 
     fn abandon_asked(&self) -> bool {
         if !self.understudy {
+            // The writer's own fill, inside one of its operations: its
+            // looks are rests as the thread's are, and it gives nothing
+            // up. A commit of a batch over every block, filed by the
+            // commit, was otherwise the store read into the cache under
+            // the commit's one pin.
+            if self.writer_ops.get() > 0 {
+                let _ = self.build_rest();
+            }
             return false;
         }
         if self.fs().abandoned.get() != u64::MAX {
@@ -21257,15 +21359,13 @@ impl Reader {
             );
         }
         // A third asker, for a store under a cipher: the cache of
-        // plaintext well past its budget (`pager::Pager::crowded`). A pass
-        // that builds a form for every block a burst dirtied reads every
-        // one of those blocks' records, under one pin, and the cache
-        // gives nothing back that a pinned reader could hold: a burst
-        // over every block of a store was the store read into the cache,
-        // in one pass of fifty milliseconds, under a cache an eighth of
-        // its size. The pass gives its forms up as it does for the tables
-        // behind its pin, and the scans build what they read.
-        if self.shared.pager.as_ref().is_some_and(|p| p.crowded()) {
+        // plaintext well past its budget with this pass resting
+        // (`build_rest`). Every look here is between two blocks or two
+        // keys of the pass, where it holds nothing it was lent, so the
+        // look is the pass's rest; a cache crowded past the rest and a
+        // wait is one something else holds, and the pass gives its forms
+        // up as it does for the tables behind its pin.
+        if self.build_rest() {
             self.fs().abandoned.set(now);
             return true;
         }
@@ -23150,8 +23250,13 @@ impl Reader {
                 copy_dense: true,
                 ..self.build_ctx()
             };
+            // Under a cipher the look is at every block: it is the pass's
+            // rest (`build_rest`), and sixty-four blocks built between two
+            // rests were sixty-four blocks' records the cache could not
+            // give back.
+            let paged = self.shared.pager.is_some();
             for b in 0..table.slots.len() {
-                if b % 64 == 63 {
+                if b % 64 == 63 || paged {
                     if self.abandon_asked() {
                         return Ok(());
                     }
@@ -26534,6 +26639,14 @@ impl Db {
     /// starts over. A loose file a landing has retired meanwhile is
     /// covered by a durable segment, and its absence is no error.
     fn sync_wal(&mut self) -> Result<()> {
+        // A wait on the device, in an operation that is pinned through it
+        // and reads nothing of the store's files here: said so, for a
+        // store under a cipher (`Reader::unlend`). A durable store syncs
+        // at every commit, and with the commit's pin read as a reader's
+        // the cache gave nothing back for the length of each: the
+        // builders and the merges beside a burst waited out the cache
+        // behind every fdatasync of the log.
+        let _io = self.r.unlend();
         self.wal_dir_barrier()?;
         while let Some(p) = self.loose_wals.first().cloned() {
             match vault::open(&p) {
@@ -26972,6 +27085,7 @@ impl Db {
             depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Dirty),
             page_snap: std::cell::Cell::new(false),
+            writer_ops: std::cell::Cell::new(0),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts,
@@ -27566,6 +27680,7 @@ impl Db {
             depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Dirty),
             page_snap: std::cell::Cell::new(false),
+            writer_ops: std::cell::Cell::new(0),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts,
@@ -29861,6 +29976,7 @@ impl Reader {
             depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Dirty),
             page_snap: std::cell::Cell::new(false),
+            writer_ops: std::cell::Cell::new(0),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts: self.opts.clone(),
@@ -29897,6 +30013,7 @@ impl Reader {
             depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Dirty),
             page_snap: std::cell::Cell::new(false),
+            writer_ops: std::cell::Cell::new(0),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts: self.opts.clone(),
@@ -29940,6 +30057,7 @@ impl Reader {
             depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Latest),
             page_snap: std::cell::Cell::new(false),
+            writer_ops: std::cell::Cell::new(0),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts: self.opts.clone(),
@@ -30235,10 +30353,12 @@ impl Reader {
 }
 
 impl Db {
-    /// The guard of one of the writer's operations: see `Op`.
-    fn op(&self) -> Op {
+    /// The guard of one of the writer's operations: see `Op`, and
+    /// `WriterOp` for what this one says besides.
+    fn op(&self) -> WriterOp {
         std::mem::forget(self.r.enter());
-        Op(&self.r)
+        self.r.writer_ops.set(self.r.writer_ops.get() + 1);
+        WriterOp(&self.r)
     }
 
     /// The segment work moved to a thread of its own where the options
@@ -31768,12 +31888,13 @@ impl Reader {
                 if b == nblocks {
                     break;
                 }
-                // Under a cipher the builder stops where the cache of
-                // plaintext is well past its budget: every block it builds
-                // is a block's records read through that cache, under the
-                // one pin this job holds (`Reader::abandon_asked`).
+                // Under a cipher the builder rests between two blocks,
+                // holding nothing of a file: the forms it has built are
+                // copies, and the table's bounds are positions. It stops
+                // where the cache of plaintext is crowded past the rest
+                // (`Reader::build_rest`).
                 if stop.load(std::sync::atomic::Ordering::Relaxed)
-                    || self.shared.pager.as_ref().is_some_and(|p| p.crowded())
+                    || self.build_rest_unless(|| stop.load(std::sync::atomic::Ordering::Relaxed))
                 {
                     return Ok(());
                 }
@@ -32630,6 +32751,7 @@ impl Reader {
             depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Dirty),
             page_snap: std::cell::Cell::new(false),
+            writer_ops: std::cell::Cell::new(0),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts: self.opts.clone(),
@@ -33208,7 +33330,11 @@ impl Db {
                 break;
             }
             lend.wake();
-            std::thread::park_timeout(std::time::Duration::from_millis(1));
+            // Holding nothing of the store's files for the wait
+            // (`Reader::unlent`): the thread waited for reads them through
+            // the cache this operation's pin would otherwise hold shut.
+            self.r
+                .unlent(|| std::thread::park_timeout(std::time::Duration::from_millis(1)));
         }
         lend.holds.fetch_add(1, AtomicOrdering::Relaxed);
         lend.hold_ns
@@ -33229,7 +33355,11 @@ impl Db {
                 break;
             }
             lend.wake();
-            std::thread::park_timeout(std::time::Duration::from_millis(1));
+            // Holding nothing of the store's files for the wait
+            // (`Reader::unlent`): the thread waited for reads them through
+            // the cache this operation's pin would otherwise hold shut.
+            self.r
+                .unlent(|| std::thread::park_timeout(std::time::Duration::from_millis(1)));
         }
         lend.holds.fetch_add(1, AtomicOrdering::Relaxed);
         lend.hold_ns
@@ -33252,7 +33382,14 @@ impl Db {
                 break;
             }
             self.shared.upkeep.wake();
-            std::thread::sleep(std::time::Duration::from_micros(50));
+            // A wait for the thread's pass, holding nothing of the store's
+            // files (`Reader::unlent`). Pinned through it, a settle held
+            // the cache of a store under a cipher shut against the very
+            // pass it waited for: the pass's builds filled the cache, the
+            // evictor waited for this pin, and the pass waited a breath
+            // for the evictor and gave its forms up.
+            self.r
+                .unlent(|| std::thread::sleep(std::time::Duration::from_micros(50)));
         }
         self.take_back_upkeep();
     }
