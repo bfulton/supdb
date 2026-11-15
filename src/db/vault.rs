@@ -67,6 +67,9 @@
 //!   key, naming each live segment with its token and its wrapped key.
 //! - `wal-<id>`: the log, each commit a record sealed under a key drawn for
 //!   that file and wrapped in its header.
+//! - `spare-<id>`: a log file retired and kept to be written again in
+//!   place (`Options::recycle_wal`): its last life's records, or zeroes,
+//!   under a key its next life does not have.
 //!
 //! # Keys and nonces
 //!
@@ -506,11 +509,12 @@ struct Entry {
 
 /// Whether `name` is a file whose bytes the engine seals itself, record by
 /// record or slot by slot, and which therefore lives in the directory as
-/// it is: the log and the manifest. Every other name is kept in memory
-/// and reaches the directory as an envelope, a name nobody thought of
-/// included.
+/// it is: the log, a retired log file kept to be the next one
+/// (`Options::recycle_wal`), and the manifest. Every other name is kept
+/// in memory and reaches the directory as an envelope, a name nobody
+/// thought of included.
 fn passes(name: &str) -> bool {
-    name.starts_with("wal-") || name.starts_with("manifest")
+    name.starts_with("wal-") || name.starts_with("spare-") || name.starts_with("manifest")
 }
 
 /// What a store under a cipher counts of its own work.

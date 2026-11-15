@@ -740,9 +740,8 @@ pub enum Encryption {
     /// an open reads. A file's bytes are checked where they are decrypted,
     /// so a file changed on the device is refused at the read that first
     /// wants the changed bytes, with an error every operation after it
-    /// answers with too. Ordered ingest goes through the log, the compact
-    /// form is off and the log's files are not recycled, whatever the
-    /// options say. `Db::create` makes a store under the cipher in an
+    /// answers with too. Ordered ingest goes through the log and the
+    /// compact form is off, whatever the options say. `Db::create` makes a store under the cipher in an
     /// empty directory; `Db::open` refuses a store that is not under it,
     /// and a store under a cipher is refused where none is given.
     Cipher(vault::StoreCipher),
@@ -4221,10 +4220,11 @@ impl Wal {
     /// a 1 MB folio writes back the whole megabyte. Pre-written in 1 MB
     /// pieces, every later 100 KB commit cost 11x its bytes at the device;
     /// in 4 KB pieces, 1.04x.
+    ///
+    /// Under a cipher the zeros follow the sealed header, and read as a
+    /// record of no bytes whose tag is zeroes, which the tag refuses
+    /// (`vault::LogCipher::open_records`).
     fn prefill(&mut self, bytes: u64) -> Result<()> {
-        // A plain log's alone: a store under a cipher recycles none
-        // (`under_cipher`).
-        debug_assert!(self.enc.is_none());
         let zeros = vec![0u8; 4096];
         let mut at = self.written;
         while at < bytes {
@@ -4242,7 +4242,37 @@ impl Wal {
     /// previous life's frames, written under another id, and is overwritten
     /// as this life appends; replay stops at the first frame whose CRC does
     /// not verify under this id.
+    ///
+    /// Under a cipher the header is the file's own key, drawn for this
+    /// life and wrapped (`begin`). What follows it is the last life's
+    /// records under the last life's key, or zeroes, and the first of
+    /// either fails its tag, which is where a sealed log ends. The name
+    /// is the journal's and the header's bytes are the page cache's, so a
+    /// crash can leave the log's name on the last life's header, whole: a
+    /// key wrapped for another file, which a store that recycles reads as
+    /// a log with nothing in it (`replay`), as a plain log's old header
+    /// reads.
     fn recycle(spare: &Path, path: &Path, id: u64, kind: u8) -> Result<Wal> {
+        if let (Some(enc), head) = Wal::begin(path, id, kind)? {
+            let mut file = vault::open_write(spare)?;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(&head)?;
+            vault::rename(spare, path)?;
+            return Ok(Wal {
+                file,
+                path: path.to_path_buf(),
+                seq: 0,
+                pending: Vec::new(),
+                written: head.len() as u64,
+                synced: 0,
+                seed: wal_seed(id),
+                loose: kind == WAL_LOOSE,
+                dropped: 0,
+                head: head.len() as u64,
+                enc: Some(enc),
+                sealed: Vec::new(),
+            });
+        }
         vault::rename(spare, path)?;
         let mut file = vault::open_write(path)?;
         file.seek(SeekFrom::Start(0))?;
@@ -4472,11 +4502,20 @@ impl Wal {
     /// heads the chain -- its predecessor retired behind a manifest that
     /// covered every record in it -- a gap is a record lost, and the
     /// open refuses as it always did.
+    ///
+    /// `recycles` is a store whose log files are written again in place
+    /// (`Options::recycle_wal`): under a cipher, a file there whose header
+    /// is a sealed log's with a key that is not this file's is the last
+    /// life's header under the next life's name, the state a crash at a
+    /// rotation leaves (`recycle`), and a log with nothing in it. A store
+    /// that recycles nothing refuses such a header, which only a changed
+    /// byte makes there.
     fn replay(
         path: &Path,
         id: u64,
         from: u64,
         first: bool,
+        recycles: bool,
         apply: impl FnMut(u8, &[u8], &[u8]),
     ) -> Result<(u64, u64, bool)> {
         let mut buf = Vec::new();
@@ -4498,7 +4537,11 @@ impl Wal {
         // behind a plain header of the file's kind; those walked as a plain
         // log's are; and the length answered in the file's own bytes, the
         // end of the last record the walk kept all of.
-        let Some((enc, kind)) = Wal::resume(&v, id, &buf)? else {
+        let resumed = match Wal::resume(&v, id, &buf) {
+            Err(_) if recycles && wal_kind_named(WAL_HEAD_SEALED, &buf).is_some() => None,
+            resumed => resumed?,
+        };
+        let Some((enc, kind)) = resumed else {
             return Ok((from, 0, false));
         };
         let mut frames = wal_header(kind).to_vec();
@@ -11433,12 +11476,10 @@ fn ref_pack(off: u64, len: u32) -> u64 {
 /// compact form is a second copy of a partition, built from the first by
 /// a reader of the whole of it and attached by its bytes in the page
 /// cache, neither of which a file read by the piece through the store's
-/// own cache offers yet. And a recycled log file is one written through
-/// before its first record, to be written again in place.
+/// own cache offers yet.
 fn under_cipher(opts: &mut Options) {
     opts.direct_ingest = false;
     opts.zpages = ZPages::Off;
-    opts.recycle_wal = false;
 }
 
 fn check_options(opts: &Options) -> Result<()> {
@@ -27752,8 +27793,13 @@ impl Db {
         // loss took, and would read as a gap at every open after this one.
         let mut live = wal_ids.len().saturating_sub(1);
         for (i, &id) in wal_ids.iter().enumerate() {
-            let (next, valid, ended) =
-                Wal::replay(&Db::wal_path(dir, id), id, from, i == 0, |kind, k, v| {
+            let (next, valid, ended) = Wal::replay(
+                &Db::wal_path(dir, id),
+                id,
+                from,
+                i == 0,
+                opts.recycle_wal,
+                |kind, k, v| {
                     if kind == WAL_DEL {
                         mem.delete(mem_hash(k), k, &readers);
                         mem_bytes += k.len() + 16;
@@ -27761,7 +27807,8 @@ impl Db {
                         mem.append(mem_hash(k), k, v, &readers);
                         mem_bytes += k.len() + v.len();
                     }
-                })?;
+                },
+            )?;
             if ended {
                 live = i;
                 valid_len = valid;

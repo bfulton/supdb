@@ -1065,12 +1065,158 @@ fn a_crash_and_a_copy_open_as_what_was_committed() {
     holds(&db, n);
 }
 
+/// A store under a cipher recycles its log's files (`Options::recycle_wal`):
+/// a file a durable segment has retired is kept under a spare's name and
+/// renamed to be the next log, written in place over its last life's
+/// records. Those are sealed under the last life's key and the new file's
+/// header holds another, so the first of them fails its tag, and that is
+/// where the new log ends: nothing of a file's last life is read back.
+/// The spare is in the directory, holds nothing in the clear, and is the
+/// file the next rotation's log is, by its inode. Across crashes the store
+/// holds what it committed, each value once; closed, it leaves no spare.
+#[test]
+fn a_recycled_log_under_a_cipher_holds_what_was_committed_and_no_more() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = scratch("recycle");
+    let opts = || Options {
+        recycle_wal: true,
+        seal_bytes: 64 << 10,
+        l0_trigger: 2,
+        ..under(14)
+    };
+    let inodes = |prefix: &str| -> Vec<u64> {
+        names(&dir)
+            .iter()
+            .filter(|n| n.starts_with(prefix))
+            .map(|n| std::fs::metadata(dir.join(n)).unwrap().ino())
+            .collect()
+    };
+    let key = |i: u32| format!("{KEY_MARK}{i:05}").into_bytes();
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    let holds_model = |db: &Db, model: &BTreeMap<Vec<u8>, Vec<Vec<u8>>>, when: &str| {
+        for (k, want) in model {
+            let mut got: Vec<Vec<u8>> = Vec::new();
+            db.read_all(k, vf(&mut |x| got.push(x.to_vec()))).unwrap();
+            assert_eq!(&got, want, "{when}");
+        }
+    };
+    let mut db = Db::create(&dir, opts()).unwrap();
+    let spare = inodes("spare-");
+    assert_eq!(
+        spare.len(),
+        1,
+        "one spare, in the directory: {:?}",
+        names(&dir)
+    );
+    let mut recycled = false;
+    for round in 0u32..16 {
+        // Out of order, so that every write goes through the log, and
+        // enough of them for the log to pass its size and rotate.
+        for i in 0u32..400 {
+            let k = key((i * 7 + round) % 500);
+            let v = format!("{MARK} round {round} write {i}").into_bytes();
+            db.append(&k, &v);
+            model.entry(k).or_default().push(v);
+        }
+        db.commit().unwrap();
+        // The file that was the spare is a log now: recycled, not made.
+        recycled |= inodes("wal-").iter().any(|i| spare.contains(i));
+        if round % 4 == 3 {
+            drop(db);
+            db = Db::open(&dir, opts()).unwrap();
+            holds_model(&db, &model, &format!("after the crash in round {round}"));
+        }
+    }
+    assert!(recycled, "no rotation took the spare: {:?}", names(&dir));
+    db.flush().unwrap();
+    db.settle().unwrap();
+    // The live log's last life lies behind its header, longer than what
+    // this life goes on to write: two commits, a crash, and none of the
+    // old records read back as a value twice.
+    for (k, v) in [("new-a", "A"), ("new-b", "B")] {
+        db.append(k.as_bytes(), v.as_bytes());
+        model
+            .entry(k.as_bytes().to_vec())
+            .or_default()
+            .push(v.as_bytes().to_vec());
+        db.commit().unwrap();
+    }
+    for needle in [MARK, KEY_MARK] {
+        assert!(
+            files_holding(&dir, needle.as_bytes()).is_empty(),
+            "{needle} in the clear in {:?}",
+            files_holding(&dir, needle.as_bytes())
+        );
+    }
+    drop(db);
+    let db = Db::open(&dir, opts()).unwrap();
+    holds_model(&db, &model, "after the crash behind a recycled log");
+    drop(db);
+    // A crash at a rotation, as it leaves the directory: the spare under
+    // the next log's name, and its new header not on the device, so the
+    // header there is its last life's, a key wrapped for another file.
+    // A store that recycles reads that as a log with nothing in it; one
+    // that does not has no such file to meet and refuses it.
+    let live: u64 = names(&dir)
+        .iter()
+        .filter_map(|n| n.strip_prefix("wal-")?.parse().ok())
+        .max()
+        .unwrap();
+    let spare_name = names(&dir)
+        .into_iter()
+        .find(|n| n.starts_with("spare-"))
+        .expect("a spare while the store was open");
+    let next = dir.join(format!("wal-{:08}", live + 1));
+    std::fs::rename(dir.join(&spare_name), &next).unwrap();
+    let kept = std::fs::read(&next).unwrap();
+    let refused = Db::open(
+        &dir,
+        Options {
+            recycle_wal: false,
+            ..opts()
+        },
+    )
+    .err()
+    .expect("a log under another file's key, in a store that recycles none");
+    assert!(
+        refused.to_string().contains("not this store's log"),
+        "{refused}"
+    );
+    // And a file there that is no sealed log's at all is nobody's last
+    // life: refused by a store that recycles too.
+    let mut strange = kept.clone();
+    strange[0] ^= 0x55;
+    std::fs::write(&next, &strange).unwrap();
+    assert!(
+        Db::open(&dir, opts()).is_err(),
+        "a log file that is not a sealed log's opened"
+    );
+    std::fs::write(&next, &kept).unwrap();
+    let mut db = Db::open(&dir, opts()).unwrap();
+    holds_model(&db, &model, "after the crash at a rotation");
+    db.append(b"new-c", b"C");
+    model
+        .entry(b"new-c".to_vec())
+        .or_default()
+        .push(b"C".to_vec());
+    db.commit().unwrap();
+    drop(db);
+    let db = Db::open(&dir, opts()).unwrap();
+    holds_model(&db, &model, "and after a commit into the log begun there");
+    db.close().unwrap();
+    assert!(
+        inodes("spare-").is_empty(),
+        "a closed store left a spare: {:?}",
+        names(&dir)
+    );
+    holds_model(&Db::open(&dir, opts()).unwrap(), &model, "reopened");
+}
+
 /// What a store under a cipher runs without, it runs without whatever it
-/// is asked for: ordered ingest's run, the compact form and the recycled
-/// log each rest on a file the engine syncs itself, which under a cipher
-/// is a memory file. Asked for all three, the store keeps what it commits
-/// across a crash, and its directory holds a store under a cipher's files
-/// and no other.
+/// is asked for: ordered ingest's run and the compact form each rest on a
+/// file the engine syncs itself, which under a cipher is a memory file.
+/// Asked for both, the store keeps what it commits across a crash, and
+/// its directory holds a store under a cipher's files and no other.
 #[test]
 fn a_store_under_a_cipher_runs_without_what_it_cannot_seal() {
     let n = 12_000;
@@ -1079,7 +1225,6 @@ fn a_store_under_a_cipher_runs_without_what_it_cannot_seal() {
         direct_ingest: true,
         zpages: supdb::ZPages::Always,
         zpages_min_bytes: 0,
-        recycle_wal: true,
         ..under(7)
     };
     {

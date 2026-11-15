@@ -67,6 +67,9 @@
 //! - `ZFUZZ_MERGEPAR=n`: both stores run up to `n` partition merges at
 //!   once over disjoint ranges (`Options::merge_parallel`); a flag and not
 //!   a draw.
+//! - `ZFUZZ_RECYCLE=1`: both stores write their log's files again in
+//!   place (`Options::recycle_wal`), so a log behind which its last life's
+//!   records lie is replayed after every crash; a flag and not a draw.
 //! - `ZFUZZ_CIPHERCACHE=n`, with `ZFUZZ_CIPHER`: the `z` store's cache of
 //!   plaintext is `n` bytes (`StoreCipher::cache_bytes`), which for a small
 //!   `n` is a store that does not fit it.
@@ -327,6 +330,9 @@ fn opts(c: &Cfg) -> Options {
     }
     if let Some(n) = env_u64("ZFUZZ_MERGEPAR") {
         o.merge_parallel = n as usize;
+    }
+    if env_flag("ZFUZZ_RECYCLE") {
+        o.recycle_wal = true;
     }
     o
 }

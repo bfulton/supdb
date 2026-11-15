@@ -1379,12 +1379,35 @@ the fsync (`vault::persist`), by name, and pass over a name that has gone,
 since a promotion links a piece under another name and unlinks the first
 while the seal's thread is on its way there, and the manifest that names
 the file writes it whoever did not. Ordered ingest's run, a segment synced
-at every commit: off under a cipher, with the compact form and the
-recycled log (`under_cipher`), so an ordered load goes through the log.
+at every commit: off under a cipher, with the compact form
+(`under_cipher`), so an ordered load goes through the log.
 And the ordered index, which a plain store leaves unsynced and composes
 again where it is missing, as a store under a cipher does. A fourth fsync
 of a kept file is a durability that is not there, and the list is the
 thing to check a change against.
+
+The recycled log was off there too, for as long as it was written down
+that a file written through before its first record could not be a
+sealed one. It can (`Options::recycle_wal`): the spare passes to the
+directory as the log does, a recycled file's header is a key drawn for
+its new life, and what lies behind the header -- the last life's records
+under the last life's key, or the zeroes the file was made with -- fails
+its tag, which is where a sealed log ends. One state is new, the crash
+at a rotation: the log's name on the last life's header, the name being
+the journal's and the header's bytes the page cache's. A plain log's old
+header reads there as a log with nothing in it; a sealed one's is a key
+wrapped for another file, which an open refused as not this store's log.
+The first version synced the header into the spare before the rename, an
+order no test could hold and a store that would not open if a device
+ever lied about it. A store that recycles reads that header as a log
+with nothing in it now (`Wal::replay`'s `recycles`), and one that does
+not still refuses it, since only a changed byte makes it there;
+`tests/cipher.rs` builds the state by renaming the spare, and
+`ZFUZZ_RECYCLE=1` runs the fuzz with recycled logs. The rule: a state a
+crash can leave is one the open reads, built in a test, before it is
+one an fsync's order is trusted to prevent; and "cannot work under a
+cipher" is a claim about a mechanism, to be checked against the
+mechanism before a feature is switched off on it.
 
 A plain store's partition is named by its fences, sixteen bytes of two
 keys, so the names cannot go to the directory either: an envelope is named
