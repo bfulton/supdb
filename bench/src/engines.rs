@@ -516,6 +516,12 @@ pub struct Supdb {
     /// a durable store's commits lend either way, so it has no durable
     /// twin.
     nopace: bool,
+    /// A buffered commit near reads lends a paced batch within the share,
+    /// as before a paced batch was held until the thread had filed it
+    /// (`Options::upkeep_pace_holds` off). `supdb-ingestpacelends`; a
+    /// durable store's commits take the syncing pace, so it has no durable
+    /// twin.
+    pacelends: bool,
     /// A buffered commit near reads files any batch itself, however
     /// small (`Options::upkeep_inline_min` at one). `supdb-ingestinlineall`,
     /// and `supdb-inlineall` durable, where the commits sync and so lend
@@ -1717,6 +1723,12 @@ struct Policy {
     /// a durable store's commits lend either way, so it has no durable
     /// twin.
     nopace: bool,
+    /// A buffered commit near reads lends a paced batch within the share,
+    /// as before a paced batch was held until the thread had filed it
+    /// (`Options::upkeep_pace_holds` off). `supdb-ingestpacelends`; a
+    /// durable store's commits take the syncing pace, so it has no durable
+    /// twin.
+    pacelends: bool,
     /// A buffered commit near reads files any batch itself, however
     /// small (`Options::upkeep_inline_min` at one). `supdb-ingestinlineall`,
     /// and `supdb-inlineall` durable, where the commits sync and so lend
@@ -2681,6 +2693,7 @@ impl Default for Policy {
             rowatclose: false,
             lendbursts: false,
             nopace: false,
+            pacelends: false,
             inlineall: false,
             lazysettle: false,
             walsync: false,
@@ -4542,6 +4555,22 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 nopace: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` lending a burst's paced batch within the share, the
+    /// thread left to trail by it (`Options::upkeep_pace_holds` off).
+    /// Against `supdb-ingest` it prices the trail: the burst's overlap
+    /// against the first scan after the burst.
+    pub fn create_ingest_pacelends(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                pacelends: true,
                 ..Policy::default()
             },
         )
@@ -8097,6 +8126,7 @@ impl Supdb {
             rowatclose,
             lendbursts,
             nopace,
+            pacelends,
             inlineall,
             lazysettle,
             walsync,
@@ -8499,6 +8529,7 @@ impl Supdb {
             } else {
                 supdb::Options::default().upkeep_pace_pct
             },
+            upkeep_pace_holds: !pacelends,
             upkeep_inline_min: if inlineall {
                 1
             } else {
@@ -8982,6 +9013,7 @@ impl Supdb {
             rowatclose,
             lendbursts,
             nopace,
+            pacelends,
             inlineall,
             lazysettle,
             walsync,
@@ -9823,6 +9855,9 @@ impl Engine for Supdb {
         }
         if self.nopace {
             return "supdb-ingestnopace";
+        }
+        if self.pacelends {
+            return "supdb-ingestpacelends";
         }
         if self.inlineall {
             return if self.partition {
@@ -12171,6 +12206,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestrowatclose"
         | "supdb-ingestlendbursts"
         | "supdb-ingestnopace"
+        | "supdb-ingestpacelends"
         | "supdb-ingestinlineall"
         | "supdb-ingestlazysettle"
         | "supdb-ingestsettlelate"
@@ -13117,6 +13153,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-lendbursts" => supdb_arm(Supdb::create_lendbursts, dir)?,
         "supdb-ingestlendbursts" => supdb_arm(Supdb::create_ingest_lendbursts, dir)?,
         "supdb-ingestnopace" => supdb_arm(Supdb::create_ingest_nopace, dir)?,
+        "supdb-ingestpacelends" => supdb_arm(Supdb::create_ingest_pacelends, dir)?,
         "supdb-inlineall" => supdb_arm(Supdb::create_inlineall, dir)?,
         "supdb-ingestinlineall" => supdb_arm(Supdb::create_ingest_inlineall, dir)?,
         "supdb-lazysettle" => supdb_arm(Supdb::create_lazysettle, dir)?,

@@ -3655,9 +3655,35 @@ pub struct Options {
     /// a burst of one commit with scans at once behind it, the lag
     /// sweep's bursts at the small rungs, gains nothing from a thread
     /// that has to be woken and whose pass the first scan then waits
-    /// out. Zero files every such batch in the commit, the shape before:
+    /// out. A paced batch is held for its filing by default
+    /// (`upkeep_pace_holds`), the trail the share allows read as the first
+    /// scan's to pay, so the share now draws which batches the thread
+    /// files while the commit waits and which the commit files itself.
+    /// Zero files every such batch in the commit, the shape before:
     /// `supdb-ingestnopace` (`docs/engine.md`).
     pub upkeep_pace_pct: usize,
+    /// A buffered commit's batch that `upkeep_pace_pct` paces is held
+    /// until the thread has filed it (`Hand::Pace(0)`), where the share
+    /// lets the thread trail by the batch and the pass before it. The
+    /// trail is a linear trade: every write of it saves the burst its
+    /// filing at every batch and costs the first scan after the burst its
+    /// filing once, so a sum over the burst and the pass (the suite's
+    /// `weighted_ms`) reads lending ahead at any depth, while the pass,
+    /// read against its comparator, is where the trail lands: at a
+    /// hundred thousand keys the share is one batch, the first scan after
+    /// the full rewrite waited out the pass in flight and settled the
+    /// batch after it, 0.6-1.1 ms of a pass of 4.5-6, and the pass read
+    /// 0.89-0.92x of `lmdb-nosync` with the burst 2.0x. Held, the first
+    /// scan settles nothing and takes 20 µs, the pass reads 1.2-1.3x and
+    /// the burst 1.5-1.6x; at three hundred thousand keys the passes gain
+    /// a tenth and the bursts, 2-5x of the comparator's, a third to a half. The
+    /// thread still files, so the forms stand built where the inline fill
+    /// (`upkeep_pace_pct` at zero) leaves them to the scans. A syncing
+    /// commit's pace is its own (`upkeep_pace_syncs_bp`). Off is the batch
+    /// lent within the share, the shape before; `supdb-ingestpacelends` is
+    /// the arm.
+    #[doc(hidden)]
+    pub upkeep_pace_holds: bool,
     /// A syncing commit's batch of a burst lent and paced as
     /// `upkeep_pace_pct` paces a buffered one, within this share of the
     /// store's keys in basis points, while the store is in core: the
@@ -6005,6 +6031,7 @@ impl Default for Options {
             upkeep_inline_bursts: true,
             upkeep_inline_min: UPKEEP_WAKE_WRITES,
             upkeep_pace_pct: 1,
+            upkeep_pace_holds: true,
             upkeep_pace_syncs_bp: 25,
             upkeep_pace_syncs_to_share: true,
             upkeep_pace_syncs_model: true,
@@ -40240,6 +40267,10 @@ impl Db {
                 && batch <= PACE_SYNCS_SHARE_MAX_BATCH
             {
                 share
+            } else if !pace_syncs && self.opts.upkeep_pace_holds {
+                // Held for its filing: the first scan after the burst
+                // meets no trail (`Options::upkeep_pace_holds`).
+                0
             } else {
                 share.max(batch as u64)
             };

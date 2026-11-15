@@ -19514,12 +19514,15 @@ fn the_oracle_holds_with_loose_rotations() {
 /// commit held for that, the scan after the burst finds nothing left to
 /// settle, and every key reads as written through the writer and through
 /// a handle. A batch over the share, or every batch at zero, is filed in
-/// the commit: nothing is lent and the thread makes no pass.
+/// the commit: nothing is lent and the thread makes no pass. Held for its
+/// filing (`Options::upkeep_pace_holds`), a paced commit returns with the
+/// thread trailing by nothing, where lent within the share it returns
+/// with its own batch unfiled.
 #[test]
 fn a_bursts_batches_after_the_first_are_lent_a_batch_behind_the_thread() {
     // Batches of a thousand over twenty thousand keys: five percent of
     // the store, paced at a share of ten and filed at one.
-    let run = |name: &str, pace_pct: usize| {
+    let run = |name: &str, pace_pct: usize, hold: bool| {
         let pace = pace_pct >= 5;
         let d = dir(name);
         let mut db = Db::create(
@@ -19528,6 +19531,7 @@ fn a_bursts_batches_after_the_first_are_lent_a_batch_behind_the_thread() {
                 sync: supdb::SyncPolicy::EveryN(u32::MAX),
                 upkeep: supdb::Upkeep::Background(1),
                 upkeep_pace_pct: pace_pct,
+                upkeep_pace_holds: hold,
                 partition_bytes: Some(256 << 10),
                 seal_max_pct: 0,
                 ..Options::default()
@@ -19581,10 +19585,17 @@ fn a_bursts_batches_after_the_first_are_lent_a_batch_behind_the_thread() {
             if pace && round > 0 {
                 let behind = db.upkeep_behind_writes();
                 let share = keys as u64 * pace_pct as u64 / 100;
-                assert!(
-                    behind <= share,
-                    "commit {round}: the thread trails by at most the share {share}, not {behind}"
-                );
+                if hold {
+                    assert_eq!(
+                        behind, 0,
+                        "commit {round}: held, the thread trails by nothing"
+                    );
+                } else {
+                    assert!(
+                        behind <= share,
+                        "commit {round}: the thread trails by at most the share {share}, not {behind}"
+                    );
+                }
             }
         }
         let after = db.upkeep_counts();
@@ -19599,23 +19610,28 @@ fn a_bursts_batches_after_the_first_are_lent_a_batch_behind_the_thread() {
         check(&h, &want, "through a handle after the burst");
         (passes, holds, by_scan)
     };
-    let (passes, holds, by_scan) = run("paced-burst", 10);
-    assert!(
-        passes >= 1,
-        "the thread filed the lent batches: {passes} passes"
-    );
-    assert_eq!(holds, 7, "every commit after the first held for the thread");
-    assert_eq!(
-        by_scan, 0,
-        "the scan after the burst found nothing left to settle"
-    );
-    let (passes, holds, by_scan) = run("unpaced-burst", 0);
+    for (name, hold) in [("paced-burst", false), ("held-burst", true)] {
+        let (passes, holds, by_scan) = run(name, 10, hold);
+        assert!(
+            passes >= 1,
+            "{name}: the thread filed the lent batches: {passes} passes"
+        );
+        assert_eq!(
+            holds, 7,
+            "{name}: every commit after the first held for the thread"
+        );
+        assert_eq!(
+            by_scan, 0,
+            "{name}: the scan after the burst found nothing left to settle"
+        );
+    }
+    let (passes, holds, by_scan) = run("unpaced-burst", 0, false);
     assert_eq!(
         (passes, holds, by_scan),
         (0, 0, 0),
         "filed in the commits: no pass, no hold, nothing for the scan"
     );
-    let (passes, holds, by_scan) = run("over-the-share-burst", 1);
+    let (passes, holds, by_scan) = run("over-the-share-burst", 1, false);
     assert_eq!(
         (passes, holds, by_scan),
         (0, 0, 0),

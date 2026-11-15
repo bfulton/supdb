@@ -878,6 +878,16 @@ a pass, for longer passes while the writer ran ahead, read level, since
 the trailing thread took several batches a pass already and the share
 bounds the trail that lending's long passes amortise, so a lever on a
 pass's length is read against the passes counted before it is built.
+And the share is the first scan's to pay: a paced batch is held now
+until the thread has filed it (`Options::upkeep_pace_holds`;
+`supdb-ingestpacelends` lends it within the share), since the trail is
+a linear trade -- each write of it saves the burst its filing at every
+batch and costs the first scan after the burst its filing once -- that a
+sum over the burst and the pass reads lending's way at any depth, while
+the cells read it the other way: at a hundred thousand keys the share is
+one batch, the first scan after the full rewrite paid the pass in flight
+and the batch after it, and the pass read 0.9x of `lmdb-nosync` with the
+burst at 2x; held, 1.2-1.3x and 1.5-1.6x.
 `supdb-ingestlendbursts` is the arm that lends every batch and
 `supdb-ingestnopace` the one that files every batch. A syncing commit
 lends every batch, since its thread files through the fsync, and in core

@@ -3887,6 +3887,44 @@ found none, and nothing was built; the cost it would have moved is one
 batch of a burst, ten to twenty-five percent of a lag pass at these
 rungs, and shrinks only as a settle does.
 
+#### The buffered burst's last batch, held for its filing
+
+The buffered arm's pass after the full rewrite at a hundred thousand
+keys read 0.73-0.82x of `lmdb-nosync` in three quick rows and 0.85-0.92x
+in the pairings that priced it, the one lag cell lost on the ladder in
+every reading, and the lag counters put the whole loss in the first scan:
+0.6-1.6 ms against LMDB's ten microseconds, in a pass of 4.5-6 ms whose
+other tenths ran at LMDB's rate. The share the buffered pace is held to
+(`Options::upkeep_pace_pct`, a hundredth of the store) is one batch of
+the sweep's thousand at that rung, so a paced commit returned with its
+own batch lent and unfiled, the scan after the burst's last commit waited
+for the thread's pass over the batch before it (`take`, 0.36-0.59 ms) and
+then settled the last batch itself (`settle`, 0.38-0.51), and the durable
+arm, whose thread files beside every commit's fsync, met 0.03 ms of both.
+
+The trail the share allows is a linear trade. Each write of it lets the
+writer's next commit run beside the thread's filing, a saving at every
+batch of the burst, and is a write the first scan files once, so any sum
+over the burst and the pass -- the suite's `weighted_ms` among them --
+reads lending ahead at every depth, and the cells read the pass, against
+its comparator, as lost while the burst stood at 2x. Holding each paced
+batch until the thread has filed it (`Options::upkeep_pace_holds`) leaves
+the first scan nothing: 13-104 µs at a hundred thousand keys, 17-24 at
+three hundred, the `take` and `settle` phases at nothing and the thread's
+own work a pass the same (`bench/scripts/pair.sh SUPDB_LAG_COUNTERS=1
+SUPDB_SCAN_OPS=1 supdb-ingest supdb-ingestpacelends SIZE --reps 8`).
+Against the comparator in the row's whole order with the counters off,
+the pass after the full rewrite read 1.22-1.29x at a hundred thousand
+keys and 1.59-1.70x at three hundred, and the bursts 1.45-1.58x and
+1.96-2.06x, where lending read 0.89-0.92x and 1.18-1.20x for the pass and
+1.96-1.98x and 2.79-2.87x for the burst; the one-percent and ten-percent
+points moved the same way, every lag cell won under both shapes but the
+one. The mixes' batches of a hundred are under `upkeep_inline_min` and
+are lent as before, and A and F read level arm against arm. Level 2 of
+the upkeep (`supdb-ingesthold`) holds the bursts too, and also files the
+mixes' small batches in the commit, which took a third off A's and F's
+margins: the hold is a burst's decision, not the upkeep's level.
+
 #### The buffered load's write path: six copies of a value, and the pages they touch
 
 With the manifest in its slots the buffered ordered load stood at 0.72x
