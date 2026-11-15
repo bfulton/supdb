@@ -4023,8 +4023,12 @@ fn a_syncing_store_pre_writes_its_wal_ahead_of_the_tail_and_not_whole() {
     };
     let page = |n: u64| (n + 4095) & !4095;
     let ahead = 256u64 << 10;
+    // The lengths below are the inline shape's, a commit's file holding the
+    // reach when the commit returns; beside, a helper writes it after
+    // (`a_syncing_stores_pre_write_is_made_beside_the_commit_that_buys_it`).
     let opts = Options {
         wal_ahead_bytes: ahead as usize,
+        wal_ahead_beside: false,
         ..Options::default()
     };
     assert!(opts.recycle_wal && matches!(opts.sync, supdb::SyncPolicy::Always));
@@ -4154,6 +4158,7 @@ fn a_syncing_store_pre_writes_its_wal_ahead_of_the_tail_and_not_whole() {
     let rot = Options {
         wal_ahead_bytes: small as usize,
         seal_bytes: 256 << 10,
+        wal_ahead_beside: false,
         ..Options::default()
     };
     let mut db = Db::create(&d, rot).unwrap();
@@ -4187,6 +4192,7 @@ fn a_syncing_store_pre_writes_its_wal_ahead_of_the_tail_and_not_whole() {
     let flat = Options {
         wal_ahead_bytes: ahead as usize,
         wal_ahead_small_runs: false,
+        wal_ahead_beside: false,
         ..Options::default()
     };
     let mut db = Db::create(&d, flat).unwrap();
@@ -4226,6 +4232,96 @@ fn a_syncing_store_pre_writes_its_wal_ahead_of_the_tail_and_not_whole() {
         "a store whose commits do not sync pre-writes nothing"
     );
     assert_eq!(spares(&d), 0);
+}
+
+/// The log's pre-write made beside the commit that buys it
+/// (`Options::wal_ahead_beside`): the buying commit's file holds its frames
+/// and no reach when it returns, the reach is the file's once the helper is
+/// joined, and the next commit lands in it; a crash with a helper's reach
+/// written past the tail reopens to every commit; and a helper's failure
+/// is the next commit's error, never swallowed.
+#[test]
+fn a_syncing_stores_pre_write_is_made_beside_the_commit_that_buys_it() {
+    let page = |n: u64| (n + 4095) & !4095;
+    let ahead = 256u64 << 10;
+    let opts = Options {
+        wal_ahead_bytes: ahead as usize,
+        ..Options::default()
+    };
+    assert!(opts.wal_ahead_beside && opts.wal_ahead_small_runs);
+    let d = dir("wal-beside");
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+    let write = |db: &mut Db, round: u32, model: &mut HashMap<Vec<u8>, Vec<Vec<u8>>>| {
+        for i in 0u32..60 {
+            let k = format!("k{:04}", (i * 13 + round) % 400).into_bytes();
+            let v = format!("r{round}i{i}").repeat(8).into_bytes();
+            db.append(&k, &v);
+            model.entry(k).or_default().push(v);
+        }
+        db.commit().unwrap();
+    };
+    // Small commits until one buys a reach: the run has written a reach
+    // and the commit runs past the file's end.
+    let mut round = 0u32;
+    let bought = loop {
+        assert!(round < 2000, "a reach bought in two thousand small commits");
+        let (writes, _) = db.wal_ahead_counts();
+        write(&mut db, round, &mut model);
+        round += 1;
+        if db.wal_ahead_counts().0 > writes {
+            break db.wal_durable().2;
+        }
+    };
+    let (live, synced, written) = db.wal_durable();
+    assert_eq!((synced, written), (bought, bought), "the buying commit synced its frames");
+    let len = db.wal_join_ahead().unwrap();
+    assert_eq!(len, page(bought + ahead), "the reach is the file's once the helper is joined");
+    // The next commit lands inside the reach and buys nothing.
+    let (writes, _) = db.wal_ahead_counts();
+    write(&mut db, round, &mut model);
+    round += 1;
+    let (_, _, written) = db.wal_durable();
+    assert!(written < len, "the next commit lands in the reach");
+    assert_eq!(db.wal_ahead_counts().0, writes, "and buys none");
+    assert_eq!(std::fs::metadata(&live).unwrap().len(), len);
+    // Commits until the next reach is bought, then a crash with the reach
+    // past the tail: every commit is there after the reopen.
+    loop {
+        let (w, _) = db.wal_ahead_counts();
+        write(&mut db, round, &mut model);
+        round += 1;
+        if db.wal_ahead_counts().0 > w {
+            break;
+        }
+    }
+    db.crash();
+    let mut db = Db::open(&d, opts.clone()).unwrap();
+    for (k, want) in &model {
+        assert_eq!(&read_vec(&db, k), want, "after the crash");
+    }
+    // A helper that fails: the commit that bought the reach is answered,
+    // and the next write answers the helper's error.
+    db.fail_next_wal_zeroing();
+    let mut failed = None;
+    for _ in 0..2000 {
+        for i in 0u32..60 {
+            let k = format!("k{:04}", (i * 13 + round) % 400).into_bytes();
+            db.append(&k, b"after");
+        }
+        round += 1;
+        if let Err(e) = db.commit() {
+            failed = Some(e);
+            break;
+        }
+    }
+    let e = failed.expect("the helper's failure reached a commit");
+    assert!(
+        e.to_string().contains("injected failure of the log's pre-write"),
+        "the helper's own error: {e}"
+    );
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
 }
 
 #[test]

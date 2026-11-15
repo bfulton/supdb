@@ -963,6 +963,10 @@ pub struct Supdb {
     /// whatever the commit's size, from a file's first
     /// (`Options::wal_ahead_small_runs` off). `supdb-walaheadflat`.
     walaheadflat: bool,
+    /// The WAL's pre-write made ahead of the buying commit's frames on the
+    /// writer's path (`Options::wal_ahead_beside` off).
+    /// `supdb-walaheadinline`.
+    walaheadinline: bool,
     /// A settle that returns without waiting for the form files the store
     /// asked the kernel for (`Options::zpages_settle_joins_asks` off).
     /// `supdb-zsettleloose`.
@@ -2160,6 +2164,10 @@ struct Policy {
     /// whatever the commit's size, from a file's first
     /// (`Options::wal_ahead_small_runs` off). `supdb-walaheadflat`.
     walaheadflat: bool,
+    /// The WAL's pre-write made ahead of the buying commit's frames on the
+    /// writer's path (`Options::wal_ahead_beside` off).
+    /// `supdb-walaheadinline`.
+    walaheadinline: bool,
     /// A settle that returns without waiting for the form files the store
     /// asked the kernel for (`Options::zpages_settle_joins_asks` off).
     /// `supdb-zsettleloose`.
@@ -2782,6 +2790,7 @@ impl Default for Policy {
             walappend: false,
             walprefill: false,
             walaheadflat: false,
+            walaheadinline: false,
             zsettleloose: false,
             norecycle: false,
             heapblocks: false,
@@ -8197,6 +8206,7 @@ impl Supdb {
             walappend,
             walprefill,
             walaheadflat,
+            walaheadinline,
             zsettleloose,
             norecycle,
             heapblocks,
@@ -8670,6 +8680,7 @@ impl Supdb {
             recycle_wal: !walappend,
             wal_ahead_bytes: if walprefill { 0 } else { 1 << 20 },
             wal_ahead_small_runs: !walaheadflat,
+            wal_ahead_beside: !walaheadinline,
             zpages_settle_joins_asks: !zsettleloose,
             prefault: populate,
             direct_put_one: !recordsteps,
@@ -9080,6 +9091,7 @@ impl Supdb {
             walappend,
             walprefill,
             walaheadflat,
+            walaheadinline,
             zsettleloose,
             norecycle,
             heapblocks,
@@ -10476,6 +10488,9 @@ impl Engine for Supdb {
         if self.walprefill {
             return "supdb-walprefill";
         }
+        if self.walaheadinline {
+            return "supdb-walaheadinline";
+        }
         if self.walaheadflat {
             return "supdb-walaheadflat";
         }
@@ -10839,6 +10854,10 @@ impl Engine for Supdb {
             ("builds_clean", bk.0[3] as f64),
             ("recopies", bk.1 as f64),
             ("wide_walks", db.wide_walks() as f64),
+            // The log's pre-writes and the writer's time on them
+            // (`Options::wal_ahead_beside`).
+            ("wal_ahead_writes", db.wal_ahead_counts().0 as f64),
+            ("wal_ahead_wait_us", db.wal_ahead_counts().1 as f64 / 1e3),
             ("sheds", bk.2 as f64),
             ("span_starts", db.span_starts() as f64),
             // The scans' start blocks the start cache named, and the
@@ -12017,6 +12036,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-walappend"
         | "supdb-walprefill"
         | "supdb-walaheadflat"
+        | "supdb-walaheadinline"
         | "supdb-zsettleloose"
         | "supdb-norecycle"
         | "supdb-heapblocks"
@@ -13833,6 +13853,18 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-walappend" => supdb_arm(Supdb::create_walappend, dir)?,
         "supdb-walprefill" => supdb_arm(Supdb::create_walprefill, dir)?,
         "supdb-walaheadflat" => supdb_arm(Supdb::create_walaheadflat, dir)?,
+        "supdb-walaheadinline" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        walaheadinline: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
         "supdb-zsettleloose" => supdb_arm(Supdb::create_zsettleloose, dir)?,
         "supdb-ingestlatesync" => supdb_arm(Supdb::create_ingest_latesync, dir)?,
         "supdb-norecycle" => supdb_arm(Supdb::create_norecycle, dir)?,
@@ -15962,6 +15994,21 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.wal_ahead_small_runs && b.wal_ahead_small_runs);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("walaheadinline"),
+                    Policy {
+                        walaheadinline: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-walaheadinline");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.wal_ahead_beside && b.wal_ahead_beside);
+                assert!(o.wal_ahead_small_runs);
             }
             {
                 let z = Supdb::create_zsettleloose(&dir("zsettleloose")).unwrap();

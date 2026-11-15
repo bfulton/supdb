@@ -753,6 +753,8 @@ fn counters_line(
             "builds_clean",
             "recopies",
             "wide_walks",
+            "wal_ahead_writes",
+            "wal_ahead_wait_us",
             "sheds",
             // The merges the mix planned and landed, for a policy that
             // chains them through writes (`Options::merge_chains_writes`).

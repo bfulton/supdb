@@ -709,6 +709,9 @@ alone and paces no batch under 256 writes
 commit for its batch's filing where the store's own runs of commits
 between scans make a scan the likelier next operation, and paces every
 other batch within the backlog bound (`Options::upkeep_pace_syncs_model`);
+`supdb-walaheadinline` writes the log's pre-write ahead of the buying
+commit's frames on the writer's path, where the default writes it on a
+helper once the commit has synced (`Options::wal_ahead_beside`);
 `supdb-probestwice` and `supdb-ingestprobestwice` have a point read over a
 store with tombstones probe every source again after its tombstone pass,
 where the default keeps what the pass found of each source
