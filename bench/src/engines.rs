@@ -40,6 +40,9 @@
 
 use std::path::{Path, PathBuf};
 
+#[path = "dense.rs"]
+mod dense;
+
 /// What an engine actually guarantees. Reported beside every number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Features {
@@ -12361,6 +12364,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-bglag"
         | "lmdb"
         | "lmdb-nordahead"
+        | "dense"
         | "rocksdb-tuned-lz4"
         | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest"
@@ -14136,6 +14140,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestnoseal" => supdb_arm(Supdb::create_ingest_noseal, dir)?,
         "lmdb" => Box::new(Lmdb::create(dir, map_gb)?),
         "lmdb-nordahead" => Box::new(Lmdb::create_nordahead(dir, map_gb)?),
+        "dense" => Box::new(dense::Dense::open(dir)?),
         "lmdb-nosync" => Box::new(Lmdb::create_nosync(dir, map_gb)?),
         "rocksdb-tuned" => Box::new(Rocks::create_tuned(dir)?),
         "rocksdb-tuned-lz4" => Box::new(Rocks::create_tuned_lz4(dir)?),
