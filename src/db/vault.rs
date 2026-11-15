@@ -60,9 +60,12 @@
 //!   store without one is not under a cipher, and one with it opens under
 //!   no other.
 //! - `x-<token>`: a segment, as an envelope under a key drawn for that
-//!   file; `x-<token>.o`, its ordered index, under the same key. The names
-//!   say nothing: a segment's own name carries its fences, sixteen bytes of
-//!   two keys, and lives in the manifest.
+//!   file; `x-<token>.o`, its ordered index, and `x-<token>.z`, its
+//!   compact form where it has one (`zfile`), under the same key. The
+//!   names say nothing: a segment's own name carries its fences, sixteen
+//!   bytes of two keys, and lives in the manifest. No manifest names the
+//!   two beside a segment: each is a function of its segment, checked
+//!   against it where it is opened and made again where it is missing.
 //! - `manifest`, `manifest.alt`: the slots, each sealed under the store's
 //!   key, naming each live segment with its token and its wrapped key.
 //! - `wal-<id>`: the log, each commit a record sealed under a key drawn for
@@ -86,8 +89,8 @@
 //!
 //! # What an attacker who can write the directory can and cannot do
 //!
-//! Any byte changed in a segment, an index, a manifest or a log record is
-//! found, and none is ever read as data. A file's bytes are checked where
+//! Any byte changed in a segment, an index, a form file, a manifest or a
+//! log record is found, and none is ever read as data. A file's bytes are checked where
 //! they are decrypted, which is where they are first read: a header that
 //! is not the file's is refused where the file is opened, and a chunk
 //! that fails its tag at the read that wants it, which answers with an
@@ -114,11 +117,17 @@
 //! to swap and to a core file; a host where that matters encrypts its swap
 //! and keeps its core files where it keeps its keys.
 //!
-//! # What a store under a cipher runs without
+//! # A file beside a segment, written again
 //!
-//! The compact form, whatever the options say (`under_cipher` in the
-//! engine): it is built from a partition's records borrowed whole and
-//! attached by its bytes in the page cache.
+//! A segment's compact form is built after the segment, by a reader of
+//! the segment's records through the store's cache, and may be built more
+//! than once: in another coding, or after a page of it failed a check.
+//! Its envelope is written under the segment's token and key
+//! (`Vault::persist_form`) under a temp name and renamed over its own, so
+//! that a reader's view of the form before keeps the file it was opened
+//! on; an open learns of it where the engine first asks after it
+//! (`companion`), since nothing names it but its place; and it leaves the
+//! directory with its segment.
 //!
 //! # A file written and mapped at once
 //!
@@ -453,44 +462,70 @@ pub(crate) fn refuse_marked(dir: &Path) -> Result<()> {
 
 // ---------------------------------------------------------------- files --
 
+/// What an envelope holds: a segment, or one of the two files derived from
+/// a segment and kept beside it under its token and its key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Seg,
+    /// The segment's ordered index, `x-<token>.o`.
+    Ord,
+    /// The segment's compact form (`zfile`), `x-<token>.z`.
+    Form,
+}
+
+impl Kind {
+    fn suffix(self) -> &'static str {
+        match self {
+            Kind::Seg => "",
+            Kind::Ord => ".o",
+            Kind::Form => ".z",
+        }
+    }
+}
+
 /// Where a kept file's envelope is, and the key it is under.
 #[derive(Clone)]
 struct Disk {
     token: Token,
     wrapped: [u8; WRAPPED],
-    /// The ordered index beside the segment the token names.
-    ord: bool,
+    /// The segment the token names, or which of the files beside it.
+    kind: Kind,
 }
 
 impl Disk {
     fn name(&self) -> String {
-        disk_name(&self.token, self.ord)
+        disk_name(&self.token, self.kind)
     }
 
     fn same(&self, other: &Disk) -> bool {
-        self.token == other.token && self.ord == other.ord
+        self.token == other.token && self.kind == other.kind
     }
 }
 
-fn disk_name(token: &Token, ord: bool) -> String {
+fn disk_name(token: &Token, kind: Kind) -> String {
     let mut s = String::with_capacity(36);
     s.push_str("x-");
     for b in token {
         s.push_str(&format!("{b:02x}"));
     }
-    if ord {
-        s.push_str(".o");
-    }
+    s.push_str(kind.suffix());
     s
 }
 
+/// The name an envelope is written under before it has its own
+/// (`Vault::persist_form`), which a crash leaves for the sweep.
+const ENVELOPE_TMP: &str = ".tmp";
+
 /// The token and kind an envelope's name carries, or nothing for a name
 /// that is not one.
-fn disk_parse(name: &str) -> Option<(Token, bool)> {
+fn disk_parse(name: &str) -> Option<(Token, Kind)> {
     let rest = name.strip_prefix("x-")?;
-    let (hex, ord) = match rest.strip_suffix(".o") {
-        Some(h) => (h, true),
-        None => (rest, false),
+    let (hex, kind) = if let Some(h) = rest.strip_suffix(".o") {
+        (h, Kind::Ord)
+    } else if let Some(h) = rest.strip_suffix(".z") {
+        (h, Kind::Form)
+    } else {
+        (rest, Kind::Seg)
     };
     if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
@@ -499,7 +534,7 @@ fn disk_parse(name: &str) -> Option<(Token, bool)> {
     for (i, t) in token.iter_mut().enumerate() {
         *t = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
     }
-    Some((token, ord))
+    Some((token, kind))
 }
 
 /// One of the store's files.
@@ -955,6 +990,21 @@ impl Vault {
                 .any(|o| o.disk.as_ref().is_some_and(|x| x.same(&d)));
             if !shared {
                 let _ = std::fs::remove_file(self.real.join(d.name()));
+                if d.kind == Kind::Seg {
+                    // The form file beside a segment goes with it where no
+                    // name of the store's holds it: one written and never
+                    // attached by this open of the store (`companion`).
+                    let z = Disk {
+                        kind: Kind::Form,
+                        ..d
+                    };
+                    let held = files
+                        .values()
+                        .any(|o| o.disk.as_ref().is_some_and(|x| x.same(&z)));
+                    if !held {
+                        let _ = std::fs::remove_file(self.real.join(z.name()));
+                    }
+                }
             }
         }
         Ok(())
@@ -1105,12 +1155,17 @@ impl Vault {
     /// envelope took half as long again: each piece waits for the device
     /// where the cached pieces go to it together.
     fn write_envelope(&self, mem: &File, disk: &Disk, key: &Key, sync: bool) -> Result<u64> {
+        self.write_envelope_at(mem, &self.real.join(disk.name()), key, sync)
+    }
+
+    /// `write_envelope` to a path of the caller's choosing.
+    fn write_envelope_at(&self, mem: &File, path: &Path, key: &Key, sync: bool) -> Result<u64> {
         let aead = (self.data)(&key.0);
         let len = mem.metadata()?.len();
         // Under a key of the file's own, which has no name of the caller's.
         let opts = EncryptOptions::default();
         let mut out = Ahead {
-            file: File::create(self.real.join(disk.name()))?,
+            file: File::create(path)?,
             at: 0,
             hint: sync,
         };
@@ -1270,7 +1325,7 @@ impl Vault {
                     let disk = Disk {
                         token,
                         wrapped: self.wrap(&Vault::file_aad(&token), &key)?,
-                        ord: false,
+                        kind: Kind::Seg,
                     };
                     let keep = self.keeps(&mem);
                     self.write_envelope(&mem, &disk, &key, true)?;
@@ -1312,7 +1367,7 @@ impl Vault {
                         .unwrap(&Vault::file_aad(&disk.token), &disk.wrapped)
                         .ok_or_else(|| refused("a file's key does not unwrap under the store's"))?;
                     let odisk = Disk {
-                        ord: true,
+                        kind: Kind::Ord,
                         ..disk.clone()
                     };
                     let keep = self.keeps(&mem);
@@ -1340,6 +1395,132 @@ impl Vault {
         Ok(out)
     }
 
+    /// `seg`'s compact form, the file the store holds as `form`, written to
+    /// the directory as an envelope beside the segment's, under the
+    /// segment's token and key, and from there the cache's to give back
+    /// and read again: `x-<token>.z`. Whether it was: a segment with no
+    /// envelope yet has no token to write beside, and a form with no
+    /// memory file has its envelope or is gone, each of which leaves the
+    /// form as it is.
+    ///
+    /// The envelope is written under a temp name and renamed over the
+    /// name, where a segment's is written in place: a segment's token is
+    /// drawn for its one envelope, and a form file may be written again
+    /// for the same segment -- in another coding, or after a page of the
+    /// first failed a check -- while a reader still holds the view over
+    /// the first, whose file a write in place would cut to nothing under
+    /// it. No manifest names a form file: it is a function of its
+    /// segment, found beside it at the next open (`companion`) and built
+    /// again where it is missing or fails its checks, so it is synced only
+    /// where the caller says and the directory never is. A second
+    /// envelope under one file's key meets no nonce of the first, each
+    /// envelope's nonces being behind an id drawn for it (`crypt`).
+    ///
+    /// `cold` is a form file nothing reads yet, one built ahead of the
+    /// controller's buy beside a raw form that fits: its plaintext is not
+    /// taken into the store's cache, where it would stand in the raw
+    /// form's place, and the kernel's cache of its envelope is written
+    /// back and dropped, as a plain store drops such a file's pages
+    /// (`zfile::BuildPlan::drop_output`).
+    fn persist_form(&self, seg: &str, form: &str, sync: bool, cold: bool) -> Result<bool> {
+        // Outside the lock a segment's persist takes: a form file is one
+        // builder's, and its envelope, megabytes on a thread at idle
+        // priority, is not to stand in front of a seal's.
+        let (sdisk, mem) = {
+            let files = lock(&self.files);
+            let Some(sdisk) = files
+                .get(seg)
+                .and_then(|e| e.disk.clone())
+                .filter(|d| d.kind == Kind::Seg)
+            else {
+                return Ok(false);
+            };
+            match files.get(form) {
+                Some(Entry {
+                    mem: Some(mem),
+                    disk: None,
+                    ..
+                }) => (sdisk, mem.clone()),
+                _ => return Ok(false),
+            }
+        };
+        let key = self
+            .unwrap(&Vault::file_aad(&sdisk.token), &sdisk.wrapped)
+            .ok_or_else(|| refused("a file's key does not unwrap under the store's"))?;
+        let zdisk = Disk {
+            kind: Kind::Form,
+            ..sdisk
+        };
+        let keep = !cold && self.keeps(&mem);
+        let path = self.real.join(zdisk.name());
+        let tmp = self.real.join(format!("{}{ENVELOPE_TMP}", zdisk.name()));
+        self.write_envelope_at(&mem, &tmp, &key, sync)?;
+        if cold {
+            if let Ok(f) = File::open(&tmp) {
+                drop_cached(&f);
+            }
+        }
+        std::fs::rename(&tmp, &path).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
+        let mut files = lock(&self.files);
+        let held = match files.get_mut(form) {
+            Some(e) if e.mem.as_ref().is_some_and(|m| Arc::ptr_eq(m, &mem)) => {
+                e.disk = Some(zdisk.clone());
+                true
+            }
+            _ => false,
+        };
+        if held {
+            // Under the one lock with the naming above, as a segment's is.
+            self.settled(&mut files, form, &mem, &zdisk, keep)?;
+        } else {
+            // Removed while its envelope was written: nobody's.
+            let _ = std::fs::remove_file(&path);
+        }
+        Ok(held)
+    }
+
+    /// The form file beside `seg` known to the store as `form`, where the
+    /// directory holds one and the store does not know it yet: an open
+    /// reads the segments its manifest names and nothing says which of
+    /// them has a form file but the file. Whether the store holds `form`
+    /// now.
+    fn companion(&self, seg: &str, form: &str) -> bool {
+        let mut files = lock(&self.files);
+        if files.contains_key(form) {
+            return true;
+        }
+        let Some(sdisk) = files
+            .get(seg)
+            .and_then(|e| e.disk.clone())
+            .filter(|d| d.kind == Kind::Seg)
+        else {
+            return false;
+        };
+        let zdisk = Disk {
+            kind: Kind::Form,
+            ..sdisk
+        };
+        if !self.real.join(zdisk.name()).exists() {
+            return false;
+        }
+        // The view another name over the same envelope has already.
+        let page = files
+            .values()
+            .find(|e| e.page.is_some() && e.disk.as_ref().is_some_and(|x| x.same(&zdisk)))
+            .and_then(|e| e.page.clone());
+        files.insert(
+            form.to_string(),
+            Entry {
+                mem: None,
+                page,
+                disk: Some(zdisk),
+            },
+        );
+        true
+    }
+
     /// A segment a manifest names, with the envelope it is in, and its
     /// ordered index where the directory holds one: known to the store
     /// from here, and decrypted when something first reads it.
@@ -1348,7 +1529,7 @@ impl Vault {
         let disk = Disk {
             token,
             wrapped,
-            ord: false,
+            kind: Kind::Seg,
         };
         // The view another name over the same envelope has already.
         let page_of = |files: &HashMap<String, Entry>, d: &Disk| {
@@ -1369,7 +1550,10 @@ impl Vault {
             );
         }
         if let Some(ord) = ord {
-            let odisk = Disk { ord: true, ..disk };
+            let odisk = Disk {
+                kind: Kind::Ord,
+                ..disk
+            };
             if !files.contains_key(ord) && self.real.join(odisk.name()).exists() {
                 let page = page_of(&files, &odisk);
                 files.insert(
@@ -1411,13 +1595,25 @@ impl Vault {
         let mut swept = 0;
         for entry in std::fs::read_dir(&self.real)? {
             let name = entry?.file_name().to_string_lossy().into_owned();
-            let Some((token, ord)) = disk_parse(&name) else {
+            if name.starts_with("x-") && name.ends_with(ENVELOPE_TMP) {
+                // An envelope a crash came while it was written under its
+                // temp name (`persist_form`): nobody's.
+                if std::fs::remove_file(self.real.join(&name)).is_ok() {
+                    swept += 1;
+                }
+                continue;
+            }
+            let Some((token, kind)) = disk_parse(&name) else {
                 continue;
             };
+            // A form file is held by its segment as well as by its own
+            // name: the store learns of it where it is first attached
+            // (`companion`), which is after this.
             let held = files.values().any(|e| {
-                e.disk
-                    .as_ref()
-                    .is_some_and(|d| d.token == token && d.ord == ord)
+                e.disk.as_ref().is_some_and(|d| {
+                    d.token == token
+                        && (d.kind == kind || (kind == Kind::Form && d.kind == Kind::Seg))
+                })
             });
             if !held && std::fs::remove_file(self.real.join(&name)).is_ok() {
                 swept += 1;
@@ -1829,6 +2025,16 @@ pub(crate) fn exists(path: impl AsRef<Path>) -> bool {
     }
 }
 
+/// `Path::is_file`.
+pub(crate) fn is_file(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    match locate(path) {
+        None => path.is_file(),
+        Some((v, name)) if passes(&name) => v.real.join(name).is_file(),
+        Some((v, name)) => lock(&v.files).contains_key(&name),
+    }
+}
+
 /// The file's length, as `std::fs::metadata` has it.
 pub(crate) fn len(path: impl AsRef<Path>) -> Result<u64> {
     let path = path.as_ref();
@@ -1929,6 +2135,67 @@ pub(crate) fn persist_one(dir: impl AsRef<Path>, seg: &str) -> Result<()> {
         }
         None => Ok(()),
     }
+}
+
+/// `seg`'s compact form, written as `form`, given its envelope beside the
+/// segment's (`Vault::persist_form`), synced where `sync` says: for a
+/// store under a cipher, where a form file is otherwise a memory file the
+/// store's cache can give nothing back of and the close loses. Nothing
+/// for a plain store, whose form file is in its directory as it is
+/// written.
+pub(crate) fn persist_form(
+    dir: impl AsRef<Path>,
+    seg: &str,
+    form: &str,
+    sync: bool,
+    cold: bool,
+) -> Result<()> {
+    match under(dir.as_ref()) {
+        Some(v) => v.persist_form(seg, form, sync, cold).map(|_| ()),
+        None => Ok(()),
+    }
+}
+
+/// A file's pages written back and dropped from the kernel's cache: the
+/// writeback waited for by range, which asks for no flush of the device,
+/// then the clean pages dropped.
+fn drop_cached(file: &File) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a writeback and an advice over a descriptor this call
+        // borrows; neither changes a byte of the file.
+        unsafe {
+            libc::sync_file_range(
+                file.as_raw_fd(),
+                0,
+                0,
+                libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                    | libc::SYNC_FILE_RANGE_WRITE
+                    | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+            );
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = file;
+}
+
+/// The form file beside `seg` made known to the store as `form`, where a
+/// store under a cipher holds one in its directory from an earlier open
+/// (`Vault::companion`). Nothing for a plain store, whose form file is
+/// found by its name.
+pub(crate) fn companion(dir: impl AsRef<Path>, seg: &str, form: &str) {
+    if let Some(v) = under(dir.as_ref()) {
+        v.companion(seg, form);
+    }
+}
+
+/// Whether `path` names a file a store under a cipher keeps: one that is
+/// read through the store's cache by the piece and has no descriptor to
+/// read it by, where a plain store's file, the log and the manifest have.
+pub(crate) fn kept(path: impl AsRef<Path>) -> bool {
+    matches!(locate(path.as_ref()), Some((_, name)) if !passes(&name))
 }
 
 /// The file mapped for reading, as `MmapBytes::open` maps it. A kept
@@ -2059,6 +2326,67 @@ pub(crate) mod tests {
         hay.windows(needle.len()).any(|w| w == needle)
     }
 
+    /// A form file written again for the same segment leaves the view over
+    /// the one before reading what it read: the second envelope is a file
+    /// of its own, renamed over the first's name, and the first's bytes
+    /// stay under the mapping a reader holds. Written in place, the first
+    /// view would read the second's bytes under the first's header, and
+    /// none of them passes its tag. And the name the first is kept under
+    /// meanwhile takes the envelope with it only when it is the last.
+    #[test]
+    fn a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first() {
+        let real = dir("formagain");
+        // A cache with no room: a file is read from its envelope, by the
+        // chunk, when something wants it.
+        let held = Vault::create(&real, &cipher(4).cache_bytes(4096)).unwrap();
+        let d = held.dir();
+        let v = held.vault();
+        put(&d.join("par-1.sup"), &b"a segment ".repeat(100));
+        v.persist(&pair("par-1.sup", None), false).unwrap();
+        let first = b"the first coding of the form, ".repeat(2000);
+        let second = b"another coding of it, and a longer file, ".repeat(3000);
+        put(&d.join("zpg-1.zpg"), &first);
+        assert!(v
+            .persist_form("par-1.sup", "zpg-1.zpg", false, false)
+            .unwrap());
+        let forms = |real: &Path| {
+            on_disk(real)
+                .into_iter()
+                .filter(|(n, _)| n.ends_with(".z"))
+                .count()
+        };
+        assert_eq!(forms(&real), 1);
+        // A reader's view of the first, nothing of it read yet.
+        let old = map(d.join("zpg-1.zpg")).unwrap();
+        rename(d.join("zpg-1.zpg"), d.join("dead-1")).unwrap();
+        put(&d.join("zpg-1.zpg"), &second);
+        assert!(v
+            .persist_form("par-1.sup", "zpg-1.zpg", false, false)
+            .unwrap());
+        assert_eq!(forms(&real), 1, "one envelope a segment's form");
+        {
+            let _held = v.pager().hold();
+            let mut got = vec![0u8; first.len()];
+            old.read_at(0, &mut got).unwrap();
+            assert!(got == first, "the first view read other bytes");
+        }
+        v.pager().check().unwrap();
+        assert!(read(d.join("zpg-1.zpg")).unwrap() == second);
+        // The first's name goes, and the envelope under the name they
+        // share is the second's and stays.
+        drop(old);
+        remove_file(d.join("dead-1")).unwrap();
+        assert_eq!(
+            forms(&real),
+            1,
+            "the second's envelope went with the first's name"
+        );
+        assert!(read(d.join("zpg-1.zpg")).unwrap() == second);
+        // And with the last name, it goes.
+        remove_file(d.join("zpg-1.zpg")).unwrap();
+        assert_eq!(forms(&real), 0);
+    }
+
     /// A kept file is written, read, mapped, renamed, linked and removed
     /// through the door as a file on disk is, and none of it reaches the
     /// directory: only a persist does, as an envelope whose name and bytes
@@ -2112,8 +2440,8 @@ pub(crate) mod tests {
             names,
             vec![
                 MARKER.to_string(),
-                disk_name(&token, false),
-                disk_name(&token, true)
+                disk_name(&token, Kind::Seg),
+                disk_name(&token, Kind::Ord)
             ]
         );
         for (name, bytes) in on_disk(&real) {
@@ -2151,13 +2479,13 @@ pub(crate) mod tests {
         hard_link(d.join("par-1-key-00750.sup"), d.join("par-1-wide.sup")).unwrap();
         assert!(hard_link(d.join("par-1-key-00750.sup"), d.join("par-1-wide.sup")).is_err());
         remove_file(d.join("par-1-key-00750.sup")).unwrap();
-        assert!(real.join(disk_name(&token, false)).exists());
+        assert!(real.join(disk_name(&token, Kind::Seg)).exists());
         assert_eq!(read(d.join("par-1-wide.sup")).unwrap(), body);
         remove_file(d.join("par-1-wide.sup")).unwrap();
-        assert!(!real.join(disk_name(&token, false)).exists());
+        assert!(!real.join(disk_name(&token, Kind::Seg)).exists());
         assert!(remove_file(d.join("par-1-wide.sup")).is_err());
         remove_file(d.join("ord-1.oidx")).unwrap();
-        assert!(!real.join(disk_name(&token, true)).exists());
+        assert!(!real.join(disk_name(&token, Kind::Ord)).exists());
     }
 
     /// A file operation that did not come through the door finds no
@@ -2239,7 +2567,7 @@ pub(crate) mod tests {
         v.adopt("seg-1.sup", token, wrapped, Some("ord-1.oidx"));
         v.adopt("par-1.sup", token, wrapped, None);
         assert_eq!(v.sweep().unwrap(), 1);
-        assert!(!real.join(disk_name(&orphan, false)).exists());
+        assert!(!real.join(disk_name(&orphan, Kind::Seg)).exists());
         assert_eq!(len(d.join("seg-1.sup")).unwrap(), body.len() as u64);
         let m = map(d.join("seg-1.sup")).unwrap();
         assert_eq!(
@@ -2270,7 +2598,7 @@ pub(crate) mod tests {
         // The name another slot had it under goes, and the envelope stays
         // for the name that is left.
         remove_file(d.join("par-1.sup")).unwrap();
-        assert!(real.join(disk_name(&token, false)).exists());
+        assert!(real.join(disk_name(&token, Kind::Seg)).exists());
     }
 
     /// A byte changed anywhere in an envelope, or a wrapped key that is
@@ -2289,7 +2617,7 @@ pub(crate) mod tests {
             let b = v.persist(&pair("seg-2.sup", None), true).unwrap()[0];
             (a.0, a.1, b.1)
         };
-        let path = real.join(disk_name(&token, false));
+        let path = real.join(disk_name(&token, Kind::Seg));
         let good = std::fs::read(&path).unwrap();
         for at in (0..good.len()).step_by(97) {
             let mut bad = good.clone();

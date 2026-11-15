@@ -721,6 +721,9 @@ pub(crate) struct Back {
     hdr: Header,
     aad: [u8; Header::LEN],
     aead: Box<DynAead>,
+    /// Where the envelope was opened, for a drop of the kernel's cache of
+    /// it (`Paged::forget`), which a mapping's own advice does not reach.
+    path: std::path::PathBuf,
 }
 
 impl Back {
@@ -746,6 +749,7 @@ impl Back {
             map,
             hdr,
             aead,
+            path: path.to_path_buf(),
         })
     }
 
@@ -1367,6 +1371,158 @@ impl Paging for Paged {
             });
         }
     }
+
+    /// The chunks of the range a read would not wait on the device for:
+    /// present here, or their ciphertext in the kernel's cache of the
+    /// envelope, by one `mincore` over the envelope's bytes for the range.
+    /// A hint, read with no pin: a chunk present now may be given back
+    /// before anyone reads it.
+    fn resident(&self, off: u64, len: usize) -> f64 {
+        if len == 0 || off >= self.len {
+            return 0.0;
+        }
+        let a = (off / CHUNK as u64) as usize;
+        let b = (((off + len as u64).min(self.len) - 1) / CHUNK as u64) as usize;
+        let cached = self.back.get().map(|back| {
+            let ps = page_size();
+            let from = back.hdr.stored_off(a as u64) as usize / ps * ps;
+            let to = (back.hdr.stored_off(b as u64) as usize + self.chunk_len(b) + TAG)
+                .min(back.map.len());
+            let mut vec = vec![0u8; to.saturating_sub(from).div_ceil(ps)];
+            // SAFETY: whole pages of the envelope's mapping, which lives
+            // as long as this view, and a byte of `vec` for each.
+            let rc = if to > from {
+                unsafe {
+                    libc::mincore(
+                        back.map.as_ptr().add(from).cast_mut().cast(),
+                        to - from,
+                        vec.as_mut_ptr().cast(),
+                    )
+                }
+            } else {
+                -1
+            };
+            (rc == 0, from, vec)
+        });
+        let mut have = 0usize;
+        for c in a..=b {
+            let s = self.state[c].load(Ordering::Relaxed);
+            if s == HOT || s == COLD {
+                have += 1;
+                continue;
+            }
+            if let (Some((true, from, vec)), Some(back)) = (&cached, self.back.get()) {
+                let ps = page_size();
+                let at = back.hdr.stored_off(c as u64) as usize;
+                let end = at + self.chunk_len(c) + TAG;
+                let pages = (at / ps * ps..end).step_by(ps);
+                if pages
+                    .map(|p| (p - from) / ps)
+                    .all(|i| vec.get(i).is_some_and(|b| b & 1 != 0))
+                {
+                    have += 1;
+                }
+            }
+        }
+        have as f64 / (b - a + 1) as f64
+    }
+
+    /// The kernel's cache of the envelope's bytes for the range given up:
+    /// this process's entries for them dropped, then the file's clean
+    /// pages, which a drop skips while a mapping holds them. Whole pages
+    /// inside the range's ciphertext alone. The chunks present here stay,
+    /// to be given back as the cache gives anything back.
+    fn forget(&self, off: u64, len: usize) {
+        let Some((back, mut from, mut to)) = self.stored_pages(off, len, true) else {
+            return;
+        };
+        // The whole file is dropped whole, its header's page with it: the
+        // page cache holds a file in folios the size of the writes that
+        // made them, a megabyte for an envelope, and a drop takes only the
+        // folios wholly inside its range, so a range a page short of the
+        // file left the first megabyte of it.
+        if off == 0 && len as u64 >= self.len {
+            (from, to) = (0, back.map.len());
+        }
+        // SAFETY: an advice over whole pages of a read-only shared mapping
+        // of a file this view holds: no byte changes, and a chunk read
+        // after it is read from the file again.
+        unsafe {
+            libc::madvise(
+                back.map.as_ptr().add(from).cast_mut().cast(),
+                to - from,
+                libc::MADV_DONTNEED,
+            );
+        }
+        if let Ok(f) = File::open(&back.path) {
+            use std::os::fd::AsRawFd;
+            // SAFETY: an advice over a descriptor this call holds.
+            unsafe {
+                libc::posix_fadvise(
+                    f.as_raw_fd(),
+                    from as libc::off_t,
+                    (to - from) as libc::off_t,
+                    libc::POSIX_FADV_DONTNEED,
+                );
+            }
+        }
+    }
+
+    /// The envelope's bytes for the range asked of the kernel, in the
+    /// pieces it reads whole (`bytes::WILLNEED_PIECE`): the read a chunk
+    /// not present here will make of the file, started before the reader
+    /// gets there. The envelope is mapped for far-apart reads, so nothing
+    /// reads ahead of a walk but this.
+    fn willneed(&self, off: u64, len: usize) -> usize {
+        let Some((back, from, to)) = self.stored_pages(off, len, false) else {
+            return 0;
+        };
+        // Nothing for a range every chunk of which is here already.
+        let a = (off / CHUNK as u64) as usize;
+        let b = (((off + len as u64).min(self.len) - 1) / CHUNK as u64) as usize;
+        if (a..=b).all(|c| matches!(self.state[c].load(Ordering::Relaxed), HOT | COLD)) {
+            return 0;
+        }
+        let mut at = from;
+        while at < to {
+            let n = (to - at).min(crate::bytes::WILLNEED_PIECE);
+            // SAFETY: an advice over pages of the envelope's mapping.
+            unsafe {
+                libc::madvise(
+                    back.map.as_ptr().add(at).cast_mut().cast(),
+                    n,
+                    libc::MADV_WILLNEED,
+                );
+            }
+            at += n;
+        }
+        to - from
+    }
+}
+
+impl Paged {
+    /// The envelope and the pages of it that hold the chunks of `len`
+    /// bytes at `off`: the pages wholly inside those chunks' stored bytes
+    /// (`inside`), which is what may be dropped, or every page a byte of
+    /// them lies in, which is what a read of them touches.
+    fn stored_pages(&self, off: u64, len: usize, inside: bool) -> Option<(&Back, usize, usize)> {
+        let back = self.back.get()?;
+        if len == 0 || off >= self.len {
+            return None;
+        }
+        let ps = page_size();
+        let a = (off / CHUNK as u64) as usize;
+        let b = (((off + len as u64).min(self.len) - 1) / CHUNK as u64) as usize;
+        let lo = back.hdr.stored_off(a as u64) as usize;
+        let hi =
+            (back.hdr.stored_off(b as u64) as usize + self.chunk_len(b) + TAG).min(back.map.len());
+        let (from, to) = if inside {
+            (lo.next_multiple_of(ps), hi / ps * ps)
+        } else {
+            (lo / ps * ps, hi.next_multiple_of(ps).min(back.map.len()))
+        };
+        (from < to).then_some((back, from, to))
+    }
 }
 
 /// `len` bytes of `mem` mapped shared and writable.
@@ -1537,6 +1693,70 @@ mod tests {
             // SAFETY: made present by `ensure`, under the caller's hold.
             unsafe { std::slice::from_raw_parts(p.base.add(off as usize), len) }.to_vec()
         })
+    }
+
+    /// A view says what of a range is in memory, here or in the kernel's
+    /// cache of the envelope, gives the kernel's up, and asks it back: the
+    /// three things the engine asks of a mapped file's pages, asked of the
+    /// file a paged mapping stands in front of.
+    #[test]
+    fn a_view_says_what_is_in_memory_and_drops_and_asks_for_what_stands_behind_it() {
+        let dir = scratch("resident");
+        let bytes = plain(4 * 1024 * 1024, 3);
+        let path = dir.join("e");
+        envelope(&path, &bytes, 9);
+        // Clean pages are what a drop takes.
+        File::open(&path).unwrap().sync_all().unwrap();
+        let pager = Pager::new(u64::MAX);
+        let p = sparse(&pager, &path, 9);
+        let len = bytes.len();
+        assert_eq!(p.resident(0, 0), 0.0);
+        let just_written = p.resident(0, len);
+        assert!(just_written > 0.99, "a file just written: {just_written}");
+        p.forget(0, len);
+        let dropped = p.resident(0, len);
+        assert!(dropped < 0.05, "a forget left {dropped} of the file");
+        // A chunk here is in memory whatever the kernel holds of it.
+        {
+            let _h = pager.hold();
+            read(&p, 1_000_000, 10).unwrap();
+        }
+        p.forget(0, len);
+        assert_eq!(p.resident(1_000_000, 10), 1.0, "a chunk present");
+        assert_eq!(p.resident(2_000_000, 10), 0.0, "a chunk nobody holds");
+        assert_eq!(p.willneed(1_000_000, 10), 0, "nothing asked for it");
+        // A part dropped leaves the rest.
+        let asked = p.willneed(0, len);
+        assert!(asked >= len, "the whole file asked for: {asked}");
+        let t = std::time::Instant::now();
+        while p.resident(0, len) < 0.99 {
+            assert!(t.elapsed().as_secs() < 20, "the file did not come back");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        p.forget(2_000_000, 1_000_000);
+        assert!(p.resident(2_100_000, 800_000) < 0.05, "the range dropped");
+        assert!(p.resident(0, 1_900_000) > 0.99, "and nothing before it");
+        assert!(p.resident(3_100_000, 900_000) > 0.99, "or after it");
+        // And as the engine asks, through the mapping a reader holds: the
+        // advice a mapped file takes for its own pages reaches the file
+        // behind a paged one.
+        use crate::bytes::Bytes;
+        let m = crate::bytes::MmapBytes::paged(p.clone());
+        assert_eq!(m.resident_at(2_500_000), Some(false));
+        assert_eq!(m.resident_at(100_000), Some(true));
+        assert_eq!(m.resident_at(len as u64), None, "past the end");
+        assert!(m.advise_willneed(2_000_000, 1_000_000) >= 1_000_000);
+        let t = std::time::Instant::now();
+        while m.resident_at(2_500_000) != Some(true) {
+            assert!(t.elapsed().as_secs() < 20, "the range did not come back");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(m.paged_resident(0, len).map(|s| s > 0.99), Some(true));
+        m.advise_dontneed_range(2_000_000, 1_000_000);
+        assert_eq!(m.resident_at(2_500_000), Some(false));
+        m.advise_dontneed();
+        assert_eq!(m.resident_at(100_000), Some(false), "the whole file");
+        assert_eq!(m.resident_at(1_000_000), Some(true), "but the chunk here");
     }
 
     #[test]

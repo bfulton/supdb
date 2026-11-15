@@ -315,6 +315,18 @@ pub trait Paging: Send + Sync {
     /// How what stands behind the mapping is about to be read: far apart
     /// (`random`), or in order.
     fn advise(&self, random: bool);
+    /// The share of `len` bytes at `off` that a read would find in memory:
+    /// present in the mapping, or in the kernel's cache of what stands
+    /// behind it.
+    fn resident(&self, off: u64, len: usize) -> f64;
+    /// The kernel's cache of what stands behind `len` bytes at `off` given
+    /// up, for bytes nothing is expected to read again soon; what the
+    /// mapping holds present is its owner's to give back.
+    fn forget(&self, off: u64, len: usize);
+    /// What stands behind `len` bytes at `off` asked of the kernel now, in
+    /// the background, and the bytes asked for: nothing for bytes the
+    /// mapping holds present.
+    fn willneed(&self, off: u64, len: usize) -> usize;
 }
 
 /// The most of a mapping one `MADV_WILLNEED` asks for. Linux reads a
@@ -396,6 +408,17 @@ impl MmapBytes {
     /// skip. The range is clamped to the mapping, and every page a byte of
     /// it lies in counts, the first one from its start; zero for a range
     /// that is empty or past the mapping, and where the kernel will not say.
+    /// The share of `len` bytes at `off` a read would find in memory: for
+    /// a paged mapping, present in it or in the kernel's cache of the file
+    /// behind it (`Paging::resident`); for a mapped file, `None`, since its
+    /// residency is asked of the borrowed range itself.
+    pub fn paged_resident(&self, off: u64, len: usize) -> Option<f64> {
+        match &self.own {
+            Own::Paged(p) => Some(p.resident(off, len)),
+            Own::Map(_) => None,
+        }
+    }
+
     pub fn resident_pages(&self, off: usize, len: usize) -> usize {
         let page = os_page_size();
         let end = off.saturating_add(len).min(self.lend as usize);
@@ -506,7 +529,13 @@ impl Bytes for MmapBytes {
     #[cfg(target_os = "linux")]
     fn advise_dontneed_range(&self, off: u64, len: usize) {
         // A paged mapping's pages are its pager's to give back, never an
-        // advice's: its lendable length is zero, so the range is empty.
+        // advice's: its lendable length is zero, so the range below is
+        // empty, and what a drop reaches is the kernel's cache of the file
+        // behind it.
+        if let Own::Paged(p) = &self.own {
+            p.forget(off, len);
+            return;
+        }
         let Ok(off) = usize::try_from(off) else {
             return;
         };
@@ -530,6 +559,9 @@ impl Bytes for MmapBytes {
     }
     #[cfg(target_os = "linux")]
     fn resident_at(&self, off: u64) -> Option<bool> {
+        if let Own::Paged(p) = &self.own {
+            return (off < self.len).then(|| p.resident(off, 1) > 0.0);
+        }
         let off = usize::try_from(off).ok()?;
         if off >= self.lend as usize {
             return None;
@@ -562,10 +594,21 @@ impl Bytes for MmapBytes {
                 );
             }
         }
+        // A paged mapping's own pages are its pager's to give back; what
+        // the kernel caches of the file behind it is what a drop can
+        // reach.
+        if let Own::Paged(p) = &self.own {
+            p.forget(0, self.len as usize);
+        }
     }
     fn advise_willneed(&self, off: u64, len: usize) -> usize {
         let Some(map) = self.map() else {
-            return 0;
+            // A paged mapping: the file behind it asked for, where the
+            // bytes are not present already.
+            return match &self.own {
+                Own::Paged(p) => p.willneed(off, len),
+                Own::Map(_) => 0,
+            };
         };
         // Clamped rather than trusted: the offsets come from a plan built out
         // of a file's own block table, and a damaged one must not hand the

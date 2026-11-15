@@ -138,6 +138,13 @@ thread_local! {
     /// The cache a store under a cipher is given, in bytes, for the test
     /// that runs the range under one too small for its stores.
     static CIPHER_CACHE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Whether the `z` store has the compact form forced on, for the test
+    /// that runs the range so; `ZFUZZ_ZPAGES` sets it for every test.
+    static ZPAGES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn zpages_forced() -> bool {
+    ZPAGES.get() || env_flag("ZFUZZ_ZPAGES")
 }
 
 fn under_cipher() -> bool {
@@ -343,7 +350,7 @@ fn opts(c: &Cfg) -> Options {
 /// over the same writes -- the strongest check a second read path has.
 fn opts_z(c: &Cfg) -> Options {
     let mut o = opts(c);
-    if env_flag("ZFUZZ_ZPAGES") {
+    if zpages_forced() {
         o.zpages = supdb::ZPages::Always;
         o.zpages_min_bytes = 0;
     }
@@ -383,7 +390,7 @@ fn opts_z(c: &Cfg) -> Options {
     // (`Options::zpages_both`): the spares' builds, their collect beside the
     // served file and their retirement with a merged segment, and whatever
     // the reads heat into a flip, are read against the raw store.
-    if env_flag("ZFUZZ_BOTH") && env_flag("ZFUZZ_ZPAGES") {
+    if env_flag("ZFUZZ_BOTH") && zpages_forced() {
         o.zpages_recode = true;
         o.zpages_recode_keep = true;
         o.zpages_both = true;
@@ -766,6 +773,10 @@ struct Stats {
     /// opens. What says a run under a small cache read through one.
     evicted: u64,
     fills: u64,
+    /// The reads and scans the `z` store answered through a form file,
+    /// summed over its opens: what says a run with the compact form
+    /// forced read through one.
+    zreads: u64,
 }
 
 fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
@@ -815,15 +826,16 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     let mut rng = Rng::new(seed);
     let cfg = pick_cfg(&mut rng, want_cache);
     // A directory of its own for each range that runs beside the plain
-    // one over the same seeds: under a cipher, and under one with a cache
-    // too small for its stores.
+    // one over the same seeds: under a cipher, under one with a cache too
+    // small for its stores, and under that with the compact form forced.
     let tag = format!(
-        "s{seed}{}",
+        "s{seed}{}{}",
         match (CIPHER.get(), CIPHER_CACHE.get()) {
             (false, _) => "",
             (true, 0) => "c",
             (true, _) => "cs",
-        }
+        },
+        if ZPAGES.get() { "z" } else { "" }
     );
     let (dz, dr) = (scratch(&format!("{tag}-z")), scratch(&format!("{tag}-r")));
     if verbose {
@@ -856,6 +868,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         beside: 0,
         evicted: 0,
         fills: 0,
+        zreads: 0,
     };
     let mut fails: Vec<String> = Vec::new();
     let mut absent = absent_around(&pool, &mut rng);
@@ -1040,6 +1053,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                         st.evicted += c.cache.evicted_units;
                         st.fills += c.cache.fills;
                     }
+                    st.zreads += z.zpage_counts().reads + z.zpage_counts().scans;
                     let clean = rng.chance(50) || !matches!(cfg.sync, SyncPolicy::Always);
                     if clean {
                         for op in staged.drain(..) {
@@ -1208,6 +1222,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         st.evicted += c.cache.evicted_units;
         st.fills += c.cache.fills;
     }
+    st.zreads += z.zpage_counts().reads + z.zpage_counts().scans;
     drop(z);
     drop(r);
     if ok {
@@ -1252,6 +1267,20 @@ fn fuzz_range_under_a_cipher_that_does_not_fit_its_cache() {
     run_range();
 }
 
+/// The range a fourth time, `z` under a cipher with a cache of sixteen
+/// kilobytes and the compact form forced on: every partition's form file
+/// built from records read by the piece through that cache, sealed beside
+/// its segment, and read and scanned through, against the model and a
+/// plain store in the raw form over the same writes.
+#[test]
+#[cfg(target_os = "linux")]
+fn fuzz_range_under_a_cipher_with_the_compact_form() {
+    CIPHER.set(true);
+    CIPHER_CACHE.set(16 << 10);
+    ZPAGES.set(true);
+    run_range();
+}
+
 fn run_range() {
     let from = env_u64("ZFUZZ_FROM").unwrap_or(0);
     let to = env_u64("ZFUZZ_TO").unwrap_or(from + DEFAULT_SEEDS);
@@ -1264,7 +1293,7 @@ fn run_range() {
     let seeds: Vec<u64> = list.unwrap_or_else(|| (from..to).collect());
     let (mut bad, mut reopens, mut abandons, mut bindings, mut beside) =
         (Vec::new(), 0u64, 0u64, 0u64, 0u64);
-    let (mut evicted, mut fills) = (0u64, 0u64);
+    let (mut evicted, mut fills, mut zreads) = (0u64, 0u64, 0u64);
     for seed in seeds {
         match run_seed(seed, want_cache, verbose) {
             Ok(s) => {
@@ -1274,12 +1303,13 @@ fn run_range() {
                 beside += s.beside;
                 evicted += s.evicted;
                 fills += s.fills;
+                zreads += s.zreads;
             }
             Err(e) => bad.push(format!("seed {seed}: {e}")),
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, cache units given back {evicted}, chunks decrypted {fills}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, cache units given back {evicted}, chunks decrypted {fills}, reads through a form {zreads}, FAILURES {}",
         bad.len()
     );
     for b in &bad {
@@ -1294,6 +1324,11 @@ fn run_range() {
             evicted > 0 && fills > 0,
             "a small cache gave nothing back: {evicted} units, {fills} chunks"
         );
+    }
+    // And a run with the compact form forced is a run of the raw form
+    // unless reads were answered through form files.
+    if zpages_forced() {
+        assert!(zreads > 0, "no read or scan went through a form file");
     }
 }
 

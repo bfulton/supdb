@@ -228,12 +228,33 @@ What an engine picker would hit, roughly in order.
   the log, so its drain pays it; a plain store's does wherever a closed
   log file waits at such a publish. The manifest's spare is unlinked at
   an idle tick for the same reason.
-- [ ] **The compact form under a cipher.** It is off there: the form is
-  built from a partition's records borrowed whole and attached by its
-  bytes in the page cache, where a file under a cipher is read by the
-  piece through the store's own cache. It wants the form file's pages
-  sealed one by one, which is the shape its reader already has: a page
-  read, checked and decoded into memory of its own.
+- [x] **The compact form under a cipher.** A form file is built from its
+  segment's records read by the piece through the store's cache, sealed
+  beside the segment's envelope under the segment's key, and read by the
+  page through the cache; the controller samples, builds ahead, buys and
+  installs as it does for a plain store, and a store under a cipher fixes
+  no option.
+- [ ] **A form file's damage taken as the form's alone.** A chunk of a
+  form file that fails its tag is a read of the store that failed, and
+  the store refuses every read after it, as it does for a segment's. A
+  plain store takes a damaged form file out of service, reads the
+  partition raw and builds the file again, and a form file is as
+  regenerable under a cipher. Done when a failed chunk of a form file's
+  envelope is the form's failure, at every site that reads a form page,
+  with the byte-damage test saying which outcome each flip had.
+- [ ] **The controller under a cipher prices the kernel's cache alone.**
+  It reads the group's budget, its refaults and the thread's major
+  faults, as for a plain store, which under a cipher are the kernel's
+  cache of the envelopes: right where the store does not fit memory. A
+  store that fits memory and not its own cache of plaintext
+  (`StoreCipher::cache_bytes`) takes two chunks decrypted for a raw point
+  read and one and a decode through the form, and the controller sees
+  none of it. Whether the form pays there is not measured.
+- [ ] **A writer that waits for segment work that is gone.** A panic on
+  the segment work's thread leaves the writer waiting in `land_seal` for
+  a landing nobody will make, with no end: found under a mutant whose
+  debug assertion fired on that thread, where the test hung and did not
+  fail. Done when the writer answers with the thread's failure.
 - [ ] **A store under a cipher on another platform.** The memory files a
   file is written in and the cache gives pages back from are Linux's
   (`memfd_create`, `MADV_REMOVE`); elsewhere the store is refused before it
@@ -248,9 +269,9 @@ What an engine picker would hit, roughly in order.
   asks for a window of records at a time already. Done when the walks by
   rank do too, a point read asks once for each piece it touches, and what
   a read does at its start and its end under a cipher is a look and not
-  two calls. `bench/scripts/pair.sh supdb-cipher supdb-cipherbase 300000`
+  two calls. `bench/scripts/pair.sh supdb-cipher supdb 300000`
   is the pairing, and `bench/examples/read_only.rs supdb-cipher 100000 1
-  n-none` under callgrind beside `supdb-cipherbase` the count; a shape
+  n-none` under callgrind beside `supdb` the count; a shape
   that takes an instruction from the read under a cipher is counted on
   the plain read before it is kept.
 - [ ] **A store under a key, priced on a kernel with hardware AES.** The

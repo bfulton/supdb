@@ -1381,6 +1381,29 @@ impl<B: Bytes> Blob<B> {
         idx.regions(sec)
     }
 
+    /// `record_regions` for a reader over a source that lends by the
+    /// piece: the two regions by their place, each read by asking for the
+    /// range it wants. `None` for a reader that holds the section whole,
+    /// which `record_regions` answers.
+    #[cfg(not(target_family = "wasm"))]
+    #[doc(hidden)]
+    pub fn record_pieces(&self) -> Option<(Pieces<'_, B>, Pieces<'_, B>)> {
+        let (sec, idx) = self.pieces()?;
+        idx.regions(sec)
+    }
+
+    /// The record region's length, bytes, however the reader holds its
+    /// section: the second of the two populations the raw form's fault
+    /// model takes, read from the header's words.
+    #[cfg(not(target_family = "wasm"))]
+    #[doc(hidden)]
+    pub fn record_region_bytes(&self) -> usize {
+        match &self.index {
+            Index::Flat { idx, .. } => idx.record_bytes(),
+            Index::Sparse(_) => 0,
+        }
+    }
+
     /// The record region's offset in the source and its length, bytes:
     /// `record_regions` placed by offset, for an advice to the file that
     /// holds it. `None` where there is no region or the source lends none.
@@ -1391,6 +1414,19 @@ impl<B: Bytes> Blob<B> {
         let base = self.src.slice_at(0, 1)?.as_ptr() as usize;
         let at = (recs.as_ptr() as usize).checked_sub(base)?;
         Some((at as u64, recs.len() as u64))
+    }
+
+    /// Where the record region lies in a source that lends by the piece,
+    /// its offset and its length, bytes: `record_region_span` for a reader
+    /// that holds no section whole, placed by the header's words, for an
+    /// advice to what stands behind the source. `None` for a reader that
+    /// holds the section whole.
+    #[cfg(not(target_family = "wasm"))]
+    #[doc(hidden)]
+    pub fn record_region_place(&self) -> Option<(u64, usize)> {
+        let (sec, idx) = self.pieces()?;
+        let (recs, _) = idx.regions(sec)?;
+        Some((recs.offset(), recs.size()))
     }
 
     /// The hash region's bytes, the slots a point read probes one page of;
@@ -1411,14 +1447,20 @@ impl<B: Bytes> Blob<B> {
     #[cfg(not(target_family = "wasm"))]
     #[doc(hidden)]
     pub fn z_source_facts(&self) -> Option<ZSource> {
-        let (sec, idx) = self.flat()?;
-        let h = flatindex::Header::parse(sec)?;
+        indexed!(self, |sec, idx| self.z_facts_in(sec, idx), None)
+    }
+
+    /// `z_source_facts` over the key section however this reader holds it:
+    /// the header's words and the checksum row's bytes, asked for.
+    #[cfg(not(target_family = "wasm"))]
+    fn z_facts_in<'a, S: Sect<'a>>(&self, sec: S, idx: &FlatIndex) -> Option<ZSource> {
+        let h = flatindex::Header::parse(sec.range(0, flatindex::HEADER.min(sec.size()))?)?;
         if h.crc_off == 0 {
             return None;
         }
         let base = self.index_offset();
         let n = flatindex::checksum_row_len(h.crc_off, h.piece_shift, base);
-        let row = sec.get(h.crc_off..h.crc_off.checked_add(n)?)?;
+        let row = sec.range(h.crc_off, h.crc_off.checked_add(n)?)?;
         Some(ZSource {
             nkeys: idx.len() as u64,
             recs_len: h.recs_len as u64,
@@ -1861,6 +1903,46 @@ impl<B: Bytes> Blob<B> {
             })?;
         }
         Ok(n)
+    }
+
+    /// `read_exts` for a caller whose records' values are mostly inline
+    /// and whose own loop is the hot one: the read of a run that lies in a
+    /// block is a call out of line, so the caller's loop holds the inline
+    /// run's few instructions and none of a block's fetch, checks and
+    /// decode. The compact form's walk reads a record's values this way:
+    /// with the block's reader written into it, that reader's growth -- a
+    /// second way to fetch a block, for a source that lends by the piece
+    /// -- took a register from the walk's loop over a partition whose
+    /// values are all inline, four instructions an entry of a plain
+    /// store's scan through its form.
+    pub fn read_exts_inline<F: FnMut(&[u8])>(
+        &self,
+        exts: &[Ext],
+        tail: &[u8],
+        mut f: F,
+    ) -> Result<u64> {
+        let mut n = 0u64;
+        for e in exts {
+            n += if e.is_inline() {
+                let a = e.off as usize;
+                let b = a
+                    .checked_add(e.len as usize)
+                    .filter(|&b| b <= tail.len())
+                    .ok_or_else(|| corrupt("inline run runs past its record"))?;
+                crate::index::each_value(&tail[a..b], e, &mut |v| f(v)).map_err(corrupt)?
+            } else {
+                self.read_block_run(e, &mut f)?
+            };
+        }
+        Ok(n)
+    }
+
+    /// The values of one run that lies in a block (`read_exts_inline`).
+    #[inline(never)]
+    fn read_block_run<F: FnMut(&[u8])>(&self, e: &Ext, f: &mut F) -> Result<u64> {
+        self.with_extent(*e, |run| {
+            crate::index::each_value(run, e, &mut |v| f(v)).map_err(corrupt)
+        })
     }
 
     /// Every value of `key`, in append order, appended to `out` back to back

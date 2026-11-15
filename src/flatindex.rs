@@ -728,6 +728,24 @@ impl<'a, B: crate::bytes::Bytes + ?Sized> Pieces<'a, B> {
     }
 }
 
+impl<'a, B: crate::bytes::Bytes + ?Sized> Pieces<'a, B> {
+    /// Where the section lies in its source.
+    pub fn offset(self) -> u64 {
+        self.off
+    }
+
+    /// The record at `off` as its image: the bytes `parse_record` consumes
+    /// for it, padding included (`record_key_next`), from a window that
+    /// holds them. What a reader that copies records out whole asks for,
+    /// one ask a record that does not cross a piece.
+    pub fn image(self, off: usize) -> Option<&'a [u8]> {
+        self.window(off, |w| {
+            let (_, next) = record_key_next(w, 0)?;
+            w.get(..next)
+        })
+    }
+}
+
 impl<'a, B: crate::bytes::Bytes + ?Sized> Sect<'a> for Pieces<'a, B> {
     #[inline]
     fn part(self, a: usize, b: usize) -> Option<Self> {
@@ -2165,6 +2183,11 @@ impl FlatIndex {
     /// (`db::Seg::foot`).
     pub fn hash_bytes(&self) -> usize {
         self.hash.1.saturating_sub(self.hash.0)
+    }
+
+    /// The record region's bytes, the second of the two.
+    pub fn record_bytes(&self) -> usize {
+        self.recs.1.saturating_sub(self.recs.0)
     }
 
     /// Where the records at `rank` and `n` ranks on lie by the directory:

@@ -6764,6 +6764,65 @@ fn the_gate_decides_the_form_under_auto_as_under_always() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The controller under a cipher (`Encryption::Cipher`): the same store
+/// driven to COMPACT through the seam, its partitions sampled, built and
+/// installed from files read by the piece through the store's cache, and
+/// the gate deciding the form as it does for a plain store -- every answer
+/// the model's, raw and through the form, before and after a reopen that
+/// finds the form files beside their segments.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_controller_buys_builds_and_installs_the_form_under_a_cipher() {
+    let cipher = || {
+        supdb::Encryption::Cipher(supdb::StoreCipher::new(
+            common::Gcm::new(&[0x5a; 32]),
+            common::Gcm::new,
+        ))
+    };
+    let (dir, db, model, _inject, r, keys, _) =
+        compact_store_with("auto-cipher", 1 << 20, |o| o.encryption = cipher());
+    assert!(db.cipher_counts().is_some(), "the store is under a cipher");
+    let c = db.zpage_counts();
+    assert!(
+        c.model_hash_bytes > 0 && c.model_record_bytes > 0,
+        "a footprint of nothing: {c:?}"
+    );
+    let some: Vec<Vec<u8>> = keys.iter().step_by(101).cloned().collect();
+    for (gate, served) in [(1u8, false), (0, false), (2, true)] {
+        db.zgate_set(gate);
+        let before = db.zpage_counts();
+        check(&r, &model, &some, &format!("auto cipher gate {gate}"));
+        let after = db.zpage_counts();
+        let through = (after.reads + after.counts + after.rawserves)
+            - (before.reads + before.counts + before.rawserves);
+        if served {
+            assert!(after.reads > before.reads, "{after:?}");
+            assert_eq!(after.fallbacks, before.fallbacks, "{after:?}");
+        } else {
+            assert_eq!(through, 0, "gate {gate}: nothing through the form");
+        }
+    }
+    check_scan(&r, &model, "auto cipher scan");
+    let forms = db.zpage_counts().form_files;
+    assert!(forms > 0);
+    // No form file is its writer's memory still: each has its envelope.
+    assert_eq!(db.cipher_counts().unwrap().files, 0);
+    drop(r);
+    db.close().unwrap();
+    let on_disk = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".z")
+        })
+        .count() as u64;
+    assert_eq!(on_disk, forms, "an envelope a form file");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Reads through the form over `hot` keys, in stretches whose windows
 /// close through the ticks, for `secs` seconds of the injected clock, each
 /// read with `faults` faults on the seam: what a COMPACT store's handle
@@ -7143,6 +7202,102 @@ fn form_files_on_disk_are_dormant_under_auto_and_attached_when_the_form_is_wante
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The same under a cipher (`Encryption::Cipher`), where a form file an
+/// earlier open left is an envelope beside its segment's that this open's
+/// table of names does not hold until something asks for it: the
+/// controller's probes find it there, so it is neither built again ahead
+/// nor attached before the form is wanted, and the buy is its attach.
+#[cfg(target_os = "linux")]
+#[test]
+fn form_files_an_earlier_open_left_under_a_cipher_are_dormant_and_then_attached() {
+    let cipher = || {
+        supdb::Encryption::Cipher(supdb::StoreCipher::new(
+            common::Gcm::new(&[0x5a; 32]),
+            common::Gcm::new,
+        ))
+    };
+    let dir = scratch("auto-dormant-cipher");
+    let model = {
+        let mut db = Db::create(&dir, forced(|o| o.encryption = cipher())).unwrap();
+        let model = ordered_load(&mut db, 20_000, 0x4A9);
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert!(c.form_files >= 1 && c.form_files == c.partitions, "{c:?}");
+        db.close().unwrap();
+        model
+    };
+    let envelopes = || {
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".z")
+            })
+            .count() as u64
+    };
+    let on_disk = envelopes();
+    assert!(on_disk > 0);
+    let inject = std::sync::Arc::new(supdb::ZInject::new());
+    inject.set_budget(1 << 20);
+    inject.set_refault_rate(1_000_000.0);
+    inject.set_fault_cost(FAULT_1MS);
+    inject.set_decode_cost(DECODE_5US);
+    inject.advance(std::time::Duration::from_millis(1));
+    let db = Db::open(
+        &dir,
+        Options {
+            zpages: ZPages::Auto,
+            zpages_min_bytes: 0,
+            zpages_inject: Some(inject.clone()),
+            encryption: cipher(),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let c = db.zpage_counts();
+    assert_eq!((c.form_files, c.attached), (0, 0), "dormant: {c:?}");
+    assert_eq!(envelopes(), on_disk, "and kept");
+    // Past the selector's line from its first tick: the look that first
+    // finds it there swaps the records of every partition with a form
+    // file on disk for the file (`Maint::z_cross`), which is every
+    // partition here, each found by a probe of the store's table of
+    // names that learns of the envelope as it asks.
+    assert!(
+        tick_until(&db, 50, |c| c.ahead_swapped >= c.partitions),
+        "the form files on disk were not found: {:?}",
+        db.zpage_counts()
+    );
+    assert_eq!(db.zpage_counts().build_starts, 0, "{:?}", db.zpage_counts());
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+        "COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.builds, c.build_starts),
+        (0, 0),
+        "attached, not built: {c:?}"
+    );
+    assert_eq!(
+        (c.attached, c.form_files),
+        (c.partitions, c.partitions),
+        "{c:?}"
+    );
+    let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+    check(&r, &model, &some, "dormant attached under a cipher");
+    assert!(db.zpage_counts().reads > 0);
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A store past its budget with the builds ahead on
 /// (`Options::zpages_prebuild`): every partition's form file is built and
 /// left on disk unattached while the controller is in SUSPECT, the raw
@@ -7366,6 +7521,144 @@ fn two_builds_ahead_run_beside_each_other_and_build_each_partition_once() {
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// Builds ahead under a cipher (`Encryption::Cipher`): a store past the
+/// percent of its budget builds every partition's form file ahead from
+/// records its cache holds, seals each beside its segment, and attaches
+/// none; and a form file nothing reads yet takes nothing of the store's
+/// cache or of the kernel's -- its plaintext is not taken into the cache,
+/// where it would stand in the raw form's place, and its envelope's pages
+/// are written back and dropped.
+#[cfg(target_os = "linux")]
+#[test]
+fn builds_ahead_under_a_cipher_seal_their_form_files_and_keep_them_cold() {
+    let (dir, db, _model, inject, raw) = land_store_with("auto-ahead-cipher", 50, |o| {
+        o.encryption = supdb::Encryption::Cipher(supdb::StoreCipher::new(
+            common::Gcm::new(&[0x5a; 32]),
+            common::Gcm::new,
+        ));
+        o.partition_bytes = Some(400 << 10);
+    });
+    let before = db.cipher_counts().expect("a store under a cipher");
+    inject.set_budget(raw * 3 / 2);
+    assert!(
+        tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+        "built ahead: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert!(c.partitions >= 3, "{c:?}");
+    assert_eq!(
+        (c.phase, c.prebuilt, c.build_starts, c.attached),
+        (0, c.partitions, c.partitions, 0),
+        "each partition built ahead once: {c:?}"
+    );
+    let after = db.cipher_counts().unwrap();
+    assert_eq!(after.files, 0, "a form file with no envelope: {after:?}");
+    assert_eq!(
+        after.adopted, before.adopted,
+        "the cache took a form file nothing reads: {after:?}"
+    );
+    assert_eq!(after.left - before.left, c.partitions, "{after:?}");
+    let envelopes: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.to_string_lossy().ends_with(".z"))
+        .collect();
+    assert_eq!(envelopes.len() as u64, c.partitions, "an envelope each");
+    for z in &envelopes {
+        let len = std::fs::metadata(z).unwrap().len() as usize;
+        let cached = cached_pages(z, 0, len);
+        assert!(
+            cached * 4 <= len.div_ceil(4096),
+            "{}: {cached} of its {} pages in the page cache",
+            z.display(),
+            len.div_ceil(4096)
+        );
+    }
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The crossing under a cipher: form files built ahead while the store was
+/// under the selector's line, their records kept and their envelopes
+/// dropped as written, are swapped at the look that first finds the store
+/// past it -- in the kernel's cache of the envelopes, which is where a
+/// store under a cipher has both: the records' ciphertext dropped, by the
+/// folios a drop can take, and the form files' asked back -- once, and
+/// every read after it the model's.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_crossing_under_a_cipher_swaps_the_ciphertext_of_records_for_forms() {
+    let (dir, db, model, inject, raw) = land_store_with("auto-cross-cipher", 50, |o| {
+        o.encryption = supdb::Encryption::Cipher(supdb::StoreCipher::new(
+            common::Gcm::new(&[0x5a; 32]),
+            common::Gcm::new,
+        ));
+        o.zpages_land_drop_past = true;
+        o.zpages_cover_resident = false;
+        o.zpages_suspect_at_crossing = false;
+    });
+    inject.set_budget(raw * 3 / 2);
+    assert!(
+        tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+        "built ahead: {:?}",
+        db.zpage_counts()
+    );
+    let pages_of = |form: bool| -> (usize, usize) {
+        let (mut cached, mut pages) = (0usize, 0usize);
+        for f in std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()) {
+            let name = f.file_name().unwrap().to_string_lossy().into_owned();
+            let is = if form {
+                name.ends_with(".z")
+            } else {
+                name.starts_with("x-") && !name.contains('.')
+            };
+            if is {
+                let len = std::fs::metadata(&f).unwrap().len() as usize;
+                cached += cached_pages(&f, 0, len);
+                pages += len.div_ceil(4096);
+            }
+        }
+        (cached, pages)
+    };
+    let (rc, rp) = pages_of(false);
+    let (fc, fp) = pages_of(true);
+    assert!(
+        rc * 10 >= rp * 9 && fc * 4 < fp,
+        "under: records {rc}/{rp} forms {fc}/{fp}"
+    );
+    inject.set_budget(raw * 2 / 3);
+    assert!(
+        tick_until(&db, 200, |c| c.ahead_swapped >= c.partitions),
+        "swapped: {:?}",
+        db.zpage_counts()
+    );
+    // The files' pages come in behind the advice, asynchronously.
+    let t0 = std::time::Instant::now();
+    while pages_of(true).0 * 2 < fp && t0.elapsed() < std::time::Duration::from_secs(20) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (rc2, _) = pages_of(false);
+    let (fc2, _) = pages_of(true);
+    assert!(
+        rc2 * 10 < rc * 8 && fc2 * 2 >= fp,
+        "past: records {rc2}/{rp} (were {rc}) forms {fc2}/{fp}"
+    );
+    wait_steps(&db, 10);
+    assert_eq!(
+        db.zpage_counts().ahead_swapped,
+        db.zpage_counts().partitions,
+        "once"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+    let r = db.reader().unwrap();
+    check(&r, &model, &some, "raw after the crossing under a cipher");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The sample asked for between builds ahead

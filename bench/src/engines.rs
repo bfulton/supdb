@@ -380,10 +380,10 @@ pub struct Supdb {
     path: PathBuf,
     /// The store's directory is under a key (`Policy::dir_key`).
     dirkey: bool,
-    /// The store is under a cipher of the caller's (`Policy::cipher`), or
-    /// is that store's twin in the clear (`Policy::cipher_base`).
+    /// The store is under a cipher of the caller's (`Policy::cipher`).
     cipher: bool,
-    cipher_base: bool,
+    /// `Policy::cipher_noz`.
+    cipher_noz: bool,
     /// `Policy::cipher_cache`.
     cipher_cache: u64,
     /// `Policy::cipher_log`.
@@ -1246,10 +1246,8 @@ struct Policy {
     /// The store under a cipher the caller supplies (`Encryption::Cipher`),
     /// here AES-256-GCM: `supdb-cipher` and `supdb-ingestcipher`. Its
     /// directory holds its files' envelopes and it reads them through a
-    /// cache of plaintext of its own, and it runs with the compact form
-    /// off whatever it is asked, so it is priced twice: against
-    /// `cipher_base`, which is what the cipher alone costs, and against
-    /// `supdb`, which is what the mode costs.
+    /// cache of plaintext of its own. It fixes no option, so its pair is
+    /// `supdb`, or `supdb-ingest`, itself.
     cipher: bool,
     /// The plaintext the store under a cipher may hold, bytes
     /// (`StoreCipher::cache_bytes`), or zero for the engine's own choice,
@@ -1264,10 +1262,12 @@ struct Policy {
     /// `supdb-cipherlog` and `supdb-ingestcipherlog`, what the run is
     /// priced against under the cipher.
     cipher_log: bool,
-    /// `supdb` with the option a cipher fixes and no cipher
-    /// (`supdb-cipherbase`, `supdb-ingestcipherbase`): the store a cipher
-    /// runs, in the clear.
-    cipher_base: bool,
+    /// The store under a cipher with the compact form off
+    /// (`ZPages::Off`), as every store under a cipher ran before a form
+    /// file was sealed beside its segment: `supdb-ciphernozpages` and
+    /// `supdb-ingestciphernozpages`, what the form is priced against under
+    /// the cipher.
+    cipher_noz: bool,
     partition: bool,
     drain: bool,
     advice: Option<supdb::ReadAdvice>,
@@ -1965,7 +1965,7 @@ impl Default for Policy {
         Policy {
             dir_key: false,
             cipher: false,
-            cipher_base: false,
+            cipher_noz: false,
             cipher_cache: 0,
             cipher_log: false,
             partition: true,
@@ -2240,24 +2240,25 @@ impl Supdb {
         )
     }
 
-    /// `supdb` as a cipher runs it, in the clear: the compact form off.
-    /// The pair of `supdb-cipher` that differs by the cipher alone.
-    pub fn create_cipherbase(path: &Path) -> Res<Supdb> {
+    /// `supdb-cipher` and `supdb-ingestcipher` with the compact form off
+    /// (`Policy::cipher_noz`).
+    pub fn create_ciphernoz(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                cipher_base: true,
+                cipher: true,
+                cipher_noz: true,
                 ..Policy::default()
             },
         )
     }
 
-    /// `supdb-ingest` under a cipher, and its twin in the clear.
-    pub fn create_ingest_cipher(path: &Path) -> Res<Supdb> {
+    pub fn create_ingest_ciphernoz(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
                 cipher: true,
+                cipher_noz: true,
                 partition: false,
                 durable: false,
                 ..Policy::default()
@@ -2265,11 +2266,12 @@ impl Supdb {
         )
     }
 
-    pub fn create_ingest_cipherbase(path: &Path) -> Res<Supdb> {
+    /// `supdb-ingest` under a cipher.
+    pub fn create_ingest_cipher(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                cipher_base: true,
+                cipher: true,
                 partition: false,
                 durable: false,
                 ..Policy::default()
@@ -6599,7 +6601,7 @@ impl Supdb {
         let Policy {
             dir_key,
             cipher,
-            cipher_base,
+            cipher_noz,
             cipher_cache,
             cipher_log,
             partition,
@@ -7200,11 +7202,15 @@ impl Supdb {
             },
             None => opts,
         };
-        // What a cipher fixes, set for its twin in the clear as well, so
-        // the pair differs by the cipher and nothing else.
-        let opts = if cipher || cipher_base {
+        // The shapes a store under a cipher had before it ran everything
+        // a plain store runs, for the arms that price the new against them.
+        let opts = if cipher {
             supdb::Options {
-                zpages: supdb::ZPages::Off,
+                zpages: if cipher_noz {
+                    supdb::ZPages::Off
+                } else {
+                    opts.zpages
+                },
                 direct_ingest: opts.direct_ingest && !cipher_log,
                 ..opts
             }
@@ -7231,7 +7237,7 @@ impl Supdb {
             path: path.to_path_buf(),
             dirkey: dir_key,
             cipher,
-            cipher_base,
+            cipher_noz,
             cipher_cache,
             cipher_log,
             partition,
@@ -7502,15 +7508,15 @@ impl Engine for Supdb {
                 "supdb-ingestdirkey"
             };
         }
-        if self.cipher || self.cipher_base {
-            return match (self.cipher, self.durable) {
-                (true, true) if self.cipher_log => "supdb-cipherlog",
-                (true, false) if self.cipher_log => "supdb-ingestcipherlog",
-                (true, true) if self.cipher_cache != 0 => "supdb-cipher64",
-                (true, true) => "supdb-cipher",
-                (true, false) => "supdb-ingestcipher",
-                (false, true) => "supdb-cipherbase",
-                (false, false) => "supdb-ingestcipherbase",
+        if self.cipher {
+            return match self.durable {
+                true if self.cipher_log => "supdb-cipherlog",
+                false if self.cipher_log => "supdb-ingestcipherlog",
+                true if self.cipher_noz => "supdb-ciphernozpages",
+                false if self.cipher_noz => "supdb-ingestciphernozpages",
+                true if self.cipher_cache != 0 => "supdb-cipher64",
+                true => "supdb-cipher",
+                false => "supdb-ingestcipher",
             };
         }
         // The pinned shapes alone name an arm; a field that follows the
@@ -9752,7 +9758,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cipher"
         | "supdb-cipher64"
         | "supdb-cipherlog"
-        | "supdb-cipherbase"
+        | "supdb-ciphernozpages"
         | "supdb-nocacheordread"
         | "supdb-nocachezpages"
         | "supdb-nocachezpagesnodrop"
@@ -10036,7 +10042,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestdirkey"
         | "supdb-ingestcipher"
         | "supdb-ingestcipherlog"
-        | "supdb-ingestcipherbase"
+        | "supdb-ingestciphernozpages"
         // A write-once segment makes nothing durable before its one sync.
         | "supdb-segment"
         | "supdb-segment-enc"
@@ -10100,9 +10106,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cipher64" => supdb_arm(Supdb::create_cipher64, dir)?,
         "supdb-cipherlog" => supdb_arm(Supdb::create_cipherlog, dir)?,
         "supdb-ingestcipherlog" => supdb_arm(Supdb::create_ingest_cipherlog, dir)?,
-        "supdb-cipherbase" => supdb_arm(Supdb::create_cipherbase, dir)?,
+        "supdb-ciphernozpages" => supdb_arm(Supdb::create_ciphernoz, dir)?,
         "supdb-ingestcipher" => supdb_arm(Supdb::create_ingest_cipher, dir)?,
-        "supdb-ingestcipherbase" => supdb_arm(Supdb::create_ingest_cipherbase, dir)?,
+        "supdb-ingestciphernozpages" => supdb_arm(Supdb::create_ingest_ciphernoz, dir)?,
         "supdb-nocacheordread" => supdb_arm(Supdb::create_nocache_ordread, dir)?,
         "supdb-nocachezpages" => supdb_arm(Supdb::create_nocache_zpages, dir)?,
         "supdb-nocachezpagesnodrop" => supdb_arm(Supdb::create_nocache_zpages_nodrop, dir)?,

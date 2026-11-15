@@ -1156,6 +1156,10 @@ and read by function (`callgrind_annotate`, the functions' own
 instructions side by side), never by the total alone. They read under
 the main line's: the point read seventeen instructions of 848, the scan
 fifty-five a scan of a hundred entries, the round 1.3%, the merge 4.4%.
+Those four were the count, and a store's reads through its compact form
+were not in it: a scan through a form was 370 instructions over the main
+line while this paragraph said nothing was, until the form itself went
+under a cipher and was counted (the compact form, below).
 What it took, each a shape:
 
 The question rides a test the operation already makes. Every read looks
@@ -1418,8 +1422,9 @@ plain run is its own log: a segment open for append, a marker and an
 fdatasync of that file a commit, the WAL never written. Under a cipher
 the run's file is a memory file until it closes, so a commit synced
 there is synced nowhere, and the first answer was to switch the run off
-(`under_cipher`) and send an ordered load through the log and a hash
-table to a seal's sort. The run does not need its file to be its log. It
+(`under_cipher`, the function that fixed a store's options under a
+cipher, gone with the last of them) and send an ordered load through the
+log and a hash table to a seal's sort. The run does not need its file to be its log. It
 is kept whole -- the ordered table, the records laid out once as the
 segment takes them, the close that composes a trailer where a seal sorts
 -- and each commit's batch goes to the log as well, sealed, written and
@@ -1507,6 +1512,142 @@ says whether the work was worth doing; and a mutant that survives
 because another mechanism covers for the deleted one is held by
 counting which mechanism did the work.
 
+The compact form was the last thing off there, and the reason written
+down for it was about the code and was read as being about the form:
+"built from a partition's records borrowed whole and attached by its
+bytes in the page cache, neither of which a file read by the piece
+offers". Neither was the form's. The reader already read a form page by
+asking its mapping for it (`ZFile::page_bytes`, a `slice_at`) and copied
+the resident part to the heap at its attach, so over a paged mapping it
+is the reader it was; and the builder took its records through a trait
+(`zpages::Images`) that had a second implementation for the tests. A
+store under a cipher fixes no option now, and `under_cipher` is gone.
+What it took:
+
+The builder reads by the piece. `PieceImages` is the directory's word for
+a rank and then a window that holds the record (`flatindex::Pieces::image`),
+each asked of the store's cache, on a thread with no slot of the reader
+table and so under a hold (`pager::Hold`). What the build does about the
+cache its segment is read through is a type (`zfile::Walked`), as a
+merge's rests are: `Mapped` is the plain build's code, the page cache's
+advice by the mapping's address, and `Held` rests at each page written,
+where nothing the walk was lent is read again, so a partition several
+times the cache is built within it. The same advice is asked there of
+the kernel's cache of the envelope, below. The attach and the sampler
+take a hold for their own reads the same way.
+
+A form file is an envelope beside its segment's, under the segment's
+token and key: `x-<token>.z`, a third kind after the segment and its
+ordered index (`vault::Kind`). No manifest names it, as none names a
+plain store's: it is a function of its segment, the store learns of it
+where it is first probed or attached (`vault::companion`), the open's
+sweep leaves it while its segment lives, and it goes with its segment
+whether or not this open ever knew it (`Vault::remove`). It is written
+under a temp name and renamed over its own, where a segment's envelope
+is written in place: a segment's token is drawn for its one envelope,
+and a form file is written again for the same segment -- in the other
+coding, or after a page failed a check -- while a reader holds the view
+over the first, whose file a write in place cuts to nothing under it. A
+second envelope under one file's key meets no nonce of the first, each
+envelope's nonces standing behind an id drawn for it.
+
+The controller needed nothing measured anew and one thing forwarded. The
+group's budget, its refaults and a thread's major faults are, under a
+cipher, the kernel's cache of the envelopes, which is where a store that
+does not fit memory waits; so the model, the census and the sampler's
+price of a fault read what they read. What did nothing under a cipher was
+every advice the engine gives the page cache about a mapped file, since a
+paged mapping lends nothing to advise: the build's ask ahead and its drop
+behind, the drop of a partition's raw pages once its form serves, the
+swap at the crossing, the residency a build ahead waits for, and the
+read path's own asks out of core. A paged mapping answers them for the
+file behind it now (`bytes::Paging::resident`, `forget`, `willneed`,
+through `MmapBytes::resident_at`, `advise_dontneed_range`,
+`advise_willneed` and `advise_dontneed`), so every caller of those got
+them and no call site names a cipher. An envelope is mapped for reads far
+apart, so without the ask ahead a build read its segment a chunk a device
+round trip. And a form file built ahead of the controller's buy is kept
+cold: its plaintext is not taken into the store's cache, where it would
+stand in the raw form's place, and its envelope's pages are written back
+and dropped (`Vault::persist_form`'s `cold`).
+
+One thing the forwarding found is the kernel's and holds for a plain
+store too: the page cache keeps a file in folios the size of the writes
+that made them, and a drop of a range takes only the folios wholly
+inside it. The pager's first test of a whole file's drop read a quarter
+of four megabytes still resident, the first megabyte, because the range
+began a page in, past the envelope's header; a whole file is dropped
+whole now, and a partial drop leaves its edges, which the crossing's
+test under a cipher allows for and nothing has looked at for a plain
+store's drops of a record region.
+
+Every test of it passed at its first run, the fuzz's among them, so none
+was believed until its mutant failed it. Twenty-four mutants; four
+outlived the first tests. An envelope written in place passed everything,
+there being no test in which a form file was written twice: the vault's
+unit test writes one, takes a view of it, writes another under the name
+and reads the first through the view. The build's check of whether its
+reads had read could be deleted, since a record that does not read is an
+image of no bytes, which the build already refuses as a record with no
+key: the check went. The footprint read from a section held whole, which
+is zero bytes under a cipher and so a model that says every store fits,
+passed until a test drove the controller there (`tests/zpages.rs`, the
+tests with `cipher` in their names). And the controller's probes for a
+form file an earlier open left passed without the store learning of the
+file as it asked, since the attach learns of it too; what the probe
+alone decides is the swap at the crossing, which the test now waits for.
+One mutant, an attach that holds nothing, did not fail a test and hung
+one: its debug assertion fired on the segment work's thread, and the
+writer waits in `land_seal` for a landing a dead thread will not make
+(`ROADMAP.md`). The runner stops a test binary after seven minutes and
+reads that as the mutant's death, and removes the stores a mutant's
+tests left, after a hung one's filled the disk under the run and took
+its verdicts with it.
+
+What is not the same as a plain store is one thing, and it is the
+pager's: a chunk of a form file that fails its tag is a read of the
+store that failed, and the store refuses every read after it, where a
+plain store takes a damaged form file out of service and reads the
+partition raw (`a_changed_byte_in_a_form_file_is_refused_or_the_form_is`
+holds what it does; `ROADMAP.md` has what it should). And one regime is
+not priced: a store that fits memory and not its own cache of plaintext
+decrypts two chunks for a raw point read and one, and a decode, through
+the form; the controller reads the kernel's cache and sees none of it.
+
+Counting the plain store against the main line for this found what the
+count before it had missed. "A store in the clear pays nothing an
+operation" was held by a point read and a scan of the raw form, a
+writer's round and a merge, and a scan through the compact form was none
+of them: it read 370 instructions a scan of a hundred entries over the
+main line, from the commit that gave the readers a source that lends by
+the piece (`eb377fe4`), four commits before the claim. The walk through
+a form reads a record's values with `Blob::read_exts`, whose read of a
+run in a block is written into its caller; that reader had grown a
+second way to fetch a block, and though no record of a form file's
+partition has a run in a block, the walk's loop kept a register less for
+it, two spills an entry. Out of line for the form's reads
+(`Blob::read_exts_inline`), the scan through a form counts 986
+instructions under the main line's and the point read through one nine;
+kept out of line for every caller, the raw scan read 150 over. The same
+count read the point read through a form 1.8 over at first, one helper
+(`ZFile::view_of`) left a call where the main line's build had it in the
+read. The probes are `bench/examples/read_only.rs` and `lag0_probe.rs`
+with `supdb-nocachezpages` beside `supdb`, the toggles as above, built
+at `origin/main` from this tree's example sources and at the tree.
+
+The rules: a feature that "cannot work" under a mode is a claim about
+the code that does the work today, and it is checked at each place that
+code touches what the mode changes -- here a mapping opened by a path, a
+section borrowed whole, and four file calls -- before the feature is
+given up; an advice forwarded through the type every caller already
+holds reaches the callers nobody listed, where a branch at each call
+site reaches the ones somebody remembered; tests that pass at their
+first run are run against the mutants before anything is said of them;
+and "pays nothing" is said of the operations that were counted, by
+name, with the ones that were not -- every read path a store has, each
+form of it, is a row of the count, and a path left out is a path the
+claim does not cover.
+
 A plain store's partition is named by its fences, sixteen bytes of two
 keys, so the names cannot go to the directory either: an envelope is named
 by a token drawn for it, the names live in the sealed manifest beside the
@@ -1583,10 +1724,13 @@ directory" and the store went on -- so the test counts the builds begun.
 
 What the first shape cost was read off pairings against the same store
 in the clear,
-`supdb-cipherbase`, which runs with the options a cipher fixes and no
+`supdb-cipherbase`, which ran with the options a cipher fixed and no
 cipher (`bench/scripts/pair.sh supdb-cipher supdb-cipherbase 300000`, and
-at 100000; `bench/DESIGN.md`), and against `supdb` for what the mode costs
-with what it forgoes (`pair.sh supdb-cipher supdb 300000`). The first
+at 100000), and against `supdb` for what the mode cost with what it
+forwent (`pair.sh supdb-cipher supdb 300000`). The twin was an arm for as
+long as a cipher fixed an option, `0ea02c5f` the last commit with it:
+a cipher fixes none now, and the pair of `supdb-cipher` is `supdb`
+itself (`bench/DESIGN.md`). The first
 pairing, at a hundred thousand keys, read three things in both sittings:
 the loads at 0.77-0.89x, the scan pass after the shuffled load at 0.8x,
 and nothing else. The scan pass was faults. `SUPDB_LAG_COUNTERS=1` read 220

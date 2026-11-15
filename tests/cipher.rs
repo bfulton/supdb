@@ -1507,13 +1507,14 @@ fn a_runs_table_reads_its_run_while_the_cache_turns_over() {
     }
 }
 
-/// What a store under a cipher runs without, it runs without whatever it
-/// is asked for: the compact form is built from a partition's records
-/// borrowed whole, which a file read by the piece does not lend. Asked
-/// for it, the store builds none, keeps what it commits across a crash,
-/// and its directory holds a store under a cipher's files and no other.
+/// The compact form under a cipher (`ZPages::Always`): every partition is
+/// given its form file, built from records read through the store's cache
+/// by the piece; reads are answered through it; it is in the directory as
+/// an envelope beside its segment's and as nothing else; and the next
+/// open finds it there and builds none. Ordered, so that the run is under
+/// it too, with a crash before the first settle.
 #[test]
-fn a_store_under_a_cipher_runs_without_what_it_cannot_seal() {
+fn the_compact_form_under_a_cipher_is_built_read_and_found_again() {
     let n = 12_000;
     let dir = scratch("forced");
     let asked = || Options {
@@ -1533,7 +1534,7 @@ fn a_store_under_a_cipher_runs_without_what_it_cannot_seal() {
         }
         db.commit().unwrap();
     }
-    {
+    let partitions = {
         let mut db = Db::open(&dir, asked()).unwrap();
         let mut seen = 0u32;
         db.scan(b"", usize::MAX, kv(&mut |_k, _v| seen += 1))
@@ -1545,14 +1546,38 @@ fn a_store_under_a_cipher_runs_without_what_it_cannot_seal() {
         db.commit().unwrap();
         db.flush().unwrap();
         db.settle().unwrap();
-        holds(&db, n);
+        db.zpages_settle().unwrap();
+        let forms = db.zpage_form_files();
+        assert!(!forms.is_empty(), "no form file under a cipher");
         assert!(
-            db.zpage_form_files().is_empty(),
-            "no form file under a cipher"
+            forms.iter().all(|f| !f.3),
+            "a form file out of service: {forms:?}"
         );
-        assert_eq!(db.zpage_counts().build_starts, 0, "and none begun");
+        let before = db.zpage_counts();
+        assert!(before.build_starts > 0, "no build begun");
+        assert_eq!(before.build_failed, 0, "a build failed");
+        holds(&db, n);
+        let after = db.zpage_counts();
+        assert!(
+            after.reads > before.reads,
+            "no read was answered through the form"
+        );
+        assert_eq!(after.fallbacks, before.fallbacks, "a read fell back");
+        forms.len()
+    };
+    // In the directory: an envelope a form file, beside its segment's,
+    // and no name or byte of the store's in the clear.
+    let all = names(&dir);
+    let forms: Vec<&String> = all.iter().filter(|n| n.ends_with(".z")).collect();
+    assert_eq!(forms.len(), partitions, "an envelope a form file: {all:?}");
+    for z in &forms {
+        let seg = z.strip_suffix(".z").unwrap();
+        assert!(
+            all.iter().any(|n| n == seg),
+            "{z} beside no segment's envelope"
+        );
     }
-    for name in names(&dir) {
+    for name in &all {
         let known = name == "supdb.cipher"
             || name.starts_with("manifest")
             || name.starts_with("wal-")
@@ -1562,7 +1587,416 @@ fn a_store_under_a_cipher_runs_without_what_it_cannot_seal() {
     for needle in [MARK, KEY_MARK] {
         assert!(files_holding(&dir, needle.as_bytes()).is_empty());
     }
-    holds(&Db::open(&dir, asked()).unwrap(), n);
+    // What a crash in the middle of a form file's envelope leaves: the
+    // temp name it is written under, which the next open removes.
+    let torn = format!("{}.tmp", forms[0]);
+    std::fs::write(dir.join(&torn), b"half an envelope").unwrap();
+    // The next open attaches what is there.
+    let mut db = Db::open(&dir, asked()).unwrap();
+    assert!(
+        !dir.join(&torn).exists(),
+        "a torn envelope outlived the open"
+    );
+    db.zpages_settle().unwrap();
+    let counts = db.zpage_counts();
+    assert_eq!(counts.build_starts, 0, "a form file built again");
+    assert_eq!(
+        db.zpage_form_files().len(),
+        partitions,
+        "the form files the last open left"
+    );
+    holds(&db, n);
+    assert!(db.zpage_counts().reads > counts.reads);
+    assert_eq!(db.zpage_counts().fallbacks, counts.fallbacks);
+}
+
+/// The compact form of a store several times its cache: every form file
+/// is built through the cache, the builder's reads resting so that the
+/// cache gives back what the pages before were read from; the store's
+/// reads are answered through the forms; and what the store holds of
+/// itself stays at its cache's size and a slack through the builds and the
+/// reads, and through a reopen that attaches every form file.
+#[test]
+fn the_compact_form_is_built_and_read_within_a_cache_the_store_does_not_fit() {
+    let _quiet = one_at_a_time();
+    let n = 150_000;
+    let cache: u64 = 2 << 20;
+    let opts = || Options {
+        encryption: Encryption::Cipher(cipher(12).cache_bytes(cache)),
+        zpages: supdb::ZPages::Always,
+        zpages_min_bytes: 0,
+        ..small()
+    };
+    let dir = scratch("formlarger");
+    let slack: u64 = 8 << 20;
+    let settled = |db: &Db, what: &str| {
+        let t = std::time::Instant::now();
+        loop {
+            let c = db.cipher_counts().unwrap().cache;
+            if c.held <= c.budget {
+                return c;
+            }
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(20),
+                "{what}: the cache stayed over its budget with nothing reading: {c:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    let (forms, form_bytes) = {
+        let mut db = Db::create(&dir, opts()).unwrap();
+        fill(&mut db, n);
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let before = settled(&db, "after the fill");
+        db.zpages_settle().unwrap();
+        let forms = db.zpage_form_files();
+        assert!(
+            forms.len() >= 8,
+            "the store's partitions have {} form files",
+            forms.len()
+        );
+        assert!(forms.iter().all(|f| !f.3), "a form file out of service");
+        let z = db.zpage_counts();
+        assert_eq!(z.build_failed, 0, "a build failed");
+        let c = settled(&db, "after the builds");
+        // Every partition was read whole by its build, the store several
+        // times over its cache: read under one hold with no rest, the
+        // builds hold the store.
+        assert!(
+            c.evicted_units > before.evicted_units,
+            "the builds gave nothing back: {c:?}"
+        );
+        assert!(
+            c.peak < cache + slack,
+            "the cache held {} bytes of a budget of {cache} through the builds: {c:?}",
+            c.peak
+        );
+        holds(&db, n);
+        let after = db.zpage_counts();
+        assert!(after.reads > z.reads, "no read through a form");
+        assert!(after.scans > z.scans, "no scan through a form");
+        assert_eq!(after.fallbacks, z.fallbacks, "a read fell back");
+        let c = settled(&db, "after the reads");
+        assert!(
+            c.peak < cache + slack,
+            "the cache held {} bytes of a budget of {cache} through the reads: {c:?}",
+            c.peak
+        );
+        // No form file is left in its writer's memory: each has its
+        // envelope, and is the cache's to give back.
+        assert_eq!(
+            db.cipher_counts().unwrap().files,
+            0,
+            "a file with no envelope"
+        );
+        let bytes: u64 = names(&dir)
+            .iter()
+            .filter(|n| n.ends_with(".z"))
+            .map(|n| std::fs::metadata(dir.join(n)).unwrap().len())
+            .sum();
+        (forms.len(), bytes)
+    };
+    assert!(
+        form_bytes > 2 * cache,
+        "the form files are {form_bytes} bytes, not more than their cache of {cache}"
+    );
+    // Reopened, the form files attached by the open: what it decrypts is
+    // by the file, a handful of chunks a segment and an index and the
+    // attach's reads a form file, and not by the byte.
+    let mut db = Db::open(&dir, opts()).unwrap();
+    let opened = db.cipher_counts().unwrap().cache;
+    assert_eq!(db.zpage_form_files().len(), forms);
+    let others = names(&dir)
+        .iter()
+        .filter(|n| n.starts_with("x-") && !n.ends_with(".z"))
+        .count() as u64;
+    assert!(
+        opened.fills <= 6 * others + 40 * forms as u64,
+        "the open decrypted {} chunks of {others} files and {forms} form files: {opened:?}",
+        opened.fills
+    );
+    db.zpages_settle().unwrap();
+    assert_eq!(db.zpage_counts().build_starts, 0, "a form file built again");
+    holds(&db, n);
+    let c = settled(&db, "after the reopen");
+    assert!(
+        c.peak < cache + slack,
+        "the cache held {} bytes of a budget of {cache} after the reopen: {c:?}",
+        c.peak
+    );
+}
+
+/// The attach of a form file under a cipher decrypts what an attach reads
+/// of it -- its trailer, its resident part, the sampled pages -- and not
+/// the file: one partition of several megabytes, reopened.
+#[test]
+fn an_attach_decrypts_what_it_reads_of_a_form_file_and_not_the_file() {
+    let n = 60_000;
+    let dir = scratch("attach");
+    let opts = || Options {
+        encryption: Encryption::Cipher(cipher(13)),
+        zpages: supdb::ZPages::Always,
+        zpages_min_bytes: 0,
+        seal_bytes: 16 << 20,
+        partition_bytes: Some(16 << 20),
+        ..Options::default()
+    };
+    {
+        let mut db = Db::create(&dir, opts()).unwrap();
+        fill(&mut db, n);
+        db.flush().unwrap();
+        db.settle().unwrap();
+        db.zpages_settle().unwrap();
+        assert_eq!(db.zpage_form_files().len(), 1, "one partition, one form");
+    }
+    let form = names(&dir)
+        .into_iter()
+        .find(|n| n.ends_with(".z"))
+        .expect("a form file's envelope");
+    let chunks = std::fs::metadata(dir.join(&form)).unwrap().len() / 4096;
+    assert!(chunks > 200, "a form file of {chunks} chunks");
+    let db = Db::open(&dir, opts()).unwrap();
+    assert_eq!(db.zpage_form_files().len(), 1);
+    let fills = db.cipher_counts().unwrap().cache.fills;
+    assert!(
+        fills > 0 && fills < chunks / 3,
+        "the open decrypted {fills} chunks beside a form file of {chunks}"
+    );
+    holds(&db, n);
+    assert!(db.zpage_counts().reads > 0, "no read through the form");
+}
+
+/// A form file is built through a cache its partition does not fit: one
+/// partition several times the cache and its slack, its form built by an
+/// open that finds none, the builder resting as it goes so that the cache
+/// gives back the records the pages before were built from. Read under
+/// one hold with no rest, the build holds the partition.
+#[test]
+fn a_form_file_is_built_through_a_cache_its_partition_does_not_fit() {
+    let _quiet = one_at_a_time();
+    let n = 150_000;
+    let cache: u64 = 2 << 20;
+    let slack: u64 = 8 << 20;
+    let dir = scratch("formbuild");
+    let opts = |zpages| Options {
+        encryption: Encryption::Cipher(cipher(14).cache_bytes(cache)),
+        zpages,
+        zpages_min_bytes: 0,
+        seal_bytes: 64 << 20,
+        partition_bytes: Some(64 << 20),
+        ..Options::default()
+    };
+    {
+        let mut db = Db::create(&dir, opts(supdb::ZPages::Off)).unwrap();
+        fill(&mut db, n);
+        db.flush().unwrap();
+        db.settle().unwrap();
+    }
+    let size = stored_bytes(&dir);
+    assert!(
+        size > cache + slack + (2 << 20),
+        "the partition is {size} bytes, within the cache of {cache} and its slack"
+    );
+    let mut db = Db::open(&dir, opts(supdb::ZPages::Always)).unwrap();
+    assert!(
+        db.zpage_form_files().is_empty(),
+        "a form file before a build"
+    );
+    db.zpages_settle().unwrap();
+    assert_eq!(db.zpage_form_files().len(), 1, "one partition, one form");
+    assert_eq!(db.zpage_counts().build_failed, 0);
+    let c = db.cipher_counts().unwrap().cache;
+    assert!(c.evicted_units > 0, "the build gave nothing back: {c:?}");
+    assert!(
+        c.peak < cache + slack,
+        "the cache held {} bytes of a budget of {cache} through the build: {c:?}",
+        c.peak
+    );
+    holds(&db, n);
+    assert!(db.zpage_counts().reads > 0, "no read through the form");
+    assert_eq!(db.zpage_counts().fallbacks, 0);
+    // The build asked for its records ahead of its walk, as a plain
+    // store's does: an envelope is mapped for reads far apart, and nothing
+    // else reads ahead of a walk of it.
+    assert!(
+        db.zpage_counts().build_ahead_bytes > 0,
+        "the build asked for nothing ahead"
+    );
+}
+
+/// A build that drops the records behind its walk drops them where a
+/// store under a cipher has them: the kernel's cache of the segment's
+/// envelope, which the build has just read whole. The same partition built
+/// with the drop and without it, by the share of the envelope's pages the
+/// page cache holds afterwards.
+#[test]
+fn a_build_drops_the_ciphertext_behind_its_walk_where_it_is_told_to() {
+    let _quiet = one_at_a_time();
+    let n = 100_000;
+    let cached = |drop_behind: bool| {
+        let dir = scratch(if drop_behind {
+            "dropbehind"
+        } else {
+            "keepbehind"
+        });
+        let opts = |zpages| Options {
+            encryption: Encryption::Cipher(cipher(17)),
+            zpages,
+            zpages_min_bytes: 0,
+            zpages_drop_behind: drop_behind,
+            zpages_drop_raw: false,
+            seal_bytes: 64 << 20,
+            partition_bytes: Some(64 << 20),
+            ..Options::default()
+        };
+        {
+            let mut db = Db::create(&dir, opts(supdb::ZPages::Off)).unwrap();
+            fill(&mut db, n);
+            db.flush().unwrap();
+            db.settle().unwrap();
+        }
+        let segment = names(&dir)
+            .into_iter()
+            .filter(|name| name.starts_with("x-") && !name.contains('.'))
+            .max_by_key(|name| std::fs::metadata(dir.join(name)).unwrap().len())
+            .expect("a segment's envelope");
+        let len = std::fs::metadata(dir.join(&segment)).unwrap().len() as usize;
+        let mut db = Db::open(&dir, opts(supdb::ZPages::Always)).unwrap();
+        db.zpages_settle().unwrap();
+        assert_eq!(db.zpage_form_files().len(), 1);
+        let pages = common::cached_pages(&dir.join(&segment), 0, len);
+        pages as f64 / len.div_ceil(4096) as f64
+    };
+    let (kept, dropped) = (cached(false), cached(true));
+    assert!(kept > 0.8, "a build that drops nothing left {kept} cached");
+    assert!(
+        dropped < 0.4,
+        "a build that drops behind its walk left {dropped} cached"
+    );
+}
+
+/// A form file goes with its segment whether or not this open of the store
+/// knew of it: built and sealed by one open, left alone by the next, which
+/// runs without the compact form and rewrites every partition, it is not
+/// left in the directory beside nothing.
+#[test]
+fn a_form_file_goes_with_its_segment_whether_or_not_this_open_knew_it() {
+    let n = 12_000;
+    let dir = scratch("formgone");
+    let opts = |zpages| Options {
+        zpages,
+        zpages_min_bytes: 0,
+        ..under(15)
+    };
+    let beside = |dir: &Path| {
+        let all = names(dir);
+        let forms: Vec<String> = all.iter().filter(|n| n.ends_with(".z")).cloned().collect();
+        for z in &forms {
+            let seg = z.strip_suffix(".z").unwrap();
+            assert!(all.iter().any(|n| n == seg), "{z} beside no segment");
+        }
+        forms
+    };
+    {
+        let mut db = Db::create(&dir, opts(supdb::ZPages::Always)).unwrap();
+        fill(&mut db, n);
+        db.flush().unwrap();
+        db.settle().unwrap();
+        db.zpages_settle().unwrap();
+    }
+    let before = beside(&dir);
+    assert!(before.len() > 2, "form files to lose: {before:?}");
+    {
+        let mut db = Db::open(&dir, opts(supdb::ZPages::Off)).unwrap();
+        // Unknown to this open, and still there: a store that ran with the
+        // option may run with it again.
+        assert_eq!(beside(&dir), before);
+        for i in 0..n {
+            db.put(&k(i), &v(i, 5));
+            if i % 500 == 499 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let mut seen = 0u32;
+        db.scan(b"", usize::MAX, kv(&mut |_k, _v| seen += 1))
+            .unwrap();
+        assert_eq!(seen, n);
+    }
+    let after = beside(&dir);
+    assert!(
+        before.iter().filter(|z| after.contains(z)).count() < before.len(),
+        "no partition was rewritten: {after:?}"
+    );
+}
+
+/// A byte changed in a form file is never read as data: the store reads
+/// as itself, where the byte was in what an attach refuses the file for
+/// and the partition is read raw, or refuses to be read, where the byte
+/// was in a page a read wanted.
+#[test]
+fn a_changed_byte_in_a_form_file_is_refused_or_the_form_is() {
+    let dir = scratch("tamperz");
+    let opts = || Options {
+        zpages: supdb::ZPages::Always,
+        zpages_min_bytes: 0,
+        ..tiny(16)
+    };
+    let want = {
+        let mut db = Db::create(&dir, opts()).unwrap();
+        for c in 0..40u32 {
+            for j in 0..30 {
+                let i = (c * 37 + j * 101) % 700;
+                db.put(&k(i), &v(i, c));
+            }
+            db.commit().unwrap();
+        }
+        db.flush().unwrap();
+        db.settle().unwrap();
+        db.zpages_settle().unwrap();
+        assert!(!db.zpage_form_files().is_empty(), "no form file to change");
+        digest_of(&db)
+    };
+    let pristine = snapshot(&dir);
+    let (mut refused, mut unread, mut whole) = (0, 0, 0);
+    for (name, bytes) in pristine.iter().filter(|(n, _)| n.ends_with(".z")) {
+        let stride = (bytes.len() / 24).max(1);
+        for at in (0..bytes.len()).step_by(stride) {
+            restore(&dir, &pristine);
+            let mut bad = bytes.clone();
+            bad[at] ^= 1;
+            std::fs::write(dir.join(name), &bad).unwrap();
+            let db = match Db::open(&dir, opts()) {
+                Err(_) => {
+                    refused += 1;
+                    continue;
+                }
+                Ok(db) => db,
+            };
+            match read_digest(&db) {
+                Err(e) => {
+                    unread += 1;
+                    assert!(
+                        e.to_string().contains("did not read"),
+                        "{name}, byte {at}: refused as {e}"
+                    );
+                }
+                Ok(d) => {
+                    assert_eq!(d, want, "{name}, byte {at}: read as another store");
+                    whole += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        refused + unread > 0 && whole > 0,
+        "refused {refused}, unread {unread}, whole {whole}"
+    );
+    restore(&dir, &pristine);
+    assert_eq!(digest_of(&Db::open(&dir, opts()).unwrap()), want);
 }
 
 /// The caller's key rotated under a store with data in it

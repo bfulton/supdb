@@ -740,8 +740,8 @@ pub enum Encryption {
     /// an open reads. A file's bytes are checked where they are decrypted,
     /// so a file changed on the device is refused at the read that first
     /// wants the changed bytes, with an error every operation after it
-    /// answers with too. The compact form is off, whatever the options
-    /// say. `Db::create` makes a store under the cipher in an empty
+    /// answers with too. Every option means what it means for a store in
+    /// the clear. `Db::create` makes a store under the cipher in an empty
     /// directory; `Db::open` refuses a store that is not under it, and a
     /// store under a cipher is refused where none is given.
     Cipher(vault::StoreCipher),
@@ -8181,25 +8181,30 @@ impl Seg {
     /// records twice, and did, for as long as the controller shipped
     /// (`tests/zpages.rs`, the model's populations). Read through the form
     /// file's door, since it is a fact of the file and not a touch of its
-    /// records; a reader that does not hold the section whole has neither
-    /// region to speak of.
+    /// records: both are words of the section's header, the same however
+    /// the reader holds the section.
     fn foot(&self) -> (u64, u64) {
         let raw = self.blob.for_zfile();
-        let records = raw
-            .record_regions()
-            .map_or(0, |(recs, _)| recs.len() as u64);
-        (raw.hash_region_bytes() as u64, records)
+        (
+            raw.hash_region_bytes() as u64,
+            raw.record_region_bytes() as u64,
+        )
     }
 
     /// The share of the record region's pages the page cache holds now
     /// (`resident_share`): whether a build would read the records from
-    /// memory or from the device. Zero for a reader that does not hold the
-    /// section whole.
+    /// memory or from the device. For a file of a store under a cipher,
+    /// the share of its chunks the store's cache holds or the kernel's
+    /// holds the ciphertext of (`pager::Paged::resident`).
     fn records_resident(&self) -> f64 {
-        self.blob
-            .for_zfile()
-            .record_regions()
-            .map_or(0.0, |(recs, _)| resident_share(recs))
+        let raw = self.blob.for_zfile();
+        match raw.record_regions() {
+            Some((recs, _)) => resident_share(recs),
+            None => raw
+                .record_region_place()
+                .and_then(|(off, len)| raw.source().paged_resident(off, len))
+                .unwrap_or(0.0),
+        }
     }
 
     /// The raw form, for a read of the records on purpose (`SegBlob`):
@@ -11488,18 +11493,6 @@ fn ref_pack(off: u64, len: u32) -> u64 {
 /// the log as well (a store under a cipher).
 const RUN_REFS: u8 = 1;
 const RUN_LOGGED: u8 = 2;
-
-/// What a store under a cipher runs with whatever it was asked for
-/// (`Encryption::Cipher`): the compact form off. The form is a second copy
-/// of a partition, built from the first by a reader of the whole of it
-/// and attached by its bytes in the page cache, neither of which a file
-/// read by the piece through the store's own cache offers yet. Nothing
-/// else is fixed: an ordered run keeps its table and its segment and
-/// sends its commits through the log as well (`Db::log_run`), and the log
-/// recycles (`Wal::recycle`).
-fn under_cipher(opts: &mut Options) {
-    opts.zpages = ZPages::Off;
-}
 
 /// Combinations of options the engine cannot run soundly, refused before
 /// anything on disk is touched. An unpinned writer holds no state it
@@ -19753,13 +19746,34 @@ impl Reader {
             zfile::ScanEnd::Fallback => {
                 self.zbump(|s| &s.zfallbacks);
                 self.zbump(|s| &s.zscans);
-                Ok(r.seen + raw(rank + r.seen, n - r.seen, f)?)
+                Ok(r.seen + Reader::part_scan_rest(seg, rank + r.seen, n - r.seen, f)?)
             }
             zfile::ScanEnd::Out => {
                 self.zbump(|s| &s.zscans);
-                Ok(r.seen + raw(rank + r.seen, n - r.seen, f)?)
+                Ok(r.seen + Reader::part_scan_rest(seg, rank + r.seen, n - r.seen, f)?)
             }
         }
+    }
+
+    /// The rest of a walk a form file stopped, through the raw form
+    /// (`part_scan_z`): out of line, and said to be. Written into the walk
+    /// it follows, the raw walk and the walk by the piece behind it were
+    /// two more takers of the scan's callback in the function that holds
+    /// the walk through the form, and that walk kept a register less for
+    /// it: two to four instructions an entry of a plain store's scan
+    /// through its form, for a branch a scan of a form file in service
+    /// does not take.
+    #[cold]
+    #[inline(never)]
+    fn part_scan_rest<F: FnMut(&[u8], &[u8])>(
+        seg: &Seg,
+        rank: usize,
+        n: usize,
+        f: &mut F,
+    ) -> Result<usize> {
+        seg.raw()
+            .scan_either(rank, n, f)
+            .map_err(|e| err(&format!("segment scan: {e}")))
     }
 
     /// A scan's seek of a partition: the rank of the first key at or after
@@ -27249,10 +27263,7 @@ impl Db {
                 dirkey::protect(dir, &key)?;
                 None
             }
-            Encryption::Cipher(cipher) => {
-                under_cipher(&mut opts);
-                Some(vault::Vault::create(dir, &cipher)?)
-            }
+            Encryption::Cipher(cipher) => Some(vault::Vault::create(dir, &cipher)?),
         };
         let decoy = held.as_ref().map(vault::Held::dir);
         let dir = decoy.as_deref().unwrap_or(dir);
@@ -27549,7 +27560,6 @@ impl Db {
             }
             Encryption::Cipher(cipher) => {
                 dirkey::refuse_locked(dir)?;
-                under_cipher(&mut opts);
                 Some(vault::Vault::open(dir, &cipher)?)
             }
         };
@@ -27787,6 +27797,10 @@ impl Db {
                     ),
                     &zev,
                 );
+                // Nothing lent by that attach is read again, as above.
+                if let Some(h) = &opening {
+                    h.rest();
+                }
             }
         }
         let ord_rebuilt = segs.iter().filter(|s| s.ord_rebuilt).count() as u64;
@@ -31342,6 +31356,20 @@ pub enum ZRound {
 /// calling thread: there is no builder thread, no controller and nothing
 /// that retires a form file before its segment goes.
 impl Db {
+    /// Whether the form file of the segment named `seg` is in the store's
+    /// directory, under the name the segment's gives it. For a store under
+    /// a cipher the directory is the store's own table of names, which
+    /// learns here of a form file an earlier open left beside the
+    /// segment's envelope (`vault::companion`).
+    fn z_on_disk(dir: &Path, seg: &str) -> bool {
+        let Some((id, end)) = Db::name_id(seg).zip(Db::name_end_seq(seg)) else {
+            return false;
+        };
+        let name = zfile::zpg_name(id, end);
+        vault::companion(dir, seg, &name);
+        vault::is_file(dir.join(name))
+    }
+
     /// Whether a form file's mapping is advised random: whenever the store
     /// advises its mappings at all. The mode the store is in at the moment
     /// of the attach is not asked (see `ZFile`'s `map`).
@@ -31366,7 +31394,6 @@ impl Db {
     /// that the build's round does not ask of the same file again and count
     /// it twice; no file is not a rejection.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn z_attach(
         dir: &Path,
         seg: &Seg,
@@ -31381,6 +31408,9 @@ impl Db {
         let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
             return false;
         };
+        // A store under a cipher learns here of a form file an earlier
+        // open left beside the segment's envelope.
+        vault::companion(dir, &seg.name, &zfile::zpg_name(id, end));
         match zfile::ZFile::attach(
             &dir.join(zfile::zpg_name(id, end)),
             seg.blob.for_zfile(),
@@ -39584,6 +39614,7 @@ impl Maint {
         zfile::ZEvents::add(&self.shared.z.samples, 1);
         let idle = self.opts.zpages_sample_idle;
         let io_idle = idle && self.opts.zpages_io_idle;
+        let dir = self.dir.clone();
         let spawned = std::thread::Builder::new()
             .name("supdb-zsample".into())
             .spawn(move || {
@@ -39593,9 +39624,18 @@ impl Maint {
                 if idle {
                     idle_cpu_priority();
                 }
+                // Under a cipher the records a sample fills its pages from
+                // are read through the store's cache, by a thread with no
+                // slot of the reader table: under a hold, rested between
+                // partitions, where nothing a sample was lent is read
+                // again.
+                let hold = vault::hold(&dir);
                 let out: Vec<_> = segs
                     .into_iter()
                     .map(|s| {
+                        if let Some(h) = &hold {
+                            h.rest();
+                        }
                         let ids = Db::name_id(&s.name).zip(Db::name_end_seq(&s.name));
                         let take = |shape: zfile::FillShape| match ids {
                             Some((id, end)) => {
@@ -39691,9 +39731,7 @@ impl Maint {
                     raw.add(&s2);
                 }
             }
-            let on = Db::name_id(&seg.name)
-                .zip(Db::name_end_seq(&seg.name))
-                .is_some_and(|(id, end)| self.dir.join(zfile::zpg_name(id, end)).is_file());
+            let on = Db::z_on_disk(&self.dir, &seg.name);
             on_disk += usize::from(on);
             if !on {
                 missing_keys = missing_keys.saturating_add(seg.blob.keys() as u64);
@@ -39969,11 +40007,7 @@ impl Maint {
                 let why = s.z_declined.load(AtomicOrdering::Relaxed);
                 why == 0 || why == zfile::DECLINED_REFUSED
             })
-            .filter(|s| {
-                Db::name_id(&s.name)
-                    .zip(Db::name_end_seq(&s.name))
-                    .is_some_and(|(id, end)| self.dir.join(zfile::zpg_name(id, end)).is_file())
-            })
+            .filter(|s| Db::z_on_disk(&self.dir, &s.name))
             .cloned()
             .collect()
     }
@@ -40114,9 +40148,9 @@ impl Maint {
             .filter(|s| s.z_declined.load(AtomicOrdering::Relaxed) == 0)
             .filter(|s| cold_ok || !s.z_ahead_cold.load(AtomicOrdering::Relaxed))
             .filter(|s| {
-                Db::name_id(&s.name)
-                    .zip(Db::name_end_seq(&s.name))
-                    .is_some_and(|(id, end)| !self.dir.join(zfile::zpg_name(id, end)).is_file())
+                Db::name_id(&s.name).is_some()
+                    && Db::name_end_seq(&s.name).is_some()
+                    && !Db::z_on_disk(&self.dir, &s.name)
             })
             .collect();
         if !land {
@@ -40298,10 +40332,23 @@ impl Maint {
                     continue;
                 };
                 let form = self.dir.join(zfile::zpg_name(id, end));
-                if !form.is_file() {
+                if !Db::z_on_disk(&self.dir, &s.name) {
                     continue;
                 }
-                let Some((at, len)) = s.blob.for_zfile().record_region_span() else {
+                let raw = s.blob.for_zfile();
+                let Some((at, len)) = raw.record_region_span() else {
+                    // A file of a store under a cipher: the same swap in
+                    // the kernel's cache of the two envelopes, the
+                    // records' ciphertext dropped and the form file's
+                    // asked for.
+                    if let Some((at, len)) = raw.record_region_place() {
+                        use crate::bytes::Bytes as _;
+                        raw.source().advise_dontneed_range(at, len);
+                        if let Ok(z) = vault::map(&form) {
+                            asked += z.advise_willneed(0, z.len() as usize) as u64;
+                        }
+                        n += 1;
+                    }
                     continue;
                 };
                 let Ok(f) = vault::open(self.dir.join(&s.name)) else {
@@ -40750,7 +40797,7 @@ impl Maint {
                 .map(|c| c == zselect::Coding::RawTails);
             if let (Some(want), Some(&built)) = (want, self.z_ahead_coding.get(&name)) {
                 // A build ahead cancelled or failed left no file to give.
-                if built != want && self.dir.join(&name).is_file() {
+                if built != want && Db::z_on_disk(&self.dir, &seg.name) {
                     let n = shared.next_dead.fetch_add(1, AtomicOrdering::Relaxed);
                     let dead = self.dir.join(zfile::zpg_dead_name(n));
                     if vault::rename(self.dir.join(&name), &dead).is_ok() {
@@ -40839,7 +40886,8 @@ impl Maint {
             seg.z_declined.store(why, AtomicOrdering::Relaxed);
             seg.z_schedule_retry(retry_ms);
         };
-        let file = match vault::open(self.dir.join(&seg.name)) {
+        let seg_path = self.dir.join(&seg.name);
+        let file = match zfile::open_seg(&seg_path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Retired since it was listed: outrun, not failed.
@@ -40961,7 +41009,7 @@ impl Maint {
                 let r = if fail {
                     Err(err("the form file's build was made to fail"))
                 } else {
-                    zfile::build_file(file, &out, id, end, &plan)
+                    zfile::build_file(file, &seg_path, &out, id, end, &plan)
                 };
                 if let Some(t) = wake {
                     t.unpark();
