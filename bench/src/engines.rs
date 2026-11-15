@@ -1168,6 +1168,10 @@ pub struct Supdb {
     /// partition's reader's (`Options::zpages_seek_seeds` on):
     /// `supdb-zseekseed`.
     zseekseed: bool,
+    /// The compressed form files in the record coding, each record decoded
+    /// alone, where the controller picks a compressed coding
+    /// (`Options::zpages_record_coding` on): `supdb-zrecord`.
+    zrecorddefault: bool,
     /// A raw partition sent back to its form file once its reads a key fall
     /// under the median partition's (`Options::zpages_hot_cold_back` on):
     /// `supdb-zhotcoldback`.
@@ -2373,6 +2377,8 @@ struct Policy {
     scanrawpaced: bool,
     /// The start placed once: `supdb-zseekseed`.
     zseekseed: bool,
+    /// The record coding where a compressed form is picked: `supdb-zrecord`.
+    zrecorddefault: bool,
     /// The cold way back: `supdb-zhotcoldback`.
     zhotcoldback: bool,
     /// The reader table walked at every end: `supdb-sweepwalks`.
@@ -2837,6 +2843,7 @@ impl Default for Policy {
             noscanrawahead: false,
             scanrawpaced: false,
             zseekseed: false,
+            zrecorddefault: false,
             zhotcoldback: false,
             sweepwalks: false,
             copyprefetchwhole: false,
@@ -3398,6 +3405,20 @@ impl Supdb {
             path,
             Policy {
                 zhotgrowth5: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose compressed form files are built in the record coding,
+    /// each record decodable alone, so a point read decodes one record and
+    /// not its group (`Options::zpages_record_coding` on; the controller's
+    /// pick of the raw tails is unchanged).
+    pub fn create_zrecord(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zrecorddefault: true,
                 ..Policy::default()
             },
         )
@@ -8291,6 +8312,7 @@ impl Supdb {
             noscanrawahead,
             scanrawpaced,
             zseekseed,
+            zrecorddefault,
             zhotcoldback,
             sweepwalks,
             copyprefetchwhole,
@@ -8842,7 +8864,7 @@ impl Supdb {
             forms_settle_builds: settlebuilds
                 .unwrap_or(supdb::Options::default().forms_settle_builds),
             zpages_both: zboth,
-            zpages_record_coding: zrecord || zrawtails,
+            zpages_record_coding: zrecord || zrawtails || zrecorddefault,
             zpages_memo_first: zmemofirst,
             zpages_fence_tree: zfencetree,
             zpages_fence_words: !fencekeys,
@@ -9178,6 +9200,7 @@ impl Supdb {
             noscanrawahead,
             scanrawpaced,
             zseekseed,
+            zrecorddefault,
             zhotcoldback,
             sweepwalks,
             copyprefetchwhole,
@@ -9593,6 +9616,9 @@ impl Engine for Supdb {
         }
         if self.zseekseed {
             return "supdb-zseekseed";
+        }
+        if self.zrecorddefault {
+            return "supdb-zrecord";
         }
         if self.zhotcoldback {
             return "supdb-zhotcoldback";
@@ -12145,6 +12171,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-scanrawpaced"
         | "supdb-noscanrawahead"
         | "supdb-zseekseed"
+        | "supdb-zrecord"
         | "supdb-zhotcoldback"
         | "supdb-sweepwalks"
         | "supdb-copyprefetchwhole"
@@ -13130,6 +13157,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             dir,
         )?,
         "supdb-zseekseed" => supdb_arm(Supdb::create_zseekseed, dir)?,
+        "supdb-zrecord" => supdb_arm(Supdb::create_zrecord, dir)?,
         "supdb-zhotcoldback" => supdb_arm(Supdb::create_zhotcoldback, dir)?,
         "supdb-sweepwalks" => supdb_arm(Supdb::create_sweepwalks, dir)?,
         "supdb-copyprefetchwhole" => supdb_arm(Supdb::create_copyprefetchwhole, dir)?,
@@ -15768,6 +15796,14 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.scan_raw_ahead && o.scan_raw_ahead_lead == 1024);
                 assert!(!o.scan_raw_ahead_past_llc && b.scan_raw_ahead_lead == 0);
+            }
+            {
+                let z = Supdb::create_zrecord(&dir("zrecord")).unwrap();
+                assert_eq!(z.name(), "supdb-zrecord");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_record_coding && !b.zpages_record_coding);
+                assert!(!o.zpages_raw_tails && o.zpages_coding_auto);
             }
             {
                 let z = Supdb::create_zseekseed(&dir("zseekseed")).unwrap();

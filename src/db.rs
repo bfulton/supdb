@@ -2468,8 +2468,11 @@ pub struct Options {
     /// and E (`docs/engine.md`). A pick holds for the builds after it; the
     /// files already built keep their coding, each file naming its own. On;
     /// `supdb-cache64tofitautozpagescodingfixed` is the shape before, the
-    /// options' coding. Nothing under `Always`, whose coding is
-    /// `zpages_record_coding` and `zpages_raw_tails`.
+    /// options' coding. The pick that is not the raw tails is the options'
+    /// compressed coding: the block coding, or the record coding with its
+    /// tails compressed where `zpages_record_coding` is on (`supdb-zrecord`).
+    /// Nothing under `Always`, whose coding is `zpages_record_coding` and
+    /// `zpages_raw_tails`.
     #[doc(hidden)]
     pub zpages_coding_auto: bool,
     /// A raw-tail coded group (`zpages_record_coding` with
@@ -49338,8 +49341,11 @@ impl Maint {
             Some(zselect::Coding::RawTails) if self.opts.zpages_coding_auto => {
                 (zpages::ZCODING_RECORD, true)
             }
+            // The compressed pick is the options' compressed coding: the
+            // block coding, or the record coding with its tails compressed
+            // (`Options::zpages_record_coding`).
             Some(zselect::Coding::Block) if self.opts.zpages_coding_auto => {
-                (zpages::ZCODING_BLOCK, false)
+                (self.opts.z_coding(), false)
             }
             _ => (self.opts.z_coding(), self.opts.zpages_raw_tails),
         };
@@ -50249,7 +50255,7 @@ impl Maint {
                 (zpages::ZCODING_RECORD, true)
             }
             Some(zselect::Coding::Block) if self.opts.zpages_coding_auto => {
-                (zpages::ZCODING_BLOCK, false)
+                (self.opts.z_coding(), false)
             }
             _ => {
                 // The first partitions by key order raw-tailed
