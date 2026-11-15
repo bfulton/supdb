@@ -3758,7 +3758,7 @@ pub(super) struct Warm {
 pub(super) fn warm_file(path: &Path, cancel: Option<&AtomicBool>) -> Result<Warm> {
     let start = std::time::Instant::now();
     let map = MmapBytes::open(path)?;
-    let len = map.0.len();
+    let len = map.as_slice().len();
     let page = crate::bytes::os_page_size();
     let mut w = Warm::default();
     let mut sum = 0u64;
@@ -3776,7 +3776,7 @@ pub(super) fn warm_file(path: &Path, cancel: Option<&AtomicBool>) -> Result<Warm
             map.advise_willneed(off as u64, span);
             let mut at = off;
             while at < off + span {
-                sum = sum.wrapping_add(u64::from(map.0[at]));
+                sum = sum.wrapping_add(u64::from(map.as_slice()[at]));
                 at += page;
             }
             w.bytes += ((pages - resident) * page).min(span) as u64;
@@ -4207,8 +4207,8 @@ fn build_file_seen(
 ) -> Result<Outcome> {
     // SAFETY: the contract `MmapBytes::open` takes: a sealed segment is
     // never truncated under a mapping.
-    let map = MmapBytes(unsafe { memmap2::Mmap::map(&file)? });
-    let base = map.0.as_ptr() as usize;
+    let map = MmapBytes::from_map(unsafe { memmap2::Mmap::map(&file)? });
+    let base = map.as_slice().as_ptr() as usize;
     let blob = Blob::open_with(
         map,
         BlobOptions {
@@ -7172,8 +7172,8 @@ mod tests {
             std::fs::copy(&fx.seg, &p).unwrap();
             evict(&p);
             let m = MmapBytes::open(&p).unwrap();
-            let all = m.0.len().div_ceil(page);
-            let res = m.resident_pages(0, m.0.len());
+            let all = m.as_slice().len().div_ceil(page);
+            let res = m.resident_pages(0, m.as_slice().len());
             assert!(
                 res < all / 4,
                 "{name}: {res} of {all} resident after the eviction"
@@ -7181,19 +7181,23 @@ mod tests {
             (m, all)
         };
         let (asked, all) = cold("seg-asked");
-        ask_ahead(asked.0.as_ptr() as usize, 0, asked.0.len());
+        ask_ahead(
+            asked.as_slice().as_ptr() as usize,
+            0,
+            asked.as_slice().len(),
+        );
         let (left, _) = cold("seg-left");
         let t = std::time::Instant::now();
-        let mut res = asked.resident_pages(0, asked.0.len());
+        let mut res = asked.resident_pages(0, asked.as_slice().len());
         while res * 4 < all * 3 && t.elapsed() < std::time::Duration::from_secs(5) {
             std::thread::sleep(std::time::Duration::from_millis(10));
-            res = asked.resident_pages(0, asked.0.len());
+            res = asked.resident_pages(0, asked.as_slice().len());
         }
         assert!(
             res * 4 >= all * 3,
             "{res} of {all} pages resident after the ask"
         );
-        let untouched = left.resident_pages(0, left.0.len());
+        let untouched = left.resident_pages(0, left.as_slice().len());
         assert!(
             untouched < all / 4,
             "{untouched} of {all} resident with nothing asked"
@@ -7214,7 +7218,10 @@ mod tests {
         let page = crate::bytes::os_page_size();
         let pages = |p: &Path| {
             let m = MmapBytes::open(p).unwrap();
-            (m.resident_pages(0, m.0.len()), m.0.len().div_ceil(page))
+            (
+                m.resident_pages(0, m.as_slice().len()),
+                m.as_slice().len().div_ceil(page),
+            )
         };
         evict(&fx.out);
         let (res, all) = pages(&fx.out);

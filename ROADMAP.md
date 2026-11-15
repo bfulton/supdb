@@ -161,13 +161,13 @@ What an engine picker would hit, roughly in order.
   under a cipher of the caller's (`Encryption::Cipher`) and seals everything
   it writes to its directory under it: the segments and their indexes as
   envelopes, the log record by record, the manifest slot by slot, and the
-  files' names, which stay in the manifest. Its plaintext is held in memory
-  files and read by lending from their mappings, so a read runs the code a
-  plain store's runs. The caller's cipher wraps the store's own key and
+  files' names, which stay in the manifest. It reads its files through a
+  cache of plaintext of its own, a chunk decrypted where it is first read
+  and lent from in place. The caller's cipher wraps the store's own key and
   nothing else, each file is under a key drawn for it, and
   `supdb::cipher_rewrap` hands a store from one of the caller's keys to
   another without touching a file (`supdb::db::vault`). On any filesystem,
-  Linux only. What it does not do yet is the four items below.
+  Linux only. What it does not do yet is the open items below.
 - [ ] **An envelope written beside its segment.** A plain segment's bytes
   go to the device while the segment is built, and its fsync finds little
   left to write; a segment under a cipher is encrypted and written after
@@ -178,28 +178,54 @@ What an engine picker would hit, roughly in order.
   finished pieces to the cipher as it writes them, which wants an
   envelope whose chunks do not bind the length, and a last chunk that says
   it is the last.
-- [ ] **A store under a cipher larger than memory.** The plaintext is in
-  memory whole, and an open decrypts all of it. A file decrypted when it
-  is first read, and put out again under a bound, is what the envelope's
-  reader does for a finished segment (`supdb::crypt`); for a live store it
-  is every read path over a source that may have to decrypt, where the
-  engine is written over one mapping.
+- [x] **A store under a cipher larger than memory.** The store's cache of
+  plaintext has a budget (`StoreCipher::cache_bytes`), gives back what has
+  not been read lately once it is past it, and decrypts a chunk again
+  where it is read again, so a store of any size runs in the cache it is
+  given; an open decrypts what it reads of each file and holds no
+  descriptor for one. The readers ask their source for bytes before they
+  read them (`Bytes::piecewise`), which a reader over a mapped file does
+  not, and a file changed on the device is refused at the read that first
+  wants the changed bytes (`supdb::db::pager`).
+- [ ] **A read of one key larger than the cache.** What a read is lent it
+  holds until it ends or rests, and the cache gives none of it back
+  meanwhile: a scan rests every thousand keys and a merge every few
+  hundred, but one key's values are read in one piece, so a key whose
+  values outrun the cache holds the cache past its budget for the length
+  of that read. Done when a walk of one key's runs rests between blocks,
+  asking again for the extents it walks by.
+- [ ] **The block cache's builders under a crowded cache.** The upkeep
+  thread's pass and the builder ahead read every block they build a form
+  for under one pin; where the store's cache of plaintext is well past
+  its budget they give their forms up, as they do for the tables behind
+  a pin, and the scans build what they read. Done when they rest between
+  blocks instead, which wants each block's build to hold nothing of a
+  file across the next.
 - [ ] **Ordered ingest and the compact form under a cipher.** Both are
   off there: ordered ingest's run is a segment synced at every commit,
-  which a memory file cannot be, so an ordered load goes through the log;
-  and the compact form is for a store its memory does not hold. The first
-  wants the streamed envelope above, with a record sealed a commit.
-- [ ] **A store under a cipher on another platform.** The memory files are
-  Linux's (`memfd_create`); elsewhere the store is refused before it writes
-  anything.
-- [ ] **The first single-threaded pass of point reads under a cipher.** It
-  ran about a tenth behind the same store in the clear at a hundred
-  thousand keys in five sittings of six, and a twentieth at three hundred
-  thousand in the buffered pair, with the threaded passes after it and the
-  read mixes level. A merge's later landing accounts for some of
-  it and the memory files' small pages may account for the rest; neither
-  is established. `bench/scripts/pair.sh supdb-cipher supdb-cipherbase
-  100000 --passes load,read` is the pairing.
+  which a file that reaches the directory once, as its envelope, cannot
+  be, so an ordered load goes through the log; and the compact form is
+  built from a partition's records borrowed whole and attached by its
+  bytes in the page cache, where a file under a cipher is read by the
+  piece through the store's own cache. The first wants the streamed
+  envelope above, with a record sealed a commit; the second wants the
+  form file's pages sealed one by one, which is the shape its reader
+  already has: a page read, checked and decoded into memory of its own.
+- [ ] **A store under a cipher on another platform.** The memory files a
+  file is written in and the cache gives pages back from are Linux's
+  (`memfd_create`, `MADV_REMOVE`); elsewhere the store is refused before it
+  writes anything.
+- [ ] **A store under a cipher, in its cache, at the plain store's rate.**
+  A reader of a file under a cipher asks its source for every range
+  before it reads it, where a reader of a mapped file reads. With the
+  whole store in its cache that is all that is left between the two, and
+  it shows: point reads a little behind the same store in the clear, the
+  scan passes further, and furthest where a walk reads by the rank, which
+  is the scans after a burst and the scan mix. The scan over a partition
+  asks for a window of records at a time already. Done when the walks by
+  rank do too, and a point read asks once for each piece it touches.
+  `bench/scripts/pair.sh supdb-cipher supdb-cipherbase 300000` is the
+  pairing.
 - [ ] **A store under a key, priced on a kernel with hardware AES.** The
   pairings of `supdb-dirkey` against `supdb` ran where the kernel has no
   AES instructions built in (`/proc/crypto` names `aes-fixed-time`): reads,

@@ -283,10 +283,15 @@ cipher of the caller's (`Encryption::Cipher`), here AES-256-GCM:
 ingest through the log and the compact form off whatever it is asked, so
 it has a twin in the clear with the same two settings, `supdb-cipherbase`
 and `supdb-ingestcipherbase`, and is paired twice: against its twin, which
-differs by the cipher and the memory files alone, and against `supdb`,
-which is what the mode costs with what it forgoes. The suite does not
-reopen a store, so what an open under a cipher costs, the whole store
-decrypted, is `cargo run --release --example cipher_store` and no cell.
+differs by the cipher and the store's own cache of plaintext alone, and
+against `supdb`, which is what the mode costs with what it forgoes. That
+cache is half of what the process may use unless an arm says otherwise,
+which at the suite's in-core rungs is a store that fits it;
+`supdb-cipher64` is the same store with a cache of sixty-four mebibytes,
+which from a million keys up is a store several times its cache, read by
+the chunk it decrypts and gives back. The suite does not reopen a store,
+so an open under a cipher is `cargo run --release --example cipher_store`
+and no cell.
 
 ## Scale
 

@@ -106,7 +106,9 @@ pub use db::dirkey::{self, DirKey, DirState};
 /// gives its key, and the store handed from one of the caller's keys to
 /// another.
 #[cfg(not(target_family = "wasm"))]
-pub use db::vault::{key_id as cipher_key_id, rewrap as cipher_rewrap, CipherCounts, StoreCipher};
+pub use db::vault::{
+    key_id as cipher_key_id, rewrap as cipher_rewrap, CipherCounts, PagerCounts, StoreCipher,
+};
 #[cfg(not(target_family = "wasm"))]
 pub use db::{
     BackgroundIo, Db, Encryption, Isolation, Options, ReadAdvice, Reader, SegmentOptions,

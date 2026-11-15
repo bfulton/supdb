@@ -34,11 +34,12 @@ of the change that produced the text.
 | `src/db/zpages.rs` | the compact form's layout: the page, the directory of the groups it holds, the group, the fill that cuts records into groups and packs them into pages, the fence, the trailer and the identity a form file is bound by, with no file, thread or clock in it -- the module's own docs, and `bench/examples/zsize.rs` for what it makes of the engine's bytes |
 | `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`) -- the module's own docs |
 | `src/db/dirkey.rs` | a live store's directory under a key, encrypted by the kernel (`Encryption::Kernel`): the requests of Linux's file encryption, what `create` and `open` hold a directory to, and `lock`, with no cipher and no byte of a read path in it -- the module's own docs, and `scripts/fscrypt.sh` for a filesystem to test it on |
-| `src/db/vault.rs` | a live store under a cipher the caller supplies (`Encryption::Cipher`): the door every file operation of the engine goes through, which is the standard library's call for a plain store; a store's files as memory files and their envelopes in the directory; the marker and the keys, the caller's wrapping the store's and the store's wrapping a key a file; the manifest's slot and the log's record sealed, with no cipher in the crate -- the module's own docs, `tests/cipher.rs`, and `ZFUZZ_CIPHER=1` for the differential fuzz |
+| `src/db/vault.rs` | a live store under a cipher the caller supplies (`Encryption::Cipher`): the door every file operation of the engine goes through, which is the standard library's call for a plain store; a file as a memory file while it is written and as its envelope in the directory after; the marker and the keys, the caller's wrapping the store's and the store's wrapping a key a file; the manifest's slot and the log's record sealed, with no cipher in the crate -- the module's own docs, `tests/cipher.rs`, and `ZFUZZ_CIPHER=1` for the differential fuzz |
+| `src/db/pager.rs` | the cache a store under a cipher reads its files through: a file as address space its plaintext's length, a chunk of it decrypted where it is first asked for and a megabyte given back at a time once the cache is past its budget and no reader could hold it; the holds and rests of the threads that read with no slot of the reader table, the wait of a crowded cache, and the failure a read remembers, with no cipher in it and no reader of the format -- the module's own docs, and `tests/cipher.rs` for a store several times its cache |
 | `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, and the replays that hold it -- the module's own docs |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
 | `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index -- `docs/index-theory.md` |
-| `src/bytes.rs`, `src/blob.rs` | the read path over any byte source; compiles for wasm |
+| `src/bytes.rs`, `src/blob.rs` | the read path over any byte source, one that lends whole, one that copies, and one that lends by the piece it is asked for (`Bytes::piecewise`, `flatindex::Pieces`); compiles for wasm |
 | `src/crypt.rs` | a finished file published encrypted and read through the `Bytes` seam: the envelope, the hook a caller's cipher fits (`Aead`), `Encrypted` as a byte source over the stored object and `encrypt` as its writer, with no cipher in the crate; compiles for wasm and nothing in the module links it -- the module's own docs, `examples/crypt.rs` for the adapter, and `web/crypt.mjs` for the browser's half |
 | `src/wasmapi.rs` | the C ABI the browser calls; hand-written because the module's size is budgeted |
 | `web/` | the browser reader, its byte sources, the fetcher that decrypts, the Worker it runs in, and the size control -- `web/README.md` |
@@ -1062,8 +1063,9 @@ rule: under the kernel's encryption a write rate is read after
 engine in it has been taken in the same two directories, since the
 cipher is the kernel's and its speed is a property of the build.
 
-**A live store under the caller's cipher is the plain engine over memory
-files, and what the engine owes is the door.** `Encryption::Cipher` is the
+**A live store under the caller's cipher reads its files by the piece
+through a cache of its own, and what the engine owes is the door and the
+asking.** `Encryption::Cipher` is the
 second way a store is kept under a key, for a caller who brings the cipher
 (`src/db/vault.rs`). It was asked for first and built second: the caller's
 cipher was the plan from the question that started this, the envelope gave
@@ -1072,7 +1074,8 @@ because that kept the read path, without anyone being told the plan had
 changed. The two are not one feature done twice. The kernel's keeps the
 page cache and wants a filesystem that can encrypt; this one goes wherever
 Linux does, authenticates every byte, leaves files that are ciphertext
-wherever they are copied, and holds the store's plaintext in memory.
+wherever they are copied, and reads through a cache of plaintext of a
+size the caller sets.
 They are one option with three values (`Options::encryption`:
 `Encryption::None`, `Kernel`, `Cipher`) and were two for a day: a key
 beside a cipher, each an `Option`, with a test on an encrypting filesystem
@@ -1095,20 +1098,163 @@ is first asked whether anyone should want them to; and a refusal is
 tested by what it says, since a store that fails later for another reason
 is refused by accident.
 
-That the cipher's way holds the plaintext in memory is the constraint and
-not an accident. A store reads by lending
-from mappings, the cipher is in the process, so the plaintext is the
-process's: each file of the store is a memory file (`memfd_create`),
-written and mapped by the code that writes and maps a plain store's, and
-what reaches the directory is the file's envelope (`supdb::crypt`),
-written once the file is finished. A read path that asked its source
-whether a chunk was decrypted yet would be the envelope's reader under the
-engine: every `Blob<MmapBytes>` in forty thousand lines another type, the
-advice and the residency counts aimed at ciphertext, and the plain store
-paying a branch a section for a feature it does not use. A memory file is
-a mapping like any other, so nothing on a read path knows, and the price
-is said plainly instead: the store has to fit in memory, an open decrypts
-all of it, and the kernel cannot reclaim a page of it.
+The first shape of it held the store in memory, and that was decided by
+building it. A store reads by lending from mappings and the cipher is in
+the process, so the plaintext is the process's to hold: the first shape
+made each file a memory file (`memfd_create`), written and mapped by the
+code that writes and maps a plain store's, with its envelope written once
+it was finished, because a memory file is a mapping like any other and
+nothing on a read path had to know. The price was written here afterwards
+as a property of the design -- the store has to fit in memory, an open
+decrypts all of it, a descriptor a file -- under the words "the
+constraint and not an accident". It was neither. Nobody who asks for a
+store under a cipher means the stores that fit, and a limit of that size
+was the first thing to say and was said last, in a README, two commits
+and a pairing after it was built. The rule: a feature that holds for some
+stores is a different feature from the one asked for, and which of the
+two is being built is said before it is built; and a constraint a note
+calls the design's is checked for being the cheapest thing to have
+written.
+
+What it takes instead is the readers asking for bytes before they read
+them. `Blob` borrowed its key section whole at every lookup and
+`flatindex` addressed into the borrow, which over a mapped file is the
+kernel's paging and over anything else is the section made present whole.
+A source now says that it lends by the piece (`Bytes::piecewise`); `Blob`
+holds such a source's sections by offset (`Sec::Pieces`); and
+`flatindex`'s readers take any `Sect`, the slice, over which they are the
+code they were, or `Pieces`, each read of which is a `slice_at` of the
+range it wants. The record parsers are not generic and there is still one
+of each: a section by the piece hands them a window that holds the
+record, the piece the offset lies in and then more, which is sound
+because a parse that succeeds has read only bytes it asked the window
+for. `tests/blob.rs` holds the readers to it with a source that lends a
+copy of exactly the range asked for, and counts what it was asked for,
+since a reader that asked for its sections whole would agree on every
+answer too. The engine names one reader type as before: a paged mapping
+is a `MmapBytes` whose lendable length is zero, so its every `slice_at`
+fails the bounds check a mapped file's passes and goes round by the pager
+(`slice_slow`), and nothing in `db.rs` knows which it holds.
+
+The plain store's price was counted, not assumed: `bench/examples/
+read_only.rs supdb 100000 1 n-none` under callgrind with the toggle the
+profiling section names, built at the commit before and at this one. The
+first count read twenty-two instructions a point read more, and the
+annotation named `Blob::flat`, out of line where it had been inlined: one
+arm of the match it reads through built an error. With that arm out of
+line the count is five more in eight hundred and fifty, the one test of
+whether the store has a pager, where a read under a cipher leaves for a
+path of its own (`Reader::read_all_paged`), out of line. That path takes
+its callback as the plain one does, generic: handed it behind a pointer,
+to be compiled once, a scan paid twenty-five instructions an entry for
+the call. The same count under the cipher read 450 more than its twin in
+the clear and then 230: a page-size `sysconf` on every read, inside the
+test of whether the cache is crowded, and a divide by a field where the
+divisor is a constant. The rule is this file's already: a path "behind a
+flag" is counted with the flag off before it is called free, and with it
+on before it is called cheap.
+
+The cache (`src/db/pager.rs`) is a file as a shared mapping of a memory
+file its plaintext's length, a state a chunk, and the envelope the chunks
+are decrypted from. A chunk is a stored page less its tag, so two chunks
+share a page of plaintext and what is given back is a unit, the least
+run of chunks that is whole pages, 256 of them. What makes giving back
+safe is the reader table. A reader holds what it was lent for the length
+of its operation and nothing says where, so the evictor marks a unit's
+chunks, moves the table's epoch on, and frees once no reader is pinned
+before the move (`PagerGrace`, `Readers::oldest_lent`), which is the rule
+a retired state is freed by; a reader that meets a marked chunk takes the
+unit back, or waits for its pages to be gone and decrypts again.
+Addresses do not move, so a range asked for again after a rest is the
+same bytes in the same place: a walk that rests keeps its borrows by
+asking for them again, and copies nothing. Under debug assertions a read
+with nothing pinned panics (`Paged::ensure`), which is how the threads
+that read with no slot were found, and they hold the cache explicitly
+(`pager::Hold`): a merge over its inputs, the open over its segments.
+
+A pin is longer than a read, and every place that was true held the
+cache past its budget. Each was found the same way, by the count of what
+the evictor waited for (`PagerCounts::longest_wait_us`) and, for the
+length of the hunt, a backtrace kept at each pin and printed for the slot
+being waited on; none was found by reading, and two readings that came
+first were wrong. In the order they fell: a snapshot's handle is pinned
+for its life, so it says at each read what it holds from (`Slot::page`);
+a scan of no limit is one read, so it is walked a thousand keys at a
+time over the one pinned state, with a rest between (`scan_rested`); a
+merge kept every output in memory until its last, so each is given its
+envelope where it is finished (`Emitter::leave`); the writer's flush and
+settle are pinned for as long as the merges they wait for run, and the
+segment work for as long as it joins a thread or syncs a manifest, so a
+wait says it holds nothing (`Reader::unlent`, `unlend`); the landing of a
+merge compares a key a block of the old partition and the new, to carry
+the block cache's copies across (`Db::same_blocks`), which for records of
+a hundred bytes is most of the pages of both, read on the segment work's
+one pin -- the store read into a cache an eighth of its size in fifty
+milliseconds, at every merge -- so it rests as it goes and answers no
+once the cache is crowded; the block cache's builders read every block a
+burst dirtied under one pin, and give their forms up there
+(`Reader::abandon_asked`); and merges read their inputs in order at the
+cipher's rate, hundreds of megabytes a second, so whatever stalled the
+evictor for a few milliseconds, they had filled the cache by then, and a
+reader past the crowding line waits for the evictor, briefly and with an
+end (`Pager::breathe`). The rule: under a cache the engine fills itself,
+a pin is priced by what anyone reads while it stands, since the evictor
+waits for the oldest; a wait is the one place code not written for it can
+say it holds nothing; and the instrument is a count of the longest wait
+with the name of who was waited for, built before the first guess.
+
+A chunk that fails its tag is found where it is read, not at the open,
+and the readers' answers are `Option`s in which bytes that did not read
+and a key that is not there look alike: a search treats a record that
+will not decode as "not less", and a lookup a slot that will not read as
+absent. So the pager remembers the first failure and every read of the
+store answers with it from then on (`Pager::check`), asked at the read's
+end. A merge asks before it names its outputs (`vault::check`): one that
+read no values for a key writes the key without them and deletes its
+inputs. `tests/cipher.rs` holds the property restated -- a byte changed
+anywhere is a store refused at its open, a store that refuses to be read,
+or a state the store acknowledged -- and requires each of the outcomes to
+occur.
+
+Four things building it, each a shape. A memory file had two views. The
+envelope's naming and the file's hand-over to the cache took the table's
+lock one after the other, and a reader that mapped the file between them
+made its view and took the memory file from every entry, so the
+hand-over found no entry over the file, made a second view for nobody,
+and the evictor, giving back a megabyte of that view in the instant
+before it was dropped, punched the memory file under the first: a
+segment's hash slots read as zeroes, its key as absent, a delete in it
+unseen, one seed in two hundred of the fuzz under a cache of sixteen
+kilobytes, with every file well-formed. The two are one critical section
+(`Vault::settled`), and a second view of one memory file panics under
+debug assertions. A reader waited for the evictor while holding what the
+evictor waited for: it moved a chunk to busy, found the unit's pages
+going, and waited for them with the chunk still busy, where the evictor
+waits for no chunk to be busy before it lets them go; found reading the
+two loops side by side, since the fuzz had not met it. The reader table
+was handed to the cache after the store's threads were started, so a
+thread that read in between read under a pin nobody waited for; it is
+handed over where the table is made. And the evictor's margin was eight
+megabytes at least, which under a budget of two was every pass giving
+back everything: a floor written for a budget of gigabytes and tested
+under one of megabytes is two different constants.
+
+What holds it: the pager's unit tests under a stand-in cipher (a range is
+the plaintext and nothing else is decrypted, nothing goes under a hold, a
+rest gives way and the range asked again is the same bytes, threads read
+the plaintext while the cache turns over, a changed chunk poisons, a file
+adopted stays until it has its envelope);
+`a_store_larger_than_its_cache_reads_as_itself_within_it`, a store nine
+times its cache through a load, a scan of the whole of it, four reader
+threads beside a writer that flushes, and a reopen, with the cache's peak
+held to its budget and a fixed slack throughout, the open held to a
+handful of chunks a file, and the process to no descriptor for a file;
+and the differential fuzz under a cache of sixteen kilobytes
+(`fuzz_range_under_a_cipher_that_does_not_fit_its_cache` in the gate,
+`ZFUZZ_CIPHER=1 ZFUZZ_CIPHERCACHE=16384` by hand, with `ZFUZZ_CACHE=all
+ZFUZZ_OPTVARY=1` for the block cache's paths), which asserts that the
+cache turned over, since a run under a small cache that gave nothing
+back is a run of the other test.
 
 The engine reaches its files through `vault::` (`create`, `open`, `map`,
 `rename`, `hard_link`, `remove_file`, `names`, `len`, `exists`,
@@ -1126,7 +1272,8 @@ itself, a record a commit and a slot a publish. A new kind of file is
 therefore safe before anyone has thought about it, and lost at the close
 until someone has.
 
-An fsync of a memory file is of nothing, so every durability the engine
+A file being written is a memory file, and an fsync of a memory file is
+of nothing, so every durability the engine
 takes from an fsync of a file that is not the log or the manifest is one a
 store under a cipher gets another way, and there were three. A segment
 before the manifest that names it: the manifest's bytes are made by
@@ -1218,7 +1365,8 @@ adopted where the directory held none; and the compact form left on,
 which the door had made harmless -- its builds failed at "not a
 directory" and the store went on -- so the test counts the builds begun.
 
-What it costs was read off pairings against the same store in the clear,
+What the first shape cost was read off pairings against the same store
+in the clear,
 `supdb-cipherbase`, which runs with the options a cipher fixes and no
 cipher (`bench/scripts/pair.sh supdb-cipher supdb-cipherbase 300000`, and
 at 100000; `bench/DESIGN.md`), and against `supdb` for what the mode costs
@@ -1262,13 +1410,67 @@ unresolved in the durable one, with the threaded passes after it level;
 with megabyte folios allowed for shared memory
 (`/sys/kernel/mm/transparent_hugepage/hugepages-1024kB/shmem_enabled`) it
 read 0.93x and unresolved, and a merge that lands later under the cipher
-would do the same to a pass of fifty milliseconds. An open decrypts the
-store, which `cargo run --release --example cipher_store` times beside a
-plain store's open; it halved when the files were decrypted several at
-once (`Vault::preload`), and is still the store's size over a few cores'
-rate. A store under a cipher also holds a descriptor a file for the
-file's life, two a segment, where a plain store holds almost none: a
-store of tens of gigabytes passes a limit of 1024, and the error says so.
+would do the same to a pass of fifty milliseconds. An open decrypted the
+store and a store held a descriptor a file for the file's life, two a
+segment; both went with that shape.
+
+What the second shape costs was read the same way, and in core it costs
+more than the first, which is the trade: `pair.sh supdb-cipher
+supdb-cipherbase 300000` read, in both sittings, the loads where they
+were, 0.85-0.88x; the single-threaded pass of point reads at 0.92x with
+the threaded passes unresolved; the scan passes at 0.84-0.96x and
+0.87-0.89x threaded; the lag sweep's scans at 0.85-0.91x over the drained
+store, 0.73-0.77x after the one- and the ten-percent burst and level to
+0.89x after the full rewrite; E at 0.80-0.83x; and the other mixes level
+or unresolved. The count named the point read's share: 229 instructions
+over its twin's 841 (`bench/examples/read_only.rs supdb-cipher 100000 1
+n-none` beside `supdb-cipherbase`, the toggle as above), spread over the
+asks -- each a call through the source's pointer and a load of a chunk's
+state -- the window a record is parsed in, the look at whether the cache
+is crowded and the look at whether a read failed, with no one of them a
+fifth of it. The scans were at 0.25-0.45x of the twin before they were
+given a window of their own: a scan by the piece asked for each record's
+key, its extents and its values apiece, and it asks for sixty-four
+records' span at once now and walks the window with the loop a slice is
+walked by (`Blob::scan_windows`, `walk_fixed!`). The window's loop had to
+be a function out of line: written into `scan_at` beside the slice's, it
+cost the plain scan five instructions an entry, by what the optimizer
+then left out of line, and out of it the plain scan counts 0.7% over the
+commit before. What reads by the rank still asks by the record -- the
+sparse forms' walks, the merge path, the cursor -- and that is the
+bursts' cells and E, and an open item in `ROADMAP.md`.
+
+Out of its cache it was priced against itself: `pair.sh supdb-cipher64
+supdb-cipher 1000000 --reps 4`, a million keys under a cache of 64 MiB
+against the same store under a cache that holds it. Point reads 0.10-0.16x,
+the scan passes 0.15-0.27x, the mixes that read 0.23-0.57x and A and F
+0.69-0.88x, the shuffled load 0.76-0.80x and the ordered load level, and
+the pass after the full rewrite at a twentieth. That last cell is the
+block cache's builders giving their forms up under a crowded cache, and
+the counters say so (`SUPDB_LAG_COUNTERS=1 SUPDB_SCAN_OPS=1 bench ab
+--arms supdb-cipher64,supdb-cipher --size 1000000 --passes load,lag
+--reps 1`, the `lagcounters` line and the `lagcounterscipher` line under
+it): over the rewriting burst the upkeep thread built eighty blocks
+where its twin's built fifteen thousand, so the pass's scans built
+twelve thousand themselves, each from the partition and three pieces,
+136,000 first touches on the scanning thread against 25-33,000 at the
+points before, beside a merge turning the same cache over. A miss in
+those cells is a chunk copied out of the
+envelope's mapping, decrypted in place into a fresh page of the memory
+file, and a megabyte given back behind it. At the points before the
+full rewrite the envelope is in the kernel's page cache (`lagdev` reads
+nothing from the device) and the cells price a decryption and a first
+touch a miss, five microseconds a point read here; in the pass after it
+the process read 53 MB back from the device, a sleep a scan, since an
+envelope whose plaintext the cache took whole is dropped from the page
+cache where it is written and the cache had given the plaintext back
+since. The budget is of the files' plaintext. The block cache held more than the
+64 MiB at that pairing's end (`cache_bytes_at_end`), as it holds what it
+holds beside a plain store, under its own bound (`scan_cache_bytes`),
+and a caller who sets one budget for a store's memory has to set both.
+`cargo run --release --example cipher_store` prints an open's time and
+the cache's counts through a pass of reads and a scan, for a cache of
+any size.
 The rules: a second way to hold the same bytes is priced on the first
 operation of every pass as well as on its rate, since a mapping's first
 touch is where two kinds of memory differ; a write slower than its cipher

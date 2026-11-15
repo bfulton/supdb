@@ -93,11 +93,12 @@ fn memory_files() -> (usize, usize) {
     (fds, maps)
 }
 
-/// A store under a cipher keeps its files in memory files
-/// (`Encryption::Cipher`), which are the process's until their last
-/// descriptor and their last mapping go: an open store holds some, and a
-/// closed one none, of either. Called from the one test, since the count is
-/// the process's.
+/// A store under a cipher reads its files through mappings of memory
+/// files (`Encryption::Cipher`, `db::pager`), which are the process's until
+/// their last descriptor and their last mapping go. An open store, with
+/// everything it wrote in the directory as its envelope, maps its files
+/// and holds a descriptor for none of them; a closed one has neither.
+/// Called from the one test, since the count is the process's.
 fn a_closed_store_under_a_cipher_holds_no_memory_file() {
     let d = std::env::temp_dir().join(format!("supdb-next-mapped-cipher-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -126,7 +127,7 @@ fn a_closed_store_under_a_cipher_holds_no_memory_file() {
         let handle = db.reader().unwrap();
         let (fds, maps) = memory_files();
         assert!(
-            fds > 0 && maps > 0,
+            fds == 0 && maps > 0,
             "an open store's files: {fds} held, {maps} mapped"
         );
         drop(db);

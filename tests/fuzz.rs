@@ -67,6 +67,9 @@
 //! - `ZFUZZ_MERGEPAR=n`: both stores run up to `n` partition merges at
 //!   once over disjoint ranges (`Options::merge_parallel`); a flag and not
 //!   a draw.
+//! - `ZFUZZ_CIPHERCACHE=n`, with `ZFUZZ_CIPHER`: the `z` store's cache of
+//!   plaintext is `n` bytes (`StoreCipher::cache_bytes`), which for a small
+//!   `n` is a store that does not fit it.
 //! - `ZFUZZ_CIPHER=1`: the `z` store is kept under a cipher
 //!   (`Encryption::Cipher`) and `r` in the clear, so a store whose files are in
 //!   memory and whose directory is sealed is read against the model and
@@ -129,6 +132,9 @@ thread_local! {
     /// test. A thread's and not the process's, since the tests of a binary
     /// run beside each other.
     static CIPHER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The cache a store under a cipher is given, in bytes, for the test
+    /// that runs the range under one too small for its stores.
+    static CIPHER_CACHE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn under_cipher() -> bool {
@@ -396,12 +402,24 @@ fn opts_z(c: &Cfg) -> Options {
 /// as it is otherwise.
 fn with_cipher(mut o: Options) -> Options {
     if under_cipher() {
-        o.encryption = supdb::Encryption::Cipher(supdb::StoreCipher::new(
-            common::Gcm::new(&[0x5a; 32]),
-            common::Gcm::new,
-        ));
+        let mut c = supdb::StoreCipher::new(common::Gcm::new(&[0x5a; 32]), common::Gcm::new);
+        // The cache the store reads its files through, where the run names
+        // one: a few kilobytes is less than any store here holds, so every
+        // read is of a chunk decrypted for it and given back behind it.
+        if let Some(bytes) = cipher_cache() {
+            c = c.cache_bytes(bytes);
+        }
+        o.encryption = supdb::Encryption::Cipher(c);
     }
     o
+}
+
+/// `ZFUZZ_CIPHERCACHE`, or what the test running the range set.
+fn cipher_cache() -> Option<u64> {
+    match CIPHER_CACHE.get() {
+        0 => env_u64("ZFUZZ_CIPHERCACHE"),
+        n => Some(n),
+    }
 }
 
 fn key_pool(rng: &mut Rng, n: usize) -> Vec<Vec<u8>> {
@@ -737,6 +755,11 @@ struct Stats {
     /// Partition merges started beside another in flight, summed as
     /// `abandons` is: what says a run under `ZFUZZ_MERGEPAR` reached them.
     beside: u64,
+    /// Under a cipher: the megabytes of plaintext the `z` store's cache
+    /// gave back and the chunks it decrypted, summed over the store's
+    /// opens. What says a run under a small cache read through one.
+    evicted: u64,
+    fills: u64,
 }
 
 fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
@@ -785,9 +808,17 @@ fn cfg_line(c: &Cfg) -> String {
 fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, String> {
     let mut rng = Rng::new(seed);
     let cfg = pick_cfg(&mut rng, want_cache);
-    // A directory of its own for the range that runs under a cipher beside
-    // the plain one, over the same seeds.
-    let tag = format!("s{seed}{}", if CIPHER.get() { "c" } else { "" });
+    // A directory of its own for each range that runs beside the plain
+    // one over the same seeds: under a cipher, and under one with a cache
+    // too small for its stores.
+    let tag = format!(
+        "s{seed}{}",
+        match (CIPHER.get(), CIPHER_CACHE.get()) {
+            (false, _) => "",
+            (true, 0) => "c",
+            (true, _) => "cs",
+        }
+    );
     let (dz, dr) = (scratch(&format!("{tag}-z")), scratch(&format!("{tag}-r")));
     if verbose {
         eprintln!("seed {seed}: {cfg:?}");
@@ -817,6 +848,8 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         abandons: 0,
         bindings: 0,
         beside: 0,
+        evicted: 0,
+        fills: 0,
     };
     let mut fails: Vec<String> = Vec::new();
     let mut absent = absent_around(&pool, &mut rng);
@@ -997,6 +1030,10 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     st.abandons += z.upkeep_abandons() + r.upkeep_abandons();
                     st.bindings += z.cache_bindings() + r.cache_bindings();
                     st.beside += z.seal_waits().merges_beside + r.seal_waits().merges_beside;
+                    if let Some(c) = z.cipher_counts() {
+                        st.evicted += c.cache.evicted_units;
+                        st.fills += c.cache.fills;
+                    }
                     let clean = rng.chance(50) || !matches!(cfg.sync, SyncPolicy::Always);
                     if clean {
                         for op in staged.drain(..) {
@@ -1161,6 +1198,10 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     st.abandons += z.upkeep_abandons() + r.upkeep_abandons();
     st.bindings += z.cache_bindings() + r.cache_bindings();
     st.beside += z.seal_waits().merges_beside + r.seal_waits().merges_beside;
+    if let Some(c) = z.cipher_counts() {
+        st.evicted += c.cache.evicted_units;
+        st.fills += c.cache.fills;
+    }
     drop(z);
     drop(r);
     if ok {
@@ -1192,6 +1233,19 @@ fn fuzz_range_under_a_cipher() {
     run_range();
 }
 
+/// The range a third time, `z` under a cipher with a cache of sixteen
+/// kilobytes: a store that does not fit what it may hold of itself, every
+/// file of it read by the chunk, decrypted where it is read and given back
+/// behind the read, against the model and a plain store. What holds a
+/// store larger than its memory to the answers of one that fits.
+#[test]
+#[cfg(target_os = "linux")]
+fn fuzz_range_under_a_cipher_that_does_not_fit_its_cache() {
+    CIPHER.set(true);
+    CIPHER_CACHE.set(16 << 10);
+    run_range();
+}
+
 fn run_range() {
     let from = env_u64("ZFUZZ_FROM").unwrap_or(0);
     let to = env_u64("ZFUZZ_TO").unwrap_or(from + DEFAULT_SEEDS);
@@ -1204,6 +1258,7 @@ fn run_range() {
     let seeds: Vec<u64> = list.unwrap_or_else(|| (from..to).collect());
     let (mut bad, mut reopens, mut abandons, mut bindings, mut beside) =
         (Vec::new(), 0u64, 0u64, 0u64, 0u64);
+    let (mut evicted, mut fills) = (0u64, 0u64);
     for seed in seeds {
         match run_seed(seed, want_cache, verbose) {
             Ok(s) => {
@@ -1211,18 +1266,29 @@ fn run_range() {
                 abandons += s.abandons;
                 bindings += s.bindings;
                 beside += s.beside;
+                evicted += s.evicted;
+                fills += s.fills;
             }
             Err(e) => bad.push(format!("seed {seed}: {e}")),
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, cache units given back {evicted}, chunks decrypted {fills}, FAILURES {}",
         bad.len()
     );
     for b in &bad {
         eprintln!("FAIL: {b}");
     }
     assert!(bad.is_empty(), "{} seeds failed", bad.len());
+    // A run under a cache too small for its stores is a run of nothing
+    // unless the cache turned over: every chunk read was decrypted for the
+    // read and given back behind it, many times over.
+    if under_cipher() && cipher_cache().is_some_and(|b| b < 1 << 20) {
+        assert!(
+            evicted > 0 && fills > 0,
+            "a small cache gave nothing back: {evicted} units, {fills} chunks"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

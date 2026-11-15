@@ -562,6 +562,22 @@ fn counters_line(
     // tables and the published forms by their counts. The gap between the resident bytes and the sum of the
     // structures is slack, retention and everything uncounted, which the
     // lag sweep's peak is made of under a memory bound.
+    // The cache a store under a cipher reads through, over the window: the
+    // chunks decrypted and the megabytes given back in it, the reads that
+    // waited for a crowded cache, and what it held at the window's end
+    // beside the most it has held. Printed for the arms that have one.
+    if get(c1, "cipher_peak") > 0.0 {
+        eprintln!(
+            "{tag}cipher {arm} {point} fills {:.0} evicted_units {:.0} rescues {:.0} breaths {:.0} evictor_waited_ms {:.1} held_mb {:.0} peak_mb {:.0}",
+            d("cipher_fills"),
+            d("cipher_evicted_units"),
+            d("cipher_rescues"),
+            d("cipher_breaths"),
+            d("cipher_evictor_waited_us") / 1e3,
+            get(c1, "cipher_held_at_end") / (1u64 << 20) as f64,
+            get(c1, "cipher_peak") / (1u64 << 20) as f64,
+        );
+    }
     if tag == "lagcounters" {
         // SAFETY: mallinfo2 reads the allocator's own totals.
         #[cfg(all(target_os = "linux", target_env = "gnu"))]

@@ -390,6 +390,9 @@ pub struct OrdIndex {
     /// every eighth line of the file -- 60 us at three hundred thousand
     /// keys, a third of that scan.
     top: Vec<u64>,
+    /// The top level of a mapping that lends by the piece, read at the
+    /// first seek (`top`).
+    top_late: std::sync::OnceLock<Vec<u64>>,
 }
 
 impl OrdIndex {
@@ -399,16 +402,31 @@ impl OrdIndex {
     /// believed.
     pub fn open(path: &Path, keys: usize) -> Result<OrdIndex> {
         let map = crate::db::vault::map(path)?;
-        let b = &map.0[..];
-        if b.len() < HEADER + 4 {
+        // A mapping that lends by the piece (`Bytes::piecewise`: a store
+        // under a cipher's, whose bytes are decrypted as they are asked
+        // for) is read by the piece: its header here, and its heads as a
+        // seek reads them. Its checksum is not taken, since that would ask
+        // for the file whole and what such a source lends has passed a
+        // check of its own; and its top level, one head a stride and so a
+        // read of every page of the file, is left to the first seek
+        // (`top`).
+        let paged = map.piecewise();
+        let len = map.len() as usize;
+        if len < HEADER + 4 {
             return Err(bad("shorter than its header"));
         }
-        let body = b.len() - 4;
-        let crc = u32::from_le_bytes(b[body..].try_into().expect("four bytes"));
-        if crc32(&b[..body]) != crc {
-            return Err(bad("checksum does not match"));
+        let body = len - 4;
+        let whole = map.as_slice();
+        let head = map
+            .slice_at(0, HEADER)
+            .ok_or_else(|| bad("its header does not read"))?;
+        if !paged {
+            let crc = u32::from_le_bytes(whole[body..].try_into().expect("four bytes"));
+            if crc32(&whole[..body]) != crc {
+                return Err(bad("checksum does not match"));
+            }
         }
-        let rd = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().expect("eight bytes"));
+        let rd = |at: usize| u64::from_le_bytes(head[at..at + 8].try_into().expect("eight bytes"));
         if rd(0) != MAGIC {
             return Err(bad("wrong magic"));
         }
@@ -439,13 +457,17 @@ impl OrdIndex {
         if heads_at != HEADER || heads_at.checked_add(want) != Some(body) {
             return Err(bad("heads do not fill the file"));
         }
-        let top = (0..n)
-            .step_by(TOP_STRIDE)
-            .map(|i| {
-                let at = HEADER + i * HEAD;
-                u64::from_be_bytes(b[at..at + HEAD].try_into().expect("eight bytes"))
-            })
-            .collect();
+        let top = if paged {
+            Vec::new()
+        } else {
+            (0..n)
+                .step_by(TOP_STRIDE)
+                .map(|i| {
+                    let at = HEADER + i * HEAD;
+                    u64::from_be_bytes(whole[at..at + HEAD].try_into().expect("eight bytes"))
+                })
+                .collect()
+        };
         Ok(OrdIndex {
             map,
             n,
@@ -454,7 +476,47 @@ impl OrdIndex {
             prefix: None,
             advised: std::sync::atomic::AtomicBool::new(false),
             top,
+            top_late: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The top level: every `TOP_STRIDE`th head, in memory. Read at the
+    /// open for a mapped file. For a mapping that lends by the piece it is
+    /// read at the first seek and kept: `top` is empty until then, which
+    /// for a mapped file means an index of no keys, so the test a mapped
+    /// file pays is of a length it has loaded already.
+    #[inline]
+    fn top(&self) -> &[u64] {
+        if !self.top.is_empty() || self.n == 0 {
+            return &self.top;
+        }
+        self.top_late()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn top_late(&self) -> &[u64] {
+        self.top_late.get_or_init(|| {
+            (0..self.n)
+                .step_by(TOP_STRIDE)
+                .map(|i| self.head(i))
+                .collect()
+        })
+    }
+
+    /// A head that did not read: past the heads of a mapped file, which is
+    /// the index out of range it always was, or a piece its source could
+    /// not lend, which the source records (`db::pager`) and the read
+    /// answers for; the head is then zero and no rank is trusted by it.
+    #[cold]
+    #[inline(never)]
+    fn head_absent(&self, i: usize) -> u64 {
+        assert!(
+            self.map.piecewise(),
+            "head {i} of an ordered index of {}",
+            self.n
+        );
+        0
     }
 
     /// Every key of one length no more than the prefix plus eight bytes,
@@ -505,7 +567,7 @@ impl OrdIndex {
             return None;
         }
         let h = if rank.is_multiple_of(TOP_STRIDE) {
-            self.top[rank / TOP_STRIDE]
+            self.top()[rank / TOP_STRIDE]
         } else {
             self.head(rank)
         };
@@ -605,7 +667,10 @@ impl OrdIndex {
     #[inline]
     fn head(&self, i: usize) -> u64 {
         let at = HEADER + i * HEAD;
-        u64::from_be_bytes(self.map.0[at..at + HEAD].try_into().expect("eight bytes"))
+        match self.map.slice_at(at as u64, HEAD) {
+            Some(b) => u64::from_be_bytes(b.try_into().expect("eight bytes")),
+            None => self.head_absent(i),
+        }
     }
 
     /// `seek` within ranks `lo..hi`: the first rank there whose key is
@@ -641,7 +706,7 @@ impl OrdIndex {
             }
         }
         let h = head_of(key, self.pfx);
-        let t = lower_bound(&self.top, h);
+        let t = lower_bound(self.top(), h);
         Some(if t == 0 {
             (0, TOP_STRIDE.min(self.n))
         } else {
@@ -850,7 +915,7 @@ impl OrdIndex {
         // branch form mispredicted about half its eleven steps over the
         // 2,300 samples of a partition at 300k keys, and each miss cost
         // what a step costs three times over.
-        let t = lower_bound(&self.top, h);
+        let t = lower_bound(self.top(), h);
         // No sample below the query is the first head at or above it. Past
         // the last sample below it, the search runs to the next sample and
         // lands on it when every head between is below.
@@ -864,7 +929,9 @@ impl OrdIndex {
         // partition, and issued at once they cost one.
         if lo < hi {
             let at = HEADER + lo * HEAD;
-            crate::db::prefetch_lines(self.map.0[at..].as_ptr(), (hi - lo) * HEAD);
+            if let Some(heads) = self.map.as_slice().get(at..) {
+                crate::db::prefetch_lines(heads.as_ptr(), (hi - lo) * HEAD);
+            }
         }
         on_window(lo, hi);
         // The stride's heads searched with a mask a step, as the top

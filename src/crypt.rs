@@ -322,7 +322,7 @@ impl Header {
     }
 
     /// Where a chunk's ciphertext starts in the stored object.
-    fn stored_off(&self, chunk: u64) -> u64 {
+    pub(crate) fn stored_off(&self, chunk: u64) -> u64 {
         DATA_START + (chunk << self.chunk_shift)
     }
 
@@ -337,7 +337,7 @@ impl Header {
     }
 
     /// A chunk's nonce: the id's first eight bytes, then the chunk's index.
-    fn nonce(&self, chunk: u64) -> [u8; NONCE] {
+    pub(crate) fn nonce(&self, chunk: u64) -> [u8; NONCE] {
         let mut n = [0u8; NONCE];
         n[..8].copy_from_slice(&self.id[..8]);
         // `new` held the chunk count to what four bytes index.
@@ -430,7 +430,7 @@ where
 /// before a tag: long enough to be one, a header that parses, zeroes from
 /// the header to the first chunk, which no tag covers and a reader
 /// therefore looks at, and the length the header describes.
-fn checked_header<B: Bytes + ?Sized>(src: &B) -> Result<Header> {
+pub(crate) fn checked_header<B: Bytes + ?Sized>(src: &B) -> Result<Header> {
     // The header's page in one read.
     let mut head = [0u8; DATA_START as usize];
     if src.len() < DATA_START {
@@ -783,14 +783,14 @@ impl Drop for Filling<'_> {
 /// number. A header's chunk count and chunk length keep every offset under
 /// `2^56`.
 #[derive(Clone, Copy)]
-struct Per {
+pub(crate) struct Per {
     d: u64,
     m: u64,
     k: u32,
 }
 
 impl Per {
-    fn new(d: u64) -> Per {
+    pub(crate) fn new(d: u64) -> Per {
         let k = 56 + (64 - (d - 1).leading_zeros());
         Per {
             d,
@@ -801,7 +801,7 @@ impl Per {
 
     /// `n / d` and `n % d`, for `n` below `2^56`.
     #[inline]
-    fn of(&self, n: u64) -> (u64, usize) {
+    pub(crate) fn of(&self, n: u64) -> (u64, usize) {
         let q = ((u128::from(n) * u128::from(self.m)) >> self.k) as u64;
         (q, (n - q * self.d) as usize)
     }

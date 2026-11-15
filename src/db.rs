@@ -81,6 +81,7 @@ pub mod dirkey;
 // A store under a cipher the caller gives (`Encryption::Cipher`): its files in
 // memory, their envelopes in the directory, and the door the engine's file
 // operations go through to reach either.
+pub(crate) mod pager;
 pub mod vault;
 
 /// Write a segment's ordered index, and make it durable where `durable`
@@ -731,16 +732,19 @@ pub enum Encryption {
     /// Everything the store writes to its directory sealed under a cipher
     /// of the caller's (`vault`): the segments, the log, the manifest, and
     /// the names of the files, each authenticated, on any filesystem. The
-    /// store's plaintext is held in memory files, which is what a read
-    /// lends from as it lends from the page cache of a plain store, so
-    /// reads run the same code; the store has to fit in memory, an open
-    /// decrypts all of it, and ordered ingest goes through the log, the
-    /// compact form is off and the log's files are not recycled, whatever
-    /// the options say. Each of its files is a descriptor held open, two a
-    /// segment, so a large store wants the process's limit on open files
-    /// raised. `Db::create` makes a store under the cipher in an empty
-    /// directory; `Db::open` refuses a store that is not under it, and a
-    /// store under a cipher is refused where none is given.
+    /// store reads its files through a cache of plaintext of its own
+    /// (`StoreCipher::cache_bytes`), decrypting a chunk of a file where it
+    /// is first read and giving back what has not been read lately, as
+    /// the kernel's page cache does for a plain store: a store of any
+    /// size runs in the cache it is given, and an open decrypts only what
+    /// an open reads. A file's bytes are checked where they are decrypted,
+    /// so a file changed on the device is refused at the read that first
+    /// wants the changed bytes, with an error every operation after it
+    /// answers with too. Ordered ingest goes through the log, the compact
+    /// form is off and the log's files are not recycled, whatever the
+    /// options say. `Db::create` makes a store under the cipher in an
+    /// empty directory; `Db::open` refuses a store that is not under it,
+    /// and a store under a cipher is refused where none is given.
     Cipher(vault::StoreCipher),
 }
 
@@ -9562,6 +9566,24 @@ impl<T> Drop for Slab<T> {
     }
 }
 
+/// A store's reader table as its cache of plaintext asks of it
+/// (`pager::Grace`): the cache marks what it means to give back, moves the
+/// epoch on, and gives back once no reader is pinned before the move --
+/// the rule a retired state is freed by. Weak, since the cache is held by
+/// the segments the shared state holds.
+struct PagerGrace(std::sync::Weak<Shared>);
+
+impl pager::Grace for PagerGrace {
+    fn bump(&self) -> u64 {
+        self.0.upgrade().map_or(0, |s| s.readers.bump())
+    }
+    fn oldest(&self) -> u64 {
+        self.0
+            .upgrade()
+            .map_or(u64::MAX, |s| s.readers.oldest_lent())
+    }
+}
+
 /// The reader table: LMDB's shape. A reader handle owns a slot for its
 /// life and pins by storing the epoch it observed there; the writer
 /// bumps the epoch when it publishes a structure that replaces another,
@@ -9636,6 +9658,19 @@ fn membarrier_all_threads() {
 #[repr(align(128))]
 struct Slot {
     epoch: AtomicU64,
+    /// Under a cipher, the epoch this slot's reader last held nothing it
+    /// was lent of the store's files (`pager`), where that is later than
+    /// the epoch it is pinned at; zero where the pin says it all. The
+    /// pin holds a state, and may hold it long: a snapshot holds one for
+    /// its life, and a scan of no limit for its length. What the cache of
+    /// plaintext waits out is narrower, the reads that could still hold a
+    /// borrow into a file, so a snapshot's handle sets this at each read
+    /// and a long scan at each rest, and the cache reads it in place of
+    /// the pin (`Readers::oldest_lent`). `u64::MAX` is a slot that holds
+    /// nothing of any file though it is pinned: a snapshot between its
+    /// reads, or an operation of the writer or the segment work while it
+    /// waits for another thread (`Reader::unlent`).
+    page: AtomicU64,
     /// The handle's statistics, on this line rather than on the store's
     /// shared words: every scan through a handle bumped seven to
     /// thirteen shared counters and every form it took two more, and
@@ -9748,6 +9783,7 @@ impl Slot {
     const fn new() -> Slot {
         Slot {
             epoch: AtomicU64::new(0),
+            page: AtomicU64::new(0),
             scans: AtomicU64::new(0),
             blockpath: AtomicU64::new(0),
             unshaped: AtomicU64::new(0),
@@ -9852,6 +9888,57 @@ impl Readers {
         self.walk_pins()
     }
 
+    /// The oldest epoch a reader could still hold a borrow into one of the
+    /// store's files from: each slot's `page` where it has set one, and
+    /// its pin otherwise. What a store's cache of plaintext waits out
+    /// (`PagerGrace`); `oldest_pinned` is what a retired state waits out,
+    /// which a snapshot holds and a file's reader need not.
+    ///
+    /// A slot not pinned holds nothing. One pinned holds from its pin, or
+    /// from its `page` where that is later, and nothing where `page` is
+    /// `u64::MAX`. A `page` at or before the pin is one an earlier
+    /// operation of the slot left, since the epoch only rises and a rest
+    /// comes after the pin it rests: it is read as the pin, so nothing
+    /// has to clear it when an operation ends.
+    fn oldest_lent(&self) -> u64 {
+        self.sync_pins();
+        self.slots
+            .iter()
+            .filter_map(|s| {
+                let e = s.epoch.load(AtomicOrdering::SeqCst);
+                if e == 0 || e == u64::MAX {
+                    return None;
+                }
+                match s.page.load(AtomicOrdering::SeqCst) {
+                    u64::MAX => None,
+                    p => Some(p.max(e)),
+                }
+            })
+            .min()
+            .unwrap_or(u64::MAX)
+    }
+
+    /// `slot`'s reader holds nothing it was lent of the store's files
+    /// before now: `page` at the epoch as it stands, by the pin's own
+    /// protocol, and always fenced, since the cache's evictor issues no
+    /// barrier of its own before it reads this.
+    fn page_pin(&self, slot: usize) {
+        loop {
+            let e = self.epoch.load(AtomicOrdering::SeqCst);
+            self.slots[slot].page.store(e, AtomicOrdering::SeqCst);
+            if self.epoch.load(AtomicOrdering::SeqCst) == e {
+                return;
+            }
+        }
+    }
+
+    /// `slot`'s `page` set to `to`: zero for a slot whose pin says it all
+    /// again, `u64::MAX` for one that holds nothing of any file though it
+    /// is pinned -- a snapshot between its reads, an operation waiting.
+    fn page_set(&self, slot: usize, to: u64) {
+        self.slots[slot].page.store(to, AtomicOrdering::SeqCst);
+    }
+
     /// `oldest_pinned` for a sweep whose lowest tag is `lowest`: where the
     /// sweep fences for the pins (`asym`), the slots are read once without
     /// the barrier first, and a pin seen at an epoch below every tag means
@@ -9905,6 +9992,7 @@ impl Readers {
     }
 
     fn release(&self, slot: usize) {
+        self.slots[slot].page.store(0, AtomicOrdering::SeqCst);
         self.slots[slot].epoch.store(0, AtomicOrdering::SeqCst);
     }
 
@@ -9927,6 +10015,8 @@ impl Readers {
     /// precedes the barrier, in which case the sweep's bump is what it
     /// re-reads after, or follows it, in which case so does the store.
     fn pin(&self, slot: usize) {
+        pager::debug_pinned(true);
+
         if self.asym {
             loop {
                 let e = self.epoch.load(AtomicOrdering::Acquire);
@@ -9959,6 +10049,7 @@ impl Readers {
     /// Release suffices: a sweep's `oldest_pinned` wants the unpin to
     /// come after the reads it ends, and nothing here waits on it.
     fn unpin(&self, slot: usize) {
+        pager::debug_pinned(false);
         self.slots[slot]
             .epoch
             .store(u64::MAX, AtomicOrdering::Release);
@@ -11314,14 +11405,15 @@ fn ref_pack(off: u64, len: u32) -> u64 {
 /// the segment work moved to a thread of its own.
 /// What a store under a cipher runs with whatever it was asked for
 /// (`Encryption::Cipher`), each for the same reason: a file the engine makes
-/// durable by its own fsync is a memory file there, and the fsync is of
-/// nothing. Ordered ingest's run is a segment open for append and synced
-/// at every commit, so its batches go through the log, whose records the
-/// engine seals as it writes them. The compact form is a second copy of a
-/// partition for a store whose first does not fit the page cache, and a
-/// store under a cipher is held in memory whole. And a recycled log file
-/// is one written through before its first record, to be written again in
-/// place.
+/// durable by its own fsync as it writes it is a memory file there until
+/// it is finished, and the fsync is of nothing. Ordered ingest's run is a
+/// segment open for append and synced at every commit, so its batches go
+/// through the log, whose records the engine seals as it writes them. The
+/// compact form is a second copy of a partition, built from the first by
+/// a reader of the whole of it and attached by its bytes in the page
+/// cache, neither of which a file read by the piece through the store's
+/// own cache offers yet. And a recycled log file is one written through
+/// before its first record, to be written again in place.
 fn under_cipher(opts: &mut Options) {
     opts.direct_ingest = false;
     opts.zpages = ZPages::Off;
@@ -11748,7 +11840,12 @@ struct MergePlan {
 }
 
 fn compact_job(plan: MergePlan) -> Result<Vec<String>> {
-    compact_run(plan)
+    // A merge reads its inputs on a thread of its own, with no slot of the
+    // reader table: under a cipher it holds the store's cache for them
+    // (`pager::Hold`), and rests where its walk holds nothing it will not
+    // ask for again (`merge_ranks`, `merge_keys`).
+    let held = vault::hold(&plan.dir);
+    compact_run(plan, held.as_ref())
 }
 
 /// Cut the ranks `[from, to)`, whose keys lie in the fence `(lo, hi)`, at
@@ -12026,9 +12123,16 @@ impl<'a> Slicer<'a> {
 /// a rank and kept across the steps it does not advance in; without, every
 /// input's key is read again at every step, an input count's reads a key
 /// where the inputs a step advanced need one each.
+///
+/// `held` is the merge's hold on a cache its inputs are read through
+/// (`pager::Hold`, a store under a cipher): every `MERGE_REST` steps the
+/// walk rests it, which lets the cache give back what the steps before
+/// read, and asks again for the one thing it holds across a step, each
+/// input's key.
 fn merge_ranks(
     blobs: &[&Blob<MmapBytes>],
     cached: bool,
+    held: Option<&pager::Hold>,
     mut f: impl FnMut(&[u8], &[(usize, usize)]) -> Result<()>,
 ) -> Result<()> {
     let n: Vec<usize> = blobs.iter().map(|b| b.keys()).collect();
@@ -12047,8 +12151,17 @@ fn merge_ranks(
         cur.push(key(i, 0)?);
     }
     let mut tied: Vec<(usize, usize)> = Vec::with_capacity(blobs.len());
+    let mut steps = 0usize;
     loop {
-        if !cached {
+        steps += 1;
+        let rested = match held {
+            Some(h) if steps.is_multiple_of(MERGE_REST) => {
+                h.rest();
+                true
+            }
+            _ => false,
+        };
+        if !cached || rested {
             for (i, c) in cur.iter_mut().enumerate() {
                 *c = key(i, rank[i])?;
             }
@@ -12097,10 +12210,13 @@ fn merge_ranks(
 /// stand while another's is written; with `cached` a buffer is filled
 /// once a rank, at its input's advance, as `merge_ranks` keeps its keys,
 /// and without, every input's at the head of every step.
+/// The buffers are the walk's own, so a rest of `held` (`merge_ranks`)
+/// has nothing to ask for again.
 fn merge_keys(
     blobs: &[&Blob<MmapBytes>],
     ords: &[Option<&crate::ordindex::OrdIndex>],
     cached: bool,
+    held: Option<&pager::Hold>,
     mut f: impl FnMut(&[u8], &[(usize, usize)]) -> Result<()>,
 ) -> Result<()> {
     let n: Vec<usize> = blobs.iter().map(|b| b.keys()).collect();
@@ -12128,7 +12244,14 @@ fn merge_keys(
         have[i] = fill(i, 0, &mut bufs[i])?;
     }
     let mut tied: Vec<(usize, usize)> = Vec::with_capacity(blobs.len());
+    let mut steps = 0usize;
     loop {
+        steps += 1;
+        if let Some(h) = held {
+            if steps.is_multiple_of(MERGE_REST) {
+                h.rest();
+            }
+        }
         if !cached {
             for i in 0..blobs.len() {
                 have[i] = fill(i, rank[i], &mut bufs[i])?;
@@ -12168,6 +12291,29 @@ fn merge_keys(
         }
     }
 }
+
+/// `Reader::unlend`'s guard: the slot lent to again from where it drops.
+struct Unlent(Option<(std::sync::Arc<Shared>, usize)>);
+
+impl Drop for Unlent {
+    fn drop(&mut self) {
+        if let Some((shared, slot)) = &self.0 {
+            shared.readers.page_pin(*slot);
+        }
+    }
+}
+
+/// The keys of a scan between two rests, in a store under a cipher
+/// (`Reader::scan_rested`): what a scan is lent of the store's files it
+/// holds until its next rest, so this many keys' records and values are
+/// the most a scan of any length keeps the cache from giving back.
+const SCAN_REST: usize = 1024;
+
+/// The steps of a merge's walk between two rests of its hold on the
+/// store's cache (`merge_ranks`): what a step reads stays lent until the
+/// next rest, so this many keys' records and values are the most a merge
+/// keeps the cache from giving back.
+const MERGE_REST: usize = 256;
 
 /// One output of a merge: the ranks it holds, the fence it must contain,
 /// and its names on disk.
@@ -12270,6 +12416,13 @@ impl Emitter<'_> {
             let p = &self.pieces[self.pi];
             write_ord(self.dir, &p.name, &ord, self.ord_durable)?;
             vault::rename(&p.tmp, self.dir.join(&p.name))?;
+            // Under a cipher the piece's envelope is written now, where a
+            // plain merge's writer has just fsynced the piece, and not
+            // with the merge's other outputs at its end: a piece with its
+            // envelope is the cache's to hold or to let go
+            // (`Vault::settled`), and a merge that kept every output in
+            // memory until its last would hold what it rewrote, whole.
+            vault::persist_one(self.dir, &p.name)?;
             self.out.push(p.name.clone());
             self.pi += 1;
         }
@@ -12314,7 +12467,7 @@ impl Emitter<'_> {
     }
 }
 
-fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
+fn compact_run(plan: MergePlan, held: Option<&pager::Hold>) -> Result<Vec<String>> {
     let MergePlan {
         dir,
         inputs,
@@ -12378,7 +12531,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     // holds only what the slices are taken from (`Slicer`).
     let mut slicer = Slicer::new(fences.as_deref(), parts, max_keys);
     let all: Vec<Vec<u8>> = if cursors {
-        merge_keys(&blobs, &ords, walk_cached, |k, _| {
+        merge_keys(&blobs, &ords, walk_cached, held, |k, _| {
             slicer.push(k);
             Ok(())
         })?;
@@ -12489,7 +12642,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         dropped_to[i] = to;
     };
     if cursors {
-        merge_ranks(&blobs, walk_cached, |k, tied| {
+        merge_ranks(&blobs, walk_cached, held, |k, tied| {
             let mut start = 0usize;
             let mut live = 0u64;
             for (j, &(i, rank)) in tied.iter().enumerate() {
@@ -12516,7 +12669,13 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
             })
         })?;
     } else {
-        for k in &all {
+        for (n, k) in all.iter().enumerate() {
+            // Nothing read for the key before is read again.
+            if let Some(h) = held {
+                if n.is_multiple_of(MERGE_REST) {
+                    h.rest();
+                }
+            }
             let k = k.as_slice();
             let mut found: Vec<(usize, crate::index::Exts<'_>, &[u8])> =
                 Vec::with_capacity(blobs.len());
@@ -12555,6 +12714,10 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     out.extend(empties);
     // A merge's outputs under a cipher: their envelopes, on this thread,
     // where a plain merge's writer fsynced each.
+    // A merge that read a file that did not read has written what it was
+    // given, a key short of its values or a rank short of its key, and
+    // its outputs replace its inputs: refused here, before they are named.
+    vault::check(&dir)?;
     vault::persist(&dir, &Db::with_ords(&out))?;
     vault::sync_dir(&dir)?;
     steps.step("finish");
@@ -12631,6 +12794,9 @@ fn merge_open_inputs(
 /// tombstone is written as the tombstone alone, which is what a seal
 /// writes for a deleted key.
 fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
+    // As `compact_job` holds the store's cache for a partition merge.
+    let held = vault::hold(&plan.dir);
+    let held = held.as_ref();
     let TierPlan {
         dir,
         inputs,
@@ -12652,7 +12818,7 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
     let opened = merge_open_inputs(&dir, &inputs, &opts, verify_inputs, "tier")?;
     let blobs: Vec<&Blob<MmapBytes>> = opened.iter().collect();
     let mut total = 0usize;
-    merge_ranks(&blobs, walk_cached, |_, _| {
+    merge_ranks(&blobs, walk_cached, held, |_, _| {
         total += 1;
         Ok(())
     })?;
@@ -12684,7 +12850,7 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         w: None,
         out: Vec::new(),
     };
-    merge_ranks(&blobs, walk_cached, |k, tied| {
+    merge_ranks(&blobs, walk_cached, held, |k, tied| {
         let mut start = 0usize;
         let mut live = 0u64;
         let mut tomb = false;
@@ -12712,6 +12878,9 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         })
     })?;
     let out = em.finish(total)?;
+    // As `compact_run` refuses outputs written from a file that did not
+    // read.
+    vault::check(&dir)?;
     vault::persist(&dir, &Db::with_ords(&out))?;
     vault::sync_dir(&dir)?;
     Ok(out)
@@ -14222,6 +14391,11 @@ fn z_auto_inert(opts: &Options) -> bool {
 
 struct Shared {
     state: AtomicPtr<State>,
+    /// The cache a store under a cipher reads its files through
+    /// (`pager::Pager`), and nothing for any other store: what a read asks
+    /// at its end, since a file that did not read answers as a key that
+    /// is not there (`Reader::sound`).
+    pager: Option<std::sync::Arc<pager::Pager>>,
     /// The reader table: slots for reader handles, and the epoch the
     /// writer bumps at each publish.
     readers: Readers,
@@ -15208,6 +15382,13 @@ pub struct Reader {
     /// the first unpinned when the second ends.
     depth: std::cell::Cell<u32>,
     isolation: std::cell::Cell<Isolation>,
+    /// Whether this handle's snapshot is one its caller took
+    /// (`snapshot`), in a store under a cipher: then the handle holds
+    /// nothing of the store's files between its reads, and says so to the
+    /// cache (`Slot::page`). The engine's own uses of a held state
+    /// (`pin_at`, the keeper's tick) read under their pin throughout and
+    /// leave this off.
+    page_snap: std::cell::Cell<bool>,
     /// The state pinned by `snapshot`, or null: what `state` answers
     /// instead of the writer's latest while it is held. An atomic only
     /// so the handle is `Send`; one thread touches it.
@@ -17583,7 +17764,16 @@ impl Reader {
         }
         if let Some(slot) = self.slot {
             match self.isolation.get() {
-                Isolation::Snapshot => {}
+                // The state was pinned when the snapshot was taken, and
+                // stays so; what this read may be lent of the store's
+                // files it is lent from here (`Slot::page`), where there
+                // is a cache that would otherwise wait for the snapshot
+                // to end before it gave anything back.
+                Isolation::Snapshot => {
+                    if self.page_snap.get() {
+                        self.shared.readers.page_pin(slot);
+                    }
+                }
                 Isolation::Latest => {
                     self.shared.readers.pin(slot);
                     let p = self.shared.state.load(AtomicOrdering::Acquire);
@@ -17662,6 +17852,9 @@ impl Reader {
                 self.held
                     .store(std::ptr::null_mut(), AtomicOrdering::Relaxed);
                 self.shared.readers.unpin(slot);
+            } else if self.page_snap.get() {
+                // Between a snapshot's reads nothing of a file is held.
+                self.shared.readers.page_set(slot, u64::MAX);
             }
         }
     }
@@ -17951,6 +18144,13 @@ impl Reader {
         self.len_bound.set(len);
         self.wm.set(wm);
         self.isolation.set(Isolation::Snapshot);
+        // As the store's cache of plaintext is to see it (`Slot::page`):
+        // holding nothing of any file until its next read. Not for a
+        // snapshot taken inside a read, which is lent what that read is.
+        if self.shared.pager.is_some() && self.depth.get() == 0 {
+            self.page_snap.set(true);
+            self.shared.readers.page_set(slot, u64::MAX);
+        }
     }
 
     /// PROTOTYPE: hold the state of generation `gen` at the commit `at`
@@ -17988,6 +18188,10 @@ impl Reader {
             .store(std::ptr::null_mut(), AtomicOrdering::Relaxed);
         self.isolation.set(Isolation::Latest);
         self.shared.readers.unpin(slot);
+        // After the unpin: the slot's pin says it all again.
+        if self.page_snap.replace(false) {
+            self.shared.readers.page_set(slot, 0);
+        }
     }
 
     fn segs(&self) -> &[std::sync::Arc<Seg>] {
@@ -19563,7 +19767,43 @@ impl Reader {
         }
     }
 
-    pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
+    pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], f: F) -> Result<u64> {
+        if let Some(p) = &self.shared.pager {
+            return self.read_all_paged(p, key, f);
+        }
+        self.read_all_in(key, f)
+    }
+
+    /// `read_all` in a store under a cipher: a wait for a crowded cache
+    /// before the read (`breathe`), and after it the failure a file of the
+    /// store has met, if one has (`pager::Pager::check`) -- a chunk that
+    /// fails its tag reads as bytes that are not there, which to the index
+    /// is a key that is not there, and an answer built on that is not one
+    /// to give. Out of line, so a plain store's read is the read and the
+    /// one test that sent it there. Generic over the callback as the read
+    /// is: taken behind a pointer, to compile this path once, every value
+    /// read cost a call through it, twenty-five instructions an entry of
+    /// a scan whose whole walk is a hundred and thirty.
+    #[inline(never)]
+    fn read_all_paged<F: FnMut(&[u8])>(&self, p: &pager::Pager, key: &[u8], f: F) -> Result<u64> {
+        self.breathe(p);
+        let r = self.read_all_in(key, f);
+        p.check().and(r)
+    }
+
+    /// A read of a store under a cipher, about to begin: where the cache
+    /// it reads through is well past its budget, a short wait for it
+    /// first (`pager::Pager::breathe`), unless this handle is inside a
+    /// read already and so holds what the evictor would be waiting for.
+    #[inline]
+    fn breathe(&self, p: &pager::Pager) {
+        if p.crowded() && self.depth.get() == 0 {
+            p.breathe();
+        }
+    }
+
+    #[inline(always)]
+    fn read_all_in<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
         let _entered = self.enter();
         self.advise(true);
         self.note_read(false);
@@ -19924,7 +20164,157 @@ impl Reader {
         snap
     }
 
-    pub fn scan<F: FnMut(&[u8], &[u8])>(
+    pub fn scan<F: FnMut(&[u8], &[u8])>(&self, from: &[u8], limit: usize, f: F) -> Result<usize> {
+        if let Some(p) = &self.shared.pager {
+            return self.scan_paged(p, from, limit, f);
+        }
+        self.scan_in(from, limit, f)
+    }
+
+    /// `scan` in a store under a cipher, as `read_all_paged` is `read_all`
+    /// there, and walked with rests where it is long (`scan_rested`).
+    #[inline(never)]
+    fn scan_paged<F: FnMut(&[u8], &[u8])>(
+        &self,
+        p: &pager::Pager,
+        from: &[u8],
+        limit: usize,
+        f: F,
+    ) -> Result<usize> {
+        self.breathe(p);
+        let r = if limit > SCAN_REST {
+            self.scan_rested(from, limit, f)
+        } else {
+            self.scan_in(from, limit, f)
+        };
+        p.check().and(r)
+    }
+
+    /// `wait` run with nothing of the store's files lent to this handle's
+    /// operation, as far as the store's cache of plaintext is to know
+    /// (`Slot::page`): for a wait on another thread inside an operation
+    /// that stays pinned through it -- the writer's for a seal's landing
+    /// or the segment work's answer, the segment work's for a seal's or a
+    /// merge's thread. An operation holds its pin for its length, and the
+    /// cache gives nothing back that a pinned reader could hold; a flush
+    /// or a settle is pinned for as long as the merges it waits for run,
+    /// and with its pin read as a reader's the cache gave nothing back
+    /// until it ended: a store of sixteen megabytes under a cache of two
+    /// held all of itself through its load. Nothing read before the wait
+    /// is read after it without being asked for again, which a wait for
+    /// another thread's work is the one place it is safe to say of code
+    /// that was not written to it. A plain store's wait is the wait.
+    fn unlent<R>(&self, wait: impl FnOnce() -> R) -> R {
+        let slot = self
+            .slot
+            .or(self.pin_slot.filter(|_| self.opts.writer_pins));
+        match (&self.shared.pager, slot) {
+            (Some(_), Some(slot)) if self.depth.get() > 0 && !self.page_snap.get() => {
+                self.shared.readers.page_set(slot, u64::MAX);
+                let r = wait();
+                self.shared.readers.page_pin(slot);
+                r
+            }
+            _ => wait(),
+        }
+    }
+
+    /// A point inside an operation of this handle where it holds nothing
+    /// it was lent of the store's files, as `Slot::page` is to say it,
+    /// and whether the store's cache is well past its budget
+    /// (`pager::Pager::crowded`), for a walk that would rather stop than
+    /// read on. Nothing, and false, for a plain store.
+    fn rest(&self) -> bool {
+        let slot = self
+            .slot
+            .or(self.pin_slot.filter(|_| self.opts.writer_pins));
+        match (&self.shared.pager, slot) {
+            (Some(p), Some(slot)) if self.depth.get() > 0 && !self.page_snap.get() => {
+                self.shared.readers.page_pin(slot);
+                p.crowded()
+            }
+            (Some(p), _) => p.crowded(),
+            _ => false,
+        }
+    }
+
+    /// `unlent` as a guard, for a step that is all file operations and
+    /// takes the handle's owner by `&mut`: a manifest written and synced,
+    /// names unlinked. Each is a wait on the device, milliseconds, pinned
+    /// throughout.
+    fn unlend(&self) -> Unlent {
+        let slot = self
+            .slot
+            .or(self.pin_slot.filter(|_| self.opts.writer_pins));
+        match (&self.shared.pager, slot) {
+            (Some(_), Some(slot)) if self.depth.get() > 0 && !self.page_snap.get() => {
+                self.shared.readers.page_set(slot, u64::MAX);
+                Unlent(Some((self.shared.clone(), slot)))
+            }
+            _ => Unlent(None),
+        }
+    }
+
+    /// `scan` for a scan of more than `SCAN_REST` keys in a store under a
+    /// cipher: the same scan, over the one state and at the one commit
+    /// this read pinned, walked `SCAN_REST` keys at a time with a rest
+    /// between (`Slot::page`), each walk starting at the first key after
+    /// the last the walk before it gave.
+    ///
+    /// What a read is lent of the store's files it holds until it ends,
+    /// and the cache gives nothing back that a read in progress could
+    /// hold, so a scan of the whole store in one read would hold the
+    /// store. Between two walks nothing lent is held: the scan's state is
+    /// the handle's snapshot and tables, which are copies, and the key to
+    /// go on from, which is copied here.
+    #[inline(never)]
+    fn scan_rested<F: FnMut(&[u8], &[u8])>(
+        &self,
+        from: &[u8],
+        limit: usize,
+        mut f: F,
+    ) -> Result<usize> {
+        let _entered = self.enter();
+        let slot = self
+            .slot
+            .or(self.pin_slot.filter(|_| self.opts.writer_pins));
+        // A rest left standing when the scan ends is at or before the pin
+        // of whatever this handle does next, and read as that pin
+        // (`Readers::oldest_lent`).
+        let mut seen = 0usize;
+        let mut next: Vec<u8> = from.to_vec();
+        let mut last: Vec<u8> = Vec::new();
+        loop {
+            let want = (limit - seen).min(SCAN_REST);
+            let n = self.scan_in(&next, want, |k, v| {
+                if last.as_slice() != k {
+                    last.clear();
+                    last.extend_from_slice(k);
+                }
+                f(k, v)
+            })?;
+            seen += n;
+            if n < want || seen >= limit {
+                return Ok(seen);
+            }
+            if let Some(slot) = slot {
+                // And a wait for the cache where the scan has read it
+                // well past its budget, holding nothing.
+                if let Some(p) = self.shared.pager.as_ref().filter(|p| p.crowded()) {
+                    self.shared.readers.page_set(slot, u64::MAX);
+                    p.breathe();
+                }
+                self.shared.readers.page_pin(slot);
+            }
+            // The least key above the last: the last with a zero after it.
+            next.clear();
+            next.extend_from_slice(&last);
+            next.push(0);
+        }
+    }
+
+    #[inline(always)]
+    fn scan_in<F: FnMut(&[u8], &[u8])>(
         &self,
         from: &[u8],
         limit: usize,
@@ -20865,6 +21255,19 @@ impl Reader {
                 AtomicOrdering::AcqRel,
                 AtomicOrdering::Relaxed,
             );
+        }
+        // A third asker, for a store under a cipher: the cache of
+        // plaintext well past its budget (`pager::Pager::crowded`). A pass
+        // that builds a form for every block a burst dirtied reads every
+        // one of those blocks' records, under one pin, and the cache
+        // gives nothing back that a pinned reader could hold: a burst
+        // over every block of a store was the store read into the cache,
+        // in one pass of fifty milliseconds, under a cache an eighth of
+        // its size. The pass gives its forms up as it does for the tables
+        // behind its pin, and the scans build what they read.
+        if self.shared.pager.as_ref().is_some_and(|p| p.crowded()) {
+            self.fs().abandoned.set(now);
+            return true;
         }
         if !self.opts.upkeep_abandons || self.shared.keep_bytes == u64::MAX {
             return false;
@@ -25904,6 +26307,22 @@ impl Reader {
     /// each extent carries its record count (`Ext::count`, format v5), so no
     /// block is read. The memtable keeps a live count per key.
     pub fn count(&self, key: &[u8]) -> Result<u64> {
+        if let Some(p) = &self.shared.pager {
+            return self.count_paged(p, key);
+        }
+        self.count_in(key)
+    }
+
+    /// `count` in a store under a cipher (`read_all_paged`).
+    #[inline(never)]
+    fn count_paged(&self, p: &pager::Pager, key: &[u8]) -> Result<u64> {
+        self.breathe(p);
+        let r = self.count_in(key);
+        p.check().and(r)
+    }
+
+    #[inline(always)]
+    fn count_in(&self, key: &[u8]) -> Result<u64> {
         let _entered = self.enter();
         // A count resolves one key, so it is a point read for advice
         // purposes even though it returns no bytes (`F28`: 94 ns, a lookup).
@@ -26423,6 +26842,7 @@ impl Db {
         };
         let shared = std::sync::Arc::new(Shared {
             state: AtomicPtr::new(Box::into_raw(Box::new(state))),
+            pager: held.as_ref().map(|h| h.vault().pager().clone()),
             readers: Readers::new(opts.asym_pins),
             retired: RetireList::new(),
             advice_random: std::sync::atomic::AtomicBool::new(starts_random),
@@ -26519,6 +26939,15 @@ impl Db {
             trim_hold: std::sync::atomic::AtomicBool::new(false),
             trim_begun: AtomicU64::new(0),
         });
+        // The cache's evictor waits out this table's readers from here on
+        // (`PagerGrace`), before any thread of the store exists to read
+        // under a pin: set after them, a thread started in between read
+        // under a pin nobody waited for.
+        if let Some(p) = &shared.pager {
+            p.set_grace(Some(std::sync::Arc::new(PagerGrace(
+                std::sync::Arc::downgrade(&shared),
+            ))));
+        }
         let pin_slot = Some(
             shared
                 .readers
@@ -26542,6 +26971,7 @@ impl Db {
             pin_slot,
             depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Dirty),
+            page_snap: std::cell::Cell::new(false),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts,
@@ -26595,6 +27025,12 @@ impl Db {
             presync_failed: None,
             vault: held,
         };
+        // What the making of the store read of its files, read: a
+        // segment's open that met a chunk failing its tag has answered as
+        // if the bytes were not there.
+        if let Some(p) = &db.shared.pager {
+            p.check()?;
+        }
         db.go_away()?;
         db.start_trimmer();
         if db.opts.malloc_mmap_threshold > 0 {
@@ -26640,6 +27076,12 @@ impl Db {
         };
         let decoy = held.as_ref().map(vault::Held::dir);
         let dir = decoy.as_deref().unwrap_or(dir);
+        // Under a cipher nothing of a segment is decrypted by an open but
+        // what the open reads -- a header, a key or two, a level-0 piece's
+        // keys for its Bloom -- and this thread, which pins no slot of a
+        // reader table until the store exists, holds the store's cache
+        // for those reads (`pager::Hold`).
+        let opening = held.as_ref().map(|h| h.vault().pager().hold());
         // The manifest is the truth when it exists, and every store made
         // by `create` has one from birth. Without one the directory is
         // scanned, which is how a store written before manifests still
@@ -26825,14 +27267,6 @@ impl Db {
         );
         // Where the store starts. `Random` starts advised and never moves;
         let starts_random = opts.read_advice.starts_random();
-        // Under a cipher every live segment and its index are decrypted
-        // into memory here, several at once, ahead of the opens below,
-        // which would read them in turn on this thread.
-        if let Some(h) = &held {
-            let mut names = live.clone();
-            names.extend(live.iter().filter_map(|n| Db::ord_name_for(n)));
-            h.vault().preload(&names);
-        }
         let mut segs = Vec::with_capacity(live.len());
         for name in &live {
             segs.push(Seg::open(
@@ -26843,6 +27277,10 @@ impl Db {
                 opts.segment.checksums,
                 true,
             )?);
+            // Nothing lent by that open is read again.
+            if let Some(h) = &opening {
+                h.rest();
+            }
         }
         segs.sort_by(seg_order);
         // A store reopened under `Always` attaches the form files it finds
@@ -26998,6 +27436,7 @@ impl Db {
         };
         let shared = std::sync::Arc::new(Shared {
             state: AtomicPtr::new(Box::into_raw(Box::new(state))),
+            pager: held.as_ref().map(|h| h.vault().pager().clone()),
             readers,
             retired: RetireList::new(),
             advice_random: std::sync::atomic::AtomicBool::new(starts_random),
@@ -27094,6 +27533,15 @@ impl Db {
             trim_hold: std::sync::atomic::AtomicBool::new(false),
             trim_begun: AtomicU64::new(0),
         });
+        // The cache's evictor waits out this table's readers from here on
+        // (`PagerGrace`), before any thread of the store exists to read
+        // under a pin: set after them, a thread started in between read
+        // under a pin nobody waited for.
+        if let Some(p) = &shared.pager {
+            p.set_grace(Some(std::sync::Arc::new(PagerGrace(
+                std::sync::Arc::downgrade(&shared),
+            ))));
+        }
         let pin_slot = Some(
             shared
                 .readers
@@ -27117,6 +27565,7 @@ impl Db {
             pin_slot,
             depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Dirty),
+            page_snap: std::cell::Cell::new(false),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts,
@@ -27170,6 +27619,12 @@ impl Db {
             presync_failed: None,
             vault: held,
         };
+        // What the making of the store read of its files, read: a
+        // segment's open that met a chunk failing its tag has answered as
+        // if the bytes were not there.
+        if let Some(p) = &db.shared.pager {
+            p.check()?;
+        }
         db.go_away()?;
         db.start_trimmer();
         if db.opts.malloc_mmap_threshold > 0 {
@@ -28668,7 +29123,7 @@ impl Db {
                 continue;
             }
             waited = true;
-            std::thread::park_timeout(MAINT_LAND_POLL);
+            self.r.unlent(|| std::thread::park_timeout(MAINT_LAND_POLL));
         }
         self.mem_handed = None;
         if waited {
@@ -29405,6 +29860,7 @@ impl Reader {
             pin_slot,
             depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Dirty),
+            page_snap: std::cell::Cell::new(false),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts: self.opts.clone(),
@@ -29440,6 +29896,7 @@ impl Reader {
             pin_slot: None,
             depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Dirty),
+            page_snap: std::cell::Cell::new(false),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts: self.opts.clone(),
@@ -29482,6 +29939,7 @@ impl Reader {
             pin_slot: None,
             depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Latest),
+            page_snap: std::cell::Cell::new(false),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts: self.opts.clone(),
@@ -29504,7 +29962,12 @@ impl Db {
     /// makes it: a partition keeps its predecessor's -- the one at the
     /// same fences -- when it is that partition, or, where `rebase`, one
     /// a merge rewrote over the same blocks; any other takes its own.
-    fn layout_of(cur: &State, segs: &[std::sync::Arc<Seg>], rebase: bool) -> Vec<u64> {
+    fn layout_of(
+        cur: &State,
+        segs: &[std::sync::Arc<Seg>],
+        rebase: bool,
+        rd: Option<&Reader>,
+    ) -> Vec<u64> {
         let np_cur = cur.segs.partition_point(|s| s.level > 0);
         let parts = &cur.segs[..np_cur];
         segs.iter()
@@ -29513,7 +29976,7 @@ impl Db {
                 let was = parts.iter().position(|q| q.lo == seg.lo && q.hi == seg.hi);
                 match was {
                     Some(q) if std::sync::Arc::ptr_eq(&parts[q], seg) => cur.layout[q],
-                    Some(q) if rebase && Db::same_blocks(&parts[q], seg) => cur.layout[q],
+                    Some(q) if rebase && Db::same_blocks(&parts[q], seg, rd) => cur.layout[q],
                     _ => seg.blob.id(),
                 }
             })
@@ -29537,7 +30000,17 @@ impl Db {
     /// last, so each block covers the same range of keys in both. What a
     /// merge that folds updates into a partition leaves, and what lets a
     /// block's copy outlive the partition it was built over.
-    fn same_blocks(a: &Seg, b: &Seg) -> bool {
+    ///
+    /// A key a block of both partitions is, for records of a hundred
+    /// bytes, a read of most of the pages of both, and under a cipher
+    /// (`rd` a handle of such a store, in an operation) each is a chunk
+    /// decrypted into the store's cache. So the walk rests every few
+    /// blocks, holding nothing across a block, and answers no -- always a
+    /// right answer, the copies are built again -- once the cache is well
+    /// past its budget: at the landing of a merge over a whole store this
+    /// walk read the store into a cache an eighth of its size, on the
+    /// segment work's one pin, in fifty milliseconds.
+    fn same_blocks(a: &Seg, b: &Seg, rd: Option<&Reader>) -> bool {
         let n = a.blob.keys();
         if n != b.blob.keys() || a.level != b.level || a.lo != b.lo || a.hi != b.hi {
             return false;
@@ -29545,7 +30018,12 @@ impl Db {
         (0..n)
             .step_by(CACHE_BLOCK)
             .chain(n.checked_sub(1))
-            .all(|r| matches!((a.raw().key_at(r), b.raw().key_at(r)), (Some(x), Some(y)) if x == y))
+            .all(|r| {
+                if (r / CACHE_BLOCK).is_multiple_of(16) && rd.is_some_and(Reader::rest) {
+                    return false;
+                }
+                matches!((a.raw().key_at(r), b.raw().key_at(r)), (Some(x), Some(y)) if x == y)
+            })
     }
 
     fn store_bytes_of(dir: &Path, segs: &[std::sync::Arc<Seg>]) -> u64 {
@@ -29841,7 +30319,7 @@ impl Db {
                 return Err(err("the frozen table's seal did not land"));
             }
             waited = true;
-            std::thread::park_timeout(MAINT_LAND_POLL);
+            self.r.unlent(|| std::thread::park_timeout(MAINT_LAND_POLL));
         }
         if let Some(e) = self.shared.take_maint_err() {
             return Err(e);
@@ -29935,8 +30413,9 @@ impl Db {
                 rx
             }
         };
-        let answered = rx
-            .recv()
+        let answered = self
+            .r
+            .unlent(|| rx.recv())
             .unwrap_or_else(|_| Err(err("the store's segment work has stopped")));
         self.rehold();
         if let Some(e) = self.shared.take_maint_err() {
@@ -31289,7 +31768,13 @@ impl Reader {
                 if b == nblocks {
                     break;
                 }
-                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // Under a cipher the builder stops where the cache of
+                // plaintext is well past its budget: every block it builds
+                // is a block's records read through that cache, under the
+                // one pin this job holds (`Reader::abandon_asked`).
+                if stop.load(std::sync::atomic::Ordering::Relaxed)
+                    || self.shared.pager.as_ref().is_some_and(|p| p.crowded())
+                {
                     return Ok(());
                 }
                 // A block the writer holds a form for, or one published
@@ -32144,6 +32629,7 @@ impl Reader {
             pin_slot: self.shared.readers.claim_engine(),
             depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Dirty),
+            page_snap: std::cell::Cell::new(false),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts: self.opts.clone(),
@@ -35938,7 +36424,7 @@ impl Maint {
                     if self.shared.maint_stop.load(AtomicOrdering::Acquire) {
                         break;
                     }
-                    std::thread::park_timeout(MAINT_POLL);
+                    self.r.unlent(|| std::thread::park_timeout(MAINT_POLL));
                 }
                 // Swept here, where nothing is building and nothing starts
                 // before the answer, and not by the caller after it, which
@@ -36428,7 +36914,7 @@ impl Maint {
                         self.land_front_readable()?;
                         break;
                     }
-                    std::thread::park_timeout(MAINT_LAND_POLL);
+                    self.r.unlent(|| std::thread::park_timeout(MAINT_LAND_POLL));
                 }
             }
             self.land_front(draining)?;
@@ -36462,7 +36948,10 @@ impl Maint {
         } = job;
         let t = std::time::Instant::now();
         let blocked = !handle.is_finished();
-        let joined = handle.join().map_err(|_| err("seal thread panicked"));
+        let joined = self
+            .r
+            .unlent(|| handle.join())
+            .map_err(|_| err("seal thread panicked"));
         self.shared.drain_steps.stamp(10);
         let waited = t.elapsed().as_nanos() as u64;
         let counts = &self.shared.seal_counts;
@@ -36714,6 +37203,7 @@ impl Maint {
     /// The WAL files and temp names a durable manifest covers, retired:
     /// one WAL kept as the spare where the writer recycles one.
     fn retire_covered(&mut self) {
+        let _io = self.r.unlend();
         for old in std::mem::take(&mut self.retiring_wals) {
             // One spare is enough for the common shape, a seal landed
             // before the next rotation; a table handed beside a seal in
@@ -36950,7 +37440,7 @@ impl Maint {
             // SAFETY: this handle is pinned for its operation, and a state
             // is freed only past every pinned slot.
             let cur = unsafe { &*cur_p };
-            let layout = Db::layout_of(cur, &segs, !tier && self.opts.forms_rebase);
+            let layout = Db::layout_of(cur, &segs, !tier && self.opts.forms_rebase, Some(&self.r));
             let from = Db::replaced_from(&self.opts, &self.shared);
             let mut swapped_live = false;
             let mut retired_table = false;
@@ -37146,7 +37636,10 @@ impl Maint {
             return Ok(());
         };
         self.z_cancel_inputs(&inputs);
-        let outputs = handle.join().map_err(|_| err("tier thread panicked"))??;
+        let outputs = self
+            .r
+            .unlent(|| handle.join())
+            .map_err(|_| err("tier thread panicked"))??;
         let mut merged: Vec<std::sync::Arc<Seg>> = self
             .segs()
             .iter()
@@ -37189,6 +37682,7 @@ impl Maint {
     /// it by name alone took the index of a segment that was still open, and
     /// seven tests said so.
     fn retire_seg(&mut self, name: &str) {
+        let _io = self.r.unlend();
         let _ = vault::remove_file(self.dir.join(name));
         let Some(ord) = Db::ord_name_for(name) else {
             return;
@@ -37688,6 +38182,7 @@ impl Maint {
     /// names it covers retired: after the drain's answer, before a
     /// settle returns, and at the close.
     fn sync_owed_slot(&mut self) -> Result<()> {
+        let _io = self.r.unlend();
         if let Some(f) = self.slot_sync_due.take() {
             f.sync_data()?;
             self.retire_covered();
@@ -37696,6 +38191,7 @@ impl Maint {
     }
 
     fn publish(&mut self) -> Result<()> {
+        let _io = self.r.unlend();
         debug_assert!(
             !self.seal_between_phases(),
             "a manifest written while a seal's segments are published and not durable"
@@ -40469,8 +40965,9 @@ impl Maint {
             self.flush_merge = false;
         }
         let t = std::time::Instant::now();
-        let outputs = handle
-            .join()
+        let outputs = self
+            .r
+            .unlent(|| handle.join())
             .map_err(|_| err("compaction thread panicked"))??;
         if self.merge_trace {
             let bytes: u64 = outputs

@@ -141,7 +141,10 @@ fn a_store_under_a_cipher_reads_as_itself_and_is_ciphertext_in_its_directory() {
         holds(&db, n);
         let c = db.cipher_counts().unwrap();
         assert!(c.persisted > 2, "segments reached the directory: {c:?}");
-        assert_eq!(c.loaded, 0, "and none was read back from it");
+        assert_eq!(
+            c.cache.fills, 0,
+            "and none was read back from it: the store fits its cache: {c:?}"
+        );
     }
     for needle in [MARK, KEY_MARK] {
         assert!(
@@ -169,7 +172,7 @@ fn a_store_under_a_cipher_reads_as_itself_and_is_ciphertext_in_its_directory() {
         let db = Db::open(&dir, under(1)).unwrap();
         holds(&db, n);
         let c = db.cipher_counts().unwrap();
-        assert!(c.loaded > 0, "the open decrypted what it read: {c:?}");
+        assert!(c.cache.fills > 0, "what was read was decrypted: {c:?}");
         assert_eq!(c.swept, 0, "a clean close leaves nothing to sweep");
     }
     // The control: in the clear, the same search finds the keys and the
@@ -269,14 +272,18 @@ fn digest_pair(h: u64, key: &[u8], value: &[u8]) -> u64 {
 
 /// Everything a store holds, as one number.
 fn digest_of(db: &Db) -> u64 {
+    read_digest(db).unwrap()
+}
+
+/// `digest_of` for a store whose files may not read.
+fn read_digest(db: &Db) -> std::io::Result<u64> {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     db.scan(
         b"",
         usize::MAX,
         kv(&mut |key, value| h = digest_pair(h, key, value)),
-    )
-    .unwrap();
-    h
+    )?;
+    Ok(h)
 }
 
 fn digest_of_model(model: &BTreeMap<Vec<u8>, Vec<u8>>) -> u64 {
@@ -331,18 +338,179 @@ fn with_a_history(dir: &Path, n: u8) -> Vec<u64> {
     history
 }
 
+/// The plaintext a directory's files hold under their envelopes: what a
+/// store there would have to hold to hold itself whole.
+fn stored_bytes(dir: &Path) -> u64 {
+    names(dir)
+        .iter()
+        .filter(|n| n.starts_with("x-"))
+        .map(|n| std::fs::metadata(dir.join(n)).unwrap().len())
+        .sum()
+}
+
+/// A store several times the size of the plaintext it may hold reads as
+/// itself: every key, a scan of the whole of it in one call, reads from
+/// four threads at once beside a writer, and all of it again after a
+/// reopen. What it holds of itself stays at its cache's size, give or take
+/// what the reads in flight are lent, through all of it; an open decrypts
+/// what an open reads and not the store; and the store holds a descriptor
+/// for none of its files.
+#[test]
+fn a_store_larger_than_its_cache_reads_as_itself_within_it() {
+    let n = 150_000;
+    let cache: u64 = 2 << 20;
+    let opts = || Options {
+        encryption: Encryption::Cipher(cipher(9).cache_bytes(cache)),
+        ..small()
+    };
+    let dir = scratch("larger");
+    // What a read in flight may hold beyond the budget: a megabyte is what
+    // the cache gives back at a time, and a scan or a merge rests every
+    // thousand keys or so.
+    let slack: u64 = 8 << 20;
+    let settled = |db: &Db, what: &str| {
+        let t = std::time::Instant::now();
+        loop {
+            let c = db.cipher_counts().unwrap().cache;
+            if c.held <= c.budget {
+                return c;
+            }
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(20),
+                "{what}: the cache stayed over its budget with nothing reading: {c:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    {
+        let mut db = Db::create(&dir, opts()).unwrap();
+        fill(&mut db, n);
+        let size = stored_bytes(&dir);
+        assert!(
+            size > 6 * cache,
+            "the store is {size} bytes, not several times its cache of {cache}"
+        );
+        holds(&db, n);
+        let c = settled(&db, "after the fill");
+        assert_eq!(c.budget, cache);
+        assert!(c.evicted_units > 0, "nothing was given back: {c:?}");
+        assert!(
+            c.peak < cache + slack,
+            "the cache held {} bytes of a budget of {cache}: {c:?}",
+            c.peak
+        );
+        // Reads from four threads, each through a handle of its own, far
+        // apart in the store, beside a writer rewriting keys and flushing.
+        let handles: Vec<_> = (0..4).map(|_| db.reader().unwrap()).collect();
+        std::thread::scope(|scope| {
+            for (t, h) in handles.into_iter().enumerate() {
+                scope.spawn(move || {
+                    let mut s = 0x9e37_79b9u64 ^ ((t as u64) << 20) | 1;
+                    for _ in 0..4_000 {
+                        s ^= s << 13;
+                        s ^= s >> 7;
+                        s ^= s << 17;
+                        // The keys the writer below leaves alone.
+                        let i = (s % u64::from(n / 2)) as u32 * 2 + 1;
+                        let mut got: Vec<Vec<u8>> = Vec::new();
+                        h.read_all(&k(i), vf(&mut |x| got.push(x.to_vec())))
+                            .unwrap();
+                        let round = u32::from((n - 1 - i).is_multiple_of(3));
+                        assert_eq!(got, [v(i, round)], "thread {t}, key {i}");
+                        if s.is_multiple_of(97) {
+                            let mut seen = 0u32;
+                            h.scan(&k(i), 3000, kv(&mut |_k, _v| seen += 1)).unwrap();
+                            assert!(seen > 0);
+                        }
+                    }
+                });
+            }
+            for round in 0..3u32 {
+                for i in (0..n).step_by(2).skip(round as usize).step_by(40) {
+                    db.put(&k(i), &v(i, 7 + round));
+                }
+                db.commit().unwrap();
+                db.flush().unwrap();
+            }
+        });
+        db.settle().unwrap();
+        let c = settled(&db, "after the threads");
+        assert!(
+            c.peak < cache + slack,
+            "the cache held {} bytes of a budget of {cache} under four readers: {c:?}",
+            c.peak
+        );
+        // No descriptor of the process is a file of the store's: a memory
+        // file's is closed when the file has its envelope, and an
+        // envelope's when it is mapped.
+        let fds: Vec<String> = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+            .map(|p| p.to_string_lossy().into_owned())
+            .filter(|p| p.contains("memfd:supdb") || p.contains("/x-"))
+            .collect();
+        assert!(
+            fds.len() <= 4,
+            "the store holds descriptors for its files: {fds:?}"
+        );
+    }
+    // Reopened: what the open decrypts is what an open reads of each file
+    // -- a header, the first key and the last, the block table's and the
+    // index's first words, a handful of chunks whatever the file's length
+    // -- and not the store. The partitions here are a quarter megabyte,
+    // sixty chunks, so the bound is by the file and not by the byte.
+    let db = Db::open(&dir, opts()).unwrap();
+    let c = db.cipher_counts().unwrap().cache;
+    let files = names(&dir).iter().filter(|n| n.starts_with("x-")).count() as u64;
+    assert!(
+        c.fills <= 6 * files,
+        "the open decrypted {} chunks of {files} files: {c:?}",
+        c.fills
+    );
+    assert!(
+        c.fills * 4080 < stored_bytes(&dir) / 4,
+        "the open decrypted {} chunks of a store of {} bytes: {c:?}",
+        c.fills,
+        stored_bytes(&dir)
+    );
+    for i in (1..n).step_by(2).step_by(13) {
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        db.read_all(&k(i), vf(&mut |x| got.push(x.to_vec())))
+            .unwrap();
+        let round = u32::from((n - 1 - i).is_multiple_of(3));
+        assert_eq!(got, [v(i, round)], "key {i} after the reopen");
+    }
+    let mut seen = 0u32;
+    db.scan(b"", usize::MAX, kv(&mut |_k, _v| seen += 1))
+        .unwrap();
+    assert_eq!(seen, n);
+    let c = settled(&db, "after the reopen");
+    assert!(c.evicted_units > 0, "{c:?}");
+    assert!(
+        c.peak < cache + slack,
+        "the cache held {} bytes of a budget of {cache} after the reopen: {c:?}",
+        c.peak
+    );
+}
+
 /// A byte changed anywhere in the directory is refused, or is where the
-/// log ends: whatever opens afterwards holds a state the store
+/// log ends: what the store answers afterwards is a state it
 /// acknowledged, the last or one before it, and never anything else.
-/// Every file is walked, and each of the three outcomes has to occur --
-/// a store refused, a store that lost its log's tail, and a store whole
-/// where the byte was in a file nothing durable rests on.
+/// A store's files are decrypted where they are read, so a changed byte
+/// is refused in one of two places: at the open, where it is in what an
+/// open reads -- the marker, a manifest, an envelope's header -- and at
+/// the read that first wants it, which answers with an error and not with
+/// what is left of the store, as every read after it does. Every file is
+/// walked, and each of the four outcomes has to occur: a store refused at
+/// its open, a store that refuses to be read, a store that lost its log's
+/// tail, and a store whole where the byte was in a file nothing durable
+/// rests on.
 #[test]
 fn a_changed_byte_is_refused_or_is_where_the_log_ends() {
     let dir = scratch("tamper");
     let history = with_a_history(&dir, 3);
     let pristine = snapshot(&dir);
-    let (mut refused, mut earlier, mut whole) = (0, 0, 0);
+    let (mut refused, mut unread, mut earlier, mut whole) = (0, 0, 0, 0);
     for (name, bytes) in &pristine {
         let stride = (bytes.len() / 24).max(1);
         for at in (0..bytes.len()).step_by(stride) {
@@ -350,13 +518,31 @@ fn a_changed_byte_is_refused_or_is_where_the_log_ends() {
             let mut bad = bytes.clone();
             bad[at] ^= 1;
             std::fs::write(dir.join(name), &bad).unwrap();
-            match Db::open(&dir, tiny(3)) {
-                Err(_) => refused += 1,
-                Ok(db) => {
-                    let d = digest_of(&db);
+            let db = match Db::open(&dir, tiny(3)) {
+                Err(_) => {
+                    refused += 1;
+                    continue;
+                }
+                Ok(db) => db,
+            };
+            match read_digest(&db) {
+                Err(e) => {
+                    unread += 1;
+                    assert!(
+                        e.to_string().contains("did not read"),
+                        "{name}, byte {at}: refused as {e}"
+                    );
+                    // And from then on: no read of it answers.
+                    assert!(
+                        db.read_all(&k(1), vf(&mut |_| ())).is_err(),
+                        "{name}, byte {at}: a read answered after one had failed"
+                    );
+                    assert!(read_digest(&db).is_err());
+                }
+                Ok(d) => {
                     assert!(
                         history.contains(&d),
-                        "{name}, byte {at}: opened as a state the store never held"
+                        "{name}, byte {at}: read as a state the store never held"
                     );
                     if d == *history.last().unwrap() {
                         whole += 1;
@@ -368,8 +554,8 @@ fn a_changed_byte_is_refused_or_is_where_the_log_ends() {
         }
     }
     assert!(
-        refused > 0 && earlier > 0 && whole > 0,
-        "refused {refused}, earlier {earlier}, whole {whole}"
+        refused > 0 && unread > 0 && earlier > 0 && whole > 0,
+        "refused {refused}, unread {unread}, earlier {earlier}, whole {whole}"
     );
     // And untouched, it opens whole.
     restore(&dir, &pristine);

@@ -384,6 +384,8 @@ pub struct Supdb {
     /// is that store's twin in the clear (`Policy::cipher_base`).
     cipher: bool,
     cipher_base: bool,
+    /// `Policy::cipher_cache`.
+    cipher_cache: u64,
     /// False for the ingest-first arm: a flush stops partitioning what it
     /// sealed and leaves that to the background -- promotion at once, a
     /// merge for the rest (`Options::flush_schedules`). Both arms exist so
@@ -1241,12 +1243,18 @@ struct Policy {
     dir_key: bool,
     /// The store under a cipher the caller supplies (`Encryption::Cipher`),
     /// here AES-256-GCM: `supdb-cipher` and `supdb-ingestcipher`. Its
-    /// files are memory files and its directory their envelopes, and it
-    /// runs with ordered ingest through the log and the compact form off
-    /// whatever it is asked, so it is priced twice: against
-    /// `cipher_base`, which is what the cipher alone costs, and against
-    /// `supdb`, which is what the mode costs.
+    /// directory holds its files' envelopes and it reads them through a
+    /// cache of plaintext of its own, and it runs with ordered ingest
+    /// through the log and the compact form off whatever it is asked, so
+    /// it is priced twice: against `cipher_base`, which is what the cipher
+    /// alone costs, and against `supdb`, which is what the mode costs.
     cipher: bool,
+    /// The plaintext the store under a cipher may hold, bytes
+    /// (`StoreCipher::cache_bytes`), or zero for the engine's own choice,
+    /// half of what the process may use: `supdb-cipher64` is the store
+    /// under sixty-four mebibytes, which from a million keys up is a
+    /// store several times its cache, read by the chunk it decrypts.
+    cipher_cache: u64,
     /// `supdb` with the two options a cipher fixes and no cipher
     /// (`supdb-cipherbase`, `supdb-ingestcipherbase`): the store a cipher
     /// runs, in the clear.
@@ -1949,6 +1957,7 @@ impl Default for Policy {
             dir_key: false,
             cipher: false,
             cipher_base: false,
+            cipher_cache: 0,
             partition: true,
             drain: true,
             advice: None,
@@ -2177,6 +2186,19 @@ impl Supdb {
             path,
             Policy {
                 cipher: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipher` with a cache of sixty-four mebibytes
+    /// (`Policy::cipher_cache`).
+    pub fn create_cipher64(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_cache: 64 << 20,
                 ..Policy::default()
             },
         )
@@ -6543,6 +6565,7 @@ impl Supdb {
             dir_key,
             cipher,
             cipher_base,
+            cipher_cache,
             partition,
             drain,
             advice,
@@ -7158,7 +7181,11 @@ impl Supdb {
         let encryption = match (dir_key, cipher) {
             (true, _) => supdb::Encryption::Kernel(supdb::DirKey::new([0x5a; 32])),
             (false, true) => {
-                supdb::Encryption::Cipher(supdb::StoreCipher::new(Gcm::new(), Gcm::of))
+                let c = supdb::StoreCipher::new(Gcm::new(), Gcm::of);
+                supdb::Encryption::Cipher(match cipher_cache {
+                    0 => c,
+                    bytes => c.cache_bytes(bytes),
+                })
             }
             (false, false) => supdb::Encryption::None,
         };
@@ -7170,6 +7197,7 @@ impl Supdb {
             dirkey: dir_key,
             cipher,
             cipher_base,
+            cipher_cache,
             partition,
             drain,
             advice,
@@ -7440,6 +7468,7 @@ impl Engine for Supdb {
         }
         if self.cipher || self.cipher_base {
             return match (self.cipher, self.durable) {
+                (true, true) if self.cipher_cache != 0 => "supdb-cipher64",
                 (true, true) => "supdb-cipher",
                 (true, false) => "supdb-ingestcipher",
                 (false, true) => "supdb-cipherbase",
@@ -8433,6 +8462,11 @@ impl Engine for Supdb {
         // seal and be read as the pass's. The pass's takes come from the
         // store's own life instead.
         let (forms, form_bytes, _, _) = db.canonical_forms();
+        // The cache a store under a cipher reads its files through, and
+        // zeroes for a store under none: a cell out of that cache is read
+        // beside what was decrypted and given back in it, and beside what
+        // its reads waited for a crowded cache.
+        let pc = db.cipher_counts().map(|c| c.cache).unwrap_or_default();
         let ev = db.forms_events();
         let sd = db.settle_density();
         let bk = db.build_kinds();
@@ -8460,6 +8494,13 @@ impl Engine for Supdb {
             // above: the pair a memory decomposition holds against the
             // process's resident bytes (`lagmem`).
             ("cache_bytes_at_end", db.block_cache_bytes() as f64),
+            ("cipher_held_at_end", pc.held as f64),
+            ("cipher_peak", pc.peak as f64),
+            ("cipher_fills", pc.fills as f64),
+            ("cipher_evicted_units", pc.evicted_units as f64),
+            ("cipher_rescues", pc.rescues as f64),
+            ("cipher_breaths", pc.breaths as f64),
+            ("cipher_evictor_waited_us", pc.waited_us as f64),
             ("lazy_scans_done", db.lazy_scans().0 as f64),
             ("lazy_scans_resumed", db.lazy_scans().1 as f64),
             ("seals", db.seal_waits().joins as f64),
@@ -9668,6 +9709,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocache"
         | "supdb-dirkey"
         | "supdb-cipher"
+        | "supdb-cipher64"
         | "supdb-cipherbase"
         | "supdb-nocacheordread"
         | "supdb-nocachezpages"
@@ -10012,6 +10054,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-dirkey" => supdb_arm(Supdb::create_dirkey, dir)?,
         "supdb-ingestdirkey" => supdb_arm(Supdb::create_ingest_dirkey, dir)?,
         "supdb-cipher" => supdb_arm(Supdb::create_cipher, dir)?,
+        "supdb-cipher64" => supdb_arm(Supdb::create_cipher64, dir)?,
         "supdb-cipherbase" => supdb_arm(Supdb::create_cipherbase, dir)?,
         "supdb-ingestcipher" => supdb_arm(Supdb::create_ingest_cipher, dir)?,
         "supdb-ingestcipherbase" => supdb_arm(Supdb::create_ingest_cipherbase, dir)?,

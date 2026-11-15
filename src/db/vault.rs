@@ -10,18 +10,35 @@
 //!
 //! What it costs is where the plaintext lives. A store reads by lending
 //! from mappings, so the plaintext has to be in memory something can map,
-//! and with the cipher in the process that memory is the process's: each of
-//! the store's files is a memory file (`memfd_create`), written and mapped
-//! exactly as a file on disk is, and what reaches the directory is that
-//! file's envelope (`crate::crypt`), written once the file is finished. A
-//! read runs the code it runs over a plain store, over a mapping of memory
-//! in place of a mapping of the page cache; the cipher runs once over a file
-//! when it is written and once when the store is opened. So a store under a
-//! cipher is held in memory whole -- it has to fit, the kernel cannot
-//! reclaim it, and an open decrypts all of it -- which is the trade against
-//! the kernel's way and why there are two. Each file is a descriptor held
-//! for the file's life, a segment and its ordered index two, so a large
-//! store wants the process's limit on open files above twice its segments.
+//! and with the cipher in the process that memory is the process's, where
+//! a plain store's is the kernel's page cache. So a store under a cipher
+//! keeps a cache of its own (`super::pager`): each file is address space
+//! its plaintext's length, a chunk of which is decrypted from the file's
+//! envelope (`crate::crypt`) where something first reads it and given back
+//! once the cache is past its budget (`StoreCipher::cache_bytes`) and
+//! nothing has read it lately. A store of any size runs in the cache it is
+//! given, at the rate of its misses, as a plain store runs in the memory
+//! the kernel has for it; an open reads each file's header and decrypts
+//! nothing else; and a store holds no descriptor for a file once the file
+//! has its envelope.
+//!
+//! What makes that possible is the readers asking their source for bytes
+//! before they read them (`Bytes::piecewise`, `flatindex::Pieces`), which
+//! a reader over a mapped file does not do: a file under a cipher is a
+//! source that lends by the piece, and the engine names one reader type
+//! for both.
+//!
+//! A file being written is a memory file, written by the code that writes
+//! a plain store's, until it is finished and has its envelope
+//! (`Vault::persist`); then it is the cache's (`Vault::settled`), which
+//! takes the plaintext it was written as where it has room, so that a
+//! store that fits its cache reads what it wrote without decrypting it,
+//! and lets it go where it has not.
+//!
+//! What the cache's budget does not count is what a plain store holds in
+//! the process too: the memtables, the block cache's forms, a scan's
+//! snapshot. And the kernel's page cache holds the envelopes' ciphertext,
+//! which is what a miss is read from, as it holds a plain store's files.
 //!
 //! # The door
 //!
@@ -30,10 +47,11 @@
 //! `remove_file`, `names`, ...), each of which is the standard library's
 //! call for a plain store. A store under a cipher is given a directory that
 //! cannot exist: its marker file, `supdb.cipher`, with a name after it. The
-//! functions here find the store by that directory and act on its memory
-//! files; a file operation that did not come through them fails with "not a
-//! directory" and writes nothing, which is what keeps a path the door was
-//! not put in front of from writing plaintext beside the ciphertext.
+//! functions here find the store by that directory and act on its files
+//! as it holds them; a file operation that did not come through them fails
+//! with "not a directory" and writes nothing, which is what keeps a path
+//! the door was not put in front of from writing plaintext beside the
+//! ciphertext.
 //!
 //! # What is in the directory
 //!
@@ -66,14 +84,21 @@
 //! # What an attacker who can write the directory can and cannot do
 //!
 //! Any byte changed in a segment, an index, a manifest or a log record is
-//! found, and none is ever read as data. A segment that fails its check
-//! fails the open. An ordered index that fails is composed again from its
-//! segment. A manifest slot that fails is passed over for the other slot,
-//! as a torn one is, and the store opens as the state that slot names or
-//! is refused where the log no longer reaches back to it. A log record
-//! that fails is where the log ends, as a torn tail is. So what a changed
-//! byte can do is what a crash can do, and no more: the store opens as a
-//! state it once acknowledged, or does not open.
+//! found, and none is ever read as data. A file's bytes are checked where
+//! they are decrypted, which is where they are first read: a header that
+//! is not the file's is refused where the file is opened, and a chunk
+//! that fails its tag at the read that wants it, which answers with an
+//! error, as every operation of the store does from then on
+//! (`pager::Pager::check`) -- the readers' answers are options in which
+//! bytes that did not read and a key that is not there look alike, so the
+//! failure is remembered and asked for at each operation's end, and a
+//! merge that met one publishes nothing. A manifest slot that fails is
+//! passed over for the other slot, as a torn one is, and the store opens
+//! as the state that slot names or is refused where the log no longer
+//! reaches back to it. A log record that fails is where the log ends, as
+//! a torn tail is. So what a changed byte can do is what a crash can do,
+//! or make the store refuse to be read, and no more: the store answers as
+//! a state it once acknowledged, or does not answer.
 //!
 //! What is not refused is the store taken back to an earlier state of
 //! itself on purpose: an old copy of the whole directory, or the log cut at
@@ -82,26 +107,30 @@
 //! is, the size of each commit in the log, and the caller's name for its
 //! key.
 //!
-//! The plaintext is in memory, and memory can be written to swap and to a
-//! core file; a host where that matters encrypts its swap and keeps its
-//! core files where it keeps its keys.
+//! The plaintext the cache holds is in memory, and memory can be written
+//! to swap and to a core file; a host where that matters encrypts its swap
+//! and keeps its core files where it keeps its keys.
 //!
 //! # What a store under a cipher runs without
 //!
 //! Ordered ingest's run, the compact form and the recycled log, whatever
 //! the options say (`under_cipher` in the engine): each rests on a file the
-//! engine makes durable by its own fsync, and that file would be a memory
-//! file here. An ordered load therefore goes through the log.
+//! engine makes durable by its own fsync as it writes it, and a file here
+//! reaches the directory once, whole, as its envelope. An ordered load
+//! therefore goes through the log.
 
 use crate::bytes::{Bytes, MmapBytes};
 use crate::crypt::{self, Aead, EncryptOptions, NONCE, TAG};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Error, ErrorKind, Read, Result, Write};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+pub use super::pager::PagerCounts;
+use super::pager::{self, Back, Paged, Pager};
+use crate::bytes::Paging;
 
 /// The length of a key the store draws for itself or for a file.
 pub const KEY: usize = 32;
@@ -140,6 +169,7 @@ pub struct StoreCipher {
     master: Arc<DynAead>,
     data: Arc<Maker>,
     key_id: u64,
+    cache: Option<u64>,
 }
 
 impl StoreCipher {
@@ -155,7 +185,23 @@ impl StoreCipher {
             master: Arc::new(master),
             data: Arc::new(move |k| Box::new(data(k)) as Box<DynAead>),
             key_id: 0,
+            cache: None,
         }
+    }
+
+    /// The plaintext of its files the store may hold in memory, in bytes:
+    /// what it has decrypted and not given back. A store reads through
+    /// this cache,
+    /// decrypting a chunk of a file where it is first read and giving the
+    /// chunks least lately read back once the cache is past this, so a
+    /// store of any size runs in it, at the rate of its misses. Unset, it
+    /// is half of the memory the process may use (its control group's
+    /// limit or the machine's, less what the process already holds), and
+    /// sixty-four mebibytes at least; the other half is for the kernel's
+    /// cache of the store's files, which is what a miss is read from.
+    pub fn cache_bytes(mut self, bytes: u64) -> StoreCipher {
+        self.cache = Some(bytes);
+        self
     }
 
     /// The caller's name for its key, written in the store's marker in the
@@ -434,11 +480,19 @@ fn disk_parse(name: &str) -> Option<(Token, bool)> {
     Some((token, ord))
 }
 
-/// One of the store's files: its plaintext in a memory file, once written
-/// or read; its envelope in the directory, once written or found.
+/// One of the store's files.
+///
+/// `mem` is the memory file a writer is writing or has written, and it is
+/// held until the file has its envelope. `disk` is the envelope in the
+/// directory, once written or found. `page` is the file as it is read
+/// (`pager::Paged`): made at the first map, or when the envelope is
+/// written, from the memory file where the cache has room for it and from
+/// the envelope alone where it has not. A file with its envelope has no
+/// memory file: its plaintext is the cache's, to hold and to give back.
 #[derive(Clone, Default)]
 struct Entry {
     mem: Option<Arc<File>>,
+    page: Option<Arc<Paged>>,
     disk: Option<Disk>,
 }
 
@@ -457,9 +511,10 @@ pub(crate) struct Counts {
     /// Envelopes written, and the plaintext bytes in them.
     pub(crate) persisted: AtomicU64,
     pub(crate) persisted_bytes: AtomicU64,
-    /// Envelopes decrypted into memory, and the plaintext bytes of them.
-    pub(crate) loaded: AtomicU64,
-    pub(crate) loaded_bytes: AtomicU64,
+    /// Files whose plaintext the cache took whole from their writer, and
+    /// files it left to be read from their envelopes.
+    pub(crate) adopted: AtomicU64,
+    pub(crate) left: AtomicU64,
     /// Envelopes no manifest named, removed at the open.
     pub(crate) swept: AtomicU64,
 }
@@ -477,7 +532,20 @@ pub(crate) struct Vault {
     nonces: Mutex<Nonces>,
     /// One persist at a time: two would write one file twice.
     persisting: Mutex<()>,
+    /// The cache the store's files are read through.
+    pager: Arc<Pager>,
     pub(crate) counts: Counts,
+}
+
+/// The cache a store is given where its cipher names none: half of what
+/// `zfile::read_budget` says the process may use, the other half being the
+/// kernel's cache of the envelopes a miss is read from.
+fn default_cache() -> u64 {
+    #[cfg(target_os = "linux")]
+    if let Some(b) = super::zfile::read_budget() {
+        return (b.budget / 2).max(64 << 20);
+    }
+    1 << 30
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -524,6 +592,8 @@ impl Held {
 
 impl Drop for Held {
     fn drop(&mut self) {
+        self.0.pager.stop();
+        self.0.pager.set_grace(None);
         let mut reg = lock(&REGISTRY);
         if let Some(i) = reg.iter().position(|v| Arc::ptr_eq(v, &self.0)) {
             reg.swap_remove(i);
@@ -532,37 +602,7 @@ impl Drop for Held {
     }
 }
 
-/// A memory file: anonymous, the process's, gone with its last handle.
-#[cfg(target_os = "linux")]
-fn memfile() -> Result<File> {
-    use std::os::fd::FromRawFd;
-    // SAFETY: a NUL-terminated name and a flag; the descriptor returned is
-    // owned by nothing else.
-    let fd = unsafe { libc::memfd_create(c"supdb".as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        let e = Error::last_os_error();
-        // A descriptor a file, held for the file's life: what a store of
-        // many segments runs out of first, and says so.
-        if matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE)) {
-            return Err(Error::new(
-                e.kind(),
-                "a store under a cipher holds a descriptor for each of its files, and the \
-                 process has no more: raise its limit on open files",
-            ));
-        }
-        return Err(e);
-    }
-    // SAFETY: a descriptor just made and owned here.
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn memfile() -> Result<File> {
-    Err(Error::new(
-        ErrorKind::Unsupported,
-        "a store under a cipher keeps its files in memory files, which this platform has not",
-    ))
-}
+use pager::memfile;
 
 /// Another handle on a memory file with a position of its own, as a second
 /// open of a file has: through the process's descriptor table, and where
@@ -651,8 +691,14 @@ impl Vault {
             files: Mutex::new(HashMap::new()),
             nonces: Mutex::new(Nonces::new()?),
             persisting: Mutex::new(()),
+            pager: Pager::new(cipher.cache.unwrap_or_else(default_cache)),
             counts: Counts::default(),
         })
+    }
+
+    /// The cache the store's files are read through.
+    pub(crate) fn pager(&self) -> &Arc<Pager> {
+        &self.pager
     }
 
     fn register(self) -> Result<Held> {
@@ -733,7 +779,7 @@ impl Vault {
             .values()
             .filter(|e| e.mem.is_some())
             .count();
-        self.counts.read(files as u64)
+        self.counts.read(files as u64, self.pager.counts())
     }
 
     /// A key wrapped under the store's, bound to what it is the key of.
@@ -768,82 +814,63 @@ impl Vault {
             name.to_string(),
             Entry {
                 mem: Some(Arc::new(mem)),
+                page: None,
                 disk: None,
             },
         );
         Ok(handle)
     }
 
-    /// The file's plaintext in memory: as written, or decrypted now from
-    /// its envelope, whole, every chunk checked.
-    fn load(&self, name: &str) -> Result<Arc<File>> {
-        let disk = {
-            let files = lock(&self.files);
-            let e = files
-                .get(name)
-                .ok_or_else(|| Error::from(ErrorKind::NotFound))?;
-            if let Some(mem) = &e.mem {
-                return Ok(mem.clone());
-            }
-            e.disk
-                .clone()
-                .ok_or_else(|| Error::from(ErrorKind::NotFound))?
-        };
+    /// The envelope `disk` names, opened under its file's key.
+    fn back_of(&self, disk: &Disk) -> Result<Back> {
         let key = self
             .unwrap(&Vault::file_aad(&disk.token), &disk.wrapped)
             .ok_or_else(|| refused("a file's key does not unwrap under the store's"))?;
-        let aead = (self.data)(&key.0);
-        let path = self.real.join(disk.name());
-        let mut mem = memfile()?;
-        let hdr = {
-            let src = MmapBytes::open(&path)?;
-            let hdr = crypt::decrypt(&src, &mut mem, &*aead)?;
-            src.advise_dontneed();
-            hdr
-        };
-        if let Ok(f) = File::open(&path) {
-            drop_cache(&f);
-        }
-        Counts::add(&self.counts.loaded, 1);
-        Counts::add(&self.counts.loaded_bytes, hdr.plain_len());
-        let mem = Arc::new(mem);
-        let mut files = lock(&self.files);
-        // Every name the envelope is under takes the one copy: a segment a
-        // promotion linked is two names over one file.
-        for e in files.values_mut() {
-            if e.mem.is_none() && e.disk.as_ref().is_some_and(|d| d.same(&disk)) {
-                e.mem = Some(mem.clone());
-            }
-        }
-        Ok(files.get(name).and_then(|e| e.mem.clone()).unwrap_or(mem))
+        Back::open(&self.real.join(disk.name()), (self.data)(&key.0))
     }
 
-    /// The files in `names` read into memory ahead of their first use, as
-    /// many at once as the machine has cores for, up to eight: for the
-    /// open, which reads every segment it names and would decrypt them one
-    /// after another on its own thread, at a core's rate where the store's
-    /// size over that rate is the whole of the open. A file that fails here
-    /// fails again where it is opened, by whoever can say what its failure
-    /// means -- a segment's is the open's, an ordered index's is a rebuild
-    /// -- so nothing is answered.
-    pub(crate) fn preload(&self, names: &[String]) {
-        let threads = std::thread::available_parallelism()
-            .map_or(1, |n| n.get())
-            .min(8)
-            .min(names.len());
-        if threads < 2 {
-            return;
+    /// The file as it is read: the cache's view of it, made here if it has
+    /// none yet. A file still in its writer's memory file is taken whole,
+    /// every chunk present, and is the cache's to give back once it has
+    /// its envelope; a file known by its envelope alone starts with
+    /// nothing present. Every name over the file takes the one view.
+    fn page_of(&self, name: &str) -> Result<Arc<Paged>> {
+        let mut files = lock(&self.files);
+        let e = files
+            .get(name)
+            .cloned()
+            .ok_or_else(|| Error::from(ErrorKind::NotFound))?;
+        if let Some(p) = e.page {
+            return Ok(p);
         }
-        let next = AtomicUsize::new(0);
-        std::thread::scope(|scope| {
-            for _ in 0..threads {
-                scope.spawn(|| {
-                    while let Some(name) = names.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        let _ = self.load(name);
-                    }
-                });
+        let page = match (&e.mem, &e.disk) {
+            (Some(mem), disk) => {
+                let p = Paged::adopt(&self.pager, mem, mem.metadata()?.len(), name)?;
+                if let Some(d) = disk {
+                    p.back(self.back_of(d)?)?;
+                }
+                p
             }
-        });
+            (None, Some(d)) => Paged::sparse(&self.pager, self.back_of(d)?, name)?,
+            (None, None) => return Err(Error::from(ErrorKind::NotFound)),
+        };
+        let backed = page.backed();
+        for o in files.values_mut() {
+            let same = match (&e.mem, &e.disk) {
+                (Some(mem), _) => o.mem.as_ref().is_some_and(|m| Arc::ptr_eq(m, mem)),
+                (None, Some(d)) => o.mem.is_none() && o.disk.as_ref().is_some_and(|x| x.same(d)),
+                (None, None) => false,
+            };
+            if same && o.page.is_none() {
+                o.page = Some(page.clone());
+                if backed {
+                    // The memory file's descriptor: the view's mapping
+                    // keeps the file, and nothing else reads it.
+                    o.mem = None;
+                }
+            }
+        }
+        Ok(page)
     }
 
     fn len(&self, name: &str) -> Result<u64> {
@@ -854,6 +881,9 @@ impl Vault {
                 .ok_or_else(|| Error::from(ErrorKind::NotFound))?;
             if let Some(mem) = &e.mem {
                 return Ok(mem.metadata()?.len());
+            }
+            if let Some(page) = &e.page {
+                return Ok(page.size());
             }
             e.disk
                 .clone()
@@ -914,10 +944,11 @@ impl Vault {
             let e = files
                 .get(name)
                 .ok_or_else(|| Error::from(ErrorKind::NotFound))?;
-            if e.disk.is_some() {
+            if e.disk.is_some() || e.page.is_some() {
                 return Err(Error::new(
                     ErrorKind::PermissionDenied,
-                    "a file of a store under a cipher is written once: it has its envelope",
+                    "a file of a store under a cipher is written once: it has its envelope, or \
+                     a reader",
                 ));
             }
             e.mem
@@ -925,6 +956,25 @@ impl Vault {
                 .ok_or_else(|| Error::from(ErrorKind::NotFound))?
         };
         reopen(&mem, true, append)
+    }
+
+    /// A kept file opened to be read as a file: one still in its writer's
+    /// memory file. A file with its envelope is read through its mapping
+    /// (`map`) and has no descriptor to hand out.
+    fn reopen_written(&self, name: &str) -> Result<File> {
+        let mem = lock(&self.files)
+            .get(name)
+            .ok_or_else(|| Error::from(ErrorKind::NotFound))?
+            .mem
+            .clone()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unsupported,
+                    "a file of a store under a cipher that has its envelope is read through \
+                     its mapping",
+                )
+            })?;
+        reopen(&mem, false, false)
     }
 
     /// The kept names, and the names in the directory the engine seals
@@ -946,13 +996,22 @@ impl Vault {
     /// and synced where `sync` says so.
     ///
     /// Through the page cache, each piece handed to the device behind the
-    /// cipher (`Ahead`), and the cache's copy of the ciphertext dropped
-    /// once it is synced: the plaintext is what the store reads, and the
-    /// ciphertext is read again at the next open and not before. Written
+    /// cipher (`Ahead`), and with `drop` the cache's copy of the ciphertext
+    /// dropped once it is synced: where the store's own cache has taken
+    /// the plaintext whole (`settled`), the ciphertext is read again when
+    /// a chunk of it has been given back and not before, and where it has
+    /// not, the ciphertext is what the file's first reads are of. Written
     /// past the cache instead (`O_DIRECT`, a megabyte at a time), the same
     /// envelope took half as long again: each piece waits for the device
     /// where the cached pieces go to it together.
-    fn write_envelope(&self, mem: &File, disk: &Disk, key: &Key, sync: bool) -> Result<u64> {
+    fn write_envelope(
+        &self,
+        mem: &File,
+        disk: &Disk,
+        key: &Key,
+        sync: bool,
+        drop: bool,
+    ) -> Result<u64> {
         let aead = (self.data)(&key.0);
         let len = mem.metadata()?.len();
         // Under a key of the file's own, which has no name of the caller's.
@@ -967,17 +1026,88 @@ impl Vault {
         } else {
             // SAFETY: a mapping of a memory file the store owns, whose
             // writer has finished with it.
-            let src = MmapBytes(unsafe { memmap2::Mmap::map(mem)? });
+            let src = MmapBytes::from_map(unsafe { memmap2::Mmap::map(mem)? });
             crypt::encrypt(&src, &mut out, &*aead, &opts)?;
         }
         let out = out.file;
         if sync {
             out.sync_all()?;
-            drop_cache(&out);
+            if drop {
+                drop_cache(&out);
+            }
         }
         Counts::add(&self.counts.persisted, 1);
         Counts::add(&self.counts.persisted_bytes, len);
         Ok(len)
+    }
+
+    /// Whether the cache holds, or will take, the plaintext of the file in
+    /// `mem` whole once it has its envelope: a view a reader has made of it
+    /// already is one it keeps, and a file nobody has read yet is taken
+    /// where the cache has room for it under its budget. A store that fits
+    /// its cache therefore reads what it wrote without decrypting it, and
+    /// one that does not leaves a merge's output to be read from its
+    /// envelope, by the chunk, when something wants it.
+    fn keeps(&self, mem: &Arc<File>) -> bool {
+        let viewed = lock(&self.files)
+            .values()
+            .any(|e| e.page.is_some() && e.mem.as_ref().is_some_and(|m| Arc::ptr_eq(m, mem)));
+        viewed || mem.metadata().is_ok_and(|m| self.pager.room_for(m.len()))
+    }
+
+    /// The file in `mem` has its envelope `disk`: from here it is the
+    /// cache's. A view of it gets the envelope behind it, so its chunks
+    /// may be given back; with `keep` and no view yet, one is made of the
+    /// memory file whole; and either way every name over the file gives up
+    /// the memory file's descriptor, which only the view's mapping needs.
+    ///
+    /// `files` is the table, locked by the caller since before it named
+    /// the envelope in it, and that is the point: a memory file has one
+    /// view. The first version took the lock again here, and a reader
+    /// that mapped the file between the naming and this made its view
+    /// from the memory file and the envelope both and took the memory
+    /// file from every entry, so this found no entry over the memory file,
+    /// made a second view of it for nobody, and the evictor, giving back a
+    /// megabyte of that view in the instant before it was dropped, punched
+    /// the memory file under the first: a segment's hash slots read as
+    /// zeroes, its key as absent, and a delete in it was not seen. One
+    /// seed in two hundred of the fuzz under a cache of sixteen kilobytes.
+    fn settled(
+        &self,
+        files: &mut HashMap<String, Entry>,
+        name: &str,
+        mem: &Arc<File>,
+        disk: &Disk,
+        keep: bool,
+    ) -> Result<()> {
+        let over = |e: &Entry| e.mem.as_ref().is_some_and(|m| Arc::ptr_eq(m, mem));
+        let viewed = files
+            .values()
+            .filter(|e| over(e))
+            .find_map(|e| e.page.clone());
+        let page = match viewed {
+            Some(p) => {
+                p.back(self.back_of(disk)?)?;
+                Some(p)
+            }
+            None if keep => {
+                let p = Paged::adopt(&self.pager, mem, mem.metadata()?.len(), name)?;
+                p.back(self.back_of(disk)?)?;
+                Counts::add(&self.counts.adopted, 1);
+                Some(p)
+            }
+            None => {
+                Counts::add(&self.counts.left, 1);
+                None
+            }
+        };
+        for e in files.values_mut() {
+            if over(e) {
+                e.page = page.clone();
+                e.mem = None;
+            }
+        }
+        Ok(())
     }
 
     /// Every segment in `pairs` durable in the directory as an envelope,
@@ -995,10 +1125,23 @@ impl Vault {
     /// ahead of any manifest, and a name gone by then -- a piece a
     /// promotion has linked under another name and unlinked -- is passed
     /// over, since whichever manifest names the file writes it.
+    ///
+    /// `dir_sync` is the directory's own fsync after an envelope was
+    /// made: off for a merge's piece written as it is finished
+    /// (`persist_one`), whose merge syncs the directory once at its end.
     pub(crate) fn persist(
         &self,
         pairs: &[(String, Option<String>)],
         named: bool,
+    ) -> Result<Vec<FileKey>> {
+        self.persist_with(pairs, named, true)
+    }
+
+    fn persist_with(
+        &self,
+        pairs: &[(String, Option<String>)],
+        named: bool,
+        dir_sync: bool,
     ) -> Result<Vec<FileKey>> {
         let _one = lock(&self.persisting);
         let mut out = Vec::with_capacity(pairs.len());
@@ -1025,7 +1168,8 @@ impl Vault {
                         wrapped: self.wrap(&Vault::file_aad(&token), &key)?,
                         ord: false,
                     };
-                    self.write_envelope(&mem, &disk, &key, true)?;
+                    let keep = self.keeps(&mem);
+                    self.write_envelope(&mem, &disk, &key, true, keep)?;
                     made = true;
                     let mut files = lock(&self.files);
                     // Every name over the same memory file: a link made
@@ -1038,10 +1182,14 @@ impl Vault {
                             held = true;
                         }
                     }
-                    if !held {
+                    if held {
+                        // Under the one lock with the naming above.
+                        self.settled(&mut files, seg, &mem, &disk, keep)?;
+                    } else {
                         // Removed while its envelope was written: nobody's.
                         let _ = std::fs::remove_file(self.real.join(disk.name()));
                     }
+                    drop(files);
                     disk
                 }
             };
@@ -1050,6 +1198,7 @@ impl Vault {
                 if let Some(Entry {
                     mem: Some(mem),
                     disk: None,
+                    ..
                 }) = e
                 {
                     let key = self
@@ -1059,19 +1208,26 @@ impl Vault {
                         ord: true,
                         ..disk.clone()
                     };
-                    self.write_envelope(&mem, &odisk, &key, false)?;
+                    let keep = self.keeps(&mem);
+                    self.write_envelope(&mem, &odisk, &key, false, false)?;
                     made = true;
                     let mut files = lock(&self.files);
+                    let mut held = false;
                     if let Some(e) = files.get_mut(ord) {
                         if e.mem.as_ref().is_some_and(|m| Arc::ptr_eq(m, &mem)) {
-                            e.disk = Some(odisk);
+                            e.disk = Some(odisk.clone());
+                            held = true;
                         }
                     }
+                    if held {
+                        self.settled(&mut files, ord, &mem, &odisk, keep)?;
+                    }
+                    drop(files);
                 }
             }
             out.push((disk.token, disk.wrapped));
         }
-        if made {
+        if made && dir_sync {
             File::open(&self.real)?.sync_all()?;
         }
         Ok(out)
@@ -1087,19 +1243,20 @@ impl Vault {
             wrapped,
             ord: false,
         };
-        // The copy another name over the same envelope has read already.
-        let mem_of = |files: &HashMap<String, Entry>, d: &Disk| {
+        // The view another name over the same envelope has already.
+        let page_of = |files: &HashMap<String, Entry>, d: &Disk| {
             files
                 .values()
-                .find(|e| e.mem.is_some() && e.disk.as_ref().is_some_and(|x| x.same(d)))
-                .and_then(|e| e.mem.clone())
+                .find(|e| e.page.is_some() && e.disk.as_ref().is_some_and(|x| x.same(d)))
+                .and_then(|e| e.page.clone())
         };
         if !files.contains_key(seg) {
-            let mem = mem_of(&files, &disk);
+            let page = page_of(&files, &disk);
             files.insert(
                 seg.to_string(),
                 Entry {
-                    mem,
+                    mem: None,
+                    page,
                     disk: Some(disk.clone()),
                 },
             );
@@ -1107,11 +1264,12 @@ impl Vault {
         if let Some(ord) = ord {
             let odisk = Disk { ord: true, ..disk };
             if !files.contains_key(ord) && self.real.join(odisk.name()).exists() {
-                let mem = mem_of(&files, &odisk);
+                let page = page_of(&files, &odisk);
                 files.insert(
                     ord.to_string(),
                     Entry {
-                        mem,
+                        mem: None,
+                        page,
                         disk: Some(odisk),
                     },
                 );
@@ -1241,15 +1399,16 @@ impl Counts {
         c.fetch_add(n, Ordering::Relaxed);
     }
 
-    fn read(&self, files: u64) -> CipherCounts {
+    fn read(&self, files: u64, cache: pager::PagerCounts) -> CipherCounts {
         let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
         CipherCounts {
             files,
             persisted: get(&self.persisted),
             persisted_bytes: get(&self.persisted_bytes),
-            loaded: get(&self.loaded),
-            loaded_bytes: get(&self.loaded_bytes),
+            adopted: get(&self.adopted),
+            left: get(&self.left),
             swept: get(&self.swept),
+            cache,
         }
     }
 }
@@ -1258,18 +1417,24 @@ impl Counts {
 /// (`Db::cipher_counts`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CipherCounts {
-    /// The store's files held in memory now, each a memory file with a
-    /// descriptor of its own: a segment and its ordered index are two.
+    /// The store's files in a writer's hands now: a file being written, or
+    /// written and not yet in the directory as its envelope. Each is a
+    /// memory file with a descriptor of its own until it is.
     pub files: u64,
     /// Files written to the directory as envelopes, and the plaintext
     /// bytes sealed into them.
     pub persisted: u64,
     pub persisted_bytes: u64,
-    /// Envelopes decrypted into memory, and the plaintext bytes of them.
-    pub loaded: u64,
-    pub loaded_bytes: u64,
+    /// Files whose plaintext the cache took whole from their writer, there
+    /// being room for it, and files it left to be read from their
+    /// envelopes.
+    pub adopted: u64,
+    pub left: u64,
     /// Envelopes no manifest named, removed at the open.
     pub swept: u64,
+    /// The cache the store reads through: what it may hold and holds, and
+    /// what it has decrypted and given back.
+    pub cache: PagerCounts,
 }
 
 const SLOT_MAGIC: &[u8; 9] = b"SUPDBMAE\x01";
@@ -1419,7 +1584,7 @@ pub(crate) fn open(path: impl AsRef<Path>) -> Result<File> {
     match locate(path) {
         None => File::open(path),
         Some((v, name)) if passes(&name) => File::open(v.real.join(name)),
-        Some((v, name)) => reopen(&*v.load(&name)?, false, false),
+        Some((v, name)) => v.reopen_written(&name),
     }
 }
 
@@ -1567,9 +1732,12 @@ pub(crate) fn read(path: impl AsRef<Path>) -> Result<Vec<u8>> {
         None => std::fs::read(path),
         Some((v, name)) if passes(&name) => std::fs::read(v.real.join(name)),
         Some((v, name)) => {
-            let mem = v.load(&name)?;
-            let mut buf = vec![0u8; mem.metadata()?.len() as usize];
-            mem.read_exact_at(&mut buf, 0)?;
+            let page = v.page_of(&name)?;
+            let _held = v.pager.hold();
+            let src = MmapBytes::paged(page);
+            let mut buf = vec![0u8; src.len() as usize];
+            src.read_at(0, &mut buf)?;
+            v.pager.check()?;
             Ok(buf)
         }
     }
@@ -1618,29 +1786,49 @@ pub(crate) fn persist(dir: impl AsRef<Path>, pairs: &[(String, Option<String>)])
     }
 }
 
-/// The file mapped for reading, as `MmapBytes::open` maps it.
+/// `persist` for one segment a merge has just finished, by its name, with
+/// its ordered index beside it; the directory's sync is left to the
+/// merge's own `persist` of all its outputs at its end, which finds the
+/// envelopes made and syncs the directory once.
+pub(crate) fn persist_one(dir: impl AsRef<Path>, seg: &str) -> Result<()> {
+    match under(dir.as_ref()) {
+        Some(v) => {
+            let ord = crate::db::Db::ord_name_for(seg);
+            v.persist_with(&[(seg.to_string(), ord)], false, false)
+                .map(|_| ())
+        }
+        None => Ok(()),
+    }
+}
+
+/// The file mapped for reading, as `MmapBytes::open` maps it. A kept
+/// file's mapping is a paged one (`pager::Paged`): address space the
+/// file's length, of which a range is read by asking for it, under a pin
+/// of the store's reader table or a hold (`hold`).
 pub(crate) fn map(path: impl AsRef<Path>) -> Result<MmapBytes> {
     let path = path.as_ref();
     match locate(path) {
         None => MmapBytes::open(path),
         Some((v, name)) if passes(&name) => MmapBytes::open(&v.real.join(name)),
-        Some((v, name)) => {
-            let mem = v.load(&name)?;
-            // SAFETY: the contract `MmapBytes::open` takes: the file is
-            // written once and not again while a reader holds it, and a
-            // memory file is nobody's but the store's.
-            let map = unsafe { memmap2::Mmap::map(&*mem)? };
-            // Every page of it mapped here, by whoever opens the file: the
-            // pages are in memory already, a memory file's are small, and
-            // a first touch through an empty table maps sixteen of them a
-            // fault where a plain file's megabyte folios map one a fault.
-            // The scans after a load took 220 faults where a plain store's
-            // took 40, a fifth of a pass of a thousand scans.
-            #[cfg(target_os = "linux")]
-            let _ = map.advise(memmap2::Advice::PopulateRead);
-            Ok(MmapBytes(map))
-        }
+        Some((v, name)) => Ok(MmapBytes::paged(v.page_of(&name)?)),
     }
+}
+
+/// Whether every file of the store in `dir` has read so far: the failure a
+/// read of a store under a cipher met, if one has (`Pager::check`), and
+/// nothing for a plain store, whose reads fail where they are made.
+pub(crate) fn check(dir: impl AsRef<Path>) -> Result<()> {
+    match under(dir.as_ref()) {
+        Some(v) => v.pager.check(),
+        None => Ok(()),
+    }
+}
+
+/// A hold on the reads of the store in `dir` by this thread, for a thread
+/// that reads the store's files with no slot of its reader table pinned:
+/// nothing for a plain store, whose mappings are the kernel's to page.
+pub(crate) fn hold(dir: impl AsRef<Path>) -> Option<pager::Hold> {
+    under(dir.as_ref()).map(|v| v.pager.hold())
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1756,7 +1944,17 @@ mod tests {
         assert!(!exists(d.join("seal-1.tmp")));
         assert_eq!(read(d.join("par-1-key-00750.sup")).unwrap(), body);
         let m = map(d.join("par-1-key-00750.sup")).unwrap();
-        assert_eq!(&m.0[..], &body[..]);
+        assert!(m.piecewise(), "a kept file is read by the piece");
+        assert!(
+            m.as_slice().is_empty(),
+            "and lends nothing that was not asked for"
+        );
+        {
+            let _held = held.vault().pager().hold();
+            assert_eq!(m.slice_at(0, body.len()).unwrap(), &body[..]);
+            assert_eq!(m.slice_at(77, 5000).unwrap(), &body[77..5077]);
+            assert!(m.slice_at(1, body.len()).is_none(), "past the end");
+        }
         let mut again = Vec::new();
         open(d.join("par-1-key-00750.sup"))
             .unwrap()
@@ -1911,17 +2109,29 @@ mod tests {
         assert_eq!(v.sweep().unwrap(), 1);
         assert!(!real.join(disk_name(&orphan, false)).exists());
         assert_eq!(len(d.join("seg-1.sup")).unwrap(), body.len() as u64);
+        let m = map(d.join("seg-1.sup")).unwrap();
         assert_eq!(
-            v.counts.loaded.load(Ordering::Relaxed),
+            v.pager().counts().fills,
             0,
-            "a length decrypts nothing"
+            "a length and a map decrypt nothing"
         );
-        assert_eq!(&map(d.join("seg-1.sup")).unwrap().0[..], &body[..]);
+        {
+            let _held = v.pager().hold();
+            assert_eq!(m.slice_at(100_000, 10).unwrap(), &body[100_000..100_010]);
+        }
+        assert_eq!(v.pager().counts().fills, 1, "a read decrypts its chunk");
+        assert_eq!(read(d.join("seg-1.sup")).unwrap(), body);
+        let chunks = body.len().div_ceil(pager::CHUNK) as u64;
+        assert_eq!(v.pager().counts().fills, chunks);
         assert_eq!(read(d.join("par-1.sup")).unwrap(), body);
         assert_eq!(
-            v.counts.loaded.load(Ordering::Relaxed),
-            1,
-            "two names, one copy"
+            v.pager().counts().fills,
+            chunks,
+            "two names, one copy: nothing is decrypted twice"
+        );
+        assert!(
+            open(d.join("seg-1.sup")).is_err(),
+            "a file with its envelope has no descriptor to hand out"
         );
         assert_eq!(read(d.join("ord-1.oidx")).unwrap(), b"index");
         assert!(open_write(d.join("seg-1.sup")).is_err(), "written once");
@@ -1955,7 +2165,10 @@ mod tests {
             std::fs::write(&path, &bad).unwrap();
             let held = Vault::open(&real, &cipher(1)).unwrap();
             held.vault().adopt("seg-1.sup", token, wrapped, None);
-            assert!(map(held.dir().join("seg-1.sup")).is_err(), "byte {at}");
+            // A header that is not one is refused where the file is
+            // mapped, and a chunk that fails its tag where it is read;
+            // either way the file's bytes are not answered.
+            assert!(read(held.dir().join("seg-1.sup")).is_err(), "byte {at}");
         }
         std::fs::write(&path, &good).unwrap();
         let held = Vault::open(&real, &cipher(1)).unwrap();

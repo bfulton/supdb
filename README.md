@@ -26,7 +26,8 @@ from either source.
 - A live store opens under a key, either of two ways: the kernel encrypts
   its directory and the store reads as it does without one, or the store
   seals everything it writes under a cipher the caller supplies, on any
-  filesystem, and holds its plaintext in memory.
+  filesystem, and reads through a cache of plaintext of a size the caller
+  sets, so a store larger than memory runs in it.
 
 ## Benchmarks
 
@@ -238,8 +239,10 @@ use supdb::{Db, Encryption, Options, StoreCipher};
 
 // `Gcm` is your cipher behind `supdb::crypt::Aead`, as for an envelope:
 // once under your key, and as the constructor of one from a key the store
-// draws.
-let cipher = StoreCipher::new(Gcm::new(&my_key), Gcm::new).key_id(1);
+// draws. `cache_bytes` is the plaintext the store may hold in memory.
+let cipher = StoreCipher::new(Gcm::new(&my_key), Gcm::new)
+    .key_id(1)
+    .cache_bytes(4 << 30);
 let opts = Options {
     encryption: Encryption::Cipher(cipher),
     ..Options::default()
@@ -259,26 +262,41 @@ where none is given. `supdb::cipher_key_id` reads back the `key_id` of a
 directory without the key, and `supdb::cipher_rewrap` hands a store from
 one of your keys to another by rewriting that one wrapped key.
 
-The store's plaintext is held in memory files, and its reads borrow from
-their mappings as a plain store's borrow from the page cache, so a read
-runs the same code. What that costs: the store has to fit in memory, an
-`open` decrypts all of it, an ordered load goes through the log, each
-segment holds two file descriptors open, and it is Linux only. A byte
-changed anywhere in the directory is refused, or ends the log as a torn
-write does; the whole directory put back to an older copy of itself is
-not detected. `cargo run --release --example cipher_store` has the
-adapter and times an open, and the `supdb::db::vault` module docs have
-the layout, the keys and the limits.
+The cipher is in your process, so the kernel's page cache cannot hold the
+store's plaintext, and the store keeps a cache of its own: a chunk of a
+file is decrypted where it is first read, borrowed from in place as a
+plain store borrows from the page cache, and given back once the cache is
+past `cache_bytes` and the chunk has not been read lately. A store runs in
+the cache it is given whatever its size, at the rate of its misses, and an
+`open` decrypts what an open reads of each file, not the store. Unset, the
+cache is half of the memory the process may use; the kernel's own cache
+holds the ciphertext a miss is read from. What the cache does not count is
+what any store holds in the process: its unsealed writes and the block
+cache.
 
-Which of the two a store wants: `Encryption::Kernel` keeps the page
-cache, so a store larger than memory works and an open decrypts nothing,
-on ext4 or f2fs with `encrypt` on; it does not authenticate, and the files
-read as plaintext to whatever can read them while the kernel holds the
-key. `Encryption::Cipher` goes wherever Linux does, authenticates, and
-leaves files that are ciphertext wherever they are copied, and holds the
-store in memory. It is one or the other: a store under both would encrypt
-every byte twice for nothing, so the option takes one, and a store kept
-one way is refused when it is opened the other.
+A file's bytes are checked where they are decrypted. A byte changed in the
+marker, a manifest or a file's header is refused at the `open`, a byte
+changed in the log ends the log as a torn write does, and a byte changed
+in a segment is refused at the read that first wants it: that read
+answers with an error, and so does every operation after it. The whole
+directory put back to an older copy of itself is not detected.
+
+What it costs beside the cipher: an ordered load goes through the log, the
+compact form is off, and it is Linux only. `Db::cipher_counts` says what
+the cache holds, has decrypted and has given back. `cargo run --release
+--example cipher_store` has the adapter and opens a store under a cache
+smaller than it, and the `supdb::db::vault` module docs have the layout,
+the keys and what is and is not refused.
+
+Which of the two a store wants: `Encryption::Kernel` keeps the kernel's
+page cache and every read path as it is, on ext4 or f2fs with `encrypt`
+on; it does not authenticate, and the files read as plaintext to whatever
+can read them while the kernel holds the key. `Encryption::Cipher` goes
+wherever Linux does, authenticates, leaves files that are ciphertext
+wherever they are copied, and reads through a cache you size. It is one or
+the other: a store under both would encrypt every byte twice for nothing,
+so the option takes one, and a store kept one way is refused when it is
+opened the other.
 
 ## Building
 

@@ -193,6 +193,212 @@ fn a_source_that_cannot_lend_answers_the_same() {
     reads_what_was_written(&blob, &want);
 }
 
+/// The copies a `Piecewise` has lent, by offset and length.
+type Lent = std::collections::HashMap<(u64, usize), Box<[u64]>>;
+
+/// A source that lends by the piece (`Bytes::piecewise`), and lends exactly
+/// what it is asked for: each `slice_at` answers with a copy of the range in
+/// memory of its own, at the range's alignment in the file, with nothing of
+/// the file on either side of it. A reader that asked for less than it then
+/// read finds zeroes or the end of a slice, never the bytes that would have
+/// been there in a mapping, so a reader that agrees with the mapped one
+/// through this source has asked for every byte it read. It counts what it
+/// was asked for, since a reader that asked for its sections whole would
+/// agree as well.
+struct Piecewise {
+    bytes: Vec<u8>,
+    piece: u64,
+    /// What has been lent, by the range asked for: a range asked for again
+    /// is lent from the copy made for it the first time, since every copy
+    /// stands for as long as the source does and a walk asks for the same
+    /// windows many times over.
+    lent: std::sync::Mutex<Lent>,
+    asked: std::sync::atomic::AtomicU64,
+}
+
+impl Piecewise {
+    fn new(bytes: Vec<u8>, piece: u64) -> Piecewise {
+        Piecewise {
+            bytes,
+            piece,
+            lent: std::sync::Mutex::new(std::collections::HashMap::new()),
+            asked: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn asked(&self) -> u64 {
+        self.asked.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Bytes for Piecewise {
+    fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+    fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
+        Copying(self.bytes.clone()).read_at(off, dst)
+    }
+    fn slice_at(&self, off: u64, len: usize) -> Option<&[u8]> {
+        let end = off.checked_add(len as u64)?;
+        if end > self.len() {
+            return None;
+        }
+        self.asked
+            .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+        let phase = (off % 8) as usize;
+        let mut lent = self.lent.lock().unwrap();
+        let buf = lent.entry((off, len)).or_insert_with(|| {
+            let mut buf = vec![0u64; (phase + len).div_ceil(8) + 1].into_boxed_slice();
+            // SAFETY: `phase + len` bytes fit the buffer, and the source
+            // range is inside `bytes`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.bytes.as_ptr().add(off as usize),
+                    buf.as_mut_ptr().cast::<u8>().add(phase),
+                    len,
+                );
+            }
+            buf
+        });
+        // SAFETY: the buffer is kept in `lent` for this source's life,
+        // boxed, so it does not move when the map grows, and it is never
+        // written again: the slice lent from it stands as long as `self`.
+        Some(unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>().add(phase), len) })
+    }
+    fn piecewise(&self) -> bool {
+        true
+    }
+    fn piece_end(&self, off: u64) -> u64 {
+        ((off / self.piece + 1) * self.piece).min(self.len())
+    }
+}
+
+/// Every answer of one reader held to another's, rank by rank and key by
+/// key: the keys, the extents, the seeks, the scans and the counts.
+fn agree<A: Bytes, B: Bytes>(a: &Blob<A>, b: &Blob<B>) {
+    assert_eq!(a.keys(), b.keys());
+    assert_eq!(a.blocks(), b.blocks());
+    assert_eq!(a.index_bytes(), b.index_bytes());
+    assert_eq!(a.version(), b.version());
+    assert_eq!(a.payload_bytes(), b.payload_bytes());
+    for rank in 0..a.keys() + 2 {
+        assert_eq!(a.key_at(rank), b.key_at(rank), "key at {rank}");
+        let (x, y) = (a.exts_at_full(rank), b.exts_at_full(rank));
+        assert_eq!(x.is_some(), y.is_some(), "record at {rank}");
+        if let (Some((ka, ea, ta)), Some((kb, eb, tb))) = (x, y) {
+            assert_eq!(ka, kb);
+            assert_eq!(ea.iter().collect::<Vec<_>>(), eb.iter().collect::<Vec<_>>());
+            assert_eq!(ta, tb, "inline tail at {rank}");
+        }
+        let (mut va, mut vb) = (Vec::new(), Vec::new());
+        let na = a.values_at(rank, |v| va.push(v.to_vec())).unwrap();
+        let nb = b.values_at(rank, |v| vb.push(v.to_vec())).unwrap();
+        assert_eq!((na, va), (nb, vb), "values at {rank}");
+    }
+    let mut probes: Vec<Vec<u8>> = (0..a.keys())
+        .step_by(7)
+        .filter_map(|r| a.key_at(r).map(<[u8]>::to_vec))
+        .collect();
+    probes.push(Vec::new());
+    probes.push(b"term=".to_vec());
+    probes.push(b"term=00000003x".to_vec());
+    probes.push(b"zzzz".to_vec());
+    for key in &probes {
+        assert_eq!(a.seek(key), b.seek(key), "seek");
+        assert_eq!(
+            a.lookup(key).map(|e| e.iter().copied().collect::<Vec<_>>()),
+            b.lookup(key).map(|e| e.iter().copied().collect::<Vec<_>>()),
+            "lookup"
+        );
+        for limit in [0, 1, 5, 64, usize::MAX] {
+            let (mut sa, mut sb) = (Vec::new(), Vec::new());
+            let na = a
+                .scan(key, limit, |k, v| sa.push((k.to_vec(), v.to_vec())))
+                .unwrap();
+            let nb = b
+                .scan(key, limit, |k, v| sb.push((k.to_vec(), v.to_vec())))
+                .unwrap();
+            assert_eq!((na, sa), (nb, sb), "scan of {limit}");
+            let (mut ca, mut cb) = (Vec::new(), Vec::new());
+            a.scan_counts(key, limit, |k, n| {
+                ca.push((k.to_vec(), n));
+                true
+            })
+            .unwrap();
+            b.scan_counts(key, limit, |k, n| {
+                cb.push((k.to_vec(), n));
+                true
+            })
+            .unwrap();
+            assert_eq!(ca, cb, "counts over {limit}");
+            let (mut fa, mut fb) = (Vec::new(), Vec::new());
+            a.scan_counts_fixed(key, limit, 4, |k, n| {
+                fa.push((k.to_vec(), n));
+                true
+            })
+            .unwrap();
+            b.scan_counts_fixed(key, limit, 4, |k, n| {
+                fb.push((k.to_vec(), n));
+                true
+            })
+            .unwrap();
+            assert_eq!(fa, fb, "fixed counts over {limit}");
+        }
+    }
+}
+
+/// A source that lends by the piece answers as the mapping does, having
+/// been asked for every byte it was read by -- and for little: a reader
+/// that borrowed its key section whole at each lookup would agree on every
+/// answer and ask for the section a lookup. The shapes are the ones a
+/// record takes (full and compact, values inline, in plain blocks and in
+/// compressed ones), and the pieces are small enough that a record crosses
+/// one in most of them and large enough in the last that none does.
+#[test]
+fn a_source_that_lends_by_the_piece_answers_the_same() {
+    for (name, compress, compact) in [
+        ("plain", false, false),
+        ("compact", false, true),
+        ("compressed", true, false),
+    ] {
+        let path = scratch(&format!("piecewise-{name}"));
+        let want = build_opts(&path, 600, compress, 256, compact);
+        let raw = std::fs::read(&path).unwrap();
+        let mapped = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
+        for piece in [24, 64, 4080, 1 << 16] {
+            let blob = Blob::open(Piecewise::new(raw.clone(), piece)).expect("open by the piece");
+            assert!(blob.zero_copy(), "{name}: a piece lent is not a copy");
+            let at_open = blob_source(&blob).asked();
+            assert!(
+                at_open < 4096,
+                "{name}, pieces of {piece}: an open asked for {at_open} bytes of a section of {}",
+                blob.index_bytes()
+            );
+            reads_what_was_written(&blob, &want);
+            agree(&mapped, &blob);
+        }
+        // What a point read asks for: a slot or two, and the record's
+        // window, which is the piece the record lies in.
+        let blob = Blob::open(Piecewise::new(raw.clone(), 256)).expect("open by the piece");
+        let before = blob_source(&blob).asked();
+        let reads = 50;
+        for (key, _) in want.iter().step_by(want.len() / reads).take(reads) {
+            assert!(blob.lookup(key).is_some());
+        }
+        let per = (blob_source(&blob).asked() - before) / reads as u64;
+        assert!(
+            per < 1024,
+            "{name}: a lookup asked for {per} bytes of a section of {}",
+            blob.index_bytes()
+        );
+    }
+}
+
+/// The source a reader was opened over.
+fn blob_source<B: Bytes>(blob: &Blob<B>) -> &B {
+    blob.source()
+}
+
 /// Compact records, through a source that lends and one that copies: the
 /// same answers as each other and as what was written, and the lending one
 /// still copies nothing. The fixture's runs straddle the inline bound, so
