@@ -1704,6 +1704,43 @@ It was found by running ranges the gate does not, and attributed by
 building the main line's head and running the seed there before reading
 it as this change's; it is an open item in `ROADMAP.md`.
 
+And one the hunt did not find, because the store read right in every
+run of it: a chunk lent out of a unit marked twice. One seed in three
+hundred of the fuzz under a cache of sixteen kilobytes, four seeds at a
+time on four cores, ended in a merge that wrote its keys out of order, a
+key outside its piece's fence, or a value that was another's; the same
+seed alone, a hundred and sixty times, in nothing; and the gate's range
+never. It was there on the commit before the day's work, which is the
+first thing that was run. A page the cache gives back reads as zeroes,
+so the read that went wrong was nowhere near where it showed, and the
+instrument was to make it a fault: `SUPDB_PAGER_GUARD`, under debug
+assertions, makes pages given back unreadable until they are filled
+again (`pager::guard_on`). The first run under it faulted in a point
+read's load of a hash slot, a few instructions after the ask that made
+the slot present; a probe at the ask's end said the range was readable
+there; and the reader table printed from the fault had the reader pinned
+at the epoch as it stood, so the evictor had been right not to wait for
+it. The reader had taken a chunk on its state's word. A reader that
+finds its chunk dying takes the unit back and then says the chunk is
+lent, two words and two steps, and a thread that lost its core between
+them stayed off it while the evictor ended the pass the rescue was from
+and marked the unit again in its next, the chunk dying still: said to
+be lent then, the chunk stood in a unit about to be given back, and the
+reader after it, pinned after that mark, read it as it went. The reader
+that says so looks at the unit again now, and where it is marked puts
+the chunk back and takes the unit back from that mark too
+(`Paged::slow`); `a_chunk_is_not_lent_out_of_a_unit_marked_again_under_its_rescue`
+walks the interleaving by hand. `Paged::free` had met the state and
+explained it: it emptied chunks that were dying "or revived by a reader
+that took the unit back from an earlier mark, was waited out by this
+one, and has gone", which is the bug described as a case. It asserts
+now that no chunk of a unit given back is lent. The rules: a state met
+where the design says there is none is asserted, never given a
+sentence; a transition of two steps over two words is looked at again
+after the second; a failure that needs the machine busy is run busy,
+several seeds a core, before a range is called clean; and wrong bytes
+are made a fault before they are chased as wrong answers.
+
 The rules of the hunt: a wait under a pin is a pin, and so is a
 timeslice; a wait is drawn against what its remedy can move, and at
 different lines for work that can wait and a read that cannot; a count

@@ -771,6 +771,11 @@ pub(crate) struct Paged {
     /// Chunks present, for the drop's count; kept by the fills and the
     /// frees.
     present: AtomicUsize,
+    /// A test's hold on a reader between its taking a unit back and its
+    /// saying a chunk of it is lent (`pause_after_rescue`): 1 asked, 2
+    /// held.
+    #[cfg(test)]
+    pause: AtomicU8,
     /// The memory file this is the one view of (`VIEWED`).
     #[cfg(debug_assertions)]
     viewed: Option<u64>,
@@ -847,6 +852,8 @@ impl Paged {
             back: OnceLock::new(),
             label: label.to_string(),
             present: AtomicUsize::new(if first == EMPTY { 0 } else { chunks }),
+            #[cfg(test)]
+            pause: AtomicU8::new(0),
             #[cfg(debug_assertions)]
             viewed,
         });
@@ -976,6 +983,19 @@ impl Paged {
         // SAFETY: the chunk is `BUSY` by this thread's hand, so nobody
         // else writes it and nobody reads it; its bytes are inside the
         // mapping.
+        if guard_on() {
+            let ps = page_size();
+            let a = (c * CHUNK) / ps * ps;
+            let b = ((c * CHUNK + n).div_ceil(ps) * ps).min(self.mapped);
+            // SAFETY: the pages this chunk lies in, of this mapping.
+            unsafe {
+                libc::mprotect(
+                    self.base.add(a).cast(),
+                    b - a,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            };
+        }
         let dst = unsafe { std::slice::from_raw_parts_mut(self.base.add(c * CHUNK), n) };
         dst.copy_from_slice(&stored[..n]);
         let tag: [u8; TAG] = stored[n..].try_into().expect("a tag's length");
@@ -1022,8 +1042,31 @@ impl Paged {
                         self.gone(unit);
                         continue;
                     }
-                    // The unit is lent from again, and this chunk with it.
-                    let _ = state.compare_exchange(DYING, HOT, Ordering::SeqCst, Ordering::SeqCst);
+                    #[cfg(test)]
+                    self.pause_after_rescue();
+                    // The unit is lent from again, and this chunk with it
+                    // -- if the unit is still the one taken back. Between
+                    // the two a thread may lose its core for as long as it
+                    // takes the evictor to end the pass this rescue was
+                    // from and mark the unit again, this chunk dying in it
+                    // as the mark found it. Said to be lent then, it is a
+                    // chunk every reader after takes on that word alone
+                    // (`ensure`), in a unit the evictor gives back as soon
+                    // as the readers before its mark have gone, and those
+                    // do not include the reader that has just been lent
+                    // it. So the unit is looked at again once the chunk
+                    // says so, and where it is marked the chunk is put
+                    // back and the unit taken back from that mark too,
+                    // which this thread is in time for: it has been pinned
+                    // since before the mark, and the mark waits for it.
+                    if state
+                        .compare_exchange(DYING, HOT, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                        && unit.load(Ordering::SeqCst) != LIVE
+                    {
+                        let _ =
+                            state.compare_exchange(HOT, DYING, Ordering::SeqCst, Ordering::SeqCst);
+                    }
                 }
                 EMPTY => {
                     if state
@@ -1059,6 +1102,21 @@ impl Paged {
                 }
                 // Another thread is decrypting it: microseconds.
                 _ => std::thread::yield_now(),
+            }
+        }
+    }
+
+    /// A test's: a reader that has taken a unit back held there, before it
+    /// says its chunk is lent, until the test lets it go.
+    #[cfg(test)]
+    fn pause_after_rescue(&self) {
+        if self
+            .pause
+            .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            while self.pause.load(Ordering::SeqCst) == 2 {
+                std::thread::yield_now();
             }
         }
     }
@@ -1171,14 +1229,24 @@ impl Paged {
             // unit is `LIVE` again. The pages and the file's store behind
             // them go, and read as zeroes until filled again.
             unsafe { give_back(self.base.add(a), b - a) };
+            if guard_on() {
+                // SAFETY: the pages just given back, of this mapping.
+                unsafe { libc::mprotect(self.base.add(a).cast(), b - a, libc::PROT_NONE) };
+            }
         }
         let mut bytes = 0u64;
         let mut chunks = 0usize;
         for (i, s) in self.state[lo..hi].iter().enumerate() {
-            // Dying, as the mark left it, or revived by a reader that took
-            // the unit back from an earlier mark, was waited out by this
-            // one, and has gone: present either way, and gone now.
-            if matches!(s.swap(EMPTY, Ordering::SeqCst), DYING | COLD | HOT) {
+            let was = s.swap(EMPTY, Ordering::SeqCst);
+            // Dying, as the mark left it: a chunk lent in a unit given
+            // back is one a reader after the mark was reading.
+            debug_assert!(
+                !matches!(was, COLD | HOT),
+                "{}: chunk {} was lent in a unit given back",
+                self.label,
+                lo + i
+            );
+            if matches!(was, DYING | COLD | HOT) {
                 bytes += self.chunk_len(lo + i) as u64;
                 chunks += 1;
             }
@@ -1328,6 +1396,29 @@ fn map_shared(mem: &File, len: usize) -> Result<*mut u8> {
         libc::madvise(p, len, libc::MADV_NOHUGEPAGE);
     }
     Ok(p.cast())
+}
+
+/// Whether pages given back are made unreadable until they are filled
+/// again: under debug assertions, with `SUPDB_PAGER_GUARD` set. A page
+/// given back reads as zeroes, so a read through a borrow that outlived
+/// its pages is a key that is not there or a record of nothing, found far
+/// from where it was made; with this it is a fault at the read, and
+/// `gdb -batch -ex run -ex bt` over the test names the reader. A chunk
+/// shares a page with its neighbour, so a page is readable from the first
+/// of its chunks filled, and a read of the other half of it is not seen.
+/// It is how the chunk lent out of a unit marked twice was found
+/// (`Paged::slow`): one seed in three hundred of the fuzz under a cache of
+/// sixteen kilobytes, four seeds at a time, and a fault in the first run
+/// with this set.
+#[cfg(debug_assertions)]
+fn guard_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SUPDB_PAGER_GUARD").is_some())
+}
+
+#[cfg(not(debug_assertions))]
+const fn guard_on() -> bool {
+    false
 }
 
 /// The pages at `at` and their store given back.
@@ -1600,6 +1691,77 @@ mod tests {
             &bytes[..100],
             "asked for again, the borrow reads as it did"
         );
+        drop(p);
+        pager.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A chunk is not lent out of a unit marked again under the rescue
+    /// that lent it. A reader that finds its chunk dying takes the unit
+    /// back and then says the chunk is lent, two steps, and a thread can
+    /// lose its core between them for long enough that the evictor ends
+    /// the pass the rescue was from and marks the unit in its next: the
+    /// chunk then said to be lent stood in a unit about to be given back,
+    /// and the next reader, pinned after that mark and so not waited for,
+    /// took it on the word and read pages as they went. The interleaving
+    /// by hand: a mark, a reader held after its rescue, the first pass's
+    /// end, a second mark, the reader let go. The reader takes the unit
+    /// back from the second mark too, so nothing of it is given back
+    /// while its chunk is lent.
+    #[test]
+    fn a_chunk_is_not_lent_out_of_a_unit_marked_again_under_its_rescue() {
+        let dir = scratch("remark");
+        let bytes = plain(4 * 1024 * 1024, 9);
+        envelope(&dir.join("e"), &bytes, 23);
+        // A budget the file is far inside: the evictor marks nothing of
+        // its own, and the marks here are the test's.
+        let pager = Pager::new(1 << 40);
+        let p = sparse(&pager, &dir.join("e"), 23);
+        let h = pager.hold();
+        assert!(p.ensure(0, 100));
+        // A first look finds the chunk read and passes the unit over; the
+        // second marks it.
+        let t = std::time::Instant::now();
+        while p.mark(0) == 0 {
+            assert!(
+                t.elapsed() < Duration::from_secs(10),
+                "the unit is never marked"
+            );
+        }
+        assert_eq!(p.unit[0].load(Ordering::SeqCst), EVICTING);
+        assert_eq!(p.state[0].load(Ordering::SeqCst), DYING);
+        p.pause.store(1, Ordering::SeqCst);
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let _h = pager.hold();
+                p.ensure(0, 100)
+            });
+            let t = std::time::Instant::now();
+            while p.pause.load(Ordering::SeqCst) != 2 {
+                assert!(
+                    t.elapsed() < Duration::from_secs(10),
+                    "the reader never took the unit back"
+                );
+                std::thread::yield_now();
+            }
+            // Taken back: the first pass gives nothing of it back.
+            assert_eq!(p.unit[0].load(Ordering::SeqCst), LIVE);
+            assert_eq!(p.free(0), 0, "a unit taken back was given back");
+            // Marked again, its chunk dying still, as the reader left it.
+            assert!(p.mark(0) > 0, "the unit was not marked a second time");
+            assert_eq!(p.unit[0].load(Ordering::SeqCst), EVICTING);
+            p.pause.store(0, Ordering::SeqCst);
+            assert!(reader.join().unwrap());
+        });
+        assert_eq!(p.state[0].load(Ordering::SeqCst), HOT, "the chunk is lent");
+        assert_eq!(
+            p.unit[0].load(Ordering::SeqCst),
+            LIVE,
+            "a chunk is lent in a unit marked to go"
+        );
+        assert_eq!(p.free(0), 0, "a unit with a chunk lent was given back");
+        assert_eq!(read(&p, 0, 100).unwrap(), &bytes[..100]);
+        drop(h);
         drop(p);
         pager.stop();
         let _ = std::fs::remove_dir_all(&dir);
