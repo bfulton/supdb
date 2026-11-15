@@ -2148,6 +2148,16 @@ pub struct Options {
     /// supdb-cache64tofitautozpages supdb-cache64tofitautozpagesrecord 5000000
     /// --reps 5 --bound 671088640 --passes
     /// read,read-threaded,scan,scan-threaded,mixes --ops-div 10` at `589e7df`).
+    /// Priced again on the default as the gear's compressed pick
+    /// (`supdb-zrecord`) at ten million keys under 1.25 GiB it lost the point
+    /// reads too: C 0.70x, the read pass 0.83x, E 0.75x and the scan pass
+    /// 0.49x of the default, since the block coding's point read has gained
+    /// the partial decode, the memo's admission and the key table and the
+    /// record coding's has none of them, and still decodes its tails with
+    /// `lz4_flex` and seeks its heads one by one (`bench ab --arms
+    /// supdb,supdb-zrecord --size 10000000 --bound 1342177280 --passes
+    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+    /// --ops-div 10 --reps 2` at `3ef8f79`).
     #[doc(hidden)]
     pub zpages_record_coding: bool,
     /// EXPERIMENT: the form file's groups stored verbatim, every one, LZ4
