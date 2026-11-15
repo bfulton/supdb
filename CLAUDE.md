@@ -193,7 +193,12 @@ not what the probe times -- a warmup loop inside the toggle doubled every
 figure once. Name the function exactly: the toggle flips at every
 function the pattern matches, so `*Reader*scan*` turned collection off
 again inside `scan_blocks` and counted a scan without its walk, three
-runs before anyone read the function list. And valgrind runs one thread
+runs before anyone read the function list. Read a recursive function by
+its self rows: callgrind's inclusive figure for a recursive quicksort
+counts each level's children again, so the settle's sort of its pending
+writes read a fifth of a settle's instructions at ten thousand keys, a
+radix was built to replace it, and the settle came out 0.9M of 48M
+instructions lighter, the two percent the self rows had said. And valgrind runs one thread
 at a time: a state the upkeep thread must build while the probe sleeps
 -- the copies after a burst -- is never reached under it, however long
 the sleep, so the copy walk's instruction count cannot be had this way.
