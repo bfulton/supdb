@@ -3417,6 +3417,18 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose point reads through a form file ask no filter
+    /// (`Options::zpages_point_filter` off).
+    pub fn create_znofilter(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                znopointfilter: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` whose compressed form files are built in the record coding,
     /// each record decodable alone, so a point read decodes one record and
     /// not its group (`Options::zpages_record_coding` on; the controller's
@@ -10327,6 +10339,9 @@ impl Engine for Supdb {
         if self.zpages && !self.block_cache && self.znopointfilter {
             return "supdb-nocachezpagesnofilter";
         }
+        if self.znopointfilter {
+            return "supdb-znofilter";
+        }
         if self.zpointwhole && self.znopointkeys && self.zscanputs {
             return "supdb-zmemoplain";
         }
@@ -11981,6 +11996,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocachezpagesgroup1k"
         | "supdb-nocachezpagesnopointkeys"
         | "supdb-nocachezpagesnofilter"
+        | "supdb-znofilter"
         | "supdb-nocachezpagessettle"
         | "supdb-autozpages"
         | "supdb-nozpages"
@@ -12530,6 +12546,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             supdb_arm(Supdb::create_nocache_zpages_nopointkeys, dir)?
         }
         "supdb-nocachezpagesnofilter" => supdb_arm(Supdb::create_nocache_zpages_nofilter, dir)?,
+        "supdb-znofilter" => supdb_arm(Supdb::create_znofilter, dir)?,
         "supdb-nocachezpagessettle" => supdb_arm(Supdb::create_nocache_zpages_settle, dir)?,
         "supdb-autozpages" => supdb_arm(Supdb::create_auto_zpages, dir)?,
         "supdb-nozpages" => supdb_arm(Supdb::create_nozpages, dir)?,
@@ -15869,6 +15886,13 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.scan_raw_ahead && o.scan_raw_ahead_lead == 1024);
                 assert!(!o.scan_raw_ahead_past_llc && b.scan_raw_ahead_lead == 0);
+            }
+            {
+                let z = Supdb::create_znofilter(&dir("znofilter")).unwrap();
+                assert_eq!(z.name(), "supdb-znofilter");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.zpages_point_filter && b.zpages_point_filter);
             }
             {
                 let z = Supdb::create_zrecord(&dir("zrecord")).unwrap();
