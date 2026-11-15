@@ -2341,6 +2341,9 @@ pub(super) struct ZMemo {
     /// (`Options::zpages_point_keys`). The handle's, set where it is made.
     point_part: bool,
     point_keys: bool,
+    /// A point read asks the form file's filter before its fence
+    /// (`Options::zpages_point_filter`); on in a memo made without it.
+    point_filter: bool,
     /// A walk's first touch of a group is decoded into the cursor's own
     /// buffer and the memo takes it at its second
     /// (`Options::zpages_scan_admit`).
@@ -2393,6 +2396,7 @@ impl ZMemo {
             track: Cell::new(false),
             point_part: false,
             point_keys: false,
+            point_filter: true,
             scan_admit: false,
             walk_part: false,
             bulk_admit: false,
@@ -2444,6 +2448,13 @@ impl ZMemo {
     pub(super) fn point(mut self, part: bool, keys: bool) -> ZMemo {
         self.point_part = part;
         self.point_keys = keys;
+        self
+    }
+
+    /// The memo with the point reads' filter set
+    /// (`Options::zpages_point_filter`).
+    pub(super) fn point_filter(mut self, on: bool) -> ZMemo {
+        self.point_filter = on;
         self
     }
 
@@ -3373,13 +3384,15 @@ impl ZFile {
         }
         // A key the filter does not hold is not in the partition: answered
         // from the heap, no page touched.
-        if self.filter.as_ref().is_some_and(|f| {
-            if keyed {
-                !f.maybe_contains_hash(kh)
-            } else {
-                !f.maybe_contains(key)
-            }
-        }) {
+        if memo.point_filter
+            && self.filter.as_ref().is_some_and(|f| {
+                if keyed {
+                    !f.maybe_contains_hash(kh)
+                } else {
+                    !f.maybe_contains(key)
+                }
+            })
+        {
             return Locate::Absent { decoded: false };
         }
         // A key below the first key is not in the partition.

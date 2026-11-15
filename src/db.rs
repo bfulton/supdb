@@ -1619,6 +1619,15 @@ pub struct Options {
     /// hold, for nothing, the pairing in `docs/engine.md`.
     /// `supdb-znopointkeys` has no table.
     pub zpages_point_keys: bool,
+    /// A point read through a form file asks the form file's filter before
+    /// its fence, so a key the partition does not hold is answered with no
+    /// page touched: a probe of the filter's block at every read, a line
+    /// the core's cache does not hold for a read of a cold key, for the
+    /// reads of absent keys alone. Off is the read without it, which finds
+    /// an absent key absent at its page; `supdb-nocachezpagesnofilter` is
+    /// the forced form without it.
+    #[doc(hidden)]
+    pub zpages_point_filter: bool,
     /// EXPERIMENT: a walk's first touch of a group through a form file is
     /// decoded into its cursor's own buffer and put nowhere, and the
     /// handle's memo takes a group at its second touch while the first's
@@ -5917,6 +5926,7 @@ impl Default for Options {
             zpages_memo_ahead: true,
             zpages_point_part: true,
             zpages_point_keys: true,
+            zpages_point_filter: true,
             zpages_scan_admit: true,
             zpages_bulk_admit: true,
             zpages_bulk_ahead: true,
@@ -32867,6 +32877,7 @@ impl Db {
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes)
                 .point(opts.zpages_point_part, opts.zpages_point_keys)
+                .point_filter(opts.zpages_point_filter)
                 .scans(opts.zpages_scan_admit, opts.zpages_walk_part)
                 .bulk(
                     opts.zpages_bulk_admit,
@@ -33664,6 +33675,7 @@ impl Db {
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes)
                 .point(opts.zpages_point_part, opts.zpages_point_keys)
+                .point_filter(opts.zpages_point_filter)
                 .scans(opts.zpages_scan_admit, opts.zpages_walk_part)
                 .bulk(
                     opts.zpages_bulk_admit,
@@ -36525,6 +36537,7 @@ impl Reader {
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
                 .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
+                .point_filter(self.opts.zpages_point_filter)
                 .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
                 .bulk(
                     self.opts.zpages_bulk_admit,
@@ -36572,6 +36585,7 @@ impl Reader {
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
                 .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
+                .point_filter(self.opts.zpages_point_filter)
                 .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
                 .bulk(
                     self.opts.zpages_bulk_admit,
@@ -36626,6 +36640,7 @@ impl Reader {
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
                 .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
+                .point_filter(self.opts.zpages_point_filter)
                 .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
                 .bulk(
                     self.opts.zpages_bulk_admit,
@@ -39664,6 +39679,7 @@ impl Reader {
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
                 .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
+                .point_filter(self.opts.zpages_point_filter)
                 .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
                 .bulk(
                     self.opts.zpages_bulk_admit,

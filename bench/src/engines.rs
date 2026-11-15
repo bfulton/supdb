@@ -728,6 +728,9 @@ pub struct Supdb {
     /// No table of where the keys read through the memo lie
     /// (`Options::zpages_point_keys` off): `supdb-znopointkeys`.
     znopointkeys: bool,
+    /// A point read through a form file asks no filter
+    /// (`Options::zpages_point_filter` off): `supdb-nocachezpagesnofilter`.
+    znopointfilter: bool,
     /// Every decode of a walk through a form file put in the memo, no
     /// first touch decoded into the cursor's own buffer
     /// (`Options::zpages_scan_admit` off): `supdb-zscanputs`.
@@ -1939,6 +1942,9 @@ struct Policy {
     /// No table of where the keys read through the memo lie
     /// (`Options::zpages_point_keys` off): `supdb-znopointkeys`.
     znopointkeys: bool,
+    /// A point read through a form file asks no filter
+    /// (`Options::zpages_point_filter` off): `supdb-nocachezpagesnofilter`.
+    znopointfilter: bool,
     /// Every decode of a walk through a form file put in the memo, no
     /// first touch decoded into the cursor's own buffer
     /// (`Options::zpages_scan_admit` off): `supdb-zscanputs`.
@@ -2748,6 +2754,7 @@ impl Default for Policy {
             headsmapped: false,
             zpointwhole: false,
             znopointkeys: false,
+            znopointfilter: false,
             zscanputs: false,
             zwalkwhole: false,
             zbulkmemo: false,
@@ -7974,6 +7981,36 @@ impl Supdb {
         )
     }
 
+    /// `supdb-nocachezpages` with no key table
+    /// (`Options::zpages_point_keys` off): what the table costs a read of a
+    /// key never read before, in core where nothing else moves.
+    pub fn create_nocache_zpages_nopointkeys(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                block_cache: false,
+                zpages: true,
+                znopointkeys: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-nocachezpages` whose point reads ask no filter
+    /// (`Options::zpages_point_filter` off): what the filter's probe costs a
+    /// read of a key the partition holds.
+    pub fn create_nocache_zpages_nofilter(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                block_cache: false,
+                zpages: true,
+                znopointfilter: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-nocachezpages` with the page cut at a kibibyte of records
     /// (`Options::zpages_group_bytes` 1024) where the default cuts at two:
     /// with `supdb-nocachezpagesonegroup` at the other side, the cold point
@@ -8213,6 +8250,7 @@ impl Supdb {
             headsmapped,
             zpointwhole,
             znopointkeys,
+            znopointfilter,
             zscanputs,
             zwalkwhole,
             zbulkmemo,
@@ -8680,6 +8718,7 @@ impl Supdb {
             heads_owned: !headsmapped,
             zpages_point_part: !zpointwhole,
             zpages_point_keys: !znopointkeys,
+            zpages_point_filter: !znopointfilter,
             zpages_scan_admit: !zscanputs,
             zpages_walk_part: !zwalkwhole,
             zpages_bulk_admit: !zbulkmemo,
@@ -9101,6 +9140,7 @@ impl Supdb {
             headsmapped,
             zpointwhole,
             znopointkeys,
+            znopointfilter,
             zscanputs,
             zwalkwhole,
             zbulkmemo,
@@ -10280,6 +10320,12 @@ impl Engine for Supdb {
         }
         if self.headsmapped {
             return "supdb-headsmapped";
+        }
+        if self.zpages && !self.block_cache && self.znopointkeys {
+            return "supdb-nocachezpagesnopointkeys";
+        }
+        if self.zpages && !self.block_cache && self.znopointfilter {
+            return "supdb-nocachezpagesnofilter";
         }
         if self.zpointwhole && self.znopointkeys && self.zscanputs {
             return "supdb-zmemoplain";
@@ -11933,6 +11979,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocachezpagesrankwalk"
         | "supdb-nocachezpagesonegroup"
         | "supdb-nocachezpagesgroup1k"
+        | "supdb-nocachezpagesnopointkeys"
+        | "supdb-nocachezpagesnofilter"
         | "supdb-nocachezpagessettle"
         | "supdb-autozpages"
         | "supdb-nozpages"
@@ -12478,6 +12526,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocachezpagesrankwalk" => supdb_arm(Supdb::create_nocache_zpages_rankwalk, dir)?,
         "supdb-nocachezpagesonegroup" => supdb_arm(Supdb::create_nocache_zpages_onegroup, dir)?,
         "supdb-nocachezpagesgroup1k" => supdb_arm(Supdb::create_nocache_zpages_group1k, dir)?,
+        "supdb-nocachezpagesnopointkeys" => {
+            supdb_arm(Supdb::create_nocache_zpages_nopointkeys, dir)?
+        }
+        "supdb-nocachezpagesnofilter" => supdb_arm(Supdb::create_nocache_zpages_nofilter, dir)?,
         "supdb-nocachezpagessettle" => supdb_arm(Supdb::create_nocache_zpages_settle, dir)?,
         "supdb-autozpages" => supdb_arm(Supdb::create_auto_zpages, dir)?,
         "supdb-nozpages" => supdb_arm(Supdb::create_nozpages, dir)?,
@@ -17338,6 +17390,16 @@ mod tests {
                 "group1k",
             ),
             (
+                "supdb-nocachezpagesnopointkeys",
+                Supdb::create_nocache_zpages_nopointkeys,
+                "nopointkeys",
+            ),
+            (
+                "supdb-nocachezpagesnofilter",
+                Supdb::create_nocache_zpages_nofilter,
+                "nofilter",
+            ),
+            (
                 "supdb-nocachezpagescheckedviews",
                 Supdb::create_nocache_zpages_checkedviews,
                 "checkedviews",
@@ -17378,6 +17440,12 @@ mod tests {
             assert_eq!(arm.zrecord, arm_dir == "record");
             assert_eq!(arm.zstored, arm_dir == "stored");
             assert_eq!(arm.zrawtails, arm_dir == "recordraw");
+            assert_eq!(arm.znopointkeys, arm_dir == "nopointkeys");
+            assert_eq!(arm.znopointfilter, arm_dir == "nofilter");
+            assert_eq!(
+                arm.db.as_ref().unwrap().options().zpages_point_filter,
+                arm_dir != "nofilter"
+            );
             assert_eq!(
                 arm.db.as_ref().unwrap().options().zpages_raw_tails,
                 arm_dir == "recordraw",
