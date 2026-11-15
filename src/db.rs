@@ -5326,6 +5326,24 @@ pub struct Options {
     /// hot, and E's half second is too short for the asks to land. On;
     /// `supdb-zhotline` is the line and the look's own window.
     pub zpages_hot_raw_slack: bool,
+    /// Under `zpages_hot_raw_slack`, a partition's skew is read over the
+    /// shortest run of the latest looks whose sampled events reach
+    /// `HOT_RAW_MIN_SAMPLES`, as events a key a look, where it was read
+    /// over the whole window of `HOT_RAW_WINDOW` looks: the floor is what
+    /// keeps a look's noise from reading as heat, and a partition that
+    /// passes it in one look has its heat measured in that look, where the
+    /// window's earlier looks -- a uniform pass before a Zipfian mix --
+    /// held its skew under `HOT_RAW_SKEW` until the mix was nearly over. A
+    /// partition read thinly still sums as many looks as it needs, up to
+    /// the window. Off: the whole window, the shape before;
+    /// `supdb-zhotfast` prices it with `zpages_hot_release_resident`.
+    #[doc(hidden)]
+    pub zpages_hot_raw_evidence: bool,
+    /// A fill's ask for a partition whose raw records the cache already
+    /// holds to `HOT_RAW_RESIDENT` releases it in the same look, where it
+    /// waited a look for pages that were there.
+    #[doc(hidden)]
+    pub zpages_hot_release_resident: bool,
     /// EXPERIMENT: the hot-raw policy's ask -- the raw pages of a partition
     /// it will release, asked of the kernel at the look before the release
     /// (`MADV_WILLNEED`, 42 MB a partition at ten million keys) -- is issued
@@ -6165,6 +6183,8 @@ impl Default for Options {
             zpages_reparse: false,
             zpages_hot_raw: true,
             zpages_hot_raw_slack: true,
+            zpages_hot_raw_evidence: false,
+            zpages_hot_release_resident: false,
             zpages_hot_ask_idle: false,
             zpages_hot_growth_pct: 10,
             zpages_hot_fill_quiet: false,
@@ -47104,6 +47124,10 @@ impl Maint {
             /// reads, one in sixteen.
             rated: bool,
             delta: u64,
+            /// The looks `delta` was summed over
+            /// (`Options::zpages_hot_raw_evidence`); one otherwise, the
+            /// skew read from the count alone.
+            looks: u64,
         }
         // A served form file: its attach's identity, its coding, its bytes
         // with the kept file's, its decode time, its decodes and its opens.
@@ -47215,15 +47239,29 @@ impl Maint {
             // sampled events of the last `HOT_RAW_WINDOW` looks summed, so
             // that a partition read thinly a look but steadily across them
             // is rated on enough of them; else the look's own.
-            let window = if self.opts.zpages_hot_raw_slack {
+            let evidence = self.opts.zpages_hot_raw_evidence;
+            let (window, looks) = if self.opts.zpages_hot_raw_slack {
                 let q = self.z_hot_win.entry(seg.lo.clone()).or_default();
                 q.push_back(delta.unwrap_or(0));
                 while q.len() > HOT_RAW_WINDOW {
                     q.pop_front();
                 }
-                q.iter().sum::<u64>()
+                if evidence {
+                    // The latest looks, newest first, until the floor.
+                    let (mut sum, mut n) = (0u64, 0u64);
+                    for &d in q.iter().rev() {
+                        sum += d;
+                        n += 1;
+                        if sum >= HOT_RAW_MIN_SAMPLES {
+                            break;
+                        }
+                    }
+                    (sum, n.max(1))
+                } else {
+                    (q.iter().sum::<u64>(), 1)
+                }
             } else {
-                delta.unwrap_or(0)
+                (delta.unwrap_or(0), 1)
             };
             let old = self.z_hot_heat.get(&seg.lo).copied().unwrap_or(0.0);
             // Risen at once and decayed over `RECODE_TAU`: a release costs
@@ -47258,6 +47296,7 @@ impl Maint {
                 heat,
                 rated: delta.is_some(),
                 delta: window,
+                looks,
                 seg,
             });
         }
@@ -47293,7 +47332,7 @@ impl Maint {
         // The skew is read from the window: a partition's sampled events a
         // key against the median partition's, over the partitions rated this
         // look, raw ones among them.
-        let per_key = |p: &Part| p.delta as f64 / p.keys.max(1) as f64;
+        let per_key = |p: &Part| p.delta as f64 / p.keys.max(1) as f64 / p.looks as f64;
         let median = {
             let mut v: Vec<f64> = parts.iter().filter(|p| p.rated).map(per_key).collect();
             v.sort_by(|a, b| a.total_cmp(b));
@@ -47494,6 +47533,19 @@ impl Maint {
                 avail -= need;
                 fill_avail = fill_avail.saturating_sub(need);
                 total_after = after;
+                if self.opts.zpages_hot_release_resident
+                    && p.seg.records_resident() >= HOT_RAW_RESIDENT
+                {
+                    // The pages are there: released now, not a look on.
+                    if self.z_trace {
+                        trace("fill-release-now", Some(p));
+                    }
+                    let seg = p.seg.clone();
+                    self.z_hot_release(seg);
+                    zfile::ZEvents::add(&self.shared.z.hot_asks, 1);
+                    asked += 1;
+                    continue;
+                }
                 if self.z_trace {
                     trace("fill-ask", Some(p));
                 }

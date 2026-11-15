@@ -735,6 +735,11 @@ pub struct Supdb {
     /// searched while it comes in (`Options::zpages_filter_ahead` on):
     /// `supdb-zfilterahead`.
     zfilterahead: bool,
+    /// The hot partitions' skew read over the shortest run of looks that
+    /// reaches the floor, and a resident ask released at once
+    /// (`Options::zpages_hot_raw_evidence`,
+    /// `Options::zpages_hot_release_resident`): `supdb-zhotfast`.
+    zhotfast: bool,
     /// Every decode of a walk through a form file put in the memo, no
     /// first touch decoded into the cursor's own buffer
     /// (`Options::zpages_scan_admit` off): `supdb-zscanputs`.
@@ -1953,6 +1958,11 @@ struct Policy {
     /// searched while it comes in (`Options::zpages_filter_ahead` on):
     /// `supdb-zfilterahead`.
     zfilterahead: bool,
+    /// The hot partitions' skew read over the shortest run of looks that
+    /// reaches the floor, and a resident ask released at once
+    /// (`Options::zpages_hot_raw_evidence`,
+    /// `Options::zpages_hot_release_resident`): `supdb-zhotfast`.
+    zhotfast: bool,
     /// Every decode of a walk through a form file put in the memo, no
     /// first touch decoded into the cursor's own buffer
     /// (`Options::zpages_scan_admit` off): `supdb-zscanputs`.
@@ -2764,6 +2774,7 @@ impl Default for Policy {
             znopointkeys: false,
             znopointfilter: false,
             zfilterahead: false,
+            zhotfast: false,
             zscanputs: false,
             zwalkwhole: false,
             zbulkmemo: false,
@@ -3434,6 +3445,21 @@ impl Supdb {
             path,
             Policy {
                 zfilterahead: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose hot-raw policy reads a partition's skew over the
+    /// shortest run of looks that reaches its floor and releases an ask
+    /// whose raw records are resident at once
+    /// (`Options::zpages_hot_raw_evidence`,
+    /// `Options::zpages_hot_release_resident`).
+    pub fn create_zhotfast(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zhotfast: true,
                 ..Policy::default()
             },
         )
@@ -8300,6 +8326,7 @@ impl Supdb {
             znopointkeys,
             znopointfilter,
             zfilterahead,
+            zhotfast,
             zscanputs,
             zwalkwhole,
             zbulkmemo,
@@ -8769,6 +8796,8 @@ impl Supdb {
             zpages_point_keys: !znopointkeys,
             zpages_point_filter: !znopointfilter,
             zpages_filter_ahead: zfilterahead,
+            zpages_hot_raw_evidence: zhotfast,
+            zpages_hot_release_resident: zhotfast,
             zpages_scan_admit: !zscanputs,
             zpages_walk_part: !zwalkwhole,
             zpages_bulk_admit: !zbulkmemo,
@@ -9192,6 +9221,7 @@ impl Supdb {
             znopointkeys,
             znopointfilter,
             zfilterahead,
+            zhotfast,
             zscanputs,
             zwalkwhole,
             zbulkmemo,
@@ -10386,6 +10416,9 @@ impl Engine for Supdb {
         }
         if self.zfilterahead {
             return "supdb-zfilterahead";
+        }
+        if self.zhotfast {
+            return "supdb-zhotfast";
         }
         if self.zpointwhole && self.znopointkeys && self.zscanputs {
             return "supdb-zmemoplain";
@@ -12043,6 +12076,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocachezpagesnofilter"
         | "supdb-znofilter"
         | "supdb-zfilterahead"
+        | "supdb-zhotfast"
         | "supdb-nocachezpagesfilterahead"
         | "supdb-nocachezpagessettle"
         | "supdb-autozpages"
@@ -12595,6 +12629,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocachezpagesnofilter" => supdb_arm(Supdb::create_nocache_zpages_nofilter, dir)?,
         "supdb-znofilter" => supdb_arm(Supdb::create_znofilter, dir)?,
         "supdb-zfilterahead" => supdb_arm(Supdb::create_zfilterahead, dir)?,
+        "supdb-zhotfast" => supdb_arm(Supdb::create_zhotfast, dir)?,
         "supdb-nocachezpagesfilterahead" => {
             supdb_arm(Supdb::create_nocache_zpages_filterahead, dir)?
         }
@@ -15944,6 +15979,14 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_filter_ahead && !b.zpages_filter_ahead);
+            }
+            {
+                let z = Supdb::create_zhotfast(&dir("zhotfast")).unwrap();
+                assert_eq!(z.name(), "supdb-zhotfast");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_hot_raw_evidence && o.zpages_hot_release_resident);
+                assert!(!b.zpages_hot_raw_evidence && !b.zpages_hot_release_resident);
             }
             {
                 let z = Supdb::create_znofilter(&dir("znofilter")).unwrap();
