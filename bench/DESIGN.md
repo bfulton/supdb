@@ -279,12 +279,12 @@ can encrypt, which `scripts/fscrypt.sh` makes in a file behind a loop
 device, so `ab` names the device at its table's head and its rates are
 read as two arms on one device and not as a disk's. And a store under a
 cipher of the caller's (`Encryption::Cipher`), here AES-256-GCM:
-`supdb-cipher` and `supdb-ingestcipher`. Such a store runs with ordered
-ingest through the log and the compact form off whatever it is asked, so
-it has a twin in the clear with the same two settings, `supdb-cipherbase`
-and `supdb-ingestcipherbase`, and is paired twice: against its twin, which
-differs by the cipher and the store's own cache of plaintext alone, and
-against `supdb`, which is what the mode costs with what it forgoes. That
+`supdb-cipher` and `supdb-ingestcipher`. Such a store runs with the
+compact form off whatever it is asked, so it has a twin in the clear with
+the same setting, `supdb-cipherbase` and `supdb-ingestcipherbase`, and is
+paired twice: against its twin, which differs by the cipher and the
+store's own cache of plaintext alone, and against `supdb`, which is what
+the mode costs with what it forgoes. That
 cache is half of what the process may use unless an arm says otherwise,
 which at the suite's in-core rungs is a store that fits it;
 `supdb-cipher64` is the same store with a cache of sixty-four mebibytes,

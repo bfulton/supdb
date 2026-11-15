@@ -740,10 +740,10 @@ pub enum Encryption {
     /// an open reads. A file's bytes are checked where they are decrypted,
     /// so a file changed on the device is refused at the read that first
     /// wants the changed bytes, with an error every operation after it
-    /// answers with too. Ordered ingest goes through the log and the
-    /// compact form is off, whatever the options say. `Db::create` makes a store under the cipher in an
-    /// empty directory; `Db::open` refuses a store that is not under it,
-    /// and a store under a cipher is refused where none is given.
+    /// answers with too. The compact form is off, whatever the options
+    /// say. `Db::create` makes a store under the cipher in an empty
+    /// directory; `Db::open` refuses a store that is not under it, and a
+    /// store under a cipher is refused where none is given.
     Cipher(vault::StoreCipher),
 }
 
@@ -4718,6 +4718,9 @@ struct Direct {
     /// With `Options::direct_stream`, where the table's record stream is
     /// written to from here: its end at the last commit, marker included.
     stream_from: usize,
+    /// Under a cipher, how many of the table's entries the log holds
+    /// (`Db::log_run`).
+    logged: usize,
 }
 
 /// A half-open key range `[lo, hi)`, `None` above meaning unbounded. The
@@ -8638,6 +8641,12 @@ struct MemTable {
     /// of the batch it writes and resets the arena, which nothing but
     /// staged heads point into.
     refs: bool,
+    /// What a commit of the run does after its batch is in the run's file
+    /// (`Db::commit_direct`): `RUN_REFS`, as `refs`, and `RUN_LOGGED` for
+    /// a store under a cipher, whose run is a memory file and whose
+    /// commits are made durable by the log. One byte for both, so that a
+    /// commit of a run that does neither makes the one test it made.
+    after: u8,
     /// The table's values are the segment's records themselves
     /// (`Options::direct_stream`): `vals` is the run's record stream, laid
     /// out as the file takes it from its first record on, and an entry's
@@ -10162,6 +10171,7 @@ impl MemTable {
             index: AtomicPtr::new(Box::into_raw(Box::new(Index::with_slots(1024, mapped)))),
             ordered: false,
             refs: false,
+            after: 0,
             stream: false,
             stream_compact: false,
             stream_committed: AtomicUsize::new(0),
@@ -10192,6 +10202,13 @@ impl MemTable {
     /// segment (`Options::direct_table_refs`); with `stream`, one whose
     /// values are the run's records in place (`Options::direct_stream`),
     /// compact where it says.
+    /// An ordered table whose run's commits go to the log as well
+    /// (`RUN_LOGGED`).
+    fn logged(mut self) -> MemTable {
+        self.after |= RUN_LOGGED;
+        self
+    }
+
     fn new_ordered(
         refs: bool,
         shape: BlockShape,
@@ -10209,6 +10226,7 @@ impl MemTable {
             index: AtomicPtr::new(std::ptr::null_mut()),
             ordered: true,
             refs,
+            after: if refs { RUN_REFS } else { 0 },
             stream: stream.is_some(),
             stream_compact: stream.unwrap_or(false),
             stream_committed: AtomicUsize::new(0),
@@ -11387,6 +11405,9 @@ impl Drop for MemTable {
 /// only ever appended to and never truncated under the mapping.
 struct RunMap {
     map: memmap2::Mmap,
+    /// Under a cipher, what keeps the run's memory under this mapping
+    /// (`vault::Mapped`).
+    _held: vault::Mapped,
 }
 
 /// The run's mapping grown past the file's `written` bytes where it falls
@@ -11408,13 +11429,15 @@ fn grow_run_map(mem: &MemTable, tmp: &Path, written: u64, shared: &Shared) -> Re
 
 impl RunMap {
     fn open(path: &Path, cap: usize) -> Result<RunMap> {
-        let file = vault::open(path)?;
+        let (file, held) = vault::open_mapped(path)?;
         // SAFETY: the file is appended to and never truncated or edited in
         // the record bytes while a table maps it (`SegmentWriter` patches
         // only its head reserve, which no reference names), and a read
-        // stays below `run_flushed`.
+        // stays below `run_flushed`. Under a cipher the file is the run's
+        // memory file, and `held` keeps the store's cache from giving its
+        // pages back for as long as this maps them.
         let map = unsafe { memmap2::MmapOptions::new().len(cap).map(&file)? };
-        Ok(RunMap { map })
+        Ok(RunMap { map, _held: held })
     }
 
     fn cap(&self) -> usize {
@@ -11460,6 +11483,24 @@ fn ref_pack(off: u64, len: u32) -> u64 {
     (off << REF_LEN_BITS) | u64::from(len)
 }
 
+/// `MemTable::after`: the committed values read through the run's file
+/// from here on (`Options::direct_table_refs`), and the batch sealed into
+/// the log as well (a store under a cipher).
+const RUN_REFS: u8 = 1;
+const RUN_LOGGED: u8 = 2;
+
+/// What a store under a cipher runs with whatever it was asked for
+/// (`Encryption::Cipher`): the compact form off. The form is a second copy
+/// of a partition, built from the first by a reader of the whole of it
+/// and attached by its bytes in the page cache, neither of which a file
+/// read by the piece through the store's own cache offers yet. Nothing
+/// else is fixed: an ordered run keeps its table and its segment and
+/// sends its commits through the log as well (`Db::log_run`), and the log
+/// recycles (`Wal::recycle`).
+fn under_cipher(opts: &mut Options) {
+    opts.zpages = ZPages::Off;
+}
+
 /// Combinations of options the engine cannot run soundly, refused before
 /// anything on disk is touched. An unpinned writer holds no state it
 /// reads, which is sound only while it is the one thread that publishes:
@@ -11467,21 +11508,6 @@ fn ref_pack(off: u64, len: u32) -> u64 {
 /// published snapshot, replaced a state and freed it under the writer's
 /// read, and the suite's unpinned arm faulted in a third of its runs once
 /// the segment work moved to a thread of its own.
-/// What a store under a cipher runs with whatever it was asked for
-/// (`Encryption::Cipher`), each for the same reason: a file the engine makes
-/// durable by its own fsync as it writes it is a memory file there until
-/// it is finished, and the fsync is of nothing. Ordered ingest's run is a
-/// segment open for append and synced at every commit, so its batches go
-/// through the log, whose records the engine seals as it writes them. The
-/// compact form is a second copy of a partition, built from the first by
-/// a reader of the whole of it and attached by its bytes in the page
-/// cache, neither of which a file read by the piece through the store's
-/// own cache offers yet.
-fn under_cipher(opts: &mut Options) {
-    opts.direct_ingest = false;
-    opts.zpages = ZPages::Off;
-}
-
 fn check_options(opts: &Options) -> Result<()> {
     if opts.direct_stream && opts.direct_table_refs {
         return Err(err(
@@ -14570,6 +14596,10 @@ struct Shared {
     /// Stream blocks given up for recycling over this store's life
     /// (`Options::direct_recycle`); see `Db::stream_recycled`.
     stream_recycled: AtomicU64,
+    /// The ordered runs whose commits went to the log as well, and those
+    /// commits: every one under a cipher and none of a plain store's,
+    /// counted where the log is written; see `Db::direct_runs`.
+    runs: [AtomicU64; 2],
     /// The sequence of the last manifest the store published, stored by
     /// the publish once the slot or the rename is durable; see
     /// `Db::manifest_seq`.
@@ -27313,6 +27343,7 @@ impl Db {
             asks: AskCounts::default(),
             run_remaps: AtomicU64::new(0),
             stream_recycled: AtomicU64::new(0),
+            runs: Default::default(),
             manifest_seq: AtomicU64::new(0),
             forms_cloned: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
@@ -27916,6 +27947,7 @@ impl Db {
             asks: AskCounts::default(),
             run_remaps: AtomicU64::new(0),
             stream_recycled: AtomicU64::new(0),
+            runs: Default::default(),
             manifest_seq: AtomicU64::new(0),
             forms_cloned: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
@@ -28115,20 +28147,25 @@ impl Db {
             if self.goes_direct(key, value) {
                 if !self.mem().ordered {
                     let old = self.mem().clone();
-                    self.set_mem_with(
-                        std::sync::Arc::new(MemTable::new_ordered(
-                            self.opts.direct_table_refs,
-                            self.opts.block_shape(),
-                            self.opts
-                                .direct_stream
-                                .then_some(self.opts.segment.compact_records),
-                            self.opts.direct_recycle,
-                            self.opts.direct_keys_in_stream,
-                            self.opts.direct_log_range,
-                            self.opts.direct_slim_entries,
-                        )),
-                        true,
+                    let table = MemTable::new_ordered(
+                        self.opts.direct_table_refs,
+                        self.opts.block_shape(),
+                        self.opts
+                            .direct_stream
+                            .then_some(self.opts.segment.compact_records),
+                        self.opts.direct_recycle,
+                        self.opts.direct_keys_in_stream,
+                        self.opts.direct_log_range,
+                        self.opts.direct_slim_entries,
                     );
+                    // Under a cipher the run's file is a memory file, and
+                    // what makes a commit of it durable is the log.
+                    let table = if self.vault.is_some() {
+                        table.logged()
+                    } else {
+                        table
+                    };
+                    self.set_mem_with(std::sync::Arc::new(table), true);
                     self.carry_switch(&old);
                 }
                 self.max_key.clear();
@@ -28623,17 +28660,23 @@ impl Db {
                 committed: 0,
                 pending: std::collections::VecDeque::new(),
                 stream_from: 0,
+                logged: 0,
             });
         }
-        let mem = self.r.mem().clone();
+        // Borrowed, the table and the store's shared half: the commit
+        // publishes nothing, so the state the operation is pinned in holds
+        // both for its length, and a clone of each was two locked
+        // increments and two decrements a commit for the borrow checker.
+        let mem: &MemTable = self.r.mem();
         let map_bytes = match self.opts.direct_map_bytes {
             0 => (self.opts.seal_bytes * 2).max(1 << 20),
             n => n,
         };
-        let shared = self.shared.clone();
+        let shared: &Shared = &self.r.shared;
         let put_one = self.opts.direct_put_one;
         let d = self.direct.as_mut().expect("opened above");
-        let refs = mem.refs;
+        let after = mem.after;
+        let refs = after & RUN_REFS != 0;
         if (refs || mem.recycle) && mem.run().is_none() {
             // The table reads its committed values through the run's
             // file from here on -- every one with `refs`, those in blocks
@@ -28646,7 +28689,7 @@ impl Db {
             // the file takes them: the writer accounts for each and the
             // batch goes to the file from the arena, its marker behind it.
             if d.committed == 0 && d.stream_from == 0 {
-                d.w.set_stream_source(mem.clone());
+                d.w.set_stream_source(self.r.mem().clone());
             }
             for i in d.committed..mem.len() {
                 let e = mem.entry(i);
@@ -28666,7 +28709,7 @@ impl Db {
                 if let Some(base) = d.w.stream_base() {
                     mem.set_stream_base(base);
                     let written = d.w.file_written();
-                    grow_run_map(&mem, &d.tmp, written, &shared)?;
+                    grow_run_map(mem, &d.tmp, written, shared)?;
                     mem.set_run_flushed(written);
                     let n = mem.recycle_stream(written, &shared.readers);
                     shared
@@ -28706,6 +28749,12 @@ impl Db {
             d.w.sync()?;
             self.unsynced = 0;
         }
+        // One test for a run with nothing after its commit, which is the
+        // run of a plain store with its values copied: the two things a
+        // commit may owe are behind it.
+        if after == 0 {
+            return Ok(());
+        }
         if refs {
             // What the file holds -- the writer's buffer carries records
             // to it a piece at a time, or the sync just did -- the table
@@ -28715,7 +28764,7 @@ impl Db {
             // file's end first where it would fall short, and the length
             // published before any reference that needs it.
             let written = d.w.file_written();
-            grow_run_map(&mem, &d.tmp, written, &shared)?;
+            grow_run_map(mem, &d.tmp, written, shared)?;
             mem.set_run_flushed(written);
             while let Some(&(i, at, len)) = d.pending.front() {
                 if at + u64::from(len) > written {
@@ -28726,6 +28775,55 @@ impl Db {
             }
             mem.upkeep_staging(&shared.readers);
         }
+        if after & RUN_LOGGED != 0 {
+            let mem = self.r.mem().clone();
+            return self.log_run(&mem, due);
+        }
+        Ok(())
+    }
+
+    /// A commit of an ordered run under a cipher, made durable: the
+    /// batch's records as frames in the log, sealed and written as any
+    /// commit's are, and synced where the policy says (`due`).
+    ///
+    /// A plain store's run is its own log: its file is in the directory
+    /// from its first record, a commit is a marker and a sync of that
+    /// file, and an open that finds it walks it to its last marker.
+    /// Under a cipher the run's file is a memory file until the run
+    /// closes and its segment has an envelope, so a commit synced there
+    /// is synced nowhere. The run is kept all the same -- the ordered
+    /// table, its records laid out once as the segment takes them, a
+    /// close that composes a trailer where a seal sorts and writes a
+    /// table -- and the log carries what the run's file cannot: its
+    /// frames are covered by the sequence the run's segment is named at
+    /// (`close_run`), and retire behind the manifest that names it, as a
+    /// seal's do. A crash before that replays them.
+    ///
+    /// After the table's mark: a reader sees the batch before the log
+    /// holds it, as it sees a plain run's before its sync.
+    #[cold]
+    #[inline(never)]
+    fn log_run(&mut self, mem: &MemTable, due: bool) -> Result<()> {
+        let from = match self.direct.as_mut() {
+            Some(d) => std::mem::replace(&mut d.logged, mem.len()),
+            None => return Ok(()),
+        };
+        for i in from..mem.len() {
+            let e = mem.entry(i);
+            self.wal
+                .append(mem.key_of(e), mem.value_at(MemTable::head(e) as usize));
+        }
+        self.wal.mark_commit();
+        self.wal.write()?;
+        let runs = &self.shared.runs;
+        if from == 0 {
+            runs[0].fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        runs[1].fetch_add(1, AtomicOrdering::Relaxed);
+        if due {
+            self.sync_wal()?;
+        }
+        self.rotate_wal_by_size();
         Ok(())
     }
 
@@ -28839,6 +28937,10 @@ impl Db {
                 let names = vec![name];
                 seal_readable(&shared, readable, &names, vec![fact]);
                 shared.drain_steps.stamp(6);
+                // Under a cipher the run's file is a memory file and the
+                // syncs below are of nothing: what makes the segment
+                // durable is its envelope, written here, as a seal's is.
+                vault::persist(&dir, &Db::with_ords(&names))?;
                 if let Some(t) = presynced {
                     t.join()
                         .map_err(|_| err("the records' sync thread panicked"))??;
@@ -33843,6 +33945,18 @@ impl Db {
     /// (`Options::direct_recycle`).
     pub fn stream_recycled(&self) -> u64 {
         self.shared.stream_recycled.load(AtomicOrdering::Relaxed)
+    }
+
+    /// The ordered runs of this store's life whose commits were sealed
+    /// into the log as well, and those commits: every run and every
+    /// commit of one under a cipher (`Db::log_run`), and none of a plain
+    /// store's, which counts nothing here.
+    #[doc(hidden)]
+    pub fn direct_runs(&self) -> (u64, u64) {
+        (
+            self.shared.runs[0].load(AtomicOrdering::Relaxed),
+            self.shared.runs[1].load(AtomicOrdering::Relaxed),
+        )
     }
 
     /// Patches that copied a form shared with a published copy before

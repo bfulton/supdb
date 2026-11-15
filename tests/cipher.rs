@@ -449,8 +449,14 @@ fn a_store_larger_than_its_cache_reads_as_itself_within_it() {
         });
         db.settle().unwrap();
         let c = settled(&db, "after the threads");
+        // Under four readers, a writer and the merges behind it the bound
+        // is the line a caller's read waits at, six megabytes past a
+        // budget this small, and what each of them reads between two
+        // looks at it: held to the eight megabytes one reader is, the
+        // peak sat within a megabyte of the bound and went half a
+        // megabyte over it in one run of the file in twenty.
         assert!(
-            c.peak < cache + slack,
+            c.peak < cache + slack + (2 << 20),
             "the cache held {} bytes of a budget of {cache} under four readers: {c:?}",
             c.peak
         );
@@ -1088,7 +1094,9 @@ fn a_recycled_log_under_a_cipher_holds_what_was_committed_and_no_more() {
         names(&dir)
             .iter()
             .filter(|n| n.starts_with(prefix))
-            .map(|n| std::fs::metadata(dir.join(n)).unwrap().ino())
+            // A file the segment work retired or renamed since the
+            // listing is not there to ask.
+            .filter_map(|n| Some(std::fs::metadata(dir.join(n)).ok()?.ino()))
             .collect()
     };
     let key = |i: u32| format!("{KEY_MARK}{i:05}").into_bytes();
@@ -1212,11 +1220,298 @@ fn a_recycled_log_under_a_cipher_holds_what_was_committed_and_no_more() {
     holds_model(&Db::open(&dir, opts()).unwrap(), &model, "reopened");
 }
 
+/// Ordered ingest under a cipher (`Options::direct_ingest`): keys above
+/// the store's greatest go to an ordered run, as a plain store's do, and
+/// the run's file is a memory file, so each commit of it is sealed into
+/// the log as well, which is what a crash leaves. A store dropped in the
+/// middle of a run opens with every commit of the run and nothing of the
+/// batch that was not committed; a run left for a key out of order, and a
+/// run closed by a flush, read as themselves; and nothing of a run is in
+/// the directory in the clear, its file's name included.
+#[test]
+fn an_ordered_run_under_a_cipher_keeps_its_commits_through_the_log() {
+    let n = 24_000u32;
+    let dir = scratch("runs");
+    let opts = || under(15);
+    let check = |db: &Db, upto: u32, what: &str| {
+        let mut at = 0u32;
+        db.scan(
+            b"",
+            usize::MAX,
+            kv(&mut |key, val| {
+                assert_eq!(key, k(at).as_slice(), "{what}");
+                assert_eq!(val, v(at, 0).as_slice(), "{what}: key {at}");
+                at += 1;
+            }),
+        )
+        .unwrap();
+        assert_eq!(at, upto, "{what}");
+        for i in (0..upto).step_by(97) {
+            let mut got: Vec<Vec<u8>> = Vec::new();
+            db.read_all(&k(i), vf(&mut |x| got.push(x.to_vec())))
+                .unwrap();
+            assert_eq!(got, [v(i, 0)], "{what}: key {i}");
+        }
+    };
+    {
+        let mut db = Db::create(&dir, opts()).unwrap();
+        for i in 0..n / 2 {
+            db.append(&k(i), &v(i, 0));
+            if i % 250 == 249 {
+                db.commit().unwrap();
+            }
+            if i == 249 {
+                // In the log, and synced there, as the policy says.
+                let (_, synced, written) = db.wal_durable();
+                assert!(
+                    written > 250 * 60,
+                    "the run's first commit is not in the log"
+                );
+                assert_eq!(synced, written, "a run's commit left the log unsynced");
+            }
+        }
+        let (runs, logged) = db.direct_runs();
+        assert!(runs > 0, "no ordered run was opened under the cipher");
+        assert!(
+            logged >= u64::from(n / 2 / 250) - 1,
+            "{logged} commits of {runs} runs went to the log"
+        );
+        check(&db, n / 2, "a run in progress");
+        // A batch appended and not committed, and the store gone.
+        for i in n / 2..n / 2 + 100 {
+            db.append(&k(i), &v(i, 0));
+        }
+    }
+    assert!(
+        names(&dir).iter().all(|f| !f.contains("direct")),
+        "a run's own file in the directory: {:?}",
+        names(&dir)
+    );
+    {
+        let mut db = Db::open(&dir, opts()).unwrap();
+        check(&db, n / 2, "after the crash in the middle of a run");
+        // The rest in order, a run again, left for a key out of order
+        // with a batch in hand, and the store flushed.
+        for i in n / 2..n {
+            db.append(&k(i), &v(i, 0));
+            if i % 250 == 249 {
+                db.commit().unwrap();
+                // The log rotates under a run as under any commits: a
+                // file of it passes the size a seal is cut at by a
+                // commit, and no more.
+                let (_, _, written) = db.wal_durable();
+                assert!(
+                    written < 2 * (256 << 10),
+                    "a log file of {written} bytes under a run"
+                );
+            }
+            if i == n - 100 {
+                assert!(db.direct_runs().0 > 0, "no run after the reopen");
+            }
+        }
+        db.append(b"a key below every other", b"left the run");
+        db.commit().unwrap();
+        db.delete(b"a key below every other");
+        db.commit().unwrap();
+        check(&db, n, "a run left for a key out of order");
+        db.flush().unwrap();
+        db.settle().unwrap();
+        check(&db, n, "flushed");
+        // The log rotates under a run as under any commits, and what a
+        // closed run's segment covers retires: several runs' worth of
+        // records went through it, and it holds a file or two.
+        let logs: u64 = names(&dir)
+            .iter()
+            .filter(|f| f.starts_with("wal-"))
+            .map(|f| std::fs::metadata(dir.join(f)).unwrap().len())
+            .sum();
+        assert!(
+            logs < 3 * (256 << 10),
+            "{logs} bytes of log after an ordered load of {n} keys"
+        );
+    }
+    for name in names(&dir) {
+        let known = name == "supdb.cipher"
+            || name.starts_with("manifest")
+            || name.starts_with("wal-")
+            || name.starts_with("x-");
+        assert!(known, "a file named {name}");
+    }
+    for needle in [MARK, KEY_MARK] {
+        assert!(files_holding(&dir, needle.as_bytes()).is_empty());
+    }
+    check(&Db::open(&dir, opts()).unwrap(), n, "reopened");
+}
+
+/// A run that closes is made durable where it closes, on the thread that
+/// finishes its segment, as a plain run's segment is synced there. Left
+/// to the manifest, which writes the envelope of whatever it names that
+/// has none, the cipher over a run's segment was the segment work's to
+/// do, on the thread every landing goes through. A store's first run
+/// closes under the name it keeps, so nothing renames it on the way.
+#[test]
+fn a_closed_runs_segment_is_sealed_where_it_closes() {
+    let dir = scratch("run-close");
+    let mut db = Db::create(&dir, under(17)).unwrap();
+    for i in 0..2_000u32 {
+        db.append(&k(i), &v(i, 0));
+        if i % 250 == 249 {
+            db.commit().unwrap();
+        }
+    }
+    assert_eq!(db.direct_runs().0, 1, "one run");
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let c = db.cipher_counts().unwrap();
+    assert!(c.persisted > 0, "the run's segment has no envelope: {c:?}");
+    assert_eq!(
+        c.late, 0,
+        "the run's envelope was left to the manifest that names it: {c:?}"
+    );
+    let mut seen = 0u32;
+    db.scan(b"", usize::MAX, kv(&mut |_k, _v| seen += 1))
+        .unwrap();
+    assert_eq!(seen, 2_000);
+}
+
+/// An ordered run's table reads the records it has committed through a
+/// mapping of the run's own file, and under a cipher that file is memory
+/// the store's cache takes for its view once the run has closed and has
+/// its envelope. The cache gives back by taking pages out of that memory,
+/// so while a table still maps the run its file is not the cache's to
+/// give back: a snapshot taken over a run reads every key of it after the
+/// run has closed and the store has been read through a cache a fraction
+/// of its size, and once the snapshot has gone the run's file is given
+/// back as any is.
+#[test]
+fn a_runs_table_reads_its_run_while_the_cache_turns_over() {
+    let _quiet = one_at_a_time();
+    let n = 120_000u32;
+    let run = 40_000u32;
+    let cache: u64 = 2 << 20;
+    let dir = scratch("run-map");
+    let opts = || Options {
+        encryption: Encryption::Cipher(cipher(16).cache_bytes(cache)),
+        // The run is one table: no seal at a share of the store.
+        seal_bytes: 64 << 20,
+        seal_max_pct: 0,
+        seal_idle: false,
+        direct_map_bytes: 64 << 10,
+        ..small()
+    };
+    {
+        // A store several times the cache under the run, made with small
+        // seals so that it is partitions.
+        let mut db = Db::create(
+            &dir,
+            Options {
+                encryption: Encryption::Cipher(cipher(16).cache_bytes(cache)),
+                ..small()
+            },
+        )
+        .unwrap();
+        fill(&mut db, n);
+    }
+    let mut db = Db::open(&dir, opts()).unwrap();
+    assert!(stored_bytes(&dir) > 4 * cache);
+    let top = |i: u32| format!("{KEY_MARK}zz-{i:08}").into_bytes();
+    for i in 0..run {
+        db.append(&top(i), &v(i, 3));
+        if i % 500 == 499 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    assert!(
+        db.direct_runs().0 > 0,
+        "the keys above the store's took no run"
+    );
+    assert!(
+        db.stream_recycled() > 0,
+        "the run's table gave no block up, and reads nothing through the run's file"
+    );
+    let snap = db.reader().unwrap();
+    snap.snapshot();
+    // The run closed and durable, its table held by the snapshot alone.
+    db.flush().unwrap();
+    db.settle().unwrap();
+    // The store under the run, read through: every seventh key of it and
+    // a scan of all of it, the run's keys with it.
+    let under_it = |db: &Db| {
+        for i in (0..n).step_by(7) {
+            let mut got: Vec<Vec<u8>> = Vec::new();
+            db.read_all(&k(i), vf(&mut |x| got.push(x.to_vec())))
+                .unwrap();
+            let round = u32::from((n - 1 - i).is_multiple_of(3));
+            assert_eq!(got, [v(i, round)], "key {i}");
+        }
+        let mut seen = 0u32;
+        db.scan(b"", usize::MAX, kv(&mut |_k, _v| seen += 1))
+            .unwrap();
+        assert_eq!(seen, n + run);
+    };
+    let through = |h: &supdb::Reader, what: &str| {
+        for i in (0..run).step_by(7) {
+            let mut got: Vec<Vec<u8>> = Vec::new();
+            h.read_all(&top(i), vf(&mut |x| got.push(x.to_vec())))
+                .unwrap();
+            assert_eq!(got, [v(i, 3)], "{what}: key {i} of the run");
+        }
+    };
+    for round in 0..3 {
+        // The store under the run read through, several times the cache.
+        let before = db.cipher_counts().unwrap().cache.evicted_units;
+        under_it(&db);
+        assert!(
+            db.cipher_counts().unwrap().cache.evicted_units > before,
+            "round {round}: nothing was given back"
+        );
+        through(
+            &snap,
+            &format!("round {round}, through the snapshot's table"),
+        );
+    }
+    snap.release();
+    drop(snap);
+    // The store keeps a table it has replaced until its next publish
+    // (`State::replaced`), so the run's table goes with one: a write, a
+    // flush. Nothing maps the run then, and its file is given back with
+    // the rest.
+    db.put(&top(run), b"the next publish");
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    for i in (0..n).step_by(7) {
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        db.read_all(&k(i), vf(&mut |x| got.push(x.to_vec())))
+            .unwrap();
+        assert_eq!(got.len(), 1, "key {i}");
+    }
+    let t = std::time::Instant::now();
+    loop {
+        let c = db.cipher_counts().unwrap().cache;
+        if c.held <= c.budget {
+            break;
+        }
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(20),
+            "the cache stayed over its budget with nothing reading: {c:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    for i in (0..run).step_by(11) {
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        db.read_all(&top(i), vf(&mut |x| got.push(x.to_vec())))
+            .unwrap();
+        assert_eq!(got, [v(i, 3)], "key {i} of the run, from its segment");
+    }
+}
+
 /// What a store under a cipher runs without, it runs without whatever it
-/// is asked for: ordered ingest's run and the compact form each rest on a
-/// file the engine syncs itself, which under a cipher is a memory file.
-/// Asked for both, the store keeps what it commits across a crash, and
-/// its directory holds a store under a cipher's files and no other.
+/// is asked for: the compact form is built from a partition's records
+/// borrowed whole, which a file read by the piece does not lend. Asked
+/// for it, the store builds none, keeps what it commits across a crash,
+/// and its directory holds a store under a cipher's files and no other.
 #[test]
 fn a_store_under_a_cipher_runs_without_what_it_cannot_seal() {
     let n = 12_000;
@@ -1229,8 +1524,7 @@ fn a_store_under_a_cipher_runs_without_what_it_cannot_seal() {
     };
     {
         let mut db = Db::create(&dir, asked()).unwrap();
-        // Ordered, committed, and dropped: a run of ordered ingest would
-        // have been a memory file synced at each commit, and gone.
+        // Ordered, committed, and dropped.
         for i in 0..n {
             db.append(&k(i), &v(i, 0));
             if i % 250 == 249 {

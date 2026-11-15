@@ -386,6 +386,8 @@ pub struct Supdb {
     cipher_base: bool,
     /// `Policy::cipher_cache`.
     cipher_cache: u64,
+    /// `Policy::cipher_log`.
+    cipher_log: bool,
     /// False for the ingest-first arm: a flush stops partitioning what it
     /// sealed and leaves that to the background -- promotion at once, a
     /// merge for the rest (`Options::flush_schedules`). Both arms exist so
@@ -1244,10 +1246,10 @@ struct Policy {
     /// The store under a cipher the caller supplies (`Encryption::Cipher`),
     /// here AES-256-GCM: `supdb-cipher` and `supdb-ingestcipher`. Its
     /// directory holds its files' envelopes and it reads them through a
-    /// cache of plaintext of its own, and it runs with ordered ingest
-    /// through the log and the compact form off whatever it is asked, so
-    /// it is priced twice: against `cipher_base`, which is what the cipher
-    /// alone costs, and against `supdb`, which is what the mode costs.
+    /// cache of plaintext of its own, and it runs with the compact form
+    /// off whatever it is asked, so it is priced twice: against
+    /// `cipher_base`, which is what the cipher alone costs, and against
+    /// `supdb`, which is what the mode costs.
     cipher: bool,
     /// The plaintext the store under a cipher may hold, bytes
     /// (`StoreCipher::cache_bytes`), or zero for the engine's own choice,
@@ -1255,7 +1257,14 @@ struct Policy {
     /// under sixty-four mebibytes, which from a million keys up is a
     /// store several times its cache, read by the chunk it decrypts.
     cipher_cache: u64,
-    /// `supdb` with the two options a cipher fixes and no cipher
+    /// The store under a cipher with ordered ingest off
+    /// (`Options::direct_ingest`), so an ordered load goes through the log
+    /// and a hash table to a seal, as every load under a cipher did before
+    /// a run's commits were sealed into the log beside its segment:
+    /// `supdb-cipherlog` and `supdb-ingestcipherlog`, what the run is
+    /// priced against under the cipher.
+    cipher_log: bool,
+    /// `supdb` with the option a cipher fixes and no cipher
     /// (`supdb-cipherbase`, `supdb-ingestcipherbase`): the store a cipher
     /// runs, in the clear.
     cipher_base: bool,
@@ -1958,6 +1967,7 @@ impl Default for Policy {
             cipher: false,
             cipher_base: false,
             cipher_cache: 0,
+            cipher_log: false,
             partition: true,
             drain: true,
             advice: None,
@@ -2204,9 +2214,34 @@ impl Supdb {
         )
     }
 
-    /// `supdb` as a cipher runs it, in the clear: ordered ingest through
-    /// the log and the compact form off. The pair of `supdb-cipher` that
-    /// differs by the cipher alone.
+    /// `supdb-cipher` and `supdb-ingestcipher` with an ordered load
+    /// through the log (`Policy::cipher_log`).
+    pub fn create_cipherlog(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_log: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    pub fn create_ingest_cipherlog(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_log: true,
+                partition: false,
+                durable: false,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` as a cipher runs it, in the clear: the compact form off.
+    /// The pair of `supdb-cipher` that differs by the cipher alone.
     pub fn create_cipherbase(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
@@ -6566,6 +6601,7 @@ impl Supdb {
             cipher,
             cipher_base,
             cipher_cache,
+            cipher_log,
             partition,
             drain,
             advice,
@@ -7168,9 +7204,8 @@ impl Supdb {
         // the pair differs by the cipher and nothing else.
         let opts = if cipher || cipher_base {
             supdb::Options {
-                direct_ingest: false,
                 zpages: supdb::ZPages::Off,
-                recycle_wal: false,
+                direct_ingest: opts.direct_ingest && !cipher_log,
                 ..opts
             }
         } else {
@@ -7198,6 +7233,7 @@ impl Supdb {
             cipher,
             cipher_base,
             cipher_cache,
+            cipher_log,
             partition,
             drain,
             advice,
@@ -7468,6 +7504,8 @@ impl Engine for Supdb {
         }
         if self.cipher || self.cipher_base {
             return match (self.cipher, self.durable) {
+                (true, true) if self.cipher_log => "supdb-cipherlog",
+                (true, false) if self.cipher_log => "supdb-ingestcipherlog",
                 (true, true) if self.cipher_cache != 0 => "supdb-cipher64",
                 (true, true) => "supdb-cipher",
                 (true, false) => "supdb-ingestcipher",
@@ -9713,6 +9751,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-dirkey"
         | "supdb-cipher"
         | "supdb-cipher64"
+        | "supdb-cipherlog"
         | "supdb-cipherbase"
         | "supdb-nocacheordread"
         | "supdb-nocachezpages"
@@ -9996,6 +10035,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "rocksdb-tuned-nosync"
         | "supdb-ingestdirkey"
         | "supdb-ingestcipher"
+        | "supdb-ingestcipherlog"
         | "supdb-ingestcipherbase"
         // A write-once segment makes nothing durable before its one sync.
         | "supdb-segment"
@@ -10058,6 +10098,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestdirkey" => supdb_arm(Supdb::create_ingest_dirkey, dir)?,
         "supdb-cipher" => supdb_arm(Supdb::create_cipher, dir)?,
         "supdb-cipher64" => supdb_arm(Supdb::create_cipher64, dir)?,
+        "supdb-cipherlog" => supdb_arm(Supdb::create_cipherlog, dir)?,
+        "supdb-ingestcipherlog" => supdb_arm(Supdb::create_ingest_cipherlog, dir)?,
         "supdb-cipherbase" => supdb_arm(Supdb::create_cipherbase, dir)?,
         "supdb-ingestcipher" => supdb_arm(Supdb::create_ingest_cipher, dir)?,
         "supdb-ingestcipherbase" => supdb_arm(Supdb::create_ingest_cipherbase, dir)?,

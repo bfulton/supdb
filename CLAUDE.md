@@ -1212,7 +1212,11 @@ handle made (`paged_bits`), a snapshot taken or released, a file
 operation (the `vault::` door's counter), a wait on the device or
 another thread (`unlent`, `unlend`), a merge's start and its end
 (`vault::hold`, `check`), a fill's start (`look_mask`). Each is a load
-and a branch beside a syscall, a thread's park or a pass.
+and a branch beside a syscall, a thread's park or a pass. One more is
+the compiler's and was found counting an ordered load whole: a store's
+creation zeroes its reader table in one call, a hundred kilobytes, where
+the main line's build of the same source (`Readers::new`) wrote it a
+slot at a time, once a store.
 
 Seventeen mutants of the new paths, four of which outlived the tests
 there were: a fill that looks every sixty-four blocks under a cipher,
@@ -1379,12 +1383,12 @@ the fsync (`vault::persist`), by name, and pass over a name that has gone,
 since a promotion links a piece under another name and unlinks the first
 while the seal's thread is on its way there, and the manifest that names
 the file writes it whoever did not. Ordered ingest's run, a segment synced
-at every commit: off under a cipher, with the compact form
-(`under_cipher`), so an ordered load goes through the log.
-And the ordered index, which a plain store leaves unsynced and composes
-again where it is missing, as a store under a cipher does. A fourth fsync
-of a kept file is a durability that is not there, and the list is the
-thing to check a change against.
+at every commit: its commits go to the log as well, sealed and synced
+there (`Db::log_run`, below), and its segment gets its envelope where the
+run closes. And the ordered index, which a plain store leaves unsynced and
+composes again where it is missing, as a store under a cipher does. A
+fourth fsync of a kept file is a durability that is not there, and the
+list is the thing to check a change against.
 
 The recycled log was off there too, for as long as it was written down
 that a file written through before its first record could not be a
@@ -1408,6 +1412,100 @@ crash can leave is one the open reads, built in a test, before it is
 one an fsync's order is trusted to prevent; and "cannot work under a
 cipher" is a claim about a mechanism, to be checked against the
 mechanism before a feature is switched off on it.
+
+Ordered ingest was off there for the same kind of reason, and is on. A
+plain run is its own log: a segment open for append, a marker and an
+fdatasync of that file a commit, the WAL never written. Under a cipher
+the run's file is a memory file until it closes, so a commit synced
+there is synced nowhere, and the first answer was to switch the run off
+(`under_cipher`) and send an ordered load through the log and a hash
+table to a seal's sort. The run does not need its file to be its log. It
+is kept whole -- the ordered table, the records laid out once as the
+segment takes them, the close that composes a trailer where a seal sorts
+-- and each commit's batch goes to the log as well, sealed, written and
+synced as any commit's is (`Db::log_run`). The run's segment is named at
+the log's sequence, so the manifest that names it covers its frames and
+a replay skips them; a crash before that replays them into a table, as
+any commit's. The temp file a plain open recovers a run from is not in
+the directory: nothing of a run under a cipher is, until its envelope.
+`bench/scripts/pair.sh supdb-cipher supdb-cipherlog 300000 --passes
+load` prices it against the shape before, the arm with
+`direct_ingest` off: the ordered load 1.23x of it in both sittings and
+1.4-1.56x buffered (`supdb-ingestcipher supdb-ingestcipherlog`), the
+shuffled load level.
+
+Three things building it. The table reads its committed records through
+a mapping of the run's file (`RunMap`), and the cache gives a kept
+file's pages back by the megabyte once the file has its envelope, out
+of the memory that mapping reads. A file its writer has mapped is held
+(`vault::open_mapped`, `Mapped`): the envelope is written where the run
+closes, and the cache's view of the file is owed it
+(`MappedFile::owed`) until the last such mapping is dropped, which is
+the table's drop -- the publish after the run's landing, since the
+state keeps a replaced table for the upkeep's next look
+(`State::replaced`). Until then the run's plaintext is memory the cache
+counts and cannot give back, a seal's worth, as a seal's output in
+flight is. The first version let the vault leave the file at its
+envelope, as a merge's finished piece is left, and the reads after the
+close decrypted what had just been written. The second: the envelope of
+a run's segment is written on the run's own thread (`close_run`), where
+a plain run pays its fsync; with that line deleted every test passed,
+since the manifest writes the envelope of any segment nobody has
+(`manifest_image`), on the segment work's thread inside the landing, so
+the vault counts the envelopes a manifest's call had to write
+(`CipherCounts::late`) and a test holds it at none. The third: the log
+rotates under a run as under any commit, and with the rotation deleted
+every test passed too, the log one file of the run's size; the test
+holds the log's file under a run to twice the rotation's. Ten mutants
+in all, those two the ones that outlived the first tests.
+
+What a plain run pays for it is counted and is under nothing: the bit
+that says a run's commits are logged is in the byte the table already
+carried for `direct_table_refs` (`MemTable::after`, `RUN_REFS`,
+`RUN_LOGGED`), read once at a commit's end where the one flag was, and
+the counters of logged runs are bumped where the log is written, never
+where a run opens. The first fold of the test left two instructions a
+commit, a spill of the byte; the commit had been cloning the table's
+and the store's `Arc`s for the borrow checker, two locked increments
+and two decrements a commit, and borrowed they put `Db::commit_direct`
+a thousand instructions a commit of a thousand keys under the main
+line's (`bench/examples/load_only.rs supdb 100000 1` under callgrind,
+built at `origin/main` and at the tree, by function).
+
+What the run costs under a cipher is the double write and the envelope
+at the close, and it is not small: `pair.sh supdb-cipher
+supdb-cipherbase 300000 --passes load` reads the ordered load at 0.68x
+of the plain run in both sittings and the buffered pair at 0.52-0.57x,
+the shuffled loads at 0.80-0.84x, and the device's bytes per byte
+stored at 2.5 against 1.3. With `SUPDB_LOAD_PHASES=1
+SUPDB_DRAIN_STEPS=1` before the arms: the commits 20-50 ms longer over
+three hundred, a write and an fdatasync of the log where the plain run
+syncs its own file; and the drain 77-94 ms against 26-35, of which the
+envelope is 43-55 between the readable landing and the fsync -- forty
+megabytes sealed and written in 33 ms and synced in 20, by `strace -f
+-tt -T -y` over `load_only supdb-cipher 300000 1`, where the plain
+run's bytes went to the device commit by commit -- and 14 more are one
+`unlink`: the log file the run filled and rotated out of, retired on
+the segment work's thread by the manifest publish a drain's promotion
+makes, before the drain is answered. A plain ordered load has no such
+file, and its drain's promotion retires two temp names that are links.
+By the code any drain whose promotion or merge publishes while a closed
+log file waits retires it there (`Maint::publish`, the owed slot
+superseded); it has been looked for in no plain drain. Both are open in
+`ROADMAP.md`: an envelope sealed as the file is written makes a run its
+own log again, and a log retired after the answer takes the inode off
+the drain. From this commit the twin in the clear keeps its
+run, as `supdb` does, so the ordered-load cell of a pairing against the
+twin prices the cipher's run against the plain one, where before it
+priced two loads through the log. The rules: a feature switched off
+under a mode is first asked which part of it the mode breaks, and that
+part is given another way before the rest is given up -- the run lost
+its fsync, not its table or its close; the new shape is priced against
+the old one under the mode before it is priced against the plain
+store, since the second pairing says what is left and only the first
+says whether the work was worth doing; and a mutant that survives
+because another mechanism covers for the deleted one is held by
+counting which mechanism did the work.
 
 A plain store's partition is named by its fences, sixteen bytes of two
 keys, so the names cannot go to the directory either: an envelope is named
@@ -1519,8 +1617,9 @@ ordered and the shuffled load read 0.83-0.86x of the same store in the
 clear in both sittings, the buffered arms' 0.76-0.84x (`pair.sh
 supdb-ingestcipher supdb-ingestcipherbase 300000`), the full-rewrite
 burst a few percent behind in one sitting, and the scans and the mixes
-level; against `supdb` the shuffled load reads the same and the ordered
-load 0.6x, which is ordered ingest's run forgone and not the cipher. One
+level; against `supdb` the shuffled load read the same and the ordered
+load 0.6x, which was ordered ingest's run forgone and not the cipher (the
+run under a cipher, above). One
 cell is not explained: the first single-threaded pass of point reads read
 0.9x at a hundred thousand keys in five sittings of six, and at three
 hundred thousand 0.95x in both sittings of the buffered pair and

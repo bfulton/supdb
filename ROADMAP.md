@@ -211,16 +211,29 @@ What an engine picker would hit, roughly in order.
   checked --test fuzz fuzz_range -- --exact`), in a plain store with the
   upkeep inline. A release build has no check there and patches the entry
   the rank names.
-- [ ] **Ordered ingest and the compact form under a cipher.** Both are
-  off there: ordered ingest's run is a segment synced at every commit,
-  which a file that reaches the directory once, as its envelope, cannot
-  be, so an ordered load goes through the log; and the compact form is
+- [x] **Ordered ingest under a cipher.** An ordered run keeps its table,
+  its record stream and its close; its commits go to the log as well,
+  sealed there, and its segment gets its envelope where the run closes.
+- [ ] **An ordered run under a cipher as its own log.** A run's records
+  are written twice, to the log and to the segment's envelope, and the
+  envelope is written whole at the close, where a plain run's bytes
+  reach the device commit by commit. It wants the streamed envelope
+  above, with a commit's chunks sealed as the commit is made and a
+  recovery that reads the run's envelope to its last whole commit. Done
+  when a run under a cipher writes no frame to the log.
+- [ ] **A log file retired off the drain.** A drain whose promotion or
+  merge publishes a manifest retires the closed log files behind it
+  before it answers, and a file retired is an inode freed, a device
+  round trip the size of the file. An ordered run under a cipher fills
+  the log, so its drain pays it; a plain store's does wherever a closed
+  log file waits at such a publish. The manifest's spare is unlinked at
+  an idle tick for the same reason.
+- [ ] **The compact form under a cipher.** It is off there: the form is
   built from a partition's records borrowed whole and attached by its
   bytes in the page cache, where a file under a cipher is read by the
-  piece through the store's own cache. The first wants the streamed
-  envelope above, with a record sealed a commit; the second wants the
-  form file's pages sealed one by one, which is the shape its reader
-  already has: a page read, checked and decoded into memory of its own.
+  piece through the store's own cache. It wants the form file's pages
+  sealed one by one, which is the shape its reader already has: a page
+  read, checked and decoded into memory of its own.
 - [ ] **A store under a cipher on another platform.** The memory files a
   file is written in and the cache gives pages back from are Linux's
   (`memfd_create`, `MADV_REMOVE`); elsewhere the store is refused before it

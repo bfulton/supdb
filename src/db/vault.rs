@@ -116,11 +116,22 @@
 //!
 //! # What a store under a cipher runs without
 //!
-//! Ordered ingest's run, the compact form and the recycled log, whatever
-//! the options say (`under_cipher` in the engine): each rests on a file the
-//! engine makes durable by its own fsync as it writes it, and a file here
-//! reaches the directory once, whole, as its envelope. An ordered load
-//! therefore goes through the log.
+//! The compact form, whatever the options say (`under_cipher` in the
+//! engine): it is built from a partition's records borrowed whole and
+//! attached by its bytes in the page cache.
+//!
+//! # A file written and mapped at once
+//!
+//! Ordered ingest's run is a segment open for append that its table reads
+//! through a mapping while it is written, and a plain store makes it
+//! durable by syncing it at every commit. Here the run's file is a memory
+//! file like any other being written, so its commits go to the log as
+//! well, sealed as any commit's are, and the file gets its envelope once
+//! the run closes. A file a writer has mapped for itself
+//! ([`open_mapped`]) is held in memory for as long as the mapping stands
+//! ([`Mapped`]): its envelope is written where the file is finished, and
+//! the cache takes the file over, to give its pages back, only once the
+//! last such mapping has gone.
 
 use crate::bytes::{Bytes, MmapBytes};
 use crate::crypt::{self, Aead, EncryptOptions, NONCE, TAG};
@@ -529,6 +540,9 @@ pub(crate) struct Counts {
     pub(crate) left: AtomicU64,
     /// Envelopes no manifest named, removed at the open.
     pub(crate) swept: AtomicU64,
+    /// Segments whose envelope a manifest's own call wrote, no seal, run
+    /// or merge having written it where it finished the file.
+    pub(crate) late: AtomicU64,
 }
 
 /// A store under a cipher: its directory, its key, and its files.
@@ -544,9 +558,45 @@ pub(crate) struct Vault {
     nonces: Mutex<Nonces>,
     /// One persist at a time: two would write one file twice.
     persisting: Mutex<()>,
+    /// The memory files their writer has mapped for itself (`Mapped`).
+    /// Taken after `files` where both are.
+    mapped: Mutex<Vec<MappedFile>>,
     /// The cache the store's files are read through.
     pager: Arc<Pager>,
     pub(crate) counts: Counts,
+}
+
+/// A memory file with mappings of its own outside the cache: an ordered
+/// run's, which the run's table reads its committed records through
+/// (`db::RunMap`). The cache's view of a file is a mapping of the same
+/// memory, and what the cache gives back it takes out of that memory, so
+/// while a mapping here stands the file is not the cache's to give back.
+struct MappedFile {
+    /// The memory file, kept open: its identity for as long as it is
+    /// mapped.
+    mem: Arc<File>,
+    /// The mappings over it.
+    maps: usize,
+    /// The view of it that waits for its envelope behind it, and the
+    /// envelope: a file that got its envelope while it was mapped, to be
+    /// the cache's to give back once the last mapping has gone.
+    owed: Option<(Arc<Paged>, Disk)>,
+}
+
+/// What a mapping of a file being written holds on the file
+/// (`open_mapped`): nothing for a plain store's. Under a cipher the file
+/// is a memory file, which the store's cache will take for its own view
+/// once the file has its envelope and give back by the megabyte, out of
+/// the memory this mapping reads; dropped with the mapping, this is what
+/// says the mapping has gone.
+pub(crate) struct Mapped(Option<(Arc<Vault>, Arc<File>)>);
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        if let Some((v, mem)) = self.0.take() {
+            v.unmapped(&mem);
+        }
+    }
 }
 
 /// The cache a store is given where its cipher names none: half of what
@@ -687,6 +737,7 @@ impl Vault {
             files: Mutex::new(HashMap::new()),
             nonces: Mutex::new(Nonces::new()?),
             persisting: Mutex::new(()),
+            mapped: Mutex::new(Vec::new()),
             pager: Pager::new(cipher.cache.unwrap_or_else(default_cache)),
             counts: Counts::default(),
         })
@@ -931,6 +982,58 @@ impl Vault {
         Ok(())
     }
 
+    /// A file being written, opened to be mapped by its writer
+    /// (`open_mapped`), and the memory file the mapping is counted
+    /// against. One that has its envelope is refused, as `reopen_written`
+    /// refuses it: it is read through the cache's view.
+    fn map_written(&self, name: &str) -> Result<(File, Arc<File>)> {
+        let files = lock(&self.files);
+        let mem = files
+            .get(name)
+            .ok_or_else(|| Error::from(ErrorKind::NotFound))?
+            .mem
+            .clone()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unsupported,
+                    "a file of a store under a cipher that has its envelope is read through \
+                     its mapping",
+                )
+            })?;
+        let file = reopen(&mem, false, false)?;
+        let mut mapped = lock(&self.mapped);
+        match mapped.iter_mut().find(|m| Arc::ptr_eq(&m.mem, &mem)) {
+            Some(m) => m.maps += 1,
+            None => mapped.push(MappedFile {
+                mem: mem.clone(),
+                maps: 1,
+                owed: None,
+            }),
+        }
+        Ok((file, mem))
+    }
+
+    /// A mapping of `mem` has gone (`Mapped`): with the last of them, the
+    /// view that waited for its envelope gets it, and the file is the
+    /// cache's to give back. A view that cannot be given its envelope
+    /// stays whole in memory, which is what it was.
+    fn unmapped(&self, mem: &Arc<File>) {
+        let _files = lock(&self.files);
+        let mut mapped = lock(&self.mapped);
+        let Some(i) = mapped.iter().position(|m| Arc::ptr_eq(&m.mem, mem)) else {
+            return;
+        };
+        mapped[i].maps -= 1;
+        if mapped[i].maps > 0 {
+            return;
+        }
+        if let Some((page, disk)) = mapped.swap_remove(i).owed {
+            if let Ok(back) = self.back_of(&disk) {
+                let _ = page.back(back);
+            }
+        }
+    }
+
     /// A kept file opened to be written again. One that has an envelope is
     /// refused: the envelope would no longer be the file, and nothing
     /// would say so.
@@ -1072,14 +1175,28 @@ impl Vault {
             .values()
             .filter(|e| over(e))
             .find_map(|e| e.page.clone());
+        // A file its writer still maps is not the cache's to give back
+        // yet: its view, the one a reader made or the one made here,
+        // waits for its envelope until the mapping has gone (`unmapped`).
+        // Whole in memory meanwhile, as it was while it was written, and
+        // read with nothing decrypted.
+        let mut mapped = lock(&self.mapped);
+        let mut held = mapped.iter_mut().find(|m| Arc::ptr_eq(&m.mem, mem));
+        let mut give = |p: &Arc<Paged>| -> Result<()> {
+            match held.as_mut() {
+                Some(m) => m.owed = Some((p.clone(), disk.clone())),
+                None => p.back(self.back_of(disk)?)?,
+            }
+            Ok(())
+        };
         let page = match viewed {
             Some(p) => {
-                p.back(self.back_of(disk)?)?;
+                give(&p)?;
                 Some(p)
             }
             None if keep => {
                 let p = Paged::adopt(&self.pager, mem, mem.metadata()?.len(), name)?;
-                p.back(self.back_of(disk)?)?;
+                give(&p)?;
                 Counts::add(&self.counts.adopted, 1);
                 Some(p)
             }
@@ -1158,6 +1275,9 @@ impl Vault {
                     let keep = self.keeps(&mem);
                     self.write_envelope(&mem, &disk, &key, true)?;
                     made = true;
+                    if named {
+                        Counts::add(&self.counts.late, 1);
+                    }
                     let mut files = lock(&self.files);
                     // Every name over the same memory file: a link made
                     // before the envelope was.
@@ -1395,6 +1515,7 @@ impl Counts {
             adopted: get(&self.adopted),
             left: get(&self.left),
             swept: get(&self.swept),
+            late: get(&self.late),
             cache,
         }
     }
@@ -1419,6 +1540,12 @@ pub struct CipherCounts {
     pub left: u64,
     /// Envelopes no manifest named, removed at the open.
     pub swept: u64,
+    /// Segments whose envelope was written by the manifest that names
+    /// them, on the thread every landing goes through: a file is sealed
+    /// where it is finished, by the seal, the run or the merge that wrote
+    /// it, and this counts the ones that were not -- a piece renamed
+    /// while its writer was on its way to seal it.
+    pub late: u64,
     /// The cache the store reads through: what it may hold and holds, and
     /// what it has decrypted and given back.
     pub cache: PagerCounts,
@@ -1644,6 +1771,22 @@ pub(crate) fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()>
             ErrorKind::Unsupported,
             "a rename between a store under a cipher and somewhere else",
         )),
+    }
+}
+
+/// A file being written, opened to be mapped by its writer, and what the
+/// mapping holds on it: the file as `open` gives it, and for a store under
+/// a cipher the hold that keeps the store's cache from giving the file's
+/// memory back under the mapping (`Mapped`).
+pub(crate) fn open_mapped(path: impl AsRef<Path>) -> Result<(File, Mapped)> {
+    let path = path.as_ref();
+    match locate(path) {
+        None => Ok((File::open(path)?, Mapped(None))),
+        Some((v, name)) if passes(&name) => Ok((File::open(v.real.join(name))?, Mapped(None))),
+        Some((v, name)) => {
+            let (file, mem) = v.map_written(&name)?;
+            Ok((file, Mapped(Some((v, mem)))))
+        }
     }
 }
 
