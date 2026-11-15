@@ -11728,7 +11728,10 @@ fn the_hot_raw_policy_rates_a_burst_on_the_looks_that_pass_the_floor() {
         );
         inject.set_decode_cost(std::time::Duration::from_micros(10));
         let c = db.zpage_counts();
-        assert!(c.form_files >= 5, "{what}: partitions to choose from: {c:?}");
+        assert!(
+            c.form_files >= 5,
+            "{what}: partitions to choose from: {c:?}"
+        );
         let (partitions, total) = (c.partitions, c.file_bytes);
         inject.set_budget(total * 4);
         inject.set_slack(total * 4);
