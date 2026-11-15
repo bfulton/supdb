@@ -7974,6 +7974,23 @@ impl Supdb {
         )
     }
 
+    /// `supdb-nocachezpages` with the page cut at a kibibyte of records
+    /// (`Options::zpages_group_bytes` 1024) where the default cuts at two:
+    /// with `supdb-nocachezpagesonegroup` at the other side, the cold point
+    /// read's cost a byte decoded, read off the forced form in core where
+    /// nothing else moves with the cut.
+    pub fn create_nocache_zpages_group1k(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                block_cache: false,
+                zpages: true,
+                zgroup: Some(1024),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-nocachezpages` with every build left to the settle of the
     /// form rather than started as its partition lands
     /// (`Options::zpages_eager` off): the shape the forced arm's first
@@ -10710,6 +10727,8 @@ impl Engine for Supdb {
                 "supdb-nocachezpagesrecordraw"
             } else if self.zgroup == Some(0) {
                 "supdb-nocachezpagesonegroup"
+            } else if self.zgroup == Some(1024) {
+                "supdb-nocachezpagesgroup1k"
             } else {
                 "supdb-nocachezpages"
             };
@@ -11913,6 +11932,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocachezpagesprefetch"
         | "supdb-nocachezpagesrankwalk"
         | "supdb-nocachezpagesonegroup"
+        | "supdb-nocachezpagesgroup1k"
         | "supdb-nocachezpagessettle"
         | "supdb-autozpages"
         | "supdb-nozpages"
@@ -12457,6 +12477,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocachezpagesprefetch" => supdb_arm(Supdb::create_nocache_zpages_prefetch, dir)?,
         "supdb-nocachezpagesrankwalk" => supdb_arm(Supdb::create_nocache_zpages_rankwalk, dir)?,
         "supdb-nocachezpagesonegroup" => supdb_arm(Supdb::create_nocache_zpages_onegroup, dir)?,
+        "supdb-nocachezpagesgroup1k" => supdb_arm(Supdb::create_nocache_zpages_group1k, dir)?,
         "supdb-nocachezpagessettle" => supdb_arm(Supdb::create_nocache_zpages_settle, dir)?,
         "supdb-autozpages" => supdb_arm(Supdb::create_auto_zpages, dir)?,
         "supdb-nozpages" => supdb_arm(Supdb::create_nozpages, dir)?,
@@ -17312,6 +17333,11 @@ mod tests {
                 "onegroup",
             ),
             (
+                "supdb-nocachezpagesgroup1k",
+                Supdb::create_nocache_zpages_group1k,
+                "group1k",
+            ),
+            (
                 "supdb-nocachezpagescheckedviews",
                 Supdb::create_nocache_zpages_checkedviews,
                 "checkedviews",
@@ -17333,7 +17359,14 @@ mod tests {
             assert_eq!(guarantee(name), guarantee("supdb-nocachezpages"));
             assert!(arm.zpages && base.zpages, "both force the form");
             assert!(!arm.zpages_nodrop);
-            assert_eq!(arm.zgroup, (arm_dir == "onegroup").then_some(0));
+            assert_eq!(
+                arm.zgroup,
+                match arm_dir {
+                    "onegroup" => Some(0),
+                    "group1k" => Some(1024),
+                    _ => None,
+                }
+            );
             assert!(base.zgroup.is_none());
             assert_eq!(arm.zpages_nowarm, arm_dir == "nowarm");
             assert_eq!(arm.zpages_settle, arm_dir == "settle");
