@@ -231,9 +231,23 @@ What an engine picker would hit, roughly in order.
 - [x] **The compact form under a cipher.** A form file is built from its
   segment's records read by the piece through the store's cache, sealed
   beside the segment's envelope under the segment's key, and read by the
-  page through the cache; the controller samples, builds ahead, buys and
-  installs as it does for a plain store, and a store under a cipher fixes
-  no option.
+  page through the cache, under `ZPages::Always`; the controller samples,
+  builds ahead, buys and installs there as it does for a plain store
+  where it is asked to (`Options::zpages_under_cipher`).
+- [ ] **An envelope whose chunks are whole pages.** A chunk of an
+  envelope is a stored page less its tag, so a page of plaintext lies
+  across two chunks, and a form page, which is a page, is two pages of
+  ciphertext to a cold read: under a bound the form the controller buys
+  read at 0.73x of the raw form it replaced, and the controller is off
+  under a cipher for it. With the tags kept apart, at the envelope's end
+  or in a file beside it, a chunk is a page, a form page is one page of
+  ciphertext and a tag's page serves a megabyte of them; the store's
+  cache then gives back by the page and not by the megabyte a run of
+  chunks comes to. It is a second layout of an envelope, for a store's
+  own files, with the first on record for a published one. Done when
+  `pair.sh supdb-cipherauto supdb-cipher 5000000 --bound 671088640
+  --passes read` reads the form ahead in both sittings, and the
+  controller is on under a cipher.
 - [ ] **A form file's damage taken as the form's alone.** A chunk of a
   form file that fails its tag is a read of the store that failed, and
   the store refuses every read after it, as it does for a segment's. A
@@ -242,6 +256,13 @@ What an engine picker would hit, roughly in order.
   regenerable under a cipher. Done when a failed chunk of a form file's
   envelope is the form's failure, at every site that reads a form page,
   with the byte-damage test saying which outcome each flip had.
+- [ ] **The controller's model held to a measurement under a cipher.**
+  Its budget there is of two caches in series, the store's own and the
+  kernel's of the envelopes, and at five million keys under 640 MiB it
+  predicted no fault through the form where the census read 0.6 a read,
+  and did not leave the form in five million reads. Done when the
+  model's prediction for each form is printed beside the census there
+  and the two agree, or the selector's exits act on the difference.
 - [ ] **The controller under a cipher prices the kernel's cache alone.**
   It reads the group's budget, its refaults and the thread's major
   faults, as for a plain store, which under a cipher are the kernel's

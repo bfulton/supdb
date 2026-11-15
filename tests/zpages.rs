@@ -6779,8 +6779,10 @@ fn the_controller_buys_builds_and_installs_the_form_under_a_cipher() {
             common::Gcm::new,
         ))
     };
-    let (dir, db, model, _inject, r, keys, _) =
-        compact_store_with("auto-cipher", 1 << 20, |o| o.encryption = cipher());
+    let (dir, db, model, _inject, r, keys, _) = compact_store_with("auto-cipher", 1 << 20, |o| {
+        o.encryption = cipher();
+        o.zpages_under_cipher = true;
+    });
     assert!(db.cipher_counts().is_some(), "the store is under a cipher");
     let c = db.zpage_counts();
     assert!(
@@ -7202,6 +7204,58 @@ fn form_files_on_disk_are_dormant_under_auto_and_attached_when_the_form_is_wante
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// As shipped the controller leaves a store under a cipher in the raw form
+/// (`Options::zpages_under_cipher` off): the same store that is driven to
+/// the compact form with the option on steps no selector, builds nothing
+/// and reads raw with it off, under the same seam and the same reads.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_controller_leaves_a_store_under_a_cipher_raw_unless_it_is_asked() {
+    let dir = scratch("auto-cipher-off");
+    let inject = std::sync::Arc::new(supdb::ZInject::new());
+    inject.set_budget(1 << 20);
+    inject.set_refault_rate(1_000_000.0);
+    inject.set_fault_cost(FAULT_1MS);
+    inject.set_decode_cost(DECODE_5US);
+    inject.advance(std::time::Duration::from_millis(1));
+    let mut db = Db::create(
+        &dir,
+        Options {
+            zpages: ZPages::Auto,
+            zpages_min_bytes: 0,
+            zpages_inject: Some(inject.clone()),
+            encryption: supdb::Encryption::Cipher(supdb::StoreCipher::new(
+                common::Gcm::new(&[0x5a; 32]),
+                common::Gcm::new,
+            )),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.options().zpages, ZPages::Off, "the store's own reading");
+    let model = ordered_load(&mut db, 20_000, 0x4A9);
+    db.settle().unwrap();
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    for _ in 0..20 {
+        reads(&r, &keys, &inject, 640, &mut at, 1);
+        inject.advance(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.sel_steps, c.build_starts, c.form_files, c.reads),
+        (0, 0, 0, 0),
+        "{c:?}"
+    );
+    let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+    check(&r, &model, &some, "raw under a cipher");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The same under a cipher (`Encryption::Cipher`), where a form file an
 /// earlier open left is an envelope beside its segment's that this open's
 /// table of names does not hold until something asks for it: the
@@ -7253,6 +7307,7 @@ fn form_files_an_earlier_open_left_under_a_cipher_are_dormant_and_then_attached(
             zpages_min_bytes: 0,
             zpages_inject: Some(inject.clone()),
             encryption: cipher(),
+            zpages_under_cipher: true,
             ..Options::default()
         },
     )
@@ -7538,6 +7593,7 @@ fn builds_ahead_under_a_cipher_seal_their_form_files_and_keep_them_cold() {
             common::Gcm::new(&[0x5a; 32]),
             common::Gcm::new,
         ));
+        o.zpages_under_cipher = true;
         o.partition_bytes = Some(400 << 10);
     });
     let before = db.cipher_counts().expect("a store under a cipher");
@@ -7596,6 +7652,7 @@ fn the_crossing_under_a_cipher_swaps_the_ciphertext_of_records_for_forms() {
             common::Gcm::new(&[0x5a; 32]),
             common::Gcm::new,
         ));
+        o.zpages_under_cipher = true;
         o.zpages_land_drop_past = true;
         o.zpages_cover_resident = false;
         o.zpages_suspect_at_crossing = false;

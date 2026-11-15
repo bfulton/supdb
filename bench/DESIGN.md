@@ -279,14 +279,15 @@ can encrypt, which `scripts/fscrypt.sh` makes in a file behind a loop
 device, so `ab` names the device at its table's head and its rates are
 read as two arms on one device and not as a disk's. And a store under a
 cipher of the caller's (`Encryption::Cipher`), here AES-256-GCM:
-`supdb-cipher` and `supdb-ingestcipher`. Such a store fixes no option, so
-it is paired with `supdb` and `supdb-ingest` themselves, which differ from
-it by the cipher and the store's own cache of plaintext alone. Two more
-keep a shape a store under a cipher had before it ran what a plain store
-runs, for pricing the new one against under the cipher: `supdb-cipherlog`
-and `supdb-ingestcipherlog`, an ordered load through the log with no run,
-and `supdb-ciphernozpages` and `supdb-ingestciphernozpages`, the compact
-form off. That
+`supdb-cipher` and `supdb-ingestcipher`. Its pair is `supdb`, or
+`supdb-ingest`, itself, which differs from it by the cipher, the store's
+own cache of plaintext, and the compact form's controller, which leaves a
+store under a cipher in the raw form as shipped. Two more price a store
+under a cipher against itself: `supdb-cipherlog` and
+`supdb-ingestcipherlog`, an ordered load through the log with no run,
+which is the shape before the run was kept there; and `supdb-cipherauto`
+and `supdb-ingestcipherauto`, the controller on
+(`Options::zpages_under_cipher`). That
 cache is half of what the process may use unless an arm says otherwise,
 which at the suite's in-core rungs is a store that fits it;
 `supdb-cipher64` is the same store with a cache of sixty-four mebibytes,

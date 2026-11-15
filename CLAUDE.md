@@ -1520,9 +1520,10 @@ offers". Neither was the form's. The reader already read a form page by
 asking its mapping for it (`ZFile::page_bytes`, a `slice_at`) and copied
 the resident part to the heap at its attach, so over a paged mapping it
 is the reader it was; and the builder took its records through a trait
-(`zpages::Images`) that had a second implementation for the tests. A
-store under a cipher fixes no option now, and `under_cipher` is gone.
-What it took:
+(`zpages::Images`) that had a second implementation for the tests. The
+form builds, seals and reads under a cipher now and `under_cipher` is
+gone; whether the controller should choose it there is another question,
+which a pairing answered no (the end of this section). What it took:
 
 The builder reads by the piece. `PieceImages` is the directory's word for
 a rank and then a window that holds the record (`flatindex::Pieces::image`),
@@ -1635,6 +1636,38 @@ read. The probes are `bench/examples/read_only.rs` and `lag0_probe.rs`
 with `supdb-nocachezpages` beside `supdb`, the toggles as above, built
 at `origin/main` from this tree's example sources and at the tree.
 
+And then it was priced, last, and lost. `bench/scripts/pair.sh
+supdb-cipherauto supdb-cipher 5000000 --bound 671088640 --passes read
+--reps 2 --ops-div 10` (run with the arms named `supdb-cipher` and
+`supdb-ciphernozpages`, at `b4d555bc`): five million keys under 640 MiB,
+the controller buying the form against the same store with the form off.
+The controller bought, nineteen form files, and 470,000 of the pass's
+500,000 reads went through them at 0.60 and 0.75x of the store without
+in the two sittings, 0.69-0.81 major faults a read against 0.49. The
+builds were still reading the device inside that pass (a fault 75-80 µs
+against 30), so it was run again whole, five million reads a sitting
+(`--reps 1 --ops-div 1`): the faults level at 30 µs, every read through
+the form, 0.60 faults a read against 0.43, 0.73x. A form page is four
+kibibytes and an envelope's chunk is sixteen bytes less, its tag stored
+beside it, so every form page lies across two chunks and a cold read
+through the form takes two pages of ciphertext from the device; the raw
+read it replaces takes two as well, a hash slot's and a record's, but
+the hash slots are an eighth of the bytes and stay resident, so it takes
+about one. "ZPAGE 4096 against a chunk's 4080: a form page is two
+chunks" was a line in the plan for this work, written before any of it,
+and was not priced until the form was built, tested, mutated, gated and
+pushed with the controller on. So the controller leaves a store under a
+cipher in the raw form as shipped (`Options::zpages_under_cipher`, off;
+`cipher_controller`), `ZPages::Always` builds the form there, and the
+arms with the controller on are `supdb-cipherauto` and
+`supdb-ingestcipherauto`. What it wants is an envelope whose chunks are
+whole pages, the tags kept apart (`ROADMAP.md`). The controller did not
+leave the form in five million reads either, its model reading the raw
+form at 0.29 faults a read and the form at none while the census read
+0.60 through the form: under a cipher the model's budget is of two
+caches in series, the store's and the kernel's, and nothing has held its
+prediction to a measurement there.
+
 The rules: a feature that "cannot work" under a mode is a claim about
 the code that does the work today, and it is checked at each place that
 code touches what the mode changes -- here a mapping opened by a path, a
@@ -1646,7 +1679,12 @@ first run are run against the mutants before anything is said of them;
 and "pays nothing" is said of the operations that were counted, by
 name, with the ones that were not -- every read path a store has, each
 form of it, is a row of the count, and a path left out is a path the
-claim does not cover.
+claim does not cover. And a mechanism made to work under a mode is
+priced under the mode before its default is chosen there, on the cell it
+exists for: this one existed for reads out of core, and the first
+out-of-core pairing was the last thing run. A line in a plan that says
+why a thing may not pay is an experiment owed before the thing is built
+to completion, since everything built after it is built on its answer.
 
 A plain store's partition is named by its fences, sixteen bytes of two
 keys, so the names cannot go to the directory either: an envelope is named

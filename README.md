@@ -288,8 +288,10 @@ directory put back to an older copy of itself is not detected.
 
 What it costs beside the cipher: an ordered load is written to the log as
 well as to its segment, and it is Linux only. Every option a store in the
-clear runs with, a store under a cipher runs with. `Db::cipher_counts`
-says what
+clear runs with, a store under a cipher runs with; one choice is made
+differently, in that `ZPages::Auto` leaves such a store in the raw form
+unless `Options::zpages_under_cipher` is set, and `ZPages::Always` builds
+the compact form there as anywhere. `Db::cipher_counts` says what
 the cache holds, has decrypted and has given back. `cargo run --release
 --example cipher_store` has the adapter and opens a store under a cache
 smaller than it, and the `supdb::db::vault` module docs have the layout,

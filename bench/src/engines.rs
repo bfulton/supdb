@@ -382,8 +382,8 @@ pub struct Supdb {
     dirkey: bool,
     /// The store is under a cipher of the caller's (`Policy::cipher`).
     cipher: bool,
-    /// `Policy::cipher_noz`.
-    cipher_noz: bool,
+    /// `Policy::cipher_auto`.
+    cipher_auto: bool,
     /// `Policy::cipher_cache`.
     cipher_cache: u64,
     /// `Policy::cipher_log`.
@@ -1246,8 +1246,10 @@ struct Policy {
     /// The store under a cipher the caller supplies (`Encryption::Cipher`),
     /// here AES-256-GCM: `supdb-cipher` and `supdb-ingestcipher`. Its
     /// directory holds its files' envelopes and it reads them through a
-    /// cache of plaintext of its own. It fixes no option, so its pair is
-    /// `supdb`, or `supdb-ingest`, itself.
+    /// cache of plaintext of its own. Its pair is `supdb`, or
+    /// `supdb-ingest`, itself: it differs by the cipher, and by the
+    /// compact form's controller, which leaves a store under a cipher in
+    /// the raw form as shipped (`cipher_auto`).
     cipher: bool,
     /// The plaintext the store under a cipher may hold, bytes
     /// (`StoreCipher::cache_bytes`), or zero for the engine's own choice,
@@ -1262,12 +1264,12 @@ struct Policy {
     /// `supdb-cipherlog` and `supdb-ingestcipherlog`, what the run is
     /// priced against under the cipher.
     cipher_log: bool,
-    /// The store under a cipher with the compact form off
-    /// (`ZPages::Off`), as every store under a cipher ran before a form
-    /// file was sealed beside its segment: `supdb-ciphernozpages` and
-    /// `supdb-ingestciphernozpages`, what the form is priced against under
-    /// the cipher.
-    cipher_noz: bool,
+    /// The store under a cipher with the compact form's controller on
+    /// (`Options::zpages_under_cipher`), which is off as shipped:
+    /// `supdb-cipherauto` and `supdb-ingestcipherauto`, the form the
+    /// controller buys under a cipher priced against the raw form it
+    /// stays in otherwise.
+    cipher_auto: bool,
     partition: bool,
     drain: bool,
     advice: Option<supdb::ReadAdvice>,
@@ -1965,7 +1967,7 @@ impl Default for Policy {
         Policy {
             dir_key: false,
             cipher: false,
-            cipher_noz: false,
+            cipher_auto: false,
             cipher_cache: 0,
             cipher_log: false,
             partition: true,
@@ -2240,25 +2242,25 @@ impl Supdb {
         )
     }
 
-    /// `supdb-cipher` and `supdb-ingestcipher` with the compact form off
-    /// (`Policy::cipher_noz`).
-    pub fn create_ciphernoz(path: &Path) -> Res<Supdb> {
+    /// `supdb-cipher` and `supdb-ingestcipher` with the compact form's
+    /// controller on (`Policy::cipher_auto`).
+    pub fn create_cipherauto(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
                 cipher: true,
-                cipher_noz: true,
+                cipher_auto: true,
                 ..Policy::default()
             },
         )
     }
 
-    pub fn create_ingest_ciphernoz(path: &Path) -> Res<Supdb> {
+    pub fn create_ingest_cipherauto(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
                 cipher: true,
-                cipher_noz: true,
+                cipher_auto: true,
                 partition: false,
                 durable: false,
                 ..Policy::default()
@@ -6601,7 +6603,7 @@ impl Supdb {
         let Policy {
             dir_key,
             cipher,
-            cipher_noz,
+            cipher_auto,
             cipher_cache,
             cipher_log,
             partition,
@@ -7202,15 +7204,12 @@ impl Supdb {
             },
             None => opts,
         };
-        // The shapes a store under a cipher had before it ran everything
-        // a plain store runs, for the arms that price the new against them.
+        // The shapes a store under a cipher is priced against itself in:
+        // an ordered load through the log with no run, the shape before,
+        // and the compact form's controller on, the shape not shipped.
         let opts = if cipher {
             supdb::Options {
-                zpages: if cipher_noz {
-                    supdb::ZPages::Off
-                } else {
-                    opts.zpages
-                },
+                zpages_under_cipher: cipher_auto,
                 direct_ingest: opts.direct_ingest && !cipher_log,
                 ..opts
             }
@@ -7237,7 +7236,7 @@ impl Supdb {
             path: path.to_path_buf(),
             dirkey: dir_key,
             cipher,
-            cipher_noz,
+            cipher_auto,
             cipher_cache,
             cipher_log,
             partition,
@@ -7512,8 +7511,8 @@ impl Engine for Supdb {
             return match self.durable {
                 true if self.cipher_log => "supdb-cipherlog",
                 false if self.cipher_log => "supdb-ingestcipherlog",
-                true if self.cipher_noz => "supdb-ciphernozpages",
-                false if self.cipher_noz => "supdb-ingestciphernozpages",
+                true if self.cipher_auto => "supdb-cipherauto",
+                false if self.cipher_auto => "supdb-ingestcipherauto",
                 true if self.cipher_cache != 0 => "supdb-cipher64",
                 true => "supdb-cipher",
                 false => "supdb-ingestcipher",
@@ -9758,7 +9757,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cipher"
         | "supdb-cipher64"
         | "supdb-cipherlog"
-        | "supdb-ciphernozpages"
+        | "supdb-cipherauto"
         | "supdb-nocacheordread"
         | "supdb-nocachezpages"
         | "supdb-nocachezpagesnodrop"
@@ -10042,7 +10041,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestdirkey"
         | "supdb-ingestcipher"
         | "supdb-ingestcipherlog"
-        | "supdb-ingestciphernozpages"
+        | "supdb-ingestcipherauto"
         // A write-once segment makes nothing durable before its one sync.
         | "supdb-segment"
         | "supdb-segment-enc"
@@ -10106,9 +10105,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cipher64" => supdb_arm(Supdb::create_cipher64, dir)?,
         "supdb-cipherlog" => supdb_arm(Supdb::create_cipherlog, dir)?,
         "supdb-ingestcipherlog" => supdb_arm(Supdb::create_ingest_cipherlog, dir)?,
-        "supdb-ciphernozpages" => supdb_arm(Supdb::create_ciphernoz, dir)?,
+        "supdb-cipherauto" => supdb_arm(Supdb::create_cipherauto, dir)?,
         "supdb-ingestcipher" => supdb_arm(Supdb::create_ingest_cipher, dir)?,
-        "supdb-ingestciphernozpages" => supdb_arm(Supdb::create_ingest_ciphernoz, dir)?,
+        "supdb-ingestcipherauto" => supdb_arm(Supdb::create_ingest_cipherauto, dir)?,
         "supdb-nocacheordread" => supdb_arm(Supdb::create_nocache_ordread, dir)?,
         "supdb-nocachezpages" => supdb_arm(Supdb::create_nocache_zpages, dir)?,
         "supdb-nocachezpagesnodrop" => supdb_arm(Supdb::create_nocache_zpages_nodrop, dir)?,

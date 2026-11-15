@@ -741,7 +741,10 @@ pub enum Encryption {
     /// so a file changed on the device is refused at the read that first
     /// wants the changed bytes, with an error every operation after it
     /// answers with too. Every option means what it means for a store in
-    /// the clear. `Db::create` makes a store under the cipher in an empty
+    /// the clear, with one choice made differently: the controller leaves
+    /// such a store in the raw form (`Options::zpages_under_cipher`),
+    /// where the compact form has measured slower; `ZPages::Always` builds
+    /// it there as anywhere. `Db::create` makes a store under the cipher in an empty
     /// directory; `Db::open` refuses a store that is not under it, and a
     /// store under a cipher is refused where none is given.
     Cipher(vault::StoreCipher),
@@ -3756,6 +3759,27 @@ pub struct Options {
     /// attached partitions alone, and `supdb-zinstallwaits` is the arm with
     /// both off.
     pub zpages_cover_resident: bool,
+    /// Whether the controller chooses the compact form for a store under
+    /// a cipher (`Encryption::Cipher`): with it off, `ZPages::Auto` reads
+    /// there as `Off`, and `Always` builds the form as it does anywhere.
+    ///
+    /// Off as shipped, on a measurement. A form page is four kibibytes and
+    /// an envelope's chunk holds sixteen bytes less, its tag beside it, so
+    /// a page of a form file lies across two chunks and a cold read
+    /// through the form takes two pages of ciphertext from the device,
+    /// where the raw read it replaces takes one once the hash slots are
+    /// resident, as they are. At five million keys under 640 MiB the
+    /// controller bought the form, every read went through it, and the
+    /// read pass ran at 0.73x of the same store with the form off, 0.60
+    /// major faults a read against 0.43 with every build long finished
+    /// (`bench/scripts/pair.sh supdb-cipherauto supdb-cipher 5000000
+    /// --bound 671088640 --passes read --reps 2 --ops-div 10`, and one
+    /// sitting at `--ops-div 1`). Everything under it works and is held
+    /// by tests -- the sampler, the builds ahead, the buy, the install,
+    /// the crossing -- and it wants an envelope whose chunks are whole
+    /// pages before the form pays (`ROADMAP.md`). `supdb-cipherauto` and
+    /// `supdb-ingestcipherauto` are the arms with it on.
+    pub zpages_under_cipher: bool,
     /// The controller suspects at the moment the store crosses
     /// the selector's line to suspect, where it suspected on two hot model
     /// readings a second apart: the look the builds at landing take at every
@@ -4028,6 +4052,7 @@ impl Default for Options {
             zpages_ahead_builders: 2,
             zpages_sample_between: false,
             zpages_cover_resident: true,
+            zpages_under_cipher: false,
             zpages_suspect_at_crossing: true,
         }
     }
@@ -11493,6 +11518,19 @@ fn ref_pack(off: u64, len: u32) -> u64 {
 /// the log as well (a store under a cipher).
 const RUN_REFS: u8 = 1;
 const RUN_LOGGED: u8 = 2;
+
+/// The compact form's controller under a cipher: left to the raw form
+/// unless the store asks for it (`Options::zpages_under_cipher`), since a
+/// form page lies across two chunks of an envelope and the form it buys
+/// there has measured slower than the raw form it replaces. The one
+/// thing a store under a cipher does not do as a store in the clear does,
+/// and a choice of form, which is what a controller is for; the form
+/// itself builds, seals and reads there under `ZPages::Always`.
+fn cipher_controller(opts: &mut Options) {
+    if opts.zpages == ZPages::Auto && !opts.zpages_under_cipher {
+        opts.zpages = ZPages::Off;
+    }
+}
 
 /// Combinations of options the engine cannot run soundly, refused before
 /// anything on disk is touched. An unpinned writer holds no state it
@@ -27263,7 +27301,10 @@ impl Db {
                 dirkey::protect(dir, &key)?;
                 None
             }
-            Encryption::Cipher(cipher) => Some(vault::Vault::create(dir, &cipher)?),
+            Encryption::Cipher(cipher) => {
+                cipher_controller(&mut opts);
+                Some(vault::Vault::create(dir, &cipher)?)
+            }
         };
         let decoy = held.as_ref().map(vault::Held::dir);
         let dir = decoy.as_deref().unwrap_or(dir);
@@ -27560,6 +27601,7 @@ impl Db {
             }
             Encryption::Cipher(cipher) => {
                 dirkey::refuse_locked(dir)?;
+                cipher_controller(&mut opts);
                 Some(vault::Vault::open(dir, &cipher)?)
             }
         };
