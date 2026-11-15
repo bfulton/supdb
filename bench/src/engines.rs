@@ -10648,7 +10648,7 @@ impl Engine for Supdb {
         if self.settleroomstill {
             return "supdb-settleroomstill";
         }
-        if self.zgroup == Some(1024) {
+        if self.zgroup == Some(1024) && !(self.zpages && !self.block_cache) {
             return "supdb-zgroup1k";
         }
         if self.settlespan {
@@ -17586,10 +17586,10 @@ mod tests {
             );
             assert_eq!(
                 a.zpages_group_bytes,
-                if arm_dir == "onegroup" {
-                    0
-                } else {
-                    b.zpages_group_bytes
+                match arm_dir {
+                    "onegroup" => 0,
+                    "group1k" => 1024,
+                    _ => b.zpages_group_bytes,
                 },
                 "{name}: the one option"
             );
