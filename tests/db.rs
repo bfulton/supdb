@@ -1513,6 +1513,139 @@ fn a_fill_with_a_newer_commit_posted_is_left_for_the_pass_caught_up() {
     assert_eq!(deferred_off, 0, "without the option no fill is left");
 }
 
+/// A fill the upkeep thread leaves for a later pass
+/// (`Options::upkeep_fill_skips_posted`) is that pass's to make whatever
+/// it has to file. A commit's writes are lent and the thread's pass holds
+/// inside it; a commit with nothing staged, which adds nothing to the
+/// log, is posted behind the held pass; released, the pass settles the
+/// writes and leaves its fill, and the pass for the empty commit has no
+/// backlog to be due by. It fills the store all the same, every block
+/// walked, since the fill is owed (`Db::fill_owed_due`). Before the fill
+/// was kept as owed, the later pass was due by its own backlog or by a
+/// burst's batch near reads and by nothing else, so a fill left before a
+/// commit that filed nothing was made by no pass and the store's forms
+/// waited for a scan to build them. Both shapes that reach it: a
+/// mix's small commit near reads, in the store as it ships, and a burst
+/// far from reads under the arm that files there
+/// (`Options::forms_settle_far`) -- where a test that ends its writes
+/// with a commit of nothing read no form built at all, in seven runs of a
+/// hundred and fifty beside the whole binary's load and once on a hosted
+/// runner.
+#[test]
+fn a_fill_left_for_a_later_pass_is_made_by_a_pass_with_nothing_to_file() {
+    const KEYS: u32 = 40_000;
+    let run = |name: &str, far: bool, batch: u32| {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                upkeep: supdb::Upkeep::Background(1),
+                // Unpaced, so that a commit posts and returns where a
+                // paced one would wait for the held thread.
+                upkeep_pace_syncs_bp: 0,
+                forms_settle_far: far,
+                scan_cache_ahead: false,
+                partition_bytes: Some(256 << 10),
+                seal_max_pct: 0,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        for k in 0..KEYS {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert!(db.levels().0 > 0, "{name}: partitions for the forms");
+        if !far {
+            // Reads around: a scan over the store before the writes.
+            let mut n = 0usize;
+            db.scan(&key(0), 8, kv(&mut |_, _| n += 1)).unwrap();
+            assert_eq!(n, 8);
+        }
+        let built0 = db.blocks_built().1;
+        let walked0 = db.pass_steps().1;
+        let _held = Watchdog::arm("the held pass or a commit behind it never returned");
+        db.hold_upkeep_pinned(true);
+        let mut want: HashMap<u32, &str> = HashMap::new();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..batch {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % KEYS as u64) as u32;
+            db.put(&key(k), b"b");
+            want.insert(k, "b");
+        }
+        db.commit().unwrap();
+        // The thread takes the commit at its next poll and holds inside
+        // the pass; no commit is made while it is awaited, since one with
+        // writes behind the pass would be due by them.
+        let t = std::time::Instant::now();
+        while !db.upkeep_holding() {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(20),
+                "{name}: the pass began"
+            );
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        // Nothing staged: a commit that adds nothing to the log, posted
+        // behind the pass in flight.
+        db.commit().unwrap();
+        db.hold_upkeep_pinned(false);
+        // The thread brought to the last commit named, no reader asking.
+        db.settle().unwrap();
+        let did = format!(
+            "steps {:?}, upkeep {:?}, refusals {:?}",
+            db.pass_steps(),
+            db.upkeep_counts(),
+            db.settle_refusals()
+        );
+        assert!(
+            db.fill_deferred() >= 1,
+            "{name}: the held pass left its fill with the empty commit behind it: {did}"
+        );
+        assert!(
+            db.fill_owed_due() >= 1,
+            "{name}: the empty commit's pass was due by the fill owed alone: {did}"
+        );
+        assert!(
+            db.pass_steps().1 - walked0 >= u64::from(KEYS / 64),
+            "{name}: the fill the held pass left was made by no pass: {did}"
+        );
+        assert!(
+            db.blocks_built().1 > built0,
+            "{name}: no form was built over the writes: {did}"
+        );
+        let check = |db: &Reader, when: &str| {
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                KEYS as usize,
+                kv(&mut |k, v| {
+                    let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                    let expect = want.get(&kn).copied().unwrap_or("0");
+                    assert_eq!(
+                        std::str::from_utf8(v).unwrap(),
+                        expect,
+                        "{name}: key {kn} {when}"
+                    );
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, KEYS, "{name}: every key {when}");
+        };
+        check(&db, "after the writes");
+        let h = db.reader().unwrap();
+        check(&h, "through a handle after the writes");
+    };
+    run("fill-owed-near", false, 100);
+    run("fill-owed-far", true, 10_000);
+}
+
 /// The probe merge stays behind `cursor_merge` as the comparison arm -- and
 /// a path only one arm exercises is a path nothing tests.
 #[test]
@@ -19383,6 +19516,17 @@ fn a_syncing_commit_a_scan_follows_holds_for_its_filing() {
                 db.put(&key(k), format!("b{round}").as_bytes());
                 want.insert(k, format!("b{round}"));
             }
+            // With the model off the commit does not wait for the thread,
+            // and the thread is held before its pass here so that "still
+            // filing" is a state the test holds and not a turn it bets on:
+            // unheld, a host whose fsync outlasts the thread's pass found
+            // every batch filed at the commit's return, and the whole
+            // binary failed two runs in five there. A commit that did
+            // wait would never return, which the watchdog says.
+            let held = (!model).then(|| {
+                db.hold_upkeep_pass(true);
+                Watchdog::arm("a commit with the model off waited for the held thread")
+            });
             db.commit().unwrap();
             // The first burst has no run on record; from the second on, a
             // burst of one commit has one.
@@ -19393,6 +19537,10 @@ fn a_syncing_commit_a_scan_follows_holds_for_its_filing() {
                     behind_any += 1;
                 }
             }
+            if held.is_some() {
+                db.hold_upkeep_pass(false);
+            }
+            drop(held);
             check(&db, &want, &format!("after burst {round}"));
         }
         db.settle().unwrap();
@@ -19408,9 +19556,9 @@ fn a_syncing_commit_a_scan_follows_holds_for_its_filing() {
         (5, 0),
         "held, small batches"
     );
-    let (_, off_behind) = run("pace-model-off", false, 1000);
-    assert!(
-        off_behind > 0,
+    assert_eq!(
+        run("pace-model-off", false, 1000),
+        (0, 5),
         "with the model off a commit returns with its batch unfiled"
     );
 }

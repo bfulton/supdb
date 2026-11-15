@@ -1978,7 +1978,14 @@ state started at the commit after the hand-over, installed only where
 its post beat the thread's pass, which it lost one run in sixty. The
 engine's counters printed at the assertion (`forms_events`) told the
 three shapes apart, and `settle` now starts and joins the builder for
-the state that stands under that arm. The rule: a test that
+the state that stands under that arm. And as an fsync: the test that a
+syncing commit with the pace's model off
+(`Options::upkeep_pace_syncs_model`) returns with its batch unfiled bet
+that the upkeep thread's pass would outlast the commit's fdatasync,
+and on a host whose fsync outlasted the pass every batch was filed at
+the return, two runs of the whole binary in five; it holds the thread
+before its pass now (`hold_upkeep_pass`), and a commit that waited would
+never return, which its watchdog says. The rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; and a test that passes is read for
 the path that passed it, since a fallback that does the same work
@@ -5123,6 +5130,48 @@ each of its own crash windows, built from the states before and after
 it; and a defensive step that no test can reach is read for what it
 would do in the state that could reach it, before it is kept as
 harmless.
+
+**A turn left for the next one, which had no reason to come.** The
+upkeep thread's fill is left for a later pass while the writer has a
+newer commit posted (`Options::upkeep_fill_skips_posted`), on the reading
+that the pass for that commit would make it. A pass files and fills only
+where it is due, and it is due by what its own commit brought -- a backlog
+past the bound, a burst's batch, a scan since -- so the commit posted
+behind a pass could bring one that did nothing: a commit with nothing
+staged, or a mix's hundred writes under the bound. The fill was left by
+the first pass and taken up by no other until some later pass was due of
+itself. `a_load_nobody_reads_files_no_forms` ends its writes with a commit
+of nothing; where that commit was posted while the pass for the last batch
+was in flight, the settle after it returned with no form built, and the
+arm that files far from reads read as filing nothing: once on a hosted
+runner, in none of three hundred runs of the test alone under load and
+none of twenty on one CPU. Three reconstructions through the seams
+reproduced nothing, each a guess at the schedule: the fills' room closed,
+the thread held before each pass, a held pass under the wrong commit's
+name. What reproduced it was the test's own store in a loop beside the
+whole test binary's load, seven trials of a hundred and fifty, and what
+read it was the counters the assertion had been given before the hunt:
+four to seven fills left, no fresh build, the last pass refused as
+nothing due. A fill left is owed now (`FormsState::fill_owed`) and the
+thread's next pass is due by the debt, none of four hundred trials under
+the same load; the test holds the pass and posts the empty commit behind
+it (`hold_upkeep_pinned`), near reads in the store as it ships and far
+from them under the arm, and fails without either half of the fix. Across
+the suite's mixes and lag sweep at ten, a hundred and three hundred
+thousand keys under both policies, a fill was left in 2,519 passes of
+9,038 and no pass was due by the debt alone (`Db::fill_owed_due`, `owed`
+on the counters line; `docs/engine.md` has the command): every commit
+behind a deferral there brings a pass due of itself, so no cell can have
+moved and none was priced. The rule: work a step leaves to the next step
+is recorded as owed where it is left and makes the next step due, since
+whether a next step runs is decided by its own inputs and never by what
+was left for it; a flake no run of the test alone reproduces is run
+beside the load it failed under before its schedule is guessed at, and
+its assertion is given the counters first, since a failure that comes
+once is read from whatever it printed; and a change to when work is done
+is held to a count of how often it fires in the suite's own passes before
+it is priced, since a mechanism that fires in none of them leaves a
+pairing nothing to read.
 
 ## Standing limitations
 

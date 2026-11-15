@@ -4102,7 +4102,12 @@ pub struct Options {
     /// 0.85-0.99x and E either way; at ten million keys the lag sweep's
     /// forms are off and the fill never runs, and the mixes read level or
     /// better (`docs/engine.md`). The pass caught up, with nothing posted,
-    /// fills as before. Off, the shape before: `supdb-fillposted`.
+    /// fills as before, and a fill left is owed to the next pass
+    /// (`FormsState::fill_owed`), which is due by it whatever its commit
+    /// added to the log: the commit posted behind a pass may add nothing,
+    /// or too little to be due by, and its pass then filed nothing and
+    /// the fill stayed unmade until some later pass was due of itself.
+    /// Off, the shape before: `supdb-fillposted`.
     #[doc(hidden)]
     pub upkeep_fill_skips_posted: bool,
     /// Whether the engine's large blocks -- a memtable's arena blocks,
@@ -18205,6 +18210,9 @@ struct Shared {
     /// Fills the upkeep thread left for a later pass because the writer
     /// had posted a newer commit (`Options::upkeep_fill_skips_posted`).
     fill_deferred: AtomicU64,
+    /// Passes due by a fill owed and by nothing else
+    /// (`FormsState::fill_owed`): the passes that had filed nothing.
+    fill_owed_due: AtomicU64,
     /// Partitions the builder ahead left to the scans for the page cache
     /// holding too few of their pages (`Options::ahead_resident_pct`).
     ahead_cold: AtomicU64,
@@ -19913,6 +19921,17 @@ struct FormsState {
     /// (`Options::upkeep_files_bursts`); zero off the thread.
     pass_batch: std::cell::Cell<u64>,
     log_short: std::cell::Cell<bool>,
+    /// A fill the upkeep thread left for a later pass because the writer
+    /// had posted a newer commit (`Options::upkeep_fill_skips_posted`),
+    /// and no fill has run since: the pass that finds nothing posted
+    /// behind it is due for the fill whatever it has to file
+    /// (`settle_due`). Without it the later pass was due only by its own
+    /// backlog, and a commit that added nothing to the log -- an empty
+    /// one, posted while the pass for the last writes was in flight --
+    /// brought a pass with nothing to file: the fill was left by the one
+    /// and not taken up by the other, and the store's forms waited for a
+    /// scan to build them.
+    fill_owed: std::cell::Cell<bool>,
     /// What the lazy snapshot did, for a measurement and for the test
     /// that must know the path was taken: scans that finished without a
     /// snapshot, and scans that stopped to build one and went on.
@@ -20063,6 +20082,7 @@ impl FormsState {
             pass_lent: std::cell::Cell::new(0),
             pass_batch: std::cell::Cell::new(0),
             log_short: std::cell::Cell::new(false),
+            fill_owed: std::cell::Cell::new(false),
             lazy_scans: Counts::new(),
             settle_density: Counts::new(),
             settle_refused: Counts::new(),
@@ -25887,6 +25907,7 @@ impl Reader {
         self.fs().tables_complete.set(false);
         self.fs().cache_used.set(false);
         self.fs().cache_bytes.set(0);
+        self.fs().fill_owed.set(false);
         self.fs().built.borrow_mut().clear();
         self.fs().pending.borrow_mut().clear();
         self.fs().pending_frozen.borrow_mut().clear();
@@ -27552,13 +27573,24 @@ impl Reader {
                 && self.fs().over.borrow().as_ref().is_some_and(|o| {
                     !std::ptr::eq(o.mem.as_ptr(), std::sync::Arc::as_ptr(&st.mem))
                 });
-        let due = self.force_due.get()
+        // A fill a pass left for a later one is that later pass's to make,
+        // on the thread it was left on (`FormsState::fill_owed`): the pass
+        // for a commit that added nothing to the log has no backlog to be
+        // due by.
+        let owed = self.understudy && self.fs().fill_owed.get();
+        let other = self.force_due.get()
             || scans != self.fs().scans_seen.get()
             || (backlog >= bound && recent)
             || burst
             || posted
             || publish_due
             || (froze && !far);
+        if owed && !other && consume {
+            self.shared
+                .fill_owed_due
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        let due = other || owed;
         if !due {
             let no_room = self.opts.forms_settle_every && !every && backlog > 0;
             self.settle_refuse(consume, if no_room { 2 } else { 3 });
@@ -27979,8 +28011,12 @@ impl Reader {
             self.shared
                 .fill_deferred
                 .fetch_add(1, AtomicOrdering::Relaxed);
+            self.fs().fill_owed.set(true);
             return Ok(false);
         }
+        // This fill is the one a pass before may have left
+        // (`FormsState::fill_owed`); left again below, it is owed again.
+        self.fs().fill_owed.set(false);
         let np = self.segs().partition_point(|s| s.level > 0);
         let l0 = &self.segs()[np..];
         let ctx = self.build_ctx();
@@ -27993,6 +28029,7 @@ impl Reader {
                 self.shared
                     .fill_deferred
                     .fetch_add(1, AtomicOrdering::Relaxed);
+                self.fs().fill_owed.set(true);
                 return Ok(false);
             }
             if self.upkeep_wanted() {
@@ -32487,6 +32524,7 @@ impl Db {
             fill_passes: AtomicU64::new(0),
             fill_cuts: AtomicU64::new(0),
             fill_deferred: AtomicU64::new(0),
+            fill_owed_due: AtomicU64::new(0),
             ahead_cold: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(0),
             z: zfile::ZEvents::default(),
@@ -33276,6 +33314,7 @@ impl Db {
             fill_passes: AtomicU64::new(0),
             fill_cuts: AtomicU64::new(0),
             fill_deferred: AtomicU64::new(0),
+            fill_owed_due: AtomicU64::new(0),
             ahead_cold: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(ord_rebuilt),
             z: zev,
@@ -40169,6 +40208,14 @@ impl Db {
     #[doc(hidden)]
     pub fn fill_deferred(&self) -> u64 {
         self.shared.fill_deferred.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Passes of the upkeep thread that were due by a fill a pass before
+    /// had left and by nothing else (`Options::upkeep_fill_skips_posted`):
+    /// the passes that filed nothing while the fill stayed unmade.
+    #[doc(hidden)]
+    pub fn fill_owed_due(&self) -> u64 {
+        self.shared.fill_owed_due.load(AtomicOrdering::Relaxed)
     }
 
     /// The maintenance pass's steps, microseconds over the store's life

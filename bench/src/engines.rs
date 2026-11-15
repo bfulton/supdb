@@ -10894,6 +10894,7 @@ impl Engine for Supdb {
             ("fill_passes", db.pass_steps().2 as f64),
             ("fill_cuts", db.pass_steps().3 as f64),
             ("fill_deferred", db.fill_deferred() as f64),
+            ("fill_owed_due", db.fill_owed_due() as f64),
             ("ahead_skip_cold", db.ahead_cold() as f64),
             ("forms_cloned", db.forms_cloned() as f64),
             ("forms_trims", db.forms_trims() as f64),
