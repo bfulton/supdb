@@ -3854,6 +3854,26 @@ fn seal_trailer(b: &mut [u8; ZTRAILER], magic: &[u8; 8], version: u32) {
 /// page size, the CRC. The cheap identifying checks come first, so a page
 /// that is no trailer of this kind -- another kind's among them -- is said
 /// to be that, and the CRC says the rest was torn.
+/// The magic of the trailer page `bytes`, which says which body the file
+/// holds ([`ZMAGIC`], [`STRIDE_MAGIC`]): read by an attach before any
+/// other byte of the page, at the one place every kind's head puts it.
+/// `None` for a page shorter than a trailer.
+pub fn trailer_magic(bytes: &[u8]) -> Option<[u8; 8]> {
+    if bytes.len() != ZTRAILER {
+        return None;
+    }
+    bytes[T_MAGIC..T_MAGIC + 8].try_into().ok()
+}
+
+/// The CRC word the trailer page `bytes` ends in, every kind's at one place
+/// ([`seal_trailer`]): over every byte of the page before it, the trailer's
+/// own fields and the row's CRC among them for a stride trailer, so two
+/// trailers whose words agree are, to a CRC's strength, one trailer. `None`
+/// for a page shorter than a trailer.
+pub fn trailer_crc(bytes: &[u8]) -> Option<u32> {
+    (bytes.len() == ZTRAILER).then(|| get32(bytes, T_CRC))
+}
+
 fn open_trailer(bytes: &[u8], magic: &[u8; 8], version: u32) -> Result<(), ZError> {
     if bytes.len() != ZTRAILER {
         return Err(ZError::Length);

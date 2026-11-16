@@ -504,6 +504,33 @@ pub enum ZPages {
     Auto,
 }
 
+/// EXPERIMENT: whether a partition's form file may be the stride form
+/// (`zpages::StrideTrailer`): a partition whose keys are an exact run of
+/// numbers at one width and whose every record is one inline fixed value,
+/// held as its values alone, value `r` at `r * W`, so that a point read is
+/// a key's parse and one or two pages with nothing searched.
+///
+/// No `Auto` yet: a value that chooses nothing would be a promise the
+/// engine does not keep, and the choice is to be made from the forced
+/// arm's counts.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ZStride {
+    /// Nothing is built in the stride form, and a stride file found under a
+    /// partition's name is refused at its attach as another engine's
+    /// (`zfile::Reject::Identity`) and built again in the block coding:
+    /// what an engine from before the form does with it, which refuses it
+    /// at the trailer's magic. The engine as it was, byte for byte.
+    #[default]
+    Off,
+    /// Every build of a partition's form file asks for the stride form and
+    /// builds the block body in the same call where the partition does not
+    /// qualify (`zfile::StrideAsk::OrBlock`), the reason kept on the
+    /// segment (`Seg::z_stride_no`); a stride file on disk is attached. The
+    /// arm that prices the form, built whether or not the store needs it.
+    Forced,
+}
+
 /// What the second form has done (`Options::zpages`), read by
 /// `Reader::zpage_counts`.
 ///
@@ -551,6 +578,16 @@ pub struct ZCounts {
     /// Point reads and counts of a partition answered from its form file.
     pub reads: u64,
     pub counts: u64,
+    /// The stride form's (`Options::zpages_stride`): of `reads`, the point
+    /// reads a stride file answered; the value pages the reads checked
+    /// against a stride file's row at their first touch in this process,
+    /// none for a file the attach trusted as this process's build
+    /// (`Options::zpages_stride_trust_built`); and the block cache's and the
+    /// merge path's asks for a cursor over a stride file, which take the raw
+    /// form's walk instead.
+    pub stride_reads: u64,
+    pub stride_page_checks: u64,
+    pub stride_cursor_refused: u64,
     /// Pages decoded to answer them: one for each read or count of a key
     /// that falls in a page's range, the key the page holds and the key it
     /// does not alike, unless the thread's memo holds the group from a
@@ -873,6 +910,15 @@ pub struct ZCounts {
     pub model_record_bytes: u64,
     /// Form files the controller retired.
     pub retired: u64,
+    /// Stride files built, and the builds that asked for the stride form
+    /// and found the partition does not qualify, by reason, in the order of
+    /// `zfile::StrideNo`: a key not of the run's shape, holes, a record not
+    /// one value, a width not the run's, a tombstone flag, a run in a block,
+    /// a partition under the floor, a file that did not read back.
+    pub stride_builds: u64,
+    pub stride_declines: [u64; zfile::STRIDE_REASONS],
+    /// The live partitions whose served form file is a stride file.
+    pub stride_files: u64,
     /// Partitions live, the ones with a form file installed, the ones of
     /// those out of service, and their pages, the pages a first decode has
     /// passed, the pages a check failed, the fences kept in memory, the
@@ -5849,6 +5895,30 @@ pub struct Options {
     /// microseconds apart, so a quarter of a second is a stretch with no
     /// reader all the same. `supdb-zrewarmwait` keeps the second.
     pub zpages_rewarm_quiet_ms: u32,
+    /// EXPERIMENT: whether a partition's form file may be the stride form
+    /// (`ZStride`). `Off`, the default, is the engine as it was: nothing is
+    /// built in it, and a stride file found under a partition's name is
+    /// refused at its attach and built again in the block coding. `Forced`
+    /// asks every build of a form file for it (`Options::z_stride_ask`) and
+    /// attaches one found on disk. Refused beside the re-code policies
+    /// (`zpages_recode` and the two that act under it, `zpages_recode_auto`,
+    /// `zpages_reparse`; `check_options` says why). The block cache's reads
+    /// and the merge path's walks of a stride partition go to the raw form
+    /// until the form file's cursor walks one (`Reader::zc`).
+    #[doc(hidden)]
+    pub zpages_stride: ZStride,
+    /// EXPERIMENT: under `zpages_stride` `Forced`, a stride file whose build
+    /// in this process read every rank back through the reader's body before
+    /// its name (`zfile::check_stride`) is installed with every value page
+    /// marked verified, once its attach has found under the name the trailer
+    /// that build wrote -- the row's CRC in it, so the row too -- and so the
+    /// build's file. A file found on disk at an open, or by a build's look
+    /// before it builds, checks each value page against its row at the
+    /// page's first touch, as the block form checks its pages; the reads
+    /// count those checks (`ZCounts::stride_page_checks`). Off, the file a
+    /// build made is checked so too. On.
+    #[doc(hidden)]
+    pub zpages_stride_trust_built: bool,
 }
 
 impl Options {
@@ -5866,6 +5936,45 @@ impl Options {
             zpages::ZCODING_RECORD
         } else {
             zpages::ZCODING_BLOCK
+        }
+    }
+
+    /// What a build of a partition's form file asks of the stride form
+    /// (`zpages_stride`): the one definition every plan built for a
+    /// partition's form takes its `stride` from (`zfile::BuildPlan::stride`)
+    /// -- `z_give`'s, `z_start`'s builds and rebuilds and its builds ahead,
+    /// the builds at a merge's output finish -- so that no site restates
+    /// the option. A re-code's, a spare's and a re-parse's plans build the
+    /// other block coding of a served block file and ask nothing.
+    fn z_stride_ask(&self) -> zfile::StrideAsk {
+        match self.zpages_stride {
+            ZStride::Off => zfile::StrideAsk::No,
+            ZStride::Forced => zfile::StrideAsk::OrBlock,
+        }
+    }
+
+    /// What an attach takes of a stride file found under a partition's
+    /// name (`zfile::StrideAttach`): nothing under `ZStride::Off`, which
+    /// refuses it as an engine from before the form does; checked page by
+    /// page at first touch otherwise.
+    fn z_stride_attach(&self) -> zfile::StrideAttach {
+        match self.zpages_stride {
+            ZStride::Off => zfile::StrideAttach::Refuse,
+            ZStride::Forced => zfile::StrideAttach::Check,
+        }
+    }
+
+    /// `z_stride_attach` for the file the build `b` just made and named:
+    /// trusted where `zpages_stride_trust_built` says so and the build wrote
+    /// a stride file, whose read-back held every rank to its records, and
+    /// so its pages need no check at their first touch once the attach has
+    /// found the trailer the build wrote under the name.
+    fn z_stride_attach_built(&self, b: &zfile::Built) -> zfile::StrideAttach {
+        match (self.z_stride_attach(), b.stride_seal) {
+            (zfile::StrideAttach::Check, Some(seal)) if self.zpages_stride_trust_built => {
+                zfile::StrideAttach::Trust(seal)
+            }
+            (a, _) => a,
         }
     }
 }
@@ -6223,6 +6332,8 @@ impl Default for Options {
             zpages_rewarm_trims: false,
             zpages_rewarm_beside_merges: false,
             zpages_rewarm_quiet_ms: 250,
+            zpages_stride: ZStride::Off,
+            zpages_stride_trust_built: true,
         }
     }
 }
@@ -7622,7 +7733,7 @@ impl ZFinish {
                     // Only a conversion asks for the stride form alone, and
                     // an output at its finish is no conversion: nothing was
                     // written, and nothing serves the output yet.
-                    Ok(zfile::Outcome::NotStride(_)) => {}
+                    Ok(zfile::Outcome::NotStride(why)) => ev.stride_declined(why),
                     Err(_) => zfile::ZEvents::add(&ev.finish_failed, 1),
                 }
                 z_finish_release(&shared, &label);
@@ -12939,6 +13050,15 @@ struct Slot {
     zreads: AtomicU64,
     zcounts: AtomicU64,
     zdecodes: AtomicU64,
+    /// Of `zreads`, the point reads a stride file answered
+    /// (`Options::zpages_stride`); the value pages this handle's reads
+    /// checked against a stride file's row at their first touch
+    /// (`zfile::PointCounts::stride_checks`); and the block cache's and the
+    /// merge path's asks for a cursor over a stride file, which make none and
+    /// take the raw form's walk (`Reader::zc`, `Reader::pwalk_at`).
+    zstridereads: AtomicU64,
+    zstridechecks: AtomicU64,
+    zstriderefused: AtomicU64,
     /// Groups a scan read in place without a decode (`Group::Coded`).
     zinplace: AtomicU64,
     zraw: AtomicU64,
@@ -13055,6 +13175,9 @@ impl Slot {
             zreads: AtomicU64::new(0),
             zcounts: AtomicU64::new(0),
             zdecodes: AtomicU64::new(0),
+            zstridereads: AtomicU64::new(0),
+            zstridechecks: AtomicU64::new(0),
+            zstriderefused: AtomicU64::new(0),
             zinplace: AtomicU64::new(0),
             zraw: AtomicU64::new(0),
             zfallbacks: AtomicU64::new(0),
@@ -14693,6 +14816,31 @@ fn check_options(opts: &Options) -> Result<()> {
         return Err(err(
             "zpages Always needs writer_pins: a form file is freed with its segment \
              under the epoch, and an unpinned writer reads it unpinned",
+        ));
+    }
+    // The re-code policies tell a served form file's coding by
+    // `ZFile::coded`, one of the block body's two, and a stride file reads
+    // there as the block coding: the re-code's and the re-parse's looks take
+    // it for a block-coded candidate, the spare builder (`zpages_both`) for
+    // a served file with no spare -- the first by key order among equal
+    // heats, and a stride file's heat is its decodes, none -- and each
+    // builds the other block coding of the file under the name, renamed
+    // over it. Held back from a stride file, the same look picks it again
+    // at every turn and the spares of the partitions after it are never
+    // built. What each moves is the block body, so the stride form waits
+    // until their records tell the bodies apart.
+    if opts.zpages_stride != ZStride::Off
+        && (opts.zpages_recode
+            || opts.zpages_recode_keep
+            || opts.zpages_both
+            || opts.zpages_recode_auto
+            || opts.zpages_reparse)
+    {
+        return Err(err(
+            "zpages_stride Forced is refused beside the re-code policies \
+             (zpages_recode, zpages_recode_keep, zpages_both, zpages_recode_auto, \
+             zpages_reparse): each reads a stride file as the block coding and \
+             builds a block coding over its name",
         ));
     }
     Ok(())
@@ -23483,6 +23631,9 @@ impl Reader {
         let mut c = ZCounts {
             reads: rd.stat(|s| &s.zreads),
             counts: rd.stat(|s| &s.zcounts),
+            stride_reads: rd.stat(|s| &s.zstridereads),
+            stride_page_checks: rd.stat(|s| &s.zstridechecks),
+            stride_cursor_refused: rd.stat(|s| &s.zstriderefused),
             decodes: rd.stat(|s| &s.zdecodes),
             inplace_groups: rd.stat(|s| &s.zinplace),
             rawserves: rd.stat(|s| &s.zraw),
@@ -23649,12 +23800,15 @@ impl Reader {
             model_hash_bytes: get(&ev.model_hash),
             model_record_bytes: get(&ev.model_records),
             retired: get(&ev.retired),
+            stride_builds: get(&ev.stride_builds),
+            stride_declines: std::array::from_fn(|i| get(&ev.stride_declines[i])),
             ..ZCounts::default()
         };
         for seg in self.segs().iter().filter(|s| s.level > 0) {
             c.partitions += 1;
             if let Some(z) = seg.z.get() {
                 c.form_files += 1;
+                c.stride_files += u64::from(z.kind() == zfile::FileCoding::Stride);
                 c.own_decoder_files += u64::from(z.own_decoder);
                 c.damaged += u64::from(z.damaged());
                 c.pages += z.pages() as u64;
@@ -23781,6 +23935,9 @@ impl Reader {
             self.zbump_by(|s| &s.zkeyhits, p.key_hits);
             self.zbump_by(|s| &s.zowned, p.owned);
         }
+        if p.stride_checks != 0 {
+            self.zbump_by(|s| &s.zstridechecks, p.stride_checks);
+        }
     }
 
     /// `key`'s values in a partition read from its form file
@@ -23893,6 +24050,9 @@ impl Reader {
                 self.zbump(|s| &s.zreads);
                 if decoded {
                     self.zbump(|s| &s.zdecodes);
+                }
+                if z.is_stride() {
+                    self.zbump(|s| &s.zstridereads);
                 }
                 Ok(n)
             }
@@ -24106,12 +24266,37 @@ impl Reader {
     /// (`Options::zpages_block_cache`); none, and the read is the raw form's
     /// through the door. One relaxed load of the gate's word and a look at
     /// the cell, asked at each read as every dispatch asks.
+    ///
+    /// A stride file is none: the block cache's reads of a partition go
+    /// through the form file's cursor once one is held (`PartReader`), and
+    /// the cursor has no position in a stride file, so every read the cache
+    /// makes of a stride partition is the raw form's -- answers as the raw
+    /// form gives them, its pages touched -- and is counted on this
+    /// handle's line (`zstriderefused`), until the cursor walks one.
     #[inline]
     fn zc<'a>(&self, seg: &'a Seg) -> Option<&'a zfile::ZFile> {
         if !self.opts.zpages_block_cache || !self.z_on() {
             return None;
         }
-        seg.z.get().filter(|z| !z.damaged())
+        let z = seg.z.get().filter(|z| !z.damaged())?;
+        if z.is_stride() {
+            self.zbump(|s| &s.zstriderefused);
+            return None;
+        }
+        Some(z)
+    }
+
+    /// The form file `scan_merged` and the covered walk of `scan_partitions`
+    /// walk `seg` through a cursor over: the cell's, while the gate serves
+    /// the form, but no stride file, which a cursor has no position in --
+    /// those walks take the raw form, counted as `zc` counts the cache's.
+    fn zcursor_file<'a>(&self, seg: &'a Seg) -> Option<&'a zfile::ZFile> {
+        let z = seg.z.get().filter(|_| self.z_on())?;
+        if z.is_stride() {
+            self.zbump(|s| &s.zstriderefused);
+            return None;
+        }
+        Some(z)
     }
 
     /// `Blob::scan_at` for the block cache: the `n` records from `rank`
@@ -24501,7 +24686,7 @@ impl Reader {
     /// `scan_merged`'s walk of `seg` from `rank`: through the form file
     /// where the cell holds one in service, the raw form's otherwise.
     fn pwalk_at<'a>(&'a self, seg: &'a Seg, rank: usize) -> PWalk<'a> {
-        match seg.z.get().filter(|_| self.z_on()) {
+        match self.zcursor_file(seg) {
             Some(z) if !z.damaged() => PWalk::Z(zfile::ZCursor::at(
                 &self.zmemo,
                 z,
@@ -24521,7 +24706,7 @@ impl Reader {
     /// it, or the ordered index's where the form file cannot say, with a
     /// fallback counted where a check failed.
     fn pwalk_seek<'a>(&'a self, seg: &'a Seg, key: &[u8]) -> PWalk<'a> {
-        if let Some(z) = seg.z.get().filter(|_| self.z_on()) {
+        if let Some(z) = self.zcursor_file(seg) {
             if self.opts.zpages_seek_ord {
                 let rank = seg.ord.seek(key, |r| seg.raw().key_at(r));
                 return self.pwalk_at(seg, rank);
@@ -31699,7 +31884,7 @@ impl Reader {
             if self.opts.zpages_walk_cursor
                 && !self.opts.zpages_seek_ord
                 && self.z_on()
-                && seg.z.get().is_some()
+                && seg.z.get().is_some_and(|z| !z.is_stride())
             {
                 if let PWalk::Z(c) = self.pwalk_seek(seg, cursor) {
                     seen = self.scan_partition_cursor(
@@ -33438,6 +33623,7 @@ impl Db {
                         opts.zpages_group_ahead,
                         opts.zpages_walk_owns_decodes,
                     ),
+                    &opts.z_stride_attach(),
                     &zev,
                 );
             }
@@ -37725,6 +37911,7 @@ impl Db {
             bool,
             bool,
         ),
+        stride: &zfile::StrideAttach,
         ev: &zfile::ZEvents,
     ) -> bool {
         let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
@@ -37742,6 +37929,7 @@ impl Db {
             memo_first,
             lines.0,
             lines.1,
+            stride,
         ) {
             Ok(mut side) => {
                 side.inplace = lines.2;
@@ -37815,6 +38003,7 @@ impl Db {
                     self.opts.zpages_group_ahead,
                     self.opts.zpages_walk_owns_decodes,
                 ),
+                &self.opts.z_stride_attach(),
                 ev,
             )
         {
@@ -37835,6 +38024,7 @@ impl Db {
                 plan.parse = self.opts.zpages_parse;
                 plan.parse_chains = self.opts.zpages_parse_chains;
                 plan.own_decode = self.opts.zpages_own_decoder;
+                plan.stride = self.opts.z_stride_ask();
                 plan
             })
         };
@@ -37860,6 +38050,7 @@ impl Db {
                     self.opts.zpages_memo_first,
                     Db::fence_search(&self.opts),
                     self.opts.zpages_memo_ahead,
+                    &self.opts.z_stride_attach_built(&b),
                 ) {
                     Ok(mut side) => {
                         side.inplace = self.opts.zpages_inplace_walk;
@@ -37900,7 +38091,7 @@ impl Db {
             // Only a conversion asks for the stride form alone, and this
             // build is no conversion, a block file serving nothing here;
             // the reason is noted above.
-            Ok(zfile::Outcome::NotStride(_)) => {}
+            Ok(zfile::Outcome::NotStride(why)) => ev.stride_declined(why),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 zfile::ZEvents::add(&ev.build_orphaned, 1);
                 seg.z_declined
@@ -49507,6 +49698,7 @@ impl Maint {
         plan.parse = self.opts.zpages_parse && self.opts.zpages_parse_finish;
         plan.parse_chains = self.opts.zpages_parse_chains;
         plan.own_decode = self.opts.zpages_own_decoder;
+        plan.stride = self.opts.z_stride_ask();
         plan.hold = Some(self.shared.zbuild_hold.clone());
         Some(std::sync::Arc::new(ZFinish {
             dir: self.dir.clone(),
@@ -50280,6 +50472,7 @@ impl Maint {
                     self.opts.zpages_group_ahead,
                     self.opts.zpages_walk_owns_decodes,
                 ),
+                &self.opts.z_stride_attach(),
                 ev,
             )
     }
@@ -50390,6 +50583,18 @@ impl Maint {
         if !(reparse || recode) {
             self.z_repick();
         }
+        // A re-code, a spare and a re-parse build the other block coding of
+        // the block file the partition serves, and a stride file has none:
+        // the policies that start them are refused beside the stride form
+        // (`check_options`), which is what this rests on.
+        let stride_served = recode && seg.z.get().is_some_and(|z| z.is_stride());
+        debug_assert!(
+            !stride_served,
+            "a re-code, spare or re-parse of a stride file, which check_options refuses"
+        );
+        if stride_served {
+            return;
+        }
         let served_coded = seg.z.get().map(|z| z.coded());
         let (coding, raw_tails) = match self.z_coding_pick {
             // A re-parse keeps the served block coding.
@@ -50445,6 +50650,15 @@ impl Maint {
             self.opts.zpages_parse_chains
         };
         plan.own_decode = self.opts.zpages_own_decoder;
+        // A partition's own build -- its first, a retry, a rebuild, a build
+        // ahead -- asks what the options ask of the stride form; a re-code,
+        // a spare and a re-parse build the other block coding of the block
+        // file they replace or keep beside, and ask nothing.
+        plan.stride = if recode {
+            zfile::StrideAsk::No
+        } else {
+            self.opts.z_stride_ask()
+        };
         if raw_tails {
             zfile::ZEvents::add(&ev.builds_raw_tails, 1);
         }
@@ -50624,6 +50838,7 @@ impl Maint {
                     self.opts.zpages_memo_first,
                     Db::fence_search(&self.opts),
                     self.opts.zpages_memo_ahead,
+                    &self.opts.z_stride_attach(),
                 ) {
                     Ok(mut side) => {
                         side.inplace = self.opts.zpages_inplace_walk;
@@ -50676,6 +50891,7 @@ impl Maint {
                     self.opts.zpages_memo_first,
                     Db::fence_search(&self.opts),
                     self.opts.zpages_memo_ahead,
+                    &self.opts.z_stride_attach(),
                 ) {
                     Ok(mut side) => {
                         side.inplace = self.opts.zpages_inplace_walk;
@@ -50755,6 +50971,7 @@ impl Maint {
                         self.opts.zpages_memo_first,
                         Db::fence_search(&self.opts),
                         self.opts.zpages_memo_ahead,
+                        &self.opts.z_stride_attach_built(&built),
                     ) {
                         Ok(mut side) => {
                             side.inplace = self.opts.zpages_inplace_walk;
@@ -50809,7 +51026,7 @@ impl Maint {
             // The answer to a conversion's ask alone (`StrideAsk::Only`):
             // the reason is noted above, and the form the partition has
             // serves on.
-            Ok(zfile::Outcome::NotStride(_)) => {}
+            Ok(zfile::Outcome::NotStride(why)) => ev.stride_declined(why),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 zfile::ZEvents::add(&ev.build_orphaned, 1);
                 seg.z_declined

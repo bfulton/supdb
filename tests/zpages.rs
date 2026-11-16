@@ -14252,3 +14252,709 @@ fn a_scans_blocks_over_a_covered_partition_read_through_one_cursor() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+// ---- the stride form ---------------------------------------------------------
+
+use supdb::db::zpages::StrideTrailer;
+use supdb::ZStride;
+
+/// `forced`, with every form file's build asking for the stride form
+/// (`ZStride::Forced`).
+fn stride_forced(extra: impl FnOnce(&mut Options)) -> Options {
+    forced(|o| {
+        o.zpages_stride = ZStride::Forced;
+        extra(o);
+    })
+}
+
+fn numbered_key(i: usize) -> Vec<u8> {
+    format!("k{i:06}").into_bytes()
+}
+
+/// `n` numbered keys from zero in ascending order, one value of `w` random
+/// bytes each, committed in batches and flushed: partitions the stride form
+/// holds, and the model of them.
+fn numbered_load(db: &mut Db, n: usize, w: usize, seed: u64) -> Model {
+    let mut rng = Rng(seed);
+    let mut model = Model::new();
+    for chunk in (0..n).collect::<Vec<_>>().chunks(500) {
+        for &i in chunk {
+            let v: Vec<u8> = (0..w).map(|_| (rng.next() >> 24) as u8).collect();
+            let k = numbered_key(i);
+            db.append(&k, &v);
+            model.insert(k, vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    model
+}
+
+/// A store of one partition of `n` numbered keys of a hundred-byte value
+/// each, under the stride form, given its stride file and closed: its
+/// directory, the model and the model's keys, in rank order.
+fn stride_partition(name: &str, n: usize, seed: u64) -> (PathBuf, Model, Vec<Vec<u8>>) {
+    let dir = scratch(name);
+    let mut db = Db::create(&dir, stride_forced(|_| {})).unwrap();
+    let model = numbered_load(&mut db, n, 100, seed);
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.partitions, c.form_files, c.stride_files, c.stride_builds),
+        (1, 1, 1, 1),
+        "{c:?}"
+    );
+    db.close().unwrap();
+    let keys = model.keys().cloned().collect();
+    (dir, model, keys)
+}
+
+/// The stride file at `path`'s trailer and value pages.
+fn stride_of(path: &Path) -> (StrideTrailer, usize) {
+    let b = std::fs::read(path).unwrap();
+    let t = StrideTrailer::decode(&b[b.len() - ZTRAILER..]).unwrap();
+    let v = t.layout().unwrap().v_pages as usize;
+    (t, v)
+}
+
+/// The value pages of a file of `v` an attach checks: the first, the last
+/// and fourteen evenly spaced; and whether page `p` is clear of them --
+/// neither one nor the page after one, which the slot an attach reads there
+/// may run into, nor the last but one, whose bytes the last page's slot may
+/// begin on.
+fn stride_samples(v: usize) -> (Vec<usize>, impl Fn(usize) -> bool) {
+    let s: Vec<usize> = (0..16).map(|k| k * (v - 1) / 15).collect();
+    let clear = {
+        let s = s.clone();
+        move |p: usize| p + 2 < v && !s.iter().any(|&q| q == p || q + 1 == p)
+    };
+    (s, clear)
+}
+
+/// The keys whose hundred-byte slots touch value page `p`.
+fn keys_on_page(p: usize, keys: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let lo = p * ZPAGE / 100;
+    let hi = ((p + 1) * ZPAGE).div_ceil(100).min(keys.len());
+    keys[lo..hi].to_vec()
+}
+
+/// The oracle of the stride form: a store under `Always` and
+/// `ZStride::Forced`, and a store under `Off`, given the same operations
+/// and checked against the model after every settle, through the writer
+/// and a handle made for the purpose, and scanned. Numbered keys, loaded
+/// whole and in order, so that every partition starts as a run the form
+/// holds; then a third of the range put only (each put a delete and an
+/// append, of one width), a fourth given second values, and the rest
+/// deleted or put -- seals, merges, flushes that promote, and crashes
+/// between, so that partitions of all three are rewritten and declined and
+/// given the stride form again in one store. A fallback, a refused file, a
+/// failed build, a file out of service and a page that failed are each a
+/// failure of the form, over every instance of the store; and the stride
+/// form was built, served reads, and was declined.
+#[test]
+fn the_oracle_holds_with_the_stride_form_forced() {
+    const N: usize = 2400;
+    let opts = |on: bool| Options {
+        zpages: if on { ZPages::Always } else { ZPages::Off },
+        zpages_stride: if on { ZStride::Forced } else { ZStride::Off },
+        scan_block_cache: false,
+        zpages_min_bytes: 0,
+        seal_bytes: 8 << 10,
+        partition_bytes: Some(4 << 10),
+        l0_trigger: 2,
+        ..Options::default()
+    };
+    let (dz, dr) = (scratch("stride-oracle-z"), scratch("stride-oracle-raw"));
+    let mut z = Db::create(&dz, opts(true)).unwrap();
+    let mut raw = Db::create(&dr, opts(false)).unwrap();
+    let mut model: Model = BTreeMap::new();
+    let mut pending: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+    let keys: Vec<Vec<u8>> = (0..N + 20).map(numbered_key).collect();
+    for (i, k) in keys.iter().take(N).enumerate() {
+        let v = format!("v{i:08}").into_bytes();
+        z.append(k, &v);
+        raw.append(k, &v);
+        model.insert(k.clone(), vec![v]);
+        if i % 300 == 299 {
+            z.commit().unwrap();
+            raw.commit().unwrap();
+        }
+    }
+    z.commit().unwrap();
+    raw.commit().unwrap();
+    z.flush().unwrap();
+    raw.flush().unwrap();
+    z.zpages_settle().unwrap();
+    let loaded = z.zpage_counts();
+    assert!(
+        loaded.partitions >= 2 && loaded.stride_files == loaded.partitions,
+        "every partition of the load is a run: {loaded:?}"
+    );
+    let mut rng = Rng(0x57_01AC);
+    let mut sum = supdb::db::ZCounts::default();
+    let add = |sum: &mut supdb::db::ZCounts, c: &supdb::db::ZCounts| {
+        sum.reads += c.reads;
+        sum.stride_reads += c.stride_reads;
+        sum.stride_builds += c.stride_builds;
+        sum.fallbacks += c.fallbacks
+            + c.rejected_damage
+            + c.rejected_identity
+            + c.build_failed
+            + c.damaged
+            + c.bad_pages;
+        for (s, d) in sum.stride_declines.iter_mut().zip(c.stride_declines) {
+            *s += d;
+        }
+    };
+    let (mut crashes, mut settles) = (0, 0);
+    for step in 0..3000u64 {
+        let ix = rng.below(N);
+        let key = numbered_key(ix);
+        let v = format!("v{step:08}").into_bytes();
+        let both = |z: &mut Db, raw: &mut Db, f: &dyn Fn(&mut Db)| {
+            f(z);
+            f(raw);
+        };
+        if ix < N / 2 || (ix >= 3 * N / 4 && rng.below(3) != 0) {
+            both(&mut z, &mut raw, &|d| d.delete(&key));
+            pending.push((key.clone(), None));
+            both(&mut z, &mut raw, &|d| d.append(&key, &v));
+            pending.push((key, Some(v)));
+        } else if ix < 3 * N / 4 {
+            both(&mut z, &mut raw, &|d| d.append(&key, &v));
+            pending.push((key, Some(v)));
+        } else {
+            both(&mut z, &mut raw, &|d| d.delete(&key));
+            pending.push((key, None));
+        }
+        match rng.below(100) {
+            0..=9 => {
+                z.commit().unwrap();
+                raw.commit().unwrap();
+                apply(&mut model, &mut pending);
+            }
+            10..=12 => {
+                z.commit().unwrap();
+                raw.commit().unwrap();
+                apply(&mut model, &mut pending);
+                z.seal().unwrap();
+                raw.seal().unwrap();
+            }
+            13 if step % 5 == 0 => {
+                add(&mut sum, &z.zpage_counts());
+                drop(z);
+                drop(raw);
+                pending.clear();
+                z = Db::open(&dz, opts(true)).unwrap();
+                raw = Db::open(&dr, opts(false)).unwrap();
+                crashes += 1;
+                check(&z, &model, &keys, "after a crash");
+                check(&raw, &model, &keys, "after a crash, raw");
+            }
+            _ => {}
+        }
+        if step % 250 == 249 {
+            z.commit().unwrap();
+            raw.commit().unwrap();
+            apply(&mut model, &mut pending);
+            if step % 500 == 499 {
+                z.flush().unwrap();
+                raw.flush().unwrap();
+            }
+            z.zpages_settle().unwrap();
+            raw.settle().unwrap();
+            settles += 1;
+            check(&z, &model, &keys, "z, writer");
+            check(&raw, &model, &keys, "raw, writer");
+            let (hz, hr) = (z.reader().unwrap(), raw.reader().unwrap());
+            check(&hz, &model, &keys, "z, handle");
+            check(&hr, &model, &keys, "raw, handle");
+            check_scan(&z, &model, "z");
+            check_scan(&hz, &model, "z, handle");
+        }
+    }
+    z.commit().unwrap();
+    raw.commit().unwrap();
+    apply(&mut model, &mut pending);
+    z.flush().unwrap();
+    z.settle().unwrap();
+    z.zpages_settle().unwrap();
+    raw.settle().unwrap();
+    check(&z, &model, &keys, "z, at the end");
+    check_scan(&z, &model, "z, at the end");
+    let c = z.zpage_counts();
+    add(&mut sum, &c);
+    assert!(crashes > 0 && settles > 8, "{crashes} {settles}");
+    assert_eq!(sum.fallbacks, 0, "no failure of the form: {sum:?}");
+    assert_eq!(c.form_files, c.partitions, "a form file each: {c:?}");
+    assert!(
+        sum.stride_builds > loaded.stride_builds && sum.stride_reads > 0,
+        "rewritten partitions built in the stride form again, and read: {sum:?}"
+    );
+    assert!(
+        sum.stride_declines.iter().sum::<u64>() > 0,
+        "the second values' and the deletes' partitions declined: {sum:?}"
+    );
+    assert!(
+        c.stride_files > 0 && c.stride_files < c.partitions,
+        "both bodies in one store at the end: {c:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dz);
+    let _ = std::fs::remove_dir_all(&dr);
+}
+
+/// The stride form under the block cache, before the form file's cursor
+/// walks one: every read the cache makes of a stride partition, and the
+/// merge path's walk beside a piece, is the raw form's, counted as the
+/// guard's refusal; the scans answer as the model does, and the point
+/// reads are still the stride file's.
+#[test]
+fn the_block_cache_walks_a_stride_partition_raw_until_its_cursor_holds_one() {
+    let (dir, mut model, keys) = stride_partition("stride-cache-src", 3000, 0x5CAC);
+    let work = scratch("stride-cache-work");
+    copy_dir(&dir, &work);
+    let mut db = Db::open(&work, stride_forced(|o| o.scan_block_cache = true)).unwrap();
+    // A few keys over the run, unsealed, so the walks meet the memtable.
+    for i in (5..3000).step_by(211) {
+        let (k, v) = (numbered_key(i), vec![7u8; 100]);
+        db.put(&k, &v);
+        model.insert(k, vec![v]);
+    }
+    db.commit().unwrap();
+    for start in [0usize, 1, 63, 64, 65, 1500, 2999] {
+        let from = numbered_key(start);
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        db.scan(
+            &from,
+            200,
+            kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+        )
+        .unwrap();
+        let want: Vec<(Vec<u8>, Vec<u8>)> = model
+            .range(from.clone()..)
+            .flat_map(|(k, vs)| vs.iter().map(move |v| (k.clone(), v.clone())))
+            .take(200)
+            .collect();
+        assert_eq!(got, want, "a scan from {start}");
+    }
+    check_scan(&db, &model, "the whole");
+    check(&db, &model, &keys, "points");
+    let c = db.zpage_counts();
+    assert!(c.stride_cursor_refused > 0, "the guard refused: {c:?}");
+    assert!(
+        c.stride_reads > 0,
+        "the point reads are the stride file's: {c:?}"
+    );
+    assert_eq!((c.fallbacks, c.damaged, c.bad_pages), (0, 0, 0), "{c:?}");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// A stride file a build of this process made is installed trusted, every
+/// value page verified from the attach and none checked as the reads touch
+/// them; one found on disk at a reopen checks each page it touches once,
+/// the count the pages the reads' slots span; and with the trust off the
+/// built file is checked so too. Under the segment work's thread, whose
+/// builds the settle waits for, and with the segment work inline, where the
+/// settle builds and attaches itself (`Db::z_give`).
+#[test]
+fn a_stride_file_built_here_is_trusted_and_one_found_on_disk_is_checked_page_by_page() {
+    for (trust, inline) in [(true, false), (false, false), (true, true), (false, true)] {
+        let dir = scratch(&format!("stride-trust-{trust}-{inline}"));
+        let opts = || {
+            stride_forced(|o| {
+                o.zpages_stride_trust_built = trust;
+                o.publish_in_background = !inline;
+            })
+        };
+        let mut db = Db::create(&dir, opts()).unwrap();
+        let model = numbered_load(&mut db, 3000, 100, 0x7357);
+        db.zpages_settle().unwrap();
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&db, &model, &keys, "built here");
+        let c = db.zpage_counts();
+        assert_eq!(c.stride_files, 1, "{c:?}");
+        assert!(c.pages > 16, "{c:?}");
+        assert_eq!(c.verified_pages, c.pages, "every page verified: {c:?}");
+        assert_eq!(
+            c.stride_page_checks,
+            if trust { 0 } else { c.pages },
+            "trust {trust}, inline {inline}: {c:?}"
+        );
+        assert_eq!(c.stride_reads, keys.len() as u64, "{c:?}");
+        db.close().unwrap();
+        let db = Db::open(&dir, opts()).unwrap();
+        // Ranks 0 to 200: bytes to 20,100, pages 0 to 4.
+        check(&db, &model, &keys[..=200], "found on disk");
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.stride_page_checks, c.verified_pages),
+            (5, 5),
+            "the pages the reads touched, once each: {c:?}"
+        );
+        check(&db, &model, &keys[..=200], "again");
+        assert_eq!(db.zpage_counts().stride_page_checks, 5);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The re-code policies build the block body's other coding over a served
+/// file's name and read a stride file as the block coding: the stride form
+/// is refused beside each of them at the open, and each opens without it.
+#[test]
+fn the_stride_form_is_refused_beside_the_recode_policies() {
+    type Set = fn(&mut Options);
+    let cases: [(&str, Set); 5] = [
+        ("recode", |o| o.zpages_recode = true),
+        ("recode-keep", |o| o.zpages_recode_keep = true),
+        ("both", |o| {
+            o.zpages_recode = true;
+            o.zpages_recode_keep = true;
+            o.zpages_both = true
+        }),
+        ("recode-auto", |o| o.zpages_recode_auto = true),
+        ("reparse", |o| o.zpages_reparse = true),
+    ];
+    for (name, set) in cases {
+        let dir = scratch(&format!("stride-refused-{name}"));
+        let e = Db::create(&dir, stride_forced(set))
+            .err()
+            .unwrap_or_else(|| panic!("{name}: opened"));
+        assert!(e.to_string().contains("zpages_stride"), "{name}: {e}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Db::create(&dir, forced(set)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Bytes of a stride file, one at a time in a copy, its value pages, its
+/// row and its trailer: a flip the attach reads -- a sampled page, the row,
+/// the trailer -- is a refusal and the partition is read raw; a flip in any
+/// other value page is met at the page's first touch, which falls back,
+/// marks the page bad and takes the file out of service, so that a read of
+/// a key on another page, an intact one, is the raw form's after it. Every
+/// read answers as the model does.
+#[test]
+fn a_flipped_byte_in_a_stride_file_is_never_an_answer() {
+    let (dir, model, keys) = stride_partition("stride-flips-src", 3000, 0x5F11);
+    let file = form_files(&dir).remove(0);
+    let good = std::fs::read(&file).unwrap();
+    let (_, v) = stride_of(&file);
+    let (samples, clear) = stride_samples(v);
+    let work = scratch("stride-flips-work");
+    copy_dir(&dir, &work);
+    let target = form_files(&work).remove(0);
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&target)
+        .unwrap();
+    use std::os::unix::fs::FileExt;
+    let (mut refused, mut fell_back) = (0, 0);
+    for at in (0..good.len()).step_by(997) {
+        let p = at / ZPAGE;
+        f.write_at(&[good[at] ^ 0x40], at as u64).unwrap();
+        let db = Db::open(&work, stride_forced(|o| o.zpages_eager = false)).unwrap();
+        let probe = if p < v {
+            keys_on_page(p, &keys)
+        } else {
+            keys.iter().step_by(97).cloned().collect()
+        };
+        if (at / 997) % 2 == 1 {
+            check_counts_first(&db, &model, &probe, &format!("byte {at}"));
+        } else {
+            check(&db, &model, &probe, &format!("byte {at}"));
+        }
+        let c = db.zpage_counts();
+        if p >= v || samples.contains(&p) {
+            assert_eq!(
+                (c.rejected_damage, c.form_files, c.reads),
+                (1, 0, 0),
+                "byte {at}: {c:?}"
+            );
+            refused += 1;
+        } else if clear(p) && at < keys.len() * 100 {
+            assert_eq!(
+                (
+                    c.rejected_damage,
+                    c.form_files,
+                    c.fallbacks,
+                    c.bad_pages,
+                    c.damaged
+                ),
+                (0, 1, 1, 1, 1),
+                "byte {at}: {c:?}"
+            );
+            // A key on the first page, which the flip left intact: the file
+            // is out of service, and the read is the raw form's.
+            let before = db.zpage_counts();
+            check(&db, &model, &keys[..1], &format!("byte {at}, another page"));
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.reads - before.reads, c.rawserves - before.rawserves),
+                (0, 2),
+                "byte {at}: {c:?}"
+            );
+            fell_back += 1;
+        }
+        drop(db);
+        f.write_at(&[good[at]], at as u64).unwrap();
+    }
+    assert!(refused > 3 && fell_back > 20, "{refused} {fell_back}");
+    let db = Db::open(&work, stride_forced(|o| o.zpages_eager = false)).unwrap();
+    check(&db, &model, &keys[..300], "restored");
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.rejected_damage, c.fallbacks, c.rawserves, c.stride_files),
+        (0, 0, 0, 1),
+        "{c:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// A value page of a stride file that fails its check takes the file out of
+/// service and the settle retires it and builds the partition's stride file
+/// again, three times a segment; the fourth damage declines the partition
+/// for the segment's life. With the trust in this process's builds off, so
+/// that each rebuilt file's pages are checked at their first touch as one
+/// found on disk is: a trusted file damaged in place after its build is
+/// served as it reads, the trust's limit.
+#[test]
+fn a_damaged_stride_file_is_rebuilt_at_most_three_times_and_then_declined() {
+    let (dir, model, keys) = stride_partition("stride-rebuild-src", 3000, 0x5EB1);
+    let work = scratch("stride-rebuild-work");
+    copy_dir(&dir, &work);
+    let opts = || stride_forced(|o| o.zpages_stride_trust_built = false);
+    let mut db = Db::open(&work, opts()).unwrap();
+    let live = |dir: &Path| {
+        form_files(dir)
+            .into_iter()
+            .filter(|p| !p.to_string_lossy().contains("dead"))
+            .collect::<Vec<_>>()
+    };
+    let (_, v) = stride_of(&live(&work)[0]);
+    let (_, clear) = stride_samples(v);
+    // Pages two apart and more: a read of a page's keys verifies the page
+    // before it and the one after where a slot straddles, and a page this
+    // process has verified is not checked again, a flip under it after the
+    // fact served as it reads, as the block form's verified pages are.
+    let mut pages: Vec<usize> = Vec::new();
+    for p in (0..v).filter(|&p| clear(p)) {
+        if pages.last().is_none_or(|&q| p >= q + 3) {
+            pages.push(p);
+        }
+    }
+    pages.truncate(4);
+    assert_eq!(pages.len(), 4, "{v} pages");
+    for (round, &p) in (1..=4u64).zip(&pages) {
+        let file = live(&work).remove(0);
+        {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&file)
+                .unwrap();
+            let at = (p * ZPAGE + 50) as u64;
+            let mut b = [0u8; 1];
+            f.read_exact_at(&mut b, at).unwrap();
+            f.write_at(&[b[0] ^ 0x40], at).unwrap();
+        }
+        let probe = keys_on_page(p, &keys);
+        let before = db.zpage_counts();
+        check(&db, &model, &probe, &format!("round {round}, damaged"));
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.fallbacks - before.fallbacks, c.damaged, c.form_files),
+            (1, 1, 1),
+            "round {round}: {c:?}"
+        );
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        if round <= 3 {
+            assert_eq!(
+                (
+                    c.rebuilds,
+                    c.damaged,
+                    c.form_files,
+                    c.stride_files,
+                    c.declined_damage
+                ),
+                (round, 0, 1, 1, 0),
+                "round {round}: {c:?}"
+            );
+            let before = db.zpage_counts();
+            check(&db, &model, &probe, &format!("round {round}, rebuilt"));
+            let c = db.zpage_counts();
+            assert_eq!(
+                (
+                    c.fallbacks - before.fallbacks,
+                    c.rawserves - before.rawserves
+                ),
+                (0, 0),
+                "round {round}: served from the new file: {c:?}"
+            );
+            assert!(c.stride_reads > before.stride_reads, "{c:?}");
+        } else {
+            assert_eq!(
+                (c.rebuilds, c.damaged, c.form_files, c.declined_damage),
+                (3, 0, 0, 1),
+                "round {round}: {c:?}"
+            );
+            assert!(live(&work).is_empty());
+            let before = db.zpage_counts();
+            check(&db, &model, &probe, "declined");
+            let c = db.zpage_counts();
+            assert_eq!(
+                c.rawserves - before.rawserves,
+                2 * probe.len() as u64,
+                "{c:?}"
+            );
+        }
+    }
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// The windows of a stride file's life a crash can fall in, built on disk
+/// from a store that has its stride file, and opened under the stride form
+/// and without it: a build's temp name alone, a torn trailer, a torn row, a
+/// zeroed value page. What the open finds is counted, every read answers
+/// as the model does, and a settle leaves one form file under the live name
+/// and nothing else of the form's -- the stride file where the store takes
+/// the form, and where it does not, the stride file refused as another
+/// engine's and the partition built again in the block coding.
+#[test]
+fn every_crash_window_of_a_stride_file_is_survived_at_open_with_the_form_or_without() {
+    let (dir, model, keys) = stride_partition("stride-crash-src", 3000, 0x5C2A);
+    let seg = partition_name(&dir);
+    let (id, end) = fields_of(&seg);
+    let live = format!("zpg-{id:08}-{end:016}.zpg");
+    let (t, v) = stride_of(&dir.join(&live));
+    let lay = t.layout().unwrap();
+    let (_, clear) = stride_samples(v);
+    let zeroed = (0..v).find(|&p| clear(p)).unwrap();
+    let mut probe: Vec<Vec<u8>> = keys.iter().step_by(37).cloned().collect();
+    probe.extend(keys_on_page(zeroed, &keys));
+    use std::os::unix::fs::FileExt;
+    let write_at = |d: &Path, bytes: &[u8], at: u64| {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(d.join(&live))
+            .unwrap();
+        f.write_all_at(bytes, at).unwrap();
+    };
+    // Each case: the window's state, and what an open under the form and one
+    // without it count: (swept, attached, rejected_damage, rejected_identity).
+    type Make<'a> = Box<dyn Fn(&Path) + 'a>;
+    type AtOpen = (u64, u64, u64, u64);
+    let cases: Vec<(&str, Make, AtOpen, AtOpen)> = vec![
+        (
+            "a temp name and no final file",
+            Box::new(|d: &Path| {
+                std::fs::rename(d.join(&live), d.join(format!("{live}.tmp"))).unwrap();
+            }),
+            (1, 0, 0, 0),
+            (1, 0, 0, 0),
+        ),
+        (
+            "a torn trailer",
+            Box::new(|d: &Path| write_at(d, &[0u8; ZTRAILER], lay.file_len - ZTRAILER as u64)),
+            (0, 0, 1, 0),
+            (0, 0, 1, 0),
+        ),
+        (
+            "a torn row",
+            Box::new(|d: &Path| write_at(d, &[0u8; ZPAGE], lay.res_off)),
+            (0, 0, 1, 0),
+            (0, 0, 0, 1),
+        ),
+        (
+            "a zeroed value page",
+            Box::new(|d: &Path| write_at(d, &[0u8; ZPAGE], (zeroed * ZPAGE) as u64)),
+            (0, 1, 0, 0),
+            (0, 0, 0, 1),
+        ),
+    ];
+    for (i, (name, make, with, without)) in cases.iter().enumerate() {
+        for form in [ZStride::Forced, ZStride::Off] {
+            let what = format!("{name}, {form:?}");
+            let work = scratch(&format!("stride-crash-{i}-{form:?}"));
+            copy_dir(&dir, &work);
+            make(&work);
+            let opts = || {
+                forced(|o| {
+                    o.zpages_stride = form;
+                    o.zpages_eager = false;
+                })
+            };
+            let mut db = Db::open(&work, opts()).unwrap();
+            let c = db.zpage_counts();
+            let want = if form == ZStride::Forced {
+                with
+            } else {
+                without
+            };
+            assert_eq!(
+                (c.swept, c.attached, c.rejected_damage, c.rejected_identity),
+                *want,
+                "{what}: at the open: {c:?}"
+            );
+            check(&db, &model, &probe, &what);
+            let c = db.zpage_counts();
+            if want.1 == 1 {
+                // The zeroed page is met at its first touch.
+                assert_eq!(
+                    (c.fallbacks, c.bad_pages, c.damaged),
+                    (1, 1, 1),
+                    "{what}: {c:?}"
+                );
+            } else {
+                assert_eq!(c.reads + c.counts, 0, "{what}: {c:?}");
+            }
+            db.zpages_settle().unwrap();
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.form_files, c.partitions, c.damaged, c.stride_files),
+                (1, 1, 0, u64::from(form == ZStride::Forced)),
+                "{what}: after the settle: {c:?}"
+            );
+            let files: Vec<String> = form_files(&work)
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(files, vec![live.clone()], "{what}: after the settle");
+            let bytes = std::fs::read(work.join(&live)).unwrap();
+            let tail = &bytes[bytes.len() - ZTRAILER..];
+            assert_eq!(
+                StrideTrailer::decode(tail).is_ok(),
+                form == ZStride::Forced,
+                "{what}: the body under the name"
+            );
+            assert_eq!(
+                Trailer::decode(tail).is_ok(),
+                form == ZStride::Off,
+                "{what}"
+            );
+            let before = db.zpage_counts();
+            check(&db, &model, &probe, &format!("{what}, settled"));
+            let c = db.zpage_counts();
+            assert_eq!(
+                (
+                    c.rawserves - before.rawserves,
+                    c.fallbacks - before.fallbacks
+                ),
+                (0, 0),
+                "{what}: served from the form file after the settle: {c:?}"
+            );
+            db.close().unwrap();
+            let _ = std::fs::remove_dir_all(&work);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

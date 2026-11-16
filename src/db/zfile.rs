@@ -37,10 +37,11 @@ use super::zpages::{
     seek_group_partly_with, verify_page_with, view_trusted, walk_group, Dec, FenceEntry,
     FenceSearch, Fill, FillScratch, FillStats, GroupBuf, Images, KeyCodec, KeyShapeNo, NoPage,
     PageView, PartGroup, SegIdent, SegImages, StrideLayout, StrideTrailer, Trailer, ZError, ZFence,
-    PART_STEP, STRIDE_KEY_MAX, STRIDE_W_MAX, ZCODING_BLOCK, ZCODING_RECORD, ZGROUP_BYTES,
-    ZMAX_GROUPS, ZNOPAGE, ZPAGE, ZTRAILER,
+    PART_STEP, STRIDE_KEY_MAX, STRIDE_MAGIC, STRIDE_W_MAX, ZCODING_BLOCK, ZCODING_RECORD,
+    ZGROUP_BYTES, ZMAX_GROUPS, ZNOPAGE, ZPAGE, ZTRAILER,
 };
 use super::zpages::{stride_page_crc, stride_row_crc};
+use super::zpages::{trailer_crc, trailer_magic};
 use crate::blob::{Blob, BlobOptions, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
 use crate::flatindex::{
@@ -466,6 +467,11 @@ pub(super) struct ZCursor<'a> {
 
 impl<'a> ZCursor<'a> {
     fn new(memo: &'a ZMemo, zfile: &'a ZFile, raw: &'a Blob<MmapBytes>) -> ZCursor<'a> {
+        // The cursor walks a block file's fence and groups and has no
+        // position in a stride file: the store makes none over one
+        // (`Reader::zc`, `Reader::pwalk_at`), and its callers take the raw
+        // form's walk there, until the cursor holds a stride position.
+        debug_assert!(zfile.stride.is_none(), "a cursor over a stride file");
         ZCursor {
             memo,
             zfile,
@@ -2019,6 +2025,11 @@ pub(super) struct PointCounts {
     /// The times a group begun in part was decoded further: none where the
     /// first stop covered what the walk went on to read.
     pub(super) walk_mores: u64,
+    /// A stride file's value pages checked against its row at their first
+    /// touch in this process (`ZFile::stride_page`): none for a file a
+    /// build of this process made and the attach trusted
+    /// (`StrideAttach::Trust`), one a page touched for a file found on disk.
+    pub(super) stride_checks: u64,
 }
 
 /// The slots of the tags of groups decoded in part (`Memo::admit`): sixty-
@@ -2502,6 +2513,10 @@ impl ZMemo {
         self.memo.borrow_mut().point.owned += 1;
     }
 
+    fn count_stride_check(&self) {
+        self.memo.borrow_mut().point.stride_checks += 1;
+    }
+
     /// A walk's group begun in part: `len` of its `of` bytes decoded.
     fn count_walk_part(&self, len: usize, of: usize) {
         let mut m = self.memo.borrow_mut();
@@ -2744,8 +2759,16 @@ pub(super) struct ZFile {
     coded: bool,
     /// This attach's identity, which the memo keys its groups by.
     id: u64,
-    /// The trailer this attach accepted.
+    /// The block trailer this attach accepted; the default for a stride
+    /// file, whose trailer is its body's (`StrideBody::trailer`).
     ident: Trailer,
+    /// The stride form's body, where the file is a stride file
+    /// (`zpages::StrideTrailer`): its trailer, sizes and row, read by the
+    /// stride arm each read method begins with and by no block-only helper,
+    /// each of which holds that it is `None`. Beside it the fence is empty,
+    /// there is no filter, and `n_pages` and the bitmaps are over the value
+    /// pages.
+    stride: Option<Box<StrideBody>>,
     /// Whether compressed pages are opened through the handle's memo
     /// (`Options::zpages_memo`), and whether its slot is the hashed one
     /// (`Options::zpages_memo_hash`).
@@ -2785,6 +2808,46 @@ pub(super) struct ZFile {
     skewed: Option<(Vec<u8>, usize)>,
 }
 
+/// What an attach takes of a stride file under a partition's name
+/// (`Options::zpages_stride`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StrideAttach {
+    /// Refused as another engine's file (`Reject::Identity`), as an engine
+    /// from before the form refuses it at the trailer's magic: the store does
+    /// not take the stride form, and the partition is built again in the
+    /// block coding.
+    Refuse,
+    /// Attached after its checks, each value page checked against its word
+    /// of the row at its first touch: a file found on disk.
+    Check,
+    /// Attached with every value page marked verified where the file under
+    /// the name has a trailer of this CRC word -- the one a build of this
+    /// process wrote and read back every rank of (`Built::stride_seal`), the
+    /// row's CRC in it -- and as under `Check` where it has another.
+    Trust(u32),
+}
+
+/// What an attach read of a form file, either body's, for `ZFile::assemble`.
+struct Assembly {
+    map: MmapBytes,
+    file: Option<std::fs::File>,
+    advise: bool,
+    fence: ZFence,
+    filter: Option<super::BlockedBloom>,
+    nkeys: usize,
+    n_pages: usize,
+    bind: u32,
+    ident: Trailer,
+    stride: Option<Box<StrideBody>>,
+}
+
+/// A stride file's body as its attach accepted it, and whether its pages
+/// are trusted (`StrideAttach::Trust`).
+struct StrideAttached {
+    body: StrideBody,
+    trusted: bool,
+}
+
 impl ZFile {
     /// The form file at `path`, if it is the form file of the live segment
     /// `blob`, whose name carries `id` and `end_seq`. The checks, in order:
@@ -2809,6 +2872,13 @@ impl ZFile {
     /// whose layout the engine no longer computes would answer present keys
     /// absent with nothing raised, so each is an identity refusal.
     ///
+    /// The last page's magic says which body the file holds, read after the
+    /// advice and before anything else of the file: a stride file
+    /// (`zpages::STRIDE_MAGIC`) is refused as another engine's where
+    /// `stride` refuses the form and is otherwise the stride form's attach
+    /// (`ZFile::attach_stride`); every other file is the block form's,
+    /// whose trailer's decode refuses one of neither kind at its magic.
+    ///
     /// `advise` maps the file `MADV_RANDOM`, before its own sampled reads.
     /// `fence` is how the fence is searched: over its keys, over its words
     /// laid flat (`ZFence::index_words`, `Options::zpages_fence_words`) or
@@ -2828,6 +2898,7 @@ impl ZFile {
         memo_first: bool,
         fence: FenceSearch,
         memo_ahead: bool,
+        stride: &StrideAttach,
     ) -> std::result::Result<ZFile, Reject> {
         let memo = memo.into();
         let damage = |e: ZError| Reject::Damage(e.to_string());
@@ -2850,11 +2921,52 @@ impl ZFile {
         if len < ZTRAILER as u64 || !len.is_multiple_of(ZPAGE as u64) {
             return Err(damage(ZError::Length));
         }
-        let t = Trailer::decode(
-            map.slice_at(len - ZTRAILER as u64, ZTRAILER)
-                .ok_or_else(|| damage(ZError::Length))?,
-        )
-        .map_err(damage)?;
+        let last = map
+            .slice_at(len - ZTRAILER as u64, ZTRAILER)
+            .ok_or_else(|| damage(ZError::Length))?;
+        // The last page's magic, before anything else of it is read: which
+        // body the file holds. The block form's goes on below as it always
+        // has; anything that is neither kind's is the block trailer's to
+        // refuse, as damage, at its magic.
+        if trailer_magic(last) == Some(STRIDE_MAGIC) {
+            if *stride == StrideAttach::Refuse {
+                return Err(Reject::Identity(
+                    "a stride form file, which the store does not take".into(),
+                ));
+            }
+            let StrideAttached {
+                body,
+                trusted: trusted_all,
+            } = ZFile::attach_stride(&map, blob, id, end_seq, stride)?;
+            let n_pages = body.pages();
+            let nkeys = body.keys() as usize;
+            let zfile = ZFile::assemble(
+                Assembly {
+                    map,
+                    file,
+                    advise,
+                    fence: ZFence::new(),
+                    filter: None,
+                    nkeys,
+                    n_pages,
+                    bind: body.trailer().bind32(),
+                    ident: Trailer::default(),
+                    stride: Some(Box::new(body)),
+                },
+                memo,
+                prefetch,
+                trusted,
+                memo_first,
+                memo_ahead,
+            );
+            if trusted_all {
+                for p in 0..n_pages {
+                    set_bit(&zfile.verified, p);
+                }
+            }
+            return Ok(zfile);
+        }
+        let t = Trailer::decode(last).map_err(damage)?;
         if t.expected_file_len() != Some(len) {
             return Err(damage(ZError::Trailer(
                 "the file is not the length its trailer says",
@@ -2890,24 +3002,56 @@ impl ZFile {
             None
         };
         let bind = bind32(id, end_seq, facts.nkeys, facts.row_crc);
-        let mut zfile = ZFile {
-            map,
-            file,
-            advised: advise,
-            fence,
-            filter,
-            nkeys,
-            n_pages,
-            bind,
+        let mut zfile = ZFile::assemble(
+            Assembly {
+                map,
+                file,
+                advise,
+                fence,
+                filter,
+                nkeys,
+                n_pages,
+                bind,
+                ident: t,
+                stride: None,
+            },
+            memo,
+            prefetch,
+            trusted,
+            memo_first,
+            memo_ahead,
+        );
+        zfile.coded = zfile.check_sample().map_err(damage)?;
+        Ok(zfile)
+    }
+
+    /// An attached form file of either body from what its attach read, the
+    /// one place its fields are listed: every block-coding and memo setting
+    /// at what the store's options and the store's sets after the attach
+    /// start from, nothing verified, nothing counted.
+    fn assemble(
+        a: Assembly,
+        memo: MemoShape,
+        prefetch: bool,
+        trusted: bool,
+        memo_first: bool,
+        memo_ahead: bool,
+    ) -> ZFile {
+        let words = a.n_pages.div_ceil(64);
+        ZFile {
+            map: a.map,
+            file: a.file,
+            advised: a.advise,
+            fence: a.fence,
+            filter: a.filter,
+            nkeys: a.nkeys,
+            n_pages: a.n_pages,
+            bind: a.bind,
             own_decoder: false,
             flat_decoder: false,
             flat_slack: false,
-            verified: (0..n_pages.div_ceil(64))
-                .map(|_| AtomicU64::new(0))
-                .collect(),
-            bad: (0..n_pages.div_ceil(64))
-                .map(|_| AtomicU64::new(0))
-                .collect(),
+            verified: (0..words).map(|_| AtomicU64::new(0)).collect(),
+            bad: (0..words).map(|_| AtomicU64::new(0)).collect(),
             damaged: AtomicBool::new(false),
             decodes16: AtomicU64::new(0),
             decode_ns16: AtomicU64::new(0),
@@ -2915,7 +3059,8 @@ impl ZFile {
             time_decodes: false,
             coded: false,
             id: NEXT_ZSIDE_ID.fetch_add(1, Ordering::Relaxed),
-            ident: t,
+            ident: a.ident,
+            stride: a.stride,
             memo: memo != MemoShape::Off,
             memo_hashed: memo == MemoShape::Hashed,
             trusted,
@@ -2928,9 +3073,108 @@ impl ZFile {
             prefetch,
             #[cfg(test)]
             skewed: None,
-        };
-        zfile.coded = zfile.check_sample().map_err(damage)?;
-        Ok(zfile)
+        }
+    }
+
+    /// The stride form's attach, from the file's mapping, its length whole
+    /// pages and its last page the stride trailer's magic: the checks, in
+    /// order, each a refusal of its own kind -- the trailer and the length
+    /// its sizes give (damage); the segment it names the live one
+    /// (`same_segment`, identity); the row's CRC and the zeros after it
+    /// (damage), the row then copied into the heap (`StrideBody::open` and
+    /// `StrideBody::with_row`); the first and the last key the codec renders
+    /// the live segment's own first and last keys (identity); and the first,
+    /// the last and fourteen evenly spaced value pages each against its
+    /// word of the row (damage) and the slot each holds the start of --
+    /// where none starts on it, the slot its first byte is in -- against the
+    /// live segment's record at that rank, key and value (identity). That
+    /// last is the one check behind the checksum a file of values alone can
+    /// make: a page forged with a good CRC is refused here where it is
+    /// sampled and served where it is not, the block form's limit too. A
+    /// value page beyond the sample is checked against its word at its
+    /// first touch (`ZFile::stride_page`).
+    ///
+    /// Where `stride` trusts a trailer and the file's is that trailer, the
+    /// file is the one a build of this process wrote and read back, every
+    /// rank of it against its records, before its name: the row is the
+    /// build's by the CRC the trailer carries, and the endpoints and the
+    /// sample, which the read-back covered, are not read again -- they
+    /// would be a raw page each of records the install is about to give
+    /// back.
+    fn attach_stride(
+        map: &MmapBytes,
+        blob: &Blob<MmapBytes>,
+        id: u64,
+        end_seq: u64,
+        stride: &StrideAttach,
+    ) -> std::result::Result<StrideAttached, Reject> {
+        let damage = |e: ZError| Reject::Damage(e.to_string());
+        let identity = |why: &str| Reject::Identity(why.into());
+        let bytes: &[u8] = &map.0;
+        let (trailer, layout) = StrideBody::open(bytes).map_err(damage)?;
+        let facts = blob
+            .z_source_facts()
+            .ok_or_else(|| identity("the segment has no checksum row to be bound to"))?;
+        same_segment(&trailer.seg_ident(), &facts, id, end_seq).map_err(identity)?;
+        let body = StrideBody::with_row(bytes, trailer, layout).map_err(damage)?;
+        if let StrideAttach::Trust(seal) = *stride {
+            if trailer_crc(&bytes[bytes.len() - ZTRAILER..]) == Some(seal) {
+                return Ok(StrideAttached {
+                    body,
+                    trusted: true,
+                });
+            }
+        }
+        let n = body.keys();
+        let mut kbuf = [0u8; STRIDE_KEY_MAX];
+        for (rank, which) in [(0, "first"), (n - 1, "last")] {
+            let rendered = body.key_at_into(rank, &mut kbuf);
+            if rendered.is_none() || rendered != blob.key_at(rank as usize) {
+                return Err(Reject::Identity(format!(
+                    "the stride form's {which} key is not the segment's"
+                )));
+            }
+        }
+        let v = body.pages();
+        let take = v.min(ZSAMPLE_PAGES);
+        let mut want: Vec<u32> = (0..take)
+            .map(|k| {
+                if v <= ZSAMPLE_PAGES {
+                    k as u32
+                } else {
+                    (k * (v - 1) / (ZSAMPLE_PAGES - 1)) as u32
+                }
+            })
+            .collect();
+        want.dedup();
+        let mut raw = Vec::new();
+        for p in want {
+            let rank = body.rank_on_page(p);
+            // Every page the slot spans, the sampled one among them, against
+            // its word of the row before the slot is read.
+            let value = match body.values_at(bytes, rank, &mut |q| body.page_ok(bytes, q)) {
+                StrideAt::Value(value) => value,
+                StrideAt::Absent | StrideAt::Bad(_) => return Err(damage(ZError::PageCrc)),
+            };
+            raw.clear();
+            let got = blob
+                .values_at(rank as usize, &mut |v: &[u8]| raw.push(v.to_vec()))
+                .map_err(|e| Reject::Damage(format!("the segment's record reads: {e}")))?;
+            if got != 1 || raw[0] != value {
+                return Err(identity(
+                    "a sampled value page's slot is not the segment's value at its rank",
+                ));
+            }
+            if body.key_at_into(rank, &mut kbuf) != blob.key_at(rank as usize) {
+                return Err(identity(
+                    "a sampled value page's slot is not the segment's key at its rank",
+                ));
+            }
+        }
+        Ok(StrideAttached {
+            body,
+            trusted: false,
+        })
     }
 
     /// The first, the last and fourteen evenly spaced pages through
@@ -2941,6 +3185,10 @@ impl ZFile {
     /// is marked verified. Whether the first group of a sampled page is
     /// record-coded, which is the coding the file was built in.
     fn check_sample(&self) -> std::result::Result<bool, ZError> {
+        debug_assert!(
+            self.stride.is_none(),
+            "a block-only helper over a stride file"
+        );
         let take = self.n_pages.min(ZSAMPLE_PAGES);
         let mut want: Vec<usize> = (0..take)
             .map(|k| {
@@ -3020,6 +3268,10 @@ impl ZFile {
         inplace: bool,
         memoise: bool,
     ) -> Option<(Opened<'a>, usize, usize, bool)> {
+        debug_assert!(
+            self.stride.is_none(),
+            "a block-only helper over a stride file"
+        );
         self.open_group_with(memo, entry, j, buf, view, inplace, false, false, memoise)
     }
 
@@ -3038,6 +3290,10 @@ impl ZFile {
         entry: &FenceEntry<'_>,
         j: usize,
     ) -> std::result::Result<Option<(Opened<'a>, usize, usize, bool)>, ()> {
+        debug_assert!(
+            self.stride.is_none(),
+            "a block-only helper over a stride file"
+        );
         let p = entry.page as usize;
         if self.page_bytes(p).filter(|_| p < self.n_pages).is_none() {
             self.fail(p);
@@ -3080,6 +3336,10 @@ impl ZFile {
         absent: bool,
         memoise: bool,
     ) -> Option<(Opened<'a>, usize, usize, bool)> {
+        debug_assert!(
+            self.stride.is_none(),
+            "a block-only helper over a stride file"
+        );
         let p = entry.page as usize;
         let Some(page) = self.page_bytes(p).filter(|_| p < self.n_pages) else {
             self.fail(p);
@@ -3252,6 +3512,10 @@ impl ZFile {
     /// `page_view` otherwise. What every lookup of a group in a page goes
     /// through, so the two shapes differ here and nowhere else.
     fn view<'a>(&self, p: usize, page: &'a [u8]) -> std::result::Result<PageView<'a>, ZError> {
+        debug_assert!(
+            self.stride.is_none(),
+            "a block-only helper over a stride file"
+        );
         if self.trusted && bit(&self.verified, p) {
             view_trusted(page)
         } else {
@@ -3262,6 +3526,10 @@ impl ZFile {
     /// Page `p`'s view, where it has bytes and they parse; `None` takes the
     /// page out of service.
     fn view_of(&self, p: usize) -> Option<PageView<'_>> {
+        debug_assert!(
+            self.stride.is_none(),
+            "a block-only helper over a stride file"
+        );
         let v = self
             .page_bytes(p)
             .filter(|_| p < self.n_pages)
@@ -3276,6 +3544,10 @@ impl ZFile {
     /// page, by the directory; `None` where the page's values do not
     /// parse, the page out of service.
     fn group_of_index(&self, p: usize, i: usize) -> Option<usize> {
+        debug_assert!(
+            self.stride.is_none(),
+            "a block-only helper over a stride file"
+        );
         let j = self
             .page_bytes(p)
             .and_then(|page| self.view(p, page).ok())
@@ -3292,6 +3564,10 @@ impl ZFile {
     /// decode's to refuse: the group chosen is then opened and the page's
     /// CRC read before anything is answered from it.
     fn group_of_key(&self, p: usize, key: &[u8]) -> Option<usize> {
+        debug_assert!(
+            self.stride.is_none(),
+            "a block-only helper over a stride file"
+        );
         let j = self
             .page_bytes(p)
             .and_then(|page| self.view(p, page).ok())
@@ -3306,6 +3582,10 @@ impl ZFile {
     /// fence that does not cover the rank is damage, since the tiling check
     /// held every rank below the key count to an entry.
     fn entry_at_rank(&self, rank: usize) -> Option<FenceEntry<'_>> {
+        debug_assert!(
+            self.stride.is_none(),
+            "a block-only helper over a stride file"
+        );
         u32::try_from(rank)
             .ok()
             .and_then(|r| self.fence.entry_at_rank(r))
@@ -3321,6 +3601,10 @@ impl ZFile {
     /// to the record by `record_key_next`. A rank past the end is absent; an
     /// entry no page holds is the raw form's.
     fn locate_rank<'a>(&'a self, memo: &ZMemo, rank: usize, buf: &'a mut GroupBuf) -> Locate<'a> {
+        debug_assert!(
+            self.stride.is_none(),
+            "a block-only helper over a stride file"
+        );
         if self.damaged.load(Ordering::Relaxed) {
             return Locate::Out;
         }
@@ -3363,6 +3647,10 @@ impl ZFile {
     /// Where `key` lies among the records of this partition, opening the
     /// one page that could hold it.
     fn locate<'a>(&'a self, memo: &ZMemo, key: &[u8], buf: &'a mut GroupBuf) -> Locate<'a> {
+        debug_assert!(
+            self.stride.is_none(),
+            "a block-only helper over a stride file"
+        );
         if self.damaged.load(Ordering::Relaxed) {
             return Locate::Out;
         }
@@ -3596,6 +3884,9 @@ impl ZFile {
         key: &[u8],
         f: &mut F,
     ) -> Result<ZRead> {
+        if let Some(body) = self.stride.as_deref() {
+            return Ok(self.stride_read_all(body, memo, key, f));
+        }
         let mut buf = take_buf();
         let r = match self.locate(memo, key, &mut buf) {
             Locate::Absent { decoded } => Ok(ZRead::Served { n: 0, decoded }),
@@ -3625,6 +3916,9 @@ impl ZFile {
 
     /// How many values `key` has in this partition.
     pub(super) fn count(&self, memo: &ZMemo, key: &[u8]) -> ZRead {
+        if let Some(body) = self.stride.as_deref() {
+            return self.stride_count(body, key);
+        }
         let mut buf = take_buf();
         let r = match self.locate(memo, key, &mut buf) {
             Locate::Absent { decoded } => ZRead::Served { n: 0, decoded },
@@ -3675,6 +3969,9 @@ impl ZFile {
         limit: usize,
         f: &mut F,
     ) -> Result<ZScan> {
+        if let Some(body) = self.stride.as_deref() {
+            return Ok(self.stride_scan(body, memo, from, limit, f));
+        }
         let mut out = ZScan {
             seen: 0,
             decoded: 0,
@@ -3710,6 +4007,10 @@ impl ZFile {
         buf: &mut GroupBuf,
         out: &mut ZScan,
     ) -> Result<()> {
+        debug_assert!(
+            self.stride.is_none(),
+            "a block-only helper over a stride file"
+        );
         let nkeys = self.nkeys;
         let mut rank = from;
         let mut asked = false;
@@ -4005,6 +4306,10 @@ impl ZFile {
         buf: &mut GroupBuf,
         f: &mut F,
     ) -> Result<PartWalk> {
+        debug_assert!(
+            self.stride.is_none(),
+            "a block-only helper over a stride file"
+        );
         if !self.own_decoder || !bit(&self.verified, p) {
             return Ok(PartWalk::Declined);
         }
@@ -4094,6 +4399,10 @@ impl ZFile {
         j: usize,
         within: bool,
     ) -> bool {
+        debug_assert!(
+            self.stride.is_none(),
+            "a block-only helper over a stride file"
+        );
         let lines = match view.payload(j + 1) {
             Some(payload) if within => Some((payload.as_ptr(), payload.len())),
             Some(_) => None,
@@ -4122,6 +4431,10 @@ impl ZFile {
     /// Whether it asked: nothing with the option off, nothing wanted past
     /// the page, or no page after it.
     fn ask_ahead(&self, p: usize, past: usize) -> bool {
+        debug_assert!(
+            self.stride.is_none(),
+            "a block-only helper over a stride file"
+        );
         if !self.prefetch || past == 0 {
             return false;
         }
@@ -4148,6 +4461,9 @@ impl ZFile {
         rank: usize,
         f: &mut F,
     ) -> Result<ZRead> {
+        if let Some(body) = self.stride.as_deref() {
+            return Ok(self.stride_values_at(body, memo, rank, f));
+        }
         let mut buf = take_buf();
         let r = match self.locate_rank(memo, rank, &mut buf) {
             Locate::Absent { decoded } => Ok(ZRead::Served { n: 0, decoded }),
@@ -4189,6 +4505,9 @@ impl ZFile {
     /// holds is what a block table keeps, and it was a touch of the raw
     /// form until the fence answered it.
     pub(super) fn key_at_into(&self, memo: &ZMemo, rank: usize, out: &mut Vec<u8>) -> ZRead {
+        if let Some(body) = self.stride.as_deref() {
+            return self.stride_key_at_into(body, rank, out);
+        }
         if !self.damaged.load(Ordering::Relaxed) && rank < self.nkeys {
             if let Some(e) = self.entry_at_rank(rank) {
                 if e.page == ZNOPAGE && e.count == 1 {
@@ -4239,6 +4558,9 @@ impl ZFile {
     /// falls in, where the ordered index takes its heads and a key read of
     /// the raw records for each probe.
     pub(super) fn seek(&self, memo: &ZMemo, key: &[u8]) -> ZSeek {
+        if let Some(body) = self.stride.as_deref() {
+            return self.stride_seek(body, key);
+        }
         if self.damaged.load(Ordering::Relaxed) {
             return ZSeek::Out;
         }
@@ -4368,6 +4690,9 @@ impl ZFile {
     /// search from the top costs the fence's depth (the settle's filing of
     /// a sorted batch, `Reader::lazy_block`). `usize::MAX` is no hint.
     pub(super) fn owner_span_from(&self, key: &[u8], hint: &mut usize) -> Option<(usize, usize)> {
+        if let Some(body) = self.stride.as_deref() {
+            return self.stride_owner_span(body, key);
+        }
         if self.damaged.load(Ordering::Relaxed) {
             return None;
         }
@@ -4432,7 +4757,12 @@ impl ZFile {
         self.damaged.load(Ordering::Relaxed)
     }
 
-    /// Pages in the file.
+    /// Pages in the file that hold its records: the block form's region A,
+    /// and for a stride file its value pages, `V` -- the row and the trailer
+    /// apart, as region B and the trailer are. What the store sums for the
+    /// form's pages (`Db::zpage_counts`, `Db::zpage_form_files`) and E2's
+    /// footprint divides the keys by (`Maint::z_footprint`), where a stride
+    /// file's pages hold the values alone.
     pub(super) fn pages(&self) -> usize {
         self.n_pages
     }
@@ -4443,7 +4773,9 @@ impl ZFile {
     }
 
     /// Pages whose first-decode checks have passed in this process, and
-    /// pages a check has failed.
+    /// pages a check has failed: of a stride file, its value pages checked
+    /// against the row, or all of them where the attach trusted the file
+    /// (`StrideAttach::Trust`).
     pub(super) fn verified_pages(&self) -> u64 {
         popcount(&self.verified)
     }
@@ -4454,7 +4786,8 @@ impl ZFile {
 
     /// The share of the file's pages the page cache holds now (`mincore`
     /// over the mapping): whether a build that reads the form reads memory
-    /// or the device.
+    /// or the device. Over the whole file whichever body it holds, so a
+    /// stride file's row and trailer count as region B and the trailer do.
     pub(super) fn pages_resident(&self) -> f64 {
         let len = self.map.len();
         match self.map.slice_at(0, len as usize) {
@@ -4463,9 +4796,14 @@ impl ZFile {
         }
     }
 
-    /// Heap bytes the form file keeps resident: the fence and the filter.
+    /// Heap bytes the form file keeps resident: the fence and the filter, and
+    /// for a stride file its body's row and trailer (`StrideBody::heap_bytes`)
+    /// beside an empty fence. What the store sums for the forms' heap
+    /// (`Db::zpage_counts`).
     pub(super) fn resident_bytes(&self) -> usize {
-        self.fence.heap_bytes() + self.filter.as_ref().map_or(0, |f| f.blocks.len() * 64)
+        self.fence.heap_bytes()
+            + self.filter.as_ref().map_or(0, |f| f.blocks.len() * 64)
+            + self.stride.as_ref().map_or(0, |b| b.heap_bytes())
     }
 
     /// A group's decode begun: whether it is the one in sixteen this
@@ -4522,12 +4860,16 @@ impl ZFile {
         }
     }
 
-    /// The form file is the record coding's (`ZFile::coded`).
+    /// The form file is the record coding's (`ZFile::coded`); false for a
+    /// stride file, which is neither of the block body's codings
+    /// (`ZFile::kind`).
     pub(super) fn coded(&self) -> bool {
         self.coded
     }
 
-    /// The file's bytes.
+    /// The file's bytes, whichever body: what the room and the hot-raw
+    /// policy charge a served partition (`Db::settle_room_bytes`,
+    /// `Maint::z_hot_look`), the page cache a file takes.
     pub(super) fn file_bytes(&self) -> u64 {
         self.map.len()
     }
@@ -4553,9 +4895,15 @@ impl ZFile {
         self.map.advise_willneed(0, self.map.len() as usize) as u64
     }
 
-    /// The decoded bytes of every group the file holds, as its trailer says.
+    /// The decoded bytes of every group the file holds, as its trailer says;
+    /// for a stride file its values' bytes, `n * W` (`StrideBody::value_bytes`):
+    /// what each body holds of the records, which the store sums for the
+    /// form's ratio to them (`Db::zpage_counts`).
     pub(super) fn group_bytes(&self) -> u64 {
-        self.ident.total_ulen
+        match &self.stride {
+            Some(b) => b.value_bytes(),
+            None => self.ident.total_ulen,
+        }
     }
 
     /// This attach's number: no other form file attached in this process has
@@ -4568,6 +4916,303 @@ impl ZFile {
     #[cfg(test)]
     pub(super) fn ident(&self) -> &Trailer {
         &self.ident
+    }
+}
+
+// ---- the stride arms ---------------------------------------------------------
+//
+// Each read method of a form file begins with a look at `ZFile::stride` and,
+// for a stride file, answers here: a load of a field the method reads anyway
+// and a branch, out of line, so that a block file's read runs the code it ran
+// before the form and pays that branch alone. Each arm honours the file's
+// being out of service first (`Out`), as the block form's paths do before
+// anything else, since a check that failed on one page takes the whole file
+// out of service and a read of another page of it is the raw form's from then
+// on; a page whose check fails takes the file out of service, and the read
+// that met it answers `Fallback` with nothing handed over, so that the raw
+// form answers it whole. A value is handed to the caller after every page of
+// its slot has passed. A key the codec does not render, or one outside the
+// run, is absent: the build proved every key of the partition the rendering
+// of its rank, and the attach the two ends, so absence is a fact of the run
+// and never a check that failed.
+//
+// The reads count where a block file's served read counts (the dispatch's
+// form-read counters, `zreads` and the rest) and never as a decode or a group
+// opened, since none is made: a stride file's heat and its census by form are
+// not counted here.
+
+impl ZFile {
+    /// Whether this is a stride file (`ZFile::stride`): the one way a
+    /// caller asks which body a form file holds, with `kind`.
+    pub(super) fn is_stride(&self) -> bool {
+        self.stride.is_some()
+    }
+
+    /// The body and coding this form file holds, as its attach read it: the
+    /// stride body, or the block body whose sampled groups are record-coded
+    /// (`ZFile::coded`, the coding the selector's raw-tail pick names) or
+    /// not. A record coding with compressed tails, which only
+    /// `Options::zpages_record_coding` makes, reads as `RawTails` here, as
+    /// `coded` has it: the attach reads the record flag and not the tails.
+    pub(super) fn kind(&self) -> FileCoding {
+        if self.stride.is_some() {
+            FileCoding::Stride
+        } else if self.coded {
+            FileCoding::RawTails
+        } else {
+            FileCoding::Block
+        }
+    }
+
+    /// The mapping whole, which a stride file's value pages are read from
+    /// at their offsets.
+    fn stride_bytes(&self) -> &[u8] {
+        &self.map.0
+    }
+
+    /// Value page `p` of a stride file, checked against its word of the row
+    /// (`StrideBody::page_ok`) where this process has not verified it --
+    /// the check counted on the reading handle's memo, the page marked
+    /// verified where it passes, the page and the file out of service where
+    /// it fails. Whether the page may be read.
+    fn stride_page(&self, body: &StrideBody, memo: &ZMemo, p: u32) -> bool {
+        let i = p as usize;
+        if bit(&self.verified, i) {
+            return true;
+        }
+        memo.count_stride_check();
+        if body.page_ok(self.stride_bytes(), p) {
+            set_bit(&self.verified, i);
+            true
+        } else {
+            self.fail(i);
+            false
+        }
+    }
+
+    /// `read_all` of a stride file: the key's one value, its slot's pages
+    /// checked first, or none for a key that is not the run's.
+    #[inline(never)]
+    fn stride_read_all<F: FnMut(&[u8])>(
+        &self,
+        body: &StrideBody,
+        memo: &ZMemo,
+        key: &[u8],
+        f: &mut F,
+    ) -> ZRead {
+        if self.damaged() {
+            return ZRead::Out;
+        }
+        let file = self.stride_bytes();
+        // A page that fails was taken out of service by its check.
+        match body.read_all(
+            file,
+            key,
+            &mut |p| self.stride_page(body, memo, p),
+            &mut |v| f(v),
+        ) {
+            StrideRead::Served(n) => ZRead::Served { n, decoded: false },
+            StrideRead::Bad(_) => ZRead::Fallback,
+        }
+    }
+
+    /// `count` of a stride file: one for a key of the run, none for any
+    /// other, from the key alone; no page is touched.
+    #[inline(never)]
+    fn stride_count(&self, body: &StrideBody, key: &[u8]) -> ZRead {
+        if self.damaged() {
+            return ZRead::Out;
+        }
+        ZRead::Served {
+            n: u64::from(body.rank_of(key).is_some()),
+            decoded: false,
+        }
+    }
+
+    /// `scan_at` of a stride file: from rank `from`, at most `limit` ranks
+    /// and never past the run, each key rendered once and stepped in place
+    /// (`KeyCodec::increment`) and each value's pages checked as the walk
+    /// reaches them. A page that fails ends the walk where it stands with
+    /// `ScanEnd::Fallback` and the ranks handed over in `seen`, for the raw
+    /// form to walk the rest from there. Under `Options::zpages_scan_prefetch`
+    /// the pages the walk will cross after its first are asked for at once
+    /// (`ZFile::stride_ask_ahead`), the block walk's rule.
+    #[inline(never)]
+    fn stride_scan<F: FnMut(&[u8], &[u8])>(
+        &self,
+        body: &StrideBody,
+        memo: &ZMemo,
+        from: usize,
+        limit: usize,
+        f: &mut F,
+    ) -> ZScan {
+        let mut out = ZScan {
+            seen: 0,
+            decoded: 0,
+            inplace: 0,
+            nopage: 0,
+            prefetches: 0,
+            aheads: 0,
+            stepped: 0,
+            absent: 0,
+            from_seek: false,
+            end: ScanEnd::Served,
+        };
+        if self.damaged() {
+            out.end = ScanEnd::Out;
+            return out;
+        }
+        let n = body.keys();
+        let from = from as u64;
+        if from >= n || limit == 0 {
+            return out;
+        }
+        let want = (limit as u64).min(n - from);
+        if self.stride_ask_ahead(body, from, want) {
+            out.prefetches += 1;
+        }
+        let codec = body.codec();
+        let len = codec.key_len();
+        let mut kbuf = [0u8; STRIDE_KEY_MAX];
+        codec.render(codec.base() + from, &mut kbuf);
+        let file = self.stride_bytes();
+        for rank in from..from + want {
+            if rank > from {
+                let stepped = codec.increment(&mut kbuf[..len]);
+                debug_assert!(
+                    stepped,
+                    "a walk inside the run never passes the field's top"
+                );
+            }
+            match body.values_at(file, rank, &mut |p| self.stride_page(body, memo, p)) {
+                StrideAt::Value(v) => f(&kbuf[..len], v),
+                // A page taken out of service by its check; never `Absent`,
+                // every rank of the walk being below the key count.
+                StrideAt::Bad(_) | StrideAt::Absent => {
+                    out.end = ScanEnd::Fallback;
+                    return out;
+                }
+            }
+            out.seen += 1;
+        }
+        out
+    }
+
+    /// The pages a stride walk of `want` ranks from `from` will cross after
+    /// its first, asked for at once, at most `ZPREFETCH_PAGES` of them
+    /// (`Options::zpages_scan_prefetch`, the block walk's `ask_ahead`): the
+    /// slots' span is arithmetic, so the ask is exact. Whether it asked:
+    /// nothing with the option off, or a walk inside one page.
+    fn stride_ask_ahead(&self, body: &StrideBody, from: u64, want: u64) -> bool {
+        if !self.prefetch || want == 0 {
+            return false;
+        }
+        let (w, page) = (body.width() as u64, ZPAGE as u64);
+        let first = from * w / page;
+        let last = ((from + want) * w - 1) / page;
+        let k = (last - first).min(ZPREFETCH_PAGES as u64);
+        if k == 0 {
+            return false;
+        }
+        self.map
+            .advise_willneed((first + 1) * page, (k * page) as usize);
+        true
+    }
+
+    /// `values_at` of a stride file: rank `rank`'s one value after its
+    /// slot's pages, none past the run.
+    #[inline(never)]
+    fn stride_values_at<F: FnMut(&[u8])>(
+        &self,
+        body: &StrideBody,
+        memo: &ZMemo,
+        rank: usize,
+        f: &mut F,
+    ) -> ZRead {
+        if self.damaged() {
+            return ZRead::Out;
+        }
+        let file = self.stride_bytes();
+        match body.values_at(file, rank as u64, &mut |p| self.stride_page(body, memo, p)) {
+            StrideAt::Value(v) => {
+                f(v);
+                ZRead::Served {
+                    n: 1,
+                    decoded: false,
+                }
+            }
+            StrideAt::Absent => ZRead::Served {
+                n: 0,
+                decoded: false,
+            },
+            // Taken out of service by its check.
+            StrideAt::Bad(_) => ZRead::Fallback,
+        }
+    }
+
+    /// `key_at_into` of a stride file: rank `rank`'s key rendered, none past
+    /// the run; no page is touched.
+    #[inline(never)]
+    fn stride_key_at_into(&self, body: &StrideBody, rank: usize, out: &mut Vec<u8>) -> ZRead {
+        if self.damaged() {
+            return ZRead::Out;
+        }
+        let mut kbuf = [0u8; STRIDE_KEY_MAX];
+        match body.key_at_into(rank as u64, &mut kbuf) {
+            Some(k) => {
+                out.clear();
+                out.extend_from_slice(k);
+                ZRead::Served {
+                    n: 1,
+                    decoded: false,
+                }
+            }
+            None => ZRead::Served {
+                n: 0,
+                decoded: false,
+            },
+        }
+    }
+
+    /// `seek` of a stride file: the rank of the first key at or after `key`
+    /// and how it compares, by the codec's arithmetic over the run
+    /// (`KeyCodec::lower_bound`) -- a key the codec renders by its number,
+    /// any other by counting the renderings below it -- with no page touched.
+    /// `cut_in` is written over `seek` and answers through it.
+    #[inline(never)]
+    fn stride_seek(&self, body: &StrideBody, key: &[u8]) -> ZSeek {
+        if self.damaged() {
+            return ZSeek::Out;
+        }
+        let (rank, at) = body.lower_bound(key);
+        ZSeek::Served {
+            rank: rank as usize,
+            at,
+            decoded: false,
+        }
+    }
+
+    /// `owner_span_from` of a stride file, exact where the block form names
+    /// a group: the key's own rank where it is the run's, the rank before
+    /// the first key past it where it is not -- the rank whose block a block
+    /// cache files the key under (`Reader::cache_owner_of`) -- and rank
+    /// zero for a key below the first; one rank in every case, so the
+    /// caller never resolves it again. The hint is the fence's, and a
+    /// stride file has none to step.
+    #[inline(never)]
+    fn stride_owner_span(&self, body: &StrideBody, key: &[u8]) -> Option<(usize, usize)> {
+        if self.damaged() {
+            return None;
+        }
+        let (rank, at) = body.lower_bound(key);
+        let r = rank as usize;
+        Some(if at == KeyOrder::Equal {
+            (r, r + 1)
+        } else if r == 0 {
+            (0, 1)
+        } else {
+            (r - 1, r)
+        })
     }
 }
 
@@ -4955,6 +5600,13 @@ pub(super) struct ZEvents {
     /// Form files the controller retired: taken out of their cells through
     /// the epoch and given dead names for the idle sweep.
     pub retired: AtomicU64,
+    /// Stride files built and counted where a build is (`ZEvents::built`),
+    /// and the builds that asked for the stride form and found the
+    /// partition does not qualify, by reason (`StrideNo::code` less one):
+    /// the block file built in its place under `StrideAsk::OrBlock`, or no
+    /// file under `StrideAsk::Only` (`ZEvents::stride_declined`).
+    pub stride_builds: AtomicU64,
+    pub stride_declines: [AtomicU64; STRIDE_REASONS],
 }
 
 impl ZEvents {
@@ -5010,6 +5662,18 @@ impl ZEvents {
         ZEvents::add(&self.build_cpu_us, b.cpu_us);
         ZEvents::add(&self.build_majflt, b.majflt);
         ZEvents::add(&self.build_synced, u64::from(b.sync_us > 0));
+        if b.coding == FileCoding::Stride {
+            ZEvents::add(&self.stride_builds, 1);
+        }
+        if let Some(why) = b.stride_no {
+            self.stride_declined(why);
+        }
+    }
+
+    /// A build that asked for the stride form and found the partition does
+    /// not qualify, counted by reason.
+    pub(super) fn stride_declined(&self, why: StrideNo) {
+        ZEvents::add(&self.stride_declines[usize::from(why.code() - 1)], 1);
     }
 
     /// A warm, counted.
@@ -5120,6 +5784,14 @@ pub(super) struct Built {
     /// build's, and the reason the segment's for its life
     /// (`Outcome::note_stride`).
     pub stride_no: Option<StrideNo>,
+    /// The CRC word of the trailer of the stride file this build wrote and
+    /// read back, every rank of it, before its name (`check_stride`,
+    /// `zpages::trailer_crc`): what an attach holds the file under the name
+    /// to before it trusts its pages (`StrideAttach::Trust`). The trailer
+    /// carries the row's CRC, so a file whose trailer's word is this one has
+    /// this build's trailer and row, both to a CRC's strength. `None` for a
+    /// block file.
+    pub stride_seal: Option<u32>,
 }
 
 /// What a form file a build wrote holds: the block body in one of the
@@ -5187,6 +5859,10 @@ pub(super) enum StrideNo {
     /// a reader serves it by (`check_stride`).
     SelfCheck,
 }
+
+/// The reasons a partition is not held in the stride form, `StrideNo::code`
+/// running from one to this.
+pub(super) const STRIDE_REASONS: usize = 8;
 
 impl StrideNo {
     /// The code `Seg::z_stride_no` keeps; zero is none.
@@ -6024,6 +6700,7 @@ fn write_pages(
             FileCoding::Block
         },
         stride_no: None,
+        stride_seal: None,
     }))
 }
 
@@ -6329,10 +7006,10 @@ fn write_stride(
         res_crc,
         seg: seg_ident_of(facts, id, end_seq),
     };
-    w.push(
-        &t.encode()
-            .map_err(|e| super::err(&format!("z build: the stride trailer: {e}")))?,
-    )?;
+    let sealed = t
+        .encode()
+        .map_err(|e| super::err(&format!("z build: the stride trailer: {e}")))?;
+    w.push(&sealed)?;
     w.flush()?;
     let file_bytes = w.at;
     debug_assert_eq!(file_bytes, lay.file_len, "the file is the layout's");
@@ -6386,6 +7063,7 @@ fn write_stride(
         sync_us: 0,
         coding: FileCoding::Stride,
         stride_no: None,
+        stride_seal: trailer_crc(&sealed),
     }))
 }
 
@@ -6458,9 +7136,9 @@ fn check_stride(
 /// row in the heap, a word a value page. The one reader of the body: the
 /// build reads every rank of a file back through it before the file has a
 /// name (`check_stride`), and a form file that holds one serves its reads
-/// by it. The point read by key (`StrideBody::read_all`) is that serving's
-/// alone, compiled for the tests until a form file holds a body: the
-/// read-back holds the two quantities it is made of, not their composition.
+/// by it (`ZFile::stride`). The point read by key (`StrideBody::read_all`)
+/// is that serving's alone: the read-back holds the two quantities it is
+/// made of, not their composition.
 pub(super) struct StrideBody {
     trailer: StrideTrailer,
     layout: StrideLayout,
@@ -6481,7 +7159,6 @@ pub(super) enum StrideAt<'f> {
 
 /// What a stride body answers of a key's read: the values handed over, one
 /// or none, or the page that failed its check before any was.
-#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum StrideRead {
     Served(u64),
@@ -6490,13 +7167,21 @@ pub(super) enum StrideRead {
 
 impl StrideBody {
     /// The body of the stride form whose file's bytes these are, after the
-    /// checks that need nothing else: a length of whole pages, the trailer
-    /// (`StrideTrailer::decode`), the file the length its sizes say, the
-    /// row's CRC and the zeros after the row. Not the segment's identity,
-    /// which is the live segment's to hold the trailer to (`same_segment`),
-    /// and no value page, each of which is checked against the row where a
-    /// read first touches it (`StrideBody::page_ok`).
+    /// checks that need nothing else: `open`'s, then `with_row`'s. Not the
+    /// segment's identity, which is the live segment's to hold the trailer
+    /// to (`same_segment`), and no value page, each of which is checked
+    /// against the row where a read first touches it (`StrideBody::page_ok`).
     pub(super) fn from_bytes(file: &[u8]) -> std::result::Result<StrideBody, ZError> {
+        let (trailer, layout) = StrideBody::open(file)?;
+        StrideBody::with_row(file, trailer, layout)
+    }
+
+    /// The trailer of the stride form whose file's bytes these are and its
+    /// sizes: a length of whole pages, the trailer (`StrideTrailer::decode`),
+    /// and the file the length its sizes say. Nothing of the row, which an
+    /// attach reads only once the trailer names the live segment, since a
+    /// row is checked under the hash of the segment its trailer names.
+    pub(super) fn open(file: &[u8]) -> std::result::Result<(StrideTrailer, StrideLayout), ZError> {
         let len = file.len();
         if len < ZTRAILER || !len.is_multiple_of(ZPAGE) {
             return Err(ZError::Length);
@@ -6506,6 +7191,17 @@ impl StrideBody {
         if layout.file_len != len as u64 {
             return Err(ZError::Length);
         }
+        Ok((trailer, layout))
+    }
+
+    /// The body over `file`, whose trailer and sizes `open` gave: the row's
+    /// CRC and the zeros after the row, and the row copied into the heap, a
+    /// word a value page.
+    pub(super) fn with_row(
+        file: &[u8],
+        trailer: StrideTrailer,
+        layout: StrideLayout,
+    ) -> std::result::Result<StrideBody, ZError> {
         let bind = trailer.bind32();
         // Inside a file of the layout's length: the row and its padding lie
         // before the trailer.
@@ -6547,6 +7243,50 @@ impl StrideBody {
         self.layout.v_pages as usize
     }
 
+    /// The values' bytes, `n * W`: what the file holds of the records, the
+    /// stride form's counterpart of the block form's decoded group bytes.
+    pub(super) fn value_bytes(&self) -> u64 {
+        self.keys() * u64::from(self.trailer.w)
+    }
+
+    /// The heap a reader holds of the body: the row, a word a value page,
+    /// and the body itself, the trailer among it.
+    pub(super) fn heap_bytes(&self) -> usize {
+        self.row.len() * 4 + std::mem::size_of::<StrideBody>()
+    }
+
+    /// The rank whose slot value page `p` holds the start of, or, where no
+    /// slot starts on it -- the last page, its bytes the tail of a slot
+    /// that began on the page before -- the slot its first byte is in: a
+    /// rank whose value reads a byte of the page, for `p` below `V`.
+    pub(super) fn rank_on_page(&self, p: u32) -> u64 {
+        let w = u64::from(self.trailer.w);
+        let at = u64::from(p) * ZPAGE as u64;
+        let first = at.div_ceil(w);
+        if first < self.keys() && first * w < at + ZPAGE as u64 {
+            first
+        } else {
+            at / w
+        }
+    }
+
+    /// Where `key` falls in the run (`KeyCodec::lower_bound`): the rank of
+    /// the first key at or after it and how that key compares, the key
+    /// count with `Greater` past them all.
+    pub(super) fn lower_bound(&self, key: &[u8]) -> (u64, KeyOrder) {
+        self.trailer.codec.lower_bound(key, self.keys())
+    }
+
+    /// The codec the run's keys are rendered by.
+    pub(super) fn codec(&self) -> &KeyCodec {
+        &self.trailer.codec
+    }
+
+    /// Every value's width, `W`.
+    pub(super) fn width(&self) -> usize {
+        self.trailer.w as usize
+    }
+
     /// Whether value page `p` of `file` is the page the row says.
     pub(super) fn page_ok(&self, file: &[u8], p: u32) -> bool {
         let at = p as usize * ZPAGE;
@@ -6560,7 +7300,6 @@ impl StrideBody {
     /// renders, less the run's first, inside the run. Nothing else is: the
     /// build proved every key of the run shaped and the run whole, so a key
     /// this answers `None` for is absent, a fact of the run.
-    #[cfg(test)]
     pub(super) fn rank_of(&self, key: &[u8]) -> Option<u64> {
         let c = &self.trailer.codec;
         let r = c.decode(key)?.checked_sub(c.base())?;
@@ -6610,7 +7349,6 @@ impl StrideBody {
     /// `key`'s value in `file` handed to `f`, after its pages' checks: one
     /// for a key of the run, none for any other, and nothing handed over
     /// where a page failed.
-    #[cfg(test)]
     pub(super) fn read_all(
         &self,
         file: &[u8],
@@ -7756,6 +8494,7 @@ mod tests {
                 false,
                 FenceSearch::Keys,
                 true,
+                &StrideAttach::Check,
             )
         }
 
@@ -7778,6 +8517,7 @@ mod tests {
                 false,
                 FenceSearch::Keys,
                 true,
+                &StrideAttach::Check,
             )
         }
 
@@ -7804,6 +8544,7 @@ mod tests {
                     FenceSearch::Keys
                 },
                 memo_ahead,
+                &StrideAttach::Check,
             )
         }
 
@@ -7825,6 +8566,26 @@ mod tests {
                 false,
                 FenceSearch::Keys,
                 true,
+                &StrideAttach::Check,
+            )
+        }
+
+        /// Attached as the store attaches a file under `stride`
+        /// (`StrideAttach`), the rest as `attach` has it.
+        fn attach_stride(&self, stride: StrideAttach) -> std::result::Result<ZFile, Reject> {
+            ZFile::attach(
+                &self.out,
+                &self.blob,
+                ID,
+                END,
+                false,
+                true,
+                false,
+                true,
+                false,
+                FenceSearch::Keys,
+                true,
+                &stride,
             )
         }
 
@@ -9619,6 +10380,7 @@ mod tests {
             false,
             FenceSearch::Keys,
             true,
+            &StrideAttach::Check,
         )
         .unwrap();
         let d4 = read_all(&off);
@@ -9728,6 +10490,7 @@ mod tests {
                 memo_first,
                 FenceSearch::Keys,
                 true,
+                &StrideAttach::Check,
             )
             .unwrap();
             type Emitted = Vec<(Vec<u8>, Vec<u8>)>;
@@ -9810,7 +10573,8 @@ mod tests {
                 true,
                 false,
                 FenceSearch::Keys,
-                true
+                true,
+                &StrideAttach::Check,
             ),
             Err(Reject::Identity(_))
         ));
@@ -9826,7 +10590,8 @@ mod tests {
                 true,
                 false,
                 FenceSearch::Keys,
-                true
+                true,
+                &StrideAttach::Check,
             ),
             Err(Reject::Identity(_))
         ));
@@ -12169,6 +12934,12 @@ mod tests {
         let codes: std::collections::HashSet<u8> = all.iter().map(|w| w.code()).collect();
         assert_eq!(codes.len(), all.len());
         assert!(!codes.contains(&0));
+        // One to `STRIDE_REASONS`, the slots the decline counts are kept in
+        // (`ZEvents::stride_declines`).
+        assert_eq!(all.len(), STRIDE_REASONS);
+        assert!(codes
+            .iter()
+            .all(|&c| (1..=STRIDE_REASONS as u8).contains(&c)));
     }
 
     /// A block build names the body it wrote by the plan's two quantities
@@ -13138,5 +13909,723 @@ mod tests {
                 "page {bad} of rank {rank}'s two"
             );
         }
+    }
+
+    // ---- the stride form's reader -------------------------------------------
+
+    /// A walk's emits folded, key and value each with its length, so that
+    /// two walks of millions of records compare without holding them.
+    fn fold(h: &mut u64, k: &[u8], v: &[u8]) {
+        for part in [k, v] {
+            *h = h
+                .wrapping_mul(0x100_0000_01b3)
+                .wrapping_add(part.len() as u64)
+                .wrapping_mul(0x100_0000_01b3)
+                .wrapping_add(u64::from(crate::block::crc32(part)));
+        }
+    }
+
+    /// A fixture's stride file, built under `StrideAsk::OrBlock` as a store
+    /// asks under `ZStride::Forced`, and the build's outcome; the file under
+    /// the fixture's name.
+    fn stride_built(fx: &Fixture) -> Built {
+        let _ = std::fs::remove_file(&fx.out);
+        let made = build(&fx.seg, &fx.out, ID, END, &stride_plan(StrideAsk::OrBlock)).unwrap();
+        match made {
+            Outcome::Built(b) if b.coding == FileCoding::Stride => b,
+            other => panic!("not a stride file: {other:?}"),
+        }
+    }
+
+    /// A partition of numbered keys whose values of one width lie across
+    /// page ends, from a fixture of its own.
+    fn stride_fixture(name: &str, n: usize, w: usize, seed: u64) -> Fixture {
+        Fixture::new(name, stride_recs(n, w, seed), 1 << 16)
+    }
+
+    /// Every read a form file answers, of a stride file, against the
+    /// segment's own reader, the `Blob` the raw form is: the values and the
+    /// key at every rank and past the run; the read, the count, the seek
+    /// and the cut of every key and of keys beside the run's; the owner's
+    /// span, exactly the owner, for every one of them; and the walk from
+    /// every rank at limits of none, one, a block less one, a block, a
+    /// block and one, and the run. Values of one byte, of a hundred that
+    /// straddle pages, of three thousand that leave the last page with no
+    /// slot starting on it, of a page less one and of a page, a run of one,
+    /// and a big-endian field. The widest the builder takes is a page, and
+    /// one wider is a decline (`the_stride_form_declines_each_state_...`).
+    #[test]
+    fn every_read_of_a_stride_file_answers_as_the_segment_does() {
+        let mut rng = Rng(0x5be1);
+        let be: Vec<Rec> = (0..500u64)
+            .map(|i| {
+                let key = [b"be".as_slice(), &(0x0102_0304_0506_0000 + i).to_be_bytes()].concat();
+                (key, vec![rng.bytes(100)], false)
+            })
+            .collect();
+        let cases = [
+            ("w1", stride_recs(5000, 1, 11)),
+            ("w100", stride_recs(3000, 100, 12)),
+            ("w3000", stride_recs(30, 3000, 13)),
+            ("w4095", stride_recs(40, 4095, 14)),
+            ("w4096", stride_recs(40, 4096, 15)),
+            ("one", stride_recs(1, 100, 16)),
+            ("be", be),
+        ];
+        for (name, recs) in cases {
+            let fx = Fixture::new(&format!("stride-api-{name}"), recs, 1 << 16);
+            let built = stride_built(&fx);
+            let zfile = fx.attach().unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let body = zfile.stride.as_deref().expect("a stride body");
+            let n = fx.recs.len();
+            let w = fx.recs[0].1[0].len() as u64;
+            assert!(zfile.is_stride() && !zfile.coded(), "{name}");
+            assert_eq!(zfile.kind(), FileCoding::Stride, "{name}");
+            assert_eq!(zfile.pages(), body.pages(), "{name}");
+            assert_eq!(zfile.group_bytes(), n as u64 * w, "{name}");
+            assert_eq!(zfile.file_bytes(), built.file_bytes, "{name}");
+            assert_eq!(
+                zfile.resident_bytes(),
+                ZFence::new().heap_bytes() + body.heap_bytes(),
+                "{name}: an empty fence and no filter beside the row"
+            );
+            // By rank: the values and the key, and nothing past the run.
+            let mut kbuf = Vec::new();
+            for rank in 0..n + 2 {
+                let mut want = Vec::new();
+                let raw_n = fx.blob.values_at(rank, |v| want.push(v.to_vec())).unwrap();
+                let mut got = Vec::new();
+                let z = zfile
+                    .values_at(&fx.memo, &fx.blob, rank, &mut |v: &[u8]| {
+                        got.push(v.to_vec())
+                    })
+                    .unwrap();
+                assert_eq!(
+                    z,
+                    ZRead::Served {
+                        n: raw_n,
+                        decoded: false
+                    },
+                    "{name}: rank {rank}"
+                );
+                assert_eq!(got, want, "{name}: the values at {rank}");
+                kbuf.clear();
+                let z = zfile.key_at_into(&fx.memo, rank, &mut kbuf);
+                match fx.blob.key_at(rank) {
+                    Some(k) => {
+                        assert_eq!(
+                            z,
+                            ZRead::Served {
+                                n: 1,
+                                decoded: false
+                            },
+                            "{name}: {rank}"
+                        );
+                        assert_eq!(kbuf, k, "{name}: the key at {rank}");
+                    }
+                    None => assert_eq!(
+                        z,
+                        ZRead::Served {
+                            n: 0,
+                            decoded: false
+                        },
+                        "{name}"
+                    ),
+                }
+            }
+            // By key: the run's keys and keys beside them, shaped and not.
+            let codec = body.trailer().codec;
+            let mut keys = probes(&fx.recs);
+            let mut r = [0u8; STRIDE_KEY_MAX];
+            for x in [
+                codec.base().checked_sub(1),
+                codec.base().checked_add(n as u64),
+                codec.base().checked_add(n as u64 + 7),
+                Some(codec.top()),
+                Some(0),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|&x| x <= codec.top())
+            {
+                keys.push(codec.render(x, &mut r).to_vec());
+            }
+            let sorted: Vec<&[u8]> = fx.recs.iter().map(|r| r.0.as_slice()).collect();
+            for key in &keys {
+                let want = raw_values(&fx.blob, key);
+                assert_eq!(
+                    z_values(&fx.memo, &zfile, &fx.blob, key).as_ref(),
+                    Some(&want),
+                    "{name}: read of {key:?}"
+                );
+                assert_eq!(
+                    served(zfile.count(&fx.memo, key)),
+                    fx.blob.count(key).unwrap(),
+                    "{name}: count of {key:?}"
+                );
+                let rank = fx.blob.seek(key);
+                let at = if sorted.binary_search(&key.as_slice()).is_ok() {
+                    KeyOrder::Equal
+                } else {
+                    KeyOrder::Greater
+                };
+                assert_eq!(
+                    zfile.seek(&fx.memo, key),
+                    ZSeek::Served {
+                        rank,
+                        at,
+                        decoded: false
+                    },
+                    "{name}: seek of {key:?}"
+                );
+                let owner = if at == KeyOrder::Equal {
+                    rank
+                } else {
+                    rank.saturating_sub(1)
+                };
+                let mut hint = usize::MAX;
+                assert_eq!(
+                    zfile.owner_span_from(key, &mut hint),
+                    Some((owner, owner + 1)),
+                    "{name}: the owner of {key:?}"
+                );
+                for (lo, hi) in [(0usize, n), (0, 1), (n / 3, 2 * n / 3), (n - 1, n), (n, n)] {
+                    let r = (lo..hi)
+                        .find(|&i| sorted[i] >= key.as_slice())
+                        .unwrap_or(hi);
+                    let a = if r < hi && sorted[r] == key.as_slice() {
+                        KeyOrder::Equal
+                    } else {
+                        KeyOrder::Greater
+                    };
+                    assert_eq!(
+                        zfile.cut_in(&fx.memo, lo, hi, key),
+                        ZSeek::Served {
+                            rank: r,
+                            at: a,
+                            decoded: false
+                        },
+                        "{name}: cut of {key:?} in {lo}..{hi}"
+                    );
+                }
+            }
+            // The walk from every rank, past the end too.
+            for from in 0..=n + 1 {
+                for limit in [0, 1, 63, 64, 65, n] {
+                    let (mut want, mut got) = (0u64, 0u64);
+                    let raw_seen = fx
+                        .blob
+                        .scan_at(from, limit, |k, v| fold(&mut want, k, v))
+                        .unwrap();
+                    let z = zfile
+                        .scan_at(
+                            &fx.memo,
+                            &fx.blob,
+                            from,
+                            limit,
+                            &mut |k: &[u8], v: &[u8]| fold(&mut got, k, v),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        (z.seen, z.end, got),
+                        (raw_seen, ScanEnd::Served, want),
+                        "{name}: a walk of {limit} from {from}"
+                    );
+                    assert_eq!((z.decoded, z.inplace, z.nopage), (0, 0, 0), "{name}");
+                }
+            }
+            assert!(!zfile.damaged() && zfile.bad_pages() == 0, "{name}");
+            assert_eq!(zfile.verified_pages(), body.pages() as u64, "{name}");
+        }
+    }
+
+    /// A stride walk asks for the pages it will cross after its first where
+    /// the scan's prefetch is on, and only then; one that stays inside its
+    /// first page asks nothing.
+    #[test]
+    fn a_stride_walk_asks_for_the_pages_it_will_cross_under_the_scans_prefetch() {
+        let fx = stride_fixture("stride-ahead", 3000, 100, 0x5a);
+        stride_built(&fx);
+        let walk = |prefetch: bool, from: usize, limit: usize| {
+            let z = ZFile::attach(
+                &fx.out,
+                &fx.blob,
+                ID,
+                END,
+                false,
+                true,
+                prefetch,
+                true,
+                false,
+                FenceSearch::Keys,
+                true,
+                &StrideAttach::Check,
+            )
+            .unwrap();
+            z.scan_at(
+                &fx.memo,
+                &fx.blob,
+                from,
+                limit,
+                &mut |_: &[u8], _: &[u8]| {},
+            )
+            .unwrap()
+        };
+        assert_eq!(walk(true, 0, 3000).prefetches, 1);
+        assert_eq!(
+            walk(true, 100, 200).prefetches,
+            1,
+            "a walk across page ends"
+        );
+        assert_eq!(
+            walk(true, 0, 30).prefetches,
+            0,
+            "a walk inside its first page"
+        );
+        assert_eq!(walk(false, 0, 3000).prefetches, 0, "the option off");
+    }
+
+    /// A stride file's value pages are checked against the row at their
+    /// first touch in this process and never again, the check counted on
+    /// the reading memo; a file the attach trusts as the one a build of this
+    /// process wrote and read back is checked nowhere -- every page verified
+    /// from the attach -- and a trailer to trust that is not the file's is
+    /// the file found on disk, checked page by page. The trust's limit, held
+    /// as a test: a page changed in place under the mapping after a trusted
+    /// attach is served as it reads, where the checked attach refuses it.
+    #[test]
+    fn a_stride_files_pages_are_checked_at_first_touch_unless_the_build_is_trusted() {
+        let fx = stride_fixture("stride-trust", 3000, 100, 0x7e);
+        let built = stride_built(&fx);
+        let t = built.stride_seal.expect("the build's trailer's word");
+        let read_every_rank = |z: &ZFile| {
+            for rank in 0..fx.recs.len() {
+                let mut got = Vec::new();
+                let r = z
+                    .values_at(&fx.memo, &fx.blob, rank, &mut |v: &[u8]| {
+                        got.push(v.to_vec())
+                    })
+                    .unwrap();
+                assert_eq!(
+                    r,
+                    ZRead::Served {
+                        n: 1,
+                        decoded: false
+                    },
+                    "rank {rank}"
+                );
+                assert_eq!(got, fx.recs[rank].1, "rank {rank}");
+            }
+            fx.memo.take_point().stride_checks
+        };
+        let _ = fx.memo.take_point();
+        let checked = fx.attach_stride(StrideAttach::Check).unwrap();
+        let pages = checked.pages() as u64;
+        assert!(pages > 16, "{pages} pages");
+        assert_eq!(checked.verified_pages(), 0, "none verified before a read");
+        assert_eq!(read_every_rank(&checked), pages, "each page once");
+        assert_eq!(checked.verified_pages(), pages);
+        assert_eq!(read_every_rank(&checked), 0, "and never again");
+        let trusted = fx.attach_stride(StrideAttach::Trust(t)).unwrap();
+        assert_eq!(trusted.verified_pages(), pages, "verified from the attach");
+        assert_eq!(read_every_rank(&trusted), 0, "nothing checked");
+        let not_it = fx.attach_stride(StrideAttach::Trust(t ^ 1)).unwrap();
+        assert_eq!(
+            not_it.verified_pages(),
+            0,
+            "another trailer is not this file's"
+        );
+        assert_eq!(read_every_rank(&not_it), pages);
+        assert!(matches!(
+            fx.attach_stride(StrideAttach::Refuse),
+            Err(Reject::Identity(_))
+        ));
+        // A value byte of page 1 flipped under the mappings.
+        let rank = (ZPAGE + 50) / 100;
+        {
+            use std::os::unix::fs::FileExt;
+            let f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&fx.out)
+                .unwrap();
+            let mut b = [0u8; 1];
+            f.read_exact_at(&mut b, (ZPAGE + 50) as u64).unwrap();
+            f.write_all_at(&[b[0] ^ 0x40], (ZPAGE + 50) as u64).unwrap();
+        }
+        let trusted = fx.attach_stride(StrideAttach::Trust(t)).unwrap();
+        let mut got = Vec::new();
+        let r = trusted
+            .values_at(&fx.memo, &fx.blob, rank, &mut |v: &[u8]| {
+                got.push(v.to_vec())
+            })
+            .unwrap();
+        assert_eq!(
+            r,
+            ZRead::Served {
+                n: 1,
+                decoded: false
+            }
+        );
+        assert_ne!(got, fx.recs[rank].1, "the trusted file's page as it reads");
+        let checked = fx.attach_stride(StrideAttach::Check).unwrap();
+        let r = checked
+            .values_at(&fx.memo, &fx.blob, rank, &mut |_: &[u8]| panic!("a value"))
+            .unwrap();
+        assert_eq!(r, ZRead::Fallback, "the checked file refuses it");
+    }
+
+    /// Once a value page fails its check the stride file is out of service,
+    /// and every read of it after -- of any page, the intact ones too -- is
+    /// the raw form's: each read method answers `Out` before it reads
+    /// anything. A walk across the page that fails stops where it stands,
+    /// every rank before the page handed over and nothing after.
+    #[test]
+    fn a_stride_file_a_page_check_failed_in_answers_nothing_from_any_page() {
+        let fx = stride_fixture("stride-out", 3000, 100, 0x0b);
+        stride_built(&fx);
+        let bad_page = 3usize;
+        {
+            use std::os::unix::fs::FileExt;
+            let f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&fx.out)
+                .unwrap();
+            let at = (bad_page * ZPAGE + 7) as u64;
+            let mut b = [0u8; 1];
+            f.read_exact_at(&mut b, at).unwrap();
+            f.write_all_at(&[b[0] ^ 1], at).unwrap();
+        }
+        // A walk over the damaged page, from a file attached fresh.
+        let z = fx.attach_stride(StrideAttach::Check).unwrap();
+        let first_bad = bad_page * ZPAGE / 100;
+        let mut got = 0u64;
+        let r = z
+            .scan_at(&fx.memo, &fx.blob, 0, 3000, &mut |k: &[u8], v: &[u8]| {
+                fold(&mut got, k, v)
+            })
+            .unwrap();
+        let mut want = 0u64;
+        fx.blob
+            .scan_at(0, first_bad, |k, v| fold(&mut want, k, v))
+            .unwrap();
+        assert_eq!((r.end, r.seen, got), (ScanEnd::Fallback, first_bad, want));
+        assert!(z.damaged() && z.bad_pages() == 1);
+        // Point reads: the damaged page falls back, and then the intact first
+        // page's ranks are out, by every method.
+        let z = fx.attach_stride(StrideAttach::Check).unwrap();
+        let on_bad = &fx.recs[first_bad + 1].0;
+        let r = z
+            .read_all(&fx.memo, &fx.blob, on_bad, &mut |_: &[u8]| {
+                panic!("a value")
+            })
+            .unwrap();
+        assert_eq!(r, ZRead::Fallback);
+        assert!(z.damaged() && z.bad_pages() == 1);
+        let intact = &fx.recs[1].0;
+        let none = &mut |_: &[u8]| panic!("a value from a file out of service");
+        assert_eq!(
+            z.read_all(&fx.memo, &fx.blob, intact, none).unwrap(),
+            ZRead::Out
+        );
+        assert_eq!(z.count(&fx.memo, intact), ZRead::Out);
+        assert_eq!(
+            z.values_at(&fx.memo, &fx.blob, 1, none).unwrap(),
+            ZRead::Out
+        );
+        let mut k = Vec::new();
+        assert_eq!(z.key_at_into(&fx.memo, 1, &mut k), ZRead::Out);
+        assert_eq!(z.seek(&fx.memo, intact), ZSeek::Out);
+        assert_eq!(z.cut_in(&fx.memo, 0, 10, intact), ZSeek::Out);
+        let mut hint = usize::MAX;
+        assert_eq!(z.owner_span_from(intact, &mut hint), None);
+        let walk = z
+            .scan_at(&fx.memo, &fx.blob, 0, 10, &mut |_: &[u8], _: &[u8]| {
+                panic!("a record from a file out of service")
+            })
+            .unwrap();
+        assert_eq!((walk.end, walk.seen), (ScanEnd::Out, 0));
+    }
+
+    /// Every byte of a stride file's value pages, its row's page and its
+    /// trailer flipped, one at a time, under a fresh attach: the attach
+    /// refuses the file, as damage, where the flip is in a page it samples
+    /// or in the row or the trailer; elsewhere every read of the page's
+    /// ranks answers the raw form's value or falls back, never another
+    /// value and never absence, the slot that straddles the page's end among
+    /// them, and a fallback takes the file out of service.
+    #[test]
+    fn every_byte_of_a_stride_file_flipped_is_never_an_answer() {
+        let fx = stride_fixture("stride-flips", 820, 100, 0xf1);
+        stride_built(&fx);
+        let good = std::fs::read(&fx.out).unwrap();
+        let body = StrideBody::from_bytes(&good).unwrap();
+        let v = body.pages();
+        assert!(v > ZSAMPLE_PAGES, "{v} pages, some of them unsampled");
+        // The pages the attach reads: each sampled page, and the page beside
+        // it that the slot it checks there spans (`StrideBody::rank_on_page`).
+        let w = 100usize;
+        let mut sampled: Vec<usize> = Vec::new();
+        for k in 0..ZSAMPLE_PAGES {
+            let p = k * (v - 1) / (ZSAMPLE_PAGES - 1);
+            let r = body.rank_on_page(p as u32) as usize;
+            sampled.extend([r * w / ZPAGE, (r * w + w - 1) / ZPAGE]);
+        }
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fx.out)
+            .unwrap();
+        use std::os::unix::fs::FileExt;
+        let (mut refused, mut fell, mut straddled) = (0usize, 0usize, 0usize);
+        for (at, &byte) in good.iter().enumerate() {
+            f.write_all_at(&[byte ^ 0x5a], at as u64).unwrap();
+            let p = at / ZPAGE;
+            match fx.attach() {
+                Err(Reject::Damage(_)) => {
+                    assert!(
+                        p >= v || sampled.contains(&p),
+                        "byte {at}: refused, page {p}"
+                    );
+                    refused += 1;
+                }
+                Err(e) => panic!("byte {at}: {e:?}"),
+                Ok(z) => {
+                    assert!(
+                        p < v && !sampled.contains(&p),
+                        "byte {at}: page {p} attached"
+                    );
+                    // The ranks whose slots touch the page.
+                    let lo = p * ZPAGE / w;
+                    let hi = (((p + 1) * ZPAGE).div_ceil(w)).min(fx.recs.len());
+                    let mut failed = false;
+                    for rank in lo..hi {
+                        let mut got = Vec::new();
+                        let r = z
+                            .values_at(&fx.memo, &fx.blob, rank, &mut |x: &[u8]| {
+                                got.push(x.to_vec())
+                            })
+                            .unwrap();
+                        match r {
+                            ZRead::Served { n: 1, .. } => {
+                                assert_eq!(got, fx.recs[rank].1, "byte {at}: rank {rank}")
+                            }
+                            ZRead::Fallback | ZRead::Out => {
+                                assert!(got.is_empty());
+                                failed = true;
+                                if rank * w / ZPAGE != (rank * w + w - 1) / ZPAGE {
+                                    straddled += 1;
+                                }
+                            }
+                            other => panic!("byte {at}: rank {rank}: {other:?}"),
+                        }
+                    }
+                    // A flip in the padding past the last value is in no
+                    // slot: no read sees it.
+                    let in_slot = at < fx.recs.len() * w;
+                    assert_eq!(
+                        failed, in_slot,
+                        "byte {at}: a fallback where the flip is read"
+                    );
+                    assert_eq!(z.damaged(), in_slot, "byte {at}");
+                    fell += usize::from(in_slot);
+                }
+            }
+            f.write_all_at(&[byte], at as u64).unwrap();
+        }
+        assert!(
+            refused > 0 && fell > 0 && straddled > 0,
+            "{refused} {fell} {straddled}"
+        );
+        assert!(fx.attach().is_ok(), "the file restored attaches");
+    }
+
+    /// The attach's checks behind the checksums, each held to firing by a
+    /// file forged with good CRCs, and the identity's: a sampled page's slot
+    /// not the segment's value is an identity refusal; a first number off by
+    /// one, its row and trailer whole, is one at the first key; a page no
+    /// attach samples, forged so, is served as it reads, which is the
+    /// sample's limit; and a stride file of another segment -- another name
+    /// in its trailer, or the same name over other records, as a segment id
+    /// handed out again after a crash -- is refused.
+    #[test]
+    fn a_stride_file_forged_under_good_checksums_is_refused_where_the_attach_looks() {
+        let fx = stride_fixture("stride-forge", 3000, 100, 0xf0);
+        stride_built(&fx);
+        let good = std::fs::read(&fx.out).unwrap();
+        let v = StrideBody::from_bytes(&good).unwrap().pages();
+        let sampled: Vec<usize> = (0..ZSAMPLE_PAGES)
+            .map(|k| k * (v - 1) / (ZSAMPLE_PAGES - 1))
+            .collect();
+        let identity = |what: &str| match fx.attach() {
+            Err(Reject::Identity(why)) => why,
+            Err(other) => panic!("{what}: {other:?}"),
+            Ok(_) => panic!("{what}: attached"),
+        };
+        // A sampled page's slot forged.
+        let p = sampled[3];
+        let b = StrideBody::from_bytes(&good).unwrap();
+        let rank = b.rank_on_page(p as u32) as usize;
+        forge_stride(&fx.out, Some(p as u32), |bytes, _, _| {
+            bytes[rank * 100 + 1] ^= 1
+        });
+        let why = identity("a sampled page forged");
+        assert!(why.contains("value at its rank"), "{why}");
+        std::fs::write(&fx.out, &good).unwrap();
+        // The first number off by one.
+        forge_stride(&fx.out, None, |_, t, _| {
+            let c = t.codec;
+            t.codec = KeyCodec::new(c.kind(), c.prefix(), c.d(), c.base() + 1).unwrap();
+        });
+        let why = identity("the first number");
+        assert!(why.contains("first key"), "{why}");
+        std::fs::write(&fx.out, &good).unwrap();
+        // A page no attach samples, forged: served as it reads.
+        let p = (1..v).find(|p| !sampled.contains(p)).unwrap();
+        let rank = p * ZPAGE / 100 + 1;
+        assert_eq!(rank * 100 / ZPAGE, p, "a slot inside the page");
+        forge_stride(&fx.out, Some(p as u32), |bytes, _, _| {
+            bytes[rank * 100 + 2] ^= 1
+        });
+        let z = fx.attach().expect("an unsampled forged page attaches");
+        let mut got = Vec::new();
+        let r = z
+            .values_at(&fx.memo, &fx.blob, rank, &mut |x: &[u8]| {
+                got.push(x.to_vec())
+            })
+            .unwrap();
+        assert_eq!(
+            r,
+            ZRead::Served {
+                n: 1,
+                decoded: false
+            }
+        );
+        assert_ne!(got, fx.recs[rank].1, "served as forged: the sample's limit");
+        std::fs::write(&fx.out, &good).unwrap();
+        assert!(fx.attach().is_ok());
+        // Another segment's file under this name: another id in its trailer,
+        // and this id over other records.
+        let _ = std::fs::remove_file(&fx.out);
+        build(&fx.seg, &fx.out, ID + 1, END, &stride_plan(StrideAsk::Only)).unwrap();
+        let why = identity("another name");
+        assert!(why.contains("another segment"), "{why}");
+        let other = stride_fixture("stride-forge-other", 2000, 100, 0xf2);
+        stride_built(&other);
+        std::fs::copy(&other.out, &fx.out).unwrap();
+        let why = identity("this name over other records");
+        assert!(why.contains("differs"), "{why}");
+        std::fs::write(&fx.out, &good).unwrap();
+        assert!(fx.attach().is_ok());
+        // A segment of the same count, ends and values, whose key at a
+        // sampled rank is not the rendering of its number -- a key between
+        // its neighbours that the build's walk would decline -- and this
+        // file under its name, its trailer naming that segment and its row
+        // bound to it: every checksum good, the ends the segment's, and the
+        // sampled slot's value the segment's, so its key is what refuses.
+        let p = sampled[3];
+        let rank = b.rank_on_page(p as u32) as usize;
+        let mut recs = fx.recs.clone();
+        recs[rank].0 = [recs[rank - 1].0.as_slice(), b"x"].concat();
+        let odd = Fixture::new("stride-forge-key", recs, 1 << 16);
+        let facts = odd.blob.z_source_facts().unwrap();
+        let mut bytes = good.clone();
+        let len = bytes.len();
+        let mut t = StrideTrailer::decode(&bytes[len - ZTRAILER..]).unwrap();
+        let lay = t.layout().unwrap();
+        t.seg = seg_ident_of(&facts, ID, END);
+        let bind = t.bind32();
+        let res = lay.res_off as usize;
+        for q in 0..lay.v_pages as usize {
+            let word = stride_page_crc(&bytes[q * ZPAGE..(q + 1) * ZPAGE], bind, q as u32);
+            bytes[res + 4 * q..res + 4 * q + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        t.res_crc = stride_row_crc(&bytes[res..res + lay.res_len as usize], bind);
+        bytes[len - ZTRAILER..].copy_from_slice(&t.encode().unwrap());
+        std::fs::write(&odd.out, &bytes).unwrap();
+        match odd.attach() {
+            Err(Reject::Identity(why)) => {
+                assert!(why.contains("key at its rank"), "{why}")
+            }
+            Err(e) => panic!("a sampled slot's key: {e:?}"),
+            Ok(_) => panic!("a sampled slot's key: attached"),
+        }
+    }
+
+    /// The stride form's seek is the binary search of its keys under the
+    /// engine's key order (`key_cmp`), for keys of every shape about runs
+    /// of either kind: the run's own, its neighbours, keys a byte shorter
+    /// and longer, a non-digit at each place, the empty key and keys of
+    /// 0xff -- the arithmetic held to the search it stands for.
+    #[test]
+    fn a_stride_seek_is_the_binary_search_of_its_keys() {
+        use crate::db::key_cmp;
+        use crate::db::zpages::KeyKind;
+        let mut rng = Rng(0x5e);
+        let runs: Vec<(KeyCodec, u64)> = vec![
+            (KeyCodec::new(KeyKind::Decimal, b"k", 6, 0).unwrap(), 3000),
+            (KeyCodec::new(KeyKind::Decimal, b"k0", 5, 997).unwrap(), 41),
+            (KeyCodec::new(KeyKind::Decimal, b"", 3, 950).unwrap(), 50),
+            (
+                KeyCodec::new(KeyKind::BigEndian, b"be", 2, 0xfe00).unwrap(),
+                512,
+            ),
+            (KeyCodec::new(KeyKind::BigEndian, b"", 1, 7).unwrap(), 9),
+        ];
+        for (codec, n) in runs {
+            let mut buf = [0u8; STRIDE_KEY_MAX];
+            let keys: Vec<Vec<u8>> = (0..n)
+                .map(|r| codec.render(codec.base() + r, &mut buf).to_vec())
+                .collect();
+            let mut probes: Vec<Vec<u8>> = vec![Vec::new(), vec![0xff; 12], vec![0], b"k".to_vec()];
+            for k in keys
+                .iter()
+                .step_by(((n / 40) as usize).max(1))
+                .chain(keys.last())
+            {
+                probes.extend(around_key(k));
+                for i in 0..k.len() {
+                    for b in [b'/', b':', 0, 0xff] {
+                        let mut x = k.clone();
+                        x[i] = b;
+                        probes.push(x);
+                    }
+                }
+            }
+            for _ in 0..200 {
+                let len = rng.below(10);
+                probes.push(rng.bytes(len));
+            }
+            for p in &probes {
+                let want = keys.partition_point(|k| key_cmp(k, p) == KeyOrder::Less);
+                let at = if keys.get(want).is_some_and(|k| k == p) {
+                    KeyOrder::Equal
+                } else {
+                    KeyOrder::Greater
+                };
+                assert_eq!(
+                    codec.lower_bound(p, n),
+                    (want as u64, at),
+                    "{codec:?} over {n}: {p:?}"
+                );
+            }
+        }
+    }
+
+    /// Keys around `k`: it, a byte either side of its last, a proper prefix
+    /// of it, and two keys that extend it.
+    fn around_key(k: &[u8]) -> Vec<Vec<u8>> {
+        let mut v = vec![
+            k.to_vec(),
+            [k, &[0u8][..]].concat(),
+            [k, &[0xffu8][..]].concat(),
+        ];
+        if let Some((&last, head)) = k.split_last() {
+            v.push(head.to_vec());
+            v.push([head, &[last.wrapping_sub(1)][..]].concat());
+            v.push([head, &[last.wrapping_add(1)][..]].concat());
+        }
+        v
     }
 }
