@@ -14380,12 +14380,16 @@ fn keys_on_page(p: usize, keys: &[Vec<u8>]) -> Vec<Vec<u8>> {
 /// whole and in order, so that every partition starts as a run the form
 /// holds; then a third of the range put only (each put a delete and an
 /// append, of one width), a fourth given second values, and the rest
-/// deleted or put -- seals, merges, flushes that promote, and crashes
-/// between, so that partitions of all three are rewritten and declined and
-/// given the stride form again in one store. A fallback, a refused file, a
-/// failed build, a file out of service and a page that failed are each a
-/// failure of the form, over every instance of the store; and the stride
-/// form was built, served reads, and was declined.
+/// deleted or put -- seals, merges, flushes and crashes between, so that
+/// partitions of all three are rewritten and declined and given the stride
+/// form again in one store. Every write after the load is inside the range
+/// it filled, so nothing promotes past the load's own flush: a promotion
+/// while stride files stand is a test of its own
+/// (`a_promotion_keeps_the_stride_file_of_the_partition_it_closes`). A
+/// fallback, a refused file, a failed build, a file out of service and a
+/// page that failed are each a failure of the form, over every instance of
+/// the store; and the stride form was built, served reads, and was
+/// declined.
 #[test]
 fn the_oracle_holds_with_the_stride_form_forced() {
     const N: usize = 2400;
@@ -14528,10 +14532,11 @@ fn the_oracle_holds_with_the_stride_form_forced() {
     );
     // Declines by reason, in `ZCounts::stride_declines`' order: the second
     // values' partitions for a record not one value, the deletes' for the
-    // numbers they took out of the run -- holes, or a promoted piece's
-    // tombstone flags where a promotion kept one -- and none for a width,
-    // a block, the floor or a read-back, which no partition of this store
-    // can give: one width of inline values, a floor of nothing, no damage.
+    // numbers they took out of the run -- holes, since a merge drops the
+    // flags a promotion would have kept and nothing promotes here past the
+    // load -- and none for a width, a block, the floor or a read-back, which
+    // no partition of this store can give: one width of inline values, a
+    // floor of nothing, no damage.
     let [_, holes, not_one, width, tomb, block, small, check_no] = sum.stride_declines;
     assert!(
         not_one > 0 && holes + tomb > 0,
@@ -14648,6 +14653,154 @@ fn a_stride_file_built_here_is_trusted_and_one_found_on_disk_is_checked_page_by_
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// A promotion while stride files stand: a run appended above the store's
+/// greatest key and flushed is a piece the flush promotes by link -- the
+/// last partition closed at the piece's first key and opened again under
+/// its new name with an empty cell, the piece made a partition of its own.
+/// A promotion keeps the two fields a form file is named by, so the closed
+/// partition's stride file is the one under its name, attached as a file
+/// found on disk: the same inode, and its pages checked at their first
+/// touch where every file this process built is trusted. The one build is
+/// the new partition's; every other file stands as it stood. Every
+/// partition a stride file, none refused, and the reads through the
+/// writer, a handle and a reopen the model's. The oracle's store writes
+/// inside its range and never promotes after its load
+/// (`the_oracle_holds_with_the_stride_form_forced`); this is the state it
+/// cannot reach.
+#[cfg(unix)]
+#[test]
+fn a_promotion_keeps_the_stride_file_of_the_partition_it_closes() {
+    use std::os::unix::fs::MetadataExt;
+    const N: usize = 3000;
+    const MORE: usize = 600;
+    let dir = scratch("stride-promote");
+    let opts = || stride_forced(|o| o.partition_bytes = Some(64 << 10));
+    let inodes = || -> BTreeMap<PathBuf, u64> {
+        form_files(&dir)
+            .into_iter()
+            .map(|f| {
+                let ino = std::fs::metadata(&f).unwrap().ino();
+                (f, ino)
+            })
+            .collect()
+    };
+    let mut db = Db::create(&dir, opts()).unwrap();
+    let mut model = numbered_load(&mut db, N, 100, 0x9A0E);
+    db.zpages_settle().unwrap();
+    let loaded = db.zpage_counts();
+    assert!(
+        loaded.partitions > 1 && loaded.stride_files == loaded.partitions,
+        "every partition of the load a stride file: {loaded:?}"
+    );
+    let keys: Vec<Vec<u8>> = (0..N + MORE + 20).map(numbered_key).collect();
+    check(&db, &model, &keys, "loaded");
+    assert_eq!(
+        db.zpage_counts().stride_page_checks,
+        0,
+        "the load's files are this process's builds, trusted"
+    );
+    let before = inodes();
+    // The last partition's file, the one the promotion will close: the
+    // file whose run starts at the greatest key, and its value pages.
+    let closed_pages = before
+        .keys()
+        .map(|f| {
+            let (t, v) = stride_of(f);
+            let mut buf = [0u8; supdb::db::zpages::STRIDE_KEY_MAX];
+            (t.codec.render(t.codec.base(), &mut buf).to_vec(), v as u64)
+        })
+        .max()
+        .map(|(_, v)| v)
+        .unwrap();
+    let (promoted, builds) = (db.promotions().0, loaded.stride_builds);
+    // The run above the greatest key, one width: a run the form holds.
+    let mut rng = Rng(0x9A0F);
+    for chunk in (N..N + MORE).collect::<Vec<_>>().chunks(200) {
+        for &i in chunk {
+            let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
+            let k = numbered_key(i);
+            db.append(&k, &v);
+            model.insert(k, vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    db.zpages_settle().unwrap();
+    let pieces = db.promotions().0 - promoted;
+    let c = db.zpage_counts();
+    assert!(pieces > 0, "the flush promoted its piece: {c:?}");
+    assert_eq!(
+        (c.partitions, c.stride_files, c.form_files),
+        (
+            loaded.partitions + pieces,
+            loaded.partitions + pieces,
+            loaded.partitions + pieces
+        ),
+        "a partition for each piece, every one a stride file: {c:?}"
+    );
+    assert_eq!(
+        (c.rejected_damage, c.rejected_identity, c.build_failed),
+        (0, 0, 0),
+        "{c:?}"
+    );
+    assert_eq!(
+        c.stride_builds - builds,
+        pieces,
+        "the new partitions' builds and no other: {c:?}"
+    );
+    let after = inodes();
+    for (f, ino) in &before {
+        assert_eq!(
+            after.get(f),
+            Some(ino),
+            "{f:?}: the file a promotion keeps the name of stands as it stood"
+        );
+    }
+    assert_eq!(after.len(), before.len() + pieces as usize, "{after:?}");
+    // The reads after the promotion: the closed partition's file attached
+    // as found, so every page its keys' reads touch is checked, once; the
+    // new partition's is this process's build, trusted, as the rest are.
+    check(&db, &model, &keys, "promoted, writer");
+    let c = db.zpage_counts();
+    assert_eq!(
+        c.stride_page_checks, closed_pages,
+        "the closed partition's pages checked, and nobody else's: {c:?}"
+    );
+    assert_eq!((c.fallbacks, c.damaged, c.bad_pages), (0, 0, 0), "{c:?}");
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, "promoted, handle");
+    check_scan(&r, &model, "promoted, handle");
+    drop(r);
+    check_scan(&db, &model, "promoted, writer");
+    let reads = db.zpage_counts().stride_reads;
+    assert!(reads > 0, "the reads were the stride files'");
+    db.close().unwrap();
+    let db = Db::open(&dir, opts()).unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        (
+            c.partitions,
+            c.stride_files,
+            c.rejected_damage,
+            c.rejected_identity
+        ),
+        (loaded.partitions + pieces, loaded.partitions + pieces, 0, 0),
+        "reopened: {c:?}"
+    );
+    check(&db, &model, &keys, "reopened, writer");
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, "reopened, handle");
+    check_scan(&r, &model, "reopened, handle");
+    drop(r);
+    let c = db.zpage_counts();
+    assert!(
+        c.stride_reads > 0 && (c.fallbacks, c.damaged, c.bad_pages) == (0, 0, 0),
+        "{c:?}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Under the controller, a merge's outputs given their form files at their

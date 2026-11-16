@@ -13062,11 +13062,12 @@ struct Slot {
     /// Of `zreads`, the point reads a stride file answered
     /// (`Options::zpages_stride`); the value pages this handle's reads
     /// checked against a stride file's row at their first touch
-    /// (`zfile::PointCounts::stride_checks`), both taken off the memo at
-    /// each dispatch (`Reader::zmemo_take`); and the block cache's and the
-    /// merge path's looks for a form file to read a stride partition through,
-    /// each answered none and the read the raw form's: every look, not every
-    /// walk (`Reader::zc`, `Reader::zcursor_file`).
+    /// (`zfile::StrideCounts`), both taken off the memo at the dispatch
+    /// after the stride arm raised its flag (`Reader::zstride_take`); and
+    /// the block cache's and the merge path's looks for a form file to read
+    /// a stride partition through, each answered none and the read the raw
+    /// form's: every look, not every walk (`Reader::zc`,
+    /// `Reader::zcursor_file`).
     zstridereads: AtomicU64,
     zstridechecks: AtomicU64,
     zstriderefused: AtomicU64,
@@ -23613,6 +23614,14 @@ impl Reader {
         let mut out = Vec::new();
         for seg in self.segs().iter().filter(|s| s.level > 0) {
             if let Some(z) = seg.z.get() {
+                // A stride file reports itself here as a block file with no
+                // decode: not the record coding's (`coded` false, as
+                // `ZFile::coded` answers for it), and no group decoded or
+                // opened, since its reads are counted on the handle's line
+                // (`zstridereads`) and never as a decode. A report, which
+                // the suite prints a mix's heat by and the engine decides
+                // nothing by; the heat and the census by form are a later
+                // step's.
                 out.push(ZHeat {
                     lo: seg.lo.clone(),
                     keys: seg.raw().keys() as u64,
@@ -23948,10 +23957,20 @@ impl Reader {
             self.zbump_by(|s| &s.zkeyhits, p.key_hits);
             self.zbump_by(|s| &s.zowned, p.owned);
         }
-        if p.stride_checks | p.stride_reads != 0 {
-            self.zbump_by(|s| &s.zstridechecks, p.stride_checks);
-            self.zbump_by(|s| &s.zstridereads, p.stride_reads);
+        if self.zmemo.stride_due() {
+            self.zstride_take();
         }
+    }
+
+    /// What a stride file counted on the memo, onto this handle's line: out
+    /// of line, behind the flag the stride arm raises, so the take a block
+    /// file's dispatch makes is the block form's and a byte's look.
+    #[cold]
+    #[inline(never)]
+    fn zstride_take(&self) {
+        let c = self.zmemo.take_stride();
+        self.zbump_by(|s| &s.zstridechecks, c.checks);
+        self.zbump_by(|s| &s.zstridereads, c.reads);
     }
 
     /// `key`'s values in a partition read from its form file
@@ -24299,8 +24318,14 @@ impl Reader {
 
     /// The form file `scan_merged` and the covered walk of `scan_partitions`
     /// walk `seg` through a cursor over: the cell's, while the gate serves
-    /// the form, but no stride file, which a cursor has no position in --
-    /// those walks take the raw form, counted as `zc` counts the cache's.
+    /// the form, but no stride file, which a cursor has no position in. The
+    /// merge path's walk of a stride partition takes the raw form, counted
+    /// as `zc` counts the cache's. The covered walk asks the cell's kind
+    /// before it asks for a cursor, so it never reaches the refusal here: a
+    /// stride partition takes that walk's loop by rank, whose seek, cuts,
+    /// walks and values are the stride arms' (`part_seek_z`, `part_cut_z`,
+    /// `part_scan_z`, `part_values_z`), served from the file and counted
+    /// as they count a block file's.
     fn zcursor_file<'a>(&self, seg: &'a Seg) -> Option<&'a zfile::ZFile> {
         let z = seg.z.get().filter(|_| self.z_on())?;
         if z.is_stride() {
@@ -47400,6 +47425,19 @@ impl Maint {
                         && !self.z_finishing(&s.name)
                         && !self.z_ahead_holds(&s.name)
                 })
+                // A stride file is a served row like a block file's: not
+                // the record coding's, its bytes its file's, and no decode
+                // or open counted, so it adds nothing to the decode's price
+                // below and rates no heat -- never a candidate for a release
+                // (its window under `HOT_RAW_MIN_SAMPLES`), never the raw
+                // partition the way back takes, its bytes counted with the
+                // forms'. Rated, it is one of the partitions the median is
+                // taken over, at nothing. No kind check is needed for an
+                // answer: the release of a stride partition, were one rated
+                // hot, takes it raw as it would a block file's. Under
+                // `ZStride::Forced` beside `ZPages::Auto` that is what the
+                // look sees; the heat and the median by form are a later
+                // step's, with the policy that converts.
                 .filter_map(|s| match s.z.get() {
                     Some(z) if !z.damaged() => Some((
                         s.clone(),

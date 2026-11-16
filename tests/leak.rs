@@ -387,13 +387,13 @@ fn a_zpages_life(name: &str) {
 
 /// A store under the stride form: its partitions' stride files, reopened so
 /// that each is a file found on disk and checked page by page as the reads
-/// touch them; a handle pinned at a snapshot; a value page no attach samples
-/// flipped in place under the mappings, which the reads meet and the settle
-/// takes out of its live cell into the retire list -- the path a merge never
-/// reaches, the form file outliving the segment that held it -- and builds
-/// again. The store closes with the pin held, so nothing sweeps: the
-/// handle's drop frees what the list held, and nothing of the directory
-/// stays mapped after it.
+/// touch them; a handle pinned at a snapshot; a value page flipped in place
+/// under the mappings once the open has attached them, which a read meets
+/// at the page's first touch and the settle takes out of its live cell into
+/// the retire list -- the path a merge never reaches, the form file
+/// outliving the segment that held it -- and builds again. The store closes
+/// with the pin held, so nothing sweeps: the handle's drop frees what the
+/// list held, and nothing of the directory stays mapped after it.
 fn a_stride_life(name: &str) {
     let d = std::env::temp_dir().join(format!("supdb-next-leak-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -455,8 +455,9 @@ fn a_stride_life(name: &str) {
     };
     let pinned = db.reader().unwrap();
     pinned.snapshot();
-    // The largest stride file's second value page, which no attach samples
-    // of a file of more than sixteen.
+    // The largest stride file's second value page. The open attached every
+    // file before this, so what meets the flip is a read's first touch of
+    // the page and never the attach's sample.
     let mut files: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(&d)
         .unwrap()
         .flatten()
