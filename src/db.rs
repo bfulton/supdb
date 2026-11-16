@@ -7605,10 +7605,17 @@ impl ZFinish {
                             .z_finish_coded
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .push((zfile::zpg_name(id, end), plan.raw_tails));
+                            .push((
+                                zfile::zpg_name(id, end),
+                                b.coding == zfile::FileCoding::RawTails,
+                            ));
                     }
                     Ok(zfile::Outcome::Declined(d)) => ev.declined(d),
                     Ok(zfile::Outcome::Cancelled) => zfile::ZEvents::add(&ev.build_cancelled, 1),
+                    // Only a conversion asks for the stride form alone, and
+                    // an output at its finish is no conversion: nothing was
+                    // written, and nothing serves the output yet.
+                    Ok(zfile::Outcome::NotStride(_)) => {}
                     Err(_) => zfile::ZEvents::add(&ev.finish_failed, 1),
                 }
                 z_finish_release(&shared, &label);
@@ -7952,6 +7959,13 @@ struct Seg {
     /// reads to tell a sliver left raw for its size from one that could not
     /// be covered.
     z_declined: std::sync::atomic::AtomicU8,
+    /// Why the stride form does not hold this partition, for the life of
+    /// the segment, as `zfile::StrideNo::code` numbers the reasons, or zero
+    /// (`zfile::Outcome::note_stride`). Never `z_declined`: every code there
+    /// but a refusal's and a failure's stops all builds of the partition,
+    /// and a partition the stride form declines is one the block form
+    /// serves.
+    z_stride_no: std::sync::atomic::AtomicU8,
     /// Reads of the raw form while the hot-raw policy holds this partition
     /// there (`zfile::DECLINED_HOT_RAW`), one in sixteen per thread
     /// (`Seg::hot_read`): the partition's heat, as a form file's opens are
@@ -11476,6 +11490,7 @@ impl Seg {
                 z_spare: zfile::ZCell::new(),
                 hot_reads16: AtomicU64::new(0),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
+                z_stride_no: std::sync::atomic::AtomicU8::new(0),
                 z_rebuilds: std::sync::atomic::AtomicU8::new(0),
                 z_retry: std::sync::Mutex::new(None),
                 z_backoff: AtomicU64::new(0),
@@ -11520,6 +11535,7 @@ impl Seg {
                 z_spare: zfile::ZCell::new(),
                 hot_reads16: AtomicU64::new(0),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
+                z_stride_no: std::sync::atomic::AtomicU8::new(0),
                 z_rebuilds: std::sync::atomic::AtomicU8::new(0),
                 z_retry: std::sync::Mutex::new(None),
                 z_backoff: AtomicU64::new(0),
@@ -11556,6 +11572,7 @@ impl Seg {
             z_spare: zfile::ZCell::new(),
             hot_reads16: AtomicU64::new(0),
             z_declined: std::sync::atomic::AtomicU8::new(0),
+            z_stride_no: std::sync::atomic::AtomicU8::new(0),
             z_rebuilds: std::sync::atomic::AtomicU8::new(0),
             z_retry: std::sync::Mutex::new(None),
             z_backoff: AtomicU64::new(0),
@@ -37819,6 +37836,9 @@ impl Db {
             seg.z_declined.store(why, AtomicOrdering::Relaxed);
             seg.z_schedule_retry(self.opts.zpages_retry_ms);
         };
+        if let Ok(o) = &made {
+            o.note_stride(&seg.z_stride_no);
+        }
         match made {
             Ok(zfile::Outcome::Built(b)) => {
                 match zfile::ZFile::attach(
@@ -37870,6 +37890,10 @@ impl Db {
             }
             // An inline build has no cancel flag; counted all the same.
             Ok(zfile::Outcome::Cancelled) => zfile::ZEvents::add(&ev.build_cancelled, 1),
+            // Only a conversion asks for the stride form alone, and this
+            // build is no conversion, a block file serving nothing here;
+            // the reason is noted above.
+            Ok(zfile::Outcome::NotStride(_)) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 zfile::ZEvents::add(&ev.build_orphaned, 1);
                 seg.z_declined
@@ -50535,6 +50559,7 @@ impl Maint {
                     match other {
                         Ok(zfile::Outcome::Cancelled) => "cancelled",
                         Ok(zfile::Outcome::Declined(_)) => "declined",
+                        Ok(zfile::Outcome::NotStride(_)) => "not stride",
                         Ok(zfile::Outcome::Built(_)) => "built",
                         Err(_) => "failed",
                     },
@@ -50570,6 +50595,9 @@ impl Maint {
             zfile::ZEvents::add(&ev.spare_failed, 1);
             me.z_spare_failed.insert(seg.name.clone());
         };
+        if let Ok(o) = &outcome {
+            o.note_stride(&seg.z_stride_no);
+        }
         match outcome {
             // A spare: attached beside the served file and kept, its pages
             // dropped -- the served one is unchanged, though the build's
@@ -50771,6 +50799,10 @@ impl Maint {
                 }
             }
             Ok(zfile::Outcome::Cancelled) => zfile::ZEvents::add(&ev.build_cancelled, 1),
+            // The answer to a conversion's ask alone (`StrideAsk::Only`):
+            // the reason is noted above, and the form the partition has
+            // serves on.
+            Ok(zfile::Outcome::NotStride(_)) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 zfile::ZEvents::add(&ev.build_orphaned, 1);
                 seg.z_declined

@@ -35,14 +35,17 @@ use super::zpages::{
     coded_key_into, coded_rec, decode_group_more, decode_group_with, decode_record, fill_page,
     filter_bytes, group_seek, open_group_partly_with, page_view, parse_page, record_group_seek,
     seek_group_partly_with, verify_page_with, view_trusted, walk_group, Dec, FenceEntry,
-    FenceSearch, Fill, FillScratch, FillStats, GroupBuf, Images, NoPage, PageView, PartGroup,
-    SegIdent, SegImages, Trailer, ZError, ZFence, PART_STEP, ZCODING_BLOCK, ZGROUP_BYTES,
+    FenceSearch, Fill, FillScratch, FillStats, GroupBuf, Images, KeyCodec, KeyShapeNo, NoPage,
+    PageView, PartGroup, SegIdent, SegImages, StrideLayout, StrideTrailer, Trailer, ZError, ZFence,
+    PART_STEP, STRIDE_KEY_MAX, STRIDE_W_MAX, ZCODING_BLOCK, ZCODING_RECORD, ZGROUP_BYTES,
     ZMAX_GROUPS, ZNOPAGE, ZPAGE, ZTRAILER,
 };
+use super::zpages::{stride_page_crc, stride_row_crc};
 use crate::blob::{Blob, BlobOptions, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
 use crate::flatindex::{
-    compact_fixed_at, parse_record, parse_record_tail, rd_u32, record_key, record_key_next,
+    compact_fixed_at, compact_fixed_tomb_at, parse_record, parse_record_tail, rd_u32, record_key,
+    record_key_next,
 };
 use crate::index::Ext;
 use std::cell::{Cell, RefCell};
@@ -50,7 +53,7 @@ use std::cmp::Ordering as KeyOrder;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Result, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 /// The size floor: a partition whose record region is under this many bytes
@@ -5110,6 +5113,93 @@ pub(super) struct Built {
     /// The file's sync once named, microseconds (`BuildPlan::sync`); zero
     /// where it was not asked for.
     pub sync_us: u64,
+    /// The body and coding the file holds.
+    pub coding: FileCoding,
+    /// Why the stride form is not what was built, where the plan asked for
+    /// it or the block body (`StrideAsk::OrBlock`): the block file is this
+    /// build's, and the reason the segment's for its life
+    /// (`Outcome::note_stride`).
+    pub stride_no: Option<StrideNo>,
+}
+
+/// What a form file a build wrote holds: the block body in one of the
+/// selector's two codings (`zselect::Coding`) -- the compressed coding the
+/// options give, or the record coding's groups with their tails stored raw,
+/// what the segment work's record of the files' codings calls raw-tailed
+/// (`Maint::z_ahead_coding`) -- or the stride body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FileCoding {
+    Block,
+    RawTails,
+    Stride,
+}
+
+/// Whether a build asks for the stride form (`zpages::StrideTrailer`): a
+/// partition whose keys are an exact run of numbers at one width and whose
+/// every record is one inline fixed value, held as its values alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StrideAsk {
+    /// The block body, in the plan's coding.
+    No,
+    /// The stride form or nothing: a conversion of a partition a block file
+    /// serves, which serves on where the partition does not qualify
+    /// (`Outcome::NotStride`), the floor's and the blocks' declines among
+    /// them, since a decline of the block form's would leave a served
+    /// partition marked as one no build may touch.
+    Only,
+    /// The stride form where the partition qualifies, and the block body in
+    /// the same call where it does not, with the reason on what was built
+    /// (`Built::stride_no`); a decline of the block form is the build's
+    /// answer, the partition being one no form file covers.
+    OrBlock,
+}
+
+/// Why a partition is not held in the stride form, which a segment keeps
+/// for its life (`Seg::z_stride_no`, `StrideNo::code`) beside and never in
+/// `Seg::z_declined`: every code there but a refusal's and a failure's
+/// stops all builds of the partition, and a partition the stride form
+/// declines is one the block form serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StrideNo {
+    /// A key is not of the run's shape: the empty key, one longer than a
+    /// stride form takes, keys of two lengths, a byte no field of the
+    /// run's kind holds, a field wider than its kind holds, or no key.
+    NotShaped,
+    /// The run's numbers are not its keys' count: a number missing between
+    /// its ends, or a key out of its place.
+    Holes,
+    /// A record is not one inline value: two or more (appends, a merge's
+    /// concatenation), a record that does not parse.
+    NotOneValue,
+    /// A value's width is not the run's, or not one to a page: two widths,
+    /// or one value of no bytes (a prefixed run).
+    Width,
+    /// A record's run carries the tombstone flag: a promoted piece's, which
+    /// keeps the flags a seal wrote, and one with nothing under it.
+    Tomb,
+    /// A run lies in a block (`Decline::BlockBacked`).
+    BlockBacked,
+    /// The record region is under the floor (`Decline::Small`).
+    Small,
+    /// The file written did not read back as its records through the body
+    /// a reader serves it by (`check_stride`).
+    SelfCheck,
+}
+
+impl StrideNo {
+    /// The code `Seg::z_stride_no` keeps; zero is none.
+    pub(super) fn code(self) -> u8 {
+        match self {
+            StrideNo::NotShaped => 1,
+            StrideNo::Holes => 2,
+            StrideNo::NotOneValue => 3,
+            StrideNo::Width => 4,
+            StrideNo::Tomb => 5,
+            StrideNo::BlockBacked => 6,
+            StrideNo::Small => 7,
+            StrideNo::SelfCheck => 8,
+        }
+    }
 }
 
 /// What a warm of a form file did (`warm_file`).
@@ -5170,6 +5260,30 @@ pub(super) enum Outcome {
     Declined(Decline),
     /// Stopped by its cancel flag; no file left.
     Cancelled,
+    /// A build that asked for the stride form alone (`StrideAsk::Only`)
+    /// found the partition does not qualify, or what it wrote did not read
+    /// back; no file left, and the form the partition has serves on.
+    NotStride(StrideNo),
+}
+
+impl Outcome {
+    /// What this outcome says of the stride form, kept in `cell`
+    /// (`Seg::z_stride_no`): the reason it was not built, where this names
+    /// one, and none where a stride file was. Every other outcome -- a block
+    /// file built where nothing asked for the stride form, a decline, a
+    /// cancel -- leaves the cell as it was, since none of them looked.
+    pub(super) fn note_stride(&self, cell: &AtomicU8) {
+        let code = match self {
+            Outcome::NotStride(why) => why.code(),
+            Outcome::Built(b) => match (b.coding, b.stride_no) {
+                (FileCoding::Stride, _) => 0,
+                (_, Some(why)) => why.code(),
+                (_, None) => return,
+            },
+            Outcome::Declined(_) | Outcome::Cancelled => return,
+        };
+        cell.store(code, Ordering::Relaxed);
+    }
 }
 
 /// Where a build's pieces go: in order, whole, one call a piece, at the
@@ -5468,6 +5582,14 @@ pub(super) struct BuildPlan {
     /// checked page by page at its attach, and one a crash tore is refused
     /// there and built again.
     pub sync: bool,
+    /// Whether the build asks for the stride form, and what it builds
+    /// where the partition does not qualify.
+    pub stride: StrideAsk,
+    /// A test's: the stride form's file damaged once it is written and
+    /// before it is read back, so that a check the reads go through is
+    /// shown to refuse what it is for.
+    #[cfg(test)]
+    pub damage: Option<fn(&Path)>,
 }
 
 impl BuildPlan {
@@ -5489,6 +5611,20 @@ impl BuildPlan {
             hold: None,
             drop_output: false,
             sync: false,
+            stride: StrideAsk::No,
+            #[cfg(test)]
+            damage: None,
+        }
+    }
+
+    /// One of the opening's declines, as this plan answers it: a
+    /// conversion's (`StrideAsk::Only`) is the stride form's, since the
+    /// block file it would replace serves on and a block decline would mark
+    /// the partition as one no build may touch.
+    fn declined(&self, d: Decline, why: StrideNo) -> Outcome {
+        match self.stride {
+            StrideAsk::Only => Outcome::NotStride(why),
+            StrideAsk::No | StrideAsk::OrBlock => Outcome::Declined(d),
         }
     }
 
@@ -5537,6 +5673,10 @@ impl BuildPlan {
 /// in the trailer. The temp name is removed on every way out the function
 /// has, a decline after pages were written among them; a crash leaves it
 /// for the sweep at open.
+///
+/// Where the plan asks for the stride form (`StrideAsk`), its writer
+/// (`write_stride`) takes the page walk's place over the same opening, and
+/// both end in the one tail that names a file (`name_built`).
 pub(super) fn build(
     seg_path: &Path,
     out: &Path,
@@ -5605,10 +5745,10 @@ fn build_file_seen(
         .ok_or_else(|| super::err("z build: the segment's records are not resident"))?;
     let recs_len = usize::try_from(facts.recs_len).unwrap_or(usize::MAX);
     if recs_len < plan.floor {
-        return Ok(Outcome::Declined(Decline::Small(recs_len)));
+        return Ok(plan.declined(Decline::Small(recs_len), StrideNo::Small));
     }
     if blob.blocks() > 0 {
-        return Ok(Outcome::Declined(Decline::BlockBacked));
+        return Ok(plan.declined(Decline::BlockBacked, StrideNo::BlockBacked));
     }
     let nkeys = blob.keys();
     let bind = bind32(id, end_seq, facts.nkeys, facts.row_crc);
@@ -5617,36 +5757,64 @@ fn build_file_seen(
         s.push(".tmp");
         std::path::PathBuf::from(s)
     };
-    let made = write_pages(
-        &file, base, recs, dir, nkeys, bind, &tmp, &facts, id, end_seq, plan, seen,
-    );
+    let block = |seen: &mut dyn FnMut(usize, usize)| {
+        write_pages(
+            &file, base, recs, dir, nkeys, bind, &tmp, &facts, id, end_seq, plan, seen,
+        )
+    };
+    let made = match plan.stride {
+        StrideAsk::No => block(seen),
+        ask => match write_stride(
+            &file, base, recs, dir, nkeys, bind, &tmp, &facts, id, end_seq, plan, seen,
+        ) {
+            // A late decline: the block body is built in the same call,
+            // over records the walk left warm, under the same temporary
+            // name, which its writer opens truncated.
+            Ok(Outcome::NotStride(why)) if ask == StrideAsk::OrBlock => {
+                block(seen).map(|o| match o {
+                    Outcome::Built(b) => Outcome::Built(Built {
+                        stride_no: Some(why),
+                        ..b
+                    }),
+                    other => other,
+                })
+            }
+            other => other,
+        },
+    };
     match made {
-        Ok(Outcome::Built(mut b)) => {
-            // The cancel's last look, before the file gets its name; a
-            // build past it renames whatever landed meanwhile, and the
-            // collect finds the target gone and the file an orphan.
-            if plan.cancelled() {
-                let _ = std::fs::remove_file(&tmp);
-                return Ok(Outcome::Cancelled);
-            }
-            plan.wait_rename();
-            std::fs::rename(&tmp, out).inspect_err(|_| {
-                let _ = std::fs::remove_file(&tmp);
-            })?;
-            if plan.sync {
-                let t = std::time::Instant::now();
-                if let Ok(f) = File::open(out) {
-                    let _ = f.sync_data();
-                }
-                b.sync_us = (t.elapsed().as_micros() as u64).max(1);
-            }
-            Ok(Outcome::Built(b))
-        }
+        Ok(Outcome::Built(b)) => name_built(&tmp, out, plan, b),
         other => {
             let _ = std::fs::remove_file(&tmp);
             other
         }
     }
+}
+
+/// A file either body's writer built, given its name: the cancel's last
+/// look, the test's hold, the rename, and the sync where the plan asks for
+/// it -- the one tail both writers end in, so that what a name promises is
+/// promised once.
+fn name_built(tmp: &Path, out: &Path, plan: &BuildPlan, mut b: Built) -> Result<Outcome> {
+    // The cancel's last look, before the file gets its name; a build past
+    // it renames whatever landed meanwhile, and the collect finds the
+    // target gone and the file an orphan.
+    if plan.cancelled() {
+        let _ = std::fs::remove_file(tmp);
+        return Ok(Outcome::Cancelled);
+    }
+    plan.wait_rename();
+    std::fs::rename(tmp, out).inspect_err(|_| {
+        let _ = std::fs::remove_file(tmp);
+    })?;
+    if plan.sync {
+        let t = std::time::Instant::now();
+        if let Ok(f) = File::open(out) {
+            let _ = f.sync_data();
+        }
+        b.sync_us = (t.elapsed().as_micros() as u64).max(1);
+    }
+    Ok(Outcome::Built(b))
 }
 
 /// The pages, the resident part and the trailer of the form file of the
@@ -5831,6 +5999,11 @@ fn write_pages(
     }
     let file_bytes = w.at;
     debug_assert_eq!(Some(file_bytes), t.expected_file_len());
+    debug_assert_eq!(
+        t.seg_ident(),
+        seg_ident_of(facts, id, end_seq),
+        "the two writers' accounts of one segment"
+    );
     Ok(Outcome::Built(Built {
         fill: scratch.stats,
         file_bytes,
@@ -5840,7 +6013,587 @@ fn write_pages(
         cpu_us: 0,
         majflt: 0,
         sync_us: 0,
+        coding: if plan.coding == ZCODING_RECORD && plan.raw_tails {
+            FileCoding::RawTails
+        } else {
+            FileCoding::Block
+        },
+        stride_no: None,
     }))
+}
+
+/// The segment a form file of the segment `facts` describes derives from,
+/// under the name fields `id` and `end_seq`: what a writer records of the
+/// segment in either kind of trailer, and what the attach holds a trailer
+/// to (`same_segment`). The one mapping of the live segment's account into
+/// the trailers' shape; the block writer's trailer is held to it.
+fn seg_ident_of(facts: &ZSource, id: u64, end_seq: u64) -> SegIdent {
+    SegIdent {
+        seg_id: id,
+        seg_end_seq: end_seq,
+        nkeys: facts.nkeys,
+        recs_len: facts.recs_len,
+        crc_off: facts.crc_off,
+        key_off: facts.key_off,
+        hash_cap: facts.hash_cap,
+        file_len: facts.file_len,
+        timestamp: facts.timestamp,
+        generation: facts.generation,
+        row_crc: facts.row_crc,
+        rec_version: facts.rec_version,
+        rec_magic: facts.rec_magic,
+    }
+}
+
+/// What the stride form's precheck found of a partition from its two ends
+/// (`stride_precheck`): the keys' codec, the values' width, and the file's
+/// sizes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct StrideFacts {
+    pub codec: KeyCodec,
+    pub w: u32,
+    pub layout: StrideLayout,
+}
+
+/// Whether a partition's two ends, ranks 0 and `n - 1`, make a run the
+/// stride form holds, and its sizes where they do: both records one inline
+/// fixed value of one width of one to a page with no flag
+/// (`stride_record`), and the two keys of one length under a codec by which
+/// they bound exactly the partition's count of numbers (`KeyCodec::detect`).
+/// It proves the run's count and the ends' shape, nothing between them,
+/// which is the build's walk to check rank by rank; what it gives is the
+/// file's sizes, the trailer's own (`StrideTrailer::layout`), exact before
+/// anything past the two ends is read.
+pub(super) fn stride_precheck(images: &impl Images) -> std::result::Result<StrideFacts, StrideNo> {
+    let n = images.records();
+    let last = n.checked_sub(1).ok_or(StrideNo::NotShaped)?;
+    let (k0, v0) = stride_record(images.image(0))?;
+    let (kn, vn) = stride_record(images.image(last))?;
+    let w = u32::try_from(v0.len())
+        .ok()
+        .filter(|w| (1..=STRIDE_W_MAX).contains(w))
+        .ok_or(StrideNo::Width)?;
+    if vn.len() != v0.len() {
+        return Err(StrideNo::Width);
+    }
+    let codec = KeyCodec::detect(k0, kn, n as u64).map_err(|e| match e {
+        KeyShapeNo::Holes => StrideNo::Holes,
+        KeyShapeNo::Length | KeyShapeNo::Field => StrideNo::NotShaped,
+    })?;
+    // The trailer's own sizes and the refusals they make, so that what a
+    // precheck prices is what the writer can write: a key count past what
+    // a page index counts is no run the form holds.
+    let layout = StrideTrailer {
+        codec,
+        w,
+        res_crc: 0,
+        seg: SegIdent {
+            nkeys: n as u64,
+            ..SegIdent::default()
+        },
+    }
+    .layout()
+    .map_err(|_| StrideNo::NotShaped)?;
+    Ok(StrideFacts { codec, w, layout })
+}
+
+/// A record as the stride form holds it -- its key and its one value --
+/// where it is one inline fixed value with no flag; why not, otherwise.
+/// The compact record is read where it lies (`compact_fixed_tomb_at`), its
+/// header's tombstone flag tested here, since the walk that reads it so
+/// reads past the flag; any other is parsed (`parse_record`), the full
+/// record `SegmentOptions::compact_records` off writes among them, and must
+/// give one extent, inline, of one fixed record and no flag. The flag comes
+/// first: a promoted piece keeps the flags its seal wrote, a put's among
+/// them, and a run with nothing under it is a tombstone and no value.
+fn stride_record(image: &[u8]) -> std::result::Result<(&[u8], &[u8]), StrideNo> {
+    if let Some(f) = compact_fixed_tomb_at(image, 0) {
+        if f.tomb {
+            return Err(StrideNo::Tomb);
+        }
+        if f.records != 1 {
+            return Err(StrideNo::NotOneValue);
+        }
+        return Ok((f.key, f.run));
+    }
+    let (key, exts, tail, _) = parse_record(image, 0).ok_or(StrideNo::NotOneValue)?;
+    let &[e] = &*exts else {
+        return Err(StrideNo::NotOneValue);
+    };
+    if e.is_tombstone() {
+        return Err(StrideNo::Tomb);
+    }
+    if !e.is_inline() || e.records() != 1 {
+        return Err(StrideNo::NotOneValue);
+    }
+    // One value written prefixed is one of no bytes: a fixed run's width
+    // is never zero.
+    if !e.is_fixed() {
+        return Err(StrideNo::Width);
+    }
+    let at = e.off as usize;
+    let value = tail
+        .get(at..at + e.len as usize)
+        .ok_or(StrideNo::NotOneValue)?;
+    Ok((key, value))
+}
+
+/// A value page into the file and its word into the row, the word taken
+/// over the page as it goes out (`stride_page_crc`).
+fn stride_page_out(
+    w: &mut Pieces<FileSink<'_>>,
+    row: &mut Vec<u8>,
+    page: &[u8; ZPAGE],
+    bind: u32,
+    p: &mut u32,
+) -> Result<()> {
+    row.extend_from_slice(&stride_page_crc(page, bind, *p).to_le_bytes());
+    w.push(page)?;
+    *p += 1;
+    Ok(())
+}
+
+/// The stride form of the partition whose records and directory these are,
+/// written to `tmp` (`StrideAsk`), from the opening `write_pages` has and in
+/// its shape: the file in whole pieces at their own alignment, the raw
+/// records asked for ahead of the walk a window at a time, the cancel
+/// looked at once a window, and each value page's word of the row taken as
+/// the page completes; then the row and the trailer.
+///
+/// The partition qualifies by its two ends (`stride_precheck`) and then
+/// rank by rank, each read through the directory and never by stride,
+/// since a segment closed from a direct run keeps its commit markers inside
+/// the record region: every record one inline fixed value of the run's
+/// width with no flag (`stride_record`), and every key both quantities of
+/// the run's rule, its number the run's next and that number's rendering
+/// the key byte for byte, since a decode alone that took a key it does not
+/// render would put a value under a key no read asks for. A rank that fails
+/// ends the walk with its reason.
+///
+/// The file is then read back, every rank, through the body a reader serves
+/// it by (`check_stride`), before it has a name, against the records it
+/// was written from. Those are warm: the walk asked for them and left them,
+/// and the check is the build's last read of them, so the drop behind the
+/// walk is the check's, a window at a time -- dropped behind the first walk,
+/// the check would read every record from the device a second time. A walk
+/// that declines under `StrideAsk::Only` drops what it read, since nothing
+/// reads it next; under `OrBlock` the block walk reads it next and drops it
+/// as that walk does.
+#[allow(clippy::too_many_arguments)]
+fn write_stride(
+    file: &File,
+    base: usize,
+    recs: &[u8],
+    dir: &[u8],
+    nkeys: usize,
+    bind: u32,
+    tmp: &Path,
+    facts: &ZSource,
+    id: u64,
+    end_seq: u64,
+    plan: &BuildPlan,
+    seen: &mut dyn FnMut(usize, usize),
+) -> Result<Outcome> {
+    let images = SegImages::new(recs, dir, nkeys);
+    let sf = match stride_precheck(&images) {
+        Ok(f) => f,
+        Err(why) => return Ok(Outcome::NotStride(why)),
+    };
+    let recs_at = recs.as_ptr() as usize - base;
+    let dir_at = dir.as_ptr() as usize - base;
+    let mut forget = |from: usize, to: usize| {
+        if plan.drop_behind && from < to {
+            seen(from, to);
+            drop_behind(base, file, from, to);
+        }
+    };
+    // Where rank `r`'s record begins in the region, the region's end past
+    // the last: the directory says, as it says to the block walk.
+    let rec_at = |r: usize| {
+        if r < nkeys {
+            rd_u32(dir, r * 4).map_or(recs.len(), |o| o as usize)
+        } else {
+            recs.len()
+        }
+        .min(recs.len())
+    };
+    let out = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(tmp)?;
+    let mut w = Pieces::new(FileSink::new(&out, plan.drop_output), plan.piece);
+    let lay = sf.layout;
+    let codec = sf.codec;
+    let width = sf.w as usize;
+    let mut row: Vec<u8> = Vec::with_capacity(usize::try_from(lay.res_len).unwrap_or(0));
+    let mut page = [0u8; ZPAGE];
+    let (mut fill, mut p) = (0usize, 0u32);
+    let (mut asked, mut asked_bytes, mut looked) = (0usize, 0u64, 0usize);
+    let mut kbuf = [0u8; STRIDE_KEY_MAX];
+    for r in 0..nkeys {
+        let at = rec_at(r);
+        if r == 0 || at - looked >= plan.window {
+            if plan.cancelled() {
+                return Ok(Outcome::Cancelled);
+            }
+            looked = at;
+        }
+        if plan.ahead > 0 && asked < recs.len() && at + plan.ahead / 2 >= asked {
+            let to = asked.saturating_add(plan.ahead).min(recs.len());
+            ask_ahead(base, recs_at + asked, recs_at + to);
+            asked_bytes += (to - asked) as u64;
+            asked = to;
+        }
+        let value = stride_record(images.image(r)).and_then(|(key, value)| {
+            if value.len() != width {
+                return Err(StrideNo::Width);
+            }
+            // Inside the run the precheck proved: `base + r` is within
+            // what the field holds.
+            let x = codec.base() + r as u64;
+            match codec.decode(key) {
+                None => Err(StrideNo::NotShaped),
+                Some(y) if y != x => Err(StrideNo::Holes),
+                Some(_) if codec.render(x, &mut kbuf) != key => Err(StrideNo::NotShaped),
+                Some(_) => Ok(value),
+            }
+        });
+        let mut rest = match value {
+            Ok(v) => v,
+            Err(why) => {
+                if plan.stride == StrideAsk::Only {
+                    forget(recs_at, recs_at + rec_at(r + 1));
+                    forget(dir_at, dir_at + dir.len());
+                }
+                return Ok(Outcome::NotStride(why));
+            }
+        };
+        while !rest.is_empty() {
+            let take = (ZPAGE - fill).min(rest.len());
+            page[fill..fill + take].copy_from_slice(&rest[..take]);
+            fill += take;
+            rest = &rest[take..];
+            if fill == ZPAGE {
+                stride_page_out(&mut w, &mut row, &page, bind, &mut p)?;
+                fill = 0;
+            }
+        }
+    }
+    if fill > 0 {
+        page[fill..].fill(0);
+        stride_page_out(&mut w, &mut row, &page, bind, &mut p)?;
+    }
+    debug_assert_eq!(
+        u64::from(p),
+        lay.v_pages,
+        "the value pages are the layout's"
+    );
+    let res_crc = stride_row_crc(&row, bind);
+    w.push(&row)?;
+    let pad = usize::try_from(lay.res_pages * ZPAGE as u64 - lay.res_len).unwrap_or(0);
+    w.push(&vec![0u8; pad])?;
+    let t = StrideTrailer {
+        codec,
+        w: sf.w,
+        res_crc,
+        seg: seg_ident_of(facts, id, end_seq),
+    };
+    w.push(
+        &t.encode()
+            .map_err(|e| super::err(&format!("z build: the stride trailer: {e}")))?,
+    )?;
+    w.flush()?;
+    let file_bytes = w.at;
+    debug_assert_eq!(file_bytes, lay.file_len, "the file is the layout's");
+    #[cfg(test)]
+    if let Some(damage) = plan.damage {
+        damage(tmp);
+    }
+    let mut dropped = 0usize;
+    let mut looked = 0usize;
+    let checked = check_stride(tmp, &images, facts, id, end_seq, &mut |r| {
+        let at = rec_at(r);
+        if r == 0 || at - looked >= plan.window {
+            if plan.cancelled() {
+                return false;
+            }
+            looked = at;
+        }
+        if at - dropped >= plan.window {
+            forget(recs_at + dropped, recs_at + at);
+            dropped = at;
+        }
+        true
+    })?;
+    match checked {
+        Some(Outcome::Cancelled) => return Ok(Outcome::Cancelled),
+        Some(o) if plan.stride == StrideAsk::OrBlock => return Ok(o),
+        Some(o) => {
+            forget(recs_at + dropped, recs_at + recs.len());
+            forget(dir_at, dir_at + dir.len());
+            return Ok(o);
+        }
+        None => {}
+    }
+    forget(recs_at + dropped, recs_at + recs.len());
+    forget(dir_at, dir_at + dir.len());
+    if plan.drop_output {
+        drop_written(&out);
+    }
+    Ok(Outcome::Built(Built {
+        fill: FillStats {
+            pages: lay.v_pages,
+            records: nkeys as u64,
+            ..FillStats::default()
+        },
+        file_bytes,
+        total_ulen: nkeys as u64 * u64::from(sf.w),
+        asked: asked_bytes,
+        wall_us: 0,
+        cpu_us: 0,
+        majflt: 0,
+        sync_us: 0,
+        coding: FileCoding::Stride,
+        stride_no: None,
+    }))
+}
+
+/// Whether the stride form at `tmp` reads back as the records `images` it
+/// was written from, every rank, through the body a reader serves it by:
+/// the body taken from the file's bytes alone (`StrideBody::from_bytes`),
+/// the segment it names the live one (`same_segment`), and at each rank the
+/// value its record holds, its key, and its key's read answering that one
+/// value, every page checked against the row once, as a reader's verified
+/// bits check it. `each` is told of a rank before it is read and stops the
+/// check where it answers false. `None` where the file reads back; else
+/// what the build answers.
+fn check_stride(
+    tmp: &Path,
+    images: &SegImages,
+    facts: &ZSource,
+    id: u64,
+    end_seq: u64,
+    each: &mut dyn FnMut(usize) -> bool,
+) -> Result<Option<Outcome>> {
+    let refused = Some(Outcome::NotStride(StrideNo::SelfCheck));
+    let map = MmapBytes::open(tmp)?;
+    let bytes: &[u8] = &map.0;
+    let Ok(body) = StrideBody::from_bytes(bytes) else {
+        return Ok(refused);
+    };
+    if same_segment(&body.trailer().seg_ident(), facts, id, end_seq).is_err() {
+        return Ok(refused);
+    }
+    let mut verified = vec![false; body.pages()];
+    let mut kbuf = [0u8; STRIDE_KEY_MAX];
+    for r in 0..images.records() {
+        if !each(r) {
+            return Ok(Some(Outcome::Cancelled));
+        }
+        let Ok((key, value)) = stride_record(images.image(r)) else {
+            return Ok(refused);
+        };
+        let mut good = |p: u32| {
+            let i = p as usize;
+            if !verified[i] {
+                verified[i] = body.page_ok(bytes, p);
+            }
+            verified[i]
+        };
+        let rank = r as u64;
+        if body.values_at(bytes, rank, &mut good) != StrideAt::Value(value) {
+            return Ok(refused);
+        }
+        if body.key_at_into(rank, &mut kbuf) != Some(key) {
+            return Ok(refused);
+        }
+        let (mut seen, mut same) = (0usize, true);
+        let read = body.read_all(bytes, key, &mut good, &mut |v| {
+            seen += 1;
+            same &= v == value;
+        });
+        if read != StrideRead::Served(1) || seen != 1 || !same {
+            return Ok(refused);
+        }
+    }
+    Ok(None)
+}
+
+// ---- the stride form's body -------------------------------------------------
+
+/// A stride form's body as a reader holds it: the trailer it accepted, the
+/// sizes that trailer gives, the hash its pages are bound by, and the CRC
+/// row in the heap, a word a value page. The one reader of the body: the
+/// build reads every rank of a file back through it before the file has a
+/// name (`check_stride`), and a form file that holds one serves its reads
+/// by it.
+pub(super) struct StrideBody {
+    trailer: StrideTrailer,
+    layout: StrideLayout,
+    bind: u32,
+    row: Box<[u32]>,
+}
+
+/// What a stride body answers of a rank.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum StrideAt<'f> {
+    /// Its value, every page of its slot checked.
+    Value(&'f [u8]),
+    /// No rank of the run: a fact of the run, never a check that failed.
+    Absent,
+    /// Value page `p` failed its check, and nothing was answered.
+    Bad(u32),
+}
+
+/// What a stride body answers of a key's read: the values handed over, one
+/// or none, or the page that failed its check before any was.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum StrideRead {
+    Served(u64),
+    Bad(u32),
+}
+
+impl StrideBody {
+    /// The body of the stride form whose file's bytes these are, after the
+    /// checks that need nothing else: a length of whole pages, the trailer
+    /// (`StrideTrailer::decode`), the file the length its sizes say, the
+    /// row's CRC and the zeros after the row. Not the segment's identity,
+    /// which is the live segment's to hold the trailer to (`same_segment`),
+    /// and no value page, each of which is checked against the row where a
+    /// read first touches it (`StrideBody::page_ok`).
+    pub(super) fn from_bytes(file: &[u8]) -> std::result::Result<StrideBody, ZError> {
+        let len = file.len();
+        if len < ZTRAILER || !len.is_multiple_of(ZPAGE) {
+            return Err(ZError::Length);
+        }
+        let trailer = StrideTrailer::decode(&file[len - ZTRAILER..])?;
+        let layout = trailer.layout()?;
+        if layout.file_len != len as u64 {
+            return Err(ZError::Length);
+        }
+        let bind = trailer.bind32();
+        // Inside a file of the layout's length: the row and its padding lie
+        // before the trailer.
+        let at = layout.res_off as usize;
+        let row = &file[at..at + layout.res_len as usize];
+        if stride_row_crc(row, bind) != trailer.res_crc {
+            return Err(ZError::ResidentCrc);
+        }
+        let pad = &file[at + row.len()..at + (layout.res_pages as usize) * ZPAGE];
+        if pad.iter().any(|&b| b != 0) {
+            return Err(ZError::Resident("a byte after the row is not zero"));
+        }
+        let row = row
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
+            .collect();
+        Ok(StrideBody {
+            trailer,
+            layout,
+            bind,
+            row,
+        })
+    }
+
+    /// The trailer this body was read from.
+    pub(super) fn trailer(&self) -> &StrideTrailer {
+        &self.trailer
+    }
+
+    /// The run's keys, `n`.
+    pub(super) fn keys(&self) -> u64 {
+        self.trailer.seg.nkeys
+    }
+
+    /// The value pages, `V`.
+    pub(super) fn pages(&self) -> usize {
+        self.layout.v_pages as usize
+    }
+
+    /// Whether value page `p` of `file` is the page the row says.
+    pub(super) fn page_ok(&self, file: &[u8], p: u32) -> bool {
+        let at = p as usize * ZPAGE;
+        match (file.get(at..at + ZPAGE), self.row.get(p as usize)) {
+            (Some(page), Some(&word)) => stride_page_crc(page, self.bind, p) == word,
+            _ => false,
+        }
+    }
+
+    /// The rank `key` is at: its number, where it is a key the codec
+    /// renders, less the run's first, inside the run. Nothing else is: the
+    /// build proved every key of the run shaped and the run whole, so a key
+    /// this answers `None` for is absent, a fact of the run.
+    pub(super) fn rank_of(&self, key: &[u8]) -> Option<u64> {
+        let c = &self.trailer.codec;
+        let r = c.decode(key)?.checked_sub(c.base())?;
+        (r < self.keys()).then_some(r)
+    }
+
+    /// Rank `rank`'s key, rendered into `buf`; no page is touched.
+    pub(super) fn key_at_into<'b>(
+        &self,
+        rank: u64,
+        buf: &'b mut [u8; STRIDE_KEY_MAX],
+    ) -> Option<&'b [u8]> {
+        if rank >= self.keys() {
+            return None;
+        }
+        let c = &self.trailer.codec;
+        Some(c.render(c.base() + rank, buf))
+    }
+
+    /// Rank `rank`'s value in `file`, every page of its slot -- one, or two
+    /// where it straddles -- held to `good` first: a reader's verified bit,
+    /// or its check (`StrideBody::page_ok`) whose answer it keeps.
+    pub(super) fn values_at<'f>(
+        &self,
+        file: &'f [u8],
+        rank: u64,
+        good: &mut dyn FnMut(u32) -> bool,
+    ) -> StrideAt<'f> {
+        if rank >= self.keys() {
+            return StrideAt::Absent;
+        }
+        let w = u64::from(self.trailer.w);
+        let (at, end) = (rank * w, rank * w + w);
+        let page = ZPAGE as u64;
+        let (first, last) = ((at / page) as u32, ((end - 1) / page) as u32);
+        for p in first..=last {
+            if !good(p) {
+                return StrideAt::Bad(p);
+            }
+        }
+        match file.get(at as usize..end as usize) {
+            Some(v) => StrideAt::Value(v),
+            None => StrideAt::Bad(first),
+        }
+    }
+
+    /// `key`'s value in `file` handed to `f`, after its pages' checks: one
+    /// for a key of the run, none for any other, and nothing handed over
+    /// where a page failed.
+    pub(super) fn read_all(
+        &self,
+        file: &[u8],
+        key: &[u8],
+        good: &mut dyn FnMut(u32) -> bool,
+        f: &mut dyn FnMut(&[u8]),
+    ) -> StrideRead {
+        let Some(rank) = self.rank_of(key) else {
+            return StrideRead::Served(0);
+        };
+        match self.values_at(file, rank, good) {
+            StrideAt::Value(v) => {
+                f(v);
+                StrideRead::Served(1)
+            }
+            StrideAt::Absent => StrideRead::Served(0),
+            StrideAt::Bad(p) => StrideRead::Bad(p),
+        }
+    }
 }
 
 /// A build run on this thread with its wall, the thread's CPU and its major
@@ -6796,7 +7549,12 @@ mod tests {
 
     /// A segment written as the engine's own writer writes one.
     fn write_segment(path: &Path, recs: &[Rec], inline_max: usize) {
-        let mut w = SegmentWriter::create(path, &SegmentOptions::default()).unwrap();
+        write_segment_with(path, recs, inline_max, &SegmentOptions::default());
+    }
+
+    /// `write_segment` under the writer's options as given.
+    fn write_segment_with(path: &Path, recs: &[Rec], inline_max: usize, opts: &SegmentOptions) {
+        let mut w = SegmentWriter::create(path, opts).unwrap();
         w.set_inline_max(inline_max);
         for (k, vals, tomb) in recs {
             w.begin(k).unwrap();
@@ -6911,9 +7669,22 @@ mod tests {
             coding: u8,
             raw_tails: bool,
         ) -> Fixture {
+            Fixture::written(name, recs, coding, raw_tails, |seg, recs| {
+                write_segment(seg, recs, inline_max)
+            })
+        }
+
+        /// A fixture over the segment `write` makes of `recs`.
+        fn written(
+            name: &str,
+            recs: Vec<Rec>,
+            coding: u8,
+            raw_tails: bool,
+            write: impl FnOnce(&Path, &[Rec]),
+        ) -> Fixture {
             let dir = dir(name);
             let seg = dir.join("par-00000007-0000000000000099--.sup");
-            write_segment(&seg, &recs, inline_max);
+            write(&seg, &recs);
             let blob = Blob::open(MmapBytes::open(&seg).unwrap()).unwrap();
             Fixture {
                 out: dir.join(zpg_name(ID, END)),
@@ -11240,5 +12011,931 @@ mod tests {
             ZRead::NoPage,
             "the fence's own answer for a key in a run of several records"
         );
+    }
+
+    // ---- the stride form's builder ----------------------------------------
+
+    /// `n` keys of `k` and six digits from zero, each with one value of `w`
+    /// bytes drawn for it.
+    fn stride_recs(n: usize, w: usize, seed: u64) -> Vec<Rec> {
+        let mut rng = Rng(seed | 1);
+        (0..n)
+            .map(|i| (format!("k{i:06}").into_bytes(), vec![rng.bytes(w)], false))
+            .collect()
+    }
+
+    /// A plan asking `ask` of the stride form in pieces of three pages and
+    /// windows of four, so that a fixture a test can afford crosses every
+    /// boundary a partition's build does.
+    fn stride_plan(ask: StrideAsk) -> BuildPlan {
+        BuildPlan {
+            stride: ask,
+            piece: 3 * ZPAGE,
+            window: 4 * ZPAGE,
+            ..BuildPlan::new(0, true)
+        }
+    }
+
+    /// The precheck over a fixture's records, as a build makes it.
+    fn precheck_of(fx: &Fixture) -> std::result::Result<StrideFacts, StrideNo> {
+        let (recs, dir) = fx.blob.record_regions().unwrap();
+        stride_precheck(&SegImages::new(recs, dir, fx.blob.keys()))
+    }
+
+    /// The stride file a fixture built, held to the fixture's records and to
+    /// the raw form through the body a reader serves it by: the segment it
+    /// names the live one; every rank's value, key and key's read; nothing
+    /// past the run; keys beside the run's absent; and the zeros from the
+    /// values' end to their last page's.
+    fn stride_agrees(fx: &Fixture) -> StrideBody {
+        let bytes = std::fs::read(&fx.out).unwrap();
+        let body = StrideBody::from_bytes(&bytes).expect("the stride file reads");
+        let facts = fx.blob.z_source_facts().unwrap();
+        assert_eq!(
+            same_segment(&body.trailer().seg_ident(), &facts, ID, END),
+            Ok(())
+        );
+        assert_eq!(body.keys(), fx.recs.len() as u64);
+        let mut good = |p: u32| body.page_ok(&bytes, p);
+        let mut kbuf = [0u8; STRIDE_KEY_MAX];
+        for (r, (key, vals, _)) in fx.recs.iter().enumerate() {
+            let rank = r as u64;
+            assert_eq!(vals.len(), 1, "rank {r}");
+            assert_eq!(
+                body.values_at(&bytes, rank, &mut good),
+                StrideAt::Value(&vals[0][..]),
+                "rank {r}"
+            );
+            assert_eq!(
+                body.key_at_into(rank, &mut kbuf),
+                Some(&key[..]),
+                "rank {r}"
+            );
+            assert_eq!(body.rank_of(key), Some(rank), "rank {r}");
+            let mut got = Vec::new();
+            assert_eq!(
+                body.read_all(&bytes, key, &mut good, &mut |v| got.push(v.to_vec())),
+                StrideRead::Served(1),
+                "rank {r}"
+            );
+            assert_eq!(&got, vals, "rank {r}");
+            assert_eq!(&raw_values(&fx.blob, key), vals, "the raw form's, rank {r}");
+        }
+        let n = body.keys();
+        assert_eq!(body.values_at(&bytes, n, &mut good), StrideAt::Absent);
+        assert_eq!(body.key_at_into(n, &mut kbuf), None);
+        let (first, last) = (&fx.recs[0].0, &fx.recs[fx.recs.len() - 1].0);
+        let codec = body.trailer().codec;
+        let mut beside = vec![
+            [first.as_slice(), b"0"].concat(),
+            first[..first.len() - 1].to_vec(),
+            [last.as_slice(), b"\0"].concat(),
+            Vec::new(),
+        ];
+        if let Some(below) = codec.base().checked_sub(1) {
+            beside.push(codec.render(below, &mut kbuf).to_vec());
+        }
+        if codec.holds(n + 1) {
+            beside.push(codec.render(codec.base() + n, &mut kbuf).to_vec());
+        }
+        for k in &beside {
+            assert_eq!(body.rank_of(k), None, "{k:?}");
+            assert_eq!(
+                body.read_all(&bytes, k, &mut good, &mut |_| panic!("a value for {k:?}")),
+                StrideRead::Served(0),
+                "{k:?}"
+            );
+            assert!(raw_values(&fx.blob, k).is_empty(), "{k:?}");
+        }
+        let end = fx.recs.len() * body.trailer().w as usize;
+        assert!(
+            bytes[end..body.pages() * ZPAGE].iter().all(|&b| b == 0),
+            "the values' last page is zeros past them"
+        );
+        body
+    }
+
+    /// The codes a segment keeps the reasons by are distinct and none of
+    /// them zero, which is no reason.
+    #[test]
+    fn every_stride_reason_has_a_code_of_its_own() {
+        use StrideNo::*;
+        let all = [
+            NotShaped,
+            Holes,
+            NotOneValue,
+            Width,
+            Tomb,
+            BlockBacked,
+            Small,
+            SelfCheck,
+        ];
+        let codes: std::collections::HashSet<u8> = all.iter().map(|w| w.code()).collect();
+        assert_eq!(codes.len(), all.len());
+        assert!(!codes.contains(&0));
+    }
+
+    /// Partitions of numbered keys of one length with one fixed value each
+    /// -- values of one byte, of a hundred that straddle pages, of a page
+    /// less one byte and of a page, a run of one, and a big-endian field --
+    /// are built in the stride form under either ask, the precheck's sizes
+    /// the file's to the byte, no temporary name left, the reason a segment
+    /// keeps cleared, and every rank read back through the reader's body.
+    #[test]
+    fn a_run_of_numbered_keys_and_one_fixed_value_each_is_built_in_the_stride_form() {
+        let mut rng = Rng(0x5be);
+        let be: Vec<Rec> = (0..500u64)
+            .map(|i| {
+                let key = [b"be".as_slice(), &(0x0102_0304_0506_0000 + i).to_be_bytes()].concat();
+                (key, vec![rng.bytes(100)], false)
+            })
+            .collect();
+        let cases = [
+            ("w1", stride_recs(5000, 1, 1)),
+            ("w100", stride_recs(3000, 100, 2)),
+            ("w4095", stride_recs(40, 4095, 3)),
+            ("w4096", stride_recs(40, 4096, 4)),
+            ("one", stride_recs(1, 100, 5)),
+            ("be", be),
+        ];
+        for (name, recs) in cases {
+            let fx = Fixture::new(&format!("stride-{name}"), recs, 1 << 16);
+            let facts = precheck_of(&fx).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            for ask in [StrideAsk::Only, StrideAsk::OrBlock] {
+                let _ = std::fs::remove_file(&fx.out);
+                let cell = AtomicU8::new(StrideNo::SelfCheck.code());
+                let made = build(&fx.seg, &fx.out, ID, END, &stride_plan(ask)).unwrap();
+                made.note_stride(&cell);
+                let Outcome::Built(b) = made else {
+                    panic!("{name} {ask:?}: {made:?}")
+                };
+                assert_eq!(
+                    (b.coding, b.stride_no),
+                    (FileCoding::Stride, None),
+                    "{name}"
+                );
+                assert_eq!(
+                    b.file_bytes, facts.layout.file_len,
+                    "{name}: the precheck's sizes are the file's"
+                );
+                assert_eq!(std::fs::metadata(&fx.out).unwrap().len(), b.file_bytes);
+                assert!(!tmp_of(&fx.out).exists(), "{name}");
+                assert_eq!(cell.load(Ordering::Relaxed), 0, "{name}: no reason");
+                let body = stride_agrees(&fx);
+                assert_eq!(
+                    (body.trailer().codec, body.trailer().w),
+                    (facts.codec, facts.w),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    /// Each state a partition can be in that the stride form does not hold,
+    /// built: asked for the stride form alone, the reason named, nothing on
+    /// disk, the reason kept where the segment keeps it, and the precheck
+    /// deciding the states its two ends show; asked for it or the block
+    /// form, the block file built in the same call and serving the raw
+    /// form's answers with the reason beside it, or the block form's own
+    /// decline for the two states that decline it too.
+    #[test]
+    fn the_stride_form_declines_each_state_for_its_reason_and_leaves_nothing() {
+        use StrideNo::*;
+        let n = 600;
+        let mid = n / 2;
+        let base = stride_recs(n, 100, 0x57);
+        let with = |f: &dyn Fn(&mut Vec<Rec>)| {
+            let mut r = base.clone();
+            f(&mut r);
+            r
+        };
+        let long: Vec<Rec> = base
+            .iter()
+            .enumerate()
+            .map(|(i, (_, v, t))| {
+                let key = format!("{}{i:07}", "p".repeat(STRIDE_KEY_MAX - 6)).into_bytes();
+                (key, v.clone(), *t)
+            })
+            .collect();
+        assert_eq!(long[0].0.len(), STRIDE_KEY_MAX + 1);
+        // (name, records, floor, inline bytes, reason, decided by the ends)
+        type Case = (&'static str, Vec<Rec>, usize, usize, StrideNo, Option<bool>);
+        let cases: Vec<Case> = vec![
+            (
+                "two-values",
+                with(&|r| {
+                    let v = r[mid].1[0].clone();
+                    r[mid].1.push(v)
+                }),
+                0,
+                1 << 16,
+                NotOneValue,
+                Some(false),
+            ),
+            (
+                "two-values-first",
+                with(&|r| {
+                    let v = r[0].1[0].clone();
+                    r[0].1.push(v)
+                }),
+                0,
+                1 << 16,
+                NotOneValue,
+                Some(true),
+            ),
+            (
+                "two-widths",
+                with(&|r| r[mid].1[0].push(7)),
+                0,
+                1 << 16,
+                Width,
+                Some(false),
+            ),
+            (
+                "two-widths-last",
+                with(&|r| {
+                    r[n - 1].1[0].pop();
+                }),
+                0,
+                1 << 16,
+                Width,
+                Some(true),
+            ),
+            (
+                "no-bytes",
+                with(&|r| r[mid].1[0].clear()),
+                0,
+                1 << 16,
+                Width,
+                Some(false),
+            ),
+            (
+                // A prefixed run's one value of no bytes is its length's
+                // byte: a run of them all is no run of one-byte values.
+                "no-bytes-all",
+                with(&|r| r.iter_mut().for_each(|x| x.1[0].clear())),
+                0,
+                1 << 16,
+                Width,
+                Some(true),
+            ),
+            (
+                "flagged",
+                with(&|r| r[mid].2 = true),
+                0,
+                1 << 16,
+                Tomb,
+                Some(false),
+            ),
+            (
+                "tomb-alone",
+                with(&|r| {
+                    r[mid].1.clear();
+                    r[mid].2 = true
+                }),
+                0,
+                1 << 16,
+                Tomb,
+                Some(false),
+            ),
+            (
+                "two-lengths",
+                with(&|r| r[mid].0.push(b'x')),
+                0,
+                1 << 16,
+                NotShaped,
+                Some(false),
+            ),
+            (
+                // Below a digit, so that the key sorts in its place.
+                "non-digit",
+                with(&|r| *r[mid].0.last_mut().unwrap() = b'/'),
+                0,
+                1 << 16,
+                NotShaped,
+                Some(false),
+            ),
+            (
+                "hole",
+                with(&|r| {
+                    r.remove(mid);
+                }),
+                0,
+                1 << 16,
+                Holes,
+                Some(true),
+            ),
+            (
+                "empty-key",
+                with(&|r| r[0].0.clear()),
+                0,
+                1 << 16,
+                NotShaped,
+                Some(true),
+            ),
+            ("long-keys", long, 0, 1 << 16, NotShaped, Some(true)),
+            (
+                "block-backed",
+                with(&|r| r[mid].1[0] = vec![7u8; 9000]),
+                0,
+                256,
+                BlockBacked,
+                None,
+            ),
+            ("small", base.clone(), usize::MAX, 1 << 16, Small, None),
+        ];
+        for (name, recs, floor, inline, why, by_ends) in cases {
+            let mut sorted = recs.clone();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(sorted, recs, "{name}: the fixture's keys are in order");
+            let fx = Fixture::new(&format!("stride-no-{name}"), recs, inline);
+            match by_ends {
+                Some(true) => assert_eq!(precheck_of(&fx), Err(why), "{name}"),
+                Some(false) => assert!(precheck_of(&fx).is_ok(), "{name}: past the ends"),
+                None => {}
+            }
+            let plan = |ask| BuildPlan {
+                floor,
+                ..stride_plan(ask)
+            };
+            let cell = AtomicU8::new(0);
+            let made = build(&fx.seg, &fx.out, ID, END, &plan(StrideAsk::Only)).unwrap();
+            made.note_stride(&cell);
+            assert!(
+                matches!(made, Outcome::NotStride(w) if w == why),
+                "{name}: {made:?}"
+            );
+            assert!(!fx.out.exists(), "{name}: no file");
+            assert!(!tmp_of(&fx.out).exists(), "{name}: no temporary name");
+            assert_eq!(cell.load(Ordering::Relaxed), why.code(), "{name}");
+            let cell = AtomicU8::new(0);
+            let made = build(&fx.seg, &fx.out, ID, END, &plan(StrideAsk::OrBlock)).unwrap();
+            made.note_stride(&cell);
+            assert!(!tmp_of(&fx.out).exists(), "{name}: no temporary name");
+            match why {
+                Small | BlockBacked => {
+                    assert!(
+                        matches!(
+                            made,
+                            Outcome::Declined(Decline::Small(_) | Decline::BlockBacked)
+                        ),
+                        "{name}: {made:?}"
+                    );
+                    assert!(!fx.out.exists(), "{name}: no file");
+                    assert_eq!(cell.load(Ordering::Relaxed), 0, "{name}");
+                }
+                _ => {
+                    let Outcome::Built(b) = made else {
+                        panic!("{name}: {made:?}")
+                    };
+                    assert_eq!((b.coding, b.stride_no), (FileCoding::Block, Some(why)));
+                    assert_eq!(cell.load(Ordering::Relaxed), why.code(), "{name}");
+                    let zfile = fx.attach().expect("the block file attaches");
+                    agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
+                }
+            }
+        }
+    }
+
+    /// A segment whose key section was right at its open and whose record
+    /// region a key was then changed in -- rank three hundred's made rank
+    /// four hundred's, so that the two ends still count the run -- is
+    /// declined at the rank it fails: a number the walk does not expect is
+    /// a hole, whatever the precheck said of the ends.
+    #[test]
+    fn a_key_out_of_its_place_is_a_hole_at_its_rank() {
+        let recs = stride_recs(600, 100, 0x58);
+        let fx = Fixture::new("stride-out-of-place", recs, 1 << 16);
+        let map = MmapBytes::open(&fx.seg).unwrap();
+        let base = map.slice_at(0, 1).unwrap().as_ptr() as usize;
+        let blob = Blob::open(map).unwrap();
+        let (recs, dir) = blob.record_regions().unwrap();
+        let at = rd_u32(dir, 300 * 4).unwrap() as usize;
+        let key = record_key(&recs[at..], 0).unwrap();
+        assert_eq!(key, b"k000300");
+        let off = key.as_ptr() as usize - base;
+        drop(blob);
+        let f = OpenOptions::new().write(true).open(&fx.seg).unwrap();
+        f.write_at(b"k000400", off as u64).unwrap();
+        drop(f);
+        assert!(precheck_of(&fx).is_ok(), "the ends still count the run");
+        let made = build(&fx.seg, &fx.out, ID, END, &stride_plan(StrideAsk::Only)).unwrap();
+        assert!(
+            matches!(made, Outcome::NotStride(StrideNo::Holes)),
+            "{made:?}"
+        );
+        assert!(!fx.out.exists() && !tmp_of(&fx.out).exists());
+    }
+
+    /// The full record (`SegmentOptions::compact_records` off) carries its
+    /// extent and is read by `parse_record`, not in place: a run of such
+    /// records qualifies through that parse, and that parse names a flag,
+    /// two values and a value of no bytes as the compact path names them.
+    #[test]
+    fn the_full_record_qualifies_through_its_parse() {
+        use StrideNo::*;
+        let opts = SegmentOptions {
+            compact_records: false,
+            ..SegmentOptions::default()
+        };
+        let full = |name: &str, recs: Vec<Rec>| {
+            Fixture::written(name, recs, ZCODING_BLOCK, false, |seg, recs| {
+                write_segment_with(seg, recs, 1 << 16, &opts)
+            })
+        };
+        let n = 400;
+        let fx = full("stride-full", stride_recs(n, 100, 0x59));
+        let (recs, dir) = fx.blob.record_regions().unwrap();
+        let images = SegImages::new(recs, dir, n);
+        for r in 0..n {
+            assert!(
+                compact_fixed_tomb_at(images.image(r), 0).is_none(),
+                "rank {r} is a full record"
+            );
+        }
+        let made = build(&fx.seg, &fx.out, ID, END, &stride_plan(StrideAsk::Only)).unwrap();
+        assert!(
+            matches!(
+                made,
+                Outcome::Built(Built {
+                    coding: FileCoding::Stride,
+                    ..
+                })
+            ),
+            "{made:?}"
+        );
+        stride_agrees(&fx);
+        let mid = n / 2;
+        type Edit = fn(&mut Rec);
+        let states: [(&str, Edit, StrideNo); 4] = [
+            ("flagged", |r| r.2 = true, Tomb),
+            (
+                "tomb-alone",
+                |r| {
+                    r.1.clear();
+                    r.2 = true
+                },
+                Tomb,
+            ),
+            (
+                "two-values",
+                |r| {
+                    let v = r.1[0].clone();
+                    r.1.push(v)
+                },
+                NotOneValue,
+            ),
+            ("no-bytes", |r| r.1[0].clear(), Width),
+        ];
+        for (name, edit, why) in states {
+            let mut recs = stride_recs(n, 100, 0x59);
+            edit(&mut recs[mid]);
+            let fx = full(&format!("stride-full-{name}"), recs);
+            let made = build(&fx.seg, &fx.out, ID, END, &stride_plan(StrideAsk::Only)).unwrap();
+            assert!(
+                matches!(made, Outcome::NotStride(w) if w == why),
+                "{name}: {made:?}"
+            );
+        }
+    }
+
+    /// A segment closed from a direct run keeps a commit marker after each
+    /// batch inside its record region, so its records are not end to end:
+    /// the walk reads each through the directory and the run qualifies,
+    /// where a walk by stride would read the markers as records.
+    #[test]
+    fn a_direct_runs_segment_with_its_markers_qualifies() {
+        let n = 500;
+        let fx = Fixture::written(
+            "stride-marked",
+            stride_recs(n, 100, 0x5a),
+            ZCODING_BLOCK,
+            false,
+            |seg, recs| {
+                let mut w = SegmentWriter::create(seg, &SegmentOptions::default()).unwrap();
+                w.set_inline_max(1 << 16);
+                w.set_marks(true);
+                for (i, (k, vals, tomb)) in recs.iter().enumerate() {
+                    w.begin(k).unwrap();
+                    for v in vals {
+                        w.value(v);
+                    }
+                    w.end_with(*tomb).unwrap();
+                    if i % 7 == 6 {
+                        w.mark().unwrap();
+                    }
+                }
+                w.mark().unwrap();
+                w.finish(1).unwrap();
+            },
+        );
+        let (recs, dir) = fx.blob.record_regions().unwrap();
+        let images = SegImages::new(recs, dir, n);
+        let at = |r: usize| rd_u32(dir, r * 4).unwrap() as usize;
+        let gaps = (0..n - 1)
+            .filter(|&r| at(r) + images.image(r).len() != at(r + 1))
+            .count();
+        assert_eq!(gaps, (n - 1) / 7, "a marker after every seventh record");
+        let made = build(&fx.seg, &fx.out, ID, END, &stride_plan(StrideAsk::Only)).unwrap();
+        assert!(
+            matches!(
+                made,
+                Outcome::Built(Built {
+                    coding: FileCoding::Stride,
+                    ..
+                })
+            ),
+            "{made:?}"
+        );
+        stride_agrees(&fx);
+    }
+
+    /// The stride file is the same bytes whatever piece it is written in and
+    /// whatever window it asks and drops by, and the drop behind it -- the
+    /// read-back's, the build's last read of the records -- covers the
+    /// records once, in order, a window at a time, and the directory last.
+    #[test]
+    fn a_stride_file_is_the_same_bytes_whatever_the_piece_and_the_window() {
+        let fx = Fixture::new("stride-plans", stride_recs(4000, 100, 0x5b), 1 << 16);
+        let map = MmapBytes::open(&fx.seg).unwrap();
+        let base = map.slice_at(0, 1).unwrap().as_ptr() as usize;
+        let blob = Blob::open(map).unwrap();
+        let (recs, dir) = blob.record_regions().unwrap();
+        let recs_at = recs.as_ptr() as usize - base;
+        let (recs_end, dir_at) = (recs_at + recs.len(), dir.as_ptr() as usize - base);
+        let dir_end = dir_at + dir.len();
+        drop(blob);
+        let mut reference: Option<Vec<u8>> = None;
+        let plans = [
+            (ZWRITE_PIECE, ZDROP_WINDOW, true),
+            (ZPAGE, ZPAGE, true),
+            (3 * ZPAGE, 5 * ZPAGE + 100, true),
+            (7 * ZPAGE + 12, 64 << 10, true),
+            (ZWRITE_PIECE, 64 << 10, false),
+        ];
+        for (piece, window, drop_behind) in plans {
+            let _ = std::fs::remove_file(&fx.out);
+            let plan = BuildPlan {
+                piece,
+                window,
+                ahead: window,
+                stride: StrideAsk::Only,
+                ..BuildPlan::new(0, drop_behind)
+            };
+            let mut seen: Vec<(usize, usize)> = Vec::new();
+            let r = build_seen(&fx.seg, &fx.out, ID, END, &plan, &mut |a, b| {
+                seen.push((a, b))
+            })
+            .unwrap();
+            assert!(
+                matches!(r, Outcome::Built(Built { coding: FileCoding::Stride, asked, .. }) if asked > 0),
+                "{r:?}"
+            );
+            let bytes = std::fs::read(&fx.out).unwrap();
+            match &reference {
+                None => reference = Some(bytes),
+                Some(want) => assert_eq!(&bytes, want, "piece {piece}, window {window}"),
+            }
+            if !drop_behind {
+                assert!(
+                    seen.is_empty(),
+                    "a build asked not to drop dropped {seen:?}"
+                );
+                continue;
+            }
+            let (dirs, recs_seen) = seen.split_last().expect("something was dropped");
+            assert_eq!(*dirs, (dir_at, dir_end), "the directory is dropped last");
+            let mut at = recs_at;
+            for (i, &(a, b)) in recs_seen.iter().enumerate() {
+                assert_eq!(a, at, "range {i} begins where the one before ended");
+                assert!(b > a, "range {i} is empty");
+                if i + 1 < recs_seen.len() {
+                    assert!(b - a >= window, "range {i} is {} bytes", b - a);
+                }
+                at = b;
+            }
+            assert_eq!(at, recs_end, "the records are dropped to their end");
+            assert_eq!(
+                recs_seen.len() > 1,
+                window <= 64 << 10,
+                "a window under the region drops in turns, one over it once"
+            );
+        }
+        stride_agrees(&fx);
+    }
+
+    thread_local! {
+        /// The cancel a test's damage seam sets, the build running on the
+        /// test's own thread: the seam is a function and holds nothing.
+        static CANCEL_AT_SEAM: std::cell::RefCell<Option<Arc<AtomicBool>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// A stride build whose cancel is set before it begins stops at the
+    /// write walk's first look, writing nothing past it -- the seam after
+    /// the write is never reached -- and one whose cancel is set between
+    /// the write and the read-back stops at the read-back's first look,
+    /// before the read-back gives back a record: a cancel is a merge taking
+    /// the partition as an input, which reads those records next, and the
+    /// rename's own last look would answer the same outcome after a
+    /// read-back that ran whole. Either leaves nothing on disk.
+    #[test]
+    fn a_cancelled_stride_build_stops_at_its_next_look_and_leaves_nothing() {
+        let fx = Fixture::new("stride-cancel", stride_recs(300, 100, 0x5c), 1 << 16);
+        for ask in [StrideAsk::Only, StrideAsk::OrBlock] {
+            let plan = BuildPlan {
+                cancel: Some(Arc::new(AtomicBool::new(true))),
+                damage: Some(|_| panic!("the write walk ran past its cancel")),
+                ..stride_plan(ask)
+            };
+            let made = build(&fx.seg, &fx.out, ID, END, &plan).unwrap();
+            assert!(matches!(made, Outcome::Cancelled), "{ask:?}: {made:?}");
+            assert!(!fx.out.exists() && !tmp_of(&fx.out).exists(), "{ask:?}");
+            let cancel = Arc::new(AtomicBool::new(false));
+            CANCEL_AT_SEAM.with(|c| *c.borrow_mut() = Some(cancel.clone()));
+            let plan = BuildPlan {
+                cancel: Some(cancel),
+                damage: Some(|_| {
+                    CANCEL_AT_SEAM.with(|c| {
+                        c.borrow()
+                            .as_ref()
+                            .expect("the test's cancel")
+                            .store(true, Ordering::Release)
+                    })
+                }),
+                ..stride_plan(ask)
+            };
+            let mut seen: Vec<(usize, usize)> = Vec::new();
+            let made = build_seen(&fx.seg, &fx.out, ID, END, &plan, &mut |a, b| {
+                seen.push((a, b))
+            })
+            .unwrap();
+            assert!(matches!(made, Outcome::Cancelled), "{ask:?}: {made:?}");
+            assert!(seen.is_empty(), "{ask:?}: the read-back gave back {seen:?}");
+            assert!(!fx.out.exists() && !tmp_of(&fx.out).exists(), "{ask:?}");
+        }
+    }
+
+    /// A walk that declines with the stride form asked for alone gives back
+    /// what it read -- the records to the end of the one it declined at,
+    /// and the directory -- since the block file it would have replaced
+    /// serves on and nothing reads them next; asked for the stride form or
+    /// the block form, it leaves them to the block walk, which drops them
+    /// as its own walk does, from the region's start.
+    #[test]
+    fn a_stride_walk_that_declines_alone_gives_back_what_it_read() {
+        let n = 2000;
+        let mid = n / 2;
+        let mut recs = stride_recs(n, 100, 0x5f);
+        let v = recs[mid].1[0].clone();
+        recs[mid].1.push(v);
+        let fx = Fixture::new("stride-no-drop", recs, 1 << 16);
+        let map = MmapBytes::open(&fx.seg).unwrap();
+        let base = map.slice_at(0, 1).unwrap().as_ptr() as usize;
+        let blob = Blob::open(map).unwrap();
+        let (recs, dir) = blob.record_regions().unwrap();
+        let recs_at = recs.as_ptr() as usize - base;
+        let past = recs_at + rd_u32(dir, (mid + 1) * 4).unwrap() as usize;
+        let dir_at = dir.as_ptr() as usize - base;
+        let dir_end = dir_at + dir.len();
+        drop(blob);
+        let mut seen: Vec<(usize, usize)> = Vec::new();
+        let made = build_seen(
+            &fx.seg,
+            &fx.out,
+            ID,
+            END,
+            &stride_plan(StrideAsk::Only),
+            &mut |a, b| seen.push((a, b)),
+        )
+        .unwrap();
+        assert!(
+            matches!(made, Outcome::NotStride(StrideNo::NotOneValue)),
+            "{made:?}"
+        );
+        assert_eq!(seen, vec![(recs_at, past), (dir_at, dir_end)]);
+        let mut seen: Vec<(usize, usize)> = Vec::new();
+        let made = build_seen(
+            &fx.seg,
+            &fx.out,
+            ID,
+            END,
+            &stride_plan(StrideAsk::OrBlock),
+            &mut |a, b| seen.push((a, b)),
+        )
+        .unwrap();
+        assert!(matches!(made, Outcome::Built(_)), "{made:?}");
+        assert_eq!(seen.first().map(|r| r.0), Some(recs_at), "{seen:?}");
+        assert_eq!(seen.last(), Some(&(dir_at, dir_end)), "{seen:?}");
+        assert!(
+            seen.windows(2).all(|w| w[0].1 <= w[1].0),
+            "the block walk drops each range once: {seen:?}"
+        );
+    }
+
+    /// The stride file at `path` with `edit` applied to its bytes and its
+    /// trailer, and then made whole again under every checksum `edit` did
+    /// not break on purpose: page `reword`'s word of the row taken again
+    /// where one is named, the row's CRC taken again, and the trailer sealed
+    /// again -- so that what `edit` changed is reached only by a check
+    /// behind the checksums.
+    fn forge_stride(
+        path: &Path,
+        reword: Option<u32>,
+        edit: impl FnOnce(&mut [u8], &mut StrideTrailer, &StrideLayout),
+    ) {
+        let mut b = std::fs::read(path).unwrap();
+        let len = b.len();
+        let mut t = StrideTrailer::decode(&b[len - ZTRAILER..]).unwrap();
+        let lay = t.layout().unwrap();
+        edit(&mut b, &mut t, &lay);
+        let bind = t.bind32();
+        let res = lay.res_off as usize;
+        if let Some(p) = reword {
+            let at = p as usize * ZPAGE;
+            let word = stride_page_crc(&b[at..at + ZPAGE], bind, p);
+            let w_at = res + 4 * p as usize;
+            b[w_at..w_at + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        t.res_crc = stride_row_crc(&b[res..res + lay.res_len as usize], bind);
+        b[len - ZTRAILER..].copy_from_slice(&t.encode().unwrap());
+        std::fs::write(path, &b).unwrap();
+    }
+
+    /// The read-back before the name refuses a file the reader's body would
+    /// serve wrong, each damage made between the write and the read-back
+    /// and forged under good checksums where a checksum would catch it
+    /// first: a value byte, a word of the row, the trailer's first number
+    /// and the trailer's segment. Asked for the stride form alone, nothing
+    /// is named and nothing left; asked for it or the block form, the block
+    /// file is built with the reason beside it. The seam that damages
+    /// nothing builds.
+    #[test]
+    fn the_read_back_refuses_what_the_reader_would_serve_wrong() {
+        let fx = Fixture::new("stride-check", stride_recs(1500, 100, 0x5d), 1 << 16);
+        type Damage = (&'static str, fn(&Path));
+        let damages: [Damage; 7] = [
+            ("value byte", |p| {
+                let f = OpenOptions::new().write(true).read(true).open(p).unwrap();
+                let mut b = [0u8; 1];
+                f.read_exact_at(&mut b, 7).unwrap();
+                f.write_at(&[b[0] ^ 0x10], 7).unwrap();
+            }),
+            ("value byte, forged", |p| {
+                forge_stride(p, Some(0), |b, _, _| b[7] ^= 0x10)
+            }),
+            ("row word", |p| {
+                let mut b = std::fs::read(p).unwrap();
+                let t = StrideTrailer::decode(&b[b.len() - ZTRAILER..]).unwrap();
+                b[t.layout().unwrap().res_off as usize + 12] ^= 1;
+                std::fs::write(p, &b).unwrap();
+            }),
+            ("row word, forged", |p| {
+                forge_stride(p, None, |b, _, l| b[l.res_off as usize + 12] ^= 1)
+            }),
+            ("first number, forged", |p| {
+                forge_stride(p, None, |_, t, _| {
+                    let c = t.codec;
+                    t.codec = KeyCodec::new(c.kind(), c.prefix(), c.d(), c.base() + 1).unwrap()
+                })
+            }),
+            ("segment, forged", |p| {
+                forge_stride(p, None, |_, t, _| t.seg.timestamp += 1)
+            }),
+            ("a page's zeros, forged", |p| {
+                forge_stride(p, Some(36), |b, t, l| {
+                    // Rank 1500's would-be slot in the last value page,
+                    // which no read touches.
+                    let end = 1500 * t.w as usize;
+                    assert!(end < l.v_pages as usize * ZPAGE);
+                    assert_eq!(end / ZPAGE, 36);
+                    b[end] = 1;
+                })
+            }),
+        ];
+        for (name, damage) in damages {
+            let _ = std::fs::remove_file(&fx.out);
+            let cell = AtomicU8::new(0);
+            let plan = BuildPlan {
+                damage: Some(damage),
+                ..stride_plan(StrideAsk::Only)
+            };
+            let made = build(&fx.seg, &fx.out, ID, END, &plan).unwrap();
+            made.note_stride(&cell);
+            if name == "a page's zeros, forged" {
+                // Bytes no read reaches read back as the records: the
+                // read-back is of what a reader serves, and the zeros are
+                // the writer's, held by `stride_agrees`.
+                assert!(matches!(made, Outcome::Built(_)), "{name}: {made:?}");
+                continue;
+            }
+            assert!(
+                matches!(made, Outcome::NotStride(StrideNo::SelfCheck)),
+                "{name}: {made:?}"
+            );
+            assert!(!fx.out.exists(), "{name}: nothing named");
+            assert!(!tmp_of(&fx.out).exists(), "{name}: nothing left");
+            assert_eq!(cell.load(Ordering::Relaxed), StrideNo::SelfCheck.code());
+            let plan = BuildPlan {
+                damage: Some(damage),
+                ..stride_plan(StrideAsk::OrBlock)
+            };
+            let made = build(&fx.seg, &fx.out, ID, END, &plan).unwrap();
+            let Outcome::Built(b) = made else {
+                panic!("{name}: {made:?}")
+            };
+            assert_eq!(
+                (b.coding, b.stride_no),
+                (FileCoding::Block, Some(StrideNo::SelfCheck)),
+                "{name}"
+            );
+            assert!(!tmp_of(&fx.out).exists(), "{name}: nothing left");
+            let zfile = fx.attach().expect("the block file attaches");
+            agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
+        }
+        let _ = std::fs::remove_file(&fx.out);
+        let plan = BuildPlan {
+            damage: Some(|_| {}),
+            ..stride_plan(StrideAsk::Only)
+        };
+        let made = build(&fx.seg, &fx.out, ID, END, &plan).unwrap();
+        assert!(
+            matches!(
+                made,
+                Outcome::Built(Built {
+                    coding: FileCoding::Stride,
+                    ..
+                })
+            ),
+            "{made:?}"
+        );
+        stride_agrees(&fx);
+    }
+
+    /// The body refuses bytes its trailer does not describe, each check
+    /// reached with the ones before it passing: a length of no whole pages;
+    /// a page more than the trailer's sizes; a word of the row the row's
+    /// CRC does not cover; a byte after the row; a byte of the trailer. A
+    /// page checks against its word, and a slot that straddles two pages
+    /// is held to both.
+    #[test]
+    fn a_stride_body_refuses_bytes_its_trailer_does_not_describe() {
+        let fx = Fixture::new("stride-body", stride_recs(1500, 100, 0x5e), 1 << 16);
+        assert!(matches!(
+            build(&fx.seg, &fx.out, ID, END, &stride_plan(StrideAsk::Only)).unwrap(),
+            Outcome::Built(_)
+        ));
+        let bytes = std::fs::read(&fx.out).unwrap();
+        let body = StrideBody::from_bytes(&bytes).unwrap();
+        let lay = body.trailer().layout().unwrap();
+        let (len, res) = (bytes.len(), lay.res_off as usize);
+        assert!(
+            lay.res_len < lay.res_pages * ZPAGE as u64,
+            "the row has padding"
+        );
+        let short = &bytes[..len - 1];
+        assert_eq!(StrideBody::from_bytes(short).err(), Some(ZError::Length));
+        let mut longer = bytes[..len - ZTRAILER].to_vec();
+        longer.extend_from_slice(&[0u8; ZPAGE]);
+        longer.extend_from_slice(&bytes[len - ZTRAILER..]);
+        assert_eq!(StrideBody::from_bytes(&longer).err(), Some(ZError::Length));
+        let mut row = bytes.clone();
+        row[res + 5] ^= 1;
+        assert_eq!(
+            StrideBody::from_bytes(&row).err(),
+            Some(ZError::ResidentCrc)
+        );
+        let mut pad = bytes.clone();
+        pad[res + lay.res_len as usize] = 1;
+        assert!(
+            matches!(StrideBody::from_bytes(&pad), Err(ZError::Resident(_))),
+            "a byte after the row"
+        );
+        let mut trailer = bytes.clone();
+        trailer[len - ZTRAILER + 30] ^= 1;
+        assert_eq!(
+            StrideBody::from_bytes(&trailer).err(),
+            Some(ZError::TrailerCrc)
+        );
+        // A value byte: its page fails its word, the others pass theirs.
+        let mut value = bytes.clone();
+        value[ZPAGE + 3] ^= 1;
+        for p in 0..body.pages() as u32 {
+            assert_eq!(body.page_ok(&value, p), p != 1, "page {p}");
+        }
+        // A slot across a page's end, at a hundred bytes a value: the
+        // first page's failure and the second's are each the read's.
+        let w = body.trailer().w as u64;
+        let rank = (0..body.keys())
+            .find(|r| (r * w) / ZPAGE as u64 != (r * w + w - 1) / ZPAGE as u64)
+            .expect("a slot that straddles");
+        let first = (rank * w / ZPAGE as u64) as u32;
+        for bad in [first, first + 1] {
+            assert_eq!(
+                body.values_at(&bytes, rank, &mut |p| p != bad),
+                StrideAt::Bad(bad),
+                "page {bad} of rank {rank}'s two"
+            );
+        }
     }
 }

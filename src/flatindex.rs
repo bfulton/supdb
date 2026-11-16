@@ -573,6 +573,28 @@ pub fn record_key_next(buf: &[u8], off: usize) -> Option<(&[u8], usize)> {
 /// callgrind at three hundred thousand keys (`bench/examples/scan_only.rs`).
 #[inline]
 pub(crate) fn compact_fixed_at(buf: &[u8], off: usize) -> Option<(&[u8], &[u8], usize, usize)> {
+    compact_fixed_tomb_at(buf, off).map(|f| (f.key, f.run, f.records, f.next))
+}
+
+/// The compact record with a fixed run, read in place
+/// (`compact_fixed_tomb_at`).
+pub(crate) struct CompactFixed<'a> {
+    pub key: &'a [u8],
+    pub run: &'a [u8],
+    pub records: usize,
+    /// The offset of the record after it.
+    pub next: usize,
+    /// The run's header carries the tombstone flag.
+    pub tomb: bool,
+}
+
+/// `compact_fixed_at`, and whether the run's header carries the tombstone
+/// flag, which that walk reads past: a reader that holds a record's values
+/// without its flag (the stride form, `db::zfile`) has to decline a flagged
+/// record where the walk serves it, and the flag's place is this layout's
+/// to say, once.
+#[inline]
+pub(crate) fn compact_fixed_tomb_at(buf: &[u8], off: usize) -> Option<CompactFixed<'_>> {
     let h: &[u8; 4] = buf.get(off..off.checked_add(4)?)?.try_into().ok()?;
     if u16::from_le_bytes([h[2], h[3]]) != COMPACT {
         return None;
@@ -597,7 +619,13 @@ pub(crate) fn compact_fixed_at(buf: &[u8], off: usize) -> Option<(&[u8], &[u8], 
     let run = buf.get(e_at + 4..e_at + 4 + elen)?;
     let key = buf.get(key_at..key_at + klen)?;
     let next = off + record_len_compact(klen, elen);
-    (next <= buf.len()).then_some((key, run, records, next))
+    (next <= buf.len()).then_some(CompactFixed {
+        key,
+        run,
+        records,
+        next,
+        tomb: c & C_TOMB != 0,
+    })
 }
 
 #[inline]
