@@ -520,7 +520,10 @@ pub enum ZStride {
     /// partition's name is refused at its attach as another engine's
     /// (`zfile::Reject::Identity`) and built again in the block coding:
     /// what an engine from before the form does with it, which refuses it
-    /// at the trailer's magic. The engine as it was, byte for byte.
+    /// at the trailer's magic. The engine as it was but for that refusal's
+    /// account: counted as an identity rejection (`ZCounts::rejected_identity`)
+    /// where an engine from before counts damage at the magic, and named so
+    /// in the reject's text.
     #[default]
     Off,
     /// Every build of a partition's form file asks for the stride form and
@@ -5930,7 +5933,11 @@ pub struct Options {
     /// build's file: the attach that follows the build, or for a file the
     /// build left on disk -- built ahead and not wanted yet, or at a merge's
     /// output finish -- the attach that first installs it
-    /// (`Shared::z_left_seals`). A file found on disk at an open, or by a
+    /// (`Shared::z_left_seals`), where the build kept the file's pages. A
+    /// build that wrote them back and dropped them
+    /// (`zfile::BuildPlan::drop_output`) leaves no word: its attach reads
+    /// the bytes from the device again, past what its read-back saw. A file
+    /// found on disk at an open, or by a
     /// build's look before it builds where no build of this process left
     /// it, and any later attach of a file already installed, checks each
     /// value page against its row at the page's first touch, as the block
@@ -7670,13 +7677,29 @@ struct ZBuild {
 }
 
 /// What the record of the form files' codings keeps for a file `plan`
-/// builds (`Maint::z_ahead_coding`, `Shared::z_finish_coded`): the plan's
-/// raw tails. One predicate for both sites that record it, since
-/// `Maint::z_file_refused` holds an entry from either to one pick, and a
-/// record two sites take two ways gives a file built by one a verdict the
-/// other's file of the same plan does not get.
+/// builds in the block body (`Maint::z_ahead_coding`,
+/// `Shared::z_finish_coded`): the plan's raw tails. One predicate for both
+/// sites that record it, since `Maint::z_file_refused` holds an entry from
+/// either to one pick, and a record two sites take two ways gives a file
+/// built by one a verdict the other's file of the same plan does not get. A
+/// stride file is on no record (`z_on_record`): the pick is between the block body's two codings, and a stride
+/// file on record under the plan's flag was given back at its attach and
+/// built again into the same bytes whenever the pick moved, and read as
+/// covering nothing meanwhile.
 fn z_coded_record(plan: &zfile::BuildPlan) -> bool {
     plan.raw_tails
+}
+
+/// Whether the record of the codings holds an entry for the file `b`: one
+/// in the block body, whose coding a pick may refuse, and not a stride file.
+fn z_on_record(b: &zfile::Built) -> bool {
+    b.coding != zfile::FileCoding::Stride
+}
+
+/// The record's entry for the file a build of `plan` made as `b`: the
+/// plan's coding where it is on record (`z_on_record`), none otherwise.
+fn z_coded_entry(plan: &zfile::BuildPlan, b: &zfile::Built) -> Option<bool> {
+    z_on_record(b).then(|| z_coded_record(plan))
 }
 
 /// A form file `b` built under `name` and left on disk for a later attach:
@@ -7774,7 +7797,7 @@ impl ZFinish {
                             .z_finish_coded
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .push((zfile::zpg_name(id, end), z_coded_record(&plan)));
+                            .push((zfile::zpg_name(id, end), z_coded_entry(&plan, &b)));
                         z_leave_seal(&shared, zfile::zpg_name(id, end), &b);
                     }
                     Ok(zfile::Outcome::Declined(d)) => ev.declined(d),
@@ -13105,14 +13128,11 @@ struct Slot {
     zdecodes: AtomicU64,
     /// Of `zreads`, the point reads a stride file answered
     /// (`Options::zpages_stride`); the value pages this handle's reads
-    /// checked against a stride file's row at their first touch
-    /// (`zfile::StrideCounts`), both taken off the memo at the dispatch
-    /// after the stride arm raised its flag (`Reader::zstride_take`); and
-    /// the values a cursor's stride position handed over
-    /// (`zfile::StrideCounts::cursor`), taken the same way.
-    zstridereads: AtomicU64,
-    zstridechecks: AtomicU64,
-    zstridecursor: AtomicU64,
+    /// checked against a stride file's row at their first touch; and the
+    /// values a cursor's stride position handed over
+    /// (`zfile::StrideCounts`): counted here by the stride arms through the
+    /// handle's memo (`zfile::ZMemo::tally_into`), and by no dispatch.
+    zstride: zfile::StrideTally,
     /// Groups a scan read in place without a decode (`Group::Coded`).
     zinplace: AtomicU64,
     zraw: AtomicU64,
@@ -13229,9 +13249,7 @@ impl Slot {
             zreads: AtomicU64::new(0),
             zcounts: AtomicU64::new(0),
             zdecodes: AtomicU64::new(0),
-            zstridereads: AtomicU64::new(0),
-            zstridechecks: AtomicU64::new(0),
-            zstridecursor: AtomicU64::new(0),
+            zstride: zfile::StrideTally::new(),
             zinplace: AtomicU64::new(0),
             zraw: AtomicU64::new(0),
             zfallbacks: AtomicU64::new(0),
@@ -14883,20 +14901,25 @@ fn check_options(opts: &Options) -> Result<()> {
     // at every turn and the spares of the partitions after it are never
     // built. What each moves is the block body, so the stride form waits
     // until their records tell the bodies apart. Three of them start those
-    // builds: `zpages_recode` under the forced form, and
-    // `zpages_recode_auto` and `zpages_reparse` under the controller, each
-    // on its own (`Maint::z_recode_tick`). `zpages_recode_keep` and
-    // `zpages_both` start none: the one keeps what a re-code's collect
-    // replaced and the other shapes the look and the spares, and both are
-    // read only on the paths those three start, so beside the stride form
-    // alone they do nothing and are not refused.
-    if opts.zpages_stride != ZStride::Off
-        && (opts.zpages_recode || opts.zpages_recode_auto || opts.zpages_reparse)
-    {
+    // builds, each under one mode and on its own (`Maint::z_recode_tick`):
+    // `zpages_recode` under the forced form (`Maint::z_step`), and
+    // `zpages_recode_auto` and `zpages_reparse` under the controller
+    // (`Maint::z_tick`). Each under the other mode, and `zpages_recode_keep`
+    // and `zpages_both` under either, start none -- the last two keep what a
+    // re-code's collect replaced and shape the look and the spares, read
+    // only on the paths the three start -- so beside the stride form they do
+    // nothing and are not refused: the refusal is of what acts.
+    let recodes = match opts.zpages {
+        ZPages::Always => opts.zpages_recode,
+        ZPages::Auto => opts.zpages_recode_auto || opts.zpages_reparse,
+        ZPages::Off => false,
+    };
+    if opts.zpages_stride != ZStride::Off && recodes {
         return Err(err(
-            "zpages_stride Forced is refused beside the re-code policies \
-             (zpages_recode, zpages_recode_auto, zpages_reparse): each reads a \
-             stride file as the block coding and builds a block coding over its name",
+            "zpages_stride Forced is refused beside a re-code policy that starts \
+             builds (zpages_recode under ZPages::Always, zpages_recode_auto or \
+             zpages_reparse under ZPages::Auto): each reads a stride file as the \
+             block coding and builds a block coding over its name",
         ));
     }
     Ok(())
@@ -18749,11 +18772,15 @@ struct Shared {
     /// the segment work takes into its record of the files' codings
     /// (`Maint::z_ahead_coding`) at its next look, so that a file in the
     /// coding a later pick refuses is not counted as covering its partition.
-    z_finish_coded: std::sync::Mutex<Vec<(String, bool)>>,
+    /// None for a stride file, which the record holds no entry for
+    /// (`z_coded_entry`).
+    z_finish_coded: std::sync::Mutex<Vec<(String, Option<bool>)>>,
     /// The stride files a build of this process wrote, read back and named
     /// and left on disk for a later attach -- a build ahead not wanted yet,
-    /// a build at a merge's output finish -- by name, each with the word
-    /// the build's trailer carries (`zfile::Built::stride_seal`): the attach
+    /// a build at a merge's output finish -- with their pages kept, by name,
+    /// each with the word the build's trailer carries
+    /// (`zfile::Built::stride_seal`, none for a build that dropped its
+    /// pages, which an attach checks page by page): the attach
     /// that first installs one (`Maint::z_attach_on_disk`) is the build's
     /// own attach come late, and holds the file to that word as the collect
     /// and `Db::z_give` hold a file they install at once
@@ -23713,9 +23740,9 @@ impl Reader {
         let mut c = ZCounts {
             reads: rd.stat(|s| &s.zreads),
             counts: rd.stat(|s| &s.zcounts),
-            stride_reads: rd.stat(|s| &s.zstridereads),
-            stride_page_checks: rd.stat(|s| &s.zstridechecks),
-            stride_cursor_reads: rd.stat(|s| &s.zstridecursor),
+            stride_reads: rd.stat(|s| &s.zstride.reads),
+            stride_page_checks: rd.stat(|s| &s.zstride.checks),
+            stride_cursor_reads: rd.stat(|s| &s.zstride.cursor),
             decodes: rd.stat(|s| &s.zdecodes),
             inplace_groups: rd.stat(|s| &s.zinplace),
             rawserves: rd.stat(|s| &s.zraw),
@@ -24017,24 +24044,19 @@ impl Reader {
             self.zbump_by(|s| &s.zkeyhits, p.key_hits);
             self.zbump_by(|s| &s.zowned, p.owned);
         }
-        if self.zmemo.stride_due() {
-            self.zstride_take();
-        }
     }
 
-    /// What a stride file counted on the memo, onto this handle's line: out
-    /// of line, behind the flag the stride arm raises, so the take a block
-    /// file's dispatch makes is the block form's and a byte's look. Not
-    /// `#[cold]`: the stride arm raises the flag on every read it serves, so
-    /// under the forced form this is every stride read's path, and a hint
-    /// that lays it out as the unlikely one would bias the pairing that
-    /// prices the form against the block coding.
-    #[inline(never)]
-    fn zstride_take(&self) {
-        let c = self.zmemo.take_stride();
-        self.zbump_by(|s| &s.zstridechecks, c.checks);
-        self.zbump_by(|s| &s.zstridereads, c.reads);
-        self.zbump_by(|s| &s.zstridecursor, c.cursor);
+    /// The handle, its memo's stride counts sent to its slot line
+    /// (`zfile::ZMemo::tally_into`) where it has one: every handle's
+    /// constructor ends in it.
+    fn tallied(self) -> Reader {
+        if let Some(i) = self.slot.or(self.pin_slot) {
+            // SAFETY: the slot is in the reader table of the `Shared` this
+            // handle holds an `Arc` of, and the memo is a field of the
+            // handle, so the slot outlives the memo.
+            unsafe { self.zmemo.tally_into(&self.shared.readers.slots[i].zstride) };
+        }
+        self
     }
 
     /// `key`'s values in a partition read from its form file
@@ -24181,7 +24203,9 @@ impl Reader {
             seg.hot_read();
             return raw();
         };
-        let served = z.count(&self.zmemo, key);
+        // The block path's count, and a stride file's on its arm for a file
+        // the block path does not serve (`zfile::ZFile::count_block`).
+        let served = z.count_block(&self.zmemo, key);
         self.zmemo_take();
         match served {
             zfile::ZRead::Served { n, decoded } => {
@@ -24199,10 +24223,16 @@ impl Reader {
                 self.zbump(|s| &s.znopage);
                 raw()
             }
-            zfile::ZRead::Out => {
-                self.zbump(|s| &s.zraw);
-                raw()
-            }
+            zfile::ZRead::Out => match z.count_out(key) {
+                zfile::ZRead::Served { n, .. } => {
+                    self.zbump(|s| &s.zcounts);
+                    Ok(n)
+                }
+                _ => {
+                    self.zbump(|s| &s.zraw);
+                    raw()
+                }
+            },
         }
     }
 
@@ -33245,7 +33275,8 @@ impl Db {
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
             filing: std::cell::Cell::new(false),
-        };
+        }
+        .tallied();
         let maint = MaintHome::Here(Box::new(Maint::new(
             r.maint_reader()?,
             dir,
@@ -34046,7 +34077,8 @@ impl Db {
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
             filing: std::cell::Cell::new(false),
-        };
+        }
+        .tallied();
         let maint = MaintHome::Here(Box::new(Maint::new(
             r.maint_reader()?,
             dir,
@@ -36907,7 +36939,8 @@ impl Reader {
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
             filing: std::cell::Cell::new(false),
-        })
+        }
+        .tallied())
     }
 
     /// A handle for the seal thread, which publishes the frozen table's
@@ -36918,45 +36951,48 @@ impl Reader {
     /// are taken, and the seal publishes nothing.
     fn seal_reader(&self) -> Option<Reader> {
         let slot = self.shared.readers.claim_engine()?;
-        Some(Reader {
-            shared: self.shared.clone(),
-            counted: false,
-            understudy: false,
-            scan_ns: std::cell::Cell::new([0; 6]),
-            forms_off_now: std::cell::Cell::new(false),
-            ord_served: std::cell::Cell::new(0),
-            ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
-                .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
-                .point_filter(self.opts.zpages_point_filter)
-                .filter_ahead(self.opts.zpages_filter_ahead)
-                .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
-                .bulk(
-                    self.opts.zpages_bulk_admit,
-                    self.opts.zpages_bulk_ahead,
-                    self.opts.zpages_bulk_part,
-                )
-                .bulk_within(self.opts.zpages_bulk_ahead_within)
-                .bulk_steps(self.opts.zpages_bulk_steps),
-            zwin: std::cell::Cell::new(ZWindow::closed()),
-            zwin_open: std::cell::Cell::new(false),
-            zwin_counting: std::cell::Cell::new(false),
-            zcensus: false,
-            slot: Some(slot),
-            pin_slot: None,
-            depth: std::cell::Cell::new(0),
-            isolation: std::cell::Cell::new(Isolation::Dirty),
-            held: AtomicPtr::new(std::ptr::null_mut()),
-            wm: std::cell::Cell::new(SEE_ALL),
-            opts: self.opts.clone(),
-            fs: FormsCell::new(),
-            signalled: std::cell::Cell::new((0, usize::MAX)),
-            mode_note: std::cell::Cell::new(ModeNote::default()),
-            log_bound: std::cell::Cell::new(usize::MAX),
-            len_bound: std::cell::Cell::new(usize::MAX),
-            force_due: std::cell::Cell::new(false),
-            filing: std::cell::Cell::new(false),
-        })
+        Some(
+            Reader {
+                shared: self.shared.clone(),
+                counted: false,
+                understudy: false,
+                scan_ns: std::cell::Cell::new([0; 6]),
+                forms_off_now: std::cell::Cell::new(false),
+                ord_served: std::cell::Cell::new(0),
+                ord_declined: std::cell::Cell::new(0),
+                zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
+                    .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
+                    .point_filter(self.opts.zpages_point_filter)
+                    .filter_ahead(self.opts.zpages_filter_ahead)
+                    .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
+                    .bulk(
+                        self.opts.zpages_bulk_admit,
+                        self.opts.zpages_bulk_ahead,
+                        self.opts.zpages_bulk_part,
+                    )
+                    .bulk_within(self.opts.zpages_bulk_ahead_within)
+                    .bulk_steps(self.opts.zpages_bulk_steps),
+                zwin: std::cell::Cell::new(ZWindow::closed()),
+                zwin_open: std::cell::Cell::new(false),
+                zwin_counting: std::cell::Cell::new(false),
+                zcensus: false,
+                slot: Some(slot),
+                pin_slot: None,
+                depth: std::cell::Cell::new(0),
+                isolation: std::cell::Cell::new(Isolation::Dirty),
+                held: AtomicPtr::new(std::ptr::null_mut()),
+                wm: std::cell::Cell::new(SEE_ALL),
+                opts: self.opts.clone(),
+                fs: FormsCell::new(),
+                signalled: std::cell::Cell::new((0, usize::MAX)),
+                mode_note: std::cell::Cell::new(ModeNote::default()),
+                log_bound: std::cell::Cell::new(usize::MAX),
+                len_bound: std::cell::Cell::new(usize::MAX),
+                force_due: std::cell::Cell::new(false),
+                filing: std::cell::Cell::new(false),
+            }
+            .tallied(),
+        )
     }
 
     /// A handle for the engine's own use -- the builder ahead's -- which
@@ -37012,7 +37048,8 @@ impl Reader {
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
             filing: std::cell::Cell::new(false),
-        })
+        }
+        .tallied())
     }
 }
 
@@ -37656,6 +37693,49 @@ impl Db {
             .keys()
             .filter(|n| names.contains(*n))
             .count()
+    }
+
+    /// A test's: the words kept for stride files a build of this process
+    /// left on disk (`Shared::z_left_seals`), a live partition's or not --
+    /// what the record holds, of which `zpage_left_seals` counts the live.
+    #[doc(hidden)]
+    pub fn zpage_left_seals_held(&self) -> usize {
+        self.shared
+            .z_left_seals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    /// A test's: words kept under `names` as a build of this process keeps
+    /// them for the stride files it leaves on disk (`Shared::z_left_seals`):
+    /// a name no live partition has stands for a file whose partition a
+    /// merge retired before the attach that would have taken its word.
+    #[doc(hidden)]
+    pub fn zpage_leave_seals(&self, names: &[String]) {
+        let mut seals = self
+            .shared
+            .z_left_seals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for n in names {
+            seals.insert(n.clone(), 0);
+        }
+    }
+
+    /// A test's: the reason each live partition's segment keeps for not
+    /// having been built in the stride form (`Seg::z_stride_no`), in key
+    /// order: none where a build made its stride file or none has asked, a
+    /// `zfile::StrideNo` code otherwise, one more than the reason's slot in
+    /// `ZCounts::stride_declines`.
+    #[doc(hidden)]
+    pub fn zpage_stride_nos(&self) -> Vec<u8> {
+        let _op = self.op();
+        self.segs()
+            .iter()
+            .filter(|s| s.level > 0)
+            .map(|s| s.z_stride_no.load(AtomicOrdering::Relaxed))
+            .collect()
     }
 
     pub fn segments(&self) -> usize {
@@ -40090,6 +40170,7 @@ impl Reader {
             filing: std::cell::Cell::new(false),
             fs: FormsCell::empty(),
         }
+        .tallied()
     }
 
     /// The upkeep thread's loop, on an understudy: see `Lend`.
@@ -49084,6 +49165,7 @@ impl Maint {
         };
         let own = self.opts.zpages_own_decoder;
         let advise = Db::z_advise(&self.opts);
+        let stride = self.opts.z_stride_attach();
         let mut sums = ZSums::default();
         let (mut on_disk, mut on_recs, mut missing_recs, mut timed) = (0usize, 0u64, 0u64, 0usize);
         for seg in &segs {
@@ -49099,7 +49181,8 @@ impl Maint {
                 .filter(|&(id, end)| !self.z_file_refused(&zfile::zpg_name(id, end)))
                 .and_then(|(id, end)| {
                     let path = self.dir.join(zfile::zpg_name(id, end));
-                    zfile::file_facts(&path, blob, id, end, advise).map(|f| (path, id, end, f))
+                    zfile::file_facts(&path, blob, id, end, advise, &stride)
+                        .map(|f| (path, id, end, f))
                 });
             let Some((path, id, end, f)) = on else {
                 missing_recs = missing_recs.saturating_add(facts.recs_len);
@@ -49647,7 +49730,12 @@ impl Maint {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()),
         );
-        self.z_ahead_coding.extend(coded);
+        for (name, coded) in coded {
+            match coded {
+                Some(raw) => self.z_ahead_coding.insert(name, raw),
+                None => self.z_ahead_coding.remove(&name),
+            };
+        }
         let live = {
             let _op = self.op();
             self.segs().iter().filter(|s| s.level > 0).count()
@@ -50948,6 +51036,14 @@ impl Maint {
         };
         if let Ok(o) = &outcome {
             o.note_stride(&seg.z_stride_no);
+        }
+        // The record of the codings took the plan's for a build ahead at
+        // its plan (`z_coded_record`), before the body was known: a stride
+        // file is on no record (`z_coded_entry`).
+        if let Ok(zfile::Outcome::Built(b)) = &outcome {
+            if !z_on_record(b) {
+                self.z_ahead_coding.remove(&zfile::zpg_name(id, end));
+            }
         }
         match outcome {
             // A spare: attached beside the served file and kept, its pages
@@ -52466,8 +52562,51 @@ mod finish_coding {
             .clone();
         assert_eq!(
             coded,
-            vec![(zfile::zpg_name(id, end), z_coded_record(&plan))],
+            vec![(zfile::zpg_name(id, end), Some(z_coded_record(&plan)))],
             "the finish build's record is the builds ahead's for its plan"
+        );
+        // The same plan asking for the stride form, which the partition's
+        // numbered keys of one value each take: a stride file, on no record
+        // whatever the plan's raw tails say -- the pick is the block body's,
+        // and a stride file on record under the plan's flag was given back
+        // at its attach and built again whenever the pick moved.
+        db.shared
+            .z_finish_coded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let _ = std::fs::remove_file(segs.join(zfile::zpg_name(id, end)));
+        let mut stride = plan.clone();
+        stride.stride = zfile::StrideAsk::OrBlock;
+        let finish = ZFinish {
+            plan: stride,
+            ..finish
+        };
+        finish.build(&name);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while db.shared.z_finish_live.load(AtomicOrdering::Acquire) > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the finish build ends"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let bytes = std::fs::read(segs.join(zfile::zpg_name(id, end))).unwrap();
+        assert_eq!(
+            zpages::trailer_magic(&bytes[bytes.len() - zpages::ZTRAILER..]),
+            Some(zpages::STRIDE_MAGIC),
+            "a stride file"
+        );
+        let coded = db
+            .shared
+            .z_finish_coded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(
+            coded,
+            vec![(zfile::zpg_name(id, end), None)],
+            "a stride file is on no record of the block body's codings"
         );
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&base);

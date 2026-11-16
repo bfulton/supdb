@@ -822,6 +822,28 @@ impl GroupBuf {
         unsafe { std::slice::from_raw_parts_mut(self.words.as_mut_ptr() as *mut u8, room) }
     }
 
+    /// Its first [`STRIDE_KEY_MAX`] bytes as the last write left them, the
+    /// buffer grown to hold them where it is shorter: a stride cursor's key,
+    /// rendered and stepped in place in the buffer the cursor holds, which a
+    /// stride file, with no group to decode, leaves to it. Only the first
+    /// call grows a buffer, so a key rendered into it is there at the next.
+    pub fn stride_key(&mut self) -> &mut [u8; STRIDE_KEY_MAX] {
+        if self.words.len() * 8 < STRIDE_KEY_MAX {
+            self.grow_for_stride_key();
+        }
+        // SAFETY: `words` owns at least `STRIDE_KEY_MAX` initialised bytes,
+        // grown above where it did not, `u8` has no alignment to violate,
+        // and the borrow of `self` is the only access while the array lives.
+        unsafe { &mut *(self.words.as_mut_ptr() as *mut [u8; STRIDE_KEY_MAX]) }
+    }
+
+    /// `stride_key`'s growth, once a thread's buffer, out of line.
+    #[cold]
+    #[inline(never)]
+    fn grow_for_stride_key(&mut self) {
+        self.bytes_for(STRIDE_KEY_MAX);
+    }
+
     /// The bytes the buffer holds room for: what the last growth made it,
     /// in whole pages, and zero before the first decode into it.
     pub fn capacity_bytes(&self) -> usize {

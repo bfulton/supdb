@@ -68,7 +68,7 @@ jobs:
       # `scripts/check.sh` is the single definition of what this project
       # checks, so a contributor running it locally runs exactly this.
       - name: Build, test and lint the engine and the suite
-        run: sh scripts/check.sh build test lint bench
+        run: sh scripts/check.sh build test stride lint bench
       - name: The machine, as a row records it
         run: ./bench/target/release/bench machine | tee -a "$GITHUB_STEP_SUMMARY"
 

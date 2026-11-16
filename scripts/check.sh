@@ -16,6 +16,15 @@
 #   build    the crate, release
 #   test     cargo test (unit and integration, every target), optimized
 #            with overflow and invariant checks on
+#   stride   the tests again with the stride form forced (an EXPERIMENT,
+#            `Options::zpages_stride`): every test that forces the compact
+#            form or names no form, under SUPDB_TEST_STRIDE (tests/common),
+#            and a bounded seed range of the differential fuzz with the form
+#            forced on its z store (ZFUZZ_STRIDE). The test group's binaries,
+#            so it builds nothing of its own. Its own group because a switch
+#            that only a hand ran checked nothing between two hand runs: the
+#            adaptations it made of other tests, and the stride form under
+#            threads and under a checkpoint, ran in no gate
 #   lint     clippy at -D warnings, and the format gate
 #   wasm     the browser reader and its floor, built for wasm32-unknown-unknown
 #            by web/build.sh
@@ -31,7 +40,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-ALL="build test lint wasm bench"
+ALL="build test stride lint wasm bench"
 # Lowercase because `GROUPS` is a built-in bash variable holding the current
 # user's group ids. Assigning to it does not take, so on any host where
 # /bin/sh is bash -- macOS ships bash 3.2 as /bin/sh -- this loop would have
@@ -50,6 +59,12 @@ for g in $groups; do
     test)
       say "test"
       cargo test --profile checked
+      ;;
+    stride)
+      say "stride"
+      SUPDB_TEST_STRIDE=1 cargo test --profile checked --no-fail-fast
+      ZFUZZ_ZPAGES=1 ZFUZZ_STRIDE=1 ZFUZZ_FROM=0 ZFUZZ_TO=24 \
+        cargo test --profile checked --test fuzz fuzz_range -- --exact
       ;;
     lint)
       say "lint"
