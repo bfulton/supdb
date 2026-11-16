@@ -206,8 +206,10 @@ impl Dense {
         let (full, present) = match std::fs::read(dir.join(PRESENT)) {
             Ok(b) => {
                 let words: Vec<u64> = b
-                    .chunks_exact(8)
-                    .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| u64::from_le_bytes(*c))
                     .collect();
                 let mut full = 0u64;
                 while full < count
