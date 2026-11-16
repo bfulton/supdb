@@ -507,11 +507,18 @@ fn a_stride_life(name: &str) {
     read_all(&db);
     read_all(&pinned);
     drop(db);
+    // The retired file by its own mapping: the rebuild renamed a new file
+    // over its name, so its inode shows unlinked. The pinned state maps the
+    // rebuilt files too, under their names, and those alone are no sign of
+    // the retired one.
     #[cfg(target_os = "linux")]
-    assert!(
-        !common::zpg_mappings(&d).is_empty(),
-        "the pin holds the retired stride file past the store's close"
-    );
+    {
+        let maps = common::zpg_mappings(&d);
+        assert!(
+            maps.iter().any(|p| p.ends_with(" (deleted)")),
+            "the pin holds the retired stride file past the store's close: {maps:?}"
+        );
+    }
     drop(pinned);
     #[cfg(target_os = "linux")]
     assert!(

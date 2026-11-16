@@ -5361,7 +5361,10 @@ pub struct Options {
     /// lost the mixes to the decode (`docs/engine.md`). On as shipped;
     /// `supdb-znohotraw` is the shape with every covered partition served
     /// from its form file. Stands down where the re-code policy runs
-    /// (`zpages_recode_auto`, `zpages_reparse`).
+    /// (`zpages_recode_auto`, `zpages_reparse`), and beside the stride form
+    /// (`zpages_stride`), whose files count no decode or open: rated at no
+    /// heat, each was a partition of the median a block file's skew is read
+    /// against at nothing, until the heat and the median are counted by form.
     pub zpages_hot_raw: bool,
     /// EXPERIMENT: with the hot-raw policy, a release's room is the group's
     /// unused memory -- its limit less its anonymous memory and its page
@@ -5930,20 +5933,22 @@ pub struct Options {
     /// its name (`zfile::check_stride`) is installed with every value page
     /// marked verified, once its attach has found under the name the trailer
     /// that build wrote -- the row's CRC in it, so the row too -- and so the
-    /// build's file: the attach that follows the build, or for a file the
-    /// build left on disk -- built ahead and not wanted yet, or at a merge's
-    /// output finish -- the attach that first installs it
-    /// (`Shared::z_left_seals`), where the build kept the file's pages. A
-    /// build that wrote them back and dropped them
-    /// (`zfile::BuildPlan::drop_output`) leaves no word: its attach reads
-    /// the bytes from the device again, past what its read-back saw. A file
-    /// found on disk at an open, or by a
-    /// build's look before it builds where no build of this process left
-    /// it, and any later attach of a file already installed, checks each
-    /// value page against its row at the page's first touch, as the block
-    /// form checks its pages; the reads count those checks
-    /// (`ZCounts::stride_page_checks`). Off, the file a build made is
-    /// checked so too. On.
+    /// build's file: the attach that follows the build, which reads what the
+    /// read-back read; or for a file the build left on disk -- built ahead
+    /// and not wanted yet, or at a merge's output finish -- the attach that
+    /// first installs it (`Shared::z_left_seals`), where the build's
+    /// read-back read the device: none of the file's pages in the page cache
+    /// as it began (`zfile::Built::left_seal`), what a build that writes its
+    /// output back and drops it leaves (`zfile::BuildPlan::drop_output`). A
+    /// build that kept its pages read back the cache, and a later attach
+    /// reads the device's copy, which no check has seen, once the cache has
+    /// given the pages up: it leaves no word. A file found on disk at an
+    /// open, or by a build's look before it builds where no build of this
+    /// process left a word for it, and any later attach of a file already
+    /// installed, checks each value page against its row at the page's
+    /// first touch, as the block form checks its pages; the reads count
+    /// those checks (`ZCounts::stride_page_checks`). Off, the file a build
+    /// made is checked so too. On.
     #[doc(hidden)]
     pub zpages_stride_trust_built: bool,
 }
@@ -5998,12 +6003,13 @@ impl Options {
     }
 
     /// `z_stride_attach` for a file a build of this process wrote as a
-    /// stride file, its trailer's word `seal` (`zfile::Built::stride_seal`,
-    /// at once or kept by name until its attach, `Shared::z_left_seals`):
-    /// trusted where `zpages_stride_trust_built` says so, since the build's
-    /// read-back held every rank to its records, and so its pages need no
-    /// check at their first touch once the attach has found the trailer the
-    /// build wrote under the name. No word, the file found on disk.
+    /// stride file, its trailer's word `seal` (`zfile::Built::stride_seal`
+    /// at once, `zfile::Built::left_seal` kept by name until its attach,
+    /// `Shared::z_left_seals`): trusted where `zpages_stride_trust_built`
+    /// says so, since the build's read-back held every rank to its records
+    /// as the attach will read them, and so its pages need no check at their
+    /// first touch once the attach has found the trailer the build wrote
+    /// under the name. No word, the file found on disk.
     fn z_stride_attach_sealed(&self, seal: Option<u32>) -> zfile::StrideAttach {
         match (self.z_stride_attach(), seal) {
             (zfile::StrideAttach::Check, Some(seal)) if self.zpages_stride_trust_built => {
@@ -7703,16 +7709,17 @@ fn z_coded_entry(plan: &zfile::BuildPlan, b: &zfile::Built) -> Option<bool> {
 }
 
 /// A form file `b` built under `name` and left on disk for a later attach:
-/// its trailer's word kept for that attach where it is a stride file
-/// (`Shared::z_left_seals`), and any word kept for an earlier file under
-/// the name dropped where it is not, so that the record names what the
-/// name holds.
+/// its trailer's word kept for that attach where it is a stride file whose
+/// read-back read the device (`zfile::Built::left_seal`,
+/// `Shared::z_left_seals`), and any word kept for an earlier file under the
+/// name dropped where there is none, so that the record names what the name
+/// holds.
 fn z_leave_seal(shared: &Shared, name: String, b: &zfile::Built) {
     let mut seals = shared
         .z_left_seals
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    match b.stride_seal {
+    match b.left_seal() {
         Some(seal) => {
             seals.insert(name, seal);
         }
@@ -7721,6 +7728,12 @@ fn z_leave_seal(shared: &Shared, name: String, b: &zfile::Built) {
         }
     }
 }
+
+/// A build at a merge's output finish as the segment work takes it in
+/// (`Shared::z_finish_coded`): its form file's name, whether the file is on
+/// the codings' record and raw-tailed (`z_coded_entry`), and what it said
+/// of the stride form (`zfile::Outcome::stride_code`).
+type FinishCoded = (String, Option<bool>, Option<u8>);
 
 /// What a merge's thread is given to build each output's form file as the
 /// output is finished (`Options::zpages_build_at_finish`): the builder's
@@ -7777,6 +7790,7 @@ impl ZFinish {
                 zbuild_hold_wait(&hold, ZHOLD_START);
                 let r = File::open(&path).and_then(|f| zfile::build_file(f, &out, id, end, &plan));
                 let ev = &shared.z;
+                let stride = r.as_ref().ok().and_then(zfile::Outcome::stride_code);
                 match r {
                     Ok(zfile::Outcome::Built(b)) => {
                         if trace {
@@ -7797,7 +7811,7 @@ impl ZFinish {
                             .z_finish_coded
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .push((zfile::zpg_name(id, end), z_coded_entry(&plan, &b)));
+                            .push((zfile::zpg_name(id, end), z_coded_entry(&plan, &b), stride));
                         z_leave_seal(&shared, zfile::zpg_name(id, end), &b);
                     }
                     Ok(zfile::Outcome::Declined(d)) => ev.declined(d),
@@ -18773,18 +18787,20 @@ struct Shared {
     /// (`Maint::z_ahead_coding`) at its next look, so that a file in the
     /// coding a later pick refuses is not counted as covering its partition.
     /// None for a stride file, which the record holds no entry for
-    /// (`z_coded_entry`).
-    z_finish_coded: std::sync::Mutex<Vec<(String, Option<bool>)>>,
-    /// The stride files a build of this process wrote, read back and named
-    /// and left on disk for a later attach -- a build ahead not wanted yet,
-    /// a build at a merge's output finish -- with their pages kept, by name,
-    /// each with the word the build's trailer carries
-    /// (`zfile::Built::stride_seal`, none for a build that dropped its
-    /// pages, which an attach checks page by page): the attach
-    /// that first installs one (`Maint::z_attach_on_disk`) is the build's
-    /// own attach come late, and holds the file to that word as the collect
-    /// and `Db::z_give` hold a file they install at once
-    /// (`Options::zpages_stride_trust_built`). Taken by that attach, and
+    /// (`z_coded_entry`). Beside it the build's word on the stride form
+    /// (`zfile::Outcome::stride_code`), which the output's segment, not live
+    /// while its finish builds, is given at the attach that installs the
+    /// file (`Maint::z_finish_stride`).
+    z_finish_coded: std::sync::Mutex<Vec<FinishCoded>>,
+    /// The stride files a build of this process wrote, read back from the
+    /// device and named and left on disk for a later attach -- a build ahead
+    /// not wanted yet, a build at a merge's output finish -- by name, each
+    /// with the word the build's trailer carries (`zfile::Built::left_seal`,
+    /// none for a build that kept its pages and read back the cache, which
+    /// an attach checks page by page): the attach that first installs one
+    /// (`Maint::z_attach_on_disk`) is the build's own attach come late, and
+    /// holds the file to that word as the collect and `Db::z_give` hold a
+    /// file they install at once (`Options::zpages_stride_trust_built`). Taken by that attach, and
     /// held to the live partitions' names as the codings' record is
     /// (`Maint::z_take_finish_codings`), since a file whose partition a
     /// merge retired never reaches it. A later attach of the same file, a
@@ -37727,7 +37743,9 @@ impl Db {
     /// having been built in the stride form (`Seg::z_stride_no`), in key
     /// order: none where a build made its stride file or none has asked, a
     /// `zfile::StrideNo` code otherwise, one more than the reason's slot in
-    /// `ZCounts::stride_declines`.
+    /// `ZCounts::stride_declines`. A build at a merge's output finish says
+    /// so at the attach that installs its file, the output's segment not
+    /// live while it built (`Maint::z_finish_stride`).
     #[doc(hidden)]
     pub fn zpage_stride_nos(&self) -> Vec<u8> {
         let _op = self.op();
@@ -44607,6 +44625,12 @@ struct Maint {
     /// merge started and the pick may be taken back after it
     /// (`Maint::z_repick`).
     z_ahead_coding: std::collections::HashMap<String, bool>,
+    /// What the builds at a merge's output finish said of the stride form,
+    /// by their form files' names (`Shared::z_finish_coded`), until the
+    /// attach that installs each file gives it to the output's segment
+    /// (`Seg::z_stride_no`), which was not live while it was built. Held to
+    /// the live partitions' names as the codings' record is.
+    z_finish_stride: std::collections::HashMap<String, u8>,
     /// The re-code policy's (`Options::zpages_recode`): when it last
     /// looked; each form file's decode time and opens then, by its attach's
     /// identity; each partition's decayed heat, by its name; the group's
@@ -45259,6 +45283,7 @@ impl Maint {
             z_ask_pending: false,
             z_land_due: false,
             z_ahead_coding: std::collections::HashMap::new(),
+            z_finish_stride: std::collections::HashMap::new(),
             z_recode_last: None,
             z_recode_seen: std::collections::HashMap::new(),
             z_recode_heat: std::collections::HashMap::new(),
@@ -47574,19 +47599,11 @@ impl Maint {
                         && !self.z_finishing(&s.name)
                         && !self.z_ahead_holds(&s.name)
                 })
-                // A stride file is a served row like a block file's: not
-                // the record coding's, its bytes its file's, and no decode
-                // or open counted, so it adds nothing to the decode's price
-                // below and rates no heat -- never a candidate for a release
-                // (its window under `HOT_RAW_MIN_SAMPLES`), never the raw
-                // partition the way back takes, its bytes counted with the
-                // forms'. Rated, it is one of the partitions the median is
-                // taken over, at nothing. No kind check is needed for an
-                // answer: the release of a stride partition, were one rated
-                // hot, takes it raw as it would a block file's. Under
-                // `ZStride::Forced` beside `ZPages::Auto` that is what the
-                // look sees; the heat and the median by form are a later
-                // step's, with the policy that converts.
+                // A stride file would be a served row like a block file's:
+                // no decode or open counted, so no heat, and one of the
+                // partitions the median is taken over at nothing. The look
+                // stands down beside the stride form (`z_hot_runs`) until
+                // the heat and the median are counted by form.
                 .filter_map(|s| match s.z.get() {
                     Some(z) if !z.damaged() => Some((
                         s.clone(),
@@ -48534,11 +48551,13 @@ impl Maint {
     }
 
     /// Whether the hot-raw policy is this store's: on, under the controller,
-    /// and standing down where the re-code policy runs.
+    /// and standing down where the re-code policy runs and beside the stride
+    /// form (`Options::zpages_hot_raw`).
     fn z_hot_runs(&self) -> bool {
         self.opts.zpages_hot_raw
             && self.opts.zpages == ZPages::Auto
             && !(self.opts.zpages_recode_auto || self.opts.zpages_reparse)
+            && self.opts.zpages_stride == ZStride::Off
     }
 
     /// The controller's clock: the injected one where a test has moved it,
@@ -48659,7 +48678,12 @@ impl Maint {
             return None;
         }
         let (mut hash, mut records, mut nkeys, mut n_pages) = (0u64, 0u64, 0u64, 0u64);
-        // A partition the hot-raw policy holds raw is raw footprint whole.
+        // A partition the hot-raw policy holds raw is raw footprint whole,
+        // and so is one a stride file serves: its reads touch no page the
+        // handles count (`zfile::ZFile::stride`), and its value pages hold
+        // the values alone, so its keys over them are no share of a touched
+        // block page's -- in the division below they thinned every page's
+        // records and left its raw footprint out of the bound.
         let mut held = 0u64;
         for s in self.segs().iter().filter(|s| s.level > 0) {
             let Some(z) = s.z.get() else {
@@ -48669,6 +48693,11 @@ impl Maint {
                 }
                 continue;
             };
+            if z.is_stride() {
+                let (h, r) = s.foot();
+                held = held.saturating_add(h).saturating_add(r);
+                continue;
+            }
             let (h, r) = s.foot();
             hash = hash.saturating_add(h);
             records = records.saturating_add(r);
@@ -49168,6 +49197,7 @@ impl Maint {
         let stride = self.opts.z_stride_attach();
         let mut sums = ZSums::default();
         let (mut on_disk, mut on_recs, mut missing_recs, mut timed) = (0usize, 0u64, 0u64, 0usize);
+        let mut on_block = 0usize;
         for seg in &segs {
             let blob = seg.blob.for_zfile();
             let Some(facts) = blob.z_source_facts() else {
@@ -49193,6 +49223,13 @@ impl Maint {
             sums.w_z = sums.w_z.saturating_add(f.bytes);
             sums.resident = sums.resident.saturating_add(f.resident);
             sums.pages = sums.pages.saturating_add(f.pages);
+            // A stride file holds no group to time: a read of it decodes
+            // nothing, and the decode the reading prices is the block
+            // files' alone.
+            if f.stride {
+                continue;
+            }
+            on_block += 1;
             if timed < READING_TIMED_FILES {
                 if let Some(d) =
                     zfile::time_file_decodes(&path, blob, id, end, READING_TIMED_PAGES, own, advise)
@@ -49206,7 +49243,12 @@ impl Maint {
                 }
             }
         }
-        if on_disk == 0 || on_recs == 0 || sums.zgroups == 0 {
+        // A decode timed where block files are on disk, and none needed
+        // where every file is a stride file, whose reads are priced at no
+        // decode: asked of every store, the reading never stood for one whose
+        // every partition is a stride file, and the fill sample ran in its
+        // place over files already on disk.
+        if on_disk == 0 || on_recs == 0 || (on_block > 0 && sums.zgroups == 0) {
             return false;
         }
         // The partitions without a file, at the ratio of those with one.
@@ -49730,7 +49772,11 @@ impl Maint {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()),
         );
-        for (name, coded) in coded {
+        for (name, coded, stride) in coded {
+            match stride {
+                Some(code) => self.z_finish_stride.insert(name.clone(), code),
+                None => self.z_finish_stride.remove(&name),
+            };
             match coded {
                 Some(raw) => self.z_ahead_coding.insert(name, raw),
                 None => self.z_ahead_coding.remove(&name),
@@ -49745,7 +49791,13 @@ impl Maint {
             .z_left_seals
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if self.z_ahead_coding.len().max(seals.len()) > 4 * live.max(8) {
+        if self
+            .z_ahead_coding
+            .len()
+            .max(seals.len())
+            .max(self.z_finish_stride.len())
+            > 4 * live.max(8)
+        {
             let names: std::collections::HashSet<String> = {
                 let _op = self.op();
                 self.segs()
@@ -49755,6 +49807,7 @@ impl Maint {
                     .collect()
             };
             self.z_ahead_coding.retain(|n, _| names.contains(n));
+            self.z_finish_stride.retain(|n, _| names.contains(n));
             seals.retain(|n, _| names.contains(n));
         }
     }
@@ -50649,6 +50702,11 @@ impl Maint {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&name);
+        // What the build at the output's finish said of the stride form,
+        // the segment's to keep now that it is live (`Seg::z_stride_no`).
+        if let Some(code) = self.z_finish_stride.remove(&name) {
+            seg.z_stride_no.store(code, AtomicOrdering::Relaxed);
+        }
         if !dormant {
             let want = self
                 .z_coding_pick
@@ -52562,7 +52620,7 @@ mod finish_coding {
             .clone();
         assert_eq!(
             coded,
-            vec![(zfile::zpg_name(id, end), Some(z_coded_record(&plan)))],
+            vec![(zfile::zpg_name(id, end), Some(z_coded_record(&plan)), None)],
             "the finish build's record is the builds ahead's for its plan"
         );
         // The same plan asking for the stride form, which the partition's
@@ -52605,7 +52663,7 @@ mod finish_coding {
             .clone();
         assert_eq!(
             coded,
-            vec![(zfile::zpg_name(id, end), None)],
+            vec![(zfile::zpg_name(id, end), None, Some(0))],
             "a stride file is on no record of the block body's codings"
         );
         db.close().unwrap();

@@ -235,12 +235,20 @@ impl MmapBytes {
     /// kernel holds in memory now, by `mincore`: what a warm of the file can
     /// skip. The range is clamped to the mapping, and every page a byte of
     /// it lies in counts, the first one from its start; zero for a range
-    /// that is empty or past the mapping, and where the kernel will not say.
+    /// that is empty or past the mapping, and where the kernel will not say
+    /// (`resident_count` tells that apart).
     pub fn resident_pages(&self, off: usize, len: usize) -> usize {
+        self.resident_count(off, len).unwrap_or(0)
+    }
+
+    /// `resident_pages`, with `None` where the kernel will not say: for a
+    /// question whose wrong answer is "none resident", which a count read
+    /// as zero on a refusal would give.
+    pub fn resident_count(&self, off: usize, len: usize) -> Option<usize> {
         let page = os_page_size();
         let end = off.saturating_add(len).min(self.0.len());
         if end <= off {
-            return 0;
+            return Some(0);
         }
         let start = off / page * page;
         let span = end - start;
@@ -255,9 +263,9 @@ impl MmapBytes {
             )
         };
         if rc != 0 {
-            return 0;
+            return None;
         }
-        vec.iter().filter(|&&b| b & 1 != 0).count()
+        Some(vec.iter().filter(|&&b| b & 1 != 0).count())
     }
 }
 

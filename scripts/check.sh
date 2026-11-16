@@ -19,12 +19,14 @@
 #   stride   the tests again with the stride form forced (an EXPERIMENT,
 #            `Options::zpages_stride`): every test that forces the compact
 #            form or names no form, under SUPDB_TEST_STRIDE (tests/common),
-#            and a bounded seed range of the differential fuzz with the form
-#            forced on its z store (ZFUZZ_STRIDE). The test group's binaries,
-#            so it builds nothing of its own. Its own group because a switch
-#            that only a hand ran checked nothing between two hand runs: the
-#            adaptations it made of other tests, and the stride form under
-#            threads and under a checkpoint, ran in no gate
+#            and bounded seed ranges of the differential fuzz and of its
+#            readers on threads with the form forced on the store
+#            (ZFUZZ_STRIDE), each failing a range no stride read reached.
+#            The test group's binaries, so it builds nothing of its own. Its
+#            own group because a switch that only a hand ran checked nothing
+#            between two hand runs: the adaptations it made of other tests,
+#            and the stride form under threads and under a checkpoint, ran
+#            in no gate
 #   lint     clippy at -D warnings, and the format gate
 #   wasm     the browser reader and its floor, built for wasm32-unknown-unknown
 #            by web/build.sh
@@ -65,6 +67,8 @@ for g in $groups; do
       SUPDB_TEST_STRIDE=1 cargo test --profile checked --no-fail-fast
       ZFUZZ_ZPAGES=1 ZFUZZ_STRIDE=1 ZFUZZ_FROM=0 ZFUZZ_TO=24 \
         cargo test --profile checked --test fuzz fuzz_range -- --exact
+      ZFUZZ_ZPAGES=1 ZFUZZ_STRIDE=1 ZFUZZ_FROM=0 ZFUZZ_TO=4 \
+        cargo test --profile checked --test fuzz concurrent_range -- --exact
       ;;
     lint)
       say "lint"

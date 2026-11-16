@@ -303,8 +303,29 @@ pub(super) enum ZSeek {
 /// mapping, decoded in the cursor's own buffer, or nowhere -- a run of
 /// records no page holds, or a form file that failed a check under the
 /// cursor, both read through the raw form -- or past the end.
+///
+/// The order of the variants is the tag's, and it is chosen so that each
+/// question the block paths ask of the tag is the one compare it was before
+/// the stride form: `Stride` and `Raw` are the tag's first two, so the step's
+/// question (`advance`) is a tag under the second; the block groups the four
+/// after them and `None` last, so the block groups' range (`resume`,
+/// `walk_inner`, `next_group`) is the subtraction and compare it was. Two
+/// variants matched as two arms are two compares and two branches, which is
+/// what a stride arm beside the raw form's cost every block record and every
+/// block walk; and each test leaves the variants it gathers to a function out
+/// of line, so that the compiler does not split the one test back into a
+/// compare a variant. A block range that became one compare made `resume`'s
+/// two tests one branchless sequence, longer than the branch it replaced.
 enum Group<'a> {
-    None,
+    /// A stride file's position, with the file's body: the position is the
+    /// cursor's rank and nothing else, its key the codec's rendering of the
+    /// rank's number in the cursor's buffer (`GroupBuf::stride_key`), made
+    /// where the cursor is placed and stepped in place as it moves
+    /// (`StrideBody::step_key`),
+    /// and its value the slot at the rank, read after the slot's pages pass
+    /// their checks (`StrideBody::values_at`). Nothing is decoded or opened.
+    Stride(&'a StrideBody),
+    Raw,
     Page(&'a [u8]),
     Buf(usize),
     /// The memo's, `n` bytes of it, held for the group's life in the
@@ -319,17 +340,7 @@ enum Group<'a> {
     /// is compressed after all, or whose extents cannot be read where they
     /// lie, is decoded on its own into the cursor's buffer.
     Coded(&'a [u8], usize),
-    /// A stride file's position, with the file's body: the position is the
-    /// cursor's rank and nothing else, its key the codec's rendering of the
-    /// rank's number in the cursor's buffer (`GroupBuf::stride_key`), made
-    /// where the cursor is placed and stepped in place as it moves
-    /// (`StrideBody::step_key`),
-    /// and its value the slot at the rank, read after the slot's pages pass
-    /// their checks (`StrideBody::values_at`). Nothing is decoded or opened.
-    Stride(&'a StrideBody),
-    /// Last, beside `Stride`: `advance` tests the two at once, a block
-    /// group neither.
-    Raw,
+    None,
 }
 
 /// Whether a record-coded group's tails are raw, judged from its last
@@ -1039,8 +1050,15 @@ impl<'a> ZCursor<'a> {
     /// entry the rank falls in.
     fn next_group(&mut self) {
         // A stride position's end is the run's (`stride_load`), so it comes
-        // here only past the run, to the load that makes it the end.
-        if self.rank < self.page_end && !matches!(self.group, Group::Raw | Group::None) {
+        // here only past the run, to the load that makes it the end; asked
+        // as the block groups' range of the tag (`Group`), one test for the
+        // three that are not.
+        if self.rank < self.page_end
+            && matches!(
+                self.group,
+                Group::Page(_) | Group::Buf(_) | Group::Memo(..) | Group::Coded(..)
+            )
+        {
             if let Some(entry) = self.zfile.fence.entry(self.eidx, self.zfile.nkeys as u32) {
                 // The walk's next group: decoded into this cursor's own
                 // buffer under `ZFile::walk_owns`, the memo asked and not
@@ -1250,17 +1268,25 @@ impl<'a> ZCursor<'a> {
             self.next_group();
             return;
         }
-        // One test of the tag for a group's record: the two variants a
-        // block group is not, `Stride` and `Raw`, are the tag's last two,
-        // and the stride step is on their branch, not ahead of the block
-        // step's.
-        match self.group {
-            Group::Raw => {}
-            Group::Stride(body) => self.stride_step(body),
-            _ => {
-                self.off = self.next;
-                self.place();
-            }
+        // One test of the tag for a group's record, as the step made before
+        // the stride form: `Stride` and `Raw` are the tag's first two
+        // (`Group`), and the step out of line tells them apart.
+        if matches!(self.group, Group::Stride(_) | Group::Raw) {
+            self.step_off_block();
+        } else {
+            self.off = self.next;
+            self.place();
+        }
+    }
+
+    /// `advance`'s step where the group is not a block group: a stride
+    /// position's key moved to the next rank's, a run the raw form reads
+    /// nothing past the rank. Out of line, so that the step's one test of the
+    /// tag is not split into a test a variant.
+    #[inline(never)]
+    fn step_off_block(&mut self) {
+        if let Group::Stride(body) = self.group {
+            self.stride_step(body);
         }
     }
 
@@ -1350,41 +1376,25 @@ impl<'a> ZCursor<'a> {
         self.last_ok = false;
         self.resume();
         let mut n = 0usize;
-        // A stride position walks the run to the limit, to `until`'s rank or
-        // to the end in one call, before the loop: a group is never a stride
-        // position again once the loop runs -- the run's end is `None` and a
-        // fall is `Raw` -- so the block groups' loop tests nothing for it.
-        if let Group::Stride(body) = self.group {
-            let (walked, done) = self.stride_walk(body, until, limit, f);
-            if let Some(order) = done {
-                return Ok((walked, order));
-            }
-            n = walked;
-        }
         while n < limit {
             self.want = (limit - n).saturating_add(self.ahead);
-            if matches!(self.group, Group::None) {
-                return Ok((n, KeyOrder::Greater));
-            }
-            if matches!(self.group, Group::Raw) {
-                let Some(k) = self.raw().key_at(self.rank) else {
-                    return Ok((n, KeyOrder::Greater));
-                };
-                if let Some(u) = until {
-                    match k.cmp(u) {
-                        KeyOrder::Less => {}
-                        order => return Ok((n, order)),
-                    }
+            // The end, a stride position and a run the raw form reads, asked
+            // as one test, a group outside the block groups' range of the tag
+            // (`Group`), where the walk before the stride form tested the end
+            // and the raw form apart and a test of the stride position's own
+            // at the walk's head was a compare and a branch more on every
+            // block walk.
+            if !matches!(
+                self.group,
+                Group::Page(_) | Group::Buf(_) | Group::Memo(..) | Group::Coded(..)
+            ) {
+                let (walked, done) = self.walk_off_block(until, limit - n, f)?;
+                n += walked;
+                if let Some(order) = done {
+                    return Ok((n, order));
                 }
-                self.raw().values_at(self.rank, &mut |v: &[u8]| f(k, v))?;
-                n += 1;
-                self.advance();
                 continue;
             }
-            debug_assert!(
-                !matches!(self.group, Group::Stride(_)),
-                "a stride position inside the block groups' loop"
-            );
             if !self.asked {
                 self.asked = true;
                 let past = (limit - n).saturating_sub(self.page_end - self.rank);
@@ -1555,6 +1565,47 @@ impl<'a> ZCursor<'a> {
             }
         }
         Ok((n, KeyOrder::Greater))
+    }
+
+    /// `walk_inner`'s walk where the group is not a block group, for at most
+    /// `limit` records: how many it handed over, and the answer where the walk
+    /// is done -- the end; a stride position's walk to the limit, `until` or
+    /// the run's end (`stride_walk`); a run the raw form reads, a key at a time
+    /// while the group stays that run, stopped by `until` or the raw form's end
+    /// -- or `None` where the walk goes on in whatever group the cursor holds
+    /// now: the limit reached, a block group opened past the run, or a stride
+    /// position fallen. Out of line, so that the walk's one test of the tag is
+    /// not split into a test a variant.
+    #[inline(never)]
+    fn walk_off_block<F: FnMut(&[u8], &[u8])>(
+        &mut self,
+        until: Option<&[u8]>,
+        limit: usize,
+        f: &mut F,
+    ) -> Result<(usize, Option<KeyOrder>)> {
+        match self.group {
+            Group::None => Ok((0, Some(KeyOrder::Greater))),
+            Group::Stride(body) => Ok(self.stride_walk(body, until, limit, f)),
+            _ => {
+                let mut n = 0usize;
+                while n < limit && matches!(self.group, Group::Raw) {
+                    self.want = (limit - n).saturating_add(self.ahead);
+                    let Some(k) = self.raw().key_at(self.rank) else {
+                        return Ok((n, Some(KeyOrder::Greater)));
+                    };
+                    if let Some(u) = until {
+                        match k.cmp(u) {
+                            KeyOrder::Less => {}
+                            order => return Ok((n, Some(order))),
+                        }
+                    }
+                    self.raw().values_at(self.rank, &mut |v: &[u8]| f(k, v))?;
+                    n += 1;
+                    self.advance();
+                }
+                Ok((n, None))
+            }
+        }
     }
 
     /// A group a walk spent to its last record (`walk_until` at its limit):
@@ -1815,9 +1866,12 @@ impl<'a> ZCursor<'a> {
 // its start, and reads on, each page by its own check, as the block walk
 // reads on in the group it holds when another handle takes the file out of
 // service under it. A page whose check fails takes the file out of service
-// (`ZFile::fail`); the read that met it answers the raw form's value, with
-// nothing of the slot handed over, as the block cursor answers a group that
-// fails under it, and the cursor falls, the rest of its walk the raw form's.
+// (`ZFile::fail`), with nothing of the slot handed over. A walk that meets it
+// stops there and falls, the rest of the walk the raw form's. A value read
+// (`stride_values`) answers the raw form's value and moves nothing, as the
+// block cursor answers a group that fails under it: it reads through `&self`,
+// so the cursor falls at its next step or placing (`stride_step`, `load`,
+// `skip_to`), each of which finds the file out first.
 // The cursor's placings meet the stride body where the file's methods do, on
 // the gate's branch (`ZCursor::seek`, `load`, `skip_to`), and each arm here is
 // out of line, so that the block cursor's code is its own.
@@ -6281,17 +6335,36 @@ pub(super) struct Built {
     pub stride_no: Option<StrideNo>,
     /// The CRC word of the trailer of the stride file this build wrote and
     /// read back, every rank of it, before its name (`check_stride`,
-    /// `zpages::trailer_crc`): what an attach holds the file under the name
-    /// to before it trusts its pages (`StrideAttach::Trust`). The trailer
-    /// carries the row's CRC, so a file whose trailer's word is this one has
-    /// this build's trailer and row, both to a CRC's strength. `None` for a
-    /// block file, and for a stride file whose pages the build dropped after
-    /// its read-back (`BuildPlan::drop_output`): the read-back saw the bytes
-    /// in the page cache, the drop gave them up, and every read after it
-    /// takes them from the device a second time, which nothing the build
-    /// checked covers -- so such a file is checked page by page at its first
-    /// touch, as a file found on disk is and as every block page is.
+    /// `zpages::trailer_crc`): what the attach that follows the build holds
+    /// the file under the name to before it trusts its pages
+    /// (`StrideAttach::Trust`). The trailer carries the row's CRC, so a file
+    /// whose trailer's word is this one has this build's trailer and row,
+    /// both to a CRC's strength. `None` for a block file. A file left on
+    /// disk for a later attach keeps the word only where the read-back read
+    /// the device (`stride_device`, `Built::left_seal`).
     pub stride_seal: Option<u32>,
+    /// Whether the read-back read every byte of the stride file from the
+    /// device: none of its pages in the page cache as the read-back began,
+    /// by the kernel's count (`mincore`), which is what a build that writes
+    /// its output back and drops it as it goes leaves once its last piece
+    /// is dropped too (`BuildPlan::drop_output`). A build that keeps its
+    /// pages read back the page cache, which says nothing of the device:
+    /// a writeback whose error nobody reads leaves a page that reads right
+    /// until the cache gives it up and wrong from the device after.
+    pub stride_device: bool,
+}
+
+impl Built {
+    /// The word a stride file left on disk for a later attach keeps
+    /// (`Shared::z_left_seals`): the build's word where its read-back read
+    /// the device, none otherwise. A later attach reads the file after the
+    /// cache has had time to give up what the build wrote, so its first
+    /// touch of a page is the device's copy, and only a read-back of the
+    /// device has seen that copy; the attach that follows the build reads
+    /// what the read-back read.
+    pub fn left_seal(&self) -> Option<u32> {
+        self.stride_seal.filter(|_| self.stride_device)
+    }
 }
 
 /// What a form file a build wrote holds: the block body in one of the
@@ -6456,16 +6529,25 @@ impl Outcome {
     /// the block form declines is one no form file serves, which a
     /// conversion -- of a partition a block file serves -- never asks of.
     pub(super) fn note_stride(&self, cell: &AtomicU8) {
-        let code = match self {
-            Outcome::NotStride(why) => why.code(),
+        if let Some(code) = self.stride_code() {
+            cell.store(code, Ordering::Relaxed);
+        }
+    }
+
+    /// The code `note_stride` keeps, or `None` where it leaves the cell as
+    /// it was: for a build whose segment is not live yet to keep it in, a
+    /// build at a merge's output finish, whose code waits by name for the
+    /// attach that installs its file (`Maint::z_attach_on_disk`).
+    pub(super) fn stride_code(&self) -> Option<u8> {
+        match self {
+            Outcome::NotStride(why) => Some(why.code()),
             Outcome::Built(b) => match (b.coding, b.stride_no) {
-                (FileCoding::Stride, _) => 0,
-                (_, Some(why)) => why.code(),
-                (_, None) => return,
+                (FileCoding::Stride, _) => Some(0),
+                (_, Some(why)) => Some(why.code()),
+                (_, None) => None,
             },
-            Outcome::Declined(_) | Outcome::Cancelled => return,
-        };
-        cell.store(code, Ordering::Relaxed);
+            Outcome::Declined(_) | Outcome::Cancelled => None,
+        }
     }
 }
 
@@ -7201,6 +7283,7 @@ fn write_pages(
         },
         stride_no: None,
         stride_seal: None,
+        stride_device: false,
     }))
 }
 
@@ -7388,12 +7471,15 @@ fn stride_key_is(
 /// as that walk does.
 ///
 /// The output is not warm in the same way under `BuildPlan::drop_output`:
-/// its sink writes back and drops each piece as the next goes out, so the
-/// read-back reads the file from the device, and the drop after it drops
-/// what that read brought in. That read is the price of a stride build
-/// where the store fits, for whoever asks for one there to weigh; holding
-/// the pieces to the read-back would keep the whole file dirty beside the
-/// raw form instead, the shape the per-piece drop was made to end.
+/// its sink writes back and drops each piece as the next goes out, and the
+/// last piece is written back and dropped before the read-back, so the
+/// read-back reads the whole file from the device -- the copy a later
+/// attach reads, which is what lets the file left on disk keep its word
+/// (`Built::left_seal`) -- and the drop after it drops what that read
+/// brought in. That read is the price of a stride build where the store
+/// fits, for whoever asks for one there to weigh; holding the pieces to the
+/// read-back would keep the whole file dirty beside the raw form instead,
+/// the shape the per-piece drop was made to end.
 #[allow(clippy::too_many_arguments)]
 fn write_stride(
     file: &File,
@@ -7517,6 +7603,9 @@ fn write_stride(
     if let Some(damage) = plan.damage {
         damage(tmp);
     }
+    if plan.drop_output {
+        drop_written(&out);
+    }
     let mut dropped = 0usize;
     let mut looked = 0usize;
     let checked = check_stride(tmp, &images, facts, id, end_seq, &mut |r| {
@@ -7533,16 +7622,16 @@ fn write_stride(
         }
         true
     })?;
-    match checked {
-        Some(Outcome::Cancelled) => return Ok(Outcome::Cancelled),
-        Some(o) if plan.stride == StrideAsk::OrBlock => return Ok(o),
-        Some(o) => {
+    let device = match checked {
+        StrideCheck::Refused(Outcome::Cancelled) => return Ok(Outcome::Cancelled),
+        StrideCheck::Refused(o) if plan.stride == StrideAsk::OrBlock => return Ok(o),
+        StrideCheck::Refused(o) => {
             forget(recs_at + dropped, recs_at + recs.len());
             forget(dir_at, dir_at + dir.len());
             return Ok(o);
         }
-        None => {}
-    }
+        StrideCheck::Read { device } => device,
+    };
     forget(recs_at + dropped, recs_at + recs.len());
     forget(dir_at, dir_at + dir.len());
     if plan.drop_output {
@@ -7563,8 +7652,19 @@ fn write_stride(
         sync_us: 0,
         coding: FileCoding::Stride,
         stride_no: None,
-        stride_seal: trailer_crc(&sealed).filter(|_| !plan.drop_output),
+        stride_seal: trailer_crc(&sealed),
+        stride_device: device,
     }))
+}
+
+/// What the read-back of a stride file found (`check_stride`).
+enum StrideCheck {
+    /// Every rank read back; `device` where none of the file's pages was in
+    /// the page cache as the read-back began, by `mincore`, so that every
+    /// byte it read came from the device (`Built::stride_device`).
+    Read { device: bool },
+    /// Not read back, and what the build answers.
+    Refused(Outcome),
 }
 
 /// Whether the stride form at `tmp` reads back as the records `images` it
@@ -7585,6 +7685,12 @@ fn write_stride(
 /// the two do not and refuse what each of them is for, a guard no file
 /// reaches that leaves either of the two deletable with every damage still
 /// refused.
+///
+/// Whether the read-back read the device is the kernel's count of the
+/// file's pages it holds before the first byte is read, never the plan's
+/// word that the pieces were dropped: a drop is advice, and a page it
+/// skips -- dirty, locked, mapped -- is read back from the cache with
+/// nothing said.
 fn check_stride(
     tmp: &Path,
     images: &SegImages,
@@ -7592,9 +7698,10 @@ fn check_stride(
     id: u64,
     end_seq: u64,
     each: &mut dyn FnMut(usize) -> bool,
-) -> Result<Option<Outcome>> {
-    let refused = Some(Outcome::NotStride(StrideNo::SelfCheck));
+) -> Result<StrideCheck> {
+    let refused = StrideCheck::Refused(Outcome::NotStride(StrideNo::SelfCheck));
     let map = MmapBytes::open(tmp)?;
+    let device = map.resident_count(0, map.0.len()) == Some(0);
     let bytes: &[u8] = &map.0;
     let Ok(body) = StrideBody::from_bytes(bytes) else {
         return Ok(refused);
@@ -7606,7 +7713,7 @@ fn check_stride(
     let mut kbuf = [0u8; STRIDE_KEY_MAX];
     for r in 0..images.records() {
         if !each(r) {
-            return Ok(Some(Outcome::Cancelled));
+            return Ok(StrideCheck::Refused(Outcome::Cancelled));
         }
         let Ok((key, value)) = stride_record(images.image(r)) else {
             return Ok(refused);
@@ -7626,7 +7733,7 @@ fn check_stride(
             return Ok(refused);
         }
     }
-    Ok(None)
+    Ok(StrideCheck::Read { device })
 }
 
 // ---- the stride form's body -------------------------------------------------
@@ -8380,6 +8487,9 @@ pub(super) struct FileFacts {
     pub bytes: u64,
     pub pages: u64,
     pub resident: u64,
+    /// The file holds the stride body: no group to time a decode of
+    /// (`time_file_decodes`), and a read of it decodes nothing.
+    pub stride: bool,
 }
 
 pub(super) fn file_facts(
@@ -8411,6 +8521,7 @@ pub(super) fn file_facts(
             bytes: len,
             pages: lay.v_pages,
             resident: len - lay.res_off,
+            stride: true,
         });
     }
     let t = Trailer::decode(last).ok()?;
@@ -8423,6 +8534,7 @@ pub(super) fn file_facts(
         bytes: len,
         pages: t.n_pages,
         resident: len.saturating_sub(t.res_off),
+        stride: false,
     })
 }
 
@@ -8433,8 +8545,9 @@ pub(super) fn file_facts(
 /// form pays a group, timed on the file as built, where a fill sample times
 /// it on the pages it fills. `None` where the file does not open, is not
 /// this segment's, or a page fails its own parse, decode or walk, and for a
-/// stride file, which holds no group to time: its last page's magic says so
-/// before anything else is read of it, as the attach reads it.
+/// stride file, which holds no group to time: the block trailer's decode
+/// refuses its last page's magic (`Trailer::decode`). The reading times no
+/// stride file (`FileFacts::stride`).
 pub(super) struct DecodeTiming {
     pub decode_ns: u64,
     pub groups: u64,
@@ -8462,9 +8575,6 @@ pub(super) fn time_file_decodes(
         return None;
     }
     let last = map.slice_at(len - ZTRAILER as u64, ZTRAILER)?;
-    if trailer_magic(last) == Some(STRIDE_MAGIC) {
-        return None;
-    }
     let t = Trailer::decode(last).ok()?;
     let facts = blob.z_source_facts()?;
     same_segment(&t.seg_ident(), &facts, id, end_seq).ok()?;
@@ -8775,6 +8885,7 @@ mod tests {
             .expect("the file's facts");
         assert_eq!(f.bytes, b.file_bytes);
         assert_eq!(f.pages, b.fill.pages);
+        assert!(!f.stride, "a block file");
         assert!(
             f.resident > 0 && f.resident < f.bytes,
             "{}/{}",
@@ -8819,13 +8930,14 @@ mod tests {
 
     /// A stride file's facts are its own trailer's, read by the last page's
     /// magic as the attach reads it: its length, its value pages and its
-    /// row with the trailer as the resident part, for a store that takes the
-    /// form; none for one that refuses it, as its attach refuses the file;
-    /// none for another segment; and nothing timed, since it holds no group.
-    /// Read as a block trailer, the file was missing to the controller's
-    /// reading while the files' cover counted it on disk.
+    /// row with the trailer as the resident part, and its body, for a store
+    /// that takes the form; none for one that refuses it, as its attach
+    /// refuses the file; none for another segment. Read as a block trailer,
+    /// the file was missing to the controller's reading while the files'
+    /// cover counted it on disk. It holds no group, and a decode timing of it
+    /// is none, the block trailer's decode refusing its magic.
     #[test]
-    fn a_stride_files_facts_are_its_trailers_and_it_times_nothing() {
+    fn a_stride_files_facts_are_its_trailers() {
         let fx = stride_fixture("stride-facts", 3000, 100, 0x3f);
         stride_built(&fx);
         let bytes = std::fs::read(&fx.out).unwrap();
@@ -8833,8 +8945,13 @@ mod tests {
         for stride in [StrideAttach::Check, StrideAttach::Trust(0)] {
             let f = file_facts(&fx.out, &fx.blob, ID, END, true, &stride).expect("its facts");
             assert_eq!(
-                (f.bytes, f.pages, f.resident),
-                (bytes.len() as u64, lay.v_pages, lay.file_len - lay.res_off),
+                (f.bytes, f.pages, f.resident, f.stride),
+                (
+                    bytes.len() as u64,
+                    lay.v_pages,
+                    lay.file_len - lay.res_off,
+                    true
+                ),
                 "{stride:?}"
             );
             assert!(file_facts(&fx.out, &fx.blob, ID + 1, END, true, &stride).is_none());
@@ -14924,14 +15041,18 @@ mod tests {
         assert_eq!(walk(false, 0, 3000).prefetches, 0, "the option off");
     }
 
-    /// A stride build that drops its output's pages after the read-back
-    /// (`BuildPlan::drop_output`, the builds ahead and at a merge's finish
-    /// under the selector's line) carries no word to trust it by: an attach
-    /// reads its bytes from the device a second time, which the read-back
-    /// never saw, so the file is checked page by page as one found on disk
-    /// is. The same build keeping its pages carries the trailer's word.
+    /// A stride build carries its trailer's word for the attach that
+    /// follows it, and a file it leaves on disk keeps the word for a later
+    /// attach only where the read-back read the device: a build that drops
+    /// its output (`BuildPlan::drop_output`, the builds ahead and at a
+    /// merge's finish under the selector's line) drops its last piece too
+    /// before the read-back, the file wholly out of the cache by `mincore`,
+    /// and a build that keeps its pages read back the cache, which says
+    /// nothing of the copy a later attach reads from the device once the
+    /// cache has given the pages up (`Built::left_seal`).
+    #[cfg(target_os = "linux")]
     #[test]
-    fn a_stride_build_that_drops_its_output_leaves_no_word_to_trust() {
+    fn a_stride_build_leaves_its_word_for_a_later_attach_only_where_it_read_the_device() {
         let fx = stride_fixture("stride-dropseal", 3000, 100, 0x5d);
         for drop_output in [false, true] {
             let _ = std::fs::remove_file(&fx.out);
@@ -14947,8 +15068,8 @@ mod tests {
             let word = trailer_crc(&bytes[bytes.len() - ZTRAILER..]);
             assert!(word.is_some());
             assert_eq!(
-                b.stride_seal,
-                if drop_output { None } else { word },
+                (b.stride_seal, b.stride_device, b.left_seal()),
+                (word, drop_output, if drop_output { word } else { None }),
                 "drop_output {drop_output}"
             );
         }

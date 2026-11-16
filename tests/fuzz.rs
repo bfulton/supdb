@@ -96,7 +96,12 @@
 //!   and the model sees nothing wrong; and a range in which the stride form
 //!   served no read fails, since a steer that reaches no partition is a run
 //!   that tested nothing. Refused beside `ZFUZZ_BOTH`, whose re-code the
-//!   store refuses beside the stride form.
+//!   store refuses beside the stride form. `concurrent_range` runs its store
+//!   forced with the stride form under it, its keys one run of numbers at
+//!   one width, each written once before the readers start and put again,
+//!   never appended or deleted, with a value of one width that says how many
+//!   times it was put, so that its partitions qualify through every merge;
+//!   a range whose stride files answered no read fails there too.
 //! - `ZFUZZ_NOPUT`, `ZFUZZ_NOBURST`: set, no puts, or no ordered bursts.
 //! - `ZFUZZ_SEEDKEY=1`: the store's first write is a key of its own, and
 //!   one goes ahead of every write of the empty key, so that no write of
@@ -1835,19 +1840,33 @@ fn parse_c(v: &[u8]) -> (u32, u32) {
     )
 }
 
-fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<(), String> {
+/// A concurrent seed's store, run with its readers on threads: `Ok` with the
+/// point reads its stride files answered.
+fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<u64, String> {
     let mut rng = Rng::new(seed ^ 0xC0FFEE);
     let cfg = pick_cfg(&mut rng, false);
     let dir = scratch(&format!("c{seed}"));
     let heads_flip = env_flag("ZFUZZ_HEADSFLIP") && env_flag("ZFUZZ_ZPAGES");
-    let made = if heads_flip { opts_z(&cfg) } else { opts(&cfg) };
+    // Under `ZFUZZ_STRIDE` the store forced with the stride form under it,
+    // and the writes shaped so that every partition qualifies: one run of
+    // numbers at one width, every key written before the readers start, and
+    // a key's later writes puts of one value of one width -- the value its
+    // count of puts -- with no delete, which would leave a hole.
+    let stride = stride_on();
+    let made = if heads_flip || stride {
+        opts_z(&cfg)
+    } else {
+        opts(&cfg)
+    };
     let mut db = Db::create(&dir, made).map_err(|e| format!("create: {e}"))?;
-    census_gate(&db, heads_flip);
+    census_gate(&db, heads_flip || stride);
     let nkeys = 150 + rng.below(250);
     let keys: Arc<Vec<Vec<u8>>> = Arc::new(
         (0..nkeys)
             .map(|i| {
-                if i % 7 == 0 {
+                if stride {
+                    format!("c{i:05}").into_bytes()
+                } else if i % 7 == 0 {
                     format!("c{:03}-long-key-{}", i, "x".repeat(i % 20)).into_bytes()
                 } else {
                     format!("c{:05}", i * 3).into_bytes()
@@ -1857,11 +1876,28 @@ fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<(), Str
             .into_iter()
             .collect(),
     );
-    // Per key: the (epoch, n) the writer has committed, and has appended.
+    // Per key: the (epoch, n) the writer has committed, and has appended;
+    // under the stride form n is how many times the key was put.
     let committed: Arc<Vec<AtomicU64>> =
         Arc::new((0..keys.len()).map(|_| AtomicU64::new(0)).collect());
     let appended: Arc<Vec<AtomicU64>> =
         Arc::new((0..keys.len()).map(|_| AtomicU64::new(0)).collect());
+    let mut epoch = vec![0u32; keys.len()];
+    let mut n = vec![0u32; keys.len()];
+    if stride {
+        for (i, k) in keys.iter().enumerate() {
+            n[i] = 1;
+            db.put(k, &cvalue(0, 1, STRIDE_PAD));
+        }
+        db.commit().map_err(|e| format!("commit: {e}"))?;
+        db.flush().map_err(|e| format!("flush: {e}"))?;
+        db.zpages_settle()
+            .map_err(|e| format!("zpages settle: {e}"))?;
+        for i in 0..keys.len() {
+            committed[i].store(pack(0, 1), Ordering::SeqCst);
+            appended[i].store(pack(0, 1), Ordering::SeqCst);
+        }
+    }
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let errs: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let reads_done = Arc::new(AtomicU64::new(0));
@@ -1930,15 +1966,25 @@ fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<(), Str
                     errs.lock().unwrap().push(format!("thread {t}: n {n_read} != {}", vals.len()));
                     return;
                 }
-                // The values: one epoch, indexes 0..n, in order.
+                // The values: one epoch, indexes 0..n, in order; under the
+                // stride form one value, whose index is the key's count of
+                // puts.
                 let mut epoch = None;
+                if stride && vals.len() > 1 {
+                    errs.lock().unwrap().push(format!(
+                        "thread {t}: key {}: {} values of a key only ever put",
+                        show(&keys[i]),
+                        vals.len()
+                    ));
+                    return;
+                }
                 for (j, v) in vals.iter().enumerate() {
                     if v.len() < 8 {
                         errs.lock().unwrap().push(format!("thread {t}: short value"));
                         return;
                     }
                     let (e, idx) = parse_c(v);
-                    if epoch.is_some_and(|x| x != e) || idx as usize != j {
+                    if epoch.is_some_and(|x| x != e) || (!stride && idx as usize != j) {
                         errs.lock().unwrap().push(format!(
                             "thread {t}: key {}: values out of shape at {j}: epoch {e} idx {idx} (first epoch {epoch:?})",
                             show(&keys[i])
@@ -1947,7 +1993,11 @@ fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<(), Str
                     }
                     epoch = Some(e);
                 }
-                let got = if vals.is_empty() { None } else { Some(pack(epoch.unwrap(), vals.len() as u32)) };
+                let got = match vals.first() {
+                    None => None,
+                    Some(v) if stride => Some(pack(epoch.unwrap(), parse_c(v).1)),
+                    Some(_) => Some(pack(epoch.unwrap(), vals.len() as u32)),
+                };
                 // Monotone and bounded: what was committed before the read
                 // started is a floor, what was appended by its end a ceiling.
                 match got {
@@ -2018,15 +2068,16 @@ fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<(), Str
         }));
     }
     // The writer.
-    let mut epoch = vec![0u32; keys.len()];
-    let mut n = vec![0u32; keys.len()];
     let mut staged: Vec<usize> = Vec::new();
     for step in 0..secs_ops {
         if heads_flip && step.is_multiple_of(61) {
             db.zgate_set(if (step / 61) % 2 == 0 { 1 } else { 2 });
         }
         let i = rng.below(keys.len());
-        if rng.chance(4) {
+        if stride {
+            n[i] += 1;
+            db.put(&keys[i], &cvalue(epoch[i], n[i], STRIDE_PAD));
+        } else if rng.chance(4) {
             db.delete(&keys[i]);
             epoch[i] += 1;
             n[i] = 0;
@@ -2083,13 +2134,26 @@ fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<(), Str
         return Err(format!("seed {seed} ({cfg:?}): {:?}", &e[..e.len().min(4)]));
     }
     let (owned, given, _) = db.heads_owned_counts();
+    let c = db.zpage_counts();
+    if stride && (c.fallbacks, c.damaged, c.build_failed) != (0, 0, 0) {
+        return Err(format!(
+            "seed {seed} ({cfg:?}): the form files failed: {c:?}"
+        ));
+    }
     eprintln!(
-        "concurrent seed {seed}: reads {}, heads owned {owned} given back {given}",
-        reads_done.load(Ordering::Relaxed)
+        "concurrent seed {seed}: reads {}, heads owned {owned} given back {given}, stride files {} builds {} reads {}",
+        reads_done.load(Ordering::Relaxed),
+        c.stride_files,
+        c.stride_builds,
+        c.stride_reads
     );
     let _ = std::fs::remove_dir_all(&dir);
-    Ok(())
+    Ok(c.stride_reads)
 }
+
+/// The padding of a concurrent seed's values under the stride form: one
+/// width for every value, the epoch and the count before it.
+const STRIDE_PAD: usize = 8;
 
 #[test]
 fn concurrent_range() {
@@ -2097,13 +2161,31 @@ fn concurrent_range() {
     let to = env_u64("ZFUZZ_TO").unwrap_or(from + 3);
     let ops = env_u64("ZFUZZ_OPS").unwrap_or(4000) as usize;
     let snaps = env_flag("ZFUZZ_SNAPS");
+    if env_flag("ZFUZZ_STRIDE") {
+        assert!(
+            env_flag("ZFUZZ_ZPAGES"),
+            "ZFUZZ_STRIDE forces the stride form on the store whose form is forced: set ZFUZZ_ZPAGES"
+        );
+        assert!(
+            !env_flag("ZFUZZ_BOTH"),
+            "ZFUZZ_STRIDE beside ZFUZZ_BOTH: the store refuses the stride form beside the re-code"
+        );
+    }
     let mut bad = Vec::new();
+    let mut stride_reads = 0u64;
     for seed in from..to {
         match std::panic::catch_unwind(|| run_concurrent(seed, ops, snaps)) {
-            Ok(Ok(())) => {}
+            Ok(Ok(reads)) => stride_reads += reads,
             Ok(Err(e)) => bad.push(e),
             Err(p) => bad.push(format!("seed {seed}: PANIC {}", panic_text(p.as_ref()))),
         }
+    }
+    // As the sequential range's: a run whose stride files answered nothing
+    // passed over the block form alone and tested nothing it was asked to.
+    if stride_on() && stride_reads == 0 && to > from {
+        bad.push(format!(
+            "the stride form served no read in seeds {from}..{to}"
+        ));
     }
     for b in &bad {
         eprintln!("FAIL: {b}");
