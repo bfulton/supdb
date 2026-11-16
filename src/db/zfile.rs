@@ -5671,8 +5671,10 @@ impl BuildPlan {
 /// fence alone. A filter over every key, the ones no page holds included,
 /// goes into region B beside the fence, with its signature and parameters
 /// in the trailer. The temp name is removed on every way out the function
-/// has, a decline after pages were written among them; a crash leaves it
-/// for the sweep at open.
+/// has once a writer has opened it, a decline after pages were written
+/// among them; a crash leaves it for the sweep at open. A decline before
+/// it -- the opening's, and the stride form's two ends asked for alone --
+/// touches no name.
 ///
 /// Where the plan asks for the stride form (`StrideAsk`), its writer
 /// (`write_stride`) takes the page walk's place over the same opening, and
@@ -5764,23 +5766,35 @@ fn build_file_seen(
     };
     let made = match plan.stride {
         StrideAsk::No => block(seen),
-        ask => match write_stride(
-            &file, base, recs, dir, nkeys, bind, &tmp, &facts, id, end_seq, plan, seen,
-        ) {
-            // A late decline: the block body is built in the same call,
-            // over records the walk left warm, under the same temporary
-            // name, which its writer opens truncated.
-            Ok(Outcome::NotStride(why)) if ask == StrideAsk::OrBlock => {
-                block(seen).map(|o| match o {
-                    Outcome::Built(b) => Outcome::Built(Built {
-                        stride_no: Some(why),
-                        ..b
-                    }),
-                    other => other,
-                })
+        ask => {
+            let walked = match stride_precheck(&SegImages::new(recs, dir, nkeys)) {
+                Ok(sf) => write_stride(
+                    &file, base, recs, dir, nkeys, bind, &tmp, &facts, id, end_seq, &sf, plan, seen,
+                ),
+                // The two ends decide before the temporary name is this
+                // build's: asked for the stride form alone, their decline
+                // is the opening's and leaves the name alone, since a way
+                // out removes only a name its build opened, and the name is
+                // the partition's, which another build of it may hold.
+                Err(why) if ask == StrideAsk::Only => return Ok(Outcome::NotStride(why)),
+                Err(why) => Ok(Outcome::NotStride(why)),
+            };
+            match walked {
+                // A late decline: the block body is built in the same
+                // call, over records the walk left warm, under the same
+                // temporary name, which its writer opens truncated.
+                Ok(Outcome::NotStride(why)) if ask == StrideAsk::OrBlock => {
+                    block(seen).map(|o| match o {
+                        Outcome::Built(b) => Outcome::Built(Built {
+                            stride_no: Some(why),
+                            ..b
+                        }),
+                        other => other,
+                    })
+                }
+                other => other,
             }
-            other => other,
-        },
+        }
     };
     match made {
         Ok(Outcome::Built(b)) => name_built(&tmp, out, plan, b),
@@ -6153,6 +6167,32 @@ fn stride_page_out(
     Ok(())
 }
 
+/// Whether `key` is the key of number `x` in the run `codec` renders, as
+/// the build's walk asks it of every rank: both quantities of the run's
+/// rule, the number `decoded` read from the key the run's `x` and `x`'s
+/// rendering the key byte for byte, since a number alone taken from a key
+/// it does not render would put a value under a key no read asks for. The
+/// shipped decoder takes a key only where every byte is its field's or its
+/// prefix's (`KeyCodec::decode`), which rendering undoes, so the second
+/// quantity names its reason only behind a decoder that takes keys it does
+/// not render -- a field read past its width, a prefix compared short --
+/// and the number is this function's input so that a test can hand it the
+/// lax decoder's.
+fn stride_key_is(
+    codec: &KeyCodec,
+    key: &[u8],
+    x: u64,
+    decoded: Option<u64>,
+    kbuf: &mut [u8; STRIDE_KEY_MAX],
+) -> std::result::Result<(), StrideNo> {
+    match decoded {
+        None => Err(StrideNo::NotShaped),
+        Some(y) if y != x => Err(StrideNo::Holes),
+        Some(_) if codec.render(x, kbuf) != key => Err(StrideNo::NotShaped),
+        Some(_) => Ok(()),
+    }
+}
+
 /// The stride form of the partition whose records and directory these are,
 /// written to `tmp` (`StrideAsk`), from the opening `write_pages` has and in
 /// its shape: the file in whole pieces at their own alignment, the raw
@@ -6160,15 +6200,13 @@ fn stride_page_out(
 /// looked at once a window, and each value page's word of the row taken as
 /// the page completes; then the row and the trailer.
 ///
-/// The partition qualifies by its two ends (`stride_precheck`) and then
-/// rank by rank, each read through the directory and never by stride,
-/// since a segment closed from a direct run keeps its commit markers inside
-/// the record region: every record one inline fixed value of the run's
-/// width with no flag (`stride_record`), and every key both quantities of
-/// the run's rule, its number the run's next and that number's rendering
-/// the key byte for byte, since a decode alone that took a key it does not
-/// render would put a value under a key no read asks for. A rank that fails
-/// ends the walk with its reason.
+/// The partition has qualified by its two ends (`stride_precheck`, the
+/// opening's, whose facts `sf` are) and qualifies here rank by rank, each
+/// read through the directory and never by stride, since a segment closed
+/// from a direct run keeps its commit markers inside the record region:
+/// every record one inline fixed value of the run's width with no flag
+/// (`stride_record`), and every key its rank's (`stride_key_is`). A rank
+/// that fails ends the walk with its reason.
 ///
 /// The file is then read back, every rank, through the body a reader serves
 /// it by (`check_stride`), before it has a name, against the records it
@@ -6191,14 +6229,11 @@ fn write_stride(
     facts: &ZSource,
     id: u64,
     end_seq: u64,
+    sf: &StrideFacts,
     plan: &BuildPlan,
     seen: &mut dyn FnMut(usize, usize),
 ) -> Result<Outcome> {
     let images = SegImages::new(recs, dir, nkeys);
-    let sf = match stride_precheck(&images) {
-        Ok(f) => f,
-        Err(why) => return Ok(Outcome::NotStride(why)),
-    };
     let recs_at = recs.as_ptr() as usize - base;
     let dir_at = dir.as_ptr() as usize - base;
     let mut forget = |from: usize, to: usize| {
@@ -6252,12 +6287,7 @@ fn write_stride(
             // Inside the run the precheck proved: `base + r` is within
             // what the field holds.
             let x = codec.base() + r as u64;
-            match codec.decode(key) {
-                None => Err(StrideNo::NotShaped),
-                Some(y) if y != x => Err(StrideNo::Holes),
-                Some(_) if codec.render(x, &mut kbuf) != key => Err(StrideNo::NotShaped),
-                Some(_) => Ok(value),
-            }
+            stride_key_is(&codec, key, x, codec.decode(key), &mut kbuf).map(|()| value)
         });
         let mut rest = match value {
             Ok(v) => v,
@@ -12218,6 +12248,15 @@ mod tests {
             })
             .collect();
         assert_eq!(long[0].0.len(), STRIDE_KEY_MAX + 1);
+        // Both ends' values one wider than the widest the form takes, of one
+        // width, so that the width and not two widths declines them; a
+        // byte repeated, so that the block form's pages hold them
+        // compressed.
+        let wide = with(&|r| {
+            for i in [0, n - 1] {
+                r[i].1[0] = vec![0x5a; STRIDE_W_MAX as usize + 1];
+            }
+        });
         // (name, records, floor, inline bytes, reason, decided by the ends)
         type Case = (&'static str, Vec<Rec>, usize, usize, StrideNo, Option<bool>);
         let cases: Vec<Case> = vec![
@@ -12334,6 +12373,7 @@ mod tests {
                 Some(true),
             ),
             ("long-keys", long, 0, 1 << 16, NotShaped, Some(true)),
+            ("wide", wide, 0, 1 << 16, Width, Some(true)),
             (
                 "block-backed",
                 with(&|r| r[mid].1[0] = vec![7u8; 9000]),
@@ -12358,6 +12398,16 @@ mod tests {
                 floor,
                 ..stride_plan(ask)
             };
+            // A decline the opening or the two ends decide comes before
+            // the temporary name is the build's: a name it never opened --
+            // another build's of the partition, under the same name -- is
+            // left as it was. A decline the walk decides removes the name
+            // the walk opened.
+            let early = by_ends != Some(false);
+            let other = b"another build's bytes";
+            if early {
+                std::fs::write(tmp_of(&fx.out), other).unwrap();
+            }
             let cell = AtomicU8::new(0);
             let made = build(&fx.seg, &fx.out, ID, END, &plan(StrideAsk::Only)).unwrap();
             made.note_stride(&cell);
@@ -12366,6 +12416,14 @@ mod tests {
                 "{name}: {made:?}"
             );
             assert!(!fx.out.exists(), "{name}: no file");
+            if early {
+                assert_eq!(
+                    std::fs::read(tmp_of(&fx.out)).unwrap(),
+                    other,
+                    "{name}: a name the build never opened left as it was"
+                );
+                std::fs::remove_file(tmp_of(&fx.out)).unwrap();
+            }
             assert!(!tmp_of(&fx.out).exists(), "{name}: no temporary name");
             assert_eq!(cell.load(Ordering::Relaxed), why.code(), "{name}");
             let cell = AtomicU8::new(0);
@@ -12394,6 +12452,113 @@ mod tests {
                     agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
                 }
             }
+        }
+    }
+
+    /// A build that gave no answer for the stride form leaves the reason a
+    /// segment keeps as it was: a block file built where nothing asked for
+    /// the stride form, a floor's decline under the block ask and under the
+    /// stride form or the block form, and a cancel under each ask. The
+    /// segment work notes every build's outcome (`Seg::z_stride_no`), so a
+    /// reason one build found is the next block build's to keep, not to
+    /// clear.
+    #[test]
+    fn a_build_that_gives_no_answer_for_the_stride_form_leaves_its_reason_as_it_was() {
+        let fx = Fixture::new("stride-note", stride_recs(600, 100, 0x60), 1 << 16);
+        assert!(
+            precheck_of(&fx).is_ok(),
+            "a partition the stride form would take, so that nothing declines it but the plan"
+        );
+        let kept = StrideNo::Holes.code();
+        let cancelled = |ask| BuildPlan {
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+            ..stride_plan(ask)
+        };
+        let floor = |ask| BuildPlan {
+            floor: usize::MAX,
+            ..stride_plan(ask)
+        };
+        type Want = fn(&Outcome) -> bool;
+        let cases: [(&str, BuildPlan, Want); 6] = [
+            ("block", stride_plan(StrideAsk::No), |o| {
+                matches!(
+                    o,
+                    Outcome::Built(Built {
+                        coding: FileCoding::Block,
+                        stride_no: None,
+                        ..
+                    })
+                )
+            }),
+            ("floor, block", floor(StrideAsk::No), |o| {
+                matches!(o, Outcome::Declined(Decline::Small(_)))
+            }),
+            ("floor, stride or block", floor(StrideAsk::OrBlock), |o| {
+                matches!(o, Outcome::Declined(Decline::Small(_)))
+            }),
+            ("cancel, block", cancelled(StrideAsk::No), |o| {
+                matches!(o, Outcome::Cancelled)
+            }),
+            (
+                "cancel, stride or block",
+                cancelled(StrideAsk::OrBlock),
+                |o| matches!(o, Outcome::Cancelled),
+            ),
+            ("cancel, stride alone", cancelled(StrideAsk::Only), |o| {
+                matches!(o, Outcome::Cancelled)
+            }),
+        ];
+        for (name, plan, want) in cases {
+            let _ = std::fs::remove_file(&fx.out);
+            let cell = AtomicU8::new(kept);
+            let made = build(&fx.seg, &fx.out, ID, END, &plan).unwrap();
+            assert!(want(&made), "{name}: {made:?}");
+            made.note_stride(&cell);
+            assert_eq!(cell.load(Ordering::Relaxed), kept, "{name}");
+        }
+    }
+
+    /// The walk's key check takes both quantities of the run's rule as its
+    /// inputs and names each one's reason: no number, a number not the
+    /// rank's, and the rank's number read from a key that does not render
+    /// it. The shipped decoder gives no such number -- it refuses each key
+    /// below -- so the number is handed in as a lax decoder would read it:
+    /// a field read past its width, a prefix compared short, a byte past
+    /// the key's length ignored.
+    #[test]
+    fn a_key_is_its_ranks_only_where_its_number_is_and_the_number_renders_it() {
+        use crate::db::zpages::KeyKind;
+        let codec = KeyCodec::new(KeyKind::Decimal, b"k", 6, 100).unwrap();
+        let mut kbuf = [0u8; STRIDE_KEY_MAX];
+        let x = 300;
+        let key = codec.render(x, &mut kbuf).to_vec();
+        assert_eq!(key, b"k000300");
+        let is = |key: &[u8], x: u64, decoded: Option<u64>| {
+            stride_key_is(&codec, key, x, decoded, &mut [0u8; STRIDE_KEY_MAX])
+        };
+        assert_eq!(is(&key, x, codec.decode(&key)), Ok(()));
+        assert_eq!(
+            is(&key, x + 1, codec.decode(&key)),
+            Err(StrideNo::Holes),
+            "the next rank's number"
+        );
+        let unshaped = b"k00030x";
+        assert_eq!(codec.decode(unshaped), None);
+        assert_eq!(
+            is(unshaped, x, codec.decode(unshaped)),
+            Err(StrideNo::NotShaped)
+        );
+        for lax in [&b"k0000300"[..], b"j000300", b"k000300\0"] {
+            assert_eq!(
+                codec.decode(lax),
+                None,
+                "the shipped decoder refuses {lax:?}"
+            );
+            assert_eq!(
+                is(lax, x, Some(x)),
+                Err(StrideNo::NotShaped),
+                "{lax:?} does not render {x}"
+            );
         }
     }
 

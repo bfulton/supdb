@@ -7530,6 +7530,16 @@ struct ZBuild {
     reparse: bool,
 }
 
+/// What the record of the form files' codings keeps for a file `plan`
+/// builds (`Maint::z_ahead_coding`, `Shared::z_finish_coded`): the plan's
+/// raw tails. One predicate for both sites that record it, since
+/// `Maint::z_file_refused` holds an entry from either to one pick, and a
+/// record two sites take two ways gives a file built by one a verdict the
+/// other's file of the same plan does not get.
+fn z_coded_record(plan: &zfile::BuildPlan) -> bool {
+    plan.raw_tails
+}
+
 /// What a merge's thread is given to build each output's form file as the
 /// output is finished (`Options::zpages_build_at_finish`): the builder's
 /// plan as the builds ahead would have it, the store's counters and holds,
@@ -7605,10 +7615,7 @@ impl ZFinish {
                             .z_finish_coded
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .push((
-                                zfile::zpg_name(id, end),
-                                b.coding == zfile::FileCoding::RawTails,
-                            ));
+                            .push((zfile::zpg_name(id, end), z_coded_record(&plan)));
                     }
                     Ok(zfile::Outcome::Declined(d)) => ev.declined(d),
                     Ok(zfile::Outcome::Cancelled) => zfile::ZEvents::add(&ev.build_cancelled, 1),
@@ -50427,7 +50434,7 @@ impl Maint {
         plan.raw_tails = raw_tails;
         if dormant {
             self.z_ahead_coding
-                .insert(zfile::zpg_name(id, end), raw_tails);
+                .insert(zfile::zpg_name(id, end), z_coded_record(&plan));
         }
         plan.parse = self.opts.zpages_parse || reparse;
         // A re-parse is the shipped lazy parse whatever the builds' search,
@@ -52026,5 +52033,95 @@ mod sweep_gate {
         );
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod finish_coding {
+    use super::*;
+
+    /// The record a build at a merge's output finish leaves of its file's
+    /// coding is the one the builds ahead keep for the same plan
+    /// (`z_coded_record`), not one read from the body the file came out in:
+    /// the raw tails asked for under the options' block coding -- the plan
+    /// both `Maint::z_finish_plan` and `Maint::z_start` make before any
+    /// pick under `Options::zpages_raw_tails` -- build a block-coded file,
+    /// and an entry for it that one site took from the body and the other
+    /// from the plan is a file `Maint::z_file_refused` refuses by which site
+    /// built it.
+    #[test]
+    fn a_finish_build_records_the_coding_the_builds_ahead_record_for_its_plan() {
+        let base =
+            std::env::temp_dir().join(format!("supdb-next-finish-coding-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (store, segs) = (base.join("store"), base.join("segs"));
+        std::fs::create_dir_all(&segs).unwrap();
+        let db = Db::create(&store, Options::default()).unwrap();
+        // A partition's segment, written where the store does not look.
+        let opts = Options::default();
+        let name = Db::seg_name(7, 7);
+        let tmp = segs.join("seal-00000007.tmp");
+        let mut w =
+            PieceWriter::create(&tmp, &Db::segment_opts(&opts), 0, opts.inline_bytes).unwrap();
+        w.reserve_keys(3000, 3000 * 16);
+        for i in 0..3000u32 {
+            w.begin(format!("key-{i:08}").as_bytes()).unwrap();
+            w.value(&[i as u8; 100]);
+            w.end_with(false).unwrap();
+        }
+        drop(w.finish_unsynced().unwrap());
+        std::fs::rename(&tmp, segs.join(&name)).unwrap();
+        let (id, end) = (
+            Db::name_id(&name).unwrap(),
+            Db::name_end_seq(&name).unwrap(),
+        );
+
+        let mut plan = zfile::BuildPlan::new(0, false);
+        plan.coding = zpages::ZCODING_BLOCK;
+        plan.raw_tails = true;
+        // The body that plan builds, through the builder alone.
+        let alone = segs.join("alone.zpg");
+        let made = zfile::build(&segs.join(&name), &alone, id, end, &plan).unwrap();
+        assert!(
+            matches!(
+                made,
+                zfile::Outcome::Built(zfile::Built {
+                    coding: zfile::FileCoding::Block,
+                    ..
+                })
+            ),
+            "the raw tails make a raw-tailed file only under the record coding: {made:?}"
+        );
+
+        let finish = ZFinish {
+            dir: segs.clone(),
+            plan: plan.clone(),
+            shared: db.shared.clone(),
+            slots: 1,
+            trace: false,
+            epoch: std::time::Instant::now(),
+        };
+        finish.build(&name);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while db.shared.z_finish_live.load(AtomicOrdering::Acquire) > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the finish build ends"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let coded = db
+            .shared
+            .z_finish_coded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(
+            coded,
+            vec![(zfile::zpg_name(id, end), z_coded_record(&plan))],
+            "the finish build's record is the builds ahead's for its plan"
+        );
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -9579,6 +9579,26 @@ mod tests {
                 assert_eq!(c.decode(&ff), want, "{c:?} {len} bytes of 0xff");
             }
         }
+        // The decoder takes exactly the keys the codec renders, and
+        // rendering gives each back byte for byte: every field of one and
+        // of two bytes, of each kind, behind a prefix. That is what leaves
+        // the build walk's second quantity, a key the number renders
+        // (`zfile::stride_key_is`), a reason no key earns under this
+        // decoder.
+        for kind in [KeyKind::Decimal, KeyKind::BigEndian] {
+            for d in 1..=2usize {
+                let c = KeyCodec::new(kind, b"k", d, 0).unwrap();
+                let mut taken = 0u64;
+                for f in 0..1u64 << (8 * d) {
+                    let key = [b"k".as_slice(), &f.to_be_bytes()[8 - d..]].concat();
+                    if let Some(x) = c.decode(&key) {
+                        taken += 1;
+                        assert_eq!(c.render(x, &mut buf), &key[..], "{c:?} {key:?}");
+                    }
+                }
+                assert_eq!(taken, c.top() + 1, "{c:?}: every number's key, once");
+            }
+        }
         // The widest decimal field holds every nineteen-digit number and
         // nothing of twenty.
         let c = KeyCodec::new(KeyKind::Decimal, b"", STRIDE_DECIMAL_MAX, 0).unwrap();
