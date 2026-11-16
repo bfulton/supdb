@@ -425,7 +425,10 @@ const ZGROUP_AHEAD: usize = 1024;
 pub(super) struct ZCursor<'a> {
     memo: &'a ZMemo,
     zfile: &'a ZFile,
-    raw: &'a Blob<MmapBytes>,
+    /// The raw form through the form file's door (`SegBlob::for_zfile`),
+    /// read by `ZCursor::raw` and nothing else, which counts the reads a
+    /// stride file's cursor makes of it.
+    door: &'a Blob<MmapBytes>,
     rank: usize,
     /// The rank the current group's records end at; the key count past the
     /// last entry or once the cursor is the raw form's.
@@ -503,7 +506,7 @@ impl<'a> ZCursor<'a> {
         ZCursor {
             memo,
             zfile,
-            raw,
+            door: raw,
             rank: 0,
             end: 0,
             page_end: 0,
@@ -660,6 +663,22 @@ impl<'a> ZCursor<'a> {
     /// The rank at the position: the key count at the end.
     pub(super) fn rank(&self) -> usize {
         self.rank
+    }
+
+    /// The raw form, for the cursor's every read of it: a run no page
+    /// holds, a value that lies in a block, the walk after a fall. Over a
+    /// stride file, where none of the first two exists, each read is
+    /// counted on the file under debug assertions (`ZFile::raw_reads`): the
+    /// door is not `Seg::raw`, and a stride position that answered from
+    /// here where it had the slot was a read of the pages the form
+    /// replaces that no count saw.
+    #[inline]
+    fn raw(&self) -> &'a Blob<MmapBytes> {
+        #[cfg(debug_assertions)]
+        if self.zfile.is_stride() {
+            self.zfile.raw_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        self.door
     }
 
     /// The rest of the walk is the raw form's, after a check failed.
@@ -1138,7 +1157,7 @@ impl<'a> ZCursor<'a> {
         );
         match self.group {
             Group::None => None,
-            Group::Raw => self.raw.key_at(self.rank),
+            Group::Raw => self.raw().key_at(self.rank),
             Group::Coded(..) => Some(self.keybuf.as_slice()),
             Group::Stride(_) => {
                 let (at, len) = self.key_at;
@@ -1159,7 +1178,7 @@ impl<'a> ZCursor<'a> {
         );
         match self.group {
             Group::None => Ok(0),
-            Group::Raw => self.raw.values_at(self.rank, &mut *f),
+            Group::Raw => self.raw().values_at(self.rank, &mut *f),
             Group::Stride(body) => self.stride_values(body, f),
             Group::Coded(payload, count) => {
                 // The record where it lies, or decoded on its own into a
@@ -1171,7 +1190,7 @@ impl<'a> ZCursor<'a> {
                 let mut scratch = GroupBuf::new();
                 let read = match CodedGroup::open(payload, count) {
                     Ok(g) => coded_record_to(
-                        self.raw,
+                        self.raw(),
                         &g,
                         self.off,
                         &mut key,
@@ -1187,18 +1206,18 @@ impl<'a> ZCursor<'a> {
                     Ok(n)
                 } else {
                     self.zfile.fail(self.page);
-                    self.raw.values_at(self.rank, &mut *f)
+                    self.raw().values_at(self.rank, &mut *f)
                 }
             }
             Group::Page(_) | Group::Buf(_) | Group::Memo(..) => {
                 match parse_record(self.group(), self.off) {
-                    Some((_, exts, tail, _)) => self.raw.read_exts(&exts, tail, &mut *f),
+                    Some((_, exts, tail, _)) => self.raw().read_exts(&exts, tail, &mut *f),
                     None => {
                         // The first decode walked every record of the group
                         // whole, so this is a group changed under the mapping:
                         // the page out of service and the raw form's values.
                         self.zfile.fail(self.page);
-                        self.raw.values_at(self.rank, &mut *f)
+                        self.raw().values_at(self.rank, &mut *f)
                     }
                 }
             }
@@ -1316,7 +1335,7 @@ impl<'a> ZCursor<'a> {
                 return Ok((n, KeyOrder::Greater));
             }
             if matches!(self.group, Group::Raw) {
-                let Some(k) = self.raw.key_at(self.rank) else {
+                let Some(k) = self.raw().key_at(self.rank) else {
                     return Ok((n, KeyOrder::Greater));
                 };
                 if let Some(u) = until {
@@ -1325,7 +1344,7 @@ impl<'a> ZCursor<'a> {
                         order => return Ok((n, order)),
                     }
                 }
-                self.raw.values_at(self.rank, &mut |v: &[u8]| f(k, v))?;
+                self.raw().values_at(self.rank, &mut |v: &[u8]| f(k, v))?;
                 n += 1;
                 self.advance();
                 continue;
@@ -1352,7 +1371,7 @@ impl<'a> ZCursor<'a> {
                 // A raw-tail coded group: each record's key assembled and
                 // its values read where its tail lies, nothing decoded.
                 let (payload, count) = (*payload, *count);
-                let raw = self.raw;
+                let raw = self.raw();
                 let (mut i, mut rank, end) = (self.off, self.rank, self.end);
                 let mut stop: Option<KeyOrder> = None;
                 let mut damaged = false;
@@ -1457,7 +1476,7 @@ impl<'a> ZCursor<'a> {
                             }
                         }
                     }
-                    self.raw.read_exts(&exts, tail, &mut |v: &[u8]| f(k, v))?;
+                    self.raw().read_exts(&exts, tail, &mut |v: &[u8]| f(k, v))?;
                     off += len;
                     rank += 1;
                     n += 1;
@@ -1645,7 +1664,7 @@ impl<'a> ZCursor<'a> {
                     if self.fell {
                         return KeyOrder::Greater;
                     }
-                    let Some(k) = self.raw.key_at(self.rank) else {
+                    let Some(k) = self.raw().key_at(self.rank) else {
                         return KeyOrder::Greater;
                     };
                     match k.cmp(until) {
@@ -1812,7 +1831,7 @@ impl<'a> ZCursor<'a> {
     fn stride_values<F: FnMut(&[u8])>(&self, body: &StrideBody, f: &mut F) -> Result<u64> {
         let zfile = self.zfile;
         if zfile.damaged() {
-            return self.raw.values_at(self.rank, &mut *f);
+            return self.raw().values_at(self.rank, &mut *f);
         }
         let memo = self.memo;
         let file = zfile.stride_bytes();
@@ -1827,7 +1846,7 @@ impl<'a> ZCursor<'a> {
             // A page whose check failed, which took it and the file out of
             // service (`ZFile::stride_page`); never `Absent` inside the
             // run, where the position is. The raw form's values.
-            StrideAt::Bad(_) | StrideAt::Absent => self.raw.values_at(self.rank, &mut *f),
+            StrideAt::Bad(_) | StrideAt::Absent => self.raw().values_at(self.rank, &mut *f),
         }
     }
 
@@ -2286,9 +2305,10 @@ pub(super) struct StrideCounts {
     /// Point reads a stride file answered (`ZFile::stride_read_all`).
     pub(super) reads: u64,
     /// Values a cursor's stride position handed over (`Group::Stride`): its
-    /// walks' records and the values read at the position, the block
-    /// cache's and the merge path's reads of a stride partition through
-    /// the cursor.
+    /// walks' records and the values read at the position -- the block
+    /// cache's reads of a stride partition, the merge path's walks over it
+    /// and the covered walk of a scan over the partitions alone
+    /// (`Reader::scan_partitions`), each through the cursor.
     pub(super) cursor: u64,
 }
 
@@ -3053,6 +3073,16 @@ pub(super) struct ZFile {
     /// file decodes nothing, so its heat is the groups it opens, priced at
     /// what a decode costs (`Options::zpages_recode`).
     pub(super) opens16: AtomicU64,
+    /// Reads of the raw form a cursor over this file made through its door
+    /// while the file is a stride file, under debug assertions
+    /// (`ZCursor::raw`). A stride file holds every value in a slot and
+    /// none in a block, so every read through the door there is a record
+    /// read -- a fall's, or a position that answered from the raw form
+    /// where it had the slot -- and the door is not `Seg::raw`, whose
+    /// touches are the only other count: a cursor that served the raw
+    /// form's records passed every test that held the store to no touch.
+    /// `Reader::raw_touches` sums it beside them.
+    raw_reads: AtomicU64,
     /// The counted decodes are timed (`Options::zpages_recode`).
     pub(super) time_decodes: bool,
     /// The sampled pages' groups are record-coded ([`ZCODING_RECORD`]):
@@ -3362,6 +3392,7 @@ impl ZFile {
             decodes16: AtomicU64::new(0),
             decode_ns16: AtomicU64::new(0),
             opens16: AtomicU64::new(0),
+            raw_reads: AtomicU64::new(0),
             time_decodes: false,
             coded: false,
             id: NEXT_ZSIDE_ID.fetch_add(1, Ordering::Relaxed),
@@ -5218,6 +5249,14 @@ impl ZFile {
         } else {
             FileCoding::Block
         }
+    }
+
+    /// The cursors' reads of the raw form over this stride file
+    /// (`ZFile::raw_reads`): none in a build without debug assertions, and
+    /// none over a block file, where the door reads a run no page holds and
+    /// a value that lies in a block on purpose.
+    pub(super) fn raw_reads(&self) -> u64 {
+        self.raw_reads.load(Ordering::Relaxed)
     }
 
     /// The mapping whole, which a stride file's value pages are read from
@@ -15239,6 +15278,16 @@ mod tests {
                 "{name}: every value the stride position handed over, counted"
             );
             assert!(!zfile.damaged() && zfile.bad_pages() == 0, "{name}");
+            // Every key and value above was the stride position's: nothing
+            // went through the cursor's door to the raw form, every read of
+            // which is a record read over a stride file. The block cursor
+            // read every value through it, of a block body, which the count
+            // leaves out (`ZFile::raw_reads`).
+            assert_eq!(
+                (zfile.raw_reads(), block.raw_reads()),
+                (0, 0),
+                "{name}: the raw form read through the cursor's door"
+            );
         }
     }
 
@@ -15358,6 +15407,18 @@ mod tests {
             first_bad as u64,
             "the ranks before the bad page from the file, none from it on"
         );
+        // The control for the count `Reader::raw_touches` sums: the ranks
+        // from the bad page on were read through the cursor's door, each
+        // at least once, and a build without debug assertions counts none.
+        assert!(
+            if cfg!(debug_assertions) {
+                z.raw_reads() >= (n - first_bad) as u64
+            } else {
+                z.raw_reads() == 0
+            },
+            "the fall's reads of the raw form counted: {}",
+            z.raw_reads()
+        );
         // A cursor standing on the damaged page: its value read fails the
         // page's check and answers the raw form's value, never none, with
         // nothing of the slot handed over or counted, and the file out of
@@ -15374,6 +15435,11 @@ mod tests {
         );
         assert!(z.damaged() && z.bad_pages() == 1);
         assert_eq!(fx.memo.take_stride().cursor, 0, "nothing from the slot");
+        assert_eq!(
+            z.raw_reads(),
+            u64::from(cfg!(debug_assertions)),
+            "the one value read through the door, counted"
+        );
         // A cursor standing on an intact page when a point read takes the
         // file out of service.
         let z = fx.attach_stride(StrideAttach::Check).unwrap();

@@ -15853,11 +15853,19 @@ fn stride_raw_touches(name: &str, cache: bool) {
         probes.extend(around(k));
     }
     let limits = [1usize, 3, 57, 114, 1500];
+    // Each reader's window held to no touch of the raw form -- through
+    // `Seg::raw` or through a stride cursor's door (`Reader::raw_touches`
+    // sums both) -- and to no read or walk that went to the raw form by
+    // another way: a fallback, a read served raw for want of a file, a
+    // partition walked raw. A stride cursor that fell at every placing
+    // answered every key right through the raw form, so the answers say
+    // nothing of which form gave them.
     let held = |db: &Db, model: &Model, what: &str| {
         let r = db.reader().unwrap();
         let w: &Reader = db;
         for who in [w, &r] {
             let before = who.raw_touches();
+            let counted = db.zpage_counts();
             check(who, model, &keys, what);
             check(who, model, &probes, what);
             for start in &probes {
@@ -15878,6 +15886,24 @@ fn stride_raw_touches(name: &str, cache: bool) {
                 who.raw_touches(),
                 before,
                 "{name}, {what}: touches of the raw form"
+            );
+            let c = db.zpage_counts();
+            assert_eq!(
+                (
+                    c.fallbacks,
+                    c.rawserves,
+                    c.raw_scans,
+                    c.damaged,
+                    c.bad_pages
+                ),
+                (
+                    counted.fallbacks,
+                    counted.rawserves,
+                    counted.raw_scans,
+                    0,
+                    0
+                ),
+                "{name}, {what}: reads and walks gone to the raw form: {c:?}"
             );
         }
     };

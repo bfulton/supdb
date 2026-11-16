@@ -584,9 +584,12 @@ pub struct ZCounts {
     /// none for a file the attach trusted as this process's build
     /// (`Options::zpages_stride_trust_built`); and the values a form file
     /// cursor's stride position handed over, its walks' records and the
-    /// values read at it -- the block cache's and the merge path's reads of
-    /// a stride partition, which are walks and not point reads, so counted
-    /// apart from `stride_reads`.
+    /// values read at it -- the block cache's reads of a stride partition,
+    /// the merge path's walks over it beside the pieces, and the covered
+    /// walk of a scan over the partitions alone (`scan_partitions` under
+    /// `Options::zpages_walk_cursor`, its unsealed keys' emits among them),
+    /// which are walks and not point reads, so counted apart from
+    /// `stride_reads`.
     pub stride_reads: u64,
     pub stride_page_checks: u64,
     pub stride_cursor_reads: u64,
@@ -5912,9 +5915,11 @@ pub struct Options {
     /// own -- and not beside `zpages_recode_keep` or `zpages_both`, which act
     /// only on the paths those start (`check_options` says why). Every read
     /// path serves a stride partition from its file: the point reads, the
-    /// counts and the scans by its arms (`ZFile::stride`), and the block
-    /// cache's reads and the merge path's walks through the form file's
-    /// cursor, which stands at a rank there (`zfile::ZCursor`).
+    /// counts and a scan's walks by rank by its arms (`ZFile::stride`), and
+    /// the block cache's reads, the merge path's walks and the covered walk
+    /// of a scan over the partitions alone (`Options::zpages_walk_cursor`)
+    /// through the form file's cursor, which stands at a rank there
+    /// (`zfile::ZCursor`).
     #[doc(hidden)]
     pub zpages_stride: ZStride,
     /// EXPERIMENT: under `zpages_stride` `Forced`, a stride file whose build
@@ -7983,8 +7988,10 @@ fn z_dead_rename(shared: &Shared, dir: &Path, seg: &Seg) -> Option<PathBuf> {
 /// a block of the partition a merge retires, a segment's first or last key,
 /// the recovery's walk of a pending segment). Under debug assertions a
 /// touch through `Seg::raw` on a segment with a form file installed counts
-/// (`Seg::raw_touches`), which `tests/zpages.rs` holds to zero over a
-/// covered partition's reads and scans.
+/// (`Seg::raw_touches`), and so does a read a cursor over a stride file
+/// makes through the form file's door (`ZFile::raw_reads`), which holds
+/// no value in a block for the door to be for; `tests/zpages.rs` holds the
+/// sum to zero over a covered partition's reads and scans.
 struct SegBlob(Blob<MmapBytes>);
 
 impl SegBlob {
@@ -8018,7 +8025,9 @@ impl SegBlob {
     /// The raw form for the form file: `ZFile` reads a run that lies in a
     /// block through it, as the raw form reads one, and at the attach the
     /// identity the form file is bound by; nothing of the records' region
-    /// for an inline value, which is why it is not a touch.
+    /// for an inline value, which is why it is not a touch. A stride file
+    /// has no value in a block, so a read its cursor makes through here is
+    /// one of the records', and is counted on the file (`ZFile::raw_reads`).
     fn for_zfile(&self) -> &Blob<MmapBytes> {
         &self.0
     }
@@ -23618,14 +23627,18 @@ impl Reader {
     /// before the counters are read are in the sum.
     #[doc(hidden)]
     /// A test's: the raw form's touches through `Seg::raw` on segments with
-    /// a form file installed, summed over the live segments; a build without
+    /// a form file installed, and the reads a cursor over a stride file
+    /// made through the form file's door (`ZFile::raw_reads`), summed over
+    /// the live segments and the files their cells hold; a build without
     /// debug assertions counts none (`SegBlob`).
     #[doc(hidden)]
     pub fn raw_touches(&self) -> u64 {
         let _entered = self.enter();
         self.segs()
             .iter()
-            .map(|s| s.raw_touches.load(AtomicOrdering::Relaxed))
+            .map(|s| {
+                s.raw_touches.load(AtomicOrdering::Relaxed) + s.z.get().map_or(0, |z| z.raw_reads())
+            })
             .sum()
     }
 
