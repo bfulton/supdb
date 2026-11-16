@@ -586,6 +586,14 @@ fn oracle(inline: bool, raw_tails: bool) {
     // failure of the form.
     assert_eq!(life.failures, 0, "{life:?}");
     assert!(life.reads > 0 && life.counts > 0, "{life:?}");
+    // No form file of the block body is counted a stride file, the
+    // raw-tailed coding's among them: `ZCounts::stride_files` counts the
+    // one kind, and under the raw tails every file here is the other
+    // coding of the block body, a kind beside the block coding's.
+    assert!(
+        c.form_files > 0 && c.stride_files == 0,
+        "the block body's files are no stride files: {c:?}"
+    );
     if inline {
         assert_eq!(
             c.form_files, c.partitions,
@@ -1018,7 +1026,7 @@ fn a_flipped_byte_in_a_form_file_is_never_an_answer() {
     let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
     let pages = t.n_pages as usize;
     assert!(pages > 40, "{pages} pages");
-    let sampled: Vec<usize> = (0..16).map(|k| k * (pages - 1) / 15).collect();
+    let sampled = supdb::db::zpage_samples(pages);
     let work = scratch("flips-work");
     copy_dir(&dir, &work);
     let target = form_files(&work).remove(0);
@@ -5366,7 +5374,7 @@ fn an_untouched_page(path: &Path, taken: &[usize]) -> usize {
     let t = Trailer::decode(&bytes[bytes.len() - ZTRAILER..]).unwrap();
     let pages = t.n_pages as usize;
     assert!(pages > 40, "{pages} pages");
-    let sampled: Vec<usize> = (0..16).map(|k| k * (pages - 1) / 15).collect();
+    let sampled = supdb::db::zpage_samples(pages);
     (pages / 2..pages)
         .find(|p| !sampled.contains(p) && !taken.contains(p))
         .expect("a page nobody sampled or read")
@@ -14352,13 +14360,13 @@ fn stride_of(path: &Path) -> (StrideTrailer, usize) {
     (t, v)
 }
 
-/// The value pages of a file of `v` an attach checks: the first, the last
-/// and fourteen evenly spaced; and whether page `p` is clear of them --
-/// neither one nor the page after one, which the slot an attach reads there
-/// may run into, nor the last but one, whose bytes the last page's slot may
-/// begin on.
+/// The value pages of a file of `v` an attach checks
+/// (`supdb::db::zpage_samples`, the engine's own choice of them); and
+/// whether page `p` is clear of them -- neither one nor the page after one,
+/// which the slot an attach reads there may run into, nor the last but one,
+/// whose bytes the last page's slot may begin on.
 fn stride_samples(v: usize) -> (Vec<usize>, impl Fn(usize) -> bool) {
-    let s: Vec<usize> = (0..16).map(|k| k * (v - 1) / 15).collect();
+    let s = supdb::db::zpage_samples(v);
     let clear = {
         let s = s.clone();
         move |p: usize| p + 2 < v && !s.iter().any(|&q| q == p || q + 1 == p)
@@ -14534,17 +14542,20 @@ fn the_oracle_holds_with_the_stride_form_forced() {
     // values' partitions for a record not one value, the deletes' for the
     // numbers they took out of the run -- holes, since a merge drops the
     // flags a promotion would have kept and nothing promotes here past the
-    // load -- and none for a width, a block, the floor or a read-back, which
-    // no partition of this store can give: one width of inline values, a
-    // floor of nothing, no damage.
-    let [_, holes, not_one, width, tomb, block, small, check_no] = sum.stride_declines;
+    // load -- and none for a width or a read-back, which no partition of
+    // this store can give: one width of inline values, no damage. A run in
+    // a block and a partition under the floor are not asserted: under
+    // `ZStride::Forced` the build that meets either is the block form's
+    // decline and counted there alone, so those two slots stay empty
+    // whatever the store holds.
+    let [_, holes, not_one, width, tomb, _, _, check_no] = sum.stride_declines;
     assert!(
         not_one > 0 && holes + tomb > 0,
         "the second values' and the deletes' partitions declined: {sum:?}"
     );
     assert_eq!(
-        (width, block, small, check_no),
-        (0, 0, 0, 0),
+        (width, check_no),
+        (0, 0),
         "declines no partition here can give: {sum:?}"
     );
     assert!(
@@ -14601,6 +14612,90 @@ fn the_block_cache_walks_a_stride_partition_raw_until_its_cursor_holds_one() {
         "the point reads are the stride file's: {c:?}"
     );
     assert_eq!((c.fallbacks, c.damaged, c.bad_pages), (0, 0, 0), "{c:?}");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// A scan over partitions alone that meets an unsealed key equal to a
+/// stride partition's own: the emit reads the partition's value at the
+/// key's rank through the stride file (`Reader::emit_unsealed`,
+/// `ZFile::values_at`), then the memtable's -- the one path a stride
+/// record is read by rank outside a walk, and the one no piece standing
+/// sends to the merge path, which reads a stride partition raw until its
+/// cursor holds one. The store is the one partition a closed load leaves,
+/// opened again so that its file is the one found on disk and each value
+/// page is checked at its first touch; the unsealed writes are second
+/// values, with no tombstone in any source, so the emit reads the
+/// partition's value before the memtable's. A scan of one key from a
+/// written key reaches the partition's record through the emit alone -- the
+/// seek and the cut are the codec's arithmetic and touch no page, and no
+/// walk runs before the emit -- so the page checks rise by exactly the
+/// pages that key's slot spans, through the writer and through a handle,
+/// the slot that straddles two pages among them; and the whole store
+/// scanned from below every key, through both, answers as the model does.
+#[test]
+fn a_scan_over_partitions_reads_a_stride_record_under_an_unsealed_key_through_the_file() {
+    let (dir, mut model, keys) = stride_partition("stride-emit-src", 3000, 0x5E31);
+    let work = scratch("stride-emit-work");
+    copy_dir(&dir, &work);
+    let mut db = Db::open(&work, stride_forced(|_| {})).unwrap();
+    // Ranks whose slots lie on pages no other of them touches: rank 40's
+    // hundred bytes run from 4,000 to 4,099, across the first page's end.
+    let w = 100usize;
+    let slot_pages = |r: usize| (r * w / ZPAGE..=(r * w + w - 1) / ZPAGE).count() as u64;
+    let (by_writer, by_handle) = ([40usize, 700], [1500usize, 2999]);
+    assert_eq!(slot_pages(40), 2, "rank 40 straddles");
+    for &r in by_writer.iter().chain(&by_handle) {
+        let (k, v) = (keys[r].clone(), format!("second {r}").into_bytes());
+        db.append(&k, &v);
+        model.get_mut(&k).unwrap().push(v);
+    }
+    db.commit().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        (db.segments() as u64, c.partitions, c.stride_files),
+        (1, 1, 1),
+        "one partition and no piece: {c:?}"
+    );
+    assert_eq!(c.stride_page_checks, 0, "nothing read yet: {c:?}");
+    let one = |r: &Reader, rank: usize, what: &str| {
+        let before = db.zpage_counts().stride_page_checks;
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        r.scan(
+            &keys[rank],
+            1,
+            kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+        )
+        .unwrap();
+        let want: Vec<(Vec<u8>, Vec<u8>)> = model[&keys[rank]]
+            .iter()
+            .map(|v| (keys[rank].clone(), v.clone()))
+            .collect();
+        assert_eq!(want.len(), 2, "the record's value and the memtable's");
+        assert_eq!(got, want, "{what}: a scan of one key from rank {rank}");
+        assert_eq!(
+            db.zpage_counts().stride_page_checks - before,
+            slot_pages(rank),
+            "{what}: rank {rank}'s slot read through the stride file"
+        );
+    };
+    for &r in &by_writer {
+        one(&db, r, "the writer");
+    }
+    let h = db.reader().unwrap();
+    for &r in &by_handle {
+        one(&h, r, "a handle");
+    }
+    check_scan(&db, &model, "the writer");
+    check_scan(&h, &model, "a handle");
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.fallbacks, c.damaged, c.bad_pages, c.rawserves),
+        (0, 0, 0, 0),
+        "{c:?}"
+    );
+    drop(h);
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&work);
@@ -14811,6 +14906,13 @@ fn a_promotion_keeps_the_stride_file_of_the_partition_it_closes() {
 /// at their finish in the stride form -- and nothing else built, the builds
 /// ahead at landing held off by the scans, so that the stride builds are
 /// the finishes' alone -- and every form file it holds is a stride file.
+/// The controller's attach of those files, ticks later, is the finishes'
+/// builds' own attach come late (`Shared::z_left_seals`): each file's word
+/// kept until that attach and taken by it, each file installed with its
+/// value pages verified from the attach and none checked as the reads of
+/// every key touch them, with nothing built again in between -- where a
+/// file found on disk would check each page it touches
+/// (`Options::zpages_stride_trust_built`).
 #[cfg(target_os = "linux")]
 #[test]
 fn a_merges_outputs_are_built_in_the_stride_form_at_their_finish() {
@@ -14875,9 +14977,116 @@ fn a_merges_outputs_are_built_in_the_stride_form_at_their_finish() {
             "{what}: {f:?} is not a stride file"
         );
     }
+    // A word kept for each live partition's file until the attach that
+    // installs it, and taken by that attach.
+    let c = db.zpage_counts();
+    assert_eq!(
+        db.zpage_left_seals() as u64,
+        c.partitions - c.form_files,
+        "{what}: the finishes' words kept: {c:?}"
+    );
+    assert!(
+        tick_until(&db, 400, |c| c.sel_installs >= 1
+            && c.form_files == c.partitions),
+        "{what}: the files on disk not installed: {:?}",
+        db.zpage_counts()
+    );
+    assert_eq!(db.zpage_left_seals(), 0, "{what}: the words taken");
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.stride_files, c.build_starts, c.ahead_recoded),
+        (c.partitions, 0, 0),
+        "{what}: the finishes' files installed, nothing built again: {c:?}"
+    );
     let r = db.reader().unwrap();
     check(&r, &model, &keys, what);
     drop(r);
+    // Reads through the files, if not every key's: a key a piece still
+    // holds, one the merges have not folded yet, is answered by the piece's
+    // tombstone and value and never reaches its partition.
+    let c = db.zpage_counts();
+    assert!(c.stride_reads > 0, "{what}: {c:?}");
+    assert_eq!(
+        (c.stride_page_checks, c.verified_pages, c.fallbacks),
+        (0, c.pages, 0),
+        "{what}: the files a build of this process left installed trusted: {c:?}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same for the builds ahead at landing: a store of numbered keys past
+/// the share of its budget the builds ahead start at has every partition's
+/// stride file built ahead and left dormant on disk, its word kept for the
+/// attach that installs it (`Shared::z_left_seals`); driven to COMPACT
+/// far past the budget by faulting reads, every file is attached, the
+/// words taken, nothing built again, and the reads through the files check
+/// no page.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stride_file_built_ahead_is_installed_trusted_at_its_late_attach() {
+    let what = "the stride form built ahead";
+    let (dir, db, model, inject, raw) = land_store_loaded(
+        "auto-ahead-stride",
+        50,
+        |o| {
+            o.zpages_stride = ZStride::Forced;
+            o.partition_bytes = Some(160 << 10);
+            o.zpages_land_cold_past = false;
+        },
+        |db| numbered_load(db, 20_000, 100, 0xA4EA),
+    );
+    inject.set_budget(raw * 3 / 2);
+    assert!(
+        tick_until(&db, 400, |c| c.prebuilt >= c.partitions),
+        "{what}: built ahead: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    let n = c.partitions;
+    assert!(n >= 4, "{what}: {c:?}");
+    assert_eq!(
+        (c.stride_builds, c.prebuilt, c.attached, c.form_files),
+        (n, n, 0, 0),
+        "{what}: every partition's stride file built ahead and dormant: {c:?}"
+    );
+    assert_eq!(
+        db.zpage_left_seals() as u64,
+        n,
+        "{what}: a word kept for each: {c:?}"
+    );
+    inject.set_budget(1 << 20);
+    inject.set_refault_rate(1_000_000.0);
+    inject.set_fault_cost(FAULT_1MS);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+        "{what}: COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    assert!(
+        tick_until(&db, 400, |c| c.attached >= n && c.form_files == n),
+        "{what}: every partition attached: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.stride_files, c.build_starts),
+        (n, n),
+        "{what}: the files built ahead installed, nothing built again: {c:?}"
+    );
+    assert_eq!(db.zpage_left_seals(), 0, "{what}: the words taken");
+    check(&r, &model, &keys, what);
+    drop(r);
+    let c = db.zpage_counts();
+    assert!(c.stride_reads > 0, "{what}: through the files: {c:?}");
+    assert_eq!(
+        (c.stride_page_checks, c.verified_pages, c.fallbacks),
+        (0, c.pages, 0),
+        "{what}: the files a build of this process left installed trusted: {c:?}"
+    );
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

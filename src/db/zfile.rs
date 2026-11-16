@@ -94,8 +94,9 @@ const ZSAMPLE_PAGES: usize = 16;
 /// first, the last and evenly spaced pages between, `ZSAMPLE_PAGES` of
 /// them -- past that many pages the step between two is at least one, so
 /// no page is named twice. The one choice of a sample both bodies' attaches
-/// make (`ZFile::check_sample`, `ZFile::attach_stride`).
-fn sample_pages(n: usize) -> Vec<usize> {
+/// make (`ZFile::check_sample`, `ZFile::attach_stride`), and the one the
+/// tests that forge a page around the sample read (`db::zpage_samples`).
+pub(super) fn sample_pages(n: usize) -> Vec<usize> {
     if n <= ZSAMPLE_PAGES {
         (0..n).collect()
     } else {
@@ -2043,14 +2044,12 @@ pub(super) struct PointCounts {
     pub(super) walk_mores: u64,
 }
 
-/// What only a stride file counts on a handle, kept apart from the block
-/// form's counts (`PointCounts`), which every dispatch takes whole: two
-/// words more there were two more words copied and zeroed at every block
-/// file's dispatch and a test of them, seven or eight instructions more on
-/// the take's path where nothing was counted, counted in the checked
-/// build's disassembly. These are taken behind the one flag the stride arm
-/// raises (`ZMemo::stride_due`), so a block file's dispatch pays the
-/// compare of a byte and a branch, two.
+/// What only a stride file counts on a handle, kept off the block form's
+/// counts (`PointCounts`), which every dispatch copies, zeroes and tests
+/// whole: a word there is a word every block file's dispatch pays for
+/// whether a stride file exists or not. These are taken behind the one
+/// flag the stride arm raises (`ZMemo::stride_due`), so a block file's
+/// dispatch tests that flag and takes nothing else of them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct StrideCounts {
     /// Value pages checked against their word of the row at their first
@@ -5090,7 +5089,7 @@ impl ZFile {
             return out;
         }
         let want = (limit as u64).min(n - from);
-        if self.stride_ask_ahead(body, from, want) {
+        if self.stride_ask_ahead(body, from, want).is_some() {
             out.prefetches += 1;
         }
         let codec = body.codec();
@@ -5123,20 +5122,29 @@ impl ZFile {
     /// The pages a stride walk of `want` ranks from `from` will cross after
     /// its first, asked for at once, at most `ZPREFETCH_PAGES` of them
     /// (`Options::zpages_scan_prefetch`, the block walk's `ask_ahead`): the
-    /// slots' span is arithmetic, so the ask is exact. Whether it asked:
-    /// nothing with the option off, or a walk inside one page.
-    fn stride_ask_ahead(&self, body: &StrideBody, from: u64, want: u64) -> bool {
+    /// slots' span is arithmetic, so the ask is exact. What it asked, as the
+    /// first page and the count: nothing with the option off, or for a walk
+    /// inside one page.
+    ///
+    /// Behind the block walk's gate, which is off by default, so under
+    /// `ZPages::Always` and `ZStride::Forced`, whose install drops the raw
+    /// pages (`Options::zpages_drop_raw`), a stride walk faults its value
+    /// pages one at a time. Whether a stride walk asks with the gate off is
+    /// the open question this leaves to the forced pairing, which decides it
+    /// from the faults a scan takes by form.
+    fn stride_ask_ahead(&self, body: &StrideBody, from: u64, want: u64) -> Option<(u32, usize)> {
         if !self.prefetch || want == 0 {
-            return false;
+            return None;
         }
         let (first, last) = body.span_pages(from, want);
         let k = ((last - first) as usize).min(ZPREFETCH_PAGES);
         if k == 0 {
-            return false;
+            return None;
         }
+        let ask = first + 1;
         self.map
-            .advise_willneed((u64::from(first) + 1) * ZPAGE as u64, k * ZPAGE);
-        true
+            .advise_willneed(u64::from(ask) * ZPAGE as u64, k * ZPAGE);
+        Some((ask, k))
     }
 
     /// `values_at` of a stride file: rank `rank`'s one value after its
@@ -8978,8 +8986,8 @@ mod tests {
             pages > 3 * ZSAMPLE_PAGES,
             "pages enough to leave some unsampled"
         );
-        let sampled =
-            |p: usize| (0..ZSAMPLE_PAGES).any(|k| k * (pages - 1) / (ZSAMPLE_PAGES - 1) == p);
+        let sample = sample_pages(pages);
+        let sampled = |p: usize| sample.contains(&p);
         let unsampled: Vec<usize> = (1..pages - 1).filter(|&p| !sampled(p)).collect();
         let p = unsampled[unsampled.len() / 2];
         let f = OpenOptions::new()
@@ -9032,8 +9040,8 @@ mod tests {
             pages > 3 * ZSAMPLE_PAGES,
             "pages enough to leave some unsampled"
         );
-        let sampled =
-            |p: usize| (0..ZSAMPLE_PAGES).any(|k| k * (pages - 1) / (ZSAMPLE_PAGES - 1) == p);
+        let sample = sample_pages(pages);
+        let sampled = |p: usize| sample.contains(&p);
         let unsampled: Vec<usize> = (1..pages - 1).filter(|&p| !sampled(p)).collect();
         let p = unsampled[unsampled.len() / 2];
         let f = OpenOptions::new()
@@ -9951,8 +9959,8 @@ mod tests {
                 pages > 3 * ZSAMPLE_PAGES,
                 "pages enough to leave some unsampled"
             );
-            let sampled =
-                |p: usize| (0..ZSAMPLE_PAGES).any(|k| k * (pages - 1) / (ZSAMPLE_PAGES - 1) == p);
+            let sample = sample_pages(pages);
+            let sampled = |p: usize| sample.contains(&p);
             let unsampled: Vec<usize> = (1..pages - 1).filter(|&p| !sampled(p)).collect();
             let p = unsampled[unsampled.len() / 2];
             let v = page_view(zfile.page_bytes(p).unwrap()).unwrap();
@@ -10039,8 +10047,8 @@ mod tests {
                 pages > 3 * ZSAMPLE_PAGES,
                 "pages enough to leave some unsampled"
             );
-            let sampled =
-                |p: usize| (0..ZSAMPLE_PAGES).any(|k| k * (pages - 1) / (ZSAMPLE_PAGES - 1) == p);
+            let sample = sample_pages(pages);
+            let sampled = |p: usize| sample.contains(&p);
             let unsampled: Vec<usize> = (1..pages - 1).filter(|&p| !sampled(p)).collect();
             let p = unsampled[unsampled.len() / 2];
             let v = page_view(zfile.page_bytes(p).unwrap()).unwrap();
@@ -11052,9 +11060,7 @@ mod tests {
         let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
         let pages = t.n_pages as usize;
         assert!(pages > ZSAMPLE_PAGES + 4, "{pages} pages");
-        let sampled: Vec<usize> = (0..ZSAMPLE_PAGES)
-            .map(|k| k * (pages - 1) / (ZSAMPLE_PAGES - 1))
-            .collect();
+        let sampled = sample_pages(pages);
         let f = OpenOptions::new().write(true).open(&fx.out).unwrap();
         let (mut refused, mut declined, mut quiet) = (0usize, 0usize, 0usize);
         for at in (0..pages * ZPAGE).step_by(7) {
@@ -11209,9 +11215,7 @@ mod tests {
 
     /// The first page the attach does not sample, `skip` unsampled pages in.
     fn unsampled(pages: usize, skip: usize) -> usize {
-        let sampled: Vec<usize> = (0..ZSAMPLE_PAGES)
-            .map(|k| k * (pages - 1) / (ZSAMPLE_PAGES - 1))
-            .collect();
+        let sampled = sample_pages(pages);
         (1..pages - 1)
             .filter(|q| !sampled.contains(q))
             .nth(skip)
@@ -12359,9 +12363,7 @@ mod tests {
         // The attach's sample faulted sixteen pages in through the
         // mapping, which no eviction takes back; the pages read are the
         // others: (resident, counted) over a run.
-        let sampled: Vec<usize> = (0..ZSAMPLE_PAGES)
-            .map(|k| k * (pages - 1) / (ZSAMPLE_PAGES - 1))
-            .collect();
+        let sampled = sample_pages(pages);
         let resident = |from: usize, n: usize| -> (usize, usize) {
             let m = MmapBytes::open(&fx.out).unwrap();
             let (mut res, mut all) = (0, 0);
@@ -13980,6 +13982,31 @@ mod tests {
         }
     }
 
+    /// The sample both bodies' attaches take (`sample_pages`), held to its
+    /// doc by what it must be and not by a second copy of its arithmetic,
+    /// which the tests that forge or flip a page around the sample call
+    /// instead: every page of a file of at most `ZSAMPLE_PAGES`, and of a
+    /// longer one `ZSAMPLE_PAGES` pages ascending, the first and the last
+    /// among them, each step at least a page and no step more than a page
+    /// longer than another -- the even spacing, which leaves no stretch of
+    /// the file unsampled for longer than its share.
+    #[test]
+    fn an_attach_samples_the_first_and_the_last_page_and_evenly_between() {
+        let sizes = (1..=4 * ZSAMPLE_PAGES + 3).chain([239, 1000, 10_007, 1 << 20]);
+        for n in sizes {
+            let s = sample_pages(n);
+            if n <= ZSAMPLE_PAGES {
+                assert_eq!(s, (0..n).collect::<Vec<_>>(), "{n} pages: every one");
+                continue;
+            }
+            assert_eq!(s.len(), ZSAMPLE_PAGES, "{n} pages: {s:?}");
+            assert_eq!((s[0], s[ZSAMPLE_PAGES - 1]), (0, n - 1), "{n}: {s:?}");
+            let steps: Vec<usize> = s.windows(2).map(|w| w[1] - w[0]).collect();
+            let (lo, hi) = (steps.iter().min().unwrap(), steps.iter().max().unwrap());
+            assert!(*lo >= 1 && hi - lo <= 1, "{n} pages: steps {steps:?}");
+        }
+    }
+
     // ---- the stride form's reader -------------------------------------------
 
     /// A walk's emits folded, key and value each with its length, so that
@@ -14256,13 +14283,16 @@ mod tests {
 
     /// A stride walk asks for the pages it will cross after its first where
     /// the scan's prefetch is on, and only then; one that stays inside its
-    /// first page asks nothing.
+    /// first page asks nothing. The ask is held to its pages, from the
+    /// slots' bytes and not from the body's span: the page after the walk's
+    /// first and on, at most `ZPREFETCH_PAGES` of them, the cap reached
+    /// exactly and passed by one page.
     #[test]
     fn a_stride_walk_asks_for_the_pages_it_will_cross_under_the_scans_prefetch() {
         let fx = stride_fixture("stride-ahead", 3000, 100, 0x5a);
         stride_built(&fx);
-        let walk = |prefetch: bool, from: usize, limit: usize| {
-            let z = ZFile::attach(
+        let attach = |prefetch: bool| {
+            ZFile::attach(
                 &fx.out,
                 &fx.blob,
                 ID,
@@ -14276,7 +14306,52 @@ mod tests {
                 true,
                 &StrideAttach::Check,
             )
-            .unwrap();
+            .unwrap()
+        };
+        // The pages a walk asks for: from the page after the one its first
+        // slot starts on to the one its last slot ends on, capped.
+        let w = 100u64;
+        let want_ask = |from: u64, want: u64| -> Option<(u32, usize)> {
+            let first = (from * w / ZPAGE as u64) as usize;
+            let last = (((from + want) * w - 1) / ZPAGE as u64) as usize;
+            (last > first).then(|| ((first + 1) as u32, (last - first).min(ZPREFETCH_PAGES)))
+        };
+        // A walk whose last slot ends on the page `ZPREFETCH_PAGES` after
+        // its first, and one on the page after that.
+        let at_cap = (ZPREFETCH_PAGES * ZPAGE) as u64 / w + 1;
+        let past_cap = ((ZPREFETCH_PAGES + 1) * ZPAGE) as u64 / w + 1;
+        assert_eq!(want_ask(0, at_cap), Some((1, ZPREFETCH_PAGES)));
+        assert_eq!(want_ask(0, at_cap - 1), Some((1, ZPREFETCH_PAGES - 1)));
+        assert_eq!(want_ask(0, past_cap), Some((1, ZPREFETCH_PAGES)));
+        {
+            let (on, off) = (attach(true), attach(false));
+            let body = on.stride().unwrap();
+            for (from, want) in [
+                (0, 3000),
+                (100, 200),
+                (0, 41),
+                (0, 40),
+                (0, 30),
+                (0, at_cap),
+                (0, at_cap - 1),
+                (0, past_cap),
+                (7, past_cap),
+                (2900, 100),
+            ] {
+                assert_eq!(
+                    on.stride_ask_ahead(body, from, want),
+                    want_ask(from, want),
+                    "a walk of {want} from {from}"
+                );
+                assert_eq!(
+                    off.stride_ask_ahead(body, from, want),
+                    None,
+                    "the option off"
+                );
+            }
+        }
+        let walk = |prefetch: bool, from: usize, limit: usize| {
+            let z = attach(prefetch);
             z.scan_at(
                 &fx.memo,
                 &fx.blob,
@@ -14595,8 +14670,7 @@ mod tests {
         // it that the slot it checks there spans (`StrideBody::rank_on_page`).
         let w = 100usize;
         let mut sampled: Vec<usize> = Vec::new();
-        for k in 0..ZSAMPLE_PAGES {
-            let p = k * (v - 1) / (ZSAMPLE_PAGES - 1);
+        for p in sample_pages(v) {
             let r = body.rank_on_page(p as u32) as usize;
             sampled.extend([r * w / ZPAGE, (r * w + w - 1) / ZPAGE]);
         }
@@ -14689,9 +14763,7 @@ mod tests {
         stride_built(&fx);
         let good = std::fs::read(&fx.out).unwrap();
         let v = StrideBody::from_bytes(&good).unwrap().pages();
-        let sampled: Vec<usize> = (0..ZSAMPLE_PAGES)
-            .map(|k| k * (v - 1) / (ZSAMPLE_PAGES - 1))
-            .collect();
+        let sampled = sample_pages(v);
         let identity = |what: &str| match fx.attach() {
             Err(Reject::Identity(why)) => why,
             Err(other) => panic!("{what}: {other:?}"),

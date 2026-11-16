@@ -5921,11 +5921,16 @@ pub struct Options {
     /// its name (`zfile::check_stride`) is installed with every value page
     /// marked verified, once its attach has found under the name the trailer
     /// that build wrote -- the row's CRC in it, so the row too -- and so the
-    /// build's file. A file found on disk at an open, or by a build's look
-    /// before it builds, checks each value page against its row at the
-    /// page's first touch, as the block form checks its pages; the reads
-    /// count those checks (`ZCounts::stride_page_checks`). Off, the file a
-    /// build made is checked so too. On.
+    /// build's file: the attach that follows the build, or for a file the
+    /// build left on disk -- built ahead and not wanted yet, or at a merge's
+    /// output finish -- the attach that first installs it
+    /// (`Shared::z_left_seals`). A file found on disk at an open, or by a
+    /// build's look before it builds where no build of this process left
+    /// it, and any later attach of a file already installed, checks each
+    /// value page against its row at the page's first touch, as the block
+    /// form checks its pages; the reads count those checks
+    /// (`ZCounts::stride_page_checks`). Off, the file a build made is
+    /// checked so too. On.
     #[doc(hidden)]
     pub zpages_stride_trust_built: bool,
 }
@@ -5973,13 +5978,21 @@ impl Options {
         }
     }
 
-    /// `z_stride_attach` for the file the build `b` just made and named:
-    /// trusted where `zpages_stride_trust_built` says so and the build wrote
-    /// a stride file, whose read-back held every rank to its records, and
-    /// so its pages need no check at their first touch once the attach has
-    /// found the trailer the build wrote under the name.
+    /// `z_stride_attach` for the file the build `b` just made and named
+    /// (`z_stride_attach_sealed` of its trailer's word).
     fn z_stride_attach_built(&self, b: &zfile::Built) -> zfile::StrideAttach {
-        match (self.z_stride_attach(), b.stride_seal) {
+        self.z_stride_attach_sealed(b.stride_seal)
+    }
+
+    /// `z_stride_attach` for a file a build of this process wrote as a
+    /// stride file, its trailer's word `seal` (`zfile::Built::stride_seal`,
+    /// at once or kept by name until its attach, `Shared::z_left_seals`):
+    /// trusted where `zpages_stride_trust_built` says so, since the build's
+    /// read-back held every rank to its records, and so its pages need no
+    /// check at their first touch once the attach has found the trailer the
+    /// build wrote under the name. No word, the file found on disk.
+    fn z_stride_attach_sealed(&self, seal: Option<u32>) -> zfile::StrideAttach {
+        match (self.z_stride_attach(), seal) {
             (zfile::StrideAttach::Check, Some(seal)) if self.zpages_stride_trust_built => {
                 zfile::StrideAttach::Trust(seal)
             }
@@ -7660,6 +7673,26 @@ fn z_coded_record(plan: &zfile::BuildPlan) -> bool {
     plan.raw_tails
 }
 
+/// A form file `b` built under `name` and left on disk for a later attach:
+/// its trailer's word kept for that attach where it is a stride file
+/// (`Shared::z_left_seals`), and any word kept for an earlier file under
+/// the name dropped where it is not, so that the record names what the
+/// name holds.
+fn z_leave_seal(shared: &Shared, name: String, b: &zfile::Built) {
+    let mut seals = shared
+        .z_left_seals
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match b.stride_seal {
+        Some(seal) => {
+            seals.insert(name, seal);
+        }
+        None => {
+            seals.remove(&name);
+        }
+    }
+}
+
 /// What a merge's thread is given to build each output's form file as the
 /// output is finished (`Options::zpages_build_at_finish`): the builder's
 /// plan as the builds ahead would have it, the store's counters and holds,
@@ -7736,6 +7769,7 @@ impl ZFinish {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .push((zfile::zpg_name(id, end), z_coded_record(&plan)));
+                        z_leave_seal(&shared, zfile::zpg_name(id, end), &b);
                     }
                     Ok(zfile::Outcome::Declined(d)) => ev.declined(d),
                     Ok(zfile::Outcome::Cancelled) => zfile::ZEvents::add(&ev.build_cancelled, 1),
@@ -18708,6 +18742,20 @@ struct Shared {
     /// (`Maint::z_ahead_coding`) at its next look, so that a file in the
     /// coding a later pick refuses is not counted as covering its partition.
     z_finish_coded: std::sync::Mutex<Vec<(String, bool)>>,
+    /// The stride files a build of this process wrote, read back and named
+    /// and left on disk for a later attach -- a build ahead not wanted yet,
+    /// a build at a merge's output finish -- by name, each with the word
+    /// the build's trailer carries (`zfile::Built::stride_seal`): the attach
+    /// that first installs one (`Maint::z_attach_on_disk`) is the build's
+    /// own attach come late, and holds the file to that word as the collect
+    /// and `Db::z_give` hold a file they install at once
+    /// (`Options::zpages_stride_trust_built`). Taken by that attach, and
+    /// held to the live partitions' names as the codings' record is
+    /// (`Maint::z_take_finish_codings`), since a file whose partition a
+    /// merge retired never reaches it. A later attach of the same file, a
+    /// promotion's or a way back from a release, checks its pages as any
+    /// re-attach of a file this process installed does.
+    z_left_seals: std::sync::Mutex<std::collections::HashMap<String, u32>>,
     /// A test's: the next form file build fails as a write error would.
     fail_zbuild: std::sync::atomic::AtomicBool,
     /// A test's: `Options::zpages_hold_after_settle`, as it stands.
@@ -23964,8 +24012,11 @@ impl Reader {
 
     /// What a stride file counted on the memo, onto this handle's line: out
     /// of line, behind the flag the stride arm raises, so the take a block
-    /// file's dispatch makes is the block form's and a byte's look.
-    #[cold]
+    /// file's dispatch makes is the block form's and a byte's look. Not
+    /// `#[cold]`: the stride arm raises the flag on every read it serves, so
+    /// under the forced form this is every stride read's path, and a hint
+    /// that lays it out as the unlikely one would bias the pairing that
+    /// prices the form against the block coding.
     #[inline(never)]
     fn zstride_take(&self) {
         let c = self.zmemo.take_stride();
@@ -33071,6 +33122,7 @@ impl Db {
             z_finish_live: std::sync::atomic::AtomicUsize::new(0),
             z_finish_names: std::sync::Mutex::new(Vec::new()),
             z_finish_coded: std::sync::Mutex::new(Vec::new()),
+            z_left_seals: std::sync::Mutex::new(std::collections::HashMap::new()),
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
             zsettle_hold: std::sync::atomic::AtomicBool::new(opts.zpages_hold_after_settle),
             zgate: ZGate::new(opts.zpages),
@@ -33871,6 +33923,7 @@ impl Db {
             z_finish_live: std::sync::atomic::AtomicUsize::new(0),
             z_finish_names: std::sync::Mutex::new(Vec::new()),
             z_finish_coded: std::sync::Mutex::new(Vec::new()),
+            z_left_seals: std::sync::Mutex::new(std::collections::HashMap::new()),
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
             zsettle_hold: std::sync::atomic::AtomicBool::new(opts.zpages_hold_after_settle),
             zgate: ZGate::new(opts.zpages),
@@ -37596,6 +37649,29 @@ impl Db {
             c.promoted.load(AtomicOrdering::Relaxed),
             c.promoted_open.load(AtomicOrdering::Relaxed),
         )
+    }
+
+    /// A test's: how many of the words kept for the stride files a build
+    /// of this process left on disk (`Shared::z_left_seals`) name a live
+    /// partition's form file -- each such partition's until the attach that
+    /// installs its file takes it, and none after.
+    #[doc(hidden)]
+    pub fn zpage_left_seals(&self) -> usize {
+        let names: std::collections::HashSet<String> = {
+            let _op = self.op();
+            self.segs()
+                .iter()
+                .filter(|s| s.level > 0)
+                .filter_map(|s| zfile::zpg_name_for(&s.name))
+                .collect()
+        };
+        self.shared
+            .z_left_seals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .filter(|n| names.contains(*n))
+            .count()
     }
 
     pub fn segments(&self) -> usize {
@@ -44092,6 +44168,14 @@ const HOT_RAW_FILL: f64 = 0.75;
 /// takes is a reclaim.
 #[doc(hidden)]
 pub const HOT_RAW_GROWTH: f64 = 0.10;
+/// The pages an attach of a form file of `n` pages checks at its attach,
+/// ascending (`zfile::sample_pages`, the one choice both bodies make): what
+/// a test that forges or flips a page outside the sample names, so that it
+/// restates no arithmetic of the engine's.
+#[doc(hidden)]
+pub fn zpage_samples(n: usize) -> Vec<usize> {
+    zfile::sample_pages(n)
+}
 #[cfg(test)]
 mod hot_growth_tests {
     #[test]
@@ -49584,7 +49668,12 @@ impl Maint {
             let _op = self.op();
             self.segs().iter().filter(|s| s.level > 0).count()
         };
-        if self.z_ahead_coding.len() > 4 * live.max(8) {
+        let shared = self.shared.clone();
+        let mut seals = shared
+            .z_left_seals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self.z_ahead_coding.len().max(seals.len()) > 4 * live.max(8) {
             let names: std::collections::HashSet<String> = {
                 let _op = self.op();
                 self.segs()
@@ -49594,6 +49683,7 @@ impl Maint {
                     .collect()
             };
             self.z_ahead_coding.retain(|n, _| names.contains(n));
+            seals.retain(|n, _| names.contains(n));
         }
     }
 
@@ -50479,8 +50569,15 @@ impl Maint {
         self.z_take_finish_codings();
         let shared = self.shared.clone();
         let ev = &shared.z;
+        let name = zfile::zpg_name(id, end);
+        // The word a build of this process left for the file it named, the
+        // file this attach installs where its trailer is that word's.
+        let seal = shared
+            .z_left_seals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&name);
         if !dormant {
-            let name = zfile::zpg_name(id, end);
             let want = self
                 .z_coding_pick
                 .filter(|_| self.opts.zpages_coding_auto)
@@ -50521,7 +50618,7 @@ impl Maint {
                     self.opts.zpages_group_ahead,
                     self.opts.zpages_walk_owns_decodes,
                 ),
-                &self.opts.z_stride_attach(),
+                &self.opts.z_stride_attach_sealed(seal),
                 ev,
             )
     }
@@ -51004,6 +51101,7 @@ impl Maint {
             Ok(zfile::Outcome::Built(built)) if dormant && !self.z_want_build && live.is_some() => {
                 ev.built(&built);
                 zfile::ZEvents::add(&ev.prebuilt, 1);
+                z_leave_seal(&shared, zfile::zpg_name(id, end), &built);
                 self.z_prebuilt_landed();
             }
             Ok(zfile::Outcome::Built(built)) => match live {
