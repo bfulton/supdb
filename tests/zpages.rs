@@ -15814,8 +15814,11 @@ fn stride_scans_without_the_block_cache_agree_with_the_model_over_every_window()
 /// store: drained; with unsealed keys inside the windows, written after a
 /// scan so that, with the block cache on, the commits file them into the
 /// forms (the settles' resolves and the forms' patches, by the codec's
-/// arithmetic); over a level-0 piece (the merge path, or the block cache's
-/// builds over the piece's keys); and after the piece merges, where the
+/// arithmetic), counted in a window of their own from before the first
+/// write to the upkeep joined, since the upkeep thread files them before
+/// any read begins (`settled_without_raw`); over a level-0 piece (the merge
+/// path, or the block cache's builds over the piece's keys), its writes'
+/// settles counted the same way; and after the piece merges, where the
 /// partitions it made the form declines are block files. On the writer and
 /// a handle. The control: under the raw gate the same reads touch the raw
 /// form and the counter moves, so the zeros are the form's.
@@ -15883,35 +15886,43 @@ fn stride_raw_touches(name: &str, cache: bool) {
     db.settle().unwrap();
     held(&db, &model, "drained");
     let mut rng = Rng(0x7A151);
-    for i in 0..300 {
-        let k = keys[rng.below(keys.len())].clone();
-        match i % 4 {
-            0 => {
-                let new = [k.as_slice(), b"+"].concat();
-                let v = hundred(&mut rng);
-                db.append(&new, &v);
-                model.entry(new).or_default().push(v);
+    settled_without_raw(
+        &mut db,
+        cache,
+        &format!("{name}, with unsealed keys"),
+        |db| {
+            for i in 0..300 {
+                let k = keys[rng.below(keys.len())].clone();
+                match i % 4 {
+                    0 => {
+                        let new = [k.as_slice(), b"+"].concat();
+                        let v = hundred(&mut rng);
+                        db.append(&new, &v);
+                        model.entry(new).or_default().push(v);
+                    }
+                    1 => {
+                        let v = hundred(&mut rng);
+                        db.append(&k, &v);
+                        model.entry(k).or_default().push(v);
+                    }
+                    2 => {
+                        db.delete(&k);
+                        model.insert(k, Vec::new());
+                    }
+                    _ => {
+                        let v = hundred(&mut rng);
+                        db.put(&k, &v);
+                        model.insert(k, vec![v]);
+                    }
+                }
+                if i % 50 == 49 {
+                    db.commit().unwrap();
+                }
             }
-            1 => {
-                let v = hundred(&mut rng);
-                db.append(&k, &v);
-                model.entry(k).or_default().push(v);
-            }
-            2 => {
-                db.delete(&k);
-                model.insert(k, Vec::new());
-            }
-            _ => {
-                let v = hundred(&mut rng);
-                db.put(&k, &v);
-                model.insert(k, vec![v]);
-            }
-        }
-        if i % 50 == 49 {
             db.commit().unwrap();
-        }
-    }
-    db.commit().unwrap();
+        },
+    );
+    assert_eq!(db.levels().1, 0, "{name}: no piece yet");
     held(&db, &model, "with unsealed keys");
     // The control: under the raw gate the reads are the raw form's, through
     // the door, and the counter moves.
@@ -15936,18 +15947,25 @@ fn stride_raw_touches(name: &str, cache: bool) {
     db.zpages_settle().unwrap();
     db.settle().unwrap();
     assert!(db.levels().1 >= 1, "a piece landed: {:?}", db.levels());
-    for i in 0..100 {
-        let k = keys[rng.below(keys.len())].clone();
-        let v = hundred(&mut rng);
-        if i % 2 == 0 {
-            db.append(&k, &v);
-            model.entry(k).or_default().push(v);
-        } else {
-            db.put(&k, &v);
-            model.insert(k, vec![v]);
+    let c = db.zpage_counts();
+    assert_eq!(
+        c.stride_files, c.partitions,
+        "{name}: beside the piece: {c:?}"
+    );
+    settled_without_raw(&mut db, cache, &format!("{name}, over a piece"), |db| {
+        for i in 0..100 {
+            let k = keys[rng.below(keys.len())].clone();
+            let v = hundred(&mut rng);
+            if i % 2 == 0 {
+                db.append(&k, &v);
+                model.entry(k).or_default().push(v);
+            } else {
+                db.put(&k, &v);
+                model.insert(k, vec![v]);
+            }
         }
-    }
-    db.commit().unwrap();
+        db.commit().unwrap();
+    });
     held(&db, &model, "over a piece");
     let c = db.zpage_counts();
     assert!(
@@ -15965,6 +15983,35 @@ fn stride_raw_touches(name: &str, cache: bool) {
     held(&db, &model, "after the merge");
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The writes `write` makes and commits, over a stride-served store, held
+/// to no touch of the raw form from before the first write to the upkeep
+/// joined: the commits' own fills and the upkeep thread's passes, which
+/// resolve each written key to its block by the codec's arithmetic and
+/// patch it into the block's form through the form file, run inside this
+/// window and in no window of `held`, whose reads come after them. Joined
+/// by `settle`, which joins the upkeep first, with no seal in flight for it
+/// to land (a landing's passes read the raw form on purpose), the store's
+/// shape the same on either side; and with the block cache on, the
+/// settles counted, so that the zero is of settles that ran.
+fn settled_without_raw(db: &mut Db, cache: bool, what: &str, write: impl FnOnce(&mut Db)) {
+    let shape = db.levels();
+    let touches = db.raw_touches();
+    let settled = db.settle_density();
+    write(db);
+    db.settle().unwrap();
+    assert_eq!(db.levels(), shape, "{what}: nothing landed in the window");
+    assert_eq!(
+        db.raw_touches(),
+        touches,
+        "{what}: the settles' and the patches' touches of the raw form"
+    );
+    let after = db.settle_density();
+    assert!(
+        !cache || (after[0] > settled[0] && after[1] > settled[1]),
+        "{what}: the settles filed the writes into the stride partitions' forms: {settled:?} -> {after:?}"
+    );
 }
 
 #[test]
