@@ -14567,8 +14567,9 @@ fn stride_oracle(name: &str, cache: bool) {
             drop((hz, hr));
             // A run put again, dense inside the windows below, and every
             // other round sealed into a piece over it.
+            const RUN: usize = 48;
             let from = rng.below(N / 2 - 64);
-            for i in (from..from + 48).step_by(2) {
+            for i in (from..from + RUN).step_by(2) {
                 let (key, v) = (numbered_key(i), format!("w{step:08}").into_bytes());
                 both(&mut z, &mut raw, &|d| d.put(&key, &v));
                 pending.push((key.clone(), None));
@@ -14586,26 +14587,32 @@ fn stride_oracle(name: &str, cache: bool) {
             let pieces = z.levels().1 > 0 && z.zpage_counts().stride_files > 0;
             let before = z.zpage_counts().stride_cursor_reads;
             let hz = z.reader().unwrap();
+            // Each start with the first of the run's keys at or after it:
+            // no key sorts between two numbered keys, so from `from + 5`
+            // and a zero byte that is `from + 6`.
             let starts = [
-                numbered_key(from),
-                [numbered_key(from + 5).as_slice(), b"\0"].concat(),
-                numbered_key(from + 20),
+                (numbered_key(from), from),
+                (
+                    [numbered_key(from + 5).as_slice(), b"\0"].concat(),
+                    from + 6,
+                ),
+                (numbered_key(from + 20), from + 20),
             ];
             let w: &Reader = &z;
             for (who, label) in [(w, "writer"), (&hz, "handle")] {
-                for start in &starts {
+                for (start, first) in &starts {
                     for limit in [1usize, 3, 17, 64, 300] {
                         let what = format!(
                             "{label}, round {settles}, from {:?} for {limit}",
                             String::from_utf8_lossy(start)
                         );
                         let got = scanned(who, start, limit);
-                        // The run's own keys are live every other one.
-                        let least = if start == &starts[0] {
-                            limit.min(48).div_ceil(2)
-                        } else {
-                            0
-                        };
+                        // The run's own keys after the start are live every
+                        // other one, the first of them among the live: a
+                        // window of `limit` keys holds at least half of the
+                        // run's keys it reaches, each with its one value,
+                        // whatever the keys between them hold.
+                        let least = limit.min(from + RUN - first).div_ceil(2);
                         live_prefix(&model, start, &got, least, &what);
                     }
                 }
