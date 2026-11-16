@@ -610,7 +610,9 @@ counters say what the stride files served and why a partition declined;
 `supdb-nocachezstrideprefetch` is it with a walk's pages asked for ahead
 (`Options::zpages_scan_prefetch`), `supdb-nocachezstridechecked` with no
 stride file this process built trusted at its attach
-(`Options::zpages_stride_trust_built` off), and `supdb-cache64tofitzstride`
+(`Options::zpages_stride_trust_built` off) -- the trust reaches only a build
+whose read-back read the device, and a forced build keeps its pages, so the
+pair is the trust's noise floor -- and `supdb-cache64tofitzstride`
 and `supdb-cache64tofitzstrideprefetch` are `supdb-cache64tofitzpages` with
 the stride form, and with the ask beside it;
 `supdb-settlelate` and `supdb-ingestsettlelate` are `supdb` and

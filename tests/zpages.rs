@@ -7227,6 +7227,78 @@ fn tick_until(db: &Db, max: u32, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> 
     cond(&db.zpage_counts())
 }
 
+/// Ticks of the injected clock until `cond` holds of the counts, for as
+/// long as a minute of the wall allows rather than for a count of ticks: a
+/// build ahead runs on the builder's thread at its own pace and is
+/// collected only at a tick, and a stride build's read-back of the device
+/// beside other processes' tests outlasted four hundred ticks, seven of
+/// seventeen partitions built when the count ran out. A build in flight by
+/// the counts -- started and not yet collected -- is given a few
+/// milliseconds of the wall before the next tick, so that the injected
+/// clock moves with the builds and not with the wait.
+#[cfg(target_os = "linux")]
+fn tick_until_built(db: &Db, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> bool {
+    let t = std::time::Instant::now();
+    loop {
+        let c = db.zpage_counts();
+        if cond(&c) {
+            return true;
+        }
+        if t.elapsed().as_secs() >= 60 {
+            return false;
+        }
+        if building(&c) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        wait_steps(db, 1);
+    }
+}
+
+/// Whether a build is in flight by the counts: started and not yet
+/// collected, which a collect does only at a tick.
+#[cfg(target_os = "linux")]
+fn building(c: &supdb::db::ZCounts) -> bool {
+    c.build_starts > c.builds + c.build_cancelled + c.build_failed + c.build_orphaned
+}
+
+/// `drive_to` past its four hundred rounds for as long as a build is in
+/// flight and a minute of the wall allows, each such round given a few
+/// milliseconds of the wall first: the controller's builds of a stride
+/// store's partitions run at the device's pace beside other processes'
+/// tests, and a fixed count of rounds ran out at five of twenty-three
+/// built.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn drive_to_built(
+    db: &Db,
+    r: &Reader,
+    keys: &[Vec<u8>],
+    inject: &supdb::ZInject,
+    at: &mut usize,
+    per: usize,
+    faults: u64,
+    phase: u8,
+) -> bool {
+    let t = std::time::Instant::now();
+    let mut rounds = 0u32;
+    loop {
+        let c = db.zpage_counts();
+        if c.phase == phase {
+            return true;
+        }
+        let busy = building(&c);
+        if t.elapsed().as_secs() >= 60 || (rounds >= 400 && !busy) {
+            return false;
+        }
+        if busy {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        reads(r, keys, inject, per, at, faults);
+        close_window(db, r, &keys[0]);
+        rounds += 1;
+    }
+}
+
 /// `n` census ticks of the injected clock, each waited for.
 #[cfg(target_os = "linux")]
 fn wait_steps(db: &Db, n: u32) {
@@ -14944,15 +15016,22 @@ fn a_scan_over_partitions_reads_a_stride_record_under_an_unsealed_key_through_th
     let _ = std::fs::remove_dir_all(&work);
 }
 
-/// A stride file a build of this process made is installed trusted, every
-/// value page verified from the attach and none checked as the reads touch
-/// them; one found on disk at a reopen checks each page it touches once,
-/// the count the pages the reads' slots span; and with the trust off the
-/// built file is checked so too. Under the segment work's thread, whose
-/// builds the settle waits for, and with the segment work inline, where the
-/// settle builds and attaches itself (`Db::z_give`).
+/// A stride file a build of this process made and kept in the page cache
+/// is checked page by page, as one found on disk is, whether the trust in
+/// this process's builds is on or off: its read-back read the cache, and an
+/// attach marks a trusted page verified for the file's life, so a page the
+/// cache gives up after the attach that follows the build is read from the
+/// device's copy, which no check has seen (`zfile::Built::left_seal`). The
+/// count of checks is the pages the reads touch, once each, at the build
+/// and again at a reopen. Under the segment work's thread, whose builds the
+/// settle waits for, and with the segment work inline, where the settle
+/// builds and attaches itself (`Db::z_give`); both keep their pages, and
+/// the builds that drop theirs and are trusted are held where they are made
+/// (`a_stride_file_built_ahead_is_trusted_at_its_late_attach_where_its_read_back_read_the_device`,
+/// and the word a build leaves, by the kernel's count, in `zfile`'s own
+/// tests).
 #[test]
-fn a_stride_file_built_here_is_trusted_and_one_found_on_disk_is_checked_page_by_page() {
+fn a_stride_file_a_build_kept_in_the_cache_is_checked_page_by_page_as_one_found_on_disk_is() {
     for (trust, inline) in [(true, false), (false, false), (true, true), (false, true)] {
         let dir = scratch(&format!("stride-trust-{trust}-{inline}"));
         let opts = || {
@@ -14971,11 +15050,16 @@ fn a_stride_file_built_here_is_trusted_and_one_found_on_disk_is_checked_page_by_
         assert!(c.pages > 16, "{c:?}");
         assert_eq!(c.verified_pages, c.pages, "every page verified: {c:?}");
         assert_eq!(
-            c.stride_page_checks,
-            if trust { 0 } else { c.pages },
-            "trust {trust}, inline {inline}: {c:?}"
+            c.stride_page_checks, c.pages,
+            "trust {trust}, inline {inline}: every page checked at its first touch: {c:?}"
         );
-        assert_eq!(c.stride_reads, keys.len() as u64, "{c:?}");
+        check(&db, &model, &keys, "built here, again");
+        assert_eq!(
+            db.zpage_counts().stride_page_checks,
+            c.pages,
+            "and never again"
+        );
+        assert_eq!(db.zpage_counts().stride_reads, 2 * keys.len() as u64);
         db.close().unwrap();
         let db = Db::open(&dir, opts()).unwrap();
         // Ranks 0 to 200: bytes to 20,100, pages 0 to 4.
@@ -14999,9 +15083,11 @@ fn a_stride_file_built_here_is_trusted_and_one_found_on_disk_is_checked_page_by_
 /// its new name with an empty cell, the piece made a partition of its own.
 /// A promotion keeps the two fields a form file is named by, so the closed
 /// partition's stride file is the one under its name, attached as a file
-/// found on disk: the same inode, and its pages checked at their first
-/// touch where every file this process built is trusted. The one build is
-/// the new partition's; every other file stands as it stood. Every
+/// found on disk: the same inode, and its pages checked again at their
+/// first touch, where the files that stand installed, their pages verified
+/// by the reads before the promotion, are checked nowhere again. The one
+/// build is the new partition's, a build that kept its pages and so checked
+/// at their first touch as well; every other file stands as it stood. Every
 /// partition a stride file, none refused, and the reads through the
 /// writer, a handle and a reopen the model's. The oracle's store writes
 /// inside its range and never promotes after its load
@@ -15033,13 +15119,17 @@ fn a_promotion_keeps_the_stride_file_of_the_partition_it_closes() {
         "every partition of the load a stride file: {loaded:?}"
     );
     let keys: Vec<Vec<u8>> = (0..N + MORE + 20).map(numbered_key).collect();
-    check(&db, &model, &keys, "loaded");
-    assert_eq!(
-        db.zpage_counts().stride_page_checks,
-        0,
-        "the load's files are this process's builds, trusted"
-    );
     let before = inodes();
+    let pages_of = |files: &mut dyn Iterator<Item = &PathBuf>| -> u64 {
+        files.map(|f| stride_of(f).1 as u64).sum()
+    };
+    check(&db, &model, &keys, "loaded");
+    let loaded_checks = db.zpage_counts().stride_page_checks;
+    assert_eq!(
+        loaded_checks,
+        pages_of(&mut before.keys()),
+        "the load's files are builds that kept their pages: each page checked at its first touch"
+    );
     // The last partition's file, the one the promotion will close: the
     // file whose run starts at the greatest key, and its value pages.
     let closed_pages = before
@@ -15099,12 +15189,15 @@ fn a_promotion_keeps_the_stride_file_of_the_partition_it_closes() {
     assert_eq!(after.len(), before.len() + pieces as usize, "{after:?}");
     // The reads after the promotion: the closed partition's file attached
     // as found, so every page its keys' reads touch is checked, once; the
-    // new partition's is this process's build, trusted, as the rest are.
+    // new partition's a build that kept its pages, checked so too; the rest
+    // verified by the reads before and checked nowhere again.
+    let new_pages = pages_of(&mut after.keys().filter(|f| !before.contains_key(*f)));
     check(&db, &model, &keys, "promoted, writer");
     let c = db.zpage_counts();
     assert_eq!(
-        c.stride_page_checks, closed_pages,
-        "the closed partition's pages checked, and nobody else's: {c:?}"
+        c.stride_page_checks - loaded_checks,
+        closed_pages + new_pages,
+        "the closed partition's pages and the new partition's checked, and nobody else's: {c:?}"
     );
     assert_eq!((c.fallbacks, c.damaged, c.bad_pages), (0, 0, 0), "{c:?}");
     let r = db.reader().unwrap();
@@ -15429,7 +15522,7 @@ fn a_stride_file_built_ahead_is_trusted_at_its_late_attach_where_its_read_back_r
         );
         inject.set_budget(if past { raw * 2 / 3 } else { raw * 3 / 2 });
         assert!(
-            tick_until(&db, 400, |c| c.prebuilt >= c.partitions),
+            tick_until_built(&db, |c| c.prebuilt >= c.partitions),
             "{what}: built ahead: {:?}",
             db.zpage_counts()
         );
@@ -15456,7 +15549,7 @@ fn a_stride_file_built_ahead_is_trusted_at_its_late_attach_where_its_read_back_r
         let r = db.reader().unwrap();
         let mut at = 0usize;
         assert!(
-            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
             "{what}: COMPACT: {:?}",
             db.zpage_counts()
         );
@@ -15495,21 +15588,29 @@ fn a_stride_file_built_ahead_is_trusted_at_its_late_attach_where_its_read_back_r
 }
 
 /// Handles on threads read a store under the stride form while merges
-/// retire its stride files under them: every key is put again round by
-/// round with a value of the load's width that says which round wrote it,
-/// each round sealed and its merges landed, so that every partition is
+/// retire its stride files under them: round by round half the keys --
+/// one parity of their number, the other the next round -- are put again
+/// with a value of the load's width that says which round wrote it, each
+/// round sealed and its merges landed, so that every partition is
 /// rewritten, its stride file retired with its segment and the new
 /// partition's built -- the retire list freeing a file past every pin, the
-/// cells swapped under handles that hold the old one. The handles' reads,
-/// counts and short scans answer each key with a round no older than the
-/// last whose merges had landed before the read began and no newer than
-/// the one being written after it ended: a value read through a retired
-/// partition's stride file after its replacement landed is a round behind.
-/// Every stride file a round began with is gone from the directory once its
-/// merges have landed and their builds are collected, before any settle of
-/// the form sweeps it. A snapshot pinned before the first round reads the
-/// load's values through the stride files the store began with, after the
-/// last round has retired them, unlinked and still mapped.
+/// cells swapped under handles that hold the old one. The keys a round
+/// leaves alone are read from the partitions, so while a round's merges
+/// are held before their landing the handles' point reads are served by
+/// the stride files those merges will retire, and go on through the
+/// landing; a round that put every key would have its piece's tombstones
+/// answer every read, and no read would reach a file being retired. The
+/// handles' reads, counts and short scans answer each key with a round
+/// that wrote it, no older than the last such round whose merges had
+/// landed before the read began and no newer than the one being written
+/// after it ended: a value read through a retired partition's stride file
+/// after its replacement landed is a round behind. Every stride file a
+/// round began with is gone from the directory once its merges have landed
+/// and their builds are collected, before any settle of the form sweeps
+/// it. A snapshot pinned before the first round reads the load's values
+/// through the stride files the store began with, after the last round has
+/// retired them: each of those files, by its inode, still mapped and
+/// unlinked.
 #[test]
 fn handles_on_threads_read_stride_files_while_merges_retire_them() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -15532,6 +15633,14 @@ fn handles_on_threads_read_stride_files_while_merges_retire_them() {
         c.partitions >= 3 && c.stride_files == c.partitions,
         "{what}: every partition a stride file: {c:?}"
     );
+    #[cfg(target_os = "linux")]
+    let began: Vec<u64> = {
+        use std::os::unix::fs::MetadataExt;
+        form_files(&dir)
+            .iter()
+            .map(|f| std::fs::metadata(f).unwrap().ino())
+            .collect()
+    };
     // Round `r`'s value of a key: the load's with every byte flipped by a
     // pattern of the round's, so that no round's value is another's.
     fn val(base: &[u8], r: u64) -> Vec<u8> {
@@ -15539,6 +15648,14 @@ fn handles_on_threads_read_stride_files_while_merges_retire_them() {
     }
     fn round_of(base: &[u8], v: &[u8]) -> Option<u64> {
         (0..=ROUNDS).find(|&r| val(base, r) == v)
+    }
+    // Whether round `r` writes the key at rank `i` (the load, round zero,
+    // writes them all), and the last round at or before `x` that did.
+    fn writes(i: usize, r: u64) -> bool {
+        r == 0 || r % 2 == i as u64 % 2
+    }
+    fn last_write(i: usize, x: u64) -> u64 {
+        (0..=x).rev().find(|&r| writes(i, r)).unwrap_or(0)
     }
     let keys: Arc<Vec<Vec<u8>>> = Arc::new(model.keys().cloned().collect());
     let stop = Arc::new(AtomicBool::new(false));
@@ -15555,21 +15672,23 @@ fn handles_on_threads_read_stride_files_while_merges_retire_them() {
         threads.push(std::thread::spawn(move || {
             let mut rng = Rng(0x2468 ^ ((t + 1) * 0x9E37));
             let mut n = 0u64;
-            let held = |k: &[u8], v: &[u8], lo: u64, hi: u64, how: &str| {
+            let held = |i: usize, v: &[u8], lo: u64, hi: u64, how: &str| {
+                let k = &keys[i];
                 let round = round_of(&model[k][0], v);
                 assert!(
-                    round.is_some_and(|r| (lo..=hi).contains(&r)),
+                    round.is_some_and(|r| writes(i, r) && (last_write(i, lo)..=hi).contains(&r)),
                     "{how} of {k:?}: round {round:?}, landed {lo} before it, written {hi} after"
                 );
             };
             while !stop.load(Ordering::SeqCst) || n < 200 {
-                let k = &keys[rng.below(keys.len())];
+                let i = rng.below(keys.len());
+                let k = &keys[i];
                 let lo = landed.load(Ordering::SeqCst);
                 match n % 3 {
                     0 => {
                         let got = read_vec(&r, k);
                         assert_eq!(got.len(), 1, "a read of {k:?}");
-                        held(k, &got[0], lo, writing.load(Ordering::SeqCst), "a read");
+                        held(i, &got[0], lo, writing.load(Ordering::SeqCst), "a read");
                     }
                     1 => assert_eq!(r.count(k).unwrap(), 1, "a count of {k:?}"),
                     _ => {
@@ -15577,12 +15696,11 @@ fn handles_on_threads_read_stride_files_while_merges_retire_them() {
                         r.scan(k, 8, kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))))
                             .unwrap();
                         let hi = writing.load(Ordering::SeqCst);
-                        let want: Vec<&Vec<u8>> =
-                            model.range(k.clone()..).take(8).map(|(k, _)| k).collect();
+                        let want: Vec<&Vec<u8>> = keys[i..].iter().take(8).collect();
                         let got_keys: Vec<&Vec<u8>> = got.iter().map(|(k, _)| k).collect();
                         assert_eq!(got_keys, want, "a scan from {k:?}");
-                        for (gk, gv) in &got {
-                            held(gk, gv, lo, hi, "a scan");
+                        for (j, (_, gv)) in got.iter().enumerate() {
+                            held(i + j, gv, lo, hi, "a scan");
                         }
                     }
                 }
@@ -15590,16 +15708,47 @@ fn handles_on_threads_read_stride_files_while_merges_retire_them() {
             }
         }));
     }
+    // Whether `done` came to hold within half a minute. The hold is let go
+    // before anything is asserted of it: a merge held at its landing is
+    // joined by the store's close, and a panic with the hold on would wait
+    // in the drop for ever.
+    fn until(db: &Db, done: impl Fn(&Db) -> bool) -> bool {
+        let t = std::time::Instant::now();
+        while !done(db) {
+            if t.elapsed().as_secs() >= 30 {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        true
+    }
     for round in 1..=ROUNDS {
         let before = form_files(&dir);
         writing.store(round, Ordering::SeqCst);
-        for chunk in keys.chunks(500) {
-            for k in chunk {
+        let ranks: Vec<usize> = (0..keys.len()).filter(|&i| writes(i, round)).collect();
+        for chunk in ranks.chunks(250) {
+            for &i in chunk {
+                let k = &keys[i];
                 db.put(k, &val(&model[k][0], round));
             }
             db.commit().unwrap();
         }
+        // The round's merges held before their landing: the partitions the
+        // handles read the round's other half from are the ones they will
+        // retire, and their stride files serve those reads meanwhile.
+        db.hold_merge_landing(true);
         db.seal().unwrap();
+        let started = until(&db, |db| db.merges_in_flight() > 0);
+        let served = db.zpage_counts().stride_reads;
+        let read = started && until(&db, |db| db.zpage_counts().stride_reads >= served + 64);
+        let c = db.zpage_counts();
+        db.hold_merge_landing(false);
+        assert!(started, "{what}: round {round}: the merges started: {c:?}");
+        assert!(
+            read,
+            "{what}: round {round}: point reads served by the stride files being retired, {} since the hold: {c:?}",
+            c.stride_reads - served
+        );
         db.settle().unwrap();
         builds_collected(&db);
         landed.store(round, Ordering::SeqCst);
@@ -15625,14 +15774,20 @@ fn handles_on_threads_read_stride_files_while_merges_retire_them() {
         "{what}: every partition a stride file again: {c:?}"
     );
     // The snapshot holds the load's partitions: their stride files retired,
-    // unlinked by the settles since, and read through all the same.
+    // unlinked by the settles since, and mapped all the same -- each by its
+    // inode, under the dead name the retire gave it, since every retired
+    // file the pin holds is a dead name's and only the inode says which
+    // files the store began with.
     #[cfg(target_os = "linux")]
     {
-        let maps = zpg_mappings(&dir);
-        assert!(
-            maps.iter().any(|p| p.ends_with(" (deleted)")),
-            "{what}: the snapshot maps the files the store began with: {maps:?}"
-        );
+        let maps = common::zpg_mapped_inodes(&dir);
+        for ino in &began {
+            assert!(
+                maps.iter()
+                    .any(|(i, p)| i == ino && p.ends_with(" (deleted)")),
+                "{what}: the snapshot maps the file of inode {ino} the store began with, unlinked: {maps:?}"
+            );
+        }
     }
     let reads = db.zpage_counts().stride_reads;
     for k in keys.iter().step_by(37) {
@@ -15859,7 +16014,7 @@ fn the_reading_from_files_prices_a_stride_file_as_on_disk() {
         );
         inject.set_budget(raw * 3 / 2);
         assert!(
-            tick_until(&db, 400, |c| c.prebuilt >= c.partitions),
+            tick_until_built(&db, |c| c.prebuilt >= c.partitions),
             "{what}: built ahead: {:?}",
             db.zpage_counts()
         );
@@ -15920,20 +16075,54 @@ fn the_reading_from_files_prices_a_stride_file_as_on_disk() {
 /// stands down beside the stride form: a stride file counts no decode or
 /// open, so it rates no heat and sat in the median a block file's skew is
 /// read against at nothing. A store driven to COMPACT with the policy on
-/// looks through its period without the stride form, and makes no look in
-/// the same periods with it asked for.
+/// looks through its period without the stride form, and a store of
+/// numbered keys driven there with it asked for, every partition a stride
+/// file, makes no look in the same periods: the stand-down is the
+/// option's, held where the files it is for serve the store.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_hot_raw_policy_stands_down_beside_the_stride_form() {
     for stride in [false, true] {
         let what = format!("hot raw beside the stride form {stride}");
-        let (dir, db, model, _inject, r, keys, _) =
-            compact_store_with(&format!("auto-hot-stride-{stride}"), 1 << 20, |o| {
-                o.zpages_hot_raw = true;
-                if stride {
+        let (dir, db, model, r, keys) = if stride {
+            let (dir, db, model, inject) = auto_store_loaded(
+                "auto-hot-stride-true",
+                1 << 20,
+                1_000_000.0,
+                FAULT_1MS,
+                |o| {
+                    o.zpages_hot_raw = true;
                     o.zpages_stride = ZStride::Forced;
-                }
-            });
+                },
+                |_| {},
+                |db| numbered_load(db, 20_000, 100, 0x4A9),
+            );
+            let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+            let r = db.reader().unwrap();
+            let mut at = 0usize;
+            assert!(
+                drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
+                "{what}: COMPACT: {:?}",
+                db.zpage_counts()
+            );
+            assert!(
+                tick_until_built(&db, |c| c.form_files == c.partitions),
+                "{what}: every partition served: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert!(
+                c.partitions > 0 && c.stride_files == c.partitions,
+                "{what}: every partition a stride file: {c:?}"
+            );
+            (dir, db, model, r, keys)
+        } else {
+            let (dir, db, model, _inject, r, keys, _) =
+                compact_store_with("auto-hot-stride-false", 1 << 20, |o| {
+                    o.zpages_hot_raw = true
+                });
+            (dir, db, model, r, keys)
+        };
         for _ in 0..5 {
             advance_tick(&db, std::time::Duration::from_millis(200));
         }
@@ -15979,12 +16168,12 @@ fn the_footprint_counts_a_stride_partition_whole() {
     let r = db.reader().unwrap();
     let mut at = 0usize;
     assert!(
-        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+        drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
         "{what}: COMPACT: {:?}",
         db.zpage_counts()
     );
     assert!(
-        tick_until(&db, 400, |c| c.form_files == c.partitions),
+        tick_until_built(&db, |c| c.form_files == c.partitions),
         "{what}: every partition served: {:?}",
         db.zpage_counts()
     );
@@ -16045,7 +16234,7 @@ fn the_words_kept_for_stride_files_are_held_to_the_live_partitions() {
     );
     inject.set_budget(raw * 3 / 2);
     assert!(
-        tick_until(&db, 400, |c| c.prebuilt >= c.partitions),
+        tick_until_built(&db, |c| c.prebuilt >= c.partitions),
         "{what}: built ahead: {:?}",
         db.zpage_counts()
     );
@@ -16072,7 +16261,7 @@ fn the_words_kept_for_stride_files_are_held_to_the_live_partitions() {
     let r = db.reader().unwrap();
     let mut at = 0usize;
     assert!(
-        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+        drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
         "{what}: COMPACT: {:?}",
         db.zpage_counts()
     );
@@ -16128,7 +16317,7 @@ fn a_stride_file_built_ahead_is_not_given_back_when_the_pick_moves() {
     );
     inject.set_budget(raw * 3 / 2);
     assert!(
-        tick_until(&db, 400, |c| c.prebuilt >= c.partitions),
+        tick_until_built(&db, |c| c.prebuilt >= c.partitions),
         "{what}: built ahead: {:?}",
         db.zpage_counts()
     );

@@ -507,16 +507,18 @@ fn a_stride_life(name: &str) {
     read_all(&db);
     read_all(&pinned);
     drop(db);
-    // The retired file by its own mapping: the rebuild renamed a new file
-    // over its name, so its inode shows unlinked. The pinned state maps the
-    // rebuilt files too, under their names, and those alone are no sign of
-    // the retired one.
+    // The retired file by its own mapping: the retire renamed it to a dead
+    // name (`zfile::zpg_dead_name`) and the settle's sweep unlinked that, so
+    // the pinned mapping shows the dead name deleted. The pinned state maps
+    // the rebuilt files too, under their names, and those alone are no sign
+    // of the retired one.
     #[cfg(target_os = "linux")]
     {
         let maps = common::zpg_mappings(&d);
         assert!(
-            maps.iter().any(|p| p.ends_with(" (deleted)")),
-            "the pin holds the retired stride file past the store's close: {maps:?}"
+            maps.iter()
+                .any(|p| p.contains("/zpg-dead-") && p.ends_with(" (deleted)")),
+            "the pin holds the retired stride file, under its dead name, past the store's close: {maps:?}"
         );
     }
     drop(pinned);

@@ -69,7 +69,7 @@ failed at RocksDB's build script, `unable to find library -lclang`.
 `deps.sh` cleans an output that names a directory with no libclang in
 it.
 
-`sh scripts/check.sh` runs every group -- build, test, lint, wasm, bench --
+`sh scripts/check.sh` runs every group -- build, test, stride, lint, wasm, bench --
 and CI calls the same script with the same names, so a green run here is a
 green run there. Every group denies warnings, the wasm group since it was
 found printing six dead-code warnings and reporting green: the module built

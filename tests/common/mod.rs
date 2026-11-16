@@ -153,6 +153,28 @@ pub fn zpg_mappings(dir: &std::path::Path) -> Vec<String> {
     v
 }
 
+/// `zpg_mappings` with the inode each mapping is of, read from its line's
+/// fifth field: a mapped file renamed to a dead name and unlinked is still
+/// the inode it was under its live name, which is how a test names the
+/// files it began with among every retired one a pin holds.
+#[cfg(target_os = "linux")]
+pub fn zpg_mapped_inodes(dir: &std::path::Path) -> Vec<(u64, String)> {
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+    let prefix = dir.join("zpg-");
+    let prefix = prefix.to_string_lossy();
+    let mut v: Vec<(u64, String)> = maps
+        .lines()
+        .filter_map(|line| {
+            let path = maps_path(line)?;
+            let ino = line.split_whitespace().nth(4)?.parse().ok()?;
+            path.starts_with(&*prefix).then(|| (ino, path.to_owned()))
+        })
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 /// The path a `/proc/self/maps` line names: everything after its address,
 /// permissions, offset, device and inode, the padding before it trimmed;
 /// none for an anonymous mapping.

@@ -5915,11 +5915,13 @@ pub struct Options {
     /// built in it, and a stride file found under a partition's name is
     /// refused at its attach and built again in the block coding. `Forced`
     /// asks every build of a form file for it (`Options::z_stride_ask`) and
-    /// attaches one found on disk. Refused beside the three re-code policies
-    /// that build over a served file's name -- `zpages_recode`,
-    /// `zpages_recode_auto` and `zpages_reparse`, each of which acts on its
-    /// own -- and not beside `zpages_recode_keep` or `zpages_both`, which act
-    /// only on the paths those start (`check_options` says why). Every read
+    /// attaches one found on disk. Refused beside a re-code policy under the
+    /// mode it starts builds in, each of which builds over a served file's
+    /// name on its own -- `zpages_recode` under `ZPages::Always`, and
+    /// `zpages_recode_auto` and `zpages_reparse` under `ZPages::Auto` --
+    /// and not beside any of the three under the other mode, where it starts
+    /// none, nor beside `zpages_recode_keep` or `zpages_both`, which act only
+    /// on the paths those start (`check_options` says why). Every read
     /// path serves a stride partition from its file: the point reads, the
     /// counts and a scan's walks by rank by its arms (`ZFile::stride`), and
     /// the block cache's reads, the merge path's walks and the covered walk
@@ -5930,25 +5932,28 @@ pub struct Options {
     pub zpages_stride: ZStride,
     /// EXPERIMENT: under `zpages_stride` `Forced`, a stride file whose build
     /// in this process read every rank back through the reader's body before
-    /// its name (`zfile::check_stride`) is installed with every value page
-    /// marked verified, once its attach has found under the name the trailer
-    /// that build wrote -- the row's CRC in it, so the row too -- and so the
-    /// build's file: the attach that follows the build, which reads what the
-    /// read-back read; or for a file the build left on disk -- built ahead
-    /// and not wanted yet, or at a merge's output finish -- the attach that
-    /// first installs it (`Shared::z_left_seals`), where the build's
-    /// read-back read the device: none of the file's pages in the page cache
-    /// as it began (`zfile::Built::left_seal`), what a build that writes its
-    /// output back and drops it leaves (`zfile::BuildPlan::drop_output`). A
-    /// build that kept its pages read back the cache, and a later attach
-    /// reads the device's copy, which no check has seen, once the cache has
-    /// given the pages up: it leaves no word. A file found on disk at an
-    /// open, or by a build's look before it builds where no build of this
-    /// process left a word for it, and any later attach of a file already
-    /// installed, checks each value page against its row at the page's
-    /// first touch, as the block form checks its pages; the reads count
-    /// those checks (`ZCounts::stride_page_checks`). Off, the file a build
-    /// made is checked so too. On.
+    /// its name (`zfile::check_stride`), and read it from the device -- none
+    /// of the file's pages in the page cache as the read-back began
+    /// (`zfile::Built::left_seal`), what a build that writes its output back
+    /// and drops it leaves (`zfile::BuildPlan::drop_output`) -- is installed
+    /// with every value page marked verified, once its attach has found
+    /// under the name the trailer that build wrote -- the row's CRC in it,
+    /// so the row too -- and so the build's file: the attach that follows
+    /// the build, or for a file the build left on disk -- built ahead and
+    /// not wanted yet, or at a merge's output finish -- the attach that
+    /// first installs it (`Shared::z_left_seals`). A build that kept its
+    /// pages read back the page cache, and an attach marks a page verified
+    /// for the file's life, so a page the cache gives up after it is read
+    /// from the device's copy, which no check has seen -- a writeback whose
+    /// error nobody read reads right until then and wrong after -- at the
+    /// attach that follows the build as at a later one: its file is checked
+    /// as a file found on disk is. A file found on disk at an open, or by a
+    /// build's look before it builds where no build of this process left a
+    /// word for it, and any later attach of a file already installed, checks
+    /// each value page against its row at the page's first touch, as the
+    /// block form checks its pages; the reads count those checks
+    /// (`ZCounts::stride_page_checks`). Off, the file a build made is
+    /// checked so too. On.
     #[doc(hidden)]
     pub zpages_stride_trust_built: bool,
 }
@@ -5996,15 +6001,18 @@ impl Options {
         }
     }
 
-    /// `z_stride_attach` for the file the build `b` just made and named
-    /// (`z_stride_attach_sealed` of its trailer's word).
+    /// `z_stride_attach` for the file the build `b` just made and named:
+    /// `z_stride_attach_sealed` of the word the build leaves
+    /// (`zfile::Built::left_seal`), the one a later attach of a file left on
+    /// disk is given, since the attach that follows the build reads the
+    /// device's copy of a page the cache gives up as a later attach does.
     fn z_stride_attach_built(&self, b: &zfile::Built) -> zfile::StrideAttach {
-        self.z_stride_attach_sealed(b.stride_seal)
+        self.z_stride_attach_sealed(b.left_seal())
     }
 
     /// `z_stride_attach` for a file a build of this process wrote as a
-    /// stride file, its trailer's word `seal` (`zfile::Built::stride_seal`
-    /// at once, `zfile::Built::left_seal` kept by name until its attach,
+    /// stride file, the word `seal` its read-back of the device leaves
+    /// (`zfile::Built::left_seal`, at once or kept by name until its attach,
     /// `Shared::z_left_seals`): trusted where `zpages_stride_trust_built`
     /// says so, since the build's read-back held every rank to its records
     /// as the attach will read them, and so its pages need no check at their
@@ -7711,21 +7719,19 @@ fn z_coded_entry(plan: &zfile::BuildPlan, b: &zfile::Built) -> Option<bool> {
 /// A form file `b` built under `name` and left on disk for a later attach:
 /// its trailer's word kept for that attach where it is a stride file whose
 /// read-back read the device (`zfile::Built::left_seal`,
-/// `Shared::z_left_seals`), and any word kept for an earlier file under the
-/// name dropped where there is none, so that the record names what the name
-/// holds.
+/// `Shared::z_left_seals`). No word for an earlier file stands under the
+/// name to be dropped where there is none: a build at a merge's output
+/// finish names a file no build has named before, and every other build of
+/// a partition's form passes through the attach of the file on disk first
+/// (`Maint::z_attach_on_disk`), which takes the name's word whatever it
+/// finds, and none starts beside a finish in flight for the name.
 fn z_leave_seal(shared: &Shared, name: String, b: &zfile::Built) {
-    let mut seals = shared
-        .z_left_seals
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match b.left_seal() {
-        Some(seal) => {
-            seals.insert(name, seal);
-        }
-        None => {
-            seals.remove(&name);
-        }
+    if let Some(seal) = b.left_seal() {
+        shared
+            .z_left_seals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name, seal);
     }
 }
 
@@ -23721,7 +23727,8 @@ impl Reader {
                 // decode: not the record coding's (`coded` false, as
                 // `ZFile::coded` answers for it), and no group decoded or
                 // opened, since its reads are counted on the handle's line
-                // (`zstridereads`) and never as a decode. A report, which
+                // (the slot's `zstride`, `zfile::StrideTally::reads`) and
+                // never as a decode. A report, which
                 // the suite prints a mix's heat by and the engine decides
                 // nothing by; the heat and the census by form are a later
                 // step's.

@@ -2833,8 +2833,8 @@ pub(super) struct ZMemo {
     /// `Options::zpages_bulk_steps` the walk takes it where it covers the
     /// rank it starts at, and searches the fence otherwise.
     seek_at: Cell<Option<(u64, usize)>>,
-    /// What a stride file counted since the last take, and whether it
-    /// counted anything (`StrideCounts`).
+    /// What a stride file counted since the last take (`StrideCounts`),
+    /// for a memo with no tally.
     stride: Cell<StrideCounts>,
     /// The handle's slot line the stride counts go to (`tally_into`); null
     /// for a memo of no handle's, which keeps them in `stride`.
@@ -3346,8 +3346,9 @@ pub(super) enum StrideAttach {
     Check,
     /// Attached with every value page marked verified where the file under
     /// the name has a trailer of this CRC word -- the one a build of this
-    /// process wrote and read back every rank of (`Built::stride_seal`), the
-    /// row's CRC in it -- and as under `Check` where it has another.
+    /// process wrote and read back every rank of from the device
+    /// (`Built::left_seal`), the row's CRC in it -- and as under `Check`
+    /// where it has another.
     Trust(u32),
 }
 
@@ -6335,13 +6336,12 @@ pub(super) struct Built {
     pub stride_no: Option<StrideNo>,
     /// The CRC word of the trailer of the stride file this build wrote and
     /// read back, every rank of it, before its name (`check_stride`,
-    /// `zpages::trailer_crc`): what the attach that follows the build holds
-    /// the file under the name to before it trusts its pages
-    /// (`StrideAttach::Trust`). The trailer carries the row's CRC, so a file
-    /// whose trailer's word is this one has this build's trailer and row,
-    /// both to a CRC's strength. `None` for a block file. A file left on
-    /// disk for a later attach keeps the word only where the read-back read
-    /// the device (`stride_device`, `Built::left_seal`).
+    /// `zpages::trailer_crc`): what an attach of the file holds the file
+    /// under the name to before it trusts its pages (`StrideAttach::Trust`),
+    /// given to an attach only where the read-back read the device
+    /// (`stride_device`, `Built::left_seal`). The trailer carries the row's
+    /// CRC, so a file whose trailer's word is this one has this build's
+    /// trailer and row, both to a CRC's strength. `None` for a block file.
     pub stride_seal: Option<u32>,
     /// Whether the read-back read every byte of the stride file from the
     /// device: none of its pages in the page cache as the read-back began,
@@ -6355,13 +6355,14 @@ pub(super) struct Built {
 }
 
 impl Built {
-    /// The word a stride file left on disk for a later attach keeps
-    /// (`Shared::z_left_seals`): the build's word where its read-back read
-    /// the device, none otherwise. A later attach reads the file after the
-    /// cache has had time to give up what the build wrote, so its first
-    /// touch of a page is the device's copy, and only a read-back of the
-    /// device has seen that copy; the attach that follows the build reads
-    /// what the read-back read.
+    /// The word an attach of the stride file this build made trusts it by
+    /// (`StrideAttach::Trust`), the attach that follows the build and one
+    /// that first installs a file left on disk (`Shared::z_left_seals`)
+    /// alike: the build's word where its read-back read the device, none
+    /// otherwise. An attach marks a trusted page verified for the file's
+    /// life, and whatever page the cache gives up after it is read from the
+    /// device's copy, at once as later, so only a read-back of the device
+    /// has seen what such an attach serves.
     pub fn left_seal(&self) -> Option<u32> {
         self.stride_seal.filter(|_| self.stride_device)
     }
@@ -15041,36 +15042,85 @@ mod tests {
         assert_eq!(walk(false, 0, 3000).prefetches, 0, "the option off");
     }
 
-    /// A stride build carries its trailer's word for the attach that
-    /// follows it, and a file it leaves on disk keeps the word for a later
-    /// attach only where the read-back read the device: a build that drops
-    /// its output (`BuildPlan::drop_output`, the builds ahead and at a
-    /// merge's finish under the selector's line) drops its last piece too
-    /// before the read-back, the file wholly out of the cache by `mincore`,
-    /// and a build that keeps its pages read back the cache, which says
-    /// nothing of the copy a later attach reads from the device once the
-    /// cache has given the pages up (`Built::left_seal`).
-    #[cfg(target_os = "linux")]
+    /// A mapping of a stride file's temp name made at the build's damage
+    /// seam, one value page touched through it, held until the build has
+    /// returned: a page a mapping holds is one `POSIX_FADV_DONTNEED` skips,
+    /// so the drop that a plan asks for leaves it in the cache.
+    static HELD_MAPPING: std::sync::Mutex<Option<MmapBytes>> = std::sync::Mutex::new(None);
+
+    fn hold_a_page_mapped(tmp: &Path) {
+        let map = MmapBytes::open(tmp).unwrap();
+        std::hint::black_box(map.0[ZPAGE]);
+        *HELD_MAPPING.lock().unwrap() = Some(map);
+    }
+
+    /// A stride build is trusted -- at the attach that follows it and at a
+    /// later attach of the file it leaves on disk alike, by the one word it
+    /// leaves (`Built::left_seal`, `Options::z_stride_attach_built`) -- only
+    /// where its read-back read the device, by the kernel's count of the
+    /// file's pages in the cache as the read-back began, never by the plan's
+    /// word that it dropped them. A build that keeps its pages read back the
+    /// cache, which says nothing of the copy the reads after any attach take
+    /// from the device once the cache gives a page up: checked page by page.
+    /// A build that drops its output (`BuildPlan::drop_output`, the builds
+    /// ahead and at a merge's finish under the selector's line) drops its
+    /// last piece too before the read-back, the file wholly out of the cache
+    /// where the drop acts, on Linux; a drop that leaves a page resident --
+    /// one a mapping holds, here made through the damage seam, and every
+    /// page of a drop off Linux, where the drop does nothing -- is a
+    /// read-back of the cache all the same. With the trust off every build
+    /// is checked, and with the form off every stride file is refused.
     #[test]
-    fn a_stride_build_leaves_its_word_for_a_later_attach_only_where_it_read_the_device() {
+    fn a_stride_build_is_trusted_only_where_its_read_back_read_the_device() {
+        use crate::db::{Options, ZStride};
         let fx = stride_fixture("stride-dropseal", 3000, 100, 0x5d);
-        for drop_output in [false, true] {
+        let opts = |stride: ZStride, trust: bool| Options {
+            zpages_stride: stride,
+            zpages_stride_trust_built: trust,
+            ..Options::default()
+        };
+        for (drop_output, hold) in [(false, false), (true, false), (true, true)] {
             let _ = std::fs::remove_file(&fx.out);
             let plan = BuildPlan {
                 drop_output,
+                damage: hold.then_some(hold_a_page_mapped as fn(&Path)),
                 ..stride_plan(StrideAsk::OrBlock)
             };
-            let b = match build(&fx.seg, &fx.out, ID, END, &plan).unwrap() {
+            let made = build(&fx.seg, &fx.out, ID, END, &plan).unwrap();
+            let held = HELD_MAPPING.lock().unwrap().take();
+            assert_eq!(held.is_some(), hold, "the seam ran where it was asked");
+            drop(held);
+            let b = match made {
                 Outcome::Built(b) if b.coding == FileCoding::Stride => b,
                 other => panic!("not a stride file: {other:?}"),
             };
             let bytes = std::fs::read(&fx.out).unwrap();
             let word = trailer_crc(&bytes[bytes.len() - ZTRAILER..]);
             assert!(word.is_some());
+            let device = drop_output && !hold && cfg!(target_os = "linux");
+            let what = format!("drop_output {drop_output}, a page held {hold}");
             assert_eq!(
                 (b.stride_seal, b.stride_device, b.left_seal()),
-                (word, drop_output, if drop_output { word } else { None }),
-                "drop_output {drop_output}"
+                (word, device, if device { word } else { None }),
+                "{what}"
+            );
+            assert_eq!(
+                opts(ZStride::Forced, true).z_stride_attach_built(&b),
+                match word.filter(|_| device) {
+                    Some(w) => StrideAttach::Trust(w),
+                    None => StrideAttach::Check,
+                },
+                "{what}: the attach that follows the build"
+            );
+            assert_eq!(
+                opts(ZStride::Forced, false).z_stride_attach_built(&b),
+                StrideAttach::Check,
+                "{what}: the trust off"
+            );
+            assert_eq!(
+                opts(ZStride::Off, true).z_stride_attach_built(&b),
+                StrideAttach::Refuse,
+                "{what}: the form off"
             );
         }
     }

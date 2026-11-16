@@ -1661,8 +1661,12 @@ pub struct Supdb {
     /// unchecked at their first touch (`Options::zpages_stride_trust_built`),
     /// the engine's where `None`: `supdb-nocachezstridechecked` pins it off,
     /// every value page checked against the row at its first read
-    /// (`zpage_stride_page_checks`), the pair against `supdb-nocachezstride`
-    /// pricing what the trust saves a pass's first touches.
+    /// (`zpage_stride_page_checks`). The trust reaches only a build whose
+    /// read-back read the device, one that dropped its output -- the
+    /// controller's builds ahead and at a merge's finish under its line --
+    /// and a forced build keeps its pages, so under the forced form both
+    /// arms check every page they touch and the pair against
+    /// `supdb-nocachezstride` is the trust's noise floor.
     zstride_trust: Option<bool>,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
@@ -8152,9 +8156,12 @@ impl Supdb {
     /// `supdb-nocachezstride` with a stride file this process built checked
     /// like one found on disk (`Options::zpages_stride_trust_built` off),
     /// `supdb-nocachezstridechecked`: every value page held to the file's
-    /// row at its first touch, which the trusted arm skips for a file whose
-    /// build read every rank back. The pair prices those checks
-    /// (`zpage_stride_page_checks` counts them) on the passes after the load.
+    /// row at its first touch, which the trusted arm skips only for a file
+    /// whose build read every rank back from the device. A forced build
+    /// keeps its pages and reads them back from the cache, so the trusted
+    /// arm checks its files too and the pair, `zpage_stride_page_checks`
+    /// equal in both, is the trust's noise floor on the passes after the
+    /// load.
     pub fn create_nocache_zstride_checked(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(path, Policy::nocache_zstride_checked())
     }
@@ -18057,8 +18064,9 @@ mod tests {
     /// each, so every partition the load leaves is a stride file, the reads
     /// of it -- the writer's and a handle's -- are the stride form's, and the
     /// block arm reads the same keys through its form with none of them
-    /// counted the stride form's. The checked arm checks the pages the
-    /// trusted arm does not, and a store of keys with holes in their run
+    /// counted the stride form's. Both the trusted arm and the checked arm
+    /// check the pages they touch, since a forced build keeps its pages and
+    /// its read-back read the cache, and a store of keys with holes in their run
     /// declines the form for that reason in its slot and falls to the block
     /// form, every partition covered and none a stride file.
     #[test]
@@ -18143,8 +18151,9 @@ mod tests {
         }
         // The reads: the stride arm's are its stride files', counted as
         // reads through the form as well; the block arm's are its form's and
-        // none of them the stride form's. The trusted arm checks no page it
-        // built, the checked arm the pages it touches.
+        // none of them the stride form's. Both stride arms check the pages
+        // they touch: the forced form's builds keep their pages, and only a
+        // build whose read-back read the device is trusted.
         let mut reads = 0f64;
         for k in keys.iter().step_by(7) {
             for e in [&mut arm, &mut checked, &mut base] {
@@ -18171,15 +18180,12 @@ mod tests {
             0.0,
             "the block form's reads"
         );
-        assert_eq!(
-            count(&arm, "zpage_stride_page_checks"),
-            0.0,
-            "its own builds, trusted"
-        );
-        assert!(
-            count(&checked, "zpage_stride_page_checks") >= 1.0,
-            "every page checked once"
-        );
+        for (e, what) in [(&arm, "the trusted arm"), (&checked, "the checked arm")] {
+            assert!(
+                count(e, "zpage_stride_page_checks") >= 1.0,
+                "{what}: its builds kept their pages, every page checked once"
+            );
+        }
         assert_eq!(count(&base, "zpage_stride_page_checks"), 0.0);
         // A handle's reads are on its slot, which its drop leaves, so the
         // counters read after a threaded pass carry them.
