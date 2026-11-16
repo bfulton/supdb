@@ -4575,7 +4575,10 @@ impl ZFile {
 /// timestamps whatever else they share, and a refusal that named the clock
 /// would say nothing of whether the records were the same. Either kind of
 /// trailer is asked through its `seg_ident`, so the two kinds are held to
-/// one comparison.
+/// one comparison. The binding hash is not compared: it is a function of
+/// the name's fields, the key count and the row's CRC, each held equal
+/// here, and each trailer's decode holds the word it stores to those
+/// fields, so a compare of it could refuse nothing the ones before it pass.
 fn same_segment(
     t: &SegIdent,
     f: &ZSource,
@@ -4617,9 +4620,6 @@ fn same_segment(
     }
     if t.rec_magic != f.rec_magic {
         return Err("the file format's magic differs");
-    }
-    if t.bind32() != bind32(id, end_seq, f.nkeys, f.row_crc) {
-        return Err("the binding hash differs");
     }
     Ok(())
 }

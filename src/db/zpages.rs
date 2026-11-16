@@ -99,9 +99,11 @@
 //! page and spans at most two; the slots are not padded to a divisor of
 //! the page, which for a hundred-byte value is 128 bytes a slot and the
 //! form's bytes more than a quarter again, so a read whose slot straddles
-//! checks two pages. The trailer is the block form's length with another
-//! magic, so either kind is told from the other at the last page's first
-//! eight bytes, and a reader of one refuses the other there.
+//! checks two pages. The trailer is the block form's length and head --
+//! the magic, the version, the page size and the CRC at one set of places,
+//! written and checked by one pair of functions -- with another magic, so
+//! either kind is told from the other at the last page's first eight
+//! bytes, and a reader of one refuses the other there.
 //!
 //! # Why it is a child of `db`
 //!
@@ -3772,11 +3774,21 @@ pub fn verify_page_with(
     Ok(view.header)
 }
 
-// The trailer's fields.
+// Every trailer's head and its last word, whichever body it describes: the
+// magic naming the body, that body's layout version, the page size, and
+// the CRC of every byte before the CRC. Written by `seal_trailer` and
+// checked by `open_trailer` alone, since a reader of either kind refusing
+// the other at the magic rests on the two kinds keeping these at one set
+// of places, and an attach that dispatches on the magic reads it there.
 const T_MAGIC: usize = 0;
 const T_VERSION: usize = 8;
 const T_PAGE_SIZE: usize = 12;
-const T_N_PAGES: usize = 16;
+const T_CRC: usize = ZTRAILER - 4;
+/// The head's length: where a body's fields begin.
+const T_HEAD: usize = 16;
+
+// The block form's fields.
+const T_N_PAGES: usize = T_HEAD;
 const T_N_ENTRIES: usize = 24;
 const T_NKEYS: usize = 32;
 const T_RES_OFF: usize = 40;
@@ -3805,9 +3817,8 @@ const T_BIND32: usize = 192;
 const T_BLOOM_PROBES: usize = 196;
 const T_BLOOM_SIG: usize = 200;
 const T_BLOOM_BITS: usize = 208;
-/// Where the zeros begin, and where the trailer's own CRC does.
+/// Where the zeros begin, which run to the CRC.
 const T_ZERO: usize = 212;
-const T_CRC: usize = ZTRAILER - 4;
 
 fn put32(b: &mut [u8], at: usize, v: u32) {
     b[at..at + 4].copy_from_slice(&v.to_le_bytes());
@@ -3825,6 +3836,41 @@ fn get64(b: &[u8], at: usize) -> u64 {
     let mut w = [0u8; 8];
     w.copy_from_slice(&b[at..at + 8]);
     u64::from_le_bytes(w)
+}
+
+/// A trailer's head and CRC written over `b`, whose body's fields are in
+/// place: the magic naming the body and its version, the page size, and
+/// then the CRC, last since it covers the head as well.
+fn seal_trailer(b: &mut [u8; ZTRAILER], magic: &[u8; 8], version: u32) {
+    b[T_MAGIC..T_MAGIC + 8].copy_from_slice(magic);
+    put32(b, T_VERSION, version);
+    put32(b, T_PAGE_SIZE, ZPAGE as u32);
+    let crc = crc32(&b[..T_CRC]);
+    put32(b, T_CRC, crc);
+}
+
+/// The checks a trailer of the body `magic` names makes before it reads a
+/// field of the body, in order: the length, the magic, the version, the
+/// page size, the CRC. The cheap identifying checks come first, so a page
+/// that is no trailer of this kind -- another kind's among them -- is said
+/// to be that, and the CRC says the rest was torn.
+fn open_trailer(bytes: &[u8], magic: &[u8; 8], version: u32) -> Result<(), ZError> {
+    if bytes.len() != ZTRAILER {
+        return Err(ZError::Length);
+    }
+    if bytes[T_MAGIC..T_MAGIC + 8] != *magic {
+        return Err(ZError::Magic);
+    }
+    if get32(bytes, T_VERSION) != version {
+        return Err(ZError::Version);
+    }
+    if get32(bytes, T_PAGE_SIZE) != ZPAGE as u32 {
+        return Err(ZError::PageSize);
+    }
+    if get32(bytes, T_CRC) != crc32(&bytes[..T_CRC]) {
+        return Err(ZError::TrailerCrc);
+    }
+    Ok(())
 }
 
 /// The trailer, the file's last page: what the form file holds, the segment it
@@ -3945,9 +3991,6 @@ impl Trailer {
     /// The trailer's bytes.
     pub fn encode(&self) -> [u8; ZTRAILER] {
         let mut b = [0u8; ZTRAILER];
-        b[T_MAGIC..T_MAGIC + 8].copy_from_slice(&ZMAGIC);
-        put32(&mut b, T_VERSION, ZVERSION);
-        put32(&mut b, T_PAGE_SIZE, ZPAGE as u32);
         put64(&mut b, T_N_PAGES, self.n_pages);
         put64(&mut b, T_N_ENTRIES, self.n_entries);
         put64(&mut b, T_NKEYS, self.nkeys);
@@ -3977,33 +4020,17 @@ impl Trailer {
         put32(&mut b, T_BLOOM_PROBES, self.bloom_probes);
         put64(&mut b, T_BLOOM_SIG, self.bloom_sig);
         put32(&mut b, T_BLOOM_BITS, self.bloom_bits_per_key);
-        let crc = crc32(&b[..T_CRC]);
-        put32(&mut b, T_CRC, crc);
+        seal_trailer(&mut b, &ZMAGIC, ZVERSION);
         b
     }
 
     /// The trailer out of a page, after every check that needs nothing of the
-    /// file: the length, the magic, the version, the page size, the CRC, the
-    /// constants, the flags, the zeros, `bind32` against the fields it hashes,
-    /// and that the fields do not contradict each other. The cheap identifying
-    /// checks come first, so a file that is not a form file at all is said to
-    /// be that, and the CRC says the rest was torn.
+    /// file: the head's -- the length, the magic, the version, the page size,
+    /// the CRC ([`open_trailer`]) -- and then the constants, the flags, the
+    /// zeros, `bind32` against the fields it hashes, and that the fields do
+    /// not contradict each other.
     pub fn decode(bytes: &[u8]) -> Result<Trailer, ZError> {
-        if bytes.len() != ZTRAILER {
-            return Err(ZError::Length);
-        }
-        if bytes[T_MAGIC..T_MAGIC + 8] != ZMAGIC {
-            return Err(ZError::Magic);
-        }
-        if get32(bytes, T_VERSION) != ZVERSION {
-            return Err(ZError::Version);
-        }
-        if get32(bytes, T_PAGE_SIZE) != ZPAGE as u32 {
-            return Err(ZError::PageSize);
-        }
-        if get32(bytes, T_CRC) != crc32(&bytes[..T_CRC]) {
-            return Err(ZError::TrailerCrc);
-        }
+        open_trailer(bytes, &ZMAGIC, ZVERSION)?;
         let bad = ZError::Trailer;
         if get32(bytes, T_PAGE_CAP) != ZCAP as u32 || get32(bytes, T_MAX_COUNT) != ZMAX_COUNT as u32
         {
@@ -4392,12 +4419,16 @@ impl KeyCodec {
                 continue;
             }
             shaped = true;
-            let Some(base) = KeyCodec::field_of(kind, &first[p..]) else {
-                continue;
-            };
-            let Ok(c) = KeyCodec::new(kind, &first[..p], d, base) else {
-                continue;
-            };
+            // Neither can refuse past the test above, and a refusal here
+            // would be a kind turned away for a reason no key earns: every
+            // byte of the field is the kind's and the field is no wider
+            // than the kind holds, so it parses within a u64; the field is
+            // at least a byte, the prefix being cut short of the key, the
+            // key at most the longest, and a field's number at most its top.
+            let base = KeyCodec::field_of(kind, &first[p..])
+                .expect("a field of the kind's bytes, no wider than it holds");
+            let c = KeyCodec::new(kind, &first[..p], d, base)
+                .expect("a field of one byte to the kind's widest, in a key the form takes");
             let count = c
                 .decode(last)
                 .and_then(|x| x.checked_sub(base))
@@ -4606,11 +4637,9 @@ pub struct StrideTrailer {
     pub seg: SegIdent,
 }
 
-// A stride trailer's fields.
-const S_MAGIC: usize = 0;
-const S_VERSION: usize = 8;
-const S_PAGE_SIZE: usize = 12;
-const S_CODEC: usize = 16;
+// A stride trailer's fields, past the head every trailer has (`T_MAGIC`
+// to `T_HEAD`, and `T_CRC`).
+const S_CODEC: usize = T_HEAD;
 const S_D: usize = 17;
 const S_L: usize = 18;
 const S_P: usize = 19;
@@ -4623,9 +4652,8 @@ const S_RES_CRC: usize = 56;
 const S_BIND32: usize = 60;
 const S_SEG: usize = 64;
 const S_PREFIX: usize = S_SEG + SI_LEN;
-/// Where the zeros after the prefix's room begin.
+/// Where the zeros after the prefix's room begin, which run to the CRC.
 const S_ZERO: usize = S_PREFIX + STRIDE_KEY_MAX;
-const S_CRC: usize = ZTRAILER - 4;
 
 impl StrideTrailer {
     /// The segment the file says it derives from.
@@ -4669,9 +4697,6 @@ impl StrideTrailer {
         let lay = self.layout()?;
         let c = &self.codec;
         let mut b = [0u8; ZTRAILER];
-        b[S_MAGIC..S_MAGIC + 8].copy_from_slice(&STRIDE_MAGIC);
-        put32(&mut b, S_VERSION, STRIDE_VERSION);
-        put32(&mut b, S_PAGE_SIZE, ZPAGE as u32);
         b[S_CODEC] = c.kind.code();
         b[S_D] = c.d;
         b[S_L] = c.key_len() as u8;
@@ -4685,34 +4710,19 @@ impl StrideTrailer {
         put32(&mut b, S_BIND32, self.bind32());
         self.seg.put(&mut b[S_SEG..S_PREFIX]);
         b[S_PREFIX..S_PREFIX + c.prefix().len()].copy_from_slice(c.prefix());
-        let crc = crc32(&b[..S_CRC]);
-        put32(&mut b, S_CRC, crc);
+        seal_trailer(&mut b, &STRIDE_MAGIC, STRIDE_VERSION);
         Ok(b)
     }
 
     /// The trailer out of a page, after every check that needs nothing of
-    /// the file, in the order [`Trailer::decode`] makes them -- the length,
-    /// the magic, the version, the page size and the CRC first -- and then
-    /// the fields against each other: the codec's kind, the key's length,
-    /// the prefix and the field making it, the field's width, the run in
-    /// the field, the width, the sizes against [`stride_layout`]'s, the
-    /// zeros, and `bind32` against the fields it hashes.
+    /// the file: the head's first, as every trailer makes them
+    /// ([`open_trailer`]), and then the fields against each other: the
+    /// codec's kind, the key's length, the prefix and the field making it,
+    /// the field's width, the run in the field, the width, the sizes
+    /// against [`stride_layout`]'s, the zeros, and `bind32` against the
+    /// fields it hashes.
     pub fn decode(bytes: &[u8]) -> Result<StrideTrailer, ZError> {
-        if bytes.len() != ZTRAILER {
-            return Err(ZError::Length);
-        }
-        if bytes[S_MAGIC..S_MAGIC + 8] != STRIDE_MAGIC {
-            return Err(ZError::Magic);
-        }
-        if get32(bytes, S_VERSION) != STRIDE_VERSION {
-            return Err(ZError::Version);
-        }
-        if get32(bytes, S_PAGE_SIZE) != ZPAGE as u32 {
-            return Err(ZError::PageSize);
-        }
-        if get32(bytes, S_CRC) != crc32(&bytes[..S_CRC]) {
-            return Err(ZError::TrailerCrc);
-        }
+        open_trailer(bytes, &STRIDE_MAGIC, STRIDE_VERSION)?;
         let bad = ZError::Trailer;
         let kind = KeyKind::from_code(bytes[S_CODEC])
             .ok_or(bad("the key codec is not one this reader knows"))?;
@@ -4755,7 +4765,7 @@ impl StrideTrailer {
         if bytes[S_PREFIX + p..S_ZERO].iter().any(|&b| b != 0) {
             return Err(bad("a byte past the prefix is not zero"));
         }
-        if bytes[S_ZERO..S_CRC].iter().any(|&b| b != 0) {
+        if bytes[S_ZERO..T_CRC].iter().any(|&b| b != 0) {
             return Err(bad("a reserved byte is not zero"));
         }
         if get32(bytes, S_BIND32) != t.bind32() {
@@ -9651,6 +9661,18 @@ mod tests {
             (be, b"\x00\x01", 2, 250, 600),
             (be, b"\xff", 1, 3, 200),
             (be, b"", STRIDE_BE_MAX, u64::MAX - 30, 31),
+            // Prefixed runs that end at their field's top, where a key
+            // above the prefix is past the run by exactly every number
+            // the field holds and the clamp to `n` hides nothing: a run
+            // whose last key is the field's last, as "k0990" to "k0999"
+            // makes, and as the last partition of a store of sixteen-digit
+            // keys whose prefix holds a digit makes. A run that ends short
+            // of the top answers `n` for any count at or past its end.
+            (dec, b"k", 1, 0, 10),
+            (dec, b"k099", 1, 0, 10),
+            (dec, b"0000000009", 6, 999_000, 1000),
+            (be, b"\x80", 1, 3, 253),
+            (be, b"\x00\x01", 2, 65_000, 536),
         ];
         let mut buf = [0u8; STRIDE_KEY_MAX];
         for &(kind, prefix, d, base, n) in &runs {
@@ -9795,6 +9817,28 @@ mod tests {
         assert_eq!(
             KeyCodec::detect(b"k0042", b"k0042", 0),
             Err(KeyShapeNo::Holes)
+        );
+        // Every eight-byte number, from zeros to 0xff bytes, is a run one
+        // longer than any count: no `n` is it, and a count that wrapped
+        // would take it for a run of none.
+        for n in [0, 1, u64::MAX] {
+            assert_eq!(
+                KeyCodec::detect(&[0; STRIDE_BE_MAX], &[0xff; STRIDE_BE_MAX], n),
+                Err(KeyShapeNo::Holes),
+                "{n}"
+            );
+        }
+        // The same field from a later first key is a run a count holds,
+        // to the field's top.
+        let first = 0x0101_0101_0101_0101u64;
+        let c = KeyCodec::detect(
+            &first.to_be_bytes(),
+            &[0xff; STRIDE_BE_MAX],
+            u64::MAX - first + 1,
+        );
+        assert_eq!(
+            c.map(|c| (c.kind(), c.d(), c.base())),
+            Ok((KeyKind::BigEndian, STRIDE_BE_MAX, first))
         );
         // Two lengths, the empty key, a key past the longest.
         assert_eq!(
@@ -10158,7 +10202,7 @@ mod tests {
         for at in [S_PREFIX + p, S_ZERO - 1] {
             assert_eq!(why(bad(&|b| b[at] = 1)), past, "byte {at}");
         }
-        for at in [S_ZERO, 2000, S_CRC - 1] {
+        for at in [S_ZERO, 2000, T_CRC - 1] {
             assert_eq!(
                 why(bad(&|b| b[at] = 1)),
                 "a reserved byte is not zero",
@@ -10186,7 +10230,7 @@ mod tests {
         // A version or a page size the CRC covers is refused before it.
         for v in [0u32, STRIDE_VERSION + 1] {
             let mut b = base;
-            put32(&mut b, S_VERSION, v);
+            put32(&mut b, T_VERSION, v);
             assert_eq!(
                 StrideTrailer::decode(&b),
                 Err(ZError::Version),
@@ -10194,7 +10238,7 @@ mod tests {
             );
         }
         let mut b = base;
-        put32(&mut b, S_PAGE_SIZE, 16_384);
+        put32(&mut b, T_PAGE_SIZE, 16_384);
         assert_eq!(StrideTrailer::decode(&b), Err(ZError::PageSize));
     }
 }
