@@ -15141,6 +15141,14 @@ mod store_format {
     /// kind for a boundary a run of ordered ingest left unsynced, and the
     /// run's place in the sequence with it: the note in a run's file, in
     /// its two kinds.
+    ///
+    /// The form file's two magics are a pair because a form file holds one
+    /// of two bodies, and the stride form's magic joined version 2 without
+    /// moving it: it is a new kind's magic, not a moved one, in a file no
+    /// manifest names, and an engine from before it takes such a file's
+    /// trailer at the block form's length, refuses it at the magic as
+    /// damage and builds the form again, which a derived file is for -- a
+    /// refusal, never a misread, so nothing a release reads changed.
     #[test]
     fn store_format_names_the_files_magics() {
         let version_2 = (
@@ -15148,7 +15156,7 @@ mod store_format {
             *b"SUPDBMAN\x03",
             (*b"SUPDBWL", 4u8, 5u8, 6u8),
             0x3144_524f_4450_5553u64,
-            *b"SUPDZPG2",
+            (*b"SUPDZPG2", *b"SUPDZST1"),
             (0x5355_5044_5255_4e31u64, 0x5355_5044_5255_4e32u64),
         );
         let now = (
@@ -15156,7 +15164,7 @@ mod store_format {
             *MANIFEST_MAGIC,
             (*WAL_HEAD, WAL_CHAINED, WAL_LOOSE, WAL_LOOSE_RUN),
             crate::ordindex::MAGIC,
-            zpages::ZMAGIC,
+            (zpages::ZMAGIC, zpages::STRIDE_MAGIC),
             (RUN_NOTE_MAGIC, RUN_NOTE_CHAINED),
         );
         assert_eq!(

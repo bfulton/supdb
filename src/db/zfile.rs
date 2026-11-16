@@ -36,8 +36,8 @@ use super::zpages::{
     filter_bytes, group_seek, open_group_partly_with, page_view, parse_page, record_group_seek,
     seek_group_partly_with, verify_page_with, view_trusted, walk_group, Dec, FenceEntry,
     FenceSearch, Fill, FillScratch, FillStats, GroupBuf, Images, NoPage, PageView, PartGroup,
-    SegImages, Trailer, ZError, ZFence, PART_STEP, ZCODING_BLOCK, ZGROUP_BYTES, ZMAX_GROUPS,
-    ZNOPAGE, ZPAGE, ZTRAILER,
+    SegIdent, SegImages, Trailer, ZError, ZFence, PART_STEP, ZCODING_BLOCK, ZGROUP_BYTES,
+    ZMAX_GROUPS, ZNOPAGE, ZPAGE, ZTRAILER,
 };
 use crate::blob::{Blob, BlobOptions, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
@@ -2860,7 +2860,8 @@ impl ZFile {
         let facts = blob.z_source_facts().ok_or_else(|| {
             Reject::Identity("the segment has no checksum row to be bound to".into())
         })?;
-        same_segment(&t, &facts, id, end_seq).map_err(|why| Reject::Identity(why.into()))?;
+        same_segment(&t.seg_ident(), &facts, id, end_seq)
+            .map_err(|why| Reject::Identity(why.into()))?;
         let nkeys = usize::try_from(facts.nkeys)
             .ok()
             .filter(|&n| u32::try_from(n).is_ok())
@@ -4567,14 +4568,16 @@ impl ZFile {
     }
 }
 
-/// That the trailer is the live segment's: every quantity it records of the
-/// segment equals what the segment recomputed of itself. The first mismatch
-/// is named, the name's fields and the content's fingerprint first: two
-/// segments written a second apart differ in their timestamps whatever else
-/// they share, and a refusal that named the clock would say nothing of
-/// whether the records were the same.
+/// That the segment a form file's trailer records is the live segment:
+/// every quantity it records equals what the segment recomputed of itself.
+/// The first mismatch is named, the name's fields and the content's
+/// fingerprint first: two segments written a second apart differ in their
+/// timestamps whatever else they share, and a refusal that named the clock
+/// would say nothing of whether the records were the same. Either kind of
+/// trailer is asked through its `seg_ident`, so the two kinds are held to
+/// one comparison.
 fn same_segment(
-    t: &Trailer,
+    t: &SegIdent,
     f: &ZSource,
     id: u64,
     end_seq: u64,
@@ -4585,28 +4588,28 @@ fn same_segment(
     if t.nkeys != f.nkeys {
         return Err("the key count differs");
     }
-    if t.seg_row_crc != f.row_crc {
+    if t.row_crc != f.row_crc {
         return Err("the key section's checksum row differs");
     }
-    if t.seg_recs_len != f.recs_len {
+    if t.recs_len != f.recs_len {
         return Err("the record region's length differs");
     }
-    if t.seg_crc_off != f.crc_off {
+    if t.crc_off != f.crc_off {
         return Err("the checksum row's place differs");
     }
-    if t.seg_key_off != f.key_off {
+    if t.key_off != f.key_off {
         return Err("the key section's offset differs");
     }
-    if t.seg_hash_cap != f.hash_cap {
+    if t.hash_cap != f.hash_cap {
         return Err("the hash capacity differs");
     }
-    if t.seg_file_len != f.file_len {
+    if t.file_len != f.file_len {
         return Err("the segment's length differs");
     }
-    if t.seg_timestamp != f.timestamp {
+    if t.timestamp != f.timestamp {
         return Err("the segment's timestamp differs");
     }
-    if t.seg_generation != f.generation {
+    if t.generation != f.generation {
         return Err("the segment's generation differs");
     }
     if t.rec_version != f.rec_version {
@@ -6343,7 +6346,7 @@ pub(super) fn file_facts(
         return None;
     }
     let facts = blob.z_source_facts()?;
-    same_segment(&t, &facts, id, end_seq).ok()?;
+    same_segment(&t.seg_ident(), &facts, id, end_seq).ok()?;
     Some(FileFacts {
         bytes: len,
         pages: t.n_pages,
@@ -6386,7 +6389,7 @@ pub(super) fn time_file_decodes(
     }
     let t = Trailer::decode(map.slice_at(len - ZTRAILER as u64, ZTRAILER)?).ok()?;
     let facts = blob.z_source_facts()?;
-    same_segment(&t, &facts, id, end_seq).ok()?;
+    same_segment(&t.seg_ident(), &facts, id, end_seq).ok()?;
     let bind = bind32(id, end_seq, facts.nkeys, facts.row_crc);
     let n_pages = usize::try_from(t.n_pages).ok()?;
     if n_pages == 0 || pages == 0 {
@@ -9031,6 +9034,191 @@ mod tests {
             Reject::Missing => "missing".into(),
             Reject::Damage(why) => format!("damage: {why}"),
             Reject::Identity(why) => format!("identity: {why}"),
+        }
+    }
+
+    /// Either kind of trailer's account of its segment, held to the live
+    /// segment's by the one comparison, with each field wrong in turn named
+    /// by its own refusal: the block form's through `Trailer::seg_ident`, and
+    /// the stride form's as its bytes decode, so that a field of either
+    /// mapped to another's place is a refusal of the wrong words.
+    #[test]
+    fn same_segment_names_each_field_of_either_kinds_ident() {
+        use crate::db::zpages::{KeyCodec, KeyKind, StrideTrailer};
+        let f = ZSource {
+            nkeys: 200,
+            recs_len: 24_800,
+            crc_off: 30_000,
+            key_off: 192,
+            hash_cap: 512,
+            file_len: 40_960,
+            timestamp: 1_760_000_000,
+            generation: 1,
+            row_crc: 0x1357_9BDF,
+            rec_version: 3,
+            rec_magic: 0x5355_5044_4200_0007,
+        };
+        let (id, end_seq) = (17, 4_000);
+        let block = Trailer {
+            nkeys: f.nkeys,
+            seg_recs_len: f.recs_len,
+            seg_crc_off: f.crc_off,
+            seg_key_off: f.key_off,
+            seg_hash_cap: f.hash_cap,
+            seg_file_len: f.file_len,
+            seg_timestamp: f.timestamp,
+            seg_generation: f.generation,
+            seg_row_crc: f.row_crc,
+            rec_version: f.rec_version,
+            rec_magic: f.rec_magic,
+            seg_id: id,
+            seg_end_seq: end_seq,
+            ..Trailer::default()
+        };
+        let stride_of = |seg: SegIdent| {
+            let t = StrideTrailer {
+                codec: KeyCodec::new(KeyKind::Decimal, b"k", 4, 0).unwrap(),
+                w: 100,
+                res_crc: 0,
+                seg,
+            };
+            StrideTrailer::decode(&t.encode().unwrap())
+                .unwrap()
+                .seg_ident()
+        };
+        assert_eq!(stride_of(block.seg_ident()), block.seg_ident());
+        assert_eq!(same_segment(&block.seg_ident(), &f, id, end_seq), Ok(()));
+        assert_eq!(
+            same_segment(&stride_of(block.seg_ident()), &f, id, end_seq),
+            Ok(())
+        );
+        // The live segment named otherwise.
+        assert_eq!(
+            same_segment(&block.seg_ident(), &f, id + 1, end_seq),
+            Err("the form file names another segment")
+        );
+        assert_eq!(
+            same_segment(&block.seg_ident(), &f, id, end_seq + 1),
+            Err("the form file names another segment")
+        );
+        type Edit = (fn(&mut Trailer), fn(&mut SegIdent), &'static str);
+        let edits: Vec<(&str, Edit)> = vec![
+            (
+                "seg_id",
+                (
+                    |t| t.seg_id += 1,
+                    |s| s.seg_id += 1,
+                    "the form file names another segment",
+                ),
+            ),
+            (
+                "seg_end_seq",
+                (
+                    |t| t.seg_end_seq += 1,
+                    |s| s.seg_end_seq += 1,
+                    "the form file names another segment",
+                ),
+            ),
+            (
+                "nkeys",
+                (|t| t.nkeys += 1, |s| s.nkeys += 1, "the key count differs"),
+            ),
+            (
+                "row_crc",
+                (
+                    |t| t.seg_row_crc ^= 1,
+                    |s| s.row_crc ^= 1,
+                    "the key section's checksum row differs",
+                ),
+            ),
+            (
+                "recs_len",
+                (
+                    |t| t.seg_recs_len += 4,
+                    |s| s.recs_len += 4,
+                    "the record region's length differs",
+                ),
+            ),
+            (
+                "crc_off",
+                (
+                    |t| t.seg_crc_off += 4,
+                    |s| s.crc_off += 4,
+                    "the checksum row's place differs",
+                ),
+            ),
+            (
+                "key_off",
+                (
+                    |t| t.seg_key_off += 4096,
+                    |s| s.key_off += 4096,
+                    "the key section's offset differs",
+                ),
+            ),
+            (
+                "hash_cap",
+                (
+                    |t| t.seg_hash_cap *= 2,
+                    |s| s.hash_cap *= 2,
+                    "the hash capacity differs",
+                ),
+            ),
+            (
+                "file_len",
+                (
+                    |t| t.seg_file_len += 4096,
+                    |s| s.file_len += 4096,
+                    "the segment's length differs",
+                ),
+            ),
+            (
+                "timestamp",
+                (
+                    |t| t.seg_timestamp += 1,
+                    |s| s.timestamp += 1,
+                    "the segment's timestamp differs",
+                ),
+            ),
+            (
+                "generation",
+                (
+                    |t| t.seg_generation += 1,
+                    |s| s.generation += 1,
+                    "the segment's generation differs",
+                ),
+            ),
+            (
+                "rec_version",
+                (
+                    |t| t.rec_version += 1,
+                    |s| s.rec_version += 1,
+                    "the record format's version differs",
+                ),
+            ),
+            (
+                "rec_magic",
+                (
+                    |t| t.rec_magic ^= 1,
+                    |s| s.rec_magic ^= 1,
+                    "the file format's magic differs",
+                ),
+            ),
+        ];
+        for (field, (on_block, on_ident, why)) in &edits {
+            let mut t = block.clone();
+            on_block(&mut t);
+            assert_eq!(
+                same_segment(&t.seg_ident(), &f, id, end_seq),
+                Err(*why),
+                "the block form's trailer with {field} changed"
+            );
+            let mut s = block.seg_ident();
+            on_ident(&mut s);
+            assert_eq!(
+                same_segment(&stride_of(s), &f, id, end_seq),
+                Err(*why),
+                "the stride form's trailer with {field} changed"
+            );
         }
     }
 
