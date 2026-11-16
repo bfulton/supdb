@@ -151,6 +151,16 @@ What an engine picker would hit, roughly in order.
   with a count; add an end bound and reverse order.
 - [ ] **Batched point reads (`MultiGet`).** Cheap to add, and a natural new
   benchmark workload.
+- [ ] **One sequence for the log and the runs.** A recovery orders the
+  log's replayed frames above every piece, the one it rebuilds from a
+  direct run's file included, so a run is sound only above every key the
+  log names; the writer keeps that by its greatest key, which every write
+  raises, a delete's included. A store written before deletes raised it
+  may hold a run of a key whose tombstone is in its log past the
+  manifest, and opens with the run's values masked. Done when run
+  markers and log frames carry one commit sequence and a recovery orders
+  a rebuilt run against the frames by it, which repairs such a store at
+  its open, with crash tests of each order.
 - [x] **Encryption at rest for a live store.** A store opens under a key
   (`Encryption::Kernel`) and the kernel encrypts its directory: every file
   it writes is ciphertext on the device and plaintext in the page cache,

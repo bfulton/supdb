@@ -16228,7 +16228,9 @@ pub struct Db {
     /// (`Options::seal_idle`). A store nothing has read starts in one.
     read_mode: (u64, u64, bool),
     /// The store's greatest key, or empty for none: what a key has to be
-    /// above to go direct.
+    /// above to go direct. Raised by every write, a delete's included, and
+    /// never lowered, so it is at or above every key a frame in the log
+    /// names.
     max_key: Vec<u8>,
     /// Scratch for the run a value would encode as, measured at `append`
     /// against the inline limit.
@@ -28375,7 +28377,9 @@ impl Db {
     }
 
     /// The greatest key any source holds: the partitions' and pieces' last
-    /// keys and the memtable's, for a store that opens with all of them.
+    /// keys and the memtable's, for a store that opens with all of them. A
+    /// tombstone counts as a key, the memtable's above all: those are the
+    /// log's frames a recovery replays over any run that opens after them.
     fn max_key_of(segs: &[std::sync::Arc<Seg>], mem: &MemTable) -> Vec<u8> {
         let mut best: Vec<u8> = Vec::new();
         for s in segs {
@@ -28424,7 +28428,9 @@ impl Db {
 
     /// End every value of `key` written before this point; later appends
     /// start fresh. Durable at the next `commit`, exactly like an append,
-    /// and reclaimed by the next merge that reaches the key.
+    /// and reclaimed by the next merge that reaches the key. A deleted key
+    /// counts toward the store's greatest, so ordered appends go through
+    /// the log, not a direct run, until they pass it.
     pub fn delete(&mut self, key: &[u8]) {
         let _op = self.op();
         if !self.writes_go() {
@@ -28432,6 +28438,15 @@ impl Db {
         }
         if self.mem().ordered {
             self.leave_direct();
+        }
+        // A tombstone is a key the log names, as a put's is: a direct run
+        // opens only above every such key, since a recovery replays the
+        // log's frames as newer than the piece it rebuilds from the run's
+        // file, and a run of a key deleted above the greatest came back
+        // masked by the delete it followed.
+        if key > self.max_key.as_slice() {
+            self.max_key.clear();
+            self.max_key.extend_from_slice(key);
         }
         let hash = self.mem().prefetch(key);
         self.wal.delete(key);

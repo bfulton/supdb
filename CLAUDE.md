@@ -2195,9 +2195,12 @@ not, and an experiment that assumed otherwise measured a 286,000-key seal it
 had never joined.
 
 Ordered ingest has its own log and one more window. A run of keys above the
-store's greatest goes to an ordered memtable and, at each commit, to a
-segment open for append: the batch's records, then a commit marker carrying
-their CRC, length and count, then one fdatasync on that file. The WAL never
+store's greatest -- every key a segment holds or a frame of the log names,
+a delete's included, since recovery replays the log's frames as newer than
+the piece it rebuilds from a run's file -- goes to an ordered memtable and,
+at each commit, to a segment open for append: the batch's records, then a
+commit marker carrying their CRC, length and count, then one fdatasync on
+that file. The WAL never
 sees them (`direct_ingest: false` is the arm that still sends them there).
 Recovery walks the temp file's record stream to the last marker whose three
 quantities agree with the records before it and rewrites what precedes it as
@@ -3583,7 +3586,28 @@ and the two reservations agree (`tests/settle.rs`). The corollary: a fuzz
 whose seeds share one random stream changes every seed's operations when
 a draw is added, so a failure that appears with a new option is attributed
 by running the commit before with the same draws, not by reading the
-option's name.
+option's name. It came back as a quantity the writes keep rather than a
+resource they hand out: the store's greatest key, which a key has to be
+above to open a direct run, was raised by `put` and by `append` and not
+by `delete`, so a key deleted above the greatest and then appended opened
+a run while its tombstone sat in the log past what the manifest covered.
+The live store read the append, the run's table being newer than the
+frozen tombstone; a crash before the tombstone's seal was durable
+rebuilt the run as a piece and replayed the log over it, and the
+acknowledged append read as deleted, at that open and every one after.
+The delete raises the greatest key as the other writes do, and
+`tests/durable.rs` builds the crash in each window of the seal, from a
+delete first, second and alone in its batch, from a transaction, from a
+delete the seal commits with no `commit`, from a delete that ends a run
+and from a tombstone the open replayed (`Db::max_key_of` counts the
+memtable's tombstones). A raise is a raise: one taken as an assignment
+lowers the greatest at a delete below it, and the run that opens there
+spans partitions and is refused by the flush's merge; a greatest
+recomputed at an open without the segments does the same. The
+corollary: a quantity that guards an order between two logs is kept by
+every write that reaches either log, where the write is made and not at
+whichever call makes it durable, and the test of each write is the
+crash, since the live store reads right whichever way the guard went.
 
 **A check spelled twice, and the copy nothing reached.** The form file
 reader's first decode compared a page's rank and count with its fence entry
