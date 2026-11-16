@@ -161,6 +161,19 @@ What an engine picker would hit, roughly in order.
   markers and log frames carry one commit sequence and a recovery orders
   a rebuilt run against the frames by it, which repairs such a store at
   its open, with crash tests of each order.
+- [ ] **A log's device errors held on a device that makes them.** A
+  failed write of the log is put back and written again, and a failed
+  sync of it is kept until the store is reopened (`SyncPolicy`). The
+  tests inject both through seams in the engine, and the seam for a
+  failed sync models Linux's: the error reported once, the pages it
+  covered lost, and a later fdatasync of the same file succeeding. No
+  test has run the store over a device that fails a write or a writeback
+  for real. Done when a dm-flakey or dm-error target under the store's
+  filesystem (root and a loop device, as `scripts/fscrypt.sh` sets one
+  up) fails the log's writeback in the middle of a commit stream, and the
+  store answers the error to every commit after it and reopens at a
+  prefix of what it acknowledged; and when the same target returns
+  ENOSPC for a write, and the store commits again once space is freed.
 - [x] **Encryption at rest for a live store.** A store opens under a key
   (`Encryption::Kernel`) and the kernel encrypts its directory: every file
   it writes is ciphertext on the device and plaintext in the page cache,

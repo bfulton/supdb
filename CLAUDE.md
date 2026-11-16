@@ -2099,7 +2099,15 @@ prove it.
 
 **Crash discipline is an order, and every window in it is survivable.**
 Commit is a WAL append and one fdatasync; the batch is durable or its tail
-frame fails its CRC and replay stops before it. Seal is write to a temp name,
+frame fails its CRC and replay stops before it. A write the device refuses
+is put back before the commit answers it -- the file cut to its last good
+length, the batch's commit frame taken off what is pending and its
+sequence number given back -- so the next commit writes the batch again
+under its own frame and the log holds no byte a replay would misread; a
+sync that fails is kept and never retried, and every commit, sync and
+flush answers it until the store is reopened, so nothing after the failure
+is acknowledged over frames the device may not hold (`Db::lost`), and the
+open finds a prefix of what was acknowledged before it. Seal is write to a temp name,
 rename into place, publish to readers, fsync, then the manifest -- one of
 two slot files written in place and fdatasynced, the newest valid slot by
 its publish sequence being the store at open, so a torn publish is the
@@ -3372,6 +3380,68 @@ shipped. The flush answers with the presync's error now, and a hook
 injects the failure for the test. The rule: an fsync's error is consumed
 by the call that sees it, so the result of every sync on a path is
 checked by that path and never left to a later sync of the same file.
+It came back at the log, where the path did check and then forgot: a
+failed fdatasync of the log was the commit's answer, and the next
+commit's fdatasync of the same descriptor, which Linux answers with
+success over pages it marked clean after failing their writeback, was
+the next commit's `Ok`; the frames behind the hole were acknowledged and
+replay stopped before them. A loose file's sync and the directory's fsync
+a new log file's name needs did the same, the second by design, a
+barrier "retried by the syncs after it until it succeeds". The writer
+keeps the first such error now and answers it to every commit, sync and
+flush until the store is reopened, and the check rides the one each of
+them made already: the kept error refills `pending_err` each time it is
+taken. The corollary: a sync's error is not the call's alone either --
+it is a fact about what the device holds, so it is kept for every later
+call that would promise the same bytes, and a retry is never the remedy.
+
+**A failure that left the buffer it failed on for the next call to
+build on.** The log's write staged a commit's frames, wrote them, and
+cleared them; a write the device refused returned before the clear and
+before the cursor moved, and left both as they were mid-failure: the
+batch and its commit frame still pending, and whatever part of the write
+had reached the file sitting past the log's length. The next commit
+appended its own batch and closed it with a frame whose CRC covered
+everything pending, the failed batch's commit frame included, so replay
+rejected it and every commit after the failure was lost; a part written
+shifted every frame after it; and a rotation after either made the open
+refuse the store with a sequence gap the engine had written itself.
+Nothing raised until the open. The failure path now puts back what the
+call changed -- the file cut to its last good length, the commit frame
+off the staged batch and its sequence number given back, so the batch
+joins the next commit's under one frame with no gap -- and a file that
+cannot be cut back is kept as a sync's error is. Two batches under two
+frames was the other shape, and it costs a position kept on every
+commit; this one costs nothing until a write fails. The rule: a call that
+fails part way through changing a buffer and a cursor puts both back to
+where the call found them before it answers, since the next call builds
+on whatever it leaves; and the shape of the put-back is chosen on the
+failure path, where its cost is. Two things the first version of the
+put-back missed, each found in review. Its tests made every store with
+`Db::create`, whose log is written at its cursor, so the seek did the
+work and a put-back without the cut passed them, the retry's bytes
+being always longer than the stray ones; a reopened store's log is
+opened for append, where a write lands at the file's end whatever the
+cursor says and only the cut keeps it from landing behind the stray
+bytes, and the tests run the cuts on a reopened store now. And under a
+cipher an ordered run's commit goes to the log as well (`Db::log_run`),
+after the run has counted the batch its own: a commit or a `sync` with
+nothing new for the run answered `Ok` at the run's "nothing to commit"
+and never wrote the frames the failed write had left staged in the log,
+so the batch was visible and on no device. That early return asks the
+log too now. The batch is still visible from the failed commit on, as a
+run's batch is before its sync, since the run marks its table before
+its log write; the first wording of the crate docs promised readers
+nothing before the next commit, which held for the log's path alone,
+and they name the run's exception now; the second promised the batch
+durable at whichever call wrote it again, which held under `Always`
+alone, since a commit under `EveryN` writes without syncing, and they
+say durable as that call's policy makes it now. The corollaries: a put-back of a file is tested on every
+way the file is opened, since the same calls do different work on each;
+and a "nothing to do" answered from one counter is wrong wherever a
+failure can leave the work in another buffer that counter does not see;
+and a contract written for a failure is read against every path that
+reaches it, since the paths order their marks and writes differently.
 
 **A length read off the slab that held the exceptions.** The ordered
 table's write log became the range of its entries, its length the

@@ -14,10 +14,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use supdb::{Db, Encryption, Options, Reader, StoreCipher};
+use supdb::{Db, Encryption, Options, Reader, StoreCipher, SyncPolicy};
 
 mod common;
-use common::{vf, Gcm};
+use common::{seg_names, vf, Gcm};
 
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-{name}-{}", std::process::id()));
@@ -667,4 +667,862 @@ fn an_open_keeps_the_greatest_its_segments_hold() {
         },
         None,
     );
+}
+
+// ---------------------------------------------------------------------
+// log-errors: what the log does after the device refuses a write or a
+// sync. A failed write is put back -- the file cut to its last good length,
+// the batch staged again -- and the next commit writes it as frames a
+// replay accepts; a failed fdatasync or fsync of the log is kept, and every
+// commit, sync and flush after it answers with it until the store is
+// reopened, since Linux reports a writeback error once and a later sync of
+// the same file answers `Ok` over pages it never wrote.
+// ---------------------------------------------------------------------
+
+/// The words every answer after a kept error carries.
+const KEPT: &str = "until it is reopened";
+
+/// `put` and not `append`: an `append` of a key above the store's greatest
+/// opens a direct run, whose commits never reach a plain store's log, and
+/// `put` stays in the log under the default options.
+fn put_commit(db: &mut Db, k: &str, v: &str) -> std::io::Result<()> {
+    db.put(k.as_bytes(), v.as_bytes());
+    db.commit()
+}
+
+fn reads(db: &Reader, k: &str, v: &str, what: &str) {
+    assert_eq!(
+        read_vec(db, k.as_bytes()),
+        vec![v.as_bytes().to_vec()],
+        "{what}: {k} reads back once"
+    );
+}
+
+/// An answer that is the kept error: refused, in its words.
+fn kept(r: std::io::Result<()>, what: &str) {
+    match r {
+        Ok(()) => panic!("{what}: answered Ok after the log's device error"),
+        Err(e) => assert!(
+            e.to_string().contains(KEPT),
+            "{what}: answered with an error that is not the kept one: {e}"
+        ),
+    }
+}
+
+/// `kept`, of the kind the error that was kept had: a caller that tells
+/// a device out of space from one that failed reads the same kind from
+/// every answer after it.
+fn kept_as(r: std::io::Result<()>, kind: std::io::ErrorKind, what: &str) {
+    if let Err(e) = &r {
+        assert_eq!(e.kind(), kind, "{what}: the kept error's kind: {e}");
+    }
+    kept(r, what);
+}
+
+/// `a_failed_write_is_written_again`'s `after` for a record whose seal
+/// fails under a cipher, before anything is written.
+const SEAL: usize = usize::MAX;
+
+/// A store whose next log write fails after `after` bytes, through `put`,
+/// whose batches go to the log alone: the commit answers the error, the
+/// commits after it are acknowledged, and every one of them -- the failed
+/// batch too, written again by the next commit and visible from that
+/// commit on, once -- reads back live and from a
+/// copy of the files, which under `Always` is what a kill and a power cut
+/// both leave. With `reopened`, the store is opened from a kill's copy
+/// before the failure, so its log is the file an open appends to
+/// (`O_APPEND`), where a write lands at the file's end whatever the
+/// cursor says and only the cut back of the file keeps the next one from
+/// landing behind the failed write's bytes; otherwise its log is the file
+/// the creation made, written at its cursor.
+fn a_failed_write_is_written_again(tag: &str, opts: Options, after: usize, reopened: bool) {
+    let d = dir(&format!("dur-walwrite-{tag}"));
+    let crash = dir(&format!("dur-walwrite-{tag}-crash"));
+    assert!(
+        matches!(opts.sync, SyncPolicy::Always),
+        "{tag}: the premise"
+    );
+    let mut db = if reopened {
+        let first = dir(&format!("dur-walwrite-{tag}-first"));
+        let mut db = Db::create(&first, opts.clone()).unwrap();
+        put_commit(&mut db, "k0", "v0").unwrap();
+        copy_store(&first, &d);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&first);
+        let db = Db::open(&d, opts.clone()).unwrap();
+        assert_eq!(db.levels(), (0, 0), "{tag}: the log alone holds k0");
+        db
+    } else {
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        put_commit(&mut db, "k0", "v0").unwrap();
+        db
+    };
+    if after == SEAL {
+        db.fail_next_wal_seal();
+    } else {
+        db.fail_next_wal_write(after);
+    }
+    match put_commit(&mut db, "k1", "v1") {
+        Ok(()) => panic!("{tag}: the injected write failure is the commit's answer"),
+        // A seal that fails is answered before any write is made: the
+        // answer is the seal's, not a write's of whatever the seal's
+        // buffer held before.
+        Err(e) if after == SEAL => assert!(
+            e.to_string().contains("seal failed"),
+            "{tag}: the commit's answer is the seal's and no write was made: {e}"
+        ),
+        Err(_) => {}
+    }
+    let h = db.reader().unwrap();
+    assert!(
+        read_vec(&h, b"k1").is_empty(),
+        "{tag}: a batch whose commit failed is not visible to a handle"
+    );
+    put_commit(&mut db, "k2", "v2").unwrap();
+    put_commit(&mut db, "k3", "v3").unwrap();
+    for (r, what) in [(&*db, "the writer"), (&h, "a handle")] {
+        reads(r, "k1", "v1", &format!("{tag}, live through {what}"));
+        reads(r, "k2", "v2", &format!("{tag}, live through {what}"));
+    }
+    drop(h);
+    assert_eq!(
+        db.levels(),
+        (0, 0),
+        "{tag}: nothing sealed, the log alone holds the commits"
+    );
+    copy_store(&d, &crash);
+    drop(db);
+    for (at, what) in [(&crash, "the crash"), (&d, "the closed store")] {
+        let db = Db::open(at, opts.clone()).unwrap_or_else(|e| panic!("{tag}: {what} opens: {e}"));
+        let what = format!("{tag}, {what}");
+        reads(&db, "k0", "v0", &format!("{what}: before the failure"));
+        reads(&db, "k1", "v1", &format!("{what}: the batch written again"));
+        reads(
+            &db,
+            "k2",
+            "v2",
+            &format!("{what}: acknowledged after the failure"),
+        );
+        reads(
+            &db,
+            "k3",
+            "v3",
+            &format!("{what}: acknowledged after the failure"),
+        );
+    }
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// A write that failed whole: nothing of it on the file.
+#[test]
+fn a_failed_log_write_loses_no_commit_acknowledged_after_it() {
+    a_failed_write_is_written_again("zero", Options::default(), 0, false);
+}
+
+/// A write that put part of the batch on the file and then failed: the
+/// prefix on the file and the cursor past it, which is what `write_all`
+/// leaves after a short write and a failed one. Cut inside the first
+/// frame's header (1, 5) and at the first frame's end (20: a delete frame
+/// of a two-byte key is 8 + 8 + 1 + 1 + 2 bytes), which leaves a
+/// well-formed record frame in front of whatever is written next.
+#[test]
+fn a_log_write_that_failed_part_way_loses_no_commit_acknowledged_after_it() {
+    for after in [1usize, 5, 20] {
+        a_failed_write_is_written_again(&format!("part-{after}"), Options::default(), after, false);
+    }
+}
+
+/// The same cuts in a store reopened before the failure, whose log is
+/// appended to (`O_APPEND`): the write after the failure lands at the
+/// file's end, so the failed bytes have to be cut off it.
+#[test]
+fn a_log_write_that_failed_part_way_in_a_reopened_store_loses_no_commit_acknowledged_after_it() {
+    for after in [1usize, 5, 20] {
+        a_failed_write_is_written_again(
+            &format!("reopened-part-{after}"),
+            Options::default(),
+            after,
+            true,
+        );
+    }
+}
+
+/// The same under a cipher, whose log takes a commit's frames as one
+/// sealed record: a record cut part way and one never written.
+#[test]
+fn a_failed_log_write_loses_no_commit_acknowledged_after_it_under_a_cipher() {
+    for after in [0usize, 5, 40] {
+        a_failed_write_is_written_again(&format!("cipher-{after}"), under_cipher(), after, false);
+    }
+    for after in [5usize, 40] {
+        a_failed_write_is_written_again(
+            &format!("cipher-reopened-{after}"),
+            under_cipher(),
+            after,
+            true,
+        );
+    }
+}
+
+/// A record that fails to seal under a cipher -- a commit too large for
+/// one record -- is a write that failed whole: the seal's buffer holds
+/// the record before it, and none of it reaches the file.
+#[test]
+fn a_log_record_that_fails_to_seal_loses_no_commit_acknowledged_after_it() {
+    a_failed_write_is_written_again("cipher-seal", under_cipher(), SEAL, false);
+}
+
+/// A commit with nothing new staged after a failed one writes the failed
+/// batch, and its `Ok` is that batch's durability.
+#[test]
+fn a_commit_with_nothing_staged_after_a_failed_write_makes_the_batch_durable() {
+    for (tag, opts) in [("plain", Options::default()), ("cipher", under_cipher())] {
+        let d = dir(&format!("dur-walwrite-retry-{tag}"));
+        let crash = dir(&format!("dur-walwrite-retry-{tag}-crash"));
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        put_commit(&mut db, "k0", "v0").unwrap();
+        db.fail_next_wal_write(5);
+        assert!(put_commit(&mut db, "k1", "v1").is_err(), "{tag}");
+        db.commit().unwrap();
+        copy_store(&d, &crash);
+        drop(db);
+        let db = Db::open(&crash, opts).unwrap();
+        reads(&db, "k0", "v0", tag);
+        reads(
+            &db,
+            "k1",
+            "v1",
+            &format!("{tag}: committed by the commit after"),
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&crash);
+    }
+}
+
+/// Under a cipher an ordered run's commits go to the log as well
+/// (`Db::log_run`), and its own file is a memory file until the run
+/// closes, so the log is where they are durable. A run's batch whose log
+/// write failed is in the table and counted as the run's, and is written
+/// to the log by whatever comes next -- a commit with nothing new, a
+/// `sync`, or a commit of the run's next batch -- once, under that call's
+/// commit frame, durable at that call's `Ok` as that call's policy makes
+/// it: a commit with nothing new, a `sync` (`then` 1) and a `flush` (4)
+/// sync it whatever the policy, a commit of the run's next batch (2) syncs
+/// it where the policy syncs that commit, and 3 is that commit under the
+/// buffered policy, which leaves it unsynced, with a `flush` after it.
+/// Unlike a batch
+/// of the log alone it is visible from the commit that failed, since the
+/// run marks its table before the log is written (`SyncPolicy`).
+fn a_runs_batch_is_written_again(tag: &str, then: u8, opts: Options) {
+    {
+        let d = dir(&format!("dur-walwrite-run-{tag}"));
+        let crash = dir(&format!("dur-walwrite-run-{tag}-crash"));
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        db.append(b"a0", b"v0");
+        db.commit().unwrap();
+        assert_eq!(db.direct_runs(), (1, 1), "{tag}: the premise, a logged run");
+        db.commit().unwrap();
+        db.sync().unwrap();
+        assert_eq!(
+            db.direct_runs(),
+            (1, 1),
+            "{tag}: a commit and a sync with nothing new write nothing to the log"
+        );
+        db.fail_next_wal_write(5);
+        db.append(b"a1", b"v1");
+        assert!(
+            db.commit().is_err(),
+            "{tag}: the failure is the commit's answer"
+        );
+        let h = db.reader().unwrap();
+        reads(
+            &h,
+            "a1",
+            "v1",
+            &format!("{tag}: a run's batch is visible from its failed commit"),
+        );
+        drop(h);
+        match then {
+            0 => db.commit().expect("a commit with nothing new"),
+            1 => db.sync().expect("a sync"),
+            4 => db.flush().expect("a flush"),
+            _ => {
+                db.append(b"a2", b"v2");
+                db.commit().expect("the run's next commit");
+                if then == 3 {
+                    // The buffered policy: the run's next commit writes the
+                    // batch with its own and syncs neither, as it syncs no
+                    // commit of its own; the flush after it makes both
+                    // durable with the rest of the run.
+                    let (_, synced, written) = db.wal_durable();
+                    assert!(
+                        synced < written,
+                        "{tag}: the run's next commit, durable as its policy makes it, \
+                         left the log unsynced (synced {synced}, written {written})"
+                    );
+                    let runs = db.direct_runs();
+                    db.flush().expect("a flush after the run's next commit");
+                    assert_eq!(
+                        db.direct_runs(),
+                        runs,
+                        "{tag}: the flush wrote nothing more to the log"
+                    );
+                }
+            }
+        }
+        let runs = db.direct_runs();
+        if then < 3 {
+            assert_eq!(
+                db.levels(),
+                (0, 0),
+                "{tag}: the run is open, the log alone holds it"
+            );
+        }
+        // A power cut: the log as far as a sync covered it, which is
+        // every byte the call answered `Ok` for -- any call's under
+        // `Always`, the `sync`'s under the buffered policy.
+        let (log, synced, _) = db.wal_durable();
+        copy_store(&d, &crash);
+        drop(db);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(crash.join(log.file_name().unwrap()))
+            .unwrap()
+            .set_len(synced)
+            .unwrap();
+        let db = Db::open(&crash, opts.clone())
+            .unwrap_or_else(|e| panic!("{tag}: the crash opens: {e}"));
+        reads(&db, "a0", "v0", &format!("{tag}: before the failure"));
+        reads(&db, "a1", "v1", &format!("{tag}: the batch written again"));
+        if then == 2 || then == 3 {
+            reads(&db, "a2", "v2", &format!("{tag}: the commit after"));
+        }
+        assert_eq!(
+            runs,
+            (1, 2),
+            "{tag}: the run's batch went to the log at that call, once"
+        );
+        drop(db);
+        let db = Db::open(&d, opts).unwrap();
+        reads(&db, "a1", "v1", &format!("{tag}: the closed store"));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&crash);
+    }
+}
+
+#[test]
+fn a_runs_batch_whose_log_write_failed_under_a_cipher_is_written_by_a_commit_of_nothing() {
+    a_runs_batch_is_written_again("commit", 0, under_cipher());
+}
+
+#[test]
+fn a_runs_batch_whose_log_write_failed_under_a_cipher_is_written_by_a_sync() {
+    a_runs_batch_is_written_again("sync", 1, under_cipher());
+}
+
+/// Under the buffered policy a `sync` is the call whose `Ok` promises
+/// the batch: the write again syncs whatever the policy, since the commit
+/// that failed may have owed the sync and its count is spent.
+#[test]
+fn a_runs_batch_whose_log_write_failed_under_a_buffered_cipher_is_written_by_a_sync() {
+    a_runs_batch_is_written_again(
+        "sync-buffered",
+        1,
+        Options {
+            sync: SyncPolicy::EveryN(u32::MAX),
+            ..under_cipher()
+        },
+    );
+}
+
+#[test]
+fn a_runs_batch_whose_log_write_failed_under_a_cipher_is_written_by_the_runs_next_commit() {
+    a_runs_batch_is_written_again("next", 2, under_cipher());
+}
+
+/// Under the buffered policy the run's next commit writes the batch again
+/// with its own and is as durable as that policy makes it: the frames are
+/// on the file and not synced, and the `flush` after it is the call whose
+/// `Ok` promises both (`SyncPolicy`).
+#[test]
+fn a_runs_batch_whose_log_write_failed_under_a_buffered_cipher_is_written_by_the_runs_next_commit()
+{
+    a_runs_batch_is_written_again(
+        "next-buffered",
+        3,
+        Options {
+            sync: SyncPolicy::EveryN(u32::MAX),
+            ..under_cipher()
+        },
+    );
+}
+
+/// A `flush` writes the run's batch again and syncs it whatever the
+/// policy, before the run closes into a segment.
+#[test]
+fn a_runs_batch_whose_log_write_failed_under_a_buffered_cipher_is_written_by_a_flush() {
+    a_runs_batch_is_written_again(
+        "flush-buffered",
+        4,
+        Options {
+            sync: SyncPolicy::EveryN(u32::MAX),
+            ..under_cipher()
+        },
+    );
+}
+
+/// The same failure under the buffered policy, acknowledged by a `sync`:
+/// a `sync` that returns `Ok` makes everything committed before it
+/// durable. The seal `sync` hands the live table to (`adaptive_shape`) is
+/// held before it writes anything, so the copy is the crash that falls
+/// between the answer and the seal, where the log is the store.
+#[test]
+fn a_sync_after_a_failed_log_write_makes_every_commit_before_it_durable() {
+    let d = dir("dur-walwrite-sync");
+    let crash = dir("dur-walwrite-sync-crash");
+    let opts = Options {
+        sync: SyncPolicy::EveryN(u32::MAX),
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    put_commit(&mut db, "k0", "v0").unwrap();
+    db.fail_next_wal_write(0);
+    assert!(put_commit(&mut db, "k1", "v1").is_err());
+    put_commit(&mut db, "k2", "v2").unwrap();
+    put_commit(&mut db, "k3", "v3").unwrap();
+    db.hold_seal_landing(true);
+    db.sync().unwrap();
+    copy_store(&d, &crash);
+    db.hold_seal_landing(false);
+    drop(db);
+    assert!(
+        seg_names(&crash).is_empty(),
+        "the held seal wrote nothing: the crash's store is its log alone"
+    );
+    let db = Db::open(&crash, opts).unwrap();
+    reads(&db, "k0", "v0", "sync");
+    reads(&db, "k1", "v1", "sync: the batch written again");
+    reads(&db, "k2", "v2", "sync: committed before it");
+    reads(&db, "k3", "v3", "sync: committed before it");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// After a failed write the log rotates by size (`seal_rotates_wal` off,
+/// the default) before any seal retires the closed file: the store opens,
+/// with every acknowledged commit, and with no gap in the sequence across
+/// the two files.
+#[test]
+fn a_store_whose_log_rotated_after_a_failed_write_opens_with_every_acknowledged_commit() {
+    let d = dir("dur-walwrite-rot");
+    let crash = dir("dur-walwrite-rot-crash");
+    let opts = Options {
+        seal_rotates_wal: false,
+        // The log passes `seal_bytes` before the memtable reaches the
+        // seal: a frame carries a header beside its key and value, and a
+        // `put` a delete frame as well.
+        seal_bytes: 64 << 10,
+        seal_max_pct: 0,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    put_commit(&mut db, "a0000000", "v").unwrap();
+    db.fail_next_wal_write(5);
+    assert!(put_commit(&mut db, "a0000001", "v").is_err());
+    let val = "x".repeat(100);
+    let mut acked: Vec<String> = Vec::new();
+    let mut i = 0u32;
+    while db.seal_waits().wal_rotations == 0 {
+        let k = format!("b{i:07}");
+        put_commit(&mut db, &k, &val).unwrap();
+        acked.push(k);
+        i += 1;
+        assert!(i < 10_000, "the log never rotated");
+    }
+    put_commit(&mut db, "c0000000", &val).unwrap();
+    acked.push("c0000000".into());
+    assert_eq!(
+        db.levels(),
+        (0, 0),
+        "nothing sealed: the closed file is not retired, the window under test"
+    );
+    copy_store(&d, &crash);
+    drop(db);
+    assert!(crash.join("wal-00000000").exists(), "the closed file");
+    assert!(
+        crash.join("wal-00000001").exists(),
+        "the file the rotation began"
+    );
+    let db = Db::open(&crash, opts).unwrap_or_else(|e| panic!("the crash opens: {e}"));
+    reads(&db, "a0000000", "v", "rotation");
+    reads(&db, "a0000001", "v", "rotation: the batch written again");
+    for k in &acked {
+        reads(&db, k, &val, "rotation: acknowledged under Always");
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// A failed write whose bytes cannot be cut back off the file leaves a
+/// log the next write would land behind a stray prefix in: the error is
+/// kept, every commit, sync and flush after it answers with it while
+/// reads go on, and the store opens again at what its log holds.
+#[test]
+fn a_failed_write_that_cannot_be_put_back_is_kept_until_the_store_is_reopened() {
+    let d = dir("dur-walwrite-stuck");
+    let opts = Options::default();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    put_commit(&mut db, "k0", "v0").unwrap();
+    db.fail_next_wal_write(5);
+    db.fail_next_wal_cut();
+    kept(
+        put_commit(&mut db, "k1", "v1"),
+        "the commit whose write could not be put back",
+    );
+    kept(put_commit(&mut db, "k2", "v2"), "a commit after");
+    kept(db.sync(), "a sync after");
+    kept(db.flush(), "a flush after");
+    kept(db.commit(), "a commit after a flush");
+    reads(&db, "k0", "v0", "reads go on");
+    kept(db.close(), "the close");
+    let mut db = Db::open(&d, opts.clone()).unwrap();
+    reads(&db, "k0", "v0", "reopened");
+    for k in ["k1", "k2"] {
+        let got = read_vec(&db, k.as_bytes());
+        assert!(got.len() <= 1, "reopened: {k} read back {got:?}");
+    }
+    put_commit(&mut db, "k4", "v4").expect("a reopened store commits again");
+    db.flush().unwrap();
+    reads(&db, "k4", "v4", "reopened");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Every call that writes the log keeps a write it could not put back,
+/// whichever it is: the call answers the kept error, and so does the
+/// commit after it; the store opens again at what its log holds.
+fn a_stray_write_is_kept(
+    tag: &str,
+    opts: Options,
+    run: bool,
+    call: fn(&mut Db) -> std::io::Result<()>,
+) {
+    let d = dir(&format!("dur-walwrite-stray-{tag}"));
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    if run {
+        db.append(b"a0", b"v0");
+        db.commit().unwrap();
+        assert_eq!(db.direct_runs(), (1, 1), "{tag}: the premise, a logged run");
+        db.append(b"a1", b"v1");
+    } else {
+        put_commit(&mut db, "a0", "v0").unwrap();
+        db.put(b"a1", b"v1");
+    }
+    db.fail_next_wal_write(5);
+    db.fail_next_wal_cut();
+    kept(
+        call(&mut db),
+        &format!("{tag}: the call whose write could not be put back"),
+    );
+    // The seam's own premise: the failed write's prefix reached the file,
+    // past what the log counts written, as a short write leaves it.
+    let (log, _, written) = db.wal_durable();
+    assert!(
+        std::fs::metadata(&log).unwrap().len() > written,
+        "{tag}: the failed write left its bytes on the file"
+    );
+    db.append(b"a2", b"v2");
+    kept(db.commit(), &format!("{tag}: a commit after"));
+    kept(db.sync(), &format!("{tag}: a sync after"));
+    reads(&db, "a0", "v0", &format!("{tag}: reads go on"));
+    drop(db);
+    let db = Db::open(&d, opts).unwrap_or_else(|e| panic!("{tag}: the store opens again: {e}"));
+    reads(&db, "a0", "v0", &format!("{tag}: reopened"));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_write_that_cannot_be_put_back_is_kept_by_a_sync() {
+    a_stray_write_is_kept("sync", Options::default(), false, |db| db.sync());
+}
+
+#[test]
+fn a_write_that_cannot_be_put_back_is_kept_by_a_flush() {
+    a_stray_write_is_kept("flush", Options::default(), false, |db| db.flush());
+}
+
+#[test]
+fn a_write_that_cannot_be_put_back_is_kept_by_a_seal() {
+    a_stray_write_is_kept("seal", Options::default(), false, |db| db.seal());
+    let rotates = Options {
+        seal_rotates_wal: true,
+        ..Options::default()
+    };
+    a_stray_write_is_kept("seal-rotates", rotates, false, |db| db.seal());
+}
+
+#[test]
+fn a_write_that_cannot_be_put_back_is_kept_by_a_runs_commit_under_a_cipher() {
+    a_stray_write_is_kept("run", under_cipher(), true, |db| db.commit());
+}
+
+/// Under the default policy a commit whose fdatasync failed leaves the
+/// store unable to answer `Ok` for anything after it until it is reopened,
+/// and an `Ok` that was given anyway is durable: every commit answered
+/// `Ok` reads back from the store as a power cut after a later, successful
+/// sync of the same file leaves it (`Db::fail_next_wal_sync`). The store
+/// is flushed first so its writes after go to the log and not to a direct
+/// run (a key below the store's greatest), the path of every update.
+fn a_commit_after_a_failed_sync(tag: &str, opts: Options) {
+    let d = dir(&format!("dur-walsync-commit-{tag}"));
+    let crash = dir(&format!("dur-walsync-commit-{tag}-crash"));
+    assert!(matches!(opts.sync, SyncPolicy::Always), "the premise");
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    for c in 0u32..100 {
+        db.append(format!("m{c:04}").as_bytes(), &c.to_le_bytes());
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.append(b"a-acked", b"A");
+    db.commit().unwrap();
+    db.fail_next_wal_sync();
+    db.append(b"b-failed", b"B");
+    assert!(
+        db.commit().is_err(),
+        "{tag}: the injected failure reached the log's sync"
+    );
+    db.append(b"c-after", b"C");
+    let c = db.commit();
+    copy_store(&d, &crash);
+    drop(db);
+    let reopened = Db::open(&crash, opts).expect("a store whose log lost unsynced frames opens");
+    assert_eq!(
+        read_vec(&reopened, b"a-acked"),
+        vec![b"A".to_vec()],
+        "{tag}"
+    );
+    for i in 0u32..100 {
+        assert_eq!(
+            read_vec(&reopened, format!("m{i:04}").as_bytes()),
+            vec![i.to_le_bytes().to_vec()],
+            "{tag}: the flushed keys"
+        );
+    }
+    if c.is_ok() {
+        assert_eq!(
+            read_vec(&reopened, b"c-after"),
+            vec![b"C".to_vec()],
+            "{tag}: a commit answered Ok after a failed sync of the log is durable"
+        );
+    }
+    kept(c, &format!("{tag}: the commit after a failed sync"));
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+#[test]
+fn a_commit_answered_ok_after_a_failed_log_sync_survives_a_crash() {
+    a_commit_after_a_failed_sync("plain", Options::default());
+}
+
+#[test]
+fn a_commit_answered_ok_after_a_failed_log_sync_survives_a_crash_under_a_cipher() {
+    a_commit_after_a_failed_sync("cipher", under_cipher());
+}
+
+/// Under a buffered policy `sync` is the promise: a `sync` after a failed
+/// one answers with the failure, and one answered `Ok` would have made
+/// every commit before it durable.
+#[test]
+fn a_sync_answered_ok_after_a_failed_one_makes_every_commit_before_it_durable() {
+    let d = dir("dur-walsync-sync");
+    let crash = dir("dur-walsync-sync-crash");
+    let opts = Options {
+        sync: SyncPolicy::EveryN(u32::MAX),
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    for c in 0u32..100 {
+        db.append(format!("m{c:04}").as_bytes(), &c.to_le_bytes());
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    for c in 0u32..20 {
+        db.append(format!("a{c:04}").as_bytes(), &c.to_le_bytes());
+        db.commit().unwrap();
+    }
+    db.fail_next_wal_sync();
+    assert!(
+        db.sync().is_err(),
+        "the injected failure reached the log's sync"
+    );
+    let again = db.sync();
+    copy_store(&d, &crash);
+    drop(db);
+    let reopened = Db::open(&crash, opts).expect("a store whose log lost unsynced frames opens");
+    for c in 0u32..100 {
+        assert_eq!(
+            read_vec(&reopened, format!("m{c:04}").as_bytes()),
+            vec![c.to_le_bytes().to_vec()],
+            "the flushed keys"
+        );
+    }
+    if again.is_ok() {
+        for c in 0u32..20 {
+            assert_eq!(
+                read_vec(&reopened, format!("a{c:04}").as_bytes()),
+                vec![c.to_le_bytes().to_vec()],
+                "a sync answered Ok after a failed one made the commits before it durable"
+            );
+        }
+    }
+    kept(again, "the sync after a failed one");
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// A failed fdatasync of the log is kept: every commit, sync, flush and
+/// transaction after it answers with it while reads go on; the close
+/// answers it too and seals nothing; and the store reopens at a prefix of
+/// what it acknowledged and commits again.
+#[test]
+fn a_failed_log_sync_is_kept_until_the_store_is_reopened() {
+    let d = dir("dur-walsync-kept");
+    let opts = Options::default();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    put_commit(&mut db, "a", "A").unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    put_commit(&mut db, "b", "B").unwrap();
+    db.fail_next_wal_sync();
+    let first = put_commit(&mut db, "c", "C");
+    // The seam fails the sync as a writeback out of space would.
+    let full = std::io::ErrorKind::StorageFull;
+    kept_as(first, full, "the commit whose sync failed");
+    kept_as(put_commit(&mut db, "d", "D"), full, "a commit after");
+    kept_as(db.commit(), full, "a commit of nothing after");
+    kept_as(db.sync(), full, "a sync after");
+    kept_as(db.flush(), full, "a flush after");
+    let mut t = db.begin();
+    t.append(b"e", b"E");
+    kept_as(t.commit(), full, "a transaction after");
+    kept_as(db.seal(), full, "a seal after");
+    reads(&db, "a", "A", "reads go on");
+    reads(&db, "b", "B", "reads go on");
+    let segs = seg_names(&d);
+    kept(db.close(), "the close");
+    assert_eq!(
+        seg_names(&d),
+        segs,
+        "the close under a kept error sealed nothing"
+    );
+    let mut db = Db::open(&d, opts).unwrap();
+    reads(&db, "a", "A", "reopened: flushed");
+    reads(&db, "b", "B", "reopened: synced before the failure");
+    assert!(
+        read_vec(&db, b"c").is_empty(),
+        "reopened: the frames the failed sync lost"
+    );
+    put_commit(&mut db, "f", "F").expect("a reopened store commits again");
+    db.sync().expect("and syncs");
+    reads(&db, "f", "F", "reopened");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A buffered store whose log has rotated by size with frames no sync had
+/// covered: a loose file, synced by the first sync after it, behind the
+/// directory fsync the new file's name is owed.
+fn rotated_loose(tag: &str) -> (PathBuf, Db) {
+    let d = dir(&format!("dur-walsync-{tag}"));
+    let opts = Options {
+        sync: SyncPolicy::EveryN(u32::MAX),
+        seal_rotates_wal: false,
+        seal_bytes: 64 << 10,
+        seal_max_pct: 0,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let val = "x".repeat(100);
+    let mut i = 0u32;
+    while db.seal_waits().wal_rotations == 0 {
+        put_commit(&mut db, &format!("b{i:07}"), &val).unwrap();
+        i += 1;
+        assert!(i < 10_000, "the log never rotated");
+    }
+    assert!(
+        db.seal_waits().rotated_unsynced > 0,
+        "{tag}: a loose rotation"
+    );
+    (d, db)
+}
+
+/// A failed fdatasync of a loose log file is kept.
+#[test]
+fn a_failed_sync_of_a_loose_log_file_is_kept() {
+    let (d, mut db) = rotated_loose("loose");
+    db.fail_next_loose_wal_sync();
+    assert!(
+        db.sync().is_err(),
+        "the injected failure reached the loose file"
+    );
+    kept(db.sync(), "the sync after");
+    kept(put_commit(&mut db, "z", "Z"), "a commit after");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A failed fsync of the directory a rotation owes its new log file is
+/// kept, where the sync by policy owes it.
+#[test]
+fn a_failed_sync_of_the_log_directory_is_kept() {
+    let (d, mut db) = rotated_loose("dir");
+    db.fail_next_wal_dir_sync();
+    assert!(
+        db.sync().is_err(),
+        "the injected failure reached the barrier"
+    );
+    kept(db.sync(), "the sync after");
+    kept(put_commit(&mut db, "z", "Z"), "a commit after");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The same where a rotation under `Always` owes the barrier itself: the
+/// commit that rotated was synced into the closed file and answers `Ok`,
+/// and everything after answers the kept error.
+#[test]
+fn a_failed_sync_of_the_log_directory_at_a_rotation_is_kept() {
+    let d = dir("dur-walsync-dir-always");
+    let opts = Options {
+        seal_rotates_wal: false,
+        seal_bytes: 64 << 10,
+        seal_max_pct: 0,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    db.fail_next_wal_dir_sync();
+    let val = "x".repeat(100);
+    let mut i = 0u32;
+    while db.seal_waits().wal_rotations == 0 {
+        put_commit(&mut db, &format!("b{i:07}"), &val).unwrap();
+        i += 1;
+        assert!(i < 10_000, "the log never rotated");
+    }
+    assert!(
+        put_commit(&mut db, "y", "Y").is_err(),
+        "the rotation's error"
+    );
+    kept(put_commit(&mut db, "z", "Z"), "a commit after");
+    kept(db.sync(), "a sync after");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
 }

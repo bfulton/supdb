@@ -172,6 +172,29 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
 /// It exists because the device was measured serving ~2,700 barriers a
 /// second however they are issued -- sharding cannot scale past 1.6x --
 /// so on a barrier-bound device the lever is fewer barriers per record.
+///
+/// Under either policy a write of the log the device refuses fails the
+/// commit that made it, and the batch stays staged: the next commit writes
+/// it again with its own, from that commit on both are visible together,
+/// and they reach the device together, as durable as that commit's policy
+/// makes it -- synced by it under `Always`, by the next sync `EveryN`
+/// makes otherwise -- while a `sync` writes and syncs them whatever the
+/// policy, and a `flush` makes them durable with the rest of the store.
+/// An ordered run's batch under a cipher is the one
+/// exception to the visibility: the run's table marks it before the log
+/// is written, so a reader sees it from the commit that failed, while it
+/// is on no device. Its durability follows the same rule: the run's next
+/// commit writes it with its own, durable as that commit's policy makes
+/// it, and a commit with nothing new for the run, a `sync` or a `flush`
+/// writes and syncs it whatever the policy. A failed sync of the log -- its fdatasync, a closed
+/// file's, or the directory's fsync a new log file's name needs -- is never
+/// retried, since Linux reports a writeback error once and a later sync of
+/// the same file answers `Ok` over bytes the device does not hold: every
+/// commit, `sync` and `flush` after it answers with that error until the
+/// store is reopened, while reads go on, and the open finds a prefix of
+/// what was acknowledged before the failure and whatever the device kept
+/// of the rest. So does a failed write whose bytes cannot be cut back off
+/// the log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncPolicy {
     /// One fdatasync per commit. Durable per batch, LMDB's boundary.
@@ -4110,6 +4133,19 @@ struct Wal {
     enc: Option<vault::LogCipher>,
     /// The record being sealed.
     sealed: Vec<u8>,
+    /// A test's (`Db::fail_next_wal_write`): the next `write` hands the
+    /// file the first this-many bytes of what it writes and then fails, as
+    /// a write the device refused part way, or at zero whole, would; under
+    /// a cipher, `SEAL_FAILS` fails the record's seal before anything is
+    /// written (`Db::fail_next_wal_seal`).
+    fail_next: Option<usize>,
+    /// A test's (`Db::fail_next_wal_cut`): the next cut of a failed
+    /// write's bytes back off the file fails.
+    fail_cut: bool,
+    /// A failed write's bytes are on the file past `written` and could not
+    /// be cut back off it (`put_back`): a write after them would land
+    /// behind them, so the writer keeps the error (`Db::lost`).
+    stray: bool,
 }
 
 /// The WAL file starts with eight bytes, this name and a kind byte, so a
@@ -4173,8 +4209,28 @@ fn wal_seed(id: u64) -> u32 {
 /// Frame kinds. A batch is the frames between commit frames, and replay
 /// applies a batch only once its commit frame has been read intact.
 const WAL_PUT: u8 = 0;
+/// `Db::fail_log_sync`'s bits, a test's: which sync of the log fails next.
+const FAIL_SYNC_LIVE: u8 = 1;
+const FAIL_SYNC_LOOSE: u8 = 2;
+const FAIL_SYNC_DIR: u8 = 4;
+
+/// What every commit, sync and flush answers once the store has kept an
+/// error it cannot take back (`Db::lost`): the kept error, in words that
+/// say what the store is doing about it.
+fn lost_answer(e: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        e.kind(),
+        format!(
+            "the log may not hold what the store acknowledged after a device error, \
+             so the store answers no commit, sync or flush until it is reopened: {e}"
+        ),
+    )
+}
 const WAL_DEL: u8 = 1;
 const WAL_COMMIT: u8 = 2;
+
+/// `Wal::fail_next`'s value for a test's failed seal under a cipher.
+const SEAL_FAILS: usize = usize::MAX;
 
 impl Wal {
     fn create(path: &Path, id: u64, kind: u8) -> Result<Wal> {
@@ -4194,6 +4250,9 @@ impl Wal {
             head: head.len() as u64,
             enc,
             sealed: Vec::new(),
+            fail_next: None,
+            fail_cut: false,
+            stray: false,
         })
     }
 
@@ -4296,6 +4355,9 @@ impl Wal {
                 head: head.len() as u64,
                 enc: Some(enc),
                 sealed: Vec::new(),
+                fail_next: None,
+                fail_cut: false,
+                stray: false,
             });
         }
         vault::rename(spare, path)?;
@@ -4315,6 +4377,9 @@ impl Wal {
             head: WAL_MAGIC.len() as u64,
             enc: None,
             sealed: Vec::new(),
+            fail_next: None,
+            fail_cut: false,
+            stray: false,
         })
     }
 
@@ -4369,6 +4434,9 @@ impl Wal {
             head,
             enc,
             sealed: Vec::new(),
+            fail_next: None,
+            fail_cut: false,
+            stray: false,
         })
     }
 
@@ -4439,15 +4507,40 @@ impl Wal {
         }
         match &mut self.enc {
             None => {
-                self.file.write_all(&self.pending)?;
+                let r = if self.fail_next.is_some() {
+                    Err(self.fail_injected())
+                } else {
+                    self.file.write_all(&self.pending)
+                };
+                if let Err(e) = r {
+                    return Err(self.put_back(e));
+                }
                 self.written += self.pending.len() as u64;
             }
             // One record for what is pending, which is whole batches: every
             // write follows a `mark_commit`, so a record that fails its
             // check takes whole commits with it and no part of one.
             Some(enc) => {
-                enc.seal_into(self.written, &self.pending, &mut self.sealed)?;
-                self.file.write_all(&self.sealed)?;
+                // The seal's seam asked apart from the write's, so a seal
+                // that fails reaches the check below as a real one would.
+                let mut r = if self.fail_next == Some(SEAL_FAILS) {
+                    self.fail_next = None;
+                    Err(std::io::Error::other(
+                        "injected: the log record's seal failed",
+                    ))
+                } else {
+                    enc.seal_into(self.written, &self.pending, &mut self.sealed)
+                };
+                if r.is_ok() {
+                    r = if self.fail_next.is_some() {
+                        Err(self.fail_injected())
+                    } else {
+                        self.file.write_all(&self.sealed)
+                    };
+                }
+                if let Err(e) = r {
+                    return Err(self.put_back(e));
+                }
                 self.written += self.sealed.len() as u64;
             }
         }
@@ -4458,6 +4551,80 @@ impl Wal {
     fn sync(&mut self) -> Result<()> {
         self.file.sync_data()?;
         self.synced = self.written;
+        Ok(())
+    }
+
+    /// A write the device refused, put back as it was before it: the
+    /// batch's commit frame taken off what is pending, and the sequence
+    /// number it took given back, so the batch's records stay staged and
+    /// join whatever the next commit closes, under that commit's frame,
+    /// with no gap in the sequence -- the records are in the memtable
+    /// already, uncommitted, and the next commit makes them visible with
+    /// its own; and whatever reached the file cut back off it, the cursor
+    /// at `written`, so the next write lands where this one should have.
+    /// Two batches under two frames would need each commit frame's CRC
+    /// taken from its own batch's start, a position kept on every commit,
+    /// where this costs nothing until a write fails. A file that cannot
+    /// be cut back is marked (`stray`), for the writer to keep the error.
+    #[cold]
+    #[inline(never)]
+    fn put_back(&mut self, e: std::io::Error) -> std::io::Error {
+        // Every write follows a `mark_commit`, so what is pending ends in
+        // the commit frame: header, sequence, kind and the batch's CRC.
+        const COMMIT_FRAME: usize = FRAME_HEADER + 8 + 1 + 4;
+        let at = self.pending.len() - COMMIT_FRAME;
+        debug_assert_eq!(self.pending[at + FRAME_HEADER + 8], WAL_COMMIT);
+        self.pending.truncate(at);
+        self.seq -= 1;
+        let cut = if std::mem::take(&mut self.fail_cut) {
+            Err(std::io::Error::other("injected: the log's cut back failed"))
+        } else {
+            self.file
+                .set_len(self.written)
+                .and_then(|()| self.file.seek(SeekFrom::Start(self.written)).map(|_| ()))
+        };
+        if let Err(c) = cut {
+            self.stray = true;
+            return std::io::Error::new(
+                e.kind(),
+                format!("{e}; and the log could not be cut back after it: {c}"),
+            );
+        }
+        e
+    }
+
+    /// A test's (`Db::fail_next_wal_write`): the first `fail_next` bytes
+    /// of what this write would hand the file handed to it, and then an
+    /// error, which is what `write_all` leaves after a short write and a
+    /// failed one: the prefix on the file and the cursor past it.
+    #[cold]
+    #[inline(never)]
+    fn fail_injected(&mut self) -> std::io::Error {
+        let after = self.fail_next.take().unwrap_or(0);
+        let bytes = if self.enc.is_some() {
+            &self.sealed
+        } else {
+            &self.pending
+        };
+        if let Err(e) = self.file.write_all(&bytes[..after.min(bytes.len())]) {
+            return e;
+        }
+        std::io::Error::other("injected: the log's write failed")
+    }
+
+    /// A test's (`Db::fail_next_wal_sync`): the bytes no sync has covered
+    /// made what a device that failed their writeback holds -- zeros in a
+    /// fresh file -- through a handle of its own, as `chain` writes, since
+    /// this one may be in append mode.
+    #[cold]
+    #[inline(never)]
+    fn lose_unsynced(&mut self) -> Result<()> {
+        let from = self.synced.max(self.head);
+        if self.written > from {
+            let mut f = vault::open_write(&self.path)?;
+            f.seek(SeekFrom::Start(from))?;
+            f.write_all(&vec![0u8; (self.written - from) as usize])?;
+        }
         Ok(())
     }
 
@@ -16245,10 +16412,29 @@ pub struct Db {
     /// comes after its commit's batch is written and must not be read as
     /// that batch failing.
     pending_err: Option<std::io::Error>,
-    /// A rotated WAL whose directory entry has not been made durable: the
-    /// barrier failed after the rotation's bookkeeping, and every commit
-    /// retries it before it writes, so nothing is acknowledged into a file
-    /// a crash could lose the name of (`Db::wal_dir_barrier`).
+    /// The first error after which the device may not hold what the store
+    /// told it to: a failed fdatasync or fsync of the log -- the live file,
+    /// a loose one, the directory a rotation owes its new file -- or a
+    /// failed write of the log whose bytes could not be cut back off it.
+    /// Linux reports a writeback error once per open file description and
+    /// marks the pages clean, so a later sync of the same file answers
+    /// `Ok` over bytes that never reached the device: nothing is retried,
+    /// and every commit, sync and flush after it answers with this until
+    /// the store is reopened (`Db::keep_lost`), through `pending_err`,
+    /// which is filled again each time it is taken while this stands, so
+    /// the check every such call makes already is the only one. Reads go
+    /// on.
+    lost: Option<std::io::Error>,
+    /// A test's: the next sync of the live log (`FAIL_SYNC_LIVE`), of a
+    /// loose file (`FAIL_SYNC_LOOSE`) or of the directory a rotation owes
+    /// its new file (`FAIL_SYNC_DIR`) fails, as a failed fdatasync or fsync
+    /// would; see `Db::fail_next_wal_sync`.
+    fail_log_sync: u8,
+    /// A rotated WAL whose directory entry has not been made durable: owed
+    /// by a loose rotation to the first sync by policy, so nothing is
+    /// acknowledged into a file a crash could lose the name of
+    /// (`Db::wal_dir_barrier`); a barrier that failed is kept
+    /// (`Db::lost`) and not retried.
     wal_dir_unsynced: bool,
     /// Commits written since the last barrier, for `SyncPolicy::EveryN`.
     unsynced: u32,
@@ -26999,9 +27185,10 @@ impl Db {
     /// after the barrier, a failed directory fsync left the writer on a
     /// file at sequence zero under the old id, whose commits replay
     /// skipped as covered, and the next rotation created the same name
-    /// over the live file and retired it. A failed barrier is sticky
-    /// instead (`wal_dir_unsynced`) and the next sync by policy retries
-    /// it first.
+    /// over the live file and retired it. A failed barrier is kept
+    /// (`Db::lost`): a directory's writeback error is reported once, as a
+    /// file's is, so a retry that succeeded promised a name it had not
+    /// made durable.
     ///
     /// The frames the policy has left unsynced stay so. The rotation
     /// synced them once, so that replay would never meet a gap: an
@@ -27053,7 +27240,8 @@ impl Db {
     /// forgotten, then the live file's header chained, since nothing
     /// before it is loose any more, and the live file itself; `unsynced`
     /// starts over. A loose file a landing has retired meanwhile is
-    /// covered by a durable segment, and its absence is no error.
+    /// covered by a durable segment, and its absence is no error. A sync
+    /// of any of them that fails is kept (`Db::lost`), never retried.
     fn sync_wal(&mut self) -> Result<()> {
         // A wait on the device, in an operation that is pinned through it
         // and reads nothing of the store's files here: said so, for a
@@ -27067,7 +27255,17 @@ impl Db {
         while let Some(p) = self.loose_wals.first().cloned() {
             match vault::open(&p) {
                 Ok(f) => {
-                    f.sync_data()?;
+                    let r = if self.fail_log_sync & FAIL_SYNC_LOOSE != 0 {
+                        self.fail_log_sync &= !FAIL_SYNC_LOOSE;
+                        Err(std::io::Error::other(
+                            "injected: a loose log file's fdatasync failed",
+                        ))
+                    } else {
+                        f.sync_data()
+                    };
+                    if let Err(e) = r {
+                        return Err(self.keep_lost(e));
+                    }
                     SealCounts::add(&self.shared.seal_counts.loose_synced, 1);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -27076,20 +27274,81 @@ impl Db {
             self.loose_wals.remove(0);
         }
         self.wal.chain()?;
-        self.wal.sync()?;
+        let r = if self.fail_log_sync & FAIL_SYNC_LIVE != 0 {
+            self.fail_log_sync &= !FAIL_SYNC_LIVE;
+            self.wal.lose_unsynced()?;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "injected: the log's fdatasync failed",
+            ))
+        } else {
+            self.wal.sync()
+        };
+        if let Err(e) = r {
+            return Err(self.keep_lost(e));
+        }
         self.wal.drop_synced(self.opts.wal_drop_bytes as u64);
         self.unsynced = 0;
         Ok(())
     }
 
-    /// The directory fsync a rotation owes its new file, retried by the
-    /// syncs by policy after it until it succeeds; see `wal_dir_unsynced`.
+    /// The directory fsync a rotation owes its new file, paid once: a
+    /// failure is kept (`Db::lost`) and never retried; see
+    /// `wal_dir_unsynced`.
     fn wal_dir_barrier(&mut self) -> Result<()> {
         if self.wal_dir_unsynced {
-            vault::sync_dir(&self.dir)?;
+            let r = if self.fail_log_sync & FAIL_SYNC_DIR != 0 {
+                self.fail_log_sync &= !FAIL_SYNC_DIR;
+                Err(std::io::Error::other(
+                    "injected: the log directory's fsync failed",
+                ))
+            } else {
+                vault::sync_dir(&self.dir)
+            };
+            if let Err(e) = r {
+                return Err(self.keep_lost(e));
+            }
             self.wal_dir_unsynced = false;
         }
         Ok(())
+    }
+
+    /// `e` kept as the store's lost durability (`Db::lost`), the first
+    /// such error and no later one, and what every call answers from here
+    /// on: this one, and through `pending_err` the next.
+    #[cold]
+    #[inline(never)]
+    fn keep_lost(&mut self, e: std::io::Error) -> std::io::Error {
+        let first = self.lost.get_or_insert(e);
+        let answer = lost_answer(first);
+        if self.pending_err.is_none() {
+            self.pending_err = Some(lost_answer(first));
+        }
+        answer
+    }
+
+    /// `pending_err`'s error, taken as the answer of the call that found
+    /// it, and the kept error put back for the next call while one stands
+    /// (`Db::lost`).
+    #[cold]
+    #[inline(never)]
+    fn answer_pending(&mut self, e: std::io::Error) -> std::io::Error {
+        if let Some(l) = &self.lost {
+            self.pending_err = Some(lost_answer(l));
+        }
+        e
+    }
+
+    /// A failed write of the log: put back by `Wal::write`, and the next
+    /// commit writes the batch again, unless its bytes could not be cut
+    /// back off the file, which is kept (`Db::lost`).
+    #[cold]
+    #[inline(never)]
+    fn wal_write_failed(&mut self, e: std::io::Error) -> std::io::Error {
+        if self.wal.stray {
+            return self.keep_lost(e);
+        }
+        e
     }
 
     /// Whether a commit past the seal threshold seals now: always, unless
@@ -27538,6 +27797,8 @@ impl Db {
             built_ahead_len: 0,
             built_ahead_gen: 0,
             pending_err: None,
+            lost: None,
+            fail_log_sync: 0,
             wal_dir_unsynced: false,
             keeper: None,
             upkeeper: None,
@@ -27578,7 +27839,9 @@ impl Db {
     /// one a seal renamed into place and never synced, swept here. The WAL
     /// replays whatever outlived the last seal, torn tail tolerated. A
     /// directory with no segments and only a WAL is a store killed before
-    /// its first seal, and it opens -- the brief's P-E.
+    /// its first seal, and it opens -- the brief's P-E. An open is also how
+    /// a store that kept a failed sync of its log answers commits again
+    /// (`SyncPolicy`): it reads what the device holds.
     pub fn open(dir: &Path, mut opts: Options) -> Result<Db> {
         check_options(&opts)?;
         // Before anything is read, the store held to the way it is asked
@@ -28146,6 +28409,8 @@ impl Db {
             built_ahead_len: 0,
             built_ahead_gen: 0,
             pending_err: None,
+            lost: None,
+            fail_log_sync: 0,
             wal_dir_unsynced: false,
             keeper: None,
             upkeeper: None,
@@ -28487,10 +28752,21 @@ impl Db {
     /// If the memtable has crossed the seal threshold, seal after the
     /// commit -- after, so the batch's durability never waits on a segment
     /// write.
+    ///
+    /// An error from the log's write leaves the batch staged for the next
+    /// commit, `sync` or `flush` to write -- durable as that commit's
+    /// policy makes it, and whatever the policy at a `sync` or a `flush`
+    /// -- and invisible to readers until
+    /// then -- except an ordered run's under a cipher, which readers see
+    /// from the failed commit on, before any device holds it, since the
+    /// run marks its table before its log write (`SyncPolicy`).
+    /// An error from its sync is kept: this commit and
+    /// every commit, `sync` and `flush` after it answer with it until the
+    /// store is reopened (`SyncPolicy`).
     pub fn commit(&mut self) -> Result<()> {
         let _op = self.op();
         if let Some(e) = self.pending_err.take() {
-            return Err(e);
+            return Err(self.answer_pending(e));
         }
         if let Some(e) = self.shared.take_maint_err() {
             return Err(e);
@@ -28508,7 +28784,9 @@ impl Db {
             self.commit_direct()?;
         } else {
             self.wal.mark_commit();
-            self.wal.write()?;
+            if let Err(e) = self.wal.write() {
+                return Err(self.wal_write_failed(e));
+            }
             self.mem().commit();
             self.unsynced += 1;
             let due = match self.opts.sync {
@@ -28660,7 +28938,7 @@ impl Db {
     /// frames otherwise. What `sync` and `flush` do before anything else.
     fn commit_staged(&mut self) -> Result<()> {
         if let Some(e) = self.pending_err.take() {
-            return Err(e);
+            return Err(self.answer_pending(e));
         }
         // As in `commit`: nothing is staged after a hand-off.
         if self.mem_handed.is_some() {
@@ -28673,11 +28951,15 @@ impl Db {
             // made whatever the policy was cost a buffered drain a
             // fdatasync of the whole log before its seal began
             // (`Options::drain_syncs_wal`). A sync owed and not yet paid
-            // -- a failed one, or the staged frames under `Always` -- is
-            // paid here; one the log holds nothing for is skipped.
+            // -- the staged frames under `Always`, or what an `EveryN`
+            // left -- is paid here; one the log holds nothing for is
+            // skipped. A failed one is never owed: it is kept
+            // (`Db::lost`), and this call answered it above.
             let staged = !self.wal.pending.is_empty();
             self.wal.mark_commit();
-            self.wal.write()?;
+            if let Err(e) = self.wal.write() {
+                return Err(self.wal_write_failed(e));
+            }
             self.mem().commit();
             if staged {
                 self.unsynced += 1;
@@ -28704,6 +28986,18 @@ impl Db {
     /// policy asks for. The segment is their log; the WAL never sees them.
     fn commit_direct(&mut self) -> Result<()> {
         if self.direct.as_ref().map_or(0, |d| d.committed) == self.mem().len() {
+            // Nothing new for the run's file. Under a cipher a batch whose
+            // log write failed is the run's and in the table, and its
+            // frames wait in the log, put back without their commit frame
+            // (`Wal::put_back`): this call is the commit that closes them
+            // and writes them again. Nothing else leaves frames pending
+            // under an ordered table: a run opens only over an empty log
+            // (`direct_can_open`), and every write that stages a frame
+            // leaves the run first (`leave_direct`), so frames pending here
+            // are a logged run's and the test asks nothing of the table.
+            if !self.wal.pending.is_empty() {
+                return self.log_run_again();
+            }
             return Ok(());
         }
         if self.direct.is_none() {
@@ -28875,6 +29169,9 @@ impl Db {
     #[cold]
     #[inline(never)]
     fn log_run(&mut self, mem: &MemTable, due: bool) -> Result<()> {
+        // Moved before the write: a failed write leaves the frames staged
+        // in the log (`Wal::put_back`), and the next call closes them
+        // under its own commit frame, so they are never staged twice.
         let from = match self.direct.as_mut() {
             Some(d) => std::mem::replace(&mut d.logged, mem.len()),
             None => return Ok(()),
@@ -28885,7 +29182,9 @@ impl Db {
                 .append(mem.key_of(e), mem.value_at(MemTable::head(e) as usize));
         }
         self.wal.mark_commit();
-        self.wal.write()?;
+        if let Err(e) = self.wal.write() {
+            return Err(self.wal_write_failed(e));
+        }
         let runs = &self.shared.runs;
         if from == 0 {
             runs[0].fetch_add(1, AtomicOrdering::Relaxed);
@@ -28896,6 +29195,18 @@ impl Db {
         }
         self.rotate_wal_by_size();
         Ok(())
+    }
+
+    /// A run's batch whose log write failed, closed and written by a
+    /// call with nothing new for the run (`commit_direct`): `log_run` with
+    /// no entry past what it logged, so the commit frame closes the frames
+    /// put back, and synced whatever the policy, since the commit that
+    /// failed may have owed the sync and its count is spent.
+    #[cold]
+    #[inline(never)]
+    fn log_run_again(&mut self) -> Result<()> {
+        let mem = self.r.mem().clone();
+        self.log_run(&mem, true)
     }
 
     /// The direct run closed: its segment finished, indexed and linked
@@ -29107,7 +29418,7 @@ impl Db {
     pub fn seal(&mut self) -> Result<()> {
         let _op = self.op();
         if let Some(e) = self.pending_err.take() {
-            return Err(e);
+            return Err(self.answer_pending(e));
         }
         // A table a sync handed to a seal is already going: what is live
         // after this is a fresh table, and empty.
@@ -29120,7 +29431,9 @@ impl Db {
         }
         if self.opts.seal_rotates_wal {
             self.wal.mark_commit();
-            self.wal.write()?;
+            if let Err(e) = self.wal.write() {
+                return Err(self.wal_write_failed(e));
+            }
             self.mem().commit();
             self.sync_wal()?;
         } else {
@@ -29129,7 +29442,9 @@ impl Db {
             // the file, so nothing about the seal needs the log synced.
             let staged = !self.wal.pending.is_empty();
             self.wal.mark_commit();
-            self.wal.write()?;
+            if let Err(e) = self.wal.write() {
+                return Err(self.wal_write_failed(e));
+            }
             self.mem().commit();
             if staged {
                 self.unsynced += 1;
@@ -29165,7 +29480,7 @@ impl Db {
         // the seal: commits into it are acknowledged from here on, and an
         // fdatasync of the file does not promise the entry that names it.
         // One directory barrier per seal, off the per-commit path, and a
-        // failed one sticky for the next commit to retry, as a size
+        // failed one kept for every commit after to answer, as a size
         // rotation's is (`rotate_wal`); the seal itself goes on, since it
         // needs nothing of the new file.
         if self.opts.seal_rotates_wal {
@@ -29628,6 +29943,10 @@ impl Db {
     /// caller wants when it has stopped writing for now and will read the
     /// tail out of memory; `flush` is the other answer, and the difference
     /// was priced at 11% of a canonical load window.
+    ///
+    /// An `Ok` is durability for every commit before it. After a failed
+    /// sync of the log every `sync` answers that error until the store is
+    /// reopened (`SyncPolicy`).
     pub fn sync(&mut self) -> Result<()> {
         let _op = self.op();
         self.commit_staged()?;
@@ -29771,6 +30090,10 @@ impl Db {
     /// sealed without draining and every scan walked the 550k-key frozen
     /// table for the rest of the phase -- the same artifact the seal was
     /// supposed to remove, back through the side door.
+    ///
+    /// After a failed sync of the log a flush seals nothing and answers
+    /// that error, as every flush does until the store is reopened
+    /// (`SyncPolicy`).
     pub fn flush(&mut self) -> Result<()> {
         let _op = self.op();
         self.shared.drain_steps.stamp(0);
@@ -31237,6 +31560,56 @@ impl Db {
         self.shared
             .fail_presync
             .store(true, AtomicOrdering::Release);
+    }
+
+    /// A test's: the live log's next write hands the file the first
+    /// `after` bytes of what it writes and then fails, as a device error
+    /// part way through the write would; at zero, a write that failed
+    /// whole. The commit that makes the write answers the error.
+    #[doc(hidden)]
+    pub fn fail_next_wal_write(&mut self, after: usize) {
+        self.wal.fail_next = Some(after);
+    }
+
+    /// A test's: under a cipher, the live log's next record fails to
+    /// seal, as a commit too large for one record would, and nothing of
+    /// it is written. The commit that makes the write answers the error.
+    #[doc(hidden)]
+    pub fn fail_next_wal_seal(&mut self) {
+        self.wal.fail_next = Some(SEAL_FAILS);
+    }
+
+    /// A test's: the next cut of a failed write's bytes back off the live
+    /// log fails, as an ftruncate the device refused would.
+    #[doc(hidden)]
+    pub fn fail_next_wal_cut(&mut self) {
+        self.wal.fail_cut = true;
+    }
+
+    /// A test's: the next fdatasync of the live log fails, and the frames
+    /// it was to cover are lost, as Linux loses pages whose writeback
+    /// failed and marks them clean: zeroed in the file (`Wal::lose_unsynced`),
+    /// so a copy of the store is what a power cut after a later sync that
+    /// succeeded leaves. The error is of the kind a writeback that ran
+    /// out of space reports (`ErrorKind::StorageFull`), so a test can see
+    /// the kind carried to every answer after it.
+    #[doc(hidden)]
+    pub fn fail_next_wal_sync(&mut self) {
+        self.fail_log_sync |= FAIL_SYNC_LIVE;
+    }
+
+    /// A test's: the next fdatasync of a log file a loose rotation closed
+    /// (`Db::sync_wal`) fails.
+    #[doc(hidden)]
+    pub fn fail_next_loose_wal_sync(&mut self) {
+        self.fail_log_sync |= FAIL_SYNC_LOOSE;
+    }
+
+    /// A test's: the next fsync of the directory a rotation owes its new
+    /// log file (`Db::wal_dir_barrier`) fails.
+    #[doc(hidden)]
+    pub fn fail_next_wal_dir_sync(&mut self) {
+        self.fail_log_sync |= FAIL_SYNC_DIR;
     }
 
     #[doc(hidden)]
