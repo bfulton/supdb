@@ -5124,9 +5124,11 @@ pub(super) struct Built {
 
 /// What a form file a build wrote holds: the block body in one of the
 /// selector's two codings (`zselect::Coding`) -- the compressed coding the
-/// options give, or the record coding's groups with their tails stored raw,
-/// what the segment work's record of the files' codings calls raw-tailed
-/// (`Maint::z_ahead_coding`) -- or the stride body.
+/// options give, or the record coding's groups with their tails stored raw
+/// -- or the stride body. The body, and not the segment work's record of
+/// the files' codings (`Maint::z_ahead_coding`), which keeps the plan's
+/// flag (`z_coded_record`): the two part where a plan asks for raw tails
+/// under the block coding, a block body the record calls raw-tailed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FileCoding {
     Block,
@@ -5271,7 +5273,12 @@ impl Outcome {
     /// (`Seg::z_stride_no`): the reason it was not built, where this names
     /// one, and none where a stride file was. Every other outcome -- a block
     /// file built where nothing asked for the stride form, a decline, a
-    /// cancel -- leaves the cell as it was, since none of them looked.
+    /// cancel -- leaves the cell as it was. A decline or a cancel of the
+    /// block body under `StrideAsk::OrBlock` after the stride walk declined
+    /// late is one of them and carries no reason, though the walk looked:
+    /// a cancelled build's rebuild walks again and finds it, and a partition
+    /// the block form declines is one no form file serves, which a
+    /// conversion -- of a partition a block file serves -- never asks of.
     pub(super) fn note_stride(&self, cell: &AtomicU8) {
         let code = match self {
             Outcome::NotStride(why) => why.code(),
@@ -5978,10 +5985,9 @@ fn write_pages(
     }
     let (res, rf) = fence.encode_resident(&bloom.words())?;
     w.push(&res)?;
-    let t = Trailer {
+    let mut t = Trailer {
         n_pages: u64::from(pages),
         n_entries: fence.len() as u64,
-        nkeys: nkeys as u64,
         res_off: u64::from(pages) * ZPAGE as u64,
         res_len: rf.res_len,
         keys_len: rf.keys_len,
@@ -5990,22 +5996,12 @@ fn write_pages(
         res_crc: rf.res_crc,
         filter: true,
         total_ulen,
-        seg_recs_len: facts.recs_len,
-        seg_crc_off: facts.crc_off,
-        seg_key_off: facts.key_off,
-        seg_hash_cap: facts.hash_cap,
-        seg_file_len: facts.file_len,
-        seg_timestamp: facts.timestamp,
-        seg_generation: facts.generation,
-        seg_row_crc: facts.row_crc,
-        rec_version: facts.rec_version,
-        rec_magic: facts.rec_magic,
-        seg_id: id,
-        seg_end_seq: end_seq,
         bloom_probes: super::BLOOM_PROBES,
         bloom_sig: super::BLOOM_SIG,
         bloom_bits_per_key: super::BLOOM_BITS_PER_KEY,
+        ..Trailer::default()
     };
+    t.set_seg(&seg_ident_of(facts, id, end_seq));
     w.push(&t.encode())?;
     w.flush()?;
     if plan.drop_output {
@@ -6013,11 +6009,6 @@ fn write_pages(
     }
     let file_bytes = w.at;
     debug_assert_eq!(Some(file_bytes), t.expected_file_len());
-    debug_assert_eq!(
-        t.seg_ident(),
-        seg_ident_of(facts, id, end_seq),
-        "the two writers' accounts of one segment"
-    );
     Ok(Outcome::Built(Built {
         fill: scratch.stats,
         file_bytes,
@@ -6040,7 +6031,8 @@ fn write_pages(
 /// under the name fields `id` and `end_seq`: what a writer records of the
 /// segment in either kind of trailer, and what the attach holds a trailer
 /// to (`same_segment`). The one mapping of the live segment's account into
-/// the trailers' shape; the block writer's trailer is held to it.
+/// the trailers' shape, which both writers fill their trailers from
+/// (`Trailer::set_seg`, `StrideTrailer::seg`).
 fn seg_ident_of(facts: &ZSource, id: u64, end_seq: u64) -> SegIdent {
     SegIdent {
         seg_id: id,
@@ -6217,6 +6209,14 @@ fn stride_key_is(
 /// that declines under `StrideAsk::Only` drops what it read, since nothing
 /// reads it next; under `OrBlock` the block walk reads it next and drops it
 /// as that walk does.
+///
+/// The output is not warm in the same way under `BuildPlan::drop_output`:
+/// its sink writes back and drops each piece as the next goes out, so the
+/// read-back reads the file from the device, and the drop after it drops
+/// what that read brought in. That read is the price of a stride build
+/// where the store fits, for whoever asks for one there to weigh; holding
+/// the pieces to the read-back would keep the whole file dirty beside the
+/// raw form instead, the shape the per-piece drop was made to end.
 #[allow(clippy::too_many_arguments)]
 fn write_stride(
     file: &File,
@@ -6393,11 +6393,20 @@ fn write_stride(
 /// was written from, every rank, through the body a reader serves it by:
 /// the body taken from the file's bytes alone (`StrideBody::from_bytes`),
 /// the segment it names the live one (`same_segment`), and at each rank the
-/// value its record holds, its key, and its key's read answering that one
-/// value, every page checked against the row once, as a reader's verified
-/// bits check it. `each` is told of a rank before it is read and stops the
-/// check where it answers false. `None` where the file reads back; else
-/// what the build answers.
+/// two quantities a file holds of it -- the value its slot holds, every
+/// page checked against the row once as a reader's verified bits check it,
+/// and the key its trailer's codec renders there. `each` is told of a rank
+/// before it is read and stops the check where it answers false. `None`
+/// where the file reads back; else what the build answers.
+///
+/// A key's read (`StrideBody::read_all`) is not a third leg: it is the
+/// codec's inverse of the render the key leg holds, then the value leg's
+/// read, so with both passing it fails only where the codec decodes a key
+/// to another number than the one it renders it from, which no file can
+/// make and the codec's own test holds. As a leg it would refuse nothing
+/// the two do not and refuse what each of them is for, a guard no file
+/// reaches that leaves either of the two deletable with every damage still
+/// refused.
 fn check_stride(
     tmp: &Path,
     images: &SegImages,
@@ -6438,14 +6447,6 @@ fn check_stride(
         if body.key_at_into(rank, &mut kbuf) != Some(key) {
             return Ok(refused);
         }
-        let (mut seen, mut same) = (0usize, true);
-        let read = body.read_all(bytes, key, &mut good, &mut |v| {
-            seen += 1;
-            same &= v == value;
-        });
-        if read != StrideRead::Served(1) || seen != 1 || !same {
-            return Ok(refused);
-        }
     }
     Ok(None)
 }
@@ -6457,7 +6458,9 @@ fn check_stride(
 /// row in the heap, a word a value page. The one reader of the body: the
 /// build reads every rank of a file back through it before the file has a
 /// name (`check_stride`), and a form file that holds one serves its reads
-/// by it.
+/// by it. The point read by key (`StrideBody::read_all`) is that serving's
+/// alone, compiled for the tests until a form file holds a body: the
+/// read-back holds the two quantities it is made of, not their composition.
 pub(super) struct StrideBody {
     trailer: StrideTrailer,
     layout: StrideLayout,
@@ -6478,6 +6481,7 @@ pub(super) enum StrideAt<'f> {
 
 /// What a stride body answers of a key's read: the values handed over, one
 /// or none, or the page that failed its check before any was.
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum StrideRead {
     Served(u64),
@@ -6556,6 +6560,7 @@ impl StrideBody {
     /// renders, less the run's first, inside the run. Nothing else is: the
     /// build proved every key of the run shaped and the run whole, so a key
     /// this answers `None` for is absent, a fact of the run.
+    #[cfg(test)]
     pub(super) fn rank_of(&self, key: &[u8]) -> Option<u64> {
         let c = &self.trailer.codec;
         let r = c.decode(key)?.checked_sub(c.base())?;
@@ -6605,6 +6610,7 @@ impl StrideBody {
     /// `key`'s value in `file` handed to `f`, after its pages' checks: one
     /// for a key of the run, none for any other, and nothing handed over
     /// where a page failed.
+    #[cfg(test)]
     pub(super) fn read_all(
         &self,
         file: &[u8],
@@ -12165,6 +12171,33 @@ mod tests {
         assert!(!codes.contains(&0));
     }
 
+    /// A block build names the body it wrote by the plan's two quantities
+    /// together: raw tails are a body of their own under the record coding
+    /// alone, and under the block coding the flag builds the block body --
+    /// the plan the segment work's record calls raw-tailed all the same
+    /// (`z_coded_record`). Each file attaches in the coding it was built in
+    /// and serves the raw form's answers.
+    #[test]
+    fn a_block_build_names_the_body_its_plan_makes() {
+        for (coding, raw_tails, body) in [
+            (ZCODING_BLOCK, false, FileCoding::Block),
+            (ZCODING_BLOCK, true, FileCoding::Block),
+            (ZCODING_RECORD, false, FileCoding::Block),
+            (ZCODING_RECORD, true, FileCoding::RawTails),
+        ] {
+            let name = format!("coding-{coding}-{raw_tails}");
+            let fx = Fixture::with_shape(&name, suite(1200, 31), 256, coding, raw_tails);
+            let made = fx.build();
+            let Outcome::Built(b) = made else {
+                panic!("{name}: {made:?}")
+            };
+            assert_eq!((b.coding, b.stride_no), (body, None), "{name}");
+            let zfile = fx.attach().expect("the block file attaches");
+            assert_eq!(zfile.coded(), coding == ZCODING_RECORD, "{name}");
+            agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
+        }
+    }
+
     /// Partitions of numbered keys of one length with one fixed value each
     /// -- values of one byte, of a hundred that straddle pages, of a page
     /// less one byte and of a page, a run of one, and a big-endian field --
@@ -12931,7 +12964,10 @@ mod tests {
     /// serve wrong, each damage made between the write and the read-back
     /// and forged under good checksums where a checksum would catch it
     /// first: a value byte, a word of the row, the trailer's first number
-    /// and the trailer's segment. Asked for the stride form alone, nothing
+    /// and the trailer's segment, each forged one refused by one of the
+    /// read-back's checks alone -- the value's, the value's page against the
+    /// row, the key's, the segment's -- so that any one of them deleted
+    /// leaves its damage served. Asked for the stride form alone, nothing
     /// is named and nothing left; asked for it or the block form, the block
     /// file is built with the reason beside it. The seam that damages
     /// nothing builds.

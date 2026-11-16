@@ -3967,6 +3967,27 @@ impl Trailer {
         }
     }
 
+    /// The segment's fields set from `s`, the inverse of
+    /// [`Trailer::seg_ident`]: what a writer records of the segment it
+    /// derives from, from the one account of it both kinds of trailer are
+    /// filled from (`zfile::seg_ident_of`), so that no writer spells the
+    /// segment's fields out again. The key count is the segment's.
+    pub fn set_seg(&mut self, s: &SegIdent) {
+        self.seg_id = s.seg_id;
+        self.seg_end_seq = s.seg_end_seq;
+        self.nkeys = s.nkeys;
+        self.seg_recs_len = s.recs_len;
+        self.seg_crc_off = s.crc_off;
+        self.seg_key_off = s.key_off;
+        self.seg_hash_cap = s.hash_cap;
+        self.seg_file_len = s.file_len;
+        self.seg_timestamp = s.timestamp;
+        self.seg_generation = s.generation;
+        self.seg_row_crc = s.row_crc;
+        self.rec_version = s.rec_version;
+        self.rec_magic = s.rec_magic;
+    }
+
     /// Whether the stored filter is the one this engine would compute: its
     /// signature, probes and bits a key are the running engine's. A filter
     /// answers "absent" for a key it does not hold, so one whose bits are
@@ -6515,6 +6536,35 @@ mod tests {
             ..sample_trailer()
         };
         assert_eq!(huge.expected_file_len(), None);
+    }
+
+    /// A trailer's segment set from an account of it reads back as that
+    /// account and leaves every other field as it was: the setter is the
+    /// getter's inverse field by field, each field's value distinct from
+    /// every other's so that two fields' places swapped read back wrong.
+    #[test]
+    fn a_trailers_segment_set_reads_back_as_set() {
+        let s = SegIdent {
+            seg_id: 1,
+            seg_end_seq: 2,
+            nkeys: 3,
+            recs_len: 4,
+            crc_off: 5,
+            key_off: 6,
+            hash_cap: 7,
+            file_len: 8,
+            timestamp: 9,
+            generation: 10,
+            row_crc: 11,
+            rec_version: 12,
+            rec_magic: 13,
+        };
+        let mut t = sample_trailer();
+        t.set_seg(&s);
+        assert_eq!(t.seg_ident(), s);
+        let mut back = t.clone();
+        back.set_seg(&sample_trailer().seg_ident());
+        assert_eq!(back, sample_trailer(), "nothing but the segment moved");
     }
 
     #[test]
