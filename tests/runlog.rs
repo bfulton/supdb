@@ -44,7 +44,7 @@ fn buffered() -> Options {
     Options {
         sync: SyncPolicy::EveryN(u32::MAX),
         seal_bytes: 1 << 20,
-        ..Options::default()
+        ..common::options()
     }
 }
 
@@ -295,7 +295,7 @@ fn runs_and_frames_come_back_whole_and_stay_so() {
         let opts = || Options {
             sync,
             seal_bytes: 1 << 20,
-            ..Options::default()
+            ..common::options()
         };
         let d = dir(&format!("whole-{sync:?}").replace(['(', ')'], "-"));
         let mut db = Db::create(&d, opts()).unwrap();
@@ -371,7 +371,7 @@ fn runs_and_frames_come_back_whole_and_stay_so() {
 #[test]
 fn a_synced_run_that_is_gone_is_a_record_lost() {
     let d = dir("damage");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     db.hold_seal_landing(true);
     for b in 0..2 {
         ordered_batch(&mut db, b);
@@ -381,7 +381,7 @@ fn a_synced_run_that_is_gone_is_a_record_lost() {
     assert_eq!(db.runs_unsynced(), (None, 0), "every commit was synced");
     db.crash();
     std::fs::remove_file(run_file(&d, 0)).unwrap();
-    let e = match Db::open(&d, Options::default()) {
+    let e = match Db::open(&d, common::options()) {
         Ok(_) => panic!("a store with a synced run missing opened"),
         Err(e) => e.to_string(),
     };
@@ -405,7 +405,7 @@ fn a_sync_covers_the_runs_as_well_as_the_log() {
             sync: SyncPolicy::EveryN(4),
             // The run in progress stays where it is at a `sync`.
             adaptive_shape: false,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -486,7 +486,7 @@ fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
         Options {
             sync: SyncPolicy::Always,
             adaptive_shape: false,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -527,7 +527,7 @@ fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
         Options {
             sync: SyncPolicy::EveryN(4),
             adaptive_shape: false,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -597,7 +597,7 @@ fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
         Options {
             sync: SyncPolicy::EveryN(4),
             adaptive_shape: false,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -673,7 +673,7 @@ fn a_barrier_that_fails_is_owed_until_it_is_made() {
         inline(Options {
             sync: SyncPolicy::Always,
             adaptive_shape: false,
-            ..Options::default()
+            ..common::options()
         }),
     )
     .unwrap();
@@ -718,7 +718,7 @@ fn a_barrier_that_fails_is_owed_until_it_is_made() {
     assert_eq!(db.seal_waits().run_names, 2);
     db.crash();
 
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     assert_eq!(values(&db, &key(0)), vec![b"closes the run".to_vec()]);
     assert_eq!(values(&db, &key(1)), vec![VALUE.to_vec()]);
     for b in 1..3 {
@@ -812,7 +812,7 @@ fn a_run_begun_behind_a_sync_refuses_a_gap_before_it() {
     let always = || Options {
         sync: SyncPolicy::Always,
         seal_bytes: 1 << 20,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, always()).unwrap();
     db.hold_seal_landing(true);
@@ -849,7 +849,7 @@ fn a_run_begun_behind_a_sync_refuses_a_gap_before_it() {
         sync: SyncPolicy::EveryN(4),
         seal_bytes: 1 << 20,
         adaptive_shape: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, everyn()).unwrap();
     db.hold_seal_landing(true);
@@ -1035,7 +1035,7 @@ fn a_run_an_open_takes_is_finished_where_it_lies() {
     for sync in [SyncPolicy::EveryN(u32::MAX), SyncPolicy::Always] {
         let opts = || Options {
             sync,
-            ..Options::default()
+            ..common::options()
         };
         let tag = format!("{sync:?}").replace(['(', ')'], "-");
         let write = |d: &Path| {
@@ -1350,7 +1350,7 @@ fn oracle_options(sync: SyncPolicy) -> Options {
         // Small seals: a run closes, a table seals and a merge starts
         // every few commits.
         seal_bytes: 96 << 10,
-        ..Options::default()
+        ..common::options()
     }
 }
 

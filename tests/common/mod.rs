@@ -20,6 +20,49 @@ pub fn vf(f: &mut dyn FnMut(&[u8])) -> &mut dyn FnMut(&[u8]) {
     f
 }
 
+/// The switch that runs the tests which hold a store's answers whatever form
+/// serves it with the stride form forced: `SUPDB_TEST_STRIDE=1`, read here
+/// and nowhere else. Off, the default, it changes nothing and the gate runs
+/// the tests as they are written. The stride form is asked for only by a
+/// build of a form file, and those run only where the compact form is
+/// forced, so a switch that set `ZStride::Forced` alone would leave every
+/// test that names no form in the controller's FITS, raw, with the stride
+/// code never reached; so where a test forces the compact form the switch
+/// adds the stride form beside it (`with_stride`), and where a test names
+/// no form it starts from the compact form forced as well (`options`).
+pub fn stride_switch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SUPDB_TEST_STRIDE").is_ok_and(|v| v == "1"))
+}
+
+/// `o`, and under the switch (`stride_switch`) every build of a form file
+/// asking for the stride form: for a test that forces the compact form
+/// itself, at the site where it does.
+pub fn with_stride(mut o: supdb::Options) -> supdb::Options {
+    if stride_switch() {
+        o.zpages_stride = supdb::ZStride::Forced;
+    }
+    o
+}
+
+/// The options a test builds on in place of `Options::default()`: the
+/// default, and under the switch (`stride_switch`) the compact form forced
+/// (`ZPages::Always`) with its floor lowered, since the floor declines every
+/// partition a test can afford to write, and the stride form asked for. A
+/// test that names a form keeps it: the switch moves what a test builds on
+/// and nothing it says, so a field a test sets is the test's.
+pub fn options() -> supdb::Options {
+    let o = supdb::Options::default();
+    if !stride_switch() {
+        return o;
+    }
+    with_stride(supdb::Options {
+        zpages: supdb::ZPages::Always,
+        zpages_min_bytes: 0,
+        ..o
+    })
+}
+
 /// A segment file without the part of it that is a function of when it was
 /// written.
 ///

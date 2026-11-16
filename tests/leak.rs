@@ -66,7 +66,7 @@ fn a_store_life(name: &str, blocks_mapped: bool) {
         partition_bytes: Some(64 << 20),
         scan_block_cache: true,
         blocks_mapped,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let keys = 20_000u32;
@@ -120,7 +120,7 @@ fn a_handed_life(name: &str) {
         seal_bytes: 1 << 20,
         partition_bytes: Some(64 << 20),
         scan_block_cache: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let keys = 20_000u32;
@@ -170,7 +170,7 @@ fn a_three_frozen_life(name: &str) {
         seal_bytes: 1 << 30,
         partition_bytes: Some(64 << 10),
         scan_block_cache: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let keys = 20_000u32;
@@ -232,7 +232,13 @@ fn a_zpages_life(name: &str) {
         scan_block_cache: false,
         seal_bytes: 1 << 20,
         partition_bytes: Some(256 << 10),
-        ..Options::default()
+        // The page flipped below is met by the check a page takes at its
+        // first touch, which a stride file this process built is trusted
+        // past (`Options::zpages_stride_trust_built`): under the stride
+        // switch, whose keys and values here the stride form holds, the
+        // check is asked for, so the flip reaches the retire list.
+        zpages_stride_trust_built: false,
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let keys = 20_000u32;
@@ -405,7 +411,7 @@ fn a_stride_life(name: &str) {
         scan_block_cache: false,
         seal_bytes: 1 << 20,
         partition_bytes: Some(256 << 10),
-        ..Options::default()
+        ..common::options()
     };
     let keys = 12_000u32;
     let key = |k: u32| format!("k{k:06}").into_bytes();

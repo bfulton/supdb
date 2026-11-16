@@ -52,7 +52,7 @@ fn a_key_at_the_empty_keys_arena_offset_is_filed_and_patched() {
             publish_in_background: false,
             upkeep: Upkeep::Inline,
             scan_block_cache: true,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -119,7 +119,7 @@ fn a_key_written_into_an_empty_partitions_range_is_in_a_scan_through_the_cache()
             scan_block_cache: true,
             l0_trigger: 2,
             promote: true,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -268,7 +268,7 @@ fn a_filed_keys_cut_is_resolved_again_across_its_partitions_rewrite() {
             upkeep: Upkeep::Inline,
             scan_block_cache: true,
             l0_trigger: 2,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -428,7 +428,7 @@ fn a_sparse_forms_cuts_are_resolved_again_across_its_partitions_rewrite() {
                 scan_block_cache: true,
                 l0_trigger: 2,
                 rebase_recuts_sparse: recut,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -604,7 +604,7 @@ fn a_snapshot_over_the_empty_key_alone_is_sought_at_a_partitions_fence() {
                 upkeep: Upkeep::Inline,
                 scan_block_cache: true,
                 snapshot_runs: runs,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -662,7 +662,7 @@ fn a_commit_near_reads_files_its_batch_under_settle_every() {
                 upkeep: Upkeep::Inline,
                 scan_block_cache: true,
                 forms_settle_every: every,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -733,7 +733,7 @@ fn a_commits_fill_builds_the_blocks_its_settle_filed_into() {
                 // enough to shed nothing: without one the fill completes
                 // every overlaid block's form whatever this option says.
                 scan_cache_bytes: 1 << 30,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -815,7 +815,7 @@ fn the_fills_build_only_while_the_refaults_hold_still() {
             forms_settle_builds: true,
             scan_cache_bytes: 1 << 30,
             zpages_inject: Some(inject.clone()),
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -905,7 +905,7 @@ fn the_fills_room_is_closed_by_pressure_and_not_by_a_refault() {
                 forms_settle_room_pressure: pressure,
                 scan_cache_bytes: 1 << 30,
                 zpages_inject: Some(inject.clone()),
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -991,7 +991,7 @@ fn the_list_of_the_fills_forms_is_bounded_by_the_stores_blocks() {
             // round below builds its blocks' forms again.
             rebase_recuts_sparse: false,
             zpages_inject: Some(inject.clone()),
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -1061,7 +1061,7 @@ fn the_fills_forms_are_not_shed_for_a_fill_that_builds_them_again() {
                 forms_settle_builds: true,
                 forms_settle_sheds_unbound: sheds,
                 zpages_inject: Some(inject.clone()),
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -1163,7 +1163,7 @@ fn a_settles_seeks_planned_ahead_file_a_batch_as_the_gallop_does() {
                     scan_block_cache: true,
                     forms_settle_every: true,
                     settle_seek_ahead: ahead,
-                    ..Options::default()
+                    ..common::options()
                 },
             )
             .unwrap();
@@ -1283,7 +1283,7 @@ fn a_patch_by_its_rank_asks_for_its_lines_by_the_cut() {
                 settle_form_ahead: form_ahead,
                 settle_table_ahead: table_ahead,
                 zpages_inject: Some(inject.clone()),
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();

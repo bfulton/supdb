@@ -154,7 +154,7 @@ fn read_vec(db: &Reader, key: &[u8]) -> Vec<Vec<u8>> {
 #[test]
 fn values_come_back_in_append_order_across_seals() {
     let d = dir("order");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
     for round in 0u32..3 {
         for k in 0u32..50 {
@@ -181,7 +181,7 @@ fn values_come_back_in_append_order_across_seals() {
 #[test]
 fn reads_see_uncommitted_and_unsealed_state() {
     let d = dir("ryw");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     db.append(b"k", b"one");
     assert_eq!(
         read_vec(&db, b"k"),
@@ -197,14 +197,14 @@ fn reads_see_uncommitted_and_unsealed_state() {
 fn killed_before_first_seal_opens_from_the_wal_alone() {
     // P-E: no segment exists, only a WAL.
     let d = dir("preseal");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     for i in 0u32..500 {
         db.append(format!("k{i}").as_bytes(), &i.to_le_bytes());
     }
     db.commit().unwrap();
     drop(db); // no close, no seal: the crash
 
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     assert_eq!(db.segments(), 0, "nothing was sealed");
     for i in 0u32..500 {
         assert_eq!(
@@ -217,13 +217,13 @@ fn killed_before_first_seal_opens_from_the_wal_alone() {
 #[test]
 fn uncommitted_tail_is_lost_whole_and_committed_state_survives() {
     let d = dir("tail");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     db.append(b"durable", b"yes");
     db.commit().unwrap();
     db.append(b"volatile", b"never-synced");
     drop(db); // pending buffer never reached the file
 
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     assert_eq!(read_vec(&db, b"durable"), vec![b"yes".to_vec()]);
     assert_eq!(read_vec(&db, b"volatile"), Vec::<Vec<u8>>::new());
 }
@@ -254,7 +254,7 @@ fn a_torn_tail_loses_its_batch_whole_and_earlier_batches_survive() {
     f.set_len(tail - 3).unwrap();
     drop(f);
 
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     assert_eq!(
         read_vec(&db, b"a"),
         vec![b"1".to_vec()],
@@ -275,7 +275,7 @@ fn a_torn_tail_loses_its_batch_whole_and_earlier_batches_survive() {
 #[test]
 fn a_transaction_is_all_or_nothing_and_sees_its_own_writes() {
     let d = dir("txn");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     db.append(b"z", b"old");
     db.commit().unwrap();
     {
@@ -329,7 +329,7 @@ fn a_transaction_is_all_or_nothing_and_sees_its_own_writes() {
         "dropped without commit is abort"
     );
     drop(db);
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     assert_eq!(
         read_vec(&db, b"x"),
         vec![b"1".to_vec(), b"2".to_vec()],
@@ -350,7 +350,7 @@ fn crash_between_rename_and_wal_reset_does_not_duplicate() {
     // `a_segment_the_manifest_does_not_name_is_swept_and_its_wal_replayed`
     // has it.)
     let d = dir("renamewin");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     for i in 0u32..40 {
         db.append(b"dup-window", &i.to_le_bytes());
     }
@@ -366,7 +366,7 @@ fn crash_between_rename_and_wal_reset_does_not_duplicate() {
     drop(db);
     std::fs::write(&wal, &saved).unwrap();
 
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     assert_eq!(db.segments(), 1);
     let got = read_vec(&db, b"dup-window");
     assert_eq!(
@@ -382,7 +382,7 @@ fn crash_between_rename_and_wal_reset_does_not_duplicate() {
 #[test]
 fn reopen_after_seal_serves_both_old_and_new_writes() {
     let d = dir("reopen");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     db.append(b"k", b"sealed");
     db.commit().unwrap();
     db.seal().unwrap();
@@ -390,7 +390,7 @@ fn reopen_after_seal_serves_both_old_and_new_writes() {
     db.commit().unwrap();
     drop(db); // crash with one segment and one live WAL record
 
-    let mut db = Db::open(&d, Options::default()).unwrap();
+    let mut db = Db::open(&d, common::options()).unwrap();
     assert_eq!(
         read_vec(&db, b"k"),
         vec![b"sealed".to_vec(), b"walled".to_vec()]
@@ -400,7 +400,7 @@ fn reopen_after_seal_serves_both_old_and_new_writes() {
     db.seal().unwrap();
     drop(db);
 
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     assert_eq!(
         read_vec(&db, b"k"),
         vec![b"sealed".to_vec(), b"walled".to_vec(), b"after".to_vec()],
@@ -417,7 +417,7 @@ fn oracle(cursors: bool, upkeep: supdb::Upkeep) {
         Options {
             cursor_merge: cursors,
             upkeep,
-            ..Options::default()
+            ..common::options()
         },
     );
 }
@@ -553,7 +553,7 @@ fn the_oracle_holds_with_the_carry_left_to_the_next_look() {
         Options {
             freeze_settles: false,
             upkeep: supdb::Upkeep::Background(1),
-            ..Options::default()
+            ..common::options()
         },
     );
 }
@@ -573,7 +573,7 @@ fn the_oracle_holds_with_the_lag_bounded_and_the_passes_batched() {
             upkeep_lag_pct: 50,
             upkeep_batch_pct: 50,
             upkeep: supdb::Upkeep::Background(1),
-            ..Options::default()
+            ..common::options()
         },
     );
 }
@@ -589,7 +589,7 @@ fn the_oracle_holds_on_a_buffered_store_filing_its_bursts() {
             upkeep_inline_bursts: true,
             sync: supdb::SyncPolicy::EveryN(u32::MAX),
             upkeep: supdb::Upkeep::Background(1),
-            ..Options::default()
+            ..common::options()
         },
     );
 }
@@ -603,7 +603,7 @@ fn the_oracle_holds_on_a_buffered_store_that_lends_every_batch() {
             upkeep_inline_bursts: false,
             sync: supdb::SyncPolicy::EveryN(u32::MAX),
             upkeep: supdb::Upkeep::Background(1),
-            ..Options::default()
+            ..common::options()
         },
     );
 }
@@ -625,7 +625,7 @@ fn a_look_drops_the_tables_it_passed_before_any_publish() {
         Options {
             upkeep: supdb::Upkeep::Background(1),
             seal_bytes: 64 << 10,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -696,7 +696,7 @@ fn frozen_under_a_held_look(
         Options {
             upkeep: supdb::Upkeep::Background(1),
             seal_bytes: 64 << 10,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -830,7 +830,7 @@ fn an_upkeep_thread_the_writes_outran_gives_its_forms_up_until_a_scan() {
             upkeep: supdb::Upkeep::Background(1),
             upkeep_keep_bytes: 1,
             seal_bytes: 64 << 10,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -924,7 +924,7 @@ fn an_upkeep_pass_that_pins_a_landed_table_gives_its_forms_up() {
             upkeep: supdb::Upkeep::Background(1),
             upkeep_keep_bytes: 1,
             seal_bytes: 64 << 10,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -1021,7 +1021,7 @@ fn a_burst_lent_to_the_upkeep_thread_is_filed_before_the_first_scan() {
                 // (`Options::forms_settle_every` and `forms_settle_builds` off).
                 forms_settle_every: false,
                 forms_settle_builds: false,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -1144,7 +1144,7 @@ fn a_pass_the_writer_wants_its_upkeep_back_from_yields_at_its_next_step() {
                 upkeep_yields: yields,
                 partition_bytes: Some(256 << 10),
                 seal_max_pct: 0,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -1245,7 +1245,9 @@ fn the_builder_ahead_leaves_the_partitions_whose_pages_are_not_in_memory() {
                 // test makes.
                 ahead_in_core_scans_div: 0,
                 zpages_inject: Some(inject),
-                ..Options::default()
+                // In memory, as `a_builder_ahead_of_the_reader_fills_the_cache`.
+                zpages: supdb::ZPages::Auto,
+                ..common::options()
             },
         )
         .unwrap();
@@ -1317,7 +1319,7 @@ fn a_fill_the_writer_wants_its_upkeep_back_from_stops_at_its_next_block() {
                 scan_cache_ahead: false,
                 partition_bytes: Some(256 << 10),
                 seal_max_pct: 0,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -1431,7 +1433,7 @@ fn a_fill_with_a_newer_commit_posted_is_left_for_the_pass_caught_up() {
                 scan_cache_ahead: false,
                 partition_bytes: Some(256 << 10),
                 seal_max_pct: 0,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -1547,7 +1549,7 @@ fn a_fill_left_for_a_later_pass_is_made_by_a_pass_with_nothing_to_file() {
                 scan_cache_ahead: false,
                 partition_bytes: Some(256 << 10),
                 seal_max_pct: 0,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -1673,7 +1675,7 @@ fn an_unpinned_writer_is_refused_beside_another_publisher() {
         "nopin-background",
         Options {
             writer_pins: false,
-            ..Options::default()
+            ..common::options()
         },
     );
     refused(
@@ -1682,7 +1684,7 @@ fn an_unpinned_writer_is_refused_beside_another_publisher() {
             writer_pins: false,
             publish_in_background: false,
             snapshot_keeper: true,
-            ..Options::default()
+            ..common::options()
         },
     );
     oracle_in(
@@ -1690,7 +1692,10 @@ fn an_unpinned_writer_is_refused_beside_another_publisher() {
         Options {
             writer_pins: false,
             publish_in_background: false,
-            ..Options::default()
+            // The forced form is refused beside an unpinned writer
+            // (`check_options`); the controller is inert there.
+            zpages: supdb::ZPages::Auto,
+            ..common::options()
         },
     );
 }
@@ -1707,7 +1712,7 @@ fn the_oracle_holds_with_seals_that_keep_the_wal() {
         Options {
             seal_rotates_wal: false,
             seal_bytes: 2 << 10,
-            ..Options::default()
+            ..common::options()
         },
     );
     assert!(w.wal_rotations > 0, "the log rotated by size: {w:?}");
@@ -1729,7 +1734,7 @@ fn the_oracle_holds_under_the_shape_with_seals_that_keep_the_wal() {
             seal_rotates_wal: false,
             adaptive_shape: true,
             seal_bytes: 2 << 10,
-            ..Options::default()
+            ..common::options()
         },
     );
     assert!(w.wal_rotations > 0 && w.publishes > 0, "{w:?}");
@@ -1759,7 +1764,7 @@ fn seg_names(d: &std::path::Path) -> Vec<String> {
 #[test]
 fn a_lone_piece_is_promoted_rather_than_rewritten() {
     let d = dir("promote-one");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
     for k in 0u32..2_000 {
         let key = format!("key-{k:05}").into_bytes();
@@ -1804,7 +1809,7 @@ fn a_lone_piece_is_promoted_rather_than_rewritten() {
 #[test]
 fn a_lone_piece_holding_a_tombstone_still_merges() {
     let d = dir("promote-tomb");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     for k in 0u32..2_000 {
         db.append(
             format!("key-{k:05}").as_bytes(),
@@ -1849,7 +1854,7 @@ fn a_point_read_over_tombstones_in_every_source_answers_from_one_probe_of_each()
             &d,
             Options {
                 read_probes_once: once,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -1956,7 +1961,7 @@ fn a_segment_whose_ordered_index_is_missing_or_damaged_rebuilds_it_at_open() {
     // partition instead of folding into it.
     let no_merge = || Options {
         compact: false,
-        ..Options::default()
+        ..common::options()
     };
     let d = dir("ord-required");
     let mut db = Db::create(&d, no_merge()).unwrap();
@@ -2059,7 +2064,10 @@ fn a_segment_whose_ordered_index_is_missing_or_damaged_rebuilds_it_at_open() {
 // and nothing it returns, so what these hold it to is the model, the same
 // files read without the option, and a count that says the path was taken
 // where it can be and was not where it cannot or was not asked for: "a
-// path only one arm exercises is a path nothing tests".
+// path only one arm exercises is a path nothing tests". The path is the
+// raw form's, which a partition's form file takes the read from, so the
+// stores here name the controller (`ZPages::Auto`), raw in memory, where
+// the stride switch (`common::stride_switch`) would force the form.
 
 /// How a fixture's keys are cut, which is what `OrdIndex::uniform` asks of
 /// a partition.
@@ -2119,7 +2127,8 @@ fn ord_fixture(name: &str, shape: OrdShape, via_ord: bool) -> OrdFixture {
         shape,
         Options {
             point_via_ord: via_ord,
-            ..Options::default()
+            zpages: supdb::ZPages::Auto,
+            ..common::options()
         },
     )
 }
@@ -2278,7 +2287,7 @@ fn a_point_read_hashed_once_answers_as_one_hashed_per_source() {
                 Options {
                     read_hash_once: once,
                     read_lines_ahead: ahead,
-                    ..Options::default()
+                    ..common::options()
                 },
             );
             let key = |k: u32| ord_key(shape, k);
@@ -2408,7 +2417,8 @@ fn each_partition_of_a_store_reads_through_its_own_ordered_index() {
                 partition_bytes: Some(64 << 10),
                 l0_trigger: 2,
                 point_via_ord: via_ord,
-                ..Options::default()
+                zpages: supdb::ZPages::Auto,
+                ..common::options()
             },
         )
         .unwrap();
@@ -2445,7 +2455,8 @@ fn each_partition_of_a_store_reads_through_its_own_ordered_index() {
 fn a_rebuilt_ordered_index_serves_point_reads_as_the_one_it_replaced() {
     let opts = || Options {
         point_via_ord: true,
-        ..Options::default()
+        zpages: supdb::ZPages::Auto,
+        ..common::options()
     };
     let key = |k: u32| format!("key-{k:05}").into_bytes();
     let d = dir("ordread-rebuild");
@@ -2544,7 +2555,8 @@ fn a_rebuilt_ordered_index_serves_point_reads_as_the_one_it_replaced() {
 fn an_ordered_index_naming_the_wrong_keys_never_returns_another_keys_values() {
     let opts = || Options {
         point_via_ord: true,
-        ..Options::default()
+        zpages: supdb::ZPages::Auto,
+        ..common::options()
     };
     let n = 1_000u32;
     let key = |k: u32| format!("key-{k:05}").into_bytes();
@@ -2631,7 +2643,8 @@ fn an_ordered_index_naming_the_wrong_keys_never_returns_another_keys_values() {
 fn the_oracle_holds_with_point_reads_through_the_ordered_index() {
     let opts = Options {
         point_via_ord: true,
-        ..Options::default()
+        zpages: supdb::ZPages::Auto,
+        ..common::options()
     };
     let d = dir("oracle-ordread");
     let mut db = Db::create(&d, opts.clone()).unwrap();
@@ -2708,7 +2721,8 @@ fn readers_on_threads_keep_answering_through_the_ordered_index() {
         partition_bytes: Some(64 << 10),
         l0_trigger: 2,
         point_via_ord: true,
-        ..Options::default()
+        zpages: supdb::ZPages::Auto,
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let keys = 3000u32;
@@ -2806,7 +2820,7 @@ fn a_direct_runs_table_reads_its_values_through_the_runs_segment() {
             write_piece: 4096,
             ..Default::default()
         },
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let key = |k: u32| format!("key-{k:06}").into_bytes();
@@ -2930,7 +2944,7 @@ fn a_streamed_runs_recycled_blocks_read_through_the_runs_segment() {
             write_piece: 4096,
             ..Default::default()
         },
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let key = |k: u32| format!("key-{k:06}").into_bytes();
@@ -3032,7 +3046,7 @@ fn a_streamed_runs_recycled_blocks_read_through_the_runs_segment() {
 #[test]
 fn a_direct_runs_table_that_copies_its_values_reads_the_same() {
     let d = dir("direct-copies");
-    let opts = Options::default();
+    let opts = common::options();
     let mut db = Db::create(&d, opts).unwrap();
     let key = |k: u32| format!("key-{k:06}").into_bytes();
     let val = |k: u32| format!("value-{k}").into_bytes();
@@ -3104,7 +3118,7 @@ fn an_ordered_index_survives_promotion_and_reopen() {
 fn wal_arm() -> Options {
     Options {
         direct_ingest: false,
-        ..Options::default()
+        ..common::options()
     }
 }
 
@@ -3118,7 +3132,7 @@ fn small_opts(l0_trigger: usize) -> Options {
         seal_bytes: 4 << 10,
         l0_trigger,
         partition_bytes: None,
-        ..Options::default()
+        ..common::options()
     }
 }
 
@@ -3310,7 +3324,7 @@ fn a_full_flush_over_partitions_does_not_promote_its_pieces() {
             l0_trigger: 1000,
             partition_bytes: None,
             flush_ranges: false,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -3363,7 +3377,7 @@ fn scale(flush_ranges: bool) {
             l0_trigger: 3,
             partition_bytes: None,
             flush_ranges,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -3634,7 +3648,7 @@ fn dir_bytes(d: &std::path::Path) -> u64 {
 #[test]
 fn an_empty_key_may_be_the_first_write_into_a_memtable() {
     let d = dir("emptykey-first");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     db.append(b"", b"first");
     db.append(b"after", b"");
     db.commit().unwrap();
@@ -3657,7 +3671,7 @@ fn an_empty_key_may_be_the_first_write_into_a_memtable() {
     assert_eq!(read_vec(&db, b"k"), vec![Vec::<u8>::new()]);
     // And through a reopen, whose replay writes the same way.
     drop(db);
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     assert_eq!(
         read_vec(&db, b""),
         vec![b"first".to_vec(), b"second".to_vec()]
@@ -3669,7 +3683,7 @@ fn an_empty_key_may_be_the_first_write_into_a_memtable() {
 #[test]
 fn a_delete_ends_older_values_and_later_appends_start_fresh() {
     let d = dir("delete");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     db.append(b"k", b"v1");
     db.append(b"k", b"v2");
     db.commit().unwrap();
@@ -3698,7 +3712,7 @@ fn a_delete_ends_older_values_and_later_appends_start_fresh() {
         "through a sealed tombstone"
     );
     drop(db);
-    let mut db = Db::open(&d, Options::default()).unwrap();
+    let mut db = Db::open(&d, common::options()).unwrap();
     assert_eq!(read_vec(&db, b"k"), vec![b"v4".to_vec()], "after reopen");
     db.flush().unwrap();
     assert_eq!(read_vec(&db, b"k"), vec![b"v4".to_vec()], "after the merge");
@@ -3741,7 +3755,7 @@ fn deleted_values_do_not_survive_the_merge() {
     let opts = Options {
         seal_bytes: 256 << 10,
         l0_trigger: 3,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let filler = vec![b'x'; 200];
@@ -3870,7 +3884,7 @@ fn idle_io_priority_and_sync_spreading_change_nothing_observable() {
         background_io: BackgroundIo::Idle,
         seal_sync_every: 64 << 10,
         partition_bytes: Some(512 << 10),
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let filler = vec![b'y'; 120];
@@ -3905,7 +3919,7 @@ fn ordered_pieces_are_promoted_to_partitions_without_a_merge() {
         seal_bytes: 256 << 10,
         l0_trigger: 3,
         partition_bytes: None,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let filler = vec![b'p'; 100];
@@ -3982,7 +3996,7 @@ fn a_wal_header_torn_by_power_loss_opens_and_is_rewritten() {
         // frames whose CRCs fail under the new file's id
         // (`a_recycled_wal_never_adopts_a_frame_from_its_previous_life`).
         recycle_wal: false,
-        ..Options::default()
+        ..common::options()
     };
     let newest_wal = |d: &std::path::Path| -> std::path::PathBuf {
         let mut wals: Vec<std::path::PathBuf> = std::fs::read_dir(d)
@@ -4048,7 +4062,7 @@ fn a_recycled_wal_never_adopts_a_frame_from_its_previous_life() {
     let opts = Options {
         recycle_wal: true,
         seal_bytes: 64 << 10,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     // Life 1 of wal-00000000: about 3 seals' worth, so the file is long.
@@ -4158,7 +4172,7 @@ fn a_syncing_store_pre_writes_its_wal_ahead_of_the_tail_and_not_whole() {
     let ahead = 256u64 << 10;
     let opts = Options {
         wal_ahead_bytes: ahead as usize,
-        ..Options::default()
+        ..common::options()
     };
     assert!(opts.recycle_wal && matches!(opts.sync, supdb::SyncPolicy::Always));
     assert!(opts.wal_ahead_small_runs);
@@ -4287,7 +4301,7 @@ fn a_syncing_store_pre_writes_its_wal_ahead_of_the_tail_and_not_whole() {
     let rot = Options {
         wal_ahead_bytes: small as usize,
         seal_bytes: 256 << 10,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, rot).unwrap();
     let first = db.wal_durable().0;
@@ -4320,7 +4334,7 @@ fn a_syncing_store_pre_writes_its_wal_ahead_of_the_tail_and_not_whole() {
     let flat = Options {
         wal_ahead_bytes: ahead as usize,
         wal_ahead_small_runs: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, flat).unwrap();
     write(&mut db, 0, &mut HashMap::new());
@@ -4346,7 +4360,7 @@ fn a_syncing_store_pre_writes_its_wal_ahead_of_the_tail_and_not_whole() {
     let opts = Options {
         sync: supdb::SyncPolicy::EveryN(u32::MAX),
         wal_ahead_bytes: ahead as usize,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     for round in 0u32..10 {
@@ -4374,7 +4388,7 @@ fn a_syncing_stores_pre_write_is_made_beside_the_commit_that_buys_it() {
     let opts = Options {
         wal_ahead_bytes: ahead as usize,
         wal_ahead_beside: true,
-        ..Options::default()
+        ..common::options()
     };
     assert!(opts.wal_ahead_small_runs);
     let d = dir("wal-beside");
@@ -4470,7 +4484,7 @@ fn a_syncing_stores_pre_write_is_made_beside_the_commit_that_buys_it() {
         wal_ahead_bytes: size as usize,
         seal_bytes: size as usize,
         wal_ahead_beside: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, rot).unwrap();
     let first = db.wal_durable().0;
@@ -4518,7 +4532,7 @@ fn a_reach_a_failed_commit_bought_is_not_written_over_the_next_commit() {
         wal_ahead_bytes: small as usize,
         seal_bytes: 256 << 10,
         wal_ahead_beside: true,
-        ..Options::default()
+        ..common::options()
     };
     assert!(opts.wal_ahead_small_runs);
     let d = dir("wal-beside-failed");
@@ -4627,7 +4641,7 @@ fn recycling_survives_crashes_and_leaves_no_spare_after_close() {
         recycle_wal: true,
         seal_bytes: 32 << 10,
         l0_trigger: 2,
-        ..Options::default()
+        ..common::options()
     };
     let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
     let mut db = Db::create(&d, opts.clone()).unwrap();
@@ -4673,7 +4687,7 @@ fn a_flipped_byte_anywhere_in_a_batch_loses_that_batch_and_the_ones_after() {
     // batch and every batch after it, and nothing before it. Every byte
     // offset of a three-batch WAL is flipped in turn.
     let d = dir("flip");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     let mut ends = Vec::new();
     for b in 0u32..3 {
         for i in 0..4u32 {
@@ -4709,7 +4723,7 @@ fn a_flipped_byte_anywhere_in_a_batch_loses_that_batch_and_the_ones_after() {
         std::fs::write(dd.join("wal-00000000"), &damaged).unwrap();
         // The batch that holds this byte, and so the number that survive.
         let survive = ends.iter().position(|&e| off < e).unwrap();
-        let db = match Db::open(&dd, Options::default()) {
+        let db = match Db::open(&dd, common::options()) {
             Ok(db) => db,
             Err(e) => panic!("offset {off}: open refused the store: {e}"),
         };
@@ -4738,7 +4752,7 @@ fn put_replaces_and_append_accumulates() {
     // external harness confused them once and every Zipfian rewrite piled
     // onto its key until reads walked the pile.
     let d = dir("put");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     db.append(b"k", b"1");
     db.append(b"k", b"2");
     db.commit().unwrap();
@@ -4755,7 +4769,7 @@ fn put_replaces_and_append_accumulates() {
         "appends after a put accumulate again"
     );
     drop(db);
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     assert_eq!(
         read_vec(&db, b"k"),
         vec![b"3".to_vec(), b"4".to_vec()],
@@ -4831,7 +4845,11 @@ fn a_merge_asks_ahead_only_where_its_inputs_are_not_resident() {
                 partition_bytes: None,
                 l0_trigger: 1,
                 merge_read_ahead: window,
-                ..Options::default()
+                // The raw form in memory: a form file drops the raw records
+                // it serves (`Options::zpages_drop_raw`), and the inputs
+                // this holds resident would be cold under the forced form.
+                zpages: supdb::ZPages::Auto,
+                ..common::options()
             },
         )
         .unwrap();
@@ -5323,7 +5341,7 @@ fn a_cache_bound_after_its_tables_were_complete_reads_no_shed_block_as_clean() {
                 forms_settle_backlog_pct: 0,
                 scan_cache_auto_bytes: auto,
                 upkeep: supdb::Upkeep::Inline,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -5403,7 +5421,7 @@ fn the_caches_own_budget_grows_into_the_room_the_partitions_leave() {
                 scan_cache_auto_room: room,
                 zpages_inject: Some(inject),
                 upkeep: supdb::Upkeep::Inline,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -5473,9 +5491,14 @@ fn a_covered_partitions_settle_files_a_key_under_the_block_its_samples_name() {
                 forms_settle_backlog_pct: 0,
                 zpages: supdb::ZPages::Always,
                 zpages_min_bytes: 0,
+                // The block form's span: a group that straddles a block's
+                // edge is what the samples are for, and the stride form,
+                // which these keys and values would take, names a key's
+                // block by its rank and files every one by its span.
+                zpages_stride: supdb::ZStride::Off,
                 settle_covered_samples: samples,
                 upkeep: supdb::Upkeep::Inline,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -5561,7 +5584,12 @@ fn a_raw_partitions_settle_files_a_key_under_the_block_its_samples_name() {
                 forms_settle_backlog_pct: 0,
                 settle_lazy_raw: lazy,
                 upkeep: supdb::Upkeep::Inline,
-                ..Options::default()
+                // Raw partitions, in memory: a partition a form file serves
+                // files its keys with their cuts left by the covered
+                // settle's samples (`Options::settle_covered_samples`),
+                // which the forced form's builds give it once they land.
+                zpages: supdb::ZPages::Auto,
+                ..common::options()
             },
         )
         .unwrap();
@@ -5710,7 +5738,7 @@ fn burst_into_forms_prepared(
         // The commit's own maintenance, step by step.
         upkeep: supdb::Upkeep::Inline,
         forms_to_fit: fit,
-        ..Options::default()
+        ..common::options()
     };
     tune(&mut opts);
     let mut db = Db::create(&d, opts).unwrap();
@@ -6118,7 +6146,7 @@ fn shed_over_published_forms_with(
         commit_forms: true,
         upkeep: supdb::Upkeep::Inline,
         forms_to_fit: fit,
-        ..Options::default()
+        ..common::options()
     };
     tune(&mut opts);
     let mut db = Db::create(&d, opts).unwrap();
@@ -6386,7 +6414,7 @@ fn one_delta_a_block(name: &str, fit: bool) -> (Db, ScanModel) {
         commit_forms: true,
         upkeep: supdb::Upkeep::Inline,
         forms_to_fit: fit,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -6570,7 +6598,7 @@ fn differential_budgeted(
         commit_forms: true,
         upkeep,
         forms_to_fit: fit,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -6731,7 +6759,7 @@ fn the_seal_grows_with_the_store() {
             seal_bytes: 64 << 10,
             partition_bytes: Some(256 << 10),
             seal_grows: grows,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let val = vec![7u8; 200];
@@ -6797,7 +6825,7 @@ fn the_store_is_short_of_memory_while_its_raw_form_exceeds_the_budget() {
             forms_fit_when_short: on,
             zpages: supdb::ZPages::Off,
             zpages_inject: Some(inject.clone()),
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let val = vec![7u8; 200];
@@ -6845,7 +6873,7 @@ fn the_wal_drops_its_synced_frames_from_the_page_cache() {
             direct_ingest: false,
             seal_bytes: 256 << 20,
             wal_drop_bytes: if on { stride } else { 0 },
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let val = vec![9u8; 1000];
@@ -6910,7 +6938,7 @@ fn the_seal_holds_at_its_floor_out_of_core() {
             seal_floor_out_of_core: floor_ooc,
             // The gate is the test's to set.
             zpages: supdb::ZPages::Off,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let val = vec![7u8; 200];
@@ -7009,7 +7037,7 @@ fn fold_model_with(block_cache: bool, pieces_only: bool, hot_copy: bool) {
         scan_block_cache: block_cache,
         forms_pieces_only: pieces_only,
         forms_copy_hot_wide: hot_copy,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -7163,7 +7191,7 @@ fn a_copy_of_updates_starts_a_scan_at_the_seeks_rank() {
         seal_bytes: 1 << 20,
         partition_bytes: Some(64 << 10),
         scan_block_cache: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -7214,7 +7242,7 @@ fn a_copy_walk_paces_the_next_blocks_prefetch_through_itself() {
             partition_bytes: Some(64 << 10),
             scan_block_cache: true,
             scan_prefetch_paced: on,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -7270,7 +7298,7 @@ fn a_dense_form_converts_from_its_own_deltas() {
         partition_bytes: Some(64 << 10),
         scan_block_cache: true,
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -7332,7 +7360,11 @@ fn a_light_form_converts_on_the_upkeep_thread_and_not_over_a_burst() {
             partition_bytes: Some(1 << 20),
             scan_block_cache: true,
             forms_convert_from: line,
-            ..Options::default()
+            // In memory, the controller's FITS: a light form converts
+            // only while the gate is at the raw form, and the forced
+            // form's is not.
+            zpages: supdb::ZPages::Auto,
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -7403,7 +7435,7 @@ fn a_manifest_publish_leaves_its_spare_to_the_sweep() {
         seal_bytes: 1 << 20,
         partition_bytes: Some(64 << 10),
         manifest_slots: false,
-        ..Options::default()
+        ..common::options()
     };
     let spares = |d: &std::path::Path| -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(d)
@@ -7468,7 +7500,7 @@ fn a_manifest_publish_alternates_two_slots_and_the_open_takes_the_newest_valid()
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(64 << 10),
-        ..Options::default()
+        ..common::options()
     };
     let key = |k: u32| format!("key-{k:05}");
     let mut db = Db::create(&d, opts.clone()).unwrap();
@@ -7638,7 +7670,7 @@ fn a_write_settles_into_the_block_it_lands_in() {
         seal_bytes: 1 << 20,
         partition_bytes: Some(64 << 10),
         scan_block_cache: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -7700,7 +7732,7 @@ fn a_write_settles_into_the_block_it_lands_in() {
             seal_bytes: 1 << 20,
             partition_bytes: Some(64 << 10),
             scan_block_cache: true,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -7732,7 +7764,11 @@ fn a_builder_ahead_of_the_reader_fills_the_cache() {
         // The builder at the state's first scan: one scan here stands for
         // a state that is being scanned.
         ahead_in_core_scans_div: 0,
-        ..Options::default()
+        // In memory, the controller's FITS: the forced form's gate reads
+        // as out of core, where the builder waits for a state scanned
+        // many times (`Options::ahead_out_of_core_scans`).
+        zpages: supdb::ZPages::Auto,
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -7798,7 +7834,7 @@ fn a_builder_ahead_of_the_reader_fills_the_cache() {
             scan_block_cache: true,
             scan_cache_ahead: true,
             scan_cache_ahead_min_blocks: 0,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -7860,7 +7896,7 @@ fn a_key_held_by_many_pieces_counts_once_toward_a_wide_block() {
         tier_pieces: 0,
         // What is counted is the wide form: the block stays wide.
         forms_copy_hot_wide: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -7926,7 +7962,7 @@ fn a_wide_blocks_window_stops_at_the_scans_limit() {
             emit_lone_unsearched: lone,
             // The window is what is tested: the block stays wide.
             forms_copy_hot_wide: false,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -8011,7 +8047,7 @@ fn a_hot_wide_block_is_copied_and_kept_past_the_bound() {
             // The walk at which the copy pays by the fixed ratio; the
             // priced rule has a test of its own.
             forms_copy_wide_priced: false,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -8095,7 +8131,7 @@ fn a_hot_wide_blocks_copy_is_bought_once_its_walks_have_paid() {
             seal_bytes: 1 << 26,
             partition_bytes: Some(2 << 10),
             scan_block_cache: true,
-            ..Options::default()
+            ..common::options()
         };
         assert!(opts.forms_copy_hot_wide && opts.forms_copy_wide_priced);
         let mut db = Db::create(&d, opts).unwrap();
@@ -8306,7 +8342,7 @@ fn a_seal_drops_the_scan_snapshot_before_the_next_rehash() {
         seal_bytes: 1 << 20,
         partition_bytes: Some(64 << 10),
         scan_block_cache: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -8352,7 +8388,7 @@ fn a_direct_run_opened_after_a_landing_the_writer_has_not_seen_keeps_the_piece()
             seal_bytes: 1 << 20,
             partition_bytes: Some(64 << 10),
             scan_block_cache: true,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -8408,7 +8444,7 @@ fn a_scan_starts_at_the_first_partition_that_reaches_it() {
             seal_bytes: 1 << 20,
             partition_bytes: Some(1 << 10),
             scan_block_cache: block_cache,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -8442,7 +8478,7 @@ fn a_seek_brackets_its_search_in_the_top_level() {
             seal_bytes: 8 << 20,
             partition_bytes: Some(64 << 20),
             scan_block_cache: block_cache,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -8509,7 +8545,7 @@ fn an_ordered_load_goes_straight_into_segments() {
             scan_block_cache: block_cache,
             // The segments as the threshold left them, none merged.
             tier_pieces: 0,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts.clone()).unwrap();
         let mut m = ScanModel::default();
@@ -8650,7 +8686,7 @@ fn a_direct_run_streamed_from_its_table_is_the_run_the_copies_write() {
         seal_bytes: 64 << 20,
         partition_bytes: Some(1 << 20),
         direct_stream: stream,
-        ..Options::default()
+        ..common::options()
     };
     let drive = |d: &std::path::Path, stream: bool| -> (Db, ScanModel) {
         let mut db = Db::create(d, opts(stream)).unwrap();
@@ -8857,7 +8893,7 @@ fn a_direct_segment_recovers_to_its_last_commit_marker() {
         let opts = Options {
             seal_bytes: 1 << 20,
             partition_bytes: Some(1 << 20),
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -8880,7 +8916,7 @@ fn a_direct_segment_recovers_to_its_last_commit_marker() {
         let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
         std::io::Write::write_all(&mut f, &[0x2a; 777]).unwrap();
         drop(f);
-        let db = Db::open(&d, Options::default()).unwrap();
+        let db = Db::open(&d, common::options()).unwrap();
         assert!(!tmp.exists(), "recovered and removed");
         m.check(
             &db,
@@ -8904,7 +8940,7 @@ fn a_direct_segment_recovers_to_its_last_commit_marker() {
             m.vals.remove(key(k).as_bytes());
             m.touched.remove(key(k).as_bytes());
         }
-        let mut db = Db::open(&d, Options::default()).unwrap();
+        let mut db = Db::open(&d, common::options()).unwrap();
         m.check(&db, "two batches");
         for k in 200..300u32 {
             assert!(
@@ -8939,7 +8975,7 @@ fn a_direct_segment_recovers_to_its_last_commit_marker() {
             m.vals.remove(key(k).as_bytes());
             m.touched.remove(key(k).as_bytes());
         }
-        let db = Db::open(&d, Options::default()).unwrap();
+        let db = Db::open(&d, common::options()).unwrap();
         m.check(
             &db,
             "two batches, the third's record damaged under its marker",
@@ -8968,7 +9004,7 @@ fn a_direct_segment_recovers_to_its_last_commit_marker() {
             .expect("the closed segment as a partition");
         drop(db);
         std::fs::copy(d.join(&par), tmp_of(&d)).unwrap();
-        let db = Db::open(&d, Options::default()).unwrap();
+        let db = Db::open(&d, common::options()).unwrap();
         assert!(!tmp_of(&d).exists());
         assert_eq!(db.levels(), (parts, 0), "not recovered twice");
         m.check(&db, "the stale temp file removed");
@@ -8988,7 +9024,7 @@ fn a_value_the_record_cannot_hold_sends_its_batch_through_the_wal() {
         let opts = Options {
             seal_bytes: 1 << 20,
             partition_bytes: Some(1 << 20),
-            ..Options::default()
+            ..common::options()
         };
         let val = "x".repeat(opts.inline_bytes + usize::from(big));
         let mut db = Db::create(&d, opts).unwrap();
@@ -9009,7 +9045,7 @@ fn a_value_the_record_cannot_hold_sends_its_batch_through_the_wal() {
             assert!(tmp.exists(), "{name}: a segment open");
         }
         db.crash();
-        let db = Db::open(&d, Options::default()).unwrap();
+        let db = Db::open(&d, common::options()).unwrap();
         m.check(&db, &format!("{name}: every batch back after a crash"));
     }
 }
@@ -9149,7 +9185,7 @@ fn overlay_model_z(
             supdb::ZPages::Off
         },
         zpages_min_bytes: 0,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -9350,7 +9386,7 @@ fn a_reader_handle_sees_what_its_isolation_says() {
         seal_bytes: 64 << 10,
         partition_bytes: Some(128 << 10),
         l0_trigger: 2,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let key = |k: u32| format!("key-{k:05}").into_bytes();
@@ -9489,7 +9525,7 @@ fn readers_through_seals_and_merges(name: &str, zpages: bool, cache: bool) {
         partition_bytes: Some(64 << 10),
         l0_trigger: 2,
         scan_block_cache: cache,
-        ..Options::default()
+        ..common::options()
     };
     if zpages {
         opts.zpages = supdb::ZPages::Always;
@@ -9619,7 +9655,7 @@ fn readers_through_seals_and_merges(name: &str, zpages: bool, cache: bool) {
 #[test]
 fn the_reader_table_has_a_slot_for_each_handle() {
     let d = dir("reader-slots");
-    let db = Db::create(&d, Options::default()).unwrap();
+    let db = Db::create(&d, common::options()).unwrap();
     let mut held = Vec::new();
     while let Ok(r) = db.reader() {
         held.push(r);
@@ -9639,7 +9675,7 @@ fn the_reader_table_has_a_slot_for_each_handle() {
 #[test]
 fn a_reader_sees_the_replayed_writes_from_the_open_on() {
     let d = dir("reopen-watermark");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     for k in 0..300u32 {
         db.append(format!("key-{k:05}").as_bytes(), b"v0");
     }
@@ -9651,7 +9687,7 @@ fn a_reader_sees_the_replayed_writes_from_the_open_on() {
     db.delete(b"key-00001");
     db.commit().unwrap();
     drop(db);
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     let reader = db.reader().unwrap();
     assert_eq!(reader.isolation(), Isolation::Latest);
     assert_eq!(
@@ -9697,7 +9733,7 @@ fn a_reader_under_latest_sees_the_commit_of_a_key_it_settled_uncommitted() {
         l0_trigger: 64,
         scan_block_cache: true,
         scan_cache_ahead: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let key = |k: u32| format!("key-{k:05}");
@@ -9782,7 +9818,7 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
         ("first-partition-shuffled", true),
     ] {
         let d = dir(name);
-        let mut db = Db::create(&d, Options::default()).unwrap();
+        let mut db = Db::create(&d, common::options()).unwrap();
         let mut x = 0x9E37_79B9_7F4A_7C15u64;
         for i in 0..3000u32 {
             let k = if shuffled {
@@ -9819,7 +9855,7 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
         assert_eq!(n, 3000, "{name}");
     }
     let d = dir("first-partition-tombstone");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     for i in 0..3000u32 {
         db.append(&key(i), b"v");
     }
@@ -9842,7 +9878,7 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
         Options {
             partition_on_flush: false,
             flush_schedules: false,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -9869,7 +9905,7 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
         &d,
         Options {
             partition_on_flush: false,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -9902,7 +9938,7 @@ fn a_durable_only_sync_seals_an_ordered_load_as_its_first_partition() {
         &d,
         Options {
             adaptive_shape: true,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -9947,7 +9983,7 @@ fn a_lone_piece_is_promoted_at_open_without_a_read() {
     let n = 20_000u32;
     {
         // Without the shaping, a seal that is not a flush's leaves a piece.
-        let mut db = Db::create(&d, Options::default()).unwrap();
+        let mut db = Db::create(&d, common::options()).unwrap();
         for i in 0..n {
             db.append(format!("k{i:08}").as_bytes(), &val(i));
             if i % 1000 == 999 {
@@ -9963,7 +9999,7 @@ fn a_lone_piece_is_promoted_at_open_without_a_read() {
         &d,
         Options {
             adaptive_shape: true,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -9997,7 +10033,7 @@ fn overlapping_pieces_are_merged_once_the_store_is_read() {
             Options {
                 seal_bytes: 512 << 10,
                 l0_trigger: 100,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -10022,7 +10058,7 @@ fn overlapping_pieces_are_merged_once_the_store_is_read() {
         Options {
             adaptive_shape: true,
             l0_trigger: 100,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -10057,7 +10093,7 @@ fn a_seal_lands_while_the_writer_is_away() {
     let d = dir("seal-lands-away");
     let opts = Options {
         publish_in_background: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let key = |k: u32| format!("key-{k:06}");
@@ -10120,7 +10156,7 @@ fn a_flush_that_does_not_partition_merges_the_rest_in_the_background() {
                 // No merge of the seals' own: the pieces the flush leaves
                 // are the whole of what happens to the store.
                 l0_trigger: 100,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -10210,7 +10246,7 @@ fn a_reader_walks_the_forms_the_writer_maintains_at_commit() {
         // The commit's own maintenance, step by step: on the thread, which
         // commit a pass files is the thread's timing.
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -10422,7 +10458,7 @@ fn a_handle_reads_replaced_keys_over_pieces_only_forms() {
         scan_block_cache: true,
         commit_forms: true,
         forms_pieces_only: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let key = |k: u32| format!("key-{k:05}").into_bytes();
@@ -10597,7 +10633,7 @@ fn reader_threads_over_blocks_tuned(
         scan_block_cache: true,
         commit_forms,
         forms_pieces_only: pieces_only,
-        ..Options::default()
+        ..common::options()
     };
     tune(&mut opts);
     let budgeted = opts.scan_cache_bytes > 0;
@@ -10806,7 +10842,7 @@ fn the_adaptive_upkeep_holds_only_for_what_a_commit_leaves_to_a_read() {
         // (`Options::forms_settle_every` and `forms_settle_builds` off).
         forms_settle_every: false,
         forms_settle_builds: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     // The settle bound is 2% of the partitions' keys: 400.
@@ -10879,7 +10915,7 @@ fn a_buffered_commit_near_reads_files_its_burst_and_lends_a_small_batch() {
         partition_bytes: Some(256 << 10),
         // The plain seal, so the few hundred writes below seal nothing.
         seal_max_pct: 0,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     // The settle bound is 2% of the partitions' keys, 400: the batches
@@ -10982,7 +11018,7 @@ fn a_burst_filed_in_the_commit_leaves_its_builds_to_the_walk() {
             partition_bytes: Some(256 << 10),
             seal_max_pct: 0,
             forms_settle_builds_filed: filed,
-            ..Options::default()
+            ..common::options()
         };
         assert!(opts.forms_settle_every && opts.forms_settle_builds);
         let mut db = Db::create(&d, opts).unwrap();
@@ -11089,7 +11125,7 @@ fn a_commit_that_syncs_lends_its_burst_to_the_thread() {
         upkeep_pace_syncs_bp: 0,
         partition_bytes: Some(256 << 10),
         seal_max_pct: 0,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let keys = 20_000u32;
@@ -11175,7 +11211,7 @@ fn a_block_the_reads_pay_for_is_held_as_a_copy_too() {
         // for no block and promotes nothing, which is the point of the
         // maintenance rather than a fault in it.
         commit_forms: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -11306,7 +11342,7 @@ fn a_piece_kept_across_a_merge_is_ranked_against_the_partition_it_meets() {
         seal_bytes: 1 << 20,
         partition_bytes: Some(64 << 20),
         l0_trigger: 2,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
@@ -11453,7 +11489,7 @@ fn a_scan_snapshot_stands_across_a_publish_that_leaves_the_memtables() {
             snapshot_runs: runs,
             // The builds counted below are the scans' own.
             forms_settle_backlog_pct: 0,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -11676,7 +11712,7 @@ fn every_handle_after_the_first_adopts_the_snapshot_it_published() {
         // its own; the backlog bound would, so it is off here.
         forms_settle_backlog_pct: 0,
         share_snapshot: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -11747,7 +11783,7 @@ fn a_handle_that_adopts_a_snapshot_sees_the_keys_written_past_it() {
         // adoptable, which is what this test is about.
         snapshot_adopt_behind: 4096,
         commit_forms: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -11881,7 +11917,7 @@ fn extend_order_model_with(block_cache: bool, pieces_only: bool) {
         // store before its seal: built whatever the reads
         // (`Options::seal_snapshot_far`).
         seal_snapshot_far: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -11987,7 +12023,7 @@ fn the_cap_and_the_trigger_follow_the_reads_and_relax_over_a_write_only_stretch(
         adaptive_trigger: true,
         trigger_reading: 2,
         lag_relax_pct: 100,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let key = |k: u32| format!("key-{k:06}");
@@ -12084,7 +12120,7 @@ fn carry_model_with(block_cache: bool, pieces_only: bool) {
         // store before its seal: built whatever the reads
         // (`Options::seal_snapshot_far`).
         seal_snapshot_far: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -12183,7 +12219,7 @@ fn the_writer_maintains_the_forms_once_a_reader_handle_is_live() {
         // The commit's own maintenance, step by step: on the thread, which
         // commit a pass files is the thread's timing.
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -12272,7 +12308,7 @@ fn the_writers_own_handle_takes_the_forms_it_maintains() {
             // The commit's own maintenance, step by step: on the thread, which
             // commit a pass files is the thread's timing.
             upkeep: supdb::Upkeep::Inline,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -12340,7 +12376,7 @@ fn a_store_below_the_seal_floor_still_seals_once_it_has_bytes() {
             seal_bytes: 32 << 20,
             seal_max_pct: cap,
             partition_bytes: Some(2 << 20),
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         for k in 0..9000u32 {
@@ -12404,7 +12440,7 @@ fn the_seal_is_sized_by_the_data_and_not_by_the_file() {
                 ..Default::default()
             },
             seal_on_file: on_file,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts.clone()).unwrap();
         for k in 0..n {
@@ -12488,7 +12524,7 @@ fn a_write_burst_is_settled_once_its_backlog_passes_the_bound() {
             // (`Options::forms_settle_every` and `forms_settle_builds` off).
             forms_settle_every: false,
             forms_settle_builds: false,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -12560,7 +12596,7 @@ fn the_settle_bound_is_a_share_of_the_partitions_keys() {
             // (`Options::forms_settle_every` and `forms_settle_builds` off).
             forms_settle_every: false,
             forms_settle_builds: false,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -12637,7 +12673,7 @@ fn a_reader_meets_a_block_gone_wide_through_the_forms() {
         // The commit's own maintenance, step by step: on the thread, which
         // commit a pass files is the thread's timing.
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -12733,7 +12769,7 @@ fn the_copies_survive_a_merge_with(compact: bool) {
         // The freeze's own carry, which this is about: off, the next look
         // at the log carries the tables (`the_next_look_carries_the_forms_across_a_freeze`).
         freeze_settles: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -12887,7 +12923,7 @@ fn same_blocks_carries(long: bool, from_index: bool) -> (u64, u64, u64, [u64; 2]
         upkeep: supdb::Upkeep::Inline,
         freeze_settles: true,
         same_blocks_from_index: from_index,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -13023,7 +13059,7 @@ fn the_forms_survive_a_seal_with(snapshot_carry: bool) {
         // The freeze's own carry, which this is about: off, the next look
         // at the log carries the tables (`the_next_look_carries_the_forms_across_a_freeze`).
         freeze_settles: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -13157,7 +13193,7 @@ fn the_forms_survive_a_direct_runs_start() {
         // The freeze's own carry, which this is about: off, the next look
         // at the log carries the tables (`the_next_look_carries_the_forms_across_a_freeze`).
         freeze_settles: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -13244,7 +13280,9 @@ fn a_publish_starts_the_builder_and_a_commit_installs_its_forms_with(upkeep: sup
         commit_forms: true,
         build_ahead_on_publish: true,
         upkeep,
-        ..Options::default()
+        // In memory, as `a_builder_ahead_of_the_reader_fills_the_cache`.
+        zpages: supdb::ZPages::Auto,
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -13329,7 +13367,7 @@ fn the_splice_bounds_off_the_top_level_are_the_records_bounds() {
                         partition_bytes: Some(32 << 10),
                         scan_block_cache: true,
                         boundary_keys_from_top: on,
-                        ..Options::default()
+                        ..common::options()
                     },
                 )
                 .unwrap();
@@ -13417,7 +13455,7 @@ fn the_builder_ahead_starts_in_core_and_out_of_core_only_under_the_option() {
             zpages: supdb::ZPages::Off,
             ahead_out_of_core: ooc,
             ahead_out_of_core_scans: scans,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         db.zgate_set(gate);
@@ -13490,7 +13528,7 @@ fn a_scan_starts_the_builder_ahead_in_core_once_the_state_is_scanned() {
             zpages: supdb::ZPages::Off,
             ahead_in_core_scans_div: div,
             ahead_out_of_core_scans: 0,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -13579,7 +13617,7 @@ fn the_forms_are_published_when_a_handle_asks() {
         // The commit's own maintenance, step by step: on the thread, which
         // commit a pass files is the thread's timing.
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -13685,7 +13723,7 @@ fn a_table_the_commit_filled_takes_the_writes_after_it() {
         // The commit's own maintenance, step by step: on the thread, which
         // commit a pass files is the thread's timing.
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -13738,7 +13776,7 @@ fn a_handle_claimed_after_a_burst_adopts_the_writers_snapshot() {
         scan_block_cache: true,
         scan_cache_ahead: false,
         commit_forms: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -13825,7 +13863,7 @@ fn a_burst_is_settled_by_its_backlog_only_near_a_scan() {
         // The commit's own rules, whose deferred burst the upkeep thread
         // would file ahead of the read.
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -13908,7 +13946,7 @@ fn pieces_merge_case(tier_pieces: usize, l0_trigger: usize) {
         tier_pieces: tier,
         scan_block_cache: true,
         commit_forms: true,
-        ..Options::default()
+        ..common::options()
     };
     let key = |i: u64| format!("{i:016}");
     let (da, dbd) = (
@@ -14005,7 +14043,7 @@ fn the_snapshots_runs_answer_as_the_chains_do() {
             // every step below, so the reads meet its versions too.
             snapshot_keeper: keeper,
             snapshot_keeper_recent_pct: 0,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -14119,7 +14157,7 @@ fn the_snapshots_runs_answer_as_the_chains_do() {
         drop(reader);
         drop(later);
         drop(db);
-        let db = Db::open(&d, Options::default()).unwrap();
+        let db = Db::open(&d, common::options()).unwrap();
         m.check(&db, &format!("cache {block_cache}: reopened"));
     }
 }
@@ -14151,7 +14189,7 @@ fn the_run_keeper_keeps_the_published_snapshot_current() {
             // burst's commit, whose upkeep sorted the live table again
             // where the keeper carries it across a landing anywhere else.
             publish_in_background: false,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -14302,7 +14340,7 @@ fn the_run_keeper_keeps_the_published_snapshot_current() {
         drop(reader);
         drop(later);
         drop(db);
-        let db = Db::open(&d, Options::default()).unwrap();
+        let db = Db::open(&d, common::options()).unwrap();
         m.check(&db, &format!("{block_cache} {pct}: reopened"));
     }
 }
@@ -14332,7 +14370,7 @@ fn a_replacing_write_patches_a_copy_in_place() {
         // commit a pass files is the thread's timing, and a count read
         // before the pass began counts a table nothing has been filed into.
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -14420,7 +14458,7 @@ fn a_scan_builds_the_snapshot_only_where_a_block_needs_it() {
             // (`Options::forms_settle_every` and `forms_settle_builds` off).
             forms_settle_every: false,
             forms_settle_builds: false,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -14642,7 +14680,7 @@ fn a_failed_landing_stops_the_seals_behind_it_and_a_reopen_replays_them() {
     let opts = Options {
         seal_bytes: 1 << 30,
         adaptive_shape: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
@@ -14758,7 +14796,7 @@ fn a_merge_that_finishes_while_a_seal_is_between_its_phases_lands_after_it() {
         seal_bytes: 1 << 20,
         partition_bytes: Some(64 << 20),
         l0_trigger: 2,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
@@ -14857,7 +14895,7 @@ fn a_merge_that_finishes_while_a_seal_is_between_its_phases_lands_after_it() {
 #[test]
 fn a_held_handle_never_names_an_entry_a_direct_run_left_uncommitted() {
     let d = dir("held-direct-exit");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     let r = db.reader().unwrap();
     // The first key of an empty store opens an ordered run, left
     // uncommitted.
@@ -14902,7 +14940,7 @@ fn a_handles_scan_limit_counts_only_committed_keys() {
     let d = dir("scan-limit-committed");
     let opts = Options {
         direct_ingest: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     for k in 0..20u32 {
@@ -14938,7 +14976,7 @@ fn a_handle_adopts_no_snapshot_past_its_commit() {
     let d = dir("adopt-past-commit");
     let opts = Options {
         direct_ingest: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     for k in 0..20u32 {
@@ -15006,7 +15044,7 @@ fn reader_handles_across_seals_see_every_value_once_and_in_order() {
         seal_bytes: 1 << 30,
         partition_bytes: Some(1 << 30),
         l0_trigger: 1 << 20,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let keys = 2000u32;
@@ -15154,7 +15192,7 @@ fn seal_snapshot_store(name: &str) -> (Db, ScanModel) {
             // store before its seal: built whatever the reads
             // (`Options::seal_snapshot_far`).
             seal_snapshot_far: true,
-            ..Options::default()
+            ..common::options()
         },
     )
 }
@@ -15254,7 +15292,7 @@ fn a_seal_far_from_reads_builds_no_copy() {
             &format!("seal-copy-far-{far}"),
             Options {
                 seal_snapshot_far: far,
-                ..Options::default()
+                ..common::options()
             },
         );
         db.hold_seal_landing(true);
@@ -15319,7 +15357,7 @@ fn a_seal_far_from_reads_builds_no_copy() {
                 l0_trigger: 1 << 20,
                 seal_snapshot_far: far,
                 land_ranks_far: far,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -15387,7 +15425,7 @@ fn a_seal_far_from_reads_builds_no_copy() {
             &d,
             Options {
                 drain_snapshot,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -15434,7 +15472,7 @@ fn the_pieces_are_ranked_whole_only_under_the_arm() {
                 // One seal's pieces stand until the test is done with them.
                 l0_trigger: 1 << 20,
                 piece_ranks_whole: whole,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -15506,7 +15544,7 @@ fn a_frozen_tables_snapshot_outlives_the_state_it_was_published_in() {
             Options {
                 frozen_snaps,
                 seal_snapshot_far: true,
-                ..Options::default()
+                ..common::options()
             },
         );
         db.hold_seal_landing(true);
@@ -15559,7 +15597,7 @@ fn the_seal_takes_the_order_the_writers_freeze_carried() {
         // The order set at the freeze itself, which this is about: off,
         // the look that carries the snapshot races the seal's own sort.
         freeze_settles: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -15712,7 +15750,7 @@ fn a_live_write_over_the_frozen_table_is_one_key_on_every_scan_path() {
 /// of their own.
 fn scan_path_arms() -> [(&'static str, Options); 10] {
     [
-        ("default", Options::default()),
+        ("default", common::options()),
         // The compact form forced, with the block cache and without it: the
         // block path over the form files, and the merge and bulk-walk paths
         // through them.
@@ -15721,7 +15759,7 @@ fn scan_path_arms() -> [(&'static str, Options); 10] {
             Options {
                 zpages: supdb::ZPages::Always,
                 zpages_min_bytes: 0,
-                ..Options::default()
+                ..common::options()
             },
         ),
         (
@@ -15730,7 +15768,7 @@ fn scan_path_arms() -> [(&'static str, Options); 10] {
                 zpages: supdb::ZPages::Always,
                 zpages_min_bytes: 0,
                 scan_block_cache: false,
-                ..Options::default()
+                ..common::options()
             },
         ),
         // The overlay walk cut by rank, as it was before the cursor.
@@ -15741,7 +15779,7 @@ fn scan_path_arms() -> [(&'static str, Options); 10] {
                 zpages_min_bytes: 0,
                 scan_block_cache: false,
                 zpages_walk_cursor: false,
-                ..Options::default()
+                ..common::options()
             },
         ),
         (
@@ -15749,42 +15787,42 @@ fn scan_path_arms() -> [(&'static str, Options); 10] {
             Options {
                 scan_merge: false,
                 scan_block_cache: false,
-                ..Options::default()
+                ..common::options()
             },
         ),
         (
             "nocache",
             Options {
                 scan_block_cache: false,
-                ..Options::default()
+                ..common::options()
             },
         ),
         (
             "lazy",
             Options {
                 scan_lazy_snapshot: true,
-                ..Options::default()
+                ..common::options()
             },
         ),
         (
             "runs",
             Options {
                 snapshot_runs: true,
-                ..Options::default()
+                ..common::options()
             },
         ),
         (
             "unshared",
             Options {
                 share_snapshot: false,
-                ..Options::default()
+                ..common::options()
             },
         ),
         (
             "nofrozen",
             Options {
                 frozen_snaps: false,
-                ..Options::default()
+                ..common::options()
             },
         ),
     ]
@@ -15804,7 +15842,7 @@ fn the_writer_keeps_its_live_snapshot_across_a_landing() {
             seal_bytes: 1 << 30,
             partition_bytes: Some(64 << 10),
             direct_ingest: false,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -15940,7 +15978,7 @@ fn load_ordered_with_tail(d: &std::path::Path, n: u32) -> Db {
             adaptive_shape: true,
             seal_bytes: 1 << 20,
             partition_bytes: Some(8 << 20),
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -16024,7 +16062,7 @@ fn an_ordered_tail_handed_at_sync_is_promoted_beside_the_partition() {
         &d,
         Options {
             adaptive_shape: true,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -16098,7 +16136,7 @@ fn a_write_after_a_handed_seal_takes_a_fresh_table_from_whichever_side_swapped()
                 // Never on its own: the whole table is the sync's to hand.
                 seal_bytes: 1 << 40,
                 partition_bytes: Some(64 << 20),
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -16385,7 +16423,7 @@ fn a_writer_freezes_into_room_while_three_seals_are_held() {
 #[test]
 fn a_fourth_freeze_waits_for_the_front_to_land() {
     let key = |k: u32| format!("key-{k:05}");
-    let (mut db, mut m, _) = partitions_under_a_piece("fourth-freeze", Options::default());
+    let (mut db, mut m, _) = partitions_under_a_piece("fourth-freeze", common::options());
     let watch = Watchdog::arm("a freeze waited for a held seal, or the fourth past the release");
     db.hold_seal_landing(true);
     // The durable phase held as well, so once the release lets the front
@@ -16445,7 +16483,7 @@ fn a_handed_tail_freezes_into_room_beside_two_seals() {
         "handed-into-room",
         Options {
             adaptive_shape: true,
-            ..Options::default()
+            ..common::options()
         },
     );
     let watch = Watchdog::arm("a freeze or the write after the hand-off waited for a held seal");
@@ -16519,7 +16557,7 @@ fn copy_store(from: &std::path::Path, to: &std::path::Path) {
 fn a_crash_with_three_seals_in_flight_replays_them_all() {
     for between in [false, true] {
         let name = format!("crash-three-{between}");
-        let (mut db, mut m, src) = partitions_under_a_piece(&name, Options::default());
+        let (mut db, mut m, src) = partitions_under_a_piece(&name, common::options());
         let watch = Watchdog::arm("a freeze waited for a held seal");
         if between {
             db.hold_seal_durable(true);
@@ -16548,7 +16586,7 @@ fn a_crash_with_three_seals_in_flight_replays_them_all() {
         // Opened as the store was made: no merge of the pieces at open.
         let opts = Options {
             l0_trigger: 64,
-            ..Options::default()
+            ..common::options()
         };
         let opened = Db::open(&copy, opts.clone()).unwrap();
         m.check(&opened, &format!("{name}: the crash copy reopened"));
@@ -16577,7 +16615,7 @@ fn readers_on_threads_keep_answering_beside_three_frozen_tables() {
         seal_bytes: 1 << 30,
         partition_bytes: Some(64 << 10),
         l0_trigger: 2,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let keys = 3000u32;
@@ -16735,7 +16773,7 @@ fn a_handed_tables_seal_snapshot_serves_the_state_that_freezes_it() {
                 // the store before its seal: built whatever the reads
                 // (`Options::seal_snapshot_far`).
                 seal_snapshot_far: true,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -16811,7 +16849,7 @@ fn a_hashed_tail_handed_beside_a_seal_in_flight_lands_as_a_piece() {
             sync: supdb::SyncPolicy::EveryN(u32::MAX),
             // Each seal's own WAL, retired by its own landing.
             seal_rotates_wal: true,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -16979,7 +17017,7 @@ fn a_handed_tables_log_is_retired_at_its_landing_and_replays_before_it() {
     let opts = || Options {
         adaptive_shape: true,
         seal_rotates_wal: true,
-        ..Options::default()
+        ..common::options()
     };
     // The hashed tail: updates over a partition, through the WAL.
     {
@@ -17161,7 +17199,7 @@ fn a_landing_that_replaces_the_live_table_carries_no_form() {
         // The writer files at its own commit: the position the forms are
         // current to is the writer's, not a thread's.
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -17261,7 +17299,7 @@ fn a_form_dropped_under_a_landings_carry_is_retracted_at_the_writers_look() {
         // (`Options::forms_settle_every` and `forms_settle_builds` off).
         forms_settle_every: false,
         forms_settle_builds: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -17382,7 +17420,7 @@ fn a_scan_takes_no_form_published_after_the_commit_it_reads_at() {
         scan_cache_bytes: 64 << 20,
         commit_forms: true,
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let key = |k: u32| format!("key-{k:05}");
@@ -17468,7 +17506,7 @@ fn an_open_cut_tail_handed_beside_a_seal_in_flight_is_promoted_on_its_keys() {
             adaptive_shape: true,
             seal_bytes: 512 << 10,
             partition_bytes: Some(8 << 20),
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -17556,7 +17594,7 @@ fn an_open_cut_tail_handed_beside_a_seal_in_flight_is_promoted_on_its_keys() {
         &d,
         Options {
             adaptive_shape: true,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -17617,7 +17655,7 @@ fn a_seal_that_keeps_the_wal_retires_files_by_sequence() {
         // Ascending keys would go to ordered ingest, which writes a
         // segment and not the log.
         direct_ingest: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let mut want: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
@@ -17706,7 +17744,7 @@ fn a_rotated_wal_torn_in_its_new_file_reopens_to_a_prefix() {
         // Ascending keys would go to ordered ingest, which writes a
         // segment and not the log.
         direct_ingest: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     // Records until the log has rotated once and before the memtable
@@ -17789,7 +17827,7 @@ fn a_commit_past_the_threshold_keeps_writing_while_the_frozen_list_is_full() {
         // Ascending keys would go to ordered ingest, which writes a
         // segment and not the log.
         direct_ingest: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     // A commit that waited would never return; say so rather than hang.
@@ -17891,7 +17929,7 @@ fn a_commit_seals_whenever_the_sealer_is_idle() {
             seal_max_pct: 0,
             sync: supdb::SyncPolicy::EveryN(u32::MAX),
             direct_ingest: false,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut want: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
@@ -17999,7 +18037,7 @@ fn a_fresh_store_under_the_shape_seals_its_first_load_at_the_floor() {
             seal_rotates_wal: false,
             seal_first_floor: floor,
             sync: supdb::SyncPolicy::EveryN(u32::MAX),
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let n = 30_000u32;
@@ -18048,7 +18086,7 @@ fn a_closed_wal_outlives_a_seal_between_its_phases_and_a_crash_there() {
         seal_max_pct: 0,
         sync: supdb::SyncPolicy::EveryN(u32::MAX),
         direct_ingest: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let mut want: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
@@ -18125,7 +18163,7 @@ fn a_flush_publishes_its_seal_before_the_seal_is_durable() {
             Options {
                 publish_in_background: background,
                 direct_ingest: false,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -18210,7 +18248,7 @@ fn the_next_look_carries_the_forms_across_a_freeze_with(
         freeze_settles: false,
         snapshot_carry,
         upkeep,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -18322,7 +18360,7 @@ fn a_commit_that_freezes_leaves_the_carry_to_the_upkeep_thread() {
         forms_settle_backlog_pct: 0,
         freeze_settles: false,
         upkeep: supdb::Upkeep::Background(1),
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -18400,7 +18438,7 @@ fn a_commit_past_the_bound_holds_for_the_thread() {
         upkeep_lag_pct: 7,
         upkeep_batch_pct: 3,
         upkeep: supdb::Upkeep::Background(1),
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -18456,7 +18494,7 @@ fn a_pending_manifest_is_the_store_only_once_its_segment_reads_back_whole() {
                 checksums,
                 ..Default::default()
             },
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts.clone()).unwrap();
         let mut m = ScanModel::default();
@@ -18524,7 +18562,7 @@ fn a_clean_close_leaves_no_pending_name() {
     let opts = Options {
         seal_bytes: 1 << 20,
         manifest_pending: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     for k in (0..2000u32).rev() {
@@ -18550,7 +18588,7 @@ fn a_store_from_before_the_pending_flags_opens_with_both_slots_rewritten() {
     let d = dir("manifest-upgrade");
     let opts = Options {
         seal_bytes: 1 << 20,
-        ..Options::default()
+        ..common::options()
     };
     let key = |k: u32| format!("key-{k:05}");
     let mut db = Db::create(&d, opts.clone()).unwrap();
@@ -18638,7 +18676,7 @@ fn a_run_whose_keys_the_table_keeps_leaves_the_segment_the_copies_leave() {
         partition_bytes: Some(1 << 20),
         direct_derive_keys: derive,
         direct_keys_in_stream: in_stream,
-        ..Options::default()
+        ..common::options()
     };
     let drive = |d: &std::path::Path, derive: bool, in_stream: bool| {
         let mut db = Db::create(d, opts(derive, in_stream)).unwrap();
@@ -18724,7 +18762,7 @@ fn a_run_whose_keys_the_table_keeps_leaves_the_segment_the_copies_leave() {
 #[test]
 fn a_failed_presync_is_the_flushs_answer() {
     let d = dir("presyncfail");
-    let opts = Options::default();
+    let opts = common::options();
     let mut db = Db::create(&d, opts.clone()).unwrap();
     for c in 0u32..500 {
         db.append(format!("k{c:04}").as_bytes(), &c.to_le_bytes());
@@ -18766,7 +18804,7 @@ fn a_scans_answers_are_the_same_with_the_directory_hint_and_without() {
         let d = dir(&format!("{name}-{}", if hint { "hint" } else { "plain" }));
         let opts = Options {
             seek_prefetch_dir: hint,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         for k in 0..keys {
@@ -18854,7 +18892,7 @@ fn a_scans_answers_are_the_same_with_the_directory_hint_and_without() {
 fn a_seek_counts_its_directory_hint_once_a_scan_and_the_threads_pass_none() {
     // A drained store, one partition: every scan of ten is one seek.
     let d = dir("dirhint-count");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     let key = |k: u32| format!("key-{k:06}").into_bytes();
     for k in 0..5_000u32 {
         db.append(&key(k), b"0");
@@ -18905,7 +18943,7 @@ fn a_seek_counts_its_directory_hint_once_a_scan_and_the_threads_pass_none() {
         upkeep_inline_bursts: true,
         partition_bytes: Some(256 << 10),
         seal_max_pct: 0,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let keys = 20_000u32;
@@ -18964,7 +19002,7 @@ fn the_directory_hint_writes_the_segment_and_the_ordered_index_the_default_does(
         });
         let opts = Options {
             seek_prefetch_dir: hint,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         for c in 0u32..3000 {
@@ -19037,7 +19075,7 @@ fn a_load_nobody_reads_files_no_forms() {
             // random writes after it overlay their blocks.
             seal_bytes: 1 << 20,
             forms_settle_far: far,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         // The handle the suite holds from the open, so the forms are
@@ -19161,7 +19199,7 @@ fn a_handle_claimed_between_two_scans_leaves_the_writers_scan_whole_before_the_f
             promote: false,
             partition_bytes: Some(1 << 10),
             direct_ingest: false,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -19258,7 +19296,7 @@ fn a_loose_rotation_syncs_nothing_and_a_gap_at_its_boundary_ends_the_log() {
         seal_bytes: 16 << 10,
         // Ascending keys through the log, not a direct run.
         direct_ingest: false,
-        ..Options::default()
+        ..common::options()
     };
     let key = |i: u32| format!("k{i:05}").into_bytes();
     let val = vec![7u8; 100];
@@ -19406,7 +19444,7 @@ fn the_first_sync_by_policy_after_a_loose_rotation_syncs_the_closed_file_and_cha
         seal_rotates_wal: false,
         seal_bytes: 16 << 10,
         direct_ingest: false,
-        ..Options::default()
+        ..common::options()
     };
     // Commits of eight records until the log rotates once; how many that
     // takes, counted on a store of its own, so the policy below can sync
@@ -19500,7 +19538,7 @@ fn the_oracle_holds_with_loose_rotations() {
             sync: supdb::SyncPolicy::EveryN(u32::MAX),
             seal_rotates_wal: false,
             seal_bytes: 2 << 10,
-            ..Options::default()
+            ..common::options()
         },
     );
     assert!(w.wal_rotations > 0 && w.rotated_unsynced > 0, "{w:?}");
@@ -19534,7 +19572,7 @@ fn a_bursts_batches_after_the_first_are_lent_a_batch_behind_the_thread() {
                 upkeep_pace_holds: hold,
                 partition_bytes: Some(256 << 10),
                 seal_max_pct: 0,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -19657,7 +19695,7 @@ fn a_syncing_commits_large_batch_is_held_to_the_share() {
                 zpages: supdb::ZPages::Off,
                 partition_bytes: Some(256 << 10),
                 seal_max_pct: 0,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -19747,7 +19785,7 @@ fn a_syncing_commit_a_scan_follows_holds_for_its_filing() {
                 zpages: supdb::ZPages::Off,
                 partition_bytes: Some(256 << 10),
                 seal_max_pct: 0,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -19865,7 +19903,7 @@ fn a_syncing_commits_burst_batches_are_paced_behind_the_thread() {
                 zpages: supdb::ZPages::Off,
                 partition_bytes: Some(256 << 10),
                 seal_max_pct: 0,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -19973,7 +20011,7 @@ fn scans_that_meet_their_blocks_once_out_of_core_keep_no_forms() {
             scan_forms_off_ghost_bits: 6,
             zpages: supdb::ZPages::Off,
             partition_bytes: Some(256 << 10),
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -20190,7 +20228,7 @@ fn forms_given_up_are_taken_back_by_a_stretch_of_small_commits_with_no_scan() {
                 zpages: supdb::ZPages::Off,
                 partition_bytes: Some(256 << 10),
                 upkeep,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -20369,7 +20407,7 @@ fn the_writes_since_a_scan_are_counted_once_across_a_landing() {
                 scan_block_cache: true,
                 partition_bytes: Some(256 << 10),
                 upkeep,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -20450,7 +20488,7 @@ fn the_directory(d: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
 #[test]
 fn a_second_open_of_a_store_is_refused_until_the_first_is_gone() {
     let d = dir("second-open");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     for i in 0..1000u32 {
         db.append(format!("k{i:05}").as_bytes(), b"v");
     }
@@ -20460,8 +20498,8 @@ fn a_second_open_of_a_store_is_refused_until_the_first_is_gone() {
     std::fs::write(d.join("seg-00000000000000ff.sup"), b"an orphan").unwrap();
     let before = the_directory(&d);
     for (what, e) in [
-        ("open", Db::open(&d, Options::default()).err()),
-        ("create", Db::create(&d, Options::default()).err()),
+        ("open", Db::open(&d, common::options()).err()),
+        ("create", Db::create(&d, common::options()).err()),
     ] {
         let e = e.unwrap_or_else(|| panic!("a second {what} of a live store"));
         assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{what}: {e}");
@@ -20475,7 +20513,7 @@ fn a_second_open_of_a_store_is_refused_until_the_first_is_gone() {
     db.append(b"k99999", b"after");
     db.commit().unwrap();
     db.close().unwrap();
-    let mut db = Db::open(&d, Options::default()).unwrap();
+    let mut db = Db::open(&d, common::options()).unwrap();
     assert_eq!(db.count(b"k00500").unwrap(), 1);
     assert_eq!(db.count(b"k99999").unwrap(), 1);
     assert!(
@@ -20485,7 +20523,7 @@ fn a_second_open_of_a_store_is_refused_until_the_first_is_gone() {
     db.append(b"k99998", b"before the crash");
     db.commit().unwrap();
     db.crash();
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     assert_eq!(db.count(b"k99998").unwrap(), 1, "a crashed store opens");
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
@@ -20500,7 +20538,7 @@ fn a_store_open_in_one_process_is_refused_to_another() {
     const PROBE: &str = "SUPDB_LOCK_PROBE";
     const TEST: &str = "a_store_open_in_one_process_is_refused_to_another";
     if let Some(p) = std::env::var_os(PROBE) {
-        let code = match Db::open(std::path::Path::new(&p), Options::default()) {
+        let code = match Db::open(std::path::Path::new(&p), common::options()) {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 3,
             Err(_) => 4,
             Ok(_) => 5,
@@ -20519,7 +20557,7 @@ fn a_store_open_in_one_process_is_refused_to_another() {
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
     };
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     db.append(b"k", b"v");
     db.commit().unwrap();
     let (code, err) = probe(&d);

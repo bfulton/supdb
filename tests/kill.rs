@@ -48,7 +48,7 @@ fn key(batch: u32, j: u32) -> Vec<u8> {
 /// acknowledged on stdout once its commit has returned. Killed from
 /// outside; never returns.
 fn child(dir: &Path) -> ! {
-    let mut db = Db::create(dir, Options::default()).unwrap();
+    let mut db = Db::create(dir, common::options()).unwrap();
     let out = std::io::stdout();
     let mut i = 0u32;
     loop {
@@ -119,7 +119,7 @@ fn a_killed_writers_acknowledged_batches_are_all_there() {
             }
         }
         let last = last.expect("no batch acknowledged");
-        let db = Db::open(&d, Options::default()).unwrap();
+        let db = Db::open(&d, common::options()).unwrap();
         for i in 0..=last {
             for j in 0..BATCH {
                 assert_eq!(
@@ -169,7 +169,7 @@ fn buffered_key(i: u32) -> Vec<u8> {
 fn buffered_options() -> Options {
     Options {
         sync: SyncPolicy::EveryN(u32::MAX),
-        ..Options::default()
+        ..common::options()
     }
 }
 

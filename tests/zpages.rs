@@ -246,13 +246,17 @@ type Model = BTreeMap<Vec<u8>, Vec<Vec<u8>>>;
 /// (`BuildCtx::cut_known`, "an overlay key's cut is behind the walk"),
 /// with the second form off as well and at the commit this work began from.
 /// A test that wants the cache says so.
+///
+/// Under the stride switch (`common::stride_switch`) every build asks for
+/// the stride form as well, before `extra`, so a test about the block form
+/// says so by setting `zpages_stride` itself.
 fn forced(extra: impl FnOnce(&mut Options)) -> Options {
-    let mut o = Options {
+    let mut o = common::with_stride(Options {
         zpages: ZPages::Always,
         zpages_min_bytes: 0,
         scan_block_cache: false,
         ..Options::default()
-    };
+    });
     extra(&mut o);
     o
 }
@@ -366,7 +370,7 @@ const ORACLE_KEYS: usize = 240;
 /// upkeep trips its assertion (see `forced`), and the stores it is compared
 /// with are opened the same way.
 fn oracle_opts(z: bool, inline: bool, raw_tails: bool) -> Options {
-    Options {
+    let o = Options {
         zpages: if z { ZPages::Always } else { ZPages::Off },
         zpages_record_coding: raw_tails,
         zpages_raw_tails: raw_tails,
@@ -381,6 +385,13 @@ fn oracle_opts(z: bool, inline: bool, raw_tails: bool) -> Options {
         },
         l0_trigger: 2,
         ..Options::default()
+    };
+    // The `z` store asks for the stride form under the stride switch, as
+    // `forced` does; the store it is compared with is the raw form's.
+    if z {
+        common::with_stride(o)
+    } else {
+        o
     }
 }
 
@@ -589,9 +600,11 @@ fn oracle(inline: bool, raw_tails: bool) {
     // No form file of the block body is counted a stride file, the
     // raw-tailed coding's among them: `ZCounts::stride_files` counts the
     // one kind, and under the raw tails every file here is the other
-    // coding of the block body, a kind beside the block coding's.
+    // coding of the block body, a kind beside the block coding's. Under
+    // the stride switch the `z` store asks for the stride form, and a
+    // partition it holds is a stride file by right.
     assert!(
-        c.form_files > 0 && c.stride_files == 0,
+        c.form_files > 0 && (common::stride_switch() || c.stride_files == 0),
         "the block body's files are no stride files: {c:?}"
     );
     if inline {
@@ -3079,6 +3092,10 @@ fn the_overlay_walk_through_the_cursor_opens_a_group_a_group_where_the_walk_by_r
             forced(|o| {
                 o.zpages_walk_cursor = by_cursor;
                 o.inline_bytes = 1 << 16;
+                // The groups a walk opens are the block body's: the keys
+                // here are one run of one width that the stride form
+                // would hold, and it opens none.
+                o.zpages_stride = ZStride::Off;
             }),
         )
         .unwrap();
@@ -12645,6 +12662,9 @@ fn recode_store_with(
         forced(|o| {
             o.partition_bytes = Some(160 << 10);
             o.zpages_drop_raw = true;
+            // The re-code moves the block body between its codings and is
+            // refused beside the stride form (`check_options`).
+            o.zpages_stride = ZStride::Off;
             o.zpages_recode = true;
             o.zpages_memo = false;
             o.zpages_inject = Some(inject.clone());
@@ -12820,6 +12840,7 @@ fn a_kept_form_file_makes_every_later_recode_an_exchange() {
         forced(|o| {
             o.partition_bytes = Some(160 << 10);
             o.zpages_drop_raw = true;
+            o.zpages_stride = ZStride::Off;
             o.zpages_recode = true;
             o.zpages_recode_keep = true;
             o.zpages_memo = false;
@@ -14381,6 +14402,66 @@ fn keys_on_page(p: usize, keys: &[Vec<u8>]) -> Vec<Vec<u8>> {
     keys[lo..hi].to_vec()
 }
 
+/// The stride switch (`common::stride_switch`) held to the stores it is
+/// for. Under it, the store a test that names no form opens
+/// (`common::options`) and the one `forced` opens each give a partition of
+/// numbered keys a stride file and answer its reads from it, and the
+/// oracle's forced store asks for the form beside the raw store it is held
+/// to; without it, all are what they were, the default and the block
+/// form's. A run under the switch that reached no stride file would pass
+/// every test it runs and say nothing of the form, so the switch's word is
+/// read here a second time only to hold `stride_switch`'s reading of it to
+/// it.
+#[test]
+fn the_stride_switch_gives_the_stores_it_reaches_the_stride_form() {
+    let on = std::env::var("SUPDB_TEST_STRIDE").is_ok_and(|v| v == "1");
+    assert_eq!(common::stride_switch(), on, "the switch read as set");
+    let asked = if on { ZStride::Forced } else { ZStride::Off };
+    for raw_tails in [false, true] {
+        assert_eq!(
+            oracle_opts(true, false, raw_tails).zpages_stride,
+            asked,
+            "the oracle's forced store"
+        );
+        assert_eq!(
+            oracle_opts(false, false, raw_tails).zpages_stride,
+            ZStride::Off,
+            "the oracle's raw store"
+        );
+    }
+    let stores = [
+        ("switch-options", common::options()),
+        ("switch-forced", forced(|_| {})),
+    ];
+    if !on {
+        let d = Options::default();
+        for (name, o) in &stores {
+            assert_eq!(o.zpages_stride, ZStride::Off, "{name}");
+        }
+        assert!(
+            stores[0].1.zpages == d.zpages && stores[0].1.zpages_min_bytes == d.zpages_min_bytes,
+            "the options a test builds on are the default's"
+        );
+        return;
+    }
+    for (name, opts) in stores {
+        let dir = scratch(name);
+        let mut db = Db::create(&dir, opts).unwrap();
+        let model = numbered_load(&mut db, 2000, 100, 0x5717);
+        db.zpages_settle().unwrap();
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&db, &model, &keys, name);
+        let c = db.zpage_counts();
+        assert!(
+            c.stride_files > 0 && c.stride_files == c.partitions,
+            "{name}: every partition a stride file: {c:?}"
+        );
+        assert!(c.stride_reads > 0, "{name}: read through them: {c:?}");
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The oracle of the stride form: a store under `Always` and
 /// `ZStride::Forced`, and a store under `Off`, given the same operations
 /// and checked against the model after every settle, through the writer
@@ -15243,7 +15324,11 @@ fn the_stride_form_is_refused_beside_the_recode_policies() {
             .unwrap_or_else(|| panic!("{name}: opened"));
         assert!(e.to_string().contains("zpages_stride"), "{name}: {e}");
         let _ = std::fs::remove_dir_all(&dir);
-        let db = Db::create(&dir, forced(set)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let block = |o: &mut Options| {
+            o.zpages_stride = ZStride::Off;
+            set(o);
+        };
+        let db = Db::create(&dir, forced(block)).unwrap_or_else(|e| panic!("{name}: {e}"));
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

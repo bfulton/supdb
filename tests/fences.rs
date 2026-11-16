@@ -68,7 +68,7 @@ fn a_merge_planned_with_fences_a_landing_old_takes_the_partitions_standing_after
             // One merge in flight: the planner joins the held merge only
             // where it has no room for a second.
             merge_parallel: 1,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -142,7 +142,7 @@ fn the_first_partitioning_holds_its_fences_when_a_bound_cuts_nothing() {
             partition_bytes: Some(1024),
             partition_on_flush: true,
             publish_in_background: false,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -181,7 +181,7 @@ fn a_partition_rewrite_joins_its_sub_pieces_where_a_fence_can_separate_them() {
             partition_on_flush: true,
             publish_in_background: false,
             l0_trigger: 2,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -236,7 +236,7 @@ fn a_promotion_never_closes_a_partition_at_its_own_lower_fence() {
             scan_block_cache: false,
             l0_trigger: 2,
             promote: true,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -356,7 +356,7 @@ fn a_merge_writes_an_empty_partition_for_a_fence_no_input_key_lies_in() {
             l0_trigger: 2,
             promote: true,
             compact: true,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -491,7 +491,7 @@ fn a_merges_first_pass_over_the_heads_writes_what_the_records_write() {
                     partition_bytes: Some(32 << 10),
                     l0_trigger: 2,
                     merge_keys_by_heads: heads,
-                    ..Options::default()
+                    ..common::options()
                 },
             )
             .unwrap();
@@ -580,7 +580,14 @@ fn a_merges_walk_with_its_keys_kept_writes_what_a_walk_reading_every_input_write
                     l0_trigger: l0,
                     tier_pieces: tier,
                     merge_walk_cached: cached,
-                    ..Options::default()
+                    // The scan that reads the answers below has the segment
+                    // work's loop plan a merge with none in flight
+                    // (`Options::merge_plan_idle`), and the piece merge it
+                    // starts lands before the close's drain or not by the
+                    // loop's timing, which the forced form's builds, turning
+                    // the loop, make a race.
+                    merge_plan_idle: false,
+                    ..common::options()
                 },
             )
             .unwrap();
@@ -685,7 +692,7 @@ fn a_merge_drops_its_inputs_pages_behind_its_second_pass() {
                 // A drop every sixteen kilobytes, so a store of kilobytes
                 // reaches one.
                 merge_drop_chunk: 16 << 10,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -765,7 +772,7 @@ fn a_merges_writers_sync_behind_them_at_the_merges_own_stride() {
                     write_piece: 64 << 10,
                     ..supdb::SegmentOptions::default()
                 },
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -853,7 +860,13 @@ fn a_store_read_with_no_merge_in_flight_plans_one_in_its_loop() {
                 // One merge in flight, so the second range waits for the
                 // held one's landing as the shape this is about does.
                 merge_parallel: 1,
-                ..Options::default()
+                // The in-core shape: a landing chains without a scan where
+                // the gate is away from the raw form
+                // (`Options::merge_chains_writes`), as it is under the
+                // forced form, and the held merge's landing would plan
+                // the range this leaves to the loop.
+                merge_chains_writes: false,
+                ..common::options()
             },
         )
         .unwrap();
@@ -984,7 +997,7 @@ fn a_merges_landing_plans_the_next_and_a_cap_lands_a_range_at_a_time() {
                 } else {
                     supdb::ZPages::Off
                 },
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -1100,7 +1113,7 @@ fn a_second_merge_runs_beside_the_first_over_ranges_it_does_not_hold() {
             partition_bytes: Some(32 << 10),
             l0_trigger: 2,
             merge_parallel: par,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts()).unwrap();
         let key = |k: u32| format!("key-{k:05}").into_bytes();

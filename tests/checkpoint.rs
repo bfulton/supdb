@@ -64,7 +64,7 @@ fn small(background: bool) -> Options {
         partition_bytes: Some(32 << 10),
         l0_trigger: 2,
         publish_in_background: background,
-        ..Options::default()
+        ..common::options()
     }
 }
 
@@ -238,6 +238,10 @@ fn a_checkpoint_at_a_path_that_exists_is_refused_and_nothing_changes() {
     let mut db = a_store_with_everything(&d, small(true));
     db.flush().unwrap();
     db.settle().unwrap();
+    // The form files a forced form builds behind the landings joined too,
+    // as the stride switch has it (`common::options`): a build in flight
+    // renames its temp name over the listing below.
+    db.zpages_settle().unwrap();
     let before = dump(&db);
     let files = |p: &Path| -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(p)
@@ -332,7 +336,7 @@ fn a_checkpoint_carries_on_from_the_stores_sequence() {
     let opts = || Options {
         seal_bytes: 16 << 10,
         compact: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts()).unwrap();
     for round in 0..4u32 {
@@ -388,9 +392,9 @@ fn a_checkpoint_carries_on_from_the_stores_sequence() {
 #[test]
 fn a_checkpoint_of_an_empty_store_is_an_empty_store() {
     let (d, c) = dirs("empty");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     db.checkpoint(&c).unwrap();
-    let mut ck = Db::open(&c, Options::default()).unwrap();
+    let mut ck = Db::open(&c, common::options()).unwrap();
     assert_eq!(dump(&ck), Vec::new());
     ck.append(b"k", b"v");
     ck.commit().unwrap();
