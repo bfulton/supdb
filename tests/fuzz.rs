@@ -84,6 +84,19 @@
 //!   snapshots, the seals and the merges; `concurrent_range` runs its
 //!   store forced under it and flips beside its reader threads, each of
 //!   which may hold a copy's address when the copy is given up.
+//! - `ZFUZZ_STRIDE=1`, with `ZFUZZ_ZPAGES`: the `z` store asks every build
+//!   of a form file for the stride form (`Options::zpages_stride`
+//!   `Forced`), trusting its own builds in some seeds and not in others
+//!   (`zpages_stride_trust_built`), and the seed's keys and values are
+//!   steered so that partitions qualify for it and decline it
+//!   (`StrideSteer`); the summary counts the stride builds, the files, the
+//!   reads they served and the declines by reason. A seed whose form files
+//!   failed -- a read fallen back, an attach refused, a build failed, a
+//!   page found damaged -- fails, since the raw form answers in their place
+//!   and the model sees nothing wrong; and a range in which the stride form
+//!   served no read fails, since a steer that reaches no partition is a run
+//!   that tested nothing. Refused beside `ZFUZZ_BOTH`, whose re-code the
+//!   store refuses beside the stride form.
 //! - `ZFUZZ_NOPUT`, `ZFUZZ_NOBURST`: set, no puts, or no ordered bursts.
 //! - `ZFUZZ_SEEDKEY=1`: the store's first write is a key of its own, and
 //!   one goes ahead of every write of the empty key, so that no write of
@@ -253,6 +266,235 @@ struct Cfg {
     /// a quarter of the seeds under `ZFUZZ_OPTVARY`, the side generator's
     /// next draw, and the engine's otherwise.
     hot_starts: u32,
+    /// Under `ZFUZZ_STRIDE`, the stride form's steer; `None` without it.
+    stride: Option<StrideSteer>,
+}
+
+/// Whether the stride form is forced on the `z` store and the seed steered
+/// toward it (`ZFUZZ_STRIDE`, with the form forced).
+fn stride_on() -> bool {
+    env_flag("ZFUZZ_STRIDE") && env_flag("ZFUZZ_ZPAGES")
+}
+
+/// Where a stride seed's run of numbers starts: at zero, at the field's top
+/// less the run, which a key past the run's last would overflow, or
+/// anywhere in the field.
+#[derive(Clone, Copy, Debug)]
+enum RunBase {
+    Zero,
+    Top,
+    Any,
+}
+
+/// A seed's steer toward the stride form (`ZFUZZ_STRIDE`). A partition
+/// qualifies where its keys are one length, a prefix and then a number of
+/// one width, every number between its first and last present, and every
+/// record one inline value of one width with no flag; so the pool is a run
+/// of numbers at one width under one prefix -- zero-padded decimal, or
+/// big-endian in a quarter of the seeds -- most values take one width, and
+/// every key is written once before the steps in most seeds, in key order
+/// (a direct run) or shuffled. What makes a partition decline comes at
+/// rates the seed draws: deletes (holes, and a promoted piece's tombstone
+/// flags), runs of values and appends to a key that has one (a record of
+/// more than one value), values of another width, numbers taken out of the
+/// pool and keys of another shape put into it -- none of them in some
+/// seeds, a few in most, and in some enough that most partitions decline,
+/// so that the seals and merges rewrite partitions from one form into the
+/// other both ways. A partition's puts reach a piece as a tombstone and a
+/// value, which a merge folds into one value and a promotion keeps; both
+/// are read against the model through the stride files and the raw twin.
+/// Drawn from a generator of its own (`pick_cfg`), so that with the switch
+/// off no draw of any seed moves.
+#[derive(Clone, Debug)]
+struct StrideSteer {
+    /// `Options::zpages_stride_trust_built`, both ways across seeds.
+    trust: bool,
+    /// The keys: `prefix`, then the number in `d` bytes, big-endian where
+    /// `be`, zero-padded decimal otherwise, from `base`.
+    be: bool,
+    prefix: Vec<u8>,
+    d: usize,
+    base: RunBase,
+    /// The width most values take: one byte to a page, the inline limit's
+    /// either side among them, so that a value past it, not inline, makes
+    /// its partition decline in the seeds that keep the default limit.
+    w: usize,
+    /// Chances in a thousand that a write deletes, appends a run of
+    /// values, appends one value rather than putting it, or that a value
+    /// takes another width.
+    delete: usize,
+    multi: usize,
+    append: usize,
+    odd: usize,
+    /// Numbers taken out of the run, and keys of another shape put into
+    /// the pool among the run's.
+    gaps: usize,
+    foreign: usize,
+    /// Every key of the pool written once before the steps, and whether in
+    /// key order.
+    preload: bool,
+    ordered: bool,
+    /// The ordered bursts' keys put rather than appended.
+    burst_puts: bool,
+}
+
+impl StrideSteer {
+    fn pick(r: &mut Rng) -> StrideSteer {
+        let be = r.chance(25);
+        let d = if be {
+            [1, 2, 3, 4, 6, 8][r.below(6)]
+        } else {
+            [3, 4, 5, 6, 8, 12, 16, 19][r.below(8)]
+        };
+        let prefix: &[u8] = if be {
+            [&b""[..], b"\x01", b"b/", b"\x00\x00"][r.below(4)]
+        } else {
+            [&b""[..], b"k", b"user", b"a/long/common/prefix/", b"\x01"][r.below(5)]
+        };
+        let base = match r.below(5) {
+            0 | 1 => RunBase::Zero,
+            2 => RunBase::Top,
+            _ => RunBase::Any,
+        };
+        let w = [1, 3, 4, 8, 8, 8, 13, 16, 16, 24, 100, 256, 257, 1000, 4096][r.below(15)];
+        let (delete, multi, append, odd) = match r.below(20) {
+            0..=6 => (0, 0, 0, 0),
+            7..=14 => (8, 4, 15, 4),
+            _ => (40, 25, 80, 30),
+        };
+        let gaps = if r.chance(15) { 1 + r.below(3) } else { 0 };
+        let foreign = if r.chance(15) { 1 + r.below(3) } else { 0 };
+        let preload = r.chance(85);
+        let ordered = r.chance(60);
+        let burst_puts = r.chance(30);
+        StrideSteer {
+            trust: r.chance(50),
+            be,
+            prefix: prefix.to_vec(),
+            d,
+            base,
+            w,
+            delete,
+            multi,
+            append,
+            odd,
+            gaps,
+            foreign,
+            preload,
+            ordered,
+            burst_puts,
+        }
+    }
+
+    /// The largest number the field holds.
+    fn top(&self) -> u64 {
+        if self.be {
+            u64::MAX >> (8 * (8 - self.d))
+        } else {
+            10u64.pow(self.d as u32) - 1
+        }
+    }
+
+    fn key(&self, x: u64) -> Vec<u8> {
+        let mut k = self.prefix.clone();
+        if self.be {
+            k.extend_from_slice(&x.to_be_bytes()[8 - self.d..]);
+        } else {
+            k.extend(format!("{x:0w$}", w = self.d).bytes());
+        }
+        k
+    }
+
+    /// The seed's pool: `n` numbers from the run's base, as many as the
+    /// field holds, less the gaps -- never the run's ends, so that the gap
+    /// is a hole and not a shorter run -- and with the foreign keys among
+    /// them: a run key with a byte more, a byte short, or its last byte
+    /// changed -- past a digit's in decimal, to the byte's top in
+    /// big-endian, another number there and maybe one past the run -- each
+    /// sorting among the run's keys or beside them.
+    fn pool(&self, rng: &mut Rng, n: usize) -> Vec<Vec<u8>> {
+        let top = self.top();
+        let n = (n as u64).min(top.saturating_add(1)).max(1);
+        let last_base = top - (n - 1);
+        let base = match self.base {
+            RunBase::Zero => 0,
+            RunBase::Top => last_base,
+            RunBase::Any => rng.next() % last_base.saturating_add(1),
+        };
+        let mut nums: Vec<u64> = (0..n).map(|i| base + i).collect();
+        for _ in 0..self.gaps {
+            if nums.len() > 2 {
+                nums.remove(1 + rng.below(nums.len() - 2));
+            }
+        }
+        let mut set: BTreeSet<Vec<u8>> = nums.iter().map(|&x| self.key(x)).collect();
+        for _ in 0..self.foreign {
+            let mut k = self.key(nums[rng.below(nums.len())]);
+            match rng.below(3) {
+                0 => k.push(if self.be { 0 } else { b'x' }),
+                1 => *k.last_mut().unwrap() = if self.be { 0xff } else { b':' },
+                _ => {
+                    k.pop();
+                }
+            }
+            set.insert(k);
+        }
+        set.into_iter().collect()
+    }
+
+    /// A value of the seed's width, or of another at the seed's rate: one
+    /// byte either side of it, none, or past twice it. Random bytes, so
+    /// that a value read from the wrong slot is not the one asked for.
+    fn value(&self, rng: &mut Rng) -> Vec<u8> {
+        let w = if rng.below(1000) < self.odd {
+            match rng.below(4) {
+                0 => self.w + 1,
+                1 => self.w - 1,
+                2 => 0,
+                _ => 2 * self.w + 3,
+            }
+        } else {
+            self.w
+        };
+        let mut v = Vec::with_capacity(w + 8);
+        while v.len() < w {
+            v.extend_from_slice(&rng.next().to_le_bytes());
+        }
+        v.truncate(w);
+        v
+    }
+
+    /// A step's writes to `k`: a put of one value, or at the seed's rates a
+    /// delete, a run of values, or one value appended. Under `ZFUZZ_NOPUT`
+    /// the put is an append.
+    fn ops(&self, rng: &mut Rng, k: &[u8]) -> Vec<Op> {
+        let r = rng.below(1000);
+        let k = k.to_vec();
+        if r < self.delete {
+            vec![Op::Delete(k)]
+        } else if r < self.delete + self.multi {
+            (0..2 + rng.below(3))
+                .map(|_| Op::Append(k.clone(), self.value(rng)))
+                .collect()
+        } else if r < self.delete + self.multi + self.append || std::env::var("ZFUZZ_NOPUT").is_ok()
+        {
+            vec![Op::Append(k, self.value(rng))]
+        } else {
+            vec![Op::Put(k, self.value(rng))]
+        }
+    }
+}
+
+/// One write, staged for the model and made to both stores.
+fn write(op: Op, staged: &mut Vec<Op>, z: &mut Db, r: &mut Db) {
+    for d in [z, r] {
+        match &op {
+            Op::Append(k, v) => d.append(k, v),
+            Op::Delete(k) => d.delete(k),
+            Op::Put(k, v) => d.put(k, v),
+        }
+    }
+    staged.push(op);
 }
 
 /// Whether a seed runs with the block cache on. The chance is drawn whenever
@@ -276,6 +518,10 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let (part_off, keys_off, scan_off) = (side.chance(25), side.chance(25), side.chance(25));
     let walk_off = side.chance(25);
     let hot_two = side.chance(25);
+    // A generator of its own, as `side` is, so that the switch moves none
+    // of the draws below.
+    let stride =
+        stride_on().then(|| StrideSteer::pick(&mut Rng::new(rng.0 ^ 0x5791_DE57_0000_0002)));
     Cfg {
         seal_bytes: [2 << 10, 4 << 10, 8 << 10, 16 << 10, 32 << 10][rng.below(5)],
         partition_bytes: match rng.below(4) {
@@ -322,6 +568,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         } else {
             Options::default().promote_starts
         },
+        stride,
     }
 }
 
@@ -379,6 +626,12 @@ fn opts_z(c: &Cfg) -> Options {
     if env_flag("ZFUZZ_ZPAGES") {
         o.zpages = supdb::ZPages::Always;
         o.zpages_min_bytes = 0;
+    }
+    // Under `ZFUZZ_STRIDE` every build of a form file asks for the stride
+    // form and builds the block body where the partition declines it.
+    if let Some(s) = &c.stride {
+        o.zpages_stride = supdb::ZStride::Forced;
+        o.zpages_stride_trust_built = s.trust;
     }
     // Under `ZFUZZ_PROMOTE` with the form forced and the cache on, a block
     // read a few entries' worth is held as a copy in its slot and the
@@ -812,6 +1065,99 @@ struct Stats {
     /// (`Options::scan_forms_off_stale_writes`), what says a run under
     /// `ZFUZZ_FORMSOFF` reached that exit.
     point: [u64; 8],
+    /// The `z` store's stride form under `ZFUZZ_STRIDE`.
+    stride: StrideStats,
+}
+
+/// What the stride form did in a seed (`ZCounts`' stride counts), summed
+/// over the `z` store's opens as `recuts` is, but for the files, the most
+/// partitions a stride file served at once at any of the counts.
+#[derive(Clone, Debug, Default)]
+struct StrideStats {
+    builds: u64,
+    files: u64,
+    /// Point reads a stride file answered, the values its cursor handed
+    /// over, and the value pages checked against the row at a first touch.
+    reads: u64,
+    cursor: u64,
+    checks: u64,
+    /// The builds that asked for the stride form and declined it, by
+    /// reason, in `ZCounts::stride_declines`' order.
+    declines: Vec<u64>,
+    /// The form's failures of any kind: reads that fell back to the raw
+    /// form after a check, attaches refused as damaged or as another
+    /// segment's, builds that failed, and files or pages found damaged.
+    /// None is a wrong answer, which the model would see; each is a form
+    /// file the store could not serve from, which a seed should not make.
+    failures: u64,
+    /// Form files built of either body, and the partitions whose values
+    /// lie in blocks, which neither body holds: under `ZStride::Forced` the
+    /// stride form's decline for a run in a block is counted there, once
+    /// (`ZCounts::declined_block_backed`), and a seed whose values are past
+    /// the inline limit reaches no stride file for that reason.
+    form_builds: u64,
+    block_backed: u64,
+}
+
+impl StrideStats {
+    fn add(&mut self, c: &supdb::db::ZCounts) {
+        self.form_builds += c.builds;
+        self.block_backed += c.declined_block_backed;
+        self.builds += c.stride_builds;
+        self.files = self.files.max(c.stride_files);
+        self.reads += c.stride_reads;
+        self.cursor += c.stride_cursor_reads;
+        self.checks += c.stride_page_checks;
+        if self.declines.len() < c.stride_declines.len() {
+            self.declines.resize(c.stride_declines.len(), 0);
+        }
+        for (s, d) in self.declines.iter_mut().zip(c.stride_declines) {
+            *s += d;
+        }
+        self.failures += c.fallbacks
+            + c.rejected_damage
+            + c.rejected_identity
+            + c.build_failed
+            + c.damaged
+            + c.bad_pages;
+    }
+
+    fn merge(&mut self, o: &StrideStats) {
+        self.builds += o.builds;
+        self.files += o.files;
+        self.reads += o.reads;
+        self.cursor += o.cursor;
+        self.checks += o.checks;
+        if self.declines.len() < o.declines.len() {
+            self.declines.resize(o.declines.len(), 0);
+        }
+        for (s, d) in self.declines.iter_mut().zip(&o.declines) {
+            *s += d;
+        }
+        self.failures += o.failures;
+        self.form_builds += o.form_builds;
+        self.block_backed += o.block_backed;
+    }
+}
+
+impl std::fmt::Display for StrideStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "form builds {} block-backed {}, stride builds {} files {} reads {} cursor {} \
+             page checks {} failures {}, \
+             declines [shape, holes, values, width, tomb, block, small, readback] {:?}",
+            self.form_builds,
+            self.block_backed,
+            self.builds,
+            self.files,
+            self.reads,
+            self.cursor,
+            self.checks,
+            self.failures,
+            self.declines
+        )
+    }
 }
 
 /// A store's point-read and walk counts through its form files, added to
@@ -902,7 +1248,10 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     let seedkey_first = env_flag("ZFUZZ_SEEDKEY");
     let mut model: Model = BTreeMap::new();
     let mut staged: Vec<Op> = Vec::new();
-    let mut pool = key_pool(&mut rng, cfg.keys);
+    let mut pool = match &cfg.stride {
+        Some(s) => s.pool(&mut rng, cfg.keys),
+        None => key_pool(&mut rng, cfg.keys),
+    };
     if seedkey_first {
         let seedkey = b"\x01seed".to_vec();
         z.append(&seedkey, b"s");
@@ -915,6 +1264,36 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
             .push(b"s".to_vec());
         pool.push(seedkey);
     }
+    // Under `ZFUZZ_STRIDE`, every key of the pool written once before the
+    // steps in most seeds, in key order -- a direct run past the store's
+    // greatest -- or shuffled, and made partitions in most of those.
+    if let Some(s) = cfg.stride.as_ref().filter(|s| s.preload) {
+        let mut order = pool.clone();
+        if !s.ordered {
+            for i in (1..order.len()).rev() {
+                order.swap(i, rng.below(i + 1));
+            }
+        }
+        for (i, k) in order.iter().enumerate() {
+            write(
+                Op::Append(k.clone(), s.value(&mut rng)),
+                &mut staged,
+                &mut z,
+                &mut r,
+            );
+            if i % 97 == 96 || i + 1 == order.len() {
+                z.commit().map_err(|e| format!("commit z: {e}"))?;
+                r.commit().map_err(|e| format!("commit r: {e}"))?;
+                for op in staged.drain(..) {
+                    apply(&mut model, &op);
+                }
+            }
+        }
+        if rng.chance(70) {
+            z.flush().map_err(|e| format!("flush z: {e}"))?;
+            r.flush().map_err(|e| format!("flush r: {e}"))?;
+        }
+    }
     let mut hi = 0u64;
     let mut handles: Vec<Handle> = Vec::new();
     let mut st = Stats {
@@ -926,6 +1305,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         recuts: 0,
         heads: [0; 2],
         point: [0; 8],
+        stride: StrideStats::default(),
     };
     let mut fails: Vec<String> = Vec::new();
     let mut absent = absent_around(&pool, &mut rng);
@@ -955,34 +1335,40 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
             staged.push(Op::Append(seedkey.clone(), b"e".to_vec()));
             both!(|d: &mut Db| d.append(&seedkey, b"e"));
         }
-        match rng.below(100) {
-            0..=44 => {
-                let v = value(&mut rng, step, cfg.big);
-                staged.push(Op::Append(k.clone(), v.clone()));
-                both!(|d: &mut Db| d.append(&k, &v));
+        if let Some(s) = &cfg.stride {
+            for op in s.ops(&mut rng, &k) {
+                write(op, &mut staged, &mut z, &mut r);
             }
-            45..=52 => {
-                for _ in 0..2 + rng.below(8) {
-                    let v = if rng.chance(50) {
-                        // a fixed width run
-                        ((rng.below(1 << 16)) as u32).to_le_bytes().to_vec()
-                    } else {
-                        value(&mut rng, step, cfg.big)
-                    };
+        } else {
+            match rng.below(100) {
+                0..=44 => {
+                    let v = value(&mut rng, step, cfg.big);
                     staged.push(Op::Append(k.clone(), v.clone()));
                     both!(|d: &mut Db| d.append(&k, &v));
                 }
+                45..=52 => {
+                    for _ in 0..2 + rng.below(8) {
+                        let v = if rng.chance(50) {
+                            // a fixed width run
+                            ((rng.below(1 << 16)) as u32).to_le_bytes().to_vec()
+                        } else {
+                            value(&mut rng, step, cfg.big)
+                        };
+                        staged.push(Op::Append(k.clone(), v.clone()));
+                        both!(|d: &mut Db| d.append(&k, &v));
+                    }
+                }
+                53..=60 => {
+                    staged.push(Op::Delete(k.clone()));
+                    both!(|d: &mut Db| d.delete(&k));
+                }
+                61..=65 if std::env::var("ZFUZZ_NOPUT").is_err() => {
+                    let v = value(&mut rng, step, cfg.big);
+                    staged.push(Op::Put(k.clone(), v.clone()));
+                    both!(|d: &mut Db| d.put(&k, &v));
+                }
+                _ => {}
             }
-            53..=60 => {
-                staged.push(Op::Delete(k.clone()));
-                both!(|d: &mut Db| d.delete(&k));
-            }
-            61..=65 if std::env::var("ZFUZZ_NOPUT").is_err() => {
-                let v = value(&mut rng, step, cfg.big);
-                staged.push(Op::Put(k.clone(), v.clone()));
-                both!(|d: &mut Db| d.put(&k, &v));
-            }
-            _ => {}
         }
         // The writer's own reads see the staged batch.
         if rng.chance(3) {
@@ -1052,6 +1438,17 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                 65..=94 => {
                     // The builder, with or without a settle's worth of quiet.
                     z.settle().map_err(|e| format!("settle z: {e}"))?;
+                    // With the segment work inline no form file's build
+                    // starts in the fuzz's stores -- the builds start at
+                    // the turns of the segment work's thread's loop
+                    // (`Maint::z_step`) -- so under `ZFUZZ_STRIDE` such a
+                    // seed gives its partitions theirs here, on the
+                    // writer's thread (`Db::zpages_settle`), or reaches no
+                    // stride file at all.
+                    if cfg.stride.is_some() && !cfg.bg {
+                        z.zpages_settle()
+                            .map_err(|e| format!("zpages settle z: {e}"))?;
+                    }
                 }
                 95..=104 if std::env::var("ZFUZZ_NOBURST").is_err() => {
                     // An ordered burst: keys above the store's greatest, a
@@ -1061,9 +1458,21 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                         let mut key = vec![0xff, 0xff, 0xff, 0xff];
                         key.extend(format!("{:08}", hi).bytes());
                         hi += 1;
-                        let v = value(&mut rng, step, cfg.big);
-                        staged.push(Op::Append(key.clone(), v.clone()));
-                        both!(|d: &mut Db| d.append(&key, &v));
+                        // A run of numbers already: under `ZFUZZ_STRIDE`
+                        // its values take the seed's width, so that a run
+                        // a burst makes qualifies as the pool's do, and in
+                        // the seeds that put them (`StrideSteer::burst_puts`)
+                        // the keys leave the direct run for the hash table,
+                        // whose seal flags each record a put wrote, and the
+                        // piece above the partitions is promoted with its
+                        // flags: a partition the stride form declines for
+                        // them.
+                        let op = match &cfg.stride {
+                            Some(s) if s.burst_puts => Op::Put(key.clone(), s.value(&mut rng)),
+                            Some(s) => Op::Append(key.clone(), s.value(&mut rng)),
+                            None => Op::Append(key.clone(), value(&mut rng, step, cfg.big)),
+                        };
+                        write(op, &mut staged, &mut z, &mut r);
                         pool.push(key);
                         if rng.chance(15) || i + 1 == n {
                             z.commit().map_err(|e| format!("commit z: {e}"))?;
@@ -1118,6 +1527,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     count_point(&mut st, &r);
                     count_heads(&mut st, &z);
                     count_heads(&mut st, &r);
+                    st.stride.add(&z.zpage_counts());
                     let clean = rng.chance(50) || !matches!(cfg.sync, SyncPolicy::Always);
                     if clean {
                         for op in staged.drain(..) {
@@ -1279,7 +1689,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         sn.snapshot();
         check_keys("final z snapshot", &sn, &model, &probe, &mut fails);
     }
-    let ok = fails.is_empty();
+    let mut ok = fails.is_empty();
     drop(handles);
     st.abandons += z.upkeep_abandons() + r.upkeep_abandons();
     st.bindings += z.cache_bindings() + r.cache_bindings();
@@ -1290,6 +1700,21 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     count_point(&mut st, &r);
     count_heads(&mut st, &z);
     count_heads(&mut st, &r);
+    st.stride.add(&z.zpage_counts());
+    // A form file the store refused, took out of service or failed to
+    // build answers nothing wrong -- the raw form answers in its place --
+    // so the model cannot see it; under the stride form each is a defect
+    // of the form the seed was steered to reach.
+    if cfg.stride.is_some() && st.stride.failures > 0 && ok {
+        fail(
+            &mut fails,
+            format!(
+                "z's form files failed {} times: {}",
+                st.stride.failures, st.stride
+            ),
+        );
+        ok = false;
+    }
     drop(z);
     drop(r);
     if ok {
@@ -1316,14 +1741,30 @@ fn fuzz_range() {
         .ok()
         .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect());
     let seeds: Vec<u64> = list.unwrap_or_else(|| (from..to).collect());
+    if env_flag("ZFUZZ_STRIDE") {
+        assert!(
+            env_flag("ZFUZZ_ZPAGES"),
+            "ZFUZZ_STRIDE forces the stride form on the store whose form is forced: set ZFUZZ_ZPAGES"
+        );
+        assert!(
+            !env_flag("ZFUZZ_BOTH"),
+            "ZFUZZ_STRIDE beside ZFUZZ_BOTH: the store refuses the stride form beside the re-code"
+        );
+    }
     let (mut bad, mut reopens, mut abandons, mut bindings, mut beside, mut switches) =
         (Vec::new(), 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut recuts = 0u64;
     let mut point = [0u64; 8];
     let mut heads = [0u64; 2];
+    let mut stride = StrideStats::default();
+    let ran = seeds.len();
     for seed in seeds {
         match run_seed(seed, want_cache, verbose) {
             Ok(s) => {
+                if verbose && stride_on() {
+                    eprintln!("seed {seed}: {}", s.stride);
+                }
+                stride.merge(&s.stride);
                 reopens += s.reopens;
                 abandons += s.abandons;
                 bindings += s.bindings;
@@ -1353,6 +1794,18 @@ fn fuzz_range() {
         point[7],
         bad.len()
     );
+    if stride_on() {
+        // Summed over the seeds, the files as each seed's most at once.
+        eprintln!("seeds {from}..{to}: {stride}");
+        // A steer that reaches no partition passes every check over the
+        // block form alone, so a range in which no stride file answered a
+        // read is a run that did not test what it was asked to.
+        if stride.reads == 0 && ran > 0 {
+            bad.push(format!(
+                "the stride form served no read in {ran} seeds: the steer reached no partition ({stride})"
+            ));
+        }
+    }
     for b in &bad {
         eprintln!("FAIL: {b}");
     }
