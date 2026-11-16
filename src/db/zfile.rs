@@ -452,8 +452,11 @@ pub(super) struct ZCursor<'a> {
     /// in the cursor and lent by `key` as `key_at` spans it: a buffer of
     /// the cursor's own and not the heap's, since a scan places a cursor
     /// in every partition it enters and a stride walk steps the key at
-    /// every rank, which an allocation a placing would price.
-    skey: [u8; STRIDE_KEY_MAX],
+    /// every rank, which an allocation a placing would price. Made at the
+    /// cursor's first stride placing (`stride_key`) and none before it, so
+    /// that a cursor over a block file -- every cursor a store without the
+    /// form places -- writes the tag and not the buffer.
+    skey: Option<[u8; STRIDE_KEY_MAX]>,
     /// The view of page `pview_page`, held across the page's groups under
     /// `ZFile::cursor_view`; the open's own otherwise.
     pview: Option<PageView<'a>>,
@@ -514,7 +517,7 @@ impl<'a> ZCursor<'a> {
             group: Group::None,
             buf: take_buf(),
             keybuf: Vec::new(),
-            skey: [0; STRIDE_KEY_MAX],
+            skey: None,
             pview: None,
             pview_page: usize::MAX,
             decoded: 0,
@@ -1139,7 +1142,7 @@ impl<'a> ZCursor<'a> {
             Group::Coded(..) => Some(self.keybuf.as_slice()),
             Group::Stride(_) => {
                 let (at, len) = self.key_at;
-                self.skey.get(at..at + len)
+                self.skey.as_ref()?.get(at..at + len)
             }
             Group::Page(_) | Group::Buf(_) | Group::Memo(..) => {
                 let (at, len) = self.key_at;
@@ -1776,7 +1779,7 @@ impl<'a> ZCursor<'a> {
         self.part = None;
         self.end = self.zfile.nkeys;
         self.page_end = self.zfile.nkeys;
-        match body.key_at_into(self.rank as u64, &mut self.skey) {
+        match body.key_at_into(self.rank as u64, self.stride_key()) {
             Some(k) => {
                 self.key_at = (0, k.len());
                 self.group = Group::Stride(body);
@@ -1794,7 +1797,13 @@ impl<'a> ZCursor<'a> {
             return;
         }
         let len = self.key_at.1;
-        body.step_key(&mut self.skey[..len]);
+        body.step_key(&mut self.stride_key()[..len]);
+    }
+
+    /// The stride position's key buffer, made at the first placing that
+    /// renders into it.
+    fn stride_key(&mut self) -> &mut [u8; STRIDE_KEY_MAX] {
+        self.skey.get_or_insert([0; STRIDE_KEY_MAX])
     }
 
     /// `values` at a stride position: the slot's one value after its
@@ -1868,11 +1877,12 @@ impl<'a> ZCursor<'a> {
             }
         }
         let (memo, file, len) = (self.memo, zfile.stride_bytes(), self.key_at.1);
+        let key = &mut self.stride_key()[..len];
         let mut r = rank;
         let mut fell = false;
         while r < to {
             match body.values_at(file, r as u64, &mut |p| zfile.stride_page(body, memo, p)) {
-                StrideAt::Value(v) => f(&self.skey[..len], v),
+                StrideAt::Value(v) => f(key, v),
                 // A page taken out of service by its check
                 // (`ZFile::stride_page`); never `Absent`, every rank of the
                 // walk being in the run.
@@ -1883,7 +1893,7 @@ impl<'a> ZCursor<'a> {
             }
             r += 1;
             if r < end {
-                body.step_key(&mut self.skey[..len]);
+                body.step_key(key);
             }
         }
         let walked = r - rank;
@@ -14918,20 +14928,26 @@ mod tests {
     /// each; `seek` of every key of the run, of keys beside them and of
     /// keys no rendering is, every one against the raw seek; `unplaced` and
     /// `skip_to` over the same keys in key order and in reverse, against
-    /// the block cursor's moves and the file's cut, with the values under
+    /// the block cursor's moves and the file's cut, with the key the move
+    /// stands on -- none past the run, where a stride position left at the
+    /// run's last rank would lend that rank's key -- and the values under
     /// the position where the key is the run's, as a block's build reads
     /// the record an overlay key replaces; and the bulk walk, `walk_until`
     /// and `walk_run_ahead`, from ranks across the run, with `until` a key
     /// of the run (the walk stops on it, `Equal`), a key between two that
     /// the codec does not render (`Greater`, one rank on), the rendering
-    /// past the run where the field holds it and none, at limits that stop
-    /// before `until` and after it -- where the walk stops on `until`, the
-    /// overlay walk's turn: the values under the cursor, the step, the walk
-    /// on to the end. Over runs of one width a page holds many of and one
-    /// a page holds one of, one key, a big-endian field, and a run that
-    /// ends at its field's top, whose next number no key renders. The
-    /// stride position decodes, views and asks ahead of nothing, and the
-    /// memo counts every value it handed over (`StrideCounts::cursor`).
+    /// past the run where the field holds it and none, keys of the run and
+    /// between two below the position (nothing handed over, `Greater`: the
+    /// key under the cursor is compared, never `until`'s own answer
+    /// taken), at limits that stop before `until` and after it -- where the
+    /// walk stops on `until`, the overlay walk's turn: the values under the
+    /// cursor, the step, the walk on to the end. Over runs of one width a
+    /// page holds many of and one a page holds one of, one key, a
+    /// big-endian field, and a run that ends at its field's top, whose next
+    /// number no key renders. The stride position decodes, views and asks
+    /// ahead of nothing, the memo counts every value it handed over
+    /// (`StrideCounts::cursor`), and no block cursor makes the stride
+    /// position's key buffer.
     #[test]
     fn a_cursor_over_a_stride_file_stands_where_the_block_cursor_and_the_raw_form_do() {
         let mut rng = Rng(0x5c0a);
@@ -15013,6 +15029,7 @@ mod tests {
                     }
                     assert!(!c.fell_back() && !b.fell_back(), "{what}");
                     stride_cursor_quiet(&c, &what);
+                    assert!(b.skey.is_none(), "{what}: a block cursor's stride key");
                 }
             }
             // By key: the run's keys, keys beside them, and renderings
@@ -15046,6 +15063,7 @@ mod tests {
                     "{name}: the block cursor's seek of {k:?}"
                 );
                 stride_cursor_quiet(&c, name);
+                assert!(b.skey.is_none(), "{name}: a block cursor's stride key");
             }
             // Moved to each key, in key order and back, from one cursor:
             // the cut the file's seek gives, and the block cursor's; the
@@ -15071,6 +15089,18 @@ mod tests {
                         (b.rank().min(n), bat),
                         "{name}, {order}: the block cursor's move to {k:?}"
                     );
+                    // The key under the position, past the run as well,
+                    // where the move leaves the end and no rank's key.
+                    assert_eq!(
+                        c.key(),
+                        fx.blob.key_at(c.rank()),
+                        "{name}, {order}: the key the move to {k:?} stands on"
+                    );
+                    assert_eq!(
+                        c.key(),
+                        b.key(),
+                        "{name}, {order}: the block cursor's key after the move to {k:?}"
+                    );
                     if at == KeyOrder::Equal {
                         let mut got = Vec::new();
                         handed += c.values(&mut |v: &[u8]| got.push(v.to_vec())).unwrap();
@@ -15079,6 +15109,10 @@ mod tests {
                 }
                 assert!(!c.fell_back(), "{name}, {order}");
                 stride_cursor_quiet(&c, name);
+                assert!(
+                    b.skey.is_none(),
+                    "{name}, {order}: a block cursor's stride key"
+                );
             }
             // The bulk walk.
             for &start in &starts {
@@ -15095,6 +15129,18 @@ mod tests {
                     if codec.holds(n as u64 + 1) {
                         let past = codec.render(codec.base() + n as u64, &mut kb).to_vec();
                         untils.push((Some(past), n, KeyOrder::Greater));
+                    }
+                    // `until` below the position, a key of the run and one
+                    // between two: nothing handed over, and the key the
+                    // cursor stands on past it, as the block walk compares
+                    // it, never `until`'s own answer.
+                    let mut below = vec![0, start.saturating_sub(2), start.saturating_sub(1)];
+                    below.retain(|&r| r < start && r < n);
+                    below.dedup();
+                    for r in below {
+                        let k = fx.blob.key_at(r).unwrap();
+                        untils.push((Some(k.to_vec()), r, KeyOrder::Greater));
+                        untils.push((Some([k, &[0u8]].concat()), r + 1, KeyOrder::Greater));
                     }
                     for (until, stop, at_want) in untils {
                         for limit in [1usize, 7, 64, usize::MAX] {
@@ -15181,6 +15227,7 @@ mod tests {
                                 }
                                 assert!(!c.fell_back(), "{what}");
                                 stride_cursor_quiet(&c, &what);
+                                assert!(b.skey.is_none(), "{what}: a block cursor's stride key");
                             }
                         }
                     }
@@ -15198,7 +15245,9 @@ mod tests {
     /// The stride position under the scan's prefetch: a walk that will
     /// cross pages past its first asks for them, once a cursor, as the
     /// block walk does (`ZFile::stride_ask_ahead`); one inside its first
-    /// page and one with the prefetch off ask nothing.
+    /// page and one with the prefetch off ask nothing; and a walk whose
+    /// limit passes the run's end, unbounded or not, asks for the slots to
+    /// the end and none past it.
     #[test]
     fn a_stride_cursors_walk_asks_ahead_only_under_the_scans_prefetch() {
         let fx = stride_fixture("stride-cursor-ahead", 3000, 100, 0x5a1);
@@ -15216,6 +15265,39 @@ mod tests {
         let mut c = ZCursor::at(&fx.memo, &off, &fx.blob, 0);
         c.walk_until(None, 300, &mut sink).unwrap();
         assert_eq!(c.prefetches, 0, "the option off");
+        // A walk near the run's end whose limit passes it, unbounded and
+        // not: the ask is of the slots to the run's end and no further,
+        // whatever the limit -- from the last rank whose slot starts before
+        // the last value page, that page alone, and from the first whose
+        // slot starts on it, nothing. A want taken as the limit asks pages
+        // past the run, and an unbounded one overflows the span's byte
+        // arithmetic.
+        let n = fx.recs.len();
+        let body = on.stride().unwrap();
+        let w = body.trailer().w as usize;
+        let value_pages = (n * w).div_ceil(ZPAGE);
+        let on_last = ((value_pages - 1) * ZPAGE).div_ceil(w);
+        assert!(on_last < n, "a run whose last value page holds slots");
+        assert_eq!(
+            on.stride_ask_ahead(body, (on_last - 1) as u64, (n - on_last + 1) as u64),
+            Some(((value_pages - 1) as u32, 1)),
+            "the run's last value page"
+        );
+        assert_eq!(
+            on.stride_ask_ahead(body, on_last as u64, (n - on_last) as u64),
+            None
+        );
+        for (from, asks) in [(on_last, 0u64), (on_last - 1, 1)] {
+            for limit in [n, usize::MAX] {
+                let mut c = ZCursor::at(&fx.memo, &on, &fx.blob, from);
+                let walked = c.walk_until(None, limit, &mut sink).unwrap();
+                assert_eq!(walked, (n - from, KeyOrder::Greater), "from {from}");
+                assert_eq!(
+                    c.prefetches, asks,
+                    "from {from} for {limit}: the ask stays inside the value pages"
+                );
+            }
+        }
     }
 
     /// A cursor over a stride file honours the file's being out of service
