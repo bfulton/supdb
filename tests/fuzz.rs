@@ -25,11 +25,32 @@
 //! A long range is one process per seed, each in a `TMPDIR` of its own and
 //! under a timeout, so that a hang is a result and not a stall.
 //!
+//! A seed keeps a record of what it did (`Log`): every write with its step,
+//! whether a commit took it into the model or a crash dropped it, and every
+//! commit, seal, flush, settle, burst, check, close, crash and reopen, each
+//! with both stores' counts of seals, merges, promotions, manifests, runs
+//! and levels at that moment. A wrong answer for a key prints, beside the
+//! failure line, the values got and wanted in hex, the earlier write each
+//! wrong value equals -- an older value of the key, another key's, or none
+//! -- the store's sources for the key (`Reader::debug_key`) in full, and the
+//! key's history from that record (`DETAIL`, `SOURCES` and `HISTORY` lines).
+//! A failure that comes once in a long run is read from those: the record
+//! is a function of the draws, so a rerun of the seed gives it back whole
+//! where it does not give back the schedule that failed.
+//!
 //! Knobs, all environment variables:
 //!
 //! - `ZFUZZ_FROM`, `ZFUZZ_TO`: the seeds, half open. The default is a few
 //!   seeds that run in seconds.
 //! - `ZFUZZ_SEEDS`: a comma separated list of seeds in place of the range.
+//! - `ZFUZZ_PIN_CFG=n`: every seed runs seed `n`'s configuration (its
+//!   `StrideSteer` with it) and draws its own operations, the ones that
+//!   follow its own configuration's draws, so that a range is that many
+//!   schedules of one failing shape; the pinned seed itself runs as it
+//!   does unpinned. Unset, no seed's draws move. A failure line names the
+//!   pin.
+//! - `ZFUZZ_HISTORY=<hex key>`: print the key's history at the seed's end,
+//!   passed or failed (`ZFUZZ_HISTORY=` for the empty key).
 //! - `ZFUZZ_CACHE`: `1` turns the block cache on for the one seed in five
 //!   that asks for it, `all` for every seed, and `off` for none while
 //!   drawing as `1` does, so that a seed that failed under `1` or `all`
@@ -106,8 +127,11 @@
 //! - `ZFUZZ_SEEDKEY=1`: the store's first write is a key of its own, and
 //!   one goes ahead of every write of the empty key, so that no write of
 //!   the empty key is the first of its memtable.
-//! - `ZFUZZ_VERBOSE=1`: print each seed's configuration. `ZFUZZ_TRACE=1`:
-//!   print each event as it is reached, for the last line of a hang.
+//! - `ZFUZZ_VERBOSE=1`: print each seed's configuration, and at its end a
+//!   hash of its record's writes and events, which the draws alone decide,
+//!   so that two builds' streams are compared seed by seed.
+//!   `ZFUZZ_TRACE=1`: print each event as it is reached, for the last line
+//!   of a hang.
 //! - `ZFUZZ_SCANEVERY=1`: scan the whole store through the writer after
 //!   every step that leaves nothing staged, so a scan that goes wrong is
 //!   caught at the step it does and not at the next full check; a
@@ -490,7 +514,8 @@ impl StrideSteer {
     }
 }
 
-/// One write, staged for the model and made to both stores.
+/// One write, staged for the model, made to both stores and noted in the
+/// seed's record.
 fn write(op: Op, staged: &mut Vec<Op>, z: &mut Db, r: &mut Db) {
     for d in [z, r] {
         match &op {
@@ -499,6 +524,10 @@ fn write(op: Op, staged: &mut Vec<Op>, z: &mut Db, r: &mut Db) {
             Op::Put(k, v) => d.put(k, v),
         }
     }
+    note(Rec::Write {
+        step: STEP.get(),
+        op: op.clone(),
+    });
     staged.push(op);
 }
 
@@ -799,6 +828,446 @@ fn apply(model: &mut Model, op: &Op) {
     }
 }
 
+thread_local! {
+    /// The seed's record, for the reason `STEP` is kept: a check that fails
+    /// is far from the loop that made the writes it is about.
+    static LOG: std::cell::RefCell<Log> = std::cell::RefCell::new(Log::default());
+}
+
+/// What a seed did, in the order it did it. Every entry but the counts is
+/// a function of the draws, so the record is the same in every run of a
+/// seed, whatever the schedule did in it.
+#[derive(Default)]
+struct Log {
+    recs: Vec<Rec>,
+    /// Keys whose history a failure has printed: a seed stops at the step
+    /// a check failed at, so every check that finds the key wrong after the
+    /// first would print the same history.
+    shown: BTreeSet<Vec<u8>>,
+}
+
+/// One entry of the record, at the step it was made: -1 before the steps
+/// and the seed's `ops` in the final check.
+enum Rec {
+    /// A write staged to both stores.
+    Write { step: i64, op: Op },
+    /// The writes staged since the last `Commit` or `Lost` taken into the
+    /// model: both stores' commits (`how` "commit"), or the commit a clean
+    /// close makes ("close").
+    Commit {
+        step: i64,
+        how: &'static str,
+        counts: Counts,
+    },
+    /// The staged writes dropped by a crash.
+    Lost { step: i64 },
+    /// Anything else that changes the stores' shape or reads them whole:
+    /// `what` begins with `check` at a full check, whose line in a key's
+    /// history carries the model's value there, and with `reopen` at a
+    /// reopen, whose stores count from zero.
+    Event {
+        step: i64,
+        what: String,
+        counts: Counts,
+    },
+}
+
+/// Both stores' counts at an entry, `z` then `r`, under `COUNT_NAMES`.
+type Counts = [[u64; 10]; 2];
+
+/// Seals joined, partition merges landed, merges planned, pieces promoted,
+/// manifests published, WAL rotations, directory barriers made for the
+/// temp names of runs of ordered ingest -- at most one a run, and none for
+/// a run whose name a rotation carried, so not a count of the runs -- then
+/// whether a run of ordered ingest is open, which a burst's keys go to only
+/// where the memtable was empty, and the partitions and the pieces
+/// standing.
+const COUNT_NAMES: [&str; 10] = [
+    "seals",
+    "merges",
+    "plans",
+    "promotions",
+    "manifests",
+    "rotations",
+    "run-names",
+    "run-open",
+    "partitions",
+    "pieces",
+];
+
+/// A store's counts: atomic loads, a field of the writer's, and the levels
+/// under the writer's own pin, as any of its reads takes it. Nothing here
+/// takes the upkeep home or draws, so a seed's schedule and stream are
+/// what they were without the record.
+fn counts_of(d: &Db) -> [u64; 10] {
+    let w = d.seal_waits();
+    let (parts, pieces) = d.levels();
+    [
+        w.joins,
+        w.merges,
+        w.plans,
+        d.promotions().0,
+        w.publishes,
+        w.wal_rotations,
+        w.run_names,
+        u64::from(d.runs_unsynced().0.is_some()),
+        parts as u64,
+        pieces as u64,
+    ]
+}
+
+fn note(rec: Rec) {
+    LOG.with_borrow_mut(|l| l.recs.push(rec));
+}
+
+fn note_commit(how: &'static str, z: &Db, r: &Db) {
+    let counts = [counts_of(z), counts_of(r)];
+    note(Rec::Commit {
+        step: STEP.get(),
+        how,
+        counts,
+    });
+}
+
+fn note_event(what: impl Into<String>, z: &Db, r: &Db) {
+    let counts = [counts_of(z), counts_of(r)];
+    note(Rec::Event {
+        step: STEP.get(),
+        what: what.into(),
+        counts,
+    });
+}
+
+/// Both stores' commits, and the staged writes taken into the model.
+fn commit_both(
+    z: &mut Db,
+    r: &mut Db,
+    model: &mut Model,
+    staged: &mut Vec<Op>,
+) -> Result<(), String> {
+    z.commit().map_err(|e| format!("commit z: {e}"))?;
+    r.commit().map_err(|e| format!("commit r: {e}"))?;
+    for op in staged.drain(..) {
+        apply(model, &op);
+    }
+    note_commit("commit", z, r);
+    Ok(())
+}
+
+fn op_key(op: &Op) -> &[u8] {
+    match op {
+        Op::Append(k, _) | Op::Delete(k) | Op::Put(k, _) => k,
+    }
+}
+
+fn op_value(op: &Op) -> Option<&[u8]> {
+    match op {
+        Op::Append(_, v) | Op::Put(_, v) => Some(v),
+        Op::Delete(_) => None,
+    }
+}
+
+/// A value in hex with its length, cut to its first 32 bytes past 48.
+fn hexv(v: &[u8]) -> String {
+    if v.len() <= 48 {
+        format!("{}({})", show(v), v.len())
+    } else {
+        format!("{}..({})", show(&v[..32]), v.len())
+    }
+}
+
+fn hexvs(vs: &[Vec<u8>]) -> String {
+    let all: Vec<String> = vs.iter().map(|v| hexv(v)).collect();
+    format!("[{}]", all.join(", "))
+}
+
+fn op_line(op: &Op) -> String {
+    match op {
+        Op::Append(_, v) => format!("Append {}", hexv(v)),
+        Op::Put(_, v) => format!("Put {}", hexv(v)),
+        Op::Delete(_) => "Delete".into(),
+    }
+}
+
+/// For each entry, the `Commit` or `Lost` that ended it where it is a
+/// write; `None` for a write still staged at the record's end.
+fn fates(recs: &[Rec]) -> Vec<Option<usize>> {
+    let mut out = vec![None; recs.len()];
+    let mut pending = Vec::new();
+    for (i, rec) in recs.iter().enumerate() {
+        match rec {
+            Rec::Write { .. } => pending.push(i),
+            Rec::Commit { .. } | Rec::Lost { .. } => {
+                for w in pending.drain(..) {
+                    out[w] = Some(i);
+                }
+            }
+            Rec::Event { .. } => {}
+        }
+    }
+    out
+}
+
+fn fate_line(recs: &[Rec], end: Option<usize>) -> String {
+    match end.map(|j| &recs[j]) {
+        Some(Rec::Commit { step, how, .. }) if *how == "close" => {
+            format!("committed by the close at s{step}")
+        }
+        Some(Rec::Commit { step, .. }) => format!("committed at s{step}"),
+        Some(Rec::Lost { step }) => format!("dropped by the crash at s{step}"),
+        _ => "staged at the record's end".into(),
+    }
+}
+
+/// Both stores' counts where they moved since `prev`, or whole where
+/// there is nothing to move from: a reopen's stores count from zero.
+fn counts_line(prev: Option<&Counts>, now: &Counts) -> String {
+    let mut parts = Vec::new();
+    for (s, name) in ["z", "r"].iter().enumerate() {
+        let mut moved = Vec::new();
+        for (c, n) in COUNT_NAMES.iter().enumerate() {
+            let v = now[s][c] as i64;
+            match prev {
+                Some(p) if v != p[s][c] as i64 => {
+                    moved.push(format!("{n}{:+}", v - p[s][c] as i64));
+                }
+                None if v != 0 => moved.push(format!("{n} {v}")),
+                _ => {}
+            }
+        }
+        if !moved.is_empty() {
+            parts.push(format!("{name} {}", moved.join(" ")));
+        }
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", parts.join("; "))
+    }
+}
+
+/// The key's history from the seed's record, one line an entry that
+/// touches it: each write with its step and its fate, each commit that
+/// took one with the model's value after it, each crash that dropped one,
+/// and every check with the model's value there and both stores' counts
+/// whole. The entries between are one line each gap -- the seals, flushes,
+/// settles, bursts, closes, crashes and reopens, and the commits where the
+/// counts moved -- each with the counts that moved since the entry before.
+fn history_of(recs: &[Rec], key: &[u8]) -> String {
+    let ends = fates(recs);
+    let mut lines: Vec<String> = Vec::new();
+    let mut between: Vec<String> = Vec::new();
+    // The model's value of the key, replayed by the model's own `apply`.
+    let mut model: Model = BTreeMap::new();
+    let mut staged: Vec<&Op> = Vec::new();
+    let mut prev: Option<&Counts> = None;
+    let mut writes = 0usize;
+    let value = |m: &Model| hexvs(m.get(key).map_or(&[][..], |v| v.as_slice()));
+    let gap = |between: &mut Vec<String>, lines: &mut Vec<String>| {
+        if !between.is_empty() {
+            lines.push(format!("    .. {}", between.join(", ")));
+            between.clear();
+        }
+    };
+    for (i, rec) in recs.iter().enumerate() {
+        match rec {
+            Rec::Write { step, op } => {
+                if op_key(op) == key {
+                    gap(&mut between, &mut lines);
+                    writes += 1;
+                    lines.push(format!(
+                        "  s{step} {} -- {}",
+                        op_line(op),
+                        fate_line(recs, ends[i])
+                    ));
+                    staged.push(op);
+                }
+            }
+            Rec::Commit { step, how, counts } => {
+                let moved = counts_line(prev, counts);
+                prev = Some(counts);
+                if staged.is_empty() {
+                    if !moved.is_empty() || *how != "commit" {
+                        between.push(format!("s{step} {how}{moved}"));
+                    }
+                } else {
+                    for op in staged.drain(..) {
+                        apply(&mut model, op);
+                    }
+                    gap(&mut between, &mut lines);
+                    lines.push(format!(
+                        "  s{step} {how}{moved}: the model's value {}",
+                        value(&model)
+                    ));
+                }
+            }
+            Rec::Lost { step } => {
+                if !staged.is_empty() {
+                    gap(&mut between, &mut lines);
+                    lines.push(format!(
+                        "  s{step} crash: {} staged write(s) of the key dropped",
+                        staged.len()
+                    ));
+                    staged.clear();
+                }
+            }
+            Rec::Event { step, what, counts } => {
+                let whole = what.starts_with("reopen");
+                let moved = counts_line(if whole { None } else { prev }, counts);
+                prev = Some(counts);
+                if what.starts_with("check") {
+                    gap(&mut between, &mut lines);
+                    lines.push(format!(
+                        "  s{step} {what}: the model's value {}; counts{}",
+                        value(&model),
+                        counts_line(None, counts)
+                    ));
+                } else {
+                    between.push(format!("s{step} {what}{moved}"));
+                }
+            }
+        }
+    }
+    gap(&mut between, &mut lines);
+    format!(
+        "key {} (len {}): {writes} write(s), the model's value at the record's end {}\n{}",
+        show(key),
+        key.len(),
+        value(&model),
+        lines.join("\n")
+    )
+}
+
+fn history(key: &[u8]) -> String {
+    LOG.with_borrow(|l| history_of(&l.recs, key))
+}
+
+/// The writes of the seed's record that wrote `v`: the key's own, then
+/// other keys', a few of each, newest first.
+fn provenance(key: &[u8], v: &[u8]) -> String {
+    LOG.with_borrow(|l| {
+        let ends = fates(&l.recs);
+        let (mut own, mut other) = (Vec::new(), Vec::new());
+        for (i, rec) in l.recs.iter().enumerate().rev() {
+            let Rec::Write { step, op } = rec else {
+                continue;
+            };
+            if op_value(op) != Some(v) {
+                continue;
+            }
+            let kind = match op {
+                Op::Append(..) => "Append",
+                Op::Put(..) => "Put",
+                Op::Delete(..) => unreachable!("a delete writes no value"),
+            };
+            let what = format!("{kind} at s{step}, {}", fate_line(&l.recs, ends[i]));
+            if op_key(op) == key {
+                own.push(format!("the key's own {what}"));
+            } else {
+                other.push(format!("key {}'s {what}", show(op_key(op))));
+            }
+        }
+        if own.is_empty() && other.is_empty() {
+            return "no write of the seed's".into();
+        }
+        let (n_own, n_other) = (own.len(), other.len());
+        own.truncate(4);
+        other.truncate(4);
+        let mut out = own;
+        out.extend(other);
+        format!(
+            "{} ({n_own} of the key's own, {n_other} of other keys')",
+            out.join("; ")
+        )
+    })
+}
+
+/// A key a check found wrong, said in full on stderr, since a failure's
+/// line is cut short: what was read and what the model wants, in hex; the
+/// earlier write each value read and not wanted equals; the reader's
+/// sources for the key; and, the first time a seed's check finds the key
+/// wrong, its history. `got` is `None` where the check read no values.
+fn explain(label: &str, src: &Reader, key: &[u8], got: Option<&[Vec<u8>]>, want: &[Vec<u8>]) {
+    let step = STEP.get();
+    eprintln!(
+        "DETAIL {label} [step {step}] key {} (len {}): got {}, want {}",
+        show(key),
+        key.len(),
+        got.map_or_else(|| "-".to_string(), hexvs),
+        hexvs(want)
+    );
+    for (i, v) in got.unwrap_or_default().iter().enumerate() {
+        if !want.contains(v) {
+            eprintln!(
+                "DETAIL {label} [step {step}] got value {i} {} is {}",
+                hexv(v),
+                provenance(key, v)
+            );
+        }
+    }
+    eprintln!(
+        "SOURCES {label} [step {step}] key {}: {}",
+        show(key),
+        src.debug_key(key)
+    );
+    if LOG.with_borrow_mut(|l| l.shown.insert(key.to_vec())) {
+        eprintln!("HISTORY [step {step}] {}", history(key));
+    }
+}
+
+/// The record's writes and events hashed (FNV-1a), the counts left out:
+/// a function of the draws alone.
+fn log_hash() -> (usize, u64) {
+    LOG.with_borrow(|l| {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let mut eat = |b: &[u8]| {
+            for &x in b {
+                h = (h ^ x as u64).wrapping_mul(0x0100_0000_01b3);
+            }
+            // A separator no length ambiguity crosses.
+            h = (h ^ 0x1ff).wrapping_mul(0x0100_0000_01b3);
+        };
+        for rec in &l.recs {
+            match rec {
+                Rec::Write { step, op } => {
+                    let kind: &[u8] = match op {
+                        Op::Append(..) => b"A",
+                        Op::Put(..) => b"P",
+                        Op::Delete(..) => b"D",
+                    };
+                    eat(kind);
+                    eat(&step.to_le_bytes());
+                    eat(op_key(op));
+                    eat(op_value(op).unwrap_or_default());
+                }
+                Rec::Commit { step, how, .. } => {
+                    eat(how.as_bytes());
+                    eat(&step.to_le_bytes());
+                }
+                Rec::Lost { step } => {
+                    eat(b"lost");
+                    eat(&step.to_le_bytes());
+                }
+                Rec::Event { step, what, .. } => {
+                    eat(what.as_bytes());
+                    eat(&step.to_le_bytes());
+                }
+            }
+        }
+        (l.recs.len(), h)
+    })
+}
+
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
 fn read_vec(r: &Reader, key: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     let mut v = Vec::new();
     let n = r
@@ -872,11 +1341,16 @@ fn fail(fails: &mut Vec<String>, msg: String) {
     fails.push(msg);
 }
 
+/// Keys a check explains in full (`explain`) before it only counts them.
+const EXPLAINED: usize = 3;
+
 fn check_keys(label: &str, r: &Reader, model: &Model, keys: &[Vec<u8>], fails: &mut Vec<String>) {
+    let mut explained = 0;
     for k in keys {
         let want = model.get(k).cloned().unwrap_or_default();
-        match read_vec(r, k) {
-            Ok(got) if got == want => {}
+        let before = fails.len();
+        let got = match read_vec(r, k) {
+            Ok(got) if got == want => Some(got),
             Ok(got) => {
                 fail(fails, format!(
                     "{label}: read of key {} (len {}): {}: got {} values {:?}.., want {} values {:?}..",
@@ -888,9 +1362,13 @@ fn check_keys(label: &str, r: &Reader, model: &Model, keys: &[Vec<u8>], fails: &
                     want.len(),
                     want.iter().take(3).map(|v| v.len()).collect::<Vec<_>>(),
                 ));
+                Some(got)
             }
-            Err(e) => fail(fails, format!("{label}: read of key {}: {e}", show(k))),
-        }
+            Err(e) => {
+                fail(fails, format!("{label}: read of key {}: {e}", show(k)));
+                None
+            }
+        };
         match r.count(k) {
             Ok(n) if n as usize == want.len() => {}
             Ok(n) => fail(
@@ -903,6 +1381,10 @@ fn check_keys(label: &str, r: &Reader, model: &Model, keys: &[Vec<u8>], fails: &
                 ),
             ),
             Err(e) => fail(fails, format!("{label}: count of key {}: {e}", show(k))),
+        }
+        if fails.len() > before && explained < EXPLAINED {
+            explained += 1;
+            explain(label, r, k, got.as_deref(), &want);
         }
         if fails.len() > 20 {
             return;
@@ -977,11 +1459,33 @@ fn absent_around(keys: &[Vec<u8>], rng: &mut Rng) -> Vec<Vec<u8>> {
     v
 }
 
-/// The first key the model has that `got` answers differently.
+/// The first key, in key order, that `got` answers differently from the
+/// model: one the model has and `got` answers otherwise or not at all, or
+/// one `got` lists that the model does not.
 fn first_diff_key(got: &Model, want: &Model) -> Option<Vec<u8>> {
-    want.iter()
+    let differs = want
+        .iter()
         .find(|(k, w)| got.get(*k) != Some(w))
-        .map(|(k, _)| k.clone())
+        .map(|(k, _)| k);
+    let extra = got.keys().find(|k| !want.contains_key(*k));
+    match (differs, extra) {
+        (Some(a), Some(b)) => Some(a.min(b).clone()),
+        (a, b) => a.or(b).cloned(),
+    }
+}
+
+/// The first key a whole scan answered wrongly, said in full (`explain`).
+fn explain_scan(label: &str, src: &Reader, got: &Model, want: &Model) {
+    if let Some(k) = first_diff_key(got, want) {
+        let none = Vec::new();
+        explain(
+            label,
+            src,
+            &k,
+            Some(got.get(&k).unwrap_or(&none)),
+            want.get(&k).unwrap_or(&none),
+        );
+    }
 }
 
 fn model_diff(got: &Model, want: &Model) -> String {
@@ -1202,20 +1706,60 @@ fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_default()
 }
 
+/// The seed whose configuration every seed runs under `ZFUZZ_PIN_CFG`.
+fn pinned() -> Option<u64> {
+    env_u64("ZFUZZ_PIN_CFG")
+}
+
+/// " (cfg of seed n)" where the configuration is pinned, for the lines
+/// that name a seed's configuration.
+fn pin_note() -> String {
+    pinned().map_or_else(String::new, |p| format!(" (cfg of seed {p})"))
+}
+
+/// A seed's configuration and the generator its operations are drawn
+/// from, past its own configuration's draws. Under `ZFUZZ_PIN_CFG` the
+/// configuration is the pinned seed's, drawn from a generator of its own,
+/// and the seed's own is drawn all the same and thrown away, so that the
+/// operations are the ones the seed draws unpinned: the pinned seed runs as
+/// it does without the pin, and every other seed is another schedule of
+/// its shape.
+fn seed_draws(seed: u64, want_cache: bool) -> (Cfg, Rng) {
+    let mut rng = Rng::new(seed);
+    let own = pick_cfg(&mut rng, want_cache);
+    let cfg = match pinned() {
+        Some(p) => pick_cfg(&mut Rng::new(p), want_cache),
+        None => own,
+    };
+    (cfg, rng)
+}
+
 /// One seed, whose failure line carries the step it was at and the
 /// configuration it drew, whether the seed failed a check, returned an
-/// error or panicked.
+/// error or panicked. The record is the seed's from here, whatever ended
+/// it, so `ZFUZZ_HISTORY` reads it after a panic as after a pass.
 fn run_seed(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, String> {
-    let mut rng0 = Rng::new(seed);
-    let cfg0 = pick_cfg(&mut rng0, want_cache);
+    let (cfg0, _) = seed_draws(seed, want_cache);
     STEP.set(-1);
+    LOG.with_borrow_mut(|l| *l = Log::default());
     let run = std::panic::catch_unwind(|| run_seed_inner(seed, want_cache, verbose));
     let at = format!(
-        "[step {} of {}] [cfg {}]",
+        "[step {} of {}] [cfg {}{}]",
         STEP.get(),
         cfg0.ops,
-        cfg_line(&cfg0)
+        cfg_line(&cfg0),
+        pin_note()
     );
+    if verbose {
+        let (n, h) = log_hash();
+        eprintln!("seed {seed}: record {n} entries, draws hash {h:016x}");
+    }
+    if let Ok(hex) = std::env::var("ZFUZZ_HISTORY") {
+        match unhex(&hex) {
+            Some(k) => eprintln!("HISTORY seed {seed} {}", history(&k)),
+            None => eprintln!("ZFUZZ_HISTORY={hex} is not a key in hex"),
+        }
+    }
     match run {
         Ok(Ok(st)) => Ok(st),
         Ok(Err(e)) => Err(format!("{e} {at}")),
@@ -1239,12 +1783,11 @@ fn cfg_line(c: &Cfg) -> String {
 }
 
 fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, String> {
-    let mut rng = Rng::new(seed);
-    let cfg = pick_cfg(&mut rng, want_cache);
+    let (cfg, mut rng) = seed_draws(seed, want_cache);
     let tag = format!("s{seed}");
     let (dz, dr) = (scratch(&format!("{tag}-z")), scratch(&format!("{tag}-r")));
     if verbose {
-        eprintln!("seed {seed}: {cfg:?}");
+        eprintln!("seed {seed}{}: {cfg:?}", pin_note());
     }
     let mut z = Db::create(&dz, opts_z(&cfg)).map_err(|e| format!("create z: {e}"))?;
     let mut r = Db::create(&dr, opts(&cfg)).map_err(|e| format!("create r: {e}"))?;
@@ -1259,14 +1802,13 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     };
     if seedkey_first {
         let seedkey = b"\x01seed".to_vec();
-        z.append(&seedkey, b"s");
-        r.append(&seedkey, b"s");
-        z.commit().map_err(|e| format!("commit z: {e}"))?;
-        r.commit().map_err(|e| format!("commit r: {e}"))?;
-        model
-            .entry(seedkey.clone())
-            .or_default()
-            .push(b"s".to_vec());
+        write(
+            Op::Append(seedkey.clone(), b"s".to_vec()),
+            &mut staged,
+            &mut z,
+            &mut r,
+        );
+        commit_both(&mut z, &mut r, &mut model, &mut staged)?;
         pool.push(seedkey);
     }
     // Under `ZFUZZ_STRIDE`, every key of the pool written once before the
@@ -1287,16 +1829,13 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                 &mut r,
             );
             if i % 97 == 96 || i + 1 == order.len() {
-                z.commit().map_err(|e| format!("commit z: {e}"))?;
-                r.commit().map_err(|e| format!("commit r: {e}"))?;
-                for op in staged.drain(..) {
-                    apply(&mut model, &op);
-                }
+                commit_both(&mut z, &mut r, &mut model, &mut staged)?;
             }
         }
         if rng.chance(70) {
             z.flush().map_err(|e| format!("flush z: {e}"))?;
             r.flush().map_err(|e| format!("flush r: {e}"))?;
+            note_event("flush", &z, &r);
         }
     }
     let mut hi = 0u64;
@@ -1315,12 +1854,6 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     let mut fails: Vec<String> = Vec::new();
     let mut absent = absent_around(&pool, &mut rng);
 
-    macro_rules! both {
-        ($f:expr) => {{
-            $f(&mut z);
-            $f(&mut r);
-        }};
-    }
     let all_probe = |pool: &[Vec<u8>], absent: &[Vec<u8>]| -> Vec<Vec<u8>> {
         pool.iter().chain(absent.iter()).cloned().collect()
     };
@@ -1337,8 +1870,12 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         let k = pool[rng.below(pool.len())].clone();
         if seedkey_first && k.is_empty() {
             let seedkey = b"\x01seed".to_vec();
-            staged.push(Op::Append(seedkey.clone(), b"e".to_vec()));
-            both!(|d: &mut Db| d.append(&seedkey, b"e"));
+            write(
+                Op::Append(seedkey, b"e".to_vec()),
+                &mut staged,
+                &mut z,
+                &mut r,
+            );
         }
         if let Some(s) = &cfg.stride {
             for op in s.ops(&mut rng, &k) {
@@ -1348,8 +1885,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
             match rng.below(100) {
                 0..=44 => {
                     let v = value(&mut rng, step, cfg.big);
-                    staged.push(Op::Append(k.clone(), v.clone()));
-                    both!(|d: &mut Db| d.append(&k, &v));
+                    write(Op::Append(k.clone(), v), &mut staged, &mut z, &mut r);
                 }
                 45..=52 => {
                     for _ in 0..2 + rng.below(8) {
@@ -1359,18 +1895,13 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                         } else {
                             value(&mut rng, step, cfg.big)
                         };
-                        staged.push(Op::Append(k.clone(), v.clone()));
-                        both!(|d: &mut Db| d.append(&k, &v));
+                        write(Op::Append(k.clone(), v), &mut staged, &mut z, &mut r);
                     }
                 }
-                53..=60 => {
-                    staged.push(Op::Delete(k.clone()));
-                    both!(|d: &mut Db| d.delete(&k));
-                }
+                53..=60 => write(Op::Delete(k.clone()), &mut staged, &mut z, &mut r),
                 61..=65 if std::env::var("ZFUZZ_NOPUT").is_err() => {
                     let v = value(&mut rng, step, cfg.big);
-                    staged.push(Op::Put(k.clone(), v.clone()));
-                    both!(|d: &mut Db| d.put(&k, &v));
+                    write(Op::Put(k.clone(), v), &mut staged, &mut z, &mut r);
                 }
                 _ => {}
             }
@@ -1389,11 +1920,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         }
         let commit_now = rng.chance(9);
         if commit_now {
-            z.commit().map_err(|e| format!("commit z: {e}"))?;
-            r.commit().map_err(|e| format!("commit r: {e}"))?;
-            for op in staged.drain(..) {
-                apply(&mut model, &op);
-            }
+            commit_both(&mut z, &mut r, &mut model, &mut staged)?;
             // The handles at their latest.
             for (i, h) in handles.iter().enumerate() {
                 if h.snap.is_none() && rng.chance(20) {
@@ -1419,30 +1946,26 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
             }
             match event {
                 0..=29 => {
-                    z.commit().map_err(|e| format!("commit z: {e}"))?;
-                    r.commit().map_err(|e| format!("commit r: {e}"))?;
-                    for op in staged.drain(..) {
-                        apply(&mut model, &op);
-                    }
+                    commit_both(&mut z, &mut r, &mut model, &mut staged)?;
                     z.seal().map_err(|e| format!("seal z: {e}"))?;
                     r.seal().map_err(|e| format!("seal r: {e}"))?;
+                    note_event("seal", &z, &r);
                 }
                 30..=44 => {
-                    z.commit().map_err(|e| format!("commit z: {e}"))?;
-                    r.commit().map_err(|e| format!("commit r: {e}"))?;
-                    for op in staged.drain(..) {
-                        apply(&mut model, &op);
-                    }
+                    commit_both(&mut z, &mut r, &mut model, &mut staged)?;
                     z.flush().map_err(|e| format!("flush z: {e}"))?;
                     r.flush().map_err(|e| format!("flush r: {e}"))?;
+                    note_event("flush", &z, &r);
                 }
                 45..=64 => {
                     z.settle().map_err(|e| format!("settle z: {e}"))?;
                     r.settle().map_err(|e| format!("settle r: {e}"))?;
+                    note_event("settle", &z, &r);
                 }
                 65..=94 => {
                     // The builder, with or without a settle's worth of quiet.
                     z.settle().map_err(|e| format!("settle z: {e}"))?;
+                    note_event("settle z", &z, &r);
                     // With the segment work inline no form file's build
                     // starts in the fuzz's stores -- the builds start at
                     // the turns of the segment work's thread's loop
@@ -1453,12 +1976,14 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     if cfg.stride.is_some() && !cfg.bg {
                         z.zpages_settle()
                             .map_err(|e| format!("zpages settle z: {e}"))?;
+                        note_event("zpages settle z", &z, &r);
                     }
                 }
                 95..=104 if std::env::var("ZFUZZ_NOBURST").is_err() => {
                     // An ordered burst: keys above the store's greatest, a
                     // direct run with markers in its record region.
                     let n = 5 + rng.below(80);
+                    note_event(format!("burst of {n}"), &z, &r);
                     for i in 0..n {
                         let mut key = vec![0xff, 0xff, 0xff, 0xff];
                         key.extend(format!("{:08}", hi).bytes());
@@ -1480,16 +2005,13 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                         write(op, &mut staged, &mut z, &mut r);
                         pool.push(key);
                         if rng.chance(15) || i + 1 == n {
-                            z.commit().map_err(|e| format!("commit z: {e}"))?;
-                            r.commit().map_err(|e| format!("commit r: {e}"))?;
-                            for op in staged.drain(..) {
-                                apply(&mut model, &op);
-                            }
+                            commit_both(&mut z, &mut r, &mut model, &mut staged)?;
                         }
                     }
                     if rng.chance(70) {
                         z.flush().map_err(|e| format!("flush z: {e}"))?;
                         r.flush().map_err(|e| format!("flush r: {e}"))?;
+                        note_event("flush", &z, &r);
                     }
                     absent = absent_around(&pool, &mut rng);
                 }
@@ -1499,25 +2021,24 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                             r: z.reader().map_err(|e| format!("reader: {e}"))?,
                             snap: None,
                         });
+                        note_event("claim z", &z, &r);
                     }
                 }
                 120..=139 => {
                     // A snapshot of the committed store, held while the store
                     // changes under it.
-                    z.commit().map_err(|e| format!("commit z: {e}"))?;
-                    r.commit().map_err(|e| format!("commit r: {e}"))?;
-                    for op in staged.drain(..) {
-                        apply(&mut model, &op);
-                    }
+                    commit_both(&mut z, &mut r, &mut model, &mut staged)?;
                     if let Some(h) = handles.iter_mut().find(|h| h.snap.is_none()) {
                         h.r.snapshot();
                         h.snap = Some(model.clone());
+                        note_event("snapshot z", &z, &r);
                     }
                 }
                 140..=159 => {
                     if let Some(h) = handles.iter_mut().find(|h| h.snap.is_some()) {
                         h.r.release();
                         h.snap = None;
+                        note_event("release z", &z, &r);
                     }
                 }
                 160..=169 => {
@@ -1539,9 +2060,12 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                             // close commits the staged batch.
                             apply(&mut model, &op);
                         }
+                        note_commit("close", &z, &r);
                         z.close().map_err(|e| format!("close z: {e}"))?;
                         r.close().map_err(|e| format!("close r: {e}"))?;
                     } else {
+                        note(Rec::Lost { step: STEP.get() });
+                        note_event("crash", &z, &r);
                         staged.clear();
                         drop(z);
                         drop(r);
@@ -1553,6 +2077,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     st.reopens += 1;
                     let probe = all_probe(&pool, &absent);
                     let how = if clean { "a close" } else { "a crash" };
+                    note_event(format!("reopen after {how}"), &z, &r);
                     check_keys(&format!("z, after {how}"), &z, &model, &probe, &mut fails);
                     check_keys(&format!("r, after {how}"), &r, &model, &probe, &mut fails);
                 }
@@ -1570,8 +2095,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     let sources = first_diff_key(&a, &want)
                         .map(|k| format!("; {name}'s sources of the first: {}", d.debug_key(&k)))
                         .unwrap_or_default();
-                    // In full, since a failure's line is cut short.
-                    eprintln!("SOURCES {name} [step {step}]{sources}");
+                    explain_scan(&format!("{name} scan"), d, &a, &want);
                     fail(
                         &mut fails,
                         format!(
@@ -1588,13 +2112,12 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         }
         // Full checks now and then, on a quiet store.
         if step % 200 == 199 {
-            z.commit().map_err(|e| format!("commit z: {e}"))?;
-            r.commit().map_err(|e| format!("commit r: {e}"))?;
-            for op in staged.drain(..) {
-                apply(&mut model, &op);
-            }
+            commit_both(&mut z, &mut r, &mut model, &mut staged)?;
             if rng.chance(75) {
                 z.settle().map_err(|e| format!("settle z: {e}"))?;
+                note_event("check, z settled", &z, &r);
+            } else {
+                note_event("check", &z, &r);
             }
             let probe = all_probe(&pool, &absent);
             check_keys("z writer", &z, &model, &probe, &mut fails);
@@ -1629,6 +2152,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                             format!("; the writer's sources of the first: {}", z.debug_key(&k))
                         })
                         .unwrap_or_default();
+                    explain_scan("z scan", &z, &a, &want);
                     fail(
                         &mut fails,
                         format!(
@@ -1641,7 +2165,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     let sources = first_diff_key(&b, &want)
                         .map(|k| format!("; the twin's sources of the first: {}", r.debug_key(&k)))
                         .unwrap_or_default();
-                    eprintln!("SOURCES r [step {step}]{sources}");
+                    explain_scan("r scan", &r, &b, &want);
                     fail(
                         &mut fails,
                         format!(
@@ -1660,13 +2184,10 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     // failed a check keeps the step it failed at.
     if fails.is_empty() {
         STEP.set(cfg.ops as i64);
-        z.commit().map_err(|e| format!("commit z: {e}"))?;
-        r.commit().map_err(|e| format!("commit r: {e}"))?;
-        for op in staged.drain(..) {
-            apply(&mut model, &op);
-        }
+        commit_both(&mut z, &mut r, &mut model, &mut staged)?;
         z.settle().map_err(|e| format!("settle z: {e}"))?;
         r.settle().map_err(|e| format!("settle r: {e}"))?;
+        note_event("check, final, both settled", &z, &r);
         let probe = all_probe(&pool, &absent);
         check_keys("final z writer", &z, &model, &probe, &mut fails);
         check_keys("final r writer", &r, &model, &probe, &mut fails);
