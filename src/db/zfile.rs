@@ -1787,7 +1787,13 @@ impl<'a> ZCursor<'a> {
 // nothing of the slot handed over, as the block cursor answers a group that
 // fails under it, and the cursor falls, the rest of its walk the raw form's.
 // The values it hands over are counted on the handle's memo
-// (`StrideCounts::cursor`), and nowhere as a decode or a group opened.
+// (`StrideCounts::cursor`), and nowhere as a decode or a group opened, so
+// its walks and values add nothing to the file's heat (`ZFile::decodes16`,
+// `ZFile::opens16`) and nothing to a census by form: under the block cache
+// this cursor is a covered scan's path, and a stride partition read through
+// it reads cold to the hot policy until a stride file's heat and census are
+// counted, here and in the file's own read arms (above `ZFile::is_stride`)
+// together.
 
 impl<'a> ZCursor<'a> {
     /// The position at the rank in a stride file: its key rendered into

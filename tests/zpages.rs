@@ -15634,8 +15634,11 @@ fn hundred(rng: &mut Rng) -> Vec<u8> {
 /// it walks the stride partitions at its stride position, the values it
 /// hands over counted; under the cache read a run at a time
 /// (`Options::zpages_block_cursor` off) the walks are the file's own and no
-/// cursor's. Nothing is decoded, no walk is the raw form's, and the raw
-/// form is touched by none of it.
+/// cursor's. With the seek seeding the reader (`Options::zpages_seek_seeds`)
+/// the writer's scans from a key inside a partition seed its reader with the
+/// seek's cursor at its stride position, counted, every partition being a
+/// stride file's; without it nothing is seeded. Nothing is decoded, no walk
+/// is the raw form's, and the raw form is touched by none of it.
 fn stride_windows(name: &str, cache: bool, block_cursor: bool, seeds: bool) {
     let counts = cfg!(debug_assertions);
     let dir = scratch(name);
@@ -15724,11 +15727,13 @@ fn stride_windows(name: &str, cache: bool, block_cursor: bool, seeds: bool) {
     }
     let limits = [1usize, 2, 3, 5, 17, 56, 63, 64, 65, 114, usize::MAX];
     // Every window through the writer and a handle; the values the cursor's
-    // stride position handed over meanwhile.
-    let windows = |db: &Db, model: &Model, what: &str| -> u64 {
+    // stride position handed over meanwhile, and the writer's scans whose
+    // start seek seeded a partition's reader.
+    let windows = |db: &Db, model: &Model, what: &str| -> (u64, u64) {
         let latest = db.reader().unwrap();
         let w: &Reader = db;
         let before = db.zpage_counts();
+        let seeds_before = db.seek_seeds();
         let touches = (db.raw_touches(), latest.raw_touches());
         for start in &starts {
             for &limit in &limits {
@@ -15760,14 +15765,22 @@ fn stride_windows(name: &str, cache: bool, block_cursor: bool, seeds: bool) {
             c.raw_scans, before.raw_scans,
             "{name}, {what}: no walk the raw form's: {c:?}"
         );
-        c.stride_cursor_reads - before.stride_cursor_reads
+        (
+            c.stride_cursor_reads - before.stride_cursor_reads,
+            db.seek_seeds() - seeds_before,
+        )
     };
     let cursor = !cache || block_cursor;
-    let through = windows(&db, &model, "over a frozen table and the live one");
+    let (through, seeded) = windows(&db, &model, "over a frozen table and the live one");
     assert_eq!(
         through > 0,
         cursor,
         "{name}: {through} values through the cursor's stride position"
+    );
+    assert_eq!(
+        seeded > 0,
+        seeds,
+        "{name}: {seeded} of the writer's scans seeded a stride partition's reader"
     );
     // The seal lands: a piece over the partitions, and more writes over it.
     db.hold_seal_landing(false);
@@ -15780,11 +15793,16 @@ fn stride_windows(name: &str, cache: bool, block_cursor: bool, seeds: bool) {
     );
     write(&mut db, &mut model, &mut rng, 120);
     db.commit().unwrap();
-    let through = windows(&db, &model, "over a piece");
+    let (through, seeded) = windows(&db, &model, "over a piece");
     assert_eq!(
         through > 0,
         cursor,
         "{name}: over a piece, {through} values through the cursor's stride position"
+    );
+    assert_eq!(
+        seeded > 0,
+        seeds,
+        "{name}: over a piece, {seeded} of the writer's scans seeded a stride partition's reader"
     );
     assert!(db.levels().1 >= 1, "the piece stood through the windows");
     let c = db.zpage_counts();
