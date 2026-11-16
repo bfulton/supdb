@@ -3849,11 +3849,6 @@ fn seal_trailer(b: &mut [u8; ZTRAILER], magic: &[u8; 8], version: u32) {
     put32(b, T_CRC, crc);
 }
 
-/// The checks a trailer of the body `magic` names makes before it reads a
-/// field of the body, in order: the length, the magic, the version, the
-/// page size, the CRC. The cheap identifying checks come first, so a page
-/// that is no trailer of this kind -- another kind's among them -- is said
-/// to be that, and the CRC says the rest was torn.
 /// The magic of the trailer page `bytes`, which says which body the file
 /// holds ([`ZMAGIC`], [`STRIDE_MAGIC`]): read by an attach before any
 /// other byte of the page, at the one place every kind's head puts it.
@@ -3874,6 +3869,11 @@ pub fn trailer_crc(bytes: &[u8]) -> Option<u32> {
     (bytes.len() == ZTRAILER).then(|| get32(bytes, T_CRC))
 }
 
+/// The checks a trailer of the body `magic` names makes before it reads a
+/// field of the body, in order: the length, the magic, the version, the
+/// page size, the CRC. The cheap identifying checks come first, so a page
+/// that is no trailer of this kind -- another kind's among them -- is said
+/// to be that, and the CRC says the rest was torn.
 fn open_trailer(bytes: &[u8], magic: &[u8; 8], version: u32) -> Result<(), ZError> {
     if bytes.len() != ZTRAILER {
         return Err(ZError::Length);

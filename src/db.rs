@@ -583,8 +583,11 @@ pub struct ZCounts {
     /// against a stride file's row at their first touch in this process,
     /// none for a file the attach trusted as this process's build
     /// (`Options::zpages_stride_trust_built`); and the block cache's and the
-    /// merge path's asks for a cursor over a stride file, which take the raw
-    /// form's walk instead.
+    /// merge path's looks for a form file to read a stride partition
+    /// through, every one of them -- a cursor's placing, a seek, a key read,
+    /// a block's build, an ask ahead -- answered none and the read taken by
+    /// the raw form (`Reader::zc`, `Reader::zcursor_file`), so a count of
+    /// looks and not of walks.
     pub stride_reads: u64,
     pub stride_page_checks: u64,
     pub stride_cursor_refused: u64,
@@ -914,7 +917,11 @@ pub struct ZCounts {
     /// and found the partition does not qualify, by reason, in the order of
     /// `zfile::StrideNo`: a key not of the run's shape, holes, a record not
     /// one value, a width not the run's, a tombstone flag, a run in a block,
-    /// a partition under the floor, a file that did not read back.
+    /// a partition under the floor, a file that did not read back. The two
+    /// before the last are counted only where a conversion asks for the
+    /// stride form alone; under `ZStride::Forced` a run in a block or a
+    /// partition under the floor is the block form's decline as well, and
+    /// counted once, there (`declined_block_backed`, `declined_small`).
     pub stride_builds: u64,
     pub stride_declines: [u64; zfile::STRIDE_REASONS],
     /// The live partitions whose served form file is a stride file.
@@ -5900,11 +5907,13 @@ pub struct Options {
     /// built in it, and a stride file found under a partition's name is
     /// refused at its attach and built again in the block coding. `Forced`
     /// asks every build of a form file for it (`Options::z_stride_ask`) and
-    /// attaches one found on disk. Refused beside the re-code policies
-    /// (`zpages_recode` and the two that act under it, `zpages_recode_auto`,
-    /// `zpages_reparse`; `check_options` says why). The block cache's reads
-    /// and the merge path's walks of a stride partition go to the raw form
-    /// until the form file's cursor walks one (`Reader::zc`).
+    /// attaches one found on disk. Refused beside the three re-code policies
+    /// that build over a served file's name -- `zpages_recode`,
+    /// `zpages_recode_auto` and `zpages_reparse`, each of which acts on its
+    /// own -- and not beside `zpages_recode_keep` or `zpages_both`, which act
+    /// only on the paths those start (`check_options` says why). The block
+    /// cache's reads and the merge path's walks of a stride partition go to
+    /// the raw form until the form file's cursor walks one (`Reader::zc`).
     #[doc(hidden)]
     pub zpages_stride: ZStride,
     /// EXPERIMENT: under `zpages_stride` `Forced`, a stride file whose build
@@ -13053,9 +13062,11 @@ struct Slot {
     /// Of `zreads`, the point reads a stride file answered
     /// (`Options::zpages_stride`); the value pages this handle's reads
     /// checked against a stride file's row at their first touch
-    /// (`zfile::PointCounts::stride_checks`); and the block cache's and the
-    /// merge path's asks for a cursor over a stride file, which make none and
-    /// take the raw form's walk (`Reader::zc`, `Reader::pwalk_at`).
+    /// (`zfile::PointCounts::stride_checks`), both taken off the memo at
+    /// each dispatch (`Reader::zmemo_take`); and the block cache's and the
+    /// merge path's looks for a form file to read a stride partition through,
+    /// each answered none and the read the raw form's: every look, not every
+    /// walk (`Reader::zc`, `Reader::zcursor_file`).
     zstridereads: AtomicU64,
     zstridechecks: AtomicU64,
     zstriderefused: AtomicU64,
@@ -14828,19 +14839,21 @@ fn check_options(opts: &Options) -> Result<()> {
     // over it. Held back from a stride file, the same look picks it again
     // at every turn and the spares of the partitions after it are never
     // built. What each moves is the block body, so the stride form waits
-    // until their records tell the bodies apart.
+    // until their records tell the bodies apart. Three of them start those
+    // builds: `zpages_recode` under the forced form, and
+    // `zpages_recode_auto` and `zpages_reparse` under the controller, each
+    // on its own (`Maint::z_recode_tick`). `zpages_recode_keep` and
+    // `zpages_both` start none: the one keeps what a re-code's collect
+    // replaced and the other shapes the look and the spares, and both are
+    // read only on the paths those three start, so beside the stride form
+    // alone they do nothing and are not refused.
     if opts.zpages_stride != ZStride::Off
-        && (opts.zpages_recode
-            || opts.zpages_recode_keep
-            || opts.zpages_both
-            || opts.zpages_recode_auto
-            || opts.zpages_reparse)
+        && (opts.zpages_recode || opts.zpages_recode_auto || opts.zpages_reparse)
     {
         return Err(err(
             "zpages_stride Forced is refused beside the re-code policies \
-             (zpages_recode, zpages_recode_keep, zpages_both, zpages_recode_auto, \
-             zpages_reparse): each reads a stride file as the block coding and \
-             builds a block coding over its name",
+             (zpages_recode, zpages_recode_auto, zpages_reparse): each reads a \
+             stride file as the block coding and builds a block coding over its name",
         ));
     }
     Ok(())
@@ -23935,8 +23948,9 @@ impl Reader {
             self.zbump_by(|s| &s.zkeyhits, p.key_hits);
             self.zbump_by(|s| &s.zowned, p.owned);
         }
-        if p.stride_checks != 0 {
+        if p.stride_checks | p.stride_reads != 0 {
             self.zbump_by(|s| &s.zstridechecks, p.stride_checks);
+            self.zbump_by(|s| &s.zstridereads, p.stride_reads);
         }
     }
 
@@ -24050,9 +24064,6 @@ impl Reader {
                 self.zbump(|s| &s.zreads);
                 if decoded {
                     self.zbump(|s| &s.zdecodes);
-                }
-                if z.is_stride() {
-                    self.zbump(|s| &s.zstridereads);
                 }
                 Ok(n)
             }
