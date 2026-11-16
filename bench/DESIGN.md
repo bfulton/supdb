@@ -599,6 +599,20 @@ re-codes exchange the two without a build (`Options::zpages_recode_keep`);
 partition built at write time, the other beside each served file on the
 builder's thread, and the policy only exchanging them
 (`Options::zpages_both`);
+`supdb-nocachezstride` is `supdb-nocachezpages` with every build of a form
+file asking for the stride form -- a partition's values alone at their
+stride, where its keys are one run of numbers at one width and every record
+one inline value of one width -- and making the block form in the same call
+where the partition does not qualify (`Options::zpages_stride` at
+`Forced`); a pass refuses it after the ordered load unless the store holds a
+stride file, beside the forced arm's own rules, and the `zpage_stride_*`
+counters say what the stride files served and why a partition declined;
+`supdb-nocachezstrideprefetch` is it with a walk's pages asked for ahead
+(`Options::zpages_scan_prefetch`), `supdb-nocachezstridechecked` with no
+stride file this process built trusted at its attach
+(`Options::zpages_stride_trust_built` off), and `supdb-cache64tofitzstride`
+and `supdb-cache64tofitzstrideprefetch` are `supdb-cache64tofitzpages` with
+the stride form, and with the ask beside it;
 `supdb-settlelate` and `supdb-ingestsettlelate` are `supdb` and
 `supdb-ingest` with a commit near reads leaving a batch under the backlog
 bound to the scans, the shape before every such commit filed its batch and

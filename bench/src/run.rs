@@ -560,7 +560,10 @@ pub fn phase_mark(arm: &str, phase: &str, edge: &str) {
 /// writer, so that a scan's wait for the pass in flight is read against
 /// the step it waited out, and the fills left for a later pass beside the
 /// passes that were due by one alone (`Db::fill_deferred`,
-/// `Db::fill_owed_due`). The lag sweep prints one a
+/// `Db::fill_owed_due`), and the stride form's reads, first-touch checks,
+/// cursor values and builds over the window beside the stride files the
+/// store holds after it (`zs`), so that a stride arm's cell is read by the
+/// form that served it. The lag sweep prints one a
 /// point (`SUPDB_LAG_COUNTERS`) and the mixes one a mix
 /// (`SUPDB_MIX_COUNTERS`).
 fn counters_line(
@@ -575,7 +578,7 @@ fn counters_line(
     let get = |c: &[(&str, f64)], n: &str| c.iter().find(|(k, _)| *k == n).map_or(0.0, |(_, v)| *v);
     let d = |n: &str| get(c1, n) - get(c0, n);
     eprintln!(
-        "{tag} {arm} {point} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {burst_ms:.1} pass_ms {pass_ms:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p holds {:.0}/{:.1}ms maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} stood {:.0} dropped_mb {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0} | z reads {:.0} dec {:.0} scans {:.0} groups {:.0} memo {:.0}/{:.0} pf {:.0} | steps settle {:.1} snap {:.1} fillwalk {:.1} fillbuild {:.1} ms fills {:.0} cuts {:.0} left {:.0} owed {:.0}",
+        "{tag} {arm} {point} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {burst_ms:.1} pass_ms {pass_ms:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p holds {:.0}/{:.1}ms maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} stood {:.0} dropped_mb {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0} | z reads {:.0} dec {:.0} scans {:.0} groups {:.0} memo {:.0}/{:.0} pf {:.0} | steps settle {:.1} snap {:.1} fillwalk {:.1} fillbuild {:.1} ms fills {:.0} cuts {:.0} left {:.0} owed {:.0} | zs reads {:.0} checks {:.0} cursor {:.0} builds {:.0} files {:.0}",
         mem_free_mb(),
         d("scan_take_us") / 1e3,
         d("scan_sync_us") / 1e3,
@@ -618,7 +621,12 @@ fn counters_line(
         d("fill_passes"),
         d("fill_cuts"),
         d("fill_deferred"),
-        d("fill_owed_due")
+        d("fill_owed_due"),
+        d("zpage_stride_reads"),
+        d("zpage_stride_page_checks"),
+        d("zpage_stride_cursor_reads"),
+        d("zpage_stride_builds"),
+        get(c1, "zpage_stride_files_at_end")
     );
     // The process's memory beside the structures that count their own: the
     // resident bytes, what the allocator has handed out and what it holds
@@ -719,6 +727,23 @@ fn counters_line(
             "zpage_prefetches",
             "zpage_nopage_scans",
             "zpage_raw_scans",
+            // The stride form's: the reads a stride file answered, the
+            // value pages checked at their first touch, the values the
+            // cursor's stride position handed the block cache and the
+            // merge path, the stride files built, and the builds that
+            // found a partition does not qualify, by reason.
+            "zpage_stride_reads",
+            "zpage_stride_page_checks",
+            "zpage_stride_cursor_reads",
+            "zpage_stride_builds",
+            "zpage_stride_no_not_shaped",
+            "zpage_stride_no_holes",
+            "zpage_stride_no_not_one_value",
+            "zpage_stride_no_width",
+            "zpage_stride_no_tomb",
+            "zpage_stride_no_block_backed",
+            "zpage_stride_no_small",
+            "zpage_stride_no_self_check",
             // The writer's settles over the mix: runs, keys, the blocks
             // the keys grouped into, the blocks dropped for a rebuild, and
             // the keys filed with their cut unresolved against those
@@ -2257,8 +2282,9 @@ const Z_RAW_SHARE_MAX_PCT: u64 = 1;
 /// the engine's own decision, counted and printed
 /// (`zpage_declined_small_bytes`), and covers nothing the form is for;
 /// every other partition without a form file was declined for what it holds
-/// or failed, and refuses the pass. `None` is an engine with no such form,
-/// which nothing is asked of.
+/// or failed, and refuses the pass. A stride arm (`ZState::stride`) is held
+/// to those rules and, after the ordered load, to at least one stride file.
+/// `None` is an engine with no such form, which nothing is asked of.
 fn zpages_refusal(arm: &str, size: u64, stage: ZStage, z: Option<ZState>) -> Result<(), String> {
     let Some(z) = z else { return Ok(()) };
     let wrong = |what: String| {
@@ -2305,6 +2331,21 @@ fn zpages_refusal(arm: &str, size: u64, stage: ZStage, z: Option<ZState>) -> Res
             "the form is forced and {} of {} form files are out of service {when}: a check \
              of one of their pages failed, and a partition is read raw from then on",
             z.damaged, z.form_files
+        )),
+        // The stride form is asked of every build and falls to the block
+        // form in the same call where a partition does not qualify, so the
+        // coverage rules above hold a stride arm as they hold the block
+        // arm, a declined partition being a block file; what they cannot
+        // see is a store where every partition declined, whose reads are
+        // the block form's under the stride form's name. Asked at the
+        // ordered load, whose keys and values are the shape the form is
+        // for; the shuffled store's partitions are merge outputs, and what
+        // qualifies there is the counts' to say, not this refusal's.
+        (ZStage::Loaded, _) if z.stride && z.stride_files == 0 => wrong(format!(
+            "the stride form is forced and none of {} form files is a stride file {when}: \
+             every partition declined it (`zpage_stride_no_*` says why), so the reads \
+             are the block form's",
+            z.form_files
         )),
         (ZStage::Read, true) if z.reads == 0 => wrong(
             "the form is forced and no point read of the pass was answered from a form file".into(),
@@ -2354,6 +2395,26 @@ fn read_phase(
     counting.end(c0, "read", "", None, reads);
     zpages_refusal(arm, size, ZStage::Read, e.zpages_state())?;
     Ok(read_s)
+}
+
+/// The pass's store loaded in key order, its seconds and the device bytes it
+/// wrote returned. Then the question whether a forced arm's form covers it:
+/// the form files are made by the `sync` the load ends in, so a forced arm
+/// that is not covered, or a stride arm with no stride file, is refused here
+/// and not after the hour its reads would take.
+fn ordered_load(
+    e: &mut dyn Engine,
+    arm: &str,
+    size: u64,
+    plan: &Plan,
+    payload: &Payload,
+    counting: &mut Counting<'_>,
+) -> Result<(f64, u64), String> {
+    let c0 = counting.begin();
+    let got = load(e, size, plan, payload, |i| i)?;
+    counting.end(c0, "load", "", None, size);
+    zpages_refusal(arm, size, ZStage::Loaded, e.zpages_state())?;
+    Ok(got)
 }
 
 /// The pass's second store loaded in a shuffled order, its seconds returned.
@@ -2632,13 +2693,7 @@ fn one_pass(
     let mut counting = Counting::new(plan.bound.as_ref(), dir, trace)?;
     let prime_a = prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
     let mut e = engines::open(arm, dir, map_gb)?;
-    let c0 = counting.begin();
-    let (load_s, wrote) = load(e.as_mut(), size, plan, payload, |i| i)?;
-    counting.end(c0, "load", "", None, size);
-    // The form's form files are made by the `sync` the load ends in: a forced
-    // arm that is not covered is refused here and not after the hour its
-    // reads would take.
-    zpages_refusal(arm, size, ZStage::Loaded, e.zpages_state())?;
+    let (load_s, wrote) = ordered_load(e.as_mut(), arm, size, plan, payload, &mut counting)?;
     let stored = size as f64 * (KEY_SIZE + plan.value_size) as f64;
     // Read here so that this and the device bytes describe one moment: what
     // the engine wrote to get there, and what it occupies having got there.
@@ -5627,6 +5682,156 @@ mod tests {
         }))
         .unwrap_err();
         assert!(out.contains("out of service"), "{out}");
+    }
+
+    /// A stride arm is held after the ordered load to a store with a stride
+    /// file in it, beside the coverage rules every forced arm is held to:
+    /// green with one or more, red with none whatever its coverage, and at
+    /// no other stage, since the shuffled store's merge outputs are the
+    /// counts' to read; a block arm, which asks for no stride form, is
+    /// asked for none.
+    #[test]
+    fn a_stride_arm_with_no_stride_file_after_the_load_is_refused() {
+        let covered = ZState {
+            forced: true,
+            stride: true,
+            partitions: 18,
+            form_files: 18,
+            files: 18,
+            stride_files: 18,
+            ..ZState::default()
+        };
+        let run = |stage, z: ZState| zpages_refusal("supdb-nocachezstride", 1_000, stage, Some(z));
+        assert!(run(ZStage::Loaded, covered).is_ok());
+        let some = ZState {
+            stride_files: 1,
+            ..covered
+        };
+        assert!(
+            run(ZStage::Loaded, some).is_ok(),
+            "a partition declined is a block file, and the counts say why"
+        );
+        let none = ZState {
+            stride_files: 0,
+            ..covered
+        };
+        let why = run(ZStage::Loaded, none).unwrap_err();
+        assert!(
+            why.starts_with("supdb-nocachezstride at 1000: ")
+                && why.contains("none of 18 form files is a stride file after the load"),
+            "{why}"
+        );
+        for stage in [ZStage::Read, ZStage::Shuffled] {
+            let z = ZState { reads: 10, ..none };
+            assert!(run(stage, z).is_ok(), "{stage:?}");
+        }
+        // The coverage rules come first, and hold a stride arm as they hold
+        // the block arm.
+        let short = ZState {
+            form_files: 17,
+            files: 17,
+            stride_files: 17,
+            ..covered
+        };
+        assert!(run(ZStage::Loaded, short).unwrap_err().contains("17 of 18"));
+        // A block arm is asked for no stride file.
+        let block = ZState {
+            stride: false,
+            stride_files: 0,
+            ..covered
+        };
+        assert!(run(ZStage::Loaded, block).is_ok());
+    }
+
+    /// The ordered load asks, after it, whether a stride arm's store holds
+    /// a stride file -- the call site of a refusal that a real arm reaches
+    /// red only over keys or values the form does not take, so it is asked
+    /// of something that can lie, and then of a real stride arm's store of
+    /// keys with holes in their run, which declines the form in every
+    /// partition and is the state the refusal is for.
+    #[test]
+    fn the_ordered_load_asks_whether_a_stride_arm_built_the_stride_form() {
+        let mut counting = Counting::new(None, Path::new("."), None).unwrap();
+        let plan = Plan::new(Scale::Quick, vec![], 1_000, 4);
+        let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
+        let covered = ZState {
+            forced: true,
+            stride: true,
+            partitions: 3,
+            form_files: 3,
+            files: 3,
+            stride_files: 3,
+            ..ZState::default()
+        };
+        let mut phase = |z: Option<ZState>| {
+            let mut e = Telling { z, gets: 0 };
+            ordered_load(
+                &mut e,
+                "supdb-nocachezstride",
+                1_000,
+                &plan,
+                &payload,
+                &mut counting,
+            )
+        };
+        assert!(phase(Some(covered)).is_ok());
+        assert!(
+            phase(None).is_ok(),
+            "an engine with no form is asked nothing"
+        );
+        let none = phase(Some(ZState {
+            stride_files: 0,
+            ..covered
+        }))
+        .unwrap_err();
+        assert!(none.contains("is a stride file after the load"), "{none}");
+        // The block form's rules are asked at the same site.
+        let raw = phase(Some(ZState {
+            form_files: 0,
+            files: 0,
+            stride_files: 0,
+            ..covered
+        }))
+        .unwrap_err();
+        assert!(raw.contains("none of 3 partitions"), "{raw}");
+
+        // A real stride arm over every other number: the shape and the one
+        // value of one width, and holes in the run.
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-zstrideload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let state = |dir: &str, step: u64| {
+            let d = root.join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            let mut e = engines::open("supdb-nocachezstride", &d, 1).unwrap();
+            let value = [7u8; 100];
+            let mut keys = Vec::new();
+            for i in 0..30_000u64 {
+                let mut k = [0u8; KEY_SIZE];
+                db_key_into(step * i, &mut k);
+                keys.push(k);
+            }
+            for chunk in keys.chunks(1_000) {
+                let items: Vec<(&[u8], &[u8])> =
+                    chunk.iter().map(|k| (&k[..], &value[..])).collect();
+                e.write_batch(&items).unwrap();
+            }
+            e.sync().unwrap();
+            e.zpages_state()
+        };
+        let holed = state("holed", 2);
+        let why =
+            zpages_refusal("supdb-nocachezstride", 30_000, ZStage::Loaded, holed).unwrap_err();
+        assert!(
+            why.contains("is a stride file after the load"),
+            "{holed:?}: {why}"
+        );
+        let run = state("run", 1);
+        assert!(
+            zpages_refusal("supdb-nocachezstride", 30_000, ZStage::Loaded, run).is_ok(),
+            "{run:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// An engine that holds the keys it is told to and nothing else: the
