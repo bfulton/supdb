@@ -14397,21 +14397,63 @@ fn keys_on_page(p: usize, keys: &[Vec<u8>]) -> Vec<Vec<u8>> {
 /// fallback, a refused file, a failed build, a file out of service and a
 /// page that failed are each a failure of the form, over every instance of
 /// the store; and the stride form was built, served reads, and was
-/// declined.
+/// declined. At every check a run of keys in the put-only half is put
+/// again, packed inside the windows the scans that follow walk, so that
+/// the overlay walk crosses the cursor at most of its records, and every
+/// other check seals it and settles first, so that a piece stands over the
+/// stride partitions it covers and the scans take the merge path; each
+/// window is held to the live model's entries from its start, in order --
+/// a deleted key counts against a limit until a merge drops its
+/// tombstone, which the two stores do at moments of their own, so the
+/// count is not -- and the values the cursor's stride position handed over
+/// are counted, under a piece among them.
 #[test]
 fn the_oracle_holds_with_the_stride_form_forced() {
+    stride_oracle("stride-oracle", false);
+}
+
+/// The stride oracle with the block cache on: the scans are the block
+/// path's over the stride partitions, its walks, cuts and replaced records
+/// read through the cursor's stride position (`PartReader`), its builds
+/// over the unsealed keys and the pieces made from the file, and its
+/// settles of the writes filed by the codec's arithmetic.
+#[test]
+fn the_oracle_holds_with_the_stride_form_forced_and_the_block_cache_on() {
+    stride_oracle("stride-oracle-cache", true);
+}
+
+/// The entries `got` of a window from `start` are the live model's from
+/// there, in order, and at least `least` of them.
+fn live_prefix(model: &Model, start: &[u8], got: &Window, least: usize, what: &str) {
+    let want: Vec<(Vec<u8>, Vec<u8>)> = model
+        .range(start.to_vec()..)
+        .flat_map(|(k, vs)| vs.iter().map(move |v| (k.clone(), v.clone())))
+        .take(got.0.len())
+        .collect();
+    assert_eq!(got.0, want, "{what}: the window's entries");
+    assert!(
+        got.0.len() >= least,
+        "{what}: {} entries, wanted {least} at least",
+        got.0.len()
+    );
+}
+
+fn stride_oracle(name: &str, cache: bool) {
     const N: usize = 2400;
     let opts = |on: bool| Options {
         zpages: if on { ZPages::Always } else { ZPages::Off },
         zpages_stride: if on { ZStride::Forced } else { ZStride::Off },
-        scan_block_cache: false,
+        scan_block_cache: cache,
         zpages_min_bytes: 0,
         seal_bytes: 8 << 10,
         partition_bytes: Some(4 << 10),
         l0_trigger: 2,
         ..Options::default()
     };
-    let (dz, dr) = (scratch("stride-oracle-z"), scratch("stride-oracle-raw"));
+    let (dz, dr) = (
+        scratch(&format!("{name}-z")),
+        scratch(&format!("{name}-raw")),
+    );
     let mut z = Db::create(&dz, opts(true)).unwrap();
     let mut raw = Db::create(&dr, opts(false)).unwrap();
     let mut model: Model = BTreeMap::new();
@@ -14442,6 +14484,7 @@ fn the_oracle_holds_with_the_stride_form_forced() {
     let add = |sum: &mut supdb::db::ZCounts, c: &supdb::db::ZCounts| {
         sum.reads += c.reads;
         sum.stride_reads += c.stride_reads;
+        sum.stride_cursor_reads += c.stride_cursor_reads;
         sum.stride_builds += c.stride_builds;
         sum.fallbacks += c.fallbacks
             + c.rejected_damage
@@ -14454,6 +14497,9 @@ fn the_oracle_holds_with_the_stride_form_forced() {
         }
     };
     let (mut crashes, mut settles) = (0, 0);
+    // The windows' rounds with a piece standing, and the values the
+    // cursor's stride position handed over in them.
+    let (mut piece_rounds, mut piece_cursor) = (0, 0u64);
     for step in 0..3000u64 {
         let ix = rng.below(N);
         let key = numbered_key(ix);
@@ -14518,6 +14564,57 @@ fn the_oracle_holds_with_the_stride_form_forced() {
             check(&hr, &model, &keys, "raw, handle");
             check_scan(&z, &model, "z");
             check_scan(&hz, &model, "z, handle");
+            drop((hz, hr));
+            // A run put again, dense inside the windows below, and every
+            // other round sealed into a piece over it.
+            let from = rng.below(N / 2 - 64);
+            for i in (from..from + 48).step_by(2) {
+                let (key, v) = (numbered_key(i), format!("w{step:08}").into_bytes());
+                both(&mut z, &mut raw, &|d| d.put(&key, &v));
+                pending.push((key.clone(), None));
+                pending.push((key, Some(v)));
+            }
+            z.commit().unwrap();
+            raw.commit().unwrap();
+            apply(&mut model, &mut pending);
+            if settles % 2 == 0 {
+                z.seal().unwrap();
+                raw.seal().unwrap();
+                z.settle().unwrap();
+                raw.settle().unwrap();
+            }
+            let pieces = z.levels().1 > 0 && z.zpage_counts().stride_files > 0;
+            let before = z.zpage_counts().stride_cursor_reads;
+            let hz = z.reader().unwrap();
+            let starts = [
+                numbered_key(from),
+                [numbered_key(from + 5).as_slice(), b"\0"].concat(),
+                numbered_key(from + 20),
+            ];
+            let w: &Reader = &z;
+            for (who, label) in [(w, "writer"), (&hz, "handle")] {
+                for start in &starts {
+                    for limit in [1usize, 3, 17, 64, 300] {
+                        let what = format!(
+                            "{label}, round {settles}, from {:?} for {limit}",
+                            String::from_utf8_lossy(start)
+                        );
+                        let got = scanned(who, start, limit);
+                        // The run's own keys are live every other one.
+                        let least = if start == &starts[0] {
+                            limit.min(48).div_ceil(2)
+                        } else {
+                            0
+                        };
+                        live_prefix(&model, start, &got, least, &what);
+                    }
+                }
+            }
+            drop(hz);
+            if pieces {
+                piece_rounds += 1;
+                piece_cursor += z.zpage_counts().stride_cursor_reads - before;
+            }
         }
     }
     z.commit().unwrap();
@@ -14537,6 +14634,14 @@ fn the_oracle_holds_with_the_stride_form_forced() {
     assert!(
         sum.stride_builds > loaded.stride_builds && sum.stride_reads > 0,
         "rewritten partitions built in the stride form again, and read: {sum:?}"
+    );
+    assert!(
+        sum.stride_cursor_reads > 0,
+        "the scans read the stride partitions through the cursor: {sum:?}"
+    );
+    assert!(
+        piece_rounds > 0 && piece_cursor > 0,
+        "{piece_rounds} rounds over a piece, {piece_cursor} values through the cursor in them"
     );
     // Declines by reason, in `ZCounts::stride_declines`' order: the second
     // values' partitions for a record not one value, the deletes' for the
@@ -14566,27 +14671,30 @@ fn the_oracle_holds_with_the_stride_form_forced() {
     let _ = std::fs::remove_dir_all(&dr);
 }
 
-/// The stride form under the block cache, before the form file's cursor
-/// walks one: every read the cache makes of a stride partition -- its
-/// walks, its seeks and its builds over the unsealed keys -- is the raw
-/// form's, counted as the guard's refusal; the scans answer as the model
-/// does, and the point reads are still the stride file's. The merge path's
-/// walks beside a piece, under the same guard, are the oracle's
-/// (`the_oracle_holds_with_the_stride_form_forced`), whose store has pieces
-/// between its seals and merges and no block cache.
+/// The stride form under the block cache: every read the cache makes of a
+/// stride partition -- its walks, its seeks, its cuts and its builds over
+/// the unsealed keys -- goes through the form file, the walks and the cuts
+/// through the cursor's stride position (`PartReader`), and the values that
+/// position hands over are counted; the scans answer as the model does, the
+/// point reads are the stride file's, and nothing is decoded, viewed or
+/// asked ahead of, since a stride file has no group or page header to open.
 #[test]
-fn the_block_cache_walks_a_stride_partition_raw_until_its_cursor_holds_one() {
+fn the_block_cache_walks_a_stride_partition_through_its_cursor() {
     let (dir, mut model, keys) = stride_partition("stride-cache-src", 3000, 0x5CAC);
     let work = scratch("stride-cache-work");
     copy_dir(&dir, &work);
     let mut db = Db::open(&work, stride_forced(|o| o.scan_block_cache = true)).unwrap();
-    // A few keys over the run, unsealed, so the walks meet the memtable.
+    // A first scan, so the tables stand before the writes and the writes
+    // reach them through a settle; then a few keys over the run, unsealed,
+    // so the walks meet the memtable.
+    let _ = scanned(&db, b"", 10);
     for i in (5..3000).step_by(211) {
         let (k, v) = (numbered_key(i), vec![7u8; 100]);
         db.put(&k, &v);
         model.insert(k, vec![v]);
     }
     db.commit().unwrap();
+    let before = db.zpage_counts();
     for start in [0usize, 1, 63, 64, 65, 1500, 2999] {
         let from = numbered_key(start);
         let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -14603,15 +14711,28 @@ fn the_block_cache_walks_a_stride_partition_raw_until_its_cursor_holds_one() {
             .collect();
         assert_eq!(got, want, "a scan from {start}");
     }
+    let c = db.zpage_counts();
+    assert!(
+        c.stride_cursor_reads > before.stride_cursor_reads,
+        "the windows read through the cursor's stride position: {c:?}"
+    );
     check_scan(&db, &model, "the whole");
     check(&db, &model, &keys, "points");
     let c = db.zpage_counts();
-    assert!(c.stride_cursor_refused > 0, "the guard refused: {c:?}");
     assert!(
         c.stride_reads > 0,
         "the point reads are the stride file's: {c:?}"
     );
-    assert_eq!((c.fallbacks, c.damaged, c.bad_pages), (0, 0, 0), "{c:?}");
+    assert_eq!(
+        (c.scan_groups, c.scan_views, c.group_aheads, c.decodes),
+        (0, 0, 0, 0),
+        "nothing decoded, viewed or asked ahead of: {c:?}"
+    );
+    assert_eq!(
+        (c.fallbacks, c.damaged, c.bad_pages, c.raw_scans),
+        (0, 0, 0, 0),
+        "{c:?}"
+    );
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&work);
@@ -14619,11 +14740,12 @@ fn the_block_cache_walks_a_stride_partition_raw_until_its_cursor_holds_one() {
 
 /// A scan over partitions alone that meets an unsealed key equal to a
 /// stride partition's own: the emit reads the partition's value at the
-/// key's rank through the stride file (`Reader::emit_unsealed`,
-/// `ZFile::values_at`), then the memtable's -- the one path a stride
-/// record is read by rank outside a walk, and the one no piece standing
-/// sends to the merge path, which reads a stride partition raw until its
-/// cursor holds one. The store is the one partition a closed load leaves,
+/// key's rank through the stride file, then the memtable's -- the covered
+/// walk's cursor stands on the record (`Reader::scan_partition_cursor`) and
+/// lends it to the emit (`Reader::emit_unsealed`, `PartVals::Cursor`),
+/// whose read is the position's (`ZCursor::values`), the one read of a
+/// stride record at a position a walk did not hand over. The store is the
+/// one partition a closed load leaves,
 /// opened again so that its file is the one found on disk and each value
 /// page is checked at its first touch; the unsealed writes are second
 /// values, with no tombstone in any source, so the emit reads the
@@ -15467,4 +15589,563 @@ fn every_crash_window_of_a_stride_file_is_survived_at_open_with_the_form_or_with
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The first and the last key of every partition a stride file holds in
+/// `dir`, rendered by each file's codec from its trailer.
+fn stride_ends(dir: &Path) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; supdb::db::zpages::STRIDE_KEY_MAX];
+    for f in form_files(dir) {
+        let bytes = std::fs::read(&f).unwrap();
+        let Ok(t) = StrideTrailer::decode(&bytes[bytes.len() - ZTRAILER..]) else {
+            continue;
+        };
+        let (base, n) = (t.codec.base(), t.seg.nkeys);
+        out.push(t.codec.render(base, &mut buf).to_vec());
+        out.push(t.codec.render(base + n - 1, &mut buf).to_vec());
+    }
+    out
+}
+
+/// A hundred random bytes, the width every numbered load here writes.
+fn hundred(rng: &mut Rng) -> Vec<u8> {
+    (0..100).map(|_| (rng.next() >> 24) as u8).collect()
+}
+
+/// The scans of stride partitions answer as the model does over every
+/// window, with the unsealed keys laid over them dense -- updates of the
+/// run's width, inserts between records, second values and deletes, in a
+/// frozen table and the live one, and a run of fifty-six consecutive keys
+/// put again across a block's edge -- and then over a piece the frozen
+/// table lands as, with more writes over it. Windows begin at every key of
+/// the dense run and a byte either side, at each partition's ends, at keys
+/// a page apart and at the edges of the key space, and end after the counts
+/// a block and a page make interesting; through the writer and a handle.
+/// Where a cursor walks -- the block cache's reader under the block cursor,
+/// the covered walk without the cache, and the merge path over the piece --
+/// it walks the stride partitions at its stride position, the values it
+/// hands over counted; under the cache read a run at a time
+/// (`Options::zpages_block_cursor` off) the walks are the file's own and no
+/// cursor's. Nothing is decoded, no walk is the raw form's, and the raw
+/// form is touched by none of it.
+fn stride_windows(name: &str, cache: bool, block_cursor: bool, seeds: bool) {
+    let counts = cfg!(debug_assertions);
+    let dir = scratch(name);
+    let mut db = Db::create(
+        &dir,
+        stride_forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            o.scan_block_cache = cache;
+            o.zpages_block_cursor = block_cursor;
+            o.zpages_seek_seeds = seeds;
+        }),
+    )
+    .unwrap();
+    let mut model = numbered_load(&mut db, 5000, 100, 0x5717);
+    db.zpages_settle().unwrap();
+    db.settle().unwrap();
+    let c = db.zpage_counts();
+    assert!(
+        c.partitions >= 3 && c.stride_files == c.partitions,
+        "{name}: every partition a run the form holds: {c:?}"
+    );
+    let ends = stride_ends(&dir);
+    assert_eq!(ends.len() as u64, 2 * c.partitions, "{name}");
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    // The seal is held short of its landing until the piece phase: a piece
+    // merged back into its partition drops the tombstones the windows are
+    // held to counting.
+    db.hold_seal_landing(true);
+    let mut rng = Rng(0x57171);
+    // A short scan first, so the tables stand before the writes and the
+    // writes reach them through a settle.
+    same_window(
+        &scanned(&db, b"", 10),
+        &window(&model, b"", 10),
+        "before the writes",
+    );
+    let write = |db: &mut Db, model: &mut Model, rng: &mut Rng, n: usize| {
+        for _ in 0..n {
+            let k = keys[rng.below(keys.len())].clone();
+            match rng.below(7) {
+                0 => {
+                    db.delete(&k);
+                    model.insert(k, Vec::new());
+                }
+                1 => {
+                    let new = [k.as_slice(), b"+"].concat();
+                    let v = hundred(rng);
+                    db.append(&new, &v);
+                    model.entry(new).or_default().push(v);
+                }
+                2 => {
+                    let v = hundred(rng);
+                    db.append(&k, &v);
+                    model.entry(k).or_default().push(v);
+                }
+                _ => {
+                    let v = hundred(rng);
+                    db.put(&k, &v);
+                    model.insert(k, vec![v]);
+                }
+            }
+        }
+    };
+    for round in 0..3 {
+        write(&mut db, &mut model, &mut rng, 120);
+        if round == 2 {
+            for k in &keys[2020..2076] {
+                let v = hundred(&mut rng);
+                db.put(k, &v);
+                model.insert(k.clone(), vec![v]);
+            }
+        }
+        db.commit().unwrap();
+        if round == 1 {
+            db.seal().unwrap();
+        }
+    }
+    assert_eq!(db.frozen_tables(), 1, "the seal is held, its table frozen");
+    let mut starts: Vec<Vec<u8>> =
+        vec![b"".to_vec(), b"a".to_vec(), b"zzz".to_vec(), vec![0xff; 8]];
+    for k in keys[2016..2080].iter().chain(&ends) {
+        starts.extend(around(k));
+    }
+    for k in keys.iter().step_by(397) {
+        starts.extend(around(k));
+    }
+    let limits = [1usize, 2, 3, 5, 17, 56, 63, 64, 65, 114, usize::MAX];
+    // Every window through the writer and a handle; the values the cursor's
+    // stride position handed over meanwhile.
+    let windows = |db: &Db, model: &Model, what: &str| -> u64 {
+        let latest = db.reader().unwrap();
+        let w: &Reader = db;
+        let before = db.zpage_counts();
+        let touches = (db.raw_touches(), latest.raw_touches());
+        for start in &starts {
+            for &limit in &limits {
+                let cap = limit.min(1500);
+                let want = window(model, start, cap);
+                let at = format!(
+                    "{what}, from {:?} for {cap}",
+                    String::from_utf8_lossy(start)
+                );
+                same_window(&scanned(w, start, cap), &want, &format!("writer, {at}"));
+                same_window(
+                    &scanned(&latest, start, cap),
+                    &want,
+                    &format!("handle, {at}"),
+                );
+            }
+        }
+        let c = db.zpage_counts();
+        assert!(
+            !counts || (db.raw_touches(), latest.raw_touches()) == touches,
+            "{name}, {what}: the raw form touched"
+        );
+        assert_eq!(
+            (c.fallbacks, c.damaged, c.bad_pages, c.scan_groups),
+            (0, 0, 0, 0),
+            "{name}, {what}: {c:?}"
+        );
+        assert_eq!(
+            c.raw_scans, before.raw_scans,
+            "{name}, {what}: no walk the raw form's: {c:?}"
+        );
+        c.stride_cursor_reads - before.stride_cursor_reads
+    };
+    let cursor = !cache || block_cursor;
+    let through = windows(&db, &model, "over a frozen table and the live one");
+    assert_eq!(
+        through > 0,
+        cursor,
+        "{name}: {through} values through the cursor's stride position"
+    );
+    // The seal lands: a piece over the partitions, and more writes over it.
+    db.hold_seal_landing(false);
+    db.settle().unwrap();
+    db.zpages_settle().unwrap();
+    assert!(
+        db.levels().1 >= 1,
+        "a piece landed and stays one: {:?}",
+        db.levels()
+    );
+    write(&mut db, &mut model, &mut rng, 120);
+    db.commit().unwrap();
+    let through = windows(&db, &model, "over a piece");
+    assert_eq!(
+        through > 0,
+        cursor,
+        "{name}: over a piece, {through} values through the cursor's stride position"
+    );
+    assert!(db.levels().1 >= 1, "the piece stood through the windows");
+    let c = db.zpage_counts();
+    assert_eq!(c.stride_files, c.partitions, "{name}: {c:?}");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stride_scans_through_the_block_cursor_agree_with_the_model_over_every_window() {
+    stride_windows("stride-windows-cursor", true, true, false);
+}
+
+#[test]
+fn stride_scans_through_the_block_cache_a_run_at_a_time_agree_with_the_model_over_every_window() {
+    stride_windows("stride-windows-perrun", true, false, false);
+}
+
+#[test]
+fn stride_scans_with_the_seek_seeding_the_reader_agree_with_the_model_over_every_window() {
+    stride_windows("stride-windows-seeds", true, true, true);
+}
+
+#[test]
+fn stride_scans_without_the_block_cache_agree_with_the_model_over_every_window() {
+    stride_windows("stride-windows-nocache", false, true, false);
+}
+
+/// What a read of a stride partition touches of the raw form, counted at
+/// the one door (`Seg::raw`, under debug assertions): nothing, for every
+/// kind of read -- point reads and counts of the run's keys and of keys
+/// beside them, scans from the partitions' ends and from keys a page apart
+/// at limits a block and a page make interesting -- over every shape of
+/// store: drained; with unsealed keys inside the windows, written after a
+/// scan so that, with the block cache on, the commits file them into the
+/// forms (the settles' resolves and the forms' patches, by the codec's
+/// arithmetic); over a level-0 piece (the merge path, or the block cache's
+/// builds over the piece's keys); and after the piece merges, where the
+/// partitions it made the form declines are block files. On the writer and
+/// a handle. The control: under the raw gate the same reads touch the raw
+/// form and the counter moves, so the zeros are the form's.
+fn stride_raw_touches(name: &str, cache: bool) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = scratch(name);
+    let mut db = Db::create(
+        &dir,
+        stride_forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            o.inline_bytes = 1 << 16;
+            o.scan_block_cache = cache;
+        }),
+    )
+    .unwrap();
+    let mut model = numbered_load(&mut db, 5000, 100, 0x7A15);
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert!(
+        c.partitions >= 3 && c.stride_files == c.partitions,
+        "every partition a run the form holds: {c:?}"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let mut probes: Vec<Vec<u8>> = vec![b"".to_vec(), b"a".to_vec(), vec![0xff; 8]];
+    for k in &stride_ends(&dir) {
+        probes.extend(around(k));
+    }
+    // A hundred-byte slot a key: a page's keys are forty-one apart.
+    for k in keys.iter().step_by(41) {
+        probes.extend(around(k));
+    }
+    let limits = [1usize, 3, 57, 114, 1500];
+    let held = |db: &Db, model: &Model, what: &str| {
+        let r = db.reader().unwrap();
+        let w: &Reader = db;
+        for who in [w, &r] {
+            let before = who.raw_touches();
+            check(who, model, &keys, what);
+            check(who, model, &probes, what);
+            for start in &probes {
+                for &limit in &limits {
+                    let at = format!(
+                        "{what}, from {:?} for {limit}",
+                        String::from_utf8_lossy(start)
+                    );
+                    same_window(
+                        &scanned(who, start, limit),
+                        &window(model, start, limit),
+                        &at,
+                    );
+                }
+            }
+            check_scan(who, model, what);
+            assert_eq!(
+                who.raw_touches(),
+                before,
+                "{name}, {what}: touches of the raw form"
+            );
+        }
+    };
+    // Every landing in flight joined before a count begins: a landing's own
+    // passes read the raw form on purpose.
+    db.settle().unwrap();
+    held(&db, &model, "drained");
+    let mut rng = Rng(0x7A151);
+    for i in 0..300 {
+        let k = keys[rng.below(keys.len())].clone();
+        match i % 4 {
+            0 => {
+                let new = [k.as_slice(), b"+"].concat();
+                let v = hundred(&mut rng);
+                db.append(&new, &v);
+                model.entry(new).or_default().push(v);
+            }
+            1 => {
+                let v = hundred(&mut rng);
+                db.append(&k, &v);
+                model.entry(k).or_default().push(v);
+            }
+            2 => {
+                db.delete(&k);
+                model.insert(k, Vec::new());
+            }
+            _ => {
+                let v = hundred(&mut rng);
+                db.put(&k, &v);
+                model.insert(k, vec![v]);
+            }
+        }
+        if i % 50 == 49 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    held(&db, &model, "with unsealed keys");
+    // The control: under the raw gate the reads are the raw form's, through
+    // the door, and the counter moves.
+    {
+        let r = db.reader().unwrap();
+        db.zgate_set(0);
+        let before = r.raw_touches();
+        check(&r, &model, &keys[..50], "under the raw gate");
+        same_window(
+            &scanned(&r, b"", 300),
+            &window(&model, b"", 300),
+            "under the raw gate",
+        );
+        assert!(
+            r.raw_touches() > before,
+            "{name}: under the raw gate the reads touched the raw form"
+        );
+        db.zgate_set(2);
+    }
+    // The same keys sealed into a piece: the merge path.
+    db.seal().unwrap();
+    db.zpages_settle().unwrap();
+    db.settle().unwrap();
+    assert!(db.levels().1 >= 1, "a piece landed: {:?}", db.levels());
+    for i in 0..100 {
+        let k = keys[rng.below(keys.len())].clone();
+        let v = hundred(&mut rng);
+        if i % 2 == 0 {
+            db.append(&k, &v);
+            model.entry(k).or_default().push(v);
+        } else {
+            db.put(&k, &v);
+            model.insert(k, vec![v]);
+        }
+    }
+    db.commit().unwrap();
+    held(&db, &model, "over a piece");
+    let c = db.zpage_counts();
+    assert!(
+        c.stride_cursor_reads > 0 && c.stride_reads > 0,
+        "{name}: the stride files read by key and through the cursor: {c:?}"
+    );
+    // The piece merged into its partitions.
+    db.flush().unwrap();
+    db.zpages_settle().unwrap();
+    db.settle().unwrap();
+    model.retain(|_, v| !v.is_empty());
+    let c = db.zpage_counts();
+    assert_eq!(db.levels().1, 0, "merged: {:?}", db.levels());
+    assert_eq!(c.form_files, c.partitions, "{c:?}");
+    held(&db, &model, "after the merge");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_stride_form_touches_no_raw_page() {
+    stride_raw_touches("stride-rawtouches", false);
+}
+
+#[test]
+fn the_block_cache_over_the_stride_form_touches_no_raw_page() {
+    stride_raw_touches("stride-rawtouches-cache", true);
+}
+
+/// A partition whose keys are a prefix and a big-endian number gets a
+/// stride file whose codec is the big-endian kind, and a store of them
+/// answers as a store without the form given the same operations, and as
+/// the model: every point read and count of the run's keys and of keys
+/// beside them -- a byte either side, a key a byte longer and one a byte
+/// shorter, renderings below and past the runs -- and every window, from
+/// the partitions' ends, from keys a page apart and from the edges of the
+/// key space; drained, with unsealed keys inside the windows (updates of
+/// the width, inserts between records, second values and deletes), and
+/// over a piece; through the writer and a handle, with the block cache on
+/// and off. The stride files served the point reads and the cursor's
+/// walks.
+#[test]
+fn a_big_endian_keyed_partition_is_a_stride_file_and_agrees_with_the_raw_form_everywhere() {
+    use supdb::db::zpages::KeyKind;
+    let be = |i: u64| {
+        [
+            b"be".as_slice(),
+            &(0x0102_0304_0506_0000u64 + i).to_be_bytes(),
+        ]
+        .concat()
+    };
+    const N: u64 = 4000;
+    for cache in [false, true] {
+        let (dz, dr) = (
+            scratch(&format!("stride-be-{cache}-z")),
+            scratch(&format!("stride-be-{cache}-raw")),
+        );
+        let opts = |on: bool| Options {
+            zpages: if on { ZPages::Always } else { ZPages::Off },
+            zpages_stride: if on { ZStride::Forced } else { ZStride::Off },
+            zpages_min_bytes: 0,
+            scan_block_cache: cache,
+            partition_bytes: Some(160 << 10),
+            inline_bytes: 1 << 16,
+            ..Options::default()
+        };
+        let mut z = Db::create(&dz, opts(true)).unwrap();
+        let mut raw = Db::create(&dr, opts(false)).unwrap();
+        let mut model = Model::new();
+        let mut rng = Rng(0xBE5);
+        let keys: Vec<Vec<u8>> = (0..N).map(be).collect();
+        for chunk in keys.chunks(500) {
+            for k in chunk {
+                let v = hundred(&mut rng);
+                z.append(k, &v);
+                raw.append(k, &v);
+                model.insert(k.clone(), vec![v]);
+            }
+            z.commit().unwrap();
+            raw.commit().unwrap();
+        }
+        for d in [&mut z, &mut raw] {
+            d.flush().unwrap();
+            d.settle().unwrap();
+        }
+        z.zpages_settle().unwrap();
+        let c = z.zpage_counts();
+        assert!(
+            c.partitions >= 2 && c.stride_files == c.partitions,
+            "cache {cache}: every partition a run the form holds: {c:?}"
+        );
+        for f in form_files(&dz) {
+            let (t, _) = stride_of(&f);
+            assert_eq!(t.codec.kind(), KeyKind::BigEndian, "{f:?}");
+        }
+        let mut probes: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"be".to_vec(),
+            be(0)[..9].to_vec(),
+            be(N + 5),
+            be(u64::MAX - 0x0102_0304_0506_0000),
+            vec![0xff; 12],
+        ];
+        for k in stride_ends(&dz) {
+            probes.extend(around(&k));
+        }
+        for k in keys.iter().step_by(41) {
+            probes.extend(around(k));
+        }
+        let limits = [1usize, 3, 40, 64, 65, 300, 5000];
+        let agree = |z: &Db, raw: &Db, model: &Model, what: &str| {
+            let (hz, hr) = (z.reader().unwrap(), raw.reader().unwrap());
+            let (wz, wr): (&Reader, &Reader) = (z, raw);
+            for (who, other, label) in [(wz, wr, "writer"), (&hz, &hr, "handle")] {
+                let at = format!("cache {cache}, {what}, {label}");
+                check(who, model, &keys, &at);
+                check(who, model, &probes, &at);
+                for k in &probes {
+                    assert_eq!(read_vec(who, k), read_vec(other, k), "{at}: {k:?}");
+                }
+                for start in &probes {
+                    for &limit in &limits {
+                        let got = scanned(who, start, limit);
+                        let w = format!("{at}, from {start:?} for {limit}");
+                        same_window(&got, &scanned(other, start, limit), &w);
+                        same_window(&got, &window(model, start, limit), &w);
+                    }
+                }
+            }
+        };
+        agree(&z, &raw, &model, "drained");
+        // A scan first, so the writes after it are settled into the block
+        // cache's forms where it is on.
+        let _ = scanned(&z, b"", 10);
+        let _ = scanned(&raw, b"", 10);
+        let writes = |z: &mut Db, raw: &mut Db, model: &mut Model, rng: &mut Rng| {
+            for i in 0..240 {
+                let k = keys[rng.below(keys.len())].clone();
+                match i % 4 {
+                    0 => {
+                        let v = hundred(rng);
+                        z.put(&k, &v);
+                        raw.put(&k, &v);
+                        model.insert(k, vec![v]);
+                    }
+                    1 => {
+                        let new = [k.as_slice(), &[0u8]].concat();
+                        let v = hundred(rng);
+                        z.append(&new, &v);
+                        raw.append(&new, &v);
+                        model.entry(new).or_default().push(v);
+                    }
+                    2 => {
+                        let v = hundred(rng);
+                        z.append(&k, &v);
+                        raw.append(&k, &v);
+                        model.entry(k).or_default().push(v);
+                    }
+                    _ => {
+                        z.delete(&k);
+                        raw.delete(&k);
+                        model.insert(k, Vec::new());
+                    }
+                }
+            }
+            z.commit().unwrap();
+            raw.commit().unwrap();
+        };
+        writes(&mut z, &mut raw, &mut model, &mut rng);
+        agree(&z, &raw, &model, "with unsealed keys");
+        for d in [&mut z, &mut raw] {
+            d.seal().unwrap();
+            d.settle().unwrap();
+        }
+        z.zpages_settle().unwrap();
+        assert!(z.levels().1 >= 1, "a piece landed: {:?}", z.levels());
+        writes(&mut z, &mut raw, &mut model, &mut rng);
+        agree(&z, &raw, &model, "over a piece");
+        let c = z.zpage_counts();
+        assert_eq!(c.stride_files, c.partitions, "cache {cache}: {c:?}");
+        assert!(
+            c.stride_reads > 0 && c.stride_cursor_reads > 0,
+            "cache {cache}: the stride files read by key and through the cursor: {c:?}"
+        );
+        assert_eq!(
+            (
+                c.fallbacks,
+                c.damaged,
+                c.bad_pages,
+                c.decodes,
+                c.scan_groups
+            ),
+            (0, 0, 0, 0, 0),
+            "cache {cache}: {c:?}"
+        );
+        z.close().unwrap();
+        raw.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dz);
+        let _ = std::fs::remove_dir_all(&dr);
+    }
 }

@@ -582,15 +582,14 @@ pub struct ZCounts {
     /// reads a stride file answered; the value pages the reads checked
     /// against a stride file's row at their first touch in this process,
     /// none for a file the attach trusted as this process's build
-    /// (`Options::zpages_stride_trust_built`); and the block cache's and the
-    /// merge path's looks for a form file to read a stride partition
-    /// through, every one of them -- a cursor's placing, a seek, a key read,
-    /// a block's build, an ask ahead -- answered none and the read taken by
-    /// the raw form (`Reader::zc`, `Reader::zcursor_file`), so a count of
-    /// looks and not of walks.
+    /// (`Options::zpages_stride_trust_built`); and the values a form file
+    /// cursor's stride position handed over, its walks' records and the
+    /// values read at it -- the block cache's and the merge path's reads of
+    /// a stride partition, which are walks and not point reads, so counted
+    /// apart from `stride_reads`.
     pub stride_reads: u64,
     pub stride_page_checks: u64,
-    pub stride_cursor_refused: u64,
+    pub stride_cursor_reads: u64,
     /// Pages decoded to answer them: one for each read or count of a key
     /// that falls in a page's range, the key the page holds and the key it
     /// does not alike, unless the thread's memo holds the group from a
@@ -5911,9 +5910,11 @@ pub struct Options {
     /// that build over a served file's name -- `zpages_recode`,
     /// `zpages_recode_auto` and `zpages_reparse`, each of which acts on its
     /// own -- and not beside `zpages_recode_keep` or `zpages_both`, which act
-    /// only on the paths those start (`check_options` says why). The block
-    /// cache's reads and the merge path's walks of a stride partition go to
-    /// the raw form until the form file's cursor walks one (`Reader::zc`).
+    /// only on the paths those start (`check_options` says why). Every read
+    /// path serves a stride partition from its file: the point reads, the
+    /// counts and the scans by its arms (`ZFile::stride`), and the block
+    /// cache's reads and the merge path's walks through the form file's
+    /// cursor, which stands at a rank there (`zfile::ZCursor`).
     #[doc(hidden)]
     pub zpages_stride: ZStride,
     /// EXPERIMENT: under `zpages_stride` `Forced`, a stride file whose build
@@ -13098,13 +13099,11 @@ struct Slot {
     /// checked against a stride file's row at their first touch
     /// (`zfile::StrideCounts`), both taken off the memo at the dispatch
     /// after the stride arm raised its flag (`Reader::zstride_take`); and
-    /// the block cache's and the merge path's looks for a form file to read
-    /// a stride partition through, each answered none and the read the raw
-    /// form's: every look, not every walk (`Reader::zc`,
-    /// `Reader::zcursor_file`).
+    /// the values a cursor's stride position handed over
+    /// (`zfile::StrideCounts::cursor`), taken the same way.
     zstridereads: AtomicU64,
     zstridechecks: AtomicU64,
-    zstriderefused: AtomicU64,
+    zstridecursor: AtomicU64,
     /// Groups a scan read in place without a decode (`Group::Coded`).
     zinplace: AtomicU64,
     zraw: AtomicU64,
@@ -13223,7 +13222,7 @@ impl Slot {
             zdecodes: AtomicU64::new(0),
             zstridereads: AtomicU64::new(0),
             zstridechecks: AtomicU64::new(0),
-            zstriderefused: AtomicU64::new(0),
+            zstridecursor: AtomicU64::new(0),
             zinplace: AtomicU64::new(0),
             zraw: AtomicU64::new(0),
             zfallbacks: AtomicU64::new(0),
@@ -23703,7 +23702,7 @@ impl Reader {
             counts: rd.stat(|s| &s.zcounts),
             stride_reads: rd.stat(|s| &s.zstridereads),
             stride_page_checks: rd.stat(|s| &s.zstridechecks),
-            stride_cursor_refused: rd.stat(|s| &s.zstriderefused),
+            stride_cursor_reads: rd.stat(|s| &s.zstridecursor),
             decodes: rd.stat(|s| &s.zdecodes),
             inplace_groups: rd.stat(|s| &s.zinplace),
             rawserves: rd.stat(|s| &s.zraw),
@@ -24022,6 +24021,7 @@ impl Reader {
         let c = self.zmemo.take_stride();
         self.zbump_by(|s| &s.zstridechecks, c.checks);
         self.zbump_by(|s| &s.zstridereads, c.reads);
+        self.zbump_by(|s| &s.zstridecursor, c.cursor);
     }
 
     /// `key`'s values in a partition read from its form file
@@ -24346,44 +24346,15 @@ impl Reader {
     /// in service, while the gate serves the form and the cache reads it
     /// (`Options::zpages_block_cache`); none, and the read is the raw form's
     /// through the door. One relaxed load of the gate's word and a look at
-    /// the cell, asked at each read as every dispatch asks.
-    ///
-    /// A stride file is none: the block cache's reads of a partition go
-    /// through the form file's cursor once one is held (`PartReader`), and
-    /// the cursor has no position in a stride file, so every read the cache
-    /// makes of a stride partition is the raw form's -- answers as the raw
-    /// form gives them, its pages touched -- and is counted on this
-    /// handle's line (`zstriderefused`), until the cursor walks one.
+    /// the cell, asked at each read as every dispatch asks. Either body: a
+    /// stride file's reads by key and rank are its arms' (`ZFile::stride`),
+    /// and its cursor stands at a rank (`zfile::ZCursor`, `Group::Stride`).
     #[inline]
     fn zc<'a>(&self, seg: &'a Seg) -> Option<&'a zfile::ZFile> {
         if !self.opts.zpages_block_cache || !self.z_on() {
             return None;
         }
-        let z = seg.z.get().filter(|z| !z.damaged())?;
-        if z.is_stride() {
-            self.zbump(|s| &s.zstriderefused);
-            return None;
-        }
-        Some(z)
-    }
-
-    /// The form file `scan_merged` and the covered walk of `scan_partitions`
-    /// walk `seg` through a cursor over: the cell's, while the gate serves
-    /// the form, but no stride file, which a cursor has no position in. The
-    /// merge path's walk of a stride partition takes the raw form, counted
-    /// as `zc` counts the cache's. The covered walk asks the cell's kind
-    /// before it asks for a cursor, so it never reaches the refusal here: a
-    /// stride partition takes that walk's loop by rank, whose seek, cuts,
-    /// walks and values are the stride arms' (`part_seek_z`, `part_cut_z`,
-    /// `part_scan_z`, `part_values_z`), served from the file and counted
-    /// as they count a block file's.
-    fn zcursor_file<'a>(&self, seg: &'a Seg) -> Option<&'a zfile::ZFile> {
-        let z = seg.z.get().filter(|_| self.z_on())?;
-        if z.is_stride() {
-            self.zbump(|s| &s.zstriderefused);
-            return None;
-        }
-        Some(z)
+        seg.z.get().filter(|z| !z.damaged())
     }
 
     /// `Blob::scan_at` for the block cache: the `n` records from `rank`
@@ -24773,7 +24744,7 @@ impl Reader {
     /// `scan_merged`'s walk of `seg` from `rank`: through the form file
     /// where the cell holds one in service, the raw form's otherwise.
     fn pwalk_at<'a>(&'a self, seg: &'a Seg, rank: usize) -> PWalk<'a> {
-        match self.zcursor_file(seg) {
+        match seg.z.get().filter(|_| self.z_on()) {
             Some(z) if !z.damaged() => PWalk::Z(zfile::ZCursor::at(
                 &self.zmemo,
                 z,
@@ -24793,7 +24764,7 @@ impl Reader {
     /// it, or the ordered index's where the form file cannot say, with a
     /// fallback counted where a check failed.
     fn pwalk_seek<'a>(&'a self, seg: &'a Seg, key: &[u8]) -> PWalk<'a> {
-        if let Some(z) = self.zcursor_file(seg) {
+        if let Some(z) = seg.z.get().filter(|_| self.z_on()) {
             if self.opts.zpages_seek_ord {
                 let rank = seg.ord.seek(key, |r| seg.raw().key_at(r));
                 return self.pwalk_at(seg, rank);
@@ -31971,7 +31942,7 @@ impl Reader {
             if self.opts.zpages_walk_cursor
                 && !self.opts.zpages_seek_ord
                 && self.z_on()
-                && seg.z.get().is_some_and(|z| !z.is_stride())
+                && seg.z.get().is_some()
             {
                 if let PWalk::Z(c) = self.pwalk_seek(seg, cursor) {
                     seen = self.scan_partition_cursor(

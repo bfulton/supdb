@@ -301,6 +301,13 @@ enum Group<'a> {
     /// is compressed after all, or whose extents cannot be read where they
     /// lie, is decoded on its own into the cursor's buffer.
     Coded(&'a [u8], usize),
+    /// A stride file's position, with the file's body: the position is the
+    /// cursor's rank and nothing else, its key the codec's rendering of the
+    /// rank's number in the cursor's `skey`, made where the cursor is
+    /// placed and stepped in place as it moves (`StrideBody::step_key`),
+    /// and its value the slot at the rank, read after the slot's pages pass
+    /// their checks (`StrideBody::values_at`). Nothing is decoded or opened.
+    Stride(&'a StrideBody),
     Raw,
 }
 
@@ -441,6 +448,12 @@ pub(super) struct ZCursor<'a> {
     /// The key at the position of a raw-tail coded group, assembled
     /// (`Group::Coded`).
     keybuf: Vec<u8>,
+    /// The key at a stride position (`Group::Stride`), rendered in place
+    /// in the cursor and lent by `key` as `key_at` spans it: a buffer of
+    /// the cursor's own and not the heap's, since a scan places a cursor
+    /// in every partition it enters and a stride walk steps the key at
+    /// every rank, which an allocation a placing would price.
+    skey: [u8; STRIDE_KEY_MAX],
     /// The view of page `pview_page`, held across the page's groups under
     /// `ZFile::cursor_view`; the open's own otherwise.
     pview: Option<PageView<'a>>,
@@ -484,11 +497,6 @@ pub(super) struct ZCursor<'a> {
 
 impl<'a> ZCursor<'a> {
     fn new(memo: &'a ZMemo, zfile: &'a ZFile, raw: &'a Blob<MmapBytes>) -> ZCursor<'a> {
-        // The cursor walks a block file's fence and groups and has no
-        // position in a stride file: the store makes none over one
-        // (`Reader::zc`, `Reader::pwalk_at`), and its callers take the raw
-        // form's walk there, until the cursor holds a stride position.
-        debug_assert!(!zfile.is_stride(), "a cursor over a stride file");
         ZCursor {
             memo,
             zfile,
@@ -506,6 +514,7 @@ impl<'a> ZCursor<'a> {
             group: Group::None,
             buf: take_buf(),
             keybuf: Vec::new(),
+            skey: [0; STRIDE_KEY_MAX],
             pview: None,
             pview_page: usize::MAX,
             decoded: 0,
@@ -586,6 +595,13 @@ impl<'a> ZCursor<'a> {
             return Err(ZSeek::Out);
         }
         let mut c = ZCursor::new(memo, zfile, raw);
+        // A stride file's seek is the codec's arithmetic over the run, the
+        // path `ZFile::seek` takes (`StrideBody::lower_bound`): no page.
+        if let Some(body) = zfile.stride() {
+            c.rank = body.lower_bound(key).0 as usize;
+            c.stride_load(body);
+            return Ok(c);
+        }
         let Some(e) = zfile.fence.entry_of(key) else {
             c.load();
             return Ok(c);
@@ -654,7 +670,7 @@ impl<'a> ZCursor<'a> {
             Group::Page(p) => p,
             Group::Buf(n) => self.buf.bytes(*n),
             Group::Memo(g, n) => g.bytes(*n),
-            Group::None | Group::Raw | Group::Coded(..) => &[],
+            Group::None | Group::Raw | Group::Coded(..) | Group::Stride(_) => &[],
         }
     }
 
@@ -990,6 +1006,8 @@ impl<'a> ZCursor<'a> {
     /// page where there is one, opened at its first record, else the
     /// entry the rank falls in.
     fn next_group(&mut self) {
+        // A stride position's end is the run's (`stride_load`), so it comes
+        // here only past the run, to the load that makes it the end.
         if self.rank < self.page_end && !matches!(self.group, Group::Raw | Group::None) {
             if let Some(entry) = self.zfile.fence.entry(self.eidx, self.zfile.nkeys as u32) {
                 // The walk's next group: decoded into this cursor's own
@@ -1062,6 +1080,10 @@ impl<'a> ZCursor<'a> {
             self.fall();
             return;
         }
+        if let Some(body) = self.zfile.stride() {
+            self.stride_load(body);
+            return;
+        }
         let Some(entry) = self.zfile.entry_at_rank(self.rank) else {
             self.fall();
             return;
@@ -1115,6 +1137,10 @@ impl<'a> ZCursor<'a> {
             Group::None => None,
             Group::Raw => self.raw.key_at(self.rank),
             Group::Coded(..) => Some(self.keybuf.as_slice()),
+            Group::Stride(_) => {
+                let (at, len) = self.key_at;
+                self.skey.get(at..at + len)
+            }
             Group::Page(_) | Group::Buf(_) | Group::Memo(..) => {
                 let (at, len) = self.key_at;
                 self.group().get(at..at + len)
@@ -1131,6 +1157,7 @@ impl<'a> ZCursor<'a> {
         match self.group {
             Group::None => Ok(0),
             Group::Raw => self.raw.values_at(self.rank, &mut *f),
+            Group::Stride(body) => self.stride_values(body, f),
             Group::Coded(payload, count) => {
                 // The record where it lies, or decoded on its own into a
                 // buffer of this call's, since the position's own buffer
@@ -1186,6 +1213,8 @@ impl<'a> ZCursor<'a> {
         self.rank += 1;
         if self.rank >= self.end {
             self.next_group();
+        } else if let Group::Stride(body) = self.group {
+            self.stride_step(body);
         } else if !matches!(self.group, Group::Raw) {
             self.off = self.next;
             self.place();
@@ -1297,6 +1326,17 @@ impl<'a> ZCursor<'a> {
                 n += 1;
                 self.advance();
                 continue;
+            }
+            if let Group::Stride(body) = self.group {
+                // The run to the limit, to `until`'s rank or to the end, in
+                // one call; a file that falls under it leaves the rest to
+                // the raw arm above.
+                let (walked, done) = self.stride_walk(body, until, limit - n, f);
+                n += walked;
+                match done {
+                    Some(order) => return Ok((n, order)),
+                    None => continue,
+                }
             }
             if !self.asked {
                 self.asked = true;
@@ -1509,6 +1549,14 @@ impl<'a> ZCursor<'a> {
             self.fall();
             return None;
         }
+        // A stride file's cut is the seek's arithmetic, from any position,
+        // forwards or back: nothing held to keep and no record read.
+        if let Some(body) = self.zfile.stride() {
+            let (rank, at) = body.lower_bound(until);
+            self.rank = rank as usize;
+            self.stride_load(body);
+            return Some(at);
+        }
         self.resume();
         // The position is the cut already: every record before it is below
         // the key before, which is at or below this one; at the end, every
@@ -1582,6 +1630,10 @@ impl<'a> ZCursor<'a> {
     /// not parse is damage, the page out of service and the cursor fallen,
     /// which the caller reads before the answer.
     fn advance_until(&mut self, until: &[u8]) -> KeyOrder {
+        debug_assert!(
+            !matches!(self.group, Group::Stride(_)),
+            "a stride position is moved to a key by the seek's arithmetic"
+        );
         self.whole();
         loop {
             match self.group {
@@ -1689,6 +1741,170 @@ impl<'a> ZCursor<'a> {
                 }
             }
         }
+    }
+}
+
+// ---- the cursor's stride position -------------------------------------------
+//
+// A cursor over a stride file stands at a rank and holds nothing else
+// (`Group::Stride`): its key is the rank's rendering, made where the cursor
+// is placed and stepped in place as it moves, its value the rank's slot read
+// after the slot's pages pass, and a seek, a move to a key and a walk's
+// stop at `until` are the codec's arithmetic over the run
+// (`StrideBody::lower_bound`), the path `ZFile::seek` takes. So every
+// placing -- `at`, `at_wanting`, `unplaced` then `skip_to`, either way,
+// `seek` -- is arithmetic, `resume` has no group to open, and the decode,
+// view and ahead counts stay at nothing; the prefetch count moves only
+// under the scan prefetch's gate, as the block walk's does. Each arm honours
+// the file's being out of service before anything else, as the block paths
+// do where they place (`load`, `seek`, `skip_to`), and at every step and
+// every value as well, since a stride position holds no group to read on
+// from: the rest is the raw form's from the first look that finds the file
+// out. A page whose check fails takes the file out of service
+// (`ZFile::fail`); the read that met it answers the raw form's value, with
+// nothing of the slot handed over, as the block cursor answers a group that
+// fails under it, and the cursor falls, the rest of its walk the raw form's.
+// The values it hands over are counted on the handle's memo
+// (`StrideCounts::cursor`), and nowhere as a decode or a group opened.
+
+impl<'a> ZCursor<'a> {
+    /// The position at the rank in a stride file: its key rendered into
+    /// the cursor's buffer (`StrideBody::key_at_into`), or the end past the
+    /// run.
+    fn stride_load(&mut self, body: &'a StrideBody) {
+        self.off = 0;
+        self.part = None;
+        self.end = self.zfile.nkeys;
+        self.page_end = self.zfile.nkeys;
+        match body.key_at_into(self.rank as u64, &mut self.skey) {
+            Some(k) => {
+                self.key_at = (0, k.len());
+                self.group = Group::Stride(body);
+            }
+            None => self.group = Group::None,
+        }
+    }
+
+    /// `advance`'s step at a stride position, inside the run: the key moved
+    /// to the next rank's in place, or the rest the raw form's where the
+    /// file is out of service.
+    fn stride_step(&mut self, body: &'a StrideBody) {
+        if self.zfile.damaged() {
+            self.fall();
+            return;
+        }
+        let len = self.key_at.1;
+        body.step_key(&mut self.skey[..len]);
+    }
+
+    /// `values` at a stride position: the slot's one value after its
+    /// pages' checks, counted; the raw form's values where the file is out
+    /// of service or a page fails, the page and the file taken out first.
+    fn stride_values<F: FnMut(&[u8])>(&self, body: &StrideBody, f: &mut F) -> Result<u64> {
+        let zfile = self.zfile;
+        if zfile.damaged() {
+            return self.raw.values_at(self.rank, &mut *f);
+        }
+        let memo = self.memo;
+        let file = zfile.stride_bytes();
+        match body.values_at(file, self.rank as u64, &mut |p| {
+            zfile.stride_page(body, memo, p)
+        }) {
+            StrideAt::Value(v) => {
+                memo.count_stride_cursor(1);
+                f(v);
+                Ok(1)
+            }
+            // A page whose check failed, which took it and the file out of
+            // service (`ZFile::stride_page`); never `Absent` inside the
+            // run, where the position is. The raw form's values.
+            StrideAt::Bad(_) | StrideAt::Absent => self.raw.values_at(self.rank, &mut *f),
+        }
+    }
+
+    /// The bulk walk at a stride position (`walk_until`, `walk_run_ahead`):
+    /// the ranks from the position to the first of the limit, `until`'s
+    /// rank -- taken once, by the seek's arithmetic -- and the run's end,
+    /// each key stepped in place and each value handed over after its
+    /// slot's pages pass; the cursor stands where it stopped. How many it
+    /// handed over, and how the key it stands at compares with `until` as
+    /// the block walk answers it: `Equal` for `until` itself, `Greater` for
+    /// a key past it and at the limit or the end, where nothing is
+    /// compared. `None` in place of the answer where the file was out of
+    /// service or a page failed: the cursor has fallen, standing at the
+    /// first rank not handed over, and the rest is the raw form's.
+    fn stride_walk<F: FnMut(&[u8], &[u8])>(
+        &mut self,
+        body: &'a StrideBody,
+        until: Option<&[u8]>,
+        limit: usize,
+        f: &mut F,
+    ) -> (usize, Option<KeyOrder>) {
+        let zfile = self.zfile;
+        if zfile.damaged() {
+            self.fall();
+            return (0, None);
+        }
+        let (rank, end) = (self.rank, self.end);
+        let cap = rank.saturating_add(limit).min(end);
+        let (ur, uat) = match until {
+            Some(u) => {
+                let (r, at) = body.lower_bound(u);
+                (r as usize, at)
+            }
+            None => (end, KeyOrder::Greater),
+        };
+        // `until` stops the walk where its rank is short of the limit and
+        // the end; a rank at or before the position stops it before a key.
+        let by_until = ur < cap;
+        let to = if by_until { ur } else { cap };
+        if !self.asked {
+            self.asked = true;
+            if zfile
+                .stride_ask_ahead(body, rank as u64, (cap - rank) as u64)
+                .is_some()
+            {
+                self.prefetches += 1;
+            }
+        }
+        let (memo, file, len) = (self.memo, zfile.stride_bytes(), self.key_at.1);
+        let mut r = rank;
+        let mut fell = false;
+        while r < to {
+            match body.values_at(file, r as u64, &mut |p| zfile.stride_page(body, memo, p)) {
+                StrideAt::Value(v) => f(&self.skey[..len], v),
+                // A page taken out of service by its check
+                // (`ZFile::stride_page`); never `Absent`, every rank of the
+                // walk being in the run.
+                StrideAt::Bad(_) | StrideAt::Absent => {
+                    fell = true;
+                    break;
+                }
+            }
+            r += 1;
+            if r < end {
+                body.step_key(&mut self.skey[..len]);
+            }
+        }
+        let walked = r - rank;
+        self.rank = r;
+        if walked > 0 {
+            memo.count_stride_cursor(walked as u64);
+        }
+        if fell {
+            self.fall();
+            return (walked, None);
+        }
+        if r >= end {
+            self.load();
+            return (walked, Some(KeyOrder::Greater));
+        }
+        let order = if by_until && ur >= rank {
+            uat
+        } else {
+            KeyOrder::Greater
+        };
+        (walked, Some(order))
     }
 }
 
@@ -2059,6 +2275,11 @@ pub(super) struct StrideCounts {
     pub(super) checks: u64,
     /// Point reads a stride file answered (`ZFile::stride_read_all`).
     pub(super) reads: u64,
+    /// Values a cursor's stride position handed over (`Group::Stride`): its
+    /// walks' records and the values read at the position, the block
+    /// cache's and the merge path's reads of a stride partition through
+    /// the cursor.
+    pub(super) cursor: u64,
 }
 
 /// The slots of the tags of groups decoded in part (`Memo::admit`): sixty-
@@ -2558,6 +2779,13 @@ impl ZMemo {
     fn count_stride_read(&self) {
         let mut c = self.stride.get();
         c.reads += 1;
+        self.stride.set(c);
+        self.stride_due.set(true);
+    }
+
+    fn count_stride_cursor(&self, n: u64) {
+        let mut c = self.stride.get();
+        c.cursor += n;
         self.stride.set(c);
         self.stride_due.set(true);
     }
@@ -5099,11 +5327,7 @@ impl ZFile {
         let file = self.stride_bytes();
         for rank in from..from + want {
             if rank > from {
-                let stepped = codec.increment(&mut kbuf[..len]);
-                debug_assert!(
-                    stepped,
-                    "a walk inside the run never passes the field's top"
-                );
+                body.step_key(&mut kbuf[..len]);
             }
             match body.values_at(file, rank, &mut |p| self.stride_page(body, memo, p)) {
                 StrideAt::Value(v) => f(&kbuf[..len], v),
@@ -7348,6 +7572,20 @@ impl StrideBody {
         }
         let c = &self.trailer.codec;
         Some(c.render(c.base() + rank, buf))
+    }
+
+    /// A rank's key, rendered, moved to the next rank's in place
+    /// (`KeyCodec::increment`): the one step a walk makes from a key it
+    /// rendered once, the file's (`ZFile::stride_scan`) and a cursor's
+    /// (`ZCursor::stride_walk`), each for a rank below the run's last, whose
+    /// next the field holds, since the run is one the codec holds whole
+    /// (`KeyCodec::holds`).
+    pub(super) fn step_key(&self, key: &mut [u8]) {
+        let stepped = self.trailer.codec.increment(key);
+        debug_assert!(
+            stepped,
+            "a walk inside the run never passes the field's top"
+        );
     }
 
     /// Rank `rank`'s value in `file`, every page of its slot -- one, or two
@@ -14530,7 +14768,8 @@ mod tests {
             fx.memo.take_stride(),
             StrideCounts {
                 checks: 2,
-                reads: 1
+                reads: 1,
+                cursor: 0
             }
         );
         none("taken");
@@ -14541,7 +14780,8 @@ mod tests {
             fx.memo.take_stride(),
             StrideCounts {
                 checks: 0,
-                reads: 1
+                reads: 1,
+                cursor: 0
             },
             "the pages verified, the read counted again"
         );
@@ -14552,7 +14792,8 @@ mod tests {
             fx.memo.take_stride(),
             StrideCounts {
                 checks: 1,
-                reads: 0
+                reads: 0,
+                cursor: 0
             },
             "ranks 0 to 81 end on page 2, the one page not checked before"
         );
@@ -14621,7 +14862,8 @@ mod tests {
                 PointCounts::default(),
                 StrideCounts {
                     checks: 1,
-                    reads: 0
+                    reads: 0,
+                    cursor: 0
                 }
             ),
             "the failed check counted, and no read served"
@@ -14649,6 +14891,480 @@ mod tests {
             })
             .unwrap();
         assert_eq!((walk.end, walk.seen), (ScanEnd::Out, 0));
+    }
+
+    /// A cursor's counts that a stride position never moves: it decodes,
+    /// reads in place, meets a run no page holds, views and asks ahead of
+    /// nothing, and asks the pages of a walk only under the scan's prefetch.
+    fn stride_cursor_quiet(c: &ZCursor<'_>, what: &str) {
+        assert_eq!(
+            (
+                c.decoded,
+                c.inplace,
+                c.nopage,
+                c.views,
+                c.aheads,
+                c.prefetches
+            ),
+            (0, 0, 0, 0, 0, 0),
+            "{what}: a stride position decodes, opens and asks nothing"
+        );
+    }
+
+    /// A cursor over a stride file stands where the block cursor over the
+    /// same segment and the segment's own reader stand, at every placing
+    /// and every move. `at` and `at_wanting` from ranks across the run and
+    /// past it, stepped a rank at a time with the key and the values at
+    /// each; `seek` of every key of the run, of keys beside them and of
+    /// keys no rendering is, every one against the raw seek; `unplaced` and
+    /// `skip_to` over the same keys in key order and in reverse, against
+    /// the block cursor's moves and the file's cut, with the values under
+    /// the position where the key is the run's, as a block's build reads
+    /// the record an overlay key replaces; and the bulk walk, `walk_until`
+    /// and `walk_run_ahead`, from ranks across the run, with `until` a key
+    /// of the run (the walk stops on it, `Equal`), a key between two that
+    /// the codec does not render (`Greater`, one rank on), the rendering
+    /// past the run where the field holds it and none, at limits that stop
+    /// before `until` and after it -- where the walk stops on `until`, the
+    /// overlay walk's turn: the values under the cursor, the step, the walk
+    /// on to the end. Over runs of one width a page holds many of and one
+    /// a page holds one of, one key, a big-endian field, and a run that
+    /// ends at its field's top, whose next number no key renders. The
+    /// stride position decodes, views and asks ahead of nothing, and the
+    /// memo counts every value it handed over (`StrideCounts::cursor`).
+    #[test]
+    fn a_cursor_over_a_stride_file_stands_where_the_block_cursor_and_the_raw_form_do() {
+        let mut rng = Rng(0x5c0a);
+        let be: Vec<Rec> = (0..600u64)
+            .map(|i| {
+                let key = [b"be".as_slice(), &(0x0102_0304_0506_00f0 + i).to_be_bytes()].concat();
+                (key, vec![rng.bytes(100)], false)
+            })
+            .collect();
+        let cases = [
+            ("w100", stride_recs(1200, 100, 31)),
+            ("w1", stride_recs(700, 1, 32)),
+            ("w3000", stride_recs(30, 3000, 33)),
+            ("one", stride_recs(1, 100, 34)),
+            ("be", be),
+            ("top", stride_recs_from(999_400, 600, 100, 35)),
+        ];
+        for (name, recs) in cases {
+            let fx = Fixture::new(&format!("stride-cursor-{name}"), recs, 1 << 16);
+            // The block body of the segment, attached and kept mapped, then
+            // the stride file built under the same name.
+            let block = match fx.build() {
+                Outcome::Built(_) => fx.attach().unwrap(),
+                other => panic!("{name}: the block body: {other:?}"),
+            };
+            assert!(!block.is_stride(), "{name}");
+            stride_built(&fx);
+            let zfile = fx.attach().unwrap();
+            let body = zfile.stride().expect("a stride body");
+            let n = fx.recs.len();
+            let _ = fx.memo.take_stride();
+            let mut handed = 0u64;
+            let raw_vals = |r: usize| -> Vec<Vec<u8>> {
+                let mut v = Vec::new();
+                fx.blob.values_at(r, |x| v.push(x.to_vec())).unwrap();
+                v
+            };
+            let raw_seq = |from: usize, to: usize| -> Vec<(Vec<u8>, Vec<u8>)> {
+                let mut v = Vec::new();
+                for r in from..to.min(n) {
+                    let k = fx.blob.key_at(r).unwrap().to_vec();
+                    fx.blob
+                        .values_at(r, |x| v.push((k.clone(), x.to_vec())))
+                        .unwrap();
+                }
+                v
+            };
+            let mut starts: Vec<usize> =
+                vec![0, 1, 2, 39, 40, 41, 63, 64, 65, n / 2, n - 1, n, n + 1];
+            starts.retain(|&s| s <= n + 1);
+            starts.sort_unstable();
+            starts.dedup();
+            // Placed at a rank, and stepped a rank at a time, with the key
+            // and the values at each.
+            for &start in &starts {
+                for want in [None, Some(1usize), Some(5), Some(200)] {
+                    let what = format!("{name}: at {start} wanting {want:?}");
+                    let place = |z| match want {
+                        None => ZCursor::at(&fx.memo, z, &fx.blob, start),
+                        Some(w) => ZCursor::at_wanting(&fx.memo, z, &fx.blob, start, w),
+                    };
+                    let (mut c, mut b) = (place(&zfile), place(&block));
+                    let steps = n.saturating_sub(start).min(want.unwrap_or(130) + 2);
+                    for rank in start..=start + steps {
+                        assert_eq!(c.rank(), rank, "{what}");
+                        assert_eq!(c.key(), fx.blob.key_at(rank), "{what}: key at {rank}");
+                        assert_eq!(c.key(), b.key(), "{what}: the block cursor's, at {rank}");
+                        let (mut got, mut bgot) = (Vec::new(), Vec::new());
+                        let m = c.values(&mut |v: &[u8]| got.push(v.to_vec())).unwrap();
+                        b.values(&mut |v: &[u8]| bgot.push(v.to_vec())).unwrap();
+                        assert_eq!(got, raw_vals(rank), "{what}: values at {rank}");
+                        assert_eq!(got, bgot, "{what}: the block cursor's, at {rank}");
+                        handed += m;
+                        if c.key().is_none() {
+                            break;
+                        }
+                        c.advance();
+                        b.advance();
+                    }
+                    assert!(!c.fell_back() && !b.fell_back(), "{what}");
+                    stride_cursor_quiet(&c, &what);
+                }
+            }
+            // By key: the run's keys, keys beside them, and renderings
+            // below and past the run.
+            let codec = body.trailer().codec;
+            let mut keys = probes(&fx.recs);
+            let mut kb = [0u8; STRIDE_KEY_MAX];
+            for x in [
+                codec.base().checked_sub(1),
+                codec.base().checked_add(n as u64),
+                Some(codec.top()),
+                Some(0),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|&x| x <= codec.top())
+            {
+                keys.push(codec.render(x, &mut kb).to_vec());
+            }
+            keys.sort();
+            keys.dedup();
+            for k in &keys {
+                let c = ZCursor::seek(&fx.memo, &zfile, &fx.blob, k).unwrap();
+                let b = ZCursor::seek(&fx.memo, &block, &fx.blob, k).unwrap();
+                let rank = fx.blob.seek(k);
+                assert_eq!(c.rank().min(n), rank, "{name}: seek of {k:?}");
+                assert_eq!(c.key(), fx.blob.key_at(rank), "{name}: seek of {k:?}");
+                assert_eq!(
+                    (c.rank().min(n), c.key()),
+                    (b.rank().min(n), b.key()),
+                    "{name}: the block cursor's seek of {k:?}"
+                );
+                stride_cursor_quiet(&c, name);
+            }
+            // Moved to each key, in key order and back, from one cursor:
+            // the cut the file's seek gives, and the block cursor's; the
+            // values under the position where the key is the run's.
+            for order in ["forwards", "backwards"] {
+                let mut c = ZCursor::unplaced(&fx.memo, &zfile, &fx.blob);
+                let mut b = ZCursor::unplaced(&fx.memo, &block, &fx.blob);
+                let walk: Vec<&Vec<u8>> = if order == "forwards" {
+                    keys.iter().collect()
+                } else {
+                    keys.iter().rev().collect()
+                };
+                for k in walk {
+                    let at = c.skip_to(k).expect("the file answers");
+                    let bat = b.skip_to(k).expect("the block file answers");
+                    let cut = match zfile.cut_in(&fx.memo, 0, n, k) {
+                        ZSeek::Served { rank, at, .. } => (rank, at),
+                        other => panic!("{other:?}"),
+                    };
+                    assert_eq!((c.rank().min(n), at), cut, "{name}, {order}: {k:?}");
+                    assert_eq!(
+                        (c.rank().min(n), at),
+                        (b.rank().min(n), bat),
+                        "{name}, {order}: the block cursor's move to {k:?}"
+                    );
+                    if at == KeyOrder::Equal {
+                        let mut got = Vec::new();
+                        handed += c.values(&mut |v: &[u8]| got.push(v.to_vec())).unwrap();
+                        assert_eq!(got, raw_vals(c.rank()), "{name}, {order}: {k:?}");
+                    }
+                }
+                assert!(!c.fell_back(), "{name}, {order}");
+                stride_cursor_quiet(&c, name);
+            }
+            // The bulk walk.
+            for &start in &starts {
+                for ahead in [0usize, 1, 5, 70] {
+                    let target = start + ahead;
+                    let mut untils: Vec<(Option<Vec<u8>>, usize, KeyOrder)> =
+                        vec![(None, n, KeyOrder::Greater)];
+                    if let Some(k) = fx.blob.key_at(target) {
+                        untils.push((Some(k.to_vec()), target, KeyOrder::Equal));
+                        let between = [k, &[0u8]].concat();
+                        assert_eq!(codec.decode(&between), None, "not a rendering");
+                        untils.push((Some(between), target + 1, KeyOrder::Greater));
+                    }
+                    if codec.holds(n as u64 + 1) {
+                        let past = codec.render(codec.base() + n as u64, &mut kb).to_vec();
+                        untils.push((Some(past), n, KeyOrder::Greater));
+                    }
+                    for (until, stop, at_want) in untils {
+                        for limit in [1usize, 7, 64, usize::MAX] {
+                            for run_ahead in [None, Some(0usize), Some(100)] {
+                                let what = format!(
+                                    "{name}: from {start}, until {:?} (stop {stop}), limit {limit}, ahead {run_ahead:?}",
+                                    until.as_deref().map(String::from_utf8_lossy)
+                                );
+                                let stop = stop.min(n);
+                                let mut c = ZCursor::at(&fx.memo, &zfile, &fx.blob, start);
+                                let mut b = ZCursor::at(&fx.memo, &block, &fx.blob, start);
+                                let (mut got, mut bgot) = (Vec::new(), Vec::new());
+                                let walk =
+                                    |c: &mut ZCursor<'_>, out: &mut Vec<(Vec<u8>, Vec<u8>)>| {
+                                        let mut f =
+                                            |k: &[u8], v: &[u8]| out.push((k.to_vec(), v.to_vec()));
+                                        let r = match run_ahead {
+                                            None => c.walk_until(until.as_deref(), limit, &mut f),
+                                            Some(a) => {
+                                                c.walk_run_ahead(until.as_deref(), limit, a, &mut f)
+                                            }
+                                        };
+                                        let r = r.unwrap();
+                                        c.resume();
+                                        r
+                                    };
+                                let (m, at) = walk(&mut c, &mut got);
+                                let (bm, bat) = walk(&mut b, &mut bgot);
+                                handed += m as u64;
+                                let want_n = stop.saturating_sub(start).min(limit);
+                                let want_at = if want_n >= limit {
+                                    KeyOrder::Greater
+                                } else {
+                                    at_want
+                                };
+                                assert_eq!((m, at), (want_n, want_at), "{what}");
+                                assert_eq!((m, at), (bm, bat), "{what}: the block cursor's");
+                                assert_eq!(got, raw_seq(start, start + want_n), "{what}");
+                                assert_eq!(got, bgot, "{what}: the block cursor's");
+                                let at_rank = start + want_n;
+                                assert_eq!(
+                                    c.rank().min(n),
+                                    at_rank.min(n),
+                                    "{what}: the rank after"
+                                );
+                                assert_eq!(
+                                    c.key(),
+                                    fx.blob.key_at(at_rank),
+                                    "{what}: the key under it"
+                                );
+                                assert_eq!(
+                                    c.key(),
+                                    b.key(),
+                                    "{what}: the block cursor's key after"
+                                );
+                                if at == KeyOrder::Equal {
+                                    let mut vals = Vec::new();
+                                    handed +=
+                                        c.values(&mut |v: &[u8]| vals.push(v.to_vec())).unwrap();
+                                    assert_eq!(vals, raw_vals(at_rank), "{what}: under the cursor");
+                                    c.advance();
+                                    let mut rest = Vec::new();
+                                    let (r, at2) = c
+                                        .walk_until(None, usize::MAX, &mut |k: &[u8], v: &[u8]| {
+                                            rest.push((k.to_vec(), v.to_vec()))
+                                        })
+                                        .unwrap();
+                                    handed += r as u64;
+                                    assert_eq!(
+                                        (r, at2),
+                                        (n - at_rank - 1, KeyOrder::Greater),
+                                        "{what}: the rest"
+                                    );
+                                    assert_eq!(
+                                        rest,
+                                        raw_seq(at_rank + 1, n),
+                                        "{what}: the rest's records"
+                                    );
+                                    assert_eq!(
+                                        (c.key(), c.rank()),
+                                        (None, n),
+                                        "{what}: at the end"
+                                    );
+                                }
+                                assert!(!c.fell_back(), "{what}");
+                                stride_cursor_quiet(&c, &what);
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                fx.memo.take_stride().cursor,
+                handed,
+                "{name}: every value the stride position handed over, counted"
+            );
+            assert!(!zfile.damaged() && zfile.bad_pages() == 0, "{name}");
+        }
+    }
+
+    /// The stride position under the scan's prefetch: a walk that will
+    /// cross pages past its first asks for them, once a cursor, as the
+    /// block walk does (`ZFile::stride_ask_ahead`); one inside its first
+    /// page and one with the prefetch off ask nothing.
+    #[test]
+    fn a_stride_cursors_walk_asks_ahead_only_under_the_scans_prefetch() {
+        let fx = stride_fixture("stride-cursor-ahead", 3000, 100, 0x5a1);
+        stride_built(&fx);
+        let on = fx.attach_opts(false, true, true).unwrap();
+        let off = fx.attach().unwrap();
+        let mut sink = |_: &[u8], _: &[u8]| {};
+        let mut c = ZCursor::at(&fx.memo, &on, &fx.blob, 0);
+        c.walk_until(None, 300, &mut sink).unwrap();
+        c.walk_until(None, 300, &mut sink).unwrap();
+        assert_eq!(c.prefetches, 1, "one ask a cursor");
+        let mut c = ZCursor::at(&fx.memo, &on, &fx.blob, 0);
+        c.walk_until(None, 40, &mut sink).unwrap();
+        assert_eq!(c.prefetches, 0, "ranks 0 to 39 lie in the first page");
+        let mut c = ZCursor::at(&fx.memo, &off, &fx.blob, 0);
+        c.walk_until(None, 300, &mut sink).unwrap();
+        assert_eq!(c.prefetches, 0, "the option off");
+    }
+
+    /// A cursor over a stride file honours the file's being out of service
+    /// before anything else at every step, as the block cursor does at its
+    /// every placing: a walk across a page that fails its check stops the
+    /// stride position at the first rank the page holds, every rank before
+    /// it handed over from the file and every rank from it on the raw
+    /// form's, with the file out of service; a cursor standing on an intact
+    /// page when another read takes the file out answers its values from
+    /// the raw form, falls at its next step and walks the rest raw, with
+    /// nothing more counted as the stride position's; and a cursor placed
+    /// after is fallen from the start, a seek is refused and a move to a
+    /// key answers none. Every key and value right throughout.
+    #[test]
+    fn a_stride_cursor_answers_the_raw_form_once_its_file_is_out_of_service() {
+        let fx = stride_fixture("stride-cursor-out", 3000, 100, 0x0c);
+        stride_built(&fx);
+        let n = fx.recs.len();
+        let bad_page = 3usize;
+        {
+            use std::os::unix::fs::FileExt;
+            let f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&fx.out)
+                .unwrap();
+            let at = (bad_page * ZPAGE + 7) as u64;
+            let mut b = [0u8; 1];
+            f.read_exact_at(&mut b, at).unwrap();
+            f.write_all_at(&[b[0] ^ 1], at).unwrap();
+        }
+        let first_bad = bad_page * ZPAGE / 100;
+        let raw_seq = |from: usize, to: usize| -> Vec<(Vec<u8>, Vec<u8>)> {
+            let mut v = Vec::new();
+            for r in from..to.min(n) {
+                let k = fx.blob.key_at(r).unwrap().to_vec();
+                fx.blob
+                    .values_at(r, |x| v.push((k.clone(), x.to_vec())))
+                    .unwrap();
+            }
+            v
+        };
+        // A walk across the damaged page, from a file attached fresh.
+        let _ = fx.memo.take_stride();
+        let z = fx.attach_stride(StrideAttach::Check).unwrap();
+        let mut c = ZCursor::at(&fx.memo, &z, &fx.blob, 0);
+        let mut got = Vec::new();
+        let (m, at) = c
+            .walk_until(None, usize::MAX, &mut |k: &[u8], v: &[u8]| {
+                got.push((k.to_vec(), v.to_vec()))
+            })
+            .unwrap();
+        assert_eq!((m, at), (n, KeyOrder::Greater));
+        assert_eq!(got, raw_seq(0, n), "every key and value, across the fall");
+        assert!(c.fell_back() && z.damaged() && z.bad_pages() == 1);
+        assert_eq!(
+            fx.memo.take_stride().cursor,
+            first_bad as u64,
+            "the ranks before the bad page from the file, none from it on"
+        );
+        // A cursor standing on the damaged page: its value read fails the
+        // page's check and answers the raw form's value, never none, with
+        // nothing of the slot handed over or counted, and the file out of
+        // service.
+        let z = fx.attach_stride(StrideAttach::Check).unwrap();
+        let c = ZCursor::at(&fx.memo, &z, &fx.blob, first_bad);
+        assert!(!c.fell_back() && !z.damaged());
+        let mut v = Vec::new();
+        assert_eq!(c.values(&mut |x: &[u8]| v.push(x.to_vec())).unwrap(), 1);
+        assert_eq!(
+            v,
+            vec![fx.recs[first_bad].1[0].clone()],
+            "the raw form's value"
+        );
+        assert!(z.damaged() && z.bad_pages() == 1);
+        assert_eq!(fx.memo.take_stride().cursor, 0, "nothing from the slot");
+        // A cursor standing on an intact page when a point read takes the
+        // file out of service.
+        let z = fx.attach_stride(StrideAttach::Check).unwrap();
+        let mut c = ZCursor::at(&fx.memo, &z, &fx.blob, 1);
+        let mut v = Vec::new();
+        c.values(&mut |x: &[u8]| v.push(x.to_vec())).unwrap();
+        assert_eq!(v, vec![fx.recs[1].1[0].clone()]);
+        assert_eq!(fx.memo.take_stride().cursor, 1, "served before the failure");
+        let r = z
+            .read_all(
+                &fx.memo,
+                &fx.blob,
+                &fx.recs[first_bad + 1].0,
+                &mut |_: &[u8]| panic!("a value"),
+            )
+            .unwrap();
+        assert_eq!(r, ZRead::Fallback);
+        assert!(z.damaged());
+        let _ = fx.memo.take_stride();
+        let mut v = Vec::new();
+        assert_eq!(c.values(&mut |x: &[u8]| v.push(x.to_vec())).unwrap(), 1);
+        assert_eq!(v, vec![fx.recs[1].1[0].clone()], "the raw form's value");
+        assert!(!c.fell_back(), "a value read moves nothing");
+        c.advance();
+        assert!(c.fell_back(), "fallen at its next step");
+        assert_eq!(c.key(), fx.blob.key_at(2));
+        let mut rest = Vec::new();
+        let (m, _) = c
+            .walk_until(None, 100, &mut |k: &[u8], v: &[u8]| {
+                rest.push((k.to_vec(), v.to_vec()))
+            })
+            .unwrap();
+        assert_eq!((m, rest), (100, raw_seq(2, 102)));
+        assert_eq!(
+            fx.memo.take_stride().cursor,
+            0,
+            "nothing from a file out of service"
+        );
+        // A walk begun on a cursor placed before the failure falls before
+        // its first record.
+        let z = fx.attach_stride(StrideAttach::Check).unwrap();
+        let mut c = ZCursor::at(&fx.memo, &z, &fx.blob, 10);
+        let _ = z
+            .read_all(
+                &fx.memo,
+                &fx.blob,
+                &fx.recs[first_bad + 1].0,
+                &mut |_: &[u8]| panic!("a value"),
+            )
+            .unwrap();
+        assert!(z.damaged());
+        let _ = fx.memo.take_stride();
+        let mut got = Vec::new();
+        let (m, at) = c
+            .walk_until(Some(&fx.recs[20].0), 50, &mut |k: &[u8], v: &[u8]| {
+                got.push((k.to_vec(), v.to_vec()))
+            })
+            .unwrap();
+        assert_eq!((m, at), (10, KeyOrder::Equal));
+        assert_eq!(got, raw_seq(10, 20));
+        assert!(c.fell_back());
+        assert_eq!(fx.memo.take_stride().cursor, 0, "nothing from the file");
+        // Placed after: fallen from the start, a seek refused, a move none.
+        let c = ZCursor::at(&fx.memo, &z, &fx.blob, 5);
+        assert!(c.fell_back());
+        assert_eq!(c.key(), fx.blob.key_at(5));
+        assert!(matches!(
+            ZCursor::seek(&fx.memo, &z, &fx.blob, &fx.recs[5].0),
+            Err(ZSeek::Out)
+        ));
+        let mut c = ZCursor::unplaced(&fx.memo, &z, &fx.blob);
+        assert_eq!(c.skip_to(&fx.recs[5].0), None);
+        assert!(c.fell_back());
     }
 
     /// Every byte of a stride file's value pages, its row's page and its
