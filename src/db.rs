@@ -33040,6 +33040,18 @@ impl Db {
             .store(true, AtomicOrdering::Release);
     }
 
+    /// A test's: from `on`, record every directory fsync that returned and
+    /// every open of a manifest slot for writing, process-wide and in the
+    /// order they were made, each with its path; off, record nothing. The
+    /// record so far, which a test reads for its own directory: what an
+    /// open made durable before the slot it writes, read from the calls
+    /// themselves and not from the open's word for them
+    /// (`open_synced_files`).
+    #[doc(hidden)]
+    pub fn trace_dir_io(on: bool) -> Vec<(&'static str, PathBuf)> {
+        vault::trace_io(on)
+    }
+
     /// A test's: the files the open that made this store fsynced, the
     /// directory as `.`, in the order the fsyncs returned
     /// (`Shared::open_synced`).

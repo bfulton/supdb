@@ -148,7 +148,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Error, ErrorKind, Read, Result, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub use super::pager::PagerCounts;
@@ -1955,6 +1955,9 @@ pub(crate) fn open_append(path: impl AsRef<Path>) -> Result<File> {
 /// nowhere if it is: a manifest slot.
 pub(crate) fn open_slot(path: impl AsRef<Path>) -> Result<File> {
     let path = path.as_ref();
+    if IO_TRACE_ON.load(Ordering::Relaxed) {
+        io_trace("open_slot", path);
+    }
     let plain = |p: &Path| {
         OpenOptions::new()
             .write(true)
@@ -2124,9 +2127,35 @@ pub(crate) fn read(path: impl AsRef<Path>) -> Result<Vec<u8>> {
 pub(crate) fn sync_dir(dir: impl AsRef<Path>) -> Result<()> {
     let dir = dir.as_ref();
     match under(dir) {
-        Some(v) => File::open(&v.real)?.sync_all(),
-        None => File::open(dir)?.sync_all(),
+        Some(v) => File::open(&v.real)?.sync_all()?,
+        None => File::open(dir)?.sync_all()?,
     }
+    if IO_TRACE_ON.load(Ordering::Relaxed) {
+        io_trace("sync_dir", dir);
+    }
+    Ok(())
+}
+
+/// A test's: whether directory fsyncs and slot opens are recorded
+/// (`trace_io`), read beside the syscall each makes.
+static IO_TRACE_ON: AtomicBool = AtomicBool::new(false);
+
+/// A test's: what `trace_io` recorded, in order, process-wide.
+static IO_TRACE: Mutex<Vec<(&'static str, PathBuf)>> = Mutex::new(Vec::new());
+
+fn io_trace(what: &'static str, path: &Path) {
+    IO_TRACE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((what, path.to_path_buf()));
+}
+
+/// A test's: from `on`, record every directory fsync that returned and
+/// every open of a manifest slot for writing, in the order they were
+/// made, process-wide; off, record nothing. The record so far.
+pub(crate) fn trace_io(on: bool) -> Vec<(&'static str, PathBuf)> {
+    IO_TRACE_ON.store(on, Ordering::Relaxed);
+    IO_TRACE.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Where in the filesystem a file the engine names lies: the path itself,
