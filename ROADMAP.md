@@ -262,20 +262,6 @@ What an engine picker would hit, roughly in order.
   tests if a store that must not be reopened ever asks for it. A merge in
   flight at the failure finishes and is held, and its outputs are files no
   slot names, swept at the open.
-- [ ] **A torn manifest slot on a device that tears one.** A publish
-  writes the slot that does not hold the newest manifest known durable,
-  and an open fdatasyncs the slot it takes (`SlotChoice`), so a power cut
-  tearing a slot write leaves the other slot whole on the device. The
-  tests build the tear by hand -- the slot's header rewritten over what
-  the device held, the other slot as its last fdatasync left it, read
-  from the engine's own record of which syncs returned
-  (`Db::watch_slot_writes`) -- and no device here has been seen to tear
-  a write of a slot, which fits in a page; nor has anything shown that an
-  fdatasync of one slot file leaves the other's dirty page unwritten, on
-  which the defect the rule closes rests. Done when a dm-flakey target
-  drops or tears the writes after a chosen point inside a drain with its
-  slot owed and a merge publishing behind it, and the store opens to
-  every acknowledged write.
 - [ ] **A run's due commit beside log frames no sync covered.** Under
   `EveryN` a run's commit that is due syncs the run's file and not the
   log, and a run opens over a log that may hold the frames of a table
