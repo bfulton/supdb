@@ -7913,9 +7913,14 @@ fn an_open_that_takes_an_unsynced_slot_never_overwrites_the_durable_one_under_a_
 /// writeback -- not yet what the device holds -- read from the kernel
 /// (`/proc/self/pagemap` over a mapping of the file, then
 /// `/proc/kpageflags` at its frame); `None` where the kernel does not say,
-/// which it does only to a privileged reader.
+/// which it does only to a privileged reader -- and, with
+/// `SUPDB_TEST_UNPRIVILEGED` set, to nobody, so that a privileged run can
+/// show what the tests hold where the gate runs without the privilege.
 fn os_page_unwritten(path: &Path) -> Option<bool> {
     use std::io::{Read, Seek, SeekFrom};
+    if std::env::var_os("SUPDB_TEST_UNPRIVILEGED").is_some() {
+        return None;
+    }
     let f = std::fs::File::open(path).ok()?;
     let m = unsafe { memmap2::Mmap::map(&f) }.ok()?;
     std::hint::black_box(m.first().copied()?);
@@ -9050,18 +9055,20 @@ fn oo_holds(db: &Reader, model: &BTreeMap<Vec<u8>, Vec<Vec<u8>>>, tag: &str) {
 /// replayed log holds that key, and is no holder of a run's records, which
 /// in the clear never go to it. And the same over a segment flushed
 /// before the run, which the slot before names: a segment that holds
-/// keys, and none of them the run's.
+/// keys, and none of them the run's. And a run of one key, whose segment
+/// is no less the only copy of its record for holding one.
 #[test]
 fn a_flushed_run_is_not_lost_when_the_newest_slot_is_damaged_after_its_temp_retired() {
     for again in [None, Some(0), Some(1999)] {
-        a_damaged_slot_over_a_flushed_run(again, false);
+        a_damaged_slot_over_a_flushed_run(again, false, 2000);
     }
-    a_damaged_slot_over_a_flushed_run(None, true);
+    a_damaged_slot_over_a_flushed_run(None, true, 2000);
+    a_damaged_slot_over_a_flushed_run(None, false, 1);
 }
 
-fn a_damaged_slot_over_a_flushed_run(again: Option<u32>, below: bool) {
-    let d = dir(&format!("oo-run-{again:?}-{below}"));
-    let c = dir(&format!("oo-run-{again:?}-{below}-kill"));
+fn a_damaged_slot_over_a_flushed_run(again: Option<u32>, below: bool, n: u32) {
+    let d = dir(&format!("oo-run-{again:?}-{below}-{n}"));
+    let c = dir(&format!("oo-run-{again:?}-{below}-{n}-kill"));
     // Below, the run's flush leaves its segment a piece, so the partition
     // the slot before names stands under the name that slot gives it.
     let opts = Options {
@@ -9082,7 +9089,7 @@ fn a_damaged_slot_over_a_flushed_run(again: Option<u32>, below: bool) {
         db.flush().unwrap();
         db.settle().unwrap();
     }
-    for k in 0..2000u32 {
+    for k in 0..n {
         db.append(key(k).as_bytes(), b"acked");
         model.insert(key(k).into_bytes(), vec![b"acked".to_vec()]);
     }
@@ -9121,7 +9128,7 @@ fn a_damaged_slot_over_a_flushed_run(again: Option<u32>, below: bool) {
     oo_holds(&db, &model, "run, repaired");
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
-    let _ = std::fs::remove_dir_all(dir(&format!("oo-run-{again:?}-{below}")));
+    let _ = std::fs::remove_dir_all(dir(&format!("oo-run-{again:?}-{below}-{n}")));
 }
 
 /// A refusal made once the log is replayed leaves the log as it found it.
@@ -9630,7 +9637,10 @@ fn the_windows_a_torn_publish_leaves_open_through_the_slot_before() {
                         .filter(|n| n.starts_with("direct-") && n.ends_with(".tmp")),
                 )
                 .collect();
-            assert!(torn.len() >= 2, "{case}: premise: the run's two names: {torn:?}");
+            assert!(
+                torn.len() >= 2,
+                "{case}: premise: the run's two names: {torn:?}"
+            );
             for n in &torn {
                 use std::os::unix::fs::FileExt;
                 std::fs::OpenOptions::new()
@@ -9835,8 +9845,9 @@ fn oo_dirty(path: &Path) {
 /// after that open loses whatever of the segments, their ordered indexes
 /// and their names no fsync covered since, and every commit acknowledged
 /// before the kill has to read back. What the open fsynced is its own
-/// record (`Db::open_synced_files`), held where the kernel says to the
-/// page cache's word on each file's first page.
+/// record (`Db::open_synced_files`), held to the calls that made the
+/// fsyncs (`Db::trace_dir_io`), and where the kernel says to the page
+/// cache's word on each file's first page.
 fn a_pending_segment_adopted_by_an_open(how: OoTear, ord_durable: bool, pieces: bool) {
     let tag = format!("{how:?}-ord{ord_durable}-pieces{pieces}");
     let d = dir(&format!("oo-pend-{tag}"));
@@ -9954,6 +9965,17 @@ fn a_pending_segment_adopted_by_an_open(how: OoTear, ord_durable: bool, pieces: 
             calls[..write].iter().any(|(what, _)| *what == "sync_dir"),
             "{tag}: the directory fsynced before the slot {slot} was written: {calls:?}"
         );
+        // And each file's fsync, returned before the slot was opened, read
+        // off the call that made it: the record above is the open's word,
+        // and the kernel's word below is read only by root.
+        for f in pend.iter().chain(ords.iter().filter(|_| ord_durable)) {
+            assert!(
+                calls[..write]
+                    .iter()
+                    .any(|(what, p)| *what == "sync_file" && *p == d.join(f)),
+                "{tag}: {f} fsynced before the slot {slot} was written: {calls:?}"
+            );
+        }
     }
     if kernel {
         for f in &files {
@@ -9999,7 +10021,8 @@ fn a_pending_segment_adopted_by_an_open(how: OoTear, ord_durable: bool, pieces: 
     // An ordered index torn by the cut is composed again at the open, so
     // the reads above cannot tell whether the open synced one; a store
     // that keeps them durable (`ord_durable`) has each in the open's
-    // record, which the kernel's word above holds to the device.
+    // record, which the calls above, and where it says the kernel's word,
+    // hold to the device.
     if ord_durable {
         for o in &ords {
             assert!(
@@ -10081,6 +10104,86 @@ fn an_open_whose_pending_fsync_fails_names_nothing_durable() {
     oo_holds(&db, &model, "after the failed open");
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A power cut between a seal's pending slot and its fsync, under
+/// `Options::ord_durable`: the slot's fdatasync returned, the segment's
+/// pages reached the device by write-back and its ordered index's name
+/// did not. The open's read of the segment back whole composes the index
+/// again where it is missing and writes it synced, so the fsync owed it
+/// before the slot that names the segment durable finds it there: the
+/// open answers with every acknowledged write, and the index is back.
+#[test]
+fn an_open_adopts_a_pending_segment_whose_durable_index_a_power_cut_took() {
+    let d = dir("oo-pend-noord");
+    let opts = Options {
+        manifest_pending: true,
+        ord_durable: true,
+        direct_ingest: false,
+        seal_bytes: 1 << 20,
+        l0_trigger: 1000,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    for k in (0..3000u32).rev() {
+        db.put(key(k).as_bytes(), b"v");
+        model.insert(key(k).into_bytes(), vec![b"v".to_vec()]);
+    }
+    db.commit().unwrap();
+    db.hold_seal_durable(true);
+    db.seal().unwrap();
+    let pending = || -> Vec<String> {
+        let b = std::fs::read(&oo_by_age(&d)[0]).unwrap();
+        oo_names(&b)
+            .1
+            .into_iter()
+            .filter(|(_, p)| *p)
+            .map(|(n, _)| n)
+            .collect()
+    };
+    wait_for("the seal's pending slot", || !pending().is_empty());
+    let pend = pending();
+    // The kill, and the store copied as it stands: the process's threads
+    // go on in the original -- the landing opens the segment it published
+    // and composes an index it finds missing -- where a killed process's
+    // would not.
+    std::mem::forget(db);
+    let c = dir("oo-pend-noord-kill");
+    copy_store(&d, &c);
+    let d = c;
+    let ords: Vec<String> = pend
+        .iter()
+        .map(|n| {
+            let f: Vec<&str> = n.split('-').collect();
+            format!("ord-{}-{}.oidx", f[1], f[2].trim_end_matches(".sup"))
+        })
+        .collect();
+    for o in &ords {
+        std::fs::remove_file(d.join(o))
+            .unwrap_or_else(|e| panic!("premise: the seal wrote {o}: {e}"));
+    }
+    let db = Db::open(&d, opts.clone())
+        .unwrap_or_else(|e| panic!("the store refused its acknowledged commits: {e}"));
+    oo_holds(&db, &model, "a pending segment whose index was lost");
+    let [newest, older] = oo_by_age(&d);
+    let read = |p: &Path| oo_names(&std::fs::read(p).unwrap());
+    assert!(
+        read(&newest).1.iter().any(|(n, p)| pend.contains(n) && !p),
+        "premise: the open adopted {pend:?}: newest {:?}, older {:?}, files {:?}",
+        read(&newest),
+        read(&older),
+        files_of(&d).keys().collect::<Vec<_>>()
+    );
+    drop(db);
+    for o in &ords {
+        assert!(d.join(o).is_file(), "the open composed {o} again");
+    }
+    let db = Db::open(&d, opts).expect("the store opens again");
+    oo_holds(&db, &model, "reopened");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(dir("oo-pend-noord"));
 }
 
 #[test]

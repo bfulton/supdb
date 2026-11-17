@@ -316,14 +316,14 @@ What an engine picker would hit, roughly in order.
   adopts pending segments (`Options::manifest_pending`) fsyncs each, its
   ordered index under `ord_durable`, and the directory before the slot
   that names them durable. The tests hold the order through the open's
-  own record of what it fsynced (`Db::open_synced_files`) and each
-  file's fsync through the kernel's page flags, which only root may
-  read; nothing reads whether the directory's entries reached the
-  device, so an open that recorded the directory's fsync without making
-  it would pass. Done when a dm-flakey target that drops unflushed
-  writes cuts the power after such an open, and the store reopens with
-  every acknowledged write, with the directory fsync removed as its
-  control.
+  own record of what it fsynced (`Db::open_synced_files`) and the calls
+  it made and saw return (`Db::trace_dir_io`: each file's fsync and the
+  directory's before the slot's open), and where the process is root,
+  each file's through the kernel's page flags; nothing reads whether the
+  directory's entries or a file's pages reached the device. Done when a
+  dm-flakey target that drops unflushed writes cuts the power after
+  such an open, and the store reopens with every acknowledged write,
+  with the directory fsync removed as its control.
 - [ ] **A run's due commit beside log frames no sync covered.** Under
   `EveryN` a run's commit that is due syncs the run's file and not the
   log, and a run opens over a log that may hold the frames of a table
