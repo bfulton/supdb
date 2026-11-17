@@ -19,7 +19,7 @@ use supdb::{
 };
 
 mod common;
-use common::{seg_names, vf, Gcm};
+use common::{kv, seg_names, vf, Gcm};
 
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-{name}-{}", std::process::id()));
@@ -5456,4 +5456,997 @@ fn a_sync_with_a_run_open_pays_the_log_directorys_barrier() {
     kept(db.sync(), "the sync after");
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
+}
+
+// ---------------------------------------------------------------------
+// seal-sync: a segment whose sync failed -- its data's, its directory
+// entry's at the readable landing, the presync of a closing run's records
+// -- is named durable by no manifest, its sequence is covered by none,
+// and the log that holds its writes is retired by nothing, whichever path
+// would write the next manifest: a merge's landing, a later seal's, a
+// drain's, the close. The seal queue stops (`Db::seals_wedged`), readers
+// go on reading what was published, and every `sync` and `flush` answers
+// the failure until the store is reopened.
+// ---------------------------------------------------------------------
+
+/// The words every `sync` and `flush` of a store whose seal failed to make
+/// its segments durable answers with, before the failure's own.
+const SS_WEDGED: &str = "a seal failed to make its segments durable";
+
+type SsModel = BTreeMap<Vec<u8>, Vec<Vec<u8>>>;
+
+/// A slot as `ss_newest` reads it: its publish sequence, the log sequence
+/// it covers, and its names with their pending flags.
+type SsSlot = (u64, u64, Vec<(String, bool)>);
+
+/// What the newest valid slot says: its publish sequence, the log
+/// sequence it covers, and the names it calls live with their pending
+/// flags. Version 3: an eight-byte magic, the version byte, the sequence,
+/// the body's length and its CRC, then the covered sequence, a count, and
+/// per name a u16 length, the bytes and a flag byte. A slot that does not
+/// parse is passed over, so a slot read while the engine writes it is
+/// not mistaken for one; `None` where no slot parses.
+fn ss_newest(d: &Path) -> Option<SsSlot> {
+    let mut best: Option<SsSlot> = None;
+    for slot in ["manifest", "manifest.alt"] {
+        let Ok(b) = std::fs::read(d.join(slot)) else {
+            continue;
+        };
+        if b.len() < 37 || &b[..8] != b"SUPDBMAN" || b[8] != 3 {
+            continue;
+        }
+        let seq = u64::from_le_bytes(b[9..17].try_into().unwrap());
+        let body = &b[25..];
+        let covered = u64::from_le_bytes(body[..8].try_into().unwrap());
+        let n = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
+        let mut p = 12;
+        let mut names = Vec::new();
+        let mut whole = true;
+        for _ in 0..n {
+            let Some(l) = body.get(p..p + 2) else {
+                whole = false;
+                break;
+            };
+            let l = u16::from_le_bytes(l.try_into().unwrap()) as usize;
+            p += 2;
+            let (Some(name), Some(flag)) = (body.get(p..p + l), body.get(p + l)) else {
+                whole = false;
+                break;
+            };
+            names.push((String::from_utf8_lossy(name).into_owned(), flag & 1 != 0));
+            p += l + 1;
+        }
+        if whole && best.as_ref().is_none_or(|x| seq > x.0) {
+            best = Some((seq, covered, names));
+        }
+    }
+    best
+}
+
+fn ss_names(d: &Path) -> Vec<String> {
+    ss_newest(d)
+        .expect("a manifest")
+        .2
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect()
+}
+
+/// The log sequence a seal's segment ends at, from its name:
+/// `seg-<id>-<end>.sup`, `par-<id>-<end>-...` or `pcs-<id>-<end>-...`.
+fn ss_end_seq(name: &str) -> u64 {
+    let field = name.split('-').nth(2).unwrap();
+    field.trim_end_matches(".sup").parse().unwrap()
+}
+
+fn ss_logs(d: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(d)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("wal-"))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Every key of `model` read back through `r`, by point read and by one
+/// scan of the whole store.
+fn ss_check(r: &Reader, model: &SsModel, state: &str) {
+    for (k, want) in model {
+        assert_eq!(
+            &read_vec(r, k),
+            want,
+            "{state}: an acknowledged write of {} reads back",
+            String::from_utf8_lossy(k)
+        );
+    }
+    let mut seen: SsModel = BTreeMap::new();
+    r.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| seen.entry(k.to_vec()).or_default().push(v.to_vec())),
+    )
+    .unwrap();
+    assert!(seen == *model, "{state}: the scan disagrees with the model");
+}
+
+fn ss_key(k: u32) -> Vec<u8> {
+    format!("key-{k:06}").into_bytes()
+}
+
+fn ss_between(k: u32, i: u32) -> Vec<u8> {
+    format!("key-{k:06}x{i}").into_bytes()
+}
+
+fn ss_put(db: &mut Db, model: &mut SsModel, k: &[u8], v: &str) {
+    db.append(k, v.as_bytes());
+    model
+        .entry(k.to_vec())
+        .or_default()
+        .push(v.as_bytes().to_vec());
+}
+
+/// `r` an error carrying the wedge's words and the failure's own (`cause`).
+fn ss_wedged(r: std::io::Result<()>, cause: &str, what: &str) {
+    match r {
+        Ok(()) => panic!("{what}: answered Ok after a seal failed to make its segments durable"),
+        Err(e) => {
+            let s = e.to_string();
+            assert!(
+                s.contains(SS_WEDGED) && s.contains(cause),
+                "{what}: answered with an error that does not say the seal failed \
+                 ({SS_WEDGED:?}) and why ({cause:?}): {s}"
+            );
+        }
+    }
+}
+
+/// A store of one partition over 400,000 keys and two pieces over keys it
+/// holds, so that the second piece's durable landing starts a merge of the
+/// range, as `tests/db.rs`'s held-landing tests build it. `before_second`
+/// runs before the second piece's seal. Every commit is under
+/// `SyncPolicy::Always`, so every write is acknowledged when it returns.
+fn ss_store_with_a_merge_due(
+    d: &Path,
+    base: Options,
+    model: &mut SsModel,
+    before_second: impl FnOnce(&Db),
+) -> (Db, Options) {
+    let mut before_second = Some(before_second);
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(64 << 20),
+        l0_trigger: 2,
+        ..base
+    };
+    let mut db = Db::create(d, opts.clone()).unwrap();
+    for k in 0..400_000 {
+        ss_put(&mut db, model, &ss_key(k), "p");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.levels(), (1, 0), "one partition over every key");
+    for (n, (tag, base)) in [("a", 1000u32), ("b", 2000u32)].into_iter().enumerate() {
+        for i in 0..10 {
+            ss_put(&mut db, model, &ss_key(base + i), tag);
+            ss_put(&mut db, model, &ss_between(base, i), tag);
+        }
+        db.commit().unwrap();
+        if n == 1 {
+            (before_second.take().unwrap())(&db);
+        }
+        db.seal().unwrap();
+        wait_for("the seal's landing", || !db.in_flight().0);
+    }
+    wait_for("the merge's start", || db.in_flight().1);
+    (db, opts)
+}
+
+/// The third piece's keys, written and committed: acknowledged.
+fn ss_third(db: &mut Db, model: &mut SsModel) {
+    for i in 0..10 {
+        ss_put(db, model, &ss_key(3000 + i), "c");
+        ss_put(db, model, &ss_between(3000, i), "c");
+    }
+    db.commit().unwrap();
+}
+
+/// The one segment on disk that was not in `before`.
+fn ss_new_piece(d: &Path, before: &[String]) -> String {
+    let new: Vec<String> = seg_names(d)
+        .into_iter()
+        .filter(|n| !before.contains(n))
+        .collect();
+    assert_eq!(new.len(), 1, "the seal's one segment: {new:?}");
+    new.into_iter().next().unwrap()
+}
+
+/// The slot an open reads names `piece` nowhere, and covers none of its
+/// sequence.
+fn ss_named_by_no_manifest(d: &Path, piece: &str, why: &str) {
+    let (_, covered, names) = ss_newest(d).expect("a manifest");
+    assert!(
+        !names.iter().any(|(n, _)| n == piece),
+        "a manifest names the segment {piece} whose {why} failed: {names:?}"
+    );
+    assert!(
+        covered < ss_end_seq(piece),
+        "a manifest covers sequence {covered}, past the writes of {piece} whose {why} failed"
+    );
+}
+
+/// A seal whose directory fsync fails at its readable landing has its
+/// segments published and its sequence counted, and the seal queue
+/// stops; a merge in flight across it, whose outputs were written and
+/// their directory fsynced before the seal renamed its piece into place,
+/// must not then land a manifest that names the piece or covers its
+/// sequence. A power cut may lose the piece's directory entry -- no fsync
+/// that succeeded covered it -- and the reopen replays the log that holds
+/// the piece's acknowledged writes.
+#[test]
+fn a_seal_whose_directory_fsync_failed_is_named_by_no_manifest() {
+    let d = dir("dur-ss-dirsync");
+    let mut model = SsModel::new();
+    let (mut db, opts) = ss_store_with_a_merge_due(&d, Options::default(), &mut model, |db| {
+        db.hold_merge_landing(true)
+    });
+    // The merge's outputs written and their directory fsynced, before the
+    // third piece exists: no directory fsync after this succeeds.
+    wait_for("the merge at its landing hold", || {
+        db.merge_waits_at_landing()
+    });
+    assert_eq!(db.levels(), (1, 2));
+    let pieces_before = seg_names(&d);
+    let covered_before = ss_newest(&d).unwrap().1;
+
+    db.fail_next_seal_dir_sync();
+    ss_third(&mut db, &mut model);
+    db.seal().unwrap();
+    wait_for("the failed landing", || db.seals_wedged());
+    assert!(
+        !db.seal_sync_fault_pending(),
+        "the seal's directory fsync was failed; the case was reached"
+    );
+    let third = ss_new_piece(&d, &pieces_before);
+    assert!(ss_end_seq(&third) > covered_before, "the premise");
+
+    // The merge lands, or is refused, and the store closes.
+    db.hold_merge_landing(false);
+    wait_for("the merge's end", || !db.in_flight().1);
+    ss_check(&db, &model, "after the failure, before the close");
+    // The answers, read once the files are: a store that names the piece
+    // is wrong first in what it left on disk.
+    let answers = [
+        ("a sync after the failure", db.sync()),
+        ("a flush after the failure", db.flush()),
+        ("the flush after that", db.flush()),
+    ];
+    drop(db);
+    ss_named_by_no_manifest(&d, &third, "directory fsync");
+
+    // The power cut: the piece's link, which no successful directory fsync
+    // covered, is gone.
+    std::fs::remove_file(d.join(&third)).unwrap();
+    let db = Db::open(&d, opts).expect("the store opens after the power cut");
+    ss_check(&db, &model, "reopened after the power cut");
+    drop(db);
+    for (what, r) in answers {
+        ss_wedged(r, "directory fsync", what);
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A seal whose step that makes its data durable fails after its readable
+/// landing has published segments whose bytes may not be on the device.
+/// The store writes no manifest that names them or covers their sequence
+/// from there -- the merge held behind the seal lands no slot -- so a
+/// power cut that loses the unsynced bytes leaves a store whose log still
+/// holds the acknowledged writes. The failure is the seal's own and is
+/// not tried again: the queue stops.
+#[test]
+fn a_seal_whose_data_fsync_failed_after_its_publish_is_named_by_no_manifest() {
+    let d = dir("dur-ss-datasync");
+    let mut model = SsModel::new();
+    let (mut db, opts) = ss_store_with_a_merge_due(&d, Options::default(), &mut model, |_| {});
+    assert_eq!(db.levels(), (1, 2));
+    let pieces_before = seg_names(&d);
+    let covered_before = ss_newest(&d).unwrap().1;
+
+    // The third piece, held between its phases: published, not durable.
+    db.hold_seal_durable(true);
+    ss_third(&mut db, &mut model);
+    db.seal().unwrap();
+    wait_for("the third piece's publish", || db.levels() == (1, 3));
+    let third = ss_new_piece(&d, &pieces_before);
+    assert!(ss_end_seq(&third) > covered_before, "the premise");
+    // The merge finished and held behind the seal, so it lands after the
+    // seal's failure and not before it.
+    wait_for("a merge held for the seal", || {
+        db.seal_waits().held_landings > 0
+    });
+
+    db.fail_next_seal_sync();
+    db.hold_seal_durable(false);
+    wait_for("the seal's end", || !db.in_flight().0);
+    assert!(
+        !db.seal_sync_fault_pending(),
+        "the seal's fsync was failed; the case was reached"
+    );
+    wait_for("the merge's end", || !db.in_flight().1);
+    ss_check(&db, &model, "after the failure, before the close");
+    let answers = [
+        ("a sync after the failure", db.sync()),
+        ("a flush after the failure", db.flush()),
+    ];
+    let wedged = db.seals_wedged();
+    drop(db);
+    ss_named_by_no_manifest(&d, &third, "fsync");
+
+    // The power cut: the piece's data, which no fsync that succeeded
+    // covered, is lost whole.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(d.join(&third))
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    let db = Db::open(&d, opts).expect("the store opens after the power cut");
+    ss_check(&db, &model, "reopened after the power cut");
+    drop(db);
+    for (what, r) in answers {
+        ss_wedged(r, "a test failed this seal's fsync", what);
+    }
+    assert!(
+        wedged,
+        "a seal that failed after its readable landing stops the queue, \
+         and is not tried again"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The same failure, met by the seal after it rather than by a merge: no
+/// later seal lands a manifest naming the failed piece or covering its
+/// sequence, and no log file that held its writes is retired -- each file
+/// on disk when the failed seal was handed is there after the close.
+/// The commit after the failure answers it once; every `sync` and `flush`
+/// answers it until the store is reopened, the commits being durable in
+/// the log.
+#[test]
+fn a_later_seal_names_no_seal_whose_fsync_failed_and_retires_none_of_its_log() {
+    let d = dir("dur-ss-later");
+    let opts = Options {
+        direct_ingest: false,
+        seal_bytes: 1 << 20,
+        l0_trigger: 1000,
+        ..Options::default()
+    };
+    let mut model = SsModel::new();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let value = "v".repeat(400);
+    let batch = |db: &mut Db, model: &mut SsModel, from: u32| {
+        for k in from..from + 3000 {
+            ss_put(db, model, &ss_key(k), &value);
+        }
+        db.commit().unwrap();
+    };
+    batch(&mut db, &mut model, 0);
+    db.settle().unwrap();
+    let before = seg_names(&d);
+    assert!(!before.is_empty(), "the first batch sealed");
+
+    db.hold_seal_durable(true);
+    batch(&mut db, &mut model, 10_000);
+    db.seal().unwrap();
+    wait_for("the second seal's publish", || {
+        let (p, l0) = db.levels();
+        seg_names(&d).len() > before.len() && p + l0 > before.len()
+    });
+    let failed = ss_new_piece(&d, &before);
+    let logs = ss_logs(&d);
+    db.fail_next_seal_sync();
+    db.hold_seal_durable(false);
+    wait_for("the failed seal's end", || !db.in_flight().0);
+
+    // The next commit answers the seal's failure; the one after it takes
+    // the batch, durable in the log.
+    for k in 20_000..21_000 {
+        ss_put(&mut db, &mut model, &ss_key(k), &value);
+    }
+    let cause = "a test failed this seal's fsync";
+    match db.commit() {
+        Ok(()) => panic!("the commit after the seal's failure answered Ok"),
+        Err(e) => assert!(
+            e.to_string().contains(cause),
+            "the commit after the failure answers it: {e}"
+        ),
+    }
+    db.commit().unwrap();
+    // A seal of that batch is handed and lands nothing.
+    db.seal().unwrap();
+    let answers = [
+        ("a sync after the failure", db.sync()),
+        ("a flush after the failure", db.flush()),
+    ];
+    ss_check(&db, &model, "after the failure, before the close");
+    let wedged = db.seals_wedged();
+    drop(db);
+
+    ss_named_by_no_manifest(&d, &failed, "fsync");
+    let after = ss_logs(&d);
+    for l in &logs {
+        assert!(
+            after.contains(l),
+            "{l}, a log file holding the failed seal's writes, was retired: {after:?}"
+        );
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(d.join(&failed))
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    let db = Db::open(&d, opts).expect("the store opens after the power cut");
+    ss_check(&db, &model, "reopened after the power cut");
+    drop(db);
+    for (what, r) in answers {
+        ss_wedged(r, cause, what);
+    }
+    assert!(wedged, "the queue stopped");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Under a cipher a segment is made durable by its envelope, written by
+/// its seal (`vault::persist`), and a manifest writes the envelope of any
+/// segment it names that has none: a seal whose envelope failed after its
+/// readable landing would be made durable, and named, by the next
+/// manifest's own write. No manifest is written from the failure on, so
+/// none writes the envelope late.
+#[test]
+fn a_seal_whose_envelope_failed_under_a_cipher_is_made_durable_by_no_manifest() {
+    let d = dir("dur-ss-cipher");
+    let mut model = SsModel::new();
+    let (mut db, opts) = ss_store_with_a_merge_due(&d, under_cipher(), &mut model, |_| {});
+    assert_eq!(db.levels(), (1, 2));
+    let late_before = db.cipher_counts().unwrap().late;
+    db.hold_seal_durable(true);
+    ss_third(&mut db, &mut model);
+    db.seal().unwrap();
+    wait_for("the third piece's publish", || db.levels() == (1, 3));
+    wait_for("a merge held for the seal", || {
+        db.seal_waits().held_landings > 0
+    });
+    db.fail_next_seal_sync();
+    db.hold_seal_durable(false);
+    wait_for("the seal's end", || !db.in_flight().0);
+    assert!(!db.seal_sync_fault_pending(), "the case was reached");
+    wait_for("the merge's end", || !db.in_flight().1);
+    ss_check(&db, &model, "after the failure, before the close");
+    let late = db.cipher_counts().unwrap().late;
+    let answers = [
+        ("a sync after the failure", db.sync()),
+        ("a flush after the failure", db.flush()),
+    ];
+    let wedged = db.seals_wedged();
+    drop(db);
+    assert_eq!(
+        late, late_before,
+        "a manifest wrote the envelope of a segment whose seal failed to"
+    );
+    let db = Db::open(&d, opts).expect("the store opens");
+    ss_check(&db, &model, "reopened");
+    drop(db);
+    for (what, r) in answers {
+        ss_wedged(r, "a test failed this seal's fsync", what);
+    }
+    assert!(wedged, "the queue stopped");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The store's files copied from `from` to `to`, with every whole page of
+/// `[from_off, upto)` zeroed in each file whose inode is `ino`: what a power
+/// cut leaves of a file whose fdatasync of that range failed and which
+/// nothing wrote again. A file the copy cannot read (gone between the
+/// listing and the read) is skipped. Returns the files cut.
+fn ss_copy_with_lost_pages(from: &Path, to: &Path, ino: u64, from_off: u64, upto: u64) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    let _ = std::fs::remove_dir_all(to);
+    std::fs::create_dir_all(to).unwrap();
+    let mut hit = 0;
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let Ok(md) = std::fs::symlink_metadata(e.path()) else {
+            continue;
+        };
+        if !md.is_file() {
+            continue;
+        }
+        let Ok(mut bytes) = std::fs::read(e.path()) else {
+            continue;
+        };
+        if md.ino() == ino {
+            let lo = from_off.div_ceil(4096) * 4096;
+            let hi = (upto / 4096 * 4096).min(bytes.len() as u64);
+            if hi > lo {
+                bytes[lo as usize..hi as usize].fill(0);
+                hit += 1;
+            }
+        }
+        std::fs::write(to.join(e.file_name()), &bytes).unwrap();
+    }
+    hit
+}
+
+fn ss_val(k: u32) -> Vec<u8> {
+    format!("value-{k:06}-{}", "x".repeat(100)).into_bytes()
+}
+
+/// A run of 3000 keys under `EveryN(1_000_000)`, committed in batches the
+/// file takes a page at a time, then a flush whose presync of the run's
+/// records fails: the presync is the records' first sync. `inline` takes
+/// the arm that syncs on a thread of its own and joins it into the seal
+/// job (`Options::close_finish_inline`).
+///
+/// Off the inline arm the presync runs on the writer's thread after the
+/// seal job is handed, and the job's own fsync of the same description
+/// reports nothing: the landing that names the segment durable has to
+/// wait for the writer's word, and here the writer is held at its presync
+/// (`Reader::hold_presync`) until the seal thread has finished and any
+/// landing that did not wait would have written its slot. On the inline
+/// arm the job fails after its readable landing, which a hold makes come
+/// first (`hold_seal_durable`). Either way the flush answers the failure,
+/// every `sync` and `flush` after it answers it again, no slot names the
+/// run's segment, and a power cut that loses the pages the failed sync
+/// covered leaves a store that opens.
+fn ss_failed_presync(tag: &str, inline: bool) {
+    let d = dir(&format!("dur-ss-presync-{tag}"));
+    let opts = Options {
+        sync: SyncPolicy::EveryN(1_000_000),
+        close_finish_inline: inline,
+        segment: SegmentOptions {
+            // The run's records go to the file at each commit, a page at a
+            // time, so the presync has something on the file to cover.
+            write_piece: 4096,
+            ..Default::default()
+        },
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    for k in 0..3000u32 {
+        db.append(&ss_key(k), &ss_val(k));
+        if k % 300 == 299 {
+            db.commit().unwrap();
+        }
+    }
+    db.fail_next_presync();
+    let h = db.reader().unwrap();
+    if inline {
+        db.hold_seal_durable(true);
+    } else {
+        db.hold_presync(true);
+    }
+    let dd = d.clone();
+    let lifter = std::thread::spawn(move || {
+        let t = std::time::Instant::now();
+        while h.levels() == (0, 0) {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(20),
+                "the run's segment was never published"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if inline {
+            h.hold_seal_durable_from_handle(false);
+        } else {
+            // The seal thread's finish and fsyncs given their time, and a
+            // landing that did not wait for the writer meanwhile: a slot
+            // that names the segment ends the wait early.
+            let t = std::time::Instant::now();
+            while t.elapsed() < std::time::Duration::from_secs(2)
+                && ss_newest(&dd).is_none_or(|(_, _, n)| n.is_empty())
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            h.hold_presync(false);
+        }
+    });
+    match db.flush() {
+        Ok(()) => panic!("{tag}: the flush answered Ok over its records' failed sync"),
+        Err(e) => assert!(
+            e.to_string()
+                .contains("the records' sync failed (injected)"),
+            "{tag}: the flush answers the records' failed sync: {e}"
+        ),
+    }
+    lifter.join().unwrap();
+    let (ino, upto) = db
+        .failed_presync_extent()
+        .expect("the flush's close ran the injected presync");
+    assert!(
+        upto >= 16 * 4096,
+        "{tag}: premise: the run's records were on its file when the presync failed, {upto} bytes"
+    );
+    let answers = [("the flush after", db.flush()), ("a sync after", db.sync())];
+    for k in [0u32, 1499, 2999] {
+        assert_eq!(
+            read_vec(&db, &ss_key(k)),
+            vec![ss_val(k)],
+            "{tag}: reads go on"
+        );
+    }
+    let _ = db.settle();
+    drop(db);
+    let names = ss_names(&d);
+    assert!(
+        names.is_empty(),
+        "{tag}: a slot names the run's segment, whose records' sync failed: {names:?}"
+    );
+    let cut = d.with_extension("powercut");
+    // The run's records start after the head the finish patches
+    // (superblock and section header, 0..8192 under `write_piece` 4096);
+    // the pages from there to what the file held at the failure were
+    // covered by the failed sync and by nothing after it.
+    let hit = ss_copy_with_lost_pages(&d, &cut, ino, 8192, upto);
+    assert!(hit > 0, "{tag}: the run's file is in the store");
+    let db = Db::open(&cut, opts)
+        .unwrap_or_else(|e| panic!("{tag}: the store refused to open after a power cut: {e}"));
+    drop(db);
+    for (what, r) in answers {
+        ss_wedged(
+            r,
+            "the records' sync failed (injected)",
+            &format!("{tag}: {what}"),
+        );
+    }
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&cut);
+}
+
+#[test]
+fn a_flush_after_a_failed_presync_is_not_ok_over_the_lost_records() {
+    ss_failed_presync("writer", false);
+}
+
+#[test]
+fn a_flush_after_a_failed_inline_presync_is_not_ok_over_the_lost_records() {
+    ss_failed_presync("inline", true);
+}
+
+/// A direct run closed -- by `Db::seal`, or by a flush on either arm of
+/// its finish -- whose seal fails at the step that makes its segment
+/// durable, after its readable landing: under `Always` every commit of the
+/// run synced its records, so the reopen recovers them from the run's
+/// temp name, which nothing retires; and no later landing names the
+/// run's segment, whose trailer no fsync covered.
+fn ss_run_close_fails(tag: &str, by_flush: bool, inline: bool) {
+    let d = dir(&format!("dur-ss-runclose-{tag}"));
+    let crash = dir(&format!("dur-ss-runclose-{tag}-crash"));
+    let opts = Options {
+        close_finish_inline: inline,
+        ..Options::default()
+    };
+    let mut model = SsModel::new();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    for k in 0..3000u32 {
+        ss_put(&mut db, &mut model, &ss_key(k + 100_000), "r");
+        if k % 300 == 299 {
+            db.commit().unwrap();
+        }
+    }
+    let ino = run_ino(&d);
+    let synced = db.run_synced_bytes().expect("a run is open");
+    db.fail_next_seal_sync();
+    db.hold_seal_durable(true);
+    let cause = "a test failed this seal's fsync";
+    if by_flush {
+        let h = db.reader().unwrap();
+        let lifter = std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            while h.levels() == (0, 0) {
+                assert!(
+                    t.elapsed() < std::time::Duration::from_secs(20),
+                    "the run's segment was never published"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            h.hold_seal_durable_from_handle(false);
+        });
+        match db.flush() {
+            Ok(()) => panic!("{tag}: the flush answered Ok over its seal's failure"),
+            Err(e) => assert!(
+                e.to_string().contains(cause),
+                "{tag}: the flush answers its seal's failure: {e}"
+            ),
+        }
+        lifter.join().unwrap();
+    } else {
+        db.seal().unwrap();
+        wait_for("the run's segment published", || db.levels() != (0, 0));
+        db.hold_seal_durable(false);
+        wait_for("the failed seal's end", || !db.in_flight().0);
+    }
+    assert!(!db.seal_sync_fault_pending(), "{tag}: the case was reached");
+    // A write below the run's keys, through the log: the commit that takes
+    // the segment work's error answers it, the next one is acknowledged.
+    ss_put(&mut db, &mut model, &ss_key(7), "low");
+    if db.commit().is_err() {
+        db.commit().unwrap();
+    }
+    let answers = [("a flush after", db.flush()), ("a sync after", db.sync())];
+    ss_check(&db, &model, &format!("{tag}: after the failure"));
+    let wedged = db.seals_wedged();
+    drop(db);
+    let names = ss_names(&d);
+    assert!(
+        names.is_empty(),
+        "{tag}: a slot names a segment, the run's whose seal failed among them: {names:?}"
+    );
+    // The power cut: the run's file cut to what its commits' fdatasyncs
+    // covered, the trailer the failed seal wrote gone.
+    copy_store(&d, &crash);
+    use std::os::unix::fs::MetadataExt;
+    for e in std::fs::read_dir(&d).unwrap() {
+        let e = e.unwrap();
+        if e.metadata().map(|m| m.ino()).ok() == Some(ino) {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(crash.join(e.file_name()))
+                .unwrap()
+                .set_len(synced)
+                .unwrap();
+        }
+    }
+    let db = Db::open(&crash, opts)
+        .unwrap_or_else(|e| panic!("{tag}: the store refused to open after a power cut: {e}"));
+    ss_check(&db, &model, &format!("{tag}: reopened after a power cut"));
+    drop(db);
+    for (what, r) in answers {
+        ss_wedged(r, cause, &format!("{tag}: {what}"));
+    }
+    assert!(wedged, "{tag}: the queue stopped");
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+#[test]
+fn a_runs_close_whose_fsync_failed_is_named_by_no_manifest() {
+    ss_run_close_fails("seal", false, false);
+    ss_run_close_fails("flush", true, false);
+    ss_run_close_fails("flushinline", true, true);
+}
+
+/// Under `Options::manifest_pending` the slot naming a seal's segments
+/// pending is written at its readable landing, and the close writes a
+/// slot naming them durable. A seal whose fsync failed after its readable
+/// landing is not durable, and the pending slot is the only truth about
+/// it: the close (the drop, which `Db::close` also ends in) writes no slot
+/// naming it durable, since that slot's covered sequence skips the log
+/// frames that are the commits' only durable copy. With the segment work
+/// on its own thread the failure may be landed before the close or joined
+/// by it; `inline` runs the segment work on the writer's thread, where
+/// nothing lands it but the close's own join (`Maint::stop`).
+fn ss_pending_close(tag: &str, inline: bool) {
+    let d = dir(&format!("dur-ss-pending-close-{tag}"));
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        manifest_pending: true,
+        publish_in_background: !inline,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    // High to low, so the seal is the memtable's and the log holds them.
+    let mut model = SsModel::new();
+    for k in (0..3000u32).rev() {
+        ss_put(&mut db, &mut model, &ss_key(k), "v");
+    }
+    db.commit().unwrap();
+    // The seal held between its phases: its segments renamed into place
+    // and published, the pending slot naming them written, the fsync not
+    // paid. Inline, a commit is what lands the readable phase.
+    db.hold_seal_durable(true);
+    db.seal().unwrap();
+    wait_for("the piece's publish and its pending slot", || {
+        if inline {
+            db.commit().unwrap();
+        }
+        db.levels().1 == 1 && ss_newest(&d).is_some_and(|(_, _, n)| n.iter().any(|(_, p)| *p))
+    });
+    let names = ss_newest(&d).unwrap().2;
+    assert_eq!(
+        names.len(),
+        1,
+        "{tag}: the slot names the seal's piece: {names:?}"
+    );
+    let piece = names[0].0.clone();
+    // The fsync the hold keeps from starting fails once the drop lifts the
+    // hold, and the close writes its slot after.
+    db.fail_next_seal_sync();
+    drop(db);
+    let names = ss_newest(&d).unwrap().2;
+    assert!(
+        !names.iter().any(|(n, p)| n == &piece && !p),
+        "{tag}: the close named durable a segment whose fsync failed: {names:?}"
+    );
+    // The power cut: the segment's writeback failed, and its bytes on the
+    // device are whatever the failure left.
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(d.join(&piece))
+            .unwrap();
+        f.write_all_at(&[0u8; 4096], 8192).unwrap();
+    }
+    let db = Db::open(&d, opts)
+        .unwrap_or_else(|e| panic!("{tag}: the store refused its acknowledged commits: {e}"));
+    ss_check(&db, &model, &format!("{tag}: reopened after a power cut"));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_seal_whose_fsync_failed_is_not_named_durable_by_the_close() {
+    ss_pending_close("thread", false);
+    ss_pending_close("inline", true);
+}
+
+/// A run's fdatasync whose failure is kept (`Db::lost`), then a write the
+/// run cannot take: the run closes into a seal that refuses to finish the
+/// file and stops the queue. Nothing panics, every call that answers the
+/// caller says the device's error, reads go on, and a reopen after a kill
+/// reads every commit acknowledged before the failure.
+#[test]
+fn a_run_closed_after_its_kept_sync_failure_answers_the_device_and_reads_on() {
+    let d = dir("dur-ss-runlost");
+    let crash = dir("dur-ss-runlost-crash");
+    let opts = Options::default();
+    let mut model = SsModel::new();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    for k in 0..900u32 {
+        ss_put(&mut db, &mut model, &ss_key(k + 100_000), "r");
+        if k % 300 == 299 {
+            db.commit().unwrap();
+        }
+    }
+    db.fail_next_run_sync();
+    // The batch whose sync fails: visible from its commit on, as a run's
+    // batch is before its sync, and on the file a kill keeps.
+    for k in 900..1200u32 {
+        ss_put(&mut db, &mut model, &ss_key(k + 100_000), "r");
+    }
+    let device = "injected";
+    match db.commit() {
+        Ok(()) => panic!("the commit answered Ok over the run's failed fdatasync"),
+        Err(e) => assert!(e.to_string().contains(device), "the device's error: {e}"),
+    }
+    // Below the run's keys: the run closes.
+    db.append(&ss_key(7), b"low");
+    for (what, r) in [
+        ("a commit", db.commit()),
+        ("a sync", db.sync()),
+        ("a flush", db.flush()),
+        ("a seal", db.seal()),
+    ] {
+        match r {
+            Ok(()) => panic!("{what} after the run's failed fdatasync answered Ok"),
+            Err(e) => assert!(
+                e.to_string().contains(device),
+                "{what} answers with the device's error: {e}"
+            ),
+        }
+    }
+    // Through a handle, which reads what was committed: the writer's own
+    // reads see the write staged after the failure too.
+    let h = db.reader().unwrap();
+    ss_check(&h, &model, "after the failure");
+    drop(h);
+    copy_store(&d, &crash);
+    drop(db);
+    let db = Db::open(&crash, opts).expect("the store opens after a kill");
+    ss_check(&db, &model, "reopened after a kill");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// A run's close that cannot be made -- the seal queue stopped by a seal
+/// whose landing failed and the frozen tables full behind it, so the
+/// run's table has nowhere to go -- leaves the run open. A write the run
+/// cannot take is dropped and kept as the store's failure, so nothing
+/// after it is acknowledged; with `seal_first`, `Db::seal` answers the
+/// failure first and the run takes its next commit as before. Nothing
+/// panics, every call that answers says why, and reads go on.
+fn ss_no_room_for_the_run(tag: &str, seal_first: bool) {
+    let d = dir(&format!("dur-ss-noroom-{tag}"));
+    let crash = dir(&format!("dur-ss-noroom-{tag}-crash"));
+    let opts = Options {
+        seal_bytes: 64 << 20,
+        l0_trigger: 1000,
+        ..Options::default()
+    };
+    let mut model = SsModel::new();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    // A hashed table, whose seal's landing fails.
+    for k in (0..300u32).rev() {
+        ss_put(&mut db, &mut model, &ss_key(k), "h");
+    }
+    db.commit().unwrap();
+    db.fail_next_landing();
+    db.seal().unwrap();
+    wait_for("the failed landing", || db.seals_wedged());
+    let cause = "a test failed this landing";
+    // The frozen tables filled behind it: each seal is handed, lands
+    // nothing, and keeps its table frozen.
+    let mut first = true;
+    // The failed landing's table stays frozen: two more fill the list.
+    for t in 0..2u32 {
+        for k in (0..100u32).rev() {
+            ss_put(&mut db, &mut model, &ss_key(1000 * (t + 1) + k), "f");
+        }
+        if db.commit().is_err() {
+            assert!(
+                first,
+                "{tag}: only the first commit answers the segment work's error"
+            );
+            db.commit().unwrap();
+        }
+        first = false;
+        db.seal().unwrap();
+    }
+    // A run above every key, committed and acknowledged.
+    for k in 0..300u32 {
+        ss_put(&mut db, &mut model, &ss_key(100_000 + k), "r");
+    }
+    db.commit().unwrap();
+    assert!(db.run_synced_bytes().is_some(), "{tag}: a run is open");
+    if seal_first {
+        // Its close has nowhere to go: the seal answers, the run stays.
+        ss_wedged(db.seal(), cause, &format!("{tag}: a seal of the run"));
+        assert!(db.run_synced_bytes().is_some(), "{tag}: the run stays open");
+        for k in 300..600u32 {
+            ss_put(&mut db, &mut model, &ss_key(100_000 + k), "r");
+        }
+        db.commit().unwrap();
+    }
+    // A write the run cannot take: dropped, and the failure kept.
+    db.append(&ss_key(7), b"low");
+    for (what, r) in [
+        ("a commit", db.commit()),
+        ("a sync", db.sync()),
+        ("a flush", db.flush()),
+    ] {
+        match r {
+            Ok(()) => panic!("{tag}: {what} after a write the store dropped answered Ok"),
+            Err(e) => assert!(
+                e.to_string().contains(cause),
+                "{tag}: {what} answers with the failure: {e}"
+            ),
+        }
+    }
+    db.append(&ss_key(100_000 + 600), b"r");
+    assert!(
+        db.commit().is_err(),
+        "{tag}: nothing after the dropped write is acknowledged"
+    );
+    // Through a handle, which reads what was committed: the writer's own
+    // reads see the write staged after the failure too.
+    let h = db.reader().unwrap();
+    ss_check(&h, &model, &format!("{tag}: after the failure"));
+    drop(h);
+    copy_store(&d, &crash);
+    drop(db);
+    let db = Db::open(&crash, opts).expect("the store opens after a kill");
+    ss_check(&db, &model, &format!("{tag}: reopened after a kill"));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+#[test]
+fn a_write_that_ends_a_run_whose_close_cannot_be_made_is_answered_and_panics_nothing() {
+    ss_no_room_for_the_run("write", false);
+}
+
+#[test]
+fn a_seal_of_a_run_whose_close_cannot_be_made_leaves_the_run_open() {
+    ss_no_room_for_the_run("seal", true);
 }
