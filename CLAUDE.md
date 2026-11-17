@@ -33,7 +33,7 @@ of the change that produced the text.
 | `src/db.rs` | the engine: WAL with atomic batches, memtable, sealed segments, partitioned compaction, tombstones, `Txn`, and the `SegmentWriter` every segment is written by -- `docs/engine.md` |
 | `src/db/zpages.rs` | the compact form's layout: the page, the directory of the groups it holds, the group, the fill that cuts records into groups and packs them into pages, the fence, the trailer and the identity a form file is bound by, with no file, thread or clock in it -- the module's own docs, and `bench/examples/zsize.rs` for what it makes of the engine's bytes |
 | `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`); and the stride form, an experiment (`Options::zpages_stride`, off), a partition's values alone at their stride where its keys are one run of numbers -- the module's own docs, and `docs/engine.md` for where it wins and where it does not fit |
-| `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, and the replays that hold it -- the module's own docs |
+| `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, the replays that hold it, and the model of a cache's faults over populations of pages (`model_populations`) -- the module's own docs |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
 | `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index -- `docs/index-theory.md` |
 | `src/bytes.rs`, `src/blob.rs` | the read path over any byte source; compiles for wasm |
@@ -5244,6 +5244,33 @@ cell allows is a ceiling for that cell and says nothing of its
 neighbours; and an arm made of a sibling's policy inherits what the
 sibling pins, so the options a pairing's question rests on are read off
 the arm before its cells are.
+
+**A fit read off a file's size, and an estimator built before the counts
+at hand were held to the answer.** The stride form was written off under
+1 GiB as a form that does not fit, its gigabyte against a fill share of
+the budget, and paired form against form in the row's order
+(`docs/engine.md`, which form a workload calls for) it read C at four
+times the block form there and the scans at twice, with no fault until
+the write mixes had grown the process. Its faults were the same to three
+figures in both orders, and a model of the page cache with one unknown,
+the bytes the pass left to the form, solved to a capacity that rose 75 MB
+through the read passes and fell a hundred through the mixes, every kind
+of pass in a stretch agreeing on it (`bench/examples/formfit.rs`). So a
+form fits or does not by the pass, a line drawn at a share of a budget is
+crossed both ways inside one row, and the store that reads fastest at
+such a bound is in two forms, as much of the fast one as fits. The
+estimator went the way the form had: a sketch of reuse distances that
+every form would read at its own bytes a key was built first, read the
+forms 8% to 50% off because a granule of ranks is no form's page, and was
+taken out for two things already there, a miniature of the cache itself
+and Che's approximation over the reads the store counts a partition
+(`zselect::model_populations`), neither of which put a store that faults
+on the side of one that fits in any line of the probe. The rules: a fit is
+priced as faults an operation in the pass that would take them, never as
+a size against a share; a model of faults is held to the measured ones by
+solving for the capacity pass by pass and asking whether it moves like one
+quantity; and before an estimator is built, what the store's existing
+counts already predict is held to the exact answer first.
 
 ## Standing limitations
 

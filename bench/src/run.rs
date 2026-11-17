@@ -395,6 +395,14 @@ const YCSBS_SEED_SALT: u64 = 0x5300;
 const YCSB_BATCH: usize = 100;
 const YCSB_SCAN: usize = 50;
 
+/// The seeds the read and scan passes draw their keys with, named once
+/// since `replay_row` draws the same keys for a model of a store.
+const READ_SEED: u64 = 7;
+const SCAN_SEED: u64 = 11;
+const READ_THREADED_SEED: u64 = 0x7EAD;
+const SCAN_THREADED_SEED: u64 = 0x5CA0;
+const SCAN_MIXED_SEED: u64 = 0x5CA1;
+
 /// A workload's operation count at a rung: a sixth of the keys, so the six
 /// mixes together cost about one read pass. At a third, `quick` took twice
 /// the two minutes it is meant to take.
@@ -2380,7 +2388,7 @@ fn read_phase(
     counting: &mut Counting<'_>,
 ) -> Result<f64, String> {
     let mut kb = [0u8; KEY_SIZE];
-    let mut g = KeyGen::new(KeyDist::Uniform, size, 7);
+    let mut g = KeyGen::new(KeyDist::Uniform, size, READ_SEED);
     let c0 = counting.begin();
     phase_mark(arm, "read", "start");
     let t = Instant::now();
@@ -2745,7 +2753,7 @@ fn one_pass(
             threads,
             ops,
             size,
-            0x7EAD,
+            READ_THREADED_SEED,
             Op::Get,
             c0.is_some(),
         )?;
@@ -2763,7 +2771,7 @@ fn one_pass(
 
     let scans = plan.divided((size / plan.scan_len as u64).max(1));
     let scan_keys = size.saturating_sub(plan.scan_len as u64).max(1);
-    let mut g2 = KeyGen::new(KeyDist::Uniform, scan_keys, 11);
+    let mut g2 = KeyGen::new(KeyDist::Uniform, scan_keys, SCAN_SEED);
     // With `SUPDB_SCAN_OPS` set, every scan of the pass is timed on its
     // own, for every arm, and the pass line names its first scans beside
     // the rest: a pass of a hundred scans at the smallest rung is a few
@@ -2832,7 +2840,7 @@ fn one_pass(
             threads,
             ops,
             scan_keys,
-            0x5CA0,
+            SCAN_THREADED_SEED,
             Op::Range(plan.scan_len),
             c0.is_some(),
         )?;
@@ -2887,7 +2895,7 @@ fn one_pass(
             threads,
             ops,
             scan_keys,
-            0x5CA1,
+            SCAN_MIXED_SEED,
             Op::Range(plan.scan_len),
             c0.is_some(),
         )?;
@@ -4067,6 +4075,13 @@ fn share(ops: u64, threads: usize, i: usize) -> u64 {
     ops / threads as u64 + u64::from((i as u64) < ops % threads as u64)
 }
 
+/// Thread `i`'s seed under a pass's base seed. Distinct per thread and
+/// deterministic: one multiplicative mix of the base and the thread's
+/// index, so the streams do not start a few steps apart.
+fn thread_seed(seed: u64, i: usize) -> u64 {
+    (seed + i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
 /// `ops` operations of `op`, keys drawn uniformly below `keys`, split
 /// across `threads` threads, each through a reader of its own -- made on
 /// this thread, opened on its own -- and a generator seeded apart from
@@ -4130,10 +4145,7 @@ fn threaded(
             .map(|(i, open)| {
                 let barrier = &barrier;
                 let share = share(ops, threads, i);
-                // Distinct per thread and deterministic: one multiplicative
-                // mix of the base and the thread's index, so the streams
-                // do not start a few steps apart.
-                let seed = (seed + i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let seed = thread_seed(seed, i);
                 s.spawn(move || -> Timed {
                     // Every thread reaches the barrier whatever opening
                     // did: one that returned before it would leave the
@@ -4529,6 +4541,129 @@ fn flush_ycsb(b: &mut Batch, e: &mut dyn Engine, insert: bool) -> Result<(), Str
     } else {
         b.flush_updates(e)
     }
+}
+
+/// A pass's reads, scans and mixes in the pass's order, over an engine that
+/// models a store and holds none (`bench/examples/formfit.rs`): the read
+/// pass, the threaded reads, the scan pass, the threaded scans, the first
+/// family, the threaded scans again and the second family, each from the
+/// generator and the seed the pass itself draws with and the mixes through
+/// `ycsb` itself, so a model is driven by the suite's own definition of a
+/// workload and not by a copy of it. `phase` is called after each with the
+/// name the row gives it and its operation count.
+///
+/// The threaded passes go to `e` one operation a thread a turn, which is a
+/// model of a schedule: the real threads interleave as the host runs them.
+/// Nothing is timed and nothing loaded; the engine is taken to hold `size`
+/// keys already.
+pub fn replay_row<E: Engine>(
+    e: &mut E,
+    size: u64,
+    plan: &Plan,
+    mut phase: impl FnMut(&mut E, &str, u64),
+) -> Result<(), String> {
+    fn turns(
+        e: &mut dyn Engine,
+        threads: usize,
+        ops: u64,
+        keys: u64,
+        seed: u64,
+        scan: Option<usize>,
+    ) -> Result<(), String> {
+        let mut gens: Vec<(KeyGen, u64)> = (0..threads)
+            .map(|i| {
+                (
+                    KeyGen::new(KeyDist::Uniform, keys, thread_seed(seed, i)),
+                    share(ops, threads, i),
+                )
+            })
+            .collect();
+        let mut kb = [0u8; KEY_SIZE];
+        let mut left = ops;
+        while left > 0 {
+            for (g, mine) in &mut gens {
+                if *mine == 0 {
+                    continue;
+                }
+                *mine -= 1;
+                left -= 1;
+                db_key_into(g.next(), &mut kb);
+                match scan {
+                    None => e.get(&kb)?,
+                    Some(n) => e.range(&kb, n)?,
+                };
+            }
+        }
+        Ok(())
+    }
+    let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
+    let mut kb = [0u8; KEY_SIZE];
+
+    let reads = plan.divided(size);
+    let mut g = KeyGen::new(KeyDist::Uniform, size, READ_SEED);
+    for _ in 0..reads {
+        db_key_into(g.next(), &mut kb);
+        e.get(&kb)?;
+    }
+    phase(e, "read", reads);
+    for &threads in &plan.threads {
+        let ops = reads * threads as u64;
+        turns(e, threads, ops, size, READ_THREADED_SEED, None)?;
+        phase(e, &format!("read_{threads}t"), ops);
+    }
+
+    let scans = plan.divided((size / plan.scan_len as u64).max(1));
+    let scan_keys = size.saturating_sub(plan.scan_len as u64).max(1);
+    let mut g2 = KeyGen::new(KeyDist::Uniform, scan_keys, SCAN_SEED);
+    for _ in 0..scans {
+        db_key_into(g2.next(), &mut kb);
+        e.range(&kb, plan.scan_len)?;
+    }
+    phase(e, "scan", scans);
+    let threaded_scan = |e: &mut E,
+                         name: &str,
+                         seed: u64,
+                         phase: &mut dyn FnMut(&mut E, &str, u64)|
+     -> Result<(), String> {
+        for &threads in &plan.threads {
+            let ops = plan.divided(size) * threads as u64;
+            turns(e, threads, ops, scan_keys, seed, Some(plan.scan_len))?;
+            phase(e, &format!("{name}_{threads}t"), ops);
+        }
+        Ok(())
+    };
+    threaded_scan(e, "scan", SCAN_THREADED_SEED, &mut phase)?;
+
+    let mut inserted = 0u64;
+    let mix_ops = plan.divided(ycsb_ops(size));
+    let mut family = |e: &mut E,
+                      prefix: &str,
+                      table: &[(char, u32, u32, u32, u32, u32, KeyDist); 6],
+                      salt: u64,
+                      phase: &mut dyn FnMut(&mut E, &str, u64)|
+     -> Result<(), String> {
+        for letter in YCSB_ORDER {
+            let w = table.iter().find(|w| w.0 == letter).unwrap();
+            let mix = format!("{prefix}-{letter}");
+            ycsb(
+                e,
+                "replay",
+                &mix,
+                w,
+                salt,
+                size,
+                mix_ops,
+                &mut inserted,
+                &payload,
+            )?;
+            phase(e, &mix, mix_ops);
+        }
+        Ok(())
+    };
+    family(e, "ycsb", &YCSB, 0, &mut phase)?;
+    threaded_scan(e, "scan-mixed", SCAN_MIXED_SEED, &mut phase)?;
+    family(e, "ycsbs", &YCSBS, YCSBS_SEED_SALT, &mut phase)?;
+    Ok(())
 }
 
 /// Load `size` keys through `order`, batched, ending with one `sync` so a

@@ -175,7 +175,10 @@
 //!   the form is served as it stands.
 //!
 //! The model's arithmetic (S1) is here too, as pure functions of byte counts:
-//! [`model_raw`], [`model_z`] and [`ski_rental_price`].
+//! [`model_raw`], [`model_z`] and [`ski_rental_price`]. [`model_populations`]
+//! is the first of them over any populations of pages, each read at its own
+//! rate, which is what a choice of form a partition would be priced by; the
+//! selector reads it for the raw form's two regions and nothing else yet.
 
 use std::time::Duration;
 
@@ -353,41 +356,51 @@ pub const PRIOR_T_Z_SCAN: f64 = 11.3e-6;
 
 // ---- S1's arithmetic ----------------------------------------------------
 
-/// The raw form's faults a point read, by Che's approximation to LRU over the
-/// two populations a read touches uniformly: one page of the hash region and
-/// one page of the record region.
+/// A population of pages read uniformly: its bytes, and the touches a page
+/// of it takes in whatever unit the caller counts in -- one a read for a
+/// region every read touches a page of, a partition's reads in a window for
+/// that partition's part of a form.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Population {
+    pub bytes: u64,
+    pub touches: f64,
+}
+
+/// The faults of a cache of `budget` bytes over populations each read
+/// uniformly at its own rate, by Che's approximation to LRU, in the unit the
+/// touches are counted in.
 ///
-/// `T` solves `n_h (1 - e^(-T/n_h)) + n_r (1 - e^(-T/n_r)) = B / 4096` for
-/// `n_h = hash / 4096` and `n_r = records / 4096`, and the rate is
-/// `e^(-T/n_h) + e^(-T/n_r)`. It is 0 while both fit, and it exceeds 1 once
-/// the hash stops fitting: a model with one population saturates at one fault
-/// a read, and a store far past its cache would then look as if the compact
-/// form saved nothing, when the raw form is taking two faults a read.
-pub fn model_raw(budget: u64, hash: u64, records: u64) -> f64 {
+/// `T` solves `sum n_i (1 - e^(-r_i T / n_i)) = B / 4096` for `n_i` the
+/// population's pages and `r_i` its touches, and the faults are
+/// `sum r_i e^(-r_i T / n_i)`: a page is in the cache while it was touched
+/// within `T`, the time in which the touched pages fill it. It is 0 while
+/// the populations that are touched at all fit, and a population nobody
+/// touches takes no room. What it does not see is skew inside a population,
+/// which it reads as uniform and so over-counts, and what the cache held
+/// before the rates were what they are: it is the steady state's rate
+/// (`bench/examples/formfit.rs` holds it to an exact cache over the suite's
+/// passes).
+pub fn model_populations(budget: u64, pops: &[Population]) -> f64 {
     let page = PAGE as f64;
-    let (c, nh, nr) = (
-        budget as f64 / page,
-        hash as f64 / page,
-        records as f64 / page,
-    );
-    if nh + nr <= c {
+    let c = budget as f64 / page;
+    let live = || {
+        pops.iter()
+            .filter(|p| p.bytes > 0 && p.touches > 0.0)
+            .map(|p| (p.bytes as f64 / page, p.touches))
+    };
+    if live().map(|p| p.0).sum::<f64>() <= c {
         return 0.0;
     }
-    let populations = f64::from(u8::from(nh > 0.0)) + f64::from(u8::from(nr > 0.0));
+    let all: f64 = live().map(|p| p.1).sum();
     if c <= 0.0 {
-        return populations;
+        return all;
     }
     let filled = |t: f64| {
-        let part = |n: f64| {
-            if n > 0.0 {
-                n * (1.0 - (-t / n).exp())
-            } else {
-                0.0
-            }
-        };
-        part(nh) + part(nr)
+        live()
+            .map(|(n, r)| n * (1.0 - (-r * t / n).exp()))
+            .sum::<f64>()
     };
-    // The bracket: `filled` rises from 0 to nh + nr, which is over `c`.
+    // The bracket: `filled` rises from 0 to the live pages, which are over `c`.
     let (mut lo, mut hi) = (0.0f64, c.max(1.0));
     for _ in 0..200 {
         if filled(hi) >= c {
@@ -405,8 +418,26 @@ pub fn model_raw(budget: u64, hash: u64, records: u64) -> f64 {
         }
     }
     let t = 0.5 * (lo + hi);
-    let miss = |n: f64| if n > 0.0 { (-t / n).exp() } else { 0.0 };
-    (miss(nh) + miss(nr)).clamp(0.0, populations)
+    live()
+        .map(|(n, r)| r * (-r * t / n).exp())
+        .sum::<f64>()
+        .clamp(0.0, all)
+}
+
+/// The raw form's faults a point read: [`model_populations`] over the two
+/// populations a read touches a page of uniformly, the hash region and the
+/// record region.
+///
+/// It is 0 while both fit, and it exceeds 1 once the hash stops fitting: a
+/// model with one population saturates at one fault a read, and a store far
+/// past its cache would then look as if the compact form saved nothing, when
+/// the raw form is taking two faults a read.
+pub fn model_raw(budget: u64, hash: u64, records: u64) -> f64 {
+    let region = |bytes| Population {
+        bytes,
+        touches: 1.0,
+    };
+    model_populations(budget, &[region(hash), region(records)])
 }
 
 /// The compact form's faults a point read: one population read uniformly,
@@ -3473,6 +3504,50 @@ mod tests {
         assert_eq!(model_z(0, 0, 0), 0.0);
         assert_eq!(model_z(10, 20, 100), 1.0);
         assert_eq!(model_z(u64::MAX, 0, 1 << 30), 0.0);
+    }
+
+    /// The model over any populations: one population is the compact form's
+    /// line, the faults are the cold population's where a hot one shares the
+    /// cache, a population nobody reads takes no room, and the faults are in
+    /// the unit the touches are counted in.
+    #[test]
+    fn the_model_over_populations_charges_the_cold_one() {
+        let pop = |bytes, touches| Population { bytes, touches };
+        let gb = 1u64 << 30;
+        // One population read uniformly misses on the share that is out.
+        for cache in [gb / 4, gb / 2, gb * 3 / 4] {
+            let one = model_populations(cache, &[pop(gb, 1.0)]);
+            assert!((one - model_z(cache, 0, gb)).abs() < 1e-9, "{cache}: {one}");
+        }
+        // A tenth of the pages taking nine tenths of the touches, in a cache
+        // of half the pages: the hot tenth stays, and the misses are the cold
+        // population's, under its share of the touches and far under the
+        // half a uniform read of the same pages would miss on.
+        let (hot, cold) = (pop(gb / 10, 0.9), pop(gb * 9 / 10, 0.1));
+        let skewed = model_populations(gb / 2, &[hot, cold]);
+        let hot_alone = model_populations(gb / 2, &[hot]);
+        assert_eq!(hot_alone, 0.0, "the hot population alone fits");
+        assert!(skewed > 0.04 && skewed < 0.1, "{skewed}");
+        assert!(skewed < 0.2 * model_populations(gb / 2, &[pop(gb, 1.0)]));
+        // The order the populations come in is nothing.
+        assert!((skewed - model_populations(gb / 2, &[cold, hot])).abs() < 1e-12);
+        // A population nobody reads is not in the cache: the one that is
+        // read fits beside it, whatever its size.
+        assert_eq!(
+            model_populations(gb / 2, &[pop(gb / 4, 1.0), pop(8 * gb, 0.0)]),
+            0.0
+        );
+        // Touches a second or touches a window: the faults scale with them.
+        let per_s = model_populations(gb / 2, &[pop(gb / 10, 900.0), pop(gb * 9 / 10, 100.0)]);
+        assert!((per_s - 1000.0 * skewed).abs() < 1e-6 * per_s, "{per_s}");
+        // Nothing fits in no cache, and nothing misses with nothing read.
+        assert!((model_populations(0, &[hot, cold]) - 1.0).abs() < 1e-12);
+        assert_eq!(model_populations(gb, &[]), 0.0);
+        // The raw form's model is this one over its two regions.
+        assert_eq!(
+            model_raw(gb / 2, gb / 10, gb),
+            model_populations(gb / 2, &[pop(gb / 10, 1.0), pop(gb, 1.0)])
+        );
     }
 
     #[test]
