@@ -2113,30 +2113,7 @@ two slot files written in place and fdatasynced, the newest valid slot by
 its publish sequence being the store at open, so a torn publish is the
 slot an open ignores (`Options::manifest_slots`; the shape before it wrote
 a temp name, renamed it over the old manifest and fsynced the directory,
-`supdb-ingestmanifestrename`). A seal that fails at any step -- its
-landing, its directory's fsync there, the fsync or the envelope of its
-data before its readable landing or after it, a closing run's presync --
-stops the seal queue for the life of the open (`Shared::seal_wedged`): no
-seal lands and the segment work writes no manifest from its first look
-at the queue after the failure, the writer's presync's included
-(`Maint::seals_stopped`), so nothing names its segments durable, covers
-its sequence or retires the log that holds its writes, and the fsync is
-never tried again; readers go on reading what was published, every
-`flush` and `settle` answers the failure until the store is reopened,
-and so does every call that has to land a seal for room -- with the
-segment work inline every `seal` and every commit at the threshold, the
-commit's batch in the log first -- a `sync` answers nothing of it since
-what it promises is in the log, until a write is dropped for want of
-room behind the stopped queue -- a write that ends an ordered run, or the
-first write after a `sync` handed the live table to a seal, each of
-which freezes a table -- and from that write on every commit, `sync` and
-`flush` answers it; and the open replays the log and sweeps what no slot
-names.
-Under `manifest_pending` the slot the seal's readable landing wrote
-before the failure stays, naming the segments pending and covering their
-sequence, and the open's rule for a pending name is what reads it. A
-run's close whose records the writer presyncs lands durable only at the
-writer's own ask, after the presync (`SealJob::awaits_writer`). A flush's drain is answered once its
+`supdb-ingestmanifestrename`). A flush's drain is answered once its
 seal's fsyncs are done and the slot is written, and the slot's fdatasync
 follows on the segment work's thread with the WAL's and temp names'
 retirement behind it (`Options::flush_waits_manifest` is the shape that
@@ -3162,14 +3139,7 @@ as its siblings that count what a commit filed already did. The rule is the
 one above, applied to two more states a test cannot see it needs: the
 second a store was finished in, and which side of a hand-off a counter is
 read from. A flake whose trigger is a phase is reproduced by choosing the
-phase, not by repeating the run. It came again as two signals of one
-failure: the segment work stops the seal queue and then, its look done,
-leaves the failure for the writer's next commit, and tests that waited for
-the stop's flag (or for the seal counted out) and then committed a batch
-read the commit's answer as the failure's -- in about one run of three
-of a mutant pass once the stop moved ahead of the count. A test that
-waits on one signal and reads another waits for the one it reads: here a
-commit with nothing staged, until one answers.
+phase, not by repeating the run.
 
 **A mark taken whole and then read in part.** A commit publishes the
 log's length, the entry count and the watermark as one mark, and a
@@ -3545,98 +3515,6 @@ check of the path made before. The corollary: a kept error
 is checked at every path that would sync the same bytes again, the
 background ones included, and not only at the calls that answer the
 caller.
-It came back a fourth time at the presync itself, whose error the flush
-answered: the presync runs on the writer's thread after the seal job is
-handed, the job's fsync of the same description reports nothing of what
-the presync met, and the segment work landed the job durable whenever its
-thread returned -- before the writer had its answer, by timing, so the
-manifest named the segment and the next flush answered `Ok`. A failed
-presync stops the seal queue now, and a job whose records the writer
-syncs lands durable only at the writer's own ask, which follows the
-presync (`SealJob::awaits_writer`): a flag the segment work reads where
-it already asks whether the job has returned, and no wait anyone made
-before. The corollary: an error answered to the caller is not therefore
-seen by the thread that acts on the same bytes; whoever names the bytes
-durable is ordered after whoever learns they are not.
-
-**A failure after the publish, left for the next publish to name.** A
-seal lands in two phases, its segments published for readers at the
-first and named by a manifest only once its thread has returned with
-their fsyncs paid, and a seal that failed before its readable landing
-stopped the queue for the life of the open. One that failed after it --
-at its data's fsync, its envelope under a cipher, its directory's fsync
-at the landing itself, a run's presync joined into the job -- did not,
-by design: its comment said the segments "stay live with their sequence
-covered, so the next landing's manifest names them". The next landing
-was a merge's, a later seal's or the pending arm's close, and its slot
-named durable a segment no fsync had covered and covered the sequence of
-the log that held its writes, which the open then skipped: a power cut
-left a store that refused to open over acknowledged writes the log still
-had. Every test of the failure path failed the landing, never the fsync
-after it. The queue stops for every failure now and the fsync is never
-tried again (`Shared::wedge`), and a stopped queue is held as the window
-between a seal's phases is held, for good (`Maint::seal_between_phases`):
-a merge's, a tier's and a promotion's landing wait in that window
-already, the writer's asks end at `join_seal`, a seal's own landings --
-`publish_unsynced` and the pending slot -- are not reached once no seal
-lands, the close asks the queue before it publishes, and `Maint::publish`
-asserts the window shut. The first repair put a refusal in
-`Maint::publish` itself, a load beside every manifest's write, and a
-load in every `sync`; the window was a check every manifest path made
-already, and a `sync` promises nothing of a seal's writes. Every `flush`
-answers the failure. The window was then held for a stop the segment
-work raised itself, and a stop the writer raised -- its run's presync,
-failed after the job was handed -- was held only by the job waiting at
-the front, landed, for the writer's word: a presync that failed before
-the job's readable landing left it unlanded for good, and a merge in
-flight landed its slot after the store had answered the failure, naming
-nothing of the job but writing the manifest the docs said nobody would.
-The review read it off the docs; a test with the job held before its
-finish and a merge at its landing hold made it. The segment work takes
-the stop into its own hold where it already loads the flag, at its look
-at the queue, which every path of it to a manifest makes first. The
-rule: a failure that leaves a thing published
-and not durable is a state, not an error to report and pass: it is held
-where the paths that would make the thing durable already wait for it
-to be durable, and a path that bypasses that wait is the bug; and a test
-of a failure path fails every step of it, the ones after the publish
-above all, since those are the steps a publish has already made look
-done; and a stop either side can raise is held by the flag both sides
-read, never by the shape of whatever job happened to be at the front
-when one of them raised it.
-
-**A refusal that came after the take.** A direct run's close took the
-run from the writer and then waited for room in the frozen list, and a
-refusal there -- the seal queue stopped, the list full behind it --
-dropped the run's writer with its ordered table still live, so the write
-that ended the run went on into the ordered table and panicked in its
-order check, and a `Db::seal` of the run left a table no run backed. The
-close waits for room before it takes anything now, so a refusal leaves
-the run open and its table live; and the write a run cannot take, which
-cannot fail, is dropped only with the refusal kept (`Db::lost`), since a
-write dropped beside a later commit answered `Ok` would break the order
-the commits promise. The first version of the drop took any error the
-wait met with the list full for a refusal, and a merge's error the
-segment work had left for the next commit is one the wait meets while
-the list is full behind seals that will land: backpressure read as a
-stopped queue, a write dropped and the store answering every call
-until it was reopened. The write is dropped only where room will not
-come -- the queue stopped -- and otherwise the error is the next
-commit's and the wait goes on. A second arm, no seal left in flight to
-land, was in the condition for a while and no test could reach it once a
-failed seal stopped the queue before it was counted out, since a frozen
-table is always a seal in flight or a stopped queue's; it was taken out. The write after a
-`sync` handed the live table to a seal had the same shape from before:
-the table's replacement failed, the write was dropped and the next commit
-answered it once, and the commits after that answered `Ok` over it; it is
-dropped and kept on the same terms now (`Db::writes_go`), and behind a
-stopped queue the handed table is frozen where there is room, since
-nothing lands to retire it either way. The rule: a step that
-can be refused is asked before anything it would consume is taken, so a
-refusal leaves the state as it found it; a call that cannot fail and
-cannot be done is dropped only where nothing after it is acknowledged;
-and "cannot be done" is read off the state that makes it so, never off
-an error that the state merely happened to be beside.
 
 **A failure that left the buffer it failed on for the next call to
 build on.** The log's write staged a commit's frames, wrote them, and
