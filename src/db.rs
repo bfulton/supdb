@@ -12306,13 +12306,90 @@ const MANIFEST_MAGIC_V1: &[u8; 9] = b"SUPDBMAN\x01";
 /// named at its seal's readable landing and may not be durable yet
 /// (`Options::manifest_pending`).
 const MANIFEST_PENDING: u8 = 1;
-/// The two slot files a publish alternates between.
+/// The two slot files a publish writes in place. Which one a publish
+/// writes is chosen by durability, not by its sequence: never the slot
+/// holding the newest manifest known durable -- the last whose fdatasync
+/// returned -- so that slot stands whole on the device under any write in
+/// flight, and a slot written and not yet synced is written over again by
+/// the next publish rather than left as the only newer one (`Maint::slot`).
 const MANIFEST_SLOTS: [&str; 2] = ["manifest", "manifest.alt"];
 
-/// The slot a publish of sequence `seq` writes.
-fn manifest_slot(seq: u64) -> &'static str {
-    MANIFEST_SLOTS[(seq % 2) as usize]
+/// Which manifest slot a publish writes: never the one holding the newest
+/// manifest known durable, so that one stands whole under the write. A
+/// slot is known durable when an fdatasync covering its last write has
+/// returned -- never when the write or the sync is issued -- and from then
+/// the other slot is the one written. So two publishes with no sync
+/// between them write the same slot, the second over the first, which
+/// never was the store's only manifest on the device.
+#[derive(Clone, Copy, Debug)]
+struct SlotChoice {
+    /// The slot holding the newest manifest whose fdatasync returned.
+    durable: usize,
+    /// Per slot, the sequence its last returned fdatasync covered, zero for
+    /// none: what an open made durable, the seed of a test's record of
+    /// it (`Shared::slot_synced`).
+    synced: [u64; 2],
 }
+
+impl SlotChoice {
+    /// None known durable: the first publish writes the first slot.
+    const NONE: SlotChoice = SlotChoice {
+        durable: 1,
+        synced: [0, 0],
+    };
+
+    /// The slot the next publish writes.
+    fn next(&self) -> usize {
+        1 - self.durable
+    }
+
+    /// An fdatasync covering `slot`'s write of `seq` has returned.
+    fn landed(&mut self, slot: usize, seq: u64) {
+        self.durable = slot;
+        self.synced[slot] = seq;
+    }
+
+    /// The open's publish of `seq`, by the shape the options name, into
+    /// the next slot, which is the durable one once the write has
+    /// returned, its fsync with it.
+    fn write_shape(
+        &mut self,
+        dir: &Path,
+        opts: &Options,
+        seq: u64,
+        covered_seq: u64,
+        names: &[String],
+    ) -> Result<()> {
+        let slot = self.next();
+        manifest_write_shape(dir, opts, slot, seq, covered_seq, names)?;
+        if opts.manifest_slots {
+            self.landed(slot, seq);
+        }
+        Ok(())
+    }
+}
+
+/// A test's view of one manifest slot write the segment work is about to
+/// make (`Db::watch_slot_writes`).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct SlotWrite {
+    /// The publish sequence being written.
+    pub seq: u64,
+    /// The slot file it goes to: an index into `["manifest", "manifest.alt"]`.
+    pub slot: usize,
+    /// Written without its fdatasync, the sync owed: a drain's
+    /// (`publish_unsynced`), or a pending slot the sync helper syncs.
+    pub deferred: bool,
+    /// Per slot file, the sequence whose write the last fdatasync of that
+    /// file this process saw return covered -- the open's included -- since
+    /// the watch was set; zero for none.
+    pub synced: [u64; 2],
+}
+
+/// A test's: run on the segment work's thread before each slot write.
+#[doc(hidden)]
+pub type SlotWatch = std::sync::Arc<dyn Fn(&SlotWrite) + Send + Sync>;
 
 /// The spare names a manifest publish leaves for the sweep
 /// (`Options::manifest_spare`), each unique, so two publishes close
@@ -12409,12 +12486,13 @@ fn manifest_open(dir: &Path, buf: &[u8]) -> Result<Manifest> {
 /// old one's tail behind it, past the length the header names.
 fn manifest_write_slot(
     dir: &Path,
+    slot: usize,
     seq: u64,
     covered_seq: u64,
     names: &[String],
     pending: &[String],
 ) -> Result<()> {
-    manifest_write_slot_unsynced(dir, seq, covered_seq, names, pending)?.sync_data()?;
+    manifest_write_slot_unsynced(dir, slot, seq, covered_seq, names, pending)?.sync_data()?;
     Ok(())
 }
 
@@ -12423,6 +12501,7 @@ fn manifest_write_slot(
 /// thread beside the seal's fsync (`Maint::land_readable`).
 fn manifest_write_slot_unsynced(
     dir: &Path,
+    slot: usize,
     seq: u64,
     covered_seq: u64,
     names: &[String],
@@ -12430,7 +12509,7 @@ fn manifest_write_slot_unsynced(
 ) -> Result<File> {
     use std::os::unix::fs::FileExt;
     let out = manifest_image(dir, seq, covered_seq, names, pending)?;
-    let f = vault::open_slot(dir.join(manifest_slot(seq)))?;
+    let f = vault::open_slot(dir.join(MANIFEST_SLOTS[slot]))?;
     f.write_all_at(&out, 0)?;
     Ok(f)
 }
@@ -12453,18 +12532,20 @@ fn manifest_make_slots(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The manifest written by whichever shape the options name: the slot, or
-/// the temp name renamed into place with the directory fsynced, the spare
-/// it leaves (`manifest_write`) unlinked here, where no landing waits.
+/// The manifest written by whichever shape the options name: the slot
+/// `slot`, or the temp name renamed into place with the directory fsynced,
+/// the spare it leaves (`manifest_write`) unlinked here, where no landing
+/// waits.
 fn manifest_write_shape(
     dir: &Path,
     opts: &Options,
+    slot: usize,
     seq: u64,
     covered_seq: u64,
     names: &[String],
 ) -> Result<()> {
     if opts.manifest_slots {
-        return manifest_write_slot(dir, seq, covered_seq, names, &[]);
+        return manifest_write_slot(dir, slot, seq, covered_seq, names, &[]);
     }
     if let Some(spare) = manifest_write(dir, seq, covered_seq, names, false)? {
         let _ = vault::remove_file(spare);
@@ -12517,6 +12598,8 @@ fn manifest_write(
 struct Manifest {
     /// The format the slot was read in: 1, 2 or 3.
     version: u8,
+    /// The slot file it was read from, an index into `MANIFEST_SLOTS`.
+    slot: usize,
     seq: u64,
     covered: u64,
     names: Vec<String>,
@@ -12589,6 +12672,7 @@ fn manifest_parse(buf: &[u8]) -> Result<Manifest> {
     }
     Ok(Manifest {
         version,
+        slot: 0,
         seq,
         covered,
         names,
@@ -12605,7 +12689,7 @@ fn manifest_parse(buf: &[u8]) -> Result<Manifest> {
 fn manifest_read_all(dir: &Path) -> Result<Vec<Manifest>> {
     let mut valid: Vec<Manifest> = Vec::new();
     let mut torn: Option<std::io::Error> = None;
-    for slot in MANIFEST_SLOTS {
+    for (i, slot) in MANIFEST_SLOTS.iter().enumerate() {
         let mut buf = Vec::new();
         match vault::open(dir.join(slot)) {
             Ok(mut f) => f.read_to_end(&mut buf)?,
@@ -12616,7 +12700,7 @@ fn manifest_read_all(dir: &Path) -> Result<Vec<Manifest>> {
             continue;
         }
         match manifest_open(dir, &buf) {
-            Ok(m) => valid.push(m),
+            Ok(m) => valid.push(Manifest { slot: i, ..m }),
             Err(e) => torn = Some(e),
         }
     }
@@ -15530,6 +15614,14 @@ struct Shared {
     /// A test's: while set, the writer's presync of a closing run's records
     /// waits before it syncs (`Reader::hold_presync`).
     presync_hold: std::sync::atomic::AtomicBool,
+    /// A test's: told of every slot write the segment work makes, before
+    /// it is made (`Db::watch_slot_writes`), while `slot_watching` is set.
+    slot_watch: std::sync::Mutex<Option<SlotWatch>>,
+    slot_watching: std::sync::atomic::AtomicBool,
+    /// A test's: per slot file, the sequence the last fdatasync of it this
+    /// process saw return covered -- the open's, and while `slot_watching`
+    /// is set the segment work's (`SlotWrite::synced`).
+    slot_synced: [AtomicU64; 2],
     /// A test's: the next seal's directory fsync at its readable landing
     /// fails, as a device error would (`Db::fail_next_seal_dir_sync`).
     fail_seal_dir_sync: std::sync::atomic::AtomicBool,
@@ -28273,7 +28365,7 @@ impl Db {
         // file that may be torn, and the manifest is what says it is not
         // the store's. The scan stays for stores written before manifests.
         if opts.manifest_slots {
-            manifest_write_slot(dir, 0, 0, &[], &[])?;
+            manifest_write_slot(dir, 0, 0, 0, &[], &[])?;
             manifest_make_slots(dir)?;
         } else {
             manifest_write(dir, 0, 0, &[], false)?;
@@ -28381,6 +28473,9 @@ impl Db {
             fail_presync: std::sync::atomic::AtomicBool::new(false),
             failed_presync: std::sync::Mutex::new(None),
             presync_hold: std::sync::atomic::AtomicBool::new(false),
+            slot_watch: std::sync::Mutex::new(None),
+            slot_watching: std::sync::atomic::AtomicBool::new(false),
+            slot_synced: [AtomicU64::new(0), AtomicU64::new(0)],
             fail_seal_dir_sync: std::sync::atomic::AtomicBool::new(false),
             fail_seal_sync: std::sync::atomic::AtomicBool::new(false),
             maint_err: AtomicPtr::new(std::ptr::null_mut()),
@@ -28469,6 +28564,10 @@ impl Db {
             0,
             Vec::new(),
             0,
+            SlotChoice {
+                durable: 0,
+                synced: [0, 0],
+            },
         )));
         let mut db = Db {
             r,
@@ -28629,6 +28728,19 @@ impl Db {
             Some(slots.remove(0))
         };
         let had_manifest = manifest.is_some();
+        // The slot the store is read from made durable before anything
+        // below unlinks a file it does not name or writes over the other
+        // slot: a process kill leaves the page cache whole, so the slot
+        // read may be a publish whose fdatasync never ran, and the other
+        // slot the only manifest on the device. One fdatasync, of nothing
+        // where the slot is clean. From here the slot read is the one a
+        // publish keeps off (`Maint::slot`); with no manifest read, none
+        // is durable and the first publish writes the first slot.
+        let mut slot = SlotChoice::NONE;
+        if let Some(m) = &manifest {
+            vault::open_slot(dir.join(MANIFEST_SLOTS[m.slot]))?.sync_data()?;
+            slot.landed(m.slot, m.seq);
+        }
         // A slot to write below: pending names verified whole, or a slot
         // skipped, whose file would otherwise read as the newest at the
         // next open and be verified again against segments swept here.
@@ -28667,15 +28779,18 @@ impl Db {
         // same writes.
         if !had_manifest {
             mseq += 1;
-            manifest_write_shape(dir, &opts, mseq, sealed, &live)?;
+            slot.write_shape(dir, &opts, mseq, sealed, &live)?;
         } else if opts.manifest_slots && (had_pending || upgrade) {
             // Every name durable now, in a slot of this version; and the
             // other slot too where it was of a version before, so neither
-            // reads as the store to a reader of that version.
+            // reads as the store to a reader of that version -- written
+            // once the first is durable, and the first stays the newest.
             mseq += 1;
-            manifest_write_slot(dir, mseq, sealed, &live, &[])?;
+            slot.write_shape(dir, &opts, mseq, sealed, &live)?;
             if upgrade {
-                manifest_write_slot(dir, mseq - 1, sealed, &live, &[])?;
+                let older = slot.next();
+                manifest_write_slot(dir, older, mseq - 1, sealed, &live, &[])?;
+                slot.synced[older] = mseq - 1;
             }
         }
         // A direct segment a crash left open: its records up to the last
@@ -28735,7 +28850,7 @@ impl Db {
             vault::sync_dir(dir)?;
             live.push(name);
             mseq += 1;
-            manifest_write_shape(dir, &opts, mseq, sealed, &live)?;
+            slot.write_shape(dir, &opts, mseq, sealed, &live)?;
             let _ = vault::remove_file(&tmp);
         }
         // The same for ordered indexes, which outlive their segment by a
@@ -29050,6 +29165,9 @@ impl Db {
             fail_presync: std::sync::atomic::AtomicBool::new(false),
             failed_presync: std::sync::Mutex::new(None),
             presync_hold: std::sync::atomic::AtomicBool::new(false),
+            slot_watch: std::sync::Mutex::new(None),
+            slot_watching: std::sync::atomic::AtomicBool::new(false),
+            slot_synced: [AtomicU64::new(slot.synced[0]), AtomicU64::new(slot.synced[1])],
             fail_seal_dir_sync: std::sync::atomic::AtomicBool::new(false),
             fail_seal_sync: std::sync::atomic::AtomicBool::new(false),
             maint_err: AtomicPtr::new(std::ptr::null_mut()),
@@ -29138,6 +29256,7 @@ impl Db {
             sealed,
             retiring,
             mseq,
+            slot,
         )));
         let mut db = Db {
             r,
@@ -32723,6 +32842,23 @@ impl Db {
     #[doc(hidden)]
     pub fn owed_slots_held(&self) -> u64 {
         self.shared.owed_slots_held.load(AtomicOrdering::Acquire)
+    }
+
+    /// A test's: `f` called before every manifest slot write the segment
+    /// work makes, with the slot it goes to and the sequences each slot
+    /// file's last fdatasync covered, so a test can build what a power cut
+    /// during the write leaves. `None` stops it.
+    #[doc(hidden)]
+    pub fn watch_slot_writes(&self, f: Option<SlotWatch>) {
+        let on = f.is_some();
+        *self
+            .shared
+            .slot_watch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = f;
+        self.shared
+            .slot_watching
+            .store(on, AtomicOrdering::Release);
     }
 
     /// A test's: the next fdatasync of a log file a loose rotation closed
@@ -38397,9 +38533,8 @@ struct Maint {
     /// on the reopen after a merge. A durability bound may only ever rise.
     covered_seq: u64,
     /// The sequence of the last manifest written, every publish one past
-    /// it and the slot it writes the sequence's parity
-    /// (`Options::manifest_slots`); the open reads it from the manifest it
-    /// took and hands it here with the manifests it wrote itself counted.
+    /// it; the open reads it from the manifest it took and hands it here
+    /// with the manifests it wrote itself counted.
     manifest_seq: u64,
     /// The names the newest slot flags pending (`Options::manifest_pending`):
     /// a seal's, written at its readable landing; durable once its thread
@@ -38409,10 +38544,17 @@ struct Maint {
     /// The thread that makes a pending slot durable beside the seal's
     /// fsync, spawned at the first pending publish.
     sync_helper: Option<SyncHelper>,
+    /// Which slot a publish writes: never the one holding the newest
+    /// manifest known durable (`SlotChoice`), which moves only once a
+    /// publish's fdatasync has returned -- its own, the sync helper's for a
+    /// pending slot, or the owed one a drain left (`sync_owed_slot`).
+    slot: SlotChoice,
     /// A drain's manifest slot written and not yet durable
-    /// (`Options::flush_waits_manifest` off): synced once the drain is
-    /// answered, and the WAL and temp names it covers retired behind it.
-    slot_sync_due: Option<File>,
+    /// (`Options::flush_waits_manifest` off), with the slot and sequence
+    /// written: synced once the drain is answered, and the WAL and temp
+    /// names it covers retired behind it. A publish before that sync
+    /// writes the same slot, over it.
+    slot_sync_due: Option<(File, usize, u64)>,
     /// The partition merges in flight, oldest first, at most
     /// `Options::merge_parallel` of them and over disjoint inputs and
     /// ranges. Each one's inputs stay live and readable until the manifest
@@ -39095,6 +39237,7 @@ impl Maint {
         covered_seq: u64,
         retiring_wals: Vec<PathBuf>,
         manifest_seq: u64,
+        slot: SlotChoice,
     ) -> Maint {
         r.shared
             .manifest_seq
@@ -39114,6 +39257,7 @@ impl Maint {
             dir: dir.to_path_buf(),
             covered_seq,
             manifest_seq,
+            slot,
             pending: Vec::new(),
             sync_helper: None,
             slot_sync_due: None,
@@ -39419,17 +39563,25 @@ impl Maint {
             let covered = names.iter().fold(self.covered_seq, |c, n| {
                 c.max(Db::name_end_seq(n).unwrap_or(0))
             });
-            let slot =
-                manifest_write_slot_unsynced(&self.dir, self.manifest_seq, covered, &live, names)?;
+            let to = self.slot.next();
+            self.watch_slot(to, self.manifest_seq, true);
+            let slot = manifest_write_slot_unsynced(
+                &self.dir,
+                to,
+                self.manifest_seq,
+                covered,
+                &live,
+                names,
+            )?;
             let dir = vault::open_dir(&self.dir)?;
             if self.sync_helper.is_none() {
                 self.sync_helper = Some(SyncHelper::spawn()?);
             }
             let helper = self.sync_helper.as_ref().expect("spawned above");
             helper.start(slot, dir)?;
-            true
+            Some(to)
         } else {
-            false
+            None
         };
         let mut segs = self.segs().to_vec();
         for (i, name) in names.iter().enumerate() {
@@ -39455,12 +39607,14 @@ impl Maint {
         for name in names {
             self.covered_seq = self.covered_seq.max(Db::name_end_seq(name).unwrap_or(0));
         }
-        if pending_sync {
+        if let Some(to) = pending_sync {
             // The pending slot and the directory's entries durable: the
             // durable landing writes nothing. The slot names the seal before
             // this one durable too, so what that seal's landing deferred
             // retires.
             self.sync_helper.as_ref().expect("started above").wait()?;
+            self.slot.landed(to, self.manifest_seq);
+            self.slot_synced(to, self.manifest_seq);
             self.pending = names.to_vec();
             self.shared
                 .manifest_seq
@@ -40550,8 +40704,14 @@ impl Maint {
         );
         SealCounts::add(&self.shared.seal_counts.publishes, 1);
         self.manifest_seq += 1;
+        // The slot the last durable publish did not write, which a slot
+        // still owed its sync from before is already in: written over, it
+        // was never the only newer manifest on the device.
+        let to = self.slot.next();
+        self.watch_slot(to, self.manifest_seq, true);
         let f = manifest_write_slot_unsynced(
             &self.dir,
+            to,
             self.manifest_seq,
             self.covered_seq,
             &self.live_names(),
@@ -40565,7 +40725,7 @@ impl Maint {
         self.shared
             .manifest_seq
             .store(self.manifest_seq, AtomicOrdering::Release);
-        self.slot_sync_due = Some(f);
+        self.slot_sync_due = Some((f, to, self.manifest_seq));
         Ok(())
     }
 
@@ -40574,12 +40734,43 @@ impl Maint {
     /// settle returns, and at the close.
     fn sync_owed_slot(&mut self) -> Result<()> {
         let _io = self.r.unlend();
-        if let Some(f) = self.slot_sync_due.take() {
+        if let Some((f, slot, seq)) = self.slot_sync_due.take() {
             seal_hold_wait(&self.shared, SEAL_HOLD_OWED_SLOT);
             f.sync_data()?;
+            self.slot.landed(slot, seq);
+            self.slot_synced(slot, seq);
             self.retire_covered();
         }
         Ok(())
+    }
+
+    /// A test's: the slot watch told of the write of `seq` into `slot`.
+    fn watch_slot(&self, slot: usize, seq: u64, deferred: bool) {
+        if !self.shared.slot_watching.load(AtomicOrdering::Relaxed) {
+            return;
+        }
+        let w = self
+            .shared
+            .slot_watch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(w) = w {
+            let synced = [0, 1].map(|i| self.shared.slot_synced[i].load(AtomicOrdering::Acquire));
+            w(&SlotWrite {
+                seq,
+                slot,
+                deferred,
+                synced,
+            });
+        }
+    }
+
+    /// A test's record: `slot`'s file fdatasynced over the write of `seq`.
+    fn slot_synced(&self, slot: usize, seq: u64) {
+        if self.shared.slot_watching.load(AtomicOrdering::Relaxed) {
+            self.shared.slot_synced[slot].store(seq, AtomicOrdering::Release);
+        }
     }
 
     fn publish(&mut self) -> Result<()> {
@@ -40612,13 +40803,20 @@ impl Maint {
             // The slot alone: the seal's directory entries were made
             // durable at its readable landing (`land_readable`), and a
             // merge's or a promotion's by the job itself before this.
+            // Into the slot the last durable publish did not write, which
+            // is the one a slot owed its sync is in.
+            let to = self.slot.next();
+            self.watch_slot(to, self.manifest_seq, false);
             manifest_write_slot(
                 &self.dir,
+                to,
                 self.manifest_seq,
                 self.covered_seq,
                 &self.live_names(),
                 &[],
             )?;
+            self.slot.landed(to, self.manifest_seq);
+            self.slot_synced(to, self.manifest_seq);
             self.shared
                 .manifest_seq
                 .store(self.manifest_seq, AtomicOrdering::Release);
