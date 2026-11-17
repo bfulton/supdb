@@ -232,38 +232,6 @@ What an engine picker would hit, roughly in order.
   error to the writer's own fdatasync as well, whichever sync met it
   first -- one open where the helper is spawned, nothing a commit; it
   needs a device that fails writeback (dm-flakey) to be tested at all.
-- [ ] **A run's due commit beside log frames no sync covered.** Under
-  `EveryN` a run's commit that is due syncs the run's file and not the
-  log, and a run opens over a log that may hold the frames of a table
-  frozen before it, unsynced, its seal not yet durable: a power cut then
-  keeps the run's commits and loses the earlier ones in the log, which is
-  not a tail of the commit order. A `sync` covers both. Done when the
-  run's open notes, once a run, whether the log owes a sync, and the due
-  branch asks that note beside the run's fdatasync and syncs the log
-  first, priced on the buffered loads after a shuffled one, with a crash
-  test that holds the frozen table's seal before its fsyncs.
-- [ ] **A sync over a run closed into a seal in flight.** Under
-  `EveryN` a run in the clear that closes -- at any write it cannot take
-  (an `append` of a key at or below its greatest, of an empty or overlong
-  key, or of a value that does not inline; a `put`; a `delete`), or at
-  any seal (`Db::seal`, or the one a commit makes at the threshold) --
-  hands its writer to a seal with the commits the
-  policy left unsynced, the tail short of a whole piece still held: a
-  `sync` before that seal lands answers `Ok` over them, and a kill or a
-  power cut then loses them while a later commit to the log survives. A
-  `flush` covers them; the docs say a `sync` does not. Two shapes, each
-  priced first: the run's close notes, once a run, that it closed owing
-  commits, and a `sync` that finds the note waits for that seal's
-  durable landing -- a wait on another thread inside `sync`; or the close
-  writes the held tail on the writer's thread (run-tail-kill's P1, one
-  write under a megabyte a close) and keeps the run's file handle, and a
-  `sync` that finds the note fdatasyncs it, a syscall only where
-  something is owed. Done with a test that closes a run every way --
-  a key below its greatest, a `delete` and a `put` above it, a value that
-  does not inline, `Db::seal`, and a commit that crosses the seal
-  threshold -- under `EveryN(u32::MAX)`, holds the seal's landing, syncs,
-  and reads every commit back after a kill and after a power cut, on
-  every run arm.
 - [x] **Encryption at rest for a live store.** A store opens under a key
   (`Encryption::Kernel`) and the kernel encrypts its directory: every file
   it writes is ciphertext on the device and plaintext in the page cache,
