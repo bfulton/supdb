@@ -276,6 +276,27 @@ What an engine picker would hit, roughly in order.
   drops or tears the writes after a chosen point inside a drain with its
   slot owed and a merge publishing behind it, and the store opens to
   every acknowledged write.
+- [ ] **A fall back past a damaged slot under a cipher.** An open that
+  passes over a slot which failed its check holds every segment the slot
+  before it does not name to what holds its writes, and refuses where
+  nothing does (`Db::fallback_refusals`); under a cipher such a segment
+  is an envelope whose key was in the slot that failed, so it cannot be
+  read, and the open sweeps it as the crash window's. A crash passes over
+  only a slot that never became durable, so this is media damage alone,
+  and the open answers `Ok` with the writes only the damaged slot named
+  missing. Done when a slot under a cipher carries what an open needs to
+  judge such an envelope without its key, or the open keeps the
+  envelopes no slot it read names until a slot is written over the
+  damaged one.
+- [ ] **A fall back held by a segment's first and last keys.** In the
+  clear the same check reads an unnamed segment newer than every segment
+  the slot taken names by its first and last keys, and sweeps it where
+  each is held by that slot's segments, a run's temp name or the replayed
+  log, as a merge's outputs are by their inputs. A run whose records
+  begin and end at keys a later write put in the log, or whose id was
+  drawn before a merge the older slot names, passes. Damage only, as
+  above. Done when the segment says in its own bytes whether it is a
+  merge's output, or the check reads every key where the first two pass.
 - [ ] **A run's due commit beside log frames no sync covered.** Under
   `EveryN` a run's commit that is due syncs the run's file and not the
   log, and a run opens over a log that may hold the frames of a table

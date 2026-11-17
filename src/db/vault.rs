@@ -1586,6 +1586,27 @@ impl Vault {
         Ok(())
     }
 
+    /// Whether the directory holds a segment's envelope: for an open that
+    /// read no slot, and so knows none of them.
+    fn holds_segments(&self) -> Result<bool> {
+        for entry in std::fs::read_dir(&self.real)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if matches!(disk_parse(&name), Some((_, Kind::Seg))) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether `name`'s envelope -- the one a slot read named for it -- is
+    /// in the directory.
+    fn on_device(&self, name: &str) -> bool {
+        lock(&self.files)
+            .get(name)
+            .and_then(|e| e.disk.clone())
+            .is_some_and(|d| self.real.join(d.name()).exists())
+    }
+
     /// Every envelope in the directory that no file of the store is in,
     /// removed: one a crash came after and no manifest named, as a plain
     /// store sweeps a segment its manifest does not name. For the open,
@@ -2022,6 +2043,26 @@ pub(crate) fn exists(path: impl AsRef<Path>) -> bool {
         None => path.exists(),
         Some((v, name)) if passes(&name) => v.real.join(name).exists(),
         Some((v, name)) => lock(&v.files).contains_key(&name),
+    }
+}
+
+/// Whether `path`'s bytes are in the directory: the file, or under a
+/// cipher the envelope a slot read named for it.
+pub(crate) fn on_device(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    match locate(path) {
+        None => path.exists(),
+        Some((v, name)) if passes(&name) => v.real.join(name).exists(),
+        Some((v, name)) => v.on_device(&name),
+    }
+}
+
+/// Whether the store at `dir`, under a cipher, holds any segment's
+/// envelope; never for a store in the clear.
+pub(crate) fn holds_envelopes(dir: impl AsRef<Path>) -> Result<bool> {
+    match under(dir.as_ref()) {
+        Some(v) => v.holds_segments(),
+        None => Ok(false),
     }
 }
 

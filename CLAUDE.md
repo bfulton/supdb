@@ -2117,7 +2117,19 @@ slot it does not write is one the device holds whole, and the open
 fdatasyncs the slot it takes before it removes a file or writes over the
 other (`Options::manifest_slots`, `SlotChoice`; the shape before it wrote
 a temp name, renamed it over the old manifest and fsynced the directory,
-`supdb-ingestmanifestrename`). A seal that fails at any step -- its
+`supdb-ingestmanifestrename`). The open removes nothing -- a segment, an
+envelope, a log file, a spare -- and writes no slot until the slot it
+takes is checked against the directory, and refuses with every file as
+it found it where that slot cannot be the store
+(`Db::open_refusals`, `Db::fallback_refusals`): a name it lists that is
+not there; no slot readable beside `par-` or `pcs-` files, or under a
+cipher beside envelopes, which only a store with a manifest writes; and,
+where it passed over a newer slot, a segment it does not name that reads
+back whole and holds writes the log no longer replays, or keys that
+nothing it names, no run's temp name and no replayed frame holds. A
+crash passes over only a slot that never became durable, so nothing was
+retired behind it and every window opens as before; damage passes over
+one whose log files and temp names may be gone. A seal that fails at any step -- its
 landing, its directory's fsync there, the fsync or the envelope of its
 data before its readable landing or after it, a closing run's presync --
 stops the seal queue for the life of the open (`Shared::seal_wedged`): no
@@ -2200,7 +2212,10 @@ finishes in that window lands after the seal (`Maint::collect` holds it,
 window, naming its segments pending (`Options::manifest_pending`,
 `supdb-manifestpending`), trades the order for a rule at the open --
 a pending name counts only once the segment reads back whole, else the
-slot before is the store -- and retires the WAL only behind a slot that
+slot before is the store, and the open that takes it fsyncs the segment,
+its ordered index under `ord_durable` and the directory before it writes
+the slot naming it durable, since a segment read back after a kill was
+read out of the page cache -- and retires the WAL only behind a slot that
 names the segments durable; it bought nothing here, because the thread
 its fsyncs were handed to woke a millisecond late. The seals in flight are a queue (`Maint::sealing`),
 landed in the order they were handed and each in its two phases, and only
@@ -2410,7 +2425,38 @@ fdatasync owed is in the page cache alone after a kill; the reopened
 store's first publish wrote over the other slot, the one the device
 held, and a power cut tearing that write left no slot that named the
 store. The open fdatasyncs the slot it takes now, before it unlinks
-anything a slot does not name.
+anything a slot does not name. And it came back at the pending arm:
+the open took a pending name whose segment read back whole, wrote a
+slot naming it durable that covered the log frames holding its writes,
+and fsynced nothing, so a power cut after the reopen lost the segment's
+unsynced pages and the log was skipped past them; the open fsyncs a
+pending segment, its ordered index where those are kept durable, and
+the directory before the slot that names it durable. The corollary: a
+check that reads a file back proves the page cache, and only an fsync
+makes what it read durable.
+
+**A sweep made before the choice it was for.** The open listed the
+segments, removed every one its chosen slot did not name, and only
+then found out whether that slot could be the store. With the newest
+slot damaged it fell back to the slot before, swept the segments only
+the damaged slot named -- a flushed run whose temp name had retired
+behind it, the only copy of its records -- and answered `Ok` with every
+flushed key absent; with the slot before naming inputs a merge had
+unlinked, it swept the merge's output and then refused at a segment it
+could not find, in words that named a missing file and not a damaged
+slot; and with both slots emptied beside partitions it took the scan
+kept for stores from before manifests, which takes `seg-` names alone,
+and removed every partition. Every test of the slots tore a publish
+still in flight, whose log still held its writes. The open removes and
+writes nothing now until the slot it takes is checked against the
+directory, and a fall back past a newer slot is held to what retired
+behind it: a segment the slot before does not name is swept only where
+the log replays its writes, a run's temp name holds them, or its keys
+are the slot's own. The rule: a step that removes what a decision rules
+out runs after the decision is made and checked, never as part of
+making it; a fall back is held to the evidence of what the thing it
+passed over had retired; and a refusal is tested by its own words,
+since a refusal further in, after the damage is done, carries others.
 
 **A slot chosen by its sequence, beside a sync left owed.** The
 manifest's two slots were written by the publish sequence's parity, on
