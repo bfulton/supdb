@@ -686,6 +686,14 @@ pub struct ZCounts {
     /// flag stopped.
     pub build_starts: u64,
     pub build_cancelled: u64,
+    /// Builds started on the builder's thread and taken in, whatever came of
+    /// them -- attached, left dormant, declined, refused, cancelled, failed,
+    /// orphaned, or a spawn that failed -- each counted once: a build is in
+    /// flight while `build_starts` is past this, and by no other sum, since
+    /// the counts of the outcomes are bumped by builds that are not the
+    /// builder's (a finish's `builds`) and not at all for some outcomes (a
+    /// decline, an install refused).
+    pub build_collected: u64,
     /// Form files built ahead of the controller's decision and left on
     /// disk unattached (`Options::zpages_prebuild`).
     pub prebuilt: u64,
@@ -908,9 +916,12 @@ pub struct ZCounts {
     pub sel_excess_ns: u64,
     pub sel_c_build_ns: u64,
     /// E2's footprint as the tick last computed it: the compact pages the
-    /// handles touched, summed, and the raw bound in bytes.
+    /// handles touched, summed, and the raw bound in bytes; and of the
+    /// bound, the raw footprints counted whole, the hash and the records of
+    /// every partition a stride file serves or the hot-raw policy holds raw.
     pub footprint_pages: u64,
     pub footprint_bytes: u64,
+    pub footprint_held: u64,
     /// The model's two populations as the tick last summed them over the
     /// partitions, bytes: the hash regions and the record regions
     /// (`zselect::model_raw`).
@@ -5944,16 +5955,21 @@ pub struct Options {
     /// first installs it (`Shared::z_left_seals`). A build that kept its
     /// pages read back the page cache, and an attach marks a page verified
     /// for the file's life, so a page the cache gives up after it is read
-    /// from the device's copy, which no check has seen -- a writeback whose
-    /// error nobody read reads right until then and wrong after -- at the
-    /// attach that follows the build as at a later one: its file is checked
-    /// as a file found on disk is. A file found on disk at an open, or by a
-    /// build's look before it builds where no build of this process left a
-    /// word for it, and any later attach of a file already installed, checks
-    /// each value page against its row at the page's first touch, as the
-    /// block form checks its pages; the reads count those checks
-    /// (`ZCounts::stride_page_checks`). Off, the file a build made is
-    /// checked so too. On.
+    /// from the device's copy, which no read of this process has seen -- the
+    /// build read its writeback's error before its read-back
+    /// (`zfile::read_writeback`), so the device acknowledged every page, and
+    /// a write it acknowledged and misplaced is seen only by a read of it --
+    /// at the attach that follows the build as at a later one: its file is
+    /// checked as a file found on disk is. A file found on disk at an open,
+    /// or by a build's look before it builds where no build of this process
+    /// left a word for it, and any later attach of a file already
+    /// installed, checks each value page against its row at the page's
+    /// first touch, as the block form checks its pages; the reads count
+    /// those checks (`ZCounts::stride_page_checks`). That check is of the
+    /// copy the first touch reads and stands for the file's life: it sees
+    /// the device's copy of a page first touched after the cache gave the
+    /// page up, and the cache's of one first touched before. Off, the file a
+    /// build made is checked so too. On.
     #[doc(hidden)]
     pub zpages_stride_trust_built: bool,
 }
@@ -7719,19 +7735,31 @@ fn z_coded_entry(plan: &zfile::BuildPlan, b: &zfile::Built) -> Option<bool> {
 /// A form file `b` built under `name` and left on disk for a later attach:
 /// its trailer's word kept for that attach where it is a stride file whose
 /// read-back read the device (`zfile::Built::left_seal`,
-/// `Shared::z_left_seals`). No word for an earlier file stands under the
-/// name to be dropped where there is none: a build at a merge's output
-/// finish names a file no build has named before, and every other build of
-/// a partition's form passes through the attach of the file on disk first
-/// (`Maint::z_attach_on_disk`), which takes the name's word whatever it
-/// finds, and none starts beside a finish in flight for the name.
+/// `Shared::z_left_seals`), and any word an earlier build left under the
+/// name dropped where this one leaves none, so that the record names what
+/// the name holds. Two builds of one partition write the same trailer, so
+/// an earlier build's word stands for a later build's file wherever the
+/// later one leaves it: a build whose read-back read the cache would be
+/// trusted by the word of one that read the device. No such pair is made
+/// by the paths that start builds -- a build at a merge's output finish
+/// names a file no build has named before, every other build of a
+/// partition's form passes through the attach of the file on disk first
+/// (`Maint::z_attach_on_disk`), which takes the name's word, and none
+/// starts while another build of the same form file is in flight
+/// (`zfile::same_zpg`) -- and the drop here is what keeps the record true
+/// should one be.
 fn z_leave_seal(shared: &Shared, name: String, b: &zfile::Built) {
-    if let Some(seal) = b.left_seal() {
-        shared
-            .z_left_seals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(name, seal);
+    let mut seals = shared
+        .z_left_seals
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match b.left_seal() {
+        Some(seal) => {
+            seals.insert(name, seal);
+        }
+        None => {
+            seals.remove(&name);
+        }
     }
 }
 
@@ -7810,15 +7838,19 @@ impl ZFinish {
                                 plan.drop_output
                             );
                         }
-                        ev.built(&b);
-                        zfile::ZEvents::add(&ev.prebuilt, 1);
-                        zfile::ZEvents::add(&ev.finish_builds, 1);
+                        // The record and the word first, the counts after
+                        // them: a count is what a waiter reads, and one read
+                        // before the word is in reads a build whose word is
+                        // not yet kept.
                         shared
                             .z_finish_coded
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .push((zfile::zpg_name(id, end), z_coded_entry(&plan, &b), stride));
                         z_leave_seal(&shared, zfile::zpg_name(id, end), &b);
+                        ev.built(&b);
+                        zfile::ZEvents::add(&ev.prebuilt, 1);
+                        zfile::ZEvents::add(&ev.finish_builds, 1);
                     }
                     Ok(zfile::Outcome::Declined(d)) => ev.declined(d),
                     Ok(zfile::Outcome::Cancelled) => zfile::ZEvents::add(&ev.build_cancelled, 1),
@@ -18782,10 +18814,12 @@ struct Shared {
     /// Builds at a merge's output finish in flight
     /// (`Options::zpages_build_at_finish`), bumped before each starts.
     z_finish_live: std::sync::atomic::AtomicUsize,
-    /// The outputs those builds are of, by name, each from its slot taken
-    /// to its thread's end: an output being built at its finish is a build
-    /// in flight -- not built ahead again, and in flight for the sample's
-    /// count -- until its file is on disk.
+    /// The outputs those builds are of, by the name each had at its finish,
+    /// from its slot taken to its thread's end: an output being built at
+    /// its finish is a build in flight -- not built ahead again, and in
+    /// flight for the sample's count -- until its file is on disk, asked of
+    /// its form file under whatever name a promotion gives the output
+    /// since (`Maint::z_finishing`).
     z_finish_names: std::sync::Mutex<Vec<String>>,
     /// The form files those builds wrote, by name, with whether each is
     /// raw-tailed: the coding a merge's plan carried when it started, which
@@ -23814,6 +23848,7 @@ impl Reader {
             rebuilds: get(&ev.rebuilds),
             declined_damage: get(&ev.declined_damage),
             build_starts: get(&ev.build_starts),
+            build_collected: get(&ev.build_collected),
             build_io_class: get(&ev.build_io_class),
             build_ahead_bytes: get(&ev.build_ahead_bytes),
             build_cancelled: get(&ev.build_cancelled),
@@ -23929,6 +23964,7 @@ impl Reader {
             sel_c_build_ns: get(&ev.sel_c_build_ns),
             footprint_pages: get(&ev.footprint_pages),
             footprint_bytes: get(&ev.footprint_bytes),
+            footprint_held: get(&ev.footprint_held),
             model_hash_bytes: get(&ev.model_hash),
             model_record_bytes: get(&ev.model_records),
             retired: get(&ev.retired),
@@ -37763,6 +37799,22 @@ impl Db {
             .collect()
     }
 
+    /// A test's: the raw footprint of the live partitions a stride file
+    /// serves, their hash and record regions summed (`Seg::foot`) -- what
+    /// E2's footprint counts whole for them (`ZCounts::footprint_held`).
+    #[doc(hidden)]
+    pub fn zpage_stride_foot(&self) -> u64 {
+        let _op = self.op();
+        self.segs()
+            .iter()
+            .filter(|s| s.level > 0 && s.z.get().is_some_and(|z| z.is_stride()))
+            .map(|s| {
+                let (h, r) = s.foot();
+                h.saturating_add(r)
+            })
+            .sum()
+    }
+
     pub fn segments(&self) -> usize {
         let _op = self.op();
         // The segments and the seals in flight from one state: the frozen
@@ -48689,8 +48741,8 @@ impl Maint {
         // and so is one a stride file serves: its reads touch no page the
         // handles count (`zfile::ZFile::stride`), and its value pages hold
         // the values alone, so its keys over them are no share of a touched
-        // block page's -- in the division below they thinned every page's
-        // records and left its raw footprint out of the bound.
+        // block page's -- in the division below they would thin every page's
+        // records and leave its raw footprint out of the bound.
         let mut held = 0u64;
         for s in self.segs().iter().filter(|s| s.level > 0) {
             let Some(z) = s.z.get() else {
@@ -48729,6 +48781,10 @@ impl Maint {
             .z
             .footprint_bytes
             .store(bound, AtomicOrdering::Relaxed);
+        self.shared
+            .z
+            .footprint_held
+            .store(held, AtomicOrdering::Relaxed);
         Some(bound)
     }
 
@@ -49252,9 +49308,9 @@ impl Maint {
         }
         // A decode timed where block files are on disk, and none needed
         // where every file is a stride file, whose reads are priced at no
-        // decode: asked of every store, the reading never stood for one whose
-        // every partition is a stride file, and the fill sample ran in its
-        // place over files already on disk.
+        // decode: asked of every store, the reading would never stand for one
+        // whose every partition is a stride file, and the fill sample would
+        // run in its place over files already on disk.
         if on_disk == 0 || on_recs == 0 || (on_block > 0 && sums.zgroups == 0) {
             return false;
         }
@@ -49714,27 +49770,39 @@ impl Maint {
         self.z_prebuild_pending() && !self.opts.zpages_cover_resident
     }
 
-    /// Whether a build ahead is in flight for `name`, in either slot, or a
-    /// build at its merge's output finish.
+    /// Whether a build ahead is in flight for `name`'s form file, in either
+    /// slot, or a build at its merge's output finish. Every check of a
+    /// build in flight is of the form file and not of the segment's name
+    /// (`zfile::same_zpg`), since a promotion re-opens a partition under a
+    /// new name with the file's fields kept.
     fn z_building_ahead(&self, name: &str) -> bool {
         self.z_ahead_holds(name)
             || self
                 .zbuild
                 .as_ref()
-                .is_some_and(|b| b.dormant && b.seg.name == name)
+                .is_some_and(|b| b.dormant && zfile::same_zpg(&b.seg.name, name))
             || self.z_finishing(name)
     }
 
     /// Whether `name`'s form file is being built at its merge's output
     /// finish (`Options::zpages_build_at_finish`), from the build's slot
-    /// taken to its thread's end.
+    /// taken to its thread's end, under whatever name a promotion has given
+    /// the output since.
     fn z_finishing(&self, name: &str) -> bool {
         self.shared
             .z_finish_names
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .any(|n| n == name)
+            .any(|n| zfile::same_zpg(n, name))
+    }
+
+    /// Whether the job in the builder's slot is a build of `name`'s form
+    /// file, ahead or not.
+    fn z_builder_holds(&self, name: &str) -> bool {
+        self.zbuild
+            .as_ref()
+            .is_some_and(|b| zfile::same_zpg(&b.seg.name, name))
     }
 
     /// Whether `seg`'s raw records count as covering it for want of a form
@@ -49753,9 +49821,12 @@ impl Maint {
         share >= LAND_RESIDENT
     }
 
-    /// Whether the second build ahead holds `name` (`Maint::zahead`).
+    /// Whether the second build ahead holds `name`'s form file
+    /// (`Maint::zahead`).
     fn z_ahead_holds(&self, name: &str) -> bool {
-        self.zahead.as_ref().is_some_and(|b| b.seg.name == name)
+        self.zahead
+            .as_ref()
+            .is_some_and(|b| zfile::same_zpg(&b.seg.name, name))
     }
 
     /// [`Maint::z_finish_plan`] after the coding's pick is taken again
@@ -50047,7 +50118,7 @@ impl Maint {
             .filter(|s| !self.in_flight_input(&s.name))
             .filter(|s| !self.z_ahead_holds(&s.name))
             .filter(|s| !self.z_finishing(&s.name))
-            .filter(|s| !self.zbuild.as_ref().is_some_and(|b| b.seg.name == s.name))
+            .filter(|s| !self.z_builder_holds(&s.name))
             .filter(|s| s.z.get().is_none())
             .filter(|s| s.z_declined.load(AtomicOrdering::Relaxed) == 0)
             .filter(|s| cold_ok || !s.z_ahead_cold.load(AtomicOrdering::Relaxed))
@@ -50997,7 +51068,10 @@ impl Maint {
                     reparse,
                 });
             }
-            Err(_) => failed(zfile::DECLINED_FAILED),
+            Err(_) => {
+                failed(zfile::DECLINED_FAILED);
+                zfile::ZEvents::add(&ev.build_collected, 1);
+            }
         }
     }
 
@@ -51031,6 +51105,16 @@ impl Maint {
                 return;
             }
         };
+        // The build counted collected on the way out, whichever way that
+        // is, after everything it took in: a wait that reads the count reads
+        // a build whose outcome has landed (`ZCounts::build_collected`).
+        struct Collected<'a>(&'a AtomicU64);
+        impl Drop for Collected<'_> {
+            fn drop(&mut self) {
+                zfile::ZEvents::add(self.0, 1);
+            }
+        }
+        let _collected = Collected(&ev.build_collected);
         let outcome = handle
             .join()
             .unwrap_or_else(|_| Err(err("the form file's build panicked")));
@@ -51244,9 +51328,10 @@ impl Maint {
             // attach the controller's build makes when it comes; counted
             // as built here, where its bytes were written.
             Ok(zfile::Outcome::Built(built)) if dormant && !self.z_want_build && live.is_some() => {
+                // The word before the counts, as at a finish.
+                z_leave_seal(&shared, zfile::zpg_name(id, end), &built);
                 ev.built(&built);
                 zfile::ZEvents::add(&ev.prebuilt, 1);
-                z_leave_seal(&shared, zfile::zpg_name(id, end), &built);
                 self.z_prebuilt_landed();
             }
             Ok(zfile::Outcome::Built(built)) => match live {
@@ -51372,11 +51457,13 @@ impl Maint {
         }
     }
 
-    /// The job in flight cancelled if its target is among `inputs`, the
-    /// segments a landing is about to retire; collected at the next turn.
+    /// The job in flight cancelled if its target's form file is an input's
+    /// among `inputs`, the segments a landing is about to retire, under
+    /// whatever name a promotion has given the target since its start;
+    /// collected at the next turn.
     fn z_cancel_inputs(&self, inputs: &[String]) {
         for b in [&self.zbuild, &self.zahead].into_iter().flatten() {
-            if inputs.iter().any(|n| *n == b.seg.name) {
+            if inputs.iter().any(|n| zfile::same_zpg(n, &b.seg.name)) {
                 b.cancel.store(true, AtomicOrdering::Release);
             }
         }

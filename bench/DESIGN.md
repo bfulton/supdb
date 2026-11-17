@@ -608,13 +608,13 @@ where the partition does not qualify (`Options::zpages_stride` at
 stride file, beside the forced arm's own rules, and the `zpage_stride_*`
 counters say what the stride files served and why a partition declined;
 `supdb-nocachezstrideprefetch` is it with a walk's pages asked for ahead
-(`Options::zpages_scan_prefetch`), `supdb-nocachezstridechecked` with no
-stride file this process built trusted at its attach
-(`Options::zpages_stride_trust_built` off) -- the trust reaches only a build
-whose read-back read the device, and a forced build keeps its pages, so the
-pair is the trust's noise floor -- and `supdb-cache64tofitzstride`
+(`Options::zpages_scan_prefetch`), and `supdb-cache64tofitzstride`
 and `supdb-cache64tofitzstrideprefetch` are `supdb-cache64tofitzpages` with
-the stride form, and with the ask beside it;
+the stride form, and with the ask beside it; no arm moves the trust in this
+process's builds (`Options::zpages_stride_trust_built`), which reaches only
+a build whose read-back read the device, and a forced build keeps its pages
+and reads them back from the cache, so the forced form's every arm checks
+the pages it touches, as a file found on disk is checked;
 `supdb-settlelate` and `supdb-ingestsettlelate` are `supdb` and
 `supdb-ingest` with a commit near reads leaving a batch under the backlog
 bound to the scans, the shape before every such commit filed its batch and

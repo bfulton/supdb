@@ -1657,17 +1657,6 @@ pub struct Supdb {
     /// pin nothing here, so they follow the engine, which builds no stride
     /// file.
     zstride: Option<supdb::ZStride>,
-    /// A stride file this process built trusted at its attach, its pages
-    /// unchecked at their first touch (`Options::zpages_stride_trust_built`),
-    /// the engine's where `None`: `supdb-nocachezstridechecked` pins it off,
-    /// every value page checked against the row at its first read
-    /// (`zpage_stride_page_checks`). The trust reaches only a build whose
-    /// read-back read the device, one that dropped its output -- the
-    /// controller's builds ahead and at a merge's finish under its line --
-    /// and a forced build keeps its pages, so under the forced form both
-    /// arms check every page they touch and the pair against
-    /// `supdb-nocachezstride` is the trust's noise floor.
-    zstride_trust: Option<bool>,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -2715,10 +2704,6 @@ struct Policy {
     /// (`Options::zpages_stride`), the engine's where `None`:
     /// `supdb-nocachezstride`, `supdb-cache64tofitzstride`.
     zstride: Option<supdb::ZStride>,
-    /// A stride file this process built trusted at its attach
-    /// (`Options::zpages_stride_trust_built`), the engine's where `None`:
-    /// `supdb-nocachezstridechecked` pins it off.
-    zstride_trust: Option<bool>,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -3008,7 +2993,6 @@ impl Default for Policy {
             zperrun: false,
             zmemo_mib: 0,
             zstride: None,
-            zstride_trust: None,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3070,14 +3054,6 @@ impl Policy {
         Policy {
             zstride: Some(supdb::ZStride::Forced),
             ..Policy::nocache_zpages_prefetch()
-        }
-    }
-
-    /// `supdb-nocachezstridechecked`: no stride file trusted at its attach.
-    fn nocache_zstride_checked() -> Policy {
-        Policy {
-            zstride_trust: Some(false),
-            ..Policy::nocache_zstride()
         }
     }
 
@@ -8153,19 +8129,6 @@ impl Supdb {
         Supdb::with_policy(path, Policy::nocache_zstride_prefetch())
     }
 
-    /// `supdb-nocachezstride` with a stride file this process built checked
-    /// like one found on disk (`Options::zpages_stride_trust_built` off),
-    /// `supdb-nocachezstridechecked`: every value page held to the file's
-    /// row at its first touch, which the trusted arm skips only for a file
-    /// whose build read every rank back from the device. A forced build
-    /// keeps its pages and reads them back from the cache, so the trusted
-    /// arm checks its files too and the pair, `zpage_stride_page_checks`
-    /// equal in both, is the trust's noise floor on the passes after the
-    /// load.
-    pub fn create_nocache_zstride_checked(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, Policy::nocache_zstride_checked())
-    }
-
     /// `supdb-nocachezpages` with the overlay walk of a covered partition
     /// cut by rank, as it was before the cursor (`Options::zpages_walk_cursor`
     /// off): the pair against `supdb-nocachezpages` differs by that one
@@ -8691,7 +8654,6 @@ impl Supdb {
             zperrun,
             zmemo_mib,
             zstride,
-            zstride_trust,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -9227,8 +9189,6 @@ impl Supdb {
                 supdb::Options::default().zpages_memo_bytes
             },
             zpages_stride: zstride.unwrap_or(supdb::Options::default().zpages_stride),
-            zpages_stride_trust_built: zstride_trust
-                .unwrap_or(supdb::Options::default().zpages_stride_trust_built),
             zpages_seek_ord: if zpages_heads {
                 true
             } else {
@@ -9591,7 +9551,6 @@ impl Supdb {
             zperrun,
             zmemo_mib,
             zstride,
-            zstride_trust,
             ord_threads: Default::default(),
         })
     }
@@ -11012,8 +10971,6 @@ impl Engine for Supdb {
         if self.zpages && zstride {
             return if self.zpages_prefetch {
                 "supdb-nocachezstrideprefetch"
-            } else if self.zstride_trust == Some(false) {
-                "supdb-nocachezstridechecked"
             } else {
                 "supdb-nocachezstride"
             };
@@ -12283,7 +12240,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocachezpagesprefetch"
         | "supdb-nocachezstride"
         | "supdb-nocachezstrideprefetch"
-        | "supdb-nocachezstridechecked"
         | "supdb-cache64tofitzstride"
         | "supdb-cache64tofitzstrideprefetch"
         | "supdb-nocachezpagesrankwalk"
@@ -12844,7 +12800,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocachezpagesprefetch" => supdb_arm(Supdb::create_nocache_zpages_prefetch, dir)?,
         "supdb-nocachezstride" => supdb_arm(Supdb::create_nocache_zstride, dir)?,
         "supdb-nocachezstrideprefetch" => supdb_arm(Supdb::create_nocache_zstride_prefetch, dir)?,
-        "supdb-nocachezstridechecked" => supdb_arm(Supdb::create_nocache_zstride_checked, dir)?,
         "supdb-nocachezpagesrankwalk" => supdb_arm(Supdb::create_nocache_zpages_rankwalk, dir)?,
         "supdb-nocachezpagesonegroup" => supdb_arm(Supdb::create_nocache_zpages_onegroup, dir)?,
         "supdb-nocachezpagesgroup1k" => supdb_arm(Supdb::create_nocache_zpages_group1k, dir)?,
@@ -17895,11 +17850,15 @@ mod tests {
     /// moved -- `supdb-nocachezstride` and `supdb-cache64tofitzstride` the
     /// forced block arms with the stride form forced, the prefetch arms the
     /// stride arms with a walk's ask on (and `supdb-nocachezstrideprefetch`
-    /// the block prefetch arm with the stride form), the checked arm the
-    /// stride arm with no build trusted -- and nothing else: the policies
-    /// compared whole, the names, the guarantee, the features, the dispatch,
-    /// and on the options the engine was opened with, the one option moved
-    /// of the three the arms move and the form forced on both sides.
+    /// the block prefetch arm with the stride form) -- and nothing else: the
+    /// policies compared whole, the names, the guarantee, the features, the
+    /// dispatch, and on the options the engine was opened with, the one
+    /// option moved of the two the arms move, the trust in this process's
+    /// builds the engine's in every arm, and the form forced on both sides.
+    /// No arm moves the trust: every forced build keeps its pages, so its
+    /// read-back reads the cache and the trust reaches no file the forced
+    /// form builds, and an arm without it is the arm it would be priced
+    /// against.
     #[test]
     fn each_stride_arm_is_its_sibling_and_the_one_option_its_name_says() {
         use supdb::ZStride::{Forced, Off};
@@ -17956,16 +17915,6 @@ mod tests {
                 sib_make: Supdb::create_nocache_zpages_prefetch,
                 moved: |p| p.zstride = Some(Forced),
                 want: (Forced, true, true),
-            },
-            Case {
-                name: "supdb-nocachezstridechecked",
-                policy: Policy::nocache_zstride_checked,
-                make: Supdb::create_nocache_zstride_checked,
-                sib: "supdb-nocachezstride",
-                sib_policy: Policy::nocache_zstride,
-                sib_make: Supdb::create_nocache_zstride,
-                moved: |p| p.zstride_trust = Some(false),
-                want: (Forced, false, false),
             },
             Case {
                 name: "supdb-cache64tofitzstride",
@@ -18064,11 +18013,12 @@ mod tests {
     /// each, so every partition the load leaves is a stride file, the reads
     /// of it -- the writer's and a handle's -- are the stride form's, and the
     /// block arm reads the same keys through its form with none of them
-    /// counted the stride form's. Both the trusted arm and the checked arm
-    /// check the pages they touch, since a forced build keeps its pages and
-    /// its read-back read the cache, and a store of keys with holes in their run
-    /// declines the form for that reason in its slot and falls to the block
-    /// form, every partition covered and none a stride file.
+    /// counted the stride form's. The stride arm checks the pages it
+    /// touches, as a file found on disk is checked, since a forced build
+    /// keeps its pages and its read-back read the cache, and a store of keys
+    /// with holes in their run declines the form for that reason in its slot
+    /// and falls to the block form, every partition covered and none a
+    /// stride file.
     #[test]
     fn the_stride_arms_count_the_files_they_built_and_the_reads_those_served() {
         let root = std::env::temp_dir().join(format!("supdb-bench-zstride-{}", std::process::id()));
@@ -18079,7 +18029,6 @@ mod tests {
             make(&d).unwrap()
         };
         let mut arm = new("stride", Supdb::create_nocache_zstride);
-        let mut checked = new("checked", Supdb::create_nocache_zstride_checked);
         let mut cached = new("cached", Supdb::create_cache64_tofit_zstride);
         let mut base = new("block", Supdb::create_nocache_zpages);
         let mut holed = new("holed", Supdb::create_nocache_zstride);
@@ -18098,7 +18047,7 @@ mod tests {
             }
             e.sync().unwrap();
         };
-        for e in [&mut arm, &mut checked, &mut cached, &mut base] {
+        for e in [&mut arm, &mut cached, &mut base] {
             load(e, &keys);
         }
         // Every other number: the shape, one value of one width, and holes.
@@ -18121,7 +18070,7 @@ mod tests {
             "zpage_stride_no_small",
             "zpage_stride_no_self_check",
         ];
-        for (e, what) in [(&arm, "stride"), (&checked, "checked"), (&cached, "cached")] {
+        for (e, what) in [(&arm, "stride"), (&cached, "cached")] {
             let z = e.zpages_state().unwrap();
             assert!(z.forced && z.stride, "{what}: {z:?}");
             assert!(
@@ -18151,41 +18100,37 @@ mod tests {
         }
         // The reads: the stride arm's are its stride files', counted as
         // reads through the form as well; the block arm's are its form's and
-        // none of them the stride form's. Both stride arms check the pages
-        // they touch: the forced form's builds keep their pages, and only a
+        // none of them the stride form's. The stride arm checks the pages it
+        // touches: the forced form's builds keep their pages, and only a
         // build whose read-back read the device is trusted.
         let mut reads = 0f64;
         for k in keys.iter().step_by(7) {
-            for e in [&mut arm, &mut checked, &mut base] {
+            for e in [&mut arm, &mut base] {
                 assert_eq!(e.get(k).unwrap(), value.len());
             }
             reads += 1.0;
         }
-        for e in [&arm, &checked] {
-            let served = count(e, "zpage_stride_reads");
-            assert!(
-                served >= reads && served <= reads + 1.0,
-                "{served} of {reads}"
-            );
-            assert_eq!(
-                count(e, "zpage_reads"),
-                served,
-                "every form read a stride read"
-            );
-            assert_eq!(count(e, "zpage_rawserves"), 0.0);
-        }
+        let served = count(&arm, "zpage_stride_reads");
+        assert!(
+            served >= reads && served <= reads + 1.0,
+            "{served} of {reads}"
+        );
+        assert_eq!(
+            count(&arm, "zpage_reads"),
+            served,
+            "every form read a stride read"
+        );
+        assert_eq!(count(&arm, "zpage_rawserves"), 0.0);
         assert!(count(&base, "zpage_reads") >= reads);
         assert_eq!(
             count(&base, "zpage_stride_reads"),
             0.0,
             "the block form's reads"
         );
-        for (e, what) in [(&arm, "the trusted arm"), (&checked, "the checked arm")] {
-            assert!(
-                count(e, "zpage_stride_page_checks") >= 1.0,
-                "{what}: its builds kept their pages, every page checked once"
-            );
-        }
+        assert!(
+            count(&arm, "zpage_stride_page_checks") >= 1.0,
+            "the stride arm: its builds kept their pages, every page checked once"
+        );
         assert_eq!(count(&base, "zpage_stride_page_checks"), 0.0);
         // A handle's reads are on its slot, which its drop leaves, so the
         // counters read after a threaded pass carry them.
@@ -18226,7 +18171,7 @@ mod tests {
             assert_eq!(count(&holed, n), want, "{n}");
         }
         assert_eq!(count(&holed, "zpage_stride_builds"), 0.0);
-        drop((arm, checked, cached, base, holed));
+        drop((arm, cached, base, holed));
         let _ = std::fs::remove_dir_all(&root);
     }
 

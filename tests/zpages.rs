@@ -5182,7 +5182,7 @@ fn builds_collected(db: &Db) {
     let t = std::time::Instant::now();
     loop {
         let c = db.zpage_counts();
-        if c.build_starts == c.builds + c.build_cancelled + c.build_failed + c.build_orphaned {
+        if !building(&c) {
             return;
         }
         assert!(
@@ -7231,9 +7231,8 @@ fn tick_until(db: &Db, max: u32, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> 
 /// long as a minute of the wall allows rather than for a count of ticks: a
 /// build ahead runs on the builder's thread at its own pace and is
 /// collected only at a tick, and a stride build's read-back of the device
-/// beside other processes' tests outlasted four hundred ticks, seven of
-/// seventeen partitions built when the count ran out. A build in flight by
-/// the counts -- started and not yet collected -- is given a few
+/// beside other processes' tests takes the device's time, which no count of
+/// ticks bounds. A build in flight by the counts (`building`) is given a few
 /// milliseconds of the wall before the next tick, so that the injected
 /// clock moves with the builds and not with the wait.
 #[cfg(target_os = "linux")]
@@ -7254,19 +7253,20 @@ fn tick_until_built(db: &Db, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> bool
     }
 }
 
-/// Whether a build is in flight by the counts: started and not yet
-/// collected, which a collect does only at a tick.
-#[cfg(target_os = "linux")]
+/// Whether a build is in flight by the counts: one started on the builder's
+/// thread and not yet taken in, which a collect does only at a tick
+/// (`ZCounts::build_collected`, counted once whatever came of the build), or
+/// one at a merge's output finish still on its thread
+/// (`ZCounts::finish_live`). The one definition the waits read.
 fn building(c: &supdb::db::ZCounts) -> bool {
-    c.build_starts > c.builds + c.build_cancelled + c.build_failed + c.build_orphaned
+    c.build_starts > c.build_collected || c.finish_live > 0
 }
 
 /// `drive_to` past its four hundred rounds for as long as a build is in
 /// flight and a minute of the wall allows, each such round given a few
 /// milliseconds of the wall first: the controller's builds of a stride
 /// store's partitions run at the device's pace beside other processes'
-/// tests, and a fixed count of rounds ran out at five of twenty-three
-/// built.
+/// tests, which no fixed count of rounds bounds.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn drive_to_built(
@@ -8362,6 +8362,39 @@ fn two_builds_ahead_run_beside_each_other_and_build_each_partition_once() {
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// A build started on the builder's thread is taken in once whatever comes
+/// of it, and counted so (`ZCounts::build_collected`): builds ahead of
+/// partitions under the floor each decline, which the counts of the
+/// outcomes that leave a file never see, and the waits' one definition of a
+/// build in flight (`building`) reads none in flight once every decline is
+/// collected, where a sum of the outcomes' counts reads each of them in
+/// flight for the store's life.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_build_ahead_that_declines_is_collected_and_no_build_is_in_flight_after_it() {
+    let (dir, db, _model, inject, raw) = land_store_with("auto-ahead-declined", 50, |o| {
+        o.partition_bytes = Some(400 << 10);
+        o.zpages_min_bytes = 1 << 40;
+    });
+    inject.set_budget(raw * 3 / 2);
+    assert!(
+        tick_until(&db, 200, |c| c.declined_small >= c.partitions
+            && c.build_starts == c.build_collected),
+        "declined ahead: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert!(c.partitions >= 3, "{c:?}");
+    assert_eq!(
+        (c.build_starts, c.build_collected, c.builds, c.prebuilt),
+        (c.partitions, c.partitions, 0, 0),
+        "each partition's build ahead started, declined and collected once: {c:?}"
+    );
+    assert!(!building(&c), "nothing in flight: {c:?}");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The sample asked for between builds ahead
@@ -15021,15 +15054,18 @@ fn a_scan_over_partitions_reads_a_stride_record_under_an_unsealed_key_through_th
 /// this process's builds is on or off: its read-back read the cache, and an
 /// attach marks a trusted page verified for the file's life, so a page the
 /// cache gives up after the attach that follows the build is read from the
-/// device's copy, which no check has seen (`zfile::Built::left_seal`). The
-/// count of checks is the pages the reads touch, once each, at the build
-/// and again at a reopen. Under the segment work's thread, whose builds the
-/// settle waits for, and with the segment work inline, where the settle
-/// builds and attaches itself (`Db::z_give`); both keep their pages, and
-/// the builds that drop theirs and are trusted are held where they are made
+/// device's copy, which no read of this process has seen
+/// (`zfile::Built::left_seal`). The count of checks is the pages the reads
+/// touch, once each, at the build and again at a reopen. Under the segment
+/// work's thread, whose builds the settle waits for, and with the segment
+/// work inline, where the settle builds and attaches itself (`Db::z_give`);
+/// both keep their pages, and the builds that drop theirs and are trusted
+/// are held where they are made
 /// (`a_stride_file_built_ahead_is_trusted_at_its_late_attach_where_its_read_back_read_the_device`,
 /// and the word a build leaves, by the kernel's count, in `zfile`'s own
-/// tests).
+/// tests). What the check sees, the copy a page's first touch reads, is
+/// held by
+/// `a_kept_stride_files_check_is_of_the_copy_a_pages_first_touch_reads`.
 #[test]
 fn a_stride_file_a_build_kept_in_the_cache_is_checked_page_by_page_as_one_found_on_disk_is() {
     for (trust, inline) in [(true, false), (false, false), (true, true), (false, true)] {
@@ -15072,6 +15108,103 @@ fn a_stride_file_a_build_kept_in_the_cache_is_checked_page_by_page_as_one_found_
         );
         check(&db, &model, &keys[..=200], "again");
         assert_eq!(db.zpage_counts().stride_page_checks, 5);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// One byte of `file` at `at` flipped on the device past the page cache: the
+/// page around it read and written back with `O_DIRECT`, which writes the
+/// device's copy and drops the cached one and the mappings of it, so that
+/// the next touch of the page reads the device.
+#[cfg(target_os = "linux")]
+fn flip_on_the_device(file: &Path, at: usize) {
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+    const PAGE: usize = 4096;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(file)
+        .unwrap();
+    let layout = std::alloc::Layout::from_size_align(PAGE, PAGE).unwrap();
+    // SAFETY: a buffer of `PAGE` bytes at the page's alignment, which
+    // `O_DIRECT` asks of it, freed below with the same layout.
+    let buf = unsafe { std::alloc::alloc_zeroed(layout) };
+    assert!(!buf.is_null());
+    // SAFETY: `buf` holds `PAGE` initialized bytes until it is freed.
+    let page = unsafe { std::slice::from_raw_parts_mut(buf, PAGE) };
+    let off = (at / PAGE * PAGE) as u64;
+    f.read_exact_at(page, off).unwrap();
+    page[at % PAGE] ^= 0x40;
+    f.write_all_at(page, off).unwrap();
+    // SAFETY: allocated above with `layout`, and no slice of it outlives this.
+    unsafe { std::alloc::dealloc(buf, layout) };
+}
+
+/// A stride file a build of this process kept in the page cache is checked
+/// at each value page's first touch, and the check is of the copy that touch
+/// reads and stands for the file's life (`zfile::Built::left_seal`). A value
+/// byte of page 1 changed on the device after the page's first touch is not
+/// checked: the read of the rank over it serves the device's copy, nothing
+/// refused and no check made again. The same byte changed on the device
+/// before the page's first touch is: the touch reads the device's copy, the
+/// check refuses it, and the read is answered through the raw form. The
+/// build's own writeback error, the case a cached copy could check right
+/// over a wrong one, fails the build before its read-back
+/// (`zfile::read_writeback`, held in `zfile`'s own tests).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_kept_stride_files_check_is_of_the_copy_a_pages_first_touch_reads() {
+    // Rank 41's value is bytes 4,100 to 4,200, in value page 1.
+    const RANK: usize = 41;
+    const AT: usize = 4096 + 100;
+    for touched in [true, false] {
+        let what = format!("the device's copy changed after the page's first touch {touched}");
+        let what = what.as_str();
+        let dir = scratch(&format!("stride-copy-{touched}"));
+        let mut db = Db::create(&dir, stride_forced(|_| {})).unwrap();
+        let model = numbered_load(&mut db, 3000, 100, 0x7358);
+        db.zpages_settle().unwrap();
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let files = named_form_files(&dir);
+        assert_eq!(files.len(), 1, "{what}: {files:?}");
+        let key = numbered_key(RANK);
+        let want = model.get(&key).cloned().unwrap();
+        let mut flipped = want.clone();
+        flipped[0][AT - RANK * 100] ^= 0x40;
+        if touched {
+            check(&db, &model, &keys, what);
+        }
+        let before = db.zpage_counts();
+        assert_eq!(before.stride_files, 1, "{what}: {before:?}");
+        flip_on_the_device(&files[0], AT);
+        let got = read_vec(&db, &key);
+        let c = db.zpage_counts();
+        if touched {
+            assert_eq!(
+                got, flipped,
+                "{what}: the device's copy served, the check not made again"
+            );
+            assert_eq!(
+                (
+                    c.stride_page_checks,
+                    c.bad_pages,
+                    c.damaged,
+                    c.fallbacks,
+                    c.stride_reads
+                ),
+                (before.stride_page_checks, 0, 0, 0, before.stride_reads + 1),
+                "{what}: {c:?}"
+            );
+        } else {
+            assert_eq!(got, want, "{what}: the raw form's answer");
+            assert_eq!(
+                (c.stride_page_checks, c.bad_pages, c.fallbacks),
+                (1, 1, 1),
+                "{what}: the page checked at its first touch, in the device's copy, and refused: {c:?}"
+            );
+        }
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15585,6 +15718,370 @@ fn a_stride_file_built_ahead_is_trusted_at_its_late_attach_where_its_read_back_r
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// `n` numbered keys from `from` on, one value of the load's width each,
+/// appended above the store's greatest key in batches and flushed: a run
+/// the stride form holds, which the flush promotes into a partition of its
+/// own, closing the last partition at the run's first key and opening it
+/// again under a new name with the two fields its form file is named by
+/// kept.
+#[cfg(target_os = "linux")]
+fn numbered_run(db: &mut Db, model: &mut Model, from: usize, n: usize, seed: u64) {
+    let mut rng = Rng(seed);
+    for chunk in (from..from + n).collect::<Vec<_>>().chunks(500) {
+        for &i in chunk {
+            let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
+            let k = numbered_key(i);
+            db.append(&k, &v);
+            model.insert(k, vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+}
+
+/// The named form files in a store's directory, no build's temporary name
+/// among them.
+#[cfg(target_os = "linux")]
+fn named_form_files(dir: &Path) -> Vec<PathBuf> {
+    form_files(dir)
+        .into_iter()
+        .filter(|f| f.extension().is_some_and(|e| e == "zpg"))
+        .collect()
+}
+
+/// A store of numbered keys under the stride form whose every partition's
+/// file was built ahead under the selector's line, each a build that wrote
+/// its output back and dropped it, so that its read-back read the device and
+/// its word is kept; then a run appended above the greatest key and
+/// promoted, the new partition's build ahead held at its rename -- a build
+/// of the same kind, past its read-back with its word in hand. With the
+/// named form files from before the run, every one of them a partition's
+/// that stands.
+#[cfg(target_os = "linux")]
+#[allow(clippy::type_complexity)]
+fn stride_store_with_a_build_ahead_held(
+    name: &str,
+    extra: impl FnOnce(&mut Options),
+) -> (
+    PathBuf,
+    Db,
+    Model,
+    std::sync::Arc<supdb::ZInject>,
+    u64,
+    Vec<PathBuf>,
+) {
+    let (dir, mut db, mut model, inject, raw) = land_store_loaded(
+        name,
+        50,
+        |o| {
+            o.zpages_stride = ZStride::Forced;
+            o.partition_bytes = Some(160 << 10);
+            o.zpages_land_cold_past = false;
+            extra(o);
+        },
+        |db| numbered_load(db, 20_000, 100, 0xA4EB),
+    );
+    inject.set_budget(raw * 3 / 2);
+    assert!(
+        tick_until_built(&db, |c| c.prebuilt >= c.partitions),
+        "{name}: built ahead: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.build_starts, c.prebuilt, db.zpage_left_seals() as u64),
+        (c.partitions, c.partitions, c.partitions),
+        "{name}: each partition built ahead once, its word kept: {c:?}"
+    );
+    let before = named_form_files(&dir);
+    assert_eq!(before.len() as u64, c.partitions, "{name}: {before:?}");
+    let promoted = db.promotions().0;
+    db.hold_zpage_rename(true);
+    numbered_run(&mut db, &mut model, 20_000, 1_500, 0xA4EC);
+    assert!(
+        db.promotions().0 > promoted,
+        "{name}: the run's piece promoted: {:?}",
+        db.zpage_counts()
+    );
+    assert!(
+        tick_until_built(&db, |n| n.build_starts == c.build_starts + 1
+            && db.zpage_build_waiting()),
+        "{name}: the run's partition's build ahead held at its rename: {:?}",
+        db.zpage_counts()
+    );
+    (dir, db, model, inject, raw, before)
+}
+
+/// A promotion while a build ahead of a partition's form file is in flight:
+/// the partition is opened again under a new name with the file's fields
+/// kept, and the checks of a build in flight ask of the form file, never of
+/// the name (`zfile::same_zpg`), so no second build of that file starts
+/// beside the held one -- the two would share its temporary name, and the
+/// held build's word, its read-back of the device, would stand for the
+/// second's file, whose read-back read the cache. A run appended and
+/// promoted with the new partition's build held at its rename under the
+/// selector's line; the budget then taken past the line, where a build
+/// ahead keeps its pages and leaves no word, every build held at its start
+/// as well, and a second run promoted over the held build's partition. The
+/// held build is the one build of its file: once both holds are lifted,
+/// every partition's form file was built once, the held build's file stands
+/// under its name as it was named, nothing was orphaned, and every file
+/// keeps its word but the second run's partition's, built past the line.
+/// Driven to COMPACT, the reads check that partition's pages and no other's,
+/// every page verified.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_build_ahead_in_flight_across_a_promotion_is_the_one_build_of_its_form_file() {
+    use std::os::unix::fs::MetadataExt;
+    let what = "a build ahead held across a promotion";
+    let (dir, mut db, mut model, inject, raw, before) =
+        stride_store_with_a_build_ahead_held("auto-ahead-promote", |o| {
+            // Nothing bought before the builds ahead have finished dormant.
+            o.zpages_cover_resident = false;
+            o.zpages_suspect_at_crossing = false;
+        });
+    let held = db.zpage_counts();
+    inject.set_budget(raw * 2 / 3);
+    db.hold_zpage_build(true);
+    let promoted = db.promotions().0;
+    numbered_run(&mut db, &mut model, 21_500, 1_500, 0xA4ED);
+    assert!(
+        db.promotions().0 > promoted,
+        "{what}: the second run's piece promoted over the held build's partition: {:?}",
+        db.zpage_counts()
+    );
+    wait_steps(&db, 10);
+    let c = db.zpage_counts();
+    assert_eq!(
+        c.partitions,
+        held.partitions + 1,
+        "{what}: the second run's partition: {c:?}"
+    );
+    db.hold_zpage_rename(false);
+    assert!(
+        tick_until_built(&db, |c| c.prebuilt > held.prebuilt),
+        "{what}: the held build collected: {:?}",
+        db.zpage_counts()
+    );
+    let named: Vec<PathBuf> = named_form_files(&dir)
+        .into_iter()
+        .filter(|f| !before.contains(f))
+        .collect();
+    assert_eq!(named.len(), 1, "{what}: the held build's file: {named:?}");
+    let first = named[0].clone();
+    let ino = std::fs::metadata(&first).unwrap().ino();
+    db.hold_zpage_build(false);
+    assert!(
+        tick_until_built(&db, |c| !building(c)
+            && named_form_files(&dir).len() as u64 == c.partitions),
+        "{what}: every partition's file on disk: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.build_starts, c.prebuilt, c.build_orphaned),
+        (c.partitions, c.partitions, 0),
+        "{what}: each partition's form file built once, nothing orphaned: {c:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&first).unwrap().ino(),
+        ino,
+        "{what}: the held build's file stands as it was named"
+    );
+    assert_eq!(
+        db.zpage_left_seals() as u64,
+        c.partitions - 1,
+        "{what}: a word for every file but the one built past the line: {c:?}"
+    );
+    let last: Vec<PathBuf> = named_form_files(&dir)
+        .into_iter()
+        .filter(|f| !before.contains(f) && *f != first)
+        .collect();
+    assert_eq!(last.len(), 1, "{what}: {last:?}");
+    let kept_pages = stride_of(&last[0]).1 as u64;
+    inject.set_budget(1 << 20);
+    inject.set_refault_rate(1_000_000.0);
+    inject.set_fault_cost(FAULT_1MS);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(
+        drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
+        "{what}: COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    let n = c.partitions;
+    assert!(
+        tick_until(&db, 400, |c| c.attached >= n && c.form_files == n),
+        "{what}: every partition attached: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.stride_files, c.build_starts),
+        (n, n),
+        "{what}: the files built ahead installed, nothing built again: {c:?}"
+    );
+    check(&r, &model, &keys, what);
+    drop(r);
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.stride_page_checks, c.verified_pages, c.fallbacks),
+        (kept_pages, c.pages, 0),
+        "{what}: the pages of the file built past the line checked, and no other's: {c:?}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A build ahead the controller buys while it is in flight: built dormant
+/// under the selector's line, so its read-back read the device, and held at
+/// its rename while faulting reads drive the controller to buy, so that it
+/// is collected as the controller's own build and installed at once
+/// (`Maint::z_collect`'s general arm) rather than left on disk. That attach
+/// takes the word the build leaves (`Options::z_stride_attach_built`): the
+/// file installed trusted, its pages verified from the attach, as the files
+/// built ahead before it are by the words their late attaches take. Every
+/// key read, no page checked.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_build_ahead_bought_while_in_flight_is_trusted_at_once_where_its_read_back_read_the_device() {
+    let what = "a build ahead bought in flight";
+    let (dir, db, model, inject, _raw, before) =
+        stride_store_with_a_build_ahead_held("auto-ahead-bought", |_| {});
+    let held = db.zpage_counts();
+    inject.set_budget(1 << 20);
+    inject.set_refault_rate(1_000_000.0);
+    inject.set_fault_cost(FAULT_1MS);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(
+        drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
+        "{what}: COMPACT with the build held: {:?}",
+        db.zpage_counts()
+    );
+    assert!(db.zpage_build_waiting(), "{what}: still held");
+    db.hold_zpage_rename(false);
+    let n = held.partitions;
+    assert!(
+        tick_until_built(&db, |c| c.attached >= n && c.form_files == n),
+        "{what}: every partition attached: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.prebuilt, c.build_starts, c.stride_files),
+        (held.prebuilt, n, n),
+        "{what}: the held build collected as the controller's, nothing built again: {c:?}"
+    );
+    assert_eq!(named_form_files(&dir).len() as u64, n, "{what}: {before:?}");
+    assert_eq!(db.zpage_left_seals_held(), 0, "{what}: the words taken");
+    check(&r, &model, &keys, what);
+    drop(r);
+    let c = db.zpage_counts();
+    assert!(c.stride_reads > 0, "{what}: through the files: {c:?}");
+    assert_eq!(
+        (c.stride_page_checks, c.verified_pages, c.fallbacks),
+        (0, c.pages, 0),
+        "{what}: every page verified from the attach, none checked: {c:?}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A promotion while a build at a merge's output finish is in flight: the
+/// output is opened again under a new name with its form file's fields
+/// kept, and the finish is in flight for the form file and not the name
+/// (`Maint::z_finishing`, `zfile::same_zpg`), so no build ahead of the same
+/// file starts beside it under the output's new name: the two would share
+/// the file's temporary name. A store whose every partition's stride file
+/// was built ahead under the selector's line; its greatest keys put again,
+/// sealed and merged, the outputs' finishes held at their renames, past the
+/// open of the output's file a promotion's unlink of its old name would
+/// fail; then a run appended above the greatest key and promoted over the
+/// last output. Once the hold is lifted, the one build ahead since is the
+/// run's partition's, every finish built its output's file, nothing was
+/// orphaned, and every partition has its file.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_finish_in_flight_across_a_promotion_is_the_one_build_of_its_form_file() {
+    let what = "a finish held across a promotion";
+    let (dir, mut db, mut model, inject, raw) = land_store_loaded(
+        "auto-finish-promote",
+        50,
+        |o| {
+            o.zpages_stride = ZStride::Forced;
+            o.zpages_build_at_finish = true;
+            o.partition_bytes = Some(160 << 10);
+            o.zpages_land_cold_past = false;
+            o.l0_trigger = 1;
+        },
+        |db| numbered_load(db, 20_000, 100, 0xF1A0),
+    );
+    inject.set_budget(raw * 3 / 2);
+    assert!(
+        tick_until_built(&db, |c| c.prebuilt >= c.partitions && !building(c)),
+        "{what}: built ahead: {:?}",
+        db.zpage_counts()
+    );
+    let c0 = db.zpage_counts();
+    assert_eq!(
+        (c0.build_starts, c0.finish_starts),
+        (c0.partitions, 0),
+        "{what}: {c0:?}"
+    );
+    // The greatest keys put again, one value of the load's width: the
+    // piece the seal makes is merged over the last partition, and the
+    // outputs' finishes are held at their renames.
+    db.hold_zpage_rename(true);
+    let mut rng = Rng(0xF1A1);
+    for i in 20_000 - 200..20_000 {
+        let k = numbered_key(i);
+        let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
+        db.put(&k, &v);
+        model.insert(k, vec![v]);
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    wait_for("the merge landed with its outputs' finishes held", || {
+        let c = db.zpage_counts();
+        c.finish_live >= 1 && db.merges_in_flight() == 0 && db.zpage_build_waiting()
+    });
+    let promoted = db.promotions().0;
+    numbered_run(&mut db, &mut model, 20_000, 1_500, 0xF1A2);
+    assert!(
+        db.promotions().0 > promoted,
+        "{what}: the run's piece promoted over the output: {:?}",
+        db.zpage_counts()
+    );
+    wait_steps(&db, 10);
+    db.hold_zpage_rename(false);
+    assert!(
+        tick_until_built(&db, |c| !building(c)
+            && c.finish_builds >= 1
+            && named_form_files(&dir).len() as u64 == c.partitions),
+        "{what}: every partition's file on disk: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.build_starts, c.build_orphaned, c.finish_failed),
+        (c0.build_starts + 1, 0, 0),
+        "{what}: the run's partition's build ahead and no build of the output's file: {c:?}"
+    );
+    assert_eq!(
+        c.finish_builds, c.finish_starts,
+        "{what}: every finish built its output's file: {c:?}"
+    );
+    let r = db.reader().unwrap();
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    check(&r, &model, &keys, what);
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Handles on threads read a store under the stride form while merges
@@ -16142,12 +16639,14 @@ fn the_hot_raw_policy_stands_down_beside_the_stride_form() {
 /// E2's footprint (`Maint::z_footprint`) counts a stride partition's raw
 /// footprint whole: its reads touch no page the handles count, and its
 /// value pages hold the values alone, so in the division of the keys over
-/// the served pages its keys thinned every touched block page's records and
-/// its own raw footprint was left out of the bound. A store whose lower
+/// the served pages its keys would thin every touched block page's records
+/// and leave its own raw footprint out of the bound. A store whose lower
 /// half's partitions are stride files and upper half's block files, driven
-/// to COMPACT, then read over a few keys of the block files: the bound
-/// covers the stride partitions' records, a third of the store's, where a
-/// few touched pages' share of the records is a sliver of them.
+/// to COMPACT, then read over a few keys of the block files: the part of
+/// the bound counted whole is the stride partitions' hash and records to
+/// the byte (`ZCounts::footprint_held`, `Db::zpage_stride_foot`), a third of
+/// the store's records among them, and the touched pages' share of the
+/// block partitions is beside it.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_footprint_counts_a_stride_partition_whole() {
@@ -16195,9 +16694,21 @@ fn the_footprint_counts_a_stride_partition_whole() {
         (1..=10).contains(&c.footprint_pages),
         "{what}: ten keys touch at most ten pages: {c:?}"
     );
+    // No partition is held raw, so what the bound counts whole is the
+    // stride partitions' hash and records, every byte of both.
+    assert_eq!(c.hot_raw_now, 0, "{what}: {c:?}");
+    let stride_foot = db.zpage_stride_foot();
     assert!(
-        c.footprint_bytes * 4 >= c.model_record_bytes,
-        "{what}: the stride partitions' records in the bound: {c:?}"
+        stride_foot * 4 >= c.model_record_bytes,
+        "{what}: the stride partitions a third of the store: {c:?}"
+    );
+    assert_eq!(
+        c.footprint_held, stride_foot,
+        "{what}: the stride partitions' hash and records counted whole: {c:?}"
+    );
+    assert!(
+        c.footprint_bytes > c.footprint_held,
+        "{what}: and the touched block pages' share beside them: {c:?}"
     );
     check(&r, &model, &keys, what);
     drop(r);

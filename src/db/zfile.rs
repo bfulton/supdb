@@ -121,6 +121,18 @@ pub(super) fn zpg_fields(seg: &str) -> Option<(u64, u64)> {
     Some((super::Db::name_id(seg)?, super::Db::name_end_seq(seg)?))
 }
 
+/// Whether the segments named `a` and `b` address one form file: the same
+/// two fields (`zpg_fields`), never the same name. Every check of a build
+/// in flight asks this, since a promotion re-opens a partition under a new
+/// name with the fields kept, and two builds of one form file share its
+/// temporary name: asked by name, a build held at its rename is not in
+/// flight for the re-opened partition, so a second build of the file starts
+/// beside it, its open truncates the temporary file the first may be
+/// reading back, and the word the first leaves stands for the second's file.
+pub(super) fn same_zpg(a: &str, b: &str) -> bool {
+    zpg_fields(a).is_some_and(|f| zpg_fields(b) == Some(f))
+}
+
 /// The form file a segment named `seg` would have, or `None` for a name that
 /// is not a segment's.
 pub(super) fn zpg_name_for(seg: &str) -> Option<String> {
@@ -305,17 +317,17 @@ pub(super) enum ZSeek {
 /// cursor, both read through the raw form -- or past the end.
 ///
 /// The order of the variants is the tag's, and it is chosen so that each
-/// question the block paths ask of the tag is the one compare it was before
-/// the stride form: `Stride` and `Raw` are the tag's first two, so the step's
-/// question (`advance`) is a tag under the second; the block groups the four
-/// after them and `None` last, so the block groups' range (`resume`,
-/// `walk_inner`, `next_group`) is the subtraction and compare it was. Two
-/// variants matched as two arms are two compares and two branches, which is
-/// what a stride arm beside the raw form's cost every block record and every
-/// block walk; and each test leaves the variants it gathers to a function out
-/// of line, so that the compiler does not split the one test back into a
-/// compare a variant. A block range that became one compare made `resume`'s
-/// two tests one branchless sequence, longer than the branch it replaced.
+/// question the block paths ask of the tag is one compare: `Stride` and
+/// `Raw` are the tag's first two, so the step's question (`advance`) is a tag
+/// under the second; the block groups the four after them and `None` last,
+/// so the block groups' range (`resume`, `walk_inner`, `next_group`) is a
+/// subtraction and a compare. Two variants matched as two arms are two
+/// compares and two branches, which a stride arm beside the raw form's would
+/// cost every block record and every block walk; and each test leaves the
+/// variants it gathers to a function out of line, so that the compiler does
+/// not split the one test back into a compare a variant. The block groups
+/// are not at the tag's top: there `resume`'s two tests compile to one
+/// branchless sequence, longer than the branch it replaces.
 enum Group<'a> {
     /// A stride file's position, with the file's body: the position is the
     /// cursor's rank and nothing else, its key the codec's rendering of the
@@ -1268,9 +1280,9 @@ impl<'a> ZCursor<'a> {
             self.next_group();
             return;
         }
-        // One test of the tag for a group's record, as the step made before
-        // the stride form: `Stride` and `Raw` are the tag's first two
-        // (`Group`), and the step out of line tells them apart.
+        // One test of the tag for a block group's record: `Stride` and `Raw`
+        // are the tag's first two (`Group`), and the step out of line tells
+        // them apart, so a block record's step pays no test of either.
         if matches!(self.group, Group::Stride(_) | Group::Raw) {
             self.step_off_block();
         } else {
@@ -1282,7 +1294,10 @@ impl<'a> ZCursor<'a> {
     /// `advance`'s step where the group is not a block group: a stride
     /// position's key moved to the next rank's, a run the raw form reads
     /// nothing past the rank. Out of line, so that the step's one test of the
-    /// tag is not split into a test a variant.
+    /// tag is not split into a test a variant; a record of a run the raw
+    /// form reads pays the call where it is stepped by `advance`, the merge
+    /// path's step of a fallen cursor, and the walk over such a run steps by
+    /// `raw_step` and pays none.
     #[inline(never)]
     fn step_off_block(&mut self) {
         if let Group::Stride(body) = self.group {
@@ -1380,10 +1395,9 @@ impl<'a> ZCursor<'a> {
             self.want = (limit - n).saturating_add(self.ahead);
             // The end, a stride position and a run the raw form reads, asked
             // as one test, a group outside the block groups' range of the tag
-            // (`Group`), where the walk before the stride form tested the end
-            // and the raw form apart and a test of the stride position's own
-            // at the walk's head was a compare and a branch more on every
-            // block walk.
+            // (`Group`): two tests here, or a test of the stride position's
+            // own at the walk's head, would be a compare and a branch more on
+            // every block walk.
             if !matches!(
                 self.group,
                 Group::Page(_) | Group::Buf(_) | Group::Memo(..) | Group::Coded(..)
@@ -1601,10 +1615,24 @@ impl<'a> ZCursor<'a> {
                     }
                     self.raw().values_at(self.rank, &mut |v: &[u8]| f(k, v))?;
                     n += 1;
-                    self.advance();
+                    self.raw_step();
                 }
                 Ok((n, None))
             }
+        }
+    }
+
+    /// `advance` for a run the raw form reads, which is all of it there: the
+    /// rank on, and the next group at the run's end. Inline, for the walk
+    /// over such a run, a record a step, which `advance` would send through
+    /// its step out of line (`step_off_block`).
+    #[inline]
+    fn raw_step(&mut self) {
+        debug_assert!(matches!(self.group, Group::Raw));
+        self.last_ok = false;
+        self.rank += 1;
+        if self.rank >= self.end {
+            self.next_group();
         }
     }
 
@@ -5992,6 +6020,9 @@ pub(super) struct ZEvents {
     /// stopped: a merge took the target as an input, or the store closed.
     pub build_starts: AtomicU64,
     pub build_cancelled: AtomicU64,
+    /// Builds started on the builder's thread and taken in, whatever came
+    /// of them (`ZCounts::build_collected`).
+    pub build_collected: AtomicU64,
     /// Builds collected dormant, ahead of the controller's decision
     /// (`ZCounts::prebuilt`).
     pub prebuilt: AtomicU64,
@@ -6135,9 +6166,11 @@ pub(super) struct ZEvents {
     pub sel_excess_ns: AtomicU64,
     pub sel_c_build_ns: AtomicU64,
     /// E2's footprint as the tick last computed it: the compact pages the
-    /// handles touched, summed, and the raw bound in bytes.
+    /// handles touched, summed, and the raw bound in bytes, and of it the
+    /// raw footprints counted whole (`ZCounts::footprint_held`).
     pub footprint_pages: AtomicU64,
     pub footprint_bytes: AtomicU64,
+    pub footprint_held: AtomicU64,
     /// The model's two populations as the tick last summed them over the
     /// partitions, bytes: the hash regions and the record regions.
     pub model_hash: AtomicU64,
@@ -6348,9 +6381,11 @@ pub(super) struct Built {
     /// by the kernel's count (`mincore`), which is what a build that writes
     /// its output back and drops it as it goes leaves once its last piece
     /// is dropped too (`BuildPlan::drop_output`). A build that keeps its
-    /// pages read back the page cache, which says nothing of the device:
-    /// a writeback whose error nobody reads leaves a page that reads right
-    /// until the cache gives it up and wrong from the device after.
+    /// pages read back the page cache, after reading its writeback's error
+    /// (`read_writeback`): the device acknowledged every page, which says
+    /// that the device holds what the cache does as far as the kernel
+    /// knows, and not that a read of the device returns it -- a write the
+    /// device misplaced or stored wrong is seen only by a read of it.
     pub stride_device: bool,
 }
 
@@ -6362,7 +6397,13 @@ impl Built {
     /// otherwise. An attach marks a trusted page verified for the file's
     /// life, and whatever page the cache gives up after it is read from the
     /// device's copy, at once as later, so only a read-back of the device
-    /// has seen what such an attach serves.
+    /// has seen what such an attach serves. A file with no word is checked
+    /// as one found on disk is, each value page at its first touch, and
+    /// that check is of the copy the touch reads and stands for the file's
+    /// life: a page first touched while the cache holds it is checked in
+    /// the cache's copy, which its build's writeback was acknowledged for
+    /// (`read_writeback`), and one first touched after the cache gave it up
+    /// in the device's.
     pub fn left_seal(&self) -> Option<u32> {
         self.stride_seal.filter(|_| self.stride_device)
     }
@@ -6588,7 +6629,7 @@ impl PieceSink for FileSink<'_> {
         super::start_writeback(self.file, at, piece.len() as u64);
         if self.drop {
             if let Some((a, n)) = self.prev {
-                drop_written_range(self.file, a, n);
+                drop_written_range(self.file, a, n)?;
             }
             self.prev = Some((at, piece.len() as u64));
         }
@@ -6647,35 +6688,109 @@ impl<S: PieceSink> Pieces<S> {
 
 /// A file's own pages written back and dropped from the page cache, the
 /// whole of it (`drop_written_range`).
-fn drop_written(file: &File) {
-    drop_written_range(file, 0, 0);
+fn drop_written(file: &File) -> Result<()> {
+    drop_written_range(file, 0, 0)
 }
 
 /// `[at, at + n)` of a file written back and dropped from the page cache,
-/// zero bytes being to the file's end: the writeback started and waited for
-/// by range, which asks the filesystem for no journal commit as an fsync
-/// would, then the clean pages dropped.
+/// zero bytes being to the file's end: the writeback waited for and its
+/// error read (`written_back_range`), then the clean pages dropped. The
+/// error is this call's to answer: the wait consumes it for the descriptor,
+/// so no later wait or sync of the file sees it, and a page whose writeback
+/// failed and that the drop skipped -- one a mapping holds -- reads right
+/// from the cache and wrong from the device.
 #[cfg(target_os = "linux")]
-fn drop_written_range(file: &File, at: u64, n: u64) {
+fn drop_written_range(file: &File, at: u64, n: u64) -> Result<()> {
     use std::os::unix::io::AsRawFd;
-    let (at, n) = (at as libc::off64_t, n as libc::off64_t);
-    // SAFETY: a writeback and an advice over a descriptor this call holds
-    // open; neither changes a byte of the file.
+    written_back_range(file, at, n)?;
+    // SAFETY: an advice over a descriptor this call holds open; it changes
+    // no byte of the file.
     unsafe {
-        libc::sync_file_range(
+        libc::posix_fadvise(
             file.as_raw_fd(),
-            at,
-            n,
-            libc::SYNC_FILE_RANGE_WAIT_BEFORE
-                | libc::SYNC_FILE_RANGE_WRITE
-                | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+            at as libc::off64_t,
+            n as libc::off64_t,
+            libc::POSIX_FADV_DONTNEED,
         );
-        libc::posix_fadvise(file.as_raw_fd(), at, n, libc::POSIX_FADV_DONTNEED);
     }
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn drop_written_range(_file: &File, _at: u64, _n: u64) {}
+fn drop_written_range(_file: &File, _at: u64, _n: u64) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's: the next writeback wait on this thread answers an error,
+    /// once, as a write the device failed answers the first wait that reads
+    /// it and no wait after (`fail_next_writeback`).
+    static WRITEBACK_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A test's: the next wait for a writeback on this thread
+/// (`written_back_range`) answers an error, once -- what no input of a test
+/// can make.
+#[cfg(test)]
+fn fail_next_writeback(on: bool) {
+    WRITEBACK_FAILS.with(|f| f.set(on));
+}
+
+/// `[at, at + n)` of a file's writeback started and waited for and its
+/// error read, zero bytes being to the file's end: `sync_file_range` with
+/// both waits, which reports a writeback error the descriptor has not yet
+/// seen as an fsync does, once, and asks the filesystem for no journal
+/// commit and the device for no flush, as an fsync would. Off Linux, where
+/// nothing waits for a range, the file's sync. A test's seam answers an
+/// error once (`fail_next_writeback`).
+fn written_back_range(file: &File, at: u64, n: u64) -> Result<()> {
+    #[cfg(test)]
+    if WRITEBACK_FAILS.with(|f| f.replace(false)) {
+        return Err(std::io::Error::other(
+            "the form file's writeback was made to fail",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: a writeback over a descriptor this call holds open; it
+        // reads and writes no memory of ours.
+        let rc = unsafe {
+            libc::sync_file_range(
+                file.as_raw_fd(),
+                at as libc::off64_t,
+                n as libc::off64_t,
+                libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                    | libc::SYNC_FILE_RANGE_WRITE
+                    | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (at, n);
+        file.sync_data()
+    }
+}
+
+/// A stride file's writeback waited for and its error read before its
+/// read-back (`write_stride`): every page of it on the device as the cache
+/// holds it, as far as the kernel knows, or the build fails. A read-back
+/// that reads the cache checks the cache's copy, and so does a page's check
+/// at its first touch while the cache still holds the page, which stands
+/// for the file's life: the copy the reads take once the cache gives the
+/// page up is the device's, and a writeback error nobody read leaves that
+/// copy wrong under a check of the right one. A build that drops its
+/// output reads the error of each piece's writeback but the last's as it
+/// drops the piece (`drop_written_range`), and this wait reads the last's.
+fn read_writeback(file: &File) -> Result<()> {
+    written_back_range(file, 0, 0)
+}
 
 /// A partition built ahead turned, in the page cache, into what a build
 /// past the budget leaves (`Options::zpages_land_drop_past`): the
@@ -6844,9 +6959,12 @@ pub(super) struct BuildPlan {
     /// build's own thread (`Options::zpages_build_sync`): its pages reach
     /// the device by `sync_file_range`, which asks for no flush of the
     /// device's write-back cache, and the next fsync anyone issues pays
-    /// that flush. The sync's error is the file's alone: a form file is
-    /// checked page by page at its attach, and one a crash tore is refused
-    /// there and built again.
+    /// that flush. The sync asks for that flush alone, and its error is the
+    /// file's: a build that drops its output read every writeback error as
+    /// it dropped each piece (`drop_written_range`), so a flush that fails
+    /// is one a crash may tear the file over, and a file a crash tore is a
+    /// file found on disk, checked page by page as its reads first touch it
+    /// and built again where a page is refused.
     pub sync: bool,
     /// Whether the build asks for the stride form, and what it builds
     /// where the partition does not qualify.
@@ -6856,6 +6974,12 @@ pub(super) struct BuildPlan {
     /// shown to refuse what it is for.
     #[cfg(test)]
     pub damage: Option<fn(&Path)>,
+    /// A test's: the kernel's count of the stride file's pages it holds as
+    /// the read-back begins answers nothing (`read_back_residency`), as a
+    /// `mincore` that fails answers, which a mapping a test holds cannot
+    /// make.
+    #[cfg(test)]
+    pub residency_unknown: bool,
 }
 
 impl BuildPlan {
@@ -6880,6 +7004,8 @@ impl BuildPlan {
             stride: StrideAsk::No,
             #[cfg(test)]
             damage: None,
+            #[cfg(test)]
+            residency_unknown: false,
         }
     }
 
@@ -7264,7 +7390,7 @@ fn write_pages(
     w.push(&t.encode())?;
     w.flush()?;
     if plan.drop_output {
-        drop_written(&out);
+        drop_written(&out)?;
     }
     let file_bytes = w.at;
     debug_assert_eq!(Some(file_bytes), t.expected_file_len());
@@ -7604,12 +7730,13 @@ fn write_stride(
     if let Some(damage) = plan.damage {
         damage(tmp);
     }
+    read_writeback(&out)?;
     if plan.drop_output {
-        drop_written(&out);
+        drop_written(&out)?;
     }
     let mut dropped = 0usize;
     let mut looked = 0usize;
-    let checked = check_stride(tmp, &images, facts, id, end_seq, &mut |r| {
+    let checked = check_stride(tmp, &images, facts, id, end_seq, plan, &mut |r| {
         let at = rec_at(r);
         if r == 0 || at - looked >= plan.window {
             if plan.cancelled() {
@@ -7636,7 +7763,7 @@ fn write_stride(
     forget(recs_at + dropped, recs_at + recs.len());
     forget(dir_at, dir_at + dir.len());
     if plan.drop_output {
-        drop_written(&out);
+        drop_written(&out)?;
     }
     Ok(Outcome::Built(Built {
         fill: FillStats {
@@ -7656,6 +7783,20 @@ fn write_stride(
         stride_seal: trailer_crc(&sealed),
         stride_device: device,
     }))
+}
+
+/// The kernel's count of the pages of the mapped stride file it holds as
+/// the read-back begins (`MmapBytes::resident_count`), or `None` where it
+/// would not say: a count refused is no count of none, and only a count of
+/// none says the read-back reads the device (`check_stride`). A test's seam
+/// answers `None` (`BuildPlan::residency_unknown`).
+fn read_back_residency(map: &MmapBytes, plan: &BuildPlan) -> Option<usize> {
+    #[cfg(test)]
+    if plan.residency_unknown {
+        return None;
+    }
+    let _ = plan;
+    map.resident_count(0, map.0.len())
 }
 
 /// What the read-back of a stride file found (`check_stride`).
@@ -7692,17 +7833,19 @@ enum StrideCheck {
 /// word that the pieces were dropped: a drop is advice, and a page it
 /// skips -- dirty, locked, mapped -- is read back from the cache with
 /// nothing said.
+#[allow(clippy::too_many_arguments)]
 fn check_stride(
     tmp: &Path,
     images: &SegImages,
     facts: &ZSource,
     id: u64,
     end_seq: u64,
+    plan: &BuildPlan,
     each: &mut dyn FnMut(usize) -> bool,
 ) -> Result<StrideCheck> {
     let refused = StrideCheck::Refused(Outcome::NotStride(StrideNo::SelfCheck));
     let map = MmapBytes::open(tmp)?;
-    let device = map.resident_count(0, map.0.len()) == Some(0);
+    let device = read_back_residency(&map, plan) == Some(0);
     let bytes: &[u8] = &map.0;
     let Ok(body) = StrideBody::from_bytes(bytes) else {
         return Ok(refused);
@@ -15121,6 +15264,94 @@ mod tests {
                 opts(ZStride::Off, true).z_stride_attach_built(&b),
                 StrideAttach::Refuse,
                 "{what}: the form off"
+            );
+        }
+    }
+
+    /// A build reads its own writeback's error where it waits for the
+    /// writeback, and an error fails the build with nothing named and the
+    /// temporary name gone. A stride build reads it before its read-back
+    /// (`read_writeback`): a read-back of the cache checks the cache's copy,
+    /// which a write the device failed leaves right over a wrong one on the
+    /// device, the copy every read takes once the cache gives the page up.
+    /// A build that drops its output, of either body, reads it as it drops
+    /// each piece (`drop_written_range`), and that wait is the only one that
+    /// sees it: the kernel reports a writeback error once to a descriptor,
+    /// and the seam answers the first wait after it is armed and no other
+    /// (`fail_next_writeback`), as the kernel would. A block build that keeps
+    /// its pages waits for nothing, and builds with the seam armed. Without
+    /// the seam every plan builds its file.
+    #[test]
+    fn a_build_whose_writeback_fails_names_nothing() {
+        let fx = stride_fixture("stride-wbfail", 3000, 100, 0x5e);
+        let linux = cfg!(target_os = "linux");
+        for (ask, drop_output, fails) in [
+            (StrideAsk::OrBlock, false, true),
+            (StrideAsk::OrBlock, true, true),
+            (StrideAsk::No, true, linux),
+            (StrideAsk::No, false, false),
+        ] {
+            let what = format!("{ask:?}, drop_output {drop_output}");
+            let _ = std::fs::remove_file(&fx.out);
+            let plan = BuildPlan {
+                drop_output,
+                ..stride_plan(ask)
+            };
+            fail_next_writeback(true);
+            let made = build(&fx.seg, &fx.out, ID, END, &plan);
+            fail_next_writeback(false);
+            if fails {
+                assert!(made.is_err(), "{what}: {made:?}");
+                assert!(!fx.out.exists(), "{what}: nothing named");
+            } else {
+                assert!(
+                    matches!(made, Ok(Outcome::Built(_))),
+                    "{what}: no wait, no error: {made:?}"
+                );
+            }
+            assert!(
+                !fx.out.with_extension("zpg.tmp").exists(),
+                "{what}: the temporary name gone"
+            );
+            let _ = std::fs::remove_file(&fx.out);
+            let want = if ask == StrideAsk::No {
+                FileCoding::Block
+            } else {
+                FileCoding::Stride
+            };
+            match build(&fx.seg, &fx.out, ID, END, &plan).unwrap() {
+                Outcome::Built(b) if b.coding == want => {}
+                other => panic!("{what}: not the file asked for: {other:?}"),
+            }
+        }
+    }
+
+    /// The read-back's word that it read the device is the kernel's count
+    /// of none of the file's pages cached, and a count the kernel will not
+    /// give is no count of none: a build that drops its output and whose
+    /// count is refused leaves no word (`read_back_residency`). The seam
+    /// answers the refusal, which a `mincore` over a live mapping never
+    /// makes; the same plan without it leaves its word on Linux.
+    #[test]
+    fn a_stride_build_whose_residency_is_unknown_leaves_no_word() {
+        let fx = stride_fixture("stride-nores", 3000, 100, 0x5f);
+        for unknown in [true, false] {
+            let _ = std::fs::remove_file(&fx.out);
+            let plan = BuildPlan {
+                drop_output: true,
+                residency_unknown: unknown,
+                ..stride_plan(StrideAsk::OrBlock)
+            };
+            let b = match build(&fx.seg, &fx.out, ID, END, &plan).unwrap() {
+                Outcome::Built(b) if b.coding == FileCoding::Stride => b,
+                other => panic!("not a stride file: {other:?}"),
+            };
+            let device = !unknown && cfg!(target_os = "linux");
+            assert!(b.stride_seal.is_some(), "unknown {unknown}");
+            assert_eq!(
+                (b.stride_device, b.left_seal().is_some()),
+                (device, device),
+                "the count refused {unknown}"
             );
         }
     }
