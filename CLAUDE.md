@@ -2111,7 +2111,11 @@ open finds a prefix of what was acknowledged before it. Seal is write to a temp 
 rename into place, publish to readers, fsync, then the manifest -- one of
 two slot files written in place and fdatasynced, the newest valid slot by
 its publish sequence being the store at open, so a torn publish is the
-slot an open ignores (`Options::manifest_slots`; the shape before it wrote
+slot an open ignores; a publish never writes the slot that holds the
+newest manifest known durable, the last whose fdatasync returned, so the
+slot it does not write is one the device holds whole, and the open
+fdatasyncs the slot it takes before it removes a file or writes over the
+other (`Options::manifest_slots`, `SlotChoice`; the shape before it wrote
 a temp name, renamed it over the old manifest and fsynced the directory,
 `supdb-ingestmanifestrename`). A seal that fails at any step -- its
 landing, its directory's fsync there, the fsync or the envelope of its
@@ -2142,7 +2146,10 @@ follows on the segment work's thread with the WAL's and temp names'
 retirement behind it (`Options::flush_waits_manifest` is the shape that
 waited, `supdb-waitmanifest`): the round trip was a tenth of a
 ten-thousand-key drain, and a crash inside it is a torn newest slot, the
-case the slots were made for. A buffered store's flush commits what is
+case the slots were made for, since any publish before that fdatasync
+writes the same slot again and never the other, giving the owed sync
+up before its write begins, so a write that fails leaves nothing to
+name the slot durable. A buffered store's flush commits what is
 staged under its policy, with no sync (`Options::drain_syncs_wal` is the
 shape that fsynced the whole log first, `supdb-ingestwalsync`), so its
 drain is answered behind the slot's fdatasync instead: the log's
@@ -2397,6 +2404,61 @@ after a reopen and cut the power. The rule: what an open rebuilds from a
 log is as durable as the device has been told, not as the read found
 it, and the open hands the live path the same marks the writes that
 made it would have left -- unsynced, and loose where a sync is owed.
+It came back at the manifest: the open took the newest valid slot as
+the store and synced none, and a slot a drain had written with its
+fdatasync owed is in the page cache alone after a kill; the reopened
+store's first publish wrote over the other slot, the one the device
+held, and a power cut tearing that write left no slot that named the
+store. The open fdatasyncs the slot it takes now, before it unlinks
+anything a slot does not name.
+
+**A slot chosen by its sequence, beside a sync left owed.** The
+manifest's two slots were written by the publish sequence's parity, on
+the reading that the slot before a publish is always durable; the
+drain's slot then had its fdatasync deferred past the answer, and a
+merge's or a promotion's publish in the same drain, or a second seal's,
+wrote the next sequence into the other slot -- the newest durable one --
+while the first was still owed, and dropped the owed sync. A power cut
+tearing that write left the device the older slot, whose retirements
+had run, and the open refused the store over acknowledged commits, or
+both slots torn. Every test of the slots tore the newest slot by hand
+on a store at rest, where the slot before it was durable. Each publish
+now writes the slot that does not hold the newest manifest known
+durable, and a slot is known durable when an fdatasync covering its
+last write has returned (`SlotChoice`), so two publishes with no sync
+between them write one slot twice; the tests watch every slot write
+(`Db::watch_slot_writes`) and build what a cut during it leaves from
+which writes a sync covered. The rule: of two copies kept so that one
+stands while the other is written, the one written is chosen by which
+is known durable, never by a counter, and "known" is a sync that
+returned, never one issued or owed; and a deferral of a sync is checked
+against every step that can follow it before the sync runs. It came
+back on the failure path of the same window: the publish after an owed
+slot writes that slot's file, and a write that failed part way returned
+before the publish gave the owed entry up, so the owed fdatasync ran
+after it, returned over the torn bytes, named the slot durable and
+retired the log behind it, and the next publish went into the only
+valid slot. A sync of a descriptor covers whatever the file holds when
+it runs, not the write it was owed for, so a write into an owed slot
+gives the owed entry up before it begins (`Maint::write_slot`), and a
+test tears that write (`Db::tear_next_slot_write`); another fails a
+slot's fdatasync (`Db::fail_next_slot_sync`), since a slot named durable
+where its sync was issued, not where it returned, is invisible to every
+test whose syncs succeed. The corollary: a
+record of what a pending sync will make durable is dropped the moment
+anything else writes the bytes it covers, on the path where the write
+fails as on the one where it succeeds. And the open's own sync of the
+slot it takes was held only by a test that reads the kernel's page
+flags, which only root may, so in the gate it ran nothing, and the
+order it keeps -- the slot durable before the sweep unlinks what the
+other slot names -- was called unobservable on the reading that no
+unsynced slot names less than the one before it, which a kill between
+a merge's slot write and its fdatasync makes false. A seam fails that
+sync (`Options::fail_open_slot_sync`) and the open is held to leaving
+the directory as it found it. The corollary: a check whose only test
+needs a privilege the gate does not have is a check nothing runs, and a
+claim that an order is unobservable is checked against the kill between
+every write and its sync before it is written down.
 
 **A path only one arm exercises is a path nothing tests.** A delete was never
 marked dirty, and the checkpoint asked to carry it dropped it, leaving the key
@@ -2409,7 +2471,14 @@ arena's block table by the tag, and six sittings of the stream as an arm
 never ran a scan over a run in progress with the cache on; the gate's first
 run with the stream as the default did, in a test written for another bug.
 Flipping the default is the test an arm never gets, so flip it under the
-gate before pricing it as the default.
+gate before pricing it as the default. It came back as a mode
+beside an arm: the open's check that a pending slot's segments read
+back whole walked each with the whole-section scan, which a segment
+read by the piece refuses, so under a cipher every pending slot read as
+torn and the open took the slot before it, whose log the pending
+landing had retired; no test had run `manifest_pending` under a cipher
+and cut the power. An arm's crash test runs under every mode the arm
+can be set beside.
 
 **The sharp edges of a log are in the bookkeeping around it, never in the
 append.** A value-carrying log queued a key twice when it sealed, re-queued
