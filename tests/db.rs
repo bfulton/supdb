@@ -12,7 +12,7 @@ use supdb::{Db, Isolation, Options, ReadAdvice, Reader};
 mod common;
 #[cfg(target_os = "linux")]
 use common::cached_pages;
-use common::{dead_arena, kv, vf, without_the_clock};
+use common::{dead_arena, kv, manifest_v2_of, vf, without_the_clock};
 
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-{name}-{}", std::process::id()));
@@ -73,23 +73,6 @@ fn manifest_names_v3(bytes: &[u8]) -> Vec<(String, bool)> {
         p += 1;
     }
     out
-}
-
-/// CRC32C (Castagnoli) resumed from `seed`, as the manifest's header
-/// carries it over its sequence and body, for a slot a test writes by hand.
-fn crc32c_from(seed: u32, data: &[u8]) -> u32 {
-    let mut crc = !seed;
-    for &b in data {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0x82F6_3B78
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    !crc
 }
 
 /// The newest manifest in `d`, by its publish sequence, with the slot it
@@ -15735,22 +15718,8 @@ fn a_store_from_before_the_pending_flags_opens_with_both_slots_rewritten() {
         .into_iter()
         .map(|(n, _)| n)
         .collect();
-    let covered = &bytes[25..33];
-    let mut body = Vec::new();
-    body.extend_from_slice(covered);
-    body.extend_from_slice(&(names.len() as u32).to_le_bytes());
-    for n in &names {
-        body.extend_from_slice(&(n.len() as u16).to_le_bytes());
-        body.extend_from_slice(n.as_bytes());
-    }
     let seq2 = seq + 1;
-    let crc = crc32c_from(crc32c_from(0, &seq2.to_le_bytes()), &body);
-    let mut v2 = Vec::new();
-    v2.extend_from_slice(b"SUPDBMAN\x02");
-    v2.extend_from_slice(&seq2.to_le_bytes());
-    v2.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    v2.extend_from_slice(&crc.to_le_bytes());
-    v2.extend_from_slice(&body);
+    let v2 = manifest_v2_of(&bytes, seq2);
     std::fs::write(d.join(MANIFEST_SLOTS[(seq2 % 2) as usize]), &v2).unwrap();
     let db = Db::open(&d, opts).unwrap();
     for k in (0..2000u32).step_by(97) {
