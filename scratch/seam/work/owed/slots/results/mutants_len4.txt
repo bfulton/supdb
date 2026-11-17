@@ -1,0 +1,72 @@
+== slots open_read=device parity=1 maxlen=4 alpha=WUOBEFwVsKXP runs 21470 states {'proc': 64850, 'any': 151350} violations 35156 secs 3.9
+    ('any', 'LOSS') 1147
+    ('any', 'NO_SLOT') 27843
+    ('proc', 'LOSS') 99
+    ('proc', 'NO_SLOT') 6067
+  first ('any', 'LOSS') ('LOSS', 0, 'acked', 1)
+     ops ('W', 'U', 'U')
+     trace ['W', 'U', 'U']
+     reads [('VALID', 2, 0, ((2, 0), (2, 1), (2, 2)), None), ('TORN',)]
+  first ('any', 'NO_SLOT') ('NO_SLOT', 'REFUSE')
+     ops ('U', 'U')
+     trace ['U', 'U']
+== slots land_issue=1 open_read=device maxlen=4 alpha=WUOBEFwVsKXP runs 21470 states {'proc': 61942, 'any': 131929, 'claim': 16494} violations 66158 secs 4.2
+    ('any', 'LOSS') 36182
+    ('any', 'NO_SLOT') 13090
+    ('claim', 'CLAIM') 16494
+    ('proc', 'LOSS') 131
+    ('proc', 'NO_SLOT') 261
+  first ('any', 'LOSS') ('LOSS', 0, 'acked', 1)
+     ops ('U',)
+     trace ['U']
+     reads [('VALID', 2, 0, ((2, 0), (2, 1), (2, 2)), None), ('EMPTY',)]
+  first ('any', 'NO_SLOT') ('NO_SLOT', 'REFUSE')
+     ops ('U', 'U')
+== slots keep_owed=1 open_read=device maxlen=4 alpha=WUOBEFwVsKXP runs 21470 states {'proc': 63739, 'any': 111846, 'claim': 498} violations 1286 secs 3.0
+    ('any', 'LOSS') 445
+    ('any', 'NO_SLOT') 112
+    ('claim', 'CLAIM') 498
+    ('proc', 'LOSS') 195
+    ('proc', 'NO_SLOT') 36
+  first ('any', 'LOSS') ('LOSS', 0, 'acked', 1)
+     ops ('U', 'w', 'O')
+     trace ['U', 'w', 'w1', 'O']
+     reads [('VALID', 2, 0, ((2, 0), (2, 1), (2, 2)), None), ('TORN',)]
+  first ('any', 'NO_SLOT') ('NO_SLOT', 'REFUSE')
+     ops ('U', 'w', 'O', 'U')
+== slots open_read=device open_sync=none maxlen=4 alpha=WUOBEFwVsKXP runs 21470 states {'proc': 65999, 'any': 156947, 'claim': 1260} violations 13324 secs 3.6
+    ('any', 'LOSS') 2956
+    ('any', 'LOSS_BRANCH') 7634
+    ('any', 'NO_SLOT') 1462
+    ('claim', 'CLAIM') 1260
+    ('proc', 'LOSS_BRANCH') 12
+  first ('any', 'LOSS') ('LOSS', 0, 'acked', 1)
+     ops ('U', 'X')
+     trace ['U', 'X']
+     reads [('VALID', 2, 0, ((2, 0), (2, 1), (2, 2)), None), ('EMPTY',)]
+  first ('any', 'LOSS_BRANCH') ('LOSS_BRANCH', 4)
+     ops ('U', 'K')
+== slots noidx=1 open_read=device maxlen=4 alpha=WUOBEFwVsKXP runs 21470 states {'proc': 63772, 'any': 112230} violations 0 secs 3.2
+== slots nocheck=1 open_read=device maxlen=4 alpha=WUOBEFwVsKXP runs 21470 states {'proc': 43376, 'any': 83326} violations 44153 secs 2.5
+    ('any', 'WRONG') 25466
+    ('proc', 'WRONG') 18687
+  first ('any', 'WRONG') ('WRONG', 'mixed')
+     ops ('w',)
+     trace ['w', 'w1']
+     reads [('VALID', 2, 0, ((2, 0), (2, 1), (2, 2)), None), ('VALID', 4, 1, ((4, 0), None), None)]
+  first ('proc', 'WRONG') ('WRONG', 'mixed')
+     ops ('w',)
+     trace ['w', 'w1']
+     reads [('VALID', 2, 0, ((2, 0), (2, 1), (2, 2)), None), ('VALID', 4, 1, ((4, 0), None), None)]
+== slots count_reuse=1 open_read=device maxlen=4 alpha=WUOBEFwVsKXP runs 21470 states {'proc': 63772, 'any': 112230, 'seal': 9319} violations 9319 secs 3.4
+    ('seal', 'NONCE') 9319
+  first ('seal', 'NONCE') ('NONCE', 'reuse')
+     ops ('w', 'W')
+     trace ['w', 'w1', 'W']
+== slots open_read=device prefix_fixed=1 maxlen=4 alpha=WUOBEFwVsKXP runs 21470 states {'proc': 63772, 'any': 112230, 'seal': 17105} violations 17105 secs 3.2
+    ('seal', 'NONCE') 17105
+  first ('seal', 'NONCE') ('NONCE', 'reuse')
+     ops ('K', 'W')
+     trace ['K', 'K1', 'W']
+== slots open_read=device torn_empty=1 maxlen=4 alpha=WUOBEFwVsKXP runs 21470 states {'proc': 63772, 'any': 112230} violations 0 secs 3.2
+== slots open_read=device open_sync=taken maxlen=4 alpha=WUOBEFwVsKXP runs 21470 states {'proc': 63772, 'any': 112230} violations 0 secs 3.3

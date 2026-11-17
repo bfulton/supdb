@@ -1,0 +1,26 @@
+### stream.py sfail maxlen=6 chain=1 wait=False sync_rule=max
+sequences 5893 complete
+== stream sfail chain=1 sync_rule=max wait=False maxlen=6 runs 5893 blocked 0 sampled 0 states {'proc': 9245, 'any': 106671} violations 0 secs 2.1
+### stream.py sfail maxlen=6 chain=1 wait=True sync_rule=assign
+sequences 5893 complete
+== stream sfail chain=1 sync_rule=assign wait=True maxlen=6 runs 5893 blocked 0 sampled 0 states {'proc': 9245, 'any': 106671} violations 0 secs 2.3
+### stream.py sfail maxlen=6 chain=1 wait=False sync_rule=assign
+sequences 5893 complete
+== stream sfail chain=1 sync_rule=assign wait=False maxlen=6 runs 5893 blocked 0 sampled 0 states {'proc': 9245, 'any': 106671} violations 0 secs 2.4
+### stream.py sfail maxlen=6 chain=1 wait=False sync_rule=max keep_err=0
+sequences 5893 complete
+== stream sfail chain=1 keep_err=0 sync_rule=max wait=False maxlen=6 runs 5893 blocked 0 sampled 0 states {'proc': 9245, 'any': 106671} violations 3820 secs 2.1
+    ('any', 'LOSS') 3820
+  first ('any', 'LOSS') ('LOSS', 0, 'acked', 1)
+     ops (1, 'B', 'F', 'S')
+     view {}
+### stream.py sfail maxlen=6 chain=1 wait=False sync_rule=max err_later_only=1
+sequences 5893 complete
+== stream sfail chain=1 err_later_only=1 sync_rule=max wait=False maxlen=6 runs 5893 blocked 0 sampled 0 states {'proc': 9245, 'any': 106671} violations 0 secs 2.7
+### stream.py sfail maxlen=6 chain=1 wait=True sync_rule=max keep_err=0
+sequences 5893 complete
+== stream sfail chain=1 keep_err=0 sync_rule=max wait=True maxlen=6 runs 5893 blocked 0 sampled 0 states {'proc': 9245, 'any': 106671} violations 3820 secs 1.8
+    ('any', 'LOSS') 3820
+  first ('any', 'LOSS') ('LOSS', 0, 'acked', 1)
+     ops (1, 'B', 'F', 'S')
+     view {}

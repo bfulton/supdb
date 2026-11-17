@@ -1,0 +1,17 @@
+# Stream as decision 2 takes it (chain=1), under the SYNCOP driver
+stream.py ooo maxlen=7 chain=1 wait=True sync_rule=assign
+stream.py ooo maxlen=7 chain=1 wait=False sync_rule=max
+stream.py ooo maxlen=7 chain=1 wait=False sync_rule=assign
+stream.py ooox maxlen=7 chain=1 wait=True sync_rule=assign
+stream.py ooox maxlen=7 chain=1 wait=False sync_rule=max
+stream.py ooox maxlen=7 chain=1 wait=False sync_rule=assign
+stream.py sfail maxlen=6 chain=1 wait=True sync_rule=assign
+stream.py sfail maxlen=6 chain=1 wait=False sync_rule=max
+stream.py sfail maxlen=6 chain=1 wait=False sync_rule=assign
+# mutants
+stream.py ooo maxlen=7 chain=1 wait=False sync_rule=max cover_at_completion=1
+stream.py ooo maxlen=7 chain=1 wait=True sync_rule=max cover_at_completion=1
+stream.py sfail maxlen=6 chain=1 wait=False sync_rule=max keep_err=False
+stream.py sfail maxlen=6 chain=1 wait=True sync_rule=max keep_err=False
+stream.py sfail maxlen=6 chain=1 wait=False sync_rule=max err_later_only=True
+stream.py sfail maxlen=6 chain=1 wait=True sync_rule=max err_later_only=True

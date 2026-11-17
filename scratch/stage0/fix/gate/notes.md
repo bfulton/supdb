@@ -1,0 +1,3 @@
+Gate run on HEAD 561ce7ef69c67817d27685a4fcad444832b22cc7. Step: sh scripts/check.sh running, log /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/stage0/fix/gate/check.log, exit in /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/stage0/fix/gate/check.exit. TMPDIR=/tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/stage0/tmp/gate
+step: gate2 check.sh running, log /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/stage0/fix/gate/check2.log
+gate2 done: EXIT 0, all groups green; tmp removed

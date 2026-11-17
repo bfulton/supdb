@@ -1,0 +1,6 @@
+   refused opens 0 skipped ops 1149 slot table full 0
+== spill n=4 alpha=CTDPRUXLctdpru {'bind': 'seq'} runs 4735 blocked 0 states {'proc': 177606, 'any': 767174} violations 40 secs 4.5
+    ('any', 'MISNAMED') 40
+  first ('any', 'MISNAMED') ('MISNAMED', 'L4', 'made for', 'L12')
+     ops pLP
+     trace [('create', 'n0'), ('data', 'i0'), ('fsync', 'i0'), ('sync_dir',), ('man write', ('n0',)), ('man sync',), '--', 'p', ('rec', 'L4'), ('link', 'L4'), 'L', 'P', ('rec', 'L12'), ('link', 'L12')]

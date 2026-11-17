@@ -1,0 +1,6 @@
+   refused opens 0 skipped ops 912 slot table full 0
+== spill n=4 alpha=CTDPRUXLctdpru {'cutk': 3} runs 4735 blocked 0 states {'proc': 127678, 'any': 350129} violations 3088 secs 2.1
+    ('any', 'UNNAMED') 3088
+  first ('any', 'UNNAMED') ('UNNAMED', 'L6')
+     ops CrXC
+     trace [('create', 'n0'), ('data', 'i0'), ('fsync', 'i0'), ('sync_dir',), ('man write', ('n0',)), ('man sync',), '--', 'C', ('create', 't7'), ('data', 'i4'), ('rec', 'L6'), ('rename', 'L6'), ('fsync', 'i4'), ('sync_dir',), ('man write', ('n0', 'L6')), ('man sync',), 'r', ('create', 't16'), ('data', 'i14'), ('fsync', 'i14'), ('rec', 'L6'), ('rename', 'L6'), 'X', ('unlink', ('sweep', 'L6')), 'C', ('create', 't26'), ('data', 'i23'), ('rec', 'L25'), ('rename', 'L25')]

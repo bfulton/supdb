@@ -1,0 +1,8 @@
+syncop.py ooo maxlen=7 R=5 wait=True sync_rule=assign secs=550
+syncop.py ooo maxlen=6 R=5 wait=True sync_rule=max secs=550
+syncop.py ooo maxlen=6 R=5 wait=False sync_rule=assign secs=550
+syncop.py fail maxlen=6 R=5 wait=False sync_rule=max secs=550
+syncop.py fail maxlen=6 R=5 wait=False sync_rule=max keep_err=False secs=550
+syncop.py fail maxlen=6 R=5 wait=False sync_rule=max err_later_only=True secs=550
+syncop.py fail maxlen=6 R=5 wait=True sync_rule=assign secs=550
+syncop.py fail maxlen=6 R=5 wait=True sync_rule=assign keep_err=False secs=550

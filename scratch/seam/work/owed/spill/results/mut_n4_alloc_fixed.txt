@@ -1,0 +1,10 @@
+   refused opens 144 skipped ops 1095 slot table full 0
+== spill n=4 alpha=CTDPRUXLctdpru {'alloc': 'fixed'} runs 4735 blocked 0 states {'proc': 169766, 'any': 644347} violations 23412 secs 4.0
+    ('any', 'UNNAMED') 17716
+    ('proc', 'UNNAMED') 5696
+  first ('any', 'UNNAMED') ('UNNAMED', 'L6')
+     ops CP
+     trace [('create', 'n0'), ('data', 'i0'), ('fsync', 'i0'), ('sync_dir',), ('man write', ('n0',)), ('man sync',), '--', 'C', ('create', 't7'), ('data', 'i4'), ('rec', 'L6'), ('rename', 'L6'), ('fsync', 'i4'), ('sync_dir',), ('man write', ('n0', 'L6')), ('man sync',), 'P', ('rec', 'L14'), ('link', 'L14')]
+  first ('proc', 'UNNAMED') ('UNNAMED', 'L6')
+     ops CP
+     trace [('create', 'n0'), ('data', 'i0'), ('fsync', 'i0'), ('sync_dir',), ('man write', ('n0',)), ('man sync',), '--', 'C', ('create', 't7'), ('data', 'i4'), ('rec', 'L6'), ('rename', 'L6'), ('fsync', 'i4'), ('sync_dir',), ('man write', ('n0', 'L6')), ('man sync',), 'P', ('rec', 'L14')]

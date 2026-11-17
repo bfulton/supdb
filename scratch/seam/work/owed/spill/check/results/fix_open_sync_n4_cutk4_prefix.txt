@@ -1,0 +1,2 @@
+   refused opens 0 skipped ops 867 slot table full 0
+== spill n=4 alpha=CTDPRUXLctdpru {'dir_mode': 'prefix', 'cutk': 4, 'open_sync': True} runs 4735 blocked 0 states {'proc': 129840, 'any': 242708} violations 0 secs 1.9
