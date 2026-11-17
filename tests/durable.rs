@@ -9431,20 +9431,33 @@ fn an_open_under_a_cipher_adopts_a_pending_segment_and_opens_again() {
 /// an older partition the merge left alone; and under a buffered
 /// policy, a seal's segments synced beside a log whose frames for them a
 /// power cut took, the publish of their landing torn -- the store as it
-/// was before those writes, which no sync acknowledged. Each opens with every acknowledged write, the unnamed files swept.
+/// was before those writes, which no sync acknowledged; a run's segment
+/// whose superblock the power cut took, under both its names, so that
+/// neither opens as a segment; and a merge's output of no record, every
+/// key of its partition deleted. Each opens with every acknowledged
+/// write, the unnamed files swept.
 #[test]
 fn the_windows_a_torn_publish_leaves_open_through_the_slot_before() {
-    for case in ["seal", "run", "merge", "inputs", "inputs-old", "buffered"] {
+    for case in [
+        "seal",
+        "run",
+        "run-torn",
+        "merge",
+        "empty",
+        "inputs",
+        "inputs-old",
+        "buffered",
+    ] {
         let d = dir(&format!("oo-win-{case}"));
         let c = dir(&format!("oo-win-{case}-kill"));
         let opts = Options {
-            partition_on_flush: case == "seal" || case == "run" || case == "buffered",
+            partition_on_flush: case == "seal" || case.starts_with("run") || case == "buffered",
             sync: if case == "buffered" {
                 SyncPolicy::EveryN(u32::MAX)
             } else {
                 SyncPolicy::Always
             },
-            flush_schedules: case == "merge" || case.starts_with("inputs"),
+            flush_schedules: case == "merge" || case == "empty" || case.starts_with("inputs"),
             seal_bytes: 1 << 20,
             l0_trigger: 1000,
             ..Options::default()
@@ -9513,7 +9526,7 @@ fn the_windows_a_torn_publish_leaves_open_through_the_slot_before() {
                     seg_names(&d).iter().any(|n| !before.contains(n))
                 });
             }
-            "run" => {
+            "run" | "run-torn" => {
                 for k in 0..3000u32 {
                     let k = format!("run-{k:06}").into_bytes();
                     db.append(&k, b"r");
@@ -9532,6 +9545,13 @@ fn the_windows_a_torn_publish_leaves_open_through_the_slot_before() {
                 if case == "merge" {
                     for k in (0..2000u32).step_by(3) {
                         put(&mut db, &mut model, key(k).into_bytes(), b"v1");
+                    }
+                } else if case == "empty" {
+                    // Every key of the partition deleted: the merge's
+                    // output is a partition of no record.
+                    for k in 0..2000u32 {
+                        db.delete(key(k).as_bytes());
+                        model.insert(key(k).into_bytes(), Vec::new());
                     }
                 } else {
                     // The partition's first and last keys deleted, which the
@@ -9591,6 +9611,33 @@ fn the_windows_a_torn_publish_leaves_open_through_the_slot_before() {
                     .open(c.join(&w))
                     .unwrap()
                     .set_len(n)
+                    .unwrap();
+            }
+        }
+        if case == "run-torn" {
+            // The power cut before the close's fsync: the run's segment is
+            // its temp file under a second name, and its superblock, written
+            // at the close, never reached the device. Neither name opens as
+            // a segment; the temp name's records, synced at each commit, are
+            // the run.
+            let torn: Vec<String> = unnamed
+                .iter()
+                .cloned()
+                .chain(
+                    std::fs::read_dir(&c)
+                        .unwrap()
+                        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                        .filter(|n| n.starts_with("direct-") && n.ends_with(".tmp")),
+                )
+                .collect();
+            assert!(torn.len() >= 2, "{case}: premise: the run's two names: {torn:?}");
+            for n in &torn {
+                use std::os::unix::fs::FileExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(c.join(n))
+                    .unwrap()
+                    .write_all_at(&[0u8; 4096], 0)
                     .unwrap();
             }
         }
@@ -9854,7 +9901,18 @@ fn a_pending_segment_adopted_by_an_open(how: OoTear, ord_durable: bool, pieces: 
         oo_dirty(&d.join(f));
     }
     let kernel = os_page_unwritten(&d.join(&pend[0])).is_some();
+    // The calls themselves, process-wide: left on, since tests beside this
+    // one may be reading it too, and read for this directory alone.
+    let from = Db::trace_dir_io(true).len();
     let db = Db::open(&d, opts.clone()).unwrap();
+    let calls: Vec<(&str, PathBuf)> = Db::trace_dir_io(true)
+        .split_off(from)
+        .into_iter()
+        .filter(|(what, p)| match *what {
+            "sync_dir" => p == &d,
+            _ => p.parent() == Some(d.as_path()),
+        })
+        .collect();
     oo_holds(&db, &model, &format!("{tag}: after the kill"));
     let synced = db.open_synced_files();
     let [newest, _] = oo_by_age(&d);
@@ -9885,6 +9943,17 @@ fn a_pending_segment_adopted_by_an_open(how: OoTear, ord_durable: bool, pieces: 
                 "{tag}: {f} fsynced before the slot {slot} named it durable: {synced:?}"
             );
         }
+        // The same order read off the calls, which a record the open keeps
+        // of its own fsyncs cannot vouch for: a directory fsync that
+        // returned before the slot was opened for the write.
+        let write = calls
+            .iter()
+            .position(|(what, p)| *what == "open_slot" && *p == newest)
+            .unwrap_or_else(|| panic!("{tag}: the open wrote {slot}: {calls:?}"));
+        assert!(
+            calls[..write].iter().any(|(what, _)| *what == "sync_dir"),
+            "{tag}: the directory fsynced before the slot {slot} was written: {calls:?}"
+        );
     }
     if kernel {
         for f in &files {
