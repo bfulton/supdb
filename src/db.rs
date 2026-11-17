@@ -173,10 +173,6 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
 /// second however they are issued -- sharding cannot scale past 1.6x --
 /// so on a barrier-bound device the lever is fewer barriers per record.
 ///
-/// Frames an open replays count as unsynced under either policy, since a
-/// process kill leaves them in the page cache alone: the next sync the
-/// policy makes, or a `sync` or `flush`, makes them durable.
-///
 /// Under either policy a write of the log the device refuses fails the
 /// commit that made it, and the batch stays staged: the next commit writes
 /// it again with its own, from that commit on both are visible together,
@@ -4223,30 +4219,6 @@ fn wal_kind_named(head: &[u8; 7], header: &[u8]) -> Option<u8> {
     }
 }
 
-/// The least a power cut loses of a file at once: a sector, of 512 bytes
-/// on every block device; a filesystem's block is a whole number of them.
-const WAL_LOST_SECTOR: usize = 512;
-
-/// Whether a log file's bytes begin with a sector of zeroes, or are zeroes
-/// all through where shorter: the first page of a file no fdatasync ever
-/// covered, lost by a power cut that kept the file's size -- a store just
-/// created, a file a rotation began, a log under a direct run whose own
-/// file was synced at every commit -- which is a log with nothing in it.
-/// No write puts zeroes there, plain or sealed, and an fdatasync covers
-/// the header with the frames, so no frame behind such a sector was ever
-/// acknowledged. A zero header over a first sector that holds anything
-/// else is not a lost page, and stays refused as a header that is not a
-/// log's. A file `Options::recycle_wal` writes through to its length
-/// before its first use was synced with its header, so a crash leaves it
-/// whole there, and so does a recycled file's header, rewritten in place
-/// over one an earlier life synced; a file the open itself begins is not
-/// written through, and reads by this rule as any fresh file does.
-fn wal_head_lost(buf: &[u8]) -> bool {
-    buf[..buf.len().min(WAL_LOST_SECTOR)]
-        .iter()
-        .all(|&b| b == 0)
-}
-
 /// The per-file CRC seed. Any mix that separates neighbouring ids will do;
 /// this is splitmix64's finalizer.
 fn wal_seed(id: u64) -> u32 {
@@ -4433,30 +4405,20 @@ impl Wal {
     }
 
     /// Reopen a WAL for appending at `seq`, after replay has truncated it to
-    /// its last commit frame. A file that does not exist yet, or that
-    /// replay read as a lost header and cut to nothing, gets a header of
-    /// `kind` so the next replay finds one.
-    ///
-    /// `settled` says that what the file holds needs no sync: replay
-    /// applied none of its frames, every one of them covered by the
-    /// manifest's sequence, or the open's cut of its torn tail synced it.
-    /// Otherwise its frames are unsynced, whatever replay read: after a
-    /// process kill an open reads them out of the page cache, where a
-    /// power cut can still take them, and the first sync by policy is what
-    /// makes them durable.
-    fn open_append(path: &Path, id: u64, seq: u64, kind: u8, settled: bool) -> Result<Wal> {
+    /// its last commit frame. A file that does not exist yet gets its header
+    /// so the next replay finds one.
+    fn open_append(path: &Path, id: u64, seq: u64) -> Result<Wal> {
         let mut file = vault::open_append(path)?;
         let mut written = file.metadata()?.len();
-        let loose;
+        let mut loose = false;
         let mut head = WAL_MAGIC.len() as u64;
         let mut enc = None;
         if written == 0 {
-            let (e, h) = Wal::begin(path, id, kind)?;
+            let (e, h) = Wal::begin(path, id, WAL_CHAINED)?;
             file.write_all(&h)?;
             written = h.len() as u64;
             head = written;
             enc = e;
-            loose = kind == WAL_LOOSE;
         } else if let Some(v) = path.parent().and_then(vault::under) {
             // The file replay accepted: its key from its header, and the
             // records from here under nonces this open draws.
@@ -4476,11 +4438,10 @@ impl Wal {
             file.read_exact(&mut head)?;
             loose = wal_kind(&head) == Some(WAL_LOOSE);
         }
-        let synced = if written == head || !settled {
-            0
-        } else {
-            written
-        };
+        // What replay kept was read back from the device, so it counts as
+        // synced; a header written just now does not until the first
+        // barrier.
+        let synced = if written == head { 0 } else { written };
         Ok(Wal {
             file,
             path: path.to_path_buf(),
@@ -4712,8 +4673,7 @@ impl Wal {
     /// records sync in the run's own file -- wait for its slot's
     /// fdatasync, 0.4 to 0.9 ms on the drain for frames the log did
     /// not hold. The header needs no sync of its own: an open takes a
-    /// file short of it, torn inside it, or zero over its first sector
-    /// (`wal_head_lost`), as a log with nothing in it.
+    /// file short of it, or torn inside it, as a log with nothing in it.
     fn frames_unsynced(&self) -> bool {
         self.written > self.synced.max(self.head)
     }
@@ -4723,9 +4683,7 @@ impl Wal {
     /// mode, where a write lands at the end whatever the offset. The byte
     /// reaches the device with the file's next sync, which is what follows
     /// it (`Db::sync_wal`).
-    ///
-    /// `trace` is a test's (`Db::trace_wal_syncs`), told of the rewrite.
-    fn chain(&mut self, trace: &mut Option<Vec<(PathBuf, Option<u64>)>>) -> Result<()> {
+    fn chain(&mut self) -> Result<()> {
         if !self.loose {
             return Ok(());
         }
@@ -4733,9 +4691,6 @@ impl Wal {
         f.seek(SeekFrom::Start(WAL_HEAD.len() as u64))?;
         f.write_all(&[WAL_CHAINED])?;
         self.loose = false;
-        if let Some(t) = trace {
-            t.push((vault::real(&self.path), None));
-        }
         Ok(())
     }
 
@@ -4784,7 +4739,7 @@ impl Wal {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((from, 0, false)),
             Err(e) => return Err(e),
         }
-        if buf.is_empty() || wal_head_lost(&buf) {
+        if buf.is_empty() {
             return Ok((from, 0, false));
         }
         let Some(v) = path.parent().and_then(vault::under) else {
@@ -15426,9 +15381,6 @@ struct Shared {
     /// between its two phases, the segments published and their fsyncs
     /// not yet paid (`Db::hold_seal_landing`, `Db::hold_seal_durable`).
     seal_hold: std::sync::atomic::AtomicU8,
-    /// A test's: the slots drains left owed while `SEAL_HOLD_OWED_SLOT`
-    /// was held (`Db::owed_slots_held`).
-    owed_slots_held: AtomicU64,
     /// A test's holds on the merge (`MERGE_HOLD_*`): the merge thread held
     /// before its landing (`Db::hold_merge_landing`), and the planner made
     /// to join a merge in flight before it plans (`Db::plan_joins_merge`),
@@ -16921,15 +16873,6 @@ pub struct Db {
     /// its new file (`FAIL_SYNC_DIR`) fails, as a failed fdatasync or fsync
     /// would; see `Db::fail_next_wal_sync`.
     fail_log_sync: u8,
-    /// A test's (`Db::trace_wal_syncs`): every fdatasync of a log file
-    /// that returned `Ok`, with the file's length at its issue, and every
-    /// rewrite of a header's kind as chained (`None`), in the order they
-    /// were made. Nothing is recorded while it is `None`.
-    wal_trace: Option<Vec<(PathBuf, Option<u64>)>>,
-    /// The fdatasync the open's cut of a torn tail made of the live log,
-    /// with the length it covered, which a trace begins with
-    /// (`Db::trace_wal_syncs`); `None` where the open cut nothing.
-    wal_opened: Option<(PathBuf, u64)>,
     /// A test's failure (`RUN_FAULT_*`) for the next direct run to open,
     /// handed to its writer where it opens: `Db::fail_next_run_write`
     /// with no run open.
@@ -27770,9 +27713,6 @@ impl Db {
                     if let Err(e) = r {
                         return Err(self.keep_lost(e));
                     }
-                    if let Some(t) = &mut self.wal_trace {
-                        t.push((vault::real(&p), vault::len(&p).ok()));
-                    }
                     SealCounts::add(&self.shared.seal_counts.loose_synced, 1);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -27780,7 +27720,7 @@ impl Db {
             }
             self.loose_wals.remove(0);
         }
-        self.wal.chain(&mut self.wal_trace)?;
+        self.wal.chain()?;
         let r = if self.fail_log_sync & FAIL_SYNC_LIVE != 0 {
             self.fail_log_sync &= !FAIL_SYNC_LIVE;
             self.wal.lose_unsynced()?;
@@ -27793,9 +27733,6 @@ impl Db {
         };
         if let Err(e) = r {
             return Err(self.keep_lost(e));
-        }
-        if let Some(t) = &mut self.wal_trace {
-            t.push((vault::real(&self.wal.path), Some(self.wal.synced)));
         }
         self.wal.drop_synced(self.opts.wal_drop_bytes as u64);
         self.unsynced = 0;
@@ -27941,9 +27878,6 @@ impl Db {
             }
             let mut wal = Wal::create(&path, id, kind)?;
             wal.prefill(self.opts.seal_bytes as u64)?;
-            if let Some(t) = &mut self.wal_trace {
-                t.push((vault::real(&path), vault::len(&path).ok()));
-            }
             return Ok(wal);
         }
         Wal::create(&path, id, kind)
@@ -28202,7 +28136,6 @@ impl Db {
             in_merge: AtomicUsize::new(0),
             forms_short: std::sync::atomic::AtomicBool::new(false),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
-            owed_slots_held: AtomicU64::new(0),
             merge_hold: std::sync::atomic::AtomicU8::new(0),
             forms_position_hold: std::sync::atomic::AtomicBool::new(false),
             seal_wedged: std::sync::atomic::AtomicBool::new(false),
@@ -28313,8 +28246,6 @@ impl Db {
             pending_err: None,
             lost: None,
             fail_log_sync: 0,
-            wal_trace: None,
-            wal_opened: None,
             run_fault_open: 0,
             wal_dir_unsynced: false,
             keeper: None,
@@ -28360,15 +28291,6 @@ impl Db {
     /// a store that kept a failed sync of its log or of an ordered run's
     /// file answers commits again (`SyncPolicy`): it reads what the device
     /// holds, the run's file to its last commit marker.
-    ///
-    /// What the open replays from the log is visible from the open on, and
-    /// is not taken as durable: after a process kill it is read out of the
-    /// page cache, where a power cut can still take it, so the first
-    /// `sync` or `flush` after an open that replayed frames makes them
-    /// durable as it would frames committed since. A log file that begins
-    /// with a sector of zeroes, the first page of a file no sync ever
-    /// covered and a power cut lost, is a log with nothing in it; a header
-    /// that is neither a log's nor zeroes over its first sector is refused.
     pub fn open(dir: &Path, mut opts: Options) -> Result<Db> {
         check_options(&opts)?;
         // Before anything is read, the store held to the way it is asked
@@ -28671,10 +28593,6 @@ impl Db {
         // file after it removed: their records continue a tail a power
         // loss took, and would read as a gap at every open after this one.
         let mut live = wal_ids.len().saturating_sub(1);
-        // Which files replay applied frames of: frames an open read back
-        // out of the page cache, after a process kill, as readily as off
-        // the device, so none of them is known durable.
-        let mut applied: Vec<bool> = Vec::with_capacity(wal_ids.len());
         for (i, &id) in wal_ids.iter().enumerate() {
             let (next, valid, ended) = Wal::replay(
                 &Db::wal_path(dir, id),
@@ -28692,7 +28610,6 @@ impl Db {
                     }
                 },
             )?;
-            applied.push(!ended && next != from);
             if ended {
                 live = i;
                 valid_len = valid;
@@ -28705,20 +28622,6 @@ impl Db {
             valid_len = valid;
         }
         wal_ids.truncate(live + 1);
-        // The older files whose frames replay applied are loose, as a
-        // rotation that left them unsynced would have left them: the first
-        // sync by policy syncs each before the live file's header can say
-        // chained over it (`Db::sync_wal`). Synced alone, the live file's
-        // header would be rewritten chained over files a power cut can
-        // still cut, and the open after that cut would read the gap as a
-        // record lost.
-        let loose_wals: Vec<PathBuf> = wal_ids
-            .iter()
-            .zip(&applied)
-            .take(live)
-            .filter(|&(_, &a)| a)
-            .map(|(&id, _)| Db::wal_path(dir, id))
-            .collect();
         // What replayed is what the WAL had committed: a reader under
         // `Latest` sees it from the open on, not from the first commit
         // after. The builder ahead of the reader found it missing, reading
@@ -28738,28 +28641,14 @@ impl Db {
         // A batch that never committed is cut off before anything is
         // appended behind it: left in place, its records would sit in front
         // of the next batch's commit frame and be adopted by it.
-        let mut cut = false;
-        // The cut's fdatasync, with the length it covered, for a test's
-        // trace (`Db::trace_wal_syncs`): the one sync of the log an open
-        // makes, made before any trace can be on.
-        let mut wal_opened = None;
         if let Ok(len) = vault::len(&wal_path) {
             if len > valid_len {
                 let f = vault::open_write(&wal_path)?;
                 f.set_len(valid_len)?;
-                wal_opened = Some((vault::real(&wal_path), f.sync_data().map(|()| valid_len)?));
-                cut = true;
+                f.sync_data()?;
             }
         }
-        // A header written now, over a file replay found without one, says
-        // whether a file before it is loose.
-        let kind = if loose_wals.is_empty() {
-            WAL_CHAINED
-        } else {
-            WAL_LOOSE
-        };
-        let settled = cut || !applied.get(live).copied().unwrap_or(false);
-        let wal = Wal::open_append(&wal_path, wal_id, from, kind, settled)?;
+        let wal = Wal::open_append(&wal_path, wal_id, from)?;
         let next_seg = seg_ids.iter().map(|&(n, _)| n + 1).max().unwrap_or(0);
         let spare_wal = spare_wals
             .into_iter()
@@ -28861,7 +28750,6 @@ impl Db {
             in_merge: AtomicUsize::new(0),
             forms_short: std::sync::atomic::AtomicBool::new(false),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
-            owed_slots_held: AtomicU64::new(0),
             merge_hold: std::sync::atomic::AtomicU8::new(0),
             forms_position_hold: std::sync::atomic::AtomicBool::new(false),
             seal_wedged: std::sync::atomic::AtomicBool::new(false),
@@ -28961,7 +28849,7 @@ impl Db {
             wal,
             wal_id,
             closed_wals: Vec::new(),
-            loose_wals,
+            loose_wals: Vec::new(),
             mem_bytes,
             direct: None,
             mem_handed: None,
@@ -28972,8 +28860,6 @@ impl Db {
             pending_err: None,
             lost: None,
             fail_log_sync: 0,
-            wal_trace: None,
-            wal_opened,
             run_fault_open: 0,
             wal_dir_unsynced: false,
             keeper: None,
@@ -30589,8 +30475,7 @@ impl Db {
     /// tail out of memory; `flush` is the other answer, and the difference
     /// was priced at 11% of a canonical load window.
     ///
-    /// An `Ok` is durability for every commit before it, and for whatever
-    /// the open replayed from the log. After a failed
+    /// An `Ok` is durability for every commit before it. After a failed
     /// sync of the log or of an ordered run's file every `sync` answers
     /// that error until the store is reopened (`SyncPolicy`); after a
     /// failed write of the run's file a `sync` writes the batch again and
@@ -30738,11 +30623,6 @@ impl Db {
     /// sealed without draining and every scan walked the 550k-key frozen
     /// table for the rest of the phase -- the same artifact the seal was
     /// supposed to remove, back through the side door.
-    ///
-    /// What the open replayed from the log is in the drain's segment like
-    /// any other commit, and while the log holds frames no sync covered,
-    /// replayed ones among them, the flush answers only once the slot that
-    /// names the segment is synced.
     ///
     /// After a failed sync of the log or of an ordered run's file a flush
     /// seals nothing and answers that error, as every flush does until the
@@ -32249,51 +32129,6 @@ impl Db {
     #[doc(hidden)]
     pub fn fail_next_wal_sync(&mut self) {
         self.fail_log_sync |= FAIL_SYNC_LIVE;
-    }
-
-    /// A test's: from `on`, record every fdatasync of a log file that
-    /// answers `Ok` -- the live file's, a loose file's, a recycled file's
-    /// pre-write -- with the file's length when it was issued, and every
-    /// rewrite of a live file's header as chained, in order; off, record
-    /// nothing and forget what was recorded. What a power cut keeps of
-    /// a log file this life is at least what its last recorded sync
-    /// covered, and a header rewritten after its file's last sync may be
-    /// lost (`wal_syncs_traced`). A trace begins with the fdatasync the
-    /// open made of the live file where it cut a torn tail off it, the
-    /// one sync of the log an open makes.
-    #[doc(hidden)]
-    pub fn trace_wal_syncs(&mut self, on: bool) {
-        self.wal_trace = on.then(|| {
-            self.wal_opened
-                .iter()
-                .map(|(p, len)| (p.clone(), Some(*len)))
-                .collect()
-        });
-    }
-
-    /// A test's: what `trace_wal_syncs` recorded, each with the file's
-    /// real path: `Some(len)` an fdatasync that covered `len` bytes,
-    /// `None` the header's kind rewritten chained.
-    #[doc(hidden)]
-    pub fn wal_syncs_traced(&self) -> Vec<(PathBuf, Option<u64>)> {
-        self.wal_trace.clone().unwrap_or_default()
-    }
-
-    /// A test's: while `on`, a slot a buffered drain leaves owed its
-    /// fdatasync (`Options::flush_waits_manifest` off) waits before that
-    /// fdatasync, so the instant after the drain's answer can be copied;
-    /// and each slot left owed while it is on is counted
-    /// (`owed_slots_held`).
-    #[doc(hidden)]
-    pub fn hold_owed_slot(&self, on: bool) {
-        self.set_seal_hold(SEAL_HOLD_OWED_SLOT, on);
-    }
-
-    /// A test's: how many drains have left their slot owed its fdatasync
-    /// while `hold_owed_slot` was on.
-    #[doc(hidden)]
-    pub fn owed_slots_held(&self) -> u64 {
-        self.shared.owed_slots_held.load(AtomicOrdering::Acquire)
     }
 
     /// A test's: the next fdatasync of a log file a loose rotation closed
@@ -37634,8 +37469,6 @@ impl SealReadable {
 /// The bits of `Shared::seal_hold`.
 const SEAL_HOLD_LANDING: u8 = 1;
 const SEAL_HOLD_DURABLE: u8 = 2;
-/// The fdatasync of a slot a drain left owed (`Db::hold_owed_slot`).
-const SEAL_HOLD_OWED_SLOT: u8 = 4;
 
 /// A test's holds on the merge (`Shared::merge_hold`): the merge thread
 /// held before it returns its outputs; a planned merge made to wait for the
@@ -40023,11 +39856,6 @@ impl Maint {
             &self.live_names(),
             &[],
         )?;
-        if self.shared.seal_hold.load(AtomicOrdering::Relaxed) & SEAL_HOLD_OWED_SLOT != 0 {
-            self.shared
-                .owed_slots_held
-                .fetch_add(1, AtomicOrdering::AcqRel);
-        }
         self.shared
             .manifest_seq
             .store(self.manifest_seq, AtomicOrdering::Release);
@@ -40041,7 +39869,6 @@ impl Maint {
     fn sync_owed_slot(&mut self) -> Result<()> {
         let _io = self.r.unlend();
         if let Some(f) = self.slot_sync_due.take() {
-            seal_hold_wait(&self.shared, SEAL_HOLD_OWED_SLOT);
             f.sync_data()?;
             self.retire_covered();
         }
