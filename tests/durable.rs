@@ -8921,3 +8921,774 @@ fn an_open_that_recovers_a_run_keeps_the_slot_that_names_it() {
     let _ = std::fs::remove_dir_all(&d);
     let _ = std::fs::remove_dir_all(&k);
 }
+
+// ---------------------------------------------------------------------
+// open-order: an open removes nothing until it has chosen the manifest
+// slot that is the store and checked it against the directory, and it
+// refuses, by name and with every file left as it found it, where what
+// that slot names cannot be the store: a name the directory does not
+// hold, no readable slot beside partitions only a manifest names, or a
+// fall back past a slot that failed its check onto one beside a segment
+// whose records neither it nor the log holds. Every state a crash leaves
+// still opens -- a torn publish's slot is the one the open passes over,
+// and what it named is swept as it always was -- and a slot whose pending
+// names the open takes is written durable only once the open has made
+// their files and the directory durable (`Options::manifest_pending`).
+// ---------------------------------------------------------------------
+
+/// The words of each refusal, which a refusal further in -- a segment the
+/// open fails to find once it has swept -- does not carry.
+const OO_GONE: &str = "is missing from the directory";
+const OO_LOG: &str = "the log no longer holds";
+const OO_KEYS: &str = "holds keys nothing the slot names";
+const OO_NO_SLOT: &str = "no manifest slot can be read";
+
+const OO_SLOTS: [&str; 2] = ["manifest", "manifest.alt"];
+
+/// A slot's publish sequence, for either a plain or a sealed slot: both
+/// carry it in the clear behind a nine-byte magic.
+fn oo_seq(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 25 || !bytes.starts_with(b"SUPDBMA") {
+        return None;
+    }
+    Some(u64::from_le_bytes(bytes[9..17].try_into().unwrap()))
+}
+
+/// A plain version-3 slot's covered sequence and names, each with its
+/// pending flag.
+fn oo_names(bytes: &[u8]) -> (u64, Vec<(String, bool)>) {
+    assert_eq!(&bytes[..9], b"SUPDBMAN\x03", "a plain slot of this version");
+    let len = u32::from_le_bytes(bytes[17..21].try_into().unwrap()) as usize;
+    let body = &bytes[25..25 + len];
+    let covered = u64::from_le_bytes(body[..8].try_into().unwrap());
+    let n = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
+    let (mut p, mut out) = (12usize, Vec::with_capacity(n));
+    for _ in 0..n {
+        let l = u16::from_le_bytes(body[p..p + 2].try_into().unwrap()) as usize;
+        p += 2;
+        out.push((
+            String::from_utf8(body[p..p + l].to_vec()).unwrap(),
+            body[p + l] & 1 != 0,
+        ));
+        p += l + 1;
+    }
+    (covered, out)
+}
+
+/// The two slots' paths, newest first by their sequence.
+fn oo_by_age(d: &Path) -> [PathBuf; 2] {
+    let seq = |s: &str| std::fs::read(d.join(s)).ok().and_then(|b| oo_seq(&b));
+    if seq(OO_SLOTS[0]) >= seq(OO_SLOTS[1]) {
+        [d.join(OO_SLOTS[0]), d.join(OO_SLOTS[1])]
+    } else {
+        [d.join(OO_SLOTS[1]), d.join(OO_SLOTS[0])]
+    }
+}
+
+/// One byte of a slot changed inside what its check covers: the covered
+/// sequence of a plain slot, a byte of a sealed one's ciphertext.
+fn oo_damage(slot: &Path) {
+    let mut b = std::fs::read(slot).unwrap();
+    let at = if b.starts_with(b"SUPDBMAN") { 25 } else { 40 };
+    b[at] ^= 0x5A;
+    std::fs::write(slot, &b).unwrap();
+}
+
+/// The window a publish torn by a crash leaves, staged by hand: the slot
+/// that does not hold the newest manifest written with the newest's bytes
+/// under the next sequence, which its check refuses.
+fn oo_tear_next(d: &Path) {
+    let [newest, other] = oo_by_age(d);
+    let mut b = std::fs::read(&newest).unwrap();
+    let seq = oo_seq(&b).unwrap() + 1;
+    b[9..17].copy_from_slice(&seq.to_le_bytes());
+    std::fs::write(&other, &b).unwrap();
+}
+
+/// The open of `d` refused with `words`, every file left as it was.
+fn oo_refused(d: &Path, opts: &Options, words: &str, tag: &str) {
+    let before = files_of(d);
+    match Db::open(d, opts.clone()) {
+        Ok(_) => panic!("{tag}: the open answered Ok where it had to refuse ({words})"),
+        Err(e) => assert!(
+            e.to_string().contains(words),
+            "{tag}: the refusal says why ({words}): {e}"
+        ),
+    }
+    let after = files_of(d);
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>(),
+        "{tag}: a refused open leaves the directory's names as they were"
+    );
+    assert!(
+        before == after,
+        "{tag}: a refused open leaves every file's bytes as they were"
+    );
+}
+
+/// Every key of `model` reads its values, in `db`.
+fn oo_holds(db: &Reader, model: &BTreeMap<Vec<u8>, Vec<Vec<u8>>>, tag: &str) {
+    for (k, want) in model {
+        assert_eq!(
+            &read_vec(db, k),
+            want,
+            "{tag}: acknowledged key {} reads back",
+            String::from_utf8_lossy(k)
+        );
+    }
+}
+
+/// An ordered load goes into a direct run and never into the log; the
+/// flush closes it, the slot naming its segment is synced, and the run's
+/// temp name is retired behind it. With that slot damaged, the slot
+/// before it -- the birth slot -- names nothing, and the run's segment,
+/// the only copy of its records, holds keys nothing it names holds. The
+/// open refuses, and the store whose slot is put back opens whole.
+///
+/// And the same with the run's first key, or its last, written again after
+/// the flush, by a commit the log holds and the store killed after it: the
+/// replayed log holds that key, and the run's other end is the key nothing
+/// else holds.
+#[test]
+fn a_flushed_run_is_not_lost_when_the_newest_slot_is_damaged_after_its_temp_retired() {
+    for again in [None, Some(0), Some(1999)] {
+        a_damaged_slot_over_a_flushed_run(again);
+    }
+}
+
+fn a_damaged_slot_over_a_flushed_run(again: Option<u32>) {
+    let d = dir(&format!("oo-run-{again:?}"));
+    let c = dir(&format!("oo-run-{again:?}-kill"));
+    let opts = Options::default();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model = BTreeMap::new();
+    for k in 0..2000u32 {
+        db.append(key(k).as_bytes(), b"acked");
+        model.insert(key(k).into_bytes(), vec![b"acked".to_vec()]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    if let Some(k) = again {
+        db.settle().unwrap();
+        db.put(key(k).as_bytes(), b"again");
+        model.insert(key(k).into_bytes(), vec![b"again".to_vec()]);
+        db.commit().unwrap();
+        copy_store(&d, &c);
+        drop(db);
+    } else {
+        db.close().unwrap();
+        copy_store(&d, &c);
+    }
+    let d = c;
+    assert!(!open_run(&d), "premise: the run's temp name retired");
+    let [newest, older] = oo_by_age(&d);
+    let named = |p: &Path| oo_names(&std::fs::read(p).unwrap()).1;
+    let segs = seg_names(&d);
+    assert!(
+        segs.iter()
+            .any(|n| !named(&older).iter().any(|(o, _)| o == n)),
+        "premise: a segment only the newest slot names: {segs:?}"
+    );
+    let saved = std::fs::read(&newest).unwrap();
+    oo_damage(&newest);
+    oo_refused(&d, &opts, OO_KEYS, "run");
+    std::fs::write(&newest, &saved).unwrap();
+    let db = Db::open(&d, opts).expect("the store with its slot put back opens");
+    oo_holds(&db, &model, "run, repaired");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(dir(&format!("oo-run-{again:?}")));
+}
+
+/// A partition, then every key rewritten by commits through the log until
+/// it rotates, and the close: its drain seals the rewrites and its merge
+/// folds them into a new partition, unlinking the files the slot before
+/// it names. With the newest slot damaged the open falls back to a slot
+/// that names files the directory does not hold, and refuses before it
+/// removes anything -- not at a segment it fails to find once it has
+/// swept the newest slot's partition away.
+fn a_fallback_onto_a_slot_naming_files_gone(tag: &str, base: Options) {
+    let d = dir(&format!("oo-gone-{tag}"));
+    let opts = Options {
+        direct_ingest: false,
+        seal_bytes: 256 << 10,
+        ..base
+    };
+    let k12 = |k: u32| format!("key-{k:012}").into_bytes();
+    let val = |k: u32, round: u32| format!("{round:04}-{k:0>96}").into_bytes();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    for k in 0..2000 {
+        db.put(&k12(k), &val(k, 0));
+        model.insert(k12(k), vec![val(k, 0)]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    let rotations = db.seal_waits().wal_rotations;
+    let (mut k, mut round) = (0u32, 1u32);
+    while db.seal_waits().wal_rotations == rotations {
+        for _ in 0..100 {
+            db.put(&k12(k), &val(k, round));
+            model.insert(k12(k), vec![val(k, round)]);
+            k += 1;
+            if k == 2000 {
+                k = 0;
+                round += 1;
+            }
+        }
+        db.commit().unwrap();
+    }
+    db.close().unwrap();
+    let [newest, older] = oo_by_age(&d);
+    if tag == "plain" {
+        let gone: Vec<String> = oo_names(&std::fs::read(&older).unwrap())
+            .1
+            .into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| !d.join(n).exists())
+            .collect();
+        assert!(!gone.is_empty(), "premise: the older slot names files gone");
+    }
+    let saved = std::fs::read(&newest).unwrap();
+    oo_damage(&newest);
+    oo_refused(&d, &opts, OO_GONE, tag);
+    std::fs::write(&newest, &saved).unwrap();
+    let db = Db::open(&d, opts).expect("the store with its slot put back opens");
+    oo_holds(&db, &model, &format!("{tag}, repaired"));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_fallback_onto_a_slot_naming_files_gone_is_refused_before_anything_is_removed() {
+    a_fallback_onto_a_slot_naming_files_gone("plain", Options::default());
+}
+
+#[test]
+fn a_fallback_onto_a_slot_naming_files_gone_is_refused_under_a_cipher() {
+    a_fallback_onto_a_slot_naming_files_gone("cipher", under_cipher());
+}
+
+/// A partition, then a seal of rewrites into a piece over it whose log
+/// file retires at the piece's durable landing (`seal_rotates_wal`), and
+/// nothing after. With the newest slot damaged, the slot before it names
+/// the partition alone, every file in place, and covers less of the log
+/// than the piece; the log that held the rewrites is gone, so the open
+/// that took the slot before would answer every rewritten key's first
+/// value. It refuses.
+#[test]
+fn a_fallback_past_a_slot_whose_log_retired_is_refused() {
+    let d = dir("oo-log");
+    let c = dir("oo-log-kill");
+    let opts = Options {
+        direct_ingest: false,
+        seal_rotates_wal: true,
+        seal_bytes: 1 << 20,
+        l0_trigger: 1000,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    for k in 0..2000u32 {
+        db.put(key(k).as_bytes(), b"v0");
+        model.insert(key(k).into_bytes(), vec![b"v0".to_vec()]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    for k in (0..2000u32).step_by(7) {
+        db.put(key(k).as_bytes(), b"v1");
+        model.insert(key(k).into_bytes(), vec![b"v1".to_vec()]);
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    // The store as it stands, nothing in flight: what a kill leaves.
+    copy_store(&d, &c);
+    drop(db);
+    let [newest, older] = oo_by_age(&c);
+    let (cov_new, new_names) = oo_names(&std::fs::read(&newest).unwrap());
+    let (cov_old, old_names) = oo_names(&std::fs::read(&older).unwrap());
+    assert!(
+        cov_old < cov_new
+            && old_names.iter().all(|(n, _)| c.join(n).exists())
+            && new_names.iter().any(|n| !old_names.contains(n)),
+        "premise: the older slot covers less, names files in place, and \
+         not the piece: {old_names:?} at {cov_old} beside {new_names:?} at {cov_new}"
+    );
+    for w in wal_names(&c) {
+        assert_eq!(
+            std::fs::metadata(c.join(&w)).unwrap().len(),
+            8,
+            "premise: {w} holds nothing, the file the rewrites were in retired"
+        );
+    }
+    let saved = std::fs::read(&newest).unwrap();
+    oo_damage(&newest);
+    oo_refused(&c, &opts, OO_LOG, "log");
+    std::fs::write(&newest, &saved).unwrap();
+    let db = Db::open(&c, opts).expect("the store with its slot put back opens");
+    oo_holds(&db, &model, "log, repaired");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&c);
+}
+
+/// The windows a fall back has to open through, each staged as a crash
+/// leaves it -- the store's files copied with a job held at its landing --
+/// and then the publish after it torn: a seal's segments renamed into
+/// place and unnamed, with the log that holds their writes; a run's
+/// segment linked under its piece name beside its temp name; a merge's
+/// outputs renamed into place beside the inputs the slot before names; and
+/// a merge's inputs left beside the outputs a durable slot names, their
+/// first and last keys among those the merge dropped. Each opens with every acknowledged write, the unnamed files swept.
+#[test]
+fn the_windows_a_torn_publish_leaves_open_through_the_slot_before() {
+    for case in ["seal", "run", "merge", "inputs"] {
+        let d = dir(&format!("oo-win-{case}"));
+        let c = dir(&format!("oo-win-{case}-kill"));
+        let opts = Options {
+            partition_on_flush: case == "seal" || case == "run",
+            flush_schedules: case == "merge" || case == "inputs",
+            seal_bytes: 1 << 20,
+            l0_trigger: 1000,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+        fn put(db: &mut Db, model: &mut BTreeMap<Vec<u8>, Vec<Vec<u8>>>, k: Vec<u8>, v: &[u8]) {
+            db.put(&k, v);
+            model.insert(k, vec![v.to_vec()]);
+        }
+        // A partition first, from writes through the log.
+        for k in (0..2000u32).rev() {
+            put(&mut db, &mut model, key(k).into_bytes(), b"v0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let before = seg_names(&d);
+        match case {
+            "seal" => {
+                for k in (0..2000u32).step_by(3) {
+                    put(
+                        &mut db,
+                        &mut model,
+                        format!("new-{k:06}").into_bytes(),
+                        b"s",
+                    );
+                    put(&mut db, &mut model, key(k).into_bytes(), b"v1");
+                }
+                db.commit().unwrap();
+                db.hold_seal_durable(true);
+                db.seal().unwrap();
+                wait_for("the seal's segments in place", || {
+                    seg_names(&d).iter().any(|n| !before.contains(n))
+                });
+            }
+            "run" => {
+                for k in 0..3000u32 {
+                    let k = format!("run-{k:06}").into_bytes();
+                    db.append(&k, b"r");
+                    model.insert(k, vec![b"r".to_vec()]);
+                }
+                db.commit().unwrap();
+                assert!(open_run(&d), "premise: an ordered run is open");
+                db.hold_seal_durable(true);
+                db.seal().unwrap();
+                wait_for("the run's segment in place", || {
+                    seg_names(&d).iter().any(|n| !before.contains(n))
+                });
+                assert!(open_run(&d), "premise: the run's temp name stands");
+            }
+            _ => {
+                if case == "merge" {
+                    for k in (0..2000u32).step_by(3) {
+                        put(&mut db, &mut model, key(k).into_bytes(), b"v1");
+                    }
+                } else {
+                    // The partition's first and last keys deleted, which the
+                    // merge drops from its outputs with what they masked.
+                    for k in [0u32, 1999] {
+                        db.delete(key(k).as_bytes());
+                        model.insert(key(k).into_bytes(), Vec::new());
+                    }
+                }
+                db.commit().unwrap();
+                db.hold_merge_landing(true);
+                db.flush().unwrap();
+                wait_for("the merge at its landing hold", || {
+                    db.merge_waits_at_landing()
+                });
+            }
+        }
+        copy_store(&d, &c);
+        db.hold_seal_durable(false);
+        db.hold_merge_landing(false);
+        if case == "inputs" {
+            // The merge landed durable and the crash before it unlinked
+            // its inputs: its outputs named, and the inputs put back from
+            // the copy taken while it was held.
+            db.settle().unwrap();
+            let b = dir("oo-win-inputs-landed");
+            copy_store(&d, &b);
+            for (n, bytes) in files_of(&c) {
+                let seg = ["par-", "pcs-", "seg-", "ord-"]
+                    .iter()
+                    .any(|p| n.starts_with(p));
+                if seg && !b.join(&n).exists() {
+                    std::fs::write(b.join(&n), bytes).unwrap();
+                }
+            }
+            let _ = std::fs::remove_dir_all(&c);
+            std::fs::rename(&b, &c).unwrap();
+        }
+        drop(db);
+        let unnamed: Vec<String> = {
+            let (_, names) = oo_names(&std::fs::read(&oo_by_age(&c)[0]).unwrap());
+            seg_names(&c)
+                .into_iter()
+                .filter(|n| !names.iter().any(|(m, _)| m == n))
+                .collect()
+        };
+        assert!(
+            !unnamed.is_empty(),
+            "{case}: premise: segments no slot names stand"
+        );
+        oo_tear_next(&c);
+        let db = Db::open(&c, opts.clone())
+            .unwrap_or_else(|e| panic!("{case}: the window refused: {e}"));
+        oo_holds(&db, &model, case);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&c);
+    }
+}
+
+/// Small partitions, so a load of tens of thousands of keys is several
+/// `par-` files.
+fn oo_slot_opts(base: Options) -> Options {
+    Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(64 << 10),
+        ..base
+    }
+}
+
+/// A store of partitions and a level-0 piece: an ordered load flushed into
+/// partitions, then every seventh key replaced through the log and sealed
+/// into a piece, every write acknowledged. Dropped, not closed, so the
+/// piece stands. Returns what every key reads.
+fn oo_populated(d: &Path, opts: &Options, n: u32) -> BTreeMap<Vec<u8>, Vec<Vec<u8>>> {
+    let mut model = BTreeMap::new();
+    let mut db = Db::create(d, opts.clone()).unwrap();
+    for k in 0..n {
+        db.append(key(k).as_bytes(), b"v0");
+        model.insert(key(k).into_bytes(), vec![b"v0".to_vec()]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    for k in (0..n).step_by(7) {
+        db.put(key(k).as_bytes(), b"v1");
+        model.insert(key(k).into_bytes(), vec![b"v1".to_vec()]);
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    drop(db);
+    model
+}
+
+/// Both slots emptied, or removed, in a store whose data is in `par-` and
+/// `pcs-` files -- damage from outside the engine, which never empties a
+/// slot: an open reads no manifest, and the scan kept for stores from
+/// before manifests would take `seg-` files alone as live and remove every
+/// partition and piece. Refused, every file left; the store whose slots
+/// are put back opens whole. And the same with the partitions gone too,
+/// so a piece alone beside the empty slots is what the refusal sees.
+#[test]
+fn an_open_with_no_readable_slot_beside_partitions_refuses_and_leaves_every_file() {
+    for how in ["emptied", "removed", "pieces"] {
+        let d = dir(&format!("oo-noslot-{how}"));
+        let opts = oo_slot_opts(Options::default());
+        let model = oo_populated(&d, &opts, 20_000);
+        let names = seg_names(&d);
+        assert!(
+            names.iter().any(|n| n.starts_with("par-"))
+                && names.iter().any(|n| n.starts_with("pcs-")),
+            "{how}: premise: partitions and a piece: {names:?}"
+        );
+        let saved: Vec<Vec<u8>> = OO_SLOTS
+            .iter()
+            .map(|s| std::fs::read(d.join(s)).unwrap())
+            .collect();
+        for s in OO_SLOTS {
+            match how {
+                "removed" => std::fs::remove_file(d.join(s)).unwrap(),
+                _ => std::fs::write(d.join(s), b"").unwrap(),
+            }
+        }
+        if how == "pieces" {
+            for n in names.iter().filter(|n| n.starts_with("par-")) {
+                std::fs::remove_file(d.join(n)).unwrap();
+            }
+        }
+        oo_refused(&d, &opts, OO_NO_SLOT, how);
+        if how != "pieces" {
+            for (s, b) in OO_SLOTS.iter().zip(&saved) {
+                std::fs::write(d.join(s), b).unwrap();
+            }
+            let db = Db::open(&d, opts).expect("the store with its slots put back opens");
+            oo_holds(&db, &model, how);
+            drop(db);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Control, as the open always did: both slots zeroes, which fail their
+/// magic, are refused before anything is listed.
+#[test]
+fn an_open_with_both_slots_zeroed_refuses_and_leaves_every_file() {
+    let d = dir("oo-zeroed");
+    let opts = oo_slot_opts(Options::default());
+    let model = oo_populated(&d, &opts, 20_000);
+    let saved: Vec<Vec<u8>> = OO_SLOTS
+        .iter()
+        .map(|s| std::fs::read(d.join(s)).unwrap())
+        .collect();
+    for (s, b) in OO_SLOTS.iter().zip(&saved) {
+        std::fs::write(d.join(s), vec![0u8; b.len().max(64)]).unwrap();
+    }
+    oo_refused(&d, &opts, "manifest magic is wrong", "zeroed");
+    for (s, b) in OO_SLOTS.iter().zip(&saved) {
+        std::fs::write(d.join(s), b).unwrap();
+    }
+    let db = Db::open(&d, opts).expect("the store with its slots put back opens");
+    oo_holds(&db, &model, "zeroed");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Under a cipher a slot is the only place a segment's envelope is named
+/// and keyed, and an open sweeps every envelope no slot it read names:
+/// with both slots emptied, every envelope of the store. Refused, every
+/// file left.
+#[test]
+fn an_open_with_no_readable_slot_beside_envelopes_refuses_under_a_cipher() {
+    let d = dir("oo-noslot-cipher");
+    let opts = oo_slot_opts(under_cipher());
+    let model = oo_populated(&d, &opts, 5_000);
+    let saved: Vec<Vec<u8>> = OO_SLOTS
+        .iter()
+        .map(|s| std::fs::read(d.join(s)).unwrap())
+        .collect();
+    assert!(
+        files_of(&d).keys().any(|n| n.starts_with("x-")),
+        "premise: envelopes"
+    );
+    for s in OO_SLOTS {
+        std::fs::write(d.join(s), b"").unwrap();
+    }
+    oo_refused(&d, &opts, OO_NO_SLOT, "cipher");
+    for (s, b) in OO_SLOTS.iter().zip(&saved) {
+        std::fs::write(d.join(s), b).unwrap();
+    }
+    let db = Db::open(&d, opts).expect("the store with its slots put back opens");
+    oo_holds(&db, &model, "cipher");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// How a power cut leaves a file whose writes nothing fsynced.
+#[derive(Clone, Copy, Debug)]
+enum OoTear {
+    /// A run of its pages never written back: 4 KiB of zeroes at 8 KiB.
+    Run,
+    /// None of it written back.
+    Empty,
+}
+
+fn oo_tear(path: &Path, how: OoTear) {
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    match how {
+        OoTear::Run => {
+            if f.metadata().unwrap().len() > 8192 {
+                f.write_all_at(&[0u8; 4096], 8192).unwrap();
+            } else {
+                f.set_len(0).unwrap();
+            }
+        }
+        OoTear::Empty => f.set_len(0).unwrap(),
+    }
+}
+
+/// The first page of `path` written again as it is, so that it waits for
+/// writeback as a write a kill came after would.
+fn oo_dirty(path: &Path) {
+    use std::os::unix::fs::FileExt;
+    let b = std::fs::read(path).unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.write_all_at(&b[..b.len().min(4096)], 0).unwrap();
+}
+
+/// A process killed between a seal's pending slot and its fsync leaves the
+/// seal's segments whole in the page cache and synced by nobody -- the kill
+/// taken, as it may be, before the sync helper's directory fsync, so the
+/// segments' names are no more durable than their bytes. The open after
+/// it reads them whole and writes a slot naming them durable, which covers
+/// the log frames that are the commits' only durable copy. A power cut
+/// after that open loses whatever of the segments, their ordered indexes
+/// and their names no fsync covered since, and every commit acknowledged
+/// before the kill has to read back. What the open fsynced is its own
+/// record (`Db::open_synced_files`), held where the kernel says to the
+/// page cache's word on each file's first page.
+fn a_pending_segment_adopted_by_an_open(how: OoTear, ord_durable: bool, pieces: bool) {
+    let tag = format!("{how:?}-ord{ord_durable}-pieces{pieces}");
+    let d = dir(&format!("oo-pend-{tag}"));
+    let opts = Options {
+        manifest_pending: true,
+        ord_durable,
+        direct_ingest: false,
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(64 << 10),
+        l0_trigger: 1000,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    let n = if pieces { 20_000 } else { 3000 };
+    if pieces {
+        // Partitions first, so the seal below cuts its table into a piece
+        // over each of several.
+        for k in (0..n).rev() {
+            db.put(key(k).as_bytes(), b"v0");
+            model.insert(key(k).into_bytes(), vec![b"v0".to_vec()]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+    }
+    for k in (0..n).rev().step_by(if pieces { 5 } else { 1 }) {
+        db.put(key(k).as_bytes(), b"v");
+        model.insert(key(k).into_bytes(), vec![b"v".to_vec()]);
+    }
+    db.commit().unwrap();
+    db.hold_seal_durable(true);
+    db.seal().unwrap();
+    let pending = || -> Vec<String> {
+        let b = std::fs::read(&oo_by_age(&d)[0]).unwrap();
+        oo_names(&b)
+            .1
+            .into_iter()
+            .filter(|(_, p)| *p)
+            .map(|(n, _)| n)
+            .collect()
+    };
+    wait_for("the seal's pending slot", || !pending().is_empty());
+    let pend = pending();
+    assert!(
+        !pieces || pend.len() >= 2,
+        "{tag}: premise: the seal is several pieces: {pend:?}"
+    );
+    // The kill: the seal thread parked before its fsync for good; a drop
+    // would join it and let it sync.
+    std::mem::forget(db);
+    let ords: Vec<String> = pend
+        .iter()
+        .map(|n| {
+            let f: Vec<&str> = n.split('-').collect();
+            format!("ord-{}-{}.oidx", f[1], f[2].trim_end_matches(".sup"))
+        })
+        .collect();
+    let files: Vec<&String> = pend.iter().chain(&ords).collect();
+    for f in &files {
+        assert!(d.join(f).is_file(), "{tag}: premise: {f} in place");
+        oo_dirty(&d.join(f));
+    }
+    let kernel = os_page_unwritten(&d.join(&pend[0])).is_some();
+    let db = Db::open(&d, opts.clone()).unwrap();
+    oo_holds(&db, &model, &format!("{tag}: after the kill"));
+    let synced = db.open_synced_files();
+    let [newest, _] = oo_by_age(&d);
+    let durable = oo_names(&std::fs::read(&newest).unwrap())
+        .1
+        .iter()
+        .any(|(n, p)| pend.contains(n) && !p);
+    if kernel {
+        for f in &files {
+            let unwritten = os_page_unwritten(&d.join(f));
+            if synced.contains(f) {
+                assert_eq!(
+                    unwritten,
+                    Some(false),
+                    "{tag}: {f}, which the open says it fsynced, is on the device"
+                );
+            } else if !ord_durable && f.starts_with("ord-") {
+                assert_eq!(
+                    unwritten,
+                    Some(true),
+                    "{tag}: the control, an index no fsync covered, still waits for writeback"
+                );
+            }
+        }
+    } else {
+        eprintln!("{tag}: the kernel does not say which pages are dirty to this process");
+    }
+    // The power cut: nothing of this store runs on, a file no fsync covered
+    // comes back torn, and a name no directory fsync covered is gone.
+    std::mem::forget(db);
+    for f in &files {
+        if !synced.contains(f) {
+            oo_tear(&d.join(f), how);
+        }
+    }
+    if !synced.iter().any(|s| s == ".") {
+        for f in &files {
+            std::fs::remove_file(d.join(f)).unwrap();
+        }
+    }
+    let state = format!(
+        "{tag}: a power cut after the open (named {pend:?} durable: {durable}; \
+         it fsynced {synced:?})"
+    );
+    let db = Db::open(&d, opts)
+        .unwrap_or_else(|e| panic!("{state}: the store refused its acknowledged commits: {e}"));
+    oo_holds(&db, &model, &state);
+    drop(db);
+    // An ordered index torn by the cut is composed again at the open, so
+    // the reads above cannot tell whether the open synced one; a store
+    // that keeps them durable (`ord_durable`) has each in the open's
+    // record, which the kernel's word above holds to the device.
+    if ord_durable {
+        for o in &ords {
+            assert!(
+                synced.contains(o),
+                "{tag}: the open fsynced the durable index {o}: {synced:?}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn acknowledged_commits_survive_a_power_cut_after_an_open_that_adopted_a_pending_segment() {
+    for how in [OoTear::Run, OoTear::Empty] {
+        a_pending_segment_adopted_by_an_open(how, false, false);
+    }
+}
+
+#[test]
+fn an_open_that_adopts_a_pending_segment_makes_its_durable_index_durable() {
+    for how in [OoTear::Run, OoTear::Empty] {
+        a_pending_segment_adopted_by_an_open(how, true, false);
+    }
+}
+
+#[test]
+fn an_open_that_adopts_several_pending_pieces_makes_each_durable() {
+    a_pending_segment_adopted_by_an_open(OoTear::Run, true, true);
+}

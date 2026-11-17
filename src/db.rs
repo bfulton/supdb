@@ -3140,7 +3140,9 @@ pub struct Options {
     /// WAL and temp name retire only once a slot naming its segments
     /// durable is itself durable (the next publish, or the close's). Only
     /// the newest slot's pending names are in doubt. The open and the close
-    /// write a slot with every name durable. On this machine the shape
+    /// write a slot with every name durable, the open once it has fsynced
+    /// the pending segments it read back, their ordered indexes under
+    /// `ord_durable`, and the directory. On this machine the shape
     /// bought nothing: a thread woken from idle reaches its first syscall
     /// about a millisecond on, past the seal's fsync it was to overlap,
     /// spawned or parked alike, and three shapes read the drain at ten
@@ -12703,10 +12705,12 @@ fn manifest_parse(buf: &[u8]) -> Result<Manifest> {
 /// Every valid slot, newest first by publish sequence; empty when neither
 /// exists -- a store that has never sealed, or one written before
 /// manifests. An empty slot is one made and never written. A slot that
-/// fails its CRC is a torn write: ignored where another slot is valid,
-/// since the torn one is the publish the crash interrupted and the other
-/// is the store, and refused where no slot is valid rather than guessed at.
-fn manifest_read_all(dir: &Path) -> Result<Vec<Manifest>> {
+/// fails its CRC is a torn write: passed over where another slot is
+/// valid, since the torn one is the publish the crash interrupted and the
+/// other is the store, which the open then holds to the directory
+/// (`Db::fallback_refusals`) -- the second answer says one was passed
+/// over -- and refused where no slot is valid rather than guessed at.
+fn manifest_read_all(dir: &Path) -> Result<(Vec<Manifest>, bool)> {
     let mut valid: Vec<Manifest> = Vec::new();
     let mut torn: Option<std::io::Error> = None;
     for (i, slot) in MANIFEST_SLOTS.iter().enumerate() {
@@ -12727,7 +12731,7 @@ fn manifest_read_all(dir: &Path) -> Result<Vec<Manifest>> {
     valid.sort_by_key(|m| std::cmp::Reverse(m.seq));
     match (valid.is_empty(), torn) {
         (true, Some(e)) => Err(e),
-        _ => Ok(valid),
+        (_, torn) => Ok((valid, torn.is_some())),
     }
 }
 
@@ -15628,6 +15632,10 @@ struct Shared {
     /// A test's: the next close's presync reports a failure as a failed
     /// fdatasync would.
     fail_presync: std::sync::atomic::AtomicBool,
+    /// A test's: the files the open that made this store fsynced, each
+    /// pushed once its fsync returned, the directory as `.`; none at
+    /// `Db::create` (`Db::open_synced_files`).
+    open_synced: Vec<String>,
     /// A test's: the inode of the run's file and the bytes the file held
     /// when an injected presync failed (`Db::failed_presync_extent`).
     failed_presync: std::sync::Mutex<Option<(u64, u64)>>,
@@ -28497,6 +28505,7 @@ impl Db {
             wedge_cause: std::sync::Mutex::new(None),
             fail_landing: std::sync::atomic::AtomicBool::new(false),
             fail_presync: std::sync::atomic::AtomicBool::new(false),
+            open_synced: Vec::new(),
             failed_presync: std::sync::Mutex::new(None),
             presync_hold: std::sync::atomic::AtomicBool::new(false),
             slot_watch: std::sync::Mutex::new(None),
@@ -28677,6 +28686,21 @@ impl Db {
     /// name -- under a cipher, an envelope neither slot names included --
     /// or writes over the other slot: one fdatasync of a small file,
     /// of nothing where the slot was already on the device.
+    ///
+    /// The open removes and writes nothing until the slot it takes is held
+    /// to the directory, and refuses, with every file left as it found it,
+    /// where that slot cannot be the store: a segment it names is not in
+    /// the directory; no slot can be read beside `par-` or `pcs-` files,
+    /// or under a cipher beside segments' envelopes, which only a store
+    /// with a manifest writes; or, where a newer slot failed its check and
+    /// was passed over, a segment the slot taken does not name holds
+    /// writes the log no longer replays, or keys nothing the slot names,
+    /// no run's temp name and no replayed frame holds. A store with no
+    /// slot and only `seg-` files is one from before manifests and opens
+    /// from their names. Under `Options::manifest_pending` a pending
+    /// segment the open reads back whole is fsynced, with its ordered
+    /// index under `Options::ord_durable` and the directory, before the
+    /// open writes the slot naming it durable.
     pub fn open(dir: &Path, mut opts: Options) -> Result<Db> {
         check_options(&opts)?;
         // Before anything is read, the store held to the way it is asked
@@ -28728,7 +28752,7 @@ impl Db {
         // version 2 or 1, gets both slots rewritten in this version below,
         // since a reader of those versions skips a slot it cannot parse for
         // one it can, and would take the older state for the store.
-        let mut slots = manifest_read_all(dir)?;
+        let (mut slots, slot_failed) = manifest_read_all(dir)?;
         let upgrade = slots.iter().any(|m| m.version < 3);
         // Only the newest slot's pending names are in doubt: the slot
         // before it was written by a publish that waited for that seal's
@@ -28739,6 +28763,15 @@ impl Db {
         if skipped {
             slots.remove(0);
         }
+        // The slot taken is not the newest one written: one failed its
+        // check. A crash leaves that where a publish it interrupted never
+        // became durable, so nothing was retired behind it; damage leaves
+        // it where one did, and then the slot before is not the store. A
+        // newest slot passed over for its pending names is neither: a
+        // slot naming a seal's segments pending retires nothing of that
+        // seal's log or temp names, which wait for a slot naming them
+        // durable, and that slot is the newer one.
+        let fell_back = slot_failed;
         let manifest: Option<Manifest> = if slots.is_empty() {
             None
         } else {
@@ -28757,6 +28790,9 @@ impl Db {
         // Per slot file, the sequence an fdatasync here covered: a test's
         // record of what the open made durable (`Shared::slot_synced`).
         let mut synced = [0u64; 2];
+        // A test's: every file this open fsyncs, once its fsync has
+        // returned (`Shared::open_synced`).
+        let mut open_synced: Vec<String> = Vec::new();
         // A test's: the first slot this open writes torn
         // (`Options::tear_open_slot_write`), whichever write is first.
         let mut tear = opts.tear_open_slot_write;
@@ -28776,13 +28812,6 @@ impl Db {
             slot.landed(m.slot);
             synced[m.slot] = m.seq;
         }
-        // Listed after the manifests are read and the slot taken is
-        // durable: under a cipher the segments the directory holds are
-        // known by the slots that name them, and an envelope neither slot
-        // names is nobody's and goes here, the first file the open removes.
-        if let Some(h) = &held {
-            h.vault().sweep()?;
-        }
         let mut on_disk: Vec<String> = Vec::new();
         for name in vault::names(dir)? {
             if (name.starts_with("seg-") || name.starts_with("par-") || name.starts_with("pcs-"))
@@ -28798,9 +28827,10 @@ impl Db {
         // The publish sequence the store is at, moved by every manifest
         // written here and handed to the segment work.
         let mut mseq = manifest.as_ref().map_or(0, |m| m.seq);
-        if opts.manifest_slots {
-            manifest_make_slots(dir)?;
-        }
+        // The pending names the slot taken carries, made durable below
+        // before a slot names them so (`Options::manifest_pending`).
+        let pending: Vec<String> = manifest.as_ref().map_or(Vec::new(), |m| m.pending.clone());
+        let taken = manifest.as_ref().map(|m| MANIFEST_SLOTS[m.slot]);
         let (sealed, mut live) = match manifest {
             Some(m) => (m.covered, m.names),
             None => {
@@ -28814,6 +28844,117 @@ impl Db {
                 (covered, names)
             }
         };
+        // What the slot taken names held to the directory before anything
+        // is removed or written: an open that refuses leaves every file as
+        // it found it, for the store to be put right.
+        Db::open_refusals(dir, taken, &live, &on_disk, held.is_some())?;
+        let mut wal_ids: Vec<u64> = Vec::new();
+        let mut spare_wals: Vec<PathBuf> = Vec::new();
+        // Spares beyond the one kept, and log files after the one the log
+        // ended at: removed once the open has decided the store is what
+        // it reads, with everything else it removes.
+        let mut spare_extra: Vec<PathBuf> = Vec::new();
+        let mut wal_later: Vec<u64> = Vec::new();
+        for name in vault::names(dir)? {
+            if let Some(id) = name.strip_prefix("wal-") {
+                wal_ids.push(id.parse().map_err(|_| err("wal file name is malformed"))?);
+            } else if name.starts_with("spare-") {
+                // A retired WAL kept for recycling. It holds nothing a
+                // segment does not, so it is either the pool or garbage.
+                if opts.recycle_wal && spare_wals.is_empty() {
+                    spare_wals.push(dir.join(&name));
+                } else {
+                    spare_extra.push(dir.join(&name));
+                }
+            }
+        }
+        wal_ids.sort_unstable();
+        let mem = MemTable::new(opts.block_shape());
+        // Replay's own table, for the index resizes a replayed delete
+        // frees through; nothing reads beside it.
+        let readers = Readers::new(false);
+        let mut mem_bytes = 0usize;
+        let mut from = sealed;
+        let mut valid_len = 0u64;
+        // The file the writer appends to: the last, unless the log ended
+        // at a loose boundary before it (`Wal::replay`), where it is the
+        // file that boundary begins, cut to its header below, with every
+        // file after it removed: their records continue a tail a power
+        // loss took, and would read as a gap at every open after this one.
+        let mut live_wal = wal_ids.len().saturating_sub(1);
+        // Which files replay applied frames of: frames an open read back
+        // out of the page cache, after a process kill, as readily as off
+        // the device, so none of them is known durable.
+        let mut applied: Vec<bool> = Vec::with_capacity(wal_ids.len());
+        for (i, &id) in wal_ids.iter().enumerate() {
+            let (next, valid, ended) = Wal::replay(
+                &Db::wal_path(dir, id),
+                id,
+                from,
+                i == 0,
+                opts.recycle_wal,
+                |kind, k, v| {
+                    if kind == WAL_DEL {
+                        mem.delete(mem_hash(k), k, &readers);
+                        mem_bytes += k.len() + 16;
+                    } else {
+                        mem.append(mem_hash(k), k, v, &readers);
+                        mem_bytes += k.len() + v.len();
+                    }
+                },
+            )?;
+            // A file the log ended at answers `from` (`replay_frames`):
+            // nothing of it applied.
+            applied.push(next != from);
+            if ended {
+                live_wal = i;
+                valid_len = valid;
+                wal_later.extend_from_slice(&wal_ids[i + 1..]);
+                break;
+            }
+            from = next;
+            valid_len = valid;
+        }
+        wal_ids.truncate(live_wal + 1);
+        // The older files whose frames replay applied are loose, as a
+        // rotation that left them unsynced would have left them: the first
+        // sync by policy syncs each before the live file's header can say
+        // chained over it (`Db::sync_wal`). Synced alone, the live file's
+        // header would be rewritten chained over files a power cut can
+        // still cut, and the open after that cut would read the gap as a
+        // record lost.
+        let loose_wals: Vec<PathBuf> = wal_ids
+            .iter()
+            .zip(&applied)
+            .take(live_wal)
+            .filter(|&(_, &a)| a)
+            .map(|(&id, _)| Db::wal_path(dir, id))
+            .collect();
+        // What replayed is what the WAL had committed: a reader under
+        // `Latest` sees it from the open on, not from the first commit
+        // after. The builder ahead of the reader found it missing, reading
+        // a reopened store at its watermark.
+        mem.commit();
+        if fell_back && held.is_none() {
+            Db::fallback_refusals(dir, taken, sealed, from, &live, &on_disk, &mem)?;
+        }
+        // The store is what the slot taken names: from here the open
+        // removes what nothing names and writes what it owes.
+        // Under a cipher the segments the directory holds are known by the
+        // slots that name them, and an envelope neither slot names is
+        // nobody's and goes here.
+        if let Some(h) = &held {
+            h.vault().sweep()?;
+        }
+        if opts.manifest_slots {
+            manifest_make_slots(dir)?;
+        }
+        for p in &spare_extra {
+            let _ = vault::remove_file(p);
+        }
+        for &later in &wal_later {
+            vault::remove_file(Db::wal_path(dir, later))?;
+        }
         // Orphans: files a crash left behind from a merge or a seal whose
         // manifest never landed. The manifest says what is live, so
         // anything else is unreachable and is removed rather than kept.
@@ -28838,6 +28979,28 @@ impl Db {
             // other slot too where it was of a version before, so neither
             // reads as the store to a reader of that version -- written
             // once the first is durable, and the first stays the newest.
+            // A pending name the open read back whole was read out of the
+            // page cache, where a kill leaves a seal's segments its fsync
+            // never covered: each made durable here, with its ordered index
+            // where the store keeps those durable and the directory's
+            // entries for them, before the slot covers the log frames that
+            // were their writes' only durable copy. Under a cipher a
+            // pending segment's envelope was written and synced before the
+            // slot naming it was (`manifest_image`).
+            if !pending.is_empty() && held.is_none() {
+                for name in &pending {
+                    let mut files = vec![name.clone()];
+                    if opts.ord_durable {
+                        files.extend(Db::ord_name_for(name));
+                    }
+                    for f in files {
+                        vault::open(dir.join(&f))?.sync_all()?;
+                        open_synced.push(f);
+                    }
+                }
+                vault::sync_dir(dir)?;
+                open_synced.push(".".into());
+            }
             mseq += 1;
             let to = slot.write_shape(dir, &opts, mseq, sealed, &live, take(&mut tear))?;
             synced[to] = mseq;
@@ -28991,90 +29154,6 @@ impl Db {
             .iter()
             .filter_map(|n| Some((Db::name_id(n)?, Db::name_end_seq(n)?)))
             .collect();
-        let mut wal_ids: Vec<u64> = Vec::new();
-        let mut spare_wals: Vec<PathBuf> = Vec::new();
-        for name in vault::names(dir)? {
-            if let Some(id) = name.strip_prefix("wal-") {
-                wal_ids.push(id.parse().map_err(|_| err("wal file name is malformed"))?);
-            } else if name.starts_with("spare-") {
-                // A retired WAL kept for recycling. It holds nothing a
-                // segment does not, so it is either the pool or garbage.
-                if opts.recycle_wal && spare_wals.is_empty() {
-                    spare_wals.push(dir.join(&name));
-                } else {
-                    let _ = vault::remove_file(dir.join(&name));
-                }
-            }
-        }
-        wal_ids.sort_unstable();
-        let mem = MemTable::new(opts.block_shape());
-        // Replay's own table, for the index resizes a replayed delete
-        // frees through; nothing reads beside it.
-        let readers = Readers::new(false);
-        let mut mem_bytes = 0usize;
-        let mut from = sealed;
-        let mut valid_len = 0u64;
-        // The file the writer appends to: the last, unless the log ended
-        // at a loose boundary before it (`Wal::replay`), where it is the
-        // file that boundary begins, cut to its header below, with every
-        // file after it removed: their records continue a tail a power
-        // loss took, and would read as a gap at every open after this one.
-        let mut live = wal_ids.len().saturating_sub(1);
-        // Which files replay applied frames of: frames an open read back
-        // out of the page cache, after a process kill, as readily as off
-        // the device, so none of them is known durable.
-        let mut applied: Vec<bool> = Vec::with_capacity(wal_ids.len());
-        for (i, &id) in wal_ids.iter().enumerate() {
-            let (next, valid, ended) = Wal::replay(
-                &Db::wal_path(dir, id),
-                id,
-                from,
-                i == 0,
-                opts.recycle_wal,
-                |kind, k, v| {
-                    if kind == WAL_DEL {
-                        mem.delete(mem_hash(k), k, &readers);
-                        mem_bytes += k.len() + 16;
-                    } else {
-                        mem.append(mem_hash(k), k, v, &readers);
-                        mem_bytes += k.len() + v.len();
-                    }
-                },
-            )?;
-            // A file the log ended at answers `from` (`replay_frames`):
-            // nothing of it applied.
-            applied.push(next != from);
-            if ended {
-                live = i;
-                valid_len = valid;
-                for &later in &wal_ids[i + 1..] {
-                    vault::remove_file(Db::wal_path(dir, later))?;
-                }
-                break;
-            }
-            from = next;
-            valid_len = valid;
-        }
-        wal_ids.truncate(live + 1);
-        // The older files whose frames replay applied are loose, as a
-        // rotation that left them unsynced would have left them: the first
-        // sync by policy syncs each before the live file's header can say
-        // chained over it (`Db::sync_wal`). Synced alone, the live file's
-        // header would be rewritten chained over files a power cut can
-        // still cut, and the open after that cut would read the gap as a
-        // record lost.
-        let loose_wals: Vec<PathBuf> = wal_ids
-            .iter()
-            .zip(&applied)
-            .take(live)
-            .filter(|&(_, &a)| a)
-            .map(|(&id, _)| Db::wal_path(dir, id))
-            .collect();
-        // What replayed is what the WAL had committed: a reader under
-        // `Latest` sees it from the open on, not from the first commit
-        // after. The builder ahead of the reader found it missing, reading
-        // a reopened store at its watermark.
-        mem.commit();
         // Older WALs are kept, not swept: their records are in the
         // memtable and the memtable is not durable. They retire at the
         // next seal, when a named segment covers them.
@@ -29109,7 +29188,7 @@ impl Db {
         } else {
             WAL_LOOSE
         };
-        let settled = cut || !applied.get(live).copied().unwrap_or(false);
+        let settled = cut || !applied.get(live_wal).copied().unwrap_or(false);
         let wal = Wal::open_append(&wal_path, wal_id, from, kind, settled)?;
         let next_seg = seg_ids.iter().map(|&(n, _)| n + 1).max().unwrap_or(0);
         let spare_wal = spare_wals
@@ -29219,6 +29298,7 @@ impl Db {
             wedge_cause: std::sync::Mutex::new(None),
             fail_landing: std::sync::atomic::AtomicBool::new(false),
             fail_presync: std::sync::atomic::AtomicBool::new(false),
+            open_synced,
             failed_presync: std::sync::Mutex::new(None),
             presync_hold: std::sync::atomic::AtomicBool::new(false),
             slot_watch: std::sync::Mutex::new(None),
@@ -29492,6 +29572,163 @@ impl Db {
         self.fs().log_gen.set(st.gen);
         self.fs().log_seen.set(0);
         self.note_over(st);
+    }
+
+    /// The open's refusals of the slot it takes, made before it removes
+    /// or writes anything, so that a store it cannot read as the slot says
+    /// is left as it was found. With no slot read, a `par-` or `pcs-` file
+    /// -- names only a store with a manifest writes -- or under a cipher
+    /// any segment's envelope, which only a slot names, is a store whose
+    /// manifest is gone and not one from before manifests: the scan kept
+    /// for those takes `seg-` files alone and would remove the rest. With a
+    /// slot, every segment it names is in the directory, since a slot names
+    /// only what is durable and a landing removes nothing until the slot
+    /// that stops naming it is.
+    fn open_refusals(
+        dir: &Path,
+        taken: Option<&str>,
+        live: &[String],
+        on_disk: &[String],
+        cipher: bool,
+    ) -> Result<()> {
+        let Some(slot) = taken else {
+            if let Some(n) = on_disk
+                .iter()
+                .find(|n| n.starts_with("par-") || n.starts_with("pcs-"))
+            {
+                return Err(err(&format!(
+                    "refused: no manifest slot can be read, beside {n}, which only a \
+                     store with a manifest writes; nothing was removed"
+                )));
+            }
+            if cipher && vault::holds_envelopes(dir)? {
+                return Err(err(
+                    "refused: no manifest slot can be read, beside the envelopes of \
+                     segments only a slot names; nothing was removed",
+                ));
+            }
+            return Ok(());
+        };
+        if let Some(n) = live.iter().find(|n| !vault::on_device(dir.join(n))) {
+            return Err(err(&format!(
+                "refused: the manifest slot {slot} names {n}, which is missing from the \
+                 directory; nothing was removed"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The refusals of an open that passed over a newer slot, one that
+    /// failed its check, for the slot before it. A crash leaves that only
+    /// where the publish it interrupted never became durable, so nothing
+    /// was retired behind it and the slot taken, the log and the runs'
+    /// temp names hold every write; damage leaves it where the newer slot
+    /// was durable, and the log files and temp names it covered may be
+    /// gone. So every segment
+    /// the slot taken does not name, and that reads back whole, is held to
+    /// what holds its records before the open sweeps it: one with writes
+    /// past what the slot covers, by the log replaying through them
+    /// (`replayed`, the sequence after the last frame replay applied: a
+    /// run's segment is named at the log's sequence, which the log reaches
+    /// whether or not it holds the run's records); and one newer than every
+    /// segment the slot names, by its first and last keys, each held by a
+    /// segment the slot names, a run's segment beside its temp name -- a
+    /// run's own among them -- or the replayed log, as a merge's outputs
+    /// are held by their inputs and a seal's by its log, and a run's whose
+    /// temp name was retired by nothing. A segment that does not read back
+    /// whole was never durable, so no slot named it so and nothing retired
+    /// behind it. Not under a cipher, where an envelope no slot names has
+    /// its key in no slot that can be read.
+    fn fallback_refusals(
+        dir: &Path,
+        taken: Option<&str>,
+        sealed: u64,
+        replayed: u64,
+        live: &[String],
+        on_disk: &[String],
+        mem: &MemTable,
+    ) -> Result<()> {
+        let Some(slot) = taken else {
+            return Ok(());
+        };
+        let unnamed: Vec<&String> = on_disk.iter().filter(|n| !live.contains(n)).collect();
+        if unnamed.is_empty() {
+            return Ok(());
+        }
+        let next_id = live
+            .iter()
+            .filter_map(|n| Db::name_id(n))
+            .map(|i| i + 1)
+            .max()
+            .unwrap_or(0);
+        let runs: std::collections::HashSet<u64> = vault::names(dir)?
+            .iter()
+            .filter_map(|n| {
+                n.strip_prefix("direct-")
+                    .and_then(|r| r.strip_suffix(".tmp"))
+                    .and_then(|r| r.parse::<u64>().ok())
+            })
+            .collect();
+        let whole = |n: &str| -> Option<Blob<MmapBytes>> {
+            let src = vault::map(dir.join(n)).ok()?;
+            Blob::open_with(
+                src,
+                crate::blob::BlobOptions {
+                    verify_checksums: true,
+                    verify_index: true,
+                    ..Default::default()
+                },
+            )
+            .ok()
+        };
+        let refused = |what: String| {
+            err(&format!(
+                "refused: a newer manifest slot did not check out, and the slot before \
+                 it, {slot}, is not the store: {what}; nothing was removed"
+            ))
+        };
+        // What holds a key besides the log, opened at the first key asked.
+        let mut holders: Option<Vec<Blob<MmapBytes>>> = None;
+        for u in &unnamed {
+            let (Some(id), Some(end)) = (Db::name_id(u), Db::name_end_seq(u)) else {
+                continue;
+            };
+            let Some(b) = whole(u) else {
+                continue;
+            };
+            if end > sealed && replayed < end {
+                return Err(refused(format!(
+                    "{u} holds writes to sequence {end}, which the log no longer holds \
+                     (it replays to {replayed})"
+                )));
+            }
+            if id < next_id || b.keys() == 0 {
+                continue;
+            }
+            let holders = holders.get_or_insert_with(|| {
+                live.iter()
+                    .map(|n| n.as_str())
+                    .chain(
+                        unnamed
+                            .iter()
+                            .filter(|n| Db::name_id(n).is_some_and(|i| runs.contains(&i)))
+                            .map(|n| n.as_str()),
+                    )
+                    .filter_map(whole)
+                    .collect()
+            });
+            for k in [b.key_at(0), b.key_at(b.keys() - 1)].into_iter().flatten() {
+                if mem.get(k, usize::MAX).is_none()
+                    && !holders.iter().any(|h| h.lookup(k).is_some())
+                {
+                    return Err(refused(format!(
+                        "{u} holds keys nothing the slot names holds, and neither does \
+                         the log or a run's temp name"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Whether every segment in `names` reads back whole: its superblock
@@ -32807,6 +33044,13 @@ impl Db {
         self.shared
             .fail_seal_sync
             .store(true, AtomicOrdering::Release);
+    }
+
+    /// A test's: the files the open that made this store fsynced, the
+    /// directory as `.` (`Shared::open_synced`).
+    #[doc(hidden)]
+    pub fn open_synced_files(&self) -> Vec<String> {
+        self.shared.open_synced.clone()
     }
 
     /// A test's: whether a fault set by `fail_next_seal_sync` or
