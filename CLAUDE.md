@@ -2144,24 +2144,7 @@ file before the live one and chains the kind, and a replay that meets a
 sequence gap at a loose boundary ends the log there where at a chained
 one it refuses the open -- and a closed file retires at the next seal's
 durable landing, whose manifest covers it (`seal_rotates_wal` is the arm
-that syncs and rotates at every seal instead). An open takes nothing it
-replays as durable, since a kill leaves the page cache whole: the older
-files it applied frames from go on the loose list, the live file's
-frames count unsynced, and a header the open writes over a file it found
-without one says loose where an older file is, so the first sync by
-policy or `sync` after the open syncs the older files oldest first and
-then the live one, and the first flush covers them by its segment
-instead and is answered behind its slot's fdatasync, as a buffered
-drain is; an open with nothing replayed, or whose cut of a torn tail
-synced the live file, owes nothing. A log file whose first sector is
-zeroes -- a log no sync ever covered, a page a power cut lost -- is a
-log with nothing in it, newest or older, under either kind, and no frame
-behind it is replayed: a sync covers the header with the frames, so none
-was acknowledged unless the device changed bytes it had synced; the gap rules then read the file after an older one,
-the log's end at a loose boundary and a record lost at a chained one,
-since a chained header says the file before it was synced whole and its
-zeroes are damage. A zero header over a first sector that holds anything
-else is damage and refused. Readers wait for no
+that syncs and rotates at every seal instead). Readers wait for no
 fsync and the manifest does, and no manifest is written while a seal's
 segments are published and unsynced -- it would name a segment that may be
 torn and cover a sequence the WAL still has to hold -- so a merge that
@@ -2348,21 +2331,6 @@ empty; the open commits what it replayed now, and a test reads a
 reopened store through a handle. The rule: a path that rebuilds a
 structure ends where the live path ends, and a reader that honours a
 mark the live path sets is the test that tells the two apart.
-
-It came back as a mark: the open set the live log's synced mark to its
-length, on the reading that replay read the frames back from the
-device, and after a process kill it had read them from the page cache.
-A `sync` after the reopen found nothing unsynced and answered `Ok`, the
-first flush was answered before its slot's fdatasync with the log
-covering nothing, and a power cut then took what both had acknowledged;
-the older files replay read were not on the loose list either, so the
-first sync would have chained the live header over a file a power cut
-could still cut, and the open after that cut refused a gap it read as a
-record lost. Every test reopened a store and read it, and none synced
-after a reopen and cut the power. The rule: what an open rebuilds from a
-log is as durable as the device has been told, not as the read found
-it, and the open hands the live path the same marks the writes that
-made it would have left -- unsynced, and loose where a sync is owed.
 
 **A path only one arm exercises is a path nothing tests.** A delete was never
 marked dirty, and the checkpoint asked to carry it dropped it, leaving the key
@@ -4731,27 +4699,6 @@ of the call that happens to need the write; and a burst that costs more
 than its commits is listed under `strace` before its profile is read,
 since the profile of a thread that waits shows the work and not the
 wait.
-
-**A header that needed no sync, read as if it had had one.** A new log
-file's header is written and left to the next sync, which covers it
-with the frames, and the open read a file shorter than its header as a
-log with nothing in it on the reading that a power cut tears a file at
-its end. A power cut can also keep the size and lose the page: a store
-just created, a file a rotation began, the log of a durable ordered
-load whose commits all synced the run's own file, and a buffered
-store's log, which a flush acknowledges past, could each come back with
-a first sector of zeroes where the header was, and every open after refused the
-store as "not a supdb WAL" with its acknowledged writes in segments and
-runs beside it, at every open, since every open reads the log again.
-The test that a fresh store opens after a lost header was never
-written, because the file a test copies is the page cache's, which
-never loses a page. The rule is the fresh-pages one turned to the
-device: what a power cut leaves of a file no sync covered is any part
-of it, the first page included, so an open reads every such state --
-here a first sector of zeroes as a log with nothing in it, and only
-that, since a header zeroed over frames is not a lost page -- and the
-fix is at the read, where it costs an open a compare, never a sync at
-the write, where it would cost every rotation one.
 
 **A point that was not the store it said, and a burst as wide as the
 share it is held to.** The buffered arm's one-percent burst at three
