@@ -2212,7 +2212,17 @@ that file. The WAL never
 sees them (`direct_ingest: false` is the arm that still sends them there).
 Recovery walks the temp file's record stream to the last marker whose three
 quantities agree with the records before it and rewrites what precedes it as
-a piece; what follows is a batch nobody was told was durable. The CRC is
+a piece; what follows is a batch nobody was told was durable. The run's
+writer writes at the offset it counts, never at the file's cursor, so a
+write the device refuses part way leaves bytes past what counts and the
+next write lands over them; the batch is the writer's whole by then, so
+the failure is held for the commit that syncs it, and the batch is owed
+until a sync covers it -- no commit with nothing new, `sync` or `flush`
+answers `Ok` before one has. A failed fdatasync of the run's file, the
+commit's or the helper's behind the writer, is kept as the log's is, and
+the run's close refuses to finish the file, since its fsync would be the
+retry; a run closed while it owes a batch writes the batch into its
+segment, durable with the segment once it lands. The CRC is
 there because a crash can land the page a marker is on and not a page of its
 batch, and a record whose bytes came back zero still parses. The close is
 the seal's shape with one difference: the finished segment is hard-linked
@@ -3394,6 +3404,29 @@ them made already: the kept error refills `pending_err` each time it is
 taken. The corollary: a sync's error is not the call's alone either --
 it is a fact about what the device holds, so it is kept for every later
 call that would promise the same bytes, and a retry is never the remedy.
+It came back a third time at the direct run's file, twice. The helper
+thread that syncs a segment behind its writer keeps its fdatasync's error
+for the finish, and its doc said why -- the writer's own fsync, on the
+same description, "would then report nothing" -- while the run's commits
+are the writer's own fsyncs and never the finish: a failure the helper
+met was answered by no commit, and the commit after it was acknowledged
+over the hole. The writer reads the helper's error where it already
+tells the helper it has synced (`synced_all`), so a writer with no helper
+pays nothing. And the run's own failed fdatasync was answered once and
+forgotten as the log's had been, and with the kept error in place a write
+below the store's greatest still closed the run, whose finish fsyncs the
+same file and whose landing names it: a retry with a manifest behind it.
+The finish refuses a file whose sync failed, and asks nothing to know
+it: the lost sync and a held write are bits of the byte the writer's
+test seams already asked beside every write and every sync, so a write
+of a file whose sync failed is refused in the write's own cold path, a
+finish always has its trailer to write, and the first draft's checks of
+two fields of their own, one at the top of every run commit's sync and
+one at every segment's finish, were a load and a branch each that no
+check of the path made before. The corollary: a kept error
+is checked at every path that would sync the same bytes again, the
+background ones included, and not only at the calls that answer the
+caller.
 
 **A failure that left the buffer it failed on for the next call to
 build on.** The log's write staged a commit's frames, wrote them, and
@@ -3442,6 +3475,39 @@ and a "nothing to do" answered from one counter is wrong wherever a
 failure can leave the work in another buffer that counter does not see;
 and a contract written for a failure is read against every path that
 reaches it, since the paths order their marks and writes differently.
+It came back at the direct run, whose file is its own log and whose
+writer had the same shape twice. A piece the device refused at a commit's
+marker returned before the commit counted the batch, with the writer's
+keys, its marker and its CRC already past it, so the next commit handed
+the writer the same keys again and the run refused every commit after it
+as keys out of order, never naming the device; and a write at the sync
+that failed, or failed part way, left the batch counted and the file's
+cursor past what the writer counted, so a commit with nothing new and a
+`sync` answered `Ok` at the run's "nothing to commit" with no write at
+all, and the commit after a part written landed past the stray bytes and
+was lost to the recovery walk. The writer writes at the offset it counts
+now (`pwritev_all`), holds a failure it meets between two syncs with
+every byte for the next sync to write and answer (`AlignedWriter::defer`),
+and says it owes the file in a bit of the same byte its seams and its
+held and lost states share, set where the write fails and cleared on the
+sync's cold path once a sync has covered it, so that early return asks
+one compare it did not make before and the exact count
+(`SegmentWriter::owes`) only behind it: the first draft asked the count
+itself, two loads where the path had none; and a short write, which no
+seam had made, is one now, since a loop that moves the offset on by the
+count it got is a line only a short count reaches. A failure met inside
+a sync that then wrote and synced every byte it held is paid by that
+sync, never answered to the next one, which would answer it without
+writing its own batch. The corollary: a failure in the middle of a call
+whose earlier steps another component has already taken is completed
+forward, never answered from where it stood, since the half that was
+taken cannot be handed back; and a writer that counts its own offset
+writes at it, so that the cursor is never a second count. A run that
+closes while it owes a batch -- a key below its greatest, before any
+commit synced the batch again -- writes the batch into its segment, and
+the close is the batch's sync; a test closes such a run, held and owed,
+under both policies, every arm and a cipher, since the first tests
+closed only runs whose owed batch a sync had already written.
 
 **A length read off the slab that held the exceptions.** The ordered
 table's write log became the range of its entries, its length the

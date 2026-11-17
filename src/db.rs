@@ -195,6 +195,27 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
 /// what was acknowledged before the failure and whatever the device kept
 /// of the rest. So does a failed write whose bytes cannot be cut back off
 /// the log.
+///
+/// An ordered run's file is its own log in the clear, and the same rules
+/// hold of it. Its table marks a batch before the batch's sync, so a
+/// reader sees the batch from its commit, whatever that commit answers. A
+/// write of the run's file the device refuses is answered by the commit
+/// that syncs it -- under `Always` its own, under `EveryN` the next that
+/// syncs -- and the batch is owed: nothing the write left on the file
+/// past what the file held counts, the run's next commit takes it with its
+/// own, as durable as that commit's policy makes it, and no commit with
+/// nothing new, `sync` or `flush` answers `Ok` before it has written the
+/// batch again, at the offset the file is good to, and synced it, whatever
+/// the policy.
+/// A failed fdatasync of the run's file, the commit's own or the one a
+/// thread makes behind the writer, is kept as the log's is, and the run is
+/// never closed into a segment over it.
+/// A run that closes -- at a write below its greatest key, a seal, a
+/// flush -- while it owes a batch writes the batch into its segment with
+/// the rest, and the batch is as durable as that segment once it lands;
+/// a write failure no commit had answered yet is answered by nothing
+/// then, the bytes it failed on being the segment's, or by the close's
+/// own failure where the close fails.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncPolicy {
     /// One fdatasync per commit. Durable per batch, LMDB's boundary.
@@ -5625,6 +5646,37 @@ fn seg_order(a: &Seg, b: &Seg) -> Ordering {
 
 // ------------------------------------------------------- the segment writer --
 
+/// A test's injected failure of a direct run's file (`AlignedWriter::fault`,
+/// `Db::fail_next_run_write`), in the byte's low bits (`RUN_FAULT_SEAM`):
+/// the next `sync_data` fails; the next write fails having written
+/// nothing; the next write fails having written half of its first part.
+const RUN_FAULT_SYNC: u8 = 1;
+const RUN_FAULT_WRITE: u8 = 2;
+const RUN_FAULT_PARTIAL: u8 = 3;
+/// The next two writes fail having written nothing: a failure that is
+/// still there when the write is tried again.
+const RUN_FAULT_TWICE: u8 = 4;
+/// The next write's first `pwritev` writes half of its first part and
+/// answers that count, as a short write does, and the loop goes on.
+const RUN_FAULT_SHORT: u8 = 5;
+/// The bits of `AlignedWriter::fault` a test's seam sets.
+const RUN_FAULT_SEAM: u8 = 0x07;
+/// Bytes handed to the writer are owed to the file (`AlignedWriter::owe`):
+/// set where a write of them fails, cleared by the cold sync that pays
+/// them (`SegmentWriter::sync_attended`). Set, it says only that the
+/// writer may owe (`SegmentWriter::owes` is the exact answer), so a call
+/// with nothing new for the run asks it in the one compare of `fault`.
+const RUN_ATTN_OWED: u8 = 0x20;
+/// A write failure is held for the next sync to answer
+/// (`AlignedWriter::defer`).
+const RUN_ATTN_HELD: u8 = 0x40;
+/// An fdatasync of the file failed (`AlignedWriter::lose`); never reset.
+const RUN_ATTN_LOST: u8 = 0x80;
+
+/// The piece of a writer that failed a write it holds (`AlignedWriter::defer`):
+/// past any file's end, so no write happens before the next sync's.
+const STUCK_PIECE: u64 = 1 << 62;
+
 /// The segment file's output, written in pieces of
 /// `SegmentOptions::write_piece` at multiples of it.
 ///
@@ -5700,6 +5752,32 @@ struct AlignedWriter {
     /// folds the pieces' CRCs out of the same pass (`write_hashed`), so the
     /// helper there only syncs.
     helper_hashes: bool,
+    /// What the writer's file asks of a write and a sync, zero for
+    /// nothing: a test's armed failure (`RUN_FAULT_*`) and the writer's
+    /// own state after a failure (`RUN_ATTN_*`). A sync asks it once
+    /// before anything (`SegmentWriter::sync`), a write once beside its
+    /// syscall (`pwritev_all`), every value but the sync's seam past the
+    /// write's compare, and a commit with nothing new for the run once
+    /// (`SegmentWriter::attends`), so a writer with nothing to answer pays
+    /// those compares and no other.
+    fault: u8,
+    /// A direct run's writer (`SegmentWriter::set_marks`): its file is the
+    /// run's log, and a write of it the device refuses between two syncs
+    /// is held, not answered (`defer`): every byte stays with the writer,
+    /// nothing past `written` counts, and the next sync writes it at
+    /// `written` and answers the failure first. A seal's or a merge's
+    /// writer answers it where it happens and is given up.
+    defers: bool,
+    /// The write failure held for the next sync to answer
+    /// (`RUN_ATTN_HELD`); once a sync of the file has failed
+    /// (`RUN_ATTN_LOST`), that failure, answered by every sync after it.
+    held_err: Option<std::io::Error>,
+    /// The bytes handed to the writer when a write of them failed: owed to the file while `synced` is below them
+    /// (`SegmentWriter::owes`). Moved only on a failure; a sync that
+    /// covers them is what pays them.
+    owed_to: u64,
+    /// `SegmentOptions::fail_helper_syncs`, handed to the helper.
+    fail_helper: Option<std::sync::Arc<AtomicU64>>,
 }
 
 /// The pieces of the key section the helper hashed: `crcs[i]` is the CRC
@@ -5740,6 +5818,11 @@ impl AlignedWriter {
             own_crc: 0,
             own_row: Vec::new(),
             helper_hashes: true,
+            fault: 0,
+            fail_helper: None,
+            defers: false,
+            held_err: None,
+            owed_to: 0,
         }
     }
 
@@ -5817,7 +5900,12 @@ impl AlignedWriter {
     /// folios the buffer's whole pieces did.
     fn stream_hash(&mut self, from: usize, to: usize) -> std::io::Result<u32> {
         if !self.buf.is_empty() {
-            self.write_buf_with(false)?;
+            if let Err(e) = self.write_buf_with(false) {
+                self.defer(e)?;
+            }
+            if !self.buf.is_empty() {
+                return Ok(self.stream_copy(from, to));
+            }
         }
         if self.held_from == self.held_to {
             self.held_from = from;
@@ -5906,7 +5994,7 @@ impl AlignedWriter {
                 parts.push(arena.slice(p, part));
                 p += part;
             }
-            writev_all(&mut self.file, &parts)?;
+            pwritev_all(&self.file, self.written, &parts, &mut self.fault)?;
             self.written = stop;
             self.held_from = to;
             if self.writeback && stop % piece == 0 {
@@ -5990,6 +6078,12 @@ impl AlignedWriter {
 
     /// The file, every buffered byte written and the helper joined; what
     /// it synced is synced, and the caller's fsync covers the rest.
+    ///
+    /// A writer whose fdatasync failed (`RUN_ATTN_LOST`) refuses here,
+    /// since the caller's fsync would be the retry no sync of the file is
+    /// trusted for: every write of such a file fails (`run_write_fault`),
+    /// and a finish has its trailer at least to write, which no write
+    /// before this one can have taken from the buffer.
     fn into_inner(mut self) -> std::io::Result<File> {
         std::io::Write::flush(&mut self)?;
         self.join_helper()?;
@@ -6082,6 +6176,7 @@ impl AlignedWriter {
                 },
                 self.flushes.clone(),
                 self.hashed.clone(),
+                self.fail_helper.clone(),
             )?);
             // The pieces the writer hashed before the helper ran are the
             // helper's row's prefix, and the helper hashes on from there.
@@ -6098,14 +6193,132 @@ impl AlignedWriter {
     }
 
     /// The writer synced the file itself, to its end: nothing on it is the
-    /// thread's to sync.
-    fn synced_all(&mut self) {
-        self.synced = self.written;
+    /// thread's to sync -- unless the thread's own fdatasync failed before
+    /// it, which the writer's, on the same open file description, does not
+    /// report: that failure is the sync's answer, and nothing counts as
+    /// synced.
+    fn synced_all(&mut self) -> std::io::Result<()> {
         if let Some(h) = &self.helper {
+            let code = h.shared.error.load(AtomicOrdering::Acquire);
+            if code != 0 {
+                return Err(std::io::Error::from_raw_os_error(code));
+            }
             h.shared
                 .synced
                 .fetch_max(self.written, AtomicOrdering::AcqRel);
         }
+        self.synced = self.written;
+        Ok(())
+    }
+
+    /// A write that failed: held for the next sync where the writer
+    /// `defers` -- the failure kept for that sync to answer, the bytes
+    /// owed, and the writer stuck: its piece made larger than any file, so
+    /// that no piece is written before the sync, which writes every held
+    /// byte as one write at `written`, and the bytes after it are buffered
+    /// behind them -- but for the buffer a failed head left, which the
+    /// next commit's stream tries again before it is taken in behind it
+    /// (`stream_hash`). A stuck writer stays stuck for the run's life, one
+    /// write a sync. Answered where the writer does not defer.
+    #[cold]
+    #[inline(never)]
+    fn defer(&mut self, e: std::io::Error) -> std::io::Result<()> {
+        if !self.defers {
+            return Err(e);
+        }
+        if self.held_err.is_none() {
+            self.held_err = Some(e);
+        }
+        self.fault |= RUN_ATTN_HELD;
+        self.piece = STUCK_PIECE;
+        self.owe();
+        Ok(())
+    }
+
+    /// Everything handed to the writer so far owed to the file.
+    fn owe(&mut self) {
+        let handed = self.pos() + self.buf.len() as u64;
+        self.owed_to = self.owed_to.max(handed);
+        self.fault |= RUN_ATTN_OWED;
+    }
+
+    /// The owed bit cleared once a sync has covered every byte owed: only
+    /// on a sync's cold path, so the sync's own count (`synced_all`) stays
+    /// a count.
+    fn paid(&mut self) {
+        if self.owed_to <= self.synced {
+            self.fault &= !RUN_ATTN_OWED;
+        }
+    }
+
+    /// A write or a flush at a sync that failed: owed, and answered.
+    #[cold]
+    #[inline(never)]
+    fn owing(&mut self, e: std::io::Error) -> std::io::Error {
+        self.owe();
+        e
+    }
+
+    /// An fdatasync that failed, the writer's or its helper's: kept, and
+    /// the answer of every sync and the finish from here on. Linux reports
+    /// a writeback error once per open file description and marks the
+    /// pages clean, so no later sync of this file is trusted, and nothing
+    /// is owed: no sync can pay it.
+    #[cold]
+    #[inline(never)]
+    fn lose(&mut self, e: std::io::Error) -> std::io::Error {
+        self.fault |= RUN_ATTN_LOST;
+        self.held_err = Some(std::io::Error::new(e.kind(), e.to_string()));
+        e
+    }
+
+    /// What a sync answers before it writes anything: the write failure
+    /// held for it, taken, or a sync's failure, kept -- or nothing, where
+    /// the held failure was met inside a sync that then wrote and synced
+    /// every byte it held (`owed_to` at or below `synced`): that sync's
+    /// `Ok` was true, and answering the failure now would answer it to a
+    /// sync whose batch it has not written, with nothing owed after it.
+    #[cold]
+    #[inline(never)]
+    fn answer_held(&mut self) -> Option<std::io::Error> {
+        if self.fault & RUN_ATTN_LOST != 0 {
+            let e = self.held_err.as_ref().expect("a lost sync is kept");
+            return Some(std::io::Error::new(e.kind(), e.to_string()));
+        }
+        self.fault &= !RUN_ATTN_HELD;
+        let e = self.held_err.take().expect("a held failure");
+        (self.owed_to > self.synced).then_some(e)
+    }
+
+    /// The stream's bytes `from..to` taken into the buffer behind what a
+    /// failed write left there, the file's head first: the held stream
+    /// lands ahead of the buffer, so a stream that cannot be held behind
+    /// a buffer that is not empty goes into it, hashed into the row as the
+    /// buffer hashes, and is written with it at the next sync. Their CRC
+    /// for the marker. Only a stuck writer gets here.
+    #[cold]
+    #[inline(never)]
+    fn stream_copy(&mut self, from: usize, to: usize) -> u32 {
+        debug_assert_eq!(self.stream_held(), 0, "a buffer is never behind the stream");
+        if self.stream_base.is_none() {
+            self.stream_base = Some(self.written + self.buf.len() as u64 - from as u64);
+        }
+        let src = self.stream_src.clone().expect("a stream has its table");
+        let arena = src.stream_arena();
+        let mut whole = 0u32;
+        let mut p = from;
+        while p < to {
+            let part = (to - p).min(arena.block_len() - (p & (arena.block_len() - 1)));
+            let s = arena.slice(p, part);
+            whole = block::crc32_combine(whole, block::crc32(s), part as u64);
+            // Buffered: a stuck writer tries no write before the sync.
+            let _ = std::io::Write::write_all(self, s);
+            p += part;
+        }
+        // The held range is left as it was, empty (asserted above): every
+        // reader of it asks its length (`stream_held`), and the next
+        // `stream_hash` that holds anything starts it at its own `from`.
+        whole
     }
 
     /// The key section starts at `at`, the next byte written: the helper
@@ -6182,15 +6395,18 @@ impl AlignedWriter {
                 p += part;
             }
             parts.push(&self.buf);
-            writev_all(&mut self.file, &parts)?;
+            pwritev_all(&self.file, at, &parts, &mut self.fault)?;
             self.held_from = self.held_to;
         } else {
+            use std::os::unix::fs::FileExt;
             let split = (self.prefix as usize).min(self.buf.len());
-            if at == 0 && split > 0 && split < self.buf.len() {
-                std::io::Write::write_all(&mut self.file, &self.buf[..split])?;
-                std::io::Write::write_all(&mut self.file, &self.buf[split..])?;
+            if self.fault >= RUN_FAULT_WRITE {
+                pwritev_all(&self.file, at, &[&self.buf], &mut self.fault)?;
+            } else if at == 0 && split > 0 && split < self.buf.len() {
+                self.file.write_all_at(&self.buf[..split], 0)?;
+                self.file.write_all_at(&self.buf[split..], split as u64)?;
             } else {
-                std::io::Write::write_all(&mut self.file, &self.buf)?;
+                self.file.write_all_at(&self.buf, at)?;
             }
         }
         let total = (held + self.buf.len()) as u64;
@@ -6206,11 +6422,55 @@ impl AlignedWriter {
     }
 }
 
-/// `write_all` over several slices as one `writev`: the kernel sizes the
-/// page cache's folios by the write it sees and the offset it starts at,
-/// so a piece in two parts -- a stream across an arena block, a tail with
-/// the index behind it -- goes as one write, as the buffer's pieces do.
-fn writev_all(file: &mut File, parts: &[&[u8]]) -> std::io::Result<()> {
+/// `parts` written whole at file offset `at`, as one `pwritev` where the
+/// kernel takes them in one: the kernel sizes the page cache's folios by
+/// the write it sees and the offset it starts at, so a piece in two parts
+/// -- a stream across an arena block, a tail with the index behind it --
+/// goes as one write, as the buffer's pieces do. At the offset the writer
+/// counts and not at the file's cursor: the same pieces at the same
+/// offsets as a `writev` at the cursor, so the same folios, and the bytes
+/// of a write that failed part way move nothing -- the next write lands
+/// over them, at the offset the file is good to. A test's armed failure
+/// (`RUN_FAULT_*`) stands in for the write: one that writes nothing, or
+/// one that writes half of its first part and then fails, as a short
+/// write followed by an error does; and a writer's state after a failure
+/// (`RUN_ATTN_*`) is asked in the same compare (`run_write_fault`).
+fn pwritev_all(file: &File, at: u64, parts: &[&[u8]], fault: &mut u8) -> std::io::Result<()> {
+    if *fault >= RUN_FAULT_WRITE {
+        return run_write_fault(file, at, parts, fault);
+    }
+    pwritev_at(file, at, parts)
+}
+
+/// `pwritev_all`'s write.
+#[inline(always)]
+fn pwritev_at(file: &File, at: u64, parts: &[&[u8]]) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    pwritev_loop(at, parts, |iov: &[std::io::IoSlice<'_>], at: u64| {
+        // SAFETY: `IoSlice` is ABI-compatible with `iovec` on unix, and
+        // every slice it names is borrowed for the call.
+        unsafe {
+            libc::pwritev(
+                fd,
+                iov.as_ptr() as *const libc::iovec,
+                iov.len().min(1024) as libc::c_int,
+                at as libc::off_t,
+            )
+        }
+    })
+}
+
+/// The loop of a positioned write: `call` is one `pwritev` of the slices
+/// left at the offset reached, and a short count moves both on. Its one
+/// caller on a write's path hands it the syscall itself; a test's short
+/// write (`RUN_FAULT_SHORT`) hands it a call that is short once.
+#[inline(always)]
+fn pwritev_loop(
+    mut at: u64,
+    parts: &[&[u8]],
+    mut call: impl FnMut(&[std::io::IoSlice<'_>], u64) -> isize,
+) -> std::io::Result<()> {
     let mut iovs: Vec<std::io::IoSlice<'_>> = parts
         .iter()
         .filter(|p| !p.is_empty())
@@ -6218,16 +6478,87 @@ fn writev_all(file: &mut File, parts: &[&[u8]]) -> std::io::Result<()> {
         .collect();
     let mut iov: &mut [std::io::IoSlice<'_>] = &mut iovs[..];
     while !iov.is_empty() {
-        let n = std::io::Write::write_vectored(file, iov)?;
+        let n = call(iov, at);
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
         if n == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
                 "failed to write whole buffer",
             ));
         }
-        std::io::IoSlice::advance_slices(&mut iov, n);
+        std::io::IoSlice::advance_slices(&mut iov, n as usize);
+        at += n as u64;
     }
     Ok(())
+}
+
+/// A write a writer's `fault` asks about (`pwritev_all`), out of the
+/// write's path: refused once an fdatasync of the file has failed
+/// (`RUN_ATTN_LOST`), since nothing written to it after is a byte any sync
+/// can be trusted for -- which is also how the run's close refuses
+/// (`AlignedWriter::into_inner`); a test's armed failure; and otherwise the
+/// write, as `pwritev_all` makes it.
+#[cold]
+#[inline(never)]
+fn run_write_fault(file: &File, at: u64, parts: &[&[u8]], fault: &mut u8) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    if *fault & RUN_ATTN_LOST != 0 {
+        return Err(std::io::Error::other(
+            "an fdatasync of the run's file failed, and no write to it after is trusted",
+        ));
+    }
+    let seam = *fault & RUN_FAULT_SEAM;
+    if seam < RUN_FAULT_WRITE {
+        return pwritev_at(file, at, parts);
+    }
+    if seam == RUN_FAULT_SHORT {
+        *fault &= !RUN_FAULT_SEAM;
+        let mut short = true;
+        return pwritev_loop(at, parts, |iov: &[std::io::IoSlice<'_>], at: u64| {
+            let cut = if std::mem::take(&mut short) {
+                (iov[0].len() / 2).max(1)
+            } else {
+                usize::MAX
+            };
+            let mut n = 0isize;
+            let mut off = at;
+            for v in iov {
+                let take = v.len().min(cut - n as usize);
+                if take == 0 {
+                    break;
+                }
+                if file.write_all_at(&v[..take], off).is_err() {
+                    return -1;
+                }
+                n += take as isize;
+                off += take as u64;
+            }
+            n
+        });
+    }
+    let partial = seam == RUN_FAULT_PARTIAL;
+    let next = if seam == RUN_FAULT_TWICE {
+        RUN_FAULT_WRITE
+    } else {
+        0
+    };
+    *fault = (*fault & !RUN_FAULT_SEAM) | next;
+    if partial {
+        if let Some(p) = parts.iter().find(|p| !p.is_empty()) {
+            file.write_all_at(&p[..(p.len() / 2).max(1)], at)?;
+        }
+    }
+    Err(std::io::Error::other(if partial {
+        "the run's write failed after a partial write (injected)"
+    } else {
+        "the run's write failed (injected)"
+    }))
 }
 
 /// Ask the kernel to start writing `len` bytes of `file` from `at` to the
@@ -6319,6 +6650,7 @@ impl WriterHelper {
         section: Option<u64>,
         flushes: std::sync::Arc<AtomicU64>,
         hashed: std::sync::Arc<AtomicU64>,
+        fail: Option<std::sync::Arc<AtomicU64>>,
     ) -> std::io::Result<WriterHelper> {
         let dup = file.try_clone()?;
         let shared = std::sync::Arc::new(HelperShared {
@@ -6339,14 +6671,14 @@ impl WriterHelper {
         let s = shared.clone();
         let thread = std::thread::Builder::new()
             .name("supdb-helper".into())
-            .spawn(move || WriterHelper::run(&s, &dup, ahead))?;
+            .spawn(move || WriterHelper::run(&s, &dup, ahead, fail.as_deref()))?;
         Ok(WriterHelper {
             shared,
             thread: Some(thread),
         })
     }
 
-    fn run(s: &HelperShared, dup: &File, ahead: u64) {
+    fn run(s: &HelperShared, dup: &File, ahead: u64, fail: Option<&AtomicU64>) {
         use std::os::unix::fs::FileExt;
         let piece = 1u64 << flatindex::PIECE_SHIFT;
         let mut buf = vec![0u8; 1 << 20];
@@ -6382,7 +6714,14 @@ impl WriterHelper {
             // the segment covers what is left, and the finish waits for the
             // join.
             if !stop && landed.saturating_sub(synced) >= ahead {
-                if let Err(e) = dup.sync_data() {
+                // A test's failure stands in for the fdatasync, as a device
+                // error the dup's sync consumed leaves the range unsynced.
+                let r = if fail.is_some() {
+                    Err(std::io::Error::from_raw_os_error(libc::EIO))
+                } else {
+                    dup.sync_data()
+                };
+                if let Err(e) = r {
                     let code = e.raw_os_error().unwrap_or(libc::EIO);
                     let _ = s.error.compare_exchange(
                         0,
@@ -6390,6 +6729,11 @@ impl WriterHelper {
                         AtomicOrdering::AcqRel,
                         AtomicOrdering::Acquire,
                     );
+                }
+                // Counted after the error is stored: a test that sees the
+                // count sees the error.
+                if let Some(c) = fail {
+                    c.fetch_add(1, AtomicOrdering::Release);
                 }
                 s.synced.fetch_max(landed, AtomicOrdering::AcqRel);
                 s.flushes.fetch_add(1, AtomicOrdering::Relaxed);
@@ -6478,7 +6822,12 @@ impl std::io::Write for AlignedWriter {
             self.buf.extend_from_slice(&rest[..take]);
             rest = &rest[take..];
             if self.buf.len() == self.to_boundary() {
-                self.write_buf()?;
+                if let Err(e) = self.write_buf() {
+                    // Held, the piece and every byte after it, for the
+                    // next sync: the writer is stuck (`defer`), and the
+                    // rest of this write is taken whole below.
+                    self.defer(e)?;
+                }
             }
         }
         Ok(data.len())
@@ -6806,6 +7155,7 @@ impl SegmentWriter {
             opts.prefault,
         );
         out.set_row_on_write(opts.row_on_write);
+        out.fail_helper = opts.fail_helper_syncs.clone();
         // The header region stays zero until `finish`, so a segment that
         // was never finished is a file no reader accepts rather than a
         // segment with some of its keys.
@@ -7056,8 +7406,13 @@ impl SegmentWriter {
         self.out.stream_hash(off, off + DIRECT_MARK_LEN)?;
         self.marked();
         // The whole pieces the batch completed, as the buffer path's
-        // buffer went at each boundary; the rest waits for the next.
-        self.out.stream_flush(false)?;
+        // buffer went at each boundary; the rest waits for the next. A
+        // piece the device refuses is held for the sync (`defer`): the
+        // batch is the writer's whole by now, and an answer here would
+        // leave it to be handed again.
+        if let Err(e) = self.out.stream_flush(false) {
+            self.out.defer(e)?;
+        }
         Ok(())
     }
 
@@ -7082,6 +7437,40 @@ impl SegmentWriter {
     }
 
     pub fn sync(&mut self) -> Result<()> {
+        // One compare for everything a sync may have to answer first
+        // (`AlignedWriter::fault`): a test's seam, a write that failed
+        // since the last sync, a sync that failed.
+        if self.out.fault != 0 {
+            return self.sync_attended();
+        }
+        self.sync_with(false)
+    }
+
+    /// A sync whose writer has something to answer (`AlignedWriter::fault`):
+    /// a write that failed since the last sync, held for this one, is its
+    /// answer, and the next sync writes it; a sync that failed is every
+    /// sync's answer (`RUN_ATTN_LOST`); a test's armed failure of the
+    /// fdatasync stands in for it.
+    #[cold]
+    #[inline(never)]
+    fn sync_attended(&mut self) -> Result<()> {
+        if self.out.fault & (RUN_ATTN_HELD | RUN_ATTN_LOST) != 0 {
+            if let Some(e) = self.out.answer_held() {
+                return Err(e);
+            }
+        }
+        let fail = self.out.fault & RUN_FAULT_SEAM == RUN_FAULT_SYNC;
+        if fail {
+            self.out.fault &= !RUN_FAULT_SEAM;
+        }
+        self.sync_with(fail)?;
+        self.out.paid();
+        Ok(())
+    }
+
+    /// The sync, its fdatasync failed by a test where `fail`.
+    #[inline(always)]
+    fn sync_with(&mut self, fail: bool) -> Result<()> {
         // Records held for a marker that has not come are written, not
         // committed: without their marker the recovery walk stops before
         // them, as it does for a batch nobody was told was durable.
@@ -7096,11 +7485,55 @@ impl SegmentWriter {
         }
         // A streamed writer's tail, held for a whole piece: the sync covers
         // only what is on the file.
-        self.out.stream_flush(true)?;
-        self.out.flush()?;
-        self.out.get_ref().sync_data()?;
-        self.out.synced_all();
+        if let Err(e) = self.out.stream_flush(true) {
+            return Err(self.out.owing(e));
+        }
+        if let Err(e) = std::io::Write::flush(&mut self.out) {
+            return Err(self.out.owing(e));
+        }
+        let r = if fail {
+            Err(err("the run's fdatasync failed (injected)"))
+        } else {
+            self.out.get_ref().sync_data()
+        };
+        if let Err(e) = r.and_then(|()| self.out.synced_all()) {
+            return Err(self.out.lose(e));
+        }
         Ok(())
+    }
+
+    /// A test's: the next write of the file fails having written nothing,
+    /// as a device's EIO or ENOSPC would.
+    #[doc(hidden)]
+    pub fn fail_next_write(&mut self) {
+        self.out.fault = (self.out.fault & !RUN_FAULT_SEAM) | RUN_FAULT_WRITE;
+    }
+
+    /// A test's: the next fdatasync of the file fails, having synced
+    /// nothing.
+    #[doc(hidden)]
+    pub fn fail_next_sync(&mut self) {
+        self.out.fault = (self.out.fault & !RUN_FAULT_SEAM) | RUN_FAULT_SYNC;
+    }
+
+    /// Whether bytes handed to the writer are owed to the file: a write of
+    /// them failed, and no sync has covered them since. A failed sync owes
+    /// nothing; it is kept (`sync_lost`).
+    pub(crate) fn owes(&self) -> bool {
+        self.out.owed_to > self.out.synced
+    }
+
+    /// Whether the writer has anything a call with nothing new for the run
+    /// may have to look at (`AlignedWriter::fault`): one byte, nonzero for
+    /// a seam, a held write, a lost sync or bytes owed; `owes` is the answer.
+    #[inline(always)]
+    pub(crate) fn attends(&self) -> bool {
+        self.out.fault != 0
+    }
+
+    /// Whether an fdatasync of the file failed (`RUN_ATTN_LOST`).
+    pub(crate) fn sync_lost(&self) -> bool {
+        self.out.fault & RUN_ATTN_LOST != 0
     }
 
     /// The keys and values a direct segment's stream holds up to its last
@@ -7178,6 +7611,9 @@ impl SegmentWriter {
     /// the first key; a marker on a writer without it is an error.
     pub fn set_marks(&mut self, on: bool) {
         self.marks = on;
+        // A marked file is a run's log, and a write it fails is held for
+        // the next sync (`AlignedWriter::defers`).
+        self.out.defers = on;
         // A marking writer hashes every record for its markers and folds
         // the row's pieces out of the same pass, so the helper only syncs;
         // where the row is left to the close, the helper hashes as before.
@@ -7584,7 +8020,7 @@ impl SegmentWriter {
             if self.since_sync >= self.sync_every {
                 self.out.flush()?;
                 self.out.get_ref().sync_data()?;
-                self.out.synced_all();
+                self.out.synced_all()?;
                 self.since_sync = 0;
             }
         }
@@ -8145,6 +8581,12 @@ pub struct SegmentOptions {
     /// the fill rather than faulted one by one as the records land; see
     /// `Options::prefault`, which a `Db` sets this from. Off.
     pub prefault: bool,
+    /// A test's: every fdatasync the helper thread of a writer made with
+    /// these options would issue is skipped and reported as `EIO`, as a
+    /// device error the dup's fdatasync consumed would be, and each is
+    /// counted here once its error is stored. `None` but in a test.
+    #[doc(hidden)]
+    pub fail_helper_syncs: Option<std::sync::Arc<AtomicU64>>,
 }
 
 impl Default for SegmentOptions {
@@ -8160,6 +8602,7 @@ impl Default for SegmentOptions {
             row_on_write: true,
             lookahead: true,
             prefault: false,
+            fail_helper_syncs: None,
         }
     }
 }
@@ -16430,6 +16873,10 @@ pub struct Db {
     /// its new file (`FAIL_SYNC_DIR`) fails, as a failed fdatasync or fsync
     /// would; see `Db::fail_next_wal_sync`.
     fail_log_sync: u8,
+    /// A test's failure (`RUN_FAULT_*`) for the next direct run to open,
+    /// handed to its writer where it opens: `Db::fail_next_run_write`
+    /// with no run open.
+    run_fault_open: u8,
     /// A rotated WAL whose directory entry has not been made durable: owed
     /// by a loose rotation to the first sync by policy, so nothing is
     /// acknowledged into a file a crash could lose the name of
@@ -27799,6 +28246,7 @@ impl Db {
             pending_err: None,
             lost: None,
             fail_log_sync: 0,
+            run_fault_open: 0,
             wal_dir_unsynced: false,
             keeper: None,
             upkeeper: None,
@@ -27840,8 +28288,9 @@ impl Db {
     /// replays whatever outlived the last seal, torn tail tolerated. A
     /// directory with no segments and only a WAL is a store killed before
     /// its first seal, and it opens -- the brief's P-E. An open is also how
-    /// a store that kept a failed sync of its log answers commits again
-    /// (`SyncPolicy`): it reads what the device holds.
+    /// a store that kept a failed sync of its log or of an ordered run's
+    /// file answers commits again (`SyncPolicy`): it reads what the device
+    /// holds, the run's file to its last commit marker.
     pub fn open(dir: &Path, mut opts: Options) -> Result<Db> {
         check_options(&opts)?;
         // Before anything is read, the store held to the way it is asked
@@ -28411,6 +28860,7 @@ impl Db {
             pending_err: None,
             lost: None,
             fail_log_sync: 0,
+            run_fault_open: 0,
             wal_dir_unsynced: false,
             keeper: None,
             upkeeper: None,
@@ -28763,6 +29213,13 @@ impl Db {
     /// An error from its sync is kept: this commit and
     /// every commit, `sync` and `flush` after it answer with it until the
     /// store is reopened (`SyncPolicy`).
+    ///
+    /// Under ordered ingest the batch is visible from this commit, and an
+    /// error from the write of the run's file leaves it owed to the file:
+    /// the next commit takes it with its own, and no commit, `sync` or
+    /// `flush` answers `Ok` over it unsynced where its policy syncs. An
+    /// error from the run's fdatasync is kept as the log's is
+    /// (`SyncPolicy`).
     pub fn commit(&mut self) -> Result<()> {
         let _op = self.op();
         if let Some(e) = self.pending_err.take() {
@@ -28995,6 +29452,13 @@ impl Db {
             // (`direct_can_open`), and every write that stages a frame
             // leaves the run first (`leave_direct`), so frames pending here
             // are a logged run's and the test asks nothing of the table.
+            // A batch whose write or sync failed is owed by the run's file
+            // (`SegmentWriter::owes`), and this call writes it again; the
+            // writer's one byte of attention says whether to ask
+            // (`SegmentWriter::attends`).
+            if self.direct.as_ref().is_some_and(|d| d.w.0.attends()) {
+                return self.run_attended();
+            }
             if !self.wal.pending.is_empty() {
                 return self.log_run_again();
             }
@@ -29018,6 +29482,7 @@ impl Db {
                 w.reserve_keys(hint, hint * 16);
             }
             w.set_marks(true);
+            w.0.out.fault = std::mem::take(&mut self.run_fault_open);
             self.direct = Some(Direct {
                 w,
                 tmp,
@@ -29111,7 +29576,9 @@ impl Db {
             SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
         };
         if due {
-            d.w.sync()?;
+            if let Err(e) = d.w.sync() {
+                return Err(self.run_failed(e));
+            }
             self.unsynced = 0;
         }
         // One test for a run with nothing after its commit, which is the
@@ -29207,6 +29674,70 @@ impl Db {
     fn log_run_again(&mut self) -> Result<()> {
         let mem = self.r.mem().clone();
         self.log_run(&mem, true)
+    }
+
+    /// A call with nothing new for the run whose writer has something to
+    /// attend to (`SegmentWriter::attends`): the batch owed written again
+    /// (`run_again`), and otherwise what the call does for a writer with
+    /// nothing to attend to, since a seam armed or a lost sync (kept by the
+    /// store, `Db::lost`) owes nothing.
+    #[cold]
+    #[inline(never)]
+    fn run_attended(&mut self) -> Result<()> {
+        if self.direct.as_ref().is_some_and(|d| d.w.0.owes()) {
+            return self.run_again();
+        }
+        if !self.wal.pending.is_empty() {
+            return self.log_run_again();
+        }
+        Ok(())
+    }
+
+    /// A run's batch owed by its file (`SegmentWriter::owes`), written
+    /// again and synced by a call with nothing new for the run -- a commit
+    /// of nothing, a `sync`, a `flush` -- whatever the policy, since the
+    /// commit that failed may have owed the sync and its count is spent;
+    /// and under a cipher logged as well, where that commit's failure left
+    /// it unlogged, and the log synced, where that commit logged it under
+    /// a policy that did not sync.
+    #[cold]
+    #[inline(never)]
+    fn run_again(&mut self) -> Result<()> {
+        let d = self.direct.as_mut().expect("a run owes");
+        if let Err(e) = d.w.sync() {
+            return Err(self.run_failed(e));
+        }
+        self.unsynced = 0;
+        let logged = self.direct.as_ref().map_or(0, |d| d.logged);
+        if self.mem().after & RUN_LOGGED != 0 {
+            if logged < self.mem().len() || !self.wal.pending.is_empty() {
+                return self.log_run_again();
+            }
+            // Logged by the commit that failed, as its policy left it: the
+            // log is the batch's durable form, and this call's `Ok` is
+            // the promise. The directory a rotation owes its new file is
+            // not asked apart: a loose rotation leaves its file in
+            // `loose_wals` beside it, a chained one pays it at once or
+            // keeps its failure (`rotate_wal`), and `sync_wal` pays it
+            // before it empties `loose_wals`.
+            if self.wal.frames_unsynced() || !self.loose_wals.is_empty() {
+                self.sync_wal()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A failed sync of the run's batch: a write's failure is the answer
+    /// and the batch is owed; an fdatasync's, the writer's or its
+    /// helper's, is kept (`Db::lost`), since no later sync of the file is
+    /// one the device's answer can be trusted for.
+    #[cold]
+    #[inline(never)]
+    fn run_failed(&mut self, e: std::io::Error) -> std::io::Error {
+        if self.direct.as_ref().is_some_and(|d| d.w.0.sync_lost()) {
+            return self.keep_lost(e);
+        }
+        e
     }
 
     /// The direct run closed: its segment finished, indexed and linked
@@ -29945,8 +30476,10 @@ impl Db {
     /// was priced at 11% of a canonical load window.
     ///
     /// An `Ok` is durability for every commit before it. After a failed
-    /// sync of the log every `sync` answers that error until the store is
-    /// reopened (`SyncPolicy`).
+    /// sync of the log or of an ordered run's file every `sync` answers
+    /// that error until the store is reopened (`SyncPolicy`); after a
+    /// failed write of the run's file a `sync` writes the batch again and
+    /// syncs it, or answers the write's error.
     pub fn sync(&mut self) -> Result<()> {
         let _op = self.op();
         self.commit_staged()?;
@@ -30091,9 +30624,9 @@ impl Db {
     /// table for the rest of the phase -- the same artifact the seal was
     /// supposed to remove, back through the side door.
     ///
-    /// After a failed sync of the log a flush seals nothing and answers
-    /// that error, as every flush does until the store is reopened
-    /// (`SyncPolicy`).
+    /// After a failed sync of the log or of an ordered run's file a flush
+    /// seals nothing and answers that error, as every flush does until the
+    /// store is reopened (`SyncPolicy`).
     pub fn flush(&mut self) -> Result<()> {
         let _op = self.op();
         self.shared.drain_steps.stamp(0);
@@ -31619,6 +32152,70 @@ impl Db {
             .store(true, AtomicOrdering::Release);
     }
 
+    /// A test's: the next write of the direct run's file -- the open run's,
+    /// or with none open the next run's -- fails having written nothing, as
+    /// a device's EIO or ENOSPC would.
+    #[doc(hidden)]
+    pub fn fail_next_run_write(&mut self) {
+        self.run_fault(RUN_FAULT_WRITE);
+    }
+
+    /// A test's: the next write of the direct run's file (as
+    /// `fail_next_run_write` names it) writes half of its first part and
+    /// then fails, as a short write and an error would.
+    #[doc(hidden)]
+    pub fn fail_next_run_write_partial(&mut self) {
+        self.run_fault(RUN_FAULT_PARTIAL);
+    }
+
+    /// A test's: the next two writes of the direct run's file (as
+    /// `fail_next_run_write` names it) fail having written nothing, as a
+    /// device whose failure outlasts the first retry would.
+    #[doc(hidden)]
+    pub fn fail_next_run_writes_twice(&mut self) {
+        self.run_fault(RUN_FAULT_TWICE);
+    }
+
+    /// A test's: the next write of the direct run's file (as
+    /// `fail_next_run_write` names it) is short once -- its first
+    /// `pwritev` writes half of its first part and answers that count --
+    /// and is written whole by the loop after it, as a short write is.
+    #[doc(hidden)]
+    pub fn short_next_run_write(&mut self) {
+        self.run_fault(RUN_FAULT_SHORT);
+    }
+
+    /// A test's: the next fdatasync of the direct run's file (as
+    /// `fail_next_run_write` names it) fails, having synced nothing.
+    #[doc(hidden)]
+    pub fn fail_next_run_sync(&mut self) {
+        self.run_fault(RUN_FAULT_SYNC);
+    }
+
+    fn run_fault(&mut self, f: u8) {
+        match self.direct.as_mut() {
+            Some(d) => d.w.0.out.fault = (d.w.0.out.fault & !RUN_FAULT_SEAM) | f,
+            None => self.run_fault_open = f,
+        }
+    }
+
+    /// A test's: the bytes of the open direct run's file that the writer's
+    /// last successful fdatasync covered -- what a power cut leaves of it.
+    /// `None` with no run open.
+    #[doc(hidden)]
+    pub fn run_synced_bytes(&self) -> Option<u64> {
+        self.direct.as_ref().map(|d| d.w.0.out.synced)
+    }
+
+    /// A test's: whether the open direct run's writer asks a call with
+    /// nothing new for the run to look at it (`SegmentWriter::attends`):
+    /// false once a sync has paid what a failed write owed. `None` with no
+    /// run open.
+    #[doc(hidden)]
+    pub fn run_attends(&self) -> Option<bool> {
+        self.direct.as_ref().map(|d| d.w.0.attends())
+    }
+
     /// Whether a seal's landing has failed and the seals behind it stopped;
     /// see `Shared::seal_wedged`.
     #[doc(hidden)]
@@ -31719,6 +32316,14 @@ impl Db {
             self.shared.in_seal.load(AtomicOrdering::Acquire) > 0,
             self.shared.in_merge.load(AtomicOrdering::Acquire) > 0,
         )
+    }
+
+    /// A test's: whether anything of the log is unsynced -- frames of the
+    /// live file, a file a rotation left loose, or the directory entry of
+    /// a new one: what a sync by policy syncs.
+    #[doc(hidden)]
+    pub fn wal_unsynced(&self) -> bool {
+        self.wal.frames_unsynced() || !self.loose_wals.is_empty() || self.wal_dir_unsynced
     }
 
     /// The live WAL: its path, the bytes of it behind a barrier, and the

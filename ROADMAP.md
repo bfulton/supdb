@@ -174,6 +174,26 @@ What an engine picker would hit, roughly in order.
   store answers the error to every commit after it and reopens at a
   prefix of what it acknowledged; and when the same target returns
   ENOSPC for a write, and the store commits again once space is freed.
+  The same for a direct run's file: its writes at the offset the writer
+  counts, a failed one held and written again at the next sync, and a
+  failed fdatasync kept, its own or the helper's behind the writer.
+- [ ] **A helper sync in flight when the run's commit syncs.** The run's
+  commit reads the helper thread's kept fdatasync error after its own
+  fdatasync, and a helper whose failed sync has consumed the device's
+  error but not yet stored it is read as clean: the commit is
+  acknowledged, and the next sync answers the failure. The window is the
+  instant between the helper's syscall returning and its store. Done when
+  the commit waits for a helper sync in flight before reading (a count
+  the helper raises before its fdatasync and lowers after its store,
+  asked beside the commit's own fdatasync), priced on the ordered load
+  under `Always` at a size past `sync_ahead`, with a test that holds the
+  helper inside its sync. The cheaper shape to price first: the helper
+  syncs through an open file description of its own (the file opened
+  again by path, or through `/proc/self/fd` for a memory file) in place
+  of a duplicate of the writer's, so that the kernel reports a writeback
+  error to the writer's own fdatasync as well, whichever sync met it
+  first -- one open where the helper is spawned, nothing a commit; it
+  needs a device that fails writeback (dm-flakey) to be tested at all.
 - [x] **Encryption at rest for a live store.** A store opens under a key
   (`Encryption::Kernel`) and the kernel encrypts its directory: every file
   it writes is ciphertext on the device and plaintext in the page cache,

@@ -14,7 +14,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use supdb::{Db, Encryption, Options, Reader, StoreCipher, SyncPolicy};
+use supdb::{
+    Db, Encryption, Options, Reader, SegmentOptions, SegmentWriter, StoreCipher, SyncPolicy,
+};
 
 mod common;
 use common::{seg_names, vf, Gcm};
@@ -1525,4 +1527,1492 @@ fn a_failed_sync_of_the_log_directory_at_a_rotation_is_kept() {
     kept(db.sync(), "a sync after");
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
+}
+
+// ---------------------------------------------------------------------
+// run-errors: what a direct run does after the device refuses a write or
+// a sync of its file, which is the run's own log. A failed write leaves
+// the batch owed: every byte of it stays with the writer, nothing on the
+// file past what the file is known good to counts, and the next commit,
+// commit of nothing or sync writes it again at that offset before it
+// answers `Ok`. A failed fdatasync of the run's file -- the commit's own
+// or the helper thread's behind the writer -- is kept, as the log's is,
+// and never retried: not by a later sync, and not by the run's close.
+// ---------------------------------------------------------------------
+
+/// The run's arms (`bench/src/engines.rs`): each keeps an older shape of
+/// the run alive, and each reaches the writes these tests fail.
+fn run_arms() -> Vec<(&'static str, Options)> {
+    let d = Options::default;
+    vec![
+        ("default", d()),
+        (
+            "copyvals",
+            Options {
+                direct_stream: false,
+                ..d()
+            },
+        ),
+        (
+            "threecalls",
+            Options {
+                direct_stream: false,
+                direct_put_one: false,
+                ..d()
+            },
+        ),
+        (
+            "refvals",
+            Options {
+                direct_stream: false,
+                direct_table_refs: true,
+                ..d()
+            },
+        ),
+        (
+            "norecycle",
+            Options {
+                direct_recycle: false,
+                ..d()
+            },
+        ),
+        (
+            "keysarena",
+            Options {
+                direct_keys_in_stream: false,
+                ..d()
+            },
+        ),
+        (
+            "keycopies",
+            Options {
+                direct_derive_keys: false,
+                ..d()
+            },
+        ),
+        (
+            "fatentries",
+            Options {
+                direct_slim_entries: false,
+                ..d()
+            },
+        ),
+    ]
+}
+
+/// The open run's temp file in `d`: the run's own log until it closes.
+fn run_tmp_name(d: &Path) -> std::ffi::OsString {
+    std::fs::read_dir(d)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .find(|n| {
+            let n = n.to_string_lossy();
+            n.starts_with("direct-") && n.ends_with(".tmp")
+        })
+        .expect("an open run's temp file")
+}
+
+/// A power cut of a store whose run is open: its files copied from `d` to
+/// `crash`, every name of the run's file (`ino`) cut to what an fdatasync
+/// covered (`synced`), and the log to its synced length.
+fn power_cut(db: &Db, d: &Path, crash: &Path, ino: u64, synced: u64) {
+    use std::os::unix::fs::MetadataExt;
+    let (log, log_synced, _) = db.wal_durable();
+    copy_store(d, crash);
+    for e in std::fs::read_dir(d).unwrap() {
+        let e = e.unwrap();
+        if e.metadata().map(|m| m.ino()).ok() == Some(ino) {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(crash.join(e.file_name()))
+                .unwrap()
+                .set_len(synced)
+                .unwrap();
+        }
+    }
+    if let Some(name) = log.file_name() {
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .write(true)
+            .open(crash.join(name))
+        {
+            f.set_len(log_synced).unwrap();
+        }
+    }
+}
+
+fn run_ino(d: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(d.join(run_tmp_name(d))).unwrap().ino()
+}
+
+fn injected(r: std::io::Result<()>, what: &str) {
+    match r {
+        Ok(()) => panic!("{what}: answered Ok over the run's failed write"),
+        Err(e) => assert!(
+            e.to_string().contains("injected"),
+            "{what}: answered with an error that is not the device's: {e}"
+        ),
+    }
+}
+
+/// `a_run_write_that_failed`'s ways to write the owed batch again.
+#[derive(Clone, Copy, Debug)]
+enum Again {
+    /// A commit with nothing new.
+    Nothing,
+    /// A `sync`.
+    Sync,
+    /// The run's next commit, with a batch of its own.
+    Next,
+}
+
+/// A run's commit whose write fails in its sync arm -- the batch counted
+/// and visible, its tail held for the file -- answers the device's error,
+/// and the batch is owed: the call after it, whichever `again` names,
+/// writes it at the offset the file is good to and syncs it before it
+/// answers `Ok`, and a power cut after that Ok -- the run's file cut to
+/// what its fdatasyncs covered -- reads it back once. With `partial`, the
+/// failed write left half of a part on the file first.
+fn a_run_write_that_failed(tag: &str, opts: Options, again: Again, partial: bool) {
+    let d = dir(&format!("dur-runwrite-{tag}"));
+    let crash = dir(&format!("dur-runwrite-{tag}-crash"));
+    assert!(matches!(opts.sync, SyncPolicy::Always), "the premise");
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    db.append(b"k1", b"v1");
+    db.commit().unwrap();
+    assert!(open_run(&d), "{tag}: the premise, a run");
+    if partial {
+        db.fail_next_run_write_partial();
+    } else {
+        db.fail_next_run_write();
+    }
+    db.append(b"k2", b"v2");
+    injected(db.commit(), &format!("{tag}: the failed write's commit"));
+    match again {
+        Again::Nothing => db.commit().expect("a commit of nothing writes the batch"),
+        Again::Sync => db.sync().expect("a sync writes the batch"),
+        Again::Next => {
+            db.append(b"k3", b"v3");
+            db.commit().expect("the run's next commit writes both");
+        }
+    }
+    assert_eq!(db.levels(), (0, 0), "{tag}: the run is open");
+    // Paid: the writer asks nothing more of a call with nothing new, so
+    // the commits after it take the path they took before the failure.
+    assert_eq!(
+        db.run_attends(),
+        Some(false),
+        "{tag}: the run's writer still attends after the batch was paid"
+    );
+    let ino = run_ino(&d);
+    let synced = db.run_synced_bytes().expect("a run open");
+    power_cut(&db, &d, &crash, ino, synced);
+    let h = db.reader().unwrap();
+    reads(&h, "k2", "v2", &format!("{tag}: live"));
+    drop(h);
+    std::mem::forget(db);
+    for (at, what) in [(&crash, "the power cut"), (&d, "the kill")] {
+        let db = Db::open(at, opts.clone()).unwrap_or_else(|e| panic!("{tag}: {what} opens: {e}"));
+        reads(
+            &db,
+            "k1",
+            "v1",
+            &format!("{tag}, {what}: before the failure"),
+        );
+        reads(
+            &db,
+            "k2",
+            "v2",
+            &format!("{tag}, {what}: the batch written again"),
+        );
+        if matches!(again, Again::Next) {
+            reads(&db, "k3", "v3", &format!("{tag}, {what}: the commit after"));
+        }
+        drop(db);
+    }
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+#[test]
+fn a_run_write_that_failed_is_written_again_by_a_commit_of_nothing() {
+    for (tag, o) in run_arms() {
+        a_run_write_that_failed(&format!("nothing-{tag}"), o, Again::Nothing, false);
+    }
+}
+
+#[test]
+fn a_run_write_that_failed_is_written_again_by_a_sync() {
+    for (tag, o) in run_arms() {
+        a_run_write_that_failed(&format!("sync-{tag}"), o, Again::Sync, false);
+    }
+}
+
+#[test]
+fn a_run_write_that_failed_is_written_again_by_the_runs_next_commit() {
+    for (tag, o) in run_arms() {
+        a_run_write_that_failed(&format!("next-{tag}"), o, Again::Next, false);
+    }
+}
+
+/// A write that lands part of a batch and then fails leaves bytes on the
+/// file the writer does not count; the write after it lands at the offset
+/// the file is good to, over them, and not where the failed write left
+/// the file's cursor.
+#[test]
+fn a_run_write_that_failed_part_way_loses_no_commit_acknowledged_after_it() {
+    for (tag, o) in run_arms() {
+        a_run_write_that_failed(&format!("partial-{tag}"), o.clone(), Again::Next, true);
+        a_run_write_that_failed(&format!("partial-sync-{tag}"), o, Again::Sync, true);
+    }
+}
+
+/// The run's first write, its file's head with the first batch, fails:
+/// the batch is owed as any other, and the run goes on.
+#[test]
+fn a_runs_first_write_that_failed_is_written_again() {
+    for (tag, o) in run_arms() {
+        let d = dir(&format!("dur-runwrite-first-{tag}"));
+        let mut db = Db::create(&d, o.clone()).unwrap();
+        db.fail_next_run_write();
+        db.append(b"k1", b"v1");
+        injected(db.commit(), &format!("{tag}: the run's first commit"));
+        db.append(b"k2", b"v2");
+        db.commit()
+            .unwrap_or_else(|e| panic!("{tag}: the commit after: {e}"));
+        std::mem::forget(db);
+        let db = Db::open(&d, o).unwrap();
+        reads(&db, "k1", "v1", &format!("{tag}: the first batch"));
+        reads(&db, "k2", "v2", &format!("{tag}: the commit after"));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A commit whose batch carries the run's file across a write piece, and
+/// whose piece write fails: the commit answers the device's error, the
+/// piece is held, and the next commit -- a key of its own, no order
+/// broken -- writes it and its own batch, and a power cut after that Ok
+/// reads both back.
+fn a_failed_run_piece_write(tag: &str, opts: Options) {
+    let d = dir(&format!("dur-runpiece-{tag}"));
+    let crash = dir(&format!("dur-runpiece-{tag}-crash"));
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    db.append(b"a0000000", b"v");
+    db.commit().unwrap();
+    db.fail_next_run_write();
+    let val = vec![b'x'; 100];
+    // About 3.4 MB of records: the batch crosses the 1 MiB write piece, so
+    // its first write is a whole piece's, before the batch's sync.
+    for i in 1..30_000u32 {
+        db.append(format!("a{i:07}").as_bytes(), &val);
+    }
+    injected(db.commit(), &format!("{tag}: the piece's failed write"));
+    db.append(b"b0000001", b"v");
+    db.commit()
+        .unwrap_or_else(|e| panic!("{tag}: the commit after the failed piece: {e}"));
+    assert_eq!(db.levels(), (0, 0), "{tag}: the run is open");
+    let ino = run_ino(&d);
+    let synced = db.run_synced_bytes().expect("a run open");
+    power_cut(&db, &d, &crash, ino, synced);
+    std::mem::forget(db);
+    let db = Db::open(&crash, opts).unwrap_or_else(|e| panic!("{tag}: the cut opens: {e}"));
+    let what = format!("{tag}: the batch taken again and the commit after it");
+    reads(&db, "a0000000", "v", &what);
+    let x = String::from_utf8(val).unwrap();
+    reads(&db, "a0000001", &x, &what);
+    reads(&db, "a0029999", &x, &what);
+    reads(&db, "b0000001", "v", &what);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// A write the device takes only part of answers the count it took, and
+/// the rest is written at the offset that count reached: a commit whose
+/// write is short once -- the tail at its sync, or with `big` the piece a
+/// batch of 3.4 MB crosses -- answers `Ok`, and a power cut after the
+/// commit behind it reads both back.
+fn a_short_run_write(tag: &str, opts: Options, big: bool) {
+    let d = dir(&format!("dur-runshort-{tag}"));
+    let crash = dir(&format!("dur-runshort-{tag}-crash"));
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    db.append(b"a0000000", b"v");
+    db.commit().unwrap();
+    assert!(open_run(&d), "{tag}: the premise, a run");
+    db.short_next_run_write();
+    let val = vec![b'x'; 100];
+    let n = if big { 30_000u32 } else { 2 };
+    for i in 1..n {
+        db.append(format!("a{i:07}").as_bytes(), &val);
+    }
+    db.commit()
+        .unwrap_or_else(|e| panic!("{tag}: the commit whose write was short: {e}"));
+    db.append(b"b0000001", b"v");
+    db.commit()
+        .unwrap_or_else(|e| panic!("{tag}: the commit after: {e}"));
+    assert_eq!(db.levels(), (0, 0), "{tag}: the run is open");
+    let ino = run_ino(&d);
+    let synced = db.run_synced_bytes().expect("a run open");
+    power_cut(&db, &d, &crash, ino, synced);
+    std::mem::forget(db);
+    for (at, what) in [(&crash, "the power cut"), (&d, "the kill")] {
+        let db = Db::open(at, opts.clone()).unwrap_or_else(|e| panic!("{tag}: {what} opens: {e}"));
+        let what = format!("{tag}, {what}: the short write and the commit after it");
+        reads(&db, "a0000000", "v", &what);
+        let x = String::from_utf8(val.clone()).unwrap();
+        reads(&db, "a0000001", &x, &what);
+        reads(&db, &format!("a{:07}", n - 1), &x, &what);
+        reads(&db, "b0000001", "v", &what);
+        drop(db);
+    }
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+#[test]
+fn a_short_run_write_is_written_whole_at_the_offset_it_reached() {
+    for (tag, o) in run_arms() {
+        a_short_run_write(&format!("tail-{tag}"), o.clone(), false);
+        a_short_run_write(&format!("piece-{tag}"), o, true);
+    }
+}
+
+#[test]
+fn a_failed_run_piece_write_is_held_and_written_by_the_next_commit() {
+    for (tag, o) in run_arms() {
+        a_failed_run_piece_write(tag, o);
+    }
+}
+
+/// A run with a failed write, closed by a flush: the close computes its
+/// offsets from what the writer counts, and the flush answers `Ok` only
+/// over a segment that holds every batch; under every close the arms keep
+/// (`Options::close_presync`, `Options::close_finish_inline`).
+#[test]
+fn a_run_write_that_failed_part_way_is_flushed_whole() {
+    let mut arms = run_arms();
+    arms.push((
+        "latesync",
+        Options {
+            close_presync: false,
+            ..Options::default()
+        },
+    ));
+    arms.push((
+        "finishinline",
+        Options {
+            close_finish_inline: true,
+            ..Options::default()
+        },
+    ));
+    for (tag, o) in arms {
+        let d = dir(&format!("dur-runflush-{tag}"));
+        let mut db = Db::create(&d, o.clone()).unwrap();
+        db.append(b"k1", b"v1");
+        db.commit().unwrap();
+        db.fail_next_run_write_partial();
+        db.append(b"k2", b"v2");
+        injected(db.commit(), &format!("{tag}: the failed write's commit"));
+        db.append(b"k3", b"v3");
+        db.commit()
+            .unwrap_or_else(|e| panic!("{tag}: the commit after: {e}"));
+        db.flush()
+            .unwrap_or_else(|e| panic!("{tag}: the flush: {e}"));
+        assert!(!open_run(&d) || db.levels() != (0, 0), "{tag}: flushed");
+        std::mem::forget(db);
+        let db = Db::open(&d, o).unwrap_or_else(|e| panic!("{tag}: opens: {e}"));
+        for (k, v) in [("k1", "v1"), ("k2", "v2"), ("k3", "v3")] {
+            reads(&db, k, v, &format!("{tag}: flushed"));
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A run's failed fdatasync is kept: the commit answers it, and every
+/// commit, commit of nothing, sync and flush after it answers it in the
+/// kept words, never with a retried fdatasync that Linux would answer
+/// `Ok` over pages it failed to write back and marked clean. A power cut
+/// leaves the run's file as far as the last successful fdatasync reached,
+/// and the store opens there.
+fn a_failed_run_sync_is_kept(tag: &str, opts: Options) {
+    let d = dir(&format!("dur-runsync-{tag}"));
+    let crash = dir(&format!("dur-runsync-{tag}-crash"));
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    db.append(b"k1", b"v1");
+    db.commit().unwrap();
+    let before = db.run_synced_bytes().expect("a run open");
+    db.fail_next_run_sync();
+    db.append(b"k2", b"v2");
+    let first = db.commit();
+    assert!(
+        first
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("injected")),
+        "{tag}: the failed fdatasync is its commit's answer: {first:?}"
+    );
+    assert_eq!(
+        db.run_synced_bytes(),
+        Some(before),
+        "{tag}: nothing counts as synced over the failed fdatasync"
+    );
+    kept(db.commit(), &format!("{tag}: a commit of nothing after"));
+    let synced = db.sync();
+    db.append(b"k3", b"v3");
+    kept(db.commit(), &format!("{tag}: a commit after"));
+    kept(db.flush(), &format!("{tag}: a flush after"));
+    reads(&db, "k1", "v1", &format!("{tag}: reads go on"));
+    let ino = run_ino(&d);
+    let covered = db.run_synced_bytes().expect("the run is still open");
+    power_cut(&db, &d, &crash, ino, covered);
+    std::mem::forget(db);
+    let db = Db::open(&crash, opts).unwrap_or_else(|e| panic!("{tag}: the cut opens: {e}"));
+    reads(
+        &db,
+        "k1",
+        "v1",
+        &format!("{tag}: the commit before the failure"),
+    );
+    drop(db);
+    // The seam fails before the fdatasync is issued, so a retried one here
+    // really syncs; on Linux a writeback error is reported once per open
+    // file description and the pages are marked clean, so a retry would
+    // answer Ok over bytes the device never took. Only a refusal is sound.
+    kept(
+        synced,
+        &format!("{tag}: a sync after the run's failed fdatasync"),
+    );
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+#[test]
+fn a_failed_run_fdatasync_is_kept_until_the_store_is_reopened() {
+    for (tag, o) in run_arms() {
+        a_failed_run_sync_is_kept(tag, o);
+    }
+}
+
+/// A run whose fdatasync failed is not closed into a segment a manifest
+/// names: a write below the greatest leaves the run, and its close would
+/// finish the file and fsync it -- a retry of the failed sync, which Linux
+/// answers `Ok` -- and the landing's manifest would name a file whose
+/// pages the device never took. The power cut cuts every name of the
+/// run's file to what its fdatasyncs covered, and the store still opens,
+/// with every commit acknowledged before the failure; the reopened store
+/// commits again.
+#[test]
+fn a_run_whose_fdatasync_failed_is_not_closed_into_a_named_segment() {
+    for (tag, o) in run_arms() {
+        let d = dir(&format!("dur-runsync-leave-{tag}"));
+        let crash = dir(&format!("dur-runsync-leave-{tag}-crash"));
+        let mut db = Db::create(&d, o.clone()).unwrap();
+        db.append(b"k1", b"v1");
+        db.commit().unwrap();
+        db.fail_next_run_sync();
+        db.append(b"k2", b"v2");
+        assert!(db.commit().is_err(), "{tag}: the failed fdatasync");
+        let ino = run_ino(&d);
+        let covered = db.run_synced_bytes().expect("the run is open");
+        // Below the greatest: the run is left, and its close begins.
+        db.put(b"a", b"A");
+        kept(
+            db.commit(),
+            &format!("{tag}: the commit of the write that left"),
+        );
+        let _ = db.settle();
+        power_cut(&db, &d, &crash, ino, covered);
+        std::mem::forget(db);
+        let mut db =
+            Db::open(&crash, o.clone()).unwrap_or_else(|e| panic!("{tag}: the cut opens: {e}"));
+        reads(
+            &db,
+            "k1",
+            "v1",
+            &format!("{tag}: acknowledged before the failure"),
+        );
+        db.put(b"z", b"Z");
+        db.commit().expect("a reopened store commits");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&crash);
+    }
+}
+
+/// Under a cipher the run's file is a memory file and its commits go to
+/// the log as well (`Db::log_run`); a failed write of the run's file is
+/// owed as in the clear, and the call that writes it again writes the
+/// batch to the log too, so a power cut -- the memory file gone, the log
+/// cut to what a sync covered -- reads it back.
+#[test]
+fn a_run_write_that_failed_under_a_cipher_is_written_again() {
+    for (tag, again) in [
+        ("nothing", Again::Nothing),
+        ("sync", Again::Sync),
+        ("next", Again::Next),
+    ] {
+        let tag = format!("cipher-{tag}");
+        let d = dir(&format!("dur-runwrite-{tag}"));
+        let crash = dir(&format!("dur-runwrite-{tag}-crash"));
+        let opts = under_cipher();
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        db.append(b"k1", b"v1");
+        db.commit().unwrap();
+        assert_eq!(db.direct_runs(), (1, 1), "{tag}: the premise, a logged run");
+        db.fail_next_run_write();
+        db.append(b"k2", b"v2");
+        injected(db.commit(), &format!("{tag}: the failed write's commit"));
+        match again {
+            Again::Nothing => db.commit().expect("a commit of nothing"),
+            Again::Sync => db.sync().expect("a sync"),
+            Again::Next => {
+                db.append(b"k3", b"v3");
+                db.commit().expect("the run's next commit");
+            }
+        }
+        let (log, synced, _) = db.wal_durable();
+        copy_store(&d, &crash);
+        std::mem::forget(db);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(crash.join(log.file_name().unwrap()))
+            .unwrap()
+            .set_len(synced)
+            .unwrap();
+        let db =
+            Db::open(&crash, opts.clone()).unwrap_or_else(|e| panic!("{tag}: the cut opens: {e}"));
+        reads(&db, "k1", "v1", &format!("{tag}: before the failure"));
+        reads(&db, "k2", "v2", &format!("{tag}: the batch written again"));
+        if matches!(again, Again::Next) {
+            reads(&db, "k3", "v3", &format!("{tag}: the commit after"));
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&crash);
+    }
+}
+
+/// Under a cipher a failed fdatasync of the run's memory file is kept as
+/// in the clear: nothing is retried.
+#[test]
+fn a_failed_run_fdatasync_is_kept_under_a_cipher() {
+    let d = dir("dur-runsync-cipher");
+    let mut db = Db::create(&d, under_cipher()).unwrap();
+    db.append(b"k1", b"v1");
+    db.commit().unwrap();
+    db.fail_next_run_sync();
+    db.append(b"k2", b"v2");
+    assert!(db.commit().is_err(), "the failed fdatasync");
+    kept(db.commit(), "a commit of nothing after");
+    kept(db.sync(), "a sync after");
+    reads(&db, "k1", "v1", "reads go on");
+    drop(db);
+    let db = Db::open(&d, under_cipher()).unwrap();
+    reads(&db, "k1", "v1", "reopened");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+fn hkey(k: u32) -> Vec<u8> {
+    format!("key-{k:06}").into_bytes()
+}
+
+fn hval(k: u32) -> Vec<u8> {
+    format!("value-{k:06}-{}", "x".repeat(100)).into_bytes()
+}
+
+fn wait_count(n: &std::sync::atomic::AtomicU64, at_least: u64, what: &str) {
+    wait_for(what, || {
+        n.load(std::sync::atomic::Ordering::Acquire) >= at_least
+    });
+}
+
+/// The helper thread behind a marked segment's writer -- a direct run's --
+/// fails its fdatasync of part of the records; it keeps the error for the
+/// finish, and the writer's own fdatasync, on the same open file
+/// description, reports nothing. The writer's `sync` answers the helper's
+/// failure, and every `sync` after it.
+#[test]
+fn a_marked_segments_sync_reports_its_helpers_failed_sync() {
+    let d = dir("dur-helper-writer");
+    let failed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let opts = SegmentOptions {
+        write_piece: 4096,
+        sync_ahead: 16384,
+        fail_helper_syncs: Some(failed.clone()),
+        ..Default::default()
+    };
+    let mut w = SegmentWriter::create(&d.join("run.sup"), &opts).unwrap();
+    // A direct run's writer: records first, a marker a batch.
+    w.set_inline_max(256);
+    w.set_marks(true);
+    for k in 0..3000u32 {
+        w.begin(&hkey(k)).unwrap();
+        w.value(&hval(k));
+        w.end_with(false).unwrap();
+    }
+    w.mark().unwrap();
+    // Several `sync_ahead`s are on the file: the helper's turn comes, and
+    // its sync fails.
+    wait_count(&failed, 1, "the helper never took its turn at a sync");
+    assert!(
+        w.sync().is_err(),
+        "a sync over records whose earlier fdatasync failed is not answered Ok"
+    );
+    assert!(w.sync().is_err(), "nor is the sync after it");
+    drop(w);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A marked segment's own fdatasync that failed is every sync's answer
+/// after it, and its finish's: none of them is a retry Linux would answer
+/// `Ok` over pages it marked clean.
+#[test]
+fn a_marked_segments_failed_sync_is_every_later_syncs_answer() {
+    let d = dir("dur-writer-sync-kept");
+    let opts = SegmentOptions {
+        write_piece: 4096,
+        ..Default::default()
+    };
+    let mut w = SegmentWriter::create(&d.join("run.sup"), &opts).unwrap();
+    w.set_inline_max(256);
+    w.set_marks(true);
+    for k in 0..100u32 {
+        w.begin(&hkey(k)).unwrap();
+        w.value(&hval(k));
+        w.end_with(false).unwrap();
+    }
+    w.mark().unwrap();
+    w.fail_next_sync();
+    let first = w.sync().expect_err("the failed fdatasync");
+    assert!(first.to_string().contains("injected"), "{first}");
+    // A sync with nothing new to write: nothing is owed, and a retried
+    // fdatasync would answer Ok over the pages the failed one left.
+    let again = w
+        .sync()
+        .expect_err("a sync with nothing new after the failed fdatasync");
+    assert!(again.to_string().contains("injected"), "{again}");
+    // A batch after it: its pieces are refused by the file, the writer
+    // holds them, and the sync's failure stays the answer -- not the
+    // writes' that came after it.
+    for k in 100..200u32 {
+        w.begin(&hkey(k)).unwrap();
+        w.value(&hval(k));
+        w.end_with(false).unwrap();
+    }
+    w.mark().unwrap();
+    for i in 0..3 {
+        let e = w.sync().expect_err("a sync after the failed fdatasync");
+        assert!(
+            e.to_string().contains("injected"),
+            "sync {i} after the failed fdatasync answers it: {e}"
+        );
+    }
+    assert!(w.finish(1).is_err(), "the finish, whose fsync is the retry");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A writer that is not a run's -- a seal's, a merge's, a caller's with
+/// sorted input -- answers a failed write where it happens: it is given
+/// up, and holding the segment's bytes for a sync that never comes would
+/// hold them all.
+#[test]
+fn an_unmarked_segments_failed_write_is_answered_where_it_happens() {
+    let d = dir("dur-writer-write-unmarked");
+    let opts = SegmentOptions {
+        write_piece: 4096,
+        ..Default::default()
+    };
+    let mut w = SegmentWriter::create(&d.join("seg.sup"), &opts).unwrap();
+    w.set_inline_max(256);
+    w.fail_next_write();
+    let mut failed = false;
+    for k in 0..1000u32 {
+        w.begin(&hkey(k)).unwrap();
+        w.value(&hval(k));
+        if w.end_with(false).is_err() {
+            failed = true;
+            break;
+        }
+    }
+    assert!(
+        failed,
+        "the failed write is the answer of the call that met it"
+    );
+    drop(w);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A commit with nothing new for a run that owes nothing syncs nothing:
+/// under the buffered policy the run's file stays synced where it was.
+#[test]
+fn a_commit_of_nothing_in_a_run_that_owes_nothing_syncs_nothing() {
+    for (tag, o) in run_arms() {
+        let d = dir(&format!("dur-run-nothing-{tag}"));
+        let opts = Options {
+            sync: SyncPolicy::EveryN(u32::MAX),
+            ..o
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        db.append(b"k1", b"v1");
+        db.commit().unwrap();
+        let before = db.run_synced_bytes().expect("a run open");
+        db.commit().unwrap();
+        assert_eq!(
+            db.run_synced_bytes(),
+            Some(before),
+            "{tag}: a commit of nothing synced the run"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// The same through the store: under `EveryN(2)` the second commit is the
+/// policy's sync of the run, and the helper's fdatasync of the first
+/// batch's pieces failed before it. The commit answers the failure, and
+/// every commit and sync after it answers it in the kept words.
+#[test]
+fn a_due_commit_is_not_acknowledged_over_a_failed_helper_sync() {
+    let d = dir("dur-helper-commit");
+    let failed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let opts = Options {
+        sync: SyncPolicy::EveryN(2),
+        segment: SegmentOptions {
+            write_piece: 4096,
+            sync_ahead: 16384,
+            fail_helper_syncs: Some(failed.clone()),
+            ..Default::default()
+        },
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    // Ascending into an empty store: a direct run.
+    for k in 0..3000u32 {
+        db.append(&hkey(k), &hval(k));
+    }
+    db.commit().unwrap(); // the policy's first of two: no sync
+    wait_count(&failed, 1, "the run's helper never took its turn at a sync");
+    let synced = db.run_synced_bytes();
+    db.append(&hkey(3000), &hval(3000));
+    assert!(
+        db.commit().is_err(),
+        "the policy's sync, after the run's records failed theirs, is not answered Ok"
+    );
+    assert_eq!(
+        db.run_synced_bytes(),
+        synced,
+        "nothing counts as synced over the helper's failure"
+    );
+    kept(db.commit(), "a commit of nothing after");
+    kept(db.sync(), "a sync after");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A piece the device refuses at a commit the buffered policy does not
+/// sync: the commit answers `Ok`, having promised nothing, and the failure
+/// is held for the call that syncs. A `sync` answers it, and the run owes
+/// the batch until a sync covers it: the `sync` after writes it and
+/// answers `Ok`, and a power cut after that reads every key back. With
+/// `twice`, the device refuses the write the first `sync` would have made
+/// as well, and the run, holding every byte since the first failure for
+/// the next sync, tries no write in between.
+fn a_buffered_run_piece_write_that_failed(tag: &str, opts: Options, twice: bool) {
+    let d = dir(&format!("dur-runpiece-buf-{tag}"));
+    let crash = dir(&format!("dur-runpiece-buf-{tag}-crash"));
+    let opts = Options {
+        sync: SyncPolicy::EveryN(u32::MAX),
+        ..opts
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    db.append(b"a0000000", b"v");
+    db.commit().unwrap();
+    db.sync().unwrap();
+    if twice {
+        db.fail_next_run_writes_twice();
+    } else {
+        db.fail_next_run_write();
+    }
+    let val = vec![b'x'; 100];
+    for i in 1..30_000u32 {
+        db.append(format!("a{i:07}").as_bytes(), &val);
+    }
+    db.commit()
+        .unwrap_or_else(|e| panic!("{tag}: a commit the policy does not sync: {e}"));
+    for i in 0..30_000u32 {
+        db.append(format!("b{i:07}").as_bytes(), &val);
+    }
+    db.commit()
+        .unwrap_or_else(|e| panic!("{tag}: the commit after, not synced either: {e}"));
+    injected(
+        db.sync(),
+        &format!("{tag}: the sync answers the held failure"),
+    );
+    if twice {
+        injected(db.sync(), &format!("{tag}: the sync that met it again"));
+    }
+    db.sync()
+        .unwrap_or_else(|e| panic!("{tag}: the sync that writes the batch: {e}"));
+    assert_eq!(db.levels(), (0, 0), "{tag}: the run is open");
+    assert_eq!(
+        db.run_attends(),
+        Some(false),
+        "{tag}: the run's writer still attends after the sync paid it"
+    );
+    let ino = run_ino(&d);
+    let synced = db.run_synced_bytes().expect("a run open");
+    power_cut(&db, &d, &crash, ino, synced);
+    std::mem::forget(db);
+    let db = Db::open(&crash, opts).unwrap_or_else(|e| panic!("{tag}: the cut opens: {e}"));
+    let x = String::from_utf8(val).unwrap();
+    for k in ["a0000001", "a0029999", "b0000000", "b0029999"] {
+        reads(&db, k, &x, &format!("{tag}: synced after the failure"));
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+#[test]
+fn a_buffered_run_piece_write_that_failed_is_answered_and_written_by_a_sync() {
+    for (tag, o) in run_arms() {
+        a_buffered_run_piece_write_that_failed(tag, o, false);
+    }
+}
+
+#[test]
+fn a_run_write_the_device_refuses_again_is_tried_once_a_sync() {
+    for (tag, o) in run_arms() {
+        a_buffered_run_piece_write_that_failed(&format!("twice-{tag}"), o, true);
+    }
+}
+
+/// H1 under the shipped policy: under `Always` every commit of a run is
+/// its own sync, and the helper thread behind the writer fails its
+/// fdatasync of the pieces a large batch lands. The commits that met the
+/// race may answer either way; once the helper has stored its failure,
+/// the next commit answers it, nothing counts as synced over it, and
+/// every commit and sync after answers it in the kept words.
+#[test]
+fn a_commit_under_always_is_not_acknowledged_over_a_failed_helper_sync() {
+    let d = dir("dur-helper-always");
+    let failed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let opts = Options {
+        segment: SegmentOptions {
+            write_piece: 4096,
+            sync_ahead: 16384,
+            fail_helper_syncs: Some(failed.clone()),
+            ..Default::default()
+        },
+        ..Options::default()
+    };
+    assert!(matches!(opts.sync, SyncPolicy::Always), "the premise");
+    let mut db = Db::create(&d, opts).unwrap();
+    // Each batch is many `sync_ahead`s of pieces landed before its commit's
+    // own sync: the helper's turn comes inside one of them.
+    // The first commit that answers the failure may be one of these: the
+    // count it leaves is held to the one before it wherever it falls.
+    let mut k = 0u32;
+    let mut answered = false;
+    for _ in 0..20 {
+        for _ in 0..3000 {
+            db.append(&hkey(k), &hval(k));
+            k += 1;
+        }
+        // No run before the first: nothing of it synced.
+        let before = db.run_synced_bytes().unwrap_or(0);
+        if db.commit().is_err() {
+            assert_eq!(
+                db.run_synced_bytes(),
+                Some(before),
+                "nothing counts as synced over the helper's failure, in the batches"
+            );
+            answered = true;
+            break;
+        }
+        if failed.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            break;
+        }
+    }
+    assert!(open_run(&d), "the premise, a run");
+    wait_count(&failed, 1, "the run's helper never took its turn at a sync");
+    if !answered {
+        let synced = db.run_synced_bytes();
+        db.append(&hkey(k), &hval(k));
+        k += 1;
+        assert!(
+            db.commit().is_err(),
+            "a commit's sync, after the run's records failed theirs, is not answered Ok"
+        );
+        assert_eq!(
+            db.run_synced_bytes(),
+            synced,
+            "nothing counts as synced over the helper's failure"
+        );
+    }
+    db.append(&hkey(k + 1), &hval(k + 1));
+    kept(db.commit(), "a commit after");
+    kept(db.commit(), "a commit of nothing after");
+    kept(db.sync(), "a sync after");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Where the write that failed falls (`a_run_closed_over_a_failed_write`).
+#[derive(Clone, Copy, Debug)]
+enum Fails {
+    /// The run's first write, its file's head with the first batch.
+    Head,
+    /// A whole piece of a batch, written by the commit before its sync:
+    /// the writer holds every byte from there for the next sync.
+    Piece,
+    /// The tail a sync writes (`Always` only): owed, the writer not held.
+    Tail,
+}
+
+/// The run's file after the batch whose write failed is owed or held:
+/// a key below the run's greatest closes the run, and the close writes
+/// the batch into its segment with the rest. Once the segment has landed
+/// (`settle`), a power cut -- the log cut to what its fdatasyncs covered
+/// -- and a kill each read every key back, the batch whose write failed
+/// among them, whether a commit had answered its failure (`Always`) or
+/// none had (`EveryN`).
+fn a_run_closed_over_a_failed_write(tag: &str, opts: Options, fails: Fails) {
+    let d = dir(&format!("dur-runclose-{tag}"));
+    let crash = dir(&format!("dur-runclose-{tag}-crash"));
+    let always = matches!(opts.sync, SyncPolicy::Always);
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let val = vec![b'x'; 100];
+    let x = String::from_utf8(val.clone()).unwrap();
+    let mut first = 0u32;
+    if !matches!(fails, Fails::Head) {
+        db.append(b"a0000000", b"v");
+        db.commit().unwrap();
+        db.sync().unwrap();
+        first = 1;
+    }
+    db.fail_next_run_write();
+    // About 3.4 MB of records, past the 1 MiB write piece in every arm, so
+    // the failed write is the commit's own and not the close's; the tail's
+    // batch is one record, which only its sync writes.
+    let last = if matches!(fails, Fails::Tail) {
+        first
+    } else {
+        first + 29_999
+    };
+    for i in first..=last {
+        db.append(format!("a{i:07}").as_bytes(), &val);
+    }
+    let r = db.commit();
+    if always {
+        injected(r, &format!("{tag}: the failed write's commit"));
+    } else {
+        r.unwrap_or_else(|e| panic!("{tag}: a commit the policy does not sync: {e}"));
+    }
+    assert!(db.run_synced_bytes().is_some(), "{tag}: the premise, a run");
+    if always && matches!(fails, Fails::Head) {
+        // The run's next commit writes the head and the stream behind it
+        // and syncs them, and the stream's blocks the file then holds are
+        // given up to it (`Options::direct_recycle`): read back through the
+        // file, at the offset the stream landed at.
+        db.append(b"b0000000", b"v");
+        db.commit()
+            .unwrap_or_else(|e| panic!("{tag}: the commit after the failed head: {e}"));
+        reads(
+            &db,
+            "a0000000",
+            &x,
+            &format!("{tag}: live, through the file"),
+        );
+        reads(
+            &db,
+            "a0029999",
+            &x,
+            &format!("{tag}: live, through the file"),
+        );
+    }
+    // Below the run's greatest key: the run closes.
+    db.put(b"0000", b"below");
+    db.commit()
+        .unwrap_or_else(|e| panic!("{tag}: the commit that closed the run: {e}"));
+    db.sync()
+        .unwrap_or_else(|e| panic!("{tag}: the sync after: {e}"));
+    db.settle()
+        .unwrap_or_else(|e| panic!("{tag}: the run's segment lands: {e}"));
+    assert!(db.run_synced_bytes().is_none(), "{tag}: the run closed");
+    let (log, log_synced, _) = db.wal_durable();
+    copy_store(&d, &crash);
+    if let Some(name) = log.file_name() {
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .write(true)
+            .open(crash.join(name))
+        {
+            f.set_len(log_synced).unwrap();
+        }
+    }
+    std::mem::forget(db);
+    // Under a cipher the store is held open in this process past the
+    // forget, so the kill is the power cut's case alone: its memory files
+    // go with it either way.
+    let cipher = matches!(opts.encryption, Encryption::Cipher(_));
+    let ends: &[(&std::path::PathBuf, &str)] = if cipher {
+        &[(&crash, "the power cut")]
+    } else {
+        &[(&crash, "the power cut"), (&d, "the kill")]
+    };
+    for &(at, what) in ends {
+        let db = Db::open(at, opts.clone()).unwrap_or_else(|e| panic!("{tag}: {what} opens: {e}"));
+        let w = format!("{tag}, {what}");
+        if first == 1 {
+            reads(&db, "a0000000", "v", &w);
+        }
+        reads(&db, &format!("a{first:07}"), &x, &w);
+        reads(&db, &format!("a{last:07}"), &x, &w);
+        reads(&db, "0000", "below", &w);
+        drop(db);
+    }
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+#[test]
+fn a_run_closed_over_a_failed_write_writes_the_batch_into_its_segment() {
+    let mut arms = run_arms();
+    arms.push(("cipher", under_cipher()));
+    for (tag, o) in arms {
+        for (p, sync) in [
+            ("always", SyncPolicy::Always),
+            ("buf", SyncPolicy::EveryN(u32::MAX)),
+        ] {
+            let fails: &[Fails] = if p == "always" {
+                &[Fails::Head, Fails::Piece, Fails::Tail]
+            } else {
+                &[Fails::Head, Fails::Piece]
+            };
+            for &f in fails {
+                let opts = Options { sync, ..o.clone() };
+                a_run_closed_over_a_failed_write(&format!("{p}-{f:?}-{tag}"), opts, f);
+            }
+        }
+    }
+}
+
+/// Under a cipher a run's batch whose piece write failed at a commit the
+/// buffered policy does not sync, and whose log write failed in the same
+/// commit, is owed twice: the run's file holds the failure for the next
+/// sync, and the log has the frames put back. The commit of nothing that
+/// answers `Ok` has written and synced both, so a crash after it -- which
+/// takes every memory file the store had -- reads the batch back from
+/// the log.
+#[test]
+fn a_cipher_runs_batch_owed_to_its_file_and_its_log_is_logged_again() {
+    let d = dir("dur-runlog-cipher-both");
+    let opts = Options {
+        sync: SyncPolicy::EveryN(u32::MAX),
+        ..under_cipher()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    db.append(b"a0000000", b"v");
+    db.commit().unwrap();
+    db.sync().unwrap();
+    assert_eq!(db.direct_runs(), (1, 1), "the premise, a logged run");
+    db.fail_next_run_write();
+    db.fail_next_wal_write(0);
+    let val = vec![b'x'; 100];
+    for i in 1..30_000u32 {
+        db.append(format!("a{i:07}").as_bytes(), &val);
+    }
+    assert!(
+        db.commit().is_err(),
+        "the log's failed write is the commit's answer"
+    );
+    injected(db.commit(), "the run's held failure, answered by the sync");
+    db.commit()
+        .expect("a commit of nothing writes the run's batch and logs it");
+    let crash = dir("dur-runlog-cipher-both-crash");
+    let (log, synced, _) = db.wal_durable();
+    copy_store(&d, &crash);
+    std::mem::forget(db);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(crash.join(log.file_name().unwrap()))
+        .unwrap()
+        .set_len(synced)
+        .unwrap();
+    let db = Db::open(&crash, opts).unwrap_or_else(|e| panic!("the crash opens: {e}"));
+    let x = String::from_utf8(val).unwrap();
+    reads(&db, "a0000000", "v", "before the failure");
+    reads(&db, "a0000001", &x, "the batch both failed");
+    reads(&db, "a0029999", &x, "the batch both failed");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// Under a cipher a run's batch whose log write failed, and whose run
+/// write did not, is logged by the commit of nothing after it even where
+/// the run's writer has something to attend to that owes nothing -- here
+/// a test's armed failure of its next fdatasync: the writer's one byte of
+/// attention sends the call to the cold path, which still closes the
+/// frames the log put back, and a crash after its `Ok` reads the batch.
+#[test]
+fn a_cipher_runs_unlogged_batch_is_logged_by_a_commit_of_nothing_beside_an_armed_writer() {
+    let d = dir("dur-runlog-cipher-armed");
+    let opts = Options {
+        sync: SyncPolicy::EveryN(u32::MAX),
+        ..under_cipher()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    db.append(b"a0000000", b"v");
+    db.commit().unwrap();
+    db.sync().unwrap();
+    assert_eq!(db.direct_runs(), (1, 1), "the premise, a logged run");
+    db.fail_next_wal_write(0);
+    db.append(b"a0000001", b"w");
+    assert!(
+        db.commit().is_err(),
+        "the log's failed write is the commit's answer"
+    );
+    db.fail_next_run_sync();
+    assert_eq!(
+        db.run_attends(),
+        Some(true),
+        "the premise: the writer attends"
+    );
+    db.commit()
+        .expect("a commit of nothing logs the batch the log put back");
+    let crash = dir("dur-runlog-cipher-armed-crash");
+    let (log, synced, _) = db.wal_durable();
+    copy_store(&d, &crash);
+    std::mem::forget(db);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(crash.join(log.file_name().unwrap()))
+        .unwrap()
+        .set_len(synced)
+        .unwrap();
+    let db = Db::open(&crash, opts).unwrap_or_else(|e| panic!("the crash opens: {e}"));
+    reads(&db, "a0000000", "v", "before the failure");
+    reads(&db, "a0000001", "w", "the batch the log put back");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// A run's batch written again by a call with nothing new pays the
+/// policy's count: the commits after it count from it, as from any sync.
+#[test]
+fn a_run_written_again_restarts_the_policys_count() {
+    let d = dir("dur-run-again-count");
+    let opts = Options {
+        sync: SyncPolicy::EveryN(2),
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    db.append(b"a0000000", b"v");
+    db.commit().unwrap();
+    db.fail_next_run_write();
+    let val = vec![b'x'; 100];
+    for i in 1..30_000u32 {
+        db.append(format!("a{i:07}").as_bytes(), &val);
+    }
+    injected(db.commit(), "the policy's sync answers the held failure");
+    db.commit().expect("a commit of nothing writes the batch");
+    let synced = db.run_synced_bytes();
+    db.append(b"b0000000", b"v");
+    db.commit().unwrap();
+    assert_eq!(
+        db.run_synced_bytes(),
+        synced,
+        "the first commit after the batch was written again is not the policy's sync"
+    );
+    db.append(b"b0000001", b"v");
+    db.commit().unwrap();
+    assert_ne!(db.run_synced_bytes(), synced, "the second is");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Under the buffered policy the run's first write, its file's head with
+/// the first batch's records, fails at a commit the policy does not sync:
+/// the failure is held, and the stream's next range -- the same commit's
+/// marker -- tries the head again before it is held behind it, so the
+/// file holds the head and the records before any sync, where a writer
+/// that tried nothing would buffer the run until its sync; the sync after
+/// still answers the failure it held, and the sync after that writes the
+/// rest.
+#[test]
+fn a_buffered_runs_failed_first_write_is_tried_again_before_its_sync() {
+    for (tag, o) in run_arms().into_iter().filter(|(_, o)| o.direct_stream) {
+        let d = dir(&format!("dur-runhead-buf-{tag}"));
+        let crash = dir(&format!("dur-runhead-buf-{tag}-crash"));
+        let opts = Options {
+            sync: SyncPolicy::EveryN(u32::MAX),
+            ..o
+        };
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        db.fail_next_run_write();
+        db.append(b"k1", b"v1");
+        db.commit()
+            .unwrap_or_else(|e| panic!("{tag}: a commit the policy does not sync: {e}"));
+        let len = || std::fs::metadata(d.join(run_tmp_name(&d))).unwrap().len();
+        assert!(len() > 0, "{tag}: the marker's stream tried the head again");
+        db.append(b"k2", b"v2");
+        db.commit()
+            .unwrap_or_else(|e| panic!("{tag}: the commit after, not synced either: {e}"));
+        injected(
+            db.sync(),
+            &format!("{tag}: the sync answers the held failure"),
+        );
+        db.sync()
+            .unwrap_or_else(|e| panic!("{tag}: the sync that writes the rest: {e}"));
+        let ino = run_ino(&d);
+        let synced = db.run_synced_bytes().expect("a run open");
+        power_cut(&db, &d, &crash, ino, synced);
+        std::mem::forget(db);
+        let db = Db::open(&crash, opts).unwrap_or_else(|e| panic!("{tag}: the cut opens: {e}"));
+        reads(&db, "k1", "v1", &format!("{tag}: the first batch"));
+        reads(&db, "k2", "v2", &format!("{tag}: the commit after"));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&crash);
+    }
+}
+
+/// A held failure answered is gone: the head refused twice, by the write
+/// and by the marker's try, is held and answered by a `sync` that writes
+/// nothing; the next commit's try of the head fails part way, and the
+/// sync after answers that failure in its own words, not the first's;
+/// the sync after it writes everything, and a power cut reads both
+/// batches back.
+#[test]
+fn a_run_write_failure_after_one_answered_is_answered_in_its_own_words() {
+    for (tag, o) in run_arms().into_iter().filter(|(_, o)| o.direct_stream) {
+        let d = dir(&format!("dur-runhead-again-{tag}"));
+        let crash = dir(&format!("dur-runhead-again-{tag}-crash"));
+        let opts = Options {
+            sync: SyncPolicy::EveryN(u32::MAX),
+            ..o
+        };
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        db.fail_next_run_writes_twice();
+        db.append(b"k1", b"v1");
+        db.commit()
+            .unwrap_or_else(|e| panic!("{tag}: a commit the policy does not sync: {e}"));
+        let len = || std::fs::metadata(d.join(run_tmp_name(&d))).unwrap().len();
+        assert_eq!(len(), 0, "{tag}: the premise, the head refused twice");
+        let first = db.sync().expect_err("the sync answers the held failure");
+        assert!(
+            first.to_string().contains("injected") && !first.to_string().contains("partial"),
+            "{tag}: the first failure's words: {first}"
+        );
+        db.fail_next_run_write_partial();
+        db.append(b"k2", b"v2");
+        db.commit()
+            .unwrap_or_else(|e| panic!("{tag}: the commit whose try fails part way: {e}"));
+        let second = db.sync().expect_err("the sync answers the second failure");
+        assert!(
+            second.to_string().contains("after a partial write"),
+            "{tag}: the second failure in its own words: {second}"
+        );
+        db.sync()
+            .unwrap_or_else(|e| panic!("{tag}: the sync that writes the rest: {e}"));
+        let ino = run_ino(&d);
+        let synced = db.run_synced_bytes().expect("a run open");
+        power_cut(&db, &d, &crash, ino, synced);
+        std::mem::forget(db);
+        let db = Db::open(&crash, opts).unwrap_or_else(|e| panic!("{tag}: the cut opens: {e}"));
+        reads(&db, "k1", "v1", &format!("{tag}: the first batch"));
+        reads(&db, "k2", "v2", &format!("{tag}: the commit after"));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&crash);
+    }
+}
+
+/// A marked writer's sync that meets a write failure of its own -- the
+/// records it writes ahead of their marker cross a piece and the piece's
+/// write fails -- and then writes and syncs every byte it holds answers
+/// `Ok`, which is true; the failure is paid by it, so the sync after a
+/// new batch writes that batch and answers `Ok` too, and the file holds
+/// both batches under the one marker.
+#[test]
+fn a_marked_segments_write_that_failed_inside_a_sync_is_paid_by_that_sync() {
+    let d = dir("dur-writer-insync");
+    let opts = SegmentOptions {
+        write_piece: 4096,
+        ..Default::default()
+    };
+    let path = d.join("run.sup");
+    let mut w = SegmentWriter::create(&path, &opts).unwrap();
+    w.set_inline_max(256);
+    w.set_marks(true);
+    for k in 0..100u32 {
+        w.begin(&hkey(k)).unwrap();
+        w.value(&hval(k));
+        w.end_with(false).unwrap();
+    }
+    w.fail_next_write();
+    w.sync()
+        .expect("a sync that wrote and synced every byte after the failure");
+    for k in 100..200u32 {
+        w.begin(&hkey(k)).unwrap();
+        w.value(&hval(k));
+        w.end_with(false).unwrap();
+    }
+    w.mark().unwrap();
+    w.sync()
+        .expect("the sync after: the failure was paid, and this batch is written");
+    let got = SegmentWriter::recover_direct(&path).unwrap();
+    assert_eq!(got.len(), 200, "both batches, under the marker");
+    assert_eq!(got[199].0, hkey(199));
+    drop(w);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The same at the edge: the records a sync writes ahead of their marker
+/// end exactly at a piece's boundary, so the failed write was of every
+/// byte the writer held and the sync's own write of them is the last;
+/// what the failure owed is exactly what the sync covered, and it is paid.
+#[test]
+fn a_write_that_failed_inside_a_sync_and_owed_exactly_what_it_synced_is_paid() {
+    let d = dir("dur-writer-insync-edge");
+    let opts = SegmentOptions {
+        write_piece: 4096,
+        ..Default::default()
+    };
+    let path = d.join("run.sup");
+    let mut found = false;
+    for l in 1..=600usize {
+        let _ = std::fs::remove_file(&path);
+        let mut w = SegmentWriter::create(&path, &opts).unwrap();
+        w.set_inline_max(1024);
+        w.set_marks(true);
+        for k in 0..28u32 {
+            w.begin(&hkey(k)).unwrap();
+            w.value(&hval(k));
+            w.end_with(false).unwrap();
+        }
+        w.begin(&hkey(28)).unwrap();
+        w.value(&vec![b'y'; l]);
+        w.end_with(false).unwrap();
+        w.fail_next_write();
+        let first = w.sync();
+        let len = std::fs::metadata(&path).unwrap().len();
+        if first.is_err() || !len.is_multiple_of(4096) {
+            continue;
+        }
+        found = true;
+        w.begin(&hkey(29)).unwrap();
+        w.value(&hval(29));
+        w.end_with(false).unwrap();
+        w.mark().unwrap();
+        w.sync()
+            .expect("the sync after: the failure was paid to the byte");
+        assert_eq!(SegmentWriter::recover_direct(&path).unwrap().len(), 30);
+        break;
+    }
+    assert!(found, "the premise: records that end at a piece's boundary");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The same where the log rotated by size behind the logged batch: the
+/// frames are in the file the rotation left loose and the live file holds
+/// none, and the commit of nothing that answers `Ok` has synced the loose
+/// file as a sync by policy would.
+#[test]
+fn a_cipher_runs_batch_written_again_is_synced_in_a_log_file_a_rotation_left_loose() {
+    let d = dir("dur-runlog-cipher-loose");
+    // The log's frames pass `seal_bytes` at the batch while the table's
+    // bytes stay under it: the log rotates and the run stays open.
+    let opts = Options {
+        sync: SyncPolicy::EveryN(u32::MAX),
+        seal_rotates_wal: false,
+        seal_bytes: 3_300_000,
+        seal_max_pct: 0,
+        ..under_cipher()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    db.append(b"a0000000", b"v");
+    db.commit().unwrap();
+    db.sync().unwrap();
+    assert_eq!(db.direct_runs(), (1, 1), "the premise, a logged run");
+    db.fail_next_run_write();
+    let val = vec![b'x'; 100];
+    for i in 1..30_000u32 {
+        db.append(format!("a{i:07}").as_bytes(), &val);
+    }
+    db.commit()
+        .expect("a commit the policy does not sync holds the piece's failure");
+    assert_eq!(
+        db.seal_waits().wal_rotations,
+        1,
+        "the premise: the log rotated"
+    );
+    assert_eq!(db.levels(), (0, 0), "the premise: the run is open");
+    assert!(db.wal_unsynced(), "the premise: the loose file is unsynced");
+    injected(db.commit(), "the run's held failure, answered by the sync");
+    db.commit()
+        .expect("a commit of nothing writes the run's batch and syncs its log");
+    assert!(
+        !db.wal_unsynced(),
+        "the commit of nothing answered Ok over a log file left loose"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Under a cipher a run's batch whose piece write failed at a commit the
+/// buffered policy does not sync was logged by that commit, unsynced, as
+/// the policy leaves a commit's frames. The commit of nothing that writes
+/// the run's batch again and answers `Ok` has synced the log as well, the
+/// batch's one durable form under a cipher, so a crash after it -- which
+/// takes every memory file the store had -- reads the batch back.
+#[test]
+fn a_cipher_runs_batch_written_again_by_a_commit_of_nothing_is_synced_in_its_log() {
+    let d = dir("dur-runlog-cipher-again");
+    let opts = Options {
+        sync: SyncPolicy::EveryN(u32::MAX),
+        ..under_cipher()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    db.append(b"a0000000", b"v");
+    db.commit().unwrap();
+    db.sync().unwrap();
+    assert_eq!(db.direct_runs(), (1, 1), "the premise, a logged run");
+    db.fail_next_run_write();
+    let val = vec![b'x'; 100];
+    for i in 1..30_000u32 {
+        db.append(format!("a{i:07}").as_bytes(), &val);
+    }
+    db.commit()
+        .expect("a commit the policy does not sync holds the piece's failure");
+    injected(db.commit(), "the run's held failure, answered by the sync");
+    db.commit()
+        .expect("a commit of nothing writes the run's batch and syncs its log");
+    let crash = dir("dur-runlog-cipher-again-crash");
+    let (log, synced, _) = db.wal_durable();
+    copy_store(&d, &crash);
+    std::mem::forget(db);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(crash.join(log.file_name().unwrap()))
+        .unwrap()
+        .set_len(synced)
+        .unwrap();
+    let db = Db::open(&crash, opts).unwrap_or_else(|e| panic!("the crash opens: {e}"));
+    let x = String::from_utf8(val).unwrap();
+    reads(&db, "a0000001", &x, "the batch written again");
+    reads(&db, "a0029999", &x, "the batch written again");
+    reads(
+        &db,
+        "a0000000",
+        "v",
+        "the batch before it, in the log it synced",
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
 }
