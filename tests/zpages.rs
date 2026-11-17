@@ -16470,6 +16470,164 @@ fn partitions_keep_why_the_stride_form_does_not_hold_them(background: bool) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A store held in two forms by its keys' place
+/// (`Options::zpages_stride_below`): the partitions whose first key is under
+/// the key are asked for the stride form and hold it, the partitions from
+/// the key up are not asked and hold the block form, and none keeps a
+/// reason, since none that was asked was declined. Under the forced form the
+/// builds are the segment work's where it has a thread of its own and the
+/// writer's where it runs inline, so the store is made both ways, and every
+/// key reads as the model has it through whichever file holds it.
+#[test]
+fn a_store_holds_the_stride_form_under_a_key_and_the_block_form_from_it_up() {
+    for background in [true, false] {
+        let what = &format!("two forms by a key, segment work on its own thread {background}");
+        let dir = scratch(&format!("stride-below-{background}"));
+        let cut = numbered_key(3000);
+        let mut db = Db::create(
+            &dir,
+            stride_forced(|o| {
+                o.partition_bytes = Some(160 << 10);
+                o.publish_in_background = background;
+                o.zpages_stride_below = Some(cut.as_slice().into());
+            }),
+        )
+        .unwrap();
+        let model = numbered_load(&mut db, 6000, 100, 0x5EA6);
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert_eq!(
+            c.form_files, c.partitions,
+            "{what}: a form file each: {c:?}"
+        );
+        // A partition's lower fence is its first key but the first's, which
+        // is open: the partitions under the key are the fences under it.
+        let under = db
+            .zpage_heat()
+            .iter()
+            .filter(|h| h.lo.as_slice() < cut.as_slice())
+            .count() as u64;
+        assert!(
+            under > 0 && under < c.partitions,
+            "{what}: partitions on both sides of the key: {under} of {c:?}"
+        );
+        assert_eq!(
+            c.stride_files, under,
+            "{what}: the stride form under the key and nowhere else: {c:?}"
+        );
+        let nos = db.zpage_stride_nos();
+        assert!(
+            nos.iter().all(|&n| n == 0),
+            "{what}: a partition not asked keeps no reason: {nos:?}"
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&db, &model, &keys, what);
+        let c = db.zpage_counts();
+        assert!(
+            c.stride_reads > 0 && c.reads > c.stride_reads,
+            "{what}: reads through both files: {c:?}"
+        );
+        assert_eq!(c.fallbacks, 0, "{what}: {c:?}");
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The same line at a merge's output finish, the third site a partition's
+/// form is built at: every key put again, the pieces merged, and each output
+/// built at its finish in the stride form where its first key is under the
+/// key and in the block form from the key up. The files on disk are of both
+/// kinds, and installed they serve the partitions as the line has them.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_merges_outputs_are_built_in_the_form_their_side_of_the_key_has() {
+    let what = "two forms by a key at the outputs' finish";
+    let cut = numbered_key(10_000);
+    let (dir, mut db, mut model, inject, raw) = land_store_loaded(
+        "auto-finish-stride-below",
+        50,
+        |o| {
+            o.zpages_stride = ZStride::Forced;
+            o.zpages_stride_below = Some(cut.as_slice().into());
+            o.zpages_build_at_finish = true;
+            o.zpages_ahead_builders = 8;
+            o.partition_bytes = Some(1 << 20);
+            o.l0_trigger = 1;
+        },
+        |db| numbered_load(db, 20_000, 100, 0x5F2),
+    );
+    let mut seen = 0usize;
+    db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+    assert_eq!(seen, 10);
+    inject.set_decode_cost(std::time::Duration::from_micros(1));
+    inject.set_budget(raw / 2);
+    wait_steps(&db, 2);
+    let mut rng = Rng(0x5EEE);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    for chunk in keys.chunks(250) {
+        for k in chunk {
+            let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
+            db.put(k, &v);
+            model.insert(k.clone(), vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.seal().unwrap();
+    db.settle().unwrap();
+    wait_for("the builds at the outputs' finish to end", || {
+        let c = db.zpage_counts();
+        c.finish_builds >= 1 && c.finish_live == 0 && db.merges_in_flight() == 0
+    });
+    let c = db.zpage_counts();
+    assert!(
+        c.stride_builds > 0 && c.stride_builds < c.finish_builds,
+        "{what}: outputs built in both forms: {c:?}"
+    );
+    let magics: Vec<_> = form_files(&dir)
+        .iter()
+        .map(|f| {
+            let b = std::fs::read(f).unwrap();
+            supdb::db::zpages::trailer_magic(&b[b.len() - ZTRAILER..])
+                == Some(supdb::db::zpages::STRIDE_MAGIC)
+        })
+        .collect();
+    assert!(
+        magics.iter().any(|&m| m) && magics.iter().any(|&m| !m),
+        "{what}: files of both kinds on disk: {magics:?}"
+    );
+    assert!(
+        tick_until(&db, 400, |c| c.sel_installs >= 1
+            && c.form_files == c.partitions),
+        "{what}: the files on disk not installed: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    let under = db
+        .zpage_heat()
+        .iter()
+        .filter(|h| h.lo.as_slice() < cut.as_slice())
+        .count() as u64;
+    assert!(
+        under > 0 && under < c.partitions,
+        "{what}: {under} of {c:?}"
+    );
+    assert_eq!(
+        (c.stride_files, c.build_starts),
+        (under, 0),
+        "{what}: the finishes' files installed as built, the stride form under the key: {c:?}"
+    );
+    let nos = db.zpage_stride_nos();
+    assert!(nos.iter().all(|&n| n == 0), "{what}: no reason: {nos:?}");
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, what);
+    drop(r);
+    let c = db.zpage_counts();
+    assert!(c.stride_reads > 0, "{what}: {c:?}");
+    assert_eq!(c.fallbacks, 0, "{what}: {c:?}");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A reading made from the form files on disk at the crossing
 /// (`Maint::z_reading_from_files`) takes a stride file as on disk, as the
 /// files' cover counts it and as the attach takes it: by its own trailer,

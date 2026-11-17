@@ -6969,6 +6969,12 @@ pub(super) struct BuildPlan {
     /// Whether the build asks for the stride form, and what it builds
     /// where the partition does not qualify.
     pub stride: StrideAsk,
+    /// The key at and above which a partition is not asked for the stride
+    /// form whatever `stride` says (`Options::zpages_stride_below`): one
+    /// whose first key is at or above it is built in the block form as a
+    /// plan that asks nothing builds it, with no reason kept, since none was
+    /// found -- the partition was not asked. `None` asks every partition.
+    pub stride_below: Option<std::sync::Arc<[u8]>>,
     /// A test's: the stride form's file damaged once it is written and
     /// before it is read back, so that a check the reads go through is
     /// shown to refuse what it is for.
@@ -7002,6 +7008,7 @@ impl BuildPlan {
             drop_output: false,
             sync: false,
             stride: StrideAsk::No,
+            stride_below: None,
             #[cfg(test)]
             damage: None,
             #[cfg(test)]
@@ -7156,7 +7163,13 @@ fn build_file_seen(
             &file, base, recs, dir, nkeys, bind, &tmp, &facts, id, end_seq, plan, seen,
         )
     };
-    let made = match plan.stride {
+    // A partition the plan keeps in the block form by its keys' place is
+    // not asked (`BuildPlan::stride_below`).
+    let ask = match plan.stride_below.as_deref() {
+        Some(cut) if blob.key_at(0).is_some_and(|first| first >= cut) => StrideAsk::No,
+        _ => plan.stride,
+    };
+    let made = match ask {
         StrideAsk::No => block(seen),
         ask => {
             let walked = match stride_precheck(&SegImages::new(recs, dir, nkeys)) {
@@ -14188,6 +14201,57 @@ mod tests {
             assert!(want(&made), "{name}: {made:?}");
             made.note_stride(&cell);
             assert_eq!(cell.load(Ordering::Relaxed), kept, "{name}");
+        }
+    }
+
+    /// A plan that keeps the partitions at and above a key in the block
+    /// form (`BuildPlan::stride_below`) asks the stride form of a partition
+    /// whose first key is below the key, and nothing of one whose first key
+    /// is the key or above it: the block body with no reason, as a plan
+    /// that asks nothing builds it, the reason a segment keeps left as it
+    /// was. Under either ask, a conversion's too.
+    #[test]
+    fn a_partition_at_or_above_the_plans_key_is_not_asked_for_the_stride_form() {
+        let fx = Fixture::new("stride-below", stride_recs(600, 100, 0x61), 1 << 16);
+        assert!(
+            precheck_of(&fx).is_ok(),
+            "a partition the stride form would take, so that nothing keeps it out but the key"
+        );
+        let first = fx.blob.key_at(0).unwrap().to_vec();
+        // The run's second key, above the first; and the first key less its
+        // last byte, which sorts below it.
+        let second = fx.blob.key_at(1).unwrap().to_vec();
+        let under = first[..first.len() - 1].to_vec();
+        let kept = StrideNo::Holes.code();
+        for ask in [StrideAsk::OrBlock, StrideAsk::Only] {
+            for (name, cut, stride) in [
+                ("the key above the first", &second, true),
+                ("the key the first", &first, false),
+                ("the key below the first", &under, false),
+            ] {
+                let what = format!("{ask:?}, {name}");
+                let _ = std::fs::remove_file(&fx.out);
+                let plan = BuildPlan {
+                    stride_below: Some(cut.as_slice().into()),
+                    ..stride_plan(ask)
+                };
+                let cell = AtomicU8::new(kept);
+                let made = build(&fx.seg, &fx.out, ID, END, &plan).unwrap();
+                made.note_stride(&cell);
+                let Outcome::Built(b) = made else {
+                    panic!("{what}: {made:?}")
+                };
+                assert_eq!(b.stride_no, None, "{what}: no reason either way");
+                if stride {
+                    assert_eq!(b.coding, FileCoding::Stride, "{what}");
+                    assert_eq!(cell.load(Ordering::Relaxed), 0, "{what}: held");
+                } else {
+                    assert_eq!(b.coding, FileCoding::Block, "{what}");
+                    assert_eq!(cell.load(Ordering::Relaxed), kept, "{what}: not asked");
+                    let zfile = fx.attach().expect("the block file attaches");
+                    agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
+                }
+            }
         }
     }
 

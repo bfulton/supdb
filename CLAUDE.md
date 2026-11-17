@@ -32,7 +32,7 @@ of the change that produced the text.
 |---|---|
 | `src/db.rs` | the engine: WAL with atomic batches, memtable, sealed segments, partitioned compaction, tombstones, `Txn`, and the `SegmentWriter` every segment is written by -- `docs/engine.md` |
 | `src/db/zpages.rs` | the compact form's layout: the page, the directory of the groups it holds, the group, the fill that cuts records into groups and packs them into pages, the fence, the trailer and the identity a form file is bound by, with no file, thread or clock in it -- the module's own docs, and `bench/examples/zsize.rs` for what it makes of the engine's bytes |
-| `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`); and the stride form, an experiment (`Options::zpages_stride`, off), a partition's values alone at their stride where its keys are one run of numbers -- the module's own docs, and `docs/engine.md` for where it wins and where it does not fit |
+| `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`); and the stride form, an experiment (`Options::zpages_stride`, off; `zpages_stride_below` keeps it to the partitions under a key), a partition's values alone at their stride where its keys are one run of numbers -- the module's own docs, and `docs/engine.md` for where it wins and where it does not fit |
 | `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, the replays that hold it, and the model of a cache's faults over populations of pages (`model_populations`) -- the module's own docs |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
 | `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index -- `docs/index-theory.md` |
@@ -5258,7 +5258,20 @@ through the read passes and fell a hundred through the mixes, every kind
 of pass in a stretch agreeing on it (`bench/examples/formfit.rs`). So a
 form fits or does not by the pass, a line drawn at a share of a budget is
 crossed both ways inside one row, and the store that reads fastest at
-such a bound is in two forms, as much of the fast one as fits. The
+such a bound is in two forms. How much of each the model then got wrong:
+priced at the capacity the stride arm's faults implied, a store half to
+three quarters stride was to read ahead everywhere, and built
+(`Options::zpages_stride_below`, the arms `...zstridedrop2m` to `...7m`)
+it faulted through every pass after the write mixes. The one unknown was
+three things a census of the page cache by file counted in one run: the
+process, a hundred megabytes larger after the mixes than before; the
+ordered index's heads, which the block form's scans keep in the cache
+and the stride form's never touch; and, over the read passes, no limit
+at all, the group standing a sixth under its bound while the form files
+were read back after the load. With the room counted so, three tenths
+of the keys in the stride form fit, and that store read ahead of the
+block form or level with it in sixteen cells of twenty in both orders,
+C at two and a half times. The
 estimator went the way the form had: a sketch of reuse distances that
 every form would read at its own bytes a key was built first, read the
 forms 8% to 50% off because a granule of ranks is no form's page, and was
@@ -5269,8 +5282,11 @@ on the side of one that fits in any line of the probe. The rules: a fit is
 priced as faults an operation in the pass that would take them, never as
 a size against a share; a model of faults is held to the measured ones by
 solving for the capacity pass by pass and asking whether it moves like one
-quantity; and before an estimator is built, what the store's existing
-counts already predict is held to the exact answer first.
+quantity; an unknown solved from one arm's faults is that arm's, so
+before it prices another store what it is made of is counted, by file
+and by owner, at the pass it is to be used in; and before an estimator
+is built, what the store's existing counts already predict is held to
+the exact answer first.
 
 ## Standing limitations
 

@@ -30,7 +30,12 @@
 //! the block cache's copies (a hit on either touches no page), the level-0
 //! pieces a write mix leaves, and the capacity itself, which is the bound
 //! less whatever else the process and the page cache hold at that moment and
-//! moves through a pass. A key a mix has written is read from the memtable
+//! moves through a pass. Two parts of that are a form's own and are not in
+//! the model: the pages its reads keep beside its file (the block form's
+//! scans seek the ordered index's heads, eight bytes a key) and the process
+//! memory its read path grows. So a capacity solved from one store's
+//! faults is not another store's: the two-form stores it priced at the
+//! stride arm's capacity faulted where it gave none (`docs/engine.md`). A key a mix has written is read from the memtable
 //! and touches no page of a form (`--no-overlay` reads it through the form);
 //! a scan touches its pages whatever was written under it.
 //!
