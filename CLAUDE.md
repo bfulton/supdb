@@ -32,7 +32,7 @@ of the change that produced the text.
 |---|---|
 | `src/db.rs` | the engine: WAL with atomic batches, memtable, sealed segments, partitioned compaction, tombstones, `Txn`, and the `SegmentWriter` every segment is written by -- `docs/engine.md` |
 | `src/db/zpages.rs` | the compact form's layout: the page, the directory of the groups it holds, the group, the fill that cuts records into groups and packs them into pages, the fence, the trailer and the identity a form file is bound by, with no file, thread or clock in it -- the module's own docs, and `bench/examples/zsize.rs` for what it makes of the engine's bytes |
-| `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`) -- the module's own docs |
+| `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`); and the stride form, an experiment (`Options::zpages_stride`, off), a partition's values alone at their stride where its keys are one run of numbers -- the module's own docs, and `docs/engine.md` for where it wins and where it does not fit |
 | `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, and the replays that hold it -- the module's own docs |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
 | `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index -- `docs/index-theory.md` |
@@ -5216,6 +5216,34 @@ once is read from whatever it printed; and a change to when work is done
 is held to a count of how often it fires in the suite's own passes before
 it is priced, since a mechanism that fires in none of them leaves a
 pairing nothing to read.
+
+**A form priced at the one bound it fits, and an arm that kept its
+sibling's setting.** The stride form -- a partition's values alone at
+their stride, read by arithmetic on the key -- was built for the C mix at
+ten million keys under 1.25 GiB, and its forced arm read C there at three
+times LMDB's with no fault. Its bytes are the payload's, a gigabyte at
+that store between the block form's 0.72 and the raw form's 1.45, so it
+fits beside a lean process under that bound and on neither side of it:
+under 1 GiB it took 0.085 faults a read and lost five of the six
+scrambled mixes to the default, at three million keys, where the raw form fits, it traded
+its point reads for the scans, E and the loads, and the budgets at which
+it passes the fill share the coding gear keeps while the raw form does
+not fit are 1.18 to 1.45 GB, which the suite's bounds lie under. That
+arithmetic needs the three sizes and nothing else, and it was done after
+the form was built, reviewed six times and gated. And its first pairing
+beside the block cache read E at 0.6x of LMDB with 0.028 faults a read in
+the first read pass, which was the arm's and not the form's:
+`supdb-cache64tofitzstride` is its block sibling's policy with one field
+moved, and the sibling keeps the raw records in the page cache
+(`zdropraw` off), so the stride files stood beside the form they replace.
+The rules: a second form's size is set against the budgets on either side
+of the cell it is built for -- the bound below it, the rung where the raw
+form fits -- before the form is built, since a form that wins at one
+bound has a band and the band is arithmetic; a probe that shows what a
+cell allows is a ceiling for that cell and says nothing of its
+neighbours; and an arm made of a sibling's policy inherits what the
+sibling pins, so the options a pairing's question rests on are read off
+the arm before its cells are.
 
 ## Standing limitations
 
