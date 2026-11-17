@@ -2225,7 +2225,18 @@ a delete's included, since recovery replays the log's frames as newer than
 the piece it rebuilds from a run's file -- goes to an ordered memtable and,
 at each commit, to a segment open for append: the batch's records, then a
 commit marker carrying their CRC, length and count, then one fdatasync on
-that file. The WAL never
+that file where the policy is due; a commit under `EveryN` that is not
+writes the batch's whole pieces and holds the rest with the writer, and
+a `sync` writes what the run holds and syncs the file, after the log
+beside it -- an open run's only: a run in the clear closed by any write
+it cannot take (a key at or below its greatest, an empty or overlong
+key, a value that does not inline, a `put`, a `delete`) or by any seal
+(`Db::seal`, or a commit's at the threshold) goes to its seal with what
+the policy left unsynced, a `sync` before that seal lands does not cover
+it, and a `flush` does. A run's due commit syncs the run's file and not
+the log, so the frames of a table frozen before the run that no sync
+covered are durable at a `sync`, a `flush` or their seal's landing, and
+a power cut between may keep the run's commits and lose them. The WAL never
 sees them (`direct_ingest: false` is the arm that still sends them there).
 Recovery walks the temp file's record stream to the last marker whose three
 quantities agree with the records before it and rewrites what precedes it as
@@ -2800,6 +2811,40 @@ writer's first scan after the buffered lag sweep's largest burst spent
 thirty milliseconds there. The rule: a fast path is gated on the
 property that makes it valid, not on the source it was first written
 for.
+
+It came back as a skip of a promise. `sync` makes everything written
+durable, and synced the log only when the live table was hashed, on the
+reading that an ordered run is its own log and the log holds nothing of
+it; and it did nothing for the run, on the reading that a run's commit
+syncs its file. Both were true under `Always` and neither under
+`EveryN`, the policy whose stores are the ones that call `sync`: a run's
+commit that is not due writes its batch's whole pieces and holds the
+tail, so a `sync` answered `Ok` lost to a process kill every key of a
+run under a megabyte; a run opens over a log that still holds the frames
+of a table frozen before it, unsynced; and under a cipher the run's
+commits are frames of that log. `sync` asks the log what it owes whatever
+the table, and the run by the count of commits no sync has covered,
+which the log's sync starts over, so the run is asked first. The
+corollary: a call whose contract is durability is gated on what is
+unsynced, never on which structure is live, since the policy that
+leaves things unsynced is the one whose callers rely on the call. The
+fix covered the open run and its first docs promised every commit: a
+run closed into a seal in flight holds its unsynced commits on the seal
+thread's way to its segment, beyond anything the writer can sync without
+waiting for that thread, and the review read the gap off the doc before
+any test had gone near it. The restated docs then named two of the ways
+a run closes, a key below its greatest and `Db::seal`, and a run closes
+at every write it cannot take -- a `put`, a `delete`, a key or a value
+the run cannot hold -- and at the seal a commit makes at the threshold,
+which is the common one; a reader of the docs was pointed away from the
+store's own seal. The same docs still promised that `EveryN` loses a
+tail and that the policy's next sync covers the frames an open replayed,
+over a window the unit had itself reproduced and filed: a run's due
+commit syncs the run's file and leaves the log's older frames unsynced. A
+promise is written for the states the fix reached, the states it did not
+reach are named beside it until they are built, and a list of the ways
+into a state is read off the call sites that reach it, never off the
+cases a test happened to build.
 
 **A pass that reported done for a turn it skipped.** The upkeep thread's
 pass checked that the state was the commit's by its generation and, where

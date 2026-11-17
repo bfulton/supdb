@@ -4569,3 +4569,891 @@ fn a_store_whose_log_rotated_after_a_failed_write_survives_a_power_cut() {
         let _ = std::fs::remove_dir_all(&crash);
     }
 }
+
+// ---------------------------------------------------------------------
+// sync-run: a `sync` makes an open run's commits durable whatever the
+// policy left of them -- the tail its writer still held written, the
+// run's file synced -- and syncs the log wherever it holds frames no
+// sync covered, the live table ordered or not.
+// ---------------------------------------------------------------------
+
+/// A store whose writes above its greatest key go to one direct run for
+/// as long as these tests write, sealed by nothing but a test's own call,
+/// under `sync` and the run's arm `arm`.
+fn sr_opts(sync: SyncPolicy, arm: Options) -> Options {
+    Options {
+        sync,
+        seal_bytes: 64 << 20,
+        seal_max_pct: 0,
+        seal_idle: false,
+        partition_bytes: Some(1 << 20),
+        ..arm
+    }
+}
+
+fn sr_key(k: u32) -> Vec<u8> {
+    format!("key-{k:06}").into_bytes()
+}
+
+/// A hundred bytes naming its key, so a value read back is the key's own.
+fn sr_val(k: u32) -> Vec<u8> {
+    let mut v = format!("v{k:06}-").into_bytes();
+    v.resize(100, b'b');
+    v
+}
+
+/// Keys `from..to` appended above the store's greatest, in commits of
+/// `per`: every one goes to the run. `append`, since a `put` is a replace,
+/// which no run takes.
+fn sr_commits(db: &mut Db, from: u32, to: u32, per: u32) {
+    let mut k = from;
+    while k < to {
+        for k in k..(k + per).min(to) {
+            db.append(&sr_key(k), &sr_val(k));
+        }
+        db.commit().unwrap();
+        k += per;
+    }
+}
+
+/// The keys of `0..n` that do not read back their one value in `db`, as
+/// a failure's words, or `None`.
+fn sr_missing(db: &Reader, n: u32, what: &str) -> Option<String> {
+    let missing: Vec<u32> = (0..n)
+        .filter(|&k| read_vec(db, &sr_key(k)) != vec![sr_val(k)])
+        .collect();
+    (!missing.is_empty()).then(|| {
+        format!(
+            "{what}: {} of {n} keys written before an Ok sync did not read back, the first {:?}",
+            missing.len(),
+            String::from_utf8_lossy(&sr_key(missing[0]))
+        )
+    })
+}
+
+/// What a run holds when `sync` is called: one commit of a hundred, the
+/// one commit no sync has covered; three commits of a hundred, none of
+/// them on the file at all; twelve of a thousand, whole write
+/// pieces on the file and the tail held; three of a hundred and a hundred
+/// more staged, which the sync itself commits; three of a hundred
+/// synced, then three more, then synced again; and three of a hundred
+/// synced, then a hundred staged, which the second sync commits as the
+/// one commit no sync has covered; and six of a hundred, under `EveryN(5)`
+/// one commit past the policy's due sync.
+#[derive(Clone, Copy, Debug)]
+enum RunHeld {
+    One,
+    Small,
+    Large,
+    Staged,
+    Twice,
+    SyncedThenStaged,
+    AfterDue,
+}
+
+const RUN_HELD: [RunHeld; 7] = [
+    RunHeld::One,
+    RunHeld::Small,
+    RunHeld::Large,
+    RunHeld::Staged,
+    RunHeld::Twice,
+    RunHeld::SyncedThenStaged,
+    RunHeld::AfterDue,
+];
+
+/// The run `held` names written and synced: the keys committed before the
+/// last `sync`, which answered `Ok`.
+fn sr_written_and_synced(db: &mut Db, held: RunHeld) -> u32 {
+    match held {
+        RunHeld::One => sr_commits(db, 0, 100, 100),
+        RunHeld::Small => sr_commits(db, 0, 300, 100),
+        RunHeld::Large => sr_commits(db, 0, 12_000, 1000),
+        RunHeld::AfterDue => sr_commits(db, 0, 600, 100),
+        RunHeld::Staged => {
+            sr_commits(db, 0, 300, 100);
+            for k in 300..400 {
+                db.append(&sr_key(k), &sr_val(k));
+            }
+        }
+        RunHeld::Twice => {
+            sr_commits(db, 0, 300, 100);
+            db.sync().unwrap();
+            sr_commits(db, 300, 600, 100);
+        }
+        RunHeld::SyncedThenStaged => {
+            sr_commits(db, 0, 300, 100);
+            db.sync().unwrap();
+            for k in 300..400 {
+                db.append(&sr_key(k), &sr_val(k));
+            }
+        }
+    }
+    db.sync().unwrap();
+    match held {
+        RunHeld::One => 100,
+        RunHeld::Small => 300,
+        RunHeld::Large => 12_000,
+        RunHeld::Staged => 400,
+        RunHeld::Twice => 600,
+        RunHeld::SyncedThenStaged => 400,
+        RunHeld::AfterDue => 600,
+    }
+}
+
+const SR_POLICIES: [(&str, SyncPolicy); 2] = [
+    ("every5", SyncPolicy::EveryN(5)),
+    ("buffered", SyncPolicy::EveryN(u32::MAX)),
+];
+
+/// A process killed after `sync` answered `Ok`, with a run open under a
+/// policy that does not sync every commit: the page cache is kept, and
+/// every commit before the sync reads back, the batch's tail the writer
+/// held among them. Under `EveryN(5)` the large run's commits end two past
+/// a due sync; under `EveryN(u32::MAX)` none is ever due. Every arm of the
+/// run, since each keeps the records on their way to the file in its own
+/// shape.
+#[test]
+fn a_sync_puts_an_open_runs_commits_where_a_process_kill_keeps_them() {
+    let mut failures = Vec::new();
+    for (arm, base) in run_arms() {
+        for (pol, sync) in SR_POLICIES {
+            for held in RUN_HELD {
+                let tag = format!("{arm}-{pol}-{held:?}");
+                let d = dir(&format!("dur-srkill-{tag}"));
+                let crash = dir(&format!("dur-srkill-{tag}-crash"));
+                let opts = sr_opts(sync, base.clone());
+                let mut db = Db::create(&d, opts.clone()).unwrap();
+                let n = sr_written_and_synced(&mut db, held);
+                assert!(open_run(&d), "{tag}: the run is open");
+                assert!(!db.in_flight().0, "{tag}: no seal in flight to write it");
+                copy_store(&d, &crash);
+                drop(db);
+                let opened = Db::open(&crash, opts).unwrap();
+                failures.extend(sr_missing(
+                    &opened,
+                    n,
+                    &format!("{tag}: killed after the sync"),
+                ));
+                drop(opened);
+                let _ = std::fs::remove_dir_all(&d);
+                let _ = std::fs::remove_dir_all(&crash);
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The same runs, and a power cut after `sync` answered `Ok`: the run's
+/// file keeps only what its writer's fdatasyncs covered, and the log what
+/// its syncs did, and that is every commit before the sync.
+#[test]
+fn a_sync_makes_an_open_runs_commits_survive_a_power_cut() {
+    let mut failures = Vec::new();
+    for (arm, base) in run_arms() {
+        for (pol, sync) in SR_POLICIES {
+            for held in RUN_HELD {
+                let tag = format!("{arm}-{pol}-{held:?}");
+                let d = dir(&format!("dur-srcut-{tag}"));
+                let crash = dir(&format!("dur-srcut-{tag}-crash"));
+                let opts = sr_opts(sync, base.clone());
+                let mut db = Db::create(&d, opts.clone()).unwrap();
+                let n = sr_written_and_synced(&mut db, held);
+                let synced = db
+                    .run_synced_bytes()
+                    .expect("the run is open after a sync that seals nothing");
+                power_cut(&db, &d, &crash, run_ino(&d), synced);
+                drop(db);
+                let opened = Db::open(&crash, opts).unwrap();
+                failures.extend(sr_missing(
+                    &opened,
+                    n,
+                    &format!("{tag}: a power cut after the sync"),
+                ));
+                drop(opened);
+                let _ = std::fs::remove_dir_all(&d);
+                let _ = std::fs::remove_dir_all(&crash);
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Commits into a hashed table, in the log and unsynced under the policy;
+/// the table frozen and handed to a seal held before its fsyncs, so no
+/// manifest names its segment; then a run opened beside it, and `sync`.
+/// The live table being ordered is no reason to leave the log unsynced:
+/// after a power cut the log's frames are the only copy of the first
+/// commits, and the run's file of the second, and both read back.
+#[test]
+fn a_sync_with_a_run_open_makes_the_logs_unsynced_frames_survive_a_power_cut() {
+    let opts = sr_opts(SyncPolicy::EveryN(u32::MAX), Options::default());
+    let d = dir("dur-srlog");
+    let crash = dir("dur-srlog-crash");
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    // Values the record cannot hold inline: the batch goes to the log and
+    // a hashed table, and no run opens.
+    let big = "x".repeat(opts.inline_bytes + 1);
+    for k in 0..200u32 {
+        db.append(format!("a-{k:06}").as_bytes(), big.as_bytes());
+    }
+    db.commit().unwrap();
+    db.hold_seal_durable(true);
+    // Everything between the hold and its release under `catch_unwind`, so
+    // a failure lets the seal thread go before the store is dropped.
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.seal().unwrap();
+        sr_commits(&mut db, 0, 300, 100);
+        assert!(
+            db.run_synced_bytes().is_some(),
+            "the keys above the greatest opened a run beside the seal in flight"
+        );
+        assert!(
+            db.in_flight().0,
+            "the hashed table's seal is held in flight"
+        );
+        db.sync().unwrap();
+        let synced = db.run_synced_bytes().expect("the run is open");
+        power_cut(&db, &d, &crash, run_ino(&d), synced);
+    }));
+    db.hold_seal_durable(false);
+    if let Err(p) = caught {
+        std::panic::resume_unwind(p);
+    }
+    drop(db);
+    let opened = Db::open(&crash, opts).unwrap();
+    let a_missing = (0..200u32)
+        .filter(|k| {
+            read_vec(&opened, format!("a-{k:06}").as_bytes()) != vec![big.as_bytes().to_vec()]
+        })
+        .count();
+    let run = sr_missing(&opened, 300, "the run's keys");
+    assert!(
+        a_missing == 0 && run.is_none(),
+        "a power cut after an Ok sync: {a_missing} of 200 keys committed to the log \
+         did not read back; {run:?}"
+    );
+    drop(opened);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// Under `adaptive_shape` a `sync` hands the open run to a seal without
+/// waiting for it. The commits it answered for are on the run's file
+/// before the hand-off, not left to the seal thread: with the seal held
+/// before it writes anything, a process killed after the answer keeps
+/// every one. A second `sync` in a row, the run handed and nothing
+/// committed since, answers `Ok` and leaves the handed run as it was.
+#[test]
+fn a_sync_that_hands_an_open_run_to_a_seal_has_put_its_commits_on_the_file() {
+    let mut failures = Vec::new();
+    for (arm, base) in [
+        ("default", Options::default()),
+        (
+            "copyvals",
+            Options {
+                direct_stream: false,
+                ..Options::default()
+            },
+        ),
+    ] {
+        for held in [RunHeld::Small, RunHeld::Large] {
+            let tag = format!("{arm}-{held:?}");
+            let opts = Options {
+                adaptive_shape: true,
+                ..sr_opts(SyncPolicy::EveryN(u32::MAX), base.clone())
+            };
+            let d = dir(&format!("dur-srhand-{tag}"));
+            let crash = dir(&format!("dur-srhand-{tag}-crash"));
+            let mut db = Db::create(&d, opts.clone()).unwrap();
+            db.hold_seal_landing(true);
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let n = sr_written_and_synced(&mut db, held);
+                db.sync()
+                    .unwrap_or_else(|e| panic!("{tag}: a second sync after the hand-off: {e}"));
+                assert!(
+                    db.run_synced_bytes().is_none(),
+                    "{tag}: the sync handed the run to a seal"
+                );
+                assert!(db.in_flight().0, "{tag}: its seal is held in flight");
+                assert!(
+                    open_run(&d),
+                    "{tag}: the run's temp name stays until a manifest names it"
+                );
+                copy_store(&d, &crash);
+                n
+            }));
+            db.hold_seal_landing(false);
+            let n = match caught {
+                Ok(n) => n,
+                Err(p) => std::panic::resume_unwind(p),
+            };
+            drop(db);
+            let opened = Db::open(&crash, opts).unwrap();
+            failures.extend(sr_missing(
+                &opened,
+                n,
+                &format!("{tag}: killed after a sync that handed the run"),
+            ));
+            drop(opened);
+            let _ = std::fs::remove_dir_all(&d);
+            let _ = std::fs::remove_dir_all(&crash);
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Under a cipher a run's commits go to the log as well (`Db::log_run`),
+/// and the log is their durable form, since the run's file is a memory
+/// file until the run closes. Under a policy that does not sync every
+/// commit, a `sync` with the run open syncs the frames the run left in
+/// the log: after a power cut -- the memory files gone, the log cut to
+/// what its syncs covered -- every commit before the sync reads back.
+#[test]
+fn a_sync_makes_an_open_runs_logged_commits_survive_a_power_cut_under_a_cipher() {
+    let mut failures = Vec::new();
+    for (pol, sync) in SR_POLICIES {
+        for held in RUN_HELD {
+            let tag = format!("{pol}-{held:?}");
+            let d = dir(&format!("dur-srcipher-{tag}"));
+            let crash = dir(&format!("dur-srcipher-{tag}-crash"));
+            let opts = sr_opts(sync, under_cipher());
+            let mut db = Db::create(&d, opts.clone()).unwrap();
+            let n = sr_written_and_synced(&mut db, held);
+            assert!(db.run_synced_bytes().is_some(), "{tag}: the run is open");
+            let (log, log_synced, _) = db.wal_durable();
+            copy_store(&d, &crash);
+            let name = log.file_name().expect("the log's file name");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(crash.join(name))
+                .unwrap()
+                .set_len(log_synced)
+                .unwrap();
+            drop(db);
+            let opened = Db::open(&crash, opts).unwrap();
+            failures.extend(sr_missing(
+                &opened,
+                n,
+                &format!("{tag}: a power cut after the sync"),
+            ));
+            drop(opened);
+            let _ = std::fs::remove_dir_all(&d);
+            let _ = std::fs::remove_dir_all(&crash);
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A `sync` whose fdatasync of the open run's file fails answers the
+/// failure, and the store keeps it: every commit, `sync` and `flush` after
+/// it answers the kept error until the store is reopened, as after the
+/// run's own commit's failed fdatasync (`SyncPolicy`), since a sync
+/// retried would answer `Ok` over pages the device never took.
+#[test]
+fn a_sync_whose_run_fdatasync_fails_answers_it_and_keeps_it() {
+    for (arm, base) in run_arms() {
+        let tag = format!("{arm}-buffered");
+        let d = dir(&format!("dur-srsyncfail-{tag}"));
+        let opts = sr_opts(SyncPolicy::EveryN(u32::MAX), base);
+        let mut db = Db::create(&d, opts).unwrap();
+        sr_commits(&mut db, 0, 300, 100);
+        db.fail_next_run_sync();
+        injected(
+            db.sync(),
+            &format!("{tag}: the sync over the failed fdatasync"),
+        );
+        kept(db.commit(), &format!("{tag}: a commit of nothing after"));
+        kept(db.sync(), &format!("{tag}: a sync after"));
+        db.append(&sr_key(300), &sr_val(300));
+        kept(db.commit(), &format!("{tag}: a commit after"));
+        kept(db.flush(), &format!("{tag}: a flush after"));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A `sync` whose write of what the open run holds fails answers the
+/// write's failure, and the batch is owed: the next `sync` writes it at
+/// the offset the file is good to and syncs it, and a power cut after that
+/// `Ok` reads every commit back.
+#[test]
+fn a_sync_whose_write_of_the_runs_tail_fails_is_written_by_the_next_sync() {
+    for (arm, base) in run_arms() {
+        let tag = format!("{arm}-buffered");
+        let d = dir(&format!("dur-srwritefail-{tag}"));
+        let crash = dir(&format!("dur-srwritefail-{tag}-crash"));
+        let opts = sr_opts(SyncPolicy::EveryN(u32::MAX), base);
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        sr_commits(&mut db, 0, 300, 100);
+        db.fail_next_run_write();
+        injected(db.sync(), &format!("{tag}: the sync over the failed write"));
+        db.sync()
+            .unwrap_or_else(|e| panic!("{tag}: the sync after writes the batch again: {e}"));
+        let synced = db.run_synced_bytes().expect("the run is open");
+        power_cut(&db, &d, &crash, run_ino(&d), synced);
+        drop(db);
+        let opened = Db::open(&crash, opts).unwrap();
+        if let Some(m) = sr_missing(&opened, 300, &format!("{tag}: a power cut after")) {
+            panic!("{m}");
+        }
+        drop(opened);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&crash);
+    }
+}
+
+/// The order inside a `sync`: the log's frames are older than every
+/// commit of the open run, so the log is synced first, and a sync of the
+/// log that fails leaves the run's file as the policy left it. A power cut
+/// after that failure keeps a prefix of the commit order -- the run's
+/// commits only with the log's before them.
+#[test]
+fn a_sync_with_a_run_open_syncs_the_log_before_the_run() {
+    let opts = sr_opts(SyncPolicy::EveryN(u32::MAX), Options::default());
+    let d = dir("dur-srorder");
+    let crash = dir("dur-srorder-crash");
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let big = "x".repeat(opts.inline_bytes + 1);
+    for k in 0..200u32 {
+        db.append(format!("a-{k:06}").as_bytes(), big.as_bytes());
+    }
+    db.commit().unwrap();
+    db.hold_seal_durable(true);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.seal().unwrap();
+        sr_commits(&mut db, 0, 300, 100);
+        assert!(
+            db.run_synced_bytes().is_some(),
+            "a run opened beside the seal"
+        );
+        db.fail_next_wal_sync();
+        kept(db.sync(), "the sync whose log sync failed");
+        let synced = db.run_synced_bytes().expect("the run is open");
+        power_cut(&db, &d, &crash, run_ino(&d), synced);
+    }));
+    db.hold_seal_durable(false);
+    if let Err(p) = caught {
+        std::panic::resume_unwind(p);
+    }
+    drop(db);
+    let opened = Db::open(&crash, opts).unwrap();
+    let a_missing = (0..200u32)
+        .filter(|k| read_vec(&opened, format!("a-{k:06}").as_bytes()).is_empty())
+        .count();
+    let run_kept = (0..300u32)
+        .filter(|&k| !read_vec(&opened, &sr_key(k)).is_empty())
+        .count();
+    assert!(
+        a_missing == 0 || run_kept == 0,
+        "a power cut after a sync whose log sync failed kept {run_kept} of the run's 300 \
+         keys and lost {a_missing} of the 200 committed to the log before them"
+    );
+    drop(opened);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// A `sync` with nothing of the open run unsynced syncs nothing of it:
+/// under `Always` every commit synced the run, and under `EveryN` a due
+/// commit did. The run's fdatasync is armed to fail, and the `sync` that
+/// owes nothing answers `Ok` with the failure still armed, which the
+/// run's next commit then meets.
+#[test]
+fn a_sync_with_nothing_of_the_run_unsynced_syncs_nothing_of_it() {
+    for (pol, sync, commits) in [
+        ("always", SyncPolicy::Always, 1u32),
+        ("every5-due", SyncPolicy::EveryN(5), 5),
+    ] {
+        let d = dir(&format!("dur-srnothing-{pol}"));
+        let mut db = Db::create(&d, sr_opts(sync, Options::default())).unwrap();
+        sr_commits(&mut db, 0, commits * 100, 100);
+        let synced = db.run_synced_bytes().expect("the run is open");
+        db.fail_next_run_sync();
+        db.sync()
+            .unwrap_or_else(|e| panic!("{pol}: a sync that owes the run nothing: {e}"));
+        assert_eq!(db.run_synced_bytes(), Some(synced), "{pol}: nothing synced");
+        let mut r = Ok(());
+        for c in commits..commits + 5 {
+            for k in c * 100..(c + 1) * 100 {
+                db.append(&sr_key(k), &sr_val(k));
+            }
+            r = db.commit();
+            if r.is_err() {
+                break;
+            }
+        }
+        injected(
+            r,
+            &format!("{pol}: the policy's next sync meets the armed failure"),
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A `sync` starts the policy's count over for the open run as it does
+/// for the log: under `EveryN(5)`, three commits, a `sync`, and four
+/// commits after it leave the run as the `sync` left it; the fifth after
+/// it is due.
+#[test]
+fn a_sync_starts_the_policys_count_over_for_an_open_run() {
+    let d = dir("dur-srcount");
+    let mut db = Db::create(&d, sr_opts(SyncPolicy::EveryN(5), Options::default())).unwrap();
+    sr_commits(&mut db, 0, 300, 100);
+    db.sync().unwrap();
+    let synced = db.run_synced_bytes().expect("the run is open");
+    sr_commits(&mut db, 300, 700, 100);
+    assert_eq!(
+        db.run_synced_bytes(),
+        Some(synced),
+        "four commits after a sync are not due under EveryN(5)"
+    );
+    sr_commits(&mut db, 700, 800, 100);
+    assert!(
+        db.run_synced_bytes() > Some(synced),
+        "the fifth commit after the sync is due"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A `sync` that finds only the open run owing syncs the run and nothing
+/// of the log: under `EveryN(u32::MAX)` a `sync` leaves the log owing
+/// nothing, the run's commits after it write nothing to the log, and the next
+/// `sync` writes and syncs the run with no fdatasync of a log file
+/// (`Db::trace_wal_syncs`).
+#[test]
+fn a_sync_with_only_the_run_owing_syncs_nothing_of_the_log() {
+    let d = dir("dur-srlogclean");
+    let mut db = Db::create(
+        &d,
+        sr_opts(SyncPolicy::EveryN(u32::MAX), Options::default()),
+    )
+    .unwrap();
+    sr_commits(&mut db, 0, 300, 100);
+    db.sync().unwrap();
+    db.trace_wal_syncs(true);
+    let traced = db.wal_syncs_traced().len();
+    sr_commits(&mut db, 300, 600, 100);
+    let synced = db.run_synced_bytes().expect("the run is open");
+    db.sync().unwrap();
+    assert!(
+        db.run_synced_bytes() > Some(synced),
+        "the sync synced the run's commits"
+    );
+    assert_eq!(
+        db.wal_syncs_traced().len(),
+        traced,
+        "a sync that owed the log nothing synced a log file: {:?}",
+        db.wal_syncs_traced()
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A due commit whose write of the run fails spends nothing of the
+/// policy's count: under `EveryN(3)` the third commit's sync fails at the
+/// write, and the fourth, which takes the third's batch with its own, is
+/// the policy's sync -- a power cut after it keeps all four commits,
+/// where a count started over would leave the first, second and fourth
+/// unsynced past the policy's bound.
+#[test]
+fn a_run_commit_after_a_failed_due_write_is_due() {
+    let d = dir("dur-srdue-after-fail");
+    let crash = dir("dur-srdue-after-fail-crash");
+    let opts = sr_opts(SyncPolicy::EveryN(3), Options::default());
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    sr_commits(&mut db, 0, 200, 100);
+    let ino = run_ino(&d);
+    db.fail_next_run_write();
+    for k in 200..300 {
+        db.append(&sr_key(k), &sr_val(k));
+    }
+    injected(db.commit(), "the due commit's write");
+    let synced = db.run_synced_bytes().expect("the run is open");
+    for k in 300..400 {
+        db.append(&sr_key(k), &sr_val(k));
+    }
+    db.commit()
+        .expect("the commit after the failure writes both batches");
+    let now = db.run_synced_bytes().expect("the run is open");
+    assert!(
+        now > synced,
+        "the commit after a failed due write was not the policy's sync: synced {synced} -> {now}"
+    );
+    power_cut(&db, &d, &crash, ino, now);
+    drop(db);
+    let opened = Db::open(&crash, opts).unwrap();
+    if let Some(f) = sr_missing(&opened, 400, "a power cut after the due commit") {
+        panic!("{f}");
+    }
+    drop(opened);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// A run closed under `EveryN(u32::MAX)` -- by a key below its greatest,
+/// or by `Db::seal` -- goes to a seal with its commits unsynced; what
+/// makes them durable is that seal's landing, which a `flush` waits for.
+/// Cut to what the device was told to keep after the flush's `Ok`, every
+/// commit before it reads back. (A `sync` in that window does not cover
+/// the closed run: `SyncPolicy`, and `ROADMAP.md`.)
+#[test]
+fn a_flush_after_a_run_closed_into_a_seal_makes_the_runs_commits_durable() {
+    for (closed, how) in [(false, "lower-key"), (true, "seal")] {
+        let d = dir(&format!("dur-srclosedflush-{how}"));
+        let crash = dir(&format!("dur-srclosedflush-{how}-crash"));
+        let opts = sr_opts(SyncPolicy::EveryN(u32::MAX), Options::default());
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        sr_commits(&mut db, 0, 300, 100);
+        if closed {
+            db.seal().unwrap();
+        } else {
+            db.append(b"a-lower", b"below the run");
+            db.commit().unwrap();
+        }
+        assert!(db.run_synced_bytes().is_none(), "{how}: the run closed");
+        db.flush().unwrap();
+        let (log, log_synced, _) = db.wal_durable();
+        copy_store(&d, &crash);
+        if let Some(name) = log.file_name() {
+            if let Ok(f) = std::fs::OpenOptions::new()
+                .write(true)
+                .open(crash.join(name))
+            {
+                f.set_len(log_synced).unwrap();
+            }
+        }
+        drop(db);
+        let opened = Db::open(&crash, opts).unwrap();
+        if let Some(m) = sr_missing(&opened, 300, &format!("{how}: a power cut after the flush")) {
+            panic!("{m}");
+        }
+        if !closed {
+            assert_eq!(
+                read_vec(&opened, b"a-lower"),
+                vec![b"below the run".to_vec()],
+                "{how}: the lower key's commit"
+            );
+        }
+        drop(opened);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&crash);
+    }
+}
+
+/// Under a cipher a run's commits are frames of the log (`Db::log_run`),
+/// so a run closed into a seal in flight leaves them where a `sync`
+/// covers them: with the seal held, a `sync` answered `Ok`, and a power
+/// cut -- the memory files gone, the log cut to what its syncs covered --
+/// every commit before the sync reads back, under both policies.
+#[test]
+fn a_sync_after_a_run_closed_into_a_seal_covers_its_logged_commits_under_a_cipher() {
+    let mut failures = Vec::new();
+    for (pol, sync) in SR_POLICIES {
+        for (closed, how) in [(false, "lower-key"), (true, "seal")] {
+            let tag = format!("{pol}-{how}");
+            let d = dir(&format!("dur-srclosedcipher-{tag}"));
+            let crash = dir(&format!("dur-srclosedcipher-{tag}-crash"));
+            let opts = sr_opts(sync, under_cipher());
+            let mut db = Db::create(&d, opts.clone()).unwrap();
+            sr_commits(&mut db, 0, 300, 100);
+            db.hold_seal_landing(true);
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if closed {
+                    db.seal().unwrap();
+                } else {
+                    db.append(b"a-lower", b"below the run");
+                    db.commit().unwrap();
+                }
+                assert!(db.run_synced_bytes().is_none(), "{tag}: the run closed");
+                assert!(db.in_flight().0, "{tag}: its seal is held in flight");
+                db.sync().unwrap();
+                let (log, log_synced, _) = db.wal_durable();
+                copy_store(&d, &crash);
+                let name = log.file_name().expect("the log's file name");
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(crash.join(name))
+                    .unwrap()
+                    .set_len(log_synced)
+                    .unwrap();
+            }));
+            db.hold_seal_landing(false);
+            if let Err(p) = caught {
+                std::panic::resume_unwind(p);
+            }
+            drop(db);
+            let opened = Db::open(&crash, opts).unwrap();
+            failures.extend(sr_missing(
+                &opened,
+                300,
+                &format!("{tag}: a power cut after the sync"),
+            ));
+            if !closed && read_vec(&opened, b"a-lower").is_empty() {
+                failures.push(format!("{tag}: the lower key's commit lost"));
+            }
+            drop(opened);
+            let _ = std::fs::remove_dir_all(&d);
+            let _ = std::fs::remove_dir_all(&crash);
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The helper thread behind the run's writer syncs the run's pieces as
+/// they reach the file, and its fdatasync fails before the `sync`: a
+/// `sync` over the run answers the helper's failure, since the writer's
+/// own fdatasync on the same open file description reports nothing, and
+/// the store keeps it.
+#[test]
+fn a_sync_over_a_run_whose_helper_sync_failed_answers_it_and_keeps_it() {
+    let d = dir("dur-srhelper");
+    let failed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let opts = Options {
+        segment: SegmentOptions {
+            write_piece: 4096,
+            sync_ahead: 16384,
+            fail_helper_syncs: Some(failed.clone()),
+            ..Default::default()
+        },
+        ..sr_opts(SyncPolicy::EveryN(u32::MAX), Options::default())
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    sr_commits(&mut db, 0, 3000, 1000);
+    wait_count(&failed, 1, "the run's helper never took its turn at a sync");
+    assert!(db.run_synced_bytes().is_some(), "the run is open");
+    assert!(
+        db.sync().is_err(),
+        "a sync over the run, after its records failed their helper's sync, is not answered Ok"
+    );
+    kept(db.commit(), "a commit of nothing after");
+    kept(db.sync(), "a sync after");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A run's commits count toward the policy's `n` across the run's close:
+/// under `EveryN(5)`, three commits of a run, the run closed -- by a key
+/// below its greatest, committed to the log, or by `Db::seal` and a
+/// commit below it -- and the fifth commit is the policy's sync of the
+/// log.
+#[test]
+fn a_runs_commits_count_toward_the_policys_sync_after_it_closes() {
+    for (seal, how) in [(false, "lower-key"), (true, "seal")] {
+        let d = dir(&format!("dur-srclosedcount-{how}"));
+        let mut db = Db::create(&d, sr_opts(SyncPolicy::EveryN(5), Options::default())).unwrap();
+        sr_commits(&mut db, 0, 300, 100);
+        if seal {
+            db.seal().unwrap();
+        }
+        db.append(b"a-lower-1", b"below the run");
+        db.commit().unwrap();
+        assert!(db.run_synced_bytes().is_none(), "{how}: the run closed");
+        let (_, synced, written) = db.wal_durable();
+        assert!(synced < written, "{how}: the fourth commit is not due");
+        db.append(b"a-lower-2", b"below the run");
+        db.commit().unwrap();
+        let (_, synced, written) = db.wal_durable();
+        assert_eq!(
+            synced, written,
+            "{how}: the fifth commit is the policy's sync"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A run whose commits end on a write piece's boundary: every byte of
+/// them on the file and nothing held by the writer, and none of it synced
+/// under `EveryN(u32::MAX)`. A `sync` syncs the file all the same, so a
+/// power cut after its `Ok` keeps every commit. Each commit is one record,
+/// and the last one's value is sized to end the stream on the boundary.
+#[test]
+fn a_sync_syncs_a_run_whose_commits_end_on_a_piece_boundary() {
+    const PIECE: u64 = 1 << 20;
+    let mut failures = Vec::new();
+    for (arm, base) in run_arms() {
+        let d = dir(&format!("dur-srpiece-{arm}"));
+        let crash = dir(&format!("dur-srpiece-{arm}-crash"));
+        let opts = sr_opts(SyncPolicy::EveryN(u32::MAX), base);
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        let end = |db: &Db| {
+            let (w, h) = db.run_written_and_held().expect("the run is open");
+            w + h
+        };
+        let mut k = 0u32;
+        let mut prev = 0u64;
+        let last = loop {
+            assert!(k < 20_000, "{arm}: the stream never came near a boundary");
+            let now = if k == 0 { 0 } else { end(&db) };
+            // What one commit of one key and a value of a hundred bytes
+            // adds to the stream, read off the last such commit.
+            let step = now - prev;
+            let left = (now / PIECE + 1) * PIECE - now;
+            if k > 2 && left + 90 >= step && left <= step + 20 {
+                let len = (100 + left - step) as usize;
+                let mut last = format!("v{k:06}-").into_bytes();
+                last.resize(len, b'b');
+                db.append(&sr_key(k), &last);
+                db.commit().unwrap();
+                k += 1;
+                break last;
+            }
+            prev = now;
+            sr_commits(&mut db, k, k + 1, 1);
+            k += 1;
+        };
+        let (written, held) = db.run_written_and_held().expect("the run is open");
+        let synced = db.run_synced_bytes().expect("the run is open");
+        assert!(
+            held == 0 && written % PIECE == 0 && synced < written,
+            "{arm}: the commits end on a piece boundary, all of it on the file and none of it \
+             synced: written {written}, held {held}, synced {synced}"
+        );
+        db.sync().unwrap();
+        let synced = db.run_synced_bytes().expect("the run is open");
+        power_cut(&db, &d, &crash, run_ino(&d), synced);
+        drop(db);
+        let opened = Db::open(&crash, opts).unwrap();
+        failures.extend(sr_missing(
+            &opened,
+            k - 1,
+            &format!("{arm}: a power cut after the sync"),
+        ));
+        if read_vec(&opened, &sr_key(k - 1)) != vec![last] {
+            failures.push(format!("{arm}: the last commit's key did not read back"));
+        }
+        drop(opened);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&crash);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The directory barrier a loose rotation owes the new log file's name is
+/// paid by a `sync` with a run open, as with a hashed table live: a log
+/// rotated loose under `EveryN(u32::MAX)`, its table sealed, a run opened
+/// above it, and the `sync` meets the directory's fsync, armed to fail,
+/// and keeps the failure.
+#[test]
+fn a_sync_with_a_run_open_pays_the_log_directorys_barrier() {
+    let (d, mut db) = rotated_loose("srdir");
+    db.seal().unwrap();
+    sr_commits(&mut db, 0, 300, 100);
+    assert!(
+        db.run_synced_bytes().is_some(),
+        "a run opened above the sealed table"
+    );
+    db.fail_next_wal_dir_sync();
+    match db.sync() {
+        Ok(()) => panic!("a sync with a run open answered Ok over the directory's barrier"),
+        Err(e) => assert!(
+            e.to_string().contains("injected"),
+            "the sync answered with an error that is not the barrier's: {e}"
+        ),
+    }
+    kept(db.sync(), "the sync after");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
