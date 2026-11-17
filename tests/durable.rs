@@ -9222,6 +9222,89 @@ fn a_fallback_onto_a_slot_naming_files_gone_is_refused_under_a_cipher() {
     a_fallback_onto_a_slot_naming_files_gone("cipher", under_cipher());
 }
 
+/// The newest slot whole and the slot before it whole too, no fall back at
+/// all, and a segment the newest names removed from the directory: damage
+/// from outside the engine, which removes nothing a durable slot names.
+/// The open refuses by the missing name and removes nothing, and the store
+/// whose file is put back opens whole.
+#[test]
+fn an_open_whose_newest_slot_names_a_file_gone_refuses_and_leaves_every_file() {
+    let d = dir("oo-gone-newest");
+    let opts = oo_slot_opts(Options::default());
+    let model = oo_populated(&d, &opts, 5_000);
+    let [newest, older] = oo_by_age(&d);
+    let names = oo_names(&std::fs::read(&newest).unwrap()).1;
+    assert!(
+        oo_seq(&std::fs::read(&older).unwrap()).is_some(),
+        "premise: the slot before the newest reads too"
+    );
+    let gone = names
+        .iter()
+        .map(|(n, _)| n.clone())
+        .find(|n| n.starts_with("pcs-"))
+        .expect("premise: the newest slot names a piece");
+    let saved = std::fs::read(d.join(&gone)).unwrap();
+    std::fs::remove_file(d.join(&gone)).unwrap();
+    oo_refused(&d, &opts, OO_GONE, "newest");
+    std::fs::write(d.join(&gone), &saved).unwrap();
+    let db = Db::open(&d, opts).expect("the store with its file put back opens");
+    oo_holds(&db, &model, "newest, repaired");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Under a cipher and `Options::manifest_pending`, a store killed with a
+/// seal held between its pending slot and its durable landing: the copy
+/// opens, takes the pending name (its envelope was written and synced
+/// before the slot that names it), writes the slot naming it durable, and
+/// opens again with every acknowledged write.
+#[test]
+fn an_open_under_a_cipher_adopts_a_pending_segment_and_opens_again() {
+    let d = dir("oo-pend-cipher");
+    let c = dir("oo-pend-cipher-kill");
+    let opts = Options {
+        manifest_pending: true,
+        direct_ingest: false,
+        seal_bytes: 1 << 20,
+        l0_trigger: 1000,
+        ..under_cipher()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    for k in (0..3000u32).rev() {
+        db.put(key(k).as_bytes(), b"v");
+        model.insert(key(k).into_bytes(), vec![b"v".to_vec()]);
+    }
+    db.commit().unwrap();
+    let seq = |d: &Path| {
+        OO_SLOTS
+            .iter()
+            .filter_map(|s| std::fs::read(d.join(s)).ok().and_then(|b| oo_seq(&b)))
+            .max()
+            .unwrap_or(0)
+    };
+    let at = seq(&d);
+    db.hold_seal_durable(true);
+    db.seal().unwrap();
+    wait_for("the seal's pending slot", || seq(&d) > at);
+    copy_store(&d, &c);
+    db.hold_seal_durable(false);
+    drop(db);
+    let copied = seq(&c);
+    let db = Db::open(&c, opts.clone()).expect("the crash copy opens");
+    oo_holds(&db, &model, "cipher pending: after the kill");
+    assert!(
+        seq(&c) > copied,
+        "premise: the open wrote a slot over the pending one it took"
+    );
+    drop(db);
+    let db = Db::open(&c, opts).expect("the store the open wrote opens again");
+    oo_holds(&db, &model, "cipher pending: reopened");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&c);
+}
+
 /// The windows a fall back has to open through, each staged as a crash
 /// leaves it -- the store's files copied with a job held at its landing --
 /// and then the publish after it torn: a seal's segments renamed into
