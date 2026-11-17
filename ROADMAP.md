@@ -276,26 +276,41 @@ What an engine picker would hit, roughly in order.
   drops or tears the writes after a chosen point inside a drain with its
   slot owed and a merge publishing behind it, and the store opens to
   every acknowledged write.
-- [ ] **A fall back past a damaged slot under a cipher.** An open that
-  passes over a slot which failed its check holds every segment the slot
-  before it does not name to what holds its writes, and refuses where
-  nothing does (`Db::fallback_refusals`); under a cipher such a segment
-  is an envelope whose key was in the slot that failed, so it cannot be
-  read, and the open sweeps it as the crash window's. A crash passes over
-  only a slot that never became durable, so this is media damage alone,
+- [ ] **A fall back past a damaged slot under a cipher.** An open holds
+  a segment the slot it takes does not name to what holds its writes,
+  and refuses where nothing does (`Db::unnamed_refusals`); under a
+  cipher such a segment is an envelope whose key was in a slot that
+  failed its check, so it cannot be read, and the open sweeps it as the
+  crash window's. A crash passes over only a slot that never became
+  durable, so this is media damage alone,
   and the open answers `Ok` with the writes only the damaged slot named
   missing. Done when a slot under a cipher carries what an open needs to
   judge such an envelope without its key, or the open keeps the
   envelopes no slot it read names until a slot is written over the
   damaged one.
+- [ ] **A fall back past a damaged slot whose log retired.** A slot
+  that names a seal's segment durable retires the log files that held
+  its writes; with that slot damaged, the open falls back to the slot
+  before, sweeps the segment, replays a log that no longer holds them,
+  and answers the writes' older values. A buffered store whose publish
+  of that landing was torn by a power cut leaves the same files -- the
+  segment synced, the log's frames for it never synced and cut -- and
+  must open, so the files cannot tell the two apart and the open sweeps
+  in both (`Db::unnamed_refusals`). Media damage alone. Done when a slot
+  names the log file its covered sequence lies in, so that an open can
+  see a log file the slot before needs and the directory lacks; the
+  reproduction is `a_fallback_past_a_slot_whose_log_retired_is_refused`
+  in stage 0's open-order notes, which fails today.
 - [ ] **A fall back held by a segment's first and last keys.** In the
   clear the same check reads an unnamed segment newer than every segment
-  the slot taken names by its first and last keys, and sweeps it where
-  each is held by that slot's segments, a run's temp name or the replayed
-  log, as a merge's outputs are by their inputs. A run whose records
+  the slot taken names, and within what it covers, by its first and last
+  keys, and sweeps it where each is held by that slot's segments, a run's
+  temp name or the replayed log, as a merge's outputs are by their
+  inputs. A run whose records
   begin and end at keys a later write put in the log, or whose id was
-  drawn before a merge the older slot names, passes. Damage only, as
-  above. Done when the segment says in its own bytes whether it is a
+  drawn before a merge the older slot names, or that closed after a
+  commit the log holds past what the older slot covers, passes. Damage
+  only, as above. Done when the segment says in its own bytes whether it is a
   merge's output, or the check reads every key where the first two pass.
 - [ ] **A run's due commit beside log frames no sync covered.** Under
   `EveryN` a run's commit that is due syncs the run's file and not the

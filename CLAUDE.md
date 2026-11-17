@@ -2121,15 +2121,19 @@ a temp name, renamed it over the old manifest and fsynced the directory,
 envelope, a log file, a spare -- and writes no slot until the slot it
 takes is checked against the directory, and refuses with every file as
 it found it where that slot cannot be the store
-(`Db::open_refusals`, `Db::fallback_refusals`): a name it lists that is
+(`Db::open_refusals`, `Db::unnamed_refusals`): a name it lists that is
 not there; no slot readable beside `par-` or `pcs-` files, or under a
-cipher beside envelopes, which only a store with a manifest writes; and,
-where it passed over a newer slot, a segment it does not name that reads
-back whole and holds writes the log no longer replays, or keys that
+cipher beside envelopes, which only a store with a manifest writes; and
+a segment it does not name, newer than every segment it names and
+within what it covers -- a merge's output or a run's -- that holds keys
 nothing it names, no run's temp name and no replayed frame holds. A
-crash passes over only a slot that never became durable, so nothing was
-retired behind it and every window opens as before; damage passes over
-one whose log files and temp names may be gone. A seal that fails at any step -- its
+crash leaves an unnamed segment only from a job whose publish never
+became durable, so nothing was retired behind it and every window opens
+as before; damage that makes the open pass over a durable slot leaves
+one whose log files and temp names may be gone, and a seal's segment
+past what the slot covers is swept as the window's even then, since
+under a buffered policy a torn publish of its landing leaves the same
+files as damage past a log that retired. A seal that fails at any step -- its
 landing, its directory's fsync there, the fsync or the envelope of its
 data before its readable landing or after it, a closing run's presync --
 stops the seal queue for the life of the open (`Shared::seal_wedged`): no
@@ -2449,13 +2453,22 @@ kept for stores from before manifests, which takes `seg-` names alone,
 and removed every partition. Every test of the slots tore a publish
 still in flight, whose log still held its writes. The open removes and
 writes nothing now until the slot it takes is checked against the
-directory, and a fall back past a newer slot is held to what retired
-behind it: a segment the slot before does not name is swept only where
-the log replays its writes, a run's temp name holds them, or its keys
-are the slot's own. The rule: a step that removes what a decision rules
-out runs after the decision is made and checked, never as part of
-making it; a fall back is held to the evidence of what the thing it
-passed over had retired; and a refusal is tested by its own words,
+directory, and a segment the slot does not name is held to what
+retired behind it: a run's segment, or a merge's, is swept only where a
+run's temp name, the replayed log or the slot's own segments hold its
+keys. The first version held a seal's
+segment past what the slot covers to the log replaying it as well, and
+a buffered store's torn publish leaves exactly that -- the segment
+synced, the log's frames for it cut by the power cut -- which the open
+must sweep; told apart from damage past a retired log by nothing in the
+files, it is a gap and not a check. And the check ran only where the
+open had passed over a slot, until a mutant that ran it at every open
+survived every test: every state a crash leaves passes it, so the gate
+was a second condition nothing could reach. The rule: a step that removes what
+a decision rules out runs after the decision is made and checked, never
+as part of making it; what it removes is held to the evidence of what
+retired behind it, and only where every crash state leaves different
+evidence; and a refusal is tested by its own words,
 since a refusal further in, after the damage is done, carries others.
 
 **A slot chosen by its sequence, beside a sync left owed.** The
