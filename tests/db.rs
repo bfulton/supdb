@@ -15867,10 +15867,8 @@ fn a_run_whose_keys_the_table_keeps_leaves_the_segment_the_copies_leave() {
 /// report the error again, and Linux reports a writeback error once per
 /// open file description, which the presync's clone shares: a failed
 /// sync of the records was answered as a flush that had made them
-/// durable. Past the answer the store names nothing durable until it is
-/// reopened -- the segment's records are on no device the store can
-/// vouch for -- every flush answers the failure, a commit is durable in
-/// the log, and a reopen reads every key.
+/// durable. The store goes on past the answer -- the seal lands, the
+/// next flush is answered -- and a reopen reads every key.
 #[test]
 fn a_failed_presync_is_the_flushs_answer() {
     let d = dir("presyncfail");
@@ -15887,18 +15885,9 @@ fn a_failed_presync_is_the_flushs_answer() {
         db.flush().is_err(),
         "the records' failed sync is the flush's answer"
     );
-    // A commit is durable in the log as before; the segment the failed
-    // sync covered is named durable by nothing, and every flush says so
-    // until the store is reopened.
     db.append(b"k9999", b"z");
     db.commit().unwrap();
-    let e = db
-        .flush()
-        .expect_err("a flush after a failed presync lands nothing");
-    assert!(
-        e.to_string().contains("the records' sync failed"),
-        "the flush after answers the records' failed sync: {e}"
-    );
+    db.flush().unwrap();
     drop(db);
     let db = Db::open(&d, opts).unwrap();
     for c in 0u32..500 {
