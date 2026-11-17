@@ -28700,11 +28700,15 @@ impl Db {
     /// where that slot cannot be the store: a segment it names is not in
     /// the directory; no slot can be read beside `par-` or `pcs-` files,
     /// or under a cipher beside segments' envelopes, which only a store
-    /// with a manifest writes; or a segment the slot does not name, newer
-    /// than every segment it names and within what it covers, has a last
-    /// key that no segment the slot names and no run's temp name holds --
-    /// which a crash never leaves, and damage that passes over a newer
-    /// slot can. Only that one key of such a segment is read. A
+    /// with a manifest writes; or, in the clear, a segment the slot does
+    /// not name, newer than every segment it names and within what it
+    /// covers, has a last key that no segment the slot names and no run's
+    /// temp name holds -- which a crash never leaves, and damage that
+    /// passes over a newer slot can. Only that one key of such a segment
+    /// is read. Under a cipher such a segment's envelope has its key in no
+    /// slot the open can read: it is swept, and an open that passes over a
+    /// damaged slot and is not refused answers without the writes only
+    /// that slot named. A
     /// store with no slot and only `seg-` files is one from before
     /// manifests and opens from their names. Under
     /// `Options::manifest_pending` a pending segment the open reads back
@@ -28994,13 +28998,12 @@ impl Db {
                         files.extend(Db::ord_name_for(name));
                     }
                     for f in files {
-                        let file = vault::open(dir.join(&f))?;
                         if opts.fail_open_pending_sync {
                             return Err(err(&format!(
                                 "a test failed the open's fsync of the pending {f}"
                             )));
                         }
-                        file.sync_all()?;
+                        vault::sync_file(dir.join(&f))?;
                         open_synced.push(f);
                     }
                 }
@@ -33040,8 +33043,10 @@ impl Db {
             .store(true, AtomicOrdering::Release);
     }
 
-    /// A test's: from `on`, record every directory fsync that returned and
-    /// every open of a manifest slot for writing, process-wide and in the
+    /// A test's: from `on`, record every directory fsync that returned,
+    /// every fsync the open makes of a pending segment or its ordered index
+    /// that returned (`sync_file`), and every open of a manifest slot for
+    /// writing, process-wide and in the
     /// order they were made, each with its path; off, record nothing. The
     /// record so far, which a test reads for its own directory: what an
     /// open made durable before the slot it writes, read from the calls

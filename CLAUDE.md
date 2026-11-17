@@ -2123,11 +2123,14 @@ takes is checked against the directory, and refuses with every file as
 it found it where that slot cannot be the store
 (`Db::open_refusals`, `Db::unnamed_refusals`): a name it lists that is
 not there; no slot readable beside `par-` or `pcs-` files, or under a
-cipher beside envelopes, which only a store with a manifest writes; and
-a segment it does not name, newer than every segment it names and
-within what it covers -- a merge's output or a run's -- whose last key
-nothing it names and no run's temp name holds, read by that key alone
-(`ROADMAP.md`). A
+cipher beside envelopes, which only a store with a manifest writes; and,
+in the clear, a segment it does not name, newer than every segment it
+names and within what it covers -- a merge's output or a run's -- whose
+last key nothing it names and no run's temp name holds, read by that key
+alone. Under a cipher an envelope the slot taken does not name has its
+key in no slot the open can read, so it is not held to anything: the
+open sweeps it, and a fall back past a damaged slot that is not refused
+answers without the writes only that slot named (`ROADMAP.md`, both). A
 crash leaves an unnamed segment only from a job whose publish never
 became durable, so nothing was retired behind it and every window opens
 as before; damage that makes the open pass over a durable slot leaves
@@ -2443,10 +2446,19 @@ open's record of what it had fsynced and tore what the record lacked,
 and the record said nothing of where the slot's write fell among the
 fsyncs, so an open that synced the directory, or every file after the
 first, after the slot passed them all; the slot's write is in the same
-record now, and the test holds each fsync to a place before it. The
-corollary: an order is tested by one record that holds both of its
-ends, since a record of each end apart holds that each happened and not
-which came first.
+record now, and the test holds each fsync to a place before it. A record
+the open keeps is the open's word, and an open that skipped the
+directory's fsync and kept the word passed that too: the directory's
+fsync is read off the calls themselves (`Db::trace_dir_io`). Each file's
+was read off the kernel's page flags, which only root may read, so an
+open that skipped a file's fsync and kept the word passed every run
+without the privilege, the gate's among them; each file's fsync goes
+through a call that records it once it returns (`vault::sync_file`),
+and the page flags are a second word where they can be had. The
+corollary: an order is tested by one
+record that holds both of its ends, since a record of each end apart
+holds that each happened and not which came first; and the record is
+made by the call, never beside it by the code under test.
 
 **A sweep made before the choice it was for.** The open listed the
 segments, removed every one its chosen slot did not name, and only

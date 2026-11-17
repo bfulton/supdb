@@ -2136,8 +2136,21 @@ pub(crate) fn sync_dir(dir: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
-/// A test's: whether directory fsyncs and slot opens are recorded
-/// (`trace_io`), read beside the syscall each makes.
+/// A file's bytes made durable: an fsync of the file, opened for it. The
+/// open's, for a pending segment it adopts and that segment's ordered
+/// index, before the slot that names them durable.
+pub(crate) fn sync_file(path: impl AsRef<Path>) -> Result<()> {
+    let path = path.as_ref();
+    open(path)?.sync_all()?;
+    if IO_TRACE_ON.load(Ordering::Relaxed) {
+        io_trace("sync_file", path);
+    }
+    Ok(())
+}
+
+/// A test's: whether directory fsyncs, the open's file fsyncs
+/// (`sync_file`) and slot opens are recorded (`trace_io`), read beside the
+/// syscall each makes.
 static IO_TRACE_ON: AtomicBool = AtomicBool::new(false);
 
 /// A test's: what `trace_io` recorded, in order, process-wide.
@@ -2150,8 +2163,9 @@ fn io_trace(what: &'static str, path: &Path) {
         .push((what, path.to_path_buf()));
 }
 
-/// A test's: from `on`, record every directory fsync that returned and
-/// every open of a manifest slot for writing, in the order they were
+/// A test's: from `on`, record every directory fsync that returned, every
+/// file fsync through `sync_file` that returned and every open of a
+/// manifest slot for writing, in the order they were
 /// made, process-wide; off, record nothing. The record so far.
 pub(crate) fn trace_io(on: bool) -> Vec<(&'static str, PathBuf)> {
     IO_TRACE_ON.store(on, Ordering::Relaxed);
