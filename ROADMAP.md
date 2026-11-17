@@ -234,11 +234,16 @@ What an engine picker would hit, roughly in order.
   needs a device that fails writeback (dm-flakey) to be tested at all.
 - [ ] **A seal's failed sync held on a device that makes it, and a
   store that goes on past it.** A seal that fails at any step stops the
-  seal queue for the life of the open: no manifest is written, every
-  `flush` answers the failure, and the open replays the log
+  seal queue for the life of the open: the segment work writes no
+  manifest from its first look after the failure, every `flush` and
+  `settle` answers it, and the open replays the log
   (`Shared::seal_wedged`). A `sync` answers nothing of it, since what it
-  promises is in the log; a caller that syncs and never flushes learns of
-  it from the one commit that answers the segment work's error. Every `sync` answering it, with commits
+  promises is in the log, until a write is dropped for want of room in
+  the frozen tables -- a write that ends an ordered run, or the first
+  write after a `sync` handed the live table to a seal -- after which
+  every commit, `sync` and `flush` answers it; a caller that syncs and
+  never flushes otherwise learns of it from the one commit that answers
+  the segment work's error. Every `sync` answering it, with commits
   still `Ok`, is a writer-side kept answer set where the writer first
   learns of the failure and returned by the check `sync` makes of a kept
   error already: a contract to choose before it is built. The tests inject each failure through seams
@@ -247,13 +252,16 @@ What an engine picker would hit, roughly in order.
   on. Done when a dm-flakey or dm-error target fails a seal's fsync after
   its readable landing and the store names nothing of it and reopens to
   every acknowledged write. Beyond that, a store that stops sealing holds
-  every later table in memory until the frozen list is full and is of use
+  every later table in memory -- until the frozen list is full where the
+  segment work has a thread of its own, and in one live table that every
+  commit at the threshold answers the failure over where it is inline --
+  and is of use
   only to be reopened; the shape that goes on writes the failed seal's
   table again into a new file under a new name, never fsyncing the old
   inode again, and lands it as any seal -- to be built with its own crash
-  tests if a store that must not be reopened ever asks for it. Merges and
-  promotions still start while the queue is stopped, and their outputs are
-  files no slot names, swept at the open.
+  tests if a store that must not be reopened ever asks for it. A merge in
+  flight at the failure finishes and is held, and its outputs are files no
+  slot names, swept at the open.
 - [ ] **A run's due commit beside log frames no sync covered.** Under
   `EveryN` a run's commit that is due syncs the run's file and not the
   log, and a run opens over a log that may hold the frames of a table

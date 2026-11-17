@@ -2117,12 +2117,21 @@ a temp name, renamed it over the old manifest and fsynced the directory,
 landing, its directory's fsync there, the fsync or the envelope of its
 data before its readable landing or after it, a closing run's presync --
 stops the seal queue for the life of the open (`Shared::seal_wedged`): no
-seal lands and no manifest is written, so nothing names its segments
-durable, covers its sequence or retires the log that holds its writes,
-and the fsync is never tried again; readers go on reading what was
-published, every `flush` answers the failure until the store is
-reopened, a `sync` answers nothing of it since what it promises is in
-the log, and the open replays the log and sweeps what no slot names.
+seal lands and the segment work writes no manifest from its first look
+at the queue after the failure, the writer's presync's included
+(`Maint::seals_stopped`), so nothing names its segments durable, covers
+its sequence or retires the log that holds its writes, and the fsync is
+never tried again; readers go on reading what was published, every
+`flush` and `settle` answers the failure until the store is reopened,
+and so does every call that has to land a seal for room -- with the
+segment work inline every `seal` and every commit at the threshold, the
+commit's batch in the log first -- a `sync` answers nothing of it since
+what it promises is in the log, until a write is dropped for want of
+room behind the stopped queue -- a write that ends an ordered run, or the
+first write after a `sync` handed the live table to a seal, each of
+which freezes a table -- and from that write on every commit, `sync` and
+`flush` answers it; and the open replays the log and sweeps what no slot
+names.
 Under `manifest_pending` the slot the seal's readable landing wrote
 before the failure stays, naming the segments pending and covering their
 sequence, and the open's rule for a pending name is what reads it. A
@@ -3153,7 +3162,14 @@ as its siblings that count what a commit filed already did. The rule is the
 one above, applied to two more states a test cannot see it needs: the
 second a store was finished in, and which side of a hand-off a counter is
 read from. A flake whose trigger is a phase is reproduced by choosing the
-phase, not by repeating the run.
+phase, not by repeating the run. It came again as two signals of one
+failure: the segment work stops the seal queue and then, its look done,
+leaves the failure for the writer's next commit, and tests that waited for
+the stop's flag (or for the seal counted out) and then committed a batch
+read the commit's answer as the failure's -- in about one run of three
+of a mutant pass once the stop moved ahead of the count. A test that
+waits on one signal and reads another waits for the one it reads: here a
+commit with nothing staged, until one answers.
 
 **A mark taken whole and then read in part.** A commit publishes the
 log's length, the entry count and the watermark as one mark, and a
@@ -3568,13 +3584,26 @@ asserts the window shut. The first repair put a refusal in
 `Maint::publish` itself, a load beside every manifest's write, and a
 load in every `sync`; the window was a check every manifest path made
 already, and a `sync` promises nothing of a seal's writes. Every `flush`
-answers the failure. The rule: a failure that leaves a thing published
+answers the failure. The window was then held for a stop the segment
+work raised itself, and a stop the writer raised -- its run's presync,
+failed after the job was handed -- was held only by the job waiting at
+the front, landed, for the writer's word: a presync that failed before
+the job's readable landing left it unlanded for good, and a merge in
+flight landed its slot after the store had answered the failure, naming
+nothing of the job but writing the manifest the docs said nobody would.
+The review read it off the docs; a test with the job held before its
+finish and a merge at its landing hold made it. The segment work takes
+the stop into its own hold where it already loads the flag, at its look
+at the queue, which every path of it to a manifest makes first. The
+rule: a failure that leaves a thing published
 and not durable is a state, not an error to report and pass: it is held
 where the paths that would make the thing durable already wait for it
 to be durable, and a path that bypasses that wait is the bug; and a test
 of a failure path fails every step of it, the ones after the publish
 above all, since those are the steps a publish has already made look
-done.
+done; and a stop either side can raise is held by the flag both sides
+read, never by the shape of whatever job happened to be at the front
+when one of them raised it.
 
 **A refusal that came after the take.** A direct run's close took the
 run from the writer and then waited for room in the frozen list, and a
@@ -3592,8 +3621,11 @@ segment work had left for the next commit is one the wait meets while
 the list is full behind seals that will land: backpressure read as a
 stopped queue, a write dropped and the store answering every call
 until it was reopened. The write is dropped only where room will not
-come -- the queue stopped, or no seal left to land -- and otherwise the
-error is the next commit's and the wait goes on. The write after a
+come -- the queue stopped -- and otherwise the error is the next
+commit's and the wait goes on. A second arm, no seal left in flight to
+land, was in the condition for a while and no test could reach it once a
+failed seal stopped the queue before it was counted out, since a frozen
+table is always a seal in flight or a stopped queue's; it was taken out. The write after a
 `sync` handed the live table to a seal had the same shape from before:
 the table's replacement failed, the write was dropped and the next commit
 answered it once, and the commits after that answered `Ok` over it; it is

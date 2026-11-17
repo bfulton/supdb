@@ -5625,6 +5625,26 @@ fn ss_wedged(r: std::io::Result<()>, cause: &str, what: &str) {
     }
 }
 
+/// The commit that answers a failure the segment work met on its own:
+/// commits with nothing staged until one answers it, since the work stops
+/// the queue before it leaves its error for the writer (`seals_wedged`
+/// reads true a moment before a commit can answer).
+fn ss_commit_answer(db: &mut Db) -> std::io::Error {
+    let t = std::time::Instant::now();
+    loop {
+        match db.commit() {
+            Err(e) => return e,
+            Ok(()) => {
+                assert!(
+                    t.elapsed() < std::time::Duration::from_secs(120),
+                    "no commit answered the segment work's failure"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+}
+
 /// A store of one partition over 400,000 keys and two pieces over keys it
 /// holds, so that the second piece's durable landing starts a merge of the
 /// range, as `tests/db.rs`'s held-landing tests build it. `before_second`
@@ -5800,7 +5820,10 @@ fn a_seal_whose_data_fsync_failed_after_its_publish_is_named_by_no_manifest() {
     ss_merge_landed_or_held(&db);
     ss_check(&db, &model, "after the failure, before the close");
     let sync_ans = db.sync();
-    let answers = [("a flush after the failure", db.flush())];
+    let answers = [
+        ("a flush after the failure", db.flush()),
+        ("a settle after the failure", db.settle()),
+    ];
     let wedged = db.seals_wedged();
     drop(db);
     ss_named_by_no_manifest(&d, &third, "fsync");
@@ -5832,9 +5855,10 @@ fn a_seal_whose_data_fsync_failed_after_its_publish_is_named_by_no_manifest() {
 /// later seal lands a manifest naming the failed piece or covering its
 /// sequence, and no log file that held its writes is retired -- each file
 /// on disk when the failed seal was handed is there after the close.
-/// The commit after the failure answers it once; every `sync` and `flush`
-/// answers it until the store is reopened, the commits being durable in
-/// the log.
+/// The commit after the failure answers it once in the seal's own words,
+/// the commits after it answer `Ok`, durable in the log, and every `flush`
+/// answers the failure until the store is reopened, while a `sync`, which
+/// promises nothing of a seal's writes, answers nothing of it.
 #[test]
 fn a_later_seal_names_no_seal_whose_fsync_failed_and_retires_none_of_its_log() {
     let d = dir("dur-ss-later");
@@ -5871,18 +5895,16 @@ fn a_later_seal_names_no_seal_whose_fsync_failed_and_retires_none_of_its_log() {
     db.hold_seal_durable(false);
     wait_for("the failed seal's end", || !db.in_flight().0);
 
-    // The next commit answers the seal's failure; the one after it takes
+    // A commit answers the seal's failure once; the one after it takes
     // the batch, durable in the log.
+    let cause = "a test failed this seal's fsync";
+    let e = ss_commit_answer(&mut db);
+    assert!(
+        e.to_string().contains(cause),
+        "the commit after the failure answers it: {e}"
+    );
     for k in 20_000..21_000 {
         ss_put(&mut db, &mut model, &ss_key(k), &value);
-    }
-    let cause = "a test failed this seal's fsync";
-    match db.commit() {
-        Ok(()) => panic!("the commit after the seal's failure answered Ok"),
-        Err(e) => assert!(
-            e.to_string().contains(cause),
-            "the commit after the failure answers it: {e}"
-        ),
     }
     db.commit().unwrap();
     // A seal of that batch is handed and lands nothing.
@@ -6019,11 +6041,22 @@ fn ss_val(k: u32) -> Vec<u8> {
 /// every `sync` and `flush` after it answers it again, no slot names the
 /// run's segment, and a power cut that loses the pages the failed sync
 /// covered leaves a store that opens.
-fn ss_failed_presync(tag: &str, inline: bool) {
+///
+/// `both` holds the segment work's poll from the seal's readable phase
+/// (`Db::hold_readable_landing`) until the seal thread has returned, so
+/// one poll meets both phases due: a landing that took the job whole
+/// there would name it durable without the writer's word. `pending`
+/// writes the slot that names the seal's segments pending at its
+/// readable landing (`Options::manifest_pending`), and the close must not
+/// name them durable; the power cut is not taken there, the open's rule
+/// for a pending name being another unit's, and the store is reopened as
+/// the close left it.
+fn ss_failed_presync(tag: &str, inline: bool, both: bool, pending: bool) {
     let d = dir(&format!("dur-ss-presync-{tag}"));
     let opts = Options {
         sync: SyncPolicy::EveryN(1_000_000),
         close_finish_inline: inline,
+        manifest_pending: pending,
         segment: SegmentOptions {
             // The run's records go to the file at each commit, a page at a
             // time, so the presync has something on the file to cover.
@@ -6046,17 +6079,44 @@ fn ss_failed_presync(tag: &str, inline: bool) {
     } else {
         db.hold_presync(true);
     }
+    if both {
+        db.hold_readable_landing(true);
+    }
     let dd = d.clone();
     let lifter = std::thread::spawn(move || {
         let t = std::time::Instant::now();
-        while h.levels() == (0, 0) {
+        while !both && h.levels() == (0, 0) {
             assert!(
                 t.elapsed() < std::time::Duration::from_secs(20),
                 "the run's segment was never published"
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        if inline {
+        if both {
+            // The seal thread's readable signal, its fsyncs and its
+            // return given their time with the poll held, then the poll
+            // let go with the writer still held at its presync: the look
+            // that meets both phases due lands the readable one, and a
+            // landing that took the job whole there writes a slot that
+            // ends the second wait early.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            h.hold_readable_landing_from_handle(false);
+            let t = std::time::Instant::now();
+            while h.levels() == (0, 0) {
+                assert!(
+                    t.elapsed() < std::time::Duration::from_secs(20),
+                    "the run's segment was never published"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let t = std::time::Instant::now();
+            while t.elapsed() < std::time::Duration::from_secs(2)
+                && ss_newest(&dd).is_none_or(|(_, _, n)| n.is_empty())
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            h.hold_presync(false);
+        } else if inline {
             h.hold_seal_durable_from_handle(false);
         } else {
             // The seal thread's finish and fsyncs given their time, and a
@@ -6096,13 +6156,40 @@ fn ss_failed_presync(tag: &str, inline: bool) {
             "{tag}: reads go on"
         );
     }
-    let _ = db.settle();
+    let settle_ans = db.settle();
     drop(db);
-    let names = ss_names(&d);
+    let names = ss_newest(&d).expect("a manifest").2;
     assert!(
-        names.is_empty(),
-        "{tag}: a slot names the run's segment, whose records' sync failed: {names:?}"
+        names.iter().all(|(_, p)| pending && *p),
+        "{tag}: a slot names the run's segment durable, whose records' sync failed: {names:?}"
     );
+    ss_wedged(
+        settle_ans,
+        "the records' sync failed (injected)",
+        &format!("{tag}: a settle after the failure"),
+    );
+    if pending {
+        let db = Db::open(&d, opts)
+            .unwrap_or_else(|e| panic!("{tag}: the store refused to open after its close: {e}"));
+        for k in [0u32, 1499, 2999] {
+            assert_eq!(
+                read_vec(&db, &ss_key(k)),
+                vec![ss_val(k)],
+                "{tag}: reopened"
+            );
+        }
+        drop(db);
+        ss_sync_answers_nothing(sync_ans, "a sync after the failure");
+        for (what, r) in answers {
+            ss_wedged(
+                r,
+                "the records' sync failed (injected)",
+                &format!("{tag}: {what}"),
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        return;
+    }
     let cut = d.with_extension("powercut");
     // The run's records start after the head the finish patches
     // (superblock and section header, 0..8192 under `write_piece` 4096);
@@ -6127,12 +6214,20 @@ fn ss_failed_presync(tag: &str, inline: bool) {
 
 #[test]
 fn a_flush_after_a_failed_presync_is_not_ok_over_the_lost_records() {
-    ss_failed_presync("writer", false);
+    ss_failed_presync("writer", false, false, false);
+}
+
+/// The same, with the seal thread's two phases met by one poll of the
+/// segment work, and with the slot that names the seal's segments pending.
+#[test]
+fn a_flush_after_a_failed_presync_is_not_ok_whichever_way_its_seal_lands() {
+    ss_failed_presync("both", false, true, false);
+    ss_failed_presync("pending", false, false, true);
 }
 
 #[test]
 fn a_flush_after_a_failed_inline_presync_is_not_ok_over_the_lost_records() {
-    ss_failed_presync("inline", true);
+    ss_failed_presync("inline", true, false, false);
 }
 
 /// A direct run closed -- by `Db::seal`, or by a flush on either arm of
@@ -6189,10 +6284,22 @@ fn ss_run_close_fails(tag: &str, by_flush: bool, inline: bool) {
         wait_for("the failed seal's end", || !db.in_flight().0);
     }
     assert!(!db.seal_sync_fault_pending(), "{tag}: the case was reached");
-    // A write below the run's keys, through the log: the commit that takes
-    // the segment work's error answers it, the next one is acknowledged.
+    // A write below the run's keys, through the log, acknowledged: the
+    // segment work's error, left for the writer where the work met the
+    // failure on its own, answered by a commit first.
+    if !by_flush {
+        let e = ss_commit_answer(&mut db);
+        assert!(
+            e.to_string().contains(cause),
+            "{tag}: a commit answers the seal's failure: {e}"
+        );
+    }
     ss_put(&mut db, &mut model, &ss_key(7), "low");
     if db.commit().is_err() {
+        assert!(
+            by_flush,
+            "{tag}: a second commit answered the seal's failure"
+        );
         db.commit().unwrap();
     }
     let answers = [("a flush after", db.flush())];
@@ -6726,4 +6833,378 @@ fn a_write_that_ends_a_run_over_a_stopped_queue_with_room_is_taken() {
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&crash);
     }
+}
+
+/// A run's close whose presync fails on the writer while its seal has not
+/// yet been published -- the seal thread held before its finish
+/// (`Db::hold_seal_landing`) -- stops the queue on the writer's side, and
+/// the segment work holds every manifest from there as it does for a
+/// failure it met itself: the merge in flight finishes and is held, the
+/// newest slot is the one that stood at the failure, and the close writes
+/// none after it.
+#[test]
+fn a_presync_that_fails_before_its_seals_publish_stops_every_manifest() {
+    let d = dir("dur-ss-presync-early");
+    let mut model = SsModel::new();
+    let (mut db, opts) = ss_store_with_a_merge_due(&d, Options::default(), &mut model, |db| {
+        db.hold_merge_landing(true)
+    });
+    wait_for("the merge at its landing hold", || {
+        db.merge_waits_at_landing()
+    });
+    // An ordered run above every key the store holds.
+    for k in 500_000..503_000u32 {
+        ss_put(&mut db, &mut model, &ss_key(k), "run");
+        if k % 300 == 299 {
+            db.commit().unwrap();
+        }
+    }
+    assert!(db.run_synced_bytes().is_some(), "premise: a run is open");
+    let (seq, covered, names) = ss_newest(&d).expect("a manifest");
+    db.hold_seal_landing(true);
+    db.fail_next_presync();
+    let cause = "the records' sync failed (injected)";
+    match db.flush() {
+        Ok(()) => panic!("the flush answered Ok over its records' failed sync"),
+        Err(e) => assert!(
+            e.to_string().contains(cause),
+            "the flush answers the records' failed sync: {e}"
+        ),
+    }
+    assert!(db.seals_wedged(), "premise: the presync stopped the queue");
+    let held = db.seal_waits().held_landings;
+    db.hold_merge_landing(false);
+    // Held at every look of the segment work, or landed with a slot.
+    wait_for("the merge's hold or its slot", || {
+        db.seal_waits().held_landings > held + 1 || ss_newest(&d).is_some_and(|(s, _, _)| s != seq)
+    });
+    let now = ss_newest(&d).expect("a manifest");
+    assert_eq!(
+        (now.0, now.1),
+        (seq, covered),
+        "a manifest was written after the seal queue stopped: {:?} against {names:?}",
+        now.2
+    );
+    assert!(
+        db.in_flight().1,
+        "the merge landed after the seal queue stopped"
+    );
+    db.hold_seal_landing(false);
+    ss_check(&db, &model, "after the failure");
+    let sync_ans = db.sync();
+    let answers = [
+        ("a flush after the failure", db.flush()),
+        ("a settle after the failure", db.settle()),
+    ];
+    drop(db);
+    let now = ss_newest(&d).expect("a manifest");
+    assert_eq!(
+        (now.0, now.1, &now.2),
+        (seq, covered, &names),
+        "the close wrote a manifest after the seal queue stopped"
+    );
+    let db = Db::open(&d, opts).expect("the store opens");
+    ss_check(&db, &model, "reopened");
+    drop(db);
+    ss_sync_answers_nothing(sync_ans, "a sync after the failure");
+    for (what, r) in answers {
+        ss_wedged(r, cause, what);
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The same with the segment work inline (`Options::publish_in_background`
+/// off), where the writer lands the merge a flush scheduled
+/// (`Options::flush_schedules`) at its next commit: a run's presync that
+/// fails on the writer stops the queue before the run's seal has landed
+/// even readable, and the commit after the merge has finished holds it as
+/// the segment work's own look does -- the slot stands where it stood at
+/// the failure, the merge stays in flight, and the close writes no slot
+/// after it.
+#[test]
+fn a_presync_that_fails_before_its_seals_publish_stops_every_manifest_inline() {
+    let d = dir("dur-ss-presync-early-inline");
+    let opts = Options {
+        publish_in_background: false,
+        partition_on_flush: false,
+        flush_schedules: true,
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(64 << 20),
+        l0_trigger: 1000,
+        ..Options::default()
+    };
+    let mut model = SsModel::new();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    for k in 0..400_000 {
+        ss_put(&mut db, &mut model, &ss_key(k), "p");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.levels(), (1, 0), "premise: one partition over every key");
+    // A piece over keys the partition holds, which a flush cannot promote:
+    // the flush schedules a merge of the range and leaves it in flight,
+    // held before its landing.
+    for i in 0..10 {
+        ss_put(&mut db, &mut model, &ss_key(1000 + i), "a");
+        ss_put(&mut db, &mut model, &ss_between(1000, i), "a");
+    }
+    db.commit().unwrap();
+    db.hold_merge_landing(true);
+    db.flush().unwrap();
+    assert!(
+        db.in_flight().1,
+        "premise: the flush left a merge in flight"
+    );
+    wait_for("the merge at its landing hold", || {
+        db.merge_waits_at_landing()
+    });
+    // An ordered run above every key the store holds.
+    for k in 500_000..503_000u32 {
+        ss_put(&mut db, &mut model, &ss_key(k), "run");
+        if k % 300 == 299 {
+            db.commit().unwrap();
+        }
+    }
+    assert!(db.run_synced_bytes().is_some(), "premise: a run is open");
+    let (seq, covered, names) = ss_newest(&d).expect("a manifest");
+    db.fail_next_presync();
+    let cause = "the records' sync failed (injected)";
+    match db.flush() {
+        Ok(()) => panic!("the flush answered Ok over its records' failed sync"),
+        Err(e) => assert!(
+            e.to_string().contains(cause),
+            "the flush answers the records' failed sync: {e}"
+        ),
+    }
+    assert!(db.seals_wedged(), "premise: the presync stopped the queue");
+    // The merge let go and given time to finish: the next commit is the
+    // look that would land it.
+    db.hold_merge_landing(false);
+    wait_for("the merge past its landing hold", || {
+        !db.merge_waits_at_landing()
+    });
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    ss_put(&mut db, &mut model, &ss_key(9), "after");
+    db.commit()
+        .unwrap_or_else(|e| panic!("a commit under the threshold answers Ok: {e}"));
+    let now = ss_newest(&d).expect("a manifest");
+    assert_eq!(
+        (now.0, now.1),
+        (seq, covered),
+        "a manifest was written after the seal queue stopped: {:?} against {names:?}",
+        now.2
+    );
+    assert!(
+        db.in_flight().1,
+        "the merge landed after the seal queue stopped"
+    );
+    ss_check(&db, &model, "after the failure");
+    ss_sync_answers_nothing(db.sync(), "a sync after the failure");
+    ss_wedged(db.flush(), cause, "a flush after the failure");
+    ss_wedged(db.settle(), cause, "a settle after the failure");
+    drop(db);
+    let now = ss_newest(&d).expect("a manifest");
+    assert_eq!(
+        (now.0, now.1, &now.2),
+        (seq, covered, &names),
+        "the close wrote a manifest after the seal queue stopped"
+    );
+    let db = Db::open(&d, opts).expect("the store opens");
+    ss_check(&db, &model, "reopened");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// With the segment work inline (`Options::publish_in_background` off) the
+/// writer lands its seals itself, and every call that would land one
+/// answers a stopped queue: the settle that meets the failure answers it
+/// in the seal's own words, and from then every `Db::seal`, every commit
+/// that crosses the seal threshold -- its batch in the log first, as its
+/// policy makes it -- every settle and every flush answers it in words
+/// that say a seal failed and why, while a commit under the threshold and
+/// a `sync` answer `Ok`. A reopen reads every acknowledged commit and the
+/// batches the threshold's commits answered with the failure.
+#[test]
+fn a_stopped_queue_is_answered_by_every_seal_inline() {
+    let d = dir("dur-ss-inline-answers");
+    let opts = Options {
+        direct_ingest: false,
+        publish_in_background: false,
+        seal_bytes: 1 << 20,
+        l0_trigger: 1000,
+        ..Options::default()
+    };
+    let mut model = SsModel::new();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let value = "v".repeat(400);
+    let batch = |db: &mut Db, model: &mut SsModel, from: u32, n: u32| {
+        for k in from..from + n {
+            ss_put(db, model, &ss_key(k), &value);
+        }
+        db.commit()
+    };
+    batch(&mut db, &mut model, 0, 100).unwrap();
+    db.fail_next_seal_sync();
+    db.seal().unwrap();
+    let cause = "a test failed this seal's fsync";
+    match db.settle() {
+        Ok(()) => panic!("the settle that landed the failed seal answered Ok"),
+        Err(e) => assert!(
+            e.to_string().contains(cause),
+            "the settle answers the seal's failure: {e}"
+        ),
+    }
+    assert!(
+        db.seals_wedged(),
+        "premise: the seal's failure stopped the queue"
+    );
+    batch(&mut db, &mut model, 1000, 10).unwrap();
+    ss_wedged(db.seal(), cause, "a seal after the failure");
+    // A batch past the threshold: its commit writes it to the log and then
+    // answers the seal it cannot land.
+    ss_wedged(
+        batch(&mut db, &mut model, 2000, 3000),
+        cause,
+        "a commit that crosses the seal threshold",
+    );
+    ss_wedged(
+        batch(&mut db, &mut model, 6000, 10),
+        cause,
+        "the commit after that, still past the threshold",
+    );
+    ss_sync_answers_nothing(db.sync(), "a sync after the failure");
+    ss_wedged(db.settle(), cause, "a settle after the failure");
+    ss_wedged(db.flush(), cause, "a flush after the failure");
+    ss_check(&db, &model, "after the failure");
+    let crash = d.with_extension("crash");
+    copy_store(&d, &crash);
+    drop(db);
+    let db = Db::open(&crash, opts).expect("the store opens after a kill");
+    ss_check(&db, &model, "reopened after a kill");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// A second failure after the queue stopped -- a run's presync, failed in
+/// a flush after a seal's fsync had failed -- is answered by the flush
+/// that met it, and the stopped queue's answer after it is the first
+/// failure's: what stopped the queue, and not whatever failed since.
+#[test]
+fn a_stopped_queue_answers_the_failure_that_stopped_it() {
+    let d = dir("dur-ss-first-cause");
+    let mut model = SsModel::new();
+    let mut db = Db::create(&d, Options::default()).unwrap();
+    // High to low, so the seal is the memtable's.
+    for k in (0..3000u32).rev() {
+        ss_put(&mut db, &mut model, &ss_key(k), "v");
+    }
+    db.commit().unwrap();
+    db.fail_next_seal_sync();
+    db.seal().unwrap();
+    wait_for("the seal's failure", || db.seals_wedged());
+    let first = "a test failed this seal's fsync";
+    let e = ss_commit_answer(&mut db);
+    assert!(
+        e.to_string().contains(first),
+        "the commit after the failure answers it: {e}"
+    );
+    // An ordered run above every key, closed by a flush whose presync
+    // fails.
+    for k in 10_000..13_000u32 {
+        ss_put(&mut db, &mut model, &ss_key(k), "run");
+        if k % 300 == 299 {
+            db.commit().unwrap();
+        }
+    }
+    assert!(db.run_synced_bytes().is_some(), "premise: a run is open");
+    db.fail_next_presync();
+    let second = "the records' sync failed (injected)";
+    match db.flush() {
+        Ok(()) => panic!("the flush answered Ok over its records' failed sync"),
+        Err(e) => assert!(
+            e.to_string().contains(second),
+            "the flush answers the records' failed sync: {e}"
+        ),
+    }
+    assert!(
+        db.failed_presync_extent().is_some(),
+        "premise: the flush's close ran the injected presync"
+    );
+    for (what, r) in [
+        ("a flush after both", db.flush()),
+        ("a settle after both", db.settle()),
+    ] {
+        let s = r.map(|()| String::new()).unwrap_or_else(|e| e.to_string());
+        assert!(
+            s.contains(SS_WEDGED) && s.contains(first) && !s.contains(second),
+            "{what}: answers the failure that stopped the queue, not the one after it: {s:?}"
+        );
+    }
+    ss_check(&db, &model, "after both failures");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// One look of the segment work that meets a seal's failure and a merge
+/// finished beside it -- the seal's readable landing failing at its
+/// directory fsync, the poll held until both are due
+/// (`Db::hold_readable_landing`) -- holds the merge: the window is read
+/// after the seal's landing has stopped the queue, not before it.
+#[test]
+fn a_merge_finished_beside_a_failing_seal_is_held_in_the_same_look() {
+    let d = dir("dur-ss-same-look");
+    let mut model = SsModel::new();
+    let (mut db, opts) = ss_store_with_a_merge_due(&d, Options::default(), &mut model, |db| {
+        db.hold_merge_landing(true)
+    });
+    wait_for("the merge at its landing hold", || {
+        db.merge_waits_at_landing()
+    });
+    let pieces_before = seg_names(&d);
+    let (seq, covered, names) = ss_newest(&d).expect("a manifest");
+    db.hold_readable_landing(true);
+    db.fail_next_seal_dir_sync();
+    ss_third(&mut db, &mut model);
+    db.seal().unwrap();
+    wait_for("the third piece renamed into place", || {
+        seg_names(&d).len() > pieces_before.len()
+    });
+    let third = ss_new_piece(&d, &pieces_before);
+    db.hold_merge_landing(false);
+    wait_for("the merge past its hold", || !db.merge_waits_at_landing());
+    // The merge thread returns its outputs once let go; given its moment.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let held = db.seal_waits().held_landings;
+    db.hold_readable_landing(false);
+    wait_for("the seal's failure", || db.seals_wedged());
+    let t = std::time::Instant::now();
+    while t.elapsed() < std::time::Duration::from_secs(10)
+        && db.seal_waits().held_landings <= held
+        && ss_newest(&d).is_some_and(|(s, _, _)| s == seq)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let now = ss_newest(&d).expect("a manifest");
+    assert_eq!(
+        (now.0, now.1),
+        (seq, covered),
+        "a manifest was written in the look that met the seal's failure: {:?} against {names:?}",
+        now.2
+    );
+    assert!(
+        db.seal_waits().held_landings > held,
+        "the merge finished beside the failure was not held"
+    );
+    let answers = [("a flush after the failure", db.flush())];
+    ss_check(&db, &model, "after the failure");
+    drop(db);
+    ss_named_by_no_manifest(&d, &third, "directory fsync");
+    let db = Db::open(&d, opts).expect("the store opens");
+    ss_check(&db, &model, "reopened");
+    drop(db);
+    for (what, r) in answers {
+        ss_wedged(r, "directory fsync", what);
+    }
+    let _ = std::fs::remove_dir_all(&d);
 }
