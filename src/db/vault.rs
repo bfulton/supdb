@@ -1956,7 +1956,7 @@ pub(crate) fn open_append(path: impl AsRef<Path>) -> Result<File> {
 pub(crate) fn open_slot(path: impl AsRef<Path>) -> Result<File> {
     let path = path.as_ref();
     if IO_TRACE_ON.load(Ordering::Relaxed) {
-        io_trace("open_slot", path);
+        io_trace("open_slot", &real(path));
     }
     let plain = |p: &Path| {
         OpenOptions::new()
@@ -1973,6 +1973,35 @@ pub(crate) fn open_slot(path: impl AsRef<Path>) -> Result<File> {
             r => r,
         },
     }
+}
+
+/// A manifest slot opened to be made durable, where it is: never made,
+/// so an open that finds no file there writes nothing; `None` then.
+pub(crate) fn open_slot_found(path: impl AsRef<Path>) -> Result<Option<File>> {
+    match File::open(real(path)) {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// A manifest slot's bytes made durable as the page cache holds them: an
+/// fdatasync of `f`, the file at `path` (`open_slot_found`), recorded once
+/// it has returned. `failed` is a test's: the error the fdatasync answers
+/// in its place, so a failure is never recorded.
+pub(crate) fn sync_slot(
+    f: &File,
+    path: impl AsRef<Path>,
+    failed: Option<std::io::Error>,
+) -> Result<()> {
+    match failed {
+        Some(e) => Err(e),
+        None => f.sync_data(),
+    }?;
+    if IO_TRACE_ON.load(Ordering::Relaxed) {
+        io_trace("sync_slot", &real(path));
+    }
+    Ok(())
 }
 
 /// `std::fs::rename`.
@@ -2149,8 +2178,8 @@ pub(crate) fn sync_file(path: impl AsRef<Path>) -> Result<()> {
 }
 
 /// A test's: whether directory fsyncs, the open's file fsyncs
-/// (`sync_file`) and slot opens are recorded (`trace_io`), read beside the
-/// syscall each makes.
+/// (`sync_file`, `sync_slot`) and slot opens are recorded (`trace_io`),
+/// read beside the syscall each makes.
 static IO_TRACE_ON: AtomicBool = AtomicBool::new(false);
 
 /// A test's: what `trace_io` recorded, in order, process-wide.
@@ -2164,9 +2193,10 @@ fn io_trace(what: &'static str, path: &Path) {
 }
 
 /// A test's: from `on`, record every directory fsync that returned, every
-/// file fsync through `sync_file` that returned and every open of a
-/// manifest slot for writing, in the order they were
-/// made, process-wide; off, record nothing. The record so far.
+/// file fsync through `sync_file` or `sync_slot` that returned and every
+/// open of a manifest slot for writing, each by the file's path in the
+/// filesystem (`real`), in the order they were made, process-wide; off,
+/// record nothing. The record so far.
 pub(crate) fn trace_io(on: bool) -> Vec<(&'static str, PathBuf)> {
     IO_TRACE_ON.store(on, Ordering::Relaxed);
     IO_TRACE.lock().unwrap_or_else(|e| e.into_inner()).clone()

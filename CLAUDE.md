@@ -2114,8 +2114,9 @@ its publish sequence being the store at open, so a torn publish is the
 slot an open ignores; a publish never writes the slot that holds the
 newest manifest known durable, the last whose fdatasync returned, so the
 slot it does not write is one the device holds whole, and the open
-fdatasyncs the slot it takes before it removes a file or writes over the
-other (`Options::manifest_slots`, `SlotChoice`; the shape before it wrote
+fdatasyncs both slots as it found them, the one it takes and the other,
+before it removes a file or writes over either (`Options::manifest_slots`,
+`SlotChoice`; the shape before it wrote
 a temp name, renamed it over the old manifest and fsynced the directory,
 `supdb-ingestmanifestrename`). The open removes nothing -- a segment, an
 envelope, a log file, a spare -- and writes no slot until the slot it
@@ -2432,8 +2433,9 @@ the store and synced none, and a slot a drain had written with its
 fdatasync owed is in the page cache alone after a kill; the reopened
 store's first publish wrote over the other slot, the one the device
 held, and a power cut tearing that write left no slot that named the
-store. The open fdatasyncs the slot it takes now, before it unlinks
-anything a slot does not name. And it came back at the pending arm:
+store. The open fdatasyncs the slot it takes now, and the other beside
+it ("A slot chosen by its sequence", below), before it unlinks anything
+a slot does not name. And it came back at the pending arm:
 the open took a pending name whose segment read back whole, wrote a
 slot naming it durable that covered the log frames holding its writes,
 and fsynced nothing, so a power cut after the reopen lost the segment's
@@ -2572,7 +2574,31 @@ after a flush the test had settled and synced: a test tears the first
 publishes after each of those. The corollary: a sentence of a contract
 is checked against every mode before an exception is written into the
 test that holds it, and a choice seeded at several places is held at
-each place, by the first write after it.
+each place, by the first write after it. And the open synced the slot it
+took and left the other to the kernel's writeback. A publish into the
+slot whose fdatasync was owed, the next publish into the same slot -- the
+other holding the newest manifest known durable -- and a kill part way
+through that write leave the page cache holding the slot torn and the
+device free to hold the owed publish in it whole, its writeback having
+run before the torn write dirtied the page again; the reopen passed over
+the torn slot, took the other, swept the owed publish's segment and
+acknowledged commits, and a power cut before anything wrote the torn
+image back handed the next open the owed record as the newest slot, which
+refused the store over a segment that open's sweep had removed. A model
+of the two slots found it, and every test had built the device's slots
+from what a sync covered and the cache's from what the cache held,
+never a slot torn in the cache over one whole beneath it. The open
+fdatasyncs the other slot too, whatever it read as, where the file is
+there, and a seam fails that sync (`Options::fail_open_other_slot_sync`);
+both syncs are read off the calls that made them (`vault::sync_slot`,
+`Db::trace_dir_io`), which holds the open's own sync without root; the
+seam's failure stands in for the fdatasync's result inside that call, so
+a record made before the sync returned, or a sync run and failed after,
+is a record of a failure, which the test refuses. The
+corollary: of two copies kept so one stands while the other is written,
+an open that picks one settles what the device holds of the other before
+it acts on the choice, since a copy read as torn from the cache may be
+whole on the device.
 
 **A path only one arm exercises is a path nothing tests.** A delete was never
 marked dirty, and the checkpoint asked to carry it dropped it, leaving the key
