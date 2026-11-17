@@ -232,6 +232,23 @@ What an engine picker would hit, roughly in order.
   error to the writer's own fdatasync as well, whichever sync met it
   first -- one open where the helper is spawned, nothing a commit; it
   needs a device that fails writeback (dm-flakey) to be tested at all.
+- [ ] **A seal's failed sync held on a device that makes it, and a
+  store that goes on past it.** A seal that fails at any step stops the
+  seal queue for the life of the open: no manifest is written, every
+  `sync` and `flush` answers the failure, and the open replays the log
+  (`Shared::seal_wedged`). The tests inject each failure through seams
+  that skip the step they fail, and none has met a real writeback error
+  under a seal, nor a directory fsync that fails while the filesystem goes
+  on. Done when a dm-flakey or dm-error target fails a seal's fsync after
+  its readable landing and the store names nothing of it and reopens to
+  every acknowledged write. Beyond that, a store that stops sealing holds
+  every later table in memory until the frozen list is full and is of use
+  only to be reopened; the shape that goes on writes the failed seal's
+  table again into a new file under a new name, never fsyncing the old
+  inode again, and lands it as any seal -- to be built with its own crash
+  tests if a store that must not be reopened ever asks for it. Merges and
+  promotions still start while the queue is stopped, and their outputs are
+  files no slot names, swept at the open.
 - [ ] **A run's due commit beside log frames no sync covered.** Under
   `EveryN` a run's commit that is due syncs the run's file and not the
   log, and a run opens over a log that may hold the frames of a table

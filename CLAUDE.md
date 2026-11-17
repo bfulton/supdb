@@ -2113,7 +2113,18 @@ two slot files written in place and fdatasynced, the newest valid slot by
 its publish sequence being the store at open, so a torn publish is the
 slot an open ignores (`Options::manifest_slots`; the shape before it wrote
 a temp name, renamed it over the old manifest and fsynced the directory,
-`supdb-ingestmanifestrename`). A flush's drain is answered once its
+`supdb-ingestmanifestrename`). A seal that fails at any step -- its
+landing, its directory's fsync there, the fsync or the envelope of its
+data before its readable landing or after it, a closing run's presync --
+stops the seal queue for the life of the open (`Shared::seal_wedged`): no
+seal lands and no manifest is written, so nothing names its segments
+durable, covers its sequence or retires the log that holds its writes,
+and the fsync is never tried again; readers go on reading what was
+published, every `sync` and `flush` answers the failure until the store
+is reopened, and the open replays the log and sweeps what no slot
+names. A run's close whose records the writer presyncs lands durable
+only at the writer's own ask, after the presync
+(`SealJob::awaits_writer`). A flush's drain is answered once its
 seal's fsyncs are done and the slot is written, and the slot's fdatasync
 follows on the segment work's thread with the WAL's and temp names'
 retirement behind it (`Options::flush_waits_manifest` is the shape that
@@ -3515,6 +3526,60 @@ check of the path made before. The corollary: a kept error
 is checked at every path that would sync the same bytes again, the
 background ones included, and not only at the calls that answer the
 caller.
+It came back a fourth time at the presync itself, whose error the flush
+answered: the presync runs on the writer's thread after the seal job is
+handed, the job's fsync of the same description reports nothing of what
+the presync met, and the segment work landed the job durable whenever its
+thread returned -- before the writer had its answer, by timing, so the
+manifest named the segment and the next flush answered `Ok`. A failed
+presync stops the seal queue now, and a job whose records the writer
+syncs lands durable only at the writer's own ask, which follows the
+presync (`SealJob::awaits_writer`): a flag the segment work reads where
+it already asks whether the job has returned, and no wait anyone made
+before. The corollary: an error answered to the caller is not therefore
+seen by the thread that acts on the same bytes; whoever names the bytes
+durable is ordered after whoever learns they are not.
+
+**A failure after the publish, left for the next publish to name.** A
+seal lands in two phases, its segments published for readers at the
+first and named by a manifest only once its thread has returned with
+their fsyncs paid, and a seal that failed before its readable landing
+stopped the queue for the life of the open. One that failed after it --
+at its data's fsync, its envelope under a cipher, its directory's fsync
+at the landing itself, a run's presync joined into the job -- did not,
+by design: its comment said the segments "stay live with their sequence
+covered, so the next landing's manifest names them". The next landing
+was a merge's, a later seal's or the pending arm's close, and its slot
+named durable a segment no fsync had covered and covered the sequence of
+the log that held its writes, which the open then skipped: a power cut
+left a store that refused to open over acknowledged writes the log still
+had. Every test of the failure path failed the landing, never the fsync
+after it. The queue stops for every failure now and the fsync is never
+tried again (`Shared::wedge`), every manifest is refused while it stands
+at the two calls all of them go through and at the pending slot
+(`Maint::publish`, `publish_unsynced`), the close publishes over no seal
+it joined that failed, and every `sync` and `flush` answers the failure
+in its own words. The rule: a failure that leaves a thing published and
+not durable is a state, not an error to report and pass: it is held at
+the one place every path that would make the thing durable goes
+through, and a path that bypasses that place is the bug; and a test of a
+failure path fails every step of it, the ones after the publish above
+all, since those are the steps a publish has already made look done.
+
+**A refusal that came after the take.** A direct run's close took the
+run from the writer and then waited for room in the frozen list, and a
+refusal there -- the seal queue stopped, the list full behind it --
+dropped the run's writer with its ordered table still live, so the write
+that ended the run went on into the ordered table and panicked in its
+order check, and a `Db::seal` of the run left a table no run backed. The
+close waits for room before it takes anything now, so a refusal leaves
+the run open and its table live; and the write a run cannot take, which
+cannot fail, is dropped only with the refusal kept (`Db::lost`), since a
+write dropped beside a later commit answered `Ok` would break the order
+the commits promise. The rule: a step that can be refused is asked
+before anything it would consume is taken, so a refusal leaves the state
+as it found it; and a call that cannot fail and cannot be done is dropped
+only where nothing after it is acknowledged.
 
 **A failure that left the buffer it failed on for the next call to
 build on.** The log's write staged a commit's frames, wrote them, and
