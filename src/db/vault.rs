@@ -148,7 +148,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Error, ErrorKind, Read, Result, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub use super::pager::PagerCounts;
@@ -1586,6 +1586,27 @@ impl Vault {
         Ok(())
     }
 
+    /// Whether the directory holds a segment's envelope: for an open that
+    /// read no slot, and so knows none of them.
+    fn holds_segments(&self) -> Result<bool> {
+        for entry in std::fs::read_dir(&self.real)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if matches!(disk_parse(&name), Some((_, Kind::Seg))) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether `name`'s envelope -- the one a slot read named for it -- is
+    /// in the directory.
+    fn on_device(&self, name: &str) -> bool {
+        lock(&self.files)
+            .get(name)
+            .and_then(|e| e.disk.clone())
+            .is_some_and(|d| self.real.join(d.name()).exists())
+    }
+
     /// Every envelope in the directory that no file of the store is in,
     /// removed: one a crash came after and no manifest named, as a plain
     /// store sweeps a segment its manifest does not name. For the open,
@@ -1934,6 +1955,9 @@ pub(crate) fn open_append(path: impl AsRef<Path>) -> Result<File> {
 /// nowhere if it is: a manifest slot.
 pub(crate) fn open_slot(path: impl AsRef<Path>) -> Result<File> {
     let path = path.as_ref();
+    if IO_TRACE_ON.load(Ordering::Relaxed) {
+        io_trace("open_slot", path);
+    }
     let plain = |p: &Path| {
         OpenOptions::new()
             .write(true)
@@ -2025,6 +2049,26 @@ pub(crate) fn exists(path: impl AsRef<Path>) -> bool {
     }
 }
 
+/// Whether `path`'s bytes are in the directory: the file, or under a
+/// cipher the envelope a slot read named for it.
+pub(crate) fn on_device(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    match locate(path) {
+        None => path.exists(),
+        Some((v, name)) if passes(&name) => v.real.join(name).exists(),
+        Some((v, name)) => v.on_device(&name),
+    }
+}
+
+/// Whether the store at `dir`, under a cipher, holds any segment's
+/// envelope; never for a store in the clear.
+pub(crate) fn holds_envelopes(dir: impl AsRef<Path>) -> Result<bool> {
+    match under(dir.as_ref()) {
+        Some(v) => v.holds_segments(),
+        None => Ok(false),
+    }
+}
+
 /// `Path::is_file`.
 pub(crate) fn is_file(path: impl AsRef<Path>) -> bool {
     let path = path.as_ref();
@@ -2083,9 +2127,49 @@ pub(crate) fn read(path: impl AsRef<Path>) -> Result<Vec<u8>> {
 pub(crate) fn sync_dir(dir: impl AsRef<Path>) -> Result<()> {
     let dir = dir.as_ref();
     match under(dir) {
-        Some(v) => File::open(&v.real)?.sync_all(),
-        None => File::open(dir)?.sync_all(),
+        Some(v) => File::open(&v.real)?.sync_all()?,
+        None => File::open(dir)?.sync_all()?,
     }
+    if IO_TRACE_ON.load(Ordering::Relaxed) {
+        io_trace("sync_dir", dir);
+    }
+    Ok(())
+}
+
+/// A file's bytes made durable: an fsync of the file, opened for it. The
+/// open's, for a pending segment it adopts and that segment's ordered
+/// index, before the slot that names them durable.
+pub(crate) fn sync_file(path: impl AsRef<Path>) -> Result<()> {
+    let path = path.as_ref();
+    open(path)?.sync_all()?;
+    if IO_TRACE_ON.load(Ordering::Relaxed) {
+        io_trace("sync_file", path);
+    }
+    Ok(())
+}
+
+/// A test's: whether directory fsyncs, the open's file fsyncs
+/// (`sync_file`) and slot opens are recorded (`trace_io`), read beside the
+/// syscall each makes.
+static IO_TRACE_ON: AtomicBool = AtomicBool::new(false);
+
+/// A test's: what `trace_io` recorded, in order, process-wide.
+static IO_TRACE: Mutex<Vec<(&'static str, PathBuf)>> = Mutex::new(Vec::new());
+
+fn io_trace(what: &'static str, path: &Path) {
+    IO_TRACE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((what, path.to_path_buf()));
+}
+
+/// A test's: from `on`, record every directory fsync that returned, every
+/// file fsync through `sync_file` that returned and every open of a
+/// manifest slot for writing, in the order they were
+/// made, process-wide; off, record nothing. The record so far.
+pub(crate) fn trace_io(on: bool) -> Vec<(&'static str, PathBuf)> {
+    IO_TRACE_ON.store(on, Ordering::Relaxed);
+    IO_TRACE.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Where in the filesystem a file the engine names lies: the path itself,
