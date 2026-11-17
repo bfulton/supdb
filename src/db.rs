@@ -247,22 +247,35 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
 /// A seal that fails to make its segments durable -- a failed fsync of
 /// their data or of the directory that names them, a failed envelope
 /// under a cipher, a failed presync of a closing run's records -- is never
-/// tried again, and no manifest is written from then until the store is
-/// reopened: no seal lands, nothing names the segments durable, and the
-/// log that holds their writes stays. The call that meets the failure
-/// answers it once in its own words: a `flush` whose seal's landing or
-/// whose run's presync fails, or, for a failure the store's segment work
-/// meets on its own, the first commit, `seal` or `flush` after it. Every
-/// `flush` after that answers it in words that say a seal failed and why,
-/// until the store is reopened. A
-/// `sync` answers nothing of it, since what a `sync` promises is in the
-/// log and a run's commits closed into the seal are durable once that
-/// seal lands, which a `sync` never covers. Commits after the failure are
-/// durable in the log as their policy makes them, until the frozen tables
-/// have no room and a commit or a seal that needs room answers the failure
-/// too. Reads go on. A write that ends an ordered run whose close will
-/// find no room is dropped, and every commit, `sync` and `flush` after it
-/// answers the failure until the store is reopened.
+/// tried again, and the seal queue stops until the store is reopened: no
+/// seal lands, nothing names the failed seal's segments durable or covers
+/// their sequence, and the log that holds their writes stays. The store's
+/// segment work writes no manifest from its first look at the queue after
+/// the failure; a merge in flight then finishes and is held, and its
+/// outputs are swept at the open. The first call that answers the caller
+/// after the failure answers it: a `flush` whose seal's landing or whose
+/// run's presync fails, a `settle` or `seal` that lands the failed seal,
+/// or, for a failure the store's segment work meets on its own, the first
+/// commit, `seal`, `flush` or `settle` after it. From then, every `flush`
+/// and every `settle` (and so `Db::zpages_settle` under `ZPages::Always`,
+/// which settles first) answers it in words that say a seal failed and
+/// why, until the store is reopened, and so does every call
+/// that has to land a seal: with the segment work on a thread of its own
+/// (`Options::publish_in_background`), a `seal` or a commit at the seal
+/// threshold once the frozen tables have no room; with the segment work
+/// inline, every `seal` and every commit at the seal threshold. A commit
+/// that answers it so has written its batch to the log first, as its
+/// policy makes it. A `sync` answers nothing of the failure itself, since
+/// what a `sync` promises is in the log and a run's commits closed into
+/// the seal are durable once that seal lands, which a `sync` never covers.
+/// Other commits are durable in the log as their policy makes them. Reads
+/// go on. Two writes need room in the frozen tables, and are dropped
+/// where the stopped queue leaves none: a write that ends an ordered run,
+/// whose close freezes the run's table, and the first write after a
+/// `sync` handed the live table to a seal (`Options::adaptive_shape`,
+/// with the segment work on a thread of its own), which freezes the
+/// handed table. From such a dropped write on, every commit, `sync` and
+/// `flush` answers the failure until the store is reopened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncPolicy {
     /// One fdatasync per commit. Durable per batch, LMDB's boundary.
@@ -15488,19 +15501,20 @@ struct Shared {
     forms_position_hold: std::sync::atomic::AtomicBool,
     /// A seal failed -- its landing, or the step that makes its segments
     /// durable, before its readable landing or after it, or the presync of
-    /// a closing run's records -- and no seal lands and no manifest is
-    /// written from here until the store is reopened (`Shared::wedge`). A
-    /// manifest written after it would name a segment whose bytes or whose
-    /// directory entry may not be on the device, or cover the failed seal's
-    /// sequence with its segments unnamed, and a reopen would skip the WAL
-    /// that holds its writes; and the fsync is not tried again, since
-    /// Linux reports a writeback error once and a retry answers `Ok` over
-    /// pages it marked clean. Readers go on reading what was published.
-    /// The writer's waits for room in the frozen list read this and fail
-    /// instead of waiting on a landing that will not come, and every `sync`
-    /// and `flush` answers it (`Shared::wedged_err`); a reopen replays every
-    /// WAL the manifest does not cover and sweeps the segments it does not
-    /// name.
+    /// a closing run's records -- and no seal lands from here until the
+    /// store is reopened (`Shared::wedge`), and the segment work writes no
+    /// manifest from its first look at the queue after it
+    /// (`Maint::seals_stopped`). A manifest written after it would name a
+    /// segment whose bytes or whose directory entry may not be on the
+    /// device, or cover the failed seal's sequence with its segments
+    /// unnamed, and a reopen would skip the WAL that holds its writes; and
+    /// the fsync is not tried again, since Linux reports a writeback error
+    /// once and a retry answers `Ok` over pages it marked clean. Readers go
+    /// on reading what was published. The writer's waits for room in the
+    /// frozen list read this and fail instead of waiting on a landing that
+    /// will not come, and every `flush` and `settle` answers it
+    /// (`Shared::wedged_err`, `SyncPolicy`); a reopen replays every WAL the
+    /// manifest does not cover and sweeps the segments it does not name.
     seal_wedged: std::sync::atomic::AtomicBool,
     /// Why the queue stopped: the first failure's kind and words, which
     /// every answer of the stopped queue carries (`Shared::wedged_err`).
@@ -27776,6 +27790,20 @@ impl Reader {
     pub fn hold_presync(&self, on: bool) {
         self.shared.presync_hold.store(on, AtomicOrdering::Release);
     }
+
+    /// A test's: `Db::hold_readable_landing` from a handle.
+    #[doc(hidden)]
+    pub fn hold_readable_landing_from_handle(&self, on: bool) {
+        if on {
+            self.shared
+                .seal_hold
+                .fetch_or(SEAL_HOLD_READABLE, AtomicOrdering::AcqRel);
+        } else {
+            self.shared
+                .seal_hold
+                .fetch_and(!SEAL_HOLD_READABLE, AtomicOrdering::AcqRel);
+        }
+    }
 }
 
 impl Db {
@@ -29328,8 +29356,7 @@ impl Db {
     ///
     /// `append`, `put` and `delete` cannot fail. A close the frozen list
     /// will never have room for -- the seal queue stopped behind a failed
-    /// seal (`Shared::seal_wedged`), or no seal left in flight to land --
-    /// leaves the run open and its batch staged, and the write that ended
+    /// seal (`Shared::seal_wedged`) -- leaves the run open and its batch staged, and the write that ended
     /// it is dropped and the refusal kept (`Db::lost`), so no call answers
     /// `Ok` after a write the store did not take; returns false then, and
     /// the caller writes nothing. The first version took the run, dropped
@@ -29341,11 +29368,13 @@ impl Db {
     fn leave_direct(&mut self) -> bool {
         if self.direct.is_some() {
             while let Err(e) = self.land_seal() {
-                // The count before the state, as `land_seal` reads them.
-                let seals = self.shared.in_seal.load(AtomicOrdering::Acquire);
+                // Without room and with the queue going on, a seal in
+                // flight holds a frozen table and its landing makes room: a
+                // seal is counted out only once landed, or once it has
+                // stopped the queue (`Maint::stop_seals`).
                 self.rehold();
                 let room = self.state().frozen.len() < FROZEN_CAP;
-                if !room && (seals == 0 || self.shared.seal_wedged.load(AtomicOrdering::Acquire)) {
+                if !room && self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
                     let _ = self.keep_lost(e);
                     return false;
                 }
@@ -29457,8 +29486,8 @@ impl Db {
     /// The start of every write: the live table a `sync` handed to a seal
     /// replaced first (`take_fresh_mem`), so nothing is written into it.
     /// A write cannot fail, so when the replacement cannot be made -- no
-    /// room in the frozen list and none to come, the seal queue stopped or
-    /// no seal left to land -- the write is dropped and the refusal kept
+    /// room in the frozen list and none to come, the seal queue stopped --
+    /// the write is dropped and the refusal kept
     /// (`Db::lost`), as `leave_direct` leaves a close that cannot be made;
     /// any other error, the segment work's, is the next commit's, and the
     /// replacement is tried again. The first version dropped the write on
@@ -29470,14 +29499,14 @@ impl Db {
             return true;
         }
         loop {
-            // The count before the call's look at the state, as the call
-            // reads them: a count of zero beside a table not replaced is a
-            // replacement nothing in flight will make.
-            let seals = self.shared.in_seal.load(AtomicOrdering::Acquire);
+            // A handed table not yet replaced has its seal in flight, or
+            // the seal has stopped the queue before it was counted out
+            // (`Maint::stop_seals`), so a refusal that will not change is
+            // a stopped queue's.
             match self.take_fresh_mem() {
                 Ok(()) => return true,
                 Err(e) => {
-                    if seals == 0 || self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
+                    if self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
                         let _ = self.keep_lost(e);
                         return false;
                     }
@@ -30817,6 +30846,9 @@ impl Db {
     /// (a joined seal may still trigger a merge when compaction is on and
     /// the level-0 count says so). For an experiment that wants a store in a
     /// known shape before it measures.
+    ///
+    /// After a seal failed to make its segments durable every settle
+    /// answers the failure until the store is reopened (`SyncPolicy`).
     pub fn settle(&mut self) -> Result<()> {
         let _op = self.op();
         // The upkeep first: every join after it touches the writer's
@@ -30849,9 +30881,12 @@ impl Db {
     /// store is reopened (`SyncPolicy`); after a failed write of the run's
     /// file a `sync` writes the batch again and syncs it, or answers the
     /// write's error. A seal that failed to make its segments durable is
-    /// nothing a `sync` answers: its writes are in the log, which stays,
-    /// or are the commits of a run closed into it, which a `sync` does not
-    /// cover (`SyncPolicy`).
+    /// nothing a `sync` answers by itself: its writes are in the log, which
+    /// stays, or are the commits of a run closed into it, which a `sync`
+    /// does not cover. Once a write was dropped for want of room behind
+    /// that stopped queue -- a write that ends an ordered run, or the first
+    /// write after a `sync` handed the live table to a seal -- every `sync`
+    /// answers the failure until the store is reopened (`SyncPolicy`).
     pub fn sync(&mut self) -> Result<()> {
         let _op = self.op();
         self.commit_staged()?;
@@ -32201,8 +32236,8 @@ impl Db {
     /// readable and not yet published, and its thread finished -- as
     /// `Maint::collect` asks on the thread of its own, which lands its
     /// seals itself.
-    fn seal_due(&self) -> (bool, bool) {
-        match &self.maint {
+    fn seal_due(&mut self) -> (bool, bool) {
+        match &mut self.maint {
             MaintHome::Here(m) => m.seal_phases_due(),
             MaintHome::Away(_) => (false, false),
         }
@@ -32791,6 +32826,16 @@ impl Db {
     #[doc(hidden)]
     pub fn hold_seal_landing(&self, on: bool) {
         self.set_seal_hold(SEAL_HOLD_LANDING, on);
+    }
+
+    /// A test's: while `on`, the segment work's poll lands nothing while a
+    /// seal's readable phase is due -- the seal's phases and a merge's
+    /// landing alike -- so a seal thread that has signalled its segments
+    /// readable and then returned, and a merge that has finished beside
+    /// it, are met by one poll. The writer's own joins are not held.
+    #[doc(hidden)]
+    pub fn hold_readable_landing(&self, on: bool) {
+        self.set_seal_hold(SEAL_HOLD_READABLE, on);
     }
 
     /// A test's: while `on`, a publish of the forms swaps them into their
@@ -38036,6 +38081,9 @@ const SEAL_HOLD_LANDING: u8 = 1;
 const SEAL_HOLD_DURABLE: u8 = 2;
 /// The fdatasync of a slot a drain left owed (`Db::hold_owed_slot`).
 const SEAL_HOLD_OWED_SLOT: u8 = 4;
+/// The segment work's poll landing nothing while a seal's readable phase
+/// is due (`Db::hold_readable_landing`).
+const SEAL_HOLD_READABLE: u8 = 8;
 
 /// A test's holds on the merge (`Shared::merge_hold`): the merge thread
 /// held before it returns its outputs; a planned merge made to wait for the
@@ -38305,10 +38353,13 @@ struct Maint {
     /// seals start waits for the next seal, since a store that has stopped
     /// sealing would otherwise never see it.
     flush_merge: bool,
-    /// A seal this work landed or joined failed (`Shared::wedge`): its
-    /// segments may be published and are durable never, so the work holds
-    /// every manifest from here as it holds one while a seal is between
-    /// its phases (`seal_between_phases`).
+    /// The seal queue stopped (`Shared::wedge`): a seal this work landed
+    /// or joined failed, or, seen at this work's next look at the queue
+    /// (`seal_phases_due`), the writer's presync of a closing run's
+    /// records did. The failed seal's segments may be published and
+    /// are durable never, so the work holds every manifest from here as it
+    /// holds one while a seal is between its phases
+    /// (`seal_between_phases`).
     seals_stopped: bool,
     /// The store's scan life at the last landing's plan (`Shared::scans_life`
     /// and `scans_merged`): a merge's landing plans the next merge only
@@ -38722,6 +38773,11 @@ impl Maint {
         if !(readable || sealed || merged || tiered) {
             return;
         }
+        // A test's hold, asked where the landings' syscalls follow.
+        if readable && self.shared.seal_hold.load(AtomicOrdering::Relaxed) & SEAL_HOLD_READABLE != 0
+        {
+            return;
+        }
         let op = self.op();
         let mut done = self.collect_seal();
         // A merge's landing writes the manifest, and a manifest written
@@ -38785,8 +38841,11 @@ impl Maint {
     /// alone: a seal behind it lands only once the front is durable, so
     /// one seal at most is between its phases and the landings keep hand
     /// order. Inline, `Db::seal_due` asks this at every commit.
-    fn seal_phases_due(&self) -> (bool, bool) {
+    fn seal_phases_due(&mut self) -> (bool, bool) {
         if self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
+            // A stop the writer raised (its run's failed presync) held
+            // from this look on, as one this work raised is.
+            self.seals_stopped = true;
             return (false, false);
         }
         self.sealing.front().map_or((false, false), |s| {
@@ -38853,8 +38912,11 @@ impl Maint {
                 if let Some(s) = self.sealing.pop_front() {
                     let _ = s.handle.join();
                 }
-                self.shared.in_seal.fetch_sub(1, AtomicOrdering::AcqRel);
+                // Stopped before it is counted out: a writer that reads
+                // the count and then the flag (`land_seal`, `writes_go`)
+                // finds the stop wherever it finds the count gone.
                 self.stop_seals(&e);
+                self.shared.in_seal.fetch_sub(1, AtomicOrdering::AcqRel);
                 Err(e)
             }
         }
@@ -38873,10 +38935,16 @@ impl Maint {
     /// Whether a seal's segments are published and not yet durable: the
     /// window in which no manifest may be written. The front's, since no
     /// other seal's phases land while it is in flight -- and for good once
-    /// a seal failed (`seals_stopped`), whose segments may be published
-    /// and will never be durable. A seal the writer's failed presync
-    /// stopped holds the window by staying at the front, landed and never
-    /// landed durable (`SealJob::awaits_writer`).
+    /// the seal queue stopped (`seals_stopped`), whose failed seal's
+    /// segments may be published and will never be durable. A stop the
+    /// writer raised at its run's failed presync holds from this work's
+    /// next look at the queue (`seal_phases_due`), which every path to a
+    /// manifest makes first: `collect` and the loop's plans after it, and
+    /// inline the commit's look; the writer's asks end at `join_seal`,
+    /// which answers the stop before anything. A landing already past that
+    /// look names nothing of the failed seal: its job waits at the front
+    /// for the writer's word (`SealJob::awaits_writer`), its segments live
+    /// only once its readable landing has held this window shut.
     fn seal_between_phases(&self) -> bool {
         self.sealing.front().is_some_and(|s| s.landed) || self.seals_stopped
     }
@@ -39273,16 +39341,16 @@ impl Maint {
                 // or a later seal's, over bytes no fsync had covered. The
                 // WAL is not retired: it retires only behind a manifest
                 // that names what covers it.
-                self.shared.in_seal.fetch_sub(1, AtomicOrdering::AcqRel);
                 self.stop_seals(&e);
+                self.shared.in_seal.fetch_sub(1, AtomicOrdering::AcqRel);
                 return Err(e);
             }
         };
         if !landed {
             let facts = readable.facts.get().cloned().unwrap_or_default();
             if let Err(e) = self.land_readable(&names, &facts, &table) {
-                self.shared.in_seal.fetch_sub(1, AtomicOrdering::AcqRel);
                 self.stop_seals(&e);
+                self.shared.in_seal.fetch_sub(1, AtomicOrdering::AcqRel);
                 return Err(e);
             }
         }
@@ -40514,10 +40582,13 @@ impl Maint {
         // before anything; a seal's own landings -- this, `publish_unsynced`
         // and the pending slot `land_readable` writes -- are not reached,
         // since no seal lands from then (`seal_phases_due`, `join_seal`);
-        // and the close asks the queue itself (`stop`). A seal the writer's
-        // failed presync stops while an older one lands names only the
-        // older, which is durable, since a seal is published only once
-        // every seal before it is. The assertion below is the check.
+        // and the close asks the queue itself (`stop`). A stop the writer
+        // raised at its run's failed presync is held from this work's next
+        // look at the queue (`seal_phases_due`), and a landing
+        // already past that look names nothing of the failed seal, whose
+        // job waits at the front for the writer's word
+        // (`SealJob::awaits_writer`) with its segments unpublished, or
+        // published and the window shut. The assertion below is the check.
         let _io = self.r.unlend();
         debug_assert!(
             !self.seal_between_phases(),
