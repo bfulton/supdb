@@ -235,8 +235,13 @@ What an engine picker would hit, roughly in order.
 - [ ] **A seal's failed sync held on a device that makes it, and a
   store that goes on past it.** A seal that fails at any step stops the
   seal queue for the life of the open: no manifest is written, every
-  `sync` and `flush` answers the failure, and the open replays the log
-  (`Shared::seal_wedged`). The tests inject each failure through seams
+  `flush` answers the failure, and the open replays the log
+  (`Shared::seal_wedged`). A `sync` answers nothing of it, since what it
+  promises is in the log; a caller that syncs and never flushes learns of
+  it from the one commit that answers the segment work's error. Every `sync` answering it, with commits
+  still `Ok`, is a writer-side kept answer set where the writer first
+  learns of the failure and returned by the check `sync` makes of a kept
+  error already: a contract to choose before it is built. The tests inject each failure through seams
   that skip the step they fail, and none has met a real writeback error
   under a seal, nor a directory fsync that fails while the filesystem goes
   on. Done when a dm-flakey or dm-error target fails a seal's fsync after

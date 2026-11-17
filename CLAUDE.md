@@ -2120,11 +2120,14 @@ stops the seal queue for the life of the open (`Shared::seal_wedged`): no
 seal lands and no manifest is written, so nothing names its segments
 durable, covers its sequence or retires the log that holds its writes,
 and the fsync is never tried again; readers go on reading what was
-published, every `sync` and `flush` answers the failure until the store
-is reopened, and the open replays the log and sweeps what no slot
-names. A run's close whose records the writer presyncs lands durable
-only at the writer's own ask, after the presync
-(`SealJob::awaits_writer`). A flush's drain is answered once its
+published, every `flush` answers the failure until the store is
+reopened, a `sync` answers nothing of it since what it promises is in
+the log, and the open replays the log and sweeps what no slot names.
+Under `manifest_pending` the slot the seal's readable landing wrote
+before the failure stays, naming the segments pending and covering their
+sequence, and the open's rule for a pending name is what reads it. A
+run's close whose records the writer presyncs lands durable only at the
+writer's own ask, after the presync (`SealJob::awaits_writer`). A flush's drain is answered once its
 seal's fsyncs are done and the slot is written, and the slot's fdatasync
 follows on the segment work's thread with the WAL's and temp names'
 retirement behind it (`Options::flush_waits_manifest` is the shape that
@@ -3555,16 +3558,23 @@ the log that held its writes, which the open then skipped: a power cut
 left a store that refused to open over acknowledged writes the log still
 had. Every test of the failure path failed the landing, never the fsync
 after it. The queue stops for every failure now and the fsync is never
-tried again (`Shared::wedge`), every manifest is refused while it stands
-at the two calls all of them go through and at the pending slot
-(`Maint::publish`, `publish_unsynced`), the close publishes over no seal
-it joined that failed, and every `sync` and `flush` answers the failure
-in its own words. The rule: a failure that leaves a thing published and
-not durable is a state, not an error to report and pass: it is held at
-the one place every path that would make the thing durable goes
-through, and a path that bypasses that place is the bug; and a test of a
-failure path fails every step of it, the ones after the publish above
-all, since those are the steps a publish has already made look done.
+tried again (`Shared::wedge`), and a stopped queue is held as the window
+between a seal's phases is held, for good (`Maint::seal_between_phases`):
+a merge's, a tier's and a promotion's landing wait in that window
+already, the writer's asks end at `join_seal`, a seal's own landings --
+`publish_unsynced` and the pending slot -- are not reached once no seal
+lands, the close asks the queue before it publishes, and `Maint::publish`
+asserts the window shut. The first repair put a refusal in
+`Maint::publish` itself, a load beside every manifest's write, and a
+load in every `sync`; the window was a check every manifest path made
+already, and a `sync` promises nothing of a seal's writes. Every `flush`
+answers the failure. The rule: a failure that leaves a thing published
+and not durable is a state, not an error to report and pass: it is held
+where the paths that would make the thing durable already wait for it
+to be durable, and a path that bypasses that wait is the bug; and a test
+of a failure path fails every step of it, the ones after the publish
+above all, since those are the steps a publish has already made look
+done.
 
 **A refusal that came after the take.** A direct run's close took the
 run from the writer and then waited for room in the frozen list, and a
@@ -3576,10 +3586,25 @@ close waits for room before it takes anything now, so a refusal leaves
 the run open and its table live; and the write a run cannot take, which
 cannot fail, is dropped only with the refusal kept (`Db::lost`), since a
 write dropped beside a later commit answered `Ok` would break the order
-the commits promise. The rule: a step that can be refused is asked
-before anything it would consume is taken, so a refusal leaves the state
-as it found it; and a call that cannot fail and cannot be done is dropped
-only where nothing after it is acknowledged.
+the commits promise. The first version of the drop took any error the
+wait met with the list full for a refusal, and a merge's error the
+segment work had left for the next commit is one the wait meets while
+the list is full behind seals that will land: backpressure read as a
+stopped queue, a write dropped and the store answering every call
+until it was reopened. The write is dropped only where room will not
+come -- the queue stopped, or no seal left to land -- and otherwise the
+error is the next commit's and the wait goes on. The write after a
+`sync` handed the live table to a seal had the same shape from before:
+the table's replacement failed, the write was dropped and the next commit
+answered it once, and the commits after that answered `Ok` over it; it is
+dropped and kept on the same terms now (`Db::writes_go`), and behind a
+stopped queue the handed table is frozen where there is room, since
+nothing lands to retire it either way. The rule: a step that
+can be refused is asked before anything it would consume is taken, so a
+refusal leaves the state as it found it; a call that cannot fail and
+cannot be done is dropped only where nothing after it is acknowledged;
+and "cannot be done" is read off the state that makes it so, never off
+an error that the state merely happened to be beside.
 
 **A failure that left the buffer it failed on for the next call to
 build on.** The log's write staged a commit's frames, wrote them, and
