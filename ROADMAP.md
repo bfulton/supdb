@@ -301,17 +301,29 @@ What an engine picker would hit, roughly in order.
   see a log file the slot before needs and the directory lacks; the
   reproduction is `a_fallback_past_a_slot_whose_log_retired_is_refused`
   in stage 0's open-order notes, which fails today.
-- [ ] **A fall back held by a segment's first and last keys.** In the
+- [ ] **A fall back held by a segment's last key.** In the
   clear the same check reads an unnamed segment newer than every segment
-  the slot taken names, and within what it covers, by its first and last
-  keys, and sweeps it where each is held by that slot's segments, a run's
-  temp name or the replayed log, as a merge's outputs are by their
-  inputs. A run whose records
-  begin and end at keys a later write put in the log, or whose id was
-  drawn before a merge the older slot names, or that closed after a
-  commit the log holds past what the older slot covers, passes. Damage
+  the slot taken names, and within what it covers, by its last key, and
+  sweeps it where that key is held by that slot's segments or a run's
+  temp name, as a merge's outputs are by their inputs; no other key of
+  it is read. A segment whose last key the slot's segments hold and whose
+  other keys they do not, or a run whose id was drawn
+  before a merge the older slot names, or that closed after a commit the
+  log holds past what the older slot covers, passes. Damage
   only, as above. Done when the segment says in its own bytes whether it is a
-  merge's output, or the check reads every key where the first two pass.
+  merge's output, or the check reads every key where the last passes.
+- [ ] **The open's directory fsync held on a device.** An open that
+  adopts pending segments (`Options::manifest_pending`) fsyncs each, its
+  ordered index under `ord_durable`, and the directory before the slot
+  that names them durable. The tests hold the order through the open's
+  own record of what it fsynced (`Db::open_synced_files`) and each
+  file's fsync through the kernel's page flags, which only root may
+  read; nothing reads whether the directory's entries reached the
+  device, so an open that recorded the directory's fsync without making
+  it would pass. Done when a dm-flakey target that drops unflushed
+  writes cuts the power after such an open, and the store reopens with
+  every acknowledged write, with the directory fsync removed as its
+  control.
 - [ ] **A run's due commit beside log frames no sync covered.** Under
   `EveryN` a run's commit that is due syncs the run's file and not the
   log, and a run opens over a log that may hold the frames of a table

@@ -1226,6 +1226,11 @@ pub struct Options {
     /// work's).
     #[doc(hidden)]
     pub tear_open_slot_write: bool,
+    /// A test's: the open's fsync of the first pending segment it adopts
+    /// fails, as a device error would, and the open answers that failure
+    /// (`Options::manifest_pending`).
+    #[doc(hidden)]
+    pub fail_open_pending_sync: bool,
     /// A test's: a settle of the form, once its segment work has answered,
     /// holds the builds after it before their renames and returns only
     /// once the next has parked there (`Db::hold_zpage_after_settle`), so a
@@ -4003,6 +4008,7 @@ impl Default for Options {
             zpages_hold_rename: false,
             fail_open_slot_sync: false,
             tear_open_slot_write: false,
+            fail_open_pending_sync: false,
             zpages_hold_after_settle: false,
             zpages_eager: true,
             zpages_warm: true,
@@ -15633,7 +15639,9 @@ struct Shared {
     /// fdatasync would.
     fail_presync: std::sync::atomic::AtomicBool,
     /// A test's: the files the open that made this store fsynced, each
-    /// pushed once its fsync returned, the directory as `.`; none at
+    /// pushed once its fsync returned, the directory as `.`, in the order
+    /// the fsyncs returned -- the slot that names pending segments durable
+    /// among them, so its place says what was durable before it; none at
     /// `Db::create` (`Db::open_synced_files`).
     open_synced: Vec<String>,
     /// A test's: the inode of the run's file and the bytes the file held
@@ -28693,11 +28701,12 @@ impl Db {
     /// the directory; no slot can be read beside `par-` or `pcs-` files,
     /// or under a cipher beside segments' envelopes, which only a store
     /// with a manifest writes; or a segment the slot does not name, newer
-    /// than every segment it names and within what it covers, holds keys
-    /// nothing the slot names, no run's temp name and no replayed frame
-    /// holds -- which a crash never leaves, and damage that passes over a
-    /// newer slot can. A store with no slot and only `seg-` files is one
-    /// from before manifests and opens from their names. Under
+    /// than every segment it names and within what it covers, has a last
+    /// key that no segment the slot names and no run's temp name holds --
+    /// which a crash never leaves, and damage that passes over a newer
+    /// slot can. Only that one key of such a segment is read. A
+    /// store with no slot and only `seg-` files is one from before
+    /// manifests and opens from their names. Under
     /// `Options::manifest_pending` a pending segment the open reads back
     /// whole is fsynced, with its ordered index under `Options::ord_durable`
     /// and the directory, before the open writes the slot naming it durable.
@@ -28927,7 +28936,7 @@ impl Db {
         // a reopened store at its watermark.
         mem.commit();
         if held.is_none() {
-            Db::unnamed_refusals(dir, taken, sealed, &live, &on_disk, &mem)?;
+            Db::unnamed_refusals(dir, taken, sealed, &live, &on_disk)?;
         }
         // The store is what the slot taken names: from here the open
         // removes what nothing names and writes what it owes.
@@ -28985,7 +28994,13 @@ impl Db {
                         files.extend(Db::ord_name_for(name));
                     }
                     for f in files {
-                        vault::open(dir.join(&f))?.sync_all()?;
+                        let file = vault::open(dir.join(&f))?;
+                        if opts.fail_open_pending_sync {
+                            return Err(err(&format!(
+                                "a test failed the open's fsync of the pending {f}"
+                            )));
+                        }
+                        file.sync_all()?;
                         open_synced.push(f);
                     }
                 }
@@ -28994,6 +29009,7 @@ impl Db {
             }
             mseq += 1;
             let to = slot.write_shape(dir, &opts, mseq, sealed, &live, take(&mut tear))?;
+            open_synced.push(MANIFEST_SLOTS[to].into());
             synced[to] = mseq;
             if upgrade {
                 let older = slot.next();
@@ -29618,11 +29634,15 @@ impl Db {
     /// leaves one whose log files and temp names may be gone. A segment
     /// newer than every segment the slot names and whose writes are all
     /// within what it covers -- a merge's output, or a run's segment, named
-    /// at the log's sequence -- is held by its first and last keys to what
-    /// holds its records: a segment the slot names, as a merge's inputs
-    /// hold its outputs, a run's segment beside its temp name, a run's own
-    /// among them, or the replayed log; a run's whose temp name was
-    /// retired holds them alone. One with writes past what the slot covers
+    /// at the log's sequence -- is held by its last key, and by that alone,
+    /// to what holds its records: a segment the slot names, as a merge's
+    /// inputs hold its outputs, or a run's segment beside its temp name, a
+    /// run's own among them; a run's whose temp name was retired holds it
+    /// alone. A run's keys sit above every key before it, so its last key
+    /// is where a run's records show, in a run's segment or in a merge's
+    /// output that folded one in. The log holds none of them: a run's
+    /// commits never go to it in the clear, and a merge's keys are its
+    /// inputs'. One with writes past what the slot covers
     /// is a seal's, and is swept as the crash window's: under a buffered
     /// policy a torn publish of its landing leaves it synced beside a log
     /// a power cut cut short, the same files as damage past a log that
@@ -29636,7 +29656,6 @@ impl Db {
         sealed: u64,
         live: &[String],
         on_disk: &[String],
-        mem: &MemTable,
     ) -> Result<()> {
         let Some(slot) = taken else {
             return Ok(());
@@ -29694,13 +29713,11 @@ impl Db {
                     .filter_map(whole)
                     .collect()
             });
-            for k in [b.key_at(0), b.key_at(b.keys() - 1)].into_iter().flatten() {
-                if mem.get(k, usize::MAX).is_none()
-                    && !holders.iter().any(|h| h.lookup(k).is_some())
-                {
+            if let Some(k) = b.key_at(b.keys() - 1) {
+                if !holders.iter().any(|h| h.lookup(k).is_some()) {
                     return Err(refused(format!(
                         "{u} holds keys nothing the slot names holds, and neither does \
-                         the log or a run's temp name"
+                         a run's temp name"
                     )));
                 }
             }
@@ -33024,7 +33041,8 @@ impl Db {
     }
 
     /// A test's: the files the open that made this store fsynced, the
-    /// directory as `.` (`Shared::open_synced`).
+    /// directory as `.`, in the order the fsyncs returned
+    /// (`Shared::open_synced`).
     #[doc(hidden)]
     pub fn open_synced_files(&self) -> Vec<String> {
         self.shared.open_synced.clone()

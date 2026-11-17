@@ -9047,21 +9047,41 @@ fn oo_holds(db: &Reader, model: &BTreeMap<Vec<u8>, Vec<Vec<u8>>>, tag: &str) {
 ///
 /// And the same with the run's first key, or its last, written again after
 /// the flush, by a commit the log holds and the store killed after it: the
-/// replayed log holds that key, and the run's other end is the key nothing
-/// else holds.
+/// replayed log holds that key, and is no holder of a run's records, which
+/// in the clear never go to it. And the same over a segment flushed
+/// before the run, which the slot before names: a segment that holds
+/// keys, and none of them the run's.
 #[test]
 fn a_flushed_run_is_not_lost_when_the_newest_slot_is_damaged_after_its_temp_retired() {
     for again in [None, Some(0), Some(1999)] {
-        a_damaged_slot_over_a_flushed_run(again);
+        a_damaged_slot_over_a_flushed_run(again, false);
     }
+    a_damaged_slot_over_a_flushed_run(None, true);
 }
 
-fn a_damaged_slot_over_a_flushed_run(again: Option<u32>) {
-    let d = dir(&format!("oo-run-{again:?}"));
-    let c = dir(&format!("oo-run-{again:?}-kill"));
-    let opts = Options::default();
+fn a_damaged_slot_over_a_flushed_run(again: Option<u32>, below: bool) {
+    let d = dir(&format!("oo-run-{again:?}-{below}"));
+    let c = dir(&format!("oo-run-{again:?}-{below}-kill"));
+    // Below, the run's flush leaves its segment a piece, so the partition
+    // the slot before names stands under the name that slot gives it.
+    let opts = Options {
+        partition_on_flush: !below,
+        flush_schedules: !below,
+        drain_names_partition: !below,
+        ..Options::default()
+    };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let mut model = BTreeMap::new();
+    if below {
+        for k in 0..2000u32 {
+            let k = format!("a-{k:06}").into_bytes();
+            db.append(&k, b"below");
+            model.insert(k, vec![b"below".to_vec()]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+    }
     for k in 0..2000u32 {
         db.append(key(k).as_bytes(), b"acked");
         model.insert(key(k).into_bytes(), vec![b"acked".to_vec()]);
@@ -9089,6 +9109,10 @@ fn a_damaged_slot_over_a_flushed_run(again: Option<u32>) {
             .any(|n| !named(&older).iter().any(|(o, _)| o == n)),
         "premise: a segment only the newest slot names: {segs:?}"
     );
+    assert!(
+        !below || !named(&older).is_empty(),
+        "premise: the slot before names the segment below the run"
+    );
     let saved = std::fs::read(&newest).unwrap();
     oo_damage(&newest);
     oo_refused(&d, &opts, OO_KEYS, "run");
@@ -9097,7 +9121,7 @@ fn a_damaged_slot_over_a_flushed_run(again: Option<u32>) {
     oo_holds(&db, &model, "run, repaired");
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
-    let _ = std::fs::remove_dir_all(dir(&format!("oo-run-{again:?}")));
+    let _ = std::fs::remove_dir_all(dir(&format!("oo-run-{again:?}-{below}")));
 }
 
 /// A refusal made once the log is replayed leaves the log as it found it.
@@ -9151,6 +9175,97 @@ fn a_refused_open_leaves_the_log_files_its_replay_ended_before() {
     oo_refused(&c, &opts, OO_KEYS, "loose");
     let _ = std::fs::remove_dir_all(&d);
     let _ = std::fs::remove_dir_all(&c);
+}
+
+/// The same three log files and the same cut, with the slot whole: the
+/// open takes the store, the log ends where the second file begins, and
+/// the third file, whose records continue a tail the cut took, is removed
+/// once the open has decided, so the open after a commit reads no gap.
+#[test]
+fn an_open_removes_the_log_files_after_the_end_it_replayed_to() {
+    let d = dir("oo-loose-ok");
+    let c = dir("oo-loose-ok-kill");
+    let opts = rotating();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut i = 0u32;
+    while db.seal_waits().wal_rotations < 2 {
+        put_commit(&mut db, &format!("r{i:07}"), "x").unwrap();
+        i += 1;
+        assert!(i < 100_000, "the log rotated twice");
+    }
+    put_commit(&mut db, "s0000000", "x").unwrap();
+    copy_store(&d, &c);
+    drop(db);
+    let wals = wal_names(&c);
+    assert_eq!(wals.len(), 3, "premise: three log files: {wals:?}");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(c.join(&wals[0]))
+        .unwrap()
+        .set_len(WAL_HEAD)
+        .unwrap();
+    let mut db = Db::open(&c, opts.clone()).expect("the cut store opens");
+    let after = wal_names(&c);
+    assert!(
+        !after.contains(&wals[2]),
+        "the log file after the end the replay reached is removed: {after:?}"
+    );
+    put_commit(&mut db, "t0000000", "x").unwrap();
+    db.sync().unwrap();
+    drop(db);
+    let db = Db::open(&c, opts).expect("the store opens again after a commit");
+    assert_eq!(read_vec(&db, b"t0000000"), vec![b"x".to_vec()]);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&c);
+}
+
+/// A store that recycled its log killed with a spare standing, then
+/// opened recycling none: the spare is nobody's pool and the open removes
+/// it, once it has decided the store is what it reads.
+#[test]
+fn an_open_that_recycles_no_log_removes_the_spare_it_finds() {
+    let d = dir("oo-spare");
+    let opts = Options {
+        recycle_wal: true,
+        seal_bytes: 32 << 10,
+        l0_trigger: 2,
+        ..Options::default()
+    };
+    let spares = |d: &Path| -> Vec<String> {
+        files_of(d)
+            .into_keys()
+            .filter(|n| n.starts_with("spare-"))
+            .collect()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut i = 0u32;
+    while spares(&d).is_empty() {
+        for _ in 0..400 {
+            db.append(format!("k{:06}", i % 5000).as_bytes(), b"v");
+            i += 1;
+        }
+        db.commit().unwrap();
+        db.settle().unwrap();
+        assert!(i < 2_000_000, "premise: a retired log kept as a spare");
+    }
+    std::mem::forget(db);
+    assert!(!spares(&d).is_empty(), "premise: the kill leaves the spare");
+    let db = Db::open(
+        &d,
+        Options {
+            recycle_wal: false,
+            ..opts
+        },
+    )
+    .unwrap();
+    assert!(
+        spares(&d).is_empty(),
+        "an open that recycles nothing removes the spare: {:?}",
+        spares(&d)
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
 }
 
 /// A partition, then every key rewritten by commits through the log until
@@ -9312,13 +9427,14 @@ fn an_open_under_a_cipher_adopts_a_pending_segment_and_opens_again() {
 /// segment linked under its piece name beside its temp name; a merge's
 /// outputs renamed into place beside the inputs the slot before names; and
 /// a merge's inputs left beside the outputs a durable slot names, their
-/// first and last keys among those the merge dropped; and under a buffered
+/// first and last keys among those the merge dropped, and the same beside
+/// an older partition the merge left alone; and under a buffered
 /// policy, a seal's segments synced beside a log whose frames for them a
 /// power cut took, the publish of their landing torn -- the store as it
 /// was before those writes, which no sync acknowledged. Each opens with every acknowledged write, the unnamed files swept.
 #[test]
 fn the_windows_a_torn_publish_leaves_open_through_the_slot_before() {
-    for case in ["seal", "run", "merge", "inputs", "buffered"] {
+    for case in ["seal", "run", "merge", "inputs", "inputs-old", "buffered"] {
         let d = dir(&format!("oo-win-{case}"));
         let c = dir(&format!("oo-win-{case}-kill"));
         let opts = Options {
@@ -9328,7 +9444,7 @@ fn the_windows_a_torn_publish_leaves_open_through_the_slot_before() {
             } else {
                 SyncPolicy::Always
             },
-            flush_schedules: case == "merge" || case == "inputs",
+            flush_schedules: case == "merge" || case.starts_with("inputs"),
             seal_bytes: 1 << 20,
             l0_trigger: 1000,
             ..Options::default()
@@ -9338,6 +9454,16 @@ fn the_windows_a_torn_publish_leaves_open_through_the_slot_before() {
         fn put(db: &mut Db, model: &mut BTreeMap<Vec<u8>, Vec<Vec<u8>>>, k: Vec<u8>, v: &[u8]) {
             db.put(&k, v);
             model.insert(k, vec![v.to_vec()]);
+        }
+        if case == "inputs-old" {
+            // A partition below the rest, older than every segment after
+            // it and left alone by the merge below.
+            for k in (0..2000u32).rev() {
+                put(&mut db, &mut model, format!("a-{k:06}").into_bytes(), b"a");
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+            db.settle().unwrap();
         }
         // A partition first, from writes through the log.
         for k in (0..2000u32).rev() {
@@ -9426,7 +9552,7 @@ fn the_windows_a_torn_publish_leaves_open_through_the_slot_before() {
         copy_store(&d, &c);
         db.hold_seal_durable(false);
         db.hold_merge_landing(false);
-        if case == "inputs" {
+        if case.starts_with("inputs") {
             // The merge landed durable and the crash before it unlinked
             // its inputs: its outputs named, and the inputs put back from
             // the copy taken while it was held.
@@ -9736,6 +9862,30 @@ fn a_pending_segment_adopted_by_an_open(how: OoTear, ord_durable: bool, pieces: 
         .1
         .iter()
         .any(|(n, p)| pend.contains(n) && !p);
+    // The order: the slot that names the segments durable covers the log
+    // frames that were their writes' only durable copy, so every pending
+    // segment, its durable index and the directory's entries were durable
+    // before it -- a power cut between that slot's fdatasync and any of
+    // theirs leaves a durable slot naming what may be gone.
+    assert!(durable, "{tag}: premise: the open adopted {pend:?}");
+    {
+        let slot = newest.file_name().unwrap().to_str().unwrap().to_string();
+        let at = synced
+            .iter()
+            .position(|s| *s == slot)
+            .unwrap_or_else(|| panic!("{tag}: the open records its slot {slot}: {synced:?}"));
+        let owed = pend
+            .iter()
+            .chain(ords.iter().filter(|_| ord_durable))
+            .cloned()
+            .chain(std::iter::once(".".to_string()));
+        for f in owed {
+            assert!(
+                synced[..at].contains(&f),
+                "{tag}: {f} fsynced before the slot {slot} named it durable: {synced:?}"
+            );
+        }
+    }
     if kernel {
         for f in &files {
             let unwritten = os_page_unwritten(&d.join(f));
@@ -9789,6 +9939,78 @@ fn a_pending_segment_adopted_by_an_open(how: OoTear, ord_durable: bool, pieces: 
             );
         }
     }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The open's fsync of the pending segment it adopts fails
+/// (`Options::fail_open_pending_sync`): the open answers the failure, and
+/// no slot it wrote names the segment durable, since the slot that does
+/// is written only once the fsyncs have returned. Both slots are as the
+/// kill left them, and the store opens with every write after.
+#[test]
+fn an_open_whose_pending_fsync_fails_names_nothing_durable() {
+    let d = dir("oo-pend-fail");
+    let opts = Options {
+        manifest_pending: true,
+        direct_ingest: false,
+        seal_bytes: 1 << 20,
+        l0_trigger: 1000,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    for k in (0..3000u32).rev() {
+        db.put(key(k).as_bytes(), b"v");
+        model.insert(key(k).into_bytes(), vec![b"v".to_vec()]);
+    }
+    db.commit().unwrap();
+    db.hold_seal_durable(true);
+    db.seal().unwrap();
+    let pending = || -> Vec<String> {
+        let b = std::fs::read(&oo_by_age(&d)[0]).unwrap();
+        oo_names(&b)
+            .1
+            .into_iter()
+            .filter(|(_, p)| *p)
+            .map(|(n, _)| n)
+            .collect()
+    };
+    wait_for("the seal's pending slot", || !pending().is_empty());
+    let pend = pending();
+    std::mem::forget(db);
+    let slots = |d: &Path| -> Vec<Option<Vec<u8>>> {
+        OO_SLOTS
+            .iter()
+            .map(|s| std::fs::read(d.join(s)).ok())
+            .collect()
+    };
+    let before = slots(&d);
+    match Db::open(
+        &d,
+        Options {
+            fail_open_pending_sync: true,
+            ..opts.clone()
+        },
+    ) {
+        Ok(_) => panic!("the open answered Ok over a failed fsync of {pend:?}"),
+        Err(e) => assert!(
+            e.to_string().contains("fsync of the pending"),
+            "the open answers the failed fsync: {e}"
+        ),
+    }
+    for b in slots(&d).into_iter().flatten() {
+        assert!(
+            !oo_names(&b).1.iter().any(|(n, p)| pend.contains(n) && !p),
+            "no slot names {pend:?} durable after its fsync failed"
+        );
+    }
+    assert!(
+        slots(&d) == before,
+        "the slots are as the kill left them after the failed open"
+    );
+    let db = Db::open(&d, opts).expect("the store opens once the device answers");
+    oo_holds(&db, &model, "after the failed open");
+    drop(db);
     let _ = std::fs::remove_dir_all(&d);
 }
 
