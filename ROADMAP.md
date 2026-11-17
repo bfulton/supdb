@@ -177,6 +177,44 @@ What an engine picker would hit, roughly in order.
   The same for a direct run's file: its writes at the offset the writer
   counts, a failed one held and written again at the next sync, and a
   failed fdatasync kept, its own or the helper's behind the writer.
+- [ ] **A log's power cuts held on a device that loses pages.** An open
+  takes what it replays from the log as unsynced, and reads a log file
+  whose first sector is zeroes as a log with nothing in it. The tests
+  build each state a power cut can leave by hand, from a copy of the
+  page cache and a trace of the fdatasyncs the store issued
+  (`Db::trace_wal_syncs`); none has cut a real device's power, and which
+  of those states ext4 and xfs reach under their defaults is reasoned and
+  not observed. Done when a dm-flakey target that drops unflushed writes
+  (`drop_writes`, or a dm-log-writes replay to each flush) runs a kill, a
+  reopen, a `sync` and a cut, and a fresh store, a rotation and a flush
+  with the log never synced, and every open after reads what was
+  acknowledged. The reading takes a power cut to keep or lose a sector
+  whole: a device that tears inside one would undo the first-sector rule,
+  and the in-place rewrite of a recycled file's header
+  (`Options::recycle_wal`) with it, since there the new header and this
+  life's first frames share the sector behind which the last life's
+  header would otherwise survive.
+- [ ] **A reopen with nothing replayed held to no fdatasync at the
+  syscall.** The tests read the log's syncs through the engine's own
+  trace (`Db::trace_wal_syncs`), which records the syncs the engine's
+  sync paths make and the open's cut, and a sync written straight into
+  the open's path records nothing there: such a sync passes every test.
+  `strace -f -y -e trace=fdatasync,fsync` over
+  `a_reopen_with_nothing_replayed_owes_its_log_no_sync` reads none of a
+  reopened log's files synced but where the open cut a torn tail or a
+  lost header, by hand. Done when a test counts the process's
+  fdatasyncs of the store's files across an open, without a seam the
+  path has to remember to call.
+- [ ] **A zeroed first sector over frames that verify behind it.** An
+  open reads a log file whose first sector is zeroes as a log with
+  nothing in it and cuts it, the newest file included, whatever lies
+  behind the sector. A power cut leaves that state only over frames no
+  sync covered; media damage to a synced sector leaves it over frames
+  that were acknowledged, and the open cannot tell the two apart from
+  the file, since the policy that wrote it is the last life's. Done when
+  such a file whose bytes past the sector hold a commit frame that
+  verifies is set aside under a name of its own and named in the open's
+  refusal or its counters, not cut.
 - [ ] **A helper sync in flight when the run's commit syncs.** The run's
   commit reads the helper thread's kept fdatasync error after its own
   fdatasync, and a helper whose failed sync has consumed the device's

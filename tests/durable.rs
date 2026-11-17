@@ -3016,3 +3016,1556 @@ fn a_cipher_runs_batch_written_again_by_a_commit_of_nothing_is_synced_in_its_log
     let _ = std::fs::remove_dir_all(&d);
     let _ = std::fs::remove_dir_all(&crash);
 }
+
+// ---------------------------------------------------------------------
+// log-at-open: what an open makes of the log a crash left. A process kill
+// keeps the page cache, so the frames an open replays are visible whether
+// or not any fdatasync covered them, and the first sync or flush after the
+// open has to make them durable; and a log file no sync ever covered can
+// come back from a power cut with its first sector zero, which is a log
+// with nothing in it and never a refusal.
+// ---------------------------------------------------------------------
+
+/// A plain log's header length; the kind byte is its last.
+const WAL_HEAD: u64 = 8;
+const WAL_KIND_AT: u64 = 7;
+const WAL_LOOSE_KIND: u8 = 5;
+
+fn bkey(batch: char, i: u32) -> Vec<u8> {
+    format!("{batch}{i:04}").into_bytes()
+}
+
+fn bval(batch: char, i: u32) -> Vec<u8> {
+    format!("v-{batch}-{i}").into_bytes()
+}
+
+fn put_batch(db: &mut Db, batch: char, n: u32) {
+    for i in 0..n {
+        db.put(&bkey(batch, i), &bval(batch, i));
+    }
+    db.commit().unwrap();
+}
+
+/// The log files of a store, by name, in id order.
+fn wal_names(d: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(d)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("wal-"))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Every file of a store by name with its bytes: what a refused open must
+/// leave as it found.
+fn files_of(d: &Path) -> BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(d)
+        .unwrap()
+        .map(|e| e.unwrap())
+        .filter(|e| e.file_type().unwrap().is_file())
+        .map(|e| {
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                std::fs::read(e.path()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// The power cut, applied to a copy of the store's files in `crash`: each
+/// log file cut to the longest length an fdatasync of it covered in any
+/// of the `lives` traced (`Db::wal_syncs_traced`), and never below its
+/// header of `head` bytes, which a power cut may keep whether or not it
+/// was synced; and a header whose kind was rewritten chained after its
+/// file's last fdatasync put back loose, as the device may still hold it.
+/// Nothing a sync covered is taken. The files named in `whole` keep what
+/// no sync covered as well, as the device may have written it back: the
+/// state where a later file's frames survive a cut of an earlier one's.
+fn power_cut_logs(crash: &Path, lives: &[&[(PathBuf, Option<u64>)]], head: u64, whole: &[&str]) {
+    for name in wal_names(crash) {
+        let mut durable = 0u64;
+        let mut chained_unsynced = false;
+        for (p, ev) in lives.iter().flat_map(|l| l.iter()) {
+            if p.file_name().map(|n| n.to_string_lossy() == name.as_str()) != Some(true) {
+                continue;
+            }
+            match ev {
+                Some(len) => {
+                    durable = durable.max(*len);
+                    chained_unsynced = false;
+                }
+                None => chained_unsynced = true,
+            }
+        }
+        let path = crash.join(&name);
+        let len = std::fs::metadata(&path).unwrap().len();
+        let keep = if whole.contains(&name.as_str()) {
+            len
+        } else {
+            durable.max(head.min(len))
+        };
+        assert!(
+            durable <= len,
+            "{name}: a sync covered more than the file holds"
+        );
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        if keep < len {
+            f.set_len(keep).unwrap();
+        }
+        if chained_unsynced && len > WAL_KIND_AT {
+            use std::os::unix::fs::FileExt;
+            f.write_at(&[WAL_LOOSE_KIND], WAL_KIND_AT).unwrap();
+        }
+    }
+}
+
+fn every_key_of(db: &Reader, batches: &[(char, u32)], what: &str) {
+    for &(batch, n) in batches {
+        for i in 0..n {
+            assert_eq!(
+                read_vec(db, &bkey(batch, i)),
+                vec![bval(batch, i)],
+                "{what}: key {batch}{i:04}, acknowledged before the power cut, is gone after it"
+            );
+        }
+    }
+}
+
+/// The batches of `batches` an open shows, which under a buffered policy
+/// must be a prefix of them in commit order, each whole or absent.
+fn a_prefix_of(db: &Reader, batches: &[(char, u32)], what: &str) -> usize {
+    let mut shown = 0;
+    for (at, &(batch, n)) in batches.iter().enumerate() {
+        let here = (0..n)
+            .filter(|&i| !read_vec(db, &bkey(batch, i)).is_empty())
+            .count() as u32;
+        assert!(
+            here == 0 || here == n,
+            "{what}: batch {batch} is in part, {here} keys of {n}"
+        );
+        if here == n {
+            assert_eq!(shown, at, "{what}: batch {batch} without a batch before it");
+            shown += 1;
+        }
+    }
+    shown
+}
+
+fn buffered() -> Options {
+    Options {
+        sync: SyncPolicy::EveryN(u32::MAX),
+        ..Options::default()
+    }
+}
+
+/// Life 1: batch `a` committed and synced, batch `b` committed and left
+/// unsynced, then a process kill: the page cache keeps batch `b`. `put`
+/// throughout, so every write goes through the log. Under `Always` the
+/// same file is what a kill between batch `b`'s write and its fdatasync
+/// leaves: `b` not acknowledged before the kill, visible after the reopen.
+/// The kill is a copy of the files at that instant, opened in place of
+/// the store (`killed`). Returns what life 1's syncs covered.
+fn life_one(d: &Path, opts: Options) -> Vec<(PathBuf, Option<u64>)> {
+    let mut db = Db::create(&made(d), opts).unwrap();
+    db.trace_wal_syncs(true);
+    put_batch(&mut db, 'a', 100);
+    db.sync().unwrap();
+    put_batch(&mut db, 'b', 100);
+    let (_, synced, written) = db.wal_durable();
+    assert!(
+        written > synced,
+        "life 1 leaves batch b unsynced: synced {synced}, written {written}"
+    );
+    assert_eq!(
+        db.levels(),
+        (0, 0),
+        "life 1: the log alone holds both batches"
+    );
+    let traced = db.wal_syncs_traced();
+    killed(db, d);
+    traced
+}
+
+/// Where a store whose kill `killed` copies into `d` is made.
+fn made(d: &Path) -> PathBuf {
+    let m = d.with_extension("made");
+    let _ = std::fs::remove_dir_all(&m);
+    m
+}
+
+/// A process kill of `db`, made where `made(d)` names: its files copied
+/// into `d` as they stand, which keeps whatever the page cache holds, and
+/// the store closed, its own directory gone. The copy is opened in the
+/// store's place; a store under a cipher is one open in the process, so
+/// the original is dropped before that open, never forgotten.
+fn killed(db: Db, d: &Path) {
+    let m = d.with_extension("made");
+    copy_store(&m, d);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&m);
+}
+
+/// The reopen that replays batch `b` out of the page cache, with its syncs
+/// traced from the open on.
+fn life_two(d: &Path, opts: Options) -> Db {
+    let mut db = Db::open(d, opts).unwrap();
+    db.trace_wal_syncs(true);
+    assert_eq!(
+        read_vec(&db, &bkey('b', 7)),
+        vec![bval('b', 7)],
+        "precondition: the reopen made batch b visible"
+    );
+    db
+}
+
+fn a_sync_after_a_reopen(tag: &str, life1: Options, opts: Options, head: u64) {
+    let d = dir(&format!("dur-reopen-sync-{tag}"));
+    let crash = dir(&format!("dur-reopen-sync-{tag}-cut"));
+    let one = life_one(&d, life1);
+    let mut db = life_two(&d, opts.clone());
+    // The acknowledgement: everything visible before it is durable.
+    db.sync().unwrap();
+    copy_store(&d, &crash);
+    power_cut_logs(&crash, &[&one, &db.wal_syncs_traced()], head, &[]);
+    drop(db);
+    let db = Db::open(&crash, opts).unwrap();
+    every_key_of(
+        &db,
+        &[('a', 100), ('b', 100)],
+        &format!("{tag}: sync after a reopen"),
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+#[test]
+fn a_sync_after_a_reopen_makes_the_replayed_writes_durable_buffered() {
+    a_sync_after_a_reopen("everyn", buffered(), buffered(), WAL_HEAD);
+}
+
+#[test]
+fn a_sync_after_a_reopen_makes_the_replayed_writes_durable_always() {
+    a_sync_after_a_reopen("always", buffered(), Options::default(), WAL_HEAD);
+}
+
+/// The sealed log's header, the kind and the file's wrapped key, is longer
+/// than the plain one's; the power cut keeps all of it or a prefix only
+/// where no sync covered it, and here life 1's sync did.
+#[test]
+fn a_sync_after_a_reopen_makes_the_replayed_writes_durable_under_a_cipher() {
+    let o = Options {
+        sync: SyncPolicy::EveryN(u32::MAX),
+        ..under_cipher()
+    };
+    a_sync_after_a_reopen("cipher", o.clone(), o, WAL_HEAD);
+}
+
+/// Run with the store's merges on and off: on, the drain joins a merge
+/// whose synced publish names its segment before the answer, so a slot
+/// left owed is superseded there; off, the drain's own slot is all that
+/// names it, and only the order of the answer and the slot's fdatasync
+/// keeps the replayed writes.
+fn a_flush_after_a_reopen(tag: &str, life1: Options, opts: Options) {
+    a_flush_after_a_reopen_once(tag, life1.clone(), opts.clone());
+    let off = Options {
+        compact: false,
+        ..opts
+    };
+    a_flush_after_a_reopen_once(&format!("{tag}-nomerge"), life1, off);
+}
+
+fn a_flush_after_a_reopen_once(tag: &str, life1: Options, opts: Options) {
+    let d = dir(&format!("dur-reopen-flush-{tag}"));
+    let crash = dir(&format!("dur-reopen-flush-{tag}-cut"));
+    let one = life_one(&d, life1);
+    let mut db = life_two(&d, opts.clone());
+    // The slots as they stand, durable as far as this test is concerned.
+    let slots = ["manifest", "manifest.alt"];
+    let before: Vec<Option<Vec<u8>>> = slots
+        .iter()
+        .map(|s| std::fs::read(d.join(s)).ok())
+        .collect();
+    // A slot the drain leaves owed is not synced until the hold lifts, so
+    // the instant after the answer can be copied.
+    db.hold_owed_slot(true);
+    db.flush().unwrap();
+    let owed = db.owed_slots_held();
+    copy_store(&d, &crash);
+    power_cut_logs(&crash, &[&one, &db.wal_syncs_traced()], WAL_HEAD, &[]);
+    if owed > 0 {
+        // The slot the drain wrote, its fdatasync not yet run: a power cut
+        // may keep the slots as they were before the write.
+        for (s, b) in slots.iter().zip(&before) {
+            match b {
+                Some(bytes) => std::fs::write(crash.join(s), bytes).unwrap(),
+                None => {
+                    let _ = std::fs::remove_file(crash.join(s));
+                }
+            }
+        }
+    }
+    db.hold_owed_slot(false);
+    drop(db);
+    let db = Db::open(&crash, opts).unwrap();
+    every_key_of(
+        &db,
+        &[('a', 100), ('b', 100)],
+        &format!("{tag}: flush after a reopen"),
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+#[test]
+fn a_flush_after_a_reopen_is_answered_only_once_its_writes_are_durable_buffered() {
+    a_flush_after_a_reopen("everyn", buffered(), buffered());
+}
+
+#[test]
+fn a_flush_after_a_reopen_is_answered_only_once_its_writes_are_durable_always() {
+    a_flush_after_a_reopen("always", buffered(), Options::default());
+}
+
+/// The same under a cipher: the drain's segment gets its envelope and its
+/// slot names it, and the log's sealed records are what the flush covers.
+#[test]
+fn a_flush_after_a_reopen_is_answered_only_once_its_writes_are_durable_under_a_cipher() {
+    let o = Options {
+        sync: SyncPolicy::EveryN(u32::MAX),
+        ..under_cipher()
+    };
+    a_flush_after_a_reopen("cipher", o.clone(), o);
+}
+
+/// The instrument the flush tests above read their power cut by, held to
+/// firing: a drain over a log that owes nothing is answered before its
+/// slot's fdatasync, so with the hold on the answer comes with a slot
+/// counted owed, and the closed log file the slot covers is still in the
+/// directory however long the hold stands -- a power cut there that
+/// takes the slot replays it. Without this, a hold that counted nothing
+/// would let those tests keep the drain's slot through the cut, and a
+/// drain answered before the slot of a log that owes frames would pass
+/// them; and a hold that held nothing would retire the file before the
+/// copy. And the count is of slots still owed: one a merge's synced
+/// publish superseded before the answer is not, or those tests would put
+/// back a slot the device holds and fail a drain for nothing.
+#[test]
+fn a_drain_answered_before_its_slots_sync_keeps_the_log_file_the_slot_covers() {
+    let d = dir("dur-owed-slot");
+    let crash = dir("dur-owed-slot-cut");
+    // The seal syncs and closes the log file it covers, so the drain's
+    // slot is what retires a file, and the log owes nothing at the drain;
+    // no merge, whose synced publish would supersede the slot before the
+    // answer.
+    let opts = Options {
+        seal_rotates_wal: true,
+        compact: false,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    put_batch(&mut db, 'a', 100);
+    assert!(!db.wal_unsynced(), "precondition: the log owes nothing");
+    let closed = wal_names(&d)[0].clone();
+    let slots = ["manifest", "manifest.alt"];
+    let before: Vec<Option<Vec<u8>>> = slots
+        .iter()
+        .map(|s| std::fs::read(d.join(s)).ok())
+        .collect();
+    db.hold_owed_slot(true);
+    db.flush().unwrap();
+    assert!(
+        db.owed_slots_held() > 0,
+        "the drain over a log that owes nothing left its slot owed"
+    );
+    // Held, the slot's fdatasync and the retirement behind it wait; a hold
+    // that does not hold retires the file within this.
+    for _ in 0..30 {
+        assert!(
+            d.join(&closed).exists(),
+            "the closed log file {closed} retired before the slot that covers it was synced"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    copy_store(&d, &crash);
+    for (s, b) in slots.iter().zip(&before) {
+        match b {
+            Some(bytes) => std::fs::write(crash.join(s), bytes).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(crash.join(s));
+            }
+        }
+    }
+    db.hold_owed_slot(false);
+    db.settle().unwrap();
+    assert!(
+        !d.join(&closed).exists(),
+        "the slot, synced, retires the closed log file {closed}"
+    );
+    assert!(
+        wal_names(&crash).contains(&closed),
+        "the copy holds the closed log file"
+    );
+    drop(db);
+    let db = Db::open(&crash, opts.clone())
+        .unwrap_or_else(|e| panic!("the slot a power cut took before its sync: {e}"));
+    every_key_of(&db, &[('a', 100)], "a drain whose slot a power cut took");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+    // With the merges on, the drain joins a merge whose synced publish
+    // supersedes the slot before the answer: nothing is owed then, and
+    // the closed file is retired behind the durable slot.
+    let opts = Options {
+        compact: true,
+        ..opts
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    put_batch(&mut db, 'a', 100);
+    let closed = wal_names(&d)[0].clone();
+    db.hold_owed_slot(true);
+    db.flush().unwrap();
+    assert_eq!(
+        db.owed_slots_held(),
+        0,
+        "a slot a merge's publish superseded before the answer counted owed"
+    );
+    assert!(
+        !d.join(&closed).exists(),
+        "the superseding slot, synced, retired the closed log file {closed}"
+    );
+    db.hold_owed_slot(false);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A buffered store whose log rotated by size with frames no sync had
+/// covered, killed: two log files, the closed one loose, the live one's
+/// header saying so, both read back by the open out of the page cache.
+fn rotated_and_killed(d: &Path, opts: Options) -> (Vec<(PathBuf, Option<u64>)>, u32) {
+    let mut db = Db::create(&made(d), opts).unwrap();
+    db.trace_wal_syncs(true);
+    let val = "x".repeat(100);
+    let mut i = 0u32;
+    while db.seal_waits().wal_rotations == 0 {
+        put_commit(&mut db, &format!("r{i:07}"), &val).unwrap();
+        i += 1;
+        assert!(i < 10_000, "the log never rotated");
+    }
+    put_commit(&mut db, "s0000000", &val).unwrap();
+    assert!(db.seal_waits().rotated_unsynced > 0, "a loose rotation");
+    assert_eq!(
+        db.levels(),
+        (0, 0),
+        "nothing sealed: both files hold frames"
+    );
+    let traced = db.wal_syncs_traced();
+    assert!(traced.is_empty(), "nothing synced in life 1: {traced:?}");
+    killed(db, d);
+    assert_eq!(wal_names(d).len(), 2, "two log files");
+    (traced, i)
+}
+
+fn rotating() -> Options {
+    Options {
+        sync: SyncPolicy::EveryN(u32::MAX),
+        seal_rotates_wal: false,
+        seal_bytes: 64 << 10,
+        seal_max_pct: 0,
+        ..Options::default()
+    }
+}
+
+/// The reopen of a store whose closed log file was left loose: a sync
+/// after it makes the closed file's replayed frames durable as well as the
+/// live file's. Synced alone, the live file's header is rewritten chained
+/// over a closed file a power cut can still cut, and the open after that
+/// cut reads a gap at a chained boundary and refuses the store.
+#[test]
+fn a_sync_after_a_reopen_makes_a_replayed_loose_log_file_durable() {
+    let d = dir("dur-reopen-loose");
+    let crash = dir("dur-reopen-loose-cut");
+    let opts = rotating();
+    let (one, n) = rotated_and_killed(&d, opts.clone());
+    let mut db = Db::open(&d, opts.clone()).unwrap();
+    db.trace_wal_syncs(true);
+    db.sync().unwrap();
+    copy_store(&d, &crash);
+    power_cut_logs(&crash, &[&one, &db.wal_syncs_traced()], WAL_HEAD, &[]);
+    drop(db);
+    let db = Db::open(&crash, opts)
+        .unwrap_or_else(|e| panic!("a store synced after its reopen is refused: {e}"));
+    let val = "x".repeat(100);
+    for i in 0..n {
+        reads(&db, &format!("r{i:07}"), &val, "the closed file's frames");
+    }
+    reads(&db, "s0000000", &val, "the live file's frame");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// The reopen of a store whose live log holds replayed frames no sync
+/// covered, past the size a rotation closes a file at, and a commit of
+/// nothing, which rotates it before anything else is written or synced:
+/// the file it closes is loose, and the new file's header says so, so a
+/// power cut that takes the replayed frames and keeps a commit after the
+/// rotation leaves a log that ends at the boundary. Closed as chained, the
+/// commit after reads as a gap after a synced file, a record lost, and the
+/// open refuses.
+#[test]
+fn a_rotation_after_a_reopen_leaves_the_replayed_file_loose() {
+    let d = dir("dur-reopen-rotate");
+    let crash = dir("dur-reopen-rotate-cut");
+    let one = life_one(&d, buffered());
+    let opts = Options {
+        seal_bytes: 4096,
+        ..rotating()
+    };
+    let mut db = life_two(&d, opts.clone());
+    assert!(
+        db.wal_durable().2 >= 4096,
+        "the replayed file is past the size"
+    );
+    // The table is past `seal_bytes` too, so the commits may hand it to a
+    // seal: held before its landing, so the copy is of a store whose seal
+    // is in flight, and never of a listing taken before a segment's rename
+    // beside a manifest copied after the slot that names it, which is no
+    // state a crash leaves. Let go before anything here can fail, so a
+    // red run is not a hung one.
+    db.hold_seal_landing(true);
+    let rotate = db.commit();
+    let rotations = db.seal_waits().wal_rotations;
+    let after = put_commit(&mut db, "s0000000", "S");
+    let levels = db.levels();
+    copy_store(&d, &crash);
+    db.hold_seal_landing(false);
+    rotate.unwrap();
+    assert_eq!(rotations, 1, "the commit of nothing rotated");
+    after.unwrap();
+    assert_eq!(levels, (0, 0), "nothing landed");
+    // The new file's frame written back, the replayed file's tail lost.
+    let newest = wal_names(&crash).pop().unwrap();
+    assert_eq!(newest, "wal-00000001", "the rotation's file");
+    power_cut_logs(
+        &crash,
+        &[&one, &db.wal_syncs_traced()],
+        WAL_HEAD,
+        &[newest.as_str()],
+    );
+    drop(db);
+    let db = Db::open(&crash, opts).unwrap_or_else(|e| {
+        panic!("a power cut a buffered store may meet after a rotation is refused: {e}")
+    });
+    every_key_of(&db, &[('a', 100)], "synced in life 1");
+    a_prefix_of(&db, &[('b', 100)], "replayed in life 2");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// A reopen whose live log file's header a power cut had lost, beside a
+/// closed file it replayed frames out of the page cache from: the header
+/// the open writes says the file before it is loose, since no sync has
+/// covered that file's frames, so a commit after it that the device kept
+/// while it lost the closed file's tail reads as the log's end. Written
+/// chained, it reads as a record lost and the open refuses.
+#[test]
+fn a_header_an_open_writes_beside_an_unsynced_closed_file_is_loose() {
+    let d = dir("dur-reopen-newhead");
+    let crash = dir("dur-reopen-newhead-cut");
+    let opts = rotating();
+    let (one, _) = rotated_and_killed(&d, opts.clone());
+    // The live file's header lost, its page with it.
+    let live = d.join(wal_names(&d).last().unwrap());
+    let mut bytes = std::fs::read(&live).unwrap();
+    let n = bytes.len().min(4096);
+    bytes[..n].fill(0);
+    std::fs::write(&live, &bytes).unwrap();
+    let mut db = Db::open(&d, opts.clone())
+        .unwrap_or_else(|e| panic!("a lost header of a never-synced log is refused: {e}"));
+    db.trace_wal_syncs(true);
+    put_commit(&mut db, "t0000000", "T").unwrap();
+    copy_store(&d, &crash);
+    // The closed file's frames lost, no sync in either life having covered
+    // them, and the live file's written back.
+    let newest = wal_names(&crash).pop().unwrap();
+    power_cut_logs(
+        &crash,
+        &[&one, &db.wal_syncs_traced()],
+        WAL_HEAD,
+        &[newest.as_str()],
+    );
+    let at_once = Db::open(&crash, opts.clone())
+        .unwrap_or_else(|e| panic!("a power cut a buffered store may meet is refused: {e}"));
+    drop(at_once);
+    // Then a sync, which syncs the closed file and rewrites the header
+    // chained, both durable with it: damage after the power cut that takes
+    // the closed file's frames is a gap the open refuses, never the log's
+    // end with the acknowledged commit dropped.
+    db.sync().unwrap();
+    copy_store(&d, &crash);
+    power_cut_logs(&crash, &[&one, &db.wal_syncs_traced()], WAL_HEAD, &[]);
+    drop(db);
+    let names = wal_names(&crash);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(crash.join(&names[0]))
+        .unwrap()
+        .set_len(WAL_HEAD)
+        .unwrap();
+    let found = files_of(&crash);
+    match Db::open(&crash, opts) {
+        Ok(db) => reads(&db, "t0000000", "T", "acknowledged by the sync"),
+        Err(e) => {
+            assert!(
+                e.to_string().contains("sequence gap"),
+                "refused for the gap: {e}"
+            );
+            assert_eq!(files_of(&crash), found, "a refused open leaves the files");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// A store that crashed with nothing to replay -- closed; killed after a
+/// flush whose manifest covers every frame; killed with a closed file the
+/// manifest covers still beside the live one, as a kill between the
+/// manifest's sync and the file's removal leaves it -- or whose replayed
+/// frames the open synced itself, cutting a torn tail off them, reopens to
+/// a log nothing is owed: a sync and a flush after it issue no fdatasync
+/// of the log beyond the open's own, which the trace begins with where the
+/// open cut a tail and nowhere else. (A commit of nothing under `Always`
+/// syncs the log whatever was replayed.)
+#[test]
+fn a_reopen_with_nothing_replayed_owes_its_log_no_sync() {
+    for (tag, how) in [
+        ("closed", 0u8),
+        ("killed after a flush", 1),
+        ("killed with a torn tail", 2),
+        ("killed beside a covered closed file", 3),
+        (
+            "killed beside a covered closed file, the live header lost",
+            4,
+        ),
+    ] {
+        let d = dir(&format!("dur-reopen-clean-{how}"));
+        for opts in [buffered(), Options::default()] {
+            let _ = std::fs::remove_dir_all(&d);
+            let life1 = if how >= 3 { rotating() } else { buffered() };
+            let mut db = Db::create(&made(&d), life1).unwrap();
+            put_batch(&mut db, 'a', 100);
+            if how == 0 {
+                db.close().unwrap();
+                copy_store(&d.with_extension("made"), &d);
+            } else if how == 1 {
+                db.flush().unwrap();
+                db.settle().unwrap();
+                killed(db, &d);
+            } else if how == 2 {
+                put_batch(&mut db, 'b', 100);
+                killed(db, &d);
+                let wal = d.join("wal-00000000");
+                let mut f = std::fs::OpenOptions::new().append(true).open(&wal).unwrap();
+                std::io::Write::write_all(&mut f, &[9, 0, 0, 0, 1]).unwrap();
+            } else {
+                let val = "x".repeat(100);
+                let mut i = 0u32;
+                while db.seal_waits().wal_rotations == 0 {
+                    put_commit(&mut db, &format!("r{i:07}"), &val).unwrap();
+                    i += 1;
+                    assert!(i < 10_000, "the log never rotated");
+                }
+                let before = d.with_extension("before");
+                copy_store(&d.with_extension("made"), &before);
+                db.flush().unwrap();
+                db.settle().unwrap();
+                killed(db, &d);
+                assert!(
+                    !d.join("wal-00000000").exists(),
+                    "the flush retired the closed file"
+                );
+                std::fs::copy(before.join("wal-00000000"), d.join("wal-00000000")).unwrap();
+                let _ = std::fs::remove_dir_all(&before);
+                if how == 4 {
+                    // Whatever the live file holds the flush covered;
+                    // its every byte zero is a first sector a power cut
+                    // took, with nothing behind it a replay could keep.
+                    let names = wal_names(&d);
+                    let last = d.join(names.last().unwrap());
+                    let len = std::fs::metadata(&last).unwrap().len() as usize;
+                    assert!(
+                        names.len() == 2 && len >= 8,
+                        "{tag}: two log files, the live one its header at least: {names:?}, {len}"
+                    );
+                    std::fs::write(&last, vec![0u8; len]).unwrap();
+                }
+            }
+            let mut db = Db::open(&d, opts.clone()).unwrap();
+            db.trace_wal_syncs(true);
+            let at_open = db.wal_syncs_traced();
+            let (live, _, written) = db.wal_durable();
+            if how == 2 {
+                assert_eq!(
+                    at_open,
+                    vec![(live.clone(), Some(written))],
+                    "{tag}: the open's cut synced the live file to its frames"
+                );
+            } else if how == 4 {
+                assert_eq!(
+                    at_open,
+                    vec![(live.clone(), Some(0))],
+                    "{tag}: the open's cut of the lost header synced the live file empty"
+                );
+            } else {
+                assert_eq!(at_open, vec![], "{tag}: the open synced nothing");
+            }
+            every_key_of(&db, &[('a', 100)], tag);
+            assert!(!db.wal_unsynced(), "{tag}: the reopened log owes nothing");
+            db.sync().unwrap();
+            db.flush().unwrap();
+            assert_eq!(
+                db.wal_syncs_traced(),
+                at_open,
+                "{tag}: a reopen with nothing replayed synced its log"
+            );
+            if how == 4 {
+                // No file before the header the open wrote is owed a
+                // sync, so it says chained, and the first sync with frames
+                // to cover rewrites nothing.
+                assert_ne!(
+                    std::fs::read(&live).unwrap()[WAL_KIND_AT as usize],
+                    WAL_LOOSE_KIND,
+                    "{tag}: the header the open wrote beside covered files says loose"
+                );
+                put_batch(&mut db, 'c', 10);
+                db.sync().unwrap();
+                let after = db.wal_syncs_traced();
+                assert!(
+                    after[at_open.len()..].iter().all(|(_, e)| e.is_some()),
+                    "{tag}: the first sync after the open rewrote the live header: {after:?}"
+                );
+            }
+            drop(db);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// The sync that syncs a loose file and rewrites the live file's header
+/// chained makes that header durable with it: after a power cut the
+/// boundary still says the file before was synced, so damage that takes
+/// that file's frames is a gap the open refuses, where a header left loose
+/// on the device would read it as the log's end and drop the live file's
+/// acknowledged frames with nothing said.
+#[test]
+fn a_sync_that_chains_a_loose_boundary_makes_the_chained_header_durable() {
+    let d = dir("dur-chain-durable");
+    let crash = dir("dur-chain-durable-cut");
+    let opts = rotating();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    db.trace_wal_syncs(true);
+    let val = "x".repeat(100);
+    let mut i = 0u32;
+    while db.seal_waits().wal_rotations == 0 {
+        put_commit(&mut db, &format!("r{i:07}"), &val).unwrap();
+        i += 1;
+        assert!(i < 10_000, "the log never rotated");
+    }
+    put_commit(&mut db, "s0000000", &val).unwrap();
+    db.sync().unwrap();
+    copy_store(&d, &crash);
+    power_cut_logs(&crash, &[&db.wal_syncs_traced()], WAL_HEAD, &[]);
+    drop(db);
+    // Damage after the power cut: the closed file's frames gone.
+    let names = wal_names(&crash);
+    assert_eq!(names.len(), 2, "the closed file and the live one");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(crash.join(&names[0]))
+        .unwrap()
+        .set_len(WAL_HEAD)
+        .unwrap();
+    let found = files_of(&crash);
+    match Db::open(&crash, opts) {
+        Ok(db) => {
+            // Opened: it must hold every acknowledged frame, which it
+            // cannot, the damage having taken some.
+            for i in 0..i {
+                reads(&db, &format!("r{i:07}"), &val, "acknowledged by the sync");
+            }
+            reads(&db, "s0000000", &val, "acknowledged by the sync");
+        }
+        Err(e) => {
+            assert!(
+                e.to_string().contains("sequence gap"),
+                "refused for the gap: {e}"
+            );
+            assert_eq!(files_of(&crash), found, "a refused open leaves the files");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// `n` bytes from the start of `p` made zero, the length kept: what a
+/// power cut leaves of the pages of a file no fdatasync covered, the
+/// inode's size and any later page surviving.
+fn zero_prefix(p: &Path, n: usize) {
+    let mut bytes = std::fs::read(p).unwrap();
+    let n = n.min(bytes.len());
+    bytes[..n].fill(0);
+    std::fs::write(p, &bytes).unwrap();
+}
+
+/// The live log file's real path (under a cipher, where the directory the
+/// store names is not the real one) and its name.
+fn live_wal_name(db: &Db) -> String {
+    let (p, _, _) = db.wal_durable();
+    p.file_name().unwrap().to_string_lossy().into_owned()
+}
+
+fn a_store_just_created(tag: &str, opts: Options) {
+    let d = dir(&format!("dur-created-header-{tag}"));
+    let crash = dir(&format!("dur-created-header-{tag}-cut"));
+    let db = Db::create(&d, opts.clone()).unwrap();
+    let wal = live_wal_name(&db);
+    let (p, synced, written) = db.wal_durable();
+    assert_eq!(synced, 0, "{tag}: no sync covered the header");
+    drop(db);
+    let real = p.parent().unwrap().to_path_buf();
+    assert_eq!(
+        std::fs::metadata(real.join(&wal)).unwrap().len(),
+        written,
+        "{tag}: a fresh store's log holds only its header"
+    );
+    copy_store(&real, &crash);
+    zero_prefix(&crash.join(&wal), usize::MAX);
+    let mut db = Db::open(&crash, opts.clone()).unwrap_or_else(|e| {
+        panic!("{tag}: a store whose log header never reached the device is refused: {e}")
+    });
+    put_commit(&mut db, "after", "A").unwrap();
+    drop(db);
+    let db = Db::open(&crash, opts).unwrap();
+    reads(
+        &db,
+        "after",
+        "A",
+        &format!("{tag}: committed after the open"),
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// A store just created: `Db::create` returned `Ok`, the log's header was
+/// written and never synced, and a power cut that keeps the file's size
+/// and not its page leaves zeroes under `wal-00000000`. The store opens,
+/// empty, and takes writes that a reopen reads back.
+#[test]
+fn a_store_just_created_opens_after_a_power_cut_loses_its_logs_unsynced_header() {
+    a_store_just_created("plain", Options::default());
+}
+
+#[test]
+fn a_store_just_created_opens_after_a_power_cut_loses_its_logs_unsynced_header_under_a_cipher() {
+    a_store_just_created("cipher", under_cipher());
+}
+
+/// The default store, durable, loaded in key order: every commit goes to
+/// the direct run and fdatasyncs the run's own file, so each one is
+/// acknowledged, and the log is never synced -- it holds its header alone,
+/// unsynced, for the whole load. A power cut that loses that header must
+/// not cost the acknowledged commits: the store opens and reads every one,
+/// at this open and at the next.
+#[test]
+fn acknowledged_direct_run_commits_survive_a_power_cut_that_loses_the_logs_unsynced_header() {
+    let d = dir("dur-run-header");
+    let crash = dir("dur-run-header-cut");
+    let opts = Options::default();
+    assert!(
+        matches!(opts.sync, SyncPolicy::Always),
+        "the default is durable"
+    );
+    let k = |i: u32| format!("k{i:05}").into_bytes();
+    let val = vec![7u8; 100];
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut n = 0u32;
+    for _ in 0..64 {
+        for _ in 0..8 {
+            db.append(&k(n), &val);
+            n += 1;
+        }
+        db.commit().unwrap();
+    }
+    drop(db);
+    assert!(
+        open_run(&d),
+        "an ordered load on a fresh store opens a direct run"
+    );
+    assert_eq!(
+        std::fs::metadata(d.join("wal-00000000")).unwrap().len(),
+        WAL_HEAD,
+        "the log holds only its header, which no fdatasync of it has covered"
+    );
+    copy_store(&d, &crash);
+    zero_prefix(&crash.join("wal-00000000"), usize::MAX);
+    let mut refused = Vec::new();
+    for round in 0..2 {
+        match Db::open(&crash, opts.clone()) {
+            Ok(db) => {
+                for i in 0..n {
+                    assert_eq!(
+                        read_vec(&db, &k(i)),
+                        vec![val.clone()],
+                        "open {round}, key {i}"
+                    );
+                }
+                drop(db);
+            }
+            Err(e) => refused.push(format!("open {round}: {e}")),
+        }
+    }
+    assert!(
+        refused.is_empty(),
+        "acknowledged commits made unreachable by a lost log header: {refused:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// A buffered store: commits never sync, and a flush acknowledges them by
+/// a segment and a manifest without syncing the log
+/// (`Options::drain_syncs_wal` off). The log's header and frames may then
+/// never be synced in the file's life, and a power cut can leave its first
+/// page zero -- with the later pages written back by the kernel, or with
+/// the whole file zero. Everything the flush acknowledged is in the
+/// segment, and the store opens and reads it, in either case.
+fn a_flush_survives_a_lost_first_page(tag: &str, base: Options) {
+    let opts = Options {
+        sync: SyncPolicy::EveryN(u32::MAX),
+        direct_ingest: false,
+        ..base
+    };
+    let k = |i: u32| format!("k{:05}", (i * 7919) % 100_000).into_bytes();
+    let val = vec![7u8; 100];
+    let d = dir(&format!("dur-buffered-header-{tag}"));
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let wal = live_wal_name(&db);
+    let n = 400u32;
+    for c in 0..n / 8 {
+        for i in c * 8..c * 8 + 8 {
+            db.append(&k(i), &val);
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    assert_eq!(db.wal_durable().1, 0, "{tag}: nothing synced the log");
+    drop(db);
+    let len = std::fs::metadata(d.join(&wal)).unwrap().len();
+    assert!(
+        len > 2 * 4096,
+        "{tag}: the flush left the live log with its frames, over several pages: {len}"
+    );
+    let mut failed = Vec::new();
+    for (name, zeroed) in [("page", 4096usize), ("whole", usize::MAX)] {
+        let crash = dir(&format!("dur-buffered-header-{tag}-{name}"));
+        copy_store(&d, &crash);
+        zero_prefix(&crash.join(&wal), zeroed);
+        match Db::open(&crash, opts.clone()) {
+            Ok(db) => {
+                for i in 0..n {
+                    assert_eq!(
+                        read_vec(&db, &k(i)),
+                        vec![val.clone()],
+                        "{tag} {name}, key {i}"
+                    );
+                }
+                drop(db);
+            }
+            Err(e) => failed.push(format!("{name}: {e}")),
+        }
+        let _ = std::fs::remove_dir_all(&crash);
+    }
+    assert!(
+        failed.is_empty(),
+        "{tag}: a flushed store refused for a log no sync ever covered: {failed:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_flush_survives_a_power_cut_that_loses_the_first_page_of_a_never_synced_log() {
+    a_flush_survives_a_lost_first_page("plain", Options::default());
+}
+
+#[test]
+fn a_flush_survives_a_power_cut_that_loses_the_first_page_of_a_never_synced_log_under_a_cipher() {
+    a_flush_survives_a_lost_first_page("cipher", under_cipher());
+}
+
+/// A durable store whose log rotated by size: the commit that crossed the
+/// boundary was synced into the closed file, and the new file's header
+/// was written and not synced. A power cut that loses it leaves the
+/// newest file zero, and the store opens with every commit the closed
+/// file holds.
+#[test]
+fn a_log_file_a_rotation_began_whose_header_a_power_cut_lost_opens_with_every_commit_before_it() {
+    let d = dir("dur-rotated-header");
+    let crash = dir("dur-rotated-header-cut");
+    let opts = Options {
+        seal_rotates_wal: false,
+        seal_bytes: 64 << 10,
+        seal_max_pct: 0,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let val = "x".repeat(100);
+    let mut i = 0u32;
+    while db.seal_waits().wal_rotations == 0 {
+        put_commit(&mut db, &format!("r{i:07}"), &val).unwrap();
+        i += 1;
+        assert!(i < 10_000, "the log never rotated");
+    }
+    assert_eq!(db.levels(), (0, 0), "nothing sealed");
+    copy_store(&d, &crash);
+    drop(db);
+    let names = wal_names(&crash);
+    assert_eq!(
+        names.len(),
+        2,
+        "the closed file and the one the rotation began"
+    );
+    assert_eq!(
+        std::fs::metadata(crash.join(&names[1])).unwrap().len(),
+        WAL_HEAD,
+        "the new file holds its header alone"
+    );
+    zero_prefix(&crash.join(&names[1]), usize::MAX);
+    let db = Db::open(&crash, opts)
+        .unwrap_or_else(|e| panic!("a lost header of a never-synced log file is refused: {e}"));
+    for i in 0..i {
+        reads(&db, &format!("r{i:07}"), &val, "acknowledged under Always");
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// A closed log file no sync ever covered, its first page lost: a buffered
+/// store's first file after a loose rotation. The log ends there; the
+/// files after it continue a tail the power cut took, and the store opens
+/// as the state before it.
+#[test]
+fn an_older_log_file_whose_unsynced_header_a_power_cut_lost_opens_as_the_logs_end() {
+    let d = dir("dur-older-header");
+    let crash = dir("dur-older-header-cut");
+    let opts = rotating();
+    let (_, _) = rotated_and_killed(&d, opts.clone());
+    copy_store(&d, &crash);
+    let names = wal_names(&crash);
+    zero_prefix(&crash.join(&names[0]), 4096);
+    let db = Db::open(&crash, opts)
+        .unwrap_or_else(|e| panic!("a lost header of a never-synced log file is refused: {e}"));
+    // Nothing of either file was acknowledged; what shows is a prefix,
+    // which with the first file's first page gone is nothing.
+    assert!(
+        read_vec(&db, b"r0000000").is_empty(),
+        "the frames behind a lost first page are not replayed"
+    );
+    assert!(
+        read_vec(&db, b"s0000000").is_empty(),
+        "nothing after a lost tail is replayed"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// Under `Always`, a frame behind a zero header is a frame no sync
+/// covered, since a sync covers the header too: here a buffered life's
+/// commits after a durable life's, in the file the durable life's rotation
+/// began, its first sector lost -- with the rest of its first page kept,
+/// and with that page lost whole. The open drops them, as a power cut may,
+/// and reads every commit the durable life acknowledged.
+#[test]
+fn frames_behind_a_lost_first_sector_are_dropped_as_unsynced() {
+    for lost in [512usize, 4096] {
+        let d = dir(&format!("dur-behind-header-{lost}"));
+        let crash = dir(&format!("dur-behind-header-{lost}-cut"));
+        let always = Options {
+            seal_rotates_wal: false,
+            seal_bytes: 64 << 10,
+            seal_max_pct: 0,
+            ..Options::default()
+        };
+        let mut db = Db::create(&made(&d), always.clone()).unwrap();
+        let val = "x".repeat(100);
+        let mut i = 0u32;
+        while db.seal_waits().wal_rotations == 0 {
+            put_commit(&mut db, &format!("r{i:07}"), &val).unwrap();
+            i += 1;
+            assert!(i < 10_000, "the log never rotated");
+        }
+        killed(db, &d);
+        let buffered = Options {
+            sync: SyncPolicy::EveryN(u32::MAX),
+            ..always.clone()
+        };
+        let mut db = Db::open(&d, buffered).unwrap();
+        let later = [('c', 100), ('d', 100), ('e', 100), ('f', 100)];
+        for (b, n) in later {
+            put_batch(&mut db, b, n);
+        }
+        assert_eq!(db.levels(), (0, 0), "nothing sealed");
+        copy_store(&d, &crash);
+        drop(db);
+        let names = wal_names(&crash);
+        assert_eq!(names.len(), 2);
+        let newest = crash.join(&names[1]);
+        assert!(std::fs::metadata(&newest).unwrap().len() > 2 * 4096);
+        zero_prefix(&newest, lost);
+        let bytes = std::fs::read(&newest).unwrap();
+        assert!(
+            bytes[lost..4096.max(lost)].iter().all(|&b| b == 0) == (lost == 4096)
+                && bytes[4096..].iter().any(|&b| b != 0),
+            "{lost}: frames kept behind the lost bytes, in the first page where a sector alone was lost"
+        );
+        let db = Db::open(&crash, always).unwrap_or_else(|e| {
+            panic!("{lost}: a lost first sector of a never-synced log file is refused: {e}")
+        });
+        for i in 0..i {
+            reads(&db, &format!("r{i:07}"), &val, "acknowledged under Always");
+        }
+        assert_eq!(
+            a_prefix_of(&db, &later, "the buffered life"),
+            0,
+            "{lost}: frames behind a lost first sector are not replayed"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&crash);
+    }
+}
+
+/// A zero header over a first sector that still holds frames is not a
+/// page a power cut lost -- the page would have gone whole -- but bytes
+/// changed on the device, under acknowledged commits: refused, in words,
+/// with the store's files left as they were.
+#[test]
+fn a_zeroed_header_over_frames_in_its_first_sector_is_refused_as_damage() {
+    let d = dir("dur-header-damage");
+    let opts = Options::default();
+    let mut db = Db::create(&made(&d), opts.clone()).unwrap();
+    put_commit(&mut db, "k0", "v0").unwrap();
+    put_commit(&mut db, "k1", "v1").unwrap();
+    killed(db, &d);
+    zero_prefix(&d.join("wal-00000000"), WAL_HEAD as usize);
+    let found = files_of(&d);
+    match Db::open(&d, opts) {
+        Ok(_) => panic!("a log whose header was zeroed over acknowledged frames opened"),
+        Err(e) => assert!(
+            e.to_string().contains("not a supdb WAL"),
+            "refused as a log that is not one: {e}"
+        ),
+    }
+    assert_eq!(files_of(&d), found, "a refused open leaves the files");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A header that is neither a log's nor zeroes is refused, in words, with
+/// the files left as they were: a power cut leaves a page lost or whole.
+#[test]
+fn a_foreign_log_header_is_refused() {
+    for (tag, head) in [
+        ("other-name", *b"SUPDBWX\x04"),
+        ("other-kind", *b"SUPDBWL\x09"),
+        ("noise", *b"\x00\x00\x00\x00\x00\x00\x00\x01"),
+    ] {
+        let d = dir(&format!("dur-header-foreign-{tag}"));
+        let opts = Options::default();
+        let db = Db::create(&d, opts.clone()).unwrap();
+        drop(db);
+        {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(d.join("wal-00000000"))
+                .unwrap();
+            f.write_at(&head, 0).unwrap();
+        }
+        let found = files_of(&d);
+        match Db::open(&d, opts) {
+            Ok(_) => panic!("{tag}: a foreign log header opened"),
+            Err(e) => assert!(
+                e.to_string().contains("not a supdb WAL"),
+                "{tag}: refused as a log that is not one: {e}"
+            ),
+        }
+        assert_eq!(
+            files_of(&d),
+            found,
+            "{tag}: a refused open leaves the files"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A closed log file whose first sector is zeroes, before a file whose
+/// header says chained: the chained header was written by the sync that
+/// synced the closed file, header and frames, first, so no power cut
+/// leaves that file's first sector lost, and the zeroes are bytes changed
+/// on the device under acknowledged commits. The gap they leave before the
+/// chained file is refused, in words, plain and sealed, with the store's
+/// files as they were found -- never read as the log's end, which would
+/// drop the chained file's acknowledged frames with nothing said.
+fn a_zero_older_file_before_a_chained_one(tag: &str, base: Options) {
+    let d = dir(&format!("dur-older-zero-chained-{tag}"));
+    let opts = Options {
+        sync: SyncPolicy::EveryN(u32::MAX),
+        seal_rotates_wal: false,
+        seal_bytes: 64 << 10,
+        seal_max_pct: 0,
+        ..base
+    };
+    let mut db = Db::create(&made(&d), opts.clone()).unwrap();
+    let val = "x".repeat(100);
+    let mut i = 0u32;
+    while db.seal_waits().wal_rotations == 0 {
+        put_commit(&mut db, &format!("r{i:07}"), &val).unwrap();
+        i += 1;
+        assert!(i < 10_000, "{tag}: the log never rotated");
+    }
+    put_commit(&mut db, "s0000000", &val).unwrap();
+    assert!(
+        db.seal_waits().rotated_unsynced > 0,
+        "{tag}: a loose rotation"
+    );
+    // The sync that syncs the closed file and chains the live one.
+    db.sync().unwrap();
+    assert_eq!(db.levels(), (0, 0), "{tag}: nothing sealed");
+    killed(db, &d);
+    let names = wal_names(&d);
+    assert_eq!(names.len(), 2, "{tag}: the closed file and the live one");
+    let live = std::fs::read(d.join(&names[1])).unwrap();
+    assert_ne!(
+        live[WAL_KIND_AT as usize], WAL_LOOSE_KIND,
+        "{tag}: the live header says chained"
+    );
+    zero_prefix(&d.join(&names[0]), 512);
+    let found = files_of(&d);
+    match Db::open(&d, opts) {
+        Ok(_) => panic!("{tag}: a zeroed log file before a chained one opened as the log's end"),
+        Err(e) => assert!(
+            e.to_string().contains("sequence gap"),
+            "{tag}: refused for the gap: {e}"
+        ),
+    }
+    assert_eq!(
+        files_of(&d),
+        found,
+        "{tag}: a refused open leaves the files"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_zeroed_older_log_file_before_a_chained_one_is_refused_as_damage() {
+    a_zero_older_file_before_a_chained_one("plain", Options::default());
+}
+
+#[test]
+fn a_zeroed_older_log_file_before_a_chained_one_is_refused_as_damage_under_a_cipher() {
+    a_zero_older_file_before_a_chained_one("cipher", under_cipher());
+}
+
+/// A kill with batch `b` unsynced and a torn batch behind it: the open cuts
+/// the tail off and fdatasyncs the live file, which makes `b` durable and
+/// is the trace's first record; the sync after it issues nothing more, and
+/// a power cut that keeps what the syncs covered -- the open's included,
+/// and only because the trace records it -- reads both batches back.
+fn a_sync_after_a_reopen_that_cut_a_torn_tail(tag: &str, opts: Options) {
+    let d = dir(&format!("dur-reopen-torn-{tag}"));
+    let crash = dir(&format!("dur-reopen-torn-{tag}-cut"));
+    let one = life_one(&d, opts.clone());
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(d.join("wal-00000000"))
+            .unwrap();
+        std::io::Write::write_all(&mut f, &[9, 0, 0, 0, 1, 2, 3]).unwrap();
+    }
+    let mut db = life_two(&d, opts.clone());
+    let at_open = db.wal_syncs_traced();
+    let (live, _, written) = db.wal_durable();
+    assert_eq!(
+        at_open,
+        vec![(live, Some(written))],
+        "{tag}: the open's cut synced the live file"
+    );
+    db.sync().unwrap();
+    assert_eq!(
+        db.wal_syncs_traced(),
+        at_open,
+        "{tag}: nothing more owed after the open's sync"
+    );
+    copy_store(&d, &crash);
+    power_cut_logs(&crash, &[&one, &db.wal_syncs_traced()], WAL_HEAD, &[]);
+    drop(db);
+    let db = Db::open(&crash, opts).unwrap();
+    every_key_of(
+        &db,
+        &[('a', 100), ('b', 100)],
+        &format!("{tag}: sync after a reopen that cut a torn tail"),
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+#[test]
+fn a_reopen_that_cuts_a_torn_tail_makes_the_replayed_writes_durable() {
+    a_sync_after_a_reopen_that_cut_a_torn_tail("plain", buffered());
+}
+
+#[test]
+fn a_reopen_that_cuts_a_torn_tail_makes_the_replayed_writes_durable_under_a_cipher() {
+    let o = Options {
+        sync: SyncPolicy::EveryN(u32::MAX),
+        ..under_cipher()
+    };
+    a_sync_after_a_reopen_that_cut_a_torn_tail("cipher", o);
+}
+
+/// A sync whose fdatasync of a loose file fails returns before it rewrites
+/// the live file's header: the kind stays loose in the page cache, so the
+/// kernel's write-back of that header beside a power cut that takes the
+/// loose file's tail leaves a log that ends at the boundary. A header
+/// chained before the loose file was synced, written back, reads that gap
+/// as a record lost and the store is refused for a sync that failed.
+fn a_failed_loose_sync_leaves_the_header(tag: &str, base: Options) {
+    let d = dir(&format!("dur-loose-fail-head-{tag}"));
+    let crash = dir(&format!("dur-loose-fail-head-{tag}-cut"));
+    let opts = Options {
+        sync: SyncPolicy::EveryN(u32::MAX),
+        seal_rotates_wal: false,
+        seal_bytes: 64 << 10,
+        seal_max_pct: 0,
+        ..base
+    };
+    let mut db = Db::create(&made(&d), opts.clone()).unwrap();
+    db.trace_wal_syncs(true);
+    // The header's length, plain or sealed: a fresh log holds it alone.
+    let head = db.wal_durable().2;
+    let val = "x".repeat(100);
+    let mut i = 0u32;
+    while db.seal_waits().wal_rotations == 0 {
+        put_commit(&mut db, &format!("r{i:07}"), &val).unwrap();
+        i += 1;
+        assert!(i < 10_000, "{tag}: the log never rotated");
+    }
+    put_commit(&mut db, "s0000000", &val).unwrap();
+    db.fail_next_loose_wal_sync();
+    assert!(db.sync().is_err(), "{tag}: the injected failure answers");
+    assert_eq!(db.levels(), (0, 0), "{tag}: nothing sealed");
+    let traced = db.wal_syncs_traced();
+    killed(db, &d);
+    let names = wal_names(&d);
+    assert_eq!(names.len(), 2, "{tag}: the closed file and the live one");
+    copy_store(&d, &crash);
+    // The live file's header as the page cache holds it, written back whole
+    // with the file; the loose file's frames, which no sync covered, lost.
+    let header: Vec<u8> = std::fs::read(crash.join(&names[1])).unwrap()[..head as usize].to_vec();
+    power_cut_logs(&crash, &[&traced], head, &[names[1].as_str()]);
+    {
+        use std::os::unix::fs::FileExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(crash.join(&names[1]))
+            .unwrap()
+            .write_at(&header, 0)
+            .unwrap();
+    }
+    let db = Db::open(&crash, opts).unwrap_or_else(|e| {
+        panic!("{tag}: a store whose loose file's sync failed is refused after a power cut: {e}")
+    });
+    assert!(
+        read_vec(&db, b"r0000000").is_empty() && read_vec(&db, b"s0000000").is_empty(),
+        "{tag}: the log ends at the lost tail"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+#[test]
+fn a_failed_sync_of_a_loose_log_file_leaves_the_live_header_loose() {
+    a_failed_loose_sync_leaves_the_header("plain", Options::default());
+}
+
+#[test]
+fn a_failed_sync_of_a_loose_log_file_leaves_the_live_header_loose_under_a_cipher() {
+    a_failed_loose_sync_leaves_the_header("cipher", under_cipher());
+}
+
+/// Three log files, the two older left loose by their rotations, killed and
+/// reopened: the sync after the reopen syncs every older file replay read,
+/// oldest first, before it chains and syncs the live one, and a power cut
+/// that keeps what those syncs covered reads every commit back. A file left
+/// off the list is cut by the power cut, and the loose header after it
+/// ends the log there. Two rotations' worth of frames is a table past the
+/// seal size, so every seal is held before its landing in both lives: a
+/// landing would retire the older files it covers, and the files asked
+/// for here are the ones the sync has to make durable.
+#[test]
+fn a_sync_after_a_reopen_syncs_every_replayed_older_file_oldest_first() {
+    let d = dir("dur-reopen-three");
+    let crash = dir("dur-reopen-three-cut");
+    let opts = Options {
+        seal_idle: false,
+        ..rotating()
+    };
+    let m = made(&d);
+    let mut db = Db::create(&m, opts.clone()).unwrap();
+    db.hold_seal_landing(true);
+    db.trace_wal_syncs(true);
+    let val = "x".repeat(100);
+    let mut i = 0u32;
+    while db.seal_waits().wal_rotations < 2 {
+        put_commit(&mut db, &format!("r{i:07}"), &val).unwrap();
+        i += 1;
+        assert!(i < 20_000, "the log never rotated twice");
+    }
+    put_commit(&mut db, "s0000000", &val).unwrap();
+    assert_eq!(db.levels(), (0, 0), "nothing landed");
+    let one = db.wal_syncs_traced();
+    assert!(one.is_empty(), "nothing synced in life 1: {one:?}");
+    // The kill: the files as they stand, then the original let go.
+    copy_store(&m, &d);
+    db.hold_seal_landing(false);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&m);
+    let names = wal_names(&d);
+    assert_eq!(names.len(), 3, "three log files");
+    for n in &names[1..] {
+        assert_eq!(
+            std::fs::read(d.join(n)).unwrap()[WAL_KIND_AT as usize],
+            WAL_LOOSE_KIND,
+            "{n}: both rotations left the file before loose"
+        );
+    }
+    let mut db = Db::open(&d, opts.clone()).unwrap();
+    db.hold_seal_landing(true);
+    db.trace_wal_syncs(true);
+    db.sync().unwrap();
+    assert_eq!(db.levels(), (0, 0), "nothing landed after the reopen");
+    let two = db.wal_syncs_traced();
+    let order: Vec<(String, bool)> = two
+        .iter()
+        .map(|(p, ev)| {
+            (
+                p.file_name().unwrap().to_string_lossy().into_owned(),
+                ev.is_some(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            (names[0].clone(), true),
+            (names[1].clone(), true),
+            (names[2].clone(), false),
+            (names[2].clone(), true),
+        ],
+        "the older files synced oldest first, then the live one chained and synced"
+    );
+    copy_store(&d, &crash);
+    db.hold_seal_landing(false);
+    drop(db);
+    power_cut_logs(&crash, &[&one, &two], WAL_HEAD, &[]);
+    let db = Db::open(&crash, opts)
+        .unwrap_or_else(|e| panic!("a store synced after its reopen is refused: {e}"));
+    for i in 0..i {
+        reads(&db, &format!("r{i:07}"), &val, "an older file's frames");
+    }
+    reads(&db, "s0000000", &val, "the live file's frame");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// The log-errors section's failed write, in a store that recycles its log
+/// files (`Options::recycle_wal`): the live file was written through to
+/// `seal_bytes` and synced at its creation, so the cut back of a failed
+/// write shortens a pre-written file. Every commit reads back.
+#[test]
+fn a_failed_log_write_in_a_recycled_log_loses_no_commit_acknowledged_after_it() {
+    let opts = Options {
+        recycle_wal: true,
+        ..Options::default()
+    };
+    a_failed_write_is_written_again("recycled", opts.clone(), 5, false);
+    a_failed_write_is_written_again("recycled-reopened", opts, 5, true);
+}
+
+/// The log-errors section's rotation after a failed write, with the power
+/// cut applied: each log file cut to what its syncs covered. Under
+/// `Always` every acknowledged commit was synced, the new file's name by
+/// the rotation's directory fsync, and every one reads back.
+#[test]
+fn a_store_whose_log_rotated_after_a_failed_write_survives_a_power_cut() {
+    for recycle_wal in [false, true] {
+        let tag = if recycle_wal { "recycled" } else { "plain" };
+        let d = dir(&format!("dur-walwrite-rotcut-{tag}"));
+        let crash = dir(&format!("dur-walwrite-rotcut-{tag}-cut"));
+        let opts = Options {
+            seal_rotates_wal: false,
+            seal_bytes: 64 << 10,
+            seal_max_pct: 0,
+            recycle_wal,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        db.trace_wal_syncs(true);
+        put_commit(&mut db, "a0000000", "v").unwrap();
+        db.fail_next_wal_write(5);
+        assert!(put_commit(&mut db, "a0000001", "v").is_err());
+        let val = "x".repeat(100);
+        let mut acked: Vec<String> = Vec::new();
+        let mut i = 0u32;
+        while db.seal_waits().wal_rotations == 0 {
+            let k = format!("b{i:07}");
+            put_commit(&mut db, &k, &val).unwrap();
+            acked.push(k);
+            i += 1;
+            assert!(i < 10_000, "{tag}: the log never rotated");
+        }
+        put_commit(&mut db, "c0000000", &val).unwrap();
+        acked.push("c0000000".into());
+        assert_eq!(db.levels(), (0, 0), "{tag}: nothing sealed");
+        copy_store(&d, &crash);
+        let traced = db.wal_syncs_traced();
+        drop(db);
+        // A pre-written file's tail of zeroes is synced with it; the cut
+        // keeps what the syncs covered and no more.
+        power_cut_logs(&crash, &[&traced], WAL_HEAD, &[]);
+        let db =
+            Db::open(&crash, opts).unwrap_or_else(|e| panic!("{tag}: the power cut opens: {e}"));
+        reads(&db, "a0000000", "v", tag);
+        reads(
+            &db,
+            "a0000001",
+            "v",
+            &format!("{tag}: the batch written again"),
+        );
+        for k in &acked {
+            reads(&db, k, &val, &format!("{tag}: acknowledged under Always"));
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&crash);
+    }
+}
