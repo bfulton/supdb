@@ -167,7 +167,10 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
 /// under every policy; this decides only the barrier. `EveryN(n)` bounds
 /// loss at n batches: on a crash, replay stops at the first frame that is
 /// torn or missing and the sequence-gap check refuses anything past a
-/// hole, so an unsynced tail is lost whole and never served in part.
+/// hole, so an unsynced tail of the log is lost whole and never served in
+/// part. An ordered run open in the clear is the exception, below: its
+/// syncs are of its own file, and a crash may lose earlier commits in the
+/// log while the run's later ones survive.
 ///
 /// It exists because the device was measured serving ~2,700 barriers a
 /// second however they are issued -- sharding cannot scale past 1.6x --
@@ -175,7 +178,9 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
 ///
 /// Frames an open replays count as unsynced under either policy, since a
 /// process kill leaves them in the page cache alone: the next sync the
-/// policy makes, or a `sync` or `flush`, makes them durable.
+/// policy makes of the log, a `sync`, a `flush`, or the durable landing
+/// of the seal they go to, makes them durable -- not a sync the policy
+/// makes of an ordered run's file, which leaves the log as it was.
 ///
 /// Under either policy a write of the log the device refuses fails the
 /// commit that made it, and the batch stays staged: the next commit writes
@@ -201,11 +206,29 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
 /// the log.
 ///
 /// An ordered run's file is its own log in the clear, and the same rules
-/// hold of it. Its table marks a batch before the batch's sync, so a
-/// reader sees the batch from its commit, whatever that commit answers. A
-/// write of the run's file the device refuses is answered by the commit
-/// that syncs it -- under `Always` its own, under `EveryN` the next that
-/// syncs -- and the batch is owed: nothing the write left on the file
+/// hold of it. Under `EveryN` a run's commit writes its batch's whole
+/// pieces and holds the rest for the next sync, so commits the policy
+/// does not sync may be lost to a process kill as well as to a power cut,
+/// a tail of the run's commits and never one in part; a `sync` writes and
+/// syncs what an open run holds. A run's commit in the clear that the
+/// policy syncs -- every one under `Always`, the due one under `EveryN` --
+/// syncs the run's file and not the log, so frames of tables frozen
+/// before the run, or replayed by the open, that no sync has covered are
+/// durable only at a `sync`, a `flush` or their seal's landing, and a
+/// crash may lose them while the run's later commits survive. A run in
+/// the clear closed under `EveryN` -- by any write the run cannot take (an
+/// `append` of a key at or below its greatest, of an empty key or one
+/// longer than `u16::MAX` bytes, or of a value that does not inline; any
+/// `put`; any `delete`), or by a seal (`Db::seal`, or the one a commit
+/// makes at the seal threshold) -- goes to a seal with what its writer
+/// held, and its commits since the last sync
+/// are durable once that seal's segment lands and not before: a `sync`
+/// while the seal is in flight does not cover them, and a crash then may
+/// lose them while a later commit to the log survives. Its table marks a
+/// batch before the batch's sync, so a reader sees the batch from its
+/// commit, whatever that commit answers. A write of the run's file the device refuses is answered by
+/// the commit that syncs it -- under `Always` its own, under `EveryN` the
+/// next that syncs -- and the batch is owed: nothing the write left on the file
 /// past what the file held counts, the run's next commit takes it with its
 /// own, as durable as that commit's policy makes it, and no commit with
 /// nothing new, `sync` or `flush` answers `Ok` before it has written the
@@ -224,7 +247,11 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
 pub enum SyncPolicy {
     /// One fdatasync per commit. Durable per batch, LMDB's boundary.
     Always,
-    /// One fdatasync per `n` commits, and always at seal, flush and close.
+    /// One fdatasync per `n` commits; a `flush` and a `close` make every
+    /// commit before them durable, and a `sync` every commit but an
+    /// ordered run's in the clear once the run has closed into a seal
+    /// still in flight; those, and a seal's records, are durable once its
+    /// segment lands.
     EveryN(u32),
 }
 
@@ -29313,7 +29340,11 @@ impl Db {
     }
 
     /// The durability point: WAL append + fdatasync -- or, under ordered
-    /// ingest, the batch streamed to the direct segment and that synced.
+    /// ingest, the batch streamed to the direct segment and that synced --
+    /// with the fdatasync where the policy says (`SyncPolicy`): under
+    /// `EveryN` a run's commit that is not due leaves the batch's tail
+    /// short of a whole write piece with the writer, for the next sync
+    /// (the policy's, a `sync`'s, a flush's or the run's close) to write.
     /// If the memtable has crossed the seal threshold, seal after the
     /// commit -- after, so the batch's durability never waits on a segment
     /// write.
@@ -29838,6 +29869,20 @@ impl Db {
             if self.wal.frames_unsynced() || !self.loose_wals.is_empty() {
                 self.sync_wal()?;
             }
+        }
+        Ok(())
+    }
+
+    /// The open run's commits made durable by a `sync` where the policy
+    /// left them unsynced: what its writer holds -- the batch's tail short
+    /// of a whole piece, a buffer's bytes -- written, and the run's file
+    /// synced, by the call a commit makes where its policy is due.
+    #[cold]
+    #[inline(never)]
+    fn sync_run(&mut self) -> Result<()> {
+        let d = self.direct.as_mut().expect("a run is open");
+        if let Err(e) = d.w.sync() {
+            return Err(self.run_failed(e));
         }
         Ok(())
     }
@@ -30585,26 +30630,48 @@ impl Db {
     }
 
     /// Make everything written durable and seal nothing: the WAL's pending
-    /// frames written and fsynced, the memtable left where it is. What a
-    /// caller wants when it has stopped writing for now and will read the
-    /// tail out of memory; `flush` is the other answer, and the difference
-    /// was priced at 11% of a canonical load window.
+    /// frames written and fsynced, whatever the policy left unsynced of
+    /// the log synced, and an open ordered run's commits written and its
+    /// file synced, whichever table is live; the memtable left where it
+    /// is. What a caller wants when it has stopped writing for now and will
+    /// read the tail out of memory; `flush` is the other answer, and the
+    /// difference was priced at 11% of a canonical load window.
     ///
     /// An `Ok` is durability for every commit before it, and for whatever
-    /// the open replayed from the log. After a failed
-    /// sync of the log or of an ordered run's file every `sync` answers
-    /// that error until the store is reopened (`SyncPolicy`); after a
-    /// failed write of the run's file a `sync` writes the batch again and
-    /// syncs it, or answers the write's error.
+    /// the open replayed from the log, but for the commits of an ordered
+    /// run in the clear that closed under `EveryN` into a seal still in
+    /// flight -- by a write the run cannot take (an `append` of a key at or
+    /// below its greatest, of an empty or overlong key, or of a value that
+    /// does not inline; a `put`; a `delete`), or by a seal, `Db::seal` or
+    /// the one a commit makes at the seal threshold: those are
+    /// durable once that seal lands, which a `flush` waits for and a
+    /// `sync` does not (`SyncPolicy`). After a failed sync of the log or
+    /// of an ordered run's file every `sync` answers that error until the
+    /// store is reopened (`SyncPolicy`); after a failed write of the run's
+    /// file a `sync` writes the batch again and syncs it, or answers the
+    /// write's error.
     pub fn sync(&mut self) -> Result<()> {
         let _op = self.op();
         self.commit_staged()?;
         // The promise is this call's, whatever the policy left unsynced,
-        // in the live file and in the files loose rotations closed.
-        if !self.mem().ordered
-            && (self.wal.frames_unsynced() || !self.loose_wals.is_empty() || self.wal_dir_unsynced)
-        {
+        // in the live file and in the files loose rotations closed --
+        // whatever the live table is: a run opens over a log that holds
+        // the frames of tables frozen before it, unsynced under `EveryN`
+        // until a sync covers them, and under a cipher the run's own
+        // commits are frames of the log (`Db::log_run`). The log first,
+        // since its frames are older than any commit of the open run.
+        //
+        // The open run's commits since the last sync by policy are asked
+        // first, since the log's sync starts the count over: the count is
+        // of commits no sync has covered, and a run's commit counts in it
+        // until its sync (`commit_direct`), so a run with a count of
+        // nothing has nothing held -- every commit under `Always`.
+        let run_owed = self.unsynced != 0 && self.direct.is_some();
+        if self.wal.frames_unsynced() || !self.loose_wals.is_empty() || self.wal_dir_unsynced {
             self.sync_wal()?;
+        }
+        if run_owed {
+            self.sync_run()?;
         }
         self.unsynced = 0;
         // The tail goes to a seal too, without waiting for it and without
@@ -32373,6 +32440,19 @@ impl Db {
     #[doc(hidden)]
     pub fn run_synced_bytes(&self) -> Option<u64> {
         self.direct.as_ref().map(|d| d.w.0.out.synced)
+    }
+
+    /// A test's: the bytes the open direct run's file holds, and the bytes
+    /// its writer holds for it -- records waiting for their marker, a
+    /// buffer's bytes, a stream's tail short of a whole piece. `None` with
+    /// no run open.
+    #[doc(hidden)]
+    pub fn run_written_and_held(&self) -> Option<(u64, u64)> {
+        self.direct.as_ref().map(|d| {
+            let w = &d.w.0;
+            let held = w.batch_buf.len() + w.out.buf.len() + w.out.stream_held();
+            (w.out.written, held as u64)
+        })
     }
 
     /// A test's: whether the open direct run's writer asks a call with
