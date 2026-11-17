@@ -2118,7 +2118,12 @@ fdatasyncs both slots as it found them, the one it takes and the other,
 before it removes a file or writes over either (`Options::manifest_slots`,
 `SlotChoice`; the shape before it wrote
 a temp name, renamed it over the old manifest and fsynced the directory,
-`supdb-ingestmanifestrename`). The open removes nothing -- a segment, an
+`supdb-ingestmanifestrename`, and there a seal's names are made durable
+by that publish's directory fsync, on a filesystem that puts a rename
+on the device no sooner than the renames before it; an open under that
+shape fsyncs the directory, and any pending segment it takes from a
+store that ran under the slots, before it removes anything, since the
+manifest it read may be a rename a kill left in the page cache). The open removes nothing -- a segment, an
 envelope, a log file, a spare -- and writes no slot until the slot it
 takes is checked against the directory, and refuses with every file as
 it found it where that slot cannot be the store
@@ -2140,7 +2145,8 @@ past what the slot covers is swept as the window's even then, since
 under a buffered policy a torn publish of its landing leaves the same
 files as damage past a log that retired. A seal that fails at any step -- its
 landing, its directory's fsync there, the fsync or the envelope of its
-data before its readable landing or after it, a closing run's presync --
+data before its readable landing or after it, a closing run's presync,
+and under the rename shape the publish that names it --
 stops the seal queue for the life of the open (`Shared::seal_wedged`): no
 seal lands and the segment work writes no manifest from its first look
 at the queue after the failure, the writer's presync's included
@@ -2620,7 +2626,21 @@ read by the piece refuses, so under a cipher every pending slot read as
 torn and the open took the slot before it, whose log the pending
 landing had retired; no test had run `manifest_pending` under a cipher
 and cut the power. An arm's crash test runs under every mode the arm
-can be set beside.
+can be set beside. And it came back as the arm itself: the
+manifest's rename shape (`manifest_slots` off) was held by reading
+alone while three fixes to the slots were built and tested beside it,
+and the first crash states built under it found three holes the reading
+had named and nobody had made. A publish whose directory fsync failed
+after its rename counted the seal out with the queue going, so the next
+landing's fsync named the seal's segments durable over the entries the
+failed one was for and retired the log; an open of a manifest a kill had
+left renamed and unsynced swept what it stopped naming, and a power cut
+could keep the sweep and lose the rename; and an open of a store that
+had run under `manifest_pending` took its pending names, read out of the
+page cache, without the fsyncs the slots' open makes. The corollary: an
+arm kept for pricing is a shape a store can be opened in, so every crash
+state built for the default is built for the arm, and across a change
+from one to the other, before a fix to the default is called done.
 
 **The sharp edges of a log are in the bookkeeping around it, never in the
 append.** A value-carrying log queued a key twice when it sealed, re-queued
