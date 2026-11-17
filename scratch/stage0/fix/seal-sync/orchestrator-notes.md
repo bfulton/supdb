@@ -1,0 +1,3 @@
+- 09:00 UTC: snapshot of keep1/ (round-1 fixed copy) pushed as b4e4a52e on b851704c (snap-msg3.txt), by the orchestrator.
+10:19 UTC: snapshot of keep3/ (round-3 fixed copy at its start) pushed as 5e56d53e on b4e4a52e (snap-msg4.txt), by the orchestrator.
+- 11:45 UTC 2026-11-17: the unit's commit (local 2744a21a, gate `build test lint` exit 0, durable 140, db 226) landed on the remote branch as 02b7a440 (same tree, message, author and dates), on take-back commit 568f0cc9 over the four snapshots (b851704c..5e56d53e). The local branch is on 02b7a440. Engine diff read: seal-sync/commit-engine.diff; the source at the commit: seal-sync/db-at-commit.rs.
