@@ -264,8 +264,9 @@ What an engine picker would hit, roughly in order.
   slot names, swept at the open.
 - [ ] **A torn manifest slot on a device that tears one.** A publish
   writes the slot that does not hold the newest manifest known durable,
-  and an open fdatasyncs the slot it takes (`SlotChoice`), so a power cut
-  tearing a slot write leaves the other slot whole on the device. The
+  and an open fdatasyncs both slots as it found them (`SlotChoice`), so
+  a power cut tearing a slot write leaves the other slot whole on the
+  device. The
   tests build the tear by hand -- the slot's header rewritten over what
   the device held, the other slot as its last fdatasync left it, read
   from the engine's own record of which syncs returned

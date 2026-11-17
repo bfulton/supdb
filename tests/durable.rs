@@ -7941,15 +7941,19 @@ fn os_page_unwritten(path: &Path) -> Option<bool> {
     Some(flags & (1 << 4 | 1 << 8) != 0)
 }
 
-/// An open makes the slot it takes durable before anything can write over
-/// the other, which a process kill may have left the only one on the
-/// device: held by the kernel's own word on the slot file's page, with
-/// the other slot, which the open does not take, the control that the
-/// instrument sees a page not yet written back.
+/// An open makes both slots durable as the page cache holds them before
+/// anything can write over either: the slot it takes, which a process kill
+/// may have left in the page cache alone, and the other, which a kill may
+/// have left torn in the cache over a record the device still holds whole.
+/// Held by the calls themselves (`Db::trace_dir_io`), wherever the test
+/// runs, and by the kernel's own word on each slot file's page where it
+/// says, with a file the open never touches, written the same way, the
+/// control that the instrument sees a page not yet written back.
 fn an_open_syncs_its_slot(tag: &str, base: Options) {
     use std::os::unix::fs::FileExt;
     let opts = os_opts(&base);
     let d = dir(&format!("os-open-sync-{tag}"));
+    let control = d.with_extension("control");
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let mut model = BTreeMap::new();
     os_round(&mut db, &mut model, "r0", 0, 4000);
@@ -7969,34 +7973,49 @@ fn an_open_syncs_its_slot(tag: &str, base: Options) {
             .unwrap();
         f.write_all_at(&bytes[j], 0).unwrap();
     }
+    std::fs::write(&control, &bytes[newest]).unwrap();
     let before = [0, 1].map(|j| os_page_unwritten(&d.join(OS_SLOTS[j])));
-    if before.iter().any(|b| b.is_none()) {
-        eprintln!("{tag}: the kernel does not say which pages are dirty to this process; not run");
-        let _ = std::fs::remove_dir_all(&d);
-        return;
-    }
-    assert_eq!(
-        before,
-        [Some(true), Some(true)],
-        "{tag}: the instrument sees the slots just written as not on the device"
-    );
+    let from = Db::trace_dir_io(true).len();
     let db = Db::open(&d, opts.clone()).unwrap();
-    let after = [0, 1].map(|j| os_page_unwritten(&d.join(OS_SLOTS[j])));
-    assert_eq!(
-        after[newest],
-        Some(false),
-        "{tag}: the slot the open took ({}) is on the device once the open has returned",
-        OS_SLOTS[newest]
-    );
-    assert_eq!(
-        after[1 - newest],
-        Some(true),
-        "{tag}: the control, the slot the open did not take, still waits for writeback"
-    );
+    let calls = osl_calls(&d, from);
+    // The calls: an fdatasync of each slot file that returned.
+    for slot in OS_SLOTS {
+        assert!(
+            calls
+                .iter()
+                .any(|(what, p)| *what == "sync_slot" && *p == d.join(slot)),
+            "{tag}: the open fdatasynced {slot}: {calls:?}"
+        );
+    }
+    if before.iter().any(|b| b.is_none()) {
+        eprintln!(
+            "{tag}: the kernel does not say which pages are dirty to this process; the page \
+             flags not read"
+        );
+    } else {
+        assert_eq!(
+            before,
+            [Some(true), Some(true)],
+            "{tag}: the instrument sees the slots just written as not on the device"
+        );
+        let after = [0, 1].map(|j| os_page_unwritten(&d.join(OS_SLOTS[j])));
+        assert_eq!(
+            after,
+            [Some(false), Some(false)],
+            "{tag}: both slots (the open took {}) are on the device once the open has returned",
+            OS_SLOTS[newest]
+        );
+        assert_eq!(
+            os_page_unwritten(&control),
+            Some(true),
+            "{tag}: the control, a file the open does not touch, still waits for writeback"
+        );
+    }
     for (k, v) in model.iter().step_by(97) {
         assert_eq!(read_vec(&db, k), vec![v.clone()], "{tag}");
     }
     drop(db);
+    let _ = std::fs::remove_file(&control);
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -9965,6 +9984,16 @@ fn a_pending_segment_adopted_by_an_open(how: OoTear, ord_durable: bool, pieces: 
             calls[..write].iter().any(|(what, _)| *what == "sync_dir"),
             "{tag}: the directory fsynced before the slot {slot} was written: {calls:?}"
         );
+        // Both slots made durable as the open found them before it wrote
+        // either: the one it took and the one it is about to write over.
+        for s in OS_SLOTS {
+            assert!(
+                calls[..write]
+                    .iter()
+                    .any(|(what, p)| *what == "sync_slot" && *p == d.join(s)),
+                "{tag}: {s} fdatasynced before the slot {slot} was written: {calls:?}"
+            );
+        }
         // And each file's fsync, returned before the slot was opened, read
         // off the call that made it: the record above is the open's word,
         // and the kernel's word below is read only by root.
@@ -10203,4 +10232,477 @@ fn an_open_that_adopts_a_pending_segment_makes_its_durable_index_durable() {
 #[test]
 fn an_open_that_adopts_several_pending_pieces_makes_each_durable() {
     a_pending_segment_adopted_by_an_open(OoTear::Run, true, true);
+}
+
+// ---------------------------------------------------------------------
+// other-slot: an open makes the manifest slot it does not take durable
+// as the page cache holds it, beside the one it takes, before it removes
+// or writes anything. A publish into a slot with its fdatasync owed (a
+// drain's), then the next publish into the same slot -- the other holds
+// the newest manifest known durable -- killed part way through its write:
+// the page cache holds that slot torn, and the device may hold the owed
+// publish in it whole, its writeback having run before the torn write
+// dirtied the page again. The reopen passes over the torn slot, takes the
+// other and sweeps what it does not name; a power cut before anything
+// writes the torn image back must not leave the device's whole record the
+// newest slot the next open reads.
+// ---------------------------------------------------------------------
+
+/// The calls the process-wide record holds from `from` on for files of
+/// `d`: what an open of `d` made (`Db::trace_dir_io`).
+fn osl_calls(d: &Path, from: usize) -> Vec<(&'static str, PathBuf)> {
+    Db::trace_dir_io(true)
+        .split_off(from)
+        .into_iter()
+        .filter(|(_, p)| p.parent() == Some(d))
+        .collect()
+}
+
+/// The file names of `d` whose bytes differ, are gone or were made against
+/// `found`.
+fn osl_changed(found: &BTreeMap<String, Vec<u8>>, d: &Path) -> Vec<String> {
+    let left = os_files(d);
+    let mut out: Vec<String> = found
+        .iter()
+        .filter(|(n, b)| left.get(*n) != Some(*b))
+        .map(|(n, _)| n.clone())
+        .collect();
+    out.extend(left.keys().filter(|n| !found.contains_key(*n)).cloned());
+    out
+}
+
+fn a_torn_publish_over_an_owed_slot(tag: &str, base: Options) {
+    let opts = os_opts(&base);
+    let (d, mut db, mut model, t) = os_start(&format!("osl-torn-{tag}"), &opts);
+    for r in 1..=6u32 {
+        os_round(&mut db, &mut model, &format!("r{r}"), r * OS_KEYS, OS_KEYS);
+        OsTracker::arm(&t, true);
+        db.flush().unwrap();
+        OsTracker::arm(&t, false);
+        db.settle().unwrap();
+        if !t.lock().unwrap().kills.is_empty() {
+            break;
+        }
+    }
+    db.watch_slot_writes(None);
+    drop(db);
+    let mut t = OsTracker::taken(t);
+    for (p, _) in std::mem::take(&mut t.crashes) {
+        let _ = std::fs::remove_dir_all(p);
+    }
+    assert!(
+        !t.kills.is_empty(),
+        "{tag}: no write followed a deferred slot whose sync was owed; the case was not \
+         reached: {:?}",
+        t.writes
+    );
+    let (k, _, owed) = t.kills.remove(0);
+    // The owed publish's slot, and the next publish's: the same, since the
+    // other holds the newest manifest known durable.
+    let slot_of = |seq: u64| t.writes.iter().find(|w| w.seq == seq).map(|w| w.slot);
+    let b = slot_of(owed).expect("the owed publish was watched");
+    assert_eq!(
+        slot_of(owed + 1),
+        Some(b),
+        "{tag}: premise: the publish after the owed one writes the same slot: {:?}",
+        t.writes
+    );
+    let a = 1 - b;
+    let whole = std::fs::read(k.join(OS_SLOTS[b])).unwrap();
+    assert_eq!(
+        os_seq_of(&whole),
+        Some(owed),
+        "{tag}: premise: the cache holds the owed publish whole in {}",
+        OS_SLOTS[b]
+    );
+    let a_seq = os_seq_of(&std::fs::read(k.join(OS_SLOTS[a])).unwrap())
+        .expect("premise: the other slot holds a manifest");
+    assert!(a_seq < owed, "{tag}: premise: {a_seq} before {owed}");
+    // The publish after it, killed part way through its write: the page
+    // cache holds the slot torn.
+    let torn = os_torn(&whole, owed + 1);
+    std::fs::write(k.join(OS_SLOTS[b]), &torn).unwrap();
+
+    // A copy for the second sync's failure, below.
+    let k2 = dir(&format!("osl-torn-{tag}-fail"));
+    copy_store(&k, &k2);
+    // And one for the newest slot passed over for pending segments, below:
+    // plain only, since a sealed slot is not forged here.
+    let skipped_case = whole.starts_with(b"SUPDBMAN");
+    let k3 = dir(&format!("osl-torn-{tag}-skipped"));
+    let at_kill = model.clone();
+    if skipped_case {
+        copy_store(&k, &k3);
+    }
+
+    // The reopen, the slot written torn passed over.
+    let from = Db::trace_dir_io(true).len();
+    let mut db = Db::open(&k, opts.clone()).expect("the kill state opens");
+    let calls = osl_calls(&k, from);
+    db.hold_merge_landing(true);
+    db.hold_seal_landing(true);
+    assert_eq!(
+        db.manifest_seq(),
+        a_seq,
+        "{tag}: premise: the open took {} and published nothing",
+        OS_SLOTS[a]
+    );
+    // Commits acknowledged on the reopened store, too few to seal, so
+    // nothing publishes and the torn slot stays as the kill left it.
+    os_round(&mut db, &mut model, "after", 60 * OS_KEYS, 2000);
+    assert_eq!(
+        std::fs::read(k.join(OS_SLOTS[b])).unwrap(),
+        torn,
+        "{tag}: premise: nothing rewrote {} since the open",
+        OS_SLOTS[b]
+    );
+    assert_eq!(
+        db.manifest_seq(),
+        a_seq,
+        "{tag}: premise: nothing published"
+    );
+    // The power cut, the landings held across the copy: every file as the
+    // page cache holds it, the slot taken as the open synced it, and the
+    // other as the device may hold it -- the owed publish whole where no
+    // fdatasync of that file ran since the kill, the torn image where the
+    // open's did.
+    let cut = dir(&format!("osl-torn-{tag}-cut"));
+    copy_store(&k, &cut);
+    db.hold_seal_landing(false);
+    db.hold_merge_landing(false);
+    let b_synced = calls
+        .iter()
+        .any(|(what, p)| *what == "sync_slot" && *p == k.join(OS_SLOTS[b]));
+    if !b_synced {
+        std::fs::write(cut.join(OS_SLOTS[b]), &whole).unwrap();
+    }
+    // The first slot the store opens for writing after the reopen, read
+    // off the calls by its path in the filesystem as the syncs are, comes
+    // after both slots' fdatasyncs.
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let later = osl_calls(&k, from);
+    drop(db);
+    let failures = os_check_all(
+        &[(
+            cut.clone(),
+            format!(
+                "a power cut after the reopen, {} holding {}",
+                OS_SLOTS[b],
+                if b_synced {
+                    "the torn image the open synced"
+                } else {
+                    "the owed publish whole"
+                }
+            ),
+        )],
+        &model,
+        &opts,
+    );
+    assert!(failures.is_empty(), "{tag}: {failures:?}");
+    // Both slots fdatasynced by the open, read off the calls.
+    for s in OS_SLOTS {
+        assert!(
+            calls
+                .iter()
+                .any(|(what, p)| *what == "sync_slot" && *p == k.join(s)),
+            "{tag}: the open fdatasynced {s}: {calls:?}"
+        );
+    }
+    let write = later
+        .iter()
+        .position(|(what, _)| *what == "open_slot")
+        .unwrap_or_else(|| panic!("{tag}: the flush after the reopen wrote a slot: {later:?}"));
+    for s in OS_SLOTS {
+        assert!(
+            later[..write]
+                .iter()
+                .any(|(what, p)| *what == "sync_slot" && *p == k.join(s)),
+            "{tag}: {s} fdatasynced before the first slot was written: {later:?}"
+        );
+    }
+    // The second sync's failure is the open's answer, and the open that
+    // gives it has removed and written nothing; the failure names the
+    // inode of the slot the open did not take.
+    let found = os_files(&k2);
+    let from2 = Db::trace_dir_io(true).len();
+    let refused = match Db::open(
+        &k2,
+        Options {
+            fail_open_other_slot_sync: true,
+            ..opts.clone()
+        },
+    ) {
+        Ok(_) => panic!("{tag}: the open answered Ok over a failed fdatasync of its other slot"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        refused.contains("a test failed the open's fdatasync of the manifest slot it did not take"),
+        "{tag}: the open refused for another reason: {refused}"
+    );
+    let ino = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(k2.join(OS_SLOTS[b])).unwrap().ino()
+    };
+    assert!(
+        refused.ends_with(&format!("(inode {ino})")),
+        "{tag}: the sync that failed was not of the slot the open passed over, {} (inode \
+         {ino}): {refused}",
+        OS_SLOTS[b]
+    );
+    let changed = osl_changed(&found, &k2);
+    assert!(
+        changed.is_empty(),
+        "{tag}: the open that failed its other slot's fdatasync changed the directory: \
+         {changed:?}"
+    );
+    // The call that records an fdatasync once it returns records the taken
+    // slot's and not the one that failed.
+    let failed_calls = osl_calls(&k2, from2);
+    let synced_of = |s: &str| {
+        failed_calls
+            .iter()
+            .any(|(what, p)| *what == "sync_slot" && *p == k2.join(s))
+    };
+    assert!(
+        synced_of(OS_SLOTS[a]) && !synced_of(OS_SLOTS[b]),
+        "{tag}: the record holds the taken slot's fdatasync and not the failed one: \
+         {failed_calls:?}"
+    );
+    // The control: the open that succeeds removes something here (what
+    // the owed publish named), so the failed open had something to leave.
+    drop(Db::open(&k2, opts.clone()).expect("the kill state opens"));
+    assert!(
+        found.keys().any(|n| !k2.join(n).exists()),
+        "{tag}: the open removed nothing from the kill state; the case was not reached"
+    );
+    let _ = std::fs::remove_dir_all(&k2);
+    if skipped_case {
+        osl_skipped(tag, &k3, [a, b], &whole, [a_seq, owed], &at_kill, &opts);
+    }
+    let _ = std::fs::remove_dir_all(&k3);
+
+    for (p, _, _) in &t.kills {
+        let _ = std::fs::remove_dir_all(p);
+    }
+    let _ = std::fs::remove_dir_all(&k);
+    let _ = std::fs::remove_dir_all(&cut);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&t.root);
+}
+
+/// A plain slot of this version: `whole`'s manifest under the sequence
+/// `seq`, each of `pending` flagged pending, its checksum made again.
+fn osl_pending_of(whole: &[u8], seq: u64, pending: &[String]) -> Vec<u8> {
+    assert_eq!(&whole[..9], b"SUPDBMAN\x03", "a plain slot of this version");
+    let len = u32::from_le_bytes(whole[17..21].try_into().unwrap()) as usize;
+    let mut body = whole[25..25 + len].to_vec();
+    let n = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
+    let mut p = 12usize;
+    for _ in 0..n {
+        let l = u16::from_le_bytes(body[p..p + 2].try_into().unwrap()) as usize;
+        let name = std::str::from_utf8(&body[p + 2..p + 2 + l]).unwrap();
+        if pending.iter().any(|x| x == name) {
+            body[p + 2 + l] = 1;
+        }
+        p += 2 + l + 1;
+    }
+    let crc = common::crc32c_from(common::crc32c_from(0, &seq.to_le_bytes()), &body);
+    let mut out = b"SUPDBMAN\x03".to_vec();
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+/// The other slot passed over because it is the newest and its pending
+/// segments do not read whole: the open writes over that slot itself, but
+/// only after its sweep. `k` is a kill state whose cache holds, in slot
+/// `b`, a publish after the owed one -- forged here, the owed publish's new
+/// segments flagged pending under the next sequence, and one of them lost
+/// -- and whose device may hold the owed publish whole there. The open's
+/// own slot write torn (`Options::tear_open_slot_write`) stops it after the
+/// sweep has removed what the slot it takes does not name and before
+/// anything rewrites `b`; a power cut then hands the next open what the
+/// device holds of `b`, which must not be the owed publish.
+fn osl_skipped(
+    tag: &str,
+    k: &Path,
+    [a, b]: [usize; 2],
+    whole: &[u8],
+    [a_seq, owed]: [u64; 2],
+    model: &BTreeMap<Vec<u8>, Vec<u8>>,
+    opts: &Options,
+) {
+    let names_of =
+        |bytes: &[u8]| -> Vec<String> { oo_names(bytes).1.into_iter().map(|(n, _)| n).collect() };
+    let a_names = names_of(&std::fs::read(k.join(OS_SLOTS[a])).unwrap());
+    let new: Vec<String> = names_of(whole)
+        .into_iter()
+        .filter(|n| n.ends_with(".sup") && !a_names.contains(n))
+        .collect();
+    assert!(
+        !new.is_empty(),
+        "{tag}: premise: the owed publish names a segment {} does not",
+        OS_SLOTS[a]
+    );
+    std::fs::write(k.join(OS_SLOTS[b]), osl_pending_of(whole, owed + 1, &new)).unwrap();
+    // Premises, each on a copy: with its segments whole the open takes the
+    // forged slot, and with one lost it passes the slot over for the other.
+    let w = dir(&format!("osl-skip-{tag}-whole"));
+    copy_store(k, &w);
+    let seq = Db::open(&w, opts.clone())
+        .expect("the forged slot's store opens")
+        .manifest_seq();
+    assert!(
+        seq > owed + 1,
+        "{tag}: premise: the open took the forged slot {} at {}: {seq}",
+        OS_SLOTS[b],
+        owed + 1
+    );
+    oo_tear(&k.join(&new[0]), OoTear::Empty);
+    copy_store(k, &w);
+    let seq = Db::open(&w, opts.clone())
+        .expect("the store with a pending segment lost opens")
+        .manifest_seq();
+    assert!(
+        seq > a_seq && seq <= owed,
+        "{tag}: premise: the open passed the forged slot over for {} at {a_seq}: {seq}",
+        OS_SLOTS[a]
+    );
+    let _ = std::fs::remove_dir_all(&w);
+    // The open stopped between its sweep and its own write over `b`.
+    let from = Db::trace_dir_io(true).len();
+    let refused = match Db::open(
+        k,
+        Options {
+            tear_open_slot_write: true,
+            ..opts.clone()
+        },
+    ) {
+        Ok(_) => panic!("{tag}: the open answered Ok over a torn slot write"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        refused.contains("a test tore this manifest slot write"),
+        "{tag}: the open failed for another reason: {refused}"
+    );
+    let calls = osl_calls(k, from);
+    assert!(
+        new.iter().all(|n| !k.join(n).exists()),
+        "{tag}: premise: the open swept {new:?} before its slot write"
+    );
+    // The power cut: every file as the page cache holds it, and `b` the
+    // owed publish whole where no fdatasync of that file ran since the kill.
+    let cut = dir(&format!("osl-skip-{tag}-cut"));
+    copy_store(k, &cut);
+    let b_synced = calls
+        .iter()
+        .any(|(what, p)| *what == "sync_slot" && *p == k.join(OS_SLOTS[b]));
+    if !b_synced {
+        std::fs::write(cut.join(OS_SLOTS[b]), whole).unwrap();
+    }
+    let failures = os_check_all(
+        &[(
+            cut.clone(),
+            format!(
+                "a power cut after an open that passed over {} for pending segments, it \
+                 holding {}",
+                OS_SLOTS[b],
+                if b_synced {
+                    "the image the open synced and then tore"
+                } else {
+                    "the owed publish whole"
+                }
+            ),
+        )],
+        model,
+        opts,
+    );
+    assert!(failures.is_empty(), "{tag}: {failures:?}");
+    let _ = std::fs::remove_dir_all(&cut);
+}
+
+#[test]
+fn a_torn_publish_over_an_owed_slot_survives_a_power_cut_after_the_reopen() {
+    a_torn_publish_over_an_owed_slot("plain", Options::default());
+}
+
+#[test]
+fn a_torn_publish_over_an_owed_slot_survives_a_power_cut_after_the_reopen_under_a_cipher() {
+    a_torn_publish_over_an_owed_slot("cipher", under_cipher());
+}
+
+/// A store whose other slot file is not there -- one born under the rename
+/// shape (`manifest_slots` off) -- is opened without the open making it: an
+/// open that refuses leaves the directory as it found it, the file still
+/// absent, and an open under the rename shape that answers Ok makes none.
+fn an_absent_other_slot(tag: &str, base: Options) {
+    let rename = Options {
+        manifest_slots: false,
+        ..os_opts(&base)
+    };
+    let slots = os_opts(&base);
+    let d = dir(&format!("osl-absent-{tag}"));
+    let mut db = Db::create(&d, rename.clone()).unwrap();
+    let mut model = BTreeMap::new();
+    os_round(&mut db, &mut model, "r0", 0, OS_KEYS);
+    db.flush().unwrap();
+    db.settle().unwrap();
+    drop(db);
+    assert!(
+        !d.join(OS_SLOTS[1]).exists(),
+        "{tag}: premise: the rename shape has no {}",
+        OS_SLOTS[1]
+    );
+    // A segment the manifest names taken away, so the open refuses at its
+    // check of the slot against the directory, after its slot syncs.
+    let found = os_files(&d);
+    let seg = found
+        .iter()
+        .filter(|(n, _)| !n.starts_with("manifest") && !n.starts_with("wal-"))
+        .max_by_key(|(_, b)| b.len())
+        .map(|(n, _)| n.clone())
+        .expect("a segment");
+    std::fs::remove_file(d.join(&seg)).unwrap();
+    let mut gone = found.clone();
+    gone.remove(&seg);
+    for (shape, opts) in [("rename", &rename), ("slots", &slots)] {
+        let refused = match Db::open(&d, opts.clone()) {
+            Ok(_) => panic!("{tag}, {shape}: the open answered Ok without {seg}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            refused.contains("which is missing from the directory"),
+            "{tag}, {shape}: the open refused for another reason: {refused}"
+        );
+        let changed = osl_changed(&gone, &d);
+        assert!(
+            changed.is_empty(),
+            "{tag}, {shape}: the open that refused changed the directory: {changed:?}"
+        );
+    }
+    std::fs::write(d.join(&seg), &found[&seg]).unwrap();
+    let db = Db::open(&d, rename.clone()).expect("the store opens");
+    for (k, v) in model.iter().step_by(97) {
+        assert_eq!(read_vec(&db, k), vec![v.clone()], "{tag}");
+    }
+    drop(db);
+    assert!(
+        !d.join(OS_SLOTS[1]).exists(),
+        "{tag}: an open under the rename shape made {}",
+        OS_SLOTS[1]
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn an_open_makes_no_slot_file_it_does_not_find() {
+    an_absent_other_slot("plain", Options::default());
+}
+
+#[test]
+fn an_open_makes_no_slot_file_it_does_not_find_under_a_cipher() {
+    an_absent_other_slot("cipher", under_cipher());
 }

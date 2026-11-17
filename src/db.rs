@@ -1220,6 +1220,11 @@ pub struct Options {
     /// error names the inode of the file the sync was for.
     #[doc(hidden)]
     pub fail_open_slot_sync: bool,
+    /// A test's: the open's fdatasync of the manifest slot it does not
+    /// take fails, as a device error would, before the open has changed
+    /// anything; the error names the inode of the file the sync was for.
+    #[doc(hidden)]
+    pub fail_open_other_slot_sync: bool,
     /// A test's: the first manifest slot the open writes is torn, the
     /// first half of its image written and the write failed, and the open
     /// answers that failure (`Db::tear_next_slot_write` is the segment
@@ -4007,6 +4012,7 @@ impl Default for Options {
             zpages_hold_build: false,
             zpages_hold_rename: false,
             fail_open_slot_sync: false,
+            fail_open_other_slot_sync: false,
             tear_open_slot_write: false,
             fail_open_pending_sync: false,
             zpages_hold_after_settle: false,
@@ -12309,8 +12315,8 @@ fn check_options(opts: &Options) -> Result<()> {
 /// two slot files in place and fsyncs it, each publish a sequence past the
 /// last and never into the slot that holds the newest manifest known
 /// durable, the last whose fdatasync returned (`SlotChoice`); an open takes
-/// the newest valid slot and fdatasyncs it before it removes a file or
-/// writes over the other, so a reopen sees exactly one of the two sets and
+/// the newest valid slot and fdatasyncs both slots before it removes a file
+/// or writes over either, so a reopen sees exactly one of the two sets and
 /// a publish torn by a crash is the slot it ignores
 /// (`Options::manifest_slots`). The
 /// shape before it wrote a temp name, renamed it over the old manifest and
@@ -28689,11 +28695,15 @@ impl Db {
     /// covered and a power cut lost, is a log with nothing in it; a header
     /// that is neither a log's nor zeroes over its first sector is refused.
     ///
-    /// The manifest slot the open takes is read out of the page cache too,
-    /// and is fdatasynced before the open removes any file it does not
-    /// name -- under a cipher, an envelope neither slot names included --
-    /// or writes over the other slot: one fdatasync of a small file,
-    /// of nothing where the slot was already on the device.
+    /// The manifest slots are read out of the page cache too, and both
+    /// are fdatasynced as the open found them before it removes any file
+    /// the slot it takes does not name -- under a cipher, an envelope
+    /// neither slot names included -- or writes over either slot: the slot
+    /// it takes, and the other, which a process kill part way through a
+    /// publish into it may have left torn in the cache over a record the
+    /// device holds whole. An fdatasync of each small file, of nothing
+    /// where it was already on the device; a slot file that is not there
+    /// is not made.
     ///
     /// The open removes and writes nothing until the slot it takes is held
     /// to the directory, and refuses, with every file left as it found it,
@@ -28782,14 +28792,16 @@ impl Db {
             Some(slots.remove(0))
         };
         let had_manifest = manifest.is_some();
-        // The slot the store is read from made durable before anything
-        // below unlinks a file it does not name or writes over the other
-        // slot: a process kill leaves the page cache whole, so the slot
-        // read may be a publish whose fdatasync never ran, and the other
-        // slot the only manifest on the device. One fdatasync, of nothing
-        // where the slot is clean. From here the slot read is the one a
-        // publish keeps off (`Maint::slot`); with no manifest read, none
-        // is durable and the first publish writes the first slot.
+        // Both slots made durable as the page cache holds them before
+        // anything below unlinks a file the slot read does not name or
+        // writes over the other slot: a process kill leaves the page cache
+        // whole, so the slot read may be a publish whose fdatasync never
+        // ran, and the other slot the only manifest on the device -- or a
+        // publish into the other torn in the cache over a record the device
+        // holds whole. An fdatasync each, of nothing where a slot is clean.
+        // From here the slot read is the one a publish keeps off
+        // (`Maint::slot`); with no manifest read, none is durable and the
+        // first publish writes the first slot.
         let mut slot = SlotChoice::NONE;
         // Per slot file, the sequence an fdatasync here covered: a test's
         // record of what the open made durable (`Shared::slot_synced`).
@@ -28802,17 +28814,39 @@ impl Db {
         let mut tear = opts.tear_open_slot_write;
         let take = std::mem::take::<bool>;
         if let Some(m) = &manifest {
-            let f = vault::open_slot(dir.join(MANIFEST_SLOTS[m.slot]))?;
-            if opts.fail_open_slot_sync {
-                // The file the sync was for named by its inode, so a test
-                // can tell the slot taken from the other.
-                use std::os::unix::fs::MetadataExt;
-                return Err(err(&format!(
-                    "a test failed the open's fdatasync of its manifest slot (inode {})",
-                    f.metadata()?.ino()
-                )));
+            // The slot taken, and the other whatever it read as -- torn,
+            // older, or newer and passed over for pending segments that did
+            // not read whole -- since a power cut would otherwise hand the
+            // next open what the device holds of it, which may be a state
+            // this open passed over, naming what it sweeps. A slot file that
+            // is not there is not made.
+            for (s, fail, what) in [
+                (m.slot, opts.fail_open_slot_sync, "its manifest slot"),
+                (
+                    1 - m.slot,
+                    opts.fail_open_other_slot_sync,
+                    "the manifest slot it did not take",
+                ),
+            ] {
+                let path = dir.join(MANIFEST_SLOTS[s]);
+                let Some(f) = vault::open_slot_found(&path)? else {
+                    continue;
+                };
+                // A test's failure stands in for the fdatasync's own, inside
+                // the call that records the ones that return; the file it
+                // was for named by its inode, so a test can tell the slot
+                // taken from the other.
+                let failed = if fail {
+                    use std::os::unix::fs::MetadataExt;
+                    Some(err(&format!(
+                        "a test failed the open's fdatasync of {what} (inode {})",
+                        f.metadata()?.ino()
+                    )))
+                } else {
+                    None
+                };
+                vault::sync_slot(&f, &path, failed)?;
             }
-            f.sync_data()?;
             slot.landed(m.slot);
             synced[m.slot] = m.seq;
         }
