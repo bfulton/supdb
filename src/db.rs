@@ -12705,12 +12705,12 @@ fn manifest_parse(buf: &[u8]) -> Result<Manifest> {
 /// Every valid slot, newest first by publish sequence; empty when neither
 /// exists -- a store that has never sealed, or one written before
 /// manifests. An empty slot is one made and never written. A slot that
-/// fails its CRC is a torn write: passed over where another slot is
-/// valid, since the torn one is the publish the crash interrupted and the
-/// other is the store, which the open then holds to the directory
-/// (`Db::fallback_refusals`) -- the second answer says one was passed
-/// over -- and refused where no slot is valid rather than guessed at.
-fn manifest_read_all(dir: &Path) -> Result<(Vec<Manifest>, bool)> {
+/// fails its CRC is a torn write: ignored where another slot is valid,
+/// since the torn one is the publish the crash interrupted and the other
+/// is the store, and refused where no slot is valid rather than guessed at.
+/// The open holds the slot it takes to the directory before it believes
+/// that (`Db::open_refusals`, `Db::unnamed_refusals`).
+fn manifest_read_all(dir: &Path) -> Result<Vec<Manifest>> {
     let mut valid: Vec<Manifest> = Vec::new();
     let mut torn: Option<std::io::Error> = None;
     for (i, slot) in MANIFEST_SLOTS.iter().enumerate() {
@@ -12731,7 +12731,7 @@ fn manifest_read_all(dir: &Path) -> Result<(Vec<Manifest>, bool)> {
     valid.sort_by_key(|m| std::cmp::Reverse(m.seq));
     match (valid.is_empty(), torn) {
         (true, Some(e)) => Err(e),
-        (_, torn) => Ok((valid, torn.is_some())),
+        _ => Ok(valid),
     }
 }
 
@@ -28692,15 +28692,15 @@ impl Db {
     /// where that slot cannot be the store: a segment it names is not in
     /// the directory; no slot can be read beside `par-` or `pcs-` files,
     /// or under a cipher beside segments' envelopes, which only a store
-    /// with a manifest writes; or, where a newer slot failed its check and
-    /// was passed over, a segment the slot taken does not name holds
-    /// writes the log no longer replays, or keys nothing the slot names,
-    /// no run's temp name and no replayed frame holds. A store with no
-    /// slot and only `seg-` files is one from before manifests and opens
-    /// from their names. Under `Options::manifest_pending` a pending
-    /// segment the open reads back whole is fsynced, with its ordered
-    /// index under `Options::ord_durable` and the directory, before the
-    /// open writes the slot naming it durable.
+    /// with a manifest writes; or a segment the slot does not name, newer
+    /// than every segment it names and within what it covers, holds keys
+    /// nothing the slot names, no run's temp name and no replayed frame
+    /// holds -- which a crash never leaves, and damage that passes over a
+    /// newer slot can. A store with no slot and only `seg-` files is one
+    /// from before manifests and opens from their names. Under
+    /// `Options::manifest_pending` a pending segment the open reads back
+    /// whole is fsynced, with its ordered index under `Options::ord_durable`
+    /// and the directory, before the open writes the slot naming it durable.
     pub fn open(dir: &Path, mut opts: Options) -> Result<Db> {
         check_options(&opts)?;
         // Before anything is read, the store held to the way it is asked
@@ -28752,7 +28752,7 @@ impl Db {
         // version 2 or 1, gets both slots rewritten in this version below,
         // since a reader of those versions skips a slot it cannot parse for
         // one it can, and would take the older state for the store.
-        let (mut slots, slot_failed) = manifest_read_all(dir)?;
+        let mut slots = manifest_read_all(dir)?;
         let upgrade = slots.iter().any(|m| m.version < 3);
         // Only the newest slot's pending names are in doubt: the slot
         // before it was written by a publish that waited for that seal's
@@ -28763,15 +28763,6 @@ impl Db {
         if skipped {
             slots.remove(0);
         }
-        // The slot taken is not the newest one written: one failed its
-        // check. A crash leaves that where a publish it interrupted never
-        // became durable, so nothing was retired behind it; damage leaves
-        // it where one did, and then the slot before is not the store. A
-        // newest slot passed over for its pending names is neither: a
-        // slot naming a seal's segments pending retires nothing of that
-        // seal's log or temp names, which wait for a slot naming them
-        // durable, and that slot is the newer one.
-        let fell_back = slot_failed;
         let manifest: Option<Manifest> = if slots.is_empty() {
             None
         } else {
@@ -28935,8 +28926,8 @@ impl Db {
         // after. The builder ahead of the reader found it missing, reading
         // a reopened store at its watermark.
         mem.commit();
-        if fell_back && held.is_none() {
-            Db::fallback_refusals(dir, taken, sealed, from, &live, &on_disk, &mem)?;
+        if held.is_none() {
+            Db::unnamed_refusals(dir, taken, sealed, &live, &on_disk, &mem)?;
         }
         // The store is what the slot taken names: from here the open
         // removes what nothing names and writes what it owes.
@@ -29618,32 +29609,31 @@ impl Db {
         Ok(())
     }
 
-    /// The refusals of an open that passed over a newer slot, one that
-    /// failed its check, for the slot before it. A crash leaves that only
-    /// where the publish it interrupted never became durable, so nothing
-    /// was retired behind it and the slot taken, the log and the runs'
-    /// temp names hold every write; damage leaves it where the newer slot
-    /// was durable, and the log files and temp names it covered may be
-    /// gone. So every segment
-    /// the slot taken does not name, and that reads back whole, is held to
-    /// what holds its records before the open sweeps it: one with writes
-    /// past what the slot covers, by the log replaying through them
-    /// (`replayed`, the sequence after the last frame replay applied: a
-    /// run's segment is named at the log's sequence, which the log reaches
-    /// whether or not it holds the run's records); and one newer than every
-    /// segment the slot names, by its first and last keys, each held by a
-    /// segment the slot names, a run's segment beside its temp name -- a
-    /// run's own among them -- or the replayed log, as a merge's outputs
-    /// are held by their inputs and a seal's by its log, and a run's whose
-    /// temp name was retired by nothing. A segment that does not read back
-    /// whole was never durable, so no slot named it so and nothing retired
-    /// behind it. Not under a cipher, where an envelope no slot names has
-    /// its key in no slot that can be read.
-    fn fallback_refusals(
+    /// The open's refusal of a segment the slot it takes does not name,
+    /// before it sweeps it. A crash leaves such a segment from a job whose
+    /// publish never became durable -- a seal's, a run's, a merge's -- so
+    /// nothing was retired behind it and the slot, the log and the runs'
+    /// temp names hold every write the store acknowledged; damage that
+    /// makes the open pass over a newer slot whose publish was durable
+    /// leaves one whose log files and temp names may be gone. A segment
+    /// newer than every segment the slot names and whose writes are all
+    /// within what it covers -- a merge's output, or a run's segment, named
+    /// at the log's sequence -- is held by its first and last keys to what
+    /// holds its records: a segment the slot names, as a merge's inputs
+    /// hold its outputs, a run's segment beside its temp name, a run's own
+    /// among them, or the replayed log; a run's whose temp name was
+    /// retired holds them alone. One with writes past what the slot covers
+    /// is a seal's, and is swept as the crash window's: under a buffered
+    /// policy a torn publish of its landing leaves it synced beside a log
+    /// a power cut cut short, the same files as damage past a log that
+    /// retired. One older than a segment the slot names is a job's input
+    /// or a promotion's old name, and one that does not open is a file
+    /// nothing reads. Not under a cipher, where an envelope no slot names
+    /// has its key in no slot that can be read.
+    fn unnamed_refusals(
         dir: &Path,
         taken: Option<&str>,
         sealed: u64,
-        replayed: u64,
         live: &[String],
         on_disk: &[String],
         mem: &MemTable,
@@ -29669,22 +29659,12 @@ impl Db {
                     .and_then(|r| r.parse::<u64>().ok())
             })
             .collect();
-        let whole = |n: &str| -> Option<Blob<MmapBytes>> {
-            let src = vault::map(dir.join(n)).ok()?;
-            Blob::open_with(
-                src,
-                crate::blob::BlobOptions {
-                    verify_checksums: true,
-                    verify_index: true,
-                    ..Default::default()
-                },
-            )
-            .ok()
-        };
+        let whole =
+            |n: &str| -> Option<Blob<MmapBytes>> { Blob::open(vault::map(dir.join(n)).ok()?).ok() };
         let refused = |what: String| {
             err(&format!(
-                "refused: a newer manifest slot did not check out, and the slot before \
-                 it, {slot}, is not the store: {what}; nothing was removed"
+                "refused: the manifest slot {slot} is not the store: {what}; nothing was \
+                 removed"
             ))
         };
         // What holds a key besides the log, opened at the first key asked.
@@ -29693,16 +29673,13 @@ impl Db {
             let (Some(id), Some(end)) = (Db::name_id(u), Db::name_end_seq(u)) else {
                 continue;
             };
+            if id < next_id || end > sealed {
+                continue;
+            }
             let Some(b) = whole(u) else {
                 continue;
             };
-            if end > sealed && replayed < end {
-                return Err(refused(format!(
-                    "{u} holds writes to sequence {end}, which the log no longer holds \
-                     (it replays to {replayed})"
-                )));
-            }
-            if id < next_id || b.keys() == 0 {
+            if b.keys() == 0 {
                 continue;
             }
             let holders = holders.get_or_insert_with(|| {

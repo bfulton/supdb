@@ -8939,7 +8939,6 @@ fn an_open_that_recovers_a_run_keeps_the_slot_that_names_it() {
 /// The words of each refusal, which a refusal further in -- a segment the
 /// open fails to find once it has swept -- does not carry.
 const OO_GONE: &str = "is missing from the directory";
-const OO_LOG: &str = "the log no longer holds";
 const OO_KEYS: &str = "holds keys nothing the slot names";
 const OO_NO_SLOT: &str = "no manifest slot can be read";
 
@@ -9101,6 +9100,59 @@ fn a_damaged_slot_over_a_flushed_run(again: Option<u32>) {
     let _ = std::fs::remove_dir_all(dir(&format!("oo-run-{again:?}")));
 }
 
+/// A refusal made once the log is replayed leaves the log as it found it.
+/// A buffered store's log in three files, each rotation leaving the file
+/// before it loose, and a power cut that took the first file's frames, so
+/// replay ends where the second begins and the third holds a tail the cut
+/// came before; beside it a flushed run whose slot is damaged, which the
+/// open refuses. The files after the end of the log are removed only once
+/// the open has decided the store is what it reads.
+#[test]
+fn a_refused_open_leaves_the_log_files_its_replay_ended_before() {
+    let d = dir("oo-loose");
+    let c = dir("oo-loose-kill");
+    let opts = rotating();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    for k in 0..200u32 {
+        db.append(key(k).as_bytes(), b"acked");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    assert!(!open_run(&d), "premise: the run's temp name retired");
+    // Frames far larger than what they put in the table, so the log
+    // rotates twice before the table is a seal's worth.
+    let mut i = 0u32;
+    while db.seal_waits().wal_rotations < 2 {
+        put_commit(&mut db, &format!("r{i:07}"), "x").unwrap();
+        i += 1;
+        assert!(i < 100_000, "the log rotated twice");
+    }
+    put_commit(&mut db, "s0000000", "x").unwrap();
+    copy_store(&d, &c);
+    drop(db);
+    let wals = wal_names(&c);
+    assert_eq!(wals.len(), 3, "premise: three log files: {wals:?}");
+    let [newest, older] = oo_by_age(&c);
+    let (_, new_names) = oo_names(&std::fs::read(&newest).unwrap());
+    let (_, old_names) = oo_names(&std::fs::read(&older).unwrap());
+    assert!(
+        new_names.iter().any(|n| !old_names.contains(n)),
+        "premise: the run's segment only the newest slot names: {new_names:?} beside {old_names:?}"
+    );
+    // The power cut: the first file's frames, which no sync covered, gone.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(c.join(&wals[0]))
+        .unwrap()
+        .set_len(WAL_HEAD)
+        .unwrap();
+    oo_damage(&newest);
+    oo_refused(&c, &opts, OO_KEYS, "loose");
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&c);
+}
+
 /// A partition, then every key rewritten by commits through the log until
 /// it rotates, and the close: its drain seals the rewrites and its merge
 /// folds them into a new partition, unlinking the files the slot before
@@ -9170,71 +9222,6 @@ fn a_fallback_onto_a_slot_naming_files_gone_is_refused_under_a_cipher() {
     a_fallback_onto_a_slot_naming_files_gone("cipher", under_cipher());
 }
 
-/// A partition, then a seal of rewrites into a piece over it whose log
-/// file retires at the piece's durable landing (`seal_rotates_wal`), and
-/// nothing after. With the newest slot damaged, the slot before it names
-/// the partition alone, every file in place, and covers less of the log
-/// than the piece; the log that held the rewrites is gone, so the open
-/// that took the slot before would answer every rewritten key's first
-/// value. It refuses.
-#[test]
-fn a_fallback_past_a_slot_whose_log_retired_is_refused() {
-    let d = dir("oo-log");
-    let c = dir("oo-log-kill");
-    let opts = Options {
-        direct_ingest: false,
-        seal_rotates_wal: true,
-        seal_bytes: 1 << 20,
-        l0_trigger: 1000,
-        ..Options::default()
-    };
-    let mut db = Db::create(&d, opts.clone()).unwrap();
-    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-    for k in 0..2000u32 {
-        db.put(key(k).as_bytes(), b"v0");
-        model.insert(key(k).into_bytes(), vec![b"v0".to_vec()]);
-    }
-    db.commit().unwrap();
-    db.flush().unwrap();
-    db.settle().unwrap();
-    for k in (0..2000u32).step_by(7) {
-        db.put(key(k).as_bytes(), b"v1");
-        model.insert(key(k).into_bytes(), vec![b"v1".to_vec()]);
-    }
-    db.commit().unwrap();
-    db.seal().unwrap();
-    db.settle().unwrap();
-    // The store as it stands, nothing in flight: what a kill leaves.
-    copy_store(&d, &c);
-    drop(db);
-    let [newest, older] = oo_by_age(&c);
-    let (cov_new, new_names) = oo_names(&std::fs::read(&newest).unwrap());
-    let (cov_old, old_names) = oo_names(&std::fs::read(&older).unwrap());
-    assert!(
-        cov_old < cov_new
-            && old_names.iter().all(|(n, _)| c.join(n).exists())
-            && new_names.iter().any(|n| !old_names.contains(n)),
-        "premise: the older slot covers less, names files in place, and \
-         not the piece: {old_names:?} at {cov_old} beside {new_names:?} at {cov_new}"
-    );
-    for w in wal_names(&c) {
-        assert_eq!(
-            std::fs::metadata(c.join(&w)).unwrap().len(),
-            8,
-            "premise: {w} holds nothing, the file the rewrites were in retired"
-        );
-    }
-    let saved = std::fs::read(&newest).unwrap();
-    oo_damage(&newest);
-    oo_refused(&c, &opts, OO_LOG, "log");
-    std::fs::write(&newest, &saved).unwrap();
-    let db = Db::open(&c, opts).expect("the store with its slot put back opens");
-    oo_holds(&db, &model, "log, repaired");
-    drop(db);
-    let _ = std::fs::remove_dir_all(&d);
-    let _ = std::fs::remove_dir_all(&c);
-}
-
 /// The windows a fall back has to open through, each staged as a crash
 /// leaves it -- the store's files copied with a job held at its landing --
 /// and then the publish after it torn: a seal's segments renamed into
@@ -9242,14 +9229,22 @@ fn a_fallback_past_a_slot_whose_log_retired_is_refused() {
 /// segment linked under its piece name beside its temp name; a merge's
 /// outputs renamed into place beside the inputs the slot before names; and
 /// a merge's inputs left beside the outputs a durable slot names, their
-/// first and last keys among those the merge dropped. Each opens with every acknowledged write, the unnamed files swept.
+/// first and last keys among those the merge dropped; and under a buffered
+/// policy, a seal's segments synced beside a log whose frames for them a
+/// power cut took, the publish of their landing torn -- the store as it
+/// was before those writes, which no sync acknowledged. Each opens with every acknowledged write, the unnamed files swept.
 #[test]
 fn the_windows_a_torn_publish_leaves_open_through_the_slot_before() {
-    for case in ["seal", "run", "merge", "inputs"] {
+    for case in ["seal", "run", "merge", "inputs", "buffered"] {
         let d = dir(&format!("oo-win-{case}"));
         let c = dir(&format!("oo-win-{case}-kill"));
         let opts = Options {
-            partition_on_flush: case == "seal" || case == "run",
+            partition_on_flush: case == "seal" || case == "run" || case == "buffered",
+            sync: if case == "buffered" {
+                SyncPolicy::EveryN(u32::MAX)
+            } else {
+                SyncPolicy::Always
+            },
             flush_schedules: case == "merge" || case == "inputs",
             seal_bytes: 1 << 20,
             l0_trigger: 1000,
@@ -9269,6 +9264,14 @@ fn the_windows_a_torn_publish_leaves_open_through_the_slot_before() {
         db.flush().unwrap();
         db.settle().unwrap();
         let before = seg_names(&d);
+        // The log as the flush left it durable, for the buffered case's cut.
+        let logged: Vec<(String, u64)> = wal_names(&d)
+            .into_iter()
+            .map(|w| {
+                let n = std::fs::metadata(d.join(&w)).unwrap().len();
+                (w, n)
+            })
+            .collect();
         match case {
             "seal" => {
                 for k in (0..2000u32).step_by(3) {
@@ -9279,6 +9282,20 @@ fn the_windows_a_torn_publish_leaves_open_through_the_slot_before() {
                         b"s",
                     );
                     put(&mut db, &mut model, key(k).into_bytes(), b"v1");
+                }
+                db.commit().unwrap();
+                db.hold_seal_durable(true);
+                db.seal().unwrap();
+                wait_for("the seal's segments in place", || {
+                    seg_names(&d).iter().any(|n| !before.contains(n))
+                });
+            }
+            "buffered" => {
+                // Writes no sync covers, sealed: the seal's segments synced,
+                // and the publish of their landing the one a power cut tore.
+                for k in (0..2000u32).step_by(3) {
+                    db.put(format!("new-{k:06}").as_bytes(), b"s");
+                    db.put(key(k).as_bytes(), b"v1");
                 }
                 db.commit().unwrap();
                 db.hold_seal_durable(true);
@@ -9356,10 +9373,28 @@ fn the_windows_a_torn_publish_leaves_open_through_the_slot_before() {
             !unnamed.is_empty(),
             "{case}: premise: segments no slot names stand"
         );
+        if case == "buffered" {
+            // The power cut: the log's frames past the flush never synced.
+            for w in wal_names(&c) {
+                let n = logged.iter().find(|(l, _)| *l == w).map_or(8, |l| l.1);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(c.join(&w))
+                    .unwrap()
+                    .set_len(n)
+                    .unwrap();
+            }
+        }
         oo_tear_next(&c);
         let db = Db::open(&c, opts.clone())
             .unwrap_or_else(|e| panic!("{case}: the window refused: {e}"));
         oo_holds(&db, &model, case);
+        if case == "buffered" {
+            assert!(
+                read_vec(&db, b"new-000000").is_empty(),
+                "{case}: the store as it was before the writes no sync covered"
+            );
+        }
         drop(db);
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&c);
