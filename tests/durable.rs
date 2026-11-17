@@ -5465,12 +5465,14 @@ fn a_sync_with_a_run_open_pays_the_log_directorys_barrier() {
 // and the log that holds its writes is retired by nothing, whichever path
 // would write the next manifest: a merge's landing, a later seal's, a
 // drain's, the close. The seal queue stops (`Db::seals_wedged`), readers
-// go on reading what was published, and every `sync` and `flush` answers
-// the failure until the store is reopened.
+// go on reading what was published, and every `flush` answers the failure
+// until the store is reopened; a `sync`, which promises nothing of a
+// seal's writes, answers nothing of it.
 // ---------------------------------------------------------------------
 
-/// The words every `sync` and `flush` of a store whose seal failed to make
-/// its segments durable answers with, before the failure's own.
+/// The words every `flush` of a store whose seal failed to make its
+/// segments durable answers with, after the call that met the failure,
+/// before the failure's own.
 const SS_WEDGED: &str = "a seal failed to make its segments durable";
 
 type SsModel = BTreeMap<Vec<u8>, Vec<Vec<u8>>>;
@@ -5584,6 +5586,17 @@ fn ss_put(db: &mut Db, model: &mut SsModel, k: &[u8], v: &str) {
         .entry(k.to_vec())
         .or_default()
         .push(v.as_bytes().to_vec());
+}
+
+/// A `sync` after a seal failed answers `Ok`: what it promises is in the
+/// log, which no manifest retires while the queue is stopped, and the
+/// commits of a run closed into the seal are durable once that seal lands,
+/// which a `sync` never covers (`SyncPolicy`); a `flush` is the call that
+/// answers the failure.
+fn ss_sync_answers_nothing(r: std::io::Result<()>, what: &str) {
+    if let Err(e) = r {
+        panic!("{what}: answered the seal's failure, which a sync does not cover: {e}");
+    }
 }
 
 /// `r` an error carrying the wedge's words and the failure's own (`cause`).
@@ -5716,8 +5729,8 @@ fn a_seal_whose_directory_fsync_failed_is_named_by_no_manifest() {
     ss_check(&db, &model, "after the failure, before the close");
     // The answers, read once the files are: a store that names the piece
     // is wrong first in what it left on disk.
+    let sync_ans = db.sync();
     let answers = [
-        ("a sync after the failure", db.sync()),
         ("a flush after the failure", db.flush()),
         ("the flush after that", db.flush()),
     ];
@@ -5730,6 +5743,7 @@ fn a_seal_whose_directory_fsync_failed_is_named_by_no_manifest() {
     let db = Db::open(&d, opts).expect("the store opens after the power cut");
     ss_check(&db, &model, "reopened after the power cut");
     drop(db);
+    ss_sync_answers_nothing(sync_ans, "a sync after the failure");
     for (what, r) in answers {
         ss_wedged(r, "directory fsync", what);
     }
@@ -5774,8 +5788,8 @@ fn a_seal_whose_data_fsync_failed_after_its_publish_is_named_by_no_manifest() {
     );
     wait_for("the merge's end", || !db.in_flight().1);
     ss_check(&db, &model, "after the failure, before the close");
+    let sync_ans = db.sync();
     let answers = [
-        ("a sync after the failure", db.sync()),
         ("a flush after the failure", db.flush()),
     ];
     let wedged = db.seals_wedged();
@@ -5793,6 +5807,7 @@ fn a_seal_whose_data_fsync_failed_after_its_publish_is_named_by_no_manifest() {
     let db = Db::open(&d, opts).expect("the store opens after the power cut");
     ss_check(&db, &model, "reopened after the power cut");
     drop(db);
+    ss_sync_answers_nothing(sync_ans, "a sync after the failure");
     for (what, r) in answers {
         ss_wedged(r, "a test failed this seal's fsync", what);
     }
@@ -5863,8 +5878,8 @@ fn a_later_seal_names_no_seal_whose_fsync_failed_and_retires_none_of_its_log() {
     db.commit().unwrap();
     // A seal of that batch is handed and lands nothing.
     db.seal().unwrap();
+    let sync_ans = db.sync();
     let answers = [
-        ("a sync after the failure", db.sync()),
         ("a flush after the failure", db.flush()),
     ];
     ss_check(&db, &model, "after the failure, before the close");
@@ -5888,6 +5903,7 @@ fn a_later_seal_names_no_seal_whose_fsync_failed_and_retires_none_of_its_log() {
     let db = Db::open(&d, opts).expect("the store opens after the power cut");
     ss_check(&db, &model, "reopened after the power cut");
     drop(db);
+    ss_sync_answers_nothing(sync_ans, "a sync after the failure");
     for (what, r) in answers {
         ss_wedged(r, cause, what);
     }
@@ -5922,8 +5938,8 @@ fn a_seal_whose_envelope_failed_under_a_cipher_is_made_durable_by_no_manifest() 
     wait_for("the merge's end", || !db.in_flight().1);
     ss_check(&db, &model, "after the failure, before the close");
     let late = db.cipher_counts().unwrap().late;
+    let sync_ans = db.sync();
     let answers = [
-        ("a sync after the failure", db.sync()),
         ("a flush after the failure", db.flush()),
     ];
     let wedged = db.seals_wedged();
@@ -5935,6 +5951,7 @@ fn a_seal_whose_envelope_failed_under_a_cipher_is_made_durable_by_no_manifest() 
     let db = Db::open(&d, opts).expect("the store opens");
     ss_check(&db, &model, "reopened");
     drop(db);
+    ss_sync_answers_nothing(sync_ans, "a sync after the failure");
     for (what, r) in answers {
         ss_wedged(r, "a test failed this seal's fsync", what);
     }
@@ -6065,7 +6082,8 @@ fn ss_failed_presync(tag: &str, inline: bool) {
         upto >= 16 * 4096,
         "{tag}: premise: the run's records were on its file when the presync failed, {upto} bytes"
     );
-    let answers = [("the flush after", db.flush()), ("a sync after", db.sync())];
+    let answers = [("the flush after", db.flush())];
+    let sync_ans = db.sync();
     for k in [0u32, 1499, 2999] {
         assert_eq!(
             read_vec(&db, &ss_key(k)),
@@ -6090,6 +6108,7 @@ fn ss_failed_presync(tag: &str, inline: bool) {
     let db = Db::open(&cut, opts)
         .unwrap_or_else(|e| panic!("{tag}: the store refused to open after a power cut: {e}"));
     drop(db);
+    ss_sync_answers_nothing(sync_ans, "a sync after the failure");
     for (what, r) in answers {
         ss_wedged(
             r,
@@ -6171,7 +6190,8 @@ fn ss_run_close_fails(tag: &str, by_flush: bool, inline: bool) {
     if db.commit().is_err() {
         db.commit().unwrap();
     }
-    let answers = [("a flush after", db.flush()), ("a sync after", db.sync())];
+    let answers = [("a flush after", db.flush())];
+    let sync_ans = db.sync();
     ss_check(&db, &model, &format!("{tag}: after the failure"));
     let wedged = db.seals_wedged();
     drop(db);
@@ -6199,6 +6219,7 @@ fn ss_run_close_fails(tag: &str, by_flush: bool, inline: bool) {
         .unwrap_or_else(|e| panic!("{tag}: the store refused to open after a power cut: {e}"));
     ss_check(&db, &model, &format!("{tag}: reopened after a power cut"));
     drop(db);
+    ss_sync_answers_nothing(sync_ans, "a sync after the failure");
     for (what, r) in answers {
         ss_wedged(r, cause, &format!("{tag}: {what}"));
     }
@@ -6449,4 +6470,137 @@ fn a_write_that_ends_a_run_whose_close_cannot_be_made_is_answered_and_panics_not
 #[test]
 fn a_seal_of_a_run_whose_close_cannot_be_made_leaves_the_run_open() {
     ss_no_room_for_the_run("seal", true);
+}
+
+/// The frozen list full of seals held before their landing -- ordinary
+/// backpressure, the queue alive -- and the segment work's own error
+/// waiting for the writer, as a merge's failure leaves it: a write that
+/// ends an ordered run waits for room as any close does, and is taken.
+/// The error is the next commit's answer, once, and the store goes on;
+/// nothing is kept as lost.
+#[test]
+fn a_write_that_ends_a_run_beside_a_segment_work_error_waits_for_room_and_is_taken() {
+    let d = dir("dur-ss-roomerr");
+    let crash = dir("dur-ss-roomerr-crash");
+    let opts = Options {
+        seal_bytes: 64 << 20,
+        l0_trigger: 1000,
+        ..Options::default()
+    };
+    let cause = "a test's error of the segment work";
+    let mut model = SsModel::new();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    db.hold_seal_landing(true);
+    for t in 0..3u32 {
+        for k in (0..100u32).rev() {
+            ss_put(&mut db, &mut model, &ss_key(1000 * (t + 1) + k), "f");
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+    }
+    assert_eq!(db.frozen_tables(), 3, "the frozen list is full, its seals held");
+    for k in 0..300u32 {
+        ss_put(&mut db, &mut model, &ss_key(100_000 + k), "r");
+    }
+    db.commit().unwrap();
+    assert!(db.run_synced_bytes().is_some(), "a run is open");
+    db.put_segment_work_err(cause);
+    // Let go once the writer, waiting for room, has met the error.
+    let release = db.release_seal_landing_once_taken();
+    ss_put(&mut db, &mut model, &ss_key(7), "low");
+    release.join().unwrap();
+    assert!(!db.seals_wedged(), "no seal failed");
+    assert!(db.run_synced_bytes().is_none(), "the run closed");
+    match db.commit() {
+        Ok(()) => panic!("the commit after the error answered Ok"),
+        Err(e) => assert!(
+            e.to_string().contains(cause),
+            "the next commit answers the segment work's error: {e}"
+        ),
+    }
+    db.commit()
+        .expect("the commit after that writes the batch and answers Ok");
+    ss_put(&mut db, &mut model, &ss_key(8), "after");
+    db.commit().expect("and the commits after it");
+    db.sync().expect("a sync after it");
+    db.flush().expect("a flush after it");
+    let h = db.reader().unwrap();
+    ss_check(&h, &model, "after the error");
+    drop(h);
+    copy_store(&d, &crash);
+    drop(db);
+    let db = Db::open(&crash, opts).expect("the store opens after a kill");
+    ss_check(&db, &model, "reopened after a kill");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// A store whose seal queue stopped, with room in the frozen list: a
+/// write that ends an ordered run is taken and the run closes, its
+/// segment one more that never lands. Inline the wait for room is the
+/// queue's own join, which answers the stopped queue every time it is
+/// asked, so the close goes on where there is room. The next commit
+/// answers the failure once and the commits after it are durable in the
+/// log; a `sync` answers nothing of it, a `flush` answers it every time.
+#[test]
+fn a_write_that_ends_a_run_over_a_stopped_queue_with_room_is_taken() {
+    for background in [false, true] {
+        let tag = if background { "background" } else { "inline" };
+        let d = dir(&format!("dur-ss-wedgeroom-{tag}"));
+        let crash = dir(&format!("dur-ss-wedgeroom-{tag}-crash"));
+        let opts = Options {
+            seal_bytes: 64 << 20,
+            l0_trigger: 1000,
+            publish_in_background: background,
+            ..Options::default()
+        };
+        let cause = "a test failed this landing";
+        let mut model = SsModel::new();
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        for k in (0..300u32).rev() {
+            ss_put(&mut db, &mut model, &ss_key(k), "h");
+        }
+        db.commit().unwrap();
+        db.fail_next_landing();
+        db.seal().unwrap();
+        if background {
+            wait_for("the failed landing", || db.seals_wedged());
+        } else {
+            assert!(db.settle().is_err(), "{tag}: the settle meets the failure");
+        }
+        assert!(db.seals_wedged(), "{tag}: the queue stopped");
+        assert!(db.frozen_tables() < 3, "{tag}: the frozen list has room");
+        for k in 0..300u32 {
+            ss_put(&mut db, &mut model, &ss_key(100_000 + k), "r");
+        }
+        if db.commit().is_err() {
+            assert!(background, "{tag}: only the segment work's error is answered");
+            db.commit().unwrap();
+        }
+        assert!(db.run_synced_bytes().is_some(), "{tag}: a run is open");
+        ss_put(&mut db, &mut model, &ss_key(7), "low");
+        assert!(db.run_synced_bytes().is_none(), "{tag}: the run closed");
+        if !background {
+            ss_wedged(db.commit(), cause, &format!("{tag}: the next commit"));
+        }
+        db.commit()
+            .unwrap_or_else(|e| panic!("{tag}: the commit after that answers Ok: {e}"));
+        ss_put(&mut db, &mut model, &ss_key(8), "after");
+        db.commit().unwrap();
+        db.sync()
+            .unwrap_or_else(|e| panic!("{tag}: a sync promises nothing of the seal: {e}"));
+        ss_wedged(db.flush(), cause, &format!("{tag}: a flush"));
+        ss_wedged(db.flush(), cause, &format!("{tag}: the flush after"));
+        let h = db.reader().unwrap();
+        ss_check(&h, &model, &format!("{tag}: after the failure"));
+        drop(h);
+        copy_store(&d, &crash);
+        drop(db);
+        let db = Db::open(&crash, opts).expect("the store opens after a kill");
+        ss_check(&db, &model, &format!("{tag}: reopened after a kill"));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&crash);
+    }
 }
