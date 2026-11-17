@@ -3083,6 +3083,23 @@ impl Policy {
             ..Policy::cache64_tofit_zstride()
         }
     }
+
+    /// `supdb-cache64tofitzpagesdrop`: `supdb-cache64tofitzpages` with the
+    /// raw pages a form file serves dropped from the page cache.
+    fn cache64_tofit_zpages_drop() -> Policy {
+        Policy {
+            zdropraw: Some(true),
+            ..Policy::cache64_tofit_zpages()
+        }
+    }
+
+    /// `supdb-cache64tofitzstridedrop`: the stride form forced beside it.
+    fn cache64_tofit_zstride_drop() -> Policy {
+        Policy {
+            zstride: Some(supdb::ZStride::Forced),
+            ..Policy::cache64_tofit_zpages_drop()
+        }
+    }
 }
 
 impl Supdb {
@@ -7563,16 +7580,18 @@ impl Supdb {
     /// files' page cache at five million keys under 640 MiB, given to the
     /// form.
     pub fn create_cache64_tofit_zpages_drop(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages: true,
-                zdropraw: Some(true),
-                ..Policy::default()
-            },
-        )
+        Supdb::with_policy(path, Policy::cache64_tofit_zpages_drop())
+    }
+
+    /// `supdb-cache64tofitzpagesdrop` with every build of a form file asking
+    /// for the stride form (`Options::zpages_stride` at `Forced`),
+    /// `supdb-cache64tofitzstridedrop`: the block cache's reads of a stride
+    /// partition where the stride files have the room the raw records held.
+    /// `supdb-cache64tofitzstride` keeps those records in the page cache, as
+    /// its sibling does, and under a bound the stride files fault for the
+    /// want of the room.
+    pub fn create_cache64_tofit_zstride_drop(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(path, Policy::cache64_tofit_zstride_drop())
     }
 
     /// `supdb-cache64tofitzpagesdrop` with its block-coded groups written by
@@ -9715,7 +9734,9 @@ impl Engine for Supdb {
         // The stride form's before every other forced shape, since each of
         // them would also match a store that forces the stride form.
         if self.budget == 64 << 20 && self.tofit && self.zpages && zstride {
-            return if self.zpages_prefetch {
+            return if zdropraw {
+                "supdb-cache64tofitzstridedrop"
+            } else if self.zpages_prefetch {
                 "supdb-cache64tofitzstrideprefetch"
             } else {
                 "supdb-cache64tofitzstride"
@@ -12242,6 +12263,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocachezstrideprefetch"
         | "supdb-cache64tofitzstride"
         | "supdb-cache64tofitzstrideprefetch"
+        | "supdb-cache64tofitzstridedrop"
         | "supdb-nocachezpagesrankwalk"
         | "supdb-nocachezpagesonegroup"
         | "supdb-nocachezpagesgroup1k"
@@ -12792,6 +12814,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cache64tofitzstride" => supdb_arm(Supdb::create_cache64_tofit_zstride, dir)?,
         "supdb-cache64tofitzstrideprefetch" => {
             supdb_arm(Supdb::create_cache64_tofit_zstride_prefetch, dir)?
+        }
+        "supdb-cache64tofitzstridedrop" => {
+            supdb_arm(Supdb::create_cache64_tofit_zstride_drop, dir)?
         }
         "supdb-cache64tofitzpagesstored" => {
             supdb_arm(Supdb::create_cache64_tofit_zpages_stored, dir)?
@@ -17847,10 +17872,11 @@ mod tests {
     }
 
     /// The stride form's arms are each another arm's policy with one field
-    /// moved -- `supdb-nocachezstride` and `supdb-cache64tofitzstride` the
-    /// forced block arms with the stride form forced, the prefetch arms the
-    /// stride arms with a walk's ask on (and `supdb-nocachezstrideprefetch`
-    /// the block prefetch arm with the stride form) -- and nothing else: the
+    /// moved -- `supdb-nocachezstride`, `supdb-cache64tofitzstride` and
+    /// `supdb-cache64tofitzstridedrop` the forced block arms with the stride
+    /// form forced, the prefetch arms the stride arms with a walk's ask on
+    /// (and `supdb-nocachezstrideprefetch` the block prefetch arm with the
+    /// stride form) -- and nothing else: the
     /// policies compared whole, the names, the guarantee, the features, the
     /// dispatch, and on the options the engine was opened with, the one
     /// option moved of the two the arms move, the trust in this process's
@@ -17935,6 +17961,16 @@ mod tests {
                 sib_make: Supdb::create_cache64_tofit_zstride,
                 moved: |p| p.zpages_prefetch = true,
                 want: (Forced, true, true),
+            },
+            Case {
+                name: "supdb-cache64tofitzstridedrop",
+                policy: Policy::cache64_tofit_zstride_drop,
+                make: Supdb::create_cache64_tofit_zstride_drop,
+                sib: "supdb-cache64tofitzpagesdrop",
+                sib_policy: Policy::cache64_tofit_zpages_drop,
+                sib_make: Supdb::create_cache64_tofit_zpages_drop,
+                moved: |p| p.zstride = Some(Forced),
+                want: (Forced, true, false),
             },
         ];
         let three = |o: &supdb::Options| {

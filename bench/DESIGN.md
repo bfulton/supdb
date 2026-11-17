@@ -610,7 +610,12 @@ counters say what the stride files served and why a partition declined;
 `supdb-nocachezstrideprefetch` is it with a walk's pages asked for ahead
 (`Options::zpages_scan_prefetch`), and `supdb-cache64tofitzstride`
 and `supdb-cache64tofitzstrideprefetch` are `supdb-cache64tofitzpages` with
-the stride form, and with the ask beside it; no arm moves the trust in this
+the stride form, and with the ask beside it;
+`supdb-cache64tofitzstridedrop` is `supdb-cache64tofitzpagesdrop` with the
+stride form, the arm to read a bounded cell from: `supdb-cache64tofitzpages`
+keeps the raw records in the page cache, and under a bound they hold the
+room the stride files need, which then fault at their first touches; no arm
+moves the trust in this
 process's builds (`Options::zpages_stride_trust_built`), which reaches only
 a build whose read-back read the device, and a forced build keeps its pages
 and reads them back from the cache, so the forced form's every arm checks
