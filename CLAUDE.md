@@ -2458,7 +2458,33 @@ sync (`Options::fail_open_slot_sync`) and the open is held to leaving
 the directory as it found it. The corollary: a check whose only test
 needs a privilege the gate does not have is a check nothing runs, and a
 claim that an order is unobservable is checked against the kill between
-every write and its sync before it is written down.
+every write and its sync before it is written down. That seam failed
+the open's sync whichever file the open had opened, so an open that
+synced the other slot passed it and every test but the root one; it
+names the inode it failed for now, and the test holds that to the slot
+taken. And the upgrade's order -- the newest slot written first, the
+one the store was read from after it -- was held by nothing, both
+writes being synced and no test cutting between them, until a seam tore
+the open's first slot write (`Options::tear_open_slot_write`). The
+corollary: a seam that fails an operation names what the operation was
+on, since a mutant that aims the operation at the wrong object fails
+through the seam as well. And the owed entry carried its slot and its
+sequence for a test's record, while the state that owes it already says
+both: a word stored on a drain's path that only a seam reads is a cost
+the seam was to be free of. The docs then said the open syncs its slot
+before it removes any file, and under a cipher the vault's sweep of
+envelopes neither slot names ran before the sync; the order was safe and
+the sentence false, and the test made an exception for the mode instead
+of the code keeping the sentence. The sweep runs after the sync now and
+the test holds both modes to a directory left as found. And the slot
+landed by the open's own writes -- a store's creation, an open with no
+manifest, a run recovered from its temp name -- and by an inline
+publish was held by no test, since every test's first publish came
+after a flush the test had settled and synced: a test tears the first
+publishes after each of those. The corollary: a sentence of a contract
+is checked against every mode before an exception is written into the
+test that holds it, and a choice seeded at several places is held at
+each place, by the first write after it.
 
 **A path only one arm exercises is a path nothing tests.** A delete was never
 marked dirty, and the checkpoint asked to carry it dropped it, leaving the key

@@ -5010,7 +5010,8 @@ the newest manifest known durable -- the last whose fdatasync returned
 still owed and never the other, and gives the owed sync up before its
 write, which a sync run after it would cover whole or torn -- and the open takes the newest slot
 whose checksum holds, a torn write being the slot it ignores, and
-fdatasyncs it before it removes a file or writes over the other. Both slots exist from the store's
+fdatasyncs it before it removes a file -- under a cipher, an envelope
+neither slot names included -- or writes over the other. Both slots exist from the store's
 birth or its first open under this, so no publish creates a directory
 entry (`Options::manifest_slots`; the rename shape is
 `supdb-manifestrename` and `supdb-ingestmanifestrename`). The header
