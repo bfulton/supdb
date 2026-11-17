@@ -2125,8 +2125,9 @@ it found it where that slot cannot be the store
 not there; no slot readable beside `par-` or `pcs-` files, or under a
 cipher beside envelopes, which only a store with a manifest writes; and
 a segment it does not name, newer than every segment it names and
-within what it covers -- a merge's output or a run's -- that holds keys
-nothing it names, no run's temp name and no replayed frame holds. A
+within what it covers -- a merge's output or a run's -- whose last key
+nothing it names and no run's temp name holds, read by that key alone
+(`ROADMAP.md`). A
 crash leaves an unnamed segment only from a job whose publish never
 became durable, so nothing was retired behind it and every window opens
 as before; damage that makes the open pass over a durable slot leaves
@@ -2437,7 +2438,15 @@ unsynced pages and the log was skipped past them; the open fsyncs a
 pending segment, its ordered index where those are kept durable, and
 the directory before the slot that names it durable. The corollary: a
 check that reads a file back proves the page cache, and only an fsync
-makes what it read durable.
+makes what it read durable. The first tests of that order read the
+open's record of what it had fsynced and tore what the record lacked,
+and the record said nothing of where the slot's write fell among the
+fsyncs, so an open that synced the directory, or every file after the
+first, after the slot passed them all; the slot's write is in the same
+record now, and the test holds each fsync to a place before it. The
+corollary: an order is tested by one record that holds both of its
+ends, since a record of each end apart holds that each happened and not
+which came first.
 
 **A sweep made before the choice it was for.** The open listed the
 segments, removed every one its chosen slot did not name, and only
@@ -2455,8 +2464,15 @@ still in flight, whose log still held its writes. The open removes and
 writes nothing now until the slot it takes is checked against the
 directory, and a segment the slot does not name is held to what
 retired behind it: a run's segment, or a merge's, is swept only where a
-run's temp name, the replayed log or the slot's own segments hold its
-keys. The first version held a seal's
+run's temp name or the slot's own segments hold its last key. The log
+was a third holder in the first version, and a mutant that took it away
+survived every test: nothing a crash leaves puts a run's or a merge's
+keys in the log alone, so the arm only let damage through. Both ends of
+the segment were read, and a mutant that read either end alone survived
+too: in every state one damaged slot leaves, the two ends are held
+alike, and the last is the one a run's records show at, since a run's
+keys sit above every key before it. And the docs promised every key
+of the segment read where two were. The first version held a seal's
 segment past what the slot covers to the log replaying it as well, and
 a buffered store's torn publish leaves exactly that -- the segment
 synced, the log's frames for it cut by the power cut -- which the open
@@ -2468,8 +2484,9 @@ was a second condition nothing could reach. The rule: a step that removes what
 a decision rules out runs after the decision is made and checked, never
 as part of making it; what it removes is held to the evidence of what
 retired behind it, and only where every crash state leaves different
-evidence; and a refusal is tested by its own words,
-since a refusal further in, after the damage is done, carries others.
+evidence; a refusal is tested by its own words, since a refusal
+further in, after the damage is done, carries others; and the docs of
+a check name what it reads, never what it stands for.
 
 **A slot chosen by its sequence, beside a sync left owed.** The
 manifest's two slots were written by the publish sequence's parity, on
