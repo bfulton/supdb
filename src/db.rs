@@ -30666,8 +30666,14 @@ impl Db {
         // of commits no sync has covered, and a run's commit counts in it
         // until its sync (`commit_direct`), so a run with a count of
         // nothing has nothing held -- every commit under `Always`.
+        //
+        // The directory barrier a rotation owes its new file is not asked
+        // apart, as `run_again` does not ask it: a loose rotation owes it
+        // with its file in `loose_wals`, which only `sync_wal` empties and
+        // only after paying it, and a chained one pays it at once or keeps
+        // its failure, which `commit_staged` answered above.
         let run_owed = self.unsynced != 0 && self.direct.is_some();
-        if self.wal.frames_unsynced() || !self.loose_wals.is_empty() || self.wal_dir_unsynced {
+        if self.wal.frames_unsynced() || !self.loose_wals.is_empty() {
             self.sync_wal()?;
         }
         if run_owed {
