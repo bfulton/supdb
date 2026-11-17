@@ -110,3 +110,153 @@ S6); `forms.md` (the contract and stages G1 to G3); `binding.md` (decision 1);
 
 A stage that fails its own gate stops there and comes to the owner with the
 numbers.
+
+## The G1 and G2 plan (2026-11-17, after the scouting)
+
+The scouting (`plan/g1.md`, `plan/g2.md`, each scout's notes re-derived by a
+skeptic in `plan/*/check.md`) amends `forms.md` in eleven places, listed at
+the end of each plan. All eleven are taken: each comes from a constraint that
+was checked (what Rust's visibility can say, what today's pager gives back,
+a cipher test that holds an open to a handful of chunks), none from
+convenience. Three were left as questions.
+
+11. **The thread half of the door waits for S1**, where the `pin::` wrappers
+    are built. At G1 a per-file count of `std::thread::` holds growth.
+    Not fragile: barring it at G1 is an allow on 55 functions, each "owed to
+    S1", and a gate that starts with 55 exemptions teaches the next one.
+
+12. **The wall compares totals by (file, token, region)**, with the scopes
+    printed beside a failure. Not fragile: a gate that asks for an approved
+    edit every time a coupled function moves or is renamed is one people
+    learn to edit without reading. Growth anywhere still fails.
+
+13. **The hidden accessors are built** (`Db::partition_fences`,
+    `Db::form_fence_keys`, answered from the state and never from the
+    directory). Reliable: about fifty tests come under the conform pass now
+    where they would wait for S3. Not fragile: a test that asks the store is
+    not a test of how the store is kept.
+
+14. **An unpinned writer is refused under a cipher** (G2-1). It is the rule
+    the store already has for `writer_pins` off, sound only while nothing
+    else frees what the writer reads, applied to the evictor, which does.
+    The option is a pricing arm (`supdb-nopin`), no feature of a store; the
+    refusal is said in the README's list of what a cipher store does not
+    take, with its reason.
+
+15. **G2 is split.** G2a is on today's pager and stays through S3. G2b (a
+    cache of a few pages exactly, the guard exact to the chunk, the
+    crash-state API that brings the byte-level crash tests under the pass)
+    follows S3, since each needs eviction by the page. Until then the pass
+    holds no crash window on the paged path, and says so.
+
+16. **The rewrites of G1-4 and G1-6 change what a cipher store does only
+    behind the compact form or `merge_drop_behind`**, neither a default
+    there. Their pricing is S5's, and the commit messages say it.
+
+Order within the stages is the plans'. Stage G1 follows the priced
+durability fixes; its three gate units (wall, door, cost) change no
+instruction of any build.
+
+## The owed items, concluded (2026-11-17)
+
+Four items were owed before later stages: the manifest slot as a sealed
+record, the model's op for syncs that overlap, the long-name spill, and the
+list of sites that read a form page. Each was built in Python models or read
+from the tree, re-derived by a skeptic, and concluded in
+`work/owed/conclusion.md`, which is the stage-by-stage list of what they
+change; where a check corrects its work, the check stands. Nothing in them was
+compiled or run on the engine. They amend the decisions above in four places
+and left four questions, decided here on the same rule as before.
+
+Amendments:
+
+- **Decision 2, the slots carry no chain.** A slot is one sealed record at
+  offset 0, rewritten whole. A chain to the previous publish refuses legal
+  states, a chain across the slots needs the engine's slot choice inside the
+  door, and neither catches the one hazard the model found. The log and the
+  spare keep the chain as decided.
+- **Decision 2, the slot's key is the file's.** A key derived from the
+  file's own key with a prefix a handle, as the Stream class has, which is the
+  key rule already written (the store's key seals nothing under a random
+  nonce). The slot's index stays in the associated data and is cited as
+  protecting nothing: what keeps a moved record harmless is that the engine
+  takes a slot's index from the file it read.
+- **Decision 2, Replace leaves S2.** Its only users were the two slots and
+  the rename shape's spare, and the rename shape is refused under a cipher.
+- **Decision 4's leakage list** gains nothing: the spill is not built (20).
+
+17. **The open settles both slots (H2), now.** The open fdatasyncs the slot
+    it takes and leaves the other to the kernel's writeback, so a slot read
+    as torn from the cache can be whole on the device for some seconds, and a
+    power cut there hands the next open a state the last one passed over. It
+    is the plain store's defect as much as a cipher store's and is the first
+    unit of the pricing run (`other-slot`): a failing test first, then one
+    more fdatasync at the open, of nothing where the file is clean.
+    Reliable: a store that refuses every open with its commits in its log is
+    the worst answer the engine has. Performant: nothing off the open.
+
+18. **A failed sync across a reopen (H1) is not fixed on a model.** After a
+    failed fdatasync Linux leaves the pages clean in the cache; a reopen
+    reads them, and a fresh descriptor's fdatasync answers Ok over bytes the
+    device may not hold. It is every file an open reads back (the slots, the
+    log, a run's temp file, pending segments), and the remedies differ: the
+    slots need a read past the cache, since writing either slot there can
+    destroy the only copy the device holds; the log's replayed frames need
+    to be written again into fresh pages (a new log file, or a seal of what
+    was replayed, which is what the other engines do at the end of a
+    recovery), never over themselves, where a torn sector would cost frames
+    that were durable. None of it can be tested here: this guest's kernel has
+    no device mapper and no fault injection, and a fix held only by a seam
+    that pretends the device answered is a fix held by its own assumption.
+    So: the docs say what is true (after a failed sync what the device holds
+    is not known, and a reopen while the kernel still caches the files reads
+    what the device may not hold); ROADMAP's item beside the fault-injecting
+    device names all four files and the remedies with their reasons; and the
+    CI job that has the privilege is where it is built and held. Told to the
+    owner as the one durability hazard left open by choice.
+
+19. **A failed tag on a form file under a cipher stays store-fatal until R8
+    lands with the layer (S1)**, where it becomes the file's alone, as a
+    plain store's is. Not fragile: the interim would be built on today's
+    pager and built again at S1. Two things move to S1 with it, not later:
+    the vault's change that makes a retired form's envelope unreachable
+    under its name (file-local failure makes the re-adoption path live for
+    any store that builds the form, and `ZPages::Always` is one today), and
+    its test (T5: a new attach id, one rebuild, no decline, the old bytes
+    gone). T4, the unit seam that makes a form page's read answer nothing at
+    each listed site, lands with G2a, where it is the poison draw's only
+    input for the forms. The form-site list for R8 is
+    `work/owed/formsites/sites.md` as its check corrects it; a gate over it
+    is keyed by (file, impl owner, name) and searches every file.
+
+20. **A form failure is counted and repaired, never surfaced**, as in a
+    plain store. An error or an event there is an API no store has today,
+    for a failure the store recovers from by itself.
+
+21. **The long-name spill is designed and not built.** No name spills at
+    today's `FENCE_MAX` (the longest is 115 bytes of 128). A compile-time
+    assertion that every name constructor fits the inline budget at
+    `FENCE_MAX` stands in its place, with the design and its check
+    (`work/owed/spill/`) for whoever grows the fence. Not fragile: the spill
+    is two to three hundred lines, a sync the engine did not issue, three
+    gaps its own check found, and no store to run it. This is no limit on a
+    store: every store's names fit, and a change that would make one not fit
+    does not compile. R10 is restated so. The duplicate-name fix the spill's
+    model found is the names layer's whether or not anything spills: the
+    open, resolving two entries for one name, makes the kept one durable and
+    fsyncs the directory before it unlinks the other.
+
+22. **The sync rules of the classes are the check's.** A sync waits for one
+    in flight on the same file description (two syncs of one description can
+    hand the device's error to one and Ok to the other); what is synced is
+    written as a maximum, never assigned; coverage is taken once, where the
+    sync is issued; a kept error answers every later sync. Each has its test
+    by the model's trace, run at a length where the in-flight state is
+    reachable. The Once class's record slot choice is modelled before S3
+    wires it. For today's engine the same analysis gives one defect, the
+    segment writer's helper syncing on the writer's own description, already
+    a unit of the pricing run, and two assertions for the slot choice.
+
+Still owed: the slot record's device probe (a timing run, before S6); the
+model of the Once class's slot choice (before S3); the budget margin gate
+(G3).

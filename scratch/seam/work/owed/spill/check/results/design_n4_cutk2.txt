@@ -1,0 +1,6 @@
+   refused opens 12 skipped ops 978 slot table full 0
+== spill n=4 alpha=CTDPRUXLctdpru {'cutk': 2} runs 4735 blocked 0 states {'proc': 136880, 'any': 433195} violations 5797 secs 2.7
+    ('any', 'UNNAMED') 5797
+  first ('any', 'UNNAMED') ('UNNAMED', 'n0')
+     ops rXC
+     trace [('create', 'n0'), ('data', 'i0'), ('fsync', 'i0'), ('sync_dir',), ('man write', ('n0',)), ('man sync',), '--', 'r', ('create', 't6'), ('data', 'i4'), ('fsync', 'i4'), ('rename', 'n0'), 'X', ('unlink', ('sweep', 'n0')), 'C', ('create', 't15'), ('data', 'i12'), ('rec', 'L14'), ('rename', 'L14')]

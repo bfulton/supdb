@@ -1,0 +1,2 @@
+   refused opens 0 skipped ops 20289 slot table full 0
+== spill n=5 alpha=CTDPRUXLctdpru {'NS': 2} runs 43999 blocked 0 states {'proc': 2699250, 'any': 15343583} violations 0 secs 73.9
