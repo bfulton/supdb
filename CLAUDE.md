@@ -1458,6 +1458,30 @@ every few hundred puts met it in their first minute. The pieces over one
 fence now order by the sequence their names carry, and a read's
 "oldest to newest" is a property of that order and not of the names.
 
+**An order that held by fence.** The pieces sorted by fence and then by
+sequence, which is an age order wherever the pieces that meet share a
+fence -- every piece aligned -- and wherever a piece cut at fences a merge
+replaced meets only pieces cut finer, which every merge over given ranges
+cuts. A first partitioning planned against a store with none joined a merge
+in flight that was a first partitioning too, and went on with no fences
+over the store the join had partitioned, cutting it again from every key at
+fences that refine nothing. A seal frozen while it ran was cut at the old
+fences and a seal after its landing at the new, a new range opened below
+the old piece's fence, and the newer piece over a key sorted ahead of the
+older: a read took the older piece's tombstone for the newest source and
+answered the value before the last put, the merge that folded the two
+wrote it, and a store kept from the differential fuzz's failure read it
+so at every open. The doc that said reads were ready for a piece over ranges it was not
+cut at was right about the ranges and silent on the order. Once a piece is
+unaligned the pieces sort by sequence alone (`sort_segs`), every sort holds
+each piece behind every older piece it meets under a debug assertion, and
+`tests/fences.rs` builds the re-cut with the old piece sealed beside it
+(`Db::hold_merge_start`). The rule: an order a rule rests on is the order
+of the quantity the rule is about, and where a cheaper key gives the same
+order only under a property of the history -- that every re-cut refines --
+the order is taken from the quantity wherever the property can fail, and
+asserted where it is made.
+
 **A form dropped by its writer stayed published.** The writer keeps
 its own copy of every block form and publishes a clone for readers to
 take; a reader takes a published form as the block and, with the table

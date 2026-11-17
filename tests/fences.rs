@@ -1199,3 +1199,167 @@ fn a_second_merge_runs_beside_the_first_over_ranges_it_does_not_hold() {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+/// Every value a key holds, read through the writer.
+fn values_of(db: &Db, k: &[u8]) -> Vec<Vec<u8>> {
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    db.read_all(k, vf(&mut |v| got.push(v.to_vec())))
+        .unwrap_or_else(|e| panic!("read of {:?}: {e}", String::from_utf8_lossy(k)));
+    got
+}
+
+/// Waits for `done` or fails the test with `what` after a minute.
+fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let t = std::time::Instant::now();
+    while !done() {
+        assert!(t.elapsed().as_secs() < 60, "never came: {what}");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// A piece cut at fences a re-cut replaced, beside a newer piece cut at
+/// the new ones. The first partitioning is planned against an
+/// unpartitioned store, and the merge it starts joins a merge in flight
+/// first, whose landing is a first partitioning of its own: the plan goes
+/// on with no fences, and cuts the store again from every key at fences
+/// that are no refinement of the ones standing. A piece sealed while it
+/// runs is cut at the old fences; a piece sealed after its landing, at the
+/// new; and a new range opens below the old piece's fence, so the two
+/// sorted by fence put the newer piece ahead of the older one, a read took
+/// the older piece's tombstone as the newest source and answered the value
+/// before the last put, and the merge that folded the two wrote it, which
+/// is the wrong answer the differential fuzz found under load. Built here by
+/// holding the first merge before its landing, making the planner join it,
+/// and holding the re-cut before it reads anything while the old piece is
+/// sealed: every key reads its last put through the writer, a handle and
+/// a scan, before the merge that folds the pieces, after it and after a
+/// reopen.
+#[test]
+fn a_piece_cut_at_fences_a_re_cut_replaced_reads_older_than_the_pieces_after_it() {
+    let d = scratch("re-cut");
+    let opts = || Options {
+        // Seals where the test asks for them, and partitions of a few
+        // dozen kilobytes, so that a merge from every key cuts by its
+        // inputs' bytes and the re-cut, whose inputs are one copy of the
+        // keys where the first partitioning's are two, cuts coarser.
+        seal_bytes: 64 << 20,
+        partition_bytes: Some(64 << 10),
+        l0_trigger: 2,
+        // One merge in flight, a merge where the store has none, and no
+        // merge planned at a merge's landing: what plans is the seal the
+        // test asks for.
+        merge_parallel: 1,
+        promote: false,
+        merge_chains: false,
+        // The keys go to the memtable, not to a run of ordered ingest.
+        direct_ingest: false,
+        ..common::options()
+    };
+    let mut db = Db::create(&d, opts()).unwrap();
+    let n = 4000u32;
+    let key = |k: u32| format!("key-{k:05}").into_bytes();
+    let val = |tag: &str| format!("{tag:-<64}").into_bytes();
+    // Two pieces of every key, a scrambled order, and the second piece's
+    // landing starts the first partitioning, held before its landing.
+    db.hold_merge_landing(true);
+    for tag in ["a", "b"] {
+        for i in 0..n {
+            db.put(&key((i * 7919) % n), &val(tag));
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+    }
+    wait_for("the first partitioning", || db.merges_in_flight() == 1);
+    // A third piece, sealed with the store unpartitioned: its landing plans
+    // the first partitioning again and joins the one in flight first.
+    for i in (0..n).step_by(97) {
+        db.put(&key(i), &val("c"));
+    }
+    db.commit().unwrap();
+    db.plan_joins_merge(true);
+    db.seal().unwrap();
+    wait_for("the planner's join", || db.merge_plan_joining());
+    db.hold_merge_start(true);
+    db.hold_merge_landing(false);
+    wait_for("the re-cut started after the first landed", || {
+        !db.merge_plan_joining() && db.merges_in_flight() == 1
+    });
+    db.plan_joins_merge(false);
+    let old = partition_fences(&d);
+    assert!(old.len() >= 4, "the first partitioning: {old:?}");
+    assert_eq!(
+        db.levels(),
+        (old.len(), 1),
+        "the partitions and the third piece"
+    );
+    // A key at each old partition's lower fence, put while the re-cut holds,
+    // in a piece cut at the old fences.
+    let probes: Vec<Vec<u8>> = old.iter().skip(1).map(|f| f.0.clone()).collect();
+    let plans = db.seal_waits().plans;
+    for k in &probes {
+        db.put(k, &val("old"));
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    wait_for("the old piece's landing", || db.seal_waits().plans > plans);
+    // Counted once the landing has published and retired its inputs.
+    let merges = db.seal_waits().merges;
+    db.hold_merge_start(false);
+    wait_for("the re-cut's landing", || db.seal_waits().merges > merges);
+    let new = partition_fences(&d);
+    let straddled: Vec<&Vec<u8>> = probes
+        .iter()
+        .filter(|k| !new.iter().any(|f| &f.0 == *k))
+        .collect();
+    assert!(
+        !straddled.is_empty(),
+        "a new partition opens below an old fence: old {old:?}, new {new:?}"
+    );
+    // The same keys put again, in a piece cut at the new fences; its landing
+    // plans the merge that folds the two, held before it reads anything.
+    db.hold_merge_start(true);
+    let plans = db.seal_waits().plans;
+    for k in &probes {
+        db.put(k, &val("new"));
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    wait_for("the new piece's landing", || db.seal_waits().plans > plans);
+    let want = vec![val("new")];
+    let read_back = |db: &Db, when: &str| {
+        let h = db.reader().unwrap();
+        for k in &probes {
+            let name = String::from_utf8_lossy(k).into_owned();
+            assert_eq!(
+                values_of(db, k),
+                want,
+                "{when}: the writer's read of {name}"
+            );
+            let mut got: Vec<Vec<u8>> = Vec::new();
+            h.read_all(k, vf(&mut |v| got.push(v.to_vec()))).unwrap();
+            assert_eq!(got, want, "{when}: a handle's read of {name}");
+            let mut scanned: Vec<Vec<u8>> = Vec::new();
+            db.scan(
+                k,
+                1,
+                kv(&mut |sk, v| {
+                    assert_eq!(sk, k.as_slice(), "{when}: the scan from {name}");
+                    scanned.push(v.to_vec());
+                }),
+            )
+            .unwrap();
+            assert_eq!(scanned, want, "{when}: the scan from {name}");
+        }
+    };
+    read_back(&db, "beside the old piece");
+    db.hold_merge_start(false);
+    db.settle().unwrap();
+    read_back(&db, "the pieces folded");
+    db.flush().unwrap();
+    read_back(&db, "flushed");
+    drop(db);
+    let db = Db::open(&d, opts()).unwrap();
+    read_back(&db, "reopened");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}

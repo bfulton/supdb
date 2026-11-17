@@ -8147,8 +8147,8 @@ struct Seg {
     bounds: BoundsById,
     level: u8,
     /// The WAL sequence the segment's name carries: what orders the
-    /// level-0 pieces over one fence oldest to newest, which a read's
-    /// tombstone rule and a merge's value order both rest on. Ordered by
+    /// level-0 pieces that meet oldest to newest, which a read's tombstone
+    /// rule and a merge's value order both rest on (`sort_segs`). Ordered by
     /// name alone, a piece sealed before the first partitioning, named
     /// `seg-`, came after a newer `pcs-` piece over the same empty fence,
     /// and a read took the older piece's tombstone as the newest source:
@@ -8239,13 +8239,6 @@ struct Seg {
     heads: std::sync::Mutex<Option<HeadsBuf>>,
 }
 
-/// The order the live segments hold: partitions first, disjoint and by
-/// fence; then the level-0 pieces by fence, so the pieces over one range
-/// are one run `pieces_over` can bracket, and within a fence oldest to
-/// newest by the sequence their names carry, and by name last. A piece
-/// sealed before the first partitioning has the empty fence, as the
-/// pieces aligned to the first partition do, and it is the sequence that
-/// puts it before them.
 /// A merge's fences from the ranges `given` to it: the partitions standing
 /// (`parts`, which tile the key space) that any given range overlaps, and
 /// then every partition a level-0 segment over them also overlaps, until
@@ -8388,12 +8381,70 @@ fn fences_overlap(
     !below && !above
 }
 
+/// Partitions first, by fence; then the level-0 pieces by fence, and over
+/// one fence by the sequence their names carry, and by name last. A piece
+/// sealed before the first partitioning has the empty fence, as the pieces
+/// aligned to the first partition do, and it is the sequence that puts it
+/// before them. An age order only while every piece is aligned
+/// (`sort_segs`).
 fn seg_order(a: &Seg, b: &Seg) -> Ordering {
     b.level
         .cmp(&a.level)
         .then_with(|| a.lo.cmp(&b.lo))
         .then_with(|| a.seq.cmp(&b.seq))
         .then_with(|| a.name.cmp(&b.name))
+}
+
+/// Level-0 pieces by the sequence their names carry alone, then by fence
+/// and name: the order `sort_segs` gives them once one is unaligned.
+fn age_order(a: &Seg, b: &Seg) -> Ordering {
+    a.seq
+        .cmp(&b.seq)
+        .then_with(|| a.lo.cmp(&b.lo))
+        .then_with(|| a.name.cmp(&b.name))
+}
+
+/// The live segments in the order they hold, and whether every level-0
+/// piece is aligned to a partition (`State::l0_aligned`). Partitions come
+/// first, disjoint and by fence; then the pieces, oldest to newest wherever
+/// two of them meet, which a read's tombstone rule, a scan's and a merge's
+/// value order all rest on, since each takes the pieces in this order as
+/// oldest to newest. While every piece is aligned the pieces sort by fence
+/// and then by sequence (`seg_order`): the pieces over one range are one run
+/// `pieces_over` can bracket, oldest first, and pieces over other ranges do
+/// not meet. A piece cut at fences a merge replaced before it landed is
+/// read beside the pieces cut at the new ones, and a fence order is an age
+/// order there only while the new fences cut the old ranges finer: a merge
+/// that cuts the store again from every key -- a first partitioning started
+/// after its own join had landed one, with a seal in flight -- opens a range
+/// below an old piece's fence, the newer piece over a key sorted ahead of
+/// the older one, a read took the older piece's tombstone as the newest
+/// source and answered the value before the last put, and the merge that
+/// folded the two wrote it. So once a piece is unaligned the pieces sort by
+/// sequence (`age_order`): a read of such a store walks every piece anyway.
+fn sort_segs(segs: &mut [std::sync::Arc<Seg>]) -> bool {
+    segs.sort_by(|a, b| seg_order(a, b));
+    let aligned = Db::l0_aligned_of(segs);
+    let np = segs.partition_point(|s| s.level > 0);
+    if !aligned {
+        segs[np..].sort_by(|a, b| age_order(a, b));
+    }
+    debug_assert!(
+        {
+            let l0 = &segs[np..];
+            l0.iter().enumerate().all(|(i, a)| {
+                l0[i + 1..]
+                    .iter()
+                    .all(|b| a.seq <= b.seq || !fences_overlap(&a.lo, &a.hi, &b.lo, &b.hi))
+            })
+        },
+        "level 0 holds a newer piece ahead of an older one it meets: {:?}",
+        segs[np..]
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    aligned
 }
 
 // ------------------------------------------------------- the segment writer --
@@ -19016,9 +19067,10 @@ struct Shared {
     /// not yet paid (`Db::hold_seal_landing`, `Db::hold_seal_durable`).
     seal_hold: std::sync::atomic::AtomicU8,
     /// A test's holds on the merge (`MERGE_HOLD_*`): the merge thread held
-    /// before its landing (`Db::hold_merge_landing`), and the planner made
-    /// to join a merge in flight before it plans (`Db::plan_joins_merge`),
-    /// which is the window a landing otherwise falls in by chance.
+    /// before its landing (`Db::hold_merge_landing`) or before it reads
+    /// anything (`Db::hold_merge_start`), and the planner made to join a
+    /// merge in flight before it plans (`Db::plan_joins_merge`), which is
+    /// the window a landing otherwise falls in by chance.
     merge_hold: std::sync::atomic::AtomicU8,
     /// A test's hold on the forms' position (`Db::hold_forms_position`):
     /// while set, a publish swaps the forms into their slots and leaves
@@ -23102,12 +23154,13 @@ impl Reader {
 
     /// The level-0 pieces a read of a key in partition `at` consults. When
     /// every piece is aligned to a partition they are the run over `at`
-    /// alone: the pieces sort by lower fence and then by name, so one
+    /// alone: the pieces sort by lower fence and then by sequence, so one
     /// range's pieces are consecutive and oldest first, and two binary
-    /// searches bound the run. Otherwise all of them, each answering from
-    /// its own fence, as every read did before: a walk over every piece
-    /// in the store, two fence compares each, that grew with the range
-    /// count times the pieces over a range.
+    /// searches bound the run. Otherwise all of them, oldest first by
+    /// sequence and each answering from its own fence (`sort_segs`), as
+    /// every read did before: a walk over every piece in the store, two
+    /// fence compares each, that grew with the range count times the
+    /// pieces over a range.
     fn pieces_over(&self, np: usize, at: usize) -> &[std::sync::Arc<Seg>] {
         self.state().pieces_over(np, at)
     }
@@ -33757,7 +33810,9 @@ impl Db {
                 )?,
             });
         }
-        segs.sort_by(seg_order);
+        let mut segs: Vec<std::sync::Arc<Seg>> =
+            segs.into_iter().map(std::sync::Arc::new).collect();
+        let l0_aligned = sort_segs(&mut segs);
         // A store reopened under `Always` attaches the form files it finds
         // for its partitions. One that does not check out is counted and
         // the partition is read from the raw form until a settle builds it
@@ -33920,11 +33975,9 @@ impl Db {
             .into_iter()
             .next()
             .map_or(std::ptr::null_mut(), |p| Box::into_raw(Box::new(p)));
-        let segs: Vec<std::sync::Arc<Seg>> = segs.into_iter().map(std::sync::Arc::new).collect();
         let mean_key_bytes = Db::mean_key_bytes_of(&segs);
         let store_bytes = Db::store_bytes_of(dir, &segs);
         let data_bytes = Db::data_bytes_of(&segs);
-        let l0_aligned = Db::l0_aligned_of(&segs);
         let segs_tombs = segs.iter().any(|s| s.tombs);
         let max_key = Db::max_seg_key(&segs).max(replay_max);
         debug_assert_eq!(
@@ -37907,6 +37960,17 @@ impl Db {
     #[doc(hidden)]
     pub fn hold_merge_landing(&self, on: bool) {
         Db::set_hold(&self.shared.merge_hold, MERGE_HOLD_LANDING, on);
+    }
+
+    /// A test's: while `on`, a merge's thread waits before it reads any of
+    /// its inputs, which its plan has named already, so the merge stays in
+    /// flight and unlanded for as long as the test says. The hold before
+    /// the landing holds every merge that reaches it, the one a test means
+    /// to let land included; this one holds a merge started after the test
+    /// let that one go.
+    #[doc(hidden)]
+    pub fn hold_merge_start(&self, on: bool) {
+        Db::set_hold(&self.shared.merge_hold, MERGE_HOLD_START, on);
     }
 
     /// A test's: while `on`, a merge the planner would start beside one
@@ -44113,11 +44177,13 @@ const SEAL_HOLD_DURABLE: u8 = 2;
 
 /// A test's holds on the merge (`Shared::merge_hold`): the merge thread
 /// held before it returns its outputs; a planned merge made to wait for the
-/// one running and join it before it plans; and the bit the planner sets
-/// while it waits in that join, for the test to release the first against.
+/// one running and join it before it plans; the bit the planner sets
+/// while it waits in that join, for the test to release the first against;
+/// and the merge thread held before it reads anything.
 const MERGE_HOLD_LANDING: u8 = 1;
 const MERGE_HOLD_JOINS: u8 = 2;
 const MERGE_HOLD_JOINING: u8 = 4;
+const MERGE_HOLD_START: u8 = 8;
 
 /// The bits of `Shared::zbuild_hold`: a test's holds on the form file
 /// builder's thread, before its first write and before its rename, and
@@ -45983,7 +46049,7 @@ impl Maint {
         tier: bool,
         landed: Option<&std::sync::Arc<MemTable>>,
     ) {
-        segs.sort_by(|a, b| seg_order(a, b));
+        let l0_aligned = sort_segs(&mut segs);
         // One fresh table for every attempt: a landing that lost the swap
         // installs the same empty table on its retry.
         let fresh = landed.map(|_| std::sync::Arc::new(MemTable::new(self.opts.block_shape())));
@@ -46006,7 +46072,6 @@ impl Maint {
             settle_write_on(&self.opts, data_bytes),
             AtomicOrdering::Relaxed,
         );
-        let l0_aligned = Db::l0_aligned_of(&segs);
         let segs_tombs = segs.iter().any(|s| s.tombs);
         loop {
             let cur_p = self.shared.state.load(AtomicOrdering::Acquire);
@@ -51664,6 +51729,11 @@ impl Maint {
         let wake = self.wake.clone();
         let held = self.shared.clone();
         let handle = std::thread::spawn(move || {
+            // A test's hold before the merge reads anything
+            // (`Db::hold_merge_start`): its inputs are named already.
+            while held.merge_hold.load(AtomicOrdering::Acquire) & MERGE_HOLD_START != 0 {
+                std::thread::park_timeout(MAINT_LAND_POLL);
+            }
             let out = compact_job(MergePlan {
                 dir,
                 inputs: job_inputs,
@@ -51818,11 +51888,13 @@ impl Drop for Db {
     fn drop(&mut self) {
         let _op = self.op();
         // A test's holds on the seal thread, on the form's builder, on the
-        // upkeep thread and on a landing's swap or a look are lifted: the
-        // close joins the threads they hold, and a test that failed under
-        // a hold hung here in the builder's join before the second was,
-        // and in the upkeep thread's before the third and fourth were.
+        // upkeep thread, on a landing's swap or a look, and on the merges
+        // are lifted: the close joins the threads they hold, and a test
+        // that failed under a hold hung here in the builder's join before
+        // the second was, and in the upkeep thread's before the third and
+        // fourth were.
         self.shared.seal_hold.store(0, AtomicOrdering::Release);
+        self.shared.merge_hold.store(0, AtomicOrdering::Release);
         self.shared.zbuild_hold.store(0, AtomicOrdering::Release);
         self.shared.upkeep_hold_at.store(0, AtomicOrdering::Release);
         self.shared.kept_hold.store(0, AtomicOrdering::Release);
