@@ -249,12 +249,12 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
 /// under a cipher, a failed presync of a closing run's records -- is never
 /// tried again, and no manifest is written from then until the store is
 /// reopened: no seal lands, nothing names the segments durable, and the
-/// log that holds their writes stays. A `flush` that meets the failure
-/// itself -- its seal's landing, or the presync of its run's records --
-/// answers it in the failure's own words; a failure the store's segment
-/// work meets on its own is answered once, in its own words, by the first
-/// commit or `flush` after it; and every `flush` after that answers it in
-/// words that say a seal failed and why, until the store is reopened. A
+/// log that holds their writes stays. The call that meets the failure
+/// answers it once in its own words: a `flush` whose seal's landing or
+/// whose run's presync fails, or, for a failure the store's segment work
+/// meets on its own, the first commit, `seal` or `flush` after it. Every
+/// `flush` after that answers it in words that say a seal failed and why,
+/// until the store is reopened. A
 /// `sync` answers nothing of it, since what a `sync` promises is in the
 /// log and a run's commits closed into the seal are durable once that
 /// seal lands, which a `sync` never covers. Commits after the failure are
@@ -16177,12 +16177,14 @@ impl Shared {
     #[cold]
     #[inline(never)]
     fn wedge(&self, e: &std::io::Error) {
+        // The flag set under the cause's lock, so a reader that sees it
+        // and asks for the cause (`wedged_err`) waits for the cause.
         let mut cause = self.wedge_cause.lock().unwrap_or_else(|p| p.into_inner());
         if cause.is_none() {
             *cause = Some((e.kind(), e.to_string()));
         }
-        drop(cause);
         self.seal_wedged.store(true, AtomicOrdering::Release);
+        drop(cause);
     }
 
     /// The answer of a store whose seal queue stopped (`seal_wedged`):
@@ -29454,18 +29456,33 @@ impl Db {
 
     /// The start of every write: the live table a `sync` handed to a seal
     /// replaced first (`take_fresh_mem`), so nothing is written into it.
-    /// A write cannot fail, so when the replacement does -- the segment
-    /// work has stopped -- the write is dropped and the next `commit`
-    /// returns the error, as `leave_direct` leaves a failed close.
+    /// A write cannot fail, so when the replacement cannot be made -- no
+    /// room in the frozen list and none to come, the seal queue stopped or
+    /// no seal left to land -- the write is dropped and the refusal kept
+    /// (`Db::lost`), as `leave_direct` leaves a close that cannot be made;
+    /// any other error, the segment work's, is the next commit's, and the
+    /// replacement is tried again. The first version dropped the write on
+    /// any error and left it to the next commit to answer once, so the
+    /// commits after that answered `Ok` beside a write the store had not
+    /// taken.
     fn writes_go(&mut self) -> bool {
         if self.mem_handed.is_none() {
             return true;
         }
-        match self.take_fresh_mem() {
-            Ok(()) => true,
-            Err(e) => {
-                self.pending_err.get_or_insert(e);
-                false
+        loop {
+            // The count before the call's look at the state, as the call
+            // reads them: a count of zero beside a table not replaced is a
+            // replacement nothing in flight will make.
+            let seals = self.shared.in_seal.load(AtomicOrdering::Acquire);
+            match self.take_fresh_mem() {
+                Ok(()) => return true,
+                Err(e) => {
+                    if seals == 0 || self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
+                        let _ = self.keep_lost(e);
+                        return false;
+                    }
+                    self.pending_err.get_or_insert(e);
+                }
             }
         }
     }
@@ -29509,9 +29526,9 @@ impl Db {
     /// (`SyncPolicy`).
     ///
     /// The first commit after a failure of the store's segment work -- a
-    /// seal's the segment work met on its own, a merge's -- that no `flush`
-    /// has answered yet answers it once, its batch left staged for the next
-    /// commit (`SyncPolicy`).
+    /// seal's the segment work met on its own, a merge's -- that no
+    /// `flush` or `seal` has answered yet answers it once, its batch left
+    /// staged for the next commit (`SyncPolicy`).
     pub fn commit(&mut self) -> Result<()> {
         let _op = self.op();
         if let Some(e) = self.pending_err.take() {
@@ -30960,18 +30977,22 @@ impl Db {
                 break;
             }
             // Before the freeze, not only before the wait: frozen under a
-            // fresh table with its seal failed, the handed table would sit
-            // in the list for no landing to retire, and every later seal
-            // would wait on it. Live, its keys stay readable and the next
-            // write tries again.
+            // fresh table with its seal failed and the queue going on, the
+            // handed table would sit in the list for no landing to retire,
+            // and every later seal would wait on it. Live, its keys stay
+            // readable and the next write tries again. Behind a stopped
+            // queue nothing lands at all, and the table is frozen where
+            // there is room as any table is, so the writes after it go to
+            // the log as every commit's after the failure does.
             if let Some(e) = self.shared.take_maint_err() {
                 return Err(e);
             }
-            if self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
-                return Err(self.shared.wedged_err());
-            }
-            if seals == 0 {
+            let wedged = self.shared.seal_wedged.load(AtomicOrdering::Acquire);
+            if seals == 0 && !wedged {
                 return Err(err("a handed table's seal did not land"));
+            }
+            if wedged && !room {
+                return Err(self.shared.wedged_err());
             }
             if room {
                 if self.freeze_table(&handed) {
@@ -31010,10 +31031,10 @@ impl Db {
     /// seals nothing and answers that error, as every flush does until the
     /// store is reopened (`SyncPolicy`). A flush whose seal fails to make
     /// its segments durable -- the presync of a run's records among the
-    /// steps -- answers that failure in its own words, and every flush
-    /// after it, and after a seal failure the segment work met on its own,
-    /// lands nothing and answers it in words that say a seal failed and
-    /// why, until the store is reopened.
+    /// steps -- answers that failure in its own words, as the first flush
+    /// after a seal failure the segment work met on its own may, and every
+    /// flush after that lands nothing and answers it in words that say a
+    /// seal failed and why, until the store is reopened (`SyncPolicy`).
     pub fn flush(&mut self) -> Result<()> {
         let _op = self.op();
         self.shared.drain_steps.stamp(0);
@@ -32383,6 +32404,13 @@ impl Db {
             c.tail_by_writer.load(AtomicOrdering::Relaxed),
             c.tail_by_landing.load(AtomicOrdering::Relaxed),
         )
+    }
+
+    /// A test's: whether the live table is one a `sync` handed to a seal
+    /// without a freeze, not yet replaced (`Db::mem_handed`).
+    #[doc(hidden)]
+    pub fn table_handed(&self) -> bool {
+        self.mem_handed.is_some()
     }
 
     /// The frozen tables the store holds, each a seal in flight; for a
@@ -38948,10 +38976,13 @@ impl Maint {
         // A seal joined here that failed stops the queue as a landing's
         // failure does, so the close names nothing of it durable below.
         while let Some(job) = self.sealing.pop_front() {
-            match job.handle.join() {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => self.stop_seals(&e),
-                Err(_) => self.stop_seals(&err("seal thread panicked")),
+            let joined = job
+                .handle
+                .join()
+                .map_err(|_| err("seal thread panicked"))
+                .and_then(|r| r);
+            if let Err(e) = joined {
+                self.stop_seals(&e);
             }
         }
         for m in self.compacting.drain(..) {

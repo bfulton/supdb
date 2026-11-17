@@ -5588,6 +5588,17 @@ fn ss_put(db: &mut Db, model: &mut SsModel, k: &[u8], v: &str) {
         .push(v.as_bytes().to_vec());
 }
 
+/// The merge in flight either landed or, finished, is held behind the
+/// stopped queue: a stopped queue holds every landing that writes a
+/// manifest as the window between a seal's phases does, for good, so a
+/// finished merge is counted held at every look of the segment work.
+fn ss_merge_landed_or_held(db: &Db) {
+    let held = db.seal_waits().held_landings;
+    wait_for("the merge's end or its hold", || {
+        !db.in_flight().1 || db.seal_waits().held_landings > held + 1
+    });
+}
+
 /// A `sync` after a seal failed answers `Ok`: what it promises is in the
 /// log, which no manifest retires while the queue is stopped, and the
 /// commits of a run closed into the seal are durable once that seal lands,
@@ -5725,7 +5736,7 @@ fn a_seal_whose_directory_fsync_failed_is_named_by_no_manifest() {
 
     // The merge lands, or is refused, and the store closes.
     db.hold_merge_landing(false);
-    wait_for("the merge's end", || !db.in_flight().1);
+    ss_merge_landed_or_held(&db);
     ss_check(&db, &model, "after the failure, before the close");
     // The answers, read once the files are: a store that names the piece
     // is wrong first in what it left on disk.
@@ -5786,12 +5797,10 @@ fn a_seal_whose_data_fsync_failed_after_its_publish_is_named_by_no_manifest() {
         !db.seal_sync_fault_pending(),
         "the seal's fsync was failed; the case was reached"
     );
-    wait_for("the merge's end", || !db.in_flight().1);
+    ss_merge_landed_or_held(&db);
     ss_check(&db, &model, "after the failure, before the close");
     let sync_ans = db.sync();
-    let answers = [
-        ("a flush after the failure", db.flush()),
-    ];
+    let answers = [("a flush after the failure", db.flush())];
     let wedged = db.seals_wedged();
     drop(db);
     ss_named_by_no_manifest(&d, &third, "fsync");
@@ -5879,9 +5888,7 @@ fn a_later_seal_names_no_seal_whose_fsync_failed_and_retires_none_of_its_log() {
     // A seal of that batch is handed and lands nothing.
     db.seal().unwrap();
     let sync_ans = db.sync();
-    let answers = [
-        ("a flush after the failure", db.flush()),
-    ];
+    let answers = [("a flush after the failure", db.flush())];
     ss_check(&db, &model, "after the failure, before the close");
     let wedged = db.seals_wedged();
     drop(db);
@@ -5935,13 +5942,11 @@ fn a_seal_whose_envelope_failed_under_a_cipher_is_made_durable_by_no_manifest() 
     db.hold_seal_durable(false);
     wait_for("the seal's end", || !db.in_flight().0);
     assert!(!db.seal_sync_fault_pending(), "the case was reached");
-    wait_for("the merge's end", || !db.in_flight().1);
+    ss_merge_landed_or_held(&db);
     ss_check(&db, &model, "after the failure, before the close");
     let late = db.cipher_counts().unwrap().late;
     let sync_ans = db.sync();
-    let answers = [
-        ("a flush after the failure", db.flush()),
-    ];
+    let answers = [("a flush after the failure", db.flush())];
     let wedged = db.seals_wedged();
     drop(db);
     assert_eq!(
@@ -6498,7 +6503,11 @@ fn a_write_that_ends_a_run_beside_a_segment_work_error_waits_for_room_and_is_tak
         db.commit().unwrap();
         db.seal().unwrap();
     }
-    assert_eq!(db.frozen_tables(), 3, "the frozen list is full, its seals held");
+    assert_eq!(
+        db.frozen_tables(),
+        3,
+        "the frozen list is full, its seals held"
+    );
     for k in 0..300u32 {
         ss_put(&mut db, &mut model, &ss_key(100_000 + k), "r");
     }
@@ -6534,6 +6543,117 @@ fn a_write_that_ends_a_run_beside_a_segment_work_error_waits_for_room_and_is_tak
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
     let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// A store whose seal queue stopped and whose `sync` then handed its live
+/// table to a seal without a freeze (`Options::adaptive_shape`): the next
+/// write replaces the handed table first. With room in the frozen list
+/// the table is frozen as any table is and the write is taken, durable in
+/// the log; with none, and none to come, the write is dropped and every
+/// call after it answers the failure until the store is reopened.
+fn ss_handed_over_a_stopped_queue(tag: &str, full: bool) {
+    let d = dir(&format!("dur-ss-handed-{tag}"));
+    let crash = dir(&format!("dur-ss-handed-{tag}-crash"));
+    let opts = Options {
+        seal_bytes: 64 << 20,
+        l0_trigger: 1000,
+        adaptive_shape: true,
+        ..Options::default()
+    };
+    let cause = "a test failed this landing";
+    let mut model = SsModel::new();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    for k in (0..300u32).rev() {
+        ss_put(&mut db, &mut model, &ss_key(k), "h");
+    }
+    db.commit().unwrap();
+    db.fail_next_landing();
+    db.seal().unwrap();
+    wait_for("the failed landing", || db.seals_wedged());
+    let mut first = true;
+    for t in 0..if full { 2u32 } else { 0 } {
+        for k in (0..100u32).rev() {
+            ss_put(&mut db, &mut model, &ss_key(1000 * (t + 1) + k), "f");
+        }
+        if db.commit().is_err() {
+            assert!(
+                first,
+                "{tag}: only the first commit answers the segment work's error"
+            );
+            db.commit().unwrap();
+        }
+        first = false;
+        db.seal().unwrap();
+    }
+    assert_eq!(
+        db.frozen_tables() == 3,
+        full,
+        "{tag}: the premise, the list full or not"
+    );
+    // A hashed table, below every key, synced and handed to a seal.
+    for k in (0..50u32).rev() {
+        ss_put(&mut db, &mut model, &ss_key(500 + k), "s");
+    }
+    if db.commit().is_err() {
+        assert!(
+            first,
+            "{tag}: only the first commit answers the segment work's error"
+        );
+        db.commit().unwrap();
+    }
+    db.sync()
+        .unwrap_or_else(|e| panic!("{tag}: the sync that hands the table: {e}"));
+    assert!(db.table_handed(), "{tag}: the sync handed the live table");
+    db.append(&ss_key(7), b"next");
+    if full {
+        // Dropped, not written into the handed table: not even the
+        // writer's own reads, which honour no watermark, see it.
+        assert_eq!(
+            read_vec(&db, &ss_key(7)),
+            model[&ss_key(7)],
+            "{tag}: the dropped write is in no table"
+        );
+        for (what, r) in [
+            ("a commit", db.commit()),
+            ("a sync", db.sync()),
+            ("a flush", db.flush()),
+            ("a commit after", db.commit()),
+        ] {
+            ss_wedged(
+                r,
+                cause,
+                &format!("{tag}: {what} after a write the store dropped"),
+            );
+        }
+    } else {
+        model.entry(ss_key(7)).or_default().push(b"next".to_vec());
+        db.commit()
+            .unwrap_or_else(|e| panic!("{tag}: the write after the hand-off is taken: {e}"));
+        ss_put(&mut db, &mut model, &ss_key(8), "after");
+        db.commit().unwrap();
+        db.sync().unwrap();
+        ss_wedged(db.flush(), cause, &format!("{tag}: a flush"));
+    }
+    let h = db.reader().unwrap();
+    ss_check(&h, &model, &format!("{tag}: after the failure"));
+    drop(h);
+    copy_store(&d, &crash);
+    drop(db);
+    let db = Db::open(&crash, opts).expect("the store opens after a kill");
+    ss_check(&db, &model, &format!("{tag}: reopened after a kill"));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+#[test]
+fn a_write_after_a_hand_off_over_a_stopped_queue_with_room_is_taken() {
+    ss_handed_over_a_stopped_queue("room", false);
+}
+
+#[test]
+fn a_write_after_a_hand_off_over_a_stopped_queue_without_room_is_answered_until_reopen() {
+    ss_handed_over_a_stopped_queue("full", true);
 }
 
 /// A store whose seal queue stopped, with room in the frozen list: a
@@ -6575,7 +6695,10 @@ fn a_write_that_ends_a_run_over_a_stopped_queue_with_room_is_taken() {
             ss_put(&mut db, &mut model, &ss_key(100_000 + k), "r");
         }
         if db.commit().is_err() {
-            assert!(background, "{tag}: only the segment work's error is answered");
+            assert!(
+                background,
+                "{tag}: only the segment work's error is answered"
+            );
             db.commit().unwrap();
         }
         assert!(db.run_synced_bytes().is_some(), "{tag}: a run is open");
