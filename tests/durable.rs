@@ -7388,6 +7388,16 @@ impl OsTracker {
         })
     }
 
+    /// Whether, while armed, a write followed a pending slot (deferred,
+    /// its sync on the helper) whose sync had returned: the slot the
+    /// helper made durable is the one that write must keep off.
+    fn reached_pending(&self) -> bool {
+        self.writes.windows(2).any(|w| {
+            let (a, b) = (w[0], w[1]);
+            a.armed && b.armed && a.deferred && b.seq == a.seq + 1 && b.synced[a.slot] == a.seq
+        })
+    }
+
     fn taken(t: OsShared) -> OsTracker {
         std::sync::Arc::try_unwrap(t)
             .ok()
@@ -7407,10 +7417,10 @@ fn os_watcher(t: OsShared) -> supdb::db::SlotWatch {
         // A slot file whose last write an fdatasync covered holds it on
         // the device; otherwise the device holds what it held at the
         // file's last sync, which `durable` already has.
-        for j in 0..2 {
-            if let Some(s) = os_seq_of(&cur[j]) {
+        for (j, c) in cur.iter().enumerate() {
+            if let Some(s) = os_seq_of(c) {
                 if s != 0 && w.synced[j] == s {
-                    t.durable[j] = cur[j].clone();
+                    t.durable[j] = c.clone();
                 }
             }
         }
@@ -7582,7 +7592,11 @@ fn os_start(name: &str, opts: &Options) -> (PathBuf, Db, BTreeMap<Vec<u8>, Vec<u
 /// The crash states the watch built since the last call, checked against
 /// what had been acknowledged when they were built: the model as it stands
 /// after the flush they were taken in.
-fn os_check_built(t: &OsShared, model: &BTreeMap<Vec<u8>, Vec<u8>>, opts: &Options) -> (usize, Vec<String>) {
+fn os_check_built(
+    t: &OsShared,
+    model: &BTreeMap<Vec<u8>, Vec<u8>>,
+    opts: &Options,
+) -> (usize, Vec<String>) {
     let built = std::mem::take(&mut t.lock().unwrap_or_else(|e| e.into_inner()).crashes);
     (built.len(), os_check_all(&built, model, opts))
 }
@@ -7593,15 +7607,23 @@ fn os_check_built(t: &OsShared, model: &BTreeMap<Vec<u8>, Vec<u8>>, opts: &Optio
 /// acknowledged commit. Four drains, each after the last one's owed sync,
 /// so a slot a sync made durable is the one each next drain must keep.
 fn a_publish_after_an_owed_slot(tag: &str, base: Options) {
+    a_publish_after_a_slot(tag, base, OS_KEYS / 4, |t| t.reached(false));
+}
+
+/// Drains, each after a round of `count` puts and each a seal's slot and
+/// whatever the drain publishes after it, every slot write's crash states
+/// built and opened; `reached` says the window the arm is for was met.
+fn a_publish_after_a_slot(tag: &str, base: Options, count: u32, reached: fn(&OsTracker) -> bool) {
     let opts = os_opts(&base);
     let (d, mut db, mut model, t) = os_start(&format!("os-merge-{tag}"), &opts);
     let (mut states, mut failures) = (0, Vec::new());
     for r in 1..=4u32 {
-        // A quarter of the keys rewritten, spread over every partition and
-        // under `seal_bytes`, so nothing seals before the flush: the
-        // drain's one seal defers its slot, and the piece it leaves is
-        // merged or promoted in the same drain (`partition_on_flush`).
-        os_round(&mut db, &mut model, &format!("r{r}"), r * OS_KEYS, OS_KEYS / 4);
+        // Under the default a quarter of the keys rewritten, spread over
+        // every partition and under `seal_bytes`, so nothing seals before
+        // the flush: the drain's one seal defers its slot, and the piece
+        // it leaves is merged or promoted in the same drain
+        // (`partition_on_flush`).
+        os_round(&mut db, &mut model, &format!("r{r}"), r * OS_KEYS, count);
         OsTracker::arm(&t, true);
         db.flush().unwrap();
         OsTracker::arm(&t, false);
@@ -7614,11 +7636,11 @@ fn a_publish_after_an_owed_slot(tag: &str, base: Options) {
     drop(db);
     let t = OsTracker::taken(t);
     assert!(
-        t.reached(false),
-        "{tag}: no synced publish followed a drain's deferred one before its sync; the case was \
-         not reached: {:?}",
+        reached(&t),
+        "{tag}: the window was not met; the case was not reached: {:?}",
         t.writes
     );
+    assert!(states > 0, "{tag}: no crash state was built");
     assert!(
         failures.is_empty(),
         "{tag}: {} of {states} crash states lost acknowledged commits:\n{}\nslot writes: {:?}",
@@ -7640,6 +7662,93 @@ fn a_publish_after_a_drains_owed_slot_never_overwrites_the_last_durable_slot() {
 #[test]
 fn a_publish_after_a_drains_owed_slot_never_overwrites_the_last_durable_slot_under_a_cipher() {
     a_publish_after_an_owed_slot("cipher", under_cipher());
+}
+
+/// The arms that write the slots another way: a drain that waits for its
+/// slot's fdatasync (`flush_waits_manifest`), and a seal's slot written
+/// pending at its readable landing and synced by the helper beside its
+/// fsync (`manifest_pending`), after which the slot the helper made
+/// durable is the one the next publish keeps off. And the drain that
+/// fsyncs the log first (`drain_syncs_wal`), which changes nothing here.
+#[test]
+fn every_arm_that_writes_a_slot_keeps_the_last_durable_one() {
+    a_publish_after_a_slot(
+        "waits",
+        Options {
+            flush_waits_manifest: true,
+            ..Options::default()
+        },
+        OS_KEYS / 4,
+        |t| t.writes.iter().any(|w| w.armed && !w.deferred),
+    );
+    a_publish_after_a_slot(
+        "pending",
+        Options {
+            manifest_pending: true,
+            ..Options::default()
+        },
+        OS_KEYS,
+        OsTracker::reached_pending,
+    );
+    a_publish_after_a_slot(
+        "pending-cipher",
+        Options {
+            manifest_pending: true,
+            ..under_cipher()
+        },
+        OS_KEYS,
+        OsTracker::reached_pending,
+    );
+    a_publish_after_a_slot(
+        "walsync",
+        Options {
+            drain_syncs_wal: true,
+            ..Options::default()
+        },
+        OS_KEYS / 4,
+        |t| t.reached(false),
+    );
+}
+
+/// Under the rename shape (`manifest_slots` off, with and without the
+/// spare) nothing is written in place: every publish renames, and a store
+/// moved between the shapes opens to every acknowledged write, the slot an
+/// open under the slots takes being one a rename left synced.
+#[test]
+fn a_store_moved_between_the_manifest_shapes_keeps_its_writes() {
+    for spare in [false, true] {
+        let d = dir(&format!("os-shapes-{spare}"));
+        let slots = os_opts(&Options::default());
+        let rename = Options {
+            manifest_slots: false,
+            manifest_spare: spare,
+            ..slots.clone()
+        };
+        let mut model = BTreeMap::new();
+        let mut db = Db::create(&d, slots.clone()).unwrap();
+        for (r, opts) in [&rename, &slots, &rename, &slots].into_iter().enumerate() {
+            os_round(
+                &mut db,
+                &mut model,
+                &format!("s{r}"),
+                r as u32 * OS_KEYS,
+                OS_KEYS / 4,
+            );
+            db.flush().unwrap();
+            db.settle().unwrap();
+            drop(db);
+            db = Db::open(&d, opts.clone()).unwrap();
+            for (k, v) in model.iter().step_by(37) {
+                assert_eq!(
+                    read_vec(&db, k),
+                    vec![v.clone()],
+                    "spare {spare}, round {r}"
+                );
+            }
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
 
 /// Two seals landed by one drain each write their slot with the fdatasync
@@ -7878,4 +7987,433 @@ fn an_open_makes_the_slot_it_takes_durable() {
 #[test]
 fn an_open_makes_the_slot_it_takes_durable_under_a_cipher() {
     an_open_syncs_its_slot("cipher", under_cipher());
+}
+
+/// Drains that publish nothing after the seal's slot -- no merge, no
+/// promotion, no partitioning at the flush -- each seal rotating the log
+/// (`seal_rotates_wal`), so each slot's owed fdatasync runs on its own
+/// after the answer and retires the log file behind it, and the next
+/// drain's slot must keep off the one that sync made durable: the slot
+/// before it covers less than the log that is left.
+fn drains_after_an_owed_sync(tag: &str, base: Options) {
+    a_publish_after_a_slot(
+        tag,
+        Options {
+            compact: false,
+            promote: false,
+            partition_on_flush: false,
+            seal_rotates_wal: true,
+            ..base
+        },
+        OS_KEYS / 4,
+        |t| {
+            t.writes.windows(2).any(|w| {
+                let (a, b) = (w[0], w[1]);
+                a.armed && b.armed && a.deferred && b.seq == a.seq + 1 && b.synced[a.slot] == a.seq
+            })
+        },
+    );
+}
+
+#[test]
+fn a_drain_after_an_owed_slot_was_synced_keeps_that_slot() {
+    drains_after_an_owed_sync("plain", Options::default());
+}
+
+#[test]
+fn a_drain_after_an_owed_slot_was_synced_keeps_that_slot_under_a_cipher() {
+    drains_after_an_owed_sync("cipher", under_cipher());
+}
+
+/// A drain's slot is written with its fdatasync owed, and the publish
+/// after it in the same drain -- a merge's or a promotion's, or a second
+/// seal's -- writes the same slot file, since the slot the last durable
+/// publish did not write is the one the owed slot is in. That write fails
+/// part way (`Db::tear_next_slot_write`: half the image, then an error, as
+/// a device out of space would). The owed fdatasync, run after it, would
+/// cover the torn bytes and not the manifest it was owed for: the slot it
+/// names durable is one that does not parse, the log files behind it
+/// retire, and the next publish writes over the only valid slot. After the
+/// failure and every sync the store makes, the store as it stands must
+/// open with every acknowledged commit, and so must the store after the
+/// drains that follow.
+fn a_torn_write_over_an_owed_slot(tag: &str, base: Options) {
+    // The seal rotates the log, so what waits behind the owed slot is a
+    // closed log file the slot's sync would retire.
+    let opts = os_opts(&Options {
+        seal_rotates_wal: true,
+        ..base
+    });
+    let d = dir(&format!("os-tear-{tag}"));
+    let c = dir(&format!("os-tear-{tag}-copy"));
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model = BTreeMap::new();
+    os_round(&mut db, &mut model, "r0", 0, OS_KEYS);
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let mut torn = false;
+    let mut answers = Vec::new();
+    for r in 1..=6u32 {
+        db.tear_next_slot_write();
+        os_round(
+            &mut db,
+            &mut model,
+            &format!("r{r}"),
+            r * OS_KEYS,
+            OS_KEYS / 4,
+        );
+        answers.push(db.flush().err().map(|e| e.to_string()));
+        answers.push(db.settle().err().map(|e| e.to_string()));
+        // A commit with nothing staged answers whatever the segment work
+        // left for the writer.
+        answers.push(db.commit().err().map(|e| e.to_string()));
+        torn = answers
+            .iter()
+            .flatten()
+            .any(|e| e.contains("a test tore this manifest slot write"));
+        if torn {
+            break;
+        }
+    }
+    assert!(
+        torn,
+        "{tag}: no slot write was made over an owed slot; the case was not reached: {answers:?}"
+    );
+    // Nothing in flight after the settle: the store's files as they stand
+    // are a state a power cut may leave, the torn slot and the slots the
+    // owed sync would have named durable among them.
+    copy_store(&d, &c);
+    let failures = os_check_all(&[(c.clone(), "after the torn write".into())], &model, &opts);
+    assert!(
+        failures.is_empty(),
+        "{tag}: the store after a torn slot write over an owed slot: {failures:?}; answers \
+         {answers:?}"
+    );
+    // The drains after it: their crash states, at every slot write, must
+    // open too, the torn slot being whatever the device holds of it.
+    let root = dir(&format!("os-tear-{tag}-crashes"));
+    let t = OsTracker::new(&d, &root, os_sync_slots(&d));
+    db.watch_slot_writes(Some(os_watcher(t.clone())));
+    let (mut states, mut later) = (0, Vec::new());
+    for r in 7..=8u32 {
+        os_round(
+            &mut db,
+            &mut model,
+            &format!("r{r}"),
+            r * OS_KEYS,
+            OS_KEYS / 4,
+        );
+        OsTracker::arm(&t, true);
+        db.flush().unwrap();
+        OsTracker::arm(&t, false);
+        db.settle().unwrap();
+        let (n, f) = os_check_built(&t, &model, &opts);
+        states += n;
+        later.extend(f);
+    }
+    db.watch_slot_writes(None);
+    drop(db);
+    let t = OsTracker::taken(t);
+    assert!(states > 0, "{tag}: no crash state was built after the tear");
+    assert!(
+        later.is_empty(),
+        "{tag}: {} of {states} crash states after the tear lost acknowledged commits:\n{}\nslot \
+         writes: {:?}",
+        later.len(),
+        later.join("\n"),
+        t.writes
+    );
+    let failures = os_check_all(&[(d.clone(), "reopened".into())], &model, &opts);
+    assert!(failures.is_empty(), "{tag}: {failures:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_slot_write_torn_over_an_owed_slot_is_not_named_durable_by_the_owed_sync() {
+    a_torn_write_over_an_owed_slot("plain", Options::default());
+}
+
+#[test]
+fn a_slot_write_torn_over_an_owed_slot_is_not_named_durable_by_the_owed_sync_under_a_cipher() {
+    a_torn_write_over_an_owed_slot("cipher", under_cipher());
+}
+
+/// Every file of a store directory and its bytes.
+fn os_files(d: &Path) -> BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(d)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|e| {
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                std::fs::read(e.path()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// A process killed between a merge's or a promotion's slot write and its
+/// fdatasync: the slot in the page cache names fewer files than the slot
+/// before it, and the files it no longer names -- the merge's inputs, the
+/// promotion's old names -- are still on disk, since they go only after
+/// the publish. The open takes that slot, and makes it durable before it
+/// sweeps those files: swept first, a power cut or a failed sync before
+/// the slot's fdatasync leaves the device's other slot naming files that
+/// are gone. A failed fdatasync there (`Options::fail_open_slot_sync`) is
+/// the open's answer, and the directory is left as the open found it.
+fn an_open_whose_slot_sync_fails(tag: &str, base: Options) {
+    let under = matches!(base.encryption, Encryption::Cipher(_));
+    let opts = os_opts(&base);
+    let d = dir(&format!("os-opensync-{tag}"));
+    let k = dir(&format!("os-opensync-{tag}-kill"));
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model = BTreeMap::new();
+    os_round(&mut db, &mut model, "r0", 0, OS_KEYS);
+    db.flush().unwrap();
+    db.settle().unwrap();
+    // At a synced publish's write, the store as it is just before it.
+    type Seen = std::sync::Arc<std::sync::Mutex<Option<(u64, usize)>>>;
+    let seen: Seen = Default::default();
+    let watch: supdb::db::SlotWatch = {
+        let (seen, d, k) = (seen.clone(), d.clone(), k.clone());
+        std::sync::Arc::new(move |w: &supdb::db::SlotWrite| {
+            let mut s = seen.lock().unwrap_or_else(|e| e.into_inner());
+            if s.is_none() && !w.deferred {
+                os_copy(&d, &k);
+                *s = Some((w.seq, w.slot));
+            }
+        })
+    };
+    db.watch_slot_writes(Some(watch));
+    for r in 1..=4u32 {
+        os_round(
+            &mut db,
+            &mut model,
+            &format!("r{r}"),
+            r * OS_KEYS,
+            OS_KEYS / 4,
+        );
+        db.flush().unwrap();
+        if seen.lock().unwrap().is_some() {
+            break;
+        }
+    }
+    db.watch_slot_writes(None);
+    let (seq, slot) = seen
+        .lock()
+        .unwrap()
+        .expect("a drain published a merge or a promotion; the case was not reached");
+    // The kill state: the files as they were before the write, the slot
+    // as the write left it, and every file written since the copy that
+    // the slot may name (under a cipher, the envelopes its manifest image
+    // wrote) -- not the files the publish went on to remove.
+    let now = os_files(&d);
+    let bytes = now
+        .get(OS_SLOTS[slot])
+        .cloned()
+        .expect("the slot file the publish wrote");
+    assert_eq!(
+        os_seq_of(&bytes),
+        Some(seq),
+        "{tag}: the slot still holds the publish watched"
+    );
+    std::fs::write(k.join(OS_SLOTS[slot]), &bytes).unwrap();
+    let before_copy = os_files(&k);
+    for (name, b) in &now {
+        if !before_copy.contains_key(name) {
+            std::fs::write(k.join(name), b).unwrap();
+        }
+    }
+    db.settle().unwrap();
+    drop(db);
+    let found = os_files(&k);
+    // The files the slot before the publish names: what a store opened
+    // from that slot alone leaves of the kill state.
+    let named: std::collections::BTreeSet<String> = {
+        let o = dir(&format!("os-opensync-{tag}-older"));
+        copy_store(&k, &o);
+        std::fs::write(o.join(OS_SLOTS[slot]), &found[OS_SLOTS[1 - slot]]).unwrap();
+        drop(Db::open(&o, opts.clone()).expect("the slot before the publish opens"));
+        let left = os_files(&o);
+        let _ = std::fs::remove_dir_all(&o);
+        found
+            .keys()
+            .filter(|n| left.contains_key(*n))
+            .cloned()
+            .collect()
+    };
+    let refused = match Db::open(
+        &k,
+        Options {
+            fail_open_slot_sync: true,
+            ..opts.clone()
+        },
+    ) {
+        Ok(_) => panic!("{tag}: the open answered Ok over a failed fdatasync of its slot"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        refused.contains("a test failed the open's fdatasync of its manifest slot"),
+        "{tag}: the open refused for another reason: {refused}"
+    );
+    let left = os_files(&k);
+    // Under a cipher the open has swept, before it read anything, the
+    // envelopes neither slot names -- a crash's leftovers whichever slot
+    // the device holds: the pieces the drain's overwritten slot alone
+    // named, the envelopes of work still in flight. What it may not have
+    // removed are the files the slot before the publish names, the one
+    // the device may hold: those a store opened from that slot alone
+    // keeps (`named`).
+    let kept: BTreeMap<String, Vec<u8>> = if under {
+        found
+            .iter()
+            .filter(|(n, _)| named.contains(*n))
+            .map(|(n, b)| (n.clone(), b.clone()))
+            .collect()
+    } else {
+        found.clone()
+    };
+    let gone: Vec<_> = kept.keys().filter(|n| !left.contains_key(*n)).collect();
+    let changed: Vec<_> = found
+        .iter()
+        .filter(|(n, b)| left.get(*n).is_some_and(|l| l != *b))
+        .map(|(n, _)| n)
+        .collect();
+    let made: Vec<_> = left.keys().filter(|n| !found.contains_key(*n)).collect();
+    assert!(
+        under || left.len() == found.len(),
+        "{tag}: the open that failed its slot's fdatasync removed files"
+    );
+    assert!(
+        gone.is_empty() && changed.is_empty() && made.is_empty(),
+        "{tag}: the open that failed its slot's fdatasync changed the directory: removed \
+         {gone:?}, changed {changed:?}, made {made:?}"
+    );
+    // The control: the open that succeeds sweeps files the slot it takes
+    // does not name, so the failed open had something to leave.
+    let db = Db::open(&k, opts.clone()).expect("the kill state opens");
+    drop(db);
+    let after = os_files(&k);
+    assert!(
+        kept.keys().any(|n| !after.contains_key(n)),
+        "{tag}: the kill state held no file the slot it was opened from leaves unnamed; the \
+         case was not reached"
+    );
+    let failures = os_check_all(&[(k.clone(), "the kill state".into())], &model, &opts);
+    assert!(failures.is_empty(), "{tag}: {failures:?}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn an_open_whose_slot_sync_fails_leaves_the_directory_as_it_found_it() {
+    an_open_whose_slot_sync_fails("plain", Options::default());
+}
+
+#[test]
+fn an_open_whose_slot_sync_fails_leaves_the_directory_as_it_found_it_under_a_cipher() {
+    an_open_whose_slot_sync_fails("cipher", under_cipher());
+}
+
+/// A slot's fdatasync fails -- a drain's owed one, run after its answer,
+/// or the synced publish after it in the same drain, whichever the drain
+/// reaches first -- after the test made both slots durable itself. The
+/// slot whose sync failed is not one the device is known to hold, so it
+/// is not the slot a publish keeps off: the first slot write after the
+/// failure goes into that slot again, and a power cut during it leaves
+/// the other slot, which the test made durable. Built at that write: the
+/// slot being written torn, and the other slot as the test's own sync
+/// left it where its bytes have not changed since, torn where they have.
+fn a_failed_slot_sync(tag: &str, base: Options) {
+    let opts = os_opts(&Options {
+        seal_rotates_wal: true,
+        ..base
+    });
+    let d = dir(&format!("os-syncfail-{tag}"));
+    let root = dir(&format!("os-syncfail-{tag}-crashes"));
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model = BTreeMap::new();
+    os_round(&mut db, &mut model, "r0", 0, OS_KEYS);
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let synced = os_sync_slots(&d);
+    db.fail_next_slot_sync();
+    os_round(&mut db, &mut model, "r1", OS_KEYS, OS_KEYS / 4);
+    let mut answers = vec![db.flush().err().map(|e| e.to_string())];
+    answers.push(db.settle().err().map(|e| e.to_string()));
+    answers.push(db.commit().err().map(|e| e.to_string()));
+    assert!(
+        answers
+            .iter()
+            .flatten()
+            .any(|e| e.contains("a test failed this manifest slot's fdatasync")),
+        "{tag}: no slot sync failed; the case was not reached: {answers:?}"
+    );
+    // The first slot write after the failure, and its crash state.
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(PathBuf, String)>>>;
+    let seen: Seen = Default::default();
+    let watch: supdb::db::SlotWatch = {
+        let (seen, d, root) = (seen.clone(), d.clone(), root.clone());
+        std::sync::Arc::new(move |w: &supdb::db::SlotWrite| {
+            let mut s = seen.lock().unwrap_or_else(|e| e.into_inner());
+            if !s.is_empty() {
+                return;
+            }
+            let (i, o) = (w.slot, 1 - w.slot);
+            let cur = |j: usize| std::fs::read(d.join(OS_SLOTS[j])).unwrap_or_default();
+            let c = root.join("crash");
+            os_copy(&d, &c);
+            let _ = std::fs::write(c.join(OS_SLOTS[i]), os_torn(&cur(i), w.seq));
+            let other = cur(o);
+            let same = other == synced[o];
+            let held = if same {
+                other
+            } else {
+                os_torn(&synced[o], os_seq_of(&other).unwrap_or(0))
+            };
+            let _ = std::fs::write(c.join(OS_SLOTS[o]), held);
+            s.push((
+                c,
+                format!(
+                    "publish {} into {} torn, {} {}",
+                    w.seq,
+                    OS_SLOTS[i],
+                    OS_SLOTS[o],
+                    if same {
+                        "as the test synced it"
+                    } else {
+                        "written since and never known synced, torn"
+                    }
+                ),
+            ));
+        })
+    };
+    db.watch_slot_writes(Some(watch));
+    os_round(&mut db, &mut model, "r2", 2 * OS_KEYS, OS_KEYS / 4);
+    let flushed = db.flush();
+    db.watch_slot_writes(None);
+    let built = std::mem::take(&mut *seen.lock().unwrap());
+    assert_eq!(
+        built.len(),
+        1,
+        "{tag}: no slot was written after the failure: {flushed:?}"
+    );
+    let failures = os_check_all(&built, &model, &opts);
+    assert!(
+        failures.is_empty(),
+        "{tag}: after a failed slot sync: {failures:?}; answers {answers:?}"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_slot_whose_fdatasync_failed_is_not_the_one_a_publish_keeps_off() {
+    a_failed_slot_sync("plain", Options::default());
+}
+
+#[test]
+fn a_slot_whose_fdatasync_failed_is_not_the_one_a_publish_keeps_off_under_a_cipher() {
+    a_failed_slot_sync("cipher", under_cipher());
 }

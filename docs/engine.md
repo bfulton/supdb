@@ -5004,9 +5004,13 @@ file's fsync and 0.4 for the directory's in the drain's strace at ten
 thousand keys, and the spare's unlink later, a discard of 1.2-3.8 ms of
 device time off the path. The manifest is two slot files now, `manifest`
 and `manifest.alt`: each publish is a sequence past the last and writes
-the slot of the sequence's parity in place, fdatasynced and never
-truncated, and the open takes the newest slot whose checksum holds, a
-torn write being the slot it ignores. Both slots exist from the store's
+in place, fdatasynced and never truncated, the slot that does not hold
+the newest manifest known durable -- the last whose fdatasync returned
+(`SlotChoice`), so a publish before an owed sync writes over the slot
+still owed and never the other, and gives the owed sync up before its
+write, which a sync run after it would cover whole or torn -- and the open takes the newest slot
+whose checksum holds, a torn write being the slot it ignores, and
+fdatasyncs it before it removes a file or writes over the other. Both slots exist from the store's
 birth or its first open under this, so no publish creates a directory
 entry (`Options::manifest_slots`; the rename shape is
 `supdb-manifestrename` and `supdb-ingestmanifestrename`). The header

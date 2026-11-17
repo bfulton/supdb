@@ -5524,13 +5524,17 @@ fn a_manifest_publish_leaves_its_spare_to_the_sweep() {
     assert_eq!(n, 2000, "the store reads as published");
 }
 
-/// A publish writes one of two slots, alternating, each stamped a
-/// sequence past the last, and never a temp name: one fsync, no rename,
-/// no directory fsync. The open takes the newest valid slot, so a slot a
-/// crash tore mid-write is the one it ignores and the slot before it is
-/// the store. A store from before the slots -- one `manifest` with no
-/// sequence -- opens as a sequence of zero and gets its second slot at
-/// that open, so no publish after it ever creates a directory entry.
+/// A publish writes one of two slots, each stamped a sequence past the
+/// last, and never a temp name: one fsync, no rename, no directory fsync.
+/// The slot it writes is never the one holding the newest manifest known
+/// durable, so at rest the two slots hold the newest manifest and one
+/// before it, and the next publish writes over the older. The open takes
+/// the newest valid slot, so a slot a crash tore mid-write is the one it
+/// ignores and the slot before it is the store, and the torn slot is the
+/// one the reopened store writes over first. A store from before the
+/// slots -- one `manifest` with no sequence -- opens as a sequence of zero
+/// and gets its second slot at that open, so no publish after it ever
+/// creates a directory entry.
 #[test]
 fn a_manifest_publish_alternates_two_slots_and_the_open_takes_the_newest_valid() {
     let d = dir("manifest-slots");
@@ -5560,10 +5564,17 @@ fn a_manifest_publish_alternates_two_slots_and_the_open_takes_the_newest_valid()
     let seq_a = manifest_seq_of(&bytes_a).unwrap();
     assert!(seq_a >= 1, "the flush published: {seq_a}");
     assert_eq!(db.manifest_seq(), seq_a, "the store's count is the slot's");
-    assert_eq!(
-        slot_a.file_name().unwrap().to_str().unwrap(),
-        MANIFEST_SLOTS[(seq_a % 2) as usize],
-        "the slot is the sequence's"
+    // The slot that does not hold the newest: the one the next publish
+    // writes, holding a manifest before it.
+    let other = if slot_a.ends_with(MANIFEST_SLOTS[0]) {
+        d.join(MANIFEST_SLOTS[1])
+    } else {
+        d.join(MANIFEST_SLOTS[0])
+    };
+    let other_seq = manifest_seq_of(&std::fs::read(&other).unwrap());
+    assert!(
+        other_seq.is_some_and(|s| s < seq_a),
+        "the other slot holds a manifest before the newest: {other_seq:?} beside {seq_a}"
     );
     assert!(!d.join("manifest.tmp").exists(), "no temp name under slots");
     // The window a publish torn by a crash leaves: the slot of the next
@@ -5574,7 +5585,6 @@ fn a_manifest_publish_alternates_two_slots_and_the_open_takes_the_newest_valid()
     // it any, would be swept as unnamed, which the merge-window test holds.
     // (A real second publish torn after the fact names files the publish
     // retired, which is a different store from the window's.)
-    let other = d.join(MANIFEST_SLOTS[((seq_a + 1) % 2) as usize]);
     let mut torn = bytes_a.clone();
     torn[9..17].copy_from_slice(&(seq_a + 1).to_le_bytes());
     std::fs::write(&other, &torn).unwrap();
@@ -5612,15 +5622,22 @@ fn a_manifest_publish_alternates_two_slots_and_the_open_takes_the_newest_valid()
         seq_b > seq_a,
         "every publish moves the sequence: {seq_b} after {seq_a}"
     );
-    assert_eq!(
-        slot_b.file_name().unwrap().to_str().unwrap(),
-        MANIFEST_SLOTS[(seq_b % 2) as usize],
-        "the slot is the sequence's"
-    );
     assert_eq!(db.manifest_seq(), seq_b);
-    let other = d.join(MANIFEST_SLOTS[1 - (seq_b % 2) as usize]);
-    let other_seq = manifest_seq_of(&std::fs::read(&other).unwrap()).unwrap();
-    assert_eq!(other_seq, seq_b - 1, "the other slot is the publish before");
+    assert_ne!(
+        std::fs::read(&other).unwrap(),
+        torn,
+        "the torn slot, not the store's, is the one written over"
+    );
+    let other_b = if slot_b.ends_with(MANIFEST_SLOTS[0]) {
+        d.join(MANIFEST_SLOTS[1])
+    } else {
+        d.join(MANIFEST_SLOTS[0])
+    };
+    let other_seq = manifest_seq_of(&std::fs::read(&other_b).unwrap()).unwrap();
+    assert!(
+        other_seq < seq_b,
+        "the other slot is a publish before: {other_seq} beside {seq_b}"
+    );
     assert_eq!(read_vec(&db, key(7).as_bytes()), vec![b"v1".to_vec()]);
     drop(db);
     let db = Db::open(&d, opts.clone()).unwrap();
