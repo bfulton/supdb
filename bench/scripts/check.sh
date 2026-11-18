@@ -56,7 +56,14 @@ for g in $groups; do
       say quick
       cargo build --release --bin bench
       rm -rf runs-ci
-      ./target/release/bench run --scale quick --out runs-ci
+      # `ARMS`, where set, names the arms to run (`ci`'s `arms` input): a
+      # reader reproducing a row runs two arms in a fraction of the time.
+      arms="${ARMS:-}"
+      if [ -n "$arms" ]; then
+        ./target/release/bench run --scale quick --out runs-ci --arms "$arms"
+      else
+        ./target/release/bench run --scale quick --out runs-ci
+      fi
       # Then the gate against the committed series. With no rows yet for
       # this class it says so and passes; the first regression it catches
       # is the day the series earns its keep.

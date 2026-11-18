@@ -32,7 +32,7 @@ fn a_closed_stores_blocks_are_not_resident() {
     std::fs::create_dir_all(&d).unwrap();
     let opts = Options {
         seal_bytes: 1 << 30,
-        ..Options::default()
+        ..common::options()
     };
     assert!(opts.blocks_mapped, "the default maps");
     let mapped_before = Db::mapped_bytes();

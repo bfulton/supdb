@@ -78,6 +78,33 @@
 //! decode a quarter of the page's (`bench/examples/zdecode.rs`); a target of
 //! zero is the page as one group.
 //!
+//! # The stride form
+//!
+//! A form file's other body, for a partition whose keys are an exact run of
+//! numbers rendered at one width -- every number from the first key's to
+//! the last's present, each key the prefix the two share and a field of
+//! decimal digits or big-endian bytes ([`KeyCodec`]) -- and whose every
+//! record is one inline fixed value of one width `W`. Rank `r`'s key is the
+//! rendering of `base + r` and its value lies at `r * W`, so the file holds
+//! the values alone and a point read is a key's parse and one or two pages,
+//! with nothing searched.
+//!
+//! | region | offset | contents |
+//! |---|---|---|
+//! | V, values | 0 | rank `r`'s value at `r * W`, unpadded; zeros from `n * W` to the page's end |
+//! | R, CRC row | `res_off = 4096 * V` | a u32 a value page, page `p`'s [`stride_page_crc`], zeros to the page's end |
+//! | trailer | `len - 4096` | [`StrideTrailer`], magic [`STRIDE_MAGIC`] |
+//!
+//! [`stride_layout`] is the arithmetic of the three. A slot is at most a
+//! page and spans at most two; the slots are not padded to a divisor of
+//! the page, which for a hundred-byte value is 128 bytes a slot and the
+//! form's bytes more than a quarter again, so a read whose slot straddles
+//! checks two pages. The trailer is the block form's length and head --
+//! the magic, the version, the page size and the CRC at one set of places,
+//! written and checked by one pair of functions -- with another magic, so
+//! either kind is told from the other at the last page's first eight
+//! bytes, and a reader of one refuses the other there.
+//!
 //! # Why it is a child of `db`
 //!
 //! The filter stored in region B is `BlockedBloom`'s words and the walk over
@@ -795,6 +822,28 @@ impl GroupBuf {
         unsafe { std::slice::from_raw_parts_mut(self.words.as_mut_ptr() as *mut u8, room) }
     }
 
+    /// Its first [`STRIDE_KEY_MAX`] bytes as the last write left them, the
+    /// buffer grown to hold them where it is shorter: a stride cursor's key,
+    /// rendered and stepped in place in the buffer the cursor holds, which a
+    /// stride file, with no group to decode, leaves to it. Only the first
+    /// call grows a buffer, so a key rendered into it is there at the next.
+    pub fn stride_key(&mut self) -> &mut [u8; STRIDE_KEY_MAX] {
+        if self.words.len() * 8 < STRIDE_KEY_MAX {
+            self.grow_for_stride_key();
+        }
+        // SAFETY: `words` owns at least `STRIDE_KEY_MAX` initialised bytes,
+        // grown above where it did not, `u8` has no alignment to violate,
+        // and the borrow of `self` is the only access while the array lives.
+        unsafe { &mut *(self.words.as_mut_ptr() as *mut [u8; STRIDE_KEY_MAX]) }
+    }
+
+    /// `stride_key`'s growth, once a thread's buffer, out of line.
+    #[cold]
+    #[inline(never)]
+    fn grow_for_stride_key(&mut self) {
+        self.bytes_for(STRIDE_KEY_MAX);
+    }
+
     /// The bytes the buffer holds room for: what the last growth made it,
     /// in whole pages, and zero before the first decode into it.
     pub fn capacity_bytes(&self) -> usize {
@@ -839,17 +888,82 @@ pub fn decode_group<'a>(
     decode_group_with(view, j, buf, false)
 }
 
-/// [`decode_group`] with the block coding's groups decoded by the engine's
-/// own decoder where `own` (`Options::zpages_own_decoder`, `super::zlz4`)
-/// and by `lz4_flex` where not: the same bytes from every block either
+/// The LZ4 decoder a block-coded group is decoded by: `lz4_flex`'s, the
+/// engine's own fast loop (`Options::zpages_own_decoder`), or the engine's
+/// own with its flat loop ahead of the fast one
+/// (`Options::zpages_flat_decode`, `zlz4::decompress_in_flat`). The same
+/// bytes from every block and the same refusals of every damage, from all
+/// three. A `bool` is the choice before the flat loop: the engine's own
+/// decoder or `lz4_flex`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Dec {
+    #[default]
+    Flex,
+    Own,
+    Flat,
+    /// The flat loop given the room it runs to the group's end in
+    /// (`zlz4::FLAT_SLACK`, `Options::zpages_flat_slack`).
+    FlatEnd,
+}
+
+impl Dec {
+    /// The decoder the two options name: `lz4_flex` without the engine's
+    /// own, and the flat loop only with it.
+    pub fn of(own: bool, flat: bool) -> Dec {
+        match (own, flat) {
+            (false, _) => Dec::Flex,
+            (true, false) => Dec::Own,
+            (true, true) => Dec::Flat,
+        }
+    }
+
+    /// Whether the engine's own decoder is this one, flat or not.
+    pub fn own(self) -> bool {
+        self != Dec::Flex
+    }
+
+    /// Whether the flat loop runs.
+    pub fn flat(self) -> bool {
+        matches!(self, Dec::Flat | Dec::FlatEnd)
+    }
+
+    /// The flat loop given the room it runs to the group's end in, where
+    /// `on` and the flat loop runs; this decoder otherwise.
+    pub fn with_slack(self, on: bool) -> Dec {
+        if on && self == Dec::Flat {
+            Dec::FlatEnd
+        } else {
+            self
+        }
+    }
+
+    /// The room past a group's decoded length its buffer is lent with.
+    pub fn slack(self) -> usize {
+        if self == Dec::FlatEnd {
+            super::zlz4::FLAT_SLACK
+        } else {
+            super::zlz4::DECODE_SLACK
+        }
+    }
+}
+
+impl From<bool> for Dec {
+    fn from(own: bool) -> Dec {
+        Dec::of(own, false)
+    }
+}
+
+/// [`decode_group`] with the block coding's groups decoded by the decoder
+/// `dec` names (`Dec`): the same bytes from every block either encoder
 /// writes, and the same refusals of every damage the page's checks let
 /// through.
 pub fn decode_group_with<'a>(
     view: &PageView<'a>,
     j: usize,
     buf: &'a mut GroupBuf,
-    own: bool,
+    dec: impl Into<Dec>,
 ) -> Result<&'a [u8], ZError> {
+    let dec = dec.into();
     let g = view
         .group(j)
         .ok_or(ZError::Header("no such group in the page"))?;
@@ -871,7 +985,7 @@ pub fn decode_group_with<'a>(
     if g.coded {
         return decode_record_group(payload, usize::from(g.count), ulen, buf);
     }
-    if own {
+    if dec.own() {
         // The engine's own decoder, into the group's bytes and the slack
         // its fast loop runs to the end in (`zlz4::DECODE_SLACK`), as much
         // of it as the buffer's whole pages hold past the group. A
@@ -880,8 +994,13 @@ pub fn decode_group_with<'a>(
         // one that decodes short is the length that disagrees: the same
         // refusals either decoder gives.
         let (rest, len) = view.payload_and_rest(j).ok_or(ZError::Length)?;
-        let out = buf.bytes_with_slack(ulen, super::zlz4::DECODE_SLACK);
-        let n = super::zlz4::decompress_in(rest, len, out).map_err(|_| ZError::Decode)?;
+        let out = buf.bytes_with_slack(ulen, dec.slack());
+        let n = if dec.flat() {
+            super::zlz4::decompress_in_flat(rest, len, out)
+        } else {
+            super::zlz4::decompress_in(rest, len, out)
+        }
+        .map_err(|_| ZError::Decode)?;
         if n > ulen {
             return Err(ZError::Decode);
         }
@@ -896,6 +1015,261 @@ pub fn decode_group_with<'a>(
         return Err(ZError::DecodedLen);
     }
     Ok(out)
+}
+
+/// The output a point read's partial decode asks its decoder for past what
+/// it has ([`seek_group_partly`]): two of the suite's records, so that a
+/// call brings a record or two and the walk asks again once a record or
+/// so. Smaller, and the calls' own cost is a share of a short decode;
+/// larger, and the read decodes that much past its record.
+pub const PART_STEP: usize = 256;
+
+/// A block-coded group being decoded a part at a time for a walk
+/// ([`open_group_partly`], [`decode_group_more`]): where its decoder
+/// stands, the payload with the rest of its page behind it, and the bytes
+/// the whole group decodes to.
+#[derive(Clone, Copy, Debug)]
+pub struct PartGroup<'a> {
+    st: super::zlz4::Part,
+    rest: &'a [u8],
+    len: usize,
+    ulen: usize,
+    /// The flat loop runs (`Dec::Flat`), and the room past the group the
+    /// buffer is lent with (`Dec::slack`), the same at every call.
+    flat: bool,
+    slack: usize,
+}
+
+impl PartGroup<'_> {
+    /// The group's bytes decoded so far, never the decoder's overrun past
+    /// them.
+    pub fn have(&self) -> usize {
+        self.st.op.min(self.ulen)
+    }
+
+    /// The bytes the whole group decodes to.
+    pub fn ulen(&self) -> usize {
+        self.ulen
+    }
+
+    /// Whether the decode has reached the group's end.
+    pub fn done(&self) -> bool {
+        self.st.done
+    }
+}
+
+/// Group `j` of a page this process has verified, begun: decoded into
+/// `buf` from its first byte to `stop` bytes, a sequence past it at most,
+/// or to its end where that comes first, and handed back as what
+/// [`decode_group_more`] goes on from. `Ok(None)` for a group this does
+/// not serve, which the caller opens whole: one that is stored or
+/// record-coded.
+///
+/// For a walk's own decode of a group it will not read to the end
+/// (`Options::zpages_walk_part`): a scan's last group is read half way at
+/// the mean, the decoder is sequential and its cost is its tokens. The
+/// page is one whose every group a first decode has walked whole, as
+/// [`seek_group_partly`]'s is, and nothing is verified again; what a
+/// decode that stops short does not see is said there. The bytes of `buf`
+/// past [`PartGroup::have`] are not the group's.
+pub fn open_group_partly<'a>(
+    view: &PageView<'a>,
+    j: usize,
+    buf: &mut GroupBuf,
+    stop: usize,
+) -> Result<Option<PartGroup<'a>>, ZError> {
+    open_group_partly_with(view, j, buf, stop, Dec::Own)
+}
+
+/// [`open_group_partly`] with the flat loop where `dec` names it.
+pub fn open_group_partly_with<'a>(
+    view: &PageView<'a>,
+    j: usize,
+    buf: &mut GroupBuf,
+    stop: usize,
+    dec: Dec,
+) -> Result<Option<PartGroup<'a>>, ZError> {
+    let g = view
+        .group(j)
+        .ok_or(ZError::Header("no such group in the page"))?;
+    if g.stored || g.coded {
+        return Ok(None);
+    }
+    let ulen = g.ulen as usize;
+    if ulen == 0 || ulen > ZMAX_ULEN {
+        return Err(ZError::Header(
+            "a group's ulen is not 4 to the most a group holds",
+        ));
+    }
+    let (rest, len) = view.payload_and_rest(j).ok_or(ZError::Length)?;
+    let mut part = PartGroup {
+        st: super::zlz4::Part::default(),
+        rest,
+        len,
+        ulen,
+        flat: dec.flat(),
+        slack: dec.slack(),
+    };
+    decode_group_more(&mut part, buf, stop)?;
+    Ok(Some(part))
+}
+
+/// The decode `part` began taken on to `stop` bytes or the group's end,
+/// in `buf`, the buffer it began in, which nothing has written since: the
+/// bytes of the group decoded after it. A call always decodes a sequence
+/// more of a group not yet at its end, whatever `stop`. An `Err` is
+/// damage, as [`seek_group_partly`]'s is: a payload that does not decode,
+/// decodes past the group, or ends short of it.
+pub fn decode_group_more(
+    part: &mut PartGroup<'_>,
+    buf: &mut GroupBuf,
+    stop: usize,
+) -> Result<usize, ZError> {
+    if part.st.done {
+        return Ok(part.have());
+    }
+    let out = buf.bytes_with_slack(part.ulen, part.slack);
+    let stop = stop.max(part.st.op);
+    if part.flat {
+        super::zlz4::decompress_more_flat(part.rest, part.len, out, &mut part.st, stop)
+    } else {
+        super::zlz4::decompress_more(part.rest, part.len, out, &mut part.st, stop)
+    }
+    .map_err(|_| ZError::Decode)?;
+    if part.st.op > part.ulen {
+        return Err(ZError::Decode);
+    }
+    if part.st.done && part.st.op < part.ulen {
+        return Err(ZError::DecodedLen);
+    }
+    Ok(part.have())
+}
+
+/// Where a key falls in a group decoded only as far as the walk for it
+/// read ([`seek_group_partly`]): the record's offset, or `None` for a key
+/// the group does not hold; the bytes of the group decoded, which hold the
+/// record whole; and the bytes the whole group decodes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartSeek {
+    pub off: Option<usize>,
+    pub len: usize,
+    pub of: usize,
+}
+
+/// [`group_seek`] over group `j` of a page this process has verified, the
+/// group decoded into `buf` a part at a time and only as far as the walk
+/// reads: the records are walked from the first as [`group_seek`] walks
+/// them, and where the next record does not lie whole in what is decoded
+/// the decoder is asked for [`PART_STEP`] bytes more
+/// (`zlz4::decompress_more`), until the key is met, passed, or the group
+/// ends. `Ok(None)` for a group this does not serve, which the caller opens
+/// whole: one that is stored or record-coded.
+///
+/// For a point read's first touch of a group (`Options::zpages_point_part`):
+/// the read wants one record, the decoder is sequential and its cost is its
+/// tokens, so a read of a record in the middle of its group pays for half
+/// of it. The page is one whose every group a first decode has walked
+/// whole (`first_checks`), so the prefix decoded here is a prefix of bytes
+/// already held to the page's CRC and the walk's checks; nothing is
+/// verified again, and a caller must not use this on a page that has not
+/// been. The bytes of `buf` past the length answered are not the group's.
+///
+/// An `Err` is damage, as [`group_seek`]'s is: a payload that does not
+/// decode, decodes past the group, ends short of it, or a record that does
+/// not parse with the whole group decoded. A walk that stops before the
+/// group's end does not see what a whole decode learns there, a decoded
+/// length that disagrees with the directory's: bytes that change under a
+/// verified page are no more this path's to find than the whole decode's,
+/// which reads the page's CRC once, at the page's first decode.
+pub fn seek_group_partly(
+    view: &PageView<'_>,
+    j: usize,
+    buf: &mut GroupBuf,
+    key: &[u8],
+) -> Result<Option<PartSeek>, ZError> {
+    seek_group_partly_with(view, j, buf, key, Dec::Own)
+}
+
+/// [`seek_group_partly`] with the flat loop where `dec` names it.
+pub fn seek_group_partly_with(
+    view: &PageView<'_>,
+    j: usize,
+    buf: &mut GroupBuf,
+    key: &[u8],
+    dec: Dec,
+) -> Result<Option<PartSeek>, ZError> {
+    const CUT: ZError = ZError::Walk("a record does not parse");
+    let g = view
+        .group(j)
+        .ok_or(ZError::Header("no such group in the page"))?;
+    if g.stored || g.coded {
+        return Ok(None);
+    }
+    let ulen = g.ulen as usize;
+    if ulen == 0 || ulen > ZMAX_ULEN {
+        return Err(ZError::Header(
+            "a group's ulen is not 4 to the most a group holds",
+        ));
+    }
+    let (rest, len) = view.payload_and_rest(j).ok_or(ZError::Length)?;
+    let out = buf.bytes_with_slack(ulen, dec.slack());
+    let count = usize::from(g.count);
+    let mut st = super::zlz4::Part::default();
+    let mut off = 0usize;
+    for _ in 0..count {
+        let (k, next) = loop {
+            // The group's bytes decoded so far, never the decoder's
+            // overrun past them.
+            let have = st.op.min(ulen);
+            if let Some(r) = record_key_next(&out[..have], off) {
+                break r;
+            }
+            if st.done {
+                return Err(CUT);
+            }
+            let stop = st.op.max(off) + PART_STEP;
+            if dec.flat() {
+                super::zlz4::decompress_more_flat(rest, len, out, &mut st, stop)
+            } else {
+                super::zlz4::decompress_more(rest, len, out, &mut st, stop)
+            }
+            .map_err(|_| ZError::Decode)?;
+            if st.op > ulen {
+                return Err(ZError::Decode);
+            }
+            if st.done && st.op < ulen {
+                return Err(ZError::DecodedLen);
+            }
+        };
+        // Nothing sorts below the empty key, so the first record is its
+        // answer, found where that record's key is empty too, and no
+        // compare is made, as `group_seek` makes none.
+        let ord = if !key.is_empty() {
+            key_cmp(k, key)
+        } else if k.is_empty() {
+            Ordering::Equal
+        } else {
+            Ordering::Greater
+        };
+        let at = match ord {
+            Ordering::Less => {
+                off = next;
+                continue;
+            }
+            Ordering::Equal => Some(off),
+            Ordering::Greater => None,
+        };
+        return Ok(Some(PartSeek {
+            off: at,
+            len: st.op.min(ulen),
+            of: ulen,
+        }));
+    }
+    Ok(Some(PartSeek {
+        off: None,
+        len: st.op.min(ulen),
+        of: ulen,
+    }))
 }
 
 /// Which LZ4 decoder a build links.
@@ -1757,6 +2131,10 @@ pub struct FillScratch {
     /// (`Options::zpages_parse`, `super::zlz4`) and not `lz4_flex`'s greedy
     /// one: the same format in fewer sequences.
     pub parse: bool,
+    /// Under `parse`, the parse's search: zero the shipped lazy parse
+    /// (`zlz4::Effort::SHIPPED`), else a greedy parse over that many of
+    /// each position's chain (`Options::zpages_parse_chains`).
+    pub parse_chains: u32,
     /// The pages the fill writes read back through the engine's own decoder
     /// (`Options::zpages_own_decoder`), as the readers of the store that
     /// builds them will read them.
@@ -1793,6 +2171,7 @@ impl FillScratch {
             store_all: false,
             raw_tails: false,
             parse: false,
+            parse_chains: 0,
             own_decode: false,
             parser: None,
             stats: FillStats::default(),
@@ -1910,7 +2289,7 @@ impl FillScratch {
                 .compress_into(
                     &self.imgs[..ulen],
                     &mut self.out,
-                    super::zlz4::Effort::SHIPPED,
+                    super::zlz4::Effort::of_chains(self.parse_chains),
                 )?
         } else {
             lz4_flex::block::compress_into(&self.imgs[..ulen], &mut self.out).ok()?
@@ -2602,6 +2981,20 @@ pub struct FenceEntry<'a> {
     pub key: &'a [u8],
 }
 
+/// How a form file's fence is searched, decided at the attach: over the
+/// keys, a binary search with a line of the offsets and a line of the key
+/// blob a probe (the shape before); through a static B-tree of the
+/// entries' words, eight a node and a cache line a level
+/// (`Options::zpages_fence_words`, [`ZFence::index_words`]); or through the
+/// binary tree over the words (`Options::zpages_fence_tree`,
+/// [`ZFence::index`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FenceSearch {
+    Keys,
+    Words,
+    Tree,
+}
+
 /// The fence: for each entry the rank and the key of the first record it
 /// covers and the page that holds them, in rank order. Heap, not mapped: it
 /// is resident from attach and never evicted, and a read searches it for the
@@ -2623,6 +3016,14 @@ pub struct ZFence {
     probe: Vec<ProbeLine>,
     /// Each node's entry: `probe_pos[i]` for node `i`.
     probe_pos: Vec<u32>,
+    /// The entries' words in a static B-tree of eight a node
+    /// ([`ZFence::index_words`]): node `k`'s words at `words[8k..8k + 8]`,
+    /// its nine children the nodes `9k + 1..=9k + 9`, the words in key
+    /// order through the tree, padded with `u64::MAX` past the last entry.
+    /// Empty until `index_words` builds it, and emptied by a `push` or by
+    /// `index`; `words_h` is the tree's height.
+    words: Vec<u64>,
+    words_h: u8,
     /// The bytes every non-empty key shares, and so where an entry's word
     /// begins in its key.
     shared: Vec<u8>,
@@ -2679,6 +3080,8 @@ impl ZFence {
             keys: Vec::new(),
             probe: Vec::new(),
             probe_pos: Vec::new(),
+            words: Vec::new(),
+            words_h: 0,
             shared: Vec::new(),
         }
     }
@@ -2699,6 +3102,8 @@ impl ZFence {
         // The tree was of the entries before this one.
         self.probe.clear();
         self.probe_pos.clear();
+        self.words.clear();
+        self.words_h = 0;
         self.shared.clear();
         Ok(())
     }
@@ -2715,17 +3120,13 @@ impl ZFence {
         let n = self.len();
         self.probe.clear();
         self.probe_pos.clear();
+        self.words.clear();
+        self.words_h = 0;
         self.shared.clear();
         if n == 0 {
             return;
         }
-        let first = (0..n).find(|&i| self.key(i).is_some_and(|k| !k.is_empty()));
-        if let Some(f) = first {
-            let a = self.key(f).expect("an entry has its key");
-            let b = self.key(n - 1).expect("an entry has its key");
-            let shared = a.iter().zip(b).take_while(|(x, y)| x == y).count();
-            self.shared = a[..shared].to_vec();
-        }
+        self.find_shared();
         let shared = self.shared.len();
         self.probe = vec![ProbeLine([0; 8]); (n + 1).div_ceil(8)];
         self.probe_pos = vec![0; n + 1];
@@ -2746,6 +3147,128 @@ impl ZFence {
         let mut next = 0usize;
         fill(self, 1, n, &mut next, shared);
         debug_assert_eq!(next, n, "every entry has its node");
+    }
+
+    /// The bytes every non-empty key shares, found: the bytes the first
+    /// non-empty key and the last share, since the keys ascend. For `index`
+    /// and `index_words`.
+    fn find_shared(&mut self) {
+        let n = self.len();
+        let first = (0..n).find(|&i| self.key(i).is_some_and(|k| !k.is_empty()));
+        if let Some(f) = first {
+            let a = self.key(f).expect("an entry has its key");
+            let b = self.key(n - 1).expect("an entry has its key");
+            let shared = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+            self.shared = a[..shared].to_vec();
+        }
+    }
+
+    /// The entries' words in a static B-tree, for `entry_of` to search a
+    /// cache line a level (`Options::zpages_fence_words`): eight words a
+    /// node, nine children, the words as `index` takes them laid through
+    /// the tree in key order -- node `k`'s children are nodes `9k + 1` to
+    /// `9k + 9`, a child's whole subtree below the node word after it --
+    /// and the slots past the last entry `u64::MAX`. The height is the
+    /// least with room for every entry: four levels hold 6,560, which is a
+    /// partition's fence at the suite's shape, where a binary search over
+    /// the same words is thirteen dependent loads. Takes the binary tree
+    /// down, as a push does: a fence is searched one way.
+    pub fn index_words(&mut self) {
+        self.probe.clear();
+        self.probe_pos.clear();
+        self.words.clear();
+        self.words_h = 0;
+        self.shared.clear();
+        let n = self.len();
+        if n == 0 {
+            return;
+        }
+        self.find_shared();
+        let shared = self.shared.len();
+        let mut h = 1usize;
+        let mut slots = 8usize;
+        while slots < n {
+            h += 1;
+            slots = slots * 9 + 8;
+        }
+        let mut words = vec![u64::MAX; slots];
+        // The in-order walk: each child's subtree before the node's word
+        // after it, so the words ascend through the tree; a slot the walk
+        // reaches past the last entry keeps the padding.
+        #[allow(clippy::too_many_arguments)]
+        fn fill(
+            f: &ZFence,
+            words: &mut [u64],
+            k: usize,
+            depth: usize,
+            h: usize,
+            next: &mut usize,
+            n: usize,
+            shared: usize,
+        ) {
+            if depth == h {
+                return;
+            }
+            for j in 0..8 {
+                fill(f, words, 9 * k + 1 + j, depth + 1, h, next, n, shared);
+                if *next < n {
+                    words[8 * k + j] =
+                        fence_word(f.key(*next).expect("an entry has its key"), shared);
+                }
+                *next += 1;
+            }
+            fill(f, words, 9 * k + 9, depth + 1, h, next, n, shared);
+        }
+        let mut next = 0usize;
+        fill(self, &mut words, 0, 0, h, &mut next, n, shared);
+        debug_assert_eq!(next, slots, "every slot has its turn");
+        self.words = words;
+        self.words_h = h as u8;
+    }
+
+    /// Whether the word tree stands (`index_words`).
+    pub fn worded(&self) -> bool {
+        !self.words.is_empty()
+    }
+
+    /// The first entry whose word is above `w`, by the word tree: a line a
+    /// level, each level's eight words compared at once for how many are
+    /// at or below `w`, which is how many of the node's words and whole
+    /// child subtrees lie below -- the rank gathers those -- and names the
+    /// child to take. Four dependent loads for a partition's fence where a
+    /// binary search over the same words makes thirteen, and the cost of
+    /// the search was the latency of its chain: laid flat and searched
+    /// with no branch on the data, the words took the same share of E's,
+    /// C's and D's threads as the search over the keys (`docs/engine.md`).
+    /// The padding past the last entry is `u64::MAX`, at or below nothing
+    /// but a word of `u64::MAX`, whose answer is the length anyway.
+    /// `len()` for none. With it, whether an entry ties `w` on the word:
+    /// the greatest word at or below `w` is the last of the node words
+    /// counted at some level, so a tie is seen in the descent, and where
+    /// there is none the entry before the first above is at or below `key`
+    /// by its word alone -- `entry_of` then reads no key at all, where it
+    /// read the entry's key to find the same thing: a line of the offsets
+    /// and a line of the key blob a search, whatever the search over the
+    /// words had saved.
+    fn above_by_word_wide(&self, w: u64) -> (usize, bool) {
+        let ws = &self.words;
+        let h = usize::from(self.words_h);
+        let mut k = 0usize;
+        let mut rank = 0usize;
+        let mut tie = false;
+        // A node word at or below `w` counts itself and the child subtree
+        // before it: 9^(h - 1 - depth) entries, less one for the subtree
+        // that is not there below a leaf.
+        let mut per = 9usize.pow(h.saturating_sub(1) as u32);
+        for _ in 0..h {
+            let node = &ws[8 * k..8 * k + 8];
+            let i = node.iter().filter(|&&x| x <= w).count();
+            tie |= i > 0 && node[i - 1] == w;
+            rank += i * per;
+            k = 9 * k + 1 + i;
+            per /= 9;
+        }
+        (rank.min(self.len()), tie)
     }
 
     /// Whether the tree stands (`index`).
@@ -2851,8 +3374,11 @@ impl ZFence {
     /// measured. An empty key sorts below every other, so neither needs
     /// one.
     ///
-    /// Over an indexed fence (`index`, `Options::zpages_fence_tree`) the
-    /// search is over the tree of the entries' words: a key that differs
+    /// Over a fence with its word tree (`index_words`,
+    /// `Options::zpages_fence_words`) or indexed (`index`,
+    /// `Options::zpages_fence_tree`) the search is by the entries' words,
+    /// the word tree a line a level and the binary tree a word a level: a
+    /// key that differs
     /// from the shared bytes is below or above every non-empty entry, a key
     /// shorter than them that agrees as far as it goes is below them all (a
     /// prefix sorts first), and a key that carries them is searched by its
@@ -2863,7 +3389,7 @@ impl ZFence {
     /// partitioned store's fences are small enough to sit in a cache and
     /// the search over them was never miss-bound (the option's doc).
     pub fn entry_of(&self, key: &[u8]) -> Option<usize> {
-        if self.probe.is_empty() {
+        if self.probe.is_empty() && self.words.is_empty() {
             return self.entry_of_search(key);
         }
         if key.is_empty() {
@@ -2879,7 +3405,16 @@ impl ZFence {
             Ordering::Equal => {}
         }
         let w = fence_word(key, shared);
-        let mut e = self.above_by_word(w);
+        let (mut e, tie) = if self.words.is_empty() {
+            (self.above_by_word(w), true)
+        } else {
+            self.above_by_word_wide(w)
+        };
+        // No entry tied on the word: the one before the first above is at
+        // or below by its word, and no key is read.
+        if !tie {
+            return e.checked_sub(1);
+        }
         // Down from the first entry above by word: an entry below by word
         // is at or below without a compare, the empty key is at or below
         // everything, and an entry tied on the word is compared whole.
@@ -2978,6 +3513,7 @@ impl ZFence {
             + self.keys.len()
             + std::mem::size_of::<ProbeLine>() * self.probe.len()
             + 4 * self.probe_pos.len()
+            + 8 * self.words.len()
             + self.shared.len()
     }
 
@@ -3092,6 +3628,8 @@ impl ZFence {
             keys: region[12 * e + 4..b_end].to_vec(),
             probe: Vec::new(),
             probe_pos: Vec::new(),
+            words: Vec::new(),
+            words_h: 0,
             shared: Vec::new(),
         };
         fence.check_tiling(t.nkeys, t.n_pages)?;
@@ -3258,11 +3796,21 @@ pub fn verify_page_with(
     Ok(view.header)
 }
 
-// The trailer's fields.
+// Every trailer's head and its last word, whichever body it describes: the
+// magic naming the body, that body's layout version, the page size, and
+// the CRC of every byte before the CRC. Written by `seal_trailer` and
+// checked by `open_trailer` alone, since a reader of either kind refusing
+// the other at the magic rests on the two kinds keeping these at one set
+// of places, and an attach that dispatches on the magic reads it there.
 const T_MAGIC: usize = 0;
 const T_VERSION: usize = 8;
 const T_PAGE_SIZE: usize = 12;
-const T_N_PAGES: usize = 16;
+const T_CRC: usize = ZTRAILER - 4;
+/// The head's length: where a body's fields begin.
+const T_HEAD: usize = 16;
+
+// The block form's fields.
+const T_N_PAGES: usize = T_HEAD;
 const T_N_ENTRIES: usize = 24;
 const T_NKEYS: usize = 32;
 const T_RES_OFF: usize = 40;
@@ -3291,9 +3839,8 @@ const T_BIND32: usize = 192;
 const T_BLOOM_PROBES: usize = 196;
 const T_BLOOM_SIG: usize = 200;
 const T_BLOOM_BITS: usize = 208;
-/// Where the zeros begin, and where the trailer's own CRC does.
+/// Where the zeros begin, which run to the CRC.
 const T_ZERO: usize = 212;
-const T_CRC: usize = ZTRAILER - 4;
 
 fn put32(b: &mut [u8], at: usize, v: u32) {
     b[at..at + 4].copy_from_slice(&v.to_le_bytes());
@@ -3311,6 +3858,61 @@ fn get64(b: &[u8], at: usize) -> u64 {
     let mut w = [0u8; 8];
     w.copy_from_slice(&b[at..at + 8]);
     u64::from_le_bytes(w)
+}
+
+/// A trailer's head and CRC written over `b`, whose body's fields are in
+/// place: the magic naming the body and its version, the page size, and
+/// then the CRC, last since it covers the head as well.
+fn seal_trailer(b: &mut [u8; ZTRAILER], magic: &[u8; 8], version: u32) {
+    b[T_MAGIC..T_MAGIC + 8].copy_from_slice(magic);
+    put32(b, T_VERSION, version);
+    put32(b, T_PAGE_SIZE, ZPAGE as u32);
+    let crc = crc32(&b[..T_CRC]);
+    put32(b, T_CRC, crc);
+}
+
+/// The magic of the trailer page `bytes`, which says which body the file
+/// holds ([`ZMAGIC`], [`STRIDE_MAGIC`]): read by an attach before any
+/// other byte of the page, at the one place every kind's head puts it.
+/// `None` for a page shorter than a trailer.
+pub fn trailer_magic(bytes: &[u8]) -> Option<[u8; 8]> {
+    if bytes.len() != ZTRAILER {
+        return None;
+    }
+    bytes[T_MAGIC..T_MAGIC + 8].try_into().ok()
+}
+
+/// The CRC word the trailer page `bytes` ends in, every kind's at one place
+/// ([`seal_trailer`]): over every byte of the page before it, the trailer's
+/// own fields and the row's CRC among them for a stride trailer, so two
+/// trailers whose words agree are, to a CRC's strength, one trailer. `None`
+/// for a page shorter than a trailer.
+pub fn trailer_crc(bytes: &[u8]) -> Option<u32> {
+    (bytes.len() == ZTRAILER).then(|| get32(bytes, T_CRC))
+}
+
+/// The checks a trailer of the body `magic` names makes before it reads a
+/// field of the body, in order: the length, the magic, the version, the
+/// page size, the CRC. The cheap identifying checks come first, so a page
+/// that is no trailer of this kind -- another kind's among them -- is said
+/// to be that, and the CRC says the rest was torn.
+fn open_trailer(bytes: &[u8], magic: &[u8; 8], version: u32) -> Result<(), ZError> {
+    if bytes.len() != ZTRAILER {
+        return Err(ZError::Length);
+    }
+    if bytes[T_MAGIC..T_MAGIC + 8] != *magic {
+        return Err(ZError::Magic);
+    }
+    if get32(bytes, T_VERSION) != version {
+        return Err(ZError::Version);
+    }
+    if get32(bytes, T_PAGE_SIZE) != ZPAGE as u32 {
+        return Err(ZError::PageSize);
+    }
+    if get32(bytes, T_CRC) != crc32(&bytes[..T_CRC]) {
+        return Err(ZError::TrailerCrc);
+    }
+    Ok(())
 }
 
 /// The trailer, the file's last page: what the form file holds, the segment it
@@ -3383,7 +3985,49 @@ pub struct Trailer {
 impl Trailer {
     /// The hash this form file's pages are bound by ([`bind32`]).
     pub fn bind32(&self) -> u32 {
-        bind32(self.seg_id, self.seg_end_seq, self.nkeys, self.seg_row_crc)
+        self.seg_ident().bind32()
+    }
+
+    /// The segment this form file says it derives from, in the shape both
+    /// kinds of trailer record it, so that one comparison holds either to
+    /// the live segment (`zfile::same_segment`).
+    pub fn seg_ident(&self) -> SegIdent {
+        SegIdent {
+            seg_id: self.seg_id,
+            seg_end_seq: self.seg_end_seq,
+            nkeys: self.nkeys,
+            recs_len: self.seg_recs_len,
+            crc_off: self.seg_crc_off,
+            key_off: self.seg_key_off,
+            hash_cap: self.seg_hash_cap,
+            file_len: self.seg_file_len,
+            timestamp: self.seg_timestamp,
+            generation: self.seg_generation,
+            row_crc: self.seg_row_crc,
+            rec_version: self.rec_version,
+            rec_magic: self.rec_magic,
+        }
+    }
+
+    /// The segment's fields set from `s`, the inverse of
+    /// [`Trailer::seg_ident`]: what a writer records of the segment it
+    /// derives from, from the one account of it both kinds of trailer are
+    /// filled from (`zfile::seg_ident_of`), so that no writer spells the
+    /// segment's fields out again. The key count is the segment's.
+    pub fn set_seg(&mut self, s: &SegIdent) {
+        self.seg_id = s.seg_id;
+        self.seg_end_seq = s.seg_end_seq;
+        self.nkeys = s.nkeys;
+        self.seg_recs_len = s.recs_len;
+        self.seg_crc_off = s.crc_off;
+        self.seg_key_off = s.key_off;
+        self.seg_hash_cap = s.hash_cap;
+        self.seg_file_len = s.file_len;
+        self.seg_timestamp = s.timestamp;
+        self.seg_generation = s.generation;
+        self.seg_row_crc = s.row_crc;
+        self.rec_version = s.rec_version;
+        self.rec_magic = s.rec_magic;
     }
 
     /// Whether the stored filter is the one this engine would compute: its
@@ -3410,9 +4054,6 @@ impl Trailer {
     /// The trailer's bytes.
     pub fn encode(&self) -> [u8; ZTRAILER] {
         let mut b = [0u8; ZTRAILER];
-        b[T_MAGIC..T_MAGIC + 8].copy_from_slice(&ZMAGIC);
-        put32(&mut b, T_VERSION, ZVERSION);
-        put32(&mut b, T_PAGE_SIZE, ZPAGE as u32);
         put64(&mut b, T_N_PAGES, self.n_pages);
         put64(&mut b, T_N_ENTRIES, self.n_entries);
         put64(&mut b, T_NKEYS, self.nkeys);
@@ -3442,33 +4083,17 @@ impl Trailer {
         put32(&mut b, T_BLOOM_PROBES, self.bloom_probes);
         put64(&mut b, T_BLOOM_SIG, self.bloom_sig);
         put32(&mut b, T_BLOOM_BITS, self.bloom_bits_per_key);
-        let crc = crc32(&b[..T_CRC]);
-        put32(&mut b, T_CRC, crc);
+        seal_trailer(&mut b, &ZMAGIC, ZVERSION);
         b
     }
 
     /// The trailer out of a page, after every check that needs nothing of the
-    /// file: the length, the magic, the version, the page size, the CRC, the
-    /// constants, the flags, the zeros, `bind32` against the fields it hashes,
-    /// and that the fields do not contradict each other. The cheap identifying
-    /// checks come first, so a file that is not a form file at all is said to
-    /// be that, and the CRC says the rest was torn.
+    /// file: the head's -- the length, the magic, the version, the page size,
+    /// the CRC ([`open_trailer`]) -- and then the constants, the flags, the
+    /// zeros, `bind32` against the fields it hashes, and that the fields do
+    /// not contradict each other.
     pub fn decode(bytes: &[u8]) -> Result<Trailer, ZError> {
-        if bytes.len() != ZTRAILER {
-            return Err(ZError::Length);
-        }
-        if bytes[T_MAGIC..T_MAGIC + 8] != ZMAGIC {
-            return Err(ZError::Magic);
-        }
-        if get32(bytes, T_VERSION) != ZVERSION {
-            return Err(ZError::Version);
-        }
-        if get32(bytes, T_PAGE_SIZE) != ZPAGE as u32 {
-            return Err(ZError::PageSize);
-        }
-        if get32(bytes, T_CRC) != crc32(&bytes[..T_CRC]) {
-            return Err(ZError::TrailerCrc);
-        }
+        open_trailer(bytes, &ZMAGIC, ZVERSION)?;
         let bad = ZError::Trailer;
         if get32(bytes, T_PAGE_CAP) != ZCAP as u32 || get32(bytes, T_MAX_COUNT) != ZMAX_COUNT as u32
         {
@@ -3530,6 +4155,686 @@ impl Trailer {
         }
         if t.filter && (t.bloom_probes == 0 || t.bloom_bits_per_key == 0) {
             return Err(bad("a filter with no probes or no bits"));
+        }
+        Ok(t)
+    }
+}
+
+/// The segment a form file derives from, as the segment says of itself:
+/// what either kind of trailer records of it and what the attach holds to
+/// the live segment's own account (`zfile::same_segment`), field by field.
+/// One shape for both kinds, so that the comparison and its refusals are
+/// written once; a second copy of it for the stride form would be a second
+/// definition of what "this segment's file" means.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SegIdent {
+    /// The segment's name fields: its id, and the sequence it covers.
+    pub seg_id: u64,
+    pub seg_end_seq: u64,
+    /// Its key count.
+    pub nkeys: u64,
+    /// Its record region's length.
+    pub recs_len: u64,
+    /// Where its key section's checksum row is.
+    pub crc_off: u64,
+    /// Its key section's offset.
+    pub key_off: u64,
+    /// Its hash capacity.
+    pub hash_cap: u64,
+    /// Its file's length.
+    pub file_len: u64,
+    /// Its superblock's timestamp and generation.
+    pub timestamp: u64,
+    pub generation: u64,
+    /// CRC-32C of its key section's checksum row.
+    pub row_crc: u32,
+    /// The record format's version and the file format's magic its records
+    /// are laid out by.
+    pub rec_version: u32,
+    pub rec_magic: u64,
+}
+
+// A `SegIdent`'s fields in a stride trailer, from its start.
+const SI_SEG_ID: usize = 0;
+const SI_SEG_END_SEQ: usize = 8;
+const SI_NKEYS: usize = 16;
+const SI_RECS_LEN: usize = 24;
+const SI_CRC_OFF: usize = 32;
+const SI_KEY_OFF: usize = 40;
+const SI_HASH_CAP: usize = 48;
+const SI_FILE_LEN: usize = 56;
+const SI_TIMESTAMP: usize = 64;
+const SI_GENERATION: usize = 72;
+const SI_ROW_CRC: usize = 80;
+const SI_REC_VERSION: usize = 84;
+const SI_REC_MAGIC: usize = 88;
+const SI_LEN: usize = 96;
+
+impl SegIdent {
+    /// The hash a form file's pages are bound by ([`bind32`]) over the
+    /// fields it takes.
+    pub fn bind32(&self) -> u32 {
+        bind32(self.seg_id, self.seg_end_seq, self.nkeys, self.row_crc)
+    }
+
+    fn put(&self, b: &mut [u8]) {
+        put64(b, SI_SEG_ID, self.seg_id);
+        put64(b, SI_SEG_END_SEQ, self.seg_end_seq);
+        put64(b, SI_NKEYS, self.nkeys);
+        put64(b, SI_RECS_LEN, self.recs_len);
+        put64(b, SI_CRC_OFF, self.crc_off);
+        put64(b, SI_KEY_OFF, self.key_off);
+        put64(b, SI_HASH_CAP, self.hash_cap);
+        put64(b, SI_FILE_LEN, self.file_len);
+        put64(b, SI_TIMESTAMP, self.timestamp);
+        put64(b, SI_GENERATION, self.generation);
+        put32(b, SI_ROW_CRC, self.row_crc);
+        put32(b, SI_REC_VERSION, self.rec_version);
+        put64(b, SI_REC_MAGIC, self.rec_magic);
+    }
+
+    fn get(b: &[u8]) -> SegIdent {
+        SegIdent {
+            seg_id: get64(b, SI_SEG_ID),
+            seg_end_seq: get64(b, SI_SEG_END_SEQ),
+            nkeys: get64(b, SI_NKEYS),
+            recs_len: get64(b, SI_RECS_LEN),
+            crc_off: get64(b, SI_CRC_OFF),
+            key_off: get64(b, SI_KEY_OFF),
+            hash_cap: get64(b, SI_HASH_CAP),
+            file_len: get64(b, SI_FILE_LEN),
+            timestamp: get64(b, SI_TIMESTAMP),
+            generation: get64(b, SI_GENERATION),
+            row_crc: get32(b, SI_ROW_CRC),
+            rec_version: get32(b, SI_REC_VERSION),
+            rec_magic: get64(b, SI_REC_MAGIC),
+        }
+    }
+}
+
+// ---- the stride form ------------------------------------------------------
+
+/// The stride trailer's magic: which body the file's last page describes,
+/// read before anything else of it. Not [`ZMAGIC`] moved, since the block
+/// form's layout is unchanged: a reader of the block form alone takes this
+/// file's trailer at the same length and refuses it at the magic, as
+/// damage, and rebuilds -- refused, never misread, which is all a derived
+/// file needs of an old reader. The digit moves when a stride reader would
+/// misread a newer stride file rather than refuse it.
+pub const STRIDE_MAGIC: [u8; 8] = *b"SUPDZST1";
+/// The stride trailer's version: what an older stride reader refuses
+/// without misreading.
+pub const STRIDE_VERSION: u32 = 1;
+/// The longest key a stride form takes, and the buffer a key renders into
+/// on the stack of every read that renders one. The prefix is at most a
+/// byte shorter, the field being at least a byte, and the trailer keeps
+/// this many bytes for it.
+pub const STRIDE_KEY_MAX: usize = 64;
+/// The most decimal digits a field holds: every number of nineteen digits
+/// is below 2^64, and not every one of twenty is.
+pub const STRIDE_DECIMAL_MAX: usize = 19;
+/// The most big-endian bytes a field holds: a u64's.
+pub const STRIDE_BE_MAX: usize = 8;
+/// The widest value a stride form holds: a page, so that a slot spans at
+/// most two pages and a read checks at most two of the row's words.
+pub const STRIDE_W_MAX: u32 = ZPAGE as u32;
+/// The multiplier a value page's index is mixed into its word of the row
+/// by, the golden ratio's 32-bit word. A block page names its first rank in
+/// its header and the fence holds it to that; a value page names nothing of
+/// its own, so its word is bound to its index as well as to the file, and a
+/// word moved with its page to another index -- a row and its pages
+/// shifted together -- fails there.
+pub const STRIDE_PAGE_MIX: u32 = 0x9E37_79B9;
+
+/// Value page `p`'s word in a stride form's CRC row: CRC-32C of the page,
+/// xor the file's [`bind32`], xor the index mixed by [`STRIDE_PAGE_MIX`].
+/// The one definition: the builder fills the row by it and every read
+/// checks a page by it. An index is a u32 because a stride trailer's key
+/// count is ([`StrideTrailer::decode`]) and a value is at most a page, so
+/// there are no more value pages than keys.
+pub fn stride_page_crc(page: &[u8], bind: u32, p: u32) -> u32 {
+    crc32(page) ^ bind ^ p.wrapping_mul(STRIDE_PAGE_MIX)
+}
+
+/// The CRC a stride trailer records of the row: CRC-32C of the row's
+/// words, `res_len` bytes and not their padding, xor the file's
+/// [`bind32`], so a row copied whole from another form file fails it.
+pub fn stride_row_crc(row: &[u8], bind: u32) -> u32 {
+    crc32(row) ^ bind
+}
+
+/// A stride form's sizes ([`stride_layout`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StrideLayout {
+    /// Pages of values, `V`.
+    pub v_pages: u64,
+    /// The CRC row's offset, `4096 * V`.
+    pub res_off: u64,
+    /// The CRC row's bytes, a word a value page.
+    pub res_len: u64,
+    /// The row's pages, padded to a whole page.
+    pub res_pages: u64,
+    /// The file's length: the values, the row padded, the trailer.
+    pub file_len: u64,
+}
+
+/// The sizes of a stride form of `n` values of `w` bytes each: the one
+/// definition of them, which the builder writes by, the trailer is held
+/// to, and a precheck prices a conversion with. `None` where they overflow.
+pub fn stride_layout(n: u64, w: u32) -> Option<StrideLayout> {
+    let page = ZPAGE as u64;
+    let v_pages = n.checked_mul(u64::from(w))?.div_ceil(page);
+    let res_off = v_pages.checked_mul(page)?;
+    let res_len = v_pages.checked_mul(4)?;
+    let res_pages = res_len.div_ceil(page);
+    let file_len = v_pages
+        .checked_add(res_pages)?
+        .checked_add(1)?
+        .checked_mul(page)?;
+    Some(StrideLayout {
+        v_pages,
+        res_off,
+        res_len,
+        res_pages,
+        file_len,
+    })
+}
+
+/// How a stride form's key field holds its number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyKind {
+    /// Zero-padded ASCII decimal digits.
+    Decimal,
+    /// Big-endian unsigned bytes.
+    BigEndian,
+}
+
+impl KeyKind {
+    /// The byte a stride trailer records.
+    pub fn code(self) -> u8 {
+        match self {
+            KeyKind::Decimal => 1,
+            KeyKind::BigEndian => 2,
+        }
+    }
+
+    /// The kind a trailer's byte names, if any.
+    pub fn from_code(c: u8) -> Option<KeyKind> {
+        match c {
+            1 => Some(KeyKind::Decimal),
+            2 => Some(KeyKind::BigEndian),
+            _ => None,
+        }
+    }
+
+    /// The widest field of this kind.
+    pub fn d_max(self) -> usize {
+        match self {
+            KeyKind::Decimal => STRIDE_DECIMAL_MAX,
+            KeyKind::BigEndian => STRIDE_BE_MAX,
+        }
+    }
+
+    /// The values a byte of the field takes.
+    fn radix(self) -> u64 {
+        match self {
+            KeyKind::Decimal => 10,
+            KeyKind::BigEndian => 256,
+        }
+    }
+
+    /// For a byte `b` of a key, how many of this kind's field bytes are
+    /// below it, and whether it is one: a field byte's value is the first.
+    fn rank_byte(self, b: u8) -> (u64, bool) {
+        match self {
+            KeyKind::Decimal if b < b'0' => (0, false),
+            KeyKind::Decimal if b > b'9' => (10, false),
+            KeyKind::Decimal => (u64::from(b - b'0'), true),
+            KeyKind::BigEndian => (u64::from(b), true),
+        }
+    }
+}
+
+/// Why two keys are not the ends of a run a stride form renders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyShapeNo {
+    /// They are not of one length of one to [`STRIDE_KEY_MAX`] bytes: the
+    /// empty key renders from no field.
+    Length,
+    /// The field past the prefix they share is neither decimal digits, at
+    /// most [`STRIDE_DECIMAL_MAX`] of them, nor at most [`STRIDE_BE_MAX`]
+    /// bytes.
+    Field,
+    /// No kind counts exactly the run's keys between them.
+    Holes,
+}
+
+/// The keys of a stride form: a prefix `P` the run shares and a field of
+/// `D` bytes holding a number, zero-padded decimal or big-endian, so that
+/// every key is `L = P + D` bytes and rank `r`'s key is the rendering of
+/// `base + r`. Both kinds render at a fixed width, so rendering is strictly
+/// increasing under the byte order the engine's keys sort by (`key_cmp`),
+/// and a key's rank, a seek's answer and a scan's next key are arithmetic.
+///
+/// Its fields are private and its constructors check them, so a codec in
+/// hand renders every number from `base` to [`KeyCodec::top`]: a codec
+/// that could not would answer a read with a key it cannot write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyCodec {
+    kind: KeyKind,
+    d: u8,
+    p: u8,
+    prefix: [u8; STRIDE_KEY_MAX],
+    base: u64,
+}
+
+impl KeyCodec {
+    /// A codec of `kind` over `prefix` and a field of `d` bytes, whose run
+    /// starts at `base`; the reason where they make none.
+    pub fn new(
+        kind: KeyKind,
+        prefix: &[u8],
+        d: usize,
+        base: u64,
+    ) -> std::result::Result<KeyCodec, &'static str> {
+        if d == 0 || d > kind.d_max() {
+            return Err("the field's width is not one to the most its kind holds");
+        }
+        if prefix.len() + d > STRIDE_KEY_MAX {
+            return Err("the key is longer than a stride form takes");
+        }
+        let mut c = KeyCodec {
+            kind,
+            d: d as u8,
+            p: prefix.len() as u8,
+            prefix: [0; STRIDE_KEY_MAX],
+            base,
+        };
+        c.prefix[..prefix.len()].copy_from_slice(prefix);
+        if base > c.top() {
+            return Err("the first key's number is past what the field holds");
+        }
+        Ok(c)
+    }
+
+    /// The codec under which `first` and `last` are the ends of a run of
+    /// exactly `n` keys, each rendered from its number: the prefix they
+    /// share, cut a byte short of the key so the field has one, and the
+    /// rest the field. Decimal is tried where both fields are digits and
+    /// big-endian where the field fits a u64, in that order, and a kind is
+    /// taken only where it counts `n` keys from the first to the last; a
+    /// key between the two shares the prefix, since bytewise order puts
+    /// every key that does not outside them. What this proves is the run's
+    /// count: that the keys between are the renderings is the build's
+    /// walk to check, a key at a time.
+    pub fn detect(first: &[u8], last: &[u8], n: u64) -> std::result::Result<KeyCodec, KeyShapeNo> {
+        let l = first.len();
+        if l == 0 || l > STRIDE_KEY_MAX || last.len() != l {
+            return Err(KeyShapeNo::Length);
+        }
+        let shared = first.iter().zip(last).take_while(|(a, b)| a == b).count();
+        let p = shared.min(l - 1);
+        let d = l - p;
+        let digits = |k: &[u8]| k[p..].iter().all(u8::is_ascii_digit);
+        let mut shaped = false;
+        for kind in [KeyKind::Decimal, KeyKind::BigEndian] {
+            if d > kind.d_max() || (kind == KeyKind::Decimal && !(digits(first) && digits(last))) {
+                continue;
+            }
+            shaped = true;
+            // Neither can refuse past the test above, and a refusal here
+            // would be a kind turned away for a reason no key earns: every
+            // byte of the field is the kind's and the field is no wider
+            // than the kind holds, so it parses within a u64; the field is
+            // at least a byte, the prefix being cut short of the key, the
+            // key at most the longest, and a field's number at most its top.
+            let base = KeyCodec::field_of(kind, &first[p..])
+                .expect("a field of the kind's bytes, no wider than it holds");
+            let c = KeyCodec::new(kind, &first[..p], d, base)
+                .expect("a field of one byte to the kind's widest, in a key the form takes");
+            let count = c
+                .decode(last)
+                .and_then(|x| x.checked_sub(base))
+                .and_then(|k| k.checked_add(1));
+            if count == Some(n) {
+                return Ok(c);
+            }
+        }
+        Err(if shaped {
+            KeyShapeNo::Holes
+        } else {
+            KeyShapeNo::Field
+        })
+    }
+
+    /// The kind of the field.
+    pub fn kind(&self) -> KeyKind {
+        self.kind
+    }
+
+    /// The field's width, `D`.
+    pub fn d(&self) -> usize {
+        usize::from(self.d)
+    }
+
+    /// The key's length, `L`.
+    pub fn key_len(&self) -> usize {
+        usize::from(self.p) + usize::from(self.d)
+    }
+
+    /// The prefix every key shares, `P` bytes.
+    pub fn prefix(&self) -> &[u8] {
+        &self.prefix[..usize::from(self.p)]
+    }
+
+    /// The first key's number.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// The largest number the field holds.
+    pub fn top(&self) -> u64 {
+        match self.kind {
+            KeyKind::Decimal => 10u64.pow(u32::from(self.d)) - 1,
+            KeyKind::BigEndian => u64::MAX >> (8 * (STRIDE_BE_MAX - self.d())),
+        }
+    }
+
+    /// Whether a run of `n` keys from `base` is a run at all and renders
+    /// whole: `n` at least one, and `base + n - 1` within the field.
+    pub fn holds(&self, n: u64) -> bool {
+        n.checked_sub(1)
+            .and_then(|k| self.base.checked_add(k))
+            .is_some_and(|last| last <= self.top())
+    }
+
+    /// The number a field of `kind` holds, where every byte is one of its.
+    fn field_of(kind: KeyKind, field: &[u8]) -> Option<u64> {
+        let radix = kind.radix();
+        let mut x = 0u64;
+        for &b in field {
+            let (v, ok) = kind.rank_byte(b);
+            if !ok {
+                return None;
+            }
+            x = x.checked_mul(radix)?.checked_add(v)?;
+        }
+        Some(x)
+    }
+
+    /// The number `key` renders, where it is this codec's: the key's
+    /// length, the prefix and every field byte one of the kind's; `None`
+    /// for any other key. Not its rank: a rank is the number less `base`.
+    pub fn decode(&self, key: &[u8]) -> Option<u64> {
+        let p = usize::from(self.p);
+        if key.len() != self.key_len() || key[..p] != self.prefix[..p] {
+            return None;
+        }
+        KeyCodec::field_of(self.kind, &key[p..])
+    }
+
+    /// Number `x`'s key, rendered into `buf`, at most [`KeyCodec::top`].
+    pub fn render<'a>(&self, x: u64, buf: &'a mut [u8; STRIDE_KEY_MAX]) -> &'a [u8] {
+        debug_assert!(x <= self.top(), "{x} is past what the field holds");
+        let (p, l) = (usize::from(self.p), self.key_len());
+        buf[..p].copy_from_slice(&self.prefix[..p]);
+        let field = &mut buf[p..l];
+        match self.kind {
+            KeyKind::Decimal => {
+                let mut v = x;
+                for b in field.iter_mut().rev() {
+                    *b = b'0' + (v % 10) as u8;
+                    v /= 10;
+                }
+            }
+            KeyKind::BigEndian => {
+                field.copy_from_slice(&x.to_be_bytes()[STRIDE_BE_MAX - self.d()..])
+            }
+        }
+        &buf[..l]
+    }
+
+    /// A rendered key moved to the next number's, in place, as a scan
+    /// steps a rank: the field's last byte up by one, carried left, the
+    /// prefix untouched. False where the field was [`KeyCodec::top`] and
+    /// wrapped to zero, which a walk inside a run that [`holds`] never
+    /// reaches.
+    ///
+    /// [`holds`]: KeyCodec::holds
+    pub fn increment(&self, key: &mut [u8]) -> bool {
+        debug_assert_eq!(key.len(), self.key_len(), "not a rendered key");
+        let (zero, nine) = match self.kind {
+            KeyKind::Decimal => (b'0', b'9'),
+            KeyKind::BigEndian => (0, u8::MAX),
+        };
+        for b in key[usize::from(self.p)..].iter_mut().rev() {
+            if *b == nine {
+                *b = zero;
+            } else {
+                *b += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Where `key` falls in the run of `n` keys from `base`: the rank of
+    /// the first key at or after it, `Equal` where that key is `key` and
+    /// `Greater` otherwise, `n` with `Greater` past them all -- the answer
+    /// a binary search of the rendered keys under `key_cmp` gives, by
+    /// arithmetic. Any key is asked: a seek's key is the caller's and need
+    /// not be shaped.
+    pub fn lower_bound(&self, key: &[u8], n: u64) -> (u64, Ordering) {
+        if let Some(x) = self.decode(key) {
+            return match x.checked_sub(self.base) {
+                None => (0, Ordering::Greater),
+                Some(r) if r >= n => (n, Ordering::Greater),
+                Some(r) => (r, Ordering::Equal),
+            };
+        }
+        let below = self.below(key);
+        let r = below
+            .saturating_sub(u128::from(self.base))
+            .min(u128::from(n));
+        (r as u64, Ordering::Greater)
+    }
+
+    /// How many numbers of the field render to a key below `key` in byte
+    /// order: every one where `key` is above the prefix, none where it is
+    /// below it or the prefix alone, and otherwise the field's renderings
+    /// below `key`'s tail, counted byte by byte from the left -- at each
+    /// byte the renderings that agree before it and take a smaller byte
+    /// there, until the tail leaves the kind's bytes or runs out. A u128,
+    /// since the big-endian field of eight bytes holds 2^64 numbers.
+    fn below(&self, key: &[u8]) -> u128 {
+        let (p, d) = (usize::from(self.p), self.d());
+        let radix = u128::from(self.kind.radix());
+        let all = radix.pow(d as u32);
+        let k = key.len().min(p);
+        match key[..k].cmp(&self.prefix[..k]) {
+            Ordering::Less => return 0,
+            Ordering::Greater => return all,
+            Ordering::Equal => {}
+        }
+        if key.len() <= p {
+            return 0;
+        }
+        let tail = &key[p..];
+        let mut count = 0u128;
+        let mut weight = all;
+        for (i, &b) in tail.iter().enumerate() {
+            if i == d {
+                // The tail holds a whole field and more: the rendering of
+                // its field is a proper prefix of it, so below it too.
+                return count + 1;
+            }
+            weight /= radix;
+            let (smaller, ok) = self.kind.rank_byte(b);
+            count += u128::from(smaller) * weight;
+            if !ok {
+                return count;
+            }
+        }
+        // The tail ran out at or before the field's end: every rendering
+        // that agrees with it so far is as long or longer, so none is
+        // below it.
+        count
+    }
+}
+
+/// A stride form's trailer, the file's last page: the keys' codec and the
+/// values' width, the row's CRC and the segment the file derives from. The
+/// magic, the version and the page size are constants of the layout;
+/// `V`, `res_off`, `res_len` and the file's length are [`stride_layout`]'s
+/// of the key count and the width and are written and checked, not held;
+/// `bind32` and the CRC are derived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StrideTrailer {
+    /// The keys' codec, the first key's number with it.
+    pub codec: KeyCodec,
+    /// Every value's width, `W`.
+    pub w: u32,
+    /// The row's CRC ([`stride_row_crc`]).
+    pub res_crc: u32,
+    /// The segment, whose key count is the run's.
+    pub seg: SegIdent,
+}
+
+// A stride trailer's fields, past the head every trailer has (`T_MAGIC`
+// to `T_HEAD`, and `T_CRC`).
+const S_CODEC: usize = T_HEAD;
+const S_D: usize = 17;
+const S_L: usize = 18;
+const S_P: usize = 19;
+const S_W: usize = 20;
+const S_BASE: usize = 24;
+const S_V: usize = 32;
+const S_RES_OFF: usize = 40;
+const S_RES_LEN: usize = 48;
+const S_RES_CRC: usize = 56;
+const S_BIND32: usize = 60;
+const S_SEG: usize = 64;
+const S_PREFIX: usize = S_SEG + SI_LEN;
+/// Where the zeros after the prefix's room begin, which run to the CRC.
+const S_ZERO: usize = S_PREFIX + STRIDE_KEY_MAX;
+
+impl StrideTrailer {
+    /// The segment the file says it derives from.
+    pub fn seg_ident(&self) -> SegIdent {
+        self.seg
+    }
+
+    /// The hash the file's row is bound by ([`bind32`]).
+    pub fn bind32(&self) -> u32 {
+        self.seg.bind32()
+    }
+
+    /// The file's sizes, after the checks its fields need of each other: a
+    /// key count of one to what a u32 page index counts, a run the codec
+    /// renders whole, and a width of one to [`STRIDE_W_MAX`].
+    pub fn layout(&self) -> Result<StrideLayout, ZError> {
+        let bad = ZError::Trailer;
+        let n = self.seg.nkeys;
+        if n == 0 || n > u64::from(u32::MAX) {
+            return Err(bad("the key count is not one to what a page index counts"));
+        }
+        if !self.codec.holds(n) {
+            return Err(bad("the run passes what its key field holds"));
+        }
+        if self.w == 0 || self.w > STRIDE_W_MAX {
+            return Err(bad("the value width is not one to a page"));
+        }
+        // Inside those bounds the values are under 2^44 bytes, and nothing
+        // of the layout overflows: a refusal here would be one no file
+        // could earn.
+        Ok(stride_layout(n, self.w).expect("a u32 of keys of a page each overflows no u64"))
+    }
+
+    /// The length the file must have.
+    pub fn expected_file_len(&self) -> Option<u64> {
+        self.layout().ok().map(|l| l.file_len)
+    }
+
+    /// The trailer's bytes, or the check its fields fail.
+    pub fn encode(&self) -> Result<[u8; ZTRAILER], ZError> {
+        let lay = self.layout()?;
+        let c = &self.codec;
+        let mut b = [0u8; ZTRAILER];
+        b[S_CODEC] = c.kind.code();
+        b[S_D] = c.d;
+        b[S_L] = c.key_len() as u8;
+        b[S_P] = c.p;
+        put32(&mut b, S_W, self.w);
+        put64(&mut b, S_BASE, c.base);
+        put64(&mut b, S_V, lay.v_pages);
+        put64(&mut b, S_RES_OFF, lay.res_off);
+        put64(&mut b, S_RES_LEN, lay.res_len);
+        put32(&mut b, S_RES_CRC, self.res_crc);
+        put32(&mut b, S_BIND32, self.bind32());
+        self.seg.put(&mut b[S_SEG..S_PREFIX]);
+        b[S_PREFIX..S_PREFIX + c.prefix().len()].copy_from_slice(c.prefix());
+        seal_trailer(&mut b, &STRIDE_MAGIC, STRIDE_VERSION);
+        Ok(b)
+    }
+
+    /// The trailer out of a page, after every check that needs nothing of
+    /// the file: the head's first, as every trailer makes them
+    /// ([`open_trailer`]), and then the fields against each other: the
+    /// codec's kind, the key's length, the prefix and the field making it,
+    /// the field's width, the run in the field, the width, the sizes
+    /// against [`stride_layout`]'s, the zeros, and `bind32` against the
+    /// fields it hashes.
+    pub fn decode(bytes: &[u8]) -> Result<StrideTrailer, ZError> {
+        open_trailer(bytes, &STRIDE_MAGIC, STRIDE_VERSION)?;
+        let bad = ZError::Trailer;
+        let kind = KeyKind::from_code(bytes[S_CODEC])
+            .ok_or(bad("the key codec is not one this reader knows"))?;
+        let (d, l, p) = (
+            usize::from(bytes[S_D]),
+            usize::from(bytes[S_L]),
+            usize::from(bytes[S_P]),
+        );
+        if l == 0 || l > STRIDE_KEY_MAX {
+            return Err(bad(
+                "the key length is not one to the most a stride form takes",
+            ));
+        }
+        if p + d != l {
+            return Err(bad("the prefix and the field are not the key's length"));
+        }
+        let codec = KeyCodec::new(
+            kind,
+            &bytes[S_PREFIX..S_PREFIX + p],
+            d,
+            get64(bytes, S_BASE),
+        )
+        .map_err(bad)?;
+        let t = StrideTrailer {
+            codec,
+            w: get32(bytes, S_W),
+            res_crc: get32(bytes, S_RES_CRC),
+            seg: SegIdent::get(&bytes[S_SEG..S_PREFIX]),
+        };
+        let lay = t.layout()?;
+        if get64(bytes, S_V) != lay.v_pages {
+            return Err(bad("V is not the values' pages"));
+        }
+        if get64(bytes, S_RES_OFF) != lay.res_off {
+            return Err(bad("res_off is not the values' length"));
+        }
+        if get64(bytes, S_RES_LEN) != lay.res_len {
+            return Err(bad("res_len is not the row's length"));
+        }
+        if bytes[S_PREFIX + p..S_ZERO].iter().any(|&b| b != 0) {
+            return Err(bad("a byte past the prefix is not zero"));
+        }
+        if bytes[S_ZERO..T_CRC].iter().any(|&b| b != 0) {
+            return Err(bad("a reserved byte is not zero"));
+        }
+        if get32(bytes, S_BIND32) != t.bind32() {
+            return Err(bad(
+                "bind32 is not the hash of the segment's identity fields",
+            ));
         }
         Ok(t)
     }
@@ -4880,7 +6185,8 @@ mod tests {
         assert_eq!(fi.heap_bytes(), f.heap_bytes() + 64 + 4 * 6);
     }
 
-    /// The tree's search (`index`) answers as the search over the keys for
+    /// The tree's search (`index`) and the word tree's (`index_words`)
+    /// answer as the search over the keys for
     /// every shape of fence -- the suite's digit keys with their long
     /// shared prefix, an empty first key, random keys of every length,
     /// keys tied on the word and told apart beyond it, a key that is
@@ -4898,6 +6204,11 @@ mod tests {
         };
         let mut fences: Vec<Vec<Vec<u8>>> = Vec::new();
         fences.push(digits(3000, 7));
+        // The word tree's heights change at 8, 80, 728 and 6,560 entries:
+        // a fence at each side of each.
+        for n in [8, 9, 80, 81, 728, 729, 6560, 6561] {
+            fences.push(digits(n, 3));
+        }
         let mut with_empty = digits(500, 13);
         with_empty[0].clear();
         fences.push(with_empty);
@@ -4946,8 +6257,25 @@ mod tests {
             for (i, k) in keys.iter().enumerate() {
                 f.push(i as u32 * 10, i as u32, k).unwrap();
             }
+            let mut fw = f.clone();
             f.index();
             assert!(f.indexed());
+            fw.index_words();
+            assert_eq!(fw.worded(), !keys.is_empty());
+            assert!(!fw.indexed(), "a fence is searched one way");
+            if !keys.is_empty() {
+                // The least height with room for every entry, and the
+                // tree's slots exactly that height's.
+                let h = usize::from(fw.words_h);
+                let slots = |h: u32| 9usize.pow(h) - 1;
+                assert!(h >= 1 && keys.len() <= slots(h as u32));
+                assert!(h == 1 || keys.len() > slots(h as u32 - 1));
+                assert_eq!(fw.words.len(), slots(h as u32));
+            }
+            assert_eq!(
+                fw.shared, f.shared,
+                "the words' shared bytes are the tree's"
+            );
             let shared = f.shared.clone();
             let mut probes: Vec<Vec<u8>> = vec![
                 Vec::new(),
@@ -4997,7 +6325,19 @@ mod tests {
                     keys.len(),
                     String::from_utf8_lossy(&shared)
                 );
+                assert_eq!(
+                    fw.entry_of(key),
+                    f.entry_of_search(key),
+                    "word tree: fence of {} keys (shared {:?}), key {key:?}",
+                    keys.len(),
+                    String::from_utf8_lossy(&shared)
+                );
             }
+            // A push after the words takes them down, as it takes the tree.
+            let mut fp = fw.clone();
+            fp.push(u32::MAX - 1, u32::MAX - 1, &[255u8; 32]).unwrap();
+            assert!(!fp.worded());
+            assert_eq!(fp.entry_of(b"\x01"), fp.entry_of_search(b"\x01"));
         }
     }
 
@@ -5238,6 +6578,35 @@ mod tests {
             ..sample_trailer()
         };
         assert_eq!(huge.expected_file_len(), None);
+    }
+
+    /// A trailer's segment set from an account of it reads back as that
+    /// account and leaves every other field as it was: the setter is the
+    /// getter's inverse field by field, each field's value distinct from
+    /// every other's so that two fields' places swapped read back wrong.
+    #[test]
+    fn a_trailers_segment_set_reads_back_as_set() {
+        let s = SegIdent {
+            seg_id: 1,
+            seg_end_seq: 2,
+            nkeys: 3,
+            recs_len: 4,
+            crc_off: 5,
+            key_off: 6,
+            hash_cap: 7,
+            file_len: 8,
+            timestamp: 9,
+            generation: 10,
+            row_crc: 11,
+            rec_version: 12,
+            rec_magic: 13,
+        };
+        let mut t = sample_trailer();
+        t.set_seg(&s);
+        assert_eq!(t.seg_ident(), s);
+        let mut back = t.clone();
+        back.set_seg(&sample_trailer().seg_ident());
+        assert_eq!(back, sample_trailer(), "nothing but the segment moved");
     }
 
     #[test]
@@ -7222,6 +8591,538 @@ mod tests {
         }
     }
 
+    // ---- a group sought a part at a time ----------------------------------
+
+    /// The suite's records in pages as a builder fills them, decoded by the
+    /// flat loop (`Dec::Flat`, and `Dec::FlatEnd` with the room it runs to
+    /// the group's end in) whole, a part at a time and sought a part at a
+    /// time: every byte, length, offset and stop the fast loop's
+    /// (`Dec::Own`) gives the same calls.
+    #[test]
+    fn a_group_decoded_by_the_flat_loop_is_the_fast_loops_whole_in_parts_and_sought() {
+        let images = suite_images(3000, 29);
+        let bind = 11;
+        let mut s = FillScratch::new();
+        let (mut rank, mut pages) = (0usize, Vec::new());
+        while rank < images.len() {
+            let mut page = [0u8; ZPAGE];
+            match fill_page(&images, rank, bind, &mut s, &mut page) {
+                Fill::Page(g) => {
+                    pages.push((rank, page));
+                    rank += g.count;
+                }
+                other => panic!("rank {rank}: {other:?}"),
+            }
+        }
+        let (mut fast, mut flat) = (GroupBuf::new(), GroupBuf::new());
+        let (mut fast_part, mut flat_part) = (GroupBuf::new(), GroupBuf::new());
+        let mut groups = 0usize;
+        for (first, page) in &pages {
+            let v = parse_page(page, bind).unwrap();
+            let mut at = *first;
+            for j in 0..v.groups() {
+                let count = usize::from(v.group(j).unwrap().count);
+                let g = decode_group_with(&v, j, &mut fast, Dec::Own)
+                    .unwrap()
+                    .to_vec();
+                // The flat loop lent the fast loop's slack and the room it
+                // runs to the group's end in (`Dec::FlatEnd`).
+                for dec in [Dec::Flat, Dec::FlatEnd] {
+                    let f = decode_group_with(&v, j, &mut flat, dec).unwrap();
+                    assert!(
+                        f == &g[..],
+                        "page at {first}, group {j}, {dec:?}: the whole decode"
+                    );
+                    for probe in [
+                        format!("{at:016}").into_bytes(),
+                        format!("{:016}", at + count / 2).into_bytes(),
+                        format!("{:016}x", at + count - 1).into_bytes(),
+                        b"z".to_vec(),
+                    ] {
+                        let a = seek_group_partly_with(&v, j, &mut fast_part, &probe, Dec::Own)
+                            .unwrap()
+                            .unwrap();
+                        let b = seek_group_partly_with(&v, j, &mut flat_part, &probe, dec)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!((a.off, a.len, a.of), (b.off, b.len, b.of), "a seek");
+                        assert!(flat_part.bytes(b.len) == &g[..b.len], "the seek's prefix");
+                    }
+                    for step in [1usize, 64, 300] {
+                        let mut p = open_group_partly_with(&v, j, &mut flat_part, 0, dec)
+                            .unwrap()
+                            .expect("a block-coded group");
+                        let mut before = p.have();
+                        while !p.done() {
+                            let got =
+                                decode_group_more(&mut p, &mut flat_part, before + step).unwrap();
+                            assert!(got > before || p.done(), "a call goes on");
+                            assert!(flat_part.bytes(got) == &g[..got], "step {step}: a prefix");
+                            before = got;
+                        }
+                        assert_eq!(p.have(), g.len());
+                    }
+                }
+                at += count;
+                groups += 1;
+            }
+        }
+        assert!(groups > 20, "{groups} groups");
+    }
+
+    /// The suite's records in pages as a builder fills them, every group one
+    /// LZ4 block: each key of a group, a key just past it and one above the
+    /// whole group, sought by the whole decode's walk and by the partial
+    /// one. The same record at the same offset, the bytes decoded a prefix
+    /// of the whole decode's that holds the record whole, and over every
+    /// key of a group about half of it decoded.
+    #[test]
+    fn a_groups_partial_seek_is_the_whole_seek_and_stops_near_its_record() {
+        let images = suite_images(3000, 23);
+        let bind = 7;
+        let mut s = FillScratch::new();
+        let (mut rank, mut pages) = (0usize, Vec::new());
+        while rank < images.len() {
+            let mut page = [0u8; ZPAGE];
+            match fill_page(&images, rank, bind, &mut s, &mut page) {
+                Fill::Page(g) => {
+                    pages.push((rank, page));
+                    rank += g.count;
+                }
+                other => panic!("rank {rank}: {other:?}"),
+            }
+        }
+        let (mut whole, mut part) = (GroupBuf::new(), GroupBuf::new());
+        let (mut seeks, mut short, mut bytes, mut of) = (0usize, 0usize, 0usize, 0usize);
+        let mut groups = 0usize;
+        for (first, page) in &pages {
+            let v = parse_page(page, bind).unwrap();
+            let mut at = *first;
+            for j in 0..v.groups() {
+                let ge = v.group(j).unwrap();
+                let count = usize::from(ge.count);
+                assert!(!ge.stored && !ge.coded, "the suite's records compress");
+                groups += 1;
+                let g = decode_group_with(&v, j, &mut whole, true).unwrap();
+                let mut probes: Vec<Vec<u8>> = Vec::new();
+                for r in at..at + count {
+                    let key = format!("{r:016}").into_bytes();
+                    probes.push([key.as_slice(), b"x"].concat());
+                    probes.push(key);
+                }
+                for probe in &probes {
+                    let want = group_seek(g, count, probe).unwrap();
+                    let got = seek_group_partly(&v, j, &mut part, probe)
+                        .unwrap()
+                        .expect("a block-coded group");
+                    assert_eq!(got.off, want.found.then_some(want.off));
+                    assert_eq!(got.of, g.len());
+                    assert!(got.len <= got.of);
+                    assert!(
+                        part.bytes(got.len) == &g[..got.len],
+                        "a prefix of the group"
+                    );
+                    if let Some(off) = got.off {
+                        let end = record_key_next(g, off).unwrap().1;
+                        assert!(end <= got.len, "the record whole in what was decoded");
+                    }
+                    seeks += 1;
+                    short += usize::from(got.len < got.of);
+                    bytes += got.len;
+                    of += got.of;
+                }
+                // A key above every key of the group walks it to its end,
+                // and one below its first stops at the first record.
+                let above = seek_group_partly(&v, j, &mut part, b"z").unwrap().unwrap();
+                assert_eq!((above.off, above.len), (None, g.len()));
+                assert!(
+                    part.bytes(g.len()) == g,
+                    "the whole group, a part at a time"
+                );
+                let below = seek_group_partly(&v, j, &mut part, b"!").unwrap().unwrap();
+                assert_eq!(below.off, None);
+                assert!(below.len <= (2 * PART_STEP).min(g.len()), "{}", below.len);
+                // The empty key is answered by the first record with no
+                // compare, as the whole walk answers it: absent here,
+                // where no key is empty.
+                let empty = seek_group_partly(&v, j, &mut part, b"").unwrap().unwrap();
+                let want = group_seek(g, count, b"").unwrap();
+                assert_eq!(empty.off, want.found.then_some(want.off));
+                assert!(empty.len <= (2 * PART_STEP).min(g.len()));
+                at += count;
+            }
+        }
+        assert!(
+            groups > 100 && seeks > 5000,
+            "{groups} groups, {seeks} seeks"
+        );
+        assert!(
+            bytes * 100 < of * 80 && short * 2 > seeks,
+            "{bytes} of {of} bytes decoded, {short} of {seeks} seeks short of the group"
+        );
+    }
+
+    /// Bytes that changed under a verified page: every byte of a group's
+    /// payload flipped in turn and keys sought through the damage. The
+    /// partial seek returns and never panics, and where the whole decode
+    /// still decodes the payload, what the partial one decoded is a prefix
+    /// of the same bytes -- one decoder over one input -- so it answers
+    /// what the whole walk answers from them. What it does not see is what
+    /// a whole decode learns at the block's end, a length that disagrees:
+    /// neither path reads the page's CRC again, and a page is held to it
+    /// once, at its first decode.
+    #[test]
+    fn a_partial_seek_over_a_damaged_payload_reads_a_prefix_of_the_whole_decodes_bytes() {
+        let images = suite_images(40, 5);
+        let mut s = FillScratch::new();
+        let mut page = [0u8; ZPAGE];
+        let Fill::Page(_) = fill_page(&images, 0, 3, &mut s, &mut page) else {
+            panic!("a page")
+        };
+        let v = parse_page(&page, 3).unwrap();
+        let ge = v.group(0).unwrap();
+        assert!(!ge.stored && !ge.coded);
+        let count = usize::from(ge.count);
+        let (coff, clen) = (usize::from(ge.coff), usize::from(ge.clen));
+        let probes: Vec<Vec<u8>> = vec![
+            format!("{:016}", 0).into_bytes(),
+            format!("{:016}", count / 2).into_bytes(),
+            format!("{:016}", count - 1).into_bytes(),
+            b"z".to_vec(),
+        ];
+        let (mut whole, mut part) = (GroupBuf::new(), GroupBuf::new());
+        let (mut refused, mut prefixes, mut whole_refused) = (0usize, 0usize, 0usize);
+        for i in coff..coff + clen {
+            for bit in [1u8, 0x10, 0x80] {
+                let mut bad = page;
+                bad[i] ^= bit;
+                // The damaged page's view, its CRC not asked.
+                let Ok(bv) = page_view(&bad) else { continue };
+                let w = decode_group_with(&bv, 0, &mut whole, true).map(|g| g.to_vec());
+                whole_refused += usize::from(w.is_err());
+                for probe in &probes {
+                    match seek_group_partly(&bv, 0, &mut part, probe) {
+                        Err(_) => refused += 1,
+                        Ok(None) => panic!("a block-coded group"),
+                        Ok(Some(p)) => {
+                            assert!(p.len <= p.of && p.of == ge.ulen as usize);
+                            if let Ok(g) = &w {
+                                assert!(
+                                    part.bytes(p.len) == &g[..p.len],
+                                    "byte {i} bit {bit:#x}: not the whole decode's prefix"
+                                );
+                                if let Ok(want) = group_seek(g, count, probe) {
+                                    assert_eq!(p.off, want.found.then_some(want.off));
+                                }
+                                prefixes += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            refused > 0 && prefixes > 0 && whole_refused > 0,
+            "{refused} refused, {prefixes} prefixes held, {whole_refused} whole decodes refused"
+        );
+    }
+
+    /// A directory that names a group four bytes shorter than its payload
+    /// decodes to, the payload as it was. The whole decode refuses the
+    /// length at the block's end. A partial seek whose decode runs that far
+    /// refuses it too, and its own check is the only thing that does: the
+    /// decoder's bound is the stated length and its slack, which the four
+    /// bytes are inside, and the record sought lies whole in the stated
+    /// length. The check a verified page cannot reach, held here by the
+    /// forged directory; short records, so that the step for the last whole
+    /// record takes the decode to the block's end.
+    #[test]
+    fn a_partial_seek_refuses_a_payload_that_decodes_past_its_groups_length() {
+        let images: Vec<Vec<u8>> = (0..40)
+            .map(|i| one_value(format!("{i:016}").as_bytes(), b"foxfoxfo"))
+            .collect();
+        let mut s = FillScratch::new();
+        let mut page = [0u8; ZPAGE];
+        let Fill::Page(_) = fill_page(&images, 0, 3, &mut s, &mut page) else {
+            panic!("a page")
+        };
+        let v = parse_page(&page, 3).unwrap();
+        let ge = v.group(0).unwrap();
+        assert!(!ge.stored && !ge.coded, "a block-coded group: {ge:?}");
+        let count = usize::from(ge.count);
+        assert!(count >= 3);
+        let mut whole = GroupBuf::new();
+        let g = decode_group_with(&v, 0, &mut whole, true).unwrap().to_vec();
+        // The record before the last: its start and its key.
+        let (mut off, mut key) = (0usize, Vec::new());
+        for i in 0..count - 1 {
+            let (k, next) = record_key_next(&g, off).unwrap();
+            if i == count - 2 {
+                key = k.to_vec();
+            } else {
+                off = next;
+            }
+        }
+        // Through the page as written the seek answers the record, and its
+        // decode has run to the group's end by then.
+        let mut part = GroupBuf::new();
+        let got = seek_group_partly(&v, 0, &mut part, &key).unwrap().unwrap();
+        assert_eq!((got.off, got.len), (Some(off), g.len()));
+        // The group's length in the directory, and the header's sum of the
+        // groups' lengths by as much, which the view holds the directory to.
+        let cut = 4usize;
+        assert!(cut < super::super::zlz4::DECODE_SLACK);
+        let mut bad = page;
+        let at = ZHDR + D_ULEN4;
+        bad[at..at + 2].copy_from_slice(&(((g.len() - cut) / 4) as u16).to_le_bytes());
+        let sum = u32::from_le_bytes(bad[P_ULEN..P_ULEN + 4].try_into().unwrap());
+        bad[P_ULEN..P_ULEN + 4].copy_from_slice(&(sum - cut as u32).to_le_bytes());
+        let bv = page_view(&bad).expect("a view of the forged page");
+        assert_eq!(bv.group(0).unwrap().ulen as usize, g.len() - cut);
+        assert!(
+            decode_group_with(&bv, 0, &mut whole, true).is_err(),
+            "the whole decode refuses the length"
+        );
+        assert!(
+            seek_group_partly(&bv, 0, &mut part, &key).is_err(),
+            "a decode past the stated length is refused, not answered from"
+        );
+    }
+
+    // ---- a group decoded a part at a time for a walk ----------------------
+
+    /// The suite's records in pages as a builder fills them: every group
+    /// begun at a spread of stops and taken on in steps of several sizes.
+    /// What is decoded is at every step a prefix of the whole decode's
+    /// bytes, past what was asked or the whole group, a call goes on by a
+    /// sequence at the least, and the last leaves the whole group and says
+    /// so. A group begun for nothing stops well short of its end.
+    #[test]
+    fn a_group_decoded_a_part_at_a_time_is_a_prefix_of_the_whole_at_every_step() {
+        let images = suite_images(3000, 37);
+        let bind = 9;
+        let mut s = FillScratch::new();
+        let (mut rank, mut pages) = (0usize, Vec::new());
+        while rank < images.len() {
+            let mut page = [0u8; ZPAGE];
+            match fill_page(&images, rank, bind, &mut s, &mut page) {
+                Fill::Page(g) => {
+                    pages.push(page);
+                    rank += g.count;
+                }
+                other => panic!("rank {rank}: {other:?}"),
+            }
+        }
+        let (mut whole, mut part) = (GroupBuf::new(), GroupBuf::new());
+        let (mut groups, mut steps, mut begun0, mut of0) = (0usize, 0usize, 0usize, 0usize);
+        for page in &pages {
+            let v = parse_page(page, bind).unwrap();
+            for j in 0..v.groups() {
+                let ge = v.group(j).unwrap();
+                assert!(!ge.stored && !ge.coded, "the suite's records compress");
+                groups += 1;
+                let g = decode_group_with(&v, j, &mut whole, true).unwrap().to_vec();
+                let n = g.len();
+                for (stop, step) in [
+                    (0, 1),
+                    (1, 64),
+                    (n / 4, PART_STEP),
+                    (n / 2, 7),
+                    (n - 1, 1),
+                    (n, 1),
+                    (usize::MAX, 1),
+                ] {
+                    let mut p = open_group_partly(&v, j, &mut part, stop)
+                        .unwrap()
+                        .expect("a block-coded group");
+                    assert_eq!(p.ulen(), n);
+                    assert!(p.done() || p.have() > stop, "stop {stop}: {}", p.have());
+                    assert_eq!(p.done(), p.have() == n, "stop {stop}");
+                    assert!(part.bytes(p.have()) == &g[..p.have()], "a prefix");
+                    if stop == 0 {
+                        begun0 += p.have();
+                        of0 += n;
+                    }
+                    while !p.done() {
+                        let before = p.have();
+                        let got = decode_group_more(&mut p, &mut part, before + step).unwrap();
+                        assert_eq!(got, p.have());
+                        assert!(got > before, "a call goes on");
+                        assert!(p.done() || got > before + step, "past what was asked");
+                        assert!(part.bytes(got) == &g[..got], "a prefix still");
+                        steps += 1;
+                    }
+                    assert!(part.bytes(n) == g.as_slice(), "the whole group at the end");
+                    // A group at its end is left as it is.
+                    assert_eq!(decode_group_more(&mut p, &mut part, usize::MAX).unwrap(), n);
+                    assert!(part.bytes(n) == g.as_slice());
+                }
+            }
+        }
+        assert!(
+            groups > 100 && steps > 5000,
+            "{groups} groups, {steps} steps"
+        );
+        assert!(
+            begun0 * 4 < of0,
+            "{begun0} of {of0} bytes decoded by a begin that asked for none"
+        );
+    }
+
+    /// A group that is stored or record-coded is not begun, and the caller
+    /// opens it as it lies; a group the page does not have is an error.
+    #[test]
+    fn a_stored_or_record_coded_group_is_not_decoded_a_part_at_a_time() {
+        let mut part = GroupBuf::new();
+        let mut rng = Rng::new(31);
+        let noise: Vec<Vec<u8>> = (0..40).map(|_| rng.bytes(124)).collect();
+        let mut s = FillScratch::new();
+        let mut page = [0u8; ZPAGE];
+        let Fill::Page(_) = fill_page(&noise, 0, 3, &mut s, &mut page) else {
+            panic!("a page")
+        };
+        let v = parse_page(&page, 3).unwrap();
+        assert!(v.group(0).unwrap().stored);
+        assert!(open_group_partly(&v, 0, &mut part, 64).unwrap().is_none());
+        assert!(open_group_partly(&v, v.groups(), &mut part, 64).is_err());
+
+        let images = suite_images(200, 5);
+        let mut s = FillScratch::new();
+        s.coding = ZCODING_RECORD;
+        let Fill::Page(_) = fill_page(&images, 0, 3, &mut s, &mut page) else {
+            panic!("a page")
+        };
+        let v = parse_page(&page, 3).unwrap();
+        let mut coded = 0usize;
+        for j in 0..v.groups() {
+            if v.group(j).unwrap().coded {
+                coded += 1;
+                assert!(open_group_partly(&v, j, &mut part, 64).unwrap().is_none());
+            }
+        }
+        assert!(coded > 0, "a record-coded group in the page");
+    }
+
+    /// Bytes that changed under a verified page, as the partial seek's test
+    /// has them: every byte of a group's payload flipped in turn and the
+    /// group decoded a part at a time through the damage. It returns and
+    /// never panics, what it holds at every step is no longer than the
+    /// group, it reaches the group's end only where the whole decode
+    /// decodes the payload, and where that does, every step is a prefix of
+    /// the same bytes.
+    #[test]
+    fn a_damaged_payload_decoded_a_part_at_a_time_is_the_whole_decodes_prefix_or_refused() {
+        let images = suite_images(40, 5);
+        let mut s = FillScratch::new();
+        let mut page = [0u8; ZPAGE];
+        let Fill::Page(_) = fill_page(&images, 0, 3, &mut s, &mut page) else {
+            panic!("a page")
+        };
+        let v = parse_page(&page, 3).unwrap();
+        let ge = v.group(0).unwrap();
+        assert!(!ge.stored && !ge.coded);
+        let ulen = ge.ulen as usize;
+        let (coff, clen) = (usize::from(ge.coff), usize::from(ge.clen));
+        let (mut whole, mut part) = (GroupBuf::new(), GroupBuf::new());
+        let (mut refused, mut prefixes, mut ended) = (0usize, 0usize, 0usize);
+        for i in coff..coff + clen {
+            for bit in [1u8, 0x10, 0x80] {
+                let mut bad = page;
+                bad[i] ^= bit;
+                let Ok(bv) = page_view(&bad) else { continue };
+                let w = decode_group_with(&bv, 0, &mut whole, true).map(|g| g.to_vec());
+                for (stop, step) in [(0usize, 1usize), (ulen / 2, PART_STEP)] {
+                    let mut p = match open_group_partly(&bv, 0, &mut part, stop) {
+                        Err(_) => {
+                            refused += 1;
+                            continue;
+                        }
+                        Ok(None) => panic!("a block-coded group"),
+                        Ok(Some(p)) => p,
+                    };
+                    loop {
+                        assert!(p.have() <= ulen && p.ulen() == ulen);
+                        if let Ok(g) = &w {
+                            assert!(
+                                part.bytes(p.have()) == &g[..p.have()],
+                                "byte {i} bit {bit:#x}: not the whole decode's prefix"
+                            );
+                            prefixes += 1;
+                        }
+                        if p.done() {
+                            assert!(
+                                w.is_ok(),
+                                "byte {i} bit {bit:#x}: an end the whole decode refuses"
+                            );
+                            assert_eq!(p.have(), ulen);
+                            ended += 1;
+                            break;
+                        }
+                        let before = p.have();
+                        match decode_group_more(&mut p, &mut part, before + step) {
+                            Err(_) => {
+                                refused += 1;
+                                break;
+                            }
+                            Ok(got) => assert!(got > before, "a call goes on"),
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            refused > 0 && prefixes > 0 && ended > 0,
+            "{refused} refused, {prefixes} prefixes held, {ended} ended"
+        );
+    }
+
+    /// The directory forged four bytes short of what the payload decodes
+    /// to, as the partial seek's test forges it: a decode a part at a time
+    /// that runs to the block's end refuses the length there, in one call
+    /// or in steps, and never hands the group over as whole.
+    #[test]
+    fn a_part_at_a_time_decode_refuses_a_payload_that_decodes_past_its_groups_length() {
+        let images: Vec<Vec<u8>> = (0..40)
+            .map(|i| one_value(format!("{i:016}").as_bytes(), b"foxfoxfo"))
+            .collect();
+        let mut s = FillScratch::new();
+        let mut page = [0u8; ZPAGE];
+        let Fill::Page(_) = fill_page(&images, 0, 3, &mut s, &mut page) else {
+            panic!("a page")
+        };
+        let v = parse_page(&page, 3).unwrap();
+        let ge = v.group(0).unwrap();
+        assert!(!ge.stored && !ge.coded, "a block-coded group: {ge:?}");
+        let mut whole = GroupBuf::new();
+        let n = decode_group_with(&v, 0, &mut whole, true).unwrap().len();
+        let cut = 4usize;
+        assert!(cut < super::super::zlz4::DECODE_SLACK);
+        let mut bad = page;
+        let at = ZHDR + D_ULEN4;
+        bad[at..at + 2].copy_from_slice(&(((n - cut) / 4) as u16).to_le_bytes());
+        let sum = u32::from_le_bytes(bad[P_ULEN..P_ULEN + 4].try_into().unwrap());
+        bad[P_ULEN..P_ULEN + 4].copy_from_slice(&(sum - cut as u32).to_le_bytes());
+        let bv = page_view(&bad).expect("a view of the forged page");
+        assert_eq!(bv.group(0).unwrap().ulen as usize, n - cut);
+        let mut part = GroupBuf::new();
+        assert!(
+            open_group_partly(&bv, 0, &mut part, usize::MAX).is_err(),
+            "the whole of it in one call"
+        );
+        let mut p = open_group_partly(&bv, 0, &mut part, 0)
+            .expect("a begin short of the end")
+            .expect("a block-coded group");
+        let refused = loop {
+            assert!(!p.done(), "never whole");
+            let before = p.have();
+            match decode_group_more(&mut p, &mut part, before + 16) {
+                Err(_) => break true,
+                Ok(got) => assert!(got > before && got <= n - cut),
+            }
+        };
+        assert!(refused);
+    }
+
     // ---- a whole form file ------------------------------------------------
 
     #[test]
@@ -7353,6 +9254,9 @@ mod tests {
             lo.checked_sub(1)
         };
         let mut raw_seen = 0;
+        let mut part_buf = GroupBuf::new();
+        let (mut part_seeks, mut part_bytes, mut part_of, mut part_short) =
+            (0usize, 0usize, 0usize, 0usize);
         for (rank, (k, _)) in recs.iter().enumerate() {
             for (probe, want_found) in [(k.clone(), true), ([k.as_slice(), &[0u8]].concat(), false)]
             {
@@ -7370,6 +9274,32 @@ mod tests {
                 let ge = v.group(j).unwrap();
                 let g = decode_group(&v, j, &mut buf).unwrap();
                 let p = group_seek(g, usize::from(ge.count), &probe).unwrap();
+                // The same seek with the group decoded only as far as the
+                // walk reads (`seek_group_partly`): the same record at the
+                // same offset, whole in what was decoded and byte for byte
+                // the whole decode's; a stored group is not its to serve.
+                match seek_group_partly(&v, j, &mut part_buf, &probe).unwrap() {
+                    Some(s) => {
+                        assert!(!ge.stored && !ge.coded, "rank {rank}");
+                        assert_eq!(s.of, ge.ulen as usize, "rank {rank}");
+                        assert_eq!(s.off, p.found.then_some(p.off), "rank {rank}");
+                        assert!(s.len <= s.of, "rank {rank}");
+                        assert_eq!(
+                            part_buf.bytes(s.len),
+                            &g[..s.len],
+                            "rank {rank}: the prefix"
+                        );
+                        if let Some(off) = s.off {
+                            let end = record_key_next(g, off).unwrap().1;
+                            assert!(end <= s.len, "rank {rank}: the record whole");
+                        }
+                        part_seeks += 1;
+                        part_bytes += s.len;
+                        part_of += s.of;
+                        part_short += usize::from(s.len < s.of);
+                    }
+                    None => assert!(ge.stored || ge.coded, "rank {rank}"),
+                }
                 let at_rank = e.first_rank as usize + usize::from(ge.first) + p.index;
                 if want_found {
                     assert!(p.found && at_rank == rank, "rank {rank}");
@@ -7387,6 +9317,18 @@ mod tests {
             raw_seen >= raw,
             "the raw records were reached through NOPAGE entries"
         );
+        // These records are mostly random bytes, so few of their groups
+        // are blocks; the ones that are were each held to the whole walk
+        // above, and the suite's shape has a test of its own.
+        assert!(part_bytes <= part_of && part_short <= part_seeks);
+        // A group the page does not have is refused.
+        let e = (0..fence.len())
+            .map(|i| fence.entry(i, n as u32).unwrap())
+            .find(|e| e.page != ZNOPAGE)
+            .unwrap();
+        let at = e.page as usize * ZPAGE;
+        let v = parse_page(&file[at..at + ZPAGE], t.bind32()).unwrap();
+        assert!(seek_group_partly(&v, v.groups(), &mut part_buf, b"k").is_err());
     }
 
     // ---- pins -----------------------------------------------------------
@@ -7628,5 +9570,787 @@ mod tests {
             // The suite's record is 124 bytes, and the images say so.
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- the stride form ------------------------------------------------
+
+    /// Every kind at every width it holds, each over no prefix, a byte of
+    /// one, and the longest prefix the key's length leaves room for.
+    fn every_codec_shape() -> Vec<KeyCodec> {
+        let mut v = Vec::new();
+        for kind in [KeyKind::Decimal, KeyKind::BigEndian] {
+            for d in 1..=kind.d_max() {
+                let long = vec![b'p'; STRIDE_KEY_MAX - d];
+                for prefix in [&b""[..], b"k", &long] {
+                    v.push(KeyCodec::new(kind, prefix, d, 0).expect("a codec of a width it holds"));
+                }
+            }
+        }
+        v
+    }
+
+    /// Numbers across a field: its ends and their neighbours, the carries
+    /// of its first bytes, and a scatter, ascending and distinct.
+    fn numbers_of(c: &KeyCodec, rng: &mut Rng) -> Vec<u64> {
+        let top = c.top();
+        let radix = c.kind().radix();
+        let mut v = vec![0, 1, 2, top / 2, top - 1, top];
+        let mut w = 1u64;
+        for _ in 0..c.d() {
+            v.extend([w.saturating_sub(1), w, w.saturating_add(1)]);
+            w = w.saturating_mul(radix);
+        }
+        v.extend((0..64).map(|_| rng.word() % top.saturating_add(1).max(1)));
+        v.retain(|&x| x <= top);
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    #[test]
+    fn a_key_codec_renders_decodes_and_steps_in_key_order() {
+        let mut rng = Rng::new(43);
+        let mut buf = [0u8; STRIDE_KEY_MAX];
+        let mut next = [0u8; STRIDE_KEY_MAX];
+        for c in every_codec_shape() {
+            let xs = numbers_of(&c, &mut rng);
+            let mut before: Option<Vec<u8>> = None;
+            for &x in &xs {
+                let key = c.render(x, &mut buf).to_vec();
+                assert_eq!(key.len(), c.key_len(), "{c:?} {x}");
+                assert_eq!(&key[..c.prefix().len()], c.prefix());
+                assert_eq!(c.decode(&key), Some(x), "{c:?} {x}");
+                // Strictly increasing under the engine's key order.
+                if let Some(b) = &before {
+                    assert_eq!(key_cmp(b, &key), Ordering::Less, "{c:?} at {x}");
+                }
+                before = Some(key.clone());
+                // A step is the next number's rendering, until the top,
+                // which wraps and says so.
+                let mut stepped = key.clone();
+                let fit = c.increment(&mut stepped);
+                if x < c.top() {
+                    assert!(fit, "{c:?} {x}");
+                    assert_eq!(stepped, c.render(x + 1, &mut next), "{c:?} {x}");
+                } else {
+                    assert!(!fit, "{c:?} top");
+                    assert_eq!(stepped, c.render(0, &mut next), "{c:?} wraps");
+                }
+                // Refusals: the wrong length, either way.
+                assert_eq!(c.decode(&key[..key.len() - 1]), None, "{c:?} {x} short");
+                for b in [0u8, b'0', 0xff] {
+                    let mut long = key.clone();
+                    long.push(b);
+                    assert_eq!(c.decode(&long), None, "{c:?} {x} long");
+                }
+                // A prefix byte other than the prefix's.
+                for i in 0..c.prefix().len() {
+                    let mut k = key.clone();
+                    k[i] ^= 1;
+                    assert_eq!(c.decode(&k), None, "{c:?} {x} prefix byte {i}");
+                }
+                // A byte at each place of the field that is no digit.
+                if c.kind() == KeyKind::Decimal {
+                    for i in c.prefix().len()..key.len() {
+                        for b in [b'0' - 1, b'9' + 1, 0, 0xff] {
+                            let mut k = key.clone();
+                            k[i] = b;
+                            assert_eq!(c.decode(&k), None, "{c:?} {x} field byte {i} = {b}");
+                        }
+                    }
+                }
+            }
+            // The empty key is no codec's, and a key of 0xff bytes is the
+            // top of a big-endian field with no prefix and nobody else's.
+            assert_eq!(c.decode(b""), None);
+            for len in 1..=STRIDE_KEY_MAX + 1 {
+                let ff = vec![0xffu8; len];
+                let want =
+                    (c.kind() == KeyKind::BigEndian && c.prefix().is_empty() && len == c.d())
+                        .then_some(c.top());
+                assert_eq!(c.decode(&ff), want, "{c:?} {len} bytes of 0xff");
+            }
+        }
+        // The decoder takes exactly the keys the codec renders, and
+        // rendering gives each back byte for byte: every field of one and
+        // of two bytes, of each kind, behind a prefix. That is what leaves
+        // the build walk's second quantity, a key the number renders
+        // (`zfile::stride_key_is`), a reason no key earns under this
+        // decoder.
+        for kind in [KeyKind::Decimal, KeyKind::BigEndian] {
+            for d in 1..=2usize {
+                let c = KeyCodec::new(kind, b"k", d, 0).unwrap();
+                let mut taken = 0u64;
+                for f in 0..1u64 << (8 * d) {
+                    let key = [b"k".as_slice(), &f.to_be_bytes()[8 - d..]].concat();
+                    if let Some(x) = c.decode(&key) {
+                        taken += 1;
+                        assert_eq!(c.render(x, &mut buf), &key[..], "{c:?} {key:?}");
+                    }
+                }
+                assert_eq!(taken, c.top() + 1, "{c:?}: every number's key, once");
+            }
+        }
+        // The widest decimal field holds every nineteen-digit number and
+        // nothing of twenty.
+        let c = KeyCodec::new(KeyKind::Decimal, b"", STRIDE_DECIMAL_MAX, 0).unwrap();
+        let nines = vec![b'9'; STRIDE_DECIMAL_MAX];
+        assert_eq!(c.decode(&nines), Some(c.top()));
+        assert_eq!(c.render(c.top(), &mut buf), &nines[..]);
+        assert_eq!(c.decode(&[b'9'; STRIDE_DECIMAL_MAX + 1]), None);
+        assert_eq!(c.decode(&[b'1'; STRIDE_DECIMAL_MAX + 1]), None);
+        assert_eq!(
+            u128::from(c.top()) + 1,
+            10u128.pow(STRIDE_DECIMAL_MAX as u32)
+        );
+        let c = KeyCodec::new(KeyKind::BigEndian, b"", STRIDE_BE_MAX, 0).unwrap();
+        assert_eq!(c.top(), u64::MAX);
+        // The constructor refuses what it cannot render.
+        for kind in [KeyKind::Decimal, KeyKind::BigEndian] {
+            let width = "the field's width is not one to the most its kind holds";
+            assert_eq!(KeyCodec::new(kind, b"", 0, 0).err(), Some(width));
+            assert_eq!(
+                KeyCodec::new(kind, b"", kind.d_max() + 1, 0).err(),
+                Some(width)
+            );
+            let long = vec![b'p'; STRIDE_KEY_MAX];
+            assert_eq!(
+                KeyCodec::new(kind, &long, 1, 0).err(),
+                Some("the key is longer than a stride form takes")
+            );
+            assert!(KeyCodec::new(kind, &long[1..], 1, 0).is_ok());
+            let c = KeyCodec::new(kind, b"k", 2, 0).unwrap();
+            assert!(KeyCodec::new(kind, b"k", 2, c.top()).is_ok());
+            assert_eq!(
+                KeyCodec::new(kind, b"k", 2, c.top() + 1).err(),
+                Some("the first key's number is past what the field holds")
+            );
+        }
+        // A run held whole is one of at least a key and not past the top.
+        let c = KeyCodec::new(KeyKind::Decimal, b"", 2, 90).unwrap();
+        assert!(!c.holds(0));
+        assert!(c.holds(1) && c.holds(10));
+        assert!(!c.holds(11));
+        assert!(!c.holds(u64::MAX));
+        let c = KeyCodec::new(KeyKind::BigEndian, b"", STRIDE_BE_MAX, u64::MAX).unwrap();
+        assert!(c.holds(1) && !c.holds(2));
+    }
+
+    /// The rank of the first rendered key at or after `q`, and whether it is
+    /// `q`, by a binary search under the engine's key order: what
+    /// `lower_bound` computes, written the other way.
+    fn search(keys: &[Vec<u8>], q: &[u8]) -> (u64, Ordering) {
+        let r = keys.partition_point(|k| key_cmp(k, q) == Ordering::Less);
+        let at = if keys.get(r).is_some_and(|k| k == q) {
+            Ordering::Equal
+        } else {
+            Ordering::Greater
+        };
+        (r as u64, at)
+    }
+
+    #[test]
+    fn lower_bound_is_the_binary_search_of_the_rendered_keys() {
+        let dec = KeyKind::Decimal;
+        let be = KeyKind::BigEndian;
+        let top = |kind, d| KeyCodec::new(kind, b"", d, 0).unwrap().top();
+        let runs: Vec<(KeyKind, &[u8], usize, u64, u64)> = vec![
+            // A run of one; a run over a carry of the field's first digit.
+            (dec, b"", 3, 0, 1),
+            (dec, b"k", 4, 990, 37),
+            // The suite's: a long prefix of zeros, a field of the rest.
+            (dec, b"0000000000", 6, 0, 2000),
+            // A run to the field's top, and one over a whole field.
+            (
+                dec,
+                b"",
+                STRIDE_DECIMAL_MAX,
+                top(dec, STRIDE_DECIMAL_MAX) - 40,
+                41,
+            ),
+            (dec, b"", 1, 0, 10),
+            (be, b"", 1, 0, 256),
+            (be, b"\x00\x01", 2, 250, 600),
+            (be, b"\xff", 1, 3, 200),
+            (be, b"", STRIDE_BE_MAX, u64::MAX - 30, 31),
+            // Prefixed runs that end at their field's top, where a key
+            // above the prefix is past the run by exactly every number
+            // the field holds and the clamp to `n` hides nothing: a run
+            // whose last key is the field's last, as "k0990" to "k0999"
+            // makes, and as the last partition of a store of sixteen-digit
+            // keys whose prefix holds a digit makes. A run that ends short
+            // of the top answers `n` for any count at or past its end.
+            (dec, b"k", 1, 0, 10),
+            (dec, b"k099", 1, 0, 10),
+            (dec, b"0000000009", 6, 999_000, 1000),
+            (be, b"\x80", 1, 3, 253),
+            (be, b"\x00\x01", 2, 65_000, 536),
+        ];
+        let mut buf = [0u8; STRIDE_KEY_MAX];
+        for &(kind, prefix, d, base, n) in &runs {
+            let c = KeyCodec::new(kind, prefix, d, base).unwrap();
+            assert!(c.holds(n), "{c:?} {n}");
+            let keys: Vec<Vec<u8>> = (0..n)
+                .map(|r| c.render(base + r, &mut buf).to_vec())
+                .collect();
+            let mut qs: Vec<Vec<u8>> = vec![
+                Vec::new(),
+                prefix.to_vec(),
+                prefix[..prefix.len().saturating_sub(1)].to_vec(),
+            ];
+            for len in 1..=c.key_len() + 1 {
+                qs.push(vec![0xff; len]);
+                qs.push(vec![0; len]);
+                qs.push(vec![b'0'; len]);
+                qs.push(vec![b'9'; len]);
+            }
+            for i in 0..prefix.len() {
+                for delta in [1u8, 0xff] {
+                    let mut q = keys[0].clone();
+                    q[i] = q[i].wrapping_add(delta);
+                    qs.push(q);
+                }
+            }
+            // The run's keys with their neighbours inside the field, each
+            // as it is, a byte short, a byte long, and with each place
+            // turned to a byte on either side of the digits and to the
+            // ends of a byte.
+            let lo = base.saturating_sub(3);
+            let hi = (base + (n - 1)).saturating_add(3).min(c.top());
+            for x in lo..=hi {
+                let k = c.render(x, &mut buf).to_vec();
+                qs.push(k[..k.len() - 1].to_vec());
+                for b in [0u8, b'0', b'9', 0xff] {
+                    let mut q = k.clone();
+                    q.push(b);
+                    qs.push(q);
+                }
+                for i in 0..k.len() {
+                    for b in [b'0' - 1, b'9' + 1, 0, 0xff] {
+                        let mut q = k.clone();
+                        q[i] = b;
+                        qs.push(q);
+                    }
+                }
+                qs.push(k);
+            }
+            for q in &qs {
+                assert_eq!(
+                    c.lower_bound(q, n),
+                    search(&keys, q),
+                    "{c:?} n {n}: {q:02x?}"
+                );
+            }
+            // The run's own keys, each found where it is.
+            for (r, k) in keys.iter().enumerate() {
+                assert_eq!(c.lower_bound(k, n), (r as u64, Ordering::Equal));
+            }
+        }
+    }
+
+    #[test]
+    fn detect_takes_exactly_a_run_its_codec_counts() {
+        let dec = |s: &str| s.as_bytes().to_vec();
+        let mut buf = [0u8; STRIDE_KEY_MAX];
+        // A run of one: the prefix cut a byte short of the key, so the
+        // field has one, whatever byte it is.
+        let c = KeyCodec::detect(b"k0042", b"k0042", 1).unwrap();
+        assert_eq!(
+            (c.kind(), c.prefix(), c.d(), c.base()),
+            (KeyKind::Decimal, &b"k004"[..], 1, 2)
+        );
+        let c = KeyCodec::detect(b"key\xfe", b"key\xfe", 1).unwrap();
+        assert_eq!(
+            (c.kind(), c.prefix(), c.d(), c.base()),
+            (KeyKind::BigEndian, &b"key"[..], 1, 0xfe)
+        );
+        // A carry across what the ends share: no prefix at all.
+        let c = KeyCodec::detect(b"0999", b"1002", 4).unwrap();
+        assert_eq!(
+            (c.kind(), c.prefix(), c.d(), c.base()),
+            (KeyKind::Decimal, &b""[..], 4, 999)
+        );
+        for (r, want) in ["0999", "1000", "1001", "1002"].iter().enumerate() {
+            assert_eq!(c.render(c.base() + r as u64, &mut buf), want.as_bytes());
+        }
+        // The suite's keys: sixteen digits, the run's ten leading zeros the
+        // prefix.
+        let n = 345_000u64;
+        let c = KeyCodec::detect(
+            &dec(&format!("{:016}", 0)),
+            &dec(&format!("{:016}", n - 1)),
+            n,
+        )
+        .unwrap();
+        assert_eq!(
+            (c.kind(), c.prefix(), c.d(), c.base()),
+            (KeyKind::Decimal, &b"0000000000"[..], 6, 0)
+        );
+        let c = KeyCodec::detect(b"user0000", b"user0999", 1000).unwrap();
+        assert_eq!(
+            (c.kind(), c.prefix(), c.d()),
+            (KeyKind::Decimal, &b"user0"[..], 3)
+        );
+        // Big-endian fields, and the widest.
+        let c = KeyCodec::detect(&[0, 0, 1, 0], &[0, 0, 2, 255], 512).unwrap();
+        assert_eq!(
+            (c.kind(), c.prefix(), c.d(), c.base()),
+            (KeyKind::BigEndian, &[0u8, 0][..], 2, 256)
+        );
+        let (first, last) = ((1u64 << 56).to_be_bytes(), (2u64 << 56).to_be_bytes());
+        let c = KeyCodec::detect(&first, &last, (1 << 56) + 1).unwrap();
+        assert_eq!(
+            (c.kind(), c.d(), c.base()),
+            (KeyKind::BigEndian, STRIDE_BE_MAX, 1 << 56)
+        );
+        // Digits at both ends that decimal does not count: the bytes of the
+        // run between them are big-endian's.
+        let span = u64::from(u16::from_be_bytes(*b"20") - u16::from_be_bytes(*b"19")) + 1;
+        let c = KeyCodec::detect(b"19", b"20", span).unwrap();
+        assert_eq!(c.kind(), KeyKind::BigEndian);
+        assert_eq!(
+            KeyCodec::detect(b"19", b"20", 2).unwrap().kind(),
+            KeyKind::Decimal
+        );
+        // Holes, a run counted backwards, a run of nothing.
+        assert_eq!(
+            KeyCodec::detect(b"k0000", b"k0999", 999),
+            Err(KeyShapeNo::Holes)
+        );
+        assert_eq!(
+            KeyCodec::detect(b"k0000", b"k0999", 1001),
+            Err(KeyShapeNo::Holes)
+        );
+        assert!(KeyCodec::detect(b"k0000", b"k0999", 1000).is_ok());
+        assert_eq!(
+            KeyCodec::detect(b"k0999", b"k0000", 1000),
+            Err(KeyShapeNo::Holes)
+        );
+        assert_eq!(
+            KeyCodec::detect(b"k0042", b"k0042", 0),
+            Err(KeyShapeNo::Holes)
+        );
+        // Every eight-byte number, from zeros to 0xff bytes, is a run one
+        // longer than any count: no `n` is it, and a count that wrapped
+        // would take it for a run of none.
+        for n in [0, 1, u64::MAX] {
+            assert_eq!(
+                KeyCodec::detect(&[0; STRIDE_BE_MAX], &[0xff; STRIDE_BE_MAX], n),
+                Err(KeyShapeNo::Holes),
+                "{n}"
+            );
+        }
+        // The same field from a later first key is a run a count holds,
+        // to the field's top.
+        let first = 0x0101_0101_0101_0101u64;
+        let c = KeyCodec::detect(
+            &first.to_be_bytes(),
+            &[0xff; STRIDE_BE_MAX],
+            u64::MAX - first + 1,
+        );
+        assert_eq!(
+            c.map(|c| (c.kind(), c.d(), c.base())),
+            Ok((KeyKind::BigEndian, STRIDE_BE_MAX, first))
+        );
+        // Two lengths, the empty key, a key past the longest.
+        assert_eq!(
+            KeyCodec::detect(b"k000", b"k0000", 2),
+            Err(KeyShapeNo::Length)
+        );
+        assert_eq!(KeyCodec::detect(b"", b"", 1), Err(KeyShapeNo::Length));
+        let longest = vec![b'p'; STRIDE_KEY_MAX];
+        assert!(KeyCodec::detect(&longest, &longest, 1).is_ok());
+        let past = vec![b'p'; STRIDE_KEY_MAX + 1];
+        assert_eq!(KeyCodec::detect(&past, &past, 1), Err(KeyShapeNo::Length));
+        // A field wider than either kind holds: twenty digits, and nine
+        // bytes that are not digits.
+        let nineteen = (
+            dec(&format!("1{}", "0".repeat(18))),
+            vec![b'9'; STRIDE_DECIMAL_MAX],
+        );
+        let c = KeyCodec::detect(&nineteen.0, &nineteen.1, 9 * 10u64.pow(18)).unwrap();
+        assert_eq!((c.kind(), c.d()), (KeyKind::Decimal, STRIDE_DECIMAL_MAX));
+        let twenty = (
+            dec(&format!("1{}", "0".repeat(19))),
+            vec![b'9'; STRIDE_DECIMAL_MAX + 1],
+        );
+        assert_eq!(
+            KeyCodec::detect(&twenty.0, &twenty.1, 2),
+            Err(KeyShapeNo::Field)
+        );
+        assert_eq!(
+            KeyCodec::detect(&[0; STRIDE_BE_MAX + 1], &[1; STRIDE_BE_MAX + 1], 2),
+            Err(KeyShapeNo::Field)
+        );
+        // Decimal only where both ends are digits: a first key of digits
+        // beside a last key of none is no decimal run, and too wide for
+        // big-endian.
+        assert_eq!(
+            KeyCodec::detect(b"123456789", &[0xff; 9], 2),
+            Err(KeyShapeNo::Field)
+        );
+    }
+
+    #[test]
+    fn a_stride_page_is_bound_to_its_file_and_its_index() {
+        let mut rng = Rng::new(47);
+        let page = rng.bytes(ZPAGE);
+        let bind = 0x0BAD_CAFE;
+        for p in [0u32, 1, 2, 239, u32::MAX] {
+            assert_eq!(
+                stride_page_crc(&page, bind, p),
+                crc32c(&page) ^ bind ^ p.wrapping_mul(STRIDE_PAGE_MIX),
+                "page {p}"
+            );
+        }
+        // Another file's bind, or another index, and the word is another.
+        assert_ne!(
+            stride_page_crc(&page, bind, 7),
+            stride_page_crc(&page, bind ^ 1, 7)
+        );
+        // No two indices give one page's bytes the same word: the mix is
+        // odd, so it moves every index to another word.
+        assert_eq!(STRIDE_PAGE_MIX % 2, 1);
+        let zero = [0u8; ZPAGE];
+        let mut words: Vec<u32> = (0..4096).map(|p| stride_page_crc(&zero, bind, p)).collect();
+        words.sort_unstable();
+        words.dedup();
+        assert_eq!(words.len(), 4096, "a zero page's words at 4096 indices");
+        // The row's own CRC is bound to the file too.
+        let row = rng.bytes(4 * 239);
+        assert_eq!(stride_row_crc(&row, bind), crc32c(&row) ^ bind);
+        assert_ne!(stride_row_crc(&row, bind), stride_row_crc(&row, bind ^ 1));
+    }
+
+    #[test]
+    fn the_stride_layout_is_its_regions_end_to_end() {
+        let page = ZPAGE as u128;
+        // Whole pages and one more for a part, by quotient and remainder.
+        let pages = |bytes: u128| bytes / page + u128::from(!bytes.is_multiple_of(page));
+        for n in [0u64, 1, 40, 41, 345_000, 10_000_000, u64::from(u32::MAX)] {
+            for w in [1u32, 99, 100, 4095, STRIDE_W_MAX] {
+                let l = stride_layout(n, w).expect("no overflow inside a trailer's ranges");
+                let values = u128::from(n) * u128::from(w);
+                let v = pages(values);
+                assert_eq!(u128::from(l.v_pages), v, "{n} {w}");
+                assert!(u128::from(l.v_pages) * page >= values);
+                assert!(values == 0 || (u128::from(l.v_pages) - 1) * page < values);
+                assert_eq!(u128::from(l.res_off), v * page);
+                assert_eq!(u128::from(l.res_len), 4 * v);
+                assert_eq!(u128::from(l.res_pages), pages(4 * v));
+                assert_eq!(
+                    u128::from(l.file_len),
+                    (v + u128::from(l.res_pages) + 1) * page,
+                    "{n} {w}"
+                );
+                assert_eq!(l.file_len % ZPAGE as u64, 0);
+            }
+        }
+        assert_eq!(stride_layout(u64::MAX, 2), None);
+        assert_eq!(stride_layout(u64::MAX / 2, STRIDE_W_MAX), None);
+    }
+
+    fn sample_stride_trailer() -> StrideTrailer {
+        StrideTrailer {
+            codec: KeyCodec::new(KeyKind::Decimal, b"0000000000", 6, 0).unwrap(),
+            w: 100,
+            res_crc: 0xF00D_CAFE,
+            seg: sample_trailer().seg_ident(),
+        }
+    }
+
+    #[test]
+    fn the_stride_trailer_round_trips() {
+        let plain = sample_stride_trailer();
+        let mut shapes = vec![plain];
+        shapes.push(StrideTrailer {
+            codec: KeyCodec::new(KeyKind::BigEndian, b"", STRIDE_BE_MAX, 1 << 40).unwrap(),
+            w: 1,
+            ..plain
+        });
+        let long = vec![0xa5u8; STRIDE_KEY_MAX - 1];
+        shapes.push(StrideTrailer {
+            codec: KeyCodec::new(KeyKind::BigEndian, &long, 1, 0).unwrap(),
+            w: STRIDE_W_MAX,
+            seg: SegIdent {
+                nkeys: 256,
+                ..plain.seg
+            },
+            ..plain
+        });
+        shapes.push(StrideTrailer {
+            seg: SegIdent {
+                nkeys: 1,
+                ..plain.seg
+            },
+            ..plain
+        });
+        // The most keys a page index counts, a value a key.
+        shapes.push(StrideTrailer {
+            codec: KeyCodec::new(KeyKind::BigEndian, b"", 4, 0).unwrap(),
+            w: 1,
+            seg: SegIdent {
+                nkeys: u64::from(u32::MAX),
+                ..plain.seg
+            },
+            ..plain
+        });
+        for t in shapes {
+            let b = t.encode().expect("a trailer of consistent fields");
+            assert_eq!(StrideTrailer::decode(&b), Ok(t), "{t:?}");
+            let l = stride_layout(t.seg.nkeys, t.w).unwrap();
+            assert_eq!(t.layout(), Ok(l));
+            assert_eq!(t.expected_file_len(), Some(l.file_len));
+            assert_eq!(t.seg_ident(), t.seg);
+            assert_eq!(
+                t.bind32(),
+                bind32(t.seg.seg_id, t.seg.seg_end_seq, t.seg.nkeys, t.seg.row_crc)
+            );
+        }
+        // The block form's trailer names the same segment by the same
+        // fields.
+        let b = sample_trailer();
+        assert_eq!(b.seg_ident().bind32(), b.bind32());
+        // Fields that make no file are refused before a byte is written.
+        let zero = StrideTrailer { w: 0, ..plain };
+        assert!(matches!(zero.encode(), Err(ZError::Trailer(_))));
+        assert_eq!(zero.expected_file_len(), None);
+        let none = StrideTrailer {
+            seg: SegIdent {
+                nkeys: 0,
+                ..plain.seg
+            },
+            ..plain
+        };
+        assert!(matches!(none.encode(), Err(ZError::Trailer(_))));
+    }
+
+    #[test]
+    fn the_stride_trailer_is_read_by_an_independent_decoder() {
+        let t = sample_stride_trailer();
+        let b = t.encode().unwrap();
+        let c = &t.codec;
+        let s = &t.seg;
+        let n = s.nkeys;
+        let v = (n * u64::from(t.w)).div_ceil(4096);
+        assert_eq!(&b[0..8], b"SUPDZST1");
+        assert_eq!(le32(&b, 8), 1, "version");
+        assert_eq!(le32(&b, 12), 4096, "page size");
+        assert_eq!(b[16], 1, "the decimal codec");
+        assert_eq!(usize::from(b[17]), c.d());
+        assert_eq!(usize::from(b[18]), c.key_len());
+        assert_eq!(usize::from(b[19]), c.prefix().len());
+        assert_eq!(le32(&b, 20), t.w);
+        for (at, want) in [
+            (24, c.base()),
+            (32, v),
+            (40, 4096 * v),
+            (48, 4 * v),
+            (64, s.seg_id),
+            (72, s.seg_end_seq),
+            (80, s.nkeys),
+            (88, s.recs_len),
+            (96, s.crc_off),
+            (104, s.key_off),
+            (112, s.hash_cap),
+            (120, s.file_len),
+            (128, s.timestamp),
+            (136, s.generation),
+            (152, s.rec_magic),
+        ] {
+            assert_eq!(le64(&b, at), want, "the u64 at {at}");
+        }
+        for (at, want) in [(56, t.res_crc), (144, s.row_crc), (148, s.rec_version)] {
+            assert_eq!(le32(&b, at), want, "the u32 at {at}");
+        }
+        let p = c.prefix().len();
+        assert_eq!(&b[160..160 + p], c.prefix());
+        assert!(
+            b[160 + p..4092].iter().all(|&x| x == 0),
+            "zeros past the prefix"
+        );
+        assert_eq!(
+            le32(&b, 4092),
+            crc32c(&b[..4092]),
+            "the CRC covers [0, 4092)"
+        );
+        // bind32 is the CRC of the 28 identity bytes, in the block form's
+        // order.
+        let mut ident = Vec::new();
+        ident.extend_from_slice(&b[64..72]);
+        ident.extend_from_slice(&b[72..80]);
+        ident.extend_from_slice(&b[80..88]);
+        ident.extend_from_slice(&b[144..148]);
+        assert_eq!(le32(&b, 60), crc32c(&ident));
+        let big = StrideTrailer {
+            codec: KeyCodec::new(KeyKind::BigEndian, b"", 2, 0).unwrap(),
+            ..t
+        };
+        assert_eq!(big.encode().unwrap()[16], 2, "the big-endian codec");
+    }
+
+    #[test]
+    fn a_flipped_byte_anywhere_in_a_stride_trailer_is_refused() {
+        let b = sample_stride_trailer().encode().unwrap();
+        for at in 0..ZTRAILER {
+            for flip in [0x01u8, 0x80, 0xFF] {
+                let mut bad = b;
+                bad[at] ^= flip;
+                let want = match at {
+                    0..=7 => ZError::Magic,
+                    8..=11 => ZError::Version,
+                    12..=15 => ZError::PageSize,
+                    _ => ZError::TrailerCrc,
+                };
+                assert_eq!(
+                    StrideTrailer::decode(&bad),
+                    Err(want),
+                    "byte {at} ^ {flip:#x}"
+                );
+            }
+        }
+        assert_eq!(
+            StrideTrailer::decode(&b[..ZTRAILER - 1]),
+            Err(ZError::Length)
+        );
+        assert_eq!(StrideTrailer::decode(&[]), Err(ZError::Length));
+        assert_eq!(StrideTrailer::decode(&[0u8; ZTRAILER]), Err(ZError::Magic));
+        // Each kind's decoder refuses the other's trailer at the magic: what
+        // an engine that reads only the block form does with a stride file,
+        // and the other way.
+        assert_eq!(Trailer::decode(&b), Err(ZError::Magic));
+        assert_eq!(
+            StrideTrailer::decode(&sample_trailer().encode()),
+            Err(ZError::Magic)
+        );
+    }
+
+    #[test]
+    fn damage_the_stride_trailers_crc_cannot_see_is_refused_by_the_checks_behind_it() {
+        let base = sample_stride_trailer().encode().unwrap();
+        assert!(StrideTrailer::decode(&base).is_ok());
+        let bad = |f: &dyn Fn(&mut [u8; ZTRAILER])| {
+            let mut b = base;
+            f(&mut b);
+            resign_trailer(&mut b);
+            StrideTrailer::decode(&b).err()
+        };
+        let why = |e: Option<ZError>| match e {
+            Some(ZError::Trailer(w)) => w,
+            other => panic!("not an inconsistent trailer: {other:?}"),
+        };
+        let p = sample_stride_trailer().codec.prefix().len();
+        let codec = "the key codec is not one this reader knows";
+        assert_eq!(why(bad(&|b| b[S_CODEC] = 0)), codec);
+        assert_eq!(why(bad(&|b| b[S_CODEC] = 3)), codec);
+        let length = "the key length is not one to the most a stride form takes";
+        assert_eq!(why(bad(&|b| b[S_L] = 0)), length);
+        assert_eq!(why(bad(&|b| b[S_L] = STRIDE_KEY_MAX as u8 + 1)), length);
+        let parts = "the prefix and the field are not the key's length";
+        assert_eq!(why(bad(&|b| b[S_P] += 1)), parts);
+        assert_eq!(why(bad(&|b| b[S_D] -= 1)), parts);
+        // A field wider than its kind, with the length made to agree; and a
+        // field of nothing, all of the key the prefix.
+        let width = "the field's width is not one to the most its kind holds";
+        assert_eq!(
+            why(bad(&|b| {
+                b[S_D] = STRIDE_DECIMAL_MAX as u8 + 1;
+                b[S_L] = b[S_P] + b[S_D];
+            })),
+            width
+        );
+        assert_eq!(
+            why(bad(&|b| {
+                b[S_CODEC] = KeyKind::BigEndian.code();
+                b[S_D] = STRIDE_BE_MAX as u8 + 1;
+                b[S_L] = b[S_P] + b[S_D];
+            })),
+            width
+        );
+        assert_eq!(
+            why(bad(&|b| {
+                b[S_D] = 0;
+                b[S_L] = b[S_P];
+            })),
+            width
+        );
+        // The run in the field: its first number past it, and its last.
+        let top = sample_stride_trailer().codec.top();
+        assert_eq!(
+            why(bad(&|b| put64(b, S_BASE, top + 1))),
+            "the first key's number is past what the field holds"
+        );
+        assert_eq!(
+            why(bad(&|b| put64(b, S_BASE, top))),
+            "the run passes what its key field holds"
+        );
+        // The key count a page index counts.
+        let count = "the key count is not one to what a page index counts";
+        assert_eq!(why(bad(&|b| put64(b, S_SEG + SI_NKEYS, 0))), count);
+        assert_eq!(
+            why(bad(&|b| put64(
+                b,
+                S_SEG + SI_NKEYS,
+                u64::from(u32::MAX) + 1
+            ))),
+            count
+        );
+        // The width.
+        let w = "the value width is not one to a page";
+        assert_eq!(why(bad(&|b| put32(b, S_W, 0))), w);
+        assert_eq!(why(bad(&|b| put32(b, S_W, STRIDE_W_MAX + 1))), w);
+        // The sizes, each against the layout's.
+        assert_eq!(why(bad(&|b| b[S_V] ^= 1)), "V is not the values' pages");
+        assert_eq!(
+            why(bad(&|b| b[S_RES_OFF + 1] ^= 0x10)),
+            "res_off is not the values' length"
+        );
+        assert_eq!(
+            why(bad(&|b| b[S_RES_LEN] ^= 4)),
+            "res_len is not the row's length"
+        );
+        // The zeros: past the prefix, and after the prefix's room.
+        let past = "a byte past the prefix is not zero";
+        for at in [S_PREFIX + p, S_ZERO - 1] {
+            assert_eq!(why(bad(&|b| b[at] = 1)), past, "byte {at}");
+        }
+        for at in [S_ZERO, 2000, T_CRC - 1] {
+            assert_eq!(
+                why(bad(&|b| b[at] = 1)),
+                "a reserved byte is not zero",
+                "byte {at}"
+            );
+        }
+        // bind32 against the fields it hashes, each moved without it.
+        let bind = "bind32 is not the hash of the segment's identity fields";
+        assert_eq!(why(bad(&|b| b[S_BIND32] ^= 1)), bind);
+        for (field, at) in [
+            ("seg_id", S_SEG + SI_SEG_ID),
+            ("seg_end_seq", S_SEG + SI_SEG_END_SEQ),
+            ("nkeys", S_SEG + SI_NKEYS),
+            ("row_crc", S_SEG + SI_ROW_CRC),
+        ] {
+            assert_eq!(why(bad(&|b| b[at] ^= 1)), bind, "{field} without bind32");
+        }
+        // The fields only the attach can judge are the segment's own
+        // account, and decode takes them as written.
+        let mut b = base;
+        b[S_SEG + SI_RECS_LEN] ^= 4;
+        resign_trailer(&mut b);
+        let t = StrideTrailer::decode(&b).unwrap();
+        assert_eq!(t.seg.recs_len, sample_stride_trailer().seg.recs_len ^ 4);
+        // A version or a page size the CRC covers is refused before it.
+        for v in [0u32, STRIDE_VERSION + 1] {
+            let mut b = base;
+            put32(&mut b, T_VERSION, v);
+            assert_eq!(
+                StrideTrailer::decode(&b),
+                Err(ZError::Version),
+                "version {v}"
+            );
+        }
+        let mut b = base;
+        put32(&mut b, T_PAGE_SIZE, 16_384);
+        assert_eq!(StrideTrailer::decode(&b), Err(ZError::PageSize));
     }
 }

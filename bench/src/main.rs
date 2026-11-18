@@ -17,6 +17,7 @@ usage:
   bench gate ROW.json [--runs DIR]
   bench figures [--runs DIR] [--out DIR] [--scale quick|full|ooc]
   bench machine
+  bench stamp
 
 run    measures every arm over the size ladder and writes runs/<scale>/<utc>-<sha7>.json
        --out   directory holding runs/ (default: runs)
@@ -27,10 +28,12 @@ run    measures every arm over the size ladder and writes runs/<scale>/<utc>-<sh
                ooc 10000000)
        --bottom the ladder's bottom rung in keys (default: the whole ladder from 10000; ooc 3000000)
        --reps  repetitions per size and arm (default: quick 5, full 7, ooc 3)
-       --bound the memory the run may use, in bytes, enforced by a cgroup of the run's own:
-               required at ooc, refused at quick and full. The process is moved into the
-               group before anything is measured, the limit as read back goes into the row's
-               class, and a bound too small for the floors is refused before the floors
+       --bound the memory the run may use, in bytes, enforced by a cgroup: required at ooc,
+               refused at quick and full. Under cgroup v1 the run makes a group of its own
+               and moves into it before anything is measured; under v2 alone it attaches to
+               the group it was started in, whose limit has to be this number (systemd-run
+               -p MemoryMax=BYTES -p MemorySwapMax=0). The limit as read back goes into the
+               row's class, and a bound too small for the floors is refused before the floors
        --ops-div what the read passes' operation counts are divided by at ooc (default 10);
                loads and bursts are never divided, and no divided count goes below 1000
        --resume DIR  take up the run whose ledger is DIR (<out>/inflight/<utc>-<sha7>, what a run
@@ -52,8 +55,8 @@ ab     two arms in one process, alternating and paired rep by rep, for choosing
        --bound as for run: the pairing under a memory bound, with the counts per
                operation a bounded row records paired like any other quantity.
        --passes a comma-separated subset of load,read,read-threaded,scan,scan-threaded,
-               mixes,scan-mixed,lag (default: all), for a question one phase answers
-               at a rung where the whole pass is an hour.
+               mixes,scan-mixed,mixes-scrambled,lag,recover (default: all but recover),
+               for a question one phase answers at a rung where the whole pass is an hour.
        --ops-div as for run, here at any scale (default 1): the read passes' counts
                divided, for a pairing at a rung where the whole pass is an hour.
        --compress the fraction of each value that is a repeated phrase (default 0.5,
@@ -115,9 +118,25 @@ fn enter_bound(bytes: u64) -> Result<Bound, String> {
         b.limit(),
         b.group().display()
     );
+    eprintln!(
+        "bench: {}",
+        match b.mode() {
+            supdb_bench::bound::Mode::PerPass =>
+                "each pass in a group of its own with the bound on it, this process in none",
+            supdb_bench::bound::Mode::Shared =>
+                "the passes share this process's group, which a wrapper bounded (cgroup v2, \
+                 not delegated): each pass records what the group held at its start",
+        }
+    );
     run::probe_counts(&b).map_err(|e| format!("refused: {e}"))?;
     Ok(b)
 }
+
+/// The refusal of `--one-process` under `--bound`: a bound is each pass's
+/// own process's (`bound::Bound::pass`), and a pass in this process has none.
+const ONE_PROCESS_BOUND: &str =
+    "refused: --one-process under --bound: the bound is each pass's own process's, and a pass in \
+     this process would run outside it";
 
 struct Args(Vec<String>);
 impl Args {
@@ -140,6 +159,21 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(|s| s.as_str()) {
         Some("run") => cmd_run(Args(args[1..].to_vec())),
+        // The recovery workloads' writer (`run::crash_load_child`), spawned
+        // by a pass and killed by it: it returns only where it failed.
+        Some("crash-load") => match args.get(1) {
+            Some(spec) => match run::crash_load_child(std::path::Path::new(spec)) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("crash-load failed: {e}");
+                    2
+                }
+            },
+            None => {
+                eprintln!("crash-load SPEC: the spec file a pass wrote is required");
+                2
+            }
+        },
         // A pass's own process (`run::one_pass_child`), spawned by `run`.
         Some("one-pass") => match args.get(1) {
             Some(spec) => match run::one_pass_child(std::path::Path::new(spec)) {
@@ -158,6 +192,13 @@ fn main() {
         Some("gate") => cmd_gate(Args(args[1..].to_vec())),
         Some("figures") => cmd_figures(Args(args[1..].to_vec())),
         Some("machine") => cmd_machine(),
+        // The binary's stamp of the engine it was built from and of its
+        // compiler, as every row carries them: for a script that will not
+        // bank a row of a tree with uncommitted changes (`scripts/ooc.sh`).
+        Some("stamp") => {
+            println!("{} {}", run::sha(), run::rustc());
+            0
+        }
         _ => {
             eprintln!("{USAGE}");
             2
@@ -296,7 +337,10 @@ fn cmd_ab(a: Args) -> i32 {
                 return 2;
             }
         },
-        None => run::Passes::all(),
+        // Every pass a pairing has always run: the recovery workloads are
+        // two stores more an arm a rep, and a pairing runs them when it
+        // names them.
+        None => run::Passes::paired(),
     };
     // The bound first, before the machine capture and the plan's threads:
     // a cgroup v1 move takes the whole thread group, and the pairing's
@@ -326,6 +370,14 @@ fn cmd_ab(a: Args) -> i32 {
     } else if a.has("--one-process") {
         plan.fresh_process = false;
     }
+    if plan.bound.is_some() && !plan.fresh_process {
+        eprintln!("bench ab: {ONE_PROCESS_BOUND}");
+        return 2;
+    }
+    // The test's seam: memory this process touches and holds for the
+    // pairing's length, which no pass's bound may see
+    // (`tests/bound_isolation.rs`).
+    let _ballast = run::parent_ballast();
     if let Some(l) = a.num("--len") {
         plan.scan_len = (l as usize).max(1);
     }
@@ -359,7 +411,7 @@ fn cmd_ab(a: Args) -> i32 {
             Some(b) => format!(", under a bound of {b} bytes"),
             None => String::new(),
         },
-        if plan.passes == run::Passes::all() {
+        if plan.passes == run::Passes::paired() {
             String::new()
         } else {
             format!(", passes {}", a.get("--passes").unwrap_or_default())
@@ -813,6 +865,10 @@ fn cmd_run(a: Args) -> i32 {
         plan.fresh_process = true;
     } else if a.has("--one-process") {
         plan.fresh_process = false;
+    }
+    if plan.bound.is_some() && !plan.fresh_process {
+        eprintln!("bench run: {ONE_PROCESS_BOUND}");
+        return 2;
     }
 
     // The rungs, not just the top: with a bottom set, the top alone does not
