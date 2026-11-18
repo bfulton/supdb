@@ -5864,9 +5864,6 @@ const RUN_FAULT_TWICE: u8 = 4;
 const RUN_FAULT_SHORT: u8 = 5;
 /// The bits of `AlignedWriter::fault` a test's seam sets.
 const RUN_FAULT_SEAM: u8 = 0x07;
-/// A test's writeback error is set on the writer (`HelperFault`): every
-/// sync asks whether it reaches the writer's description.
-const RUN_FAULT_WB: u8 = 0x10;
 /// Bytes handed to the writer are owed to the file (`AlignedWriter::owe`):
 /// set where a write of them fails, cleared by the cold sync that pays
 /// them (`SegmentWriter::sync_attended`). Set, it says only that the
@@ -5984,9 +5981,6 @@ struct AlignedWriter {
     owed_to: u64,
     /// `SegmentOptions::fail_helper_syncs`, handed to the helper.
     fail_helper: Option<std::sync::Arc<AtomicU64>>,
-    /// `SegmentOptions::helper_fault`, handed to the helper and asked by
-    /// the writer's syncs (`RUN_FAULT_WB`).
-    helper_fault: Option<std::sync::Arc<HelperFault>>,
 }
 
 /// The pieces of the key section the helper hashed: `crcs[i]` is the CRC
@@ -6029,7 +6023,6 @@ impl AlignedWriter {
             helper_hashes: true,
             fault: 0,
             fail_helper: None,
-            helper_fault: None,
             defers: false,
             held_err: None,
             owed_to: 0,
@@ -6366,14 +6359,6 @@ impl AlignedWriter {
             if self.helper_done || self.written < self.ahead {
                 return Ok(());
             }
-            // The helper's own open file description of the file, so that a
-            // writeback error its fdatasync meets is reported to the
-            // writer's own as well (`helper_description`). Where it cannot
-            // be had, there is no helper: the writer syncs and hashes alone.
-            let Ok(desc) = self.helper_description() else {
-                self.helper_done = true;
-                return Ok(());
-            };
             let hands_over = self.helper_hashes && self.own_on;
             let own = if hands_over {
                 self.own_row_so_far()
@@ -6383,40 +6368,19 @@ impl AlignedWriter {
             if self.helper_hashes {
                 self.own_on = false;
             }
-            let section = if self.helper_hashes {
-                self.section
-            } else {
-                None
-            };
-            let (flushes, hashed) = (self.flushes.clone(), self.hashed.clone());
-            // A test's seams choose the thread's body, so a writer with none
-            // spawns the thread it always did.
-            self.helper = Some(
-                if self.fail_helper.is_some() || self.helper_fault.is_some() {
-                    WriterHelper::spawn::<true>(
-                        desc,
-                        self.ahead,
-                        self.synced,
-                        section,
-                        flushes,
-                        hashed,
-                        Some(HelperSeams {
-                            fail: self.fail_helper.clone(),
-                            fault: self.helper_fault.clone(),
-                        }),
-                    )
+            self.helper = Some(WriterHelper::spawn(
+                &self.file,
+                self.ahead,
+                self.synced,
+                if self.helper_hashes {
+                    self.section
                 } else {
-                    WriterHelper::spawn::<false>(
-                        desc,
-                        self.ahead,
-                        self.synced,
-                        section,
-                        flushes,
-                        hashed,
-                        None,
-                    )
-                }?,
-            );
+                    None
+                },
+                self.flushes.clone(),
+                self.hashed.clone(),
+                self.fail_helper.clone(),
+            )?);
             // The pieces the writer hashed before the helper ran are the
             // helper's row's prefix, and the helper hashes on from there.
             if let Some(own) = own {
@@ -6431,29 +6395,11 @@ impl AlignedWriter {
         Ok(())
     }
 
-    /// The file opened again for the helper thread, a second open file
-    /// description of it (`/proc/self/fd`, which reopens a memory file as
-    /// well), where a duplicate of the writer's descriptor would share the
-    /// writer's: Linux reports a writeback error to the first fdatasync of
-    /// each description that runs after it, so with one description
-    /// between them the helper's fdatasync could take the error and the
-    /// writer's, returning first, answer `Ok` before the helper had stored
-    /// it. One open where the helper is spawned; its syncs and reads go
-    /// through it, and it is closed with the thread.
-    fn helper_description(&self) -> std::io::Result<File> {
-        if self.helper_fault.as_ref().is_some_and(|f| f.refuses()) {
-            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
-        }
-        reopen(&self.file)
-    }
-
     /// The writer synced the file itself, to its end: nothing on it is the
     /// thread's to sync -- unless the thread's own fdatasync failed before
-    /// it: that failure is the sync's answer, and nothing counts as synced.
-    /// The thread syncs on a description of its own, so the writer's
-    /// fdatasync is told of the same writeback error whether or not the
-    /// thread has stored its word yet; the word answers it where the
-    /// writer's description was not told.
+    /// it, which the writer's, on the same open file description, does not
+    /// report: that failure is the sync's answer, and nothing counts as
+    /// synced.
     fn synced_all(&mut self) -> std::io::Result<()> {
         if let Some(h) = &self.helper {
             let code = h.shared.error.load(AtomicOrdering::Acquire);
@@ -6844,8 +6790,7 @@ fn start_writeback(file: &File, at: u64, len: u64) {
 
 /// The thread behind a segment's writer (`SegmentOptions::sync_ahead`):
 /// it syncs the file whenever `ahead` bytes are on it past what is synced,
-/// an fdatasync on an open file description of its own
-/// (`AlignedWriter::helper_description`), so the fsync that
+/// an fdatasync on a dup of the writer's descriptor, so the fsync that
 /// closes the segment finds the device holding all but the last pieces;
 /// and it hashes the key section's checksum pieces as they land, read
 /// back from the page cache, so the finish takes its row from the thread
@@ -6864,8 +6809,8 @@ fn start_writeback(file: &File, at: u64, len: u64) {
 ///
 /// The thread parks between pieces and is woken by each; told to stop, it
 /// hashes to the section's end and exits. An fdatasync that fails is kept
-/// for the writer's next sync and for `finish`, each of which answers it
-/// whatever its own fdatasync returns; a read that fails
+/// for `finish`, since a dup shares the descriptor's error with the
+/// writer's own fsync, which would then report nothing; a read that fails
 /// ends the hashing where it is, and the finish reads the rest itself.
 struct WriterHelper {
     shared: std::sync::Arc<HelperShared>,
@@ -6900,70 +6845,17 @@ impl HelperShared {
     }
 }
 
-/// A test's seams handed to a helper thread: `None` to the thread of
-/// every writer but a test's.
-struct HelperSeams {
-    fail: Option<std::sync::Arc<AtomicU64>>,
-    fault: Option<std::sync::Arc<HelperFault>>,
-}
-
-impl HelperSeams {
-    #[cold]
-    #[inline(never)]
-    fn sync(&self, dup: &File) -> std::io::Result<()> {
-        if self.fail.is_some() {
-            return Err(std::io::Error::from_raw_os_error(libc::EIO));
-        }
-        match &self.fault {
-            Some(f) => f.helper_sync(dup),
-            None => dup.sync_data(),
-        }
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn counted(&self) {
-        if let Some(c) = &self.fail {
-            c.fetch_add(1, AtomicOrdering::Release);
-        }
-        if let Some(f) = &self.fault {
-            f.failed.fetch_add(1, AtomicOrdering::Release);
-        }
-    }
-
-    fn sync_at_stop(&self) -> bool {
-        self.fault.as_ref().is_some_and(|f| f.armed())
-    }
-
-    /// Where the test asks it, the thread begins only once a stop is
-    /// asked (`HelperFault::start_after_stop`).
-    #[cold]
-    #[inline(never)]
-    fn start(&self, s: &HelperShared) {
-        if self
-            .fault
-            .as_ref()
-            .is_some_and(|f| f.after_stop.load(AtomicOrdering::Acquire))
-        {
-            while !s.stop.load(AtomicOrdering::Acquire) {
-                std::thread::park();
-            }
-        }
-    }
-}
-
 impl WriterHelper {
-    /// The thread, with a test's `seams` where `SEAMED` (`HelperSeams::start`
-    /// before its loop) and with none otherwise.
-    fn spawn<const SEAMED: bool>(
-        dup: File,
+    fn spawn(
+        file: &File,
         ahead: u64,
         synced: u64,
         section: Option<u64>,
         flushes: std::sync::Arc<AtomicU64>,
         hashed: std::sync::Arc<AtomicU64>,
-        seams: Option<HelperSeams>,
+        fail: Option<std::sync::Arc<AtomicU64>>,
     ) -> std::io::Result<WriterHelper> {
+        let dup = file.try_clone()?;
         let shared = std::sync::Arc::new(HelperShared {
             landed: AtomicU64::new(synced),
             synced: AtomicU64::new(synced),
@@ -6982,21 +6874,14 @@ impl WriterHelper {
         let s = shared.clone();
         let thread = std::thread::Builder::new()
             .name("supdb-helper".into())
-            .spawn(move || {
-                if SEAMED {
-                    if let Some(m) = &seams {
-                        m.start(&s);
-                    }
-                }
-                WriterHelper::run(&s, &dup, ahead, seams.as_ref())
-            })?;
+            .spawn(move || WriterHelper::run(&s, &dup, ahead, fail.as_deref()))?;
         Ok(WriterHelper {
             shared,
             thread: Some(thread),
         })
     }
 
-    fn run(s: &HelperShared, dup: &File, ahead: u64, seams: Option<&HelperSeams>) {
+    fn run(s: &HelperShared, dup: &File, ahead: u64, fail: Option<&AtomicU64>) {
         use std::os::unix::fs::FileExt;
         let piece = 1u64 << flatindex::PIECE_SHIFT;
         let mut buf = vec![0u8; 1 << 20];
@@ -7031,14 +6916,13 @@ impl WriterHelper {
             // No sync begins once a stop is asked: the fsync that closes
             // the segment covers what is left, and the finish waits for the
             // join.
-            if (!stop || seams.is_some_and(HelperSeams::sync_at_stop))
-                && landed.saturating_sub(synced) >= ahead
-            {
+            if !stop && landed.saturating_sub(synced) >= ahead {
                 // A test's failure stands in for the fdatasync, as a device
-                // error the helper's sync met leaves the range unsynced.
-                let r = match seams {
-                    Some(m) => m.sync(dup),
-                    None => dup.sync_data(),
+                // error the dup's sync consumed leaves the range unsynced.
+                let r = if fail.is_some() {
+                    Err(std::io::Error::from_raw_os_error(libc::EIO))
+                } else {
+                    dup.sync_data()
                 };
                 if let Err(e) = r {
                     let code = e.raw_os_error().unwrap_or(libc::EIO);
@@ -7048,11 +6932,11 @@ impl WriterHelper {
                         AtomicOrdering::AcqRel,
                         AtomicOrdering::Acquire,
                     );
-                    // Counted after the error is stored: a test that sees
-                    // the count sees the error.
-                    if let Some(m) = seams {
-                        m.counted();
-                    }
+                }
+                // Counted after the error is stored: a test that sees the
+                // count sees the error.
+                if let Some(c) = fail {
+                    c.fetch_add(1, AtomicOrdering::Release);
                 }
                 s.synced.fetch_max(landed, AtomicOrdering::AcqRel);
                 s.flushes.fetch_add(1, AtomicOrdering::Relaxed);
@@ -7475,10 +7359,6 @@ impl SegmentWriter {
         );
         out.set_row_on_write(opts.row_on_write);
         out.fail_helper = opts.fail_helper_syncs.clone();
-        if let Some(f) = &opts.helper_fault {
-            out.helper_fault = Some(f.clone());
-            out.fault |= RUN_FAULT_WB;
-        }
         // The header region stays zero until `finish`, so a segment that
         // was never finished is a file no reader accepts rather than a
         // segment with some of its keys.
@@ -7782,18 +7662,9 @@ impl SegmentWriter {
                 return Err(e);
             }
         }
-        let mut fail = self.out.fault & RUN_FAULT_SEAM == RUN_FAULT_SYNC;
+        let fail = self.out.fault & RUN_FAULT_SEAM == RUN_FAULT_SYNC;
         if fail {
             self.out.fault &= !RUN_FAULT_SEAM;
-        }
-        // A test's writeback error that a helper met on another description
-        // is this sync's as well, as Linux reports it.
-        if self.out.fault & RUN_FAULT_WB != 0 {
-            fail |= self
-                .out
-                .helper_fault
-                .as_ref()
-                .is_some_and(|f| f.reaches(self.out.get_ref()));
         }
         self.sync_with(fail)?;
         self.out.paid();
@@ -8925,190 +8796,10 @@ pub struct SegmentOptions {
     pub prefault: bool,
     /// A test's: every fdatasync the helper thread of a writer made with
     /// these options would issue is skipped and reported as `EIO`, as a
-    /// device error the helper's fdatasync met would be, and each is
+    /// device error the dup's fdatasync consumed would be, and each is
     /// counted here once its error is stored. `None` but in a test.
     #[doc(hidden)]
     pub fail_helper_syncs: Option<std::sync::Arc<AtomicU64>>,
-    /// A test's: a writeback error the helper thread's fdatasync meets,
-    /// reported as Linux reports one (`HelperFault`). `None` but in a test.
-    #[doc(hidden)]
-    pub helper_fault: Option<std::sync::Arc<HelperFault>>,
-}
-
-/// A test's stand-in for a writeback error on a segment's file, met by its
-/// helper thread's fdatasync and reported as Linux reports one: once to
-/// each open file description whose fdatasync runs after it, so a second
-/// fdatasync on the description that met it answers `Ok` and one on any
-/// other description answers the error. The helper's syncs fail while it
-/// is armed, each standing in for a sync that met the error on the
-/// helper's description, and the writer's sync of the file answers the
-/// error where its description is another (`kcmp`), whether or not the
-/// helper has stored its error yet; a writer told keeps the failure
-/// itself (`RUN_ATTN_LOST`) and asks the seam nothing after, so the seam
-/// keeps no record of whom it told. Held (`hold_store`), the helper waits
-/// between its fdatasync's return and the store of its error. Free when
-/// unset: a writer with none asks nothing of it.
-#[doc(hidden)]
-#[derive(Debug, Default)]
-pub struct HelperFault {
-    armed: std::sync::atomic::AtomicBool,
-    hold: std::sync::atomic::AtomicBool,
-    in_window: std::sync::atomic::AtomicBool,
-    refuse: std::sync::atomic::AtomicBool,
-    refused: AtomicU64,
-    failed: AtomicU64,
-    after_stop: std::sync::atomic::AtomicBool,
-    /// A duplicate of the description the error was reported to, the
-    /// helper's.
-    met: std::sync::Mutex<Option<File>>,
-}
-
-impl HelperFault {
-    /// The helper's fdatasyncs fail while `on`; an armed helper also takes
-    /// a sync that is due when the finish asks it to stop, so a test's
-    /// failure is met whatever the thread's timing.
-    pub fn arm(&self, on: bool) {
-        self.armed.store(on, AtomicOrdering::Release);
-    }
-
-    /// The helper waits, after its failed fdatasync returns and before it
-    /// stores the error, while `on`.
-    pub fn hold_store(&self, on: bool) {
-        self.hold.store(on, AtomicOrdering::Release);
-    }
-
-    /// Whether the helper is waiting there.
-    pub fn in_window(&self) -> bool {
-        self.in_window.load(AtomicOrdering::Acquire)
-    }
-
-    /// The helper's syncs that failed, counted once each error is stored.
-    pub fn failed(&self) -> u64 {
-        self.failed.load(AtomicOrdering::Acquire)
-    }
-
-    /// The helper thread begins only once the finish has asked it to stop,
-    /// while `on`, so its every sync is one an armed helper takes at the
-    /// stop.
-    pub fn start_after_stop(&self, on: bool) {
-        self.after_stop.store(on, AtomicOrdering::Release);
-    }
-
-    /// The helper's own open of the file fails, as it would with no
-    /// `/proc` mounted.
-    pub fn refuse_reopen(&self, on: bool) {
-        self.refuse.store(on, AtomicOrdering::Release);
-    }
-
-    fn armed(&self) -> bool {
-        self.armed.load(AtomicOrdering::Acquire)
-    }
-
-    /// How many times the helper's open was refused.
-    pub fn refused(&self) -> u64 {
-        self.refused.load(AtomicOrdering::Acquire)
-    }
-
-    fn refuses(&self) -> bool {
-        let r = self.refuse.load(AtomicOrdering::Acquire);
-        if r {
-            self.refused.fetch_add(1, AtomicOrdering::AcqRel);
-        }
-        r
-    }
-
-    /// The helper's fdatasync over `dup`, failed while armed: the error is
-    /// reported to `dup`'s description, and the thread waits where held.
-    fn helper_sync(&self, dup: &File) -> std::io::Result<()> {
-        if !self.armed() {
-            return dup.sync_data();
-        }
-        *self.met.lock().unwrap_or_else(|e| e.into_inner()) = Some(dup.try_clone()?);
-        if self.hold.load(AtomicOrdering::Acquire) {
-            self.in_window.store(true, AtomicOrdering::Release);
-            while self.hold.load(AtomicOrdering::Acquire) {
-                std::thread::sleep(std::time::Duration::from_micros(200));
-            }
-            self.in_window.store(false, AtomicOrdering::Release);
-        }
-        Err(std::io::Error::from_raw_os_error(libc::EIO))
-    }
-
-    /// Whether the writer's fdatasync of `file` is answered the error: a
-    /// helper met one on a description that is not `file`'s.
-    fn reaches(&self, file: &File) -> bool {
-        let met = self.met.lock().unwrap_or_else(|e| e.into_inner());
-        met.as_ref().is_some_and(|m| !same_description(file, m))
-    }
-}
-
-/// `file` opened again, read-only, as a new open file description of the
-/// same file: through `/proc/self/fd/<fd>` on Linux, a path built on the
-/// stack; a duplicate of the descriptor elsewhere.
-fn reopen(file: &File) -> std::io::Result<File> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::{AsRawFd, FromRawFd};
-        let mut path = *b"/proc/self/fd/\0\0\0\0\0\0\0\0\0\0\0\0";
-        let mut digits = [0u8; 10];
-        let (mut fd, mut n) = (file.as_raw_fd() as u32, 0);
-        loop {
-            digits[n] = b'0' + (fd % 10) as u8;
-            n += 1;
-            fd /= 10;
-            if fd == 0 {
-                break;
-            }
-        }
-        for i in 0..n {
-            path[14 + i] = digits[n - 1 - i];
-        }
-        // SAFETY: `path` is a NUL-terminated string on the stack; the
-        // descriptor returned is ours alone.
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr() as *const libc::c_char,
-                libc::O_RDONLY | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: a descriptor just opened, owned by nothing else.
-        Ok(unsafe { File::from_raw_fd(fd) })
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        file.try_clone()
-    }
-}
-
-/// Whether two files are one open file description (`kcmp`'s
-/// `KCMP_FILE`).
-fn same_description(a: &File, b: &File) -> bool {
-    use std::os::unix::io::AsRawFd;
-    #[cfg(target_os = "linux")]
-    {
-        const KCMP_FILE: libc::c_int = 0;
-        let pid = std::process::id() as libc::pid_t;
-        // SAFETY: compares two of this process's descriptors; no memory.
-        let r = unsafe {
-            libc::syscall(
-                libc::SYS_kcmp,
-                pid,
-                pid,
-                KCMP_FILE,
-                a.as_raw_fd() as libc::c_ulong,
-                b.as_raw_fd() as libc::c_ulong,
-            )
-        };
-        assert!(r >= 0, "kcmp: {}", std::io::Error::last_os_error());
-        r == 0
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        a.as_raw_fd() == b.as_raw_fd()
-    }
 }
 
 impl Default for SegmentOptions {
@@ -9125,7 +8816,6 @@ impl Default for SegmentOptions {
             lookahead: true,
             prefault: false,
             fail_helper_syncs: None,
-            helper_fault: None,
         }
     }
 }
@@ -30768,7 +30458,7 @@ impl Db {
                 w.reserve_keys(hint, hint * 16);
             }
             w.set_marks(true);
-            w.0.out.fault |= std::mem::take(&mut self.run_fault_open);
+            w.0.out.fault = std::mem::take(&mut self.run_fault_open);
             // The directory barrier a rotation owes its new file is not
             // asked apart, as `Db::sync` does not ask it: a loose rotation
             // owes it with its file in `loose_wals`, and a chained one pays
@@ -44821,85 +44511,6 @@ mod streaming_writes {
         blob.read_all(b"key-00001234", |v| got.push(v.to_vec()))
             .unwrap();
         assert_eq!(got, vec![format!("value-{:0100}", 1234).into_bytes()]);
-    }
-
-    /// A seamed helper's syncs that succeed count as no failure: the seam
-    /// counts a sync only once its error is stored, so a test that waits
-    /// for the count waits for a failure.
-    #[test]
-    fn an_unarmed_seams_helper_counts_no_failure() {
-        let dir = fresh("unarmed-helper");
-        let fault = std::sync::Arc::new(HelperFault::default());
-        let sopts = SegmentOptions {
-            write_piece: 4096,
-            sync_ahead: 16384,
-            helper_fault: Some(fault.clone()),
-            ..Default::default()
-        };
-        let path = dir.join("seg.sup");
-        let mut w = SegmentWriter::create(&path, &sopts).unwrap();
-        w.set_inline_max(256);
-        let (flushes, _) = w.helper_counts();
-        for i in 0..3000u32 {
-            let key = format!("key-{i:08}");
-            w.begin(key.as_bytes()).unwrap();
-            w.value(format!("value-{i:0100}").as_bytes());
-            w.end_with(false).unwrap();
-            if i == 1000 || i == 2000 {
-                let t = std::time::Instant::now();
-                let want = if i == 1000 { 1 } else { 2 };
-                while flushes.load(AtomicOrdering::Relaxed) < want {
-                    assert!(
-                        t.elapsed() < std::time::Duration::from_secs(10),
-                        "the helper never synced the pieces on the file"
-                    );
-                    std::thread::yield_now();
-                }
-            }
-        }
-        assert_eq!(
-            fault.failed(),
-            0,
-            "the helper's {} syncs succeeded",
-            flushes.load(AtomicOrdering::Relaxed)
-        );
-        w.finish(1).unwrap();
-        assert_eq!(fault.failed(), 0, "nor did the finish count one");
-    }
-
-    /// A writer whose helper cannot open the file goes on hashing its own
-    /// row, so the finish has nothing of the section to read back.
-    #[test]
-    fn a_writer_with_no_helper_keeps_its_own_row() {
-        let dir = fresh("no-helper-row");
-        let fault = std::sync::Arc::new(HelperFault::default());
-        fault.refuse_reopen(true);
-        let sopts = SegmentOptions {
-            write_piece: 4096,
-            sync_ahead: 16384,
-            helper_fault: Some(fault.clone()),
-            ..Default::default()
-        };
-        let path = dir.join("seg.sup");
-        let mut w = SegmentWriter::create(&path, &sopts).unwrap();
-        w.set_inline_max(256);
-        for i in 0..3000u32 {
-            let key = format!("key-{i:08}");
-            w.begin(key.as_bytes()).unwrap();
-            w.value(format!("value-{i:0100}").as_bytes());
-            w.end_with(false).unwrap();
-        }
-        assert_eq!(fault.refused(), 1, "the helper's open was asked for");
-        assert!(w.out.helper.is_none(), "no helper runs");
-        assert!(w.out.own_on, "the writer hashes its own row still");
-        assert!(
-            w.out.own_row.len() >= 8,
-            "the writer's row holds the section's pieces so far, not {}",
-            w.out.own_row.len()
-        );
-        w.finish(1).unwrap();
-        let blob = crate::blob::Blob::open(crate::bytes::MmapBytes::open(&path).unwrap()).unwrap();
-        assert_eq!(blob.count(b"key-00002999").unwrap(), 1);
     }
 
     /// The row the helper hashes as the pieces land is the row a re-read

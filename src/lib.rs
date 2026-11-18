@@ -111,6 +111,6 @@ pub use db::vault::{
 };
 #[cfg(not(target_family = "wasm"))]
 pub use db::{
-    BackgroundIo, Db, Encryption, HelperFault, Isolation, Options, ReadAdvice, Reader,
-    SegmentOptions, SegmentWrite, SegmentWriter, SyncPolicy, Txn, Upkeep, ZInject, ZPages,
+    BackgroundIo, Db, Encryption, Isolation, Options, ReadAdvice, Reader, SegmentOptions,
+    SegmentWrite, SegmentWriter, SyncPolicy, Txn, Upkeep, ZInject, ZPages,
 };
