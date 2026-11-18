@@ -3514,6 +3514,12 @@ them all and leaves a test no hold to forget, and a copy of a store
 nothing holds open, or one a hold of the test's already keeps from
 landing, says so at its call (`copy_closed`, `copy_held`). The pause's
 mutant is the whole binary run four at a time with the pause taken out.
+And as a clock: a test that held a seal's fsyncs on a timer asserted
+that the flush published the segment within the first half of it, and
+a busy box took longer; the thread that sees the publish lifts the hold
+now. And as a read at an answer: a flush answers a stopped queue without
+waiting for the seal job of the run it closed, whose presync runs on a
+thread of its own, and the test read the presync's record at the answer.
 The rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; and a mutant's kill is read again

@@ -1650,7 +1650,7 @@ fn run_tmp_name(d: &Path) -> std::ffi::OsString {
 fn power_cut(db: &Db, d: &Path, crash: &Path, ino: u64, synced: u64) {
     use std::os::unix::fs::MetadataExt;
     let (log, log_synced, _) = db.wal_durable();
-    copy_live(&db, d, crash);
+    copy_live(db, d, crash);
     for e in std::fs::read_dir(d).unwrap() {
         let e = e.unwrap();
         if e.metadata().map(|m| m.ino()).ok() == Some(ino) {
@@ -2214,7 +2214,9 @@ fn a_marked_segments_failed_sync_is_every_later_syncs_answer() {
     match rx.recv_timeout(std::time::Duration::from_secs(60)) {
         Ok(Ok(())) => {}
         Ok(Err(p)) => std::panic::resume_unwind(p),
-        Err(_) => panic!("the writer made no progress for a minute: a write after its held failure loops"),
+        Err(_) => {
+            panic!("the writer made no progress for a minute: a write after its held failure loops")
+        }
     }
 }
 
@@ -7792,11 +7794,14 @@ fn every_arm_that_writes_a_slot_keeps_the_last_durable_one() {
 /// the crossing from the state a crash leaves, not only from a close. The
 /// crossings' power cuts, a rename left without its directory fsync among
 /// them, are the rename section's (`a_store_moved_slots_rename_slots_*`).
+/// Each life publishes once more or not, so the slot a life under the slots
+/// leaves newest is `manifest` in some runs and `manifest.alt` in others,
+/// and each crossing's open is killed again before its life publishes.
 #[test]
 fn a_store_moved_between_the_manifest_shapes_keeps_its_writes() {
-    for spare in [false, true] {
-        let d = dir(&format!("os-shapes-{spare}"));
-        let k = dir(&format!("os-shapes-{spare}-kill"));
+    for (spare, extra) in [(false, false), (false, true), (true, false), (true, true)] {
+        let d = dir(&format!("os-shapes-{spare}-{extra}"));
+        let k = dir(&format!("os-shapes-{spare}-{extra}-kill"));
         let slots = os_opts(&Options::default());
         let rename = Options {
             manifest_slots: false,
@@ -7815,6 +7820,14 @@ fn a_store_moved_between_the_manifest_shapes_keeps_its_writes() {
             );
             db.flush().unwrap();
             db.settle().unwrap();
+            if extra {
+                let one = format!("extra-{r}").into_bytes();
+                db.put(&one, b"E");
+                db.commit().unwrap();
+                db.flush().unwrap();
+                db.settle().unwrap();
+                model.insert(one, b"E".to_vec());
+            }
             // The kill: one write past the flush, acknowledged by its
             // synced commit, then the files as they stand.
             let late = format!("late-{r}").into_bytes();
@@ -7823,13 +7836,15 @@ fn a_store_moved_between_the_manifest_shapes_keeps_its_writes() {
             model.insert(late, b"L".to_vec());
             copy_live(&db, &d, &k);
             let killed = Db::open(&k, opts.clone()).unwrap_or_else(|e| {
-                panic!("spare {spare}, round {r}: the kill opened under the other shape: {e}")
+                panic!(
+                    "spare {spare}, extra {extra}, round {r}: the kill under the other shape: {e}"
+                )
             });
             for (key, v) in &model {
                 assert_eq!(
                     read_vec(&killed, key),
                     vec![v.clone()],
-                    "spare {spare}, round {r}: the kill under the other shape"
+                    "spare {spare}, extra {extra}, round {r}: the kill under the other shape"
                 );
             }
             drop(killed);
@@ -7839,9 +7854,23 @@ fn a_store_moved_between_the_manifest_shapes_keeps_its_writes() {
                 assert_eq!(
                     read_vec(&db, k),
                     vec![v.clone()],
-                    "spare {spare}, round {r}"
+                    "spare {spare}, extra {extra}, round {r}"
                 );
             }
+            // Killed again at once, before this life has published: what
+            // the crossing's open left on its own is the store.
+            copy_live(&db, &d, &k);
+            let killed = Db::open(&k, opts.clone()).unwrap_or_else(|e| {
+                panic!("spare {spare}, extra {extra}, round {r}: the kill after the crossing: {e}")
+            });
+            for (key, v) in &model {
+                assert_eq!(
+                    read_vec(&killed, key),
+                    vec![v.clone()],
+                    "spare {spare}, extra {extra}, round {r}: the kill after the crossing"
+                );
+            }
+            drop(killed);
         }
         drop(db);
         let _ = std::fs::remove_dir_all(&d);
@@ -8054,9 +8083,11 @@ fn os_page_kept_unwritten(path: &Path) -> Option<bool> {
 /// may have left in the page cache alone, and the other, which a kill may
 /// have left torn in the cache over a record the device still holds whole.
 /// Held by the calls themselves (`Db::trace_dir_io`), wherever the test
-/// runs, and by the kernel's own word on each slot file's page where it
-/// says, with a file the open never touches, written the same way, the
-/// control that the instrument sees a page not yet written back.
+/// runs, and by the kernel's own word on each slot file's page -- its page
+/// flags where the process may read them, the page cache's drop of clean
+/// pages where it may not (`os_page_kept_unwritten`) -- with a file the
+/// open never touches, written the same way, the control that the
+/// instrument sees a page not yet written back.
 fn an_open_syncs_its_slot(tag: &str, base: Options) {
     use std::os::unix::fs::FileExt;
     let opts = os_opts(&base);
@@ -12429,7 +12460,7 @@ fn dl_power_cut(db: &Db, d: &Path, crash: &Path, lives: &[&[(PathBuf, Option<u64
     use std::os::unix::fs::MetadataExt;
     let synced = db.run_device_synced().expect("the run is open").0;
     let ino = (open_run(d)).then(|| run_ino(d));
-    copy_live(&db, d, crash);
+    copy_live(db, d, crash);
     if let Some(ino) = ino {
         for e in std::fs::read_dir(d).unwrap() {
             let e = e.unwrap();
@@ -15608,7 +15639,9 @@ fn a_fallback_past_a_slot_whose_log_retired_is_refused() {
     assert!(
         cov_old < cov_new
             && old_names.iter().all(|(n, _)| c.join(n).exists())
-            && new_names.iter().any(|n| !old_names.iter().any(|(o, _)| o == n)),
+            && new_names
+                .iter()
+                .any(|n| !old_names.iter().any(|(o, _)| o == n)),
         "premise: the older slot covers less, names files in place, and \
          not the piece: {old_names:?} at {cov_old} beside {new_names:?} at {cov_new}"
     );
@@ -15724,7 +15757,10 @@ fn a_pause_asked_inside_a_landing_returns_after_it() {
     wait_for("the merge at its landing hold", || {
         db.merge_waits_at_landing()
     });
-    let (inside, go) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let (inside, go) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
     let watch: supdb::db::SlotWatch = {
         let (inside, go) = (inside.clone(), go.clone());
         Arc::new(move |_: &supdb::db::SlotWrite| {
