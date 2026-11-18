@@ -6383,20 +6383,40 @@ impl AlignedWriter {
             if self.helper_hashes {
                 self.own_on = false;
             }
-            self.helper = Some(WriterHelper::spawn(
-                desc,
-                self.ahead,
-                self.synced,
-                if self.helper_hashes {
-                    self.section
+            let section = if self.helper_hashes {
+                self.section
+            } else {
+                None
+            };
+            let (flushes, hashed) = (self.flushes.clone(), self.hashed.clone());
+            // A test's seams choose the thread's body, so a writer with none
+            // spawns the thread it always did.
+            self.helper = Some(
+                if self.fail_helper.is_some() || self.helper_fault.is_some() {
+                    WriterHelper::spawn::<true>(
+                        desc,
+                        self.ahead,
+                        self.synced,
+                        section,
+                        flushes,
+                        hashed,
+                        Some(HelperSeams {
+                            fail: self.fail_helper.clone(),
+                            fault: self.helper_fault.clone(),
+                        }),
+                    )
                 } else {
-                    None
-                },
-                self.flushes.clone(),
-                self.hashed.clone(),
-                self.fail_helper.clone(),
-                self.helper_fault.clone(),
-            )?);
+                    WriterHelper::spawn::<false>(
+                        desc,
+                        self.ahead,
+                        self.synced,
+                        section,
+                        flushes,
+                        hashed,
+                        None,
+                    )
+                }?,
+            );
             // The pieces the writer hashed before the helper ran are the
             // helper's row's prefix, and the helper hashes on from there.
             if let Some(own) = own {
@@ -6429,9 +6449,11 @@ impl AlignedWriter {
 
     /// The writer synced the file itself, to its end: nothing on it is the
     /// thread's to sync -- unless the thread's own fdatasync failed before
-    /// it, which the writer's, on the same open file description, does not
-    /// report: that failure is the sync's answer, and nothing counts as
-    /// synced.
+    /// it: that failure is the sync's answer, and nothing counts as synced.
+    /// The thread syncs on a description of its own, so the writer's
+    /// fdatasync is told of the same writeback error whether or not the
+    /// thread has stored its word yet; the word answers it where the
+    /// writer's description was not told.
     fn synced_all(&mut self) -> std::io::Result<()> {
         if let Some(h) = &self.helper {
             let code = h.shared.error.load(AtomicOrdering::Acquire);
@@ -6822,7 +6844,8 @@ fn start_writeback(file: &File, at: u64, len: u64) {
 
 /// The thread behind a segment's writer (`SegmentOptions::sync_ahead`):
 /// it syncs the file whenever `ahead` bytes are on it past what is synced,
-/// an fdatasync on a dup of the writer's descriptor, so the fsync that
+/// an fdatasync on an open file description of its own
+/// (`AlignedWriter::helper_description`), so the fsync that
 /// closes the segment finds the device holding all but the last pieces;
 /// and it hashes the key section's checksum pieces as they land, read
 /// back from the page cache, so the finish takes its row from the thread
@@ -6841,8 +6864,8 @@ fn start_writeback(file: &File, at: u64, len: u64) {
 ///
 /// The thread parks between pieces and is woken by each; told to stop, it
 /// hashes to the section's end and exits. An fdatasync that fails is kept
-/// for `finish`, since a dup shares the descriptor's error with the
-/// writer's own fsync, which would then report nothing; a read that fails
+/// for the writer's next sync and for `finish`, each of which answers it
+/// whatever its own fdatasync returns; a read that fails
 /// ends the hashing where it is, and the finish reads the rest itself.
 struct WriterHelper {
     shared: std::sync::Arc<HelperShared>,
@@ -6911,18 +6934,31 @@ impl HelperSeams {
     fn sync_at_stop(&self) -> bool {
         self.fault.as_ref().is_some_and(|f| f.armed())
     }
+
+    /// Where the test asks it, the thread begins only once a stop is
+    /// asked (`HelperFault::start_after_stop`).
+    #[cold]
+    #[inline(never)]
+    fn start(&self, s: &HelperShared) {
+        if self.fault.as_ref().is_some_and(|f| f.after_stop.load(AtomicOrdering::Acquire)) {
+            while !s.stop.load(AtomicOrdering::Acquire) {
+                std::thread::park();
+            }
+        }
+    }
 }
 
 impl WriterHelper {
-    fn spawn(
+    /// The thread, with a test's `seams` where `SEAMED` (`HelperSeams::start`
+    /// before its loop) and with none otherwise.
+    fn spawn<const SEAMED: bool>(
         dup: File,
         ahead: u64,
         synced: u64,
         section: Option<u64>,
         flushes: std::sync::Arc<AtomicU64>,
         hashed: std::sync::Arc<AtomicU64>,
-        fail: Option<std::sync::Arc<AtomicU64>>,
-        fault: Option<std::sync::Arc<HelperFault>>,
+        seams: Option<HelperSeams>,
     ) -> std::io::Result<WriterHelper> {
         let shared = std::sync::Arc::new(HelperShared {
             landed: AtomicU64::new(synced),
@@ -6943,7 +6979,11 @@ impl WriterHelper {
         let thread = std::thread::Builder::new()
             .name("supdb-helper".into())
             .spawn(move || {
-                let seams = (fail.is_some() || fault.is_some()).then_some(HelperSeams { fail, fault });
+                if SEAMED {
+                    if let Some(m) = &seams {
+                        m.start(&s);
+                    }
+                }
                 WriterHelper::run(&s, &dup, ahead, seams.as_ref())
             })?;
         Ok(WriterHelper {
@@ -6991,7 +7031,7 @@ impl WriterHelper {
                 && landed.saturating_sub(synced) >= ahead
             {
                 // A test's failure stands in for the fdatasync, as a device
-                // error the dup's sync consumed leaves the range unsynced.
+                // error the helper's sync met leaves the range unsynced.
                 let r = match seams {
                     Some(m) => m.sync(dup),
                     None => dup.sync_data(),
@@ -8881,7 +8921,7 @@ pub struct SegmentOptions {
     pub prefault: bool,
     /// A test's: every fdatasync the helper thread of a writer made with
     /// these options would issue is skipped and reported as `EIO`, as a
-    /// device error the dup's fdatasync consumed would be, and each is
+    /// device error the helper's fdatasync met would be, and each is
     /// counted here once its error is stored. `None` but in a test.
     #[doc(hidden)]
     pub fail_helper_syncs: Option<std::sync::Arc<AtomicU64>>,
@@ -8897,9 +8937,11 @@ pub struct SegmentOptions {
 /// fdatasync on the description that met it answers `Ok` and one on any
 /// other description answers the error. The helper's syncs fail while it
 /// is armed, each standing in for a sync that met the error on the
-/// helper's description, and the writer's next sync of the file answers
-/// the error where its description is another (`kcmp`), whether or not the
-/// helper has stored its error yet. Held (`hold_store`), the helper waits
+/// helper's description, and the writer's sync of the file answers the
+/// error where its description is another (`kcmp`), whether or not the
+/// helper has stored its error yet; a writer told keeps the failure
+/// itself (`RUN_ATTN_LOST`) and asks the seam nothing after, so the seam
+/// keeps no record of whom it told. Held (`hold_store`), the helper waits
 /// between its fdatasync's return and the store of its error. Free when
 /// unset: a writer with none asks nothing of it.
 #[doc(hidden)]
@@ -8911,10 +8953,10 @@ pub struct HelperFault {
     refuse: std::sync::atomic::AtomicBool,
     refused: AtomicU64,
     failed: AtomicU64,
+    after_stop: std::sync::atomic::AtomicBool,
     /// A duplicate of the description the error was reported to, the
-    /// helper's, and whether it has been reported to another since.
+    /// helper's.
     met: std::sync::Mutex<Option<File>>,
-    told_other: std::sync::atomic::AtomicBool,
 }
 
 impl HelperFault {
@@ -8939,6 +8981,13 @@ impl HelperFault {
     /// The helper's syncs that failed, counted once each error is stored.
     pub fn failed(&self) -> u64 {
         self.failed.load(AtomicOrdering::Acquire)
+    }
+
+    /// The helper thread begins only once the finish has asked it to stop,
+    /// while `on`, so its every sync is one an armed helper takes at the
+    /// stop.
+    pub fn start_after_stop(&self, on: bool) {
+        self.after_stop.store(on, AtomicOrdering::Release);
     }
 
     /// The helper's own open of the file fails, as it would with no
@@ -8982,18 +9031,10 @@ impl HelperFault {
     }
 
     /// Whether the writer's fdatasync of `file` is answered the error: a
-    /// helper met one on a description that is not `file`'s, and it has
-    /// not been reported to another description yet.
+    /// helper met one on a description that is not `file`'s.
     fn reaches(&self, file: &File) -> bool {
         let met = self.met.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(m) = met.as_ref() else {
-            return false;
-        };
-        if self.told_other.load(AtomicOrdering::Acquire) || same_description(file, m) {
-            return false;
-        }
-        self.told_other.store(true, AtomicOrdering::Release);
-        true
+        met.as_ref().is_some_and(|m| !same_description(file, m))
     }
 }
 
@@ -44776,6 +44817,41 @@ mod streaming_writes {
         blob.read_all(b"key-00001234", |v| got.push(v.to_vec()))
             .unwrap();
         assert_eq!(got, vec![format!("value-{:0100}", 1234).into_bytes()]);
+    }
+
+    /// A writer whose helper cannot open the file goes on hashing its own
+    /// row, so the finish has nothing of the section to read back.
+    #[test]
+    fn a_writer_with_no_helper_keeps_its_own_row() {
+        let dir = fresh("no-helper-row");
+        let fault = std::sync::Arc::new(HelperFault::default());
+        fault.refuse_reopen(true);
+        let sopts = SegmentOptions {
+            write_piece: 4096,
+            sync_ahead: 16384,
+            helper_fault: Some(fault.clone()),
+            ..Default::default()
+        };
+        let path = dir.join("seg.sup");
+        let mut w = SegmentWriter::create(&path, &sopts).unwrap();
+        w.set_inline_max(256);
+        for i in 0..3000u32 {
+            let key = format!("key-{i:08}");
+            w.begin(key.as_bytes()).unwrap();
+            w.value(format!("value-{i:0100}").as_bytes());
+            w.end_with(false).unwrap();
+        }
+        assert_eq!(fault.refused(), 1, "the helper's open was asked for");
+        assert!(w.out.helper.is_none(), "no helper runs");
+        assert!(w.out.own_on, "the writer hashes its own row still");
+        assert!(
+            w.out.own_row.len() >= 8,
+            "the writer's row holds the section's pieces so far, not {}",
+            w.out.own_row.len()
+        );
+        w.finish(1).unwrap();
+        let blob = crate::blob::Blob::open(crate::bytes::MmapBytes::open(&path).unwrap()).unwrap();
+        assert_eq!(blob.count(b"key-00002999").unwrap(), 1);
     }
 
     /// The row the helper hashes as the pieces land is the row a re-read

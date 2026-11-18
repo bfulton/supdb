@@ -3875,6 +3875,28 @@ check of the path made before. The corollary: a kept error
 is checked at every path that would sync the same bytes again, the
 background ones included, and not only at the calls that answer the
 caller.
+That check still read the helper's word after the helper had acted on
+it: the helper synced through a duplicate of the writer's descriptor,
+one open file description between them, so a failed fdatasync of the
+helper's took the device's error for both, and a commit whose own
+fdatasync returned in the instant before the helper stored its error
+read the helper's word as clean and was acknowledged over the hole. A
+model of two syncs in flight on one description named the order, and no
+test had built it, since the seam failed the helper's sync by count and
+not by description. The helper opens the file again for itself now
+(`/proc/self/fd`, one open where it is spawned), so the kernel reports
+the error to the writer's description as well, whoever syncs first: on
+this kernel a probe over a loop device on a full tmpfs read the writer's
+fdatasync `Ok` after the duplicate's failed one and the error after its
+own description's. The seam says which description met the error
+(`HelperFault`, `kcmp`) and holds the helper between its syscall and its
+store, which is the window. And the finish's join of the helper, which
+takes its error before a seal's or a merge's segment is renamed into
+place, was held by no test, every test of a failed helper sync being a
+run's; one each now. The corollary: where two threads sync one file and
+either can answer a caller, each syncs through its own open file
+description, since the kernel's error is a description's to consume and
+a word stored after the syscall is a word read too early by the other.
 It came back a fourth time at the presync itself, whose error the flush
 answered: the presync runs on the writer's thread after the seal job is
 handed, the job's fsync of the same description reports nothing of what
