@@ -1,0 +1,85 @@
+An open syncs each slot through the descriptor it read and reads only the segments that can hold an unnamed key
+
+What a caller saw: the open's durability checks from the previous
+fixes were right but each cost more than it needed. Every open opened
+each manifest slot file a second time for its fdatasync, stat-ed every
+named segment beside a directory listing it already had, listed the
+directory three times, and replayed the log before the check that
+could refuse the store, so a refused open had replayed for nothing.
+After a crash that left a merge's outputs unnamed, the open mapped
+every named segment, and every run's segment, to look up one key.
+
+What the fix does:
+- The open fdatasyncs each slot through the handle manifest_read_all
+  opened to read it, so there is no second open and close.
+- A plain store answers "is this named segment there" from one sorted
+  listing of the directory, by binary search. Under a cipher the
+  per-envelope stat (vault::on_device) stays, because the listing there
+  is the vault's names and not the device's.
+- The open's three listings are one.
+- unnamed_refusals runs before the replay.
+- For an unnamed segment's last key, the open maps only the candidates
+  whose name fences take that key in (Db::name_takes; a seg- name, or a
+  name that does not parse, takes every key). It maps each candidate
+  once and stops at the first one that holds the key.
+When nothing fails, the open adds nothing over the previous fixes and
+does fewer syscalls. Nothing is added to a commit, sync, flush, drain,
+seal, rotation, publish or read. Trace notes on the open's paths cost
+one relaxed load each when tracing is off.
+
+Pricing. The measuring tree only (its diff is kept outside the
+repository) carried price_open_cost_old (the open as the previous fixes
+landed it), a bare shape (no slot sync, no named check, no unnamed
+check), and a probe, bench/examples/open_cost.rs <arm> <size> <opens>
+<clean|log|unnamed>, that alternates the shapes over the same files.
+Median open, this fix against the shape it replaces, per sitting:
+- supdb at 10000 keys: 0.98x in both sittings for clean, log and
+  unnamed.
+- supdb and supdb-ingest at 300000 and 3000000 keys:
+  0.97-1.02x, with the signs disagreeing between sittings: level.
+- supdb-ingest at 10000 keys: 0.98-1.01x.
+Syscalls in one open's window (strace -f): 151 against 166 at 10000
+keys clean, and 206 against 234 at 300000 keys unnamed.
+Against the bare open, what the previous fixes still cost:
+- The two slot fdatasyncs, about a quarter of a 10000-key open.
+- After a crash with unnamed merge outputs, about 1.5x the bare open
+  (+18 ms at 300000 keys, +170 ms at 3M).
+The control pairings
+  OUT=... sh bench/scripts/pair.sh supdb supdb-opencostold SIZE --passes load
+  OUT=... sh bench/scripts/pair.sh supdb-ingest supdb-ingestopencostold SIZE --passes load
+at 10000 and 300000 keys, two sittings each, read level: 0.92-1.04x,
+with signs disagreeing and every p >= 0.15. No suite phase opens a
+store, so these pairings only show that the change moves nothing in
+the suite. Both arms were measuring-tree twins of supdb and
+supdb-ingest.
+
+Tests (tests/durable.rs). Five fail on the engine before the fix:
+- each slot file is read and synced through one descriptor, with the
+  same fd and offset, in the clear and under a cipher;
+- a plain open stats no named segment;
+- an open after a crash maps no partition whose fences leave the
+  unnamed key out;
+- an open that refuses an unnamed segment replays no log first.
+Four more hold behaviour:
+- a cipher open looks for each named envelope once;
+- unnamed keys are held by seg- pieces without fences;
+- no pcs- piece is read whose fences leave the key out;
+- a key is held at its range's lower fence.
+Forty-six mutants were run, including the earlier units' mutants on
+these lines. Every behaviour mutant is killed. The survivors are
+cost-only or equivalent: a linear contains for the binary search, the
+listing left unsorted with a linear search, the break after the first
+holder removed, and the check moved within the open but still before
+the replay.
+
+Left open (ROADMAP.md):
+- The unnamed state's residual cost is not attributed by a stamp. It is
+  probably the whole Blob::open of each unnamed segment and holder for
+  one key, which is unverified.
+- Under a cipher the unnamed check does not run, as before.
+- The routing relies on a segment holding only keys its name's fences
+  take in, the invariant reads route by. That is argued, and tested
+  only through the states these tests build.
+- The round that added the lower-fence test changed no source. The
+  descriptor-identity round added only trace calls, and its code was not
+  probed again.

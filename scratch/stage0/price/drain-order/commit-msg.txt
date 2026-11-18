@@ -1,0 +1,68 @@
+A drain's run lands durable at the writer's ask after its presync, priced level, and the presync's seams cost one load
+
+What a caller saw: nothing. The order this holds was landed by an earlier
+commit without a price: a closing run whose records the writer presyncs
+(`SealJob::awaits_writer`) is named durable only at the writer's Drain
+ask, after the presync has returned, so a failed presync stops the seal
+queue before any manifest names the run's segment. That serialises the
+durable landing behind the presync and adds a hop to the writer's ask,
+where the shape before landed the job whenever the seal thread returned.
+
+Priced against that shape (kept in the measuring tree only, as
+`Options::price_drain_order_old` with the arms `supdb-drainorderold` and
+`supdb-ingestdrainorderold`), it costs nothing measurable: the drain's
+stamps put the presync's return and the ask before the seal thread's
+return in 207 of 208 drains, so both shapes land from the ask and the
+landing waits for the seal thread as it did. `strace -f -c` over
+`bench/examples/load_only.rs` read the same file system calls in both
+arms. Pairings (B/A, new against old; no cell marked in either sitting):
+
+  sh bench/scripts/pair.sh supdb supdb-drainorderold {10000,300000} --passes load
+    sitting 1: 10k ordered 1.02, shuffled 0.98; 300k ordered 1.02, shuffled 1.02
+    sitting 2: 10k ordered 0.97, shuffled 1.03; 300k ordered 0.97, shuffled 0.96
+  sh bench/scripts/pair.sh supdb-ingest supdb-ingestdrainorderold {10000,300000} --passes load
+    sitting 1: 10k ordered 0.97, shuffled 0.98; 300k ordered 1.01, shuffled 0.96
+    sitting 2: 10k ordered 1.00, shuffled 0.97; 300k ordered 1.02, shuffled 0.99
+
+With SUPDB_LOAD_PHASES=1 SUPDB_DRAIN_STEPS=1 before the same arms, the
+drain's gap from the later of the fsync and the presync to the join read
+level: durable 10k 76/75 and 91/68 us, 300k 145/176 and 157/152 (a rerun
+139/134 and 117/181); buffered 10k 79/64 and 65/67, 300k 176/172 and
+176/186 (new/old, per sitting). Device bytes were identical.
+
+The presync's two test seams, a hold the writer's presync loaded and a
+failure flag it swapped on every presync -- an atomic read-modify-write
+on the success path -- are one byte now (`Shared::presync_seam`:
+`PRESYNC_FAIL`, `PRESYNC_HOLD`, and `PRESYNC_WAITING`, which a held
+presync sets while it waits), loaded once with Acquire; a nonzero byte
+goes to a cold `seamed_presync`. A presync no test armed does one load
+where it did a load and a swap (read off the source, not counted). A
+debug assertion in `hand_seal` holds that a job awaiting the writer is
+handed only during a drain, whose ask lands it; and a flush cannot send
+no ask after such a hand-over, since `close_direct` waits for room before
+it takes the run and nothing after the take can fail, which a comment in
+`Db::flush` says. CLAUDE.md's presync entry says how the order was priced.
+
+Tests (tests/durable.rs, section drain-order): a drain names its run's
+segment durable before it answers, on the background and the inline
+segment work and under Encryption::Cipher, where a run's commits are log
+frames and there is no writer presync to fail; and the seams held apart
+(a hold and a failure, a failure armed before and under a hold taken at
+the lift, the inline arm's presync not held, an injected failure taken
+once). The drain tests pass on the commit before as well, since no
+behaviour changed, and are not evidence of a fix. Held to 40 mutants
+over four rounds; three survive: the hand_seal assertion deleted (it
+holds by construction, and a caller that hands outside a drain fires
+it), the landing gate restated as `awaits_writer && draining`
+(equivalent under that assertion), and the wedge moved after the
+writer's own record of the failure (two consecutive stores on the
+writer's thread, the second read by the writer alone).
+
+Left open: the durable 300k pairing's readable-landing stamp read longer
+in the new arm in every sitting, before every instruction the arms
+differ in, and no pairing of an arm against its own twin was run to
+read it as position; Encryption::Kernel was not run; the presync path
+was not counted under callgrind.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GEwcALZsCzTm28PHd4bQza
