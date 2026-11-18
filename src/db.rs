@@ -168,9 +168,14 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
 /// loss at n batches: on a crash, replay stops at the first frame that is
 /// torn or missing and the sequence-gap check refuses anything past a
 /// hole, so an unsynced tail of the log is lost whole and never served in
-/// part. An ordered run in the clear closed into a seal still in flight is
-/// the exception, below: a crash may lose its commits while a later commit
-/// to the log survives.
+/// part. An ordered run in the clear is the exception twice, below: one
+/// closed into a seal still in flight may lose its commits to a crash
+/// while a later commit, to the log or of a later run, survives; and a
+/// run's commits that
+/// reach the device before any sync by policy covers them -- by the sync a
+/// thread makes behind the run's writer, by the kernel's writeback, or by
+/// the syncs of a run that closes before any of its commits was due --
+/// may survive a crash that loses older log frames no sync covered.
 ///
 /// It exists because the device was measured serving ~2,700 barriers a
 /// second however they are issued -- sharding cannot scale past 1.6x --
@@ -215,8 +220,21 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
 /// syncs the run's file, and the first of them syncs the log before it
 /// wherever the log owed a sync when the run opened -- frames of tables
 /// frozen before the run or replayed by the open, a file a rotation left
-/// loose -- so a crash that keeps the run's synced commits keeps every
-/// commit before them. A run in
+/// loose -- so a crash that keeps a run's commit the policy synced keeps
+/// every commit of the log before it (not those of a run closed earlier
+/// into a seal still in flight, below); so does the sync of a batch the
+/// run's file owes
+/// that a commit with nothing new for the run, a `sync` or a `flush` makes
+/// whatever the policy. Before that first sync the run's file reaches
+/// the device by other ways the log is not ordered behind: the thread
+/// behind the run's writer fdatasyncs it once the file is
+/// `SegmentOptions::sync_ahead` long, whatever the policy; the kernel
+/// writes back its pages; and a run that closes first has its records
+/// synced by the flush that closes it (`Options::close_presync`) and its
+/// whole file by its seal, neither waiting for the durable landing of a
+/// seal before it. A crash then may keep run commits nothing acknowledged
+/// as durable while it loses older frames of the log, which is not a tail
+/// of the commit order. A run in
 /// the clear closed under `EveryN` -- by any write the run cannot take (an
 /// `append` of a key at or below its greatest, of an empty key or one
 /// longer than `u16::MAX` bytes, or of a value that does not inline; any
@@ -225,7 +243,9 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
 /// held, and its commits since the last sync
 /// are durable once that seal's segment lands and not before: a `sync`
 /// while the seal is in flight does not cover them, and a crash then may
-/// lose them while a later commit to the log survives. Its table marks a
+/// lose them while a later commit survives, to the log or of a run opened
+/// after it, whose first sync syncs the log and nothing of the closed run's
+/// file. Its table marks a
 /// batch before the batch's sync, so a reader sees the batch from its
 /// commit, whatever that commit answers. A write of the run's file the device refuses is answered by
 /// the commit that syncs it -- under `Always` its own, under `EveryN` the
@@ -5102,7 +5122,20 @@ struct Direct {
     /// pays before the run's own (`Db::run_due_log_first`). Nothing writes
     /// the log while a run is open in the clear, so what it owed then is
     /// all it owes; under a cipher the run's due commits sync the log
-    /// behind their own frames (`Db::log_run`) and this stays false.
+    /// behind their own frames (`Db::log_run`) and this stays false. It
+    /// orders the log behind the policy's syncs of the run alone, and the
+    /// sync of a batch the run's file owes that stands in for one
+    /// (`Db::run_again`): the writer's helper thread
+    /// (`SegmentOptions::sync_ahead`), the kernel's writeback, and the
+    /// syncs of a run that closes before its first due commit -- the
+    /// flush's presync of its records, its seal's fsync of the file --
+    /// reach the device without asking it (`ROADMAP.md`). It is of the
+    /// log alone: a run closed before this one into a seal still in flight
+    /// owes its file's unsynced commits to that seal's landing, and this
+    /// run's due commit syncs nothing of it. What is older than the run and
+    /// unsynced is one state, the log's frames and a closed run's file, and
+    /// a note of the second would be read here beside the first; it is not
+    /// taken (`ROADMAP.md`, the sync over a run closed into a seal).
     log_owed: bool,
 }
 
@@ -7691,6 +7724,16 @@ impl SegmentWriter {
     /// nothing; it is kept (`sync_lost`).
     pub(crate) fn owes(&self) -> bool {
         self.out.owed_to > self.out.synced
+    }
+
+    /// Everything handed to the writer owed to the file, as a write that
+    /// failed leaves it (`AlignedWriter::owe`), for a commit whose sync of
+    /// them was never reached: the next call with nothing new for the run
+    /// writes and syncs them (`Db::run_again`).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn owe_unsynced(&mut self) {
+        self.out.owe();
     }
 
     /// Whether the writer has anything a call with nothing new for the run
@@ -30561,8 +30604,13 @@ impl Db {
     /// a sync (`Direct::log_owed`): the log synced first, wherever it
     /// still owes -- a `sync` since the open may have paid it -- and then
     /// the run's file, so no power cut keeps the run's commits and loses
-    /// the older frames. A log sync that fails is the answer and is kept
-    /// (`Db::lost`), with nothing of the run synced. What the commit does
+    /// the older frames. A log sync that fails is the answer, with nothing
+    /// of the run synced: kept where `sync_wal` keeps it (an fdatasync's,
+    /// `Db::lost`), and where it is not -- a loose file that would not
+    /// open, the live header's chain -- the batch, committed and visible,
+    /// is owed by the run's file (`SegmentWriter::owe_unsynced`), so a call
+    /// with nothing new after it writes and syncs it, the log first, where
+    /// it would answer `Ok` with nothing synced. What the commit does
     /// after its sync otherwise, the references of
     /// `Options::direct_table_refs` taken for the entries the file holds,
     /// the run's next commit does, as it does for those the file did not
@@ -30571,7 +30619,12 @@ impl Db {
     #[inline(never)]
     fn run_due_log_first(&mut self) -> Result<()> {
         if self.wal.frames_unsynced() || !self.loose_wals.is_empty() {
-            self.sync_wal()?;
+            if let Err(e) = self.sync_wal() {
+                if let Some(d) = self.direct.as_mut() {
+                    d.w.0.owe_unsynced();
+                }
+                return Err(e);
+            }
         }
         let d = self.direct.as_mut().expect("a run is open");
         d.log_owed = false;
@@ -30672,10 +30725,24 @@ impl Db {
     /// commit that failed may have owed the sync and its count is spent;
     /// and under a cipher logged as well, where that commit's failure left
     /// it unlogged, and the log synced, where that commit logged it under
-    /// a policy that did not sync.
+    /// a policy that did not sync. In the clear that sync stands in for
+    /// the policy's, so where the run opened beside a log that owed one
+    /// (`Direct::log_owed`) the log is synced first, as a due commit syncs
+    /// it (`Db::run_due_log_first`), and a log sync that fails is the
+    /// answer with nothing of the run synced: the batch still owed and the
+    /// note standing, whether or not `sync_wal` kept the error, so the next
+    /// call syncs the log first again.
     #[cold]
     #[inline(never)]
     fn run_again(&mut self) -> Result<()> {
+        if self.direct.as_ref().is_some_and(|d| d.log_owed) {
+            if self.wal.frames_unsynced() || !self.loose_wals.is_empty() {
+                self.sync_wal()?;
+            }
+            if let Some(d) = self.direct.as_mut() {
+                d.log_owed = false;
+            }
+        }
         let d = self.direct.as_mut().expect("a run owes");
         if let Err(e) = d.w.sync() {
             return Err(self.run_failed(e));
@@ -31529,8 +31596,10 @@ impl Db {
         // in the live file and in the files loose rotations closed --
         // whatever the live table is: a run opens over a log that holds
         // the frames of tables frozen before it, unsynced under `EveryN`
-        // until a sync covers them -- this one, or the run's first due
-        // commit (`Db::run_due_log_first`) -- and under a cipher the
+        // until a sync covers them -- this one, the run's first due
+        // commit (`Db::run_due_log_first`), or the sync of a batch the
+        // run's file owes, which `commit_staged` makes above
+        // (`Db::run_again`) -- and under a cipher the
         // run's own commits are frames of the log (`Db::log_run`). The
         // log first, since its frames are older than any commit of the
         // open run.
@@ -33538,6 +33607,26 @@ impl Db {
     #[doc(hidden)]
     pub fn run_synced_bytes(&self) -> Option<u64> {
         self.direct.as_ref().map(|d| d.w.0.out.synced)
+    }
+
+    /// A test's: the bytes of the open direct run's file that any
+    /// fdatasync of it covered -- the writer's own, or its helper
+    /// thread's behind it (`SegmentOptions::sync_ahead`), which syncs
+    /// under any policy -- and how many fdatasyncs the helper has made.
+    /// `None` with no run open.
+    #[doc(hidden)]
+    pub fn run_device_synced(&self) -> Option<(u64, u64)> {
+        self.direct.as_ref().map(|d| {
+            let out = &d.w.0.out;
+            let helper = out
+                .helper
+                .as_ref()
+                .map_or(0, |h| h.shared.synced.load(AtomicOrdering::Acquire));
+            (
+                out.synced.max(helper),
+                out.flushes.load(AtomicOrdering::Relaxed),
+            )
+        })
     }
 
     /// A test's: the bytes the open direct run's file holds, and the bytes
