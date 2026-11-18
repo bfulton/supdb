@@ -325,16 +325,6 @@ What an engine picker would hit, roughly in order.
   dm-flakey target that drops unflushed writes cuts the power after
   such an open, and the store reopens with every acknowledged write,
   with the directory fsync removed as its control.
-- [ ] **A run's due commit beside log frames no sync covered.** Under
-  `EveryN` a run's commit that is due syncs the run's file and not the
-  log, and a run opens over a log that may hold the frames of a table
-  frozen before it, unsynced, its seal not yet durable: a power cut then
-  keeps the run's commits and loses the earlier ones in the log, which is
-  not a tail of the commit order. A `sync` covers both. Done when the
-  run's open notes, once a run, whether the log owes a sync, and the due
-  branch asks that note beside the run's fdatasync and syncs the log
-  first, priced on the buffered loads after a shuffled one, with a crash
-  test that holds the frozen table's seal before its fsyncs.
 - [ ] **A sync over a run closed into a seal in flight.** Under
   `EveryN` a run in the clear that closes -- at any write it cannot take
   (an `append` of a key at or below its greatest, of an empty or overlong
