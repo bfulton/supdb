@@ -389,6 +389,13 @@ impl Pager {
         self.held().saturating_add(bytes) <= self.budget()
     }
 
+    /// Start the peak again from what the cache holds now: for a test
+    /// that holds one phase of a store's life to a line, where an earlier
+    /// phase was held to another (`Db::restart_cipher_peak`).
+    pub(crate) fn restart_peak(&self) {
+        self.peak.store(self.held(), Ordering::Relaxed);
+    }
+
     pub(crate) fn counts(&self) -> PagerCounts {
         let c = &self.counts;
         let r = |a: &AtomicU64| a.load(Ordering::Relaxed);

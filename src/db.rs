@@ -28435,6 +28435,18 @@ impl Db {
         self.vault.as_ref().map(|h| h.vault().counts())
     }
 
+    /// The cache's peak (`CipherCounts::cache`'s `peak`) started again
+    /// from what it holds now, for a test that holds one phase to a line:
+    /// a caller's read waits only at the cache's second line, the store's
+    /// own work at its first, so a test of the second kind of reader
+    /// cannot read its peak over a life that had the first in it.
+    #[doc(hidden)]
+    pub fn restart_cipher_peak(&self) {
+        if let Some(h) = self.vault.as_ref() {
+            h.vault().pager().restart_peak();
+        }
+    }
+
     /// WAL files are numbered and rotate at each seal: the sealing thread
     /// owns the old file and deletes it once its segment is renamed into
     /// place, while commits continue into the next file. Replay walks them
