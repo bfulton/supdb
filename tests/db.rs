@@ -5519,7 +5519,7 @@ fn a_manifest_publish_leaves_its_spare_to_the_sweep() {
 /// and gets its second slot at that open, so no publish after it ever
 /// creates a directory entry.
 #[test]
-fn a_manifest_publish_alternates_two_slots_and_the_open_takes_the_newest_valid() {
+fn a_manifest_publish_spares_the_newest_durable_slot_and_the_open_takes_the_newest_valid() {
     let d = dir("manifest-slots");
     let opts = Options {
         seal_bytes: 1 << 20,
@@ -5589,10 +5589,21 @@ fn a_manifest_publish_alternates_two_slots_and_the_open_takes_the_newest_valid()
         Db::open(&d, opts.clone()).is_err(),
         "no valid slot is a torn store"
     );
-    // The store restored: the publishes alternate the slots, each one
-    // past the last, and the torn slot is the first one written over.
+    // The store restored: each publish past the last, into the slot that
+    // does not hold the newest manifest known durable, and the torn slot
+    // the first one written over. Every slot write is watched, with the
+    // sequence each slot file's last returned fdatasync covered.
     std::fs::write(&slot_a, &bytes_a).unwrap();
     let mut db = Db::open(&d, opts.clone()).unwrap();
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<supdb::db::SlotWrite>>>;
+    let seen: Seen = Default::default();
+    let watch: supdb::db::SlotWatch = {
+        let seen = seen.clone();
+        std::sync::Arc::new(move |w: &supdb::db::SlotWrite| {
+            seen.lock().unwrap_or_else(|e| e.into_inner()).push(w.clone());
+        })
+    };
+    db.watch_slot_writes(Some(watch));
     for k in 0..2000u32 {
         db.put(key(k).as_bytes(), b"v1");
     }
@@ -5617,9 +5628,25 @@ fn a_manifest_publish_alternates_two_slots_and_the_open_takes_the_newest_valid()
         d.join(MANIFEST_SLOTS[0])
     };
     let other_seq = manifest_seq_of(&std::fs::read(&other_b).unwrap()).unwrap();
-    assert!(
-        other_seq < seq_b,
-        "the other slot is a publish before: {other_seq} beside {seq_b}"
+    db.watch_slot_writes(None);
+    let writes = seen.lock().unwrap().clone();
+    let last = writes.last().expect("the round published");
+    assert_eq!(
+        (last.seq, MANIFEST_SLOTS[last.slot]),
+        (seq_b, slot_b.file_name().unwrap().to_str().unwrap()),
+        "the last slot write is the newest slot's"
+    );
+    for w in &writes {
+        assert!(
+            w.synced[1 - w.slot] >= w.synced[w.slot],
+            "a publish wrote over the slot holding the newest manifest known durable: {w:?}"
+        );
+    }
+    assert_eq!(
+        other_seq,
+        last.synced[1 - last.slot],
+        "the slot the last publish did not write holds the newest manifest known durable \
+         when it was written: {other_seq} beside {seq_b}, {last:?}"
     );
     assert_eq!(read_vec(&db, key(7).as_bytes()), vec![b"v1".to_vec()]);
     drop(db);
@@ -15710,8 +15737,11 @@ fn a_store_from_before_the_pending_flags_opens_with_both_slots_rewritten() {
     db.settle().unwrap();
     db.close().unwrap();
     // The newest slot's content as a version-2 manifest one sequence on,
-    // in the slot of that sequence: the store as a writer of that version
-    // would have left it after one more publish.
+    // in the slot of that sequence's parity, which is where a writer of
+    // that version put it: it chose a slot by the parity of the publish's
+    // sequence, before slots were chosen by which one holds the newest
+    // manifest known durable. The store as such a writer would have left
+    // it after one more publish.
     let (_, bytes) = newest_manifest(&d);
     let seq = manifest_seq_of(&bytes).unwrap();
     let names: Vec<String> = manifest_names_v3(&bytes)

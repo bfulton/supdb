@@ -79,6 +79,15 @@
 //!   against a plain store over the same writes, across closes and crashes.
 //!   `fuzz_range_under_a_cipher` is the range run so with nothing set, and
 //!   the variable is for the other tests and for a range run by hand.
+//! - `ZFUZZ_SYNCVARY=1`: a seed draws its sync policy from four --
+//!   `Always`, and `EveryN` of one, of eight and of `u32::MAX`, which
+//!   is due never -- where it draws from the first and the third alone,
+//!   and a crash under `EveryN` follows a `sync` of both stores, which
+//!   promises what a crash keeps, where under `EveryN` it is otherwise a
+//!   close. The draw is one more in the seed's stream, so every seed's
+//!   operations differ from the same seed's without the variable: a
+//!   failure under it is attributed by running the seed with it on the
+//!   commit before, never by reading the policy's name.
 //! - `ZFUZZ_NOPUT`, `ZFUZZ_NOBURST`: set, no puts, or no ordered bursts.
 //! - `ZFUZZ_SEEDKEY=1`: the store's first write is a key of its own, and
 //!   one goes ahead of every write of the empty key, so that no write of
@@ -282,10 +291,15 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
             _ => Upkeep::Background(1),
         },
         bg: rng.chance(75),
-        sync: if rng.chance(50) {
-            SyncPolicy::Always
-        } else {
-            SyncPolicy::EveryN(8)
+        sync: match (rng.chance(50), env_flag("ZFUZZ_SYNCVARY")) {
+            (_, true) => [
+                SyncPolicy::Always,
+                SyncPolicy::EveryN(1),
+                SyncPolicy::EveryN(8),
+                SyncPolicy::EveryN(u32::MAX),
+            ][rng.below(4)],
+            (true, false) => SyncPolicy::Always,
+            (false, false) => SyncPolicy::EveryN(8),
         },
         ops: 600 + rng.below(1800),
         keys: 40 + rng.below(500),
@@ -1054,7 +1068,19 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                         st.fills += c.cache.fills;
                     }
                     st.zreads += z.zpage_counts().reads + z.zpage_counts().scans;
-                    let clean = rng.chance(50) || !matches!(cfg.sync, SyncPolicy::Always);
+                    let always = matches!(cfg.sync, SyncPolicy::Always);
+                    let synced = !always && env_flag("ZFUZZ_SYNCVARY") && rng.chance(50);
+                    if synced {
+                        // What the sync promises: every commit before it,
+                        // a run's held tail among them, kept by the crash.
+                        z.sync().map_err(|e| format!("sync z: {e}"))?;
+                        r.sync().map_err(|e| format!("sync r: {e}"))?;
+                        // A sync commits what is staged first.
+                        for op in staged.drain(..) {
+                            apply(&mut model, &op);
+                        }
+                    }
+                    let clean = rng.chance(50) || !(always || synced);
                     if clean {
                         for op in staged.drain(..) {
                             // close commits the staged batch.

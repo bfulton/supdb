@@ -2488,7 +2488,13 @@ was read off the kernel's page flags, which only root may read, so an
 open that skipped a file's fsync and kept the word passed every run
 without the privilege, the gate's among them; each file's fsync goes
 through a call that records it once it returns (`vault::sync_file`),
-and the page flags are a second word where they can be had. The
+and the page flags are a second word where they can be had. Where they
+cannot, the page cache answers for a slot file without them: a drop of
+a file's clean pages (`POSIX_FADV_DONTNEED`) leaves a page no sync has
+written, which `mincore` then finds, against a control written and
+synced by nobody that has to read as unwritten
+(`os_page_kept_unwritten`); a call that recorded a slot's sync it never
+made was caught by the page flags alone until then. The
 corollary: an order is tested by one
 record that holds both of its ends, since a record of each end apart
 holds that each happened and not which came first; and the record is
@@ -3497,7 +3503,18 @@ state a crash leaves, read as the open refusing one. A copy of a live
 store is a crash only while nothing lands, so it holds the landing
 across the copy, and lets it go before anything that can fail. Three
 mutants the test was listed as killing were killed by the race and not
-by the test. The rule: a test that
+by the test. The hold was each test's to remember, and most of the
+binary's tests copied a live store: the race came back in a delete's
+crash test, whose copy met a merge's landing and was read once as a
+mutant's kill. Every copy of a live store goes through one helper now,
+which pauses the segment work across the copy
+(`Db::pause_segment_work`, `copy_live` in `tests/durable.rs`): every
+landing, slot write and retirement is that thread's, so the pause holds
+them all and leaves a test no hold to forget, and a copy of a store
+nothing holds open, or one a hold of the test's already keeps from
+landing, says so at its call (`copy_closed`, `copy_held`). The pause's
+mutant is the whole binary run four at a time with the pause taken out.
+The rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; and a mutant's kill is read again
 once a race under the killing test is found, since the race kills
@@ -4137,7 +4154,14 @@ closes while it owes a batch -- a key below its greatest, before any
 commit synced the batch again -- writes the batch into its segment, and
 the close is the batch's sync; a test closes such a run, held and owed,
 under both policies, every arm and a cipher, since the first tests
-closed only runs whose owed batch a sync had already written.
+closed only runs whose owed batch a sync had already written. The
+writer that stays stuck has a mutant that is not, and it does not fail
+the test of a kept sync: the writer meets the full piece it holds at
+every turn of its write, writes nothing and loops, and only a runner's
+timeout said so. The test runs its writer on a thread of its own with
+an end, and fails where it hung. The corollary: a mutant killed by a
+hang is a test with no end of its own, which is given one before the
+kill is counted.
 
 **A length read off the slab that held the exceptions.** The ordered
 table's write log became the range of its entries, its length the
@@ -4462,7 +4486,14 @@ allocate, and the count of anonymous bytes resident beyond the allocator's
 use is lowered by any allocation from a free chunk already resident: a
 dead arena of thirty-two megabytes read as nine in one run of the whole
 `db` binary, so that test has a binary of its own (`tests/resident.rs`), as
-the allocation count has (`tests/leak.rs`).
+the allocation count has (`tests/leak.rs`). It came back as a record:
+the calls the open's tests read off (`Db::trace_dir_io`) were kept
+process-wide, the record stayed on once any test had turned it on, and
+it grew with every recorded call of every test in the binary while each
+reader filtered it by its own directory. It is kept by the directory a
+test asks for now, and handed back and let go when that test asks it
+off. The corollary: a seam that records is scoped to what the test
+reading it owns, and let go by that test.
 
 **A call site no real input reaches red.** The suite's refusals after the
 read pass and after the shuffled load were green-side only, because a real

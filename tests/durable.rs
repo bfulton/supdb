@@ -40,8 +40,10 @@ fn read_vec(db: &Reader, key: &[u8]) -> Vec<Vec<u8>> {
 /// device that kept every completed write, which is what a process kill
 /// leaves. A file gone between the listing and its copy is left out, as a
 /// crash before its creation would leave it. A store under a cipher loses
-/// its memory files here, as it does at a crash.
-fn copy_store(from: &Path, to: &Path) {
+/// its memory files here, as it does at a crash. Only a state the store
+/// holds still while the files are read is one a crash leaves, so this is
+/// reached through the three below, each of which says why it does.
+fn copy_files(from: &Path, to: &Path) {
     let _ = std::fs::remove_dir_all(to);
     std::fs::create_dir_all(to).unwrap();
     for e in std::fs::read_dir(from).unwrap() {
@@ -55,6 +57,35 @@ fn copy_store(from: &Path, to: &Path) {
             Err(err) => panic!("copying {:?}: {err}", e.path()),
         }
     }
+}
+
+/// A store open in `db` copied from `from` as a process kill leaves it:
+/// its segment work paused across the copy (`Db::pause_segment_work`), so
+/// no landing falls inside it -- a landing writes a slot naming segments
+/// the listing may have missed and removes what the slot before named --
+/// and the writer, which is the caller, makes no call meanwhile. Seal and
+/// merge threads may still be writing their own files, which no slot names
+/// until a landing: a state a kill leaves too. The copy that once went red
+/// was a seal landing between the listing and the slot's copy, a slot that
+/// named a segment the copy did not hold, which no crash leaves.
+fn copy_live(db: &Db, from: &Path, to: &Path) {
+    let paused = db.pause_segment_work();
+    copy_files(from, to);
+    drop(paused);
+}
+
+/// A store no `Db` holds open copied from `from`: closed, dropped or
+/// forgotten after its segment work joined, or a copy made earlier.
+fn copy_closed(from: &Path, to: &Path) {
+    copy_files(from, to);
+}
+
+/// A store open in a `Db` whose segment work a hold of the test's keeps
+/// from landing anything for the length of the copy -- parked at the owed
+/// slot's fdatasync (`Db::hold_owed_slot`), where a pause would wait for
+/// it -- copied from `from`. The caller says which hold.
+fn copy_held(from: &Path, to: &Path) {
+    copy_files(from, to);
 }
 
 fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
@@ -282,7 +313,7 @@ fn delete_then_write_crash_while_sealing(
     );
 
     // The crash.
-    copy_store(&d, &c);
+    copy_live(&db, &d, &c);
     hold(&db, held, false);
     db.settle().unwrap();
     assert_eq!(
@@ -438,7 +469,7 @@ fn an_append_after_a_delete_that_ends_a_run_survives_a_crash_before_its_seal_wri
     delete_and_commit(&mut db, &k, Del::Delete);
     seal_held(&mut db, SealHeld::BeforeWrite);
     write_after(&mut db, &k, Then::Append);
-    copy_store(&d, &c);
+    copy_live(&db, &d, &c);
     hold(&db, SealHeld::BeforeWrite, false);
     db.settle().unwrap();
     assert_eq!(
@@ -484,7 +515,7 @@ fn an_append_after_a_replayed_delete_survives_a_crash_before_its_seal_writes() {
     let mut db = loaded(&d, opts.clone());
     let k = key(500_000);
     delete_and_commit(&mut db, &k, Del::Delete);
-    copy_store(&d, &c1);
+    copy_live(&db, &d, &c1);
     drop(db);
 
     let mut db = Db::open(&c1, opts.clone()).unwrap();
@@ -499,7 +530,7 @@ fn an_append_after_a_replayed_delete_survives_a_crash_before_its_seal_writes() {
     );
     seal_held(&mut db, SealHeld::BeforeWrite);
     write_after(&mut db, &k, Then::Append);
-    copy_store(&c1, &c2);
+    copy_live(&db, &c1, &c2);
     hold(&db, SealHeld::BeforeWrite, false);
     db.settle().unwrap();
     assert_eq!(
@@ -548,7 +579,7 @@ fn a_buffered_crash_never_recovers_a_batch_without_its_first_key() {
     }
     db.commit().unwrap();
 
-    copy_store(&d, &c);
+    copy_live(&db, &d, &c);
     hold(&db, SealHeld::BeforeWrite, false);
     db.settle().unwrap();
     drop(db);
@@ -625,7 +656,7 @@ fn appends_below_the_greatest_read_back(
     }
     db.commit().unwrap();
     holds_the_model(&db, &model, &format!("{tag}, live"));
-    copy_store(&d, &c);
+    copy_live(&db, &d, &c);
     db.flush().unwrap();
     db.settle().unwrap();
     holds_the_model(&db, &model, &format!("{tag}, flushed and settled"));
@@ -749,7 +780,7 @@ fn a_failed_write_is_written_again(tag: &str, opts: Options, after: usize, reope
         let first = dir(&format!("dur-walwrite-{tag}-first"));
         let mut db = Db::create(&first, opts.clone()).unwrap();
         put_commit(&mut db, "k0", "v0").unwrap();
-        copy_store(&first, &d);
+        copy_live(&db, &first, &d);
         drop(db);
         let _ = std::fs::remove_dir_all(&first);
         let db = Db::open(&d, opts.clone()).unwrap();
@@ -793,7 +824,7 @@ fn a_failed_write_is_written_again(tag: &str, opts: Options, after: usize, reope
         (0, 0),
         "{tag}: nothing sealed, the log alone holds the commits"
     );
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     drop(db);
     for (at, what) in [(&crash, "the crash"), (&d, "the closed store")] {
         let db = Db::open(at, opts.clone()).unwrap_or_else(|e| panic!("{tag}: {what} opens: {e}"));
@@ -888,7 +919,7 @@ fn a_commit_with_nothing_staged_after_a_failed_write_makes_the_batch_durable() {
         db.fail_next_wal_write(5);
         assert!(put_commit(&mut db, "k1", "v1").is_err(), "{tag}");
         db.commit().unwrap();
-        copy_store(&d, &crash);
+        copy_live(&db, &d, &crash);
         drop(db);
         let db = Db::open(&crash, opts).unwrap();
         reads(&db, "k0", "v0", tag);
@@ -987,7 +1018,7 @@ fn a_runs_batch_is_written_again(tag: &str, then: u8, opts: Options) {
         // every byte the call answered `Ok` for -- any call's under
         // `Always`, the `sync`'s under the buffered policy.
         let (log, synced, _) = db.wal_durable();
-        copy_store(&d, &crash);
+        copy_live(&db, &d, &crash);
         drop(db);
         std::fs::OpenOptions::new()
             .write(true)
@@ -1098,7 +1129,7 @@ fn a_sync_after_a_failed_log_write_makes_every_commit_before_it_durable() {
     put_commit(&mut db, "k3", "v3").unwrap();
     db.hold_seal_landing(true);
     db.sync().unwrap();
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     db.hold_seal_landing(false);
     drop(db);
     assert!(
@@ -1153,7 +1184,7 @@ fn a_store_whose_log_rotated_after_a_failed_write_opens_with_every_acknowledged_
         (0, 0),
         "nothing sealed: the closed file is not retired, the window under test"
     );
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     drop(db);
     assert!(crash.join("wal-00000000").exists(), "the closed file");
     assert!(
@@ -1302,7 +1333,7 @@ fn a_commit_after_a_failed_sync(tag: &str, opts: Options) {
     );
     db.append(b"c-after", b"C");
     let c = db.commit();
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     drop(db);
     let reopened = Db::open(&crash, opts).expect("a store whose log lost unsynced frames opens");
     assert_eq!(
@@ -1367,7 +1398,7 @@ fn a_sync_answered_ok_after_a_failed_one_makes_every_commit_before_it_durable() 
         "the injected failure reached the log's sync"
     );
     let again = db.sync();
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     drop(db);
     let reopened = Db::open(&crash, opts).expect("a store whose log lost unsynced frames opens");
     for c in 0u32..100 {
@@ -1619,7 +1650,7 @@ fn run_tmp_name(d: &Path) -> std::ffi::OsString {
 fn power_cut(db: &Db, d: &Path, crash: &Path, ino: u64, synced: u64) {
     use std::os::unix::fs::MetadataExt;
     let (log, log_synced, _) = db.wal_durable();
-    copy_store(d, crash);
+    copy_live(&db, d, crash);
     for e in std::fs::read_dir(d).unwrap() {
         let e = e.unwrap();
         if e.metadata().map(|m| m.ino()).ok() == Some(ino) {
@@ -2073,7 +2104,7 @@ fn a_run_write_that_failed_under_a_cipher_is_written_again() {
             }
         }
         let (log, synced, _) = db.wal_durable();
-        copy_store(&d, &crash);
+        copy_live(&db, &d, &crash);
         std::mem::forget(db);
         std::fs::OpenOptions::new()
             .write(true)
@@ -2171,6 +2202,23 @@ fn a_marked_segments_sync_reports_its_helpers_failed_sync() {
 /// `Ok` over pages it marked clean.
 #[test]
 fn a_marked_segments_failed_sync_is_every_later_syncs_answer() {
+    // On a thread of its own with an end: a writer that stops being stuck
+    // after a held write meets the full piece it holds at every turn of its
+    // write, writes nothing and loops there, and the test fails where it
+    // would hang.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = std::panic::catch_unwind(a_marked_segments_failed_sync_body);
+        let _ = tx.send(r);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+        Ok(Ok(())) => {}
+        Ok(Err(p)) => std::panic::resume_unwind(p),
+        Err(_) => panic!("the writer made no progress for a minute: a write after its held failure loops"),
+    }
+}
+
+fn a_marked_segments_failed_sync_body() {
     let d = dir("dur-writer-sync-kept");
     let opts = SegmentOptions {
         write_piece: 4096,
@@ -2544,7 +2592,7 @@ fn a_run_closed_over_a_failed_write(tag: &str, opts: Options, fails: Fails) {
         .unwrap_or_else(|e| panic!("{tag}: the run's segment lands: {e}"));
     assert!(db.run_synced_bytes().is_none(), "{tag}: the run closed");
     let (log, log_synced, _) = db.wal_durable();
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     if let Some(name) = log.file_name() {
         if let Ok(f) = std::fs::OpenOptions::new()
             .write(true)
@@ -2634,7 +2682,7 @@ fn a_cipher_runs_batch_owed_to_its_file_and_its_log_is_logged_again() {
         .expect("a commit of nothing writes the run's batch and logs it");
     let crash = dir("dur-runlog-cipher-both-crash");
     let (log, synced, _) = db.wal_durable();
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     std::mem::forget(db);
     std::fs::OpenOptions::new()
         .write(true)
@@ -2686,7 +2734,7 @@ fn a_cipher_runs_unlogged_batch_is_logged_by_a_commit_of_nothing_beside_an_armed
         .expect("a commit of nothing logs the batch the log put back");
     let crash = dir("dur-runlog-cipher-armed-crash");
     let (log, synced, _) = db.wal_durable();
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     std::mem::forget(db);
     std::fs::OpenOptions::new()
         .write(true)
@@ -2995,7 +3043,7 @@ fn a_cipher_runs_batch_written_again_by_a_commit_of_nothing_is_synced_in_its_log
         .expect("a commit of nothing writes the run's batch and syncs its log");
     let crash = dir("dur-runlog-cipher-again-crash");
     let (log, synced, _) = db.wal_durable();
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     std::mem::forget(db);
     std::fs::OpenOptions::new()
         .write(true)
@@ -3202,7 +3250,7 @@ fn made(d: &Path) -> PathBuf {
 /// the original is dropped before that open, never forgotten.
 fn killed(db: Db, d: &Path) {
     let m = d.with_extension("made");
-    copy_store(&m, d);
+    copy_live(&db, &m, d);
     drop(db);
     let _ = std::fs::remove_dir_all(&m);
 }
@@ -3227,7 +3275,7 @@ fn a_sync_after_a_reopen(tag: &str, life1: Options, opts: Options, head: u64) {
     let mut db = life_two(&d, opts.clone());
     // The acknowledgement: everything visible before it is durable.
     db.sync().unwrap();
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     power_cut_logs(&crash, &[&one, &db.wal_syncs_traced()], head, &[]);
     drop(db);
     let db = Db::open(&crash, opts).unwrap();
@@ -3293,7 +3341,13 @@ fn a_flush_after_a_reopen_once(tag: &str, life1: Options, opts: Options) {
     db.hold_owed_slot(true);
     db.flush().unwrap();
     let owed = db.owed_slots_held();
-    copy_store(&d, &crash);
+    // A slot owed parks the segment work at the hold before its
+    // fdatasync, where nothing else lands; with none owed it is paused.
+    if owed > 0 {
+        copy_held(&d, &crash);
+    } else {
+        copy_live(&db, &d, &crash);
+    }
     power_cut_logs(&crash, &[&one, &db.wal_syncs_traced()], WAL_HEAD, &[]);
     if owed > 0 {
         // The slot the drain wrote, its fdatasync not yet run: a power cut
@@ -3390,7 +3444,9 @@ fn a_drain_answered_before_its_slots_sync_keeps_the_log_file_the_slot_covers() {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    copy_store(&d, &crash);
+    // The segment work is parked at the owed slot's hold, before its
+    // fdatasync, where nothing else lands.
+    copy_held(&d, &crash);
     for (s, b) in slots.iter().zip(&before) {
         match b {
             Some(bytes) => std::fs::write(crash.join(s), bytes).unwrap(),
@@ -3493,7 +3549,7 @@ fn a_sync_after_a_reopen_makes_a_replayed_loose_log_file_durable() {
     let mut db = Db::open(&d, opts.clone()).unwrap();
     db.trace_wal_syncs(true);
     db.sync().unwrap();
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     power_cut_logs(&crash, &[&one, &db.wal_syncs_traced()], WAL_HEAD, &[]);
     drop(db);
     let db = Db::open(&crash, opts)
@@ -3541,7 +3597,7 @@ fn a_rotation_after_a_reopen_leaves_the_replayed_file_loose() {
     let rotations = db.seal_waits().wal_rotations;
     let after = put_commit(&mut db, "s0000000", "S");
     let levels = db.levels();
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     db.hold_seal_landing(false);
     rotate.unwrap();
     assert_eq!(rotations, 1, "the commit of nothing rotated");
@@ -3589,7 +3645,7 @@ fn a_header_an_open_writes_beside_an_unsynced_closed_file_is_loose() {
         .unwrap_or_else(|e| panic!("a lost header of a never-synced log is refused: {e}"));
     db.trace_wal_syncs(true);
     put_commit(&mut db, "t0000000", "T").unwrap();
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     // The closed file's frames lost, no sync in either life having covered
     // them, and the live file's written back.
     let newest = wal_names(&crash).pop().unwrap();
@@ -3607,7 +3663,7 @@ fn a_header_an_open_writes_beside_an_unsynced_closed_file_is_loose() {
     // the closed file's frames is a gap the open refuses, never the log's
     // end with the acknowledged commit dropped.
     db.sync().unwrap();
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     power_cut_logs(&crash, &[&one, &db.wal_syncs_traced()], WAL_HEAD, &[]);
     drop(db);
     let names = wal_names(&crash);
@@ -3661,7 +3717,7 @@ fn a_reopen_with_nothing_replayed_owes_its_log_no_sync() {
             put_batch(&mut db, 'a', 100);
             if how == 0 {
                 db.close().unwrap();
-                copy_store(&d.with_extension("made"), &d);
+                copy_closed(&d.with_extension("made"), &d);
             } else if how == 1 {
                 db.flush().unwrap();
                 db.settle().unwrap();
@@ -3681,7 +3737,7 @@ fn a_reopen_with_nothing_replayed_owes_its_log_no_sync() {
                     assert!(i < 10_000, "the log never rotated");
                 }
                 let before = d.with_extension("before");
-                copy_store(&d.with_extension("made"), &before);
+                copy_live(&db, &d.with_extension("made"), &before);
                 db.flush().unwrap();
                 db.settle().unwrap();
                 killed(db, &d);
@@ -3778,7 +3834,7 @@ fn a_sync_that_chains_a_loose_boundary_makes_the_chained_header_durable() {
     }
     put_commit(&mut db, "s0000000", &val).unwrap();
     db.sync().unwrap();
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     power_cut_logs(&crash, &[&db.wal_syncs_traced()], WAL_HEAD, &[]);
     drop(db);
     // Damage after the power cut: the closed file's frames gone.
@@ -3843,7 +3899,7 @@ fn a_store_just_created(tag: &str, opts: Options) {
         written,
         "{tag}: a fresh store's log holds only its header"
     );
-    copy_store(&real, &crash);
+    copy_closed(&real, &crash);
     zero_prefix(&crash.join(&wal), usize::MAX);
     let mut db = Db::open(&crash, opts.clone()).unwrap_or_else(|e| {
         panic!("{tag}: a store whose log header never reached the device is refused: {e}")
@@ -3912,7 +3968,7 @@ fn acknowledged_direct_run_commits_survive_a_power_cut_that_loses_the_logs_unsyn
         WAL_HEAD,
         "the log holds only its header, which no fdatasync of it has covered"
     );
-    copy_store(&d, &crash);
+    copy_closed(&d, &crash);
     zero_prefix(&crash.join("wal-00000000"), usize::MAX);
     let mut refused = Vec::new();
     for round in 0..2 {
@@ -3974,7 +4030,7 @@ fn a_flush_survives_a_lost_first_page(tag: &str, base: Options) {
     let mut failed = Vec::new();
     for (name, zeroed) in [("page", 4096usize), ("whole", usize::MAX)] {
         let crash = dir(&format!("dur-buffered-header-{tag}-{name}"));
-        copy_store(&d, &crash);
+        copy_closed(&d, &crash);
         zero_prefix(&crash.join(&wal), zeroed);
         match Db::open(&crash, opts.clone()) {
             Ok(db) => {
@@ -4032,7 +4088,7 @@ fn a_log_file_a_rotation_began_whose_header_a_power_cut_lost_opens_with_every_co
         assert!(i < 10_000, "the log never rotated");
     }
     assert_eq!(db.levels(), (0, 0), "nothing sealed");
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     drop(db);
     let names = wal_names(&crash);
     assert_eq!(
@@ -4066,7 +4122,7 @@ fn an_older_log_file_whose_unsynced_header_a_power_cut_lost_opens_as_the_logs_en
     let crash = dir("dur-older-header-cut");
     let opts = rotating();
     let (_, _) = rotated_and_killed(&d, opts.clone());
-    copy_store(&d, &crash);
+    copy_closed(&d, &crash);
     let names = wal_names(&crash);
     zero_prefix(&crash.join(&names[0]), 4096);
     let db = Db::open(&crash, opts)
@@ -4122,7 +4178,7 @@ fn frames_behind_a_lost_first_sector_are_dropped_as_unsynced() {
             put_batch(&mut db, b, n);
         }
         assert_eq!(db.levels(), (0, 0), "nothing sealed");
-        copy_store(&d, &crash);
+        copy_live(&db, &d, &crash);
         drop(db);
         let names = wal_names(&crash);
         assert_eq!(names.len(), 2);
@@ -4313,7 +4369,7 @@ fn a_sync_after_a_reopen_that_cut_a_torn_tail(tag: &str, opts: Options) {
         at_open,
         "{tag}: nothing more owed after the open's sync"
     );
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     power_cut_logs(&crash, &[&one, &db.wal_syncs_traced()], WAL_HEAD, &[]);
     drop(db);
     let db = Db::open(&crash, opts).unwrap();
@@ -4376,7 +4432,7 @@ fn a_failed_loose_sync_leaves_the_header(tag: &str, base: Options) {
     killed(db, &d);
     let names = wal_names(&d);
     assert_eq!(names.len(), 2, "{tag}: the closed file and the live one");
-    copy_store(&d, &crash);
+    copy_closed(&d, &crash);
     // The live file's header as the page cache holds it, written back whole
     // with the file; the loose file's frames, which no sync covered, lost.
     let header: Vec<u8> = std::fs::read(crash.join(&names[1])).unwrap()[..head as usize].to_vec();
@@ -4445,7 +4501,7 @@ fn a_sync_after_a_reopen_syncs_every_replayed_older_file_oldest_first() {
     let one = db.wal_syncs_traced();
     assert!(one.is_empty(), "nothing synced in life 1: {one:?}");
     // The kill: the files as they stand, then the original let go.
-    copy_store(&m, &d);
+    copy_live(&db, &m, &d);
     db.hold_seal_landing(false);
     drop(db);
     let _ = std::fs::remove_dir_all(&m);
@@ -4483,7 +4539,7 @@ fn a_sync_after_a_reopen_syncs_every_replayed_older_file_oldest_first() {
         ],
         "the older files synced oldest first, then the live one chained and synced"
     );
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     db.hold_seal_landing(false);
     drop(db);
     power_cut_logs(&crash, &[&one, &two], WAL_HEAD, &[]);
@@ -4547,7 +4603,7 @@ fn a_store_whose_log_rotated_after_a_failed_write_survives_a_power_cut() {
         put_commit(&mut db, "c0000000", &val).unwrap();
         acked.push("c0000000".into());
         assert_eq!(db.levels(), (0, 0), "{tag}: nothing sealed");
-        copy_store(&d, &crash);
+        copy_live(&db, &d, &crash);
         let traced = db.wal_syncs_traced();
         drop(db);
         // A pre-written file's tail of zeroes is synced with it; the cut
@@ -4727,7 +4783,7 @@ fn a_sync_puts_an_open_runs_commits_where_a_process_kill_keeps_them() {
                 let n = sr_written_and_synced(&mut db, held);
                 assert!(open_run(&d), "{tag}: the run is open");
                 assert!(!db.in_flight().0, "{tag}: no seal in flight to write it");
-                copy_store(&d, &crash);
+                copy_live(&db, &d, &crash);
                 drop(db);
                 let opened = Db::open(&crash, opts).unwrap();
                 failures.extend(sr_missing(
@@ -4880,7 +4936,7 @@ fn a_sync_that_hands_an_open_run_to_a_seal_has_put_its_commits_on_the_file() {
                     open_run(&d),
                     "{tag}: the run's temp name stays until a manifest names it"
                 );
-                copy_store(&d, &crash);
+                copy_live(&db, &d, &crash);
                 n
             }));
             db.hold_seal_landing(false);
@@ -4922,7 +4978,7 @@ fn a_sync_makes_an_open_runs_logged_commits_survive_a_power_cut_under_a_cipher()
             let n = sr_written_and_synced(&mut db, held);
             assert!(db.run_synced_bytes().is_some(), "{tag}: the run is open");
             let (log, log_synced, _) = db.wal_durable();
-            copy_store(&d, &crash);
+            copy_live(&db, &d, &crash);
             let name = log.file_name().expect("the log's file name");
             std::fs::OpenOptions::new()
                 .write(true)
@@ -5216,7 +5272,7 @@ fn a_flush_after_a_run_closed_into_a_seal_makes_the_runs_commits_durable() {
         assert!(db.run_synced_bytes().is_none(), "{how}: the run closed");
         db.flush().unwrap();
         let (log, log_synced, _) = db.wal_durable();
-        copy_store(&d, &crash);
+        copy_live(&db, &d, &crash);
         if let Some(name) = log.file_name() {
             if let Ok(f) = std::fs::OpenOptions::new()
                 .write(true)
@@ -5271,7 +5327,7 @@ fn a_sync_after_a_run_closed_into_a_seal_covers_its_logged_commits_under_a_ciphe
                 assert!(db.in_flight().0, "{tag}: its seal is held in flight");
                 db.sync().unwrap();
                 let (log, log_synced, _) = db.wal_durable();
-                copy_store(&d, &crash);
+                copy_live(&db, &d, &crash);
                 let name = log.file_name().expect("the log's file name");
                 std::fs::OpenOptions::new()
                     .write(true)
@@ -6315,7 +6371,7 @@ fn ss_run_close_fails(tag: &str, by_flush: bool, inline: bool) {
     );
     // The power cut: the run's file cut to what its commits' fdatasyncs
     // covered, the trailer the failed seal wrote gone.
-    copy_store(&d, &crash);
+    copy_closed(&d, &crash);
     use std::os::unix::fs::MetadataExt;
     for e in std::fs::read_dir(&d).unwrap() {
         let e = e.unwrap();
@@ -6473,7 +6529,7 @@ fn a_run_closed_after_its_kept_sync_failure_answers_the_device_and_reads_on() {
     let h = db.reader().unwrap();
     ss_check(&h, &model, "after the failure");
     drop(h);
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     drop(db);
     let db = Db::open(&crash, opts).expect("the store opens after a kill");
     ss_check(&db, &model, "reopened after a kill");
@@ -6566,7 +6622,7 @@ fn ss_no_room_for_the_run(tag: &str, seal_first: bool) {
     let h = db.reader().unwrap();
     ss_check(&h, &model, &format!("{tag}: after the failure"));
     drop(h);
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     drop(db);
     let db = Db::open(&crash, opts).expect("the store opens after a kill");
     ss_check(&db, &model, &format!("{tag}: reopened after a kill"));
@@ -6644,7 +6700,7 @@ fn a_write_that_ends_a_run_beside_a_segment_work_error_waits_for_room_and_is_tak
     let h = db.reader().unwrap();
     ss_check(&h, &model, "after the error");
     drop(h);
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     drop(db);
     let db = Db::open(&crash, opts).expect("the store opens after a kill");
     ss_check(&db, &model, "reopened after a kill");
@@ -6745,7 +6801,7 @@ fn ss_handed_over_a_stopped_queue(tag: &str, full: bool) {
     let h = db.reader().unwrap();
     ss_check(&h, &model, &format!("{tag}: after the failure"));
     drop(h);
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     drop(db);
     let db = Db::open(&crash, opts).expect("the store opens after a kill");
     ss_check(&db, &model, &format!("{tag}: reopened after a kill"));
@@ -6826,7 +6882,7 @@ fn a_write_that_ends_a_run_over_a_stopped_queue_with_room_is_taken() {
         let h = db.reader().unwrap();
         ss_check(&h, &model, &format!("{tag}: after the failure"));
         drop(h);
-        copy_store(&d, &crash);
+        copy_live(&db, &d, &crash);
         drop(db);
         let db = Db::open(&crash, opts).expect("the store opens after a kill");
         ss_check(&db, &model, &format!("{tag}: reopened after a kill"));
@@ -7124,7 +7180,7 @@ fn a_stopped_queue_is_answered_by_every_seal_inline() {
     ss_wedged(db.flush(), cause, "a flush after the failure");
     ss_check(&db, &model, "after the failure");
     let crash = d.with_extension("crash");
-    copy_store(&d, &crash);
+    copy_live(&db, &d, &crash);
     drop(db);
     let db = Db::open(&crash, opts).expect("the store opens after a kill");
     ss_check(&db, &model, "reopened after a kill");
@@ -7730,11 +7786,17 @@ fn every_arm_that_writes_a_slot_keeps_the_last_durable_one() {
 /// Under the rename shape (`manifest_slots` off, with and without the
 /// spare) nothing is written in place: every publish renames, and a store
 /// moved between the shapes opens to every acknowledged write, the slot an
-/// open under the slots takes being one a rename left synced.
+/// open under the slots takes being one a rename left synced. Each life is
+/// also killed after its flush, with a write acknowledged past it that
+/// only the log holds, and the kill opened under the next life's shape --
+/// the crossing from the state a crash leaves, not only from a close. The
+/// crossings' power cuts, a rename left without its directory fsync among
+/// them, are the rename section's (`a_store_moved_slots_rename_slots_*`).
 #[test]
 fn a_store_moved_between_the_manifest_shapes_keeps_its_writes() {
     for spare in [false, true] {
         let d = dir(&format!("os-shapes-{spare}"));
+        let k = dir(&format!("os-shapes-{spare}-kill"));
         let slots = os_opts(&Options::default());
         let rename = Options {
             manifest_slots: false,
@@ -7753,6 +7815,24 @@ fn a_store_moved_between_the_manifest_shapes_keeps_its_writes() {
             );
             db.flush().unwrap();
             db.settle().unwrap();
+            // The kill: one write past the flush, acknowledged by its
+            // synced commit, then the files as they stand.
+            let late = format!("late-{r}").into_bytes();
+            db.put(&late, b"L");
+            db.commit().unwrap();
+            model.insert(late, b"L".to_vec());
+            copy_live(&db, &d, &k);
+            let killed = Db::open(&k, opts.clone()).unwrap_or_else(|e| {
+                panic!("spare {spare}, round {r}: the kill opened under the other shape: {e}")
+            });
+            for (key, v) in &model {
+                assert_eq!(
+                    read_vec(&killed, key),
+                    vec![v.clone()],
+                    "spare {spare}, round {r}: the kill under the other shape"
+                );
+            }
+            drop(killed);
             drop(db);
             db = Db::open(&d, opts.clone()).unwrap();
             for (k, v) in model.iter().step_by(37) {
@@ -7765,6 +7845,7 @@ fn a_store_moved_between_the_manifest_shapes_keeps_its_writes() {
         }
         drop(db);
         let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&k);
     }
 }
 
@@ -7942,6 +8023,32 @@ fn os_page_unwritten(path: &Path) -> Option<bool> {
     Some(flags & (1 << 4 | 1 << 8) != 0)
 }
 
+/// Whether the first page of `path` held bytes the device had not been
+/// given, asked of the page cache with no privilege: the file's clean
+/// pages dropped (`POSIX_FADV_DONTNEED`, which starts the writeback of a
+/// dirty page and leaves it, and a page under writeback, in the cache),
+/// then whether the page is still there (`mincore` over a mapping made
+/// after the drop and never touched). The drop starts the writeback, so a
+/// file is asked once, after the state it is asked of. `None` where a
+/// call fails.
+fn os_page_kept_unwritten(path: &Path) -> Option<bool> {
+    use std::os::fd::AsRawFd;
+    let f = std::fs::File::open(path).ok()?;
+    // SAFETY: an advice on a descriptor this function owns.
+    let r = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    if r != 0 {
+        return None;
+    }
+    let m = unsafe { memmap2::Mmap::map(&f) }.ok()?;
+    let mut v = [0u8; 1];
+    // SAFETY: the mapping is at least a page long and lives across the call.
+    let r = unsafe { libc::mincore(m.as_ptr() as *mut libc::c_void, 1, v.as_mut_ptr()) };
+    if r != 0 {
+        return None;
+    }
+    Some(v[0] & 1 != 0)
+}
+
 /// An open makes both slots durable as the page cache holds them before
 /// anything can write over either: the slot it takes, which a process kill
 /// may have left in the page cache alone, and the other, which a kill may
@@ -7976,9 +8083,10 @@ fn an_open_syncs_its_slot(tag: &str, base: Options) {
     }
     std::fs::write(&control, &bytes[newest]).unwrap();
     let before = [0, 1].map(|j| os_page_unwritten(&d.join(OS_SLOTS[j])));
-    let from = Db::trace_dir_io(true).len();
+    let from = Db::trace_dir_io(&d, true).len();
     let db = Db::open(&d, opts.clone()).unwrap();
     let calls = osl_calls(&d, from);
+    Db::trace_dir_io(&d, false);
     // The calls: an fdatasync of each slot file that returned.
     for slot in OS_SLOTS {
         assert!(
@@ -7989,9 +8097,22 @@ fn an_open_syncs_its_slot(tag: &str, base: Options) {
         );
     }
     if before.iter().any(|b| b.is_none()) {
-        eprintln!(
-            "{tag}: the kernel does not say which pages are dirty to this process; the page \
-             flags not read"
+        // Without the kernel's page flags, the page cache asked whether
+        // each page was written: the control, written and synced by
+        // nobody, has to read as not written, or the instrument read
+        // nothing.
+        let control_kept = os_page_kept_unwritten(&control);
+        let after = [0, 1].map(|j| os_page_kept_unwritten(&d.join(OS_SLOTS[j])));
+        assert_eq!(
+            control_kept,
+            Some(true),
+            "{tag}: the control, a file the open does not touch, is still not written back"
+        );
+        assert_eq!(
+            after,
+            [Some(false), Some(false)],
+            "{tag}: both slots (the open took {}) are on the device once the open has returned",
+            OS_SLOTS[newest]
         );
     } else {
         assert_eq!(
@@ -8129,7 +8250,7 @@ fn a_torn_write_over_an_owed_slot(tag: &str, base: Options) {
     // Nothing in flight after the settle: the store's files as they stand
     // are a state a power cut may leave, the torn slot and the slots the
     // owed sync would have named durable among them.
-    copy_store(&d, &c);
+    copy_live(&db, &d, &c);
     // The control: the write left a slot the open refuses, a sequence
     // newer than the store it opens as.
     let newest = OS_SLOTS
@@ -8138,7 +8259,7 @@ fn a_torn_write_over_an_owed_slot(tag: &str, base: Options) {
         .max();
     {
         let o = dir(&format!("os-tear-{tag}-control"));
-        copy_store(&c, &o);
+        copy_live(&db, &c, &o);
         let db = Db::open(&o, opts.clone()).expect("the store after the tear opens");
         assert!(
             newest.is_some_and(|n| db.manifest_seq() < n),
@@ -8325,7 +8446,7 @@ fn an_open_whose_slot_sync_fails_in(tag: &str, base: Options, rename: bool) {
     // from that slot alone leaves of the kill state.
     let named: std::collections::BTreeSet<String> = {
         let o = dir(&format!("os-opensync-{tag}-older"));
-        copy_store(&k, &o);
+        copy_closed(&k, &o);
         std::fs::write(o.join(OS_SLOTS[slot]), &found[OS_SLOTS[1 - slot]]).unwrap();
         drop(Db::open(&o, opts.clone()).expect("the slot before the publish opens"));
         let left = os_files(&o);
@@ -8694,7 +8815,7 @@ fn a_torn_second_seal_slot(tag: &str, base: Options) {
         "{tag}: no drain landed a second seal over an owed slot; the case was not reached: \
          {answers:?}"
     );
-    copy_store(&d, &c);
+    copy_live(&db, &d, &c);
     drop(db);
     let failures = os_check_all(&[(c.clone(), "after the torn write".into())], &model, &opts);
     assert!(
@@ -8785,8 +8906,8 @@ fn a_failed_pending_slot_sync(tag: &str, base: Options) {
     );
     let as_written = dir(&format!("os-pendfail-{tag}-written"));
     let torn = dir(&format!("os-pendfail-{tag}-torn"));
-    copy_store(&d, &as_written);
-    copy_store(&d, &torn);
+    copy_live(&db, &d, &as_written);
+    copy_live(&db, &d, &torn);
     std::fs::write(torn.join(OS_SLOTS[slot]), os_torn(&held, seq)).unwrap();
     db.watch_slot_writes(None);
     drop(db);
@@ -9201,11 +9322,11 @@ fn a_damaged_slot_over_a_flushed_run(again: Option<u32>, below: bool, n: u32) {
         db.put(key(k).as_bytes(), b"again");
         model.insert(key(k).into_bytes(), vec![b"again".to_vec()]);
         db.commit().unwrap();
-        copy_store(&d, &c);
+        copy_live(&db, &d, &c);
         drop(db);
     } else {
         db.close().unwrap();
-        copy_store(&d, &c);
+        copy_closed(&d, &c);
     }
     let d = c;
     assert!(!open_run(&d), "premise: the run's temp name retired");
@@ -9261,7 +9382,7 @@ fn a_refused_open_leaves_the_log_files_its_replay_ended_before() {
         assert!(i < 100_000, "the log rotated twice");
     }
     put_commit(&mut db, "s0000000", "x").unwrap();
-    copy_store(&d, &c);
+    copy_live(&db, &d, &c);
     drop(db);
     let wals = wal_names(&c);
     assert_eq!(wals.len(), 3, "premise: three log files: {wals:?}");
@@ -9302,7 +9423,7 @@ fn an_open_removes_the_log_files_after_the_end_it_replayed_to() {
         assert!(i < 100_000, "the log rotated twice");
     }
     put_commit(&mut db, "s0000000", "x").unwrap();
-    copy_store(&d, &c);
+    copy_live(&db, &d, &c);
     drop(db);
     let wals = wal_names(&c);
     assert_eq!(wals.len(), 3, "premise: three log files: {wals:?}");
@@ -9510,7 +9631,7 @@ fn an_open_under_a_cipher_adopts_a_pending_segment_and_opens_again() {
     db.hold_seal_durable(true);
     db.seal().unwrap();
     wait_for("the seal's pending slot", || seq(&d) > at);
-    copy_store(&d, &c);
+    copy_live(&db, &d, &c);
     db.hold_seal_durable(false);
     drop(db);
     let copied = seq(&c);
@@ -9677,7 +9798,7 @@ fn the_windows_a_torn_publish_leaves_open_through_the_slot_before() {
                 });
             }
         }
-        copy_store(&d, &c);
+        copy_live(&db, &d, &c);
         db.hold_seal_durable(false);
         db.hold_merge_landing(false);
         if case.starts_with("inputs") {
@@ -9686,7 +9807,7 @@ fn the_windows_a_torn_publish_leaves_open_through_the_slot_before() {
             // the copy taken while it was held.
             db.settle().unwrap();
             let b = dir("oo-win-inputs-landed");
-            copy_store(&d, &b);
+            copy_live(&db, &d, &b);
             for (n, bytes) in files_of(&c) {
                 let seg = ["par-", "pcs-", "seg-", "ord-"]
                     .iter()
@@ -10013,11 +10134,11 @@ fn a_pending_segment_adopted_by_an_open(how: OoTear, ord_durable: bool, pieces: 
         oo_dirty(&d.join(f));
     }
     let kernel = os_page_unwritten(&d.join(&pend[0])).is_some();
-    // The calls themselves, process-wide: left on, since tests beside this
-    // one may be reading it too, and read for this directory alone.
-    let from = Db::trace_dir_io(true).len();
+    // The calls themselves, recorded for this directory alone and let go
+    // once read.
+    let from = Db::trace_dir_io(&d, true).len();
     let db = Db::open(&d, opts.clone()).unwrap();
-    let calls: Vec<(&str, PathBuf)> = Db::trace_dir_io(true)
+    let calls: Vec<(&str, PathBuf)> = Db::trace_dir_io(&d, false)
         .split_off(from)
         .into_iter()
         .filter(|(what, p)| match *what {
@@ -10259,9 +10380,9 @@ fn an_open_adopts_a_pending_segment_whose_durable_index_a_power_cut_took() {
     // go on in the original -- the landing opens the segment it published
     // and composes an index it finds missing -- where a killed process's
     // would not.
-    std::mem::forget(db);
     let c = dir("oo-pend-noord-kill");
-    copy_store(&d, &c);
+    copy_live(&db, &d, &c);
+    std::mem::forget(db);
     let d = c;
     let ords: Vec<String> = pend
         .iter()
@@ -10330,10 +10451,10 @@ fn an_open_that_adopts_several_pending_pieces_makes_each_durable() {
 // newest slot the next open reads.
 // ---------------------------------------------------------------------
 
-/// The calls the process-wide record holds from `from` on for files of
+/// The calls the record kept for `d` holds from `from` on for files of
 /// `d`: what an open of `d` made (`Db::trace_dir_io`).
 fn osl_calls(d: &Path, from: usize) -> Vec<(&'static str, PathBuf)> {
-    Db::trace_dir_io(true)
+    Db::trace_dir_io(d, true)
         .split_off(from)
         .into_iter()
         .filter(|(_, p)| p.parent() == Some(d))
@@ -10407,18 +10528,18 @@ fn a_torn_publish_over_an_owed_slot(tag: &str, base: Options) {
 
     // A copy for the second sync's failure, below.
     let k2 = dir(&format!("osl-torn-{tag}-fail"));
-    copy_store(&k, &k2);
+    copy_closed(&k, &k2);
     // And one for the newest slot passed over for pending segments, below:
     // plain only, since a sealed slot is not forged here.
     let skipped_case = whole.starts_with(b"SUPDBMAN");
     let k3 = dir(&format!("osl-torn-{tag}-skipped"));
     let at_kill = model.clone();
     if skipped_case {
-        copy_store(&k, &k3);
+        copy_closed(&k, &k3);
     }
 
     // The reopen, the slot written torn passed over.
-    let from = Db::trace_dir_io(true).len();
+    let from = Db::trace_dir_io(&k, true).len();
     let mut db = Db::open(&k, opts.clone()).expect("the kill state opens");
     let calls = osl_calls(&k, from);
     db.hold_merge_landing(true);
@@ -10449,7 +10570,7 @@ fn a_torn_publish_over_an_owed_slot(tag: &str, base: Options) {
     // fdatasync of that file ran since the kill, the torn image where the
     // open's did.
     let cut = dir(&format!("osl-torn-{tag}-cut"));
-    copy_store(&k, &cut);
+    copy_live(&db, &k, &cut);
     db.hold_seal_landing(false);
     db.hold_merge_landing(false);
     let b_synced = calls
@@ -10464,6 +10585,7 @@ fn a_torn_publish_over_an_owed_slot(tag: &str, base: Options) {
     db.flush().unwrap();
     db.settle().unwrap();
     let later = osl_calls(&k, from);
+    Db::trace_dir_io(&k, false);
     drop(db);
     let failures = os_check_all(
         &[(
@@ -10507,7 +10629,7 @@ fn a_torn_publish_over_an_owed_slot(tag: &str, base: Options) {
     // gives it has removed and written nothing; the failure names the
     // inode of the slot the open did not take.
     let found = os_files(&k2);
-    let from2 = Db::trace_dir_io(true).len();
+    let from2 = Db::trace_dir_io(&k2, true).len();
     let refused = match Db::open(
         &k2,
         Options {
@@ -10541,6 +10663,7 @@ fn a_torn_publish_over_an_owed_slot(tag: &str, base: Options) {
     // The call that records an fdatasync once it returns records the taken
     // slot's and not the one that failed.
     let failed_calls = osl_calls(&k2, from2);
+    Db::trace_dir_io(&k2, false);
     let synced_of = |s: &str| {
         failed_calls
             .iter()
@@ -10633,7 +10756,7 @@ fn osl_skipped(
     // Premises, each on a copy: with its segments whole the open takes the
     // forged slot, and with one lost it passes the slot over for the other.
     let w = dir(&format!("osl-skip-{tag}-whole"));
-    copy_store(k, &w);
+    copy_closed(k, &w);
     let seq = Db::open(&w, opts.clone())
         .expect("the forged slot's store opens")
         .manifest_seq();
@@ -10644,7 +10767,7 @@ fn osl_skipped(
         owed + 1
     );
     oo_tear(&k.join(&new[0]), OoTear::Empty);
-    copy_store(k, &w);
+    copy_closed(k, &w);
     let seq = Db::open(&w, opts.clone())
         .expect("the store with a pending segment lost opens")
         .manifest_seq();
@@ -10655,7 +10778,7 @@ fn osl_skipped(
     );
     let _ = std::fs::remove_dir_all(&w);
     // The open stopped between its sweep and its own write over `b`.
-    let from = Db::trace_dir_io(true).len();
+    let from = Db::trace_dir_io(k, true).len();
     let refused = match Db::open(
         k,
         Options {
@@ -10671,6 +10794,7 @@ fn osl_skipped(
         "{tag}: the open failed for another reason: {refused}"
     );
     let calls = osl_calls(k, from);
+    Db::trace_dir_io(k, false);
     assert!(
         new.iter().all(|n| !k.join(n).exists()),
         "{tag}: premise: the open swept {new:?} before its slot write"
@@ -10678,7 +10802,7 @@ fn osl_skipped(
     // The power cut: every file as the page cache holds it, and `b` the
     // owed publish whole where no fdatasync of that file ran since the kill.
     let cut = dir(&format!("osl-skip-{tag}-cut"));
-    copy_store(k, &cut);
+    copy_closed(k, &cut);
     let b_synced = calls
         .iter()
         .any(|(what, p)| *what == "sync_slot" && *p == k.join(OS_SLOTS[b]));
@@ -11072,7 +11196,7 @@ fn a_rename_shape_publish_leaves_a_whole_manifest_at_every_step_under_a_cipher()
 
 /// The trace's directory fsyncs of `d` from `from` on.
 fn ra_dir_synced(d: &Path, from: usize) -> bool {
-    Db::trace_dir_io(true)
+    Db::trace_dir_io(d, true)
         .split_off(from)
         .iter()
         .any(|(what, p)| *what == "sync_dir" && p.starts_with(d))
@@ -11222,7 +11346,7 @@ fn ra_kill_and_reopen(
     for (n, (p, model)) in pubs.iter().enumerate() {
         let x = ra_state(&p.at, &root.join(format!("k{n}")), |_| {});
         let found = ra_names(&x);
-        let from = Db::trace_dir_io(true).len();
+        let from = Db::trace_dir_io(&x, true).len();
         if prefail {
             assert!(
                 !x.join("manifest.alt").exists(),
@@ -11277,6 +11401,7 @@ fn ra_kill_and_reopen(
         let y = root.join(format!("k{n}-cut"));
         os_copy(&x, &y);
         let synced = ra_dir_synced(&x, from);
+        Db::trace_dir_io(&x, false);
         std::mem::forget(db);
         if !synced {
             std::fs::write(y.join("manifest"), &p.before).unwrap();
@@ -11354,7 +11479,7 @@ fn a_crossing_slots_open_whose_dir_sync_fails(tag: &str, base: Options) {
             "{tag}: premise: the rename life took the slots' other file away"
         );
         let found = ra_names(&x);
-        let from = Db::trace_dir_io(true).len();
+        let from = Db::trace_dir_io(&x, true).len();
         let e = match Db::open(&x, reopen.clone()) {
             Ok(_) => panic!("{tag}: publish {}: the open answered no failure", p.seq),
             Err(e) => e.to_string(),
@@ -11362,7 +11487,7 @@ fn a_crossing_slots_open_whose_dir_sync_fails(tag: &str, base: Options) {
         // The seam stands in for the fsync after the slot file is made, so
         // the one directory fsync the failed open made is the one before
         // the file was made.
-        let calls: Vec<(&str, PathBuf)> = Db::trace_dir_io(true)
+        let calls: Vec<(&str, PathBuf)> = Db::trace_dir_io(&x, false)
             .split_off(from)
             .into_iter()
             .filter(|(_, q)| q.starts_with(&x))
@@ -11795,9 +11920,9 @@ fn a_pending_store_reopened_under_the_rename_shape_as(
     for f in &made {
         oo_dirty(&d.join(f));
     }
-    let from = Db::trace_dir_io(true).len();
+    let from = Db::trace_dir_io(&d, true).len();
     let mut db = Db::open(&d, rename.clone()).unwrap();
-    let calls = Db::trace_dir_io(true).split_off(from);
+    let calls = Db::trace_dir_io(&d, false).split_off(from);
     let synced: Vec<PathBuf> = calls
         .iter()
         .filter(|(what, p)| *what == "sync_file" && p.parent() == Some(d.as_path()))
@@ -11913,9 +12038,9 @@ fn a_slots_store_reopened_under_the_rename_shape(tag: &str, base: Options) {
         "{tag}: premise: a kill with a drain's slot owed was built"
     );
     let (kill, device, _) = t.kills.remove(0);
-    let from = Db::trace_dir_io(true).len();
+    let from = Db::trace_dir_io(&kill, true).len();
     let mut db = Db::open(&kill, rename.clone()).expect("the kill state opens");
-    let synced: Vec<PathBuf> = Db::trace_dir_io(true)
+    let synced: Vec<PathBuf> = Db::trace_dir_io(&kill, false)
         .split_off(from)
         .into_iter()
         .filter(|(what, _)| *what == "sync_slot")
@@ -12097,10 +12222,12 @@ fn a_rename_publish_syncs_its_directory(tag: &str, base: Options) {
     db.settle().unwrap();
     type At = std::sync::Arc<std::sync::Mutex<Vec<usize>>>;
     let at: At = Default::default();
+    Db::trace_dir_io(&d, true);
     let watch: supdb::db::SlotWatch = {
         let at = at.clone();
+        let dd = d.clone();
         std::sync::Arc::new(move |_: &supdb::db::SlotWrite| {
-            let n = Db::trace_dir_io(true).len();
+            let n = Db::trace_dir_io(&dd, true).len();
             at.lock().unwrap_or_else(|e| e.into_inner()).push(n);
         })
     };
@@ -12120,7 +12247,7 @@ fn a_rename_publish_syncs_its_directory(tag: &str, base: Options) {
             !marks.is_empty(),
             "{tag}: round {r}: premise: the flush published"
         );
-        let trace = Db::trace_dir_io(true);
+        let trace = Db::trace_dir_io(&d, true);
         for (i, &m) in marks.iter().enumerate() {
             let end = marks.get(i + 1).copied().unwrap_or(trace.len());
             assert!(
@@ -12134,6 +12261,7 @@ fn a_rename_publish_syncs_its_directory(tag: &str, base: Options) {
         db.settle().unwrap();
     }
     db.watch_slot_writes(None);
+    Db::trace_dir_io(&d, false);
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -12301,7 +12429,7 @@ fn dl_power_cut(db: &Db, d: &Path, crash: &Path, lives: &[&[(PathBuf, Option<u64
     use std::os::unix::fs::MetadataExt;
     let synced = db.run_device_synced().expect("the run is open").0;
     let ino = (open_run(d)).then(|| run_ino(d));
-    copy_store(d, crash);
+    copy_live(&db, d, crash);
     if let Some(ino) = ino {
         for e in std::fs::read_dir(d).unwrap() {
             let e = e.unwrap();
@@ -12616,7 +12744,7 @@ fn a_runs_due_commit_under_a_cipher_syncs_the_log_once_behind_its_frames() {
         assert!(!db.wal_unsynced(), "the due commit left the log owing");
         let (_, synced, written) = db.wal_durable();
         assert_eq!(synced, written, "the log's every frame is synced");
-        copy_store(&d, &crash);
+        copy_live(&db, &d, &crash);
         power_cut_logs(&crash, &[&traced], WAL_HEAD, &[]);
     }));
     db.hold_seal_durable(false);
@@ -13130,7 +13258,9 @@ fn a_runs_commits_its_close_synced_before_a_due_one_outlive_older_log_frames() {
                 })
             };
             wait_for("the closed run's link", || linked(&dd));
-            copy_store(&dd, &cc);
+            // The seal held between its phases (`hold_seal_durable`) lands
+            // nothing, and the writer waits in its flush for it.
+            copy_held(&dd, &cc);
             // The presync's extent of the run's file under its temp name; the
             // link's entry is the directory's, which no fsync covered.
             for e in std::fs::read_dir(&dd).unwrap() {
@@ -13631,7 +13761,7 @@ fn a_runs_due_commit_after_a_run_closed_into_a_held_seal_outlives_that_runs_comm
         let b_synced = db.run_device_synced().expect("B is open").0;
         assert!(b_synced > 0, "the premise, B's due commit synced its file");
         let traced = db.wal_syncs_traced();
-        copy_store(&d, &crash);
+        copy_live(&db, &d, &crash);
         // Each run's file, under every name it has, cut to what its syncs
         // covered; the log to what its own did.
         for e in std::fs::read_dir(&d).unwrap() {
@@ -14680,12 +14810,13 @@ fn ps_failure_taken_once(tag: &str, inline: bool) {
     db.fail_next_presync();
     db.flush()
         .expect_err("a store whose seal queue stopped answers the stop");
-    let third = db
-        .failed_presync_extent()
-        .expect("the failure was injected");
-    assert_ne!(
-        third.0, first.0,
-        "the store closed no later run, so nothing was presynced after the first failure"
+    // The flush answers the stopped queue without waiting for the closed
+    // run's seal job, and on the inline arm (`close_finish_inline`) the
+    // presync runs on a thread of its own, which records its failure when
+    // it gets there: waited for, not read at the answer.
+    wait_for(
+        &format!("{tag}: a later run's presync took the armed failure"),
+        || db.failed_presync_extent().is_some_and(|e| e.0 != first.0),
     );
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
@@ -14742,7 +14873,7 @@ fn a_failure_armed_under_a_held_presync_is_taken_at_its_lift() {
 
 // ---------------------------------------------------------------------
 // open-cost: what an open reads to make its checks, counted through the
-// process-wide record of the open's own reads (`Db::trace_dir_io`): each
+// record kept for the store's directory of the open's own reads (`Db::trace_dir_io`): each
 // manifest slot file opened once, read and made durable through the one
 // descriptor; a plain store's named segments looked for in the listing the
 // open makes anyway, never one by one (under a cipher, where the listing
@@ -14752,11 +14883,11 @@ fn a_failure_armed_under_a_held_presync_is_taken_at_its_lift() {
 // at its checks replays no log first.
 // ---------------------------------------------------------------------
 
-/// The process-wide record's entries from `from` on of kind `what` for a
+/// The entries of the record kept for `d` from `from` on of kind `what` for a
 /// file under `d` (a store under a cipher records a kept file under the
 /// store's marker), by file name.
 fn oc_calls(d: &Path, from: usize, what: &str) -> Vec<String> {
-    Db::trace_dir_io(true)
+    Db::trace_dir_io(d, true)
         .split_off(from)
         .into_iter()
         .filter(|(w, p)| *w == what && p.starts_with(d))
@@ -14799,7 +14930,7 @@ fn oc_store(tag: &str, base: Options) -> (PathBuf, Options, OcModel) {
 
 fn an_open_reads_each_slot_once(tag: &str, base: Options) {
     let (d, opts, model) = oc_store(&format!("slots-{tag}"), base);
-    let from = Db::trace_dir_io(true).len();
+    let from = Db::trace_dir_io(&d, true).len();
     let db = Db::open(&d, opts).unwrap();
     let mut read = oc_calls(&d, from, "read_slot");
     read.sort();
@@ -14818,10 +14949,11 @@ fn an_open_reads_each_slot_once(tag: &str, base: Options) {
     // opened: the same number, and the same open file description, whose
     // offset the read left at the file's end where a second open of the
     // file starts at nothing.
-    let desc: Vec<_> = Db::trace_slot_descriptors()
+    let desc: Vec<_> = Db::trace_slot_descriptors(&d)
         .into_iter()
         .filter(|(_, p, _, _)| p.starts_with(&d))
         .collect();
+    Db::trace_dir_io(&d, false);
     for s in OO_SLOTS {
         let of = |what: &str| -> Vec<(i32, u64)> {
             desc.iter()
@@ -14867,9 +14999,10 @@ fn an_open_opens_each_slot_file_once_under_a_cipher() {
 
 fn an_open_looks_for_named_segments(tag: &str, base: Options, one_by_one: bool) {
     let (d, opts, model) = oc_store(&format!("named-{tag}"), base);
-    let from = Db::trace_dir_io(true).len();
+    let from = Db::trace_dir_io(&d, true).len();
     let db = Db::open(&d, opts).unwrap();
     let looked = oc_calls(&d, from, "on_device");
+    Db::trace_dir_io(&d, false);
     // What the slot taken names: the store's segments as it opened.
     let named = db.segments();
     assert!(
@@ -14966,7 +15099,7 @@ fn an_open_after_a_crash_reads_only_the_segments_over_an_unnamed_segments_keys()
     wait_for("the merge at its landing hold", || {
         db.merge_waits_at_landing()
     });
-    copy_store(&d, &c);
+    copy_live(&db, &d, &c);
     db.hold_merge_landing(false);
     drop(db);
     let named: Vec<String> = oo_names(&std::fs::read(&oo_by_age(&c)[0]).unwrap())
@@ -14994,9 +15127,10 @@ fn an_open_after_a_crash_reads_only_the_segments_over_an_unnamed_segments_keys()
         named.iter().any(|n| !over(n)),
         "premise: a named segment whose fences leave the middle range out: {named:?}"
     );
-    let from = Db::trace_dir_io(true).len();
+    let from = Db::trace_dir_io(&c, true).len();
     let db = Db::open(&c, opts).expect("the window opens");
     let read = oc_calls(&c, from, "open_holder");
+    Db::trace_dir_io(&c, false);
     assert!(
         !read.is_empty(),
         "premise: the open read segments for the outputs' keys"
@@ -15036,7 +15170,7 @@ fn an_open_that_refuses_an_unnamed_segment_replays_no_log_first() {
     db.settle().unwrap();
     db.put(key(0).as_bytes(), b"again");
     db.commit().unwrap();
-    copy_store(&d, &c);
+    copy_live(&db, &d, &c);
     drop(db);
     assert!(!open_run(&c), "premise: the run's temp name retired");
     assert!(
@@ -15046,9 +15180,10 @@ fn an_open_that_refuses_an_unnamed_segment_replays_no_log_first() {
         "premise: the log holds the write after the flush"
     );
     oo_damage(&oo_by_age(&c)[0]);
-    let from = Db::trace_dir_io(true).len();
+    let from = Db::trace_dir_io(&c, true).len();
     oo_refused(&c, &opts, OO_KEYS, "noreplay");
     let replayed = oc_calls(&c, from, "replay");
+    Db::trace_dir_io(&c, false);
     assert!(
         replayed.is_empty(),
         "an open that refuses at its checks of the slot replayed {replayed:?} first"
@@ -15091,7 +15226,7 @@ fn an_open_after_a_crash_holds_an_unnamed_segments_keys_to_pieces_without_fences
     wait_for("the merge at its landing hold", || {
         db.merge_waits_at_landing()
     });
-    copy_store(&d, &c);
+    copy_live(&db, &d, &c);
     db.hold_merge_landing(false);
     drop(db);
     let named: Vec<String> = oo_names(&std::fs::read(&oo_by_age(&c)[0]).unwrap())
@@ -15111,9 +15246,10 @@ fn an_open_after_a_crash_holds_an_unnamed_segments_keys_to_pieces_without_fences
         !unnamed.is_empty(),
         "premise: the merge's outputs stand unnamed: {named:?}"
     );
-    let from = Db::trace_dir_io(true).len();
+    let from = Db::trace_dir_io(&c, true).len();
     let db = Db::open(&c, opts).expect("the window opens");
     let read = oc_calls(&c, from, "open_holder");
+    Db::trace_dir_io(&c, false);
     assert!(
         !read.is_empty() && read.iter().all(|n| n.starts_with("seg-")),
         "premise: the open read the pieces for the outputs' keys: {read:?}"
@@ -15185,7 +15321,7 @@ fn an_open_after_a_crash_reads_no_piece_whose_fences_leave_an_unnamed_segments_k
     wait_for("the merge at its landing hold", || {
         db.merge_waits_at_landing()
     });
-    copy_store(&d, &c);
+    copy_live(&db, &d, &c);
     db.hold_merge_landing(false);
     drop(db);
     let named: Vec<String> = oo_names(&std::fs::read(&oo_by_age(&c)[0]).unwrap())
@@ -15224,9 +15360,10 @@ fn an_open_after_a_crash_reads_no_piece_whose_fences_leave_an_unnamed_segments_k
         None => true,
         Some((lo, hi)) => lo.as_slice() <= k && hi.is_none_or(|h| k < h.as_slice()),
     };
-    let from = Db::trace_dir_io(true).len();
+    let from = Db::trace_dir_io(&c, true).len();
     let db = Db::open(&c, opts).expect("the window opens");
     let read = oc_calls(&c, from, "open_holder");
+    Db::trace_dir_io(&c, false);
     assert!(
         read.iter().any(|n| n.starts_with("pcs-")),
         "premise: the open read a piece for an output's key: {read:?}"
@@ -15285,7 +15422,7 @@ fn an_open_after_a_crash_holds_an_unnamed_segments_key_at_its_ranges_lower_fence
     wait_for("the merge at its landing hold", || {
         db.merge_waits_at_landing()
     });
-    copy_store(&d, &c);
+    copy_live(&db, &d, &c);
     db.hold_merge_landing(false);
     drop(db);
     let named: Vec<String> = oo_names(&std::fs::read(&oo_by_age(&c)[0]).unwrap())
@@ -15331,9 +15468,10 @@ fn an_open_after_a_crash_holds_an_unnamed_segments_key_at_its_ranges_lower_fence
         "premise: every named segment whose fences take m in has m for its lower fence: \
          {named:?}"
     );
-    let from = Db::trace_dir_io(true).len();
+    let from = Db::trace_dir_io(&c, true).len();
     let db = Db::open(&c, opts).expect("the window opens");
     let read = oc_calls(&c, from, "open_holder");
+    Db::trace_dir_io(&c, false);
     assert!(
         read.iter().any(|n| holders.contains(&n)),
         "the open read no segment whose lower fence is the output's last key: {read:?}"
@@ -15341,5 +15479,284 @@ fn an_open_after_a_crash_holds_an_unnamed_segments_key_at_its_ranges_lower_fence
     oo_holds(&db, &model, "lo");
     drop(db);
     let _ = std::fs::remove_dir_all(&c);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// ---------------------------------------------------------------------
+// tests-tidy: what the live store answers after a run's kept error left a
+// frozen table nothing lands, and the reproduction an open-order item of
+// `ROADMAP.md` names.
+// ---------------------------------------------------------------------
+
+/// A run whose fdatasync failed, left by a write below its greatest: the
+/// close refuses to finish the run's file, its seal fails before anything
+/// is published, the seal queue stops, and the run's table stays frozen
+/// with nothing to land it. The live store goes on reading -- the run's
+/// acknowledged commit through the writer and through a handle -- answers
+/// the kept error to every commit, sync and flush and the stopped queue to
+/// a settle, and publishes no manifest, until it is reopened (which
+/// `a_run_whose_fdatasync_failed_is_not_closed_into_a_named_segment`
+/// holds).
+#[test]
+fn a_write_that_leaves_a_run_whose_sync_failed_leaves_the_store_reading_and_refusing() {
+    for (tag, o) in run_arms() {
+        let d = dir(&format!("dur-tidy-leave-{tag}"));
+        let mut db = Db::create(&d, o.clone()).unwrap();
+        db.append(b"k1", b"v1");
+        db.commit().unwrap();
+        let slots_before: Vec<Option<Vec<u8>>> = ["manifest", "manifest.alt"]
+            .iter()
+            .map(|s| std::fs::read(d.join(s)).ok())
+            .collect();
+        db.fail_next_run_sync();
+        db.append(b"k2", b"v2");
+        assert!(db.commit().is_err(), "{tag}: the failed fdatasync");
+        db.put(b"a", b"A");
+        kept(
+            db.commit(),
+            &format!("{tag}: the commit of the write that left"),
+        );
+        assert!(db.run_synced_bytes().is_none(), "{tag}: the run was left");
+        wait_for(&format!("{tag}: the run's seal stops the queue"), || {
+            db.seals_wedged()
+        });
+        assert_eq!(
+            db.frozen_tables(),
+            1,
+            "{tag}: the run's table stays frozen, nothing to land it"
+        );
+        reads(&db, "k1", "v1", &format!("{tag}: the writer, live"));
+        let h = db.reader().unwrap();
+        reads(&h, "k1", "v1", &format!("{tag}: a handle, live"));
+        drop(h);
+        kept(db.commit(), &format!("{tag}: a commit of nothing"));
+        db.put(b"b", b"B");
+        kept(db.commit(), &format!("{tag}: a commit after"));
+        kept(db.sync(), &format!("{tag}: a sync"));
+        kept(db.flush(), &format!("{tag}: a flush"));
+        // A settle answers the stopped queue, whose cause is the same
+        // failure; a flush answered the writer's kept error first.
+        ss_wedged(
+            db.settle(),
+            "an fdatasync of the run's file failed",
+            &format!("{tag}: a settle"),
+        );
+        assert_eq!(db.frozen_tables(), 1, "{tag}: still nothing landed");
+        let slots_after: Vec<Option<Vec<u8>>> = ["manifest", "manifest.alt"]
+            .iter()
+            .map(|s| std::fs::read(d.join(s)).ok())
+            .collect();
+        assert!(
+            slots_after == slots_before,
+            "{tag}: a manifest slot was written after the run's sync failed"
+        );
+        reads(&db, "k1", "v1", &format!("{tag}: the writer, after"));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// The words the refusal below is to answer in, once there is one: the
+/// open's word for a log file the slot it would fall back to needs and the
+/// directory does not hold.
+const OO_LOG: &str = "a log file it covers is missing";
+
+/// A partition, then a seal of rewrites into a piece over it whose log
+/// file retires at the piece's durable landing (`seal_rotates_wal`), and
+/// nothing after. With the newest slot damaged, the slot before it names
+/// the partition alone, every file in place, and covers less of the log
+/// than the piece; the log that held the rewrites is gone, so the open
+/// that took the slot before would answer every rewritten key's first
+/// value. It is to refuse; `ROADMAP.md`'s "A fall back past a damaged slot
+/// whose log retired" says what an open needs to see it.
+#[test]
+#[ignore = "fails today: no slot names the log file its covered sequence lies in, so the open \
+            cannot see that the slot before needs a log file the directory lacks (ROADMAP.md, \
+            \"A fall back past a damaged slot whose log retired\")"]
+fn a_fallback_past_a_slot_whose_log_retired_is_refused() {
+    let d = dir("oo-log");
+    let c = dir("oo-log-kill");
+    let opts = Options {
+        direct_ingest: false,
+        seal_rotates_wal: true,
+        seal_bytes: 1 << 20,
+        l0_trigger: 1000,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    for k in 0..2000u32 {
+        db.put(key(k).as_bytes(), b"v0");
+        model.insert(key(k).into_bytes(), vec![b"v0".to_vec()]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    for k in (0..2000u32).step_by(7) {
+        db.put(key(k).as_bytes(), b"v1");
+        model.insert(key(k).into_bytes(), vec![b"v1".to_vec()]);
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    copy_live(&db, &d, &c);
+    drop(db);
+    let [newest, older] = oo_by_age(&c);
+    let (cov_new, new_names) = oo_names(&std::fs::read(&newest).unwrap());
+    let (cov_old, old_names) = oo_names(&std::fs::read(&older).unwrap());
+    let new_names: Vec<String> = new_names.into_iter().map(|(n, _)| n).collect();
+    assert!(
+        cov_old < cov_new
+            && old_names.iter().all(|(n, _)| c.join(n).exists())
+            && new_names.iter().any(|n| !old_names.iter().any(|(o, _)| o == n)),
+        "premise: the older slot covers less, names files in place, and \
+         not the piece: {old_names:?} at {cov_old} beside {new_names:?} at {cov_new}"
+    );
+    for w in wal_names(&c) {
+        assert_eq!(
+            std::fs::metadata(c.join(&w)).unwrap().len(),
+            WAL_HEAD,
+            "premise: {w} holds nothing, the file the rewrites were in retired"
+        );
+    }
+    let saved = std::fs::read(&newest).unwrap();
+    oo_damage(&newest);
+    oo_refused(&c, &opts, OO_LOG, "log");
+    std::fs::write(&newest, &saved).unwrap();
+    let db = Db::open(&c, opts).expect("the store with its slot put back opens");
+    oo_holds(&db, &model, "log, repaired");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&c);
+}
+
+/// The pause a live store's copy is taken under (`copy_live`): while the
+/// segment work is paused nothing lands, so a merge let go under it
+/// finishes and waits, its slot unwritten and its inputs in place, and it
+/// lands once the pause ends.
+#[test]
+fn a_paused_segment_work_lands_nothing_until_it_goes_on() {
+    let d = dir("dur-tidy-pause");
+    let mut model = SsModel::new();
+    let (db, _) = ss_store_with_a_merge_due(&d, Options::default(), &mut model, |db| {
+        db.hold_merge_landing(true)
+    });
+    wait_for("the merge at its landing hold", || {
+        db.merge_waits_at_landing()
+    });
+    let slots = || ["manifest", "manifest.alt"].map(|s| std::fs::read(d.join(s)).ok());
+    let (before, segs) = (slots(), seg_names(&d));
+    let paused = db
+        .pause_segment_work()
+        .expect("the segment work has a thread of its own");
+    db.hold_merge_landing(false);
+    wait_for("the merge past its landing hold", || {
+        !db.merge_waits_at_landing()
+    });
+    // The merge's thread has nothing left but to return; a landing beside
+    // the pause would have written its slot and removed its inputs here.
+    let t = std::time::Instant::now();
+    while t.elapsed() < std::time::Duration::from_millis(300) {
+        assert!(db.in_flight().1, "the merge landed under the pause");
+        assert!(slots() == before, "a slot was written under the pause");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        segs.iter().all(|n| d.join(n).exists()),
+        "an input was removed under the pause"
+    );
+    drop(paused);
+    wait_for("the merge's landing once the pause ended", || {
+        !db.in_flight().1 && slots() != before
+    });
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The record of a store's calls (`Db::trace_dir_io`) is kept for the
+/// directory a test asks for and for nothing else -- another store's
+/// calls beside it are not in it -- and asked off it is handed back and
+/// let go, so the next ask starts from nothing: the record holds the calls
+/// of the tests reading it while they read it.
+#[test]
+fn the_call_record_holds_the_directory_asked_for_until_it_is_let_go() {
+    let d = dir("dur-tidy-trace");
+    let other = dir("dur-tidy-trace-other");
+    assert!(Db::trace_dir_io(&d, true).is_empty(), "a fresh record");
+    let db = Db::create(&d, Options::default()).unwrap();
+    let db2 = Db::create(&other, Options::default()).unwrap();
+    drop(db2);
+    let rec = Db::trace_dir_io(&d, true);
+    assert!(
+        rec.iter().any(|(what, p)| *what == "sync_dir" && p == &d),
+        "premise: the creation fsynced its directory: {rec:?}"
+    );
+    assert!(
+        rec.iter().all(|(_, p)| p.starts_with(&d)),
+        "the record holds calls on another directory: {rec:?}"
+    );
+    drop(db);
+    let all = Db::trace_dir_io(&d, false);
+    assert!(all.len() >= rec.len(), "asked off, the record handed back");
+    assert!(
+        Db::trace_dir_io(&d, true).is_empty(),
+        "asked again, the record starts from nothing"
+    );
+    Db::trace_dir_io(&d, false);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&other);
+}
+
+/// A pause asked while the segment work is inside a landing returns only
+/// once that landing has ended, so nothing a copy taken under it reads
+/// is half a landing: the landing is held at its slot write (the watch
+/// runs on the segment work's thread and waits there), the pause asked,
+/// and the landing let go a moment later from another thread.
+#[test]
+fn a_pause_asked_inside_a_landing_returns_after_it() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let d = dir("dur-tidy-pause-inside");
+    let mut model = SsModel::new();
+    let (db, _) = ss_store_with_a_merge_due(&d, Options::default(), &mut model, |db| {
+        db.hold_merge_landing(true)
+    });
+    wait_for("the merge at its landing hold", || {
+        db.merge_waits_at_landing()
+    });
+    let (inside, go) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let watch: supdb::db::SlotWatch = {
+        let (inside, go) = (inside.clone(), go.clone());
+        Arc::new(move |_: &supdb::db::SlotWrite| {
+            inside.store(true, Ordering::Release);
+            let t = std::time::Instant::now();
+            while !go.load(Ordering::Acquire) && t.elapsed() < std::time::Duration::from_secs(60) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })
+    };
+    db.watch_slot_writes(Some(watch));
+    db.hold_merge_landing(false);
+    wait_for("the merge's landing at its slot write", || {
+        inside.load(Ordering::Acquire)
+    });
+    let lifter = {
+        let go = go.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            go.store(true, Ordering::Release);
+        })
+    };
+    let paused = db
+        .pause_segment_work()
+        .expect("the segment work has a thread of its own");
+    assert!(
+        go.load(Ordering::Acquire),
+        "the pause returned while the landing it was asked inside was still writing its slot"
+    );
+    drop(paused);
+    lifter.join().unwrap();
+    db.watch_slot_writes(None);
+    drop(db);
     let _ = std::fs::remove_dir_all(&d);
 }

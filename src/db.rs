@@ -12803,6 +12803,13 @@ pub struct SlotWrite {
     pub synced: [u64; 2],
 }
 
+/// A test's: the segment work paused while this lives
+/// (`Db::pause_segment_work`); dropped, it goes on.
+#[doc(hidden)]
+pub struct SegmentWorkPaused {
+    _until: std::sync::mpsc::Sender<()>,
+}
+
 /// A test's: run on the segment work's thread before each slot write.
 #[doc(hidden)]
 pub type SlotWatch = std::sync::Arc<dyn Fn(&SlotWrite) + Send + Sync>;
@@ -33811,29 +33818,30 @@ impl Db {
             .store(true, AtomicOrdering::Release);
     }
 
-    /// A test's: from `on`, record every directory fsync that returned,
-    /// every fsync the open makes of a pending segment or its ordered index
-    /// that returned (`sync_file`), and every open of a manifest slot for
-    /// writing, process-wide and in the
-    /// order they were made, each with its path; off, record nothing. The
-    /// record so far, which a test reads for its own directory: what an
-    /// open made durable before the slot it writes, read from the calls
+    /// A test's: with `on`, record from now, for `dir` and every file
+    /// under it, every directory fsync that returned, every file fsync
+    /// through the door's recorded calls that returned (`sync_file`,
+    /// `sync_slot`), every open of a manifest slot for writing and the
+    /// open's own reads, in the order they were made, each with its path;
+    /// the record for `dir` so far. Off, the record returned and dropped:
+    /// a test asks it off once it has read, so the record holds the calls
+    /// on the directories of the tests reading it and nothing else. What
+    /// an open made durable before the slot it writes, read from the calls
     /// themselves and not from the open's word for them
     /// (`open_synced_files`).
     #[doc(hidden)]
-    pub fn trace_dir_io(on: bool) -> Vec<(&'static str, PathBuf)> {
-        vault::trace_io(on)
+    pub fn trace_dir_io(dir: &Path, on: bool) -> Vec<(&'static str, PathBuf)> {
+        vault::trace_io(dir, on)
     }
 
-    /// A test's: beside the record `trace_dir_io` keeps, the descriptor
-    /// each slot file was read through at an open (`read_slot`) and the
-    /// one each slot fdatasync was made through (`sync_slot`): the call,
-    /// the file's path in the filesystem, the descriptor's number and its
-    /// open file description's offset, in order, process-wide, recorded
-    /// while `trace_dir_io` is on.
+    /// A test's: beside the record `trace_dir_io` keeps for `dir`, the
+    /// descriptor each slot file was read through at an open (`read_slot`)
+    /// and the one each slot fdatasync was made through (`sync_slot`): the
+    /// call, the file's path in the filesystem, the descriptor's number and
+    /// its open file description's offset, in order.
     #[doc(hidden)]
-    pub fn trace_slot_descriptors() -> Vec<(&'static str, PathBuf, i32, u64)> {
-        vault::traced_descriptors()
+    pub fn trace_slot_descriptors(dir: &Path) -> Vec<(&'static str, PathBuf, i32, u64)> {
+        vault::traced_descriptors(dir)
     }
 
     /// A test's: the files the open that made this store fsynced, the
@@ -34141,6 +34149,36 @@ impl Db {
         self.shared
             .forms_position_hold
             .store(on, AtomicOrdering::Release);
+    }
+
+    /// A test's: the store's segment work stopped where it stands until
+    /// the answer is dropped. On a thread of its own
+    /// (`Options::publish_in_background`), the thread takes this as its
+    /// next job and waits in it, pinning nothing, so nothing lands, no
+    /// manifest slot is written and no file is retired or swept while the
+    /// answer lives; this returns once the thread is waiting, which is
+    /// after any landing it was in has ended. Inline the segment work runs
+    /// inside the writer's own calls, and nothing is asked. Seal and merge
+    /// threads go on writing their own files, which nothing names until a
+    /// landing. So a copy of the store's directory taken meanwhile is a
+    /// state a process kill can leave. `None` where nothing was paused. A
+    /// thread another of the test's holds keeps waiting
+    /// (`hold_owed_slot`) is waited for, so a test pauses only where
+    /// nothing it holds stops the thread.
+    #[doc(hidden)]
+    pub fn pause_segment_work(&self) -> Option<SegmentWorkPaused> {
+        let MaintHome::Away(a) = &self.maint else {
+            return None;
+        };
+        let jobs = a.tx.as_ref()?;
+        let (here_tx, here) = std::sync::mpsc::channel();
+        let (until, until_rx) = std::sync::mpsc::channel();
+        jobs.send(MaintJob::Pause(here_tx, until_rx)).ok()?;
+        if let Some(t) = &a.thread {
+            t.unpark();
+        }
+        here.recv().ok()?;
+        Some(SegmentWorkPaused { _until: until })
     }
 
     /// A test's: while `on`, a merge's thread waits before it returns its
@@ -39465,6 +39503,9 @@ enum MaintJob {
     Seal(SealJob),
     /// Something the writer waits for, answered down the sender.
     Ask(MaintAsk, std::sync::mpsc::Sender<Result<()>>),
+    /// A test's (`Db::pause_segment_work`): the thread says it is here and
+    /// waits, holding nothing, until the second channel's sender drops.
+    Pause(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>),
 }
 
 /// A seal in flight, as the segment work holds it: its thread; the names
@@ -39957,6 +39998,11 @@ impl Maint {
                 break;
             }
             match rx.try_recv() {
+                Ok(MaintJob::Pause(here, until)) => {
+                    let _ = here.send(());
+                    let _ = until.recv();
+                    continue;
+                }
                 Ok(job) => {
                     self.handle(job);
                     continue;
@@ -39983,6 +40029,7 @@ impl Maint {
                 MaintJob::Ask(_, reply) => {
                     let _ = reply.send(Err(err("the store is closing")));
                 }
+                MaintJob::Pause(..) => {}
             }
         }
         self.shared
@@ -40018,6 +40065,7 @@ impl Maint {
                     self.shared.put_maint_err(e);
                 }
             }
+            MaintJob::Pause(..) => unreachable!("taken by the loop, before a pin"),
         }
     }
 
@@ -40749,6 +40797,15 @@ impl Maint {
             });
             let to = self.slot.next();
             self.watch_slot(to, self.manifest_seq, true);
+            // No slot is owed its fdatasync here: under this shape a drain
+            // leaves one owed only where its landing found no pending name
+            // (`land_durable`), and a seal that lands a segment makes one,
+            // here. Were one owed, the answer below, which says what
+            // waited behind it may retire, would be dropped.
+            debug_assert!(
+                self.slot_sync_due.is_none(),
+                "a pending landing over a slot owed its fdatasync"
+            );
             let (slot, _) = self.write_slot(to, covered, &live, names)?;
             let dir = vault::open_dir(&self.dir)?;
             if self.sync_helper.is_none() {
