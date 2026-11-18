@@ -13147,8 +13147,8 @@ fn manifest_read_all(dir: &Path) -> Result<(Vec<Manifest>, [Option<File>; 2])> {
         let mut buf = Vec::new();
         match vault::open(dir.join(slot)) {
             Ok(mut f) => {
-                vault::note("read_slot", dir.join(slot));
                 f.read_to_end(&mut buf)?;
+                vault::note_file("read_slot", dir.join(slot), &f);
                 files[i] = Some(f);
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -33823,6 +33823,17 @@ impl Db {
     #[doc(hidden)]
     pub fn trace_dir_io(on: bool) -> Vec<(&'static str, PathBuf)> {
         vault::trace_io(on)
+    }
+
+    /// A test's: beside the record `trace_dir_io` keeps, the descriptor
+    /// each slot file was read through at an open (`read_slot`) and the
+    /// one each slot fdatasync was made through (`sync_slot`): the call,
+    /// the file's path in the filesystem, the descriptor's number and its
+    /// open file description's offset, in order, process-wide, recorded
+    /// while `trace_dir_io` is on.
+    #[doc(hidden)]
+    pub fn trace_slot_descriptors() -> Vec<(&'static str, PathBuf, i32, u64)> {
+        vault::traced_descriptors()
     }
 
     /// A test's: the files the open that made this store fsynced, the

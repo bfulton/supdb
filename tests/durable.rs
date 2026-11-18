@@ -14814,6 +14814,42 @@ fn an_open_reads_each_slot_once(tag: &str, base: Options) {
         2,
         "{tag}: both slot files made durable by the open: {synced:?}"
     );
+    // Each slot file's fdatasync made through the descriptor its read
+    // opened: the same number, and the same open file description, whose
+    // offset the read left at the file's end where a second open of the
+    // file starts at nothing.
+    let desc: Vec<_> = Db::trace_slot_descriptors()
+        .into_iter()
+        .filter(|(_, p, _, _)| p.starts_with(&d))
+        .collect();
+    for s in OO_SLOTS {
+        let of = |what: &str| -> Vec<(i32, u64)> {
+            desc.iter()
+                .filter(|(w, p, _, _)| {
+                    *w == what && p.file_name().unwrap() == std::ffi::OsStr::new(s)
+                })
+                .map(|&(_, _, fd, at)| (fd, at))
+                .collect()
+        };
+        let (read, sync) = (of("read_slot"), of("sync_slot"));
+        let len = std::fs::metadata(d.join(s)).unwrap().len();
+        assert!(len > 0, "{tag}: premise: the slot file {s} holds a slot");
+        assert_eq!(
+            (read.len(), sync.len()),
+            (1, 1),
+            "{tag}: {s} read once and synced once: {desc:?}"
+        );
+        assert_eq!(
+            read[0],
+            (read[0].0, len),
+            "{tag}: {s} read whole through its descriptor"
+        );
+        assert_eq!(
+            sync[0], read[0],
+            "{tag}: {s} made durable through the descriptor its read opened, not a second open \
+             of the file"
+        );
+    }
     oo_holds(&db, &model, tag);
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
@@ -15017,6 +15053,293 @@ fn an_open_that_refuses_an_unnamed_segment_replays_no_log_first() {
         replayed.is_empty(),
         "an open that refuses at its checks of the slot replayed {replayed:?} first"
     );
+    let _ = std::fs::remove_dir_all(&c);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A store that has not partitioned yet: its segments are `seg-` pieces,
+/// whose names carry no fences and so take in every key. The first merge,
+/// held at its landing and the store copied there, leaves its outputs
+/// unnamed beside the pieces; the open holds their last keys to the
+/// pieces, which it may not pass over for want of fences.
+#[test]
+fn an_open_after_a_crash_holds_an_unnamed_segments_keys_to_pieces_without_fences() {
+    let d = dir("oc-seg");
+    let c = dir("oc-seg-kill");
+    let opts = Options {
+        partition_on_flush: false,
+        l0_trigger: 3,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    for r in 0..3u32 {
+        for k in (0..1500u32).rev() {
+            let k = format!("{:06}-{r}", k).into_bytes();
+            db.put(&k, b"v");
+            model.insert(k, vec![b"v".to_vec()]);
+        }
+        db.commit().unwrap();
+        if r == 2 {
+            db.hold_merge_landing(true);
+        }
+        db.seal().unwrap();
+        if r < 2 {
+            db.settle().unwrap();
+        }
+    }
+    wait_for("the merge at its landing hold", || {
+        db.merge_waits_at_landing()
+    });
+    copy_store(&d, &c);
+    db.hold_merge_landing(false);
+    drop(db);
+    let named: Vec<String> = oo_names(&std::fs::read(&oo_by_age(&c)[0]).unwrap())
+        .1
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    let unnamed: Vec<String> = seg_names(&c)
+        .into_iter()
+        .filter(|n| !named.contains(n))
+        .collect();
+    assert!(
+        !named.is_empty() && named.iter().all(|n| n.starts_with("seg-")),
+        "premise: the slot names pieces without fences alone: {named:?}"
+    );
+    assert!(
+        !unnamed.is_empty(),
+        "premise: the merge's outputs stand unnamed: {named:?}"
+    );
+    let from = Db::trace_dir_io(true).len();
+    let db = Db::open(&c, opts).expect("the window opens");
+    let read = oc_calls(&c, from, "open_holder");
+    assert!(
+        !read.is_empty() && read.iter().all(|n| n.starts_with("seg-")),
+        "premise: the open read the pieces for the outputs' keys: {read:?}"
+    );
+    oo_holds(&db, &model, "seg");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&c);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The same window with pieces standing beside the partitions: a piece
+/// over the first range, under its partition's last key, and one over the
+/// middle range with a key past its partition's last, so that the merge's
+/// output over the middle range ends at a key only that piece holds. The
+/// open reads, for each output's last key, only segments whose names'
+/// fences take that key in: a piece's name has fences as a partition's
+/// does, and the piece over the first range is not read for the middle
+/// range's key.
+#[test]
+fn an_open_after_a_crash_reads_no_piece_whose_fences_leave_an_unnamed_segments_key_out() {
+    let d = dir("oc-pcs");
+    let c = dir("oc-pcs-kill");
+    let opts = Options {
+        partition_on_flush: false,
+        flush_schedules: true,
+        seal_bytes: 1 << 20,
+        l0_trigger: 2,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    for p in ["a", "m", "z"] {
+        for k in (0..2000u32).rev() {
+            let k = format!("{p}-{k:06}").into_bytes();
+            db.put(&k, b"v0");
+            model.insert(k, vec![b"v0".to_vec()]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+    }
+    // A piece over the first range, below its partition's last key.
+    for k in (0..20u32).rev() {
+        let k = format!("a-{k:06}").into_bytes();
+        db.put(&k, b"v1");
+        model.insert(k, vec![b"v1".to_vec()]);
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    // Two over the middle range, each under its partition's last key and
+    // past it, so that neither is promoted: the second's landing makes the
+    // range due, and its merge is held at its landing.
+    for (r, hi) in [(1u32, 5010u32), (2, 5020)] {
+        for k in (hi - 10..hi).rev().chain([r]) {
+            let k = format!("m-{k:06}").into_bytes();
+            db.put(&k, b"v1");
+            model.insert(k, vec![b"v1".to_vec()]);
+        }
+        db.commit().unwrap();
+        if r == 2 {
+            db.hold_merge_landing(true);
+        }
+        db.seal().unwrap();
+        if r == 1 {
+            db.settle().unwrap();
+        }
+    }
+    wait_for("the merge at its landing hold", || {
+        db.merge_waits_at_landing()
+    });
+    copy_store(&d, &c);
+    db.hold_merge_landing(false);
+    drop(db);
+    let named: Vec<String> = oo_names(&std::fs::read(&oo_by_age(&c)[0]).unwrap())
+        .1
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    let unnamed: Vec<String> = seg_names(&c)
+        .into_iter()
+        .filter(|n| !named.contains(n))
+        .collect();
+    assert!(
+        named.iter().filter(|n| n.starts_with("pcs-")).count() >= 2,
+        "premise: the slot names the pieces: {named:?}"
+    );
+    // Each unnamed output's last key: the greatest key of the store in
+    // its fences.
+    let ends: Vec<Vec<u8>> = unnamed
+        .iter()
+        .filter_map(|n| {
+            let (lo, hi) = oc_fence(n)?;
+            model
+                .range(lo..)
+                .filter(|(k, _)| hi.as_ref().is_none_or(|h| *k < h))
+                .map(|(k, _)| k.clone())
+                .next_back()
+        })
+        .collect();
+    assert!(
+        ends.iter().any(|k| k.as_slice() == b"m-005019")
+            && ends.iter().all(|k| k.as_slice() > b"m".as_slice()),
+        "premise: the outputs are over the middle range alone, and one ends at a key only the \
+         second piece over it holds: {unnamed:?} {ends:?}"
+    );
+    let takes = |n: &String, k: &[u8]| match oc_fence(n) {
+        None => true,
+        Some((lo, hi)) => lo.as_slice() <= k && hi.is_none_or(|h| k < h.as_slice()),
+    };
+    let from = Db::trace_dir_io(true).len();
+    let db = Db::open(&c, opts).expect("the window opens");
+    let read = oc_calls(&c, from, "open_holder");
+    assert!(
+        read.iter().any(|n| n.starts_with("pcs-")),
+        "premise: the open read a piece for an output's key: {read:?}"
+    );
+    for n in &read {
+        assert!(
+            named.contains(n) && ends.iter().any(|k| takes(n, k)),
+            "the open read {n}, whose fences take in no output's last key (ends {ends:?}, \
+             read {read:?})"
+        );
+    }
+    oo_holds(&db, &model, "pcs");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&c);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The same window where the merge's output ends at its range's lower
+/// fence: a partition of one key, a key short enough that the fence cut
+/// from it is the key itself, and a piece over that range writing the key
+/// again, merged and held at its landing. The output's last key is the
+/// lower fence of every named segment that holds it, and a name's fences
+/// take in their lower bound.
+#[test]
+fn an_open_after_a_crash_holds_an_unnamed_segments_key_at_its_ranges_lower_fence() {
+    let d = dir("oc-lo");
+    let c = dir("oc-lo-kill");
+    let opts = Options {
+        partition_on_flush: false,
+        flush_schedules: true,
+        seal_bytes: 1 << 20,
+        l0_trigger: 1000,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    for (p, n) in [("a-", 2000u32), ("m", 1), ("z-", 2000)] {
+        for k in (0..n).rev() {
+            let k = if n == 1 {
+                p.as_bytes().to_vec()
+            } else {
+                format!("{p}{k:06}").into_bytes()
+            };
+            db.put(&k, b"v0");
+            model.insert(k, vec![b"v0".to_vec()]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+    }
+    db.put(b"m", b"v1");
+    model.insert(b"m".to_vec(), vec![b"v1".to_vec()]);
+    db.commit().unwrap();
+    db.hold_merge_landing(true);
+    db.flush().unwrap();
+    wait_for("the merge at its landing hold", || {
+        db.merge_waits_at_landing()
+    });
+    copy_store(&d, &c);
+    db.hold_merge_landing(false);
+    drop(db);
+    let named: Vec<String> = oo_names(&std::fs::read(&oo_by_age(&c)[0]).unwrap())
+        .1
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    let unnamed: Vec<String> = seg_names(&c)
+        .into_iter()
+        .filter(|n| !named.contains(n))
+        .collect();
+    // Each unnamed output's last key: the greatest key of the store in
+    // its fences.
+    let ends: Vec<Vec<u8>> = unnamed
+        .iter()
+        .filter_map(|n| {
+            let (lo, hi) = oc_fence(n)?;
+            model
+                .range(lo..)
+                .filter(|(k, _)| hi.as_ref().is_none_or(|h| *k < h))
+                .map(|(k, _)| k.clone())
+                .next_back()
+        })
+        .collect();
+    assert!(
+        ends.iter().any(|k| k.as_slice() == b"m"),
+        "premise: an unnamed output ends at the key m: {named:?} {unnamed:?} {ends:?}"
+    );
+    let holders: Vec<&String> = named
+        .iter()
+        .filter(|n| {
+            oc_fence(n).is_some_and(|(lo, hi)| {
+                lo.as_slice() <= b"m".as_slice()
+                    && hi.is_none_or(|h| b"m".as_slice() < h.as_slice())
+            })
+        })
+        .collect();
+    assert!(
+        !holders.is_empty()
+            && holders
+                .iter()
+                .all(|n| oc_fence(n).is_some_and(|(lo, _)| lo.as_slice() == b"m".as_slice())),
+        "premise: every named segment whose fences take m in has m for its lower fence: \
+         {named:?}"
+    );
+    let from = Db::trace_dir_io(true).len();
+    let db = Db::open(&c, opts).expect("the window opens");
+    let read = oc_calls(&c, from, "open_holder");
+    assert!(
+        read.iter().any(|n| holders.contains(&n)),
+        "the open read no segment whose lower fence is the output's last key: {read:?}"
+    );
+    oo_holds(&db, &model, "lo");
+    drop(db);
     let _ = std::fs::remove_dir_all(&c);
     let _ = std::fs::remove_dir_all(&d);
 }
