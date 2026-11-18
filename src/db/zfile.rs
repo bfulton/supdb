@@ -3310,11 +3310,13 @@ pub(super) struct ZFile {
     /// have opened for the same reads.
     touch_shift: u8,
     /// Whether a stride file's reads are counted as its heat
-    /// (`count_stride_touch`): set where the store converts partitions
-    /// between the forms (`Options::zpages_stride_convert`) and nowhere
-    /// else, so that a stride file's read pays the count only where a
-    /// policy reads it.
-    pub(super) stride_heat: bool,
+    /// (`count_stride_touch`): set by the policy that reads the heat, at
+    /// its first look at the file (`ask_stride_heat`,
+    /// `Options::zpages_stride_convert`), and by nothing else, so that a
+    /// stride file's read pays the count only where a policy reads it and
+    /// no attach of one has to be told. Written once and read by every
+    /// read, which shares the line as readers.
+    stride_heat: std::sync::atomic::AtomicBool,
     /// Reads of the raw form a cursor over this file made through its door
     /// while the file is a stride file, under debug assertions
     /// (`ZCursor::raw`). A stride file holds every value in a slot and
@@ -3645,7 +3647,7 @@ impl ZFile {
                     .ilog2() as u8,
             },
             raw_reads: AtomicU64::new(0),
-            stride_heat: false,
+            stride_heat: std::sync::atomic::AtomicBool::new(false),
             time_decodes: false,
             coded: false,
             id: NEXT_ZSIDE_ID.fetch_add(1, Ordering::Relaxed),
@@ -5421,6 +5423,16 @@ impl ZFile {
         }
     }
 
+    /// This stride file's reads counted as its heat from here on
+    /// (`ZFile::stride_heat`): the policy's first look at the file. The
+    /// reads before it were not counted, and a look takes no rate from a
+    /// file it has not seen before.
+    pub(super) fn ask_stride_heat(&self) {
+        if !self.stride_heat.load(Ordering::Relaxed) {
+            self.stride_heat.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// A stride file's read of `ranks` values in a run, counted where the
     /// store converts between the forms (`ZFile::stride_heat`) as the
     /// groups the block form would have opened for it -- one, and one more
@@ -5432,7 +5444,7 @@ impl ZFile {
     /// load and a branch.
     #[inline]
     fn count_stride_touch(&self, ranks: u64) {
-        if !self.stride_heat {
+        if !self.stride_heat.load(Ordering::Relaxed) {
             return;
         }
         self.count_stride_touch_due(ranks);
@@ -5463,7 +5475,7 @@ impl ZFile {
     /// such reads are the walk's and not the reads the heat is for.
     #[inline]
     fn count_stride_touch_at(&self, rank: usize) {
-        if !self.stride_heat {
+        if !self.stride_heat.load(Ordering::Relaxed) {
             return;
         }
         if rank & ((1usize << self.touch_shift) - 1) == 0 {
@@ -15790,8 +15802,8 @@ mod tests {
         }
         assert_eq!(opens(&z), 0, "timed decodes alone count no stride read");
         drop(z);
-        let mut z = fx.attach_stride(StrideAttach::Check).unwrap();
-        z.stride_heat = true;
+        let z = fx.attach_stride(StrideAttach::Check).unwrap();
+        z.ask_stride_heat();
         // Point reads: the thread's every sixteenth, one each.
         for i in 0..160 {
             z.read_all(&memo, &fx.blob, &fx.recs[i].0, &mut |_: &[u8]| {})

@@ -6053,8 +6053,8 @@ pub struct Options {
     /// process has lately been read holding (`Maint::z_budget_grown`), here
     /// and where `zpages_stride_room` asks whether the store fits, since a
     /// room read with the memtables empty is taken back by the next write
-    /// mix. A stride file's reads are counted only under this option
-    /// (`zfile::ZFile::stride_heat`).
+    /// mix. A stride file's reads are counted only once this policy has
+    /// looked at it (`zfile::ZFile::ask_stride_heat`).
     /// A move is made once what it would have saved since it
     /// first paid comes to what its build costs, a ski rental as the form's
     /// own purchase is: the build's wall at the builds' measured rate a
@@ -33984,7 +33984,6 @@ impl Db {
                         opts.zpages_cursor_view,
                         opts.zpages_group_ahead,
                         opts.zpages_walk_owns_decodes,
-                        opts.zpages_stride_convert,
                     ),
                     &opts.z_stride_attach(),
                     &zev,
@@ -38374,7 +38373,6 @@ impl Db {
             bool,
             bool,
             bool,
-            bool,
         ),
         stride: &zfile::StrideAttach,
         ev: &zfile::ZEvents,
@@ -38405,7 +38403,6 @@ impl Db {
                 side.cursor_view = lines.6;
                 side.group_ahead = lines.7;
                 side.walk_owns = lines.8;
-                side.stride_heat = lines.9;
                 let installed = seg.z.install(side);
                 if installed {
                     zfile::ZEvents::add(&ev.attached, 1);
@@ -38468,7 +38465,6 @@ impl Db {
                     self.opts.zpages_cursor_view,
                     self.opts.zpages_group_ahead,
                     self.opts.zpages_walk_owns_decodes,
-                    self.opts.zpages_stride_convert,
                 ),
                 &self.opts.z_stride_attach(),
                 ev,
@@ -38529,7 +38525,6 @@ impl Db {
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
                         side.walk_owns = self.opts.zpages_walk_owns_decodes;
-                        side.stride_heat = self.opts.zpages_stride_convert;
                         if seg.z.install(side) {
                             ev.built(&b);
                             zfile::ZEvents::add(&ev.attached, 1);
@@ -47934,6 +47929,11 @@ impl Maint {
                             other = other.saturating_add(z.file_bytes());
                             continue;
                         }
+                        // A stride file counts its reads from the first
+                        // look that asks: no attach is told to.
+                        if z.is_stride() {
+                            z.ask_stride_heat();
+                        }
                         rows.push(Row {
                             seg: s.clone(),
                             id: z.id(),
@@ -51614,7 +51614,6 @@ impl Maint {
                     self.opts.zpages_cursor_view,
                     self.opts.zpages_group_ahead,
                     self.opts.zpages_walk_owns_decodes,
-                    self.opts.zpages_stride_convert,
                 ),
                 &self.opts.z_stride_attach_sealed(seal),
                 ev,
@@ -52056,7 +52055,6 @@ impl Maint {
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
                         side.walk_owns = self.opts.zpages_walk_owns_decodes;
-                        side.stride_heat = self.opts.zpages_stride_convert;
                         side.drop_cache();
                         let old = target.z_spare.keep(Box::into_raw(Box::new(side)));
                         if !old.is_null() {
@@ -52110,7 +52108,6 @@ impl Maint {
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
                         side.walk_owns = self.opts.zpages_walk_owns_decodes;
-                        side.stride_heat = self.opts.zpages_stride_convert;
                         let coded = side.coded();
                         let stride = side.is_stride();
                         let mut old = target.z.replace(side);
@@ -52200,7 +52197,6 @@ impl Maint {
                             side.cursor_view = self.opts.zpages_cursor_view;
                             side.group_ahead = self.opts.zpages_group_ahead;
                             side.walk_owns = self.opts.zpages_walk_owns_decodes;
-                            side.stride_heat = self.opts.zpages_stride_convert;
                             if target.z.install(side) {
                                 ev.built(&built);
                                 zfile::ZEvents::add(&ev.attached, 1);
