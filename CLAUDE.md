@@ -2123,7 +2123,11 @@ by that publish's directory fsync, on a filesystem that puts a rename
 on the device no sooner than the renames before it; an open under that
 shape fsyncs the directory, and any pending segment it takes from a
 store that ran under the slots, before it removes anything, since the
-manifest it read may be a rename a kill left in the page cache). The open removes nothing -- a segment, an
+manifest it read may be a rename a kill left in the page cache, and then
+removes the slot file a life under the slots left, the manifest it read
+written as `manifest` first where that file held it, so that an open
+under the slots after it makes the file again and fsyncs the directory
+before it removes anything). The open removes nothing -- a segment, an
 envelope, a log file, a spare -- and writes no slot until the slot it
 takes is checked against the directory, and refuses with every file as
 it found it where that slot cannot be the store
@@ -2637,10 +2641,23 @@ failed one was for and retired the log; an open of a manifest a kill had
 left renamed and unsynced swept what it stopped naming, and a power cut
 could keep the sweep and lose the rename; and an open of a store that
 had run under `manifest_pending` took its pending names, read out of the
-page cache, without the fsyncs the slots' open makes. The corollary: an
-arm kept for pricing is a shape a store can be opened in, so every crash
-state built for the default is built for the arm, and across a change
-from one to the other, before a fix to the default is called done.
+page cache, without the fsyncs the slots' open makes. A fourth was
+found after those were called closed, in the crossing back: a store that
+ran under the slots, then the rename shape, killed between a rename and
+its directory fsync and opened under the slots again found both slot
+files, the first life's `manifest.alt` among them, so it made neither,
+fsynced no directory, and swept what the renamed manifest stopped
+naming; the tests of the crossing had stores born under the rename
+shape, which have no second file. The rename open takes the file away
+now, and the slots open makes it and fsyncs the directory before it
+removes anything, the cipher's sweep of envelopes included, which ran
+before that fsync. The corollary: an arm kept for pricing
+is a shape a store can be opened in, so every crash state built for the
+default is built for the arm, and across a change from one to the other
+and back, with what each life leaves for the next, before a fix to the
+default is called done. And a seam a test needs on such an arm's path
+rides the word that path already loads (`vault::sync_dir_as`), never a
+load of its own on every publish.
 
 **The sharp edges of a log are in the bookkeeping around it, never in the
 append.** A value-carrying log queued a key twice when it sealed, re-queued

@@ -8568,6 +8568,62 @@ fn a_failed_slot_sync(tag: &str, base: Options, owed_only: bool) {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Under the slots a seal's own publish whose slot fdatasync fails is
+/// answered and stops nothing: the slot was never known durable, so the
+/// next publish writes it again, whole, and the store goes on and reopens
+/// with every acknowledged write. (The rename shape stops the queue there
+/// instead, since its publish's directory fsync is the seal's names'.)
+fn a_seal_publish_slot_sync_fails_under_the_slots(tag: &str, base: Options) {
+    let opts = os_opts(&Options {
+        compact: false,
+        promote: false,
+        partition_on_flush: false,
+        ..base
+    });
+    let d = dir(&format!("os-sealsyncfail-{tag}"));
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model = BTreeMap::new();
+    os_round(&mut db, &mut model, "r0", 0, OS_KEYS / 4);
+    db.flush().unwrap();
+    db.settle().unwrap();
+    os_round(&mut db, &mut model, "r1", OS_KEYS, OS_KEYS / 8);
+    db.fail_next_slot_sync();
+    let sealed = db.seal();
+    let settled = db.settle();
+    let answers = [sealed.err(), settled.err(), db.commit().err()];
+    assert!(
+        answers.iter().flatten().any(|e| e
+            .to_string()
+            .contains("a test failed this manifest slot's fdatasync")),
+        "{tag}: premise: the seal's publish failed its slot sync: {answers:?}"
+    );
+    os_round(&mut db, &mut model, "r2", 2 * OS_KEYS, OS_KEYS / 8);
+    db.flush()
+        .unwrap_or_else(|e| panic!("{tag}: the flush after a failed slot sync: {e}"));
+    db.settle().unwrap();
+    drop(db);
+    let failures = os_check_all(
+        &[(
+            d.clone(),
+            format!("{tag}: reopened after a seal's slot sync failed"),
+        )],
+        &model,
+        &opts,
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_seals_publish_whose_slot_sync_fails_is_written_again_by_the_next_under_the_slots() {
+    a_seal_publish_slot_sync_fails_under_the_slots("plain", Options::default());
+}
+
+#[test]
+fn a_seals_publish_whose_slot_sync_fails_is_written_again_under_the_slots_and_a_cipher() {
+    a_seal_publish_slot_sync_fails_under_the_slots("cipher", under_cipher());
+}
+
 #[test]
 fn a_slot_whose_fdatasync_failed_is_not_the_one_a_publish_keeps_off() {
     a_failed_slot_sync("plain", Options::default(), false);
@@ -10917,13 +10973,32 @@ fn ra_rounds(
     opts: &Options,
     rounds: u32,
 ) -> (PathBuf, PathBuf, Vec<(RaPublish, RaModel)>) {
+    ra_rounds_born(tag, None, opts, rounds)
+}
+
+/// `ra_rounds`, the store born under `born` where it is given -- the
+/// slots, with its newest manifest in `manifest.alt` where `alt` says so --
+/// and reopened under `opts` for the rounds watched: a store that ran under
+/// the slots and moved to the rename shape, its other slot file left.
+fn ra_rounds_born(
+    tag: &str,
+    born: Option<(&Options, bool)>,
+    opts: &Options,
+    rounds: u32,
+) -> (PathBuf, PathBuf, Vec<(RaPublish, RaModel)>) {
     let d = dir(&format!("ra-{tag}"));
     let root = dir(&format!("ra-{tag}-crashes"));
-    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut db = Db::create(&d, born.map_or(opts, |b| b.0).clone()).unwrap();
     let mut model = BTreeMap::new();
     os_round(&mut db, &mut model, "r0", 0, OS_KEYS);
     db.flush().unwrap();
     db.settle().unwrap();
+    if let Some((_, alt)) = born {
+        ra_slots_life_ends_in(tag, &d, &mut db, &mut model, alt);
+        drop(db);
+        db = Db::open(&d, opts.clone()).unwrap();
+        db.settle().unwrap();
+    }
     // Watched from the manifest the tracker reads: nothing lands between.
     db.hold_seal_landing(true);
     db.hold_merge_landing(true);
@@ -11010,12 +11085,122 @@ fn ra_dir_synced(d: &Path, from: usize) -> bool {
 /// -- and keeps what the open removed, which nothing orders behind the
 /// rename. The store opens with every acknowledged write.
 fn a_kill_between_the_rename_and_its_dir_sync(tag: &str, base: Options, reopen: &Options) {
+    a_kill_between_the_rename_and_its_dir_sync_born(tag, base, None, reopen)
+}
+
+/// Rounds of a store under the slots until its newest manifest is in
+/// `manifest.alt` where `alt` says so, and in `manifest` where it does not.
+fn ra_slots_life_ends_in(
+    tag: &str,
+    d: &Path,
+    db: &mut Db,
+    model: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+    alt: bool,
+) {
+    let mut i = 0u32;
+    loop {
+        let s = OS_SLOTS.map(|f| std::fs::read(d.join(f)).ok().and_then(|b| os_seq_of(&b)));
+        if (s[1] > s[0]) == alt {
+            return;
+        }
+        i += 1;
+        assert!(
+            i < 8,
+            "{tag}: premise: the slots life's newest manifest in the slot asked"
+        );
+        os_round(
+            db,
+            model,
+            &format!("b{i}"),
+            (100 + i) * OS_KEYS,
+            OS_KEYS / 4,
+        );
+        db.flush().unwrap();
+        db.settle().unwrap();
+    }
+}
+
+/// (e) A store under the slots whose newest manifest is in `manifest.alt`,
+/// opened under the rename shape and killed at once, its landings held:
+/// opened under either shape, it is every acknowledged write. The rename
+/// open takes `manifest.alt` away, and the store's manifest is then the one
+/// it wrote as `manifest`, or no manifest names the store.
+fn a_kill_at_the_rename_open_of_an_alt_store(tag: &str, base: Options) {
+    let slots = os_opts(&base);
+    let rename = ra_opts(&base);
+    let d = dir(&format!("ra-altopen-{tag}"));
+    let mut db = Db::create(&d, slots.clone()).unwrap();
+    let mut model = BTreeMap::new();
+    os_round(&mut db, &mut model, "r0", 0, OS_KEYS);
+    db.flush().unwrap();
+    db.settle().unwrap();
+    ra_slots_life_ends_in(tag, &d, &mut db, &mut model, true);
+    drop(db);
+    let db = Db::open(&d, rename.clone()).unwrap();
+    db.hold_seal_landing(true);
+    db.hold_merge_landing(true);
+    let k = dir(&format!("ra-altopen-{tag}-killed"));
+    os_copy(&d, &k);
+    db.hold_seal_landing(false);
+    db.hold_merge_landing(false);
+    drop(db);
+    let mut states = Vec::new();
+    for (i, o) in ["the rename shape", "the slots"].into_iter().enumerate() {
+        let c = dir(&format!("ra-altopen-{tag}-killed-{i}"));
+        os_copy(&k, &c);
+        states.push((c, o, i));
+    }
+    let mut failures = Vec::new();
+    for (c, o, i) in &states {
+        let opts = if *i == 0 { &rename } else { &slots };
+        failures.extend(os_check_all(
+            &[(
+                c.clone(),
+                format!("{tag}: killed at its rename-shape open, reopened under {o}"),
+            )],
+            &model,
+            opts,
+        ));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    for (c, _, _) in &states {
+        let _ = std::fs::remove_dir_all(c);
+    }
+    let _ = std::fs::remove_dir_all(&k);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_store_moved_from_the_alt_slot_killed_at_its_rename_open_is_whole() {
+    a_kill_at_the_rename_open_of_an_alt_store("plain", Options::default());
+}
+
+#[test]
+fn a_store_moved_from_the_alt_slot_killed_at_its_rename_open_is_whole_under_a_cipher() {
+    a_kill_at_the_rename_open_of_an_alt_store("cipher", under_cipher());
+}
+
+/// The same, the store born under the slots and moved to the rename shape
+/// before the kill where `born` says so (`ra_rounds_born`): a store that
+/// goes slots, rename, slots, its `manifest.alt` from the first life.
+fn a_kill_between_the_rename_and_its_dir_sync_born(
+    tag: &str,
+    base: Options,
+    born: Option<bool>,
+    reopen: &Options,
+) {
     let opts = ra_opts(&base);
     let reopen = Options {
         encryption: base.encryption.clone(),
         ..reopen.clone()
     };
-    let (d, root, pubs) = ra_rounds(&format!("kill-{tag}"), &opts, 4);
+    let slots = os_opts(&base);
+    let (d, root, pubs) = ra_rounds_born(
+        &format!("kill-{tag}"),
+        born.map(|alt| (&slots, alt)),
+        &opts,
+        4,
+    );
     let mut reached = 0usize;
     let mut failures = Vec::new();
     for (n, (p, model)) in pubs.iter().enumerate() {
@@ -11103,6 +11288,105 @@ fn a_rename_shape_store_killed_before_its_directory_fsync_reopens_under_the_slot
 fn a_rename_shape_store_killed_before_its_directory_fsync_reopens_under_the_slots_cipher() {
     let s = os_opts(&Options::default());
     a_kill_between_the_rename_and_its_dir_sync("to-slots-cipher", under_cipher(), &s);
+}
+
+/// (e) The slots open of a store that went slots, rename, slots, killed in
+/// its rename life between a rename and its directory fsync: the fsync the
+/// open makes for the slot file the rename life took away fails
+/// (`Options::fail_open_dir_sync`), and the open answers it having removed
+/// nothing -- under a cipher, no envelope the renamed manifest stopped
+/// naming swept before that fsync.
+fn a_crossing_slots_open_whose_dir_sync_fails(tag: &str, base: Options) {
+    let opts = ra_opts(&base);
+    let slots = os_opts(&base);
+    let reopen = Options {
+        fail_open_dir_sync: true,
+        ..slots.clone()
+    };
+    let (d, root, pubs) = ra_rounds_born(&format!("xfail-{tag}"), Some((&slots, false)), &opts, 4);
+    let mut reached = 0usize;
+    for (n, (p, _)) in pubs.iter().enumerate() {
+        let x = ra_state(&p.at, &root.join(format!("x{n}")), |_| {});
+        assert!(
+            !x.join("manifest.alt").exists(),
+            "{tag}: premise: the rename life took the slots' other file away"
+        );
+        let found = ra_names(&x);
+        let e = match Db::open(&x, reopen.clone()) {
+            Ok(_) => panic!("{tag}: publish {}: the open answered no failure", p.seq),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            e.contains("a test failed the open's directory fsync"),
+            "{tag}: publish {}: the open refused for another reason: {e}",
+            p.seq
+        );
+        let gone: Vec<String> = found
+            .difference(&ra_names(&x))
+            .filter(|f| ra_entry(f))
+            .cloned()
+            .collect();
+        assert!(
+            gone.is_empty(),
+            "{tag}: publish {}: removed before the directory fsync: {gone:?}",
+            p.seq
+        );
+        if Db::open(&x, slots.clone()).is_ok() {
+            reached += 1;
+        }
+        let _ = std::fs::remove_dir_all(&x);
+    }
+    assert!(
+        reached > 0,
+        "{tag}: premise: the states open without the failure"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_crossing_slots_open_whose_directory_fsync_fails_removes_nothing() {
+    a_crossing_slots_open_whose_dir_sync_fails("plain", Options::default());
+}
+
+#[test]
+fn a_crossing_slots_open_whose_directory_fsync_fails_removes_nothing_under_a_cipher() {
+    a_crossing_slots_open_whose_dir_sync_fails("cipher", under_cipher());
+}
+
+/// (e) Both ways in one store: born under the slots, moved to the rename
+/// shape -- its newest manifest in `manifest` and, the second pair, in
+/// `manifest.alt` when it moved -- killed between a rename and its
+/// directory fsync, reopened under the slots, commits acknowledged, then a
+/// power cut. The slot file the first life left is the slots open's reason
+/// to make none and fsync no directory, unless the rename life took it away.
+#[test]
+fn a_store_moved_slots_rename_slots_killed_before_a_directory_fsync_survives_a_power_cut() {
+    let s = os_opts(&Options::default());
+    a_kill_between_the_rename_and_its_dir_sync_born("srs", Options::default(), Some(false), &s);
+}
+
+#[test]
+fn a_store_moved_slots_rename_slots_killed_before_a_directory_fsync_survives_under_a_cipher() {
+    let s = os_opts(&Options::default());
+    a_kill_between_the_rename_and_its_dir_sync_born("srs-cipher", under_cipher(), Some(false), &s);
+}
+
+#[test]
+fn a_store_moved_from_the_alt_slot_killed_before_a_directory_fsync_survives_a_power_cut() {
+    let s = os_opts(&Options::default());
+    a_kill_between_the_rename_and_its_dir_sync_born("srs-alt", Options::default(), Some(true), &s);
+}
+
+#[test]
+fn a_store_moved_from_the_alt_slot_killed_before_a_directory_fsync_survives_under_a_cipher() {
+    let s = os_opts(&Options::default());
+    a_kill_between_the_rename_and_its_dir_sync_born(
+        "srs-alt-cipher",
+        under_cipher(),
+        Some(true),
+        &s,
+    );
 }
 
 /// The open's directory fsync under the rename shape fails
@@ -11269,6 +11553,78 @@ fn a_rename_publish_whose_directory_fsync_fails_names_nothing_durable_after_unde
     a_failed_publish_dir_sync("cipher", under_cipher());
 }
 
+/// (b) A rename publish that fails before its rename -- its temp name taken
+/// by a directory, so the temp cannot be made, as a device refusing the
+/// write would leave it -- stops the seal queue as one that fails after its
+/// rename does: every flush after it answers the failure, with the temp
+/// name free again, until a reopen, which finds every acknowledged commit.
+fn a_failed_publish_temp(tag: &str, base: Options) {
+    let opts = Options {
+        compact: false,
+        ..ra_opts(&base)
+    };
+    let d = dir(&format!("ra-pubtemp-{tag}"));
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model = BTreeMap::new();
+    os_round(&mut db, &mut model, "r0", 0, OS_KEYS / 2);
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let old = std::fs::read(d.join("manifest")).unwrap();
+    os_round(&mut db, &mut model, "r1", OS_KEYS, OS_KEYS / 4);
+    std::fs::create_dir(d.join("manifest.tmp")).unwrap();
+    let first = db.flush();
+    assert!(
+        first.is_err(),
+        "{tag}: premise: the publish failed at its temp"
+    );
+    std::fs::remove_dir(d.join("manifest.tmp")).unwrap();
+    assert_eq!(
+        std::fs::read(d.join("manifest")).unwrap(),
+        old,
+        "{tag}: premise: the failed publish renamed nothing"
+    );
+    for i in 0..100u32 {
+        let k = format!("after-{i:04}").into_bytes();
+        let v = format!("w-{i}").into_bytes();
+        db.put(&k, &v);
+        model.insert(k, v);
+    }
+    db.commit().unwrap();
+    let second = db.flush();
+    let settled = db.settle();
+    assert!(
+        second.is_err() && settled.is_err(),
+        "{tag}: the flush and the settle after a publish that failed at its temp answer it \
+         (flush {second:?}, settle {settled:?})"
+    );
+    assert_eq!(
+        std::fs::read(d.join("manifest")).unwrap(),
+        old,
+        "{tag}: no manifest was written after the failure"
+    );
+    drop(db);
+    let failures = os_check_all(
+        &[(
+            d.clone(),
+            format!("{tag}: reopened after a publish failed at its temp"),
+        )],
+        &model,
+        &opts,
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_rename_publish_that_fails_before_its_rename_stops_the_seal_queue() {
+    a_failed_publish_temp("plain", Options::default());
+}
+
+#[test]
+fn a_rename_publish_that_fails_before_its_rename_stops_the_seal_queue_under_a_cipher() {
+    a_failed_publish_temp("cipher", under_cipher());
+}
+
 /// (d) A store written under `manifest_pending`, killed with its newest
 /// slot naming a seal's segments pending -- whole in the page cache, synced
 /// by nobody -- and reopened under the rename shape: the open takes the
@@ -11277,6 +11633,17 @@ fn a_rename_publish_whose_directory_fsync_fails_names_nothing_durable_after_unde
 /// A power cut leaves a pending segment torn unless an fsync covered it,
 /// and the store opens with every acknowledged commit.
 fn a_pending_store_reopened_under_the_rename_shape(tag: &str, base: Options) {
+    a_pending_store_reopened_under_the_rename_shape_as(tag, base, true)
+}
+
+/// The same, the rename-shape reopen made with `manifest_pending` as
+/// `reopen_pending` says: the pending names the open takes are the slot's,
+/// whatever the reopening options ask.
+fn a_pending_store_reopened_under_the_rename_shape_as(
+    tag: &str,
+    base: Options,
+    reopen_pending: bool,
+) {
     let d = dir(&format!("ra-pend-{tag}"));
     // No merge, so the flush after the reopen leaves the pending segment
     // standing beside its own piece rather than rewriting it into a
@@ -11293,6 +11660,7 @@ fn a_pending_store_reopened_under_the_rename_shape(tag: &str, base: Options) {
     let cipher = opts.encryption.clone();
     let rename = Options {
         manifest_slots: false,
+        manifest_pending: reopen_pending,
         encryption: cipher,
         ..opts.clone()
     };
@@ -11397,6 +11765,16 @@ fn a_pending_store_reopened_under_the_rename_shape(tag: &str, base: Options) {
 #[test]
 fn a_pending_store_reopened_under_the_rename_shape_survives_a_power_cut() {
     a_pending_store_reopened_under_the_rename_shape("plain", Options::default());
+}
+
+#[test]
+fn a_pending_store_reopened_under_the_rename_shape_without_the_option_survives_a_power_cut() {
+    a_pending_store_reopened_under_the_rename_shape_as("plain-off", Options::default(), false);
+}
+
+#[test]
+fn a_pending_store_reopened_under_the_rename_shape_without_the_option_under_a_cipher() {
+    a_pending_store_reopened_under_the_rename_shape_as("cipher-off", under_cipher(), false);
 }
 
 /// Under a cipher a pending seal's envelope is written and synced before
