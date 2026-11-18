@@ -3893,9 +3893,17 @@ own description's. The seam says which description met the error
 store, which is the window. And the finish's join of the helper, which
 takes its error before a seal's or a merge's segment is renamed into
 place, was held by no test, every test of a failed helper sync being a
-run's; one each now. The corollary: where two threads sync one file and
-either can answer a caller, each syncs through its own open file
-description, since the kernel's error is a description's to consume and
+run's; one each now. Those two reach the failure whether the helper
+syncs before the finish asks it to stop or at the stop, and a mutant
+that took the sync at the stop away passed them in five runs of six:
+the stop is held by a test whose helper begins only after it
+(`HelperFault::start_after_stop`), since a path reached by timing is a
+path a test bets on. And the helper names the file by the writer's
+descriptor's number (`/proc/self/fd/<n>`), so a test builds that number
+at two, three and four digits, none of them a palindrome, since a path
+built from a number's digits is wrong in a way only some numbers show.
+The corollary: where two threads sync one file and either can answer a
+caller, each syncs through its own open file description, since the kernel's error is a description's to consume and
 a word stored after the syscall is a word read too early by the other.
 It came back a fourth time at the presync itself, whose error the flush
 answered: the presync runs on the writer's thread after the seal job is
