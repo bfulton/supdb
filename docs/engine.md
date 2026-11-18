@@ -5955,11 +5955,11 @@ every four, the same 0.1-0.4 at 37 ms of flushes.
 So the segment writer hands each piece to the device as it lands
 (`SegmentOptions::early_writeback`) and, once the file is eight
 megabytes long, starts a thread of its own behind the writer
-(`WriterHelper`, `sync_ahead`), woken by each piece: an fdatasync on a
-dup of the descriptor whenever eight megabytes are on the file past what
-is synced, with the writer's own sync, the durable arm's at every batch,
-marking what it synced so that writer's thread syncs nothing. The hint
-had been tried on 2 MB pieces and not kept (above): the run's fsync fell
+(`WriterHelper`, `sync_ahead`), woken by each piece: an fdatasync on an
+open file description of its own whenever eight megabytes are on the
+file past what is synced, with the writer's own sync, the durable arm's
+at every batch, marking what it synced so that writer's thread syncs
+nothing. The hint had been tried on 2 MB pieces and not kept (above): the run's fsync fell
 by the same third and nothing the suite times resolved, because the
 close's other costs stood, and the durable arm read 1.10x slower in
 seven of eight pairs. This time the hint alone, alternated as probes:
