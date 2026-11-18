@@ -4913,6 +4913,7 @@ impl Wal {
         apply: impl FnMut(u8, &[u8], &[u8]),
     ) -> Result<(u64, u64, bool)> {
         let mut buf = Vec::new();
+        vault::note("replay", path);
         match vault::open(path) {
             Ok(mut f) => {
                 f.read_to_end(&mut buf)?;
@@ -13134,14 +13135,22 @@ fn manifest_parse(buf: &[u8]) -> Result<Manifest> {
 /// since the torn one is the publish the crash interrupted and the other
 /// is the store, and refused where no slot is valid rather than guessed at.
 /// The open holds the slot it takes to the directory before it believes
-/// that (`Db::open_refusals`, `Db::unnamed_refusals`).
-fn manifest_read_all(dir: &Path) -> Result<Vec<Manifest>> {
+/// that (`Db::open_refusals`, `Db::unnamed_refusals`). Beside them, each
+/// slot file found, by its index, as it was opened to be read: the open
+/// makes the slot files durable through these descriptors, whatever they
+/// read as.
+fn manifest_read_all(dir: &Path) -> Result<(Vec<Manifest>, [Option<File>; 2])> {
     let mut valid: Vec<Manifest> = Vec::new();
     let mut torn: Option<std::io::Error> = None;
+    let mut files: [Option<File>; 2] = [None, None];
     for (i, slot) in MANIFEST_SLOTS.iter().enumerate() {
         let mut buf = Vec::new();
         match vault::open(dir.join(slot)) {
-            Ok(mut f) => f.read_to_end(&mut buf)?,
+            Ok(mut f) => {
+                vault::note("read_slot", dir.join(slot));
+                f.read_to_end(&mut buf)?;
+                files[i] = Some(f);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         };
@@ -13156,7 +13165,7 @@ fn manifest_read_all(dir: &Path) -> Result<Vec<Manifest>> {
     valid.sort_by_key(|m| std::cmp::Reverse(m.seq));
     match (valid.is_empty(), torn) {
         (true, Some(e)) => Err(e),
-        _ => Ok(valid),
+        _ => Ok((valid, files)),
     }
 }
 
@@ -28808,6 +28817,31 @@ impl Db {
         Db::name_field(name, 0)
     }
 
+    /// Whether a segment's name takes `key` in: a `par-` or `pcs-` name's
+    /// fences, `[lo, hi)` with an empty high fence unbounded, which are the
+    /// segment's (`Seg::open`); a name with none -- a `seg-` name -- or one
+    /// that does not read as two fences takes in every key.
+    fn name_takes(name: &str, key: &[u8]) -> bool {
+        let Some(rest) = name
+            .strip_prefix("par-")
+            .or_else(|| name.strip_prefix("pcs-"))
+            .and_then(|r| r.strip_suffix(".sup"))
+        else {
+            return true;
+        };
+        let mut f = rest.split('-').skip(2);
+        let (Some(lo), Some(hi), None) = (f.next(), f.next(), f.next()) else {
+            return true;
+        };
+        let Some(lo) = unhex(lo) else {
+            return true;
+        };
+        if key < lo.as_slice() {
+            return false;
+        }
+        hi.is_empty() || unhex(hi).is_none_or(|h| key < h.as_slice())
+    }
+
     fn name_end_seq(name: &str) -> Option<u64> {
         Db::name_field(name, 1)
     }
@@ -29154,9 +29188,9 @@ impl Db {
     /// neither slot names included -- or writes over either slot: the slot
     /// it takes, and the other, which a process kill part way through a
     /// publish into it may have left torn in the cache over a record the
-    /// device holds whole. An fdatasync of each small file, of nothing
-    /// where it was already on the device; a slot file that is not there
-    /// is not made.
+    /// device holds whole. An fdatasync of each small file, through the
+    /// descriptor it was read through, of nothing where it was already on
+    /// the device; a slot file that is not there is not made.
     ///
     /// The open removes and writes nothing until the slot it takes is held
     /// to the directory, and refuses, with every file left as it found it,
@@ -29168,7 +29202,9 @@ impl Db {
     /// covers, has a last key that no segment the slot names and no run's
     /// temp name holds -- which a crash never leaves, and damage that
     /// passes over a newer slot can. Only that one key of such a segment
-    /// is read. Under a cipher such a segment's envelope has its key in no
+    /// is read, and only in the segments whose fences take it in. In the
+    /// clear the directory's one listing says which names are there; under
+    /// a cipher each envelope a slot names is looked for. Under a cipher such a segment's envelope has its key in no
     /// slot the open can read: it is swept, and an open that passes over a
     /// damaged slot and is not refused answers without the writes only
     /// that slot named. A
@@ -29235,7 +29271,7 @@ impl Db {
         // version 2 or 1, gets both slots rewritten in this version below,
         // since a reader of those versions skips a slot it cannot parse for
         // one it can, and would take the older state for the store.
-        let mut slots = manifest_read_all(dir)?;
+        let (mut slots, mut slot_files) = manifest_read_all(dir)?;
         let upgrade = slots.iter().any(|m| m.version < 3);
         // Only the newest slot's pending names are in doubt: the slot
         // before it was written by a publish that waited for that seal's
@@ -29281,8 +29317,9 @@ impl Db {
             // older, or newer and passed over for pending segments that did
             // not read whole -- since a power cut would otherwise hand the
             // next open what the device holds of it, which may be a state
-            // this open passed over, naming what it sweeps. A slot file that
-            // is not there is not made.
+            // this open passed over, naming what it sweeps. Each through the
+            // descriptor its read opened; a slot file that is not there is
+            // not made.
             for (s, fail, what) in [
                 (m.slot, opts.fail_open_slot_sync, "its manifest slot"),
                 (
@@ -29292,7 +29329,7 @@ impl Db {
                 ),
             ] {
                 let path = dir.join(MANIFEST_SLOTS[s]);
-                let Some(f) = vault::open_slot_found(&path)? else {
+                let Some(f) = slot_files[s].take() else {
                     continue;
                 };
                 alt_found |= s == 1;
@@ -29314,14 +29351,19 @@ impl Db {
             slot.landed(m.slot);
             synced[m.slot] = m.seq;
         }
-        let mut on_disk: Vec<String> = Vec::new();
-        for name in vault::names(dir)? {
-            if (name.starts_with("seg-") || name.starts_with("par-") || name.starts_with("pcs-"))
-                && name.ends_with(".sup")
-            {
-                on_disk.push(name);
-            }
-        }
+        drop(slot_files);
+        // The directory listed once, for every name the checks and the
+        // sweeps below ask about, sorted to be searched.
+        let mut listed = vault::names(dir)?;
+        listed.sort_unstable();
+        let on_disk: Vec<String> = listed
+            .iter()
+            .filter(|name| {
+                (name.starts_with("seg-") || name.starts_with("par-") || name.starts_with("pcs-"))
+                    && name.ends_with(".sup")
+            })
+            .cloned()
+            .collect();
         // A slot to write below: pending names verified whole, or a slot
         // skipped, whose file would otherwise read as the newest at the
         // next open and be verified again against segments swept here.
@@ -29349,7 +29391,12 @@ impl Db {
         // What the slot taken names held to the directory before anything
         // is removed or written: an open that refuses leaves every file as
         // it found it, for the store to be put right.
-        Db::open_refusals(dir, taken, &live, &on_disk, held.is_some())?;
+        Db::open_refusals(dir, taken, &live, &on_disk, &listed, held.is_some())?;
+        // And what it does not name, before the log is replayed, which an
+        // open that refuses here would have done for nothing.
+        if held.is_none() {
+            Db::unnamed_refusals(dir, taken, sealed, &live, &on_disk, &listed)?;
+        }
         let mut wal_ids: Vec<u64> = Vec::new();
         let mut spare_wals: Vec<PathBuf> = Vec::new();
         // Spares beyond the one kept, and log files after the one the log
@@ -29357,16 +29404,16 @@ impl Db {
         // it reads, with everything else it removes.
         let mut spare_extra: Vec<PathBuf> = Vec::new();
         let mut wal_later: Vec<u64> = Vec::new();
-        for name in vault::names(dir)? {
+        for name in &listed {
             if let Some(id) = name.strip_prefix("wal-") {
                 wal_ids.push(id.parse().map_err(|_| err("wal file name is malformed"))?);
             } else if name.starts_with("spare-") {
                 // A retired WAL kept for recycling. It holds nothing a
                 // segment does not, so it is either the pool or garbage.
                 if opts.recycle_wal && spare_wals.is_empty() {
-                    spare_wals.push(dir.join(&name));
+                    spare_wals.push(dir.join(name));
                 } else {
-                    spare_extra.push(dir.join(&name));
+                    spare_extra.push(dir.join(name));
                 }
             }
         }
@@ -29437,9 +29484,6 @@ impl Db {
         // after. The builder ahead of the reader found it missing, reading
         // a reopened store at its watermark.
         mem.commit();
-        if held.is_none() {
-            Db::unnamed_refusals(dir, taken, sealed, &live, &on_disk)?;
-        }
         // The store is what the slot taken names: from here the open
         // removes what nothing names and writes what it owes.
         // Under the rename shape the manifest read is a name a publish
@@ -30152,12 +30196,15 @@ impl Db {
     /// for those takes `seg-` files alone and would remove the rest. With a
     /// slot, every segment it names is in the directory, since a slot names
     /// only what is durable and a landing removes nothing until the slot
-    /// that stops naming it is.
+    /// that stops naming it is: in the clear by the open's listing
+    /// (`listed`, sorted), under a cipher by each envelope looked for,
+    /// since the listing there is of the names a slot gave the store.
     fn open_refusals(
         dir: &Path,
         taken: Option<&str>,
         live: &[String],
         on_disk: &[String],
+        listed: &[String],
         cipher: bool,
     ) -> Result<()> {
         let Some(slot) = taken else {
@@ -30178,7 +30225,17 @@ impl Db {
             }
             return Ok(());
         };
-        if let Some(n) = live.iter().find(|n| !vault::on_device(dir.join(n))) {
+        // In the clear the open's listing says which names the directory
+        // holds. Under a cipher the listing is of the store's own names,
+        // the ones a slot read gave it, and each envelope is looked for.
+        let gone = |n: &&String| {
+            if cipher {
+                !vault::on_device(dir.join(n))
+            } else {
+                listed.binary_search(n).is_err()
+            }
+        };
+        if let Some(n) = live.iter().find(gone) {
             return Err(err(&format!(
                 "refused: the manifest slot {slot} names {n}, which is missing from the \
                  directory; nothing was removed"
@@ -30202,9 +30259,12 @@ impl Db {
     /// run's own among them; a run's whose temp name was retired holds it
     /// alone. A run's keys sit above every key before it, so its last key
     /// is where a run's records show, in a run's segment or in a merge's
-    /// output that folded one in. The log holds none of them: a run's
-    /// commits never go to it in the clear, and a merge's keys are its
-    /// inputs'. One with writes past what the slot covers
+    /// output that folded one in. The key is looked up only in the
+    /// segments whose names' fences take it in, as a read routes it
+    /// (`Seg::may_hold`), each mapped once for every key asked of it. The
+    /// log holds none of them: a run's commits never go to it in the
+    /// clear, and a merge's keys are its inputs'. Made before the log is
+    /// replayed, from the open's one listing (`listed`, sorted). One with writes past what the slot covers
     /// is a seal's, and is swept as the crash window's: under a buffered
     /// policy a torn publish of its landing leaves it synced beside a log
     /// a power cut cut short, the same files as damage past a log that
@@ -30218,6 +30278,7 @@ impl Db {
         sealed: u64,
         live: &[String],
         on_disk: &[String],
+        listed: &[String],
     ) -> Result<()> {
         let Some(slot) = taken else {
             return Ok(());
@@ -30232,7 +30293,7 @@ impl Db {
             .map(|i| i + 1)
             .max()
             .unwrap_or(0);
-        let runs: std::collections::HashSet<u64> = vault::names(dir)?
+        let runs: std::collections::HashSet<u64> = listed
             .iter()
             .filter_map(|n| {
                 n.strip_prefix("direct-")
@@ -30248,8 +30309,21 @@ impl Db {
                  removed"
             ))
         };
-        // What holds a key besides the log, opened at the first key asked.
-        let mut holders: Option<Vec<Blob<MmapBytes>>> = None;
+        // What may hold a key besides the log: a segment the slot names,
+        // or a run's beside its temp name.
+        let candidates: Vec<&str> = live
+            .iter()
+            .map(|n| n.as_str())
+            .chain(
+                unnamed
+                    .iter()
+                    .filter(|n| Db::name_id(n).is_some_and(|i| runs.contains(&i)))
+                    .map(|n| n.as_str()),
+            )
+            .collect();
+        // Each opened at the first key asked of it, and kept for the next.
+        let mut opened: std::collections::HashMap<&str, Option<Blob<MmapBytes>>> =
+            std::collections::HashMap::new();
         for u in &unnamed {
             let (Some(id), Some(end)) = (Db::name_id(u), Db::name_end_seq(u)) else {
                 continue;
@@ -30263,20 +30337,24 @@ impl Db {
             if b.keys() == 0 {
                 continue;
             }
-            let holders = holders.get_or_insert_with(|| {
-                live.iter()
-                    .map(|n| n.as_str())
-                    .chain(
-                        unnamed
-                            .iter()
-                            .filter(|n| Db::name_id(n).is_some_and(|i| runs.contains(&i)))
-                            .map(|n| n.as_str()),
-                    )
-                    .filter_map(whole)
-                    .collect()
-            });
             if let Some(k) = b.key_at(b.keys() - 1) {
-                if !holders.iter().any(|h| h.lookup(k).is_some()) {
+                // Only a segment whose fences take the key in can hold it:
+                // a read routes by the same fences (`Seg::may_hold`).
+                let mut held = false;
+                for &n in &candidates {
+                    if !Db::name_takes(n, k) {
+                        continue;
+                    }
+                    let h = opened.entry(n).or_insert_with(|| {
+                        vault::note("open_holder", dir.join(n));
+                        whole(n)
+                    });
+                    if h.as_ref().is_some_and(|h| h.lookup(k).is_some()) {
+                        held = true;
+                        break;
+                    }
+                }
+                if !held {
                     return Err(refused(format!(
                         "{u} holds keys nothing the slot names holds, and neither does \
                          a run's temp name"

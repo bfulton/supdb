@@ -14739,3 +14739,284 @@ fn a_failure_armed_under_a_held_presync_is_taken_at_its_lift() {
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// ---------------------------------------------------------------------
+// open-cost: what an open reads to make its checks, counted through the
+// process-wide record of the open's own reads (`Db::trace_dir_io`): each
+// manifest slot file opened once, read and made durable through the one
+// descriptor; a plain store's named segments looked for in the listing the
+// open makes anyway, never one by one (under a cipher, where the listing
+// is of the store's names and not of what the directory holds, one by
+// one); an unnamed segment's last key looked up in the segments whose
+// fences hold it, not in every segment; and an open that refuses a slot
+// at its checks replays no log first.
+// ---------------------------------------------------------------------
+
+/// The process-wide record's entries from `from` on of kind `what` for a
+/// file under `d` (a store under a cipher records a kept file under the
+/// store's marker), by file name.
+fn oc_calls(d: &Path, from: usize, what: &str) -> Vec<String> {
+    Db::trace_dir_io(true)
+        .split_off(from)
+        .into_iter()
+        .filter(|(w, p)| *w == what && p.starts_with(d))
+        .map(|(_, p)| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// What each key of a store reads: its values in order.
+type OcModel = BTreeMap<Vec<u8>, Vec<Vec<u8>>>;
+
+/// A store of several flushes, each landing a slot, so both slot files
+/// stand, closed cleanly.
+fn oc_store(tag: &str, base: Options) -> (PathBuf, Options, OcModel) {
+    let d = dir(&format!("oc-{tag}"));
+    let opts = Options {
+        flush_schedules: true,
+        ..base
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model = BTreeMap::new();
+    for r in 0..3u32 {
+        for k in (0..1500u32).rev() {
+            let k = format!("{r}-{}", key(k)).into_bytes();
+            db.put(&k, b"v");
+            model.insert(k, vec![b"v".to_vec()]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+    }
+    db.close().unwrap();
+    for s in OO_SLOTS {
+        assert!(
+            d.join(s).exists(),
+            "{tag}: premise: the slot file {s} stands"
+        );
+    }
+    (d, opts, model)
+}
+
+fn an_open_reads_each_slot_once(tag: &str, base: Options) {
+    let (d, opts, model) = oc_store(&format!("slots-{tag}"), base);
+    let from = Db::trace_dir_io(true).len();
+    let db = Db::open(&d, opts).unwrap();
+    let mut read = oc_calls(&d, from, "read_slot");
+    read.sort();
+    assert_eq!(
+        read,
+        OO_SLOTS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        "{tag}: the open opened each slot file once, to read it and to make it durable"
+    );
+    let synced = oc_calls(&d, from, "sync_slot");
+    assert_eq!(
+        synced.len(),
+        2,
+        "{tag}: both slot files made durable by the open: {synced:?}"
+    );
+    oo_holds(&db, &model, tag);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn an_open_opens_each_slot_file_once() {
+    an_open_reads_each_slot_once("plain", Options::default());
+}
+
+#[test]
+fn an_open_opens_each_slot_file_once_under_a_cipher() {
+    an_open_reads_each_slot_once("cipher", under_cipher());
+}
+
+fn an_open_looks_for_named_segments(tag: &str, base: Options, one_by_one: bool) {
+    let (d, opts, model) = oc_store(&format!("named-{tag}"), base);
+    let from = Db::trace_dir_io(true).len();
+    let db = Db::open(&d, opts).unwrap();
+    let looked = oc_calls(&d, from, "on_device");
+    // What the slot taken names: the store's segments as it opened.
+    let named = db.segments();
+    assert!(
+        named >= 2,
+        "{tag}: premise: the slot names several segments: {named}"
+    );
+    if one_by_one {
+        let mut once = looked.clone();
+        once.sort();
+        once.dedup();
+        assert_eq!(
+            (looked.len(), once.len()),
+            (named, named),
+            "{tag}: each named segment's envelope looked for once: {looked:?}"
+        );
+    } else {
+        assert!(
+            looked.is_empty(),
+            "{tag}: the open looked for named segments one by one where its listing says \
+             which are there: {looked:?}"
+        );
+    }
+    oo_holds(&db, &model, tag);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_plain_open_finds_its_named_segments_in_its_listing() {
+    an_open_looks_for_named_segments("plain", Options::default(), false);
+}
+
+/// Under a cipher the listing is of the store's own names, which the slot
+/// read gave it; whether each envelope is in the directory is asked of the
+/// directory, one by one. Held, not fixed: it passes before and after.
+#[test]
+fn an_open_under_a_cipher_looks_for_each_named_envelope() {
+    an_open_looks_for_named_segments("cipher", under_cipher(), true);
+}
+
+/// The two fences a segment's name carries, `None` where it carries none
+/// (a `seg-` name, whose range is the store's).
+fn oc_fence(name: &str) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+    let rest = name
+        .strip_prefix("par-")
+        .or_else(|| name.strip_prefix("pcs-"))?
+        .strip_suffix(".sup")?;
+    let f: Vec<&str> = rest.split('-').collect();
+    let unhex = |s: &str| -> Vec<u8> {
+        (0..s.len() / 2)
+            .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())
+            .collect()
+    };
+    Some((unhex(f[2]), (!f[3].is_empty()).then(|| unhex(f[3]))))
+}
+
+/// A store of three partitions, then a merge over the middle one held at
+/// its landing and the store copied there: the copy's slot names the
+/// three partitions, and the merge's outputs stand unnamed beside them,
+/// newer than every named segment and within what the slot covers. The
+/// open holds the outputs' last keys to what the slot names, and reads
+/// for it only the segments whose fences take in the middle range.
+#[test]
+fn an_open_after_a_crash_reads_only_the_segments_over_an_unnamed_segments_keys() {
+    let d = dir("oc-route");
+    let c = dir("oc-route-kill");
+    let opts = Options {
+        partition_on_flush: false,
+        flush_schedules: true,
+        seal_bytes: 1 << 20,
+        l0_trigger: 1000,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    for p in ["a", "m", "z"] {
+        for k in (0..2000u32).rev() {
+            let k = format!("{p}-{k:06}").into_bytes();
+            db.put(&k, b"v0");
+            model.insert(k, vec![b"v0".to_vec()]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+    }
+    for k in (0..2000u32).step_by(3) {
+        let k = format!("m-{k:06}").into_bytes();
+        db.put(&k, b"v1");
+        model.insert(k, vec![b"v1".to_vec()]);
+    }
+    db.commit().unwrap();
+    db.hold_merge_landing(true);
+    db.flush().unwrap();
+    wait_for("the merge at its landing hold", || {
+        db.merge_waits_at_landing()
+    });
+    copy_store(&d, &c);
+    db.hold_merge_landing(false);
+    drop(db);
+    let named: Vec<String> = oo_names(&std::fs::read(&oo_by_age(&c)[0]).unwrap())
+        .1
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    let unnamed: Vec<String> = seg_names(&c)
+        .into_iter()
+        .filter(|n| !named.contains(n))
+        .collect();
+    assert!(
+        !unnamed.is_empty(),
+        "premise: the merge's outputs stand unnamed: {named:?}"
+    );
+    // What a key of the middle range may lie in, by the names' fences.
+    let over = |n: &String| match oc_fence(n) {
+        None => true,
+        Some((lo, hi)) => {
+            lo.as_slice() <= b"m-999999".as_slice()
+                && hi.is_none_or(|h| h.as_slice() > b"m-000000".as_slice())
+        }
+    };
+    assert!(
+        named.iter().any(|n| !over(n)),
+        "premise: a named segment whose fences leave the middle range out: {named:?}"
+    );
+    let from = Db::trace_dir_io(true).len();
+    let db = Db::open(&c, opts).expect("the window opens");
+    let read = oc_calls(&c, from, "open_holder");
+    assert!(
+        !read.is_empty(),
+        "premise: the open read segments for the outputs' keys"
+    );
+    for n in &read {
+        assert!(
+            named.contains(n) && over(n),
+            "the open read {n}, whose fences leave the outputs' keys out, for them \
+             (named {named:?}, read {read:?})"
+        );
+    }
+    oo_holds(&db, &model, "route");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&c);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A flushed run whose slot is damaged after its temp name retired, with
+/// a write after the flush in the log: the open refuses at its checks of
+/// the slot, and replays no log file before it does.
+#[test]
+fn an_open_that_refuses_an_unnamed_segment_replays_no_log_first() {
+    let d = dir("oc-noreplay");
+    let c = dir("oc-noreplay-kill");
+    let opts = Options {
+        partition_on_flush: true,
+        flush_schedules: true,
+        drain_names_partition: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    for k in 0..2000u32 {
+        db.append(key(k).as_bytes(), b"acked");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    db.put(key(0).as_bytes(), b"again");
+    db.commit().unwrap();
+    copy_store(&d, &c);
+    drop(db);
+    assert!(!open_run(&c), "premise: the run's temp name retired");
+    assert!(
+        wal_names(&c)
+            .iter()
+            .any(|w| std::fs::metadata(c.join(w)).unwrap().len() > 64),
+        "premise: the log holds the write after the flush"
+    );
+    oo_damage(&oo_by_age(&c)[0]);
+    let from = Db::trace_dir_io(true).len();
+    oo_refused(&c, &opts, OO_KEYS, "noreplay");
+    let replayed = oc_calls(&c, from, "replay");
+    assert!(
+        replayed.is_empty(),
+        "an open that refuses at its checks of the slot replayed {replayed:?} first"
+    );
+    let _ = std::fs::remove_dir_all(&c);
+    let _ = std::fs::remove_dir_all(&d);
+}
