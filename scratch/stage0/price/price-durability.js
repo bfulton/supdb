@@ -323,6 +323,24 @@ const kindNote = u => u.kind === 'price'
   ? 'This is a fix unit for a defect found since stage 0: a test that fails first, the smallest fix, mutants. Nothing is priced by a pairing (verdict "not-priced", land true unless you cannot finish it, or the engine turns out not to have the defect, which you then show), rule 13 does not apply, and rule 1 allows the one thing the brief names where the brief names it, and nothing else.'
   : 'This is a tidy unit: nothing is priced (verdict "not-priced", land true unless you cannot finish it), rule 13 does not apply, and rule 1 allows nothing on a success path beyond a load and a branch folded into a check the path already makes.'
 
+// A fix step a container restart killed part way is started again with what the killed run left.
+// Every other unit's prompt is unchanged, so a resumed run takes its earlier answers as they were.
+function resumeFixNote(u) {
+  if (u.key === 'helper-race') return `
+
+RESUMED AFTER A CONTAINER RESTART. An earlier run of this same step was killed by a restart of the machine at about 06:05 UTC on 2026-11-18, part way through step 7; nothing of its answer exists. Step 0 does not apply to you: the working tree is NOT clean, and it is not meant to be. What the earlier run left, and what the orchestrator did after it:
+1. Its notes are ${P}/helper-race/notes.md: read them first, whole, and continue from them. Do not start the unit over. By those notes steps 1 to 6 are done: the tests and seams are in (before.log), the fix is in (the helper opens a description of its own through /proc/self/fd), the neighbours ran, the pricing is done with its verdict "no cost resolved, lands" (the pairings, strace counts and folio compositions are in the notes and under pairs/, strace/ and folios/; do not run them again), and the measuring field and its bench arms are out (measuring.patch holds the measuring tree; after-landing.log is the unit's tests on the landing tree).
+2. keep/ holds the landing tree's three files (src_db.rs.fixed, src_lib.rs.fixed, tests_durable.rs.fixed) with keep/sha256.txt; the *.measuring copies beside them are the measuring tree and are not to go back in.
+3. Step 7 was running: mut.py with verdicts in mut-results.txt and logs mut-<name>.log. M1 and M2 are KILLED; M3 (finish-ignores-helper-error) was building or running when the machine went, and the rest had not run. The restart left M3's edit in src/db.rs. The orchestrator put keep/src_db.rs.fixed back: src/db.rs, src/lib.rs and tests/durable.rs are keep/ by sha256.txt. Check the sums yourself before the first build and after every mutant, and run M3 and every mutant after it.
+4. Step 8 had begun beside the mutants: CLAUDE.md and ROADMAP.md carry the earlier run's doc edits, uncommitted and with no kept copy. Read them (git diff CLAUDE.md ROADMAP.md) and finish or correct them; they may stop mid-thought. The doc comments in src/ are as keep/ has them.
+5. The whole of the tree's diff as the restart left it, M3's line included, is ${P}/helper-race/restart-0605.patch, for reference only.
+6. target/ may hold a half-built or a mutant's build of the test binaries, and bench/target was built from the measuring tree. Build before you believe a result, and believe a result only from a binary built from the tree you name. The unit's TMPDIR (${S}/tmp/helper-race) was cleared of the killed run's test stores.
+7. Background commands of the earlier run went with the machine: a runner's log with no exit line is a dead run, not a running one.
+8. A restart can come again. Keep notes.md current at each step (which mutant is in the tree, which results are in, what is next), and refresh keep/ and keep/sha256.txt whenever the tree changes for good (the docs too, once they are done), so that the next start can pick up as this one does.
+Then steps 7, 8 and 9 as written above, and the structured result for the whole unit, the pricing list from the notes included.`
+  return ''
+}
+
 function implementPrompt(u) {
   return `${CONTEXT}
 YOUR UNIT: "${u.key}" (${u.defects.join('; ')}). ${kindNote(u)} You build it: tests in and shown failing, the fix${u.kind === 'price' ? ', its pairings and their verdict' : ''}, then the mutants. You do not commit.
@@ -340,7 +358,7 @@ ${u.kind === 'price' ? `5. Price it (rule 13b to 13f), the machine to itself. Ev
 7. Mutants (rule 6) on the tree that will land, into ${P}/${u.key}/mutants.md. Put the tree back exactly.
 8. Docs (rule 9). Run "sh scripts/fmt.sh" the way scripts/check.sh's lint group checks it and fix what it reports.
 9. Finish notes.md: what was wrong, what you changed and why that shape, what each test holds, the pricing table, what you left out and why, what you did not verify.
-Leave the work uncommitted in the working tree (or, for a unit that does not land, the tree clean and the patch saved). Return the structured result; it is data for the next step, not a message to a person. Set engine_changed to true if anything under src/ changed.`
+Leave the work uncommitted in the working tree (or, for a unit that does not land, the tree clean and the patch saved). Return the structured result; it is data for the next step, not a message to a person. Set engine_changed to true if anything under src/ changed.${resumeFixNote(u)}`
 }
 
 function reviewPrompt(u, lens, round, impl) {
@@ -358,6 +376,33 @@ The implementer's own account (data, to be checked, not believed):
 ${JSON.stringify(impl, null, 1).slice(0, 16000)}`
 }
 
+// A step a container restart killed part way is started again with what the killed run left, said once here.
+// Every other step's prompt is unchanged, so a resumed run takes its earlier answers as they were.
+function resumeNote(u, round) {
+  if (u.key === 'helper-race' && round === 0) return `
+
+RESUMED AFTER A CONTAINER RESTART (the third of the day, at about 07:10 UTC on 2026-11-18). An earlier run of this same repair step was killed part way; nothing of its answer exists. What it left, and what the orchestrator found:
+1. Its notes are ${P}/helper-race/notes.md, section "Repair round 1". Read them first and continue from them; do not start the round over.
+2. Done, by those notes: the new tests (r1-new*.log), the extra mutants (mut2-, mut3- and mut4-results.txt: every one killed once tests were added for E5 and E7; E6's told_other taken out as unreachable; E8 and E9 killed), and keep/ refreshed to the fixed tree after those changes (keep/sha256.txt checks: src_db.rs.fixed, src_lib.rs.fixed, tests_durable.rs.fixed, CLAUDE.md.fixed, ROADMAP.md.fixed, docs_engine.md.fixed).
+3. It was pricing again, because the helper's spawn was restructured on the writer's path, and THE MEASURING ARM IS IN THE TREE NOW: src/db.rs is keep/src_db.rs.fixed plus the measuring field (price_helper_race_old in Options and SegmentOptions, price_old in AlignedWriter; the diff against keep is those hunks alone), and bench/src/engines.rs carries the two arms (supdb-helperraceold, supdb-ingesthelperraceold). bench/target/release/bench was built from that tree at 07:03 (bench-build-r1.log, exit 0); the load_only example there is older, from the first pricing.
+4. pairs-r1/ holds every pairing started before the kill, each finished (status.txt ends "alldone"; no pairing was running when the machine went, and the unit's TMPDIR is empty): m1 (load,lag: both arm pairs at 10000 and 300000), st1 (stamped load: both pairs, both sizes) and st2 (stamped load, supdb against supdb-helperraceold at 300000, finished 07:10:15 and NOT read yet). The notes' last line: "r1 tables read: no cell worse both sittings; stamped: durable ordered fsync-after-readable new +0.27/+0.21 ms both sittings (round 0 had new shorter both) -> rerun st2". So: read st2 with phases.py, decide as rule 13e says (a phase longer in both sittings of two stamped pairings by more than the sittings differ is a resolved cost; one that splits is not), run whatever else the verdict needs with the machine to itself (pgrep -af '/bench ' empty first), and say in the result what that phase is and whether the change can reach it (the fix is one open where a helper is spawned).
+5. Then take the measuring field and arms out (13g): put keep/src_db.rs.fixed back over src/db.rs, "git checkout HEAD -- bench/src/engines.rs", check keep/sha256.txt against the tree, and run the unit's tests on that tree.
+6. CLAUDE.md in the tree is newer than keep/CLAUDE.md.fixed: a paragraph of this round written after keep was taken (the sync at the stop, the descriptor's digits). Keep it, finish it, and refresh keep/CLAUDE.md.fixed and the sums.
+7. ${P}/helper-race/restart-0710.patch is the tree's whole diff as the restart left it (the measuring tree), for reference only.
+8. target/ and bench/target may hold a half-built build. Build before you believe a result. Background commands of the earlier run went with the machine: a log with no exit line is a dead run.
+9. A restart can come again (three so far today: 00:19, 06:05, 07:10 UTC). Keep notes.md current at each step and keep/ current whenever the fixed tree changes, so the next start can pick up as this one does.`
+  if (u.key === 'rename-arm' && round === 1) return `
+
+RESUMED AFTER A CONTAINER RESTART. An earlier run of this same step was killed part way by a restart of the machine at 00:19 UTC on 2026-11-18; nothing of its answer exists. What it left, and what the orchestrator did after it:
+1. Its notes are in ${P}/rename-arm/notes.md, section "Repair round 2". Read them first and continue from them; do not start the round over.
+2. It was running the extra mutants listed above as ${P}/rename-arm/mutants-r2.json (ids r2-A to r2-H) with mut-r1.py (MUTS=mutants-r2.json), verdict lines "r2-*" in mut-results-r1.txt and logs mut-r1-r2-*.log. As the machine went: A, B and F SURVIVED; E KILLED; D reads BUILD-FAIL/OTHER with exit 101, its log ending in "fatal runtime error: failed to initiate panic" in the durable binary (read it and decide whether that is a kill, a build failure or the runner's own); G was still compiling; H had not run; C was set aside for a removal seam "added after the first pass". So: run G and H, settle D, do C, and give each survivor (A, B, F and any new one) a test that kills it or the reason no input can reach it. r2_tests.rs and r2-tests.json hold what the earlier run had drafted; none of it is in the tree.
+3. The restart left mutant G's edit in src/db.rs (the line "mseq += 1;" deleted). The orchestrator put keep/src_db.rs.fixed back. The four changed files (CLAUDE.md, src/db.rs, src/db/vault.rs, tests/durable.rs) are keep/ by keep/sha256.txt, which is the round-1 tree that both second-round reviewers passed. Check the sums yourself before the first build and after every mutant.
+4. target/ may hold a half-built or a mutant's build of the test binaries. Build before you believe a result, and believe a result only from a binary built from the tree you name.
+5. The unit's TMPDIR (${S}/tmp/rename-arm) is empty. Background commands of the earlier run went with the machine: a runner's log with no exit line is a dead run, not a running one.
+6. A restart can come again. Keep notes.md current at each step (which mutant is in the tree, which results are in, what is next), and refresh keep/ and keep/sha256.txt whenever the tree changes for good, so that the next start can pick up as this one does.`
+  return ''
+}
+
 function repairPrompt(u, round, blocking, extra, source) {
   return `${CONTEXT}
 YOUR UNIT: "${u.key}" (${u.defects.join('; ')}), repair round ${round + 1}. ${kindNote(u)} The unit's work is uncommitted in the working tree, with its notes under ${P}/${u.key}/. ${source} found the problems below. Deal with each: fix it, or show with a test or a line of code why it is not a problem (and say so). Run every extra mutant; a survivor means a missing test or an unreachable check. Keep everything the unit already fixed. ${u.kind === 'price' ? 'If this round changes code on a path that runs when nothing fails, or a reviewer showed a pairing does not reach the mechanism, the affected pairings are run again: put the measuring field back from measuring.patch (adapted), price as rule 13 says, and take it out again.' : ''} Then run the unit's tests and the neighbours again, the format step, and update notes.md and mutants.md. You do not commit.
@@ -371,7 +416,7 @@ ${JSON.stringify(blocking, null, 1)}
 EXTRA MUTANTS TO RUN:
 ${JSON.stringify(extra, null, 1)}
 
-Return the structured result for the unit as it now stands (all of it, not only this round's changes; the pricing list whole). Set engine_changed to true only if this round changed anything under src/.`
+Return the structured result for the unit as it now stands (all of it, not only this round's changes; the pricing list whole). Set engine_changed to true only if this round changed anything under src/.${resumeNote(u, round)}`
 }
 
 function commitPrompt(u, impl, unresolved) {

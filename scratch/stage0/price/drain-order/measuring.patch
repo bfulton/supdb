@@ -1,0 +1,352 @@
+diff --git a/bench/src/engines.rs b/bench/src/engines.rs
+index b1585907..e6d626e8 100644
+--- a/bench/src/engines.rs
++++ b/bench/src/engines.rs
+@@ -792,6 +792,9 @@ pub struct Supdb {
+     /// A flush that does not partition leaves its pieces as they are,
+     /// as before `Options::flush_schedules`. `supdb-ingestleave`.
+     leave: bool,
++    /// Pricing the drain-order unit only: `Options::price_drain_order_old`
++    /// (`supdb-drainorderold`, `supdb-ingestdrainorderold`).
++    price: bool,
+     /// The partitions' blocks below which no builder starts, or none for
+     /// the engine's own. `supdb-ahead`.
+     aheadmin: Option<usize>,
+@@ -1637,6 +1640,9 @@ struct Policy {
+     /// A flush that does not partition leaves its pieces as they are,
+     /// as before `Options::flush_schedules`. `supdb-ingestleave`.
+     leave: bool,
++    /// Pricing the drain-order unit only: `Options::price_drain_order_old`
++    /// (`supdb-drainorderold`, `supdb-ingestdrainorderold`).
++    price: bool,
+     /// The builder's minimum blocks, or none for the engine's own.
+     /// `supdb-ahead`.
+     aheadmin: Option<usize>,
+@@ -2156,6 +2162,7 @@ impl Default for Policy {
+             aheadpub: false,
+             pubalways: false,
+             leave: false,
++            price: false,
+         }
+     }
+ }
+@@ -2176,6 +2183,31 @@ impl Supdb {
+         )
+     }
+ 
++    /// Pricing the drain-order unit: `supdb` with `Options::price_drain_order_old`.
++    pub fn create_drainorderold(path: &Path) -> Res<Supdb> {
++        Supdb::with_policy(
++            path,
++            Policy {
++                price: true,
++                ..Policy::default()
++            },
++        )
++    }
++
++    /// Pricing the drain-order unit: `supdb-ingest` with
++    /// `Options::price_drain_order_old`.
++    pub fn create_ingest_drainorderold(path: &Path) -> Res<Supdb> {
++        Supdb::with_policy(
++            path,
++            Policy {
++                partition: false,
++                durable: false,
++                price: true,
++                ..Policy::default()
++            },
++        )
++    }
++
+     /// `supdb` with its directory under a key: every file the store writes
+     /// encrypted by the kernel (`Encryption::Kernel`). The pair against
+     /// `supdb`, both on a filesystem that can encrypt, differs by the key
+@@ -6721,6 +6753,7 @@ impl Supdb {
+             aheadpub,
+             pubalways,
+             leave,
++            price,
+             adaptcap,
+             adapttrig,
+             rotate,
+@@ -7047,6 +7080,7 @@ impl Supdb {
+             // commit as they were.
+             forms_publish_lazily: !pubalways,
+             flush_schedules: !leave,
++            price_drain_order_old: price,
+             // The unsealed share past which the maintenance stops, so an
+             // arm can maintain whoever is reading without paying for it
+             // on a store that is nearly all unmerged.
+@@ -7354,6 +7388,7 @@ impl Supdb {
+             aheadpub,
+             pubalways,
+             leave,
++            price,
+             adaptcap,
+             adapttrig,
+             rotate,
+@@ -7498,6 +7533,13 @@ impl ThreadReader for TallyReader {
+ 
+ impl Engine for Supdb {
+     fn name(&self) -> &'static str {
++        if self.price {
++            return if self.partition {
++                "supdb-drainorderold"
++            } else {
++                "supdb-ingestdrainorderold"
++            };
++        }
+         // A store under a key is the default or the buffered arm with
+         // nothing else changed.
+         if self.dirkey {
+@@ -9940,10 +9982,12 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
+         | "supdb-behindyield"
+         | "supdb-bg"
+         | "supdb-bglag"
++        | "supdb-drainorderold"
+         | "lmdb"
+         | "lmdb-nordahead"
+         | "rocksdb-tuned" => Guarantee::Durable,
+         "supdb-ingest"
++        | "supdb-ingestdrainorderold"
+         | "supdb-ingestleave"
+         | "supdb-ingestnoseal"
+         | "supdb-ingestsync"
+@@ -10315,6 +10359,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
+         "supdb-nocacheautozpageseager" => supdb_arm(Supdb::create_nocache_auto_zpages_eager, dir)?,
+         "supdb-cache256" => supdb_arm(Supdb::create_cache256, dir)?,
+         "supdb-ingest" => supdb_arm(Supdb::create_ingest, dir)?,
++        "supdb-drainorderold" => supdb_arm(Supdb::create_drainorderold, dir)?,
++        "supdb-ingestdrainorderold" => supdb_arm(Supdb::create_ingest_drainorderold, dir)?,
+         "supdb-ingestleave" => supdb_arm(Supdb::create_ingest_leave, dir)?,
+         "supdb-l0" => supdb_arm(Supdb::create_l0, dir)?,
+         "supdb-nopin" => supdb_arm(Supdb::create_nopin, dir)?,
+diff --git a/src/db.rs b/src/db.rs
+index 842793ae..a9ce1895 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -3128,6 +3128,11 @@ pub struct Options {
+     /// without the advice, nothing changes. A `Db` passes it to its
+     /// segment writers over `SegmentOptions::prefault`.
+     pub prefault: bool,
++    /// MEASURING: a drain's run job (`SealJob::awaits_writer`) lands
++    /// durable whenever its seal thread has returned, as before the
++    /// writer's ask ordered it after the presync. Unsound; off, the fix.
++    #[doc(hidden)]
++    pub price_drain_order_old: bool,
+     /// Whether a drain that does not partition on flush names its first
+     /// seal's piece as the partition at the close, where it fits one and
+     /// holds no tombstone, rather than landing it as a piece and promoting
+@@ -4183,6 +4188,7 @@ impl Default for Options {
+             convert_from_form: true,
+             copy_exact: true,
+             prefault: false,
++            price_drain_order_old: false,
+             drain_names_partition: true,
+             manifest_spare: true,
+             manifest_slots: true,
+@@ -16054,9 +16060,11 @@ struct Shared {
+     wedge_cause: std::sync::Mutex<Option<(std::io::ErrorKind, String)>>,
+     /// A test's: the next readable landing fails as a `Seg::open` would.
+     fail_landing: std::sync::atomic::AtomicBool,
+-    /// A test's: the next close's presync reports a failure as a failed
+-    /// fdatasync would.
+-    fail_presync: std::sync::atomic::AtomicBool,
++    /// A test's: the seams of a closing run's presync, one byte the
++    /// presync loads once (`PRESYNC_FAIL`, `PRESYNC_HOLD`): the next
++    /// presync reports a failure as a failed fdatasync would, and while
++    /// held the writer's presync waits before it syncs.
++    presync_seam: std::sync::atomic::AtomicU8,
+     /// A test's: the files the open that made this store fsynced, each
+     /// pushed once its fsync returned, the directory as `.`, in the order
+     /// the fsyncs returned -- the slot that names pending segments durable
+@@ -16066,9 +16074,6 @@ struct Shared {
+     /// A test's: the inode of the run's file and the bytes the file held
+     /// when an injected presync failed (`Db::failed_presync_extent`).
+     failed_presync: std::sync::Mutex<Option<(u64, u64)>>,
+-    /// A test's: while set, the writer's presync of a closing run's records
+-    /// waits before it syncs (`Reader::hold_presync`).
+-    presync_hold: std::sync::atomic::AtomicBool,
+     /// A test's: told of every slot write the segment work makes, before
+     /// it is made (`Db::watch_slot_writes`), while `slot_watching` is set.
+     slot_watch: std::sync::Mutex<Option<SlotWatch>>,
+@@ -28341,7 +28346,15 @@ impl Reader {
+     /// hold the writer's flush there while the seal thread finishes.
+     #[doc(hidden)]
+     pub fn hold_presync(&self, on: bool) {
+-        self.shared.presync_hold.store(on, AtomicOrdering::Release);
++        if on {
++            self.shared
++                .presync_seam
++                .fetch_or(PRESYNC_HOLD, AtomicOrdering::AcqRel);
++        } else {
++            self.shared
++                .presync_seam
++                .fetch_and(!PRESYNC_HOLD, AtomicOrdering::AcqRel);
++        }
+     }
+ 
+     /// A test's: the holds `Db::hold_seal_landing` and
+@@ -28931,10 +28944,9 @@ impl Db {
+             seal_wedged: std::sync::atomic::AtomicBool::new(false),
+             wedge_cause: std::sync::Mutex::new(None),
+             fail_landing: std::sync::atomic::AtomicBool::new(false),
+-            fail_presync: std::sync::atomic::AtomicBool::new(false),
++            presync_seam: std::sync::atomic::AtomicU8::new(0),
+             open_synced: Vec::new(),
+             failed_presync: std::sync::Mutex::new(None),
+-            presync_hold: std::sync::atomic::AtomicBool::new(false),
+             slot_watch: std::sync::Mutex::new(None),
+             slot_watching: std::sync::atomic::AtomicBool::new(false),
+             tear_slot: std::sync::atomic::AtomicBool::new(false),
+@@ -29800,10 +29812,9 @@ impl Db {
+             seal_wedged: std::sync::atomic::AtomicBool::new(false),
+             wedge_cause: std::sync::Mutex::new(None),
+             fail_landing: std::sync::atomic::AtomicBool::new(false),
+-            fail_presync: std::sync::atomic::AtomicBool::new(false),
++            presync_seam: std::sync::atomic::AtomicU8::new(0),
+             open_synced,
+             failed_presync: std::sync::Mutex::new(None),
+-            presync_hold: std::sync::atomic::AtomicBool::new(false),
+             slot_watch: std::sync::Mutex::new(None),
+             slot_watching: std::sync::atomic::AtomicBool::new(false),
+             tear_slot: std::sync::atomic::AtomicBool::new(false),
+@@ -31270,10 +31281,8 @@ impl Db {
+                 std::thread::Builder::new()
+                     .name("supdb-presync".into())
+                     .spawn(move || {
+-                        let r = if shared.fail_presync.load(AtomicOrdering::Relaxed)
+-                            && shared.fail_presync.swap(false, AtomicOrdering::AcqRel)
+-                        {
+-                            Db::injected_presync(&shared, &f, upto)
++                        let r = if shared.presync_seam.load(AtomicOrdering::Acquire) != 0 {
++                            Db::seamed_presync(&shared, &f, upto, false)
+                         } else {
+                             f.sync_data()
+                         };
+@@ -31307,11 +31316,10 @@ impl Db {
+             // the job durable (`SealJob::awaits_writer`): the next flush
+             // answered `Ok` over a segment the manifest named.
+             if let Some((f, upto)) = presync {
+-                while self.shared.presync_hold.load(AtomicOrdering::Acquire) {
+-                    std::thread::park_timeout(MAINT_LAND_POLL);
+-                }
+-                let r = if self.shared.fail_presync.swap(false, AtomicOrdering::AcqRel) {
+-                    Db::injected_presync(&self.shared, &f, upto)
++                // The seams' one byte, asked once: a presync no test
++                // armed loads it and syncs.
++                let r = if self.shared.presync_seam.load(AtomicOrdering::Acquire) != 0 {
++                    Db::seamed_presync(&self.shared, &f, upto, true)
+                 } else {
+                     f.sync_data()
+                 };
+@@ -32093,7 +32101,17 @@ impl Db {
+         // (`Options::land_ranks_far`), whichever path the drain's own
+         // seal takes.
+         self.shared.reads_near.store(true, AtomicOrdering::Release);
+-        let sealed = self.seal().and_then(|_| {
++        // A run's close that awaits the writer's word for its durable
++        // landing (`SealJob::awaits_writer`) is the last step of the
++        // seal's ordered branch and cannot fail, so the ask below follows
++        // every such hand-over: a seal that fails has handed none, and
++        // one whose job's landing fails is answered by the ask.
++        let sealed = self.seal();
++        debug_assert!(
++            sealed.is_ok() || !self.handed_awaiting_writer(),
++            "a drain's seal failed after it handed a job that awaits the writer's ask"
++        );
++        let sealed = sealed.and_then(|_| {
+             self.shared.drain_steps.stamp(1);
+             self.maint_request(MaintAsk::Drain)
+         });
+@@ -32106,6 +32124,17 @@ impl Db {
+         sealed
+     }
+ 
++    /// Whether a seal in flight on the inline segment work awaits the
++    /// writer's ask (`SealJob::awaits_writer`); asked by a debug assertion
++    /// only, and answered `false` where the segment work has a thread of
++    /// its own, whose queue the writer does not see.
++    fn handed_awaiting_writer(&self) -> bool {
++        match &self.maint {
++            MaintHome::Here(m) => m.sealing.iter().any(|j| j.awaits_writer),
++            MaintHome::Away(_) => false,
++        }
++    }
++
+     /// The state the writer's operation holds moved to whatever is
+     /// current: another thread may have published since the operation
+     /// began, and what the writer publishes next is made over the store as
+@@ -33331,6 +33360,12 @@ impl Db {
+         awaits_writer: bool,
+     ) {
+         let draining = self.draining;
++        // The writer's ask that lands such a job durable is a drain's
++        // (`MaintAsk::Drain`), which only a draining writer sends after it.
++        debug_assert!(
++            !awaits_writer || draining,
++            "a seal that awaits the writer's word handed outside a drain"
++        );
+         let wake = match &self.maint {
+             MaintHome::Away(a) => a.thread.clone(),
+             MaintHome::Here(_) => None,
+@@ -33583,8 +33618,32 @@ impl Db {
+     #[doc(hidden)]
+     pub fn fail_next_presync(&self) {
+         self.shared
+-            .fail_presync
+-            .store(true, AtomicOrdering::Release);
++            .presync_seam
++            .fetch_or(PRESYNC_FAIL, AtomicOrdering::AcqRel);
++    }
++
++    /// A presync a test armed (`Shared::presync_seam`): held while the
++    /// hold is on, where `holds` (the writer's presync; the thread's on the
++    /// inline arm is not held), then the injected failure if one is armed,
++    /// taken once, or the fdatasync.
++    #[cold]
++    #[inline(never)]
++    fn seamed_presync(shared: &Shared, f: &File, upto: u64, holds: bool) -> std::io::Result<()> {
++        if holds {
++            while shared.presync_seam.load(AtomicOrdering::Acquire) & PRESYNC_HOLD != 0 {
++                std::thread::park_timeout(MAINT_LAND_POLL);
++            }
++        }
++        if shared
++            .presync_seam
++            .fetch_and(!PRESYNC_FAIL, AtomicOrdering::AcqRel)
++            & PRESYNC_FAIL
++            != 0
++        {
++            Db::injected_presync(shared, f, upto)
++        } else {
++            f.sync_data()
++        }
+     }
+ 
+     /// A test's injected presync failure: the run's file and its length
+@@ -39221,6 +39280,11 @@ impl SealReadable {
+     }
+ }
+ 
++/// `Shared::presync_seam`: the next presync fails (`Db::fail_next_presync`).
++const PRESYNC_FAIL: u8 = 1;
++/// `Shared::presync_seam`: the writer's presync waits (`Reader::hold_presync`).
++const PRESYNC_HOLD: u8 = 2;
++
+ /// The bits of `Shared::seal_hold`.
+ const SEAL_HOLD_LANDING: u8 = 1;
+ const SEAL_HOLD_DURABLE: u8 = 2;
+@@ -40024,7 +40088,10 @@ impl Maint {
+             let (readable, sealed) = self.seal_phases_due();
+             // A run's close whose records the writer is syncing lands
+             // durable at the writer's ask alone (`SealJob::awaits_writer`).
+-            if sealed && !self.sealing.front().is_some_and(|j| j.awaits_writer) {
++            if sealed
++                && (self.opts.price_drain_order_old
++                    || !self.sealing.front().is_some_and(|j| j.awaits_writer))
++            {
+                 let draining = self.sealing.front().is_some_and(|j| j.draining);
+                 self.land_front(draining)?;
+                 continue;

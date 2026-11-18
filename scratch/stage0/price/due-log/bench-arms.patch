@@ -1,0 +1,124 @@
+diff --git a/bench/src/engines.rs b/bench/src/engines.rs
+index b1585907..72c1e751 100644
+--- a/bench/src/engines.rs
++++ b/bench/src/engines.rs
+@@ -792,6 +792,9 @@ pub struct Supdb {
+     /// A flush that does not partition leaves its pieces as they are,
+     /// as before `Options::flush_schedules`. `supdb-ingestleave`.
+     leave: bool,
++    /// Pricing the due-log unit only: `Options::price_due_log_old`
++    /// (`supdb-duelogold`, `supdb-ingestduelogold`).
++    price: bool,
+     /// The partitions' blocks below which no builder starts, or none for
+     /// the engine's own. `supdb-ahead`.
+     aheadmin: Option<usize>,
+@@ -1637,6 +1640,9 @@ struct Policy {
+     /// A flush that does not partition leaves its pieces as they are,
+     /// as before `Options::flush_schedules`. `supdb-ingestleave`.
+     leave: bool,
++    /// Pricing the due-log unit only: `Options::price_due_log_old`
++    /// (`supdb-duelogold`, `supdb-ingestduelogold`).
++    price: bool,
+     /// The builder's minimum blocks, or none for the engine's own.
+     /// `supdb-ahead`.
+     aheadmin: Option<usize>,
+@@ -2156,6 +2162,7 @@ impl Default for Policy {
+             aheadpub: false,
+             pubalways: false,
+             leave: false,
++            price: false,
+         }
+     }
+ }
+@@ -2176,6 +2183,31 @@ impl Supdb {
+         )
+     }
+ 
++    /// Pricing the due-log unit: `supdb` with `Options::price_due_log_old`.
++    pub fn create_duelogold(path: &Path) -> Res<Supdb> {
++        Supdb::with_policy(
++            path,
++            Policy {
++                price: true,
++                ..Policy::default()
++            },
++        )
++    }
++
++    /// Pricing the due-log unit: `supdb-ingest` with
++    /// `Options::price_due_log_old`.
++    pub fn create_ingest_duelogold(path: &Path) -> Res<Supdb> {
++        Supdb::with_policy(
++            path,
++            Policy {
++                partition: false,
++                durable: false,
++                price: true,
++                ..Policy::default()
++            },
++        )
++    }
++
+     /// `supdb` with its directory under a key: every file the store writes
+     /// encrypted by the kernel (`Encryption::Kernel`). The pair against
+     /// `supdb`, both on a filesystem that can encrypt, differs by the key
+@@ -6721,6 +6753,7 @@ impl Supdb {
+             aheadpub,
+             pubalways,
+             leave,
++            price,
+             adaptcap,
+             adapttrig,
+             rotate,
+@@ -7047,6 +7080,7 @@ impl Supdb {
+             // commit as they were.
+             forms_publish_lazily: !pubalways,
+             flush_schedules: !leave,
++            price_due_log_old: price,
+             // The unsealed share past which the maintenance stops, so an
+             // arm can maintain whoever is reading without paying for it
+             // on a store that is nearly all unmerged.
+@@ -7354,6 +7388,7 @@ impl Supdb {
+             aheadpub,
+             pubalways,
+             leave,
++            price,
+             adaptcap,
+             adapttrig,
+             rotate,
+@@ -7498,6 +7533,13 @@ impl ThreadReader for TallyReader {
+ 
+ impl Engine for Supdb {
+     fn name(&self) -> &'static str {
++        if self.price {
++            return if self.partition {
++                "supdb-duelogold"
++            } else {
++                "supdb-ingestduelogold"
++            };
++        }
+         // A store under a key is the default or the buffered arm with
+         // nothing else changed.
+         if self.dirkey {
+@@ -9940,10 +9982,12 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
+         | "supdb-behindyield"
+         | "supdb-bg"
+         | "supdb-bglag"
++        | "supdb-duelogold"
+         | "lmdb"
+         | "lmdb-nordahead"
+         | "rocksdb-tuned" => Guarantee::Durable,
+         "supdb-ingest"
++        | "supdb-ingestduelogold"
+         | "supdb-ingestleave"
+         | "supdb-ingestnoseal"
+         | "supdb-ingestsync"
+@@ -10315,6 +10359,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
+         "supdb-nocacheautozpageseager" => supdb_arm(Supdb::create_nocache_auto_zpages_eager, dir)?,
+         "supdb-cache256" => supdb_arm(Supdb::create_cache256, dir)?,
+         "supdb-ingest" => supdb_arm(Supdb::create_ingest, dir)?,
++        "supdb-duelogold" => supdb_arm(Supdb::create_duelogold, dir)?,
++        "supdb-ingestduelogold" => supdb_arm(Supdb::create_ingest_duelogold, dir)?,
+         "supdb-ingestleave" => supdb_arm(Supdb::create_ingest_leave, dir)?,
+         "supdb-l0" => supdb_arm(Supdb::create_l0, dir)?,
+         "supdb-nopin" => supdb_arm(Supdb::create_nopin, dir)?,
