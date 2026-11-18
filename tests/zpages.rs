@@ -8327,6 +8327,192 @@ fn land_store_loaded(
     (dir, db, model, inject, raw)
 }
 
+/// The crossing asks for the raw pages of the partitions it has no form
+/// file for (`Options::zpages_cross_asks_raw`): a store whose every
+/// partition's records the cache has let go, taken past the selector's
+/// line with the builds held at their start. With the option each such
+/// partition's raw pages are asked for at the crossing and are in the
+/// cache soon after, where the reads the raw form serves until a form file
+/// is built will find them; without it nothing is asked for, and they stay
+/// out until a read or a build faults them in a page at a time. A
+/// partition whose records the cache holds is asked nothing, and one whose
+/// form file is on disk is the swap's, its records dropped and its form
+/// asked for, and no raw page of it asked.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_crossing_asks_for_the_raw_pages_of_a_cold_partition_with_no_form_file() {
+    for (on, cold, ahead) in [
+        (true, true, false),
+        (false, true, false),
+        (true, false, false),
+        (true, true, true),
+    ] {
+        let what = format!(
+            "the crossing's ask for raw pages {on}, records out {cold}, files built ahead {ahead}"
+        );
+        let what = what.as_str();
+        let (dir, db, model, inject, raw) =
+            land_store_with(&format!("auto-cross-raw-{on}-{cold}-{ahead}"), 50, |o| {
+                o.zpages_cross_asks_raw = on;
+                o.partition_bytes = Some(400 << 10);
+                o.zpages_ahead_builders = 1;
+                // Nothing is bought, and no build ahead takes a partition
+                // found cold, so the records stay as the crossing left them.
+                o.zpages_cover_resident = false;
+                o.zpages_suspect_at_crossing = false;
+                o.zpages_land_cold_past = false;
+            });
+        if ahead {
+            // Two partitions built ahead under the line, their files on
+            // disk, and the third's build held at its start.
+            inject.set_budget(raw * 3 / 2);
+            assert!(
+                tick_until_built(&db, |c| c.prebuilt >= 2),
+                "{what}: built ahead: {:?}",
+                db.zpage_counts()
+            );
+        }
+        db.hold_zpage_build(true);
+        if ahead {
+            let t = std::time::Instant::now();
+            while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+                wait_steps(&db, 1);
+            }
+            assert!(db.zpage_build_waiting(), "{what}: a build held");
+        }
+        let on_disk = named_form_files(&dir).len() as u64;
+        let pars: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("par-") && n.ends_with(".sup"))
+            })
+            .collect();
+        assert!(pars.len() >= 4, "{what}: partitions: {pars:?}");
+        assert!(
+            if ahead { on_disk >= 2 } else { on_disk == 0 },
+            "{what}: {on_disk} form files on disk"
+        );
+        let share = |f: &Path| {
+            let len = std::fs::metadata(f).unwrap().len() as usize;
+            cached_pages(f, 0, len) as f64 / len.div_ceil(4096) as f64
+        };
+        if cold {
+            for f in &pars {
+                unmap_pages(f);
+                evict(f);
+                assert!(share(f) < 0.1, "{what}: {} out of the cache", f.display());
+            }
+        }
+        inject.set_budget(raw * 2 / 3);
+        wait_steps(&db, 5);
+        let c = db.zpage_counts();
+        let asks = if on && cold {
+            c.partitions - on_disk
+        } else {
+            0
+        };
+        assert_eq!(
+            (c.cross_raw_asks, c.ahead_swapped, c.attached),
+            (asks, on_disk, 0),
+            "{what}: the partitions with no form file asked for at the \
+             crossing, with the option and their records out: {c:?}"
+        );
+        if !ahead {
+            if on && cold {
+                wait_for(&format!("{what}: the raw pages in the cache"), || {
+                    pars.iter().all(|f| share(f) >= 0.8)
+                });
+            } else if cold {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                for f in &pars {
+                    assert!(
+                        share(f) < 0.1,
+                        "{what}: {} left out of the cache: {}",
+                        f.display(),
+                        share(f)
+                    );
+                }
+            }
+        }
+        db.hold_zpage_build(false);
+        let keys: Vec<Vec<u8>> = model.keys().step_by(53).cloned().collect();
+        let r = db.reader().unwrap();
+        check(&r, &model, &keys, what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The builder's turn comes when a job of its ends
+/// (`Options::zpages_drive_at_job_end`), and not only at the controller's
+/// next step. A store whose every partition is due a build ahead, one
+/// builder, and one step of the clock: with the option each build's end is
+/// the next one's start, and every partition is built with the clock where
+/// that step left it, a turn taken at each job's end and no more than
+/// that; without it the build the step started is the only one until the
+/// clock moves again, a build a step.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_builders_turn_comes_at_a_jobs_end_and_not_only_at_a_step() {
+    for on in [true, false] {
+        let what = format!("the builder's turn at a job's end {on}");
+        let what = what.as_str();
+        let (dir, db, _model, inject, raw) =
+            land_store_with(&format!("auto-drive-end-{on}"), 50, |o| {
+                o.zpages_drive_at_job_end = on;
+                o.zpages_ahead_builders = 1;
+                o.partition_bytes = Some(400 << 10);
+            });
+        inject.set_budget(raw * 3 / 2);
+        wait_steps(&db, 1);
+        let (parts, steps) = {
+            let c = db.zpage_counts();
+            (c.partitions, c.sel_steps)
+        };
+        assert!(
+            parts >= 3,
+            "{what}: partitions to build: {:?}",
+            db.zpage_counts()
+        );
+        if on {
+            wait_for(&format!("{what}: every partition built ahead"), || {
+                db.zpage_counts().prebuilt >= parts
+            });
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.build_starts, c.build_collected, c.sel_steps),
+                (parts, parts, steps),
+                "{what}: each built once, with no step since the first: {c:?}"
+            );
+            assert!(
+                c.job_end_drives >= parts - 1 && c.job_end_drives <= 2 * parts,
+                "{what}: a turn at each job's end and no more: {c:?}"
+            );
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let c = db.zpage_counts();
+            assert!(
+                c.build_starts == 1 && c.prebuilt == 0 && c.job_end_drives == 0,
+                "{what}: the next build waits for a step: {c:?}"
+            );
+            assert!(
+                tick_until_built(&db, |c| c.prebuilt >= c.partitions),
+                "{what}: built ahead a step at a time: {:?}",
+                db.zpage_counts()
+            );
+            assert_eq!(db.zpage_counts().job_end_drives, 0, "{what}");
+        }
+        assert_eq!(form_files(&dir).len() as u64, parts, "{what}: on disk");
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Two builds ahead at once (`Options::zpages_ahead_builders`): the second
 /// slot runs beside the first, and every partition is still built ahead
 /// once, its form file on disk and nothing attached; with one builder the
@@ -8342,7 +8528,7 @@ fn two_builds_ahead_run_beside_each_other_and_build_each_partition_once() {
             });
         inject.set_budget(raw * 3 / 2);
         assert!(
-            tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+            tick_until_built(&db, |c| c.prebuilt >= c.partitions),
             "built ahead: {:?}",
             db.zpage_counts()
         );
@@ -9044,7 +9230,7 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
             });
         inject.set_budget(raw * 2 / 3);
         assert!(
-            tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+            tick_until_built(&db, |c| c.prebuilt >= c.partitions),
             "{what}: built ahead: {:?}",
             db.zpage_counts()
         );

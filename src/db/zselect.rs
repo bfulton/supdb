@@ -1217,6 +1217,18 @@ pub struct Decision {
     pub event: Option<Event>,
 }
 
+impl Decision {
+    /// The decision without its pulses: what holds between two steps, for
+    /// whoever acts on it again before the next.
+    pub fn levels(self) -> Decision {
+        Decision {
+            retire: false,
+            event: None,
+            ..self
+        }
+    }
+}
+
 /// Counters of what the selector has done, for the engine's own counters and
 /// for the tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4035,6 +4047,35 @@ mod tests {
         assert_eq!(conversion_room(1000, 850), (150, 0));
         assert_eq!(conversion_room(1000, 900), (100, 0));
         assert_eq!(conversion_room(1000, 2000), (0, 0));
+    }
+
+    /// A decision's levels (`Decision::levels`): the phase, the gate and
+    /// what is wanted as the step left them, and neither pulse.
+    #[test]
+    fn a_decisions_levels_carry_no_pulse() {
+        let d = Decision {
+            phase: Phase::Compact,
+            gate: GATE_Z,
+            census: true,
+            sample: true,
+            build: true,
+            retire: true,
+            event: Some(Event::Install),
+        };
+        assert_eq!(
+            d.levels(),
+            Decision {
+                retire: false,
+                event: None,
+                ..d
+            }
+        );
+        let quiet = Decision {
+            retire: false,
+            event: None,
+            ..d
+        };
+        assert_eq!(quiet.levels(), quiet);
     }
 
     /// Every priced move with what it would save or lose

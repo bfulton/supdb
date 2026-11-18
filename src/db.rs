@@ -734,6 +734,12 @@ pub struct ZCounts {
     /// bytes asked for (`Options::zpages_ask_dropped`).
     pub dropped_asks: u64,
     pub dropped_ask_bytes: u64,
+    /// Turns of the builder taken at a job's end between two of the
+    /// controller's steps (`Options::zpages_drive_at_job_end`).
+    pub job_end_drives: u64,
+    /// Partitions with no form file whose raw pages the crossing asked for
+    /// (`Options::zpages_cross_asks_raw`).
+    pub cross_raw_asks: u64,
     /// Form files synced once named, on their build's thread
     /// (`Options::zpages_build_sync`).
     pub build_synced: u64,
@@ -2245,6 +2251,47 @@ pub struct Options {
     /// bar past the line too.
     #[doc(hidden)]
     pub zpages_land_cold_past: bool,
+    /// EXPERIMENT: the crossing asks for the raw pages of the partitions
+    /// it has no form file for, ahead of the form files it asks back
+    /// (`zpages_land_drop_past`, `Maint::z_cross`). A partition whose
+    /// records the cache let go during the load is one no build ahead
+    /// takes while the store is under the line, and after the crossing it
+    /// waits for the builder behind the builds in flight; until its form
+    /// file is built its reads go to the raw form, a fault on a hash page
+    /// and one on a record page each. At ten million keys under 1.25 GiB
+    /// there is one such partition at the load's end, a fifth to two
+    /// fifths resident, and with the dropped files asked back
+    /// (`zpages_ask_dropped`) its raw records took 14,874 of the 18,285
+    /// major faults of the one-thread read pass over stride files, the
+    /// reader at nothing else for a second and a half of 2.3 (`perf
+    /// record -e major-faults -c 1 -d` over `bench ab --arms
+    /// supdb-zstrideroomconvaskhot,supdb-zaskdropped --size 10000000
+    /// --bound 1342177280 --passes load,read --reps 1 --ops-div 10`, at
+    /// `1e7ba94`). The build reads those records anyway, a window ahead of
+    /// its walk; asked for whole and first, they are one stream at the
+    /// head of the device's queue, and the reads and the build both find
+    /// them. Off; `supdb-zcrossraw` turns it on.
+    #[doc(hidden)]
+    pub zpages_cross_asks_raw: bool,
+    /// EXPERIMENT: the builder's turn comes when a job of its ends, and
+    /// not only at the controller's next step. The controller steps once a
+    /// census interval, a tenth of a second, and takes a finished build or
+    /// warm in and starts the next at its step alone, so a chain of the
+    /// builder's jobs ran one a step however short each was: at ten
+    /// million keys under 1 GiB the warms of 29 form files the cache held
+    /// already took two and a half seconds, a job a step, with the
+    /// conversions that were due behind them (`zpages_stride_convert`),
+    /// and each of the 24 conversions was taken in 20-90 ms after it
+    /// ended, a second and a half of the nine and a half they took
+    /// (`SUPDB_ZPAGES_TRACE` over `bench ab --arms
+    /// supdb-zstrideroomconvaskhot,supdb --size 10000000 --bound
+    /// 1073741824` in the row's passes, at `1e7ba94`). A job's thread
+    /// wakes the segment work's as it ends; with the option the turn it
+    /// wakes into takes the job in and starts the next, under the levels
+    /// of the controller's last decision and none of its pulses. Off;
+    /// `supdb-zdriveend` turns it on.
+    #[doc(hidden)]
+    pub zpages_drive_at_job_end: bool,
     /// EXPERIMENT: the hot-raw policy (`zpages_hot_raw`) runs beside the
     /// stride form, over the partitions a block file serves. It stood
     /// down wherever the stride form was asked for, since a stride file
@@ -6325,6 +6372,8 @@ impl Default for Options {
             zpages_land_cold_past: true,
             zpages_ask_dropped: false,
             zpages_hot_raw_beside_stride: false,
+            zpages_drive_at_job_end: false,
+            zpages_cross_asks_raw: false,
             zpages_ahead_past_scans: false,
             zpages_build_at_finish: true,
             zpages_group_bytes: zpages::ZGROUP_BYTES,
@@ -24111,6 +24160,8 @@ impl Reader {
             ahead_swapped: get(&ev.ahead_swapped),
             dropped_asks: get(&ev.dropped_asks),
             dropped_ask_bytes: get(&ev.dropped_ask_bytes),
+            job_end_drives: get(&ev.job_end_drives),
+            cross_raw_asks: get(&ev.cross_raw_asks),
             build_synced: get(&ev.build_synced),
             build_nopage: get(&ev.build_nopage),
             warms: get(&ev.warms),
@@ -44871,6 +44922,10 @@ struct Maint {
     /// (`Options::zpages_ahead_builders`): only builds ahead take it, and
     /// nothing picks the partition it holds.
     zahead: Option<ZBuild>,
+    /// The controller's last decision, for the builder's turn between two
+    /// steps (`Options::zpages_drive_at_job_end`): its levels hold until
+    /// the next, and its pulses were that step's alone.
+    z_last_d: Option<zselect::Decision>,
     /// Inside a `ZSettle` answer: every kind of build is due, where the
     /// loop's own turns start only the builds of partitions with none.
     z_settling: bool,
@@ -45636,6 +45691,7 @@ impl Maint {
             shaped_at: 0,
             zbuild: None,
             zahead: None,
+            z_last_d: None,
             z_settling: false,
             zsel: {
                 let mut sel = zselect::ZSelect::default();
@@ -49501,6 +49557,16 @@ impl Maint {
             .z_last_step
             .is_some_and(|t| now.saturating_sub(t) < zselect::CENSUS_INTERVAL)
         {
+            // Between two steps, the builder's turn where a job of its has
+            // ended (`Options::zpages_drive_at_job_end`): the job's thread
+            // woke this one, and the job is taken in and the next started
+            // now, under the last decision's levels.
+            if self.opts.zpages_drive_at_job_end && self.z_job_ended() {
+                if let Some(last) = self.z_last_d {
+                    zfile::ZEvents::add(&self.shared.z.job_end_drives, 1);
+                    self.z_drive(&last.levels());
+                }
+            }
             return;
         }
         self.z_last_step = Some(now);
@@ -49578,7 +49644,16 @@ impl Maint {
             self.z_rewarm_due = true;
             self.z_rewarm_whole = true;
         }
+        self.z_last_d = Some(d);
         self.z_drive(&d);
+    }
+
+    /// Whether a job of the builder's has ended and waits to be taken in.
+    fn z_job_ended(&self) -> bool {
+        [&self.zbuild, &self.zahead]
+            .into_iter()
+            .flatten()
+            .any(|b| b.job.is_finished())
     }
 
     /// E2's bound (design 4.7): the raw footprint, bytes, of the compact
@@ -51338,6 +51413,38 @@ impl Maint {
         let (mut n, mut asked, mut live) = (0u64, 0u64, 0u64);
         {
             let _op = self.op();
+            // First the raw pages of the partitions with no form file to
+            // ask for, where the cache has let their records go
+            // (`Options::zpages_cross_asks_raw`): their reads are the raw
+            // form's until the builder reaches them, and a build reads
+            // those records whether one is in flight or to come.
+            if self.opts.zpages_cross_asks_raw {
+                for s in self
+                    .segs()
+                    .iter()
+                    .filter(|s| s.level > 0 && s.z.get().is_none())
+                {
+                    let Some((id, end)) = Db::name_id(&s.name).zip(Db::name_end_seq(&s.name))
+                    else {
+                        continue;
+                    };
+                    if self.dir.join(zfile::zpg_name(id, end)).is_file()
+                        || s.records_resident() >= HOT_RAW_RESIDENT
+                    {
+                        continue;
+                    }
+                    Maint::z_hot_ask(s, false);
+                    zfile::ZEvents::add(&self.shared.z.cross_raw_asks, 1);
+                    if self.z_trace {
+                        eprintln!(
+                            "zahead t={:.1} crossed asked raw {} resident {:.3}",
+                            self.z_epoch.elapsed().as_secs_f64(),
+                            s.name,
+                            s.records_resident()
+                        );
+                    }
+                }
+            }
             for s in self
                 .segs()
                 .iter()
