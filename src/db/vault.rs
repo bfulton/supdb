@@ -142,7 +142,7 @@
 //! the cache takes the file over, to give its pages back, only once the
 //! last such mapping has gone.
 
-use crate::bytes::{Bytes, MmapBytes};
+use crate::bytes::MmapBytes;
 use crate::crypt::{self, Aead, EncryptOptions, NONCE, TAG};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -1931,14 +1931,30 @@ pub(crate) fn open_write(path: impl AsRef<Path>) -> Result<File> {
     }
 }
 
-/// A file opened to be read and appended to, made if it is not there.
+/// A file that exists, opened to be read and written where the caller
+/// says, cut nowhere: a run's file an open resumes (`SegmentWriter::resume_run`).
+pub(crate) fn open_rw(path: impl AsRef<Path>) -> Result<File> {
+    let path = path.as_ref();
+    let plain = |p: &Path| OpenOptions::new().read(true).write(true).open(p);
+    match locate(path) {
+        None => plain(path),
+        Some((v, name)) if passes(&name) => plain(&v.real.join(name)),
+        Some((v, name)) => v.rewrite(&name, false),
+    }
+}
+
+/// A file opened to be read and written at the offset its caller seeks
+/// to, made if it is not there and cut nowhere: a log file reopened for
+/// its next frames (`Wal::open_append`). Not opened to append, since an
+/// append-mode write goes to the file's end whatever the cursor says.
 pub(crate) fn open_append(path: impl AsRef<Path>) -> Result<File> {
     let path = path.as_ref();
     let plain = |p: &Path| {
         OpenOptions::new()
             .read(true)
+            .write(true)
             .create(true)
-            .append(true)
+            .truncate(false)
             .open(p)
     };
     match locate(path) {
@@ -1949,6 +1965,19 @@ pub(crate) fn open_append(path: impl AsRef<Path>) -> Result<File> {
             r => r,
         },
     }
+}
+
+/// A store's lock file (`db::StoreLock`), made if it is not there and cut
+/// nowhere: in the store's own directory whatever the store is kept
+/// under, a file of no bytes that only the kernel's lock on it means
+/// anything, and nothing the vault's door stands in front of.
+pub(crate) fn open_lock(path: impl AsRef<Path>) -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
 }
 
 /// A file opened to be written in place, made if it is not there and cut
@@ -1990,6 +2019,53 @@ pub(crate) fn sync_slot(
     }?;
     note_file("sync_slot", path, f);
     Ok(())
+}
+
+/// `std::fs::read`: the file's bytes. The tests' only.
+#[cfg(test)]
+pub(crate) fn read(path: impl AsRef<Path>) -> Result<Vec<u8>> {
+    use crate::bytes::Bytes;
+    let path = path.as_ref();
+    match locate(path) {
+        None => std::fs::read(path),
+        Some((v, name)) if passes(&name) => std::fs::read(v.real.join(name)),
+        Some((v, name)) => {
+            let page = v.page_of(&name)?;
+            let _held = v.pager.hold();
+            let src = MmapBytes::paged(page);
+            let mut buf = vec![0u8; src.len() as usize];
+            src.read_at(0, &mut buf)?;
+            v.pager.check()?;
+            Ok(buf)
+        }
+    }
+}
+
+/// `std::fs::copy`, for a copy out of a store in the clear (a checkpoint's
+/// files where a link is refused); a store under a cipher has no file to
+/// copy as it lies, so a path under one is refused.
+pub(crate) fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<u64> {
+    let (from, to) = (from.as_ref(), to.as_ref());
+    match (locate(from), locate(to)) {
+        (None, None) => std::fs::copy(from, to),
+        _ => Err(Error::new(
+            ErrorKind::Unsupported,
+            "a copy of a file of a store under a cipher",
+        )),
+    }
+}
+
+/// `std::fs::metadata` of a directory, answered as whether it is there:
+/// the error where it is not.
+pub(crate) fn dir_exists(dir: impl AsRef<Path>) -> Result<()> {
+    let dir = dir.as_ref();
+    match locate(dir) {
+        None => std::fs::metadata(dir).map(|_| ()),
+        Some(_) => Err(Error::new(
+            ErrorKind::Unsupported,
+            "a directory inside a store under a cipher",
+        )),
+    }
 }
 
 /// `std::fs::rename`.
@@ -2119,24 +2195,6 @@ pub(crate) fn names(dir: impl AsRef<Path>) -> Result<Vec<String>> {
                 out.push(entry?.file_name().to_string_lossy().into_owned());
             }
             Ok(out)
-        }
-    }
-}
-
-/// `std::fs::read`: the file's bytes.
-pub(crate) fn read(path: impl AsRef<Path>) -> Result<Vec<u8>> {
-    let path = path.as_ref();
-    match locate(path) {
-        None => std::fs::read(path),
-        Some((v, name)) if passes(&name) => std::fs::read(v.real.join(name)),
-        Some((v, name)) => {
-            let page = v.page_of(&name)?;
-            let _held = v.pager.hold();
-            let src = MmapBytes::paged(page);
-            let mut buf = vec![0u8; src.len() as usize];
-            src.read_at(0, &mut buf)?;
-            v.pager.check()?;
-            Ok(buf)
         }
     }
 }
@@ -2493,6 +2551,7 @@ pub(crate) fn hold(dir: impl AsRef<Path>) -> Option<pager::Hold> {
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod tests {
     use super::*;
+    use crate::bytes::Bytes;
 
     /// A cipher for the tests: a keystream and a tag that are functions of
     /// the key, the nonce, the associated data and the bytes, and nothing
@@ -3137,9 +3196,6 @@ pub(crate) mod tests {
     #[test]
     fn the_engine_names_no_file_but_through_the_door() {
         let engine = include_str!("../db.rs");
-        let tests = engine
-            .rfind("\n#[cfg(test)]\nmod streaming_writes")
-            .unwrap();
         let barred = [
             "File::open(",
             "File::create(",
@@ -3155,12 +3211,28 @@ pub(crate) mod tests {
             "MmapBytes::open(",
             ".exists()",
         ];
-        for (i, line) in engine[..tests].lines().enumerate() {
+        // The engine's own tests, each a module behind `#[cfg(test)]` that
+        // closes at the first column, are not the engine.
+        let (mut in_tests, mut after_cfg, mut seen) = (false, false, 0);
+        for (i, line) in engine.lines().enumerate() {
+            if in_tests {
+                in_tests = line != "}";
+                continue;
+            }
+            if after_cfg && line.starts_with("mod ") && line.ends_with('{') {
+                (in_tests, seen) = (true, seen + 1);
+                continue;
+            }
+            after_cfg = line == "#[cfg(test)]";
             let code = line.split("//").next().unwrap();
             for b in barred {
                 assert!(!code.contains(b), "db.rs:{}: {b} past the door", i + 1);
             }
         }
+        assert!(
+            seen > 1,
+            "the engine's test modules are found and passed over"
+        );
         let index = include_str!("../ordindex.rs");
         let open = index.find("pub fn open(path: &Path, keys: usize)").unwrap();
         assert!(index[open..open + 200].contains("crate::db::vault::map(path)"));

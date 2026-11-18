@@ -98,29 +98,21 @@ fn fixed_count(exts: &[Ext], stride: u64, width: u64) -> Option<u64> {
     Some(total)
 }
 
-/// Superblock magic and geometry.
+/// Superblock magic and geometry: `format`'s, the one definition, which
+/// compiles on every target.
 ///
-/// Duplicated from `store.rs` rather than shared, because `store.rs` does not
-/// compile for wasm -- it is the write path and it maps files -- so this
-/// reader cannot call into it.
-///
-/// A duplicated format constant is a liability and this one has already gone
-/// off. `store.rs` grew two superblock fields, the encoded size went from 120
+/// This module kept a copy once, from when the constants lived in the write
+/// path and the write path did not compile for wasm, and the copy went off:
+/// the writer grew two superblock fields, the encoded size went from 120
 /// bytes to 136 and the magic to version 2, and this decoder went on slicing
 /// 120 -- reading a prefix that no longer reached the checksum, and reporting
-/// a perfectly healthy file as "no valid supdb checkpoint". That is the same
-/// trap the commit which added those fields describes eight instances of
-/// inside `store.rs` itself; this was the ninth, in another module.
-///
-/// Two things catch it now. `tests/blob.rs` opens a store written by
-/// `store.rs` and fails on six paths at once, which is how it was found. And
-/// the constants below are asserted equal to `store.rs`'s at compile time on
-/// every native build, which says *why* in one line instead of six stack
-/// traces.
-const MAGIC: u64 = 0x5355_5044_4200_0007;
-const SUPER: u64 = 4096;
-const SLOT: u64 = 512;
-const SB_BYTES: usize = 144;
+/// a perfectly healthy file as "no valid supdb checkpoint". `tests/blob.rs`,
+/// which opens a store the writer wrote, failed on six paths at once, which
+/// is how it was found, and the copy was then asserted equal to the writer's
+/// at compile time on native builds. With the constants in `format`, the
+/// copy was the only reason `format`'s own were unread on wasm; the reader
+/// names them now, and the assertion left is the superblock's arithmetic.
+use crate::format::{MAGIC, SLOT, SUPER, SUPER_BYTES as SB_BYTES};
 const SB_FIELDS: usize = 16;
 
 /// The superblock page's extension: what a write-once segment adds after
@@ -253,20 +245,8 @@ pub fn decode_super_ext(page: &[u8], generation: u64) -> Option<SuperExt> {
     })
 }
 
-// The write path is not compiled for wasm, so this can only be checked where
-// it is -- which is every build that could have changed it.
-#[cfg(not(target_family = "wasm"))]
-const _: () = {
-    assert!(MAGIC == crate::format::MAGIC, "superblock magic drifted");
-    assert!(
-        SB_BYTES == crate::format::SUPER_BYTES,
-        "the superblock changed size and blob.rs still slices the old one"
-    );
-    assert!(SUPER == crate::format::SUPER);
-    assert!(SLOT == crate::format::SLOT);
-    // The fields, then the magic, then the checksum.
-    assert!(SB_BYTES == SB_FIELDS * 8 + 16, "field count disagrees");
-};
+// The fields, then the magic, then the checksum.
+const _: () = assert!(SB_BYTES == SB_FIELDS * 8 + 16, "field count disagrees");
 
 #[derive(Clone, Copy, Debug)]
 struct Super {
@@ -608,12 +588,71 @@ fn open_head<B: Bytes>(src: &B) -> Result<Super> {
 }
 
 /// How much to check on the way out.
+/// The span a walk asks next, ahead of itself: the asks' frontier
+/// `asked_to` over a region ending at `end`, the walk at offset `off`, a
+/// window of `window` bytes. `None` while the walk is more than half a
+/// window short of the frontier, or the frontier is at the region's end;
+/// else the window from the frontier, or from the walk where the walk has
+/// passed it, cut at the end. Shared by the open's verification walk
+/// (`BlobOptions::read_ahead`) and the merge's second pass
+/// (`Options::merge_read_ahead`).
+pub fn ahead_span(asked_to: u64, end: u64, off: u64, window: u64) -> Option<(u64, u64)> {
+    if asked_to >= end || off.saturating_add(window / 2) < asked_to {
+        return None;
+    }
+    let from = asked_to.max(off);
+    let to = from.saturating_add(window).min(end);
+    (from < to).then_some((from, to))
+}
+
+#[cfg(test)]
+mod ahead_tests {
+    use super::ahead_span;
+
+    const M: u64 = 1 << 20;
+
+    /// The first window from the region's start, the next once the walk is
+    /// within half a window of the frontier, the last cut at the region's
+    /// end and nothing after it, and a walk past the frontier asked from
+    /// where it stands.
+    #[test]
+    fn the_window_follows_the_walk_half_a_window_ahead() {
+        assert_eq!(ahead_span(0, 10 * M, 0, 4 * M), Some((0, 4 * M)));
+        assert_eq!(ahead_span(4 * M, 10 * M, M, 4 * M), None);
+        assert_eq!(ahead_span(4 * M, 10 * M, 2 * M - 1, 4 * M), None);
+        assert_eq!(
+            ahead_span(4 * M, 10 * M, 2 * M, 4 * M),
+            Some((4 * M, 8 * M))
+        );
+        assert_eq!(
+            ahead_span(8 * M, 10 * M, 7 * M, 4 * M),
+            Some((8 * M, 10 * M))
+        );
+        assert_eq!(ahead_span(10 * M, 10 * M, 9 * M, 4 * M), None);
+        assert_eq!(
+            ahead_span(4 * M, 10 * M, 9 * M, 4 * M),
+            Some((9 * M, 10 * M))
+        );
+        // A region of nothing asks nothing.
+        assert_eq!(ahead_span(0, 0, 0, 4 * M), None);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct BlobOptions {
     /// Verify block checksums. On by default, matching `ReadOptions`: a
     /// browser reading an object off a CDN has more reason to check than a
     /// process reading its own disk, not less.
     pub verify_checksums: bool,
+    /// The open's verification of the key section's checksum row asks the
+    /// kernel for the section this many bytes ahead of its walk, a window
+    /// at a time (`ahead_span`, `Bytes::advise_willneed`), each window
+    /// only where its first page is not resident: over a mapping that walk
+    /// is the one sequential read of the section, and a merge's inputs
+    /// out of core read it one kernel readahead window a wait behind the
+    /// readers' faults (`Options::merge_read_ahead`). Zero asks nothing;
+    /// the asks made are `Blob::open_ahead`.
+    pub read_ahead: usize,
     /// Verify the key index's checksum row when the section carries one:
     /// every piece at a resident open, each piece as it is first used in a
     /// sparse reader. On by default for the same reason.
@@ -629,6 +668,7 @@ impl Default for BlobOptions {
     fn default() -> Self {
         BlobOptions {
             verify_checksums: true,
+            read_ahead: 0,
             verify_index: true,
             resident_directory: false,
         }
@@ -676,6 +716,9 @@ pub struct Blob<B: Bytes> {
     /// read is O(block) work to return O(value) bytes. Atomic words, since
     /// a reader is shared between threads.
     verified: Box<[AtomicU64]>,
+    /// The windows the open's verification asked the kernel for ahead of
+    /// its walk and their bytes (`BlobOptions::read_ahead`).
+    open_ahead: (u64, u64),
     /// Which reader this is, for the thread's scratch: the decoded span it
     /// remembers is this reader's or nobody's.
     id: u64,
@@ -973,14 +1016,43 @@ impl<B: Bytes> Blob<B> {
             )
         })?;
         // The whole section is resident, so the whole row is checked here,
-        // once, and no read path pays anything after. A section held by
-        // the piece is not asked for whole, here or anywhere: the row is
-        // not checked, and what such a source lends has passed the
-        // source's own check, which is what makes it one to hold so.
+        // once, and no read path pays anything after.
+        let mut open_ahead = (0u64, 0u64);
+        // A section held by the piece is not asked for whole, here or
+        // anywhere: the row is not checked, and what such a source lends
+        // has passed the source's own check, which is what makes it one
+        // to hold so.
         if idx.crc_off != 0 && opts.verify_index && key.pieces(&src).is_none() {
-            if let Err(p) =
-                flatindex::verify_pieces(key.get(&src)?, idx.crc_off, idx.piece_shift, sb.key_off)
-            {
+            let sec = key.get(&src)?;
+            // The walk asked ahead of itself where the option says so: the
+            // frontier of asked bytes over the section, moved a window at a
+            // time as the pieces come within half a window of it, each
+            // window only where its first page is not resident.
+            let window = opts.read_ahead as u64;
+            let (mut asked_to, end) = (sb.key_off, sb.key_off.saturating_add(sec.len() as u64));
+            let verdict = flatindex::verify_pieces_with(
+                sec,
+                idx.crc_off,
+                idx.piece_shift,
+                sb.key_off,
+                |a, _| {
+                    if window == 0 {
+                        return;
+                    }
+                    let off = sb.key_off.saturating_add(a as u64);
+                    if let Some((from, to)) = ahead_span(asked_to, end, off, window) {
+                        asked_to = to;
+                        if src.resident_at(from) != Some(true) {
+                            let n = src.advise_willneed(from, (to - from) as usize);
+                            if n > 0 {
+                                open_ahead.0 += 1;
+                                open_ahead.1 += n as u64;
+                            }
+                        }
+                    }
+                },
+            );
+            if let Err(p) = verdict {
                 return Err(corrupt(&format!(
                     "key index checksum mismatch in piece {p}"
                 )));
@@ -994,6 +1066,7 @@ impl<B: Bytes> Blob<B> {
         let verified = vec![0u64; (blocks.len() * block::MAX_CHUNK_CRCS).div_ceil(64)];
         Ok(Blob {
             src,
+            open_ahead,
             // The generation of the index *section*, not of the superblock.
             // They are not always the same number -- a publish can move the
             // superblock on without writing a new index -- and `Reader`
@@ -1071,7 +1144,10 @@ impl<B: Bytes> Blob<B> {
 
     /// A number no other open blob in this process has: what a cache
     /// derived from one blob is keyed by, so it cannot be read against
-    /// another over the same range.
+    /// another over the same range. The caches are the engine's, which
+    /// the wasm build has none of, so the accessor is compiled where a
+    /// caller can be; the field stays, the decode scratch is keyed by it.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
@@ -1295,6 +1371,36 @@ impl<B: Bytes> Blob<B> {
         self.src.advise_willneed(off, b - a)
     }
 
+    /// The bytes at file offset `off` for `len`, asked of the kernel ahead
+    /// of a walk that will read them (`Bytes::advise_willneed`), unless the
+    /// span's first page is resident already (`Bytes::resident_at`), where
+    /// an ask would cost the kernel's walk of resident pages for nothing:
+    /// the bytes submitted.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn willneed_at(&self, off: u64, len: usize) -> usize {
+        if len == 0 || self.src.resident_at(off) == Some(true) {
+            return 0;
+        }
+        self.src.advise_willneed(off, len)
+    }
+
+    /// `willneed_at` whether or not the span's first page is resident: for
+    /// a span a release under the hot-raw policy brings back whole, whose
+    /// first page a read may have touched already.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn willneed_span(&self, off: u64, len: usize) -> usize {
+        if len == 0 {
+            return 0;
+        }
+        self.src.advise_willneed(off, len)
+    }
+
+    /// The windows the open's verification asked the kernel for ahead of
+    /// its walk, and their bytes (`BlobOptions::read_ahead`).
+    pub fn open_ahead(&self) -> (u64, u64) {
+        self.open_ahead
+    }
+
     pub fn record_offset(&self, rank: usize) -> Option<u64> {
         let (sec, idx) = self.flat()?;
         let (recs, dir) = idx.regions(sec)?;
@@ -1429,6 +1535,22 @@ impl<B: Bytes> Blob<B> {
         Some((recs.offset(), recs.size()))
     }
 
+    /// The span of the file a raw point read touches a page of each
+    /// population in -- the hash slots and the records, and whatever lies
+    /// between them in the index section -- as offset and length: what the
+    /// hot-raw policy asks the kernel for ahead of the reads it sends to the
+    /// raw form (`db::Seg`). `None` for a reader that does not hold the
+    /// section whole.
+    #[cfg(not(target_family = "wasm"))]
+    #[doc(hidden)]
+    pub fn raw_read_span(&self) -> Option<(u64, u64)> {
+        let (_, idx) = self.flat()?;
+        let (h, r) = idx.population_spans();
+        let (lo, hi) = (h.0.min(r.0), h.1.max(r.1));
+        let base = self.index_offset();
+        Some((base + lo as u64, (hi - lo) as u64))
+    }
+
     /// The hash region's bytes, the slots a point read probes one page of;
     /// 0 for a reader that does not hold the section whole.
     #[cfg(not(target_family = "wasm"))]
@@ -1438,6 +1560,17 @@ impl<B: Bytes> Blob<B> {
             Index::Flat { idx, .. } => idx.hash_bytes(),
             Index::Sparse(_) => 0,
         }
+    }
+
+    /// The record region's bytes as the section's header gives them, the
+    /// `recs_len` of [`Blob::z_source_facts`] without the checksum row's
+    /// hash: what the raw-tail form's size is read off where the coding is
+    /// picked again (`Options::zpages_coding_auto`).
+    #[cfg(not(target_family = "wasm"))]
+    #[doc(hidden)]
+    pub fn z_records_len(&self) -> Option<u64> {
+        let (sec, _) = self.flat()?;
+        flatindex::Header::parse(sec).map(|h| h.recs_len as u64)
     }
 
     /// What a form file binds itself to (`ZSource`), or `None` where there is
@@ -1881,6 +2014,37 @@ impl<B: Bytes> Blob<B> {
             .unwrap_or(Ok(0))
     }
 
+    /// `read_all` for a key whose index hash (`flatindex::key_hash`) the
+    /// caller has taken: a point read over a partition and its pieces
+    /// hashes the key once for all of them.
+    pub fn read_all_hashed<F: FnMut(&[u8])>(&self, key: &[u8], h: u64, f: F) -> Result<u64> {
+        let Some((sec, idx)) = self.flat() else {
+            return self.read_all(key, f);
+        };
+        idx.with_lookup_hashed(sec, key, h, |exts, tail| self.read_exts(exts, tail, f))
+            .unwrap_or(Ok(0))
+    }
+
+    /// `lookup` for a key whose index hash the caller has taken.
+    pub fn lookup_hashed(&self, key: &[u8], h: u64) -> Option<Exts<'_>> {
+        let Some((sec, idx)) = self.flat() else {
+            return self.lookup(key);
+        };
+        idx.lookup_full_hashed(sec, key, h).map(|(e, _)| e)
+    }
+
+    /// A hint to fetch the line of the first hash slot a lookup of index
+    /// hash `h` reads; nothing is read.
+    #[cfg(not(target_family = "wasm"))]
+    #[inline]
+    pub fn prefetch_slot(&self, h: u64) {
+        if let Some((sec, idx)) = self.flat() {
+            if let Some(at) = idx.slot_pos(sec.len(), h) {
+                crate::db::prefetch_lines(sec[at..].as_ptr(), 8);
+            }
+        }
+    }
+
     /// EXPERIMENT: `read_all` through `lookup_full`, the extents returned
     /// by value: the shape before `with_lookup`, kept to price it
     /// (`Options::exts_by_value`).
@@ -2090,6 +2254,15 @@ impl<B: Bytes> Blob<B> {
     /// extent record with format v5, for four bytes an extent.
     pub fn count(&self, key: &[u8]) -> Result<u64> {
         let Some(exts) = self.lookup(key) else {
+            return Ok(0);
+        };
+        Ok(exts.iter().map(|e| u64::from(e.records())).sum())
+    }
+
+    /// `count` for a key whose index hash (`flatindex::key_hash`) the
+    /// caller has taken.
+    pub fn count_hashed(&self, key: &[u8], h: u64) -> Result<u64> {
+        let Some(exts) = self.lookup_hashed(key, h) else {
             return Ok(0);
         };
         Ok(exts.iter().map(|e| u64::from(e.records())).sum())
@@ -2451,17 +2624,69 @@ impl<B: Bytes> Blob<B> {
         limit: usize,
         f: F,
     ) -> Result<usize> {
-        let mut f = f;
-        let mut rank = from_rank;
-        let mut seen = 0usize;
-        let mut cached: Option<(u32, &[u8])> = None;
+        self.scan_at_with::<false, F>(from_rank, limit, 0, f)
+    }
+
+    /// `scan_at`, asking for the records `lead` bytes ahead of the one
+    /// being read as the walk goes: the first `lead` bytes at the start,
+    /// then each line as the walk comes within `lead` of it, so the fetch
+    /// runs beside the walk rather than before it. A hint, nothing waited
+    /// for; the common record shape only, as the walk's fast loop is.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn scan_at_paced<F: FnMut(&[u8], &[u8])>(
+        &self,
+        from_rank: usize,
+        limit: usize,
+        lead: usize,
+        f: F,
+    ) -> Result<usize> {
+        self.scan_at_with::<true, F>(from_rank, limit, lead, f)
+    }
+
+    /// A walker over this segment's records for several runs in turn, the
+    /// record regions resolved once (`RunWalk::scan_at`): what a sparse
+    /// block's walk takes between its deltas, a run at a time.
+    pub fn run_walk(&self) -> RunWalk<'_, B> {
+        RunWalk {
+            blob: self,
+            walk: self.walk_regions(),
+        }
+    }
+
+    /// The flat index and its record region and directory, as a walk over
+    /// the records reads them.
+    fn walk_regions(&self) -> Option<(&FlatIndex, &[u8], &[u8])> {
+        self.flat()
+            .and_then(|(sec, idx)| idx.regions(sec).map(|(recs, dir)| (idx, recs, dir)))
+    }
+
+    fn scan_at_with<const PACE: bool, F: FnMut(&[u8], &[u8])>(
+        &self,
+        from_rank: usize,
+        limit: usize,
+        lead: usize,
+        f: F,
+    ) -> Result<usize> {
         // The regions once, not once a key: `exts_at_full` re-resolves the
         // section and re-slices the directory and the records every call, and
         // that plumbing rather than the record read is most of what resolving
         // a rank costs.
-        let walk = self
-            .flat()
-            .and_then(|(sec, idx)| idx.regions(sec).map(|(recs, dir)| (idx, recs, dir)));
+        self.scan_at_in::<PACE, F>(self.walk_regions(), from_rank, limit, lead, f)
+    }
+
+    /// `scan_at_with` over regions the caller resolved (`walk_regions`).
+    fn scan_at_in<const PACE: bool, F: FnMut(&[u8], &[u8])>(
+        &self,
+        walk: Option<(&FlatIndex, &[u8], &[u8])>,
+        from_rank: usize,
+        limit: usize,
+        lead: usize,
+        f: F,
+    ) -> Result<usize> {
+        let mut f = f;
+        let mut rank = from_rank;
+        let mut seen = 0usize;
+        let mut cached: Option<(u32, &[u8])> = None;
         // The common shape first -- one extent, inline, fixed width -- in a
         // loop of its own, with nothing per entry but the parse, a bounds
         // check and the call. The first record of any other shape breaks
@@ -2510,6 +2735,13 @@ impl<B: Bytes> Blob<B> {
                 .unwrap_or(&[])
                 .as_chunks::<4>()
                 .0;
+            // The next byte of the records not yet asked for, under `PACE`;
+            // the engine's prefetch is not built for wasm, and neither is a
+            // caller that paces.
+            #[cfg(not(target_family = "wasm"))]
+            let mut asked = 0usize;
+            #[cfg(target_family = "wasm")]
+            let _ = lead;
             walk_fixed!(
                 recs,
                 true,
@@ -2519,7 +2751,20 @@ impl<B: Bytes> Blob<B> {
                 rank,
                 w,
                 off,
-                let off = u32::from_le_bytes(*w) as usize
+                let off = {
+                    let off = u32::from_le_bytes(*w) as usize;
+                    #[cfg(not(target_family = "wasm"))]
+                    if PACE {
+                        let want = off.saturating_add(lead).min(recs.len());
+                        let from = asked.max(off);
+                        if from < want {
+                            // SAFETY: `[from, want)` lies inside `recs`.
+                            crate::db::prefetch_lines(unsafe { recs.as_ptr().add(from) }, want - from);
+                            asked = want;
+                        }
+                    }
+                    off
+                }
             );
         } else if self.src.piecewise() {
             return Err(by_the_piece());
@@ -2536,6 +2781,27 @@ impl<B: Bytes> Blob<B> {
             rank += 1;
         }
         Ok(seen)
+    }
+}
+
+/// A segment's record regions resolved once, for a walk that reads several
+/// runs of its records in turn (`Blob::run_walk`): each `scan_at` is the
+/// blob's own over the same regions, without resolving them again.
+pub struct RunWalk<'a, B: Bytes> {
+    blob: &'a Blob<B>,
+    walk: Option<(&'a FlatIndex, &'a [u8], &'a [u8])>,
+}
+
+impl<B: Bytes> RunWalk<'_, B> {
+    /// `Blob::scan_at` over the regions this walker holds.
+    pub fn scan_at<F: FnMut(&[u8], &[u8])>(
+        &self,
+        from_rank: usize,
+        limit: usize,
+        f: F,
+    ) -> Result<usize> {
+        self.blob
+            .scan_at_in::<false, F>(self.walk, from_rank, limit, 0, f)
     }
 }
 
@@ -2921,6 +3187,7 @@ impl<B: Bytes> SparseBlob<B> {
                 timestamp: sb.timestamp,
                 opts,
                 verified: verified.into_iter().map(AtomicU64::new).collect(),
+                open_ahead: (0, 0),
                 id: NEXT_BLOB_ID.fetch_add(1, AtomicOrdering::Relaxed),
                 decodes: AtomicU64::new(0),
             },

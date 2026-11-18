@@ -37,6 +37,19 @@ fn main() {
     }
     println!("cargo:rustc-env=SUPDB_SHA={}", sha());
     println!("cargo:rustc-env=SUPDB_RUSTC={}", rustc());
+    #[cfg(feature = "codecs")]
+    lzav();
+}
+
+/// LZAV for the codec probe (`examples/zcodec.rs`), from upstream's header
+/// in `vendor/lzav`, at the optimization the release profile asks for.
+#[cfg(feature = "codecs")]
+fn lzav() {
+    println!("cargo:rerun-if-changed=vendor/lzav");
+    cc::Build::new()
+        .file("vendor/lzav/lzav.c")
+        .include("vendor/lzav")
+        .compile("supdb_lzav");
 }
 
 /// The files whose change means HEAD may name a different commit: HEAD, the

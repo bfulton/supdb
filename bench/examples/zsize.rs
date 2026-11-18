@@ -5,7 +5,7 @@
 //! ```text
 //! cargo run --release --example zsize -- [--keys N] [--shapes seq,rdec,rbytes,uuid]
 //!                                        [--comp 0.5,0,1] [--rounds R] [--dir PATH] [--no-time]
-//!                                        [--coding block|record]
+//!                                        [--coding block|record] [--parse CHAINS]
 //! cargo run --release --example zsize --features lz4-safe -- ...      # the cross-check codec
 //! ```
 //!
@@ -58,6 +58,20 @@ static CODING: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(ZC
 
 fn coding() -> u8 {
     CODING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The block coding's encoder (`--parse CHAINS`): none `lz4_flex`'s greedy
+/// one, the build's default; else the engine's parsing encoder, zero its
+/// shipped lazy parse and a count its greedy parse over that many chain
+/// positions (`Options::zpages_parse`, `Options::zpages_parse_chains`).
+static PARSE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+fn parse_into(s: &mut FillScratch) {
+    let p = PARSE.load(std::sync::atomic::Ordering::Relaxed);
+    if p >= 0 {
+        s.parse = true;
+        s.parse_chains = p as u32;
+    }
 }
 use supdb::flatindex::{self, record_key, record_key_next, FlatIndex};
 use supdb::{Blob, Bytes, Db, MmapBytes, Options};
@@ -281,6 +295,7 @@ fn analyze(segs: &[PathBuf], want: usize, shape: Shape, comp: f64, sweep: bool) 
     };
     let mut scratch = FillScratch::new();
     scratch.coding = coding();
+    parse_into(&mut scratch);
     let mut vbuf = GroupBuf::new();
     for (pi, path) in segs.iter().enumerate() {
         let src = MmapBytes::open(path).expect("map");
@@ -364,6 +379,7 @@ fn analyze(segs: &[PathBuf], want: usize, shape: Shape, comp: f64, sweep: bool) 
             for rounds in 0..=3u32 {
                 let mut s = FillScratch::new();
                 s.coding = coding();
+                parse_into(&mut s);
                 s.group_bytes = 0;
                 s.grow_rounds = rounds;
                 s.hint = 60;
@@ -616,6 +632,10 @@ fn main() {
                     .collect()
             }
             "--no-time" => timing = false,
+            "--parse" => PARSE.store(
+                val("a chain count").parse().expect("a count"),
+                std::sync::atomic::Ordering::Relaxed,
+            ),
             "--coding" => {
                 let c = match val("block|record").as_str() {
                     "block" => ZCODING_BLOCK,

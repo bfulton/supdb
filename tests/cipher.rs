@@ -169,9 +169,14 @@ fn a_store_under_a_cipher_reads_as_itself_and_is_ciphertext_in_its_directory() {
     let fence: String = KEY_MARK.bytes().map(|b| format!("{b:02x}")).collect();
     for name in names(&dir) {
         let known = name == "supdb.cipher"
+            // The store lock: empty, and named alike in every store.
+            || name == "LOCK"
             || name == "manifest"
             || name == "manifest.alt"
             || (name.starts_with("wal-") && name[4..].bytes().all(|b| b.is_ascii_digit()))
+            // A retired log kept to be the next one (`Options::recycle_wal`):
+            // a sealed log under a number, as a live one is.
+            || (name.starts_with("spare-") && name[6..].bytes().all(|b| b.is_ascii_digit()))
             || (name.starts_with("x-")
                 && name[2..].trim_end_matches(".o").len() == 32
                 && name[2..]
@@ -784,6 +789,12 @@ fn builders_build_through_a_small_cache(
         seal_max_pct: if sealing { small().seal_max_pct } else { 0 },
         seal_idle: sealing && small().seal_idle,
         upkeep,
+        // No builder ahead: a burst's commit starts one, and the writer's
+        // fill and the store's thread then leave its blocks to it, where
+        // these are the rests of the writer and of the store's thread
+        // under test. The builder ahead's own look under a cipher stops
+        // once the cache is crowded (`Reader::ahead_look`).
+        scan_cache_ahead_min_blocks: usize::MAX,
         ..small()
     };
     {
@@ -1117,13 +1128,10 @@ fn a_recycled_log_under_a_cipher_holds_what_was_committed_and_no_more() {
         }
     };
     let mut db = Db::create(&dir, opts()).unwrap();
-    let spare = inodes("spare-");
-    assert_eq!(
-        spare.len(),
-        1,
-        "one spare, in the directory: {:?}",
-        names(&dir)
-    );
+    // Every file that has been a spare: the first is the first file a
+    // durable segment retired, since a log pre-written ahead of its tail
+    // (`Options::wal_ahead_bytes`) is made with none.
+    let mut spare = inodes("spare-");
     let mut recycled = false;
     for round in 0u32..16 {
         // Out of order, so that every write goes through the log, and
@@ -1137,6 +1145,7 @@ fn a_recycled_log_under_a_cipher_holds_what_was_committed_and_no_more() {
         db.commit().unwrap();
         // The file that was the spare is a log now: recycled, not made.
         recycled |= inodes("wal-").iter().any(|i| spare.contains(i));
+        spare.extend(inodes("spare-"));
         if round % 4 == 3 {
             drop(db);
             db = Db::open(&dir, opts()).unwrap();
@@ -1340,8 +1349,11 @@ fn an_ordered_run_under_a_cipher_keeps_its_commits_through_the_log() {
     }
     for name in names(&dir) {
         let known = name == "supdb.cipher"
+            // The store lock: empty, and named alike in every store.
+            || name == "LOCK"
             || name.starts_with("manifest")
             || name.starts_with("wal-")
+            || name.starts_with("spare-")
             || name.starts_with("x-");
         assert!(known, "a file named {name}");
     }
@@ -1587,8 +1599,11 @@ fn the_compact_form_under_a_cipher_is_built_read_and_found_again() {
     }
     for name in &all {
         let known = name == "supdb.cipher"
+            // The store lock: empty, and named alike in every store.
+            || name == "LOCK"
             || name.starts_with("manifest")
             || name.starts_with("wal-")
+            || name.starts_with("spare-")
             || name.starts_with("x-");
         assert!(known, "a file named {name}");
     }

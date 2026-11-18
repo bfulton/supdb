@@ -246,13 +246,17 @@ type Model = BTreeMap<Vec<u8>, Vec<Vec<u8>>>;
 /// (`BuildCtx::cut_known`, "an overlay key's cut is behind the walk"),
 /// with the second form off as well and at the commit this work began from.
 /// A test that wants the cache says so.
+///
+/// Under the stride switch (`common::stride_switch`) every build asks for
+/// the stride form as well, before `extra`, so a test about the block form
+/// says so by setting `zpages_stride` itself.
 fn forced(extra: impl FnOnce(&mut Options)) -> Options {
-    let mut o = Options {
+    let mut o = common::with_stride(Options {
         zpages: ZPages::Always,
         zpages_min_bytes: 0,
         scan_block_cache: false,
         ..Options::default()
-    };
+    });
     extra(&mut o);
     o
 }
@@ -366,7 +370,7 @@ const ORACLE_KEYS: usize = 240;
 /// upkeep trips its assertion (see `forced`), and the stores it is compared
 /// with are opened the same way.
 fn oracle_opts(z: bool, inline: bool, raw_tails: bool) -> Options {
-    Options {
+    let o = Options {
         zpages: if z { ZPages::Always } else { ZPages::Off },
         zpages_record_coding: raw_tails,
         zpages_raw_tails: raw_tails,
@@ -381,6 +385,13 @@ fn oracle_opts(z: bool, inline: bool, raw_tails: bool) -> Options {
         },
         l0_trigger: 2,
         ..Options::default()
+    };
+    // The `z` store asks for the stride form under the stride switch, as
+    // `forced` does; the store it is compared with is the raw form's.
+    if z {
+        common::with_stride(o)
+    } else {
+        o
     }
 }
 
@@ -586,6 +597,16 @@ fn oracle(inline: bool, raw_tails: bool) {
     // failure of the form.
     assert_eq!(life.failures, 0, "{life:?}");
     assert!(life.reads > 0 && life.counts > 0, "{life:?}");
+    // No form file of the block body is counted a stride file, the
+    // raw-tailed coding's among them: `ZCounts::stride_files` counts the
+    // one kind, and under the raw tails every file here is the other
+    // coding of the block body, a kind beside the block coding's. Under
+    // the stride switch the `z` store asks for the stride form, and a
+    // partition it holds is a stride file by right.
+    assert!(
+        c.form_files > 0 && (common::stride_switch() || c.stride_files == 0),
+        "the block body's files are no stride files: {c:?}"
+    );
     if inline {
         assert_eq!(
             c.form_files, c.partitions,
@@ -747,6 +768,72 @@ fn absent_keys_are_absent_through_the_form_file() {
     // pages of one is not a fence.
     assert!(form_files(&dir).len() as u64 == c.form_files);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_filter_asked_ahead_turns_away_what_the_filter_asked_first_does() {
+    // Asked ahead of the fence (`Options::zpages_filter_ahead`), the
+    // filter turns away the same absent keys as the filter asked first,
+    // so every answer and every decode is the same; without a filter
+    // (`Options::zpages_point_filter` off) every answer is the same and
+    // the absent keys in range are found absent at their page, which
+    // decodes. The decode counts hold the order change to asking the
+    // filter at all: a path that skipped it would decode as the third does.
+    let n = 6000;
+    let mut decodes = Vec::new();
+    for (name, filter, ahead) in [
+        ("first", true, false),
+        ("ahead", true, true),
+        ("none", false, false),
+    ] {
+        let dir = scratch(&format!("filter-{name}"));
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.partition_bytes = Some(160 << 10);
+                o.zpages_point_filter = filter;
+                o.zpages_filter_ahead = ahead;
+            }),
+        )
+        .unwrap();
+        let model = ordered_load(&mut db, n, 0xF17E);
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert!(c.partitions >= 3 && c.form_files == c.partitions, "{c:?}");
+        // The absent keys first, one a group (fifty records apart, a
+        // group holds about fourteen), so none is answered from a group a
+        // read before it put in the memo; then the present keys.
+        let mut absent: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"a".to_vec(),
+            b"zzz".to_vec(),
+            format!("key-{:08}", n * 3 + 1).into_bytes(),
+        ];
+        absent.extend(
+            (0..n)
+                .step_by(50)
+                .map(|i| format!("key-{:08}", i * 3 + 1).into_bytes()),
+        );
+        assert!(absent.iter().all(|k| !model.contains_key(k)));
+        let present: Vec<Vec<u8>> = (25..n).step_by(50).map(spaced_key).collect();
+        let before = db.zpage_counts();
+        check(&db, &model, &absent, name);
+        let after = db.zpage_counts();
+        decodes.push(after.decodes - before.decodes);
+        check(&db, &model, &present, name);
+        let after = db.zpage_counts();
+        assert_eq!(after.rawserves + after.fallbacks, 0, "{name}: {after:?}");
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert_eq!(
+        decodes[0], decodes[1],
+        "{decodes:?}: the same keys turned away"
+    );
+    assert!(
+        decodes[2] > decodes[0],
+        "{decodes:?}: the filter turns keys away"
+    );
 }
 
 #[test]
@@ -952,7 +1039,7 @@ fn a_flipped_byte_in_a_form_file_is_never_an_answer() {
     let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
     let pages = t.n_pages as usize;
     assert!(pages > 40, "{pages} pages");
-    let sampled: Vec<usize> = (0..16).map(|k| k * (pages - 1) / 15).collect();
+    let sampled = supdb::db::zpage_samples(pages);
     let work = scratch("flips-work");
     copy_dir(&dir, &work);
     let target = form_files(&work).remove(0);
@@ -2481,6 +2568,87 @@ fn a_scan_from_a_key_a_scan_started_at_takes_its_block_from_the_start_cache() {
     round(&stores, "sealed into a piece");
 }
 
+/// A merge drops behind its second pass the raw records of an input
+/// partition its form file serves (`Options::merge_drops_covered`), and only
+/// there: the gate at the form and a form file in the partition's cell. A
+/// served partition's raw records are read by nothing but the merge, which
+/// reads them back and would leave them the cache's newest pages; under the
+/// raw gate with the cells kept, with every partition declined its form, or
+/// with the option off, the merge drops nothing. The reads after it are the
+/// model's in every case.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_merge_drops_the_raw_records_of_an_input_its_form_serves() {
+    for (label, zpages, gate_raw, declined, drops, want) in [
+        ("served", ZPages::Always, false, false, true, true),
+        ("kept", ZPages::Always, false, false, false, false),
+        ("gate-raw", ZPages::Always, true, false, true, false),
+        ("declined", ZPages::Always, false, true, true, false),
+        ("raw", ZPages::Off, false, false, true, false),
+    ] {
+        let dir = scratch(&format!("merge-drops-{label}"));
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.zpages = zpages;
+                o.partition_bytes = Some(160 << 10);
+                o.inline_bytes = 1 << 16;
+                o.l0_trigger = 2;
+                o.merge_drops_covered = drops;
+                // A drop every sixteen kilobytes, so a partition of a
+                // hundred and sixty reaches several.
+                o.merge_drop_chunk = 16 << 10;
+                if declined {
+                    o.zpages_min_bytes = 1 << 40;
+                }
+            }),
+        )
+        .unwrap();
+        let mut model = ordered_load(&mut db, 6000, 0xD80F);
+        db.zpages_settle().unwrap();
+        db.settle().unwrap();
+        let c = db.zpage_counts();
+        if zpages == ZPages::Always && !declined {
+            assert!(
+                c.partitions >= 3 && c.form_files == c.partitions,
+                "{label}: {c:?}"
+            );
+        } else {
+            assert_eq!(c.form_files, 0, "{label}: {c:?}");
+        }
+        if gate_raw {
+            db.zgate_set(0);
+        }
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let mut rng = Rng(0xD80F1);
+        // Two pieces over every partition's range, so that each is merged.
+        for round in 0..2 {
+            for k in keys.iter().step_by(5 + round) {
+                let v = suite_value(&mut rng);
+                db.append(k, &v);
+                model.entry(k.clone()).or_default().push(v);
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+        }
+        db.settle().unwrap();
+        assert_eq!(db.levels().1, 0, "{label}: the pieces merged");
+        let dropped = db.merge_dropped_bytes();
+        assert_eq!(
+            dropped > 0,
+            want,
+            "{label}: the merges dropped {dropped} bytes"
+        );
+        if gate_raw {
+            db.zgate_set(2);
+        }
+        check(&db, &model, &keys, label);
+        check_scan(&db, &model, label);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The body of the three tests above: the store, its phases and the reads
 /// under each, counted on the writer and a handle. With `via_form` the
 /// count is held to zero; without it the touches are summed and returned.
@@ -2734,6 +2902,11 @@ fn the_memo_serves_repeated_reads_of_a_partition_and_off_every_read_decodes() {
             forced(|o| {
                 o.zpages_memo = memo;
                 o.zpages_record_coding = record;
+                // The memo as it serves every open: a point read's partial
+                // decode of a first touch and its key table have a test of
+                // their own below.
+                o.zpages_point_part = false;
+                o.zpages_point_keys = false;
             }),
         )
         .unwrap();
@@ -2797,6 +2970,106 @@ fn the_memo_serves_repeated_reads_of_a_partition_and_off_every_read_decodes() {
     }
 }
 
+/// A point read through a form file (`Options::zpages_point_part`,
+/// `Options::zpages_point_keys`), each option on and off: every key and
+/// every key between two answers as the model has it, through the writer
+/// and a handle, twice over. With the partial decode, a read that decodes
+/// is a group decoded as far as its key or a whole decode the memo takes
+/// at an admission, and the bytes decoded in part are short of their
+/// groups; without it no group is decoded in part and every decode is the
+/// memo's. With the key table, the second pass's reads go straight to
+/// their records, all but each group's first key and the few whose slot
+/// another key took; without it none does.
+#[test]
+fn a_point_read_decodes_a_first_touch_in_part_and_goes_straight_to_a_key_read_before() {
+    for (part, keyed) in [(true, true), (true, false), (false, true), (false, false)] {
+        let what = format!("part {part}, keys {keyed}");
+        let dir = scratch(&format!("point-{part}-{keyed}"));
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.zpages_point_part = part;
+                o.zpages_point_keys = keyed;
+            }),
+        )
+        .unwrap();
+        let model = ordered_load(&mut db, 4000, 0x9A7);
+        db.zpages_settle().unwrap();
+        let c0 = db.zpage_counts();
+        assert_eq!(
+            (c0.partitions, c0.form_files, c0.build_stored),
+            (1, 1, 0),
+            "{what}: {c0:?}"
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let between: Vec<Vec<u8>> = (0..4000)
+            .step_by(7)
+            .map(|i| format!("key-{:08}", i * 3 + 1).into_bytes())
+            .collect();
+        let n = keys.len() as u64;
+        let r = db.reader().unwrap();
+        let w: &Reader = &db;
+        // The first pass: each page's first read is its whole first
+        // decode, and from there each group's first touch a partial one.
+        for who in [w, &r] {
+            check(who, &model, &keys, &what);
+            check(who, &model, &between, &what);
+        }
+        let c1 = db.zpage_counts();
+        let decodes = c1.decodes - c0.decodes;
+        let (parts, misses) = (c1.point_parts, c1.memo_misses);
+        assert!(decodes > 0, "{what}: {c1:?}");
+        if part {
+            assert!(parts > 0 && c1.point_admits > 0, "{what}: {c1:?}");
+            assert!(
+                c1.point_part_bytes < c1.point_part_of,
+                "{what}: the partial decodes stop short of their groups: {c1:?}"
+            );
+            assert_eq!(
+                decodes,
+                parts + misses,
+                "{what}: a read that decodes is a partial decode or one the memo takes: {c1:?}"
+            );
+        } else {
+            assert_eq!(
+                (parts, c1.point_part_bytes, c1.point_admits),
+                (0, 0, 0),
+                "{what}: {c1:?}"
+            );
+            assert_eq!(
+                decodes, misses,
+                "{what}: every decode is the memo's: {c1:?}"
+            );
+        }
+        // The second pass: the groups are the memo's, and with the key
+        // table a key read through the memo before goes to its record.
+        for who in [w, &r] {
+            check(who, &model, &keys, &what);
+            check(who, &model, &between, &what);
+        }
+        let c2 = db.zpage_counts();
+        let hits = c2.point_key_hits - c1.point_key_hits;
+        if keyed {
+            // A read and a count of every key through two handles.
+            assert!(
+                hits >= 4 * n * 8 / 10 && hits <= 4 * n,
+                "{what}: {hits} of {} reads sent to their records: {c2:?}",
+                4 * n
+            );
+        } else {
+            assert_eq!(c2.point_key_hits, 0, "{what}: {c2:?}");
+        }
+        assert_eq!(
+            (c2.rawserves, c2.fallbacks),
+            (0, 0),
+            "{what}: every read served by the form: {c2:?}"
+        );
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The heads arm (`Options::zpages_seek_ord`): a scan's seek and cut by
 /// the ordered index and the raw records, the walk after them the
 /// form file's. The windows agree with the model as the fence's do, the walks
@@ -2819,6 +3092,10 @@ fn the_overlay_walk_through_the_cursor_opens_a_group_a_group_where_the_walk_by_r
             forced(|o| {
                 o.zpages_walk_cursor = by_cursor;
                 o.inline_bytes = 1 << 16;
+                // The groups a walk opens are the block body's: the keys
+                // here are one run of one width that the stride form
+                // would hold, and it opens none.
+                o.zpages_stride = ZStride::Off;
             }),
         )
         .unwrap();
@@ -3181,6 +3458,8 @@ fn a_settle_asks_for_the_heads_its_resolves_will_seek_only_out_of_core() {
                 upkeep: supdb::Upkeep::Inline,
                 publish_in_background: false,
                 heads_willneed: on,
+                // Every ask its own look: what is counted here is the asks.
+                heads_look_ms: 0,
                 ..Options::default()
             },
         )
@@ -3261,6 +3540,543 @@ fn a_settle_asks_for_the_heads_its_resolves_will_seek_only_out_of_core() {
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// An ask for a run or a stride of heads is refused where its first page
+/// is resident, which it learns by a `mincore` of its own, so over an
+/// ordered index that is all in the page cache a settle's asks are those
+/// calls and nothing else. One look at each partition's whole stands in
+/// for them while it says the heads are resident
+/// (`Options::heads_look_ms`): such a settle looks and asks for nothing;
+/// with the indexes put out of the cache a look that has run out is made
+/// again, says so, and the asks go to the kernel as they did; a look that
+/// still stands is believed, a page gone since being a fault at the seek
+/// as it is with no ask; and zero is every ask's own look.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_look_at_a_partitions_heads_stands_in_for_the_asks_while_they_are_resident() {
+    for look_ms in [0u32, 1, 600_000] {
+        let dir = scratch(&format!("head-looks-{look_ms}"));
+        let mut db = Db::create(
+            &dir,
+            Options {
+                zpages: ZPages::Off,
+                partition_bytes: Some(160 << 10),
+                scan_block_cache: true,
+                upkeep: supdb::Upkeep::Inline,
+                publish_in_background: false,
+                heads_willneed: true,
+                heads_look_ms: look_ms,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut model = ordered_load(&mut db, 4000, 0x3B10E);
+        let check = |db: &Db, model: &Model, what: &str| {
+            for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
+                for limit in [1usize, 57, 300] {
+                    same_window(
+                        &scanned(db, &start, limit),
+                        &window(model, &start, limit),
+                        &format!(
+                            "{what}, from {:?} for {limit}",
+                            String::from_utf8_lossy(&start)
+                        ),
+                    );
+                }
+            }
+        };
+        db.zgate_set(1);
+        // A scan first, so the commits after it file their batches.
+        check(&db, &model, "drained, the gate at the census");
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let mut rng = Rng(0x3B10E1);
+        // The indexes resident, as the load left them.
+        let (size, resident) = resident_under(&dir, "ord-");
+        // Counted in whole pages, so not under the files' bytes.
+        assert!(
+            size > 0 && resident >= size,
+            "{resident} of {size} resident"
+        );
+        for k in keys.iter().step_by(5) {
+            let v = suite_value(&mut rng);
+            db.append(k, &v);
+            model.entry(k.clone()).or_default().push(v);
+        }
+        db.commit().unwrap();
+        let first = db.zpage_counts();
+        if look_ms == 0 {
+            assert!(
+                first.head_asks > 0 && first.head_looks == 0,
+                "every ask its own look: {} asks, {} looks",
+                first.head_asks,
+                first.head_looks
+            );
+        } else {
+            assert!(
+                first.head_asks == 0 && first.head_looks > 0,
+                "{look_ms} ms: the looks stood in for the asks: {} asks, {} looks",
+                first.head_asks,
+                first.head_looks
+            );
+        }
+        check(&db, &model, "a batch settled over resident heads");
+        // The indexes out of the page cache, and past the short look's time.
+        for e in std::fs::read_dir(&dir).unwrap() {
+            let path = e.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if name.starts_with("ord-") {
+                unmap_pages(&path);
+                evict(&path);
+            }
+        }
+        let (size, resident) = resident_under(&dir, "ord-");
+        assert!(
+            resident < size / 2,
+            "{resident} of {size} resident after the eviction"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for k in keys.iter().skip(2).step_by(7) {
+            let v = suite_value(&mut rng);
+            db.append(k, &v);
+            model.entry(k.clone()).or_default().push(v);
+        }
+        db.commit().unwrap();
+        let second = db.zpage_counts();
+        match look_ms {
+            0 => assert!(
+                second.head_asks > first.head_asks && second.head_submitted > first.head_submitted,
+                "every ask its own look, and the kernel asked: {} asks, {} submitted",
+                second.head_asks,
+                second.head_submitted
+            ),
+            1 => assert!(
+                second.head_looks > first.head_looks
+                    && second.head_asks > 0
+                    && second.head_submitted > 0,
+                "a look run out is made again and the asks go: {} looks, {} asks, {} submitted",
+                second.head_looks,
+                second.head_asks,
+                second.head_submitted
+            ),
+            _ => assert!(
+                second.head_looks == first.head_looks && second.head_asks == 0,
+                "a look that stands is believed: {} looks, {} asks",
+                second.head_looks,
+                second.head_asks
+            ),
+        }
+        check(
+            &db,
+            &model,
+            "a batch settled over heads put out of the cache",
+        );
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Away from the raw gate a mapping's pages leave the page cache between
+/// two seeks of them, and the ordered index is what every seek of a raw
+/// partition reads. So the segment work copies a raw-served partition's
+/// heads into the process's own memory (`Options::heads_owned`) and the
+/// index reads the copy: nothing is copied in core; out of core every
+/// partition's heads are, eight bytes a key; and with the index files put
+/// out of the cache the scans and a settled batch read none of them back,
+/// where without the option they do.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_raw_partitions_heads_are_held_in_memory_out_of_core() {
+    for owned in [true, false] {
+        let dir = scratch(&format!("heads-owned-{owned}"));
+        let mut db = Db::create(
+            &dir,
+            Options {
+                zpages: ZPages::Off,
+                partition_bytes: Some(160 << 10),
+                scan_block_cache: true,
+                heads_owned: owned,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut model = ordered_load(&mut db, 4000, 0x3B10F);
+        db.settle().unwrap();
+        let check = |db: &Db, model: &Model, what: &str| {
+            for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
+                for limit in [1usize, 57, 300] {
+                    same_window(
+                        &scanned(db, &start, limit),
+                        &window(model, &start, limit),
+                        &format!(
+                            "{what}, from {:?} for {limit}",
+                            String::from_utf8_lossy(&start)
+                        ),
+                    );
+                }
+            }
+        };
+        let ord_files = || -> Vec<PathBuf> {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("ord-"))
+                })
+                .collect()
+        };
+        let parts = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("par-"))
+            .count() as u64;
+        assert!(parts >= 2, "several partitions: {parts}");
+        // Out of core with no scan in the store's life nothing is copied,
+        // however long the segment work looks: a load nothing scans seeks
+        // no heads.
+        db.zgate_set(1);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(
+            db.heads_owned_counts(),
+            (0, 0, 0),
+            "nothing copied before a scan"
+        );
+        // Nor in core, scanned.
+        db.zgate_set(0);
+        check(&db, &model, "in core");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(db.heads_owned_counts(), (0, 0, 0), "nothing copied in core");
+        // Out of core and scanned: every partition's heads, a few a look.
+        db.zgate_set(1);
+        let t = std::time::Instant::now();
+        while owned && db.heads_owned_counts().0 < parts && t.elapsed().as_secs() < 20 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        if !owned {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let (made, given, bytes) = db.heads_owned_counts();
+        if owned {
+            assert_eq!(
+                (made, given),
+                (parts, 0),
+                "every partition's heads copied, none given back"
+            );
+            assert_eq!(bytes, 8 * model.len() as u64, "eight bytes a key");
+        } else {
+            assert_eq!((made, given, bytes), (0, 0, 0), "the mapping throughout");
+        }
+        // The index files out of the page cache, then scans and a settled
+        // batch: the copies are what they read.
+        for f in ord_files() {
+            unmap_pages(&f);
+            evict(&f);
+        }
+        let (size, before) = resident_under(&dir, "ord-");
+        assert!(
+            before < size / 2,
+            "{before} of {size} resident after the eviction"
+        );
+        check(&db, &model, "out of core, the index files evicted");
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let mut rng = Rng(0x3B10F1);
+        for k in keys.iter().step_by(5) {
+            let v = suite_value(&mut rng);
+            db.append(k, &v);
+            model.entry(k.clone()).or_default().push(v);
+        }
+        db.commit().unwrap();
+        check(&db, &model, "a batch settled");
+        let (_, after) = resident_under(&dir, "ord-");
+        if owned {
+            assert!(
+                after <= before,
+                "no seek read the mapping: {before} resident before, {after} after"
+            );
+        } else {
+            assert!(
+                after > before,
+                "the seeks read the mapping back: {before} resident before, {after} after"
+            );
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A partition a form file serves is sought through the form's fence, and
+/// no seek reads its heads: none is copied while the files serve, the
+/// copies made once the gate leaves the form (the test's seam: the census,
+/// with no controller to cover anything) are given back when the files
+/// serve again, through the epoch a reader that loaded a copy's address is
+/// pinned under, and the reads are right throughout.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_partitions_heads_are_given_back_where_a_form_file_serves_it() {
+    let dir = scratch("heads-given-back");
+    let mut db = Db::create(
+        &dir,
+        forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            o.scan_block_cache = true;
+        }),
+    )
+    .unwrap();
+    let model = ordered_load(&mut db, 4000, 0x3B110);
+    db.zpages_settle().unwrap();
+    let check = |db: &Db, what: &str| {
+        for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
+            for limit in [1usize, 57, 300] {
+                same_window(
+                    &scanned(db, &start, limit),
+                    &window(&model, &start, limit),
+                    &format!(
+                        "{what}, from {:?} for {limit}",
+                        String::from_utf8_lossy(&start)
+                    ),
+                );
+            }
+        }
+    };
+    let c = db.zpage_counts();
+    assert!(
+        c.partitions >= 2 && c.form_files == c.partitions,
+        "every partition covered: {c:?}"
+    );
+    // Scanned, the files serving: nothing copied.
+    check(&db, "covered");
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    assert_eq!(
+        db.heads_owned_counts(),
+        (0, 0, 0),
+        "no copy under the form files"
+    );
+    // The gate at the census: the raw form serves every partition.
+    db.zgate_set(1);
+    let t = std::time::Instant::now();
+    while db.heads_owned_counts().0 < c.partitions && t.elapsed().as_secs() < 20 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let (made, _, bytes) = db.heads_owned_counts();
+    assert_eq!(made, c.partitions, "every partition's heads copied");
+    assert_eq!(bytes, 8 * model.len() as u64, "eight bytes a key");
+    check(&db, "raw-served, the heads copied");
+    // A handle holding a snapshot from before the copies are given back:
+    // it may have loaded a copy's address, so none is freed while it
+    // holds, and all are once it lets go.
+    let held = db.reader().unwrap();
+    held.snapshot();
+    db.zgate_set(2);
+    let t = std::time::Instant::now();
+    while db.heads_owned_counts().2 > 0 && t.elapsed().as_secs() < 20 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let (made, given, bytes) = db.heads_owned_counts();
+    assert_eq!(bytes, 0, "no copy held under the form files");
+    assert_eq!(given, made, "every copy made was given back");
+    check(&db, "the form files serving, the copies given back");
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    assert_eq!(
+        db.heads_retired_waiting() as u64,
+        given,
+        "every copy given back waits for the handle pinned before it"
+    );
+    held.release();
+    drop(held);
+    // Nothing reads or writes the store from here to the assertion: the
+    // look that gave the copies up is what frees them, on a later turn.
+    let t = std::time::Instant::now();
+    while db.heads_retired_waiting() > 0 && t.elapsed().as_secs() < 20 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(
+        db.heads_retired_waiting(),
+        0,
+        "freed once no reader is pinned before them"
+    );
+    check(&db, "the copies freed");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Under the form's gate a copy is for a partition the form has declined,
+/// not for one the raw form is serving until its file is attached: every
+/// partition a merge lands is the second kind for a moment, and copied then
+/// it gave the copy back at once -- ninety-two copies and ninety-two given
+/// back over a lag sweep at ten million keys. A partition whose build is
+/// held is not copied however long it waits; one under the size floor,
+/// which no file will serve, is.
+#[cfg(target_os = "linux")]
+#[test]
+fn under_the_forms_gate_a_declined_partitions_heads_are_copied_and_a_waiting_ones_are_not() {
+    let scans = |db: &Db, model: &Model, what: &str| {
+        for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
+            same_window(
+                &scanned(db, &start, 57),
+                &window(model, &start, 57),
+                &format!("{what}, from {:?}", String::from_utf8_lossy(&start)),
+            );
+        }
+    };
+    // Waiting: the builds held, the raw form serving, scans near.
+    let dir = scratch("heads-waiting");
+    let mut db = Db::create(
+        &dir,
+        forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            o.scan_block_cache = true;
+        }),
+    )
+    .unwrap();
+    db.hold_zpage_build(true);
+    let model = ordered_load(&mut db, 4000, 0x3B111);
+    scans(&db, &model, "waiting for the builds");
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    assert_eq!(db.zpage_counts().form_files, 0, "no file attached yet");
+    assert_eq!(
+        db.heads_owned_counts(),
+        (0, 0, 0),
+        "a partition waiting for its file is not copied"
+    );
+    db.hold_zpage_build(false);
+    db.zpages_settle().unwrap();
+    scans(&db, &model, "the files serving");
+    assert_eq!(db.heads_owned_counts(), (0, 0, 0), "nor one a file serves");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    // Declined: the engine's own floor over partitions of a hundred and
+    // sixty kilobytes.
+    let dir = scratch("heads-declined");
+    let mut db = Db::create(
+        &dir,
+        Options {
+            zpages: ZPages::Always,
+            partition_bytes: Some(160 << 10),
+            scan_block_cache: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let model = ordered_load(&mut db, 4000, 0x3B112);
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert!(
+        c.partitions >= 2 && c.declined_small == c.partitions,
+        "every partition declined for its size: {c:?}"
+    );
+    scans(&db, &model, "declined");
+    let t = std::time::Instant::now();
+    while db.heads_owned_counts().0 < c.partitions && t.elapsed().as_secs() < 20 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let (made, given, bytes) = db.heads_owned_counts();
+    assert_eq!((made, given), (c.partitions, 0), "copied and kept");
+    assert_eq!(bytes, 8 * model.len() as u64, "eight bytes a key");
+    scans(&db, &model, "declined, the heads copied");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// At the census under the controller a copy is for a store the model says
+/// fits, whose census is the group's pressure: such a store sits there for
+/// as long as its writes make the group refault, every seek of it reads
+/// its heads, and they are copied. A store the model says does not fit is
+/// one the controller is weighing a purchase for, and neither while it
+/// weighs nor while it builds is a copy made -- the copies made between a
+/// crossing and its install read every index file from the device beside
+/// the first scans after a load, to be given back at the install.
+#[cfg(target_os = "linux")]
+#[test]
+fn at_the_census_the_controller_copies_heads_only_where_the_model_says_the_store_fits() {
+    let scan = |db: &Db, model: &Model, what: &str| {
+        let first = model.keys().next().unwrap().clone();
+        same_window(&scanned(db, &first, 50), &window(model, &first, 50), what);
+    };
+    // Pressure with room: the budget far over the store, the group
+    // refaulting. SUSPECT stands, the store is scanned, the heads copied.
+    let (dir, db, model, _inject) =
+        auto_store("heads-census-fits", 1 << 40, 1_000_000.0, FAULT_40US);
+    let parts = db.zpage_counts().partitions;
+    wait_secs(&db, 3, 1);
+    let c = db.zpage_counts();
+    assert_eq!((c.phase, c.gate), (1, 1), "SUSPECT on the pressure: {c:?}");
+    assert_eq!(db.heads_owned_counts().0, 0, "nothing copied before a scan");
+    scan(&db, &model, "the census, scanned");
+    let t = std::time::Instant::now();
+    while db.heads_owned_counts().0 < parts && t.elapsed().as_secs() < 20 {
+        wait_secs(&db, 1, 1);
+    }
+    let (made, given, bytes) = db.heads_owned_counts();
+    assert_eq!((made, given), (parts, 0), "every partition's heads copied");
+    assert_eq!(bytes, 8 * model.len() as u64);
+    scan(&db, &model, "the heads copied");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+    // A misfit with no evidence yet: SUSPECT stands while the controller
+    // waits for the reads' faults, and nothing is copied meanwhile.
+    let (dir, db, model, _inject) = suspect_store("heads-census-weighs");
+    scan(&db, &model, "weighing, scanned");
+    wait_secs(&db, 3, 1);
+    let c = db.zpage_counts();
+    assert_eq!((c.phase, c.gate), (1, 1), "still SUSPECT: {c:?}");
+    assert_eq!(
+        db.heads_owned_counts(),
+        (0, 0, 0),
+        "no copy while the controller weighs a purchase"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+    // A purchase in progress: driven to the build by point reads, which
+    // seek no heads, the build held, and the store scanned while it
+    // builds. No copy is made for a store the controller is covering,
+    // while it builds or once the files serve.
+    let (dir, db, model, inject) = blocked_store("heads-census-buys");
+    let first = model.keys().next().unwrap().clone();
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    db.hold_zpage_build(true);
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 2, 400),
+        "building: {:?}",
+        db.zpage_counts()
+    );
+    wait_for("the build at its hold", || db.zpage_build_waiting());
+    same_window(
+        &scanned(&db, &first, 50),
+        &window(&model, &first, 50),
+        "building, scanned",
+    );
+    wait_steps(&db, 3);
+    let c = db.zpage_counts();
+    assert_eq!((c.gate, c.phase), (1, 2), "{c:?}");
+    assert_eq!(
+        db.heads_owned_counts(),
+        (0, 0, 0),
+        "no copy while the controller buys"
+    );
+    db.hold_zpage_build(false);
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 200),
+        "COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    same_window(
+        &scanned(&db, &first, 50),
+        &window(&model, &first, 50),
+        "the files serving",
+    );
+    assert_eq!(
+        db.heads_owned_counts(),
+        (0, 0, 0),
+        "nor once the files serve"
+    );
+    drop(r);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The prefetch arm (`Options::zpages_scan_prefetch`): the scans agree
@@ -4106,9 +4922,12 @@ fn the_sizes_the_store_reports_are_the_files_it_holds() {
                 .header;
             groups += u64::from(h.ulen);
         }
-        let (fnc, filter) =
+        let (mut fnc, filter) =
             ZFence::decode_resident(&bytes[t.res_off as usize..bytes.len() - ZTRAILER], &t)
                 .unwrap();
+        // The fence as the attach keeps it: its word tree indexed
+        // (`Options::zpages_fence_words`, on).
+        fnc.index_words();
         fence += fnc.heap_bytes() as u64 + filter.len() as u64;
     }
     assert_eq!(c.file_bytes, file, "{c:?}");
@@ -4363,7 +5182,7 @@ fn builds_collected(db: &Db) {
     let t = std::time::Instant::now();
     loop {
         let c = db.zpage_counts();
-        if c.build_starts == c.builds + c.build_cancelled + c.build_failed + c.build_orphaned {
+        if !building(&c) {
             return;
         }
         assert!(
@@ -4572,7 +5391,7 @@ fn an_untouched_page(path: &Path, taken: &[usize]) -> usize {
     let t = Trailer::decode(&bytes[bytes.len() - ZTRAILER..]).unwrap();
     let pages = t.n_pages as usize;
     assert!(pages > 40, "{pages} pages");
-    let sampled: Vec<usize> = (0..16).map(|k| k * (pages - 1) / 15).collect();
+    let sampled = supdb::db::zpage_samples(pages);
     (pages / 2..pages)
         .find(|p| !sampled.contains(p) && !taken.contains(p))
         .expect("a page nobody sampled or read")
@@ -5637,30 +6456,63 @@ fn an_eager_auto_store_buys_the_form_before_any_read() {
 /// Under `Options::zpages_coding_auto`, as shipped, the selector chooses
 /// the coding the form files are built in: the sampler sizes the raw-tail
 /// record coding beside the block coding, and the raw tails are built where
-/// the model predicts that form faults nothing against the budget -- a store
-/// of twenty thousand keys, whose raw-tail form is about 2.2 MB, under
-/// 64 MiB -- and the block coding where it does not: the same store under a
-/// budget of 1.5 MiB, which the block form's 1.4 MB sits under and the
-/// raw-tail form's does not. With the option off the options' block coding
-/// is built under 64 MiB too, nothing chosen and nothing raw-tailed. Every
+/// the model predicts that form faults nothing against `zselect::FORM_FILL`
+/// of the budget -- a store of twenty thousand keys, whose raw-tail form is
+/// about 2.2 MB, under 64 MiB -- and the block coding where it does not:
+/// the same store under a budget of 1.5 MiB, which the block form's 1.4 MB
+/// sits under and the raw-tail form's does not, and under a budget five
+/// percent over the raw-tail form's own bytes, which that form fits whole
+/// and fills past the share -- the shape a line at the budget itself
+/// picked the raw tails for, at ten million keys under 1.25 GiB
+/// (`docs/engine.md`). With the option off the options' block coding is
+/// built under 64 MiB too, nothing chosen and nothing raw-tailed; and the
+/// first case's store with no reader before its pick builds the block
+/// coding, the raw tails waiting for a reader (`ZCounts::coding_unread`),
+/// since a pick made before any read is made partway through the store's
+/// first writing. Every
 /// store is eager and under the group's pressure, as the eager test has
 /// them, so each buys and installs; the counts say which coding was chosen
 /// and built, the raw-tail form reads larger than the block form wherever
 /// both are sized, and the reads answer the model every way.
 #[cfg(target_os = "linux")]
 #[test]
-fn the_selector_builds_the_raw_tails_where_that_form_fits_and_the_block_coding_otherwise() {
+fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the_block_coding_otherwise(
+) {
     assert!(
         Options::default().zpages_coding_auto,
         "the selector's coding as shipped"
     );
-    for (budget, gear, raw) in [
-        (64u64 << 20, true, true),
-        (1536u64 << 10, true, false),
-        (64u64 << 20, false, false),
-    ] {
-        let what = format!("budget {budget}, gear {gear}, raw tails expected {raw}");
-        let dir = scratch(&format!("coding-auto-{gear}-{raw}"));
+    // A case's budget: bytes, or a percentage of the first case's raw-tail
+    // form, which every case's store sizes alike (the same keys and values,
+    // the sampler's ranks evenly spaced).
+    enum At {
+        Bytes(u64),
+        OfRaw(u64),
+    }
+    // The last case is the first's store with no reader before the pick:
+    // the raw tails wait for one, and the block coding is chosen.
+    let cases = [
+        (At::Bytes(64 << 20), true, true, true),
+        (At::Bytes(1536 << 10), true, false, true),
+        (At::OfRaw(105), true, false, true),
+        (At::Bytes(64 << 20), false, false, true),
+        (At::Bytes(64 << 20), true, false, false),
+    ];
+    let mut raw_w_z = 0u64;
+    for (i, (at, gear, raw, read)) in cases.into_iter().enumerate() {
+        let edge = matches!(at, At::OfRaw(_));
+        let budget = match at {
+            At::Bytes(b) => b,
+            At::OfRaw(pct) => {
+                assert!(raw_w_z > 0, "the first case sized the raw-tail form");
+                raw_w_z * pct / 100
+            }
+        };
+        let fill = supdb::db::zselect::form_fill(budget);
+        let what = format!(
+            "case {i}: budget {budget} (fill {fill}), gear {gear}, raw tails expected {raw}, a reader {read}"
+        );
+        let dir = scratch(&format!("coding-auto-{i}"));
         let inject = std::sync::Arc::new(supdb::ZInject::new());
         inject.set_budget(budget);
         inject.set_refault_rate(1_000_000.0);
@@ -5680,6 +6532,13 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_and_the_block_coding_o
         .unwrap();
         let model = ordered_load(&mut db, 20_000, 0x4AA);
         db.settle().unwrap();
+        // A reader before the pick: a raw-tail pick waits for one
+        // (`Maint::z_pick_raw_ok`).
+        if read {
+            let mut seen = 0usize;
+            db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+            assert_eq!(seen, 10);
+        }
         for _ in 0..2 {
             advance_tick(&db, std::time::Duration::from_secs(1));
         }
@@ -5690,6 +6549,9 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_and_the_block_coding_o
         );
         let c = db.zpage_counts();
         assert!(c.builds >= 1, "{what}: {c:?}");
+        if i == 0 {
+            raw_w_z = c.sample_w_z_raw_bytes;
+        }
         if !gear {
             assert_eq!(
                 (c.coding_picks_raw, c.coding_picks_block, c.builds_raw_tails),
@@ -5720,12 +6582,22 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_and_the_block_coding_o
                 "{what}: the reading fed to the selector is the chosen form's"
             );
             assert!(
-                c.sample_w_z_raw_bytes < budget,
-                "{what}: the raw-tail form under the budget"
+                c.sample_w_z_raw_bytes <= fill,
+                "{what}: the raw-tail form within the fill share: {c:?}"
+            );
+        } else if gear && !read {
+            assert!(
+                c.coding_picks_block >= 1 && c.coding_picks_raw == 0 && c.coding_unread >= 1,
+                "{what}: the block coding chosen for want of a reader: {c:?}"
+            );
+            assert_eq!(c.builds_raw_tails, 0, "{what}: no build raw-tailed");
+            assert!(
+                c.sample_w_z_raw_bytes <= fill,
+                "{what}: where the raw tails fit the fill share: {c:?}"
             );
         } else if gear {
             assert!(
-                c.coding_picks_block >= 1 && c.coding_picks_raw == 0,
+                c.coding_picks_block >= 1 && c.coding_picks_raw == 0 && c.coding_unread == 0,
                 "{what}: the block coding chosen: {c:?}"
             );
             assert_eq!(c.builds_raw_tails, 0, "{what}: no build raw-tailed");
@@ -5734,9 +6606,20 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_and_the_block_coding_o
                 "{what}: the block form the smaller: {c:?}"
             );
             assert!(
-                c.sample_w_z_raw_bytes > budget,
-                "{what}: the raw-tail form over the budget: {c:?}"
+                c.sample_w_z_raw_bytes > fill,
+                "{what}: the raw-tail form over the fill share: {c:?}"
             );
+            if edge {
+                assert!(
+                    c.sample_w_z_raw_bytes < budget,
+                    "{what}: and within the budget whole, where the line at the budget picked it: {c:?}"
+                );
+            } else {
+                assert!(
+                    c.sample_w_z_raw_bytes > budget,
+                    "{what}: the raw-tail form over the budget: {c:?}"
+                );
+            }
         }
         let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
         check(&db, &model, &keys, &what);
@@ -6189,6 +7072,29 @@ fn auto_store_with(
     extra: impl FnOnce(&mut Options),
     prep: impl FnOnce(&Db),
 ) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
+    auto_store_loaded(
+        name,
+        budget,
+        refaults_per_s,
+        fault_cost,
+        extra,
+        prep,
+        |db| ordered_load(db, 20_000, 0x4A9),
+    )
+}
+
+/// `auto_store_with` loaded by `load` in place of the twenty thousand
+/// spaced keys.
+#[cfg(target_os = "linux")]
+fn auto_store_loaded(
+    name: &str,
+    budget: u64,
+    refaults_per_s: f64,
+    fault_cost: std::time::Duration,
+    extra: impl FnOnce(&mut Options),
+    prep: impl FnOnce(&Db),
+    load: impl FnOnce(&mut Db) -> Model,
+) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
     let dir = scratch(name);
     let inject = std::sync::Arc::new(supdb::ZInject::new());
     inject.set_budget(budget);
@@ -6208,17 +7114,23 @@ fn auto_store_with(
     // The purchase as the rent makes it: the builds ahead at landing
     // (`Options::zpages_land_pct`, on as shipped) buy by attach, and they
     // are their own tests' (`land_store`).
+    // The hot-raw policy off unless a test asks for it: it releases a hot
+    // partition to the raw form where the budget has room, and the tests
+    // here count the form files a store holds and read the codings by
+    // partition, which a release moves under them. Its own test turns it
+    // on (`the_controller_serves_the_hottest_partition_raw_within_the_budget`).
     let mut opts = Options {
         zpages: ZPages::Auto,
         zpages_min_bytes: 0,
         zpages_inject: Some(inject.clone()),
         zpages_land_pct: 0,
+        zpages_hot_raw: false,
         ..Options::default()
     };
     extra(&mut opts);
     let mut db = Db::create(&dir, opts).unwrap();
     prep(&db);
-    let model = ordered_load(&mut db, 20_000, 0x4A9);
+    let model = load(&mut db);
     db.settle().unwrap();
     for _ in 0..2 {
         advance_tick(&db, std::time::Duration::from_secs(1));
@@ -6313,6 +7225,78 @@ fn tick_until(db: &Db, max: u32, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> 
         wait_steps(db, 1);
     }
     cond(&db.zpage_counts())
+}
+
+/// Ticks of the injected clock until `cond` holds of the counts, for as
+/// long as a minute of the wall allows rather than for a count of ticks: a
+/// build ahead runs on the builder's thread at its own pace and is
+/// collected only at a tick, and a stride build's read-back of the device
+/// beside other processes' tests takes the device's time, which no count of
+/// ticks bounds. A build in flight by the counts (`building`) is given a few
+/// milliseconds of the wall before the next tick, so that the injected
+/// clock moves with the builds and not with the wait.
+#[cfg(target_os = "linux")]
+fn tick_until_built(db: &Db, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> bool {
+    let t = std::time::Instant::now();
+    loop {
+        let c = db.zpage_counts();
+        if cond(&c) {
+            return true;
+        }
+        if t.elapsed().as_secs() >= 60 {
+            return false;
+        }
+        if building(&c) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        wait_steps(db, 1);
+    }
+}
+
+/// Whether a build is in flight by the counts: one started on the builder's
+/// thread and not yet taken in, which a collect does only at a tick
+/// (`ZCounts::build_collected`, counted once whatever came of the build), or
+/// one at a merge's output finish still on its thread
+/// (`ZCounts::finish_live`). The one definition the waits read.
+fn building(c: &supdb::db::ZCounts) -> bool {
+    c.build_starts > c.build_collected || c.finish_live > 0
+}
+
+/// `drive_to` past its four hundred rounds for as long as a build is in
+/// flight and a minute of the wall allows, each such round given a few
+/// milliseconds of the wall first: the controller's builds of a stride
+/// store's partitions run at the device's pace beside other processes'
+/// tests, which no fixed count of rounds bounds.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn drive_to_built(
+    db: &Db,
+    r: &Reader,
+    keys: &[Vec<u8>],
+    inject: &supdb::ZInject,
+    at: &mut usize,
+    per: usize,
+    faults: u64,
+    phase: u8,
+) -> bool {
+    let t = std::time::Instant::now();
+    let mut rounds = 0u32;
+    loop {
+        let c = db.zpage_counts();
+        if c.phase == phase {
+            return true;
+        }
+        let busy = building(&c);
+        if t.elapsed().as_secs() >= 60 || (rounds >= 400 && !busy) {
+            return false;
+        }
+        if busy {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        reads(r, keys, inject, per, at, faults);
+        close_window(db, r, &keys[0]);
+        rounds += 1;
+    }
 }
 
 /// `n` census ticks of the injected clock, each waited for.
@@ -7519,7 +8503,18 @@ fn land_store_with(
     pct: u32,
     extra: impl FnOnce(&mut Options),
 ) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>, u64) {
-    let (dir, db, model, inject) = auto_store_with(
+    land_store_loaded(name, pct, extra, |db| ordered_load(db, 20_000, 0x4A9))
+}
+
+/// `land_store_with` loaded by `load`.
+#[cfg(target_os = "linux")]
+fn land_store_loaded(
+    name: &str,
+    pct: u32,
+    extra: impl FnOnce(&mut Options),
+    load: impl FnOnce(&mut Db) -> Model,
+) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>, u64) {
+    let (dir, db, model, inject) = auto_store_loaded(
         name,
         1 << 40,
         0.0,
@@ -7529,6 +8524,7 @@ fn land_store_with(
             extra(o);
         },
         |_| {},
+        load,
     );
     let c = db.zpage_counts();
     let raw = c.model_hash_bytes + c.model_record_bytes;
@@ -7637,83 +8633,35 @@ fn builds_ahead_under_a_cipher_seal_their_form_files_and_keep_them_cold() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The crossing under a cipher: form files built ahead while the store was
-/// under the selector's line, their records kept and their envelopes
-/// dropped as written, are swapped at the look that first finds the store
-/// past it -- in the kernel's cache of the envelopes, which is where a
-/// store under a cipher has both: the records' ciphertext dropped, by the
-/// folios a drop can take, and the form files' asked back -- once, and
-/// every read after it the model's.
+/// A build started on the builder's thread is taken in once whatever comes
+/// of it, and counted so (`ZCounts::build_collected`): builds ahead of
+/// partitions under the floor each decline, which the counts of the
+/// outcomes that leave a file never see, and the waits' one definition of a
+/// build in flight (`building`) reads none in flight once every decline is
+/// collected, where a sum of the outcomes' counts reads each of them in
+/// flight for the store's life.
 #[cfg(target_os = "linux")]
 #[test]
-fn the_crossing_under_a_cipher_swaps_the_ciphertext_of_records_for_forms() {
-    let (dir, db, model, inject, raw) = land_store_with("auto-cross-cipher", 50, |o| {
-        o.encryption = supdb::Encryption::Cipher(supdb::StoreCipher::new(
-            common::Gcm::new(&[0x5a; 32]),
-            common::Gcm::new,
-        ));
-        o.zpages_under_cipher = true;
-        o.zpages_land_drop_past = true;
-        o.zpages_cover_resident = false;
-        o.zpages_suspect_at_crossing = false;
+fn a_build_ahead_that_declines_is_collected_and_no_build_is_in_flight_after_it() {
+    let (dir, db, _model, inject, raw) = land_store_with("auto-ahead-declined", 50, |o| {
+        o.partition_bytes = Some(400 << 10);
+        o.zpages_min_bytes = 1 << 40;
     });
     inject.set_budget(raw * 3 / 2);
     assert!(
-        tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
-        "built ahead: {:?}",
+        tick_until(&db, 200, |c| c.declined_small >= c.partitions
+            && c.build_starts == c.build_collected),
+        "declined ahead: {:?}",
         db.zpage_counts()
     );
-    let pages_of = |form: bool| -> (usize, usize) {
-        let (mut cached, mut pages) = (0usize, 0usize);
-        for f in std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()) {
-            let name = f.file_name().unwrap().to_string_lossy().into_owned();
-            let is = if form {
-                name.ends_with(".z")
-            } else {
-                name.starts_with("x-") && !name.contains('.')
-            };
-            if is {
-                let len = std::fs::metadata(&f).unwrap().len() as usize;
-                cached += cached_pages(&f, 0, len);
-                pages += len.div_ceil(4096);
-            }
-        }
-        (cached, pages)
-    };
-    let (rc, rp) = pages_of(false);
-    let (fc, fp) = pages_of(true);
-    assert!(
-        rc * 10 >= rp * 9 && fc * 4 < fp,
-        "under: records {rc}/{rp} forms {fc}/{fp}"
-    );
-    inject.set_budget(raw * 2 / 3);
-    assert!(
-        tick_until(&db, 200, |c| c.ahead_swapped >= c.partitions),
-        "swapped: {:?}",
-        db.zpage_counts()
-    );
-    // The files' pages come in behind the advice, asynchronously.
-    let t0 = std::time::Instant::now();
-    while pages_of(true).0 * 2 < fp && t0.elapsed() < std::time::Duration::from_secs(20) {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    let (rc2, _) = pages_of(false);
-    let (fc2, _) = pages_of(true);
-    assert!(
-        rc2 * 10 < rc * 8 && fc2 * 2 >= fp,
-        "past: records {rc2}/{rp} (were {rc}) forms {fc2}/{fp}"
-    );
-    wait_steps(&db, 10);
+    let c = db.zpage_counts();
+    assert!(c.partitions >= 3, "{c:?}");
     assert_eq!(
-        db.zpage_counts().ahead_swapped,
-        db.zpage_counts().partitions,
-        "once"
+        (c.build_starts, c.build_collected, c.builds, c.prebuilt),
+        (c.partitions, c.partitions, 0, 0),
+        "each partition's build ahead started, declined and collected once: {c:?}"
     );
-    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-    let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
-    let r = db.reader().unwrap();
-    check(&r, &model, &some, "raw after the crossing under a cipher");
-    drop(r);
+    assert!(!building(&c), "nothing in flight: {c:?}");
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -7733,6 +8681,10 @@ fn the_sample_starts_between_builds_ahead_when_told_to() {
                 o.zpages_sample_between = between;
                 o.zpages_ahead_builders = 1;
                 o.partition_bytes = Some(400 << 10);
+                // The fill sample, whose order between the builds ahead is
+                // the test: with the files on disk the reading comes from
+                // them and no sample starts.
+                o.zpages_reading_from_files = false;
                 // The sample's wait for a build ahead, which a store whose
                 // resident and in-flight partitions count as covered never
                 // makes, and the build ahead started before the sample,
@@ -7814,6 +8766,10 @@ fn builds_ahead_at_landing_wait_while_scans_are_around() {
         let (dir, mut db, model, inject, raw) =
             land_store_with(&format!("auto-land-scans-{far}"), 50, |o| {
                 o.zpages_land_scans_far = far;
+                // The builds ahead at landing alone, so that a merge's
+                // outputs have no file but theirs
+                // (`Options::zpages_build_at_finish`).
+                o.zpages_build_at_finish = false;
             });
         let mut seen = 0usize;
         db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
@@ -7857,6 +8813,345 @@ fn builds_ahead_at_landing_wait_while_scans_are_around() {
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// Past the selector's line the builds ahead at landing run beside scans
+/// (`Options::zpages_ahead_past_scans`): a store scanned and never
+/// point-read, its raw populations past its budget, builds its partitions
+/// ahead, and the landing that brings the files on disk to the install's
+/// coverage has the selector's reading refreshed against them, in place of
+/// a sample, so the attach on the prediction follows and the form installs;
+/// without the option nothing is built ahead beside the scans, the first
+/// reading stands, and nothing installs.
+#[cfg(target_os = "linux")]
+#[test]
+fn builds_ahead_run_beside_scans_past_the_line_and_the_attach_follows() {
+    for on in [true, false] {
+        let what = format!("ahead past scans {on}");
+        let (dir, db, model, inject, raw) =
+            land_store_with(&format!("auto-ahead-scans-{on}"), 50, |o| {
+                o.zpages_ahead_past_scans = on;
+                o.partition_bytes = Some(400 << 10);
+            });
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let mut seen = 0usize;
+        db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+        assert_eq!(seen, 10);
+        // Well past the line: the budget at half the raw populations, and
+        // the decode priced through the seam, so the line to enter is not
+        // the build profile's to draw.
+        inject.set_decode_cost(std::time::Duration::from_micros(1));
+        // The builds ahead held at their start, so that the first reading
+        // finds no file on disk and refuses the attach, as the store the
+        // lag sweep runs on did; in core they would land before it.
+        db.hold_zpage_build(on);
+        inject.set_budget(raw / 2);
+        if on {
+            // A build ahead at its hold, and the reading taken in by the
+            // selector with it there: no file on disk, so the reading
+            // refuses the attach.
+            assert!(
+                tick_until(&db, 200, |c| c.build_starts >= 1),
+                "{what}: nothing built ahead beside the scans: {:?}",
+                db.zpage_counts()
+            );
+            wait_for("a build ahead at its hold", || db.zpage_build_waiting());
+            // `sample_us` is written as the reading is collected, where the
+            // files on disk are counted; one tick more and the selector
+            // holds it.
+            assert!(
+                tick_until(&db, 200, |c| c.sample_us > 0),
+                "{what}: no reading: {:?}",
+                db.zpage_counts()
+            );
+            wait_steps(&db, 1);
+            let c = db.zpage_counts();
+            assert_eq!(
+                (
+                    c.prebuilt,
+                    c.sel_installs,
+                    c.samples,
+                    form_files(&dir).len()
+                ),
+                (0, 0, 1, 0),
+                "{what}: the reading taken with the builds held: {c:?}"
+            );
+            db.hold_zpage_build(false);
+            assert!(
+                tick_until(&db, 400, |c| c.sel_installs >= 1),
+                "{what}: the attach did not follow the files: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert!(
+                c.samples == 1 && c.sample_refreshed >= 1 && c.prebuilt >= 1,
+                "{what}: the reading refreshed once the files landed and covered the keys, not sampled again: {c:?}"
+            );
+            assert!(
+                c.attached >= 1 && c.phase == 3,
+                "{what}: the files attached and the form installed: {c:?}"
+            );
+        } else {
+            assert!(
+                !tick_until(&db, 60, |c| c.build_starts > 0),
+                "{what}: built ahead beside the scans: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.sel_installs, c.prebuilt),
+                (0, 0),
+                "{what}: the first reading stands: {c:?}"
+            );
+        }
+        let r = db.reader().unwrap();
+        check(&r, &model, &keys, &what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A merge's outputs are given their form files as each is finished
+/// (`Options::zpages_build_at_finish`): a store under the controller past
+/// its budget, every key written again and the pieces merged, has a form
+/// file beside every output once the builds the merge started have ended,
+/// at most the builders' count of them at once -- with the builds held at
+/// their start, a merge of more outputs than builders waits for a slot and
+/// does not land -- and the tick after the last build has the selector's
+/// reading refreshed against the files, so the attach follows without the
+/// rent and with no landing after; without the option the merge lands with
+/// no file and builds nothing at its outputs' finish.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_merges_outputs_have_their_form_files_when_it_lands() {
+    // Eight builders: every output's build starts, the merges land with
+    // them parked, and the install follows the builds' landing alone;
+    // two: an output waits for a slot, which is the cap, and its merge
+    // with it.
+    for (on, builders) in [(true, 8usize), (true, 2), (false, 2)] {
+        let what = format!("build at finish {on}, {builders} builders");
+        let (dir, mut db, mut model, inject, raw) =
+            land_store_with(&format!("auto-finish-{on}-{builders}"), 50, |o| {
+                o.zpages_build_at_finish = on;
+                o.zpages_ahead_builders = builders;
+                // Three partitions, so that one merge's outputs cover the
+                // keys the attach needs.
+                o.partition_bytes = Some(1 << 20);
+                // A merge at the first piece's landing, planned by the
+                // segment work: a flush would join the merge, and the merge
+                // waits for its builds, which the test holds.
+                o.l0_trigger = 1;
+            });
+        // Past the line, the decode priced through the seam; scanned, so
+        // that the builds ahead at landing would wait for the scans.
+        let mut seen = 0usize;
+        db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+        assert_eq!(seen, 10);
+        inject.set_decode_cost(std::time::Duration::from_micros(1));
+        inject.set_budget(raw / 2);
+        wait_steps(&db, 2);
+        let partitions = db.zpage_counts().partitions;
+        assert!(partitions == 3, "{what}: {:?}", db.zpage_counts());
+        // The builds held at their start: the merge's outputs finish, their
+        // builds park, and the merge waits for them before it lands. Every
+        // key written again and sealed, the merge the landing plans.
+        db.hold_zpage_build(true);
+        let landed = db.seal_waits().merges;
+        // Values of the suite's size, so the rewrite leaves the store's
+        // footprint, and the line, where they were.
+        let mut rng = Rng(0x5EED);
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        for chunk in keys.chunks(250) {
+            for k in chunk {
+                let v = suite_value(&mut rng);
+                db.put(k, &v);
+                model.insert(k.clone(), vec![v]);
+            }
+            db.commit().unwrap();
+        }
+        db.seal().unwrap();
+        wait_for("a merge of the pieces", || db.merges_in_flight() >= 1);
+        if on {
+            wait_for("builds at the outputs' finish, at their hold", || {
+                db.zpage_build_waiting() && db.zpage_counts().finish_live >= 1
+            });
+            // Twenty ticks with the builds parked: with a slot for every
+            // output the merges land, their files to come; with two slots
+            // an output waits for one, and its merge with it.
+            wait_steps(&db, 20);
+            let c = db.zpage_counts();
+            let waits = builders == 2;
+            assert_eq!(
+                (
+                    db.seal_waits().merges > landed,
+                    db.merges_in_flight() >= 1,
+                    c.finish_builds,
+                    c.sel_installs
+                ),
+                (true, waits, 0, 0),
+                "{what}: the merges against their builds' slots: {c:?}"
+            );
+            assert!(
+                c.finish_live >= 1
+                    && c.finish_live <= builders as u64
+                    && c.finish_starts <= builders as u64,
+                "{what}: at most the builders' count at once: {c:?}"
+            );
+            db.hold_zpage_build(false);
+            wait_for("the builds at the outputs' finish to end", || {
+                db.zpage_counts().finish_live == 0 && db.merges_in_flight() == 0
+            });
+            db.settle().unwrap();
+            // Every live partition has its file, built at its output's
+            // finish and nowhere else: the builds ahead at landing are held
+            // by the scans. A build whose output the next merge of the chain
+            // retired first finds no file to build from, and counts failed.
+            let c = db.zpage_counts();
+            assert!(
+                c.finish_builds >= c.partitions && c.finish_live == 0 && c.build_starts == 0,
+                "{what}: every output built at its finish: {c:?}"
+            );
+            assert!(
+                form_files(&dir).len() as u64 >= c.partitions,
+                "{what}: a file beside every partition: {:?}",
+                form_files(&dir)
+            );
+            // No landing since the builds ended: the tick after them asked
+            // for the reading the attach follows.
+            let landed_now = db.seal_waits().merges;
+            assert!(
+                tick_until(&db, 400, |c| c.sel_installs >= 1),
+                "{what}: the attach did not follow the files: {:?}",
+                db.zpage_counts()
+            );
+            assert_eq!(
+                db.seal_waits().merges,
+                landed_now,
+                "{what}: the install followed the files, not a landing"
+            );
+            // The attach's reading came from a refresh against the files on
+            // disk, which no landing asked for: a reading is of the
+            // partitions at a generation, and the builds' end changes none.
+            let c = db.zpage_counts();
+            assert!(
+                c.sample_refreshed >= 1,
+                "{what}: the reading refreshed against the files: {c:?}"
+            );
+        } else {
+            db.hold_zpage_build(false);
+            db.settle().unwrap();
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.finish_starts, c.finish_builds, c.finish_live),
+                (0, 0, 0),
+                "{what}: nothing built at the outputs' finish: {c:?}"
+            );
+            assert!(
+                form_files(&dir).is_empty(),
+                "{what}: no file at the landing: {:?}",
+                form_files(&dir)
+            );
+        }
+        let r = db.reader().unwrap();
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&r, &model, &keys, &what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// An output being built at its merge's finish is a build in flight
+/// (`Options::zpages_build_at_finish`): the builds ahead at landing, run
+/// beside scans so they would take the landing's outputs, start on none of
+/// them while their builds are parked, and every output's file comes from
+/// its finish alone.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_output_being_built_at_its_finish_is_not_built_ahead_again() {
+    let what = "built at finish, ahead beside scans";
+    let (dir, mut db, mut model, inject, raw) = land_store_with("auto-finish-ahead", 50, |o| {
+        o.zpages_build_at_finish = true;
+        o.zpages_ahead_builders = 8;
+        o.zpages_land_scans_far = false;
+        o.partition_bytes = Some(1 << 20);
+        o.l0_trigger = 1;
+    });
+    let mut seen = 0usize;
+    db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+    assert_eq!(seen, 10);
+    inject.set_decode_cost(std::time::Duration::from_micros(1));
+    inject.set_budget(raw / 2);
+    // Past the line the builds ahead build the load's partitions, which
+    // no merge finished; every one on disk before the rewrite. Collected,
+    // whichever way: the controller buys by attach once the files on disk
+    // and the build in flight cover the keys, and a build collected after
+    // that is installed and not left dormant, so a wait for three dormant
+    // files lost to the purchase whenever the third build was slow -- seven
+    // runs of sixteen beside two other builds on four cores, at the commit
+    // before this as at this one, and none alone.
+    let partitions = db.zpage_counts().partitions;
+    assert!(partitions == 3, "{what}: {:?}", db.zpage_counts());
+    assert!(
+        tick_until_built(&db, |c| c.build_collected >= partitions
+            && c.build_starts >= partitions
+            && c.builds >= partitions),
+        "{what}: the load's partitions not built ahead: {:?}",
+        db.zpage_counts()
+    );
+    assert!(
+        form_files(&dir).len() as u64 >= partitions,
+        "{what}: a file beside every partition before the rewrite: {:?}",
+        form_files(&dir)
+    );
+    wait_for("the builds ahead to end", || !db.zpage_build_waiting());
+    let starts = db.zpage_counts().build_starts;
+    db.hold_zpage_build(true);
+    let mut rng = Rng(0x5EED);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    for chunk in keys.chunks(250) {
+        for k in chunk {
+            let v = suite_value(&mut rng);
+            db.put(k, &v);
+            model.insert(k.clone(), vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.seal().unwrap();
+    wait_for("a merge of the pieces", || db.merges_in_flight() >= 1);
+    wait_for("builds at the outputs' finish, at their hold", || {
+        db.zpage_build_waiting() && db.zpage_counts().finish_live >= 1
+    });
+    // Twenty ticks with the outputs' builds parked and the merge landed:
+    // the builds ahead, free to run beside the scans, take none of them.
+    wait_steps(&db, 20);
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.build_starts, c.finish_builds),
+        (starts, 0),
+        "{what}: a build ahead started on an output being built at its finish: {c:?}"
+    );
+    db.hold_zpage_build(false);
+    wait_for("the builds at the outputs' finish to end", || {
+        db.zpage_counts().finish_live == 0 && db.merges_in_flight() == 0
+    });
+    db.settle().unwrap();
+    let c = db.zpage_counts();
+    assert!(
+        c.finish_builds >= partitions && c.build_starts == starts,
+        "{what}: every output built at its finish and nowhere else: {c:?}"
+    );
+    assert!(
+        form_files(&dir).len() as u64 >= c.partitions,
+        "{what}: a file beside every partition: {:?}",
+        form_files(&dir)
+    );
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, what);
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The builds ahead at landing (`Options::zpages_land_pct`): a store whose
@@ -8087,9 +9382,12 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
                 o.zpages_land_drop_past = drop_past;
                 // The swap at the crossing before any buy: a controller
                 // that suspects at the crossing buys the attach on the
-                // prediction inside the steps this waits.
+                // prediction inside the steps this waits, and with the
+                // reading from the files on disk it buys in the step after
+                // it suspects, so no attach is bought on the prediction here.
                 o.zpages_cover_resident = false;
                 o.zpages_suspect_at_crossing = false;
+                o.zpages_attach_eager = false;
             });
         inject.set_budget(raw * 3 / 2);
         assert!(
@@ -8164,6 +9462,136 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
             &some,
             &format!("{what}: raw after the crossing"),
         );
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A settle waits for the form files the store has asked the kernel for
+/// and asks again for the ones the kernel left out
+/// (`Options::zpages_settle_joins_asks`): a store built ahead under its
+/// budget and then taken past the selector's line, whose crossing drops the
+/// records and asks the files back behind the call. An ask the kernel did
+/// not answer is made by putting the files out of the page cache once the
+/// crossing's ask has brought them: the settle finds them out, asks again
+/// where its looks stall, and returns with them in, by the kernel's own
+/// count; with the option off the settle looks at nothing and the files
+/// stay out. And the wait's bound, through the seam that holds its looks
+/// (`ZInject::hold_asked`): with every look reading nothing resident it
+/// asks again as often as it may and gives up at the looks a stall is after
+/// the last. A settle before any ask and a settle after the wait look at
+/// nothing, and the store reads as it did throughout.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_settle_waits_for_the_form_files_the_store_asked_for() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Case {
+        Evicted,
+        Held,
+        Off,
+    }
+    for case in [Case::Evicted, Case::Held, Case::Off] {
+        let what = format!("settle joins asks, {case:?}");
+        let (dir, mut db, model, inject, raw) =
+            land_store_with(&format!("auto-join-asks-{case:?}"), 50, |o| {
+                o.zpages_settle_joins_asks = case != Case::Off;
+                // The swap at the crossing before any buy, as the
+                // crossing's own test has it.
+                o.zpages_cover_resident = false;
+                o.zpages_suspect_at_crossing = false;
+                o.zpages_attach_eager = false;
+            });
+        inject.set_budget(raw * 3 / 2);
+        assert!(
+            tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+            "{what}: built ahead: {:?}",
+            db.zpage_counts()
+        );
+        // Nothing asked for yet: a settle looks at nothing.
+        db.settle().unwrap();
+        assert_eq!(
+            db.zpage_counts().ask_joins,
+            0,
+            "{what}: a wait with nothing asked"
+        );
+        inject.set_budget(raw * 2 / 3);
+        assert!(
+            tick_until(&db, 200, |c| c.ahead_swapped >= c.partitions),
+            "{what}: swapped: {:?}",
+            db.zpage_counts()
+        );
+        // The crossing's own ask answered, and then the files put out: the
+        // state an ask the kernel dropped leaves, made on purpose.
+        let t0 = std::time::Instant::now();
+        while {
+            let (size, resident) = resident_under(&dir, "zpg-");
+            resident * 2 < size && t0.elapsed() < std::time::Duration::from_secs(20)
+        } {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        for f in form_files(&dir) {
+            evict(&f);
+        }
+        let (size, out) = resident_under(&dir, "zpg-");
+        assert!(
+            size > 0 && out * 4 < size,
+            "{what}: the files were not put out: {out} of {size}"
+        );
+        if case == Case::Held {
+            inject.hold_asked(100);
+        }
+        db.settle().unwrap();
+        let c = db.zpage_counts();
+        let (size, resident) = resident_under(&dir, "zpg-");
+        match case {
+            Case::Evicted => {
+                assert_eq!(c.ask_joins, 1, "{what}: one wait an ask: {c:?}");
+                assert!(
+                    c.ask_join_reasks >= 1,
+                    "{what}: files left out and no ask made again: {c:?}"
+                );
+                assert!(
+                    resident * 10 >= size * 9,
+                    "{what}: the settle returned without the files: {resident} of {size}: {c:?}"
+                );
+            }
+            Case::Held => {
+                // No look found a page more: two looks and an ask again,
+                // three times over, then the looks a stall is -- the first
+                // look, six beside the asks, and nine before the tenth
+                // stall ends the wait.
+                assert_eq!(
+                    (c.ask_joins, c.ask_join_reasks, c.ask_join_polls),
+                    (1, 3, 16),
+                    "{what}: the asks again and the stall's looks: {c:?}"
+                );
+            }
+            Case::Off => {
+                assert_eq!(
+                    (c.ask_joins, c.ask_join_polls, c.ask_join_reasks),
+                    (0, 0, 0),
+                    "{what}: a wait with the option off: {c:?}"
+                );
+                assert!(
+                    resident * 4 < size,
+                    "{what}: the files came back with nothing asking: {resident} of {size}"
+                );
+            }
+        }
+        if case != Case::Off {
+            // Once an ask: the next settle finds nothing pending.
+            db.settle().unwrap();
+            assert_eq!(
+                db.zpage_counts().ask_joins,
+                1,
+                "{what}: a second wait for one ask"
+            );
+        }
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+        let r = db.reader().unwrap();
+        check(&r, &model, &some, &what);
         drop(r);
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -8482,7 +9910,12 @@ fn a_build_ahead_over_resident_records_holds_no_sample() {
         wait_steps(&db, 3);
         let c = db.zpage_counts();
         if cover {
-            assert!(c.samples >= 1, "{what}: sampled beside it: {c:?}");
+            // A reading taken beside it: from the files on disk, or a
+            // sample where they do not cover.
+            assert!(
+                c.samples + c.sample_from_files >= 1,
+                "{what}: a reading beside it: {c:?}"
+            );
             // And the reading counts the partition in flight as covered:
             // the attach is bought on the prediction once the partitions
             // have stood, with the build still held and no read made.
@@ -8555,6 +9988,240 @@ fn the_sample_waits_for_a_seal_in_flight_where_the_controller_suspects_at_the_cr
     }
 }
 
+/// The selector's raw-tail pick is a function of the partitions' size at
+/// its reading and holds for every build after it, so where the store grows
+/// past the fill share of the budget the pick was made under it is taken
+/// back (`ZCounts::coding_repicks`): the lag sweep's store at ten million
+/// keys under 1.25 GiB took its reading four seconds into its load, doubled
+/// after it, and built every partition raw-tailed, a form the size of the
+/// raw records (`docs/engine.md`). A store of twenty thousand keys picks
+/// the raw tails under a budget whose fill share holds them half again,
+/// installs them, and then either doubles, ordered keys above its greatest,
+/// or has every key written again at the same size: grown, the partitions
+/// built after the growth are block-coded and the ones served before it
+/// keep their raw tails; rewritten, nothing is taken back and every build
+/// is raw-tailed. The reads answer the model through both.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_raw_tail_pick_is_taken_back_once_the_store_grows_past_the_fill_share() {
+    assert!(Options::default().zpages_coding_auto);
+    for grow in [true, false] {
+        let what = format!("grow {grow}");
+        let (dir, mut db, mut model, inject) = auto_store_with(
+            &format!("coding-repick-{grow}"),
+            1 << 40,
+            0.0,
+            FAULT_1MS,
+            |o| o.zpages_build_eager = true,
+            |_| {},
+        );
+        // A reader before the pick, which the raw tails wait for.
+        let mut seen = 0usize;
+        db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+        assert_eq!(seen, 10, "{what}");
+        // The raw tails within the fill share half again: the records'
+        // bytes, which the raw-tail form is the size of, and a store twice
+        // as large past it.
+        let records = db.zpage_counts().model_record_bytes;
+        assert!(records > 0, "{what}: {:?}", db.zpage_counts());
+        let budget = records * 7 / 4;
+        let fill = supdb::db::zselect::form_fill(budget);
+        assert!(
+            records < fill && 2 * records > fill,
+            "{what}: {records} {fill}"
+        );
+        inject.set_budget(budget);
+        inject.set_refault_rate(1_000_000.0);
+        assert!(
+            tick_until(&db, 400, |c| c.sel_installs >= 1
+                && c.attached >= c.partitions),
+            "{what}: bought and installed: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        assert!(
+            c.coding_picks_raw >= 1 && c.coding_picks_block == 0 && c.coding_repicks == 0,
+            "{what}: the raw tails picked: {c:?}"
+        );
+        assert_eq!(
+            c.builds_raw_tails, c.builds,
+            "{what}: every build raw-tailed"
+        );
+        let (n0, built0) = (c.partitions, c.builds);
+        let mut rng = Rng(0x5EED_C0DE);
+        if grow {
+            for chunk in (20_000..40_000).collect::<Vec<usize>>().chunks(500) {
+                for &i in chunk {
+                    let (k, v) = (spaced_key(i), suite_value(&mut rng));
+                    db.append(&k, &v);
+                    model.insert(k, vec![v]);
+                }
+                db.commit().unwrap();
+            }
+        } else {
+            let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+            for chunk in keys.chunks(500) {
+                for k in chunk {
+                    let v = suite_value(&mut rng);
+                    db.put(k, &v);
+                    model.insert(k.clone(), vec![v]);
+                }
+                db.commit().unwrap();
+            }
+        }
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert!(
+            tick_until(&db, 400, |c| c.builds > built0
+                && c.attached >= c.partitions),
+            "{what}: the partitions after the writes attached: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        let coded = codings(&db);
+        if grow {
+            assert!(c.partitions > n0, "{what}: the store grew: {c:?}");
+            assert!(
+                c.coding_repicks >= 1 && c.coding_picks_block >= 1,
+                "{what}: the raw tails taken back: {c:?}"
+            );
+            assert_eq!(
+                c.builds_raw_tails, built0,
+                "{what}: nothing raw-tailed after the growth: {c:?}"
+            );
+            assert!(
+                coded.iter().any(|&raw| raw) && coded.iter().any(|&raw| !raw),
+                "{what}: the partitions served before keep their raw tails, the ones after are block-coded: {coded:?}"
+            );
+        } else {
+            assert_eq!(
+                (c.coding_repicks, c.coding_picks_block),
+                (0, 0),
+                "{what}: nothing taken back: {c:?}"
+            );
+            assert_eq!(
+                c.builds_raw_tails, c.builds,
+                "{what}: every build raw-tailed: {c:?}"
+            );
+            assert!(coded.iter().all(|&raw| raw), "{what}: {coded:?}");
+        }
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let some: Vec<Vec<u8>> = keys.iter().step_by(37).cloned().collect();
+        let r = db.reader().unwrap();
+        check(&r, &model, &some, &what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The form files a merge builds at its outputs' finish carry the pick as
+/// the merge started (`Options::zpages_build_at_finish`), and a pick taken
+/// back while they are built leaves them on disk in the refused coding: the
+/// lag sweep's store built every output raw-tailed before its growth was
+/// read. Such a file is on record by its coding, given back at its attach
+/// and built again (`ZCounts::ahead_recoded`). A store installed on the raw
+/// tails has every key written again at the same size, so that its merge
+/// builds its outputs raw-tailed, held at their start; the store then
+/// doubles, the pick is taken back at the next build's plan, and once the
+/// builds go on every partition is block-coded, the merge's outputs
+/// included; the reads answer the model.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_form_file_built_at_a_merges_finish_in_a_coding_taken_back_is_built_again() {
+    assert!(Options::default().zpages_coding_auto && Options::default().zpages_build_at_finish);
+    let (dir, mut db, mut model, inject) = auto_store_with(
+        "coding-repick-finish",
+        1 << 40,
+        0.0,
+        FAULT_1MS,
+        |o| {
+            o.zpages_build_eager = true;
+            o.zpages_land_pct = 50;
+            o.zpages_ahead_builders = 8;
+            o.partition_bytes = Some(1 << 20);
+            o.l0_trigger = 1;
+        },
+        |_| {},
+    );
+    let mut seen = 0usize;
+    db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+    assert_eq!(seen, 10, "a reader before the pick");
+    let records = db.zpage_counts().model_record_bytes;
+    inject.set_budget(records * 7 / 4);
+    inject.set_refault_rate(1_000_000.0);
+    assert!(
+        tick_until(&db, 400, |c| c.sel_installs >= 1
+            && c.attached >= c.partitions),
+        "bought and installed: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert!(
+        c.coding_picks_raw >= 1 && c.coding_repicks == 0 && codings(&db).iter().all(|&raw| raw),
+        "the raw tails picked and served: {c:?} {:?}",
+        codings(&db)
+    );
+    // Every key written again at the same size: the merge's outputs are
+    // built at their finish raw-tailed, and held there.
+    db.hold_zpage_build(true);
+    let mut rng = Rng(0x5EED_F1A1);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    for chunk in keys.chunks(250) {
+        for k in chunk {
+            let v = suite_value(&mut rng);
+            db.put(k, &v);
+            model.insert(k.clone(), vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.seal().unwrap();
+    wait_for("builds at the outputs' finish, at their hold", || {
+        db.zpage_build_waiting() && db.zpage_counts().finish_live >= 1
+    });
+    assert_eq!(db.zpage_counts().coding_repicks, 0, "nothing grew yet");
+    // The store doubled while they wait: the next build's plan takes the
+    // raw tails back.
+    for chunk in (20_000..40_000).collect::<Vec<usize>>().chunks(500) {
+        for &i in chunk {
+            let (k, v) = (spaced_key(i), suite_value(&mut rng));
+            db.append(&k, &v);
+            model.insert(k, vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    assert!(
+        tick_until(&db, 400, |c| c.coding_repicks >= 1),
+        "the raw tails taken back: {:?}",
+        db.zpage_counts()
+    );
+    db.hold_zpage_build(false);
+    wait_for("the builds at the outputs' finish to end", || {
+        db.zpage_counts().finish_live == 0 && db.merges_in_flight() == 0
+    });
+    db.settle().unwrap();
+    assert!(
+        tick_until(&db, 400, |c| c.attached >= c.partitions
+            && codings(&db).iter().all(|&raw| !raw)),
+        "every partition block-coded: {:?} {:?}",
+        db.zpage_counts(),
+        codings(&db)
+    );
+    let c = db.zpage_counts();
+    assert!(
+        c.finish_builds >= 1 && c.ahead_recoded >= 1,
+        "the outputs built at their finish raw-tailed given back: {c:?}"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let some: Vec<Vec<u8>> = keys.iter().step_by(37).cloned().collect();
+    let r = db.reader().unwrap();
+    check(&r, &model, &some, "after the finish builds given back");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A form file built ahead at landing comes before the sampler's coding
 /// pick and takes the options' coding, the block coding; where the pick
 /// is then the raw tails, the buy gives each such file back unattached
@@ -8581,6 +10248,10 @@ fn a_form_file_built_ahead_in_the_coding_the_pick_refuses_is_built_again() {
         (0, 0),
         "block-coded, FITS: {c:?}"
     );
+    // A reader, which a raw-tail pick waits for (`Maint::z_pick_raw_ok`).
+    let mut seen = 0usize;
+    db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+    assert_eq!(seen, 10);
     // A budget the raw-tail form fits under, and the group's pressure: the
     // eager entry buys on the raw tails, as the coding test's store does.
     inject.set_budget(64 << 20);
@@ -8626,7 +10297,9 @@ fn a_form_file_built_ahead_in_the_coding_the_pick_refuses_is_built_again() {
 /// or with the option off, or two percent past the budget, where the
 /// model's saving is under the selector's line to enter and only the
 /// group's pressure says otherwise, the rent waits for the evidence reads
-/// would give, and the store stays in SUSPECT with its files dormant.
+/// would give, and the store stays in SUSPECT with its files dormant --
+/// with the files' pages out of the cache, whose faults the reading prices
+/// at the seam's cost and not at a wait the machine's load chooses.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_attach_of_form_files_built_ahead_is_bought_on_the_prediction() {
@@ -8682,6 +10355,18 @@ fn an_attach_of_form_files_built_ahead_is_bought_on_the_prediction() {
             gone <= 1,
             "{what}: {removed} of {total} bytes removed"
         );
+        // Near, the files' pages put out of the cache, so that the reading's
+        // timed decodes fault: the reading prices those faults at the seam's
+        // cost and not at their wait, which under a gate's load was a
+        // stalled fault's and dropped the line to enter under the model's
+        // saving, so that the store was bought on the prediction.
+        // The files are dormant, mapped by nothing, so a drop of their cache
+        // takes every page.
+        if near {
+            for f in form_files(&dir) {
+                evict(&f);
+            }
+        }
         // Past the budget under the group's pressure: far past it, or two
         // percent past it, where the model's saving is under the line to
         // enter and the pressure alone buys nothing on the prediction.
@@ -8725,6 +10410,133 @@ fn an_attach_of_form_files_built_ahead_is_bought_on_the_prediction() {
                 "{what}: SUSPECT, the files dormant: {c:?}"
             );
         }
+        if near {
+            assert!(
+                c.sample_from_files >= 1,
+                "{what}: a reading from the files: {c:?}"
+            );
+            assert_eq!(
+                c.sample_t_f_ns,
+                FAULT_40US.as_nanos() as u64,
+                "{what}: the reading's timed decodes faulted and were priced at the seam's cost: {c:?}"
+            );
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The reading at the crossing comes from the form files on disk where
+/// they cover the keys the install needs (`Options::zpages_reading_from_files`):
+/// no fill sample runs, the reading stands in the tick that wanted it, and
+/// the buy on the prediction follows within a few steps -- the model
+/// recomputed at the step after the reading, not at its period. With the
+/// option off the fill sample runs as before and the install still comes;
+/// and where a third of the files are gone the files do not cover, so the
+/// fill sample runs under both.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_reading_at_the_crossing_comes_from_the_files_on_disk() {
+    for (from_files, gone) in [(true, 0usize), (false, 0), (true, usize::MAX)] {
+        let what = format!("reading from files {from_files}, files removed {gone}");
+        let (dir, db, model, inject, raw) = land_store_with(
+            &format!("auto-reading-files-{from_files}-{gone}"),
+            50,
+            |o| {
+                o.partition_bytes = Some(160 << 10);
+                o.zpages_reading_from_files = from_files;
+                o.zpages_land_cold_past = false;
+            },
+        );
+        inject.set_budget(raw * 3 / 2);
+        assert!(
+            tick_until(&db, 400, |c| c.prebuilt >= c.partitions),
+            "{what}: built ahead: {:?}",
+            db.zpage_counts()
+        );
+        let n = db.zpage_counts().partitions;
+        assert!(n >= 12, "{what}: partitions enough: {n}");
+        let gone = gone.min(n as usize / 3);
+        inject.set_records_resident(0.0);
+        let files = form_files(&dir);
+        for f in &files[..gone] {
+            std::fs::remove_file(f).unwrap();
+        }
+        let before = db.zpage_counts();
+        assert_eq!(
+            (before.samples, before.sample_from_files),
+            (0, 0),
+            "{what}: nothing read yet: {before:?}"
+        );
+        // Past the budget, far: the crossing.
+        inject.set_budget(1 << 20);
+        inject.set_refault_rate(1_000_000.0);
+        inject.set_fault_cost(FAULT_1MS);
+        let covers = gone == 0;
+        // Where the files do not cover the keys the install needs, the
+        // attach on the prediction buys nothing (the attach-eager test has
+        // the case): the fill sample runs, and no reading comes from the
+        // files.
+        if !covers {
+            assert!(
+                !tick_until(&db, 120, |c| c.sel_installs >= 1),
+                "{what}: nothing bought without cover: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert_eq!(
+                c.sample_from_files, 0,
+                "{what}: no reading from files: {c:?}"
+            );
+            assert!(c.samples >= 1, "{what}: the fill sample ran: {c:?}");
+            assert_eq!(
+                (c.phase, c.attached),
+                (1, 0),
+                "{what}: SUSPECT, dormant: {c:?}"
+            );
+            db.close().unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            continue;
+        }
+        assert!(
+            tick_until(&db, 400, |c| c.sel_installs >= 1),
+            "{what}: installed: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        if from_files {
+            assert_eq!(
+                (c.sample_from_files, c.samples),
+                (1, 0),
+                "{what}: the reading from the files, no fill sample: {c:?}"
+            );
+            // The reading stands in the tick that wanted it and the model is
+            // recomputed at the next step: the buy within a few steps of the
+            // crossing, where a model recomputed at its period alone bought
+            // up to ten steps after the reading.
+            assert!(
+                c.sel_steps - before.sel_steps <= 6,
+                "{what}: bought within a few steps of the crossing: {} steps: {c:?}",
+                c.sel_steps - before.sel_steps
+            );
+        } else {
+            assert_eq!(
+                c.sample_from_files, 0,
+                "{what}: no reading from files: {c:?}"
+            );
+            assert!(c.samples >= 1, "{what}: the fill sample ran: {c:?}");
+        }
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= n),
+            "{what}: every partition attached: {:?}",
+            db.zpage_counts()
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+        let r = db.reader().unwrap();
+        check(&r, &model, &some, &what);
+        assert!(db.zpage_counts().reads > 0, "{what}: through the form");
+        drop(r);
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9211,6 +11023,211 @@ fn a_block_read_often_enough_under_the_form_is_held_as_a_copy_and_walked_without
     }
 }
 
+/// Under the form file a scan that starts in a block scans have started in
+/// `promote_starts` times holds the blocks it walks as merged copies in
+/// their slots, and a scan that starts in a block held so walks the copy
+/// with no seek through the form (`Options::promote_starts`): starts met
+/// once copy nothing, the window's first two scans walk the form, the third
+/// finds its start's block hot and copies what it walked, and the fourth
+/// walks no form and seeks nothing. Scans from every few keys of a range,
+/// four rounds of them, answer as the model has them through whatever mix
+/// of copies and forms they meet, and a write into a copied block is
+/// spliced into the copy. With the option off the form is walked every
+/// time: the positive control.
+#[test]
+fn a_block_scans_keep_starting_in_is_held_as_a_copy_under_the_form() {
+    // On; off; and on with a budget no copy fits under, where a hot scan
+    // copies nothing.
+    for (starts, budget) in [(3u32, 0usize), (0, 0), (3, 1)] {
+        let on = starts > 0 && budget == 0;
+        let dir = scratch(match (starts, budget) {
+            (0, _) => "promote-starts-off",
+            (_, 0) => "promote-starts",
+            _ => "promote-starts-no-room",
+        });
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.partition_bytes = Some(160 << 10);
+                o.scan_block_cache = true;
+                o.promote_starts = starts;
+                if budget > 0 {
+                    o.scan_cache_bytes = budget;
+                }
+            }),
+        )
+        .unwrap();
+        let mut model = ordered_load(&mut db, 5000, 0x9A2);
+        db.zpages_settle().unwrap();
+        db.settle().unwrap();
+        assert!(db.zpage_counts().form_files >= 3);
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        // Starts met once each, none of them in the window's first block.
+        for i in 0..12 {
+            let k = &keys[100 + i * 331];
+            same_window(
+                &scanned(&r, k, 40),
+                &window(&model, k, 40),
+                &format!("a start met once, {i}"),
+            );
+        }
+        assert_eq!(r.form_choices()[0], 0, "a start met once copies nothing");
+        assert_eq!(r.hot_start_counts(), [0, 0]);
+        let start = keys[1003].clone();
+        let want = window(&model, &start, 100);
+        for i in 0..2 {
+            same_window(&scanned(&r, &start, 100), &want, &format!("scan {i}"));
+        }
+        assert_eq!(r.form_choices()[0], 0, "two starts in a block copy nothing");
+        same_window(&scanned(&r, &start, 100), &want, "the third scan");
+        let promoted = r.form_choices()[0];
+        let (walks, hot) = (db.zpage_counts().scans, r.hot_start_counts());
+        same_window(&scanned(&r, &start, 100), &want, "over the copies");
+        let walked = db.zpage_counts().scans - walks;
+        let after = r.hot_start_counts();
+        if on {
+            assert!(
+                promoted >= 2,
+                "the blocks the third scan walked: {promoted}"
+            );
+            assert_eq!(hot, [1, 0], "the third scan hot, none started on a copy");
+            assert_eq!(walked, 0, "a scan over the copies walks no form");
+            assert_eq!(after, [2, 1], "the fourth started on the copy, unsought");
+        } else {
+            assert_eq!(promoted, 0, "nothing copied with the option off");
+            assert!(walked >= 1, "the form walked every time: {walked}");
+            assert_eq!(after, [0, 0]);
+        }
+        // A start that is a block's first key ties the sample that would
+        // name its block -- the store's first key ties the first -- and is
+        // counted by its seek's answer: its scans go hot and copy their
+        // blocks all the same, each after a seek, none started on a copy.
+        let tie = keys[0].clone();
+        let twant = window(&model, &tie, 100);
+        let (h0, p0) = (r.hot_start_counts(), r.form_choices()[0]);
+        for i in 0..3 {
+            same_window(&scanned(&r, &tie, 100), &twant, &format!("tied scan {i}"));
+        }
+        let twalks = db.zpage_counts().scans;
+        same_window(&scanned(&r, &tie, 100), &twant, "tied, over the copies");
+        let (h1, p1) = (r.hot_start_counts(), r.form_choices()[0]);
+        if on {
+            assert_eq!(
+                (h1[0] - h0[0], h1[1] - h0[1]),
+                (2, 0),
+                "the tied start's third and fourth scans hot, each sought"
+            );
+            assert!(p1 - p0 >= 2, "the tied start's blocks copied: {}", p1 - p0);
+            assert_eq!(db.zpage_counts().scans, twalks, "and walked as copies");
+        } else {
+            assert_eq!((h1, p1), (h0, p0));
+        }
+        // The writer's own scans, over a drained partition: its first two
+        // take the one walk from the seek, the third goes through the
+        // blocks and copies them, the fourth starts on the copy.
+        let wstart = keys[3003].clone();
+        let wwant = window(&model, &wstart, 100);
+        for i in 0..4 {
+            same_window(
+                &scanned(&db, &wstart, 100),
+                &wwant,
+                &format!("the writer's scan {i}"),
+            );
+        }
+        if on {
+            assert_eq!(db.hot_starts(), [2, 1], "the writer's third and fourth");
+            assert!(
+                db.build_kinds().0[0] >= 2,
+                "the writer's copies: {:?}",
+                db.build_kinds()
+            );
+        } else {
+            assert_eq!(db.hot_starts(), [0, 0]);
+            assert_eq!(db.build_kinds().0[0], 0, "{:?}", db.build_kinds());
+        }
+        // A block the starts pass over at the partition's mean rate never
+        // goes hot: three starts in one block with a window of starts in
+        // the partition's other blocks after each -- the counts halved
+        // between them -- copy nothing, where three with nothing between
+        // them do.
+        if on {
+            let (h0, p0) = (r.hot_start_counts(), r.form_choices()[0]);
+            for round in 0..3 {
+                for j in [1usize, 0].into_iter().chain(2..16) {
+                    let k = &keys[4000 + 64 * j + 6];
+                    same_window(
+                        &scanned(&r, k, 10),
+                        &window(&model, k, 10),
+                        &format!("round {round}, block {j}"),
+                    );
+                }
+            }
+            assert_eq!(
+                (r.hot_start_counts(), r.form_choices()[0]),
+                (h0, p0),
+                "three starts a window apart are no rate"
+            );
+            let k = &keys[4000 + 64 + 6];
+            for i in 0..3 {
+                same_window(
+                    &scanned(&r, k, 10),
+                    &window(&model, k, 10),
+                    &format!("together, {i}"),
+                );
+            }
+            assert_eq!(
+                r.hot_start_counts()[0] - h0[0],
+                1,
+                "three with no window between them are"
+            );
+        }
+        // Scans from every few keys of a range, each four times: starts
+        // that tie a block's first key and name no block, starts inside
+        // blocks gone hot, windows over copies and forms mixed.
+        for round in 0..4 {
+            for k in keys[2000..2400].iter().step_by(7) {
+                same_window(
+                    &scanned(&r, k, 30),
+                    &window(&model, k, 30),
+                    &format!("round {round}"),
+                );
+            }
+        }
+        if on {
+            let c = r.hot_start_counts();
+            assert!(
+                c[0] > 100 && c[1] > 100,
+                "the range's blocks gone hot and walked as copies: {c:?}"
+            );
+        }
+        // A write into a copied block, and one that creates a key inside
+        // it: spliced into the copy by the settle, answered by the next
+        // scan, the handle's and the writer's.
+        db.append(&keys[1010], b"appended");
+        model
+            .get_mut(&keys[1010])
+            .unwrap()
+            .push(b"appended".to_vec());
+        let new = [keys[1020].as_slice(), b"+"].concat();
+        db.append(&new, b"created");
+        model.insert(new, vec![b"created".to_vec()]);
+        db.commit().unwrap();
+        same_window(
+            &scanned(&r, &start, 100),
+            &window(&model, &start, 100),
+            "after writes into a copied block",
+        );
+        same_window(
+            &scanned(&db, &start, 100),
+            &window(&model, &start, 100),
+            "the writer, after writes into a copied block",
+        );
+        drop(r);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The bytes of the files under `dir` whose names start with `prefix` that
 /// the page cache holds: `mincore` over a read-only mapping of each, which
 /// faults nothing in, so the kernel's answer and not the store's record of
@@ -9345,6 +11362,1664 @@ fn codings(db: &Db) -> Vec<bool> {
     db.zpage_heat().iter().map(|h| h.coded).collect()
 }
 
+/// Under the controller with the re-code (`Options::zpages_recode_auto`),
+/// once the form is installed, the partition whose decodes cost the most is
+/// re-coded to the raw tails while the form with their extra stays within
+/// the fill share of the budget, the partitions under their share of the
+/// decode time are left block-coded, and once the budget falls under the
+/// form past the evict share the raw tails go back; every read answers as
+/// the raw form does across each swap. Without the option nothing is
+/// re-coded however hot a partition reads.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_controller_recodes_the_hottest_partition_within_the_budget() {
+    for on in [true, false] {
+        let what = format!("recode auto {on}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-recode-{on}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_recode_auto = on;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        // Every file attached and warmed: the policy's turn comes once the
+        // builder has nothing due.
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        // A decode priced by the seam, so that the heat is the decodes.
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        assert!(
+            codings(&db).iter().all(|c| !c),
+            "{what}: built in the block coding: {:?}",
+            codings(&db)
+        );
+        let c = db.zpage_counts();
+        assert!(
+            c.form_files >= 5,
+            "{what}: partitions to choose from: {c:?}"
+        );
+        let total = c.file_bytes;
+        // A partition hot, and one past the floor and under its share of
+        // the decode time: a hundred thousand reads to three thousand.
+        let hot = keys_of_partition(&db, &model, 2);
+        let warm = keys_of_partition(&db, &model, 4);
+        let heat = |db: &Db| {
+            heat_up(db, &hot, 100_000);
+            heat_up(db, &warm, 3_000);
+        };
+        if on {
+            // The fill share of the budget the form itself: no room.
+            inject.set_budget(total * 100 / 85 + 1);
+            recode_look(&db, std::time::Duration::from_secs(1));
+            heat(&db);
+            recode_look(&db, std::time::Duration::from_secs(1));
+            wait_steps(&db, 5);
+            let c = db.zpage_counts();
+            assert_eq!(c.recodes, 0, "{what}: no room in the fill: {c:?}");
+            // Room within the fill share for a partition's raw tails.
+            inject.set_budget(total * 2);
+            heat(&db);
+            recode_look(&db, std::time::Duration::from_secs(1));
+            // The re-code is collected at a later step of the controller,
+            // which the injected clock paces.
+            assert!(
+                tick_until(&db, 400, |c| c.recodes >= 1),
+                "{what}: the hot partition re-coded: {:?} {:?}",
+                db.zpage_counts(),
+                db.zpage_heat()
+            );
+            let coded = codings(&db);
+            assert!(
+                coded[2] && coded.iter().filter(|c| **c).count() == 1,
+                "{what}: the hot partition alone raw-tailed: {coded:?} {:?}",
+                db.zpage_heat()
+            );
+            // The warm one under its share: a look more re-codes nothing.
+            heat(&db);
+            recode_look(&db, std::time::Duration::from_secs(1));
+            wait_steps(&db, 5);
+            assert_eq!(
+                codings(&db).iter().filter(|c| **c).count(),
+                1,
+                "{what}: one raw-tailed: {:?}",
+                db.zpage_heat()
+            );
+            check(&r, &model, &keys, &format!("{what}: raw-tailed"));
+            // The budget under the form past the evict share: given back.
+            inject.set_budget(db.zpage_counts().file_bytes);
+            recode_look(&db, std::time::Duration::from_secs(1));
+            assert!(
+                tick_until(&db, 400, |c| c.recodes_back >= 1),
+                "{what}: given back: {:?} {:?}",
+                db.zpage_counts(),
+                db.zpage_heat()
+            );
+            assert!(
+                codings(&db).iter().all(|c| !c),
+                "{what}: all block-coded again: {:?}",
+                codings(&db)
+            );
+        } else {
+            inject.set_budget(total * 2);
+            for _ in 0..3 {
+                heat(&db);
+                advance_tick(&db, std::time::Duration::from_secs(1));
+            }
+            wait_steps(&db, 5);
+            let c = db.zpage_counts();
+            assert_eq!((c.recodes, c.recode_looks), (0, 0), "{what}: {c:?}");
+        }
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The hot-raw policy's next look waited for (`Options::zpages_hot_raw`):
+/// the injected clock moved `by`, and the counts read once the segment
+/// work's turn has looked at it.
+#[cfg(target_os = "linux")]
+fn hot_look(db: &Db, by: std::time::Duration) {
+    let inject = db.options().zpages_inject.clone().unwrap();
+    let was = db.zpage_counts().hot_looks;
+    inject.advance(by);
+    let t = std::time::Instant::now();
+    while db.zpage_counts().hot_looks == was && t.elapsed().as_secs() < 60 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(
+        db.zpage_counts().hot_looks > was,
+        "the hot-raw policy looked"
+    );
+}
+
+/// Looks of the hot-raw policy, each a period on, until `cond` holds of the
+/// counts or `max` looks have gone: whether it holds.
+#[cfg(target_os = "linux")]
+fn hot_until(db: &Db, max: u32, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> bool {
+    for _ in 0..max {
+        if cond(&db.zpage_counts()) {
+            return true;
+        }
+        hot_look(db, std::time::Duration::from_millis(200));
+    }
+    cond(&db.zpage_counts())
+}
+
+/// Under the controller with the hot-raw policy (`Options::zpages_hot_raw`),
+/// once the form is installed, the partition whose decodes cost the most is
+/// released to the raw form -- its form file taken out of its cell and left
+/// on disk, the partition declined under the policy, its reads going raw and
+/// counted -- where the form files and the raw partitions together stay
+/// within the release share of the budget, and not where they would not;
+/// a partition under the floor is left served however much room there is;
+/// once the budget falls under the files and the raw partitions past the
+/// fill share, the coldest raw partition's file is attached again, and the
+/// store serves every partition from its form file as before. Every read
+/// and scan answers as the raw form does across each move. Without the
+/// option nothing is released however hot a partition reads.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
+    for (on, ask) in [(true, true), (true, false), (false, true)] {
+        let what = format!("hot raw {on} back ask {ask}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-hotraw-{on}-{ask}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_hot_raw = on;
+                o.zpages_hot_back_ask = ask;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        // A decode priced by the seam, so that the heat is the decodes.
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        let c = db.zpage_counts();
+        assert!(
+            c.form_files >= 5,
+            "{what}: partitions to choose from: {c:?}"
+        );
+        assert_eq!(
+            c.form_files, c.partitions,
+            "{what}: every partition served: {c:?}"
+        );
+        let (partitions, total) = (c.partitions, c.file_bytes);
+        let hot = keys_of_partition(&db, &model, 2);
+        let heat = |db: &Db| heat_up(db, &hot, 100_000);
+        if on {
+            // The release share of the budget filled by the form files
+            // themselves: no room for a raw partition.
+            inject.set_budget(total * 100 / 75 + 1);
+            hot_look(&db, std::time::Duration::from_millis(200));
+            heat(&db);
+            hot_look(&db, std::time::Duration::from_millis(200));
+            heat(&db);
+            hot_look(&db, std::time::Duration::from_millis(200));
+            let c = db.zpage_counts();
+            assert_eq!((c.hot_raw, c.hot_raw_now), (0, 0), "{what}: no room: {c:?}");
+            // Room for one partition's raw form and no more: the line at the
+            // files plus one and a half times what a release adds, a raw
+            // partition less its form file, the raw partition read as the
+            // records and the hash slots the model counts (the ordered index
+            // comes with it, a few percent more). The hot one is released at
+            // the look after the heat shows.
+            let file_one = total / partitions;
+            let raw_one = (c.model_record_bytes + c.model_hash_bytes) / partitions;
+            assert!(
+                raw_one > file_one,
+                "{what}: the raw form over the file: {c:?}"
+            );
+            let line = total + (raw_one - file_one) * 3 / 2;
+            inject.set_budget(line * 100 / 75);
+            heat(&db);
+            // The look asks for the raw pages; the look after, with the
+            // pages resident, takes the form file out of its cell.
+            hot_look(&db, std::time::Duration::from_millis(200));
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_asks, c.hot_raw, c.form_files),
+                (1, 0, partitions),
+                "{what}: asked, still served: {c:?}"
+            );
+            assert!(
+                hot_until(&db, 10, |c| c.hot_raw >= 1),
+                "{what}: the hot partition released: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert_eq!(
+                (
+                    c.hot_asks,
+                    c.hot_dropped,
+                    c.hot_raw,
+                    c.hot_raw_now,
+                    c.form_files
+                ),
+                (1, 0, 1, 1, partitions - 1),
+                "{what}: the hot partition released: {c:?}"
+            );
+            assert_eq!(c.hot_back, 0, "{what}: {c:?}");
+            // Its reads go raw and are counted; the others' still through
+            // the form. Every value as the model has it.
+            let before = db.zpage_counts();
+            check(&r, &model, &hot, &format!("{what}: released, raw"));
+            let after = db.zpage_counts();
+            assert!(
+                after.rawserves > before.rawserves,
+                "{what}: the released partition read raw: {before:?} {after:?}"
+            );
+            let cold = keys_of_partition(&db, &model, 0);
+            let before = db.zpage_counts();
+            check(&r, &model, &cold, &format!("{what}: served"));
+            let after = db.zpage_counts();
+            assert!(
+                after.reads > before.reads,
+                "{what}: a served partition read through the form: {before:?} {after:?}"
+            );
+            check_scan(&r, &model, &format!("{what}: scans across a raw partition"));
+            // Another look with the hot one raw: its own reads keep it the
+            // hottest, the checks above read the others past the floor, and
+            // there is no room for a second: nothing moves.
+            heat(&db);
+            hot_look(&db, std::time::Duration::from_millis(200));
+            hot_look(&db, std::time::Duration::from_millis(200));
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_asks, c.hot_raw, c.hot_back, c.hot_raw_now),
+                (1, 1, 0, 1),
+                "{what}: one released and nothing more: {c:?}"
+            );
+            // The budget under the form files and the raw partition past the
+            // fill share: the raw one's file attached again. The raw one's
+            // form file, out of its cell, is dropped from the cache first,
+            // so that only an ask brings its pages before the wait is out
+            // (`Options::zpages_hot_back_ask`); the served ones' mapped
+            // pages stay.
+            for e in std::fs::read_dir(&dir).unwrap() {
+                let path = e.unwrap().path();
+                if path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("zpg-")
+                {
+                    evict(&path);
+                }
+            }
+            let evicted = resident_under(&dir, "zpg-");
+            assert!(
+                evicted.1 + file_one / 2 <= evicted.0,
+                "{what}: the raw partition's form file out of the cache: {evicted:?} {file_one}"
+            );
+            inject.set_budget(total);
+            hot_look(&db, std::time::Duration::from_millis(200));
+            let c = db.zpage_counts();
+            if ask {
+                // Asked at the look that decides it, the raw form serving
+                // until the pages are there: the reads still go raw.
+                assert_eq!(
+                    (c.hot_back_asks, c.hot_back, c.hot_raw_now, c.form_files),
+                    (1, 0, 1, partitions - 1),
+                    "{what}: the way back asked: {c:?}"
+                );
+                let before = db.zpage_counts();
+                check(&r, &model, &hot, &format!("{what}: asked, raw"));
+                let after = db.zpage_counts();
+                assert!(
+                    after.rawserves > before.rawserves,
+                    "{what}: read raw while asked: {before:?} {after:?}"
+                );
+                // The pages come by the ask, well inside the wait's ten
+                // looks, and the file is attached with them there.
+                assert!(
+                    hot_until(&db, 8, |c| c.hot_back >= 1),
+                    "{what}: the way back taken: {:?}",
+                    db.zpage_counts()
+                );
+                let c = db.zpage_counts();
+                assert_eq!(
+                    (c.hot_back_asks, c.hot_back_waited),
+                    (1, 0),
+                    "{what}: taken with the pages there: {c:?}"
+                );
+            }
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_back, c.hot_raw_now, c.form_files),
+                (1, 0, partitions),
+                "{what}: the way back: {c:?}"
+            );
+            if !ask {
+                assert_eq!(c.hot_back_asks, 0, "{what}: nothing asked: {c:?}");
+            }
+            check(&r, &model, &hot, &format!("{what}: served again"));
+        } else {
+            inject.set_budget(total * 4);
+            for _ in 0..3 {
+                heat(&db);
+                advance_tick(&db, std::time::Duration::from_millis(200));
+            }
+            wait_steps(&db, 5);
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_raw, c.hot_looks, c.form_files),
+                (0, 0, partitions),
+                "{what}: {c:?}"
+            );
+        }
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Out of core with the form installed, the scans that come back after a
+/// stretch without one have the form files the page cache has lost asked
+/// for whole (`Options::zpages_rewarm_scans`): every form file dropped from
+/// the cache, a second and a half of the injected clock with no scan, then
+/// a scan of one entry, and the look after it asks for each file under the
+/// share resident and the files come back; a scan with no quiet stretch
+/// before it asks for nothing again. Without the option nothing is asked
+/// and the files stay out. The scan that brings the look is of one entry,
+/// so that the scan's own faults are not what brings the files back, and
+/// the writer's, since a handle counts its scans once a commit. With
+/// `Options::zpages_rewarm_trims` the rewarm trims the allocator before it
+/// asks, once a rewarm, and without it asks with no trim.
+#[cfg(target_os = "linux")]
+#[test]
+fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
+    for (on, trims) in [(true, true), (true, false), (false, true)] {
+        let what = format!("rewarm {on} trims {trims}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-rewarm-{on}-{trims}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_rewarm_scans = on;
+                o.zpages_rewarm_trims = trims;
+                o.zpages_hot_raw = false;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        let n = db.zpage_counts().form_files;
+        assert!(n >= 5, "{what}: form files: {:?}", db.zpage_counts());
+        // Every form file out of the cache: this process's mappings of it
+        // unmapped, then its pages dropped.
+        for p in form_files(&dir) {
+            unmap_pages(&p);
+            evict(&p);
+        }
+        let (size, cold) = resident_under(&dir, "zpg-");
+        assert!(
+            cold * 10 < size,
+            "{what}: the form files out of the cache: {cold} of {size}"
+        );
+        // A stretch with no scan, then a scan of one entry.
+        for _ in 0..5 {
+            advance_tick(&db, std::time::Duration::from_millis(300));
+        }
+        let mut one = 0usize;
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        assert_eq!(one, 1, "{what}: the scan");
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        let c = db.zpage_counts();
+        if on {
+            assert_eq!(c.rewarms, 1, "{what}: one rewarm: {c:?}");
+            assert!(
+                c.rewarm_files + 1 >= n,
+                "{what}: every cold file asked for: {c:?}"
+            );
+        } else {
+            assert_eq!((c.rewarms, c.rewarm_files), (0, 0), "{what}: {c:?}");
+        }
+        // The asks land in the cache; without them the files stay out.
+        let t = std::time::Instant::now();
+        let mut warm = resident_under(&dir, "zpg-").1;
+        while on && warm * 10 < size * 9 && t.elapsed().as_secs() < 30 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            warm = resident_under(&dir, "zpg-").1;
+        }
+        if on {
+            assert!(
+                warm * 10 >= size * 9,
+                "{what}: the form files back in the cache: {warm} of {size}"
+            );
+            // The trim runs on the rewarm's thread before its asks, so the
+            // files back in the cache are past it.
+            assert_eq!(
+                db.zpage_counts().rewarm_trims,
+                u64::from(trims),
+                "{what}: the trim before the asks: {:?}",
+                db.zpage_counts()
+            );
+        } else {
+            assert!(
+                warm * 2 < size,
+                "{what}: the form files left out: {warm} of {size}"
+            );
+        }
+        // A scan with no quiet stretch before it asks for nothing more, the
+        // files out of the cache again so that there would be something to
+        // ask for.
+        for p in form_files(&dir) {
+            unmap_pages(&p);
+            evict(&p);
+        }
+        let (size, cold) = resident_under(&dir, "zpg-");
+        assert!(
+            cold * 10 < size,
+            "{what}: the form files out of the cache again: {cold} of {size}"
+        );
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        assert_eq!(
+            db.zpage_counts().rewarms,
+            u64::from(on),
+            "{what}: no rewarm without the quiet: {:?}",
+            db.zpage_counts()
+        );
+        assert_eq!(
+            db.zpage_counts().rewarm_trims,
+            u64::from(on && trims),
+            "{what}: a trim a rewarm: {:?}",
+            db.zpage_counts()
+        );
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The rewarm's two gates, each held to firing: a rewarm due while a merge
+/// is in flight is made at once for the cold form files of the partitions
+/// the merge does not hold (`Options::zpages_rewarm_beside_merges`), and
+/// waits for the merge's landing without the option; and a stretch of
+/// 300 ms of the injected clock with no scan makes one due at a quiet of a
+/// quarter second (`Options::zpages_rewarm_quiet_ms`, as shipped) and not
+/// at a second, which a stretch of 1.6 s does. The merge rewrites the first
+/// partition and is held in flight; every form file is out of the cache
+/// when the scans come back, so a rewarm beside it asks for every file but
+/// that partition's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_rewarm_is_made_beside_a_merge_in_flight_after_a_quarter_second() {
+    let ms = std::time::Duration::from_millis;
+    for (beside, quiet_ms) in [(true, 250u32), (false, 250), (true, 1000), (false, 1000)] {
+        let what = format!("rewarm beside {beside} quiet {quiet_ms}");
+        let (dir, mut db, mut model, inject) = auto_store_with(
+            &format!("auto-rewarm-beside-{beside}-{quiet_ms}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_rewarm_beside_merges = beside;
+                o.zpages_rewarm_quiet_ms = quiet_ms;
+                o.zpages_hot_raw = false;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+                o.l0_trigger = 1;
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        let n = db.zpage_counts().form_files;
+        assert!(n >= 5, "{what}: form files: {:?}", db.zpage_counts());
+        // A merge of the first partition, held in flight: its lowest keys
+        // written again and sealed, the landing planning the merge. The
+        // hold is released on the way out of a failed assertion too, since
+        // the store's drop joins the merge.
+        struct Release<'a>(&'a Db);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.hold_merge_landing(false);
+            }
+        }
+        db.hold_merge_landing(true);
+        let mut rng = Rng(0x5EED);
+        for k in keys.iter().take(50) {
+            let v = suite_value(&mut rng);
+            db.put(k, &v);
+            model.insert(k.clone(), vec![v]);
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        let release = Release(&db);
+        wait_for("a merge of the first partition", || {
+            db.merges_in_flight() >= 1
+        });
+        // A scan the looks have seen, so that the stretch below is
+        // counted from it; then every form file out of the cache.
+        let mut one = 0usize;
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        advance_tick(&db, ms(100));
+        for p in form_files(&dir) {
+            unmap_pages(&p);
+            evict(&p);
+        }
+        let (r0, f0) = (db.zpage_counts().rewarms, db.zpage_counts().rewarm_files);
+        // 300 ms with no scan, then a scan.
+        advance_tick(&db, ms(200));
+        advance_tick(&db, ms(200));
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        advance_tick(&db, ms(100));
+        advance_tick(&db, ms(100));
+        let c = db.zpage_counts();
+        let quick = quiet_ms <= 300;
+        if quick && beside {
+            assert_eq!(
+                c.rewarms - r0,
+                1,
+                "{what}: a rewarm beside the merge: {c:?}"
+            );
+            let asked = c.rewarm_files - f0;
+            assert!(
+                asked + 2 >= n && asked < n,
+                "{what}: every cold file but the merge's, of {n}: {c:?}"
+            );
+        } else {
+            assert_eq!(c.rewarms, r0, "{what}: no rewarm yet: {c:?}");
+        }
+        // 1.6 s with no scan, then a scan: due under either quiet, made
+        // beside the merge where the option says so.
+        for _ in 0..8 {
+            advance_tick(&db, ms(200));
+        }
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        advance_tick(&db, ms(100));
+        advance_tick(&db, ms(100));
+        // A rewarm made at the quarter second may be followed by one for
+        // files its asks had not brought in by this look.
+        let c = db.zpage_counts();
+        if beside {
+            assert!(
+                c.rewarms - r0 >= 1,
+                "{what}: beside the merge after a second: {c:?}"
+            );
+        } else {
+            assert_eq!(c.rewarms, r0, "{what}: waiting for the merge: {c:?}");
+        }
+        assert!(db.merges_in_flight() >= 1, "{what}: the merge still held");
+        // The merge lands; a rewarm waiting for it is made at the next look.
+        db.hold_merge_landing(false);
+        wait_for("the merge's landing", || db.merges_in_flight() == 0);
+        advance_tick(&db, ms(100));
+        advance_tick(&db, ms(100));
+        let c = db.zpage_counts();
+        if beside {
+            assert!(c.rewarms - r0 >= 1, "{what}: {c:?}");
+        } else {
+            assert_eq!(
+                c.rewarms - r0,
+                1,
+                "{what}: the rewarm made at the merge's landing: {c:?}"
+            );
+        }
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(release);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Under the controller with the hot-raw policy and the skew read over the
+/// window's looks (`Options::zpages_hot_raw_slack`), a partition read under
+/// the sample floor at every look but steadily across the window's looks is
+/// rated on their sum and released; without the option each look's own
+/// count is under the floor, and the same reads release nothing. Every read
+/// answers as the raw form does across the move.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_hot_raw_policy_rates_a_partitions_skew_over_the_windows_looks() {
+    for on in [true, false] {
+        let what = format!("hot raw window {on}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-hotwindow-{on}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_hot_raw = true;
+                o.zpages_hot_raw_slack = on;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        let c = db.zpage_counts();
+        assert!(
+            c.form_files >= 5,
+            "{what}: partitions to choose from: {c:?}"
+        );
+        let (partitions, total) = (c.partitions, c.file_bytes);
+        // Room by every measure: the budget four times the files, the
+        // group's unused memory as much.
+        inject.set_budget(total * 4);
+        inject.set_slack(total * 4);
+        let hot = keys_of_partition(&db, &model, 2);
+        // Reads a look of half the floor's events, one decode a read with
+        // the memo off and one event in sixteen sampled: under the floor
+        // alone, over it summed across two looks and more.
+        let per_look = usize::try_from(supdb::db::HOT_RAW_MIN_SAMPLES).unwrap() * 16 / 2;
+        for _ in 0..supdb::db::HOT_RAW_WINDOW {
+            heat_up(&db, &hot, per_look);
+            hot_look(&db, std::time::Duration::from_millis(200));
+        }
+        let c = db.zpage_counts();
+        if on {
+            assert!(
+                c.hot_asks >= 1,
+                "{what}: the thin looks summed past the floor: {c:?}"
+            );
+            assert!(
+                hot_until(&db, 10, |c| c.hot_raw >= 1),
+                "{what}: the partition released: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_raw, c.hot_raw_now, c.form_files),
+                (1, 1, partitions - 1),
+                "{what}: released on the window's count: {c:?}"
+            );
+            let before = db.zpage_counts();
+            check(&r, &model, &hot, &format!("{what}: released, raw"));
+            let after = db.zpage_counts();
+            assert!(
+                after.rawserves > before.rawserves,
+                "{what}: the released partition read raw: {before:?} {after:?}"
+            );
+        } else {
+            assert_eq!(
+                (c.hot_asks, c.hot_raw, c.hot_raw_now, c.form_files),
+                (0, 0, 0, partitions),
+                "{what}: every look under the floor on its own: {c:?}"
+            );
+        }
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Under `Options::zpages_hot_raw_evidence` a partition's skew is read
+/// over the shortest run of the latest looks whose sampled events reach
+/// the floor: a burst that passes the floor in one look is rated on that
+/// look, where the window of `HOT_RAW_WINDOW` looks averaged it with the
+/// looks before it. Every partition read alike for a window, half the
+/// floor's events a look each, and then one look of four times that on one
+/// of them: over the window it reads 1.375 times the median, under the
+/// bar, and over the look that passes the floor four times the median's
+/// rate a look, over it.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_hot_raw_policy_rates_a_burst_on_the_looks_that_pass_the_floor() {
+    for on in [true, false] {
+        let what = format!("hot raw evidence {on}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-hotevidence-{on}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_hot_raw = true;
+                o.zpages_hot_raw_slack = true;
+                o.zpages_hot_raw_evidence = on;
+                o.zpages_hot_fill = false;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        let c = db.zpage_counts();
+        assert!(
+            c.form_files >= 5,
+            "{what}: partitions to choose from: {c:?}"
+        );
+        let (partitions, total) = (c.partitions, c.file_bytes);
+        inject.set_budget(total * 4);
+        inject.set_slack(total * 4);
+        let parts: Vec<Vec<Vec<u8>>> = (0..partitions as usize)
+            .map(|i| keys_of_partition(&db, &model, i))
+            .collect();
+        // Half the floor's sampled events a look on the mean partition,
+        // every partition read alike a key: one decode a read with the
+        // memo off, one event in sixteen sampled.
+        let half = usize::try_from(supdb::db::HOT_RAW_MIN_SAMPLES).unwrap() * 16 / 2;
+        let mean = parts.iter().map(Vec::len).sum::<usize>() / parts.len();
+        let alike = |p: &Vec<Vec<u8>>| half * p.len() / mean;
+        for _ in 0..supdb::db::HOT_RAW_WINDOW {
+            for p in &parts {
+                heat_up(&db, p, alike(p));
+            }
+            hot_look(&db, std::time::Duration::from_millis(200));
+        }
+        let c = db.zpage_counts();
+        assert_eq!(c.hot_asks, 0, "{what}: read alike, nothing asked: {c:?}");
+        for (i, p) in parts.iter().enumerate() {
+            heat_up(&db, p, if i == 2 { 4 * alike(p) } else { alike(p) });
+        }
+        hot_look(&db, std::time::Duration::from_millis(200));
+        let c = db.zpage_counts();
+        if on {
+            assert_eq!(c.hot_asks, 1, "{what}: the burst rated on its look: {c:?}");
+            assert!(
+                hot_until(&db, 10, |c| c.hot_raw >= 1),
+                "{what}: the partition released: {:?}",
+                db.zpage_counts()
+            );
+        } else {
+            assert_eq!(
+                (c.hot_asks, c.hot_raw),
+                (0, 0),
+                "{what}: the burst averaged under the bar: {c:?}"
+            );
+        }
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A raw partition's scans count toward its heat as the groups the form
+/// file's walk of them would open, not one a scan (`Seg::hot_scan`): the
+/// policy holds a raw partition's reads against the form files' opens, so
+/// a hundred scans of a hundred records count several times what a hundred
+/// point reads do. Without the weighting a raw partition under scans read
+/// colder than the partitions beside it it had been released for being
+/// hotter than.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_raw_partitions_scans_count_the_groups_a_form_walk_would_open() {
+    let (dir, db, model, inject) = auto_store_with(
+        "auto-hotscanweight",
+        1 << 20,
+        1_000_000.0,
+        FAULT_1MS,
+        |o| {
+            o.zpages_hot_raw = true;
+            o.zpages_hot_raw_slack = true;
+            o.zpages_hot_cold_back = false;
+            o.zpages_memo = false;
+            o.partition_bytes = Some(400 << 10);
+        },
+        |_| {},
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+        "COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    assert!(
+        tick_until(&db, 400, |c| c.attached >= c.partitions
+            && c.warms >= c.partitions),
+        "every file attached and warmed: {:?}",
+        db.zpage_counts()
+    );
+    inject.set_decode_cost(std::time::Duration::from_micros(10));
+    let total = db.zpage_counts().file_bytes;
+    inject.set_budget(total * 4);
+    inject.set_slack(total * 4);
+    let base = usize::try_from(supdb::db::HOT_RAW_MIN_SAMPLES).unwrap() * 16;
+    let hot = keys_of_partition(&db, &model, 2);
+    let others: Vec<Vec<Vec<u8>>> = [1, 3, 4]
+        .iter()
+        .map(|&i| keys_of_partition(&db, &model, i))
+        .collect();
+    for _ in 0..3 {
+        for o in &others {
+            heat_up(&db, o, base);
+        }
+        heat_up(&db, &hot, base * 4);
+        hot_look(&db, std::time::Duration::from_millis(200));
+    }
+    assert!(
+        hot_until(&db, 10, |c| c.hot_raw_now >= 1),
+        "the hot partition released: {:?}",
+        db.zpage_counts()
+    );
+    let heat = |db: &Db| db.zpage_raw_heat().iter().map(|(_, n)| n).sum::<u64>();
+    let h0 = heat(&db);
+    for i in 0..160 {
+        let k = &hot[i % hot.len()];
+        assert_eq!(read_vec(&db, k).len(), 1, "a key reads back");
+    }
+    let h1 = heat(&db);
+    let span = hot.len().saturating_sub(100).max(1);
+    for i in 0..160 {
+        let k = &hot[(i * 37) % span];
+        let mut n = 0usize;
+        r.scan(k, 100, |_k, _v| n += 1).unwrap();
+        assert_eq!(n, 100, "a scan of the raw partition reads its window");
+    }
+    let h2 = heat(&db);
+    let (reads, scans) = (h1 - h0, h2 - h1);
+    assert!(reads > 0, "the point reads counted: {reads}");
+    assert!(
+        scans >= 3 * reads,
+        "a scan of a hundred records counts its groups: {scans} for the scans, {reads} for the reads"
+    );
+    check(&r, &model, &keys, "after");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Under the controller with the hot-raw policy and room by every measure, a
+/// partition released for its skew and then read less than the others
+/// goes back to its form file with the cold way back
+/// (`Options::zpages_hot_cold_back`), with no pressure to send it, and stays
+/// raw without it. Every read answers as the raw form does across both
+/// moves.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_raw_partition_read_no_more_than_the_median_goes_back_to_its_form() {
+    for on in [true, false] {
+        let what = format!("hot raw cold back {on}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-hotcold-{on}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_hot_raw = true;
+                o.zpages_hot_raw_slack = true;
+                o.zpages_hot_cold_back = on;
+                // The fill off: with the room ample it releases every
+                // partition, and this is the skew's rule and its way back.
+                o.zpages_hot_fill = false;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        let c = db.zpage_counts();
+        assert!(
+            c.form_files >= 5,
+            "{what}: partitions to choose from: {c:?}"
+        );
+        let (partitions, total) = (c.partitions, c.file_bytes);
+        inject.set_budget(total * 4);
+        inject.set_slack(total * 4);
+        let base = usize::try_from(supdb::db::HOT_RAW_MIN_SAMPLES).unwrap() * 16;
+        let hot = keys_of_partition(&db, &model, 2);
+        let others: Vec<Vec<Vec<u8>>> = [1, 3, 4]
+            .iter()
+            .map(|&i| keys_of_partition(&db, &model, i))
+            .collect();
+        // Every partition but the hot one, taken while every partition has
+        // its form file: the heat lists the served ones alone.
+        let rest: Vec<Vec<Vec<u8>>> = (0..usize::try_from(partitions).unwrap())
+            .filter(|&i| i != 2)
+            .map(|i| keys_of_partition(&db, &model, i))
+            .collect();
+        // Released: partition 2 read four times the others.
+        for _ in 0..3 {
+            for o in &others {
+                heat_up(&db, o, base);
+            }
+            heat_up(&db, &hot, base * 4);
+            hot_look(&db, std::time::Duration::from_millis(200));
+        }
+        assert!(
+            hot_until(&db, 10, |c| c.hot_raw_now >= 1),
+            "{what}: the hot partition released: {:?}",
+            db.zpage_counts()
+        );
+        check(&r, &model, &hot, &format!("{what}: released, raw"));
+        // Then every other partition read alike and this one a quarter as
+        // much, a window's worth of looks: its reads a key fall under the
+        // median's, the room still ample, and no other partition is skewed
+        // enough to be asked for.
+        let backs0 = db.zpage_counts().hot_back;
+        for _ in 0..(supdb::db::HOT_RAW_WINDOW + 4) {
+            for o in &rest {
+                heat_up(&db, o, base);
+            }
+            heat_up(&db, &hot, base / 4);
+            hot_look(&db, std::time::Duration::from_millis(200));
+        }
+        let c = db.zpage_counts();
+        if on {
+            assert!(
+                c.hot_back > backs0 && c.hot_raw_now == 0,
+                "{what}: gone back with the room ample: {c:?}"
+            );
+            assert!(
+                tick_until(&db, 400, |c| c.attached >= partitions),
+                "{what}: every file attached again: {:?}",
+                db.zpage_counts()
+            );
+        } else {
+            assert_eq!(
+                (c.hot_back - backs0, c.hot_raw_now),
+                (0, 1),
+                "{what}: raw until the fill: {c:?}"
+            );
+        }
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Under the controller with the hot-raw policy and room by every measure,
+/// the partition read most a key -- a third over the median partition's
+/// reads a key, three others read as the median is -- is asked for and
+/// released with the skew bar read against the room
+/// (`Options::zpages_hot_skew_room`), and held cold by the bar without it,
+/// since a third over is short of `HOT_RAW_SKEW`. Every read answers as the
+/// raw form does across the move.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_hot_raw_policy_relaxes_its_skew_bar_where_the_candidate_fits_the_room() {
+    for on in [true, false] {
+        let what = format!("hot raw skew by room {on}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-hotskew-{on}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_hot_raw = true;
+                o.zpages_hot_raw_slack = true;
+                o.zpages_hot_skew_room = on;
+                // The fill off: it releases into the room whatever the
+                // skew, and this is the skew's bar.
+                o.zpages_hot_fill = false;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        let c = db.zpage_counts();
+        assert!(
+            c.form_files >= 5,
+            "{what}: partitions to choose from: {c:?}"
+        );
+        let (partitions, total) = (c.partitions, c.file_bytes);
+        inject.set_budget(total * 4);
+        inject.set_slack(total * 4);
+        // Four partitions read every look, past the floor each; the
+        // second a third more than the other three, so the median is theirs
+        // and its skew over it is a third.
+        let base = usize::try_from(supdb::db::HOT_RAW_MIN_SAMPLES).unwrap() * 16;
+        let hot = keys_of_partition(&db, &model, 2);
+        let others: Vec<Vec<Vec<u8>>> = [1, 3, 4]
+            .iter()
+            .map(|&i| keys_of_partition(&db, &model, i))
+            .collect();
+        for _ in 0..3 {
+            for o in &others {
+                heat_up(&db, o, base);
+            }
+            heat_up(&db, &hot, base * 4 / 3);
+            hot_look(&db, std::time::Duration::from_millis(200));
+        }
+        let c = db.zpage_counts();
+        if on {
+            assert!(
+                c.hot_asks >= 1,
+                "{what}: a third over the median, fitting the room, asked for: {c:?}"
+            );
+            assert!(
+                hot_until(&db, 10, |c| c.hot_raw >= 1),
+                "{what}: the partition released: {:?}",
+                db.zpage_counts()
+            );
+            let before = db.zpage_counts();
+            assert_eq!(
+                (before.hot_raw_now, before.form_files),
+                (1, partitions - 1),
+                "{what}: one partition raw: {before:?}"
+            );
+            check(&r, &model, &hot, &format!("{what}: released, raw"));
+            let after = db.zpage_counts();
+            assert!(
+                after.rawserves > before.rawserves,
+                "{what}: the released partition read raw: {before:?} {after:?}"
+            );
+        } else {
+            assert_eq!(
+                (c.hot_asks, c.hot_raw, c.form_files),
+                (0, 0, partitions),
+                "{what}: a third over the median is under the bar: {c:?}"
+            );
+        }
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Under the hot-raw policy's fill (`Options::zpages_hot_fill`), partitions
+/// read alike -- none over the median, so the skew releases none -- are
+/// released into the room the group leaves: the first look that rates them
+/// asks for as many as the room holds at once, the raw bytes of each not
+/// resident counted against it, and they are released as their pages come
+/// in, though at no look after a write; the room gone sends one back, and
+/// with the room full a partition read far over the median makes the
+/// coldest raw one give way. Without the option the same reads
+/// release nothing. Every read answers as the raw form does across each
+/// move.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_hot_raw_fill_releases_partitions_read_alike_into_the_room_and_gives_them_back() {
+    for on in [true, false] {
+        let what = format!("hot raw fill {on}");
+        let (dir, mut db, model, inject) = auto_store_with(
+            &format!("auto-hotfill-{on}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_hot_raw = true;
+                o.zpages_hot_raw_slack = true;
+                o.zpages_hot_fill = on;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        // The group's refaults pinned under the pressure line, so that the
+        // fill's feedback reads the seam's and not the machine's.
+        inject.set_refault_rate(0.0);
+        let c = db.zpage_counts();
+        assert!(
+            c.form_files >= 5,
+            "{what}: partitions to choose from: {c:?}"
+        );
+        let (partitions, total) = (c.partitions, c.file_bytes);
+        let raw_one = (c.model_record_bytes + c.model_hash_bytes) / partitions;
+        // The raw partitions out of the cache, so that each ask's bytes are
+        // the room's to find.
+        let segs: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("par-") && n.ends_with(".sup"))
+            })
+            .collect();
+        assert!(segs.len() >= partitions as usize, "{what}: {segs:?}");
+        for p in &segs {
+            unmap_pages(p);
+            evict(p);
+        }
+        // Room for two and a half partitions' raw bytes over the growth
+        // share and the one the fill leaves for skewed reads.
+        let budget = total * 4;
+        let growth = budget / 10;
+        let raw_max = raw_one * 5 / 4;
+        inject.set_budget(budget);
+        inject.set_slack(growth + raw_max + raw_one * 5 / 2);
+        let base = usize::try_from(supdb::db::HOT_RAW_MIN_SAMPLES).unwrap() * 16;
+        let parts: Vec<Vec<Vec<u8>>> = (0..partitions as usize)
+            .map(|i| keys_of_partition(&db, &model, i))
+            .collect();
+        let los: Vec<Vec<u8>> = db.zpage_heat().iter().map(|h| h.lo.clone()).collect();
+        let heat_all = |db: &Db| {
+            for p in &parts {
+                heat_up(db, p, base);
+            }
+        };
+        // A write committed between every look: the store is not quiet, and
+        // partitions read alike are asked for at none of them.
+        if on {
+            for i in 0..4 {
+                heat_all(&db);
+                db.append(format!("zz-fill-{i}").as_bytes(), b"v");
+                db.commit().unwrap();
+                hot_look(&db, std::time::Duration::from_millis(200));
+            }
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_asks, c.hot_raw),
+                (0, 0),
+                "{what}: a look after a write fills nothing: {c:?}"
+            );
+        }
+        let mut first = None;
+        for _ in 0..4 {
+            heat_all(&db);
+            let before = db.zpage_counts().hot_asks;
+            hot_look(&db, std::time::Duration::from_millis(200));
+            let asks = db.zpage_counts().hot_asks - before;
+            if asks > 0 && first.is_none() {
+                first = Some(asks);
+            }
+        }
+        if !on {
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_asks, c.hot_raw, c.form_files),
+                (0, 0, partitions),
+                "{what}: partitions read alike are under the bar: {c:?}"
+            );
+            check(&r, &model, &keys, &format!("{what}: after"));
+            drop(r);
+            db.close().unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            continue;
+        }
+        assert_eq!(
+            first,
+            Some(2),
+            "{what}: the first look asks for the two the room holds: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            hot_until(&db, 20, |c| c.hot_raw >= 2),
+            "{what}: both released: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        assert!(
+            c.hot_raw_now >= 2 && c.form_files <= partitions - 2,
+            "{what}: two or more raw: {c:?}"
+        );
+        check(&r, &model, &keys, &format!("{what}: released"));
+        // The room gone: one goes back at the look, and the room again
+        // holds the rest.
+        let backs = c.hot_back_asks + c.hot_back;
+        inject.set_slack(growth / 2);
+        heat_all(&db);
+        hot_look(&db, std::time::Duration::from_millis(200));
+        let c = db.zpage_counts();
+        assert!(
+            c.hot_back_asks + c.hot_back > backs,
+            "{what}: the room gone sends one back: {c:?}"
+        );
+        inject.set_slack(growth + raw_max + raw_one * 5 / 2);
+        assert!(
+            hot_until(&db, 40, |c| c.hot_back >= 1),
+            "{what}: the way back taken: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            db.zpage_counts().hot_raw_now >= 1,
+            "{what}: one raw left: {:?}",
+            db.zpage_counts()
+        );
+        check(&r, &model, &keys, &format!("{what}: one back"));
+        // One partition read far over the rest, with the room full: the raw
+        // one read least makes way for it, and it is asked for once the way
+        // back frees the room.
+        inject.set_slack(growth + raw_one / 4);
+        let served: Vec<Vec<u8>> = db.zpage_heat().iter().map(|h| h.lo.clone()).collect();
+        let i = los.iter().position(|lo| served.contains(lo)).unwrap();
+        let hot = &parts[i];
+        let raw_before = db.zpage_counts().hot_back;
+        for _ in 0..6 {
+            heat_up(&db, hot, base * 8);
+            hot_look(&db, std::time::Duration::from_millis(200));
+        }
+        assert!(
+            hot_until(&db, 20, |c| c.hot_back > raw_before),
+            "{what}: a skewed partition makes way for itself: {:?}",
+            db.zpage_counts()
+        );
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Under the controller with the hot-raw policy and the release's room read
+/// from the group's unused memory (`Options::zpages_hot_raw_slack`), the
+/// hottest partition is released where its raw bytes fit in that room,
+/// though the form files and the raw partitions together would stand past
+/// the policy's line of the budget, and not where the room is short of them;
+/// the fill share the way back is taken at still bounds a release, so a
+/// second that would cross it is not asked for, and the way back is as it
+/// was. Without the option the same room releases nothing past the line.
+/// Every read and scan answers as the raw form does across each move.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_hot_raw_policy_releases_into_the_groups_unused_memory_where_the_line_would_not() {
+    for on in [true, false] {
+        let what = format!("hot raw slack {on}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-hotslack-{on}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_hot_raw = true;
+                o.zpages_hot_raw_slack = on;
+                // The fill off: it fills whatever room there is, and this
+                // is the skew's release counted into the room.
+                o.zpages_hot_fill = false;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        let c = db.zpage_counts();
+        assert!(
+            c.form_files >= 5,
+            "{what}: partitions to choose from: {c:?}"
+        );
+        assert_eq!(
+            c.form_files, c.partitions,
+            "{what}: every partition served: {c:?}"
+        );
+        let (partitions, total) = (c.partitions, c.file_bytes);
+        let file_one = total / partitions;
+        let raw_one = (c.model_record_bytes + c.model_hash_bytes) / partitions;
+        assert!(
+            raw_one > file_one,
+            "{what}: the raw form over the file: {c:?}"
+        );
+        let d = raw_one - file_one;
+        // A budget whose fill share holds the files and a release and a
+        // half, and whose line does not hold one release: the release
+        // crosses the line and stays under the fill.
+        let budget = (total + d * 3 / 2) * 100 / 85;
+        assert!(
+            total + d > budget * 75 / 100,
+            "{what}: one release crosses the line: total {total} d {d} budget {budget}"
+        );
+        inject.set_budget(budget);
+        let growth = (budget as f64 * supdb::db::HOT_RAW_GROWTH) as u64;
+        let hot = keys_of_partition(&db, &model, 2);
+        let heat = |db: &Db| heat_up(db, &hot, 100_000);
+        // The room short of a partition's raw bytes: nothing asked, under
+        // the line as under the room.
+        inject.set_slack(raw_one / 2 + growth);
+        for _ in 0..3 {
+            heat(&db);
+            hot_look(&db, std::time::Duration::from_millis(200));
+        }
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.hot_asks, c.hot_raw, c.hot_raw_now),
+            (0, 0, 0),
+            "{what}: short of room: {c:?}"
+        );
+        // Room for a partition's raw bytes and half another's.
+        inject.set_slack(raw_one * 3 / 2 + growth);
+        heat(&db);
+        hot_look(&db, std::time::Duration::from_millis(200));
+        if on {
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_asks, c.hot_raw, c.form_files),
+                (1, 0, partitions),
+                "{what}: asked into the room, still served: {c:?}"
+            );
+            assert!(
+                hot_until(&db, 10, |c| c.hot_raw >= 1),
+                "{what}: the hot partition released: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert_eq!(
+                (
+                    c.hot_asks,
+                    c.hot_dropped,
+                    c.hot_raw,
+                    c.hot_raw_now,
+                    c.form_files
+                ),
+                (1, 0, 1, 1, partitions - 1),
+                "{what}: the hot partition released past the line: {c:?}"
+            );
+            let before = db.zpage_counts();
+            check(&r, &model, &hot, &format!("{what}: released, raw"));
+            let after = db.zpage_counts();
+            assert!(
+                after.rawserves > before.rawserves,
+                "{what}: the released partition read raw: {before:?} {after:?}"
+            );
+            check_scan(&r, &model, &format!("{what}: scans across a raw partition"));
+            // The room holds another partition's raw bytes, and a second
+            // release would cross the fill share: nothing more moves.
+            heat(&db);
+            hot_look(&db, std::time::Duration::from_millis(200));
+            hot_look(&db, std::time::Duration::from_millis(200));
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_asks, c.hot_raw, c.hot_back, c.hot_raw_now),
+                (1, 1, 0, 1),
+                "{what}: one released and nothing more: {c:?}"
+            );
+            // The budget under the files and the raw partition past the
+            // fill share: the way back as before, its form file's pages
+            // asked at the look that decides it and the file attached at a
+            // look after (`Options::zpages_hot_back_ask`).
+            inject.set_budget(total);
+            hot_look(&db, std::time::Duration::from_millis(200));
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_back_asks, c.hot_back),
+                (1, 0),
+                "{what}: the way back asked: {c:?}"
+            );
+            assert!(
+                hot_until(&db, 8, |c| c.hot_back >= 1),
+                "{what}: the way back taken: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_back, c.hot_raw_now, c.form_files),
+                (1, 0, partitions),
+                "{what}: the way back: {c:?}"
+            );
+            check(&r, &model, &hot, &format!("{what}: served again"));
+        } else {
+            for _ in 0..3 {
+                heat(&db);
+                hot_look(&db, std::time::Duration::from_millis(200));
+            }
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_asks, c.hot_raw, c.hot_raw_now, c.form_files),
+                (0, 0, 0, partitions),
+                "{what}: the line refuses the release the room would take: {c:?}"
+            );
+        }
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Under the controller with the re-parse (`Options::zpages_reparse`), once
+/// the form is installed, the block-coded partition whose decodes cost the
+/// most is built again by the parsing encoder and swapped in -- its form
+/// file smaller, as only the parse makes it, its coding the same -- once
+/// while its segment lives, and a partition under its share of the decode
+/// time is left as it was; every read answers as the raw form does across
+/// the swap. Without the option nothing is re-parsed however hot a
+/// partition reads.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_controller_reparses_the_hottest_partition_once() {
+    for on in [true, false] {
+        let what = format!("reparse {on}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-reparse-{on}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_reparse = on;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        // A decode priced by the seam, so that the heat is the decodes: at
+        // twenty microseconds the warm partition's thousand reads a look are
+        // past the floor and a hundredth of the hot one's, under its share
+        // through the heat's average, which lags the rates, and through the
+        // look after the swap, when the hot partition's new file gives no
+        // rate yet.
+        inject.set_decode_cost(std::time::Duration::from_micros(20));
+        inject.set_budget(db.zpage_counts().file_bytes * 2);
+        assert!(
+            codings(&db).iter().all(|c| !c),
+            "{what}: built in the block coding: {:?}",
+            codings(&db)
+        );
+        assert!(
+            db.zpage_counts().form_files >= 5,
+            "{what}: partitions to choose from: {:?}",
+            db.zpage_counts()
+        );
+        let bytes =
+            |db: &Db| -> Vec<u64> { db.zpage_heat().iter().map(|h| h.file_bytes).collect() };
+        let before = bytes(&db);
+        let hot = keys_of_partition(&db, &model, 2);
+        let warm = keys_of_partition(&db, &model, 4);
+        let heat = |db: &Db| {
+            heat_up(db, &hot, 100_000);
+            heat_up(db, &warm, 1_000);
+        };
+        if on {
+            recode_look(&db, std::time::Duration::from_secs(1));
+            heat(&db);
+            recode_look(&db, std::time::Duration::from_secs(1));
+            assert!(
+                tick_until(&db, 400, |c| c.reparses >= 1),
+                "{what}: the hot partition re-parsed: {:?} {:?}",
+                db.zpage_counts(),
+                db.zpage_heat()
+            );
+            let after = bytes(&db);
+            assert!(
+                after[2] < before[2],
+                "{what}: the parse's smaller file: {before:?} -> {after:?}"
+            );
+            for (i, (a, b)) in after.iter().zip(&before).enumerate() {
+                if i != 2 {
+                    assert_eq!(a, b, "{what}: partition {i} as it was");
+                }
+            }
+            assert!(
+                codings(&db).iter().all(|c| !c),
+                "{what}: still block-coded: {:?}",
+                codings(&db)
+            );
+            // The hot one again and the warm one under its share: more
+            // looks re-parse nothing. The reads are checked after them,
+            // since a read of every key is a heat of its own.
+            for _ in 0..3 {
+                heat(&db);
+                recode_look(&db, std::time::Duration::from_secs(1));
+            }
+            wait_steps(&db, 5);
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.reparses, c.recodes, c.recodes_back),
+                (1, 0, 0),
+                "{what}: {c:?}"
+            );
+            assert_eq!(bytes(&db), after, "{what}: nothing built again");
+        } else {
+            for _ in 0..3 {
+                heat(&db);
+                advance_tick(&db, std::time::Duration::from_secs(1));
+            }
+            wait_steps(&db, 5);
+            let c = db.zpage_counts();
+            assert_eq!((c.reparses, c.recode_looks), (0, 0), "{what}: {c:?}");
+            assert_eq!(bytes(&db), before, "{what}: nothing built again");
+        }
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// A forced store whose served partitions the re-code policy re-codes, the
 /// raw pages dropped and every read decoding (no memo), its budget and its
 /// refaults the seam's: loaded, settled, and looked at once.
@@ -9373,6 +13048,9 @@ fn recode_store_with(
         forced(|o| {
             o.partition_bytes = Some(160 << 10);
             o.zpages_drop_raw = true;
+            // The re-code moves the block body between its codings and is
+            // refused beside the stride form (`check_options`).
+            o.zpages_stride = ZStride::Off;
             o.zpages_recode = true;
             o.zpages_memo = false;
             o.zpages_inject = Some(inject.clone());
@@ -9548,6 +13226,7 @@ fn a_kept_form_file_makes_every_later_recode_an_exchange() {
         forced(|o| {
             o.partition_bytes = Some(160 << 10);
             o.zpages_drop_raw = true;
+            o.zpages_stride = ZStride::Off;
             o.zpages_recode = true;
             o.zpages_recode_keep = true;
             o.zpages_memo = false;
@@ -10075,4 +13754,6304 @@ fn a_form_the_parsing_encoder_wrote_answers_as_the_greedy_ones_in_fewer_bytes() 
         bytes[1] < bytes[0],
         "the parsing encoder's form is the smaller: {bytes:?}"
     );
+}
+
+/// The census window's busy wall is taken from one operation in sixteen
+/// once a window is a thousand operations long
+/// (`Options::zpages_census_sample`), and from every operation of a
+/// shorter window or with the option off. A window closed by its count
+/// has its reads' wall alone, so the window after it is a hundred
+/// milliseconds of reads, tens of thousands through the compact form of a
+/// small store, whatever length the drive to COMPACT left; three windows
+/// closed through the ticks after it then stamp one read in sixteen with
+/// the option and every read without, and the busy wall a read, scaled
+/// from the stamps, is within a factor of four of the wall every stamp
+/// gives, since a wall left unscaled would be a sixteenth of it.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_census_stamps_a_long_windows_wall_on_one_operation_in_sixteen() {
+    let mut per_read = [0.0f64; 2];
+    for (i, on) in [true, false].into_iter().enumerate() {
+        let what = format!("census sample {on}");
+        let (dir, db, _model, inject, r, keys, mut at) =
+            compact_store_with(&format!("census-sample-{on}"), 1 << 20, |o| {
+                o.zpages_census_sample = on;
+            });
+        // The seam's price of a fault cleared, so a window's busy wall is
+        // the stamps' own and not the faults'; no faults are injected.
+        inject
+            .fault_cost_ns
+            .store(0, std::sync::atomic::Ordering::Release);
+        // A window closed by its count, which sizes the next at a hundred
+        // milliseconds of these reads.
+        let was = db.zpage_counts().census_windows;
+        let mut n = 0usize;
+        while db.zpage_counts().census_windows == was {
+            reads(&r, &keys, &inject, 4096, &mut at, 0);
+            n += 4096;
+            assert!(
+                n <= 4 << 20,
+                "{what}: a window closed by its count within four million reads: {:?}",
+                db.zpage_counts()
+            );
+        }
+        // Three windows closed through the ticks, each over a stretch of
+        // reads: each window's reads, its stamps and its busy wall.
+        let mut windows: Vec<(u64, u64, u64)> = Vec::new();
+        for _ in 0..3 {
+            let b = db.zpage_counts();
+            reads(&r, &keys, &inject, 1024, &mut at, 0);
+            close_window(&db, &r, &keys[0]);
+            let c = db.zpage_counts();
+            let (dw, dr, ds, dbusy) = (
+                c.census_windows - b.census_windows,
+                c.census_reads - b.census_reads,
+                c.census_stamped - b.census_stamped,
+                c.census_busy_ns - b.census_busy_ns,
+            );
+            assert!(
+                dw >= 1 && dr >= 1024 && dbusy > 0,
+                "{what}: a window closed through the ticks: {c:?}"
+            );
+            windows.push((dr, ds, dbusy));
+        }
+        let (reads_n, stamped, busy) = windows
+            .iter()
+            .fold((0, 0, 0), |a, w| (a.0 + w.0, a.1 + w.1, a.2 + w.2));
+        if on {
+            for &(dr, ds, _) in &windows {
+                assert!(
+                    ds >= 1 && ds * 8 <= dr,
+                    "{what}: one read in sixteen stamped: {ds} of {dr}; {windows:?}"
+                );
+            }
+        } else {
+            assert_eq!(stamped, reads_n, "{what}: every read stamped: {windows:?}");
+        }
+        per_read[i] = busy as f64 / reads_n as f64;
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let ratio = per_read[0] / per_read[1];
+    assert!(
+        (0.25..=4.0).contains(&ratio),
+        "the scaled busy wall a read against every read stamped: {:.0} ns against {:.0} ns",
+        per_read[0],
+        per_read[1]
+    );
+}
+
+/// A scan over a covered partition's blocks that no walk of the handle's
+/// has built is one dispatch into the form file with the clean run
+/// building the blocks it reaches (`Options::scan_run_builds`), and a
+/// dispatch a block without. A partition with no unsealed key over it
+/// takes the bulk walk, one dispatch either way, so a few of the lowest
+/// keys are written first, far below the scan, as the write mixes leave
+/// a few in every cold partition; a fresh handle, whose table holds no
+/// form, then scans four blocks and a bit from a key in the middle, and
+/// the form's scan count moves by one with the option and by at least
+/// four without. The handle builds its own table here (`commit_forms`
+/// off), since a canonical table complete at the handle's commit reads
+/// every null form as clean already.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_scan_over_unvisited_clean_blocks_is_one_dispatch_into_the_form() {
+    for on in [true, false] {
+        let what = format!("run builds {on}");
+        let (dir, mut db, model, _inject, r, keys, _at) =
+            compact_store_with(&format!("run-builds-{on}"), 1 << 20, |o| {
+                o.scan_run_builds = on;
+                o.commit_forms = false;
+                // A cursor a block (`Options::zpages_scan_cursor` off), so
+                // the dispatches count the runs; held across the scan, one
+                // placement is the count whatever the run does.
+                o.zpages_scan_cursor = false;
+            });
+        drop(r);
+        for k in &keys[..3] {
+            db.append(k, &model[k][0]);
+        }
+        db.commit().unwrap();
+        let r = db.reader().unwrap();
+        let want = 4 * 64 + 10;
+        let start = keys.len() / 2;
+        assert!(
+            start + want < keys.len(),
+            "{what}: keys enough: {}",
+            keys.len()
+        );
+        let before = db.zpage_counts();
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let n = r
+            .scan(&keys[start], want, |k, _v| got.push(k.to_vec()))
+            .unwrap();
+        let c = db.zpage_counts();
+        assert_eq!(n, want, "{what}: the scan's entries");
+        assert_eq!(
+            got,
+            keys[start..start + want].to_vec(),
+            "{what}: the keys in order"
+        );
+        let dispatches = c.scans - before.scans;
+        if on {
+            assert_eq!(dispatches, 1, "{what}: one dispatch for the run: {c:?}");
+        } else {
+            assert!(dispatches >= 4, "{what}: a dispatch a block: {dispatches}");
+        }
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A block-path scan's cursor over a covered partition holds the page's view
+/// across the page's groups (`Options::zpages_cursor_view`) and asks for
+/// the next group's lines at each open (`Options::zpages_group_ahead`): a
+/// scan of four blocks and a bit through a fresh handle builds fewer views
+/// than the groups it decodes with the first option and at least one a
+/// group without it, and asks ahead once a group opened with the second --
+/// the groups the cursor opened, the start seek's apart -- and never
+/// without. The entries come back as the model has them either way.
+/// A few of the lowest keys are written first so the partition does not
+/// take the bulk walk, and the handle builds its own table (`commit_forms`
+/// off), as the cursor's test does.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_cursor_holds_a_pages_view_across_its_groups_and_asks_for_the_next() {
+    for on in [true, false] {
+        let what = format!("cursor view and ahead {on}");
+        let (dir, mut db, model, _inject, r, keys, _at) =
+            compact_store_with(&format!("cursor-view-{on}"), 1 << 20, |o| {
+                o.zpages_cursor_view = on;
+                o.zpages_group_ahead = on;
+                o.commit_forms = false;
+            });
+        drop(r);
+        for k in &keys[..3] {
+            db.append(k, &model[k][0]);
+        }
+        db.commit().unwrap();
+        let r = db.reader().unwrap();
+        let want = 4 * 64 + 10;
+        let start = keys.len() / 2;
+        assert!(
+            start + want < keys.len(),
+            "{what}: keys enough: {}",
+            keys.len()
+        );
+        let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+            .iter()
+            .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+            .collect();
+        let before = db.zpage_counts();
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let n = r
+            .scan(&keys[start], want, |k, v| {
+                got.push((k.to_vec(), v.to_vec()))
+            })
+            .unwrap();
+        let c = db.zpage_counts();
+        assert_eq!(n, want, "{what}: the scan's entries");
+        assert_eq!(got, expect, "{what}: the entries as the model has them");
+        let groups = c.scan_groups - before.scan_groups;
+        let views = c.scan_views - before.scan_views;
+        let aheads = c.group_aheads - before.group_aheads;
+        assert!(groups >= 3, "{what}: groups decoded: {groups}");
+        if on {
+            assert!(
+                views < groups,
+                "{what}: a view a page and not a group: {views} views, {groups} groups"
+            );
+            // The scan's start seek decodes one group through no cursor.
+            assert!(
+                aheads + 1 >= groups,
+                "{what}: a group asked ahead at each open: {aheads} aheads, {groups} groups"
+            );
+        } else {
+            // A view at every open; the start seek's group apart, as above.
+            assert!(
+                views + 1 >= groups,
+                "{what}: a view an open: {views} views, {groups} groups"
+            );
+            assert_eq!(aheads, 0, "{what}: nothing asked ahead");
+        }
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A block-cache scan's start over a covered partition is placed once
+/// (`Options::zpages_seek_seeds`): the writer's scan from a key in the
+/// partition's middle goes through the form file's cursor for its seek and
+/// seeds the partition's reader with it -- the seed count moves by one and
+/// the first block's walk resumes the cursor -- where without the option
+/// the seek finds the rank through the fence and a group and the walk
+/// places a second cursor at the rank, which opens the start's group
+/// again out of the memo. The entries come back as the model has them
+/// either way. The lowest keys
+/// are written first so the partition does not take the bulk walk, and the
+/// writer's own table is built by the scan (`commit_forms` off).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_covered_scans_start_seek_seeds_the_partitions_cursor() {
+    let mut by = [(0u64, 0u64, 0u64); 2];
+    for on in [true, false] {
+        let what = format!("seek seeds {on}");
+        let (dir, mut db, model, _inject, r, keys, _at) =
+            compact_store_with(&format!("seek-seeds-{on}"), 1 << 20, |o| {
+                o.zpages_seek_seeds = on;
+                // The memo as every open's, so that the second placement
+                // shows as a hit of it.
+                o.zpages_scan_admit = false;
+                o.commit_forms = false;
+            });
+        drop(r);
+        for k in &keys[..3] {
+            db.append(k, &model[k][0]);
+        }
+        db.commit().unwrap();
+        let want = 64 + 10;
+        let start = keys.len() / 2;
+        assert!(
+            start + want < keys.len(),
+            "{what}: keys enough: {}",
+            keys.len()
+        );
+        let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+            .iter()
+            .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+            .collect();
+        let before = db.zpage_counts();
+        let seeds_before = db.seek_seeds();
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let n = db
+            .scan(&keys[start], want, |k, v| {
+                got.push((k.to_vec(), v.to_vec()))
+            })
+            .unwrap();
+        let c = db.zpage_counts();
+        let seeds = db.seek_seeds() - seeds_before;
+        assert_eq!(n, want, "{what}: the scan's entries");
+        assert_eq!(got, expect, "{what}: the entries as the model has them");
+        by[usize::from(on)] = (
+            c.scans - before.scans,
+            c.scan_views - before.scan_views,
+            c.memo_hits - before.memo_hits,
+        );
+        if on {
+            assert_eq!(seeds, 1, "{what}: the start seek seeded the reader once");
+        } else {
+            assert_eq!(seeds, 0, "{what}: nothing seeded");
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // The second placement opened the start's group again, out of the
+    // memo the seek had put it in: one memo hit fewer, the scans and the
+    // views no more (the seek's own view is not a cursor's and is not
+    // counted either way).
+    let (seeded, placed) = (by[1], by[0]);
+    assert!(
+        seeded.0 <= placed.0 && seeded.1 <= placed.1 && seeded.2 < placed.2,
+        "the seeded scan opens the start's group once: seeded (scans, views, memo hits) {seeded:?}, placed {placed:?}"
+    );
+}
+
+/// A covered scan's groups after its first are decoded into the cursor's
+/// own buffer (`Options::zpages_walk_owns_decodes`): the form files' count
+/// of walk-owned decodes moves by the groups the walk opened past its
+/// start, the memo's misses by no more than before, and the entries come
+/// back as the model has them; without the option nothing is owned and
+/// every decode goes through the memo. The lowest keys are written first so
+/// the partition does not take the bulk walk.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_walks_groups_after_the_first_are_decoded_into_its_own_buffer() {
+    for on in [true, false] {
+        let what = format!("walk owns decodes {on}");
+        let (dir, mut db, model, _inject, r, keys, _at) =
+            compact_store_with(&format!("walk-owns-{on}"), 1 << 20, |o| {
+                o.zpages_walk_owns_decodes = on;
+                // The walk's own rule alone: a first touch's admission
+                // (`zpages_scan_admit`) owns decodes too, and has its test
+                // beside the memo's.
+                o.zpages_scan_admit = false;
+                o.commit_forms = false;
+            });
+        drop(r);
+        for k in &keys[..3] {
+            db.append(k, &model[k][0]);
+        }
+        db.commit().unwrap();
+        let want = 4 * 64 + 10;
+        let start = keys.len() / 2;
+        assert!(
+            start + want < keys.len(),
+            "{what}: keys enough: {}",
+            keys.len()
+        );
+        let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+            .iter()
+            .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+            .collect();
+        let owned = |db: &Db| db.zpage_counts().walk_owned;
+        let (before, owned0) = (db.zpage_counts(), owned(&db));
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let n = db
+            .scan(&keys[start], want, |k, v| {
+                got.push((k.to_vec(), v.to_vec()))
+            })
+            .unwrap();
+        let c = db.zpage_counts();
+        let owned = owned(&db) - owned0;
+        assert_eq!(n, want, "{what}: the scan's entries");
+        assert_eq!(got, expect, "{what}: the entries as the model has them");
+        let groups = c.scan_groups - before.scan_groups;
+        assert!(groups >= 3, "{what}: groups decoded: {groups}");
+        if on {
+            // The start's group and a build's go through the memo; the
+            // walk's own after them.
+            assert!(
+                owned >= 1 && owned + 3 >= groups,
+                "{what}: the walk's groups owned: {owned} of {groups} decoded"
+            );
+        } else {
+            assert_eq!(owned, 0, "{what}: every decode through the memo");
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A walk's first touch of a group through a form file is decoded into its
+/// cursor's own buffer and put nowhere, and the handle's memo takes the
+/// group at its second touch (`Options::zpages_scan_admit`): one scan made
+/// three times decodes its groups past the start's as the walk's own, then
+/// into the memo at their admission, then not at all. Without the option
+/// the first scan's decodes are all the memo's and the second scan decodes
+/// nothing. The entries come back as the model has them every time, and the
+/// lowest keys are written first so the partition does not take the bulk
+/// walk.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_scans_first_touch_of_a_group_is_its_own_decode_and_its_second_the_memos() {
+    for on in [true, false] {
+        let what = format!("scan admit {on}");
+        let (dir, mut db, model, _inject, r, keys, _at) =
+            compact_store_with(&format!("scan-admit-{on}"), 1 << 20, |o| {
+                o.zpages_scan_admit = on;
+                o.commit_forms = false;
+            });
+        drop(r);
+        for k in &keys[..3] {
+            db.append(k, &model[k][0]);
+        }
+        db.commit().unwrap();
+        let want = 4 * 64 + 10;
+        let start = keys.len() / 2;
+        assert!(
+            start + want < keys.len(),
+            "{what}: keys enough: {}",
+            keys.len()
+        );
+        let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+            .iter()
+            .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+            .collect();
+        // One scan: the groups decoded, the walk's own among them, the
+        // memo's admissions and its hits.
+        let pass = |db: &mut Db, nth: usize| {
+            let before = db.zpage_counts();
+            let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let n = db
+                .scan(&keys[start], want, |k, v| {
+                    got.push((k.to_vec(), v.to_vec()))
+                })
+                .unwrap();
+            let c = db.zpage_counts();
+            assert_eq!(n, want, "{what}, scan {nth}: the scan's entries");
+            assert_eq!(
+                got, expect,
+                "{what}, scan {nth}: the entries as the model has them"
+            );
+            (
+                c.scan_groups - before.scan_groups,
+                c.walk_owned - before.walk_owned,
+                c.point_admits - before.point_admits,
+                c.memo_hits - before.memo_hits,
+            )
+        };
+        let (first, second, third) = (pass(&mut db, 1), pass(&mut db, 2), pass(&mut db, 3));
+        assert!(first.0 >= 3, "{what}: groups decoded: {first:?}");
+        if on {
+            // The start's group and a build's go through the memo, the
+            // walk's others are its own; the second scan finds their tags
+            // and the memo takes each; the third decodes nothing.
+            assert!(
+                first.1 >= 1 && first.1 + 3 >= first.0 && first.2 == 0,
+                "{what}: the first scan's groups the walk's own: {first:?}"
+            );
+            assert!(
+                second.1 == 0 && second.2 == first.1 && second.0 == first.1,
+                "{what}: the second scan's groups the memo's, each admitted: {first:?} then {second:?}"
+            );
+        } else {
+            assert_eq!(
+                (first.1, first.2),
+                (0, 0),
+                "{what}: every decode the memo's: {first:?}"
+            );
+            assert_eq!(second.0, 0, "{what}: nothing decoded twice: {second:?}");
+        }
+        // All but the few groups the seek and a build hold by other means.
+        assert!(
+            third.0 == 0 && third.1 == 0 && third.3 + 3 >= first.0,
+            "{what}: the third scan read out of the memo: {third:?} after {first:?}"
+        );
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The bulk walk through a form file (`ZFile::scan_at`, a handle's scan of
+/// a partition no unsealed key overlays) decodes its first touch of a group
+/// into the thread's own buffer and puts it nowhere, the handle's memo
+/// taking the group at its second touch (`Options::zpages_bulk_admit`), and
+/// asks for the next page's head at a page's last group it walks on past
+/// (`Options::zpages_bulk_ahead`), and for every next group under
+/// `Options::zpages_bulk_ahead_within`: one scan made three times decodes
+/// its groups past the start's as its own and asks ahead at each page it
+/// leaves, or at each group, then into the memo at their admission, then
+/// not at all. Without the options every decode is the memo's, the second
+/// scan decodes nothing, and nothing is asked ahead. The cursor's admission
+/// and asks are off in all three, so every count here is the bulk walk's,
+/// and the entries come back as the model has them every time.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_bulk_walks_first_touch_of_a_group_is_its_own_decode_and_it_asks_for_the_next() {
+    for (on, within) in [(true, false), (true, true), (false, false)] {
+        let what = format!("bulk {on} within {within}");
+        let (dir, db, model, _inject, r, keys, _at) =
+            compact_store_with(&format!("bulk-admit-{on}-{within}"), 1 << 20, |o| {
+                o.zpages_bulk_admit = on;
+                o.zpages_bulk_ahead = on;
+                o.zpages_bulk_ahead_within = within;
+                o.zpages_scan_admit = false;
+                o.zpages_group_ahead = false;
+                o.commit_forms = false;
+            });
+        // A handle of its own, whose memo and tags no read before has
+        // touched.
+        drop(r);
+        let r = db.reader().unwrap();
+        let want = 4 * 64 + 10;
+        let start = keys.len() / 2;
+        assert!(
+            start + want < keys.len(),
+            "{what}: keys enough: {}",
+            keys.len()
+        );
+        let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+            .iter()
+            .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+            .collect();
+        // One scan through the handle: the bulk walks it made, the groups
+        // decoded, the walk's own among them, the memo's admissions and
+        // hits, and the next groups' lines asked for.
+        let pass = |nth: usize| {
+            let before = db.zpage_counts();
+            let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let n = r
+                .scan(
+                    &keys[start],
+                    want,
+                    kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+                )
+                .unwrap();
+            let c = db.zpage_counts();
+            assert_eq!(n, want, "{what}, scan {nth}: the scan's entries");
+            assert_eq!(
+                got, expect,
+                "{what}, scan {nth}: the entries as the model has them"
+            );
+            assert!(
+                c.scans > before.scans,
+                "{what}, scan {nth}: the bulk walk served it: {c:?}"
+            );
+            (
+                c.scan_groups - before.scan_groups,
+                c.walk_owned - before.walk_owned,
+                c.point_admits - before.point_admits,
+                c.memo_hits - before.memo_hits,
+                c.group_aheads - before.group_aheads,
+            )
+        };
+        let (first, second, third) = (pass(1), pass(2), pass(3));
+        assert!(first.0 >= 3, "{what}: groups decoded: {first:?}");
+        if on {
+            // The start's group is the seek's, through the memo, as is the
+            // first group of each partition the scan crosses into; the
+            // walk's others are its own, the second scan finds their tags
+            // and the memo takes each, and the third decodes nothing. Every
+            // open but the last asks for the group after it under `within`,
+            // and only a page's last group otherwise.
+            assert!(
+                first.1 >= 1 && first.1 + 3 >= first.0 && first.2 == 0,
+                "{what}: the first scan's groups the walk's own: {first:?}"
+            );
+            assert!(
+                second.1 == 0 && second.2 == first.1 && second.0 == first.1,
+                "{what}: the second scan's groups the memo's, each admitted: {first:?} then {second:?}"
+            );
+            if within {
+                assert!(
+                    first.4 + 3 >= first.0,
+                    "{what}: the next group asked for at each open: {first:?}"
+                );
+            } else {
+                // A page holds several groups, so the asks come at most
+                // one in two of the groups decoded.
+                assert!(
+                    first.4 >= 1 && first.4 * 2 <= first.0,
+                    "{what}: the next page's head asked for at each page left: {first:?}"
+                );
+            }
+        } else {
+            assert_eq!(
+                (first.1, first.2, first.4),
+                (0, 0, 0),
+                "{what}: every decode the memo's, nothing asked ahead: {first:?}"
+            );
+            assert_eq!(second.0, 0, "{what}: nothing decoded twice: {second:?}");
+        }
+        assert!(
+            third.0 == 0 && third.1 == 0 && third.3 >= first.0,
+            "{what}: the third scan read out of the memo: {third:?} after {first:?}"
+        );
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The bulk walk's own decode of the group it ends inside goes only as far
+/// as the walk reads (`Options::zpages_bulk_part`): a handle's scans of many
+/// lengths from starts spread over a drained store come back as the model
+/// has them with the option and without; with it the groups begun in part
+/// are counted among the walks' own and their bytes come short of the
+/// groups', and without it none is. The cursor's own partial decode and
+/// admission are off in both, so every count here is the bulk walk's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_bulk_walks_last_group_is_decoded_only_as_far_as_the_scan_reads() {
+    for on in [true, false] {
+        let what = format!("bulk part {on}");
+        let (dir, db, model, _inject, r, keys, _at) =
+            compact_store_with(&format!("bulk-part-{on}"), 1 << 20, |o| {
+                o.zpages_bulk_part = on;
+                o.zpages_walk_part = false;
+                o.zpages_scan_admit = false;
+                o.commit_forms = false;
+            });
+        drop(r);
+        let r = db.reader().unwrap();
+        let lens = [1usize, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233];
+        let scans = 60usize;
+        assert!(keys.len() > 1000, "{what}: keys enough: {}", keys.len());
+        let before = db.zpage_counts();
+        for i in 0..scans {
+            let want = lens[i % lens.len()];
+            let start = 64 + i * (keys.len() - 400) / scans;
+            let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+                .iter()
+                .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+                .collect();
+            let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let n = r
+                .scan(
+                    &keys[start],
+                    want,
+                    kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+                )
+                .unwrap();
+            assert_eq!(n, want, "{what}, scan {i}: the scan's entries");
+            assert_eq!(
+                got, expect,
+                "{what}, scan {i}: the entries as the model has them"
+            );
+        }
+        let c = db.zpage_counts();
+        let (parts, bytes, of, owned, walks) = (
+            c.walk_parts - before.walk_parts,
+            c.walk_part_bytes - before.walk_part_bytes,
+            c.walk_part_of - before.walk_part_of,
+            c.walk_owned - before.walk_owned,
+            c.scans - before.scans,
+        );
+        assert!(
+            walks >= scans as u64,
+            "{what}: the bulk walk served them: {c:?}"
+        );
+        if on {
+            // A scan begins one group in part at most, its last, and only
+            // where that group is a first touch the scan does not read to
+            // its end.
+            assert!(
+                parts as usize >= scans / 6 && parts as usize <= scans && parts <= owned,
+                "{what}: groups begun in part: {parts} of {owned} the walks' own, over {scans} scans"
+            );
+            assert!(
+                bytes * 100 < of * 85,
+                "{what}: {bytes} of {of} bytes decoded of the groups begun in part"
+            );
+        } else {
+            assert_eq!((parts, bytes, of), (0, 0, 0), "{what}");
+            assert!(owned > 0, "{what}: the walks' own decodes, each whole");
+        }
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A walk's own decode of a group it does not read to the end goes only as
+/// far as the walk reads (`Options::zpages_walk_part`): scans of many
+/// lengths from starts spread over the store come back as the model has
+/// them with the option and without; with it the groups begun in part are
+/// counted among the walks' own and their bytes come short of the groups',
+/// and without it none is. The lowest keys are written first so the
+/// partition does not take the bulk walk. Then the same over a stretch
+/// dense with unsealed keys, where a scan's entries come from the
+/// memtable as well and its walk of a block is cut into runs at each of
+/// them: the reader tells the cursor what the scan has left at every block
+/// and after every run, so the scan's last group is still the one begun in
+/// part where a run opens it, and a count taken once at the scan's start,
+/// or once a block, wants that group whole.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_scans_last_group_is_decoded_only_as_far_as_the_scan_reads() {
+    for on in [true, false] {
+        let what = format!("walk part {on}");
+        let (dir, mut db, model, _inject, r, keys, _at) =
+            compact_store_with(&format!("walk-part-{on}"), 1 << 20, |o| {
+                o.zpages_walk_part = on;
+                o.commit_forms = false;
+            });
+        drop(r);
+        for k in &keys[..3] {
+            db.append(k, &model[k][0]);
+        }
+        db.commit().unwrap();
+        let lens = [1usize, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233];
+        let scans = 60usize;
+        assert!(keys.len() > 1000, "{what}: keys enough: {}", keys.len());
+        let before = db.zpage_counts();
+        for i in 0..scans {
+            let want = lens[i % lens.len()];
+            let start = 64 + i * (keys.len() - 400) / scans;
+            let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+                .iter()
+                .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+                .collect();
+            let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let n = db
+                .scan(&keys[start], want, |k, v| {
+                    got.push((k.to_vec(), v.to_vec()))
+                })
+                .unwrap();
+            assert_eq!(n, want, "{what}, scan {i}: the scan's entries");
+            assert_eq!(
+                got, expect,
+                "{what}, scan {i}: the entries as the model has them"
+            );
+        }
+        let c = db.zpage_counts();
+        let (parts, bytes, of, owned) = (
+            c.walk_parts - before.walk_parts,
+            c.walk_part_bytes - before.walk_part_bytes,
+            c.walk_part_of - before.walk_part_of,
+            c.walk_owned - before.walk_owned,
+        );
+        if on {
+            // A scan begins one group in part at most, its last: its runs
+            // tell the cursor what the scan has ahead of them.
+            assert!(
+                parts as usize >= scans / 6 && parts as usize <= scans && parts <= owned,
+                "{what}: groups begun in part: {parts} of {owned} the walks' own, over {scans} scans"
+            );
+            assert!(
+                bytes * 100 < of * 85,
+                "{what}: {bytes} of {of} bytes decoded of the groups begun in part"
+            );
+        } else {
+            assert_eq!((parts, bytes, of), (0, 0, 0), "{what}");
+            assert!(owned > 0, "{what}: the walks' own decodes, each whole");
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        // A stretch with an unsealed value at every fifth key, its blocks'
+        // forms built at the write by the commit's fill, and the scans a
+        // handle's, whose memo holds none of the groups the fill decoded:
+        // a scan of forty keys takes eight entries more than its keys from
+        // the memtable and walks each block in runs between them.
+        let (dir, mut db, mut model, inject, r, keys, _at) =
+            compact_store_with(&format!("walk-part-dense-{on}"), 1 << 20, |o| {
+                o.zpages_walk_part = on;
+                o.upkeep = supdb::Upkeep::Inline;
+            });
+        drop(r);
+        inject.set_refault_rate(0.0);
+        inject.set_budget(1 << 50);
+        db.scan(&keys[0], 1, |_k, _v| {}).unwrap();
+        let lo = keys.len() / 2;
+        for (j, k) in keys[lo..lo + 700].iter().enumerate() {
+            if j % 5 == 2 {
+                db.append(k, b"more");
+                model.get_mut(k).unwrap().push(b"more".to_vec());
+            }
+        }
+        db.commit().unwrap();
+        assert!(
+            db.settle_built() > 0,
+            "{what}: the commit's fill built the stretch's forms"
+        );
+        let h = db.reader().unwrap();
+        let dense = 12usize;
+        let before = db.zpage_counts();
+        for i in 0..dense {
+            let (start, want) = (lo + 3 + i * 50, 40);
+            let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+                .iter()
+                .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+                .collect();
+            let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            h.scan(&keys[start], want, |k, v| {
+                got.push((k.to_vec(), v.to_vec()))
+            })
+            .unwrap();
+            assert_eq!(
+                got, expect,
+                "{what}, dense scan {i}: the entries as the model has them"
+            );
+        }
+        let c = db.zpage_counts();
+        let (parts, bytes, of) = (
+            c.walk_parts - before.walk_parts,
+            c.walk_part_bytes - before.walk_part_bytes,
+            c.walk_part_of - before.walk_part_of,
+        );
+        if on {
+            // Where a run of the scan's last block opens the last group:
+            // a third of these scans, the rest opening it under the step
+            // past an unsealed key's own record, which is told no count
+            // and decodes whole. A count not taken down by the entries
+            // the memtable gave, or by the runs before in the block, wants
+            // the group whole in every one of them.
+            assert!(
+                parts as usize >= dense / 4 && parts as usize <= dense,
+                "{what}: groups begun in part over the dense stretch: {parts} over {dense} scans"
+            );
+            assert!(
+                bytes * 100 < of * 85,
+                "{what}: {bytes} of {of} bytes decoded of them"
+            );
+        } else {
+            assert_eq!((parts, bytes, of), (0, 0, 0), "{what}, the dense stretch");
+        }
+        drop(h);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A handle's scan over a drained covered store, the clean run every scan
+/// over it takes, places the form file's cursor once with the start seek's
+/// seeded (`Options::zpages_seek_seeds`) as without it: the form's scan
+/// count moves by one a scan either way, and the entries come back as the
+/// model has them. The row's threaded scan passes read two dispatches a
+/// scan with the seed, which this holds at one.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_handles_clean_run_resumes_the_seeded_cursor_and_places_no_second() {
+    let mut by = [(0u64, 0u64); 2];
+    for on in [true, false] {
+        let what = format!("handle clean run seeds {on}");
+        let (dir, db, model, _inject, r, keys, _at) =
+            compact_store_with(&format!("handle-seeds-{on}"), 1 << 20, |o| {
+                o.zpages_seek_seeds = on;
+            });
+        let start = keys.len() / 2;
+        let want = 100;
+        let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+            .iter()
+            .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+            .collect();
+        // One scan first, so the handle's table and the partition's cursor
+        // state are what a pass's later scans meet.
+        r.scan(&keys[start / 2], want, |_k, _v| {}).unwrap();
+        let before = db.zpage_counts();
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let n = r
+            .scan(&keys[start], want, |k, v| {
+                got.push((k.to_vec(), v.to_vec()))
+            })
+            .unwrap();
+        let c = db.zpage_counts();
+        assert_eq!(n, want, "{what}: the scan's entries");
+        assert_eq!(got, expect, "{what}: the entries as the model has them");
+        by[usize::from(on)] = (c.scans - before.scans, c.scan_views - before.scan_views);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let (seeded, placed) = (by[1], by[0]);
+    assert!(
+        seeded.0 <= placed.0 && placed.0 <= 1,
+        "the clean run places the cursor once: seeded (scans, views) {seeded:?}, placed {placed:?}"
+    );
+}
+
+/// A scan's blocks over a covered partition read through one cursor
+/// (`Options::zpages_scan_cursor`): a scan of four blocks and a bit whose
+/// second block holds an unsealed key, through a fresh handle, places the
+/// cursor at most twice -- the form's scan count moves by that -- once for
+/// the walk and once more where the sparse block's build moved it to the
+/// key's cut, past the walk's start; and four times without the option:
+/// the clean run before the sparse block, the block's build, the block's
+/// walk, and the clean run after it. The entries come back as the
+/// model has them either way, the unsealed key's new value after its
+/// loaded one, one entry more than the keys the limit counts. A few of the lowest keys are written first so the partition
+/// does not take the bulk walk, and the handle builds its own table
+/// (`commit_forms` off), as the clean run's test does.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_scans_blocks_over_a_covered_partition_read_through_one_cursor() {
+    for on in [true, false] {
+        let what = format!("scan cursor {on}");
+        let (dir, mut db, mut model, _inject, r, keys, _at) =
+            compact_store_with(&format!("scan-cursor-{on}"), 1 << 20, |o| {
+                o.zpages_scan_cursor = on;
+                o.commit_forms = false;
+            });
+        drop(r);
+        for k in &keys[..3] {
+            db.append(k, &model[k][0]);
+        }
+        let want = 4 * 64 + 10;
+        let start = keys.len() / 2;
+        assert!(
+            start + want < keys.len(),
+            "{what}: keys enough: {}",
+            keys.len()
+        );
+        // A key in the scan's second block, with a value of its own.
+        let inner = &keys[start + 70];
+        db.append(inner, b"a second value");
+        model
+            .get_mut(inner)
+            .unwrap()
+            .push(b"a second value".to_vec());
+        db.commit().unwrap();
+        let r = db.reader().unwrap();
+        // The limit counts keys visited, so the key with two values makes
+        // the entries one more than the keys.
+        let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+            .iter()
+            .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+            .collect();
+        let before = db.zpage_counts();
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let n = r
+            .scan(&keys[start], want, |k, v| {
+                got.push((k.to_vec(), v.to_vec()))
+            })
+            .unwrap();
+        let c = db.zpage_counts();
+        assert_eq!(n, want, "{what}: the scan's entries");
+        if got != expect {
+            let at = got
+                .iter()
+                .zip(&expect)
+                .position(|(a, b)| a != b)
+                .unwrap_or(got.len().min(expect.len()));
+            let show = |w: &[(Vec<u8>, Vec<u8>)]| match w.get(at) {
+                Some((k, v)) => format!("{:?} ({} bytes)", String::from_utf8_lossy(k), v.len()),
+                None => "the end".to_string(),
+            };
+            panic!(
+                "{what}: {} entries, wanted {}; they part at entry {at}, got {}, wanted {}",
+                got.len(),
+                expect.len(),
+                show(&got),
+                show(&expect)
+            );
+        }
+        let placed = c.scans - before.scans;
+        if on {
+            assert!(
+                (1..=2).contains(&placed),
+                "{what}: the scan's cursor, placed again after the build: {placed}"
+            );
+        } else {
+            assert!(placed >= 4, "{what}: a cursor a run and a build: {placed}");
+        }
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- the stride form ---------------------------------------------------------
+
+use supdb::db::zpages::StrideTrailer;
+use supdb::ZStride;
+
+/// `forced`, with every form file's build asking for the stride form
+/// (`ZStride::Forced`).
+fn stride_forced(extra: impl FnOnce(&mut Options)) -> Options {
+    forced(|o| {
+        o.zpages_stride = ZStride::Forced;
+        extra(o);
+    })
+}
+
+fn numbered_key(i: usize) -> Vec<u8> {
+    format!("k{i:06}").into_bytes()
+}
+
+/// `n` numbered keys from zero in ascending order, one value of `w` random
+/// bytes each, committed in batches and flushed: partitions the stride form
+/// holds, and the model of them.
+fn numbered_load(db: &mut Db, n: usize, w: usize, seed: u64) -> Model {
+    let mut rng = Rng(seed);
+    let mut model = Model::new();
+    for chunk in (0..n).collect::<Vec<_>>().chunks(500) {
+        for &i in chunk {
+            let v: Vec<u8> = (0..w).map(|_| (rng.next() >> 24) as u8).collect();
+            let k = numbered_key(i);
+            db.append(&k, &v);
+            model.insert(k, vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    model
+}
+
+/// `n` numbered keys from zero as `numbered_load` writes them, and a second
+/// value of the same width appended to every key from `n / 2` on, a batch
+/// after the first: partitions of the lower half the stride form holds and
+/// those of the upper half it declines, each record there two values
+/// (`StrideNo::NotOneValue`), with a partition across the line declined too.
+fn mixed_load(db: &mut Db, n: usize, seed: u64) -> Model {
+    let mut rng = Rng(seed);
+    let mut model = Model::new();
+    for chunk in (0..n).collect::<Vec<_>>().chunks(500) {
+        for &i in chunk {
+            let k = numbered_key(i);
+            let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
+            db.append(&k, &v);
+            model.entry(k).or_default().push(v);
+        }
+        db.commit().unwrap();
+        for &i in chunk.iter().filter(|&&i| i >= n / 2) {
+            let k = numbered_key(i);
+            let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
+            db.append(&k, &v);
+            model.entry(k).or_default().push(v);
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    model
+}
+
+/// The code a segment keeps for a record of more than one value
+/// (`zfile::StrideNo::NotOneValue`): one more than its slot in
+/// `ZCounts::stride_declines`, the third.
+const STRIDE_NOT_ONE_VALUE: u8 = 3;
+
+/// A store of one partition of `n` numbered keys of a hundred-byte value
+/// each, under the stride form, given its stride file and closed: its
+/// directory, the model and the model's keys, in rank order.
+fn stride_partition(name: &str, n: usize, seed: u64) -> (PathBuf, Model, Vec<Vec<u8>>) {
+    let dir = scratch(name);
+    let mut db = Db::create(&dir, stride_forced(|_| {})).unwrap();
+    let model = numbered_load(&mut db, n, 100, seed);
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.partitions, c.form_files, c.stride_files, c.stride_builds),
+        (1, 1, 1, 1),
+        "{c:?}"
+    );
+    db.close().unwrap();
+    let keys = model.keys().cloned().collect();
+    (dir, model, keys)
+}
+
+/// The stride file at `path`'s trailer and value pages.
+fn stride_of(path: &Path) -> (StrideTrailer, usize) {
+    let b = std::fs::read(path).unwrap();
+    let t = StrideTrailer::decode(&b[b.len() - ZTRAILER..]).unwrap();
+    let v = t.layout().unwrap().v_pages as usize;
+    (t, v)
+}
+
+/// The value pages of a file of `v` an attach checks
+/// (`supdb::db::zpage_samples`, the engine's own choice of them); and
+/// whether page `p` is clear of them -- neither one nor the page after one,
+/// which the slot an attach reads there may run into, nor the last but one,
+/// whose bytes the last page's slot may begin on.
+fn stride_samples(v: usize) -> (Vec<usize>, impl Fn(usize) -> bool) {
+    let s = supdb::db::zpage_samples(v);
+    let clear = {
+        let s = s.clone();
+        move |p: usize| p + 2 < v && !s.iter().any(|&q| q == p || q + 1 == p)
+    };
+    (s, clear)
+}
+
+/// The keys whose hundred-byte slots touch value page `p`.
+fn keys_on_page(p: usize, keys: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let lo = p * ZPAGE / 100;
+    let hi = ((p + 1) * ZPAGE).div_ceil(100).min(keys.len());
+    keys[lo..hi].to_vec()
+}
+
+/// The stride switch (`common::stride_switch`) held to the stores it is
+/// for. Under it, the store a test that names no form opens
+/// (`common::options`) and the one `forced` opens each give a partition of
+/// numbered keys a stride file and answer its reads from it, and the
+/// oracle's forced store asks for the form beside the raw store it is held
+/// to; without it, all are what they were, the default and the block
+/// form's. A run under the switch that reached no stride file would pass
+/// every test it runs and say nothing of the form, so the switch's word is
+/// read here a second time only to hold `stride_switch`'s reading of it to
+/// it.
+#[test]
+fn the_stride_switch_gives_the_stores_it_reaches_the_stride_form() {
+    let on = std::env::var("SUPDB_TEST_STRIDE").is_ok_and(|v| v == "1");
+    assert_eq!(common::stride_switch(), on, "the switch read as set");
+    let asked = if on { ZStride::Forced } else { ZStride::Off };
+    for raw_tails in [false, true] {
+        assert_eq!(
+            oracle_opts(true, false, raw_tails).zpages_stride,
+            asked,
+            "the oracle's forced store"
+        );
+        assert_eq!(
+            oracle_opts(false, false, raw_tails).zpages_stride,
+            ZStride::Off,
+            "the oracle's raw store"
+        );
+    }
+    let stores = [
+        ("switch-options", common::options()),
+        ("switch-forced", forced(|_| {})),
+    ];
+    if !on {
+        let d = Options::default();
+        for (name, o) in &stores {
+            assert_eq!(o.zpages_stride, ZStride::Off, "{name}");
+        }
+        assert!(
+            stores[0].1.zpages == d.zpages && stores[0].1.zpages_min_bytes == d.zpages_min_bytes,
+            "the options a test builds on are the default's"
+        );
+        return;
+    }
+    for (name, opts) in stores {
+        let dir = scratch(name);
+        let mut db = Db::create(&dir, opts).unwrap();
+        let model = numbered_load(&mut db, 2000, 100, 0x5717);
+        db.zpages_settle().unwrap();
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&db, &model, &keys, name);
+        let c = db.zpage_counts();
+        assert!(
+            c.stride_files > 0 && c.stride_files == c.partitions,
+            "{name}: every partition a stride file: {c:?}"
+        );
+        assert!(c.stride_reads > 0, "{name}: read through them: {c:?}");
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The oracle of the stride form: a store under `Always` and
+/// `ZStride::Forced`, and a store under `Off`, given the same operations
+/// and checked against the model after every settle, through the writer
+/// and a handle made for the purpose, and scanned. Numbered keys, loaded
+/// whole and in order, so that every partition starts as a run the form
+/// holds; then a third of the range put only (each put a delete and an
+/// append, of one width), a fourth given second values, and the rest
+/// deleted or put -- seals, merges, flushes and crashes between, so that
+/// partitions of all three are rewritten and declined and given the stride
+/// form again in one store. Every write after the load is inside the range
+/// it filled, so nothing promotes past the load's own flush: a promotion
+/// while stride files stand is a test of its own
+/// (`a_promotion_keeps_the_stride_file_of_the_partition_it_closes`). A
+/// fallback, a refused file, a failed build, a file out of service and a
+/// page that failed are each a failure of the form, over every instance of
+/// the store; and the stride form was built, served reads, and was
+/// declined. At every check a run of keys in the put-only half is put
+/// again, packed inside the windows the scans that follow walk, so that
+/// the overlay walk crosses the cursor at most of its records, and every
+/// other check seals it and settles first, so that a piece stands over the
+/// stride partitions it covers and the scans take the merge path; each
+/// window is held to the live model's entries from its start, in order --
+/// a deleted key counts against a limit until a merge drops its
+/// tombstone, which the two stores do at moments of their own, so the
+/// count is not -- and the values the cursor's stride position handed over
+/// are counted, under a piece among them.
+#[test]
+fn the_oracle_holds_with_the_stride_form_forced() {
+    stride_oracle("stride-oracle", false);
+}
+
+/// The stride oracle with the block cache on: the scans are the block
+/// path's over the stride partitions, its walks, cuts and replaced records
+/// read through the cursor's stride position (`PartReader`), its builds
+/// over the unsealed keys and the pieces made from the file, and its
+/// settles of the writes filed by the codec's arithmetic.
+#[test]
+fn the_oracle_holds_with_the_stride_form_forced_and_the_block_cache_on() {
+    stride_oracle("stride-oracle-cache", true);
+}
+
+/// The entries `got` of a window from `start` are the live model's from
+/// there, in order, and at least `least` of them.
+fn live_prefix(model: &Model, start: &[u8], got: &Window, least: usize, what: &str) {
+    let want: Vec<(Vec<u8>, Vec<u8>)> = model
+        .range(start.to_vec()..)
+        .flat_map(|(k, vs)| vs.iter().map(move |v| (k.clone(), v.clone())))
+        .take(got.0.len())
+        .collect();
+    assert_eq!(got.0, want, "{what}: the window's entries");
+    assert!(
+        got.0.len() >= least,
+        "{what}: {} entries, wanted {least} at least",
+        got.0.len()
+    );
+}
+
+fn stride_oracle(name: &str, cache: bool) {
+    const N: usize = 2400;
+    let opts = |on: bool| Options {
+        zpages: if on { ZPages::Always } else { ZPages::Off },
+        zpages_stride: if on { ZStride::Forced } else { ZStride::Off },
+        scan_block_cache: cache,
+        zpages_min_bytes: 0,
+        seal_bytes: 8 << 10,
+        partition_bytes: Some(4 << 10),
+        l0_trigger: 2,
+        ..Options::default()
+    };
+    let (dz, dr) = (
+        scratch(&format!("{name}-z")),
+        scratch(&format!("{name}-raw")),
+    );
+    let mut z = Db::create(&dz, opts(true)).unwrap();
+    let mut raw = Db::create(&dr, opts(false)).unwrap();
+    let mut model: Model = BTreeMap::new();
+    let mut pending: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+    let keys: Vec<Vec<u8>> = (0..N + 20).map(numbered_key).collect();
+    for (i, k) in keys.iter().take(N).enumerate() {
+        let v = format!("v{i:08}").into_bytes();
+        z.append(k, &v);
+        raw.append(k, &v);
+        model.insert(k.clone(), vec![v]);
+        if i % 300 == 299 {
+            z.commit().unwrap();
+            raw.commit().unwrap();
+        }
+    }
+    z.commit().unwrap();
+    raw.commit().unwrap();
+    z.flush().unwrap();
+    raw.flush().unwrap();
+    z.zpages_settle().unwrap();
+    let loaded = z.zpage_counts();
+    assert!(
+        loaded.partitions >= 2 && loaded.stride_files == loaded.partitions,
+        "every partition of the load is a run: {loaded:?}"
+    );
+    let mut rng = Rng(0x57_01AC);
+    let mut sum = supdb::db::ZCounts::default();
+    let add = |sum: &mut supdb::db::ZCounts, c: &supdb::db::ZCounts| {
+        sum.reads += c.reads;
+        sum.stride_reads += c.stride_reads;
+        sum.stride_cursor_reads += c.stride_cursor_reads;
+        sum.stride_builds += c.stride_builds;
+        sum.fallbacks += c.fallbacks
+            + c.rejected_damage
+            + c.rejected_identity
+            + c.build_failed
+            + c.damaged
+            + c.bad_pages;
+        for (s, d) in sum.stride_declines.iter_mut().zip(c.stride_declines) {
+            *s += d;
+        }
+    };
+    let (mut crashes, mut settles) = (0, 0);
+    // The windows' rounds with a piece standing, and the values the
+    // cursor's stride position handed over in them.
+    let (mut piece_rounds, mut piece_cursor) = (0, 0u64);
+    for step in 0..3000u64 {
+        let ix = rng.below(N);
+        let key = numbered_key(ix);
+        let v = format!("v{step:08}").into_bytes();
+        let both = |z: &mut Db, raw: &mut Db, f: &dyn Fn(&mut Db)| {
+            f(z);
+            f(raw);
+        };
+        if ix < N / 2 || (ix >= 3 * N / 4 && rng.below(3) != 0) {
+            both(&mut z, &mut raw, &|d| d.delete(&key));
+            pending.push((key.clone(), None));
+            both(&mut z, &mut raw, &|d| d.append(&key, &v));
+            pending.push((key, Some(v)));
+        } else if ix < 3 * N / 4 {
+            both(&mut z, &mut raw, &|d| d.append(&key, &v));
+            pending.push((key, Some(v)));
+        } else {
+            both(&mut z, &mut raw, &|d| d.delete(&key));
+            pending.push((key, None));
+        }
+        match rng.below(100) {
+            0..=9 => {
+                z.commit().unwrap();
+                raw.commit().unwrap();
+                apply(&mut model, &mut pending);
+            }
+            10..=12 => {
+                z.commit().unwrap();
+                raw.commit().unwrap();
+                apply(&mut model, &mut pending);
+                z.seal().unwrap();
+                raw.seal().unwrap();
+            }
+            13 if step % 5 == 0 => {
+                add(&mut sum, &z.zpage_counts());
+                drop(z);
+                drop(raw);
+                pending.clear();
+                z = Db::open(&dz, opts(true)).unwrap();
+                raw = Db::open(&dr, opts(false)).unwrap();
+                crashes += 1;
+                check(&z, &model, &keys, "after a crash");
+                check(&raw, &model, &keys, "after a crash, raw");
+            }
+            _ => {}
+        }
+        if step % 250 == 249 {
+            z.commit().unwrap();
+            raw.commit().unwrap();
+            apply(&mut model, &mut pending);
+            if step % 500 == 499 {
+                z.flush().unwrap();
+                raw.flush().unwrap();
+            }
+            z.zpages_settle().unwrap();
+            raw.settle().unwrap();
+            settles += 1;
+            check(&z, &model, &keys, "z, writer");
+            check(&raw, &model, &keys, "raw, writer");
+            let (hz, hr) = (z.reader().unwrap(), raw.reader().unwrap());
+            check(&hz, &model, &keys, "z, handle");
+            check(&hr, &model, &keys, "raw, handle");
+            check_scan(&z, &model, "z");
+            check_scan(&hz, &model, "z, handle");
+            drop((hz, hr));
+            // A run put again, dense inside the windows below, and every
+            // other round sealed into a piece over it.
+            const RUN: usize = 48;
+            let from = rng.below(N / 2 - 64);
+            for i in (from..from + RUN).step_by(2) {
+                let (key, v) = (numbered_key(i), format!("w{step:08}").into_bytes());
+                both(&mut z, &mut raw, &|d| d.put(&key, &v));
+                pending.push((key.clone(), None));
+                pending.push((key, Some(v)));
+            }
+            z.commit().unwrap();
+            raw.commit().unwrap();
+            apply(&mut model, &mut pending);
+            if settles % 2 == 0 {
+                z.seal().unwrap();
+                raw.seal().unwrap();
+                z.settle().unwrap();
+                raw.settle().unwrap();
+            }
+            let pieces = z.levels().1 > 0 && z.zpage_counts().stride_files > 0;
+            let before = z.zpage_counts().stride_cursor_reads;
+            let hz = z.reader().unwrap();
+            // Each start with the first of the run's keys at or after it:
+            // no key sorts between two numbered keys, so from `from + 5`
+            // and a zero byte that is `from + 6`.
+            let starts = [
+                (numbered_key(from), from),
+                (
+                    [numbered_key(from + 5).as_slice(), b"\0"].concat(),
+                    from + 6,
+                ),
+                (numbered_key(from + 20), from + 20),
+            ];
+            let w: &Reader = &z;
+            for (who, label) in [(w, "writer"), (&hz, "handle")] {
+                for (start, first) in &starts {
+                    for limit in [1usize, 3, 17, 64, 300] {
+                        let what = format!(
+                            "{label}, round {settles}, from {:?} for {limit}",
+                            String::from_utf8_lossy(start)
+                        );
+                        let got = scanned(who, start, limit);
+                        // The run's own keys after the start are live every
+                        // other one, the first of them among the live: a
+                        // window of `limit` keys holds at least half of the
+                        // run's keys it reaches, each with its one value,
+                        // whatever the keys between them hold.
+                        let least = limit.min(from + RUN - first).div_ceil(2);
+                        live_prefix(&model, start, &got, least, &what);
+                    }
+                }
+            }
+            drop(hz);
+            if pieces {
+                piece_rounds += 1;
+                piece_cursor += z.zpage_counts().stride_cursor_reads - before;
+            }
+        }
+    }
+    z.commit().unwrap();
+    raw.commit().unwrap();
+    apply(&mut model, &mut pending);
+    z.flush().unwrap();
+    z.settle().unwrap();
+    z.zpages_settle().unwrap();
+    raw.settle().unwrap();
+    check(&z, &model, &keys, "z, at the end");
+    check_scan(&z, &model, "z, at the end");
+    let c = z.zpage_counts();
+    add(&mut sum, &c);
+    assert!(crashes > 0 && settles > 8, "{crashes} {settles}");
+    assert_eq!(sum.fallbacks, 0, "no failure of the form: {sum:?}");
+    assert_eq!(c.form_files, c.partitions, "a form file each: {c:?}");
+    assert!(
+        sum.stride_builds > loaded.stride_builds && sum.stride_reads > 0,
+        "rewritten partitions built in the stride form again, and read: {sum:?}"
+    );
+    assert!(
+        sum.stride_cursor_reads > 0,
+        "the scans read the stride partitions through the cursor: {sum:?}"
+    );
+    assert!(
+        piece_rounds > 0 && piece_cursor > 0,
+        "{piece_rounds} rounds over a piece, {piece_cursor} values through the cursor in them"
+    );
+    // Declines by reason, in `ZCounts::stride_declines`' order: the second
+    // values' partitions for a record not one value, the deletes' for the
+    // numbers they took out of the run -- holes, since a merge drops the
+    // flags a promotion would have kept and nothing promotes here past the
+    // load -- and none for a width or a read-back, which no partition of
+    // this store can give: one width of inline values, no damage. A run in
+    // a block and a partition under the floor are not asserted: under
+    // `ZStride::Forced` the build that meets either is the block form's
+    // decline and counted there alone, so those two slots stay empty
+    // whatever the store holds.
+    let [_, holes, not_one, width, tomb, _, _, check_no, kept] = sum.stride_declines;
+    assert!(
+        not_one > 0 && holes + tomb > 0,
+        "the second values' and the deletes' partitions declined: {sum:?}"
+    );
+    assert_eq!(
+        (width, check_no, kept),
+        (0, 0, 0),
+        "declines no partition here can give: {sum:?}"
+    );
+    assert!(
+        c.stride_files > 0 && c.stride_files < c.partitions,
+        "both bodies in one store at the end: {c:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dz);
+    let _ = std::fs::remove_dir_all(&dr);
+}
+
+/// The stride form under the block cache: every read the cache makes of a
+/// stride partition -- its walks, its seeks, its cuts and its builds over
+/// the unsealed keys -- goes through the form file, the walks and the cuts
+/// through the cursor's stride position (`PartReader`), and the values that
+/// position hands over are counted; the scans answer as the model does, the
+/// point reads are the stride file's, and nothing is decoded, viewed or
+/// asked ahead of, since a stride file has no group or page header to open.
+#[test]
+fn the_block_cache_walks_a_stride_partition_through_its_cursor() {
+    let (dir, mut model, keys) = stride_partition("stride-cache-src", 3000, 0x5CAC);
+    let work = scratch("stride-cache-work");
+    copy_dir(&dir, &work);
+    let mut db = Db::open(&work, stride_forced(|o| o.scan_block_cache = true)).unwrap();
+    // A first scan, so the tables stand before the writes and the writes
+    // reach them through a settle; then a few keys over the run, unsealed,
+    // so the walks meet the memtable.
+    let _ = scanned(&db, b"", 10);
+    for i in (5..3000).step_by(211) {
+        let (k, v) = (numbered_key(i), vec![7u8; 100]);
+        db.put(&k, &v);
+        model.insert(k, vec![v]);
+    }
+    db.commit().unwrap();
+    let before = db.zpage_counts();
+    for start in [0usize, 1, 63, 64, 65, 1500, 2999] {
+        let from = numbered_key(start);
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        db.scan(
+            &from,
+            200,
+            kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+        )
+        .unwrap();
+        let want: Vec<(Vec<u8>, Vec<u8>)> = model
+            .range(from.clone()..)
+            .flat_map(|(k, vs)| vs.iter().map(move |v| (k.clone(), v.clone())))
+            .take(200)
+            .collect();
+        assert_eq!(got, want, "a scan from {start}");
+    }
+    let c = db.zpage_counts();
+    assert!(
+        c.stride_cursor_reads > before.stride_cursor_reads,
+        "the windows read through the cursor's stride position: {c:?}"
+    );
+    check_scan(&db, &model, "the whole");
+    check(&db, &model, &keys, "points");
+    let c = db.zpage_counts();
+    assert!(
+        c.stride_reads > 0,
+        "the point reads are the stride file's: {c:?}"
+    );
+    assert_eq!(
+        (c.scan_groups, c.scan_views, c.group_aheads, c.decodes),
+        (0, 0, 0, 0),
+        "nothing decoded, viewed or asked ahead of: {c:?}"
+    );
+    assert_eq!(
+        (c.fallbacks, c.damaged, c.bad_pages, c.raw_scans),
+        (0, 0, 0, 0),
+        "{c:?}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// A scan over partitions alone that meets an unsealed key equal to a
+/// stride partition's own: the emit reads the partition's value at the
+/// key's rank through the stride file, then the memtable's -- the covered
+/// walk's cursor stands on the record (`Reader::scan_partition_cursor`) and
+/// lends it to the emit (`Reader::emit_unsealed`, `PartVals::Cursor`),
+/// whose read is the position's (`ZCursor::values`), the one read of a
+/// stride record at a position a walk did not hand over. The store is the
+/// one partition a closed load leaves,
+/// opened again so that its file is the one found on disk and each value
+/// page is checked at its first touch; the unsealed writes are second
+/// values, with no tombstone in any source, so the emit reads the
+/// partition's value before the memtable's. A scan of one key from a
+/// written key reaches the partition's record through the emit alone -- the
+/// seek and the cut are the codec's arithmetic and touch no page, and no
+/// walk runs before the emit -- so the page checks rise by exactly the
+/// pages that key's slot spans, through the writer and through a handle,
+/// the slot that straddles two pages among them; and the whole store
+/// scanned from below every key, through both, answers as the model does.
+#[test]
+fn a_scan_over_partitions_reads_a_stride_record_under_an_unsealed_key_through_the_file() {
+    let (dir, mut model, keys) = stride_partition("stride-emit-src", 3000, 0x5E31);
+    let work = scratch("stride-emit-work");
+    copy_dir(&dir, &work);
+    let mut db = Db::open(&work, stride_forced(|_| {})).unwrap();
+    // Ranks whose slots lie on pages no other of them touches: rank 40's
+    // hundred bytes run from 4,000 to 4,099, across the first page's end.
+    let w = 100usize;
+    let slot_pages = |r: usize| (r * w / ZPAGE..=(r * w + w - 1) / ZPAGE).count() as u64;
+    let (by_writer, by_handle) = ([40usize, 700], [1500usize, 2999]);
+    assert_eq!(slot_pages(40), 2, "rank 40 straddles");
+    for &r in by_writer.iter().chain(&by_handle) {
+        let (k, v) = (keys[r].clone(), format!("second {r}").into_bytes());
+        db.append(&k, &v);
+        model.get_mut(&k).unwrap().push(v);
+    }
+    db.commit().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        (db.segments() as u64, c.partitions, c.stride_files),
+        (1, 1, 1),
+        "one partition and no piece: {c:?}"
+    );
+    assert_eq!(c.stride_page_checks, 0, "nothing read yet: {c:?}");
+    let one = |r: &Reader, rank: usize, what: &str| {
+        let before = db.zpage_counts().stride_page_checks;
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        r.scan(
+            &keys[rank],
+            1,
+            kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+        )
+        .unwrap();
+        let want: Vec<(Vec<u8>, Vec<u8>)> = model[&keys[rank]]
+            .iter()
+            .map(|v| (keys[rank].clone(), v.clone()))
+            .collect();
+        assert_eq!(want.len(), 2, "the record's value and the memtable's");
+        assert_eq!(got, want, "{what}: a scan of one key from rank {rank}");
+        assert_eq!(
+            db.zpage_counts().stride_page_checks - before,
+            slot_pages(rank),
+            "{what}: rank {rank}'s slot read through the stride file"
+        );
+    };
+    for &r in &by_writer {
+        one(&db, r, "the writer");
+    }
+    let h = db.reader().unwrap();
+    for &r in &by_handle {
+        one(&h, r, "a handle");
+    }
+    check_scan(&db, &model, "the writer");
+    check_scan(&h, &model, "a handle");
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.fallbacks, c.damaged, c.bad_pages, c.rawserves),
+        (0, 0, 0, 0),
+        "{c:?}"
+    );
+    drop(h);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// A stride file a build of this process made and kept in the page cache
+/// is checked page by page, as one found on disk is, whether the trust in
+/// this process's builds is on or off: its read-back read the cache, and an
+/// attach marks a trusted page verified for the file's life, so a page the
+/// cache gives up after the attach that follows the build is read from the
+/// device's copy, which no read of this process has seen
+/// (`zfile::Built::left_seal`). The count of checks is the pages the reads
+/// touch, once each, at the build and again at a reopen. Under the segment
+/// work's thread, whose builds the settle waits for, and with the segment
+/// work inline, where the settle builds and attaches itself (`Db::z_give`);
+/// both keep their pages, and the builds that drop theirs and are trusted
+/// are held where they are made
+/// (`a_stride_file_built_ahead_is_trusted_at_its_late_attach_where_its_read_back_read_the_device`,
+/// and the word a build leaves, by the kernel's count, in `zfile`'s own
+/// tests). What the check sees, the copy a page's first touch reads, is
+/// held by
+/// `a_kept_stride_files_check_is_of_the_copy_a_pages_first_touch_reads`.
+#[test]
+fn a_stride_file_a_build_kept_in_the_cache_is_checked_page_by_page_as_one_found_on_disk_is() {
+    for (trust, inline) in [(true, false), (false, false), (true, true), (false, true)] {
+        let dir = scratch(&format!("stride-trust-{trust}-{inline}"));
+        let opts = || {
+            stride_forced(|o| {
+                o.zpages_stride_trust_built = trust;
+                o.publish_in_background = !inline;
+            })
+        };
+        let mut db = Db::create(&dir, opts()).unwrap();
+        let model = numbered_load(&mut db, 3000, 100, 0x7357);
+        db.zpages_settle().unwrap();
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&db, &model, &keys, "built here");
+        let c = db.zpage_counts();
+        assert_eq!(c.stride_files, 1, "{c:?}");
+        assert!(c.pages > 16, "{c:?}");
+        assert_eq!(c.verified_pages, c.pages, "every page verified: {c:?}");
+        assert_eq!(
+            c.stride_page_checks, c.pages,
+            "trust {trust}, inline {inline}: every page checked at its first touch: {c:?}"
+        );
+        check(&db, &model, &keys, "built here, again");
+        assert_eq!(
+            db.zpage_counts().stride_page_checks,
+            c.pages,
+            "and never again"
+        );
+        assert_eq!(db.zpage_counts().stride_reads, 2 * keys.len() as u64);
+        db.close().unwrap();
+        let db = Db::open(&dir, opts()).unwrap();
+        // Ranks 0 to 200: bytes to 20,100, pages 0 to 4.
+        check(&db, &model, &keys[..=200], "found on disk");
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.stride_page_checks, c.verified_pages),
+            (5, 5),
+            "the pages the reads touched, once each: {c:?}"
+        );
+        check(&db, &model, &keys[..=200], "again");
+        assert_eq!(db.zpage_counts().stride_page_checks, 5);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// One byte of `file` at `at` flipped on the device past the page cache: the
+/// page around it read and written back with `O_DIRECT`, which writes the
+/// device's copy and drops the cached one and the mappings of it, so that
+/// the next touch of the page reads the device.
+#[cfg(target_os = "linux")]
+fn flip_on_the_device(file: &Path, at: usize) {
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+    const PAGE: usize = 4096;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(file)
+        .unwrap();
+    let layout = std::alloc::Layout::from_size_align(PAGE, PAGE).unwrap();
+    // SAFETY: a buffer of `PAGE` bytes at the page's alignment, which
+    // `O_DIRECT` asks of it, freed below with the same layout.
+    let buf = unsafe { std::alloc::alloc_zeroed(layout) };
+    assert!(!buf.is_null());
+    // SAFETY: `buf` holds `PAGE` initialized bytes until it is freed.
+    let page = unsafe { std::slice::from_raw_parts_mut(buf, PAGE) };
+    let off = (at / PAGE * PAGE) as u64;
+    f.read_exact_at(page, off).unwrap();
+    page[at % PAGE] ^= 0x40;
+    f.write_all_at(page, off).unwrap();
+    // SAFETY: allocated above with `layout`, and no slice of it outlives this.
+    unsafe { std::alloc::dealloc(buf, layout) };
+}
+
+/// A stride file a build of this process kept in the page cache is checked
+/// at each value page's first touch, and the check is of the copy that touch
+/// reads and stands for the file's life (`zfile::Built::left_seal`). A value
+/// byte of page 1 changed on the device after the page's first touch is not
+/// checked: the read of the rank over it serves the device's copy, nothing
+/// refused and no check made again. The same byte changed on the device
+/// before the page's first touch is: the touch reads the device's copy, the
+/// check refuses it, and the read is answered through the raw form. The
+/// build's own writeback error, the case a cached copy could check right
+/// over a wrong one, fails the build before its read-back
+/// (`zfile::read_writeback`, held in `zfile`'s own tests).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_kept_stride_files_check_is_of_the_copy_a_pages_first_touch_reads() {
+    // Rank 41's value is bytes 4,100 to 4,200, in value page 1.
+    const RANK: usize = 41;
+    const AT: usize = 4096 + 100;
+    for touched in [true, false] {
+        let what = format!("the device's copy changed after the page's first touch {touched}");
+        let what = what.as_str();
+        let dir = scratch(&format!("stride-copy-{touched}"));
+        let mut db = Db::create(&dir, stride_forced(|_| {})).unwrap();
+        let model = numbered_load(&mut db, 3000, 100, 0x7358);
+        db.zpages_settle().unwrap();
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let files = named_form_files(&dir);
+        assert_eq!(files.len(), 1, "{what}: {files:?}");
+        let key = numbered_key(RANK);
+        let want = model.get(&key).cloned().unwrap();
+        let mut flipped = want.clone();
+        flipped[0][AT - RANK * 100] ^= 0x40;
+        if touched {
+            check(&db, &model, &keys, what);
+        }
+        let before = db.zpage_counts();
+        assert_eq!(before.stride_files, 1, "{what}: {before:?}");
+        flip_on_the_device(&files[0], AT);
+        let got = read_vec(&db, &key);
+        let c = db.zpage_counts();
+        if touched {
+            assert_eq!(
+                got, flipped,
+                "{what}: the device's copy served, the check not made again"
+            );
+            assert_eq!(
+                (
+                    c.stride_page_checks,
+                    c.bad_pages,
+                    c.damaged,
+                    c.fallbacks,
+                    c.stride_reads
+                ),
+                (before.stride_page_checks, 0, 0, 0, before.stride_reads + 1),
+                "{what}: {c:?}"
+            );
+        } else {
+            assert_eq!(got, want, "{what}: the raw form's answer");
+            assert_eq!(
+                (c.stride_page_checks, c.bad_pages, c.fallbacks),
+                (1, 1, 1),
+                "{what}: the page checked at its first touch, in the device's copy, and refused: {c:?}"
+            );
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A promotion while stride files stand: a run appended above the store's
+/// greatest key and flushed is a piece the flush promotes by link -- the
+/// last partition closed at the piece's first key and opened again under
+/// its new name with an empty cell, the piece made a partition of its own.
+/// A promotion keeps the two fields a form file is named by, so the closed
+/// partition's stride file is the one under its name, attached as a file
+/// found on disk: the same inode, and its pages checked again at their
+/// first touch, where the files that stand installed, their pages verified
+/// by the reads before the promotion, are checked nowhere again. The one
+/// build is the new partition's, a build that kept its pages and so checked
+/// at their first touch as well; every other file stands as it stood. Every
+/// partition a stride file, none refused, and the reads through the
+/// writer, a handle and a reopen the model's. The oracle's store writes
+/// inside its range and never promotes after its load
+/// (`the_oracle_holds_with_the_stride_form_forced`); this is the state it
+/// cannot reach.
+#[cfg(unix)]
+#[test]
+fn a_promotion_keeps_the_stride_file_of_the_partition_it_closes() {
+    use std::os::unix::fs::MetadataExt;
+    const N: usize = 3000;
+    const MORE: usize = 600;
+    let dir = scratch("stride-promote");
+    let opts = || stride_forced(|o| o.partition_bytes = Some(64 << 10));
+    let inodes = || -> BTreeMap<PathBuf, u64> {
+        form_files(&dir)
+            .into_iter()
+            .map(|f| {
+                let ino = std::fs::metadata(&f).unwrap().ino();
+                (f, ino)
+            })
+            .collect()
+    };
+    let mut db = Db::create(&dir, opts()).unwrap();
+    let mut model = numbered_load(&mut db, N, 100, 0x9A0E);
+    db.zpages_settle().unwrap();
+    let loaded = db.zpage_counts();
+    assert!(
+        loaded.partitions > 1 && loaded.stride_files == loaded.partitions,
+        "every partition of the load a stride file: {loaded:?}"
+    );
+    let keys: Vec<Vec<u8>> = (0..N + MORE + 20).map(numbered_key).collect();
+    let before = inodes();
+    let pages_of = |files: &mut dyn Iterator<Item = &PathBuf>| -> u64 {
+        files.map(|f| stride_of(f).1 as u64).sum()
+    };
+    check(&db, &model, &keys, "loaded");
+    let loaded_checks = db.zpage_counts().stride_page_checks;
+    assert_eq!(
+        loaded_checks,
+        pages_of(&mut before.keys()),
+        "the load's files are builds that kept their pages: each page checked at its first touch"
+    );
+    // The last partition's file, the one the promotion will close: the
+    // file whose run starts at the greatest key, and its value pages.
+    let closed_pages = before
+        .keys()
+        .map(|f| {
+            let (t, v) = stride_of(f);
+            let mut buf = [0u8; supdb::db::zpages::STRIDE_KEY_MAX];
+            (t.codec.render(t.codec.base(), &mut buf).to_vec(), v as u64)
+        })
+        .max()
+        .map(|(_, v)| v)
+        .unwrap();
+    let (promoted, builds) = (db.promotions().0, loaded.stride_builds);
+    // The run above the greatest key, one width: a run the form holds.
+    let mut rng = Rng(0x9A0F);
+    for chunk in (N..N + MORE).collect::<Vec<_>>().chunks(200) {
+        for &i in chunk {
+            let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
+            let k = numbered_key(i);
+            db.append(&k, &v);
+            model.insert(k, vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    db.zpages_settle().unwrap();
+    let pieces = db.promotions().0 - promoted;
+    let c = db.zpage_counts();
+    assert!(pieces > 0, "the flush promoted its piece: {c:?}");
+    assert_eq!(
+        (c.partitions, c.stride_files, c.form_files),
+        (
+            loaded.partitions + pieces,
+            loaded.partitions + pieces,
+            loaded.partitions + pieces
+        ),
+        "a partition for each piece, every one a stride file: {c:?}"
+    );
+    assert_eq!(
+        (c.rejected_damage, c.rejected_identity, c.build_failed),
+        (0, 0, 0),
+        "{c:?}"
+    );
+    assert_eq!(
+        c.stride_builds - builds,
+        pieces,
+        "the new partitions' builds and no other: {c:?}"
+    );
+    let after = inodes();
+    for (f, ino) in &before {
+        assert_eq!(
+            after.get(f),
+            Some(ino),
+            "{f:?}: the file a promotion keeps the name of stands as it stood"
+        );
+    }
+    assert_eq!(after.len(), before.len() + pieces as usize, "{after:?}");
+    // The reads after the promotion: the closed partition's file attached
+    // as found, so every page its keys' reads touch is checked, once; the
+    // new partition's a build that kept its pages, checked so too; the rest
+    // verified by the reads before and checked nowhere again.
+    let new_pages = pages_of(&mut after.keys().filter(|f| !before.contains_key(*f)));
+    check(&db, &model, &keys, "promoted, writer");
+    let c = db.zpage_counts();
+    assert_eq!(
+        c.stride_page_checks - loaded_checks,
+        closed_pages + new_pages,
+        "the closed partition's pages and the new partition's checked, and nobody else's: {c:?}"
+    );
+    assert_eq!((c.fallbacks, c.damaged, c.bad_pages), (0, 0, 0), "{c:?}");
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, "promoted, handle");
+    check_scan(&r, &model, "promoted, handle");
+    drop(r);
+    check_scan(&db, &model, "promoted, writer");
+    let reads = db.zpage_counts().stride_reads;
+    assert!(reads > 0, "the reads were the stride files'");
+    db.close().unwrap();
+    let db = Db::open(&dir, opts()).unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        (
+            c.partitions,
+            c.stride_files,
+            c.rejected_damage,
+            c.rejected_identity
+        ),
+        (loaded.partitions + pieces, loaded.partitions + pieces, 0, 0),
+        "reopened: {c:?}"
+    );
+    check(&db, &model, &keys, "reopened, writer");
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, "reopened, handle");
+    check_scan(&r, &model, "reopened, handle");
+    drop(r);
+    let c = db.zpage_counts();
+    assert!(
+        c.stride_reads > 0 && (c.fallbacks, c.damaged, c.bad_pages) == (0, 0, 0),
+        "{c:?}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Under the controller, a merge's outputs given their form files at their
+/// finish (`Options::zpages_build_at_finish`) ask for the stride form as
+/// every other build of a partition's form does (`Options::z_stride_ask`):
+/// a store of numbered keys past its share of the budget, every key put
+/// again with one value of the load's width and the pieces merged, has its
+/// outputs built at their finish in the stride form -- and nothing else
+/// built, the builds ahead at landing held off by the scans, so that the
+/// stride builds are the finishes' alone -- and every form file it holds is
+/// a stride file. The controller's attach of those files, ticks later, is
+/// the finishes' builds' own attach come late (`Shared::z_left_seals`),
+/// with nothing built again in between; whether it trusts them is whether
+/// their read-back read the device (`zfile::Built::left_seal`). Under the
+/// selector's line the finishes write their files back and drop them as
+/// they go, the last piece too before the read-back: each file's word kept
+/// until that attach and taken by it, and each file installed with its value
+/// pages verified from the attach and none checked as the reads of every key
+/// touch them. Past the line they keep their pages, the read-back reads the
+/// cache, and no word is kept: the attach checks each page the reads touch,
+/// as a file found on disk is checked (`Options::zpages_stride_trust_built`).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_merges_outputs_are_built_in_the_stride_form_at_their_finish() {
+    for past in [true, false] {
+        let what = format!("the stride form at the outputs' finish, past the line {past}");
+        let what = what.as_str();
+        let (dir, mut db, mut model, inject, raw) = land_store_loaded(
+            &format!("auto-finish-stride-{past}"),
+            50,
+            |o| {
+                o.zpages_stride = ZStride::Forced;
+                o.zpages_build_at_finish = true;
+                o.zpages_ahead_builders = 8;
+                o.partition_bytes = Some(1 << 20);
+                o.l0_trigger = 1;
+            },
+            |db| numbered_load(db, 20_000, 100, 0x5F1),
+        );
+        let mut seen = 0usize;
+        db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+        assert_eq!(seen, 10);
+        inject.set_decode_cost(std::time::Duration::from_micros(1));
+        // Past the line, or a third under the budget: past the share of
+        // it the builds ahead and the finishes start at (`zpages_land_pct`
+        // fifty) and under the line.
+        inject.set_budget(if past { raw / 2 } else { raw * 3 / 2 });
+        wait_steps(&db, 2);
+        let c = db.zpage_counts();
+        assert!(c.partitions >= 2, "{what}: {c:?}");
+        assert_eq!(
+            (c.stride_builds, c.finish_builds, c.build_starts),
+            (0, 0, 0),
+            "{what}: nothing built before the rewrite: {c:?}"
+        );
+        let mut rng = Rng(0x5EED);
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        for chunk in keys.chunks(250) {
+            for k in chunk {
+                let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
+                db.put(k, &v);
+                model.insert(k.clone(), vec![v]);
+            }
+            db.commit().unwrap();
+        }
+        db.seal().unwrap();
+        db.settle().unwrap();
+        wait_for("the builds at the outputs' finish to end", || {
+            let c = db.zpage_counts();
+            c.finish_builds >= 1 && c.finish_live == 0 && db.merges_in_flight() == 0
+        });
+        let c = db.zpage_counts();
+        assert_eq!(
+            c.build_starts, 0,
+            "{what}: no build but the finishes': {c:?}"
+        );
+        assert_eq!(
+            c.stride_builds, c.finish_builds,
+            "{what}: every output built at its finish a stride file: {c:?}"
+        );
+        let files = form_files(&dir);
+        assert!(!files.is_empty(), "{what}");
+        for f in &files {
+            let b = std::fs::read(f).unwrap();
+            assert_eq!(
+                supdb::db::zpages::trailer_magic(&b[b.len() - ZTRAILER..]),
+                Some(supdb::db::zpages::STRIDE_MAGIC),
+                "{what}: {f:?} is not a stride file"
+            );
+        }
+        // Under the line a word kept for each live partition's file until
+        // the attach that installs it; past it none, live or not.
+        let c = db.zpage_counts();
+        assert!(c.partitions > c.form_files, "{what}: {c:?}");
+        if past {
+            assert_eq!(
+                db.zpage_left_seals_held(),
+                0,
+                "{what}: no word for a file whose read-back read the cache: {c:?}"
+            );
+        } else {
+            assert_eq!(
+                db.zpage_left_seals() as u64,
+                c.partitions - c.form_files,
+                "{what}: the finishes' words kept: {c:?}"
+            );
+            // The controller's buy: past the line, the files on disk.
+            inject.set_budget(raw / 2);
+        }
+        assert!(
+            tick_until(&db, 400, |c| c.sel_installs >= 1
+                && c.form_files == c.partitions),
+            "{what}: the files on disk not installed: {:?}",
+            db.zpage_counts()
+        );
+        assert_eq!(db.zpage_left_seals(), 0, "{what}: the words taken");
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.stride_files, c.build_starts, c.ahead_recoded),
+            (c.partitions, 0, 0),
+            "{what}: the finishes' files installed, nothing built again: {c:?}"
+        );
+        let r = db.reader().unwrap();
+        check(&r, &model, &keys, what);
+        drop(r);
+        // Reads through the files, if not every key's: a key a piece still
+        // holds, one the merges have not folded yet, is answered by the
+        // piece's tombstone and value and never reaches its partition.
+        let c = db.zpage_counts();
+        assert!(c.stride_reads > 0, "{what}: {c:?}");
+        assert_eq!(c.fallbacks, 0, "{what}: {c:?}");
+        if past {
+            assert!(
+                c.verified_pages > 0 && c.stride_page_checks >= c.verified_pages,
+                "{what}: every page verified by a check at its first touch: {c:?}"
+            );
+        } else {
+            assert_eq!(
+                (c.stride_page_checks, c.verified_pages),
+                (0, c.pages),
+                "{what}: the files a build of this process left installed trusted: {c:?}"
+            );
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A build at a merge's output finish says why the stride form does not
+/// hold its partition, as every other build of a partition's form does
+/// (`Seg::z_stride_no`, `Db::zpage_stride_nos`): the output's segment is not
+/// live while it is built, so the reason waits by the file's name and the
+/// attach that installs the file gives it to the segment
+/// (`Maint::z_finish_stride`). Every key put again with one value and the
+/// upper half's given a second, the pieces merged and each output built at
+/// its finish -- a stride file for the lower half's partitions, a block file
+/// for the rest -- and the controller's attach of those files leaves each
+/// partition its reason: none where its stride file serves it, a record of
+/// two values where the block body does. Unnoted, every partition read as
+/// one the stride form holds or none had asked of.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_merges_outputs_built_at_their_finish_keep_why_the_stride_form_does_not_hold_them() {
+    let what = "the reasons the finishes kept";
+    let (dir, mut db, mut model, inject, raw) = land_store_loaded(
+        "auto-finish-reasons",
+        50,
+        |o| {
+            o.zpages_stride = ZStride::Forced;
+            o.zpages_build_at_finish = true;
+            o.zpages_ahead_builders = 8;
+            o.partition_bytes = Some(1 << 20);
+            o.l0_trigger = 1;
+        },
+        |db| numbered_load(db, 20_000, 100, 0x5F3),
+    );
+    let mut seen = 0usize;
+    db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+    assert_eq!(seen, 10);
+    inject.set_decode_cost(std::time::Duration::from_micros(1));
+    inject.set_budget(raw / 2);
+    wait_steps(&db, 2);
+    let mut rng = Rng(0x5EEE);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let half = keys.len() / 2;
+    for (c, chunk) in keys.chunks(250).enumerate() {
+        for (i, k) in chunk.iter().enumerate() {
+            let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
+            db.put(k, &v);
+            let mut vs = vec![v];
+            if c * 250 + i >= half {
+                let w: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
+                db.append(k, &w);
+                vs.push(w);
+            }
+            model.insert(k.clone(), vs);
+        }
+        db.commit().unwrap();
+    }
+    db.seal().unwrap();
+    db.settle().unwrap();
+    wait_for("the builds at the outputs' finish to end", || {
+        let c = db.zpage_counts();
+        c.finish_builds >= 1 && c.finish_live == 0 && db.merges_in_flight() == 0
+    });
+    let c = db.zpage_counts();
+    assert_eq!(
+        c.build_starts, 0,
+        "{what}: no build but the finishes': {c:?}"
+    );
+    assert!(
+        c.stride_builds > 0 && c.stride_builds < c.finish_builds,
+        "{what}: both bodies built at the finishes: {c:?}"
+    );
+    assert!(
+        tick_until(&db, 400, |c| c.sel_installs >= 1
+            && c.form_files == c.partitions),
+        "{what}: the files on disk not installed: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.build_starts, c.ahead_recoded),
+        (0, 0),
+        "{what}: the finishes' files installed as they lie: {c:?}"
+    );
+    let nos = db.zpage_stride_nos();
+    assert_eq!(nos.len() as u64, c.partitions, "{what}: {c:?}");
+    let held = nos.iter().filter(|&&n| n == 0).count() as u64;
+    assert!(
+        held > 0 && held < c.partitions,
+        "{what}: both bodies: {nos:?} {c:?}"
+    );
+    assert_eq!(
+        held, c.stride_files,
+        "{what}: a partition with no reason is one its stride file holds: {nos:?} {c:?}"
+    );
+    assert!(
+        nos.iter().all(|&n| n == 0 || n == STRIDE_NOT_ONE_VALUE),
+        "{what}: the upper half's reason, two values: {nos:?}"
+    );
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, what);
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The builds ahead at landing: a store of numbered keys past the share of
+/// its budget the builds ahead start at has every partition's stride file
+/// built ahead and left dormant on disk, and the attach that first installs
+/// one is its build's own attach come late (`Shared::z_left_seals`), which
+/// trusts it only where its read-back read the device
+/// (`zfile::Built::left_seal`). Under the selector's line a build ahead
+/// writes its file back and drops it as it goes, the last piece too before
+/// the read-back (`zfile::BuildPlan::drop_output`): the read-back reads the
+/// device's copy, the one every read after the drop reads, and the word is
+/// kept. Past the line -- the sample and the suspicion held off so that the
+/// builds ahead finish dormant -- a build ahead keeps its pages, the
+/// read-back reads the page cache, and no word is kept: a page the cache
+/// gives up before the attach is read from the device, which no check has
+/// seen. Driven to COMPACT far past the budget by faulting reads, every file
+/// is attached, nothing built again, and the reads through the files check
+/// no page under the line and each page they touch at its first touch past
+/// it, as a file found on disk is checked.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stride_file_built_ahead_is_trusted_at_its_late_attach_where_its_read_back_read_the_device() {
+    for past in [false, true] {
+        let what = format!("the stride form built ahead, past the line {past}");
+        let what = what.as_str();
+        let (dir, db, model, inject, raw) = land_store_loaded(
+            &format!("auto-ahead-stride-{past}"),
+            50,
+            |o| {
+                o.zpages_stride = ZStride::Forced;
+                o.partition_bytes = Some(160 << 10);
+                o.zpages_land_cold_past = false;
+                if past {
+                    // The sample waits for the builds ahead and nothing is
+                    // suspected at the crossing, so that nothing is bought
+                    // before every build ahead has finished dormant.
+                    o.zpages_cover_resident = false;
+                    o.zpages_suspect_at_crossing = false;
+                }
+            },
+            |db| numbered_load(db, 20_000, 100, 0xA4EA),
+        );
+        inject.set_budget(if past { raw * 2 / 3 } else { raw * 3 / 2 });
+        assert!(
+            tick_until_built(&db, |c| c.prebuilt >= c.partitions),
+            "{what}: built ahead: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        let n = c.partitions;
+        assert!(n >= 4, "{what}: {c:?}");
+        assert_eq!(
+            (c.stride_builds, c.prebuilt, c.attached, c.form_files),
+            (n, n, 0, 0),
+            "{what}: every partition's stride file built ahead and dormant: {c:?}"
+        );
+        assert_eq!(
+            (
+                db.zpage_left_seals() as u64,
+                db.zpage_left_seals_held() as u64
+            ),
+            if past { (0, 0) } else { (n, n) },
+            "{what}: a word kept for a file whose read-back read the device alone: {c:?}"
+        );
+        inject.set_budget(1 << 20);
+        inject.set_refault_rate(1_000_000.0);
+        inject.set_fault_cost(FAULT_1MS);
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= n && c.form_files == n),
+            "{what}: every partition attached: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.stride_files, c.build_starts),
+            (n, n),
+            "{what}: the files built ahead installed, nothing built again: {c:?}"
+        );
+        assert_eq!(db.zpage_left_seals_held(), 0, "{what}: the words taken");
+        check(&r, &model, &keys, what);
+        drop(r);
+        let c = db.zpage_counts();
+        assert!(c.stride_reads > 0, "{what}: through the files: {c:?}");
+        if past {
+            assert!(
+                c.verified_pages > 0 && c.stride_page_checks >= c.verified_pages,
+                "{what}: every page verified by a check at its first touch: {c:?}"
+            );
+        } else {
+            assert_eq!(
+                (c.stride_page_checks, c.verified_pages),
+                (0, c.pages),
+                "{what}: every page verified from the attach, none checked: {c:?}"
+            );
+        }
+        assert_eq!(c.fallbacks, 0, "{what}: {c:?}");
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A form file its build dropped from the page cache as it wrote it is
+/// asked back whole where the build is taken in with the store past the
+/// selector's line (`Options::zpages_ask_dropped`). A build ahead begun
+/// under the line drops its output, so that a raw form that fits keeps its
+/// cache; the crossing asks for the files then on disk, and a build in
+/// flight at the crossing is not among them. Here the first build ahead
+/// is held at its start, the store is taken past the line, and the build
+/// is let go: taken in with the form wanted, its file is asked for before
+/// the attach and is in the cache soon after; landed dormant, it is
+/// swapped as the crossing swaps a file, its records dropped and its
+/// pages asked for. Without the option the file is attached, or left,
+/// with the pages its build dropped still out: at ten million keys under
+/// 1.25 GiB the two such files took four fifths of the read pass's major
+/// faults, a page each.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_build_in_flight_at_the_crossing_has_the_file_it_dropped_asked_back() {
+    for (on, wanted, crossed) in [
+        (true, true, true),
+        (true, false, true),
+        (false, true, true),
+        (false, false, true),
+        (true, false, false),
+    ] {
+        let what = format!(
+            "ask dropped {on}, taken in with the form wanted {wanted}, past the line {crossed}"
+        );
+        let what = what.as_str();
+        let (dir, db, model, inject, raw) = land_store_loaded(
+            &format!("auto-ask-dropped-{on}-{wanted}-{crossed}"),
+            50,
+            |o| {
+                o.zpages_ask_dropped = on;
+                o.partition_bytes = Some(400 << 10);
+                o.zpages_ahead_builders = 1;
+                // Nothing but the ask brings the file in.
+                o.zpages_warm = false;
+                if !wanted {
+                    // Nothing is bought before the builds ahead are in.
+                    o.zpages_cover_resident = false;
+                    o.zpages_suspect_at_crossing = false;
+                }
+            },
+            |db| numbered_load(db, 20_000, 100, 0xD809),
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        // Past the percent and under the line: the first build ahead
+        // starts, and is held before its first write.
+        db.hold_zpage_build(true);
+        inject.set_budget(raw * 3 / 2);
+        let t = std::time::Instant::now();
+        while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+            wait_steps(&db, 1);
+        }
+        let c = db.zpage_counts();
+        assert!(
+            db.zpage_build_waiting() && (c.build_starts, c.prebuilt) == (1, 0),
+            "{what}: one build ahead, held: {c:?}"
+        );
+        assert!(named_form_files(&dir).is_empty(), "{what}: nothing on disk");
+        // Past the line, with nothing on disk for the crossing to ask for;
+        // or, in the last case, still under it, where a file its build
+        // dropped is left dropped: the raw form fits and wants the cache.
+        if crossed {
+            inject.set_budget(raw / 3);
+        }
+        wait_steps(&db, 5);
+        let on = on && crossed;
+        let r = db.reader().unwrap();
+        if wanted {
+            inject.set_refault_rate(1_000_000.0);
+            inject.set_fault_cost(FAULT_1MS);
+            let mut at = 0usize;
+            let mut rounds = 0;
+            while db.zpage_counts().phase < 2 && rounds < 400 {
+                reads(&r, &keys, &inject, 640, &mut at, 1);
+                close_window(&db, &r, &keys[0]);
+                rounds += 1;
+            }
+            let c = db.zpage_counts();
+            assert!(
+                c.phase >= 2 && db.zpage_build_waiting(),
+                "{what}: the form wanted with the build still held: {c:?}"
+            );
+        }
+        let c = db.zpage_counts();
+        assert_eq!(
+            (
+                c.build_starts,
+                c.build_collected,
+                c.ahead_swapped,
+                c.dropped_asks
+            ),
+            (1, 0, 0, 0),
+            "{what}: the crossing swapped nothing and asked for nothing: {c:?}"
+        );
+        db.hold_zpage_build(false);
+        assert!(
+            tick_until_built(&db, |c| c.build_collected >= 1),
+            "{what}: the held build taken in: {:?}",
+            db.zpage_counts()
+        );
+        // The first file to have a name is the held build's: one builder,
+        // and the builds after it start once it is in.
+        let first = named_form_files(&dir);
+        let c = db.zpage_counts();
+        assert!(
+            !first.is_empty() && c.builds >= 1,
+            "{what}: its file on disk: {c:?} {first:?}"
+        );
+        let held = first[0].file_name().unwrap().to_string_lossy().into_owned();
+        if wanted {
+            assert!(c.attached >= 1, "{what}: attached at its collect: {c:?}");
+        } else {
+            assert_eq!(
+                (c.attached, c.prebuilt >= 1),
+                (0, true),
+                "{what}: landed dormant: {c:?}"
+            );
+        }
+        assert_eq!(
+            (c.dropped_asks, c.dropped_ask_bytes > 0),
+            (u64::from(on), on),
+            "{what}: the dropped file asked for with the option alone: {c:?}"
+        );
+        if !wanted {
+            assert_eq!(
+                c.ahead_swapped,
+                u64::from(on),
+                "{what}: swapped as the crossing swaps a file: {c:?}"
+            );
+        }
+        let share = |dir: &Path| {
+            let (size, resident) = resident_under(dir, &held);
+            assert!(size > 0, "{what}: {held} is there");
+            resident as f64 / size as f64
+        };
+        if on {
+            wait_for(&format!("{what}: {held} in the cache"), || {
+                share(&dir) >= 0.9
+            });
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let s = share(&dir);
+            assert!(
+                s < 0.5,
+                "{what}: nothing asked for the pages its build dropped: {s}"
+            );
+        }
+        check(&r, &model, &keys, what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// `n` numbered keys from `from` on, one value of the load's width each,
+/// appended above the store's greatest key in batches and flushed: a run
+/// the stride form holds, which the flush promotes into a partition of its
+/// own, closing the last partition at the run's first key and opening it
+/// again under a new name with the two fields its form file is named by
+/// kept.
+#[cfg(target_os = "linux")]
+fn numbered_run(db: &mut Db, model: &mut Model, from: usize, n: usize, seed: u64) {
+    let mut rng = Rng(seed);
+    for chunk in (from..from + n).collect::<Vec<_>>().chunks(500) {
+        for &i in chunk {
+            let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
+            let k = numbered_key(i);
+            db.append(&k, &v);
+            model.insert(k, vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+}
+
+/// The named form files in a store's directory, no build's temporary name
+/// among them.
+#[cfg(target_os = "linux")]
+fn named_form_files(dir: &Path) -> Vec<PathBuf> {
+    form_files(dir)
+        .into_iter()
+        .filter(|f| f.extension().is_some_and(|e| e == "zpg"))
+        .collect()
+}
+
+/// A store of numbered keys under the stride form whose every partition's
+/// file was built ahead under the selector's line, each a build that wrote
+/// its output back and dropped it, so that its read-back read the device and
+/// its word is kept; then a run appended above the greatest key and
+/// promoted, the new partition's build ahead held at its rename -- a build
+/// of the same kind, past its read-back with its word in hand. With the
+/// named form files from before the run, every one of them a partition's
+/// that stands.
+#[cfg(target_os = "linux")]
+#[allow(clippy::type_complexity)]
+fn stride_store_with_a_build_ahead_held(
+    name: &str,
+    extra: impl FnOnce(&mut Options),
+) -> (
+    PathBuf,
+    Db,
+    Model,
+    std::sync::Arc<supdb::ZInject>,
+    u64,
+    Vec<PathBuf>,
+) {
+    let (dir, mut db, mut model, inject, raw) = land_store_loaded(
+        name,
+        50,
+        |o| {
+            o.zpages_stride = ZStride::Forced;
+            o.partition_bytes = Some(160 << 10);
+            o.zpages_land_cold_past = false;
+            extra(o);
+        },
+        |db| numbered_load(db, 20_000, 100, 0xA4EB),
+    );
+    inject.set_budget(raw * 3 / 2);
+    assert!(
+        tick_until_built(&db, |c| c.prebuilt >= c.partitions),
+        "{name}: built ahead: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.build_starts, c.prebuilt, db.zpage_left_seals() as u64),
+        (c.partitions, c.partitions, c.partitions),
+        "{name}: each partition built ahead once, its word kept: {c:?}"
+    );
+    let before = named_form_files(&dir);
+    assert_eq!(before.len() as u64, c.partitions, "{name}: {before:?}");
+    let promoted = db.promotions().0;
+    db.hold_zpage_rename(true);
+    numbered_run(&mut db, &mut model, 20_000, 1_500, 0xA4EC);
+    assert!(
+        db.promotions().0 > promoted,
+        "{name}: the run's piece promoted: {:?}",
+        db.zpage_counts()
+    );
+    assert!(
+        tick_until_built(&db, |n| n.build_starts == c.build_starts + 1
+            && db.zpage_build_waiting()),
+        "{name}: the run's partition's build ahead held at its rename: {:?}",
+        db.zpage_counts()
+    );
+    (dir, db, model, inject, raw, before)
+}
+
+/// A promotion while a build ahead of a partition's form file is in flight:
+/// the partition is opened again under a new name with the file's fields
+/// kept, and the checks of a build in flight ask of the form file, never of
+/// the name (`zfile::same_zpg`), so no second build of that file starts
+/// beside the held one -- the two would share its temporary name, and the
+/// held build's word, its read-back of the device, would stand for the
+/// second's file, whose read-back read the cache. A run appended and
+/// promoted with the new partition's build held at its rename under the
+/// selector's line; the budget then taken past the line, where a build
+/// ahead keeps its pages and leaves no word, every build held at its start
+/// as well, and a second run promoted over the held build's partition. The
+/// held build is the one build of its file: once both holds are lifted,
+/// every partition's form file was built once, the held build's file stands
+/// under its name as it was named, nothing was orphaned, and every file
+/// keeps its word but the second run's partition's, built past the line.
+/// Driven to COMPACT, the reads check that partition's pages and no other's,
+/// every page verified.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_build_ahead_in_flight_across_a_promotion_is_the_one_build_of_its_form_file() {
+    use std::os::unix::fs::MetadataExt;
+    let what = "a build ahead held across a promotion";
+    let (dir, mut db, mut model, inject, raw, before) =
+        stride_store_with_a_build_ahead_held("auto-ahead-promote", |o| {
+            // Nothing bought before the builds ahead have finished dormant.
+            o.zpages_cover_resident = false;
+            o.zpages_suspect_at_crossing = false;
+        });
+    let held = db.zpage_counts();
+    inject.set_budget(raw * 2 / 3);
+    db.hold_zpage_build(true);
+    let promoted = db.promotions().0;
+    numbered_run(&mut db, &mut model, 21_500, 1_500, 0xA4ED);
+    assert!(
+        db.promotions().0 > promoted,
+        "{what}: the second run's piece promoted over the held build's partition: {:?}",
+        db.zpage_counts()
+    );
+    wait_steps(&db, 10);
+    let c = db.zpage_counts();
+    assert_eq!(
+        c.partitions,
+        held.partitions + 1,
+        "{what}: the second run's partition: {c:?}"
+    );
+    db.hold_zpage_rename(false);
+    assert!(
+        tick_until_built(&db, |c| c.prebuilt > held.prebuilt),
+        "{what}: the held build collected: {:?}",
+        db.zpage_counts()
+    );
+    let named: Vec<PathBuf> = named_form_files(&dir)
+        .into_iter()
+        .filter(|f| !before.contains(f))
+        .collect();
+    assert_eq!(named.len(), 1, "{what}: the held build's file: {named:?}");
+    let first = named[0].clone();
+    let ino = std::fs::metadata(&first).unwrap().ino();
+    db.hold_zpage_build(false);
+    assert!(
+        tick_until_built(&db, |c| !building(c)
+            && named_form_files(&dir).len() as u64 == c.partitions),
+        "{what}: every partition's file on disk: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.build_starts, c.prebuilt, c.build_orphaned),
+        (c.partitions, c.partitions, 0),
+        "{what}: each partition's form file built once, nothing orphaned: {c:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&first).unwrap().ino(),
+        ino,
+        "{what}: the held build's file stands as it was named"
+    );
+    assert_eq!(
+        db.zpage_left_seals() as u64,
+        c.partitions - 1,
+        "{what}: a word for every file but the one built past the line: {c:?}"
+    );
+    let last: Vec<PathBuf> = named_form_files(&dir)
+        .into_iter()
+        .filter(|f| !before.contains(f) && *f != first)
+        .collect();
+    assert_eq!(last.len(), 1, "{what}: {last:?}");
+    let kept_pages = stride_of(&last[0]).1 as u64;
+    inject.set_budget(1 << 20);
+    inject.set_refault_rate(1_000_000.0);
+    inject.set_fault_cost(FAULT_1MS);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(
+        drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
+        "{what}: COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    let n = c.partitions;
+    assert!(
+        tick_until(&db, 400, |c| c.attached >= n && c.form_files == n),
+        "{what}: every partition attached: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.stride_files, c.build_starts),
+        (n, n),
+        "{what}: the files built ahead installed, nothing built again: {c:?}"
+    );
+    check(&r, &model, &keys, what);
+    drop(r);
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.stride_page_checks, c.verified_pages, c.fallbacks),
+        (kept_pages, c.pages, 0),
+        "{what}: the pages of the file built past the line checked, and no other's: {c:?}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A build ahead the controller buys while it is in flight: built dormant
+/// under the selector's line, so its read-back read the device, and held at
+/// its rename while faulting reads drive the controller to buy, so that it
+/// is collected as the controller's own build and installed at once
+/// (`Maint::z_collect`'s general arm) rather than left on disk. That attach
+/// takes the word the build leaves (`Options::z_stride_attach_built`): the
+/// file installed trusted, its pages verified from the attach, as the files
+/// built ahead before it are by the words their late attaches take. Every
+/// key read, no page checked.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_build_ahead_bought_while_in_flight_is_trusted_at_once_where_its_read_back_read_the_device() {
+    let what = "a build ahead bought in flight";
+    let (dir, db, model, inject, _raw, before) =
+        stride_store_with_a_build_ahead_held("auto-ahead-bought", |_| {});
+    let held = db.zpage_counts();
+    inject.set_budget(1 << 20);
+    inject.set_refault_rate(1_000_000.0);
+    inject.set_fault_cost(FAULT_1MS);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(
+        drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
+        "{what}: COMPACT with the build held: {:?}",
+        db.zpage_counts()
+    );
+    assert!(db.zpage_build_waiting(), "{what}: still held");
+    db.hold_zpage_rename(false);
+    let n = held.partitions;
+    assert!(
+        tick_until_built(&db, |c| c.attached >= n && c.form_files == n),
+        "{what}: every partition attached: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.prebuilt, c.build_starts, c.stride_files),
+        (held.prebuilt, n, n),
+        "{what}: the held build collected as the controller's, nothing built again: {c:?}"
+    );
+    assert_eq!(named_form_files(&dir).len() as u64, n, "{what}: {before:?}");
+    assert_eq!(db.zpage_left_seals_held(), 0, "{what}: the words taken");
+    check(&r, &model, &keys, what);
+    drop(r);
+    let c = db.zpage_counts();
+    assert!(c.stride_reads > 0, "{what}: through the files: {c:?}");
+    assert_eq!(
+        (c.stride_page_checks, c.verified_pages, c.fallbacks),
+        (0, c.pages, 0),
+        "{what}: every page verified from the attach, none checked: {c:?}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A promotion while a build at a merge's output finish is in flight: the
+/// output is opened again under a new name with its form file's fields
+/// kept, and the finish is in flight for the form file and not the name
+/// (`Maint::z_finishing`, `zfile::same_zpg`), so no build ahead of the same
+/// file starts beside it under the output's new name: the two would share
+/// the file's temporary name. A store whose every partition's stride file
+/// was built ahead under the selector's line; its greatest keys put again,
+/// sealed and merged, the outputs' finishes held at their renames, past the
+/// open of the output's file a promotion's unlink of its old name would
+/// fail; then a run appended above the greatest key and promoted over the
+/// last output. Once the hold is lifted, the one build ahead since is the
+/// run's partition's, every finish built its output's file, nothing was
+/// orphaned, and every partition has its file.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_finish_in_flight_across_a_promotion_is_the_one_build_of_its_form_file() {
+    let what = "a finish held across a promotion";
+    let (dir, mut db, mut model, inject, raw) = land_store_loaded(
+        "auto-finish-promote",
+        50,
+        |o| {
+            o.zpages_stride = ZStride::Forced;
+            o.zpages_build_at_finish = true;
+            o.partition_bytes = Some(160 << 10);
+            o.zpages_land_cold_past = false;
+            o.l0_trigger = 1;
+        },
+        |db| numbered_load(db, 20_000, 100, 0xF1A0),
+    );
+    inject.set_budget(raw * 3 / 2);
+    assert!(
+        tick_until_built(&db, |c| c.prebuilt >= c.partitions && !building(c)),
+        "{what}: built ahead: {:?}",
+        db.zpage_counts()
+    );
+    let c0 = db.zpage_counts();
+    assert_eq!(
+        (c0.build_starts, c0.finish_starts),
+        (c0.partitions, 0),
+        "{what}: {c0:?}"
+    );
+    // The greatest keys put again, one value of the load's width: the
+    // piece the seal makes is merged over the last partition, and the
+    // outputs' finishes are held at their renames.
+    db.hold_zpage_rename(true);
+    let mut rng = Rng(0xF1A1);
+    for i in 20_000 - 200..20_000 {
+        let k = numbered_key(i);
+        let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
+        db.put(&k, &v);
+        model.insert(k, vec![v]);
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    wait_for("the merge landed with its outputs' finishes held", || {
+        let c = db.zpage_counts();
+        c.finish_live >= 1 && db.merges_in_flight() == 0 && db.zpage_build_waiting()
+    });
+    let promoted = db.promotions().0;
+    numbered_run(&mut db, &mut model, 20_000, 1_500, 0xF1A2);
+    assert!(
+        db.promotions().0 > promoted,
+        "{what}: the run's piece promoted over the output: {:?}",
+        db.zpage_counts()
+    );
+    wait_steps(&db, 10);
+    db.hold_zpage_rename(false);
+    assert!(
+        tick_until_built(&db, |c| !building(c)
+            && c.finish_builds >= 1
+            && named_form_files(&dir).len() as u64 == c.partitions),
+        "{what}: every partition's file on disk: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.build_starts, c.build_orphaned, c.finish_failed),
+        (c0.build_starts + 1, 0, 0),
+        "{what}: the run's partition's build ahead and no build of the output's file: {c:?}"
+    );
+    assert_eq!(
+        c.finish_builds, c.finish_starts,
+        "{what}: every finish built its output's file: {c:?}"
+    );
+    let r = db.reader().unwrap();
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    check(&r, &model, &keys, what);
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Handles on threads read a store under the stride form while merges
+/// retire its stride files under them: round by round half the keys --
+/// one parity of their number, the other the next round -- are put again
+/// with a value of the load's width that says which round wrote it, each
+/// round sealed and its merges landed, so that every partition is
+/// rewritten, its stride file retired with its segment and the new
+/// partition's built -- the retire list freeing a file past every pin, the
+/// cells swapped under handles that hold the old one. The keys a round
+/// leaves alone are read from the partitions, so while a round's merges
+/// are held before their landing the handles' point reads are served by
+/// the stride files those merges will retire, and go on through the
+/// landing; a round that put every key would have its piece's tombstones
+/// answer every read, and no read would reach a file being retired. The
+/// handles' reads, counts and short scans answer each key with a round
+/// that wrote it, no older than the last such round whose merges had
+/// landed before the read began and no newer than the one being written
+/// after it ended: a value read through a retired partition's stride file
+/// after its replacement landed is a round behind. Every stride file a
+/// round began with is gone from the directory once its merges have landed
+/// and their builds are collected, before any settle of the form sweeps
+/// it. A snapshot pinned before the first round reads the load's values
+/// through the stride files the store began with, after the last round has
+/// retired them: each of those files, by its inode, still mapped and
+/// unlinked.
+#[test]
+fn handles_on_threads_read_stride_files_while_merges_retire_them() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    const ROUNDS: u64 = 3;
+    let what = "stride files under threads";
+    let dir = scratch("stride-threads");
+    let mut db = Db::create(
+        &dir,
+        stride_forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            o.l0_trigger = 1;
+        }),
+    )
+    .unwrap();
+    let model = Arc::new(numbered_load(&mut db, 6000, 100, 0x7D6));
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert!(
+        c.partitions >= 3 && c.stride_files == c.partitions,
+        "{what}: every partition a stride file: {c:?}"
+    );
+    #[cfg(target_os = "linux")]
+    let began: Vec<u64> = {
+        use std::os::unix::fs::MetadataExt;
+        form_files(&dir)
+            .iter()
+            .map(|f| std::fs::metadata(f).unwrap().ino())
+            .collect()
+    };
+    // Round `r`'s value of a key: the load's with every byte flipped by a
+    // pattern of the round's, so that no round's value is another's.
+    fn val(base: &[u8], r: u64) -> Vec<u8> {
+        base.iter().map(|b| b ^ (0x11 * r as u8)).collect()
+    }
+    fn round_of(base: &[u8], v: &[u8]) -> Option<u64> {
+        (0..=ROUNDS).find(|&r| val(base, r) == v)
+    }
+    // Whether round `r` writes the key at rank `i` (the load, round zero,
+    // writes them all), and the last round at or before `x` that did.
+    fn writes(i: usize, r: u64) -> bool {
+        r == 0 || r % 2 == i as u64 % 2
+    }
+    fn last_write(i: usize, x: u64) -> u64 {
+        (0..=x).rev().find(|&r| writes(i, r)).unwrap_or(0)
+    }
+    let keys: Arc<Vec<Vec<u8>>> = Arc::new(model.keys().cloned().collect());
+    let stop = Arc::new(AtomicBool::new(false));
+    // The last round whose merges have landed, and the round being written.
+    let landed = Arc::new(AtomicU64::new(0));
+    let writing = Arc::new(AtomicU64::new(0));
+    let snap = db.reader().unwrap();
+    snap.snapshot();
+    let mut threads = Vec::new();
+    for t in 0..3u64 {
+        let r = db.reader().unwrap();
+        let (model, keys, stop) = (model.clone(), keys.clone(), stop.clone());
+        let (landed, writing) = (landed.clone(), writing.clone());
+        threads.push(std::thread::spawn(move || {
+            let mut rng = Rng(0x2468 ^ ((t + 1) * 0x9E37));
+            let mut n = 0u64;
+            let held = |i: usize, v: &[u8], lo: u64, hi: u64, how: &str| {
+                let k = &keys[i];
+                let round = round_of(&model[k][0], v);
+                assert!(
+                    round.is_some_and(|r| writes(i, r) && (last_write(i, lo)..=hi).contains(&r)),
+                    "{how} of {k:?}: round {round:?}, landed {lo} before it, written {hi} after"
+                );
+            };
+            while !stop.load(Ordering::SeqCst) || n < 200 {
+                let i = rng.below(keys.len());
+                let k = &keys[i];
+                let lo = landed.load(Ordering::SeqCst);
+                match n % 3 {
+                    0 => {
+                        let got = read_vec(&r, k);
+                        assert_eq!(got.len(), 1, "a read of {k:?}");
+                        held(i, &got[0], lo, writing.load(Ordering::SeqCst), "a read");
+                    }
+                    1 => assert_eq!(r.count(k).unwrap(), 1, "a count of {k:?}"),
+                    _ => {
+                        let mut got = Vec::new();
+                        r.scan(k, 8, kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))))
+                            .unwrap();
+                        let hi = writing.load(Ordering::SeqCst);
+                        let want: Vec<&Vec<u8>> = keys[i..].iter().take(8).collect();
+                        let got_keys: Vec<&Vec<u8>> = got.iter().map(|(k, _)| k).collect();
+                        assert_eq!(got_keys, want, "a scan from {k:?}");
+                        for (j, (_, gv)) in got.iter().enumerate() {
+                            held(i + j, gv, lo, hi, "a scan");
+                        }
+                    }
+                }
+                n += 1;
+            }
+        }));
+    }
+    // Whether `done` came to hold within half a minute. The hold is let go
+    // before anything is asserted of it: a merge held at its landing is
+    // joined by the store's close, and a panic with the hold on would wait
+    // in the drop for ever.
+    fn until(db: &Db, done: impl Fn(&Db) -> bool) -> bool {
+        let t = std::time::Instant::now();
+        while !done(db) {
+            if t.elapsed().as_secs() >= 30 {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        true
+    }
+    for round in 1..=ROUNDS {
+        let before = form_files(&dir);
+        writing.store(round, Ordering::SeqCst);
+        let ranks: Vec<usize> = (0..keys.len()).filter(|&i| writes(i, round)).collect();
+        for chunk in ranks.chunks(250) {
+            for &i in chunk {
+                let k = &keys[i];
+                db.put(k, &val(&model[k][0], round));
+            }
+            db.commit().unwrap();
+        }
+        // The round's merges held before their landing: the partitions the
+        // handles read the round's other half from are the ones they will
+        // retire, and their stride files serve those reads meanwhile.
+        db.hold_merge_landing(true);
+        db.seal().unwrap();
+        let started = until(&db, |db| db.merges_in_flight() > 0);
+        let served = db.zpage_counts().stride_reads;
+        let read = started && until(&db, |db| db.zpage_counts().stride_reads >= served + 64);
+        let c = db.zpage_counts();
+        db.hold_merge_landing(false);
+        assert!(started, "{what}: round {round}: the merges started: {c:?}");
+        assert!(
+            read,
+            "{what}: round {round}: point reads served by the stride files being retired, {} since the hold: {c:?}",
+            c.stride_reads - served
+        );
+        db.settle().unwrap();
+        builds_collected(&db);
+        landed.store(round, Ordering::SeqCst);
+        // The landings that retired the round's partitions took their
+        // files: nothing has swept the directory since the round began.
+        let stayed: Vec<&PathBuf> = before.iter().filter(|f| f.exists()).collect();
+        assert!(
+            stayed.is_empty(),
+            "{what}: round {round}: a retired partition's stride file stayed: {stayed:?}"
+        );
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert_eq!(c.fallbacks, 0, "{what}: round {round}: {c:?}");
+    }
+    stop.store(true, Ordering::SeqCst);
+    for t in threads {
+        t.join().unwrap();
+    }
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.fallbacks, c.stride_files),
+        (0, c.partitions),
+        "{what}: every partition a stride file again: {c:?}"
+    );
+    // The snapshot holds the load's partitions: their stride files retired,
+    // unlinked by the settles since, and mapped all the same -- each by its
+    // inode, under the dead name the retire gave it, since every retired
+    // file the pin holds is a dead name's and only the inode says which
+    // files the store began with.
+    #[cfg(target_os = "linux")]
+    {
+        let maps = common::zpg_mapped_inodes(&dir);
+        for ino in &began {
+            assert!(
+                maps.iter()
+                    .any(|(i, p)| i == ino && p.ends_with(" (deleted)")),
+                "{what}: the snapshot maps the file of inode {ino} the store began with, unlinked: {maps:?}"
+            );
+        }
+    }
+    let reads = db.zpage_counts().stride_reads;
+    for k in keys.iter().step_by(37) {
+        assert_eq!(
+            read_vec(&snap, k),
+            model[k],
+            "{what}: the snapshot's read of {k:?}"
+        );
+    }
+    assert!(
+        db.zpage_counts().stride_reads > reads,
+        "{what}: the snapshot read through the retired stride files: {:?}",
+        db.zpage_counts()
+    );
+    drop(snap);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A checkpoint of a store its stride files serve carries them: each
+/// linked under its name, the checkpoint's file the store's own by inode as
+/// its segments are (`Db::checkpoint`). The store is then opened under a
+/// store that refuses the form, which builds each partition again in the
+/// block coding under the same name -- a new file renamed over the name,
+/// never the bytes under it rewritten -- and the checkpoint, opened under
+/// the form, attaches its stride files with nothing built and reads
+/// through them: its files are the bytes and the inodes the checkpoint
+/// took, where a rebuild written in place under a name the checkpoint
+/// shares would have changed them under it. Both stores answer the model.
+#[cfg(unix)]
+#[test]
+fn a_checkpoint_of_a_stride_store_shares_its_stride_files() {
+    use std::os::unix::fs::MetadataExt;
+    let what = "a stride store's checkpoint";
+    let dir = scratch("stride-checkpoint");
+    let opts = || stride_forced(|o| o.partition_bytes = Some(160 << 10));
+    let mut db = Db::create(&dir, opts()).unwrap();
+    let model = numbered_load(&mut db, 6000, 100, 0xC4E);
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert!(
+        c.partitions >= 2 && c.stride_files == c.partitions,
+        "{what}: {c:?}"
+    );
+    let before: Vec<(std::ffi::OsString, u64, Vec<u8>)> = form_files(&dir)
+        .iter()
+        .map(|f| {
+            (
+                f.file_name().unwrap().to_owned(),
+                std::fs::metadata(f).unwrap().ino(),
+                std::fs::read(f).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(before.len() as u64, c.partitions, "{what}");
+    let dest = scratch("stride-checkpoint-dest");
+    std::fs::remove_dir_all(&dest).unwrap();
+    db.checkpoint(&dest).unwrap();
+    for (name, ino, _) in &before {
+        let m = std::fs::metadata(dest.join(name))
+            .unwrap_or_else(|e| panic!("{what}: {name:?} not in the checkpoint: {e}"));
+        assert_eq!(m.ino(), *ino, "{what}: {name:?} linked, not copied");
+    }
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    check(&db, &model, &keys, "the store after its checkpoint");
+    db.close().unwrap();
+    // The store under a store that refuses the form: each stride file
+    // refused at its attach and its partition built again in the block
+    // coding, under the name the checkpoint shares. The form named off, as
+    // the test means it whatever switch the run is under
+    // (`SUPDB_TEST_STRIDE`).
+    let block = || {
+        forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            o.zpages_stride = ZStride::Off;
+        })
+    };
+    let mut db = Db::open(&dir, block()).unwrap();
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.stride_files, c.form_files),
+        (0, c.partitions),
+        "{what}: the store's partitions built again in the block coding: {c:?}"
+    );
+    for (name, ino, _) in &before {
+        let f = dir.join(name);
+        let b = std::fs::read(&f).unwrap();
+        assert_ne!(
+            supdb::db::zpages::trailer_magic(&b[b.len() - ZTRAILER..]),
+            Some(supdb::db::zpages::STRIDE_MAGIC),
+            "{what}: {name:?} in the store a block file"
+        );
+        assert_ne!(
+            std::fs::metadata(&f).unwrap().ino(),
+            *ino,
+            "{what}: {name:?} in the store a new file"
+        );
+    }
+    check(&db, &model, &keys, "the store under the block coding");
+    db.close().unwrap();
+    let cp = Db::open(&dest, opts()).unwrap();
+    let cc = cp.zpage_counts();
+    assert_eq!(
+        (cc.stride_files, cc.stride_builds, cc.partitions),
+        (c.partitions, 0, c.partitions),
+        "{what}: each attached at the open, nothing built: {cc:?}"
+    );
+    check(&cp, &model, &keys, what);
+    let cc = cp.zpage_counts();
+    assert!(
+        cc.stride_reads > 0 && cc.fallbacks == 0,
+        "{what}: read through: {cc:?}"
+    );
+    cp.close().unwrap();
+    for (name, ino, bytes) in &before {
+        let f = dest.join(name);
+        assert_eq!(
+            (
+                &std::fs::read(&f).unwrap(),
+                std::fs::metadata(&f).unwrap().ino()
+            ),
+            (bytes, *ino),
+            "{what}: {name:?} in the checkpoint unchanged under the store's rebuild"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+/// Each live partition keeps why the stride form does not hold it
+/// (`Seg::z_stride_no`, `Db::zpage_stride_nos`), as the build that served
+/// it found: none where its stride file serves it, the reason where the
+/// block body does -- here a record of two values. Under the forced form the
+/// builds are the segment work's where it has a thread of its own
+/// (`Maint::z_collect`) and the writer's where it runs inline (`Db::z_give`),
+/// so the store is made both ways; under the controller they are the
+/// segment work's builds ahead (`the_reading_from_files_prices_
+/// a_stride_file_as_on_disk`). Each is its own site of the record.
+#[test]
+fn each_partition_keeps_why_the_stride_form_does_not_hold_it() {
+    for background in [true, false] {
+        partitions_keep_why_the_stride_form_does_not_hold_them(background);
+    }
+}
+
+fn partitions_keep_why_the_stride_form_does_not_hold_them(background: bool) {
+    let what = &format!("the reasons kept, segment work on its own thread {background}");
+    let dir = scratch(&format!("stride-reasons-{background}"));
+    let mut db = Db::create(
+        &dir,
+        stride_forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            o.publish_in_background = background;
+        }),
+    )
+    .unwrap();
+    let model = mixed_load(&mut db, 6000, 0x5EA5);
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    let nos = db.zpage_stride_nos();
+    assert_eq!(nos.len() as u64, c.partitions, "{what}: {c:?}");
+    assert_eq!(
+        c.form_files, c.partitions,
+        "{what}: a form file each: {c:?}"
+    );
+    let held = nos.iter().filter(|&&n| n == 0).count() as u64;
+    assert!(
+        held > 0 && held < c.partitions,
+        "{what}: both bodies: {nos:?} {c:?}"
+    );
+    assert_eq!(
+        held, c.stride_files,
+        "{what}: a partition with no reason is one its stride file holds: {nos:?} {c:?}"
+    );
+    assert!(
+        nos.iter().all(|&n| n == 0 || n == STRIDE_NOT_ONE_VALUE),
+        "{what}: the upper half's reason, two values: {nos:?}"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    check(&db, &model, &keys, what);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A store held in two forms by its keys' place
+/// (`Options::zpages_stride_below`): the partitions whose first key is under
+/// the key are asked for the stride form and hold it, the partitions from
+/// the key up are not asked and hold the block form, and none keeps a
+/// reason, since none that was asked was declined. Under the forced form the
+/// builds are the segment work's where it has a thread of its own and the
+/// writer's where it runs inline, so the store is made both ways, and every
+/// key reads as the model has it through whichever file holds it.
+#[test]
+fn a_store_holds_the_stride_form_under_a_key_and_the_block_form_from_it_up() {
+    for background in [true, false] {
+        let what = &format!("two forms by a key, segment work on its own thread {background}");
+        let dir = scratch(&format!("stride-below-{background}"));
+        let cut = numbered_key(3000);
+        let mut db = Db::create(
+            &dir,
+            stride_forced(|o| {
+                o.partition_bytes = Some(160 << 10);
+                o.publish_in_background = background;
+                o.zpages_stride_below = Some(cut.as_slice().into());
+            }),
+        )
+        .unwrap();
+        let model = numbered_load(&mut db, 6000, 100, 0x5EA6);
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert_eq!(
+            c.form_files, c.partitions,
+            "{what}: a form file each: {c:?}"
+        );
+        // A partition's lower fence is its first key but the first's, which
+        // is open: the partitions under the key are the fences under it.
+        let under = db
+            .zpage_heat()
+            .iter()
+            .filter(|h| h.lo.as_slice() < cut.as_slice())
+            .count() as u64;
+        assert!(
+            under > 0 && under < c.partitions,
+            "{what}: partitions on both sides of the key: {under} of {c:?}"
+        );
+        assert_eq!(
+            c.stride_files, under,
+            "{what}: the stride form under the key and nowhere else: {c:?}"
+        );
+        let nos = db.zpage_stride_nos();
+        assert!(
+            nos.iter().all(|&n| n == 0),
+            "{what}: a partition not asked keeps no reason: {nos:?}"
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&db, &model, &keys, what);
+        let c = db.zpage_counts();
+        assert!(
+            c.stride_reads > 0 && c.reads > c.stride_reads,
+            "{what}: reads through both files: {c:?}"
+        );
+        assert_eq!(c.fallbacks, 0, "{what}: {c:?}");
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The stride form asked for only where the store in it fits the room
+/// (`Options::zpages_stride_room`): a store written with no form and opened
+/// under the forced stride form, so that every partition is built with the
+/// store whole and no piece beside it, against an injected budget. The
+/// stride form of the store is its values alone, six thousand of a hundred
+/// bytes: at a budget of exactly that every partition is asked and holds the
+/// stride form, and a byte under it none is asked, each is built in the
+/// block form with no reason kept, and the builds that asked nothing are
+/// counted. A budget of the payload's size would pass both, and a rule that
+/// counted the keys would refuse the first. A store the room moved under
+/// between its builds is in two forms, the files on disk attached as they
+/// are.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_build_asks_for_the_stride_form_only_where_the_store_in_it_fits_the_room() {
+    const KEYS: usize = 6000;
+    const WIDTH: usize = 100;
+    let values = (KEYS * WIDTH) as u64;
+    let room = |budget: u64| {
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_budget(budget);
+        let handle = inject.clone();
+        let opts = stride_forced(move |o| {
+            o.partition_bytes = Some(160 << 10);
+            o.publish_in_background = true;
+            o.zpages_stride_room = true;
+            o.zpages_inject = Some(inject);
+        });
+        (opts, handle)
+    };
+    for (budget, fits) in [(values, true), (values - 1, false)] {
+        let what = &format!("the stride form held to a room of {budget} bytes");
+        let dir = scratch(&format!("stride-room-{fits}"));
+        let model = {
+            let mut db = Db::create(
+                &dir,
+                Options {
+                    partition_bytes: Some(160 << 10),
+                    ..off()
+                },
+            )
+            .unwrap();
+            let model = numbered_load(&mut db, KEYS, WIDTH, 0x5EA7);
+            db.settle().unwrap();
+            db.close().unwrap();
+            model
+        };
+        let mut db = Db::open(&dir, room(budget).0).unwrap();
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert!(c.partitions > 2, "{what}: several partitions: {c:?}");
+        assert_eq!(
+            c.form_files, c.partitions,
+            "{what}: a form file each: {c:?}"
+        );
+        if fits {
+            assert_eq!(
+                (c.stride_files, c.stride_no_room),
+                (c.partitions, 0),
+                "{what}: every partition asked and held in the stride form: {c:?}"
+            );
+        } else {
+            assert_eq!(c.stride_files, 0, "{what}: none in the stride form: {c:?}");
+            assert!(
+                c.stride_no_room >= c.partitions,
+                "{what}: every build asked nothing, counted: {c:?}"
+            );
+        }
+        let nos = db.zpage_stride_nos();
+        assert!(
+            nos.iter().all(|&n| n == 0),
+            "{what}: a partition not asked keeps no reason: {nos:?}"
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&db, &model, &keys, what);
+        let c = db.zpage_counts();
+        assert_eq!(c.fallbacks, 0, "{what}: {c:?}");
+        assert_eq!(
+            c.stride_reads > 0,
+            fits,
+            "{what}: reads through the form the room chose: {c:?}"
+        );
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // The room gone between a store's builds: the first half built with
+    // room for it, the second written after the budget fell to a byte (the
+    // seam reads zero as no budget injected).
+    let what = "the room gone between a store's builds";
+    let dir = scratch("stride-room-moved");
+    let (opts, inject) = room(u64::MAX);
+    let mut db = Db::create(&dir, opts).unwrap();
+    let mut model = numbered_load(&mut db, KEYS / 2, WIDTH, 0x5EA8);
+    db.zpages_settle().unwrap();
+    let first = db.zpage_counts();
+    assert!(
+        first.stride_files > 0 && first.stride_files == first.form_files,
+        "{what}: the first half in the stride form: {first:?}"
+    );
+    inject.set_budget(1);
+    let mut rng = Rng(0x5EA9);
+    for i in KEYS / 2..KEYS {
+        let v: Vec<u8> = (0..WIDTH).map(|_| (rng.next() >> 24) as u8).collect();
+        let k = numbered_key(i);
+        db.append(&k, &v);
+        model.insert(k, vec![v]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        c.form_files, c.partitions,
+        "{what}: a form file each: {c:?}"
+    );
+    assert!(
+        c.stride_files > 0 && c.stride_files < c.form_files && c.stride_no_room > 0,
+        "{what}: a store in two forms: {c:?}"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    check(&db, &model, &keys, what);
+    let c = db.zpage_counts();
+    assert!(
+        c.stride_reads > 0 && c.reads > c.stride_reads && c.fallbacks == 0,
+        "{what}: reads through both files: {c:?}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same line at a merge's output finish, the third site a partition's
+/// form is built at: every key put again, the pieces merged, and each output
+/// built at its finish in the stride form where its first key is under the
+/// key and in the block form from the key up. The files on disk are of both
+/// kinds, and installed they serve the partitions as the line has them.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_merges_outputs_are_built_in_the_form_their_side_of_the_key_has() {
+    let what = "two forms by a key at the outputs' finish";
+    let cut = numbered_key(10_000);
+    let (dir, mut db, mut model, inject, raw) = land_store_loaded(
+        "auto-finish-stride-below",
+        50,
+        |o| {
+            o.zpages_stride = ZStride::Forced;
+            o.zpages_stride_below = Some(cut.as_slice().into());
+            o.zpages_build_at_finish = true;
+            o.zpages_ahead_builders = 8;
+            o.partition_bytes = Some(1 << 20);
+            o.l0_trigger = 1;
+        },
+        |db| numbered_load(db, 20_000, 100, 0x5F2),
+    );
+    let mut seen = 0usize;
+    db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+    assert_eq!(seen, 10);
+    inject.set_decode_cost(std::time::Duration::from_micros(1));
+    inject.set_budget(raw / 2);
+    wait_steps(&db, 2);
+    let mut rng = Rng(0x5EEE);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    for chunk in keys.chunks(250) {
+        for k in chunk {
+            let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
+            db.put(k, &v);
+            model.insert(k.clone(), vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.seal().unwrap();
+    db.settle().unwrap();
+    wait_for("the builds at the outputs' finish to end", || {
+        let c = db.zpage_counts();
+        c.finish_builds >= 1 && c.finish_live == 0 && db.merges_in_flight() == 0
+    });
+    let c = db.zpage_counts();
+    assert!(
+        c.stride_builds > 0 && c.stride_builds < c.finish_builds,
+        "{what}: outputs built in both forms: {c:?}"
+    );
+    let magics: Vec<_> = form_files(&dir)
+        .iter()
+        .map(|f| {
+            let b = std::fs::read(f).unwrap();
+            supdb::db::zpages::trailer_magic(&b[b.len() - ZTRAILER..])
+                == Some(supdb::db::zpages::STRIDE_MAGIC)
+        })
+        .collect();
+    assert!(
+        magics.iter().any(|&m| m) && magics.iter().any(|&m| !m),
+        "{what}: files of both kinds on disk: {magics:?}"
+    );
+    assert!(
+        tick_until(&db, 400, |c| c.sel_installs >= 1
+            && c.form_files == c.partitions),
+        "{what}: the files on disk not installed: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    let under = db
+        .zpage_heat()
+        .iter()
+        .filter(|h| h.lo.as_slice() < cut.as_slice())
+        .count() as u64;
+    assert!(
+        under > 0 && under < c.partitions,
+        "{what}: {under} of {c:?}"
+    );
+    assert_eq!(
+        (c.stride_files, c.build_starts),
+        (under, 0),
+        "{what}: the finishes' files installed as built, the stride form under the key: {c:?}"
+    );
+    let nos = db.zpage_stride_nos();
+    assert!(nos.iter().all(|&n| n == 0), "{what}: no reason: {nos:?}");
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, what);
+    drop(r);
+    let c = db.zpage_counts();
+    assert!(c.stride_reads > 0, "{what}: {c:?}");
+    assert_eq!(c.fallbacks, 0, "{what}: {c:?}");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The room at a merge's output finish (`Options::zpages_stride_room`): the
+/// store past a budget its values alone fit with fifty kilobytes to spare,
+/// every key put again and the pieces merged. The finish's plan is made
+/// with the pieces standing, and it is the pieces the room is short by: the
+/// store in the stride form with them beside it does not fit, and every
+/// output is built in the block form at its finish with the refusal counted
+/// -- where the same store with the room not asked builds its outputs in
+/// the stride form
+/// (`a_merges_outputs_are_built_in_the_form_their_side_of_the_key_has`), and
+/// a rule that left the pieces out would.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_merges_outputs_are_built_in_the_block_form_where_the_room_is_short() {
+    let what = "the room at the outputs' finish";
+    let (dir, mut db, mut model, inject, raw) = land_store_loaded(
+        "auto-finish-stride-room",
+        50,
+        |o| {
+            o.zpages_stride = ZStride::Forced;
+            o.zpages_stride_room = true;
+            o.zpages_build_at_finish = true;
+            o.zpages_ahead_builders = 8;
+            o.partition_bytes = Some(1 << 20);
+            o.l0_trigger = 1;
+        },
+        |db| numbered_load(db, 20_000, 100, 0x5F3),
+    );
+    // The values alone fit it, and the raw records do not, so the store is
+    // past its budget and its outputs are given their forms at the finish.
+    let budget = 20_000 * 100 + 50_000;
+    assert!(raw > budget, "{what}: the store past the budget: {raw}");
+    let mut seen = 0usize;
+    db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+    assert_eq!(seen, 10);
+    inject.set_decode_cost(std::time::Duration::from_micros(1));
+    inject.set_budget(budget);
+    wait_steps(&db, 2);
+    let mut rng = Rng(0x5EEF);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    for chunk in keys.chunks(250) {
+        for k in chunk {
+            let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
+            db.put(k, &v);
+            model.insert(k.clone(), vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.seal().unwrap();
+    db.settle().unwrap();
+    wait_for("the builds at the outputs' finish to end", || {
+        let c = db.zpage_counts();
+        c.finish_builds >= 1 && c.finish_live == 0 && db.merges_in_flight() == 0
+    });
+    let c = db.zpage_counts();
+    assert!(
+        c.finish_builds >= 1 && c.stride_builds == 0 && c.stride_no_room >= 1,
+        "{what}: every output built in the block form, the refusals counted: {c:?}"
+    );
+    let stride_on_disk = form_files(&dir)
+        .iter()
+        .filter(|f| {
+            let b = std::fs::read(f).unwrap();
+            supdb::db::zpages::trailer_magic(&b[b.len() - ZTRAILER..])
+                == Some(supdb::db::zpages::STRIDE_MAGIC)
+        })
+        .count();
+    assert_eq!(stride_on_disk, 0, "{what}: no stride file on disk");
+    assert!(
+        tick_until(&db, 400, |c| c.sel_installs >= 1
+            && c.form_files == c.partitions),
+        "{what}: the files on disk not installed: {:?}",
+        db.zpage_counts()
+    );
+    let nos = db.zpage_stride_nos();
+    assert!(nos.iter().all(|&n| n == 0), "{what}: no reason: {nos:?}");
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, what);
+    drop(r);
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.stride_files, c.stride_reads, c.fallbacks),
+        (0, 0, 0),
+        "{what}: served by the block form: {c:?}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `numbered_load` with values the block form compresses: four random
+/// bytes and the rest one byte, so that a partition's block form is a
+/// fraction of its stride form and the room between the two is a room.
+/// With `twice`, the last key is given a second value in a batch of its
+/// own, so that the stride form declines the last partition
+/// (`StrideNo::NotOneValue`).
+fn numbered_soft_load(db: &mut Db, n: usize, w: usize, seed: u64, twice: bool) -> Model {
+    let mut rng = Rng(seed);
+    let mut model = Model::new();
+    let value = |rng: &mut Rng| {
+        let mut v = vec![0x5Au8; w];
+        for b in v.iter_mut().take(4) {
+            *b = (rng.next() >> 24) as u8;
+        }
+        v
+    };
+    for chunk in (0..n).collect::<Vec<_>>().chunks(500) {
+        for &i in chunk {
+            let v = value(&mut rng);
+            let k = numbered_key(i);
+            db.append(&k, &v);
+            model.insert(k, vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    if twice {
+        let k = numbered_key(n - 1);
+        let v = value(&mut rng);
+        db.append(&k, &v);
+        model.get_mut(&k).unwrap().push(v);
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    model
+}
+
+/// The conversion's next look waited for (`Options::zpages_stride_convert`):
+/// the injected clock moved `by`, and the counts read once the segment
+/// work's turn has looked at it.
+///
+/// A look is made only at a tick of the controller, which comes when the
+/// injected clock moves, and only with the builder free; a build in flight
+/// when the clock moved -- a conversion's, on a thread of the idle class,
+/// with its sync -- takes the tick without a look. So where no look has
+/// come in a fifth of a second of the wall the clock is moved a census
+/// interval more, for as long as a minute.
+#[cfg(target_os = "linux")]
+fn convert_look(db: &Db, by: std::time::Duration) {
+    let inject = db.options().zpages_inject.clone().unwrap();
+    let was = db.zpage_counts().stride_convert_looks;
+    inject.advance(by);
+    let t = std::time::Instant::now();
+    let mut nudged = std::time::Instant::now();
+    while db.zpage_counts().stride_convert_looks == was && t.elapsed().as_secs() < 60 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        if nudged.elapsed().as_millis() >= 200 {
+            inject.advance(std::time::Duration::from_millis(100));
+            nudged = std::time::Instant::now();
+        }
+    }
+    assert!(
+        db.zpage_counts().stride_convert_looks > was,
+        "the conversion looked: {:?}",
+        db.zpage_counts()
+    );
+}
+
+/// `heat_up` over keys that may hold more than one value: `n` reads of
+/// `keys`, round and round, each answering something.
+fn read_round(db: &Db, keys: &[Vec<u8>], n: usize) {
+    for i in 0..n {
+        let k = &keys[i % keys.len()];
+        assert!(!read_vec(db, k).is_empty(), "a key reads back");
+    }
+}
+
+/// Every key read once and a look of the conversion a second on, round
+/// after round, until `cond` holds of the counts or `max` rounds have gone:
+/// whether it holds. The reads are alike over the partitions, so each round
+/// moves the partitions' touches toward alike whatever heat a partition
+/// carried in, which decays as the looks go by.
+#[cfg(target_os = "linux")]
+fn convert_alike_until(
+    db: &Db,
+    keys: &[Vec<u8>],
+    max: u32,
+    cond: impl Fn(&supdb::db::ZCounts) -> bool,
+) -> bool {
+    for _ in 0..max {
+        if cond(&db.zpage_counts()) {
+            return true;
+        }
+        read_round(db, keys, keys.len());
+        convert_look(db, std::time::Duration::from_secs(1));
+        wait_steps(db, 2);
+    }
+    cond(&db.zpage_counts())
+}
+
+/// Each partition's form by key order: whether a stride file serves it.
+fn strides(db: &Db) -> Vec<bool> {
+    db.zpage_heat().iter().map(|h| h.stride).collect()
+}
+
+/// A store under the controller in COMPACT with every partition served by
+/// a form file -- a block file's under `ZStride::Chosen`, where the stride
+/// form is a conversion's alone, and a stride file's under `Forced` but for
+/// the last partition, which the stride form declines -- the conversion as
+/// `on` says, a decode priced at ten microseconds, a fault at a millisecond
+/// and a conversion's build at two hundred milliseconds.
+#[cfg(target_os = "linux")]
+fn convert_store(
+    name: &str,
+    stride: ZStride,
+    on: bool,
+) -> (
+    PathBuf,
+    Db,
+    Model,
+    std::sync::Arc<supdb::ZInject>,
+    Vec<Vec<u8>>,
+) {
+    let (dir, db, model, inject) = auto_store_loaded(
+        name,
+        1 << 20,
+        1_000_000.0,
+        FAULT_1MS,
+        |o| {
+            o.zpages_stride = stride;
+            o.zpages_stride_convert = on;
+            o.zpages_memo = false;
+            o.partition_bytes = Some(400 << 10);
+        },
+        |_| {},
+        |db| numbered_soft_load(db, 20_000, 100, 0x5C0, true),
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    {
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{name}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+    }
+    assert!(
+        tick_until(&db, 400, |c| c.attached >= c.partitions
+            && c.warms >= c.partitions),
+        "{name}: every file attached and warmed: {:?}",
+        db.zpage_counts()
+    );
+    inject.set_decode_cost(std::time::Duration::from_micros(10));
+    inject.set_convert_price(std::time::Duration::from_millis(200));
+    let c = db.zpage_counts();
+    let want = if stride == ZStride::Chosen {
+        0
+    } else {
+        c.partitions - 1
+    };
+    assert!(
+        c.form_files >= 5 && c.form_files == c.partitions && c.stride_files == want,
+        "{name}: partitions to choose from, each in the form its build asks: {c:?}"
+    );
+    (dir, db, model, inject, keys)
+}
+
+/// The conversion between the block and the stride forms under the
+/// controller (`Options::zpages_stride_convert`, `ZStride::Chosen`). Every
+/// partition is built in the block form. With every partition read alike
+/// and the budget at the block files' own bytes, no move into the stride
+/// form pays -- a partition's extra would be other partitions' faults at a
+/// hundred decodes each -- and nothing is converted. With room, the
+/// partition whose reads would have saved the price of its build is
+/// converted while it serves, alone, and reads through the stride form;
+/// the partition the form declines is asked once, keeps the reason and is
+/// not asked again however hot it reads. And with the budget back at the
+/// block files' bytes and every partition read alike again, the stride
+/// form's partition goes back to the block form. Every read answers as the
+/// model has it across each swap. Without the option nothing is converted
+/// and the policy never looks.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_controller_converts_a_partition_between_the_block_and_the_stride_forms() {
+    for on in [true, false] {
+        let what = &format!("stride convert {on}");
+        let (dir, db, model, inject, keys) =
+            convert_store(&format!("auto-convert-{on}"), ZStride::Chosen, on);
+        let r = db.reader().unwrap();
+        let total = db.zpage_counts().file_bytes;
+        let parts = db.zpage_heat().len();
+        let hot = keys_of_partition(&db, &model, 2);
+        let last = keys_of_partition(&db, &model, parts - 1);
+        let sec = std::time::Duration::from_secs(1);
+        if !on {
+            inject.set_budget(total * 100);
+            for _ in 0..3 {
+                read_round(&db, &hot, 300_000);
+                advance_tick(&db, sec);
+            }
+            wait_steps(&db, 5);
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.stride_converts, c.stride_convert_looks, c.stride_files),
+                (0, 0, 0),
+                "{what}: {c:?}"
+            );
+            check(&r, &model, &keys, what);
+            drop(r);
+            db.close().unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            continue;
+        }
+        // No room, and every partition read alike.
+        inject.set_budget(total);
+        convert_look(&db, sec);
+        let starts = db.zpage_counts().build_starts;
+        read_round(&db, &keys, keys.len());
+        convert_look(&db, sec);
+        convert_look(&db, sec);
+        wait_steps(&db, 5);
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.stride_converts, c.build_starts),
+            (0, starts),
+            "{what}: no move pays without room: {c:?}"
+        );
+        // Room, and one partition hot.
+        inject.set_budget(total * 100);
+        read_round(&db, &hot, 300_000);
+        convert_look(&db, sec);
+        assert!(
+            tick_until_built(&db, |c| c.stride_converts >= 1),
+            "{what}: the hot partition converted: {:?} {:?}",
+            db.zpage_counts(),
+            db.zpage_heat()
+        );
+        let st = strides(&db);
+        assert!(
+            st[2] && st.iter().filter(|s| **s).count() == 1,
+            "{what}: the hot partition alone in the stride form: {st:?}"
+        );
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.stride_files, c.stride_converts_back, c.recode_failed),
+            (1, 0, 0),
+            "{what}: {c:?}"
+        );
+        // The conversion's file is kept and serves at once: synced by its
+        // build, where the store's own builds, which keep theirs, sync none.
+        assert_eq!(
+            c.build_synced, 1,
+            "{what}: the conversion's file synced: {c:?}"
+        );
+        let before = c.stride_reads;
+        check(
+            &r,
+            &model,
+            &keys,
+            &format!("{what}: one in the stride form"),
+        );
+        let c = db.zpage_counts();
+        assert!(
+            c.stride_reads >= before + hot.len() as u64 && c.fallbacks == 0,
+            "{what}: its reads through the stride form: {c:?}"
+        );
+        // The partition the form declines: asked once it is hot, and not
+        // again.
+        read_round(&db, &last, 300_000);
+        convert_look(&db, sec);
+        assert!(
+            tick_until_built(&db, |c| c.stride_declines.iter().sum::<u64>() >= 1),
+            "{what}: the last partition asked and declined: {:?}",
+            db.zpage_counts()
+        );
+        let nos = db.zpage_stride_nos();
+        assert!(
+            *nos.last().unwrap() != 0 && nos[..nos.len() - 1].iter().all(|&n| n == 0),
+            "{what}: the reason kept on the last partition alone: {nos:?}"
+        );
+        let asked = db.zpage_counts().build_starts;
+        read_round(&db, &last, 300_000);
+        convert_look(&db, sec);
+        convert_look(&db, sec);
+        wait_steps(&db, 5);
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.build_starts, c.stride_files, c.stride_converts_back),
+            (asked, 1, 0),
+            "{what}: a declined partition is not asked again, and nothing \
+             moves out while it fits: {c:?}"
+        );
+        // The room gone, and every partition read alike: the stride form's
+        // partition goes back.
+        inject.set_budget(total);
+        assert!(
+            convert_alike_until(&db, &keys, 120, |c| c.stride_converts_back >= 1),
+            "{what}: gone back: {:?} {:?}",
+            db.zpage_counts(),
+            db.zpage_heat()
+        );
+        assert!(
+            strides(&db).iter().all(|s| !s),
+            "{what}: every partition in the block form again: {:?}",
+            strides(&db)
+        );
+        // By a build, synced as the one that brought it in was.
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.build_starts, c.build_synced, c.recode_flips),
+            (asked + 1, 2, 0),
+            "{what}: the way back a build: {c:?}"
+        );
+        check(&r, &model, &keys, &format!("{what}: after"));
+        let c = db.zpage_counts();
+        assert_eq!((c.fallbacks, c.recode_failed), (0, 0), "{what}: {c:?}");
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A partition built in the stride form goes out of it by a build, and
+/// comes in again by one (`Options::zpages_stride_convert` under
+/// `ZStride::Forced`): the store's builds ask for the stride form, and with
+/// the budget a quarter of what
+/// the stride files hold and every partition read alike, a partition's
+/// block form is built while its stride file serves and swapped in, its
+/// reads through the block form after; then with room and that partition
+/// hot, its stride form is built again and swapped back.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_partition_built_in_the_stride_form_is_converted_out_and_in_again() {
+    let what = "stride built, converted back";
+    let (dir, db, model, inject, keys) =
+        convert_store("auto-convert-forced", ZStride::Forced, true);
+    let r = db.reader().unwrap();
+    let sec = std::time::Duration::from_secs(1);
+    let c0 = db.zpage_counts();
+    let total = c0.file_bytes;
+    inject.set_budget(total / 4);
+    convert_look(&db, sec);
+    assert!(
+        convert_alike_until(&db, &keys, 120, |c| c.stride_converts_back >= 1),
+        "{what}: a partition gone back: {:?} {:?}",
+        db.zpage_counts(),
+        db.zpage_heat()
+    );
+    let c = db.zpage_counts();
+    assert!(
+        c.build_starts > c0.build_starts
+            && c.build_synced > c0.build_synced
+            && c.recode_flips == 0
+            && c.recode_failed == 0,
+        "{what}: by a build, synced: {c:?}"
+    );
+    let st = strides(&db);
+    let back = st[..st.len() - 1]
+        .iter()
+        .position(|s| !s)
+        .expect("one of the stride form's partitions in the block form");
+    check(&r, &model, &keys, &format!("{what}: one back"));
+    // Room, and that partition hot: built in the stride form again. A
+    // look first, over the block file the swap installed: a form file a
+    // look has not seen gives it no rate, only a count to take the next
+    // one from.
+    let hot = keys_of_partition(&db, &model, back);
+    inject.set_budget(total * 100);
+    convert_look(&db, sec);
+    let before = db.zpage_counts();
+    // The rent its move out was bought on was spent on that move: the
+    // move in is paid for by the reads from here on, and none has been
+    // made.
+    wait_steps(&db, 3);
+    assert_eq!(
+        db.zpage_counts().build_starts,
+        before.build_starts,
+        "{what}: no move in on the rent the move out was paid: {:?}",
+        db.zpage_counts()
+    );
+    read_round(&db, &hot, 300_000);
+    convert_look(&db, sec);
+    assert!(
+        tick_until_built(&db, |c| c.stride_converts > before.stride_converts),
+        "{what}: the partition in the stride form again: {:?} {:?}",
+        db.zpage_counts(),
+        db.zpage_heat()
+    );
+    let c = db.zpage_counts();
+    assert!(
+        c.build_starts > before.build_starts && c.recode_flips == 0 && strides(&db)[back],
+        "{what}: by a build: {c:?} {:?}",
+        strides(&db)
+    );
+    check(&r, &model, &keys, &format!("{what}: after"));
+    check_scan(&r, &model, what);
+    let c = db.zpage_counts();
+    assert_eq!((c.fallbacks, c.recode_failed), (0, 0), "{what}: {c:?}");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A move's rent grows by what the move would have saved over each period
+/// at the reads that period held (`Options::zpages_stride_convert`,
+/// `zselect::intensity`): the stride form's partitions over their room and
+/// read alike, with a build priced past anything the reads come to, so that
+/// nothing is bought and the rents stand to be read. Once the touches have
+/// settled, a period of three times the reads adds three times the rent of
+/// the period before it, at once, and a period nobody read in adds none.
+/// Priced over the smoothed touches alone, which is the shape before, the
+/// first added a fifth more and the second went on adding for as long as
+/// the touches took to decay -- the rent of a pass came a time constant
+/// late, which at ten million keys under 1 GiB was two seconds before the
+/// first conversion out began.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_moves_rent_grows_by_the_reads_of_each_period_and_by_nothing_without_them() {
+    let what = "rent by the period's reads";
+    let (dir, db, model, inject, keys) = convert_store("auto-convert-rent", ZStride::Forced, true);
+    let r = db.reader().unwrap();
+    let sec = std::time::Duration::from_secs(1);
+    let c0 = db.zpage_counts();
+    inject.set_convert_price(std::time::Duration::from_secs(1_000_000_000));
+    inject.set_budget(c0.file_bytes / 4);
+    let rent = |db: &Db| db.zpage_counts().stride_convert_rent_us;
+    // The touches settled on reads alike over the partitions, whatever the
+    // store's way to COMPACT left them at.
+    for _ in 0..40 {
+        read_round(&db, &keys, keys.len());
+        convert_look(&db, sec);
+    }
+    let step = |times: usize| {
+        let before = rent(&db);
+        read_round(&db, &keys, times * keys.len());
+        convert_look(&db, sec);
+        rent(&db) as f64 - before as f64
+    };
+    let one = step(1);
+    assert!(
+        one > 0.0,
+        "{what}: moves out on offer, their rent growing: {:?}",
+        db.zpage_counts()
+    );
+    let again = step(1);
+    assert!(
+        (again / one - 1.0).abs() < 0.05,
+        "{what}: the same reads, the same rent: {one} then {again}"
+    );
+    let three = step(3);
+    assert!(
+        (three / one - 3.0).abs() < 0.3,
+        "{what}: three times the reads, three times the rent, in the period \
+         they were read in: {one} then {three}"
+    );
+    let before = rent(&db);
+    for _ in 0..5 {
+        convert_look(&db, sec);
+    }
+    let after = rent(&db);
+    assert!(
+        after <= before && after as f64 >= before as f64 * 0.99,
+        "{what}: no rent for a period nobody read in: {before} then {after}"
+    );
+    // A rent is a balance. With room for every file no move pays, and a
+    // period of reads takes from each move's rent what the partition's
+    // block form would have cost those reads in decodes -- something, and
+    // little beside faults at a hundred times a decode -- where a period
+    // nobody read in takes nothing; and the rent that stands is what the
+    // look that offers the moves again adds to.
+    inject.set_budget(c0.file_bytes * 100);
+    convert_look(&db, sec);
+    assert_eq!(
+        rent(&db),
+        after,
+        "{what}: the rents stand through a look that offers nothing and \
+         found nothing read"
+    );
+    read_round(&db, &keys, keys.len());
+    convert_look(&db, sec);
+    let roomy = rent(&db);
+    assert!(
+        roomy < after && roomy as f64 > after as f64 * 0.5,
+        "{what}: a period of reads the stride form served in room takes \
+         its decodes from the rents: {after} then {roomy}"
+    );
+    inject.set_budget(c0.file_bytes / 4);
+    let more = step(1);
+    assert!(
+        more > 0.0 && rent(&db) > roomy,
+        "{what}: and they grow from where they stood: {roomy} then {}",
+        rent(&db)
+    );
+    // And a balance stops at nothing: with room again and a decode priced
+    // at a millisecond the rents are spent in a few periods, and the
+    // periods after them take nothing more, so that the first period over
+    // the room again adds what a period added before.
+    inject.set_budget(c0.file_bytes * 100);
+    inject.set_decode_cost(std::time::Duration::from_millis(1));
+    let mut rounds = 0;
+    while rent(&db) > 0 && rounds < 120 {
+        read_round(&db, &keys, keys.len());
+        convert_look(&db, sec);
+        rounds += 1;
+    }
+    assert_eq!(rent(&db), 0, "{what}: the rents spent");
+    for _ in 0..3 {
+        read_round(&db, &keys, keys.len());
+        convert_look(&db, sec);
+    }
+    inject.set_decode_cost(std::time::Duration::from_micros(10));
+    inject.set_budget(c0.file_bytes / 4);
+    let fresh = step(1);
+    assert!(
+        (fresh / one - 1.0).abs() < 0.1,
+        "{what}: a balance spent starts from nothing, not under it: {one} \
+         a period then, {fresh} now"
+    );
+    wait_steps(&db, 5);
+    let c = db.zpage_counts();
+    assert_eq!(
+        (
+            c.stride_converts,
+            c.stride_converts_back,
+            c.build_starts,
+            c.recode_failed
+        ),
+        (0, 0, c0.build_starts, 0),
+        "{what}: nothing bought at that price: {c:?}"
+    );
+    check(&r, &model, &keys, what);
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The conversion looks whatever the builder is at, and a move that has
+/// paid for its build starts when the builder is free
+/// (`Options::zpages_stride_convert`, `Maint::z_convert_tick`). With one
+/// conversion's build held in flight and the stride form's partitions over
+/// their room and read alike, the looks go on beside the build, the moves'
+/// rents pass their price and nothing is started; with the build let go,
+/// the held conversion lands and the next begins at the turn that finds
+/// the builder free, with no read made since. Looking only with the builder
+/// idle, which is the shape before, the first conversion out of a store of
+/// ten million keys under 1 GiB waited for the load's last builds and 29
+/// warms before its first look, and for two more looks after it.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_conversion_looks_beside_a_build_and_starts_the_move_that_is_due_when_it_ends() {
+    let what = "looks beside a build";
+    let (dir, db, model, inject, keys) =
+        convert_store("auto-convert-beside", ZStride::Forced, true);
+    let r = db.reader().unwrap();
+    let sec = std::time::Duration::from_secs(1);
+    let c0 = db.zpage_counts();
+    db.hold_zpage_build(true);
+    db.zpages_convert_ask(1);
+    let t = std::time::Instant::now();
+    while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+        wait_steps(&db, 1);
+    }
+    let held = db.zpage_counts();
+    assert!(
+        db.zpage_build_waiting() && held.build_starts == c0.build_starts + 1,
+        "{what}: a conversion's build held at its start: {held:?}"
+    );
+    // Over the room and read alike until the rents come to ten times a
+    // build's price, which over five partitions at most is one move due.
+    inject.set_budget(c0.file_bytes / 4);
+    let mut rounds = 0;
+    while db.zpage_counts().stride_convert_rent_us < 2_000_000 && rounds < 120 {
+        read_round(&db, &keys, keys.len());
+        convert_look(&db, sec);
+        rounds += 1;
+    }
+    let c = db.zpage_counts();
+    assert!(
+        c.stride_convert_rent_us >= 2_000_000,
+        "{what}: the rents paid beside the build: {c:?}"
+    );
+    assert_eq!(
+        (c.build_starts, c.stride_converts_back, c.build_collected),
+        (
+            held.build_starts,
+            c0.stride_converts_back,
+            held.build_collected
+        ),
+        "{what}: nothing started while the builder holds the build: {c:?}"
+    );
+    // A look just made, so that the period is not out when the builder
+    // comes free: the turn that takes the held build in starts the move
+    // that is due, a millisecond of the clock later and not a period.
+    // The build is given the wall to end in before the clock moves, a
+    // census tick at a time, each well under the period.
+    convert_look(&db, sec);
+    db.hold_zpage_build(false);
+    let t = std::time::Instant::now();
+    while db.zpage_counts().build_collected == held.build_collected && t.elapsed().as_secs() < 60 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        wait_steps(&db, 1);
+    }
+    // One tick more, still inside the period: the turn that took the
+    // build in is through, where the count of the collect is read from
+    // inside it.
+    wait_steps(&db, 1);
+    let c = db.zpage_counts();
+    assert!(
+        c.build_collected > held.build_collected && c.build_starts > held.build_starts,
+        "{what}: the due move started at the turn the builder came free: {c:?}"
+    );
+    assert!(
+        tick_until_built(&db, |c| c.stride_converts_back
+            >= c0.stride_converts_back + 2),
+        "{what}: the held conversion landed and the due one after it, no \
+         read between: {:?} {:?}",
+        db.zpage_counts(),
+        db.zpage_heat()
+    );
+    check(&r, &model, &keys, what);
+    let c = db.zpage_counts();
+    assert_eq!((c.fallbacks, c.recode_failed), (0, 0), "{what}: {c:?}");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A partition's own build comes before a conversion that is due
+/// (`Maint::z_convert_tick`): the builder takes a move between the forms
+/// only with nothing of the store's own due it. A store whose moves out
+/// have been paid many times their price, at a price that kept them from
+/// starting, is given a new partition with no form file and the price it
+/// can pay: the first build taken in is the new partition's, which a form
+/// file serves from then on, and the conversions follow it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_partitions_own_build_comes_before_a_conversion_that_is_due() {
+    let what = "the store's own build first";
+    let (dir, mut db, mut model, inject, keys) =
+        convert_store("auto-convert-own-first", ZStride::Forced, true);
+    let sec = std::time::Duration::from_secs(1);
+    let c0 = db.zpage_counts();
+    inject.set_convert_price(std::time::Duration::from_secs(1_000_000_000));
+    inject.set_budget(c0.file_bytes / 4);
+    convert_look(&db, sec);
+    let mut rounds = 0;
+    while db.zpage_counts().stride_convert_rent_us < 2_000_000 && rounds < 120 {
+        read_round(&db, &keys, keys.len());
+        convert_look(&db, sec);
+        rounds += 1;
+    }
+    assert!(
+        db.zpage_counts().stride_convert_rent_us >= 2_000_000,
+        "{what}: moves paid for: {:?}",
+        db.zpage_counts()
+    );
+    // A partition of its own above the store's greatest key, with no form
+    // file: the builder's to build. The promotion that made it opened the
+    // partition before it again under a new name, whose form file on disk
+    // an attach takes up with no build.
+    numbered_run(&mut db, &mut model, 20_000, 2_000, 0x0F1);
+    let c1 = db.zpage_counts();
+    assert!(
+        c1.partitions == c0.partitions + 1
+            && c1.form_files < c1.partitions
+            && c1.build_starts == c0.build_starts,
+        "{what}: a partition no form file serves, nothing started: {c1:?}"
+    );
+    inject.set_convert_price(std::time::Duration::from_millis(200));
+    // A look, at a turn that finds the builder free, a move due at the
+    // new price and the new partition unbuilt: the move waits. The budget
+    // is one that leaves the forms room beside the raw records of the
+    // partitions no form file serves yet, and less than they hold: with no
+    // room at all no move pays, every touch a fault whatever the forms.
+    inject.set_budget(c0.file_bytes * 3 / 4);
+    convert_look(&db, sec);
+    // The first build to be taken in, and the turn that took it through.
+    let t = std::time::Instant::now();
+    while db.zpage_counts().build_collected == c1.build_collected && t.elapsed().as_secs() < 60 {
+        wait_steps(&db, 1);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let c = db.zpage_counts();
+    assert_eq!(
+        (
+            c.build_collected,
+            c.form_files,
+            c.stride_converts_back,
+            c.stride_converts
+        ),
+        (
+            c1.build_collected + 1,
+            c1.partitions,
+            c0.stride_converts_back,
+            c0.stride_converts
+        ),
+        "{what}: the partition's own build taken in first, no conversion yet: {c:?}"
+    );
+    assert!(
+        tick_until_built(&db, |c| c.stride_converts_back > c0.stride_converts_back),
+        "{what}: and the due conversion after it: {:?}",
+        db.zpage_counts()
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, what);
+    let c = db.zpage_counts();
+    assert_eq!((c.fallbacks, c.recode_failed), (0, 0), "{what}: {c:?}");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A conversion in flight is priced as made
+/// (`Options::zpages_stride_convert`, `Maint::z_convert_look`): the looks
+/// beside its build model its partition in the form it is going to and
+/// offer nothing of it. With the stride form's partitions a page over
+/// their room, one move out is all the store needs: the policy starts it,
+/// and with its build held and the reads going on no other move is
+/// offered -- no rent is paid and nothing else starts -- where a look that
+/// priced the partition as it is still served would offer a move the
+/// store no longer needs, and start it when the builder was free. And a
+/// partition on its way into the stride form is not offered out of it
+/// before it has landed, however little room there is.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_conversion_in_flight_is_priced_as_made() {
+    let sec = std::time::Duration::from_secs(1);
+    {
+        let what = "a move out in flight";
+        let (dir, db, model, inject, keys) =
+            convert_store("auto-convert-flight-out", ZStride::Forced, true);
+        let r = db.reader().unwrap();
+        let c0 = db.zpage_counts();
+        // The first partition's move out asked for and held, and that
+        // partition read three times as much as the rest from here on: the
+        // last a pricing would take out, so that a look pricing it as still
+        // in the stride form offers another's move, whichever the reads'
+        // noise puts first among the rest.
+        let first = keys_of_partition(&db, &model, 0);
+        db.hold_zpage_build(true);
+        db.zpages_convert_ask(0);
+        let t = std::time::Instant::now();
+        while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+            wait_steps(&db, 1);
+        }
+        let held = db.zpage_counts();
+        assert!(
+            db.zpage_build_waiting() && held.build_starts == c0.build_starts + 1,
+            "{what}: the one move the store needs started and held: {held:?}"
+        );
+        inject.set_budget(c0.file_bytes - 4096);
+        convert_look(&db, sec);
+        for _ in 0..8 {
+            read_round(&db, &keys, keys.len());
+            read_round(&db, &first, 2 * first.len());
+            convert_look(&db, sec);
+        }
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.stride_convert_rent_us, c.build_starts),
+            (0, held.build_starts),
+            "{what}: nothing more offered while it is built: {c:?}"
+        );
+        db.hold_zpage_build(false);
+        assert!(
+            tick_until_built(&db, |c| c.stride_converts_back
+                == c0.stride_converts_back + 1
+                && c.build_collected == c.build_starts),
+            "{what}: landed: {:?}",
+            db.zpage_counts()
+        );
+        for _ in 0..4 {
+            read_round(&db, &keys, keys.len());
+            read_round(&db, &first, 2 * first.len());
+            convert_look(&db, sec);
+        }
+        wait_steps(&db, 5);
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.stride_converts_back, c.build_starts, c.stride_converts),
+            (
+                c0.stride_converts_back + 1,
+                held.build_starts,
+                c0.stride_converts
+            ),
+            "{what}: one move, and the store fits: {c:?}"
+        );
+        assert!(
+            !strides(&db)[0],
+            "{what}: the first partition's: {:?}",
+            strides(&db)
+        );
+        check(&r, &model, &keys, what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    {
+        let what = "a move in in flight";
+        let (dir, db, model, inject, keys) =
+            convert_store("auto-convert-flight-in", ZStride::Chosen, true);
+        let r = db.reader().unwrap();
+        let c0 = db.zpage_counts();
+        inject.set_budget(c0.file_bytes * 100);
+        db.hold_zpage_build(true);
+        db.zpages_convert_ask(1);
+        let t = std::time::Instant::now();
+        while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+            wait_steps(&db, 1);
+        }
+        let held = db.zpage_counts();
+        assert!(
+            db.zpage_build_waiting() && held.build_starts == c0.build_starts + 1,
+            "{what}: a conversion in, held at its build's start: {held:?}"
+        );
+        // No room at all: the one partition priced in the stride form is
+        // the one in flight.
+        inject.set_budget(c0.file_bytes / 4);
+        convert_look(&db, sec);
+        for _ in 0..8 {
+            read_round(&db, &keys, keys.len());
+            convert_look(&db, sec);
+        }
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.stride_convert_rent_us, c.build_starts, c.stride_files),
+            (0, held.build_starts, 0),
+            "{what}: not offered out before it has landed: {c:?}"
+        );
+        db.hold_zpage_build(false);
+        assert!(
+            tick_until_built(&db, |c| c.stride_converts == c0.stride_converts + 1),
+            "{what}: landed: {:?}",
+            db.zpage_counts()
+        );
+        check(&r, &model, &keys, what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Readers on threads of their own read through a store's partitions while
+/// the conversion moves them between the two forms under them
+/// (`Options::zpages_stride_convert`): point reads, counts and scans across
+/// the partitions' fences, each held to the model, while the main thread
+/// gives the store room until partitions have moved into the stride form,
+/// takes it away until they have moved out, and gives it back. A swap
+/// replaces the form file in the partition's cell, and a reader that began
+/// in the old one finishes in it under its pin; a read that took the cell
+/// between two forms' files, or a file freed under it, answers wrong or
+/// faults here.
+#[cfg(target_os = "linux")]
+#[test]
+fn readers_read_through_a_partitions_conversions_both_ways() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    let what = "readers across conversions";
+    let (dir, db, model, inject, keys) =
+        convert_store("auto-convert-readers", ZStride::Chosen, true);
+    let total = db.zpage_counts().file_bytes;
+    let model = Arc::new(model);
+    let keys = Arc::new(keys);
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicU64::new(0));
+    let mut threads = Vec::new();
+    for t in 0..2u64 {
+        let r = db.reader().unwrap();
+        let (model, keys, stop, done) = (model.clone(), keys.clone(), stop.clone(), done.clone());
+        threads.push(std::thread::spawn(move || {
+            let mut rng = Rng(0x13579 ^ ((t + 1) * 0x9E37));
+            let mut n = 0u64;
+            // The last key holds two values, so the scans stop short of it.
+            let span = keys.len() - 16;
+            while !stop.load(Ordering::SeqCst) || n < 200 {
+                let i = rng.below(span);
+                let k = &keys[i];
+                match n % 3 {
+                    0 => assert_eq!(read_vec(&r, k), model[k], "a read of {k:?}"),
+                    1 => assert_eq!(r.count(k).unwrap(), 1, "a count of {k:?}"),
+                    _ => {
+                        let mut got = Vec::new();
+                        r.scan(k, 8, kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))))
+                            .unwrap();
+                        let want: Vec<(Vec<u8>, Vec<u8>)> = keys[i..]
+                            .iter()
+                            .take(8)
+                            .map(|k| (k.clone(), model[k][0].clone()))
+                            .collect();
+                        assert_eq!(got, want, "a scan from {k:?}");
+                    }
+                }
+                n += 1;
+                if n.is_multiple_of(64) {
+                    done.fetch_add(64, Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+    // Looks, a period of the injected clock apart, until `cond` holds or a
+    // minute of the wall has gone.
+    let until = |cond: &dyn Fn(&supdb::db::ZCounts) -> bool| {
+        let t = std::time::Instant::now();
+        while !cond(&db.zpage_counts()) && t.elapsed().as_secs() < 60 {
+            advance_tick(&db, std::time::Duration::from_millis(250));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        cond(&db.zpage_counts())
+    };
+    let mut held = Vec::new();
+    for round in 1..=2u64 {
+        inject.set_budget(total * 100);
+        let moved_in = until(&|c| c.stride_converts >= 2 * round);
+        held.push((round, "in", moved_in, db.zpage_counts()));
+        inject.set_budget(total);
+        let moved_out = until(&|c| c.stride_converts_back >= 2 * round);
+        held.push((round, "out", moved_out, db.zpage_counts()));
+    }
+    stop.store(true, Ordering::SeqCst);
+    for t in threads {
+        t.join().expect("a reader thread");
+    }
+    for (round, way, ok, c) in &held {
+        assert!(
+            ok,
+            "{what}: round {round}, two partitions moved {way}: {c:?}"
+        );
+    }
+    let c = db.zpage_counts();
+    assert!(
+        done.load(Ordering::Relaxed) >= 400 && c.stride_reads > 0 && c.fallbacks == 0,
+        "{what}: the readers read through both forms: {} {c:?}",
+        done.load(Ordering::Relaxed)
+    );
+    assert_eq!(c.recode_failed, 0, "{what}: {c:?}");
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, what);
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A merge's outputs are built in the form the partition they rewrite is
+/// served in (`ZStride::Chosen`, `Maint::z_stride_ask_finish`): the first
+/// partition converted to the stride form, every key put again and the
+/// pieces merged, with room, and the outputs whose first key lies in that
+/// partition's range are built in the stride form at their finish and the
+/// rest in the block form -- no conversion's build after the merge -- and
+/// so are the outputs of a second rewrite planned before any of the first's
+/// files is attached, which a plan that read only the served partitions
+/// would build in the block form, every one. With
+/// the budget under what the forms and the pieces hold as the merge begins,
+/// every output is built in the block form and the refusal counted: the way
+/// out of the stride form that costs no build of its own.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_merges_outputs_keep_the_form_of_the_partition_they_rewrite() {
+    for room in [true, false] {
+        let what = &format!("the form kept across a merge, room {room}");
+        let (dir, mut db, mut model, inject, raw) = land_store_loaded(
+            &format!("auto-convert-finish-{room}"),
+            50,
+            |o| {
+                o.zpages_stride = ZStride::Chosen;
+                o.zpages_stride_convert = true;
+                o.zpages_build_at_finish = true;
+                o.zpages_ahead_builders = 8;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(1 << 20);
+                o.l0_trigger = 1;
+            },
+            |db| numbered_soft_load(db, 20_000, 100, 0x5C3, false),
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        inject.set_fault_cost(FAULT_1MS);
+        inject.set_budget(raw / 2);
+        {
+            let r = db.reader().unwrap();
+            let mut at = 0usize;
+            assert!(
+                drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+                "{what}: COMPACT: {:?}",
+                db.zpage_counts()
+            );
+        }
+        assert!(
+            tick_until(&db, 400, |c| c.form_files == c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        assert!(
+            c.partitions >= 2 && c.stride_files == 0,
+            "{what}: partitions in the block form: {c:?}"
+        );
+        // The first partition into the stride form.
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        inject.set_convert_price(std::time::Duration::from_millis(200));
+        inject.set_budget(raw * 8);
+        let first = keys_of_partition(&db, &model, 0);
+        let fence = db.zpage_heat()[1].lo.clone();
+        let sec = std::time::Duration::from_secs(1);
+        convert_look(&db, sec);
+        read_round(&db, &first, 300_000);
+        convert_look(&db, sec);
+        assert!(
+            tick_until_built(&db, |c| c.stride_converts >= 1),
+            "{what}: the first partition converted: {:?}",
+            db.zpage_counts()
+        );
+        let st = strides(&db);
+        assert!(
+            st[0] && st.iter().filter(|s| **s).count() == 1,
+            "{what}: the first partition alone in the stride form: {st:?}"
+        );
+        // A rent paid a partition the merges below retire: the second
+        // partition read hot with room for it, at a price no rent comes to.
+        inject.set_convert_price(std::time::Duration::from_secs(1_000_000_000));
+        let second = keys_of_partition(&db, &model, 1);
+        convert_look(&db, sec);
+        read_round(&db, &second, 100_000);
+        convert_look(&db, sec);
+        assert!(
+            db.zpage_counts().stride_convert_rent_us > 0,
+            "{what}: a rent standing: {:?}",
+            db.zpage_counts()
+        );
+        let before = db.zpage_counts();
+        if !room {
+            inject.set_budget(before.file_bytes);
+        }
+        // Every key put again, a value of the same width, and merged; and
+        // again, with no tick of the controller between the two, so that
+        // the second round's merges are planned over the first round's
+        // outputs with their files on disk and attached to nothing -- the
+        // state a chain of merges plans in, each at the landing before it.
+        let mut rng = Rng(0x5EF0);
+        for round in 0..2u64 {
+            let was = db.zpage_counts().finish_builds;
+            for chunk in keys.chunks(250) {
+                for k in chunk {
+                    let mut v = vec![0x5Au8; 100];
+                    for b in v.iter_mut().take(4) {
+                        *b = (rng.next() >> 24) as u8;
+                    }
+                    db.put(k, &v);
+                    model.insert(k.clone(), vec![v]);
+                }
+                db.commit().unwrap();
+            }
+            db.seal().unwrap();
+            db.settle().unwrap();
+            wait_for("the builds at the outputs' finish to end", || {
+                let c = db.zpage_counts();
+                c.finish_builds > was && c.finish_live == 0 && db.merges_in_flight() == 0
+            });
+            if round == 0 {
+                let c = db.zpage_counts();
+                assert!(
+                    c.form_files < c.partitions,
+                    "{what}: the first round's outputs not attached yet: {c:?}"
+                );
+            }
+        }
+        assert!(
+            tick_until(&db, 400, |c| c.form_files == c.partitions),
+            "{what}: the finishes' files installed: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        let heat = db.zpage_heat();
+        if room {
+            assert!(
+                c.stride_files >= 1 && c.stride_files < c.partitions,
+                "{what}: outputs in both forms: {c:?}"
+            );
+            for h in &heat {
+                assert_eq!(
+                    h.stride,
+                    h.lo < fence,
+                    "{what}: the stride form where the partition rewritten had it: {:?} against {:?}",
+                    String::from_utf8_lossy(&h.lo),
+                    String::from_utf8_lossy(&fence)
+                );
+            }
+            assert_eq!(
+                (c.stride_converts, c.stride_no_room),
+                (before.stride_converts, before.stride_no_room),
+                "{what}: by the finish's builds, no conversion's: {c:?}"
+            );
+        } else {
+            assert_eq!(
+                c.stride_files, 0,
+                "{what}: every output in the block form: {c:?}"
+            );
+            assert!(
+                c.stride_no_room > before.stride_no_room,
+                "{what}: the refusal counted: {c:?}"
+            );
+        }
+        let nos = db.zpage_stride_nos();
+        assert!(nos.iter().all(|&n| n == 0), "{what}: no reason: {nos:?}");
+        // The rent went with the partition it was paid: the outputs have
+        // names of their own, and nothing has been read since.
+        convert_look(&db, sec);
+        let c = db.zpage_counts();
+        assert_eq!(
+            c.stride_convert_rent_us, 0,
+            "{what}: no rent kept for a partition a merge retired: {c:?}"
+        );
+        let r = db.reader().unwrap();
+        check(&r, &model, &keys, what);
+        check_scan(&r, &model, what);
+        drop(r);
+        let c = db.zpage_counts();
+        assert_eq!(c.fallbacks, 0, "{what}: {c:?}");
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A reading made from the form files on disk at the crossing
+/// (`Maint::z_reading_from_files`) takes a stride file as on disk, as the
+/// files' cover counts it and as the attach takes it: by its own trailer,
+/// read by the last page's magic. Its bytes are the form's in the reading,
+/// so the reading's form bytes are the files' own, every one on disk; read
+/// as a block trailer alone, each stride partition was missing to the
+/// reading while the cover counted it, and the reading put the block files'
+/// bytes to its keys in its place. A store that holds both bodies, the
+/// stride files' partitions keeping no reason and the block files' theirs,
+/// and a store whose every partition is a stride file, where no file holds
+/// a group to time a decode on: its reads decode nothing, and the reading
+/// stands at a decode price of nothing where it once waited for a timed
+/// group and left the store to the fill sample.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_reading_from_files_prices_a_stride_file_as_on_disk() {
+    for all in [false, true] {
+        let what = if all {
+            "a reading from stride files alone"
+        } else {
+            "a reading from stride and block files"
+        };
+        let (dir, db, model, inject, raw) = land_store_loaded(
+            &format!("auto-reading-stride-{all}"),
+            50,
+            |o| {
+                o.zpages_stride = ZStride::Forced;
+                o.partition_bytes = Some(160 << 10);
+                o.zpages_reading_from_files = true;
+                o.zpages_land_cold_past = false;
+            },
+            |db| {
+                if all {
+                    numbered_load(db, 20_000, 100, 0x2EAE)
+                } else {
+                    mixed_load(db, 20_000, 0x2EAD)
+                }
+            },
+        );
+        inject.set_budget(raw * 3 / 2);
+        assert!(
+            tick_until_built(&db, |c| c.prebuilt >= c.partitions),
+            "{what}: built ahead: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        let n = c.partitions;
+        if all {
+            assert_eq!(
+                c.stride_builds, n,
+                "{what}: every partition a stride file: {c:?}"
+            );
+        } else {
+            assert!(
+                c.stride_builds > 0 && c.stride_builds < n,
+                "{what}: both bodies built ahead: {c:?}"
+            );
+        }
+        let nos = db.zpage_stride_nos();
+        assert_eq!(
+            nos.iter().filter(|&&r| r == 0).count() as u64,
+            c.stride_builds,
+            "{what}: the builds ahead kept each partition's reason: {nos:?} {c:?}"
+        );
+        inject.set_records_resident(0.0);
+        let on_disk: u64 = form_files(&dir)
+            .iter()
+            .map(|f| std::fs::metadata(f).unwrap().len())
+            .sum();
+        assert_eq!(form_files(&dir).len() as u64, n, "{what}");
+        inject.set_budget(1 << 20);
+        inject.set_refault_rate(1_000_000.0);
+        inject.set_fault_cost(FAULT_1MS);
+        assert!(
+            tick_until(&db, 400, |c| c.sample_from_files + c.samples >= 1),
+            "{what}: a reading: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.sample_from_files, c.samples),
+            (1, 0),
+            "{what}: the reading from the files: {c:?}"
+        );
+        assert_eq!(
+            c.sample_w_z_bytes, on_disk,
+            "{what}: the reading's form bytes the files' own: {c:?}"
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+        let r = db.reader().unwrap();
+        check(&r, &model, &some, what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Under the controller the hot-raw policy (`Options::zpages_hot_raw`)
+/// stands down beside the stride form: a stride file counts no decode or
+/// open, so it rates no heat and sat in the median a block file's skew is
+/// read against at nothing. A store driven to COMPACT with the policy on
+/// looks through its period without the stride form, and a store of
+/// numbered keys driven there with it asked for, every partition a stride
+/// file, makes no look in the same periods: the stand-down is the
+/// option's, held where the files it is for serve the store.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_hot_raw_policy_stands_down_beside_the_stride_form() {
+    for stride in [false, true] {
+        let what = format!("hot raw beside the stride form {stride}");
+        let (dir, db, model, r, keys) = if stride {
+            let (dir, db, model, inject) = auto_store_loaded(
+                "auto-hot-stride-true",
+                1 << 20,
+                1_000_000.0,
+                FAULT_1MS,
+                |o| {
+                    o.zpages_hot_raw = true;
+                    o.zpages_stride = ZStride::Forced;
+                },
+                |_| {},
+                |db| numbered_load(db, 20_000, 100, 0x4A9),
+            );
+            let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+            let r = db.reader().unwrap();
+            let mut at = 0usize;
+            assert!(
+                drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
+                "{what}: COMPACT: {:?}",
+                db.zpage_counts()
+            );
+            assert!(
+                tick_until_built(&db, |c| c.form_files == c.partitions),
+                "{what}: every partition served: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert!(
+                c.partitions > 0 && c.stride_files == c.partitions,
+                "{what}: every partition a stride file: {c:?}"
+            );
+            (dir, db, model, r, keys)
+        } else {
+            let (dir, db, model, _inject, r, keys, _) =
+                compact_store_with("auto-hot-stride-false", 1 << 20, |o| {
+                    o.zpages_hot_raw = true
+                });
+            (dir, db, model, r, keys)
+        };
+        for _ in 0..5 {
+            advance_tick(&db, std::time::Duration::from_millis(200));
+        }
+        let c = db.zpage_counts();
+        if stride {
+            assert_eq!((c.hot_looks, c.hot_raw), (0, 0), "{what}: {c:?}");
+        } else {
+            assert!(c.hot_looks > 0, "{what}: the periods reach the look: {c:?}");
+        }
+        check(&r, &model, &keys, &what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The hot-raw policy beside the stride form
+/// (`Options::zpages_hot_raw_beside_stride`): a store whose lower
+/// partitions are stride files and upper ones block files, with room for a
+/// release. With the option the policy looks; a partition a stride file
+/// serves is rated with the rest and is not released however hot it reads
+/// -- its reads are a raw partition's already, in less room -- under the
+/// skew's release and under the fill alike, and a hot partition a block
+/// file serves is asked for and released as in a store with no stride
+/// file, every stride file still serving. Without the option the policy
+/// makes no look there.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_hot_raw_policy_releases_a_block_partition_beside_stride_files_and_never_a_stride_one() {
+    for (beside, fill) in [(true, false), (true, true), (false, false)] {
+        let what = format!("hot raw beside stride files {beside}, the fill {fill}");
+        let what = what.as_str();
+        let (dir, db, model, inject) = auto_store_loaded(
+            &format!("auto-hot-beside-{beside}-{fill}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_hot_raw = true;
+                o.zpages_hot_raw_slack = true;
+                o.zpages_hot_raw_beside_stride = beside;
+                o.zpages_hot_fill = fill;
+                o.zpages_stride = ZStride::Forced;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+            |db| mixed_load(db, 20_000, 0x4B5),
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until_built(&db, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        let c0 = db.zpage_counts();
+        let st = strides(&db);
+        let parts = st.len();
+        assert!(
+            c0.form_files == c0.partitions && st[0] && st[1] && !st[parts - 2],
+            "{what}: stride files below and block files above: {st:?} {c0:?}"
+        );
+        // Room for a release and more, by the budget and by the group.
+        let raw_one = (c0.model_record_bytes + c0.model_hash_bytes) / c0.partitions;
+        let budget = c0.file_bytes * 100;
+        inject.set_budget(budget);
+        let growth = (budget as f64 * supdb::db::HOT_RAW_GROWTH) as u64;
+        inject.set_slack(raw_one * 3 + growth);
+        let tick = std::time::Duration::from_millis(200);
+        if !beside {
+            let hot = keys_of_partition(&db, &model, parts - 2);
+            for _ in 0..4 {
+                read_round(&db, &hot, 100_000);
+                advance_tick(&db, tick);
+            }
+            wait_steps(&db, 5);
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_looks, c.hot_asks, c.hot_raw),
+                (0, 0, 0),
+                "{what}: the policy stands down: {c:?}"
+            );
+            check(&r, &model, &keys, what);
+            drop(r);
+            db.close().unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            continue;
+        }
+        // The stride files' partitions and one block file's read alike,
+        // under the skew's release: the stride files' reads are counted, so
+        // the median partition is one of them and the block one is no
+        // hotter than it. Counted at nothing they would leave the median
+        // at nothing, and any block partition read at all would be skewed.
+        hot_look(&db, tick);
+        if !fill {
+            let alike: Vec<Vec<u8>> = (0..parts)
+                .filter(|&i| st[i] || i == parts - 2)
+                .flat_map(|i| keys_of_partition(&db, &model, i))
+                .collect();
+            assert!(
+                st.iter().filter(|s| **s).count() * 2 > parts - 1,
+                "{what}: the stride files' partitions are the median's side: {st:?}"
+            );
+            for _ in 0..4 {
+                read_round(&db, &alike, 8 * alike.len());
+                hot_look(&db, tick);
+            }
+            wait_steps(&db, 5);
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_asks, c.hot_raw),
+                (0, 0),
+                "{what}: a block partition read as the stride ones are is not skewed: {c:?}"
+            );
+        }
+        // A stride file's partition read hot: rated, and left as it is.
+        let hot_stride = keys_of_partition(&db, &model, 0);
+        hot_look(&db, tick);
+        for _ in 0..4 {
+            read_round(&db, &hot_stride, 100_000);
+            hot_look(&db, tick);
+        }
+        wait_steps(&db, 5);
+        let c = db.zpage_counts();
+        assert!(c.hot_looks > 0, "{what}: the policy looks: {c:?}");
+        assert_eq!(
+            (c.hot_asks, c.hot_raw, c.hot_raw_now, c.stride_files),
+            (0, 0, 0, c0.stride_files),
+            "{what}: a stride file's partition is not released: {c:?}"
+        );
+        // A block file's partition read hot: asked for and released.
+        let hot_block = keys_of_partition(&db, &model, parts - 2);
+        for _ in 0..3 {
+            read_round(&db, &hot_block, 100_000);
+            hot_look(&db, tick);
+        }
+        assert!(
+            hot_until(&db, 10, |c| c.hot_raw >= 1),
+            "{what}: the hot block partition released: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.hot_raw_now, c.stride_files, c.form_files),
+            (1, c0.stride_files, c0.partitions - 1),
+            "{what}: one partition raw, every stride file serving: {c:?}"
+        );
+        assert_eq!(
+            strides(&db).iter().filter(|s| **s).count() as u64,
+            c0.stride_files
+        );
+        check(&r, &model, &keys, what);
+        let c = db.zpage_counts();
+        assert_eq!(c.fallbacks, 0, "{what}: {c:?}");
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// E2's footprint (`Maint::z_footprint`) counts a stride partition's raw
+/// footprint whole: its reads touch no page the handles count, and its
+/// value pages hold the values alone, so in the division of the keys over
+/// the served pages its keys would thin every touched block page's records
+/// and leave its own raw footprint out of the bound. A store whose lower
+/// half's partitions are stride files and upper half's block files, driven
+/// to COMPACT, then read over a few keys of the block files: the part of
+/// the bound counted whole is the stride partitions' hash and records to
+/// the byte (`ZCounts::footprint_held`, `Db::zpage_stride_foot`), a third of
+/// the store's records among them, and the touched pages' share of the
+/// block partitions is beside it.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_footprint_counts_a_stride_partition_whole() {
+    let what = "the footprint beside stride files";
+    let (dir, db, model, inject) = auto_store_loaded(
+        "auto-footprint-stride",
+        1 << 20,
+        1_000_000.0,
+        FAULT_1MS,
+        |o| {
+            o.zpages_stride = ZStride::Forced;
+            o.partition_bytes = Some(160 << 10);
+        },
+        |_| {},
+        |db| mixed_load(db, 20_000, 0xF00D),
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(
+        drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
+        "{what}: COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    assert!(
+        tick_until_built(&db, |c| c.form_files == c.partitions),
+        "{what}: every partition served: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert!(
+        c.stride_files > 0 && c.stride_files < c.form_files,
+        "{what}: both bodies served: {c:?}"
+    );
+    // Ten keys of the upper half, whose partitions the block body serves.
+    let hot: Vec<Vec<u8>> = keys[keys.len() / 2..]
+        .iter()
+        .step_by(1000)
+        .take(10)
+        .cloned()
+        .collect();
+    hot_reads(&db, &r, &hot, &inject, 2, 0);
+    let c = db.zpage_counts();
+    assert!(
+        (1..=10).contains(&c.footprint_pages),
+        "{what}: ten keys touch at most ten pages: {c:?}"
+    );
+    // No partition is held raw, so what the bound counts whole is the
+    // stride partitions' hash and records, every byte of both.
+    assert_eq!(c.hot_raw_now, 0, "{what}: {c:?}");
+    let stride_foot = db.zpage_stride_foot();
+    assert!(
+        stride_foot * 4 >= c.model_record_bytes,
+        "{what}: the stride partitions a third of the store: {c:?}"
+    );
+    assert_eq!(
+        c.footprint_held, stride_foot,
+        "{what}: the stride partitions' hash and records counted whole: {c:?}"
+    );
+    assert!(
+        c.footprint_bytes > c.footprint_held,
+        "{what}: and the touched block pages' share beside them: {c:?}"
+    );
+    check(&r, &model, &keys, what);
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The words kept for stride files left on disk (`Shared::z_left_seals`)
+/// are held to the live partitions' names once they outgrow them: a word
+/// whose partition a merge retired before its attach is taken by no attach,
+/// and the record would grow by one for every such file for the store's
+/// life. Words under names no live partition has, more than the bound's
+/// share of the live, are dropped at the next look that takes the
+/// finishes' codings (`Maint::z_take_finish_codings`), and the live
+/// partitions' are kept: every partition's stride file built ahead under
+/// the selector's line, read back from the device and its word kept, the
+/// dead words planted beside them, and the store driven to COMPACT -- the
+/// first attach's look prunes, every attach takes its partition's word and
+/// installs its file trusted, and no word is left. A prune that dropped
+/// every word would leave each file to be checked page by page.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_words_kept_for_stride_files_are_held_to_the_live_partitions() {
+    let what = "the left words pruned";
+    let (dir, db, model, inject, raw) = land_store_loaded(
+        "auto-left-seals",
+        50,
+        |o| {
+            o.zpages_stride = ZStride::Forced;
+            o.partition_bytes = Some(160 << 10);
+            o.zpages_land_cold_past = false;
+        },
+        |db| numbered_load(db, 20_000, 100, 0x5EA1),
+    );
+    inject.set_budget(raw * 3 / 2);
+    assert!(
+        tick_until_built(&db, |c| c.prebuilt >= c.partitions),
+        "{what}: built ahead: {:?}",
+        db.zpage_counts()
+    );
+    let n = db.zpage_counts().partitions as usize;
+    assert!(n >= 4, "{what}");
+    assert_eq!(
+        (db.zpage_left_seals_held(), db.zpage_left_seals()),
+        (n, n),
+        "{what}: a word for each live partition's file"
+    );
+    let dead: Vec<String> = (0..4 * n.max(8) + 8)
+        .map(|i| format!("zpg-dead-{i:04}.zpg"))
+        .collect();
+    db.zpage_leave_seals(&dead);
+    assert_eq!(
+        (db.zpage_left_seals_held(), db.zpage_left_seals()),
+        (n + dead.len(), n),
+        "{what}: words for no live partition beside the live"
+    );
+    inject.set_budget(1 << 20);
+    inject.set_refault_rate(1_000_000.0);
+    inject.set_fault_cost(FAULT_1MS);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(
+        drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
+        "{what}: COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    assert!(
+        tick_until(&db, 400, |c| c.attached >= n as u64
+            && c.form_files == n as u64),
+        "{what}: every partition attached: {:?}",
+        db.zpage_counts()
+    );
+    assert_eq!(
+        db.zpage_left_seals_held(),
+        0,
+        "{what}: the dead words dropped, the live taken by their attaches"
+    );
+    check(&r, &model, &keys, what);
+    drop(r);
+    let c = db.zpage_counts();
+    assert_eq!(
+        (
+            c.stride_files,
+            c.stride_page_checks,
+            c.verified_pages,
+            c.fallbacks
+        ),
+        (n as u64, 0, c.pages, 0),
+        "{what}: every file installed trusted, its word kept through the prune: {c:?}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stride file built ahead at landing is on no record of the block
+/// body's two codings (`Maint::z_ahead_coding`): the record took the plan's
+/// coding before the body was known, and a build that made a stride file
+/// takes it out. Where the sampler's pick is then the raw tails, the buy
+/// attaches every stride file as it lies -- nothing given back, nothing
+/// built again -- where on the plan's record each was given back as a file
+/// in the refused coding and built again into the same bytes.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stride_file_built_ahead_is_not_given_back_when_the_pick_moves() {
+    assert!(Options::default().zpages_coding_auto);
+    let what = "a stride file built ahead, the pick the raw tails";
+    let (dir, db, model, inject, raw) = land_store_loaded(
+        "auto-land-stride-pick",
+        50,
+        |o| {
+            o.zpages_stride = ZStride::Forced;
+            o.partition_bytes = Some(160 << 10);
+            o.zpages_build_eager = true;
+        },
+        |db| numbered_load(db, 20_000, 100, 0x91C),
+    );
+    inject.set_budget(raw * 3 / 2);
+    assert!(
+        tick_until_built(&db, |c| c.prebuilt >= c.partitions),
+        "{what}: built ahead: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    let n = c.partitions;
+    assert!(n >= 4, "{what}: {c:?}");
+    assert_eq!(
+        (c.stride_builds, c.builds_raw_tails, c.phase),
+        (n, 0, 0),
+        "{what}: every partition's stride file built ahead, FITS: {c:?}"
+    );
+    let mut seen = 0usize;
+    db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+    assert_eq!(seen, 10);
+    inject.set_budget(64 << 20);
+    inject.set_refault_rate(1_000_000.0);
+    inject.set_fault_cost(FAULT_1MS);
+    assert!(
+        tick_until(&db, 400, |c| c.sel_installs >= 1),
+        "{what}: bought and installed: {:?}",
+        db.zpage_counts()
+    );
+    assert!(
+        tick_until(&db, 400, |c| c.attached >= n),
+        "{what}: every partition attached: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert!(
+        c.coding_picks_raw >= 1,
+        "{what}: the raw tails picked: {c:?}"
+    );
+    assert_eq!(
+        (
+            c.ahead_recoded,
+            c.build_starts,
+            c.stride_builds,
+            c.stride_files
+        ),
+        (0, n, n, n),
+        "{what}: each stride file attached as built ahead, none given back: {c:?}"
+    );
+    assert_eq!(
+        form_files(&dir).len() as u64,
+        n,
+        "{what}: one form file each"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+    let r = db.reader().unwrap();
+    check(&r, &model, &some, what);
+    drop(r);
+    assert!(
+        db.zpage_counts().stride_reads > 0,
+        "{what}: through the files"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The re-code policies build the block body's other coding over a served
+/// file's name and read a stride file as the block coding: the stride form
+/// is refused at the open beside each of the three in the mode it starts
+/// such builds in -- `zpages_recode` under the forced form,
+/// `zpages_recode_auto` and `zpages_reparse` under the controller -- each set
+/// alone, and each opens without it. What starts none is not refused: each
+/// of the three in the other mode, and the two that only shape what those
+/// three do -- the file a re-code replaced kept, the spares. Beside the
+/// stride form those open, and under the forced form the store gives its
+/// partition a stride file and reads through it; the refusal by the options'
+/// names alone refused the first three of them.
+#[test]
+fn the_stride_form_is_refused_beside_the_recode_policies() {
+    type Set = fn(&mut Options);
+    let auto = |o: &mut Options| o.zpages = ZPages::Auto;
+    let always = |_: &mut Options| {};
+    let refused: [(&str, Set, Set); 3] = [
+        ("recode", always, |o| o.zpages_recode = true),
+        ("recode-auto", auto, |o| o.zpages_recode_auto = true),
+        ("reparse", auto, |o| o.zpages_reparse = true),
+    ];
+    for (name, mode, set) in refused {
+        let dir = scratch(&format!("stride-refused-{name}"));
+        let e = Db::create(
+            &dir,
+            stride_forced(|o| {
+                mode(o);
+                set(o);
+            }),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{name}: opened"));
+        assert!(e.to_string().contains("zpages_stride"), "{name}: {e}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let block = |o: &mut Options| {
+            o.zpages_stride = ZStride::Off;
+            mode(o);
+            set(o);
+        };
+        let db = Db::create(&dir, forced(block)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // In the mode that starts nothing of theirs: the controller's for the
+    // forced form's policy, and the forced form's for the controller's.
+    let dir = scratch("stride-alone-recode-auto-mode");
+    let db = Db::create(
+        &dir,
+        stride_forced(|o| {
+            auto(o);
+            o.zpages_recode = true;
+        }),
+    )
+    .unwrap_or_else(|e| panic!("recode under the controller: {e}"));
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let alone: [(&str, Set); 4] = [
+        ("recode-auto", |o| o.zpages_recode_auto = true),
+        ("reparse", |o| o.zpages_reparse = true),
+        ("recode-keep", |o| o.zpages_recode_keep = true),
+        ("both", |o| o.zpages_both = true),
+    ];
+    for (name, set) in alone {
+        let dir = scratch(&format!("stride-alone-{name}"));
+        let mut db = Db::create(&dir, stride_forced(set)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let model = numbered_load(&mut db, 2000, 100, 0xA1);
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert_eq!((c.stride_files, c.partitions), (1, 1), "{name}: {c:?}");
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&db, &model, &keys, name);
+        assert!(
+            db.zpage_counts().stride_reads > 0,
+            "{name}: through the file"
+        );
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Bytes of a stride file, one at a time in a copy, its value pages, its
+/// row and its trailer: a flip the attach reads -- a sampled page, the row,
+/// the trailer -- is a refusal and the partition is read raw; a flip in any
+/// other value page is met at the page's first touch, which falls back,
+/// marks the page bad and takes the file out of service, so that a read of
+/// a key on another page, an intact one, is the raw form's after it. Every
+/// read answers as the model does.
+#[test]
+fn a_flipped_byte_in_a_stride_file_is_never_an_answer() {
+    let (dir, model, keys) = stride_partition("stride-flips-src", 3000, 0x5F11);
+    let file = form_files(&dir).remove(0);
+    let good = std::fs::read(&file).unwrap();
+    let (_, v) = stride_of(&file);
+    let (samples, clear) = stride_samples(v);
+    let work = scratch("stride-flips-work");
+    copy_dir(&dir, &work);
+    let target = form_files(&work).remove(0);
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&target)
+        .unwrap();
+    use std::os::unix::fs::FileExt;
+    let (mut refused, mut fell_back) = (0, 0);
+    for at in (0..good.len()).step_by(997) {
+        let p = at / ZPAGE;
+        f.write_at(&[good[at] ^ 0x40], at as u64).unwrap();
+        let db = Db::open(&work, stride_forced(|o| o.zpages_eager = false)).unwrap();
+        let probe = if p < v {
+            keys_on_page(p, &keys)
+        } else {
+            keys.iter().step_by(97).cloned().collect()
+        };
+        if (at / 997) % 2 == 1 {
+            check_counts_first(&db, &model, &probe, &format!("byte {at}"));
+        } else {
+            check(&db, &model, &probe, &format!("byte {at}"));
+        }
+        let c = db.zpage_counts();
+        if p >= v || samples.contains(&p) {
+            assert_eq!(
+                (c.rejected_damage, c.form_files, c.reads),
+                (1, 0, 0),
+                "byte {at}: {c:?}"
+            );
+            refused += 1;
+        } else if clear(p) && at < keys.len() * 100 {
+            assert_eq!(
+                (
+                    c.rejected_damage,
+                    c.form_files,
+                    c.fallbacks,
+                    c.bad_pages,
+                    c.damaged
+                ),
+                (0, 1, 1, 1, 1),
+                "byte {at}: {c:?}"
+            );
+            // A key on the first page, which the flip left intact: the file
+            // is out of service, and the read is the raw form's.
+            let before = db.zpage_counts();
+            check(&db, &model, &keys[..1], &format!("byte {at}, another page"));
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.reads - before.reads, c.rawserves - before.rawserves),
+                (0, 2),
+                "byte {at}: {c:?}"
+            );
+            fell_back += 1;
+        }
+        drop(db);
+        f.write_at(&[good[at]], at as u64).unwrap();
+    }
+    assert!(refused > 3 && fell_back > 20, "{refused} {fell_back}");
+    let db = Db::open(&work, stride_forced(|o| o.zpages_eager = false)).unwrap();
+    check(&db, &model, &keys[..300], "restored");
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.rejected_damage, c.fallbacks, c.rawserves, c.stride_files),
+        (0, 0, 0, 1),
+        "{c:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// A value page of a stride file that fails its check takes the file out of
+/// service and the settle retires it and builds the partition's stride file
+/// again, three times a segment; the fourth damage declines the partition
+/// for the segment's life. With the trust in this process's builds off, so
+/// that each rebuilt file's pages are checked at their first touch as one
+/// found on disk is: a trusted file damaged in place after its build is
+/// served as it reads, the trust's limit.
+#[test]
+fn a_damaged_stride_file_is_rebuilt_at_most_three_times_and_then_declined() {
+    let (dir, model, keys) = stride_partition("stride-rebuild-src", 3000, 0x5EB1);
+    let work = scratch("stride-rebuild-work");
+    copy_dir(&dir, &work);
+    let opts = || stride_forced(|o| o.zpages_stride_trust_built = false);
+    let mut db = Db::open(&work, opts()).unwrap();
+    let live = |dir: &Path| {
+        form_files(dir)
+            .into_iter()
+            .filter(|p| !p.to_string_lossy().contains("dead"))
+            .collect::<Vec<_>>()
+    };
+    let (_, v) = stride_of(&live(&work)[0]);
+    let (_, clear) = stride_samples(v);
+    // Pages two apart and more: a read of a page's keys verifies the page
+    // before it and the one after where a slot straddles, and a page this
+    // process has verified is not checked again, a flip under it after the
+    // fact served as it reads, as the block form's verified pages are.
+    let mut pages: Vec<usize> = Vec::new();
+    for p in (0..v).filter(|&p| clear(p)) {
+        if pages.last().is_none_or(|&q| p >= q + 3) {
+            pages.push(p);
+        }
+    }
+    pages.truncate(4);
+    assert_eq!(pages.len(), 4, "{v} pages");
+    for (round, &p) in (1..=4u64).zip(&pages) {
+        let file = live(&work).remove(0);
+        {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&file)
+                .unwrap();
+            let at = (p * ZPAGE + 50) as u64;
+            let mut b = [0u8; 1];
+            f.read_exact_at(&mut b, at).unwrap();
+            f.write_at(&[b[0] ^ 0x40], at).unwrap();
+        }
+        let probe = keys_on_page(p, &keys);
+        let before = db.zpage_counts();
+        check(&db, &model, &probe, &format!("round {round}, damaged"));
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.fallbacks - before.fallbacks, c.damaged, c.form_files),
+            (1, 1, 1),
+            "round {round}: {c:?}"
+        );
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        if round <= 3 {
+            assert_eq!(
+                (
+                    c.rebuilds,
+                    c.damaged,
+                    c.form_files,
+                    c.stride_files,
+                    c.declined_damage
+                ),
+                (round, 0, 1, 1, 0),
+                "round {round}: {c:?}"
+            );
+            let before = db.zpage_counts();
+            check(&db, &model, &probe, &format!("round {round}, rebuilt"));
+            let c = db.zpage_counts();
+            assert_eq!(
+                (
+                    c.fallbacks - before.fallbacks,
+                    c.rawserves - before.rawserves
+                ),
+                (0, 0),
+                "round {round}: served from the new file: {c:?}"
+            );
+            assert!(c.stride_reads > before.stride_reads, "{c:?}");
+        } else {
+            assert_eq!(
+                (c.rebuilds, c.damaged, c.form_files, c.declined_damage),
+                (3, 0, 0, 1),
+                "round {round}: {c:?}"
+            );
+            assert!(live(&work).is_empty());
+            let before = db.zpage_counts();
+            check(&db, &model, &probe, "declined");
+            let c = db.zpage_counts();
+            assert_eq!(
+                c.rawserves - before.rawserves,
+                2 * probe.len() as u64,
+                "{c:?}"
+            );
+        }
+    }
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// The windows of a stride file's life a crash can fall in, built on disk
+/// from a store that has its stride file, and opened under the stride form
+/// and without it: a build's temp name alone, a torn trailer, a torn row, a
+/// zeroed value page, and a rebuild's temp name beside the intact file it
+/// was to replace -- a build over a refused file, or after its cell was
+/// retired. What the open finds is counted, every read answers
+/// as the model does, and a settle leaves one form file under the live name
+/// and nothing else of the form's -- the stride file where the store takes
+/// the form, and where it does not, the stride file refused as another
+/// engine's and the partition built again in the block coding.
+#[test]
+fn every_crash_window_of_a_stride_file_is_survived_at_open_with_the_form_or_without() {
+    let (dir, model, keys) = stride_partition("stride-crash-src", 3000, 0x5C2A);
+    let seg = partition_name(&dir);
+    let (id, end) = fields_of(&seg);
+    let live = format!("zpg-{id:08}-{end:016}.zpg");
+    let (t, v) = stride_of(&dir.join(&live));
+    let lay = t.layout().unwrap();
+    let (_, clear) = stride_samples(v);
+    let zeroed = (0..v).find(|&p| clear(p)).unwrap();
+    let mut probe: Vec<Vec<u8>> = keys.iter().step_by(37).cloned().collect();
+    probe.extend(keys_on_page(zeroed, &keys));
+    use std::os::unix::fs::FileExt;
+    let write_at = |d: &Path, bytes: &[u8], at: u64| {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(d.join(&live))
+            .unwrap();
+        f.write_all_at(bytes, at).unwrap();
+    };
+    // Each case: the window's state, and what an open under the form and one
+    // without it count: (swept, attached, rejected_damage, rejected_identity).
+    type Make<'a> = Box<dyn Fn(&Path) + 'a>;
+    type AtOpen = (u64, u64, u64, u64);
+    let cases: Vec<(&str, Make, AtOpen, AtOpen)> = vec![
+        (
+            "a temp name and no final file",
+            Box::new(|d: &Path| {
+                std::fs::rename(d.join(&live), d.join(format!("{live}.tmp"))).unwrap();
+            }),
+            (1, 0, 0, 0),
+            (1, 0, 0, 0),
+        ),
+        (
+            "a torn trailer",
+            Box::new(|d: &Path| write_at(d, &[0u8; ZTRAILER], lay.file_len - ZTRAILER as u64)),
+            (0, 0, 1, 0),
+            (0, 0, 1, 0),
+        ),
+        (
+            "a torn row",
+            Box::new(|d: &Path| write_at(d, &[0u8; ZPAGE], lay.res_off)),
+            (0, 0, 1, 0),
+            (0, 0, 0, 1),
+        ),
+        (
+            "a zeroed value page",
+            Box::new(|d: &Path| write_at(d, &[0u8; ZPAGE], (zeroed * ZPAGE) as u64)),
+            (0, 1, 0, 0),
+            (0, 0, 0, 1),
+        ),
+        (
+            "a rebuild's temp name beside the intact file",
+            Box::new(|d: &Path| {
+                let half = std::fs::read(d.join(&live)).unwrap();
+                std::fs::write(d.join(format!("{live}.tmp")), &half[..half.len() / 2]).unwrap();
+            }),
+            (1, 1, 0, 0),
+            (1, 0, 0, 1),
+        ),
+    ];
+    for (i, (name, make, with, without)) in cases.iter().enumerate() {
+        for form in [ZStride::Forced, ZStride::Off] {
+            let what = format!("{name}, {form:?}");
+            let work = scratch(&format!("stride-crash-{i}-{form:?}"));
+            copy_dir(&dir, &work);
+            make(&work);
+            let opts = || {
+                forced(|o| {
+                    o.zpages_stride = form;
+                    o.zpages_eager = false;
+                })
+            };
+            let mut db = Db::open(&work, opts()).unwrap();
+            let c = db.zpage_counts();
+            let want = if form == ZStride::Forced {
+                with
+            } else {
+                without
+            };
+            assert_eq!(
+                (c.swept, c.attached, c.rejected_damage, c.rejected_identity),
+                *want,
+                "{what}: at the open: {c:?}"
+            );
+            check(&db, &model, &probe, &what);
+            let c = db.zpage_counts();
+            if want.1 == 1 && *name == "a zeroed value page" {
+                // The zeroed page is met at its first touch.
+                assert_eq!(
+                    (c.fallbacks, c.bad_pages, c.damaged),
+                    (1, 1, 1),
+                    "{what}: {c:?}"
+                );
+            } else if want.1 == 1 {
+                // The intact file serves every read.
+                assert_eq!(
+                    (c.fallbacks, c.bad_pages, c.damaged),
+                    (0, 0, 0),
+                    "{what}: {c:?}"
+                );
+                assert!(c.stride_reads > 0, "{what}: {c:?}");
+            } else {
+                assert_eq!(c.reads + c.counts, 0, "{what}: {c:?}");
+            }
+            db.zpages_settle().unwrap();
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.form_files, c.partitions, c.damaged, c.stride_files),
+                (1, 1, 0, u64::from(form == ZStride::Forced)),
+                "{what}: after the settle: {c:?}"
+            );
+            let files: Vec<String> = form_files(&work)
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(files, vec![live.clone()], "{what}: after the settle");
+            let bytes = std::fs::read(work.join(&live)).unwrap();
+            let tail = &bytes[bytes.len() - ZTRAILER..];
+            assert_eq!(
+                StrideTrailer::decode(tail).is_ok(),
+                form == ZStride::Forced,
+                "{what}: the body under the name"
+            );
+            assert_eq!(
+                Trailer::decode(tail).is_ok(),
+                form == ZStride::Off,
+                "{what}"
+            );
+            let before = db.zpage_counts();
+            check(&db, &model, &probe, &format!("{what}, settled"));
+            let c = db.zpage_counts();
+            assert_eq!(
+                (
+                    c.rawserves - before.rawserves,
+                    c.fallbacks - before.fallbacks
+                ),
+                (0, 0),
+                "{what}: served from the form file after the settle: {c:?}"
+            );
+            db.close().unwrap();
+            let _ = std::fs::remove_dir_all(&work);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The first and the last key of every partition a stride file holds in
+/// `dir`, rendered by each file's codec from its trailer.
+fn stride_ends(dir: &Path) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; supdb::db::zpages::STRIDE_KEY_MAX];
+    for f in form_files(dir) {
+        let bytes = std::fs::read(&f).unwrap();
+        let Ok(t) = StrideTrailer::decode(&bytes[bytes.len() - ZTRAILER..]) else {
+            continue;
+        };
+        let (base, n) = (t.codec.base(), t.seg.nkeys);
+        out.push(t.codec.render(base, &mut buf).to_vec());
+        out.push(t.codec.render(base + n - 1, &mut buf).to_vec());
+    }
+    out
+}
+
+/// A hundred random bytes, the width every numbered load here writes.
+fn hundred(rng: &mut Rng) -> Vec<u8> {
+    (0..100).map(|_| (rng.next() >> 24) as u8).collect()
+}
+
+/// The scans of stride partitions answer as the model does over every
+/// window, with the unsealed keys laid over them dense -- updates of the
+/// run's width, inserts between records, second values and deletes, in a
+/// frozen table and the live one, and a run of fifty-six consecutive keys
+/// put again across a block's edge -- and then over a piece the frozen
+/// table lands as, with more writes over it. Windows begin at every key of
+/// the dense run and a byte either side, at each partition's ends, at keys
+/// a page apart and at the edges of the key space, and end after the counts
+/// a block and a page make interesting; through the writer and a handle.
+/// Where a cursor walks -- the block cache's reader under the block cursor,
+/// the covered walk without the cache, and the merge path over the piece --
+/// it walks the stride partitions at its stride position, the values it
+/// hands over counted; under the cache read a run at a time
+/// (`Options::zpages_block_cursor` off) the walks are the file's own and no
+/// cursor's. With the seek seeding the reader (`Options::zpages_seek_seeds`)
+/// the writer's scans from a key inside a partition seed its reader with the
+/// seek's cursor at its stride position, counted, every partition being a
+/// stride file's; without it nothing is seeded. Nothing is decoded, no walk
+/// is the raw form's, and the raw form is touched by none of it.
+fn stride_windows(name: &str, cache: bool, block_cursor: bool, seeds: bool) {
+    let counts = cfg!(debug_assertions);
+    let dir = scratch(name);
+    let mut db = Db::create(
+        &dir,
+        stride_forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            o.scan_block_cache = cache;
+            o.zpages_block_cursor = block_cursor;
+            o.zpages_seek_seeds = seeds;
+        }),
+    )
+    .unwrap();
+    let mut model = numbered_load(&mut db, 5000, 100, 0x5717);
+    db.zpages_settle().unwrap();
+    db.settle().unwrap();
+    let c = db.zpage_counts();
+    assert!(
+        c.partitions >= 3 && c.stride_files == c.partitions,
+        "{name}: every partition a run the form holds: {c:?}"
+    );
+    let ends = stride_ends(&dir);
+    assert_eq!(ends.len() as u64, 2 * c.partitions, "{name}");
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    // The seal is held short of its landing until the piece phase: a piece
+    // merged back into its partition drops the tombstones the windows are
+    // held to counting.
+    db.hold_seal_landing(true);
+    let mut rng = Rng(0x57171);
+    // A short scan first, so the tables stand before the writes and the
+    // writes reach them through a settle.
+    same_window(
+        &scanned(&db, b"", 10),
+        &window(&model, b"", 10),
+        "before the writes",
+    );
+    let write = |db: &mut Db, model: &mut Model, rng: &mut Rng, n: usize| {
+        for _ in 0..n {
+            let k = keys[rng.below(keys.len())].clone();
+            match rng.below(7) {
+                0 => {
+                    db.delete(&k);
+                    model.insert(k, Vec::new());
+                }
+                1 => {
+                    let new = [k.as_slice(), b"+"].concat();
+                    let v = hundred(rng);
+                    db.append(&new, &v);
+                    model.entry(new).or_default().push(v);
+                }
+                2 => {
+                    let v = hundred(rng);
+                    db.append(&k, &v);
+                    model.entry(k).or_default().push(v);
+                }
+                _ => {
+                    let v = hundred(rng);
+                    db.put(&k, &v);
+                    model.insert(k, vec![v]);
+                }
+            }
+        }
+    };
+    for round in 0..3 {
+        write(&mut db, &mut model, &mut rng, 120);
+        if round == 2 {
+            for k in &keys[2020..2076] {
+                let v = hundred(&mut rng);
+                db.put(k, &v);
+                model.insert(k.clone(), vec![v]);
+            }
+        }
+        db.commit().unwrap();
+        if round == 1 {
+            db.seal().unwrap();
+        }
+    }
+    assert_eq!(db.frozen_tables(), 1, "the seal is held, its table frozen");
+    let mut starts: Vec<Vec<u8>> =
+        vec![b"".to_vec(), b"a".to_vec(), b"zzz".to_vec(), vec![0xff; 8]];
+    for k in keys[2016..2080].iter().chain(&ends) {
+        starts.extend(around(k));
+    }
+    for k in keys.iter().step_by(397) {
+        starts.extend(around(k));
+    }
+    let limits = [1usize, 2, 3, 5, 17, 56, 63, 64, 65, 114, usize::MAX];
+    // Every window through the writer and a handle; the values the cursor's
+    // stride position handed over meanwhile, and the writer's scans whose
+    // start seek seeded a partition's reader.
+    let windows = |db: &Db, model: &Model, what: &str| -> (u64, u64) {
+        let latest = db.reader().unwrap();
+        let w: &Reader = db;
+        let before = db.zpage_counts();
+        let seeds_before = db.seek_seeds();
+        let touches = (db.raw_touches(), latest.raw_touches());
+        for start in &starts {
+            for &limit in &limits {
+                let cap = limit.min(1500);
+                let want = window(model, start, cap);
+                let at = format!(
+                    "{what}, from {:?} for {cap}",
+                    String::from_utf8_lossy(start)
+                );
+                same_window(&scanned(w, start, cap), &want, &format!("writer, {at}"));
+                same_window(
+                    &scanned(&latest, start, cap),
+                    &want,
+                    &format!("handle, {at}"),
+                );
+            }
+        }
+        let c = db.zpage_counts();
+        assert!(
+            !counts || (db.raw_touches(), latest.raw_touches()) == touches,
+            "{name}, {what}: the raw form touched"
+        );
+        assert_eq!(
+            (c.fallbacks, c.damaged, c.bad_pages, c.scan_groups),
+            (0, 0, 0, 0),
+            "{name}, {what}: {c:?}"
+        );
+        assert_eq!(
+            c.raw_scans, before.raw_scans,
+            "{name}, {what}: no walk the raw form's: {c:?}"
+        );
+        (
+            c.stride_cursor_reads - before.stride_cursor_reads,
+            db.seek_seeds() - seeds_before,
+        )
+    };
+    let cursor = !cache || block_cursor;
+    let (through, seeded) = windows(&db, &model, "over a frozen table and the live one");
+    assert_eq!(
+        through > 0,
+        cursor,
+        "{name}: {through} values through the cursor's stride position"
+    );
+    assert_eq!(
+        seeded > 0,
+        seeds,
+        "{name}: {seeded} of the writer's scans seeded a stride partition's reader"
+    );
+    // The seal lands: a piece over the partitions, and more writes over it.
+    db.hold_seal_landing(false);
+    db.settle().unwrap();
+    db.zpages_settle().unwrap();
+    assert!(
+        db.levels().1 >= 1,
+        "a piece landed and stays one: {:?}",
+        db.levels()
+    );
+    write(&mut db, &mut model, &mut rng, 120);
+    db.commit().unwrap();
+    let (through, seeded) = windows(&db, &model, "over a piece");
+    assert_eq!(
+        through > 0,
+        cursor,
+        "{name}: over a piece, {through} values through the cursor's stride position"
+    );
+    assert_eq!(
+        seeded > 0,
+        seeds,
+        "{name}: over a piece, {seeded} of the writer's scans seeded a stride partition's reader"
+    );
+    assert!(db.levels().1 >= 1, "the piece stood through the windows");
+    let c = db.zpage_counts();
+    assert_eq!(c.stride_files, c.partitions, "{name}: {c:?}");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stride_scans_through_the_block_cursor_agree_with_the_model_over_every_window() {
+    stride_windows("stride-windows-cursor", true, true, false);
+}
+
+#[test]
+fn stride_scans_through_the_block_cache_a_run_at_a_time_agree_with_the_model_over_every_window() {
+    stride_windows("stride-windows-perrun", true, false, false);
+}
+
+#[test]
+fn stride_scans_with_the_seek_seeding_the_reader_agree_with_the_model_over_every_window() {
+    stride_windows("stride-windows-seeds", true, true, true);
+}
+
+#[test]
+fn stride_scans_without_the_block_cache_agree_with_the_model_over_every_window() {
+    stride_windows("stride-windows-nocache", false, true, false);
+}
+
+/// What a read of a stride partition touches of the raw form, counted at
+/// the one door (`Seg::raw`, under debug assertions): nothing, for every
+/// kind of read -- point reads and counts of the run's keys and of keys
+/// beside them, scans from the partitions' ends and from keys a page apart
+/// at limits a block and a page make interesting -- over every shape of
+/// store: drained; with unsealed keys inside the windows, written after a
+/// scan so that, with the block cache on, the commits file them into the
+/// forms (the settles' resolves and the forms' patches, by the codec's
+/// arithmetic), counted in a window of their own from before the first
+/// write to the upkeep joined, since the upkeep thread files them before
+/// any read begins (`settled_without_raw`); over a level-0 piece (the merge
+/// path, or the block cache's builds over the piece's keys), its writes'
+/// settles counted the same way; and after the piece merges, where the
+/// partitions it made the form declines are block files. On the writer and
+/// a handle. The control: under the raw gate the same reads touch the raw
+/// form and the counter moves, so the zeros are the form's.
+fn stride_raw_touches(name: &str, cache: bool) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let dir = scratch(name);
+    let mut db = Db::create(
+        &dir,
+        stride_forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            o.inline_bytes = 1 << 16;
+            o.scan_block_cache = cache;
+        }),
+    )
+    .unwrap();
+    let mut model = numbered_load(&mut db, 5000, 100, 0x7A15);
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert!(
+        c.partitions >= 3 && c.stride_files == c.partitions,
+        "every partition a run the form holds: {c:?}"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let mut probes: Vec<Vec<u8>> = vec![b"".to_vec(), b"a".to_vec(), vec![0xff; 8]];
+    for k in &stride_ends(&dir) {
+        probes.extend(around(k));
+    }
+    // A hundred-byte slot a key: a page's keys are forty-one apart.
+    for k in keys.iter().step_by(41) {
+        probes.extend(around(k));
+    }
+    let limits = [1usize, 3, 57, 114, 1500];
+    // Each reader's window held to no touch of the raw form -- through
+    // `Seg::raw` or through a stride cursor's door (`Reader::raw_touches`
+    // sums both) -- and to no read or walk that went to the raw form by
+    // another way: a fallback, a read served raw for want of a file, a
+    // partition walked raw. A stride cursor that fell at every placing
+    // answered every key right through the raw form, so the answers say
+    // nothing of which form gave them.
+    let held = |db: &Db, model: &Model, what: &str| {
+        let r = db.reader().unwrap();
+        let w: &Reader = db;
+        for who in [w, &r] {
+            let before = who.raw_touches();
+            let counted = db.zpage_counts();
+            check(who, model, &keys, what);
+            check(who, model, &probes, what);
+            for start in &probes {
+                for &limit in &limits {
+                    let at = format!(
+                        "{what}, from {:?} for {limit}",
+                        String::from_utf8_lossy(start)
+                    );
+                    same_window(
+                        &scanned(who, start, limit),
+                        &window(model, start, limit),
+                        &at,
+                    );
+                }
+            }
+            check_scan(who, model, what);
+            assert_eq!(
+                who.raw_touches(),
+                before,
+                "{name}, {what}: touches of the raw form"
+            );
+            let c = db.zpage_counts();
+            assert_eq!(
+                (
+                    c.fallbacks,
+                    c.rawserves,
+                    c.raw_scans,
+                    c.damaged,
+                    c.bad_pages
+                ),
+                (
+                    counted.fallbacks,
+                    counted.rawserves,
+                    counted.raw_scans,
+                    0,
+                    0
+                ),
+                "{name}, {what}: reads and walks gone to the raw form: {c:?}"
+            );
+        }
+    };
+    // Every landing in flight joined before a count begins: a landing's own
+    // passes read the raw form on purpose.
+    db.settle().unwrap();
+    held(&db, &model, "drained");
+    let mut rng = Rng(0x7A151);
+    settled_without_raw(
+        &mut db,
+        cache,
+        &format!("{name}, with unsealed keys"),
+        |db| {
+            for i in 0..300 {
+                let k = keys[rng.below(keys.len())].clone();
+                match i % 4 {
+                    0 => {
+                        let new = [k.as_slice(), b"+"].concat();
+                        let v = hundred(&mut rng);
+                        db.append(&new, &v);
+                        model.entry(new).or_default().push(v);
+                    }
+                    1 => {
+                        let v = hundred(&mut rng);
+                        db.append(&k, &v);
+                        model.entry(k).or_default().push(v);
+                    }
+                    2 => {
+                        db.delete(&k);
+                        model.insert(k, Vec::new());
+                    }
+                    _ => {
+                        let v = hundred(&mut rng);
+                        db.put(&k, &v);
+                        model.insert(k, vec![v]);
+                    }
+                }
+                if i % 50 == 49 {
+                    db.commit().unwrap();
+                }
+            }
+            db.commit().unwrap();
+        },
+    );
+    assert_eq!(db.levels().1, 0, "{name}: no piece yet");
+    held(&db, &model, "with unsealed keys");
+    // The control: under the raw gate the reads are the raw form's, through
+    // the door, and the counter moves.
+    {
+        let r = db.reader().unwrap();
+        db.zgate_set(0);
+        let before = r.raw_touches();
+        check(&r, &model, &keys[..50], "under the raw gate");
+        same_window(
+            &scanned(&r, b"", 300),
+            &window(&model, b"", 300),
+            "under the raw gate",
+        );
+        assert!(
+            r.raw_touches() > before,
+            "{name}: under the raw gate the reads touched the raw form"
+        );
+        db.zgate_set(2);
+    }
+    // The same keys sealed into a piece: the merge path.
+    db.seal().unwrap();
+    db.zpages_settle().unwrap();
+    db.settle().unwrap();
+    assert!(db.levels().1 >= 1, "a piece landed: {:?}", db.levels());
+    let c = db.zpage_counts();
+    assert_eq!(
+        c.stride_files, c.partitions,
+        "{name}: beside the piece: {c:?}"
+    );
+    settled_without_raw(&mut db, cache, &format!("{name}, over a piece"), |db| {
+        for i in 0..100 {
+            let k = keys[rng.below(keys.len())].clone();
+            let v = hundred(&mut rng);
+            if i % 2 == 0 {
+                db.append(&k, &v);
+                model.entry(k).or_default().push(v);
+            } else {
+                db.put(&k, &v);
+                model.insert(k, vec![v]);
+            }
+        }
+        db.commit().unwrap();
+    });
+    held(&db, &model, "over a piece");
+    let c = db.zpage_counts();
+    assert!(
+        c.stride_cursor_reads > 0 && c.stride_reads > 0,
+        "{name}: the stride files read by key and through the cursor: {c:?}"
+    );
+    // The piece merged into its partitions.
+    db.flush().unwrap();
+    db.zpages_settle().unwrap();
+    db.settle().unwrap();
+    model.retain(|_, v| !v.is_empty());
+    let c = db.zpage_counts();
+    assert_eq!(db.levels().1, 0, "merged: {:?}", db.levels());
+    assert_eq!(c.form_files, c.partitions, "{c:?}");
+    held(&db, &model, "after the merge");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The writes `write` makes and commits, over a stride-served store, held
+/// to no touch of the raw form from before the first write to the upkeep
+/// joined: the commits' own fills and the upkeep thread's passes, which
+/// resolve each written key to its block by the codec's arithmetic and
+/// patch it into the block's form through the form file, run inside this
+/// window and in no window of `held`, whose reads come after them. Joined
+/// by `settle`, which joins the upkeep first, with no seal in flight for it
+/// to land (a landing's passes read the raw form on purpose), the store's
+/// shape the same on either side; and with the block cache on, the
+/// settles counted, so that the zero is of settles that ran.
+fn settled_without_raw(db: &mut Db, cache: bool, what: &str, write: impl FnOnce(&mut Db)) {
+    let shape = db.levels();
+    let touches = db.raw_touches();
+    let settled = db.settle_density();
+    write(db);
+    db.settle().unwrap();
+    assert_eq!(db.levels(), shape, "{what}: nothing landed in the window");
+    assert_eq!(
+        db.raw_touches(),
+        touches,
+        "{what}: the settles' and the patches' touches of the raw form"
+    );
+    let after = db.settle_density();
+    assert!(
+        !cache || (after[0] > settled[0] && after[1] > settled[1]),
+        "{what}: the settles filed the writes into the stride partitions' forms: {settled:?} -> {after:?}"
+    );
+}
+
+#[test]
+fn the_stride_form_touches_no_raw_page() {
+    stride_raw_touches("stride-rawtouches", false);
+}
+
+#[test]
+fn the_block_cache_over_the_stride_form_touches_no_raw_page() {
+    stride_raw_touches("stride-rawtouches-cache", true);
+}
+
+/// A partition whose keys are a prefix and a big-endian number gets a
+/// stride file whose codec is the big-endian kind, and a store of them
+/// answers as a store without the form given the same operations, and as
+/// the model: every point read and count of the run's keys and of keys
+/// beside them -- a byte either side, a key a byte longer and one a byte
+/// shorter, renderings below and past the runs -- and every window, from
+/// the partitions' ends, from keys a page apart and from the edges of the
+/// key space; drained, with unsealed keys inside the windows (updates of
+/// the width, inserts between records, second values and deletes), and
+/// over a piece; through the writer and a handle, with the block cache on
+/// and off. The stride files served the point reads and the cursor's
+/// walks.
+#[test]
+fn a_big_endian_keyed_partition_is_a_stride_file_and_agrees_with_the_raw_form_everywhere() {
+    use supdb::db::zpages::KeyKind;
+    let be = |i: u64| {
+        [
+            b"be".as_slice(),
+            &(0x0102_0304_0506_0000u64 + i).to_be_bytes(),
+        ]
+        .concat()
+    };
+    const N: u64 = 4000;
+    for cache in [false, true] {
+        let (dz, dr) = (
+            scratch(&format!("stride-be-{cache}-z")),
+            scratch(&format!("stride-be-{cache}-raw")),
+        );
+        let opts = |on: bool| Options {
+            zpages: if on { ZPages::Always } else { ZPages::Off },
+            zpages_stride: if on { ZStride::Forced } else { ZStride::Off },
+            zpages_min_bytes: 0,
+            scan_block_cache: cache,
+            partition_bytes: Some(160 << 10),
+            inline_bytes: 1 << 16,
+            ..Options::default()
+        };
+        let mut z = Db::create(&dz, opts(true)).unwrap();
+        let mut raw = Db::create(&dr, opts(false)).unwrap();
+        let mut model = Model::new();
+        let mut rng = Rng(0xBE5);
+        let keys: Vec<Vec<u8>> = (0..N).map(be).collect();
+        for chunk in keys.chunks(500) {
+            for k in chunk {
+                let v = hundred(&mut rng);
+                z.append(k, &v);
+                raw.append(k, &v);
+                model.insert(k.clone(), vec![v]);
+            }
+            z.commit().unwrap();
+            raw.commit().unwrap();
+        }
+        for d in [&mut z, &mut raw] {
+            d.flush().unwrap();
+            d.settle().unwrap();
+        }
+        z.zpages_settle().unwrap();
+        let c = z.zpage_counts();
+        assert!(
+            c.partitions >= 2 && c.stride_files == c.partitions,
+            "cache {cache}: every partition a run the form holds: {c:?}"
+        );
+        for f in form_files(&dz) {
+            let (t, _) = stride_of(&f);
+            assert_eq!(t.codec.kind(), KeyKind::BigEndian, "{f:?}");
+        }
+        let mut probes: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"be".to_vec(),
+            be(0)[..9].to_vec(),
+            be(N + 5),
+            be(u64::MAX - 0x0102_0304_0506_0000),
+            vec![0xff; 12],
+        ];
+        for k in stride_ends(&dz) {
+            probes.extend(around(&k));
+        }
+        for k in keys.iter().step_by(41) {
+            probes.extend(around(k));
+        }
+        let limits = [1usize, 3, 40, 64, 65, 300, 5000];
+        let agree = |z: &Db, raw: &Db, model: &Model, what: &str| {
+            let (hz, hr) = (z.reader().unwrap(), raw.reader().unwrap());
+            let (wz, wr): (&Reader, &Reader) = (z, raw);
+            for (who, other, label) in [(wz, wr, "writer"), (&hz, &hr, "handle")] {
+                let at = format!("cache {cache}, {what}, {label}");
+                check(who, model, &keys, &at);
+                check(who, model, &probes, &at);
+                for k in &probes {
+                    assert_eq!(read_vec(who, k), read_vec(other, k), "{at}: {k:?}");
+                }
+                for start in &probes {
+                    for &limit in &limits {
+                        let got = scanned(who, start, limit);
+                        let w = format!("{at}, from {start:?} for {limit}");
+                        same_window(&got, &scanned(other, start, limit), &w);
+                        same_window(&got, &window(model, start, limit), &w);
+                    }
+                }
+            }
+        };
+        agree(&z, &raw, &model, "drained");
+        // A scan first, so the writes after it are settled into the block
+        // cache's forms where it is on.
+        let _ = scanned(&z, b"", 10);
+        let _ = scanned(&raw, b"", 10);
+        let writes = |z: &mut Db, raw: &mut Db, model: &mut Model, rng: &mut Rng| {
+            for i in 0..240 {
+                let k = keys[rng.below(keys.len())].clone();
+                match i % 4 {
+                    0 => {
+                        let v = hundred(rng);
+                        z.put(&k, &v);
+                        raw.put(&k, &v);
+                        model.insert(k, vec![v]);
+                    }
+                    1 => {
+                        let new = [k.as_slice(), &[0u8]].concat();
+                        let v = hundred(rng);
+                        z.append(&new, &v);
+                        raw.append(&new, &v);
+                        model.entry(new).or_default().push(v);
+                    }
+                    2 => {
+                        let v = hundred(rng);
+                        z.append(&k, &v);
+                        raw.append(&k, &v);
+                        model.entry(k).or_default().push(v);
+                    }
+                    _ => {
+                        z.delete(&k);
+                        raw.delete(&k);
+                        model.insert(k, Vec::new());
+                    }
+                }
+            }
+            z.commit().unwrap();
+            raw.commit().unwrap();
+        };
+        writes(&mut z, &mut raw, &mut model, &mut rng);
+        agree(&z, &raw, &model, "with unsealed keys");
+        for d in [&mut z, &mut raw] {
+            d.seal().unwrap();
+            d.settle().unwrap();
+        }
+        z.zpages_settle().unwrap();
+        assert!(z.levels().1 >= 1, "a piece landed: {:?}", z.levels());
+        writes(&mut z, &mut raw, &mut model, &mut rng);
+        agree(&z, &raw, &model, "over a piece");
+        let c = z.zpage_counts();
+        assert_eq!(c.stride_files, c.partitions, "cache {cache}: {c:?}");
+        assert!(
+            c.stride_reads > 0 && c.stride_cursor_reads > 0,
+            "cache {cache}: the stride files read by key and through the cursor: {c:?}"
+        );
+        assert_eq!(
+            (
+                c.fallbacks,
+                c.damaged,
+                c.bad_pages,
+                c.decodes,
+                c.scan_groups
+            ),
+            (0, 0, 0, 0, 0),
+            "cache {cache}: {c:?}"
+        );
+        z.close().unwrap();
+        raw.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dz);
+        let _ = std::fs::remove_dir_all(&dr);
+    }
 }

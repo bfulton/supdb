@@ -1742,7 +1742,7 @@ fn a_run_write_that_failed(tag: &str, opts: Options, again: Again, partial: bool
     let h = db.reader().unwrap();
     reads(&h, "k2", "v2", &format!("{tag}: live"));
     drop(h);
-    std::mem::forget(db);
+    db.crash();
     for (at, what) in [(&crash, "the power cut"), (&d, "the kill")] {
         let db = Db::open(at, opts.clone()).unwrap_or_else(|e| panic!("{tag}: {what} opens: {e}"));
         reads(
@@ -1812,7 +1812,7 @@ fn a_runs_first_write_that_failed_is_written_again() {
         db.append(b"k2", b"v2");
         db.commit()
             .unwrap_or_else(|e| panic!("{tag}: the commit after: {e}"));
-        std::mem::forget(db);
+        db.crash();
         let db = Db::open(&d, o).unwrap();
         reads(&db, "k1", "v1", &format!("{tag}: the first batch"));
         reads(&db, "k2", "v2", &format!("{tag}: the commit after"));
@@ -1847,7 +1847,7 @@ fn a_failed_run_piece_write(tag: &str, opts: Options) {
     let ino = run_ino(&d);
     let synced = db.run_synced_bytes().expect("a run open");
     power_cut(&db, &d, &crash, ino, synced);
-    std::mem::forget(db);
+    db.crash();
     let db = Db::open(&crash, opts).unwrap_or_else(|e| panic!("{tag}: the cut opens: {e}"));
     let what = format!("{tag}: the batch taken again and the commit after it");
     reads(&db, "a0000000", "v", &what);
@@ -1887,7 +1887,7 @@ fn a_short_run_write(tag: &str, opts: Options, big: bool) {
     let ino = run_ino(&d);
     let synced = db.run_synced_bytes().expect("a run open");
     power_cut(&db, &d, &crash, ino, synced);
-    std::mem::forget(db);
+    db.crash();
     for (at, what) in [(&crash, "the power cut"), (&d, "the kill")] {
         let db = Db::open(at, opts.clone()).unwrap_or_else(|e| panic!("{tag}: {what} opens: {e}"));
         let what = format!("{tag}, {what}: the short write and the commit after it");
@@ -1952,7 +1952,7 @@ fn a_run_write_that_failed_part_way_is_flushed_whole() {
         db.flush()
             .unwrap_or_else(|e| panic!("{tag}: the flush: {e}"));
         assert!(!open_run(&d) || db.levels() != (0, 0), "{tag}: flushed");
-        std::mem::forget(db);
+        db.crash();
         let db = Db::open(&d, o).unwrap_or_else(|e| panic!("{tag}: opens: {e}"));
         for (k, v) in [("k1", "v1"), ("k2", "v2"), ("k3", "v3")] {
             reads(&db, k, v, &format!("{tag}: flushed"));
@@ -1998,7 +1998,7 @@ fn a_failed_run_sync_is_kept(tag: &str, opts: Options) {
     let ino = run_ino(&d);
     let covered = db.run_synced_bytes().expect("the run is still open");
     power_cut(&db, &d, &crash, ino, covered);
-    std::mem::forget(db);
+    db.crash();
     let db = Db::open(&crash, opts).unwrap_or_else(|e| panic!("{tag}: the cut opens: {e}"));
     reads(
         &db,
@@ -2055,7 +2055,7 @@ fn a_run_whose_fdatasync_failed_is_not_closed_into_a_named_segment() {
         );
         let _ = db.settle();
         power_cut(&db, &d, &crash, ino, covered);
-        std::mem::forget(db);
+        db.crash();
         let mut db =
             Db::open(&crash, o.clone()).unwrap_or_else(|e| panic!("{tag}: the cut opens: {e}"));
         reads(
@@ -2105,7 +2105,7 @@ fn a_run_write_that_failed_under_a_cipher_is_written_again() {
         }
         let (log, synced, _) = db.wal_durable();
         copy_live(&db, &d, &crash);
-        std::mem::forget(db);
+        db.crash();
         std::fs::OpenOptions::new()
             .write(true)
             .open(crash.join(log.file_name().unwrap()))
@@ -2415,7 +2415,7 @@ fn a_buffered_run_piece_write_that_failed(tag: &str, opts: Options, twice: bool)
     let ino = run_ino(&d);
     let synced = db.run_synced_bytes().expect("a run open");
     power_cut(&db, &d, &crash, ino, synced);
-    std::mem::forget(db);
+    db.crash();
     let db = Db::open(&crash, opts).unwrap_or_else(|e| panic!("{tag}: the cut opens: {e}"));
     let x = String::from_utf8(val).unwrap();
     for k in ["a0000001", "a0029999", "b0000000", "b0029999"] {
@@ -2603,7 +2603,7 @@ fn a_run_closed_over_a_failed_write(tag: &str, opts: Options, fails: Fails) {
             f.set_len(log_synced).unwrap();
         }
     }
-    std::mem::forget(db);
+    db.crash();
     // Under a cipher the store is held open in this process past the
     // forget, so the kill is the power cut's case alone: its memory files
     // go with it either way.
@@ -2685,7 +2685,7 @@ fn a_cipher_runs_batch_owed_to_its_file_and_its_log_is_logged_again() {
     let crash = dir("dur-runlog-cipher-both-crash");
     let (log, synced, _) = db.wal_durable();
     copy_live(&db, &d, &crash);
-    std::mem::forget(db);
+    db.crash();
     std::fs::OpenOptions::new()
         .write(true)
         .open(crash.join(log.file_name().unwrap()))
@@ -2737,7 +2737,7 @@ fn a_cipher_runs_unlogged_batch_is_logged_by_a_commit_of_nothing_beside_an_armed
     let crash = dir("dur-runlog-cipher-armed-crash");
     let (log, synced, _) = db.wal_durable();
     copy_live(&db, &d, &crash);
-    std::mem::forget(db);
+    db.crash();
     std::fs::OpenOptions::new()
         .write(true)
         .open(crash.join(log.file_name().unwrap()))
@@ -2822,7 +2822,7 @@ fn a_buffered_runs_failed_first_write_is_tried_again_before_its_sync() {
         let ino = run_ino(&d);
         let synced = db.run_synced_bytes().expect("a run open");
         power_cut(&db, &d, &crash, ino, synced);
-        std::mem::forget(db);
+        db.crash();
         let db = Db::open(&crash, opts).unwrap_or_else(|e| panic!("{tag}: the cut opens: {e}"));
         reads(&db, "k1", "v1", &format!("{tag}: the first batch"));
         reads(&db, "k2", "v2", &format!("{tag}: the commit after"));
@@ -2873,7 +2873,7 @@ fn a_run_write_failure_after_one_answered_is_answered_in_its_own_words() {
         let ino = run_ino(&d);
         let synced = db.run_synced_bytes().expect("a run open");
         power_cut(&db, &d, &crash, ino, synced);
-        std::mem::forget(db);
+        db.crash();
         let db = Db::open(&crash, opts).unwrap_or_else(|e| panic!("{tag}: the cut opens: {e}"));
         reads(&db, "k1", "v1", &format!("{tag}: the first batch"));
         reads(&db, "k2", "v2", &format!("{tag}: the commit after"));
@@ -3046,7 +3046,7 @@ fn a_cipher_runs_batch_written_again_by_a_commit_of_nothing_is_synced_in_its_log
     let crash = dir("dur-runlog-cipher-again-crash");
     let (log, synced, _) = db.wal_durable();
     copy_live(&db, &d, &crash);
-    std::mem::forget(db);
+    db.crash();
     std::fs::OpenOptions::new()
         .write(true)
         .open(crash.join(log.file_name().unwrap()))
@@ -5031,7 +5031,7 @@ fn a_sync_whose_run_fdatasync_fails_answers_it_and_keeps_it() {
     }
 }
 
-/// A `sync` whose write of what the open run holds fails answers the
+/// A `sync` over a run whose last commit's write failed answers the
 /// write's failure, and the batch is owed: the next `sync` writes it at
 /// the offset the file is good to and syncs it, and a power cut after that
 /// `Ok` reads every commit back.
@@ -5043,8 +5043,12 @@ fn a_sync_whose_write_of_the_runs_tail_fails_is_written_by_the_next_sync() {
         let crash = dir(&format!("dur-srwritefail-{tag}-crash"));
         let opts = sr_opts(SyncPolicy::EveryN(u32::MAX), base);
         let mut db = Db::create(&d, opts.clone()).unwrap();
-        sr_commits(&mut db, 0, 300, 100);
+        // The last commit's write fails: a commit writes its batch to the
+        // run's file whatever the policy, so the failure is held for the
+        // sync, which answers it and writes nothing before it.
+        sr_commits(&mut db, 0, 200, 100);
         db.fail_next_run_write();
+        sr_commits(&mut db, 200, 300, 100);
         injected(db.sync(), &format!("{tag}: the sync over the failed write"));
         db.sync()
             .unwrap_or_else(|e| panic!("{tag}: the sync after writes the batch again: {e}"));
@@ -9509,7 +9513,7 @@ fn an_open_that_recycles_no_log_removes_the_spare_it_finds() {
         db.settle().unwrap();
         assert!(i < 2_000_000, "premise: a retired log kept as a spare");
     }
-    std::mem::forget(db);
+    db.crash();
     assert!(!spares(&d).is_empty(), "premise: the kill leaves the spare");
     let db = Db::open(
         &d,
@@ -10151,7 +10155,7 @@ fn a_pending_segment_adopted_by_an_open(how: OoTear, ord_durable: bool, pieces: 
     );
     // The kill: the seal thread parked before its fsync for good; a drop
     // would join it and let it sync.
-    std::mem::forget(db);
+    db.crash();
     let ords: Vec<String> = pend
         .iter()
         .map(|n| {
@@ -10262,7 +10266,7 @@ fn a_pending_segment_adopted_by_an_open(how: OoTear, ord_durable: bool, pieces: 
     }
     // The power cut: nothing of this store runs on, a file no fsync covered
     // comes back torn, and a name no directory fsync covered is gone.
-    std::mem::forget(db);
+    db.crash();
     for f in &files {
         if !synced.contains(f) {
             oo_tear(&d.join(f), how);
@@ -10332,7 +10336,7 @@ fn an_open_whose_pending_fsync_fails_names_nothing_durable() {
     };
     wait_for("the seal's pending slot", || !pending().is_empty());
     let pend = pending();
-    std::mem::forget(db);
+    db.crash();
     let slots = |d: &Path| -> Vec<Option<Vec<u8>>> {
         OO_SLOTS
             .iter()
@@ -10413,7 +10417,7 @@ fn an_open_adopts_a_pending_segment_whose_durable_index_a_power_cut_took() {
     // would not.
     let c = dir("oo-pend-noord-kill");
     copy_live(&db, &d, &c);
-    std::mem::forget(db);
+    db.crash();
     let d = c;
     let ords: Vec<String> = pend
         .iter()
@@ -10898,7 +10902,9 @@ fn an_absent_other_slot(tag: &str, base: Options) {
     let found = os_files(&d);
     let seg = found
         .iter()
-        .filter(|(n, _)| !n.starts_with("manifest") && !n.starts_with("wal-"))
+        .filter(|(n, _)| {
+            !n.starts_with("manifest") && !n.starts_with("wal-") && !n.starts_with("spare-")
+        })
         .max_by_key(|(_, b)| b.len())
         .map(|(n, _)| n.clone())
         .expect("a segment");
@@ -11433,7 +11439,7 @@ fn ra_kill_and_reopen(
         os_copy(&x, &y);
         let synced = ra_dir_synced(&x, from);
         Db::trace_dir_io(&x, false);
-        std::mem::forget(db);
+        db.crash();
         if !synced {
             std::fs::write(y.join("manifest"), &p.before).unwrap();
             for f in &p.new {
@@ -11745,7 +11751,7 @@ fn a_failed_publish_dir_sync(tag: &str, base: Options) {
     // The power cut.
     let cut = dir(&format!("ra-pubfail-{tag}-cut"));
     os_copy(&d, &cut);
-    std::mem::forget(db);
+    db.crash();
     if os_seq_of(&now) == failed_seq {
         std::fs::write(cut.join("manifest"), &old).unwrap();
     }
@@ -11938,7 +11944,7 @@ fn a_pending_store_reopened_under_the_rename_shape_as(
     // The kill: the seal thread parked before its fsync for good, and the
     // store's files as it left them copied, since a store under a cipher
     // stays open in this process while its writer is.
-    std::mem::forget(db);
+    db.crash();
     let held = d;
     let d = dir(&format!("ra-pend-{tag}-killed"));
     os_copy(&held, &d);
@@ -11987,7 +11993,7 @@ fn a_pending_store_reopened_under_the_rename_shape_as(
     db.commit().unwrap();
     db.flush().unwrap();
     db.settle().unwrap();
-    std::mem::forget(db);
+    db.crash();
     let reopened = d;
     let d = dir(&format!("ra-pend-{tag}-cut"));
     os_copy(&reopened, &d);
@@ -12319,6 +12325,11 @@ fn a_rename_publish_fsyncs_the_directory_before_its_flush_is_answered_under_a_ci
 /// written as `manifest` first and nothing else has changed. Either way
 /// the store opens after, under either shape, with every write.
 fn a_rename_open_whose_alt_removal_fails(tag: &str, base: Options) {
+    // A spare past the pool is what the open removes: no pool.
+    let base = Options {
+        recycle_wal: false,
+        ..base
+    };
     let slots = os_opts(&base);
     let rename = ra_opts(&base);
     let failing = Options {
@@ -12799,10 +12810,10 @@ fn a_runs_due_commit_under_a_cipher_syncs_the_log_once_behind_its_frames() {
 /// (`SegmentOptions::sync_ahead`, here 64 KiB) before any commit of it is
 /// due, beside a hashed table's frames no sync covered: the helper's
 /// fdatasyncs are not the policy's, and a power cut that keeps what they
-/// covered keeps run commits after the log's older ones and loses those.
-/// That is the window the docs name as the exception under `SyncPolicy`
-/// and `ROADMAP.md` keeps open; this test holds it, so that whatever
-/// closes it restates this half. The run's first due commit then syncs
+/// covered and loses the log's older frames keeps no run commit either:
+/// the run's note says it began with the log unsynced, and the open
+/// removes a run whose start lies past where the history it finds ends.
+/// The run's first due commit then syncs
 /// the log before the run, and a power cut after it keeps every commit.
 #[test]
 fn a_runs_commits_its_helper_synced_before_a_due_one_outlive_older_log_frames_until_it() {
@@ -12882,12 +12893,15 @@ fn a_runs_commits_its_helper_synced_before_a_due_one_outlive_older_log_frames_un
         (log_missing, run_here)
     };
     let (log_missing, run_here) = count(&crash, first);
-    assert!(
-        run_here > 0 && log_missing == logged.len(),
-        "the window: a power cut after the helper's fdatasync keeps run commits ({run_here} of \
-         {first} keys) and loses the log's older ones ({log_missing} of {}) -- if it no longer \
-         does, the window is closed: restate this half, the docs and ROADMAP.md",
-        logged.len()
+    assert_eq!(
+        log_missing,
+        logged.len(),
+        "the premise, the cut loses the log's older frames"
+    );
+    assert_eq!(
+        run_here, 0,
+        "a power cut after the helper's fdatasync keeps run commits ({run_here} of {first} keys) \
+         past the log's older ones it lost: not a prefix"
     );
     let (log_missing, run_here) = count(&crash2, next);
     assert_eq!(
@@ -13227,12 +13241,11 @@ fn a_runs_owed_batch_written_again_whose_log_sync_fails_leaves_the_run_unsynced(
 /// thread (`Options::close_presync`) and the run's seal job would sync the
 /// whole file on its own, neither ordered behind the log. A power cut that
 /// keeps what the presync covered -- the records on the file when the run
-/// closed -- and the log as its own syncs left it keeps run commits after
-/// the log's older ones and loses those. That is a way the docs name under
-/// `SyncPolicy` beside the helper thread's and the kernel's writeback, and
-/// `ROADMAP.md` keeps open; this test holds it, so that whatever closes it
-/// restates this test. The copy is taken while every seal is held between
-/// its phases, so nothing lands inside it.
+/// closed -- and the log as its own syncs left it loses the log's older
+/// frames and keeps no run commit past them: the run's note says it began
+/// with the log unsynced, and the open removes a run whose start lies past
+/// where the history it finds ends. The copy is taken while every seal is
+/// held between its phases, so nothing lands inside it.
 #[test]
 fn a_runs_commits_its_close_synced_before_a_due_one_outlive_older_log_frames() {
     use std::os::unix::fs::MetadataExt;
@@ -13335,12 +13348,15 @@ fn a_runs_commits_its_close_synced_before_a_due_one_outlive_older_log_frames() {
     let run_here = (0..next)
         .filter(|&k| read_vec(&opened, &sr_key(k)) == vec![sr_val(k)])
         .count();
-    assert!(
-        run_here > 0 && log_missing == logged.len(),
-        "the window: a power cut after the closing run's presync keeps run commits ({run_here} of \
-         {next} keys) and loses the log's older ones ({log_missing} of {}) -- if it no longer \
-         does, the window is closed: restate this test, the docs and ROADMAP.md",
-        logged.len()
+    assert_eq!(
+        log_missing,
+        logged.len(),
+        "the premise, the cut loses the log's older frames"
+    );
+    assert_eq!(
+        run_here, 0,
+        "a power cut after the closing run's presync keeps run commits ({run_here} of {next} \
+         keys) past the log's older ones it lost: not a prefix"
     );
     drop(opened);
     let _ = std::fs::remove_dir_all(&d);
@@ -13725,14 +13741,11 @@ fn a_runs_owed_batch_written_again_whose_log_sync_could_not_open_a_loose_file_sy
 /// Run A, under `EveryN`, closed into a seal by `Db::seal` before any
 /// commit of it was due, its seal held before it writes anything
 /// (`hold_seal_landing`), so its commits are on its file and synced by
-/// nothing; then run B above it, to its first due commit. B's note is of
-/// the log, which owes nothing here, and says nothing of A's file, so the
-/// due commit syncs B's file alone, and a power cut after it keeps B's
-/// commits and loses A's older ones: not a prefix. The docs name it beside
-/// the close's presync, and `ROADMAP.md` keeps it open; this test holds
-/// the window, so that whatever closes it restates this test. The copy is
-/// taken while every seal is held before its write, so nothing lands
-/// inside it.
+/// nothing when it closes; then run B above it, to its first due commit.
+/// A closed loose, so B's due commit syncs A's file before its own
+/// (`Db::sync_wal`, the loose runs), and a power cut after it keeps both
+/// runs' commits: a prefix. The copy is taken while every seal is held
+/// before its write, so nothing lands inside it.
 #[test]
 fn a_runs_due_commit_after_a_run_closed_into_a_held_seal_outlives_that_runs_commits() {
     use std::os::unix::fs::MetadataExt;
@@ -13764,8 +13777,13 @@ fn a_runs_due_commit_after_a_run_closed_into_a_held_seal_outlives_that_runs_comm
     let mut next = a_keys;
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         db.seal().unwrap();
+        let loose_before = db.seal_waits().loose_synced;
         // Run B: commits from A's greatest up, until one is due.
         let _ = dl_until_due(&mut db, &mut next, "run B");
+        assert!(
+            db.seal_waits().loose_synced > loose_before,
+            "B's due commit synced A, which closed loose"
+        );
         let inos: Vec<u64> = std::fs::read_dir(&d)
             .unwrap()
             .map(|e| e.unwrap())
@@ -13786,8 +13804,8 @@ fn a_runs_due_commit_after_a_run_closed_into_a_held_seal_outlives_that_runs_comm
         assert_eq!(
             std::fs::metadata(&a_tmp).unwrap().len(),
             a_len,
-            "the premise, A's seal held before it writes anything: the cut below is a crash \
-             state only while nothing has synced A's file"
+            "the premise, A's seal held before it writes anything: A's file is what its \
+             commits wrote, synced whole by B's due commit"
         );
         let b_synced = db.run_device_synced().expect("B is open").0;
         assert!(b_synced > 0, "the premise, B's due commit synced its file");
@@ -13799,7 +13817,7 @@ fn a_runs_due_commit_after_a_run_closed_into_a_held_seal_outlives_that_runs_comm
             let e = e.unwrap();
             let ino = e.metadata().map(|m| m.ino()).ok();
             let keep = if ino == Some(a_ino) {
-                a_synced
+                a_len.max(a_synced)
             } else if ino == Some(b_ino) {
                 b_synced
             } else {
@@ -13827,10 +13845,9 @@ fn a_runs_due_commit_after_a_run_closed_into_a_held_seal_outlives_that_runs_comm
         .filter(|&k| read_vec(&opened, &sr_key(k)) == vec![sr_val(k)])
         .count();
     assert!(
-        b_here == (next - a_keys) as usize && a_here == 0,
-        "the window: a power cut after run B's due commit keeps B's commits ({b_here} of {}) and \
-         loses run A's older ones ({a_here} of {a_keys} kept) -- if it no longer does, the window \
-         is closed: restate this test, the docs and ROADMAP.md",
+        b_here == (next - a_keys) as usize && a_here == a_keys as usize,
+        "a power cut after run B's due commit keeps B's commits ({b_here} of {}) and run A's \
+         older ones ({a_here} of {a_keys})",
         next - a_keys
     );
     drop(opened);
@@ -14222,9 +14239,33 @@ fn one_description(a: i32, b: i32) -> bool {
 /// the error the helper met there before the helper stores it. Each width
 /// is built by holding descriptors open below it until the writer's file
 /// is given a number of that width, never a palindrome, so a number read
-/// backwards is another number.
+/// backwards is another number. The body runs in a process of its own,
+/// this binary run again for this test alone: the descriptor table is the
+/// process's, and the tests beside it in this one hold and free numbers
+/// of their own, every two-digit one at times, so that no writer here
+/// could be given one.
 #[test]
 fn a_helpers_description_is_its_own_at_every_width_of_the_writers_descriptor() {
+    const ALONE: &str = "SUPDB_TEST_DESCRIPTOR_WIDTHS";
+    if std::env::var_os(ALONE).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "a_helpers_description_is_its_own_at_every_width_of_the_writers_descriptor",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(ALONE, "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && text.contains("1 passed"),
+            "the test in a process of its own: {text}"
+        );
+        return;
+    }
     use std::os::unix::io::AsRawFd;
     let d = dir("dur-hrace-width");
     let mut held: Vec<std::fs::File> = Vec::new();

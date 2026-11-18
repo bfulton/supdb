@@ -177,7 +177,7 @@ use std::path::Path;
 
 /// "SUPDORD1", little-endian. The trailing digit is the version, and it
 /// moves whenever an older reader would misread rather than refuse.
-const MAGIC: u64 = 0x3144_524f_4450_5553;
+pub(crate) const MAGIC: u64 = 0x3144_524f_4450_5553;
 /// Room for the header and the alignment the heads want, in one constant so
 /// the writer and the reader cannot disagree about where the body starts.
 const HEADER: usize = 64;
@@ -185,7 +185,7 @@ const HEAD: usize = 8;
 /// Heads between two samples of the top level: a run of 512 bytes, eight
 /// cache lines the prefetcher walks, so a seek's cold probes fall in one
 /// run instead of across the file.
-const TOP_STRIDE: usize = 64;
+pub(crate) const TOP_STRIDE: usize = 64;
 /// Header word: one more than the keys' common length when every key has
 /// one length and it is at most `pfx + HEAD`, so a head is a whole key and
 /// a seek needs no record; 0 otherwise, and in every file from before the
@@ -360,6 +360,16 @@ fn common_prefix(first: &[u8], last: &[u8]) -> usize {
         .count()
 }
 
+/// The stride of heads a seek will search, named ahead of the seek
+/// (`OrdIndex::plan_seek`): ranks `lo..hi`, the answer among them or `hi`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeekPlan {
+    lo: u32,
+    hi: u32,
+    /// The query's head, taken once.
+    head: u64,
+}
+
 /// One segment's ordered index, mapped.
 pub struct OrdIndex {
     map: MmapBytes,
@@ -389,10 +399,17 @@ pub struct OrdIndex {
     /// seek is the first scan of a pass, which paid the build's walk over
     /// every eighth line of the file -- 60 us at three hundred thousand
     /// keys, a third of that scan.
-    top: Vec<u64>,
+    top_eager: Vec<u64>,
     /// The top level of a mapping that lends by the piece, read at the
-    /// first seek (`top`).
+    /// first seek (`top`): read through `top()` and never the field, which
+    /// is empty for such a mapping.
     top_late: std::sync::OnceLock<Vec<u64>>,
+    /// Where the heads are read: the mapping's, past its header, or a copy
+    /// of them the segment holds in anonymous memory (`set_heads`). Under
+    /// a memory bound the mapping's pages leave the page cache between two
+    /// seeks of them, and a seek that finds one gone waits on the device;
+    /// a copy in the process's own memory is not the cache's to take.
+    heads: std::sync::atomic::AtomicPtr<u8>,
 }
 
 impl OrdIndex {
@@ -401,7 +418,11 @@ impl OrdIndex {
     /// under an id handed out again later -- is refused here rather than
     /// believed.
     pub fn open(path: &Path, keys: usize) -> Result<OrdIndex> {
-        let map = crate::db::vault::map(path)?;
+        Self::over(crate::db::vault::map(path)?, keys)
+    }
+
+    /// `open` over a mapping already made.
+    fn over(map: MmapBytes, keys: usize) -> Result<OrdIndex> {
         // A mapping that lends by the piece (`Bytes::piecewise`: a store
         // under a cipher's, whose bytes are decrypted as they are asked
         // for) is read by the piece: its header here, and its heads as a
@@ -468,14 +489,23 @@ impl OrdIndex {
                 })
                 .collect()
         };
+        // A mapping read by the piece has no heads to point at: its heads
+        // are asked for out of line (`head_absent`), and it is never given a
+        // copy (`mapped_heads`).
+        let heads = std::sync::atomic::AtomicPtr::new(if paged {
+            std::ptr::null_mut()
+        } else {
+            whole[HEADER..].as_ptr() as *mut u8
+        });
         Ok(OrdIndex {
+            heads,
             map,
             n,
             pfx,
             uniform_len,
             prefix: None,
             advised: std::sync::atomic::AtomicBool::new(false),
-            top,
+            top_eager: top,
             top_late: std::sync::OnceLock::new(),
         })
     }
@@ -487,8 +517,8 @@ impl OrdIndex {
     /// file pays is of a length it has loaded already.
     #[inline]
     fn top(&self) -> &[u64] {
-        if !self.top.is_empty() || self.n == 0 {
-            return &self.top;
+        if !self.top_eager.is_empty() || self.n == 0 {
+            return &self.top_eager;
         }
         self.top_late()
     }
@@ -670,14 +700,67 @@ impl OrdIndex {
 
     #[inline]
     fn head(&self, i: usize) -> u64 {
-        // Out of the mapping as it lies, by one range check: all of a
-        // mapped file, and nothing of a mapping read by the piece, whose
-        // heads are asked for out of line. Asked through `slice_at` for
-        // both, a seek over a mapped file paid an instruction a head.
-        let at = HEADER + i * HEAD;
-        match self.map.as_slice().get(at..at + HEAD) {
-            Some(b) => u64::from_be_bytes(b.try_into().expect("eight bytes")),
-            None => self.head_absent(i),
+        let p = self.heads.load(std::sync::atomic::Ordering::Acquire);
+        if p.is_null() {
+            return self.head_absent(i);
+        }
+        assert!(i < self.n, "a head past the index");
+        // SAFETY: the pointer names `n` heads -- the mapping's, which `open`
+        // held to that many, or a copy of exactly those (`set_heads`) --
+        // and `i` is one of them.
+        u64::from_be(unsafe { p.add(i * HEAD).cast::<u64>().read_unaligned() })
+    }
+
+    /// The address of head `lo`, or one past the last; `None` for a mapping
+    /// read by the piece, whose heads are not in memory to point at.
+    #[inline]
+    fn heads_at(&self, lo: usize) -> Option<*const u8> {
+        debug_assert!(lo <= self.n);
+        let p = self.heads.load(std::sync::atomic::Ordering::Acquire);
+        // SAFETY: inside the heads or one past them.
+        (!p.is_null()).then(|| unsafe { p.add(lo * HEAD) as *const u8 })
+    }
+
+    /// The mapping's heads: what a copy of them is made from. `None` for a
+    /// mapping read by the piece, which lends nothing whole and is never
+    /// given a copy.
+    pub(crate) fn mapped_heads(&self) -> Option<&[u8]> {
+        self.map
+            .as_slice()
+            .get(HEADER..HEADER + self.n * HEAD)
+            .filter(|_| !self.map.piecewise())
+    }
+
+    /// Whether the heads are read from a copy and not from the mapping.
+    pub fn heads_owned(&self) -> bool {
+        let p = self.heads.load(std::sync::atomic::Ordering::Acquire);
+        match self.mapped_heads() {
+            Some(m) => !p.is_null() && !std::ptr::eq(p, m.as_ptr()),
+            None => false,
+        }
+    }
+
+    /// The heads read from `p` from here on.
+    ///
+    /// # Safety
+    /// `p` holds a copy of `mapped_heads`, whole before this call, that
+    /// stays as it is and allocated until `reset_heads` and past every
+    /// reader that may have loaded the pointer before it; the mapping is
+    /// one `mapped_heads` answers for.
+    pub(crate) unsafe fn set_heads(&self, p: *const u8) {
+        debug_assert!(
+            self.mapped_heads().is_some(),
+            "heads copied for a paged mapping"
+        );
+        self.heads
+            .store(p as *mut u8, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The heads read from the mapping again.
+    pub(crate) fn reset_heads(&self) {
+        if let Some(m) = self.mapped_heads() {
+            self.heads
+                .store(m.as_ptr() as *mut u8, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -703,6 +786,34 @@ impl OrdIndex {
     /// not carry the common prefix, or the prefix is not learned, since the
     /// seek then reads no head for it. For a reader asking for the stride's
     /// page ahead of the seek (`willneed_heads`).
+    /// The stride of the top level whose ranks hold `key`'s floor -- the
+    /// last rank whose key is at or below it, or rank 0 below the first --
+    /// read off the samples alone, where the key's head lies strictly
+    /// between two of them, below the first or above the last: a head
+    /// strictly below or above a sample's is a key strictly below or above
+    /// that rank's, so the floor is past one sample and before the next.
+    /// `None` where the head ties a sample, which only the stride's heads
+    /// (and past them the records) can settle, and where the key is not
+    /// under the index's prefix.
+    pub fn floor_stride(&self, key: &[u8]) -> Option<usize> {
+        if self.n == 0 {
+            return None;
+        }
+        if self.pfx > 0 {
+            let prefix = self.prefix.as_deref()?;
+            if key.len() < self.pfx || key[..self.pfx] != prefix[..self.pfx.min(prefix.len())] {
+                return None;
+            }
+        }
+        let h = head_of(key, self.pfx);
+        let top = self.top();
+        let t = lower_bound(top, h);
+        if top.get(t) == Some(&h) {
+            return None;
+        }
+        Some(t.saturating_sub(1))
+    }
+
     pub fn stride_window(&self, key: &[u8]) -> Option<(usize, usize)> {
         if self.n == 0 {
             return None;
@@ -729,7 +840,7 @@ impl OrdIndex {
     /// a key, ten to fourteen thousand in a row on one thread.
     pub fn willneed_heads(&self, lo: usize, hi: usize) -> usize {
         let hi = hi.min(self.n);
-        if lo >= hi {
+        if lo >= hi || self.heads_owned() {
             return 0;
         }
         let off = (HEADER + lo * HEAD) as u64;
@@ -737,6 +848,32 @@ impl OrdIndex {
             return 0;
         }
         self.map.advise_willneed(off, (hi - lo) * HEAD)
+    }
+
+    /// Whether every page of the heads is in the page cache now, by one
+    /// `mincore` over the mapping: what a reader about to ask for the heads
+    /// a run or a stride at a time looks at first, since each of those asks
+    /// reads its own page's residency with a call of its own
+    /// (`willneed_heads`), and over an index that is resident whole they
+    /// are calls and nothing else. False where the kernel will not say.
+    pub fn heads_all_resident(&self) -> bool {
+        if self.n == 0 || self.heads_owned() {
+            return true;
+        }
+        let len = self.n * HEAD;
+        let page = crate::bytes::os_page_size();
+        let pages = (HEADER + len).div_ceil(page) - HEADER / page;
+        self.map.resident_pages(HEADER, len) == pages
+    }
+
+    /// Every head asked of the kernel, resident or not: for a release under
+    /// the hot-raw policy, which brings the index back whole. The bytes
+    /// submitted.
+    pub fn willneed_heads_all(&self) -> usize {
+        if self.n == 0 || self.heads_owned() {
+            return 0;
+        }
+        self.map.advise_willneed(HEADER as u64, self.n * HEAD)
     }
 
     /// The page of `page` bytes holding the head of `rank`, and the first
@@ -936,9 +1073,8 @@ impl OrdIndex {
         // three of them one after another, each a miss on a cold
         // partition, and issued at once they cost one.
         if lo < hi {
-            let at = HEADER + lo * HEAD;
-            if let Some(heads) = self.map.as_slice().get(at..) {
-                crate::db::prefetch_lines(heads.as_ptr(), (hi - lo) * HEAD);
+            if let Some(heads) = self.heads_at(lo) {
+                crate::db::prefetch_lines(heads, (hi - lo) * HEAD);
             }
         }
         on_window(lo, hi);
@@ -1002,6 +1138,78 @@ impl OrdIndex {
             let base = lo + 1;
             base + crate::db::select_lower_bound(hi - base, |i| self.head(base + i) < h)
         };
+        self.exact_at(lo, h, key, key_at)
+    }
+
+    /// The stride a seek for `key` will search, found from the top level
+    /// in memory and its lines asked of the core, for a caller that
+    /// resolves a batch of keys in key order and can name each key's
+    /// stride a few keys before it seeks it: the lines then arrive while
+    /// the keys before are resolved, and `seek_exact_planned` searches
+    /// them with nothing to wait for. The gallop from the last answer
+    /// (`seek_exact_from`) reads a line a probe once the keys stand more
+    /// than a stride apart, a dozen probes one after another for keys a
+    /// few thousand ranks apart, each waiting on the one before.
+    ///
+    /// `t` is the caller's, the top-level position the key before it in
+    /// key order planned at (anything past the top level for none): a key
+    /// in the same stride plans with two compares and asks for nothing,
+    /// its lines asked for already. `None` where the seek answers without
+    /// the heads or cannot be planned from memory -- an empty index, a
+    /// query outside the common prefix, a prefix not learned -- and the
+    /// caller seeks as it did.
+    pub fn plan_seek(&self, key: &[u8], t: &mut usize) -> Option<SeekPlan> {
+        if self.n == 0 {
+            return None;
+        }
+        if self.pfx > 0 {
+            let prefix = self.prefix.as_deref()?;
+            if key.len() < self.pfx
+                || prefix.len() < self.pfx
+                || cmp_short(&key[..self.pfx], &prefix[..self.pfx]) != std::cmp::Ordering::Equal
+            {
+                return None;
+            }
+        }
+        let h = head_of(key, self.pfx);
+        let was = *t;
+        let top = self.top();
+        let same = was < top.len() && top[was] >= h && (was == 0 || top[was - 1] < h);
+        let at = if same { was } else { lower_bound(top, h) };
+        *t = at;
+        // `seek_exact_hint`'s window: nothing to search below the first
+        // sample, and otherwise the heads past the last sample below the
+        // query up to the next sample or the end.
+        let (lo, hi) = if at == 0 {
+            (0, 0)
+        } else {
+            ((at - 1) * TOP_STRIDE + 1, (at * TOP_STRIDE).min(self.n))
+        };
+        if !same && lo < hi {
+            if let Some(heads) = self.heads_at(lo) {
+                crate::db::prefetch_lines(heads, (hi - lo) * HEAD);
+            }
+        }
+        Some(SeekPlan {
+            lo: lo as u32,
+            hi: hi as u32,
+            head: h,
+        })
+    }
+
+    /// `seek_exact` for a key whose stride `plan_seek` named on this
+    /// index: the stride's heads searched, and the answer from there as
+    /// every seek gives it.
+    pub fn seek_exact_planned<'a>(
+        &self,
+        plan: SeekPlan,
+        key: &[u8],
+        key_at: impl Fn(usize) -> Option<&'a [u8]>,
+    ) -> (usize, Option<bool>) {
+        let h = plan.head;
+        debug_assert_eq!(h, head_of(key, self.pfx), "a plan is its own key's");
+        let (base, hi) = (plan.lo as usize, (plan.hi as usize).min(self.n));
+        let lo = base + crate::db::select_lower_bound(hi - base, |i| self.head(base + i) < h);
         self.exact_at(lo, h, key, key_at)
     }
 
@@ -1405,6 +1613,146 @@ mod tests {
         check_from(&keys, &[b"x", longer.as_slice(), b"zz"], "from-headtie");
     }
 
+    /// A planned seek answers as `seek_exact` does, for keys and for
+    /// probes between them, with the top-level position carried from one
+    /// query to the next in key order, carried from a query anywhere
+    /// else, and not carried at all; and nothing is planned where the
+    /// seek reads no head: a prefix not learned, a query outside it.
+    #[test]
+    fn a_planned_seek_answers_as_the_seek_does() {
+        let digits: Vec<Vec<u8>> = (0u32..5_000)
+            .map(|i| format!("{:016}", i * 3).into_bytes())
+            .collect();
+        let spread: Vec<Vec<u8>> = (0u32..2_000)
+            .map(|i| format!("{:08}", i * 50_000).into_bytes())
+            .collect();
+        let tied: Vec<Vec<u8>> = (0u32..300)
+            .map(|i| {
+                let mut k = vec![b'x'; 40];
+                k.extend_from_slice(format!("{i:06}").as_bytes());
+                k
+            })
+            .collect();
+        let mut mixed = digits.clone();
+        for i in (0u32..5_000).step_by(7) {
+            mixed.push(format!("{:016}tail{}", i * 3, i % 3).into_bytes());
+        }
+        mixed.sort();
+        for (name, owned) in [
+            ("digits", digits),
+            ("spread", spread),
+            ("tied", tied),
+            ("mixed", mixed),
+        ] {
+            let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+            let p = write(&build(&keys), &format!("planned-{name}"));
+            let mut idx = OrdIndex::open(&p, keys.len()).expect("opens");
+            if idx.pfx > 0 {
+                let mut t = usize::MAX;
+                assert!(
+                    idx.plan_seek(keys[keys.len() / 2], &mut t).is_none(),
+                    "{name}: no plan before the prefix is learned"
+                );
+            }
+            idx.learn_prefix(keys[0]);
+            let mut probes: Vec<Vec<u8>> = owned.clone();
+            probes.extend(owned.iter().map(|k| [k.as_slice(), b"+"].concat()));
+            probes.extend(owned.iter().map(|k| k[..k.len() - 1].to_vec()));
+            probes.extend([Vec::new(), b"zzzzzzzzzzzzzzzzzzzz".to_vec()]);
+            probes.sort();
+            probes.dedup();
+            // In key order, the position carried; then each probe from the
+            // position a probe far from it left; then from none.
+            let far: Vec<&Vec<u8>> = (0..probes.len())
+                .map(|i| &probes[(i * 7919) % probes.len()])
+                .collect();
+            let mut planned = 0usize;
+            for (mode, order) in [
+                ("carried", probes.iter().collect::<Vec<_>>()),
+                ("stale", far),
+                ("fresh", probes.iter().collect::<Vec<_>>()),
+            ] {
+                let mut t = usize::MAX;
+                for q in order {
+                    if mode == "fresh" {
+                        t = usize::MAX;
+                    }
+                    let want = idx.seek_exact(q, resolver(&keys));
+                    match idx.plan_seek(q, &mut t) {
+                        Some(plan) => {
+                            planned += 1;
+                            assert_eq!(
+                                idx.seek_exact_planned(plan, q, resolver(&keys)),
+                                want,
+                                "{name} {mode}: {:?}",
+                                String::from_utf8_lossy(q)
+                            );
+                        }
+                        None => assert!(
+                            idx.pfx > 0
+                                && (q.len() < idx.pfx || q[..idx.pfx] != keys[0][..idx.pfx]),
+                            "{name} {mode}: {:?} carries the prefix and has no plan",
+                            String::from_utf8_lossy(q)
+                        ),
+                    }
+                }
+            }
+            assert!(
+                planned >= 3 * owned.len(),
+                "{name}: every key was planned in every order, {planned}"
+            );
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    /// The heads read from a copy answer every seek as the mapping's do,
+    /// and again once the reads go back to the mapping: the seek from the
+    /// top, the seek from a rank, the planned seek and the windowed one.
+    #[test]
+    fn an_index_read_through_a_copy_of_its_heads_answers_the_same() {
+        let digits: Vec<Vec<u8>> = (0u32..3_000)
+            .map(|i| format!("{:016}", i * 3).into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = digits.iter().map(|k| k.as_slice()).collect();
+        let p = write(&build(&keys), "owned-heads");
+        let mut idx = OrdIndex::open(&p, keys.len()).expect("opens");
+        idx.learn_prefix(keys[0]);
+        let mut probes: Vec<Vec<u8>> = digits.clone();
+        probes.extend(digits.iter().map(|k| [k.as_slice(), b"+"].concat()));
+        probes.extend([Vec::new(), b"zzz".to_vec()]);
+        probes.sort();
+        let answers = |idx: &OrdIndex| -> Vec<(usize, Option<bool>)> {
+            let mut out = Vec::new();
+            let mut t = usize::MAX;
+            let mut from = 0usize;
+            for q in &probes {
+                let a = idx.seek_exact(q, resolver(&keys));
+                assert_eq!(idx.seek_exact_from(from, q, resolver(&keys)), a);
+                if let Some(plan) = idx.plan_seek(q, &mut t) {
+                    assert_eq!(idx.seek_exact_planned(plan, q, resolver(&keys)), a);
+                }
+                assert_eq!(idx.seek_in(0, keys.len(), q, resolver(&keys)), a.0);
+                from = a.0;
+                out.push(a);
+            }
+            out
+        };
+        let mapped = answers(&idx);
+        assert!(!idx.heads_owned());
+        let copy: Vec<u8> = idx.mapped_heads().expect("a mapped file").to_vec();
+        // SAFETY: a whole copy of the heads, alive until the reset below.
+        unsafe { idx.set_heads(copy.as_ptr()) };
+        assert!(idx.heads_owned());
+        assert!(idx.heads_all_resident(), "a copy is resident");
+        assert_eq!(idx.willneed_heads(0, keys.len()), 0, "and asks nothing");
+        assert_eq!(answers(&idx), mapped, "through the copy");
+        idx.reset_heads();
+        assert!(!idx.heads_owned());
+        assert_eq!(answers(&idx), mapped, "through the mapping again");
+        drop(copy);
+        let _ = std::fs::remove_file(&p);
+    }
+
     /// The window the hinted seek names holds its answer and spans one
     /// stride at most, for every key, between keys and at both ends;
     /// `(0, 0)` for a query below every sample of the top level; and the
@@ -1440,8 +1788,73 @@ mod tests {
                 String::from_utf8_lossy(k)
             );
             let h = head_of(k, idx.pfx);
-            if super::lower_bound(&idx.top, h) == 0 {
+            if super::lower_bound(idx.top(), h) == 0 {
                 assert_eq!((lo, hi), (0, 0), "below every sample");
+            }
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// An index read by the piece answers every seek as the mapped one
+    /// does: its top level is read at the first seek, so a path that reads
+    /// the level's field and not `top()` sees an index of no samples --
+    /// `plan_seek` planned every key into the window below the first
+    /// sample and the settle filed it at rank zero, under a cipher.
+    #[test]
+    fn an_index_read_by_the_piece_seeks_as_the_mapped_one() {
+        struct InMemory(Vec<u8>);
+        impl crate::bytes::Paging for InMemory {
+            fn base(&self) -> *const u8 {
+                self.0.as_ptr()
+            }
+            fn size(&self) -> u64 {
+                self.0.len() as u64
+            }
+            fn ensure(&self, off: u64, len: usize) -> bool {
+                off.checked_add(len as u64)
+                    .is_some_and(|e| e <= self.size())
+            }
+            fn piece_end(&self, _: u64) -> u64 {
+                self.size()
+            }
+            fn piece_from(&self, off: u64) -> usize {
+                self.size().saturating_sub(off) as usize
+            }
+            fn advise(&self, _: bool) {}
+            fn resident(&self, _: u64, _: usize) -> f64 {
+                1.0
+            }
+            fn forget(&self, _: u64, _: usize) {}
+            fn willneed(&self, _: u64, _: usize) -> usize {
+                0
+            }
+        }
+        let owned: Vec<Vec<u8>> = (0u32..2_000)
+            .map(|i| format!("{:016}", i * 3).into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let probes: Vec<Vec<u8>> = (0u32..6_100)
+            .map(|i| format!("{i:016}").into_bytes())
+            .collect();
+        let p = write(&build(&keys), "by-the-piece");
+        let mapped = OrdIndex::open(&p, keys.len()).expect("opens");
+        let bytes = std::fs::read(&p).expect("reads");
+        let paged = MmapBytes::paged(std::sync::Arc::new(InMemory(bytes)));
+        assert!(paged.piecewise());
+        let mut by_piece = OrdIndex::over(paged, keys.len()).expect("opens by the piece");
+        let mut mapped = mapped;
+        mapped.learn_prefix(keys[0]);
+        by_piece.learn_prefix(keys[0]);
+        let (mut tm, mut tp) = (usize::MAX, usize::MAX);
+        for k in probes.iter().map(|k| k.as_slice()) {
+            let want = mapped.seek_exact(k, resolver(&keys));
+            assert_eq!(by_piece.seek_exact(k, resolver(&keys)), want);
+            assert_eq!(by_piece.floor_stride(k), mapped.floor_stride(k));
+            let (pm, pp) = (mapped.plan_seek(k, &mut tm), by_piece.plan_seek(k, &mut tp));
+            assert_eq!(pm.is_some(), pp.is_some());
+            if let (Some(pm), Some(pp)) = (pm, pp) {
+                assert_eq!(mapped.seek_exact_planned(pm, k, resolver(&keys)), want);
+                assert_eq!(by_piece.seek_exact_planned(pp, k, resolver(&keys)), want);
             }
         }
         let _ = std::fs::remove_file(&p);
