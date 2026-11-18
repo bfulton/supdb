@@ -607,6 +607,25 @@ pub fn forms_cost(capacity: u64, parts: &[FormPart], costs: FormCosts) -> f64 {
     decodes + costs.t_fault * model_populations(capacity, &pops)
 }
 
+/// How many times the reads a period held are of what the touches the
+/// periods have left say: `now`, the period's touches a second, over
+/// `smoothed`, those partitions' smoothed touches, and nothing where there
+/// is nothing to go by. [`forms_cost`] is the touches' in the first degree
+/// -- the decodes are a sum over them, and the model's faults at touches
+/// `k` times as many are `k` times the faults, its characteristic time a
+/// `k`th -- so a gain priced over the smoothed touches times this is the
+/// gain at the period's own reads in the shares the smoothed touches give
+/// the partitions. What a move would have saved over a period is that: the
+/// smoothed touches alone say a tenth of a pass's reads a second into it
+/// and a tenth of them still a time constant after its end.
+pub fn intensity(now: f64, smoothed: f64) -> f64 {
+    if smoothed > 0.0 && now.is_finite() && now > 0.0 {
+        now / smoothed
+    } else {
+        0.0
+    }
+}
+
 /// The cache [`conversions`] judges a move out in and the one it judges a
 /// move in in, bytes, for a budget of `budget` with `other` bytes standing
 /// in the cache beside the forms -- the level-0 pieces' payload, the raw
@@ -3949,6 +3968,90 @@ mod tests {
         assert_eq!(conversion_room(1000, 850), (150, 0));
         assert_eq!(conversion_room(1000, 900), (100, 0));
         assert_eq!(conversion_room(1000, 2000), (0, 0));
+    }
+
+    /// What a period's reads are of the smoothed touches (`intensity`), and
+    /// what the scaling of a gain by it rests on: the cost of a store's
+    /// reads, and so every move's gain, at touches some number of times as
+    /// many is that many times itself, where the store fits and where it
+    /// faults, so a gain priced over smoothed touches times the intensity
+    /// is the gain at the period's own.
+    #[test]
+    fn a_gain_at_the_periods_reads_is_the_smoothed_gain_times_their_intensity() {
+        assert_eq!(intensity(300.0, 100.0), 3.0);
+        assert_eq!(intensity(0.0, 100.0), 0.0, "a period nobody read in");
+        assert_eq!(intensity(50.0, 0.0), 0.0, "nothing to go by");
+        assert_eq!(intensity(f64::NAN, 100.0), 0.0);
+        assert_eq!(intensity(-1.0, 100.0), 0.0);
+        let mb = 1u64 << 20;
+        let part = |stride: bool, touches: f64| FormPart {
+            stride,
+            can_stride: true,
+            block_bytes: 60 * mb,
+            stride_bytes: 100 * mb,
+            touches,
+        };
+        let costs = FormCosts {
+            t_decode: 1e-6,
+            t_fault: 40e-6,
+        };
+        let near = |a: f64, b: f64| (a - b).abs() <= 1e-6 * b.abs().max(1e-12);
+        // A store that fits, one over its room with moves out to make, and
+        // one with a move in: the smoothed touches a fortieth of the
+        // period's, as they stand a period into a pass.
+        let shapes: [(u64, u64, Vec<FormPart>); 3] = [
+            (
+                400 * mb,
+                400 * mb,
+                vec![part(false, 1000.0), part(false, 50_000.0), part(true, 10.0)],
+            ),
+            (
+                230 * mb,
+                200 * mb,
+                vec![part(true, 4000.0), part(true, 9000.0), part(true, 700.0)],
+            ),
+            (
+                300 * mb,
+                280 * mb,
+                vec![part(true, 5000.0), part(false, 8000.0), part(false, 20.0)],
+            ),
+        ];
+        for (capacity, fill, now) in &shapes {
+            let k = 40.0;
+            let smoothed: Vec<FormPart> = now
+                .iter()
+                .map(|p| FormPart {
+                    touches: p.touches / k,
+                    ..*p
+                })
+                .collect();
+            let x = intensity(
+                now.iter().map(|p| p.touches).sum(),
+                smoothed.iter().map(|p| p.touches).sum(),
+            );
+            assert!(near(x, k), "{x}");
+            assert!(
+                near(
+                    forms_cost(*capacity, now, costs),
+                    x * forms_cost(*capacity, &smoothed, costs)
+                ),
+                "the cost is the touches' in the first degree"
+            );
+            let (at_now, at_smoothed) = (
+                conversions(*capacity, *fill, now, costs),
+                conversions(*capacity, *fill, &smoothed, costs),
+            );
+            assert!(!at_now.is_empty(), "a shape with a move to price");
+            assert_eq!(
+                at_now.len(),
+                at_smoothed.len(),
+                "{at_now:?} {at_smoothed:?}"
+            );
+            for (a, b) in at_now.iter().zip(&at_smoothed) {
+                assert_eq!(a.0, b.0, "the same moves in the same order");
+                assert!(near(a.1, x * b.1), "{at_now:?} {at_smoothed:?}");
+            }
+        }
     }
 
     /// The most a quantity read over the last one to two spans

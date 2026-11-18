@@ -6241,6 +6241,9 @@ pub(super) struct ZEvents {
     pub stride_converts: AtomicU64,
     pub stride_converts_back: AtomicU64,
     pub stride_convert_looks: AtomicU64,
+    /// The rents the conversion's last look left, summed, microseconds
+    /// (`ZCounts::stride_convert_rent_us`): a level, stored and not added.
+    pub stride_convert_rent_us: AtomicU64,
     /// The partitions whose raw pages were dropped at their form file's
     /// install (`Options::zpages_drop_raw`).
     pub raw_dropped: AtomicU64,

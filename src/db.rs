@@ -851,6 +851,11 @@ pub struct ZCounts {
     pub stride_converts: u64,
     pub stride_converts_back: u64,
     pub stride_convert_looks: u64,
+    /// The rents the conversion's last look left its moves at, summed,
+    /// microseconds: what each would have saved since it was first offered
+    /// (`Options::zpages_stride_convert`). A test's, for holding a period's
+    /// rent to the period's reads.
+    pub stride_convert_rent_us: u64,
     pub builds_raw_tails: u64,
     /// Partitions re-coded while served (`Options::zpages_recode`): to the
     /// raw tails, back to the block coding, and re-codes that installed
@@ -24119,6 +24124,7 @@ impl Reader {
             stride_converts: get(&ev.stride_converts),
             stride_converts_back: get(&ev.stride_converts_back),
             stride_convert_looks: get(&ev.stride_convert_looks),
+            stride_convert_rent_us: get(&ev.stride_convert_rent_us),
             builds_raw_tails: get(&ev.builds_raw_tails),
             recodes: get(&ev.recodes),
             recodes_back: get(&ev.recodes_back),
@@ -44508,7 +44514,8 @@ const RECODE_AUTO_EVICT: f64 = 0.95;
 /// (`Options::zpages_stride_convert`): its period; what a build costs a
 /// byte of the form it writes before any build has been timed, seconds --
 /// the device's 150 MB/s here read once and written once; the wall between
-/// two looks over the wall a look took, at least; and the decodes a look
+/// two looks over what a look's pricing took of its thread's clock, at
+/// least; and the decodes a look
 /// has to have seen timed in its period to take the period's mean as what
 /// a decode costs.
 const CONVERT_PERIOD: std::time::Duration = std::time::Duration::from_millis(250);
@@ -47849,9 +47856,17 @@ impl Maint {
 
     /// The conversion's turn (`Options::zpages_stride_convert`), with the
     /// form installed and no build in flight or due: once a
-    /// `CONVERT_PERIOD`, and no sooner than `CONVERT_DUTY` times the wall
-    /// the last look took, a look, counted once it is done so that a test
-    /// that waits for one reads the decision it made.
+    /// `CONVERT_PERIOD`, and no sooner than `CONVERT_DUTY` times what the
+    /// last look took of the thread's own clock, a look, counted once it is
+    /// done so that a test that waits for one reads the decision it made.
+    /// What a look took is its pricing alone, on the thread's CPU clock: the
+    /// build it starts is the build's, and a wait inside it -- the group's
+    /// counters read under reclaim, the thread off its core beside the
+    /// readers -- is no work of the look's to hold the next one off for.
+    /// Timed by its wall with the start inside, one look of 19-33 ms held
+    /// the next off for two and three seconds, twice in the 24 conversions
+    /// a store of ten million keys under 1 GiB makes, a third of the time
+    /// they took (`docs/engine.md`).
     fn z_convert_tick(&mut self) {
         let now = self.z_now();
         if self
@@ -47876,19 +47891,42 @@ impl Maint {
         }
         let dt = self.z_conv_last.map(|t| now.saturating_sub(t));
         self.z_conv_last = Some(now);
-        let t0 = std::time::Instant::now();
-        self.z_convert_look(now, dt);
-        self.z_conv_done = Some((std::time::Instant::now(), t0.elapsed()));
+        let (t0, c0) = (std::time::Instant::now(), thread_cpu_ns());
+        let due = self.z_convert_look(now, dt);
+        let cpu = std::time::Duration::from_nanos(thread_cpu_ns().saturating_sub(c0));
+        let wall = t0.elapsed();
+        self.z_conv_done = Some((std::time::Instant::now(), cpu));
+        let started = due.is_some();
+        let s0 = std::time::Instant::now();
+        if let Some(seg) = due {
+            self.z_convert(seg);
+        }
+        if self.z_trace {
+            eprintln!(
+                "zconvert t={:.1} look wall_ms {:.2} cpu_ms {:.2} start_ms {:.2} started {}",
+                now.as_secs_f64(),
+                wall.as_secs_f64() * 1e3,
+                cpu.as_secs_f64() * 1e3,
+                s0.elapsed().as_secs_f64() * 1e3,
+                started,
+            );
+        }
         zfile::ZEvents::add(&self.shared.z.stride_convert_looks, 1);
     }
 
     /// One look of the conversion between the block and the stride forms at
     /// `now`, `dt` after the last one (none at the first): each served
     /// partition's touches a second, the moves `zselect::conversions` says
-    /// pay, each move's rent grown by what it would have saved over `dt`,
-    /// and the build of the one whose rent has most outgrown its price
+    /// pay, each move's rent grown by what it would have saved over `dt` at
+    /// the reads `dt` held,
+    /// and the partition of the one whose rent has most outgrown its price,
+    /// for the tick to start the build of
     /// (`Options::zpages_stride_convert`).
-    fn z_convert_look(&mut self, now: std::time::Duration, dt: Option<std::time::Duration>) {
+    fn z_convert_look(
+        &mut self,
+        now: std::time::Duration,
+        dt: Option<std::time::Duration>,
+    ) -> Option<std::sync::Arc<Seg>> {
         let inject = self.opts.zpages_inject.clone();
         let budget = self.z_budget_grown();
         // A served partition: its segment, its form file's identity and
@@ -48002,6 +48040,9 @@ impl Maint {
         let mut seen = std::collections::HashMap::with_capacity(rows.len());
         let mut heats = std::collections::HashMap::with_capacity(rows.len());
         let mut parts = Vec::with_capacity(rows.len());
+        // The period's touches a second and the touches the periods have
+        // left, each summed over the partitions whose file gave a rate.
+        let (mut rate_sum, mut heat_sum) = (0.0f64, 0.0f64);
         for r in &rows {
             let count = r.decodes + r.opens;
             let rate = match (self.z_conv_seen.get(&r.id), dt) {
@@ -48016,6 +48057,10 @@ impl Maint {
                 (None, Some(a)) => a * old,
                 _ => old,
             };
+            if let Some(x) = rate {
+                rate_sum += x;
+                heat_sum += heat;
+            }
             seen.insert(r.id, (count, r.ns, r.decodes));
             heats.insert(r.seg.name.clone(), heat);
             let block_bytes = if r.stride {
@@ -48037,13 +48082,13 @@ impl Maint {
         let rewriting =
             !self.compacting.is_empty() || self.tiering.is_some() || !self.sealing.is_empty();
         let (Some(budget), Some(dt)) = (budget, dt) else {
-            return;
+            return None;
         };
         if rewriting {
             if self.z_trace {
                 eprintln!("zconvert t={:.1} busy", now.as_secs_f64());
             }
-            return;
+            return None;
         }
         let t_fault = inject
             .as_ref()
@@ -48074,6 +48119,14 @@ impl Maint {
                 us as f64 * 1e-6 / bytes as f64
             }
         };
+        // What a move would have saved over the period: its gain at the
+        // period's own reads. The gains are priced over the touches the
+        // periods have left, which say how the reads are shared out among
+        // the partitions and are slow to say how many there are -- a tenth
+        // of them a second after a pass begins, and a tenth still a
+        // `RECODE_TAU` after it ends -- and a gain is as many times itself
+        // as the reads are (`zselect::intensity`).
+        let now_over_heat = zselect::intensity(rate_sum, heat_sum);
         let mut rents = std::collections::HashMap::with_capacity(moves.len());
         // The move whose rent has most outgrown its price, with both.
         let mut due: Option<(usize, f64, f64)> = None;
@@ -48083,7 +48136,8 @@ impl Maint {
                 zselect::Conversion::ToBlock(i) => (i, false),
             };
             let name = &rows[i].seg.name;
-            let rent = self.z_conv_rent.get(name).copied().unwrap_or(0.0) + gain * dt.as_secs_f64();
+            let rent = self.z_conv_rent.get(name).copied().unwrap_or(0.0)
+                + gain * now_over_heat * dt.as_secs_f64();
             rents.insert(name.clone(), rent);
             let built = if to_stride {
                 parts[i].stride_bytes
@@ -48097,12 +48151,13 @@ impl Maint {
                 .unwrap_or_else(|| zselect::ski_rental_price(built as f64 * per_byte, None));
             if self.z_trace {
                 eprintln!(
-                    "zconvert t={:.1} {} seg={} touches_s={:.0} gain_ms_s={:.3} rent_ms={:.1} price_ms={:.1} capacity_mb={} fill_mb={} other_mb={}",
+                    "zconvert t={:.1} {} seg={} touches_s={:.0} gain_ms_s={:.3} now_x={:.2} rent_ms={:.1} price_ms={:.1} capacity_mb={} fill_mb={} other_mb={}",
                     now.as_secs_f64(),
                     if to_stride { "in" } else { "out" },
                     name,
                     parts[i].touches,
                     gain * 1e3,
+                    now_over_heat,
                     rent * 1e3,
                     price * 1e3,
                     capacity >> 20,
@@ -48114,20 +48169,25 @@ impl Maint {
                 due = Some((i, rent, price));
             }
         }
+        // The rents as this look leaves them, summed: what a test holds a
+        // period's rent by (`ZCounts::stride_convert_rent_us`).
+        self.shared.z.stride_convert_rent_us.store(
+            (rents.values().sum::<f64>() * 1e6) as u64,
+            AtomicOrdering::Relaxed,
+        );
         self.z_conv_rent = rents;
-        if let Some((i, _, _)) = due {
-            let seg = rows[i].seg.clone();
-            self.z_conv_rent.remove(&seg.name);
-            if self.z_trace {
-                eprintln!(
-                    "zconvert t={:.1} start seg={} to {}",
-                    now.as_secs_f64(),
-                    seg.name,
-                    if rows[i].stride { "block" } else { "stride" },
-                );
-            }
-            self.z_convert(seg);
+        let (i, _, _) = due?;
+        let seg = rows[i].seg.clone();
+        self.z_conv_rent.remove(&seg.name);
+        if self.z_trace {
+            eprintln!(
+                "zconvert t={:.1} start seg={} to {}",
+                now.as_secs_f64(),
+                seg.name,
+                if rows[i].stride { "block" } else { "stride" },
+            );
         }
+        Some(seg)
     }
 
     /// A test's request for a conversion taken, with the builder free

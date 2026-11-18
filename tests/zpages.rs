@@ -17251,6 +17251,85 @@ fn a_partition_built_in_the_stride_form_is_converted_out_and_in_again() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A move's rent grows by what the move would have saved over each period
+/// at the reads that period held (`Options::zpages_stride_convert`,
+/// `zselect::intensity`): the stride form's partitions over their room and
+/// read alike, with a build priced past anything the reads come to, so that
+/// nothing is bought and the rents stand to be read. Once the touches have
+/// settled, a period of three times the reads adds three times the rent of
+/// the period before it, at once, and a period nobody read in adds none.
+/// Priced over the smoothed touches alone, which is the shape before, the
+/// first added a fifth more and the second went on adding for as long as
+/// the touches took to decay -- the rent of a pass came a time constant
+/// late, which at ten million keys under 1 GiB was two seconds before the
+/// first conversion out began.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_moves_rent_grows_by_the_reads_of_each_period_and_by_nothing_without_them() {
+    let what = "rent by the period's reads";
+    let (dir, db, model, inject, keys) = convert_store("auto-convert-rent", ZStride::Forced, true);
+    let r = db.reader().unwrap();
+    let sec = std::time::Duration::from_secs(1);
+    let c0 = db.zpage_counts();
+    inject.set_convert_price(std::time::Duration::from_secs(1_000_000_000));
+    inject.set_budget(c0.file_bytes / 4);
+    let rent = |db: &Db| db.zpage_counts().stride_convert_rent_us;
+    // The touches settled on reads alike over the partitions, whatever the
+    // store's way to COMPACT left them at.
+    for _ in 0..40 {
+        read_round(&db, &keys, keys.len());
+        convert_look(&db, sec);
+    }
+    let step = |times: usize| {
+        let before = rent(&db);
+        read_round(&db, &keys, times * keys.len());
+        convert_look(&db, sec);
+        rent(&db) as f64 - before as f64
+    };
+    let one = step(1);
+    assert!(
+        one > 0.0,
+        "{what}: moves out on offer, their rent growing: {:?}",
+        db.zpage_counts()
+    );
+    let again = step(1);
+    assert!(
+        (again / one - 1.0).abs() < 0.05,
+        "{what}: the same reads, the same rent: {one} then {again}"
+    );
+    let three = step(3);
+    assert!(
+        (three / one - 3.0).abs() < 0.3,
+        "{what}: three times the reads, three times the rent, in the period \
+         they were read in: {one} then {three}"
+    );
+    let before = rent(&db);
+    for _ in 0..5 {
+        convert_look(&db, sec);
+    }
+    let after = rent(&db);
+    assert!(
+        after <= before && after as f64 >= before as f64 * 0.99,
+        "{what}: no rent for a period nobody read in: {before} then {after}"
+    );
+    wait_steps(&db, 5);
+    let c = db.zpage_counts();
+    assert_eq!(
+        (
+            c.stride_converts,
+            c.stride_converts_back,
+            c.build_starts,
+            c.recode_failed
+        ),
+        (0, 0, c0.build_starts, 0),
+        "{what}: nothing bought at that price: {c:?}"
+    );
+    check(&r, &model, &keys, what);
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Readers on threads of their own read through a store's partitions while
 /// the conversion moves them between the two forms under them
 /// (`Options::zpages_stride_convert`): point reads, counts and scans across
