@@ -168,9 +168,9 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
 /// loss at n batches: on a crash, replay stops at the first frame that is
 /// torn or missing and the sequence-gap check refuses anything past a
 /// hole, so an unsynced tail of the log is lost whole and never served in
-/// part. An ordered run open in the clear is the exception, below: its
-/// syncs are of its own file, and a crash may lose earlier commits in the
-/// log while the run's later ones survive.
+/// part. An ordered run in the clear closed into a seal still in flight is
+/// the exception, below: a crash may lose its commits while a later commit
+/// to the log survives.
 ///
 /// It exists because the device was measured serving ~2,700 barriers a
 /// second however they are issued -- sharding cannot scale past 1.6x --
@@ -178,9 +178,9 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
 ///
 /// Frames an open replays count as unsynced under either policy, since a
 /// process kill leaves them in the page cache alone: the next sync the
-/// policy makes of the log, a `sync`, a `flush`, or the durable landing
-/// of the seal they go to, makes them durable -- not a sync the policy
-/// makes of an ordered run's file, which leaves the log as it was.
+/// policy makes of the log, a `sync`, a `flush`, the durable landing of
+/// the seal they go to, or the first sync the policy makes of an ordered
+/// run's file, which syncs the log first, makes them durable.
 ///
 /// Under either policy a write of the log the device refuses fails the
 /// commit that made it, and the batch stays staged: the next commit writes
@@ -212,10 +212,11 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
 /// a tail of the run's commits and never one in part; a `sync` writes and
 /// syncs what an open run holds. A run's commit in the clear that the
 /// policy syncs -- every one under `Always`, the due one under `EveryN` --
-/// syncs the run's file and not the log, so frames of tables frozen
-/// before the run, or replayed by the open, that no sync has covered are
-/// durable only at a `sync`, a `flush` or their seal's landing, and a
-/// crash may lose them while the run's later commits survive. A run in
+/// syncs the run's file, and the first of them syncs the log before it
+/// wherever the log owed a sync when the run opened -- frames of tables
+/// frozen before the run or replayed by the open, a file a rotation left
+/// loose -- so a crash that keeps the run's synced commits keeps every
+/// commit before them. A run in
 /// the clear closed under `EveryN` -- by any write the run cannot take (an
 /// `append` of a key at or below its greatest, of an empty key or one
 /// longer than `u16::MAX` bytes, or of a value that does not inline; any
@@ -5094,6 +5095,15 @@ struct Direct {
     /// Under a cipher, how many of the table's entries the log holds
     /// (`Db::log_run`).
     logged: usize,
+    /// In the clear, whether the log owed a sync when the run opened --
+    /// frames of a table frozen before it, a file a rotation left loose
+    /// with the directory barrier its successor's name needs, frames the
+    /// open replayed -- which the run's first commit its policy makes due
+    /// pays before the run's own (`Db::run_due_log_first`). Nothing writes
+    /// the log while a run is open in the clear, so what it owed then is
+    /// all it owes; under a cipher the run's due commits sync the log
+    /// behind their own frames (`Db::log_run`) and this stays false.
+    log_owed: bool,
 }
 
 /// A half-open key range `[lo, hi)`, `None` above meaning unbounded. The
@@ -30406,6 +30416,12 @@ impl Db {
             }
             w.set_marks(true);
             w.0.out.fault = std::mem::take(&mut self.run_fault_open);
+            // The directory barrier a rotation owes its new file is not
+            // asked apart, as `Db::sync` does not ask it: a loose rotation
+            // owes it with its file in `loose_wals`, and a chained one pays
+            // it at once or keeps its failure.
+            let log_owed = self.r.mem().after & RUN_LOGGED == 0
+                && (self.wal.frames_unsynced() || !self.loose_wals.is_empty());
             self.direct = Some(Direct {
                 w,
                 tmp,
@@ -30414,6 +30430,7 @@ impl Db {
                 pending: std::collections::VecDeque::new(),
                 stream_from: 0,
                 logged: 0,
+                log_owed,
             });
         }
         // Borrowed, the table and the store's shared half: the commit
@@ -30499,6 +30516,9 @@ impl Db {
             SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
         };
         if due {
+            if d.log_owed {
+                return self.run_due_log_first();
+            }
             if let Err(e) = d.w.sync() {
                 return Err(self.run_failed(e));
             }
@@ -30534,6 +30554,36 @@ impl Db {
             let mem = self.r.mem().clone();
             return self.log_run(&mem, due);
         }
+        Ok(())
+    }
+
+    /// The run's first due commit after it opened beside a log that owed
+    /// a sync (`Direct::log_owed`): the log synced first, wherever it
+    /// still owes -- a `sync` since the open may have paid it -- and then
+    /// the run's file, so no power cut keeps the run's commits and loses
+    /// the older frames. A log sync that fails is the answer and is kept
+    /// (`Db::lost`), with nothing of the run synced. What the commit does
+    /// after its sync otherwise, the references of
+    /// `Options::direct_table_refs` taken for the entries the file holds,
+    /// the run's next commit does, as it does for those the file did not
+    /// hold yet; a run's due commits under a cipher never come here.
+    #[cold]
+    #[inline(never)]
+    fn run_due_log_first(&mut self) -> Result<()> {
+        if self.wal.frames_unsynced() || !self.loose_wals.is_empty() {
+            self.sync_wal()?;
+        }
+        let d = self.direct.as_mut().expect("a run is open");
+        d.log_owed = false;
+        if let Err(e) = d.w.sync() {
+            return Err(self.run_failed(e));
+        }
+        self.unsynced = 0;
+        debug_assert_eq!(
+            self.r.mem().after & RUN_LOGGED,
+            0,
+            "a logged run's due commits sync the log behind its frames"
+        );
         Ok(())
     }
 
@@ -31479,9 +31529,11 @@ impl Db {
         // in the live file and in the files loose rotations closed --
         // whatever the live table is: a run opens over a log that holds
         // the frames of tables frozen before it, unsynced under `EveryN`
-        // until a sync covers them, and under a cipher the run's own
-        // commits are frames of the log (`Db::log_run`). The log first,
-        // since its frames are older than any commit of the open run.
+        // until a sync covers them -- this one, or the run's first due
+        // commit (`Db::run_due_log_first`) -- and under a cipher the
+        // run's own commits are frames of the log (`Db::log_run`). The
+        // log first, since its frames are older than any commit of the
+        // open run.
         //
         // The open run's commits since the last sync by policy are asked
         // first, since the log's sync starts the count over: the count is

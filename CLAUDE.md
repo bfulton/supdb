@@ -2297,10 +2297,13 @@ it cannot take (a key at or below its greatest, an empty or overlong
 key, a value that does not inline, a `put`, a `delete`) or by any seal
 (`Db::seal`, or a commit's at the threshold) goes to its seal with what
 the policy left unsynced, a `sync` before that seal lands does not cover
-it, and a `flush` does. A run's due commit syncs the run's file and not
-the log, so the frames of a table frozen before the run that no sync
-covered are durable at a `sync`, a `flush` or their seal's landing, and
-a power cut between may keep the run's commits and lose them. The WAL never
+it, and a `flush` does. A run's first due commit syncs the log before
+the run's file wherever the log owed a sync when the run opened -- the
+frames of a table frozen before it, a file a rotation left loose, frames
+an open replayed -- noted once at the run's open and asked in the due
+branch (`Direct::log_owed`), since nothing writes the log while a run is
+open in the clear; under a cipher the run's due commit syncs the log
+behind its own frames anyway. The WAL never
 sees them (`direct_ingest: false` is the arm that still sends them there).
 Recovery walks the temp file's record stream to the last marker whose three
 quantities agree with the records before it and rewrites what precedes it as
@@ -3123,7 +3126,19 @@ commit syncs the run's file and leaves the log's older frames unsynced. A
 promise is written for the states the fix reached, the states it did not
 reach are named beside it until they are built, and a list of the ways
 into a state is read off the call sites that reach it, never off the
-cases a test happened to build.
+cases a test happened to build. The due commit's window, once built,
+held the same shape from the other side: the policy's sync of the run
+was written as "the sync", and a sync by policy promises everything
+before it, so the commit that pays it pays whatever it covers -- the log
+an earlier table left owing as well as the run. It reached no cell of
+the suite, whose ordered loads open their runs over a log that owes
+nothing and whose buffered arm's policy is never due, so a test of the
+due commit beside a frozen table, a loose file and a reopen under
+`Always` is what holds it, and one beside a clean log that it syncs
+nothing more. The corollary: a sync a policy issues is priced as the
+promise it makes, every file the promise covers, and where the files it
+covers are known when the run begins, the note is taken there and read
+where the sync is due.
 
 **A pass that reported done for a turn it skipped.** The upkeep thread's
 pass checked that the state was the commit's by its generation and, where
