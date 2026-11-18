@@ -5382,6 +5382,121 @@ to compare two states is checked where its answer stops depending on
 the states, since there the comparison is decided by whatever term is
 left.
 
+**A gap in a trace that printed only what was on offer.** The
+conversion's trace printed a line for each move a look offered and none
+for a look that offered nothing, so two stretches of two and three
+seconds between one build's end and the next one's start read as
+stretches with no look. The look's guard, which holds the next look off
+a hundred times what the last one took, was the one mechanism that
+could hold a look off for seconds; a look of thirty milliseconds was
+supposed for it, the look was re-timed without the build it starts, and
+the commit said the thirty milliseconds as found (`c24b7cd`). The trace
+given a line a look read a look at half a millisecond and 2.4 at the
+most, and looks every 0.3 s through each stretch with no move on offer:
+the store fitted its room as the model had it until the next pass's
+threads grew the process. The rule: a trace that prints on events
+cannot tell nothing happening from nothing to print, so the turn itself
+gets a line before a gap in it is read; and a duration nobody timed is
+not written into a commit as measured, the message being the one place
+a guess stands as a finding for good.
+
+**An effect put on a window it was not in.** B at ten million keys
+under 1 GiB read 0.76-0.78x for the conversion arm in four pairs of
+six. The conversions were the arm's difference there, each one syncs
+its file and B commits, and the note said so: a write mix in the
+window, its commits beside the conversions' syncs. No pass's edges were
+on the conversions' clock. Stamped there (`SUPDB_LAG_MARK` beside
+`SUPDB_ZPAGES_TRACE`, the store's `zepoch` line giving the controller's
+zero on the marks' clock), the last conversion was in at 35 s and B
+began at 42. What B read behind by was the hot-raw policy, which stood
+down wherever the stride form was asked for, so that the arm served no
+partition raw where the default serves its hottest -- and the arm
+whose load is built in the block form, with no conversion in its run,
+had read B the same 0.8x two paragraphs away, which was the count to
+hold the reading to before it was written. The rule: a cell is put on a
+mechanism once the pass's edges and the mechanism's events are read on
+one clock, and not before; and where two arms that share a cause and
+not the suspected mechanism read the cell alike, the cause is the
+shared one.
+
+**A read-back named for all the files, taken by two.** The one-thread
+read pass after the load at ten million keys under a bound was known as
+the read-back of the form files: built ahead under the selector's line,
+so dropped as they are written, and asked back at the crossing a
+fraction of a second before the reads begin. A rewarm at the install
+had been built on that reading, found every file on disk resident and
+moved nothing (`Options::zpages_rewarm_at_install`). Every major fault
+of the pass laid to its file (`perf record -e major-faults
+-c 1 -d -k CLOCK_MONOTONIC` cut to the pass's marks, each address
+through the process's maps) put 22,000 of the default's 26,400 and
+30,300 of the stride arm's 40,100 in two form files and none in the
+other 24: the two builds ahead in flight at the crossing, not on disk
+for its ask, taken in after the install with nothing of them in the
+cache and read a page a fault under the random advice. With those asked
+at their collect (`Options::zpages_ask_dropped`) four fifths of what
+was left was one partition's raw records, the tail partition the cache
+had let go, which no build ahead takes and which waits third for the
+builder (`Options::zpages_cross_asks_raw`). The pass was two shapes all
+along, 0.004 and 0.027 faults a read, by whether a build happened to be
+in flight at the crossing, and had been written down as the pass's own
+churn. The rule: faults are laid to files before a mechanism is named
+for them, since a fault count says how many and a kind of file says
+nothing of which; an ask covers what is on disk when it is made, so
+whatever lands after it is asked for where it lands; and a cell that
+reads two shapes with every count the same is two events, one of which
+nobody has counted yet.
+
+**An exchange priced with an actual against an estimate.** The
+conversion prices a partition's other form from what it has: a block
+file's own bytes for a partition in the block form, and for one in the
+stride form its records at the ratio the block files served come to.
+Where no move pays alone it prices an exchange, the hottest block
+partition in and the coldest stride one out. A store that had moved one
+partition out, and fitted, was offered a second move a period later and
+made it: the exchange set the moved partition's actual block size
+against the estimate of another's, the estimate was the shorter, and
+at the fill the model read the shortfall as room made, thirty-four
+milliseconds a second of faults saved by swapping two partitions read
+alike. A test that held one move
+to be all a store needed found it; the pairings had not, since under 1
+GiB every stride file has to go anyway. The exchange is priced with the
+cold partition's block form in the share the hot one's is of its own
+stride form, both of whose sizes are known. The rule: two quantities
+compared are measured the same way or the comparison is of the
+instruments, and a decision that turns on a difference is checked at
+the difference the estimate's error can make.
+
+**A rent dropped by every look that did not offer the move.** A move's
+rent was kept in a table the look rebuilt from the moves it offered, so
+a move offered at one look and not at the next began again from
+nothing. The moves out of a store over its room are priced one after
+another with the ones before them made, and between partitions read
+alike the order is the noise's: a move the pricing had put behind two
+others for one look, when two were all the room wanted, lost the 0.6 s
+of rent it had been paid and was started 0.7 s later, the store over
+its room meanwhile. Kept across looks instead, a rent that only grows would have
+bought moves on noise: a swap that pays a little in half the looks and
+loses a little in the other half would come to its price in time. A
+rent is a balance now, grown by what the move would have saved over a
+period at the period's own reads and cut by what it would have lost
+where the partition is the better as it is, never under nothing
+(`zselect::conversions_priced`, `Maint::z_convert_look`). The rule: an
+accumulator that is reset by the absence of its own input measures the
+input's continuity and not its sum; and one that is kept has to take
+the losses with the gains, or it sums the noise.
+
+**A job a step.** The controller takes a finished build or warm in and
+starts the next at its step, and it steps once a census interval, a
+tenth of a second. Nobody had counted what that makes of a chain: at
+ten million keys under 1 GiB the warms of 29 form files the cache
+already held took two and a half seconds, a job a step, and each of 24
+conversions was taken in 20-90 ms after it ended, a second and a half
+of nine and a half. The builder's thread wakes the segment work's as it
+ends, and the turn it wakes into did nothing with it
+(`Options::zpages_drive_at_job_end`). The rule: a worker polled at a
+period is priced by the period times the jobs in its longest chain, and
+a wake that the woken side does not act on is a wake nobody made.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
