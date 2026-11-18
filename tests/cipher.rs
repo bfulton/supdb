@@ -822,6 +822,14 @@ fn builders_build_through_a_small_cache(
         db.append(&k(i), &v(i, 2));
     }
     let before = db.blocks_built().1;
+    // The peak held below is the burst's. The scans above are a caller's
+    // reads, which wait for the evictor only at the cache's second line,
+    // half the budget over it, and on a busy machine the evictor's first
+    // pass came after they had filled the cache past the first line,
+    // which is the line the store's own builders rest at and the one this
+    // test holds them to: one run of the whole file in thirteen failed on
+    // the scans' peak with the builders under the line.
+    db.restart_cipher_peak();
     db.commit().unwrap();
     db.settle().unwrap();
     let ev = db.forms_events();
