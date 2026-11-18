@@ -5600,7 +5600,7 @@ fn a_manifest_publish_spares_the_newest_durable_slot_and_the_open_takes_the_newe
     let watch: supdb::db::SlotWatch = {
         let seen = seen.clone();
         std::sync::Arc::new(move |w: &supdb::db::SlotWrite| {
-            seen.lock().unwrap_or_else(|e| e.into_inner()).push(w.clone());
+            seen.lock().unwrap_or_else(|e| e.into_inner()).push(*w);
         })
     };
     db.watch_slot_writes(Some(watch));
@@ -15312,34 +15312,39 @@ fn a_flush_publishes_its_seal_before_the_seal_is_durable() {
         }
         db.commit().unwrap();
         let handle = db.reader().unwrap();
-        let hold = std::time::Duration::from_millis(400);
         db.hold_seal_durable(true);
-        let release = db.release_seal_durable_after(hold);
-        let t0 = std::time::Instant::now();
-        let watcher = std::thread::spawn(move || {
-            while handle.unsealed_keys() > 0 {
-                if t0.elapsed() > std::time::Duration::from_secs(10) {
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            Some(t0.elapsed())
-        });
+        // The seal's fsyncs held until a handle has seen the segment
+        // published, and let go then from the handle's thread: published
+        // under the hold, or never, which ends the wait at its own bound.
+        let lifted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let lifted = lifted.clone();
+            std::thread::spawn(move || {
+                let t0 = std::time::Instant::now();
+                let seen = loop {
+                    if handle.unsealed_keys() == 0 {
+                        break true;
+                    }
+                    if t0.elapsed() > std::time::Duration::from_secs(60) {
+                        break false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                };
+                lifted.store(true, std::sync::atomic::Ordering::Release);
+                handle.hold_seal_durable_from_handle(false);
+                seen
+            })
+        };
         db.flush().unwrap();
-        let waited = t0.elapsed();
-        release.join().unwrap();
-        let seen = watcher
-            .join()
-            .unwrap()
-            .expect("the seal's table was never retired");
+        let answered_after_lift = lifted.load(std::sync::atomic::Ordering::Acquire);
+        let seen = watcher.join().unwrap();
         assert!(
-            waited >= hold,
-            "background {background}: the flush waited for the held fsyncs ({waited:?})"
+            seen,
+            "background {background}: the segment was not published while its seal was held"
         );
         assert!(
-            seen < hold / 2,
-            "background {background}: the segment was published at {seen:?}, \
-             with the seal held until {hold:?}"
+            answered_after_lift,
+            "background {background}: the flush answered before the held fsyncs were let go"
         );
         holds_all(
             &db,
