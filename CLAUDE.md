@@ -5288,6 +5288,37 @@ and by owner, at the pass it is to be used in; and before an estimator
 is built, what the store's existing counts already predict is held to
 the exact answer first.
 
+**A form priced in the arm that forces it, without the lifecycle the
+controller gives one.** The stride form's forced arm read the lag sweep
+at ten million keys under 1.25 GiB with its one-percent burst at a sixth
+of the default's rate, the pass after the ten-percent burst at 0.6 major
+faults a scan and the pass after the full rewrite at half the default's,
+and the first reading was fit again: a gigabyte of stride files beside
+the burst's pieces. The counts said otherwise for two of the three. At
+the ten-percent pass the group stood 180 MiB under its limit while the
+scans refaulted the form 4 KiB at a time: the burst had pushed the pages
+out and nothing asked them back, since the rewarm runs only once the
+selector has installed a form (`Maint::z_rewarm_look`) and a forced arm
+installs none. The burst's writer was waiting and not working, with no
+hold, behind form files built just before it and never synced, since a
+build syncs only a file it drops (`BuildPlan::sync`). Only the third was
+the form's. `supdb-zstride` is the default with every build asking for
+the stride form, and under the controller the first two went. What was
+left is a fit the selector's model cannot see: its budget is the limit
+less the process and a margin, and after a full rewrite 400 MiB of the
+page cache is the burst's pieces, the indexes, the log and the merges'
+own traffic, so it predicted no fault for a form the pass found a
+quarter short of its pages (`docs/engine.md`, which form a workload
+calls for). The rules: a mechanism measured in an arm that forces it is
+measured without whatever the controller does around it, so before a
+forced arm's loss is read as the mechanism's the gates on `installs` and
+on the gate's state are listed and the arm that leaves the controller in
+charge is built; a fit is read against the group's own count at the pass
+before it is reasoned from sizes -- room unused beside refaults is an
+ask not made, and no room is a fit; and a budget is named for what it
+subtracts, since one that leaves out a tenant says yes on that tenant's
+behalf.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
