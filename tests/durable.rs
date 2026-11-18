@@ -8244,8 +8244,19 @@ fn os_files(d: &Path) -> BTreeMap<String, Vec<u8>> {
 /// are gone. A failed fdatasync there (`Options::fail_open_slot_sync`) is
 /// the open's answer, and the directory is left as the open found it.
 fn an_open_whose_slot_sync_fails(tag: &str, base: Options) {
+    an_open_whose_slot_sync_fails_in(tag, base, false);
+}
+
+/// The same kill reopened under the slots, or with `rename` under the
+/// rename shape (`manifest_slots` off), whose open makes the slot it takes
+/// durable as the slots' open does.
+fn an_open_whose_slot_sync_fails_in(tag: &str, base: Options, rename: bool) {
     let under = matches!(base.encryption, Encryption::Cipher(_));
     let opts = os_opts(&base);
+    let reopen = Options {
+        manifest_slots: !rename,
+        ..opts.clone()
+    };
     let d = dir(&format!("os-opensync-{tag}"));
     let k = dir(&format!("os-opensync-{tag}-kill"));
     let mut db = Db::create(&d, opts.clone()).unwrap();
@@ -8328,7 +8339,7 @@ fn an_open_whose_slot_sync_fails(tag: &str, base: Options) {
         &k,
         Options {
             fail_open_slot_sync: true,
-            ..opts.clone()
+            ..reopen.clone()
         },
     ) {
         Ok(_) => panic!("{tag}: the open answered Ok over a failed fdatasync of its slot"),
@@ -8371,7 +8382,7 @@ fn an_open_whose_slot_sync_fails(tag: &str, base: Options) {
     // fdatasync would have left that slot without, so the failed open had
     // something to leave; and under a cipher it sweeps envelopes neither
     // slot names, which the failed open left too.
-    let db = Db::open(&k, opts.clone()).expect("the kill state opens");
+    let db = Db::open(&k, reopen.clone()).expect("the kill state opens");
     drop(db);
     let after = os_files(&k);
     assert!(
@@ -8388,7 +8399,7 @@ fn an_open_whose_slot_sync_fails(tag: &str, base: Options) {
             "{tag}: the kill state held no envelope the open sweeps; the case was not reached"
         );
     }
-    let failures = os_check_all(&[(k.clone(), "the kill state".into())], &model, &opts);
+    let failures = os_check_all(&[(k.clone(), "the kill state".into())], &model, &reopen);
     assert!(failures.is_empty(), "{tag}: {failures:?}");
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -8401,6 +8412,20 @@ fn an_open_whose_slot_sync_fails_leaves_the_directory_as_it_found_it() {
 #[test]
 fn an_open_whose_slot_sync_fails_leaves_the_directory_as_it_found_it_under_a_cipher() {
     an_open_whose_slot_sync_fails("cipher", under_cipher());
+}
+
+/// A store under the slots killed between a merge's slot write and its
+/// fdatasync, reopened under the rename shape: the open makes the slot it
+/// takes durable before it sweeps what that slot stopped naming, whatever
+/// the shape it is opened in.
+#[test]
+fn an_open_under_the_rename_shape_whose_slot_sync_fails_leaves_the_directory_as_it_found_it() {
+    an_open_whose_slot_sync_fails_in("to-rename", Options::default(), true);
+}
+
+#[test]
+fn an_open_under_the_rename_shape_whose_slot_sync_fails_leaves_the_directory_under_a_cipher() {
+    an_open_whose_slot_sync_fails_in("to-rename-cipher", under_cipher(), true);
 }
 
 /// A slot's fdatasync fails -- a drain's owed one, run after its answer,
@@ -8541,6 +8566,62 @@ fn a_failed_slot_sync(tag: &str, base: Options, owed_only: bool) {
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Under the slots a seal's own publish whose slot fdatasync fails is
+/// answered and stops nothing: the slot was never known durable, so the
+/// next publish writes it again, whole, and the store goes on and reopens
+/// with every acknowledged write. (The rename shape stops the queue there
+/// instead, since its publish's directory fsync is the seal's names'.)
+fn a_seal_publish_slot_sync_fails_under_the_slots(tag: &str, base: Options) {
+    let opts = os_opts(&Options {
+        compact: false,
+        promote: false,
+        partition_on_flush: false,
+        ..base
+    });
+    let d = dir(&format!("os-sealsyncfail-{tag}"));
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model = BTreeMap::new();
+    os_round(&mut db, &mut model, "r0", 0, OS_KEYS / 4);
+    db.flush().unwrap();
+    db.settle().unwrap();
+    os_round(&mut db, &mut model, "r1", OS_KEYS, OS_KEYS / 8);
+    db.fail_next_slot_sync();
+    let sealed = db.seal();
+    let settled = db.settle();
+    let answers = [sealed.err(), settled.err(), db.commit().err()];
+    assert!(
+        answers.iter().flatten().any(|e| e
+            .to_string()
+            .contains("a test failed this manifest slot's fdatasync")),
+        "{tag}: premise: the seal's publish failed its slot sync: {answers:?}"
+    );
+    os_round(&mut db, &mut model, "r2", 2 * OS_KEYS, OS_KEYS / 8);
+    db.flush()
+        .unwrap_or_else(|e| panic!("{tag}: the flush after a failed slot sync: {e}"));
+    db.settle().unwrap();
+    drop(db);
+    let failures = os_check_all(
+        &[(
+            d.clone(),
+            format!("{tag}: reopened after a seal's slot sync failed"),
+        )],
+        &model,
+        &opts,
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_seals_publish_whose_slot_sync_fails_is_written_again_by_the_next_under_the_slots() {
+    a_seal_publish_slot_sync_fails_under_the_slots("plain", Options::default());
+}
+
+#[test]
+fn a_seals_publish_whose_slot_sync_fails_is_written_again_under_the_slots_and_a_cipher() {
+    a_seal_publish_slot_sync_fails_under_the_slots("cipher", under_cipher());
 }
 
 #[test]
@@ -10705,4 +10786,1465 @@ fn an_open_makes_no_slot_file_it_does_not_find() {
 #[test]
 fn an_open_makes_no_slot_file_it_does_not_find_under_a_cipher() {
     an_absent_other_slot("cipher", under_cipher());
+}
+
+// ---------------------------------------------------------------------
+// rename-arm: the manifest's shape before the slots (`manifest_slots`
+// off), kept as an arm: a publish writes the manifest under a temp name,
+// fsyncs it, renames it over `manifest` and fsyncs the directory, and the
+// seal's own directory entries are made durable by that fsync, so the
+// shape rests on a rename reaching the device no sooner than the renames
+// made before it -- the seal's segment before the manifest that names it.
+// The states below are built on that: a power cut keeps a prefix, in the
+// order they were made, of the directory operations no directory fsync
+// that returned covered. What an open removes it removes after reading a
+// manifest an earlier process renamed into place, and no order of the
+// open's own puts the removals behind that rename: an open that removes
+// what the manifest stopped naming makes the rename durable first, or a
+// power cut may keep the removals and not the rename. Every commit is
+// made under `SyncPolicy::Always` and acknowledged before the instant a
+// state is taken in.
+// ---------------------------------------------------------------------
+
+/// The rename shape over `os_opts`.
+fn ra_opts(base: &Options) -> Options {
+    Options {
+        manifest_slots: false,
+        ..os_opts(base)
+    }
+}
+
+/// Whether `name` is a file a power cut's loss of the directory's entries
+/// is modelled for: a segment, an ordered index, a form file or an
+/// envelope, and not the log, the manifest or its spares, which the states
+/// below set by hand.
+fn ra_entry(name: &str) -> bool {
+    !(name.starts_with("wal-") || name.starts_with("spare-") || name.starts_with("manifest"))
+}
+
+fn ra_names(d: &Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_dir(d)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One rename publish as the watch saw it, between its rename and its
+/// directory fsync: the store's files copied there, the manifest before it
+/// and after it, and the entries made since the watch before it -- the
+/// publish's own new names among them, which only its directory fsync
+/// makes durable.
+struct RaPublish {
+    seq: u64,
+    at: PathBuf,
+    before: Vec<u8>,
+    now: Vec<u8>,
+    new: Vec<String>,
+}
+
+struct RaTracker {
+    store: PathBuf,
+    root: PathBuf,
+    before: Vec<u8>,
+    names: std::collections::BTreeSet<String>,
+    armed: bool,
+    seen: Vec<u64>,
+    publishes: Vec<RaPublish>,
+}
+
+type RaShared = std::sync::Arc<std::sync::Mutex<RaTracker>>;
+
+impl RaTracker {
+    /// Started over a store at rest, its manifest durable.
+    fn new(store: &Path, root: &Path) -> RaShared {
+        std::fs::create_dir_all(root).unwrap();
+        std::sync::Arc::new(std::sync::Mutex::new(RaTracker {
+            store: store.to_path_buf(),
+            root: root.to_path_buf(),
+            before: std::fs::read(store.join("manifest")).unwrap(),
+            names: ra_names(store),
+            armed: false,
+            seen: Vec::new(),
+            publishes: Vec::new(),
+        }))
+    }
+
+    fn arm(t: &RaShared, on: bool) {
+        t.lock().unwrap_or_else(|e| e.into_inner()).armed = on;
+    }
+
+    fn take(t: &RaShared) -> Vec<RaPublish> {
+        std::mem::take(&mut t.lock().unwrap_or_else(|e| e.into_inner()).publishes)
+    }
+}
+
+/// The watch: never panics, since it runs on the segment work's thread.
+fn ra_watcher(t: RaShared) -> supdb::db::SlotWatch {
+    std::sync::Arc::new(move |w: &supdb::db::SlotWrite| {
+        let mut t = t.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::fs::read(t.store.join("manifest")).unwrap_or_default();
+        let names = ra_names(&t.store);
+        t.seen.push(w.seq);
+        if t.armed {
+            let at = t.root.join(format!("pub-{}", t.seen.len()));
+            os_copy(&t.store, &at);
+            let new = names
+                .iter()
+                .filter(|n| !t.names.contains(*n) && ra_entry(n))
+                .cloned()
+                .collect();
+            let before = t.before.clone();
+            t.publishes.push(RaPublish {
+                seq: w.seq,
+                at,
+                before,
+                now: now.clone(),
+                new,
+            });
+        }
+        t.before = now;
+        t.names = names;
+    })
+}
+
+/// A copy of `from` at `to`, then made what a crash leaves.
+fn ra_state(from: &Path, to: &Path, edit: impl FnOnce(&Path)) -> PathBuf {
+    os_copy(from, to);
+    edit(to);
+    to.to_path_buf()
+}
+
+/// The crash states one rename publish leaves, at each of its steps.
+fn ra_states(p: &RaPublish, root: &Path, n: usize) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    // A kill, or a power cut, after the directory fsync: what the watch
+    // copied, the rename made.
+    out.push((
+        ra_state(&p.at, &root.join(format!("s{n}-renamed")), |_| {}),
+        format!("publish {}: a kill after its rename", p.seq),
+    ));
+    // A kill with the temp written and fsynced, not renamed.
+    out.push((
+        ra_state(&p.at, &root.join(format!("s{n}-temp")), |d| {
+            std::fs::write(d.join("manifest"), &p.before).unwrap();
+            std::fs::write(d.join("manifest.tmp"), &p.now).unwrap();
+        }),
+        format!(
+            "publish {}: a kill with its temp written (manifest seq {:?} put back, {:?} in the \
+             temp, manifest.alt seq {:?})",
+            p.seq,
+            os_seq_of(&p.before),
+            os_seq_of(&p.now),
+            std::fs::read(p.at.join("manifest.alt"))
+                .ok()
+                .and_then(|b| os_seq_of(&b))
+        ),
+    ));
+    // A power cut before the directory fsync that keeps none of the
+    // entries made since the watch before: the rename lost, and every name
+    // made since with it.
+    out.push((
+        ra_state(&p.at, &root.join(format!("s{n}-cut")), |d| {
+            std::fs::write(d.join("manifest"), &p.before).unwrap();
+            for f in &p.new {
+                let _ = std::fs::remove_file(d.join(f));
+            }
+        }),
+        format!(
+            "publish {}: a power cut before its directory fsync, {:?} lost",
+            p.seq, p.new
+        ),
+    ));
+    out
+}
+
+/// What had been acknowledged when a publish was watched.
+type RaModel = BTreeMap<Vec<u8>, Vec<u8>>;
+
+/// A rename-shape store loaded, flushed and settled, then rounds of puts
+/// each flushed with the watch armed. The publishes watched, each with the
+/// model as it stood when its flush was asked for: every commit of it
+/// acknowledged before the publish's instant.
+fn ra_rounds(
+    tag: &str,
+    opts: &Options,
+    rounds: u32,
+) -> (PathBuf, PathBuf, Vec<(RaPublish, RaModel)>) {
+    ra_rounds_born(tag, None, opts, rounds)
+}
+
+/// `ra_rounds`, the store born under `born` where it is given -- the
+/// slots, with its newest manifest in `manifest.alt` where `alt` says so --
+/// and reopened under `opts` for the rounds watched: a store that ran under
+/// the slots and moved to the rename shape, its other slot file left.
+fn ra_rounds_born(
+    tag: &str,
+    born: Option<(&Options, bool)>,
+    opts: &Options,
+    rounds: u32,
+) -> (PathBuf, PathBuf, Vec<(RaPublish, RaModel)>) {
+    let d = dir(&format!("ra-{tag}"));
+    let root = dir(&format!("ra-{tag}-crashes"));
+    let mut db = Db::create(&d, born.map_or(opts, |b| b.0).clone()).unwrap();
+    let mut model = BTreeMap::new();
+    os_round(&mut db, &mut model, "r0", 0, OS_KEYS);
+    db.flush().unwrap();
+    db.settle().unwrap();
+    if let Some((_, alt)) = born {
+        ra_slots_life_ends_in(tag, &d, &mut db, &mut model, alt);
+        drop(db);
+        db = Db::open(&d, opts.clone()).unwrap();
+        db.settle().unwrap();
+    }
+    // Watched from the manifest the tracker reads: nothing lands between.
+    db.hold_seal_landing(true);
+    db.hold_merge_landing(true);
+    let t = RaTracker::new(&d, &root);
+    db.watch_slot_writes(Some(ra_watcher(t.clone())));
+    db.hold_seal_landing(false);
+    db.hold_merge_landing(false);
+    let mut pubs = Vec::new();
+    for r in 1..=rounds {
+        os_round(
+            &mut db,
+            &mut model,
+            &format!("r{r}"),
+            r * OS_KEYS,
+            OS_KEYS / 4,
+        );
+        RaTracker::arm(&t, true);
+        db.flush().unwrap();
+        RaTracker::arm(&t, false);
+        pubs.extend(RaTracker::take(&t).into_iter().map(|p| (p, model.clone())));
+        db.settle().unwrap();
+    }
+    db.watch_slot_writes(None);
+    drop(db);
+    (d, root, pubs)
+}
+
+/// (a) At every step of every publish of a rename-shape store -- the temp
+/// written, renamed, the directory fsynced or not -- a crash leaves a
+/// manifest whose every name is in the directory, with the log holding
+/// every write since.
+fn a_rename_publish_at_every_step(tag: &str, base: Options) {
+    let opts = ra_opts(&base);
+    let (d, root, pubs) = ra_rounds(&format!("steps-{tag}"), &opts, 4);
+    assert!(
+        pubs.len() >= 4,
+        "{tag}: premise: every flush published under the watch: {}",
+        pubs.len()
+    );
+    assert!(
+        pubs.iter().any(|(p, _)| !p.new.is_empty()),
+        "{tag}: premise: a publish named entries the watch before it had not seen"
+    );
+    let mut failures = Vec::new();
+    let mut states = 0usize;
+    for (n, (p, model)) in pubs.iter().enumerate() {
+        let built = ra_states(p, &root, n);
+        states += built.len();
+        failures.extend(os_check_all(&built, model, &opts));
+    }
+    assert!(
+        failures.is_empty(),
+        "{tag}: {} of {states} crash states lost acknowledged commits:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_rename_shape_publish_leaves_a_whole_manifest_at_every_step() {
+    a_rename_publish_at_every_step("plain", Options::default());
+}
+
+#[test]
+fn a_rename_shape_publish_leaves_a_whole_manifest_at_every_step_under_a_cipher() {
+    a_rename_publish_at_every_step("cipher", under_cipher());
+}
+
+/// The trace's directory fsyncs of `d` from `from` on.
+fn ra_dir_synced(d: &Path, from: usize) -> bool {
+    Db::trace_dir_io(true)
+        .split_off(from)
+        .iter()
+        .any(|(what, p)| *what == "sync_dir" && p.starts_with(d))
+}
+
+/// (c), and (e) where `reopen` is the other shape: a kill between a
+/// publish's rename and its directory fsync, an open under `reopen`,
+/// commits acknowledged, then a power cut that takes back the directory's
+/// entries no directory fsync covered -- the rename the killed process
+/// made, and its new names with it, unless the open fsynced the directory
+/// -- and keeps what the open removed, which nothing orders behind the
+/// rename. The store opens with every acknowledged write.
+fn a_kill_between_the_rename_and_its_dir_sync(tag: &str, base: Options, reopen: &Options) {
+    a_kill_between_the_rename_and_its_dir_sync_born(tag, base, None, reopen)
+}
+
+/// Rounds of a store under the slots until its newest manifest is in
+/// `manifest.alt` where `alt` says so, and in `manifest` where it does not.
+fn ra_slots_life_ends_in(
+    tag: &str,
+    d: &Path,
+    db: &mut Db,
+    model: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+    alt: bool,
+) {
+    let mut i = 0u32;
+    loop {
+        let s = OS_SLOTS.map(|f| std::fs::read(d.join(f)).ok().and_then(|b| os_seq_of(&b)));
+        if (s[1] > s[0]) == alt {
+            return;
+        }
+        i += 1;
+        assert!(
+            i < 8,
+            "{tag}: premise: the slots life's newest manifest in the slot asked"
+        );
+        os_round(
+            db,
+            model,
+            &format!("b{i}"),
+            (100 + i) * OS_KEYS,
+            OS_KEYS / 4,
+        );
+        db.flush().unwrap();
+        db.settle().unwrap();
+    }
+}
+
+/// (e) A store under the slots whose newest manifest is in `manifest.alt`,
+/// opened under the rename shape and killed at once, its landings held:
+/// opened under either shape, it is every acknowledged write. The rename
+/// open takes `manifest.alt` away, and the store's manifest is then the one
+/// it wrote as `manifest`, or no manifest names the store.
+fn a_kill_at_the_rename_open_of_an_alt_store(tag: &str, base: Options) {
+    let slots = os_opts(&base);
+    let rename = ra_opts(&base);
+    let d = dir(&format!("ra-altopen-{tag}"));
+    let mut db = Db::create(&d, slots.clone()).unwrap();
+    let mut model = BTreeMap::new();
+    os_round(&mut db, &mut model, "r0", 0, OS_KEYS);
+    db.flush().unwrap();
+    db.settle().unwrap();
+    ra_slots_life_ends_in(tag, &d, &mut db, &mut model, true);
+    drop(db);
+    let db = Db::open(&d, rename.clone()).unwrap();
+    db.hold_seal_landing(true);
+    db.hold_merge_landing(true);
+    let k = dir(&format!("ra-altopen-{tag}-killed"));
+    os_copy(&d, &k);
+    db.hold_seal_landing(false);
+    db.hold_merge_landing(false);
+    drop(db);
+    let mut states = Vec::new();
+    for (i, o) in ["the rename shape", "the slots"].into_iter().enumerate() {
+        let c = dir(&format!("ra-altopen-{tag}-killed-{i}"));
+        os_copy(&k, &c);
+        states.push((c, o, i));
+    }
+    let mut failures = Vec::new();
+    for (c, o, i) in &states {
+        let opts = if *i == 0 { &rename } else { &slots };
+        failures.extend(os_check_all(
+            &[(
+                c.clone(),
+                format!("{tag}: killed at its rename-shape open, reopened under {o}"),
+            )],
+            &model,
+            opts,
+        ));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    for (c, _, _) in &states {
+        let _ = std::fs::remove_dir_all(c);
+    }
+    let _ = std::fs::remove_dir_all(&k);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_store_moved_from_the_alt_slot_killed_at_its_rename_open_is_whole() {
+    a_kill_at_the_rename_open_of_an_alt_store("plain", Options::default());
+}
+
+#[test]
+fn a_store_moved_from_the_alt_slot_killed_at_its_rename_open_is_whole_under_a_cipher() {
+    a_kill_at_the_rename_open_of_an_alt_store("cipher", under_cipher());
+}
+
+/// The same, the store born under the slots and moved to the rename shape
+/// before the kill where `born` says so (`ra_rounds_born`): a store that
+/// goes slots, rename, slots, its `manifest.alt` from the first life.
+fn a_kill_between_the_rename_and_its_dir_sync_born(
+    tag: &str,
+    base: Options,
+    born: Option<bool>,
+    reopen: &Options,
+) {
+    ra_kill_and_reopen(tag, base, born, reopen, false)
+}
+
+/// The same, where `prefail` says so the open under `reopen` made first
+/// with its directory fsync failed (`Options::fail_open_dir_sync`): a slots
+/// open that made the slot file the rename life took away and never
+/// reached the fsync after it, as a kill between the two leaves it; the
+/// open after it finds both slot files there.
+fn ra_kill_and_reopen(
+    tag: &str,
+    base: Options,
+    born: Option<bool>,
+    reopen: &Options,
+    prefail: bool,
+) {
+    let opts = ra_opts(&base);
+    let reopen = Options {
+        encryption: base.encryption.clone(),
+        ..reopen.clone()
+    };
+    let slots = os_opts(&base);
+    let (d, root, pubs) = ra_rounds_born(
+        &format!("kill-{tag}"),
+        born.map(|alt| (&slots, alt)),
+        &opts,
+        4,
+    );
+    let mut reached = 0usize;
+    let mut failures = Vec::new();
+    for (n, (p, model)) in pubs.iter().enumerate() {
+        let x = ra_state(&p.at, &root.join(format!("k{n}")), |_| {});
+        let found = ra_names(&x);
+        let from = Db::trace_dir_io(true).len();
+        if prefail {
+            assert!(
+                !x.join("manifest.alt").exists(),
+                "{tag}: premise: the rename life took the slots' other file away"
+            );
+            let failing = Options {
+                fail_open_dir_sync: true,
+                ..reopen.clone()
+            };
+            match Db::open(&x, failing) {
+                Ok(_) => {
+                    failures.push(format!("publish {}: the failing open answered Ok", p.seq));
+                    continue;
+                }
+                Err(e) => assert!(
+                    e.to_string()
+                        .contains("a test failed the open's directory fsync"),
+                    "{tag}: publish {}: the open refused for another reason: {e}",
+                    p.seq
+                ),
+            }
+            assert!(
+                x.join("manifest.alt").exists(),
+                "{tag}: premise: the failed open left the slot file it made"
+            );
+        }
+        let mut db = match Db::open(&x, reopen.clone()) {
+            Ok(db) => db,
+            Err(e) => {
+                failures.push(format!("publish {}: the kill state refused: {e}", p.seq));
+                continue;
+            }
+        };
+        let removed: Vec<String> = found
+            .difference(&ra_names(&x))
+            .filter(|f| ra_entry(f))
+            .cloned()
+            .collect();
+        if !removed.is_empty() {
+            reached += 1;
+        }
+        let mut model = model.clone();
+        db.hold_seal_landing(true);
+        db.hold_merge_landing(true);
+        for i in 0..300u32 {
+            let k = format!("after-{n}-{i:04}").into_bytes();
+            let v = format!("v-{n}-{i}").into_bytes();
+            db.put(&k, &v);
+            model.insert(k, v);
+        }
+        db.commit().unwrap();
+        let y = root.join(format!("k{n}-cut"));
+        os_copy(&x, &y);
+        let synced = ra_dir_synced(&x, from);
+        std::mem::forget(db);
+        if !synced {
+            std::fs::write(y.join("manifest"), &p.before).unwrap();
+            for f in &p.new {
+                let _ = std::fs::remove_file(y.join(f));
+            }
+        }
+        let what = format!(
+            "publish {}: killed before its directory fsync, reopened (removed {removed:?}, \
+             directory fsynced: {synced}), then a power cut",
+            p.seq
+        );
+        failures.extend(os_check_all(&[(y, what)], &model, &reopen));
+        let _ = std::fs::remove_dir_all(&x);
+    }
+    assert!(
+        reached > 0,
+        "{tag}: premise: an open removed what the manifest it took stopped naming"
+    );
+    assert!(
+        failures.is_empty(),
+        "{tag}: {} of {} states lost acknowledged commits:\n{}",
+        failures.len(),
+        pubs.len(),
+        failures.join("\n")
+    );
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_kill_between_a_rename_and_its_directory_fsync_survives_a_power_cut_after_the_reopen() {
+    let r = ra_opts(&Options::default());
+    a_kill_between_the_rename_and_its_dir_sync("plain", Options::default(), &r);
+}
+
+#[test]
+fn a_kill_between_a_rename_and_its_directory_fsync_survives_a_power_cut_under_a_cipher() {
+    let r = ra_opts(&Options::default());
+    a_kill_between_the_rename_and_its_dir_sync("cipher", under_cipher(), &r);
+}
+
+/// (e) The same kill, the store reopened under the slots.
+#[test]
+fn a_rename_shape_store_killed_before_its_directory_fsync_reopens_under_the_slots() {
+    let s = os_opts(&Options::default());
+    a_kill_between_the_rename_and_its_dir_sync("to-slots", Options::default(), &s);
+}
+
+#[test]
+fn a_rename_shape_store_killed_before_its_directory_fsync_reopens_under_the_slots_cipher() {
+    let s = os_opts(&Options::default());
+    a_kill_between_the_rename_and_its_dir_sync("to-slots-cipher", under_cipher(), &s);
+}
+
+/// (e) The slots open of a store that went slots, rename, slots, killed in
+/// its rename life between a rename and its directory fsync: the fsync the
+/// open makes for the slot file the rename life took away fails
+/// (`Options::fail_open_dir_sync`), and the open answers it having removed
+/// nothing -- under a cipher, no envelope the renamed manifest stopped
+/// naming swept before that fsync.
+fn a_crossing_slots_open_whose_dir_sync_fails(tag: &str, base: Options) {
+    let opts = ra_opts(&base);
+    let slots = os_opts(&base);
+    let reopen = Options {
+        fail_open_dir_sync: true,
+        ..slots.clone()
+    };
+    let (d, root, pubs) = ra_rounds_born(&format!("xfail-{tag}"), Some((&slots, false)), &opts, 4);
+    let mut reached = 0usize;
+    for (n, (p, _)) in pubs.iter().enumerate() {
+        let x = ra_state(&p.at, &root.join(format!("x{n}")), |_| {});
+        assert!(
+            !x.join("manifest.alt").exists(),
+            "{tag}: premise: the rename life took the slots' other file away"
+        );
+        let found = ra_names(&x);
+        let from = Db::trace_dir_io(true).len();
+        let e = match Db::open(&x, reopen.clone()) {
+            Ok(_) => panic!("{tag}: publish {}: the open answered no failure", p.seq),
+            Err(e) => e.to_string(),
+        };
+        // The seam stands in for the fsync after the slot file is made, so
+        // the one directory fsync the failed open made is the one before
+        // the file was made.
+        let calls: Vec<(&str, PathBuf)> = Db::trace_dir_io(true)
+            .split_off(from)
+            .into_iter()
+            .filter(|(_, q)| q.starts_with(&x))
+            .collect();
+        let syncs: Vec<usize> = (0..calls.len())
+            .filter(|&i| calls[i].0 == "sync_dir")
+            .collect();
+        let made = calls
+            .iter()
+            .position(|(what, q)| *what == "open_slot" && q.ends_with("manifest.alt"));
+        assert!(
+            syncs.len() == 1 && made.is_some_and(|m| syncs[0] < m),
+            "{tag}: publish {}: the failed open's directory fsync before it made the slot \
+             file, and none after: {calls:?}",
+            p.seq
+        );
+        assert!(
+            e.contains("a test failed the open's directory fsync"),
+            "{tag}: publish {}: the open refused for another reason: {e}",
+            p.seq
+        );
+        let gone: Vec<String> = found
+            .difference(&ra_names(&x))
+            .filter(|f| ra_entry(f))
+            .cloned()
+            .collect();
+        assert!(
+            gone.is_empty(),
+            "{tag}: publish {}: removed before the directory fsync: {gone:?}",
+            p.seq
+        );
+        if Db::open(&x, slots.clone()).is_ok() {
+            reached += 1;
+        }
+        let _ = std::fs::remove_dir_all(&x);
+    }
+    assert!(
+        reached > 0,
+        "{tag}: premise: the states open without the failure"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_crossing_slots_open_whose_directory_fsync_fails_removes_nothing() {
+    a_crossing_slots_open_whose_dir_sync_fails("plain", Options::default());
+}
+
+#[test]
+fn a_crossing_slots_open_whose_directory_fsync_fails_removes_nothing_under_a_cipher() {
+    a_crossing_slots_open_whose_dir_sync_fails("cipher", under_cipher());
+}
+
+/// (e) Both ways in one store: born under the slots, moved to the rename
+/// shape -- its newest manifest in `manifest` and, the second pair, in
+/// `manifest.alt` when it moved -- killed between a rename and its
+/// directory fsync, reopened under the slots, commits acknowledged, then a
+/// power cut. The slot file the first life left is the slots open's reason
+/// to make none and fsync no directory, unless the rename life took it away.
+#[test]
+fn a_store_moved_slots_rename_slots_killed_before_a_directory_fsync_survives_a_power_cut() {
+    let s = os_opts(&Options::default());
+    a_kill_between_the_rename_and_its_dir_sync_born("srs", Options::default(), Some(false), &s);
+}
+
+#[test]
+fn a_store_moved_slots_rename_slots_killed_before_a_directory_fsync_survives_under_a_cipher() {
+    let s = os_opts(&Options::default());
+    a_kill_between_the_rename_and_its_dir_sync_born("srs-cipher", under_cipher(), Some(false), &s);
+}
+
+/// (e) The slots open of a store that went slots, rename, slots, killed in
+/// its rename life between a rename and its directory fsync, whose first
+/// slots open made the slot file the rename life took away and failed its
+/// directory fsync: the slots open after it finds both files, and the
+/// rename life's renames are durable before it removes what they stopped
+/// naming, commits acknowledged and a power cut after.
+#[test]
+fn a_slots_open_after_a_crossing_open_that_failed_survives_a_power_cut() {
+    let s = os_opts(&Options::default());
+    ra_kill_and_reopen("srsf", Options::default(), Some(false), &s, true);
+}
+
+#[test]
+fn a_slots_open_after_a_crossing_open_that_failed_survives_a_power_cut_under_a_cipher() {
+    let s = os_opts(&Options::default());
+    ra_kill_and_reopen("srsf-cipher", under_cipher(), Some(false), &s, true);
+}
+
+#[test]
+fn a_store_moved_from_the_alt_slot_killed_before_a_directory_fsync_survives_a_power_cut() {
+    let s = os_opts(&Options::default());
+    a_kill_between_the_rename_and_its_dir_sync_born("srs-alt", Options::default(), Some(true), &s);
+}
+
+#[test]
+fn a_store_moved_from_the_alt_slot_killed_before_a_directory_fsync_survives_under_a_cipher() {
+    let s = os_opts(&Options::default());
+    a_kill_between_the_rename_and_its_dir_sync_born(
+        "srs-alt-cipher",
+        under_cipher(),
+        Some(true),
+        &s,
+    );
+}
+
+/// The open's directory fsync under the rename shape fails
+/// (`Options::fail_open_dir_sync`): the open answers the failure, having
+/// removed nothing, over a state in which it would have removed what the
+/// manifest it took stopped naming.
+fn an_open_whose_dir_sync_fails(tag: &str, base: Options) {
+    let opts = ra_opts(&base);
+    let (d, root, pubs) = ra_rounds(&format!("dirfail-{tag}"), &opts, 4);
+    let mut reached = false;
+    for (n, (p, _)) in pubs.iter().enumerate() {
+        // Which states the open removes in, read off an open that succeeds.
+        let probe = ra_state(&p.at, &root.join(format!("p{n}")), |_| {});
+        let found = ra_names(&probe);
+        drop(Db::open(&probe, opts.clone()).expect("the kill state opens"));
+        let removes = found.difference(&ra_names(&probe)).any(|f| ra_entry(f));
+        let _ = std::fs::remove_dir_all(&probe);
+        if !removes {
+            continue;
+        }
+        reached = true;
+        let x = ra_state(&p.at, &root.join(format!("f{n}")), |_| {});
+        let before = os_files(&x);
+        let failing = Options {
+            fail_open_dir_sync: true,
+            ..opts.clone()
+        };
+        match Db::open(&x, failing) {
+            Ok(_) => panic!(
+                "{tag}: publish {}: the open answered Ok over a failed directory fsync",
+                p.seq
+            ),
+            Err(e) => assert!(
+                e.to_string().contains("directory fsync"),
+                "{tag}: publish {}: the open refused for another reason: {e}",
+                p.seq
+            ),
+        }
+        let changed = osl_changed(&before, &x);
+        assert!(
+            changed.is_empty(),
+            "{tag}: publish {}: the open whose directory fsync failed changed {changed:?}",
+            p.seq
+        );
+        let _ = std::fs::remove_dir_all(&x);
+        break;
+    }
+    assert!(reached, "{tag}: premise: an open that removes was built");
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_open_under_the_rename_shape_whose_directory_fsync_fails_removes_nothing() {
+    an_open_whose_dir_sync_fails("plain", Options::default());
+}
+
+#[test]
+fn an_open_under_the_rename_shape_whose_directory_fsync_fails_removes_nothing_under_a_cipher() {
+    an_open_whose_dir_sync_fails("cipher", under_cipher());
+}
+
+/// (b) A seal's landing whose publish fails at the directory fsync after
+/// its rename (`Db::fail_next_seal_dir_sync`, which under the rename shape
+/// fails the publish's): the seal's segments' names and the manifest's
+/// rename are what that fsync was for, and a later fsync that returns does
+/// not make them durable. Nothing names the seal durable afterwards and no
+/// log retires: every flush answers the failure, the manifest is the one
+/// the failed publish left, and every log file is still there. A power cut
+/// then loses the failed fsync's entries -- and keeps what a later
+/// directory fsync that returned covered -- and the store opens with every
+/// acknowledged commit.
+fn a_failed_publish_dir_sync(tag: &str, base: Options) {
+    let opts = Options {
+        compact: false,
+        ..ra_opts(&base)
+    };
+    let d = dir(&format!("ra-pubfail-{tag}"));
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model = BTreeMap::new();
+    os_round(&mut db, &mut model, "r0", 0, OS_KEYS / 2);
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let old = std::fs::read(d.join("manifest")).unwrap();
+    let names0 = ra_names(&d);
+    os_round(&mut db, &mut model, "r1", OS_KEYS, OS_KEYS / 4);
+    db.fail_next_seal_dir_sync();
+    let first = db.flush();
+    assert!(
+        !db.seal_sync_fault_pending(),
+        "{tag}: premise: the publish's directory fsync was failed"
+    );
+    let failed = std::fs::read(d.join("manifest")).unwrap();
+    let failed_seq = os_seq_of(&failed);
+    assert!(
+        failed_seq > os_seq_of(&old),
+        "{tag}: premise: the failed publish renamed its manifest into place"
+    );
+    let new: Vec<String> = ra_names(&d)
+        .difference(&names0)
+        .filter(|f| ra_entry(f))
+        .cloned()
+        .collect();
+    assert!(
+        !new.is_empty(),
+        "{tag}: premise: the seal made entries only the failed fsync covered"
+    );
+    let wals: Vec<String> = ra_names(&d)
+        .into_iter()
+        .filter(|n| n.starts_with("wal-"))
+        .collect();
+    // More acknowledged commits, a flush, and a settle: the landing after
+    // the failure, if any lands.
+    os_round(&mut db, &mut model, "r2", 2 * OS_KEYS, OS_KEYS / 8);
+    let second = db.flush();
+    let settled = db.settle();
+    let now = std::fs::read(d.join("manifest")).unwrap();
+    let left = ra_names(&d);
+    // The power cut.
+    let cut = dir(&format!("ra-pubfail-{tag}-cut"));
+    os_copy(&d, &cut);
+    std::mem::forget(db);
+    if os_seq_of(&now) == failed_seq {
+        std::fs::write(cut.join("manifest"), &old).unwrap();
+    }
+    for f in &new {
+        let _ = std::fs::remove_file(cut.join(f));
+    }
+    let what = format!(
+        "{tag}: a power cut after a failed publish directory fsync (first flush {first:?}, \
+         second {second:?}, settle {settled:?}; manifest seq {:?} after the failure, {:?} at \
+         the cut; lost {new:?})",
+        failed_seq,
+        os_seq_of(&now)
+    );
+    let failures = os_check_all(&[(cut.clone(), what.clone())], &model, &opts);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(first.is_err(), "{what}: the flush answers the failure");
+    assert!(
+        second.is_err(),
+        "{what}: the flush after the failure answers it"
+    );
+    assert_eq!(
+        os_seq_of(&now),
+        failed_seq,
+        "{what}: no manifest was written after the failure"
+    );
+    let gone: Vec<&String> = wals.iter().filter(|w| !left.contains(*w)).collect();
+    assert!(
+        gone.is_empty(),
+        "{what}: no log retired after the failure: {gone:?} went"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&cut);
+}
+
+#[test]
+fn a_rename_publish_whose_directory_fsync_fails_names_nothing_durable_after() {
+    a_failed_publish_dir_sync("plain", Options::default());
+}
+
+#[test]
+fn a_rename_publish_whose_directory_fsync_fails_names_nothing_durable_after_under_a_cipher() {
+    a_failed_publish_dir_sync("cipher", under_cipher());
+}
+
+/// (b) A rename publish that fails before its rename -- its temp name taken
+/// by a directory, so the temp cannot be made, as a device refusing the
+/// write would leave it -- stops the seal queue as one that fails after its
+/// rename does: every flush after it answers the failure, with the temp
+/// name free again, until a reopen, which finds every acknowledged commit.
+fn a_failed_publish_temp(tag: &str, base: Options) {
+    let opts = Options {
+        compact: false,
+        ..ra_opts(&base)
+    };
+    let d = dir(&format!("ra-pubtemp-{tag}"));
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model = BTreeMap::new();
+    os_round(&mut db, &mut model, "r0", 0, OS_KEYS / 2);
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let old = std::fs::read(d.join("manifest")).unwrap();
+    os_round(&mut db, &mut model, "r1", OS_KEYS, OS_KEYS / 4);
+    std::fs::create_dir(d.join("manifest.tmp")).unwrap();
+    let first = db.flush();
+    assert!(
+        first.is_err(),
+        "{tag}: premise: the publish failed at its temp"
+    );
+    std::fs::remove_dir(d.join("manifest.tmp")).unwrap();
+    assert_eq!(
+        std::fs::read(d.join("manifest")).unwrap(),
+        old,
+        "{tag}: premise: the failed publish renamed nothing"
+    );
+    for i in 0..100u32 {
+        let k = format!("after-{i:04}").into_bytes();
+        let v = format!("w-{i}").into_bytes();
+        db.put(&k, &v);
+        model.insert(k, v);
+    }
+    db.commit().unwrap();
+    let second = db.flush();
+    let settled = db.settle();
+    assert!(
+        second.is_err() && settled.is_err(),
+        "{tag}: the flush and the settle after a publish that failed at its temp answer it \
+         (flush {second:?}, settle {settled:?})"
+    );
+    assert_eq!(
+        std::fs::read(d.join("manifest")).unwrap(),
+        old,
+        "{tag}: no manifest was written after the failure"
+    );
+    drop(db);
+    let failures = os_check_all(
+        &[(
+            d.clone(),
+            format!("{tag}: reopened after a publish failed at its temp"),
+        )],
+        &model,
+        &opts,
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_rename_publish_that_fails_before_its_rename_stops_the_seal_queue() {
+    a_failed_publish_temp("plain", Options::default());
+}
+
+#[test]
+fn a_rename_publish_that_fails_before_its_rename_stops_the_seal_queue_under_a_cipher() {
+    a_failed_publish_temp("cipher", under_cipher());
+}
+
+/// (d) A store written under `manifest_pending`, killed with its newest
+/// slot naming a seal's segments pending -- whole in the page cache, synced
+/// by nobody -- and reopened under the rename shape: the open takes the
+/// pending names, more commits are acknowledged, and a flush's publish then
+/// names the segments durable and retires the log that held their writes.
+/// A power cut leaves a pending segment torn unless an fsync covered it,
+/// and the store opens with every acknowledged commit.
+fn a_pending_store_reopened_under_the_rename_shape(tag: &str, base: Options) {
+    a_pending_store_reopened_under_the_rename_shape_as(tag, base, true)
+}
+
+/// The same, the rename-shape reopen made with `manifest_pending` as
+/// `reopen_pending` says: the pending names the open takes are the slot's,
+/// whatever the reopening options ask.
+fn a_pending_store_reopened_under_the_rename_shape_as(
+    tag: &str,
+    base: Options,
+    reopen_pending: bool,
+) {
+    let d = dir(&format!("ra-pend-{tag}"));
+    // No merge, so the flush after the reopen leaves the pending segment
+    // standing beside its own piece rather than rewriting it into a
+    // partition whose fsync would cover it.
+    let opts = Options {
+        manifest_pending: true,
+        direct_ingest: false,
+        compact: false,
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(64 << 10),
+        l0_trigger: 1000,
+        ..base
+    };
+    let cipher = opts.encryption.clone();
+    let rename = Options {
+        manifest_slots: false,
+        manifest_pending: reopen_pending,
+        encryption: cipher,
+        ..opts.clone()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    for k in (0..3000).rev() {
+        db.put(key(k).as_bytes(), b"v");
+        model.insert(key(k).into_bytes(), vec![b"v".to_vec()]);
+    }
+    db.commit().unwrap();
+    let names0 = ra_names(&d);
+    db.hold_seal_durable(true);
+    db.seal().unwrap();
+    let plain = matches!(opts.encryption, Encryption::None);
+    let pending = || -> Vec<String> {
+        let b = std::fs::read(&oo_by_age(&d)[0]).unwrap();
+        if !b.starts_with(b"SUPDBMAN") {
+            return Vec::new();
+        }
+        oo_names(&b)
+            .1
+            .into_iter()
+            .filter(|(_, p)| *p)
+            .map(|(n, _)| n)
+            .collect()
+    };
+    let newest_seq = || {
+        std::fs::read(&oo_by_age(&d)[0])
+            .ok()
+            .and_then(|b| oo_seq(&b))
+    };
+    let seq0 = newest_seq();
+    if plain {
+        wait_for("the seal's pending slot", || !pending().is_empty());
+    } else {
+        wait_for("the seal's pending slot", || newest_seq() > seq0);
+    }
+    // The kill: the seal thread parked before its fsync for good, and the
+    // store's files as it left them copied, since a store under a cipher
+    // stays open in this process while its writer is.
+    std::mem::forget(db);
+    let held = d;
+    let d = dir(&format!("ra-pend-{tag}-killed"));
+    os_copy(&held, &d);
+    let made: Vec<String> = ra_names(&d)
+        .difference(&names0)
+        .filter(|f| ra_entry(f))
+        .cloned()
+        .collect();
+    assert!(!made.is_empty(), "{tag}: premise: the seal made its files");
+    for f in &made {
+        oo_dirty(&d.join(f));
+    }
+    let from = Db::trace_dir_io(true).len();
+    let mut db = Db::open(&d, rename.clone()).unwrap();
+    let calls = Db::trace_dir_io(true).split_off(from);
+    let synced: Vec<PathBuf> = calls
+        .iter()
+        .filter(|(what, p)| *what == "sync_file" && p.parent() == Some(d.as_path()))
+        .map(|(_, p)| p.clone())
+        .collect();
+    oo_holds(&db, &model, &format!("{tag}: after the kill"));
+    // The open's record of what it fsynced, held to the calls: the
+    // directory and every pending file it synced.
+    let word = db.open_synced_files();
+    assert!(
+        calls
+            .iter()
+            .any(|(what, p)| *what == "sync_dir" && p.starts_with(&d)),
+        "{tag}: the rename open fsynced the directory"
+    );
+    for f in synced
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .chain(std::iter::once(".".to_string()))
+    {
+        assert!(
+            word.contains(&f),
+            "{tag}: the open's record holds its fsync of {f}: {word:?}"
+        );
+    }
+    for i in 0..500u32 {
+        let k = format!("after-{i:04}").into_bytes();
+        db.put(&k, b"w");
+        model.insert(k, vec![b"w".to_vec()]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    std::mem::forget(db);
+    let reopened = d;
+    let d = dir(&format!("ra-pend-{tag}-cut"));
+    os_copy(&reopened, &d);
+    let synced: Vec<PathBuf> = synced
+        .iter()
+        .map(|p| d.join(p.file_name().unwrap()))
+        .collect();
+    // The power cut: a file the seal made that no fsync covered comes back
+    // torn. Under a cipher the seal's envelope was written and synced
+    // before the slot that named it pending, so nothing of it is torn.
+    if plain {
+        for f in &made {
+            if !synced.contains(&d.join(f)) && d.join(f).exists() {
+                oo_tear(&d.join(f), OoTear::Run);
+            }
+        }
+    }
+    let state = format!(
+        "{tag}: a power cut after the rename-shape reopen of a pending store (the seal made \
+         {made:?}; the open fsynced {synced:?})"
+    );
+    let db = Db::open(&d, rename)
+        .unwrap_or_else(|e| panic!("{state}: the store refused its acknowledged commits: {e}"));
+    oo_holds(&db, &model, &state);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&reopened);
+    let _ = std::fs::remove_dir_all(&held);
+}
+
+#[test]
+fn a_pending_store_reopened_under_the_rename_shape_survives_a_power_cut() {
+    a_pending_store_reopened_under_the_rename_shape("plain", Options::default());
+}
+
+#[test]
+fn a_pending_store_reopened_under_the_rename_shape_without_the_option_survives_a_power_cut() {
+    a_pending_store_reopened_under_the_rename_shape_as("plain-off", Options::default(), false);
+}
+
+#[test]
+fn a_pending_store_reopened_under_the_rename_shape_without_the_option_under_a_cipher() {
+    a_pending_store_reopened_under_the_rename_shape_as("cipher-off", under_cipher(), false);
+}
+
+/// Under a cipher a pending seal's envelope is written and synced before
+/// the slot that names it (`manifest_image`), so the reopen has nothing to
+/// make durable; the same states hold.
+#[test]
+fn a_pending_store_reopened_under_the_rename_shape_survives_a_power_cut_under_a_cipher() {
+    a_pending_store_reopened_under_the_rename_shape("cipher", under_cipher());
+}
+
+/// (e) The other way: a store under the slots killed with a drain's slot
+/// owed its fdatasync, reopened under the rename shape, commits
+/// acknowledged, then a power cut that keeps of each slot file what an
+/// fsync covered -- the open's own, read off the calls -- and the device's
+/// bytes otherwise; then the reopened store's rename publishes, each step's
+/// crash states built.
+fn a_slots_store_reopened_under_the_rename_shape(tag: &str, base: Options) {
+    let opts = os_opts(&base);
+    let rename = ra_opts(&base);
+    let (d, mut db, mut model, t) = os_start(&format!("ra-from-slots-{tag}"), &opts);
+    for r in 1..=6u32 {
+        os_round(&mut db, &mut model, &format!("r{r}"), r * OS_KEYS, OS_KEYS);
+        OsTracker::arm(&t, true);
+        db.flush().unwrap();
+        OsTracker::arm(&t, false);
+        db.settle().unwrap();
+        if !t.lock().unwrap().kills.is_empty() {
+            break;
+        }
+    }
+    db.watch_slot_writes(None);
+    drop(db);
+    let mut t = OsTracker::taken(t);
+    assert!(
+        !t.kills.is_empty(),
+        "{tag}: premise: a kill with a drain's slot owed was built"
+    );
+    let (kill, device, _) = t.kills.remove(0);
+    let from = Db::trace_dir_io(true).len();
+    let mut db = Db::open(&kill, rename.clone()).expect("the kill state opens");
+    let synced: Vec<PathBuf> = Db::trace_dir_io(true)
+        .split_off(from)
+        .into_iter()
+        .filter(|(what, _)| *what == "sync_slot")
+        .map(|(_, p)| p)
+        .collect();
+    db.hold_seal_landing(true);
+    db.hold_merge_landing(true);
+    for i in 0..300u32 {
+        let k = format!("after-{i:04}").into_bytes();
+        let v = format!("w-{i}").into_bytes();
+        db.put(&k, &v);
+        model.insert(k, v);
+    }
+    db.commit().unwrap();
+    let cut = kill.with_file_name(format!(
+        "{}-cut",
+        kill.file_name().unwrap().to_str().unwrap()
+    ));
+    os_copy(&kill, &cut);
+    // The reopened store's publishes watched from the manifest the tracker
+    // reads, before the landings held since the copy are let go.
+    let root2 = kill.with_file_name(format!(
+        "{}-renamed",
+        kill.file_name().unwrap().to_str().unwrap()
+    ));
+    let t2 = RaTracker::new(&kill, &root2);
+    db.watch_slot_writes(Some(ra_watcher(t2.clone())));
+    db.hold_seal_landing(false);
+    db.hold_merge_landing(false);
+    for (j, s) in OS_SLOTS.iter().enumerate() {
+        if !synced.contains(&kill.join(s)) {
+            std::fs::write(cut.join(s), &device[j]).unwrap();
+        }
+    }
+    let failures = os_check_all(
+        &[(
+            cut,
+            format!("{tag}: a power cut after the rename-shape reopen of an owed slot"),
+        )],
+        &model,
+        &rename,
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    // The reopened store's first rename publishes, at every step.
+    os_round(&mut db, &mut model, "after-reopen", 60 * OS_KEYS, 2000);
+    RaTracker::arm(&t2, true);
+    db.flush().unwrap();
+    RaTracker::arm(&t2, false);
+    let pubs = RaTracker::take(&t2);
+    db.settle().unwrap();
+    db.watch_slot_writes(None);
+    drop(db);
+    assert!(
+        !pubs.is_empty(),
+        "{tag}: premise: the reopened store published"
+    );
+    let mut states = Vec::new();
+    for (n, p) in pubs.iter().enumerate() {
+        states.extend(ra_states(p, &root2, n));
+    }
+    let failures = os_check_all(&states, &model, &rename);
+    assert!(
+        failures.is_empty(),
+        "{tag}: {} of {} crash states lost acknowledged commits:\n{}",
+        failures.len(),
+        states.len(),
+        failures.join("\n")
+    );
+    for (p, _) in &t.crashes {
+        let _ = std::fs::remove_dir_all(p);
+    }
+    for (p, _, _) in &t.kills {
+        let _ = std::fs::remove_dir_all(p);
+    }
+    let _ = std::fs::remove_dir_all(&kill);
+    let _ = std::fs::remove_dir_all(&root2);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&t.root);
+}
+
+#[test]
+fn a_slots_store_killed_over_an_owed_slot_reopens_under_the_rename_shape() {
+    a_slots_store_reopened_under_the_rename_shape("plain", Options::default());
+}
+
+#[test]
+fn a_slots_store_killed_over_an_owed_slot_reopens_under_the_rename_shape_under_a_cipher() {
+    a_slots_store_reopened_under_the_rename_shape("cipher", under_cipher());
+}
+
+/// (f) The open's refusals under the rename shape say which file they read:
+/// `manifest` for a store born under the shape, and `manifest.alt` where a
+/// store moved from the slots has its newest manifest there; and a store
+/// whose only manifest is gone beside partitions is refused as one.
+#[test]
+fn an_open_under_the_rename_shape_refuses_by_the_manifest_file_it_read() {
+    let rename = ra_opts(&Options::default());
+    let slots = os_opts(&Options::default());
+    // Born under the rename shape.
+    let d = dir("ra-refuse-born");
+    let mut db = Db::create(&d, rename.clone()).unwrap();
+    let mut model = BTreeMap::new();
+    os_round(&mut db, &mut model, "r0", 0, OS_KEYS);
+    db.flush().unwrap();
+    db.settle().unwrap();
+    drop(db);
+    let named = oo_names(&std::fs::read(d.join("manifest")).unwrap()).1;
+    let seg = &named.first().expect("a segment named").0;
+    let kept = std::fs::read(d.join(seg)).unwrap();
+    std::fs::remove_file(d.join(seg)).unwrap();
+    oo_refused(
+        &d,
+        &rename,
+        &format!("the manifest slot manifest names {seg}, which is missing"),
+        "born under the rename shape",
+    );
+    std::fs::write(d.join(seg), &kept).unwrap();
+    // Its only manifest gone, beside partitions.
+    let m = std::fs::read(d.join("manifest")).unwrap();
+    std::fs::write(d.join("manifest"), b"").unwrap();
+    oo_refused(
+        &d,
+        &rename,
+        "no manifest slot can be read",
+        "the rename shape's manifest emptied",
+    );
+    std::fs::write(d.join("manifest"), &m).unwrap();
+    drop(Db::open(&d, rename.clone()).expect("the store opens again"));
+    let _ = std::fs::remove_dir_all(&d);
+    // Moved from the slots, its newest manifest in `manifest.alt`.
+    let d = dir("ra-refuse-moved");
+    let mut db = Db::create(&d, slots.clone()).unwrap();
+    let mut r = 0u32;
+    loop {
+        os_round(
+            &mut db,
+            &mut model,
+            &format!("m{r}"),
+            r * OS_KEYS,
+            OS_KEYS / 4,
+        );
+        db.flush().unwrap();
+        db.settle().unwrap();
+        r += 1;
+        let [newest, _] = oo_by_age(&d);
+        if newest.ends_with("manifest.alt") {
+            break;
+        }
+        assert!(r < 20, "premise: the newest slot came to be manifest.alt");
+    }
+    drop(db);
+    let named = oo_names(&std::fs::read(d.join("manifest.alt")).unwrap()).1;
+    let seg = &named.first().expect("a segment named").0;
+    std::fs::remove_file(d.join(seg)).unwrap();
+    oo_refused(
+        &d,
+        &rename,
+        &format!("the manifest slot manifest.alt names {seg}, which is missing"),
+        "moved from the slots",
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// (a), read off the calls: a rename publish fsyncs the directory after its
+/// rename and before the flush it lands for is answered, so the names it
+/// made are on the device before anything retires behind them. Read where
+/// nothing else fsyncs the directory between the publish's rename and the
+/// flush's answer: no merges, and no log rotation inside the flush.
+fn a_rename_publish_syncs_its_directory(tag: &str, base: Options) {
+    let opts = Options {
+        compact: false,
+        ..ra_opts(&base)
+    };
+    let d = dir(&format!("ra-pubsync-{tag}"));
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model = BTreeMap::new();
+    os_round(&mut db, &mut model, "r0", 0, OS_KEYS / 4);
+    db.flush().unwrap();
+    db.settle().unwrap();
+    type At = std::sync::Arc<std::sync::Mutex<Vec<usize>>>;
+    let at: At = Default::default();
+    let watch: supdb::db::SlotWatch = {
+        let at = at.clone();
+        std::sync::Arc::new(move |_: &supdb::db::SlotWrite| {
+            let n = Db::trace_dir_io(true).len();
+            at.lock().unwrap_or_else(|e| e.into_inner()).push(n);
+        })
+    };
+    db.watch_slot_writes(Some(watch));
+    for r in 1..=3u32 {
+        os_round(
+            &mut db,
+            &mut model,
+            &format!("r{r}"),
+            r * OS_KEYS,
+            OS_KEYS / 8,
+        );
+        let before = at.lock().unwrap().len();
+        db.flush().unwrap();
+        let marks: Vec<usize> = at.lock().unwrap()[before..].to_vec();
+        assert!(
+            !marks.is_empty(),
+            "{tag}: round {r}: premise: the flush published"
+        );
+        let trace = Db::trace_dir_io(true);
+        for (i, &m) in marks.iter().enumerate() {
+            let end = marks.get(i + 1).copied().unwrap_or(trace.len());
+            assert!(
+                trace[m..end]
+                    .iter()
+                    .any(|(what, p)| *what == "sync_dir" && p.starts_with(&d)),
+                "{tag}: round {r}: publish {i} of the flush fsynced the directory after its \
+                 rename and before the next publish or the flush's answer"
+            );
+        }
+        db.settle().unwrap();
+    }
+    db.watch_slot_writes(None);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_rename_publish_fsyncs_the_directory_before_its_flush_is_answered() {
+    a_rename_publish_syncs_its_directory("plain", Options::default());
+}
+
+#[test]
+fn a_rename_publish_fsyncs_the_directory_before_its_flush_is_answered_under_a_cipher() {
+    a_rename_publish_syncs_its_directory("cipher", under_cipher());
+}
+
+/// (e) The rename open's removal of the slot file a life under the slots
+/// left fails (`Options::fail_open_alt_removal`), as a device error would:
+/// the open answers it, since a store that went on with `manifest.alt`
+/// there would leave a later open under the slots nothing to make and no
+/// directory to fsync before it removes what this life's renames stopped
+/// naming. Nothing else is removed before it: a spare and an envelope's
+/// temp name left in the directory, each a file the open removes once it
+/// goes on, are there after the failure. Where the slot it took was
+/// `manifest` nothing has changed; where it took `manifest.alt`, that is
+/// written as `manifest` first and nothing else has changed. Either way
+/// the store opens after, under either shape, with every write.
+fn a_rename_open_whose_alt_removal_fails(tag: &str, base: Options) {
+    let slots = os_opts(&base);
+    let rename = ra_opts(&base);
+    let failing = Options {
+        fail_open_alt_removal: true,
+        ..rename.clone()
+    };
+    for alt in [false, true] {
+        let d = dir(&format!("ra-altrm-{tag}-{alt}"));
+        let mut db = Db::create(&d, slots.clone()).unwrap();
+        let mut model = BTreeMap::new();
+        os_round(&mut db, &mut model, "r0", 0, OS_KEYS);
+        db.flush().unwrap();
+        db.settle().unwrap();
+        ra_slots_life_ends_in(tag, &d, &mut db, &mut model, alt);
+        drop(db);
+        assert!(
+            d.join("manifest.alt").exists(),
+            "{tag}: premise: the slots life left manifest.alt"
+        );
+        // What an open that goes on removes: a spare past the pool
+        // (`recycle_wal` is off) and an envelope's temp name, which the
+        // cipher's sweep takes.
+        let planted = ["spare-0000000000009999", "x-0000000000000000.z.tmp"];
+        for p in planted {
+            std::fs::write(d.join(p), vec![0u8; 4096]).unwrap();
+        }
+        let probe = dir(&format!("ra-altrm-{tag}-{alt}-probe"));
+        os_copy(&d, &probe);
+        drop(Db::open(&probe, rename.clone()).expect("the state opens"));
+        let gone: Vec<&str> = planted
+            .iter()
+            .copied()
+            .filter(|p| !probe.join(p).exists())
+            .collect();
+        assert!(
+            !gone.is_empty(),
+            "{tag} (alt {alt}): premise: an open that goes on removes a planted file"
+        );
+        let _ = std::fs::remove_dir_all(&probe);
+        let found = os_files(&d);
+        let e = match Db::open(&d, failing.clone()) {
+            Ok(_) => panic!("{tag} (alt {alt}): the open answered no failure"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            e.contains("a test failed the open's removal of manifest.alt"),
+            "{tag} (alt {alt}): the open refused for another reason: {e}"
+        );
+        let changed = osl_changed(&found, &d);
+        let allowed: &[&str] = if alt { &["manifest"] } else { &[] };
+        assert!(
+            changed.iter().all(|f| allowed.contains(&f.as_str())),
+            "{tag} (alt {alt}): the open changed the directory before its failure: {changed:?}"
+        );
+        assert!(
+            d.join("manifest.alt").exists(),
+            "{tag} (alt {alt}): premise: the removal failed"
+        );
+        let mut failures = Vec::new();
+        for (i, (o, what)) in [(&rename, "the rename shape"), (&slots, "the slots")]
+            .into_iter()
+            .enumerate()
+        {
+            let c = dir(&format!("ra-altrm-{tag}-{alt}-{i}"));
+            os_copy(&d, &c);
+            failures.extend(os_check_all(
+                &[(
+                    c.clone(),
+                    format!("{tag} (alt {alt}): after a failed removal, opened under {what}"),
+                )],
+                &model,
+                o,
+            ));
+            let _ = std::fs::remove_dir_all(&c);
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[test]
+fn a_rename_open_whose_removal_of_the_slots_other_file_fails_answers_it() {
+    a_rename_open_whose_alt_removal_fails("plain", Options::default());
+}
+
+#[test]
+fn a_rename_open_whose_removal_of_the_slots_other_file_fails_answers_it_under_a_cipher() {
+    a_rename_open_whose_alt_removal_fails("cipher", under_cipher());
 }
