@@ -647,8 +647,35 @@ fn pays(gain: f64, cost: f64) -> bool {
 /// The most candidates a side of [`conversions`] prices through the model.
 const CONVERSION_CANDIDATES: usize = 16;
 
+/// A partition's move between the two forms as [`conversions_priced`]
+/// prices it: what it would save a second of wall, seconds, with the moves
+/// priced before it that pay made -- less than nothing where the partition
+/// is better as it is -- and whether it pays.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PricedMove {
+    pub conv: Conversion,
+    pub gain: f64,
+    pub pays: bool,
+}
+
 /// The moves between the two forms that [`forms_cost`] says pay, each with
-/// what it saves a second of wall, seconds.
+/// what it saves a second of wall, seconds: [`conversions_priced`]'s that
+/// pay, in its order.
+pub fn conversions(
+    capacity: u64,
+    fill: u64,
+    parts: &[FormPart],
+    costs: FormCosts,
+) -> Vec<(Conversion, f64)> {
+    conversions_priced(capacity, fill, parts, costs)
+        .into_iter()
+        .filter(|m| m.pays)
+        .map(|m| (m.conv, m.gain))
+        .collect()
+}
+
+/// Every move between the two forms that is priced, with what it would
+/// save a second of wall and whether it pays.
 ///
 /// Into the stride form, judged in a cache of `fill` bytes: a partition in
 /// the block form that may be asked, the most touches a byte of the stride
@@ -661,14 +688,26 @@ const CONVERSION_CANDIDATES: usize = 16;
 /// capacity's own fall does not take it back at once.
 ///
 /// Each side's moves are priced one after another, each with the moves
-/// before it made: a move in is offered only where it still pays with every
-/// hotter one in, so that a cold partition is not offered the room a hot
-/// one is about to take, and a move out only where it still pays with every
-/// colder one out, so that no more leave than the room is short by. Where
-/// no move pays alone and the hottest partition in the block form would
-/// pay in the room the coldest in the stride form holds, that one's move
-/// out is offered, at half the saving of the pair, since the saving takes
-/// both builds; with it made, the hot one is the first offered in.
+/// before it that pay made: a move in pays only where it still does with
+/// every hotter one in, so that a cold partition is not offered the room a
+/// hot one is about to take, and a move out only where it still does with
+/// every colder one out, so that no more leave than the room is short by.
+/// A move that does not pay is priced all the same, at what it would lose:
+/// a partition in the stride form of a store that fits would cost its
+/// decodes in the block form, and whoever keeps a balance of what a move
+/// would have saved takes that from it, so that the balance is of the
+/// reads as they were and not of the times the move was offered.
+///
+/// Where no move pays alone and the hottest partition in the block form
+/// would pay in the room the coldest in the stride form holds, that one's
+/// move out pays, at half the saving of the pair, since the saving takes
+/// both builds; with it made, the hot one is the first offered in. The
+/// pair is priced with the cold one's block form in the share of its
+/// stride form that the hot one's is of its own: the hot one's two sizes
+/// are both known, the cold one's block form is an estimate, and priced
+/// at the estimate an exchange of two partitions of one size read the
+/// estimate's error as room made -- a store that had moved one partition
+/// out and fitted moved a second for it.
 ///
 /// Nothing moves in where `fill` is nothing: the model reads every touch of
 /// a cache of no bytes as a fault whatever the forms, so a move in would
@@ -676,12 +715,12 @@ const CONVERSION_CANDIDATES: usize = 16;
 ///
 /// A side prices at most [`CONVERSION_CANDIDATES`] partitions, in that
 /// order, since each price is a solve of the model over every part.
-pub fn conversions(
+pub fn conversions_priced(
     capacity: u64,
     fill: u64,
     parts: &[FormPart],
     costs: FormCosts,
-) -> Vec<(Conversion, f64)> {
+) -> Vec<PricedMove> {
     let mut ins: Vec<usize> = (0..parts.len())
         .filter(|&i| !parts[i].stride && parts[i].can_stride && parts[i].touches > 0.0)
         .collect();
@@ -699,8 +738,14 @@ pub fn conversions(
         for &i in ins.iter().take(CONVERSION_CANDIDATES) {
             made[i].stride = true;
             let after = forms_cost(fill, &made, costs);
-            if pays(cost - after, cost) {
-                moves.push((Conversion::ToStride(i), cost - after));
+            let gain = cost - after;
+            let pays = pays(gain, cost);
+            moves.push(PricedMove {
+                conv: Conversion::ToStride(i),
+                gain,
+                pays,
+            });
+            if pays {
                 cost = after;
             } else {
                 made[i].stride = false;
@@ -712,21 +757,43 @@ pub fn conversions(
     for &i in outs.iter().take(CONVERSION_CANDIDATES) {
         made[i].stride = false;
         let after = forms_cost(capacity, &made, costs);
-        if pays(cost - after, cost) {
-            moves.push((Conversion::ToBlock(i), cost - after));
+        let gain = cost - after;
+        let pays = pays(gain, cost);
+        moves.push(PricedMove {
+            conv: Conversion::ToBlock(i),
+            gain,
+            pays,
+        });
+        if pays {
             cost = after;
         } else {
             made[i].stride = true;
         }
     }
-    if moves.is_empty() && fill > 0 {
+    if moves.iter().all(|m| !m.pays) && fill > 0 {
         if let (Some(&hot), Some(&cold)) = (ins.first(), outs.first()) {
             let mut swapped = parts.to_vec();
             swapped[hot].stride = true;
             swapped[cold].stride = false;
+            if parts[hot].stride_bytes > 0 {
+                swapped[cold].block_bytes =
+                    (parts[cold].stride_bytes as f64 * parts[hot].block_bytes as f64
+                        / parts[hot].stride_bytes as f64) as u64;
+            }
             let gain = now_fill - forms_cost(fill, &swapped, costs);
             if pays(gain, now_fill) {
-                moves.push((Conversion::ToBlock(cold), gain / 2.0));
+                let swap = PricedMove {
+                    conv: Conversion::ToBlock(cold),
+                    gain: gain / 2.0,
+                    pays: true,
+                };
+                match moves
+                    .iter_mut()
+                    .find(|m| m.conv == Conversion::ToBlock(cold))
+                {
+                    Some(m) => *m = swap,
+                    None => moves.push(swap),
+                }
             }
         }
     }
@@ -3968,6 +4035,89 @@ mod tests {
         assert_eq!(conversion_room(1000, 850), (150, 0));
         assert_eq!(conversion_room(1000, 900), (100, 0));
         assert_eq!(conversion_room(1000, 2000), (0, 0));
+    }
+
+    /// Every priced move with what it would save or lose
+    /// (`conversions_priced`): a partition in the stride form of a store
+    /// that fits is priced at the decodes its block form would cost, to
+    /// the microsecond, and does not pay; and an exchange of two
+    /// partitions is priced with the cold one's block form in the share
+    /// the hot one's is of its stride form, so that an estimate of it that
+    /// is short does not read as room made.
+    #[test]
+    fn a_move_that_does_not_pay_is_priced_at_what_it_would_lose() {
+        let mb = 1u64 << 20;
+        let costs = FormCosts {
+            t_decode: 1e-6,
+            t_fault: 40e-6,
+        };
+        let part = |stride: bool, block: u64, touches: f64| FormPart {
+            stride,
+            can_stride: true,
+            block_bytes: block * mb,
+            stride_bytes: 100 * mb,
+            touches,
+        };
+        let near = |a: f64, b: f64| (a - b).abs() <= 1e-9 * b.abs().max(1e-12);
+        // A store that fits: each partition in the stride form would cost
+        // its decodes, the coldest priced first, and nothing pays.
+        let parts = [part(true, 60, 3000.0), part(true, 60, 500.0)];
+        let priced = conversions_priced(400 * mb, 340 * mb, &parts, costs);
+        assert_eq!(priced.len(), 2, "{priced:?}");
+        assert_eq!(priced[0].conv, Conversion::ToBlock(1));
+        assert!(
+            !priced[0].pays && near(priced[0].gain, -500.0 * 1e-6),
+            "{priced:?}"
+        );
+        assert_eq!(priced[1].conv, Conversion::ToBlock(0));
+        assert!(
+            !priced[1].pays && near(priced[1].gain, -3000.0 * 1e-6),
+            "{priced:?}"
+        );
+        assert!(conversions(400 * mb, 340 * mb, &parts, costs).is_empty());
+        // Two partitions read alike, one in each form, in a fill neither
+        // move has room in. The stride one's block form is on record as
+        // two thirds of what the block one's is: priced at that, the
+        // exchange would read forty megabytes of room made; priced in the
+        // block one's own share it changes nothing, and does not pay.
+        let parts = [part(false, 60, 4000.0), part(true, 40, 4000.0)];
+        let (capacity, fill) = (200 * mb, 150 * mb);
+        let priced = conversions_priced(capacity, fill, &parts, costs);
+        assert!(priced.iter().all(|m| !m.pays), "{priced:?}");
+        let mut at_estimate = parts;
+        at_estimate.swap(0, 1);
+        at_estimate[0].stride = false;
+        at_estimate[1].stride = true;
+        assert!(
+            forms_cost(fill, &parts, costs) - forms_cost(fill, &at_estimate, costs) > 1e-3,
+            "the estimate's shortfall alone is a saving the model would read"
+        );
+        // The block one read three times as much, in a fill the two hold
+        // as they stand and would not with both in the stride form: the
+        // exchange pays, as the stride one's move out, at half the pair's
+        // saving, which is the decodes the hot one's reads no longer make
+        // less the cold one's that do.
+        let parts = [part(false, 60, 12_000.0), part(true, 40, 4000.0)];
+        let fill = 160 * mb;
+        let priced = conversions_priced(capacity, fill, &parts, costs);
+        let pay: Vec<&PricedMove> = priced.iter().filter(|m| m.pays).collect();
+        assert_eq!(pay.len(), 1, "{priced:?}");
+        assert_eq!(pay[0].conv, Conversion::ToBlock(1));
+        let mut swapped = parts;
+        swapped[0].stride = true;
+        swapped[1].stride = false;
+        swapped[1].block_bytes = 60 * mb;
+        let pair = forms_cost(fill, &parts, costs) - forms_cost(fill, &swapped, costs);
+        assert!(near(pair, 8000.0 * 1e-6), "{pair}");
+        assert!(near(pay[0].gain, pair / 2.0), "{priced:?}");
+        assert_eq!(
+            priced
+                .iter()
+                .filter(|m| m.conv == Conversion::ToBlock(1))
+                .count(),
+            1,
+            "priced once: {priced:?}"
+        );
     }
 
     /// What a period's reads are of the smoothed touches (`intensity`), and

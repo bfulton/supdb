@@ -728,6 +728,12 @@ pub struct ZCounts {
     /// and form files asked back as the store passed its whole budget
     /// (`Options::zpages_land_drop_past`).
     pub ahead_swapped: u64,
+    /// Form files whose build dropped them from the page cache as it wrote
+    /// them -- a build ahead begun under the selector's line -- asked back
+    /// of the kernel whole where the build was taken in past it, and the
+    /// bytes asked for (`Options::zpages_ask_dropped`).
+    pub dropped_asks: u64,
+    pub dropped_ask_bytes: u64,
     /// Form files synced once named, on their build's thread
     /// (`Options::zpages_build_sync`).
     pub build_synced: u64,
@@ -2239,6 +2245,47 @@ pub struct Options {
     /// bar past the line too.
     #[doc(hidden)]
     pub zpages_land_cold_past: bool,
+    /// EXPERIMENT: the hot-raw policy (`zpages_hot_raw`) runs beside the
+    /// stride form, over the partitions a block file serves. It stood
+    /// down wherever the stride form was asked for, since a stride file
+    /// counted no decode or open and sat at nothing in the median a
+    /// block file's skew is read against; a stride file counts its reads
+    /// as the groups a block file would have opened now, where the look
+    /// asks it to (`ZFile::ask_stride_heat`). A partition a stride file
+    /// serves is rated with the rest and never released: its reads are a
+    /// raw partition's already, in two thirds of the room. At ten million
+    /// keys under 1 GiB, where the store's stride files are converted out
+    /// (`zpages_stride_convert`) and every partition ends in the block
+    /// form, the stand-down was what the arm read B at 0.76-0.84x of the
+    /// default by, which serves its hottest partition raw there
+    /// (`docs/engine.md`). Off; `supdb-zstrideroomconvaskhot` turns it on.
+    #[doc(hidden)]
+    pub zpages_hot_raw_beside_stride: bool,
+    /// EXPERIMENT: a form file whose build dropped it from the page cache
+    /// as it wrote it is asked back of the kernel whole when the build is
+    /// taken in with the store past the selector's line. A build ahead
+    /// begun under the line writes its output back and drops it, so that
+    /// a raw form that fits keeps its cache (`zpages_land_pct`); the
+    /// crossing asks for every such file on disk and drops its records
+    /// (`zpages_land_drop_past`), and a build in flight at the crossing is
+    /// not on disk yet. Taken in after it, its file was attached with none
+    /// of its pages in the cache, and under the random advice each came by
+    /// a fault of its own: at ten million keys under 1.25 GiB the two
+    /// builds ahead in flight as the load ended, the largest two
+    /// partitions of the store's tail, took 22,000 of the default's 26,400
+    /// major faults over the one-thread read pass and 30,300 of 40,100
+    /// where the files are stride files, every page of both files, while
+    /// the 24 files asked for at the crossing took none (`perf record -e
+    /// major-faults -c 1 -d` over `bench ab --arms
+    /// supdb-zstrideroomconv,supdb --size 10000000 --bound 1342177280
+    /// --passes load,read --reps 1 --ops-div 10`, each fault laid to its
+    /// file by the process's maps, at `c24b7cd`). With the option the file
+    /// is asked for before the attach where the form is wanted, and where
+    /// it lands dormant after the crossing its records are dropped and it
+    /// is asked for as the crossing did for the rest. Off;
+    /// `supdb-zaskdropped` turns it on.
+    #[doc(hidden)]
+    pub zpages_ask_dropped: bool,
     /// The decoded bytes a form file's page is cut into groups at, each
     /// compressed on its own, so that a point read decodes the group its
     /// record is in and not the page (`zpages::ZGROUP_BYTES`, two
@@ -6276,6 +6323,8 @@ impl Default for Options {
             zpages_land_drop_past: true,
             zpages_build_sync: true,
             zpages_land_cold_past: true,
+            zpages_ask_dropped: false,
+            zpages_hot_raw_beside_stride: false,
             zpages_ahead_past_scans: false,
             zpages_build_at_finish: true,
             zpages_group_bytes: zpages::ZGROUP_BYTES,
@@ -24060,6 +24109,8 @@ impl Reader {
             ahead_cold: get(&ev.ahead_cold),
             ahead_recoded: get(&ev.ahead_recoded),
             ahead_swapped: get(&ev.ahead_swapped),
+            dropped_asks: get(&ev.dropped_asks),
+            dropped_ask_bytes: get(&ev.dropped_ask_bytes),
             build_synced: get(&ev.build_synced),
             build_nopage: get(&ev.build_nopage),
             warms: get(&ev.warms),
@@ -44514,8 +44565,8 @@ const RECODE_AUTO_EVICT: f64 = 0.95;
 /// (`Options::zpages_stride_convert`): its period; what a build costs a
 /// byte of the form it writes before any build has been timed, seconds --
 /// the device's 150 MB/s here read once and written once; the wall between
-/// two looks over what a look's pricing took of its thread's clock, at
-/// least; and the decodes a look
+/// two looks over the wall a look's pricing took, at least; and the decodes
+/// a look
 /// has to have seen timed in its period to take the period's mean as what
 /// a decode costs.
 const CONVERT_PERIOD: std::time::Duration = std::time::Duration::from_millis(250);
@@ -44948,12 +44999,20 @@ struct Maint {
     /// when it last looked; each form file's decodes and opens then, with
     /// its decode time and its decodes, by its attach's identity; each
     /// partition's decayed touches a second, by its
-    /// name; and what each move that pays would have saved since it first
-    /// did, seconds, by its partition's name.
+    /// name; and the balance of what each partition's move to its other
+    /// form would have saved over the looks that priced it, seconds, by
+    /// its partition's name, from the partition's last move on
+    /// (`z_convert` clears it) and for as long as a form file serves it.
     z_conv_last: Option<std::time::Duration>,
     z_conv_seen: std::collections::HashMap<u64, (u64, u64, u64)>,
     z_conv_heat: std::collections::HashMap<String, f64>,
     z_conv_rent: std::collections::HashMap<String, f64>,
+    /// The conversion's last look left a move due that it did not start:
+    /// the builder was at something else, or the look started another. The
+    /// first turn that finds the builder free with nothing due it looks at
+    /// once, without waiting out the period, so that a move that has paid
+    /// for its build waits for the builder and for nothing after it.
+    z_conv_waits: bool,
     /// When the conversion's last look ended and how long it took, by the
     /// wall: the next waits a hundred times that, so that a look, which
     /// solves the model once for each move it prices, is a hundredth of a
@@ -45629,6 +45688,7 @@ impl Maint {
             z_conv_seen: std::collections::HashMap::new(),
             z_conv_heat: std::collections::HashMap::new(),
             z_conv_rent: std::collections::HashMap::new(),
+            z_conv_waits: false,
             z_conv_done: None,
             z_anon_peak: std::cell::Cell::new(zselect::WindowMax::new(zselect::RETAIN_FLOOR)),
             z_conv_decode: None,
@@ -47855,23 +47915,35 @@ impl Maint {
     }
 
     /// The conversion's turn (`Options::zpages_stride_convert`), with the
-    /// form installed and no build in flight or due: once a
-    /// `CONVERT_PERIOD`, and no sooner than `CONVERT_DUTY` times what the
-    /// last look took of the thread's own clock, a look, counted once it is
-    /// done so that a test that waits for one reads the decision it made.
-    /// What a look took is its pricing alone, on the thread's CPU clock: the
-    /// build it starts is the build's, and a wait inside it -- the group's
-    /// counters read under reclaim, the thread off its core beside the
-    /// readers -- is no work of the look's to hold the next one off for.
-    /// Timed by its wall with the start inside, one look of 19-33 ms held
-    /// the next off for two and three seconds, twice in the 24 conversions
-    /// a store of ten million keys under 1 GiB makes, a third of the time
-    /// they took (`docs/engine.md`).
+    /// form installed: once a `CONVERT_PERIOD`, and no sooner than
+    /// `CONVERT_DUTY` times the wall the last look's pricing took, a look,
+    /// counted once it is done so that a test that waits for one reads the
+    /// decision it made. A look is made whatever the builder is at, since a
+    /// move's rent is what the reads would have saved and they do not wait
+    /// for the builder: the first conversion out of a store of ten million
+    /// keys under 1 GiB began six seconds into its reads, the builder at
+    /// the load's last five builds and then the warms of 29 files, with no
+    /// look made until it was through and no rent before the second look
+    /// (`docs/engine.md`). The look prices and names the partition whose
+    /// move is due, and the build is started here, outside what the look is
+    /// timed by, where the builder is free and has nothing of the store's
+    /// own due it. A move left due -- the builder busy, or the look having
+    /// started another -- looks again at the first turn that could start
+    /// it, without waiting out the period (`z_conv_waits`). At that store a
+    /// look over 29 partitions took half a millisecond at the median and
+    /// 2.4 at the most, the thread's CPU the same, and a start 0.07
+    /// (`SUPDB_ZPAGES_TRACE`, the `look` line).
     fn z_convert_tick(&mut self) {
         let now = self.z_now();
-        if self
-            .z_conv_last
-            .is_some_and(|t| now.saturating_sub(t) < CONVERT_PERIOD)
+        let may_start = self.zbuild.is_none() && {
+            let _op = self.op();
+            self.z_next().is_none()
+        };
+        let waited = self.z_conv_waits && may_start;
+        if !waited
+            && self
+                .z_conv_last
+                .is_some_and(|t| now.saturating_sub(t) < CONVERT_PERIOD)
         {
             return;
         }
@@ -47883,6 +47955,7 @@ impl Maint {
             .as_ref()
             .is_some_and(|i| i.clock().is_some());
         if !injected
+            && !waited
             && self
                 .z_conv_done
                 .is_some_and(|(at, took)| at.elapsed() < took * CONVERT_DUTY)
@@ -47893,22 +47966,32 @@ impl Maint {
         self.z_conv_last = Some(now);
         let (t0, c0) = (std::time::Instant::now(), thread_cpu_ns());
         let due = self.z_convert_look(now, dt);
-        let cpu = std::time::Duration::from_nanos(thread_cpu_ns().saturating_sub(c0));
         let wall = t0.elapsed();
-        self.z_conv_done = Some((std::time::Instant::now(), cpu));
-        let started = due.is_some();
+        let cpu = std::time::Duration::from_nanos(thread_cpu_ns().saturating_sub(c0));
+        self.z_conv_done = Some((std::time::Instant::now(), wall));
         let s0 = std::time::Instant::now();
-        if let Some(seg) = due {
-            self.z_convert(seg);
-        }
+        // The move most overdue started where the builder can take it; a
+        // move left due, this one or another behind it, looks again at
+        // the first turn that could start it.
+        let started = may_start && due.is_some();
+        self.z_conv_waits = match due {
+            Some((seg, more)) if may_start => {
+                self.z_convert(seg);
+                more
+            }
+            Some(_) => true,
+            None => false,
+        };
         if self.z_trace {
             eprintln!(
-                "zconvert t={:.1} look wall_ms {:.2} cpu_ms {:.2} start_ms {:.2} started {}",
+                "zconvert t={:.1} look wall_ms {:.2} cpu_ms {:.2} start_ms {:.2} started {} may_start {} waits {}",
                 now.as_secs_f64(),
                 wall.as_secs_f64() * 1e3,
                 cpu.as_secs_f64() * 1e3,
                 s0.elapsed().as_secs_f64() * 1e3,
                 started,
+                may_start,
+                self.z_conv_waits,
             );
         }
         zfile::ZEvents::add(&self.shared.z.stride_convert_looks, 1);
@@ -47920,13 +48003,13 @@ impl Maint {
     /// pay, each move's rent grown by what it would have saved over `dt` at
     /// the reads `dt` held,
     /// and the partition of the one whose rent has most outgrown its price,
-    /// for the tick to start the build of
-    /// (`Options::zpages_stride_convert`).
+    /// for the tick to start the build of, with whether another is due
+    /// behind it (`Options::zpages_stride_convert`).
     fn z_convert_look(
         &mut self,
         now: std::time::Duration,
         dt: Option<std::time::Duration>,
-    ) -> Option<std::sync::Arc<Seg>> {
+    ) -> Option<(std::sync::Arc<Seg>, bool)> {
         let inject = self.opts.zpages_inject.clone();
         let budget = self.z_budget_grown();
         // A served partition: its segment, its form file's identity and
@@ -47947,6 +48030,14 @@ impl Maint {
             opens: u64,
             can: bool,
         }
+        // The partition a conversion in flight is moving, which is priced
+        // in the form it is going to and offered nothing: the moves after
+        // it are worth what they add to it.
+        let moving: Option<String> = self
+            .zbuild
+            .as_ref()
+            .filter(|b| b.convert)
+            .map(|b| b.seg.name.clone());
         // What stands in the cache beside the forms: the level-0 pieces'
         // payload, and the raw form of a partition no form file serves.
         let (rows, other): (Vec<Row>, u64) = {
@@ -48069,9 +48160,10 @@ impl Maint {
                 r.file
             }
             .saturating_add(r.heads);
+            let in_flight = moving.as_deref() == Some(r.seg.name.as_str());
             parts.push(zselect::FormPart {
-                stride: r.stride,
-                can_stride: r.can,
+                stride: r.stride != in_flight,
+                can_stride: r.can && !in_flight,
                 block_bytes,
                 stride_bytes: if r.stride { r.file } else { r.values },
                 touches: heat,
@@ -48104,7 +48196,35 @@ impl Maint {
             t_fault,
         };
         let (capacity, fill) = zselect::conversion_room(budget, other);
-        let moves = zselect::conversions(capacity, fill, &parts, costs);
+        let moves = zselect::conversions_priced(capacity, fill, &parts, costs);
+        if self.z_trace {
+            let held = |stride: bool| -> u64 {
+                parts
+                    .iter()
+                    .filter(|p| p.stride == stride)
+                    .map(|p| {
+                        if stride {
+                            p.stride_bytes
+                        } else {
+                            p.block_bytes
+                        }
+                    })
+                    .sum()
+            };
+            eprintln!(
+                "zconvert t={:.1} room capacity_kb {} fill_kb {} other_kb {} stride_kb {} block_kb {} parts {} moves {} t_decode_us {:.2} t_fault_us {:.1}",
+                now.as_secs_f64(),
+                capacity >> 10,
+                fill >> 10,
+                other >> 10,
+                held(true) >> 10,
+                held(false) >> 10,
+                parts.len(),
+                moves.iter().filter(|m| m.pays).count(),
+                costs.t_decode * 1e6,
+                costs.t_fault * 1e6,
+            );
+        }
         // What a build costs: its wall at the builds' measured rate a byte
         // of form written, with the displacement.
         let per_byte = {
@@ -48127,18 +48247,47 @@ impl Maint {
         // `RECODE_TAU` after it ends -- and a gain is as many times itself
         // as the reads are (`zselect::intensity`).
         let now_over_heat = zselect::intensity(rate_sum, heat_sum);
-        let mut rents = std::collections::HashMap::with_capacity(moves.len());
-        // The move whose rent has most outgrown its price, with both.
+        // The rents the looks before left, of the partitions a form file
+        // still serves: a merge's outputs have names of their own and pay
+        // theirs from nothing. A move's rent is a balance: what
+        // the move would have saved over the looks that priced it, less
+        // what it would have lost over those where the partition was the
+        // better as it is, and never under nothing -- the excess of a
+        // cumulative sum, so that a move bought is one the reads have paid
+        // for since it last stopped paying, and one priced a little either
+        // way from look to look by the noise of two partitions read alike
+        // comes to nothing. A look that does not price a move leaves its
+        // rent where it stood: dropped with every look that did not offer
+        // it, the rent of a move the pricing had put behind two others of
+        // the same reads for one look was paid again from nothing, 0.6 s
+        // of a store of ten million keys over its room.
+        let mut rents: std::collections::HashMap<String, f64> = rows
+            .iter()
+            .filter_map(|r| Some((r.seg.name.clone(), *self.z_conv_rent.get(&r.seg.name)?)))
+            .collect();
+        // The move whose rent has most outgrown its price, with both, and
+        // how many are due.
         let mut due: Option<(usize, f64, f64)> = None;
-        for &(m, gain) in &moves {
-            let (i, to_stride) = match m {
+        let mut dues = 0usize;
+        for m in &moves {
+            let (i, to_stride) = match m.conv {
                 zselect::Conversion::ToStride(i) => (i, true),
                 zselect::Conversion::ToBlock(i) => (i, false),
             };
+            let gain = m.gain;
             let name = &rows[i].seg.name;
-            let rent = self.z_conv_rent.get(name).copied().unwrap_or(0.0)
-                + gain * now_over_heat * dt.as_secs_f64();
+            // The partition in flight is priced as moved, and a move of it
+            // back is nothing to pay rent on until it has landed.
+            if moving.as_deref() == Some(name.as_str()) {
+                continue;
+            }
+            let rent = (rents.get(name).copied().unwrap_or(0.0)
+                + gain * now_over_heat * dt.as_secs_f64())
+            .max(0.0);
             rents.insert(name.clone(), rent);
+            if !m.pays {
+                continue;
+            }
             let built = if to_stride {
                 parts[i].stride_bytes
             } else {
@@ -48165,8 +48314,11 @@ impl Maint {
                     other >> 20,
                 );
             }
-            if rent >= price && due.is_none_or(|(_, r, p)| rent * p > r * price) {
-                due = Some((i, rent, price));
+            if rent >= price {
+                dues += 1;
+                if due.is_none_or(|(_, r, p)| rent * p > r * price) {
+                    due = Some((i, rent, price));
+                }
             }
         }
         // The rents as this look leaves them, summed: what a test holds a
@@ -48178,16 +48330,15 @@ impl Maint {
         self.z_conv_rent = rents;
         let (i, _, _) = due?;
         let seg = rows[i].seg.clone();
-        self.z_conv_rent.remove(&seg.name);
         if self.z_trace {
             eprintln!(
-                "zconvert t={:.1} start seg={} to {}",
+                "zconvert t={:.1} due seg={} to {} of {dues} due",
                 now.as_secs_f64(),
                 seg.name,
                 if rows[i].stride { "block" } else { "stride" },
             );
         }
-        Some(seg)
+        Some((seg, dues > 1))
     }
 
     /// A test's request for a conversion taken, with the builder free
@@ -48244,6 +48395,9 @@ impl Maint {
     /// the served one.
     fn z_convert(&mut self, seg: std::sync::Arc<Seg>) {
         if self.zbuild.is_none() {
+            // What the move had been paid is spent on it: the form the
+            // partition lands in starts its own balance from nothing.
+            self.z_conv_rent.remove(&seg.name);
             self.z_start(seg, ZKind::Convert, false);
         }
     }
@@ -48300,6 +48454,10 @@ impl Maint {
         struct Part {
             seg: std::sync::Arc<Seg>,
             raw: bool,
+            /// A stride file serves it: rated with the rest, and no
+            /// candidate for a release, its reads being a raw partition's
+            /// already in less room.
+            stride: bool,
             /// The served form file's bytes, or the file on disk's for a
             /// raw partition, which the way back brings in.
             file_bytes: u64,
@@ -48319,8 +48477,9 @@ impl Maint {
             looks: u64,
         }
         // A served form file: its attach's identity, its coding, its bytes
-        // with the kept file's, its decode time, its decodes and its opens.
-        type Served = (u64, bool, u64, u64, u64, u64);
+        // with the kept file's, its decode time, its decodes and its opens,
+        // and whether it is a stride file.
+        type Served = (u64, bool, u64, u64, u64, u64, bool);
         type Row = (std::sync::Arc<Seg>, Option<Served>, u64);
         let (rows, live): (Vec<Row>, std::collections::HashSet<Vec<u8>>) = {
             let _op = self.op();
@@ -48339,24 +48498,32 @@ impl Maint {
                         && !self.z_finishing(&s.name)
                         && !self.z_ahead_holds(&s.name)
                 })
-                // A stride file would be a served row like a block file's:
-                // no decode or open counted, so no heat, and one of the
-                // partitions the median is taken over at nothing. The look
-                // stands down beside the stride form (`z_hot_runs`) until
-                // the heat and the median are counted by form.
+                // A stride file is a served row like a block file's, its
+                // reads counted as the groups a block file would have
+                // opened from the first look that asks
+                // (`ZFile::ask_stride_heat`): no attach is told to, and
+                // counted at nothing it sat in the median a block file's
+                // skew is read against, which is why the look stood down
+                // beside the form (`z_hot_runs`).
                 .filter_map(|s| match s.z.get() {
-                    Some(z) if !z.damaged() => Some((
-                        s.clone(),
+                    Some(z) if !z.damaged() => {
+                        if z.is_stride() {
+                            z.ask_stride_heat();
+                        }
                         Some((
-                            z.id(),
-                            z.coded(),
-                            z.file_bytes() + s.z_spare.get().map_or(0, |k| k.file_bytes()),
-                            16 * z.decode_ns16.load(AtomicOrdering::Relaxed),
-                            16 * z.decodes16.load(AtomicOrdering::Relaxed),
-                            16 * z.opens16.load(AtomicOrdering::Relaxed),
-                        )),
-                        0,
-                    )),
+                            s.clone(),
+                            Some((
+                                z.id(),
+                                z.coded(),
+                                z.file_bytes() + s.z_spare.get().map_or(0, |k| k.file_bytes()),
+                                16 * z.decode_ns16.load(AtomicOrdering::Relaxed),
+                                16 * z.decodes16.load(AtomicOrdering::Relaxed),
+                                16 * z.opens16.load(AtomicOrdering::Relaxed),
+                                z.is_stride(),
+                            )),
+                            0,
+                        ))
+                    }
                     Some(_) => None,
                     None if s.z_declined.load(AtomicOrdering::Relaxed)
                         == zfile::DECLINED_HOT_RAW =>
@@ -48382,8 +48549,16 @@ impl Maint {
             Some(c) => rows
                 .into_iter()
                 .map(|(s, served, reads)| {
-                    let served = served.map(|(id, coded, b, _ns, decodes, opens)| {
-                        (id, coded, b, decodes.saturating_mul(c), decodes, opens)
+                    let served = served.map(|(id, coded, b, _ns, decodes, opens, stride)| {
+                        (
+                            id,
+                            coded,
+                            b,
+                            decodes.saturating_mul(c),
+                            decodes,
+                            opens,
+                            stride,
+                        )
                     });
                     (s, served, reads)
                 })
@@ -48415,7 +48590,7 @@ impl Maint {
             // The window's sampled events, one in sixteen of the reads the
             // partition answered, and the rate they make.
             let delta = match (served, dt) {
-                (Some((id, _, _, _, decodes, opens)), Some(d)) if !d.is_zero() => {
+                (Some((id, _, _, _, decodes, opens, _)), Some(d)) if !d.is_zero() => {
                     self.z_hot_seen.get(&id).map(|&(decodes0, opens0)| {
                         (decodes.saturating_sub(decodes0) + opens.saturating_sub(opens0)) / 16
                     })
@@ -48467,7 +48642,7 @@ impl Maint {
                 _ => old,
             };
             let file_bytes = match served {
-                Some((id, _, b, _, decodes, opens)) => {
+                Some((id, _, b, _, decodes, opens, _)) => {
                     seen.insert(id, (decodes, opens));
                     b
                 }
@@ -48484,6 +48659,7 @@ impl Maint {
             heats.insert(seg.lo.clone(), heat);
             parts.push(Part {
                 raw: served.is_none(),
+                stride: served.is_some_and(|f| f.6),
                 file_bytes,
                 raw_bytes: seg.raw_bytes(),
                 keys: seg.blob.keys() as u64,
@@ -48684,6 +48860,7 @@ impl Maint {
                 .iter()
                 .filter(|p| {
                     !p.raw
+                        && !p.stride
                         && p.rated
                         && p.heat >= RECODE_FLOOR_NS
                         && p.delta >= HOT_RAW_MIN_SAMPLES
@@ -48863,7 +49040,7 @@ impl Maint {
         // of it against a key of the median partition.
         let Some(p) = parts
             .iter()
-            .filter(|p| !p.raw && p.rated)
+            .filter(|p| !p.raw && !p.stride && p.rated)
             .max_by(|a, b| per_key(a).total_cmp(&per_key(b)))
         else {
             return;
@@ -49291,13 +49468,14 @@ impl Maint {
     }
 
     /// Whether the hot-raw policy is this store's: on, under the controller,
-    /// and standing down where the re-code policy runs and beside the stride
-    /// form (`Options::zpages_hot_raw`).
+    /// and standing down where the re-code policy runs and, but under
+    /// `Options::zpages_hot_raw_beside_stride`, beside the stride form
+    /// (`Options::zpages_hot_raw`).
     fn z_hot_runs(&self) -> bool {
         self.opts.zpages_hot_raw
             && self.opts.zpages == ZPages::Auto
             && !(self.opts.zpages_recode_auto || self.opts.zpages_reparse)
-            && self.opts.zpages_stride == ZStride::Off
+            && (self.opts.zpages_stride == ZStride::Off || self.opts.zpages_hot_raw_beside_stride)
     }
 
     /// The controller's clock: the injected one where a test has moved it,
@@ -50267,6 +50445,20 @@ impl Maint {
             self.z_collect(b);
             drop(op);
         }
+        // The conversion's look (`Options::zpages_stride_convert`), with
+        // the form installed, whatever the builder is at: it starts a
+        // build only with the builder free and nothing of the store's own
+        // due it.
+        let recode = self.opts.zpages_recode_auto || self.opts.zpages_reparse;
+        let converts = !recode
+            && self.opts.zpages_stride_convert
+            && self.opts.zpages_stride != ZStride::Off
+            && d.build
+            && self.zsel.phase() == zselect::Phase::Compact
+            && !self.z_settling;
+        if converts {
+            self.z_convert_tick();
+        }
         if d.build {
             // Every form file on disk attached first, where the option says,
             // so that no attach waits for a warm (`Options::zpages_attach_first`).
@@ -50340,7 +50532,6 @@ impl Maint {
         // another partition is no reason to wait -- the mixes at the bounded
         // rung run beside the builds of the files the load's drain left, and
         // a policy that waited for the builder never looked through them.
-        let recode = self.opts.zpages_recode_auto || self.opts.zpages_reparse;
         if d.build && self.zsel.phase() == zselect::Phase::Compact && !self.z_settling {
             if recode {
                 let idle = self.zbuild.is_none() && {
@@ -50350,21 +50541,24 @@ impl Maint {
                 if idle {
                     self.z_recode_tick();
                 }
-            } else if self.opts.zpages_stride_convert && self.opts.zpages_stride != ZStride::Off {
-                // A conversion is a build, as a re-code is, and waits for
-                // the builder as one does.
-                let idle = self.zbuild.is_none() && {
-                    let _op = self.op();
-                    self.z_next().is_none()
-                };
-                if idle {
-                    self.z_convert_asked();
-                    if self.zbuild.is_none() {
-                        self.z_convert_tick();
+            } else {
+                if converts {
+                    // A test's request, taken with the builder free and
+                    // nothing due it: the policy's own look is above.
+                    let idle = self.zbuild.is_none() && {
+                        let _op = self.op();
+                        self.z_next().is_none()
+                    };
+                    if idle {
+                        self.z_convert_asked();
                     }
                 }
-            } else if self.z_hot_runs() {
-                self.z_hot_raw_tick();
+                // The hot-raw policy's turn, beside the conversion's where
+                // the option has it run beside the stride form: a release
+                // builds nothing.
+                if self.z_hot_runs() {
+                    self.z_hot_raw_tick();
+                }
             }
         }
         // The sample first where the option says, while the builder the
@@ -52230,10 +52424,43 @@ impl Maint {
                 z_leave_seal(&shared, zfile::zpg_name(id, end), &built);
                 ev.built(&built);
                 zfile::ZEvents::add(&ev.prebuilt, 1);
+                // In flight at the crossing and begun before it: what the
+                // crossing did for the files then on disk, done for this
+                // one (`Options::zpages_ask_dropped`, `z_cross`).
+                if self.opts.zpages_ask_dropped && built.dropped && self.z_crossed {
+                    let target = live.as_ref().expect("checked");
+                    if let (Some((at, len)), Ok(f)) = (
+                        target.blob.for_zfile().record_region_span(),
+                        File::open(self.dir.join(&target.name)),
+                    ) {
+                        let asked = zfile::swap_ahead(&f, at, len, &out);
+                        zfile::ZEvents::add(&ev.dropped_asks, 1);
+                        zfile::ZEvents::add(&ev.dropped_ask_bytes, asked);
+                        zfile::ZEvents::add(&ev.ahead_swapped, 1);
+                    }
+                }
                 self.z_prebuilt_landed();
             }
             Ok(zfile::Outcome::Built(built)) => match live {
                 Some(target) => {
+                    // The file's pages asked of the kernel before it
+                    // serves, where its build dropped them
+                    // (`Options::zpages_ask_dropped`): the attach's mapping
+                    // is advised random, and a file with nothing in the
+                    // cache came a page a fault under it.
+                    if self.opts.zpages_ask_dropped && built.dropped {
+                        let asked = zfile::ask_file(&out);
+                        zfile::ZEvents::add(&ev.dropped_asks, 1);
+                        zfile::ZEvents::add(&ev.dropped_ask_bytes, asked);
+                        if self.z_trace {
+                            eprintln!(
+                                "zask t={:.1} {} dropped by its build, asked_mb {:.1}",
+                                self.z_epoch.elapsed().as_secs_f64(),
+                                seg.name,
+                                asked as f64 / 1048576.0
+                            );
+                        }
+                    }
                     match zfile::ZFile::attach(
                         &out,
                         target.blob.for_zfile(),

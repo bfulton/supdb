@@ -15732,6 +15732,162 @@ fn a_stride_file_built_ahead_is_trusted_at_its_late_attach_where_its_read_back_r
     }
 }
 
+/// A form file its build dropped from the page cache as it wrote it is
+/// asked back whole where the build is taken in with the store past the
+/// selector's line (`Options::zpages_ask_dropped`). A build ahead begun
+/// under the line drops its output, so that a raw form that fits keeps its
+/// cache; the crossing asks for the files then on disk, and a build in
+/// flight at the crossing is not among them. Here the first build ahead
+/// is held at its start, the store is taken past the line, and the build
+/// is let go: taken in with the form wanted, its file is asked for before
+/// the attach and is in the cache soon after; landed dormant, it is
+/// swapped as the crossing swaps a file, its records dropped and its
+/// pages asked for. Without the option the file is attached, or left,
+/// with the pages its build dropped still out: at ten million keys under
+/// 1.25 GiB the two such files took four fifths of the read pass's major
+/// faults, a page each.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_build_in_flight_at_the_crossing_has_the_file_it_dropped_asked_back() {
+    for (on, wanted, crossed) in [
+        (true, true, true),
+        (true, false, true),
+        (false, true, true),
+        (false, false, true),
+        (true, false, false),
+    ] {
+        let what = format!(
+            "ask dropped {on}, taken in with the form wanted {wanted}, past the line {crossed}"
+        );
+        let what = what.as_str();
+        let (dir, db, model, inject, raw) = land_store_loaded(
+            &format!("auto-ask-dropped-{on}-{wanted}-{crossed}"),
+            50,
+            |o| {
+                o.zpages_ask_dropped = on;
+                o.partition_bytes = Some(400 << 10);
+                o.zpages_ahead_builders = 1;
+                // Nothing but the ask brings the file in.
+                o.zpages_warm = false;
+                if !wanted {
+                    // Nothing is bought before the builds ahead are in.
+                    o.zpages_cover_resident = false;
+                    o.zpages_suspect_at_crossing = false;
+                }
+            },
+            |db| numbered_load(db, 20_000, 100, 0xD809),
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        // Past the percent and under the line: the first build ahead
+        // starts, and is held before its first write.
+        db.hold_zpage_build(true);
+        inject.set_budget(raw * 3 / 2);
+        let t = std::time::Instant::now();
+        while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+            wait_steps(&db, 1);
+        }
+        let c = db.zpage_counts();
+        assert!(
+            db.zpage_build_waiting() && (c.build_starts, c.prebuilt) == (1, 0),
+            "{what}: one build ahead, held: {c:?}"
+        );
+        assert!(named_form_files(&dir).is_empty(), "{what}: nothing on disk");
+        // Past the line, with nothing on disk for the crossing to ask for;
+        // or, in the last case, still under it, where a file its build
+        // dropped is left dropped: the raw form fits and wants the cache.
+        if crossed {
+            inject.set_budget(raw / 3);
+        }
+        wait_steps(&db, 5);
+        let on = on && crossed;
+        let r = db.reader().unwrap();
+        if wanted {
+            inject.set_refault_rate(1_000_000.0);
+            inject.set_fault_cost(FAULT_1MS);
+            let mut at = 0usize;
+            let mut rounds = 0;
+            while db.zpage_counts().phase < 2 && rounds < 400 {
+                reads(&r, &keys, &inject, 640, &mut at, 1);
+                close_window(&db, &r, &keys[0]);
+                rounds += 1;
+            }
+            let c = db.zpage_counts();
+            assert!(
+                c.phase >= 2 && db.zpage_build_waiting(),
+                "{what}: the form wanted with the build still held: {c:?}"
+            );
+        }
+        let c = db.zpage_counts();
+        assert_eq!(
+            (
+                c.build_starts,
+                c.build_collected,
+                c.ahead_swapped,
+                c.dropped_asks
+            ),
+            (1, 0, 0, 0),
+            "{what}: the crossing swapped nothing and asked for nothing: {c:?}"
+        );
+        db.hold_zpage_build(false);
+        assert!(
+            tick_until_built(&db, |c| c.build_collected >= 1),
+            "{what}: the held build taken in: {:?}",
+            db.zpage_counts()
+        );
+        // The first file to have a name is the held build's: one builder,
+        // and the builds after it start once it is in.
+        let first = named_form_files(&dir);
+        let c = db.zpage_counts();
+        assert!(
+            !first.is_empty() && c.builds >= 1,
+            "{what}: its file on disk: {c:?} {first:?}"
+        );
+        let held = first[0].file_name().unwrap().to_string_lossy().into_owned();
+        if wanted {
+            assert!(c.attached >= 1, "{what}: attached at its collect: {c:?}");
+        } else {
+            assert_eq!(
+                (c.attached, c.prebuilt >= 1),
+                (0, true),
+                "{what}: landed dormant: {c:?}"
+            );
+        }
+        assert_eq!(
+            (c.dropped_asks, c.dropped_ask_bytes > 0),
+            (u64::from(on), on),
+            "{what}: the dropped file asked for with the option alone: {c:?}"
+        );
+        if !wanted {
+            assert_eq!(
+                c.ahead_swapped,
+                u64::from(on),
+                "{what}: swapped as the crossing swaps a file: {c:?}"
+            );
+        }
+        let share = |dir: &Path| {
+            let (size, resident) = resident_under(dir, &held);
+            assert!(size > 0, "{what}: {held} is there");
+            resident as f64 / size as f64
+        };
+        if on {
+            wait_for(&format!("{what}: {held} in the cache"), || {
+                share(&dir) >= 0.9
+            });
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let s = share(&dir);
+            assert!(
+                s < 0.5,
+                "{what}: nothing asked for the pages its build dropped: {s}"
+            );
+        }
+        check(&r, &model, &keys, what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// `n` numbered keys from `from` on, one value of the load's width each,
 /// appended above the store's greatest key in batches and flushed: a run
 /// the stride form holds, which the flush promotes into a partition of its
@@ -17228,6 +17384,16 @@ fn a_partition_built_in_the_stride_form_is_converted_out_and_in_again() {
     inject.set_budget(total * 100);
     convert_look(&db, sec);
     let before = db.zpage_counts();
+    // The rent its move out was bought on was spent on that move: the
+    // move in is paid for by the reads from here on, and none has been
+    // made.
+    wait_steps(&db, 3);
+    assert_eq!(
+        db.zpage_counts().build_starts,
+        before.build_starts,
+        "{what}: no move in on the rent the move out was paid: {:?}",
+        db.zpage_counts()
+    );
     read_round(&db, &hot, 300_000);
     convert_look(&db, sec);
     assert!(
@@ -17312,6 +17478,60 @@ fn a_moves_rent_grows_by_the_reads_of_each_period_and_by_nothing_without_them() 
         after <= before && after as f64 >= before as f64 * 0.99,
         "{what}: no rent for a period nobody read in: {before} then {after}"
     );
+    // A rent is a balance. With room for every file no move pays, and a
+    // period of reads takes from each move's rent what the partition's
+    // block form would have cost those reads in decodes -- something, and
+    // little beside faults at a hundred times a decode -- where a period
+    // nobody read in takes nothing; and the rent that stands is what the
+    // look that offers the moves again adds to.
+    inject.set_budget(c0.file_bytes * 100);
+    convert_look(&db, sec);
+    assert_eq!(
+        rent(&db),
+        after,
+        "{what}: the rents stand through a look that offers nothing and \
+         found nothing read"
+    );
+    read_round(&db, &keys, keys.len());
+    convert_look(&db, sec);
+    let roomy = rent(&db);
+    assert!(
+        roomy < after && roomy as f64 > after as f64 * 0.5,
+        "{what}: a period of reads the stride form served in room takes \
+         its decodes from the rents: {after} then {roomy}"
+    );
+    inject.set_budget(c0.file_bytes / 4);
+    let more = step(1);
+    assert!(
+        more > 0.0 && rent(&db) > roomy,
+        "{what}: and they grow from where they stood: {roomy} then {}",
+        rent(&db)
+    );
+    // And a balance stops at nothing: with room again and a decode priced
+    // at a millisecond the rents are spent in a few periods, and the
+    // periods after them take nothing more, so that the first period over
+    // the room again adds what a period added before.
+    inject.set_budget(c0.file_bytes * 100);
+    inject.set_decode_cost(std::time::Duration::from_millis(1));
+    let mut rounds = 0;
+    while rent(&db) > 0 && rounds < 120 {
+        read_round(&db, &keys, keys.len());
+        convert_look(&db, sec);
+        rounds += 1;
+    }
+    assert_eq!(rent(&db), 0, "{what}: the rents spent");
+    for _ in 0..3 {
+        read_round(&db, &keys, keys.len());
+        convert_look(&db, sec);
+    }
+    inject.set_decode_cost(std::time::Duration::from_micros(10));
+    inject.set_budget(c0.file_bytes / 4);
+    let fresh = step(1);
+    assert!(
+        (fresh / one - 1.0).abs() < 0.1,
+        "{what}: a balance spent starts from nothing, not under it: {one} \
+         a period then, {fresh} now"
+    );
     wait_steps(&db, 5);
     let c = db.zpage_counts();
     assert_eq!(
@@ -17328,6 +17548,313 @@ fn a_moves_rent_grows_by_the_reads_of_each_period_and_by_nothing_without_them() 
     drop(r);
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The conversion looks whatever the builder is at, and a move that has
+/// paid for its build starts when the builder is free
+/// (`Options::zpages_stride_convert`, `Maint::z_convert_tick`). With one
+/// conversion's build held in flight and the stride form's partitions over
+/// their room and read alike, the looks go on beside the build, the moves'
+/// rents pass their price and nothing is started; with the build let go,
+/// the held conversion lands and the next begins at the turn that finds
+/// the builder free, with no read made since. Looking only with the builder
+/// idle, which is the shape before, the first conversion out of a store of
+/// ten million keys under 1 GiB waited for the load's last builds and 29
+/// warms before its first look, and for two more looks after it.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_conversion_looks_beside_a_build_and_starts_the_move_that_is_due_when_it_ends() {
+    let what = "looks beside a build";
+    let (dir, db, model, inject, keys) =
+        convert_store("auto-convert-beside", ZStride::Forced, true);
+    let r = db.reader().unwrap();
+    let sec = std::time::Duration::from_secs(1);
+    let c0 = db.zpage_counts();
+    db.hold_zpage_build(true);
+    db.zpages_convert_ask(1);
+    let t = std::time::Instant::now();
+    while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+        wait_steps(&db, 1);
+    }
+    let held = db.zpage_counts();
+    assert!(
+        db.zpage_build_waiting() && held.build_starts == c0.build_starts + 1,
+        "{what}: a conversion's build held at its start: {held:?}"
+    );
+    // Over the room and read alike until the rents come to ten times a
+    // build's price, which over five partitions at most is one move due.
+    inject.set_budget(c0.file_bytes / 4);
+    let mut rounds = 0;
+    while db.zpage_counts().stride_convert_rent_us < 2_000_000 && rounds < 120 {
+        read_round(&db, &keys, keys.len());
+        convert_look(&db, sec);
+        rounds += 1;
+    }
+    let c = db.zpage_counts();
+    assert!(
+        c.stride_convert_rent_us >= 2_000_000,
+        "{what}: the rents paid beside the build: {c:?}"
+    );
+    assert_eq!(
+        (c.build_starts, c.stride_converts_back, c.build_collected),
+        (
+            held.build_starts,
+            c0.stride_converts_back,
+            held.build_collected
+        ),
+        "{what}: nothing started while the builder holds the build: {c:?}"
+    );
+    // A look just made, so that the period is not out when the builder
+    // comes free: the turn that takes the held build in starts the move
+    // that is due, a millisecond of the clock later and not a period.
+    // The build is given the wall to end in before the clock moves, a
+    // census tick at a time, each well under the period.
+    convert_look(&db, sec);
+    db.hold_zpage_build(false);
+    let t = std::time::Instant::now();
+    while db.zpage_counts().build_collected == held.build_collected && t.elapsed().as_secs() < 60 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        wait_steps(&db, 1);
+    }
+    // One tick more, still inside the period: the turn that took the
+    // build in is through, where the count of the collect is read from
+    // inside it.
+    wait_steps(&db, 1);
+    let c = db.zpage_counts();
+    assert!(
+        c.build_collected > held.build_collected && c.build_starts > held.build_starts,
+        "{what}: the due move started at the turn the builder came free: {c:?}"
+    );
+    assert!(
+        tick_until_built(&db, |c| c.stride_converts_back
+            >= c0.stride_converts_back + 2),
+        "{what}: the held conversion landed and the due one after it, no \
+         read between: {:?} {:?}",
+        db.zpage_counts(),
+        db.zpage_heat()
+    );
+    check(&r, &model, &keys, what);
+    let c = db.zpage_counts();
+    assert_eq!((c.fallbacks, c.recode_failed), (0, 0), "{what}: {c:?}");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A partition's own build comes before a conversion that is due
+/// (`Maint::z_convert_tick`): the builder takes a move between the forms
+/// only with nothing of the store's own due it. A store whose moves out
+/// have been paid many times their price, at a price that kept them from
+/// starting, is given a new partition with no form file and the price it
+/// can pay: the first build taken in is the new partition's, which a form
+/// file serves from then on, and the conversions follow it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_partitions_own_build_comes_before_a_conversion_that_is_due() {
+    let what = "the store's own build first";
+    let (dir, mut db, mut model, inject, keys) =
+        convert_store("auto-convert-own-first", ZStride::Forced, true);
+    let sec = std::time::Duration::from_secs(1);
+    let c0 = db.zpage_counts();
+    inject.set_convert_price(std::time::Duration::from_secs(1_000_000_000));
+    inject.set_budget(c0.file_bytes / 4);
+    convert_look(&db, sec);
+    let mut rounds = 0;
+    while db.zpage_counts().stride_convert_rent_us < 2_000_000 && rounds < 120 {
+        read_round(&db, &keys, keys.len());
+        convert_look(&db, sec);
+        rounds += 1;
+    }
+    assert!(
+        db.zpage_counts().stride_convert_rent_us >= 2_000_000,
+        "{what}: moves paid for: {:?}",
+        db.zpage_counts()
+    );
+    // A partition of its own above the store's greatest key, with no form
+    // file: the builder's to build. The promotion that made it opened the
+    // partition before it again under a new name, whose form file on disk
+    // an attach takes up with no build.
+    numbered_run(&mut db, &mut model, 20_000, 2_000, 0x0F1);
+    let c1 = db.zpage_counts();
+    assert!(
+        c1.partitions == c0.partitions + 1
+            && c1.form_files < c1.partitions
+            && c1.build_starts == c0.build_starts,
+        "{what}: a partition no form file serves, nothing started: {c1:?}"
+    );
+    inject.set_convert_price(std::time::Duration::from_millis(200));
+    // A look, at a turn that finds the builder free, a move due at the
+    // new price and the new partition unbuilt: the move waits. The budget
+    // is one that leaves the forms room beside the raw records of the
+    // partitions no form file serves yet, and less than they hold: with no
+    // room at all no move pays, every touch a fault whatever the forms.
+    inject.set_budget(c0.file_bytes * 3 / 4);
+    convert_look(&db, sec);
+    // The first build to be taken in, and the turn that took it through.
+    let t = std::time::Instant::now();
+    while db.zpage_counts().build_collected == c1.build_collected && t.elapsed().as_secs() < 60 {
+        wait_steps(&db, 1);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let c = db.zpage_counts();
+    assert_eq!(
+        (
+            c.build_collected,
+            c.form_files,
+            c.stride_converts_back,
+            c.stride_converts
+        ),
+        (
+            c1.build_collected + 1,
+            c1.partitions,
+            c0.stride_converts_back,
+            c0.stride_converts
+        ),
+        "{what}: the partition's own build taken in first, no conversion yet: {c:?}"
+    );
+    assert!(
+        tick_until_built(&db, |c| c.stride_converts_back > c0.stride_converts_back),
+        "{what}: and the due conversion after it: {:?}",
+        db.zpage_counts()
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, what);
+    let c = db.zpage_counts();
+    assert_eq!((c.fallbacks, c.recode_failed), (0, 0), "{what}: {c:?}");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A conversion in flight is priced as made
+/// (`Options::zpages_stride_convert`, `Maint::z_convert_look`): the looks
+/// beside its build model its partition in the form it is going to and
+/// offer nothing of it. With the stride form's partitions a page over
+/// their room, one move out is all the store needs: the policy starts it,
+/// and with its build held and the reads going on no other move is
+/// offered -- no rent is paid and nothing else starts -- where a look that
+/// priced the partition as it is still served would offer a move the
+/// store no longer needs, and start it when the builder was free. And a
+/// partition on its way into the stride form is not offered out of it
+/// before it has landed, however little room there is.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_conversion_in_flight_is_priced_as_made() {
+    let sec = std::time::Duration::from_secs(1);
+    {
+        let what = "a move out in flight";
+        let (dir, db, model, inject, keys) =
+            convert_store("auto-convert-flight-out", ZStride::Forced, true);
+        let r = db.reader().unwrap();
+        let c0 = db.zpage_counts();
+        // The first partition's move out asked for and held, and that
+        // partition read three times as much as the rest from here on: the
+        // last a pricing would take out, so that a look pricing it as still
+        // in the stride form offers another's move, whichever the reads'
+        // noise puts first among the rest.
+        let first = keys_of_partition(&db, &model, 0);
+        db.hold_zpage_build(true);
+        db.zpages_convert_ask(0);
+        let t = std::time::Instant::now();
+        while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+            wait_steps(&db, 1);
+        }
+        let held = db.zpage_counts();
+        assert!(
+            db.zpage_build_waiting() && held.build_starts == c0.build_starts + 1,
+            "{what}: the one move the store needs started and held: {held:?}"
+        );
+        inject.set_budget(c0.file_bytes - 4096);
+        convert_look(&db, sec);
+        for _ in 0..8 {
+            read_round(&db, &keys, keys.len());
+            read_round(&db, &first, 2 * first.len());
+            convert_look(&db, sec);
+        }
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.stride_convert_rent_us, c.build_starts),
+            (0, held.build_starts),
+            "{what}: nothing more offered while it is built: {c:?}"
+        );
+        db.hold_zpage_build(false);
+        assert!(
+            tick_until_built(&db, |c| c.stride_converts_back
+                == c0.stride_converts_back + 1
+                && c.build_collected == c.build_starts),
+            "{what}: landed: {:?}",
+            db.zpage_counts()
+        );
+        for _ in 0..4 {
+            read_round(&db, &keys, keys.len());
+            read_round(&db, &first, 2 * first.len());
+            convert_look(&db, sec);
+        }
+        wait_steps(&db, 5);
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.stride_converts_back, c.build_starts, c.stride_converts),
+            (
+                c0.stride_converts_back + 1,
+                held.build_starts,
+                c0.stride_converts
+            ),
+            "{what}: one move, and the store fits: {c:?}"
+        );
+        assert!(
+            !strides(&db)[0],
+            "{what}: the first partition's: {:?}",
+            strides(&db)
+        );
+        check(&r, &model, &keys, what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    {
+        let what = "a move in in flight";
+        let (dir, db, model, inject, keys) =
+            convert_store("auto-convert-flight-in", ZStride::Chosen, true);
+        let r = db.reader().unwrap();
+        let c0 = db.zpage_counts();
+        inject.set_budget(c0.file_bytes * 100);
+        db.hold_zpage_build(true);
+        db.zpages_convert_ask(1);
+        let t = std::time::Instant::now();
+        while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+            wait_steps(&db, 1);
+        }
+        let held = db.zpage_counts();
+        assert!(
+            db.zpage_build_waiting() && held.build_starts == c0.build_starts + 1,
+            "{what}: a conversion in, held at its build's start: {held:?}"
+        );
+        // No room at all: the one partition priced in the stride form is
+        // the one in flight.
+        inject.set_budget(c0.file_bytes / 4);
+        convert_look(&db, sec);
+        for _ in 0..8 {
+            read_round(&db, &keys, keys.len());
+            convert_look(&db, sec);
+        }
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.stride_convert_rent_us, c.build_starts, c.stride_files),
+            (0, held.build_starts, 0),
+            "{what}: not offered out before it has landed: {c:?}"
+        );
+        db.hold_zpage_build(false);
+        assert!(
+            tick_until_built(&db, |c| c.stride_converts == c0.stride_converts + 1),
+            "{what}: landed: {:?}",
+            db.zpage_counts()
+        );
+        check(&r, &model, &keys, what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Readers on threads of their own read through a store's partitions while
@@ -17504,6 +18031,18 @@ fn a_merges_outputs_keep_the_form_of_the_partition_they_rewrite() {
             st[0] && st.iter().filter(|s| **s).count() == 1,
             "{what}: the first partition alone in the stride form: {st:?}"
         );
+        // A rent paid a partition the merges below retire: the second
+        // partition read hot with room for it, at a price no rent comes to.
+        inject.set_convert_price(std::time::Duration::from_secs(1_000_000_000));
+        let second = keys_of_partition(&db, &model, 1);
+        convert_look(&db, sec);
+        read_round(&db, &second, 100_000);
+        convert_look(&db, sec);
+        assert!(
+            db.zpage_counts().stride_convert_rent_us > 0,
+            "{what}: a rent standing: {:?}",
+            db.zpage_counts()
+        );
         let before = db.zpage_counts();
         if !room {
             inject.set_budget(before.file_bytes);
@@ -17579,6 +18118,14 @@ fn a_merges_outputs_keep_the_form_of_the_partition_they_rewrite() {
         }
         let nos = db.zpage_stride_nos();
         assert!(nos.iter().all(|&n| n == 0), "{what}: no reason: {nos:?}");
+        // The rent went with the partition it was paid: the outputs have
+        // names of their own, and nothing has been read since.
+        convert_look(&db, sec);
+        let c = db.zpage_counts();
+        assert_eq!(
+            c.stride_convert_rent_us, 0,
+            "{what}: no rent kept for a partition a merge retired: {c:?}"
+        );
         let r = db.reader().unwrap();
         check(&r, &model, &keys, what);
         check_scan(&r, &model, what);
@@ -17750,6 +18297,159 @@ fn the_hot_raw_policy_stands_down_beside_the_stride_form() {
             assert!(c.hot_looks > 0, "{what}: the periods reach the look: {c:?}");
         }
         check(&r, &model, &keys, &what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The hot-raw policy beside the stride form
+/// (`Options::zpages_hot_raw_beside_stride`): a store whose lower
+/// partitions are stride files and upper ones block files, with room for a
+/// release. With the option the policy looks; a partition a stride file
+/// serves is rated with the rest and is not released however hot it reads
+/// -- its reads are a raw partition's already, in less room -- under the
+/// skew's release and under the fill alike, and a hot partition a block
+/// file serves is asked for and released as in a store with no stride
+/// file, every stride file still serving. Without the option the policy
+/// makes no look there.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_hot_raw_policy_releases_a_block_partition_beside_stride_files_and_never_a_stride_one() {
+    for (beside, fill) in [(true, false), (true, true), (false, false)] {
+        let what = format!("hot raw beside stride files {beside}, the fill {fill}");
+        let what = what.as_str();
+        let (dir, db, model, inject) = auto_store_loaded(
+            &format!("auto-hot-beside-{beside}-{fill}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_hot_raw = true;
+                o.zpages_hot_raw_slack = true;
+                o.zpages_hot_raw_beside_stride = beside;
+                o.zpages_hot_fill = fill;
+                o.zpages_stride = ZStride::Forced;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+            |db| mixed_load(db, 20_000, 0x4B5),
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until_built(&db, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        let c0 = db.zpage_counts();
+        let st = strides(&db);
+        let parts = st.len();
+        assert!(
+            c0.form_files == c0.partitions && st[0] && st[1] && !st[parts - 2],
+            "{what}: stride files below and block files above: {st:?} {c0:?}"
+        );
+        // Room for a release and more, by the budget and by the group.
+        let raw_one = (c0.model_record_bytes + c0.model_hash_bytes) / c0.partitions;
+        let budget = c0.file_bytes * 100;
+        inject.set_budget(budget);
+        let growth = (budget as f64 * supdb::db::HOT_RAW_GROWTH) as u64;
+        inject.set_slack(raw_one * 3 + growth);
+        let tick = std::time::Duration::from_millis(200);
+        if !beside {
+            let hot = keys_of_partition(&db, &model, parts - 2);
+            for _ in 0..4 {
+                read_round(&db, &hot, 100_000);
+                advance_tick(&db, tick);
+            }
+            wait_steps(&db, 5);
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_looks, c.hot_asks, c.hot_raw),
+                (0, 0, 0),
+                "{what}: the policy stands down: {c:?}"
+            );
+            check(&r, &model, &keys, what);
+            drop(r);
+            db.close().unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            continue;
+        }
+        // The stride files' partitions and one block file's read alike,
+        // under the skew's release: the stride files' reads are counted, so
+        // the median partition is one of them and the block one is no
+        // hotter than it. Counted at nothing they would leave the median
+        // at nothing, and any block partition read at all would be skewed.
+        hot_look(&db, tick);
+        if !fill {
+            let alike: Vec<Vec<u8>> = (0..parts)
+                .filter(|&i| st[i] || i == parts - 2)
+                .flat_map(|i| keys_of_partition(&db, &model, i))
+                .collect();
+            assert!(
+                st.iter().filter(|s| **s).count() * 2 > parts - 1,
+                "{what}: the stride files' partitions are the median's side: {st:?}"
+            );
+            for _ in 0..4 {
+                read_round(&db, &alike, 8 * alike.len());
+                hot_look(&db, tick);
+            }
+            wait_steps(&db, 5);
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_asks, c.hot_raw),
+                (0, 0),
+                "{what}: a block partition read as the stride ones are is not skewed: {c:?}"
+            );
+        }
+        // A stride file's partition read hot: rated, and left as it is.
+        let hot_stride = keys_of_partition(&db, &model, 0);
+        hot_look(&db, tick);
+        for _ in 0..4 {
+            read_round(&db, &hot_stride, 100_000);
+            hot_look(&db, tick);
+        }
+        wait_steps(&db, 5);
+        let c = db.zpage_counts();
+        assert!(c.hot_looks > 0, "{what}: the policy looks: {c:?}");
+        assert_eq!(
+            (c.hot_asks, c.hot_raw, c.hot_raw_now, c.stride_files),
+            (0, 0, 0, c0.stride_files),
+            "{what}: a stride file's partition is not released: {c:?}"
+        );
+        // A block file's partition read hot: asked for and released.
+        let hot_block = keys_of_partition(&db, &model, parts - 2);
+        for _ in 0..3 {
+            read_round(&db, &hot_block, 100_000);
+            hot_look(&db, tick);
+        }
+        assert!(
+            hot_until(&db, 10, |c| c.hot_raw >= 1),
+            "{what}: the hot block partition released: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.hot_raw_now, c.stride_files, c.form_files),
+            (1, c0.stride_files, c0.partitions - 1),
+            "{what}: one partition raw, every stride file serving: {c:?}"
+        );
+        assert_eq!(
+            strides(&db).iter().filter(|s| **s).count() as u64,
+            c0.stride_files
+        );
+        check(&r, &model, &keys, what);
+        let c = db.zpage_counts();
+        assert_eq!(c.fallbacks, 0, "{what}: {c:?}");
         drop(r);
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);

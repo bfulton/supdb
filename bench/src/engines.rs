@@ -1668,6 +1668,14 @@ pub struct Supdb {
     /// (`Options::zpages_stride_convert`): `supdb-zstrideconv`,
     /// `supdb-zstrideroomconv`.
     zstride_convert: bool,
+    /// A form file its build dropped asked back whole where the build is
+    /// taken in past the line (`Options::zpages_ask_dropped`):
+    /// `supdb-zaskdropped`, `supdb-zstrideroomconvask`.
+    zaskdropped: bool,
+    /// The hot-raw policy beside the stride form
+    /// (`Options::zpages_hot_raw_beside_stride`):
+    /// `supdb-zstrideroomconvaskhot`.
+    zhotbeside: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -2736,6 +2744,16 @@ struct Policy {
     /// `ZStride::Chosen`, whose load is built in the block form, and
     /// `supdb-zstrideroomconv` beside `supdb-zstrideroom`.
     zstride_convert: bool,
+    /// A form file whose build dropped it from the page cache as it wrote
+    /// it is asked back whole where the build is taken in with the store
+    /// past the selector's line (`Options::zpages_ask_dropped`):
+    /// `supdb-zaskdropped` beside `supdb`, and `supdb-zstrideroomconvask`
+    /// beside `supdb-zstrideroomconv`.
+    zaskdropped: bool,
+    /// The hot-raw policy runs beside the stride form, over the partitions
+    /// a block file serves (`Options::zpages_hot_raw_beside_stride`):
+    /// `supdb-zstrideroomconvaskhot` beside `supdb-zstrideroomconvask`.
+    zhotbeside: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -3028,6 +3046,8 @@ impl Default for Policy {
             zstride_first: None,
             zstride_room: false,
             zstride_convert: false,
+            zaskdropped: false,
+            zhotbeside: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3818,6 +3838,52 @@ impl Supdb {
                 zstride: Some(supdb::ZStride::Forced),
                 zstride_room: true,
                 zstride_convert: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with a form file its build dropped asked back whole where
+    /// the build is taken in past the selector's line
+    /// (`Options::zpages_ask_dropped`): `supdb-zaskdropped`.
+    pub fn create_zaskdropped(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zaskdropped: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-zstrideroomconv` with a form file its build dropped asked
+    /// back whole (`Options::zpages_ask_dropped`):
+    /// `supdb-zstrideroomconvask`.
+    pub fn create_zstride_room_conv_ask(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zstride: Some(supdb::ZStride::Forced),
+                zstride_room: true,
+                zstride_convert: true,
+                zaskdropped: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-zstrideroomconvask` with the hot-raw policy beside the
+    /// stride form (`Options::zpages_hot_raw_beside_stride`):
+    /// `supdb-zstrideroomconvaskhot`.
+    pub fn create_zstride_room_conv_ask_hot(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zstride: Some(supdb::ZStride::Forced),
+                zstride_room: true,
+                zstride_convert: true,
+                zaskdropped: true,
+                zhotbeside: true,
                 ..Policy::default()
             },
         )
@@ -8815,6 +8881,8 @@ impl Supdb {
             zstride_first,
             zstride_room,
             zstride_convert,
+            zaskdropped,
+            zhotbeside,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -9357,6 +9425,8 @@ impl Supdb {
             }),
             zpages_stride_room: zstride_room,
             zpages_stride_convert: zstride_convert,
+            zpages_ask_dropped: zaskdropped,
+            zpages_hot_raw_beside_stride: zhotbeside,
             zpages_seek_ord: if zpages_heads {
                 true
             } else {
@@ -9722,6 +9792,8 @@ impl Supdb {
             zstride_first,
             zstride_room,
             zstride_convert,
+            zaskdropped,
+            zhotbeside,
             ord_threads: Default::default(),
         })
     }
@@ -10093,6 +10165,9 @@ impl Engine for Supdb {
         if self.zrewarmbeside {
             return "supdb-zrewarmbeside";
         }
+        if self.zaskdropped && self.zstride.is_none() {
+            return "supdb-zaskdropped";
+        }
         // The stride form under the controller: the forced shapes that also
         // ask for it are named above and below by what they force.
         if self.zstride == Some(supdb::ZStride::Chosen) && self.zstride_convert && !self.zpages {
@@ -10100,6 +10175,10 @@ impl Engine for Supdb {
         }
         if zstride && !self.zpages && self.zstride_first.is_none() {
             return match (self.zstride_room, self.zstride_convert) {
+                (true, true) if self.zaskdropped && self.zhotbeside => {
+                    "supdb-zstrideroomconvaskhot"
+                }
+                (true, true) if self.zaskdropped => "supdb-zstrideroomconvask",
                 (true, true) => "supdb-zstrideroomconv",
                 (true, false) => "supdb-zstrideroom",
                 (false, _) => "supdb-zstride",
@@ -11658,6 +11737,8 @@ impl Engine for Supdb {
             ("zpage_stride_converts", z.stride_converts as f64),
             ("zpage_stride_converts_back", z.stride_converts_back as f64),
             ("zpage_stride_convert_looks", z.stride_convert_looks as f64),
+            ("zpage_dropped_asks", z.dropped_asks as f64),
+            ("zpage_dropped_ask_mb", (z.dropped_ask_bytes >> 20) as f64),
             ("zpage_builds_raw_tails", z.builds_raw_tails as f64),
             ("zpage_raw_dropped", z.raw_dropped as f64),
             (
@@ -12723,6 +12804,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zstrideroom"
         | "supdb-zstrideconv"
         | "supdb-zstrideroomconv"
+        | "supdb-zstrideroomconvask"
+        | "supdb-zstrideroomconvaskhot"
+        | "supdb-zaskdropped"
         | "supdb-zparsestart"
         | "supdb-zgreedy"
         | "supdb-znoflat"
@@ -13746,6 +13830,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zstrideroom" => supdb_arm(Supdb::create_zstride_room, dir)?,
         "supdb-zstrideconv" => supdb_arm(Supdb::create_zstride_conv, dir)?,
         "supdb-zstrideroomconv" => supdb_arm(Supdb::create_zstride_room_conv, dir)?,
+        "supdb-zstrideroomconvask" => supdb_arm(Supdb::create_zstride_room_conv_ask, dir)?,
+        "supdb-zstrideroomconvaskhot" => supdb_arm(Supdb::create_zstride_room_conv_ask_hot, dir)?,
+        "supdb-zaskdropped" => supdb_arm(Supdb::create_zaskdropped, dir)?,
         "supdb-zwalkowns" => supdb_arm(Supdb::create_zwalkowns, dir)?,
         "supdb-zviewperopen" => supdb_arm(Supdb::create_zviewperopen, dir)?,
         "supdb-znogroupahead" => supdb_arm(Supdb::create_znogroupahead, dir)?,
@@ -16775,6 +16862,31 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_stride == supdb::ZStride::Forced && o.zpages_stride_room);
                 assert!(o.zpages_stride_convert && o.zpages == b.zpages);
+            }
+            {
+                let z = Supdb::create_zaskdropped(&dir("zaskdropped")).unwrap();
+                assert_eq!(z.name(), "supdb-zaskdropped");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_ask_dropped && !b.zpages_ask_dropped);
+                assert!(o.zpages_stride == b.zpages_stride && o.zpages == b.zpages);
+                let z = Supdb::create_zstride_room_conv_ask(&dir("zstrideroomconvask")).unwrap();
+                assert_eq!(z.name(), "supdb-zstrideroomconvask");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_stride == supdb::ZStride::Forced && o.zpages_stride_room);
+                assert!(o.zpages_stride_convert && o.zpages_ask_dropped);
+                let c = Supdb::create_zstride_room_conv(&dir("zstrideroomconv2")).unwrap();
+                assert!(!c.db.as_ref().unwrap().options().zpages_ask_dropped);
+                assert!(!o.zpages_hot_raw_beside_stride && !b.zpages_hot_raw_beside_stride);
+                let h =
+                    Supdb::create_zstride_room_conv_ask_hot(&dir("zstrideroomconvaskhot")).unwrap();
+                assert_eq!(h.name(), "supdb-zstrideroomconvaskhot");
+                assert_eq!(h.features(), base.features());
+                let ho = h.db.as_ref().unwrap().options();
+                assert!(ho.zpages_stride == supdb::ZStride::Forced && ho.zpages_stride_room);
+                assert!(ho.zpages_stride_convert && ho.zpages_ask_dropped);
+                assert!(ho.zpages_hot_raw_beside_stride && ho.zpages_hot_raw == b.zpages_hot_raw);
             }
             {
                 let z = Supdb::create_zparsestart(&dir("zparsestart")).unwrap();

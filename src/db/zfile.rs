@@ -6136,6 +6136,11 @@ pub(super) struct ZEvents {
     /// the page cache as the store passed its budget
     /// (`ZCounts::ahead_swapped`).
     pub ahead_swapped: AtomicU64,
+    /// Form files asked back at their collect, their build having dropped
+    /// them as it wrote them, and the bytes asked for
+    /// (`ZCounts::dropped_asks`).
+    pub dropped_asks: AtomicU64,
+    pub dropped_ask_bytes: AtomicU64,
     /// Form files synced once named (`ZCounts::build_synced`).
     pub build_synced: AtomicU64,
     /// The I/O class the kernel reported for the last build thread
@@ -6488,6 +6493,11 @@ pub(super) struct Built {
     /// knows, and not that a read of the device returns it -- a write the
     /// device misplaced or stored wrong is seen only by a read of it.
     pub stride_device: bool,
+    /// Whether the build wrote its output back and dropped it from the page
+    /// cache as it went (`BuildPlan::drop_output`): the file is on the
+    /// device alone, and whoever serves it at once asks for its pages
+    /// first (`Options::zpages_ask_dropped`).
+    pub dropped: bool,
 }
 
 impl Built {
@@ -6931,27 +6941,47 @@ pub(super) fn swap_ahead(seg: &File, at: u64, len: u64, form: &Path) -> u64 {
                 libc::POSIX_FADV_DONTNEED,
             );
         }
-        let Ok(f) = File::open(form) else {
-            return 0;
-        };
-        let n = f.metadata().map_or(0, |m| m.len());
-        let mut off = 0u64;
-        while off < n {
-            let w = (n - off).min(crate::bytes::WILLNEED_PIECE as u64);
+    }
+    ask_file(form)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn swap_ahead(_seg: &File, _at: u64, _len: u64, _form: &Path) -> u64 {
+    0
+}
+
+/// The file at `form` asked of the kernel whole (`POSIX_FADV_WILLNEED`), in
+/// the pieces the kernel reads whole (`crate::bytes::WILLNEED_PIECE`): the
+/// bytes asked for, none where the file does not open. The ask starts the
+/// reads and waits for none of them, and a page the cache holds already is
+/// not read again.
+#[cfg(target_os = "linux")]
+pub(super) fn ask_file(form: &Path) -> u64 {
+    use std::os::unix::io::AsRawFd;
+    let Ok(f) = File::open(form) else {
+        return 0;
+    };
+    let n = f.metadata().map_or(0, |m| m.len());
+    let mut off = 0u64;
+    while off < n {
+        let w = (n - off).min(crate::bytes::WILLNEED_PIECE as u64);
+        // SAFETY: an advice over a file descriptor this call holds open;
+        // it changes no byte of the file.
+        unsafe {
             libc::posix_fadvise(
                 f.as_raw_fd(),
                 off as libc::off_t,
                 w as libc::off_t,
                 libc::POSIX_FADV_WILLNEED,
             );
-            off += w;
         }
-        n
+        off += w;
     }
+    n
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(super) fn swap_ahead(_seg: &File, _at: u64, _len: u64, _form: &Path) -> u64 {
+pub(super) fn ask_file(_form: &Path) -> u64 {
     0
 }
 
@@ -7553,6 +7583,7 @@ fn write_pages(
         stride_no: None,
         stride_seal: None,
         stride_device: false,
+        dropped: plan.drop_output,
     }))
 }
 
@@ -7924,6 +7955,7 @@ fn write_stride(
         stride_no: None,
         stride_seal: trailer_crc(&sealed),
         stride_device: device,
+        dropped: plan.drop_output,
     }))
 }
 
