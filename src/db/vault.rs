@@ -1975,8 +1975,18 @@ pub(crate) fn open_slot(path: impl AsRef<Path>) -> Result<File> {
     }
 }
 
+/// A manifest slot opened to be made durable, where it is: never made,
+/// so an open that finds no file there writes nothing; `None` then.
+pub(crate) fn open_slot_found(path: impl AsRef<Path>) -> Result<Option<File>> {
+    match File::open(real(path)) {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// A manifest slot's bytes made durable as the page cache holds them: an
-/// fdatasync of `f`, the file at `path` as the open read it, recorded once
+/// fdatasync of `f`, the file at `path` (`open_slot_found`), recorded once
 /// it has returned. `failed` is a test's: the error the fdatasync answers
 /// in its place, so a failure is never recorded.
 pub(crate) fn sync_slot(
@@ -1988,7 +1998,9 @@ pub(crate) fn sync_slot(
         Some(e) => Err(e),
         None => f.sync_data(),
     }?;
-    note_file("sync_slot", path, f);
+    if IO_SEAMS.load(Ordering::Relaxed) & SEAM_TRACE != 0 {
+        io_trace("sync_slot", &real(path));
+    }
     Ok(())
 }
 
@@ -2070,7 +2082,6 @@ pub(crate) fn exists(path: impl AsRef<Path>) -> bool {
 /// cipher the envelope a slot read named for it.
 pub(crate) fn on_device(path: impl AsRef<Path>) -> bool {
     let path = path.as_ref();
-    note("on_device", path);
     match locate(path) {
         None => path.exists(),
         Some((v, name)) if passes(&name) => v.real.join(name).exists(),
@@ -2252,49 +2263,6 @@ const SEAM_HOOK: u8 = 2;
 /// A test's: what `trace_io` recorded, in order, process-wide.
 static IO_TRACE: Mutex<Vec<(&'static str, PathBuf)>> = Mutex::new(Vec::new());
 
-/// A test's: `what` of the file at `path` recorded in the trace where it
-/// is on (`trace_io`), by the file's path in the filesystem; one load
-/// otherwise. For the open's own reads -- a manifest slot opened to be
-/// read (`read_slot`), a named segment looked for (`on_device`), a segment
-/// mapped to hold an unnamed one's key (`open_holder`), a log file
-/// replayed (`replay`) -- which a test counts.
-pub(crate) fn note(what: &'static str, path: impl AsRef<Path>) {
-    if IO_SEAMS.load(Ordering::Relaxed) & SEAM_TRACE != 0 {
-        io_trace(what, &real(path));
-    }
-}
-
-/// A test's: `what` of the file at `path` recorded as `note` records it,
-/// and beside it in a record of its own which descriptor it was made
-/// through -- the descriptor's number and its open file description's
-/// offset, which a second open of the same file does not share -- so a
-/// test can hold two calls to one descriptor: a slot file read
-/// (`read_slot`, once its bytes are read) and the fdatasync that makes it
-/// durable (`sync_slot`). One load where tracing is off.
-pub(crate) fn note_file(what: &'static str, path: impl AsRef<Path>, f: &File) {
-    if IO_SEAMS.load(Ordering::Relaxed) & SEAM_TRACE != 0 {
-        use std::io::Seek;
-        use std::os::fd::AsRawFd;
-        let path = real(path);
-        let at = (&mut &*f).stream_position().unwrap_or(u64::MAX);
-        io_trace(what, &path);
-        IO_DESC
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((what, path, f.as_raw_fd(), at));
-    }
-}
-
-/// A test's: what `note_file` recorded beside the trace, in order,
-/// process-wide: the call, the file's path in the filesystem, the
-/// descriptor's number and its offset.
-static IO_DESC: Mutex<Vec<(&'static str, PathBuf, i32, u64)>> = Mutex::new(Vec::new());
-
-/// A test's: the record `note_file` keeps, so far.
-pub(crate) fn traced_descriptors() -> Vec<(&'static str, PathBuf, i32, u64)> {
-    IO_DESC.lock().unwrap_or_else(|e| e.into_inner()).clone()
-}
-
 fn io_trace(what: &'static str, path: &Path) {
     IO_TRACE
         .lock()
@@ -2303,10 +2271,10 @@ fn io_trace(what: &'static str, path: &Path) {
 }
 
 /// A test's: from `on`, record every directory fsync that returned, every
-/// file fsync through `sync_file` or `sync_slot` that returned, every
-/// open of a manifest slot for writing and the open's own reads (`note`),
-/// each by the file's path in the filesystem (`real`), in the order they
-/// were made, process-wide; off, record nothing. The record so far.
+/// file fsync through `sync_file` or `sync_slot` that returned and every
+/// open of a manifest slot for writing, each by the file's path in the
+/// filesystem (`real`), in the order they were made, process-wide; off,
+/// record nothing. The record so far.
 pub(crate) fn trace_io(on: bool) -> Vec<(&'static str, PathBuf)> {
     if on {
         IO_SEAMS.fetch_or(SEAM_TRACE, Ordering::Relaxed);
