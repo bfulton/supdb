@@ -3736,6 +3736,23 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with every build of a form file asking for the stride form
+    /// (`Options::zpages_stride` at `Forced`) and nothing else moved:
+    /// `supdb-zstride`, the stride form under the controller, which buys,
+    /// drops, syncs, asks back and rewarms its files as it does the block
+    /// form's. The forced stride arms have none of that lifecycle, so this
+    /// is the arm that says what the form reads where the controller owns
+    /// it.
+    pub fn create_zstride(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zstride: Some(supdb::ZStride::Forced),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` whose rewarm is made beside merges in flight, the shape
     /// before (`Options::zpages_rewarm_beside_merges` on).
     pub fn create_zrewarmbeside(path: &Path) -> Res<Supdb> {
@@ -10000,6 +10017,11 @@ impl Engine for Supdb {
         if self.zrewarmbeside {
             return "supdb-zrewarmbeside";
         }
+        // The stride form under the controller: the forced shapes that also
+        // ask for it are named above and below by what they force.
+        if zstride && !self.zpages && self.zstride_first.is_none() {
+            return "supdb-zstride";
+        }
         if self.zwalkowns {
             return "supdb-zwalkowns";
         }
@@ -12610,6 +12632,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zhotskewroomhyst"
         | "supdb-zrewarmwait"
         | "supdb-zrewarmbeside"
+        | "supdb-zstride"
         | "supdb-zparsestart"
         | "supdb-zgreedy"
         | "supdb-znoflat"
@@ -13629,6 +13652,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zhotskewroomhyst" => supdb_arm(Supdb::create_zhotskewroomhyst, dir)?,
         "supdb-zrewarmwait" => supdb_arm(Supdb::create_zrewarmwait, dir)?,
         "supdb-zrewarmbeside" => supdb_arm(Supdb::create_zrewarmbeside, dir)?,
+        "supdb-zstride" => supdb_arm(Supdb::create_zstride, dir)?,
         "supdb-zwalkowns" => supdb_arm(Supdb::create_zwalkowns, dir)?,
         "supdb-zviewperopen" => supdb_arm(Supdb::create_zviewperopen, dir)?,
         "supdb-znogroupahead" => supdb_arm(Supdb::create_znogroupahead, dir)?,
@@ -16622,6 +16646,15 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_rewarm_beside_merges && !b.zpages_rewarm_beside_merges);
                 assert!(o.zpages_rewarm_quiet_ms == b.zpages_rewarm_quiet_ms);
+            }
+            {
+                let z = Supdb::create_zstride(&dir("zstride")).unwrap();
+                assert_eq!(z.name(), "supdb-zstride");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_stride == supdb::ZStride::Forced);
+                assert!(b.zpages_stride == supdb::ZStride::Off);
+                assert!(o.zpages == b.zpages && o.zpages_stride_below.is_none());
             }
             {
                 let z = Supdb::create_zparsestart(&dir("zparsestart")).unwrap();
