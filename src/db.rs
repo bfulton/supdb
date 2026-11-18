@@ -833,6 +833,9 @@ pub struct ZCounts {
     /// Raw-tail picks a reading made before any reader came, taken as the
     /// block coding (`Maint::z_pick_raw_ok`).
     pub coding_unread: u64,
+    /// Builds that asked nothing of the stride form for want of room
+    /// (`Options::zpages_stride_room`).
+    pub stride_no_room: u64,
     pub builds_raw_tails: u64,
     /// Partitions re-coded while served (`Options::zpages_recode`): to the
     /// raw tails, back to the block coding, and re-codes that installed
@@ -5954,6 +5957,29 @@ pub struct Options {
     /// partition lies, as `zpages_stride` attaches one.
     #[doc(hidden)]
     pub zpages_stride_below: Option<std::sync::Arc<[u8]>>,
+    /// EXPERIMENT: with `zpages_stride` at `Forced`, a build on the segment
+    /// work's thread -- a partition's own, a build ahead, a merge output's
+    /// at its finish -- asks for the stride form only where the store in
+    /// that form fits the room as it is at the build
+    /// (`zselect::stride_fits`): the partitions' values alone, which is the
+    /// stride form's size, with the level-0 pieces' payload beside them,
+    /// within the platform's budget, the limit less the process's memory
+    /// and the margin (`zfile::read_budget`; a test's injected one). Where
+    /// it does not, the partition is built in the block form as a plan that
+    /// asks nothing builds it, counted (`ZCounts::stride_no_room`) and with
+    /// no reason kept on the segment, since none was found. With no budget
+    /// to read the form is asked for. A stride file on disk is attached
+    /// whatever the room, as `zpages_stride` attaches one, so the store is
+    /// in two forms wherever the room has moved between its builds. The
+    /// selector's own budget counts none of the page cache's other tenants,
+    /// and its model predicted no fault for a stride form the pass after a
+    /// full rewrite found a quarter short of its pages (`docs/engine.md`,
+    /// which form a workload calls for); the pieces are the tenant a burst
+    /// adds, and the process's growth is in the budget read at the build.
+    /// Off; `supdb-zstrideroom` is the arm, beside `supdb-zstride`, which
+    /// asks at every build.
+    #[doc(hidden)]
+    pub zpages_stride_room: bool,
     /// EXPERIMENT: under `zpages_stride` `Forced`, a stride file whose build
     /// in this process read every rank back through the reader's body before
     /// its name (`zfile::check_stride`), and read it from the device -- none
@@ -6412,6 +6438,7 @@ impl Default for Options {
             zpages_rewarm_quiet_ms: 250,
             zpages_stride: ZStride::Off,
             zpages_stride_below: None,
+            zpages_stride_room: false,
             zpages_stride_trust_built: true,
         }
     }
@@ -8226,6 +8253,10 @@ struct Seg {
     /// and a partition the stride form declines is one the block form
     /// serves.
     z_stride_no: std::sync::atomic::AtomicU8,
+    /// The first key's length: with the key count, what the partition's
+    /// values alone come to where its keys are one width, as the stride
+    /// form asks (`Seg::stride_bytes`).
+    key0_len: u32,
     /// Reads of the raw form while the hot-raw policy holds this partition
     /// there (`zfile::DECLINED_HOT_RAW`), one in sixteen per thread
     /// (`Seg::hot_read`): the partition's heat, as a form file's opens are
@@ -11498,6 +11529,16 @@ impl PieceWriter {
 }
 
 impl Seg {
+    /// What this segment's values alone come to where its keys are of its
+    /// first key's width: its payload, keys and values, less a key of that
+    /// width for each of its keys. The stride form's size for a partition
+    /// the form takes, which holds one value of one width a key and keys
+    /// of one width (`Maint::z_stride_fits`); for any other an estimate.
+    fn stride_bytes(&self) -> u64 {
+        self.data
+            .saturating_sub(self.ord.len() as u64 * u64::from(self.key0_len))
+    }
+
     /// The ordered index's heads copied into anonymous memory and read
     /// from there from here on (`Options::heads_owned`): whether this call
     /// made the copy. The mapping's pages are asked for whole first, since
@@ -11748,8 +11789,10 @@ impl Seg {
             .map_err(|e| err(&format!("segment {name}: {e}")))?;
         // The common prefix, once, off the first key, so a seek's prefix
         // check reads no record.
+        let mut key0_len = 0u32;
         if let Some(first) = blob.key_at(0) {
             ord.learn_prefix(first);
+            key0_len = first.len() as u32;
         }
         // Taken from the POLICY, not from the phase the store is in. The
         // segment's advice follows the workload and `Db::advise` flips it;
@@ -11802,6 +11845,7 @@ impl Seg {
                 hot_reads16: AtomicU64::new(0),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
                 z_stride_no: std::sync::atomic::AtomicU8::new(0),
+                key0_len,
                 z_rebuilds: std::sync::atomic::AtomicU8::new(0),
                 z_retry: std::sync::Mutex::new(None),
                 z_backoff: AtomicU64::new(0),
@@ -11847,6 +11891,7 @@ impl Seg {
                 hot_reads16: AtomicU64::new(0),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
                 z_stride_no: std::sync::atomic::AtomicU8::new(0),
+                key0_len,
                 z_rebuilds: std::sync::atomic::AtomicU8::new(0),
                 z_retry: std::sync::Mutex::new(None),
                 z_backoff: AtomicU64::new(0),
@@ -11884,6 +11929,7 @@ impl Seg {
             hot_reads16: AtomicU64::new(0),
             z_declined: std::sync::atomic::AtomicU8::new(0),
             z_stride_no: std::sync::atomic::AtomicU8::new(0),
+            key0_len,
             z_rebuilds: std::sync::atomic::AtomicU8::new(0),
             z_retry: std::sync::Mutex::new(None),
             z_backoff: AtomicU64::new(0),
@@ -23989,6 +24035,7 @@ impl Reader {
             coding_repicks: get(&ev.coding_repicks),
             finish_refused: get(&ev.finish_refused),
             coding_unread: get(&ev.coding_unread),
+            stride_no_room: get(&ev.stride_no_room),
             builds_raw_tails: get(&ev.builds_raw_tails),
             recodes: get(&ev.recodes),
             recodes_back: get(&ev.recodes_back),
@@ -50078,6 +50125,57 @@ impl Maint {
         }
     }
 
+    /// Whether the store in the stride form fits the room as it is now
+    /// (`Options::zpages_stride_room`, `zselect::stride_fits`): every
+    /// partition's values alone and every level-0 piece's payload, against
+    /// the budget a test injects or the platform reads. With no budget to
+    /// read it fits.
+    fn z_stride_fits(&self) -> bool {
+        let budget = self
+            .opts
+            .zpages_inject
+            .as_ref()
+            .and_then(|i| i.budget())
+            .or_else(|| zfile::read_budget().map(|b| b.budget));
+        let Some(budget) = budget else {
+            return true;
+        };
+        let (stride, pieces) = {
+            let _op = self.op();
+            self.segs().iter().fold((0u64, 0u64), |(st, pc), s| {
+                if s.level > 0 {
+                    (st.saturating_add(s.stride_bytes()), pc)
+                } else {
+                    (st, pc.saturating_add(s.data))
+                }
+            })
+        };
+        let fits = zselect::stride_fits(budget, stride, pieces);
+        if self.z_trace {
+            eprintln!(
+                "zstrideroom t={:.1} fits {fits} budget_mb {} stride_mb {} pieces_mb {}",
+                self.z_now().as_secs_f64(),
+                budget >> 20,
+                stride >> 20,
+                pieces >> 20
+            );
+        }
+        fits
+    }
+
+    /// What a build on this thread asks of the stride form now: what the
+    /// options ask (`Options::z_stride_ask`), and nothing where they hold
+    /// the ask to the room and the store in the stride form does not fit it
+    /// (`Options::zpages_stride_room`), counted.
+    fn z_stride_ask_now(&self) -> zfile::StrideAsk {
+        let ask = self.opts.z_stride_ask();
+        if ask == zfile::StrideAsk::No || !self.opts.zpages_stride_room || self.z_stride_fits() {
+            return ask;
+        }
+        zfile::ZEvents::add(&self.shared.z.stride_no_room, 1);
+        zfile::StrideAsk::No
+    }
+
     /// The builds at a merge's output finish (`Options::zpages_build_at_finish`),
     /// where forms are wanted: under the controller, the store past the share
     /// of its budget the builds ahead start at, past its budget, or the form
@@ -50120,7 +50218,7 @@ impl Maint {
         plan.parse = self.opts.zpages_parse && self.opts.zpages_parse_finish;
         plan.parse_chains = self.opts.zpages_parse_chains;
         plan.own_decode = self.opts.zpages_own_decoder;
-        plan.stride = self.opts.z_stride_ask();
+        plan.stride = self.z_stride_ask_now();
         plan.stride_below = self.opts.zpages_stride_below.clone();
         plan.hold = Some(self.shared.zbuild_hold.clone());
         Some(std::sync::Arc::new(ZFinish {
@@ -51092,7 +51190,7 @@ impl Maint {
         plan.stride = if recode {
             zfile::StrideAsk::No
         } else {
-            self.opts.z_stride_ask()
+            self.z_stride_ask_now()
         };
         plan.stride_below = self.opts.zpages_stride_below.clone();
         if raw_tails {

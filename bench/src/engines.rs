@@ -1661,6 +1661,9 @@ pub struct Supdb {
     /// stride form (`Options::zpages_stride_below`), or none where every
     /// partition is asked: `supdb-cache64tofitzstridedrop2m` to `...7m`.
     zstride_first: Option<u64>,
+    /// The stride form asked for only where the store in it fits the room
+    /// (`Options::zpages_stride_room`): `supdb-zstrideroom`.
+    zstride_room: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -2718,6 +2721,11 @@ struct Policy {
     /// keys, shares of the ten-million rung they are for and every key of a
     /// rung under them.
     zstride_first: Option<u64>,
+    /// A build asks for the stride form only where the store in that form
+    /// fits the room at the build (`Options::zpages_stride_room`):
+    /// `supdb-zstrideroom`, beside `supdb-zstride`, which asks at every
+    /// build.
+    zstride_room: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -3008,6 +3016,7 @@ impl Default for Policy {
             zmemo_mib: 0,
             zstride: None,
             zstride_first: None,
+            zstride_room: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3748,6 +3757,22 @@ impl Supdb {
             path,
             Policy {
                 zstride: Some(supdb::ZStride::Forced),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-zstride` whose builds ask for the stride form only where the
+    /// store in it fits the room at the build
+    /// (`Options::zpages_stride_room`): `supdb-zstrideroom`. A rewriting
+    /// burst's pieces and the process's own growth take from the room, so
+    /// the outputs built while they stand come out in the block form.
+    pub fn create_zstride_room(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zstride: Some(supdb::ZStride::Forced),
+                zstride_room: true,
                 ..Policy::default()
             },
         )
@@ -8743,6 +8768,7 @@ impl Supdb {
             zmemo_mib,
             zstride,
             zstride_first,
+            zstride_room,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -9283,6 +9309,7 @@ impl Supdb {
                 crate::workload::db_key_into(n, &mut key);
                 std::sync::Arc::from(&key[..])
             }),
+            zpages_stride_room: zstride_room,
             zpages_seek_ord: if zpages_heads {
                 true
             } else {
@@ -9646,6 +9673,7 @@ impl Supdb {
             zmemo_mib,
             zstride,
             zstride_first,
+            zstride_room,
             ord_threads: Default::default(),
         })
     }
@@ -10020,7 +10048,11 @@ impl Engine for Supdb {
         // The stride form under the controller: the forced shapes that also
         // ask for it are named above and below by what they force.
         if zstride && !self.zpages && self.zstride_first.is_none() {
-            return "supdb-zstride";
+            return if self.zstride_room {
+                "supdb-zstrideroom"
+            } else {
+                "supdb-zstride"
+            };
         }
         if self.zwalkowns {
             return "supdb-zwalkowns";
@@ -11571,6 +11603,7 @@ impl Engine for Supdb {
             ("zpage_coding_repicks", z.coding_repicks as f64),
             ("zpage_finish_refused", z.finish_refused as f64),
             ("zpage_coding_unread", z.coding_unread as f64),
+            ("zpage_stride_no_room", z.stride_no_room as f64),
             ("zpage_builds_raw_tails", z.builds_raw_tails as f64),
             ("zpage_raw_dropped", z.raw_dropped as f64),
             (
@@ -12633,6 +12666,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zrewarmwait"
         | "supdb-zrewarmbeside"
         | "supdb-zstride"
+        | "supdb-zstrideroom"
         | "supdb-zparsestart"
         | "supdb-zgreedy"
         | "supdb-znoflat"
@@ -13653,6 +13687,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zrewarmwait" => supdb_arm(Supdb::create_zrewarmwait, dir)?,
         "supdb-zrewarmbeside" => supdb_arm(Supdb::create_zrewarmbeside, dir)?,
         "supdb-zstride" => supdb_arm(Supdb::create_zstride, dir)?,
+        "supdb-zstrideroom" => supdb_arm(Supdb::create_zstride_room, dir)?,
         "supdb-zwalkowns" => supdb_arm(Supdb::create_zwalkowns, dir)?,
         "supdb-zviewperopen" => supdb_arm(Supdb::create_zviewperopen, dir)?,
         "supdb-znogroupahead" => supdb_arm(Supdb::create_znogroupahead, dir)?,
@@ -16654,6 +16689,15 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_stride == supdb::ZStride::Forced);
                 assert!(b.zpages_stride == supdb::ZStride::Off);
+                assert!(o.zpages == b.zpages && o.zpages_stride_below.is_none());
+                assert!(!o.zpages_stride_room && !b.zpages_stride_room);
+            }
+            {
+                let z = Supdb::create_zstride_room(&dir("zstrideroom")).unwrap();
+                assert_eq!(z.name(), "supdb-zstrideroom");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_stride == supdb::ZStride::Forced && o.zpages_stride_room);
                 assert!(o.zpages == b.zpages && o.zpages_stride_below.is_none());
             }
             {

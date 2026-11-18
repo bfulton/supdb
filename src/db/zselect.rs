@@ -514,6 +514,18 @@ pub fn choose_coding(budget: u64, raw_tails: FormSize) -> Coding {
     }
 }
 
+/// Whether a store whose partitions' values alone are `stride` bytes, the
+/// stride form's size, fits `budget` beside `other`, the bytes of what its
+/// reads touch that is no form's: the level-0 pieces a scan reads a page of
+/// in every block. The whole store and not the partition a build is of,
+/// since a partition's stride form fits or does not with the rest of the
+/// store's, and the budget as it is where the question is asked, since a
+/// rewriting burst's pieces and the process's own memory take from it what
+/// they hold then (`Options::zpages_stride_room`).
+pub fn stride_fits(budget: u64, stride: u64, other: u64) -> bool {
+    stride.saturating_add(other) <= budget
+}
+
 /// `C_build`, seconds: what buying the form costs, the CPU the build is
 /// estimated to take plus the displacement of the cache it causes. Until the
 /// displacement is measured it is [`DISPLACEMENT_FACTOR`] of the CPU. For a
@@ -3510,6 +3522,21 @@ mod tests {
     /// line, the faults are the cold population's where a hot one shares the
     /// cache, a population nobody reads takes no room, and the faults are in
     /// the unit the touches are counted in.
+    #[test]
+    fn the_stride_form_fits_with_what_stands_beside_it() {
+        // The whole budget and no more, and the pieces beside the form are
+        // counted against it as the form's own bytes are.
+        assert!(stride_fits(1000, 1000, 0));
+        assert!(!stride_fits(1000, 1001, 0));
+        assert!(stride_fits(1000, 700, 300));
+        assert!(!stride_fits(1000, 700, 301));
+        // No budget holds nothing but nothing, and a sum past the type's
+        // range does not wrap into fitting.
+        assert!(stride_fits(0, 0, 0));
+        assert!(!stride_fits(0, 1, 0));
+        assert!(!stride_fits(u64::MAX - 1, u64::MAX, u64::MAX));
+    }
+
     #[test]
     fn the_model_over_populations_charges_the_cold_one() {
         let pop = |bytes, touches| Population { bytes, touches };

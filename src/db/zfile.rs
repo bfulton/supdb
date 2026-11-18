@@ -6143,6 +6143,9 @@ pub(super) struct ZEvents {
     /// Raw-tail picks taken as the block coding for want of a reader
     /// (`Maint::z_pick_raw_ok`).
     pub coding_unread: AtomicU64,
+    /// Builds held to the room that asked nothing of the stride form
+    /// (`Options::zpages_stride_room`).
+    pub stride_no_room: AtomicU64,
     /// The partitions whose raw pages were dropped at their form file's
     /// install (`Options::zpages_drop_raw`).
     pub raw_dropped: AtomicU64,

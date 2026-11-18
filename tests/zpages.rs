@@ -16533,6 +16533,136 @@ fn a_store_holds_the_stride_form_under_a_key_and_the_block_form_from_it_up() {
     }
 }
 
+/// The stride form asked for only where the store in it fits the room
+/// (`Options::zpages_stride_room`): a store written with no form and opened
+/// under the forced stride form, so that every partition is built with the
+/// store whole and no piece beside it, against an injected budget. The
+/// stride form of the store is its values alone, six thousand of a hundred
+/// bytes: at a budget of exactly that every partition is asked and holds the
+/// stride form, and a byte under it none is asked, each is built in the
+/// block form with no reason kept, and the builds that asked nothing are
+/// counted. A budget of the payload's size would pass both, and a rule that
+/// counted the keys would refuse the first. A store the room moved under
+/// between its builds is in two forms, the files on disk attached as they
+/// are.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_build_asks_for_the_stride_form_only_where_the_store_in_it_fits_the_room() {
+    const KEYS: usize = 6000;
+    const WIDTH: usize = 100;
+    let values = (KEYS * WIDTH) as u64;
+    let room = |budget: u64| {
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_budget(budget);
+        let handle = inject.clone();
+        let opts = stride_forced(move |o| {
+            o.partition_bytes = Some(160 << 10);
+            o.publish_in_background = true;
+            o.zpages_stride_room = true;
+            o.zpages_inject = Some(inject);
+        });
+        (opts, handle)
+    };
+    for (budget, fits) in [(values, true), (values - 1, false)] {
+        let what = &format!("the stride form held to a room of {budget} bytes");
+        let dir = scratch(&format!("stride-room-{fits}"));
+        let model = {
+            let mut db = Db::create(
+                &dir,
+                Options {
+                    partition_bytes: Some(160 << 10),
+                    ..off()
+                },
+            )
+            .unwrap();
+            let model = numbered_load(&mut db, KEYS, WIDTH, 0x5EA7);
+            db.settle().unwrap();
+            db.close().unwrap();
+            model
+        };
+        let mut db = Db::open(&dir, room(budget).0).unwrap();
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert!(c.partitions > 2, "{what}: several partitions: {c:?}");
+        assert_eq!(
+            c.form_files, c.partitions,
+            "{what}: a form file each: {c:?}"
+        );
+        if fits {
+            assert_eq!(
+                (c.stride_files, c.stride_no_room),
+                (c.partitions, 0),
+                "{what}: every partition asked and held in the stride form: {c:?}"
+            );
+        } else {
+            assert_eq!(c.stride_files, 0, "{what}: none in the stride form: {c:?}");
+            assert!(
+                c.stride_no_room >= c.partitions,
+                "{what}: every build asked nothing, counted: {c:?}"
+            );
+        }
+        let nos = db.zpage_stride_nos();
+        assert!(
+            nos.iter().all(|&n| n == 0),
+            "{what}: a partition not asked keeps no reason: {nos:?}"
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&db, &model, &keys, what);
+        let c = db.zpage_counts();
+        assert_eq!(c.fallbacks, 0, "{what}: {c:?}");
+        assert_eq!(
+            c.stride_reads > 0,
+            fits,
+            "{what}: reads through the form the room chose: {c:?}"
+        );
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // The room gone between a store's builds: the first half built with
+    // room for it, the second written after the budget fell to a byte (the
+    // seam reads zero as no budget injected).
+    let what = "the room gone between a store's builds";
+    let dir = scratch("stride-room-moved");
+    let (opts, inject) = room(u64::MAX);
+    let mut db = Db::create(&dir, opts).unwrap();
+    let mut model = numbered_load(&mut db, KEYS / 2, WIDTH, 0x5EA8);
+    db.zpages_settle().unwrap();
+    let first = db.zpage_counts();
+    assert!(
+        first.stride_files > 0 && first.stride_files == first.form_files,
+        "{what}: the first half in the stride form: {first:?}"
+    );
+    inject.set_budget(1);
+    let mut rng = Rng(0x5EA9);
+    for i in KEYS / 2..KEYS {
+        let v: Vec<u8> = (0..WIDTH).map(|_| (rng.next() >> 24) as u8).collect();
+        let k = numbered_key(i);
+        db.append(&k, &v);
+        model.insert(k, vec![v]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        c.form_files, c.partitions,
+        "{what}: a form file each: {c:?}"
+    );
+    assert!(
+        c.stride_files > 0 && c.stride_files < c.form_files && c.stride_no_room > 0,
+        "{what}: a store in two forms: {c:?}"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    check(&db, &model, &keys, what);
+    let c = db.zpage_counts();
+    assert!(
+        c.stride_reads > 0 && c.reads > c.stride_reads && c.fallbacks == 0,
+        "{what}: reads through both files: {c:?}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The same line at a merge's output finish, the third site a partition's
 /// form is built at: every key put again, the pieces merged, and each output
 /// built at its finish in the stride form where its first key is under the
@@ -16624,6 +16754,94 @@ fn a_merges_outputs_are_built_in_the_form_their_side_of_the_key_has() {
     let c = db.zpage_counts();
     assert!(c.stride_reads > 0, "{what}: {c:?}");
     assert_eq!(c.fallbacks, 0, "{what}: {c:?}");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The room at a merge's output finish (`Options::zpages_stride_room`): the
+/// store past a budget its values alone fit with fifty kilobytes to spare,
+/// every key put again and the pieces merged. The finish's plan is made
+/// with the pieces standing, and it is the pieces the room is short by: the
+/// store in the stride form with them beside it does not fit, and every
+/// output is built in the block form at its finish with the refusal counted
+/// -- where the same store with the room not asked builds its outputs in
+/// the stride form
+/// (`a_merges_outputs_are_built_in_the_form_their_side_of_the_key_has`), and
+/// a rule that left the pieces out would.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_merges_outputs_are_built_in_the_block_form_where_the_room_is_short() {
+    let what = "the room at the outputs' finish";
+    let (dir, mut db, mut model, inject, raw) = land_store_loaded(
+        "auto-finish-stride-room",
+        50,
+        |o| {
+            o.zpages_stride = ZStride::Forced;
+            o.zpages_stride_room = true;
+            o.zpages_build_at_finish = true;
+            o.zpages_ahead_builders = 8;
+            o.partition_bytes = Some(1 << 20);
+            o.l0_trigger = 1;
+        },
+        |db| numbered_load(db, 20_000, 100, 0x5F3),
+    );
+    // The values alone fit it, and the raw records do not, so the store is
+    // past its budget and its outputs are given their forms at the finish.
+    let budget = 20_000 * 100 + 50_000;
+    assert!(raw > budget, "{what}: the store past the budget: {raw}");
+    let mut seen = 0usize;
+    db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+    assert_eq!(seen, 10);
+    inject.set_decode_cost(std::time::Duration::from_micros(1));
+    inject.set_budget(budget);
+    wait_steps(&db, 2);
+    let mut rng = Rng(0x5EEF);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    for chunk in keys.chunks(250) {
+        for k in chunk {
+            let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
+            db.put(k, &v);
+            model.insert(k.clone(), vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.seal().unwrap();
+    db.settle().unwrap();
+    wait_for("the builds at the outputs' finish to end", || {
+        let c = db.zpage_counts();
+        c.finish_builds >= 1 && c.finish_live == 0 && db.merges_in_flight() == 0
+    });
+    let c = db.zpage_counts();
+    assert!(
+        c.finish_builds >= 1 && c.stride_builds == 0 && c.stride_no_room >= 1,
+        "{what}: every output built in the block form, the refusals counted: {c:?}"
+    );
+    let stride_on_disk = form_files(&dir)
+        .iter()
+        .filter(|f| {
+            let b = std::fs::read(f).unwrap();
+            supdb::db::zpages::trailer_magic(&b[b.len() - ZTRAILER..])
+                == Some(supdb::db::zpages::STRIDE_MAGIC)
+        })
+        .count();
+    assert_eq!(stride_on_disk, 0, "{what}: no stride file on disk");
+    assert!(
+        tick_until(&db, 400, |c| c.sel_installs >= 1
+            && c.form_files == c.partitions),
+        "{what}: the files on disk not installed: {:?}",
+        db.zpage_counts()
+    );
+    let nos = db.zpage_stride_nos();
+    assert!(nos.iter().all(|&n| n == 0), "{what}: no reason: {nos:?}");
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, what);
+    drop(r);
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.stride_files, c.stride_reads, c.fallbacks),
+        (0, 0, 0),
+        "{what}: served by the block form: {c:?}"
+    );
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
