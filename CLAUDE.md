@@ -2554,11 +2554,19 @@ clear (under a cipher the listing is of the names a slot gave the store,
 so each envelope is still looked for), makes its checks before the
 replay, and looks an unnamed segment's key up in the segments whose
 fences take it in (`Db::name_takes`); the open's own reads are in the
-process's trace (`vault::note`), which is what its tests count. The rule:
-a step added to a path no cell times is priced by a probe of that path
-before it lands, and every read it makes is first asked whether the path
-already holds the answer -- a descriptor, a listing, the fences in a
-name.
+process's trace (`vault::note`), which is what its tests count. The
+first test of the slots' fold counted the read's own record and so held
+it only against the shape it replaced, whose second open had made one
+too: a second open by path for the sync made no record and passed. The
+slot read and its fdatasync record which descriptor each went through
+(`vault::note_file`, the number and the open file description's offset,
+which a second open of the file does not share), and the test holds the
+two to one. The rule: a step added to a path no cell times is priced by
+a probe of that path before it lands, and every read it makes is first
+asked whether the path already holds the answer -- a descriptor, a
+listing, the fences in a name; and a fold that removes a call is held by
+the identity of what the remaining call used, never by a count of a
+record the removed call would have had to make.
 
 **A slot chosen by its sequence, beside a sync left owed.** The
 manifest's two slots were written by the publish sequence's parity, on

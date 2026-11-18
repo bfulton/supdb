@@ -1988,9 +1988,7 @@ pub(crate) fn sync_slot(
         Some(e) => Err(e),
         None => f.sync_data(),
     }?;
-    if IO_SEAMS.load(Ordering::Relaxed) & SEAM_TRACE != 0 {
-        io_trace("sync_slot", &real(path));
-    }
+    note_file("sync_slot", path, f);
     Ok(())
 }
 
@@ -2264,6 +2262,37 @@ pub(crate) fn note(what: &'static str, path: impl AsRef<Path>) {
     if IO_SEAMS.load(Ordering::Relaxed) & SEAM_TRACE != 0 {
         io_trace(what, &real(path));
     }
+}
+
+/// A test's: `what` of the file at `path` recorded as `note` records it,
+/// and beside it in a record of its own which descriptor it was made
+/// through -- the descriptor's number and its open file description's
+/// offset, which a second open of the same file does not share -- so a
+/// test can hold two calls to one descriptor: a slot file read
+/// (`read_slot`, once its bytes are read) and the fdatasync that makes it
+/// durable (`sync_slot`). One load where tracing is off.
+pub(crate) fn note_file(what: &'static str, path: impl AsRef<Path>, f: &File) {
+    if IO_SEAMS.load(Ordering::Relaxed) & SEAM_TRACE != 0 {
+        use std::io::Seek;
+        use std::os::fd::AsRawFd;
+        let path = real(path);
+        let at = (&mut &*f).stream_position().unwrap_or(u64::MAX);
+        io_trace(what, &path);
+        IO_DESC
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((what, path, f.as_raw_fd(), at));
+    }
+}
+
+/// A test's: what `note_file` recorded beside the trace, in order,
+/// process-wide: the call, the file's path in the filesystem, the
+/// descriptor's number and its offset.
+static IO_DESC: Mutex<Vec<(&'static str, PathBuf, i32, u64)>> = Mutex::new(Vec::new());
+
+/// A test's: the record `note_file` keeps, so far.
+pub(crate) fn traced_descriptors() -> Vec<(&'static str, PathBuf, i32, u64)> {
+    IO_DESC.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 fn io_trace(what: &'static str, path: &Path) {
