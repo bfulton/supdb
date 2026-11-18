@@ -215,19 +215,23 @@ What an engine picker would hit, roughly in order.
   such a file whose bytes past the sector hold a commit frame that
   verifies is set aside under a name of its own and named in the open's
   refusal or its counters, not cut.
-- [x] **A helper sync in flight when the run's commit syncs.** The
-  helper thread behind a segment's writer syncs the file through an open
-  file description of its own (the file opened again through
-  `/proc/self/fd`, a memory file as well), so a writeback error its
-  fdatasync meets is reported to the writer's own fdatasync too,
-  whichever runs first, and a commit that returns before the helper has
-  stored its error answers the error itself. A test stands in for the
-  device's error by description (`HelperFault`) and holds the helper
-  between its sync and its store; on a real device the two-description
-  behaviour was read with a probe (ext4 on a loop device over a full
-  tmpfs), not by the store's tests, and the store over such a device is
-  the item above. Where the file cannot be opened again the writer has
-  no helper and syncs alone.
+- [ ] **A helper sync in flight when the run's commit syncs.** The run's
+  commit reads the helper thread's kept fdatasync error after its own
+  fdatasync, and a helper whose failed sync has consumed the device's
+  error but not yet stored it is read as clean: the commit is
+  acknowledged, and the next sync answers the failure. The window is the
+  instant between the helper's syscall returning and its store. Done when
+  the commit waits for a helper sync in flight before reading (a count
+  the helper raises before its fdatasync and lowers after its store,
+  asked beside the commit's own fdatasync), priced on the ordered load
+  under `Always` at a size past `sync_ahead`, with a test that holds the
+  helper inside its sync. The cheaper shape to price first: the helper
+  syncs through an open file description of its own (the file opened
+  again by path, or through `/proc/self/fd` for a memory file) in place
+  of a duplicate of the writer's, so that the kernel reports a writeback
+  error to the writer's own fdatasync as well, whichever sync met it
+  first -- one open where the helper is spawned, nothing a commit; it
+  needs a device that fails writeback (dm-flakey) to be tested at all.
 - [ ] **A seal's failed sync held on a device that makes it, and a
   store that goes on past it.** A seal that fails at any step stops the
   seal queue for the life of the open: the segment work writes no
