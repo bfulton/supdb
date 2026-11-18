@@ -555,7 +555,19 @@ answers whether the pairs agree, not whether the sitting leaned. The cells an
 option cannot reach are read first, as a row's comparators are: an effect is
 read against their lean in the same sitting, one no larger than it is
 unresolved however many pairs agree, and the second sitting lists the arms
-the other way.
+the other way. It was measured once with nothing to reach: an arm of
+the stride form paired with the default at three million keys under
+1.25 GiB, where the raw form fits and neither arm builds, installs or
+converts a form file, so the two ran the same code through the row's
+passes, one rep an order. A read 0.71x and 0.81x, the scrambled D 0.73x and
+0.85x, the threaded reads 0.83-0.95x, and the scrambled A, B and F 1.1-1.3x,
+each in both orders (`pair.sh supdb-zstrideroomconv supdb 3000000 --bound
+1342177280 --passes load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+--reps 1 --ops-div 10`, at `52c6d51`, read beside its counts: no build, no
+install). A tenth or more apart in one direction in both orders is what
+identical code read in five cells of twenty-two here, three tenths in the
+worst; a pairing of one rep an order resolves a factor and a half and
+nothing under it.
 
 **A floor held inside the bound it runs beside.** The page floor holds
 the pages it touched to the row's end, so that a floor that gave them
