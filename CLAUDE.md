@@ -3902,9 +3902,16 @@ path a test bets on. And the helper names the file by the writer's
 descriptor's number (`/proc/self/fd/<n>`), so a test builds that number
 at two, three and four digits, none of them a palindrome, since a path
 built from a number's digits is wrong in a way only some numbers show.
-The corollary: where two threads sync one file and either can answer a
-caller, each syncs through its own open file description, since the kernel's error is a description's to consume and
-a word stored after the syscall is a word read too early by the other.
+Where the open is refused the writer goes on with no helper and keeps
+the checksum row it would have handed over, and a fallback that dropped
+the row passed every test, whose stride spawned the helper before the
+key section's first whole piece, so there was no row to drop: the test
+runs at a stride that leaves pieces in it as well. The corollary: where
+two threads sync one file and either can answer a caller, each syncs
+through its own open file description, since the kernel's error is a
+description's to consume and a word stored after the syscall is a word
+read too early by the other; and a hand-over is tested where there is
+something to hand over.
 It came back a fourth time at the presync itself, whose error the flush
 answered: the presync runs on the writer's thread after the seal job is
 handed, the job's fsync of the same description reports nothing of what
