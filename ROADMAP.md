@@ -309,7 +309,8 @@ What an engine picker would hit, roughly in order.
   names the log file its covered sequence lies in, so that an open can
   see a log file the slot before needs and the directory lacks; the
   reproduction is `a_fallback_past_a_slot_whose_log_retired_is_refused`
-  in stage 0's open-order notes, which fails today.
+  in `tests/durable.rs`, ignored while it fails; the words it holds the
+  refusal to are a placeholder for the open's own.
 - [ ] **A fall back held by a segment's last key.** In the
   clear the same check reads an unnamed segment newer than every segment
   the slot taken names, and within what it covers, by its last key, and

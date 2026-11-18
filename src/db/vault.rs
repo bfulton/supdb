@@ -2249,8 +2249,16 @@ static IO_SEAMS: AtomicU8 = AtomicU8::new(0);
 const SEAM_TRACE: u8 = 1;
 const SEAM_HOOK: u8 = 2;
 
-/// A test's: what `trace_io` recorded, in order, process-wide.
-static IO_TRACE: Mutex<Vec<(&'static str, PathBuf)>> = Mutex::new(Vec::new());
+/// A test's: the directories `trace_io` records for, each with what was
+/// recorded for it in order -- the calls, and beside them the descriptors
+/// `note_file` saw -- so a record holds only the calls on a directory a
+/// test is reading, and goes when that test says it has read.
+type IoRecord = (
+    PathBuf,
+    Vec<(&'static str, PathBuf)>,
+    Vec<(&'static str, PathBuf, i32, u64)>,
+);
+static IO_TRACE: Mutex<Vec<IoRecord>> = Mutex::new(Vec::new());
 
 /// A test's: `what` of the file at `path` recorded in the trace where it
 /// is on (`trace_io`), by the file's path in the filesystem; one load
@@ -2278,42 +2286,68 @@ pub(crate) fn note_file(what: &'static str, path: impl AsRef<Path>, f: &File) {
         let path = real(path);
         let at = (&mut &*f).stream_position().unwrap_or(u64::MAX);
         io_trace(what, &path);
-        IO_DESC
+        for r in IO_TRACE
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((what, path, f.as_raw_fd(), at));
+            .iter_mut()
+            .filter(|r| path.starts_with(&r.0))
+        {
+            r.2.push((what, path.clone(), f.as_raw_fd(), at));
+        }
     }
 }
 
-/// A test's: what `note_file` recorded beside the trace, in order,
-/// process-wide: the call, the file's path in the filesystem, the
-/// descriptor's number and its offset.
-static IO_DESC: Mutex<Vec<(&'static str, PathBuf, i32, u64)>> = Mutex::new(Vec::new());
-
-/// A test's: the record `note_file` keeps, so far.
-pub(crate) fn traced_descriptors() -> Vec<(&'static str, PathBuf, i32, u64)> {
-    IO_DESC.lock().unwrap_or_else(|e| e.into_inner()).clone()
-}
-
-fn io_trace(what: &'static str, path: &Path) {
+/// A test's: what `note_file` recorded beside the trace for `dir`, in
+/// order: the call, the file's path in the filesystem, the descriptor's
+/// number and its offset.
+pub(crate) fn traced_descriptors(dir: &Path) -> Vec<(&'static str, PathBuf, i32, u64)> {
     IO_TRACE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push((what, path.to_path_buf()));
+        .iter()
+        .find(|r| r.0 == dir)
+        .map(|r| r.2.clone())
+        .unwrap_or_default()
 }
 
-/// A test's: from `on`, record every directory fsync that returned, every
+fn io_trace(what: &'static str, path: &Path) {
+    for r in IO_TRACE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter_mut()
+        .filter(|r| path.starts_with(&r.0))
+    {
+        r.1.push((what, path.to_path_buf()));
+    }
+}
+
+/// A test's: with `on`, record from now for `dir` -- the directory itself
+/// and every file under it -- every directory fsync that returned, every
 /// file fsync through `sync_file` or `sync_slot` that returned, every
 /// open of a manifest slot for writing and the open's own reads (`note`),
 /// each by the file's path in the filesystem (`real`), in the order they
-/// were made, process-wide; off, record nothing. The record so far.
-pub(crate) fn trace_io(on: bool) -> Vec<(&'static str, PathBuf)> {
-    if on {
-        IO_SEAMS.fetch_or(SEAM_TRACE, Ordering::Relaxed);
-    } else {
+/// were made; the record for `dir` so far. Off, the record for `dir`
+/// returned and dropped, and nothing more recorded for it; nothing is
+/// recorded once no directory is asked for. Each record holds the calls
+/// on one test's directory between that test's first ask and its last.
+pub(crate) fn trace_io(dir: &Path, on: bool) -> Vec<(&'static str, PathBuf)> {
+    let mut all = IO_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+    let at = all.iter().position(|r| r.0 == dir);
+    let out = match (at, on) {
+        (Some(i), true) => all[i].1.clone(),
+        (Some(i), false) => all.swap_remove(i).1,
+        (None, true) => {
+            all.push((dir.to_path_buf(), Vec::new(), Vec::new()));
+            Vec::new()
+        }
+        (None, false) => Vec::new(),
+    };
+    if all.is_empty() {
         IO_SEAMS.fetch_and(!SEAM_TRACE, Ordering::Relaxed);
+    } else {
+        IO_SEAMS.fetch_or(SEAM_TRACE, Ordering::Relaxed);
     }
-    IO_TRACE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    out
 }
 
 /// Where in the filesystem a file the engine names lies: the path itself,
