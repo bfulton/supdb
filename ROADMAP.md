@@ -285,18 +285,6 @@ What an engine picker would hit, roughly in order.
   judge such an envelope without its key, or the open keeps the
   envelopes no slot it read names until a slot is written over the
   damaged one.
-- [ ] **An open after a crash, priced by its parts.** An open that
-  finds segments the slot taken does not name, newer than every segment
-  it names and within what it covers -- a merge held at its landing by
-  the crash -- costs over half again an open of the same store with no
-  slot synced and nothing checked, and the fold of the check to the
-  segments whose fences take each key in did not move it, since a
-  merge's outputs span most partitions. What is left is not attributed:
-  the check opens each such segment whole (`Blob::open`, its key
-  section's checksum row read) for one key, and each holder whole. Done
-  when the open's phases are stamped over that state and the share of
-  each read is known, and, if the whole opens are it, a last key read
-  through a check that covers only what is read is priced against them.
 - [ ] **A fall back past a damaged slot whose log retired.** A slot
   that names a seal's segment durable retires the log files that held
   its writes; with that slot damaged, the open falls back to the slot
