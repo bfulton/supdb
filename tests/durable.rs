@@ -13765,40 +13765,45 @@ fn a_run_commit_beside_a_helper_sync_that_met_an_error_answers_it_under_a_cipher
 }
 
 /// The same at the writer: a marked segment's `sync` returning while its
-/// helper holds a failed fdatasync's error unstored answers the error.
+/// helper holds a failed fdatasync's error unstored answers the error,
+/// whether the seam was armed before the writer was made or after.
 #[test]
 fn a_marked_segments_sync_beside_its_helpers_failed_sync_answers_it() {
     let d = dir("dur-hrace-writer");
-    let fault = helper_seam(true, true);
-    let opts = SegmentOptions {
-        write_piece: 4096,
-        sync_ahead: 16384,
-        helper_fault: Some(fault.clone()),
-        ..Default::default()
-    };
-    let mut w = SegmentWriter::create(&d.join("run.sup"), &opts).unwrap();
-    let release = ReleaseHelper(fault.clone());
-    w.set_inline_max(256);
-    w.set_marks(true);
-    for k in 0..3000u32 {
-        w.begin(&hkey(k)).unwrap();
-        w.value(&hval(k));
-        w.end_with(false).unwrap();
-    }
-    w.mark().unwrap();
-    wait_for(
-        "the helper's failed fdatasync, its error not yet stored",
-        || fault.in_window(),
-    );
-    let first = w.sync();
-    drop(release);
-    assert!(
+    for armed_at_create in [true, false] {
+        let fault = helper_seam(armed_at_create, true);
+        let opts = SegmentOptions {
+            write_piece: 4096,
+            sync_ahead: 16384,
+            helper_fault: Some(fault.clone()),
+            ..Default::default()
+        };
+        let mut w =
+            SegmentWriter::create(&d.join(format!("run-{armed_at_create}.sup")), &opts).unwrap();
+        fault.arm(true);
+        let release = ReleaseHelper(fault.clone());
+        w.set_inline_max(256);
+        w.set_marks(true);
+        for k in 0..3000u32 {
+            w.begin(&hkey(k)).unwrap();
+            w.value(&hval(k));
+            w.end_with(false).unwrap();
+        }
+        w.mark().unwrap();
+        wait_for(
+            "the helper's failed fdatasync, its error not yet stored",
+            || fault.in_window(),
+        );
+        let first = w.sync();
+        drop(release);
+        assert!(
         first.is_err(),
-        "a sync returning while the helper held a writeback error it had not stored is not \
-         answered Ok"
+        "armed at create {armed_at_create}: a sync returning while the helper held a writeback \
+         error it had not stored is not answered Ok"
     );
-    assert!(w.sync().is_err(), "nor is the sync after it");
-    drop(w);
+        assert!(w.sync().is_err(), "nor is the sync after it");
+        drop(w);
+    }
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -13809,19 +13814,24 @@ fn a_marked_segments_sync_beside_its_helpers_failed_sync_answers_it() {
 /// Both kinds of writer: a marked one, which hashes its row's pieces on
 /// its own thread whatever the helper does, and an unmarked one, which
 /// would hand its row over to the helper and keeps it instead.
+///
+/// And at two strides: at the smaller the helper would be spawned before
+/// the section's first whole piece, and at the larger with the writer's
+/// row holding several of them, which the fallback keeps where it would
+/// have handed them over.
 #[test]
 fn a_writer_whose_helper_cannot_open_its_file_writes_without_one() {
     let d = dir("dur-hrace-noproc");
-    for marked in [true, false] {
+    for (marked, ahead) in [(true, 16384), (false, 16384), (true, 98304), (false, 98304)] {
         let fault = helper_seam(true, false);
         fault.refuse_reopen(true);
         let opts = SegmentOptions {
             write_piece: 4096,
-            sync_ahead: 16384,
+            sync_ahead: ahead,
             helper_fault: Some(fault.clone()),
             ..Default::default()
         };
-        let path = d.join(format!("seg-{marked}.sup"));
+        let path = d.join(format!("seg-{marked}-{ahead}.sup"));
         let mut w = SegmentWriter::create(&path, &opts).unwrap();
         w.set_inline_max(256);
         w.set_marks(marked);
@@ -13835,7 +13845,11 @@ fn a_writer_whose_helper_cannot_open_its_file_writes_without_one() {
             w.sync().expect("the writer's sync, with no helper");
         }
         w.finish(1).expect("the finish, with no helper");
-        assert_eq!(fault.failed(), 0, "marked {marked}: no helper ran to fail a sync");
+        assert_eq!(
+            fault.failed(),
+            0,
+            "marked {marked}: no helper ran to fail a sync"
+        );
         assert_eq!(
             fault.refused(),
             1,
@@ -13874,13 +13888,118 @@ fn a_finish_answers_a_helper_sync_taken_at_the_stop() {
         w.value(&hval(k));
         w.end_with(false).unwrap();
     }
-    assert_eq!(fault.failed(), 0, "the helper has not begun before the stop");
+    assert_eq!(
+        fault.failed(),
+        0,
+        "the helper has not begun before the stop"
+    );
     let r = w.finish(1);
     assert!(
         r.is_err(),
         "the finish answers the helper's sync that failed at the stop"
     );
-    assert_eq!(fault.failed(), 1, "the helper took the one sync due at the stop");
+    assert_eq!(
+        fault.failed(),
+        1,
+        "the helper took the one sync due at the stop"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Two test seams on one writer: a helper's writeback seam, which sets
+/// the writer to ask at every sync whether a helper's error reaches it, and
+/// a failed fdatasync armed on the same writer. The armed failure is the
+/// sync's answer, whether or not a helper sync has failed; the store's
+/// run the same (`Db::fail_next_run_sync` beside `SegmentOptions::helper_fault`).
+#[test]
+fn a_sync_failed_by_a_test_beside_a_helper_seam_answers_the_failure() {
+    let d = dir("dur-hrace-twoseams");
+    for helper_failed in [false, true] {
+        let fault = helper_seam(helper_failed, false);
+        let opts = SegmentOptions {
+            write_piece: 4096,
+            sync_ahead: 16384,
+            helper_fault: Some(fault.clone()),
+            ..Default::default()
+        };
+        let mut w =
+            SegmentWriter::create(&d.join(format!("run-{helper_failed}.sup")), &opts).unwrap();
+        w.set_inline_max(256);
+        w.set_marks(true);
+        for k in 0..100u32 {
+            w.begin(&hkey(k)).unwrap();
+            w.value(&hval(k));
+            w.end_with(false).unwrap();
+        }
+        w.mark().unwrap();
+        assert_eq!(fault.failed(), 0, "no helper runs below its stride");
+        w.fail_next_sync();
+        assert!(
+            w.sync().is_err(),
+            "helper armed {helper_failed}: the sync a test failed is answered the failure"
+        );
+        drop(w);
+    }
+    let fault = helper_seam(false, false);
+    let opts = Options {
+        sync: SyncPolicy::Always,
+        segment: SegmentOptions {
+            helper_fault: Some(fault.clone()),
+            ..Default::default()
+        },
+        ..Options::default()
+    };
+    let st = d.join("store");
+    let mut db = Db::create(&st, opts).unwrap();
+    db.append(&hkey(0), &hval(0));
+    db.commit().unwrap();
+    assert!(db.run_synced_bytes().is_some(), "the run is open");
+    db.fail_next_run_sync();
+    db.append(&hkey(1), &hval(1));
+    assert!(
+        db.commit().is_err(),
+        "the run's commit whose fdatasync a test failed, beside a helper seam, answers it"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A helper's sync that failed is not tried again: the range it was for
+/// counts as the helper's, its failure kept as every later sync's and the
+/// finish's answer, so a sync falls due again only over what lands after
+/// it -- at the stop as well, where an armed helper takes a sync that is
+/// due. A retry would be answered `Ok` by the kernel over pages it marked
+/// clean; here a helper that retried would retry at its stop for good, so
+/// the finish is held to returning.
+#[test]
+fn a_helpers_failed_sync_is_not_tried_again() {
+    let d = dir("dur-hrace-noretry");
+    let fault = helper_seam(true, false);
+    let opts = SegmentOptions {
+        write_piece: 4096,
+        sync_ahead: 16384,
+        helper_fault: Some(fault.clone()),
+        ..Default::default()
+    };
+    let mut w = SegmentWriter::create(&d.join("seg.sup"), &opts).unwrap();
+    w.set_inline_max(256);
+    w.set_marks(true);
+    for k in 0..3000u32 {
+        w.begin(&hkey(k)).unwrap();
+        w.value(&hval(k));
+        w.end_with(false).unwrap();
+    }
+    w.mark().unwrap();
+    wait_count_fault(&fault, "the helper's due sync, failed");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = w.finish(1);
+        let _ = tx.send(r.is_err());
+    });
+    let err = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the finish returns: the helper takes no sync at its stop over a failed range");
+    assert!(err, "the finish answers the helper's failed sync");
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -13907,6 +14026,22 @@ fn fd_flags(fd: i32) -> u32 {
         .find_map(|l| l.strip_prefix("flags:"))
         .expect("a flags line");
     u32::from_str_radix(line.trim(), 8).unwrap()
+}
+
+/// The open flags of `path` opened read-only by the standard library
+/// (`O_RDONLY | O_CLOEXEC`), as `/proc/self/fdinfo` reads them with what
+/// the kernel adds to every open (`O_LARGEFILE`): what the helper's own
+/// open of the file reads as, flag for flag.
+fn open_flags(path: &Path) -> u32 {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::File::open(path).unwrap();
+    let flags = fd_flags(f.as_raw_fd());
+    assert_eq!(
+        flags & (libc::O_ACCMODE | libc::O_CLOEXEC) as u32,
+        (libc::O_RDONLY | libc::O_CLOEXEC) as u32,
+        "the reference open is read-only and closed on exec"
+    );
+    flags
 }
 
 /// Whether two of this process's descriptors are one open file
@@ -13948,7 +14083,7 @@ fn a_helpers_description_is_its_own_at_every_width_of_the_writers_descriptor() {
         let path = d.join(format!("run-{width}.sup"));
         let mut built = None;
         for _ in 0..1000 {
-            while held.last().map_or(true, |f| f.as_raw_fd() < lo) {
+            while held.last().is_none_or(|f| f.as_raw_fd() < lo) {
                 held.push(std::fs::File::open("/dev/null").unwrap());
             }
             let w = SegmentWriter::create(&path, &opts).unwrap();
@@ -13963,7 +14098,8 @@ fn a_helpers_description_is_its_own_at_every_width_of_the_writers_descriptor() {
             // The number just given back is held, so the next is another.
             held.push(std::fs::File::open("/dev/null").unwrap());
         }
-        let (mut w, wfd) = built.unwrap_or_else(|| panic!("a writer's descriptor of {width} digits"));
+        let (mut w, wfd) =
+            built.unwrap_or_else(|| panic!("a writer's descriptor of {width} digits"));
         // Dropped before the writer, whose drop joins the held helper.
         let release = ReleaseHelper(fault.clone());
         w.set_inline_max(256);
@@ -13994,10 +14130,13 @@ fn a_helpers_description_is_its_own_at_every_width_of_the_writers_descriptor() {
                 "width {width}: fd {fd} on the segment's file is closed on exec"
             );
         }
+        let want = open_flags(&path);
         for &fd in &others {
-            assert!(
-                fd_flags(fd) & libc::O_ACCMODE as u32 != libc::O_WRONLY as u32,
-                "width {width}: the helper's fd {fd} reads the file it hashes"
+            assert_eq!(
+                fd_flags(fd),
+                want,
+                "width {width}: the helper's fd {fd} is the file opened read-only and closed on \
+                 exec, and nothing else"
             );
         }
         let first = w.sync();
@@ -14010,6 +14149,76 @@ fn a_helpers_description_is_its_own_at_every_width_of_the_writers_descriptor() {
         drop(w);
     }
     drop(held);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A writer with no test's seam -- every store's writer -- gives its
+/// helper the file opened again: a description of the helper's own,
+/// read-only and closed on exec, held while the helper runs and closed
+/// with it at the finish. Both kinds of writer, as the helper's row is
+/// handed over by one and not the other.
+#[test]
+fn a_helper_with_no_seam_syncs_on_a_description_of_its_own() {
+    let d = dir("dur-hrace-noseam");
+    for marked in [true, false] {
+        let opts = SegmentOptions {
+            write_piece: 4096,
+            sync_ahead: 16384,
+            ..Default::default()
+        };
+        let path = d.join(format!("seg-{marked}.sup"));
+        let mut w = SegmentWriter::create(&path, &opts).unwrap();
+        let fds = fds_on(&path);
+        assert_eq!(
+            fds.len(),
+            1,
+            "marked {marked}: the writer alone holds its new file: {fds:?}"
+        );
+        let wfd = fds[0];
+        w.set_inline_max(256);
+        w.set_marks(marked);
+        for k in 0..3000u32 {
+            w.begin(&hkey(k)).unwrap();
+            w.value(&hval(k));
+            w.end_with(false).unwrap();
+        }
+        // A marked writer's records go to the file at its mark.
+        if marked {
+            w.mark().unwrap();
+        }
+        let fds = fds_on(&path);
+        let others: Vec<i32> = fds.iter().copied().filter(|&fd| fd != wfd).collect();
+        assert_eq!(
+            others.len(),
+            1,
+            "marked {marked}: a helper runs and holds one descriptor on the file \
+             (writer's fd {wfd}, every fd on the file {fds:?})"
+        );
+        let h = others[0];
+        assert!(
+            !one_description(h, wfd),
+            "marked {marked}: the helper's fd {h} is a description of its own, not the writer's"
+        );
+        assert_eq!(
+            fd_flags(h),
+            open_flags(&path),
+            "marked {marked}: the helper's fd {h} is the file opened read-only and closed on \
+             exec, and nothing else"
+        );
+        assert!(
+            fd_flags(h) & libc::O_CLOEXEC as u32 != 0,
+            "marked {marked}: the helper's fd {h} is closed on exec"
+        );
+        if marked {
+            w.sync().expect("the writer's sync");
+        }
+        w.finish(1).expect("the finish");
+        assert!(
+            fds_on(&path).is_empty(),
+            "marked {marked}: the helper's description is closed with it: {:?}",
+            fds_on(&path)
+        );
+    }
     let _ = std::fs::remove_dir_all(&d);
 }
 

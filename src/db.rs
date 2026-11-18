@@ -6940,7 +6940,11 @@ impl HelperSeams {
     #[cold]
     #[inline(never)]
     fn start(&self, s: &HelperShared) {
-        if self.fault.as_ref().is_some_and(|f| f.after_stop.load(AtomicOrdering::Acquire)) {
+        if self
+            .fault
+            .as_ref()
+            .is_some_and(|f| f.after_stop.load(AtomicOrdering::Acquire))
+        {
             while !s.stop.load(AtomicOrdering::Acquire) {
                 std::thread::park();
             }
@@ -44817,6 +44821,50 @@ mod streaming_writes {
         blob.read_all(b"key-00001234", |v| got.push(v.to_vec()))
             .unwrap();
         assert_eq!(got, vec![format!("value-{:0100}", 1234).into_bytes()]);
+    }
+
+    /// A seamed helper's syncs that succeed count as no failure: the seam
+    /// counts a sync only once its error is stored, so a test that waits
+    /// for the count waits for a failure.
+    #[test]
+    fn an_unarmed_seams_helper_counts_no_failure() {
+        let dir = fresh("unarmed-helper");
+        let fault = std::sync::Arc::new(HelperFault::default());
+        let sopts = SegmentOptions {
+            write_piece: 4096,
+            sync_ahead: 16384,
+            helper_fault: Some(fault.clone()),
+            ..Default::default()
+        };
+        let path = dir.join("seg.sup");
+        let mut w = SegmentWriter::create(&path, &sopts).unwrap();
+        w.set_inline_max(256);
+        let (flushes, _) = w.helper_counts();
+        for i in 0..3000u32 {
+            let key = format!("key-{i:08}");
+            w.begin(key.as_bytes()).unwrap();
+            w.value(format!("value-{i:0100}").as_bytes());
+            w.end_with(false).unwrap();
+            if i == 1000 || i == 2000 {
+                let t = std::time::Instant::now();
+                let want = if i == 1000 { 1 } else { 2 };
+                while flushes.load(AtomicOrdering::Relaxed) < want {
+                    assert!(
+                        t.elapsed() < std::time::Duration::from_secs(10),
+                        "the helper never synced the pieces on the file"
+                    );
+                    std::thread::yield_now();
+                }
+            }
+        }
+        assert_eq!(
+            fault.failed(),
+            0,
+            "the helper's {} syncs succeeded",
+            flushes.load(AtomicOrdering::Relaxed)
+        );
+        w.finish(1).unwrap();
+        assert_eq!(fault.failed(), 0, "nor did the finish count one");
     }
 
     /// A writer whose helper cannot open the file goes on hashing its own
