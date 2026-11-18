@@ -16054,11 +16054,9 @@ struct Shared {
     wedge_cause: std::sync::Mutex<Option<(std::io::ErrorKind, String)>>,
     /// A test's: the next readable landing fails as a `Seg::open` would.
     fail_landing: std::sync::atomic::AtomicBool,
-    /// A test's: the seams of a closing run's presync, one byte the
-    /// presync loads once (`PRESYNC_FAIL`, `PRESYNC_HOLD`): the next
-    /// presync reports a failure as a failed fdatasync would, and while
-    /// held the writer's presync waits before it syncs.
-    presync_seam: std::sync::atomic::AtomicU8,
+    /// A test's: the next close's presync reports a failure as a failed
+    /// fdatasync would.
+    fail_presync: std::sync::atomic::AtomicBool,
     /// A test's: the files the open that made this store fsynced, each
     /// pushed once its fsync returned, the directory as `.`, in the order
     /// the fsyncs returned -- the slot that names pending segments durable
@@ -16068,6 +16066,9 @@ struct Shared {
     /// A test's: the inode of the run's file and the bytes the file held
     /// when an injected presync failed (`Db::failed_presync_extent`).
     failed_presync: std::sync::Mutex<Option<(u64, u64)>>,
+    /// A test's: while set, the writer's presync of a closing run's records
+    /// waits before it syncs (`Reader::hold_presync`).
+    presync_hold: std::sync::atomic::AtomicBool,
     /// A test's: told of every slot write the segment work makes, before
     /// it is made (`Db::watch_slot_writes`), while `slot_watching` is set.
     slot_watch: std::sync::Mutex<Option<SlotWatch>>,
@@ -28334,35 +28335,13 @@ impl Reader {
         }
     }
 
-    /// A test's: the inode of the run's file and the bytes on it when the
-    /// injected presync failed -- what a power cut after the failure may
-    /// have lost, every page of it below that length not written again.
-    /// A handle reads it as the store does, so a test's thread can look
-    /// while the writer is held.
-    #[doc(hidden)]
-    pub fn failed_presync_extent(&self) -> Option<(u64, u64)> {
-        *self
-            .shared
-            .failed_presync
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
     /// A test's: while `on`, the writer's presync of a closing run's
     /// records (`Options::close_presync`, the arm off the writer's thread
     /// excepted) waits before it syncs, so a handle on another thread can
     /// hold the writer's flush there while the seal thread finishes.
     #[doc(hidden)]
     pub fn hold_presync(&self, on: bool) {
-        if on {
-            self.shared
-                .presync_seam
-                .fetch_or(PRESYNC_HOLD, AtomicOrdering::AcqRel);
-        } else {
-            self.shared
-                .presync_seam
-                .fetch_and(!PRESYNC_HOLD, AtomicOrdering::AcqRel);
-        }
+        self.shared.presync_hold.store(on, AtomicOrdering::Release);
     }
 
     /// A test's: the holds `Db::hold_seal_landing` and
@@ -28952,9 +28931,10 @@ impl Db {
             seal_wedged: std::sync::atomic::AtomicBool::new(false),
             wedge_cause: std::sync::Mutex::new(None),
             fail_landing: std::sync::atomic::AtomicBool::new(false),
-            presync_seam: std::sync::atomic::AtomicU8::new(0),
+            fail_presync: std::sync::atomic::AtomicBool::new(false),
             open_synced: Vec::new(),
             failed_presync: std::sync::Mutex::new(None),
+            presync_hold: std::sync::atomic::AtomicBool::new(false),
             slot_watch: std::sync::Mutex::new(None),
             slot_watching: std::sync::atomic::AtomicBool::new(false),
             tear_slot: std::sync::atomic::AtomicBool::new(false),
@@ -29820,9 +29800,10 @@ impl Db {
             seal_wedged: std::sync::atomic::AtomicBool::new(false),
             wedge_cause: std::sync::Mutex::new(None),
             fail_landing: std::sync::atomic::AtomicBool::new(false),
-            presync_seam: std::sync::atomic::AtomicU8::new(0),
+            fail_presync: std::sync::atomic::AtomicBool::new(false),
             open_synced,
             failed_presync: std::sync::Mutex::new(None),
+            presync_hold: std::sync::atomic::AtomicBool::new(false),
             slot_watch: std::sync::Mutex::new(None),
             slot_watching: std::sync::atomic::AtomicBool::new(false),
             tear_slot: std::sync::atomic::AtomicBool::new(false),
@@ -31289,8 +31270,10 @@ impl Db {
                 std::thread::Builder::new()
                     .name("supdb-presync".into())
                     .spawn(move || {
-                        let r = if shared.presync_seam.load(AtomicOrdering::Acquire) != 0 {
-                            Db::seamed_presync(&shared, &f, upto, false)
+                        let r = if shared.fail_presync.load(AtomicOrdering::Relaxed)
+                            && shared.fail_presync.swap(false, AtomicOrdering::AcqRel)
+                        {
+                            Db::injected_presync(&shared, &f, upto)
                         } else {
                             f.sync_data()
                         };
@@ -31324,10 +31307,11 @@ impl Db {
             // the job durable (`SealJob::awaits_writer`): the next flush
             // answered `Ok` over a segment the manifest named.
             if let Some((f, upto)) = presync {
-                // The seams' one byte, asked once: a presync no test
-                // armed loads it and syncs.
-                let r = if self.shared.presync_seam.load(AtomicOrdering::Acquire) != 0 {
-                    Db::seamed_presync(&self.shared, &f, upto, true)
+                while self.shared.presync_hold.load(AtomicOrdering::Acquire) {
+                    std::thread::park_timeout(MAINT_LAND_POLL);
+                }
+                let r = if self.shared.fail_presync.swap(false, AtomicOrdering::AcqRel) {
+                    Db::injected_presync(&self.shared, &f, upto)
                 } else {
                     f.sync_data()
                 };
@@ -32109,13 +32093,6 @@ impl Db {
         // (`Options::land_ranks_far`), whichever path the drain's own
         // seal takes.
         self.shared.reads_near.store(true, AtomicOrdering::Release);
-        // A run's close that awaits the writer's word for its durable
-        // landing (`SealJob::awaits_writer`) is the last step of the
-        // seal's ordered branch and cannot fail (`close_direct` waits for
-        // room before it takes the run, and `close_run` answers nothing),
-        // so the ask below follows every such hand-over: a seal that
-        // fails has handed none, and one whose job fails is answered by
-        // the ask, which lands it or stops the queue.
         let sealed = self.seal().and_then(|_| {
             self.shared.drain_steps.stamp(1);
             self.maint_request(MaintAsk::Drain)
@@ -33354,12 +33331,6 @@ impl Db {
         awaits_writer: bool,
     ) {
         let draining = self.draining;
-        // The writer's ask that lands such a job durable is a drain's
-        // (`MaintAsk::Drain`), which only a draining writer sends after it.
-        debug_assert!(
-            !awaits_writer || draining,
-            "a seal that awaits the writer's word handed outside a drain"
-        );
         let wake = match &self.maint {
             MaintHome::Away(a) => a.thread.clone(),
             MaintHome::Here(_) => None,
@@ -33612,34 +33583,8 @@ impl Db {
     #[doc(hidden)]
     pub fn fail_next_presync(&self) {
         self.shared
-            .presync_seam
-            .fetch_or(PRESYNC_FAIL, AtomicOrdering::AcqRel);
-    }
-
-    /// A presync a test armed (`Shared::presync_seam`): held while the
-    /// hold is on, where `holds` (the writer's presync; the thread's on the
-    /// inline arm is not held), then the injected failure if one is armed,
-    /// taken once, or the fdatasync: a store whose queue the failure
-    /// stopped still closes runs while its frozen list has room, and their
-    /// presyncs sync.
-    #[cold]
-    #[inline(never)]
-    fn seamed_presync(shared: &Shared, f: &File, upto: u64, holds: bool) -> std::io::Result<()> {
-        if holds {
-            while shared.presync_seam.load(AtomicOrdering::Acquire) & PRESYNC_HOLD != 0 {
-                std::thread::park_timeout(MAINT_LAND_POLL);
-            }
-        }
-        if shared
-            .presync_seam
-            .fetch_and(!PRESYNC_FAIL, AtomicOrdering::AcqRel)
-            & PRESYNC_FAIL
-            != 0
-        {
-            Db::injected_presync(shared, f, upto)
-        } else {
-            f.sync_data()
-        }
+            .fail_presync
+            .store(true, AtomicOrdering::Release);
     }
 
     /// A test's injected presync failure: the run's file and its length
@@ -33654,6 +33599,18 @@ impl Db {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some((ino, upto));
         Err(std::io::Error::other("the records' sync failed (injected)"))
+    }
+
+    /// A test's: the inode of the run's file and the bytes on it when the
+    /// injected presync failed -- what a power cut after the failure may
+    /// have lost, every page of it below that length not written again.
+    #[doc(hidden)]
+    pub fn failed_presync_extent(&self) -> Option<(u64, u64)> {
+        *self
+            .shared
+            .failed_presync
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// A test's: the next seal's directory fsync at its readable landing
@@ -39263,11 +39220,6 @@ impl SealReadable {
         self.names.get()
     }
 }
-
-/// `Shared::presync_seam`: the next presync fails (`Db::fail_next_presync`).
-const PRESYNC_FAIL: u8 = 1;
-/// `Shared::presync_seam`: the writer's presync waits (`Reader::hold_presync`).
-const PRESYNC_HOLD: u8 = 2;
 
 /// The bits of `Shared::seal_hold`.
 const SEAL_HOLD_LANDING: u8 = 1;

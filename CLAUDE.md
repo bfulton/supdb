@@ -3924,17 +3924,7 @@ presync (`SealJob::awaits_writer`): a flag the segment work reads where
 it already asks whether the job has returned, and no wait anyone made
 before. The corollary: an error answered to the caller is not therefore
 seen by the thread that acts on the same bytes; whoever names the bytes
-durable is ordered after whoever learns they are not. The order was
-landed unpriced, as a serialisation of the landing behind the presync
-and a hop to the writer's ask, and priced after against the shape that
-landed the job whenever its thread returned: the drain's stamps put the
-presync's return before the seal thread's fsync of the trailer in all
-but a drain whose writer lost its core between the two, so the ask is
-in before the job's thread returns and the landing waits for the thread,
-as it did; no rate moved and the file system calls were the same, call for
-call. A reorder is priced by which side of the race each of its ends
-falls on, read off a stamp at each, before the hop it adds is called a
-cost or called free.
+durable is ordered after whoever learns they are not.
 
 **A failure after the publish, left for the next publish to name.** A
 seal lands in two phases, its segments published for readers at the
