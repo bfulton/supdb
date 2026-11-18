@@ -12253,8 +12253,10 @@ fn a_rename_open_whose_removal_of_the_slots_other_file_fails_answers_it_under_a_
 // due-log: a run's commit that its policy makes due syncs the log first
 // wherever the log owed a sync when the run opened -- frames of a table
 // frozen before the run, a file a rotation left loose, frames an open
-// replayed -- so a power cut that keeps the run's commits keeps every
-// commit before them.
+// replayed -- so a power cut that keeps a run's commit the policy synced
+// keeps every commit before it. Before that sync the run's helper thread
+// and the kernel's writeback put the run's file on the device unordered
+// with the log, which the helper test below holds as the window it is.
 // ---------------------------------------------------------------------
 
 /// What the log owes when the run opens: three commits of a hashed table
@@ -12292,10 +12294,11 @@ fn dl_until_due(db: &mut Db, next: &mut u32, what: &str) -> u32 {
 
 /// A power cut of `db`, whose run is open and whose log syncs were traced
 /// in `lives`: its files copied from `d` into `crash`, the run's file cut
-/// to what its fdatasyncs covered, every log file to what its own did.
+/// to what its fdatasyncs covered -- the writer's and its helper
+/// thread's -- every log file to what its own did.
 fn dl_power_cut(db: &Db, d: &Path, crash: &Path, lives: &[&[(PathBuf, Option<u64>)]]) {
     use std::os::unix::fs::MetadataExt;
-    let synced = db.run_synced_bytes().expect("the run is open");
+    let synced = db.run_device_synced().expect("the run is open").0;
     let ino = (open_run(d)).then(|| run_ino(d));
     copy_store(d, crash);
     if let Some(ino) = ino {
@@ -12627,6 +12630,1047 @@ fn a_runs_due_commit_under_a_cipher_syncs_the_log_once_behind_its_frames() {
         .count();
     assert_eq!(log_missing, 0, "the log's keys read back after the cut");
     assert!(sr_missing(&opened, next, "the run's keys").is_none());
+    drop(opened);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// A run long enough for its writer's helper thread to sync it
+/// (`SegmentOptions::sync_ahead`, here 64 KiB) before any commit of it is
+/// due, beside a hashed table's frames no sync covered: the helper's
+/// fdatasyncs are not the policy's, and a power cut that keeps what they
+/// covered keeps run commits after the log's older ones and loses those.
+/// That is the window the docs name as the exception under `SyncPolicy`
+/// and `ROADMAP.md` keeps open; this test holds it, so that whatever
+/// closes it restates this half. The run's first due commit then syncs
+/// the log before the run, and a power cut after it keeps every commit.
+#[test]
+fn a_runs_commits_its_helper_synced_before_a_due_one_outlive_older_log_frames_until_it() {
+    let d = dir("dur-duelog-helper");
+    let crash = dir("dur-duelog-helper-crash");
+    let crash2 = dir("dur-duelog-helper-crash2");
+    let every = 1000;
+    let opts = Options {
+        segment: SegmentOptions {
+            sync_ahead: 64 << 10,
+            write_piece: 4096,
+            ..SegmentOptions::default()
+        },
+        ..sr_opts(SyncPolicy::EveryN(every), Options::default())
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    db.trace_wal_syncs(true);
+    let big = vec![b'x'; opts.inline_bytes + 1];
+    let mut logged = Vec::new();
+    for c in 0..3u32 {
+        for k in 0..50u32 {
+            db.append(&dl_key(c, k), &big);
+            logged.push(dl_key(c, k));
+        }
+        db.commit().unwrap();
+    }
+    db.hold_seal_durable(true);
+    let mut next = 0u32;
+    let mut first = 0u32;
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.seal().unwrap();
+        assert!(db.wal_unsynced(), "the premise, the log owes a sync");
+        // Commits of twenty keys, none due, until the file is four times
+        // the helper's stride; then the helper's first fdatasync waited
+        // for by its count, never by a clock.
+        let mut commits = 0u32;
+        while db.run_written_and_held().map_or(0, |(w, _)| w) < 4 * (64 << 10) {
+            sr_commits(&mut db, next, next + 20, 20);
+            next += 20;
+            commits += 1;
+            assert!(commits < every / 2, "the run reached four strides");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while db.run_device_synced().expect("the run is open").1 == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the helper made no fdatasync"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            db.run_synced_bytes(),
+            Some(0),
+            "the premise, no commit of the run was due"
+        );
+        assert!(db.wal_unsynced(), "the premise, the log still owes a sync");
+        first = next;
+        dl_power_cut(&db, &d, &crash, &[]);
+        // Then on to the run's first due commit, and a power cut there.
+        let _ = dl_until_due_within(&mut db, &mut next, every + 1);
+        dl_power_cut(&db, &d, &crash2, &[]);
+    }));
+    db.hold_seal_durable(false);
+    if let Err(p) = caught {
+        std::panic::resume_unwind(p);
+    }
+    drop(db);
+    let count = |at: &Path, run_to: u32| {
+        let opened = Db::open(at, opts.clone()).unwrap_or_else(|e| panic!("the cut opens: {e}"));
+        let log_missing = logged
+            .iter()
+            .filter(|k| read_vec(&opened, k).is_empty())
+            .count();
+        let run_here = (0..run_to)
+            .filter(|&k| read_vec(&opened, &sr_key(k)) == vec![sr_val(k)])
+            .count();
+        (log_missing, run_here)
+    };
+    let (log_missing, run_here) = count(&crash, first);
+    assert!(
+        run_here > 0 && log_missing == logged.len(),
+        "the window: a power cut after the helper's fdatasync keeps run commits ({run_here} of \
+         {first} keys) and loses the log's older ones ({log_missing} of {}) -- if it no longer \
+         does, the window is closed: restate this half, the docs and ROADMAP.md",
+        logged.len()
+    );
+    let (log_missing, run_here) = count(&crash2, next);
+    assert_eq!(
+        log_missing, 0,
+        "the run's first due commit, after the helper's syncs, kept {run_here} of the run's {next} \
+         keys and lost {log_missing} of the log's {} keys before them",
+        logged.len()
+    );
+    assert_eq!(
+        run_here, next as usize,
+        "the run's keys up to its due commit read back"
+    );
+    for at in [&d, &crash, &crash2] {
+        let _ = std::fs::remove_dir_all(at);
+    }
+}
+
+/// `dl_until_due` with a bound of `max` commits, for a policy that makes
+/// one due further on than its sixty-four.
+fn dl_until_due_within(db: &mut Db, next: &mut u32, max: u32) -> u32 {
+    let before = db.run_synced_bytes().unwrap_or(0);
+    for n in 1..=max {
+        sr_commits(db, *next, *next + 20, 20);
+        *next += 20;
+        if db.run_synced_bytes().expect("the run is open") != before {
+            return n;
+        }
+    }
+    panic!("no commit of the run was due in {max}")
+}
+
+/// A due commit whose log sync could not open a loose file -- an error of
+/// the open, not of a sync, so nothing keeps it -- answers it and syncs
+/// nothing of the run, and the run's next due commit syncs the log first
+/// again: the note is cleared only once the log is synced, and a power cut
+/// after that commit keeps every commit before it.
+#[test]
+fn a_runs_due_commit_whose_log_sync_could_not_open_a_loose_file_syncs_it_at_the_next() {
+    let d = dir("dur-duelog-unopened");
+    let crash = dir("dur-duelog-unopened-crash");
+    let shape = |sync| Options {
+        sync,
+        seal_rotates_wal: false,
+        seal_bytes: 64 << 10,
+        ..sr_opts(SyncPolicy::Always, Options::default())
+    };
+    let val = "x".repeat(100);
+    let put_until_rotated = |db: &mut Db| {
+        let mut i = 0u32;
+        while db.seal_waits().wal_rotations == 0 {
+            put_commit(db, &format!("a{i:07}"), &val).unwrap();
+            i += 1;
+            assert!(i < 10_000, "the log never rotated");
+        }
+        i
+    };
+    let probe = dir("dur-duelog-unopened-probe");
+    let n = put_until_rotated(&mut Db::create(&probe, shape(buffered().sync)).unwrap());
+    let _ = std::fs::remove_dir_all(&probe);
+    let opts = shape(SyncPolicy::EveryN(n + 3));
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    db.trace_wal_syncs(true);
+    assert_eq!(
+        put_until_rotated(&mut db),
+        n,
+        "the same writes rotate alike"
+    );
+    assert!(
+        db.seal_waits().rotated_unsynced > 0,
+        "the premise, a loose rotation"
+    );
+    let logged: Vec<Vec<u8>> = (0..n).map(|i| format!("a{i:07}").into_bytes()).collect();
+    let live = db.wal_durable().0;
+    let loose: Vec<PathBuf> = std::fs::read_dir(&d)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("wal-"))
+                && std::fs::canonicalize(p).ok() != std::fs::canonicalize(&live).ok()
+        })
+        .collect();
+    assert_eq!(
+        loose.len(),
+        1,
+        "the premise, one closed log file: {loose:?}"
+    );
+    let loose = &loose[0];
+    let aside = loose.with_extension("aside");
+    db.hold_seal_durable(true);
+    let mut next = 0u32;
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.seal().unwrap();
+        // The run's first two commits are not due; the third is, and the
+        // loose file's name is a link to itself while it runs.
+        sr_commits(&mut db, 0, 20, 10);
+        next = 20;
+        assert_eq!(db.run_synced_bytes(), Some(0), "the premise, not due yet");
+        std::fs::rename(loose, &aside).unwrap();
+        std::os::unix::fs::symlink(loose, loose).unwrap();
+        let r = sr_commits_answer(&mut db, 20, 30);
+        next = 30;
+        std::fs::remove_file(loose).unwrap();
+        std::fs::rename(&aside, loose).unwrap();
+        match r {
+            Ok(()) => panic!("the due commit answered Ok where the loose file would not open"),
+            Err(e) => assert_ne!(
+                e.kind(),
+                std::io::ErrorKind::NotFound,
+                "the premise, an error of the open that is not an absence: {e}"
+            ),
+        }
+        assert_eq!(
+            db.run_synced_bytes(),
+            Some(0),
+            "the due commit whose log sync failed synced the run"
+        );
+        let synced_loose = |db: &Db| {
+            db.wal_syncs_traced()
+                .iter()
+                .filter(|(p, _)| std::fs::canonicalize(p).ok() == std::fs::canonicalize(loose).ok())
+                .count()
+        };
+        assert_eq!(synced_loose(&db), 0, "the premise, the loose file unsynced");
+        // The policy's count did not start over: the next commit is due.
+        sr_commits_answer(&mut db, 30, 40).unwrap();
+        next = 40;
+        assert_ne!(db.run_synced_bytes(), Some(0), "the next commit was due");
+        assert_eq!(
+            synced_loose(&db),
+            1,
+            "the next due commit synced the loose file before the run"
+        );
+        dl_power_cut(&db, &d, &crash, &[]);
+    }));
+    db.hold_seal_durable(false);
+    if let Err(p) = caught {
+        std::panic::resume_unwind(p);
+    }
+    drop(db);
+    let opened = Db::open(&crash, opts).unwrap_or_else(|e| panic!("the cut opens: {e}"));
+    let log_missing = logged
+        .iter()
+        .filter(|k| read_vec(&opened, k).is_empty())
+        .count();
+    assert_eq!(
+        log_missing,
+        0,
+        "the run's next due commit lost {log_missing} of the {} keys the loose file held",
+        logged.len()
+    );
+    assert!(sr_missing(&opened, next, "the run's keys").is_none());
+    drop(opened);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// How a call with nothing new for the run writes a batch its file owes
+/// again (`Db::run_again`): a commit of nothing, or a `sync`.
+#[derive(Clone, Copy, Debug)]
+enum DlAgain {
+    Commit,
+    Sync,
+}
+
+/// A run opened beside a hashed table's frames no sync covered, whose
+/// first commit -- not due under `EveryN(5)`, a batch longer than a write
+/// piece -- the device refused and the commit answered `Ok`, owing the
+/// batch to the run's file; then a call with nothing new for the run,
+/// which writes the batch again and syncs it whatever the policy. That
+/// sync is the run's first and stands in for the policy's, so it syncs the
+/// log first, as a due commit does: a power cut after it keeps every
+/// commit before the run's, and with `fail_log` the log's sync fails, the
+/// call answers it and nothing of the run is on the device.
+fn a_run_written_again_beside_a_log_that_owes(
+    tag: &str,
+    arm: Options,
+    how: DlAgain,
+    fail_log: bool,
+) {
+    let d = dir(&format!("dur-duelog-again-{tag}"));
+    let crash = dir(&format!("dur-duelog-again-{tag}-crash"));
+    let opts = Options {
+        segment: SegmentOptions {
+            write_piece: 4096,
+            ..arm.segment.clone()
+        },
+        ..sr_opts(SyncPolicy::EveryN(5), arm)
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    db.trace_wal_syncs(true);
+    let big = vec![b'x'; opts.inline_bytes + 1];
+    let mut logged = Vec::new();
+    for c in 0..3u32 {
+        for k in 0..50u32 {
+            db.append(&dl_key(c, k), &big);
+            logged.push(dl_key(c, k));
+        }
+        db.commit().unwrap();
+    }
+    db.hold_seal_durable(true);
+    let next = 50u32;
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.seal().unwrap();
+        assert!(db.wal_unsynced(), "{tag}: the premise, the log owes a sync");
+        db.fail_next_run_write();
+        sr_commits_answer(&mut db, 0, next)
+            .unwrap_or_else(|e| panic!("{tag}: the premise, a refused piece is owed: {e}"));
+        assert_eq!(
+            db.run_synced_bytes(),
+            Some(0),
+            "{tag}: the premise, the run's first commit was not due"
+        );
+        assert!(db.wal_unsynced(), "{tag}: the premise, the log still owes");
+        let again = |db: &mut Db| match how {
+            DlAgain::Commit => db.commit(),
+            DlAgain::Sync => db.sync(),
+        };
+        if fail_log {
+            // The log's sync, the first thing the call does, fails: the
+            // call and the one after it answer the failure, and neither
+            // syncs the run's file.
+            db.fail_next_wal_sync();
+            for call in 0..2 {
+                match again(&mut db) {
+                    Ok(()) => panic!("{tag}: call {call} answered Ok over a failed log sync"),
+                    Err(e) => assert!(
+                        e.to_string().contains("the log's fdatasync failed"),
+                        "{tag}: call {call} answered another error: {e}"
+                    ),
+                }
+                assert_eq!(
+                    db.run_synced_bytes(),
+                    Some(0),
+                    "{tag}: call {call}, whose log sync failed, synced the run's file"
+                );
+            }
+        } else {
+            // The write's failure is held for the next sync of the run's
+            // file, which answers it and writes nothing; the call after
+            // that writes the batch again.
+            match again(&mut db) {
+                Ok(()) => panic!("{tag}: the premise, the next call answers the held write"),
+                Err(e) => assert!(
+                    e.to_string().contains("the run's write failed"),
+                    "{tag}: the premise, the held write's answer: {e}"
+                ),
+            }
+            assert_eq!(
+                db.run_synced_bytes(),
+                Some(0),
+                "{tag}: the premise, nothing synced"
+            );
+            again(&mut db)
+                .unwrap_or_else(|e| panic!("{tag}: the call with nothing new answers: {e}"));
+            assert_ne!(
+                db.run_synced_bytes(),
+                Some(0),
+                "{tag}: the premise, the call wrote the owed batch again and synced it"
+            );
+        }
+        dl_power_cut(&db, &d, &crash, &[]);
+    }));
+    db.hold_seal_durable(false);
+    if let Err(p) = caught {
+        std::panic::resume_unwind(p);
+    }
+    drop(db);
+    let opened = Db::open(&crash, opts).unwrap_or_else(|e| panic!("{tag}: the cut opens: {e}"));
+    let log_missing = logged
+        .iter()
+        .filter(|k| read_vec(&opened, k).is_empty())
+        .count();
+    let run_here = (0..next)
+        .filter(|&k| read_vec(&opened, &sr_key(k)) == vec![sr_val(k)])
+        .count();
+    if fail_log {
+        assert!(
+            run_here == 0 || log_missing == 0,
+            "{tag}: the call whose log sync failed left {run_here} of the run's {next} keys on \
+             the device and lost {log_missing} of the log's {} keys before them",
+            logged.len()
+        );
+    } else {
+        assert_eq!(
+            log_missing,
+            0,
+            "{tag}: the batch written again kept {run_here} of the run's {next} keys and lost \
+             {log_missing} of the {} keys committed to the log before the run",
+            logged.len()
+        );
+        assert_eq!(
+            run_here, next as usize,
+            "{tag}: the run's batch written again reads back"
+        );
+    }
+    drop(opened);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+#[test]
+fn a_runs_owed_batch_written_again_by_a_commit_of_nothing_syncs_the_log_first() {
+    for (tag, arm) in run_arms() {
+        a_run_written_again_beside_a_log_that_owes(
+            &format!("commit-{tag}"),
+            arm,
+            DlAgain::Commit,
+            false,
+        );
+    }
+}
+
+#[test]
+fn a_runs_owed_batch_written_again_by_a_sync_syncs_the_log_first() {
+    a_run_written_again_beside_a_log_that_owes("sync", Options::default(), DlAgain::Sync, false);
+}
+
+/// The log's sync comes before the run's there too: where it fails, the
+/// call answers the failure and syncs nothing of the run, whether it is a
+/// commit of nothing or a `sync`.
+#[test]
+fn a_runs_owed_batch_written_again_whose_log_sync_fails_leaves_the_run_unsynced() {
+    for (tag, how) in [
+        ("fail-commit", DlAgain::Commit),
+        ("fail-sync", DlAgain::Sync),
+    ] {
+        a_run_written_again_beside_a_log_that_owes(tag, Options::default(), how, true);
+    }
+}
+
+/// A run that closes before any commit of it is due, beside a hashed
+/// table's frames no sync covered and that table's seal held between its
+/// phases (`hold_seal_durable`), so no manifest names its segment: the
+/// flush that closes the run syncs the run's records on the writer's
+/// thread (`Options::close_presync`) and the run's seal job would sync the
+/// whole file on its own, neither ordered behind the log. A power cut that
+/// keeps what the presync covered -- the records on the file when the run
+/// closed -- and the log as its own syncs left it keeps run commits after
+/// the log's older ones and loses those. That is a way the docs name under
+/// `SyncPolicy` beside the helper thread's and the kernel's writeback, and
+/// `ROADMAP.md` keeps open; this test holds it, so that whatever closes it
+/// restates this test. The copy is taken while every seal is held between
+/// its phases, so nothing lands inside it.
+#[test]
+fn a_runs_commits_its_close_synced_before_a_due_one_outlive_older_log_frames() {
+    use std::os::unix::fs::MetadataExt;
+    let d = dir("dur-duelog-close");
+    let crash = dir("dur-duelog-close-crash");
+    let opts = Options {
+        segment: SegmentOptions {
+            write_piece: 4096,
+            ..SegmentOptions::default()
+        },
+        ..sr_opts(SyncPolicy::EveryN(10), Options::default())
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    db.trace_wal_syncs(true);
+    let big = vec![b'x'; opts.inline_bytes + 1];
+    let mut logged = Vec::new();
+    for c in 0..3u32 {
+        for k in 0..50u32 {
+            db.append(&dl_key(c, k), &big);
+            logged.push(dl_key(c, k));
+        }
+        db.commit().unwrap();
+    }
+    db.hold_seal_durable(true);
+    db.seal().unwrap();
+    assert!(db.wal_unsynced(), "the premise, the log owes a sync");
+    // Two commits of the run, neither due.
+    sr_commits(&mut db, 0, 100, 50);
+    let next = 100u32;
+    assert_eq!(
+        db.run_synced_bytes(),
+        Some(0),
+        "the premise, no commit of the run was due"
+    );
+    let (upto, _) = db.run_written_and_held().expect("the run is open");
+    assert!(upto > 0, "the premise, the run's records are on its file");
+    let ino = run_ino(&d);
+    let tmp = run_tmp_name(&d);
+    let traced = db.wal_syncs_traced();
+    let h = db.reader().unwrap();
+    let (dd, cc) = (d.clone(), crash.clone());
+    let lifter = std::thread::spawn(move || {
+        // Released on the lifter's own failure as well, so the flush the
+        // hold keeps waiting goes on to the test's failure.
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // The run's seal job links its file under a piece's name before
+            // its readable signal; from there the run is closed and its
+            // records presynced or about to be, and the hold keeps every
+            // landing out of the copy.
+            let linked = |at: &Path| {
+                std::fs::read_dir(at).unwrap().any(|e| {
+                    let e = e.unwrap();
+                    e.file_name() != tmp && e.metadata().map(|m| m.ino()).ok() == Some(ino)
+                })
+            };
+            wait_for("the closed run's link", || linked(&dd));
+            copy_store(&dd, &cc);
+            // The presync's extent of the run's file under its temp name; the
+            // link's entry is the directory's, which no fsync covered.
+            for e in std::fs::read_dir(&dd).unwrap() {
+                let e = e.unwrap();
+                if e.metadata().map(|m| m.ino()).ok() != Some(ino) {
+                    continue;
+                }
+                let at = cc.join(e.file_name());
+                if e.file_name() == tmp {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&at)
+                        .unwrap()
+                        .set_len(upto)
+                        .unwrap();
+                } else {
+                    std::fs::remove_file(&at).unwrap();
+                }
+            }
+        }));
+        h.hold_seal_durable_from_handle(false);
+        if let Err(p) = caught {
+            std::panic::resume_unwind(p);
+        }
+    });
+    let flushed = db.flush();
+    lifter.join().expect("the lifter");
+    flushed.unwrap();
+    assert_eq!(
+        db.wal_syncs_traced().len(),
+        traced.len(),
+        "the premise, the flush synced nothing of the log before the copy"
+    );
+    power_cut_logs(&crash, &[&traced], WAL_HEAD, &[]);
+    drop(db);
+    let opened = Db::open(&crash, opts).unwrap_or_else(|e| panic!("the cut opens: {e}"));
+    let log_missing = logged
+        .iter()
+        .filter(|k| read_vec(&opened, k).is_empty())
+        .count();
+    let run_here = (0..next)
+        .filter(|&k| read_vec(&opened, &sr_key(k)) == vec![sr_val(k)])
+        .count();
+    assert!(
+        run_here > 0 && log_missing == logged.len(),
+        "the window: a power cut after the closing run's presync keeps run commits ({run_here} of \
+         {next} keys) and loses the log's older ones ({log_missing} of {}) -- if it no longer \
+         does, the window is closed: restate this test, the docs and ROADMAP.md",
+        logged.len()
+    );
+    drop(opened);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// The sync of a batch the run's file owes, where a `sync` since the run
+/// opened paid what the log owed then: it asks the log again and syncs
+/// nothing of it, as a due commit does.
+#[test]
+fn a_runs_owed_batch_written_again_over_a_log_a_sync_paid_syncs_no_log() {
+    let d = dir("dur-duelog-again-paid");
+    let opts = Options {
+        segment: SegmentOptions {
+            write_piece: 4096,
+            ..SegmentOptions::default()
+        },
+        ..sr_opts(SyncPolicy::EveryN(5), Options::default())
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    db.trace_wal_syncs(true);
+    let big = vec![b'x'; opts.inline_bytes + 1];
+    for k in 0..50u32 {
+        db.append(&dl_key(0, k), &big);
+    }
+    db.commit().unwrap();
+    db.hold_seal_durable(true);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.seal().unwrap();
+        assert!(db.wal_unsynced(), "the premise, the log owes a sync");
+        sr_commits(&mut db, 0, 50, 50);
+        db.sync().unwrap();
+        assert!(!db.wal_unsynced(), "the premise, the sync paid the log");
+        db.fail_next_run_write();
+        sr_commits_answer(&mut db, 50, 100)
+            .unwrap_or_else(|e| panic!("the premise, a refused piece is owed: {e}"));
+        let synced = db.run_synced_bytes();
+        let before = db.wal_syncs_traced().len();
+        match db.commit() {
+            Ok(()) => panic!("the premise, the next call answers the held write"),
+            Err(e) => assert!(
+                e.to_string().contains("the run's write failed"),
+                "the premise, the held write's answer: {e}"
+            ),
+        }
+        db.commit()
+            .unwrap_or_else(|e| panic!("the call with nothing new answers: {e}"));
+        assert_ne!(
+            db.run_synced_bytes(),
+            synced,
+            "the premise, the call wrote the owed batch again and synced it"
+        );
+        let traced = db.wal_syncs_traced();
+        assert_eq!(
+            traced.len(),
+            before,
+            "the batch written again synced the log, which owed nothing: {:?}",
+            &traced[before..]
+        );
+    }));
+    db.hold_seal_durable(false);
+    if let Err(p) = caught {
+        std::panic::resume_unwind(p);
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Under a cipher a run's commits are frames of the log, and a run opened
+/// beside a file a rotation left loose notes nothing: its due commit syncs
+/// the loose file and the live one behind the run's frames (`Db::log_run`),
+/// and a power cut after it keeps every commit before it.
+#[test]
+fn a_runs_due_commit_under_a_cipher_beside_a_loose_log_file_syncs_it_behind_its_frames() {
+    a_due_commit_beside_a_log_that_owes("loose-cipher", under_cipher(), LogOwes::Loose, false);
+}
+
+/// The closed log files of `d`: every `wal-` name but the live one's.
+fn dl_closed_logs(d: &Path, db: &Db) -> Vec<PathBuf> {
+    let live = std::fs::canonicalize(db.wal_durable().0).ok();
+    std::fs::read_dir(d)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("wal-"))
+                && std::fs::canonicalize(p).ok() != live
+        })
+        .collect()
+}
+
+/// Each of `files` made a link to itself, so an open of it fails with an
+/// error that is not an absence; `dl_mend` puts them back.
+fn dl_break(files: &[PathBuf]) {
+    for f in files {
+        std::fs::rename(f, f.with_extension("aside")).unwrap();
+        std::os::unix::fs::symlink(f, f).unwrap();
+    }
+}
+
+fn dl_mend(files: &[PathBuf]) {
+    for f in files {
+        std::fs::remove_file(f).unwrap();
+        std::fs::rename(f.with_extension("aside"), f).unwrap();
+    }
+}
+
+/// How many syncs of `files` the store's trace holds.
+fn dl_synced_of(db: &Db, files: &[PathBuf]) -> usize {
+    let names: Vec<_> = files
+        .iter()
+        .filter_map(|f| std::fs::canonicalize(f).ok())
+        .collect();
+    db.wal_syncs_traced()
+        .iter()
+        .filter(|(p, _)| {
+            std::fs::canonicalize(p)
+                .ok()
+                .is_some_and(|c| names.contains(&c))
+        })
+        .count()
+}
+
+/// The store `Db::open` makes under `Always` of a buffered life that
+/// rotated its log by size and was killed: the older file loose, its frames
+/// replayed and unsynced. Returns the store, its options, life one's syncs
+/// and the keys life one committed.
+fn dl_reopened_loose(d: &Path) -> (Db, Options, Traced, Vec<Vec<u8>>) {
+    let shape = |sync| Options {
+        sync,
+        seal_rotates_wal: false,
+        seal_bytes: 64 << 10,
+        ..sr_opts(SyncPolicy::Always, Options::default())
+    };
+    let val = "x".repeat(100);
+    let mut db = Db::create(&made(d), shape(buffered().sync)).unwrap();
+    db.trace_wal_syncs(true);
+    let mut i = 0u32;
+    while db.seal_waits().wal_rotations == 0 {
+        put_commit(&mut db, &format!("a{i:07}"), &val).unwrap();
+        i += 1;
+        assert!(i < 10_000, "life one: the log never rotated");
+    }
+    assert!(
+        db.seal_waits().rotated_unsynced > 0,
+        "life one: the premise, a loose rotation"
+    );
+    assert_eq!(db.levels(), (0, 0), "life one: the premise, nothing sealed");
+    let one = db.wal_syncs_traced();
+    killed(db, d);
+    let opts = shape(SyncPolicy::Always);
+    let mut db = Db::open(d, opts.clone()).unwrap();
+    db.trace_wal_syncs(true);
+    let logged = (0..i).map(|i| format!("a{i:07}").into_bytes()).collect();
+    (db, opts, one, logged)
+}
+
+/// Under `Always` after a reopen of a buffered life whose log rotated, a
+/// run's first commit is due and syncs the log first; where that sync
+/// cannot open the loose file -- an error of the open, which nothing keeps
+/// -- the commit answers it with nothing of the run synced, and its batch,
+/// marked committed and visible, is owed by the run's file: a commit with
+/// nothing new after it writes and syncs the batch, the log first, or
+/// answers an error -- never `Ok` with nothing synced -- and a power cut
+/// after an `Ok` keeps every key of the batch and of the log before it.
+#[test]
+fn a_runs_due_commit_under_always_whose_log_sync_could_not_open_a_loose_file_owes_its_batch() {
+    let d = dir("dur-duelog-unopened-always");
+    let crash = dir("dur-duelog-unopened-always-crash");
+    let (mut db, opts, one, logged) = dl_reopened_loose(&d);
+    let loose = dl_closed_logs(&d, &db);
+    assert!(!loose.is_empty(), "the premise, a closed log file");
+    assert!(db.wal_unsynced(), "the premise, the log owes a sync");
+    db.hold_seal_durable(true);
+    let mut answered_ok = false;
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.seal().unwrap();
+        dl_break(&loose);
+        let r = sr_commits_answer(&mut db, 0, 10);
+        dl_mend(&loose);
+        match r {
+            Ok(()) => panic!("the due commit answered Ok where the loose file would not open"),
+            Err(e) => assert_ne!(
+                e.kind(),
+                std::io::ErrorKind::NotFound,
+                "the premise, an error of the open that is not an absence: {e}"
+            ),
+        }
+        assert_eq!(
+            db.run_synced_bytes(),
+            Some(0),
+            "the due commit whose log sync failed synced the run"
+        );
+        assert_eq!(
+            dl_synced_of(&db, &loose),
+            0,
+            "the premise, the loose file unsynced"
+        );
+        match db.commit() {
+            Err(_) => {}
+            Ok(()) => {
+                answered_ok = true;
+                assert_ne!(
+                    db.run_synced_bytes(),
+                    Some(0),
+                    "a commit of nothing answered Ok under Always over the batch its due commit \
+                     failed to sync, with nothing of the run synced"
+                );
+                assert!(
+                    dl_synced_of(&db, &loose) > 0,
+                    "a commit of nothing synced the run's batch and not the loose file before it"
+                );
+            }
+        }
+        dl_power_cut(&db, &d, &crash, &[&one]);
+    }));
+    db.hold_seal_durable(false);
+    if let Err(p) = caught {
+        std::panic::resume_unwind(p);
+    }
+    drop(db);
+    let opened = Db::open(&crash, opts).unwrap_or_else(|e| panic!("the cut opens: {e}"));
+    if answered_ok {
+        let log_missing = logged
+            .iter()
+            .filter(|k| read_vec(&opened, k).is_empty())
+            .count();
+        assert_eq!(
+            log_missing,
+            0,
+            "the Ok over the batch lost {log_missing} of the {} keys the log held before it",
+            logged.len()
+        );
+        if let Some(m) = sr_missing(
+            &opened,
+            10,
+            "the batch the commit of nothing answered Ok over",
+        ) {
+            panic!("{m}");
+        }
+    }
+    drop(opened);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// A run opened beside a file a rotation left loose -- the live file holds
+/// no frame -- whose first commit, not due, the device refused a piece of:
+/// the batch is owed, and the call with nothing new that writes it again
+/// syncs the log first. Where that sync cannot open the loose file, the
+/// call answers it, and the next call syncs the loose file before it
+/// syncs anything of the run: the note stays until the log is synced, and
+/// a power cut after the batch is written again keeps every commit before
+/// it.
+#[test]
+fn a_runs_owed_batch_written_again_whose_log_sync_could_not_open_a_loose_file_syncs_it_at_the_next()
+{
+    let d = dir("dur-duelog-again-unopened");
+    let crash = dir("dur-duelog-again-unopened-crash");
+    let shape = |sync| Options {
+        sync,
+        seal_rotates_wal: false,
+        seal_bytes: 64 << 10,
+        segment: SegmentOptions {
+            write_piece: 4096,
+            ..SegmentOptions::default()
+        },
+        ..sr_opts(SyncPolicy::Always, Options::default())
+    };
+    let val = "x".repeat(100);
+    let put_until_rotated = |db: &mut Db| {
+        let mut i = 0u32;
+        while db.seal_waits().wal_rotations == 0 {
+            put_commit(db, &format!("a{i:07}"), &val).unwrap();
+            i += 1;
+            assert!(i < 10_000, "the log never rotated");
+        }
+        i
+    };
+    let probe = dir("dur-duelog-again-unopened-probe");
+    let n = put_until_rotated(&mut Db::create(&probe, shape(buffered().sync)).unwrap());
+    let _ = std::fs::remove_dir_all(&probe);
+    let opts = shape(SyncPolicy::EveryN(n + 3));
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    db.trace_wal_syncs(true);
+    assert_eq!(
+        put_until_rotated(&mut db),
+        n,
+        "the same writes rotate alike"
+    );
+    assert!(
+        db.seal_waits().rotated_unsynced > 0,
+        "the premise, a loose rotation"
+    );
+    let logged: Vec<Vec<u8>> = (0..n).map(|i| format!("a{i:07}").into_bytes()).collect();
+    let loose = dl_closed_logs(&d, &db);
+    assert_eq!(
+        loose.len(),
+        1,
+        "the premise, one closed log file: {loose:?}"
+    );
+    db.hold_seal_durable(true);
+    let next = 50u32;
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.seal().unwrap();
+        db.fail_next_run_write();
+        sr_commits_answer(&mut db, 0, next)
+            .unwrap_or_else(|e| panic!("the premise, a refused piece is owed: {e}"));
+        assert_eq!(
+            db.run_synced_bytes(),
+            Some(0),
+            "the premise, the run's first commit was not due"
+        );
+        dl_break(&loose);
+        let r = db.commit();
+        dl_mend(&loose);
+        match r {
+            Ok(()) => panic!("the call answered Ok where the loose file would not open"),
+            Err(e) => assert_ne!(
+                e.kind(),
+                std::io::ErrorKind::NotFound,
+                "the premise, an error of the open that is not an absence: {e}"
+            ),
+        }
+        assert_eq!(
+            db.run_synced_bytes(),
+            Some(0),
+            "the call whose log sync failed synced the run"
+        );
+        assert_eq!(
+            dl_synced_of(&db, &loose),
+            0,
+            "the premise, the loose file unsynced"
+        );
+        // The held write's answer, and then the batch written again.
+        match db.commit() {
+            Ok(()) => panic!("the premise, the next call answers the held write"),
+            Err(e) => assert!(
+                e.to_string().contains("the run's write failed"),
+                "the premise, the held write's answer: {e}"
+            ),
+        }
+        assert_eq!(
+            dl_synced_of(&db, &loose),
+            1,
+            "the next call synced the loose file before the run"
+        );
+        db.commit()
+            .unwrap_or_else(|e| panic!("the call with nothing new answers: {e}"));
+        assert_ne!(
+            db.run_synced_bytes(),
+            Some(0),
+            "the premise, the call wrote the owed batch again and synced it"
+        );
+        dl_power_cut(&db, &d, &crash, &[]);
+    }));
+    db.hold_seal_durable(false);
+    if let Err(p) = caught {
+        std::panic::resume_unwind(p);
+    }
+    drop(db);
+    let opened = Db::open(&crash, opts).unwrap_or_else(|e| panic!("the cut opens: {e}"));
+    let log_missing = logged
+        .iter()
+        .filter(|k| read_vec(&opened, k).is_empty())
+        .count();
+    assert_eq!(
+        log_missing,
+        0,
+        "the batch written again lost {log_missing} of the {} keys the loose file held",
+        logged.len()
+    );
+    if let Some(m) = sr_missing(&opened, next, "the run's batch written again") {
+        panic!("{m}");
+    }
+    drop(opened);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// Run A, under `EveryN`, closed into a seal by `Db::seal` before any
+/// commit of it was due, its seal held before it writes anything
+/// (`hold_seal_landing`), so its commits are on its file and synced by
+/// nothing; then run B above it, to its first due commit. B's note is of
+/// the log, which owes nothing here, and says nothing of A's file, so the
+/// due commit syncs B's file alone, and a power cut after it keeps B's
+/// commits and loses A's older ones: not a prefix. The docs name it beside
+/// the close's presync, and `ROADMAP.md` keeps it open; this test holds
+/// the window, so that whatever closes it restates this test. The copy is
+/// taken while every seal is held before its write, so nothing lands
+/// inside it.
+#[test]
+fn a_runs_due_commit_after_a_run_closed_into_a_held_seal_outlives_that_runs_commits() {
+    use std::os::unix::fs::MetadataExt;
+    let d = dir("dur-duelog-closed-run");
+    let crash = dir("dur-duelog-closed-run-crash");
+    let opts = Options {
+        segment: SegmentOptions {
+            write_piece: 4096,
+            ..SegmentOptions::default()
+        },
+        ..sr_opts(SyncPolicy::EveryN(5), Options::default())
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    db.sync().unwrap();
+    db.trace_wal_syncs(true);
+    // Run A: two commits of batches longer than a write piece, neither
+    // due, so their pieces are on A's file and synced by nothing.
+    let a_keys = 100u32;
+    sr_commits(&mut db, 0, a_keys, 50);
+    assert_eq!(db.run_synced_bytes(), Some(0), "the premise, A not due");
+    let (a_written, _) = db.run_written_and_held().expect("A is open");
+    assert!(a_written > 0, "the premise, A's records are on its file");
+    let a_ino = run_ino(&d);
+    let a_tmp = d.join(run_tmp_name(&d));
+    let a_len = std::fs::metadata(&a_tmp).unwrap().len();
+    let a_synced = db.run_device_synced().expect("A is open").0;
+    assert!(!db.wal_unsynced(), "the premise, the log owes nothing");
+    db.hold_seal_landing(true);
+    let mut next = a_keys;
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.seal().unwrap();
+        // Run B: commits from A's greatest up, until one is due.
+        let _ = dl_until_due(&mut db, &mut next, "run B");
+        let inos: Vec<u64> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with("direct-") && n.ends_with(".tmp")
+            })
+            .map(|e| e.metadata().unwrap().ino())
+            .collect();
+        assert!(
+            inos.contains(&a_ino),
+            "the premise, A's temp name stays until a manifest names it"
+        );
+        let b_ino = *inos
+            .iter()
+            .find(|&&i| i != a_ino)
+            .expect("the premise, B is a run of its own");
+        assert_eq!(
+            std::fs::metadata(&a_tmp).unwrap().len(),
+            a_len,
+            "the premise, A's seal held before it writes anything: the cut below is a crash \
+             state only while nothing has synced A's file"
+        );
+        let b_synced = db.run_device_synced().expect("B is open").0;
+        assert!(b_synced > 0, "the premise, B's due commit synced its file");
+        let traced = db.wal_syncs_traced();
+        copy_store(&d, &crash);
+        // Each run's file, under every name it has, cut to what its syncs
+        // covered; the log to what its own did.
+        for e in std::fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            let ino = e.metadata().map(|m| m.ino()).ok();
+            let keep = if ino == Some(a_ino) {
+                a_synced
+            } else if ino == Some(b_ino) {
+                b_synced
+            } else {
+                continue;
+            };
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(crash.join(e.file_name()))
+                .unwrap()
+                .set_len(keep)
+                .unwrap();
+        }
+        power_cut_logs(&crash, &[&traced], WAL_HEAD, &[]);
+    }));
+    db.hold_seal_landing(false);
+    if let Err(p) = caught {
+        std::panic::resume_unwind(p);
+    }
+    drop(db);
+    let opened = Db::open(&crash, opts).unwrap_or_else(|e| panic!("the cut opens: {e}"));
+    let a_here = (0..a_keys)
+        .filter(|&k| read_vec(&opened, &sr_key(k)) == vec![sr_val(k)])
+        .count();
+    let b_here = (a_keys..next)
+        .filter(|&k| read_vec(&opened, &sr_key(k)) == vec![sr_val(k)])
+        .count();
+    assert!(
+        b_here == (next - a_keys) as usize && a_here == 0,
+        "the window: a power cut after run B's due commit keeps B's commits ({b_here} of {}) and \
+         loses run A's older ones ({a_here} of {a_keys} kept) -- if it no longer does, the window \
+         is closed: restate this test, the docs and ROADMAP.md",
+        next - a_keys
+    );
     drop(opened);
     let _ = std::fs::remove_dir_all(&d);
     let _ = std::fs::remove_dir_all(&crash);

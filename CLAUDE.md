@@ -2303,7 +2303,26 @@ frames of a table frozen before it, a file a rotation left loose, frames
 an open replayed -- noted once at the run's open and asked in the due
 branch (`Direct::log_owed`), since nothing writes the log while a run is
 open in the clear; under a cipher the run's due commit syncs the log
-behind its own frames anyway. The WAL never
+behind its own frames anyway; the sync of a batch the run's file owes,
+which a commit with nothing new for the run, a `sync` or a `flush` makes
+whatever the policy (`Db::run_again`), stands in for a due one and syncs
+the log first the same way. That orders the log behind the syncs the
+policy makes and no others: the helper thread behind the run's writer
+fdatasyncs the run's file every `sync_ahead` under any policy, the
+kernel writes its pages back, and a run that closes before its first due
+commit has its records synced by the flush that closes it (the presync)
+and its whole file by its seal's fsync, neither waiting for the durable
+landing of a seal before it -- so before the run's first due commit a
+power cut may keep run commits nobody acknowledged and lose the log's
+older frames (`ROADMAP.md`). The note is of the log alone: a run closed
+into a seal still in flight owes its unsynced commits to that seal's
+landing, and a later run's due commit syncs nothing of its file, so a
+power cut after it may keep the later run and lose the earlier one. A
+log sync that fails at the due commit -- kept where it is an
+fdatasync's, returned as is where a loose file would not open or the
+live header would not chain -- leaves the batch owed by the run's file,
+so the next call with nothing new writes and syncs it, the log first.
+The WAL never
 sees them (`direct_ingest: false` is the arm that still sends them there).
 Recovery walks the temp file's record stream to the last marker whose three
 quantities agree with the records before it and rewrites what precedes it as
@@ -3135,10 +3154,50 @@ the suite, whose ordered loads open their runs over a log that owes
 nothing and whose buffered arm's policy is never due, so a test of the
 due commit beside a frozen table, a loose file and a reopen under
 `Always` is what holds it, and one beside a clean log that it syncs
-nothing more. The corollary: a sync a policy issues is priced as the
-promise it makes, every file the promise covers, and where the files it
-covers are known when the run begins, the note is taken there and read
-where the sync is due.
+nothing more. Its first docs then said that a crash keeping the run's
+synced commits keeps every commit before them, and took the exception
+out of the policy's headline: the review read the file's other syncs off
+the writer -- the helper thread that fdatasyncs a run every `sync_ahead`
+of file under any policy, the only sync a buffered store's run ever
+gets before its close, and the kernel's writeback -- and every test's run
+was a few hundred bytes, under the helper's stride. A test with a small
+stride and the helper's count waited on reached it at once. The
+corollary: a sync a policy issues is priced as the promise it makes,
+every file the promise covers, and where the files it covers are known
+when the run begins, the note is taken there and read where the sync is
+due; and a promise about what a crash keeps is read against every way
+the bytes reach the device -- each thread that syncs the file and the
+kernel's writeback -- not only the syncs the fix ordered. The second
+review found two more, read off the code as the first had been. A
+commit of nothing after a run's piece write was refused writes the
+batch again and syncs it whatever the policy, standing in for the due
+commit the failure spent, and synced the run alone: a power cut after
+its `Ok` kept the run's batch and lost every older frame of the log,
+the defect the unit was for, on the one path the note was not read at;
+it reads it now. And a run that closes before any commit of it is due
+is synced twice on the way to its seal, by the flush's presync and by
+the seal's own fsync, both before the seal ahead of it is durable,
+which the docs' list of the ways had left out because it named the ways
+an open run's bytes move. The corollary of the corollary: a sync that
+stands in for one the policy would have made reads every note the
+policy's sync reads, and a list of the ways bytes reach the device is
+read off every function that syncs the file, the close's among them,
+never off the state the run happens to be in when the list is written.
+The third review read two more. A log sync that failed at the due commit
+returned before the run's sync, which was right, and answered an error
+`sync_wal` does not keep where a loose file would not open: the batch,
+marked committed, was then unsynced and owed by nothing -- no write had
+failed -- so under `Always` a commit of nothing after it answered `Ok`
+with nothing synced, a state no path had reached before the unit put a
+second sync ahead of the run's; the failure marks the batch owed now, a
+line on the error path. And the sentence the unit added, that a crash
+keeping a run's synced commit keeps every commit before it, was true of
+the log's commits and not of a run closed earlier into a seal in flight,
+whose file the later run's note says nothing of. The rule: a step put
+ahead of another on a path inherits the failure states the other's
+failure used to leave, so each error it can return is read for what it
+leaves owed; and a promise of "every commit before it" is read against
+every log a commit can be in, the runs' files as well as the WAL.
 
 **A pass that reported done for a turn it skipped.** The upkeep thread's
 pass checked that the state was the commit's by its generation and, where
