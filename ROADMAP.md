@@ -325,29 +325,16 @@ What an engine picker would hit, roughly in order.
   dm-flakey target that drops unflushed writes cuts the power after
   such an open, and the store reopens with every acknowledged write,
   with the directory fsync removed as its control.
-- [ ] **A run's commits on the device before its first due sync.** A
-  run's first commit the policy syncs syncs the log first wherever the
-  log owed a sync when the run opened (`Direct::log_owed`), but before
-  that commit the run's file reaches the device by other ways: the
-  thread behind its writer fdatasyncs it every
-  `SegmentOptions::sync_ahead` of file under any policy -- a buffered
-  store's run is never due, so only this thread syncs it -- the
-  kernel writes back its pages, and a run that closes before its first
-  due commit has its records synced by the flush's presync
-  (`Options::close_presync`) and its file by its seal's fsync, neither
-  waiting for the durable landing of the seal ahead of it. A power cut then may keep run commits
-  nothing acknowledged and lose older frames of a table frozen before
-  the run, a loose file or frames an open replayed, which is not a tail
-  of the commit order. `a_runs_commits_its_helper_synced_before_a_due_one_outlive_older_log_frames_until_it`
-  holds the helper's half and
-  `a_runs_commits_its_close_synced_before_a_due_one_outlive_older_log_frames`
-  the presync's. Shapes, each priced first: the helper held off while
-  the note stands and the close's syncs ordered behind the seal ahead
-  (writeback is left); or the log synced where the note is taken, before
-  the run's first byte (a syscall at a run's open over a log that owes,
-  the one shape that covers all four ways). Done when what survives a
-  power cut is a prefix of the commits in every shape of a run, with
-  that test restated to the prefix.
+- [ ] **A run's due commit beside log frames no sync covered.** Under
+  `EveryN` a run's commit that is due syncs the run's file and not the
+  log, and a run opens over a log that may hold the frames of a table
+  frozen before it, unsynced, its seal not yet durable: a power cut then
+  keeps the run's commits and loses the earlier ones in the log, which is
+  not a tail of the commit order. A `sync` covers both. Done when the
+  run's open notes, once a run, whether the log owes a sync, and the due
+  branch asks that note beside the run's fdatasync and syncs the log
+  first, priced on the buffered loads after a shuffled one, with a crash
+  test that holds the frozen table's seal before its fsyncs.
 - [ ] **A sync over a run closed into a seal in flight.** Under
   `EveryN` a run in the clear that closes -- at any write it cannot take
   (an `append` of a key at or below its greatest, of an empty or overlong
@@ -356,11 +343,7 @@ What an engine picker would hit, roughly in order.
   hands its writer to a seal with the commits the
   policy left unsynced, the tail short of a whole piece still held: a
   `sync` before that seal lands answers `Ok` over them, and a kill or a
-  power cut then loses them while a later commit survives -- to the log,
-  or of a run opened after it, whose due commit syncs the log
-  (`Direct::log_owed`) and nothing of the closed run's file
-  (`a_runs_due_commit_after_a_run_closed_into_a_held_seal_outlives_that_runs_commits`
-  holds that window open). A
+  power cut then loses them while a later commit to the log survives. A
   `flush` covers them; the docs say a `sync` does not. Two shapes, each
   priced first: the run's close notes, once a run, that it closed owing
   commits, and a `sync` that finds the note waits for that seal's
@@ -373,9 +356,7 @@ What an engine picker would hit, roughly in order.
   does not inline, `Db::seal`, and a commit that crosses the seal
   threshold -- under `EveryN(u32::MAX)`, holds the seal's landing, syncs,
   and reads every commit back after a kill and after a power cut, on
-  every run arm; and with the window test above restated, a later run's
-  due commit syncing the closed run's file first (or waiting for its
-  landing) so that a power cut after it keeps a prefix.
+  every run arm.
 - [x] **Encryption at rest for a live store.** A store opens under a key
   (`Encryption::Kernel`) and the kernel encrypts its directory: every file
   it writes is ciphertext on the device and plaintext in the page cache,
