@@ -15,7 +15,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use supdb::{
-    Db, Encryption, Options, Reader, SegmentOptions, SegmentWriter, StoreCipher, SyncPolicy,
+    Db, Encryption, HelperFault, Options, Reader, SegmentOptions, SegmentWriter, StoreCipher,
+    SyncPolicy,
 };
 
 mod common;
@@ -13674,4 +13675,267 @@ fn a_runs_due_commit_after_a_run_closed_into_a_held_seal_outlives_that_runs_comm
     drop(opened);
     let _ = std::fs::remove_dir_all(&d);
     let _ = std::fs::remove_dir_all(&crash);
+}
+
+// ---------------------------------------------------------------------
+// helper-race: the helper thread behind a segment's writer syncs the file
+// on an open file description of its own, so a writeback error its
+// fdatasync meets is reported to the writer's own fdatasync as well, and
+// a commit whose sync returns in the instant before the helper stores its
+// error is not acknowledged over it. And the helper's failed sync at a
+// seal's finish and at a merge's is the landing's failure.
+
+/// Lets a held helper go when the test ends, on its own failure as well:
+/// a writer's drop joins its helper.
+struct ReleaseHelper(std::sync::Arc<HelperFault>);
+
+impl Drop for ReleaseHelper {
+    fn drop(&mut self) {
+        self.0.hold_store(false);
+    }
+}
+
+fn helper_seam(armed: bool, hold: bool) -> std::sync::Arc<HelperFault> {
+    let f = std::sync::Arc::new(HelperFault::default());
+    f.arm(armed);
+    f.hold_store(hold);
+    f
+}
+
+/// The trace "1 B B Y": a batch written, the helper's fdatasync and the
+/// commit's begun, the device's error reported to the helper's, and the
+/// commit's returning before the helper stores the error. The commit is
+/// the failure's, and every call after it keeps it.
+fn a_run_commit_beside_a_helper_sync_that_met_an_error(tag: &str, base: Options) {
+    let d = dir(&format!("dur-hrace-{tag}"));
+    let fault = helper_seam(true, true);
+    let opts = Options {
+        sync: SyncPolicy::EveryN(2),
+        segment: SegmentOptions {
+            write_piece: 4096,
+            sync_ahead: 16384,
+            helper_fault: Some(fault.clone()),
+            ..Default::default()
+        },
+        ..base
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let _release = ReleaseHelper(fault.clone());
+    // Ascending into an empty store: a direct run.
+    for k in 0..3000u32 {
+        db.append(&hkey(k), &hval(k));
+    }
+    db.commit().unwrap(); // the policy's first of two: no sync
+    wait_for("the helper's failed fdatasync, its error not yet stored", || {
+        fault.in_window()
+    });
+    assert!(db.run_synced_bytes().is_some(), "the run is open");
+    db.append(&hkey(3000), &hval(3000));
+    let due = db.commit();
+    fault.hold_store(false);
+    assert!(
+        due.is_err(),
+        "{tag}: the policy's sync, returning while the helper held a writeback error it had \
+         not stored, is not answered Ok"
+    );
+    wait_count_fault(&fault, "the helper's error stored");
+    kept(db.commit(), "a commit of nothing after");
+    kept(db.sync(), "a sync after");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+fn wait_count_fault(f: &HelperFault, what: &str) {
+    wait_for(what, || f.failed() >= 1);
+}
+
+#[test]
+fn a_run_commit_beside_a_helper_sync_that_met_an_error_answers_it() {
+    a_run_commit_beside_a_helper_sync_that_met_an_error("plain", Options::default());
+}
+
+/// Under a cipher the run's file is a memory file, which has no writeback
+/// to fail and whose commits are frames of the log; the helper syncs it on
+/// a description of its own all the same, and a seam's error there is the
+/// commit's.
+#[test]
+fn a_run_commit_beside_a_helper_sync_that_met_an_error_answers_it_under_a_cipher() {
+    a_run_commit_beside_a_helper_sync_that_met_an_error("cipher", under_cipher());
+}
+
+/// The same at the writer: a marked segment's `sync` returning while its
+/// helper holds a failed fdatasync's error unstored answers the error.
+#[test]
+fn a_marked_segments_sync_beside_its_helpers_failed_sync_answers_it() {
+    let d = dir("dur-hrace-writer");
+    let fault = helper_seam(true, true);
+    let opts = SegmentOptions {
+        write_piece: 4096,
+        sync_ahead: 16384,
+        helper_fault: Some(fault.clone()),
+        ..Default::default()
+    };
+    let mut w = SegmentWriter::create(&d.join("run.sup"), &opts).unwrap();
+    let release = ReleaseHelper(fault.clone());
+    w.set_inline_max(256);
+    w.set_marks(true);
+    for k in 0..3000u32 {
+        w.begin(&hkey(k)).unwrap();
+        w.value(&hval(k));
+        w.end_with(false).unwrap();
+    }
+    w.mark().unwrap();
+    wait_for("the helper's failed fdatasync, its error not yet stored", || {
+        fault.in_window()
+    });
+    let first = w.sync();
+    drop(release);
+    assert!(
+        first.is_err(),
+        "a sync returning while the helper held a writeback error it had not stored is not \
+         answered Ok"
+    );
+    assert!(w.sync().is_err(), "nor is the sync after it");
+    drop(w);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The helper's own open of the file failing -- no `/proc` -- leaves the
+/// writer with no helper: the segment is written, synced by the writer and
+/// finished whole, and no helper sync is made to fail.
+#[test]
+fn a_writer_whose_helper_cannot_open_its_file_writes_without_one() {
+    let d = dir("dur-hrace-noproc");
+    let fault = helper_seam(true, false);
+    fault.refuse_reopen(true);
+    let opts = SegmentOptions {
+        write_piece: 4096,
+        sync_ahead: 16384,
+        helper_fault: Some(fault.clone()),
+        ..Default::default()
+    };
+    let path = d.join("seg.sup");
+    let mut w = SegmentWriter::create(&path, &opts).unwrap();
+    w.set_inline_max(256);
+    w.set_marks(true);
+    for k in 0..3000u32 {
+        w.begin(&hkey(k)).unwrap();
+        w.value(&hval(k));
+        w.end_with(false).unwrap();
+    }
+    w.mark().unwrap();
+    w.sync().expect("the writer's sync, with no helper");
+    w.finish(1).expect("the finish, with no helper");
+    assert_eq!(fault.failed(), 0, "no helper ran to fail a sync");
+    assert_eq!(
+        fault.refused(),
+        1,
+        "the writer asks for the helper's open once, and goes on without one"
+    );
+    let blob = supdb::Blob::open(supdb::bytes::MmapBytes::open(&path).unwrap()).unwrap();
+    assert_eq!(blob.count(&hkey(0)).unwrap(), 1);
+    assert_eq!(blob.count(&hkey(2999)).unwrap(), 1);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A seal whose output's helper fdatasync failed: the finish joins the
+/// helper and takes its error before the segment is renamed into place, so
+/// the seal fails before its readable landing. No segment is on disk under
+/// a live name, no manifest names one or covers the writes, and the flush
+/// answers the failure; the reopen replays the log.
+#[test]
+fn a_seal_whose_helper_sync_failed_is_named_by_no_manifest() {
+    let d = dir("dur-hrace-seal");
+    let fault = helper_seam(true, false);
+    let opts = Options {
+        direct_ingest: false,
+        segment: SegmentOptions {
+            write_piece: 4096,
+            sync_ahead: 16384,
+            helper_fault: Some(fault.clone()),
+            ..Default::default()
+        },
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model = SsModel::new();
+    for k in (0..3000u32).rev() {
+        let v = String::from_utf8(hval(k)).unwrap();
+        ss_put(&mut db, &mut model, &hkey(k), &v);
+    }
+    db.commit().unwrap();
+    let flushed = db.flush();
+    let settled = db.settle();
+    assert!(fault.failed() >= 1, "the seal's helper met its failure");
+    assert!(
+        seg_names(&d).is_empty(),
+        "no segment of the failed seal is under a live name: {:?}",
+        seg_names(&d)
+    );
+    let (_, covered, names) = ss_newest(&d).expect("a manifest");
+    assert!(names.is_empty(), "a manifest names {names:?}");
+    assert_eq!(covered, 0, "a manifest covers the writes of the failed seal");
+    ss_check(&db, &model, "after the failure");
+    for (what, r) in [("the flush", flushed), ("a settle after it", settled)] {
+        match r {
+            Ok(()) => panic!("{what}: answered Ok over the seal's failed helper sync"),
+            Err(e) => assert!(
+                e.to_string().contains("Input/output error"),
+                "{what}: answered with an error that is not the helper's: {e}"
+            ),
+        }
+    }
+    assert!(db.seals_wedged(), "the seal's failure stops the queue");
+    drop(db);
+    let reopen = Options {
+        segment: SegmentOptions::default(),
+        ..opts
+    };
+    let db = Db::open(&d, reopen).expect("the store opens");
+    ss_check(&db, &model, "reopened");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A merge whose output's helper fdatasync failed: the finish takes the
+/// helper's error before the piece is renamed into place, the merge lands
+/// nothing, the store's segments and its manifest are as they were, and
+/// the commit after it answers the failure.
+#[test]
+fn a_merge_whose_helper_sync_failed_lands_nothing() {
+    let d = dir("dur-hrace-merge");
+    let fault = helper_seam(false, false);
+    let base = Options {
+        segment: SegmentOptions {
+            write_piece: 64 << 10,
+            sync_ahead: 256 << 10,
+            helper_fault: Some(fault.clone()),
+            ..Default::default()
+        },
+        ..Options::default()
+    };
+    let mut model = SsModel::new();
+    let armed = fault.clone();
+    let (mut db, opts) = ss_store_with_a_merge_due(&d, base, &mut model, move |_| armed.arm(true));
+    wait_for("the merge's end", || !db.in_flight().1);
+    assert!(fault.failed() >= 1, "the merge's helper met its failure");
+    let e = ss_commit_answer(&mut db);
+    assert!(
+        e.to_string().contains("Input/output error"),
+        "the commit after the merge answers its helper's failure: {e}"
+    );
+    let on_disk = seg_names(&d);
+    let mut named = ss_names(&d);
+    named.sort();
+    let mut disk = on_disk.clone();
+    disk.sort();
+    assert_eq!(disk, named, "a segment of the failed merge is under a live name");
+    assert_eq!(db.levels(), (1, 2), "the partition and its two pieces stand");
+    ss_check(&db, &model, "after the failure");
+    fault.arm(false);
+    drop(db);
+    let db = Db::open(&d, opts).expect("the store opens");
+    ss_check(&db, &model, "reopened");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
 }
