@@ -16846,6 +16846,659 @@ fn a_merges_outputs_are_built_in_the_block_form_where_the_room_is_short() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `numbered_load` with values the block form compresses: four random
+/// bytes and the rest one byte, so that a partition's block form is a
+/// fraction of its stride form and the room between the two is a room.
+/// With `twice`, the last key is given a second value in a batch of its
+/// own, so that the stride form declines the last partition
+/// (`StrideNo::NotOneValue`).
+fn numbered_soft_load(db: &mut Db, n: usize, w: usize, seed: u64, twice: bool) -> Model {
+    let mut rng = Rng(seed);
+    let mut model = Model::new();
+    let value = |rng: &mut Rng| {
+        let mut v = vec![0x5Au8; w];
+        for b in v.iter_mut().take(4) {
+            *b = (rng.next() >> 24) as u8;
+        }
+        v
+    };
+    for chunk in (0..n).collect::<Vec<_>>().chunks(500) {
+        for &i in chunk {
+            let v = value(&mut rng);
+            let k = numbered_key(i);
+            db.append(&k, &v);
+            model.insert(k, vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    if twice {
+        let k = numbered_key(n - 1);
+        let v = value(&mut rng);
+        db.append(&k, &v);
+        model.get_mut(&k).unwrap().push(v);
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    model
+}
+
+/// The conversion's next look waited for (`Options::zpages_stride_convert`):
+/// the injected clock moved `by`, and the counts read once the segment
+/// work's turn has looked at it.
+///
+/// A look is made only at a tick of the controller, which comes when the
+/// injected clock moves, and only with the builder free; a build in flight
+/// when the clock moved -- a conversion's, on a thread of the idle class,
+/// with its sync -- takes the tick without a look. So where no look has
+/// come in a fifth of a second of the wall the clock is moved a census
+/// interval more, for as long as a minute.
+#[cfg(target_os = "linux")]
+fn convert_look(db: &Db, by: std::time::Duration) {
+    let inject = db.options().zpages_inject.clone().unwrap();
+    let was = db.zpage_counts().stride_convert_looks;
+    inject.advance(by);
+    let t = std::time::Instant::now();
+    let mut nudged = std::time::Instant::now();
+    while db.zpage_counts().stride_convert_looks == was && t.elapsed().as_secs() < 60 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        if nudged.elapsed().as_millis() >= 200 {
+            inject.advance(std::time::Duration::from_millis(100));
+            nudged = std::time::Instant::now();
+        }
+    }
+    assert!(
+        db.zpage_counts().stride_convert_looks > was,
+        "the conversion looked: {:?}",
+        db.zpage_counts()
+    );
+}
+
+/// `heat_up` over keys that may hold more than one value: `n` reads of
+/// `keys`, round and round, each answering something.
+fn read_round(db: &Db, keys: &[Vec<u8>], n: usize) {
+    for i in 0..n {
+        let k = &keys[i % keys.len()];
+        assert!(!read_vec(db, k).is_empty(), "a key reads back");
+    }
+}
+
+/// Every key read once and a look of the conversion a second on, round
+/// after round, until `cond` holds of the counts or `max` rounds have gone:
+/// whether it holds. The reads are alike over the partitions, so each round
+/// moves the partitions' touches toward alike whatever heat a partition
+/// carried in, which decays as the looks go by.
+#[cfg(target_os = "linux")]
+fn convert_alike_until(
+    db: &Db,
+    keys: &[Vec<u8>],
+    max: u32,
+    cond: impl Fn(&supdb::db::ZCounts) -> bool,
+) -> bool {
+    for _ in 0..max {
+        if cond(&db.zpage_counts()) {
+            return true;
+        }
+        read_round(db, keys, keys.len());
+        convert_look(db, std::time::Duration::from_secs(1));
+        wait_steps(db, 2);
+    }
+    cond(&db.zpage_counts())
+}
+
+/// Each partition's form by key order: whether a stride file serves it.
+fn strides(db: &Db) -> Vec<bool> {
+    db.zpage_heat().iter().map(|h| h.stride).collect()
+}
+
+/// A store under the controller in COMPACT with every partition served by
+/// a form file -- a block file's under `ZStride::Chosen`, where the stride
+/// form is a conversion's alone, and a stride file's under `Forced` but for
+/// the last partition, which the stride form declines -- the conversion as
+/// `on` says, a decode priced at ten microseconds, a fault at a millisecond
+/// and a conversion's build at two hundred milliseconds.
+#[cfg(target_os = "linux")]
+fn convert_store(
+    name: &str,
+    stride: ZStride,
+    on: bool,
+) -> (
+    PathBuf,
+    Db,
+    Model,
+    std::sync::Arc<supdb::ZInject>,
+    Vec<Vec<u8>>,
+) {
+    let (dir, db, model, inject) = auto_store_loaded(
+        name,
+        1 << 20,
+        1_000_000.0,
+        FAULT_1MS,
+        |o| {
+            o.zpages_stride = stride;
+            o.zpages_stride_convert = on;
+            o.zpages_memo = false;
+            o.partition_bytes = Some(400 << 10);
+        },
+        |_| {},
+        |db| numbered_soft_load(db, 20_000, 100, 0x5C0, true),
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    {
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{name}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+    }
+    assert!(
+        tick_until(&db, 400, |c| c.attached >= c.partitions
+            && c.warms >= c.partitions),
+        "{name}: every file attached and warmed: {:?}",
+        db.zpage_counts()
+    );
+    inject.set_decode_cost(std::time::Duration::from_micros(10));
+    inject.set_convert_price(std::time::Duration::from_millis(200));
+    let c = db.zpage_counts();
+    let want = if stride == ZStride::Chosen {
+        0
+    } else {
+        c.partitions - 1
+    };
+    assert!(
+        c.form_files >= 5 && c.form_files == c.partitions && c.stride_files == want,
+        "{name}: partitions to choose from, each in the form its build asks: {c:?}"
+    );
+    (dir, db, model, inject, keys)
+}
+
+/// The conversion between the block and the stride forms under the
+/// controller (`Options::zpages_stride_convert`, `ZStride::Chosen`). Every
+/// partition is built in the block form. With every partition read alike
+/// and the budget at the block files' own bytes, no move into the stride
+/// form pays -- a partition's extra would be other partitions' faults at a
+/// hundred decodes each -- and nothing is converted. With room, the
+/// partition whose reads would have saved the price of its build is
+/// converted while it serves, alone, and reads through the stride form;
+/// the partition the form declines is asked once, keeps the reason and is
+/// not asked again however hot it reads. And with the budget back at the
+/// block files' bytes and every partition read alike again, the stride
+/// form's partition goes back to the block form. Every read answers as the
+/// model has it across each swap. Without the option nothing is converted
+/// and the policy never looks.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_controller_converts_a_partition_between_the_block_and_the_stride_forms() {
+    for on in [true, false] {
+        let what = &format!("stride convert {on}");
+        let (dir, db, model, inject, keys) =
+            convert_store(&format!("auto-convert-{on}"), ZStride::Chosen, on);
+        let r = db.reader().unwrap();
+        let total = db.zpage_counts().file_bytes;
+        let parts = db.zpage_heat().len();
+        let hot = keys_of_partition(&db, &model, 2);
+        let last = keys_of_partition(&db, &model, parts - 1);
+        let sec = std::time::Duration::from_secs(1);
+        if !on {
+            inject.set_budget(total * 100);
+            for _ in 0..3 {
+                read_round(&db, &hot, 300_000);
+                advance_tick(&db, sec);
+            }
+            wait_steps(&db, 5);
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.stride_converts, c.stride_convert_looks, c.stride_files),
+                (0, 0, 0),
+                "{what}: {c:?}"
+            );
+            check(&r, &model, &keys, what);
+            drop(r);
+            db.close().unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            continue;
+        }
+        // No room, and every partition read alike.
+        inject.set_budget(total);
+        convert_look(&db, sec);
+        let starts = db.zpage_counts().build_starts;
+        read_round(&db, &keys, keys.len());
+        convert_look(&db, sec);
+        convert_look(&db, sec);
+        wait_steps(&db, 5);
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.stride_converts, c.build_starts),
+            (0, starts),
+            "{what}: no move pays without room: {c:?}"
+        );
+        // Room, and one partition hot.
+        inject.set_budget(total * 100);
+        read_round(&db, &hot, 300_000);
+        convert_look(&db, sec);
+        assert!(
+            tick_until_built(&db, |c| c.stride_converts >= 1),
+            "{what}: the hot partition converted: {:?} {:?}",
+            db.zpage_counts(),
+            db.zpage_heat()
+        );
+        let st = strides(&db);
+        assert!(
+            st[2] && st.iter().filter(|s| **s).count() == 1,
+            "{what}: the hot partition alone in the stride form: {st:?}"
+        );
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.stride_files, c.stride_converts_back, c.recode_failed),
+            (1, 0, 0),
+            "{what}: {c:?}"
+        );
+        // The conversion's file is kept and serves at once: synced by its
+        // build, where the store's own builds, which keep theirs, sync none.
+        assert_eq!(
+            c.build_synced, 1,
+            "{what}: the conversion's file synced: {c:?}"
+        );
+        let before = c.stride_reads;
+        check(
+            &r,
+            &model,
+            &keys,
+            &format!("{what}: one in the stride form"),
+        );
+        let c = db.zpage_counts();
+        assert!(
+            c.stride_reads >= before + hot.len() as u64 && c.fallbacks == 0,
+            "{what}: its reads through the stride form: {c:?}"
+        );
+        // The partition the form declines: asked once it is hot, and not
+        // again.
+        read_round(&db, &last, 300_000);
+        convert_look(&db, sec);
+        assert!(
+            tick_until_built(&db, |c| c.stride_declines.iter().sum::<u64>() >= 1),
+            "{what}: the last partition asked and declined: {:?}",
+            db.zpage_counts()
+        );
+        let nos = db.zpage_stride_nos();
+        assert!(
+            *nos.last().unwrap() != 0 && nos[..nos.len() - 1].iter().all(|&n| n == 0),
+            "{what}: the reason kept on the last partition alone: {nos:?}"
+        );
+        let asked = db.zpage_counts().build_starts;
+        read_round(&db, &last, 300_000);
+        convert_look(&db, sec);
+        convert_look(&db, sec);
+        wait_steps(&db, 5);
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.build_starts, c.stride_files, c.stride_converts_back),
+            (asked, 1, 0),
+            "{what}: a declined partition is not asked again, and nothing \
+             moves out while it fits: {c:?}"
+        );
+        // The room gone, and every partition read alike: the stride form's
+        // partition goes back.
+        inject.set_budget(total);
+        assert!(
+            convert_alike_until(&db, &keys, 120, |c| c.stride_converts_back >= 1),
+            "{what}: gone back: {:?} {:?}",
+            db.zpage_counts(),
+            db.zpage_heat()
+        );
+        assert!(
+            strides(&db).iter().all(|s| !s),
+            "{what}: every partition in the block form again: {:?}",
+            strides(&db)
+        );
+        // By a build, synced as the one that brought it in was.
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.build_starts, c.build_synced, c.recode_flips),
+            (asked + 1, 2, 0),
+            "{what}: the way back a build: {c:?}"
+        );
+        check(&r, &model, &keys, &format!("{what}: after"));
+        let c = db.zpage_counts();
+        assert_eq!((c.fallbacks, c.recode_failed), (0, 0), "{what}: {c:?}");
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A partition built in the stride form goes out of it by a build, and
+/// comes in again by one (`Options::zpages_stride_convert` under
+/// `ZStride::Forced`): the store's builds ask for the stride form, and with
+/// the budget a quarter of what
+/// the stride files hold and every partition read alike, a partition's
+/// block form is built while its stride file serves and swapped in, its
+/// reads through the block form after; then with room and that partition
+/// hot, its stride form is built again and swapped back.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_partition_built_in_the_stride_form_is_converted_out_and_in_again() {
+    let what = "stride built, converted back";
+    let (dir, db, model, inject, keys) =
+        convert_store("auto-convert-forced", ZStride::Forced, true);
+    let r = db.reader().unwrap();
+    let sec = std::time::Duration::from_secs(1);
+    let c0 = db.zpage_counts();
+    let total = c0.file_bytes;
+    inject.set_budget(total / 4);
+    convert_look(&db, sec);
+    assert!(
+        convert_alike_until(&db, &keys, 120, |c| c.stride_converts_back >= 1),
+        "{what}: a partition gone back: {:?} {:?}",
+        db.zpage_counts(),
+        db.zpage_heat()
+    );
+    let c = db.zpage_counts();
+    assert!(
+        c.build_starts > c0.build_starts
+            && c.build_synced > c0.build_synced
+            && c.recode_flips == 0
+            && c.recode_failed == 0,
+        "{what}: by a build, synced: {c:?}"
+    );
+    let st = strides(&db);
+    let back = st[..st.len() - 1]
+        .iter()
+        .position(|s| !s)
+        .expect("one of the stride form's partitions in the block form");
+    check(&r, &model, &keys, &format!("{what}: one back"));
+    // Room, and that partition hot: built in the stride form again. A
+    // look first, over the block file the swap installed: a form file a
+    // look has not seen gives it no rate, only a count to take the next
+    // one from.
+    let hot = keys_of_partition(&db, &model, back);
+    inject.set_budget(total * 100);
+    convert_look(&db, sec);
+    let before = db.zpage_counts();
+    read_round(&db, &hot, 300_000);
+    convert_look(&db, sec);
+    assert!(
+        tick_until_built(&db, |c| c.stride_converts > before.stride_converts),
+        "{what}: the partition in the stride form again: {:?} {:?}",
+        db.zpage_counts(),
+        db.zpage_heat()
+    );
+    let c = db.zpage_counts();
+    assert!(
+        c.build_starts > before.build_starts && c.recode_flips == 0 && strides(&db)[back],
+        "{what}: by a build: {c:?} {:?}",
+        strides(&db)
+    );
+    check(&r, &model, &keys, &format!("{what}: after"));
+    check_scan(&r, &model, what);
+    let c = db.zpage_counts();
+    assert_eq!((c.fallbacks, c.recode_failed), (0, 0), "{what}: {c:?}");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Readers on threads of their own read through a store's partitions while
+/// the conversion moves them between the two forms under them
+/// (`Options::zpages_stride_convert`): point reads, counts and scans across
+/// the partitions' fences, each held to the model, while the main thread
+/// gives the store room until partitions have moved into the stride form,
+/// takes it away until they have moved out, and gives it back. A swap
+/// replaces the form file in the partition's cell, and a reader that began
+/// in the old one finishes in it under its pin; a read that took the cell
+/// between two forms' files, or a file freed under it, answers wrong or
+/// faults here.
+#[cfg(target_os = "linux")]
+#[test]
+fn readers_read_through_a_partitions_conversions_both_ways() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    let what = "readers across conversions";
+    let (dir, db, model, inject, keys) =
+        convert_store("auto-convert-readers", ZStride::Chosen, true);
+    let total = db.zpage_counts().file_bytes;
+    let model = Arc::new(model);
+    let keys = Arc::new(keys);
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicU64::new(0));
+    let mut threads = Vec::new();
+    for t in 0..2u64 {
+        let r = db.reader().unwrap();
+        let (model, keys, stop, done) = (model.clone(), keys.clone(), stop.clone(), done.clone());
+        threads.push(std::thread::spawn(move || {
+            let mut rng = Rng(0x13579 ^ ((t + 1) * 0x9E37));
+            let mut n = 0u64;
+            // The last key holds two values, so the scans stop short of it.
+            let span = keys.len() - 16;
+            while !stop.load(Ordering::SeqCst) || n < 200 {
+                let i = rng.below(span);
+                let k = &keys[i];
+                match n % 3 {
+                    0 => assert_eq!(read_vec(&r, k), model[k], "a read of {k:?}"),
+                    1 => assert_eq!(r.count(k).unwrap(), 1, "a count of {k:?}"),
+                    _ => {
+                        let mut got = Vec::new();
+                        r.scan(k, 8, kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))))
+                            .unwrap();
+                        let want: Vec<(Vec<u8>, Vec<u8>)> = keys[i..]
+                            .iter()
+                            .take(8)
+                            .map(|k| (k.clone(), model[k][0].clone()))
+                            .collect();
+                        assert_eq!(got, want, "a scan from {k:?}");
+                    }
+                }
+                n += 1;
+                if n.is_multiple_of(64) {
+                    done.fetch_add(64, Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+    // Looks, a period of the injected clock apart, until `cond` holds or a
+    // minute of the wall has gone.
+    let until = |cond: &dyn Fn(&supdb::db::ZCounts) -> bool| {
+        let t = std::time::Instant::now();
+        while !cond(&db.zpage_counts()) && t.elapsed().as_secs() < 60 {
+            advance_tick(&db, std::time::Duration::from_millis(250));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        cond(&db.zpage_counts())
+    };
+    let mut held = Vec::new();
+    for round in 1..=2u64 {
+        inject.set_budget(total * 100);
+        let moved_in = until(&|c| c.stride_converts >= 2 * round);
+        held.push((round, "in", moved_in, db.zpage_counts()));
+        inject.set_budget(total);
+        let moved_out = until(&|c| c.stride_converts_back >= 2 * round);
+        held.push((round, "out", moved_out, db.zpage_counts()));
+    }
+    stop.store(true, Ordering::SeqCst);
+    for t in threads {
+        t.join().expect("a reader thread");
+    }
+    for (round, way, ok, c) in &held {
+        assert!(
+            ok,
+            "{what}: round {round}, two partitions moved {way}: {c:?}"
+        );
+    }
+    let c = db.zpage_counts();
+    assert!(
+        done.load(Ordering::Relaxed) >= 400 && c.stride_reads > 0 && c.fallbacks == 0,
+        "{what}: the readers read through both forms: {} {c:?}",
+        done.load(Ordering::Relaxed)
+    );
+    assert_eq!(c.recode_failed, 0, "{what}: {c:?}");
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, what);
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A merge's outputs are built in the form the partition they rewrite is
+/// served in (`ZStride::Chosen`, `Maint::z_stride_ask_finish`): the first
+/// partition converted to the stride form, every key put again and the
+/// pieces merged, with room, and the outputs whose first key lies in that
+/// partition's range are built in the stride form at their finish and the
+/// rest in the block form -- no conversion's build after the merge -- and
+/// so are the outputs of a second rewrite planned before any of the first's
+/// files is attached, which a plan that read only the served partitions
+/// would build in the block form, every one. With
+/// the budget under what the forms and the pieces hold as the merge begins,
+/// every output is built in the block form and the refusal counted: the way
+/// out of the stride form that costs no build of its own.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_merges_outputs_keep_the_form_of_the_partition_they_rewrite() {
+    for room in [true, false] {
+        let what = &format!("the form kept across a merge, room {room}");
+        let (dir, mut db, mut model, inject, raw) = land_store_loaded(
+            &format!("auto-convert-finish-{room}"),
+            50,
+            |o| {
+                o.zpages_stride = ZStride::Chosen;
+                o.zpages_stride_convert = true;
+                o.zpages_build_at_finish = true;
+                o.zpages_ahead_builders = 8;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(1 << 20);
+                o.l0_trigger = 1;
+            },
+            |db| numbered_soft_load(db, 20_000, 100, 0x5C3, false),
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        inject.set_fault_cost(FAULT_1MS);
+        inject.set_budget(raw / 2);
+        {
+            let r = db.reader().unwrap();
+            let mut at = 0usize;
+            assert!(
+                drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+                "{what}: COMPACT: {:?}",
+                db.zpage_counts()
+            );
+        }
+        assert!(
+            tick_until(&db, 400, |c| c.form_files == c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        assert!(
+            c.partitions >= 2 && c.stride_files == 0,
+            "{what}: partitions in the block form: {c:?}"
+        );
+        // The first partition into the stride form.
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        inject.set_convert_price(std::time::Duration::from_millis(200));
+        inject.set_budget(raw * 8);
+        let first = keys_of_partition(&db, &model, 0);
+        let fence = db.zpage_heat()[1].lo.clone();
+        let sec = std::time::Duration::from_secs(1);
+        convert_look(&db, sec);
+        read_round(&db, &first, 300_000);
+        convert_look(&db, sec);
+        assert!(
+            tick_until_built(&db, |c| c.stride_converts >= 1),
+            "{what}: the first partition converted: {:?}",
+            db.zpage_counts()
+        );
+        let st = strides(&db);
+        assert!(
+            st[0] && st.iter().filter(|s| **s).count() == 1,
+            "{what}: the first partition alone in the stride form: {st:?}"
+        );
+        let before = db.zpage_counts();
+        if !room {
+            inject.set_budget(before.file_bytes);
+        }
+        // Every key put again, a value of the same width, and merged; and
+        // again, with no tick of the controller between the two, so that
+        // the second round's merges are planned over the first round's
+        // outputs with their files on disk and attached to nothing -- the
+        // state a chain of merges plans in, each at the landing before it.
+        let mut rng = Rng(0x5EF0);
+        for round in 0..2u64 {
+            let was = db.zpage_counts().finish_builds;
+            for chunk in keys.chunks(250) {
+                for k in chunk {
+                    let mut v = vec![0x5Au8; 100];
+                    for b in v.iter_mut().take(4) {
+                        *b = (rng.next() >> 24) as u8;
+                    }
+                    db.put(k, &v);
+                    model.insert(k.clone(), vec![v]);
+                }
+                db.commit().unwrap();
+            }
+            db.seal().unwrap();
+            db.settle().unwrap();
+            wait_for("the builds at the outputs' finish to end", || {
+                let c = db.zpage_counts();
+                c.finish_builds > was && c.finish_live == 0 && db.merges_in_flight() == 0
+            });
+            if round == 0 {
+                let c = db.zpage_counts();
+                assert!(
+                    c.form_files < c.partitions,
+                    "{what}: the first round's outputs not attached yet: {c:?}"
+                );
+            }
+        }
+        assert!(
+            tick_until(&db, 400, |c| c.form_files == c.partitions),
+            "{what}: the finishes' files installed: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        let heat = db.zpage_heat();
+        if room {
+            assert!(
+                c.stride_files >= 1 && c.stride_files < c.partitions,
+                "{what}: outputs in both forms: {c:?}"
+            );
+            for h in &heat {
+                assert_eq!(
+                    h.stride,
+                    h.lo < fence,
+                    "{what}: the stride form where the partition rewritten had it: {:?} against {:?}",
+                    String::from_utf8_lossy(&h.lo),
+                    String::from_utf8_lossy(&fence)
+                );
+            }
+            assert_eq!(
+                (c.stride_converts, c.stride_no_room),
+                (before.stride_converts, before.stride_no_room),
+                "{what}: by the finish's builds, no conversion's: {c:?}"
+            );
+        } else {
+            assert_eq!(
+                c.stride_files, 0,
+                "{what}: every output in the block form: {c:?}"
+            );
+            assert!(
+                c.stride_no_room > before.stride_no_room,
+                "{what}: the refusal counted: {c:?}"
+            );
+        }
+        let nos = db.zpage_stride_nos();
+        assert!(nos.iter().all(|&n| n == 0), "{what}: no reason: {nos:?}");
+        let r = db.reader().unwrap();
+        check(&r, &model, &keys, what);
+        check_scan(&r, &model, what);
+        drop(r);
+        let c = db.zpage_counts();
+        assert_eq!(c.fallbacks, 0, "{what}: {c:?}");
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// A reading made from the form files on disk at the crossing
 /// (`Maint::z_reading_from_files`) takes a stride file as on disk, as the
 /// files' cover counts it and as the attach takes it: by its own trailer,

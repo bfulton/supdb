@@ -32,8 +32,8 @@ of the change that produced the text.
 |---|---|
 | `src/db.rs` | the engine: WAL with atomic batches, memtable, sealed segments, partitioned compaction, tombstones, `Txn`, and the `SegmentWriter` every segment is written by -- `docs/engine.md` |
 | `src/db/zpages.rs` | the compact form's layout: the page, the directory of the groups it holds, the group, the fill that cuts records into groups and packs them into pages, the fence, the trailer and the identity a form file is bound by, with no file, thread or clock in it -- the module's own docs, and `bench/examples/zsize.rs` for what it makes of the engine's bytes |
-| `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`); and the stride form, an experiment (`Options::zpages_stride`, off; `zpages_stride_below` keeps it to the partitions under a key), a partition's values alone at their stride where its keys are one run of numbers -- the module's own docs, and `docs/engine.md` for where it wins and where it does not fit |
-| `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, the replays that hold it, and the model of a cache's faults over populations of pages (`model_populations`) -- the module's own docs |
+| `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`); and the stride form, an experiment (`Options::zpages_stride`, off; `zpages_stride_below` keeps it to the partitions under a key, `zpages_stride_room` to the builds made while the store in it fits, and `zpages_stride_convert` moves a served partition between it and the block form), a partition's values alone at their stride where its keys are one run of numbers -- the module's own docs, and `docs/engine.md` for where it wins and where it does not fit |
+| `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, the replays that hold it, the model of a cache's faults over populations of pages (`model_populations`), and what the reads of a store in two forms cost with the moves between the forms that pay (`forms_cost`, `conversions`) -- the module's own docs |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
 | `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index -- `docs/index-theory.md` |
 | `src/bytes.rs`, `src/blob.rs` | the read path over any byte source; compiles for wasm |
@@ -5318,6 +5318,69 @@ before it is reasoned from sizes -- room unused beside refaults is an
 ask not made, and no room is a fit; and a budget is named for what it
 subtracts, since one that leaves out a tenant says yes on that tenant's
 behalf.
+
+**A rule taken build by build, of a store whose size its builds do not
+know.** The stride form asked for only where the store in it fits the
+room (`Options::zpages_stride_room`) was right at ten million keys under
+1.25 GiB, where the store whole in the form fits, and at 1 GiB it built
+24 of 29 partitions in the form, each while the store so far fit: the
+store that stood at the load's end did not, and from the write mixes on,
+the process a hundred megabytes larger, it read the scans beside the
+mixes at 0.3-0.5x of the default at 0.3 major faults a scan
+(`docs/engine.md`, which form a workload calls for). It is the raw-tail
+pick's shape, read a third time: a choice that holds for a store's life,
+made over a store still being written and a process at its smallest. A
+rule at the build can only be the load's half of the choice; the other
+half is a way to take the choice back once the store's size and the
+process's are known, and the room that half is judged in is read with
+the process at the most it has lately held (`Maint::z_budget_grown`),
+since the budget read after a load is the largest the store will see.
+
+**A mutant that survived because the defect was already there.** The
+test that a merge's outputs keep the form of the partition they rewrite
+passed with the key ranges taken out of the plan, every output asked for
+the stride form. The test was not weak: the plan read the ranges from
+the partitions a form file serves, a merge's outputs are served by
+nothing until a tick attaches their files, and a store's merges are
+planned one at the landing of the one before -- so after the first merge
+the plan found no range at all and built every later output in the block
+form, with the ranges or without them. The independent review named the
+same defect from the code the same hour. The plan takes an output no
+form file serves yet for the form its range was last asked in
+(`Maint::z_stride_spans`), and the test rewrites the store twice with no
+tick between. The rule: a surviving mutant is read as a question about
+the code under test before it is read as a hole in the test, since a
+defect that makes two behaviours alike hides the mutant that tells them
+apart; and a plan made at a landing reads the state the landing leaves,
+which is not the state a tick later.
+
+**A second form kept beside the first, under the name of neither.** The
+conversion between the block and the stride forms first kept the file it
+replaced, unserved, so that the way back would be an exchange and not a
+build. A build renames its file over the partition's name, so the kept
+file was an inode with no name, and after an exchange the file under the
+name was the kept one: the rewarm, a settle's wait for the asked files
+and a reopen each reach a form file by its path, and each would have
+taken the kept file for the served one -- read it in, waited on it,
+attached it. The review found it by listing every use of the name; no
+test could have, since every answer stays right. The kept file is gone
+and each way is a build. The rule: a file reached by its name in one
+place and by a handle in another is one file only while the two agree,
+so whatever can make them differ is checked against every use of the
+name; and a cheaper move is priced after the plain one has been
+measured, not built beside it.
+
+**A model's edge that reads as its opposite.** `model_populations`
+answers every touch a fault where the cache it is given is no bytes,
+whatever the populations are, so two stores compared there differ only
+by their decodes, and the conversion read a move into the larger form
+as its decodes saved for nothing, in a room that was not there -- the
+room it judges a move in is a share of the budget less what stands
+beside the forms, and a burst's pieces alone can take it to nothing.
+Nothing moves in where the room is nothing now. The rule: a model used
+to compare two states is checked where its answer stops depending on
+the states, since there the comparison is decided by whatever term is
+left.
 
 ## Standing limitations
 

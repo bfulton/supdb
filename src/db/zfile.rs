@@ -1904,14 +1904,15 @@ impl<'a> ZCursor<'a> {
 // the gate's branch (`ZCursor::seek`, `load`, `skip_to`), and each arm here is
 // out of line, so that the block cursor's code is its own.
 // The values it hands over are counted on the handle's slot line
-// (`StrideCounts::cursor`, `StrideTally`), and nowhere as a decode or a
-// group opened, so
-// its walks and values add nothing to the file's heat (`ZFile::decodes16`,
-// `ZFile::opens16`) and nothing to a census by form: under the block cache
-// this cursor is a covered scan's path, and a stride partition read through
-// it reads cold to the hot policy until a stride file's heat and census are
-// counted, here and in the file's own read arms (above `ZFile::is_stride`)
-// together.
+// (`StrideCounts::cursor`, `StrideTally`), and never as a decode. They are
+// the file's heat only where the store converts between the forms
+// (`ZFile::stride_heat`, `count_stride_touch`), counted there, here and in
+// the file's own read arms (above `ZFile::is_stride`) together, as the
+// groups a block file would have opened; elsewhere its walks and values add
+// nothing to `ZFile::opens16`, and nothing anywhere to a census by form:
+// under the block cache this cursor is a covered scan's path, and a stride
+// partition read through it reads cold to the hot-raw policy, which stands
+// down beside the form.
 
 impl<'a> ZCursor<'a> {
     /// The position at the rank in a stride file: its key rendered into
@@ -1997,6 +1998,7 @@ impl<'a> ZCursor<'a> {
         }) {
             StrideAt::Value(v) => {
                 memo.count_stride_cursor(1);
+                zfile.count_stride_touch_at(self.rank);
                 f(v);
                 Ok(1)
             }
@@ -2077,6 +2079,7 @@ impl<'a> ZCursor<'a> {
         self.rank = r;
         if walked > 0 {
             memo.count_stride_cursor(walked as u64);
+            zfile.count_stride_touch(walked as u64);
         }
         if fell {
             self.fall();
@@ -3298,6 +3301,20 @@ pub(super) struct ZFile {
     /// file decodes nothing, so its heat is the groups it opens, priced at
     /// what a decode costs (`Options::zpages_recode`).
     pub(super) opens16: AtomicU64,
+    /// The ranks a block form's group of this stride file's partition would
+    /// hold, `ZGROUP_BYTES` of values, as a shift: the power of two at or
+    /// under the count, so that a walk by the key counts by a mask and
+    /// divides nothing; zero for a block file. What a stride file's reads
+    /// are counted by (`count_stride_touch`), so that its heat is in the
+    /// unit a block file's decodes are: the groups the block form would
+    /// have opened for the same reads.
+    touch_shift: u8,
+    /// Whether a stride file's reads are counted as its heat
+    /// (`count_stride_touch`): set where the store converts partitions
+    /// between the forms (`Options::zpages_stride_convert`) and nowhere
+    /// else, so that a stride file's read pays the count only where a
+    /// policy reads it.
+    pub(super) stride_heat: bool,
     /// Reads of the raw form a cursor over this file made through its door
     /// while the file is a stride file, under debug assertions
     /// (`ZCursor::raw`). A stride file holds every value in a slot and
@@ -3621,7 +3638,14 @@ impl ZFile {
             decodes16: AtomicU64::new(0),
             decode_ns16: AtomicU64::new(0),
             opens16: AtomicU64::new(0),
+            touch_shift: match &a.body {
+                ZBody::Block(_) => 0,
+                ZBody::Stride(b) => (super::zpages::ZGROUP_BYTES as u32 / b.trailer().w.max(1))
+                    .max(1)
+                    .ilog2() as u8,
+            },
             raw_reads: AtomicU64::new(0),
+            stride_heat: false,
             time_decodes: false,
             coded: false,
             id: NEXT_ZSIDE_ID.fetch_add(1, Ordering::Relaxed),
@@ -5397,6 +5421,56 @@ impl ZFile {
         }
     }
 
+    /// A stride file's read of `ranks` values in a run, counted where the
+    /// store converts between the forms (`ZFile::stride_heat`) as the
+    /// groups the block form would have opened for it -- one, and one more
+    /// for each group's ranks of the run (`touch_shift`) -- once in sixteen
+    /// per thread on the word a raw-tailed file counts its opens in
+    /// (`ZFile::opens16`): the partition's heat while the stride form
+    /// serves it (`Options::zpages_stride_convert`), which a policy holds
+    /// against the block files' decodes. Elsewhere a read pays the flag's
+    /// load and a branch.
+    #[inline]
+    fn count_stride_touch(&self, ranks: u64) {
+        if !self.stride_heat {
+            return;
+        }
+        self.count_stride_touch_due(ranks);
+    }
+
+    #[inline(never)]
+    fn count_stride_touch_due(&self, ranks: u64) {
+        thread_local! {
+            static TICK: Cell<u32> = const { Cell::new(0) };
+        }
+        let due = TICK.with(|t| {
+            let v = t.get().wrapping_add(1);
+            t.set(v);
+            v % 16 == 0
+        });
+        if due {
+            let groups = 1 + (ranks.saturating_sub(1) >> self.touch_shift);
+            self.opens16.fetch_add(groups, Ordering::Relaxed);
+        }
+    }
+
+    /// `count_stride_touch` for a cursor's read of the one value at `rank`,
+    /// which a walk by the key makes of every rank it crosses: counted at
+    /// the ranks a block group would begin at, so that a walk of a hundred
+    /// keys is the groups it crosses and not a hundred. A lone read by
+    /// rank, as a block's build makes of a rank here and there, is counted
+    /// only where its rank begins a group, one time in the group's ranks:
+    /// such reads are the walk's and not the reads the heat is for.
+    #[inline]
+    fn count_stride_touch_at(&self, rank: usize) {
+        if !self.stride_heat {
+            return;
+        }
+        if rank & ((1usize << self.touch_shift) - 1) == 0 {
+            self.count_stride_touch_due(1);
+        }
+    }
+
     /// The form file is the record coding's (`ZFile::coded`); false for a
     /// stride file, which is neither of the block body's codings
     /// (`ZFile::kind`).
@@ -5582,6 +5656,7 @@ impl ZFile {
         ) {
             StrideRead::Served(n) => {
                 memo.count_stride_read();
+                self.count_stride_touch(1);
                 ZRead::Served { n, decoded: false }
             }
             StrideRead::Bad(_) => ZRead::Fallback,
@@ -5661,6 +5736,7 @@ impl ZFile {
             }
             out.seen += 1;
         }
+        self.count_stride_touch(out.seen as u64);
         out
     }
 
@@ -5708,6 +5784,7 @@ impl ZFile {
         let file = self.stride_bytes();
         match body.values_at(file, rank as u64, &mut |p| self.stride_page(body, memo, p)) {
             StrideAt::Value(v) => {
+                self.count_stride_touch_at(rank);
                 f(v);
                 ZRead::Served {
                     n: 1,
@@ -6146,6 +6223,12 @@ pub(super) struct ZEvents {
     /// Builds held to the room that asked nothing of the stride form
     /// (`Options::zpages_stride_room`).
     pub stride_no_room: AtomicU64,
+    /// The conversion between the block and the stride forms
+    /// (`Options::zpages_stride_convert`): partitions converted into the
+    /// stride form, out of it, and the policy's looks.
+    pub stride_converts: AtomicU64,
+    pub stride_converts_back: AtomicU64,
+    pub stride_convert_looks: AtomicU64,
     /// The partitions whose raw pages were dropped at their form file's
     /// install (`Options::zpages_drop_raw`).
     pub raw_dropped: AtomicU64,
@@ -6444,6 +6527,19 @@ pub(super) enum StrideAsk {
     /// (`Built::stride_no`); a decline of the block form is the build's
     /// answer, the partition being one no form file covers.
     OrBlock,
+}
+
+/// Key ranges a plan carries to its builder's thread, each a first key and
+/// the key it ends before, empty for no end (`BuildPlan::stride_spans`).
+pub(super) type KeySpans = std::sync::Arc<[(Vec<u8>, Vec<u8>)]>;
+
+/// Whether `key` lies in one of `spans`, each from its first key up to and
+/// not including its second, or without end where that is empty
+/// (`BuildPlan::stride_spans`).
+pub(super) fn in_spans(spans: &[(Vec<u8>, Vec<u8>)], key: &[u8]) -> bool {
+    spans
+        .iter()
+        .any(|(lo, hi)| key >= lo.as_slice() && (hi.is_empty() || key < hi.as_slice()))
 }
 
 /// Why a partition is not held in the stride form, which a segment keeps
@@ -6978,6 +7074,14 @@ pub(super) struct BuildPlan {
     /// plan that asks nothing builds it, with no reason kept, since none was
     /// found -- the partition was not asked. `None` asks every partition.
     pub stride_below: Option<std::sync::Arc<[u8]>>,
+    /// The key ranges a partition is asked for the stride form in, each a
+    /// first key and the key it ends before, empty for no end: a partition
+    /// whose first key lies in none is built in the block form as a plan
+    /// that asks nothing builds it, with no reason kept. The ranges the
+    /// stride form held as a merge began, so that each output is built in
+    /// the form the partition it rewrites had (`ZStride::Chosen`,
+    /// `Maint::z_stride_ask_finish`). `None` asks every partition.
+    pub stride_spans: Option<KeySpans>,
     /// A test's: the stride form's file damaged once it is written and
     /// before it is read back, so that a check the reads go through is
     /// shown to refuse what it is for.
@@ -7012,6 +7116,7 @@ impl BuildPlan {
             sync: false,
             stride: StrideAsk::No,
             stride_below: None,
+            stride_spans: None,
             #[cfg(test)]
             damage: None,
             #[cfg(test)]
@@ -7171,6 +7276,12 @@ fn build_file_seen(
     let ask = match plan.stride_below.as_deref() {
         Some(cut) if blob.key_at(0).is_some_and(|first| first >= cut) => StrideAsk::No,
         _ => plan.stride,
+    };
+    // Nor one whose first key lies in no range the plan asks in
+    // (`BuildPlan::stride_spans`).
+    let ask = match plan.stride_spans.as_deref() {
+        Some(spans) if !blob.key_at(0).is_some_and(|first| in_spans(spans, first)) => StrideAsk::No,
+        _ => ask,
     };
     let made = match ask {
         StrideAsk::No => block(seen),
@@ -8245,6 +8356,13 @@ pub struct ZInject {
     /// test's files are a mebibyte and resident before the first look, so
     /// the wait is held to waiting, and to giving up, through this.
     pub asked_holds: AtomicU64,
+    /// What a conversion's build costs, nanoseconds, in place of the
+    /// builds' measured wall a byte with its displacement
+    /// (`Options::zpages_stride_convert`); 0 for the measured one. A move
+    /// is made once its rent reaches the price, and a test's builds are
+    /// of a few hundred kilobytes at whatever the host gives them, so the
+    /// look a move falls at is the host's without this.
+    pub convert_price_ns: AtomicU64,
 }
 
 impl Default for ZInject {
@@ -8259,6 +8377,7 @@ impl Default for ZInject {
             records_resident: AtomicU64::new(u64::MAX),
             slack: AtomicU64::new(u64::MAX),
             asked_holds: AtomicU64::new(0),
+            convert_price_ns: AtomicU64::new(0),
         }
     }
 }
@@ -8366,6 +8485,21 @@ impl ZInject {
     pub fn set_decode_cost(&self, d: Duration) {
         let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX).max(1);
         self.decode_cost_ns.store(ns, Ordering::Release);
+    }
+
+    /// The price of a conversion's build, in place of the measured one
+    /// (`Options::zpages_stride_convert`).
+    pub fn set_convert_price(&self, d: Duration) {
+        let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX).max(1);
+        self.convert_price_ns.store(ns, Ordering::Release);
+    }
+
+    /// The injected price of a conversion's build, if one is set.
+    pub fn convert_price(&self) -> Option<Duration> {
+        match self.convert_price_ns.load(Ordering::Acquire) {
+            0 => None,
+            ns => Some(Duration::from_nanos(ns)),
+        }
     }
 
     /// The injected decode of a page, if one is set.
@@ -15614,6 +15748,124 @@ mod tests {
             "a memo with no tally keeps them"
         );
         assert_eq!(fx.memo.take_stride(), StrideCounts::default(), "taken");
+    }
+
+    /// A stride file's reads are its heat where the store asks for it
+    /// (`ZFile::stride_heat`, `Options::zpages_stride_convert`),
+    /// counted once in sixteen on the word a raw-tailed file counts its
+    /// opens in, as the groups a block file would have opened for them: a
+    /// point read one; a walk of a hundred ranks of a hundred bytes seven,
+    /// a group holding the sixteen ranks that are the power of two under
+    /// the twenty `ZGROUP_BYTES` hold; and a read of one value by its rank,
+    /// which a walk by the key makes of every rank, one at each sixteenth
+    /// rank and none between. A file not asked for its heat counts
+    /// nothing, timing its decodes or not, and a count of a key, which
+    /// touches no page, counts nothing either way.
+    #[test]
+    fn a_stride_files_reads_are_counted_as_the_groups_a_block_file_would_open() {
+        let fx = stride_fixture("stride-touch", 3000, 100, 0x70c);
+        stride_built(&fx);
+        let memo = ZMemo::new();
+        let opens = |z: &ZFile| z.opens16.load(Ordering::Relaxed);
+        // Not timed: nothing counted.
+        let z = fx.attach_stride(StrideAttach::Check).unwrap();
+        assert_eq!(z.touch_shift, 4, "sixteen ranks a group");
+        for i in 0..64 {
+            z.read_all(&memo, &fx.blob, &fx.recs[i].0, &mut |_: &[u8]| {})
+                .unwrap();
+            z.scan_at(&memo, &fx.blob, i, 100, &mut |_: &[u8], _: &[u8]| {})
+                .unwrap();
+        }
+        assert_eq!(opens(&z), 0, "a file that times nothing counts nothing");
+        drop(z);
+        let mut z = fx.attach_stride(StrideAttach::Check).unwrap();
+        // The decodes timed and the heat not asked for: nothing still, the
+        // count being the conversion's and no other policy's.
+        z.time_decodes = true;
+        z.read_all(&memo, &fx.blob, &fx.recs[0].0, &mut |_: &[u8]| {})
+            .unwrap();
+        for i in 0..64 {
+            z.scan_at(&memo, &fx.blob, i, 100, &mut |_: &[u8], _: &[u8]| {})
+                .unwrap();
+        }
+        assert_eq!(opens(&z), 0, "timed decodes alone count no stride read");
+        drop(z);
+        let mut z = fx.attach_stride(StrideAttach::Check).unwrap();
+        z.stride_heat = true;
+        // Point reads: the thread's every sixteenth, one each.
+        for i in 0..160 {
+            z.read_all(&memo, &fx.blob, &fx.recs[i].0, &mut |_: &[u8]| {})
+                .unwrap();
+            let _ = z.count(&memo, &fx.recs[i].0);
+        }
+        assert_eq!(opens(&z), 10, "a hundred and sixty reads, ten counted");
+        // Walks of a hundred ranks: one in sixteen, seven groups each.
+        for i in 0..32 {
+            z.scan_at(&memo, &fx.blob, i, 100, &mut |_: &[u8], _: &[u8]| {})
+                .unwrap();
+        }
+        assert_eq!(opens(&z), 10 + 2 * 7, "thirty-two walks, two counted");
+        // A value by its rank: the ranks a group begins at, one in sixteen
+        // of those.
+        let before = opens(&z);
+        for rank in 0..16 * 16 * 2 {
+            z.values_at(&memo, &fx.blob, rank, &mut |_: &[u8]| {})
+                .unwrap();
+        }
+        assert_eq!(
+            opens(&z),
+            before + 2,
+            "thirty-two group starts in five hundred and twelve ranks, two counted"
+        );
+    }
+
+    /// The key ranges a plan asks for the stride form in
+    /// (`BuildPlan::stride_spans`): a first key inside a range is asked,
+    /// one at a range's end or before its start is not, a range with no end
+    /// takes every key from its start, and a partition outside every range
+    /// is built in the block form with no reason kept, where the same plan
+    /// with its range around the partition builds the stride form.
+    #[test]
+    fn a_plan_asks_for_the_stride_form_in_its_key_ranges_alone() {
+        let span = |lo: &[u8], hi: &[u8]| (lo.to_vec(), hi.to_vec());
+        let spans = [span(b"b", b"d"), span(b"m", b"")];
+        for (key, inside) in [
+            (b"a".as_slice(), false),
+            (b"b", true),
+            (b"c", true),
+            (b"czz", true),
+            (b"d", false),
+            (b"l", false),
+            (b"m", true),
+            (b"zzzz", true),
+            (b"", false),
+        ] {
+            assert_eq!(in_spans(&spans, key), inside, "{key:?}");
+        }
+        assert!(!in_spans(&[], b"a"), "no range, no key");
+        assert!(in_spans(&[span(b"", b"")], b""), "the whole key space");
+        let fx = stride_fixture("stride-spans", 3000, 100, 0x70d);
+        let first = fx.recs[0].0.clone();
+        let mut past = first.clone();
+        past.push(0);
+        for (spans, stride) in [
+            (vec![span(&first, b"")], true),
+            (vec![span(b"", &past)], true),
+            (vec![span(&past, b"")], false),
+            (vec![span(b"", &first)], false),
+            (vec![], false),
+        ] {
+            let _ = std::fs::remove_file(&fx.out);
+            let plan = BuildPlan {
+                stride_spans: Some(spans.clone().into()),
+                ..stride_plan(StrideAsk::OrBlock)
+            };
+            let Outcome::Built(b) = build(&fx.seg, &fx.out, ID, END, &plan).unwrap() else {
+                panic!("built: {spans:?}");
+            };
+            assert_eq!(b.coding == FileCoding::Stride, stride, "{spans:?}");
+            assert_eq!(b.stride_no, None, "no reason either way: {spans:?}");
+        }
     }
 
     /// Once a value page fails its check the stride file is out of service,

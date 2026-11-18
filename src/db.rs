@@ -532,6 +532,15 @@ pub enum ZStride {
     /// segment (`Seg::z_stride_no`); a stride file on disk is attached. The
     /// arm that prices the form, built whether or not the store needs it.
     Forced,
+    /// No build of a partition's own asks for the stride form: a partition
+    /// is built in the block form as under `Off`, and a stride file on disk
+    /// is attached as under `Forced`. The builds that ask are a
+    /// conversion's of a served partition
+    /// (`Options::zpages_stride_convert`), for the stride form alone, and a
+    /// merge output's in a key range the stride form served as the merge
+    /// began, while the forms as they stand fit the room
+    /// (`Maint::z_stride_ask_finish`).
+    Chosen,
 }
 
 /// What the second form has done (`Options::zpages`), read by
@@ -836,6 +845,12 @@ pub struct ZCounts {
     /// Builds that asked nothing of the stride form for want of room
     /// (`Options::zpages_stride_room`).
     pub stride_no_room: u64,
+    /// The conversion between the block and the stride forms
+    /// (`Options::zpages_stride_convert`): partitions converted into the
+    /// stride form while served, out of it, and the policy's looks.
+    pub stride_converts: u64,
+    pub stride_converts_back: u64,
+    pub stride_convert_looks: u64,
     pub builds_raw_tails: u64,
     /// Partitions re-coded while served (`Options::zpages_recode`): to the
     /// raw tails, back to the block coding, and re-codes that installed
@@ -981,6 +996,12 @@ pub struct ZHeat {
     pub decodes: u64,
     pub decode_ns: u64,
     pub coded: bool,
+    /// Whether the form file is a stride file, and the reads it counted as
+    /// the groups a block file would have opened for them
+    /// (`Options::zpages_stride_convert`); a raw-tailed block file's opens
+    /// otherwise.
+    pub stride: bool,
+    pub opens: u64,
 }
 
 #[derive(Clone)]
@@ -6011,6 +6032,45 @@ pub struct Options {
     /// build made is checked so too. On.
     #[doc(hidden)]
     pub zpages_stride_trust_built: bool,
+    /// EXPERIMENT: under the controller, with `zpages_stride` not `Off`, a
+    /// served partition is converted between the block form and the stride
+    /// form while it serves (`ZKind::Convert`, `Maint::z_convert_look`).
+    /// Once the form is installed and the builder has nothing due, a look
+    /// every `CONVERT_PERIOD` takes each served partition's reads a second
+    /// -- a block file's decodes, a stride file's reads counted as the
+    /// groups a block file would have opened (`zfile::ZFile::opens16`) --
+    /// and asks `zselect::conversions` which moves pay: what the reads of
+    /// the store as it stands cost, the block form's decodes at the time a
+    /// decode has measured and the faults `zselect::model_populations`
+    /// predicts over every partition's bytes in the form it is in at the
+    /// fault's price, against the same with one partition in the other
+    /// form. The cache the model is given is the platform's budget less
+    /// what stands beside the forms, the level-0 pieces' payload and the
+    /// partitions no form serves; a move into the stride form is judged in
+    /// `zselect::FORM_FILL` of the budget, a move out in the whole of it,
+    /// so the budget's fall through a write mix does not take back the move
+    /// just made. The budget is held at the most anonymous memory the
+    /// process has lately been read holding (`Maint::z_budget_grown`), here
+    /// and where `zpages_stride_room` asks whether the store fits, since a
+    /// room read with the memtables empty is taken back by the next write
+    /// mix. A stride file's reads are counted only under this option
+    /// (`zfile::ZFile::stride_heat`).
+    /// A move is made once what it would have saved since it
+    /// first paid comes to what its build costs, a ski rental as the form's
+    /// own purchase is: the build's wall at the builds' measured rate a
+    /// byte, with the displacement `zselect::ski_rental_price` adds. A move
+    /// in asks for the stride form alone, and a partition the form declines
+    /// keeps the reason and is not asked again; a move out builds the block
+    /// form a build of the partition's own would, in the coding the pick
+    /// stands at; each way is a build, and nothing of the form replaced is
+    /// kept. Nothing is decided while
+    /// a seal or a merge is rewriting the partitions, and nothing without a
+    /// budget. The hot-raw policy stands down beside the stride form as it
+    /// did. Off; `supdb-zstrideconv` is the arm under `ZStride::Chosen`,
+    /// where the load is built in the block form, and
+    /// `supdb-zstrideroomconv` under `Forced` with `zpages_stride_room`.
+    #[doc(hidden)]
+    pub zpages_stride_convert: bool,
 }
 
 impl Options {
@@ -6018,7 +6078,11 @@ impl Options {
     /// raw-tailed group's opens (`zfile::ZFile::time_decodes`): the heat the
     /// re-code policy reads, under the forced form or the controller.
     pub(crate) fn z_times_decodes(&self) -> bool {
-        self.zpages_recode || self.zpages_recode_auto || self.zpages_reparse || self.zpages_hot_raw
+        self.zpages_recode
+            || self.zpages_recode_auto
+            || self.zpages_reparse
+            || self.zpages_hot_raw
+            || self.zpages_stride_convert
     }
 
     /// The form file's group coding the options ask for
@@ -6040,7 +6104,7 @@ impl Options {
     /// other block coding of a served block file and ask nothing.
     fn z_stride_ask(&self) -> zfile::StrideAsk {
         match self.zpages_stride {
-            ZStride::Off => zfile::StrideAsk::No,
+            ZStride::Off | ZStride::Chosen => zfile::StrideAsk::No,
             ZStride::Forced => zfile::StrideAsk::OrBlock,
         }
     }
@@ -6052,7 +6116,7 @@ impl Options {
     fn z_stride_attach(&self) -> zfile::StrideAttach {
         match self.zpages_stride {
             ZStride::Off => zfile::StrideAttach::Refuse,
-            ZStride::Forced => zfile::StrideAttach::Check,
+            ZStride::Forced | ZStride::Chosen => zfile::StrideAttach::Check,
         }
     }
 
@@ -6440,6 +6504,7 @@ impl Default for Options {
             zpages_stride_below: None,
             zpages_stride_room: false,
             zpages_stride_trust_built: true,
+            zpages_stride_convert: false,
         }
     }
 }
@@ -7745,6 +7810,8 @@ struct ZBuild {
     /// A re-code in the served coding by the parsing encoder
     /// (`ZKind::Reparse`).
     reparse: bool,
+    /// A re-code into the other form (`ZKind::Convert`).
+    convert: bool,
 }
 
 /// What the record of the form files' codings keeps for a file `plan`
@@ -8023,6 +8090,10 @@ enum ZKind {
     /// The served block-coded form file built again in its coding by the
     /// parsing encoder and swapped in (`Options::zpages_reparse`).
     Reparse,
+    /// The served form file built again in the other form, the stride form
+    /// for a block file and the block form for a stride file, and swapped
+    /// in (`Options::zpages_stride_convert`).
+    Convert,
 }
 
 /// `seg`'s form file taken out of its cell and retired through the epoch --
@@ -18960,6 +19031,11 @@ struct Shared {
     z_left_seals: std::sync::Mutex<std::collections::HashMap<String, u32>>,
     /// A test's: the next form file build fails as a write error would.
     fail_zbuild: std::sync::atomic::AtomicBool,
+    /// A test's request that a served partition be converted between the
+    /// block and the stride forms, the partition's place among the served
+    /// ones plus one, zero for none (`Db::zpages_convert_ask`,
+    /// `Maint::z_convert_asked`).
+    z_convert_ask: AtomicU64,
     /// A test's: `Options::zpages_hold_after_settle`, as it stands.
     zsettle_hold: std::sync::atomic::AtomicBool,
     /// Direct runs whose mapping was grown past the file's end
@@ -23872,13 +23948,15 @@ impl Reader {
             if let Some(z) = seg.z.get() {
                 // A stride file reports itself here as a block file with no
                 // decode: not the record coding's (`coded` false, as
-                // `ZFile::coded` answers for it), and no group decoded or
-                // opened, since its reads are counted on the handle's line
-                // (the slot's `zstride`, `zfile::StrideTally::reads`) and
-                // never as a decode. A report, which
-                // the suite prints a mix's heat by and the engine decides
-                // nothing by; the heat and the census by form are a later
-                // step's.
+                // `ZFile::coded` answers for it), and no group decoded,
+                // since its reads are counted on the handle's line (the
+                // slot's `zstride`, `zfile::StrideTally::reads`) and never
+                // as a decode; its opens are its reads as the groups a
+                // block file would have opened, counted only where the
+                // store converts between the forms
+                // (`Options::zpages_stride_convert`). A report, which the
+                // suite prints a mix's heat by; the census by form is a
+                // later step's.
                 out.push(ZHeat {
                     lo: seg.lo.clone(),
                     keys: seg.raw().keys() as u64,
@@ -23886,6 +23964,8 @@ impl Reader {
                     decodes: 16 * z.decodes16.load(AtomicOrdering::Relaxed),
                     decode_ns: 16 * z.decode_ns16.load(AtomicOrdering::Relaxed),
                     coded: z.coded(),
+                    stride: z.is_stride(),
+                    opens: 16 * z.opens16.load(AtomicOrdering::Relaxed),
                 });
             }
         }
@@ -24036,6 +24116,9 @@ impl Reader {
             finish_refused: get(&ev.finish_refused),
             coding_unread: get(&ev.coding_unread),
             stride_no_room: get(&ev.stride_no_room),
+            stride_converts: get(&ev.stride_converts),
+            stride_converts_back: get(&ev.stride_converts_back),
+            stride_convert_looks: get(&ev.stride_convert_looks),
             builds_raw_tails: get(&ev.builds_raw_tails),
             recodes: get(&ev.recodes),
             recodes_back: get(&ev.recodes_back),
@@ -33311,6 +33394,7 @@ impl Db {
             z_finish_coded: std::sync::Mutex::new(Vec::new()),
             z_left_seals: std::sync::Mutex::new(std::collections::HashMap::new()),
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
+            z_convert_ask: AtomicU64::new(0),
             zsettle_hold: std::sync::atomic::AtomicBool::new(opts.zpages_hold_after_settle),
             zgate: ZGate::new(opts.zpages),
             asks: AskCounts::default(),
@@ -33900,6 +33984,7 @@ impl Db {
                         opts.zpages_cursor_view,
                         opts.zpages_group_ahead,
                         opts.zpages_walk_owns_decodes,
+                        opts.zpages_stride_convert,
                     ),
                     &opts.z_stride_attach(),
                     &zev,
@@ -34113,6 +34198,7 @@ impl Db {
             z_finish_coded: std::sync::Mutex::new(Vec::new()),
             z_left_seals: std::sync::Mutex::new(std::collections::HashMap::new()),
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
+            z_convert_ask: AtomicU64::new(0),
             zsettle_hold: std::sync::atomic::AtomicBool::new(opts.zpages_hold_after_settle),
             zgate: ZGate::new(opts.zpages),
             asks: AskCounts::default(),
@@ -38288,6 +38374,7 @@ impl Db {
             bool,
             bool,
             bool,
+            bool,
         ),
         stride: &zfile::StrideAttach,
         ev: &zfile::ZEvents,
@@ -38318,6 +38405,7 @@ impl Db {
                 side.cursor_view = lines.6;
                 side.group_ahead = lines.7;
                 side.walk_owns = lines.8;
+                side.stride_heat = lines.9;
                 let installed = seg.z.install(side);
                 if installed {
                     zfile::ZEvents::add(&ev.attached, 1);
@@ -38380,6 +38468,7 @@ impl Db {
                     self.opts.zpages_cursor_view,
                     self.opts.zpages_group_ahead,
                     self.opts.zpages_walk_owns_decodes,
+                    self.opts.zpages_stride_convert,
                 ),
                 &self.opts.z_stride_attach(),
                 ev,
@@ -38440,6 +38529,7 @@ impl Db {
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
                         side.walk_owns = self.opts.zpages_walk_owns_decodes;
+                        side.stride_heat = self.opts.zpages_stride_convert;
                         if seg.z.install(side) {
                             ev.built(&b);
                             zfile::ZEvents::add(&ev.attached, 1);
@@ -38701,6 +38791,21 @@ impl Db {
     /// its forms back at a commit, its reading of the scans gone stale.
     pub fn forms_off_stale_exits(&self) -> u64 {
         self.shared.forms_off_stale.load(AtomicOrdering::Relaxed)
+    }
+
+    /// A test's: the `nth` partition a form file serves, counted round the
+    /// served ones, is converted to the form it is not served in at the
+    /// segment work's next turn with the builder free -- a stride file's to
+    /// the block form, a block file's to the stride form where the form has
+    /// kept no reason against it (`Maint::z_convert`). The seam the differential fuzz moves a
+    /// store's partitions between the forms by, under the forced form,
+    /// where no policy would (`Options::zpages_stride_convert` is the
+    /// controller's); a request not yet taken is replaced.
+    #[doc(hidden)]
+    pub fn zpages_convert_ask(&self, nth: usize) {
+        self.shared
+            .z_convert_ask
+            .store(nth as u64 + 1, AtomicOrdering::Release);
     }
 
     /// A test's: the gate word set by hand, so a store under `Always` can be
@@ -44404,6 +44509,17 @@ const RECODE_DECODE_NS: f64 = 1000.0;
 /// a raw-tailed set from flipping at each move.
 const RECODE_AUTO_SHARE: f64 = 0.05;
 const RECODE_AUTO_EVICT: f64 = 0.95;
+/// The conversion between the block and the stride forms
+/// (`Options::zpages_stride_convert`): its period; what a build costs a
+/// byte of the form it writes before any build has been timed, seconds --
+/// the device's 150 MB/s here read once and written once; the wall between
+/// two looks over the wall a look took, at least; and the decodes a look
+/// has to have seen timed in its period to take the period's mean as what
+/// a decode costs.
+const CONVERT_PERIOD: std::time::Duration = std::time::Duration::from_millis(250);
+const CONVERT_BUILD_S_PER_BYTE: f64 = 13e-9;
+const CONVERT_DUTY: u32 = 100;
+const CONVERT_DECODES: u64 = 256;
 /// The hot-raw policy (`Options::zpages_hot_raw`): its period, the census
 /// interval, since a release is a take and an ask for the raw pages with no
 /// build, and a divided mix at the suite's bounded rung is half a second;
@@ -44826,6 +44942,39 @@ struct Maint {
     z_recode_last: Option<std::time::Duration>,
     z_recode_seen: std::collections::HashMap<u64, (u64, u64)>,
     z_recode_heat: std::collections::HashMap<String, f64>,
+    /// The conversion between the two forms' (`Options::zpages_stride_convert`):
+    /// when it last looked; each form file's decodes and opens then, with
+    /// its decode time and its decodes, by its attach's identity; each
+    /// partition's decayed touches a second, by its
+    /// name; and what each move that pays would have saved since it first
+    /// did, seconds, by its partition's name.
+    z_conv_last: Option<std::time::Duration>,
+    z_conv_seen: std::collections::HashMap<u64, (u64, u64, u64)>,
+    z_conv_heat: std::collections::HashMap<String, f64>,
+    z_conv_rent: std::collections::HashMap<String, f64>,
+    /// When the conversion's last look ended and how long it took, by the
+    /// wall: the next waits a hundred times that, so that a look, which
+    /// solves the model once for each move it prices, is a hundredth of a
+    /// core at most however many partitions the model is over.
+    z_conv_done: Option<(std::time::Instant, std::time::Duration)>,
+    /// The most anonymous memory the platform's budget has read the process
+    /// holding over the last one to two of the selector's retention floors
+    /// (`zselect::WindowMax`, `zselect::RETAIN_FLOOR`), which the
+    /// conversion's room is held at (`z_budget_grown`): taken at the
+    /// model's every reading, a second apart, and at every look that asks
+    /// for the room. A window and not the process's life, so that one spike
+    /// does not hold the room down for good.
+    z_anon_peak: std::cell::Cell<zselect::WindowMax>,
+    /// The least a decode has cost over a look's period, seconds
+    /// (`z_convert_look`): a period's mean holds the faults its decodes
+    /// took on pages not yet in, and the least of the means is the decode.
+    z_conv_decode: Option<f64>,
+    /// The key ranges the stride form held at the last plan for a merge's
+    /// outputs (`z_stride_ask_finish`): an output that plan asked the form
+    /// of is no partition a form file serves until a tick attaches its
+    /// file, and the next merge's plan, made at the landing, takes it for
+    /// the form its range had.
+    z_stride_spans: Vec<(Vec<u8>, Vec<u8>)>,
     z_recode_refaults: Option<u64>,
     z_recode_ceiling: Option<(u64, std::time::Duration)>,
     /// Partitions whose spare build kept nothing (`Options::zpages_both`),
@@ -45474,6 +45623,14 @@ impl Maint {
             z_recode_last: None,
             z_recode_seen: std::collections::HashMap::new(),
             z_recode_heat: std::collections::HashMap::new(),
+            z_conv_last: None,
+            z_conv_seen: std::collections::HashMap::new(),
+            z_conv_heat: std::collections::HashMap::new(),
+            z_conv_rent: std::collections::HashMap::new(),
+            z_conv_done: None,
+            z_anon_peak: std::cell::Cell::new(zselect::WindowMax::new(zselect::RETAIN_FLOOR)),
+            z_conv_decode: None,
+            z_stride_spans: Vec::new(),
             z_recode_refaults: None,
             z_recode_ceiling: None,
             z_spare_failed: std::collections::HashSet::new(),
@@ -47141,6 +47298,7 @@ impl Maint {
                 return;
             }
         }
+        self.z_convert_asked();
         if self.opts.zpages_recode && !self.z_settling {
             self.z_recode_tick();
             if self.zbuild.is_none() && self.opts.zpages_both {
@@ -47691,6 +47849,342 @@ impl Maint {
         }
         if self.zbuild.is_none() {
             self.z_start(seg, ZKind::Recode, false);
+        }
+    }
+
+    /// The conversion's turn (`Options::zpages_stride_convert`), with the
+    /// form installed and no build in flight or due: once a
+    /// `CONVERT_PERIOD`, and no sooner than `CONVERT_DUTY` times the wall
+    /// the last look took, a look, counted once it is done so that a test
+    /// that waits for one reads the decision it made.
+    fn z_convert_tick(&mut self) {
+        let now = self.z_now();
+        if self
+            .z_conv_last
+            .is_some_and(|t| now.saturating_sub(t) < CONVERT_PERIOD)
+        {
+            return;
+        }
+        // By the wall, so not where a test moves the clock: its ticks come
+        // when it moves it, and a look put off would wait for the next.
+        let injected = self
+            .opts
+            .zpages_inject
+            .as_ref()
+            .is_some_and(|i| i.clock().is_some());
+        if !injected
+            && self
+                .z_conv_done
+                .is_some_and(|(at, took)| at.elapsed() < took * CONVERT_DUTY)
+        {
+            return;
+        }
+        let dt = self.z_conv_last.map(|t| now.saturating_sub(t));
+        self.z_conv_last = Some(now);
+        let t0 = std::time::Instant::now();
+        self.z_convert_look(now, dt);
+        self.z_conv_done = Some((std::time::Instant::now(), t0.elapsed()));
+        zfile::ZEvents::add(&self.shared.z.stride_convert_looks, 1);
+    }
+
+    /// One look of the conversion between the block and the stride forms at
+    /// `now`, `dt` after the last one (none at the first): each served
+    /// partition's touches a second, the moves `zselect::conversions` says
+    /// pay, each move's rent grown by what it would have saved over `dt`,
+    /// and the build of the one whose rent has most outgrown its price
+    /// (`Options::zpages_stride_convert`).
+    fn z_convert_look(&mut self, now: std::time::Duration, dt: Option<std::time::Duration>) {
+        let inject = self.opts.zpages_inject.clone();
+        let budget = self.z_budget_grown();
+        // A served partition: its segment, its form file's identity and
+        // body, the file's bytes, the partition's records', its values',
+        // its ordered index's, what the file has counted -- the decode
+        // time, the decodes, the opens -- and whether the stride form may
+        // be asked of it.
+        struct Row {
+            seg: std::sync::Arc<Seg>,
+            id: u64,
+            stride: bool,
+            file: u64,
+            records: u64,
+            values: u64,
+            heads: u64,
+            ns: u64,
+            decodes: u64,
+            opens: u64,
+            can: bool,
+        }
+        // What stands in the cache beside the forms: the level-0 pieces'
+        // payload, and the raw form of a partition no form file serves.
+        let (rows, other): (Vec<Row>, u64) = {
+            let _op = self.op();
+            let mut other = 0u64;
+            let mut rows = Vec::new();
+            for s in self.segs().iter() {
+                if s.level == 0 {
+                    other = other.saturating_add(s.data);
+                    continue;
+                }
+                match s.z.get().filter(|z| !z.damaged()) {
+                    Some(z) => {
+                        if self.in_flight_input(&s.name)
+                            || self.z_finishing(&s.name)
+                            || self.z_ahead_holds(&s.name)
+                        {
+                            other = other.saturating_add(z.file_bytes());
+                            continue;
+                        }
+                        rows.push(Row {
+                            seg: s.clone(),
+                            id: z.id(),
+                            stride: z.is_stride(),
+                            file: z.file_bytes(),
+                            records: s.foot().1,
+                            values: s.stride_bytes(),
+                            heads: s.ord.file_bytes(),
+                            ns: 16 * z.decode_ns16.load(AtomicOrdering::Relaxed),
+                            decodes: 16 * z.decodes16.load(AtomicOrdering::Relaxed),
+                            opens: 16 * z.opens16.load(AtomicOrdering::Relaxed),
+                            can: s.z_stride_no.load(AtomicOrdering::Relaxed) == 0,
+                        });
+                    }
+                    None => other = other.saturating_add(s.raw_bytes()),
+                }
+            }
+            (rows, other)
+        };
+        // What a decode costs: the seam's price where a test set one, else
+        // the least mean a period's timed decodes have come to over the
+        // block files, else the prior. A decode's time holds the fault it
+        // took on a page not yet in, so a mean over the files' lives reads
+        // a store being read back as one whose decodes are dear, and the
+        // moves it prices would be bought on the read-back.
+        {
+            let (ns, n) = rows
+                .iter()
+                .filter(|r| !r.stride)
+                .filter_map(|r| {
+                    let &(_, ns0, d0) = self.z_conv_seen.get(&r.id)?;
+                    Some((r.ns.saturating_sub(ns0), r.decodes.saturating_sub(d0)))
+                })
+                .fold((0u64, 0u64), |(a, b), (ns, d)| (a + ns, b + d));
+            if n >= CONVERT_DECODES {
+                let mean = ns as f64 / n as f64 * 1e-9;
+                self.z_conv_decode = Some(self.z_conv_decode.map_or(mean, |m| m.min(mean)));
+            }
+        }
+        let per_decode = inject
+            .as_ref()
+            .and_then(|i| i.decode_cost())
+            .map(|c| c.as_secs_f64())
+            .or(self.z_conv_decode)
+            .unwrap_or(RECODE_DECODE_NS * 1e-9);
+        // A block file's bytes a byte of its records, from the block files
+        // served, for what a stride file's partition would hold in the
+        // block form.
+        let block_ratio = {
+            let (b, r) = rows
+                .iter()
+                .filter(|r| !r.stride)
+                .fold((0u64, 0u64), |(b, rc), r| (b + r.file, rc + r.records));
+            if r == 0 {
+                0.6
+            } else {
+                b as f64 / r as f64
+            }
+        };
+        // Each partition's touches a second: the file's count over the
+        // period -- a block file's decodes and opens, a stride file's reads
+        // as the groups they would have opened -- folded into what the
+        // periods before left, by the partition's name across its moves,
+        // decayed over `RECODE_TAU`; a form file first seen gives no rate.
+        let keep = dt.map(|d| (-d.as_secs_f64() / RECODE_TAU.as_secs_f64()).exp());
+        let mut seen = std::collections::HashMap::with_capacity(rows.len());
+        let mut heats = std::collections::HashMap::with_capacity(rows.len());
+        let mut parts = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let count = r.decodes + r.opens;
+            let rate = match (self.z_conv_seen.get(&r.id), dt) {
+                (Some(&(c0, _, _)), Some(d)) if !d.is_zero() => {
+                    Some(count.saturating_sub(c0) as f64 / d.as_secs_f64())
+                }
+                _ => None,
+            };
+            let old = self.z_conv_heat.get(&r.seg.name).copied().unwrap_or(0.0);
+            let heat = match (rate, keep) {
+                (Some(x), Some(a)) => a * old + (1.0 - a) * x,
+                (None, Some(a)) => a * old,
+                _ => old,
+            };
+            seen.insert(r.id, (count, r.ns, r.decodes));
+            heats.insert(r.seg.name.clone(), heat);
+            let block_bytes = if r.stride {
+                (r.records as f64 * block_ratio) as u64
+            } else {
+                r.file
+            }
+            .saturating_add(r.heads);
+            parts.push(zselect::FormPart {
+                stride: r.stride,
+                can_stride: r.can,
+                block_bytes,
+                stride_bytes: if r.stride { r.file } else { r.values },
+                touches: heat,
+            });
+        }
+        self.z_conv_seen = seen;
+        self.z_conv_heat = heats;
+        let rewriting =
+            !self.compacting.is_empty() || self.tiering.is_some() || !self.sealing.is_empty();
+        let (Some(budget), Some(dt)) = (budget, dt) else {
+            return;
+        };
+        if rewriting {
+            if self.z_trace {
+                eprintln!("zconvert t={:.1} busy", now.as_secs_f64());
+            }
+            return;
+        }
+        let t_fault = inject
+            .as_ref()
+            .and_then(|i| i.fault_cost())
+            .map(|c| c.as_secs_f64())
+            .or_else(|| {
+                let ns = self.shared.z.census_costs[0].load(AtomicOrdering::Relaxed);
+                (ns > 0).then_some(ns as f64 * 1e-9)
+            })
+            .unwrap_or(zselect::PRIOR_T_F);
+        let costs = zselect::FormCosts {
+            t_decode: per_decode,
+            t_fault,
+        };
+        let (capacity, fill) = zselect::conversion_room(budget, other);
+        let moves = zselect::conversions(capacity, fill, &parts, costs);
+        // What a build costs: its wall at the builds' measured rate a byte
+        // of form written, with the displacement.
+        let per_byte = {
+            let ev = &self.shared.z;
+            let (us, bytes) = (
+                ev.build_wall_us.load(AtomicOrdering::Relaxed),
+                ev.build_bytes.load(AtomicOrdering::Relaxed),
+            );
+            if bytes == 0 {
+                CONVERT_BUILD_S_PER_BYTE
+            } else {
+                us as f64 * 1e-6 / bytes as f64
+            }
+        };
+        let mut rents = std::collections::HashMap::with_capacity(moves.len());
+        // The move whose rent has most outgrown its price, with both.
+        let mut due: Option<(usize, f64, f64)> = None;
+        for &(m, gain) in &moves {
+            let (i, to_stride) = match m {
+                zselect::Conversion::ToStride(i) => (i, true),
+                zselect::Conversion::ToBlock(i) => (i, false),
+            };
+            let name = &rows[i].seg.name;
+            let rent = self.z_conv_rent.get(name).copied().unwrap_or(0.0) + gain * dt.as_secs_f64();
+            rents.insert(name.clone(), rent);
+            let built = if to_stride {
+                parts[i].stride_bytes
+            } else {
+                parts[i].block_bytes.saturating_sub(rows[i].heads)
+            };
+            let price = inject
+                .as_ref()
+                .and_then(|i| i.convert_price())
+                .map(|c| c.as_secs_f64())
+                .unwrap_or_else(|| zselect::ski_rental_price(built as f64 * per_byte, None));
+            if self.z_trace {
+                eprintln!(
+                    "zconvert t={:.1} {} seg={} touches_s={:.0} gain_ms_s={:.3} rent_ms={:.1} price_ms={:.1} capacity_mb={} fill_mb={} other_mb={}",
+                    now.as_secs_f64(),
+                    if to_stride { "in" } else { "out" },
+                    name,
+                    parts[i].touches,
+                    gain * 1e3,
+                    rent * 1e3,
+                    price * 1e3,
+                    capacity >> 20,
+                    fill >> 20,
+                    other >> 20,
+                );
+            }
+            if rent >= price && due.is_none_or(|(_, r, p)| rent * p > r * price) {
+                due = Some((i, rent, price));
+            }
+        }
+        self.z_conv_rent = rents;
+        if let Some((i, _, _)) = due {
+            let seg = rows[i].seg.clone();
+            self.z_conv_rent.remove(&seg.name);
+            if self.z_trace {
+                eprintln!(
+                    "zconvert t={:.1} start seg={} to {}",
+                    now.as_secs_f64(),
+                    seg.name,
+                    if rows[i].stride { "block" } else { "stride" },
+                );
+            }
+            self.z_convert(seg);
+        }
+    }
+
+    /// A test's request for a conversion taken, with the builder free
+    /// (`Db::zpages_convert_ask`): the partition named, among those a form
+    /// file serves that no merge, finish or build ahead holds, moved to its
+    /// other form where it may be -- always out of the stride form, and
+    /// into it where the form has kept no reason against the partition, by
+    /// a build that asks for it alone. A request stays until the builder is
+    /// free, and one for a partition that may not move is dropped. Unlike
+    /// the policy it asks beside a seal or a merge in flight, which is the
+    /// point of it: the build is then cancelled at the landing that retires
+    /// its partition, or collected against whatever stands.
+    fn z_convert_asked(&mut self) {
+        if self.zbuild.is_some() || self.opts.zpages_stride == ZStride::Off {
+            return;
+        }
+        let n = self.shared.z_convert_ask.swap(0, AtomicOrdering::AcqRel);
+        if n == 0 {
+            return;
+        }
+        let seg = {
+            let _op = self.op();
+            let served: Vec<&std::sync::Arc<Seg>> = self
+                .segs()
+                .iter()
+                .filter(|s| {
+                    s.level > 0
+                        && s.z.get().is_some_and(|z| !z.damaged())
+                        && !self.in_flight_input(&s.name)
+                        && !self.z_finishing(&s.name)
+                        && !self.z_ahead_holds(&s.name)
+                })
+                .collect();
+            if served.is_empty() {
+                return;
+            }
+            served[(n - 1) as usize % served.len()].clone()
+        };
+        let stride = seg.z.get().is_some_and(|z| z.is_stride());
+        if stride || seg.z_stride_no.load(AtomicOrdering::Relaxed) == 0 {
+            self.z_convert(seg);
+        }
+    }
+
+    /// `seg` moved to the form it is not served in
+    /// (`Options::zpages_stride_convert`): built in it beside the reads
+    /// (`ZKind::Convert`) and swapped into the partition's cell at the
+    /// collect, the file it replaces retired through the epoch. Each way is
+    /// a build: a file kept unserved for the way back would be an inode
+    /// with no name once the build's rename took the name, and after an
+    /// exchange the file under the name would be the kept one, which
+    /// everything that reaches a form file by its path -- the rewarm, a
+    /// settle's wait for the asked files, a reopen -- would then take for
+    /// the served one.
+    fn z_convert(&mut self, seg: std::sync::Arc<Seg>) {
+        if self.zbuild.is_none() {
+            self.z_start(seg, ZKind::Convert, false);
         }
     }
 
@@ -49796,6 +50290,19 @@ impl Maint {
                 if idle {
                     self.z_recode_tick();
                 }
+            } else if self.opts.zpages_stride_convert && self.opts.zpages_stride != ZStride::Off {
+                // A conversion is a build, as a re-code is, and waits for
+                // the builder as one does.
+                let idle = self.zbuild.is_none() && {
+                    let _op = self.op();
+                    self.z_next().is_none()
+                };
+                if idle {
+                    self.z_convert_asked();
+                    if self.zbuild.is_none() {
+                        self.z_convert_tick();
+                    }
+                }
             } else if self.z_hot_runs() {
                 self.z_hot_raw_tick();
             }
@@ -50125,19 +50632,45 @@ impl Maint {
         }
     }
 
+    /// The budget a choice between the forms is made against: the seam's
+    /// where a test set one, else the platform's, held under
+    /// `Options::zpages_stride_convert` at the most anonymous memory the
+    /// process has lately been read holding (`zselect::Budget::held_at`,
+    /// `z_anon_peak`). A form
+    /// built or kept on the budget read after a load, with the memtables
+    /// empty, is one the write mixes' memory takes the room from: at ten
+    /// million keys under 1 GiB the process held 60 MiB at the read passes
+    /// and 150-190 through the mixes, and the stride files the load's
+    /// builds had been given room for took 0.3 faults a scan after them.
+    fn z_budget_grown(&self) -> Option<u64> {
+        if let Some(b) = self.opts.zpages_inject.as_ref().and_then(|i| i.budget()) {
+            return Some(b);
+        }
+        let b = zfile::read_budget()?;
+        let peak = self.z_anon_note(b.anon);
+        Some(if self.opts.zpages_stride_convert {
+            b.held_at(peak)
+        } else {
+            b.budget
+        })
+    }
+
+    /// `anon`, the process's anonymous memory as just read, noted: the most
+    /// of the window with it (`z_anon_peak`).
+    fn z_anon_note(&self, anon: u64) -> u64 {
+        let mut w = self.z_anon_peak.get();
+        w.note(self.z_now(), anon);
+        self.z_anon_peak.set(w);
+        w.get()
+    }
+
     /// Whether the store in the stride form fits the room as it is now
     /// (`Options::zpages_stride_room`, `zselect::stride_fits`): every
     /// partition's values alone and every level-0 piece's payload, against
     /// the budget a test injects or the platform reads. With no budget to
     /// read it fits.
     fn z_stride_fits(&self) -> bool {
-        let budget = self
-            .opts
-            .zpages_inject
-            .as_ref()
-            .and_then(|i| i.budget())
-            .or_else(|| zfile::read_budget().map(|b| b.budget));
-        let Some(budget) = budget else {
+        let Some(budget) = self.z_budget_grown() else {
             return true;
         };
         let (stride, pieces) = {
@@ -50176,6 +50709,80 @@ impl Maint {
         zfile::StrideAsk::No
     }
 
+    /// What a merge's outputs ask of the stride form at their finish, and
+    /// the key ranges they ask in. Under `ZStride::Chosen` an output is
+    /// built in the form the partition it rewrites is served in: the ranges
+    /// are those of the partitions the stride form serves now, each from
+    /// its lower fence to its upper, with those of the partitions no form
+    /// file serves yet that lie in a range the last plan asked the form in
+    /// (`z_stride_spans`) -- a chain's next merge is planned at the landing
+    /// of the one before, whose outputs' files are attached a tick later,
+    /// and read as they stood the form's ranges ended with the first merge
+    /// of a chain. Nothing is asked where there is no range, or where the
+    /// forms as they stand with the pieces beside them are past the budget
+    /// -- the outputs are then built in the block form, which is the way
+    /// out of the stride form that costs no build of its own. Elsewhere
+    /// what a build on this thread asks (`z_stride_ask_now`), of every
+    /// output.
+    fn z_stride_ask_finish(&mut self) -> (zfile::StrideAsk, Option<zfile::KeySpans>) {
+        if self.opts.zpages_stride != ZStride::Chosen {
+            return (self.z_stride_ask_now(), None);
+        }
+        let budget = self.z_budget_grown();
+        let last = std::mem::take(&mut self.z_stride_spans);
+        let dir = self.dir.clone();
+        let (spans, held) = {
+            let _op = self.op();
+            let mut spans = Vec::new();
+            let mut held = 0u64;
+            for s in self.segs().iter() {
+                if s.level == 0 {
+                    held = held.saturating_add(s.data);
+                    continue;
+                }
+                let span = || (s.lo.clone(), s.hi.clone().unwrap_or_default());
+                match s.z.get().filter(|z| !z.damaged()) {
+                    Some(z) => {
+                        held = held.saturating_add(z.file_bytes());
+                        if z.is_stride() {
+                            spans.push(span());
+                        } else {
+                            held = held.saturating_add(s.ord.file_bytes());
+                        }
+                    }
+                    // No form file serves it yet. An output of a merge that
+                    // landed since the last plan was asked the form its
+                    // range had then, and its file, built at the finish or
+                    // still being built, is attached at a tick: taken for
+                    // that form. Any other is what its file on disk holds,
+                    // or its raw form where it has none.
+                    None if zfile::in_spans(&last, &s.lo) => {
+                        held = held.saturating_add(s.stride_bytes());
+                        spans.push(span());
+                    }
+                    None => {
+                        let on_disk = zfile::zpg_name_for(&s.name)
+                            .and_then(|n| std::fs::metadata(dir.join(n)).ok())
+                            .map(|m| m.len().saturating_add(s.ord.file_bytes()));
+                        held = held.saturating_add(on_disk.unwrap_or_else(|| s.raw_bytes()));
+                    }
+                }
+            }
+            (spans, held)
+        };
+        if spans.is_empty() {
+            return (zfile::StrideAsk::No, None);
+        }
+        if budget.is_some_and(|b| held > b) {
+            // Every output of this plan is built in the block form, so
+            // none of them is taken for the stride form at the next.
+            zfile::ZEvents::add(&self.shared.z.stride_no_room, 1);
+            return (zfile::StrideAsk::No, None);
+        }
+        self.z_stride_spans = spans.clone();
+        (zfile::StrideAsk::OrBlock, Some(spans.into()))
+    }
+
     /// The builds at a merge's output finish (`Options::zpages_build_at_finish`),
     /// where forms are wanted: under the controller, the store past the share
     /// of its budget the builds ahead start at, past its budget, or the form
@@ -50183,7 +50790,7 @@ impl Maint {
     /// or installed, the records behind a build are dropped as a bought
     /// build's are and its file kept; under it the file's pages go and the
     /// records stay.
-    fn z_finish_plan(&self) -> Option<std::sync::Arc<ZFinish>> {
+    fn z_finish_plan(&mut self) -> Option<std::sync::Arc<ZFinish>> {
         if !self.opts.zpages_build_at_finish || !self.z_auto || self.opts.zpages_land_pct == 0 {
             return None;
         }
@@ -50218,7 +50825,7 @@ impl Maint {
         plan.parse = self.opts.zpages_parse && self.opts.zpages_parse_finish;
         plan.parse_chains = self.opts.zpages_parse_chains;
         plan.own_decode = self.opts.zpages_own_decoder;
-        plan.stride = self.z_stride_ask_now();
+        (plan.stride, plan.stride_spans) = self.z_stride_ask_finish();
         plan.stride_below = self.opts.zpages_stride_below.clone();
         plan.hold = Some(self.shared.zbuild_hold.clone());
         Some(std::sync::Arc::new(ZFinish {
@@ -50690,6 +51297,9 @@ impl Maint {
     fn z_model(&mut self, now: std::time::Duration) -> Option<zselect::Model> {
         let inject = self.opts.zpages_inject.clone();
         let platform = zfile::read_budget();
+        if let Some(b) = &platform {
+            self.z_anon_note(b.anon);
+        }
         let budget = inject
             .as_ref()
             .and_then(|i| i.budget())
@@ -51004,6 +51614,7 @@ impl Maint {
                     self.opts.zpages_cursor_view,
                     self.opts.zpages_group_ahead,
                     self.opts.zpages_walk_owns_decodes,
+                    self.opts.zpages_stride_convert,
                 ),
                 &self.opts.z_stride_attach_sealed(seal),
                 ev,
@@ -51043,7 +51654,12 @@ impl Maint {
                 zfile::ZEvents::add(&ev.rebuilds, 1);
             }
             ZKind::Retry => zfile::ZEvents::add(&ev.build_retries, 1),
-            ZKind::Build | ZKind::Warm | ZKind::Recode | ZKind::Spare | ZKind::Reparse => {}
+            ZKind::Build
+            | ZKind::Warm
+            | ZKind::Recode
+            | ZKind::Spare
+            | ZKind::Reparse
+            | ZKind::Convert => {}
         }
         let refused = seg.z_declined.load(AtomicOrdering::Relaxed) == zfile::DECLINED_REFUSED;
         // A re-code's partition is served by the file under the name, which
@@ -51052,7 +51668,10 @@ impl Maint {
         // file, and kept where a re-code swaps.
         let spare = kind == ZKind::Spare;
         let reparse = kind == ZKind::Reparse;
-        let recode = kind == ZKind::Recode || spare || reparse;
+        // A conversion is a re-code into the other form: started, collected
+        // and failed as one, with the body its plan asks for its own.
+        let convert = kind == ZKind::Convert;
+        let recode = kind == ZKind::Recode || spare || reparse || convert;
         if !recode && self.z_attach_on_disk(&seg, id, end, dormant, refused) {
             return;
         }
@@ -51113,7 +51732,7 @@ impl Maint {
         // it chooses one (`Options::zpages_coding_auto`), taken again
         // against the partitions as they stand (`Maint::z_repick`), else the
         // options'.
-        if !(reparse || recode) {
+        if !(reparse || recode) || convert {
             self.z_repick();
         }
         // A re-code, a spare and a re-parse build the other block coding of
@@ -51122,10 +51741,14 @@ impl Maint {
         // (`check_options`), which is what this rests on.
         let stride_served = recode && seg.z.get().is_some_and(|z| z.is_stride());
         debug_assert!(
-            !stride_served,
+            convert || !stride_served,
             "a re-code, spare or re-parse of a stride file, which check_options refuses"
         );
-        if stride_served {
+        if stride_served && !convert {
+            return;
+        }
+        // Nothing serves it any more: nothing to convert.
+        if convert && seg.z.get().is_none() {
             return;
         }
         let served_coded = seg.z.get().map(|z| z.coded());
@@ -51135,7 +51758,10 @@ impl Maint {
                 Some(false) => (zpages::ZCODING_BLOCK, false),
                 _ => return,
             },
-            _ if recode => match served_coded {
+            // A conversion out of the stride form builds the block body a
+            // build of the partition's own would, by the arms below; into
+            // it the body is the stride form's and no coding is read.
+            _ if recode && !convert => match served_coded {
                 Some(true) => (zpages::ZCODING_BLOCK, false),
                 Some(false) => (zpages::ZCODING_RECORD, true),
                 // Nothing serves it any more: nothing to re-code.
@@ -51187,13 +51813,31 @@ impl Maint {
         // ahead -- asks what the options ask of the stride form; a re-code,
         // a spare and a re-parse build the other block coding of the block
         // file they replace or keep beside, and ask nothing.
-        plan.stride = if recode {
+        // A conversion's file is kept, serves at once and was written whole
+        // into the page cache beside the mixes it is bought under: synced
+        // here, on the builder's thread, where the builds sync theirs, or
+        // its pages reach the device at the kernel's choosing and their
+        // flush is the next commit's to pay (`Options::zpages_build_sync`).
+        if convert {
+            plan.sync = self.opts.zpages_build_sync;
+        }
+        // A conversion asks for the form its partition is not served in:
+        // the stride form alone of a block file's, so that a partition the
+        // form declines serves on as it was, and nothing of a stride file's.
+        plan.stride = if convert && !stride_served {
+            zfile::StrideAsk::Only
+        } else if recode {
             zfile::StrideAsk::No
         } else {
             self.z_stride_ask_now()
         };
-        plan.stride_below = self.opts.zpages_stride_below.clone();
-        if raw_tails {
+        // The key at which the options keep a partition in the block form
+        // is for the builds that ask of their own; a conversion's partition
+        // was chosen.
+        if !convert {
+            plan.stride_below = self.opts.zpages_stride_below.clone();
+        }
+        if raw_tails && plan.stride != zfile::StrideAsk::Only {
             zfile::ZEvents::add(&ev.builds_raw_tails, 1);
         }
         plan.cancel = Some(cancel.clone());
@@ -51246,6 +51890,7 @@ impl Maint {
                     recode,
                     spare,
                     reparse,
+                    convert,
                 });
             }
             Err(_) => {
@@ -51272,6 +51917,7 @@ impl Maint {
             recode,
             spare,
             reparse,
+            convert,
             ..
         } = b;
         let handle = match job {
@@ -51365,6 +52011,12 @@ impl Maint {
         };
         if let Ok(o) = &outcome {
             o.note_stride(&seg.z_stride_no);
+            // A conversion's partition may be a promotion's re-open of the
+            // segment the build began on, and the look that would ask again
+            // reads the live one's reason.
+            if let Some(target) = live.as_ref().filter(|_| convert) {
+                o.note_stride(&target.z_stride_no);
+            }
         }
         // The record of the codings took the plan's for a build ahead at
         // its plan (`z_coded_record`), before the body was known: a stride
@@ -51404,6 +52056,7 @@ impl Maint {
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
                         side.walk_owns = self.opts.zpages_walk_owns_decodes;
+                        side.stride_heat = self.opts.zpages_stride_convert;
                         side.drop_cache();
                         let old = target.z_spare.keep(Box::into_raw(Box::new(side)));
                         if !old.is_null() {
@@ -51446,7 +52099,7 @@ impl Maint {
                     self.opts.zpages_memo_first,
                     Db::fence_search(&self.opts),
                     self.opts.zpages_memo_ahead,
-                    &self.opts.z_stride_attach(),
+                    &self.opts.z_stride_attach_built(&built),
                 ) {
                     Ok(mut side) => {
                         side.inplace = self.opts.zpages_inplace_walk;
@@ -51457,7 +52110,9 @@ impl Maint {
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
                         side.walk_owns = self.opts.zpages_walk_owns_decodes;
+                        side.stride_heat = self.opts.zpages_stride_convert;
                         let coded = side.coded();
+                        let stride = side.is_stride();
                         let mut old = target.z.replace(side);
                         // Kept where the option keeps it, its pages dropped,
                         // and whatever the cell kept before retired in its
@@ -51477,7 +52132,13 @@ impl Maint {
                         }
                         ev.built(&built);
                         zfile::ZEvents::add(&ev.attached, 1);
-                        if reparse {
+                        if convert {
+                            if stride {
+                                zfile::ZEvents::add(&ev.stride_converts, 1);
+                            } else {
+                                zfile::ZEvents::add(&ev.stride_converts_back, 1);
+                            }
+                        } else if reparse {
                             zfile::ZEvents::add(&ev.reparses, 1);
                         } else if coded {
                             zfile::ZEvents::add(&ev.recodes, 1);
@@ -51539,6 +52200,7 @@ impl Maint {
                             side.cursor_view = self.opts.zpages_cursor_view;
                             side.group_ahead = self.opts.zpages_group_ahead;
                             side.walk_owns = self.opts.zpages_walk_owns_decodes;
+                            side.stride_heat = self.opts.zpages_stride_convert;
                             if target.z.install(side) {
                                 ev.built(&built);
                                 zfile::ZEvents::add(&ev.attached, 1);
@@ -51633,6 +52295,7 @@ impl Maint {
                 recode: false,
                 spare: false,
                 reparse: false,
+                convert: false,
             });
         }
     }

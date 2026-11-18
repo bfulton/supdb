@@ -123,6 +123,17 @@
 //!   never appended or deleted, with a value of one width that says how many
 //!   times it was put, so that its partitions qualify through every merge;
 //!   a range whose stride files answered no read fails there too.
+//! - `ZFUZZ_CONVERT=1`, with `ZFUZZ_ZPAGES` and `ZFUZZ_STRIDE`: every few
+//!   dozen steps a partition a form file serves is asked to move to its
+//!   other form (`Db::zpages_convert_ask`) -- a stride file's to the block
+//!   form by a build beside the reads, and back by a build that asks for
+//!   the stride form alone where the partition kept no reason against it
+//!   -- so that a store in two forms, its partitions changing
+//!   form under the reads, the handles' snapshots, the seals and the
+//!   merges, is read against the model; the summary counts the moves each
+//!   way, and a range in which none went out of the stride form fails.
+//!   `concurrent_range` asks beside its reader threads, each of which may
+//!   be in the form file a swap replaces.
 //! - `ZFUZZ_NOPUT`, `ZFUZZ_NOBURST`: set, no puts, or no ordered bursts.
 //! - `ZFUZZ_SEEDKEY=1`: the store's first write is a key of its own, and
 //!   one goes ahead of every write of the empty key, so that no write of
@@ -1606,12 +1617,18 @@ struct StrideStats {
     /// the inline limit reaches no stride file for that reason.
     form_builds: u64,
     block_backed: u64,
+    /// Partitions moved into the stride form while served and out of it
+    /// (`ZFUZZ_CONVERT`).
+    converts: u64,
+    converts_back: u64,
 }
 
 impl StrideStats {
     fn add(&mut self, c: &supdb::db::ZCounts) {
         self.form_builds += c.builds;
         self.block_backed += c.declined_block_backed;
+        self.converts += c.stride_converts;
+        self.converts_back += c.stride_converts_back;
         self.builds += c.stride_builds;
         self.files = self.files.max(c.stride_files);
         self.reads += c.stride_reads;
@@ -1646,6 +1663,8 @@ impl StrideStats {
         self.failures += o.failures;
         self.form_builds += o.form_builds;
         self.block_backed += o.block_backed;
+        self.converts += o.converts;
+        self.converts_back += o.converts_back;
     }
 }
 
@@ -1653,11 +1672,14 @@ impl std::fmt::Display for StrideStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "form builds {} block-backed {}, stride builds {} files {} reads {} cursor {} \
+            "form builds {} block-backed {}, moved in {} out {}, \
+             stride builds {} files {} reads {} cursor {} \
              page checks {} failures {}, \
              declines [shape, holes, values, width, tomb, block, small, readback] {:?}",
             self.form_builds,
             self.block_backed,
+            self.converts,
+            self.converts_back,
             self.builds,
             self.files,
             self.reads,
@@ -1667,6 +1689,12 @@ impl std::fmt::Display for StrideStats {
             self.declines
         )
     }
+}
+
+/// Whether the `z` store's served partitions are asked to change form as
+/// the seed runs (`ZFUZZ_CONVERT`, with the stride form forced).
+fn convert_on() -> bool {
+    stride_on() && env_flag("ZFUZZ_CONVERT")
 }
 
 /// A store's point-read and walk counts through its form files, added to
@@ -1860,12 +1888,16 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
 
     let scan_every = env_flag("ZFUZZ_SCANEVERY");
     let heads_flip = env_flag("ZFUZZ_HEADSFLIP") && env_flag("ZFUZZ_ZPAGES");
+    let convert = convert_on();
     for step in 0..cfg.ops as u64 {
         STEP.set(step as i64);
         // By the step and not by a draw: every seed's stream stays as it
         // was.
         if heads_flip && step.is_multiple_of(37) {
             z.zgate_set(if (step / 37) % 2 == 0 { 1 } else { 2 });
+        }
+        if convert && step.is_multiple_of(29) {
+            z.zpages_convert_ask((step / 29) as usize);
         }
         let k = pool[rng.below(pool.len())].clone();
         if seedkey_first && k.is_empty() {
@@ -2331,6 +2363,13 @@ fn fuzz_range() {
                 "the stride form served no read in {ran} seeds: the steer reached no partition ({stride})"
             ));
         }
+        // And asked to move its partitions between the forms, a range in
+        // which none left the stride form moved nothing.
+        if convert_on() && stride.converts_back == 0 && ran > 0 {
+            bad.push(format!(
+                "no partition left the stride form in {ran} seeds: the asks reached none ({stride})"
+            ));
+        }
     }
     for b in &bad {
         eprintln!("FAIL: {b}");
@@ -2363,11 +2402,12 @@ fn parse_c(v: &[u8]) -> (u32, u32) {
 
 /// A concurrent seed's store, run with its readers on threads: `Ok` with the
 /// point reads its stride files answered.
-fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<u64, String> {
+fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<(u64, u64), String> {
     let mut rng = Rng::new(seed ^ 0xC0FFEE);
     let cfg = pick_cfg(&mut rng, false);
     let dir = scratch(&format!("c{seed}"));
     let heads_flip = env_flag("ZFUZZ_HEADSFLIP") && env_flag("ZFUZZ_ZPAGES");
+    let convert = convert_on();
     // Under `ZFUZZ_STRIDE` the store forced with the stride form under it,
     // and the writes shaped so that every partition qualifies: one run of
     // numbers at one width, every key written before the readers start, and
@@ -2594,6 +2634,9 @@ fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<u64, St
         if heads_flip && step.is_multiple_of(61) {
             db.zgate_set(if (step / 61) % 2 == 0 { 1 } else { 2 });
         }
+        if convert && step.is_multiple_of(53) {
+            db.zpages_convert_ask(step / 53);
+        }
         let i = rng.below(keys.len());
         if stride {
             n[i] += 1;
@@ -2662,14 +2705,16 @@ fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<u64, St
         ));
     }
     eprintln!(
-        "concurrent seed {seed}: reads {}, heads owned {owned} given back {given}, stride files {} builds {} reads {}",
+        "concurrent seed {seed}: reads {}, heads owned {owned} given back {given}, stride files {} builds {} reads {}, moved in {} out {}",
         reads_done.load(Ordering::Relaxed),
         c.stride_files,
         c.stride_builds,
-        c.stride_reads
+        c.stride_reads,
+        c.stride_converts,
+        c.stride_converts_back
     );
     let _ = std::fs::remove_dir_all(&dir);
-    Ok(c.stride_reads)
+    Ok((c.stride_reads, c.stride_converts_back))
 }
 
 /// The padding of a concurrent seed's values under the stride form: one
@@ -2693,10 +2738,13 @@ fn concurrent_range() {
         );
     }
     let mut bad = Vec::new();
-    let mut stride_reads = 0u64;
+    let (mut stride_reads, mut moved_out) = (0u64, 0u64);
     for seed in from..to {
         match std::panic::catch_unwind(|| run_concurrent(seed, ops, snaps)) {
-            Ok(Ok(reads)) => stride_reads += reads,
+            Ok(Ok((reads, out))) => {
+                stride_reads += reads;
+                moved_out += out;
+            }
             Ok(Err(e)) => bad.push(e),
             Err(p) => bad.push(format!("seed {seed}: PANIC {}", panic_text(p.as_ref()))),
         }
@@ -2706,6 +2754,11 @@ fn concurrent_range() {
     if stride_on() && stride_reads == 0 && to > from {
         bad.push(format!(
             "the stride form served no read in seeds {from}..{to}"
+        ));
+    }
+    if convert_on() && moved_out == 0 && to > from {
+        bad.push(format!(
+            "no partition left the stride form in seeds {from}..{to}"
         ));
     }
     for b in &bad {

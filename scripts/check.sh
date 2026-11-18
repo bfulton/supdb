@@ -21,7 +21,10 @@
 #            form or names no form, under SUPDB_TEST_STRIDE (tests/common),
 #            and bounded seed ranges of the differential fuzz and of its
 #            readers on threads with the form forced on the store
-#            (ZFUZZ_STRIDE), each failing a range no stride read reached.
+#            (ZFUZZ_STRIDE), each failing a range no stride read reached,
+#            and the same two with the store's partitions asked to change
+#            form as they run (ZFUZZ_CONVERT), each failing a range in
+#            which none left the stride form.
 #            The test group's binaries, so it builds nothing of its own. Its
 #            own group because a switch that only a hand ran checked nothing
 #            between two hand runs: the adaptations it made of other tests,
@@ -68,6 +71,10 @@ for g in $groups; do
       ZFUZZ_ZPAGES=1 ZFUZZ_STRIDE=1 ZFUZZ_FROM=0 ZFUZZ_TO=24 \
         cargo test --profile checked --test fuzz fuzz_range -- --exact
       ZFUZZ_ZPAGES=1 ZFUZZ_STRIDE=1 ZFUZZ_FROM=0 ZFUZZ_TO=4 \
+        cargo test --profile checked --test fuzz concurrent_range -- --exact
+      ZFUZZ_ZPAGES=1 ZFUZZ_STRIDE=1 ZFUZZ_CONVERT=1 ZFUZZ_FROM=0 ZFUZZ_TO=24 \
+        cargo test --profile checked --test fuzz fuzz_range -- --exact
+      ZFUZZ_ZPAGES=1 ZFUZZ_STRIDE=1 ZFUZZ_CONVERT=1 ZFUZZ_FROM=0 ZFUZZ_TO=4 \
         cargo test --profile checked --test fuzz concurrent_range -- --exact
       ;;
     lint)
