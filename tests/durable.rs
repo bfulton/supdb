@@ -14333,3 +14333,409 @@ fn a_merge_whose_helper_sync_failed_lands_nothing() {
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// ---------------------------------------------------------------------
+// drain-order: a drain's run job, which lands durable only at the
+// writer's ask after its presync (`SealJob::awaits_writer`), is named
+// durable by the flush that closed the run, before the flush answers; and
+// the presync's test seams, one byte loaded once, hold and fail apart.
+
+/// A flush that closes an ordered run hands its seal a job that waits for
+/// the writer's word, and the word is the flush's own ask: when the flush
+/// answers `Ok`, the newest slot names the run's segment durable, with
+/// nothing after the flush to land it. `inline` runs the segment work on
+/// the writer's thread (`Options::publish_in_background` off).
+fn do_drain_lands_its_run(tag: &str, inline: bool) {
+    let d = dir(&format!("dur-do-lands-{tag}"));
+    let opts = Options {
+        publish_in_background: !inline,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    for k in 0..3000u32 {
+        db.append(&ss_key(k), &ss_val(k));
+        if k % 300 == 299 {
+            db.commit().unwrap();
+        }
+    }
+    db.flush().unwrap();
+    let (_, _, names) = ss_newest(&d).expect("a manifest");
+    assert!(
+        !names.is_empty() && names.iter().all(|(_, pending)| !pending),
+        "{tag}: the flush answered with its run's segment not named durable: {names:?}"
+    );
+    let on_disk = seg_names(&d);
+    for (n, _) in &names {
+        assert!(
+            on_disk.contains(n),
+            "{tag}: the slot names {n}, not in {on_disk:?}"
+        );
+    }
+    for k in [0u32, 1499, 2999] {
+        assert_eq!(read_vec(&db, &ss_key(k)), vec![ss_val(k)], "{tag}");
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_drain_names_its_runs_segment_durable_before_it_answers() {
+    do_drain_lands_its_run("background", false);
+}
+
+#[test]
+fn a_drain_names_its_runs_segment_durable_before_it_answers_inline() {
+    do_drain_lands_its_run("inline", true);
+}
+
+/// Under a cipher the run's job awaits the writer as in the clear; the
+/// slot is sealed, so the flush's work is read back by a reopen.
+#[test]
+fn a_drain_lands_its_run_under_a_cipher() {
+    let d = dir("dur-do-lands-cipher");
+    let opts = under_cipher();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    for k in 0..3000u32 {
+        db.append(&ss_key(k), &ss_val(k));
+        if k % 300 == 299 {
+            db.commit().unwrap();
+        }
+    }
+    db.flush().unwrap();
+    assert_ne!(db.levels(), (0, 0), "premise: the run's segment is live");
+    db.settle().unwrap();
+    drop(db);
+    let db = Db::open(&d, opts).unwrap();
+    for k in [0u32, 1499, 2999] {
+        assert_eq!(read_vec(&db, &ss_key(k)), vec![ss_val(k)], "reopened");
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A store for the presync seams' tests: an ordered load under a policy
+/// that leaves the run's records to the presync, written in small pieces.
+fn ps_opts(inline: bool) -> Options {
+    Options {
+        sync: SyncPolicy::EveryN(1_000_000),
+        close_finish_inline: inline,
+        segment: SegmentOptions {
+            write_piece: 4096,
+            ..Default::default()
+        },
+        ..Options::default()
+    }
+}
+
+/// An ordered run of three thousand keys from `from`, committed in
+/// batches of three hundred.
+fn ps_run(db: &mut Db, from: u32) {
+    for k in from..from + 3000 {
+        db.append(&ss_key(k), &ss_val(k));
+        if k % 300 == 299 {
+            db.commit().unwrap();
+        }
+    }
+}
+
+/// A watchdog over a flush held at its presync: should the flush not
+/// have answered within `secs`, it lifts the hold itself, so a test whose
+/// lift never comes fails at its own assertion instead of hanging, and
+/// answers whether it had to; should its own lift not free the flush
+/// either, it ends the process, on its own stderr.
+fn ps_watchdog(
+    h: Reader,
+    flushed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    secs: u64,
+) -> std::thread::JoinHandle<bool> {
+    std::thread::spawn(move || {
+        let answered = |limit: u64| {
+            let t = std::time::Instant::now();
+            while !flushed.load(std::sync::atomic::Ordering::Acquire) {
+                if t.elapsed() > std::time::Duration::from_secs(limit) {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            true
+        };
+        if answered(secs) {
+            return false;
+        }
+        h.hold_presync(false);
+        if !answered(20) {
+            use std::io::Write;
+            if let Ok(mut e) = std::fs::OpenOptions::new().write(true).open("/dev/stderr") {
+                let _ = writeln!(e, "watchdog: a lifted presync hold still holds the flush");
+            }
+            std::process::exit(101);
+        }
+        true
+    })
+}
+
+/// Waits, from a test's thread, for the writer's presync to be waiting
+/// at the hold -- the presync says so itself, so a presync that never
+/// waited fails here and not by a race with a sleep -- and then for the
+/// run's segment to be published while the writer stays held there.
+fn ps_wait_held(h: &Reader) {
+    let t = std::time::Instant::now();
+    while !h.presync_hold_state().1 {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(20),
+            "the writer's presync never waited at the hold"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    while h.levels() == (0, 0) {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(20),
+            "the run's segment was never published"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// The presync's seams share one byte: a hold with no failure armed waits
+/// and then syncs, and the flush answers `Ok` with nothing injected; a
+/// failure armed and a hold lifted before the flush fails it without a
+/// wait. Each seam's bit is taken apart from the other's.
+#[test]
+fn the_presync_seams_hold_and_fail_apart() {
+    let d = dir("dur-do-seams");
+    let mut db = Db::create(&d, ps_opts(false)).unwrap();
+    ps_run(&mut db, 0);
+    let h = db.reader().unwrap();
+    db.hold_presync(true);
+    let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flushed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog = ps_watchdog(db.reader().unwrap(), flushed.clone(), 30);
+    let (seen, done) = (held.clone(), flushed.clone());
+    let lifter = std::thread::spawn(move || {
+        // The writer waiting at its presync, the run's segment published
+        // meanwhile, and the flush still not answered a while after: the
+        // hold holds it there until it is lifted.
+        ps_wait_held(&h);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let waited = !done.load(std::sync::atomic::Ordering::Acquire);
+        seen.store(waited, std::sync::atomic::Ordering::Release);
+        h.hold_presync(false);
+    });
+    db.flush().unwrap();
+    flushed.store(true, std::sync::atomic::Ordering::Release);
+    lifter.join().unwrap();
+    assert!(
+        !watchdog.join().unwrap(),
+        "the hold was lifted by the watchdog, not by the test's lift"
+    );
+    assert!(
+        held.load(std::sync::atomic::Ordering::Acquire),
+        "the flush answered with the presync's hold still on"
+    );
+    assert_eq!(
+        db.failed_presync_extent(),
+        None,
+        "a hold armed alone injected a failure"
+    );
+    assert_eq!(
+        db.presync_hold_state(),
+        (false, false),
+        "the held presync still says it waits after it answered"
+    );
+    // A failure armed alone: the next flush's presync fails, and no hold
+    // left from the first keeps it waiting.
+    ps_run(&mut db, 3000);
+    db.fail_next_presync();
+    let e = db
+        .flush()
+        .expect_err("the flush answers its armed presync failure");
+    assert!(
+        e.to_string()
+            .contains("the records' sync failed (injected)"),
+        "the flush answers the injected presync: {e}"
+    );
+    assert!(
+        db.failed_presync_extent().is_some(),
+        "the failure was injected"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A failure armed and then a hold: the hold arms beside the failure
+/// without clearing it, the writer waits before it takes the failure --
+/// nothing injected while it is held -- and the failure fires once the
+/// hold is lifted.
+#[test]
+fn a_held_presync_takes_the_failure_armed_before_the_hold_after_its_lift() {
+    let d = dir("dur-do-seams-both");
+    let mut db = Db::create(&d, ps_opts(false)).unwrap();
+    ps_run(&mut db, 0);
+    db.fail_next_presync();
+    db.hold_presync(true);
+    let h = db.reader().unwrap();
+    let flushed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog = ps_watchdog(db.reader().unwrap(), flushed.clone(), 30);
+    let done = flushed.clone();
+    let lifter = std::thread::spawn(move || {
+        ps_wait_held(&h);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let answered = done.load(std::sync::atomic::Ordering::Acquire);
+        let injected = h.failed_presync_extent();
+        h.hold_presync(false);
+        (answered, injected)
+    });
+    let r = db.flush();
+    flushed.store(true, std::sync::atomic::Ordering::Release);
+    let (answered, injected) = lifter.join().unwrap();
+    assert!(
+        !watchdog.join().unwrap(),
+        "the hold was lifted by the watchdog, not by the test's lift"
+    );
+    assert!(!answered, "the flush answered with the presync's hold on");
+    assert_eq!(
+        injected, None,
+        "the armed failure was taken while the presync was held"
+    );
+    let e = r.expect_err("the failure armed before the hold fires after the lift");
+    assert!(
+        e.to_string()
+            .contains("the records' sync failed (injected)"),
+        "the flush answers the injected presync: {e}"
+    );
+    assert!(
+        db.failed_presync_extent().is_some(),
+        "the failure was injected"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// On the arm that finishes a run's close inline, the presync runs on a
+/// thread of its own, which the hold does not hold: with the hold on and
+/// a failure armed, the flush answers the failure with nobody lifting it.
+#[test]
+fn the_inline_arms_presync_is_not_held() {
+    let d = dir("dur-do-seams-inline");
+    let mut db = Db::create(&d, ps_opts(true)).unwrap();
+    ps_run(&mut db, 0);
+    db.hold_presync(true);
+    db.fail_next_presync();
+    let flushed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog = ps_watchdog(db.reader().unwrap(), flushed.clone(), 20);
+    let r = db.flush();
+    flushed.store(true, std::sync::atomic::Ordering::Release);
+    assert!(
+        !watchdog.join().unwrap(),
+        "the inline arm's presync waited for the hold"
+    );
+    let e = r.expect_err("the flush answers its armed presync failure");
+    assert!(
+        e.to_string()
+            .contains("the records' sync failed (injected)"),
+        "the flush answers the injected presync: {e}"
+    );
+    assert_eq!(
+        db.presync_hold_state(),
+        (true, false),
+        "the presync the hold did not hold took the hold the test armed"
+    );
+    db.hold_presync(false);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// An injected presync failure is taken once. A store whose queue the
+/// failure stopped still closes a run while its frozen list has room, and
+/// presyncs it: with nothing armed again that presync syncs and the first
+/// failure's record stands; armed again, the next one fails on the new
+/// run's file, which says the store still presyncs there.
+fn ps_failure_taken_once(tag: &str, inline: bool) {
+    let d = dir(&format!("dur-do-seams-once-{tag}"));
+    let mut db = Db::create(&d, ps_opts(inline)).unwrap();
+    let more = |db: &mut Db, from: u32| {
+        for k in from..from + 3000 {
+            db.append(&ss_key(k), &ss_val(k));
+            if k % 300 == 299 {
+                let _ = db.commit();
+            }
+        }
+    };
+    ps_run(&mut db, 0);
+    db.fail_next_presync();
+    db.flush()
+        .expect_err("the flush answers its armed presync failure");
+    let first = db
+        .failed_presync_extent()
+        .expect("the failure was injected");
+    more(&mut db, 3000);
+    db.flush()
+        .expect_err("a store whose seal queue stopped answers the stop");
+    assert_eq!(
+        db.failed_presync_extent(),
+        Some(first),
+        "a failure armed once failed a second presync"
+    );
+    more(&mut db, 6000);
+    db.fail_next_presync();
+    db.flush()
+        .expect_err("a store whose seal queue stopped answers the stop");
+    let third = db
+        .failed_presync_extent()
+        .expect("the failure was injected");
+    assert_ne!(
+        third.0, first.0,
+        "the store closed no later run, so nothing was presynced after the first failure"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn an_injected_presync_failure_is_taken_once() {
+    ps_failure_taken_once("writer", false);
+}
+
+#[test]
+fn an_injected_presync_failure_is_taken_once_inline() {
+    ps_failure_taken_once("inline", true);
+}
+
+/// A failure armed while the writer's presync is held is that presync's:
+/// the hold is before the presync looks at what is armed, so the flush
+/// answers the failure once the hold is lifted.
+#[test]
+fn a_failure_armed_under_a_held_presync_is_taken_at_its_lift() {
+    let d = dir("dur-do-seams-during");
+    let mut db = Db::create(&d, ps_opts(false)).unwrap();
+    ps_run(&mut db, 0);
+    db.hold_presync(true);
+    let h = db.reader().unwrap();
+    let flushed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog = ps_watchdog(db.reader().unwrap(), flushed.clone(), 30);
+    let done = flushed.clone();
+    let lifter = std::thread::spawn(move || {
+        ps_wait_held(&h);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let answered = done.load(std::sync::atomic::Ordering::Acquire);
+        h.fail_next_presync();
+        h.hold_presync(false);
+        answered
+    });
+    let r = db.flush();
+    flushed.store(true, std::sync::atomic::Ordering::Release);
+    let answered = lifter.join().unwrap();
+    assert!(
+        !watchdog.join().unwrap(),
+        "the hold was lifted by the watchdog, not by the test's lift"
+    );
+    assert!(!answered, "the flush answered with the presync's hold on");
+    let e = r.expect_err("the failure armed under the hold fires at the lift");
+    assert!(
+        e.to_string()
+            .contains("the records' sync failed (injected)"),
+        "the flush answers the injected presync: {e}"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
