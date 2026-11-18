@@ -1225,13 +1225,6 @@ pub struct Options {
     /// anything; the error names the inode of the file the sync was for.
     #[doc(hidden)]
     pub fail_open_other_slot_sync: bool,
-    /// A test's: the open's fsync of the directory before it removes
-    /// anything fails as a device error would -- under the rename shape
-    /// (`manifest_slots` off) the one it always makes, before it has changed
-    /// anything, and under the slots the one it makes for a slot file it
-    /// made (`manifest_make_slots`), with that file made.
-    #[doc(hidden)]
-    pub fail_open_dir_sync: bool,
     /// A test's: the first manifest slot the open writes is torn, the
     /// first half of its image written and the write failed, and the open
     /// answers that failure (`Db::tear_next_slot_write` is the segment
@@ -3138,19 +3131,9 @@ pub struct Options {
     /// shape -- the manifest written to a temp name, fsynced, renamed over
     /// the old one and the directory fsynced, two device round trips more
     /// a landing -- kept for pricing as `supdb-manifestrename` and
-    /// `supdb-ingestmanifestrename`. Under it a seal's names are made
-    /// durable by the directory fsync of the publish that names them, which
-    /// rests on the filesystem putting a rename on the device no sooner than
-    /// the renames made before it; a seal whose publish fails stops the seal
-    /// queue as a seal that fails at any other step does; and an open fsyncs
-    /// the directory, after any pending segment it takes from a store that
-    /// ran under `manifest_pending`, before it removes anything, then
-    /// removes the second slot file a life under the slots left, the
-    /// manifest it read written as `manifest` first where that file held
-    /// it. A store written under either shape opens under either: a
-    /// version-1 manifest reads as sequence zero, and the open under the
-    /// slots makes the slot file it lacks and fsyncs the directory before
-    /// it removes anything.
+    /// `supdb-ingestmanifestrename`. A store written under either shape
+    /// opens under either: a version-1 manifest reads as sequence zero
+    /// and the open makes the slot it lacks.
     pub manifest_slots: bool,
     /// EXPERIMENT, priced and kept as an arm: a seal's manifest riding its
     /// fsync. At the seal's readable landing the segment work writes the
@@ -4030,7 +4013,6 @@ impl Default for Options {
             zpages_hold_rename: false,
             fail_open_slot_sync: false,
             fail_open_other_slot_sync: false,
-            fail_open_dir_sync: false,
             tear_open_slot_write: false,
             fail_open_pending_sync: false,
             zpages_hold_after_settle: false,
@@ -12339,8 +12321,7 @@ fn check_options(opts: &Options) -> Result<()> {
 /// (`Options::manifest_slots`). The
 /// shape before it wrote a temp name, renamed it over the old manifest and
 /// fsynced the directory, three device round trips a landing where this is
-/// one; it is kept as the arm that prices it, and an open under it fsyncs
-/// the directory before it removes anything. Segment files not named by
+/// one; it is kept as the arm that prices it. Segment files not named by
 /// the manifest are orphans from an interrupted job and are deleted at
 /// open.
 ///
@@ -12567,13 +12548,9 @@ fn manifest_write_slot_unsynced(
 }
 
 /// The slot files a store under `Options::manifest_slots` needs, made where
-/// missing -- a store that last ran under the rename shape has one, an
-/// open under that shape having removed the other -- and the directory
-/// fsynced once for them, so no publish after creates an entry, and every
-/// rename a life under that shape made is durable before the open removes
-/// what the manifest renamed into place stopped naming. `fail` is a test's
-/// (`Options::fail_open_dir_sync`): that fsync fails, where one is made.
-fn manifest_make_slots(dir: &Path, fail: bool) -> Result<()> {
+/// missing -- a store born under the rename shape has one -- and the
+/// directory fsynced once for them, so no publish after creates an entry.
+fn manifest_make_slots(dir: &Path) -> Result<()> {
     let mut made = false;
     for slot in MANIFEST_SLOTS {
         let path = dir.join(slot);
@@ -12583,9 +12560,6 @@ fn manifest_make_slots(dir: &Path, fail: bool) -> Result<()> {
         }
     }
     if made {
-        if fail {
-            return Err(err("a test failed the open's directory fsync"));
-        }
         vault::sync_dir(dir)?;
     }
     Ok(())
@@ -12618,9 +12592,6 @@ fn manifest_write_shape(
 /// `spare`, the manifest it replaces is first linked under a spare name so
 /// that the rename frees no inode, and that name is returned for the
 /// caller to unlink off every waiter's path; see `Options::manifest_spare`.
-/// The directory's fsync is a publish's to a test's hook on it
-/// (`vault::DirSync::Publish`: `Db::fail_next_seal_dir_sync`,
-/// `Db::watch_slot_writes`), which runs between the rename and the fsync.
 fn manifest_write(
     dir: &Path,
     seq: u64,
@@ -12652,7 +12623,7 @@ fn manifest_write(
         None
     };
     vault::rename(&tmp, &cur)?;
-    vault::sync_dir_as(dir, vault::DirSync::Publish)?;
+    vault::sync_dir(dir)?;
     Ok(kept)
 }
 
@@ -28443,7 +28414,7 @@ impl Db {
         // the store's. The scan stays for stores written before manifests.
         if opts.manifest_slots {
             manifest_write_slot(dir, 0, 0, 0, &[], &[], false)?;
-            manifest_make_slots(dir, false)?;
+            manifest_make_slots(dir)?;
         } else {
             manifest_write(dir, 0, 0, &[], false)?;
         }
@@ -28753,12 +28724,6 @@ impl Db {
     /// `Options::manifest_pending` a pending segment the open reads back
     /// whole is fsynced, with its ordered index under `Options::ord_durable`
     /// and the directory, before the open writes the slot naming it durable.
-    /// Under the rename shape (`Options::manifest_slots` off) the manifest
-    /// is a name a publish renamed into place, and the open fsyncs the
-    /// directory, after any pending segment it takes, before it removes
-    /// anything; a second slot file a life under the slots left is removed
-    /// then, so that an open under the slots after it makes the file again
-    /// and fsyncs the directory before it removes anything.
     pub fn open(dir: &Path, mut opts: Options) -> Result<Db> {
         check_options(&opts)?;
         // Before anything is read, the store held to the way it is asked
@@ -28848,9 +28813,6 @@ impl Db {
         // (`Options::tear_open_slot_write`), whichever write is first.
         let mut tear = opts.tear_open_slot_write;
         let take = std::mem::take::<bool>;
-        // Whether `manifest.alt` is there: under the rename shape, a slot
-        // file a life under the slots left (`manifest_make_slots`).
-        let mut alt_found = false;
         if let Some(m) = &manifest {
             // The slot taken, and the other whatever it read as -- torn,
             // older, or newer and passed over for pending segments that did
@@ -28870,7 +28832,6 @@ impl Db {
                 let Some(f) = vault::open_slot_found(&path)? else {
                     continue;
                 };
-                alt_found |= s == 1;
                 // A test's failure stands in for the fdatasync's own, inside
                 // the call that records the ones that return; the file it
                 // was for named by its inode, so a test can tell the slot
@@ -29017,53 +28978,14 @@ impl Db {
         }
         // The store is what the slot taken names: from here the open
         // removes what nothing names and writes what it owes.
-        // Under the rename shape the manifest read is a name a publish
-        // renamed into place, durable only once the directory is: a kill
-        // between that rename and its directory fsync leaves it in the page
-        // cache alone, and a removal below of what it stopped naming may
-        // reach the device without it. Its directory entry made durable
-        // first, as the slots' open makes the slot it takes durable above.
-        // A pending name it took (`Options::manifest_pending`, a store that
-        // ran under the slots) was read back whole out of the page cache,
-        // and the first publish here names it durable and retires the log
-        // that holds its writes: each made durable first, as the slots'
-        // open does before the slot it writes.
-        if !opts.manifest_slots && had_manifest {
-            if !pending.is_empty() && held.is_none() {
-                Db::sync_pending(dir, &opts, &pending, &mut open_synced)?;
-            }
-            if opts.fail_open_dir_sync {
-                return Err(err("a test failed the open's directory fsync"));
-            }
-            vault::sync_dir(dir)?;
-            open_synced.push(".".into());
-            // A slot file a life under the slots left goes before this life
-            // publishes anything: an open under the slots after a kill of
-            // this life then makes it again and fsyncs the directory
-            // (`manifest_make_slots`), which covers this life's renames,
-            // before it removes what they stopped naming; found there, it
-            // would make nothing and fsync nothing. Where it holds the
-            // manifest read, that is written as `manifest` first, its
-            // directory fsynced, so the store is never without it.
-            if alt_found {
-                if taken == Some(MANIFEST_SLOTS[1]) {
-                    mseq += 1;
-                    slot.write_shape(dir, &opts, mseq, sealed, &live, take(&mut tear))?;
-                }
-                vault::remove_file(dir.join(MANIFEST_SLOTS[1]))?;
-            }
-        }
-        // A slot file made where a life under the rename shape left one,
-        // and the directory fsynced for it, before anything is removed: the
-        // fsync is what makes that life's renames durable.
-        if opts.manifest_slots {
-            manifest_make_slots(dir, opts.fail_open_dir_sync)?;
-        }
         // Under a cipher the segments the directory holds are known by the
         // slots that name them, and an envelope neither slot names is
         // nobody's and goes here.
         if let Some(h) = &held {
             h.vault().sweep()?;
+        }
+        if opts.manifest_slots {
+            manifest_make_slots(dir)?;
         }
         for p in &spare_extra {
             let _ = vault::remove_file(p);
@@ -29104,7 +29026,21 @@ impl Db {
             // pending segment's envelope was written and synced before the
             // slot naming it was (`manifest_image`).
             if !pending.is_empty() && held.is_none() {
-                Db::sync_pending(dir, &opts, &pending, &mut open_synced)?;
+                for name in &pending {
+                    let mut files = vec![name.clone()];
+                    if opts.ord_durable {
+                        files.extend(Db::ord_name_for(name));
+                    }
+                    for f in files {
+                        if opts.fail_open_pending_sync {
+                            return Err(err(&format!(
+                                "a test failed the open's fsync of the pending {f}"
+                            )));
+                        }
+                        vault::sync_file(dir.join(&f))?;
+                        open_synced.push(f);
+                    }
+                }
                 vault::sync_dir(dir)?;
                 open_synced.push(".".into());
             }
@@ -29680,33 +29616,6 @@ impl Db {
         self.fs().log_gen.set(st.gen);
         self.fs().log_seen.set(0);
         self.note_over(st);
-    }
-
-    /// The open's fsync of each pending segment it took, and of the
-    /// segment's ordered index where the store keeps those durable
-    /// (`Options::ord_durable`), each recorded in `synced` once it returned.
-    fn sync_pending(
-        dir: &Path,
-        opts: &Options,
-        pending: &[String],
-        synced: &mut Vec<String>,
-    ) -> Result<()> {
-        for name in pending {
-            let mut files = vec![name.clone()];
-            if opts.ord_durable {
-                files.extend(Db::ord_name_for(name));
-            }
-            for f in files {
-                if opts.fail_open_pending_sync {
-                    return Err(err(&format!(
-                        "a test failed the open's fsync of the pending {f}"
-                    )));
-                }
-                vault::sync_file(dir.join(&f))?;
-                synced.push(f);
-            }
-        }
-        Ok(())
     }
 
     /// The open's refusals of the slot it takes, made before it removes
@@ -33152,63 +33061,11 @@ impl Db {
 
     /// A test's: the next seal's directory fsync at its readable landing
     /// fails, after its segments are published and its sequence counted.
-    /// Under the rename shape (`Options::manifest_slots` off), where a
-    /// seal's directory entries are made durable by the publish that names
-    /// them, the next publish's directory fsync fails instead, after its
-    /// rename.
     #[doc(hidden)]
     pub fn fail_next_seal_dir_sync(&self) {
         self.shared
             .fail_seal_dir_sync
             .store(true, AtomicOrdering::Release);
-        self.hook_publish_dir_sync();
-    }
-
-    /// A test's: the seams of a rename-shape publish's directory fsync --
-    /// `fail_next_seal_dir_sync`'s failure and `watch_slot_writes`' watch --
-    /// set on the directory's fsyncs (`vault::hook_dir_sync`), so that the
-    /// publish itself asks nothing: the hook runs where `vault::sync_dir_as`
-    /// loads the word it loads anyway, after the publish's rename and before
-    /// its fsync, and goes with the store. Under the slots no publish makes
-    /// such an fsync, and the hook is asked of none.
-    fn hook_publish_dir_sync(&self) {
-        let shared = std::sync::Arc::downgrade(&self.shared);
-        let hook: vault::DirHook = std::sync::Arc::new(move |kind| {
-            // Asked whether it is wanted under the hooks' lock: answered
-            // without taking the store, whose last drop may not run there.
-            if shared.strong_count() == 0 {
-                return None;
-            }
-            if kind != Some(vault::DirSync::Publish) {
-                return Some(Ok(()));
-            }
-            let sh = shared.upgrade()?;
-            if sh.slot_watching.load(AtomicOrdering::Acquire) {
-                let w = sh
-                    .slot_watch
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
-                if let Some(w) = w {
-                    // The publish's sequence: the segment work moves it
-                    // into the shared word once the write has returned.
-                    let synced = [0, 1].map(|i| sh.slot_synced[i].load(AtomicOrdering::Acquire));
-                    w(&SlotWrite {
-                        seq: sh.manifest_seq.load(AtomicOrdering::Acquire) + 1,
-                        slot: 0,
-                        deferred: false,
-                        synced,
-                    });
-                }
-            }
-            if sh.fail_seal_dir_sync.swap(false, AtomicOrdering::AcqRel) {
-                return Some(Err(err(
-                    "a test failed this manifest publish's directory fsync",
-                )));
-            }
-            Some(Ok(()))
-        });
-        vault::hook_dir_sync(&self.dir, Some(hook));
     }
 
     /// A test's: a seal thread's next step that makes its segments durable
@@ -33362,10 +33219,7 @@ impl Db {
     /// A test's: `f` called before every manifest slot write the segment
     /// work makes, with the slot it goes to and the sequences each slot
     /// file's last fdatasync covered, so a test can build what a power cut
-    /// during the write leaves. Under the rename shape
-    /// (`Options::manifest_slots` off) it is called at every publish
-    /// between its rename and the directory's fsync, with slot 0, the file
-    /// renamed over. `None` stops it.
+    /// during the write leaves. `None` stops it.
     #[doc(hidden)]
     pub fn watch_slot_writes(&self, f: Option<SlotWatch>) {
         let on = f.is_some();
@@ -33375,9 +33229,6 @@ impl Db {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = f;
         self.shared.slot_watching.store(on, AtomicOrdering::Release);
-        if on {
-            self.hook_publish_dir_sync();
-        }
     }
 
     /// A test's: the next fdatasync of a log file a loose rotation closed
@@ -40044,25 +39895,8 @@ impl Maint {
         // Counted out once the manifest names the segments, or the landing
         // failed: from here the seal is not in flight, and the next seal
         // in the queue may land.
-        if let Err(e) = out {
-            if !self.opts.manifest_slots {
-                // Under the rename shape the publish's directory fsync is
-                // the one that makes the seal's names durable, and a
-                // publish that failed may have renamed its manifest into
-                // place: a later publish's fsync that returned would name
-                // the segments durable over entries the failed one may have
-                // lost, and retire the log that holds their writes. The
-                // queue stops, before the seal is counted out, as for any
-                // step of a seal that fails. Under the slots the seal's
-                // names were made durable at its readable landing, and a
-                // slot whose write or sync failed is written again, whole,
-                // by the next publish.
-                self.stop_seals(&e);
-            }
-            self.shared.in_seal.fetch_sub(1, AtomicOrdering::AcqRel);
-            return Err(e);
-        }
         self.shared.in_seal.fetch_sub(1, AtomicOrdering::AcqRel);
+        out?;
         self.landed_decisions()
     }
 

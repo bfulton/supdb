@@ -148,7 +148,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Error, ErrorKind, Read, Result, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub use super::pager::PagerCounts;
@@ -1955,7 +1955,7 @@ pub(crate) fn open_append(path: impl AsRef<Path>) -> Result<File> {
 /// nowhere if it is: a manifest slot.
 pub(crate) fn open_slot(path: impl AsRef<Path>) -> Result<File> {
     let path = path.as_ref();
-    if IO_SEAMS.load(Ordering::Relaxed) & SEAM_TRACE != 0 {
+    if IO_TRACE_ON.load(Ordering::Relaxed) {
         io_trace("open_slot", &real(path));
     }
     let plain = |p: &Path| {
@@ -1998,7 +1998,7 @@ pub(crate) fn sync_slot(
         Some(e) => Err(e),
         None => f.sync_data(),
     }?;
-    if IO_SEAMS.load(Ordering::Relaxed) & SEAM_TRACE != 0 {
+    if IO_TRACE_ON.load(Ordering::Relaxed) {
         io_trace("sync_slot", &real(path));
     }
     Ok(())
@@ -2154,89 +2154,15 @@ pub(crate) fn read(path: impl AsRef<Path>) -> Result<Vec<u8>> {
 
 /// The directory's entries made durable: an fsync of the directory.
 pub(crate) fn sync_dir(dir: impl AsRef<Path>) -> Result<()> {
-    sync_dir_as(dir, DirSync::Other)
-}
-
-/// Which directory fsync a call to `sync_dir_as` is, for a test's hook on
-/// it (`hook_dir_sync`) and nothing else.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum DirSync {
-    /// Any but the next.
-    Other,
-    /// A rename-shape manifest publish's, after its rename
-    /// (`manifest_write`).
-    Publish,
-}
-
-/// `sync_dir`, saying which fsync it is. The test seams ride the one word
-/// the call loads anyway: none set, it is the fsync and nothing else.
-#[inline]
-pub(crate) fn sync_dir_as(dir: impl AsRef<Path>, kind: DirSync) -> Result<()> {
     let dir = dir.as_ref();
-    let seams = IO_SEAMS.load(Ordering::Relaxed);
-    if seams != 0 {
-        return sync_dir_seamed(dir, kind, seams);
-    }
     match under(dir) {
         Some(v) => File::open(&v.real)?.sync_all()?,
         None => File::open(dir)?.sync_all()?,
     }
-    Ok(())
-}
-
-/// `sync_dir_as` with a test's seam set: the hook on `dir`, where one is,
-/// before the fsync, which it may fail in its place; the fsync recorded
-/// once it has returned, where `trace_io` is on.
-#[cold]
-#[inline(never)]
-fn sync_dir_seamed(dir: &Path, kind: DirSync, seams: u8) -> Result<()> {
-    if seams & SEAM_HOOK != 0 {
-        let hook = {
-            let mut hooks = DIR_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
-            hooks.retain(|(_, h)| h(None).is_some());
-            if hooks.is_empty() {
-                IO_SEAMS.fetch_and(!SEAM_HOOK, Ordering::Relaxed);
-            }
-            hooks.iter().find(|(d, _)| d == dir).map(|(_, h)| h.clone())
-        };
-        if let Some(h) = hook {
-            if let Some(r) = h(Some(kind)) {
-                r?;
-            }
-        }
-    }
-    match under(dir) {
-        Some(v) => File::open(&v.real)?.sync_all()?,
-        None => File::open(dir)?.sync_all()?,
-    }
-    if seams & SEAM_TRACE != 0 {
+    if IO_TRACE_ON.load(Ordering::Relaxed) {
         io_trace("sync_dir", dir);
     }
     Ok(())
-}
-
-/// A test's hook on a directory's fsyncs: asked with `Some(kind)` before
-/// each fsync of the directory it is set on, whose error the call answers
-/// in the fsync's place, and with `None` to say whether it is still
-/// wanted; `None` back from either is a hook whose store has gone.
-pub(crate) type DirHook = Arc<dyn Fn(Option<DirSync>) -> Option<Result<()>> + Send + Sync>;
-
-/// The hooks set, by the directory each is on, as the engine names it.
-static DIR_HOOKS: Mutex<Vec<(PathBuf, DirHook)>> = Mutex::new(Vec::new());
-
-/// A test's: `hook` set on the fsyncs of `dir`, in place of any set there
-/// before; `None` takes it off.
-pub(crate) fn hook_dir_sync(dir: &Path, hook: Option<DirHook>) {
-    let mut hooks = DIR_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
-    hooks.retain(|(d, h)| d != dir && h(None).is_some());
-    if let Some(h) = hook {
-        hooks.push((dir.to_path_buf(), h));
-    }
-    if hooks.is_empty() {
-        IO_SEAMS.fetch_and(!SEAM_HOOK, Ordering::Relaxed);
-    } else {
-        IO_SEAMS.fetch_or(SEAM_HOOK, Ordering::Relaxed);
-    }
 }
 
 /// A file's bytes made durable: an fsync of the file, opened for it. The
@@ -2245,20 +2171,16 @@ pub(crate) fn hook_dir_sync(dir: &Path, hook: Option<DirHook>) {
 pub(crate) fn sync_file(path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
     open(path)?.sync_all()?;
-    if IO_SEAMS.load(Ordering::Relaxed) & SEAM_TRACE != 0 {
+    if IO_TRACE_ON.load(Ordering::Relaxed) {
         io_trace("sync_file", path);
     }
     Ok(())
 }
 
-/// A test's seams, process-wide: whether directory fsyncs, the open's file
-/// fsyncs (`sync_file`, `sync_slot`) and slot opens are recorded
-/// (`SEAM_TRACE`, `trace_io`), and whether a hook is set on some
-/// directory's fsyncs (`SEAM_HOOK`, `hook_dir_sync`); read beside the
-/// syscall each makes, one load whatever is set.
-static IO_SEAMS: AtomicU8 = AtomicU8::new(0);
-const SEAM_TRACE: u8 = 1;
-const SEAM_HOOK: u8 = 2;
+/// A test's: whether directory fsyncs, the open's file fsyncs
+/// (`sync_file`, `sync_slot`) and slot opens are recorded (`trace_io`),
+/// read beside the syscall each makes.
+static IO_TRACE_ON: AtomicBool = AtomicBool::new(false);
 
 /// A test's: what `trace_io` recorded, in order, process-wide.
 static IO_TRACE: Mutex<Vec<(&'static str, PathBuf)>> = Mutex::new(Vec::new());
@@ -2276,11 +2198,7 @@ fn io_trace(what: &'static str, path: &Path) {
 /// filesystem (`real`), in the order they were made, process-wide; off,
 /// record nothing. The record so far.
 pub(crate) fn trace_io(on: bool) -> Vec<(&'static str, PathBuf)> {
-    if on {
-        IO_SEAMS.fetch_or(SEAM_TRACE, Ordering::Relaxed);
-    } else {
-        IO_SEAMS.fetch_and(!SEAM_TRACE, Ordering::Relaxed);
-    }
+    IO_TRACE_ON.store(on, Ordering::Relaxed);
     IO_TRACE.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
