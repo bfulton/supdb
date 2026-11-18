@@ -8815,14 +8815,26 @@ fn an_output_being_built_at_its_finish_is_not_built_ahead_again() {
     inject.set_decode_cost(std::time::Duration::from_micros(1));
     inject.set_budget(raw / 2);
     // Past the line the builds ahead build the load's partitions, which
-    // no merge finished; every one on disk before the rewrite.
+    // no merge finished; every one on disk before the rewrite. Collected,
+    // whichever way: the controller buys by attach once the files on disk
+    // and the build in flight cover the keys, and a build collected after
+    // that is installed and not left dormant, so a wait for three dormant
+    // files lost to the purchase whenever the third build was slow -- seven
+    // runs of sixteen beside two other builds on four cores, at the commit
+    // before this as at this one, and none alone.
     let partitions = db.zpage_counts().partitions;
     assert!(partitions == 3, "{what}: {:?}", db.zpage_counts());
     assert!(
-        tick_until(&db, 400, |c| c.prebuilt >= partitions
-            && c.build_starts >= partitions),
+        tick_until_built(&db, |c| c.build_collected >= partitions
+            && c.build_starts >= partitions
+            && c.builds >= partitions),
         "{what}: the load's partitions not built ahead: {:?}",
         db.zpage_counts()
+    );
+    assert!(
+        form_files(&dir).len() as u64 >= partitions,
+        "{what}: a file beside every partition before the rewrite: {:?}",
+        form_files(&dir)
     );
     wait_for("the builds ahead to end", || !db.zpage_build_waiting());
     let starts = db.zpage_counts().build_starts;
