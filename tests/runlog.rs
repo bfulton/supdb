@@ -98,6 +98,7 @@ fn names(d: &Path, prefix: &str) -> Vec<String> {
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .filter(|n| n.starts_with(prefix))
+        .filter(|n| prefix != "direct-" || common::is_run_file(d, n))
         .collect();
     v.sort();
     v
@@ -486,6 +487,7 @@ fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
         Options {
             sync: SyncPolicy::Always,
             adaptive_shape: false,
+            run_spare: false,
             ..common::options()
         },
     )
@@ -527,6 +529,7 @@ fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
         Options {
             sync: SyncPolicy::EveryN(4),
             adaptive_shape: false,
+            run_spare: false,
             ..common::options()
         },
     )
@@ -597,6 +600,7 @@ fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
         Options {
             sync: SyncPolicy::EveryN(4),
             adaptive_shape: false,
+            run_spare: false,
             ..common::options()
         },
     )
@@ -627,6 +631,7 @@ fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
         &d,
         Options {
             adaptive_shape: false,
+            run_spare: false,
             ..buffered()
         },
     )
@@ -651,13 +656,124 @@ fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
     // flush is answered behind the landing, whose own directory barrier
     // carries every name in it.
     let d = dir("name-never");
-    let mut db = Db::create(&d, buffered()).unwrap();
+    let mut db = Db::create(
+        &d,
+        Options {
+            run_spare: false,
+            ..buffered()
+        },
+    )
+    .unwrap();
     for b in 0..4 {
         ordered_batch(&mut db, b);
     }
     db.flush().unwrap();
     assert_eq!(db.seal_waits().run_names, 0);
     db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The same promise kept by the spare (`Options::run_spare`): a store
+/// makes the next run's temp name empty before a directory fsync it makes
+/// anyway -- the creation's, a landing's -- and a run that takes a spare
+/// such an fsync has covered owes its name no barrier of its own. A spare
+/// no fsync has reached yet is a name like any other, and pays the
+/// barrier. A crash leaves the spare empty, and the open takes it for its
+/// own next run, refused or not, removing nothing a refused open would
+/// have to put back.
+#[test]
+fn a_spare_a_directory_fsync_has_covered_owes_its_run_no_barrier() {
+    let d = dir("name-spare");
+    let mut db = Db::create(
+        &d,
+        Options {
+            sync: SyncPolicy::Always,
+            adaptive_shape: false,
+            ..common::options()
+        },
+    )
+    .unwrap();
+    db.hold_seal_landing(true);
+    let spare = run_file(&d, 0);
+    assert_eq!(
+        std::fs::metadata(&spare).map(|m| m.len()).ok(),
+        Some(0),
+        "the creation's spare"
+    );
+    ordered_batch(&mut db, 0);
+    assert_eq!(db.seal_waits().run_spares, 1, "the run took the spare");
+    assert_eq!(
+        db.run_names_unsynced(),
+        (Some(false), 0),
+        "a synced commit was acknowledged into a run whose name nothing promises"
+    );
+    assert_eq!(
+        db.seal_waits().run_names,
+        0,
+        "the creation's directory fsync promised the spare's name"
+    );
+    ordered_batch(&mut db, 1);
+    db.put(&key(0), b"closes the run");
+    db.commit().unwrap();
+    // The close made the next spare, and nothing has fsynced the directory
+    // since: the seal's landing is held.
+    db.seal().unwrap();
+    ordered_batch(&mut db, 2);
+    assert_eq!(
+        db.seal_waits().run_spares,
+        1,
+        "a spare counts as promised only behind a directory fsync"
+    );
+    assert_eq!(db.run_names_unsynced(), (Some(false), 0));
+    assert_eq!(
+        db.seal_waits().run_names,
+        1,
+        "a spare no directory fsync had reached was promised by nothing"
+    );
+    db.put(&key(1), b"closes the run");
+    db.commit().unwrap();
+    let left: Vec<String> = std::fs::read_dir(&d)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("direct-"))
+        .filter(|n| std::fs::metadata(d.join(n)).unwrap().len() == 0)
+        .collect();
+    assert_eq!(left.len(), 1, "the next run's spare: {left:?}");
+    db.crash();
+
+    // The open takes the spare it finds for its own next run, and the
+    // run's first commit is promised by the open's own directory fsync or
+    // pays its barrier: either way nothing more is made.
+    let mut db = Db::open(
+        &d,
+        Options {
+            sync: SyncPolicy::Always,
+            adaptive_shape: false,
+            ..common::options()
+        },
+    )
+    .unwrap();
+    assert!(holds(&db, 2), "the second run across the crash");
+    assert_eq!(values(&db, &key(1)), vec![b"closes the run".to_vec()]);
+    assert!(
+        d.join(&left[0]).exists(),
+        "the open kept the spare it found"
+    );
+    db.flush().unwrap();
+    ordered_batch(&mut db, 3);
+    assert_eq!(
+        db.seal_waits().run_spares,
+        1,
+        "the run took the kept spare, promised"
+    );
+    assert!(!d.join(&left[0]).exists() || std::fs::metadata(d.join(&left[0])).unwrap().len() > 0);
+    assert_eq!(db.run_names_unsynced(), (Some(false), 0));
+    assert_eq!(
+        db.seal_waits().run_names,
+        0,
+        "the flush's landing fsynced the directory after the kept spare"
+    );
+    drop(db);
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -701,6 +817,7 @@ fn a_barrier_that_fails_is_made_by_a_guard() {
     let opts = inline(Options {
         sync: SyncPolicy::Always,
         adaptive_shape: false,
+        run_spare: false,
         ..common::options()
     });
     let mut db = Db::create(&d, opts.clone()).unwrap();
@@ -758,6 +875,7 @@ fn a_barrier_whose_guard_fails_is_kept() {
             inline(Options {
                 sync: SyncPolicy::Always,
                 adaptive_shape: false,
+                run_spare: false,
                 ..common::options()
             }),
         )
