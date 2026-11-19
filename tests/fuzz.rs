@@ -642,6 +642,11 @@ fn opts(c: &Cfg) -> Options {
         promote_starts: c.hot_starts,
         zpages_store_all: c.store_all,
         scan_start_cache: if c.start_cache { 4096 } else { 0 },
+        // The block form unless the seed draws the other (`opts_z`,
+        // `ZFUZZ_STRIDE`), whichever the engine ships: the pair is read
+        // through both by the two draws, and a re-code policy, which the
+        // engine refuses beside the stride form, is drawn only without it.
+        zpages_stride: supdb::ZStride::Off,
         ..Options::default()
     };
     if let Some(i) = c.inline_bytes {
