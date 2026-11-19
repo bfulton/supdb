@@ -2221,6 +2221,12 @@ pub(crate) fn remove_file(path: impl AsRef<Path>) -> Result<()> {
     if GUARDED.load(Ordering::Relaxed) != 0 {
         unguard(path)?;
     }
+    #[cfg(test)]
+    if tests::fails_after_unguard(path) {
+        return Err(Error::other(
+            "a test's failure between the guard's unlink and the file's",
+        ));
+    }
     match locate(path) {
         None => std::fs::remove_file(path),
         Some((v, name)) if passes(&name) => std::fs::remove_file(v.real.join(name)),
@@ -2721,6 +2727,53 @@ pub(crate) fn hold(dir: impl AsRef<Path>) -> Option<pager::Hold> {
 pub(crate) mod tests {
     use super::*;
     use crate::bytes::Bytes;
+
+    /// A test's: the next `remove_file` of this path fails between its
+    /// guard's unlink and its own, the state a crash between the two
+    /// leaves. By path, so a test beside it removing its own files is not
+    /// the one that fails.
+    static FAIL_AFTER_UNGUARD: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+    pub(crate) fn fails_after_unguard(path: &Path) -> bool {
+        let mut f = FAIL_AFTER_UNGUARD.lock().unwrap_or_else(|e| e.into_inner());
+        if f.as_deref() == Some(path) {
+            *f = None;
+            return true;
+        }
+        false
+    }
+
+    /// A guarded file's removal unlinks the guard first: stopped between
+    /// the two, the file stands with no guard, a name an open reads as it
+    /// always did, and never a guard whose file has gone, which an open
+    /// gives the name back to.
+    #[test]
+    fn a_guard_goes_before_its_file() {
+        let d = std::env::temp_dir().join(format!("supdb-vault-unguard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("direct-00000007.tmp");
+        std::fs::write(&f, b"run").unwrap();
+        guard(&f).unwrap();
+        let g = guard_path(&f);
+        assert!(
+            g.exists() && guarded(&f),
+            "premise: the file stands guarded"
+        );
+        *FAIL_AFTER_UNGUARD.lock().unwrap() = Some(f.clone());
+        assert!(
+            remove_file(&f).is_err(),
+            "the removal stopped between its unlinks"
+        );
+        assert!(f.exists(), "the file stands");
+        assert!(
+            !g.exists() && !guarded(&f),
+            "and its guard has gone before it"
+        );
+        remove_file(&f).unwrap();
+        assert!(!f.exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     /// A cipher for the tests: a keystream and a tag that are functions of
     /// the key, the nonce, the associated data and the bytes, and nothing

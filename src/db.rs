@@ -7416,6 +7416,12 @@ fn wal_seed(id: u64) -> u32 {
 /// Frame kinds. A batch is the frames between commit frames, and replay
 /// applies a batch only once its commit frame has been read intact.
 const WAL_PUT: u8 = 0;
+/// The empty file a store leaves where it kept a directory failure it could
+/// not guard (`Db::guard_names`): the next open guards every log file and
+/// run temp name it lists, syncs the directory and removes it. Not under
+/// a cipher, where a name the vault does not class is held in memory.
+const DIR_LOST_MARK: &str = "dir-lost";
+
 /// `Db::fail_guard`'s values, a test's: the guard's link fails, or the
 /// directory's fsync after the guards.
 const GUARD_FAIL_LINK: u8 = 1;
@@ -36502,6 +36508,17 @@ impl Db {
                 failed.kind(),
                 format!("{failed}, and the names it was for could not be guarded: {e}"),
             );
+            // A mark for the next open, made after the failure so that a
+            // sync can cover it: in the same boot the names the failure was
+            // for read as there, and that open guards them
+            // (`DIR_LOST_MARK`). Where the directory takes no new entry
+            // either, nothing more is promised than without it.
+            if vault::under(&self.dir).is_none() {
+                let mark = self.dir.join(DIR_LOST_MARK);
+                if vault::create(&mark).is_ok() {
+                    let _ = vault::sync_dir(&self.dir);
+                }
+            }
             return Err(self.keep_lost(kept));
         }
         Ok(())
@@ -37476,6 +37493,24 @@ impl Db {
         // open that refuses here would have done for nothing.
         if held.is_none() {
             Db::unnamed_refusals(dir, taken, sealed, &live, &on_disk, &listed)?;
+        }
+        // The last life kept a directory failure it could not guard
+        // (`DIR_LOST_MARK`): its names, seen here in the kernel's cache, may
+        // be ones the failed fsync dropped, which an fsync through this
+        // open's descriptor says nothing of. Each log file and run temp
+        // name gets a guard, a new entry the sync after it covers, before
+        // the mark goes.
+        if held.is_none() && listed.iter().any(|n| n == DIR_LOST_MARK) {
+            for n in &listed {
+                let ours = (n.starts_with("wal-") && !n.ends_with(".aside"))
+                    || (n.starts_with("direct-") && n.ends_with(".tmp"));
+                if ours {
+                    vault::guard(&dir.join(n))?;
+                }
+            }
+            vault::sync_dir(dir)?;
+            vault::remove_file(dir.join(DIR_LOST_MARK))?;
+            listed.retain(|n| n != DIR_LOST_MARK);
         }
         // The store is what the slot taken names: from here the open
         // removes what nothing names and writes what it owes.
