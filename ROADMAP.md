@@ -275,16 +275,19 @@ What an engine picker would hit, roughly in order.
   lost header, by hand. Done when a test counts the process's
   fdatasyncs of the store's files across an open, without a seam the
   path has to remember to call.
-- [ ] **A zeroed first sector over frames that verify behind it.** An
+- [x] **A zeroed first sector over frames that verify behind it.** An
   open reads a log file whose first sector is zeroes as a log with
-  nothing in it and cuts it, the newest file included, whatever lies
-  behind the sector. A power cut leaves that state only over frames no
-  sync covered; media damage to a synced sector leaves it over frames
-  that were acknowledged, and the open cannot tell the two apart from
-  the file, since the policy that wrote it is the last life's. Done when
-  such a file whose bytes past the sector hold a commit frame that
-  verifies is set aside under a name of its own and named in the open's
-  refusal or its counters, not cut.
+  nothing in it and cuts it, whatever lies behind the sector. A power
+  cut leaves that state only over frames no sync covered; media damage
+  to a synced sector leaves it over frames that were acknowledged, and
+  the open cannot tell the two apart from the file. A file whose bytes
+  past the sector hold a commit frame that verifies under its id's seed
+  is copied whole to `wal-<id>.aside`, synced, before the replay's cut,
+  and counted (`SealWaits::wal_set_aside`); the open goes on as before,
+  since the power cut's store must open. Not under a cipher, where a
+  name the vault does not class is held in memory and lost at the close
+  (`a_lost_first_sector_over_frames_that_verify_is_set_aside_and_not_cut`,
+  `tests/durable.rs`).
 - [x] **A helper sync in flight when the run's commit syncs.** The
   helper thread behind a segment's writer syncs the file through an open
   file description of its own (the file opened again through

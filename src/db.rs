@@ -7339,6 +7339,66 @@ const WAL_LOST_SECTOR: usize = 512;
 /// whole there, and so does a recycled file's header, rewritten in place
 /// over one an earlier life synced; a file the open itself begins is not
 /// written through, and reads by this rule as any fresh file does.
+/// Whether a log file of id `id` whose first sector is zeroes holds a commit
+/// frame that verifies anywhere behind it (`wal_head_lost`): a power cut
+/// that kept a page of frames no sync covered leaves one, and so does
+/// damage to a synced first sector over frames that were acknowledged, and
+/// the file cannot say which, since the policy that wrote it was the last
+/// life's. Every offset is tried, the sector having taken the first
+/// frame's length with it; a commit frame's CRC is seeded by the file's id
+/// (`wal_seed`), so another file's frames do not verify here.
+fn wal_commit_behind(buf: &[u8], id: u64) -> bool {
+    let seed = wal_seed(id);
+    let from = WAL_MAGIC.len();
+    if buf.len() < from + FRAME_HEADER + 13 {
+        return false;
+    }
+    (from..=buf.len() - FRAME_HEADER - 13).any(|p| {
+        u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()) == 13 && {
+            let body = &buf[p + FRAME_HEADER..p + FRAME_HEADER + 13];
+            body[8] == WAL_COMMIT
+                && crc32(body) ^ seed == u32::from_le_bytes(buf[p + 4..p + 8].try_into().unwrap())
+        }
+    })
+}
+
+/// The log files of `ids` in `dir` that `wal_commit_behind` finds a commit
+/// behind a lost first sector in, each copied to `wal-<id>.aside` and
+/// synced before the replay cuts it, so that a sector the device damaged
+/// over acknowledged frames leaves them for someone to read. The open goes
+/// on as it would without the copy: a power cut leaves the same bytes, and
+/// a store it left must open. A copy, not a link, since the cut truncates
+/// the inode. The count copied. A store under a cipher keeps no such copy:
+/// a name the vault does not class is held in memory and lost at the close.
+fn wal_set_aside(dir: &Path, ids: &[u64]) -> Result<u64> {
+    if vault::under(dir).is_some() {
+        return Ok(0);
+    }
+    let mut n = 0;
+    for &id in ids {
+        let path = Db::wal_path(dir, id);
+        let mut bytes = Vec::new();
+        if vault::open(&path)
+            .and_then(|mut f| f.read_to_end(&mut bytes))
+            .is_err()
+        {
+            continue;
+        }
+        if bytes.is_empty() || !wal_head_lost(&bytes) || !wal_commit_behind(&bytes, id) {
+            continue;
+        }
+        let aside = dir.join(format!("wal-{id:08}.aside"));
+        let mut f = vault::create(&aside)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        n += 1;
+    }
+    if n > 0 {
+        vault::sync_dir(dir)?;
+    }
+    Ok(n)
+}
+
 fn wal_head_lost(buf: &[u8]) -> bool {
     buf[..buf.len().min(WAL_LOST_SECTOR)]
         .iter()
@@ -19575,6 +19635,7 @@ struct SealCounts {
     /// had carried the name already (`Db::dir_barrier`).
     run_names: AtomicU64,
     run_spares: AtomicU64,
+    wal_set_aside: AtomicU64,
     /// Time the writer spent in the seals its commits started: the wait
     /// for room, the freeze, and the seal's writer half.
     freeze_ns: AtomicU64,
@@ -19606,6 +19667,7 @@ impl SealCounts {
             loose_synced: get(&self.loose_synced),
             run_names: get(&self.run_names),
             run_spares: get(&self.run_spares),
+            wal_set_aside: get(&self.wal_set_aside),
             freeze_ns: get(&self.freeze_ns),
         }
     }
@@ -19664,6 +19726,10 @@ pub struct SealWaits {
     /// Runs opened on a spare whose name a directory fsync had promised
     /// already (`Options::run_spare`), which asked no barrier for it.
     pub run_spares: u64,
+    /// Log files the open found with a first sector of zeroes over a commit
+    /// frame that verifies behind it, kept under `wal-<id>.aside` before
+    /// the replay cut them (`wal_set_aside`).
+    pub wal_set_aside: u64,
     pub freeze_ns: u64,
 }
 
@@ -37652,7 +37718,7 @@ impl Db {
         if !runs.is_empty() {
             let mut chain: Vec<u64> = Vec::new();
             for name in &listed {
-                if let Some(id) = name.strip_prefix("wal-") {
+                if let Some(id) = name.strip_prefix("wal-").filter(|r| !r.ends_with(".aside")) {
                     chain.push(id.parse().map_err(|_| err("wal file name is malformed"))?);
                 }
             }
@@ -37747,7 +37813,7 @@ impl Db {
         let mut spare_extra: Vec<PathBuf> = Vec::new();
         let mut wal_later: Vec<u64> = Vec::new();
         for name in &listed {
-            if let Some(id) = name.strip_prefix("wal-") {
+            if let Some(id) = name.strip_prefix("wal-").filter(|r| !r.ends_with(".aside")) {
                 wal_ids.push(id.parse().map_err(|_| err("wal file name is malformed"))?);
             } else if name.starts_with("spare-") {
                 // A retired WAL kept for recycling. It holds nothing a
@@ -37830,6 +37896,10 @@ impl Db {
             // The runs taken after the log's last frame.
             from = run_held(from, u64::MAX)?;
         }
+        // After the replay, whose refusals leave every file as found, and
+        // before anything below cuts a file or removes one: every log file
+        // listed, the ones past where the log ended included.
+        let set_aside = wal_set_aside(dir, &wal_ids)?;
         wal_ids.truncate(live_wal + 1);
         // The older files whose frames replay applied are loose, as a
         // rotation that left them unsynced would have left them: the first
@@ -38312,6 +38382,7 @@ impl Db {
         if let Some(p) = &db.shared.pager {
             p.check()?;
         }
+        SealCounts::add(&db.shared.seal_counts.wal_set_aside, set_aside);
         db.go_away()?;
         db.start_trimmer();
         if db.opts.malloc_mmap_threshold > 0 {

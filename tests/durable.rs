@@ -4379,6 +4379,61 @@ fn frames_behind_a_lost_first_sector_are_dropped_as_unsynced() {
     }
 }
 
+/// A first sector of zeroes over commit frames that verify behind it: a
+/// power cut that kept a page no sync covered leaves it, and so does damage
+/// to a synced sector over acknowledged frames, and the file cannot say
+/// which. The open goes on as it did, the log read as having nothing in
+/// it, and keeps the file's bytes first under `wal-<id>.aside` and counts
+/// them, so the acknowledged frames are not cut out of existence; a sector
+/// of zeroes with nothing behind it keeps nothing.
+#[test]
+fn a_lost_first_sector_over_frames_that_verify_is_set_aside_and_not_cut() {
+    let d = dir("dur-header-aside");
+    let opts = Options {
+        direct_ingest: false,
+        ..Options::default()
+    };
+    let mut db = Db::create(&made(&d), opts.clone()).unwrap();
+    for i in 0..40u32 {
+        put_commit(&mut db, &format!("k{i:04}"), &"v".repeat(100)).unwrap();
+    }
+    killed(db, &d);
+    let log = d.join("wal-00000000");
+    let was = std::fs::read(&log).unwrap();
+    assert!(was.len() > 4096, "premise: commits behind the first sector");
+    zero_prefix(&log, 512);
+    let damaged = std::fs::read(&log).unwrap();
+    let db = Db::open(&d, opts.clone()).expect("a lost first sector opens as a log of nothing");
+    assert_eq!(db.seal_waits().wal_set_aside, 1, "the file was set aside");
+    drop(db);
+    assert_eq!(
+        std::fs::read(d.join("wal-00000000.aside")).unwrap(),
+        damaged,
+        "the bytes the open found, kept whole"
+    );
+    // Opened again: the copy is no log file and is left where it is.
+    let db = Db::open(&d, opts.clone()).expect("a store beside a file set aside opens");
+    assert_eq!(db.seal_waits().wal_set_aside, 0);
+    drop(db);
+    assert!(d.join("wal-00000000.aside").exists());
+    let _ = std::fs::remove_dir_all(&d);
+
+    // A sector of zeroes and nothing behind it: a log no sync covered.
+    let d = dir("dur-header-aside-none");
+    let db = Db::create(&made(&d), opts.clone()).unwrap();
+    killed(db, &d);
+    zero_prefix(&d.join("wal-00000000"), 512);
+    let db = Db::open(&d, opts).unwrap();
+    assert_eq!(
+        db.seal_waits().wal_set_aside,
+        0,
+        "nothing behind the sector"
+    );
+    drop(db);
+    assert!(!d.join("wal-00000000.aside").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A zero header over a first sector that still holds frames is not a
 /// page a power cut lost -- the page would have gone whole -- but bytes
 /// changed on the device, under acknowledged commits: refused, in words,
