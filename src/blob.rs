@@ -2581,6 +2581,7 @@ impl<B: Bytes> Blob<B> {
     /// the clear: which kind a segment is, is found in the refusal, on the
     /// branch a failed walk takes anyway, and a plain segment's scan makes
     /// no test for it.
+    #[cfg(not(target_family = "wasm"))]
     #[inline(always)]
     pub(crate) fn scan_either<F: FnMut(&[u8], &[u8])>(
         &self,
@@ -2595,6 +2596,7 @@ impl<B: Bytes> Blob<B> {
     }
 
     /// `scan_either`'s other walk, or the error the first one met.
+    #[cfg(not(target_family = "wasm"))]
     #[cold]
     #[inline(never)]
     fn scan_refused<F: FnMut(&[u8], &[u8])>(
