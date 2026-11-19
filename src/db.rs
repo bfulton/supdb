@@ -34337,10 +34337,9 @@ impl Reader {
                         // entries are the block's records; the cursor is
                         // above record `start - 1` and not above `start`,
                         // so no entry between them is skipped.
-                        let at_rank =
-                            self.opts.copy_start_at_rank
-                                && blk.identity_of(seg.blob.id())
-                                && rank != usize::MAX;
+                        let at_rank = self.opts.copy_start_at_rank
+                            && blk.identity_of(seg.blob.id())
+                            && rank != usize::MAX;
                         let i = if !first {
                             0
                         } else if at_rank {
