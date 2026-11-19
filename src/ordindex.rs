@@ -211,18 +211,33 @@ fn head_of(key: &[u8], pfx: usize) -> u64 {
 /// key before writing and a merge emits in key order -- so this costs the
 /// copy and nothing else: 2.2ns a key measured, against the 20.2ns a
 /// separate pass spends reading them back out of the finished segment.
-#[derive(Default)]
 pub struct Builder {
     /// The keys as they arrive, kept only until `finish` knows the common
     /// prefix. They are not written.
-    starts: Vec<u32>,
-    bytes: Vec<u8>,
+    starts: crate::db::blocks::BigVec<u32>,
+    bytes: crate::db::blocks::BigVec<u8>,
     n: usize,
+}
+
+impl Default for Builder {
+    fn default() -> Builder {
+        Builder::new()
+    }
 }
 
 impl Builder {
     pub fn new() -> Builder {
-        Builder::default()
+        Builder::new_in(false)
+    }
+
+    /// `new`, its copies of the keys the engine's own mappings once they
+    /// are large where `mapped` (`Options::jobs_mapped`).
+    pub(crate) fn new_in(mapped: bool) -> Builder {
+        Builder {
+            starts: crate::db::blocks::BigVec::new(crate::db::blocks::Site::IndexStarts, mapped),
+            bytes: crate::db::blocks::BigVec::new(crate::db::blocks::Site::IndexKeys, mapped),
+            n: 0,
+        }
     }
 
     /// Room for `n` keys of about `key_bytes` in all, so the buffers do

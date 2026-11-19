@@ -86,6 +86,11 @@ rocksdb-jemalloc = ["rocksdb/jemalloc"]
 # `zcodec` built with zstd, Snappy and LZAV (`vendor/lzav`, compiled by
 # `build.rs`) beside LZ4. Off for everything the suite measures.
 codecs = ["lz4-c", "dep:zstd", "dep:snap", "dep:cc"]
+# The process's allocations counted by the thread that made them, a
+# `mixthreads` line beside each census (`SUPDB_MIX_CENSUS=2`): whose memory
+# an arena left free and resident was (`src/alloc_census.rs`). A count on
+# every allocation of every arm, so off for everything the suite measures.
+alloc-census = []
 
 [[example]]
 name = "zdecode"

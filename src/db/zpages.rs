@@ -780,14 +780,50 @@ pub fn page_view(page: &[u8]) -> Result<PageView<'_>, ZError> {
 /// for its life, and a callback that reads again makes one of its own, so a
 /// buffer made at [`ZMAX_ULEN`] was 64 KiB zeroed for every thread and every
 /// nested read to hold groups that are a few kilobytes.
+///
+/// A reader handle's memo may keep its groups in the cells of a slab
+/// instead (`in_cell`, `Options::zpages_memo_slab`): a cell is the bytes
+/// while a group fits it, and a group that does not sends the buffer back
+/// to words of its own, the cell handed back.
 pub struct GroupBuf {
     words: Vec<u64>,
+    cell: Option<super::blocks::SlabCell>,
 }
 
 impl GroupBuf {
     /// An empty buffer, which the first group decoded into it sizes.
     pub fn new() -> GroupBuf {
-        GroupBuf { words: Vec::new() }
+        GroupBuf {
+            words: Vec::new(),
+            cell: None,
+        }
+    }
+
+    /// A buffer whose bytes are `cell`'s, for the groups that fit it.
+    pub(crate) fn in_cell(cell: super::blocks::SlabCell) -> GroupBuf {
+        GroupBuf {
+            words: Vec::new(),
+            cell: Some(cell),
+        }
+    }
+
+    /// Where the buffer's bytes begin, aligned for words: the cell's
+    /// where it holds one, else the words'.
+    #[inline]
+    fn base(&self) -> *const u8 {
+        match &self.cell {
+            Some(c) => c.as_ptr(),
+            None => self.words.as_ptr() as *const u8,
+        }
+    }
+
+    /// `base`, to write through.
+    #[inline]
+    fn base_mut(&mut self) -> *mut u8 {
+        match &self.cell {
+            Some(c) => c.as_ptr(),
+            None => self.words.as_mut_ptr() as *mut u8,
+        }
     }
 
     /// The first `n` bytes of the buffer, grown to hold them. Not zeroed
@@ -795,17 +831,19 @@ impl GroupBuf {
     /// nothing beyond it is ever lent. `n` is at most [`ZMAX_ULEN`], which
     /// the header's check has seen to.
     fn bytes_for(&mut self, n: usize) -> &mut [u8] {
-        let words = n.div_ceil(8);
-        if self.words.len() < words {
+        if self.capacity_bytes() < n {
             // Whole pages, so that groups a few bytes apart in size grow the
             // buffer once and not once each. The old contents are not kept:
-            // nothing is lent from a buffer between two decodes.
-            self.words = vec![0; words.next_multiple_of(ZPAGE / 8)];
+            // nothing is lent from a buffer between two decodes. A cell
+            // does not grow: the group goes to words and the cell back.
+            self.cell = None;
+            self.words = vec![0; n.div_ceil(8).next_multiple_of(ZPAGE / 8)];
         }
-        // SAFETY: `words` owns at least `n` initialised bytes, `u8` has no
-        // alignment to violate, and the borrow of `self` is the only access
-        // while the slice lives.
-        unsafe { std::slice::from_raw_parts_mut(self.words.as_mut_ptr() as *mut u8, n) }
+        // SAFETY: the buffer owns at least `n` initialised bytes -- its
+        // words, or its cell, zero at first and written since -- `u8` has
+        // no alignment to violate, and the borrow of `self` is the only
+        // access while the slice lives.
+        unsafe { std::slice::from_raw_parts_mut(self.base_mut(), n) }
     }
 }
 
@@ -815,11 +853,11 @@ impl GroupBuf {
     /// group's end that grows the buffer no further than the group does.
     fn bytes_with_slack(&mut self, n: usize, slack: usize) -> &mut [u8] {
         self.bytes_for(n);
-        let room = (self.words.len() * 8).min(n + slack);
-        // SAFETY: `bytes_for` left `words` owning at least `room` initialised
-        // bytes, `u8` has no alignment to violate, and the borrow of `self`
-        // is the only access while the slice lives.
-        unsafe { std::slice::from_raw_parts_mut(self.words.as_mut_ptr() as *mut u8, room) }
+        let room = self.capacity_bytes().min(n + slack);
+        // SAFETY: `bytes_for` left the buffer owning at least `room`
+        // initialised bytes, `u8` has no alignment to violate, and the
+        // borrow of `self` is the only access while the slice lives.
+        unsafe { std::slice::from_raw_parts_mut(self.base_mut(), room) }
     }
 
     /// Its first [`STRIDE_KEY_MAX`] bytes as the last write left them, the
@@ -828,13 +866,14 @@ impl GroupBuf {
     /// stride file, with no group to decode, leaves to it. Only the first
     /// call grows a buffer, so a key rendered into it is there at the next.
     pub fn stride_key(&mut self) -> &mut [u8; STRIDE_KEY_MAX] {
-        if self.words.len() * 8 < STRIDE_KEY_MAX {
+        if self.capacity_bytes() < STRIDE_KEY_MAX {
             self.grow_for_stride_key();
         }
-        // SAFETY: `words` owns at least `STRIDE_KEY_MAX` initialised bytes,
-        // grown above where it did not, `u8` has no alignment to violate,
-        // and the borrow of `self` is the only access while the array lives.
-        unsafe { &mut *(self.words.as_mut_ptr() as *mut [u8; STRIDE_KEY_MAX]) }
+        // SAFETY: the buffer owns at least `STRIDE_KEY_MAX` initialised
+        // bytes, grown above where it did not, `u8` has no alignment to
+        // violate, and the borrow of `self` is the only access while the
+        // array lives.
+        unsafe { &mut *(self.base_mut() as *mut [u8; STRIDE_KEY_MAX]) }
     }
 
     /// `stride_key`'s growth, once a thread's buffer, out of line.
@@ -845,9 +884,19 @@ impl GroupBuf {
     }
 
     /// The bytes the buffer holds room for: what the last growth made it,
-    /// in whole pages, and zero before the first decode into it.
+    /// in whole pages, and zero before the first decode into it; or its
+    /// cell's bytes, where it holds one.
     pub fn capacity_bytes(&self) -> usize {
-        self.words.len() * 8
+        match &self.cell {
+            Some(c) => c.len(),
+            None => self.words.len() * 8,
+        }
+    }
+
+    /// Whether a slab's cell holds the bytes (`in_cell`).
+    #[cfg(test)]
+    pub(crate) fn is_cell(&self) -> bool {
+        self.cell.is_some()
     }
 
     /// The first `n` bytes of the buffer as the last decode left them: what
@@ -855,10 +904,10 @@ impl GroupBuf {
     /// since a decode's own borrow ends with the call that made it. `n` is
     /// at most what the last `bytes_for` was asked for.
     pub fn bytes(&self, n: usize) -> &[u8] {
-        assert!(n <= self.words.len() * 8, "a group longer than its buffer");
-        // SAFETY: `words` owns at least `n` initialised bytes and `u8` has
-        // no alignment to violate.
-        unsafe { std::slice::from_raw_parts(self.words.as_ptr() as *const u8, n) }
+        assert!(n <= self.capacity_bytes(), "a group longer than its buffer");
+        // SAFETY: the buffer owns at least `n` initialised bytes and `u8`
+        // has no alignment to violate.
+        unsafe { std::slice::from_raw_parts(self.base(), n) }
     }
 }
 
@@ -5687,6 +5736,48 @@ mod tests {
             verify_page(&page, 9, &entry, &mut buf).map(|h| h.groups),
             Ok(4)
         );
+    }
+
+    /// A buffer in a slab's cell (`GroupBuf::in_cell`) is the cell's bytes
+    /// for every group that fits it, the decoder's room past the group
+    /// inside the cell and no further; a group that does not fit sends the
+    /// buffer to words of its own in whole pages, and the cell goes back to
+    /// its slab.
+    #[test]
+    fn a_group_buffer_in_a_cell_leaves_it_for_a_group_that_does_not_fit() {
+        let slab = super::super::blocks::Slab::new(2240, 2);
+        let mut buf = GroupBuf::in_cell(slab.take().unwrap());
+        assert!(buf.is_cell() && buf.capacity_bytes() == 2240);
+        let at = buf.bytes_for(2048).as_ptr() as usize;
+        assert_eq!(at % 8, 0, "aligned for the extent arrays");
+        buf.bytes_for(2048).fill(3);
+        assert!(buf.is_cell(), "a group that fits stays in the cell");
+        assert!(buf.bytes(2048).iter().all(|&b| b == 3));
+        assert_eq!(buf.bytes(2048).as_ptr() as usize, at);
+        assert_eq!(
+            buf.bytes_with_slack(2048, 192).len(),
+            2240,
+            "the decoder's room, inside the cell"
+        );
+        assert_eq!(
+            buf.bytes_with_slack(2100, 192).len(),
+            2240,
+            "and no further than the cell"
+        );
+        assert_eq!(buf.stride_key().as_ptr() as usize, at);
+        // A group past the cell: words, in whole pages, the cell back.
+        let other = slab.take().expect("the slab's second cell");
+        assert!(slab.take().is_none(), "both cells out");
+        assert_eq!(buf.bytes_for(3000).len(), 3000);
+        assert!(!buf.is_cell() && buf.capacity_bytes() == ZPAGE);
+        let back = slab.take().expect("the cell handed back");
+        assert_eq!(back.as_ptr() as usize, at);
+        assert_ne!(other.as_ptr() as usize, at);
+        // A buffer of words is as it was: no cell, sized by its groups.
+        let mut plain = GroupBuf::new();
+        assert!(!plain.is_cell() && plain.capacity_bytes() == 0);
+        plain.bytes_for(10);
+        assert!(!plain.is_cell() && plain.capacity_bytes() == ZPAGE);
     }
 
     #[test]

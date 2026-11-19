@@ -3653,6 +3653,10 @@ fn census_line(tag: &str, arm: &str, point: &str, e: &dyn Engine, detail: bool) 
         return;
     }
     lag_arenas("lagarenas", arm, point);
+    // Whose the arenas' bytes were: every thread's peak, by its name and
+    // whether it is still there (`alloc_census`), in the build that counts.
+    #[cfg(feature = "alloc-census")]
+    crate::alloc_census::report("mixthreads", arm, point);
     // The anonymous mappings of a megabyte and more, by size: what is
     // resident in each size class says which allocations they are (a
     // thread's heap, a memtable's arena block, a snapshot's, a slab's).
@@ -4169,7 +4173,7 @@ fn threaded(
                 let barrier = &barrier;
                 let share = share(ops, threads, i);
                 let seed = thread_seed(seed, i);
-                s.spawn(move || -> Timed {
+                let work = move || -> Timed {
                     // Every thread reaches the barrier whatever opening
                     // did: one that returned before it would leave the
                     // others and the clock waiting forever, and a panic
@@ -4216,7 +4220,19 @@ fn threaded(
                         (0, 0)
                     };
                     Ok((start, end, bytes, cpu, own))
-                })
+                };
+                // Named in the build that counts allocations by thread
+                // (`alloc_census`), so a reader's are told from a seal's,
+                // whose thread carries the process's name; unnamed
+                // otherwise, as the readers have always been.
+                #[cfg(feature = "alloc-census")]
+                let worker = std::thread::Builder::new()
+                    .name("bench-reader".into())
+                    .spawn_scoped(s, work)
+                    .expect("a reader thread");
+                #[cfg(not(feature = "alloc-census"))]
+                let worker = s.spawn(work);
+                worker
             })
             .collect();
         // The other threads' clocks, read with the readers spawned and

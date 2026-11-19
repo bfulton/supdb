@@ -6,6 +6,8 @@
 //! sizes, and a regression is a row whose error bars lie entirely on the
 //! worse side of the last ten rows' on the same machine class.
 
+#[cfg(feature = "alloc-census")]
+pub mod alloc_census;
 pub mod bound;
 pub mod engines;
 pub mod env;
