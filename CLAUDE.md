@@ -5641,6 +5641,37 @@ to decide between two mechanisms is run before either is built; and a
 budget is held to what its structure costs wherever one is found counting
 what the structure holds -- the memo's was the second.
 
+**A tenant of the bound that no census counted, charged by how a page
+came into the cache.** The stride arm's scrambled D mix under 1 GiB read
+0.77x of the default in twelve pairs of twelve, and three levers were
+built on readings of what its mixes were short of -- the ordered
+indexes' second drop, the jobs' arrays, the readers' memos -- each read
+off the process's bytes by owner or the cache's by file. A rep counted
+by mix (`SUPDB_MIX_COUNTERS`, `SUPDB_MIX_KINDS`) then read the mix in
+two shapes with every counter level, and by that mix both arms' stores
+were in one form, the same bytes in the same files. What split them was
+the group's own `memory.stat` at each pass's start: cache and rss came
+12 MB short of the group's usage in the default and 23 in the arm. The
+rest is kernel memory, which a group is charged for and bounded on with
+everything else (`memory.kmem.usage_in_bytes`), and `/proc/slabinfo`
+named it: 111,000 buffer heads, 104 bytes a block of every page the
+cache held because the process had written it. A page read back from
+the device carries none, so the store's own form files, dropped as they
+are built and asked back, cost nothing there, and a conversion's file,
+written whole into the cache and kept, cost a fortieth of its size for
+as long as it served: 11 MB at that store, and the group at its limit a
+mix early. A conversion's file goes the way the others do under an
+option now (`Options::zpages_convert_drops_output`;
+`scripts/groupmem.py` is the sampler). The rule: a bound is held against
+the group's own usage, and whatever of it the census by owner and the
+residency by file leave unexplained is counted, the kernel's accounts
+being a file's read away, before a lever is built on the part already
+laid to an owner; a page's price under a bound depends on how it came
+into the cache, written or read, which no count of residency shows; and
+a cell that reads behind with every counter level is short of something
+no counter counts, so the next instrument is the accounting a level
+down and not another counter of the same kind.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
