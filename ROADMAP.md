@@ -343,18 +343,19 @@ What an engine picker would hit, roughly in order.
   drops or tears the writes after a chosen point inside a drain with its
   slot owed and a merge publishing behind it, and the store opens to
   every acknowledged write.
-- [ ] **A fall back past a damaged slot under a cipher.** An open holds
-  a segment the slot it takes does not name to what holds its writes,
-  and refuses where nothing does (`Db::unnamed_refusals`); under a
-  cipher such a segment is an envelope whose key was in a slot that
-  failed its check, so it cannot be read, and the open sweeps it as the
-  crash window's. A crash passes over only a slot that never became
-  durable, so this is media damage alone,
-  and the open answers `Ok` with the writes only the damaged slot named
-  missing. Done when a slot under a cipher carries what an open needs to
-  judge such an envelope without its key, or the open keeps the
-  envelopes no slot it read names until a slot is written over the
-  damaged one.
+- [x] **A fall back past a damaged slot under a cipher.** An open holds
+  a segment the slot it takes does not name to what holds its writes;
+  under a cipher such a segment is an envelope whose key was in a slot
+  that failed its check, so it cannot be read, and the open sweeps it.
+  What makes the sweep safe now is that every way a slot passed over can
+  have taken the only other copy of its writes leaves a trace the slot
+  taken can see: a seal's landing retires the log files that held them,
+  which the slot taken needs (`Manifest::needs_log`, `Db::log_refusal`);
+  a run's commits under a cipher are frames of that log
+  (`Db::log_run`); and a merge's or a promotion's landing removes the
+  inputs the slot taken names, which the open refuses as missing
+  (`a_fall_back_under_a_cipher_past_a_slot_whose_log_retired_is_refused`,
+  `tests/cipher.rs`).
 - [ ] **An open after a crash, priced by its parts.** An open that
   finds segments the slot taken does not name, newer than every segment
   it names and within what it covers -- a merge held at its landing by
