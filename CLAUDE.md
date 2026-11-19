@@ -5497,6 +5497,28 @@ ends, and the turn it wakes into did nothing with it
 period is priced by the period times the jobs in its longest chain, and
 a wake that the woken side does not act on is a wake nobody made.
 
+**Both orders agreed, about a cell the options could not reach.** Three
+options that act at the load's end -- a dropped form file asked back, the
+crossing's ask for raw pages, the builder's turn at a job's end -- read
+C at ten million keys under 1.25 GiB at 1.60x and 1.52x of the default,
+five pairs of six, with the arms listed both ways. Nothing in any of
+them runs in C. Each priced alone read C both ways, 0.80x and 1.27x,
+0.69x and 1.56x, whichever arm was listed second ahead, and the default
+beside them read both rates itself: C there is one cell in two shapes,
+by whether the Zipfian's head partition is raw as its reads begin, and
+the count that names the shape was on every table (the reads the
+point-key table answered, 2,500 or 85,000 through the mixes). What
+decided the shape in the traced pair was a threshold at the value it is
+compared with: the fill's quiet look asks for a partition where its raw
+bytes fit the room less a reserve, 43 MB and 94 at that store, and the
+room as the threaded scans end is 130 to 136. The rule: two sittings in
+both orders are a verdict on an option only where the option's own
+mechanism is counted in the cell; where it cannot be, the option is
+split into its parts and each priced alone before the cell is written
+down as its gain, since a cell in two shapes agrees with any option in
+both orders one time in eight; and a cell found on a threshold is
+recorded as the threshold's, with the two values beside each other.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
