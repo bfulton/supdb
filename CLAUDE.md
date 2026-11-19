@@ -3712,7 +3712,19 @@ that the upkeep thread's pass would outlast the commit's fdatasync,
 and on a host whose fsync outlasted the pass every batch was filed at
 the return, two runs of the whole binary in five; it holds the thread
 before its pass now (`hold_upkeep_pass`), and a commit that waited would
-never return, which its watchdog says. The rule: a test that
+never return, which its watchdog says. And as a step: two controller
+tests read the state between the builder's first job and its second by
+the counts after a tick, on the bet that the second waited for the
+controller's next step, a tenth of a second on. With the builder's turn
+at a job's end made the default (`Options::zpages_drive_at_job_end`)
+the second job followed the first in milliseconds and both tests failed
+every run, the gate's first under that default among them; each of the
+three defaults turned off alone named the one. The test of the
+conversion's order holds the first job before its rename and the second
+at its start now, under either turn, and fails on a tick that starts a
+conversion ahead of a partition's own build; the test whose order is
+read off the warms taken in a job a step pins the turn at the step. The
+rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; a mutant's kill is read again once a
 race under the killing test is found, since the race kills mutants too;
@@ -7590,6 +7602,102 @@ cell is read as two shapes with the share of each; a count that reads
 level at the median is read in its pairs column too; and a default is not
 drafted in the tree while its last pairing runs, since a draft taken back
 out is a second edit of the files the fix that follows has to touch.
+
+**A wait on the first counter of a turn, and a fix for it that the race
+made wide refuted.** The tests step the controller by moving its injected
+clock and waiting for the selector's step count to move (`advance_tick`),
+and a tick steps the selector first and its policies look after: the
+hot-raw policy's, the conversion's. The test of the ordered index's second
+drop read, after one such wait, whether the hot-raw policy had asked for a
+partition, between that tick's step and its look: one run in ten beside a
+build, none of ten alone. It surfaced in a run of the whole suite under
+another option's switch and read as that option's for the quarter of an
+hour it took to run the test ten times each way. The first fix waited for
+the look's own count at the one step whose result was read, and passed
+twenty runs of twenty beside the build. Held to the race made wide, sixty
+milliseconds of sleep put before the look, it failed every run and the
+test without it passed every run: the tick before's look, late, ran after
+the test had moved the budget and heated the partition, and asked a tick
+early, which the unfixed test read as the ask it was waiting for and the
+fixed one waited past, into the release. Every tick's wait has to cover
+the tick, not the one whose counts are read. A tick counts its end now
+(`ZCounts::tick_ends`), behind its builder's turn and its looks, and the
+tests' wait is on that; the test passes with the sleep in. The rules: a
+wait covers everything of the turn that the test will read, and
+everything of it that reads what the test changes next, so it names the
+counter the turn moves last; a fix for a race is held to the race made
+wide before it is believed, since a fix that narrows the window passes
+every run that the unfixed test passes; and a failure met under a switch
+is run without the switch, as many times, before it is the switch's.
+
+**A lever built for the largest peak known, before a count said whose
+memory stayed.** At ten million keys under 1 GiB the allocator held 57-68
+MB free and resident through the mixes, in arenas of one free chunk each,
+and a group at its limit faulted on form files for the want of it. A
+merge's thread peaks at 84 MB in the allocator, by a probe that counts by
+thread, so the arenas were read as the jobs': the jobs' large arrays were
+made mappings of the engine's own (`Options::jobs_mapped`), tested,
+mutated and gated, and a traced rep with them read the same free bytes at
+the same mixes. The diagnostic queued to tell the allocator's two
+behaviours apart had been cancelled to compile the lever sooner. The next
+reading took the arenas' sizes, 7.5 to 8.3 MB beside a memo budgeted at
+eight, for the readers' memos, and the memos went into slabs
+(`Options::zpages_memo_slab`), also tested, mutated and gated; the traced
+rep with those read more free bytes, not fewer, and its pairing read a
+cell behind in both orders for a policy that had stopped firing. What
+answered the question was three counts no reading of sizes replaces, each
+an hour or less to make: the allocator on its own (`bench/examples/arena.rs`:
+a dead arena keeps all a thread held under the trim threshold and nothing
+over it, and `malloc_trim` returns none of it), every allocation by its
+thread in the suite's own shape (`alloc-census`: the readers 17 to 24 MB,
+the seals 14 to 16, the closes 8), and the arm that already made the
+allocator return everything, paired for the ceiling (`supdb-mmapthr`: the
+read pass after the load a third faster, two write mixes a twelfth
+slower, the rest level). The arenas were several owners', what stood
+varied threefold between reps of one arm by which thread took whose arena
+next, a smaller reader left more behind than a larger one because the
+larger freed a seal's arena past the threshold, and the whole of it was
+worth less than either lever had been built to win. The rules: memory
+that stays is laid to its owner by a count by thread, in the suite's
+shape and the phase it stays in, before a lever is built on the largest
+peak anyone has measured; a quantity that varies between reps of one arm
+is read over several before one rep attributes it; the ceiling of a
+family of levers is priced by the cheapest arm that reaches it before any
+member is built, and here that arm was in the tree; a diagnostic queued
+to decide between two mechanisms is run before either is built; and a
+budget is held to what its structure costs wherever one is found counting
+what the structure holds -- the memo's was the second.
+
+**A tenant of the bound that no census counted, charged by how a page
+came into the cache.** The stride arm's scrambled D mix under 1 GiB read
+0.77x of the default in twelve pairs of twelve, and three levers were
+built on readings of what its mixes were short of -- the ordered
+indexes' second drop, the jobs' arrays, the readers' memos -- each read
+off the process's bytes by owner or the cache's by file. A rep counted
+by mix (`SUPDB_MIX_COUNTERS`, `SUPDB_MIX_KINDS`) then read the mix in
+two shapes with every counter level, and by that mix both arms' stores
+were in one form, the same bytes in the same files. What split them was
+the group's own `memory.stat` at each pass's start: cache and rss came
+12 MB short of the group's usage in the default and 23 in the arm. The
+rest is kernel memory, which a group is charged for and bounded on with
+everything else (`memory.kmem.usage_in_bytes`), and `/proc/slabinfo`
+named it: 111,000 buffer heads, 104 bytes a block of every page the
+cache held because the process had written it. A page read back from
+the device carries none, so the store's own form files, dropped as they
+are built and asked back, cost nothing there, and a conversion's file,
+written whole into the cache and kept, cost a fortieth of its size for
+as long as it served: 11 MB at that store, and the group at its limit a
+mix early. A conversion's file goes the way the others do under an
+option now (`Options::zpages_convert_drops_output`;
+`scripts/groupmem.py` is the sampler). The rule: a bound is held against
+the group's own usage, and whatever of it the census by owner and the
+residency by file leave unexplained is counted, the kernel's accounts
+being a file's read away, before a lever is built on the part already
+laid to an owner; a page's price under a bound depends on how it came
+into the cache, written or read, which no count of residency shows; and
+a cell that reads behind with every counter level is short of something
+no counter counts, so the next instrument is the accounting a level
+down and not another counter of the same kind.
 
 ## Standing limitations
 

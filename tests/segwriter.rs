@@ -362,6 +362,75 @@ fn the_write_piece_changes_how_a_segment_is_written_and_not_what() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Where the writer's per-key arrays and its trailer live
+/// (`SegmentOptions::buffers_mapped`) changes nothing of the segment: in
+/// either layout, with enough keys that every one of the arrays is a
+/// mapping where the option says so, the file is the same bytes; and the
+/// arrays did become mappings there, and none anywhere else in this
+/// binary, whose other tests leave the option off.
+#[test]
+fn where_the_writers_arrays_live_changes_nothing_of_the_segment() {
+    let _serial = serial();
+    let dir = scratch("buffers");
+    let data = fixed(40_000, 8, 31);
+    for (layout, inline) in [("records first", INLINE), ("blocks first", 0)] {
+        let mut files: Vec<Vec<u8>> = Vec::new();
+        for mapped in [false, true] {
+            let path = dir.join(format!("buffers-{inline}-{mapped}.sup"));
+            let count = |site: &str| -> usize {
+                supdb::Db::job_buffers_mapped()
+                    .iter()
+                    .find(|(s, _)| *s == site)
+                    .map(|&(_, n)| n)
+                    .unwrap_or_else(|| panic!("no site {site}"))
+            };
+            // The keys' copy and their spans in either layout; the
+            // offsets, the hashes and the trailer beside them where the
+            // records stream.
+            let sites: &[&str] = if inline > 0 {
+                &[
+                    "writer keys",
+                    "writer spans",
+                    "writer offsets",
+                    "writer hashes",
+                    "trailer",
+                ]
+            } else {
+                &["writer keys", "writer spans"]
+            };
+            let before: Vec<usize> = sites.iter().map(|s| count(s)).collect();
+            write_bulk_with(
+                &path,
+                &data,
+                SegmentOptions {
+                    buffers_mapped: mapped,
+                    ..opts()
+                },
+                inline,
+            );
+            for (site, was) in sites.iter().zip(before) {
+                let made = count(site) - was;
+                if mapped {
+                    assert_eq!(made, 1, "{layout}: the {site} array a mapping");
+                } else if !common::jobs_mapped_switch() {
+                    // Under the switch the stores of the tests beside
+                    // this one map theirs, and the count is the process's.
+                    assert_eq!(made, 0, "{layout}: off, {site} is no mapping");
+                }
+            }
+            files.push(without_the_clock(&std::fs::read(&path).unwrap()));
+        }
+        let first = files[0].iter().zip(&files[1]).position(|(x, y)| x != y);
+        assert!(
+            files[0].len() == files[1].len() && first.is_none(),
+            "{layout}: the mapped arrays wrote another segment: lengths {} and {}, first difference at {first:?}",
+            files[0].len(),
+            files[1].len()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_record_put_in_one_call_is_the_record_the_three_calls_write() {
     // `put_one` streams a one-value record from the caller's slices;

@@ -1273,6 +1273,40 @@ pub fn stream_trailer<'a>(
     generation: u64,
     lookahead: bool,
 ) -> Option<(Vec<u8>, Vec<u8>, usize)> {
+    stream_trailer_in(Vec::new(), n, recs_len, key_at, each, generation, lookahead)
+}
+
+/// The buffer a trailer is composed in: what `stream_trailer_in` asks of
+/// it. A trailer is the directory's four bytes a key and the hash slots
+/// beside them, twenty to forty bytes a key held from the finish's fill
+/// to its write, so the caller says where that lives.
+pub trait TrailerBuf: std::ops::DerefMut<Target = [u8]> {
+    /// `n` bytes long, the new ones `v`.
+    fn resize(&mut self, n: usize, v: u8);
+    fn extend_from_slice(&mut self, s: &[u8]);
+}
+
+impl TrailerBuf for Vec<u8> {
+    fn resize(&mut self, n: usize, v: u8) {
+        Vec::resize(self, n, v)
+    }
+    fn extend_from_slice(&mut self, s: &[u8]) {
+        Vec::extend_from_slice(self, s)
+    }
+}
+
+/// `stream_trailer` into the caller's buffer `t`, handed over empty and
+/// handed back holding the trailer: the same bytes whatever the buffer.
+pub fn stream_trailer_in<'a, B: TrailerBuf>(
+    mut t: B,
+    n: usize,
+    recs_len: usize,
+    key_at: &dyn Fn(usize) -> &'a [u8],
+    each: &mut dyn FnMut(usize) -> (u32, u64),
+    generation: u64,
+    lookahead: bool,
+) -> Option<(Vec<u8>, B, usize)> {
+    debug_assert!(t.is_empty(), "a trailer composed into an empty buffer");
     if recs_len > MAX_RECS {
         return None;
     }
@@ -1280,9 +1314,8 @@ pub fn stream_trailer<'a>(
     let cap = hash_cap_for(n)?;
     let mask = cap - 1;
 
-    let mut t: Vec<u8> = Vec::new();
     let mut at = recs_off + recs_len; // absolute section offset of t's end
-    fn pad_to(t: &mut Vec<u8>, at: &mut usize, align: usize) {
+    fn pad_to<B: TrailerBuf>(t: &mut B, at: &mut usize, align: usize) {
         let want = align_up(*at, align);
         t.resize(t.len() + (want - *at), 0);
         *at = want;

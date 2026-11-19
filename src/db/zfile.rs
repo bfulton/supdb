@@ -2359,6 +2359,19 @@ impl From<bool> for MemoShape {
 pub(super) const ZMEMO_SLOTS: usize = 4096;
 pub(super) const ZMEMO_BYTES: usize = 8 << 20;
 const ZMEMO_FREE: usize = 4;
+/// The cells a memo's slab holds past its slots and its free buffers
+/// (`Options::zpages_memo_slab`): for the groups its slots have let go
+/// that a read in flight still holds, a cursor's and a nested read's.
+const ZMEMO_HELD: usize = 12;
+
+/// The cell a memo's slab keeps a group in (`Options::zpages_memo_slab`),
+/// for groups cut at `group_bytes` decoded bytes: the cut, which no group
+/// of more than one record passes, and the room past its end the decoder's
+/// flat loop runs into (`zlz4::FLAT_SLACK`). None where a page is one
+/// group, which a cell that size would be most of.
+pub(super) fn memo_cell_bytes(group_bytes: usize) -> Option<usize> {
+    (group_bytes > 0 && group_bytes < ZPAGE).then(|| group_bytes + super::zlz4::FLAT_SLACK)
+}
 
 /// The memo of decoded groups (3.7): a reader handle's, direct-mapped over
 /// its slots and capped at `cap` bytes of the groups it holds, keyed by the
@@ -2395,6 +2408,11 @@ struct Memo {
     /// time, read a tenth slower with the memo than without it for that
     /// alone.
     free: Vec<GroupBuf>,
+    /// The cell a decoded group is kept in under
+    /// `Options::zpages_memo_slab`, in bytes, or zero for buffers of the
+    /// allocator's; and the slab of them, made at the first decode.
+    slab_cell: usize,
+    slab: Option<super::blocks::Slab>,
     hits: u64,
     misses: u64,
     /// E2's footprint (design 4.7): while the handle reads the compact form
@@ -2555,6 +2573,8 @@ impl Memo {
             bytes: 0,
             sweep: 0,
             free: Vec::new(),
+            slab_cell: 0,
+            slab: None,
             hits: 0,
             misses: 0,
             track: false,
@@ -2702,9 +2722,23 @@ impl Memo {
         }
     }
 
-    /// A buffer for a decode: a displaced entry's, or a new one.
+    /// A buffer for a decode: a displaced entry's, or a new one -- a cell
+    /// of the memo's slab where it keeps one (`Options::zpages_memo_slab`),
+    /// which holds a cell for every slot and the few buffers in flight
+    /// beside them, and a buffer of the allocator's where every cell is
+    /// out, a read still holding the groups the slots let go.
     fn take_free(&mut self) -> GroupBuf {
-        self.free.pop().unwrap_or_default()
+        if let Some(b) = self.free.pop() {
+            return b;
+        }
+        if self.slab_cell == 0 {
+            return GroupBuf::default();
+        }
+        let (cell, cells) = (self.slab_cell, self.n + ZMEMO_FREE + ZMEMO_HELD);
+        let slab = self
+            .slab
+            .get_or_insert_with(|| super::blocks::Slab::new(cell, cells));
+        slab.take().map(GroupBuf::in_cell).unwrap_or_default()
     }
 
     /// The entry a put for `(zfile, page, index)` would displace, the line
@@ -2909,6 +2943,14 @@ impl ZMemo {
             stride: Cell::new(StrideCounts::default()),
             tally: Cell::new(TallyPtr(std::ptr::null())),
         }
+    }
+
+    /// The memo keeping its decoded groups in the cells of a slab of its
+    /// own, `cell` bytes each (`Options::zpages_memo_slab`,
+    /// `memo_cell_bytes`); none leaves them the allocator's.
+    pub(super) fn slab(self, cell: Option<usize>) -> ZMemo {
+        self.memo.borrow_mut().slab_cell = cell.unwrap_or(0);
+        self
     }
 
     /// The memo with a walk's admission set (`Options::zpages_scan_admit`),
@@ -6161,6 +6203,9 @@ pub(super) struct ZEvents {
     /// (`ZCounts::dropped_asks`).
     pub dropped_asks: AtomicU64,
     pub dropped_ask_bytes: AtomicU64,
+    /// Conversions whose file its build dropped and the collect asked back
+    /// (`ZCounts::convert_dropped`).
+    pub convert_dropped: AtomicU64,
     /// The builder's turns taken at a job's end between two steps
     /// (`ZCounts::job_end_drives`).
     pub job_end_drives: AtomicU64,
@@ -6216,6 +6261,9 @@ pub(super) struct ZEvents {
     pub phase: AtomicU64,
     pub census: AtomicU64,
     pub sel_steps: AtomicU64,
+    /// The ticks that stepped the selector and have ended, their builder's
+    /// turn and their policies' looks done (`ZCounts::tick_ends`).
+    pub tick_ends: AtomicU64,
     pub sel_s1: AtomicU64,
     pub sel_switches: AtomicU64,
     pub sel_trials: AtomicU64,
@@ -11584,6 +11632,85 @@ mod tests {
         let p = both.take_point();
         assert!(p.parts > 0 && p.admits > 0 && p.key_hits > 0, "{p:?}");
         assert!(!zfile.damaged() && zfile.bad_pages() == 0);
+    }
+
+    /// With a slab (`Options::zpages_memo_slab`) every buffer the memo
+    /// makes for a decode is one of its cells, sized to a group and the
+    /// decoder's room: a displaced group's cell is the next decode's, a
+    /// group a read still holds keeps its cell and its bytes while the
+    /// slot takes another, a memo with every cell out hands a buffer of
+    /// the allocator's, and a group held past the memo's drop still reads.
+    /// Without one, no buffer is a cell.
+    #[test]
+    fn a_memo_with_a_slab_keeps_its_groups_in_cells() {
+        let cell = memo_cell_bytes(ZGROUP_BYTES).expect("a cell for the shipped cut");
+        assert_eq!(cell, ZGROUP_BYTES + crate::db::zlz4::FLAT_SLACK);
+        assert_eq!(memo_cell_bytes(0), None, "a page as one group keeps none");
+        assert_eq!(memo_cell_bytes(ZPAGE), None);
+        let mut m = Memo::new(4, 3 * 2000);
+        m.slab_cell = cell;
+        // A decode: a buffer taken, marked, and put as one group of a
+        // page. Unhashed, a page's groups take a slot each.
+        let put = |m: &mut Memo, index: u8, mark: u8| -> usize {
+            let mut b = m.take_free();
+            assert!(b.is_cell(), "group {index}: a cell");
+            assert!(b.capacity_bytes() >= cell && b.capacity_bytes() < ZPAGE);
+            b.stride_key()[0] = mark;
+            let at = b.bytes(1).as_ptr() as usize;
+            m.put(1, 0, index, false, Arc::new(b), 2000, 0, 1);
+            at
+        };
+        let mark = |m: &mut Memo, index: u8| m.get(1, 0, index, false).map(|(g, ..)| g.bytes(1)[0]);
+        let at: Vec<usize> = (0..3u8).map(|i| put(&mut m, i, 10 + i)).collect();
+        assert!(at[0] != at[1] && at[1] != at[2] && at[0] != at[2]);
+        assert_eq!(
+            (mark(&mut m, 0), mark(&mut m, 1), mark(&mut m, 2)),
+            (Some(10), Some(11), Some(12))
+        );
+        // A fourth is past the cap: the sweep lets one go, and its cell is
+        // the next decode's.
+        let fourth = put(&mut m, 3, 13);
+        assert!(!at.contains(&fourth), "three held, a fourth cell");
+        assert_eq!(m.free.len(), 1, "the displaced group's buffer kept");
+        let gone = (0..3u8).find(|&i| m.get(1, 0, i, false).is_none()).unwrap();
+        let fifth = put(&mut m, 3, 14);
+        assert_eq!(fifth, at[gone as usize], "the displaced cell, used again");
+        assert_eq!(mark(&mut m, 3), Some(14));
+        // A read holds a group while its slot takes another: the group
+        // keeps its cell and its bytes.
+        let held = m.get(1, 0, 3, false).unwrap().0;
+        let sixth = put(&mut m, 3, 15);
+        assert_ne!(sixth, fifth, "the held group's cell is not handed out");
+        assert_eq!((held.bytes(1)[0], mark(&mut m, 3)), (14, Some(15)));
+        // Every cell out: the slots', the free buffers' and the held
+        // ones'. The next buffer is the allocator's, and none after it is
+        // a cell until one comes back.
+        let mut out = Vec::new();
+        loop {
+            let b = m.take_free();
+            if !b.is_cell() {
+                break;
+            }
+            out.push(b);
+            assert!(
+                out.len() <= 4 + ZMEMO_FREE + ZMEMO_HELD,
+                "more cells than the slab has"
+            );
+        }
+        assert!(
+            out.len() >= ZMEMO_HELD,
+            "{} cells beside the slots'",
+            out.len()
+        );
+        out.pop();
+        assert!(m.take_free().is_cell(), "a cell handed back is handed out");
+        drop(out);
+        // The memo gone, the held group still reads from its cell.
+        drop(m);
+        assert_eq!(held.bytes(1)[0], 14);
+        // No slab, no cell.
+        let mut plain = Memo::new(4, 3 * 2000);
+        assert!(!plain.take_free().is_cell());
     }
 
     /// The memo: a direct-mapped table under a byte cap. An entry put is

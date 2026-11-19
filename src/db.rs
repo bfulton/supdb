@@ -72,7 +72,7 @@ pub mod zlz4;
 // The same form's engine side: the form file mapped, checked and read, the
 // cell a segment holds it in, and the builder. Private: it is the engine's
 // and nothing outside `db` names it.
-mod blocks;
+pub(crate) mod blocks;
 mod zfile;
 pub use zfile::ZInject;
 // A store's directory encrypted by the kernel, under a key the caller gives
@@ -854,6 +854,10 @@ pub struct ZCounts {
     /// bytes asked for (`Options::zpages_ask_dropped`).
     pub dropped_asks: u64,
     pub dropped_ask_bytes: u64,
+    /// Conversions whose file was dropped from the page cache as it was
+    /// written and asked back where it was taken in
+    /// (`Options::zpages_convert_drops_output`).
+    pub convert_dropped: u64,
     /// Turns of the builder taken at a job's end between two of the
     /// controller's steps (`Options::zpages_drive_at_job_end`).
     pub job_end_drives: u64,
@@ -908,6 +912,13 @@ pub struct ZCounts {
     pub phase: u8,
     pub auto_inert: u64,
     pub sel_steps: u64,
+    /// The controller's ticks that stepped the selector and have ended:
+    /// counted after everything a tick does behind the step, the
+    /// builder's turn and the policies' looks. `sel_steps` moves as the
+    /// tick begins, so a test that steps the controller waits on this
+    /// one, or it reads the store, and changes what the looks read,
+    /// between a step and its looks.
+    pub tick_ends: u64,
     pub sel_s1: u64,
     pub sel_switches: u64,
     pub sel_trials: u64,
@@ -1855,6 +1866,24 @@ pub struct Options {
     /// the same with the others, at `89e309d`.
     #[doc(hidden)]
     pub zpages_memo_bytes: usize,
+    /// EXPERIMENT: a handle's memo keeps its decoded groups in the cells of
+    /// a slab of its own, one block mapped by the engine and unmapped when
+    /// the handle drops (`blocks::Slab`, `zfile::memo_cell_bytes`), each
+    /// cell the bytes a group is cut at and the decoder's room past them.
+    /// From the allocator a group's buffer is a chunk of its own in whole
+    /// pages, 4 KB for a group of two, so a memo budgeted at
+    /// `zpages_memo_bytes`, which counts the groups' bytes, held twice
+    /// that: a thread reading through the block form held 18 MB at its
+    /// most at six hundred thousand keys, by an allocator that counts by
+    /// thread (`tests/alloc_peaks.rs`), and when the thread ended its
+    /// handle's buffers stayed in its arena, resident and nobody's -- at
+    /// ten million keys under 1 GiB the arenas of the threaded passes'
+    /// readers held most of the 57-68 MB free beside a group at its limit
+    /// (`docs/engine.md`, which form a workload calls for). A group of one
+    /// record longer than a cell keeps a buffer of the allocator's. Off;
+    /// `supdb-zmemoslab` turns it on.
+    #[doc(hidden)]
+    pub zpages_memo_slab: bool,
     /// EXPERIMENT: a verified page's group asked of the handle's memo before
     /// any view of the page, the memo's entry carrying the group's first
     /// record and count, so a hit reads nothing of the page
@@ -2464,7 +2493,7 @@ pub struct Options {
     /// bar past the line too.
     #[doc(hidden)]
     pub zpages_land_cold_past: bool,
-    /// EXPERIMENT: the crossing asks for the raw pages of the partitions
+    /// The crossing asks for the raw pages of the partitions
     /// it has no form file for, ahead of the form files it asks back
     /// (`zpages_land_drop_past`, `Maint::z_cross`). A partition whose
     /// records the cache let go during the load is one no build ahead
@@ -2483,7 +2512,8 @@ pub struct Options {
     /// `1e7ba94`). The build reads those records anyway, a window ahead of
     /// its walk; asked for whole and first, they are one stream at the
     /// head of the device's queue, and the reads and the build both find
-    /// them. Off; `supdb-zcrossraw` turns it on.
+    /// them. Priced with `zpages_ask_dropped`, whose doc has the cells.
+    /// On; `supdb-znocrossraw` asks for the form files alone.
     #[doc(hidden)]
     pub zpages_cross_asks_raw: bool,
     /// EXPERIMENT: the drop of a served partition's ordered index from the
@@ -2510,7 +2540,7 @@ pub struct Options {
     /// `supdb-zstridealldropagain` beside the stride form's options.
     #[doc(hidden)]
     pub zpages_drop_again: bool,
-    /// EXPERIMENT: the builder's turn comes when a job of its ends, and
+    /// The builder's turn comes when a job of its ends, and
     /// not only at the controller's next step. The controller steps once a
     /// census interval, a tenth of a second, and takes a finished build or
     /// warm in and starts the next at its step alone, so a chain of the
@@ -2525,8 +2555,9 @@ pub struct Options {
     /// 1073741824` in the row's passes, at `1e7ba94`). A job's thread
     /// wakes the segment work's as it ends; with the option the turn it
     /// wakes into takes the job in and starts the next, under the levels
-    /// of the controller's last decision and none of its pulses. Off;
-    /// `supdb-zdriveend` turns it on.
+    /// of the controller's last decision and none of its pulses. Priced
+    /// with `zpages_ask_dropped`, whose doc has the cells. On;
+    /// `supdb-znodriveend` is the turn at the controller's step alone.
     #[doc(hidden)]
     pub zpages_drive_at_job_end: bool,
     /// EXPERIMENT: the hot-raw policy (`zpages_hot_raw`) runs beside the
@@ -2545,7 +2576,7 @@ pub struct Options {
     /// (`docs/engine.md`). Off; `supdb-zstrideroomconvaskhot` turns it on.
     #[doc(hidden)]
     pub zpages_hot_raw_beside_stride: bool,
-    /// EXPERIMENT: a form file whose build dropped it from the page cache
+    /// A form file whose build dropped it from the page cache
     /// as it wrote it is asked back of the kernel whole when the build is
     /// taken in with the store past the selector's line. A build ahead
     /// begun under the line writes its output back and drops it, so that
@@ -2566,8 +2597,17 @@ pub struct Options {
     /// file by the process's maps, at `c24b7cd`). With the option the file
     /// is asked for before the attach where the form is wanted, and where
     /// it lands dormant after the crossing its records are dropped and it
-    /// is asked for as the crossing did for the rest. Off;
-    /// `supdb-zaskdropped` turns it on.
+    /// is asked for as the crossing did for the rest. With the two options
+    /// about the load's end beside it (`zpages_drive_at_job_end`,
+    /// `zpages_cross_asks_raw`) and against the engine before the three,
+    /// the one-thread read pass after the load read a third to a quarter
+    /// faster at ten million keys under 1 GiB in every pair of both
+    /// sittings, and level to a third faster under 1.25 GiB by which shape
+    /// the default's pass took; no other cell was apart in both orders at
+    /// either bound or at three million keys, the lag sweeps among them,
+    /// and in core none of the three acts (`docs/engine.md`). On;
+    /// `supdb-znoaskdropped` leaves a dropped file to its faults, and
+    /// `supdb-zblock` is the three off together.
     #[doc(hidden)]
     pub zpages_ask_dropped: bool,
     /// The decoded bytes a form file's page is cut into groups at, each
@@ -4635,6 +4675,38 @@ pub struct Options {
     /// were touched before. `supdb-heapblocks` is the arm that keeps the
     /// heap shape.
     pub blocks_mapped: bool,
+    /// EXPERIMENT: a job's large per-key arrays -- a seal's sort of its
+    /// table, a segment writer's copy of every key with its span, its
+    /// record's offset and its hash, the ordered index builder's keys, a
+    /// merge's key list and the trailer a finish composes -- are mapped
+    /// from the kernel once they are `blocks::MAP_FROM` bytes and unmapped
+    /// when the job drops them (`blocks::BigVec`), as the memtables'
+    /// blocks are (`blocks_mapped`). From the allocator they are a
+    /// hundred and thirty bytes for each key a merge writes and a hundred
+    /// for each a seal does, on a thread that ends with the job, and the
+    /// allocator keeps the top of that thread's arena up to twice the
+    /// largest chunk the process has mapped and freed: at ten million
+    /// keys under 1 GiB the arenas of threads that had ended held 57-68 MB
+    /// free and resident through the mixes, one free chunk of 10 to 25 MB
+    /// each, beside a group at its limit whose form files' pages then
+    /// faulted (`docs/engine.md`, which form a workload calls for). A
+    /// mapping's pages are fresh at every job, where the arena's were
+    /// touched by the job before. Off; `supdb-jobsmapped` turns it on.
+    #[doc(hidden)]
+    pub jobs_mapped: bool,
+    /// EXPERIMENT: `jobs_mapped` only while the store is short of memory,
+    /// its partitions' raw bytes over the budget the memory available
+    /// leaves (`Shared::forms_short`, the look `forms_fit_when_short`
+    /// reads): a job that starts while it is has its arrays mapped, and
+    /// one that starts while it is not has them from the allocator. What
+    /// an arena keeps of a job costs a store nothing where memory is
+    /// spare, and a mapping's fresh pages at every job cost the ordered
+    /// load a fourteenth at ten to three hundred thousand keys in both
+    /// orders (`docs/engine.md`); under a bound the arena's bytes are the
+    /// page cache's. Off, and nothing without `jobs_mapped`;
+    /// `supdb-jobsshort` turns both on.
+    #[doc(hidden)]
+    pub jobs_mapped_when_short: bool,
     /// Whether a fill on the upkeep thread leaves the rest of its
     /// conversions of dense forms the moment a newer commit is posted or
     /// the writer wants the upkeep back, so that through a burst the
@@ -6442,6 +6514,28 @@ pub struct Options {
     /// `supdb-zstrideroomconv` under `Forced` with `zpages_stride_room`.
     #[doc(hidden)]
     pub zpages_stride_convert: bool,
+    /// EXPERIMENT: a conversion's build (`zpages_stride_convert`) writes its
+    /// file back and drops it from the page cache as it goes, as a build
+    /// ahead under the selector's line does (`zfile::BuildPlan::drop_output`),
+    /// and the turn that takes it in asks the file back whole before it
+    /// attaches it. A page the cache holds because it was written carries
+    /// the filesystem's buffer heads, a hundred and four bytes a block of
+    /// kernel memory charged to the memory group for as long as the page
+    /// stays; a page read back from the device carries none. A store's own
+    /// form files are dropped as they are built and asked back at the
+    /// crossing, and a conversion's file was written whole into the cache
+    /// and kept, to serve at once. At ten million keys under 1 GiB the
+    /// stride arm converts its 29 partitions back to the block form through
+    /// the read and scan passes, and from there on its group held 22 MB of
+    /// kernel memory where the default's held 11, a hundred and eleven
+    /// thousand buffer heads more by the kernel's own count: its group
+    /// reached the limit a mix earlier, and the scrambled D and E mixes took
+    /// the major faults for it (`docs/engine.md`, the group's kernel memory;
+    /// `memory.kmem.usage_in_bytes` of the pass's group and `buffer_head` in
+    /// `/proc/slabinfo`, sampled beside one traced rep). Off;
+    /// `supdb-zstrideallcdrop` turns it on beside the stride form's options.
+    #[doc(hidden)]
+    pub zpages_convert_drops_output: bool,
 }
 
 impl Options {
@@ -6525,6 +6619,38 @@ impl Options {
     /// count of one store is made the same way from its open.
     fn counts_capacity(&self) -> bool {
         self.forms_to_fit || (self.scan_cache_auto && self.scan_cache_bytes == 0)
+    }
+}
+
+impl Options {
+    /// The cell a handle's memo keeps a decoded group in, where it keeps
+    /// them in a slab (`zpages_memo_slab`), for the cut the store's form
+    /// files are built at (`zfile::memo_cell_bytes`); none leaves the
+    /// groups' buffers the allocator's.
+    fn memo_cell(&self) -> Option<usize> {
+        self.zpages_memo_slab
+            .then(|| zfile::memo_cell_bytes(self.zpages_group_bytes))
+            .flatten()
+    }
+
+    /// A handle's memo of decoded groups as these options have it: the
+    /// writer's, a reader's and each of the store's own threads' is made
+    /// here and nowhere else, so an option of the memo's is every
+    /// handle's or none's.
+    fn handle_memo(&self) -> zfile::ZMemo {
+        zfile::ZMemo::sized(self.zpages_memo_bytes)
+            .slab(self.memo_cell())
+            .point(self.zpages_point_part, self.zpages_point_keys)
+            .point_filter(self.zpages_point_filter)
+            .filter_ahead(self.zpages_filter_ahead)
+            .scans(self.zpages_scan_admit, self.zpages_walk_part)
+            .bulk(
+                self.zpages_bulk_admit,
+                self.zpages_bulk_ahead,
+                self.zpages_bulk_part,
+            )
+            .bulk_within(self.zpages_bulk_ahead_within)
+            .bulk_steps(self.zpages_bulk_steps)
     }
 }
 
@@ -6613,6 +6739,7 @@ impl Default for Options {
             settle_covered_samples: true,
             zpages_trusted_views: true,
             zpages_memo_bytes: 8 << 20,
+            zpages_memo_slab: false,
             zpages_memo_first: false,
             zpages_fence_tree: false,
             zpages_fence_words: true,
@@ -6649,10 +6776,10 @@ impl Default for Options {
             zpages_land_drop_past: true,
             zpages_build_sync: true,
             zpages_land_cold_past: true,
-            zpages_ask_dropped: false,
+            zpages_ask_dropped: true,
             zpages_hot_raw_beside_stride: false,
-            zpages_drive_at_job_end: false,
-            zpages_cross_asks_raw: false,
+            zpages_drive_at_job_end: true,
+            zpages_cross_asks_raw: true,
             zpages_drop_again: false,
             zpages_ahead_past_scans: false,
             zpages_build_at_finish: true,
@@ -6785,6 +6912,8 @@ impl Default for Options {
             upkeep_fill_yields: true,
             upkeep_fill_skips_posted: true,
             blocks_mapped: true,
+            jobs_mapped: false,
+            jobs_mapped_when_short: false,
             forms_convert_yield: true,
             forms_convert_behind: usize::MAX,
             convert_from_form: true,
@@ -6889,6 +7018,7 @@ impl Default for Options {
             zpages_stride_room: false,
             zpages_stride_trust_built: true,
             zpages_stride_convert: false,
+            zpages_convert_drops_output: false,
         }
     }
 }
@@ -10851,8 +10981,8 @@ pub struct SegmentWriter {
     /// Every key written, concatenated, with each key's span. Flat rather
     /// than a `Vec<Vec<u8>>` because a segment has a million keys; the
     /// extent beside each span is the one record the index carries.
-    key_arena: Vec<u8>,
-    spans: Vec<(usize, usize)>,
+    key_arena: blocks::BigVec<u8>,
+    spans: blocks::BigVec<(usize, usize)>,
     exts: Vec<Extents>,
     /// The key currently open, its run of length-prefixed records, and the
     /// offset of the newest record's prefix inside the run -- what
@@ -10913,8 +11043,8 @@ pub struct SegmentWriter {
     /// Records-first mode: the records streamed so far, their offsets, and
     /// each key's hash for the trailer's slots.
     recs_len: usize,
-    rec_offs: Vec<u32>,
-    hashes: Vec<u64>,
+    rec_offs: blocks::BigVec<u32>,
+    hashes: blocks::BigVec<u64>,
     rec_buf: Vec<u8>,
     /// A marking segment's records since its last marker, written and
     /// hashed as one at the marker (`mark`).
@@ -10939,6 +11069,9 @@ pub struct SegmentWriter {
     /// the arrays, as a seal's writer does.
     deferred: Option<usize>,
     last_key: Vec<u8>,
+    /// `SegmentOptions::buffers_mapped`: where the per-key arrays above
+    /// and the finish's trailer live once they are large.
+    buffers_mapped: bool,
 }
 
 /// The two layouts the writer produces. Same format, same readers, one
@@ -11137,11 +11270,12 @@ impl SegmentWriter {
             lookahead: opts.lookahead,
             deferred: None,
             last_key: Vec::new(),
+            buffers_mapped: opts.buffers_mapped,
             builder: BlockBuilder::new(block_size),
             block_size,
             blocks: Vec::new(),
-            key_arena: Vec::new(),
-            spans: Vec::new(),
+            key_arena: blocks::BigVec::new(blocks::Site::WriterKeys, opts.buffers_mapped),
+            spans: blocks::BigVec::new(blocks::Site::WriterSpans, opts.buffers_mapped),
             exts: Vec::new(),
             open_key: None,
             run: Vec::new(),
@@ -11167,8 +11301,8 @@ impl SegmentWriter {
             tail_spans: Vec::new(),
             mode: None,
             recs_len: 0,
-            rec_offs: Vec::new(),
-            hashes: Vec::new(),
+            rec_offs: blocks::BigVec::new(blocks::Site::WriterOffs, opts.buffers_mapped),
+            hashes: blocks::BigVec::new(blocks::Site::WriterHashes, opts.buffers_mapped),
             rec_buf: Vec::new(),
             batch_buf: Vec::new(),
             pending_blocks: Vec::new(),
@@ -12314,7 +12448,8 @@ impl SegmentWriter {
                         // for its offset and hash, the Bloom and the
                         // caller's own composition told of it as it goes.
                         let mut b = BloomFill::new(BlockedBloom::with_capacity(n), self.lookahead);
-                        let r = flatindex::stream_trailer(
+                        let r = flatindex::stream_trailer_in(
+                            blocks::BigVec::new(blocks::Site::Trailer, self.buffers_mapped),
                             n,
                             self.recs_len,
                             &|i| src.key_at(i),
@@ -12339,7 +12474,8 @@ impl SegmentWriter {
                             let (s, l) = spans[i];
                             &arena[s..s + l]
                         };
-                        flatindex::stream_trailer(
+                        flatindex::stream_trailer_in(
+                            blocks::BigVec::new(blocks::Site::Trailer, self.buffers_mapped),
                             spans.len(),
                             self.recs_len,
                             &key_at,
@@ -12725,6 +12861,12 @@ pub struct SegmentOptions {
     /// reported as Linux reports one (`HelperFault`). `None` but in a test.
     #[doc(hidden)]
     pub helper_fault: Option<std::sync::Arc<HelperFault>>,
+    /// EXPERIMENT: the writer's per-key arrays, the ordered index
+    /// builder's and the trailer's buffer are the engine's mappings once
+    /// they are large (`blocks::BigVec`); see `Options::jobs_mapped`,
+    /// which a `Db` sets this from. Off.
+    #[doc(hidden)]
+    pub buffers_mapped: bool,
 }
 
 /// A test's stand-in for a writeback error on a segment's file, met by its
@@ -12918,6 +13060,7 @@ impl Default for SegmentOptions {
             prefault: false,
             fail_helper_syncs: None,
             helper_fault: None,
+            buffers_mapped: false,
         }
     }
 }
@@ -12948,7 +13091,7 @@ impl PieceWriter {
         w.set_inline_max(inline_max);
         Ok(PieceWriter(
             Box::new(w),
-            crate::ordindex::Builder::new(),
+            crate::ordindex::Builder::new_in(opts.buffers_mapped),
             false,
             false,
         ))
@@ -16470,14 +16613,19 @@ impl MemTable {
     /// suite's keys never have. The comparison sort of the whole table
     /// read two arena keys a compare, five million compares at three
     /// hundred thousand keys, and was a fifth of the seal.
-    fn slots_in_key_order(&self) -> Vec<u32> {
+    ///
+    /// `mapped` is where the sort's two arrays of a record a key and the
+    /// order it answers live (`Options::jobs_mapped`): fifty-two bytes a
+    /// key between them, on the seal's thread, for the length of the sort.
+    fn slots_in_key_order(&self, mapped: bool) -> blocks::BigVec<u32> {
         let n = self.len();
-        let mut recs: Vec<(u64, u64, u32)> = Vec::with_capacity(n);
+        let mut recs: blocks::BigVec<(u64, u64, u32)> =
+            blocks::BigVec::with_capacity(n, blocks::Site::SortRecs, mapped);
         for i in 0..n {
             let (a, b) = key_prefix(self.key_of(self.entry(i)));
             recs.push((a, b, i as u32));
         }
-        let mut scratch = Vec::new();
+        let mut scratch = blocks::BigVec::new(blocks::Site::SortScratch, mapped);
         radix_by_prefix(&mut recs, &mut scratch);
         let mut i = 0;
         while i < recs.len() {
@@ -16493,7 +16641,11 @@ impl MemTable {
             }
             i = j;
         }
-        recs.iter().map(|r| r.2).collect()
+        let mut order = blocks::BigVec::with_capacity(recs.len(), blocks::Site::SortOrder, mapped);
+        for r in recs.iter() {
+            order.push(r.2);
+        }
+        order
     }
 
     /// The key's live values, oldest first, and whether a tombstone ends
@@ -17972,15 +18124,19 @@ fn cut_by_bounds(
 /// merge. The slicing addresses keys by rank exactly as the sorted vector
 /// this replaced did, without a million allocations, a sort or a dedup.
 struct KeyList {
-    bytes: Vec<u8>,
-    offs: Vec<usize>,
+    bytes: blocks::BigVec<u8>,
+    offs: blocks::BigVec<usize>,
 }
 
 impl KeyList {
-    fn new() -> KeyList {
+    /// An empty list; `mapped` is where its buffers live once they are
+    /// large (`Options::jobs_mapped`).
+    fn new(mapped: bool) -> KeyList {
+        let mut offs = blocks::BigVec::new(blocks::Site::ListOffs, mapped);
+        offs.push(0);
         KeyList {
-            bytes: Vec::new(),
-            offs: vec![0],
+            bytes: blocks::BigVec::new(blocks::Site::ListKeys, mapped),
+            offs,
         }
     }
 
@@ -18043,20 +18199,23 @@ struct Slicer<'a> {
     from: usize,
     /// Its keys cut to the fence's length; every key, with no fences.
     held: KeyList,
+    /// `Options::jobs_mapped`, for the lists it makes.
+    mapped: bool,
     total: usize,
     slices: Vec<(usize, usize)>,
     given: Vec<Fence>,
 }
 
 impl<'a> Slicer<'a> {
-    fn new(fences: Option<&'a [Fence]>, parts: usize, max_keys: usize) -> Slicer<'a> {
+    fn new(fences: Option<&'a [Fence]>, parts: usize, max_keys: usize, mapped: bool) -> Slicer<'a> {
         Slicer {
             fences,
             parts,
             max_keys,
             fi: 0,
             from: 0,
-            held: KeyList::new(),
+            held: KeyList::new(mapped),
+            mapped,
             total: 0,
             slices: Vec::new(),
             given: Vec::new(),
@@ -18101,7 +18260,7 @@ impl<'a> Slicer<'a> {
         let fs = self.fences.expect("closing a fence of given fences");
         let (lo, hi) = &fs[self.fi];
         self.fi += 1;
-        let held = std::mem::replace(&mut self.held, KeyList::new());
+        let held = std::mem::replace(&mut self.held, KeyList::new(self.mapped));
         if held.is_empty() {
             // No input holds a key in the fence: the partition that names
             // it is an input all the same and goes with the landing, so an
@@ -18631,7 +18790,7 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<Vec<String>> {
 
     // Pass one: every distinct key once, in order, into the slicer, which
     // holds only what the slices are taken from (`Slicer`).
-    let mut slicer = Slicer::new(fences.as_deref(), parts, max_keys);
+    let mut slicer = Slicer::new(fences.as_deref(), parts, max_keys, opts.buffers_mapped);
     let all: Vec<Vec<u8>> = if cursors {
         merge_keys(&blobs, &ords, walk_cached, rest, |k, _| {
             slicer.push(k);
@@ -22083,6 +22242,15 @@ impl Drop for Shared {
 }
 
 impl Shared {
+    /// Whether a job that starts now has its large arrays mapped
+    /// (`Options::jobs_mapped`): where the option says so, and under
+    /// `Options::jobs_mapped_when_short` only while the store is short of
+    /// memory, by the segment work's last look (`Maint::short_look`).
+    fn jobs_map(&self, opts: &Options) -> bool {
+        opts.jobs_mapped
+            && (!opts.jobs_mapped_when_short || self.forms_short.load(AtomicOrdering::Relaxed))
+    }
+
     /// Every scan over the store, the block path's and the merge path's:
     /// the count the seal's copy, the abandon's ask and the outrun mark
     /// are kept by.
@@ -24869,7 +25037,7 @@ mod radix {
 /// keys sharing a long prefix -- the suite's are sixteen digits whose
 /// first ten are the same -- take a pass per byte that varies and none
 /// for the rest.
-fn radix_by_prefix(v: &mut Vec<(u64, u64, u32)>, scratch: &mut Vec<(u64, u64, u32)>) {
+fn radix_by_prefix<V: blocks::Plain<(u64, u64, u32)>>(v: &mut V, scratch: &mut V) {
     // A run of one or none is sorted, and over an empty run the masks
     // below read every byte as varying: sixteen passes of a histogram
     // zeroed and summed for no records, 18,000 instructions of the first
@@ -26537,6 +26705,7 @@ impl Reader {
             ahead_swapped: get(&ev.ahead_swapped),
             dropped_asks: get(&ev.dropped_asks),
             dropped_ask_bytes: get(&ev.dropped_ask_bytes),
+            convert_dropped: get(&ev.convert_dropped),
             job_end_drives: get(&ev.job_end_drives),
             cross_raw_asks: get(&ev.cross_raw_asks),
             raw_redrops: get(&ev.raw_redrops),
@@ -26562,6 +26731,7 @@ impl Reader {
             phase: get(&ev.phase) as u8,
             auto_inert: u64::from(z_auto_inert(&self.opts)),
             sel_steps: get(&ev.sel_steps),
+            tick_ends: get(&ev.tick_ends),
             sel_s1: get(&ev.sel_s1),
             sel_switches: get(&ev.sel_switches),
             sel_trials: get(&ev.sel_trials),
@@ -36384,6 +36554,10 @@ impl Db {
     fn segment_opts(opts: &Options) -> SegmentOptions {
         let mut s = opts.segment.clone();
         s.prefault = opts.prefault;
+        // Whatever the store's memory, where the options say so; a job of
+        // a store that maps only while short asks the store
+        // (`Shared::jobs_map`).
+        s.buffers_mapped = opts.jobs_mapped && !opts.jobs_mapped_when_short;
         s
     }
 
@@ -36670,18 +36844,7 @@ impl Db {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes)
-                .point(opts.zpages_point_part, opts.zpages_point_keys)
-                .point_filter(opts.zpages_point_filter)
-                .filter_ahead(opts.zpages_filter_ahead)
-                .scans(opts.zpages_scan_admit, opts.zpages_walk_part)
-                .bulk(
-                    opts.zpages_bulk_admit,
-                    opts.zpages_bulk_ahead,
-                    opts.zpages_bulk_part,
-                )
-                .bulk_within(opts.zpages_bulk_ahead_within)
-                .bulk_steps(opts.zpages_bulk_steps),
+            zmemo: opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             attn_open: std::cell::Cell::new(0),
             attn: u8::from(
@@ -37852,18 +38015,7 @@ impl Db {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes)
-                .point(opts.zpages_point_part, opts.zpages_point_keys)
-                .point_filter(opts.zpages_point_filter)
-                .filter_ahead(opts.zpages_filter_ahead)
-                .scans(opts.zpages_scan_admit, opts.zpages_walk_part)
-                .bulk(
-                    opts.zpages_bulk_admit,
-                    opts.zpages_bulk_ahead,
-                    opts.zpages_bulk_part,
-                )
-                .bulk_within(opts.zpages_bulk_ahead_within)
-                .bulk_steps(opts.zpages_bulk_steps),
+            zmemo: opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             attn_open: std::cell::Cell::new(0),
             attn: u8::from(
@@ -38983,7 +39135,8 @@ impl Db {
             let id = self.shared.next_seg.fetch_add(1, AtomicOrdering::Relaxed);
             let tmp = self.dir.join(format!("direct-{id:08}.tmp"));
             let _ = vault::remove_file(&tmp);
-            let opts = Db::segment_opts(&self.opts);
+            let mut opts = Db::segment_opts(&self.opts);
+            opts.buffers_mapped = self.shared.jobs_map(&self.opts);
             let mut w = PieceWriter::create(&tmp, &opts, 0, self.opts.inline_bytes)?;
             // Where the run stands in the history: its records take the
             // sequence numbers from here, one each, as they commit. And
@@ -39758,7 +39911,8 @@ impl Db {
             .next_seg
             .fetch_add(fences.len().max(1) as u64, AtomicOrdering::Relaxed);
         let dir = self.dir.clone();
-        let opts = Db::segment_opts(&self.opts);
+        let mut opts = Db::segment_opts(&self.opts);
+        opts.buffers_mapped = self.shared.jobs_map(&self.opts);
         let background_io = self.opts.background_io;
         let sync_every = self.opts.seal_sync_every;
         let inline_max = self.opts.inline_bytes;
@@ -39823,6 +39977,7 @@ impl Db {
             near || self.opts.seal_snapshot_far
         };
         let put_one = self.opts.seal_put_one;
+        let jobs_mapped = self.shared.jobs_map(&self.opts);
         let job = move |readable: &SealReadable| -> Result<Vec<String>> {
             if background_io == BackgroundIo::Idle {
                 idle_io_priority();
@@ -39851,11 +40006,21 @@ impl Db {
                 );
                 frozen_snaps && whole
             });
-            let order: Vec<u32> = match &have {
-                Some(h) => h.ents.iter().map(|e| e.frozen).collect(),
+            let order: blocks::BigVec<u32> = match &have {
+                Some(h) => {
+                    let mut order = blocks::BigVec::with_capacity(
+                        h.ents.len(),
+                        blocks::Site::SortOrder,
+                        jobs_mapped,
+                    );
+                    for e in h.ents.iter() {
+                        order.push(e.frozen);
+                    }
+                    order
+                }
                 None => {
                     SealCounts::add(&counts.seal_sorts, 1);
-                    mem.slots_in_key_order()
+                    mem.slots_in_key_order(jobs_mapped)
                 }
             };
             SealCounts::add(&counts.seal_sort_ns, t_job.elapsed().as_nanos() as u64);
@@ -41371,18 +41536,7 @@ impl Reader {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
-                .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
-                .point_filter(self.opts.zpages_point_filter)
-                .filter_ahead(self.opts.zpages_filter_ahead)
-                .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
-                .bulk(
-                    self.opts.zpages_bulk_admit,
-                    self.opts.zpages_bulk_ahead,
-                    self.opts.zpages_bulk_part,
-                )
-                .bulk_within(self.opts.zpages_bulk_ahead_within)
-                .bulk_steps(self.opts.zpages_bulk_steps),
+            zmemo: self.opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             attn_open: std::cell::Cell::new(0),
             attn: 0,
@@ -41424,18 +41578,7 @@ impl Reader {
                 forms_off_now: std::cell::Cell::new(false),
                 ord_served: std::cell::Cell::new(0),
                 ord_declined: std::cell::Cell::new(0),
-                zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
-                    .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
-                    .point_filter(self.opts.zpages_point_filter)
-                    .filter_ahead(self.opts.zpages_filter_ahead)
-                    .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
-                    .bulk(
-                        self.opts.zpages_bulk_admit,
-                        self.opts.zpages_bulk_ahead,
-                        self.opts.zpages_bulk_part,
-                    )
-                    .bulk_within(self.opts.zpages_bulk_ahead_within)
-                    .bulk_steps(self.opts.zpages_bulk_steps),
+                zmemo: self.opts.handle_memo(),
                 zwin: std::cell::Cell::new(ZWindow::closed()),
                 attn_open: std::cell::Cell::new(0),
                 attn: 0,
@@ -41484,18 +41627,7 @@ impl Reader {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
-                .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
-                .point_filter(self.opts.zpages_point_filter)
-                .filter_ahead(self.opts.zpages_filter_ahead)
-                .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
-                .bulk(
-                    self.opts.zpages_bulk_admit,
-                    self.opts.zpages_bulk_ahead,
-                    self.opts.zpages_bulk_part,
-                )
-                .bulk_within(self.opts.zpages_bulk_ahead_within)
-                .bulk_steps(self.opts.zpages_bulk_steps),
+            zmemo: self.opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             attn_open: std::cell::Cell::new(0),
             attn: u8::from(
@@ -45252,18 +45384,7 @@ impl Reader {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
-                .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
-                .point_filter(self.opts.zpages_point_filter)
-                .filter_ahead(self.opts.zpages_filter_ahead)
-                .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
-                .bulk(
-                    self.opts.zpages_bulk_admit,
-                    self.opts.zpages_bulk_ahead,
-                    self.opts.zpages_bulk_part,
-                )
-                .bulk_within(self.opts.zpages_bulk_ahead_within)
-                .bulk_steps(self.opts.zpages_bulk_steps),
+            zmemo: self.opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             attn_open: std::cell::Cell::new(0),
             attn: 0,
@@ -46490,6 +46611,24 @@ impl Db {
     /// reads beside the allocator's bytes in use.
     pub fn mapped_bytes() -> usize {
         blocks::mapped_bytes()
+    }
+
+    /// How many of the jobs' large arrays have become mappings of the
+    /// engine's own (`Options::jobs_mapped`), process-wide and ever: a
+    /// seal's sort, a segment writer's per-key arrays, an ordered index
+    /// builder's keys, a merge's key list, a finish's trailer, each
+    /// counted once as it passes `blocks::MAP_FROM` bytes, by which of
+    /// those arrays it is (`blocks::Site`).
+    #[doc(hidden)]
+    pub fn job_buffers_mapped() -> Vec<(&'static str, usize)> {
+        blocks::big_maps()
+    }
+
+    /// How many cells the handles' memos have taken of their slabs
+    /// (`Options::zpages_memo_slab`), process-wide and ever.
+    #[doc(hidden)]
+    pub fn memo_cells_taken() -> usize {
+        blocks::slab_cells()
     }
 
     /// The bytes of those blocks the kernel has resident, read from it
@@ -50696,6 +50835,14 @@ impl Maint {
                 .is_some_and(|(inputs, _)| inputs.iter().any(|n| n == name))
     }
 
+    /// A merge's writers' options (`Db::merge_segment_opts`), their arrays
+    /// mapped where a job that starts now has them so (`Shared::jobs_map`).
+    fn merge_opts(&self) -> SegmentOptions {
+        let mut s = Db::merge_segment_opts(&self.opts);
+        s.buffers_mapped = self.shared.jobs_map(&self.opts);
+        s
+    }
+
     /// `n` segment ids, the first returned: one counter for the writer's
     /// seals and this work's merges alike.
     fn alloc_segs(&self, n: u64) -> u64 {
@@ -51486,7 +51633,7 @@ impl Maint {
             end_seq,
             lo,
             hi,
-            opts: Db::merge_segment_opts(&self.opts),
+            opts: self.merge_opts(),
             background_io: self.opts.background_io,
             sync_every: self.opts.seal_sync_every,
             inline_max: self.opts.inline_bytes,
@@ -54731,6 +54878,7 @@ impl Maint {
         }
         self.z_last_d = Some(d);
         self.z_drive(&d);
+        zfile::ZEvents::add(&self.shared.z.tick_ends, 1);
     }
 
     /// Whether a job of the builder's has ended and waits to be taken in.
@@ -56707,7 +56855,11 @@ impl Maint {
     /// available leaves (`z_budget`). A budget that cannot be read is not
     /// short. The first look that finds it short starts the trim thread.
     fn short_look(&mut self) {
-        if !self.opts.forms_fit_when_short {
+        // The word is read by the forms' fit and by the jobs' mapping
+        // (`Options::jobs_mapped_when_short`); the trim thread is the
+        // fit's alone.
+        let jobs = self.opts.jobs_mapped && self.opts.jobs_mapped_when_short;
+        if !self.opts.forms_fit_when_short && !jobs {
             return;
         }
         let now = std::time::Instant::now();
@@ -56731,7 +56883,7 @@ impl Maint {
         let short = self.z_budget().is_some_and(|budget| raw > budget);
         // The thread before the word, so that a handle that reads the
         // store short and asks for a trim finds a thread to ask.
-        if short {
+        if short && self.opts.forms_fit_when_short {
             start_trimmer(&self.shared, &self.opts);
         }
         self.shared
@@ -57179,7 +57331,11 @@ impl Maint {
             self.opts.zpages_min_bytes,
             self.opts.zpages_drop_behind && (!dormant || (past && self.opts.zpages_land_drop_past)),
         );
-        plan.drop_output = dormant && !past;
+        // A conversion's file goes the same way where the option says
+        // (`Options::zpages_convert_drops_output`), and is asked back
+        // where it is taken in: the pages a write leaves in the cache
+        // carry buffer heads, and the pages a read brings carry none.
+        plan.drop_output = (dormant && !past) || (convert && self.opts.zpages_convert_drops_output);
         // Only a file written back as it was built: its pages are on the
         // device and its sync asks for the flush alone; one kept dirty for
         // the install wrote its pages in its sync, 50-160 ms each at five
@@ -57545,6 +57701,24 @@ impl Maint {
             // drops them.
             Ok(zfile::Outcome::Built(built)) if recode && live.is_some() => {
                 let target = live.expect("checked");
+                // A file its build dropped as it wrote it
+                // (`Options::zpages_convert_drops_output`) is asked of the
+                // kernel whole before it serves: the attach's mapping is
+                // advised random, and the file serves from this turn on.
+                if built.dropped {
+                    let asked = zfile::ask_file(&out);
+                    zfile::ZEvents::add(&ev.dropped_asks, 1);
+                    zfile::ZEvents::add(&ev.dropped_ask_bytes, asked);
+                    zfile::ZEvents::add(&ev.convert_dropped, 1);
+                    if self.z_trace {
+                        eprintln!(
+                            "zask t={:.1} {} dropped by its conversion, asked_mb {:.1}",
+                            self.z_epoch.elapsed().as_secs_f64(),
+                            seg.name,
+                            asked as f64 / 1048576.0
+                        );
+                    }
+                }
                 match zfile::ZFile::attach(
                     &out,
                     target.blob.for_zfile(),
@@ -57956,7 +58130,7 @@ impl Maint {
         // generously; gaps in the sequence cost nothing.
         let first_id = self.alloc_segs((parts * 4).max(8) as u64);
         let dir = self.dir.clone();
-        let opts = Db::merge_segment_opts(&self.opts);
+        let opts = self.merge_opts();
         let cursors = self.opts.cursor_merge;
         let background_io = self.opts.background_io;
         let sync_every = self.opts.seal_sync_every;
