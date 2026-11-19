@@ -19541,13 +19541,19 @@ struct CachedBlock {
     /// key offset, key length, run offset, run length; the run is values
     /// each behind a u32 length.
     ents: Vec<[u32; 4]>,
-    /// Entry `i` is the block's record `lo + i` for every `i`: the copy
-    /// was built over updates alone and no insert has been spliced in
-    /// since, so a walk's start and a patch's entry are a rank less the
+    /// The partition (its blob's id) whose records the entries are, entry
+    /// `i` the block's record `lo + i` for every `i`, or 0 for none: the
+    /// copy was built over updates alone and no insert has been spliced
+    /// in since, so a walk's start and a patch's entry are a rank less the
     /// block's first (`Options::copy_start_at_rank`). An insert clears it
     /// for good; a delete leaves the entry, with an empty run, so it
-    /// holds.
-    identity: bool,
+    /// holds. It names the partition and is asked of the one a read is
+    /// in (`identity_of`): a table carried across a merge that rewrote
+    /// its partition over the same blocks keeps its copies, and a key the
+    /// merge folded in or dropped inside a block moves every record after
+    /// it, so a claim about the records before the merge is no claim about
+    /// the ones after.
+    identity: u64,
     /// A copy of a block wide by its count (`Options::forms_copy_hot_wide`),
     /// kept past the wide bound: the settle that grows its overlay past the
     /// bound appends to it where it drops any other form for a wide build.
@@ -19598,7 +19604,14 @@ impl CachedBlock {
         self.keys == other.keys
             && self.vals == other.vals
             && self.ents == other.ents
-            && (self.identity || !other.identity)
+            && (other.identity == 0 || self.identity == other.identity)
+    }
+
+    /// Whether the entries are partition `blob`'s records, entry for record
+    /// (`identity`).
+    #[inline]
+    fn identity_of(&self, blob: u64) -> bool {
+        self.identity != 0 && self.identity == blob
     }
     /// Whether a walk of this copy emits what a walk of `other` emits:
     /// the keys that hold a value, each with its run, an entry of no
@@ -19824,7 +19837,7 @@ fn copy_entry_at(table: &BlockTable, b: u32, cut: u32) -> Option<(&CachedBlock, 
         return None;
     };
     let j = ((cut >> 1) as usize).checked_sub(b as usize * CACHE_BLOCK)?;
-    (blk.identity && j < blk.ents.len()).then_some((blk, j))
+    (blk.identity_of(table.blob) && j < blk.ents.len()).then_some((blk, j))
 }
 
 /// The lines a walk of `form` over the partition's ranks `from` to `n`
@@ -19912,7 +19925,7 @@ fn prefetch_block(
         // from there (`Options::copy_prefetch_from_start`); a copy the walk
         // will search, whole.
         Cached::Block(blk) => match at {
-            Some(i) if blk.identity => blk.prefetch_from(i),
+            Some(i) if blob.is_some_and(|p| blk.identity_of(p.id())) => blk.prefetch_from(i),
             _ => blk.prefetch(whole),
         },
         Cached::Sparse(sb) => {
@@ -32873,7 +32886,8 @@ impl Reader {
             if let Some((at2, b2, exact)) = ahead.take() {
                 if at2 == at as u32 {
                     if let Some(form) = table.slots.get(b2 as usize).and_then(|s| s.as_deref()) {
-                        let by_cut = exact && matches!(form, Cached::Block(blk) if blk.identity);
+                        let by_cut = exact
+                            && matches!(form, Cached::Block(blk) if blk.identity_of(table.blob));
                         if !by_cut {
                             prefetch_form(form, self.opts.copy_prefetch_whole);
                         }
@@ -33164,7 +33178,7 @@ impl Reader {
                 // answered (`Options::copy_start_at_rank`).
                 let lo = b * CACHE_BLOCK;
                 let at_rank = self.opts.copy_start_at_rank
-                    && blk.identity
+                    && blk.identity_of(table.blob)
                     && same
                     && c >= lo
                     && c - lo < blk.ents.len();
@@ -33216,7 +33230,7 @@ impl Reader {
                     blk.keys.extend_from_slice(key);
                     blk.ents
                         .insert(i, [key_at, key.len() as u32, at_run, run.len() as u32]);
-                    blk.identity = false;
+                    blk.identity = 0;
                 }
                 // Bloated only past twice the floor: below that the sum
                 // over the entries, a load an entry a write, cannot say so.
@@ -34324,7 +34338,9 @@ impl Reader {
                         // above record `start - 1` and not above `start`,
                         // so no entry between them is skipped.
                         let at_rank =
-                            self.opts.copy_start_at_rank && blk.identity && rank != usize::MAX;
+                            self.opts.copy_start_at_rank
+                                && blk.identity_of(seg.blob.id())
+                                && rank != usize::MAX;
                         let i = if !first {
                             0
                         } else if at_rank {
@@ -48720,7 +48736,7 @@ impl<'s> BuildCtx<'s> {
             keys: Vec::with_capacity(n * 16),
             vals: Vec::with_capacity(n * 128),
             ents: Vec::with_capacity(n),
-            identity: false,
+            identity: 0,
             wide: false,
             dead: 0,
         });
@@ -48757,7 +48773,11 @@ impl<'s> BuildCtx<'s> {
         // off) also left a copy searched where a cut had to be searched for.
         let updates = all_same
             && (self.rd.opts.zpages_block_cursor || ov.over.iter().all(|o| o.cut != u32::MAX));
-        blk.identity = updates && blk.ents.len() == hi - lo;
+        blk.identity = if updates && blk.ents.len() == hi - lo {
+            src.seg.blob.id()
+        } else {
+            0
+        };
         if self.fit {
             blk.fit();
         }
@@ -48789,7 +48809,7 @@ impl<'s> BuildCtx<'s> {
             keys: Vec::with_capacity(sb.keys.len() + kept * 16),
             vals: Vec::with_capacity(sb.vals.len() + kept * 128),
             ents: Vec::with_capacity(sb.ents.len() + kept),
-            identity: false,
+            identity: 0,
             wide: false,
             dead: 0,
         };
@@ -48853,7 +48873,11 @@ impl<'s> BuildCtx<'s> {
         }
         // Every delta an update of a record, and a key emitted per record:
         // `copy_block`'s rule, which the form's cuts answer exactly.
-        blk.identity = updates && blk.ents.len() == hi - lo;
+        blk.identity = if updates && blk.ents.len() == hi - lo {
+            src.seg.blob.id()
+        } else {
+            0
+        };
         if self.fit {
             blk.fit();
         }

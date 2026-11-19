@@ -2032,13 +2032,12 @@ against the fix before a mutant's failure is read as anything, since a
 red mutant and a red fix at one count are a bug the test found and the
 fix did not have; and an edit by markers asserts the markers' order.
 
-One seed of the fuzz outside the gate's range fails on the main line as
-it does here (`ZFUZZ_CACHE=all ZFUZZ_OPTVARY=1 ZFUZZ_SEEDS=1179 cargo test
---profile checked --test fuzz fuzz_range -- --exact`, a plain store with
-the upkeep inline: "a copy's identity entry disagrees with its search").
-It was found by running ranges the gate does not, and attributed by
-building the main line's head and running the seed there before reading
-it as this change's; it is an open item in `ROADMAP.md`.
+One seed of the fuzz outside the gate's range failed on the main line as
+it did here ("a copy's identity entry disagrees with its search", a plain
+store with the upkeep inline). It was found by running ranges the gate
+does not, and attributed by building the main line's head and running the
+seed there before reading it as this change's; it is the entry "a claim
+about a partition's records carried across its rewrite", below.
 
 And one the hunt did not find, because the store read right in every
 run of it: a chunk lent out of a unit marked twice. One seed in three
@@ -4974,6 +4973,30 @@ piece's ranks gave, applied to the keys a table files: a position taken
 against an object is kept only under that object's identity, and a
 carry that keeps the structure across a replacement of the object
 re-takes every position it holds, not only the ones a form holds.
+
+**A claim about a partition's records carried across its rewrite.** A
+copy built over a block's records by updates alone claimed its entries
+were the records, entry for record, so a settle's patch took the entry
+by the key's rank, and the claim was a flag. A table is carried across a
+merge that rewrites its partition over the same blocks, copies and all,
+and a key written into such a block and left to the backlog -- a batch no
+scan's commit filed -- was sealed and folded in by the merge, a record of
+the new partition at the rank it landed at: the patch that filed it after
+the rewrite took the entry its rank named, another key's, and in release
+wrote the run there. One seed of the differential fuzz found it, and
+stopped finding it the day the commits near reads began filing their own
+batches (`Options::forms_settle_every`), which left the old shape an arm
+that still had it: the seed went green while the bug stood, and only a
+rebuild at the commit that recorded it and a bisect that named a default
+and not a fix said so. The claim names the partition it is of now
+(`CachedBlock::identity`, its blob's id), and every site that reads it
+asks it of the partition in hand; `tests/settle.rs` builds the fold, the
+drop that keeps the block boundaries and the unfiled write. The rules: a
+claim about a structure's relation to another object names the object,
+like the cache derived from it; and a seed that goes green after a change
+in what it draws or what the store defaults to is a seed that stopped
+looking, so it is run where it failed, and the bisect from there names
+whether a fix or a steer made it pass.
 
 **A cache a thread kept of things a store had closed.** The memo of
 decoded groups was the thread's, keyed by the form file's attach identity

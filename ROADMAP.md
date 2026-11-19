@@ -484,13 +484,10 @@ What an engine picker would hit, roughly in order.
   miss, the copy of the ciphertext a fifth, and the cipher a tenth. A run
   of chunks read in order could be populated in one call and decrypted as
   one, which wants the cache to know a run when it sees one.
-- [ ] **A copy's entry found by its rank, wrong.** One seed of the
-  differential fuzz, outside the gate's range, trips the block cache's
-  check that a copy's entry taken by rank is the entry a search finds
-  (`ZFUZZ_CACHE=all ZFUZZ_OPTVARY=1 ZFUZZ_SEEDS=1179 cargo test --profile
-  checked --test fuzz fuzz_range -- --exact`), in a plain store with the
-  upkeep inline. A release build has no check there and patches the entry
-  the rank names.
+- [x] **A copy's entry found by its rank, wrong.** A copy's claim that
+  its entries are its block's records was carried across a merge that
+  rewrote the partition; the claim names the partition now
+  (`CachedBlock::identity`), and `tests/settle.rs` builds the rewrite.
 - [x] **Ordered ingest under a cipher.** An ordered run keeps its table,
   its record stream and its close; its commits go to the log as well,
   sealed there, and its segment gets its envelope where the run closes.
