@@ -13232,7 +13232,7 @@ impl Seg {
         let held = |s: &Seg| (resident_share(s.ord.mapped()) * s.ord.file_bytes() as f64) as u64;
         let before = held(self);
         if let Some(name) = Db::ord_name_for(&self.name) {
-            if let Ok(f) = std::fs::File::open(dir.join(&name)) {
+            if let Ok(f) = vault::open(dir.join(&name)) {
                 fadvise_dontneed(&f);
             }
         }
