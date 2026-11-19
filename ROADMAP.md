@@ -382,16 +382,21 @@ What an engine picker would hit, roughly in order.
   (`a_fallback_past_a_slot_whose_log_retired_is_refused`,
   `tests/durable.rs`).
 - [ ] **A fall back held by a segment's last key.** In the
-  clear the same check reads an unnamed segment newer than every segment
-  the slot taken names, and within what it covers, by its last key, and
+  clear an open holds an unnamed segment newer than every segment the
+  slot taken names, and within what it covers, to its last key, and
   sweeps it where that key is held by that slot's segments or a run's
-  temp name, as a merge's outputs are by their inputs; no other key of
-  it is read. A segment whose last key the slot's segments hold and whose
-  other keys they do not, or a run whose id was drawn
-  before a merge the older slot names, or that closed after a commit the
-  log holds past what the older slot covers, passes. Damage
-  only, as above. Done when the segment says in its own bytes whether it is a
-  merge's output, or the check reads every key where the last passes.
+  temp name, as a merge's outputs are by their inputs. Two of the ways
+  past it are closed: a seal's whose log retired behind a newer slot is
+  refused by the log file the slot taken needs (`Manifest::needs_log`),
+  and a run's piece past what the slot covers with its temp name gone is
+  refused whatever its id, which a spare drawn early can put below the
+  slot's (`a_run_below_the_slots_ids_is_not_lost_when_the_newest_slot_is_damaged`,
+  `tests/durable.rs`). One is open: a merge output past what the slot
+  covers that folded in a run's piece, whose temp name the newer slot
+  retired, reads by its name as a seal's in the crash window and is
+  swept. Media damage alone. Done when the segment says in its own
+  bytes that it is a merge's output and an open can show that no merge
+  in the crash window stands past what the slot it takes covers.
 - [ ] **What a guard does not cover.** A failed directory barrier is made
   by guards (`vault::guard`) and the writes go on; where the guard fails
   too, the failure is kept until the store is reopened. Two ways in stay
