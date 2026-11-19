@@ -4502,7 +4502,8 @@ fn a_syncing_stores_pre_write_is_made_beside_the_commit_that_buys_it() {
 
 /// A reach a commit bought and never handed over, since its sync failed,
 /// is not the next commit's to write: the failure is a directory
-/// barrier's, the rotation's, and a failed barrier is kept (`Db::lost`),
+/// barrier's, the rotation's, whose guards fail as well, so it is kept
+/// (`Db::lost`),
 /// so every commit after it answers the failure, the large one that would
 /// end the run included, and none hands a reach to a helper that would
 /// write zeros over frames the failed commits left in the file
@@ -4548,6 +4549,7 @@ fn a_reach_a_failed_commit_bought_is_not_written_over_the_next_commit() {
     // with nothing written: its records go out with the next.
     let first = db.wal_durable().0;
     db.fail_next_dir_barrier();
+    db.fail_next_dir_guard(true);
     loop {
         assert!(
             round < 400,

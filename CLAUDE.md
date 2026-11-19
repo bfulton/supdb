@@ -2442,9 +2442,16 @@ does not promise the entry that names it, and a run whose name a crash
 took is every commit of it gone. One barrier a run, none where a
 rotation's barrier for its new log file had the name in the directory
 already, and none in a store whose commits never sync, whose landings'
-directory fsyncs carry it; a barrier that fails fails the commit, and a
-run that closes owing one is the next sync's, as a run that closed
-unsynced is. The close is
+directory fsyncs carry it. A barrier that fails is never tried again:
+each name it was for gets a second entry, a hard link under its name and
+`.guard` (`vault::guard`), and the directory is synced again, a new
+operation after the failure that the new fsync covers; the guard stands
+until the file goes -- every removal and rename through the door unlinks
+it first -- and an open that finds a guard without its file gives the file
+its name back before anything reads the name. Where the guard cannot be
+made either, the failure is kept (`Db::lost`): reads go on and every write
+answers it, since a directory that cannot make a new entry durable cannot
+make the next name the store writes durable either. The close is
 the seal's shape with one difference: the finished segment is hard-linked
 under its piece name rather than renamed, and the temp name stays until the
 manifest names the segment, because a name the manifest lacks is swept at

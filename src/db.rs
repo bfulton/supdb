@@ -240,15 +240,22 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
 /// is on no device. Its durability follows the same rule: the run's next
 /// commit writes it with its own, durable as that commit's policy makes
 /// it, and a commit with nothing new for the run, a `sync` or a `flush`
-/// writes and syncs it whatever the policy. A failed sync of the log -- its fdatasync, a closed
-/// file's, or the directory's fsync a new log file's name needs -- is never
-/// retried, since Linux reports a writeback error once and a later sync of
-/// the same file answers `Ok` over bytes the device does not hold: every
-/// commit, `sync` and `flush` after it answers with that error until the
-/// store is reopened, while reads go on, and the open finds a prefix of
-/// what was acknowledged before the failure and whatever the device kept
-/// of the rest. So does a failed write whose bytes cannot be cut back off
-/// the log.
+/// writes and syncs it whatever the policy. A failed sync of the log -- its
+/// fdatasync or a closed file's -- is never retried, since Linux reports a
+/// writeback error once and a later sync of the same file answers `Ok` over
+/// bytes the device does not hold: every commit, `sync` and `flush` after it
+/// answers with that error until the store is reopened, while reads go on,
+/// and the open finds a prefix of what was acknowledged before the failure
+/// and whatever the device kept of the rest. So does a failed write whose
+/// bytes cannot be cut back off the log. Nor is the directory's fsync a new
+/// name needs -- a log file a rotation began, a run's temp name -- retried
+/// where it fails: each name it was for is given a second entry, a hard
+/// link beside it under the name with `.guard` after it, and the directory
+/// is synced again, which makes durable what was done after the failure,
+/// and the call goes on. The guard stands until its file goes, and an open
+/// that finds a guard whose file is not there -- the entry a power cut
+/// took -- gives the file its name back. Where the guard cannot be made
+/// either, the failure is kept as a failed sync of the log is.
 ///
 /// An ordered run's file is its own log in the clear, and the same rules
 /// hold of it. A run's commit writes its batch to the file whatever the
@@ -7088,6 +7095,11 @@ fn wal_seed(id: u64) -> u32 {
 /// Frame kinds. A batch is the frames between commit frames, and replay
 /// applies a batch only once its commit frame has been read intact.
 const WAL_PUT: u8 = 0;
+/// `Db::fail_guard`'s values, a test's: the guard's link fails, or the
+/// directory's fsync after the guards.
+const GUARD_FAIL_LINK: u8 = 1;
+const GUARD_FAIL_SYNC: u8 = 2;
+
 /// `Db::fail_log_sync`'s bits, a test's: which sync of the log fails next.
 const FAIL_SYNC_LIVE: u8 = 1;
 const FAIL_SYNC_LOOSE: u8 = 2;
@@ -21183,6 +21195,9 @@ struct Shared {
     /// A test's: the writer's next directory barrier fails
     /// (`Db::fail_next_dir_barrier`).
     fail_dir_barrier: std::sync::atomic::AtomicBool,
+    /// Names a failed directory barrier was for, given a guard
+    /// (`Db::guard_names`), over the store's life.
+    dir_guards: AtomicU64,
     /// An error of the segment work's, for the writer's next commit to
     /// return: one slot, the first error kept.
     maint_err: AtomicPtr<std::io::Error>,
@@ -23043,6 +23058,10 @@ pub struct Db {
     /// its new file (`FAIL_SYNC_DIR`) fails, as a failed fdatasync or fsync
     /// would; see `Db::fail_next_wal_sync`.
     fail_log_sync: u8,
+    /// A test's: which step of the next guarding of the names a failed
+    /// barrier was for fails (`GUARD_FAIL_LINK`, `GUARD_FAIL_SYNC`), which
+    /// the store keeps (`Db::lost`).
+    fail_guard: u8,
     /// A test's (`Db::trace_wal_syncs`): every fdatasync of a log file
     /// that returned `Ok`, with the file's length at its issue, and every
     /// rewrite of a header's kind as chained (`None`), in the order they
@@ -35850,8 +35869,8 @@ impl Db {
     }
 
     /// The directory fsync a rotation owes its new file, paid once: a
-    /// failure is kept (`Db::lost`) and never retried; see
-    /// `wal_dir_unsynced`.
+    /// failure is never retried, and is made by guards where it can be
+    /// (`dir_barrier`); see `wal_dir_unsynced`.
     fn wal_dir_barrier(&mut self) -> Result<()> {
         if self.wal_dir_unsynced {
             self.dir_barrier()?;
@@ -35865,8 +35884,14 @@ impl Db {
     /// names of the runs that closed loose. The barrier is of the
     /// directory and not of a name, so one promises them all, and a run
     /// whose name a rotation's barrier carried asks for none of its own.
-    /// A failure is kept (`Db::lost`) and never retried, as a failed sync
-    /// of the log is: nothing is marked, and every call after answers it.
+    /// A failure is never retried, since Linux may drop what a failed sync
+    /// was to write and answer the next one `Ok`: every name the barrier
+    /// was for is given a second entry instead, a guard (`vault::guard`),
+    /// and the directory synced again through a descriptor of its own,
+    /// which covers the guards as it covers any operation made after the
+    /// failure (`guard_names`). Where that fails too the failure is kept
+    /// (`Db::lost`): nothing is marked, reads go on, and every commit,
+    /// `sync` and `flush` after answers it until the store is reopened.
     fn dir_barrier(&mut self) -> Result<()> {
         let r = if self.fail_log_sync & FAIL_SYNC_DIR != 0 {
             self.fail_log_sync &= !FAIL_SYNC_DIR;
@@ -35885,7 +35910,7 @@ impl Db {
             vault::sync_dir(&self.dir)
         };
         if let Err(e) = r {
-            return Err(self.keep_lost(e));
+            self.guard_names(e)?;
         }
         self.wal_dir_unsynced = false;
         if let Some(d) = self.direct.as_mut() {
@@ -35893,6 +35918,69 @@ impl Db {
         }
         for r in &mut self.loose_runs {
             r.named = true;
+        }
+        Ok(())
+    }
+
+    /// The names a failed directory barrier was for, each given a guard,
+    /// and the directory synced again: where a rotation owes its barrier,
+    /// the live log file and the files rotations closed loose, any of
+    /// which may be a name no barrier has promised; the run in progress's
+    /// temp name where it is owed one; and the temp names of the runs that
+    /// closed loose owing one. Guarded, every one is as durable as a
+    /// barrier would have made it, so the barrier is made and the call goes
+    /// on. Where a link or that sync fails as well, the barrier's failure
+    /// and the guard's are kept together (`Db::lost`): a directory that
+    /// cannot make a new entry durable either can make no name the store
+    /// would write next durable, so every write is refused from there and
+    /// the reads go on; and the open after a crash gives a guarded file
+    /// whose own name was lost its name back.
+    #[cold]
+    #[inline(never)]
+    fn guard_names(&mut self, failed: std::io::Error) -> Result<()> {
+        let mut names: Vec<PathBuf> = Vec::new();
+        if self.wal_dir_unsynced {
+            names.push(self.wal.path.clone());
+            names.extend(self.loose_wals.iter().cloned());
+        }
+        if let Some(d) = self.direct.as_ref().filter(|d| !d.named) {
+            names.push(d.tmp.clone());
+        }
+        names.extend(
+            self.loose_runs
+                .iter()
+                .filter(|r| !r.named)
+                .map(|r| r.tmp.clone()),
+        );
+        let fail = std::mem::take(&mut self.fail_guard);
+        let mut made = 0u64;
+        let r = (|| -> Result<()> {
+            for n in &names {
+                // A loose file or run a landing has retired since is
+                // covered by a durable segment, and needs no name.
+                if !vault::exists(n) {
+                    continue;
+                }
+                if fail == GUARD_FAIL_LINK {
+                    return Err(err("injected: a guard's link failed"));
+                }
+                vault::guard(n)?;
+                made += 1;
+            }
+            if fail == GUARD_FAIL_SYNC {
+                return Err(err("injected: the guards' directory fsync failed"));
+            }
+            vault::sync_dir(&self.dir)
+        })();
+        self.shared
+            .dir_guards
+            .fetch_add(made, AtomicOrdering::Relaxed);
+        if let Err(e) = r {
+            let kept = std::io::Error::new(
+                failed.kind(),
+                format!("{failed}, and the names it was for could not be guarded: {e}"),
+            );
+            return Err(self.keep_lost(kept));
         }
         Ok(())
     }
@@ -36397,6 +36485,7 @@ impl Db {
             fail_seal_dir_sync: std::sync::atomic::AtomicBool::new(false),
             fail_seal_sync: std::sync::atomic::AtomicBool::new(false),
             fail_dir_barrier: std::sync::atomic::AtomicBool::new(false),
+            dir_guards: AtomicU64::new(0),
             maint_err: AtomicPtr::new(std::ptr::null_mut()),
             maint_stop: std::sync::atomic::AtomicBool::new(false),
             spare_wal: AtomicPtr::new(spare_wal),
@@ -36526,6 +36615,7 @@ impl Db {
             pending_err: None,
             lost: None,
             fail_log_sync: 0,
+            fail_guard: 0,
             wal_trace: None,
             wal_opened: None,
             run_fault_open: 0,
@@ -36786,6 +36876,39 @@ impl Db {
         // sweeps below ask about, sorted to be searched.
         let mut listed = vault::names(dir)?;
         listed.sort_unstable();
+        // A guard (`vault::guard`) is a second entry for a file whose own
+        // entry a failed directory fsync may have lost: one whose file is
+        // not there gives it its name back, the directory synced before
+        // anything reads the name, and one beside its file is kept, since
+        // the file's own entry is no more durable for the store having
+        // stopped. This is the one write an open makes before it has
+        // checked its slot: the directory it checks against is the one the
+        // store had, with the name the failure might have taken, and the
+        // files are as they were.
+        if listed.iter().any(|n| n.ends_with(vault::GUARD_SUFFIX)) {
+            let guards: Vec<String> = listed
+                .iter()
+                .filter(|n| n.ends_with(vault::GUARD_SUFFIX))
+                .cloned()
+                .collect();
+            let mut restored = false;
+            for g in &guards {
+                let name = &g[..g.len() - vault::GUARD_SUFFIX.len()];
+                let file = dir.join(name);
+                if listed.binary_search_by(|n| n.as_str().cmp(name)).is_err() {
+                    vault::rename(dir.join(g), &file)?;
+                    listed.push(name.to_string());
+                    restored = true;
+                } else {
+                    vault::adopt_guard(&file);
+                }
+            }
+            listed.retain(|n| !n.ends_with(vault::GUARD_SUFFIX));
+            listed.sort_unstable();
+            if restored {
+                vault::sync_dir(dir)?;
+            }
+        }
         let on_disk: Vec<String> = listed
             .iter()
             .filter(|name| {
@@ -37543,6 +37666,7 @@ impl Db {
             fail_seal_dir_sync: std::sync::atomic::AtomicBool::new(false),
             fail_seal_sync: std::sync::atomic::AtomicBool::new(false),
             fail_dir_barrier: std::sync::atomic::AtomicBool::new(false),
+            dir_guards: AtomicU64::new(0),
             maint_err: AtomicPtr::new(std::ptr::null_mut()),
             maint_stop: std::sync::atomic::AtomicBool::new(false),
             spare_wal: AtomicPtr::new(spare_wal),
@@ -37672,6 +37796,7 @@ impl Db {
             pending_err: None,
             lost: None,
             fail_log_sync: 0,
+            fail_guard: 0,
             wal_trace: None,
             wal_opened,
             run_fault_open: 0,
@@ -42397,6 +42522,32 @@ impl Db {
         self.fail_log_sync |= FAIL_SYNC_DIR;
     }
 
+    /// A test's: the next guarding of the names a failed directory barrier
+    /// was for fails at its first link (`link`) or at the directory's
+    /// fsync after the links, and the store keeps the failure
+    /// (`Db::guard_names`).
+    #[doc(hidden)]
+    pub fn fail_next_dir_guard(&mut self, link: bool) {
+        self.fail_guard = if link {
+            GUARD_FAIL_LINK
+        } else {
+            GUARD_FAIL_SYNC
+        };
+    }
+
+    /// A test's: the names given a guard after a failed directory barrier,
+    /// over the store's life.
+    #[doc(hidden)]
+    pub fn dir_guards(&self) -> u64 {
+        self.shared.dir_guards.load(AtomicOrdering::Relaxed)
+    }
+
+    /// A test's: whether the file at `path` stands guarded.
+    #[doc(hidden)]
+    pub fn is_guarded(path: &Path) -> bool {
+        vault::guarded(path)
+    }
+
     /// A test's: the next seal's readable landing fails as a `Seg::open`
     /// that cannot read the segment would, so the queue behind it is seen
     /// to stop and a reopen to replay what the failed seal covered.
@@ -42763,6 +42914,9 @@ impl Db {
         if let Some(h) = me.wal.zeroing.take() {
             let _ = h.join();
         }
+        // A dead process's record of the guards it made goes with it: the
+        // open after finds them on disk.
+        vault::forget_guards(&me.dir);
         me.lock.release();
     }
 
@@ -57764,6 +57918,9 @@ impl Drop for Db {
                 }
             }
         }
+        // The guards of this store's names are its files' now: the next
+        // open finds them beside their files and keeps them again.
+        vault::forget_guards(&self.dir);
     }
 }
 

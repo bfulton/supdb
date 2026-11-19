@@ -2068,9 +2068,102 @@ pub(crate) fn dir_exists(dir: impl AsRef<Path>) -> Result<()> {
     }
 }
 
+/// The names a guard stands beside (`guard`), process-wide as the door
+/// is: how many, read beside every removal and rename, and the names.
+static GUARDED: AtomicUsize = AtomicUsize::new(0);
+static GUARDS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// The guard of `path`: its name with `.guard` after it, in the same
+/// directory, so a store under a cipher passes it to the directory where
+/// it passes the file (`passes`).
+pub(crate) fn guard_path(path: &Path) -> PathBuf {
+    let mut g = path.as_os_str().to_os_string();
+    g.push(GUARD_SUFFIX);
+    PathBuf::from(g)
+}
+
+/// The suffix a guard's name carries.
+pub(crate) const GUARD_SUFFIX: &str = ".guard";
+
+/// A second directory entry made for the file at `path`, a hard link
+/// under its guard's name, after a directory fsync that was to make
+/// `path`'s own entry durable failed (`Db::dir_barrier`): Linux may drop
+/// what a failed sync was to write and answer a later one `Ok`, so the
+/// entry the failure was for is never trusted again in this boot, and a
+/// new operation on the directory is made instead, which the caller's
+/// next fsync of the directory covers as any operation after it. The
+/// guard stands until the file goes: its removal or its rename through
+/// the door unlinks the guard first (`unguard`), so a guard never names
+/// the inode under another name, and an open that finds a guard whose
+/// file is not there gives the file its name back from it.
+pub(crate) fn guard(path: &Path) -> Result<()> {
+    let g = guard_path(path);
+    match hard_link(path, &g) {
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+        r => r?,
+    }
+    adopt_guard(path);
+    Ok(())
+}
+
+/// A guard an open found beside its file, kept as `guard` keeps one.
+pub(crate) fn adopt_guard(path: &Path) {
+    let mut gs = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    if !gs.iter().any(|p| p == path) {
+        gs.push(path.to_path_buf());
+        GUARDED.store(gs.len(), Ordering::Relaxed);
+    }
+}
+
+/// The guards of the files in `dir` forgotten, unlinked nowhere: a store's
+/// close, whose files the next open finds the guards of again.
+pub(crate) fn forget_guards(dir: &Path) {
+    let mut gs = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    gs.retain(|p| p.parent() != Some(dir));
+    GUARDED.store(gs.len(), Ordering::Relaxed);
+}
+
+/// Whether `path` stands guarded, for a test.
+pub(crate) fn guarded(path: &Path) -> bool {
+    GUARDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|p| p == path)
+}
+
+/// The guard of `path` unlinked before `path` is removed or renamed, and
+/// forgotten: first, so that a crash between the two leaves the file
+/// with no guard -- a name an open reads as it always did -- and never a
+/// guard whose file has gone, which an open would give the name back.
+#[cold]
+#[inline(never)]
+fn unguard(path: &Path) -> Result<()> {
+    let mut gs = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(i) = gs.iter().position(|p| p == path) else {
+        return Ok(());
+    };
+    let g = guard_path(path);
+    let r = match locate(&g) {
+        None => std::fs::remove_file(&g),
+        Some((v, name)) if passes(&name) => std::fs::remove_file(v.real.join(name)),
+        Some((v, name)) => v.remove(&name),
+    };
+    match r {
+        Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    gs.swap_remove(i);
+    GUARDED.store(gs.len(), Ordering::Relaxed);
+    Ok(())
+}
+
 /// `std::fs::rename`.
 pub(crate) fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()> {
     let (from, to) = (from.as_ref(), to.as_ref());
+    if GUARDED.load(Ordering::Relaxed) != 0 {
+        unguard(from)?;
+    }
     match (locate(from), locate(to)) {
         (None, None) => std::fs::rename(from, to),
         (Some((v, a)), Some((w, b))) if Arc::ptr_eq(&v, &w) && passes(&a) == passes(&b) => {
@@ -2125,6 +2218,9 @@ pub(crate) fn hard_link(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<
 /// `std::fs::remove_file`.
 pub(crate) fn remove_file(path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
+    if GUARDED.load(Ordering::Relaxed) != 0 {
+        unguard(path)?;
+    }
     match locate(path) {
         None => std::fs::remove_file(path),
         Some((v, name)) if passes(&name) => std::fs::remove_file(v.real.join(name)),
