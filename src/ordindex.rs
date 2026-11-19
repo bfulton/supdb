@@ -425,6 +425,12 @@ pub struct OrdIndex {
     /// seeks of them, and a seek that finds one gone waits on the device;
     /// a copy in the process's own memory is not the cache's to take.
     heads: std::sync::atomic::AtomicPtr<u8>,
+    /// The heads a read may take through `heads`: `n` for a mapped file,
+    /// whose heads are in memory, and none for a mapping read by the
+    /// piece, whose every head is asked for out of line (`head_absent`).
+    /// It is the bound every head read tests anyway, so a mapped file's
+    /// read asks nothing it did not ask before.
+    lim: usize,
 }
 
 impl OrdIndex {
@@ -514,6 +520,7 @@ impl OrdIndex {
         });
         Ok(OrdIndex {
             heads,
+            lim: if paged { 0 } else { n },
             map,
             n,
             pfx,
@@ -532,7 +539,7 @@ impl OrdIndex {
     /// file pays is of a length it has loaded already.
     #[inline]
     fn top(&self) -> &[u64] {
-        if !self.top_eager.is_empty() || self.n == 0 {
+        if !self.top_eager.is_empty() {
             return &self.top_eager;
         }
         self.top_late()
@@ -541,6 +548,9 @@ impl OrdIndex {
     #[cold]
     #[inline(never)]
     fn top_late(&self) -> &[u64] {
+        if self.n == 0 {
+            return &self.top_eager;
+        }
         self.top_late.get_or_init(|| {
             (0..self.n)
                 .step_by(TOP_STRIDE)
@@ -557,7 +567,7 @@ impl OrdIndex {
     #[inline(never)]
     fn head_absent(&self, i: usize) -> u64 {
         assert!(
-            self.map.piecewise(),
+            self.map.piecewise() && i < self.n,
             "head {i} of an ordered index of {}",
             self.n
         );
@@ -721,11 +731,10 @@ impl OrdIndex {
 
     #[inline]
     fn head(&self, i: usize) -> u64 {
-        let p = self.heads.load(std::sync::atomic::Ordering::Acquire);
-        if p.is_null() {
+        if i >= self.lim {
             return self.head_absent(i);
         }
-        assert!(i < self.n, "a head past the index");
+        let p = self.heads.load(std::sync::atomic::Ordering::Acquire);
         // SAFETY: the pointer names `n` heads -- the mapping's, which `open`
         // held to that many, or a copy of exactly those (`set_heads`) --
         // and `i` is one of them.
