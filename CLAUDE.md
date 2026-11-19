@@ -32,7 +32,7 @@ of the change that produced the text.
 |---|---|
 | `src/db.rs` | the engine: WAL with atomic batches, memtable, sealed segments, partitioned compaction, tombstones, `Txn`, and the `SegmentWriter` every segment is written by -- `docs/engine.md` |
 | `src/db/zpages.rs` | the compact form's layout: the page, the directory of the groups it holds, the group, the fill that cuts records into groups and packs them into pages, the fence, the trailer and the identity a form file is bound by, with no file, thread or clock in it -- the module's own docs, and `bench/examples/zsize.rs` for what it makes of the engine's bytes |
-| `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`); and the stride form, an experiment (`Options::zpages_stride`, off; `zpages_stride_below` keeps it to the partitions under a key, `zpages_stride_room` to the builds made while the store in it fits, and `zpages_stride_convert` moves a served partition between it and the block form), a partition's values alone at their stride where its keys are one run of numbers -- the module's own docs, and `docs/engine.md` for where it wins and where it does not fit |
+| `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`); and the stride form (`Options::zpages_stride`; `zpages_stride_room` keeps it to the builds made while the store in it fits, `zpages_stride_convert` moves a served partition between it and the block form, and `zpages_stride_below`, an arm's, keeps it to the partitions under a key), a partition's values alone at their stride where its keys are one run of numbers -- the module's own docs, and `docs/engine.md` for where it wins and where it does not fit |
 | `src/db/dirkey.rs` | a live store's directory under a key, encrypted by the kernel (`Encryption::Kernel`): the requests of Linux's file encryption, what `create` and `open` hold a directory to, and `lock`, with no cipher and no byte of a read path in it -- the module's own docs, and `scripts/fscrypt.sh` for a filesystem to test it on |
 | `src/db/vault.rs` | a live store under a cipher the caller supplies (`Encryption::Cipher`): the door every file operation of the engine goes through, which is the standard library's call for a plain store; a file as a memory file while it is written and as its envelope in the directory after; the marker and the keys, the caller's wrapping the store's and the store's wrapping a key a file; the manifest's slot and the log's record sealed, with no cipher in the crate -- the module's own docs, `tests/cipher.rs`, and `ZFUZZ_CIPHER=1` for the differential fuzz |
 | `src/db/pager.rs` | the cache a store under a cipher reads its files through: a file as address space its plaintext's length, a chunk of it decrypted where it is first asked for and a megabyte given back at a time once the cache is past its budget and no reader could hold it; the holds and rests of the threads that read with no slot of the reader table, the two lines past the budget at which the store's own work and then a caller's read wait, and the failure a read remembers, with no cipher in it and no reader of the format -- the module's own docs, and `tests/cipher.rs` for a store several times its cache |
@@ -7634,7 +7634,18 @@ counted by the decision before the median of any rate is read, and the
 cell is read as two shapes with the share of each; a count that reads
 level at the median is read in its pairs column too; and a default is not
 drafted in the tree while its last pairing runs, since a draft taken back
-out is a second edit of the files the fix that follows has to touch.
+out is a second edit of the files the fix that follows has to touch. It came again
+as the pass a decision falls in. F under 1 GiB read 0.90x to 0.94x for
+the stride arm in four sittings of six reps, behind in both orders of two
+pairings, and was written down as the arm's. A sitting traced and timed
+by kind laid each rep's F to the mix the hot-raw policy sent its raw
+head partition back to the form in, which is whichever mix the group's
+slack runs out in: a rep whose way back fell in F read it at 565 to 642
+ms and one whose way back fell in D or E at 510 to 593, in either arm
+and but for one rep at 726 on its commits, and the arm's fell in F in
+three reps of six where the default's fell there in one. In the same shape the arm was not behind. The corollary: a
+decision every rep makes once still splits a cell in two when the pass
+it is made in varies, so the reps are counted by the pass it fell in.
 
 **A wait on the first counter of a turn, and a fix for it that the race
 made wide refuted.** The tests step the controller by moving its injected
@@ -7731,6 +7742,28 @@ into the cache, written or read, which no count of residency shows; and
 a cell that reads behind with every counter level is short of something
 no counter counts, so the next instrument is the accounting a level
 down and not another counter of the same kind.
+
+**A default gated green over a roster the gate never opens.** The
+stride form's options became the engine's on pairings at every bounded
+rung and a green `sh scripts/check.sh`, and the quick run that followed
+stopped at its first rung in two seconds: the harness refuses a stride
+arm whose store holds no stride file after the ordered load, asked it of
+any arm whose options say the form, and `supdb-nozpages`, the arm with
+the compact form off, carried the engine's new option and no form file
+of any kind. The refusal had been right for as long as only an arm that
+set the stride form had it; the controller's arms were exempt by name
+and the form-off arm by nobody. The gate's bench group opens the dozen
+arms its tests name, and the fifteen controller tests the flip broke
+were found by running the tests before the gate; the roster's arms are
+opened by the quick group alone, which is not in the gate's default set
+because it is a timing run. The refusal holds a forced arm now, and its
+test has the form-off arm. The rule: a default is gated on every place
+an arm that inherits it is opened, and a check keyed on an option's
+value is read again when the option becomes everyone's, since "the arm
+that asked for it" and "every arm that pins nothing" stop being the
+same set; before a default's quick row, the whole roster is opened at
+the smallest rung with one rep, a ten-second run that says what
+twenty-five minutes would have said at their start.
 
 ## Standing limitations
 

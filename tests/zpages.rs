@@ -7125,8 +7125,19 @@ fn auto_store_loaded(
         zpages_inject: Some(inject.clone()),
         zpages_land_pct: 0,
         zpages_hot_raw: false,
-        // Off in the engine; a test that sets it says so after this.
-        zpages_convert_drops_output: common::convert_drops_switch(),
+        // The block form, and its ordered indexes dropped once, unless a
+        // test asks: the tests here count the form files a store holds,
+        // their codings and what the cache holds of each kind of file, and
+        // were written against the block form. The tests of the stride
+        // form set it and whichever of its options they are about -- the
+        // room a build asks for it in, the conversion between the two, the
+        // hot-raw policy beside it -- each from off, as it was written; the
+        // tests of the second drop set theirs.
+        zpages_stride: ZStride::Off,
+        zpages_stride_room: false,
+        zpages_stride_convert: false,
+        zpages_hot_raw_beside_stride: false,
+        zpages_drop_again: false,
         ..Options::default()
     };
     extra(&mut opts);
@@ -15280,8 +15291,10 @@ fn keys_on_page(p: usize, keys: &[Vec<u8>]) -> Vec<Vec<u8>> {
 /// (`common::options`) and the one `forced` opens each give a partition of
 /// numbered keys a stride file and answer its reads from it, and the
 /// oracle's forced store asks for the form beside the raw store it is held
-/// to; without it, all are what they were, the default and the block
-/// form's. A run under the switch that reached no stride file would pass
+/// to; without it the first is the default's, whatever form the engine
+/// ships under the controller, and the forced ones are the block form's,
+/// which is what a test that forces the compact form was written against.
+/// A run under the switch that reached no stride file would pass
 /// every test it runs and say nothing of the form, so the switch's word is
 /// read here a second time only to hold `stride_switch`'s reading of it to
 /// it.
@@ -15298,8 +15311,8 @@ fn the_stride_switch_gives_the_stores_it_reaches_the_stride_form() {
         );
         assert_eq!(
             oracle_opts(false, false, raw_tails).zpages_stride,
-            ZStride::Off,
-            "the oracle's raw store"
+            Options::default().zpages_stride,
+            "the oracle's raw store, which names no form"
         );
     }
     let stores = [
@@ -15308,9 +15321,15 @@ fn the_stride_switch_gives_the_stores_it_reaches_the_stride_form() {
     ];
     if !on {
         let d = Options::default();
-        for (name, o) in &stores {
-            assert_eq!(o.zpages_stride, ZStride::Off, "{name}");
-        }
+        assert_eq!(
+            stores[0].1.zpages_stride, d.zpages_stride,
+            "the options a test builds on are the default's"
+        );
+        assert_eq!(
+            stores[1].1.zpages_stride,
+            ZStride::Off,
+            "a test that forces the compact form is the block form's"
+        );
         assert!(
             stores[0].1.zpages == d.zpages && stores[0].1.zpages_min_bytes == d.zpages_min_bytes,
             "the options a test builds on are the default's"
