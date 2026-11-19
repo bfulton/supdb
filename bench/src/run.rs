@@ -2398,7 +2398,7 @@ fn read_phase(
     e: &mut dyn Engine,
     arm: &str,
     size: u64,
-    km: KeyMap,
+    km: &KeyMap,
     reads: u64,
     h: &mut Hist,
     counting: &mut Counting<'_>,
@@ -2747,7 +2747,7 @@ fn one_pass(
     let mut h = Hist::new();
     let mut read_s = f64::NAN;
     if passes.read {
-        read_s = read_phase(e.as_mut(), arm, size, km, reads, &mut h, &mut counting)?;
+        read_s = read_phase(e.as_mut(), arm, size, &km, reads, &mut h, &mut counting)?;
     }
 
     // The same reads over each thread count, on the store as loaded and
@@ -2770,7 +2770,7 @@ fn one_pass(
             threads,
             ops,
             size,
-            km,
+            &km,
             READ_THREADED_SEED,
             Op::Get,
             c0.is_some(),
@@ -2858,7 +2858,7 @@ fn one_pass(
             threads,
             ops,
             scan_keys,
-            km,
+            &km,
             SCAN_THREADED_SEED,
             Op::Range(plan.scan_len),
             c0.is_some(),
@@ -2885,7 +2885,7 @@ fn one_pass(
             &YCSB,
             0,
             size,
-            km,
+            &km,
             mix_ops,
             &mut inserted,
             payload,
@@ -2915,7 +2915,7 @@ fn one_pass(
             threads,
             ops,
             scan_keys,
-            km,
+            &km,
             SCAN_MIXED_SEED,
             Op::Range(plan.scan_len),
             c0.is_some(),
@@ -2948,7 +2948,7 @@ fn one_pass(
             &YCSBS,
             YCSBS_SEED_SALT,
             size,
-            km,
+            &km,
             mix_ops,
             &mut inserted,
             payload,
@@ -4151,14 +4151,13 @@ fn thread_seed(seed: u64, i: usize) -> u64 {
 /// blend the readers' faults with the engine's merges beside them.
 // Eight parameters: clippy::too_many_arguments, allowed as `lag_sweep` allows it.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn threaded(
     e: &dyn Engine,
     pass: &str,
     threads: usize,
     ops: u64,
     keys: u64,
-    km: KeyMap,
+    km: &KeyMap,
     seed: u64,
     op: Op,
     count: bool,
@@ -4407,7 +4406,7 @@ fn mix_family(
     table: &[(char, u32, u32, u32, u32, u32, KeyDist); 6],
     seed_salt: u64,
     size: u64,
-    km: KeyMap,
+    km: &KeyMap,
     mix_ops: u64,
     inserted: &mut u64,
     payload: &Payload,
@@ -4455,7 +4454,9 @@ fn mix_family(
         }
         let cb = counting.begin();
         phase_mark(arm, &mix, "start");
-        let secs = ycsb(e, arm, &mix, w, seed_salt, size, km, mix_ops, inserted, payload)?;
+        let secs = ycsb(
+            e, arm, &mix, w, seed_salt, size, km, mix_ops, inserted, payload,
+        )?;
         phase_mark(arm, &mix, "end");
         counting.end(cb, &mix, "", None, mix_ops);
         ops_s.push((letter, mix_ops as f64 / secs));
@@ -4495,7 +4496,7 @@ fn ycsb(
     w: &(char, u32, u32, u32, u32, u32, KeyDist),
     seed_salt: u64,
     size: u64,
-    km: KeyMap,
+    km: &KeyMap,
     ops: u64,
     inserted: &mut u64,
     payload: &Payload,
@@ -4617,7 +4618,7 @@ pub fn replay_row<E: Engine>(
         threads: usize,
         ops: u64,
         keys: u64,
-        km: KeyMap,
+        km: &KeyMap,
         seed: u64,
         scan: Option<usize>,
     ) -> Result<(), String> {
@@ -4660,7 +4661,7 @@ pub fn replay_row<E: Engine>(
     phase(e, "read", reads);
     for &threads in &plan.threads {
         let ops = reads * threads as u64;
-        turns(e, threads, ops, size, km, READ_THREADED_SEED, None)?;
+        turns(e, threads, ops, size, &km, READ_THREADED_SEED, None)?;
         phase(e, &format!("read_{threads}t"), ops);
     }
 
@@ -4679,7 +4680,7 @@ pub fn replay_row<E: Engine>(
      -> Result<(), String> {
         for &threads in &plan.threads {
             let ops = plan.divided(size) * threads as u64;
-            turns(e, threads, ops, scan_keys, km, seed, Some(plan.scan_len))?;
+            turns(e, threads, ops, scan_keys, &km, seed, Some(plan.scan_len))?;
             phase(e, &format!("{name}_{threads}t"), ops);
         }
         Ok(())
@@ -4704,7 +4705,7 @@ pub fn replay_row<E: Engine>(
                 w,
                 salt,
                 size,
-                km,
+                &km,
                 mix_ops,
                 &mut inserted,
                 &payload,
@@ -5477,7 +5478,7 @@ mod tests {
                 2,
                 size,
                 size,
-                KeyMap::numbered(),
+                &KeyMap::numbered(),
                 1,
                 Op::Get,
                 count,
@@ -5539,7 +5540,7 @@ mod tests {
                 2,
                 scans,
                 size - plan.scan_len as u64,
-                KeyMap::numbered(),
+                &KeyMap::numbered(),
                 2,
                 Op::Range(plan.scan_len),
                 false,
@@ -5791,7 +5792,7 @@ mod tests {
                 &mut e,
                 "supdb-nocachezpages",
                 1_000,
-                KeyMap::numbered(),
+                &KeyMap::numbered(),
                 50,
                 &mut h,
                 &mut counting,
@@ -6253,7 +6254,7 @@ mod tests {
             w,
             salt,
             size,
-            KeyMap::numbered(),
+            &KeyMap::numbered(),
             ops,
             inserted,
             &payload,

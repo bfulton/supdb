@@ -307,31 +307,116 @@ fn mix64(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// The id of key index `n` in a store loaded with `loaded` keys
-/// (`KeyShape::Ids`).
+/// The ids of a store's keys (`KeyShape::Ids`): which 64-bit id each key
+/// index has, in a store loaded with `loaded` keys.
 ///
-/// The 64-bit space is cut into `loaded` strata of one width, and loaded
-/// key `n` is a random point of stratum `n`: so the ids ascend with the
-/// index, which is what lets a load in key order, a scan from a drawn key
-/// and a read of a drawn key each be a function of an index with nothing
-/// sorted or stored, and to an engine they are `loaded` random ids -- one a
-/// stratum where independent draws would leave some strata empty and some
-/// doubled, the neighbours' gaps anywhere from nothing to two strata wide.
-/// An index at or above `loaded` is a key inserted after the load: a random
-/// point of a random stratum, so it falls among the loaded keys and not
-/// above them. Two indexes share an id only where they share a stratum and
-/// draw one offset of its width, one chance in about two million million
-/// a pair at ten million keys, and an insert that did would be an update.
-#[inline]
-pub fn id_of(n: u64, loaded: u64) -> u64 {
-    let loaded = loaded.max(1);
-    let width = u64::MAX / loaded;
-    let stratum = if n < loaded {
-        n
-    } else {
-        mix64(n ^ 0x9E37_79B9_7F4A_7C15) % loaded
-    };
-    stratum * width + mix64(n.wrapping_add(0xD6E8_FEB8_6659_FD93)) % width.max(1)
+/// The loaded keys' ids are `loaded` independent uniform draws, sorted, as
+/// far as a function of the index can give them with nothing sorted and
+/// little stored. The space is cut into cells of one width, each loaded
+/// key is dealt to a cell by a hash of its number, and the cells' running
+/// counts are kept: so how many ids fall in any stretch of the space
+/// varies as independent draws' counts do, at every scale from a cell up --
+/// some cells hold half again their share and some hold none -- which is
+/// what a structure that guesses a key's place from its value is priced
+/// by. One id a stratum of the whole space, the first version of this,
+/// puts key `n` within one stride of `n` strides in; a guess was never
+/// wrong there by more than a key, and a search built on guessing read
+/// better than random ids would let it. Inside a cell the keys it was
+/// dealt are one to a stratum of the cell, a random point of each, so the
+/// ids ascend with the index and no two are one id: a load in key order, a
+/// scan from a drawn key and a read of a drawn key are each a function of
+/// an index. A cell holds sixteen keys or so, fewer in a small store and
+/// more past a million keys, where the cells stop at 65,536 and the two
+/// tables at half a megabyte.
+///
+/// An index at or above `loaded` is a key inserted after the load: a
+/// uniform draw of the whole space, so it falls among the loaded keys and
+/// not above them. It is one of the loaded ids with a chance in 2^64 a
+/// loaded key, and an insert that was would be an update.
+#[derive(Debug)]
+pub struct Ids {
+    loaded: u64,
+    /// The id's bits below its cell's: a cell is `1 << shift` ids wide.
+    shift: u32,
+    /// `cum[c]` is the loaded keys in the cells below `c`; one past the
+    /// last cell is `loaded`.
+    cum: Vec<u32>,
+    /// `first[t]` is the cell key index `t << step` is in: where the walk
+    /// to an index's cell starts, a cell or two short of it.
+    first: Vec<u32>,
+    step: u32,
+}
+
+/// The most cells the id space is cut into: the two tables are a word a
+/// cell each, and stay in the core's cache.
+const ID_CELLS_MAX: u64 = 1 << 16;
+/// The loaded keys a cell holds on average, while the cells are under
+/// their most.
+const ID_CELL_KEYS: u64 = 16;
+
+impl Ids {
+    pub fn new(loaded: u64) -> Ids {
+        assert!(
+            loaded < u64::from(u32::MAX),
+            "the cells' counts are 32-bit: {loaded} keys"
+        );
+        // A power of two of cells, two at least, so a cell is a shift.
+        let cells = (loaded / ID_CELL_KEYS)
+            .next_power_of_two()
+            .clamp(2, ID_CELLS_MAX);
+        let bits = cells.trailing_zeros();
+        let shift = 64 - bits;
+        let mut cum = vec![0u32; cells as usize + 1];
+        for i in 0..loaded {
+            cum[(mix64(i ^ 0x9E37_79B9_7F4A_7C15) >> shift) as usize + 1] += 1;
+        }
+        for c in 0..cells as usize {
+            cum[c + 1] += cum[c];
+        }
+        // One entry a cell's worth of indexes: the walk from an entry to
+        // an index's cell crosses the cells those few indexes span.
+        let step = (loaded / cells).max(1).ilog2();
+        let mut first = Vec::with_capacity((loaded >> step) as usize + 1);
+        let mut c = 0usize;
+        for t in 0..=(loaded >> step) {
+            let n = (t << step).min(loaded.saturating_sub(1));
+            while u64::from(cum[c + 1]) <= n && c + 1 < cells as usize {
+                c += 1;
+            }
+            first.push(c as u32);
+        }
+        Ids {
+            loaded,
+            shift,
+            cum,
+            first,
+            step,
+        }
+    }
+
+    /// The id of key index `n`.
+    #[inline]
+    pub fn of(&self, n: u64) -> u64 {
+        if n >= self.loaded {
+            return mix64(n ^ 0xD6E8_FEB8_6659_FD93);
+        }
+        let mut c = self.first[(n >> self.step) as usize] as usize;
+        while u64::from(self.cum[c + 1]) <= n {
+            c += 1;
+        }
+        let (below, here) = (
+            u64::from(self.cum[c]),
+            u64::from(self.cum[c + 1] - self.cum[c]),
+        );
+        // The cell cut into a stratum for each key dealt to it, and a
+        // random point of this key's: a multiply and a shift for the
+        // point, since a remainder is a second divide.
+        let stratum = (1u64 << self.shift) / here;
+        let point = ((u128::from(mix64(n.wrapping_add(0xA076_1D64_78BD_642F)))
+            * u128::from(stratum))
+            >> 64) as u64;
+        ((c as u64) << self.shift) + (n - below) * stratum + point
+    }
 }
 
 /// `id` as sixteen lowercase hex digits, which order as the ids do.
@@ -345,19 +430,25 @@ pub fn id_key_into(id: u64, buf: &mut [u8; 16]) {
     }
 }
 
-/// The keys of one store: their shape and, for ids, the count of loaded
-/// keys they are spread over. Every key a pass writes or asks for comes
-/// through here from its index, so a pass is over one shape whichever
-/// phase or thread makes the key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The keys of one store: their shape and, for ids, which id each index
+/// has (`Ids`). Every key a pass writes or asks for comes through here
+/// from its index, so a pass is over one shape whichever phase or thread
+/// makes the key.
+#[derive(Clone, Debug)]
 pub struct KeyMap {
     shape: KeyShape,
-    loaded: u64,
+    ids: Option<std::sync::Arc<Ids>>,
 }
 
 impl KeyMap {
+    /// The keys of a store loaded with `loaded` of them. For ids this
+    /// deals every loaded key to its cell, a few nanoseconds a key: made
+    /// once a pass, outside whatever the pass times.
     pub fn new(shape: KeyShape, loaded: u64) -> KeyMap {
-        KeyMap { shape, loaded }
+        KeyMap {
+            shape,
+            ids: (shape == KeyShape::Ids).then(|| std::sync::Arc::new(Ids::new(loaded))),
+        }
     }
 
     /// db_bench's keys, which need no count.
@@ -372,9 +463,9 @@ impl KeyMap {
     /// The key of index `n`, into a caller-owned buffer.
     #[inline]
     pub fn key_into(&self, n: u64, buf: &mut [u8; 16]) {
-        match self.shape {
-            KeyShape::Numbered => db_key_into(n, buf),
-            KeyShape::Ids => id_key_into(id_of(n, self.loaded), buf),
+        match &self.ids {
+            None => db_key_into(n, buf),
+            Some(ids) => id_key_into(ids.of(n), buf),
         }
     }
 }
@@ -445,24 +536,43 @@ mod tests {
     /// every time it is asked for.
     #[test]
     fn the_ids_ascend_with_the_index_and_an_insert_falls_among_them() {
-        for loaded in [1u64, 2, 1_000, 10_000_000] {
+        for loaded in [1u64, 2, 17, 1_000, 300_000, 10_000_000] {
             let km = KeyMap::new(KeyShape::Ids, loaded);
-            let n = loaded.min(50_000);
-            let (mut prev, mut pk) = (None, [0u8; 16]);
+            let ids = Ids::new(loaded);
+            // Every index of a small store; of a large one its first
+            // stretch, its last, and one across the middle.
+            let spans: Vec<(u64, u64)> = if loaded <= 300_000 {
+                vec![(0, loaded)]
+            } else {
+                vec![
+                    (0, 20_000),
+                    (loaded / 2 - 10_000, loaded / 2 + 10_000),
+                    (loaded - 20_000, loaded),
+                ]
+            };
             let mut seen = std::collections::HashSet::new();
             let mut steps = std::collections::HashSet::new();
-            for i in 0..n {
-                let id = id_of(i, loaded);
-                let mut k = [0u8; 16];
-                km.key_into(i, &mut k);
-                assert!(k.iter().all(|b| b.is_ascii_hexdigit()), "{k:?}");
-                if let Some(p) = prev {
-                    assert!(id > p, "{loaded}: id {i} above the one before");
-                    assert!(k > pk, "{loaded}: key {i} above the one before");
-                    steps.insert(id - p);
+            let mut n = 0u64;
+            for (from, to) in spans {
+                let (mut prev, mut pk) = (None, [0u8; 16]);
+                for i in from..to {
+                    let id = ids.of(i);
+                    let mut k = [0u8; 16];
+                    km.key_into(i, &mut k);
+                    assert!(k.iter().all(|b| b.is_ascii_hexdigit()), "{k:?}");
+                    assert_eq!(
+                        u64::from_str_radix(std::str::from_utf8(&k).unwrap(), 16),
+                        Ok(id)
+                    );
+                    if let Some(p) = prev {
+                        assert!(id > p, "{loaded}: id {i} above the one before");
+                        assert!(k > pk, "{loaded}: key {i} above the one before");
+                        steps.insert(id - p);
+                    }
+                    assert!(seen.insert(id));
+                    (prev, pk) = (Some(id), k);
+                    n += 1;
                 }
-                assert!(seen.insert(id));
-                (prev, pk) = (Some(id), k);
             }
             if loaded >= 1_000 {
                 assert!(
@@ -471,13 +581,13 @@ mod tests {
                     steps.len()
                 );
                 // The top of the space is reached, not a corner of it.
-                assert!(id_of(loaded - 1, loaded) > u64::MAX / 2);
+                assert!(ids.of(loaded - 1) > u64::MAX / 2);
                 // Inserts: among the loaded keys, spread, and stable.
-                let top = id_of(loaded - 1, loaded);
+                let top = ids.of(loaded - 1);
                 let (mut below_mid, mut below_top) = (0, 0);
                 for j in 0..1_000u64 {
-                    let id = id_of(loaded + j, loaded);
-                    assert_eq!(id, id_of(loaded + j, loaded));
+                    let id = ids.of(loaded + j);
+                    assert_eq!(id, ids.of(loaded + j));
                     below_mid += u64::from(id < u64::MAX / 2);
                     below_top += u64::from(id < top);
                 }
@@ -486,7 +596,7 @@ mod tests {
                     "{loaded}: inserts on both sides of the middle: {below_mid}"
                 );
                 assert!(
-                    below_top >= 990,
+                    below_top >= 985,
                     "{loaded}: inserts under the greatest loaded key: {below_top}"
                 );
             }
@@ -497,8 +607,55 @@ mod tests {
         db_key_into(42, &mut b);
         assert_eq!(a, b);
         assert_eq!(KeyShape::parse("ids"), Some(KeyShape::Ids));
-        assert_eq!(KeyShape::parse(KeyShape::Numbered.name()), Some(KeyShape::Numbered));
+        assert_eq!(
+            KeyShape::parse(KeyShape::Numbered.name()),
+            Some(KeyShape::Numbered)
+        );
         assert_eq!(KeyShape::parse("uuid"), None);
+    }
+
+    /// The ids are spread as independent draws are and no more evenly: how
+    /// far key `n`'s id lies from where an even spread would put it is,
+    /// over a store, as large as a random walk's -- some hundreds of keys'
+    /// worth at a million keys, where one id a stratum would be within
+    /// one -- and the counts of ids in equal stretches of the space vary as
+    /// a Poisson count's do, their variance near their mean.
+    #[test]
+    fn the_ids_are_spread_as_independent_draws_are() {
+        let loaded = 1_000_000u64;
+        let ids = Ids::new(loaded);
+        let stride = u64::MAX / loaded;
+        let worst = (0..loaded)
+            .step_by(97)
+            .map(|n| (ids.of(n) / stride).abs_diff(n))
+            .max()
+            .unwrap();
+        // The greatest deviation of a million sorted uniform draws from
+        // their even places is about 0.87 of a thousand keys at the
+        // median, and under 300 or over 2,500 one time in thousands.
+        assert!(
+            (300..2_500).contains(&worst),
+            "the farthest an id lies from its even place, in keys: {worst}"
+        );
+        // Counts in stretches of sixty-four keys' worth: a mean of 64 and
+        // a variance near it, where one id a stratum has a variance under
+        // one.
+        let cells = (loaded / 64) as usize;
+        let width = u64::MAX / cells as u64;
+        let mut counts = vec![0u32; cells + 1];
+        for n in 0..loaded {
+            counts[(ids.of(n) / width) as usize] += 1;
+        }
+        let mean = loaded as f64 / cells as f64;
+        let var = counts[..cells]
+            .iter()
+            .map(|&c| (f64::from(c) - mean).powi(2))
+            .sum::<f64>()
+            / cells as f64;
+        assert!(
+            (0.7 * mean..1.3 * mean).contains(&var),
+            "the counts' variance {var:.1} beside their mean {mean:.1}"
+        );
     }
 
     #[test]
