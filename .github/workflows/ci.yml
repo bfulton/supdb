@@ -131,7 +131,7 @@ jobs:
     # which the runner's own is not: this job makes one in a file, mounts
     # it, and runs the half of tests/dirkey.rs that reads what the device
     # holds. As the runner's user, which is who hands the kernel the key.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

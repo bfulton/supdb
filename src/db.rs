@@ -53496,7 +53496,7 @@ impl Maint {
             let Some(q) = parts.iter().find(|q| q.raw && q.seg.lo == lo) else {
                 return;
             };
-            let resident = resident_share(&map.as_slice());
+            let resident = map_resident_share(&map);
             let waited = now.saturating_sub(since) >= HOT_RAW_ASK_WAIT;
             if resident < HOT_RAW_RESIDENT && !waited {
                 if self.z_trace {
