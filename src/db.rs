@@ -854,6 +854,18 @@ pub struct ZCounts {
     /// bytes asked for (`Options::zpages_ask_dropped`).
     pub dropped_asks: u64,
     pub dropped_ask_bytes: u64,
+    /// Turns of the builder taken at a job's end between two of the
+    /// controller's steps (`Options::zpages_drive_at_job_end`).
+    pub job_end_drives: u64,
+    /// Partitions with no form file whose raw pages the crossing asked for
+    /// (`Options::zpages_cross_asks_raw`).
+    pub cross_raw_asks: u64,
+    /// Served partitions whose ordered index was dropped a second time
+    /// (`Options::zpages_drop_again`), and the bytes of those indexes the
+    /// page cache held before the second drop and after it.
+    pub raw_redrops: u64,
+    pub raw_redrop_before: u64,
+    pub raw_redrop_after: u64,
     /// Form files synced once named, on their build's thread
     /// (`Options::zpages_build_sync`).
     pub build_synced: u64,
@@ -2452,6 +2464,71 @@ pub struct Options {
     /// bar past the line too.
     #[doc(hidden)]
     pub zpages_land_cold_past: bool,
+    /// EXPERIMENT: the crossing asks for the raw pages of the partitions
+    /// it has no form file for, ahead of the form files it asks back
+    /// (`zpages_land_drop_past`, `Maint::z_cross`). A partition whose
+    /// records the cache let go during the load is one no build ahead
+    /// takes while the store is under the line, and after the crossing it
+    /// waits for the builder behind the builds in flight; until its form
+    /// file is built its reads go to the raw form, a fault on a hash page
+    /// and one on a record page each. At ten million keys under 1.25 GiB
+    /// there is one such partition at the load's end, a fifth to two
+    /// fifths resident, and with the dropped files asked back
+    /// (`zpages_ask_dropped`) its raw records took 14,874 of the 18,285
+    /// major faults of the one-thread read pass over stride files, the
+    /// reader at nothing else for a second and a half of 2.3 (`perf
+    /// record -e major-faults -c 1 -d` over `bench ab --arms
+    /// supdb-zstrideroomconvaskhot,supdb-zaskdropped --size 10000000
+    /// --bound 1342177280 --passes load,read --reps 1 --ops-div 10`, at
+    /// `1e7ba94`). The build reads those records anyway, a window ahead of
+    /// its walk; asked for whole and first, they are one stream at the
+    /// head of the device's queue, and the reads and the build both find
+    /// them. Off; `supdb-zcrossraw` turns it on.
+    #[doc(hidden)]
+    pub zpages_cross_asks_raw: bool,
+    /// EXPERIMENT: the drop of a served partition's ordered index from the
+    /// page cache (`zpages_drop_raw`) is made again a second later, for the
+    /// pages that were dirty at the first. The index is written unsynced
+    /// and never fsynced (`ord_durable`), so the indexes of the load's last
+    /// landings are still dirty when the form is installed over them; the
+    /// advice starts their writeback and leaves them, and they stand in
+    /// the page cache, read by nothing, until a reclaim takes them. Where
+    /// the group is at its limit that is soon. Where it is not they stay:
+    /// at ten million keys under 1 GiB the store whose load is built in
+    /// the stride form (`zpages_stride`) held 20 MB of ordered indexes
+    /// through every pass to the scrambled mixes, where the block form's
+    /// store, whose read pass runs at the limit, held 6
+    /// (`scripts/resident.py` at each pass's start), and the hot-raw
+    /// policy's room (`zpages_hot_raw_slack`), which counts the group's
+    /// cache whatever it is, came out short of the Zipfian's head
+    /// partition by about that: no release in four reps of six where the
+    /// block form's store released it in every one, and A 0.79x in six
+    /// pairs of six (`docs/engine.md`). The second drop is the file's
+    /// advice alone, and it is made of no partition the hot-raw policy has
+    /// asked for or released, whose seeks read the index, nor of a merge's
+    /// input or a build's. Off; `supdb-zdropagain` turns it on, and
+    /// `supdb-zstridealldropagain` beside the stride form's options.
+    #[doc(hidden)]
+    pub zpages_drop_again: bool,
+    /// EXPERIMENT: the builder's turn comes when a job of its ends, and
+    /// not only at the controller's next step. The controller steps once a
+    /// census interval, a tenth of a second, and takes a finished build or
+    /// warm in and starts the next at its step alone, so a chain of the
+    /// builder's jobs ran one a step however short each was: at ten
+    /// million keys under 1 GiB the warms of 29 form files the cache held
+    /// already took two and a half seconds, a job a step, with the
+    /// conversions that were due behind them (`zpages_stride_convert`),
+    /// and each of the 24 conversions was taken in 20-90 ms after it
+    /// ended, a second and a half of the nine and a half they took
+    /// (`SUPDB_ZPAGES_TRACE` over `bench ab --arms
+    /// supdb-zstrideroomconvaskhot,supdb --size 10000000 --bound
+    /// 1073741824` in the row's passes, at `1e7ba94`). A job's thread
+    /// wakes the segment work's as it ends; with the option the turn it
+    /// wakes into takes the job in and starts the next, under the levels
+    /// of the controller's last decision and none of its pulses. Off;
+    /// `supdb-zdriveend` turns it on.
+    #[doc(hidden)]
+    pub zpages_drive_at_job_end: bool,
     /// EXPERIMENT: the hot-raw policy (`zpages_hot_raw`) runs beside the
     /// stride form, over the partitions a block file serves. It stood
     /// down wherever the stride form was asked for, since a stride file
@@ -6574,6 +6651,9 @@ impl Default for Options {
             zpages_land_cold_past: true,
             zpages_ask_dropped: false,
             zpages_hot_raw_beside_stride: false,
+            zpages_drive_at_job_end: false,
+            zpages_cross_asks_raw: false,
+            zpages_drop_again: false,
             zpages_ahead_past_scans: false,
             zpages_build_at_finish: true,
             zpages_group_bytes: zpages::ZGROUP_BYTES,
@@ -9024,6 +9104,12 @@ struct Seg {
     /// reads to tell a sliver left raw for its size from one that could not
     /// be covered.
     z_declined: std::sync::atomic::AtomicU8,
+    /// Set where this partition's raw file and ordered index were dropped
+    /// from the page cache (`drop_raw_pages`) and the segment work has not
+    /// yet noted the drop: its look takes the flag and owes the ordered
+    /// index a second drop (`Options::zpages_drop_again`,
+    /// `Maint::z_redrop_look`).
+    z_drop_noted: std::sync::atomic::AtomicBool,
     /// Why the stride form does not hold this partition, for the life of
     /// the segment, as `zfile::StrideNo::code` numbers the reasons, or zero
     /// (`zfile::Outcome::note_stride`). Never `z_declined`: every code there
@@ -13130,7 +13216,27 @@ impl Seg {
                 fadvise_dontneed(&f);
             }
         }
+        self.z_drop_noted.store(true, AtomicOrdering::Release);
         zfile::ZEvents::add(&ev.raw_dropped, 1);
+    }
+
+    /// The ordered index's drop made again (`Options::zpages_drop_again`),
+    /// for the pages that were dirty at the first: the index is written
+    /// unsynced, the first advice starts a dirty page's writeback and
+    /// leaves the page, and nothing takes it after that but a reclaim.
+    /// The file's advice alone: the mapping's pages went at the first, and
+    /// no read of a partition its form file serves has mapped one since.
+    /// Answers the index's bytes the page cache held before the advice and
+    /// after it.
+    fn redrop_ord_pages(&self, dir: &Path) -> (u64, u64) {
+        let held = |s: &Seg| (resident_share(s.ord.mapped()) * s.ord.file_bytes() as f64) as u64;
+        let before = held(self);
+        if let Some(name) = Db::ord_name_for(&self.name) {
+            if let Ok(f) = std::fs::File::open(dir.join(&name)) {
+                fadvise_dontneed(&f);
+            }
+        }
+        (before, held(self))
     }
 
     /// A read of this partition through the raw form while the hot-raw
@@ -13380,6 +13486,7 @@ impl Seg {
                 z_spare: zfile::ZCell::new(),
                 hot_reads16: AtomicU64::new(0),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
+                z_drop_noted: std::sync::atomic::AtomicBool::new(false),
                 z_stride_no: std::sync::atomic::AtomicU8::new(0),
                 key0_len,
                 z_rebuilds: std::sync::atomic::AtomicU8::new(0),
@@ -13426,6 +13533,7 @@ impl Seg {
                 z_spare: zfile::ZCell::new(),
                 hot_reads16: AtomicU64::new(0),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
+                z_drop_noted: std::sync::atomic::AtomicBool::new(false),
                 z_stride_no: std::sync::atomic::AtomicU8::new(0),
                 key0_len,
                 z_rebuilds: std::sync::atomic::AtomicU8::new(0),
@@ -13464,6 +13572,7 @@ impl Seg {
             z_spare: zfile::ZCell::new(),
             hot_reads16: AtomicU64::new(0),
             z_declined: std::sync::atomic::AtomicU8::new(0),
+            z_drop_noted: std::sync::atomic::AtomicBool::new(false),
             z_stride_no: std::sync::atomic::AtomicU8::new(0),
             key0_len,
             z_rebuilds: std::sync::atomic::AtomicU8::new(0),
@@ -20950,6 +21059,10 @@ struct Shared {
     /// ones plus one, zero for none (`Db::zpages_convert_ask`,
     /// `Maint::z_convert_asked`).
     z_convert_ask: AtomicU64,
+    /// A test's: every partition a form file serves is noted as dropped at
+    /// the segment work's next look (`Db::zpages_redrop_owe`,
+    /// `Maint::z_redrop_look`).
+    z_redrop_owe: std::sync::atomic::AtomicBool,
     /// A test's: `Options::zpages_hold_after_settle`, as it stands.
     zsettle_hold: std::sync::atomic::AtomicBool,
     /// Direct runs whose mapping was grown past the file's end
@@ -26424,6 +26537,11 @@ impl Reader {
             ahead_swapped: get(&ev.ahead_swapped),
             dropped_asks: get(&ev.dropped_asks),
             dropped_ask_bytes: get(&ev.dropped_ask_bytes),
+            job_end_drives: get(&ev.job_end_drives),
+            cross_raw_asks: get(&ev.cross_raw_asks),
+            raw_redrops: get(&ev.raw_redrops),
+            raw_redrop_before: get(&ev.raw_redrop_before),
+            raw_redrop_after: get(&ev.raw_redrop_after),
             build_synced: get(&ev.build_synced),
             build_nopage: get(&ev.build_nopage),
             warms: get(&ev.warms),
@@ -36423,6 +36541,7 @@ impl Db {
             z_left_seals: std::sync::Mutex::new(std::collections::HashMap::new()),
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
             z_convert_ask: AtomicU64::new(0),
+            z_redrop_owe: std::sync::atomic::AtomicBool::new(false),
             zsettle_hold: std::sync::atomic::AtomicBool::new(opts.zpages_hold_after_settle),
             zgate: ZGate::new(opts.zpages),
             asks: AskCounts::default(),
@@ -37604,6 +37723,7 @@ impl Db {
             z_left_seals: std::sync::Mutex::new(std::collections::HashMap::new()),
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
             z_convert_ask: AtomicU64::new(0),
+            z_redrop_owe: std::sync::atomic::AtomicBool::new(false),
             zsettle_hold: std::sync::atomic::AtomicBool::new(opts.zpages_hold_after_settle),
             zgate: ZGate::new(opts.zpages),
             asks: AskCounts::default(),
@@ -43468,6 +43588,17 @@ impl Db {
         self.shared
             .z_convert_ask
             .store(nth as u64 + 1, AtomicOrdering::Release);
+    }
+
+    /// A test's: every partition a form file serves is taken, at the segment
+    /// work's next look, as one whose raw pages were dropped then, so that
+    /// its ordered index's second drop comes due on the controller's clock
+    /// from a moment the test chose (`Options::zpages_drop_again`).
+    #[doc(hidden)]
+    pub fn zpages_redrop_owe(&self) {
+        self.shared
+            .z_redrop_owe
+            .store(true, AtomicOrdering::Release);
     }
 
     /// A test's: the gate word set by hand, so a store under `Always` can be
@@ -49336,6 +49467,10 @@ const ASK_JOIN_CAP: std::time::Duration = std::time::Duration::from_secs(20);
 /// keeps.
 pub const REWARM_QUIET_BEFORE_MS: u32 = 1000;
 const HOT_RAW_ASK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long after a served partition's drop its ordered index is dropped
+/// again (`Options::zpages_drop_again`): time for the writeback the first
+/// advice started to end, a few megabytes a file.
+const REDROP_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 /// The share of a form file's pages under which an install's rewarm asks for
 /// it (`Options::zpages_rewarm_at_install`): short of whole, since a pass of
 /// point reads over a form touches every page of it.
@@ -49562,6 +49697,10 @@ struct Maint {
     /// (`Options::zpages_ahead_builders`): only builds ahead take it, and
     /// nothing picks the partition it holds.
     zahead: Option<ZBuild>,
+    /// The controller's last decision, for the builder's turn between two
+    /// steps (`Options::zpages_drive_at_job_end`): its levels hold until
+    /// the next, and its pulses were that step's alone.
+    z_last_d: Option<zselect::Decision>,
     /// Inside a `ZSettle` answer: every kind of build is due, where the
     /// loop's own turns start only the builds of partitions with none.
     z_settling: bool,
@@ -49704,6 +49843,10 @@ struct Maint {
     /// once, without waiting out the period, so that a move that has paid
     /// for its build waits for the builder and for nothing after it.
     z_conv_waits: bool,
+    /// The partitions owed a second drop of their ordered index
+    /// (`Options::zpages_drop_again`), by name, and when each is due on the
+    /// controller's clock (`z_redrop_look`).
+    z_redrop: Vec<(String, std::time::Duration)>,
     /// When the conversion's last look ended and how long it took, by the
     /// wall: the next waits a hundred times that, so that a look, which
     /// solves the model once for each move it prices, is a hundredth of a
@@ -50389,6 +50532,7 @@ impl Maint {
             shaped_at: 0,
             zbuild: None,
             zahead: None,
+            z_last_d: None,
             z_settling: false,
             zsel: {
                 let mut sel = zselect::ZSelect::default();
@@ -50442,6 +50586,7 @@ impl Maint {
             z_conv_heat: std::collections::HashMap::new(),
             z_conv_rent: std::collections::HashMap::new(),
             z_conv_waits: false,
+            z_redrop: Vec::new(),
             z_conv_done: None,
             z_anon_peak: std::cell::Cell::new(zselect::WindowMax::new(zselect::RETAIN_FLOOR)),
             z_conv_decode: None,
@@ -53322,6 +53467,73 @@ impl Maint {
         }
     }
 
+    /// The drops due again (`Options::zpages_drop_again`). A partition
+    /// whose raw pages were dropped since the last look is noted, its
+    /// second drop due `REDROP_AFTER` from this look; and every noted
+    /// partition past its time that a form file still serves has its
+    /// ordered index's file advised once more (`Seg::redrop_ord_pages`)
+    /// and owes nothing after. A partition the hot-raw policy has asked
+    /// for, whose index's heads the ask brought in for the release, waits
+    /// for a later look, as does a merge's input and a partition a build
+    /// holds; one no form file serves any longer, or that has gone from
+    /// the store, owes nothing.
+    fn z_redrop_look(&mut self) {
+        if !self.opts.zpages_drop_again {
+            return;
+        }
+        let now = self.z_now();
+        let owe_all = self.shared.z_redrop_owe.swap(false, AtomicOrdering::AcqRel);
+        let segs: Vec<std::sync::Arc<Seg>> = {
+            let _op = self.op();
+            self.segs()
+                .iter()
+                .filter(|s| s.level > 0)
+                .cloned()
+                .collect()
+        };
+        for s in &segs {
+            let noted = s.z_drop_noted.swap(false, AtomicOrdering::AcqRel);
+            if noted || (owe_all && s.z.get().is_some()) {
+                self.z_redrop.retain(|(name, _)| *name != s.name);
+                self.z_redrop
+                    .push((s.name.clone(), now.saturating_add(REDROP_AFTER)));
+            }
+        }
+        let mut left = Vec::with_capacity(self.z_redrop.len());
+        for (name, due) in std::mem::take(&mut self.z_redrop) {
+            let Some(seg) = segs.iter().find(|s| s.name == name) else {
+                continue;
+            };
+            if seg.z.get().is_none() {
+                continue;
+            }
+            let held = self.in_flight_input(&name)
+                || self.z_finishing(&name)
+                || self.z_ahead_holds(&name)
+                || self.z_hot_fill_asks.iter().any(|(lo, _)| *lo == seg.lo)
+                || self.z_hot_ask.as_ref().is_some_and(|(lo, _)| *lo == seg.lo);
+            if now < due || held {
+                left.push((name, due));
+                continue;
+            }
+            let (before, after) = seg.redrop_ord_pages(&self.dir);
+            let ev = &self.shared.z;
+            zfile::ZEvents::add(&ev.raw_redrops, 1);
+            zfile::ZEvents::add(&ev.raw_redrop_before, before);
+            zfile::ZEvents::add(&ev.raw_redrop_after, after);
+            if self.z_trace {
+                eprintln!(
+                    "zredrop t={:.1} {} ord_kb {} -> {}",
+                    now.as_secs_f64(),
+                    seg.name,
+                    before >> 10,
+                    after >> 10
+                );
+            }
+        }
+        self.z_redrop = left;
+    }
+
     /// The hot-raw policy's turn (`Options::zpages_hot_raw`), with the form
     /// installed and nothing to build: once a `HOT_RAW_PERIOD`, a look
     /// (`z_hot_look`), counted once it is done so that a test that waits for
@@ -54421,11 +54633,22 @@ impl Maint {
             .z_last_step
             .is_some_and(|t| now.saturating_sub(t) < zselect::CENSUS_INTERVAL)
         {
+            // Between two steps, the builder's turn where a job of its has
+            // ended (`Options::zpages_drive_at_job_end`): the job's thread
+            // woke this one, and the job is taken in and the next started
+            // now, under the last decision's levels.
+            if self.opts.zpages_drive_at_job_end && self.z_job_ended() {
+                if let Some(last) = self.z_last_d {
+                    zfile::ZEvents::add(&self.shared.z.job_end_drives, 1);
+                    self.z_drive(&last.levels());
+                }
+            }
             return;
         }
         self.z_last_step = Some(now);
         self.z_rewarm_look(now);
         self.z_land_look();
+        self.z_redrop_look();
         let model = if self
             .z_last_s1
             .is_none_or(|t| now.saturating_sub(t) >= zselect::S1_PERIOD)
@@ -54498,7 +54721,16 @@ impl Maint {
             self.z_rewarm_due = true;
             self.z_rewarm_whole = true;
         }
+        self.z_last_d = Some(d);
         self.z_drive(&d);
+    }
+
+    /// Whether a job of the builder's has ended and waits to be taken in.
+    fn z_job_ended(&self) -> bool {
+        [&self.zbuild, &self.zahead]
+            .into_iter()
+            .flatten()
+            .any(|b| b.job.is_finished())
     }
 
     /// E2's bound (design 4.7): the raw footprint, bytes, of the compact
@@ -56262,6 +56494,38 @@ impl Maint {
         let (mut n, mut asked, mut live) = (0u64, 0u64, 0u64);
         {
             let _op = self.op();
+            // First the raw pages of the partitions with no form file to
+            // ask for, where the cache has let their records go
+            // (`Options::zpages_cross_asks_raw`): their reads are the raw
+            // form's until the builder reaches them, and a build reads
+            // those records whether one is in flight or to come.
+            if self.opts.zpages_cross_asks_raw {
+                for s in self
+                    .segs()
+                    .iter()
+                    .filter(|s| s.level > 0 && s.z.get().is_none())
+                {
+                    let Some((id, end)) = Db::name_id(&s.name).zip(Db::name_end_seq(&s.name))
+                    else {
+                        continue;
+                    };
+                    if self.dir.join(zfile::zpg_name(id, end)).is_file()
+                        || s.records_resident() >= HOT_RAW_RESIDENT
+                    {
+                        continue;
+                    }
+                    Maint::z_hot_ask(s, false);
+                    zfile::ZEvents::add(&self.shared.z.cross_raw_asks, 1);
+                    if self.z_trace {
+                        eprintln!(
+                            "zahead t={:.1} crossed asked raw {} resident {:.3}",
+                            self.z_epoch.elapsed().as_secs_f64(),
+                            s.name,
+                            s.records_resident()
+                        );
+                    }
+                }
+            }
             for s in self
                 .segs()
                 .iter()
