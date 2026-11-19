@@ -7447,6 +7447,260 @@ fn compact_store_with(
     (dir, db, model, inject, r, keys, at)
 }
 
+/// A served partition's ordered index is dropped from the page cache a
+/// second time, a second after its drop (`Options::zpages_drop_again`): the
+/// index is written unsynced, so a page of it still dirty at the first drop
+/// is left there by the advice, held by the cache and mapped by nobody. The
+/// test makes such pages by reading the index files back through a
+/// descriptor of its own, which maps nothing, and owes every served
+/// partition its second drop from a moment it chose
+/// (`Db::zpages_redrop_owe`): nothing goes short of the second, everything
+/// the cache held goes at it, and without the option nothing goes at all.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_served_partitions_ordered_index_is_dropped_again_a_second_on() {
+    let ords = |dir: &Path| -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                let n = p.file_name().unwrap().to_string_lossy().into_owned();
+                n.starts_with("ord-") && n.ends_with(".oidx")
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let cached = |dir: &Path| -> usize {
+        ords(dir)
+            .iter()
+            .map(|p| {
+                let len = std::fs::metadata(p).unwrap().len() as usize;
+                common::cached_pages(p, 0, len)
+            })
+            .sum()
+    };
+    for again in [true, false] {
+        let (dir, db, _model, _inject, r, _keys, _) =
+            compact_store_with(&format!("drop-again-{again}"), 1 << 20, |o| {
+                o.zpages_drop_raw = true;
+                o.zpages_drop_again = again;
+            });
+        // Past the second drops the install's own drops were owed: each
+        // partition dropped as its form came to serve it has had its second,
+        // noted by the drop itself and by no request of the test's.
+        wait_secs(&db, 3, 1);
+        let c0 = db.zpage_counts();
+        assert!(
+            ords(&dir).len() as u64 >= c0.form_files && c0.form_files >= 1,
+            "{c0:?}"
+        );
+        assert!(c0.raw_dropped >= 1, "{c0:?}");
+        assert_eq!(
+            c0.raw_redrops,
+            if again { c0.raw_dropped } else { 0 },
+            "a second drop for each first: {c0:?}"
+        );
+        for p in ords(&dir) {
+            std::fs::read(&p).unwrap();
+        }
+        let held = cached(&dir);
+        assert!(
+            held >= ords(&dir).len(),
+            "the indexes are in the cache: {held}"
+        );
+        db.zpages_redrop_owe();
+        // The look that notes the drops, and half a second on: not yet.
+        advance_tick(&db, std::time::Duration::from_millis(100));
+        advance_tick(&db, std::time::Duration::from_millis(500));
+        let c1 = db.zpage_counts();
+        assert_eq!(
+            c1.raw_redrops, c0.raw_redrops,
+            "short of the second: {c1:?}"
+        );
+        assert_eq!(cached(&dir), held, "and nothing has gone");
+        // Past the second.
+        advance_tick(&db, std::time::Duration::from_millis(600));
+        let c2 = db.zpage_counts();
+        if again {
+            assert_eq!(
+                c2.raw_redrops - c0.raw_redrops,
+                c0.form_files,
+                "each served partition once: {c2:?}"
+            );
+            let (was, is) = (
+                c2.raw_redrop_before - c0.raw_redrop_before,
+                c2.raw_redrop_after - c0.raw_redrop_after,
+            );
+            assert!(
+                was > 0 && is * 10 <= was,
+                "what the cache held went: {was} -> {is}"
+            );
+            assert!(
+                cached(&dir) * 10 <= held,
+                "by the kernel's count too: {}",
+                cached(&dir)
+            );
+            // Owed once: a second on, nothing more.
+            advance_tick(&db, std::time::Duration::from_millis(1100));
+            assert_eq!(db.zpage_counts().raw_redrops, c2.raw_redrops);
+        } else {
+            assert_eq!(c2.raw_redrops, 0, "{c2:?}");
+            assert_eq!(cached(&dir), held, "nothing dropped without the option");
+        }
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The second drop (`Options::zpages_drop_again`) is of a partition a form
+/// file serves, and of none the hot-raw policy has asked for or released:
+/// the ask brings the index's heads in for the reads the release sends raw,
+/// and a raw partition's every seek reads them. The test owes every served
+/// partition its second drop and has the policy ask for one at the step
+/// before the drops come due, so the look that makes them finds that
+/// partition asked for, and the looks after find it released: every other
+/// partition's index goes, and that one's stays as the cache held it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_partition_asked_for_or_released_raw_is_not_dropped_again() {
+    let what = "the second drop beside the hot-raw policy";
+    let (dir, db, model, inject) = auto_store_with(
+        "auto-drop-again-hot",
+        1 << 20,
+        1_000_000.0,
+        FAULT_1MS,
+        |o| {
+            o.zpages_hot_raw = true;
+            o.zpages_drop_raw = true;
+            o.zpages_drop_again = true;
+            o.zpages_memo = false;
+            o.partition_bytes = Some(400 << 10);
+        },
+        |_| {},
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+        "{what}: COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    assert!(
+        tick_until(&db, 400, |c| c.attached >= c.partitions
+            && c.warms >= c.partitions),
+        "{what}: every file attached and warmed: {:?}",
+        db.zpage_counts()
+    );
+    inject.set_decode_cost(std::time::Duration::from_micros(10));
+    let c = db.zpage_counts();
+    assert!(
+        c.form_files >= 5 && c.form_files == c.partitions,
+        "{what}: {c:?}"
+    );
+    let (partitions, total) = (c.partitions, c.file_bytes);
+    let hot = keys_of_partition(&db, &model, 2);
+    // No room for a release, and past the second drops the load's own drops
+    // were owed.
+    inject.set_budget(total * 100 / 75 + 1);
+    wait_secs(&db, 3, 1);
+    let ords = || -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                let n = p.file_name().unwrap().to_string_lossy().into_owned();
+                n.starts_with("ord-") && n.ends_with(".oidx")
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let cached = |p: &Path| -> (usize, usize) {
+        let len = std::fs::metadata(p).unwrap().len() as usize;
+        (common::cached_pages(p, 0, len), len.div_ceil(4096))
+    };
+    for p in ords() {
+        std::fs::read(&p).unwrap();
+    }
+    assert!(
+        ords().iter().all(|p| cached(p).0 == cached(p).1),
+        "{what}: read in"
+    );
+    let c0 = db.zpage_counts();
+    assert_eq!(
+        (c0.hot_asks, c0.hot_raw),
+        (0, 0),
+        "{what}: no room yet: {c0:?}"
+    );
+    // Owed now: noted at the next step, due a second after it.
+    db.zpages_redrop_owe();
+    let step = std::time::Duration::from_millis(100);
+    advance_tick(&db, step);
+    for _ in 0..8 {
+        advance_tick(&db, step);
+    }
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.raw_redrops, c.hot_asks),
+        (c0.raw_redrops, 0),
+        "{what}: nine tenths of the second, nothing dropped or asked: {c:?}"
+    );
+    // Room for one partition's raw form, and the heat: the step before the
+    // drops come due asks for the hot partition.
+    let file_one = total / partitions;
+    let raw_one = (c.model_record_bytes + c.model_hash_bytes) / partitions;
+    let line = total + (raw_one - file_one) * 3 / 2;
+    inject.set_budget(line * 100 / 75);
+    heat_up(&db, &hot, 100_000);
+    advance_tick(&db, step);
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.hot_asks, c.hot_raw, c.raw_redrops),
+        (1, 0, c0.raw_redrops),
+        "{what}: asked for, a step short of the second: {c:?}"
+    );
+    // The second is up: every served partition's index goes but the one
+    // asked for, which the looks after find released.
+    for _ in 0..25 {
+        if db.zpage_counts().hot_raw >= 1 {
+            break;
+        }
+        advance_tick(&db, step);
+    }
+    for _ in 0..12 {
+        advance_tick(&db, step);
+    }
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.hot_raw, c.hot_raw_now),
+        (1, 1),
+        "{what}: released: {c:?}"
+    );
+    assert_eq!(
+        c.raw_redrops - c0.raw_redrops,
+        partitions - 1,
+        "{what}: every partition still served, once, and not the one released: {c:?}"
+    );
+    let kept: Vec<(usize, usize)> = ords()
+        .iter()
+        .map(|p| cached(p))
+        .filter(|(have, _)| *have > 0)
+        .collect();
+    assert_eq!(
+        kept.len(),
+        1,
+        "{what}: one index left in the cache: {kept:?}"
+    );
+    assert_eq!(kept[0].0, kept[0].1, "{what}: and that one whole: {kept:?}");
+    check(&r, &model, &keys, what);
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Under `Auto` with the raw drop, a partition whose form file attaches
 /// while the gate still sends reads to the raw form keeps its raw pages for
 /// those reads, and the install drops every attached partition's at once
@@ -8537,6 +8791,192 @@ fn land_store_loaded(
     (dir, db, model, inject, raw)
 }
 
+/// The crossing asks for the raw pages of the partitions it has no form
+/// file for (`Options::zpages_cross_asks_raw`): a store whose every
+/// partition's records the cache has let go, taken past the selector's
+/// line with the builds held at their start. With the option each such
+/// partition's raw pages are asked for at the crossing and are in the
+/// cache soon after, where the reads the raw form serves until a form file
+/// is built will find them; without it nothing is asked for, and they stay
+/// out until a read or a build faults them in a page at a time. A
+/// partition whose records the cache holds is asked nothing, and one whose
+/// form file is on disk is the swap's, its records dropped and its form
+/// asked for, and no raw page of it asked.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_crossing_asks_for_the_raw_pages_of_a_cold_partition_with_no_form_file() {
+    for (on, cold, ahead) in [
+        (true, true, false),
+        (false, true, false),
+        (true, false, false),
+        (true, true, true),
+    ] {
+        let what = format!(
+            "the crossing's ask for raw pages {on}, records out {cold}, files built ahead {ahead}"
+        );
+        let what = what.as_str();
+        let (dir, db, model, inject, raw) =
+            land_store_with(&format!("auto-cross-raw-{on}-{cold}-{ahead}"), 50, |o| {
+                o.zpages_cross_asks_raw = on;
+                o.partition_bytes = Some(400 << 10);
+                o.zpages_ahead_builders = 1;
+                // Nothing is bought, and no build ahead takes a partition
+                // found cold, so the records stay as the crossing left them.
+                o.zpages_cover_resident = false;
+                o.zpages_suspect_at_crossing = false;
+                o.zpages_land_cold_past = false;
+            });
+        if ahead {
+            // Two partitions built ahead under the line, their files on
+            // disk, and the third's build held at its start.
+            inject.set_budget(raw * 3 / 2);
+            assert!(
+                tick_until_built(&db, |c| c.prebuilt >= 2),
+                "{what}: built ahead: {:?}",
+                db.zpage_counts()
+            );
+        }
+        db.hold_zpage_build(true);
+        if ahead {
+            let t = std::time::Instant::now();
+            while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+                wait_steps(&db, 1);
+            }
+            assert!(db.zpage_build_waiting(), "{what}: a build held");
+        }
+        let on_disk = named_form_files(&dir).len() as u64;
+        let pars: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("par-") && n.ends_with(".sup"))
+            })
+            .collect();
+        assert!(pars.len() >= 4, "{what}: partitions: {pars:?}");
+        assert!(
+            if ahead { on_disk >= 2 } else { on_disk == 0 },
+            "{what}: {on_disk} form files on disk"
+        );
+        let share = |f: &Path| {
+            let len = std::fs::metadata(f).unwrap().len() as usize;
+            cached_pages(f, 0, len) as f64 / len.div_ceil(4096) as f64
+        };
+        if cold {
+            for f in &pars {
+                unmap_pages(f);
+                evict(f);
+                assert!(share(f) < 0.1, "{what}: {} out of the cache", f.display());
+            }
+        }
+        inject.set_budget(raw * 2 / 3);
+        wait_steps(&db, 5);
+        let c = db.zpage_counts();
+        let asks = if on && cold {
+            c.partitions - on_disk
+        } else {
+            0
+        };
+        assert_eq!(
+            (c.cross_raw_asks, c.ahead_swapped, c.attached),
+            (asks, on_disk, 0),
+            "{what}: the partitions with no form file asked for at the \
+             crossing, with the option and their records out: {c:?}"
+        );
+        if !ahead {
+            if on && cold {
+                wait_for(&format!("{what}: the raw pages in the cache"), || {
+                    pars.iter().all(|f| share(f) >= 0.8)
+                });
+            } else if cold {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                for f in &pars {
+                    assert!(
+                        share(f) < 0.1,
+                        "{what}: {} left out of the cache: {}",
+                        f.display(),
+                        share(f)
+                    );
+                }
+            }
+        }
+        db.hold_zpage_build(false);
+        let keys: Vec<Vec<u8>> = model.keys().step_by(53).cloned().collect();
+        let r = db.reader().unwrap();
+        check(&r, &model, &keys, what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The builder's turn comes when a job of its ends
+/// (`Options::zpages_drive_at_job_end`), and not only at the controller's
+/// next step. A store whose every partition is due a build ahead, one
+/// builder, and one step of the clock: with the option each build's end is
+/// the next one's start, and every partition is built with the clock where
+/// that step left it, a turn taken at each job's end and no more than
+/// that; without it the build the step started is the only one until the
+/// clock moves again, a build a step.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_builders_turn_comes_at_a_jobs_end_and_not_only_at_a_step() {
+    for on in [true, false] {
+        let what = format!("the builder's turn at a job's end {on}");
+        let what = what.as_str();
+        let (dir, db, _model, inject, raw) =
+            land_store_with(&format!("auto-drive-end-{on}"), 50, |o| {
+                o.zpages_drive_at_job_end = on;
+                o.zpages_ahead_builders = 1;
+                o.partition_bytes = Some(400 << 10);
+            });
+        inject.set_budget(raw * 3 / 2);
+        wait_steps(&db, 1);
+        let (parts, steps) = {
+            let c = db.zpage_counts();
+            (c.partitions, c.sel_steps)
+        };
+        assert!(
+            parts >= 3,
+            "{what}: partitions to build: {:?}",
+            db.zpage_counts()
+        );
+        if on {
+            wait_for(&format!("{what}: every partition built ahead"), || {
+                db.zpage_counts().prebuilt >= parts
+            });
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.build_starts, c.build_collected, c.sel_steps),
+                (parts, parts, steps),
+                "{what}: each built once, with no step since the first: {c:?}"
+            );
+            assert!(
+                c.job_end_drives >= parts - 1 && c.job_end_drives <= 2 * parts,
+                "{what}: a turn at each job's end and no more: {c:?}"
+            );
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let c = db.zpage_counts();
+            assert!(
+                c.build_starts == 1 && c.prebuilt == 0 && c.job_end_drives == 0,
+                "{what}: the next build waits for a step: {c:?}"
+            );
+            assert!(
+                tick_until_built(&db, |c| c.prebuilt >= c.partitions),
+                "{what}: built ahead a step at a time: {:?}",
+                db.zpage_counts()
+            );
+            assert_eq!(db.zpage_counts().job_end_drives, 0, "{what}");
+        }
+        assert_eq!(form_files(&dir).len() as u64, parts, "{what}: on disk");
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Two builds ahead at once (`Options::zpages_ahead_builders`): the second
 /// slot runs beside the first, and every partition is still built ahead
 /// once, its form file on disk and nothing attached; with one builder the
@@ -8552,7 +8992,7 @@ fn two_builds_ahead_run_beside_each_other_and_build_each_partition_once() {
             });
         inject.set_budget(raw * 3 / 2);
         assert!(
-            tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+            tick_until_built(&db, |c| c.prebuilt >= c.partitions),
             "built ahead: {:?}",
             db.zpage_counts()
         );
@@ -9313,7 +9753,7 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
             });
         inject.set_budget(raw * 2 / 3);
         assert!(
-            tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+            tick_until_built(&db, |c| c.prebuilt >= c.partitions),
             "{what}: built ahead: {:?}",
             db.zpage_counts()
         );
