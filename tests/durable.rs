@@ -15900,7 +15900,7 @@ fn a_write_that_leaves_a_run_whose_sync_failed_leaves_the_store_reading_and_refu
 /// The words the refusal below is to answer in, once there is one: the
 /// open's word for a log file the slot it would fall back to needs and the
 /// directory does not hold.
-const OO_LOG: &str = "a log file it covers is missing";
+const OO_LOG: &str = "needs the log file";
 
 /// A partition, then a seal of rewrites into a piece over it whose log
 /// file retires at the piece's durable landing (`seal_rotates_wal`), and
@@ -15911,9 +15911,6 @@ const OO_LOG: &str = "a log file it covers is missing";
 /// value. It is to refuse; `ROADMAP.md`'s "A fall back past a damaged slot
 /// whose log retired" says what an open needs to see it.
 #[test]
-#[ignore = "fails today: no slot names the log file its covered sequence lies in, so the open \
-            cannot see that the slot before needs a log file the directory lacks (ROADMAP.md, \
-            \"A fall back past a damaged slot whose log retired\")"]
 fn a_fallback_past_a_slot_whose_log_retired_is_refused() {
     let d = dir("oo-log");
     let c = dir("oo-log-kill");
@@ -15922,6 +15919,9 @@ fn a_fallback_past_a_slot_whose_log_retired_is_refused() {
         seal_rotates_wal: true,
         seal_bytes: 1 << 20,
         l0_trigger: 1000,
+        // A retired log removed, not kept as the next file's: a recycled
+        // one holds its last life's frames behind a new header.
+        recycle_wal: false,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
