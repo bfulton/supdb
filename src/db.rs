@@ -43034,6 +43034,14 @@ impl Db {
         if let Some(h) = me.wal.zeroing.take() {
             let _ = h.join();
         }
+        // Nor does its segment work: a flush is answered before its slot's
+        // fdatasync and the retirement of the log and the run's temp name,
+        // which follow on that thread, and a reopen beside it listed a file
+        // the dead store's thread then removed. Paused at its next turn,
+        // with what it is doing done, and never let go.
+        if let Some(p) = me.pause_segment_work() {
+            std::mem::forget(p);
+        }
         // A dead process's record of the guards it made goes with it: the
         // open after finds them on disk.
         vault::forget_guards(&me.dir);
