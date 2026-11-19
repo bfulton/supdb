@@ -1398,7 +1398,9 @@ fn a_copys_claim_to_its_records_is_no_claim_across_its_partitions_rewrite() {
     )
     .unwrap();
     let value = [b'v'; 100];
-    let keys: Vec<Vec<u8>> = (0..300).map(|i| format!("k{:03}", i * 2).into_bytes()).collect();
+    let keys: Vec<Vec<u8>> = (0..300)
+        .map(|i| format!("k{:03}", i * 2).into_bytes())
+        .collect();
     let mut want = std::collections::BTreeMap::new();
     for k in &keys {
         db.put(k, &value);
@@ -1419,7 +1421,10 @@ fn a_copys_claim_to_its_records_is_no_claim_across_its_partitions_rewrite() {
         .cloned()
         .collect();
     let n = inside.len();
-    assert!((5..64).contains(&n), "one block of keys inside the range: {n}");
+    assert!(
+        (5..64).contains(&n),
+        "one block of keys inside the range: {n}"
+    );
     // Every key of the partition updated and scanned, so its block is a
     // copy over updates alone.
     for k in &inside {
