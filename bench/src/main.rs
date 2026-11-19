@@ -6,6 +6,12 @@ use supdb_bench::bound::Bound;
 use supdb_bench::ledger::{self, Ledger};
 use supdb_bench::{engines, env, figures, gate, row, run, Scale};
 
+/// Every allocation counted by its thread (`alloc_census`), in a build
+/// made to ask whose memory the allocator kept and in no other.
+#[cfg(feature = "alloc-census")]
+#[global_allocator]
+static ALLOC: supdb_bench::alloc_census::Counting = supdb_bench::alloc_census::Counting;
+
 const USAGE: &str = "\
 usage:
   bench run --scale quick|full [--out DIR] [--arms a,b,...] [--top KEYS] [--bottom KEYS] [--reps N]

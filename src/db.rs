@@ -4472,6 +4472,19 @@ pub struct Options {
     /// touched by the job before. Off; `supdb-jobsmapped` turns it on.
     #[doc(hidden)]
     pub jobs_mapped: bool,
+    /// EXPERIMENT: `jobs_mapped` only while the store is short of memory,
+    /// its partitions' raw bytes over the budget the memory available
+    /// leaves (`Shared::forms_short`, the look `forms_fit_when_short`
+    /// reads): a job that starts while it is has its arrays mapped, and
+    /// one that starts while it is not has them from the allocator. What
+    /// an arena keeps of a job costs a store nothing where memory is
+    /// spare, and a mapping's fresh pages at every job cost the ordered
+    /// load a fourteenth at ten to three hundred thousand keys in both
+    /// orders (`docs/engine.md`); under a bound the arena's bytes are the
+    /// page cache's. Off, and nothing without `jobs_mapped`;
+    /// `supdb-jobsshort` turns both on.
+    #[doc(hidden)]
+    pub jobs_mapped_when_short: bool,
     /// Whether a fill on the upkeep thread leaves the rest of its
     /// conversions of dense forms the moment a newer commit is posted or
     /// the writer wants the upkeep back, so that through a burst the
@@ -6614,6 +6627,7 @@ impl Default for Options {
             upkeep_fill_skips_posted: true,
             blocks_mapped: true,
             jobs_mapped: false,
+            jobs_mapped_when_short: false,
             forms_convert_yield: true,
             forms_convert_behind: usize::MAX,
             convert_from_form: true,
@@ -20263,6 +20277,15 @@ impl Drop for Shared {
 }
 
 impl Shared {
+    /// Whether a job that starts now has its large arrays mapped
+    /// (`Options::jobs_mapped`): where the option says so, and under
+    /// `Options::jobs_mapped_when_short` only while the store is short of
+    /// memory, by the segment work's last look (`Maint::short_look`).
+    fn jobs_map(&self, opts: &Options) -> bool {
+        opts.jobs_mapped
+            && (!opts.jobs_mapped_when_short || self.forms_short.load(AtomicOrdering::Relaxed))
+    }
+
     /// Every scan over the store, the block path's and the merge path's:
     /// the count the seal's copy, the abandon's ask and the outrun mark
     /// are kept by.
@@ -33550,7 +33573,10 @@ impl Db {
     fn segment_opts(opts: &Options) -> SegmentOptions {
         let mut s = opts.segment.clone();
         s.prefault = opts.prefault;
-        s.buffers_mapped = opts.jobs_mapped;
+        // Whatever the store's memory, where the options say so; a job of
+        // a store that maps only while short asks the store
+        // (`Shared::jobs_map`).
+        s.buffers_mapped = opts.jobs_mapped && !opts.jobs_mapped_when_short;
         s
     }
 
@@ -35331,7 +35357,8 @@ impl Db {
             let id = self.shared.next_seg.fetch_add(1, AtomicOrdering::Relaxed);
             let tmp = self.dir.join(format!("direct-{id:08}.tmp"));
             let _ = std::fs::remove_file(&tmp);
-            let opts = Db::segment_opts(&self.opts);
+            let mut opts = Db::segment_opts(&self.opts);
+            opts.buffers_mapped = self.shared.jobs_map(&self.opts);
             let mut w = PieceWriter::create(&tmp, &opts, 0, self.opts.inline_bytes)?;
             // Where the run stands in the history: its records take the
             // sequence numbers from here, one each, as they commit. And
@@ -35883,7 +35910,8 @@ impl Db {
             .next_seg
             .fetch_add(fences.len().max(1) as u64, AtomicOrdering::Relaxed);
         let dir = self.dir.clone();
-        let opts = Db::segment_opts(&self.opts);
+        let mut opts = Db::segment_opts(&self.opts);
+        opts.buffers_mapped = self.shared.jobs_map(&self.opts);
         let background_io = self.opts.background_io;
         let sync_every = self.opts.seal_sync_every;
         let inline_max = self.opts.inline_bytes;
@@ -35948,7 +35976,7 @@ impl Db {
             near || self.opts.seal_snapshot_far
         };
         let put_one = self.opts.seal_put_one;
-        let jobs_mapped = self.opts.jobs_mapped;
+        let jobs_mapped = self.shared.jobs_map(&self.opts);
         let job = move |readable: &SealReadable| -> Result<Vec<String>> {
             if background_io == BackgroundIo::Idle {
                 idle_io_priority();
@@ -46007,6 +46035,14 @@ impl Maint {
                 .is_some_and(|(inputs, _)| inputs.iter().any(|n| n == name))
     }
 
+    /// A merge's writers' options (`Db::merge_segment_opts`), their arrays
+    /// mapped where a job that starts now has them so (`Shared::jobs_map`).
+    fn merge_opts(&self) -> SegmentOptions {
+        let mut s = Db::merge_segment_opts(&self.opts);
+        s.buffers_mapped = self.shared.jobs_map(&self.opts);
+        s
+    }
+
     /// `n` segment ids, the first returned: one counter for the writer's
     /// seals and this work's merges alike.
     fn alloc_segs(&self, n: u64) -> u64 {
@@ -46749,7 +46785,7 @@ impl Maint {
             end_seq,
             lo,
             hi,
-            opts: Db::merge_segment_opts(&self.opts),
+            opts: self.merge_opts(),
             background_io: self.opts.background_io,
             sync_every: self.opts.seal_sync_every,
             inline_max: self.opts.inline_bytes,
@@ -51839,7 +51875,11 @@ impl Maint {
     /// available leaves (`z_budget`). A budget that cannot be read is not
     /// short. The first look that finds it short starts the trim thread.
     fn short_look(&mut self) {
-        if !self.opts.forms_fit_when_short {
+        // The word is read by the forms' fit and by the jobs' mapping
+        // (`Options::jobs_mapped_when_short`); the trim thread is the
+        // fit's alone.
+        let jobs = self.opts.jobs_mapped && self.opts.jobs_mapped_when_short;
+        if !self.opts.forms_fit_when_short && !jobs {
             return;
         }
         let now = std::time::Instant::now();
@@ -51863,7 +51903,7 @@ impl Maint {
         let short = self.z_budget().is_some_and(|budget| raw > budget);
         // The thread before the word, so that a handle that reads the
         // store short and asks for a trim finds a thread to ask.
-        if short {
+        if short && self.opts.forms_fit_when_short {
             start_trimmer(&self.shared, &self.opts);
         }
         self.shared
@@ -53089,7 +53129,7 @@ impl Maint {
         // generously; gaps in the sequence cost nothing.
         let first_id = self.alloc_segs((parts * 4).max(8) as u64);
         let dir = self.dir.clone();
-        let opts = Db::merge_segment_opts(&self.opts);
+        let opts = self.merge_opts();
         let cursors = self.opts.cursor_merge;
         let background_io = self.opts.background_io;
         let sync_every = self.opts.seal_sync_every;

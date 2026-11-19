@@ -28,12 +28,37 @@ type Life = (
 );
 
 fn life(name: &str, mapped: bool) -> Life {
+    life_with(name, mapped, None)
+}
+
+/// `life`, and with a budget the arrays mapped only while the store is
+/// short of it (`Options::jobs_mapped_when_short`): the store's first
+/// flush leaves a partition of some seven megabytes, the budget is held
+/// to that from the seam, and the second flush's seal and the merge after
+/// it start once the segment work has looked.
+fn life_with(name: &str, mapped: bool, budget: Option<u64>) -> Life {
     let d = std::env::temp_dir().join(format!(
         "supdb-next-jobsmapped-{name}-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
+    let inject = budget.map(|b| {
+        let i = std::sync::Arc::new(supdb::ZInject::new());
+        i.set_budget(b);
+        i
+    });
+    let opts = Options {
+        jobs_mapped_when_short: budget.is_some(),
+        // The budget is the seam's and the form is nobody's question here.
+        zpages: if budget.is_some() {
+            supdb::ZPages::Off
+        } else {
+            common::options().zpages
+        },
+        zpages_inject: inject,
+        ..common::options()
+    };
     let opts = Options {
         jobs_mapped: mapped,
         // One seal a flush and none between, so the jobs are the test's
@@ -43,7 +68,7 @@ fn life(name: &str, mapped: bool) -> Life {
         // small to be a mapping.
         seal_bytes: 1 << 30,
         seal_max_pct: 0,
-        ..common::options()
+        ..opts
     };
     let maps_before = Db::job_buffers_mapped();
     let mut db = Db::create(&d, opts).unwrap();
@@ -57,6 +82,20 @@ fn life(name: &str, mapped: bool) -> Life {
     db.commit().unwrap();
     db.flush().unwrap();
     db.settle().unwrap();
+    if let Some(b) = budget {
+        // The segment work looks at the store against its budget once a
+        // second: short of a budget of a megabyte within a few looks, and
+        // never of one of a terabyte.
+        let short = b < (1 << 30);
+        let t = std::time::Instant::now();
+        while db.forms_short() != short && t.elapsed().as_secs() < 30 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if !short {
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+        }
+        assert_eq!(db.forms_short(), short, "{name}: the store against its budget");
+    }
     // Scattered: every key at a stride coprime to the count, so the table
     // is a hash table and the seal sorts it.
     for i in 0..keys {
@@ -138,6 +177,28 @@ fn a_jobs_large_arrays_are_mapped_and_the_store_is_the_same() {
         "the same files"
     );
     assert!(heap_files.keys().any(|n| n.starts_with("par-")));
+    // Mapped only while short (`Options::jobs_mapped_when_short`): a store
+    // with memory to spare maps none of its jobs' arrays, and one short of
+    // its budget maps those of the jobs that start once it reads so -- the
+    // second flush's seal, its sort and its writer, and the merge after
+    // it -- with the first flush's close, before the look, the
+    // allocator's. Both read back as the others do.
+    let (_, spare_made, spare_read) = life_with("spare", true, Some(1 << 40));
+    assert!(
+        spare_made.iter().all(|&(_, n)| n == 0),
+        "memory to spare, no array a mapping: {spare_made:?}"
+    );
+    assert_eq!(spare_read, heap_read);
+    let (_, short_made, short_read) = life_with("short", true, Some(1 << 20));
+    for site in ["sort records", "sort scratch", "sort order", "writer keys", "list keys"] {
+        let n = short_made.iter().find(|(s, _)| *s == site).unwrap().1;
+        assert!(
+            n > 0,
+            "short of memory, no {site} array became a mapping: {short_made:?}"
+        );
+    }
+    assert_eq!(short_read, heap_read);
+    assert_eq!(Db::mapped_bytes(), mapped_before, "both stores closed");
     for (name, bytes) in &heap_files {
         let other = &map_files[name];
         let first = if bytes.len() != other.len() {

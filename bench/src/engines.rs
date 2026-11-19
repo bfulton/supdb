@@ -1694,6 +1694,10 @@ pub struct Supdb {
     /// the job's end (`Options::jobs_mapped`): `supdb-jobsmapped`,
     /// `supdb-zstridealldropagainjobs`.
     jobsmapped: bool,
+    /// The jobs' arrays mapped only while the store is short of memory
+    /// (`Options::jobs_mapped_when_short`, with `jobsmapped`):
+    /// `supdb-jobsshort`, `supdb-zslabjobs`, `supdb-zstrideallslabjobs`.
+    jobsshort: bool,
     /// A handle's memo of decoded groups in a slab of its own, mapped by
     /// the engine and unmapped with the handle
     /// (`Options::zpages_memo_slab`): `supdb-zmemoslab`,
@@ -2804,6 +2808,11 @@ struct Policy {
     /// beside `supdb`, and `supdb-zstridealldropagainjobs` beside
     /// `supdb-zstridealldropagain`.
     jobsmapped: bool,
+    /// The jobs' arrays mapped only while the store is short of memory
+    /// (`Options::jobs_mapped_when_short`): `supdb-jobsshort` beside
+    /// `supdb-jobsmapped`, and with the memos' slabs in `supdb-zslabjobs`
+    /// and `supdb-zstrideallslabjobs`.
+    jobsshort: bool,
     /// The handles' memos in slabs of their own
     /// (`Options::zpages_memo_slab`): `supdb-zmemoslab` beside `supdb`, and
     /// `supdb-zstrideallslab` beside `supdb-zstridealldropagain`.
@@ -3106,6 +3115,7 @@ impl Default for Policy {
             zcrossraw: None,
             zdropagain: false,
             jobsmapped: false,
+            jobsshort: false,
             zmemoslab: false,
             defer: false,
             firstfloor: false,
@@ -3917,6 +3927,59 @@ impl Supdb {
             Policy {
                 zmemoslab: true,
                 ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-jobsmapped` only while the store is short of memory
+    /// (`Options::jobs_mapped_when_short`): `supdb-jobsshort`.
+    pub fn create_jobsshort(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                jobsmapped: true,
+                jobsshort: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with both of what its threads leave in the allocator given
+    /// back: the handles' memos in slabs (`Options::zpages_memo_slab`) and
+    /// the jobs' arrays mapped while the store is short of memory
+    /// (`Options::jobs_mapped`, `Options::jobs_mapped_when_short`):
+    /// `supdb-zslabjobs`. An arena a seal's sort filled and one a reader's
+    /// memo filled stay resident alike, and each option gives back one.
+    pub fn create_zslabjobs(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zmemoslab: true,
+                jobsmapped: true,
+                jobsshort: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-zstridealldropagain` with the same two:
+    /// `supdb-zstrideallslabjobs`.
+    pub fn create_zstride_all_slab_jobs(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zstride: Some(supdb::ZStride::Forced),
+                zstride_room: Some(true),
+                zstride_convert: Some(true),
+                zaskdropped: Some(true),
+                zhotbeside: Some(true),
+                zdriveend: Some(true),
+                zcrossraw: Some(true),
+                zdropagain: true,
+                zmemoslab: true,
+                jobsmapped: true,
+                jobsshort: true,
+                ..Policy::zblock()
             },
         )
     }
@@ -9145,6 +9208,7 @@ impl Supdb {
             zcrossraw,
             zdropagain,
             jobsmapped,
+            jobsshort,
             zmemoslab,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
@@ -9709,6 +9773,7 @@ impl Supdb {
                 .unwrap_or(supdb::Options::default().zpages_cross_asks_raw),
             zpages_drop_again: zdropagain,
             jobs_mapped: jobsmapped,
+            jobs_mapped_when_short: jobsshort,
             zpages_memo_slab: zmemoslab,
             zpages_seek_ord: if zpages_heads {
                 true
@@ -10081,6 +10146,7 @@ impl Supdb {
             zcrossraw,
             zdropagain,
             jobsmapped,
+            jobsshort,
             zmemoslab,
             ord_threads: Default::default(),
         })
@@ -10453,12 +10519,22 @@ impl Engine for Supdb {
         if self.zrewarmbeside {
             return "supdb-zrewarmbeside";
         }
+        if self.zmemoslab && self.jobsmapped {
+            return if self.zstride == Some(supdb::ZStride::Forced) {
+                "supdb-zstrideallslabjobs"
+            } else {
+                "supdb-zslabjobs"
+            };
+        }
         if self.zmemoslab {
             return if self.zstride == Some(supdb::ZStride::Forced) {
                 "supdb-zstrideallslab"
             } else {
                 "supdb-zmemoslab"
             };
+        }
+        if self.jobsshort {
+            return "supdb-jobsshort";
         }
         if self.jobsmapped {
             return if self.zstride == Some(supdb::ZStride::Forced) {
@@ -13153,6 +13229,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zstridealldropagainjobs"
         | "supdb-zmemoslab"
         | "supdb-zstrideallslab"
+        | "supdb-jobsshort"
+        | "supdb-zslabjobs"
+        | "supdb-zstrideallslabjobs"
         | "supdb-zdriveend"
         | "supdb-zcrossraw"
         | "supdb-zloadend"
@@ -14189,6 +14268,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-jobsmapped" => supdb_arm(Supdb::create_jobsmapped, dir)?,
         "supdb-zmemoslab" => supdb_arm(Supdb::create_zmemoslab, dir)?,
         "supdb-zstrideallslab" => supdb_arm(Supdb::create_zstride_all_slab, dir)?,
+        "supdb-jobsshort" => supdb_arm(Supdb::create_jobsshort, dir)?,
+        "supdb-zslabjobs" => supdb_arm(Supdb::create_zslabjobs, dir)?,
+        "supdb-zstrideallslabjobs" => supdb_arm(Supdb::create_zstride_all_slab_jobs, dir)?,
         "supdb-zstridealldropagainjobs" => {
             supdb_arm(Supdb::create_zstride_all_dropagain_jobs, dir)?
         }
@@ -17336,6 +17418,28 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_memo_slab && o.zpages_drop_again && !o.jobs_mapped);
+                assert_eq!(seven(o), (Forced, true, true, true, true, true, true));
+                // The jobs' arrays mapped only while the store is short,
+                // alone and with the memos' slabs, on both arms.
+                assert!(!b.jobs_mapped_when_short);
+                let z = Supdb::create_jobsshort(&dir("jobsshort")).unwrap();
+                assert_eq!(z.name(), "supdb-jobsshort");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.jobs_mapped && o.jobs_mapped_when_short && !o.zpages_memo_slab);
+                assert_eq!(seven(o), seven(b));
+                let z = Supdb::create_zslabjobs(&dir("zslabjobs")).unwrap();
+                assert_eq!(z.name(), "supdb-zslabjobs");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.jobs_mapped && o.jobs_mapped_when_short && o.zpages_memo_slab);
+                assert!(!o.zpages_drop_again && seven(o) == seven(b));
+                let z = Supdb::create_zstride_all_slab_jobs(&dir("zstrideallslabjobs")).unwrap();
+                assert_eq!(z.name(), "supdb-zstrideallslabjobs");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.jobs_mapped && o.jobs_mapped_when_short && o.zpages_memo_slab);
+                assert!(o.zpages_drop_again);
                 assert_eq!(seven(o), (Forced, true, true, true, true, true, true));
             }
             {
