@@ -5727,6 +5727,87 @@ fn a_sync_with_a_run_open_pays_the_log_directorys_barrier() {
 /// The words every `flush` of a store whose seal failed to make its
 /// segments durable answers with, after the call that met the failure,
 /// before the failure's own.
+/// A panic on the segment work's thread leaves nothing to land a seal or
+/// write a manifest for the rest of the open, and the writer that waits
+/// for room in the frozen list, or for a landing, answers the thread's
+/// failure in its own words where it would wait for a landing nobody
+/// makes; reads go on, and the store reopens with every commit it
+/// acknowledged. The writer runs on a thread of its own with an end, so a
+/// writer that waits for good fails the test where it would hang it.
+#[test]
+fn a_writer_beside_segment_work_that_panicked_answers_its_failure() {
+    let d = dir("maint-panic");
+    let opts = Options {
+        publish_in_background: true,
+        seal_bytes: 64 << 10,
+        seal_max_pct: 0,
+        direct_ingest: false,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let val = "v".repeat(100);
+    for i in 0..200u32 {
+        db.put(format!("before-{i:06}").as_bytes(), val.as_bytes());
+    }
+    db.commit().unwrap();
+    db.settle().unwrap();
+    assert!(db.panic_segment_work(), "the segment work runs on a thread");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let v = val.clone();
+    let writer = std::thread::spawn(move || {
+        let val = v;
+        let mut acked = 0u32;
+        let mut answer = None;
+        // Enough for many seals: the frozen list fills behind the seals
+        // nothing lands, and the commit that waits for room answers.
+        for b in 0..2_000u32 {
+            for j in 0..100u32 {
+                let k = (b * 7919 + j * 104_729) % 1_000_003;
+                db.put(format!("after-{k:08}").as_bytes(), val.as_bytes());
+            }
+            match db.commit() {
+                Ok(()) => acked = b + 1,
+                Err(e) => {
+                    answer = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        let flush = db.flush().err().map(|e| e.to_string());
+        let read = read_vec(&db, b"before-000007");
+        let _ = tx.send((acked, answer, flush, read));
+        db
+    });
+    let (acked, answer, flush, read) = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("the writer waited for a landing nobody makes");
+    let answer = answer.expect("the commits went on past the frozen list's room");
+    assert!(
+        answer.contains("the store's segment work has stopped") && answer.contains("panicked"),
+        "the thread's failure in its own words: {answer}"
+    );
+    let flush = flush.expect("a flush lands nothing");
+    assert!(flush.contains("segment work"), "{flush}");
+    assert_eq!(read, vec![val.as_bytes().to_vec()], "the reads go on");
+    let db = writer.join().unwrap();
+    db.crash();
+    let db = Db::open(&d, opts).unwrap();
+    assert_eq!(
+        read_vec(&db, b"before-000007"),
+        vec![val.as_bytes().to_vec()]
+    );
+    let mut back = 0u32;
+    for b in 0..acked {
+        let k = (b * 7919 + 99 * 104_729) % 1_000_003;
+        if read_vec(&db, format!("after-{k:08}").as_bytes()) == vec![val.as_bytes().to_vec()] {
+            back += 1;
+        }
+    }
+    assert_eq!(back, acked, "every acknowledged commit after the reopen");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 const SS_WEDGED: &str = "a seal failed to make its segments durable";
 
 type SsModel = BTreeMap<Vec<u8>, Vec<Vec<u8>>>;

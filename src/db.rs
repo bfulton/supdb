@@ -21506,6 +21506,9 @@ struct Shared {
     /// (`Shared::wedged_err`, `SyncPolicy`); a reopen replays every WAL the
     /// manifest does not cover and sweeps the segments it does not name.
     seal_wedged: std::sync::atomic::AtomicBool,
+    /// The segment work's thread panicked (`Db::go_away`), which stopped
+    /// the seal queue with the panic as its cause.
+    maint_gone: std::sync::atomic::AtomicBool,
     /// Why the queue stopped: the first failure's kind and words, which
     /// every answer of the stopped queue carries (`Shared::wedged_err`).
     wedge_cause: std::sync::Mutex<Option<(std::io::ErrorKind, String)>>,
@@ -22397,11 +22400,16 @@ impl Shared {
             .clone();
         let (kind, why) =
             cause.unwrap_or_else(|| (std::io::ErrorKind::Other, "a seal failed".to_string()));
+        let what = if self.maint_gone.load(AtomicOrdering::Acquire) {
+            "the store's segment work has stopped"
+        } else {
+            "a seal failed to make its segments durable"
+        };
         std::io::Error::new(
             kind,
             format!(
-                "a seal failed to make its segments durable, and no seal lands and no \
-                 manifest is written until the store is reopened: {why}"
+                "{what}, and no seal lands and no manifest is written until the store is \
+                 reopened: {why}"
             ),
         )
     }
@@ -36858,6 +36866,7 @@ impl Db {
             merge_hold: std::sync::atomic::AtomicU8::new(0),
             forms_position_hold: std::sync::atomic::AtomicBool::new(false),
             seal_wedged: std::sync::atomic::AtomicBool::new(false),
+            maint_gone: std::sync::atomic::AtomicBool::new(false),
             wedge_cause: std::sync::Mutex::new(None),
             fail_landing: std::sync::atomic::AtomicBool::new(false),
             presync_seam: std::sync::atomic::AtomicU8::new(0),
@@ -38039,6 +38048,7 @@ impl Db {
             merge_hold: std::sync::atomic::AtomicU8::new(0),
             forms_position_hold: std::sync::atomic::AtomicBool::new(false),
             seal_wedged: std::sync::atomic::AtomicBool::new(false),
+            maint_gone: std::sync::atomic::AtomicBool::new(false),
             wedge_cause: std::sync::Mutex::new(None),
             fail_landing: std::sync::atomic::AtomicBool::new(false),
             presync_seam: std::sync::atomic::AtomicU8::new(0),
@@ -42243,9 +42253,29 @@ impl Db {
             unreachable!("checked above")
         };
         let (tx, rx) = std::sync::mpsc::channel();
+        let shared = self.shared.clone();
         let handle = std::thread::Builder::new()
             .name("supdb-maint".into())
-            .spawn(move || m.run(rx))?;
+            .spawn(move || {
+                // A panic here leaves nothing to land a seal or write a
+                // manifest for the rest of the open, which is the seal
+                // queue stopped: the writer's waits for room and for a
+                // landing answer that (`Shared::wedged_err`), where they
+                // would otherwise wait for a landing nobody makes.
+                if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| m.run(rx)))
+                {
+                    let why = p
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| p.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "a panic".to_string());
+                    shared.maint_gone.store(true, AtomicOrdering::Release);
+                    shared.wedge(&std::io::Error::other(format!(
+                        "the segment work's thread panicked: {why}"
+                    )));
+                    std::panic::resume_unwind(p);
+                }
+            })?;
         self.maint = MaintHome::Away(MaintAway {
             tx: Some(tx),
             thread: Some(handle.thread().clone()),
@@ -43181,6 +43211,26 @@ impl Db {
         }
         here.recv().ok()?;
         Some(SegmentWorkPaused { _until: until })
+    }
+
+    /// A test's: the segment work's thread panics at its next look at its
+    /// jobs, as a bug on it would. False where the segment work runs
+    /// inline, or its thread is gone already.
+    #[doc(hidden)]
+    pub fn panic_segment_work(&self) -> bool {
+        let MaintHome::Away(a) = &self.maint else {
+            return false;
+        };
+        let Some(jobs) = a.tx.as_ref() else {
+            return false;
+        };
+        if jobs.send(MaintJob::Panic).is_err() {
+            return false;
+        }
+        if let Some(t) = &a.thread {
+            t.unpark();
+        }
+        true
     }
 
     /// A test's: while `on`, a merge's thread waits before it returns its
@@ -49617,6 +49667,9 @@ enum MaintJob {
     /// A test's (`Db::pause_segment_work`): the thread says it is here and
     /// waits, holding nothing, until the second channel's sender drops.
     Pause(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>),
+    /// A test's (`Db::panic_segment_work`): the thread panics where it
+    /// takes the job, as a bug on it would.
+    Panic,
 }
 
 /// A seal in flight, as the segment work holds it: its thread; the names
@@ -50404,7 +50457,7 @@ impl Maint {
                 MaintJob::Ask(_, reply) => {
                     let _ = reply.send(Err(err("the store is closing")));
                 }
-                MaintJob::Pause(..) => {}
+                MaintJob::Pause(..) | MaintJob::Panic => {}
             }
         }
         self.shared
@@ -50441,6 +50494,9 @@ impl Maint {
                 }
             }
             MaintJob::Pause(..) => unreachable!("taken by the loop, before a pin"),
+            MaintJob::Panic => {
+                panic!("a test's panic of the segment work (Db::panic_segment_work)")
+            }
         }
     }
 
