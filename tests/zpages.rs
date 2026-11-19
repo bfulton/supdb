@@ -7607,7 +7607,7 @@ fn a_partition_asked_for_or_released_raw_is_not_dropped_again() {
         db.zpage_counts()
     );
     assert!(
-        tick_until(&db, 400, |c| c.attached >= c.partitions
+        tick_until_built(&db, |c| c.attached >= c.partitions
             && c.warms >= c.partitions),
         "{what}: every file attached and warmed: {:?}",
         db.zpage_counts()
@@ -11863,7 +11863,7 @@ fn the_controller_recodes_the_hottest_partition_within_the_budget() {
         // Every file attached and warmed: the policy's turn comes once the
         // builder has nothing due.
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -12028,7 +12028,7 @@ fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -12255,7 +12255,7 @@ fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -12393,7 +12393,7 @@ fn a_rewarm_is_made_beside_a_merge_in_flight_after_a_quarter_second() {
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -12531,7 +12531,7 @@ fn the_hot_raw_policy_rates_a_partitions_skew_over_the_windows_looks() {
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -12632,7 +12632,7 @@ fn the_hot_raw_policy_rates_a_burst_on_the_looks_that_pass_the_floor() {
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -12722,7 +12722,7 @@ fn a_raw_partitions_scans_count_the_groups_a_form_walk_would_open() {
         db.zpage_counts()
     );
     assert!(
-        tick_until(&db, 400, |c| c.attached >= c.partitions
+        tick_until_built(&db, |c| c.attached >= c.partitions
             && c.warms >= c.partitions),
         "every file attached and warmed: {:?}",
         db.zpage_counts()
@@ -12813,7 +12813,7 @@ fn a_raw_partition_read_no_more_than_the_median_goes_back_to_its_form() {
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -12928,7 +12928,7 @@ fn the_hot_raw_policy_relaxes_its_skew_bar_where_the_candidate_fits_the_room() {
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -13033,7 +13033,7 @@ fn the_hot_raw_fill_releases_partitions_read_alike_into_the_room_and_gives_them_
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -13224,7 +13224,7 @@ fn the_hot_raw_policy_releases_into_the_groups_unused_memory_where_the_line_woul
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -13396,7 +13396,7 @@ fn the_controller_reparses_the_hottest_partition_once() {
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -17921,7 +17921,7 @@ fn convert_store_with(
         );
     }
     assert!(
-        tick_until(&db, 400, |c| c.attached >= c.partitions
+        tick_until_built(&db, |c| c.attached >= c.partitions
             && c.warms >= c.partitions),
         "{name}: every file attached and warmed: {:?}",
         db.zpage_counts()
