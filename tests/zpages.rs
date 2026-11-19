@@ -9840,6 +9840,13 @@ fn a_buy_attaches_every_form_file_built_ahead_before_any_warm() {
                 // before any warm whether or not it is asked to.
                 o.zpages_cover_resident = false;
                 o.zpages_suspect_at_crossing = false;
+                // And the builder's turn at the controller's step alone:
+                // the order is read off the warms taken in by the install,
+                // a job a step, and with the turn at a job's end as well
+                // (`Options::zpages_drive_at_job_end`) the warms of files
+                // this small are through between two steps in either
+                // order, every one taken in before the install is seen.
+                o.zpages_drive_at_job_end = false;
             });
         inject.set_budget(raw * 3 / 2);
         assert!(
@@ -18134,13 +18141,35 @@ fn a_partitions_own_build_comes_before_a_conversion_that_is_due() {
     // partitions no form file serves yet, and less than they hold: with no
     // room at all no move pays, every touch a fault whatever the forms.
     inject.set_budget(c0.file_bytes * 3 / 4);
+    // The builder's first job is held before its rename, and once it is
+    // there the job after it is held at its start: the builder's turn
+    // comes at a job's end as well as at the controller's step
+    // (`Options::zpages_drive_at_job_end`), so the moves that are due
+    // follow the first job in milliseconds, and the counts between the
+    // first job and the second are read only with the second held.
+    db.hold_zpage_rename(true);
     convert_look(&db, sec);
+    let t = std::time::Instant::now();
+    while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+        wait_steps(&db, 1);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let held = db.zpage_counts();
+    assert!(
+        db.zpage_build_waiting()
+            && held.build_starts == c1.build_starts + 1
+            && held.build_collected == c1.build_collected,
+        "{what}: one job started, held before its rename: {held:?}"
+    );
+    db.hold_zpage_build(true);
+    db.hold_zpage_rename(false);
     // The first build to be taken in, and the turn that took it through.
     let t = std::time::Instant::now();
     while db.zpage_counts().build_collected == c1.build_collected && t.elapsed().as_secs() < 60 {
         wait_steps(&db, 1);
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    wait_steps(&db, 1);
     let c = db.zpage_counts();
     assert_eq!(
         (
@@ -18157,6 +18186,22 @@ fn a_partitions_own_build_comes_before_a_conversion_that_is_due() {
         ),
         "{what}: the partition's own build taken in first, no conversion yet: {c:?}"
     );
+    // The move that waited for it starts at the turn that took the build
+    // in, whichever turn that was, and is the one job held now.
+    let t = std::time::Instant::now();
+    while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+        wait_steps(&db, 1);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let c = db.zpage_counts();
+    assert!(
+        db.zpage_build_waiting()
+            && c.build_starts == c1.build_starts + 2
+            && c.build_collected == c1.build_collected + 1
+            && c.stride_converts_back == c0.stride_converts_back,
+        "{what}: the due move started behind it and nothing else: {c:?}"
+    );
+    db.hold_zpage_build(false);
     assert!(
         tick_until_built(&db, |c| c.stride_converts_back > c0.stride_converts_back),
         "{what}: and the due conversion after it: {:?}",

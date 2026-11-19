@@ -2029,7 +2029,19 @@ that the upkeep thread's pass would outlast the commit's fdatasync,
 and on a host whose fsync outlasted the pass every batch was filed at
 the return, two runs of the whole binary in five; it holds the thread
 before its pass now (`hold_upkeep_pass`), and a commit that waited would
-never return, which its watchdog says. The rule: a test that
+never return, which its watchdog says. And as a step: two controller
+tests read the state between the builder's first job and its second by
+the counts after a tick, on the bet that the second waited for the
+controller's next step, a tenth of a second on. With the builder's turn
+at a job's end made the default (`Options::zpages_drive_at_job_end`)
+the second job followed the first in milliseconds and both tests failed
+every run, the gate's first under that default among them; each of the
+three defaults turned off alone named the one. The test of the
+conversion's order holds the first job before its rename and the second
+at its start now, under either turn, and fails on a tick that starts a
+conversion ahead of a partition's own build; the test whose order is
+read off the warms taken in a job a step pins the turn at the step. The
+rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; and a test that passes is read for
 the path that passed it, since a fallback that does the same work

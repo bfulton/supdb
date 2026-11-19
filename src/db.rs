@@ -2282,7 +2282,7 @@ pub struct Options {
     /// bar past the line too.
     #[doc(hidden)]
     pub zpages_land_cold_past: bool,
-    /// EXPERIMENT: the crossing asks for the raw pages of the partitions
+    /// The crossing asks for the raw pages of the partitions
     /// it has no form file for, ahead of the form files it asks back
     /// (`zpages_land_drop_past`, `Maint::z_cross`). A partition whose
     /// records the cache let go during the load is one no build ahead
@@ -2301,7 +2301,8 @@ pub struct Options {
     /// `1e7ba94`). The build reads those records anyway, a window ahead of
     /// its walk; asked for whole and first, they are one stream at the
     /// head of the device's queue, and the reads and the build both find
-    /// them. Off; `supdb-zcrossraw` turns it on.
+    /// them. Priced with `zpages_ask_dropped`, whose doc has the cells.
+    /// On; `supdb-znocrossraw` asks for the form files alone.
     #[doc(hidden)]
     pub zpages_cross_asks_raw: bool,
     /// EXPERIMENT: the drop of a served partition's ordered index from the
@@ -2328,7 +2329,7 @@ pub struct Options {
     /// `supdb-zstridealldropagain` beside the stride form's options.
     #[doc(hidden)]
     pub zpages_drop_again: bool,
-    /// EXPERIMENT: the builder's turn comes when a job of its ends, and
+    /// The builder's turn comes when a job of its ends, and
     /// not only at the controller's next step. The controller steps once a
     /// census interval, a tenth of a second, and takes a finished build or
     /// warm in and starts the next at its step alone, so a chain of the
@@ -2343,8 +2344,9 @@ pub struct Options {
     /// 1073741824` in the row's passes, at `1e7ba94`). A job's thread
     /// wakes the segment work's as it ends; with the option the turn it
     /// wakes into takes the job in and starts the next, under the levels
-    /// of the controller's last decision and none of its pulses. Off;
-    /// `supdb-zdriveend` turns it on.
+    /// of the controller's last decision and none of its pulses. Priced
+    /// with `zpages_ask_dropped`, whose doc has the cells. On;
+    /// `supdb-znodriveend` is the turn at the controller's step alone.
     #[doc(hidden)]
     pub zpages_drive_at_job_end: bool,
     /// EXPERIMENT: the hot-raw policy (`zpages_hot_raw`) runs beside the
@@ -2363,7 +2365,7 @@ pub struct Options {
     /// (`docs/engine.md`). Off; `supdb-zstrideroomconvaskhot` turns it on.
     #[doc(hidden)]
     pub zpages_hot_raw_beside_stride: bool,
-    /// EXPERIMENT: a form file whose build dropped it from the page cache
+    /// A form file whose build dropped it from the page cache
     /// as it wrote it is asked back of the kernel whole when the build is
     /// taken in with the store past the selector's line. A build ahead
     /// begun under the line writes its output back and drops it, so that
@@ -2384,8 +2386,17 @@ pub struct Options {
     /// file by the process's maps, at `c24b7cd`). With the option the file
     /// is asked for before the attach where the form is wanted, and where
     /// it lands dormant after the crossing its records are dropped and it
-    /// is asked for as the crossing did for the rest. Off;
-    /// `supdb-zaskdropped` turns it on.
+    /// is asked for as the crossing did for the rest. With the two options
+    /// about the load's end beside it (`zpages_drive_at_job_end`,
+    /// `zpages_cross_asks_raw`) and against the engine before the three,
+    /// the one-thread read pass after the load read a third to a quarter
+    /// faster at ten million keys under 1 GiB in every pair of both
+    /// sittings, and level to a third faster under 1.25 GiB by which shape
+    /// the default's pass took; no other cell was apart in both orders at
+    /// either bound or at three million keys, the lag sweeps among them,
+    /// and in core none of the three acts (`docs/engine.md`). On;
+    /// `supdb-znoaskdropped` leaves a dropped file to its faults, and
+    /// `supdb-zblock` is the three off together.
     #[doc(hidden)]
     pub zpages_ask_dropped: bool,
     /// The decoded bytes a form file's page is cut into groups at, each
@@ -6490,10 +6501,10 @@ impl Default for Options {
             zpages_land_drop_past: true,
             zpages_build_sync: true,
             zpages_land_cold_past: true,
-            zpages_ask_dropped: false,
+            zpages_ask_dropped: true,
             zpages_hot_raw_beside_stride: false,
-            zpages_drive_at_job_end: false,
-            zpages_cross_asks_raw: false,
+            zpages_drive_at_job_end: true,
+            zpages_cross_asks_raw: true,
             zpages_drop_again: false,
             zpages_ahead_past_scans: false,
             zpages_build_at_finish: true,
