@@ -52,7 +52,10 @@ pub fn with_stride(mut o: supdb::Options) -> supdb::Options {
 /// test that names a form keeps it: the switch moves what a test builds on
 /// and nothing it says, so a field a test sets is the test's.
 pub fn options() -> supdb::Options {
-    let o = supdb::Options::default();
+    let o = supdb::Options {
+        jobs_mapped: jobs_mapped_switch(),
+        ..supdb::Options::default()
+    };
     if !stride_switch() {
         return o;
     }
@@ -61,6 +64,16 @@ pub fn options() -> supdb::Options {
         zpages_min_bytes: 0,
         ..o
     })
+}
+
+/// Whether the tests' stores map their jobs' large arrays
+/// (`Options::jobs_mapped`): `SUPDB_TEST_JOBSMAPPED=1`, read once. The
+/// option is off in the engine, so a run of the tests under the switch is
+/// the one run that takes every seal, merge and close of theirs through
+/// the mapped buffers.
+pub fn jobs_mapped_switch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SUPDB_TEST_JOBSMAPPED").is_ok_and(|v| v == "1"))
 }
 
 /// A segment file without the part of it that is a function of when it was

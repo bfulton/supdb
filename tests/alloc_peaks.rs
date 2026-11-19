@@ -13,7 +13,10 @@
 //! is every `Vec` a seal, a merge, a run's close or a form file's build
 //! holds, which is what the allocator keeps in the arena of a thread that
 //! has ended (`docs/engine.md`, which form a workload calls for).
-//! `PROBE_N` is the store's key count, six hundred thousand unless set.
+//! `PROBE_N` is the store's key count, six hundred thousand unless set;
+//! `PROBE_BIG` the size an allocation is printed from, two megabytes unless
+//! set; and `PROBE_JOBS_MAPPED=1` runs the store under
+//! `Options::jobs_mapped`, whose mappings the allocator never sees.
 #![cfg(target_os = "linux")]
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -24,6 +27,7 @@ struct Counting;
 static LIVE: AtomicIsize = AtomicIsize::new(0);
 static PEAK: AtomicIsize = AtomicIsize::new(0);
 static BIG: AtomicIsize = AtomicIsize::new(0);
+static BIG_FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2 << 20);
 
 const T: usize = 4096;
 static TLIVE: [AtomicIsize; T] = [const { AtomicIsize::new(0) }; T];
@@ -62,7 +66,7 @@ static TRACED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::
 thread_local! { static INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 fn big(n: isize) {
-    if n < (2 << 20) || !TRACE.load(Ordering::Relaxed) {
+    if n < BIG_FROM.load(Ordering::Relaxed) as isize || !TRACE.load(Ordering::Relaxed) {
         return;
     }
     if INSIDE.with(|c| c.replace(true)) {
@@ -199,8 +203,17 @@ fn the_peaks_by_phase_and_thread() {
     let dir = std::env::temp_dir().join(format!("supdb-next-alloc-peaks-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let val = vec![0x5au8; 100];
+    // `PROBE_JOBS_MAPPED=1`: the jobs' large arrays as the engine's
+    // mappings (`Options::jobs_mapped`), which leave the allocator's count.
+    let jobs_mapped = std::env::var("PROBE_JOBS_MAPPED").is_ok_and(|v| v == "1");
+    // `PROBE_BIG`: the size from which an allocation of the traced flush
+    // is printed with where it was made, two megabytes unless set.
+    if let Some(b) = std::env::var("PROBE_BIG").ok().and_then(|s| s.parse().ok()) {
+        BIG_FROM.store(b, Ordering::Relaxed);
+    }
     let off = || Options {
         zpages: ZPages::Off,
+        jobs_mapped,
         ..Options::default()
     };
     let mut db = Db::create(&dir, off()).unwrap();
@@ -250,6 +263,7 @@ fn the_peaks_by_phase_and_thread() {
             zpages_min_bytes: 0,
             zpages_stride: stride,
             zpages_stride_room: false,
+            jobs_mapped,
             ..Options::default()
         };
         // The form files of the run before, gone: each run builds its own.

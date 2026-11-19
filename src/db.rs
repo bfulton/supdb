@@ -72,7 +72,7 @@ pub mod zlz4;
 // The same form's engine side: the form file mapped, checked and read, the
 // cell a segment holds it in, and the builder. Private: it is the engine's
 // and nothing outside `db` names it.
-mod blocks;
+pub(crate) mod blocks;
 mod zfile;
 pub use zfile::ZInject;
 
@@ -4428,6 +4428,25 @@ pub struct Options {
     /// were touched before. `supdb-heapblocks` is the arm that keeps the
     /// heap shape.
     pub blocks_mapped: bool,
+    /// EXPERIMENT: a job's large per-key arrays -- a seal's sort of its
+    /// table, a segment writer's copy of every key with its span, its
+    /// record's offset and its hash, the ordered index builder's keys, a
+    /// merge's key list and the trailer a finish composes -- are mapped
+    /// from the kernel once they are `blocks::MAP_FROM` bytes and unmapped
+    /// when the job drops them (`blocks::BigVec`), as the memtables'
+    /// blocks are (`blocks_mapped`). From the allocator they are a
+    /// hundred and thirty bytes for each key a merge writes and a hundred
+    /// for each a seal does, on a thread that ends with the job, and the
+    /// allocator keeps the top of that thread's arena up to twice the
+    /// largest chunk the process has mapped and freed: at ten million
+    /// keys under 1 GiB the arenas of threads that had ended held 57-68 MB
+    /// free and resident through the mixes, one free chunk of 10 to 25 MB
+    /// each, beside a group at its limit whose form files' pages then
+    /// faulted (`docs/engine.md`, which form a workload calls for). A
+    /// mapping's pages are fresh at every job, where the arena's were
+    /// touched by the job before. Off; `supdb-jobsmapped` turns it on.
+    #[doc(hidden)]
+    pub jobs_mapped: bool,
     /// Whether a fill on the upkeep thread leaves the rest of its
     /// conversions of dense forms the moment a newer commit is posted or
     /// the writer wants the upkeep back, so that through a burst the
@@ -6536,6 +6555,7 @@ impl Default for Options {
             upkeep_fill_yields: true,
             upkeep_fill_skips_posted: true,
             blocks_mapped: true,
+            jobs_mapped: false,
             forms_convert_yield: true,
             forms_convert_behind: usize::MAX,
             convert_from_form: true,
@@ -9754,8 +9774,8 @@ pub struct SegmentWriter {
     /// Every key written, concatenated, with each key's span. Flat rather
     /// than a `Vec<Vec<u8>>` because a segment has a million keys; the
     /// extent beside each span is the one record the index carries.
-    key_arena: Vec<u8>,
-    spans: Vec<(usize, usize)>,
+    key_arena: blocks::BigVec<u8>,
+    spans: blocks::BigVec<(usize, usize)>,
     exts: Vec<Extents>,
     /// The key currently open, its run of length-prefixed records, and the
     /// offset of the newest record's prefix inside the run -- what
@@ -9816,8 +9836,8 @@ pub struct SegmentWriter {
     /// Records-first mode: the records streamed so far, their offsets, and
     /// each key's hash for the trailer's slots.
     recs_len: usize,
-    rec_offs: Vec<u32>,
-    hashes: Vec<u64>,
+    rec_offs: blocks::BigVec<u32>,
+    hashes: blocks::BigVec<u64>,
     rec_buf: Vec<u8>,
     /// A marking segment's records since its last marker, written and
     /// hashed as one at the marker (`mark`).
@@ -9842,6 +9862,9 @@ pub struct SegmentWriter {
     /// the arrays, as a seal's writer does.
     deferred: Option<usize>,
     last_key: Vec<u8>,
+    /// `SegmentOptions::buffers_mapped`: where the per-key arrays above
+    /// and the finish's trailer live once they are large.
+    buffers_mapped: bool,
 }
 
 /// The two layouts the writer produces. Same format, same readers, one
@@ -10040,11 +10063,12 @@ impl SegmentWriter {
             lookahead: opts.lookahead,
             deferred: None,
             last_key: Vec::new(),
+            buffers_mapped: opts.buffers_mapped,
             builder: BlockBuilder::new(block_size),
             block_size,
             blocks: Vec::new(),
-            key_arena: Vec::new(),
-            spans: Vec::new(),
+            key_arena: blocks::BigVec::new(opts.buffers_mapped),
+            spans: blocks::BigVec::new(opts.buffers_mapped),
             exts: Vec::new(),
             open_key: None,
             run: Vec::new(),
@@ -10070,8 +10094,8 @@ impl SegmentWriter {
             tail_spans: Vec::new(),
             mode: None,
             recs_len: 0,
-            rec_offs: Vec::new(),
-            hashes: Vec::new(),
+            rec_offs: blocks::BigVec::new(opts.buffers_mapped),
+            hashes: blocks::BigVec::new(opts.buffers_mapped),
             rec_buf: Vec::new(),
             batch_buf: Vec::new(),
             pending_blocks: Vec::new(),
@@ -11100,7 +11124,8 @@ impl SegmentWriter {
                         // for its offset and hash, the Bloom and the
                         // caller's own composition told of it as it goes.
                         let mut b = BloomFill::new(BlockedBloom::with_capacity(n), self.lookahead);
-                        let r = flatindex::stream_trailer(
+                        let r = flatindex::stream_trailer_in(
+                            blocks::BigVec::new(self.buffers_mapped),
                             n,
                             self.recs_len,
                             &|i| src.key_at(i),
@@ -11125,7 +11150,8 @@ impl SegmentWriter {
                             let (s, l) = spans[i];
                             &arena[s..s + l]
                         };
-                        flatindex::stream_trailer(
+                        flatindex::stream_trailer_in(
+                            blocks::BigVec::new(self.buffers_mapped),
                             spans.len(),
                             self.recs_len,
                             &key_at,
@@ -11501,6 +11527,12 @@ pub struct SegmentOptions {
     /// the fill rather than faulted one by one as the records land; see
     /// `Options::prefault`, which a `Db` sets this from. Off.
     pub prefault: bool,
+    /// EXPERIMENT: the writer's per-key arrays, the ordered index
+    /// builder's and the trailer's buffer are the engine's mappings once
+    /// they are large (`blocks::BigVec`); see `Options::jobs_mapped`,
+    /// which a `Db` sets this from. Off.
+    #[doc(hidden)]
+    pub buffers_mapped: bool,
 }
 
 impl Default for SegmentOptions {
@@ -11516,6 +11548,7 @@ impl Default for SegmentOptions {
             row_on_write: true,
             lookahead: true,
             prefault: false,
+            buffers_mapped: false,
         }
     }
 }
@@ -11546,7 +11579,7 @@ impl PieceWriter {
         w.set_inline_max(inline_max);
         Ok(PieceWriter(
             Box::new(w),
-            crate::ordindex::Builder::new(),
+            crate::ordindex::Builder::new_in(opts.buffers_mapped),
             false,
             false,
         ))
@@ -14936,14 +14969,18 @@ impl MemTable {
     /// suite's keys never have. The comparison sort of the whole table
     /// read two arena keys a compare, five million compares at three
     /// hundred thousand keys, and was a fifth of the seal.
-    fn slots_in_key_order(&self) -> Vec<u32> {
+    ///
+    /// `mapped` is where the sort's two arrays of a record a key and the
+    /// order it answers live (`Options::jobs_mapped`): fifty-two bytes a
+    /// key between them, on the seal's thread, for the length of the sort.
+    fn slots_in_key_order(&self, mapped: bool) -> blocks::BigVec<u32> {
         let n = self.len();
-        let mut recs: Vec<(u64, u64, u32)> = Vec::with_capacity(n);
+        let mut recs: blocks::BigVec<(u64, u64, u32)> = blocks::BigVec::with_capacity(n, mapped);
         for i in 0..n {
             let (a, b) = key_prefix(self.key_of(self.entry(i)));
             recs.push((a, b, i as u32));
         }
-        let mut scratch = Vec::new();
+        let mut scratch = blocks::BigVec::new(mapped);
         radix_by_prefix(&mut recs, &mut scratch);
         let mut i = 0;
         while i < recs.len() {
@@ -14959,7 +14996,11 @@ impl MemTable {
             }
             i = j;
         }
-        recs.iter().map(|r| r.2).collect()
+        let mut order = blocks::BigVec::with_capacity(recs.len(), mapped);
+        for r in recs.iter() {
+            order.push(r.2);
+        }
+        order
     }
 
     /// The key's live values, oldest first, and whether a tombstone ends
@@ -16183,15 +16224,19 @@ fn cut_by_bounds(
 /// merge. The slicing addresses keys by rank exactly as the sorted vector
 /// this replaced did, without a million allocations, a sort or a dedup.
 struct KeyList {
-    bytes: Vec<u8>,
-    offs: Vec<usize>,
+    bytes: blocks::BigVec<u8>,
+    offs: blocks::BigVec<usize>,
 }
 
 impl KeyList {
-    fn new() -> KeyList {
+    /// An empty list; `mapped` is where its buffers live once they are
+    /// large (`Options::jobs_mapped`).
+    fn new(mapped: bool) -> KeyList {
+        let mut offs = blocks::BigVec::new(mapped);
+        offs.push(0);
         KeyList {
-            bytes: Vec::new(),
-            offs: vec![0],
+            bytes: blocks::BigVec::new(mapped),
+            offs,
         }
     }
 
@@ -16254,20 +16299,28 @@ struct Slicer<'a> {
     from: usize,
     /// Its keys cut to the fence's length; every key, with no fences.
     held: KeyList,
+    /// `Options::jobs_mapped`, for the lists it makes.
+    mapped: bool,
     total: usize,
     slices: Vec<(usize, usize)>,
     given: Vec<Fence>,
 }
 
 impl<'a> Slicer<'a> {
-    fn new(fences: Option<&'a [Fence]>, parts: usize, max_keys: usize) -> Slicer<'a> {
+    fn new(
+        fences: Option<&'a [Fence]>,
+        parts: usize,
+        max_keys: usize,
+        mapped: bool,
+    ) -> Slicer<'a> {
         Slicer {
             fences,
             parts,
             max_keys,
             fi: 0,
             from: 0,
-            held: KeyList::new(),
+            held: KeyList::new(mapped),
+            mapped,
             total: 0,
             slices: Vec::new(),
             given: Vec::new(),
@@ -16312,7 +16365,7 @@ impl<'a> Slicer<'a> {
         let fs = self.fences.expect("closing a fence of given fences");
         let (lo, hi) = &fs[self.fi];
         self.fi += 1;
-        let held = std::mem::replace(&mut self.held, KeyList::new());
+        let held = std::mem::replace(&mut self.held, KeyList::new(self.mapped));
         if held.is_empty() {
             // No input holds a key in the fence: the partition that names
             // it is an input all the same and goes with the landing, so an
@@ -16796,7 +16849,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
 
     // Pass one: every distinct key once, in order, into the slicer, which
     // holds only what the slices are taken from (`Slicer`).
-    let mut slicer = Slicer::new(fences.as_deref(), parts, max_keys);
+    let mut slicer = Slicer::new(fences.as_deref(), parts, max_keys, opts.buffers_mapped);
     let all: Vec<Vec<u8>> = if cursors {
         merge_keys(&blobs, &ords, walk_cached, |k, _| {
             slicer.push(k);
@@ -22778,7 +22831,7 @@ mod radix {
 /// keys sharing a long prefix -- the suite's are sixteen digits whose
 /// first ten are the same -- take a pass per byte that varies and none
 /// for the rest.
-fn radix_by_prefix(v: &mut Vec<(u64, u64, u32)>, scratch: &mut Vec<(u64, u64, u32)>) {
+fn radix_by_prefix<V: blocks::Plain<(u64, u64, u32)>>(v: &mut V, scratch: &mut V) {
     // A run of one or none is sorted, and over an empty run the masks
     // below read every byte as varying: sixteen passes of a histogram
     // zeroed and summed for no records, 18,000 instructions of the first
@@ -33442,6 +33495,7 @@ impl Db {
     fn segment_opts(opts: &Options) -> SegmentOptions {
         let mut s = opts.segment.clone();
         s.prefault = opts.prefault;
+        s.buffers_mapped = opts.jobs_mapped;
         s
     }
 
@@ -35861,6 +35915,7 @@ impl Db {
             near || self.opts.seal_snapshot_far
         };
         let put_one = self.opts.seal_put_one;
+        let jobs_mapped = self.opts.jobs_mapped;
         let job = move |readable: &SealReadable| -> Result<Vec<String>> {
             if background_io == BackgroundIo::Idle {
                 idle_io_priority();
@@ -35889,11 +35944,17 @@ impl Db {
                 );
                 frozen_snaps && whole
             });
-            let order: Vec<u32> = match &have {
-                Some(h) => h.ents.iter().map(|e| e.frozen).collect(),
+            let order: blocks::BigVec<u32> = match &have {
+                Some(h) => {
+                    let mut order = blocks::BigVec::with_capacity(h.ents.len(), jobs_mapped);
+                    for e in h.ents.iter() {
+                        order.push(e.frozen);
+                    }
+                    order
+                }
                 None => {
                     SealCounts::add(&counts.seal_sorts, 1);
-                    mem.slots_in_key_order()
+                    mem.slots_in_key_order(jobs_mapped)
                 }
             };
             SealCounts::add(&counts.seal_sort_ns, t_job.elapsed().as_nanos() as u64);
@@ -41838,6 +41899,16 @@ impl Db {
     /// reads beside the allocator's bytes in use.
     pub fn mapped_bytes() -> usize {
         blocks::mapped_bytes()
+    }
+
+    /// How many of the jobs' large arrays have become mappings of the
+    /// engine's own (`Options::jobs_mapped`), process-wide and ever: a
+    /// seal's sort, a segment writer's per-key arrays, an ordered index
+    /// builder's keys, a merge's key list, a finish's trailer, each
+    /// counted once as it passes `blocks::MAP_FROM` bytes.
+    #[doc(hidden)]
+    pub fn job_buffers_mapped() -> usize {
+        blocks::big_maps()
     }
 
     /// The bytes of those blocks the kernel has resident, read from it

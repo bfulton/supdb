@@ -1690,6 +1690,10 @@ pub struct Supdb {
     /// (`Options::zpages_drop_again`): `supdb-zdropagain`,
     /// `supdb-zstridealldropagain`.
     zdropagain: bool,
+    /// A job's large per-key arrays mapped by the engine and unmapped at
+    /// the job's end (`Options::jobs_mapped`): `supdb-jobsmapped`,
+    /// `supdb-zstridealldropagainjobs`.
+    jobsmapped: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -2790,6 +2794,11 @@ struct Policy {
     /// first (`Options::zpages_drop_again`): `supdb-zdropagain` beside
     /// `supdb`, and `supdb-zstridealldropagain` beside `supdb-zstrideall`.
     zdropagain: bool,
+    /// The seals', merges' and closes' large per-key arrays as the
+    /// engine's own mappings (`Options::jobs_mapped`): `supdb-jobsmapped`
+    /// beside `supdb`, and `supdb-zstridealldropagainjobs` beside
+    /// `supdb-zstridealldropagain`.
+    jobsmapped: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -3087,6 +3096,7 @@ impl Default for Policy {
             zdriveend: None,
             zcrossraw: None,
             zdropagain: false,
+            jobsmapped: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3871,6 +3881,41 @@ impl Supdb {
             Policy {
                 zdropagain: true,
                 ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose jobs' large per-key arrays are the engine's own
+    /// mappings, unmapped as each job ends (`Options::jobs_mapped`):
+    /// `supdb-jobsmapped`.
+    pub fn create_jobsmapped(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                jobsmapped: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-zstridealldropagain` with the same (`Options::jobs_mapped`):
+    /// `supdb-zstridealldropagainjobs`, the stride form's arm with what
+    /// its jobs' threads held given back, under a bound where that is the
+    /// room its files are short of.
+    pub fn create_zstride_all_dropagain_jobs(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zstride: Some(supdb::ZStride::Forced),
+                zstride_room: Some(true),
+                zstride_convert: Some(true),
+                zaskdropped: Some(true),
+                zhotbeside: Some(true),
+                zdriveend: Some(true),
+                zcrossraw: Some(true),
+                zdropagain: true,
+                jobsmapped: true,
+                ..Policy::zblock()
             },
         )
     }
@@ -9054,6 +9099,7 @@ impl Supdb {
             zdriveend,
             zcrossraw,
             zdropagain,
+            jobsmapped,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -9616,6 +9662,7 @@ impl Supdb {
             zpages_cross_asks_raw: zcrossraw
                 .unwrap_or(supdb::Options::default().zpages_cross_asks_raw),
             zpages_drop_again: zdropagain,
+            jobs_mapped: jobsmapped,
             zpages_seek_ord: if zpages_heads {
                 true
             } else {
@@ -9986,6 +10033,7 @@ impl Supdb {
             zdriveend,
             zcrossraw,
             zdropagain,
+            jobsmapped,
             ord_threads: Default::default(),
         })
     }
@@ -10356,6 +10404,13 @@ impl Engine for Supdb {
         }
         if self.zrewarmbeside {
             return "supdb-zrewarmbeside";
+        }
+        if self.jobsmapped {
+            return if self.zstride == Some(supdb::ZStride::Forced) {
+                "supdb-zstridealldropagainjobs"
+            } else {
+                "supdb-jobsmapped"
+            };
         }
         if self.zdropagain {
             return if self.zstride == Some(supdb::ZStride::Forced) {
@@ -13039,6 +13094,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zblock"
         | "supdb-zdropagain"
         | "supdb-zstridealldropagain"
+        | "supdb-jobsmapped"
+        | "supdb-zstridealldropagainjobs"
         | "supdb-zdriveend"
         | "supdb-zcrossraw"
         | "supdb-zloadend"
@@ -14072,6 +14129,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zblock" => supdb_arm(Supdb::create_zblock, dir)?,
         "supdb-zdropagain" => supdb_arm(Supdb::create_zdropagain, dir)?,
         "supdb-zstridealldropagain" => supdb_arm(Supdb::create_zstride_all_dropagain, dir)?,
+        "supdb-jobsmapped" => supdb_arm(Supdb::create_jobsmapped, dir)?,
+        "supdb-zstridealldropagainjobs" => {
+            supdb_arm(Supdb::create_zstride_all_dropagain_jobs, dir)?
+        }
         "supdb-zdriveend" => supdb_arm(Supdb::create_zdriveend, dir)?,
         "supdb-zcrossraw" => supdb_arm(Supdb::create_zcrossraw, dir)?,
         "supdb-zloadend" => supdb_arm(Supdb::create_zloadend, dir)?,
@@ -17187,7 +17248,22 @@ mod tests {
                 assert_eq!(z.name(), "supdb-zstridealldropagain");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_drop_again);
+                assert!(o.zpages_drop_again && !o.jobs_mapped && !b.jobs_mapped);
+                assert_eq!(seven(o), (Forced, true, true, true, true, true, true));
+                // The jobs' large arrays as the engine's mappings, on the
+                // engine's arm and on the stride form's with the second
+                // drop.
+                let z = Supdb::create_jobsmapped(&dir("jobsmapped")).unwrap();
+                assert_eq!(z.name(), "supdb-jobsmapped");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.jobs_mapped && !o.zpages_drop_again && seven(o) == seven(b));
+                let z = Supdb::create_zstride_all_dropagain_jobs(&dir("zstridealldropagainjobs"))
+                    .unwrap();
+                assert_eq!(z.name(), "supdb-zstridealldropagainjobs");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.jobs_mapped && o.zpages_drop_again);
                 assert_eq!(seven(o), (Forced, true, true, true, true, true, true));
             }
             {
