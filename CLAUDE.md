@@ -5591,6 +5591,44 @@ wide before it is believed, since a fix that narrows the window passes
 every run that the unfixed test passes; and a failure met under a switch
 is run without the switch, as many times, before it is the switch's.
 
+**A lever built for the largest peak known, before a count said whose
+memory stayed.** At ten million keys under 1 GiB the allocator held 57-68
+MB free and resident through the mixes, in arenas of one free chunk each,
+and a group at its limit faulted on form files for the want of it. A
+merge's thread peaks at 84 MB in the allocator, by a probe that counts by
+thread, so the arenas were read as the jobs': the jobs' large arrays were
+made mappings of the engine's own (`Options::jobs_mapped`), tested,
+mutated and gated, and a traced rep with them read the same free bytes at
+the same mixes. The diagnostic queued to tell the allocator's two
+behaviours apart had been cancelled to compile the lever sooner. The next
+reading took the arenas' sizes, 7.5 to 8.3 MB beside a memo budgeted at
+eight, for the readers' memos, and the memos went into slabs
+(`Options::zpages_memo_slab`), also tested, mutated and gated; the traced
+rep with those read more free bytes, not fewer, and its pairing read a
+cell behind in both orders for a policy that had stopped firing. What
+answered the question was three counts no reading of sizes replaces, each
+an hour or less to make: the allocator on its own (`bench/examples/arena.rs`:
+a dead arena keeps all a thread held under the trim threshold and nothing
+over it, and `malloc_trim` returns none of it), every allocation by its
+thread in the suite's own shape (`alloc-census`: the readers 17 to 24 MB,
+the seals 14 to 16, the closes 8), and the arm that already made the
+allocator return everything, paired for the ceiling (`supdb-mmapthr`: the
+read pass after the load a third faster, two write mixes a twelfth
+slower, the rest level). The arenas were several owners', what stood
+varied threefold between reps of one arm by which thread took whose arena
+next, a smaller reader left more behind than a larger one because the
+larger freed a seal's arena past the threshold, and the whole of it was
+worth less than either lever had been built to win. The rules: memory
+that stays is laid to its owner by a count by thread, in the suite's
+shape and the phase it stays in, before a lever is built on the largest
+peak anyone has measured; a quantity that varies between reps of one arm
+is read over several before one rep attributes it; the ceiling of a
+family of levers is priced by the cheapest arm that reaches it before any
+member is built, and here that arm was in the tree; a diagnostic queued
+to decide between two mechanisms is run before either is built; and a
+budget is held to what its structure costs wherever one is found counting
+what the structure holds -- the memo's was the second.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
