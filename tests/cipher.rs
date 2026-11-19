@@ -1047,6 +1047,80 @@ fn an_envelope_nobody_names_is_swept_and_one_missing_is_refused() {
     assert!(Db::open(&dir, under(5)).is_err());
 }
 
+/// A fall back past a damaged slot under a cipher, where the slot passed
+/// over had retired the log file holding writes only it named: the slot
+/// before needs that file (`Manifest::needs_log`), and the open refuses it
+/// with every file as found, where it swept the envelope the damaged slot
+/// named and answered the writes' older values. Put back, the slot opens as
+/// the store.
+#[test]
+fn a_fall_back_under_a_cipher_past_a_slot_whose_log_retired_is_refused() {
+    let dir = scratch("fallback-log");
+    let opts = || Options {
+        seal_rotates_wal: true,
+        recycle_wal: false,
+        seal_bytes: 1 << 20,
+        l0_trigger: 1000,
+        direct_ingest: false,
+        ..under(9)
+    };
+    let mut db = Db::create(&dir, opts()).unwrap();
+    for i in 0..2000u32 {
+        db.put(&k((i * 7919) % 2000), &v(0, 0));
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    for i in (0..2000u32).step_by(7) {
+        db.put(&k(i), &v(i, 1));
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    // Dropped, as a crash is here, the seal's landing the last thing
+    // written: a close would flush, and the merge it lands would stand in
+    // both slots' place.
+    drop(db);
+    // The slot written last is the newest: the one the seal of the
+    // rewrites landed in.
+    let slot = |n: &str| dir.join(n);
+    let age = |n: &str| std::fs::metadata(slot(n)).unwrap().modified().unwrap();
+    let newest = if age("manifest") >= age("manifest.alt") {
+        "manifest"
+    } else {
+        "manifest.alt"
+    };
+    let saved = std::fs::read(slot(newest)).unwrap();
+    let mut bad = saved.clone();
+    let at = bad.len() / 2;
+    bad[at] ^= 0x5a;
+    std::fs::write(slot(newest), &bad).unwrap();
+    let before = names(&dir);
+    let e = match Db::open(&dir, opts()) {
+        Ok(db) => {
+            let mut got = Vec::new();
+            db.read_all(&k(7), vf(&mut |x| got.push(x.to_vec())))
+                .unwrap();
+            panic!("the open fell back past the slot whose log retired and answered Ok: names {before:?} newest {newest} key7 {got:?}")
+        }
+        Err(e) => e.to_string(),
+    };
+    assert!(e.contains("needs the log file"), "the refusal's words: {e}");
+    assert_eq!(
+        names(&dir),
+        before,
+        "a refused open leaves the directory as it found it"
+    );
+    std::fs::write(slot(newest), &saved).unwrap();
+    let db = Db::open(&dir, opts()).unwrap();
+    for i in (0..2000u32).step_by(7) {
+        let mut got = Vec::new();
+        db.read_all(&k(i), vf(&mut |x| got.push(x.to_vec())))
+            .unwrap();
+        assert_eq!(got.last(), Some(&v(i, 1)), "the rewrite of {i}, repaired");
+    }
+}
+
 /// A store dropped without its close, its memory gone with it, opens from
 /// its directory as everything it had committed; and a copy of the
 /// directory taken while the store is open opens beside it, under the same
