@@ -1362,3 +1362,130 @@ fn a_patch_by_its_rank_asks_for_its_lines_by_the_cut() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// A copy built over a block's records by updates alone claims its entries
+/// are the records, entry `i` the block's record `lo + i`, and a settle's
+/// patch takes the entry by the key's rank where the claim stands
+/// (`Options::copy_start_at_rank`). The claim was a flag, and the table is
+/// carried across a merge that rewrites the partition over the same blocks
+/// with its copies: a key written into the block and left to the backlog,
+/// sealed and folded in by the merge, is a record at the rank it lands at,
+/// every record after it a rank later, and the patch that filed it after
+/// the rewrite took the entry its rank named -- another key's. The claim
+/// names the partition it was made of now, and is no claim of the one
+/// the merge wrote. A partition of one block keeps its boundaries whatever
+/// is folded in, which is what lets the table be carried.
+#[test]
+fn a_copys_claim_to_its_records_is_no_claim_across_its_partitions_rewrite() {
+    let dir = scratch("copy-identity-rewrite");
+    let mut db = Db::create(
+        &dir,
+        Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(4096),
+            partition_on_flush: true,
+            publish_in_background: true,
+            upkeep: Upkeep::Inline,
+            scan_block_cache: true,
+            // The batches left to the backlog bound and the first scan
+            // after it, which is what leaves the key's write unfiled
+            // across its seal and the merge.
+            forms_settle_every: false,
+            forms_settle_builds: false,
+            l0_trigger: 1,
+            ..common::options()
+        },
+    )
+    .unwrap();
+    let value = [b'v'; 100];
+    let keys: Vec<Vec<u8>> = (0..300).map(|i| format!("k{:03}", i * 2).into_bytes()).collect();
+    let mut want = std::collections::BTreeMap::new();
+    for k in &keys {
+        db.put(k, &value);
+        want.insert(k.clone(), vec![value.to_vec()]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let fences = partition_fences(&dir);
+    assert!(fences.len() >= 3, "partitions: {}", fences.len());
+    let (lo, hi) = {
+        let (lo, hi) = &fences[fences.len() / 2];
+        (lo.clone(), hi.clone().expect("a closed partition"))
+    };
+    let inside: Vec<Vec<u8>> = keys
+        .iter()
+        .filter(|k| **k >= lo && **k < hi)
+        .cloned()
+        .collect();
+    let n = inside.len();
+    assert!((5..64).contains(&n), "one block of keys inside the range: {n}");
+    // Every key of the partition updated and scanned, so its block is a
+    // copy over updates alone.
+    for k in &inside {
+        db.put(k, b"updated");
+        want.insert(k.clone(), vec![b"updated".to_vec()]);
+    }
+    db.commit().unwrap();
+    db.scan(&lo, n, kv(&mut |_, _| {})).unwrap();
+    let (_, _, copies, _) = db.block_cache_kinds();
+    assert!(copies >= 1, "the block is a copy: {copies}");
+    // A commit after the scan, which files its batch as the first commit
+    // after a scan does (`Options::upkeep_settle_after_scans`), so that the
+    // batch after it is left to the backlog bound.
+    db.put(b"zz-elsewhere", b"elsewhere");
+    want.insert(b"zz-elsewhere".to_vec(), vec![b"elsewhere".to_vec()]);
+    db.commit().unwrap();
+    // A key between two of the partition's records, written and left
+    // unfiled, then sealed and folded into the partition by a merge.
+    let folded = {
+        let mut k = inside[n / 3].clone();
+        k.push(b'x');
+        k
+    };
+    // A record dropped beside it, so the rewrite keeps the partition's
+    // count and its first and last keys (`same_blocks`).
+    let dropped = inside[1].clone();
+    db.put(&folded, b"folded");
+    want.insert(folded.clone(), vec![b"folded".to_vec()]);
+    db.delete(&dropped);
+    want.remove(&dropped);
+    db.commit().unwrap();
+    let rebased_before = db.forms_rebased();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    // The scan files the folded key's write into the copy it was carried
+    // with, and a record past it is written after.
+    let later = inside[2 * n / 3].clone();
+    db.put(&later, b"later");
+    want.insert(later.clone(), vec![b"later".to_vec()]);
+    db.commit().unwrap();
+    let got = scan_model(&db);
+    assert!(
+        db.forms_rebased() > rebased_before,
+        "the rewrite kept the partition's layout: {} before, {} after, kinds {:?}, fences {} then {}",
+        rebased_before,
+        db.forms_rebased(),
+        db.block_cache_kinds(),
+        fences.len(),
+        partition_fences(&dir).len()
+    );
+    assert!(got == want, "the scan answers every write");
+    let r = db.reader().unwrap();
+    let mut via_handle = std::collections::BTreeMap::new();
+    r.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| {
+            via_handle
+                .entry(k.to_vec())
+                .or_insert_with(Vec::new)
+                .push(v.to_vec());
+        }),
+    )
+    .unwrap();
+    assert!(via_handle == want, "the handle's scan");
+    drop(r);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
