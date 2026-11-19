@@ -9058,10 +9058,17 @@ fn a_value_the_record_cannot_hold_sends_its_batch_through_the_wal() {
         let tmp = d.join("direct-00000000.tmp");
         if big {
             assert!(written > 8, "{name}: through the WAL");
-            assert!(!tmp.exists(), "{name}: no segment opened");
+            // The spare stands empty (`Options::run_spare`): no run took it.
+            assert!(
+                !tmp.exists() || std::fs::metadata(&tmp).unwrap().len() == 0,
+                "{name}: no segment opened"
+            );
         } else {
             assert!(written <= 8, "{name}: the WAL untouched");
-            assert!(tmp.exists(), "{name}: a segment open");
+            assert!(
+                std::fs::metadata(&tmp).is_ok_and(|m| m.len() > 0),
+                "{name}: a segment open"
+            );
         }
         db.crash();
         let db = Db::open(&d, common::options()).unwrap();
