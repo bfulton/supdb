@@ -221,16 +221,24 @@ What an engine picker would hit, roughly in order.
   with a count; add an end bound and reverse order.
 - [ ] **Batched point reads (`MultiGet`).** Cheap to add, and a natural new
   benchmark workload.
-- [ ] **One sequence for the log and the runs.** A recovery orders the
+- [x] **One sequence for the log and the runs.** A recovery orders the
   log's replayed frames above every piece, the one it rebuilds from a
   direct run's file included, so a run is sound only above every key the
   log names; the writer keeps that by its greatest key, which every write
   raises, a delete's included. A store written before deletes raised it
   may hold a run of a key whose tombstone is in its log past the
-  manifest, and opens with the run's values masked. Done when run
-  markers and log frames carry one commit sequence and a recovery orders
-  a rebuilt run against the frames by it, which repairs such a store at
-  its open, with crash tests of each order.
+  manifest. Runs take sequence numbers since store format 2, and the
+  open now orders a delete against a run it takes by them: a delete older
+  than the run, of a key at or above the run's first, masks nothing a
+  put had written -- the run opened above every such key -- and is
+  dropped from the replay, which a store written since never holds
+  (`SealWaits::stale_deletes`). The range note an open leaves for a run
+  it took carries the run's first key, so every open until the manifest
+  covers the run orders it the same way
+  (`an_append_after_an_unraised_delete_is_ordered_by_its_sequence_at_the_open`,
+  `tests/durable.rs`, through `Db::emulate_unraised_deletes`). A
+  version-1 store's runs carry no numbers and are taken wherever they
+  stand, as before.
 - [ ] **A log's device errors held on a device that makes them.** A
   failed write of the log is put back and written again, and a failed
   sync of it is kept until the store is reopened (`SyncPolicy`). The

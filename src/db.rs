@@ -8217,7 +8217,7 @@ impl Wal {
         Ok(())
     }
 
-    /// Replay committed batches: `apply(kind, key, value)` for every record
+    /// Replay committed batches: `apply(kind, seq, key, value)` for every record
     /// of every batch whose commit frame was read intact, in order. Frames
     /// after the last commit frame are a batch that never committed -- torn,
     /// or written and never synced -- and are not applied.
@@ -8264,7 +8264,7 @@ impl Wal {
         from: u64,
         first: bool,
         recycles: bool,
-        apply: impl FnMut(u8, &[u8], &[u8]),
+        apply: impl FnMut(u8, u64, &[u8], &[u8]),
         fill: impl FnMut(u64, u64) -> Result<u64>,
     ) -> Result<(u64, u64, bool)> {
         vault::note("replay", path);
@@ -8326,7 +8326,7 @@ impl Wal {
         id: u64,
         from: u64,
         first: bool,
-        mut apply: impl FnMut(u8, &[u8], &[u8]),
+        mut apply: impl FnMut(u8, u64, &[u8], &[u8]),
         mut fill: impl FnMut(u64, u64) -> Result<u64>,
     ) -> Result<(u64, u64, bool)> {
         let seed = wal_seed(id);
@@ -8417,7 +8417,7 @@ impl Wal {
                     }
                     for &(k, s, ks, ke, ve) in &batch {
                         if s >= from {
-                            apply(k, &buf[ks..ke], &buf[ke..ve]);
+                            apply(k, s, &buf[ks..ke], &buf[ke..ve]);
                         }
                     }
                     batch.clear();
@@ -19642,6 +19642,7 @@ struct SealCounts {
     run_names: AtomicU64,
     run_spares: AtomicU64,
     wal_set_aside: AtomicU64,
+    stale_deletes: AtomicU64,
     /// Time the writer spent in the seals its commits started: the wait
     /// for room, the freeze, and the seal's writer half.
     freeze_ns: AtomicU64,
@@ -19674,6 +19675,7 @@ impl SealCounts {
             run_names: get(&self.run_names),
             run_spares: get(&self.run_spares),
             wal_set_aside: get(&self.wal_set_aside),
+            stale_deletes: get(&self.stale_deletes),
             freeze_ns: get(&self.freeze_ns),
         }
     }
@@ -19736,6 +19738,10 @@ pub struct SealWaits {
     /// frame that verifies behind it, kept under `wal-<id>.aside` before
     /// the replay cut them (`wal_set_aside`).
     pub wal_set_aside: u64,
+    /// Deletes the open dropped from its replay as older than a run it took
+    /// and of a key at or above the run's first: what a writer from before
+    /// deletes raised the greatest key left (`Db::open`).
+    pub stale_deletes: u64,
     pub freeze_ns: u64,
 }
 
@@ -23540,6 +23546,10 @@ pub struct Db {
     /// never lowered, so it is at or above every key a frame in the log
     /// names.
     max_key: Vec<u8>,
+    /// A test's (`Db::emulate_unraised_deletes`): a delete above the
+    /// greatest key leaves it where it is, as a writer from before deletes
+    /// raised it did. Read only where the delete's key is above it.
+    unraised_deletes: bool,
     /// Scratch for the run a value would encode as, measured at `append`
     /// against the inline limit.
     /// EXPERIMENT: the memtable's entry count when the last builder was
@@ -37152,6 +37162,7 @@ impl Db {
             mem_handed: None,
             read_mode: (0, 0, true),
             max_key: Vec::new(),
+            unraised_deletes: false,
             built_ahead_len: 0,
             built_ahead_gen: 0,
             pending_err: None,
@@ -37659,6 +37670,11 @@ impl Db {
         // covers it.
         let mut direct_tmps: Vec<(u64, PathBuf)> = Vec::new();
         let mut covs: Vec<(u64, u64)> = Vec::new();
+        // Each run this open takes, by its start and its first key
+        // (`Db::fill_runs`), for the replay's drop of deletes from before
+        // deletes raised the greatest key; and how many it dropped.
+        let mut run_firsts: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut stale_deletes = 0u64;
         for name in &listed {
             let name = name.clone();
             if let Some(id) = name
@@ -37671,6 +37687,15 @@ impl Db {
                 if b <= sealed {
                     let _ = vault::remove_file(dir.join(&name));
                 } else {
+                    // The run's first key, where the open that took it
+                    // wrote one; a range noted before it did is empty.
+                    let mut first = Vec::new();
+                    if let Ok(mut f) = vault::open(dir.join(&name)) {
+                        let _ = f.read_to_end(&mut first);
+                    }
+                    if !first.is_empty() {
+                        run_firsts.push((a, first));
+                    }
                     covs.push((a, b));
                 }
             }
@@ -37738,8 +37763,18 @@ impl Db {
                 // Named above what the manifest covers: an open took the
                 // run and a crash came before it said so by the range.
                 Some((start, _)) if named => {
-                    let end = start + SegmentWriter::walk_run(&tmp)?.len() as u64;
-                    Db::write_cov(dir, start, end)?;
+                    let run = SegmentWriter::walk_run(&tmp)?;
+                    let end = start + run.len() as u64;
+                    let first = if run.is_empty() {
+                        Vec::new()
+                    } else {
+                        run.key(0).to_vec()
+                    };
+                    drop(run);
+                    Db::write_cov(dir, start, end, &first)?;
+                    if !first.is_empty() {
+                        run_firsts.push((start, first));
+                    }
                     covs.push((start, end));
                     let _ = vault::remove_file(&tmp);
                 }
@@ -37783,6 +37818,7 @@ impl Db {
                         &mut mseq,
                         &mut run_facts,
                         &mut slots,
+                        &mut run_firsts,
                     )
                 };
                 for (i, &id) in chain.iter().enumerate() {
@@ -37792,7 +37828,7 @@ impl Db {
                         at,
                         i == 0,
                         opts.recycle_wal,
-                        |_, _, _| {},
+                        |_, _, _, _| {},
                         &mut fill,
                     )?;
                     at = next;
@@ -37900,7 +37936,22 @@ impl Db {
                 from,
                 i == 0,
                 opts.recycle_wal,
-                |kind, k, v| {
+                |kind, seq, k, v| {
+                    // A delete older than a run taken at this open, of a key
+                    // at or above the run's first: written by a writer from
+                    // before deletes raised the greatest key, which opened
+                    // the run above every key a put had written, so the
+                    // delete masks nothing older than the run, and replayed
+                    // above the run's piece it would mask the run. Dropped;
+                    // a store written since holds none.
+                    if kind == WAL_DEL
+                        && run_firsts
+                            .iter()
+                            .any(|(start, first)| seq < *start && k >= first.as_slice())
+                    {
+                        stale_deletes += 1;
+                        return;
+                    }
                     if k > replay_max.as_slice() {
                         replay_max.clear();
                         replay_max.extend_from_slice(k);
@@ -38375,6 +38426,7 @@ impl Db {
             mem_handed: None,
             read_mode: (0, 0, true),
             max_key,
+            unraised_deletes: false,
             built_ahead_len: 0,
             built_ahead_gen: 0,
             pending_err: None,
@@ -38418,6 +38470,7 @@ impl Db {
             p.check()?;
         }
         SealCounts::add(&db.shared.seal_counts.wal_set_aside, set_aside);
+        SealCounts::add(&db.shared.seal_counts.stale_deletes, stale_deletes);
         db.go_away()?;
         db.start_trimmer();
         if db.opts.malloc_mmap_threshold > 0 {
@@ -38862,9 +38915,17 @@ impl Db {
         (a < b).then_some((a, b))
     }
 
-    fn write_cov(dir: &Path, a: u64, b: u64) -> Result<()> {
+    /// The range `[a, b)` a run this open took holds noted (`cov_name`),
+    /// with the run's first key in the file: the next open reads the run's
+    /// place from it where the temp name is gone, for the replay's order of
+    /// a delete before the run (`Db::open`, `stale_deletes`).
+    fn write_cov(dir: &Path, a: u64, b: u64, first: &[u8]) -> Result<()> {
         if a < b {
-            vault::create(dir.join(Db::cov_name(a, b)))?;
+            let mut f = vault::create(dir.join(Db::cov_name(a, b)))?;
+            if !first.is_empty() {
+                f.write_all(first)?;
+                f.sync_data()?;
+            }
             vault::sync_dir(dir)?;
         }
         Ok(())
@@ -38968,6 +39029,7 @@ impl Db {
         mseq: &mut u64,
         facts: &mut Vec<(String, (BlockedBloom, bool))>,
         slots: &mut OpenSlots,
+        firsts: &mut Vec<(u64, Vec<u8>)>,
     ) -> Result<u64> {
         loop {
             if let Some(&(_, b)) = covs.iter().find(|&&(a, b)| a == next && b <= upto) {
@@ -39001,8 +39063,10 @@ impl Db {
                 facts,
                 slots,
             )?;
+            let first = run.key(0).to_vec();
             drop(run);
-            Db::write_cov(dir, next, end)?;
+            Db::write_cov(dir, next, end, &first)?;
+            firsts.push((next, first));
             covs.push((next, end));
             let _ = vault::remove_file(&tmp);
             next = end;
@@ -39170,7 +39234,7 @@ impl Db {
         // log's frames as newer than the piece it rebuilds from the run's
         // file, and a run of a key deleted above the greatest came back
         // masked by the delete it followed.
-        if key > self.max_key.as_slice() {
+        if key > self.max_key.as_slice() && !self.unraised_deletes {
             self.max_key.clear();
             self.max_key.extend_from_slice(key);
         }
@@ -43454,6 +43518,15 @@ impl Db {
         }
         here.recv().ok()?;
         Some(SegmentWorkPaused { _until: until })
+    }
+
+    /// A test's: while `on`, a delete above the greatest key leaves the
+    /// greatest key where it is, as a writer from before deletes raised it
+    /// did, so a run can open on a key a delete in the log names: the store
+    /// such a writer left, for the open that repairs it.
+    #[doc(hidden)]
+    pub fn emulate_unraised_deletes(&mut self, on: bool) {
+        self.unraised_deletes = on;
     }
 
     /// A test's: the segment work's thread panics at its next look at its

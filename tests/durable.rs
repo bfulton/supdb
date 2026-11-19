@@ -328,6 +328,42 @@ fn delete_then_write_crash_while_sealing(
     let _ = std::fs::remove_dir_all(&c);
 }
 
+/// A store a writer from before deletes raised the greatest key left
+/// (`Db::emulate_unraised_deletes`): the run opened on the deleted key, its
+/// append in the run's file and the delete in the log past what the
+/// manifest covers, at a lower sequence than the run's start. The open
+/// orders the two by their sequence -- the delete older than the run, of a
+/// key at or above its first, masks nothing the run did not follow -- and
+/// reads the append, at every open after; it counts the delete it dropped.
+#[test]
+fn an_append_after_an_unraised_delete_is_ordered_by_its_sequence_at_the_open() {
+    for held in [SealHeld::BeforeWrite, SealHeld::BetweenPhases] {
+        let tag = format!("unraised-{held:?}");
+        let d = dir(&format!("dur-del-unraised-{tag}"));
+        let c = dir(&format!("dur-del-unraised-{tag}-crash"));
+        let opts = Options::default();
+        let mut db = loaded(&d, opts.clone());
+        db.emulate_unraised_deletes(true);
+        let k = key(500_000);
+        delete_and_commit(&mut db, &k, Del::Delete);
+        seal_held(&mut db, held);
+        write_after(&mut db, &k, Then::Append);
+        assert!(
+            open_run(&d),
+            "{tag}: premise: the append opened a run on the deleted key"
+        );
+        copy_live(&db, &d, &c);
+        hold(&db, held, false);
+        drop(db);
+        let r = Db::open(&c, opts.clone()).unwrap();
+        assert_eq!(r.seal_waits().stale_deletes, 1, "{tag}: the delete dropped");
+        drop(r);
+        holds_the_write(&c, &opts, &k, Del::Delete, &tag);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&c);
+    }
+}
+
 #[test]
 fn an_append_after_a_delete_survives_a_crash_before_the_deletes_seal_writes() {
     delete_then_write_crash_while_sealing(
