@@ -1660,12 +1660,20 @@ reads that as the mutant's death, and removes the stores a mutant's
 tests left, after a hung one's filled the disk under the run and took
 its verdicts with it.
 
-What is not the same as a plain store is one thing, and it is the
-pager's: a chunk of a form file that fails its tag is a read of the
-store that failed, and the store refuses every read after it, where a
-plain store takes a damaged form file out of service and reads the
-partition raw (`a_changed_byte_in_a_form_file_is_refused_or_the_form_is`
-holds what it does; `ROADMAP.md` has what it should). And one regime is
+A chunk of a form file that fails its tag was a read of the store that
+failed, and the store refused every read after it, where a plain store
+takes a damaged form file out of service and reads the partition raw.
+The pager poisons the store for every file but a form file, which the
+store can make again (`pager::Paged::regenerable`): there the failed
+chunk is a range the file does not lend, and the form's readers already
+take a file out of service at a page that does not lend. The test holds
+both ways a chunk can fail -- at the attach, which reads the file's
+chunks and rejects it, and in service, re-decrypted after the cache gave
+it back -- to the store read whole and never refused
+(`a_changed_byte_in_a_form_file_takes_the_form_out_of_service_and_not_the_store`).
+Its in-service half first damaged "the first form file" of a hash map,
+which in one run in six was a file nothing serves, read by nobody
+through eleven thousand rounds: it damages every one now. And one regime is
 not priced: a store that fits memory and not its own cache of plaintext
 decrypts two chunks for a raw point read and one, and a decode, through
 the form; the controller reads the kernel's cache and sees none of it.

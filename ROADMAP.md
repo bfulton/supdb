@@ -548,14 +548,14 @@ What an engine picker would hit, roughly in order.
   `pair.sh supdb-cipherauto supdb-cipher 5000000 --bound 671088640
   --passes read` reads the form ahead in both sittings, and the
   controller is on under a cipher.
-- [ ] **A form file's damage taken as the form's alone.** A chunk of a
-  form file that fails its tag is a read of the store that failed, and
-  the store refuses every read after it, as it does for a segment's. A
-  plain store takes a damaged form file out of service, reads the
-  partition raw and builds the file again, and a form file is as
-  regenerable under a cipher. Done when a failed chunk of a form file's
-  envelope is the form's failure, at every site that reads a form page,
-  with the byte-damage test saying which outcome each flip had.
+- [x] **A form file's damage taken as the form's alone.** A chunk of a
+  form file that fails its tag was a read of the store that failed, and
+  the store refused every read after it. The pager keeps such a failure
+  the file's (`pager::Paged::regenerable`), the chunk a range the file
+  does not lend, which the form's readers take as a page out of service,
+  and the store reads the partition raw as a plain store does
+  (`a_changed_byte_in_a_form_file_takes_the_form_out_of_service_and_not_the_store`,
+  `tests/cipher.rs`, at the attach and in service).
 - [ ] **The controller's model held to a measurement under a cipher.**
   Its budget there is of two caches in series, the store's own and the
   kernel's of the envelopes, and at five million keys under 640 MiB it
