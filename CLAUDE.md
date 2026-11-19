@@ -5683,6 +5683,28 @@ a cell that reads behind with every counter level is short of something
 no counter counts, so the next instrument is the accounting a level
 down and not another counter of the same kind.
 
+**A default gated green over a roster the gate never opens.** The
+stride form's options became the engine's on pairings at every bounded
+rung and a green `sh scripts/check.sh`, and the quick run that followed
+stopped at its first rung in two seconds: the harness refuses a stride
+arm whose store holds no stride file after the ordered load, asked it of
+any arm whose options say the form, and `supdb-nozpages`, the arm with
+the compact form off, carried the engine's new option and no form file
+of any kind. The refusal had been right for as long as only an arm that
+set the stride form had it; the controller's arms were exempt by name
+and the form-off arm by nobody. The gate's bench group opens the dozen
+arms its tests name, and the fifteen controller tests the flip broke
+were found by running the tests before the gate; the roster's arms are
+opened by the quick group alone, which is not in the gate's default set
+because it is a timing run. The refusal holds a forced arm now, and its
+test has the form-off arm. The rule: a default is gated on every place
+an arm that inherits it is opened, and a check keyed on an option's
+value is read again when the option becomes everyone's, since "the arm
+that asked for it" and "every arm that pins nothing" stop being the
+same set; before a default's quick row, the whole roster is opened at
+the smallest rung with one rep, a ten-second run that says what
+twenty-five minutes would have said at their start.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
