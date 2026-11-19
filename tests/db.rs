@@ -20512,7 +20512,13 @@ fn the_directory(d: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
 #[test]
 fn a_second_open_of_a_store_is_refused_until_the_first_is_gone() {
     let d = dir("second-open");
-    let mut db = Db::create(&d, common::options()).unwrap();
+    // The live store's own form files are built beside the test on a
+    // thread of the store's, and would read as the refused open's writes.
+    let opts = || supdb::Options {
+        zpages: supdb::ZPages::Off,
+        ..common::options()
+    };
+    let mut db = Db::create(&d, opts()).unwrap();
     for i in 0..1000u32 {
         db.append(format!("k{i:05}").as_bytes(), b"v");
     }
@@ -20522,8 +20528,8 @@ fn a_second_open_of_a_store_is_refused_until_the_first_is_gone() {
     std::fs::write(d.join("seg-00000000000000ff.sup"), b"an orphan").unwrap();
     let before = the_directory(&d);
     for (what, e) in [
-        ("open", Db::open(&d, common::options()).err()),
-        ("create", Db::create(&d, common::options()).err()),
+        ("open", Db::open(&d, opts()).err()),
+        ("create", Db::create(&d, opts()).err()),
     ] {
         let e = e.unwrap_or_else(|| panic!("a second {what} of a live store"));
         assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{what}: {e}");
@@ -20537,7 +20543,7 @@ fn a_second_open_of_a_store_is_refused_until_the_first_is_gone() {
     db.append(b"k99999", b"after");
     db.commit().unwrap();
     db.close().unwrap();
-    let mut db = Db::open(&d, common::options()).unwrap();
+    let mut db = Db::open(&d, opts()).unwrap();
     assert_eq!(db.count(b"k00500").unwrap(), 1);
     assert_eq!(db.count(b"k99999").unwrap(), 1);
     assert!(
@@ -20547,7 +20553,7 @@ fn a_second_open_of_a_store_is_refused_until_the_first_is_gone() {
     db.append(b"k99998", b"before the crash");
     db.commit().unwrap();
     db.crash();
-    let db = Db::open(&d, common::options()).unwrap();
+    let db = Db::open(&d, opts()).unwrap();
     assert_eq!(db.count(b"k99998").unwrap(), 1, "a crashed store opens");
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
