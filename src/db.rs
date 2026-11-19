@@ -17126,7 +17126,11 @@ fn check_options(opts: &Options) -> Result<()> {
 /// A version-3 body ends in the store's format version
 /// (`STORE_FORMAT`), the four bytes behind the names: a reader from before
 /// it stops at the names and never reads the word, and a body without it
-/// was written before versions were recorded, which is version 1.
+/// was written before versions were recorded, which is version 1. Behind
+/// the version, eight bytes name the oldest log file the slot needs
+/// (`Manifest::needs_log`), which a reader from before them never reads
+/// and a body without them reads as nothing known: a release that does not
+/// read them opens the store as it did, without the check they allow.
 const MANIFEST_MAGIC: &[u8; 9] = b"SUPDBMAN\x03";
 /// The magic's bytes before the version byte: a manifest that carries them
 /// with a version past this one's is a newer release's, refused as one.
@@ -17214,6 +17218,9 @@ struct OpenSlots {
     slot: SlotChoice,
     synced: [u64; 2],
     tear: bool,
+    /// The log file the slot taken needs (`Manifest::needs_log`), which
+    /// every slot the open writes carries on.
+    needs_log: u64,
 }
 
 /// Which manifest slot a publish writes: never the one holding the newest
@@ -17246,17 +17253,19 @@ impl SlotChoice {
     /// The open's publish of `seq`, by the shape the options name, into
     /// the next slot, which is the durable one once the write has
     /// returned, its fsync with it. The slot written.
+    #[allow(clippy::too_many_arguments)]
     fn write_shape(
         &mut self,
         dir: &Path,
         opts: &Options,
         seq: u64,
         covered_seq: u64,
+        needs_log: u64,
         names: &[String],
         tear: bool,
     ) -> Result<usize> {
         let slot = self.next();
-        manifest_write_shape(dir, opts, slot, seq, covered_seq, names, tear)?;
+        manifest_write_shape(dir, opts, slot, seq, covered_seq, needs_log, names, tear)?;
         if opts.manifest_slots {
             self.landed(slot);
         }
@@ -17317,19 +17326,48 @@ fn sweep_manifest_spares(dir: &Path) -> Result<()> {
 /// A manifest's bytes: the header, then the covered sequence and the
 /// names, each with its flag byte -- `MANIFEST_PENDING` for the names in
 /// `pending` -- and the store's format version.
-fn manifest_encode(seq: u64, covered_seq: u64, names: &[String], pending: &[String]) -> Vec<u8> {
-    manifest_encode_as(seq, covered_seq, names, pending, Some(STORE_FORMAT))
+fn manifest_encode(
+    seq: u64,
+    covered_seq: u64,
+    needs_log: u64,
+    names: &[String],
+    pending: &[String],
+) -> Vec<u8> {
+    manifest_encode_with(
+        seq,
+        covered_seq,
+        names,
+        pending,
+        Some(STORE_FORMAT),
+        needs_log,
+    )
 }
 
 /// `manifest_encode` recording `format`, or no version where it is `None`,
 /// as a release before versions wrote: the tests' way to make the stores
 /// another release would leave.
+#[cfg(test)]
 fn manifest_encode_as(
     seq: u64,
     covered_seq: u64,
     names: &[String],
     pending: &[String],
     format: Option<u32>,
+) -> Vec<u8> {
+    manifest_encode_with(seq, covered_seq, names, pending, format, 0)
+}
+
+/// `manifest_encode_as` with the log file the slot needs behind the format
+/// word (`Manifest::needs_log`), where a format is recorded: zero says
+/// nothing is known of it. A reader from before the word stops at the
+/// format and never reads it.
+fn manifest_encode_with(
+    seq: u64,
+    covered_seq: u64,
+    names: &[String],
+    pending: &[String],
+    format: Option<u32>,
+    needs_log: u64,
 ) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&covered_seq.to_le_bytes());
@@ -17345,6 +17383,7 @@ fn manifest_encode_as(
     }
     if let Some(f) = format {
         body.extend_from_slice(&f.to_le_bytes());
+        body.extend_from_slice(&needs_log.to_le_bytes());
     }
     let crc = block::crc32_resume(crc32(&seq.to_le_bytes()), &body);
     let mut out = Vec::with_capacity(body.len() + 25);
@@ -17372,10 +17411,11 @@ fn manifest_image(
     dir: &Path,
     seq: u64,
     covered_seq: u64,
+    needs_log: u64,
     names: &[String],
     pending: &[String],
 ) -> Result<Vec<u8>> {
-    let out = manifest_encode(seq, covered_seq, names, pending);
+    let out = manifest_encode(seq, covered_seq, needs_log, names, pending);
     let Some(v) = vault::under(dir) else {
         return Ok(out);
     };
@@ -17402,16 +17442,19 @@ fn manifest_open(dir: &Path, buf: &[u8]) -> Result<Manifest> {
 /// The slot is never truncated -- a truncate frees blocks, and a freed
 /// block is a discard round trip here -- so a shorter manifest leaves the
 /// old one's tail behind it, past the length the header names.
+#[allow(clippy::too_many_arguments)]
 fn manifest_write_slot(
     dir: &Path,
     slot: usize,
     seq: u64,
     covered_seq: u64,
+    needs_log: u64,
     names: &[String],
     pending: &[String],
     tear: bool,
 ) -> Result<()> {
-    manifest_write_slot_unsynced(dir, slot, seq, covered_seq, names, pending, tear)?.sync_data()?;
+    manifest_write_slot_unsynced(dir, slot, seq, covered_seq, needs_log, names, pending, tear)?
+        .sync_data()?;
     Ok(())
 }
 
@@ -17420,17 +17463,19 @@ fn manifest_write_slot(
 /// thread beside the seal's fsync (`Maint::land_readable`). `tear` is a
 /// test's (`Db::tear_next_slot_write`): the first half of the image
 /// written and the write failed, as a device out of space part way would.
+#[allow(clippy::too_many_arguments)]
 fn manifest_write_slot_unsynced(
     dir: &Path,
     slot: usize,
     seq: u64,
     covered_seq: u64,
+    needs_log: u64,
     names: &[String],
     pending: &[String],
     tear: bool,
 ) -> Result<File> {
     use std::os::unix::fs::FileExt;
-    let out = manifest_image(dir, seq, covered_seq, names, pending)?;
+    let out = manifest_image(dir, seq, covered_seq, needs_log, names, pending)?;
     let f = vault::open_slot(dir.join(MANIFEST_SLOTS[slot]))?;
     if tear {
         f.write_all_at(&out[..out.len() / 2], 0)?;
@@ -17482,19 +17527,21 @@ fn manifest_make_slots(dir: &Path, fail: bool, settle: bool) -> Result<()> {
 /// `slot`, or the temp name renamed into place with the directory fsynced,
 /// the spare it leaves (`manifest_write`) unlinked here, where no landing
 /// waits. `tear` is a test's, for a slot (`Options::tear_open_slot_write`).
+#[allow(clippy::too_many_arguments)]
 fn manifest_write_shape(
     dir: &Path,
     opts: &Options,
     slot: usize,
     seq: u64,
     covered_seq: u64,
+    needs_log: u64,
     names: &[String],
     tear: bool,
 ) -> Result<()> {
     if opts.manifest_slots {
-        return manifest_write_slot(dir, slot, seq, covered_seq, names, &[], tear);
+        return manifest_write_slot(dir, slot, seq, covered_seq, needs_log, names, &[], tear);
     }
-    if let Some(spare) = manifest_write(dir, seq, covered_seq, names, false)? {
+    if let Some(spare) = manifest_write(dir, seq, covered_seq, needs_log, names, false)? {
         let _ = vault::remove_file(spare);
     }
     Ok(())
@@ -17512,10 +17559,11 @@ fn manifest_write(
     dir: &Path,
     seq: u64,
     covered_seq: u64,
+    needs_log: u64,
     names: &[String],
     spare: bool,
 ) -> Result<Option<PathBuf>> {
-    let out = manifest_image(dir, seq, covered_seq, names, &[])?;
+    let out = manifest_image(dir, seq, covered_seq, needs_log, names, &[])?;
     let tmp = dir.join("manifest.tmp");
     {
         let mut f = vault::create(&tmp)?;
@@ -17558,6 +17606,15 @@ struct Manifest {
     /// The store's format version the slot records (`STORE_FORMAT`): 1
     /// where it records none.
     format: u32,
+    /// The id of the oldest log file the slot needs to replay what it does
+    /// not cover: one past every log file a publish up to it has retired
+    /// (`Maint::needs_log`). A log file retires only behind a slot known
+    /// durable that covers it, so where the slot an open takes needs a
+    /// log file the directory lacks, a newer slot had retired it and the
+    /// open has fallen back past that slot's writes (`Db::open_refusals`).
+    /// Zero where nothing is known: a slot from before the word, a store
+    /// that has retired nothing, a checkpoint, which holds no log.
+    needs_log: u64,
 }
 
 /// One manifest file parsed, either version. A file that fails its CRC is
@@ -17635,6 +17692,10 @@ fn manifest_parse(buf: &[u8]) -> Result<Manifest> {
         Some(w) if version >= 3 => u32::from_le_bytes(w.try_into().unwrap()),
         _ => 1,
     };
+    let needs_log = match body.get(p + 4..p + 12) {
+        Some(w) if version >= 3 => u64::from_le_bytes(w.try_into().unwrap()),
+        _ => 0,
+    };
     Ok(Manifest {
         version,
         slot: 0,
@@ -17643,6 +17704,7 @@ fn manifest_parse(buf: &[u8]) -> Result<Manifest> {
         names,
         pending,
         format,
+        needs_log,
     })
 }
 
@@ -17906,7 +17968,7 @@ mod store_format {
     #[test]
     fn a_newer_manifest_layout_is_refused_and_not_taken_for_torn() {
         let (d, m) = a_store("format-newer-layout");
-        let mut newer = manifest_encode(m.seq + 1, m.covered, &m.names, &[]);
+        let mut newer = manifest_encode(m.seq + 1, m.covered, 0, &m.names, &[]);
         newer[8] = MANIFEST_MAGIC[8] + 1;
         std::fs::write(d.join(slot_after(&m, m.seq + 1)), newer).unwrap();
         let before = the_directory(&d);
@@ -17947,6 +18009,11 @@ mod store_format {
         let newest = manifest_read_all(&d).unwrap().0.remove(0);
         assert!(newest.seq > m.seq + 1);
         assert_eq!(newest.format, STORE_FORMAT);
+        // The log file a slot needs, behind the format word, written and
+        // read back.
+        let needs =
+            manifest_parse(&manifest_encode_with(9, 7, &m.names, &[], Some(42), 31)).unwrap();
+        assert_eq!((needs.format, needs.needs_log), (42, 31));
         let with =
             manifest_parse(&manifest_encode_as(9, 7, &m.names, &m.names[..1], Some(42))).unwrap();
         let without =
@@ -36043,6 +36110,12 @@ impl Db {
     /// owns the old file and deletes it once its segment is renamed into
     /// place, while commits continue into the next file. Replay walks them
     /// in id order; sequence numbers are continuous across the boundary.
+    /// The id a log file's name carries (`wal_path`), or none for a path
+    /// that is not a log file's.
+    fn wal_id_of(p: &Path) -> Option<u64> {
+        p.file_name()?.to_str()?.strip_prefix("wal-")?.parse().ok()
+    }
+
     fn wal_path(dir: &Path, id: u64) -> PathBuf {
         dir.join(format!("wal-{id:08}"))
     }
@@ -36737,10 +36810,10 @@ impl Db {
         // file that may be torn, and the manifest is what says it is not
         // the store's. The scan stays for stores written before manifests.
         if opts.manifest_slots {
-            manifest_write_slot(dir, 0, 0, 0, &[], &[], false)?;
+            manifest_write_slot(dir, 0, 0, 0, 0, &[], &[], false)?;
             manifest_make_slots(dir, false, false)?;
         } else {
-            manifest_write(dir, 0, 0, &[], false)?;
+            manifest_write(dir, 0, 0, 0, &[], false)?;
         }
         let segs: Vec<std::sync::Arc<Seg>> = Vec::new();
         let mean_key_bytes = 0;
@@ -36978,6 +37051,7 @@ impl Db {
             Vec::new(),
             0,
             SlotChoice { durable: 0 },
+            0,
         )));
         let mut db = Db {
             r,
@@ -37313,6 +37387,7 @@ impl Db {
         // before a slot names them so (`Options::manifest_pending`).
         let pending: Vec<String> = manifest.as_ref().map_or(Vec::new(), |m| m.pending.clone());
         let taken = manifest.as_ref().map(|m| MANIFEST_SLOTS[m.slot]);
+        let needs_log = manifest.as_ref().map_or(0, |m| m.needs_log);
         let (sealed, mut live) = match manifest {
             Some(m) => (m.covered, m.names),
             None => {
@@ -37330,6 +37405,7 @@ impl Db {
         // is removed or written: an open that refuses leaves every file as
         // it found it, for the store to be put right.
         Db::open_refusals(dir, taken, &live, &on_disk, &listed, held.is_some())?;
+        Db::log_refusal(dir, taken, needs_log)?;
         // And what it does not name, before the log is replayed, which an
         // open that refuses here would have done for nothing.
         if held.is_none() {
@@ -37372,7 +37448,7 @@ impl Db {
             if alt_found {
                 if taken == Some(MANIFEST_SLOTS[1]) {
                     mseq += 1;
-                    slot.write_shape(dir, &opts, mseq, sealed, &live, take(&mut tear))?;
+                    slot.write_shape(dir, &opts, mseq, sealed, needs_log, &live, take(&mut tear))?;
                 }
                 let removed = if opts.fail_open_alt_removal {
                     Err(err("a test failed the open's removal of manifest.alt"))
@@ -37410,7 +37486,8 @@ impl Db {
         // same writes.
         if !had_manifest {
             mseq += 1;
-            let to = slot.write_shape(dir, &opts, mseq, sealed, &live, take(&mut tear))?;
+            let to =
+                slot.write_shape(dir, &opts, mseq, sealed, needs_log, &live, take(&mut tear))?;
             if opts.manifest_slots {
                 synced[to] = mseq;
             }
@@ -37433,18 +37510,28 @@ impl Db {
                 open_synced.push(".".into());
             }
             mseq += 1;
-            let to = slot.write_shape(dir, &opts, mseq, sealed, &live, take(&mut tear))?;
+            let to =
+                slot.write_shape(dir, &opts, mseq, sealed, needs_log, &live, take(&mut tear))?;
             open_synced.push(MANIFEST_SLOTS[to].into());
             synced[to] = mseq;
             if upgrade {
                 let older = slot.next();
-                manifest_write_slot(dir, older, mseq - 1, sealed, &live, &[], take(&mut tear))?;
+                manifest_write_slot(
+                    dir,
+                    older,
+                    mseq - 1,
+                    sealed,
+                    needs_log,
+                    &live,
+                    &[],
+                    take(&mut tear),
+                )?;
             }
         } else if upgrade {
             // The one manifest of a store that keeps no slots, in this
             // version.
             mseq += 1;
-            manifest_write_shape(dir, &opts, 0, mseq, sealed, &live, false)?;
+            manifest_write_shape(dir, &opts, 0, mseq, sealed, needs_log, &live, false)?;
         }
         // The runs of ordered ingest a crash left under their temp names.
         // A run's records up to its last commit marker are the batches
@@ -37494,7 +37581,12 @@ impl Db {
         // its finish composed (`finish_run`).
         let mut run_facts: Vec<(String, (BlockedBloom, bool))> = Vec::new();
         // The open's slot writes, taken for the runs' and given back after.
-        let mut slots = OpenSlots { slot, synced, tear };
+        let mut slots = OpenSlots {
+            slot,
+            synced,
+            tear,
+            needs_log,
+        };
         // Empty temp names: the spare a store makes ahead of its next run
         // (`Options::run_spare`), which no run wrote. Removed once the open
         // has taken the store, so a refused open leaves them as it found
@@ -38160,6 +38252,7 @@ impl Db {
             retiring,
             mseq,
             slot,
+            needs_log,
         )));
         let mut db = Db {
             r,
@@ -38402,6 +38495,29 @@ impl Db {
     /// that stops naming it is: in the clear by the open's listing
     /// (`listed`, sorted), under a cipher by each envelope looked for,
     /// since the listing there is of the names a slot gave the store.
+    /// The slot taken held to the log file it needs (`Manifest::needs_log`):
+    /// a log file retires only behind a slot known durable that covers it,
+    /// and that slot needs a later one, so where the file is gone a newer
+    /// slot retired it and the open is falling back past that slot's
+    /// writes, which no log holds now. Refused with every file as found.
+    fn log_refusal(dir: &Path, taken: Option<&str>, needs_log: u64) -> Result<()> {
+        let Some(slot) = taken else {
+            return Ok(());
+        };
+        if needs_log == 0 {
+            return Ok(());
+        }
+        let name = format!("wal-{needs_log:08}");
+        if vault::exists(dir.join(&name)) {
+            return Ok(());
+        }
+        Err(err(&format!(
+            "refused: the manifest slot {slot} needs the log file {name}, which is missing \
+             from the directory: a newer slot that retired it was passed over, and the \
+             writes it covered are in no log; nothing was removed"
+        )))
+    }
+
     fn open_refusals(
         dir: &Path,
         taken: Option<&str>,
@@ -38695,6 +38811,7 @@ impl Db {
             opts,
             *mseq,
             sealed,
+            slots.needs_log,
             live,
             std::mem::take(&mut slots.tear),
         )?;
@@ -50034,6 +50151,14 @@ struct Maint {
     /// the same mistake: treating "the data is somewhere" as "the data is
     /// durable somewhere a reopen can find".
     retiring_wals: Vec<PathBuf>,
+    /// The log file the next slot needs (`Manifest::needs_log`): one past
+    /// every log file that has retired or waits to, raised at each slot's
+    /// write before the retirement that slot licenses (`slot_needs_log`).
+    /// Raised past a file that waits for a later slot it says only that
+    /// the file is not needed, which weakens the open's check and never
+    /// refuses a store; left below one a slot licenses, an open after the
+    /// retirement would refuse the store that slot is.
+    needs_log: u64,
     /// The WAL sequence every live segment covers between them: the live
     /// set's bound, raised when a seal's segments are published to readers
     /// and persisted by the manifest once they are durable, so for the
@@ -50903,6 +51028,7 @@ impl Maint {
         retiring_wals: Vec<PathBuf>,
         manifest_seq: u64,
         slot: SlotChoice,
+        needs_log: u64,
     ) -> Maint {
         r.shared
             .manifest_seq
@@ -50927,6 +51053,7 @@ impl Maint {
             sync_helper: None,
             slot_sync_due: None,
             retiring_wals,
+            needs_log,
             retiring_tmps: Vec::new(),
             spares: Vec::new(),
             compacting: Vec::new(),
@@ -51432,6 +51559,9 @@ impl Maint {
         tmp: Option<PathBuf>,
         defer_sync: bool,
     ) -> Result<()> {
+        // The log files this landing retires counted before the slot that
+        // licenses their retirement is written.
+        self.slot_needs_log(&wal);
         if self.pending_on() && !self.pending.is_empty() {
             // The slot named this seal's segments at its readable landing
             // (`land_readable`); they are durable now, and the next publish
@@ -52519,16 +52649,30 @@ impl Maint {
                 |n| n.checked_sub(1),
             );
         }
+        let needs_log = self.slot_needs_log(&[]);
         let f = manifest_write_slot_unsynced(
             &self.dir,
             to,
             self.manifest_seq,
             covered,
+            needs_log,
             names,
             pending,
             tear,
         )?;
         Ok((f, owed))
+    }
+
+    /// The log file the slot about to be written needs (`needs_log`),
+    /// raised past every log file waiting to retire and past `also`, the
+    /// ones the caller is about to hand to the retirement.
+    fn slot_needs_log(&mut self, also: &[PathBuf]) -> u64 {
+        for p in self.retiring_wals.iter().chain(also) {
+            if let Some(id) = Db::wal_id_of(p) {
+                self.needs_log = self.needs_log.max(id + 1);
+            }
+        }
+        self.needs_log
     }
 
     /// A slot's file fdatasynced: what a publish's own sync and a drain's
@@ -52624,7 +52768,8 @@ impl Maint {
                 checkpoint_file(&self.dir, tmp, &companion, false)?;
             }
         }
-        manifest_write_shape(tmp, &self.opts, 0, 1, self.covered_seq, &names, false)?;
+        // A checkpoint holds no log, so its slot needs none.
+        manifest_write_shape(tmp, &self.opts, 0, 1, self.covered_seq, 0, &names, false)?;
         vault::sync_dir(tmp)
     }
 
@@ -52680,10 +52825,12 @@ impl Maint {
             }
             return Ok(());
         }
+        let needs_log = self.slot_needs_log(&[]);
         let spare = manifest_write(
             &self.dir,
             self.manifest_seq,
             self.covered_seq,
+            needs_log,
             &self.live_names(),
             self.opts.manifest_spare,
         )?;

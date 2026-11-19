@@ -367,20 +367,20 @@ What an engine picker would hit, roughly in order.
   when the open's phases are stamped over that state and the share of
   each read is known, and, if the whole opens are it, a last key read
   through a check that covers only what is read is priced against them.
-- [ ] **A fall back past a damaged slot whose log retired.** A slot
+- [x] **A fall back past a damaged slot whose log retired.** A slot
   that names a seal's segment durable retires the log files that held
-  its writes; with that slot damaged, the open falls back to the slot
-  before, sweeps the segment, replays a log that no longer holds them,
-  and answers the writes' older values. A buffered store whose publish
-  of that landing was torn by a power cut leaves the same files -- the
-  segment synced, the log's frames for it never synced and cut -- and
-  must open, so the files cannot tell the two apart and the open sweeps
-  in both (`Db::unnamed_refusals`). Media damage alone. Done when a slot
-  names the log file its covered sequence lies in, so that an open can
-  see a log file the slot before needs and the directory lacks; the
-  reproduction is `a_fallback_past_a_slot_whose_log_retired_is_refused`
-  in `tests/durable.rs`, ignored while it fails; the words it holds the
-  refusal to are a placeholder for the open's own.
+  its writes; with that slot damaged, the open fell back to the slot
+  before, swept the segment, replayed a log that no longer held them,
+  and answered the writes' older values. Every slot now names the oldest
+  log file it needs, one past every log file a publish up to it has
+  retired or is about to (`Manifest::needs_log`, behind the format word,
+  which a reader from before it never reads), and an open refuses a slot
+  whose log file the directory lacks (`Db::log_refusal`): a log file
+  retires only behind a durable slot that needs a later one, so the file
+  is gone only where a newer slot was passed over. A buffered store's
+  torn publish leaves the log file in place and opens as before
+  (`a_fallback_past_a_slot_whose_log_retired_is_refused`,
+  `tests/durable.rs`).
 - [ ] **A fall back held by a segment's last key.** In the
   clear the same check reads an unnamed segment newer than every segment
   the slot taken names, and within what it covers, by its last key, and
