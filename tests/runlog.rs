@@ -904,8 +904,26 @@ fn a_barrier_whose_guard_fails_is_kept() {
             vec![VALUE.to_vec()],
             "link {link}: the reads go on"
         );
+        assert!(
+            d.join("dir-lost").exists(),
+            "link {link}: the mark for the next open"
+        );
         db.crash();
         let db = Db::open(&d, common::options()).unwrap();
+        // The open in the same boot guards every log file it lists, a new
+        // entry the sync after it covers, and takes the mark away.
+        assert!(!d.join("dir-lost").exists(), "link {link}: the mark taken");
+        let logs = names(&d, "wal-");
+        assert!(!logs.is_empty());
+        for w in &logs {
+            if w.ends_with(".guard") {
+                continue;
+            }
+            assert!(
+                Db::is_guarded(&d.join(w)),
+                "link {link}: {w} guarded by the open after the kept failure"
+            );
+        }
         assert_eq!(values(&db, &key(1_000 * BATCH)), vec![VALUE.to_vec()]);
         for b in 2_000..2_002 {
             let _ = holds(&db, b);

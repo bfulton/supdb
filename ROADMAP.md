@@ -403,17 +403,20 @@ What an engine picker would hit, roughly in order.
   in the crash window stands past what the slot it takes covers.
 - [ ] **What a guard does not cover.** A failed directory barrier is made
   by guards (`vault::guard`) and the writes go on; where the guard fails
-  too, the failure is kept until the store is reopened. Two ways in stay
-  open. A reopen in the same boot after a kept failure lists the names in
-  the kernel's cache and fsyncs the directory through a fresh descriptor,
-  whose `Ok` says nothing of an entry a failed sync dropped, so it takes
-  for durable a name the failure was for; a guard made at the open for
-  every name no slot covers would close it, at a link a name an open. And
-  the directory fsyncs of the segment work -- a seal's landing, the rename
+  too, the failure is kept until the store is reopened, and the store
+  leaves a mark (`dir-lost`) for the next open, which guards every log
+  file and run temp name it lists and syncs the directory before it goes
+  on: a reopen in the same boot reads those names out of the kernel's
+  cache, where the failed fsync may have dropped them, and an fsync
+  through a fresh descriptor says nothing of that. Where the directory
+  takes no new entry at all the mark is not made, and nothing more is
+  promised. The order a guard and its file go in, the guard first, is
+  held by a test that stops the removal between the two
+  (`vault::tests::a_guard_goes_before_its_file`). What is left: the
+  directory fsyncs of the segment work -- a seal's landing, the rename
   shape's publish -- stop the seal queue where they fail rather than
-  guard the names. Beside them, the order a guard and its file are
-  removed in, the guard first, is held by reading alone: no test builds
-  the state between the two unlinks.
+  guard the names, which keeps every write's durability and gives up the
+  store's writes until it is reopened; guarded, they would go on.
 - [ ] **The open's directory fsync held on a device.** An open that
   adopts pending segments (`Options::manifest_pending`) fsyncs each, its
   ordered index under `ord_durable`, and the directory before the slot
