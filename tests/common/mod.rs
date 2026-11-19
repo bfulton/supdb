@@ -367,3 +367,14 @@ pub fn manifest_v2_of(v3: &[u8], seq: u64) -> Vec<u8> {
     v2.extend_from_slice(&body);
     v2
 }
+
+/// Whether `name` in `d` is a run's temp file: `direct-*.tmp` with
+/// something in it. An empty one is the spare a store makes ahead of its
+/// next run (`Options::run_spare`), which the open removes and no run
+/// has written.
+#[allow(dead_code)]
+pub fn is_run_file(d: &std::path::Path, name: &str) -> bool {
+    name.starts_with("direct-")
+        && name.ends_with(".tmp")
+        && std::fs::metadata(d.join(name)).is_ok_and(|m| m.len() > 0)
+}

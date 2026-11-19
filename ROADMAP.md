@@ -168,7 +168,10 @@ What an engine picker would hit, roughly in order.
   commit of a run fsyncs the directory once, after the file, as a
   rotation does for its new WAL file (`Db::sync_run`; `tests/runlog.rs`
   counts it on every path that syncs). A store whose commits never sync
-  makes none.
+  makes none, and a run on a spare whose name a directory fsync the store
+  made anyway has promised makes none either (`Options::run_spare`): a
+  durable ordered load at ten thousand keys makes one directory fsync
+  fewer, its first commit a tenth of a millisecond shorter.
 - [x] **A synced run that is lost anyway is refused where anything
   follows it.** With its file synced and its name behind a barrier, a run
   goes missing only where the device loses what it was told to keep.

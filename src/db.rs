@@ -1335,6 +1335,18 @@ pub struct Options {
     /// path before it, every batch through the WAL and the seal, kept as
     /// the comparison arm.
     pub direct_ingest: bool,
+    /// A run of ordered ingest opens on a temp file made ahead of it -- at
+    /// the store's creation, after an open, and at the close of the run
+    /// before -- whose name a directory fsync the store made anyway has
+    /// promised by the time the run is acknowledged (`Db::run_spare`):
+    /// the store's creation's, a seal's landing's, a rotation's. Such a
+    /// run owes its name no barrier of its own (`Db::sync_run`). A spare
+    /// no fsync has covered yet is taken all the same and its run makes
+    /// the barrier, as a run on a file of its own does. Off, every run
+    /// makes its file as it opens: `supdb-runnospare`. A store under a
+    /// cipher makes none, its runs being memory files with no name to
+    /// promise until their envelopes.
+    pub run_spare: bool,
     /// SegmentOptions for the segment writer. Fixed to `redo_log: false, shards: 1`
     /// regardless of what is passed, because a sealed segment is written
     /// once and never reopened for writing, and a 4 MiB redo arena in a
@@ -6684,6 +6696,7 @@ impl Default for Options {
             seal_grows: true,
             seal_floor_out_of_core: false,
             direct_ingest: true,
+            run_spare: true,
             segment: SegmentOptions::default(),
             l0_trigger: 4,
             tier_pieces: 0,
@@ -8397,6 +8410,20 @@ struct LooseRun {
     tmp: PathBuf,
     file: File,
     named: bool,
+}
+
+/// The temp file the next run of ordered ingest opens on
+/// (`Options::run_spare`): made empty, its id taken from the segments'
+/// count as a run's is, and the count of its directory's fsyncs begun
+/// read after it was made (`vault::dir_ticket`). An fsync that returns
+/// past the count promises its name. Pieces order by the sequence their
+/// names end at and never by the id, so an id taken early orders nothing.
+/// An open finds a spare a crash left as a run of nothing, and keeps it
+/// as its own once it has taken the store (`Db::adopt_run_spare`).
+struct RunSpare {
+    id: u64,
+    tmp: PathBuf,
+    ticket: u64,
 }
 
 /// A half-open key range `[lo, hi)`, `None` above meaning unbounded. The
@@ -19442,6 +19469,7 @@ struct SealCounts {
     /// acknowledges a commit of it, and none where a rotation's barrier
     /// had carried the name already (`Db::dir_barrier`).
     run_names: AtomicU64,
+    run_spares: AtomicU64,
     /// Time the writer spent in the seals its commits started: the wait
     /// for room, the freeze, and the seal's writer half.
     freeze_ns: AtomicU64,
@@ -19472,6 +19500,7 @@ impl SealCounts {
             rotated_unsynced: get(&self.rotated_unsynced),
             loose_synced: get(&self.loose_synced),
             run_names: get(&self.run_names),
+            run_spares: get(&self.run_spares),
             freeze_ns: get(&self.freeze_ns),
         }
     }
@@ -19527,6 +19556,9 @@ pub struct SealWaits {
     /// Directory barriers made for the temp names of runs of ordered
     /// ingest (`SealCounts`).
     pub run_names: u64,
+    /// Runs opened on a spare whose name a directory fsync had promised
+    /// already (`Options::run_spare`), which asked no barrier for it.
+    pub run_spares: u64,
     pub freeze_ns: u64,
 }
 
@@ -23295,6 +23327,8 @@ pub struct Db {
     /// covered (`LooseRun`), oldest first: synced by the first sync by
     /// policy after them, as the loose files are.
     loose_runs: Vec<LooseRun>,
+    /// The file the next run opens on (`RunSpare`), where one is made.
+    run_spare: Option<RunSpare>,
     /// The run a drain in progress closed with a commit unsynced or its
     /// temp name unpromised: nothing's to sync if the drain succeeds, and
     /// a loose run if it fails (`flush`).
@@ -36621,7 +36655,13 @@ impl Db {
         let dir = decoy.as_deref().unwrap_or(dir);
         let mut wal = Wal::create(&Db::wal_path(dir, 0), 0, WAL_CHAINED)?;
         let mut spare_wal: *mut PathBuf = std::ptr::null_mut();
-        let next_seg = 0u64;
+        // The first run's file, made before the manifest's first write
+        // below, whose directory fsync promises its name
+        // (`Options::run_spare`).
+        let run_spare = (held.is_none() && opts.run_spare && opts.direct_ingest)
+            .then(|| Db::new_run_spare(dir, 0))
+            .flatten();
+        let next_seg = u64::from(run_spare.is_some());
         if let Some((ahead, runs, cap)) = wal_ahead(&opts) {
             // Pre-written as the commits reach it, and no spare until a
             // retired file is one.
@@ -36901,6 +36941,7 @@ impl Db {
             closed_wals: Vec::new(),
             loose_wals: Vec::new(),
             loose_runs: Vec::new(),
+            run_spare,
             drain_run: None,
             mem_bytes: 0,
             direct: None,
@@ -37407,7 +37448,16 @@ impl Db {
         let mut run_facts: Vec<(String, (BlockedBloom, bool))> = Vec::new();
         // The open's slot writes, taken for the runs' and given back after.
         let mut slots = OpenSlots { slot, synced, tear };
+        // Empty temp names: the spare a store makes ahead of its next run
+        // (`Options::run_spare`), which no run wrote. Removed once the open
+        // has taken the store, so a refused open leaves them as it found
+        // them.
+        let mut empty_tmps: Vec<PathBuf> = Vec::new();
         for (id, tmp) in direct_tmps {
+            if vault::len(&tmp).is_ok_and(|n| n == 0) {
+                empty_tmps.push(tmp);
+                continue;
+            }
             let named = live.iter().any(|n| Db::name_id(n) == Some(id));
             match SegmentWriter::run_start_of(&tmp)? {
                 // A run from before runs took numbers: taken as those
@@ -38072,6 +38122,7 @@ impl Db {
             closed_wals: Vec::new(),
             loose_wals,
             loose_runs: Vec::new(),
+            run_spare: None,
             drain_run: None,
             mem_bytes,
             direct: None,
@@ -38125,6 +38176,19 @@ impl Db {
         if db.opts.malloc_mmap_threshold > 0 {
             heap::set_mmap_threshold(db.opts.malloc_mmap_threshold);
         }
+        // The newest empty temp name is the last life's spare, taken as
+        // this one's: its entry is in the directory already, so any
+        // directory fsync begun from here promises it, and the id is
+        // held past every segment's. The rest go.
+        if let Some(tmp) = empty_tmps.pop() {
+            db.adopt_run_spare(tmp);
+        }
+        for tmp in empty_tmps {
+            let _ = vault::remove_file(&tmp);
+        }
+        // The next run's file, promised by whichever of the store's
+        // directory fsyncs comes after it.
+        db.make_run_spare();
         Ok(db)
     }
 
@@ -39147,9 +39211,25 @@ impl Db {
             return Ok(());
         }
         if self.direct.is_none() {
-            let id = self.shared.next_seg.fetch_add(1, AtomicOrdering::Relaxed);
-            let tmp = self.dir.join(format!("direct-{id:08}.tmp"));
-            let _ = vault::remove_file(&tmp);
+            // On the spare where one waits: its name is promised already
+            // where a directory fsync begun after it has returned, and the
+            // run asks no barrier for it then (`Options::run_spare`). The
+            // file is written over in place, which keeps the entry.
+            let (id, tmp, promised) = match self.run_spare.take() {
+                Some(s) => {
+                    let promised = vault::dir_synced_after(&self.dir, s.ticket);
+                    (s.id, s.tmp, promised)
+                }
+                None => {
+                    let id = self.shared.next_seg.fetch_add(1, AtomicOrdering::Relaxed);
+                    let tmp = self.dir.join(format!("direct-{id:08}.tmp"));
+                    let _ = vault::remove_file(&tmp);
+                    (id, tmp, false)
+                }
+            };
+            if promised {
+                SealCounts::add(&self.shared.seal_counts.run_spares, 1);
+            }
             let mut opts = Db::segment_opts(&self.opts);
             opts.buffers_mapped = self.shared.jobs_map(&self.opts);
             let mut w = PieceWriter::create(&tmp, &opts, 0, self.opts.inline_bytes)?;
@@ -39186,7 +39266,7 @@ impl Db {
                 unsynced: false,
                 // A logged run's file is a memory file until its envelope,
                 // with no name in the directory to make durable.
-                named: self.r.mem().after & RUN_LOGGED != 0,
+                named: promised || self.r.mem().after & RUN_LOGGED != 0,
             });
         }
         // Borrowed, the table and the store's shared half: the commit
@@ -39494,6 +39574,66 @@ impl Db {
     /// that rests on what POSIX says of a directory and not on what two
     /// filesystems happen to do. A store whose commits never sync owes
     /// the name to nothing, and its landings' directory fsyncs carry it.
+    /// A spare made in `dir` under `id` (`RunSpare`): the directory watched
+    /// first, the file made, and the count of its fsyncs read after, so an
+    /// fsync that returns past it began after the file was there. None
+    /// where the file could not be made, and a run then makes its own.
+    fn new_run_spare(dir: &Path, id: u64) -> Option<RunSpare> {
+        vault::watch_dir(dir);
+        let tmp = dir.join(format!("direct-{id:08}.tmp"));
+        vault::create(&tmp).ok()?;
+        match vault::dir_ticket(dir) {
+            Some(ticket) => Some(RunSpare { id, tmp, ticket }),
+            None => {
+                let _ = vault::remove_file(&tmp);
+                None
+            }
+        }
+    }
+
+    /// An empty temp name an open found, kept as the next run's spare
+    /// where the store keeps them and removed otherwise.
+    fn adopt_run_spare(&mut self, tmp: PathBuf) {
+        let id = tmp
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("direct-"))
+            .and_then(|r| r.strip_suffix(".tmp"))
+            .and_then(|r| r.parse::<u64>().ok());
+        let keeps = self.opts.run_spare && self.opts.direct_ingest && self.shared.pager.is_none();
+        match id {
+            Some(id) if keeps => {
+                vault::watch_dir(&self.dir);
+                if let Some(ticket) = vault::dir_ticket(&self.dir) {
+                    self.shared
+                        .next_seg
+                        .fetch_max(id + 1, AtomicOrdering::Relaxed);
+                    self.run_spare = Some(RunSpare { id, tmp, ticket });
+                    return;
+                }
+                let _ = vault::remove_file(&tmp);
+            }
+            _ => {
+                let _ = vault::remove_file(&tmp);
+            }
+        }
+    }
+
+    /// The next run's spare made, where none is waiting and the store
+    /// keeps them (`Options::run_spare`): not under a cipher, whose runs
+    /// have no name in the directory until their envelopes.
+    fn make_run_spare(&mut self) {
+        if self.run_spare.is_some()
+            || !self.opts.run_spare
+            || !self.opts.direct_ingest
+            || self.shared.pager.is_some()
+        {
+            return;
+        }
+        let id = self.shared.next_seg.fetch_add(1, AtomicOrdering::Relaxed);
+        self.run_spare = Db::new_run_spare(&self.dir, id);
+    }
+
     fn sync_run(&mut self) -> Result<()> {
         let Some(d) = self.direct.as_mut() else {
             return Ok(());
@@ -39555,6 +39695,9 @@ impl Db {
 
     /// `close_direct` once the frozen list has room for the run's table.
     fn close_direct_with_room(&mut self) -> Result<()> {
+        // The next run's file, before the seal this close hands over lands
+        // and fsyncs the directory for its names.
+        self.make_run_spare();
         *self.fs().scan_keys.borrow_mut() = None;
         self.fs().snap_added.borrow_mut().clear();
         self.drop_blocks();
@@ -43192,6 +43335,7 @@ impl Db {
         // A dead process's record of the guards it made goes with it: the
         // open after finds them on disk.
         vault::forget_guards(&me.dir);
+        vault::unwatch_dir(&me.dir);
         me.lock.release();
     }
 
@@ -58390,6 +58534,12 @@ impl Drop for Db {
         // The guards of this store's names are its files' now: the next
         // open finds them beside their files and keeps them again.
         vault::forget_guards(&self.dir);
+        // A spare no run took is a run of nothing, which an open would
+        // remove; it goes here instead.
+        if let Some(s) = self.run_spare.take() {
+            let _ = vault::remove_file(&s.tmp);
+        }
+        vault::unwatch_dir(&self.dir);
     }
 }
 

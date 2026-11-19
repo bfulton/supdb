@@ -907,6 +907,10 @@ pub struct Supdb {
     /// `Options::close_presync`. `supdb-latesync`, and
     /// `supdb-ingestlatesync` buffered.
     latesync: bool,
+    /// A run opening on a temp name of its own, made at its first commit
+    /// and promised by a directory barrier of its own, the shape before
+    /// `Options::run_spare`. `supdb-runnospare`.
+    runnospare: bool,
     /// The install of the builder ahead's forms reads each block's bounds
     /// from the partition itself, `Options::ahead_sends_bounds` off.
     /// `supdb-installreads`.
@@ -2226,6 +2230,10 @@ struct Policy {
     /// `Options::close_presync`. `supdb-latesync`, and
     /// `supdb-ingestlatesync` buffered.
     latesync: bool,
+    /// A run opening on a temp name of its own, made at its first commit
+    /// and promised by a directory barrier of its own, the shape before
+    /// `Options::run_spare`. `supdb-runnospare`.
+    runnospare: bool,
     /// The install of the builder ahead's forms reads each block's bounds
     /// from the partition itself, `Options::ahead_sends_bounds` off.
     /// `supdb-installreads`.
@@ -3007,6 +3015,7 @@ impl Default for Policy {
             keycopies: false,
             fillplain: false,
             latesync: false,
+            runnospare: false,
             installreads: false,
             noabandon: false,
             deferbursts: false,
@@ -7284,6 +7293,17 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with each run on a temp name of its own and its barrier.
+    pub fn create_runnospare(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                runnospare: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with the install of the builder ahead's forms reading
     /// each block's bounds itself.
     pub fn create_installreads(path: &Path) -> Res<Supdb> {
@@ -9291,6 +9311,7 @@ impl Supdb {
             keycopies,
             fillplain,
             latesync,
+            runnospare,
             installreads,
             noabandon,
             deferbursts,
@@ -9777,6 +9798,7 @@ impl Supdb {
             manifest_pending: manifestpending,
             flush_waits_manifest: waitmanifest,
             close_presync: !latesync,
+            run_spare: !runnospare,
             ahead_sends_bounds: !installreads,
             upkeep_abandons: !noabandon,
             upkeep_files_bursts: !deferbursts,
@@ -10262,6 +10284,7 @@ impl Supdb {
             keycopies,
             fillplain,
             latesync,
+            runnospare,
             installreads,
             noabandon,
             deferbursts,
@@ -11763,6 +11786,9 @@ impl Engine for Supdb {
             } else {
                 "supdb-ingestlatesync"
             };
+        }
+        if self.runnospare {
+            return "supdb-runnospare";
         }
         if self.installreads {
             return "supdb-installreads";
@@ -13743,6 +13769,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-keycopies"
         | "supdb-fillplain"
         | "supdb-latesync"
+        | "supdb-runnospare"
         | "supdb-installreads"
         | "supdb-noabandon"
         | "supdb-deferbursts"
@@ -15673,6 +15700,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-fillplain" => supdb_arm(Supdb::create_fillplain, dir)?,
         "supdb-ingestfillplain" => supdb_arm(Supdb::create_ingest_fillplain, dir)?,
         "supdb-latesync" => supdb_arm(Supdb::create_latesync, dir)?,
+        "supdb-runnospare" => supdb_arm(Supdb::create_runnospare, dir)?,
         "supdb-installreads" => supdb_arm(Supdb::create_installreads, dir)?,
         "supdb-noabandon" => supdb_arm(Supdb::create_noabandon, dir)?,
         "supdb-deferbursts" => supdb_arm(Supdb::create_deferbursts, dir)?,

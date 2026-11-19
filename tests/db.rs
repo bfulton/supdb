@@ -17112,7 +17112,7 @@ fn a_handed_tables_log_is_retired_at_its_landing_and_replays_before_it() {
             .filter(|p| {
                 p.file_name()
                     .and_then(|s| s.to_str())
-                    .is_some_and(|s| s.starts_with("direct-") && s.ends_with(".tmp"))
+                    .is_some_and(|s| common::is_run_file(&d, s))
             })
             .collect();
         assert_eq!(tmp.len(), 1, "the tail's open run: {tmp:?}");

@@ -2441,7 +2441,17 @@ does not promise the entry that names it, and a run whose name a crash
 took is every commit of it gone. One barrier a run, none where a
 rotation's barrier for its new log file had the name in the directory
 already, and none in a store whose commits never sync, whose landings'
-directory fsyncs carry it. A barrier that fails is never tried again:
+directory fsyncs carry it. And none where the run opened on a spare
+(`Options::run_spare`): the store makes the next run's temp name empty
+before a directory fsync it makes anyway -- the creation's, the open's
+last, a run's close ahead of the landing its seal fsyncs the directory
+at -- and counts its directory's fsyncs begun and returned
+(`vault::dir_ticket`, `dir_synced_after`), so a run on a spare an fsync begun
+after it has returned from owes its name nothing; a spare no fsync has
+reached yet pays the barrier. An open keeps the empty temp name it finds
+as its own spare and removes the rest only once it has taken the store,
+so a refused open leaves them; an empty temp name is a run that
+acknowledged nothing. A barrier that fails is never tried again:
 each name it was for gets a second entry, a hard link under its name and
 `.guard` (`vault::guard`), and the directory is synced again, a new
 operation after the failure that the new fsync covers; the guard stands

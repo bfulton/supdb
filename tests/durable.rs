@@ -102,7 +102,7 @@ fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
 fn open_run(d: &Path) -> bool {
     std::fs::read_dir(d).unwrap().any(|e| {
         let n = e.unwrap().file_name().to_string_lossy().into_owned();
-        n.starts_with("direct-") && n.ends_with(".tmp")
+        common::is_run_file(d, &n)
     })
 }
 
@@ -1499,8 +1499,12 @@ fn rotated_loose_opts() -> Options {
 }
 
 fn rotated_loose(tag: &str) -> (PathBuf, Db) {
+    rotated_loose_with(tag, rotated_loose_opts())
+}
+
+fn rotated_loose_with(tag: &str, opts: Options) -> (PathBuf, Db) {
     let d = dir(&format!("dur-walsync-{tag}"));
-    let mut db = Db::create(&d, rotated_loose_opts()).unwrap();
+    let mut db = Db::create(&d, opts).unwrap();
     let val = "x".repeat(100);
     let mut i = 0u32;
     while db.seal_waits().wal_rotations == 0 {
@@ -1802,6 +1806,7 @@ fn run_tmp_name(d: &Path) -> std::ffi::OsString {
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .find(|n| {
+            // An open run has taken the spare, so its file is the one.
             let n = n.to_string_lossy();
             n.starts_with("direct-") && n.ends_with(".tmp")
         })
@@ -5666,23 +5671,45 @@ fn a_sync_syncs_a_run_whose_commits_end_on_a_piece_boundary() {
 /// answers `Ok`.
 #[test]
 fn a_sync_with_a_run_open_pays_the_log_directorys_barrier() {
-    let (d, mut db) = rotated_loose("srdir");
-    db.seal().unwrap();
-    sr_commits(&mut db, 0, 300, 100);
-    assert!(
-        db.run_synced_bytes().is_some(),
-        "a run opened above the sealed table"
-    );
-    let live = db.wal_durable().0;
-    let tmp = d.join(run_tmp_name(&d));
-    db.fail_next_wal_dir_sync();
-    db.sync()
-        .unwrap_or_else(|e| panic!("the barrier made by its guards: {e}"));
-    assert!(Db::is_guarded(&live), "the log file stands guarded");
-    assert!(Db::is_guarded(&tmp), "the run's temp name stands guarded");
-    db.sync().unwrap();
-    drop(db);
-    let _ = std::fs::remove_dir_all(&d);
+    // Without a spare the run's temp name is new and owed the barrier as
+    // the log file's is; with one (`Options::run_spare`), the seal's
+    // landing fsynced the directory after the spare was made, so the
+    // name is promised already and only the log file's is owed.
+    for spare in [false, true] {
+        let opts = Options {
+            run_spare: spare,
+            ..rotated_loose_opts()
+        };
+        let (d, mut db) = rotated_loose_with(&format!("srdir-{spare}"), opts);
+        db.seal().unwrap();
+        sr_commits(&mut db, 0, 300, 100);
+        assert!(
+            db.run_synced_bytes().is_some(),
+            "a run opened above the sealed table"
+        );
+        assert_eq!(
+            db.seal_waits().run_spares,
+            u64::from(spare),
+            "spare {spare}: the run took the spare"
+        );
+        let live = db.wal_durable().0;
+        let tmp = d.join(run_tmp_name(&d));
+        db.fail_next_wal_dir_sync();
+        db.sync()
+            .unwrap_or_else(|e| panic!("spare {spare}: the barrier made by its guards: {e}"));
+        assert!(
+            Db::is_guarded(&live),
+            "spare {spare}: the log file stands guarded"
+        );
+        assert_eq!(
+            Db::is_guarded(&tmp),
+            !spare,
+            "spare {spare}: the run's temp name guarded where it was owed the barrier"
+        );
+        db.sync().unwrap();
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -10055,7 +10082,7 @@ fn the_windows_a_torn_publish_leaves_open_through_the_slot_before() {
                     std::fs::read_dir(&c)
                         .unwrap()
                         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                        .filter(|n| n.starts_with("direct-") && n.ends_with(".tmp")),
+                        .filter(|n| common::is_run_file(&c, n)),
                 )
                 .collect();
             assert!(
@@ -13951,10 +13978,7 @@ fn a_runs_due_commit_after_a_run_closed_into_a_held_seal_outlives_that_runs_comm
         let inos: Vec<u64> = std::fs::read_dir(&d)
             .unwrap()
             .map(|e| e.unwrap())
-            .filter(|e| {
-                let n = e.file_name().to_string_lossy().into_owned();
-                n.starts_with("direct-") && n.ends_with(".tmp")
-            })
+            .filter(|e| common::is_run_file(&d, &e.file_name().to_string_lossy()))
             .map(|e| e.metadata().unwrap().ino())
             .collect();
         assert!(
