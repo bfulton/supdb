@@ -1109,13 +1109,19 @@ fn a_recycled_log_under_a_cipher_holds_what_was_committed_and_no_more() {
         l0_trigger: 2,
         ..under(14)
     };
-    let inodes = |prefix: &str| -> Vec<u64> {
+    // A log or spare file by its name and its identity, the inode with the
+    // time it was made: a rename keeps both, and an inode number the
+    // filesystem gives again to a new file has a new birth.
+    let files = || -> Vec<(String, (u64, Option<std::time::SystemTime>))> {
         names(&dir)
-            .iter()
-            .filter(|n| n.starts_with(prefix))
+            .into_iter()
+            .filter(|n| n.starts_with("wal-") || n.starts_with("spare-"))
             // A file the segment work retired or renamed since the
             // listing is not there to ask.
-            .filter_map(|n| Some(std::fs::metadata(dir.join(n)).ok()?.ino()))
+            .filter_map(|n| {
+                let m = std::fs::metadata(dir.join(&n)).ok()?;
+                Some((n, (m.ino(), m.created().ok())))
+            })
             .collect()
     };
     let key = |i: u32| format!("{KEY_MARK}{i:05}").into_bytes();
@@ -1128,10 +1134,14 @@ fn a_recycled_log_under_a_cipher_holds_what_was_committed_and_no_more() {
         }
     };
     let mut db = Db::create(&dir, opts()).unwrap();
-    // Every file that has been a spare: the first is the first file a
-    // durable segment retired, since a log pre-written ahead of its tail
-    // (`Options::wal_ahead_bytes`) is made with none.
-    let mut spare = inodes("spare-");
+    // Every log and spare file seen, by its identity and the name it was
+    // seen under. A recycled log is a log file seen before under another
+    // name: the retired log goes to the spare's name and the next rotation
+    // takes it, and both can fall between two of these listings, so a log
+    // is not required to have been seen as a spare. The first spare is the
+    // first file a durable segment retired, since a log pre-written ahead
+    // of its tail (`Options::wal_ahead_bytes`) is made with none.
+    let mut seen: Vec<(String, (u64, Option<std::time::SystemTime>))> = files();
     let mut recycled = false;
     for round in 0u32..16 {
         // Out of order, so that every write goes through the log, and
@@ -1144,8 +1154,11 @@ fn a_recycled_log_under_a_cipher_holds_what_was_committed_and_no_more() {
         }
         db.commit().unwrap();
         // The file that was the spare is a log now: recycled, not made.
-        recycled |= inodes("wal-").iter().any(|i| spare.contains(i));
-        spare.extend(inodes("spare-"));
+        let now = files();
+        recycled |= now.iter().any(|(n, id)| {
+            n.starts_with("wal-") && seen.iter().any(|(m, was)| was == id && m != n)
+        });
+        seen.extend(now);
         if round % 4 == 3 {
             drop(db);
             db = Db::open(&dir, opts()).unwrap();
@@ -1230,7 +1243,7 @@ fn a_recycled_log_under_a_cipher_holds_what_was_committed_and_no_more() {
     holds_model(&db, &model, "and after a commit into the log begun there");
     db.close().unwrap();
     assert!(
-        inodes("spare-").is_empty(),
+        !files().iter().any(|(n, _)| n.starts_with("spare-")),
         "a closed store left a spare: {:?}",
         names(&dir)
     );
