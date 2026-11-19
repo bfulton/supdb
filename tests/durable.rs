@@ -733,6 +733,18 @@ fn reads(db: &Reader, k: &str, v: &str, what: &str) {
 }
 
 /// An answer that is the kept error: refused, in its words.
+fn inode(p: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).unwrap().ino()
+}
+
+/// The guard a failed directory barrier gives a file (`vault::guard`).
+fn guard_of(p: &Path) -> PathBuf {
+    let mut g = p.as_os_str().to_os_string();
+    g.push(".guard");
+    PathBuf::from(g)
+}
+
 fn kept(r: std::io::Result<()>, what: &str) {
     match r {
         Ok(()) => panic!("{what}: answered Ok after the log's device error"),
@@ -1475,16 +1487,20 @@ fn a_failed_log_sync_is_kept_until_the_store_is_reopened() {
 /// A buffered store whose log has rotated by size with frames no sync had
 /// covered: a loose file, synced by the first sync after it, behind the
 /// directory fsync the new file's name is owed.
-fn rotated_loose(tag: &str) -> (PathBuf, Db) {
-    let d = dir(&format!("dur-walsync-{tag}"));
-    let opts = Options {
+/// `rotated_loose`'s store's options.
+fn rotated_loose_opts() -> Options {
+    Options {
         sync: SyncPolicy::EveryN(u32::MAX),
         seal_rotates_wal: false,
         seal_bytes: 64 << 10,
         seal_max_pct: 0,
         ..Options::default()
-    };
-    let mut db = Db::create(&d, opts).unwrap();
+    }
+}
+
+fn rotated_loose(tag: &str) -> (PathBuf, Db) {
+    let d = dir(&format!("dur-walsync-{tag}"));
+    let mut db = Db::create(&d, rotated_loose_opts()).unwrap();
     let val = "x".repeat(100);
     let mut i = 0u32;
     while db.seal_waits().wal_rotations == 0 {
@@ -1514,36 +1530,90 @@ fn a_failed_sync_of_a_loose_log_file_is_kept() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-/// A failed fsync of the directory a rotation owes its new log file is
-/// kept, where the sync by policy owes it.
+/// A failed fsync of the directory a rotation owes its new log file, where
+/// the sync by policy owes it, is never retried: the live log file and the
+/// files rotations closed loose are given guards (`Db::dir_guards`) and the
+/// directory is synced again, which makes the barrier, and the sync and
+/// the writes after it answer `Ok`.
 #[test]
-fn a_failed_sync_of_the_log_directory_is_kept() {
+fn a_failed_sync_of_the_log_directory_is_made_by_a_guard() {
     let (d, mut db) = rotated_loose("dir");
+    let live = db.wal_durable().0;
     db.fail_next_wal_dir_sync();
-    assert!(
-        db.sync().is_err(),
-        "the injected failure reached the barrier"
+    Db::trace_dir_io(&d, true);
+    db.sync()
+        .unwrap_or_else(|e| panic!("the barrier made by its guards: {e}"));
+    let calls = Db::trace_dir_io(&d, false);
+    assert_eq!(
+        calls.iter().filter(|(what, _)| *what == "sync_dir").count(),
+        1,
+        "the directory synced again after the guards, and once: {calls:?}"
     );
-    kept(db.sync(), "the sync after");
-    kept(put_commit(&mut db, "z", "Z"), "a commit after");
+    assert!(db.dir_guards() >= 1, "the names were guarded");
+    assert!(Db::is_guarded(&live), "the live log file stands guarded");
+    assert_eq!(
+        inode(&live),
+        inode(&guard_of(&live)),
+        "the guard is a second entry for the live log file"
+    );
+    put_commit(&mut db, "z", "Z").unwrap();
+    db.sync().unwrap();
+    // A crash that kept both entries: the open keeps the guard beside the
+    // live log file, whose own entry is no more durable for the crash.
+    db.crash();
+    let mut db = Db::open(&d, rotated_loose_opts()).unwrap();
+    assert!(Db::is_guarded(&live), "a guard an open finds is kept");
+    assert!(guard_of(&live).exists(), "and left on disk");
+    assert_eq!(read_vec(&db, b"z"), vec![b"Z".to_vec()]);
+    // The file goes once the log has rotated past it and a durable
+    // segment covers it, its guard first.
+    let val = "x".repeat(100);
+    let mut i = 0u32;
+    while db.seal_waits().wal_rotations == 0 {
+        put_commit(&mut db, &format!("c{i:07}"), &val).unwrap();
+        i += 1;
+        assert!(i < 100_000, "the log never rotated");
+    }
+    db.flush().unwrap();
+    db.settle().unwrap();
+    assert!(!live.exists(), "the log file retired");
+    assert!(!guard_of(&live).exists(), "and its guard with it");
+    assert!(!Db::is_guarded(&live));
+    drop(db);
+    // A power cut that took the live file's own entry and kept its guard
+    // opens with the name given back.
+    let (d2, mut db) = rotated_loose("dir-lost");
+    let live = db.wal_durable().0;
+    db.fail_next_wal_dir_sync();
+    db.sync().unwrap();
+    put_commit(&mut db, "z", "Z").unwrap();
+    db.crash();
+    std::fs::remove_file(&live).unwrap();
+    let db = Db::open(&d2, rotated_loose_opts()).unwrap();
+    assert!(live.exists(), "the guard gave the log file its name back");
+    assert!(!guard_of(&live).exists());
+    assert_eq!(
+        read_vec(&db, b"z"),
+        vec![b"Z".to_vec()],
+        "the commit after the barrier"
+    );
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&d2);
 }
 
-/// The same where a rotation under `Always` owes the barrier itself: the
-/// commit that rotated was synced into the closed file and answers `Ok`,
-/// and everything after answers the kept error.
+/// The same under a cipher, whose log files pass to the store's directory
+/// under their own names, and their guards with them: a power cut that
+/// took the live log file's entry and kept its guard opens with every
+/// commit after the barrier.
 #[test]
-fn a_failed_sync_of_the_log_directory_at_a_rotation_is_kept() {
-    let d = dir("dur-walsync-dir-always");
+fn a_failed_sync_of_the_log_directory_under_a_cipher_is_made_by_a_guard() {
+    let d = dir("dur-walsync-dir-cipher");
     let opts = Options {
-        seal_rotates_wal: false,
-        seal_bytes: 64 << 10,
-        seal_max_pct: 0,
-        ..Options::default()
+        encryption: under_cipher().encryption,
+        ..rotated_loose_opts()
     };
-    let mut db = Db::create(&d, opts).unwrap();
-    db.fail_next_wal_dir_sync();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
     let val = "x".repeat(100);
     let mut i = 0u32;
     while db.seal_waits().wal_rotations == 0 {
@@ -1551,14 +1621,108 @@ fn a_failed_sync_of_the_log_directory_at_a_rotation_is_kept() {
         i += 1;
         assert!(i < 10_000, "the log never rotated");
     }
+    db.fail_next_wal_dir_sync();
+    db.sync()
+        .unwrap_or_else(|e| panic!("the barrier made by its guards: {e}"));
+    put_commit(&mut db, "z", "Z").unwrap();
+    db.sync().unwrap();
+    let guards: Vec<String> = std::fs::read_dir(&d)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("wal-") && n.ends_with(".guard"))
+        .collect();
     assert!(
-        put_commit(&mut db, "y", "Y").is_err(),
-        "the rotation's error"
+        !guards.is_empty(),
+        "the live log file's guard is in the store's directory"
     );
-    kept(put_commit(&mut db, "z", "Z"), "a commit after");
-    kept(db.sync(), "a sync after");
+    // A crash under a cipher is a drop: the store's memory files go with it.
+    drop(db);
+    for g in &guards {
+        std::fs::remove_file(d.join(g.trim_end_matches(".guard"))).unwrap();
+    }
+    let db = Db::open(&d, opts).unwrap();
+    for g in &guards {
+        assert!(
+            d.join(g.trim_end_matches(".guard")).exists(),
+            "{g} gave its name back"
+        );
+    }
+    assert_eq!(
+        read_vec(&db, b"z"),
+        vec![b"Z".to_vec()],
+        "the commit after the barrier"
+    );
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Where the guards cannot be made either -- a link refused, or the
+/// directory's fsync after them -- the failure is kept: every sync and
+/// commit after answers it, and the reads go on.
+#[test]
+fn a_failed_sync_of_the_log_directory_whose_guard_fails_is_kept() {
+    for link in [true, false] {
+        let (d, mut db) = rotated_loose(&format!("dirguard-{link}"));
+        put_commit(&mut db, "a", "A").unwrap();
+        db.fail_next_wal_dir_sync();
+        db.fail_next_dir_guard(link);
+        assert!(
+            db.sync().is_err(),
+            "link {link}: the barrier and its guard both failed"
+        );
+        kept(db.sync(), "the sync after");
+        kept(put_commit(&mut db, "z", "Z"), "a commit after");
+        assert_eq!(
+            read_vec(&db, b"a"),
+            vec![b"A".to_vec()],
+            "link {link}: the reads go on"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// The same where a rotation under `Always` owes the barrier itself: the
+/// rotation's barrier fails and is made by its guards, and the commits
+/// after it answer `Ok`; where the guards fail too, everything after the
+/// commit that rotated answers the kept error.
+#[test]
+fn a_failed_sync_of_the_log_directory_at_a_rotation_is_made_by_a_guard() {
+    for guard_fails in [false, true] {
+        let d = dir(&format!("dur-walsync-dir-always-{guard_fails}"));
+        let opts = Options {
+            seal_rotates_wal: false,
+            seal_bytes: 64 << 10,
+            seal_max_pct: 0,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        db.fail_next_wal_dir_sync();
+        if guard_fails {
+            db.fail_next_dir_guard(true);
+        }
+        let val = "x".repeat(100);
+        let mut i = 0u32;
+        let mut failed = false;
+        while db.seal_waits().wal_rotations == 0 {
+            failed |= put_commit(&mut db, &format!("b{i:07}"), &val).is_err();
+            i += 1;
+            assert!(i < 10_000, "the log never rotated");
+        }
+        if guard_fails {
+            let after = put_commit(&mut db, "y", "Y");
+            assert!(failed || after.is_err(), "the rotation's error");
+            kept(put_commit(&mut db, "z", "Z"), "a commit after");
+            kept(db.sync(), "a sync after");
+        } else {
+            assert!(!failed, "the rotation's barrier made by its guards");
+            assert!(db.dir_guards() >= 1, "the new log file was guarded");
+            put_commit(&mut db, "z", "Z").unwrap();
+            db.sync().unwrap();
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -5497,8 +5661,9 @@ fn a_sync_syncs_a_run_whose_commits_end_on_a_piece_boundary() {
 /// The directory barrier a loose rotation owes the new log file's name is
 /// paid by a `sync` with a run open, as with a hashed table live: a log
 /// rotated loose under `EveryN(u32::MAX)`, its table sealed, a run opened
-/// above it, and the `sync` meets the directory's fsync, armed to fail,
-/// and keeps the failure.
+/// above it, and the `sync` meets the directory's fsync, armed to fail:
+/// the log file and the run's temp name are given guards, and the `sync`
+/// answers `Ok`.
 #[test]
 fn a_sync_with_a_run_open_pays_the_log_directorys_barrier() {
     let (d, mut db) = rotated_loose("srdir");
@@ -5508,15 +5673,14 @@ fn a_sync_with_a_run_open_pays_the_log_directorys_barrier() {
         db.run_synced_bytes().is_some(),
         "a run opened above the sealed table"
     );
+    let live = db.wal_durable().0;
+    let tmp = d.join(run_tmp_name(&d));
     db.fail_next_wal_dir_sync();
-    match db.sync() {
-        Ok(()) => panic!("a sync with a run open answered Ok over the directory's barrier"),
-        Err(e) => assert!(
-            e.to_string().contains("injected"),
-            "the sync answered with an error that is not the barrier's: {e}"
-        ),
-    }
-    kept(db.sync(), "the sync after");
+    db.sync()
+        .unwrap_or_else(|e| panic!("the barrier made by its guards: {e}"));
+    assert!(Db::is_guarded(&live), "the log file stands guarded");
+    assert!(Db::is_guarded(&tmp), "the run's temp name stands guarded");
+    db.sync().unwrap();
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
 }

@@ -661,56 +661,140 @@ fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-/// The barrier's failure is the commit's: a commit whose run's name could
-/// not be promised is not acknowledged, and the failure is kept
-/// (`Db::lost`), never retried: a directory's fsync that failed may have
-/// lost the entry while a later one answers `Ok`, so every commit, `sync`
-/// and `flush` after it answers the failure until the store is reopened,
-/// and no barrier is made over it. The open after a crash finds each
-/// batch whole or not at all.
+fn guard_of(p: &Path) -> PathBuf {
+    let mut g = p.as_os_str().to_os_string();
+    g.push(".guard");
+    PathBuf::from(g)
+}
+
+fn inode(p: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).unwrap().ino()
+}
+
+/// The files of `from` copied to `to`, but `leave`, as a power cut that
+/// took `leave`'s directory entry leaves them.
+fn copy_without(from: &Path, to: &Path, leave: &Path) {
+    let _ = std::fs::remove_dir_all(to);
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        if e.path() == leave || !e.file_type().unwrap().is_file() {
+            continue;
+        }
+        std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+    }
+}
+
+/// A barrier that fails is never retried: Linux may drop what a failed
+/// sync was to write and answer a later one `Ok`, so the run's temp name
+/// is given a second entry, a guard, and the directory synced again, which
+/// makes the barrier, and the commit is acknowledged. The run's own entry
+/// is no more trusted for that, so the guard stands until the run's file
+/// goes: a power cut that took the entry and kept the guard opens with the
+/// name given back and every commit there; one that kept both opens with
+/// the run recovered, its temp name gone and its guard first.
 #[test]
-fn a_barrier_that_fails_is_kept() {
-    let d = dir("name-fails");
-    let mut db = Db::create(
-        &d,
-        inline(Options {
-            sync: SyncPolicy::Always,
-            adaptive_shape: false,
-            ..common::options()
-        }),
-    )
-    .unwrap();
+fn a_barrier_that_fails_is_made_by_a_guard() {
+    let d = dir("name-guard");
+    let crash = dir("name-guard-crash");
+    let opts = inline(Options {
+        sync: SyncPolicy::Always,
+        adaptive_shape: false,
+        ..common::options()
+    });
+    let mut db = Db::create(&d, opts.clone()).unwrap();
     db.fail_next_dir_barrier();
-    for j in 0..BATCH {
-        db.append(&key(j), &VALUE);
-    }
-    let e = db
-        .commit()
-        .expect_err("the barrier failed and the commit was acknowledged");
-    assert!(e.to_string().contains("injected"), "{e}");
-    assert_eq!(db.run_names_unsynced(), (Some(true), 0));
-    assert_eq!(db.seal_waits().run_names, 0);
-    // The next commit of the run answers the same failure, and makes no
-    // barrier over it.
-    for j in 0..BATCH {
-        db.append(&key(BATCH + j), &VALUE);
-    }
-    let again = db.commit().expect_err("the kept failure");
-    assert!(again.to_string().contains("injected"), "{again}");
-    assert_eq!(db.seal_waits().run_names, 0, "no barrier retried");
-    let s = db.sync().expect_err("a sync answers the kept failure");
-    assert!(s.to_string().contains("injected"), "{s}");
-    let f = db.flush().expect_err("a flush answers the kept failure");
-    assert!(f.to_string().contains("injected"), "{f}");
-    assert_eq!(db.seal_waits().run_names, 0, "no barrier retried");
+    ordered_batch(&mut db, 0);
+    let tmp = run_file(&d, 0);
+    assert_eq!(db.dir_guards(), 1, "the run's temp name was guarded");
+    assert!(Db::is_guarded(&tmp));
+    assert_eq!(
+        inode(&tmp),
+        inode(&guard_of(&tmp)),
+        "a second entry for the run"
+    );
+    assert_eq!(db.run_names_unsynced(), (Some(false), 0));
+    ordered_batch(&mut db, 1);
     db.crash();
 
-    let db = Db::open(&d, common::options()).unwrap();
+    // The run's own entry lost, its guard kept.
+    copy_without(&d, &crash, &tmp);
+    let db = Db::open(&crash, common::options()).unwrap();
+    assert!(
+        !guard_of(&run_file(&crash, 0)).exists(),
+        "the guard gave its name back"
+    );
     for b in 0..2 {
-        let _ = holds(&db, b);
+        assert!(holds(&db, b), "batch {b} after the run's name was lost");
     }
     drop(db);
+
+    // Both kept: the open recovers the run into a piece, and its temp name
+    // goes with its guard before it.
+    let db = Db::open(&d, opts).unwrap();
+    for b in 0..2 {
+        assert!(holds(&db, b), "batch {b} with both entries");
+    }
+    assert!(!tmp.exists(), "the run's temp name went with its recovery");
+    assert!(!guard_of(&tmp).exists(), "and its guard before it");
+    assert!(!Db::is_guarded(&tmp));
+    drop(db);
     let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// Where the guard cannot be made either -- its link refused, or the
+/// directory's fsync after the links -- the failure is kept (`Db::lost`):
+/// the commit is not acknowledged, every commit, `sync` and `flush` after
+/// answers it, the reads go on, and the open after a crash finds each
+/// batch whole or not at all.
+#[test]
+fn a_barrier_whose_guard_fails_is_kept() {
+    for link in [true, false] {
+        let d = dir(&format!("name-guard-fails-{link}"));
+        let mut db = Db::create(
+            &d,
+            inline(Options {
+                sync: SyncPolicy::Always,
+                adaptive_shape: false,
+                ..common::options()
+            }),
+        )
+        .unwrap();
+        logged_batch(&mut db, 0);
+        // A run opens over an empty live table.
+        db.flush().unwrap();
+        db.fail_next_dir_barrier();
+        db.fail_next_dir_guard(link);
+        for j in 0..BATCH {
+            db.append(&key(2_000 * BATCH + j), &VALUE);
+        }
+        let e = db
+            .commit()
+            .expect_err("the barrier and its guard failed and the commit was acknowledged");
+        assert!(e.to_string().contains("guarded"), "link {link}: {e}");
+        assert_eq!(db.seal_waits().run_names, 0, "no barrier made");
+        for j in 0..BATCH {
+            db.append(&key(2_001 * BATCH + j), &VALUE);
+        }
+        assert!(db.commit().is_err(), "link {link}: the kept failure");
+        assert!(db.sync().is_err(), "link {link}: a sync answers it");
+        assert!(db.flush().is_err(), "link {link}: a flush answers it");
+        assert_eq!(
+            values(&db, &key(1_000 * BATCH)),
+            vec![VALUE.to_vec()],
+            "link {link}: the reads go on"
+        );
+        db.crash();
+        let db = Db::open(&d, common::options()).unwrap();
+        assert_eq!(values(&db, &key(1_000 * BATCH)), vec![VALUE.to_vec()]);
+        for b in 2_000..2_002 {
+            let _ = holds(&db, b);
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
 
 /// Batch `b` of writes into the log: keys in falling order under the
