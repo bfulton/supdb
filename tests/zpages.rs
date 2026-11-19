@@ -9703,7 +9703,15 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
     let _ = std::fs::remove_dir_all(&dir);
     // Past the line with the records out of the page cache: each partition
     // looked at once and left; resident again, none looked at again.
-    let (dir, db, _model, inject, raw) = land_store("auto-land-cold", 50);
+    // The selector's own buy at the crossing is off, as for the crossing
+    // below: suspected there, it buys on the prediction a step later and
+    // takes over the build ahead in flight as its own, and the build is
+    // counted the selector's and not built ahead.
+    let quiet = |o: &mut Options| {
+        o.zpages_suspect_at_crossing = false;
+        o.zpages_attach_eager = false;
+    };
+    let (dir, db, _model, inject, raw) = land_store_with("auto-land-cold", 50, quiet);
     inject.set_records_resident(0.0);
     inject.set_budget(raw * 3 / 2);
     assert!(
@@ -9734,6 +9742,7 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     let (dir, db, _model, inject, raw) = land_store_with("auto-land-cold-skip", 50, |o| {
+        quiet(o);
         o.zpages_land_cold_past = false
     });
     inject.set_records_resident(0.0);
@@ -9849,7 +9858,7 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
             });
         inject.set_budget(raw * 3 / 2);
         assert!(
-            tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+            tick_until_built(&db, |c| c.prebuilt >= c.partitions),
             "{what}: built ahead: {:?}",
             db.zpage_counts()
         );
