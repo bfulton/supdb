@@ -538,6 +538,134 @@ impl<T: Copy> Plain<T> for BigVec<T> {
     }
 }
 
+/// The cells slabs have handed out, process-wide, ever: what a test holds
+/// `Options::zpages_memo_slab` to having done.
+static SLAB_CELLS: AtomicUsize = AtomicUsize::new(0);
+
+/// The count of cells slabs have handed out.
+pub(crate) fn slab_cells() -> usize {
+    SLAB_CELLS.load(Ordering::Relaxed)
+}
+
+/// Cells of one size in one block, handed out and taken back: where a
+/// reader handle's memo keeps its decoded groups
+/// (`Options::zpages_memo_slab`). From the allocator each group's buffer
+/// is a chunk of its own in whole pages, twice the group, and a handle
+/// dropped leaves them all in its thread's arena, which glibc keeps the
+/// top of: eighteen megabytes a handle for a memo budgeted at eight,
+/// resident after the thread that read through it has gone. A slab is
+/// one block of `cell * cells` bytes, a mapping where that is
+/// `MAP_FROM` or more, its pages touched as its cells are first written
+/// and all of it unmapped when the slab and the last cell of it have
+/// dropped.
+pub(crate) struct Slab {
+    inner: std::sync::Arc<SlabInner>,
+}
+
+struct SlabInner {
+    p: *mut u8,
+    bytes: usize,
+    cell: usize,
+    cells: usize,
+    state: Mutex<SlabState>,
+}
+
+/// The cells never yet handed out begin at `made`; `free` are the ones
+/// handed back.
+struct SlabState {
+    made: usize,
+    free: Vec<u32>,
+}
+
+// SAFETY: the block is the slab's own, and its cells are disjoint ranges
+// of it, each handed to one holder at a time under the lock.
+unsafe impl Send for SlabInner {}
+// SAFETY: as above; the lock is what the handing out goes through.
+unsafe impl Sync for SlabInner {}
+
+impl SlabInner {
+    fn state(&self) -> std::sync::MutexGuard<'_, SlabState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Slab {
+    /// `cells` cells of `cell` bytes, the size rounded up to a cache line
+    /// so that every cell is aligned to one; zeroed, nothing touched.
+    pub(crate) fn new(cell: usize, cells: usize) -> Slab {
+        let cell = cell.max(1).next_multiple_of(ALIGN);
+        let cells = cells.max(1);
+        let bytes = cell.checked_mul(cells).expect("slab: size overflow");
+        Slab {
+            inner: std::sync::Arc::new(SlabInner {
+                p: alloc(bytes, true, true),
+                bytes,
+                cell,
+                cells,
+                state: Mutex::new(SlabState {
+                    made: 0,
+                    free: Vec::new(),
+                }),
+            }),
+        }
+    }
+
+    /// A cell: one handed back before, else the next never handed out,
+    /// else none, every cell being out.
+    pub(crate) fn take(&self) -> Option<SlabCell> {
+        let i = {
+            let mut s = self.inner.state();
+            match s.free.pop() {
+                Some(i) => i,
+                None if s.made < self.inner.cells => {
+                    s.made += 1;
+                    (s.made - 1) as u32
+                }
+                None => return None,
+            }
+        };
+        SLAB_CELLS.fetch_add(1, Ordering::Relaxed);
+        Some(SlabCell {
+            slab: self.inner.clone(),
+            i,
+        })
+    }
+}
+
+impl Drop for SlabInner {
+    fn drop(&mut self) {
+        // SAFETY: from `alloc` with this length, mapped, and every cell
+        // of it has dropped, each holding this alive until it did.
+        unsafe { free(self.p, self.bytes, true) };
+    }
+}
+
+/// One cell of a slab, its holder's until it drops, which hands it back.
+pub(crate) struct SlabCell {
+    slab: std::sync::Arc<SlabInner>,
+    i: u32,
+}
+
+impl SlabCell {
+    /// The cell's bytes, a whole number of cache lines.
+    pub(crate) fn len(&self) -> usize {
+        self.slab.cell
+    }
+
+    /// Where the cell begins, aligned to a cache line: `len` bytes, zero
+    /// at the cell's first use and whatever its last holder left after.
+    pub(crate) fn as_ptr(&self) -> *mut u8 {
+        // SAFETY: `i < cells`, so the offset is inside the block.
+        unsafe { self.slab.p.add(self.i as usize * self.slab.cell) }
+    }
+}
+
+impl Drop for SlabCell {
+    fn drop(&mut self) {
+        self.slab.state().free.push(self.i);
+    }
+}
+
 impl crate::flatindex::TrailerBuf for BigVec<u8> {
     fn resize(&mut self, n: usize, v: u8) {
         BigVec::resize(self, n, v)
@@ -726,6 +854,61 @@ mod tests {
         by_reserve.reserve(MAP_FROM);
         assert!(by_reserve.is_mapped() && by_reserve.capacity() >= 1000 + MAP_FROM);
         assert!(by_reserve[..] == seed[..]);
+    }
+
+    /// A slab hands out as many cells as it has and no more, each its own
+    /// range of the block, aligned and as long as asked or longer; a cell
+    /// handed back is the next handed out, with what its holder left in
+    /// it; and the block outlives the slab for as long as a cell is held.
+    #[test]
+    fn a_slabs_cells_are_disjoint_and_come_back() {
+        let slab = Slab::new(2240, 300);
+        let mut cells: Vec<SlabCell> = (0..300).map(|_| slab.take().unwrap()).collect();
+        assert!(slab.take().is_none(), "every cell is out");
+        let mut at: Vec<usize> = cells.iter().map(|c| c.as_ptr() as usize).collect();
+        at.sort_unstable();
+        assert!(at.iter().all(|a| a % ALIGN == 0), "aligned to a cache line");
+        assert!(
+            cells
+                .iter()
+                .all(|c| c.len() >= 2240 && c.len() % ALIGN == 0),
+            "as long as asked, in whole cache lines"
+        );
+        assert!(
+            at.windows(2).all(|w| w[1] - w[0] >= cells[0].len()),
+            "no cell overlaps the next"
+        );
+        for (n, c) in cells.iter().enumerate() {
+            // SAFETY: the cell's own `len` bytes, held by this test alone.
+            let s = unsafe { std::slice::from_raw_parts_mut(c.as_ptr(), c.len()) };
+            assert!(s.iter().all(|&b| b == 0), "zero at its first use");
+            s.fill(n as u8);
+        }
+        for (n, c) in cells.iter().enumerate() {
+            // SAFETY: as above.
+            let s = unsafe { std::slice::from_raw_parts(c.as_ptr(), c.len()) };
+            assert!(s.iter().all(|&b| b == n as u8), "cell {n} kept its bytes");
+        }
+        let back = cells.pop().unwrap();
+        let (was, fill) = (back.as_ptr() as usize, 299usize as u8);
+        drop(back);
+        let again = slab.take().expect("the cell handed back");
+        assert_eq!(again.as_ptr() as usize, was, "handed out again");
+        // SAFETY: the cell's own bytes.
+        assert_eq!(unsafe { *again.as_ptr() }, fill, "as its holder left it");
+        assert!(slab.take().is_none());
+        // The slab gone, a held cell still reads and writes its bytes.
+        drop(slab);
+        // SAFETY: the cell's own bytes, the block alive while it is held.
+        unsafe { again.as_ptr().write(7) };
+        assert_eq!(unsafe { *again.as_ptr() }, 7);
+        drop(again);
+        drop(cells);
+        // A slab under `MAP_FROM` is the allocator's, and works the same.
+        let small = Slab::new(100, 3);
+        let a = small.take().unwrap();
+        let b = small.take().unwrap();
+        assert!(a.len() == 128 && b.as_ptr() as usize - a.as_ptr() as usize == 128);
     }
 
     /// A block grown keeps its bytes, mapping to mapping, allocator to

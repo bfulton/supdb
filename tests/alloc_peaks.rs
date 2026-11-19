@@ -15,8 +15,10 @@
 //! has ended (`docs/engine.md`, which form a workload calls for).
 //! `PROBE_N` is the store's key count, six hundred thousand unless set;
 //! `PROBE_BIG` the size an allocation is printed from, two megabytes unless
-//! set; and `PROBE_JOBS_MAPPED=1` runs the store under
-//! `Options::jobs_mapped`, whose mappings the allocator never sees.
+//! set; `PROBE_JOBS_MAPPED=1` runs the store under `Options::jobs_mapped`
+//! and `PROBE_MEMO_SLAB=1` under `Options::zpages_memo_slab`, whose
+//! mappings the allocator never sees: the bytes mapped at each phase's
+//! end are printed beside its line.
 #![cfg(target_os = "linux")]
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -179,14 +181,20 @@ fn phase<T>(what: &str, n: usize, f: impl FnOnce() -> T) -> T {
         BIG.load(Ordering::Relaxed),
     );
     eprintln!(
-        "probe {what:28} peak +{:7.2} MB ({:5.1} B/key)  kept +{:6.2} MB  largest alloc {:6.2} MB",
+        "probe {what:28} peak +{:7.2} MB ({:5.1} B/key)  kept +{:6.2} MB  largest alloc {:6.2} MB  mapped {:6.2} MB",
         (peak - base) as f64 / 1e6,
         (peak - base) as f64 / n as f64,
         (live - base) as f64 / 1e6,
-        big as f64 / 1e6
+        big as f64 / 1e6,
+        Db::mapped_bytes() as f64 / 1e6
     );
     threads(what.trim());
     t
+}
+
+/// A value read: nothing kept of it.
+fn got_len(v: &[u8]) {
+    std::hint::black_box(v.len());
 }
 
 fn key(i: usize) -> Vec<u8> {
@@ -206,6 +214,9 @@ fn the_peaks_by_phase_and_thread() {
     // `PROBE_JOBS_MAPPED=1`: the jobs' large arrays as the engine's
     // mappings (`Options::jobs_mapped`), which leave the allocator's count.
     let jobs_mapped = std::env::var("PROBE_JOBS_MAPPED").is_ok_and(|v| v == "1");
+    // `PROBE_MEMO_SLAB=1`: the handles' memos in slabs of their own
+    // (`Options::zpages_memo_slab`), mappings too.
+    let memo_slab = std::env::var("PROBE_MEMO_SLAB").is_ok_and(|v| v == "1");
     // `PROBE_BIG`: the size from which an allocation of the traced flush
     // is printed with where it was made, two megabytes unless set.
     if let Some(b) = std::env::var("PROBE_BIG").ok().and_then(|s| s.parse().ok()) {
@@ -264,6 +275,7 @@ fn the_peaks_by_phase_and_thread() {
             zpages_stride: stride,
             zpages_stride_room: false,
             jobs_mapped,
+            zpages_memo_slab: memo_slab,
             ..Options::default()
         };
         // The form files of the run before, gone: each run builds its own.
@@ -282,6 +294,60 @@ fn the_peaks_by_phase_and_thread() {
             "probe   {} form files, {} stride, {} partitions",
             c.form_files, c.stride_files, c.partitions
         );
+        // What a reader handle's thread holds: three threads, a handle
+        // each, reading uniformly through the form, and then scanning from
+        // uniform starts over a store with a few thousand keys unsealed.
+        // Each thread drops its handle as it ends, and what it peaked at is
+        // what its arena keeps.
+        let readers = |db: &Db, what: &str, f: &(dyn Fn(&supdb::db::Reader, u64) + Sync)| {
+            phase(what, n, || {
+                std::thread::scope(|s| {
+                    for t in 0..3u64 {
+                        let r = db.reader().unwrap();
+                        std::thread::Builder::new()
+                            .name("probe-reader".into())
+                            .spawn_scoped(s, move || f(&r, t))
+                            .unwrap();
+                    }
+                });
+            });
+        };
+        let next = |x: &mut u64| {
+            *x ^= *x << 13;
+            *x ^= *x >> 7;
+            *x ^= *x << 17;
+            *x
+        };
+        readers(&db, &format!("  point reads, {what}"), &|r, t| {
+            let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ (t + 1);
+            let mut got = 0u64;
+            for _ in 0..200_000 {
+                let k = (next(&mut x) % n as u64) as usize;
+                got += r.read_all(&key(k), &mut |v: &[u8]| got_len(v)).unwrap();
+            }
+            assert_eq!(got, 200_000);
+        });
+        let mut x = 0xD1B5_4A32_D192_ED03u64;
+        for _ in 0..5 {
+            for _ in 0..1000 {
+                let k = (next(&mut x) % n as u64) as usize;
+                db.delete(&key(k));
+                db.append(&key(k), &val);
+            }
+            db.commit().unwrap();
+        }
+        readers(&db, &format!("  scans, {what}"), &|r, t| {
+            let mut x = 0x2545_F491_4F6C_DD1Du64 ^ (t + 1);
+            let mut got = 0u64;
+            for _ in 0..20_000 {
+                let k = (next(&mut x) % n as u64) as usize;
+                r.scan(&key(k), 100, &mut |_: &[u8], v: &[u8]| {
+                    got += v.len() as u64;
+                })
+                .unwrap();
+            }
+            assert!(got > 0);
+        });
         db.close().unwrap();
     }
     let _ = std::fs::remove_dir_all(&dir);

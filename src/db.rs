@@ -1655,6 +1655,24 @@ pub struct Options {
     /// the same with the others, at `89e309d`.
     #[doc(hidden)]
     pub zpages_memo_bytes: usize,
+    /// EXPERIMENT: a handle's memo keeps its decoded groups in the cells of
+    /// a slab of its own, one block mapped by the engine and unmapped when
+    /// the handle drops (`blocks::Slab`, `zfile::memo_cell_bytes`), each
+    /// cell the bytes a group is cut at and the decoder's room past them.
+    /// From the allocator a group's buffer is a chunk of its own in whole
+    /// pages, 4 KB for a group of two, so a memo budgeted at
+    /// `zpages_memo_bytes`, which counts the groups' bytes, held twice
+    /// that: a thread reading through the block form held 18 MB at its
+    /// most at six hundred thousand keys, by an allocator that counts by
+    /// thread (`tests/alloc_peaks.rs`), and when the thread ended its
+    /// handle's buffers stayed in its arena, resident and nobody's -- at
+    /// ten million keys under 1 GiB the arenas of the threaded passes'
+    /// readers held most of the 57-68 MB free beside a group at its limit
+    /// (`docs/engine.md`, which form a workload calls for). A group of one
+    /// record longer than a cell keeps a buffer of the allocator's. Off;
+    /// `supdb-zmemoslab` turns it on.
+    #[doc(hidden)]
+    pub zpages_memo_slab: bool,
     /// EXPERIMENT: a verified page's group asked of the handle's memo before
     /// any view of the page, the memo's entry carrying the group's first
     /// record and count, so a hit reads nothing of the page
@@ -6313,6 +6331,38 @@ impl Options {
 }
 
 impl Options {
+    /// The cell a handle's memo keeps a decoded group in, where it keeps
+    /// them in a slab (`zpages_memo_slab`), for the cut the store's form
+    /// files are built at (`zfile::memo_cell_bytes`); none leaves the
+    /// groups' buffers the allocator's.
+    fn memo_cell(&self) -> Option<usize> {
+        self.zpages_memo_slab
+            .then(|| zfile::memo_cell_bytes(self.zpages_group_bytes))
+            .flatten()
+    }
+
+    /// A handle's memo of decoded groups as these options have it: the
+    /// writer's, a reader's and each of the store's own threads' is made
+    /// here and nowhere else, so an option of the memo's is every
+    /// handle's or none's.
+    fn handle_memo(&self) -> zfile::ZMemo {
+        zfile::ZMemo::sized(self.zpages_memo_bytes)
+            .slab(self.memo_cell())
+            .point(self.zpages_point_part, self.zpages_point_keys)
+            .point_filter(self.zpages_point_filter)
+            .filter_ahead(self.zpages_filter_ahead)
+            .scans(self.zpages_scan_admit, self.zpages_walk_part)
+            .bulk(
+                self.zpages_bulk_admit,
+                self.zpages_bulk_ahead,
+                self.zpages_bulk_part,
+            )
+            .bulk_within(self.zpages_bulk_ahead_within)
+            .bulk_steps(self.zpages_bulk_steps)
+    }
+}
+
+impl Options {
     /// How a table's blocks are made, for `MemTable::new`.
     fn block_shape(&self) -> BlockShape {
         BlockShape {
@@ -6390,6 +6440,7 @@ impl Default for Options {
             settle_covered_samples: true,
             zpages_trusted_views: true,
             zpages_memo_bytes: 8 << 20,
+            zpages_memo_slab: false,
             zpages_memo_first: false,
             zpages_fence_tree: false,
             zpages_fence_words: true,
@@ -33734,18 +33785,7 @@ impl Db {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes)
-                .point(opts.zpages_point_part, opts.zpages_point_keys)
-                .point_filter(opts.zpages_point_filter)
-                .filter_ahead(opts.zpages_filter_ahead)
-                .scans(opts.zpages_scan_admit, opts.zpages_walk_part)
-                .bulk(
-                    opts.zpages_bulk_admit,
-                    opts.zpages_bulk_ahead,
-                    opts.zpages_bulk_part,
-                )
-                .bulk_within(opts.zpages_bulk_ahead_within)
-                .bulk_steps(opts.zpages_bulk_steps),
+            zmemo: opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -34538,18 +34578,7 @@ impl Db {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes)
-                .point(opts.zpages_point_part, opts.zpages_point_keys)
-                .point_filter(opts.zpages_point_filter)
-                .filter_ahead(opts.zpages_filter_ahead)
-                .scans(opts.zpages_scan_admit, opts.zpages_walk_part)
-                .bulk(
-                    opts.zpages_bulk_admit,
-                    opts.zpages_bulk_ahead,
-                    opts.zpages_bulk_part,
-                )
-                .bulk_within(opts.zpages_bulk_ahead_within)
-                .bulk_steps(opts.zpages_bulk_steps),
+            zmemo: opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -37413,18 +37442,7 @@ impl Reader {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
-                .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
-                .point_filter(self.opts.zpages_point_filter)
-                .filter_ahead(self.opts.zpages_filter_ahead)
-                .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
-                .bulk(
-                    self.opts.zpages_bulk_admit,
-                    self.opts.zpages_bulk_ahead,
-                    self.opts.zpages_bulk_part,
-                )
-                .bulk_within(self.opts.zpages_bulk_ahead_within)
-                .bulk_steps(self.opts.zpages_bulk_steps),
+            zmemo: self.opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -37464,18 +37482,7 @@ impl Reader {
                 forms_off_now: std::cell::Cell::new(false),
                 ord_served: std::cell::Cell::new(0),
                 ord_declined: std::cell::Cell::new(0),
-                zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
-                    .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
-                    .point_filter(self.opts.zpages_point_filter)
-                    .filter_ahead(self.opts.zpages_filter_ahead)
-                    .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
-                    .bulk(
-                        self.opts.zpages_bulk_admit,
-                        self.opts.zpages_bulk_ahead,
-                        self.opts.zpages_bulk_part,
-                    )
-                    .bulk_within(self.opts.zpages_bulk_ahead_within)
-                    .bulk_steps(self.opts.zpages_bulk_steps),
+                zmemo: self.opts.handle_memo(),
                 zwin: std::cell::Cell::new(ZWindow::closed()),
                 zwin_open: std::cell::Cell::new(false),
                 zwin_counting: std::cell::Cell::new(false),
@@ -37522,18 +37529,7 @@ impl Reader {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
-                .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
-                .point_filter(self.opts.zpages_point_filter)
-                .filter_ahead(self.opts.zpages_filter_ahead)
-                .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
-                .bulk(
-                    self.opts.zpages_bulk_admit,
-                    self.opts.zpages_bulk_ahead,
-                    self.opts.zpages_bulk_part,
-                )
-                .bulk_within(self.opts.zpages_bulk_ahead_within)
-                .bulk_steps(self.opts.zpages_bulk_steps),
+            zmemo: self.opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -40697,18 +40693,7 @@ impl Reader {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
-                .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
-                .point_filter(self.opts.zpages_point_filter)
-                .filter_ahead(self.opts.zpages_filter_ahead)
-                .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
-                .bulk(
-                    self.opts.zpages_bulk_admit,
-                    self.opts.zpages_bulk_ahead,
-                    self.opts.zpages_bulk_part,
-                )
-                .bulk_within(self.opts.zpages_bulk_ahead_within)
-                .bulk_steps(self.opts.zpages_bulk_steps),
+            zmemo: self.opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -41918,6 +41903,13 @@ impl Db {
     #[doc(hidden)]
     pub fn job_buffers_mapped() -> Vec<(&'static str, usize)> {
         blocks::big_maps()
+    }
+
+    /// How many cells the handles' memos have taken of their slabs
+    /// (`Options::zpages_memo_slab`), process-wide and ever.
+    #[doc(hidden)]
+    pub fn memo_cells_taken() -> usize {
+        blocks::slab_cells()
     }
 
     /// The bytes of those blocks the kernel has resident, read from it
