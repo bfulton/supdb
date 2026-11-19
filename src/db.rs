@@ -624,15 +624,15 @@ pub enum ZPages {
     Auto,
 }
 
-/// EXPERIMENT: whether a partition's form file may be the stride form
+/// Whether a partition's form file may be the stride form
 /// (`zpages::StrideTrailer`): a partition whose keys are an exact run of
 /// numbers at one width and whose every record is one inline fixed value,
 /// held as its values alone, value `r` at `r * W`, so that a point read is
 /// a key's parse and one or two pages with nothing searched.
 ///
-/// No `Auto` yet: a value that chooses nothing would be a promise the
-/// engine does not keep, and the choice is to be made from the forced
-/// arm's counts.
+/// No `Auto`: under `Forced` the choice is the room's at a build
+/// (`Options::zpages_stride_room`) and the conversion's while the partition
+/// serves (`Options::zpages_stride_convert`).
 #[doc(hidden)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ZStride {
@@ -644,13 +644,14 @@ pub enum ZStride {
     /// account: counted as an identity rejection (`ZCounts::rejected_identity`)
     /// where an engine from before counts damage at the magic, and named so
     /// in the reject's text.
-    #[default]
     Off,
     /// Every build of a partition's form file asks for the stride form and
     /// builds the block body in the same call where the partition does not
     /// qualify (`zfile::StrideAsk::OrBlock`), the reason kept on the
     /// segment (`Seg::z_stride_no`); a stride file on disk is attached. The
-    /// arm that prices the form, built whether or not the store needs it.
+    /// engine's (`Options::zpages_stride`), with the room deciding which
+    /// builds ask (`Options::zpages_stride_room`).
+    #[default]
     Forced,
     /// No build of a partition's own asks for the stride form: a partition
     /// is built in the block form as under `Off`, and a stride file on disk
@@ -2528,7 +2529,7 @@ pub struct Options {
     /// On; `supdb-znocrossraw` asks for the form files alone.
     #[doc(hidden)]
     pub zpages_cross_asks_raw: bool,
-    /// EXPERIMENT: the drop of a served partition's ordered index from the
+    /// The drop of a served partition's ordered index from the
     /// page cache (`zpages_drop_raw`) is made again a second later, for the
     /// pages that were dirty at the first. The index is written unsynced
     /// and never fsynced (`ord_durable`), so the indexes of the load's last
@@ -2548,8 +2549,12 @@ pub struct Options {
     /// pairs of six (`docs/engine.md`). The second drop is the file's
     /// advice alone, and it is made of no partition the hot-raw policy has
     /// asked for or released, whose seeks read the index, nor of a merge's
-    /// input or a build's. Off; `supdb-zdropagain` turns it on, and
-    /// `supdb-zstridealldropagain` beside the stride form's options.
+    /// input or a build's. On the block form's engine alone it was a
+    /// trade, some mixes a tenth ahead and others a tenth behind in both
+    /// orders at each ten-million bound; beside the stride form it is what
+    /// lets the hot-raw policy make its release under 1 GiB, and it is on
+    /// with the form (`zpages_stride`, whose doc has the cells).
+    /// `supdb-zstrideallcdrop` is the engine without it.
     #[doc(hidden)]
     pub zpages_drop_again: bool,
     /// The builder's turn comes when a job of its ends, and
@@ -2572,7 +2577,7 @@ pub struct Options {
     /// `supdb-znodriveend` is the turn at the controller's step alone.
     #[doc(hidden)]
     pub zpages_drive_at_job_end: bool,
-    /// EXPERIMENT: the hot-raw policy (`zpages_hot_raw`) runs beside the
+    /// The hot-raw policy (`zpages_hot_raw`) runs beside the
     /// stride form, over the partitions a block file serves. It stood
     /// down wherever the stride form was asked for, since a stride file
     /// counted no decode or open and sat at nothing in the median a
@@ -2585,7 +2590,8 @@ pub struct Options {
     /// (`zpages_stride_convert`) and every partition ends in the block
     /// form, the stand-down was what the arm read B at 0.76-0.84x of the
     /// default by, which serves its hottest partition raw there
-    /// (`docs/engine.md`). Off; `supdb-zstrideroomconvaskhot` turns it on.
+    /// (`docs/engine.md`). On with the form (`zpages_stride`);
+    /// `supdb-zstrideroomconvask` is the stand-down.
     #[doc(hidden)]
     pub zpages_hot_raw_beside_stride: bool,
     /// A form file whose build dropped it from the page cache
@@ -6400,12 +6406,39 @@ pub struct Options {
     /// microseconds apart, so a quarter of a second is a stretch with no
     /// reader all the same. `supdb-zrewarmwait` keeps the second.
     pub zpages_rewarm_quiet_ms: u32,
-    /// EXPERIMENT: whether a partition's form file may be the stride form
-    /// (`ZStride`). `Off`, the default, is the engine as it was: nothing is
-    /// built in it, and a stride file found under a partition's name is
-    /// refused at its attach and built again in the block coding. `Forced`
-    /// asks every build of a form file for it (`Options::z_stride_ask`) and
-    /// attaches one found on disk. Refused beside a re-code policy under the
+    /// Whether a partition's form file may be the stride form (`ZStride`).
+    /// `Forced`, the default, asks every build of a form file for it
+    /// (`Options::z_stride_ask`), where the store in it fits
+    /// (`zpages_stride_room`), and attaches one found on disk; a partition
+    /// whose keys are not one run of numbers at one width, or whose records
+    /// are not one fixed value each, declines it and is built in the block
+    /// form. `Off` is the engine before the form: nothing is built in it,
+    /// and a stride file found under a partition's name is refused at its
+    /// attach and built again in the block coding. With the options beside
+    /// it -- the room, the conversion between the forms
+    /// (`zpages_stride_convert`) with a conversion's file dropped and asked
+    /// back (`zpages_convert_drops_output`), the hot-raw policy beside the
+    /// form (`zpages_hot_raw_beside_stride`) and the ordered indexes' second
+    /// drop (`zpages_drop_again`) -- and against the engine before them, at
+    /// ten million keys under 1.25 GiB every cell of the row read ahead in
+    /// both orders but the ordered load, 0.94x and 0.99x: the read passes
+    /// 2.2x to 3.8x, the scans 1.8x to 2.2x, C 3.8x and 2.4x, the scrambled
+    /// B, C, D and E 2.0x to 3.1x, A, B, E and F 1.05x to 2.1x; the lag
+    /// sweep's weighted sum took 0.95x of the time in both, the pass after
+    /// the full rewrite 1.13x and 1.54x and the pass after the ten-percent
+    /// burst 0.87x and 0.94x. Under 1 GiB, where the store converts every
+    /// partition back to the block form through the read and scan passes,
+    /// the read passes read 1.1x to 2.2x and the one-thread scan 1.2x and
+    /// 1.4x, the lag sweep level, A and the last two scrambled mixes went
+    /// with the order, and F and E read 0.90x to 0.98x by the pass the
+    /// hot-raw policy's way back fell in; the ordered load read 0.93x to
+    /// 1.01x. At three million keys, where the raw form fits, nothing of
+    /// it acts in the row's passes; in the lag sweep the builds ahead ask
+    /// for the stride form and nothing installs one, the sweep's weighted
+    /// sum level and the pass after the one-percent burst 0.88x and 0.82x.
+    /// In core nothing of it acts (`docs/engine.md` has the commands).
+    /// `supdb-zloadend` is the engine before them, `supdb-zstridealldropagain`
+    /// and `supdb-zstrideallcdrop` each take one back. Refused beside a re-code policy under the
     /// mode it starts builds in, each of which builds over a served file's
     /// name on its own -- `zpages_recode` under `ZPages::Always`, and
     /// `zpages_recode_auto` and `zpages_reparse` under `ZPages::Auto` --
@@ -6433,7 +6466,7 @@ pub struct Options {
     /// partition lies, as `zpages_stride` attaches one.
     #[doc(hidden)]
     pub zpages_stride_below: Option<std::sync::Arc<[u8]>>,
-    /// EXPERIMENT: with `zpages_stride` at `Forced`, a build on the segment
+    /// With `zpages_stride` at `Forced`, a build on the segment
     /// work's thread -- a partition's own, a build ahead, a merge output's
     /// at its finish -- asks for the stride form only where the store in
     /// that form fits the room as it is at the build
@@ -6452,8 +6485,9 @@ pub struct Options {
     /// full rewrite found a quarter short of its pages (`docs/engine.md`,
     /// which form a workload calls for); the pieces are the tenant a burst
     /// adds, and the process's growth is in the budget read at the build.
-    /// Off; `supdb-zstrideroom` is the arm, beside `supdb-zstride`, which
-    /// asks at every build.
+    /// On, priced with `zpages_stride`, whose doc has the cells;
+    /// `supdb-zstrideroom` is the arm beside `supdb-zstride`, which asks at
+    /// every build.
     #[doc(hidden)]
     pub zpages_stride_room: bool,
     /// EXPERIMENT: under `zpages_stride` `Forced`, a stride file whose build
@@ -6487,7 +6521,7 @@ pub struct Options {
     /// build made is checked so too. On.
     #[doc(hidden)]
     pub zpages_stride_trust_built: bool,
-    /// EXPERIMENT: under the controller, with `zpages_stride` not `Off`, a
+    /// Under the controller, with `zpages_stride` not `Off`, a
     /// served partition is converted between the block form and the stride
     /// form while it serves (`ZKind::Convert`, `Maint::z_convert_look`).
     /// Once the form is installed and the builder has nothing due, a look
@@ -6521,12 +6555,13 @@ pub struct Options {
     /// kept. Nothing is decided while
     /// a seal or a merge is rewriting the partitions, and nothing without a
     /// budget. The hot-raw policy stands down beside the stride form as it
-    /// did. Off; `supdb-zstrideconv` is the arm under `ZStride::Chosen`,
-    /// where the load is built in the block form, and
-    /// `supdb-zstrideroomconv` under `Forced` with `zpages_stride_room`.
+    /// did. On, priced with `zpages_stride`, whose doc has the cells;
+    /// `supdb-zstrideconv` is the arm under `ZStride::Chosen`, where the
+    /// load is built in the block form, and `supdb-zstrideroomconv` under
+    /// `Forced` with `zpages_stride_room`.
     #[doc(hidden)]
     pub zpages_stride_convert: bool,
-    /// EXPERIMENT: a conversion's build (`zpages_stride_convert`) writes its
+    /// A conversion's build (`zpages_stride_convert`) writes its
     /// file back and drops it from the page cache as it goes, as a build
     /// ahead under the selector's line does (`zfile::BuildPlan::drop_output`),
     /// and the turn that takes it in asks the file back whole before it
@@ -6544,8 +6579,11 @@ pub struct Options {
     /// reached the limit a mix earlier, and the scrambled D and E mixes took
     /// the major faults for it (`docs/engine.md`, the group's kernel memory;
     /// `memory.kmem.usage_in_bytes` of the pass's group and `buffer_head` in
-    /// `/proc/slabinfo`, sampled beside one traced rep). Off;
-    /// `supdb-zstrideallcdrop` turns it on beside the stride form's options.
+    /// `/proc/slabinfo`, sampled beside one traced rep). By itself, beside
+    /// the stride form's other options, it read nothing behind in both
+    /// orders there and the threaded reads 1.2x to 1.3x, the scrambled E
+    /// 1.35x and 1.20x. On; `supdb-zstridealldropagain` keeps a
+    /// conversion's file in the cache as it is written.
     #[doc(hidden)]
     pub zpages_convert_drops_output: bool,
 }
@@ -6790,10 +6828,10 @@ impl Default for Options {
             zpages_build_sync: true,
             zpages_land_cold_past: true,
             zpages_ask_dropped: true,
-            zpages_hot_raw_beside_stride: false,
+            zpages_hot_raw_beside_stride: true,
             zpages_drive_at_job_end: true,
             zpages_cross_asks_raw: true,
-            zpages_drop_again: false,
+            zpages_drop_again: true,
             zpages_ahead_past_scans: false,
             zpages_build_at_finish: true,
             zpages_group_bytes: zpages::ZGROUP_BYTES,
@@ -7026,12 +7064,12 @@ impl Default for Options {
             zpages_rewarm_trims: false,
             zpages_rewarm_beside_merges: false,
             zpages_rewarm_quiet_ms: 250,
-            zpages_stride: ZStride::Off,
+            zpages_stride: ZStride::Forced,
             zpages_stride_below: None,
-            zpages_stride_room: false,
+            zpages_stride_room: true,
             zpages_stride_trust_built: true,
-            zpages_stride_convert: false,
-            zpages_convert_drops_output: false,
+            zpages_stride_convert: true,
+            zpages_convert_drops_output: true,
         }
     }
 }

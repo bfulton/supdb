@@ -2310,8 +2310,9 @@ const Z_RAW_SHARE_MAX_PCT: u64 = 1;
 /// the engine's own decision, counted and printed
 /// (`zpage_declined_small_bytes`), and covers nothing the form is for;
 /// every other partition without a form file was declined for what it holds
-/// or failed, and refuses the pass. A stride arm (`ZState::stride`) is held
-/// to those rules and, after the ordered load, to at least one stride file.
+/// or failed, and refuses the pass. A forced stride arm (`ZState::stride`)
+/// is held to those rules and, after the ordered load, to at least one
+/// stride file.
 /// `None` is an engine with no such form, which nothing is asked of.
 fn zpages_refusal(arm: &str, size: u64, stage: ZStage, z: Option<ZState>) -> Result<(), String> {
     let Some(z) = z else { return Ok(()) };
@@ -2368,8 +2369,11 @@ fn zpages_refusal(arm: &str, size: u64, stage: ZStage, z: Option<ZState>) -> Res
         // the block form's under the stride form's name. Asked at the
         // ordered load, whose keys and values are the shape the form is
         // for; the shuffled store's partitions are merge outputs, and what
-        // qualifies there is the counts' to say, not this refusal's.
-        (ZStage::Loaded, _) if z.stride && z.stride_files == 0 => wrong(format!(
+        // qualifies there is the counts' to say, not this refusal's. Asked
+        // of an arm that forces the form alone: the engine ships the stride
+        // form under its controller, so an arm with the compact form off
+        // carries the option too, and builds no form file of either kind.
+        (ZStage::Loaded, true) if z.stride && z.stride_files == 0 => wrong(format!(
             "the stride form is forced and none of {} form files is a stride file {when}: \
              every partition declined it (`zpage_stride_no_*` says why), so the reads \
              are the block form's",
@@ -5915,6 +5919,20 @@ mod tests {
             ..covered
         };
         assert!(run(ZStage::Loaded, block).is_ok());
+        // Nor is an arm with the compact form off, which carries the
+        // engine's stride form as an option nothing of it reaches: no
+        // partition has a form file of either kind, at any stage.
+        let off = ZState {
+            stride: true,
+            partitions: 3,
+            ..ZState::default()
+        };
+        for stage in [ZStage::Loaded, ZStage::Read, ZStage::Shuffled] {
+            assert!(
+                zpages_refusal("supdb-nozpages", 1_000, stage, Some(off)).is_ok(),
+                "{stage:?}"
+            );
+        }
     }
 
     /// The ordered load asks, after it, whether a stride arm's store holds
