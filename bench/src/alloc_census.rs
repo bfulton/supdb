@@ -170,7 +170,7 @@ pub fn report(tag: &str, arm: &str, point: &str) {
             )
         })
         .collect();
-    gone_peaks.sort_by(|a, b| b.0.cmp(&a.0));
+    gone_peaks.sort_by_key(|p| std::cmp::Reverse(p.0));
     let peaks: Vec<String> = gone_peaks
         .iter()
         .take(24)
