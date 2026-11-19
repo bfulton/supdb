@@ -779,6 +779,13 @@ pub(crate) struct Paged {
     back: OnceLock<Back>,
     /// What the file is called, for an error.
     label: String,
+    /// A file the store can make again, a form file (`zpg-<..>.zpg`, kept as
+    /// `x-<token>.z`, by either name): a chunk
+    /// of it that fails its tag is that file's failure and not the store's,
+    /// the read answered as a range the file cannot lend, and the form's
+    /// reader takes the file out of service and reads the partition raw
+    /// (`ZFile::page_bytes`). Every other file's failure poisons the store.
+    regenerable: bool,
     /// Chunks present, for the drop's count; kept by the fills and the
     /// frees.
     present: AtomicUsize,
@@ -862,6 +869,7 @@ impl Paged {
                 .collect(),
             back: OnceLock::new(),
             label: label.to_string(),
+            regenerable: label.ends_with(".zpg") || label.ends_with(".z"),
             present: AtomicUsize::new(if first == EMPTY { 0 } else { chunks }),
             #[cfg(test)]
             pause: AtomicU8::new(0),
@@ -1106,7 +1114,9 @@ impl Paged {
                         }
                         Err(e) => {
                             state.store(EMPTY, Ordering::SeqCst);
-                            self.pager.poison(&e.to_string());
+                            if !self.regenerable {
+                                self.pager.poison(&e.to_string());
+                            }
                             return false;
                         }
                     }

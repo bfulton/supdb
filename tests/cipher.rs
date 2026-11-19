@@ -2048,7 +2048,7 @@ fn a_form_file_goes_with_its_segment_whether_or_not_this_open_knew_it() {
 /// and the partition is read raw, or refuses to be read, where the byte
 /// was in a page a read wanted.
 #[test]
-fn a_changed_byte_in_a_form_file_is_refused_or_the_form_is() {
+fn a_changed_byte_in_a_form_file_takes_the_form_out_of_service_and_not_the_store() {
     let dir = scratch("tamperz");
     let opts = || Options {
         zpages: supdb::ZPages::Always,
@@ -2071,7 +2071,11 @@ fn a_changed_byte_in_a_form_file_is_refused_or_the_form_is() {
         digest_of(&db)
     };
     let pristine = snapshot(&dir);
-    let (mut refused, mut unread, mut whole) = (0, 0, 0);
+    // A form file is the store's to make again: a byte changed anywhere in
+    // its envelope is the form's failure alone. The store opens, every read
+    // answers the store it was -- through the raw form where the file left
+    // service -- and nothing poisons the store, as for a plain store's.
+    let (mut out_of_service, mut whole) = (0, 0);
     for (name, bytes) in pristine.iter().filter(|(n, _)| n.ends_with(".z")) {
         let stride = (bytes.len() / 24).max(1);
         for at in (0..bytes.len()).step_by(stride) {
@@ -2079,32 +2083,87 @@ fn a_changed_byte_in_a_form_file_is_refused_or_the_form_is() {
             let mut bad = bytes.clone();
             bad[at] ^= 1;
             std::fs::write(dir.join(name), &bad).unwrap();
-            let db = match Db::open(&dir, opts()) {
-                Err(_) => {
-                    refused += 1;
-                    continue;
-                }
-                Ok(db) => db,
-            };
-            match read_digest(&db) {
-                Err(e) => {
-                    unread += 1;
-                    assert!(
-                        e.to_string().contains("did not read"),
-                        "{name}, byte {at}: refused as {e}"
-                    );
-                }
-                Ok(d) => {
-                    assert_eq!(d, want, "{name}, byte {at}: read as another store");
-                    whole += 1;
-                }
+            let db = Db::open(&dir, opts()).unwrap_or_else(|e| {
+                panic!("{name}, byte {at}: a form file's damage refused the store: {e}")
+            });
+            let d = read_digest(&db).unwrap_or_else(|e| {
+                panic!("{name}, byte {at}: a form file's damage poisoned the store: {e}")
+            });
+            assert_eq!(d, want, "{name}, byte {at}: read as another store");
+            // Out of service at its attach, which reads the file's chunks
+            // and rejects it, or at a page a read found failing.
+            let c = db.zpage_counts();
+            if c.rejected_damage > 0 || c.damaged > 0 {
+                out_of_service += 1;
+            } else {
+                whole += 1;
             }
         }
     }
     assert!(
-        refused + unread > 0 && whole > 0,
-        "refused {refused}, unread {unread}, whole {whole}"
+        out_of_service > 0,
+        "no flip took a form file out of service: whole {whole}"
     );
+    // The same in service: the file attached whole, then changed in place
+    // under a cache too small to keep its plaintext, so a chunk given back
+    // is decrypted again from the changed envelope and fails there. The
+    // read that meets it takes the file out of service (`ZFile::page_bytes`)
+    // and answers through the raw form.
+    restore(&dir, &pristine);
+    let small = || Options {
+        encryption: Encryption::Cipher(cipher(16).cache_bytes(16 << 10)),
+        ..opts()
+    };
+    let db = Db::open(&dir, small()).unwrap();
+    let keys: Vec<u32> = (0..700).collect();
+    for &i in &keys {
+        let mut got = Vec::new();
+        db.read_all(&k(i), vf(&mut |x| got.push(x.to_vec())))
+            .unwrap();
+    }
+    assert!(
+        db.zpage_counts().reads > 0,
+        "premise: reads through the form"
+    );
+    // Every form file changed, a byte a chunk: which of them the store
+    // serves is the controller's, and a file it does not is read by nobody.
+    for (name, bytes) in pristine.iter().filter(|(n, _)| n.ends_with(".z")) {
+        use std::os::unix::fs::FileExt;
+        let mut bad = bytes.clone();
+        for at in (4096..bad.len()).step_by(4096) {
+            bad[at] ^= 1;
+        }
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(name))
+            .unwrap();
+        f.write_all_at(&bad, 0).unwrap();
+        f.sync_all().unwrap();
+    }
+    // Rounds of reads until one meets a chunk the evictor gave back, which
+    // is its thread's to do in its own time: every round answers whole.
+    let t = std::time::Instant::now();
+    let mut round = 0;
+    while db.zpage_counts().damaged == 0 && t.elapsed().as_secs() < 60 {
+        for &i in &keys {
+            let mut got = Vec::new();
+            db.read_all(&k(i), vf(&mut |x| got.push(x.to_vec())))
+                .unwrap_or_else(|e| panic!("round {round}, key {i}: the store refused: {e}"));
+        }
+        round += 1;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        read_digest(&db).unwrap(),
+        want,
+        "read as itself through the damage"
+    );
+    assert!(
+        db.zpage_counts().damaged > 0,
+        "a chunk that failed in service took its form file out: {:?}",
+        db.zpage_counts()
+    );
+    drop(db);
     restore(&dir, &pristine);
     assert_eq!(digest_of(&Db::open(&dir, opts()).unwrap()), want);
 }
