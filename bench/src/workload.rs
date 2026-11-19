@@ -262,6 +262,123 @@ pub fn db_key_into(n: u64, buf: &mut [u8; 16]) {
     }
 }
 
+/// What a store's keys are, which is a stated parameter as their
+/// distribution is: the same workloads run over either, and what an engine
+/// makes of a key's bytes and of the gaps between keys is part of what is
+/// measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum KeyShape {
+    /// Sixteen decimal digits of the key's index (`db_key_into`): db_bench's
+    /// keys, a dense run of numbers in which the next key is the next number.
+    /// Every row before the shape was a parameter is of these.
+    #[default]
+    Numbered,
+    /// Sixteen hex digits of a random 64-bit id (`id_of`): what an
+    /// application's own identifiers look like to a store -- no key the
+    /// successor of another, the gaps between neighbours random, a key's
+    /// bytes of no use to a compressor, and a key inserted later falling
+    /// anywhere among the ones there.
+    Ids,
+}
+
+impl KeyShape {
+    pub fn parse(s: &str) -> Option<KeyShape> {
+        match s {
+            "numbered" => Some(KeyShape::Numbered),
+            "ids" => Some(KeyShape::Ids),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            KeyShape::Numbered => "numbered",
+            KeyShape::Ids => "ids",
+        }
+    }
+}
+
+/// SplitMix64's finalizer: a bijection of the 64-bit words whose output
+/// bits each depend on every input bit.
+#[inline]
+fn mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The id of key index `n` in a store loaded with `loaded` keys
+/// (`KeyShape::Ids`).
+///
+/// The 64-bit space is cut into `loaded` strata of one width, and loaded
+/// key `n` is a random point of stratum `n`: so the ids ascend with the
+/// index, which is what lets a load in key order, a scan from a drawn key
+/// and a read of a drawn key each be a function of an index with nothing
+/// sorted or stored, and to an engine they are `loaded` random ids -- one a
+/// stratum where independent draws would leave some strata empty and some
+/// doubled, the neighbours' gaps anywhere from nothing to two strata wide.
+/// An index at or above `loaded` is a key inserted after the load: a random
+/// point of a random stratum, so it falls among the loaded keys and not
+/// above them. Two indexes share an id only where they share a stratum and
+/// draw one offset of its width, one chance in about two million million
+/// a pair at ten million keys, and an insert that did would be an update.
+#[inline]
+pub fn id_of(n: u64, loaded: u64) -> u64 {
+    let loaded = loaded.max(1);
+    let width = u64::MAX / loaded;
+    let stratum = if n < loaded {
+        n
+    } else {
+        mix64(n ^ 0x9E37_79B9_7F4A_7C15) % loaded
+    };
+    stratum * width + mix64(n.wrapping_add(0xD6E8_FEB8_6659_FD93)) % width.max(1)
+}
+
+/// `id` as sixteen lowercase hex digits, which order as the ids do.
+#[inline]
+pub fn id_key_into(id: u64, buf: &mut [u8; 16]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut v = id;
+    for i in (0..16).rev() {
+        buf[i] = HEX[(v & 15) as usize];
+        v >>= 4;
+    }
+}
+
+/// The keys of one store: their shape and, for ids, the count of loaded
+/// keys they are spread over. Every key a pass writes or asks for comes
+/// through here from its index, so a pass is over one shape whichever
+/// phase or thread makes the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyMap {
+    shape: KeyShape,
+    loaded: u64,
+}
+
+impl KeyMap {
+    pub fn new(shape: KeyShape, loaded: u64) -> KeyMap {
+        KeyMap { shape, loaded }
+    }
+
+    /// db_bench's keys, which need no count.
+    pub fn numbered() -> KeyMap {
+        KeyMap::new(KeyShape::Numbered, 0)
+    }
+
+    pub fn shape(&self) -> KeyShape {
+        self.shape
+    }
+
+    /// The key of index `n`, into a caller-owned buffer.
+    #[inline]
+    pub fn key_into(&self, n: u64, buf: &mut [u8; 16]) {
+        match self.shape {
+            KeyShape::Numbered => db_key_into(n, buf),
+            KeyShape::Ids => id_key_into(id_of(n, self.loaded), buf),
+        }
+    }
+}
+
 /// A pool of pre-generated value bytes.
 ///
 /// Values are handed out as slices at varying offsets, so the measured loop
@@ -320,6 +437,69 @@ impl Payload {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// The ids of the loaded keys ascend with their index and so do their
+    /// keys' bytes, across the whole 64-bit space; no two of a sample are
+    /// one id; their low digits are no run of numbers; and an index past the
+    /// load is a key among the loaded ones, not above them, the same key
+    /// every time it is asked for.
+    #[test]
+    fn the_ids_ascend_with_the_index_and_an_insert_falls_among_them() {
+        for loaded in [1u64, 2, 1_000, 10_000_000] {
+            let km = KeyMap::new(KeyShape::Ids, loaded);
+            let n = loaded.min(50_000);
+            let (mut prev, mut pk) = (None, [0u8; 16]);
+            let mut seen = std::collections::HashSet::new();
+            let mut steps = std::collections::HashSet::new();
+            for i in 0..n {
+                let id = id_of(i, loaded);
+                let mut k = [0u8; 16];
+                km.key_into(i, &mut k);
+                assert!(k.iter().all(|b| b.is_ascii_hexdigit()), "{k:?}");
+                if let Some(p) = prev {
+                    assert!(id > p, "{loaded}: id {i} above the one before");
+                    assert!(k > pk, "{loaded}: key {i} above the one before");
+                    steps.insert(id - p);
+                }
+                assert!(seen.insert(id));
+                (prev, pk) = (Some(id), k);
+            }
+            if loaded >= 1_000 {
+                assert!(
+                    steps.len() as u64 > n / 2,
+                    "{loaded}: the gaps are not one stride: {} of {n}",
+                    steps.len()
+                );
+                // The top of the space is reached, not a corner of it.
+                assert!(id_of(loaded - 1, loaded) > u64::MAX / 2);
+                // Inserts: among the loaded keys, spread, and stable.
+                let top = id_of(loaded - 1, loaded);
+                let (mut below_mid, mut below_top) = (0, 0);
+                for j in 0..1_000u64 {
+                    let id = id_of(loaded + j, loaded);
+                    assert_eq!(id, id_of(loaded + j, loaded));
+                    below_mid += u64::from(id < u64::MAX / 2);
+                    below_top += u64::from(id < top);
+                }
+                assert!(
+                    (350..=650).contains(&below_mid),
+                    "{loaded}: inserts on both sides of the middle: {below_mid}"
+                );
+                assert!(
+                    below_top >= 990,
+                    "{loaded}: inserts under the greatest loaded key: {below_top}"
+                );
+            }
+        }
+        // The numbered shape is db_bench's, whatever the count.
+        let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
+        KeyMap::numbered().key_into(42, &mut a);
+        db_key_into(42, &mut b);
+        assert_eq!(a, b);
+        assert_eq!(KeyShape::parse("ids"), Some(KeyShape::Ids));
+        assert_eq!(KeyShape::parse(KeyShape::Numbered.name()), Some(KeyShape::Numbered));
+        assert_eq!(KeyShape::parse("uuid"), None);
+    }
 
     #[test]
     fn keys_are_sixteen_digits_and_distinct() {

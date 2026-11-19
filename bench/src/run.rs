@@ -21,7 +21,7 @@ use crate::gate;
 use crate::hist::Hist;
 use crate::ledger::{Head, Ledger, RepState};
 use crate::row::{Guarantee, Kill, MachineInfo, Measurement, Resumption, Row};
-use crate::workload::{db_key_into, KeyDist, KeyGen, Payload, Permutation, Rng};
+use crate::workload::{db_key_into, KeyDist, KeyGen, KeyMap, KeyShape, Payload, Permutation, Rng};
 use crate::{ladder_from, Scale};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -287,6 +287,11 @@ pub struct Plan {
     /// 0.0 stores the same number of bytes that nothing can shrink, which is
     /// what a compact form of the records is priced against.
     pub compress: f64,
+    /// What the stores' keys are (`KeyShape`): db_bench's numbered keys in
+    /// every row of the series so far, or random ids, over which the same
+    /// workloads run from the same indexes (`Plan::keymap`).
+    #[serde(default)]
+    pub keys: KeyShape,
     /// The memory bound the run measures under, entered before the plan
     /// was made (`bound::Bound`), or none.
     pub bound: Option<Bound>,
@@ -325,6 +330,7 @@ impl Plan {
                 Scale::Quick | Scale::Full => 1,
             },
             compress: 0.5,
+            keys: KeyShape::Numbered,
             bound: None,
             // The recovery workloads are the in-core scales' until a
             // bounded row is taken with them on purpose: each loads two
@@ -336,6 +342,11 @@ impl Plan {
             },
             fresh_process: scale == Scale::Ooc,
         }
+    }
+
+    /// The keys of a store loaded with `size` of them under this plan.
+    pub fn keymap(&self, size: u64) -> KeyMap {
+        KeyMap::new(self.keys, size)
     }
 
     /// `n` operations under `ops_div`: `n` itself at a divisor of one,
@@ -2387,6 +2398,7 @@ fn read_phase(
     e: &mut dyn Engine,
     arm: &str,
     size: u64,
+    km: KeyMap,
     reads: u64,
     h: &mut Hist,
     counting: &mut Counting<'_>,
@@ -2397,7 +2409,7 @@ fn read_phase(
     phase_mark(arm, "read", "start");
     let t = Instant::now();
     for _ in 0..reads {
-        db_key_into(g.next(), &mut kb);
+        km.key_into(g.next(), &mut kb);
         let t1 = Instant::now();
         e.get(&kb)?;
         h.record(t1.elapsed().as_nanos() as u64);
@@ -2700,6 +2712,7 @@ fn one_pass(
     // read around it (`Counting`), and the plan's passes say which phases
     // run at all; a phase left out leaves a NaN where its rate would be.
     let passes = plan.passes;
+    let km = plan.keymap(size);
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     // The directory first, since the counting finds the device through it.
     let mut counting = Counting::new(plan.bound.as_ref(), dir, trace)?;
@@ -2734,7 +2747,7 @@ fn one_pass(
     let mut h = Hist::new();
     let mut read_s = f64::NAN;
     if passes.read {
-        read_s = read_phase(e.as_mut(), arm, size, reads, &mut h, &mut counting)?;
+        read_s = read_phase(e.as_mut(), arm, size, km, reads, &mut h, &mut counting)?;
     }
 
     // The same reads over each thread count, on the store as loaded and
@@ -2757,6 +2770,7 @@ fn one_pass(
             threads,
             ops,
             size,
+            km,
             READ_THREADED_SEED,
             Op::Get,
             c0.is_some(),
@@ -2790,7 +2804,7 @@ fn one_pass(
         phase_mark(arm, "scan", "start");
         let t = Instant::now();
         for _ in 0..scans {
-            db_key_into(g2.next(), &mut kb);
+            km.key_into(g2.next(), &mut kb);
             if per_op {
                 let t0 = Instant::now();
                 e.range(&kb, plan.scan_len)?;
@@ -2844,6 +2858,7 @@ fn one_pass(
             threads,
             ops,
             scan_keys,
+            km,
             SCAN_THREADED_SEED,
             Op::Range(plan.scan_len),
             c0.is_some(),
@@ -2870,6 +2885,7 @@ fn one_pass(
             &YCSB,
             0,
             size,
+            km,
             mix_ops,
             &mut inserted,
             payload,
@@ -2899,6 +2915,7 @@ fn one_pass(
             threads,
             ops,
             scan_keys,
+            km,
             SCAN_MIXED_SEED,
             Op::Range(plan.scan_len),
             c0.is_some(),
@@ -2931,6 +2948,7 @@ fn one_pass(
             &YCSBS,
             YCSBS_SEED_SALT,
             size,
+            km,
             mix_ops,
             &mut inserted,
             payload,
@@ -3074,6 +3092,7 @@ struct CrashSpecRef<'a> {
     value_size: usize,
     compress: f64,
     shuffled: bool,
+    keys: KeyShape,
 }
 
 #[derive(Deserialize)]
@@ -3086,6 +3105,8 @@ struct CrashSpec {
     value_size: usize,
     compress: f64,
     shuffled: bool,
+    #[serde(default)]
+    keys: KeyShape,
 }
 
 /// The key the load's `i`-th record carries: `i` in key order, and its
@@ -3111,11 +3132,12 @@ pub fn crash_load_child(spec_path: &Path) -> Result<(), String> {
     std::fs::create_dir_all(&spec.dir).map_err(|e| e.to_string())?;
     let mut e = engines::open(&spec.arm, &spec.dir, spec.map_gb)?;
     let perm = spec.shuffled.then(|| Permutation::new(spec.size, 0x5EED));
+    let km = KeyMap::new(spec.keys, spec.size);
     let mut vrng = Rng::new(0xE1);
     let mut buf = Batch::with_capacity(spec.batch, payload.value_size());
     let mut kb = [0u8; KEY_SIZE];
     for i in 0..spec.size {
-        db_key_into(load_key(perm.as_ref(), i), &mut kb);
+        km.key_into(load_key(perm.as_ref(), i), &mut kb);
         buf.push(&kb, payload.get(&mut vrng));
         if buf.len() == spec.batch {
             buf.flush(e.as_mut())?;
@@ -3123,7 +3145,7 @@ pub fn crash_load_child(spec_path: &Path) -> Result<(), String> {
     }
     buf.flush(e.as_mut())?;
     for i in spec.size..spec.size + spec.batch as u64 {
-        db_key_into(i, &mut kb);
+        km.key_into(i, &mut kb);
         buf.push(&kb, payload.get(&mut vrng));
     }
     buf.stage(e.as_mut())?;
@@ -3159,6 +3181,7 @@ fn crash_load(
         value_size: plan.value_size,
         compress: plan.compress,
         shuffled,
+        keys: plan.keys,
     };
     let text = serde_json::to_vec(&spec).map_err(|e| format!("the crash load's spec: {e}"))?;
     std::fs::write(&spec_path, text).map_err(|e| format!("writing the crash load's spec: {e}"))?;
@@ -3213,6 +3236,7 @@ fn unrecovered(
     got: usize,
 ) -> Result<u64, String> {
     let mut kb = [0u8; KEY_SIZE];
+    let km = plan.keymap(size);
     let batch = plan.batch as u64;
     let batches = size.div_ceil(batch);
     let whole = [plan.value_size; 2];
@@ -3223,7 +3247,7 @@ fn unrecovered(
         let (first, last) = (b * batch, ((b + 1) * batch).min(size) - 1);
         let mut read = [0usize; 2];
         for (slot, i) in read.iter_mut().zip([first, last]) {
-            db_key_into(load_key(perm, i), &mut kb);
+            km.key_into(load_key(perm, i), &mut kb);
             *slot = e.get(&kb)?;
         }
         if read == whole {
@@ -3257,7 +3281,7 @@ fn unrecovered(
         ));
     }
     for i in size..size + batch {
-        db_key_into(i, &mut kb);
+        km.key_into(i, &mut kb);
         let n = e.get(&kb)?;
         if n != 0 {
             return Err(format!(
@@ -3301,7 +3325,8 @@ fn recover_store(
     crash_load(arm, dir, size, map_gb, plan, shuffled)?;
     let perm = shuffled.then(|| Permutation::new(size, 0x5EED));
     let mut kb = [0u8; KEY_SIZE];
-    db_key_into(load_key(perm.as_ref(), size.saturating_sub(1)), &mut kb);
+    plan.keymap(size)
+        .key_into(load_key(perm.as_ref(), size.saturating_sub(1)), &mut kb);
     prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
     phase_mark(arm, workload, "start");
     let t = Instant::now();
@@ -3348,6 +3373,7 @@ fn lag_sweep(
     burst_lag: &mut Vec<(u64, f64)>,
 ) -> Result<(), String> {
     let mut kb = [0u8; KEY_SIZE];
+    let km = plan.keymap(size);
     let mut vrng = Rng::new(0x1A5);
     let mut updated = 0u64;
     let mut ug = KeyGen::new(KeyDist::Uniform, size, 0x1A6);
@@ -3382,7 +3408,7 @@ fn lag_sweep(
         let burst_cpu0 = thread_cpu_us();
         let tw = Instant::now();
         while updated < want {
-            db_key_into(ug.next(), &mut kb);
+            km.key_into(ug.next(), &mut kb);
             buf.push(&kb, payload.get(&mut vrng));
             updated += 1;
             if buf.len() == plan.batch {
@@ -3479,7 +3505,7 @@ fn lag_sweep(
         lag_mark(arm, pct, "start");
         let t = Instant::now();
         for _ in 0..scans {
-            db_key_into(g3.next(), &mut kb);
+            km.key_into(g3.next(), &mut kb);
             if per_op {
                 let t0 = Instant::now();
                 e.range(&kb, plan.scan_len)?;
@@ -4125,12 +4151,14 @@ fn thread_seed(seed: u64, i: usize) -> u64 {
 /// blend the readers' faults with the engine's merges beside them.
 // Eight parameters: clippy::too_many_arguments, allowed as `lag_sweep` allows it.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn threaded(
     e: &dyn Engine,
     pass: &str,
     threads: usize,
     ops: u64,
     keys: u64,
+    km: KeyMap,
     seed: u64,
     op: Op,
     count: bool,
@@ -4180,7 +4208,7 @@ fn threaded(
                     let mut r = opened?;
                     let mut bytes = 0u64;
                     for _ in 0..share {
-                        db_key_into(g.next(), &mut kb);
+                        km.key_into(g.next(), &mut kb);
                         bytes += match op {
                             Op::Get => r.get(&kb)?,
                             Op::Range(n) => r.range(&kb, n)?,
@@ -4379,6 +4407,7 @@ fn mix_family(
     table: &[(char, u32, u32, u32, u32, u32, KeyDist); 6],
     seed_salt: u64,
     size: u64,
+    km: KeyMap,
     mix_ops: u64,
     inserted: &mut u64,
     payload: &Payload,
@@ -4426,7 +4455,7 @@ fn mix_family(
         }
         let cb = counting.begin();
         phase_mark(arm, &mix, "start");
-        let secs = ycsb(e, arm, &mix, w, seed_salt, size, mix_ops, inserted, payload)?;
+        let secs = ycsb(e, arm, &mix, w, seed_salt, size, km, mix_ops, inserted, payload)?;
         phase_mark(arm, &mix, "end");
         counting.end(cb, &mix, "", None, mix_ops);
         ops_s.push((letter, mix_ops as f64 / secs));
@@ -4466,6 +4495,7 @@ fn ycsb(
     w: &(char, u32, u32, u32, u32, u32, KeyDist),
     seed_salt: u64,
     size: u64,
+    km: KeyMap,
     ops: u64,
     inserted: &mut u64,
     payload: &Payload,
@@ -4508,26 +4538,26 @@ fn ycsb(
     for _ in 0..ops {
         let roll = pick.below(100) as u32;
         if roll < pread {
-            db_key_into(existing(&mut keys, committed), &mut kb);
+            km.key_into(existing(&mut keys, committed), &mut kb);
             let t0 = kinds.start();
             e.get(&kb)?;
             MixKinds::add(&mut kinds.gets, t0);
         } else if roll < pread + pupd {
-            db_key_into(existing(&mut keys, committed), &mut kb);
+            km.key_into(existing(&mut keys, committed), &mut kb);
             wbuf.push(&kb, payload.get(&mut vrng));
             wbuf_is_insert = false;
         } else if roll < pread + pupd + pins {
-            db_key_into(size + *inserted, &mut kb);
+            km.key_into(size + *inserted, &mut kb);
             *inserted += 1;
             wbuf.push(&kb, payload.get(&mut vrng));
             wbuf_is_insert = true;
         } else if roll < pread + pupd + pins + pscan {
-            db_key_into(existing(&mut keys, committed), &mut kb);
+            km.key_into(existing(&mut keys, committed), &mut kb);
             let t0 = kinds.start();
             e.range(&kb, YCSB_SCAN)?;
             MixKinds::add(&mut kinds.scans, t0);
         } else if prmw > 0 {
-            db_key_into(existing(&mut keys, committed), &mut kb);
+            km.key_into(existing(&mut keys, committed), &mut kb);
             let t0 = kinds.start();
             e.get(&kb)?;
             MixKinds::add(&mut kinds.gets, t0);
@@ -4587,6 +4617,7 @@ pub fn replay_row<E: Engine>(
         threads: usize,
         ops: u64,
         keys: u64,
+        km: KeyMap,
         seed: u64,
         scan: Option<usize>,
     ) -> Result<(), String> {
@@ -4607,7 +4638,7 @@ pub fn replay_row<E: Engine>(
                 }
                 *mine -= 1;
                 left -= 1;
-                db_key_into(g.next(), &mut kb);
+                km.key_into(g.next(), &mut kb);
                 match scan {
                     None => e.get(&kb)?,
                     Some(n) => e.range(&kb, n)?,
@@ -4618,17 +4649,18 @@ pub fn replay_row<E: Engine>(
     }
     let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
     let mut kb = [0u8; KEY_SIZE];
+    let km = plan.keymap(size);
 
     let reads = plan.divided(size);
     let mut g = KeyGen::new(KeyDist::Uniform, size, READ_SEED);
     for _ in 0..reads {
-        db_key_into(g.next(), &mut kb);
+        km.key_into(g.next(), &mut kb);
         e.get(&kb)?;
     }
     phase(e, "read", reads);
     for &threads in &plan.threads {
         let ops = reads * threads as u64;
-        turns(e, threads, ops, size, READ_THREADED_SEED, None)?;
+        turns(e, threads, ops, size, km, READ_THREADED_SEED, None)?;
         phase(e, &format!("read_{threads}t"), ops);
     }
 
@@ -4636,7 +4668,7 @@ pub fn replay_row<E: Engine>(
     let scan_keys = size.saturating_sub(plan.scan_len as u64).max(1);
     let mut g2 = KeyGen::new(KeyDist::Uniform, scan_keys, SCAN_SEED);
     for _ in 0..scans {
-        db_key_into(g2.next(), &mut kb);
+        km.key_into(g2.next(), &mut kb);
         e.range(&kb, plan.scan_len)?;
     }
     phase(e, "scan", scans);
@@ -4647,7 +4679,7 @@ pub fn replay_row<E: Engine>(
      -> Result<(), String> {
         for &threads in &plan.threads {
             let ops = plan.divided(size) * threads as u64;
-            turns(e, threads, ops, scan_keys, seed, Some(plan.scan_len))?;
+            turns(e, threads, ops, scan_keys, km, seed, Some(plan.scan_len))?;
             phase(e, &format!("{name}_{threads}t"), ops);
         }
         Ok(())
@@ -4672,6 +4704,7 @@ pub fn replay_row<E: Engine>(
                 w,
                 salt,
                 size,
+                km,
                 mix_ops,
                 &mut inserted,
                 &payload,
@@ -4699,6 +4732,7 @@ fn load(
     let mut vrng = Rng::new(0xE1);
     let mut buf = Batch::with_capacity(plan.batch, payload.value_size());
     let mut kb = [0u8; KEY_SIZE];
+    let km = plan.keymap(size);
     let io0 = IoCounters::read_now();
     let t = Instant::now();
     let (mut tc, mut tfirst, mut tmax, mut nc) = (0f64, 0f64, 0f64, 0usize);
@@ -4706,7 +4740,7 @@ fn load(
     let cpu0 = thread_cpu_us();
     phase_mark(e.name(), "load", "start");
     for i in 0..size {
-        db_key_into(order(i), &mut kb);
+        km.key_into(order(i), &mut kb);
         buf.push(&kb, payload.get(&mut vrng));
         if buf.len() == plan.batch {
             let t0 = Instant::now();
@@ -5437,7 +5471,18 @@ mod tests {
             // cgroup's; elsewhere the pass counts nothing, as the runner's
             // passes there do.
             let count = cfg!(target_os = "linux");
-            let got = threaded(e.as_ref(), "read", 2, size, size, 1, Op::Get, count).unwrap();
+            let got = threaded(
+                e.as_ref(),
+                "read",
+                2,
+                size,
+                size,
+                KeyMap::numbered(),
+                1,
+                Op::Get,
+                count,
+            )
+            .unwrap();
             assert_eq!(
                 got.bytes,
                 size * plan.value_size as u64,
@@ -5494,6 +5539,7 @@ mod tests {
                 2,
                 scans,
                 size - plan.scan_len as u64,
+                KeyMap::numbered(),
                 2,
                 Op::Range(plan.scan_len),
                 false,
@@ -5745,6 +5791,7 @@ mod tests {
                 &mut e,
                 "supdb-nocachezpages",
                 1_000,
+                KeyMap::numbered(),
                 50,
                 &mut h,
                 &mut counting,
@@ -6206,6 +6253,7 @@ mod tests {
             w,
             salt,
             size,
+            KeyMap::numbered(),
             ops,
             inserted,
             &payload,
