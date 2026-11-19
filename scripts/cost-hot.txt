@@ -1,0 +1,18 @@
+# Functions a store in the clear runs per key, entry, block or step: a gain
+# in any of them is a cost every operation pays (scripts/cost.sh). A line
+# matches a function whose callgrind name contains it.
+supdb::db::Reader::read_all
+supdb::db::Reader::scan
+supdb::db::Db::commit_direct
+supdb::db::Db::append
+supdb::db::Db::put
+supdb::db::Db::delete
+supdb::db::Db::commit
+supdb::db::Wal::write
+supdb::db::Wal::frame
+supdb::db::MemTable::append
+supdb::blob::Blob<B>::read_exts
+supdb::blob::Blob<B>::scan_at
+supdb::flatindex::lookup
+supdb::flatindex::parse_record
+pwritev_all
