@@ -5574,7 +5574,18 @@ counted by the decision before the median of any rate is read, and the
 cell is read as two shapes with the share of each; a count that reads
 level at the median is read in its pairs column too; and a default is not
 drafted in the tree while its last pairing runs, since a draft taken back
-out is a second edit of the files the fix that follows has to touch.
+out is a second edit of the files the fix that follows has to touch. It came again
+as the pass a decision falls in. F under 1 GiB read 0.90x to 0.94x for
+the stride arm in four sittings of six reps, behind in both orders of two
+pairings, and was written down as the arm's. A sitting traced and timed
+by kind laid each rep's F to the mix the hot-raw policy sent its raw
+head partition back to the form in, which is whichever mix the group's
+slack runs out in: a rep whose way back fell in F read it at 565 to 642
+ms and one whose way back fell in D or E at 510 to 593, in either arm
+and but for one rep at 726 on its commits, and the arm's fell in F in
+three reps of six where the default's fell there in one. In the same shape the arm was not behind. The corollary: a
+decision every rep makes once still splits a cell in two when the pass
+it is made in varies, so the reps are counted by the pass it fell in.
 
 **A wait on the first counter of a turn, and a fix for it that the race
 made wide refuted.** The tests step the controller by moving its injected
