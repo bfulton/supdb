@@ -19,8 +19,15 @@ fn key(k: u32) -> Vec<u8> {
 /// closed by a flush, a table of scattered updates sealed by the next --
 /// its seal sorts the table -- and the merge of that piece into the
 /// partition the run became, joined by the settle. What it leaves on
-/// disk, by name, and how many of its jobs' arrays became mappings.
-fn life(name: &str, mapped: bool) -> (BTreeMap<String, Vec<u8>>, usize, Vec<(Vec<u8>, usize)>) {
+/// disk, by name, how many of its jobs' arrays became mappings, by which
+/// array, and what a scan of it read.
+type Life = (
+    BTreeMap<String, Vec<u8>>,
+    Vec<(&'static str, usize)>,
+    Vec<(Vec<u8>, usize)>,
+);
+
+fn life(name: &str, mapped: bool) -> Life {
     let d = std::env::temp_dir().join(format!(
         "supdb-next-jobsmapped-{name}-{}",
         std::process::id()
@@ -29,8 +36,13 @@ fn life(name: &str, mapped: bool) -> (BTreeMap<String, Vec<u8>>, usize, Vec<(Vec
     std::fs::create_dir_all(&d).unwrap();
     let opts = Options {
         jobs_mapped: mapped,
-        // One seal a flush and none between: the jobs are the test's.
+        // One seal a flush and none between, so the jobs are the test's
+        // and the table the second flush seals holds every key: neither
+        // the byte threshold nor the cap at a share of the store, which
+        // sealed the updates a seventh at a time, each table's order too
+        // small to be a mapping.
         seal_bytes: 1 << 30,
+        seal_max_pct: 0,
         ..common::options()
     };
     let maps_before = Db::job_buffers_mapped();
@@ -65,7 +77,11 @@ fn life(name: &str, mapped: bool) -> (BTreeMap<String, Vec<u8>>, usize, Vec<(Vec
     )
     .unwrap();
     db.close().unwrap();
-    let made = Db::job_buffers_mapped() - maps_before;
+    let made: Vec<(&'static str, usize)> = Db::job_buffers_mapped()
+        .into_iter()
+        .zip(maps_before)
+        .map(|((site, after), (_, before))| (site, after - before))
+        .collect();
     let mut files = BTreeMap::new();
     for e in std::fs::read_dir(&d).unwrap() {
         let p = e.unwrap().path();
@@ -91,16 +107,20 @@ fn life(name: &str, mapped: bool) -> (BTreeMap<String, Vec<u8>>, usize, Vec<(Vec
 fn a_jobs_large_arrays_are_mapped_and_the_store_is_the_same() {
     let mapped_before = Db::mapped_bytes();
     let (heap_files, heap_made, heap_read) = life("heap", false);
-    assert_eq!(heap_made, 0, "off, no job's array is a mapping");
+    assert!(
+        heap_made.iter().all(|&(_, n)| n == 0),
+        "off, no job's array is a mapping: {heap_made:?}"
+    );
     assert_eq!(Db::mapped_bytes(), mapped_before, "the heap store closed");
     let (map_files, map_made, map_read) = life("mapped", true);
-    // The seal's sort alone is two arrays of a megabyte and a half; the
-    // merge's writer holds four, its builder two, its key list two and
-    // its finish a trailer, and the run's close a trailer of its own.
-    assert!(
-        map_made >= 12,
-        "on, the jobs' large arrays became mappings: {map_made}"
-    );
+    // Every array the option names, each large at sixty thousand keys:
+    // the seal's sort and its order, the writer's four and the builder's
+    // two for the piece it writes and for the merge's output, the
+    // merge's key list, and a trailer at every finish.
+    assert_eq!(map_made.len(), 12, "the sites the option names");
+    for &(site, n) in &map_made {
+        assert!(n > 0, "on, no {site} array became a mapping: {map_made:?}");
+    }
     assert_eq!(
         Db::mapped_bytes(),
         mapped_before,

@@ -234,8 +234,8 @@ impl Builder {
     /// are large where `mapped` (`Options::jobs_mapped`).
     pub(crate) fn new_in(mapped: bool) -> Builder {
         Builder {
-            starts: crate::db::blocks::BigVec::new(mapped),
-            bytes: crate::db::blocks::BigVec::new(mapped),
+            starts: crate::db::blocks::BigVec::new(crate::db::blocks::Site::IndexStarts, mapped),
+            bytes: crate::db::blocks::BigVec::new(crate::db::blocks::Site::IndexKeys, mapped),
             n: 0,
         }
     }

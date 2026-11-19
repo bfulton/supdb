@@ -17155,11 +17155,9 @@ mod tests {
                 let engine = seven(&supdb::Options::default());
                 assert_eq!(seven(b), engine);
                 type Make = fn(&Path) -> Res<Supdb>;
-                let arms: [(
-                    &str,
-                    Make,
-                    (supdb::ZStride, bool, bool, bool, bool, bool, bool),
-                ); 13] = [
+                type Seven = (supdb::ZStride, bool, bool, bool, bool, bool, bool);
+                type Arm = (&'static str, Make, Seven);
+                let arms: [Arm; 13] = [
                     (
                         "supdb-zblock",
                         Supdb::create_zblock,

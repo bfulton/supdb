@@ -5564,6 +5564,33 @@ level at the median is read in its pairs column too; and a default is not
 drafted in the tree while its last pairing runs, since a draft taken back
 out is a second edit of the files the fix that follows has to touch.
 
+**A wait on the first counter of a turn, and a fix for it that the race
+made wide refuted.** The tests step the controller by moving its injected
+clock and waiting for the selector's step count to move (`advance_tick`),
+and a tick steps the selector first and its policies look after: the
+hot-raw policy's, the conversion's. The test of the ordered index's second
+drop read, after one such wait, whether the hot-raw policy had asked for a
+partition, between that tick's step and its look: one run in ten beside a
+build, none of ten alone. It surfaced in a run of the whole suite under
+another option's switch and read as that option's for the quarter of an
+hour it took to run the test ten times each way. The first fix waited for
+the look's own count at the one step whose result was read, and passed
+twenty runs of twenty beside the build. Held to the race made wide, sixty
+milliseconds of sleep put before the look, it failed every run and the
+test without it passed every run: the tick before's look, late, ran after
+the test had moved the budget and heated the partition, and asked a tick
+early, which the unfixed test read as the ask it was waiting for and the
+fixed one waited past, into the release. Every tick's wait has to cover
+the tick, not the one whose counts are read. A tick counts its end now
+(`ZCounts::tick_ends`), behind its builder's turn and its looks, and the
+tests' wait is on that; the test passes with the sleep in. The rules: a
+wait covers everything of the turn that the test will read, and
+everything of it that reads what the test changes next, so it names the
+counter the turn moves last; a fix for a race is held to the race made
+wide before it is believed, since a fix that narrows the window passes
+every run that the unfixed test passes; and a failure met under a switch
+is run without the switch, as many times, before it is the switch's.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

@@ -788,6 +788,13 @@ pub struct ZCounts {
     pub phase: u8,
     pub auto_inert: u64,
     pub sel_steps: u64,
+    /// The controller's ticks that stepped the selector and have ended:
+    /// counted after everything a tick does behind the step, the
+    /// builder's turn and the policies' looks. `sel_steps` moves as the
+    /// tick begins, so a test that steps the controller waits on this
+    /// one, or it reads the store, and changes what the looks read,
+    /// between a step and its looks.
+    pub tick_ends: u64,
     pub sel_s1: u64,
     pub sel_switches: u64,
     pub sel_trials: u64,
@@ -10067,8 +10074,8 @@ impl SegmentWriter {
             builder: BlockBuilder::new(block_size),
             block_size,
             blocks: Vec::new(),
-            key_arena: blocks::BigVec::new(opts.buffers_mapped),
-            spans: blocks::BigVec::new(opts.buffers_mapped),
+            key_arena: blocks::BigVec::new(blocks::Site::WriterKeys, opts.buffers_mapped),
+            spans: blocks::BigVec::new(blocks::Site::WriterSpans, opts.buffers_mapped),
             exts: Vec::new(),
             open_key: None,
             run: Vec::new(),
@@ -10094,8 +10101,8 @@ impl SegmentWriter {
             tail_spans: Vec::new(),
             mode: None,
             recs_len: 0,
-            rec_offs: blocks::BigVec::new(opts.buffers_mapped),
-            hashes: blocks::BigVec::new(opts.buffers_mapped),
+            rec_offs: blocks::BigVec::new(blocks::Site::WriterOffs, opts.buffers_mapped),
+            hashes: blocks::BigVec::new(blocks::Site::WriterHashes, opts.buffers_mapped),
             rec_buf: Vec::new(),
             batch_buf: Vec::new(),
             pending_blocks: Vec::new(),
@@ -11125,7 +11132,7 @@ impl SegmentWriter {
                         // caller's own composition told of it as it goes.
                         let mut b = BloomFill::new(BlockedBloom::with_capacity(n), self.lookahead);
                         let r = flatindex::stream_trailer_in(
-                            blocks::BigVec::new(self.buffers_mapped),
+                            blocks::BigVec::new(blocks::Site::Trailer, self.buffers_mapped),
                             n,
                             self.recs_len,
                             &|i| src.key_at(i),
@@ -11151,7 +11158,7 @@ impl SegmentWriter {
                             &arena[s..s + l]
                         };
                         flatindex::stream_trailer_in(
-                            blocks::BigVec::new(self.buffers_mapped),
+                            blocks::BigVec::new(blocks::Site::Trailer, self.buffers_mapped),
                             spans.len(),
                             self.recs_len,
                             &key_at,
@@ -14975,12 +14982,13 @@ impl MemTable {
     /// key between them, on the seal's thread, for the length of the sort.
     fn slots_in_key_order(&self, mapped: bool) -> blocks::BigVec<u32> {
         let n = self.len();
-        let mut recs: blocks::BigVec<(u64, u64, u32)> = blocks::BigVec::with_capacity(n, mapped);
+        let mut recs: blocks::BigVec<(u64, u64, u32)> =
+            blocks::BigVec::with_capacity(n, blocks::Site::SortRecs, mapped);
         for i in 0..n {
             let (a, b) = key_prefix(self.key_of(self.entry(i)));
             recs.push((a, b, i as u32));
         }
-        let mut scratch = blocks::BigVec::new(mapped);
+        let mut scratch = blocks::BigVec::new(blocks::Site::SortScratch, mapped);
         radix_by_prefix(&mut recs, &mut scratch);
         let mut i = 0;
         while i < recs.len() {
@@ -14996,7 +15004,7 @@ impl MemTable {
             }
             i = j;
         }
-        let mut order = blocks::BigVec::with_capacity(recs.len(), mapped);
+        let mut order = blocks::BigVec::with_capacity(recs.len(), blocks::Site::SortOrder, mapped);
         for r in recs.iter() {
             order.push(r.2);
         }
@@ -16232,10 +16240,10 @@ impl KeyList {
     /// An empty list; `mapped` is where its buffers live once they are
     /// large (`Options::jobs_mapped`).
     fn new(mapped: bool) -> KeyList {
-        let mut offs = blocks::BigVec::new(mapped);
+        let mut offs = blocks::BigVec::new(blocks::Site::ListOffs, mapped);
         offs.push(0);
         KeyList {
-            bytes: blocks::BigVec::new(mapped),
+            bytes: blocks::BigVec::new(blocks::Site::ListKeys, mapped),
             offs,
         }
     }
@@ -16307,12 +16315,7 @@ struct Slicer<'a> {
 }
 
 impl<'a> Slicer<'a> {
-    fn new(
-        fences: Option<&'a [Fence]>,
-        parts: usize,
-        max_keys: usize,
-        mapped: bool,
-    ) -> Slicer<'a> {
+    fn new(fences: Option<&'a [Fence]>, parts: usize, max_keys: usize, mapped: bool) -> Slicer<'a> {
         Slicer {
             fences,
             parts,
@@ -24302,6 +24305,7 @@ impl Reader {
             phase: get(&ev.phase) as u8,
             auto_inert: u64::from(z_auto_inert(&self.opts)),
             sel_steps: get(&ev.sel_steps),
+            tick_ends: get(&ev.tick_ends),
             sel_s1: get(&ev.sel_s1),
             sel_switches: get(&ev.sel_switches),
             sel_trials: get(&ev.sel_trials),
@@ -35946,7 +35950,11 @@ impl Db {
             });
             let order: blocks::BigVec<u32> = match &have {
                 Some(h) => {
-                    let mut order = blocks::BigVec::with_capacity(h.ents.len(), jobs_mapped);
+                    let mut order = blocks::BigVec::with_capacity(
+                        h.ents.len(),
+                        blocks::Site::SortOrder,
+                        jobs_mapped,
+                    );
                     for e in h.ents.iter() {
                         order.push(e.frozen);
                     }
@@ -41905,9 +41913,10 @@ impl Db {
     /// engine's own (`Options::jobs_mapped`), process-wide and ever: a
     /// seal's sort, a segment writer's per-key arrays, an ordered index
     /// builder's keys, a merge's key list, a finish's trailer, each
-    /// counted once as it passes `blocks::MAP_FROM` bytes.
+    /// counted once as it passes `blocks::MAP_FROM` bytes, by which of
+    /// those arrays it is (`blocks::Site`).
     #[doc(hidden)]
-    pub fn job_buffers_mapped() -> usize {
+    pub fn job_buffers_mapped() -> Vec<(&'static str, usize)> {
         blocks::big_maps()
     }
 
@@ -49874,6 +49883,7 @@ impl Maint {
         }
         self.z_last_d = Some(d);
         self.z_drive(&d);
+        zfile::ZEvents::add(&self.shared.z.tick_ends, 1);
     }
 
     /// Whether a job of the builder's has ended and waits to be taken in.

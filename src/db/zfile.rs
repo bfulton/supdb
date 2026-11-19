@@ -6196,6 +6196,9 @@ pub(super) struct ZEvents {
     pub phase: AtomicU64,
     pub census: AtomicU64,
     pub sel_steps: AtomicU64,
+    /// The ticks that stepped the selector and have ended, their builder's
+    /// turn and their policies' looks done (`ZCounts::tick_ends`).
+    pub tick_ends: AtomicU64,
     pub sel_s1: AtomicU64,
     pub sel_switches: AtomicU64,
     pub sel_trials: AtomicU64,

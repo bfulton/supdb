@@ -41,13 +41,64 @@ const ALIGN: usize = 64;
 
 static MAPPED: AtomicUsize = AtomicUsize::new(0);
 
-/// The `BigVec` buffers that became mappings, process-wide, ever: what a
-/// test holds `Options::jobs_mapped` to having done.
-static BIG_MAPS: AtomicUsize = AtomicUsize::new(0);
+/// Which of a job's arrays a `BigVec` is: the count of those that became
+/// mappings is kept by it, so a test holds `Options::jobs_mapped` to
+/// having reached each array it names and not only some.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Site {
+    /// A seal's sort of its table: the records it sorts, the sort's
+    /// scratch, and the order it answers.
+    SortRecs,
+    SortScratch,
+    SortOrder,
+    /// A segment writer's copy of every key, the keys' spans in it, the
+    /// records' offsets and the keys' hashes.
+    WriterKeys,
+    WriterSpans,
+    WriterOffs,
+    WriterHashes,
+    /// The trailer a finish composes: the directory and the hash slots.
+    Trailer,
+    /// An ordered index builder's copy of the keys and where each starts.
+    IndexKeys,
+    IndexStarts,
+    /// A merge's key list: the keys cut short and where each starts.
+    ListKeys,
+    ListOffs,
+    /// A unit test's.
+    #[cfg(test)]
+    Test,
+}
 
-/// The count of `BigVec` buffers that have become mappings.
-pub(crate) fn big_maps() -> usize {
-    BIG_MAPS.load(Ordering::Relaxed)
+impl Site {
+    /// The sites a store's jobs have, in the order `big_maps` answers.
+    pub(crate) const ALL: [(Site, &'static str); 12] = [
+        (Site::SortRecs, "sort records"),
+        (Site::SortScratch, "sort scratch"),
+        (Site::SortOrder, "sort order"),
+        (Site::WriterKeys, "writer keys"),
+        (Site::WriterSpans, "writer spans"),
+        (Site::WriterOffs, "writer offsets"),
+        (Site::WriterHashes, "writer hashes"),
+        (Site::Trailer, "trailer"),
+        (Site::IndexKeys, "index keys"),
+        (Site::IndexStarts, "index starts"),
+        (Site::ListKeys, "list keys"),
+        (Site::ListOffs, "list offsets"),
+    ];
+}
+
+/// The `BigVec` buffers that became mappings, by site, process-wide,
+/// ever: what a test holds `Options::jobs_mapped` to having done.
+static BIG_MAPS: [AtomicUsize; 13] = [const { AtomicUsize::new(0) }; 13];
+
+/// The count of `BigVec` buffers that have become mappings, by site, as
+/// `Site::ALL` names them.
+pub(crate) fn big_maps() -> Vec<(&'static str, usize)> {
+    Site::ALL
+        .iter()
+        .map(|&(s, name)| (name, BIG_MAPS[s as usize].load(Ordering::Relaxed)))
+        .collect()
 }
 
 /// The mapped blocks alive, each by its address and length, for the
@@ -167,16 +218,20 @@ pub(crate) unsafe fn free(p: *mut u8, len: usize, mapped: bool) {
 /// # Safety
 /// `p` came from `alloc` or `regrow` with `old` and this `mapped`, `used`
 /// is no more than `old`, and nothing reads `p` after.
-pub(crate) unsafe fn regrow(p: *mut u8, old: usize, new: usize, used: usize, mapped: bool) -> *mut u8 {
+pub(crate) unsafe fn regrow(
+    p: *mut u8,
+    old: usize,
+    new: usize,
+    used: usize,
+    mapped: bool,
+) -> *mut u8 {
     debug_assert!(new > old && used <= old, "a block grown");
     #[cfg(target_os = "linux")]
     {
         if maps(old, mapped) && maps(new, mapped) {
             // SAFETY: `p` is a mapping of `old` bytes made by `map` or by
             // this; the kernel moves it where it cannot grow in place.
-            let q = unsafe {
-                libc::mremap(p as *mut libc::c_void, old, new, libc::MREMAP_MAYMOVE)
-            };
+            let q = unsafe { libc::mremap(p as *mut libc::c_void, old, new, libc::MREMAP_MAYMOVE) };
             assert!(q != libc::MAP_FAILED, "block: out of memory (mremap)");
             {
                 let mut l = live();
@@ -199,25 +254,32 @@ pub(crate) unsafe fn regrow(p: *mut u8, old: usize, new: usize, used: usize, map
     q
 }
 
-/// A job's large array: a vector of plain values that grows as `Vec`
-/// does and whose buffer, from `MAP_FROM` bytes on and where `mapped`
-/// says so, is a mapping of the engine's own, unmapped at its drop
-/// (`Options::jobs_mapped`). A seal's sort, a segment's writer, an ordered
-/// index's builder and a merge's key list each hold tens of bytes a key
-/// for as long as the job runs and nothing after it, on a thread that
-/// ends with the job: from the allocator they stay in that thread's
-/// arena, whose top glibc keeps up to twice the largest chunk the process
-/// has mapped and freed, resident and nobody's, tens of megabytes an
-/// arena under a memory bound that has page cache to hold with them
-/// (`docs/engine.md`, which form a workload calls for). Below `MAP_FROM`
-/// the buffer is the allocator's whatever the option, as a block's is. A
-/// mapping grows by `mremap`, its pages moved and never copied, and what
-/// of it was never written is resident nowhere.
+/// A job's large array: a vector of plain values that is a `Vec` and
+/// nothing else until, where `mapped` says so, its buffer would be
+/// `MAP_FROM` bytes or more, and from there a mapping of the engine's
+/// own, unmapped at its drop (`Options::jobs_mapped`). A seal's sort, a
+/// segment's writer, an ordered index's builder and a merge's key list
+/// each hold tens of bytes a key for as long as the job runs and nothing
+/// after it, on a thread that ends with the job: from the allocator they
+/// stay in that thread's arena, whose top glibc keeps up to twice the
+/// largest chunk the process has mapped and freed, resident and
+/// nobody's, tens of megabytes an arena under a memory bound that has
+/// page cache to hold with them (`docs/engine.md`, which form a workload
+/// calls for). With `mapped` off it is the `Vec` it was, the allocator
+/// asked for exactly what a `Vec` asks. A mapping grows by `mremap`, its
+/// pages moved and never copied, and what of it was never written is
+/// resident nowhere.
 pub(crate) struct BigVec<T: Copy> {
-    p: std::ptr::NonNull<T>,
+    /// The buffer while it is the allocator's; empty, with no buffer,
+    /// once `map` holds the values.
+    heap: Vec<T>,
+    /// The buffer once it is a mapping, of `cap` values with the first
+    /// `len` written; null until then.
+    map: *mut T,
     len: usize,
     cap: usize,
     mapped: bool,
+    site: Site,
 }
 
 // SAFETY: a `BigVec` owns its buffer of plain values, as a `Vec` does.
@@ -229,105 +291,177 @@ impl<T: Copy> BigVec<T> {
     /// A value with a size, aligned within a block's alignment.
     const FITS: () = assert!(std::mem::size_of::<T>() > 0 && std::mem::align_of::<T>() <= ALIGN);
 
-    /// The smallest buffer made, in bytes: a cache line.
-    const MIN_BYTES: usize = ALIGN;
-
-    /// No buffer yet; `mapped` is whether a large one will be a mapping.
-    pub(crate) fn new(mapped: bool) -> BigVec<T> {
+    /// No buffer yet; `mapped` is whether a large one will be a mapping,
+    /// and `site` which of a job's arrays this is.
+    pub(crate) fn new(site: Site, mapped: bool) -> BigVec<T> {
         let () = Self::FITS;
         BigVec {
-            p: std::ptr::NonNull::dangling(),
+            heap: Vec::new(),
+            map: std::ptr::null_mut(),
             len: 0,
             cap: 0,
             mapped,
+            site,
         }
     }
 
-    /// Room for `n` values, none of it touched.
-    pub(crate) fn with_capacity(n: usize, mapped: bool) -> BigVec<T> {
-        let mut v = BigVec::new(mapped);
-        v.reserve(n);
+    /// Room for `n` values, none of it touched: a mapping from the start
+    /// where that is large and `mapped`.
+    pub(crate) fn with_capacity(n: usize, site: Site, mapped: bool) -> BigVec<T> {
+        let mut v = BigVec::new(site, mapped);
+        if !v.become_mapping(n) {
+            v.heap = Vec::with_capacity(n);
+        }
         v
     }
 
     /// The values the buffer has room for.
+    #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
-        self.cap
+        if self.map.is_null() {
+            self.heap.capacity()
+        } else {
+            self.cap
+        }
     }
 
     /// Whether the buffer is a mapping as it stands.
+    #[cfg(test)]
     pub(crate) fn is_mapped(&self) -> bool {
-        self.cap > 0 && maps(self.cap * std::mem::size_of::<T>(), self.mapped)
+        !self.map.is_null()
+    }
+
+    /// The allocator's buffer left for a mapping of `cap` values, where
+    /// `mapped` says so and that many are `MAP_FROM` bytes or more:
+    /// whether it was. The values move once, here; the mapping's own
+    /// growths after this copy nothing.
+    #[cold]
+    fn become_mapping(&mut self, cap: usize) -> bool {
+        debug_assert!(self.map.is_null());
+        let size = std::mem::size_of::<T>();
+        let bytes = cap.checked_mul(size).expect("BigVec: capacity overflow");
+        if !maps(bytes, self.mapped) {
+            return false;
+        }
+        let p = alloc(bytes, false, true) as *mut T;
+        // SAFETY: `p` is `cap` values just mapped, `cap` at least the
+        // `Vec`'s length by every caller's choice of it, and apart from
+        // the `Vec`'s buffer.
+        unsafe { std::ptr::copy_nonoverlapping(self.heap.as_ptr(), p, self.heap.len()) };
+        self.len = self.heap.len();
+        self.cap = cap;
+        self.map = p;
+        self.heap = Vec::new();
+        BIG_MAPS[self.site as usize].fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Before the `Vec` grows to hold `more` values past its length: the
+    /// mapping in its place where the buffer it would grow to is large,
+    /// sized as the `Vec` would size it, twice what it held or what is
+    /// asked. Whether the values are in a mapping now.
+    #[cold]
+    fn outgrow(&mut self, more: usize) -> bool {
+        let want = self
+            .heap
+            .len()
+            .checked_add(more)
+            .expect("BigVec: capacity overflow");
+        self.become_mapping(want.max(self.heap.capacity().saturating_mul(2)))
+    }
+
+    /// The mapping grown to hold at least `want` values, and at least
+    /// twice what it held, so pushes are amortised as a `Vec`'s are.
+    #[cold]
+    fn grow_map(&mut self, want: usize) {
+        let size = std::mem::size_of::<T>();
+        let cap = want.max(self.cap.saturating_mul(2));
+        let bytes = cap.checked_mul(size).expect("BigVec: capacity overflow");
+        // SAFETY: the mapping is `self.cap * size` bytes from `alloc` or
+        // `regrow`, mapped, its first `self.len` values written, and
+        // `self.map` is replaced below.
+        let p = unsafe {
+            regrow(
+                self.map as *mut u8,
+                self.cap * size,
+                bytes,
+                self.len * size,
+                true,
+            )
+        };
+        self.map = p as *mut T;
+        self.cap = cap;
     }
 
     /// Room for `more` values past the length.
     pub(crate) fn reserve(&mut self, more: usize) {
-        let want = self.len.checked_add(more).expect("BigVec: capacity overflow");
-        if want > self.cap {
-            self.grow(want);
-        }
-    }
-
-    /// The buffer made to hold at least `want` values, and at least twice
-    /// what it held, so pushes are amortised as a `Vec`'s are.
-    #[cold]
-    fn grow(&mut self, want: usize) {
-        let size = std::mem::size_of::<T>();
-        let cap = want
-            .max(self.cap.saturating_mul(2))
-            .max(Self::MIN_BYTES.div_ceil(size));
-        let bytes = cap.checked_mul(size).expect("BigVec: capacity overflow");
-        if maps(bytes, self.mapped) && !maps(self.cap * size, self.mapped) {
-            BIG_MAPS.fetch_add(1, Ordering::Relaxed);
-        }
-        let p = if self.cap == 0 {
-            alloc(bytes, false, self.mapped)
-        } else {
-            // SAFETY: the buffer is `self.cap * size` bytes from `alloc`
-            // or `regrow` under this `mapped`, its first `self.len`
-            // values written, and `self.p` is replaced below.
-            unsafe {
-                regrow(
-                    self.p.as_ptr() as *mut u8,
-                    self.cap * size,
-                    bytes,
-                    self.len * size,
-                    self.mapped,
-                )
+        if self.map.is_null() {
+            let full = self.heap.capacity() - self.heap.len() < more;
+            if !(self.mapped && full && self.outgrow(more)) {
+                self.heap.reserve(more);
+                return;
             }
-        };
-        self.p = std::ptr::NonNull::new(p as *mut T).expect("a block is never null");
-        self.cap = cap;
+        }
+        let want = self
+            .len
+            .checked_add(more)
+            .expect("BigVec: capacity overflow");
+        if want > self.cap {
+            self.grow_map(want);
+        }
     }
 
     #[inline]
     pub(crate) fn push(&mut self, v: T) {
-        if self.len == self.cap {
-            self.grow(self.len + 1);
+        if self.map.is_null() {
+            let full = self.heap.len() == self.heap.capacity();
+            if !(self.mapped && full && self.outgrow(1)) {
+                self.heap.push(v);
+                return;
+            }
         }
-        // SAFETY: `self.len < self.cap`, inside the buffer.
-        unsafe { self.p.as_ptr().add(self.len).write(v) };
+        if self.len == self.cap {
+            self.grow_map(self.len + 1);
+        }
+        // SAFETY: `self.len < self.cap`, inside the mapping.
+        unsafe { self.map.add(self.len).write(v) };
         self.len += 1;
     }
 
     #[inline]
     pub(crate) fn extend_from_slice(&mut self, s: &[T]) {
-        self.reserve(s.len());
-        // SAFETY: room for `s.len()` values past the length was just
-        // reserved, and `s` borrows nothing of this buffer mutably.
-        unsafe {
-            std::ptr::copy_nonoverlapping(s.as_ptr(), self.p.as_ptr().add(self.len), s.len());
+        if self.map.is_null() {
+            let full = self.heap.capacity() - self.heap.len() < s.len();
+            if !(self.mapped && full && self.outgrow(s.len())) {
+                self.heap.extend_from_slice(s);
+                return;
+            }
         }
+        if self.cap - self.len < s.len() {
+            self.grow_map(self.len + s.len());
+        }
+        // SAFETY: room for `s.len()` values past the length, and `s`
+        // borrows nothing of this buffer mutably.
+        unsafe { std::ptr::copy_nonoverlapping(s.as_ptr(), self.map.add(self.len), s.len()) };
         self.len += s.len();
     }
 
     /// `n` values long: cut short, or filled out with `v`.
     pub(crate) fn resize(&mut self, n: usize, v: T) {
+        if self.map.is_null() {
+            let full = n > self.heap.capacity();
+            if !(self.mapped && full && self.outgrow(n - self.heap.len())) {
+                self.heap.resize(n, v);
+                return;
+            }
+        }
         if n > self.len {
-            self.reserve(n - self.len);
+            if n > self.cap {
+                self.grow_map(n);
+            }
             for i in self.len..n {
                 // SAFETY: `i < n <= self.cap`.
-                unsafe { self.p.as_ptr().add(i).write(v) };
+                unsafe { self.map.add(i).write(v) };
             }
         }
         self.len = n;
@@ -335,12 +469,8 @@ impl<T: Copy> BigVec<T> {
 
     /// No values, the buffer kept.
     pub(crate) fn clear(&mut self) {
+        self.heap.clear();
         self.len = 0;
-    }
-
-    /// At most `n` values.
-    pub(crate) fn truncate(&mut self, n: usize) {
-        self.len = self.len.min(n);
     }
 }
 
@@ -348,30 +478,35 @@ impl<T: Copy> std::ops::Deref for BigVec<T> {
     type Target = [T];
     #[inline]
     fn deref(&self) -> &[T] {
-        // SAFETY: the first `self.len` values are written; with no buffer
-        // the pointer is dangling and aligned and the length zero.
-        unsafe { std::slice::from_raw_parts(self.p.as_ptr(), self.len) }
+        if self.map.is_null() {
+            return &self.heap;
+        }
+        // SAFETY: the mapping's first `self.len` values are written.
+        unsafe { std::slice::from_raw_parts(self.map, self.len) }
     }
 }
 
 impl<T: Copy> std::ops::DerefMut for BigVec<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
+        if self.map.is_null() {
+            return &mut self.heap;
+        }
         // SAFETY: as `deref`, and the borrow is exclusive.
-        unsafe { std::slice::from_raw_parts_mut(self.p.as_ptr(), self.len) }
+        unsafe { std::slice::from_raw_parts_mut(self.map, self.len) }
     }
 }
 
 impl<T: Copy> Drop for BigVec<T> {
     fn drop(&mut self) {
-        if self.cap > 0 {
-            // SAFETY: the buffer is `self.cap` values from `alloc` or
-            // `regrow` under this `mapped`, and nothing reads it after.
+        if !self.map.is_null() {
+            // SAFETY: the mapping is `self.cap` values from `alloc` or
+            // `regrow`, mapped, and nothing reads it after.
             unsafe {
                 free(
-                    self.p.as_ptr() as *mut u8,
+                    self.map as *mut u8,
                     self.cap * std::mem::size_of::<T>(),
-                    self.mapped,
+                    true,
                 )
             };
         }
@@ -492,30 +627,36 @@ mod tests {
     }
 
     /// A `BigVec` holds what a `Vec` fed the same calls holds, through
-    /// every growth: from no buffer, through the allocator's, across
-    /// `MAP_FROM` into a mapping and through the mapping's own growths,
-    /// under either setting; and it is a mapping exactly from `MAP_FROM`
-    /// bytes on where the setting says so.
+    /// every growth: a `Vec` itself until its buffer would be `MAP_FROM`
+    /// bytes, then a mapping through the mapping's own growths where the
+    /// setting says so, and a `Vec` to the end where it does not.
     #[test]
     fn a_bigvec_is_a_vec_through_every_growth() {
         for mapped in [true, false] {
-            let mut b: BigVec<(u64, u64, u32)> = BigVec::new(mapped);
+            let mut b: BigVec<(u64, u64, u32)> = BigVec::new(Site::Test, mapped);
             let mut v: Vec<(u64, u64, u32)> = Vec::new();
             assert!(b.is_empty() && !b.is_mapped() && b.capacity() == 0);
             assert_eq!(&b[..], &v[..]);
             let mut was_heap = false;
             let mut grew_mapped = 0;
-            let mut last_cap = 0;
             for i in 0..40_000u64 {
+                let before = (b.capacity(), b.is_mapped());
                 b.push((i, !i, i as u32));
                 v.push((i, !i, i as u32));
-                if b.capacity() != last_cap {
-                    if b.is_mapped() && last_cap * 24 >= MAP_FROM {
+                if b.capacity() != before.0 {
+                    if before.1 {
                         grew_mapped += 1;
                     }
                     was_heap |= !b.is_mapped();
-                    last_cap = b.capacity();
-                    assert_eq!(&b[..], &v[..], "after a growth to {last_cap}");
+                    assert_eq!(&b[..], &v[..], "after a growth to {}", b.capacity());
+                    assert_eq!(
+                        b.is_mapped(),
+                        maps(b.capacity() * 24, mapped),
+                        "a mapping from MAP_FROM on, and only there"
+                    );
+                    if !b.is_mapped() {
+                        assert_eq!(b.capacity(), v.capacity(), "a `Vec` while it is one");
+                    }
                 }
             }
             assert_eq!(&b[..], &v[..]);
@@ -523,44 +664,68 @@ mod tests {
             assert_eq!(
                 live()
                     .iter()
-                    .any(|&(a, n)| a == b.p.as_ptr() as usize && n == b.capacity() * 24),
+                    .any(|&(a, n)| a == b.as_ptr() as usize && n == b.capacity() * 24),
                 mapped,
                 "a mapped buffer is listed for the resident count"
             );
-            assert_eq!(
-                b.is_mapped(),
-                maps(b.capacity() * 24, mapped),
-                "a mapping from MAP_FROM on"
-            );
             assert!(was_heap, "the first buffers are the allocator's");
             if mapped {
-                assert!(grew_mapped >= 2, "a mapping grown as one: {grew_mapped}");
+                // Grown as one, and by doubling: three growths from the
+                // eight thousand values it was mapped with to these, where
+                // a growth a push would be thirty thousand moves.
+                assert!(
+                    (2..=4).contains(&grew_mapped),
+                    "a mapping grown as one, by doubling: {grew_mapped}"
+                );
             }
             b.extend_from_slice(&v[..1000]);
             v.extend_from_within(..1000);
             assert_eq!(&b[..], &v[..]);
-            b.resize(50_000, (7, 7, 7));
-            v.resize(50_000, (7, 7, 7));
-            assert_eq!(&b[..], &v[..]);
+            b.resize(120_000, (7, 7, 7));
+            v.resize(120_000, (7, 7, 7));
+            assert_eq!(&b[..], &v[..], "a resize past the room");
+            b.reserve(200_000);
+            assert!(b.capacity() >= 320_000 && b.len() == 120_000);
+            assert_eq!(&b[..], &v[..], "a reserve keeps the values");
             b[3].0 = 99;
             v[3].0 = 99;
-            b.truncate(10);
-            v.truncate(10);
-            assert_eq!(&b[..], &v[..]);
-            b.truncate(20);
-            assert_eq!(b.len(), 10, "truncate never lengthens");
-            b.resize(5, (0, 0, 0));
-            assert_eq!(b.len(), 5);
+            b.resize(10, (0, 0, 0));
+            v.resize(10, (0, 0, 0));
+            assert_eq!(&b[..], &v[..], "a resize that cuts short");
             let cap = b.capacity();
             b.clear();
-            assert!(b.is_empty() && b.capacity() == cap, "clear keeps the buffer");
+            assert!(
+                b.is_empty() && b.capacity() == cap,
+                "clear keeps the buffer"
+            );
+            b.push((1, 2, 3));
+            assert_eq!(&b[..], &[(1, 2, 3)]);
         }
         // Room asked for up front is one buffer of that size, a mapping
-        // from the start where it is large, and nothing of it is touched.
-        let big: BigVec<u64> = BigVec::with_capacity(MAP_FROM / 8, true);
+        // from the start where it is large, and nothing of it is touched;
+        // and each way into a mapping from a `Vec` -- a slice appended, a
+        // resize, a reserve -- carries the values across.
+        let big: BigVec<u64> = BigVec::with_capacity(MAP_FROM / 8, Site::Test, true);
         assert!(big.is_mapped() && big.capacity() == MAP_FROM / 8 && big.is_empty());
-        let small: BigVec<u8> = BigVec::with_capacity(100, true);
+        let small: BigVec<u8> = BigVec::with_capacity(100, Site::Test, true);
         assert!(!small.is_mapped() && small.capacity() >= 100);
+        let seed: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        let mut by_slice: BigVec<u8> = BigVec::new(Site::Test, true);
+        by_slice.extend_from_slice(&seed);
+        assert!(!by_slice.is_mapped());
+        by_slice.extend_from_slice(&vec![9u8; MAP_FROM]);
+        assert!(by_slice.is_mapped() && by_slice.len() == 1000 + MAP_FROM);
+        assert!(by_slice[..1000] == seed[..] && by_slice[1000..].iter().all(|&x| x == 9));
+        let mut by_resize: BigVec<u8> = BigVec::new(Site::Test, true);
+        by_resize.extend_from_slice(&seed);
+        by_resize.resize(MAP_FROM, 5);
+        assert!(by_resize.is_mapped() && by_resize.len() == MAP_FROM);
+        assert!(by_resize[..1000] == seed[..] && by_resize[1000..].iter().all(|&x| x == 5));
+        let mut by_reserve: BigVec<u8> = BigVec::new(Site::Test, true);
+        by_reserve.extend_from_slice(&seed);
+        by_reserve.reserve(MAP_FROM);
+        assert!(by_reserve.is_mapped() && by_reserve.capacity() >= 1000 + MAP_FROM);
+        assert!(by_reserve[..] == seed[..]);
     }
 
     /// A block grown keeps its bytes, mapping to mapping, allocator to
@@ -598,7 +763,10 @@ mod tests {
             // SAFETY: `new` bytes, the first `old` written.
             let t = unsafe { std::slice::from_raw_parts_mut(q, new) };
             assert!(
-                t[..old].iter().enumerate().all(|(i, &b)| b == (i % 251) as u8),
+                t[..old]
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &b)| b == (i % 251) as u8),
                 "{old} -> {new} {mapped}"
             );
             t[new - 1] = 1;

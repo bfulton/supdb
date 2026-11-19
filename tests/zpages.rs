@@ -7187,31 +7187,36 @@ fn blocked_store_at(
 }
 
 /// The injected clock moved on by `d` and the controller's tick after it
-/// waited for. The step count is read before the clock moves: the tick
-/// runs on the segment work's thread at its own turn, and one that ran
-/// between a move and a count read after it was in the count already, so
-/// the wait sat out its minute for a step nothing would make -- the thread
-/// is woken at every build's end, and a store building ahead woke it into
-/// that window in one run of the file in three.
+/// waited for, to its end. The count is read before the clock moves: the
+/// tick runs on the segment work's thread at its own turn, and one that
+/// ran between a move and a count read after it was in the count already,
+/// so the wait sat out its minute for a step nothing would make -- the
+/// thread is woken at every build's end, and a store building ahead woke
+/// it into that window in one run of the file in three. And the count is
+/// of ticks ended (`ZCounts::tick_ends`), not of the selector's steps: a
+/// tick steps the selector first and its policies look after, so a wait
+/// on the step count returned with the tick's looks still to run -- to
+/// read their counts before they were made, or to change the budget and
+/// the heat under them.
 #[cfg(target_os = "linux")]
 fn advance_tick(db: &Db, d: std::time::Duration) {
     let inject = db.options().zpages_inject.clone().unwrap();
-    let was = db.zpage_counts().sel_steps;
+    let was = db.zpage_counts().tick_ends;
     inject.advance(d);
     wait_tick_past(db, was);
 }
 
-/// A tick of the controller past the step count `was`.
+/// A tick of the controller ended past the count of them `was`.
 #[cfg(target_os = "linux")]
 fn wait_tick_past(db: &Db, was: u64) {
     let t = std::time::Instant::now();
     // A minute: the tick is the segment work's turn, ten milliseconds
     // apart, and under the gate's stress of twelve processes a turn came
     // more than twenty seconds late once.
-    while db.zpage_counts().sel_steps == was && t.elapsed().as_secs() < 60 {
+    while db.zpage_counts().tick_ends == was && t.elapsed().as_secs() < 60 {
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
-    assert!(db.zpage_counts().sel_steps > was, "the tick stepped");
+    assert!(db.zpage_counts().tick_ends > was, "the tick ended");
 }
 
 /// Ticks of the injected clock until `cond` holds of the counts, at most

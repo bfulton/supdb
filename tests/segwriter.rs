@@ -377,7 +377,28 @@ fn where_the_writers_arrays_live_changes_nothing_of_the_segment() {
         let mut files: Vec<Vec<u8>> = Vec::new();
         for mapped in [false, true] {
             let path = dir.join(format!("buffers-{inline}-{mapped}.sup"));
-            let before = supdb::Db::job_buffers_mapped();
+            let count = |site: &str| -> usize {
+                supdb::Db::job_buffers_mapped()
+                    .iter()
+                    .find(|(s, _)| *s == site)
+                    .map(|&(_, n)| n)
+                    .unwrap_or_else(|| panic!("no site {site}"))
+            };
+            // The keys' copy and their spans in either layout; the
+            // offsets, the hashes and the trailer beside them where the
+            // records stream.
+            let sites: &[&str] = if inline > 0 {
+                &[
+                    "writer keys",
+                    "writer spans",
+                    "writer offsets",
+                    "writer hashes",
+                    "trailer",
+                ]
+            } else {
+                &["writer keys", "writer spans"]
+            };
+            let before: Vec<usize> = sites.iter().map(|s| count(s)).collect();
             write_bulk_with(
                 &path,
                 &data,
@@ -387,20 +408,15 @@ fn where_the_writers_arrays_live_changes_nothing_of_the_segment() {
                 },
                 inline,
             );
-            let made = supdb::Db::job_buffers_mapped() - before;
-            if mapped {
-                // The keys' copy and their spans in either layout; the
-                // offsets, the hashes and the trailer beside them where
-                // the records stream.
-                let want = if inline > 0 { 5 } else { 2 };
-                assert!(
-                    made >= want,
-                    "{layout}: {made} of the writer's arrays became mappings"
-                );
-            } else if !common::jobs_mapped_switch() {
-                // Under the switch the stores of the tests beside this
-                // one map theirs, and the count is the process's.
-                assert_eq!(made, 0, "{layout}: off, no array is a mapping");
+            for (site, was) in sites.iter().zip(before) {
+                let made = count(site) - was;
+                if mapped {
+                    assert_eq!(made, 1, "{layout}: the {site} array a mapping");
+                } else if !common::jobs_mapped_switch() {
+                    // Under the switch the stores of the tests beside
+                    // this one map theirs, and the count is the process's.
+                    assert_eq!(made, 0, "{layout}: off, {site} is no mapping");
+                }
             }
             files.push(without_the_clock(&std::fs::read(&path).unwrap()));
         }
