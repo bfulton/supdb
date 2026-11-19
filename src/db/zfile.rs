@@ -6147,6 +6147,11 @@ pub(super) struct ZEvents {
     /// Partitions whose raw pages the crossing asked for
     /// (`ZCounts::cross_raw_asks`).
     pub cross_raw_asks: AtomicU64,
+    /// Ordered indexes dropped a second time, and their bytes resident
+    /// before and after (`ZCounts::raw_redrops`).
+    pub raw_redrops: AtomicU64,
+    pub raw_redrop_before: AtomicU64,
+    pub raw_redrop_after: AtomicU64,
     /// Form files synced once named (`ZCounts::build_synced`).
     pub build_synced: AtomicU64,
     /// The I/O class the kernel reported for the last build thread

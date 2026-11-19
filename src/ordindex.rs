@@ -607,6 +607,12 @@ impl OrdIndex {
         self.map.len()
     }
 
+    /// The file's mapping whole, for whoever asks the kernel about its
+    /// pages (`mincore`): no byte of it is read here.
+    pub fn mapped(&self) -> &[u8] {
+        self.map.slice_at(0, self.map.len() as usize).unwrap_or(&[])
+    }
+
     /// Whether `advise_random` was called on this mapping.
     pub fn advised(&self) -> bool {
         self.advised.load(std::sync::atomic::Ordering::Relaxed)
