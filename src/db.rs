@@ -38649,6 +38649,26 @@ impl Db {
             let (Some(id), Some(end)) = (Db::name_id(u), Db::name_end_seq(u)) else {
                 continue;
             };
+            // A run's piece past what the slot covers holds records no log
+            // does, and its temp name is what holds them until a manifest
+            // names the piece: the close links the piece and keeps the temp
+            // name until then. With the temp name there it is the crash
+            // window's, taken again from there; without it a newer slot
+            // named the piece and retired the name, and the slot taken is
+            // not the store. Asked whatever the id: a run's id is drawn
+            // where it opens, or earlier for the spare it opens on
+            // (`Options::run_spare`), so a merge or a seal the slot names
+            // can stand above it.
+            if end > sealed && matches!(SegmentWriter::run_start_of(&dir.join(u)), Ok(Some(_))) {
+                if runs.contains(&id) {
+                    continue;
+                }
+                return Err(refused(format!(
+                    "{u} holds keys nothing the slot names holds: a run's piece past what \
+                     the slot covers, whose records no log holds and whose temp name has \
+                     retired"
+                )));
+            }
             if id < next_id {
                 continue;
             }

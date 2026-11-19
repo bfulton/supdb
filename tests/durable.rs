@@ -9595,6 +9595,71 @@ fn a_flushed_run_is_not_lost_when_the_newest_slot_is_damaged_after_its_temp_reti
     a_damaged_slot_over_a_flushed_run(None, false, 1);
 }
 
+/// A run whose id stands below a segment the slot before names -- here the
+/// creation's spare, id zero, which the run opens on after a shuffled load
+/// was sealed under a higher id (`Options::run_spare`) -- landed durable by
+/// the newest slot, its temp name retired. With that slot damaged the open
+/// takes the slot before, which names the load's segment and not the run,
+/// and the run's piece is the only holder of its records. The check of an
+/// unnamed segment passed over every id below the slot's highest, and the
+/// open answered `Ok` without the run; it refuses now.
+#[test]
+fn a_run_below_the_slots_ids_is_not_lost_when_the_newest_slot_is_damaged() {
+    let d = dir("oo-run-lowid");
+    let c = dir("oo-run-lowid-kill");
+    // The run's flush leaves its segment a piece, so every file the slot
+    // before names stands under the name that slot gives it.
+    let opts = Options {
+        partition_on_flush: false,
+        flush_schedules: false,
+        drain_names_partition: false,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model = BTreeMap::new();
+    // Shuffled, so the load goes through the log and a hashed table, and
+    // its seal draws an id past the spare's.
+    for i in 0..2000u32 {
+        let k = format!("a-{:06}", (i * 7919) % 2000).into_bytes();
+        db.put(&k, b"shuffled");
+        model.insert(k, vec![b"shuffled".to_vec()]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    // Ordered above every key: a run, on the spare made at the creation.
+    for k in 0..2000u32 {
+        db.append(key(k).as_bytes(), b"run");
+        model.insert(key(k).into_bytes(), vec![b"run".to_vec()]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.close().unwrap();
+    copy_closed(&d, &c);
+    assert!(!open_run(&c), "premise: the run's temp name retired");
+    let [newest, older] = oo_by_age(&c);
+    let named = |p: &Path| oo_names(&std::fs::read(p).unwrap()).1;
+    let old_names: Vec<String> = named(&older).into_iter().map(|(n, _)| n).collect();
+    let low = seg_names(&c)
+        .into_iter()
+        .find(|n| !old_names.contains(n))
+        .expect("premise: a segment only the newest slot names");
+    let id = |n: &str| u64::from_str_radix(&n[4..12], 16).unwrap_or(u64::MAX);
+    assert!(
+        old_names.iter().any(|n| id(n) > id(&low)),
+        "premise: the slot before names a segment above the run's id: {low} beside {old_names:?}"
+    );
+    let saved = std::fs::read(&newest).unwrap();
+    oo_damage(&newest);
+    oo_refused(&c, &opts, OO_KEYS, "run below");
+    std::fs::write(&newest, &saved).unwrap();
+    let db = Db::open(&c, opts).expect("the store with its slot put back opens");
+    oo_holds(&db, &model, "run below, repaired");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&c);
+}
+
 fn a_damaged_slot_over_a_flushed_run(again: Option<u32>, below: bool, n: u32) {
     let d = dir(&format!("oo-run-{again:?}-{below}-{n}"));
     let c = dir(&format!("oo-run-{again:?}-{below}-{n}-kill"));
