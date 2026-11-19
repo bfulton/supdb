@@ -551,11 +551,15 @@ What an engine picker would hit, roughly in order.
   (`StoreCipher::cache_bytes`) takes two chunks decrypted for a raw point
   read and one and a decode through the form, and the controller sees
   none of it. Whether the form pays there is not measured.
-- [ ] **A writer that waits for segment work that is gone.** A panic on
-  the segment work's thread leaves the writer waiting in `land_seal` for
-  a landing nobody will make, with no end: found under a mutant whose
+- [x] **A writer that waits for segment work that is gone.** A panic on
+  the segment work's thread left the writer waiting in `land_seal` for
+  a landing nobody would make, with no end: found under a mutant whose
   debug assertion fired on that thread, where the test hung and did not
-  fail. Done when the writer answers with the thread's failure.
+  fail. The thread's panic stops the seal queue with the panic as its
+  cause, which is what it is -- nothing lands and no manifest is written
+  for the rest of the open -- so every wait that answers a stopped queue
+  answers it (`tests/durable.rs`, the writer beside segment work that
+  panicked, on a thread with an end).
 - [ ] **A store under a cipher on another platform.** The memory files a
   file is written in and the cache gives pages back from are Linux's
   (`memfd_create`, `MADV_REMOVE`); elsewhere the store is refused before it
