@@ -5519,6 +5519,51 @@ down as its gain, since a cell in two shapes agrees with any option in
 both orders one time in eight; and a cell found on a threshold is
 recorded as the threshold's, with the two values beside each other.
 
+**A drop that met a page still dirty.** A served partition's raw file
+and its ordered index are dropped from the page cache as the form is
+installed over them (`Options::zpages_drop_raw`), and the ordered index
+is written unsynced by design: `POSIX_FADV_DONTNEED` over a dirty page
+starts its writeback and leaves the page, so the indexes of a load's last
+landings, 14 to 21 MB at ten million keys, stood in the cache with
+nothing to read them until a reclaim came. Under the block form the read
+pass runs at the group's limit and the reclaim comes at once; in the
+stride form the store is under its limit through every pass before the
+scrambled mixes, the pages stood, and the hot-raw policy's room, the
+group's memory unused, which counts a cached page whatever is in it, was
+short of the Zipfian's head partition by less than the idle indexes
+held. The arm of a form that reads faster made no release where the
+default made its one, and A, B and the scrambled D read 0.8x for it in
+eleven pairs of twelve. `scripts/resident.py` by file at each pass's
+start named it, 20 MB of ordered indexes against 6. The segment work
+notes each drop and advises the index's file again a second later
+(`Options::zpages_drop_again`, off). The rules: an advice to drop is held
+to the kernel's count after it (`mincore`), as an ask to read is, and a
+file written unsynced is dropped once its writeback is through or twice;
+a room read off a group's unused memory is short by whatever idles in its
+cache, so the cache is laid to files by residency before a policy is read
+as bound by room; and a leak one arm shows because the other arm's
+reclaim hides it is both arms' -- the default paid nothing for it only
+by being at its limit already.
+
+**A decision made once a rep, read at the median of three.** The stride
+arm under 1 GiB was paired with the default three reps a sitting first:
+the hot-raw policy's releases read one a rep in both arms at the median
+of both sittings, A level and B the arm's, and the default's flip was
+drafted in the tree -- the options' defaults, their docs, the bench's
+policy -- while a six-rep sitting ran. Six reps read no release at the
+arm's median in either sitting, and A, B and the scrambled D behind in
+eleven pairs of twelve. The release is one decision a rep at a threshold
+that sits at its own value, and the arms' releases differed in one pair
+of the six the three-rep sittings held and in seven of the twelve after
+them: a median over such reps is the side the coin fell on, and the
+table's own column of pairs that differed had said a coin was there. The
+rules: where a cell follows a decision made once a rep, the reps are
+counted by the decision before the median of any rate is read, and the
+cell is read as two shapes with the share of each; a count that reads
+level at the median is read in its pairs column too; and a default is not
+drafted in the tree while its last pairing runs, since a draft taken back
+out is a second edit of the files the fix that follows has to touch.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
