@@ -7125,6 +7125,8 @@ fn auto_store_loaded(
         zpages_inject: Some(inject.clone()),
         zpages_land_pct: 0,
         zpages_hot_raw: false,
+        // Off in the engine; a test that sets it says so after this.
+        zpages_convert_drops_output: common::convert_drops_switch(),
         ..Options::default()
     };
     extra(&mut opts);
@@ -17588,6 +17590,23 @@ fn convert_store(
     std::sync::Arc<supdb::ZInject>,
     Vec<Vec<u8>>,
 ) {
+    convert_store_with(name, stride, on, |_| {})
+}
+
+/// `convert_store` with the caller's options beside.
+#[cfg(target_os = "linux")]
+fn convert_store_with(
+    name: &str,
+    stride: ZStride,
+    on: bool,
+    extra: impl FnOnce(&mut Options),
+) -> (
+    PathBuf,
+    Db,
+    Model,
+    std::sync::Arc<supdb::ZInject>,
+    Vec<Vec<u8>>,
+) {
     let (dir, db, model, inject) = auto_store_loaded(
         name,
         1 << 20,
@@ -17598,6 +17617,7 @@ fn convert_store(
             o.zpages_stride_convert = on;
             o.zpages_memo = false;
             o.partition_bytes = Some(400 << 10);
+            extra(o);
         },
         |_| {},
         |db| numbered_soft_load(db, 20_000, 100, 0x5C0, true),
@@ -18215,6 +18235,154 @@ fn a_partitions_own_build_comes_before_a_conversion_that_is_due() {
     drop(r);
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A conversion's file is written back and dropped from the page cache as
+/// it is built and asked back where it is taken in
+/// (`Options::zpages_convert_drops_output`): a page the cache holds because
+/// it was written carries the filesystem's buffer heads, kernel memory the
+/// group is charged for, and a page read back carries none. A store whose
+/// moves out are due is given the price it can pay with the first
+/// conversion held before its rename: its file under the temp name is out
+/// of the page cache with the option and in it without. Released, with the
+/// job behind it held at its start, the one conversion is taken in: asked
+/// back whole and counted with the option, and neither without it. What
+/// the ask does to the cache is the dropped build's test's
+/// (`a_build_in_flight_at_the_crossing_has_the_file_it_dropped_asked_back`):
+/// a file this small the attach's own reads bring in whole. Every read
+/// answers as the model has it either way.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_conversions_file_is_dropped_as_it_is_written_and_asked_back() {
+    for on in [true, false] {
+        let what = &format!("a conversion drops its file {on}");
+        let (dir, db, model, inject, keys) = convert_store_with(
+            &format!("auto-convert-drops-{on}"),
+            ZStride::Forced,
+            true,
+            |o| o.zpages_convert_drops_output = on,
+        );
+        let sec = std::time::Duration::from_secs(1);
+        let c0 = db.zpage_counts();
+        inject.set_convert_price(std::time::Duration::from_secs(1_000_000_000));
+        inject.set_budget(c0.file_bytes / 4);
+        convert_look(&db, sec);
+        let mut rounds = 0;
+        while db.zpage_counts().stride_convert_rent_us < 2_000_000 && rounds < 120 {
+            read_round(&db, &keys, keys.len());
+            convert_look(&db, sec);
+            rounds += 1;
+        }
+        assert!(
+            db.zpage_counts().stride_convert_rent_us >= 2_000_000,
+            "{what}: moves paid for: {:?}",
+            db.zpage_counts()
+        );
+        // The first move held before its rename: written, under its temp
+        // name, past everything its writer does to the cache.
+        db.hold_zpage_rename(true);
+        inject.set_convert_price(std::time::Duration::from_millis(200));
+        convert_look(&db, sec);
+        let t = std::time::Instant::now();
+        while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+            wait_steps(&db, 1);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let held = db.zpage_counts();
+        assert!(
+            db.zpage_build_waiting() && held.build_starts == c0.build_starts + 1,
+            "{what}: one conversion started, held before its rename: {held:?}"
+        );
+        let tmp: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(".zpg.tmp"))
+            .collect();
+        assert_eq!(tmp.len(), 1, "{what}: the one file being written: {tmp:?}");
+        let len = std::fs::metadata(&tmp[0]).unwrap().len() as usize;
+        let pages = len.div_ceil(4096);
+        let cached = common::cached_pages(&tmp[0], 0, len);
+        assert!(
+            pages >= 8,
+            "{what}: a file of pages enough to tell: {pages}"
+        );
+        if on {
+            assert!(
+                cached * 10 <= pages,
+                "{what}: dropped as it was written: {cached} of {pages} pages cached"
+            );
+        } else {
+            assert!(
+                cached * 10 >= pages * 9,
+                "{what}: kept as it was written: {cached} of {pages} pages cached"
+            );
+        }
+        // Taken in alone: the job behind it is held at its start.
+        db.hold_zpage_build(true);
+        db.hold_zpage_rename(false);
+        let t = std::time::Instant::now();
+        while db.zpage_counts().build_collected == held.build_collected
+            && t.elapsed().as_secs() < 60
+        {
+            wait_steps(&db, 1);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        wait_steps(&db, 1);
+        let c = db.zpage_counts();
+        assert_eq!(
+            (
+                c.build_collected,
+                c.stride_converts_back + c.stride_converts,
+                c.recode_failed
+            ),
+            (
+                held.build_collected + 1,
+                c0.stride_converts_back + c0.stride_converts + 1,
+                0
+            ),
+            "{what}: the one conversion taken in: {c:?}"
+        );
+        let live = PathBuf::from(
+            tmp[0]
+                .to_string_lossy()
+                .trim_end_matches(".tmp")
+                .to_string(),
+        );
+        assert_eq!(
+            std::fs::metadata(&live).unwrap().len() as usize,
+            len,
+            "{what}: the file under its name"
+        );
+        if on {
+            assert_eq!(
+                (
+                    c.convert_dropped,
+                    c.dropped_asks - c0.dropped_asks,
+                    c.dropped_ask_bytes - c0.dropped_ask_bytes
+                ),
+                (1, 1, len as u64),
+                "{what}: asked back whole where it was taken in: {c:?}"
+            );
+        } else {
+            assert_eq!(
+                (
+                    c.convert_dropped,
+                    c.dropped_asks - c0.dropped_asks,
+                    c.dropped_ask_bytes - c0.dropped_ask_bytes
+                ),
+                (0, 0, 0),
+                "{what}: nothing dropped, nothing asked: {c:?}"
+            );
+        }
+        db.hold_zpage_build(false);
+        let r = db.reader().unwrap();
+        check(&r, &model, &keys, what);
+        let c = db.zpage_counts();
+        assert_eq!((c.fallbacks, c.recode_failed), (0, 0), "{what}: {c:?}");
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// A conversion in flight is priced as made

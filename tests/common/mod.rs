@@ -76,6 +76,18 @@ pub fn jobs_mapped_switch() -> bool {
     *ON.get_or_init(|| std::env::var("SUPDB_TEST_JOBSMAPPED").is_ok_and(|v| v == "1"))
 }
 
+/// Whether the controller tests' conversions drop their files as they
+/// write them and have them asked back
+/// (`Options::zpages_convert_drops_output`): `SUPDB_TEST_CDROP=1`, read
+/// once. The option is off in the engine, so a run of the conversion tests
+/// under the switch is the one run that takes every conversion of theirs,
+/// each way, through the drop and the ask.
+#[allow(dead_code)]
+pub fn convert_drops_switch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SUPDB_TEST_CDROP").is_ok_and(|v| v == "1"))
+}
+
 /// A segment file without the part of it that is a function of when it was
 /// written.
 ///

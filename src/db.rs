@@ -734,6 +734,10 @@ pub struct ZCounts {
     /// bytes asked for (`Options::zpages_ask_dropped`).
     pub dropped_asks: u64,
     pub dropped_ask_bytes: u64,
+    /// Conversions whose file was dropped from the page cache as it was
+    /// written and asked back where it was taken in
+    /// (`Options::zpages_convert_drops_output`).
+    pub convert_dropped: u64,
     /// Turns of the builder taken at a job's end between two of the
     /// controller's steps (`Options::zpages_drive_at_job_end`).
     pub job_end_drives: u64,
@@ -6268,6 +6272,28 @@ pub struct Options {
     /// `supdb-zstrideroomconv` under `Forced` with `zpages_stride_room`.
     #[doc(hidden)]
     pub zpages_stride_convert: bool,
+    /// EXPERIMENT: a conversion's build (`zpages_stride_convert`) writes its
+    /// file back and drops it from the page cache as it goes, as a build
+    /// ahead under the selector's line does (`zfile::BuildPlan::drop_output`),
+    /// and the turn that takes it in asks the file back whole before it
+    /// attaches it. A page the cache holds because it was written carries
+    /// the filesystem's buffer heads, a hundred and four bytes a block of
+    /// kernel memory charged to the memory group for as long as the page
+    /// stays; a page read back from the device carries none. A store's own
+    /// form files are dropped as they are built and asked back at the
+    /// crossing, and a conversion's file was written whole into the cache
+    /// and kept, to serve at once. At ten million keys under 1 GiB the
+    /// stride arm converts its 29 partitions back to the block form through
+    /// the read and scan passes, and from there on its group held 22 MB of
+    /// kernel memory where the default's held 11, a hundred and eleven
+    /// thousand buffer heads more by the kernel's own count: its group
+    /// reached the limit a mix earlier, and the scrambled D and E mixes took
+    /// the major faults for it (`docs/engine.md`, the group's kernel memory;
+    /// `memory.kmem.usage_in_bytes` of the pass's group and `buffer_head` in
+    /// `/proc/slabinfo`, sampled beside one traced rep). Off;
+    /// `supdb-zstrideallcdrop` turns it on beside the stride form's options.
+    #[doc(hidden)]
+    pub zpages_convert_drops_output: bool,
 }
 
 impl Options {
@@ -6742,6 +6768,7 @@ impl Default for Options {
             zpages_stride_room: false,
             zpages_stride_trust_built: true,
             zpages_stride_convert: false,
+            zpages_convert_drops_output: false,
         }
     }
 }
@@ -24365,6 +24392,7 @@ impl Reader {
             ahead_swapped: get(&ev.ahead_swapped),
             dropped_asks: get(&ev.dropped_asks),
             dropped_ask_bytes: get(&ev.dropped_ask_bytes),
+            convert_dropped: get(&ev.convert_dropped),
             job_end_drives: get(&ev.job_end_drives),
             cross_raw_asks: get(&ev.cross_raw_asks),
             raw_redrops: get(&ev.raw_redrops),
@@ -52361,7 +52389,11 @@ impl Maint {
             self.opts.zpages_min_bytes,
             self.opts.zpages_drop_behind && (!dormant || (past && self.opts.zpages_land_drop_past)),
         );
-        plan.drop_output = dormant && !past;
+        // A conversion's file goes the same way where the option says
+        // (`Options::zpages_convert_drops_output`), and is asked back
+        // where it is taken in: the pages a write leaves in the cache
+        // carry buffer heads, and the pages a read brings carry none.
+        plan.drop_output = (dormant && !past) || (convert && self.opts.zpages_convert_drops_output);
         // Only a file written back as it was built: its pages are on the
         // device and its sync asks for the flush alone; one kept dirty for
         // the install wrote its pages in its sync, 50-160 ms each at five
@@ -52727,6 +52759,24 @@ impl Maint {
             // drops them.
             Ok(zfile::Outcome::Built(built)) if recode && live.is_some() => {
                 let target = live.expect("checked");
+                // A file its build dropped as it wrote it
+                // (`Options::zpages_convert_drops_output`) is asked of the
+                // kernel whole before it serves: the attach's mapping is
+                // advised random, and the file serves from this turn on.
+                if built.dropped {
+                    let asked = zfile::ask_file(&out);
+                    zfile::ZEvents::add(&ev.dropped_asks, 1);
+                    zfile::ZEvents::add(&ev.dropped_ask_bytes, asked);
+                    zfile::ZEvents::add(&ev.convert_dropped, 1);
+                    if self.z_trace {
+                        eprintln!(
+                            "zask t={:.1} {} dropped by its conversion, asked_mb {:.1}",
+                            self.z_epoch.elapsed().as_secs_f64(),
+                            seg.name,
+                            asked as f64 / 1048576.0
+                        );
+                    }
+                }
                 match zfile::ZFile::attach(
                     &out,
                     target.blob.for_zfile(),

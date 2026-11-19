@@ -6183,6 +6183,9 @@ pub(super) struct ZEvents {
     /// (`ZCounts::dropped_asks`).
     pub dropped_asks: AtomicU64,
     pub dropped_ask_bytes: AtomicU64,
+    /// Conversions whose file its build dropped and the collect asked back
+    /// (`ZCounts::convert_dropped`).
+    pub convert_dropped: AtomicU64,
     /// The builder's turns taken at a job's end between two steps
     /// (`ZCounts::job_end_drives`).
     pub job_end_drives: AtomicU64,
