@@ -39,12 +39,12 @@ build() {
 }
 build "$W/base" "$W/tb" base
 build "$ROOT" "$ROOT/bench/target" head
-GET='--toggle-collect=<supdb_bench::engines::Supdb as supdb_bench::engines::Engine>::get'
-SCAN='--toggle-collect=supdb_bench::engines::supdb_range'
-probe() { # name -> "ops toggle binary args"
+GET='<supdb_bench::engines::Supdb as supdb_bench::engines::Engine>::get'
+SCAN='supdb_bench::engines::supdb_range'
+probe() { # name -> "ops toggle binary args"; the toggle one argument, spaces and all
     case $1 in
-    read) echo "200000|--collect-atstart=no $GET|read_only|supdb 100000 1 n-none" ;;
-    scan) echo "1000|--collect-atstart=no $SCAN|lag0_probe|supdb 100000 1" ;;
+    read) echo "200000|$GET|read_only|supdb 100000 1 n-none" ;;
+    scan) echo "1000|$SCAN|lag0_probe|supdb 100000 1" ;;
     load_durable) echo "100000||load_only|supdb 100000 1" ;;
     load_buffered) echo "100000||load_only|supdb-ingest 100000 1" ;;
     work) echo "300000||work_probe|100000 whole" ;;
@@ -53,18 +53,23 @@ probe() { # name -> "ops toggle binary args"
     esac
 }
 run() { # side target-dir name
-    spec=$(probe "$3")
+    side=$1 dir=$2 name=$3
+    set --
+    spec=$(probe "$name")
     tog=$(echo "$spec" | cut -d'|' -f2)
     bin=$(echo "$spec" | cut -d'|' -f3)
     args=$(echo "$spec" | cut -d'|' -f4)
-    t="$W/tmp-$1-$3"
+    t="$W/tmp-$side-$name"
     mkdir -p "$t"
+    if [ -n "$tog" ]; then
+        set -- "$@" --collect-atstart=no "--toggle-collect=$tog"
+    fi
     # shellcheck disable=SC2086
-    TMPDIR="$t" valgrind --tool=callgrind --callgrind-out-file="$W/out/$1.$3.out" $tog \
-        "$2/release/examples/$bin" $args >"$W/out/$1.$3.stdout" 2>"$W/out/$1.$3.vg" ||
-        { echo "cost: $1 $3 exited non-zero; see $W/out/$1.$3.vg"; exit 2; }
+    TMPDIR="$t" valgrind --tool=callgrind --callgrind-out-file="$W/out/$side.$name.out" "$@" \
+        "$dir/release/examples/$bin" $args >"$W/out/$side.$name.stdout" 2>"$W/out/$side.$name.vg" ||
+        { echo "cost: $side $name exited non-zero; see $W/out/$side.$name.vg"; exit 2; }
     rm -rf "$t"
-    callgrind_annotate --auto=no --inclusive=no --threshold=100 "$W/out/$1.$3.out" >"$W/out/$1.$3.self"
+    callgrind_annotate --auto=no --inclusive=no --threshold=100 "$W/out/$side.$name.out" >"$W/out/$side.$name.self"
 }
 status=0
 for p in $PROBES; do
