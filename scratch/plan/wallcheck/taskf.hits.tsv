@@ -1,0 +1,255 @@
+src/db/vault.rs	66	comment	<item>	manifest	2	//!   bytes of two keys, and lives in the manifest. No manifest names the
+src/db/vault.rs	69	comment	<item>	manifest	2	//! - `manifest`, `manifest.alt`: the slots, each sealed under the store's
+src/db/vault.rs	71	comment	<item>	wal-	1	//! - `wal-<id>`: the log, each commit a record sealed under a key drawn for
+src/db/vault.rs	73	comment	<item>	spare-	1	//! - `spare-<id>`: a log file retired and kept to be written again in
+src/db/vault.rs	92	comment	<item>	manifest	1	//! Any byte changed in a segment, an index, a form file, a manifest or a
+src/db/vault.rs	101	comment	<item>	manifest	1	//! merge that met one publishes nothing. A manifest slot that fails is
+src/db/vault.rs	167	comment	<item>	manifest	1	/// What a manifest holds of each segment it names: the token its envelope
+src/db/vault.rs	188	comment	<item>	Db::	1	/// let db = Db::create(dir, opts)?;
+src/db/vault.rs	559	comment	<item>	manifest	1	/// (`Options::recycle_wal`), and the manifest. Every other name is kept
+src/db/vault.rs	563	code	passes	wal-	1	name.starts_with("wal-") || name.starts_with("spare-") || name.starts_with("manifest")
+src/db/vault.rs	563	code	passes	spare-	1	name.starts_with("wal-") || name.starts_with("spare-") || name.starts_with("manifest")
+src/db/vault.rs	563	code	passes	manifest	1	name.starts_with("wal-") || name.starts_with("spare-") || name.starts_with("manifest")
+src/db/vault.rs	576	comment	Counts::<item>	manifest	1	/// Envelopes no manifest named, removed at the open.
+src/db/vault.rs	578	comment	Counts::<item>	manifest	1	/// Segments whose envelope a manifest's own call wrote, no seal, run
+src/db/vault.rs	585	comment	Vault::<item>	manifest	1	/// The directory the envelopes, the log and the manifest are in.
+src/db/vault.rs	1274	comment	Vault::<item>	manifest	1	/// the token and wrapped key of each segment, in order: what a manifest
+src/db/vault.rs	1281	comment	Vault::<item>	manifest	1	/// `named` is a manifest's call, for which a name the store does not
+src/db/vault.rs	1282	comment	Vault::<item>	manifest	1	/// hold is an error: the manifest would name nothing. Without it the
+src/db/vault.rs	1284	comment	Vault::<item>	manifest	1	/// ahead of any manifest, and a name gone by then -- a piece a
+src/db/vault.rs	1286	comment	Vault::<item>	manifest	1	/// over, since whichever manifest names the file writes it.
+src/db/vault.rs	1313	code	Vault::persist_with	manifest	1	format!("a manifest names {seg}, which the store does not hold"),
+src/db/vault.rs	1412	comment	Vault::<item>	manifest	1	/// it. No manifest names a form file: it is a function of its
+src/db/vault.rs	1486	comment	Vault::<item>	manifest	1	/// reads the segments its manifest names and nothing says which of
+src/db/vault.rs	1524	comment	Vault::<item>	manifest	1	/// A segment a manifest names, with the envelope it is in, and its
+src/db/vault.rs	1571	comment	Vault::<item>	manifest	1	/// `adopt` for every segment a manifest names, each with its ordered
+src/db/vault.rs	1573	comment	Vault::<item>	manifest	1	/// more files or fewer than its manifest names is refused whole, since
+src/db/vault.rs	1581	code	Vault::adopt_all	manifest	1	return Err(refused("manifest is truncated"));
+src/db/vault.rs	1590	comment	Vault::<item>	manifest	1	/// removed: one a crash came after and no manifest named, as a plain
+src/db/vault.rs	1591	comment	Vault::<item>	manifest	1	/// store sweeps a segment its manifest does not name. For the open,
+src/db/vault.rs	1592	comment	Vault::<item>	manifest	1	/// once the manifests have been read.
+src/db/vault.rs	1626	comment	Vault::<item>	manifest	1	// -- the manifest ----------------------------------------------------
+src/db/vault.rs	1628	comment	Vault::<item>	manifest	1	/// A manifest's bytes sealed for its slot, with the envelope and the
+src/db/vault.rs	1631	comment	Vault::<item>	manifest	1	/// plaintext being `u32 len | manifest | (token | wrapped key)*` and
+src/db/vault.rs	1633	code	Vault::seal_manifest	manifest	1	pub(crate) fn seal_manifest(
+src/db/vault.rs	1636	code	Vault::seal_manifest	manifest	1	manifest: &[u8],
+src/db/vault.rs	1639	code	Vault::seal_manifest	manifest	1	let mut body = Vec::with_capacity(4 + manifest.len() + files.len() * (16 + WRAPPED));
+src/db/vault.rs	1640	code	Vault::seal_manifest	manifest	1	body.extend_from_slice(&(manifest.len() as u32).to_le_bytes());
+src/db/vault.rs	1641	code	Vault::seal_manifest	manifest	1	body.extend_from_slice(manifest);
+src/db/vault.rs	1655	comment	Vault::<item>	manifest	1	/// A slot's manifest and the files behind it, or the reason it is not
+src/db/vault.rs	1657	code	Vault::open_manifest	manifest	1	pub(crate) fn open_manifest(&self, slot: &[u8]) -> Result<(Vec<u8>, Vec<FileKey>)> {
+src/db/vault.rs	1659	code	Vault::open_manifest	manifest	1	return Err(refused("manifest magic is wrong"));
+src/db/vault.rs	1665	code	Vault::open_manifest	manifest	1	.ok_or_else(|| refused("manifest is truncated"))?;
+src/db/vault.rs	1667	code	Vault::open_manifest	manifest	1	.ok_or_else(|| refused("manifest failed its check"))?;
+src/db/vault.rs	1668	code	Vault::open_manifest	manifest	1	let short = || refused("manifest is truncated");
+src/db/vault.rs	1670	code	Vault::open_manifest	manifest	1	let manifest = body.get(4..4 + mlen as usize).ok_or_else(short)?;
+src/db/vault.rs	1679	code	Vault::open_manifest	manifest	1	Ok((manifest.to_vec(), files))
+src/db/vault.rs	1721	comment	<item>	Db::	1	/// (`Db::cipher_counts`).
+src/db/vault.rs	1737	comment	CipherCounts::<item>	manifest	1	/// Envelopes no manifest named, removed at the open.
+src/db/vault.rs	1739	comment	CipherCounts::<item>	manifest	1	/// Segments whose envelope was written by the manifest that names
+src/db/vault.rs	1755	code	slot_aad	manifest	1	a[..8].copy_from_slice(b"manifest");
+src/db/vault.rs	1934	comment	<item>	manifest	1	/// nowhere if it is: a manifest slot.
+src/db/vault.rs	2093	comment	<item>	manifest	1	/// directory, which only the log and the manifest have -- a kept file's
+src/db/vault.rs	2132	code	persist_one	Db::	1	let ord = crate::db::Db::ord_name_for(seg);
+src/db/vault.rs	2196	comment	<item>	manifest	1	/// read it by, where a plain store's file, the log and the manifest have.
+src/db/vault.rs	2344	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	par-	1	put(&d.join("par-1.sup"), &b"a segment ".repeat(100));
+src/db/vault.rs	2344	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.sup	1	put(&d.join("par-1.sup"), &b"a segment ".repeat(100));
+src/db/vault.rs	2345	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	par-	1	v.persist(&pair("par-1.sup", None), false).unwrap();
+src/db/vault.rs	2345	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.sup	1	v.persist(&pair("par-1.sup", None), false).unwrap();
+src/db/vault.rs	2348	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	zpg	2	put(&d.join("zpg-1.zpg"), &first);
+src/db/vault.rs	2348	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.zpg	1	put(&d.join("zpg-1.zpg"), &first);
+src/db/vault.rs	2350	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	par-	1	.persist_form("par-1.sup", "zpg-1.zpg", false, false)
+src/db/vault.rs	2350	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.sup	1	.persist_form("par-1.sup", "zpg-1.zpg", false, false)
+src/db/vault.rs	2350	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	zpg	2	.persist_form("par-1.sup", "zpg-1.zpg", false, false)
+src/db/vault.rs	2350	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.zpg	1	.persist_form("par-1.sup", "zpg-1.zpg", false, false)
+src/db/vault.rs	2360	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	zpg	2	let old = map(d.join("zpg-1.zpg")).unwrap();
+src/db/vault.rs	2360	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.zpg	1	let old = map(d.join("zpg-1.zpg")).unwrap();
+src/db/vault.rs	2361	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	zpg	2	rename(d.join("zpg-1.zpg"), d.join("dead-1")).unwrap();
+src/db/vault.rs	2361	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.zpg	1	rename(d.join("zpg-1.zpg"), d.join("dead-1")).unwrap();
+src/db/vault.rs	2362	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	zpg	2	put(&d.join("zpg-1.zpg"), &second);
+src/db/vault.rs	2362	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.zpg	1	put(&d.join("zpg-1.zpg"), &second);
+src/db/vault.rs	2364	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	par-	1	.persist_form("par-1.sup", "zpg-1.zpg", false, false)
+src/db/vault.rs	2364	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.sup	1	.persist_form("par-1.sup", "zpg-1.zpg", false, false)
+src/db/vault.rs	2364	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	zpg	2	.persist_form("par-1.sup", "zpg-1.zpg", false, false)
+src/db/vault.rs	2364	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.zpg	1	.persist_form("par-1.sup", "zpg-1.zpg", false, false)
+src/db/vault.rs	2374	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	zpg	2	assert!(read(d.join("zpg-1.zpg")).unwrap() == second);
+src/db/vault.rs	2374	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.zpg	1	assert!(read(d.join("zpg-1.zpg")).unwrap() == second);
+src/db/vault.rs	2384	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	zpg	2	assert!(read(d.join("zpg-1.zpg")).unwrap() == second);
+src/db/vault.rs	2384	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.zpg	1	assert!(read(d.join("zpg-1.zpg")).unwrap() == second);
+src/db/vault.rs	2386	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	zpg	2	remove_file(d.join("zpg-1.zpg")).unwrap();
+src/db/vault.rs	2386	tcode	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.zpg	1	remove_file(d.join("zpg-1.zpg")).unwrap();
+src/db/vault.rs	2400	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	seal-	1	put(&d.join("seal-1.tmp"), &body);
+src/db/vault.rs	2401	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	seal-	1	assert!(exists(d.join("seal-1.tmp")));
+src/db/vault.rs	2402	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	seal-	1	assert_eq!(len(d.join("seal-1.tmp")).unwrap(), body.len() as u64);
+src/db/vault.rs	2403	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	par-	1	rename(d.join("seal-1.tmp"), d.join("par-1-key-00750.sup")).unwrap();
+src/db/vault.rs	2403	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.sup	1	rename(d.join("seal-1.tmp"), d.join("par-1-key-00750.sup")).unwrap();
+src/db/vault.rs	2403	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	seal-	1	rename(d.join("seal-1.tmp"), d.join("par-1-key-00750.sup")).unwrap();
+src/db/vault.rs	2404	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	seal-	1	assert!(!exists(d.join("seal-1.tmp")));
+src/db/vault.rs	2405	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	par-	1	assert_eq!(read(d.join("par-1-key-00750.sup")).unwrap(), body);
+src/db/vault.rs	2405	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.sup	1	assert_eq!(read(d.join("par-1-key-00750.sup")).unwrap(), body);
+src/db/vault.rs	2406	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	par-	1	let m = map(d.join("par-1-key-00750.sup")).unwrap();
+src/db/vault.rs	2406	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.sup	1	let m = map(d.join("par-1-key-00750.sup")).unwrap();
+src/db/vault.rs	2419	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	par-	1	open(d.join("par-1-key-00750.sup"))
+src/db/vault.rs	2419	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.sup	1	open(d.join("par-1-key-00750.sup"))
+src/db/vault.rs	2432	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.oidx	1	put(&d.join("ord-1.oidx"), b"an index over key-00750");
+src/db/vault.rs	2432	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	ord-	1	put(&d.join("ord-1.oidx"), b"an index over key-00750");
+src/db/vault.rs	2435	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	par-	1	.persist(&pair("par-1-key-00750.sup", Some("ord-1.oidx")), true)
+src/db/vault.rs	2435	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.sup	1	.persist(&pair("par-1-key-00750.sup", Some("ord-1.oidx")), true)
+src/db/vault.rs	2435	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.oidx	1	.persist(&pair("par-1-key-00750.sup", Some("ord-1.oidx")), true)
+src/db/vault.rs	2435	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	ord-	1	.persist(&pair("par-1-key-00750.sup", Some("ord-1.oidx")), true)
+src/db/vault.rs	2452	tcomment	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	manifest	1	// A name the store does not hold: an error for a manifest, which
+src/db/vault.rs	2458	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	pcs-	1	.persist(&pair("pcs-9.sup", None), true)
+src/db/vault.rs	2458	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.sup	1	.persist(&pair("pcs-9.sup", None), true)
+src/db/vault.rs	2462	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	pcs-	1	.persist(&pair("pcs-9.sup", None), false)
+src/db/vault.rs	2462	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.sup	1	.persist(&pair("pcs-9.sup", None), false)
+src/db/vault.rs	2465	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	pcs-	1	persist(&d, &pair("pcs-9.sup", None)).unwrap();
+src/db/vault.rs	2465	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.sup	1	persist(&d, &pair("pcs-9.sup", None)).unwrap();
+src/db/vault.rs	2466	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	pcs-	1	persist(&real, &pair("pcs-9.sup", None)).unwrap();
+src/db/vault.rs	2466	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.sup	1	persist(&real, &pair("pcs-9.sup", None)).unwrap();
+src/db/vault.rs	2471	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	par-	1	.persist(&pair("par-1-key-00750.sup", Some("ord-1.oidx")), true)
+src/db/vault.rs	2471	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.sup	1	.persist(&pair("par-1-key-00750.sup", Some("ord-1.oidx")), true)
+src/db/vault.rs	2471	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.oidx	1	.persist(&pair("par-1-key-00750.sup", Some("ord-1.oidx")), true)
+src/db/vault.rs	2471	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	ord-	1	.persist(&pair("par-1-key-00750.sup", Some("ord-1.oidx")), true)
+src/db/vault.rs	2479	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	par-	2	hard_link(d.join("par-1-key-00750.sup"), d.join("par-1-wide.sup")).unwrap();
+src/db/vault.rs	2479	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.sup	2	hard_link(d.join("par-1-key-00750.sup"), d.join("par-1-wide.sup")).unwrap();
+src/db/vault.rs	2480	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	par-	2	assert!(hard_link(d.join("par-1-key-00750.sup"), d.join("par-1-wide.sup")).is_err());
+src/db/vault.rs	2480	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.sup	2	assert!(hard_link(d.join("par-1-key-00750.sup"), d.join("par-1-wide.sup")).is_err());
+src/db/vault.rs	2481	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	par-	1	remove_file(d.join("par-1-key-00750.sup")).unwrap();
+src/db/vault.rs	2481	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.sup	1	remove_file(d.join("par-1-key-00750.sup")).unwrap();
+src/db/vault.rs	2483	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	par-	1	assert_eq!(read(d.join("par-1-wide.sup")).unwrap(), body);
+src/db/vault.rs	2483	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.sup	1	assert_eq!(read(d.join("par-1-wide.sup")).unwrap(), body);
+src/db/vault.rs	2484	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	par-	1	remove_file(d.join("par-1-wide.sup")).unwrap();
+src/db/vault.rs	2484	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.sup	1	remove_file(d.join("par-1-wide.sup")).unwrap();
+src/db/vault.rs	2486	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	par-	1	assert!(remove_file(d.join("par-1-wide.sup")).is_err());
+src/db/vault.rs	2486	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.sup	1	assert!(remove_file(d.join("par-1-wide.sup")).is_err());
+src/db/vault.rs	2487	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.oidx	1	remove_file(d.join("ord-1.oidx")).unwrap();
+src/db/vault.rs	2487	tcode	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	ord-	1	remove_file(d.join("ord-1.oidx")).unwrap();
+src/db/vault.rs	2498	tcode	a_path_the_door_is_not_in_front_of_writes_nothing	seg-	1	assert!(File::create(d.join("seg-1.sup")).is_err());
+src/db/vault.rs	2498	tcode	a_path_the_door_is_not_in_front_of_writes_nothing	.sup	1	assert!(File::create(d.join("seg-1.sup")).is_err());
+src/db/vault.rs	2499	tcode	a_path_the_door_is_not_in_front_of_writes_nothing	seg-	1	assert!(std::fs::write(d.join("seg-1.sup"), b"plaintext").is_err());
+src/db/vault.rs	2499	tcode	a_path_the_door_is_not_in_front_of_writes_nothing	.sup	1	assert!(std::fs::write(d.join("seg-1.sup"), b"plaintext").is_err());
+src/db/vault.rs	2508	tcode	a_path_the_door_is_not_in_front_of_writes_nothing	seg-	1	assert!(create(d.join("seg-1.sup")).is_err());
+src/db/vault.rs	2508	tcode	a_path_the_door_is_not_in_front_of_writes_nothing	.sup	1	assert!(create(d.join("seg-1.sup")).is_err());
+src/db/vault.rs	2511	tcomment	<item:tests>	manifest	1	/// The log and the manifest are the directory's own files, under their
+src/db/vault.rs	2514	tcode	the_log_and_the_manifest_pass_to_the_directory	manifest	1	fn the_log_and_the_manifest_pass_to_the_directory() {
+src/db/vault.rs	2518	tcode	the_log_and_the_manifest_pass_to_the_directory	wal-	1	put(&d.join("wal-00000000"), b"sealed by the engine");
+src/db/vault.rs	2519	tcode	the_log_and_the_manifest_pass_to_the_directory	manifest	1	put(&d.join("manifest.tmp"), b"sealed too");
+src/db/vault.rs	2520	tcode	the_log_and_the_manifest_pass_to_the_directory	manifest	2	rename(d.join("manifest.tmp"), d.join("manifest")).unwrap();
+src/db/vault.rs	2522	tcode	the_log_and_the_manifest_pass_to_the_directory	wal-	1	std::fs::read(real.join("wal-00000000")).unwrap(),
+src/db/vault.rs	2525	tcode	the_log_and_the_manifest_pass_to_the_directory	manifest	1	assert_eq!(std::fs::read(real.join("manifest")).unwrap(), b"sealed too");
+src/db/vault.rs	2526	tcode	the_log_and_the_manifest_pass_to_the_directory	manifest	1	assert_eq!(len(d.join("manifest")).unwrap(), 10);
+src/db/vault.rs	2527	tcode	the_log_and_the_manifest_pass_to_the_directory	manifest	2	assert_eq!(super::real(d.join("manifest")), real.join("manifest"));
+src/db/vault.rs	2528	tcode	the_log_and_the_manifest_pass_to_the_directory	seg-	2	assert_eq!(super::real(d.join("seg-1.sup")), d.join("seg-1.sup"));
+src/db/vault.rs	2528	tcode	the_log_and_the_manifest_pass_to_the_directory	.sup	2	assert_eq!(super::real(d.join("seg-1.sup")), d.join("seg-1.sup"));
+src/db/vault.rs	2529	tcode	the_log_and_the_manifest_pass_to_the_directory	manifest	2	assert_eq!(super::real(real.join("manifest")), real.join("manifest"));
+src/db/vault.rs	2532	tcode	the_log_and_the_manifest_pass_to_the_directory	wal-	1	assert_eq!(listed, vec!["manifest", "wal-00000000"]);
+src/db/vault.rs	2532	tcode	the_log_and_the_manifest_pass_to_the_directory	manifest	1	assert_eq!(listed, vec!["manifest", "wal-00000000"]);
+src/db/vault.rs	2533	tcode	the_log_and_the_manifest_pass_to_the_directory	seg-	1	assert!(rename(d.join("manifest"), d.join("seg-1.sup")).is_err());
+src/db/vault.rs	2533	tcode	the_log_and_the_manifest_pass_to_the_directory	.sup	1	assert!(rename(d.join("manifest"), d.join("seg-1.sup")).is_err());
+src/db/vault.rs	2533	tcode	the_log_and_the_manifest_pass_to_the_directory	manifest	1	assert!(rename(d.join("manifest"), d.join("seg-1.sup")).is_err());
+src/db/vault.rs	2535	tcode	the_log_and_the_manifest_pass_to_the_directory	wal-	1	remove_file(d.join("wal-00000000")).unwrap();
+src/db/vault.rs	2536	tcode	the_log_and_the_manifest_pass_to_the_directory	wal-	1	assert!(!exists(d.join("wal-00000000")));
+src/db/vault.rs	2539	tcomment	<item:tests>	manifest	1	/// A store reopened finds a file a manifest named by its token and its
+src/db/vault.rs	2541	tcomment	<item:tests>	manifest	1	/// no manifest named; a file with an envelope is not written again.
+src/db/vault.rs	2549	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	seg-	1	put(&d.join("seg-1.sup"), &body);
+src/db/vault.rs	2549	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	.sup	1	put(&d.join("seg-1.sup"), &body);
+src/db/vault.rs	2550	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	.oidx	1	put(&d.join("ord-1.oidx"), b"index");
+src/db/vault.rs	2550	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	ord-	1	put(&d.join("ord-1.oidx"), b"index");
+src/db/vault.rs	2551	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	seg-	1	put(&d.join("seg-2.sup"), b"sealed and never named");
+src/db/vault.rs	2551	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	.sup	1	put(&d.join("seg-2.sup"), b"sealed and never named");
+src/db/vault.rs	2554	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	seg-	1	.persist(&pair("seg-1.sup", Some("ord-1.oidx")), true)
+src/db/vault.rs	2554	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	.sup	1	.persist(&pair("seg-1.sup", Some("ord-1.oidx")), true)
+src/db/vault.rs	2554	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	.oidx	1	.persist(&pair("seg-1.sup", Some("ord-1.oidx")), true)
+src/db/vault.rs	2554	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	ord-	1	.persist(&pair("seg-1.sup", Some("ord-1.oidx")), true)
+src/db/vault.rs	2556	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	seg-	1	let (orphan, _) = v.persist(&pair("seg-2.sup", None), true).unwrap()[0];
+src/db/vault.rs	2556	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	.sup	1	let (orphan, _) = v.persist(&pair("seg-2.sup", None), true).unwrap()[0];
+src/db/vault.rs	2565	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	manifest	1	"nothing is known before a manifest"
+src/db/vault.rs	2567	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	seg-	1	v.adopt("seg-1.sup", token, wrapped, Some("ord-1.oidx"));
+src/db/vault.rs	2567	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	.sup	1	v.adopt("seg-1.sup", token, wrapped, Some("ord-1.oidx"));
+src/db/vault.rs	2567	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	.oidx	1	v.adopt("seg-1.sup", token, wrapped, Some("ord-1.oidx"));
+src/db/vault.rs	2567	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	ord-	1	v.adopt("seg-1.sup", token, wrapped, Some("ord-1.oidx"));
+src/db/vault.rs	2568	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	par-	1	v.adopt("par-1.sup", token, wrapped, None);
+src/db/vault.rs	2568	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	.sup	1	v.adopt("par-1.sup", token, wrapped, None);
+src/db/vault.rs	2571	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	seg-	1	assert_eq!(len(d.join("seg-1.sup")).unwrap(), body.len() as u64);
+src/db/vault.rs	2571	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	.sup	1	assert_eq!(len(d.join("seg-1.sup")).unwrap(), body.len() as u64);
+src/db/vault.rs	2572	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	seg-	1	let m = map(d.join("seg-1.sup")).unwrap();
+src/db/vault.rs	2572	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	.sup	1	let m = map(d.join("seg-1.sup")).unwrap();
+src/db/vault.rs	2583	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	seg-	1	assert_eq!(read(d.join("seg-1.sup")).unwrap(), body);
+src/db/vault.rs	2583	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	.sup	1	assert_eq!(read(d.join("seg-1.sup")).unwrap(), body);
+src/db/vault.rs	2586	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	par-	1	assert_eq!(read(d.join("par-1.sup")).unwrap(), body);
+src/db/vault.rs	2586	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	.sup	1	assert_eq!(read(d.join("par-1.sup")).unwrap(), body);
+src/db/vault.rs	2593	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	seg-	1	open(d.join("seg-1.sup")).is_err(),
+src/db/vault.rs	2593	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	.sup	1	open(d.join("seg-1.sup")).is_err(),
+src/db/vault.rs	2596	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	.oidx	1	assert_eq!(read(d.join("ord-1.oidx")).unwrap(), b"index");
+src/db/vault.rs	2596	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	ord-	1	assert_eq!(read(d.join("ord-1.oidx")).unwrap(), b"index");
+src/db/vault.rs	2597	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	seg-	1	assert!(open_write(d.join("seg-1.sup")).is_err(), "written once");
+src/db/vault.rs	2597	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	.sup	1	assert!(open_write(d.join("seg-1.sup")).is_err(), "written once");
+src/db/vault.rs	2600	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	par-	1	remove_file(d.join("par-1.sup")).unwrap();
+src/db/vault.rs	2600	tcode	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	.sup	1	remove_file(d.join("par-1.sup")).unwrap();
+src/db/vault.rs	2613	tcode	a_changed_envelope_is_refused	seg-	1	put(&d.join("seg-1.sup"), &body);
+src/db/vault.rs	2613	tcode	a_changed_envelope_is_refused	.sup	1	put(&d.join("seg-1.sup"), &body);
+src/db/vault.rs	2614	tcode	a_changed_envelope_is_refused	seg-	1	put(&d.join("seg-2.sup"), &body);
+src/db/vault.rs	2614	tcode	a_changed_envelope_is_refused	.sup	1	put(&d.join("seg-2.sup"), &body);
+src/db/vault.rs	2616	tcode	a_changed_envelope_is_refused	seg-	1	let a = v.persist(&pair("seg-1.sup", None), true).unwrap()[0];
+src/db/vault.rs	2616	tcode	a_changed_envelope_is_refused	.sup	1	let a = v.persist(&pair("seg-1.sup", None), true).unwrap()[0];
+src/db/vault.rs	2617	tcode	a_changed_envelope_is_refused	seg-	1	let b = v.persist(&pair("seg-2.sup", None), true).unwrap()[0];
+src/db/vault.rs	2617	tcode	a_changed_envelope_is_refused	.sup	1	let b = v.persist(&pair("seg-2.sup", None), true).unwrap()[0];
+src/db/vault.rs	2627	tcode	a_changed_envelope_is_refused	seg-	1	held.vault().adopt("seg-1.sup", token, wrapped, None);
+src/db/vault.rs	2627	tcode	a_changed_envelope_is_refused	.sup	1	held.vault().adopt("seg-1.sup", token, wrapped, None);
+src/db/vault.rs	2631	tcode	a_changed_envelope_is_refused	seg-	1	assert!(read(held.dir().join("seg-1.sup")).is_err(), "byte {at}");
+src/db/vault.rs	2631	tcode	a_changed_envelope_is_refused	.sup	1	assert!(read(held.dir().join("seg-1.sup")).is_err(), "byte {at}");
+src/db/vault.rs	2635	tcode	a_changed_envelope_is_refused	seg-	1	held.vault().adopt("seg-1.sup", token, other, None);
+src/db/vault.rs	2635	tcode	a_changed_envelope_is_refused	.sup	1	held.vault().adopt("seg-1.sup", token, other, None);
+src/db/vault.rs	2637	tcode	a_changed_envelope_is_refused	seg-	1	map(held.dir().join("seg-1.sup")).is_err(),
+src/db/vault.rs	2637	tcode	a_changed_envelope_is_refused	.sup	1	map(held.dir().join("seg-1.sup")).is_err(),
+src/db/vault.rs	2640	tcode	a_changed_envelope_is_refused	seg-	1	held.vault().adopt("seg-9.sup", token, wrapped, None);
+src/db/vault.rs	2640	tcode	a_changed_envelope_is_refused	.sup	1	held.vault().adopt("seg-9.sup", token, wrapped, None);
+src/db/vault.rs	2641	tcode	a_changed_envelope_is_refused	seg-	1	assert_eq!(read(held.dir().join("seg-9.sup")).unwrap(), body);
+src/db/vault.rs	2641	tcode	a_changed_envelope_is_refused	.sup	1	assert_eq!(read(held.dir().join("seg-9.sup")).unwrap(), body);
+src/db/vault.rs	2645	tcode	a_changed_envelope_is_refused	seg-	1	.adopt("seg-8.sup", token, wrapped, Some("ord-8.oidx"));
+src/db/vault.rs	2645	tcode	a_changed_envelope_is_refused	.sup	1	.adopt("seg-8.sup", token, wrapped, Some("ord-8.oidx"));
+src/db/vault.rs	2645	tcode	a_changed_envelope_is_refused	.oidx	1	.adopt("seg-8.sup", token, wrapped, Some("ord-8.oidx"));
+src/db/vault.rs	2645	tcode	a_changed_envelope_is_refused	ord-	1	.adopt("seg-8.sup", token, wrapped, Some("ord-8.oidx"));
+src/db/vault.rs	2646	tcode	a_changed_envelope_is_refused	seg-	1	assert!(exists(held.dir().join("seg-8.sup")));
+src/db/vault.rs	2646	tcode	a_changed_envelope_is_refused	.sup	1	assert!(exists(held.dir().join("seg-8.sup")));
+src/db/vault.rs	2647	tcode	a_changed_envelope_is_refused	.oidx	1	assert!(!exists(held.dir().join("ord-8.oidx")));
+src/db/vault.rs	2647	tcode	a_changed_envelope_is_refused	ord-	1	assert!(!exists(held.dir().join("ord-8.oidx")));
+src/db/vault.rs	2713	tcode	a_rewrapped_store_opens_under_the_new_key_alone	seg-	1	&held.dir().join("seg-1.sup"),
+src/db/vault.rs	2713	tcode	a_rewrapped_store_opens_under_the_new_key_alone	.sup	1	&held.dir().join("seg-1.sup"),
+src/db/vault.rs	2717	tcode	a_rewrapped_store_opens_under_the_new_key_alone	seg-	1	.persist(&pair("seg-1.sup", None), true)
+src/db/vault.rs	2717	tcode	a_rewrapped_store_opens_under_the_new_key_alone	.sup	1	.persist(&pair("seg-1.sup", None), true)
+src/db/vault.rs	2733	tcode	a_rewrapped_store_opens_under_the_new_key_alone	seg-	1	held.vault().adopt("seg-1.sup", token, wrapped, None);
+src/db/vault.rs	2733	tcode	a_rewrapped_store_opens_under_the_new_key_alone	.sup	1	held.vault().adopt("seg-1.sup", token, wrapped, None);
+src/db/vault.rs	2735	tcode	a_rewrapped_store_opens_under_the_new_key_alone	seg-	1	read(held.dir().join("seg-1.sup")).unwrap(),
+src/db/vault.rs	2735	tcode	a_rewrapped_store_opens_under_the_new_key_alone	.sup	1	read(held.dir().join("seg-1.sup")).unwrap(),
+src/db/vault.rs	2747	tcomment	<item:tests>	manifest	1	/// A manifest sealed opens to what was sealed, and a byte changed, a
+src/db/vault.rs	2750	tcode	a_sealed_manifest_opens_whole_or_not_at_all	manifest	1	fn a_sealed_manifest_opens_whole_or_not_at_all() {
+src/db/vault.rs	2756	tcode	a_sealed_manifest_opens_whole_or_not_at_all	manifest	2	.seal_manifest(9, b"the manifest's own bytes", &files)
+src/db/vault.rs	2758	tcode	a_sealed_manifest_opens_whole_or_not_at_all	manifest	1	assert!(!holds(&slot, b"manifest's own"));
+src/db/vault.rs	2759	tcode	a_sealed_manifest_opens_whole_or_not_at_all	manifest	1	let (m, f) = v.open_manifest(&slot).unwrap();
+src/db/vault.rs	2762	tcode	a_sealed_manifest_opens_whole_or_not_at_all	manifest	1	(&b"the manifest's own bytes"[..], &files)
+src/db/vault.rs	2767	tcode	a_sealed_manifest_opens_whole_or_not_at_all	manifest	1	assert!(v.open_manifest(&long).is_ok());
+src/db/vault.rs	2771	tcode	a_sealed_manifest_opens_whole_or_not_at_all	manifest	1	assert!(v.open_manifest(&bad).is_err(), "byte {at}");
+src/db/vault.rs	2773	tcode	a_sealed_manifest_opens_whole_or_not_at_all	manifest	1	assert!(v.open_manifest(&slot[..slot.len() - 1]).is_err());
+src/db/vault.rs	2774	tcode	a_sealed_manifest_opens_whole_or_not_at_all	manifest	1	assert!(v.open_manifest(&[]).is_err());
+src/db/vault.rs	2775	tcode	a_sealed_manifest_opens_whole_or_not_at_all	manifest	1	let empty = v.seal_manifest(0, b"", &[]).unwrap();
+src/db/vault.rs	2776	tcode	a_sealed_manifest_opens_whole_or_not_at_all	manifest	1	assert_eq!(v.open_manifest(&empty).unwrap(), (Vec::new(), Vec::new()));
+src/db/vault.rs	2787	tcode	a_sealed_manifest_opens_whole_or_not_at_all	manifest	1	assert!(v.open_manifest(&ragged).is_err(), "a ragged tail");
+src/db/vault.rs	2788	tcomment	a_sealed_manifest_opens_whole_or_not_at_all	manifest	1	// And a slot's files held to its manifest's names, one for one.
+src/db/vault.rs	2789	tcode	a_sealed_manifest_opens_whole_or_not_at_all	seg-	1	let segs = pair("seg-1.sup", None);
+src/db/vault.rs	2789	tcode	a_sealed_manifest_opens_whole_or_not_at_all	.sup	1	let segs = pair("seg-1.sup", None);
+src/db/vault.rs	2797	tcode	a_sealed_manifest_opens_whole_or_not_at_all	seg-	1	assert_eq!(names(held.dir()).unwrap(), vec!["seg-1.sup"]);
+src/db/vault.rs	2797	tcode	a_sealed_manifest_opens_whole_or_not_at_all	.sup	1	assert_eq!(names(held.dir()).unwrap(), vec!["seg-1.sup"]);
+src/db/vault.rs	2800	tcode	a_sealed_manifest_opens_whole_or_not_at_all	manifest	2	v.seal_manifest(9, b"the manifest's own bytes", &files)
+src/db/vault.rs	2807	tcode	a_sealed_manifest_opens_whole_or_not_at_all	manifest	1	other.vault().open_manifest(&slot).is_err(),
+src/db/pager.rs	495	comment	Pager::<item>	Db::	1	/// (`Reader::build_rest`, `Db::same_blocks`).
+src/crypt.rs	7	comment	<item>	Blob	1	//! `Bytes`, so `Blob::open(Encrypted::open(src, key)?)` and `SparseBlob` read
+src/crypt.rs	76	comment	<item>	Blob	1	//! `Blob` over the reader borrows its index out of it and copies nothing,
+src/crypt.rs	572	comment	ReadOptions::<item>	Blob	1	/// first touch, and it took a quarter off the open of a `Blob` over an
+src/crypt.rs	638	comment	Kept::<item>	Blob	1	/// section a `Blob` borrows is asked for again at every lookup, and a
+src/db/dirkey.rs	17	comment	<item>	Db::	1	//! - `Db::create` hands the kernel the key and sets the policy on the
+src/db/dirkey.rs	22	comment	<item>	Db::	1	//! - `Db::open` hands the kernel the key and holds the directory's policy
+src/db/dirkey.rs	25	comment	<item>	Db::	1	//! - `Db::open` with no key opens an encrypted store while the kernel holds
+src/db/dirkey.rs	470	comment	<item>	Db::	1	/// `Db::create`'s half: the directory encrypted under the key, before
+src/db/dirkey.rs	476	comment	<item>	Db::	1	/// `Db::open`'s half, with a key: the key handed over and the directory's
+src/db/dirkey.rs	482	comment	<item>	Db::	1	/// `Db::open`'s half, with no key: an encrypted directory whose key the

@@ -1,0 +1,244 @@
+# G-wall ratchet (draft, generated from the export of 682b2c09 by plan/wall/gen.py).
+# One line per (file, scope, token, region). Columns, tab-separated:
+#   file    path under the crate root
+#   scope   enclosing fn as Type::fn or fn; Type::<item> for a type's body or impl header;
+#           "const NAME" / "struct NAME" / "mod NAME" for a top-level item
+#   token   a token class named in the test's list
+#   region  code (strings included, comments excluded) | test (#[cfg(test)] items and #[test] fns)
+#   count   occurrences measured
+#   stage   where the line is expected to reach zero: G1 S1 R4 S3* S4 G3/S5 S6, or "stays"
+#   reason
+# Measured != listed fails the test, both ways. A key measured and not listed fails as growth.
+src/db.rs	mod dirkey	dirkey	code	1	stays	module declaration
+src/db.rs	mod pager	pager	code	1	stays	module declaration
+src/db.rs	mod vault	vault (field or module word)	code	1	stays	module declaration
+src/db.rs	Encryption::<item>	crypt	code	1	stays	the public mode enum
+src/db.rs	Encryption::<item>	dirkey	code	2	stays	the public mode enum
+src/db.rs	Encryption::<item>	cipher	code	2	stays	the public mode enum
+src/db.rs	Encryption::<item>	vault::<not a door verb>	code	1	stays	the public mode enum
+src/db.rs	Options::<item>	crypt	code	2	stays	Options.encryption
+src/db.rs	Options::<item>	cipher	code	1	S5	zpages_under_cipher
+src/db.rs	Options::default	crypt	code	2	stays	Options.encryption
+src/db.rs	Options::default	cipher	code	1	S5	zpages_under_cipher
+src/db.rs	Wal::<item>	cipher	code	1	S6	Wal.enc: Option<vault::LogCipher>
+src/db.rs	Wal::<item>	vault::<not a door verb>	code	1	S6	Wal.enc: Option<vault::LogCipher>
+src/db.rs	const WAL_SEALED_LEN	vault::<not a door verb>	code	1	S6	sealed log header length
+src/db.rs	const WAL_SEALED_LEN	sealed log/manifest	code	1	S6	sealed log header length
+src/db.rs	Wal::begin	cipher	code	1	S6	log_begin under vault::under
+src/db.rs	Wal::begin	vault::<not a door verb>	code	2	S6	log_begin under vault::under
+src/db.rs	Wal::begin	sealed log/manifest	code	2	S6	log_begin under vault::under
+src/db.rs	Wal::resume	cipher	code	1	S6	log_resume
+src/db.rs	Wal::resume	vault::<not a door verb>	code	2	S6	log_resume
+src/db.rs	Wal::resume	sealed log/manifest	code	3	S6	log_resume
+src/db.rs	Wal::open_append	vault::<not a door verb>	code	1	S6	sealed header read
+src/db.rs	Wal::open_append	sealed log/manifest	code	2	S6	sealed header read
+src/db.rs	Wal::write	sealed log/manifest	code	1	S6	enc.seal_into
+src/db.rs	Wal::replay	vault::<not a door verb>	code	1	S6	open_records
+src/db.rs	Wal::replay	sealed log/manifest	code	3	S6	open_records
+src/db.rs	Direct::<item>	run logged	code	1	S4	Direct.logged
+src/db.rs	Seg::records_resident	paged	code	1	G1	paged_resident through the byte source (R3)
+src/db.rs	struct PagerGrace	pager	code	1	stays	the reader table offered to the pager as its grace
+src/db.rs	PagerGrace::<item>	pager	code	2	stays	impl pager::Grace
+src/db.rs	Readers::page_idle	pager	code	1	stays	pager::debug_pinned hook in the reader table
+src/db.rs	Readers::page_back	pager	code	1	stays	pager::debug_pinned hook
+src/db.rs	Readers::pin	pager	code	1	stays	pager::debug_pinned hook
+src/db.rs	Readers::unpin	pager	code	1	stays	pager::debug_pinned hook
+src/db.rs	MemTable::logged	run logged	code	2	S4	
+src/db.rs	RunMap::<item>	vault::<not a door verb>	code	1	S1	vault::Mapped becomes the door's mapped backing (design 2); add to the door list then
+src/db.rs	RunMap::open	vault::<not a door verb>	code	1	S1	vault::open_mapped becomes a door verb (design 2)
+src/db.rs	const RUN_LOGGED	run logged	code	1	S4	
+src/db.rs	cipher_controller	cipher	code	2	S5	controller off under a cipher
+src/db.rs	manifest_image	vault::<not a door verb>	code	1	S6	v.persist + seal_manifest (tokens part goes at S3)
+src/db.rs	manifest_image	vault/pager method	code	1	S6	v.persist + seal_manifest (tokens part goes at S3)
+src/db.rs	manifest_image	sealed log/manifest	code	1	S6	v.persist + seal_manifest (tokens part goes at S3)
+src/db.rs	manifest_open	vault::<not a door verb>	code	1	S6	open_manifest + adopt_all (tokens part goes at S3)
+src/db.rs	manifest_open	sealed log/manifest	code	2	S6	open_manifest + adopt_all (tokens part goes at S3)
+src/db.rs	compact_job	vault::<not a door verb>	code	1	S1/R4	vault::hold picks MergeRest: pin rename, then the lease
+src/db.rs	compact_job	MergeRest/NoRest	code	1	S1/R4	vault::hold picks MergeRest: pin rename, then the lease
+src/db.rs	MergeRest::<item>	MergeRest/NoRest	code	1	R4	the lease
+src/db.rs	struct NoRest	MergeRest/NoRest	code	1	R4	Free
+src/db.rs	NoRest::<item>	MergeRest/NoRest	code	2	R4	Free
+src/db.rs	Hold::<item>	pager	code	1	R4	impl MergeRest for &pager::Hold
+src/db.rs	Hold::<item>	MergeRest/NoRest	code	1	R4	impl MergeRest for &pager::Hold
+src/db.rs	merge_ranks	MergeRest/NoRest	code	1	R4	R: MergeRest
+src/db.rs	merge_keys	MergeRest/NoRest	code	1	R4	R: MergeRest
+src/db.rs	struct Unlent	unlent/unlend	code	1	S1	pin::idle guard
+src/db.rs	Unlent::<item>	unlent/unlend	code	1	S1	pin::idle guard
+src/db.rs	Emitter::leave	vault::<not a door verb>	code	1	S3*	vault::persist_one
+src/db.rs	compact_run	MergeRest/NoRest	code	1	R4	R: MergeRest
+src/db.rs	compact_run	vault::<not a door verb>	code	2	S1+S3*	vault::check -> pin::verify (S1); vault::persist (S3*)
+src/db.rs	tier_run	vault::<not a door verb>	code	1	S1/R4	vault::hold picks MergeRest
+src/db.rs	tier_run	MergeRest/NoRest	code	1	S1/R4	vault::hold picks MergeRest
+src/db.rs	tier_walk	MergeRest/NoRest	code	1	R4	R: MergeRest
+src/db.rs	tier_walk	vault::<not a door verb>	code	2	S1+S3*	vault::check -> pin::verify (S1); vault::persist (S3*)
+src/db.rs	Shared::<item>	pager	code	3	stays	Shared.pager: the cache the read path pins
+src/db.rs	const ATTN_PAGED	attn/rest word	code	1	stays	the handle bit (CLAUDE.md, the plain store price)
+src/db.rs	const REST_HERE	attn/rest word	code	1	stays	the forms word under a cipher
+src/db.rs	const AHEAD_REST	attn/rest word	code	1	stays	the builder-ahead stop word
+src/db.rs	Db::<item>	vault::<not a door verb>	code	1	stays	Db.vault field: the open store under a cipher
+src/db.rs	Db::<item>	vault (field or module word)	code	1	stays	Db.vault field: the open store under a cipher
+src/db.rs	Reader::end_slow	pager	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::paged_begin	pager	code	2	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::paged_begin	paged	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::paged_begin	vault/pager method	code	2	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::paged_bits	paged	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::paged_bits	pager	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::paged_bits	attn/rest word	code	2	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::writer_rests	attn/rest word	code	2	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::not_asked	attn/rest word	code	2	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::look_mask	attn/rest word	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::begin_slow	attn/rest word	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::begin_slow	pager	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::begin_slow	vault/pager method	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::begin_slow	paged	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::snapshot	attn/rest word	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::release	attn/rest word	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::release	pager	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::unlent	unlent/unlend	code	1	S1	pin::idle
+src/db.rs	Reader::unlent	pager	code	1	S1	pin::idle
+src/db.rs	Reader::rest	pager	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::rest	vault/pager method	code	2	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::build_rest_unless	pager	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::build_rest_unless	vault/pager method	code	4	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::unlend	unlent/unlend	code	4	S1	pin::idle
+src/db.rs	Reader::unlend	pager	code	1	S1	pin::idle
+src/db.rs	Reader::scan_rested	pager	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::scan_rested	vault/pager method	code	2	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::abandon_slow	attn/rest word	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::abandon_pending	attn/rest word	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::abandon_forms	attn/rest word	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Db::cipher_counts	cipher	code	2	stays	public counters
+src/db.rs	Db::cipher_counts	vault::<not a door verb>	code	1	stays	public counters
+src/db.rs	Db::cipher_counts	vault/pager method	code	1	stays	public counters
+src/db.rs	Db::cipher_counts	vault (field or module word)	code	1	stays	public counters
+src/db.rs	Db::sync_wal	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
+src/db.rs	Db::create	crypt	code	4	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
+src/db.rs	Db::create	vault::<not a door verb>	code	4	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
+src/db.rs	Db::create	dirkey	code	1	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
+src/db.rs	Db::create	cipher	code	4	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
+src/db.rs	Db::create	pager	code	5	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
+src/db.rs	Db::create	vault/pager method	code	3	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
+src/db.rs	Db::create	paged	code	1	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
+src/db.rs	Db::create	vault (field or module word)	code	1	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
+src/db.rs	Db::open	crypt	code	4	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
+src/db.rs	Db::open	dirkey	code	3	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
+src/db.rs	Db::open	vault::<not a door verb>	code	4	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
+src/db.rs	Db::open	cipher	code	4	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
+src/db.rs	Db::open	pager	code	6	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
+src/db.rs	Db::open	vault/pager method	code	6	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
+src/db.rs	Db::open	paged	code	1	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
+src/db.rs	Db::open	vault (field or module word)	code	1	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
+src/db.rs	Db::append_pinned	vault (field or module word)	code	1	S4	self.vault.is_some() picks a logged table
+src/db.rs	Db::append_pinned	run logged	code	1	S4	self.vault.is_some() picks a logged table
+src/db.rs	Db::commit_direct	run logged	code	4	S4	log_run
+src/db.rs	Db::log_run	run logged	code	2	S4	
+src/db.rs	Db::log_run_again	run logged	code	2	S4	
+src/db.rs	Db::run_attended	run logged	code	1	S4	
+src/db.rs	Db::run_again	run logged	code	5	S4	
+src/db.rs	Db::close_run	vault::<not a door verb>	code	1	S3*	vault::persist
+src/db.rs	Db::seal_table	vault::<not a door verb>	code	1	S3*	vault::persist
+src/db.rs	Db::take_fresh_mem	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
+src/db.rs	Reader::maint_reader	paged	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::seal_reader	paged	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::new_reader	paged	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::start_ahead	attn/rest word	code	2	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Db::land_seal	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
+src/db.rs	Db::maint_request	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
+src/db.rs	Db::z_on_disk	vault::<not a door verb>	code	1	S3*	vault::companion
+src/db.rs	Db::z_attach	vault::<not a door verb>	code	1	S3*	vault::companion
+src/db.rs	Reader::understudy	paged	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Db::hold_within	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
+src/db.rs	Db::hold_for_upkeep	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
+src/db.rs	Db::join_upkeep	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
+src/db.rs	Maint::answer	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
+src/db.rs	Maint::join_seal	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
+src/db.rs	Maint::land_front	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
+src/db.rs	Maint::retire_covered	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
+src/db.rs	Maint::join_tier	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
+src/db.rs	Maint::retire_seg	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
+src/db.rs	Maint::sync_owed_slot	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
+src/db.rs	Maint::publish	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
+src/db.rs	Maint::z_sample_start	vault::<not a door verb>	code	1	S1	vault::hold -> pin::hold
+src/db.rs	Maint::join_merge	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
+src/db.rs	mod cipher_looks	cipher	test	1	stays	cipher_looks: the plain/cipher look words of the plumbing
+src/db.rs	the_forms_word_under_a_cipher_is_a_rest_and_stays_one	cipher	test	4	stays	cipher_looks: the plain/cipher look words of the plumbing
+src/db.rs	the_forms_word_under_a_cipher_is_a_rest_and_stays_one	crypt	test	3	stays	cipher_looks: the plain/cipher look words of the plumbing
+src/db.rs	the_forms_word_under_a_cipher_is_a_rest_and_stays_one	vault::<not a door verb>	test	1	stays	cipher_looks: the plain/cipher look words of the plumbing
+src/db.rs	the_forms_word_under_a_cipher_is_a_rest_and_stays_one	attn/rest word	test	1	stays	cipher_looks: the plain/cipher look words of the plumbing
+src/db/zfile.rs	ZFile::attach	vault::<not a door verb>	code	1	S1	vault::hold -> pin::hold
+src/db/zfile.rs	open_seg	vault::<not a door verb>	code	1	R4	vault::kept picks the held build (design 6 renames it vault::paged at S3; R0 bars that too)
+src/db/zfile.rs	open_seg	held build	code	1	R4	vault::kept picks the held build (design 6 renames it vault::paged at S3; R0 bars that too)
+src/db/zfile.rs	build_file_seen	held build	code	1	R4+S3*	SegSrc::Kept arm: vault::hold, the cipher error string (R4); vault::persist_form (S3*)
+src/db/zfile.rs	build_file_seen	vault::<not a door verb>	code	2	R4+S3*	SegSrc::Kept arm: vault::hold, the cipher error string (R4); vault::persist_form (S3*)
+src/db/zfile.rs	build_file_seen	cipher	code	1	R4+S3*	SegSrc::Kept arm: vault::hold, the cipher error string (R4); vault::persist_form (S3*)
+src/db/zfile.rs	Walked::<item>	held build	code	1	R4	
+src/db/zfile.rs	Mapped::<item>	held build	code	1	R4	impl Walked for Mapped
+src/db/zfile.rs	Held::<item>	pager	code	1	R4	impl Walked for Held
+src/db/zfile.rs	Held::<item>	held build	code	1	R4	impl Walked for Held
+src/db/zfile.rs	write_pages	held build	code	1	R4	W: Walked
+src/ordindex.rs	OrdIndex::open	piecewise/ASK_PIECES	code	1	G1	piecewise picks the CRC skip and the lazy top (R2; ordindex.rs:413-428)
+src/ordindex.rs	OrdIndex::head_absent	piecewise/ASK_PIECES	code	1	G1	piecewise picks the CRC skip and the lazy top (R2; ordindex.rs:413-428)
+src/blob.rs	Sec::read	piecewise/ASK_PIECES	code	1	stays	the dispatch on the source kind (R2 keeps it in blob)
+src/blob.rs	Sec::pieces	piecewise/ASK_PIECES	code	1	stays	the dispatch on the source kind (R2 keeps it in blob)
+src/blob.rs	not_lent	piecewise/ASK_PIECES	code	1	stays	the dispatch on the source kind (R2 keeps it in blob)
+src/blob.rs	Blob::scan_at	piecewise/ASK_PIECES	code	2	stays	the dispatch on the source kind (R2 keeps it in blob)
+src/blob.rs	Blob::scan_refused	piecewise/ASK_PIECES	code	1	stays	the dispatch on the source kind (R2 keeps it in blob)
+src/blob.rs	Blob::scan_whole	piecewise/ASK_PIECES	code	1	stays	the dispatch on the source kind (R2 keeps it in blob)
+src/db/vault.rs	Kind::suffix	kind of form file	code	5	S3*	envelope naming by kind, the persist and companion cascade, the sweep rule
+src/db/vault.rs	disk_parse	kind of form file	code	5	S3*	envelope naming by kind, the persist and companion cascade, the sweep rule
+src/db/vault.rs	passes	file name prefix/suffix	code	2	S6	the log, the spare and the manifest pass by name
+src/db/vault.rs	passes	manifest	code	1	S6	the log, the spare and the manifest pass by name
+src/db/vault.rs	default_cache	form module path	code	1	G3	zfile::read_budget: the budget moves behind Memory (R12)
+src/db/vault.rs	Vault::remove	kind of form file	code	2	S3*	envelope naming by kind, the persist and companion cascade, the sweep rule
+src/db/vault.rs	Vault::persist_with	seg/ord/form ident	code	10	S3*	envelope naming by kind, the persist and companion cascade, the sweep rule
+src/db/vault.rs	Vault::persist_with	manifest	code	1	S3*	envelope naming by kind, the persist and companion cascade, the sweep rule
+src/db/vault.rs	Vault::persist_with	kind of form file	code	2	S3*	envelope naming by kind, the persist and companion cascade, the sweep rule
+src/db/vault.rs	Vault::persist_form	seg/ord/form ident	code	6	S3*	envelope naming by kind, the persist and companion cascade, the sweep rule
+src/db/vault.rs	Vault::persist_form	kind of form file	code	2	S3*	envelope naming by kind, the persist and companion cascade, the sweep rule
+src/db/vault.rs	Vault::companion	seg/ord/form ident	code	5	S3*	envelope naming by kind, the persist and companion cascade, the sweep rule
+src/db/vault.rs	Vault::companion	kind of form file	code	2	S3*	envelope naming by kind, the persist and companion cascade, the sweep rule
+src/db/vault.rs	Vault::adopt	seg/ord/form ident	code	8	S3*	envelope naming by kind, the persist and companion cascade, the sweep rule
+src/db/vault.rs	Vault::adopt	kind of form file	code	2	S3*	envelope naming by kind, the persist and companion cascade, the sweep rule
+src/db/vault.rs	Vault::adopt_all	seg/ord/form ident	code	7	S3*	envelope naming by kind, the persist and companion cascade, the sweep rule
+src/db/vault.rs	Vault::adopt_all	manifest	code	1	S3*	envelope naming by kind, the persist and companion cascade, the sweep rule
+src/db/vault.rs	Vault::sweep	kind of form file	code	2	S3*	envelope naming by kind, the persist and companion cascade, the sweep rule
+src/db/vault.rs	Vault::seal_manifest	manifest	code	5	S6	
+src/db/vault.rs	Vault::open_manifest	manifest	code	7	S6	
+src/db/vault.rs	Vault::log_begin	log record	code	3	S6	
+src/db/vault.rs	Vault::log_resume	log record	code	3	S6	
+src/db/vault.rs	slot_aad	manifest	code	1	S6	
+src/db/vault.rs	log_aad	log record	code	1	S6	
+src/db/vault.rs	const RECORD_HEAD	log record	code	1	S6	
+src/db/vault.rs	LogCipher::<item>	log record	code	2	S6	
+src/db/vault.rs	LogCipher::new	log record	code	2	S6	
+src/db/vault.rs	LogCipher::seal_into	log record	code	4	S6	
+src/db/vault.rs	LogCipher::open_records	log record	code	3	S6	
+src/db/vault.rs	persist_one	seg/ord/form ident	code	5	S3*	envelope naming by kind, the persist and companion cascade, the sweep rule
+src/db/vault.rs	persist_one	form type	code	1	S3*	envelope naming by kind, the persist and companion cascade, the sweep rule
+src/db/vault.rs	persist_form	seg/ord/form ident	code	4	S3*	envelope naming by kind, the persist and companion cascade, the sweep rule
+src/db/vault.rs	companion	seg/ord/form ident	code	4	S3*	envelope naming by kind, the persist and companion cascade, the sweep rule
+src/db/vault.rs	pair	seg/ord/form ident	test	4	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	file name prefix/suffix	test	26	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	seg/ord/form ident	test	2	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	kind of form file	test	1	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	file name prefix/suffix	test	49	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	seg/ord/form ident	test	4	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	kind of form file	test	5	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_path_the_door_is_not_in_front_of_writes_nothing	file name prefix/suffix	test	6	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_path_the_door_is_not_in_front_of_writes_nothing	seg/ord/form ident	test	3	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	the_log_and_the_manifest_pass_to_the_directory	manifest	test	12	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	the_log_and_the_manifest_pass_to_the_directory	file name prefix/suffix	test	11	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	the_log_and_the_manifest_pass_to_the_directory	seg/ord/form ident	test	3	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	file name prefix/suffix	test	34	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	seg/ord/form ident	test	14	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	manifest	test	1	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	kind of form file	test	2	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_changed_envelope_is_refused	file name prefix/suffix	test	28	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_changed_envelope_is_refused	seg/ord/form ident	test	14	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_changed_envelope_is_refused	kind of form file	test	1	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_rewrapped_store_opens_under_the_new_key_alone	file name prefix/suffix	test	8	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_rewrapped_store_opens_under_the_new_key_alone	seg/ord/form ident	test	4	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_sealed_manifest_opens_whole_or_not_at_all	manifest	test	16	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_sealed_manifest_opens_whole_or_not_at_all	file name prefix/suffix	test	4	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_sealed_manifest_opens_whole_or_not_at_all	seg/ord/form ident	test	6	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	log record	test	12	S3/S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)

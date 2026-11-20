@@ -25,10 +25,17 @@ encryption) is designed and planned and **not started**. That is the next piece 
 - A directory fsync that fails: make the names durable another way (guards); if that fails too,
   the store stays open for reads and its writes answer the failure. Implemented (`f364cf4`,
   `9a668be`).
-- Push only to `claude/inspiring-brahmagupta-d7y8n7`
-  (`git push origin HEAD:claude/inspiring-brahmagupta-d7y8n7`, up to 4 tries), and only after
-  `sh scripts/check.sh` is green on the tree. No pull request unless asked. No model ids in
-  commits. Commit trailer: the `Co-Authored-By` and `Claude-Session` lines the session gives.
+- Push to `claude/inspiring-brahmagupta-d7y8n7` and to no other branch
+  (`git push origin HEAD:claude/inspiring-brahmagupta-d7y8n7`, up to 4 tries), whenever there is
+  a commit to push. An earlier copy of this note said "only after `sh scripts/check.sh` is green
+  on the tree"; the owner corrected that on 20 Nov: "The standing rule should be to change the
+  engine default only after benchmarks confirm it's better, why would I care about pushing
+  commits?" So pushing waits for nothing, and the gate is for what a commit claims, not for the
+  push.
+- An engine default changes only after benchmarks confirm it is better (the owner, 20 Nov), and
+  after `sh scripts/check.sh` has passed with the new default in place (`CLAUDE.md`).
+- No pull request unless asked. No model ids in commits. Commit trailer: the `Co-Authored-By`
+  and `Claude-Session` lines the session gives.
 - Preferences: be logical, test locally, do not speculate, no shortcuts.
 
 ## Where the branch stands
@@ -151,10 +158,12 @@ Read before starting:
 - **The plans' line numbers are stale.** They cite export `682b2c09`, from before three upstream
   merges (about 250 commits) and everything in "what was done" above. Every `db.rs:NNNN` has to
   be found again by symbol.
-- **G1-1's inputs are gone.** `plan/wall/couplings.txt`, `wall_cipher.json`, `wall_form.json`,
-  `lex.py` and the scouts' `notes.md`/`check.md` lived in another session's scratchpad and were
-  never copied into the repo. `g1.md` says what each held (token lists, file lists, the counts
-  at the time, the corrections). Rebuild them from the tree; the counts will differ.
+- **G1-1's inputs are in the repo now** (`scratch/plan/wall`, `door`, `borrows`, `conform`,
+  `wallcheck`: the scouts' notes and checks, `couplings.txt`, the token lists, `lex.py`,
+  `gen.py`), copied on 20 Nov from the scratchpad of the session that made them. They are of
+  the tree at `682b2c09`: the counts will differ on today's tree. One file over a megabyte was
+  left out (`wall/db.reg`, which `gen.py` writes again). `scratch/plan/build/g1-build-v2.js` is
+  the G1 script brought up to today's tree.
 - **G1-3 is partly built**: `scripts/cost.sh` and `scripts/cost-hot.txt`. What it lacks is
   listed under the count-back.
 - The process each unit inherits is at the top of `g1.md`: red input first, the change, mutants

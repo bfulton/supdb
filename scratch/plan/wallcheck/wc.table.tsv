@@ -1,0 +1,27 @@
+file	token	code	comment	tcode	tcomment
+src/blob.rs	cipher	0	2	0	0
+src/blob.rs	piecewise/ASK_PIECES	7	3	0	0
+src/db.rs	MergeRest/NoRest	11	2	0	0
+src/db.rs	attn/rest word	18	7	1	0
+src/db.rs	cipher	19	124	5	1
+src/db.rs	crypt	13	27	3	0
+src/db.rs	dirkey	7	1	0	0
+src/db.rs	envelope	0	22	0	0
+src/db.rs	paged	10	6	0	0
+src/db.rs	pager	34	21	0	0
+src/db.rs	run logged	19	17	0	0
+src/db.rs	sealed log/manifest	15	2	0	0
+src/db.rs	unlent/unlend	23	7	0	0
+src/db.rs	vault (field or module word)	6	3	0	0
+src/db.rs	vault/pager method	22	0	0	0
+src/db.rs	vault::<not a door verb>	35	5	1	0
+src/db/zfile.rs	cipher	1	11	0	0
+src/db/zfile.rs	envelope	0	4	0	0
+src/db/zfile.rs	held build	6	1	0	0
+src/db/zfile.rs	pager	1	0	0	0
+src/db/zfile.rs	vault::<not a door verb>	4	0	0	0
+src/flatindex.rs	piecewise/ASK_PIECES	0	1	0	0
+src/ordindex.rs	cipher	0	1	0	0
+src/ordindex.rs	crypt	0	1	0	0
+src/ordindex.rs	pager	0	1	0	0
+src/ordindex.rs	piecewise/ASK_PIECES	2	1	0	0

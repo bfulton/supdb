@@ -1,0 +1,703 @@
+src/bytes.rs	283	slice_at:249	-	mmap	Map(memmap2::Mmap),
+src/bytes.rs	345	open:344	-	fs	let file = std::fs::File::open(path)?;
+src/bytes.rs	350	open:344	-	mmap	Ok(MmapBytes::from_map(unsafe { memmap2::Mmap::map(&file)? }))
+src/bytes.rs	354	from_map:354	-	mmap	pub fn from_map(map: memmap2::Mmap) -> MmapBytes {
+src/bytes.rs	382	map:382	-	mmap	fn map(&self) -> Option<&memmap2::Mmap> {
+src/bytes.rs	434	resident_pages:422	-	libc	libc::mincore(
+src/bytes.rs	451	os_page_size:449	-	libc	let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+src/bytes.rs	516	advise_random:513	-	mmap	let _ = m.advise(memmap2::Advice::Random);
+src/bytes.rs	524	advise_normal:521	-	mmap	let _ = m.advise(memmap2::Advice::Normal);
+src/bytes.rs	546	advise_dontneed_range:530	-	libc	let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+src/bytes.rs	557	advise_dontneed_range:530	-	libc	libc::madvise((base + a) as *mut libc::c_void, b - a, libc::MADV_DONTNEED);
+src/bytes.rs	572	resident_at:561	-	libc	let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+src/bytes.rs	577	resident_at:561	-	libc	let rc = unsafe { libc::mincore(at as *mut libc::c_void, page, vec.as_mut_ptr()) };
+src/bytes.rs	590	advise_dontneed:580	-	libc	libc::madvise(
+src/bytes.rs	630	advise_willneed:604	-	mmap	.advise_range(memmap2::Advice::WillNeed, start + done, n)
+src/bytes.rs	655	resident_pages_counts_every_page_a_range_touches_and_none_past_the_end:650	T	fs	std::fs::write(&path, vec![7u8; len]).unwrap();
+src/bytes.rs	678	resident_pages_counts_every_page_a_range_touches_and_none_past_the_end:650	T	fs	let _ = std::fs::remove_file(&path);
+src/crypt.rs	383	encrypt:375	-	fs	std::fs::File::open("/dev/urandom")?.read_exact(&mut id)?;
+src/crypt.rs	627	default:590	-	mmap	map: memmap2::MmapRaw,
+src/crypt.rs	661	new:654	-	mmap	let map: memmap2::MmapRaw = memmap2::MmapOptions::new().len(len).map_anon().ok()?.into();
+src/crypt.rs	666	new:654	-	libc	unsafe { libc::madvise(map.as_mut_ptr().cast(), len, libc::MADV_HUGEPAGE) };
+src/crypt.rs	732	populate:723	-	libc	libc::madvise(
+src/crypt.rs	992	keep:937	-	thread	_ => std::thread::yield_now(),
+src/crypt.rs	1929	threads_decrypt_each_chunk_once_between_them:1923	T	thread	std::thread::scope(|s| {
+src/crypt.rs	1932	threads_decrypt_each_chunk_once_between_them:1923	T	thread	s.spawn(move || {
+src/crypt.rs	1933	threads_decrypt_each_chunk_once_between_them:1923	T	thread	start.wait();
+src/crypt.rs	2000	pages_asked_for_ahead_stay_inside_the_bound:1990	T	libc	unsafe { libc::mincore(k.map.as_mut_ptr().cast(), k.map.len(), vec.as_mut_ptr()) };
+src/db.rs	31	None	-	fs	use std::fs::File;
+src/db.rs	31	None	-	Filetype	use std::fs::File;
+src/db.rs	102	write_ord:99	-	fsmeth	f.sync_all()?;
+src/db.rs	117	write_ord_unsynced:117	-	Filetype	fn write_ord_unsynced(dir: &Path, seg_name: &str, bytes: &[u8]) -> Result<File> {
+src/db.rs	125	write_ord_tmp:125	-	Filetype	fn write_ord_tmp(dir: &Path, seg_name: &str, bytes: &[u8]) -> Result<(File, PathBuf, String)> {
+src/db.rs	310	idle_io_priority:305	-	libc	let _ = libc::syscall(
+src/db.rs	325	io_priority_class:322	-	libc	let v = libc::syscall(libc::SYS_ioprio_get, 1 as libc::c_int, 0 as libc::c_int);
+src/db.rs	4202	default:3954	-	Filetype	file: File,
+src/db.rs	4443	prefill:4435	-	fsmeth	self.file.sync_all()?;
+src/db.rs	4524	open_append:4522	-	fsmeth	let mut written = file.metadata()?.len();
+src/db.rs	4687	sync:4686	-	fsmeth	self.file.sync_data()?;
+src/db.rs	4718	put_back:4706	-	fsmeth	.set_len(self.written)
+src/db.rs	4857	replay:4846	-	fsmeth	f.read_to_end(&mut buf)?;
+src/db.rs	5379	join:5377	-	thread	ZJob::Build(h) => h.join().map(|_| ()),
+src/db.rs	5380	join:5377	-	thread	ZJob::Warm(h) => h.join().map(|_| ()),
+src/db.rs	5811	seg_order:5759	-	Filetype	file: File,
+src/db.rs	5913	new:5913	-	Filetype	fn new(file: File, piece: usize, writeback: bool, ahead: u64, prefault: bool) -> AlignedWriter {
+src/db.rs	6195	get_ref:6195	-	Filetype	fn get_ref(&self) -> &File {
+src/db.rs	6207	into_inner:6207	-	Filetype	fn into_inner(mut self) -> std::io::Result<File> {
+src/db.rs	6235	read_section:6234	-	fs	use std::os::unix::fs::FileExt;
+src/db.rs	6235	read_section:6234	-	fileext	use std::os::unix::fs::FileExt;
+src/db.rs	6238	read_section:6234	-	fsmeth	self.file.read_exact_at(&mut dst[..on_file], off)?;
+src/db.rs	6521	write_buf_with:6497	-	fs	use std::os::unix::fs::FileExt;
+src/db.rs	6521	write_buf_with:6497	-	fileext	use std::os::unix::fs::FileExt;
+src/db.rs	6526	write_buf_with:6497	-	fsmeth	self.file.write_all_at(&self.buf[..split], 0)?;
+src/db.rs	6527	write_buf_with:6497	-	fsmeth	self.file.write_all_at(&self.buf[split..], split as u64)?;
+src/db.rs	6529	write_buf_with:6497	-	fsmeth	self.file.write_all_at(&self.buf, at)?;
+src/db.rs	6558	pwritev_all:6558	-	Filetype	fn pwritev_all(file: &File, at: u64, parts: &[&[u8]], fault: &mut u8) -> std::io::Result<()> {
+src/db.rs	6567	pwritev_at:6567	-	Filetype	fn pwritev_at(file: &File, at: u64, parts: &[&[u8]]) -> std::io::Result<()> {
+src/db.rs	6568	pwritev_at:6567	-	fileext	use std::os::unix::io::AsRawFd;
+src/db.rs	6569	pwritev_at:6567	-	fsmeth	let fd = file.as_raw_fd();
+src/db.rs	6574	pwritev_at:6567	-	libc	libc::pwritev(
+src/db.rs	6629	run_write_fault:6629	-	Filetype	fn run_write_fault(file: &File, at: u64, parts: &[&[u8]], fault: &mut u8) -> std::io::Result<()> {
+src/db.rs	6630	run_write_fault:6629	-	fs	use std::os::unix::fs::FileExt;
+src/db.rs	6630	run_write_fault:6629	-	fileext	use std::os::unix::fs::FileExt;
+src/db.rs	6656	run_write_fault:6629	-	fsmeth	if file.write_all_at(&v[..take], off).is_err() {
+src/db.rs	6674	run_write_fault:6629	-	fsmeth	file.write_all_at(&p[..(p.len() / 2).max(1)], at)?;
+src/db.rs	6689	start_writeback:6689	-	Filetype	fn start_writeback(file: &File, at: u64, len: u64) {
+src/db.rs	6692	start_writeback:6689	-	fileext	use std::os::unix::io::AsRawFd;
+src/db.rs	6696	start_writeback:6689	-	libc	libc::sync_file_range(
+src/db.rs	6697	start_writeback:6689	-	fsmeth	file.as_raw_fd(),
+src/db.rs	6767	spawn:6766	-	Filetype	file: &File,
+src/db.rs	6775	spawn:6766	-	fsmeth	let dup = file.try_clone()?;
+src/db.rs	6792	spawn:6766	-	thread	let thread = std::thread::Builder::new()
+src/db.rs	6794	spawn:6766	-	thread	.spawn(move || WriterHelper::run(&s, &dup, ahead, fail.as_deref()))?;
+src/db.rs	6801	run:6801	-	Filetype	fn run(s: &HelperShared, dup: &File, ahead: u64, fail: Option<&AtomicU64>) {
+src/db.rs	6802	run:6801	-	fs	use std::os::unix::fs::FileExt;
+src/db.rs	6802	run:6801	-	fileext	use std::os::unix::fs::FileExt;
+src/db.rs	6817	run:6801	-	fsmeth	if dup.read_exact_at(&mut buf[..n], off).is_err() {
+src/db.rs	6842	run:6801	-	fsmeth	dup.sync_data()
+src/db.rs	6870	run:6801	-	thread	std::thread::park();
+src/db.rs	6891	stop:6887	-	thread	let _ = t.join();
+src/db.rs	7617	sync_with:7593	-	fsmeth	self.out.get_ref().sync_data()
+src/db.rs	8142	flush_block:8079	-	fsmeth	self.out.get_ref().sync_data()?;
+src/db.rs	8229	finish:8228	-	fsmeth	self.finish_unsynced(generation)?.sync_all()
+src/db.rs	8238	finish_unsynced:8238	-	Filetype	pub(crate) fn finish_unsynced(self, generation: u64) -> Result<File> {
+src/db.rs	8253	finish_unsynced_from:8248	-	Filetype	) -> Result<(File, BlockedBloom)> {
+src/db.rs	8265	finish_unsynced_with:8261	-	Filetype	) -> Result<(File, Option<BlockedBloom>)> {
+src/db.rs	8449	finish_unsynced_with:8261	-	fs	use std::os::unix::fs::FileExt;
+src/db.rs	8449	finish_unsynced_with:8261	-	fileext	use std::os::unix::fs::FileExt;
+src/db.rs	8451	finish_unsynced_with:8261	-	fsmeth	file.write_all_at(h, key_off)?;
+src/db.rs	8469	finish_unsynced_with:8261	-	fsmeth	file.write_all_at(&table, self.reserve_off)?;
+src/db.rs	8476	finish_unsynced_with:8261	-	fsmeth	file.read_exact_at(&mut row, key_off + hdr.crc_off as u64)?;
+src/db.rs	8477	finish_unsynced_with:8261	-	fsmeth	file.write_all_at(&row, at)?;
+src/db.rs	8483	finish_unsynced_with:8261	-	fsmeth	file.read_exact_at(&mut fence, key_off + foff as u64)?;
+src/db.rs	8484	finish_unsynced_with:8261	-	fsmeth	file.write_all_at(&fence, at)?;
+src/db.rs	8493	finish_unsynced_with:8261	-	fsmeth	file.read_exact_at(&mut d, key_off + hdr.dir_off as u64)?;
+src/db.rs	8494	finish_unsynced_with:8261	-	fsmeth	file.write_all_at(&d, at)?;
+src/db.rs	8547	finish_unsynced_with:8261	-	fsmeth	file.write_all_at(&page, 0)?;
+src/db.rs	8756	create:8745	-	thread	crate::ordindex::Builder::new(),
+src/db.rs	8773	file_clone:8773	-	Filetype	fn file_clone(&self) -> std::io::Result<File> {
+src/db.rs	8774	file_clone:8773	-	fsmeth	self.0.out.get_ref().try_clone()
+src/db.rs	8883	finish_unsynced:8883	-	Filetype	fn finish_unsynced(self) -> Result<(File, Vec<u8>)> {
+src/db.rs	8895	finish_unsynced_from:8892	-	Filetype	) -> Result<(File, Vec<u8>, (BlockedBloom, bool))> {
+src/db.rs	9244	open_ord:9233	-	thread	let mut b = crate::ordindex::Builder::new();
+src/db.rs	9806	populate_ahead:9791	-	libc	libc::madvise(
+src/db.rs	10442	register_membarrier:10438	-	libc	return unsafe { libc::syscall(libc::SYS_membarrier, 1i32 << 4, 0i32) } == 0;
+src/db.rs	10457	membarrier_all_threads:10453	-	libc	libc::syscall(libc::SYS_membarrier, 1i32 << 3, 0i32);
+src/db.rs	12167	drop:12146	-	mmap	map: memmap2::Mmap,
+src/db.rs	12199	open:12191	-	mmap	let map = unsafe { memmap2::MmapOptions::new().len(cap).map(&file)? };
+src/db.rs	12507	manifest_write_slot:12498	-	fsmeth	manifest_write_slot_unsynced(dir, slot, seq, covered_seq, names, pending, tear)?.sync_data()?;
+src/db.rs	12524	manifest_write_slot_unsynced:12516	-	Filetype	) -> Result<File> {
+src/db.rs	12525	manifest_write_slot_unsynced:12516	-	fs	use std::os::unix::fs::FileExt;
+src/db.rs	12525	manifest_write_slot_unsynced:12516	-	fileext	use std::os::unix::fs::FileExt;
+src/db.rs	12529	manifest_write_slot_unsynced:12516	-	fsmeth	f.write_all_at(&out[..out.len() / 2], 0)?;
+src/db.rs	12532	manifest_write_slot_unsynced:12516	-	fsmeth	f.write_all_at(&out, 0)?;
+src/db.rs	12593	manifest_write:12581	-	fsmeth	f.sync_all()?;
+src/db.rs	12715	manifest_read_all:12709	-	fsmeth	Ok(mut f) => f.read_to_end(&mut buf)?,
+src/db.rs	13581	compact_run:13438	-	fs	let files: Vec<Option<std::fs::File>> = if drop_behind {
+src/db.rs	13581	compact_run:13438	-	Filetype	let files: Vec<Option<std::fs::File>> = if drop_behind {
+src/db.rs	13881	thread_minflt:13880	-	fs	std::fs::read_to_string("/proc/thread-self/stat")
+src/db.rs	13881	thread_minflt:13880	-	procsys	std::fs::read_to_string("/proc/thread-self/stat")
+src/db.rs	13893	thread_majflt:13892	-	fs	std::fs::read_to_string("/proc/thread-self/stat")
+src/db.rs	13893	thread_majflt:13892	-	procsys	std::fs::read_to_string("/proc/thread-self/stat")
+src/db.rs	13969	finish_steps_on:13955	-	Filetype	type DirectFinished = (bool, File, Vec<u8>, Option<(BlockedBloom, bool)>);
+src/db.rs	15764	fadvise_dontneed_range:15764	-	fs	fn fadvise_dontneed_range(file: &std::fs::File, off: u64, len: u64) {
+src/db.rs	15764	fadvise_dontneed_range:15764	-	Filetype	fn fadvise_dontneed_range(file: &std::fs::File, off: u64, len: u64) {
+src/db.rs	15765	fadvise_dontneed_range:15764	-	fileext	use std::os::unix::io::AsRawFd;
+src/db.rs	15771	fadvise_dontneed_range:15764	-	fsmeth	libc::posix_fadvise(file.as_raw_fd(), off, len, libc::POSIX_FADV_DONTNEED);
+src/db.rs	15771	fadvise_dontneed_range:15764	-	libc	libc::posix_fadvise(file.as_raw_fd(), off, len, libc::POSIX_FADV_DONTNEED);
+src/db.rs	15775	fadvise_dontneed_range:15775	-	fs	fn fadvise_dontneed_range(_file: &std::fs::File, _off: u64, _len: u64) {}
+src/db.rs	15775	fadvise_dontneed_range:15775	-	Filetype	fn fadvise_dontneed_range(_file: &std::fs::File, _off: u64, _len: u64) {}
+src/db.rs	15781	fadvise_dontneed:15781	-	fs	fn fadvise_dontneed(file: &std::fs::File) {
+src/db.rs	15781	fadvise_dontneed:15781	-	Filetype	fn fadvise_dontneed(file: &std::fs::File) {
+src/db.rs	15782	fadvise_dontneed:15781	-	fileext	use std::os::unix::io::AsRawFd;
+src/db.rs	15786	fadvise_dontneed:15781	-	fsmeth	libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+src/db.rs	15786	fadvise_dontneed:15781	-	libc	libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+src/db.rs	15791	fadvise_dontneed:15791	-	fs	fn fadvise_dontneed(_file: &std::fs::File) {}
+src/db.rs	15791	fadvise_dontneed:15791	-	Filetype	fn fadvise_dontneed(_file: &std::fs::File) {}
+src/db.rs	15809	resident_share:15796	-	libc	libc::mincore(
+src/db.rs	15829	resident_share:15796	-	libc	type Mallinfo2 = unsafe extern "C" fn() -> libc::mallinfo2;
+src/db.rs	15836	mallinfo2:15831	-	libc	let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"mallinfo2".as_ptr()) };
+src/db.rs	15860	resident_beyond_use:15858	-	fs	let text = std::fs::read_to_string("/proc/self/status").ok()?;
+src/db.rs	15860	resident_beyond_use:15858	-	procsys	let text = std::fs::read_to_string("/proc/self/status").ok()?;
+src/db.rs	15892	trim:15889	-	libc	unsafe { libc::malloc_trim(0) };
+src/db.rs	15899	set_mmap_threshold:15896	-	libc	unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, n) };
+src/db.rs	15968	mono_secs:15962	-	libc	unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+src/db.rs	15991	trim_loop:15979	-	thread	std::thread::sleep(std::time::Duration::from_millis(1));
+src/db.rs	15996	trim_loop:15979	-	thread	std::thread::park();
+src/db.rs	16030	start_trimmer:16017	-	thread	let spawned = std::thread::Builder::new()
+src/db.rs	16032	start_trimmer:16017	-	thread	.spawn(move || trim_loop(&held, &flag, stride, by_resident));
+src/db.rs	17253	with_tables:17085	-	Filetype	File,
+src/db.rs	22764	upkeep_held:22758	-	thread	std::thread::sleep(std::time::Duration::from_millis(1));
+src/db.rs	22864	install_ahead:22844	-	thread	let built = match a.rx.try_recv() {
+src/db.rs	22866	install_ahead:22844	-	thread	Err(std::sync::mpsc::TryRecvError::Empty) => break,
+src/db.rs	22867	install_ahead:22844	-	thread	Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+src/db.rs	22975	install_ahead:22844	-	thread	let _ = h.join();
+src/db.rs	28056	sync_wal:28037	-	fsmeth	f.sync_data()
+src/db.rs	28348	create:28345	-	fs	std::fs::create_dir_all(dir)?;
+src/db.rs	28769	open:28680	-	fs	use std::os::unix::fs::MetadataExt;
+src/db.rs	28769	open:28680	-	fileext	use std::os::unix::fs::MetadataExt;
+src/db.rs	28772	open:28680	-	fsmeth	f.metadata()?.ino()
+src/db.rs	28775	open:28680	-	fsmeth	f.sync_data()?;
+src/db.rs	29100	open:28680	-	fsmeth	f.set_len(valid_len)?;
+src/db.rs	29101	open:28680	-	fsmeth	wal_opened = Some((vault::real(&wal_path), f.sync_data().map(|()| valid_len)?));
+src/db.rs	30422	close_run:30333	-	thread	t.join()
+src/db.rs	30425	close_run:30333	-	fsmeth	seg.sync_all()?;
+src/db.rs	30428	close_run:30333	-	fsmeth	ordf.sync_all()?;
+src/db.rs	30452	close_run:30333	-	thread	std::thread::Builder::new()
+src/db.rs	30454	close_run:30333	-	thread	.spawn(move || {
+src/db.rs	30460	close_run:30333	-	fsmeth	f.sync_data()
+src/db.rs	30493	close_run:30333	-	thread	std::thread::park_timeout(MAINT_LAND_POLL);
+src/db.rs	30498	close_run:30333	-	fsmeth	f.sync_data()
+src/db.rs	30829	seal_table:30583	-	Filetype	let mut files: Vec<(File, File)> = Vec::new();
+src/db.rs	30970	seal_table:30583	-	fsmeth	seg.sync_all()?;
+src/db.rs	30973	seal_table:30583	-	fsmeth	ordf.sync_all()?;
+src/db.rs	31231	take_fresh_mem:31182	-	thread	self.r.unlent(|| std::thread::park_timeout(MAINT_LAND_POLL));
+src/db.rs	32248	start_ahead:32207	-	thread	let (_tx, rx) = std::sync::mpsc::channel();
+src/db.rs	32322	start_ahead:32207	-	thread	let (tx, rx) = std::sync::mpsc::channel();
+src/db.rs	32325	start_ahead:32207	-	thread	let handle = std::thread::spawn(move || {
+src/db.rs	32371	stop_ahead:32363	-	thread	let _ = h.join();
+src/db.rs	32382	join_ahead:32379	-	thread	let _ = h.join();
+src/db.rs	32413	go_away:32398	-	thread	let (tx, rx) = std::sync::mpsc::channel();
+src/db.rs	32414	go_away:32398	-	thread	let handle = std::thread::Builder::new()
+src/db.rs	32416	go_away:32398	-	thread	.spawn(move || m.run(rx))?;
+src/db.rs	32476	land_seal:32453	-	thread	self.r.unlent(|| std::thread::park_timeout(MAINT_LAND_POLL));
+src/db.rs	32522	hand_seal:32503	-	thread	let handle = std::thread::spawn(move || {
+src/db.rs	32562	maint_request:32558	-	thread	let (tx, rx) = std::sync::mpsc::channel();
+src/db.rs	32574	maint_request:32558	-	thread	.unlent(|| rx.recv())
+src/db.rs	32657	release_seal_landing_after:32652	-	thread	std::thread::spawn(move || {
+src/db.rs	32658	release_seal_landing_after:32652	-	thread	std::thread::sleep(after);
+src/db.rs	32680	release_seal_landing_once_taken:32678	-	thread	std::thread::spawn(move || {
+src/db.rs	32682	release_seal_landing_once_taken:32678	-	thread	std::thread::sleep(std::time::Duration::from_millis(1));
+src/db.rs	32684	release_seal_landing_once_taken:32678	-	thread	std::thread::sleep(std::time::Duration::from_millis(200));
+src/db.rs	32700	release_seal_durable_after:32695	-	thread	std::thread::spawn(move || {
+src/db.rs	32701	release_seal_durable_after:32695	-	thread	std::thread::sleep(after);
+src/db.rs	32772	injected_presync:32772	-	Filetype	fn injected_presync(shared: &Shared, f: &File, upto: u64) -> std::io::Result<()> {
+src/db.rs	32773	injected_presync:32772	-	fs	use std::os::unix::fs::MetadataExt;
+src/db.rs	32773	injected_presync:32772	-	fileext	use std::os::unix::fs::MetadataExt;
+src/db.rs	32774	injected_presync:32772	-	fsmeth	let ino = f.metadata().map(|m| m.ino()).unwrap_or(0);
+src/db.rs	33509	zpages_settle_with:33495	-	thread	std::thread::sleep(std::time::Duration::from_millis(1));
+src/db.rs	34006	cuts_of:33949	-	thread	rx: std::sync::mpsc::Receiver<Built>,
+src/db.rs	34189	build_ahead_job:34185	-	thread	tx: &std::sync::mpsc::Sender<Built>,
+src/db.rs	34367	idle_cpu_priority:34363	-	libc	let _ = libc::sched_setscheduler(0, libc::SCHED_IDLE, &param);
+src/db.rs	34382	thread_cpu_ns:34374	-	libc	if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } == 0 {
+src/db.rs	34422	keep:34405	-	thread	std::thread::park_timeout(idle);
+src/db.rs	34425	keep:34405	-	thread	Want::Scan => std::thread::park_timeout(KEEPER_POLL_MAX),
+src/db.rs	34873	load:34847	-	thread	std::thread::yield_now();
+src/db.rs	35001	take_back:34963	-	thread	std::thread::park_timeout(std::time::Duration::from_millis(1));
+src/db.rs	35161	keep_upkeep:35137	-	thread	std::thread::park_timeout(UPKEEP_POLL_MIN);
+src/db.rs	35180	keep_upkeep:35137	-	thread	std::thread::park_timeout(wait);
+src/db.rs	35401	start_upkeep:35394	-	thread	let spawned = std::thread::Builder::new()
+src/db.rs	35403	start_upkeep:35394	-	thread	.spawn(move || r.keep_upkeep(&flag));
+src/db.rs	35488	hand_over_upkeep:35415	-	Filetype	self.upkeep_hand = Hand::File;
+src/db.rs	35631	finish_hand:35630	-	Filetype	if self.fs_home() && !matches!(self.upkeep_hand, Hand::Inline | Hand::File | Hand::Settle) {
+src/db.rs	35637	finish_hand:35630	-	Filetype	Hand::File => {
+src/db.rs	35706	hold_within:35690	-	thread	.unlent(|| std::thread::park_timeout(std::time::Duration::from_millis(1)));
+src/db.rs	35731	hold_for_upkeep:35715	-	thread	.unlent(|| std::thread::park_timeout(std::time::Duration::from_millis(1)));
+src/db.rs	35761	join_upkeep:35741	-	thread	.unlent(|| std::thread::sleep(std::time::Duration::from_micros(50)));
+src/db.rs	35780	stop_upkeep:35774	-	thread	let _ = h.join();
+src/db.rs	35976	start_keeper:35967	-	thread	let spawned = std::thread::Builder::new()
+src/db.rs	35978	start_keeper:35967	-	thread	.spawn(move || {
+src/db.rs	36025	settle_keeper:36007	-	thread	std::thread::sleep(std::time::Duration::from_micros(50));
+src/db.rs	36036	stop_keeper:36029	-	thread	let _ = h.join();
+src/db.rs	36073	stop_trimmer:36056	-	thread	let _ = h.join();
+src/db.rs	36142	release_trim_after:36140	-	thread	std::thread::spawn(move || {
+src/db.rs	36145	release_trim_after:36140	-	thread	std::thread::sleep(std::time::Duration::from_millis(5));
+src/db.rs	38276	advance:38254	-	thread	tx: Option<std::sync::mpsc::Sender<MaintJob>>,
+src/db.rs	38352	zbuild_hold_wait:38346	-	thread	std::thread::park_timeout(MAINT_LAND_POLL);
+src/db.rs	38360	seal_hold_wait:38358	-	thread	std::thread::park_timeout(MAINT_LAND_POLL);
+src/db.rs	38388	seal_readable:38368	-	thread	Ask(MaintAsk, std::sync::mpsc::Sender<Result<()>>),
+src/db.rs	38511	stands_in:38491	-	Filetype	jobs: Option<std::sync::mpsc::Sender<(File, File, bool)>>,
+src/db.rs	38511	stands_in:38491	-	thread	jobs: Option<std::sync::mpsc::Sender<(File, File, bool)>>,
+src/db.rs	38512	stands_in:38491	-	thread	done: std::sync::mpsc::Receiver<std::io::Result<()>>,
+src/db.rs	38518	spawn:38517	-	Filetype	let (jobs, rx) = std::sync::mpsc::channel::<(File, File, bool)>();
+src/db.rs	38518	spawn:38517	-	thread	let (jobs, rx) = std::sync::mpsc::channel::<(File, File, bool)>();
+src/db.rs	38519	spawn:38517	-	thread	let (tx, done) = std::sync::mpsc::channel();
+src/db.rs	38520	spawn:38517	-	thread	let thread = std::thread::Builder::new()
+src/db.rs	38522	spawn:38517	-	thread	.spawn(move || {
+src/db.rs	38523	spawn:38517	-	thread	while let Ok((slot, dir, fail)) = rx.recv() {
+src/db.rs	38527	spawn:38517	-	fsmeth	slot.sync_data().and_then(|()| dir.sync_all())
+src/db.rs	38544	start:38544	-	Filetype	fn start(&self, slot: File, dir: File, fail: bool) -> std::io::Result<()> {
+src/db.rs	38554	wait:38552	-	thread	.recv()
+src/db.rs	38563	drop:38560	-	thread	let _ = t.join();
+src/db.rs	38645	drop:38560	-	Filetype	slot_sync_due: Option<File>,
+src/db.rs	38868	run:38868	-	thread	fn run(mut self: Box<Self>, rx: std::sync::mpsc::Receiver<MaintJob>) {
+src/db.rs	38880	run:38868	-	thread	match rx.try_recv() {
+src/db.rs	38885	run:38868	-	thread	Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+src/db.rs	38886	run:38868	-	thread	Err(std::sync::mpsc::TryRecvError::Empty) => {}
+src/db.rs	38894	run:38868	-	thread	std::thread::park_timeout(MAINT_POLL);
+src/db.rs	38899	run:38868	-	thread	while let Ok(job) = rx.try_recv() {
+src/db.rs	38902	run:38868	-	thread	let _ = job.handle.join();
+src/db.rs	38981	answer:38946	-	thread	self.r.unlent(|| std::thread::park_timeout(MAINT_POLL));
+src/db.rs	39150	land_front_readable:39120	-	thread	let _ = s.handle.join();
+src/db.rs	39280	stop:39272	-	thread	b.job.join();
+src/db.rs	39283	stop:39272	-	thread	let _ = s.handle.join();
+src/db.rs	39290	stop:39272	-	thread	.join()
+src/db.rs	39298	stop:39272	-	thread	let _ = m.handle.join();
+src/db.rs	39301	stop:39272	-	thread	let _ = h.join();
+src/db.rs	39524	join_seal:39502	-	thread	self.r.unlent(|| std::thread::park_timeout(MAINT_LAND_POLL));
+src/db.rs	39561	land_front:39543	-	thread	.unlent(|| handle.join())
+src/db.rs	39701	land_readable:39622	-	thread	self.sync_helper.as_ref().expect("started above").wait()?;
+src/db.rs	40245	start_tier:40222	-	thread	let handle = std::thread::spawn(move || {
+src/db.rs	40267	join_tier:40260	-	thread	.unlent(|| handle.join())
+src/db.rs	40845	write_slot:40839	-	Filetype	) -> Result<(File, bool)> {
+src/db.rs	40872	sync_slot:40872	-	Filetype	fn sync_slot(&self, f: &File) -> Result<()> {
+src/db.rs	40881	sync_slot:40872	-	fsmeth	f.sync_data()?;
+src/db.rs	41708	z_sample_start:41671	-	thread	let spawned = std::thread::Builder::new()
+src/db.rs	41710	z_sample_start:41671	-	thread	.spawn(move || {
+src/db.rs	41785	z_sample_collect:41770	-	thread	let Ok(results) = job.handle.join() else {
+src/db.rs	43083	z_start:42931	-	thread	let spawned = std::thread::Builder::new()
+src/db.rs	43085	z_start:42931	-	thread	.spawn(move || {
+src/db.rs	43149	z_collect:43131	-	thread	if let Ok(Ok(w)) = h.join() {
+src/db.rs	43156	z_collect:43131	-	thread	.join()
+src/db.rs	43430	z_warm:43423	-	thread	let spawned = std::thread::Builder::new()
+src/db.rs	43432	z_warm:43423	-	thread	.spawn(move || {
+src/db.rs	43637	start_compact:43484	-	thread	let handle = std::thread::spawn(move || {
+src/db.rs	43665	start_compact:43484	-	thread	std::thread::park_timeout(MAINT_LAND_POLL);
+src/db.rs	43735	join_merge:43717	-	thread	.unlent(|| handle.join())
+src/db.rs	43812	drop:43789	-	thread	let _ = h.join();
+src/db.rs	43825	fresh:43823	T	fs	let _ = std::fs::remove_dir_all(&dir);
+src/db.rs	43826	fresh:43823	T	fs	std::fs::create_dir_all(&dir).unwrap();
+src/db.rs	43863	a_long_segment_is_synced_behind_its_writer:43835	T	thread	std::thread::yield_now();
+src/db.rs	43925	the_helpers_row_is_the_re_reads:43892	T	fs	std::fs::read(&helped).unwrap(),
+src/db.rs	43926	the_helpers_row_is_the_re_reads:43892	T	fs	std::fs::read(&alone).unwrap(),
+src/db.rs	44062	the_writers_facts_are_the_walks:44059	T	fs	let _ = std::fs::remove_dir_all(&dir);
+src/db.rs	44063	the_writers_facts_are_the_walks:44059	T	fs	std::fs::create_dir_all(&dir).unwrap();
+src/db.rs	44083	the_writers_facts_are_the_walks:44059	T	fs	std::fs::rename(&tmp, dir.join(&name)).unwrap();
+src/db.rs	44100	the_writers_facts_are_the_walks:44059	T	fs	let _ = std::fs::remove_dir_all(&dir);
+src/db.rs	44200	offsets_cross_blocks_and_two_threads_append_without_overlap:44172	T	thread	hs.push(std::thread::spawn(move || {
+src/db.rs	44210	offsets_cross_blocks_and_two_threads_append_without_overlap:44172	T	thread	for (off, bytes) in h.join().unwrap() {
+src/db.rs	44234	the_forms_word_under_a_cipher_is_a_rest_and_stays_one:44228	T	fs	let _ = std::fs::remove_dir_all(&dir);
+src/db.rs	44329	a_reader_takes_a_commit_whole:44294	T	thread	std::thread::scope(|s| {
+src/db.rs	44330	a_reader_takes_a_commit_whole:44294	T	thread	let reader = s.spawn(|| {
+src/db.rs	44348	a_reader_takes_a_commit_whole:44294	T	thread	let reads = reader.join().unwrap();
+src/db.rs	44381	a_retire_list_frees_each_item_once_and_never_early:44373	T	thread	pushers.push(std::thread::spawn(move || {
+src/db.rs	44395	a_retire_list_frees_each_item_once_and_never_early:44373	T	thread	sweepers.push(std::thread::spawn(move || {
+src/db.rs	44414	a_retire_list_frees_each_item_once_and_never_early:44373	T	thread	std::thread::sleep(std::time::Duration::from_millis(1));
+src/db.rs	44417	a_retire_list_frees_each_item_once_and_never_early:44373	T	thread	p.join().unwrap();
+src/db.rs	44421	a_retire_list_frees_each_item_once_and_never_early:44373	T	thread	s.join().unwrap();
+src/db.rs	44447	an_id_cache_answers_each_id_with_its_own_value:44442	T	thread	hs.push(std::thread::spawn(move || {
+src/db.rs	44458	an_id_cache_answers_each_id_with_its_own_value:44442	T	thread	h.join().unwrap();
+src/db.rs	44593	a_writer_that_has_lent_its_upkeep_leaves_the_sweep_to_the_thread_that_has_it:44590	T	fs	let _ = std::fs::remove_dir_all(&dir);
+src/db.rs	44646	a_writer_that_has_lent_its_upkeep_leaves_the_sweep_to_the_thread_that_has_it:44590	T	fs	let _ = std::fs::remove_dir_all(&dir);
+src/db/blocks.rs	84	resident_of:82	-	libc	let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as usize;
+src/db/blocks.rs	90	resident_of:82	-	libc	let r = unsafe { libc::mincore(p as *mut libc::c_void, len, vec.as_mut_ptr()) };
+src/db/blocks.rs	158	map:153	-	libc	libc::mmap(
+src/db/blocks.rs	174	unmap:172	-	libc	let r = unsafe { libc::munmap(p as *mut libc::c_void, len) };
+src/db/dirkey.rs	108	refused:95	-	fileext	use std::os::fd::AsRawFd;
+src/db/dirkey.rs	217	ask:217	-	fs	fn ask<T>(dir: &std::fs::File, request: u64, arg: &mut T) -> Result<()> {
+src/db/dirkey.rs	217	ask:217	-	Filetype	fn ask<T>(dir: &std::fs::File, request: u64, arg: &mut T) -> Result<()> {
+src/db/dirkey.rs	222	ask:217	-	fsmeth	let rc = unsafe { libc::ioctl(dir.as_raw_fd(), request as _, arg as *mut T) };
+src/db/dirkey.rs	222	ask:217	-	libc	let rc = unsafe { libc::ioctl(dir.as_raw_fd(), request as _, arg as *mut T) };
+src/db/dirkey.rs	232	policy:232	-	fs	fn policy(dir: &std::fs::File) -> Result<Option<PolicyV2>> {
+src/db/dirkey.rs	232	policy:232	-	Filetype	fn policy(dir: &std::fs::File) -> Result<Option<PolicyV2>> {
+src/db/dirkey.rs	259	add:259	-	fs	fn add(dir: &std::fs::File, key: &DirKey) -> Result<[u8; 16]> {
+src/db/dirkey.rs	259	add:259	-	Filetype	fn add(dir: &std::fs::File, key: &DirKey) -> Result<[u8; 16]> {
+src/db/dirkey.rs	279	remove:279	-	fs	fn remove(dir: &std::fs::File, identifier: [u8; 16]) -> Result<bool> {
+src/db/dirkey.rs	279	remove:279	-	Filetype	fn remove(dir: &std::fs::File, identifier: [u8; 16]) -> Result<bool> {
+src/db/dirkey.rs	295	held:295	-	fs	fn held(dir: &std::fs::File, identifier: [u8; 16]) -> Result<bool> {
+src/db/dirkey.rs	295	held:295	-	Filetype	fn held(dir: &std::fs::File, identifier: [u8; 16]) -> Result<bool> {
+src/db/dirkey.rs	334	state:333	-	fs	let d = std::fs::File::open(dir)?;
+src/db/dirkey.rs	347	protect:346	-	fs	let d = std::fs::File::open(dir)?;
+src/db/dirkey.rs	367	unlock:366	-	fs	let d = std::fs::File::open(dir)?;
+src/db/dirkey.rs	395	filesystem_root:395	-	fs	fn filesystem_root(dir: &Path) -> Result<std::fs::File> {
+src/db/dirkey.rs	395	filesystem_root:395	-	Filetype	fn filesystem_root(dir: &Path) -> Result<std::fs::File> {
+src/db/dirkey.rs	396	filesystem_root:395	-	fs	use std::os::unix::fs::MetadataExt;
+src/db/dirkey.rs	396	filesystem_root:395	-	fileext	use std::os::unix::fs::MetadataExt;
+src/db/dirkey.rs	397	filesystem_root:395	-	fsmeth	let dir = dir.canonicalize()?;
+src/db/dirkey.rs	398	filesystem_root:395	-	fsmeth	let dev = dir.metadata()?.dev();
+src/db/dirkey.rs	401	filesystem_root:395	-	fsmeth	match up.metadata() {
+src/db/dirkey.rs	403	filesystem_root:395	-	fs	if let Ok(f) = std::fs::File::open(up) {
+src/db/dirkey.rs	414	filesystem_root:395	-	fs	None => std::fs::File::open(&dir),
+src/db/pager.rs	82	None	-	fs	use std::fs::File;
+src/db/pager.rs	82	None	-	Filetype	use std::fs::File;
+src/db/pager.rs	85	None	-	thread	use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
+src/db/pager.rs	308	oldest:220	-	thread	woken: Condvar,
+src/db/pager.rs	335	new:317	-	thread	woken: Condvar::new(),
+src/db/pager.rs	341	new:317	-	thread	let t = std::thread::Builder::new()
+src/db/pager.rs	343	new:317	-	thread	.spawn(move || Pager::run(weak));
+src/db/pager.rs	420	stop:415	-	thread	let _ = t.join();
+src/db/pager.rs	537	breathe_swamped:529	-	thread	std::thread::sleep(Duration::from_micros(200));
+src/db/pager.rs	565	breathe_unless:557	-	thread	std::thread::sleep(Duration::from_micros(200));
+src/db/pager.rs	592	run:571	-	thread	.wait_timeout(owed, Duration::from_millis(20))
+src/db/pager.rs	645	pass:605	-	thread	std::thread::sleep(nap);
+src/db/pager.rs	720	bump:710	-	mmap	map: memmap2::Mmap,
+src/db/pager.rs	733	open:732	-	fs	let file = File::open(path)?;
+src/db/pager.rs	736	open:732	-	mmap	let map = unsafe { memmap2::Mmap::map(&file)? };
+src/db/pager.rs	746	open:732	-	mmap	let _ = map.advise(memmap2::Advice::Random);
+src/db/pager.rs	806	memfile:806	-	Filetype	pub(crate) fn memfile() -> Result<File> {
+src/db/pager.rs	807	memfile:806	-	fileext	use std::os::fd::FromRawFd;
+src/db/pager.rs	810	memfile:806	-	libc	let fd = unsafe { libc::memfd_create(c"supdb".as_ptr(), libc::MFD_CLOEXEC) };
+src/db/pager.rs	815	memfile:806	-	fs	Ok(unsafe { File::from_raw_fd(fd) })
+src/db/pager.rs	819	memfile:819	-	Filetype	pub(crate) fn memfile() -> Result<File> {
+src/db/pager.rs	829	make:827	-	Filetype	mem: &File,
+src/db/pager.rs	878	adopt:876	-	Filetype	mem: &File,
+src/db/pager.rs	884	adopt:876	-	fs	use std::os::unix::fs::MetadataExt;
+src/db/pager.rs	884	adopt:876	-	fileext	use std::os::unix::fs::MetadataExt;
+src/db/pager.rs	885	adopt:876	-	fsmeth	let ino = mem.metadata()?.ino();
+src/db/pager.rs	911	adopt:876	-	libc	libc::madvise(p.base.cast(), p.mapped, libc::MADV_POPULATE_READ);
+src/db/pager.rs	922	sparse:919	-	fsmeth	mem.set_len(len)?;
+src/db/pager.rs	996	fill:966	-	libc	libc::mprotect(
+src/db/pager.rs	1108	slow:1027	-	thread	_ => std::thread::yield_now(),
+src/db/pager.rs	1123	pause_after_rescue:1116	T	thread	std::thread::yield_now();
+src/db/pager.rs	1147	gone:1144	-	thread	std::thread::yield_now();
+src/db/pager.rs	1188	mark:1154	-	thread	BUSY => std::thread::yield_now(),
+src/db/pager.rs	1223	free:1210	-	thread	std::thread::yield_now();
+src/db/pager.rs	1238	free:1210	-	libc	unsafe { libc::mprotect(self.base.add(a).cast(), b - a, libc::PROT_NONE) };
+src/db/pager.rs	1297	drop:1284	-	libc	unsafe { libc::munmap(self.base.cast(), self.mapped) };
+src/db/pager.rs	1368	advise:1365	-	mmap	memmap2::Advice::Random
+src/db/pager.rs	1370	advise:1365	-	mmap	memmap2::Advice::Normal
+src/db/pager.rs	1396	resident:1380	-	libc	libc::mincore(
+src/db/pager.rs	1451	forget:1435	-	libc	libc::madvise(
+src/db/pager.rs	1457	forget:1435	-	fs	if let Ok(f) = File::open(&back.path) {
+src/db/pager.rs	1458	forget:1435	-	fileext	use std::os::fd::AsRawFd;
+src/db/pager.rs	1461	forget:1435	-	libc	libc::posix_fadvise(
+src/db/pager.rs	1462	forget:1435	-	fsmeth	f.as_raw_fd(),
+src/db/pager.rs	1491	willneed:1476	-	libc	libc::madvise(
+src/db/pager.rs	1529	map_shared:1529	-	Filetype	fn map_shared(mem: &File, len: usize) -> Result<*mut u8> {
+src/db/pager.rs	1530	map_shared:1529	-	fileext	use std::os::fd::AsRawFd;
+src/db/pager.rs	1534	map_shared:1529	-	libc	libc::mmap(
+src/db/pager.rs	1539	map_shared:1529	-	fsmeth	mem.as_raw_fd(),
+src/db/pager.rs	1552	map_shared:1529	-	libc	libc::madvise(p, len, libc::MADV_NOHUGEPAGE);
+src/db/pager.rs	1589	give_back:1585	-	libc	libc::madvise(at.cast(), len, libc::MADV_REMOVE);
+src/db/pager.rs	1656	scratch:1653	T	fs	let _ = std::fs::remove_dir_all(&d);
+src/db/pager.rs	1657	scratch:1653	T	fs	std::fs::create_dir_all(&d).unwrap();
+src/db/pager.rs	1675	envelope:1674	T	fs	let mut out = File::create(path).unwrap();
+src/db/pager.rs	1709	a_view_says_what_is_in_memory_and_drops_and_asks_for_what_stands_behind_it:1703	T	fs	File::open(&path).unwrap().sync_all().unwrap();
+src/db/pager.rs	1709	a_view_says_what_is_in_memory_and_drops_and_asks_for_what_stands_behind_it:1703	T	fsmeth	File::open(&path).unwrap().sync_all().unwrap();
+src/db/pager.rs	1734	a_view_says_what_is_in_memory_and_drops_and_asks_for_what_stands_behind_it:1703	T	thread	std::thread::sleep(std::time::Duration::from_millis(2));
+src/db/pager.rs	1752	a_view_says_what_is_in_memory_and_drops_and_asks_for_what_stands_behind_it:1703	T	thread	std::thread::sleep(std::time::Duration::from_millis(2));
+src/db/pager.rs	1804	a_range_asked_for_is_the_plaintext_and_nothing_else_is_decrypted:1772	T	fs	let _ = std::fs::remove_dir_all(&dir);
+src/db/pager.rs	1833	a_cache_over_its_budget_gives_back_and_reads_again:1810	T	thread	std::thread::sleep(Duration::from_millis(5));
+src/db/pager.rs	1842	a_cache_over_its_budget_gives_back_and_reads_again:1810	T	fs	let _ = std::fs::remove_dir_all(&dir);
+src/db/pager.rs	1859	nothing_is_given_back_under_a_hold:1848	T	thread	std::thread::sleep(Duration::from_millis(100));
+src/db/pager.rs	1871	nothing_is_given_back_under_a_hold:1848	T	thread	std::thread::sleep(Duration::from_millis(5));
+src/db/pager.rs	1876	nothing_is_given_back_under_a_hold:1848	T	fs	let _ = std::fs::remove_dir_all(&dir);
+src/db/pager.rs	1904	a_rest_gives_way_and_a_range_asked_again_is_the_same_bytes:1882	T	thread	std::thread::sleep(Duration::from_millis(5));
+src/db/pager.rs	1916	a_rest_gives_way_and_a_range_asked_again_is_the_same_bytes:1882	T	fs	let _ = std::fs::remove_dir_all(&dir);
+src/db/pager.rs	1954	a_chunk_is_not_lent_out_of_a_unit_marked_again_under_its_rescue:1932	T	thread	std::thread::scope(|scope| {
+src/db/pager.rs	1955	a_chunk_is_not_lent_out_of_a_unit_marked_again_under_its_rescue:1932	T	thread	let reader = scope.spawn(|| {
+src/db/pager.rs	1965	a_chunk_is_not_lent_out_of_a_unit_marked_again_under_its_rescue:1932	T	thread	std::thread::yield_now();
+src/db/pager.rs	1974	a_chunk_is_not_lent_out_of_a_unit_marked_again_under_its_rescue:1932	T	thread	assert!(reader.join().unwrap());
+src/db/pager.rs	1987	a_chunk_is_not_lent_out_of_a_unit_marked_again_under_its_rescue:1932	T	fs	let _ = std::fs::remove_dir_all(&dir);
+src/db/pager.rs	2004	threads_read_the_plaintext_while_the_cache_turns_over:1994	T	thread	std::thread::spawn(move || {
+src/db/pager.rs	2020	threads_read_the_plaintext_while_the_cache_turns_over:1994	T	thread	t.join().unwrap();
+src/db/pager.rs	2027	threads_read_the_plaintext_while_the_cache_turns_over:1994	T	fs	let _ = std::fs::remove_dir_all(&dir);
+src/db/pager.rs	2038	a_changed_chunk_fails_its_read_and_poisons_the_store:2034	T	fs	let mut raw = std::fs::read(dir.join("e")).unwrap();
+src/db/pager.rs	2041	a_changed_chunk_fails_its_read_and_poisons_the_store:2034	T	fs	std::fs::write(dir.join("e"), &raw).unwrap();
+src/db/pager.rs	2070	a_changed_chunk_fails_its_read_and_poisons_the_store:2034	T	fs	let _ = std::fs::remove_dir_all(&dir);
+src/db/pager.rs	2087	a_file_adopted_is_whole_and_stays_until_it_has_its_envelope:2077	T	thread	std::thread::sleep(Duration::from_millis(80));
+src/db/pager.rs	2102	a_file_adopted_is_whole_and_stays_until_it_has_its_envelope:2077	T	thread	std::thread::sleep(Duration::from_millis(5));
+src/db/pager.rs	2122	a_file_adopted_is_whole_and_stays_until_it_has_its_envelope:2077	T	fs	let _ = std::fs::remove_dir_all(&dir);
+src/db/vault.rs	148	None	-	fs	use std::fs::{File, OpenOptions};
+src/db/vault.rs	148	None	-	Filetype	use std::fs::{File, OpenOptions};
+src/db/vault.rs	286	random:279	-	libc	let n = unsafe { libc::getrandom(buf[at..].as_mut_ptr().cast(), buf.len() - at, 0) };
+src/db/vault.rs	300	random:279	-	fs	File::open("/dev/urandom")?.read_exact(buf)
+src/db/vault.rs	398	key_id:397	-	fs	match std::fs::read(dir.join(MARKER)) {
+src/db/vault.rs	418	rewrap:417	-	fs	let bytes = std::fs::read(dir.join(MARKER))?;
+src/db/vault.rs	443	write_marker:435	-	fs	let mut f = File::create(&tmp)?;
+src/db/vault.rs	445	write_marker:435	-	fsmeth	f.sync_all()?;
+src/db/vault.rs	447	write_marker:435	-	fs	std::fs::rename(&tmp, dir.join(MARKER))?;
+src/db/vault.rs	448	write_marker:435	-	fs	File::open(dir)?.sync_all()
+src/db/vault.rs	448	write_marker:435	-	fsmeth	File::open(dir)?.sync_all()
+src/db/vault.rs	454	refuse_marked:453	-	fsmeth	if dir.join(MARKER).exists() {
+src/db/vault.rs	551	disk_parse:521	-	Filetype	mem: Option<Arc<File>>,
+src/db/vault.rs	612	passes:562	-	Filetype	mem: Arc<File>,
+src/db/vault.rs	627	passes:562	-	Filetype	pub(crate) struct Mapped(Option<(Arc<Vault>, Arc<File>)>);
+src/db/vault.rs	707	reopen:707	-	Filetype	fn reopen(mem: &File, write: bool, append: bool) -> Result<File> {
+src/db/vault.rs	708	reopen:707	-	fileext	use std::os::fd::AsRawFd;
+src/db/vault.rs	709	reopen:707	-	fsmeth	let path = format!("/proc/self/fd/{}", mem.as_raw_fd());
+src/db/vault.rs	709	reopen:707	-	procsys	let path = format!("/proc/self/fd/{}", mem.as_raw_fd());
+src/db/vault.rs	710	reopen:707	-	fs	let mut o = OpenOptions::new();
+src/db/vault.rs	719	reopen:707	-	fsmeth	Err(_) => mem.try_clone(),
+src/db/vault.rs	732	reopen:707	-	Filetype	file: File,
+src/db/vault.rs	742	write:738	-	fileext	use std::os::fd::AsRawFd;
+src/db/vault.rs	746	write:738	-	libc	libc::sync_file_range(
+src/db/vault.rs	747	write:738	-	fsmeth	self.file.as_raw_fd(),
+src/db/vault.rs	804	create:803	-	fs	if std::fs::read_dir(real)?.next().is_some() {
+src/db/vault.rs	823	open:820	-	fs	let bytes = match std::fs::read(real.join(MARKER)) {
+src/db/vault.rs	850	open:820	-	fs	let _ = std::fs::remove_file(real.join(format!("{MARKER}.tmp")));
+src/db/vault.rs	889	make:889	-	Filetype	fn make(&self, name: &str) -> Result<File> {
+src/db/vault.rs	891	make:889	-	fsmeth	let handle = mem.try_clone()?;
+src/db/vault.rs	930	page_of:919	-	fsmeth	let p = Paged::adopt(&self.pager, mem, mem.metadata()?.len(), name)?;
+src/db/vault.rs	965	len:958	-	fsmeth	return Ok(mem.metadata()?.len());
+src/db/vault.rs	977	len:958	-	fs	File::open(self.real.join(disk.name()))?.read_exact(&mut head)?;
+src/db/vault.rs	992	remove:981	-	fs	let _ = std::fs::remove_file(self.real.join(d.name()));
+src/db/vault.rs	1005	remove:981	-	fs	let _ = std::fs::remove_file(self.real.join(z.name()));
+src/db/vault.rs	1039	map_written:1039	-	Filetype	fn map_written(&self, name: &str) -> Result<(File, Arc<File>)> {
+src/db/vault.rs	1070	unmapped:1070	-	Filetype	fn unmapped(&self, mem: &Arc<File>) {
+src/db/vault.rs	1090	rewrite:1090	-	Filetype	fn rewrite(&self, name: &str, append: bool) -> Result<File> {
+src/db/vault.rs	1113	reopen_written:1113	-	Filetype	fn reopen_written(&self, name: &str) -> Result<File> {
+src/db/vault.rs	1133	names:1131	-	fs	for entry in std::fs::read_dir(&self.real)? {
+src/db/vault.rs	1157	write_envelope:1157	-	Filetype	fn write_envelope(&self, mem: &File, disk: &Disk, key: &Key, sync: bool) -> Result<u64> {
+src/db/vault.rs	1162	write_envelope_at:1162	-	Filetype	fn write_envelope_at(&self, mem: &File, path: &Path, key: &Key, sync: bool) -> Result<u64> {
+src/db/vault.rs	1164	write_envelope_at:1162	-	fsmeth	let len = mem.metadata()?.len();
+src/db/vault.rs	1168	write_envelope_at:1162	-	fs	file: File::create(path)?,
+src/db/vault.rs	1177	write_envelope_at:1162	-	mmap	let src = MmapBytes::from_map(unsafe { memmap2::Mmap::map(mem)? });
+src/db/vault.rs	1182	write_envelope_at:1162	-	fsmeth	out.sync_all()?;
+src/db/vault.rs	1196	keeps:1196	-	Filetype	fn keeps(&self, mem: &Arc<File>) -> bool {
+src/db/vault.rs	1200	keeps:1196	-	fsmeth	viewed || mem.metadata().is_ok_and(|m| self.pager.room_for(m.len()))
+src/db/vault.rs	1224	settled:1220	-	Filetype	mem: &Arc<File>,
+src/db/vault.rs	1253	settled:1220	-	fsmeth	let p = Paged::adopt(&self.pager, mem, mem.metadata()?.len(), name)?;
+src/db/vault.rs	1352	persist_with:1299	-	fs	let _ = std::fs::remove_file(self.real.join(disk.name()));
+src/db/vault.rs	1393	persist_with:1299	-	fs	File::open(&self.real)?.sync_all()?;
+src/db/vault.rs	1393	persist_with:1299	-	fsmeth	File::open(&self.real)?.sync_all()?;
+src/db/vault.rs	1459	persist_form:1425	-	fs	if let Ok(f) = File::open(&tmp) {
+src/db/vault.rs	1463	persist_form:1425	-	fs	std::fs::rename(&tmp, &path).inspect_err(|_| {
+src/db/vault.rs	1464	persist_form:1425	-	fs	let _ = std::fs::remove_file(&tmp);
+src/db/vault.rs	1479	persist_form:1425	-	fs	let _ = std::fs::remove_file(&path);
+src/db/vault.rs	1505	companion:1489	-	fsmeth	if !self.real.join(zdisk.name()).exists() {
+src/db/vault.rs	1557	adopt:1527	-	fsmeth	if !files.contains_key(ord) && self.real.join(odisk.name()).exists() {
+src/db/vault.rs	1596	sweep:1593	-	fs	for entry in std::fs::read_dir(&self.real)? {
+src/db/vault.rs	1601	sweep:1593	-	fs	if std::fs::remove_file(self.real.join(&name)).is_ok() {
+src/db/vault.rs	1618	sweep:1593	-	fs	if !held && std::fs::remove_file(self.real.join(&name)).is_ok() {
+src/db/vault.rs	1863	create:1863	-	Filetype	pub(crate) fn create(path: impl AsRef<Path>) -> Result<File> {
+src/db/vault.rs	1866	create:1863	-	fs	None => File::create(path),
+src/db/vault.rs	1867	create:1863	-	fs	Some((v, name)) if passes(&name) => File::create(v.real.join(name)),
+src/db/vault.rs	1874	create_rw:1874	-	Filetype	pub(crate) fn create_rw(path: impl AsRef<Path>) -> Result<File> {
+src/db/vault.rs	1877	create_rw:1874	-	fs	OpenOptions::new()
+src/db/vault.rs	1892	open:1892	-	Filetype	pub(crate) fn open(path: impl AsRef<Path>) -> Result<File> {
+src/db/vault.rs	1895	open:1892	-	fs	None => File::open(path),
+src/db/vault.rs	1896	open:1892	-	fs	Some((v, name)) if passes(&name) => File::open(v.real.join(name)),
+src/db/vault.rs	1903	open_write:1903	-	Filetype	pub(crate) fn open_write(path: impl AsRef<Path>) -> Result<File> {
+src/db/vault.rs	1905	open_write:1903	-	fs	let plain = |p: &Path| OpenOptions::new().write(true).open(p);
+src/db/vault.rs	1914	open_append:1914	-	Filetype	pub(crate) fn open_append(path: impl AsRef<Path>) -> Result<File> {
+src/db/vault.rs	1917	open_append:1914	-	fs	OpenOptions::new()
+src/db/vault.rs	1935	open_slot:1935	-	Filetype	pub(crate) fn open_slot(path: impl AsRef<Path>) -> Result<File> {
+src/db/vault.rs	1938	open_slot:1935	-	fs	OpenOptions::new()
+src/db/vault.rs	1958	rename:1955	-	fs	(None, None) => std::fs::rename(from, to),
+src/db/vault.rs	1961	rename:1955	-	fs	std::fs::rename(v.real.join(a), v.real.join(b))
+src/db/vault.rs	1977	open_mapped:1977	-	Filetype	pub(crate) fn open_mapped(path: impl AsRef<Path>) -> Result<(File, Mapped)> {
+src/db/vault.rs	1980	open_mapped:1977	-	fs	None => Ok((File::open(path)?, Mapped(None))),
+src/db/vault.rs	1981	open_mapped:1977	-	fs	Some((v, name)) if passes(&name) => Ok((File::open(v.real.join(name))?, Mapped(None))),
+src/db/vault.rs	1993	hard_link:1990	-	fs	(None, None) => std::fs::hard_link(from, to),
+src/db/vault.rs	1996	hard_link:1990	-	fs	std::fs::hard_link(v.real.join(a), v.real.join(b))
+src/db/vault.rs	2012	remove_file:2009	-	fs	None => std::fs::remove_file(path),
+src/db/vault.rs	2013	remove_file:2009	-	fs	Some((v, name)) if passes(&name) => std::fs::remove_file(v.real.join(name)),
+src/db/vault.rs	2022	exists:2019	-	fsmeth	None => path.exists(),
+src/db/vault.rs	2023	exists:2019	-	fsmeth	Some((v, name)) if passes(&name) => v.real.join(name).exists(),
+src/db/vault.rs	2032	is_file:2029	-	fsmeth	None => path.is_file(),
+src/db/vault.rs	2033	is_file:2029	-	fsmeth	Some((v, name)) if passes(&name) => v.real.join(name).is_file(),
+src/db/vault.rs	2042	len:2039	-	fs	None => Ok(std::fs::metadata(path)?.len()),
+src/db/vault.rs	2043	len:2039	-	fs	Some((v, name)) if passes(&name) => Ok(std::fs::metadata(v.real.join(name))?.len()),
+src/db/vault.rs	2056	names:2050	-	fs	for entry in std::fs::read_dir(dir)? {
+src/db/vault.rs	2068	read:2065	-	fs	None => std::fs::read(path),
+src/db/vault.rs	2069	read:2065	-	fs	Some((v, name)) if passes(&name) => std::fs::read(v.real.join(name)),
+src/db/vault.rs	2086	sync_dir:2083	-	fs	Some(v) => File::open(&v.real)?.sync_all(),
+src/db/vault.rs	2086	sync_dir:2083	-	fsmeth	Some(v) => File::open(&v.real)?.sync_all(),
+src/db/vault.rs	2087	sync_dir:2083	-	fs	None => File::open(dir)?.sync_all(),
+src/db/vault.rs	2087	sync_dir:2083	-	fsmeth	None => File::open(dir)?.sync_all(),
+src/db/vault.rs	2105	open_dir:2105	-	Filetype	pub(crate) fn open_dir(dir: impl AsRef<Path>) -> Result<File> {
+src/db/vault.rs	2108	open_dir:2105	-	fs	Some(v) => File::open(&v.real),
+src/db/vault.rs	2109	open_dir:2105	-	fs	None => File::open(dir),
+src/db/vault.rs	2162	drop_cached:2162	-	Filetype	fn drop_cached(file: &File) {
+src/db/vault.rs	2165	drop_cached:2162	-	fileext	use std::os::fd::AsRawFd;
+src/db/vault.rs	2169	drop_cached:2162	-	libc	libc::sync_file_range(
+src/db/vault.rs	2170	drop_cached:2162	-	fsmeth	file.as_raw_fd(),
+src/db/vault.rs	2177	drop_cached:2162	-	fsmeth	libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+src/db/vault.rs	2177	drop_cached:2162	-	libc	libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+src/db/vault.rs	2296	dir:2294	T	fs	let _ = std::fs::remove_dir_all(&d);
+src/db/vault.rs	2297	dir:2294	T	fs	std::fs::create_dir_all(&d).unwrap();
+src/db/vault.rs	2311	on_disk:2310	T	fs	let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(real)
+src/db/vault.rs	2317	on_disk:2310	T	fs	std::fs::read(e.path()).unwrap(),
+src/db/vault.rs	2421	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope:2395	T	fsmeth	.read_to_end(&mut again)
+src/db/vault.rs	2482	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope:2395	T	fsmeth	assert!(real.join(disk_name(&token, Kind::Seg)).exists());
+src/db/vault.rs	2485	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope:2395	T	fsmeth	assert!(!real.join(disk_name(&token, Kind::Seg)).exists());
+src/db/vault.rs	2488	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope:2395	T	fsmeth	assert!(!real.join(disk_name(&token, Kind::Ord)).exists());
+src/db/vault.rs	2498	a_path_the_door_is_not_in_front_of_writes_nothing:2494	T	fs	assert!(File::create(d.join("seg-1.sup")).is_err());
+src/db/vault.rs	2499	a_path_the_door_is_not_in_front_of_writes_nothing:2494	T	fs	assert!(std::fs::write(d.join("seg-1.sup"), b"plaintext").is_err());
+src/db/vault.rs	2500	a_path_the_door_is_not_in_front_of_writes_nothing:2494	T	fs	assert!(std::fs::read_dir(&d).is_err());
+src/db/vault.rs	2522	the_log_and_the_manifest_pass_to_the_directory:2514	T	fs	std::fs::read(real.join("wal-00000000")).unwrap(),
+src/db/vault.rs	2525	the_log_and_the_manifest_pass_to_the_directory:2514	T	fs	assert_eq!(std::fs::read(real.join("manifest")).unwrap(), b"sealed too");
+src/db/vault.rs	2570	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not:2543	T	fsmeth	assert!(!real.join(disk_name(&orphan, Kind::Seg)).exists());
+src/db/vault.rs	2601	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not:2543	T	fsmeth	assert!(real.join(disk_name(&token, Kind::Seg)).exists());
+src/db/vault.rs	2621	a_changed_envelope_is_refused:2607	T	fs	let good = std::fs::read(&path).unwrap();
+src/db/vault.rs	2625	a_changed_envelope_is_refused:2607	T	fs	std::fs::write(&path, &bad).unwrap();
+src/db/vault.rs	2633	a_changed_envelope_is_refused:2607	T	fs	std::fs::write(&path, &good).unwrap();
+src/db/vault.rs	2672	the_marker_refuses_what_is_not_the_store:2654	T	fs	let good = std::fs::read(real.join(MARKER)).unwrap();
+src/db/vault.rs	2677	the_marker_refuses_what_is_not_the_store:2654	T	fs	std::fs::write(real.join(MARKER), &bad).unwrap();
+src/db/vault.rs	2680	the_marker_refuses_what_is_not_the_store:2654	T	fs	std::fs::write(real.join(MARKER), &good[..good.len() - 1]).unwrap();
+src/db/vault.rs	2882	the_engine_names_no_file_but_through_the_door:2876	T	fs	"File::open(",
+src/db/vault.rs	2883	the_engine_names_no_file_but_through_the_door:2876	T	fs	"File::create(",
+src/db/vault.rs	2884	the_engine_names_no_file_but_through_the_door:2876	T	fs	"OpenOptions",
+src/db/vault.rs	2885	the_engine_names_no_file_but_through_the_door:2876	T	fs	"fs::rename(",
+src/db/vault.rs	2886	the_engine_names_no_file_but_through_the_door:2876	T	fs	"fs::hard_link(",
+src/db/vault.rs	2887	the_engine_names_no_file_but_through_the_door:2876	T	fs	"fs::remove_file(",
+src/db/vault.rs	2888	the_engine_names_no_file_but_through_the_door:2876	T	fs	"fs::read_dir(",
+src/db/vault.rs	2889	the_engine_names_no_file_but_through_the_door:2876	T	fs	"fs::metadata(",
+src/db/vault.rs	2890	the_engine_names_no_file_but_through_the_door:2876	T	fs	"fs::read(",
+src/db/vault.rs	2891	the_engine_names_no_file_but_through_the_door:2876	T	fs	"fs::write(",
+src/db/vault.rs	2892	the_engine_names_no_file_but_through_the_door:2876	T	fs	"fs::copy(",
+src/db/vault.rs	2894	the_engine_names_no_file_but_through_the_door:2876	T	fsmeth	".exists()",
+src/db/zfile.rs	47	None	-	fs	use std::fs::File;
+src/db/zfile.rs	47	None	-	Filetype	use std::fs::File;
+src/db/zfile.rs	1869	popcount:1841	-	fs	file: Option<std::fs::File>,
+src/db/zfile.rs	1869	popcount:1841	-	Filetype	file: Option<std::fs::File>,
+src/db/zfile.rs	3836	put:3825	-	Filetype	file: &'a File,
+src/db/zfile.rs	3842	new:3842	-	Filetype	fn new(file: &'a File, drop: bool) -> FileSink<'a> {
+src/db/zfile.rs	3917	drop_written:3917	-	Filetype	fn drop_written(file: &File) {
+src/db/zfile.rs	3926	drop_written_range:3926	-	Filetype	fn drop_written_range(file: &File, at: u64, n: u64) {
+src/db/zfile.rs	3927	drop_written_range:3926	-	fileext	use std::os::unix::io::AsRawFd;
+src/db/zfile.rs	3932	drop_written_range:3926	-	libc	libc::sync_file_range(
+src/db/zfile.rs	3933	drop_written_range:3926	-	fsmeth	file.as_raw_fd(),
+src/db/zfile.rs	3940	drop_written_range:3926	-	fsmeth	libc::posix_fadvise(file.as_raw_fd(), at, n, libc::POSIX_FADV_DONTNEED);
+src/db/zfile.rs	3940	drop_written_range:3926	-	libc	libc::posix_fadvise(file.as_raw_fd(), at, n, libc::POSIX_FADV_DONTNEED);
+src/db/zfile.rs	3945	drop_written_range:3945	-	Filetype	fn drop_written_range(_file: &File, _at: u64, _n: u64) {}
+src/db/zfile.rs	3957	swap_ahead:3957	-	Filetype	pub(super) fn swap_ahead(seg: &File, at: u64, len: u64, form: &Path) -> u64 {
+src/db/zfile.rs	3958	swap_ahead:3957	-	fileext	use std::os::unix::io::AsRawFd;
+src/db/zfile.rs	3965	swap_ahead:3957	-	libc	libc::posix_fadvise(
+src/db/zfile.rs	3966	swap_ahead:3957	-	fsmeth	seg.as_raw_fd(),
+src/db/zfile.rs	3972	swap_ahead:3957	-	fs	let Ok(f) = File::open(form) else {
+src/db/zfile.rs	3975	swap_ahead:3957	-	fsmeth	let n = f.metadata().map_or(0, |m| m.len());
+src/db/zfile.rs	3979	swap_ahead:3957	-	libc	libc::posix_fadvise(
+src/db/zfile.rs	3980	swap_ahead:3957	-	fsmeth	f.as_raw_fd(),
+src/db/zfile.rs	3992	swap_ahead:3992	-	Filetype	pub(super) fn swap_ahead(_seg: &File, _at: u64, _len: u64, _form: &Path) -> u64 {
+src/db/zfile.rs	4002	drop_behind:4002	-	Filetype	fn drop_behind(base: usize, file: &File, from: usize, to: usize) {
+src/db/zfile.rs	4003	drop_behind:4002	-	fileext	use std::os::unix::io::AsRawFd;
+src/db/zfile.rs	4013	drop_behind:4002	-	libc	libc::madvise((base + a) as *mut libc::c_void, b - a, libc::MADV_DONTNEED);
+src/db/zfile.rs	4014	drop_behind:4002	-	libc	libc::posix_fadvise(
+src/db/zfile.rs	4015	drop_behind:4002	-	fsmeth	file.as_raw_fd(),
+src/db/zfile.rs	4024	drop_behind:4024	-	Filetype	fn drop_behind(_base: usize, _file: &File, _from: usize, _to: usize) {}
+src/db/zfile.rs	4042	ask_ahead:4035	-	libc	libc::madvise((base + a) as *mut libc::c_void, n, libc::MADV_WILLNEED);
+src/db/zfile.rs	4198	build:4184	-	Filetype	File(File),
+src/db/zfile.rs	4207	open_seg:4203	-	Filetype	Ok(SegSrc::File(super::vault::open(path)?))
+src/db/zfile.rs	4262	build_file_seen:4242	-	Filetype	SegSrc::File(file) => {
+src/db/zfile.rs	4265	build_file_seen:4242	-	mmap	let map = MmapBytes::from_map(unsafe { memmap2::Mmap::map(&file)? });
+src/db/zfile.rs	4380	build_file_seen:4242	-	fsmeth	let _ = f.sync_data();
+src/db/zfile.rs	4437	asked_bytes:4429	-	Filetype	file: &'a File,
+src/db/zfile.rs	4949	thread_major_faults:4942	-	libc	if unsafe { libc::getrusage(RUSAGE_THREAD, &mut ru) } == 0 {
+src/db/zfile.rs	5211	read_budget:5210	-	fs	budget_from(&|p: &Path| std::fs::read_to_string(p).ok())
+src/db/zfile.rs	5218	budget_from:5217	-	procsys	let meminfo = read(Path::new("/proc/meminfo"))?;
+src/db/zfile.rs	5221	budget_from:5217	-	procsys	let cg = read(Path::new("/proc/self/cgroup")).unwrap_or_default();
+src/db/zfile.rs	5222	budget_from:5217	-	procsys	let mounts = read(Path::new("/proc/mounts")).unwrap_or_default();
+src/db/zfile.rs	5264	budget_from:5217	-	procsys	let anon = read(Path::new("/proc/self/status"))
+src/db/zfile.rs	5279	read_budget:5271	T	fs	use std::fs::OpenOptions;
+src/db/zfile.rs	5293	machine:5285	T	procsys	"/proc/meminfo" => {
+src/db/zfile.rs	5300	machine:5285	T	procsys	"/proc/self/cgroup" => match (v1, v2) {
+src/db/zfile.rs	5305	machine:5285	T	procsys	"/proc/mounts" => match (v1, v2) {
+src/db/zfile.rs	5319	machine:5285	T	procsys	"/proc/self/status" => format!("RssAnon: {} kB\n", anon >> 10),
+src/db/zfile.rs	5450	the_threads_major_faults_are_the_procfs_count:5443	T	fs	let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap();
+src/db/zfile.rs	5450	the_threads_major_faults_are_the_procfs_count:5443	T	procsys	let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap();
+src/db/zfile.rs	5461	the_threads_major_faults_are_the_procfs_count:5443	T	fs	use std::os::unix::fs::FileExt;
+src/db/zfile.rs	5461	the_threads_major_faults_are_the_procfs_count:5443	T	fileext	use std::os::unix::fs::FileExt;
+src/db/zfile.rs	5486	dir:5483	T	fs	let _ = std::fs::remove_dir_all(&d);
+src/db/zfile.rs	5487	dir:5483	T	fs	std::fs::create_dir_all(&d).unwrap();
+src/db/zfile.rs	5688	drop:5687	T	fs	let _ = std::fs::remove_dir_all(&self.dir);
+src/db/zfile.rs	6037	a_cursor_moved_onto_a_damaged_page_falls_back:6025	T	fs	let f = OpenOptions::new()
+src/db/zfile.rs	6045	a_cursor_moved_onto_a_damaged_page_falls_back:6025	T	fsmeth	f.write_at(&[b[0] ^ 0x5a], at).unwrap();
+src/db/zfile.rs	6091	a_read_hands_over_nothing_before_its_checks_have_passed:6074	T	fs	let f = OpenOptions::new()
+src/db/zfile.rs	6099	a_read_hands_over_nothing_before_its_checks_have_passed:6074	T	fsmeth	f.write_at(&[b[0] ^ 0x5a], at).unwrap();
+src/db/zfile.rs	6135	a_partition_that_cannot_have_a_form_file_is_declined_for_its_reason:6130	T	fsmeth	assert!(!fx.out.exists(), "no file for a declined partition");
+src/db/zfile.rs	6136	a_partition_that_cannot_have_a_form_file_is_declined_for_its_reason:6130	T	fsmeth	assert!(!fx.out.with_extension("zpg.tmp").exists());
+src/db/zfile.rs	6147	a_partition_that_cannot_have_a_form_file_is_declined_for_its_reason:6130	T	fsmeth	assert!(!fx.out.exists());
+src/db/zfile.rs	6182	a_partition_that_cannot_have_a_form_file_is_declined_for_its_reason:6130	T	fsmeth	assert!(!alone.out.exists());
+src/db/zfile.rs	6184	a_partition_that_cannot_have_a_form_file_is_declined_for_its_reason:6130	T	fsmeth	assert!(!fx.out.exists());
+src/db/zfile.rs	6660	a_form_file_of_another_segment_is_refused:6653	T	fs	std::fs::copy(&one.out, &two.out).unwrap();
+src/db/zfile.rs	6706	a_form_file_of_another_segment_is_refused:6653	T	fs	let _ = std::fs::remove_file(&one.out);
+src/db/zfile.rs	6722	with_trailer:6721	T	fs	let mut bytes = std::fs::read(path).unwrap();
+src/db/zfile.rs	6727	with_trailer:6721	T	fs	std::fs::write(path, bytes).unwrap();
+src/db/zfile.rs	6734	every_field_of_the_trailer_wrong_is_refused:6731	T	fs	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs	6874	every_field_of_the_trailer_wrong_is_refused:6731	T	fs	std::fs::write(&fx.out, &good).unwrap();
+src/db/zfile.rs	6883	every_field_of_the_trailer_wrong_is_refused:6731	T	fs	std::fs::write(&fx.out, &good).unwrap();
+src/db/zfile.rs	6888	every_field_of_the_trailer_wrong_is_refused:6731	T	fs	std::fs::write(&fx.out, &good).unwrap();
+src/db/zfile.rs	6895	every_field_of_the_trailer_wrong_is_refused:6731	T	fs	std::fs::write(&fx.out, &bad).unwrap();
+src/db/zfile.rs	6905	every_field_of_the_trailer_wrong_is_refused:6731	T	fs	std::fs::write(&fx.out, &bad).unwrap();
+src/db/zfile.rs	6916	every_field_of_the_trailer_wrong_is_refused:6731	T	fs	std::fs::write(&fx.out, &bad).unwrap();
+src/db/zfile.rs	6940	a_flipped_byte_in_the_pages_is_never_an_answer:6931	T	fs	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs	6947	a_flipped_byte_in_the_pages_is_never_an_answer:6931	T	fs	let f = OpenOptions::new().write(true).open(&fx.out).unwrap();
+src/db/zfile.rs	6951	a_flipped_byte_in_the_pages_is_never_an_answer:6931	T	fsmeth	f.write_at(&[good[at] ^ 0x21], at as u64).unwrap();
+src/db/zfile.rs	6989	a_flipped_byte_in_the_pages_is_never_an_answer:6931	T	fsmeth	f.write_at(&[good[at]], at as u64).unwrap();
+src/db/zfile.rs	7058	forge_groups:7057	T	fs	let bytes = std::fs::read(path).unwrap();
+src/db/zfile.rs	7081	forge_groups:7057	T	fs	let f = OpenOptions::new().write(true).open(path).unwrap();
+src/db/zfile.rs	7082	forge_groups:7057	T	fsmeth	f.write_all_at(&page, (p * ZPAGE) as u64).unwrap();
+src/db/zfile.rs	7121	a_page_with_a_good_crc_and_the_wrong_records_is_never_an_answer:7111	T	fs	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs	7172	a_page_with_a_good_crc_and_the_wrong_records_is_never_an_answer:7111	T	fs	std::fs::write(&fx.out, &good).unwrap();
+src/db/zfile.rs	7208	a_page_with_a_good_crc_and_the_wrong_records_is_never_an_answer:7111	T	fs	std::fs::write(&fx.out, &good).unwrap();
+src/db/zfile.rs	7217	a_page_with_a_good_crc_and_the_wrong_records_is_never_an_answer:7111	T	fs	std::fs::write(&fx.out, &good).unwrap();
+src/db/zfile.rs	7233	a_sampled_page_with_a_good_crc_and_the_wrong_count_is_refused_at_attach:7228	T	fs	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs	7243	a_sampled_page_with_a_good_crc_and_the_wrong_count_is_refused_at_attach:7228	T	fs	std::fs::write(&fx.out, &good).unwrap();
+src/db/zfile.rs	7257	a_page_that_failed_its_first_decode_is_never_counted_verified:7249	T	fs	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs	7260	a_page_that_failed_its_first_decode_is_never_counted_verified:7249	T	fs	let f = OpenOptions::new().write(true).open(&fx.out).unwrap();
+src/db/zfile.rs	7261	a_page_that_failed_its_first_decode_is_never_counted_verified:7249	T	fsmeth	f.write_all_at(&[good[p * ZPAGE + 100] ^ 0x5a], (p * ZPAGE + 100) as u64)
+src/db/zfile.rs	7287	a_verified_page_that_changes_underneath_is_never_answered_absent:7281	T	fs	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs	7340	a_record_that_stops_parsing_after_its_page_was_verified_is_never_answered_absent:7330	T	fs	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs	7397	the_trailer_sums_the_groups_and_the_file_is_the_length_the_build_returns:7391	T	fs	let bytes = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs	7439	a_build_over_records_out_of_order_fails_and_leaves_no_file:7424	T	fs	let mut copy = std::fs::read(&fx.seg).unwrap();
+src/db/zfile.rs	7445	a_build_over_records_out_of_order_fails_and_leaves_no_file:7424	T	fs	std::fs::write(&broken, copy).unwrap();
+src/db/zfile.rs	7449	a_build_over_records_out_of_order_fails_and_leaves_no_file:7424	T	fsmeth	assert!(!out.exists());
+src/db/zfile.rs	7450	a_build_over_records_out_of_order_fails_and_leaves_no_file:7424	T	fsmeth	assert!(!tmp_of(&out).exists(), "a failed build left its temp name");
+src/db/zfile.rs	7457	evict:7456	T	fileext	use std::os::unix::io::AsRawFd;
+src/db/zfile.rs	7458	evict:7456	T	fs	let f = File::open(p).unwrap();
+src/db/zfile.rs	7459	evict:7456	T	fsmeth	f.sync_all().unwrap();
+src/db/zfile.rs	7461	evict:7456	T	fsmeth	let rc = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+src/db/zfile.rs	7461	evict:7456	T	libc	let rc = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+src/db/zfile.rs	7479	an_ask_ahead_brings_the_cold_pages_in:7474	T	fs	std::fs::copy(&fx.seg, &p).unwrap();
+src/db/zfile.rs	7500	an_ask_ahead_brings_the_cold_pages_in:7474	T	thread	std::thread::sleep(std::time::Duration::from_millis(10));
+src/db/zfile.rs	7782	the_cursor_walks_the_records_in_order_and_falls_to_the_raw_form_on_damage:7702	T	fs	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs	7787	the_cursor_walks_the_records_in_order_and_falls_to_the_raw_form_on_damage:7702	T	fs	std::fs::write(&fx.out, &flipped).unwrap();
+src/db/zfile.rs	7805	the_cursor_walks_the_records_in_order_and_falls_to_the_raw_form_on_damage:7702	T	fs	std::fs::write(&fx.out, &good).unwrap();
+src/db/zfile.rs	7939	a_raw_tail_record_that_lies_about_its_run_falls_the_walk_to_the_raw_form:7937	T	fs	use std::os::unix::fs::FileExt;
+src/db/zfile.rs	7939	a_raw_tail_record_that_lies_about_its_run_falls_the_walk_to_the_raw_form:7937	T	fileext	use std::os::unix::fs::FileExt;
+src/db/zfile.rs	7942	a_raw_tail_record_that_lies_about_its_run_falls_the_walk_to_the_raw_form:7937	T	fs	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs	7990	a_raw_tail_record_that_lies_about_its_run_falls_the_walk_to_the_raw_form:7937	T	fs	let f = OpenOptions::new().write(true).open(&fx.out).unwrap();
+src/db/zfile.rs	7991	a_raw_tail_record_that_lies_about_its_run_falls_the_walk_to_the_raw_form:7937	T	fsmeth	f.write_all_at(&page, (p * ZPAGE) as u64).unwrap();
+src/db/zfile.rs	8136	the_cursors_bulk_walk_stops_at_the_key_asked_and_hands_over_what_the_raw_form_has:8014	T	fs	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs	8141	the_cursors_bulk_walk_stops_at_the_key_asked_and_hands_over_what_the_raw_form_has:8014	T	fs	std::fs::write(&fx.out, &flipped).unwrap();
+src/db/zfile.rs	8155	the_cursors_bulk_walk_stops_at_the_key_asked_and_hands_over_what_the_raw_form_has:8014	T	fs	std::fs::write(&fx.out, &good).unwrap();
+src/db/zfile.rs	8245	a_scan_asks_for_the_pages_it_will_cross_once_and_they_come_in_behind_it:8169	T	thread	std::thread::sleep(std::time::Duration::from_millis(5));
+src/db/zfile.rs	8270	a_record_no_page_holds_among_the_pages_is_one_entry_and_the_pages_go_on:8255	T	fsmeth	assert!(fx.out.exists() && !tmp_of(&fx.out).exists());
+src/db/zfile.rs	8311	a_build_over_a_stale_temp_file_is_a_whole_form_file:8305	T	fs	std::fs::write(tmp_of(&fx.out), vec![0xA5u8; 4 << 20]).unwrap();
+src/db/zfile.rs	8317	a_build_over_a_stale_temp_file_is_a_whole_form_file:8305	T	fsmeth	assert!(!tmp_of(&fx.out).exists());
+src/db/zfile.rs	8389	a_form_file_is_the_same_bytes_whatever_the_piece_and_the_window:8365	T	fs	let _ = std::fs::remove_file(&fx.out);
+src/db/zfile.rs	8401	a_form_file_is_the_same_bytes_whatever_the_piece_and_the_window:8365	T	fs	let bytes = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs	8475	a_page_the_form_file_cannot_lend_is_refused_by_a_read_and_not_answered_absent:8460	T	fs	let bytes = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs	8585	records_the_form_holds_no_page_for_are_the_raw_forms_and_pages_are_found_by_number:8575	T	fs	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs	8620	records_the_form_holds_no_page_for_are_the_raw_forms_and_pages_are_found_by_number:8575	T	fs	std::fs::write(&fx.out, &bytes).unwrap();
+src/db/zpages.rs	6892	fill_page_is_deterministic:6864	T	thread	std::thread::spawn(move || {
+src/db/zpages.rs	6898	fill_page_is_deterministic:6864	T	thread	.join()
+src/db/zpages.rs	7507	scratch:7504	T	fs	let _ = std::fs::remove_dir_all(&d);
+src/db/zpages.rs	7508	scratch:7504	T	fs	std::fs::create_dir_all(&d).unwrap();
+src/db/zpages.rs	7630	a_segments_images_are_the_streamed_records:7567	T	fs	let _ = std::fs::remove_dir_all(&dir);
+src/db/zselect.rs	2502	the_cgroup_parsers_read_this_hosts_shapes_and_a_v2_only_host:2481	T	procsys	Some("/sys/fs/cgroup/memory")
+src/db/zselect.rs	2506	the_cgroup_parsers_read_this_hosts_shapes_and_a_v2_only_host:2481	T	procsys	Some("/sys/fs/cgroup/unified")
+src/flatindex.rs	1603	encode_inline:1450	-	thread	std::thread::scope(|sc| {
+src/flatindex.rs	1606	encode_inline:1450	-	thread	sc.spawn(move || f(r, d, a, b));
+src/flatindex.rs	1680	encode_inline:1450	-	thread	std::thread::scope(|sc| {
+src/flatindex.rs	1689	encode_inline:1450	-	thread	sc.spawn(move || {
+src/ordindex.rs	1189	build:1188	T	thread	let mut b = Builder::new();
+src/ordindex.rs	1207	write:1205	T	fs	std::fs::write(&p, bytes).expect("write");
+src/ordindex.rs	1221	check_all:1211	T	fs	let _ = std::fs::remove_file(&p);
+src/ordindex.rs	1260	the_top_level_answers_a_strides_first_key_as_the_records_do:1230	T	fs	std::fs::remove_file(&p).ok();
+src/ordindex.rs	1291	a_heads_page_ends_where_the_next_begins:1265	T	fs	std::fs::remove_file(&p).ok();
+src/ordindex.rs	1351	the_windowed_seek_says_whether_its_rank_is_the_key:1295	T	fs	let _ = std::fs::remove_file(&p);
+src/ordindex.rs	1378	check_from:1359	T	fs	let _ = std::fs::remove_file(&p);
+src/ordindex.rs	1447	the_hinted_seek_names_a_window_of_one_stride_that_holds_its_answer:1415	T	fs	let _ = std::fs::remove_file(&p);
+src/ordindex.rs	1475	a_seek_answers_what_a_lower_bound_answers:1453	T	fs	let _ = std::fs::remove_file(&p);
+src/ordindex.rs	1536	a_query_outside_the_common_prefix_seeks_to_an_end:1510	T	fs	let _ = std::fs::remove_file(&p);
+src/ordindex.rs	1575	a_uniform_index_seeks_without_reading_a_record:1545	T	fs	let _ = std::fs::remove_file(&p);
+src/ordindex.rs	1626	mixed_lengths_keep_the_tie_search:1583	T	fs	let _ = std::fs::remove_file(&p);
+src/ordindex.rs	1664	equal_lengths_past_the_head_keep_the_tie_search:1633	T	fs	let _ = std::fs::remove_file(&p);
+src/ordindex.rs	1766	the_flag_of_an_exact_seek_says_whether_the_key_is_there:1678	T	fs	let _ = std::fs::remove_file(&p);
+src/ordindex.rs	1777	an_empty_segment_builds_and_seeks:1771	T	fs	let _ = std::fs::remove_file(&p);
+src/ordindex.rs	1797	a_flipped_byte_anywhere_fails_the_open:1783	T	fs	let _ = std::fs::remove_file(&p);
+src/ordindex.rs	1811	a_companion_for_another_segment_is_refused:1804	T	fs	let _ = std::fs::remove_file(&p);
+src/ordindex.rs	1906	a_walk_along_the_heads_answers_as_the_records_do:1821	T	fs	let _ = std::fs::remove_file(&p);

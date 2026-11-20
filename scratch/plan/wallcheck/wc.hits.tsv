@@ -1,0 +1,498 @@
+src/db/zfile.rs	2003	code	ZFile::attach	vault::<not a door verb>	1	let _hold = path.parent().and_then(super::vault::hold);
+src/db/zfile.rs	2005	comment	ZFile::attach	cipher	1	// store under a cipher the cache's view of the form file's
+src/db/zfile.rs	2006	comment	ZFile::attach	envelope	1	// envelope, of which a page is read by asking for it.
+src/db/zfile.rs	2021	comment	ZFile::attach	cipher	1	// A file of a store under a cipher has no descriptor: its pages
+src/db/zfile.rs	3780	comment	warm_file	cipher	1	// A form file under a cipher lends nothing whole and has no page cache
+src/db/zfile.rs	4195	comment	<item>	cipher	1	/// mapped whole; or a file a store under a cipher keeps, as the store's
+src/db/zfile.rs	4204	code	open_seg	vault::<not a door verb>	1	if super::vault::kept(path) {
+src/db/zfile.rs	4205	code	open_seg	held build	1	Ok(SegSrc::Kept(super::vault::map(path)?))
+src/db/zfile.rs	4301	code	build_file_seen	held build	1	SegSrc::Kept(map) => {
+src/db/zfile.rs	4302	comment	build_file_seen	cipher	1	// A file of a store under a cipher: read through the store's
+src/db/zfile.rs	4309	code	build_file_seen	vault::<not a door verb>	1	let hold = super::vault::hold(dir)
+src/db/zfile.rs	4310	code	build_file_seen	cipher	1	.ok_or_else(|| super::err("z build: a kept file of no store under a cipher"))?;
+src/db/zfile.rs	4364	comment	build_file_seen	cipher	1	// Under a cipher the file is a memory file until it has its
+src/db/zfile.rs	4365	comment	build_file_seen	envelope	1	// envelope, which is written here, on the build's thread,
+src/db/zfile.rs	4373	code	build_file_seen	vault::<not a door verb>	1	super::vault::persist_form(dir, seg, form, plan.sync, plan.drop_output)
+src/db/zfile.rs	4393	comment	<item>	cipher	1	/// The records of a segment a store under a cipher keeps, as images, each
+src/db/zfile.rs	4420	comment	<item>	cipher	1	/// the code it was and a build under a cipher has none of it.
+src/db/zfile.rs	4421	code	Walked::<item>	held build	1	trait Walked {
+src/db/zfile.rs	4459	code	Mapped::<item>	held build	1	impl Walked for Mapped<'_> {
+src/db/zfile.rs	4511	comment	<item>	cipher	1	/// A segment a store under a cipher keeps, read under a hold. What the
+src/db/zfile.rs	4513	comment	<item>	envelope	1	/// the segment's envelope, through the store's cache's view of the file:
+src/db/zfile.rs	4514	comment	<item>	cipher	1	/// the records' ciphertext asked for a window ahead of the walk, since the
+src/db/zfile.rs	4515	comment	<item>	envelope	1	/// envelope is mapped for far-apart reads and nothing else reads ahead of
+src/db/zfile.rs	4522	code	Held::<item>	pager	1	hold: &'a super::pager::Hold,
+src/db/zfile.rs	4544	code	Held::<item>	held build	1	impl Walked for Held<'_> {
+src/db/zfile.rs	4594	comment	<item>	held build	1	/// walk does about the cache the segment is read through (`Walked`).
+src/db/zfile.rs	4596	code	write_pages	held build	1	fn write_pages<I: Images, W: Walked>(
+src/db/zfile.rs	5063	comment	sample	cipher	1	// where its source lends so: a store under a cipher's, each record
+src/ordindex.rs	405	comment	OrdIndex::open	piecewise/ASK_PIECES	1	// A mapping that lends by the piece (`Bytes::piecewise`: a store
+src/ordindex.rs	406	comment	OrdIndex::open	cipher	1	// under a cipher's, whose bytes are decrypted as they are asked
+src/ordindex.rs	406	comment	OrdIndex::open	crypt	1	// under a cipher's, whose bytes are decrypted as they are asked
+src/ordindex.rs	413	code	OrdIndex::open	piecewise/ASK_PIECES	1	let paged = map.piecewise();
+src/ordindex.rs	509	comment	OrdIndex::<item>	pager	1	/// not lend, which the source records (`db::pager`) and the read
+src/ordindex.rs	515	code	OrdIndex::head_absent	piecewise/ASK_PIECES	1	self.map.piecewise(),
+src/flatindex.rs	604	comment	<item>	piecewise/ASK_PIECES	1	/// bytes present when they are asked for (`Bytes::piecewise`): nothing of
+src/blob.rs	475	comment	<item>	piecewise/ASK_PIECES	1	/// Or lent by the piece (`Bytes::piecewise`): the section is where it lies
+src/blob.rs	490	code	Sec::read	piecewise/ASK_PIECES	1	if src.piecewise() {
+src/blob.rs	517	code	Sec::pieces	piecewise/ASK_PIECES	1	Sec::Lent { off, len } if src.piecewise() => Some(Pieces::new(src, *off, *len)),
+src/blob.rs	556	code	not_lent	piecewise/ASK_PIECES	1	if src.piecewise() {
+src/blob.rs	2291	comment	Blob::<item>	piecewise/ASK_PIECES	1	/// sections by the piece (`Bytes::piecewise`), a window at a time: the
+src/blob.rs	2296	comment	Blob::<item>	cipher	1	/// store under a cipher scanned at 0.25-0.45x of the same store in the
+src/blob.rs	2388	comment	Blob::<item>	piecewise/ASK_PIECES	1	/// lend so to a reader that has not been told (`Bytes::ASK_PIECES`):
+src/blob.rs	2397	code	Blob::scan_at	piecewise/ASK_PIECES	2	if B::ASK_PIECES && self.src.piecewise() {
+src/blob.rs	2407	comment	Blob::<item>	cipher	1	/// engine's, whose segments are of the one type under a cipher and in
+src/blob.rs	2436	code	Blob::scan_refused	piecewise/ASK_PIECES	1	if self.src.piecewise() && e.kind() == ErrorKind::Unsupported {
+src/blob.rs	2524	code	Blob::scan_whole	piecewise/ASK_PIECES	1	} else if self.src.piecewise() {
+src/db.rs	78	comment	<item>	crypt	1	// A store's directory encrypted by the kernel, under a key the caller gives
+src/db.rs	79	comment	<item>	crypt	1	// (`Encryption::Kernel`).
+src/db.rs	80	code	<item>	dirkey	1	pub mod dirkey;
+src/db.rs	81	comment	<item>	cipher	2	// A store under a cipher the caller gives (`Encryption::Cipher`): its files in
+src/db.rs	81	comment	<item>	crypt	1	// A store under a cipher the caller gives (`Encryption::Cipher`): its files in
+src/db.rs	82	comment	<item>	envelope	1	// memory, their envelopes in the directory, and the door the engine's file
+src/db.rs	84	code	<item>	pager	1	pub(crate) mod pager;
+src/db.rs	85	code	<item>	vault (field or module word)	1	pub mod vault;
+src/db.rs	192	comment	<item>	cipher	1	/// An ordered run's batch under a cipher is the one
+src/db.rs	248	comment	<item>	envelope	1	/// their data or of the directory that names them, a failed envelope
+src/db.rs	249	comment	<item>	cipher	1	/// under a cipher, a failed presync of a closing run's records -- is never
+src/db.rs	816	comment	<item>	crypt	1	/// How a store is kept under a key (`Options::encryption`).
+src/db.rs	819	comment	<item>	crypt	1	/// the page cache, so a store larger than memory works and an open decrypts
+src/db.rs	820	comment	<item>	cipher	1	/// nothing, on a filesystem that can encrypt. The caller's cipher goes
+src/db.rs	820	comment	<item>	crypt	1	/// nothing, on a filesystem that can encrypt. The caller's cipher goes
+src/db.rs	822	comment	<item>	cipher	1	/// memory. A store under both would pay the kernel's cipher on every byte
+src/db.rs	823	comment	<item>	cipher	1	/// it writes and reads back for bytes that are ciphertext already, and get
+src/db.rs	826	code	Encryption::<item>	crypt	1	pub enum Encryption {
+src/db.rs	831	comment	Encryption::<item>	crypt	1	/// The store's directory encrypted by the kernel under this key
+src/db.rs	832	comment	Encryption::<item>	crypt	1	/// (`dirkey`, Linux's file encryption): every file the store writes is
+src/db.rs	832	comment	Encryption::<item>	dirkey	1	/// (`dirkey`, Linux's file encryption): every file the store writes is
+src/db.rs	833	comment	Encryption::<item>	cipher	1	/// ciphertext on the device and plaintext in the page cache, so no
+src/db.rs	835	comment	Encryption::<item>	crypt	1	/// `Db::create` encrypts the directory before it writes anything, and
+src/db.rs	836	comment	Encryption::<item>	crypt	1	/// refuses where the directory cannot be encrypted; `Db::open` holds
+src/db.rs	838	comment	Encryption::<item>	crypt	1	/// encrypted under it.
+src/db.rs	839	code	Encryption::<item>	dirkey	2	Kernel(dirkey::DirKey),
+src/db.rs	840	comment	Encryption::<item>	cipher	1	/// Everything the store writes to its directory sealed under a cipher
+src/db.rs	841	comment	Encryption::<item>	vault (field or module word)	1	/// of the caller's (`vault`): the segments, the log, the manifest, and
+src/db.rs	844	comment	Encryption::<item>	cipher	1	/// (`StoreCipher::cache_bytes`), decrypting a chunk of a file where it
+src/db.rs	844	comment	Encryption::<item>	crypt	1	/// (`StoreCipher::cache_bytes`), decrypting a chunk of a file where it
+src/db.rs	847	comment	Encryption::<item>	crypt	1	/// size runs in the cache it is given, and an open decrypts only what
+src/db.rs	848	comment	Encryption::<item>	crypt	1	/// an open reads. A file's bytes are checked where they are decrypted,
+src/db.rs	853	comment	Encryption::<item>	cipher	1	/// such a store in the raw form (`Options::zpages_under_cipher`),
+src/db.rs	855	comment	Encryption::<item>	cipher	1	/// it there as anywhere. `Db::create` makes a store under the cipher in an empty
+src/db.rs	857	comment	Encryption::<item>	cipher	1	/// store under a cipher is refused where none is given.
+src/db.rs	858	code	Encryption::<item>	cipher	2	Cipher(vault::StoreCipher),
+src/db.rs	858	code	Encryption::<item>	vault::<not a door verb>	1	Cipher(vault::StoreCipher),
+src/db.rs	865	comment	Options::<item>	cipher	1	/// the kernel's encryption of its directory, or under a cipher the
+src/db.rs	865	comment	Options::<item>	crypt	1	/// the kernel's encryption of its directory, or under a cipher the
+src/db.rs	866	comment	Options::<item>	crypt	1	/// caller supplies (`Encryption`). One of the three, and the choice is
+src/db.rs	869	code	Options::<item>	crypt	2	pub encryption: Encryption,
+src/db.rs	3884	comment	Options::<item>	cipher	2	/// a cipher (`Encryption::Cipher`): with it off, `ZPages::Auto` reads
+src/db.rs	3884	comment	Options::<item>	crypt	1	/// a cipher (`Encryption::Cipher`): with it off, `ZPages::Auto` reads
+src/db.rs	3888	comment	Options::<item>	envelope	1	/// an envelope's chunk holds sixteen bytes less, its tag beside it, so
+src/db.rs	3890	comment	Options::<item>	cipher	1	/// through the form takes two pages of ciphertext from the device,
+src/db.rs	3896	comment	Options::<item>	cipher	2	/// (`bench/scripts/pair.sh supdb-cipherauto supdb-cipher 5000000
+src/db.rs	3900	comment	Options::<item>	envelope	1	/// the crossing -- and it wants an envelope whose chunks are whole
+src/db.rs	3901	comment	Options::<item>	cipher	1	/// pages before the form pays (`ROADMAP.md`). `supdb-cipherauto` and
+src/db.rs	3902	comment	Options::<item>	cipher	1	/// `supdb-ingestcipherauto` are the arms with it on.
+src/db.rs	3903	code	Options::<item>	cipher	1	pub zpages_under_cipher: bool,
+src/db.rs	3957	code	Options::default	crypt	2	encryption: Encryption::None,
+src/db.rs	4178	code	Options::default	cipher	1	zpages_under_cipher: false,
+src/db.rs	4226	comment	Wal::<item>	cipher	1	/// The file's header length: `WAL_MAGIC`'s, or under a cipher that and
+src/db.rs	4229	comment	Wal::<item>	cipher	2	/// Under a cipher (`Encryption::Cipher`), the file's: each `write` is one
+src/db.rs	4229	comment	Wal::<item>	crypt	1	/// Under a cipher (`Encryption::Cipher`), the file's: each `write` is one
+src/db.rs	4233	code	Wal::<item>	cipher	1	enc: Option<vault::LogCipher>,
+src/db.rs	4233	code	Wal::<item>	vault::<not a door verb>	1	enc: Option<vault::LogCipher>,
+src/db.rs	4239	comment	Wal::<item>	cipher	1	/// a cipher, `SEAL_FAILS` fails the record's seal before anything is
+src/db.rs	4267	comment	<item>	cipher	1	/// The name of a log under a cipher, with the kind byte after it as after
+src/db.rs	4271	code	<item>	vault::<not a door verb>	1	const WAL_SEALED_LEN: usize = WAL_MAGIC.len() + vault::WRAPPED;
+src/db.rs	4271	code	<item>	sealed log/manifest	1	const WAL_SEALED_LEN: usize = WAL_MAGIC.len() + vault::WRAPPED;
+src/db.rs	4356	comment	<item>	cipher	1	/// `Wal::fail_next`'s value for a test's failed seal under a cipher.
+src/db.rs	4383	comment	Wal::<item>	cipher	1	/// The header a file begun now takes, and under a cipher the file's
+src/db.rs	4386	code	Wal::begin	cipher	1	fn begin(path: &Path, id: u64, kind: u8) -> Result<(Option<vault::LogCipher>, Vec<u8>)> {
+src/db.rs	4386	code	Wal::begin	vault::<not a door verb>	1	fn begin(path: &Path, id: u64, kind: u8) -> Result<(Option<vault::LogCipher>, Vec<u8>)> {
+src/db.rs	4387	code	Wal::begin	vault::<not a door verb>	1	let Some(v) = path.parent().and_then(vault::under) else {
+src/db.rs	4390	code	Wal::begin	sealed log/manifest	1	let (enc, wrapped) = v.log_begin(id)?;
+src/db.rs	4391	code	Wal::begin	sealed log/manifest	1	let mut head = Vec::with_capacity(WAL_SEALED_LEN);
+src/db.rs	4398	comment	Wal::<item>	cipher	1	/// The cipher of the sealed log whose whole bytes, or whose header,
+src/db.rs	4399	comment	Wal::<item>	cipher	1	/// `buf` is, and its kind: for a store under a cipher, which reads no
+src/db.rs	4403	code	Wal::resume	cipher	1	fn resume(v: &vault::Vault, id: u64, buf: &[u8]) -> Result<Option<(vault::LogCipher, u8)>> {
+src/db.rs	4403	code	Wal::resume	vault::<not a door verb>	2	fn resume(v: &vault::Vault, id: u64, buf: &[u8]) -> Result<Option<(vault::LogCipher, u8)>> {
+src/db.rs	4406	code	Wal::resume	sealed log/manifest	1	if buf.len() < WAL_SEALED_LEN {
+src/db.rs	4415	code	Wal::resume	sealed log/manifest	2	.log_resume(id, &buf[WAL_MAGIC.len()..WAL_SEALED_LEN])
+src/db.rs	4432	comment	Wal::<item>	cipher	1	/// Under a cipher the zeros follow the sealed header, and read as a
+src/db.rs	4434	comment	Wal::<item>	cipher	1	/// (`vault::LogCipher::open_records`).
+src/db.rs	4434	comment	Wal::<item>	vault::<not a door verb>	1	/// (`vault::LogCipher::open_records`).
+src/db.rs	4434	comment	Wal::<item>	sealed log/manifest	1	/// (`vault::LogCipher::open_records`).
+src/db.rs	4454	comment	Wal::<item>	cipher	1	/// Under a cipher the header is the file's own key, drawn for this
+src/db.rs	4535	code	Wal::open_append	vault::<not a door verb>	1	} else if let Some(v) = path.parent().and_then(vault::under) {
+src/db.rs	4538	code	Wal::open_append	sealed log/manifest	1	let mut h = [0u8; WAL_SEALED_LEN];
+src/db.rs	4544	code	Wal::open_append	sealed log/manifest	1	head = WAL_SEALED_LEN as u64;
+src/db.rs	4667	code	Wal::write	sealed log/manifest	1	enc.seal_into(self.written, &self.pending, &mut self.sealed)
+src/db.rs	4840	comment	Wal::<item>	cipher	1	/// (`Options::recycle_wal`): under a cipher, a file there whose header
+src/db.rs	4865	code	Wal::replay	vault::<not a door verb>	1	let Some(v) = path.parent().and_then(vault::under) else {
+src/db.rs	4868	comment	Wal::replay	cipher	1	// Under a cipher: the records unsealed, one after another to the
+src/db.rs	4881	code	Wal::replay	sealed log/manifest	2	let ends = enc.open_records(&buf, WAL_SEALED_LEN, &mut frames);
+src/db.rs	4887	code	Wal::replay	sealed log/manifest	1	.map_or(WAL_SEALED_LEN as u64, |&(_, file_end)| file_end);
+src/db.rs	5054	comment	Direct::<item>	cipher	1	/// Under a cipher, how many of the table's entries the log holds
+src/db.rs	5055	comment	Direct::<item>	run logged	1	/// (`Db::log_run`).
+src/db.rs	5056	code	Direct::<item>	run logged	1	logged: usize,
+src/db.rs	8951	comment	Seg::<item>	cipher	1	/// memory or from the device. For a file of a store under a cipher,
+src/db.rs	8953	comment	Seg::<item>	cipher	1	/// holds the ciphertext of (`pager::Paged::resident`).
+src/db.rs	8953	comment	Seg::<item>	pager	1	/// holds the ciphertext of (`pager::Paged::resident`).
+src/db.rs	8953	comment	Seg::<item>	paged	1	/// holds the ciphertext of (`pager::Paged::resident`).
+src/db.rs	8960	code	Seg::records_resident	paged	1	.and_then(|(off, len)| raw.source().paged_resident(off, len))
+src/db.rs	9405	comment	MemTable::<item>	run logged	1	/// (`Db::commit_direct`): `RUN_REFS`, as `refs`, and `RUN_LOGGED` for
+src/db.rs	9406	comment	MemTable::<item>	cipher	1	/// a store under a cipher, whose run is a memory file and whose
+src/db.rs	10382	comment	<item>	pager	1	/// (`pager::Grace`): the cache marks what it means to give back, moves the
+src/db.rs	10386	code	<item>	pager	1	struct PagerGrace(std::sync::Weak<Shared>);
+src/db.rs	10388	code	PagerGrace::<item>	pager	2	impl pager::Grace for PagerGrace {
+src/db.rs	10473	comment	Slot::<item>	cipher	1	/// Under a cipher, the epoch this slot's reader last held nothing it
+src/db.rs	10474	comment	Slot::<item>	pager	1	/// was lent of the store's files (`pager`), where that is later than
+src/db.rs	10484	comment	Slot::<item>	unlent/unlend	1	/// waits for another thread (`Reader::unlent`).
+src/db.rs	10706	comment	Readers::<item>	pager	1	/// (`PagerGrace`); `oldest_pinned` is what a retired state waits out,
+src/db.rs	10762	comment	Readers::<item>	pager	1	/// what was called a wait panics (`pager::debug_pinned`) where in a
+src/db.rs	10765	code	Readers::page_idle	pager	1	pager::debug_pinned(false);
+src/db.rs	10772	code	Readers::page_back	pager	1	pager::debug_pinned(true);
+src/db.rs	10851	code	Readers::pin	pager	1	pager::debug_pinned(true);
+src/db.rs	10885	code	Readers::unpin	pager	1	pager::debug_pinned(false);
+src/db.rs	10966	comment	MemTable::<item>	run logged	1	/// (`RUN_LOGGED`).
+src/db.rs	10967	code	MemTable::logged	run logged	1	fn logged(mut self) -> MemTable {
+src/db.rs	10968	code	MemTable::logged	run logged	1	self.after |= RUN_LOGGED;
+src/db.rs	11040	comment	MemTable::<item>	run logged	1	/// Writer: the write logged, after the entry it names is published.
+src/db.rs	12168	comment	RunMap::<item>	cipher	1	/// Under a cipher, what keeps the run's memory under this mapping
+src/db.rs	12169	comment	RunMap::<item>	vault::<not a door verb>	1	/// (`vault::Mapped`).
+src/db.rs	12170	code	RunMap::<item>	vault::<not a door verb>	1	_held: vault::Mapped,
+src/db.rs	12192	code	RunMap::open	vault::<not a door verb>	1	let (file, held) = vault::open_mapped(path)?;
+src/db.rs	12196	comment	RunMap::open	cipher	1	// stays below `run_flushed`. Under a cipher the file is the run's
+src/db.rs	12248	comment	<item>	cipher	1	/// the log as well (a store under a cipher).
+src/db.rs	12250	code	<item>	run logged	1	const RUN_LOGGED: u8 = 2;
+src/db.rs	12252	comment	<item>	cipher	1	/// The compact form's controller under a cipher: left to the raw form
+src/db.rs	12253	comment	<item>	cipher	1	/// unless the store asks for it (`Options::zpages_under_cipher`), since a
+src/db.rs	12254	comment	<item>	envelope	1	/// form page lies across two chunks of an envelope and the form it buys
+src/db.rs	12256	comment	<item>	cipher	1	/// thing a store under a cipher does not do as a store in the clear does,
+src/db.rs	12259	code	cipher_controller	cipher	1	fn cipher_controller(opts: &mut Options) {
+src/db.rs	12260	code	cipher_controller	cipher	1	if opts.zpages == ZPages::Auto && !opts.zpages_under_cipher {
+src/db.rs	12453	comment	<item>	cipher	2	/// under a cipher (`Encryption::Cipher`), those sealed under the store's key
+src/db.rs	12453	comment	<item>	crypt	1	/// under a cipher (`Encryption::Cipher`), those sealed under the store's key
+src/db.rs	12454	comment	<item>	envelope	1	/// with each named segment's envelope and wrapped key behind them
+src/db.rs	12455	comment	<item>	vault::<not a door verb>	1	/// (`vault::Vault::seal_manifest`).
+src/db.rs	12455	comment	<item>	sealed log/manifest	1	/// (`vault::Vault::seal_manifest`).
+src/db.rs	12457	comment	<item>	cipher	1	/// Under a cipher this is where a segment reaches the directory. A plain
+src/db.rs	12459	comment	<item>	cipher	1	/// and the manifest is written after; a segment under a cipher is a memory
+src/db.rs	12460	comment	<item>	envelope	1	/// file until its envelope is written, so every segment the manifest names
+src/db.rs	12461	comment	<item>	envelope	1	/// has its envelope written and synced here, before the manifest that
+src/db.rs	12472	code	manifest_image	vault::<not a door verb>	1	let Some(v) = vault::under(dir) else {
+src/db.rs	12475	code	manifest_image	vault/pager method	1	let files = v.persist(&Db::with_ords(names), true)?;
+src/db.rs	12476	code	manifest_image	sealed log/manifest	1	v.seal_manifest(seq, &out, &files)
+src/db.rs	12480	comment	<item>	cipher	1	/// under a cipher, unsealed first, and the segments the manifest names
+src/db.rs	12481	comment	<item>	envelope	1	/// then known to the store by the envelopes the slot lists for them.
+src/db.rs	12483	code	manifest_open	vault::<not a door verb>	1	let Some(v) = vault::under(dir) else {
+src/db.rs	12486	code	manifest_open	sealed log/manifest	1	let (plain, files) = v.open_manifest(buf)?;
+src/db.rs	12488	code	manifest_open	sealed log/manifest	1	v.adopt_all(&Db::with_ords(&m.names), files)?;
+src/db.rs	12782	comment	compact_job	cipher	1	// reader table: under a cipher it holds the store's cache for them
+src/db.rs	12783	comment	compact_job	pager	1	// (`pager::Hold`), and rests where its walk holds nothing it will not
+src/db.rs	12787	comment	compact_job	MergeRest/NoRest	1	// compiled for each (`MergeRest`): asked at each step of its walks,
+src/db.rs	12789	code	compact_job	vault::<not a door verb>	1	match vault::hold(&plan.dir) {
+src/db.rs	12791	code	compact_job	MergeRest/NoRest	1	None => compact_run(plan, NoRest),
+src/db.rs	12798	comment	<item>	cipher	1	/// `MERGE_REST` steps, for a store's under a cipher (`pager::Hold`). A
+src/db.rs	12798	comment	<item>	pager	1	/// `MERGE_REST` steps, for a store's under a cipher (`pager::Hold`). A
+src/db.rs	12801	code	MergeRest::<item>	MergeRest/NoRest	1	trait MergeRest: Copy {
+src/db.rs	12809	code	<item>	MergeRest/NoRest	1	struct NoRest;
+src/db.rs	12811	code	NoRest::<item>	MergeRest/NoRest	2	impl MergeRest for NoRest {
+src/db.rs	12818	code	Hold::<item>	pager	1	impl MergeRest for &pager::Hold {
+src/db.rs	12818	code	Hold::<item>	MergeRest/NoRest	1	impl MergeRest for &pager::Hold {
+src/db.rs	13106	comment	<item>	cipher	1	/// (`MergeRest`; `pager::Hold`, for a store under a cipher): every
+src/db.rs	13106	comment	<item>	pager	1	/// (`MergeRest`; `pager::Hold`, for a store under a cipher): every
+src/db.rs	13106	comment	<item>	MergeRest/NoRest	1	/// (`MergeRest`; `pager::Hold`, for a store under a cipher): every
+src/db.rs	13110	code	merge_ranks	MergeRest/NoRest	1	fn merge_ranks<R: MergeRest>(
+src/db.rs	13187	code	merge_keys	MergeRest/NoRest	1	fn merge_keys<R: MergeRest>(
+src/db.rs	13263	comment	<item>	unlent/unlend	1	/// `Reader::unlend`'s guard: the slot lent to again from where it drops.
+src/db.rs	13264	code	<item>	unlent/unlend	1	struct Unlent(Option<(std::sync::Arc<Shared>, usize)>);
+src/db.rs	13266	code	Unlent::<item>	unlent/unlend	1	impl Drop for Unlent {
+src/db.rs	13274	comment	<item>	cipher	1	/// The keys of a scan between two rests, in a store under a cipher
+src/db.rs	13387	comment	Emitter::leave	cipher	1	// Under a cipher the piece's envelope is written now, where a
+src/db.rs	13387	comment	Emitter::leave	envelope	1	// Under a cipher the piece's envelope is written now, where a
+src/db.rs	13390	comment	Emitter::leave	envelope	1	// envelope is the cache's to hold or to let go
+src/db.rs	13393	code	Emitter::leave	vault::<not a door verb>	1	vault::persist_one(self.dir, &p.name)?;
+src/db.rs	13438	code	compact_run	MergeRest/NoRest	1	fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<Vec<String>> {
+src/db.rs	13679	comment	compact_run	cipher	1	// A merge's outputs under a cipher: their envelopes, on this thread,
+src/db.rs	13679	comment	compact_run	envelope	1	// A merge's outputs under a cipher: their envelopes, on this thread,
+src/db.rs	13684	code	compact_run	vault::<not a door verb>	1	vault::check(&dir)?;
+src/db.rs	13685	code	compact_run	vault::<not a door verb>	1	vault::persist(&dir, &Db::with_ords(&out))?;
+src/db.rs	13762	code	tier_run	vault::<not a door verb>	1	match vault::hold(&plan.dir) {
+src/db.rs	13764	code	tier_run	MergeRest/NoRest	1	None => tier_walk(plan, NoRest),
+src/db.rs	13768	code	tier_walk	MergeRest/NoRest	1	fn tier_walk<R: MergeRest>(plan: TierPlan, rest: R) -> Result<Vec<String>> {
+src/db.rs	13852	code	tier_walk	vault::<not a door verb>	1	vault::check(&dir)?;
+src/db.rs	13853	code	tier_walk	vault::<not a door verb>	1	vault::persist(&dir, &Db::with_ords(&out))?;
+src/db.rs	15363	comment	Shared::<item>	cipher	1	/// The cache a store under a cipher reads its files through
+src/db.rs	15364	comment	Shared::<item>	pager	2	/// (`pager::Pager`), and nothing for any other store: what a read asks
+src/db.rs	15367	code	Shared::<item>	pager	3	pager: Option<std::sync::Arc<pager::Pager>>,
+src/db.rs	15450	comment	Shared::<item>	cipher	1	/// commits: every one under a cipher and none of a plain store's,
+src/db.rs	15655	comment	Shared::<item>	cipher	1	/// its envelope under a cipher, its data's fsync -- fails, as a device
+src/db.rs	15655	comment	Shared::<item>	envelope	1	/// its envelope under a cipher, its data's fsync -- fails, as a device
+src/db.rs	16414	comment	Reader::<item>	cipher	1	/// writer's in a store under a cipher.
+src/db.rs	16440	comment	Reader::<item>	cipher	1	/// (`snapshot`), in a store under a cipher: then the handle holds
+src/db.rs	16497	comment	Reader::<item>	attn/rest word	1	/// itself, a bit each (`ATTN_OPEN`, `ATTN_PAGED`): whether a census
+src/db.rs	16501	comment	Reader::<item>	cipher	1	/// (`Encryption::Cipher`). The one byte the inlined hooks read, beside
+src/db.rs	16501	comment	Reader::<item>	crypt	1	/// (`Encryption::Cipher`). The one byte the inlined hooks read, beside
+src/db.rs	16504	comment	Reader::<item>	cipher	1	/// (`zcensus_begin`). The cipher's bit is in the byte the census had,
+src/db.rs	16506	comment	Reader::<item>	cipher	1	/// on every read of a store that has no cipher.
+src/db.rs	16510	comment	Reader::<item>	attn/rest word	1	/// store under `Auto` where the controller runs, `ATTN_PAGED` for a
+src/db.rs	16511	comment	Reader::<item>	cipher	1	/// handle of a store under a cipher. Zero for a read under `Off` or
+src/db.rs	16519	comment	<item>	cipher	1	/// The cipher's bit in both.
+src/db.rs	16520	code	<item>	attn/rest word	1	const ATTN_PAGED: u8 = 2;
+src/db.rs	16524	comment	<item>	cipher	1	/// cipher, whose looks are rests.
+src/db.rs	16529	comment	<item>	cipher	1	/// `FormsState::abandoned` for "not asked" in a store under a cipher,
+src/db.rs	16533	code	<item>	attn/rest word	1	const REST_HERE: u64 = u64::MAX - 1;
+src/db.rs	16536	comment	<item>	cipher	1	/// under a cipher, to rest at each block until it is.
+src/db.rs	16538	code	<item>	attn/rest word	1	const AHEAD_REST: u8 = 2;
+src/db.rs	17205	comment	Db::<item>	cipher	2	/// The store's registration under its cipher (`Encryption::Cipher`), which
+src/db.rs	17205	comment	Db::<item>	crypt	1	/// The store's registration under its cipher (`Encryption::Cipher`), which
+src/db.rs	17208	code	Db::<item>	vault::<not a door verb>	1	vault: Option<vault::Held>,
+src/db.rs	17208	code	Db::<item>	vault (field or module word)	1	vault: Option<vault::Held>,
+src/db.rs	17274	comment	Entered::<item>	cipher	1	/// and, in a store under a cipher, the one that turns the answer into
+src/db.rs	17277	comment	Entered::<item>	cipher	1	/// answer, and a test of its own for the cipher was a test on every
+src/db.rs	17934	comment	Snapshot::<item>	run logged	1	/// its logged slots the snapshot already has.
+src/db.rs	18317	comment	Snapshot::extend	run logged	1	// between is logged past this mark and read from its chain.
+src/db.rs	18945	comment	Reader::enter_by	cipher	1	// files of a store under a cipher it says at its start
+src/db.rs	18946	comment	Reader::enter_by	paged	1	// and its end, out of line (`paged_begin`, `end_slow`).
+src/db.rs	19053	comment	Reader::<item>	cipher	1	/// where it has anything to do, and, in a store under a cipher, what
+src/db.rs	19055	comment	Reader::<item>	pager	2	/// met, if one has (`pager::Pager::check`). A chunk that fails its tag
+src/db.rs	19069	code	Reader::end_slow	pager	1	match self.shared.pager.as_ref() {
+src/db.rs	19077	comment	Reader::<item>	cipher	1	/// store under a cipher, a snapshot's handle saying that it holds
+src/db.rs	19080	comment	Reader::<item>	paged	1	/// (`paged_begin`), which the slot's own word says.
+src/db.rs	19095	comment	Reader::<item>	cipher	1	/// The cipher's half of an operation's start, for the outermost read
+src/db.rs	19099	comment	Reader::<item>	pager	2	/// past its budget (`pager::Pager::swamped`) the read waits a little
+src/db.rs	19106	code	Reader::paged_begin	pager	2	fn paged_begin(&self, p: &pager::Pager, snap: bool) {
+src/db.rs	19106	code	Reader::paged_begin	paged	1	fn paged_begin(&self, p: &pager::Pager, snap: bool) {
+src/db.rs	19121	code	Reader::paged_begin	vault/pager method	1	if p.swamped() {
+src/db.rs	19125	code	Reader::paged_begin	vault/pager method	1	p.breathe_swamped();
+src/db.rs	19132	comment	Reader::<item>	cipher	1	/// A handle's two bytes with the cipher's bit, where its store is
+src/db.rs	19134	code	Reader::paged_bits	paged	1	fn paged_bits(mut self) -> Reader {
+src/db.rs	19135	code	Reader::paged_bits	pager	1	if self.shared.pager.is_some() {
+src/db.rs	19136	code	Reader::paged_bits	attn/rest word	1	self.attn |= ATTN_PAGED;
+src/db.rs	19137	code	Reader::paged_bits	attn/rest word	1	self.attn_open.set(self.attn_open.get() | ATTN_PAGED);
+src/db.rs	19142	comment	Reader::<item>	paged	1	/// The writer's own handle, after `paged_bits`: in a store under a
+src/db.rs	19143	comment	Reader::<item>	cipher	1	/// cipher its fills' looks are rests, and so are the understudy's,
+src/db.rs	19144	comment	Reader::<item>	attn/rest word	1	/// which is lent the same forms (`REST_HERE`).
+src/db.rs	19146	code	Reader::writer_rests	attn/rest word	1	if self.attn & ATTN_PAGED != 0 {
+src/db.rs	19148	code	Reader::writer_rests	attn/rest word	1	self.fs().abandoned.set(REST_HERE);
+src/db.rs	19155	code	Reader::not_asked	attn/rest word	1	if self.attn & ATTN_PAGED != 0 {
+src/db.rs	19156	code	Reader::not_asked	attn/rest word	1	REST_HERE
+src/db.rs	19163	comment	Reader::<item>	cipher	1	/// number: sixty-four, and every block under a cipher, where the look
+src/db.rs	19168	code	Reader::look_mask	attn/rest word	1	if self.attn & ATTN_PAGED != 0 {
+src/db.rs	19195	comment	Reader::zcensus_begin	cipher	1	// The answer is the cipher's (`paged_begin`): whether this is the
+src/db.rs	19195	comment	Reader::zcensus_begin	paged	1	// The answer is the cipher's (`paged_begin`): whether this is the
+src/db.rs	19204	comment	Reader::<item>	cipher	1	/// The slow half of an operation's start: the cipher's, whose answer
+src/db.rs	19206	comment	Reader::<item>	paged	1	/// (`paged_begin`) -- and the census's.
+src/db.rs	19214	code	Reader::begin_slow	attn/rest word	1	if self.attn & ATTN_PAGED != 0 && self.depth.get() == 1 {
+src/db.rs	19216	code	Reader::begin_slow	pager	1	if let Some(p) = self.shared.pager.as_ref() {
+src/db.rs	19218	code	Reader::begin_slow	vault/pager method	1	if snap || p.swamped() {
+src/db.rs	19219	code	Reader::begin_slow	paged	1	self.paged_begin(p, snap);
+src/db.rs	19503	code	Reader::snapshot	attn/rest word	1	if self.attn & ATTN_PAGED != 0 && self.depth.get() == 0 {
+src/db.rs	19543	code	Reader::release	attn/rest word	1	let snap = self.attn & ATTN_PAGED != 0 && self.page_snap.replace(false);
+src/db.rs	19546	code	Reader::release	pager	1	pager::debug_pinned(true);
+src/db.rs	21536	code	Reader::unlent	unlent/unlend	1	fn unlent<R>(&self, wait: impl FnOnce() -> R) -> R {
+src/db.rs	21540	code	Reader::unlent	pager	1	match (&self.shared.pager, slot) {
+src/db.rs	21554	comment	Reader::<item>	pager	2	/// (`pager::Pager::crowded`), for a walk that would rather stop than
+src/db.rs	21560	code	Reader::rest	pager	1	match (&self.shared.pager, slot) {
+src/db.rs	21563	code	Reader::rest	vault/pager method	1	p.crowded()
+src/db.rs	21565	code	Reader::rest	vault/pager method	1	(Some(p), _) => p.crowded(),
+src/db.rs	21570	comment	Reader::<item>	cipher	1	/// A builder's rest between two blocks, in a store under a cipher: a
+src/db.rs	21576	comment	Reader::<item>	pager	2	/// thread, or after a breath (`pager::Pager::breathe`). True where the
+src/db.rs	21603	code	Reader::build_rest_unless	pager	1	let Some(p) = self.shared.pager.as_ref() else {
+src/db.rs	21610	code	Reader::build_rest_unless	vault/pager method	1	return p.crowded();
+src/db.rs	21613	code	Reader::build_rest_unless	vault/pager method	1	if !p.crowded() {
+src/db.rs	21617	code	Reader::build_rest_unless	vault/pager method	1	p.breathe_unless(leave);
+src/db.rs	21619	code	Reader::build_rest_unless	vault/pager method	1	p.crowded()
+src/db.rs	21622	comment	Reader::<item>	unlent/unlend	1	/// `unlent` as a guard, for a step that is all file operations and
+src/db.rs	21626	code	Reader::unlend	unlent/unlend	2	fn unlend(&self) -> Unlent {
+src/db.rs	21630	code	Reader::unlend	pager	1	match (&self.shared.pager, slot) {
+src/db.rs	21633	code	Reader::unlend	unlent/unlend	1	Unlent(Some((self.shared.clone(), slot)))
+src/db.rs	21635	code	Reader::unlend	unlent/unlend	1	_ => Unlent(None),
+src/db.rs	21640	comment	Reader::<item>	cipher	1	/// cipher: the same scan, over the one state and at the one commit
+src/db.rs	21683	code	Reader::scan_rested	pager	1	if let Some(p) = self.shared.pager.as_ref().filter(|p| p.swamped()) {
+src/db.rs	21683	code	Reader::scan_rested	vault/pager method	1	if let Some(p) = self.shared.pager.as_ref().filter(|p| p.swamped()) {
+src/db.rs	21685	code	Reader::scan_rested	vault/pager method	1	p.breathe_swamped();
+src/db.rs	21701	comment	Reader::scan_in	cipher	1	// The outermost scan of a store under a cipher is walked with
+src/db.rs	22056	comment	Reader::sync_log	run logged	1	// Every write logged past the snapshot's copy may have moved a
+src/db.rs	22631	comment	Reader::<item>	cipher	1	/// In a store under a cipher every look is a rest as well
+src/db.rs	22635	comment	Reader::<item>	cipher	1	/// forms' own word for "not asked" is another under a cipher
+src/db.rs	22636	comment	Reader::<item>	attn/rest word	1	/// (`REST_HERE`), which sends the look out of line where an ask found
+src/db.rs	22659	comment	Reader::<item>	cipher	1	/// a cipher (`REST_HERE`), where the look is a rest (`build_rest`).
+src/db.rs	22659	comment	Reader::<item>	attn/rest word	1	/// a cipher (`REST_HERE`), where the look is a rest (`build_rest`).
+src/db.rs	22671	code	Reader::abandon_slow	attn/rest word	1	if self.fs().abandoned.get() < REST_HERE {
+src/db.rs	22772	code	Reader::abandon_pending	attn/rest word	1	self.fs().abandoned.get() < REST_HERE
+src/db.rs	22784	code	Reader::abandon_forms	attn/rest word	1	if at >= REST_HERE {
+src/db.rs	27940	comment	Db::<item>	cipher	1	/// What the store has done with its cipher since it was opened, or
+src/db.rs	27941	comment	Db::<item>	cipher	1	/// nothing for a store that has none (`Encryption::Cipher`).
+src/db.rs	27941	comment	Db::<item>	crypt	1	/// nothing for a store that has none (`Encryption::Cipher`).
+src/db.rs	27942	code	Db::cipher_counts	cipher	2	pub fn cipher_counts(&self) -> Option<vault::CipherCounts> {
+src/db.rs	27942	code	Db::cipher_counts	vault::<not a door verb>	1	pub fn cipher_counts(&self) -> Option<vault::CipherCounts> {
+src/db.rs	27943	code	Db::cipher_counts	vault/pager method	1	self.vault.as_ref().map(|h| h.vault().counts())
+src/db.rs	27943	code	Db::cipher_counts	vault (field or module word)	1	self.vault.as_ref().map(|h| h.vault().counts())
+src/db.rs	28040	comment	Db::sync_wal	cipher	1	// store under a cipher (`Reader::unlend`). A durable store syncs
+src/db.rs	28040	comment	Db::sync_wal	unlent/unlend	1	// store under a cipher (`Reader::unlend`). A durable store syncs
+src/db.rs	28045	code	Db::sync_wal	unlent/unlend	1	let _io = self.r.unlend();
+src/db.rs	28323	comment	Db::<item>	cipher	1	/// under a cipher writes the envelopes of together (`vault::persist`).
+src/db.rs	28323	comment	Db::<item>	envelope	1	/// under a cipher writes the envelopes of together (`vault::persist`).
+src/db.rs	28323	comment	Db::<item>	vault::<not a door verb>	1	/// under a cipher writes the envelopes of together (`vault::persist`).
+src/db.rs	28349	comment	Db::create	cipher	1	// The key or the cipher is taken out of the options here and is not
+src/db.rs	28350	comment	Db::create	crypt	1	// kept in them. Under the kernel's key the directory is encrypted
+src/db.rs	28353	comment	Db::create	cipher	1	// here. Under a cipher the marker is written before anything else,
+src/db.rs	28355	comment	Db::create	vault (field or module word)	2	// vault's door finds (`vault`).
+src/db.rs	28356	code	Db::create	crypt	1	let held = match std::mem::take(&mut opts.encryption) {
+src/db.rs	28357	code	Db::create	crypt	1	Encryption::None => {
+src/db.rs	28358	code	Db::create	vault::<not a door verb>	1	vault::refuse_marked(dir)?;
+src/db.rs	28361	code	Db::create	crypt	1	Encryption::Kernel(key) => {
+src/db.rs	28362	code	Db::create	vault::<not a door verb>	1	vault::refuse_marked(dir)?;
+src/db.rs	28363	code	Db::create	dirkey	1	dirkey::protect(dir, &key)?;
+src/db.rs	28366	code	Db::create	cipher	2	Encryption::Cipher(cipher) => {
+src/db.rs	28366	code	Db::create	crypt	1	Encryption::Cipher(cipher) => {
+src/db.rs	28367	code	Db::create	cipher	1	cipher_controller(&mut opts);
+src/db.rs	28368	code	Db::create	cipher	1	Some(vault::Vault::create(dir, &cipher)?)
+src/db.rs	28368	code	Db::create	vault::<not a door verb>	1	Some(vault::Vault::create(dir, &cipher)?)
+src/db.rs	28371	code	Db::create	vault::<not a door verb>	1	let decoy = held.as_ref().map(vault::Held::dir);
+src/db.rs	28434	code	Db::create	pager	2	pager: held.as_ref().map(|h| h.vault().pager().clone()),
+src/db.rs	28434	code	Db::create	vault/pager method	2	pager: held.as_ref().map(|h| h.vault().pager().clone()),
+src/db.rs	28544	comment	Db::create	pager	1	// (`PagerGrace`), before any thread of the store exists to read
+src/db.rs	28547	code	Db::create	pager	1	if let Some(p) = &shared.pager {
+src/db.rs	28548	code	Db::create	pager	1	p.set_grace(Some(std::sync::Arc::new(PagerGrace(
+src/db.rs	28548	code	Db::create	vault/pager method	1	p.set_grace(Some(std::sync::Arc::new(PagerGrace(
+src/db.rs	28587	code	Db::create	paged	1	.paged_bits()
+src/db.rs	28636	code	Db::create	vault (field or module word)	1	vault: held,
+src/db.rs	28641	code	Db::create	pager	1	if let Some(p) = &db.shared.pager {
+src/db.rs	28677	comment	Db::<item>	cipher	1	/// name -- under a cipher, an envelope neither slot names included --
+src/db.rs	28677	comment	Db::<item>	envelope	1	/// name -- under a cipher, an envelope neither slot names included --
+src/db.rs	28684	comment	Db::open	crypt	1	// With none, an encrypted directory whose key the kernel does not
+src/db.rs	28685	comment	Db::open	crypt	1	// hold refused by name, since its files' names are encrypted too
+src/db.rs	28686	comment	Db::open	cipher	1	// and it would read as a store of nothing. Under a cipher, the
+src/db.rs	28688	comment	Db::open	cipher	1	// cipher given to a store in the clear is refused, since the store
+src/db.rs	28689	comment	Db::open	cipher	1	// would go on in the clear. And a store under a cipher is refused
+src/db.rs	28691	code	Db::open	crypt	1	let held = match std::mem::take(&mut opts.encryption) {
+src/db.rs	28692	code	Db::open	crypt	1	Encryption::None => {
+src/db.rs	28693	code	Db::open	dirkey	1	dirkey::refuse_locked(dir)?;
+src/db.rs	28694	code	Db::open	vault::<not a door verb>	1	vault::refuse_marked(dir)?;
+src/db.rs	28697	code	Db::open	crypt	1	Encryption::Kernel(key) => {
+src/db.rs	28698	code	Db::open	dirkey	1	dirkey::unlock(dir, &key)?;
+src/db.rs	28699	code	Db::open	vault::<not a door verb>	1	vault::refuse_marked(dir)?;
+src/db.rs	28702	code	Db::open	cipher	2	Encryption::Cipher(cipher) => {
+src/db.rs	28702	code	Db::open	crypt	1	Encryption::Cipher(cipher) => {
+src/db.rs	28703	code	Db::open	dirkey	1	dirkey::refuse_locked(dir)?;
+src/db.rs	28704	code	Db::open	cipher	1	cipher_controller(&mut opts);
+src/db.rs	28705	code	Db::open	cipher	1	Some(vault::Vault::open(dir, &cipher)?)
+src/db.rs	28705	code	Db::open	vault::<not a door verb>	1	Some(vault::Vault::open(dir, &cipher)?)
+src/db.rs	28708	code	Db::open	vault::<not a door verb>	1	let decoy = held.as_ref().map(vault::Held::dir);
+src/db.rs	28710	comment	Db::open	cipher	1	// Under a cipher nothing of a segment is decrypted by an open but
+src/db.rs	28710	comment	Db::open	crypt	1	// Under a cipher nothing of a segment is decrypted by an open but
+src/db.rs	28714	comment	Db::open	pager	1	// for those reads (`pager::Hold`).
+src/db.rs	28715	code	Db::open	pager	1	let opening = held.as_ref().map(|h| h.vault().pager().hold());
+src/db.rs	28715	code	Db::open	vault/pager method	2	let opening = held.as_ref().map(|h| h.vault().pager().hold());
+src/db.rs	28780	comment	Db::open	cipher	1	// durable: under a cipher the segments the directory holds are
+src/db.rs	28781	comment	Db::open	envelope	1	// known by the slots that name them, and an envelope neither slot
+src/db.rs	28784	code	Db::open	vault/pager method	1	h.vault().sweep()?;
+src/db.rs	29156	code	Db::open	pager	2	pager: held.as_ref().map(|h| h.vault().pager().clone()),
+src/db.rs	29156	code	Db::open	vault/pager method	2	pager: held.as_ref().map(|h| h.vault().pager().clone()),
+src/db.rs	29266	comment	Db::open	pager	1	// (`PagerGrace`), before any thread of the store exists to read
+src/db.rs	29269	code	Db::open	pager	1	if let Some(p) = &shared.pager {
+src/db.rs	29270	code	Db::open	pager	1	p.set_grace(Some(std::sync::Arc::new(PagerGrace(
+src/db.rs	29270	code	Db::open	vault/pager method	1	p.set_grace(Some(std::sync::Arc::new(PagerGrace(
+src/db.rs	29309	code	Db::open	paged	1	.paged_bits()
+src/db.rs	29358	code	Db::open	vault (field or module word)	1	vault: held,
+src/db.rs	29363	code	Db::open	pager	1	if let Some(p) = &db.shared.pager {
+src/db.rs	29410	comment	Db::append_pinned	cipher	1	// Under a cipher the run's file is a memory file, and
+src/db.rs	29412	code	Db::append_pinned	vault (field or module word)	1	let table = if self.vault.is_some() {
+src/db.rs	29413	code	Db::append_pinned	run logged	1	table.logged()
+src/db.rs	29515	comment	Db::pending_whole	cipher	1	// sum a rank is added to. By the piece under a cipher, whose
+src/db.rs	29737	comment	Db::<item>	cipher	1	/// then -- except an ordered run's under a cipher, which readers see
+src/db.rs	29978	comment	Db::commit_direct	cipher	1	// Nothing new for the run's file. Under a cipher a batch whose
+src/db.rs	29986	comment	Db::commit_direct	run logged	1	// are a logged run's and the test asks nothing of the table.
+src/db.rs	29995	code	Db::commit_direct	run logged	1	return self.log_run_again();
+src/db.rs	30025	code	Db::commit_direct	run logged	1	logged: 0,
+src/db.rs	30142	code	Db::commit_direct	run logged	1	if after & RUN_LOGGED != 0 {
+src/db.rs	30144	code	Db::commit_direct	run logged	1	return self.log_run(&mem, due);
+src/db.rs	30149	comment	Db::<item>	cipher	1	/// A commit of an ordered run under a cipher, made durable: the
+src/db.rs	30156	comment	Db::<item>	cipher	1	/// Under a cipher the run's file is a memory file until the run
+src/db.rs	30157	comment	Db::<item>	envelope	1	/// closes and its segment has an envelope, so a commit synced there
+src/db.rs	30170	code	Db::log_run	run logged	1	fn log_run(&mut self, mem: &MemTable, due: bool) -> Result<()> {
+src/db.rs	30175	code	Db::log_run	run logged	1	Some(d) => std::mem::replace(&mut d.logged, mem.len()),
+src/db.rs	30200	comment	Db::<item>	run logged	1	/// call with nothing new for the run (`commit_direct`): `log_run` with
+src/db.rs	30201	comment	Db::<item>	run logged	1	/// no entry past what it logged, so the commit frame closes the frames
+src/db.rs	30206	code	Db::log_run_again	run logged	1	fn log_run_again(&mut self) -> Result<()> {
+src/db.rs	30208	code	Db::log_run_again	run logged	1	self.log_run(&mem, true)
+src/db.rs	30223	code	Db::run_attended	run logged	1	return self.log_run_again();
+src/db.rs	30232	comment	Db::<item>	cipher	1	/// and under a cipher logged as well, where that commit's failure left
+src/db.rs	30232	comment	Db::<item>	run logged	1	/// and under a cipher logged as well, where that commit's failure left
+src/db.rs	30233	comment	Db::<item>	run logged	1	/// it unlogged, and the log synced, where that commit logged it under
+src/db.rs	30243	code	Db::run_again	run logged	2	let logged = self.direct.as_ref().map_or(0, |d| d.logged);
+src/db.rs	30244	code	Db::run_again	run logged	1	if self.mem().after & RUN_LOGGED != 0 {
+src/db.rs	30245	code	Db::run_again	run logged	1	if logged < self.mem().len() || !self.wal.pending.is_empty() {
+src/db.rs	30246	code	Db::run_again	run logged	1	return self.log_run_again();
+src/db.rs	30412	comment	Db::close_run	cipher	1	// Under a cipher the run's file is a memory file and the
+src/db.rs	30414	comment	Db::close_run	envelope	1	// durable is its envelope, written here, as a seal's is.
+src/db.rs	30420	code	Db::close_run	vault::<not a door verb>	1	vault::persist(&dir, &Db::with_ords(&names))?;
+src/db.rs	30960	comment	Db::seal_table	cipher	1	// Under a cipher the pieces are memory files and their fsyncs
+src/db.rs	30962	comment	Db::seal_table	envelope	1	// envelope, written here, where a plain seal pays its fsync.
+src/db.rs	30968	code	Db::seal_table	vault::<not a door verb>	1	vault::persist(&dir, &Db::with_ords(&names))?;
+src/db.rs	31091	comment	Db::sync	cipher	1	// until a sync covers them, and under a cipher the run's own
+src/db.rs	31092	comment	Db::sync	run logged	1	// commits are frames of the log (`Db::log_run`). The log first,
+src/db.rs	31231	code	Db::take_fresh_mem	unlent/unlend	1	self.r.unlent(|| std::thread::park_timeout(MAINT_LAND_POLL));
+src/db.rs	31994	code	Reader::maint_reader	paged	1	.paged_bits())
+src/db.rs	32033	code	Reader::seal_reader	paged	1	.paged_bits(),
+src/db.rs	32081	code	Reader::new_reader	paged	1	.paged_bits())
+src/db.rs	32134	comment	Db::<item>	cipher	1	/// bytes, a read of most of the pages of both, and under a cipher
+src/db.rs	32136	comment	Db::<item>	crypt	1	/// decrypted into the store's cache. So the walk rests every few
+src/db.rs	32267	comment	Reader::start_ahead	run logged	1	// keys logged between the two outside the builder's forms and
+src/db.rs	32270	comment	Reader::start_ahead	run logged	1	// Writes logged past the commit that this handle has read already
+src/db.rs	32312	comment	Reader::start_ahead	cipher	1	// The builder's word (`AHEAD_STOP`): to go on, or, under a cipher,
+src/db.rs	32315	code	Reader::start_ahead	attn/rest word	1	if self.attn & ATTN_PAGED != 0 {
+src/db.rs	32316	code	Reader::start_ahead	attn/rest word	1	AHEAD_REST
+src/db.rs	32350	comment	Reader::<item>	cipher	1	/// to go on: told to stop, or, under a cipher (`AHEAD_REST`), a rest,
+src/db.rs	32350	comment	Reader::<item>	attn/rest word	1	/// to go on: told to stop, or, under a cipher (`AHEAD_REST`), a rest,
+src/db.rs	32476	code	Db::land_seal	unlent/unlend	1	self.r.unlent(|| std::thread::park_timeout(MAINT_LAND_POLL));
+src/db.rs	32574	code	Db::maint_request	unlent/unlend	1	.unlent(|| rx.recv())
+src/db.rs	32836	comment	Db::<item>	cipher	1	/// A test's: under a cipher, the live log's next record fails to
+src/db.rs	33168	comment	Db::wal_durable	cipher	1	// Where the file is, which for a store under a cipher is not the
+src/db.rs	33229	comment	Db::<item>	cipher	1	/// a cipher the directory is the store's own table of names, which
+src/db.rs	33231	comment	Db::<item>	envelope	1	/// segment's envelope (`vault::companion`).
+src/db.rs	33231	comment	Db::<item>	vault::<not a door verb>	1	/// segment's envelope (`vault::companion`).
+src/db.rs	33237	code	Db::z_on_disk	vault::<not a door verb>	1	vault::companion(dir, seg, &name);
+src/db.rs	33279	comment	Db::z_attach	cipher	1	// A store under a cipher learns here of a form file an earlier
+src/db.rs	33280	comment	Db::z_attach	envelope	1	// open left beside the segment's envelope.
+src/db.rs	33281	code	Db::z_attach	vault::<not a door verb>	1	vault::companion(dir, &seg.name, &zfile::zpg_name(id, end));
+src/db.rs	34007	comment	Ahead::<item>	attn/rest word	1	/// The builder's word: zero to go on, `AHEAD_STOP`, or `AHEAD_REST`.
+src/db.rs	34012	comment	Ahead::<item>	run logged	1	/// watermark from: every write logged from here on is one its forms
+src/db.rs	34262	comment	Reader::build_ahead_job	cipher	1	// The one word a block: to stop, or, under a cipher, to
+src/db.rs	35133	code	Reader::understudy	paged	1	.paged_bits()
+src/db.rs	35703	comment	Db::hold_within	unlent/unlend	1	// (`Reader::unlent`): the thread waited for reads them through
+src/db.rs	35706	code	Db::hold_within	unlent/unlend	1	.unlent(|| std::thread::park_timeout(std::time::Duration::from_millis(1)));
+src/db.rs	35728	comment	Db::hold_for_upkeep	unlent/unlend	1	// (`Reader::unlent`): the thread waited for reads them through
+src/db.rs	35731	code	Db::hold_for_upkeep	unlent/unlend	1	.unlent(|| std::thread::park_timeout(std::time::Duration::from_millis(1)));
+src/db.rs	35755	comment	Db::join_upkeep	unlent/unlend	1	// files (`Reader::unlent`). Pinned through it, a settle held
+src/db.rs	35756	comment	Db::join_upkeep	cipher	1	// the cache of a store under a cipher shut against the very
+src/db.rs	35761	code	Db::join_upkeep	unlent/unlend	1	.unlent(|| std::thread::sleep(std::time::Duration::from_micros(50)));
+src/db.rs	35850	comment	Db::<item>	cipher	1	/// commit of one under a cipher (`Db::log_run`), and none of a plain
+src/db.rs	35850	comment	Db::<item>	run logged	1	/// commit of one under a cipher (`Db::log_run`), and none of a plain
+src/db.rs	38981	code	Maint::answer	unlent/unlend	1	self.r.unlent(|| std::thread::park_timeout(MAINT_POLL));
+src/db.rs	39524	code	Maint::join_seal	unlent/unlend	1	self.r.unlent(|| std::thread::park_timeout(MAINT_LAND_POLL));
+src/db.rs	39561	code	Maint::land_front	unlent/unlend	1	.unlent(|| handle.join())
+src/db.rs	39832	code	Maint::retire_covered	unlent/unlend	1	let _io = self.r.unlend();
+src/db.rs	40267	code	Maint::join_tier	unlent/unlend	1	.unlent(|| handle.join())
+src/db.rs	40311	code	Maint::retire_seg	unlent/unlend	1	let _io = self.r.unlend();
+src/db.rs	40816	code	Maint::sync_owed_slot	unlent/unlend	1	let _io = self.r.unlend();
+src/db.rs	40933	code	Maint::publish	unlent/unlend	1	let _io = self.r.unlend();
+src/db.rs	41717	comment	Maint::z_sample_start	cipher	1	// Under a cipher the records a sample fills its pages from
+src/db.rs	41722	code	Maint::z_sample_start	vault::<not a door verb>	1	let hold = vault::hold(&dir);
+src/db.rs	42430	comment	Maint::z_cross	cipher	1	// A file of a store under a cipher: the same swap in
+src/db.rs	42431	comment	Maint::z_cross	envelope	1	// the kernel's cache of the two envelopes, the
+src/db.rs	42432	comment	Maint::z_cross	cipher	1	// records' ciphertext dropped and the form file's
+src/db.rs	43735	code	Maint::join_merge	unlent/unlend	1	.unlent(|| handle.join())
+src/db.rs	44218	tcode	<item>	cipher	1	mod cipher_looks {
+src/db.rs	44222	tcomment	<item:cipher_looks>	cipher	1	/// the cipher's own in a store under one, and the looks of the
+src/db.rs	44228	tcode	the_forms_word_under_a_cipher_is_a_rest_and_stays_one	cipher	1	fn the_forms_word_under_a_cipher_is_a_rest_and_stays_one() {
+src/db.rs	44231	tcode	the_forms_word_under_a_cipher_is_a_rest_and_stays_one	cipher	1	"supdb-next-cipher-looks-{paged}-{}",
+src/db.rs	44236	tcode	the_forms_word_under_a_cipher_is_a_rest_and_stays_one	crypt	1	encryption: if paged {
+src/db.rs	44237	tcode	the_forms_word_under_a_cipher_is_a_rest_and_stays_one	cipher	2	Encryption::Cipher(vault::tests::cipher(3))
+src/db.rs	44237	tcode	the_forms_word_under_a_cipher_is_a_rest_and_stays_one	crypt	1	Encryption::Cipher(vault::tests::cipher(3))
+src/db.rs	44237	tcode	the_forms_word_under_a_cipher_is_a_rest_and_stays_one	vault::<not a door verb>	1	Encryption::Cipher(vault::tests::cipher(3))
+src/db.rs	44239	tcode	the_forms_word_under_a_cipher_is_a_rest_and_stays_one	crypt	1	Encryption::None
+src/db.rs	44245	tcode	the_forms_word_under_a_cipher_is_a_rest_and_stays_one	attn/rest word	1	(REST_HERE, LOOKS_WRITER_RESTS)

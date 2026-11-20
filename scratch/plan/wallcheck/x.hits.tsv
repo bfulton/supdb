@@ -1,0 +1,6 @@
+src/db/vault.rs	188	comment	<item>	Db::	1	/// let db = Db::create(dir, opts)?;
+src/db/vault.rs	1721	comment	<item>	Db::	1	/// (`Db::cipher_counts`).
+src/db/vault.rs	1762	code	log_aad	log str	1	a[..4].copy_from_slice(b"log\0");
+src/db/vault.rs	1803	code	LogCipher::seal_into	log str	1	.map_err(|_| refused("a commit too large for one log record"))?;
+src/db/vault.rs	2132	code	persist_one	Db::	1	let ord = crate::db::Db::ord_name_for(seg);
+src/db/vault.rs	2816	tcode	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	log str	1	let real = dir("log");

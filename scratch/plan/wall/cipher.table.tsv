@@ -1,0 +1,126 @@
+file	token	code	comment	tcode	tcomment
+src/blob.rs	ASK_PIECES	1	1	0	0
+src/blob.rs	cipher	0	2	0	0
+src/blob.rs	lend_at	1	1	0	0
+src/blob.rs	piecewise	6	2	0	0
+src/bytes.rs	ASK_PIECES	2	0	0	0
+src/bytes.rs	encrypt/decrypt	0	2	0	0
+src/bytes.rs	lend_at	2	0	0	0
+src/bytes.rs	paged/Paged/Paging(word)	18	15	0	0
+src/bytes.rs	paged_	1	0	0	0
+src/bytes.rs	pager(word)	4	7	0	0
+src/bytes.rs	piecewise	3	1	0	0
+src/crypt.rs	Encryption	0	1	0	0
+src/crypt.rs	Wal enc / WAL_SEALED_LEN	0	1	0	0
+src/crypt.rs	cipher	0	16	4	6
+src/crypt.rs	ciphertext/plaintext	0	40	6	7
+src/crypt.rs	encrypt/decrypt	35	41	41	9
+src/crypt.rs	envelope	0	14	31	4
+src/crypt.rs	paged/Paged/Paging(word)	0	0	5	0
+src/db.rs	AHEAD_REST	2	2	0	0
+src/db.rs	ATTN_PAGED	10	2	0	0
+src/db.rs	Cipher	8	9	1	0
+src/db.rs	Encryption	9	9	2	0
+src/db.rs	Held	3	3	0	1
+src/db.rs	Hold	1	4	0	0
+src/db.rs	MergeRest/NoRest	11	2	0	0
+src/db.rs	Pager	6	8	0	0
+src/db.rs	REST_HERE	6	3	1	0
+src/db.rs	RUN_LOGGED/log_run/logged	15	17	0	0
+src/db.rs	Wal enc / WAL_SEALED_LEN	29	0	0	0
+src/db.rs	cipher	11	115	4	1
+src/db.rs	cipher_controller	3	0	0	0
+src/db.rs	ciphertext/plaintext	0	15	0	0
+src/db.rs	encrypt/decrypt	13	27	3	0
+src/db.rs	envelope	0	22	0	0
+src/db.rs	method on Vault/Pager/LogCipher/Hold	30	0	0	0
+src/db.rs	paged/Paged/Paging(word)	0	1	8	0
+src/db.rs	paged_	10	5	0	0
+src/db.rs	pager(word)	28	13	0	0
+src/db.rs	pager::	9	12	0	0
+src/db.rs	under_cipher	3	2	0	0
+src/db.rs	unlent/unlend/Unlent	23	7	0	0
+src/db.rs	vault(field/module word)	11	3	0	0
+src/db.rs	vault::<door verb>	112	0	0	0
+src/db.rs	vault::<type/other>	17	3	1	0
+src/db.rs	vault::check	2	0	0	0
+src/db.rs	vault::companion	2	1	0	0
+src/db.rs	vault::hold	3	0	0	0
+src/db.rs	vault::open_mapped	1	0	0	0
+src/db.rs	vault::persist	4	1	0	0
+src/db.rs	vault::persist_one	1	0	0	0
+src/db.rs	vault::under	5	0	0	0
+src/db.rs	zpages_under_cipher	3	2	0	0
+src/db/dirkey.rs	Encryption	1	2	0	0
+src/db/dirkey.rs	cipher	0	2	0	0
+src/db/dirkey.rs	ciphertext/plaintext	0	5	0	0
+src/db/dirkey.rs	encrypt/decrypt	9	24	0	0
+src/db/dirkey.rs	envelope	0	1	0	0
+src/db/pager.rs	Cipher	0	2	0	0
+src/db/pager.rs	Encryption	0	1	0	0
+src/db/pager.rs	Pager	15	5	10	0
+src/db/pager.rs	cipher	2	12	1	2
+src/db/pager.rs	ciphertext/plaintext	1	19	2	4
+src/db/pager.rs	crypt::	3	0	3	0
+src/db/pager.rs	encrypt/decrypt	1	13	8	1
+src/db/pager.rs	envelope	4	28	15	3
+src/db/pager.rs	method on Vault/Pager/LogCipher/Hold	9	0	0	0
+src/db/pager.rs	paged/Paged/Paging(word)	18	7	5	2
+src/db/pager.rs	paged_	0	0	1	0
+src/db/pager.rs	pager(word)	30	6	74	0
+src/db/pager.rs	piecewise	0	1	0	0
+src/db/pager.rs	unlent/unlend/Unlent	0	1	0	0
+src/db/pager.rs	vault(field/module word)	0	1	0	0
+src/db/vault.rs	Cipher	27	4	2	0
+src/db/vault.rs	Encryption	1	2	0	0
+src/db/vault.rs	Held	7	0	0	0
+src/db/vault.rs	Hold	1	0	0	0
+src/db/vault.rs	Kind	23	0	8	0
+src/db/vault.rs	Pager	7	2	0	0
+src/db/vault.rs	cipher	28	61	31	5
+src/db/vault.rs	ciphertext/plaintext	0	30	2	0
+src/db/vault.rs	crypt::	5	0	0	0
+src/db/vault.rs	encrypt/decrypt	9	20	5	0
+src/db/vault.rs	envelope	9	84	5	12
+src/db/vault.rs	method on Vault/Pager/LogCipher/Hold	3	0	37	0
+src/db/vault.rs	paged/Paged/Paging(word)	11	3	0	0
+src/db/vault.rs	pager(word)	20	4	9	0
+src/db/vault.rs	pager::	5	3	1	0
+src/db/vault.rs	piecewise	0	1	1	0
+src/db/vault.rs	vault(field/module word)	6	0	19	0
+src/db/vault.rs	vault::<door verb>	0	0	1	0
+src/db/zfile.rs	Held	4	0	0	0
+src/db/zfile.rs	Hold	1	0	0	0
+src/db/zfile.rs	Kept	3	0	0	0
+src/db/zfile.rs	PieceImages	4	0	0	0
+src/db/zfile.rs	Walked	4	1	0	0
+src/db/zfile.rs	cipher	1	11	0	0
+src/db/zfile.rs	ciphertext/plaintext	0	1	0	0
+src/db/zfile.rs	envelope	0	4	0	0
+src/db/zfile.rs	method on Vault/Pager/LogCipher/Hold	1	0	0	0
+src/db/zfile.rs	paged/Paged/Paging(word)	0	1	0	0
+src/db/zfile.rs	pager(word)	1	0	0	0
+src/db/zfile.rs	pager::	1	0	0	0
+src/db/zfile.rs	vault::<door verb>	12	0	0	0
+src/db/zfile.rs	vault::hold	2	0	0	0
+src/db/zfile.rs	vault::kept	1	0	0	0
+src/db/zfile.rs	vault::persist_form	1	0	0	0
+src/db/zlz4.rs	Wal enc / WAL_SEALED_LEN	0	0	20	0
+src/db/zpages.rs	method on Vault/Pager/LogCipher/Hold	1	0	0	0
+src/db/zpages.rs	paged/Paged/Paging(word)	0	0	3	0
+src/db/zselect.rs	Held	0	0	0	1
+src/flatindex.rs	piecewise	0	1	0	0
+src/format.rs	Wal enc / WAL_SEALED_LEN	1	0	0	0
+src/lib.rs	Cipher	2	1	0	0
+src/lib.rs	Encryption	1	1	0	0
+src/lib.rs	Pager	1	0	0	0
+src/lib.rs	cipher	2	3	0	0
+src/lib.rs	ciphertext/plaintext	0	1	0	0
+src/lib.rs	encrypt/decrypt	1	2	0	0
+src/lib.rs	envelope	0	1	0	0
+src/ordindex.rs	cipher	0	1	0	0
+src/ordindex.rs	encrypt/decrypt	0	1	0	0
+src/ordindex.rs	paged/Paged/Paging(word)	3	0	0	0
+src/ordindex.rs	pager(word)	0	1	0	0
+src/ordindex.rs	piecewise	2	1	0	0
+src/ordindex.rs	vault::<door verb>	1	0	0	0
