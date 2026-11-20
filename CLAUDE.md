@@ -3766,7 +3766,15 @@ three defaults turned off alone named the one. The test of the
 conversion's order holds the first job before its rename and the second
 at its start now, under either turn, and fails on a tick that starts a
 conversion ahead of a partition's own build; the test whose order is
-read off the warms taken in a job a step pins the turn at the step. The
+read off the warms taken in a job a step pins the turn at the step. And
+as a spare: the test of a recycled log under a cipher wrote sixteen
+rounds and asserted that one of their rotations had taken the spare,
+which the segment work offers behind a seal's durable landing; where
+that thread ran behind the writer every rotation made its file, three
+runs of forty-eight under eight-way load, once in a unit's gate whose
+diff the binary could not see. It rotates, flushes and settles, so that a
+retired log stands as the spare, and holds the next rotation's log to
+that file's inode now. The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; a mutant's kill is read again once a

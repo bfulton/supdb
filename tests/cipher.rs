@@ -1208,18 +1208,10 @@ fn a_recycled_log_under_a_cipher_holds_what_was_committed_and_no_more() {
         }
     };
     let mut db = Db::create(&dir, opts()).unwrap();
-    // Every log and spare file seen, by its identity and the name it was
-    // seen under. A recycled log is a log file seen before under another
-    // name: the retired log goes to the spare's name and the next rotation
-    // takes it, and both can fall between two of these listings, so a log
-    // is not required to have been seen as a spare. The first spare is the
-    // first file a durable segment retired, since a log pre-written ahead
-    // of its tail (`Options::wal_ahead_bytes`) is made with none.
-    let mut seen: Vec<(String, (u64, Option<std::time::SystemTime>))> = files();
-    let mut recycled = false;
-    for round in 0u32..16 {
-        // Out of order, so that every write goes through the log, and
-        // enough of them for the log to pass its size and rotate.
+    // A round's writes and their commit. Out of order, so that every write
+    // goes through the log, and enough of them for a few rounds to take the
+    // log past its size and rotate it.
+    let write_round = |db: &mut Db, model: &mut BTreeMap<Vec<u8>, Vec<Vec<u8>>>, round: u32| {
         for i in 0u32..400 {
             let k = key((i * 7 + round) % 500);
             let v = format!("{MARK} round {round} write {i}").into_bytes();
@@ -1227,19 +1219,53 @@ fn a_recycled_log_under_a_cipher_holds_what_was_committed_and_no_more() {
             model.entry(k).or_default().push(v);
         }
         db.commit().unwrap();
-        // The file that was the spare is a log now: recycled, not made.
-        let now = files();
-        recycled |= now.iter().any(|(n, id)| {
-            n.starts_with("wal-") && seen.iter().any(|(m, was)| was == id && m != n)
-        });
-        seen.extend(now);
+    };
+    let mut round = 0u32;
+    while round < 16 {
+        write_round(&mut db, &mut model, round);
         if round % 4 == 3 {
             drop(db);
             db = Db::open(&dir, opts()).unwrap();
             holds_model(&db, &model, &format!("after the crash in round {round}"));
         }
+        round += 1;
     }
-    assert!(recycled, "no rotation took the spare: {:?}", names(&dir));
+    // Rounds until the log has rotated: the live file is another.
+    let mut rotate = |db: &mut Db, model: &mut BTreeMap<Vec<u8>, Vec<Vec<u8>>>| {
+        let (before, _, _) = db.wal_durable();
+        let from = round;
+        while db.wal_durable().0 == before {
+            write_round(db, model, round);
+            round += 1;
+            assert!(round < from + 64, "the log never rotated");
+        }
+    };
+    // Whether a rotation of the rounds above found a spare waiting was the
+    // segment work's timing: a retired log is offered as the spare on that
+    // thread, behind a seal's durable landing, and a rotation that comes
+    // first makes its file. So the spare is held here, not waited for. A
+    // rotation leaves a closed log; the flush's durable landing retires it,
+    // and with no spare waiting it is kept as one, which the settle joins;
+    // the rotation after that takes it. A log pre-written ahead of its tail
+    // (`Options::wal_ahead_bytes`) is made with no spare, so the first is
+    // always a retired file.
+    rotate(&mut db, &mut model);
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let (spare_was, spare_id) = files()
+        .into_iter()
+        .find(|(n, _)| n.starts_with("spare-"))
+        .unwrap_or_else(|| panic!("a retired log is kept as the spare: {:?}", names(&dir)));
+    rotate(&mut db, &mut model);
+    // The file that was the spare is the log now: recycled, not made.
+    let (live, _, _) = db.wal_durable();
+    let m = std::fs::metadata(&live).unwrap();
+    assert_eq!(
+        (m.ino(), m.created().ok()),
+        spare_id,
+        "the rotation made {live:?} where {spare_was} was waiting: {:?}",
+        names(&dir)
+    );
     db.flush().unwrap();
     db.settle().unwrap();
     // The live log's last life lies behind its header, longer than what
