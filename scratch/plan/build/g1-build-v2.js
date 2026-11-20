@@ -17,6 +17,8 @@ const BASE = (args && args.base) || 'HEAD'
 const ONLY = (args && args.only) || null
 // A launch of some units alone (args.only) may leave the full gate and the critic to a later launch (args.tail === false).
 const TAIL = !(args && args.tail === false)
+// A step a container restart killed is told so when it is run again: args.resume maps a unit's key to a note appended to its build prompt.
+const RESUME = (args && args.resume) || {}
 
 const CONTEXT = `
 You are working in /home/user/supdb (Rust; a read-optimized embedded store; the engine is src/db.rs and src/db/*.rs, the format's readers src/blob.rs, src/flatindex.rs, src/ordindex.rs, the byte-source seam src/bytes.rs), on the branch that is checked out. The store can be kept under a caller's cipher (src/db/vault.rs, src/db/pager.rs) and the owner's goal for that feature is: reliable, performant, and not fragile to maintain. "Not fragile" has a contract, ${SP}/seam/forms.md (acceptance tests Z, N, K, F and rules R0 to R15), adopted by ${SP}/seam/decisions.md (read items 9 and 11 to 16: they amend forms.md and they stand where the two differ). Stage G1 builds the first gates of that contract on today's code, before the page layer is built under them.
@@ -153,7 +155,7 @@ Steps:
 6. Callgrind rows named for this unit (${u.rows}), by function, the commit before against the tree, from the same probe sources; from G1-3 on, through scripts/cost.sh. For a unit with no rows, say why no compiled engine code changed (the diff shows it).
 7. Mutants (rule 5). Put the tree back exactly.
 8. Finish notes.md: what the gate or the rewrite holds, what it cannot see, each departure from the plan, what you did not verify.
-Leave the work uncommitted in the working tree. Return the structured result (blocked is the empty string unless you stopped); it is data for the next step, not a message to a person.`
+Leave the work uncommitted in the working tree. Return the structured result (blocked is the empty string unless you stopped); it is data for the next step, not a message to a person.${RESUME[u.key] ? '\n\nAN EARLIER ATTEMPT AT THIS STEP WAS CUT SHORT: ' + RESUME[u.key] : ''}`
 }
 
 function reviewPrompt(u, lens, round, impl) {
