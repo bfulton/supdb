@@ -28,6 +28,9 @@
 //! whole, they read a dead arena of thirty-two megabytes as seven, and the
 //! trim that counts by the resident bytes never fired on it.
 
+// The door (scripts/door/clippy.toml, tests/data/door.txt): the engine's anonymous blocks.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 

@@ -2275,3 +2275,1848 @@ fn a_super_inside_a_group_climbs_and_a_super_alias_inside_is_inside() {
         2
     );
 }
+
+// ---------------------------------------------------------------------------
+// The door: what clippy cannot hold.
+//
+// The door itself is a clippy run over the library (`scripts/door/clippy.toml`,
+// the lint group of `scripts/check.sh`): no file, mapping, advice, sync or
+// process read outside the modules below, by symbol. What a symbol lint
+// cannot say is held here, against `tests/data/door.txt`, each kind of line a
+// ratchet whose counts are exact:
+// - `allow`: where the lint is silenced. An `allow` or `expect` naming
+//   `clippy::disallowed_*`, `clippy::style`, `clippy::all` or `warnings`,
+//   plain or inside a `cfg_attr`, by (file, the scope it governs). A new one
+//   fails, and so does one moved to another scope, since the list says why
+//   each stands where it does.
+// - `literal`: a `"/proc` or `"/sys` path written outside the door's modules,
+//   by (file, scope), test code aside. A path handed to an allowed call is
+//   not a symbol.
+// - `thread`: the count of `thread::` per file, the door's modules included
+//   (R1 lets the pager spawn and wait, and the count still holds its
+//   growth), until the thread half of the door (S1's `pin::` wrappers;
+//   decision 11).
+//   A `use` that takes a function or a spawning type out of `std::thread`,
+//   globs it or renames it would let calls go uncounted, so it fails
+//   outright, in every file.
+// - `cfgout`: a `cfg` attribute whose predicate does not hold in the door's
+//   build (the library under `checked` on Linux x86_64 with glibc), by
+//   (file, scope), outside the door's modules: the code under it is code
+//   the lint never sees. Inside it, every path the door's config bars is
+//   barred as text (`door_texts`), as the old text test of db.rs barred its
+//   list. A predicate that names `clippy` fails outright, since the door's
+//   run alone sets it, and so does a `cfg_attr` that applies a `cfg`.
+// Beside them: no out-of-line module or `include!` in a door module, whose
+// file would take the module's allow; no foreign block (`extern "C" { .. }`) outside `src/wasmapi.rs`,
+// since a declaration of the crate's own escapes a lint that names libc's;
+// and the ordered index's open maps through the door (`vault::map`).
+//
+// `SUPDB_DOOR_PRINT=1` prints the measured table in the file's format; the
+// test never writes the file.
+// ---------------------------------------------------------------------------
+
+/// The door's modules: the vault, the byte source, the pager, the envelope,
+/// the kernel's key, the engine's anonymous blocks. Each carries the lint's
+/// allow at its top, which `tests/data/door.txt` lists like any other.
+const DOOR_MODS: &[&str] = &[
+    "src/bytes.rs",
+    "src/crypt.rs",
+    "src/db/blocks.rs",
+    "src/db/dirkey.rs",
+    "src/db/pager.rs",
+    "src/db/vault.rs",
+];
+
+/// The kinds of line in `tests/data/door.txt`.
+const DOOR_KINDS: &[&str] = &["allow", "literal", "thread", "cfgout"];
+
+type DoorKey = (String, String, String); // kind, file, scope
+
+/// The end of the bracketed span that opens at `open` (a `[` or a `(`).
+fn bracket_close(s: &[char], open: usize) -> usize {
+    let mut depth = 0i32;
+    for (k, &c) in s.iter().enumerate().skip(open) {
+        match c {
+            '[' | '(' | '{' => depth += 1,
+            ']' | ')' | '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return k;
+                }
+            }
+            _ => {}
+        }
+    }
+    s.len()
+}
+
+/// Whether an attribute's text silences the door: an `allow(..)` or an
+/// `expect(..)` that names one of the door's lints, a group holding them,
+/// or a macro's metavariable that may expand to either.
+fn silences(attr: &[char]) -> bool {
+    for (at, w) in words(attr) {
+        if w != "allow" && w != "expect" {
+            continue;
+        }
+        let k = skip_ws(attr, at + w.len());
+        if attr.get(k) != Some(&'(') {
+            continue;
+        }
+        let inner: String = attr[k + 1..bracket_close(attr, k)]
+            .iter()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for name in inner.split(',') {
+            // A macro's metavariable (`clippy::$l`, `$l`) may expand to any
+            // of them.
+            if name.starts_with("clippy::disallowed_")
+                || name == "clippy::style"
+                || name == "clippy::all"
+                || name == "warnings"
+                || name.contains('$')
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Every attribute of a file that silences the door, by the scope it
+/// governs: an inner attribute its enclosing scope (`<file>` at the top),
+/// an outer one the scope of the line that holds the first `{` or `;` after
+/// it -- the item's body or the statement's end.
+fn door_allows(text: &str) -> Vec<(String, usize)> {
+    let lines = regions(text);
+    let (s, line_of) = joined(&lines, true);
+    let mut out = Vec::new();
+    let mut spans = Vec::new();
+    let mut k = 0;
+    while k < s.len() {
+        if s[k] != '#' {
+            k += 1;
+            continue;
+        }
+        let mut j = k + 1;
+        let inner = s.get(j) == Some(&'!');
+        if inner {
+            j += 1;
+        }
+        j = skip_ws(&s, j);
+        if s.get(j) != Some(&'[') {
+            k += 1;
+            continue;
+        }
+        let close = bracket_close(&s, j);
+        spans.push((k, close));
+        // An attribute a macro's metavariable writes (`#[$a]`) may be any
+        // allow at all.
+        let metavar = s.get(skip_ws(&s, j + 1)) == Some(&'$');
+        if metavar || silences(&s[j..close.min(s.len())]) {
+            let ln = line_of[k];
+            let scope = if inner {
+                // At the top of the file the lexer names no item.
+                match lines[ln].scope.as_str() {
+                    "<item>" => String::new(),
+                    s => s.to_string(),
+                }
+            } else {
+                let at = (close..s.len())
+                    .find(|&i| s[i] == '{' || s[i] == ';')
+                    .unwrap_or(s.len() - 1);
+                lines[line_of[at]].scope.clone()
+            };
+            let scope = if scope.is_empty() {
+                "<file>".to_string()
+            } else {
+                scope
+            };
+            out.push((scope, ln + 1));
+        }
+        k = close + 1;
+    }
+    // Outside an attribute: an allow handed to a macro as tokens
+    // (`quiet!(allow(clippy::disallowed_methods); ..)`), which the macro may
+    // write into one, keyed by the scope it is written in.
+    for (at, w) in words(&s) {
+        if (w != "allow" && w != "expect") || spans.iter().any(|&(a, b)| a <= at && at <= b) {
+            continue;
+        }
+        let o = skip_ws(&s, at + w.len());
+        if s.get(o) == Some(&'(') && silences(&s[at..(bracket_close(&s, o) + 1).min(s.len())]) {
+            let ln = line_of[at];
+            let scope = match lines[ln].scope.as_str() {
+                "" | "<item>" => "<file>".to_string(),
+                s => s.to_string(),
+            };
+            out.push((scope, ln + 1));
+        }
+    }
+    out
+}
+
+/// The `"/proc` and `"/sys` paths a line's code writes.
+fn proc_literals(code: &str) -> usize {
+    let c: Vec<char> = code.chars().collect();
+    let mut n = 0;
+    for i in 0..c.len() {
+        for root in ["\"/proc", "\"/sys"] {
+            if starts(&c, i, root) && matches!(c.get(i + root.len()), Some('/') | Some('"')) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// The `thread::` path segments a line's flat code holds.
+fn thread_paths(flat: &str) -> usize {
+    let c: Vec<char> = flat.chars().collect();
+    words(&c)
+        .into_iter()
+        .filter(|(at, w)| w == "thread" && starts(&c, at + w.len(), "::"))
+        .count()
+}
+
+/// The types of `std::thread` a `use` may take: none of them spawns,
+/// sleeps or parks, so a call through one is not a thread call the count
+/// misses. `Builder` and `Scope` spawn, so they are not here.
+const THREAD_TYPES: &[&str] = &[
+    "self",
+    "JoinHandle",
+    "ScopedJoinHandle",
+    "Thread",
+    "ThreadId",
+    "LocalKey",
+    "AccessError",
+    "Result",
+];
+
+/// The `use` statements of a file's flat code that the `thread::` count
+/// cannot follow, by line, with what each does: one that takes a function
+/// out of `std::thread` (`use std::thread::spawn`), a type that spawns
+/// (`Builder`, `Scope`), a glob (`std::thread::*`), or a rename of the
+/// module (`use std::thread as t`, `thread::{self as t}`), since a call
+/// through any of those holds no `thread::` path. Test code aside.
+fn thread_uses(lines: &[lex::Line]) -> Vec<(usize, String)> {
+    let (s, line_of) = joined(lines, true);
+    let mut out = Vec::new();
+    for (at, w) in words(&s) {
+        if w != "use" || lines[line_of[at]].test {
+            continue;
+        }
+        let end = (at..s.len()).find(|&i| s[i] == ';').unwrap_or(s.len());
+        // Whitespace kept only where it separates two words (`x as y`).
+        let mut body = String::new();
+        for w in s[at + 3..end].split(|c: &char| c.is_whitespace()) {
+            let w: String = w.iter().collect();
+            if w.is_empty() {
+                continue;
+            }
+            let joins = |c: Option<char>| c.is_some_and(is_word);
+            if joins(body.chars().last()) && joins(w.chars().next()) {
+                body.push(' ');
+            }
+            body.push_str(&w);
+        }
+        let b: Vec<char> = body.chars().collect();
+        for (k, w) in words(&b) {
+            if w != "thread" {
+                continue;
+            }
+            let rest: String = b[k + w.len()..].iter().collect();
+            let why = if rest.starts_with(" as ") {
+                Some("renames std::thread".to_string())
+            } else if let Some(r) = rest.strip_prefix("::") {
+                if r.starts_with('*') {
+                    Some("globs std::thread".to_string())
+                } else {
+                    // The names the `use` takes out of the module, at the
+                    // group's top level.
+                    let names: Vec<String> = match r.strip_prefix('{') {
+                        Some(g) => {
+                            let mut depth = 0i32;
+                            let mut cur = String::new();
+                            let mut names = Vec::new();
+                            for c in g.chars() {
+                                match c {
+                                    '{' => depth += 1,
+                                    '}' if depth == 0 => break,
+                                    '}' => depth -= 1,
+                                    ',' if depth == 0 => {
+                                        names.push(std::mem::take(&mut cur));
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
+                                cur.push(c);
+                            }
+                            names.push(cur);
+                            names
+                        }
+                        None => vec![r.split([',', '}']).next().unwrap_or("").to_string()],
+                    };
+                    names.iter().find_map(|n| {
+                        let n = n.trim();
+                        let name = n.split(' ').next().unwrap_or("");
+                        if name.is_empty() {
+                            None
+                        } else if !THREAD_TYPES.contains(&name) {
+                            Some(if name.chars().next().is_some_and(|c| c.is_lowercase()) {
+                                format!("takes a function out of std::thread ({name})")
+                            } else {
+                                format!("takes {name} out of std::thread")
+                            })
+                        } else if name == "self" && n.contains(" as ") {
+                            Some("renames std::thread".to_string())
+                        } else {
+                            None
+                        }
+                    })
+                }
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                out.push((line_of[at] + 1, why));
+            }
+        }
+    }
+    out
+}
+
+/// A foreign block, by line: every `extern` that is not `extern crate` or a
+/// function of an ABI (`extern "C" fn`, a definition or a pointer's type).
+/// What is left is a block (`extern "C" {`, `extern {`) or what a macro
+/// makes one of (`extern $abi {`, a `ffi!(extern)` handing the keyword
+/// over), so it is read by what may follow the keyword, never by what does.
+fn foreign_blocks(lines: &[lex::Line]) -> Vec<usize> {
+    let (s, line_of) = joined(lines, false);
+    let mut out = Vec::new();
+    for (at, w) in words(&s) {
+        if w != "extern" {
+            continue;
+        }
+        let mut k = skip_ws(&s, at + w.len());
+        if s.get(k) == Some(&'"') {
+            k += 1;
+            while k < s.len() && s[k] != '"' {
+                k += 1;
+            }
+            k = skip_ws(&s, k + 1);
+        }
+        let next = words(&s[k..(k + 16).min(s.len())])
+            .into_iter()
+            .next()
+            .filter(|(o, _)| *o == 0)
+            .map(|(_, n)| n);
+        if !matches!(next.as_deref(), Some("fn") | Some("crate")) {
+            out.push(line_of[at] + 1);
+        }
+    }
+    out
+}
+
+/// Whether `name` (or `name = "value"`) holds in the door's build: the
+/// library under the `checked` profile on Linux x86_64 with glibc, which is
+/// what `scripts/door/run.sh` lints. `None` for a name the door's build does
+/// not decide here (a feature, a `--cfg` of somebody's), which is read as
+/// compiled out.
+fn door_cfg(name: &str, value: Option<&str>) -> Option<bool> {
+    match (name, value) {
+        ("debug_assertions" | "unix", None) => Some(true),
+        ("test" | "windows" | "doc" | "miri" | "supdb_emulated", None) => Some(false),
+        (k, Some(v)) => {
+            let have = match k {
+                "target_os" => "linux",
+                "target_family" => "unix",
+                "target_arch" => "x86_64",
+                "target_env" => "gnu",
+                "target_pointer_width" => "64",
+                "target_endian" => "little",
+                "target_vendor" => "unknown",
+                "panic" => "unwind",
+                _ => return None,
+            };
+            Some(v == have)
+        }
+        _ => None,
+    }
+}
+
+/// The top-level arguments of a predicate's list (`a, any(b, c)`).
+fn cfg_args(p: &str) -> Vec<String> {
+    let (mut out, mut cur, mut depth) = (Vec::new(), String::new(), 0i32);
+    for c in p.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// A `cfg` predicate's value in the door's build, `None` where it is not
+/// decided there.
+fn cfg_eval(p: &str) -> Option<bool> {
+    let p: String = p.chars().filter(|c| !c.is_whitespace()).collect();
+    for op in ["all(", "any(", "not("] {
+        if let Some(inner) = p.strip_prefix(op).and_then(|r| r.strip_suffix(')')) {
+            let vals: Vec<Option<bool>> = cfg_args(inner).iter().map(|a| cfg_eval(a)).collect();
+            return match op {
+                "all(" if vals.contains(&Some(false)) => Some(false),
+                "all(" if vals.iter().all(|v| *v == Some(true)) => Some(true),
+                "any(" if vals.contains(&Some(true)) => Some(true),
+                "any(" if vals.iter().all(|v| *v == Some(false)) => Some(false),
+                "not(" if vals.len() == 1 => vals[0].map(|v| !v),
+                _ => None,
+            };
+        }
+    }
+    match p.split_once('=') {
+        Some((k, v)) => door_cfg(k, Some(v.trim_matches('"'))),
+        None => door_cfg(&p, None),
+    }
+}
+
+/// Every `cfg` predicate of a file's code, by the place of the attribute
+/// or macro (its `#` or its name) and the place just past its closing
+/// bracket: `#[cfg(P)]` and `#![cfg(P)]` with whether they are inner,
+/// `cfg_attr(P, ..)`'s first argument, and `cfg!(P)`. Also, for a
+/// `cfg_attr`, whether what it applies is a `cfg` itself.
+struct CfgAt {
+    at: usize,
+    end: usize,
+    /// The predicate as written, and with its literals blanked.
+    pred: String,
+    pred_flat: String,
+    /// `Some(inner)` for a `cfg` attribute, `None` for `cfg_attr` and `cfg!`.
+    attr: Option<bool>,
+    applies_cfg: bool,
+}
+
+fn cfg_preds(s: &[char], code: &[char]) -> Vec<CfgAt> {
+    let mut out = Vec::new();
+    for (at, w) in words(s) {
+        if w != "cfg" && w != "cfg_attr" {
+            continue;
+        }
+        if at > 0 && s[at - 1] == ':' {
+            continue;
+        }
+        let mut k = skip_ws(s, at + w.len());
+        let bang = w == "cfg" && s.get(k) == Some(&'!');
+        if bang {
+            k = skip_ws(s, k + 1);
+        }
+        if s.get(k) != Some(&'(') {
+            continue;
+        }
+        let close = bracket_close(s, k);
+        let body: String = code[k + 1..close.min(s.len())].iter().collect();
+        let body_flat: String = s[k + 1..close.min(s.len())].iter().collect();
+        // An attribute's `#`, `#!`, `[` before the name.
+        let mut b = back_ws(s, at);
+        let in_attr = b > 0 && s[b - 1] == '[';
+        let mut inner = false;
+        let mut start = at;
+        if in_attr {
+            b = back_ws(s, b - 1);
+            if b > 0 && s[b - 1] == '!' {
+                inner = true;
+                b = back_ws(s, b - 1);
+            }
+            if b > 0 && s[b - 1] == '#' {
+                start = b - 1;
+            }
+        }
+        // An attribute's end is past its `]`.
+        let end = match skip_ws(s, close + 1) {
+            j if in_attr && s.get(j) == Some(&']') => j + 1,
+            _ => close + 1,
+        };
+        if w == "cfg_attr" {
+            let args = cfg_args(&body);
+            let flat_args = cfg_args(&body_flat);
+            let rest = flat_args.get(1..).unwrap_or(&[]).join(",");
+            let applies_cfg = words(&rest.chars().collect::<Vec<_>>())
+                .iter()
+                .any(|(_, x)| x == "cfg" || x == "cfg_attr");
+            out.push(CfgAt {
+                at: start,
+                end,
+                pred: args.first().cloned().unwrap_or_default(),
+                pred_flat: flat_args.first().cloned().unwrap_or_default(),
+                attr: None,
+                applies_cfg,
+            });
+        } else {
+            out.push(CfgAt {
+                at: start,
+                end,
+                pred: body,
+                pred_flat: body_flat,
+                attr: if bang || !in_attr { None } else { Some(inner) },
+                applies_cfg: false,
+            });
+        }
+    }
+    out
+}
+
+/// The end (exclusive) of what an outer attribute that ends at `from`
+/// applies to: the item, statement, field, arm or expression after it,
+/// past any further attributes. An inner attribute's (`inner`) is the
+/// rest of its enclosing scope.
+fn attr_target_end(s: &[char], from: usize, inner: bool) -> usize {
+    let mut k = skip_ws(s, from);
+    while !inner && s.get(k) == Some(&'#') {
+        let j = skip_ws(s, k + 1);
+        if s.get(j) != Some(&'[') {
+            break;
+        }
+        k = skip_ws(s, bracket_close(s, j) + 1);
+    }
+    let item = words(&s[k..(k + 200).min(s.len())])
+        .into_iter()
+        .take_while(|(_, w)| {
+            [
+                "pub", "crate", "unsafe", "async", "const", "extern", "default",
+            ]
+            .contains(&w.as_str())
+        })
+        .count();
+    let first = words(&s[k..(k + 200).min(s.len())])
+        .into_iter()
+        .nth(item)
+        .map(|(_, w)| w)
+        .unwrap_or_default();
+    let is_item = [
+        "fn",
+        "struct",
+        "enum",
+        "union",
+        "impl",
+        "trait",
+        "mod",
+        "macro_rules",
+    ]
+    .contains(&first.as_str());
+    let mut depth = 0i32;
+    let mut i = k;
+    while i < s.len() {
+        match s[i] {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' => {
+                depth -= 1;
+                if depth < 0 {
+                    return i;
+                }
+            }
+            '}' => {
+                depth -= 1;
+                if depth < 0 {
+                    return i;
+                }
+                if depth == 0 && !inner {
+                    if is_item {
+                        return i + 1;
+                    }
+                    let n = skip_ws(s, i + 1);
+                    let next: String = s[n..(n + 4).min(s.len())].iter().collect();
+                    if next == "else" || s.get(n) == Some(&'.') || s.get(n) == Some(&'?') {
+                        i = n;
+                        continue;
+                    }
+                    return if s.get(n) == Some(&';') { n + 1 } else { i + 1 };
+                }
+            }
+            ';' | ',' if depth == 0 && !inner => return i + 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    s.len()
+}
+
+/// The paths a call past the door is written with, from the door's config:
+/// `fs::read`, `File::open`, `libc::remove` (a function's path by its last
+/// two segments), `.exists(` (a filesystem question of `Path`'s, which is
+/// asked as a method), and a barred type's name (`OpenOptions`, `Mmap`).
+/// What the deleted text test of db.rs barred is a subset of it, which
+/// `code_the_door_does_not_compile_is_held_by_its_text` holds.
+fn door_texts(conf: &str) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    for p in door_table(conf, "disallowed-methods") {
+        let segs: Vec<&str> = p.split("::").collect();
+        let n = segs.len();
+        out.insert(format!("{}::{}", segs[n - 2], segs[n - 1]));
+        if segs[n - 2] == "Path" {
+            out.insert(format!(".{}(", segs[n - 1]));
+        }
+    }
+    for p in door_table(conf, "disallowed-types") {
+        out.insert(p.rsplit("::").next().unwrap_or("").to_string());
+    }
+    out.into_iter().collect()
+}
+
+/// Where `text` stands in `s[from..to]` as a whole path (no word
+/// character before a word start or after a word end).
+fn text_hits(s: &[char], from: usize, to: usize, text: &str) -> Vec<usize> {
+    let t: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = from;
+    while i + t.len() <= to {
+        if s[i..i + t.len()] == t[..]
+            && (!is_word(t[0]) || boundary_before(s, i))
+            && (!is_word(t[t.len() - 1]) || boundary_at(s, i + t.len()))
+        {
+            out.push(i);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The `use` declarations (and `extern crate`s) in `s[from..to]` that would
+/// take a barred call out of reach of `door_texts`, which reads a path by
+/// its last two segments: one that renames (`use std::fs as f`, then
+/// `f::remove_file`), one that globs (`use std::fs::*`, then a bare
+/// `remove_file`), and one that takes out a name some barred function has
+/// as its last segment (`use std::fs::remove_file`). By place and what it
+/// does.
+fn use_hits(s: &[char], from: usize, to: usize, texts: &[String]) -> Vec<(usize, String)> {
+    let fns: BTreeSet<&str> = texts
+        .iter()
+        .filter_map(|t| t.split_once("::").map(|(_, f)| f))
+        .filter(|f| f.chars().next().is_some_and(|c| c.is_lowercase()))
+        .collect();
+    let mut out = Vec::new();
+    for (at, w) in words(&s[from..to]) {
+        let at = from + at;
+        let is_use = w == "use"
+            || (w == "extern"
+                && words(&s[(at + 6).min(s.len())..(at + 20).min(s.len())])
+                    .first()
+                    .is_some_and(|(_, n)| n == "crate"));
+        if !is_use || (at > 0 && s[at - 1] == ':') {
+            continue;
+        }
+        let end = (at..to).find(|&i| s[i] == ';').unwrap_or(to);
+        let body = &s[at + w.len()..end];
+        let names = words(body);
+        let why = if body.contains(&'*') {
+            Some("globs a module".to_string())
+        } else if names.iter().any(|(_, n)| n == "as") {
+            Some("renames".to_string())
+        } else {
+            names
+                .iter()
+                .find(|(_, n)| fns.contains(n.as_str()))
+                .map(|(_, n)| format!("takes out `{n}`"))
+        };
+        if let Some(why) = why {
+            out.push((at, why));
+        }
+    }
+    out
+}
+
+/// The door's config as the tree holds it.
+fn door_conf() -> String {
+    std::fs::read_to_string(root().join("scripts/door/clippy.toml"))
+        .expect("scripts/door/clippy.toml reads")
+}
+
+/// What the door cannot compile, in one file: every `cfg` attribute whose
+/// predicate does not hold in the door's build, by the scope it governs (as
+/// an allow's is keyed) and the lines it governs, with each barred path written inside what it
+/// governs, by line; and what fails outright -- a predicate naming
+/// `clippy`, which the door's build alone sets, and a `cfg_attr` that
+/// applies a `cfg`. Test code aside, and a door module's code (which may
+/// call anything) aside but for the `clippy` rule.
+/// The fourth part: the out-of-line modules (`mod name;`) such an
+/// attribute governs, whose whole file the door's build does not compile.
+type CompiledOut = (
+    Vec<(String, usize, usize)>,
+    Vec<(usize, String)>,
+    Vec<String>,
+    Vec<String>,
+);
+
+fn compiled_out(lines: &[lex::Line], door: bool, texts: &[String]) -> CompiledOut {
+    let (code, line_of) = joined(lines, false);
+    let (flat, _) = joined(lines, true);
+    assert_eq!(
+        code.len(),
+        flat.len(),
+        "the lexer's code and flat text line up"
+    );
+    let (mut regions_out, mut hits, mut errs, mut mods) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for c in cfg_preds(&flat, &code) {
+        let ln = line_of[c.at];
+        let names_clippy = words(&c.pred_flat.chars().collect::<Vec<_>>())
+            .iter()
+            .any(|(_, w)| w == "clippy");
+        if names_clippy {
+            errs.push(format!(
+                "{}: a cfg predicate names `clippy`, which only the door's run sets: code it compiles out is code the door never sees",
+                ln + 1
+            ));
+            continue;
+        }
+        if c.applies_cfg {
+            errs.push(format!(
+                "{}: a cfg_attr that applies a cfg: write the cfg itself, whose predicate the door reads",
+                ln + 1
+            ));
+            continue;
+        }
+        let Some(inner) = c.attr else { continue };
+        if door || lines[ln].test || cfg_eval(&c.pred) == Some(true) {
+            continue;
+        }
+        // Test-only code (`cfg(all(test, ..))`) the lexer marks as test.
+        let end = attr_target_end(&flat, c.end, inner);
+        let scope = if inner {
+            lines[ln].scope.clone()
+        } else {
+            let at = (c.end..flat.len())
+                .find(|&i| flat[i] == '{' || flat[i] == ';')
+                .unwrap_or(flat.len() - 1);
+            lines[line_of[at]].scope.clone()
+        };
+        let scope = match scope.as_str() {
+            "" | "<item>" => "<file>".to_string(),
+            s => s.to_string(),
+        };
+        regions_out.push((scope, ln + 1, line_of[end.saturating_sub(1).max(c.end)] + 1));
+        let body: String = flat[c.end..end].iter().collect();
+        let ws: Vec<String> = body
+            .split(|c: char| !is_word(c))
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect();
+        let vis = ws
+            .iter()
+            .take_while(|w| *w == "pub" || *w == "crate" || *w == "super" || *w == "self")
+            .count();
+        if ws.get(vis).map(String::as_str) == Some("mod")
+            && ws.len() == vis + 2
+            && body.trim_end().ends_with(';')
+        {
+            mods.push(ws[vis + 1].clone());
+        }
+        for t in texts {
+            for i in text_hits(&flat, c.end, end, t) {
+                if !lines[line_of[i]].test {
+                    hits.push((line_of[i] + 1, t.clone()));
+                }
+            }
+        }
+        for (i, why) in use_hits(&flat, c.end, end, texts) {
+            if !lines[line_of[i]].test {
+                hits.push((line_of[i] + 1, format!("a use that {why}")));
+            }
+        }
+    }
+    hits.sort();
+    hits.dedup();
+    (regions_out, hits, errs, mods)
+}
+
+/// The file of module `name` declared out of line in `parent`.
+fn child_file(src: &BTreeMap<String, String>, parent: &str, name: &str) -> Option<String> {
+    let dir = match parent
+        .strip_suffix("/mod.rs")
+        .or_else(|| parent.strip_suffix("/lib.rs"))
+    {
+        Some(d) => d.to_string(),
+        None => parent.trim_end_matches(".rs").to_string(),
+    };
+    [format!("{dir}/{name}.rs"), format!("{dir}/{name}/mod.rs")]
+        .into_iter()
+        .find(|f| src.contains_key(f))
+}
+
+/// The files the door's build compiles none of: each brought in by an
+/// out-of-line module under a `cfg` that does not hold there, and every
+/// module such a file declares.
+fn files_compiled_out(src: &BTreeMap<String, String>, texts: &[String]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut todo: Vec<String> = Vec::new();
+    for (f, text) in src.iter().filter(|(f, _)| f.ends_with(".rs")) {
+        let (_, _, _, mods) = compiled_out(&regions(text), false, texts);
+        todo.extend(mods.iter().filter_map(|m| child_file(src, f, m)));
+    }
+    while let Some(f) = todo.pop() {
+        if out.insert(f.clone()) {
+            let lines = regions(&src[&f]);
+            let (s, line_of) = joined(&lines, true);
+            for (at, w) in words(&s) {
+                if w != "mod" || lines[line_of[at]].test {
+                    continue;
+                }
+                let k = skip_ws(&s, at + 3);
+                if let Some((0, n)) = words(&s[k..(k + 80).min(s.len())]).first().cloned() {
+                    if s.get(skip_ws(&s, k + n.len())) == Some(&';') {
+                        todo.extend(child_file(src, &f, &n));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The out-of-line modules (`mod name;`) and `include!`s of a door
+/// module's code: a file they bring in takes the module's allow with it and
+/// is a door module the list does not name.
+fn door_children(lines: &[lex::Line]) -> Vec<usize> {
+    let (s, line_of) = joined(lines, true);
+    let mut out = Vec::new();
+    for (at, w) in words(&s) {
+        if lines[line_of[at]].test || (at > 0 && s[at - 1] == ':') {
+            continue;
+        }
+        let k = skip_ws(&s, at + w.len());
+        let hit = match w.as_str() {
+            "mod" => words(&s[k..(k + 80).min(s.len())])
+                .first()
+                .is_some_and(|(o, n)| *o == 0 && s.get(skip_ws(&s, k + n.len())) == Some(&';')),
+            "include" => s.get(k) == Some(&'!'),
+            _ => false,
+        };
+        if hit {
+            out.push(line_of[at] + 1);
+        }
+    }
+    out
+}
+
+/// What the door's source rules measure, by (kind, file, scope), with the
+/// lines of each; and what fails outright.
+type DoorMeasured = (BTreeMap<DoorKey, usize>, BTreeMap<DoorKey, Vec<usize>>);
+
+fn door_measure(src: &BTreeMap<String, String>) -> Result<DoorMeasured, String> {
+    let mut counts: BTreeMap<DoorKey, usize> = BTreeMap::new();
+    let mut at: BTreeMap<DoorKey, Vec<usize>> = BTreeMap::new();
+    let mut errs = Vec::new();
+    let mut put = |k: DoorKey, n: usize, ln: usize| {
+        *counts.entry(k.clone()).or_insert(0) += n;
+        at.entry(k).or_default().push(ln);
+    };
+    let texts = door_texts(&door_conf());
+    let whole_out = files_compiled_out(src, &texts);
+    for (f, text) in src.iter().filter(|(f, _)| f.ends_with(".rs")) {
+        let lines = regions(text);
+        for (scope, ln) in door_allows(text) {
+            put(("allow".into(), f.clone(), scope), 1, ln);
+        }
+        let door = DOOR_MODS.contains(&f.as_str());
+        let (outs, mut hits, cerrs, _) = compiled_out(&lines, door, &texts);
+        if whole_out.contains(f) && !door {
+            let (s, line_of) = joined(&lines, true);
+            for t in &texts {
+                for i in text_hits(&s, 0, s.len(), t) {
+                    if !lines[line_of[i]].test {
+                        hits.push((line_of[i] + 1, t.clone()));
+                    }
+                }
+            }
+            for (i, why) in use_hits(&s, 0, s.len(), &texts) {
+                if !lines[line_of[i]].test {
+                    hits.push((line_of[i] + 1, format!("a use that {why}")));
+                }
+            }
+        }
+        for (scope, ln, last) in outs {
+            if std::env::var_os("SUPDB_DOOR_PRINT").is_some() {
+                println!("# cfgout {f}:{ln}-{last}");
+            }
+            put(("cfgout".into(), f.clone(), scope), 1, ln);
+        }
+        for (ln, t) in hits {
+            errs.push(format!(
+                "{f}:{ln}: `{t}` in code the door's build compiles out, which its lint never sees: go through the door"
+            ));
+        }
+        for e in cerrs {
+            errs.push(format!("{f}:{e}"));
+        }
+        if door {
+            for ln in door_children(&lines) {
+                errs.push(format!(
+                    "{f}:{ln}: a module or an include brought into a door module's file takes its allow with it: a door module is one file of DOOR_MODS"
+                ));
+            }
+        }
+        for (i, l) in lines.iter().enumerate() {
+            if l.test {
+                continue;
+            }
+            let n = thread_paths(&l.flat);
+            if n > 0 {
+                put(("thread".into(), f.clone(), "*".into()), n, i + 1);
+            }
+            let n = proc_literals(&l.code);
+            if n > 0 && !door {
+                put(("literal".into(), f.clone(), l.scope.clone()), n, i + 1);
+            }
+            let c: Vec<char> = l.flat.chars().collect();
+            if !door
+                && words(&c)
+                    .iter()
+                    .any(|(at, w)| w == "concat" && c.get(skip_ws(&c, at + w.len())) == Some(&'!'))
+            {
+                errs.push(format!(
+                    "{f}:{}: a string put together by concat! is a literal the /proc rule cannot read: write it whole",
+                    i + 1
+                ));
+            }
+        }
+        for (ln, why) in thread_uses(&lines) {
+            errs.push(format!(
+                "{f}:{ln}: a use the thread count cannot follow, it {why}; call it as thread::name, which the count sees"
+            ));
+        }
+        if f != "src/wasmapi.rs" {
+            for ln in foreign_blocks(&lines) {
+                errs.push(format!(
+                    "{f}:{ln}: a foreign block outside src/wasmapi.rs declares what the door's lint names in libc"
+                ));
+            }
+        }
+        if f == "src/ordindex.rs" {
+            let open: String = lines
+                .iter()
+                .filter(|l| !l.test && l.scope == "OrdIndex::open")
+                .map(|l| l.code.as_str())
+                .collect();
+            if !open.contains("vault::map(") {
+                errs.push("src/ordindex.rs: OrdIndex::open does not map through vault::map".into());
+            }
+        }
+    }
+    if errs.is_empty() {
+        Ok((counts, at))
+    } else {
+        Err(errs.join("\n"))
+    }
+}
+
+/// `tests/data/door.txt`: kind, file, scope, count, reason.
+fn door_parse(text: &str) -> Result<BTreeMap<DoorKey, usize>, String> {
+    let mut out = BTreeMap::new();
+    for (i, l) in text.lines().enumerate() {
+        if l.starts_with('#') || l.trim().is_empty() {
+            continue;
+        }
+        let c: Vec<&str> = l.split('\t').collect();
+        let bad = |why: &str| format!("tests/data/door.txt line {}: {why}: {l}", i + 1);
+        if c.len() < 5 || c[4].trim().is_empty() {
+            return Err(bad("five columns, the last a reason"));
+        }
+        if !DOOR_KINDS.contains(&c[0]) {
+            return Err(bad("a kind that is not allow, literal, thread or cfgout"));
+        }
+        let n: usize = c[3]
+            .parse()
+            .map_err(|_| bad("a count that is not a number"))?;
+        if n == 0 {
+            return Err(bad("a count of zero"));
+        }
+        if out
+            .insert((c[0].into(), c[1].into(), c[2].into()), n)
+            .is_some()
+        {
+            return Err(bad("a key listed twice"));
+        }
+    }
+    Ok(out)
+}
+
+/// The door's verdict over `src` against the listed table.
+fn door_check(src: &BTreeMap<String, String>, listed: &str) -> Result<(), String> {
+    let want = door_parse(listed)?;
+    let (have, at) = door_measure(src)?;
+    if std::env::var_os("SUPDB_DOOR_PRINT").is_some() {
+        for ((kind, file, scope), n) in &have {
+            println!("{kind}\t{file}\t{scope}\t{n}\t?");
+        }
+    }
+    let keys: BTreeSet<&DoorKey> = have.keys().chain(want.keys()).collect();
+    let mut errs = Vec::new();
+    for k in keys {
+        let (h, w) = (
+            have.get(k).copied().unwrap_or(0),
+            want.get(k).copied().unwrap_or(0),
+        );
+        if h == w {
+            continue;
+        }
+        let (kind, file, scope) = k;
+        let lines = at
+            .get(k)
+            .map(|v| {
+                v.iter()
+                    .map(|l| l.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let lines = if lines.is_empty() {
+            String::new()
+        } else {
+            format!(" (lines {lines})")
+        };
+        errs.push(if h > w {
+            format!("{kind} {file} {scope}: {h} > {w} listed: the door grew{lines}")
+        } else {
+            format!("{kind} {file} {scope}: {h} < {w} listed: lower tests/data/door.txt{lines}")
+        });
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs.join("\n"))
+    }
+}
+
+fn door_listed(root: &Path) -> String {
+    std::fs::read_to_string(root.join("tests/data/door.txt")).expect("tests/data/door.txt reads")
+}
+
+#[test]
+fn the_door_holds_what_clippy_cannot() {
+    let root = root();
+    if let Err(e) = door_check(&sources(&root), &door_listed(&root)) {
+        panic!("the door, where clippy cannot hold it:\n{e}");
+    }
+}
+
+/// The real tree with `line` put first in fn `name` of `file`, with the
+/// listed table, for a red input.
+fn door_edited(file: &str, name: &str, line: &str) -> (BTreeMap<String, String>, String) {
+    (
+        edited(file, |t| first_statement(t, name, line)),
+        door_listed(&root()),
+    )
+}
+
+#[test]
+fn a_new_allow_of_the_door_fails_in_each_spelling() {
+    let anchor = "drop_written";
+    for attr in [
+        "#[allow(clippy::disallowed_methods)]",
+        "#[allow(clippy::disallowed_types)]",
+        "#[expect(clippy::disallowed_methods)]",
+        "#[allow(clippy::style)]",
+        "#[allow(clippy::all)]",
+        "#[allow(warnings)]",
+        "#[allow(dead_code, clippy :: disallowed_methods)]",
+        "#[cfg_attr(target_os = \"linux\", allow(clippy::disallowed_methods))]",
+    ] {
+        let (src, listed) = door_edited(
+            "src/db/zfile.rs",
+            anchor,
+            &format!("{attr}\n    let _ = std::fs::read(\"/\");"),
+        );
+        let e = door_check(&src, &listed).expect_err(attr);
+        assert!(
+            e.contains("allow src/db/zfile.rs drop_written: 1 > 0 listed"),
+            "{attr}: {e}"
+        );
+    }
+    // An allow a macro writes from its input: the attribute names a
+    // metavariable, which may expand to the door's lints.
+    for mac in [
+        "macro_rules! quiet { ($l:ident, $($i:item)*) => { $(#[allow(clippy::$l)] $i)* } }\nquiet!(disallowed_methods, fn door_probe() { let _ = std::fs::read(\"/\"); });\n",
+        "macro_rules! quiet { ($l:path, $($i:item)*) => { $(#[allow($l)] $i)* } }\nquiet!(clippy::disallowed_methods, fn door_probe() { let _ = std::fs::read(\"/\"); });\n",
+        // The whole attribute a metavariable, the allow handed over as tokens.
+        "macro_rules! quiet { ($a:meta; $e:expr) => { #[$a] let _ = $e; } }\nfn door_probe() { quiet!(allow(clippy::disallowed_methods); std::fs::remove_file(\"/\")); }\n",
+        // Each half alone: the attribute a metavariable, and the allow
+        // handed to a macro written elsewhere.
+        "macro_rules! quiet { ($a:meta) => { #[$a] fn door_probe() { let _ = std::fs::read(\"/\"); } } }\n",
+        "fn door_probe() { quiet!(allow(clippy::disallowed_methods); std::fs::remove_file(\"/\")); }\n",
+    ] {
+        let src = edited("src/db/zfile.rs", |t| format!("{t}\n{mac}"));
+        let e = door_check(&src, &door_listed(&root())).expect_err(mac);
+        assert!(
+            e.contains("allow src/db/zfile.rs ") && e.contains("the door grew"),
+            "{mac}: {e}"
+        );
+    }
+    // On an item, the allow is the item's.
+    let src = edited("src/db/zfile.rs", |t| {
+        t.replacen(
+            "fn drop_written(",
+            "#[allow(clippy::disallowed_methods)]\nfn drop_written(",
+            1,
+        )
+    });
+    let e = door_check(&src, &door_listed(&root())).expect_err("an item's allow");
+    assert!(
+        e.contains("allow src/db/zfile.rs drop_written: 1 > 0"),
+        "{e}"
+    );
+    // A module's own, at the top of a file.
+    let src = edited("src/db/zselect.rs", |t| {
+        format!("#![allow(clippy::disallowed_methods)]\n{t}")
+    });
+    let e = door_check(&src, &door_listed(&root())).expect_err("a module's allow");
+    assert!(e.contains("allow src/db/zselect.rs <file>: 1 > 0"), "{e}");
+    // Not the door's lints, or not an allow, or a comment: nothing.
+    for line in [
+        "#[allow(clippy::needless_return)]\n    let _ = 0;",
+        "#[deny(clippy::disallowed_methods)]\n    let _ = 0;",
+        "// #[allow(clippy::disallowed_methods)]",
+        "let _ = \"#[allow(clippy::disallowed_methods)]\";",
+    ] {
+        let (src, listed) = door_edited("src/db/zfile.rs", anchor, line);
+        door_check(&src, &listed).unwrap_or_else(|e| panic!("{line}: {e}"));
+    }
+}
+
+#[test]
+fn an_allow_moved_or_taken_away_fails_until_the_list_follows() {
+    let listed = door_listed(&root());
+    // `ask_ahead`'s allow moved onto `drop_written`.
+    let src = edited("src/db/zfile.rs", |t| {
+        let t = t.replacen(
+            "fn drop_written(",
+            "#[allow(clippy::disallowed_methods)]\nfn drop_written(",
+            1,
+        );
+        let at = t.find("\nfn ask_ahead(").expect("ask_ahead");
+        let allow = t[..at].rfind("#[allow(").expect("ask_ahead's allow");
+        let end = allow + t[allow..].find('\n').unwrap() + 1;
+        format!("{}{}", &t[..allow], &t[end..])
+    });
+    let e = door_check(&src, &listed).expect_err("a move");
+    assert!(e.contains("drop_written: 1 > 0"), "{e}");
+    assert!(e.contains("ask_ahead: 0 < 1 listed: lower"), "{e}");
+}
+
+#[test]
+fn a_proc_path_outside_the_door_fails_and_a_tests_does_not() {
+    let (src, listed) = door_edited(
+        "src/db/zfile.rs",
+        "drop_written",
+        "let _ = \"/proc/self/status\";",
+    );
+    let e = door_check(&src, &listed).expect_err("a /proc literal");
+    assert!(
+        e.contains("literal src/db/zfile.rs drop_written: 1 > 0"),
+        "{e}"
+    );
+    let (src, listed) = door_edited("src/db/zfile.rs", "drop_written", "let _ = \"/sys\";");
+    door_check(&src, &listed).expect_err("a /sys literal");
+    // A path put together from pieces the rule cannot read.
+    let (src, listed) = door_edited(
+        "src/db/zfile.rs",
+        "drop_written",
+        "let _ = concat!(\"/pro\", \"c/self/status\");",
+    );
+    let e = door_check(&src, &listed).expect_err("a concat! literal");
+    assert!(e.contains("put together by concat!"), "{e}");
+    // Test code reads what it likes; the door's modules are the door.
+    let src = edited("src/db/zfile.rs", |t| {
+        format!("{t}\n#[cfg(test)]\nmod door_probe {{\n    fn p() {{ let _ = \"/proc/self/stat\"; }}\n}}\n")
+    });
+    door_check(&src, &door_listed(&root())).expect("a test's /proc literal");
+    let (src, listed) = door_edited("src/db/vault.rs", "sync_dir", "let _ = \"/proc/x\";");
+    door_check(&src, &listed).expect("a /proc literal in the door");
+    // Not a path's start.
+    let (src, listed) = door_edited(
+        "src/db/zfile.rs",
+        "drop_written",
+        "let _ = (\"/process\", \"/system\", \"x/proc/\");",
+    );
+    door_check(&src, &listed).expect("not /proc or /sys");
+}
+
+#[test]
+fn a_thread_call_added_fails_and_a_use_of_a_thread_fn_fails() {
+    let (src, listed) = door_edited(
+        "src/db/zfile.rs",
+        "drop_written",
+        "std::thread::yield_now();",
+    );
+    let e = door_check(&src, &listed).expect_err("a thread:: path");
+    assert!(e.contains("thread src/db/zfile.rs *:"), "{e}");
+    assert!(e.contains("the door grew"), "{e}");
+    for u in [
+        "use std::thread::spawn;",
+        "use std::thread::{park, JoinHandle};",
+        "use std::{thread::sleep as nap};",
+    ] {
+        let src = edited("src/db/zfile.rs", |t| format!("{u}\n{t}"));
+        let e = door_check(&src, &door_listed(&root())).expect_err(u);
+        assert!(
+            e.contains("takes a function out of std::thread"),
+            "{u}: {e}"
+        );
+    }
+    // A rename, a glob or a type that spawns: a call through any of them
+    // holds no `thread::` path.
+    for (u, why) in [
+        ("use std::thread as t;", "renames std::thread"),
+        ("use std::{io, thread as t};", "renames std::thread"),
+        ("use std::thread::{self as t};", "renames std::thread"),
+        ("use std::thread::*;", "globs std::thread"),
+        (
+            "use std::thread::Builder;",
+            "takes Builder out of std::thread",
+        ),
+        (
+            "use std::thread::{JoinHandle, Scope};",
+            "takes Scope out of std::thread",
+        ),
+    ] {
+        let src = edited("src/db/zfile.rs", |t| format!("{u}\n{t}"));
+        let e = door_check(&src, &door_listed(&root())).expect_err(u);
+        assert!(
+            e.contains("the thread count cannot follow") && e.contains(why),
+            "{u}: {e}"
+        );
+    }
+    // A door module re-exporting the module under another name is a rename
+    // too, though the door's own thread calls are not counted.
+    let src = edited("src/db/pager.rs", |t| {
+        format!("{t}\npub(crate) use std::thread as pth;\n")
+    });
+    let e = door_check(&src, &door_listed(&root())).expect_err("a re-export");
+    assert!(
+        e.contains("src/db/pager.rs:") && e.contains("renames std::thread"),
+        "{e}"
+    );
+    for u in [
+        "use std::thread;",
+        "use std::thread::JoinHandle;",
+        "use std::thread::{self, JoinHandle};",
+        "use std::thread::{self, JoinHandle as Handle, ThreadId};",
+        "use std::io::{self, Read};",
+    ] {
+        let src = edited("src/db/zfile.rs", |t| format!("{u}\n{t}"));
+        let e = door_check(&src, &door_listed(&root()));
+        assert!(
+            !e.is_err_and(|e| e.contains("takes a function")),
+            "{u} takes no function"
+        );
+    }
+}
+
+#[test]
+fn a_foreign_block_outside_wasmapi_fails() {
+    for b in [
+        "extern \"C\" {\n    fn madvise(a: *mut u8, n: usize, adv: i32) -> i32;\n}\n",
+        "extern {\n    fn open(p: *const u8, f: i32) -> i32;\n}\n",
+        "unsafe extern \"C\" {\n    fn sync();\n}\n",
+        // Written by a macro: the ABI a metavariable, or the keyword itself
+        // handed over.
+        "macro_rules! ffi { ($a:literal) => { extern $a { fn unlink(p: *const std::ffi::c_char) -> i32; } } }\nffi!(\"C\");\n",
+        "macro_rules! ffi { ($k:tt) => { $k \"C\" { fn unlink(p: *const std::ffi::c_char) -> i32; } } }\nffi!(extern);\n",
+    ] {
+        let src = edited("src/db/zfile.rs", |t| format!("{t}\n{b}"));
+        let e = door_check(&src, &door_listed(&root())).expect_err(b);
+        assert!(e.contains("a foreign block outside src/wasmapi.rs"), "{e}");
+    }
+    // A function of the C ABI, or a pointer to one, declares nothing.
+    let src = edited("src/db/zfile.rs", |t| {
+        format!("{t}\npub extern \"C\" fn door_probe() {{}}\ntype DoorProbe = unsafe extern \"C\" fn() -> u8;\n")
+    });
+    door_check(&src, &door_listed(&root())).expect("no foreign block");
+}
+
+#[test]
+fn the_ordered_index_opens_through_the_door() {
+    let src = edited("src/ordindex.rs", |t| {
+        t.replacen(
+            "crate::db::vault::map(path)?",
+            "crate::bytes::MmapBytes::open(path)?",
+            1,
+        )
+    });
+    let e = door_check(&src, &door_listed(&root())).expect_err("a map past the door");
+    assert!(
+        e.contains("OrdIndex::open does not map through vault::map"),
+        "{e}"
+    );
+}
+
+#[test]
+fn the_door_table_is_read_as_it_says() {
+    for (bad, why) in [
+        ("allow\tsrc/x.rs\tf\t1\n", "five columns"),
+        ("allow\tsrc/x.rs\tf\t1\t \n", "five columns"),
+        ("deny\tsrc/x.rs\tf\t1\tr\n", "a kind"),
+        ("allow\tsrc/x.rs\tf\tone\tr\n", "not a number"),
+        ("allow\tsrc/x.rs\tf\t0\tr\n", "a count of zero"),
+        (
+            "allow\tsrc/x.rs\tf\t1\tr\nallow\tsrc/x.rs\tf\t2\tr\n",
+            "listed twice",
+        ),
+    ] {
+        let e = door_parse(bad).expect_err(bad);
+        assert!(e.contains(why), "{bad}: {e}");
+    }
+    assert_eq!(door_parse("# a comment\n\n").unwrap().len(), 0);
+}
+
+/// The paths of one table of `scripts/door/clippy.toml` (`disallowed-methods`
+/// or `disallowed-types`): every quoted string in it that is a path, which a
+/// reason is not.
+fn door_table(conf: &str, table: &str) -> Vec<String> {
+    let head = format!("\n{table} = [");
+    let Some(at) = conf.find(&head) else {
+        return Vec::new();
+    };
+    let body = &conf[at + head.len()..];
+    let body = &body[..body.find("\n]").unwrap_or(body.len())];
+    let body: String = body
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    body.split('"')
+        .skip(1)
+        .step_by(2)
+        .filter(|s| s.contains("::") && !s.contains(' '))
+        .map(str::to_string)
+        .collect()
+}
+
+/// What is wrong with the door's config: a table missing or empty, or an
+/// entry whose last segment is not of its table's kind. An entry of the
+/// wrong kind may resolve to something no call can name -- a tuple
+/// struct's constructor, for a type written into the methods' table --
+/// which clippy accepts without a word and bars nothing by.
+fn door_conf_check(conf: &str) -> Result<(), String> {
+    let mut errs = Vec::new();
+    for (table, wants_fn) in [("disallowed-methods", true), ("disallowed-types", false)] {
+        let paths = door_table(conf, table);
+        if paths.is_empty() {
+            errs.push(format!("{table}: no entries"));
+        }
+        for p in paths {
+            let last = p.rsplit("::").next().unwrap_or("");
+            let is_fn = last.chars().next().is_some_and(|c| c.is_lowercase());
+            if is_fn != wants_fn {
+                errs.push(format!(
+                    "{table}: `{p}` is a {} path",
+                    if is_fn { "function's" } else { "type's" }
+                ));
+            }
+        }
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs.join("\n"))
+    }
+}
+
+#[test]
+fn each_table_of_the_doors_config_names_its_kind() {
+    let conf = std::fs::read_to_string(root().join("scripts/door/clippy.toml"))
+        .expect("scripts/door/clippy.toml reads");
+    door_conf_check(&conf).unwrap_or_else(|e| panic!("scripts/door/clippy.toml:\n{e}"));
+    assert!(door_table(&conf, "disallowed-methods").len() > 50);
+    assert!(door_table(&conf, "disallowed-types").contains(&"std::fs::OpenOptions".to_string()));
+    // A type moved into the methods' table, and a function into the types'.
+    let moved = conf.replacen(
+        "disallowed-methods = [\n",
+        "disallowed-methods = [\n  \"std::fs::OpenOptions\",\n",
+        1,
+    );
+    let e = door_conf_check(&moved).expect_err("a type among the methods");
+    assert!(
+        e.contains("disallowed-methods: `std::fs::OpenOptions` is a type's"),
+        "{e}"
+    );
+    let moved = conf.replacen(
+        "disallowed-types = [\n",
+        "disallowed-types = [\n  { path = \"std::fs::read\", reason = \"a b\" },\n",
+        1,
+    );
+    let e = door_conf_check(&moved).expect_err("a function among the types");
+    assert!(
+        e.contains("disallowed-types: `std::fs::read` is a function's"),
+        "{e}"
+    );
+    let e = door_conf_check("").expect_err("no tables");
+    assert!(e.contains("disallowed-methods: no entries"), "{e}");
+}
+
+/// The files of the resolved libc that declare its functions for the
+/// door's builds, glibc on x86_64 and on aarch64 (the two Linux legs of CI),
+/// relative to the crate's directory; and the directories whose every file
+/// is one.
+const LIBC_FILES: &[&str] = &[
+    "src/unix/mod.rs",
+    "src/unix/linux_like/mod.rs",
+    "src/unix/linux_like/linux_l4re_shared.rs",
+    "src/unix/linux_like/linux/mod.rs",
+    "src/unix/linux_like/linux/arch/mod.rs",
+    "src/unix/linux_like/linux/arch/generic/mod.rs",
+    "src/unix/linux_like/linux/gnu/mod.rs",
+    "src/unix/linux_like/linux/gnu/b64/mod.rs",
+    "src/unix/linux_like/linux/gnu/b64/x86_64/mod.rs",
+    "src/unix/linux_like/linux/gnu/b64/x86_64/not_x32.rs",
+    "src/unix/linux_like/linux/gnu/b64/aarch64/mod.rs",
+    "src/unix/linux_like/linux/gnu/b64/aarch64/lp64.rs",
+];
+const LIBC_DIRS: &[&str] = &["src/new/common", "src/new/glibc", "src/new/linux_uapi"];
+
+/// The source of the libc `Cargo.lock` resolves, from cargo's registry.
+fn libc_source() -> PathBuf {
+    let lock = std::fs::read_to_string(root().join("Cargo.lock")).expect("Cargo.lock reads");
+    let at = lock
+        .find("name = \"libc\"\nversion = \"")
+        .expect("libc in Cargo.lock");
+    let rest = &lock[at + "name = \"libc\"\nversion = \"".len()..];
+    let version = &rest[..rest.find('"').expect("a version")];
+    let home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cargo"));
+    let reg = home.join("registry/src");
+    let found = std::fs::read_dir(&reg)
+        .unwrap_or_else(|e| {
+            panic!(
+                "{}: {e}: the libc source the door is held to",
+                reg.display()
+            )
+        })
+        .filter_map(|e| e.ok())
+        .map(|e| e.path().join(format!("libc-{version}")))
+        .find(|p| p.is_dir());
+    found.unwrap_or_else(|| panic!("libc-{version} is not under {}", reg.display()))
+}
+
+/// Every function the files of `LIBC_FILES` and `LIBC_DIRS` under `dir`
+/// declare with a string argument, a `*const c_char` or a `*mut c_char`:
+/// the arguments a path is passed in, whatever they are called (`unlink`'s
+/// is `c`). By name, with the file that declares it.
+fn libc_string_calls(dir: &Path) -> BTreeMap<String, String> {
+    let mut files: Vec<String> = LIBC_FILES.iter().map(|f| f.to_string()).collect();
+    for d in LIBC_DIRS {
+        let mut todo = vec![dir.join(d)];
+        while let Some(p) = todo.pop() {
+            for e in std::fs::read_dir(&p).into_iter().flatten().flatten() {
+                let q = e.path();
+                if q.is_dir() {
+                    todo.push(q);
+                } else if q.extension().is_some_and(|x| x == "rs") {
+                    files.push(q.strip_prefix(dir).unwrap().to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    for f in files {
+        let text = std::fs::read_to_string(dir.join(&f))
+            .unwrap_or_else(|e| panic!("libc's {f}: {e}: its layout moved, read LIBC_FILES again"));
+        let text: String = text
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let s: Vec<char> = text.chars().collect();
+        for (at, w) in words(&s) {
+            if w != "fn" || !s[..at].ends_with(&['p', 'u', 'b', ' ']) {
+                continue;
+            }
+            let Some((o, name)) = words(&s[at + 2..(at + 80).min(s.len())]).first().cloned() else {
+                continue;
+            };
+            let open = skip_ws(&s, at + 2 + o + name.len());
+            if s.get(open) != Some(&'(') {
+                continue;
+            }
+            // The argument list, split at its top-level commas.
+            let (mut depth, mut args, mut cur) = (0i32, Vec::new(), String::new());
+            for k in open + 1..s.len() {
+                let c = s[k];
+                match c {
+                    '(' | '<' => depth += 1,
+                    ')' if depth == 0 => break,
+                    ')' => depth -= 1,
+                    '>' if s[k - 1] != '-' => depth -= 1,
+                    ',' if depth == 0 => {
+                        args.push(std::mem::take(&mut cur));
+                        continue;
+                    }
+                    _ => {}
+                }
+                cur.push(c);
+            }
+            args.push(cur);
+            let names_path = args.iter().any(|a| {
+                let Some((_, ty)) = a.split_once(':') else {
+                    return false;
+                };
+                let ty: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
+                let ty = ty
+                    .strip_prefix("*const")
+                    .or_else(|| ty.strip_prefix("*mut"))
+                    .unwrap_or("");
+                ty.rsplit("::").next() == Some("c_char") && !ty.starts_with('*')
+            });
+            if names_path {
+                out.entry(name).or_insert_with(|| f.clone());
+            }
+        }
+    }
+    out
+}
+
+/// `tests/data/door-libc.txt`: the libc functions with a string argument
+/// that act on no file, each with its reason.
+fn door_libc_notfile(text: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .map(|l| {
+            let (n, why) = l.split_once('\t').unwrap_or((l, ""));
+            assert!(
+                !why.trim().is_empty(),
+                "tests/data/door-libc.txt: {l}: a reason"
+            );
+            (n.to_string(), why.to_string())
+        })
+        .collect()
+}
+
+/// What of `calls` the config does not bar and the list does not excuse,
+/// and what of the list names no call or a call the config bars.
+fn libc_unclassed(
+    calls: &BTreeMap<String, String>,
+    barred: &BTreeSet<String>,
+    notfile: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let mut errs = Vec::new();
+    for (n, f) in calls {
+        if !barred.contains(n) && !notfile.contains_key(n) {
+            errs.push(format!(
+                "libc::{n} ({f}) takes a string, which may be a path: bar it in scripts/door/clippy.toml, or say in tests/data/door-libc.txt why it acts on no file"
+            ));
+        }
+    }
+    for n in notfile.keys() {
+        if !calls.contains_key(n) {
+            errs.push(format!(
+                "tests/data/door-libc.txt: {n} is no libc call with a string"
+            ));
+        } else if barred.contains(n) {
+            errs.push(format!("tests/data/door-libc.txt: {n} is barred as well"));
+        }
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs.join("\n"))
+    }
+}
+
+#[test]
+fn every_libc_call_that_takes_a_string_is_barred_or_said_to_touch_no_file() {
+    let calls = libc_string_calls(&libc_source());
+    for n in [
+        "open",
+        "unlink",
+        "mkstemp",
+        "execveat",
+        "setmntent",
+        "utime",
+        "posix_spawn_file_actions_addopen",
+        "strlen",
+    ] {
+        assert!(calls.contains_key(n), "the scan finds libc::{n}: {calls:?}");
+    }
+    assert!(calls.len() > 200, "{}", calls.len());
+    let barred: BTreeSet<String> = door_table(&door_conf(), "disallowed-methods")
+        .iter()
+        .filter_map(|p| p.strip_prefix("libc::").map(str::to_string))
+        .collect();
+    let notfile = door_libc_notfile(
+        &std::fs::read_to_string(root().join("tests/data/door-libc.txt"))
+            .expect("tests/data/door-libc.txt reads"),
+    );
+    libc_unclassed(&calls, &barred, &notfile).unwrap_or_else(|e| panic!("{e}"));
+    // An entry taken out of the config, a call the list names wrongly.
+    let mut less = barred.clone();
+    less.remove("utime");
+    let e = libc_unclassed(&calls, &less, &notfile).expect_err("utime unbarred");
+    assert!(
+        e.contains("libc::utime (src/unix/mod.rs) takes a string"),
+        "{e}"
+    );
+    let mut wrong = notfile.clone();
+    wrong.insert("open".into(), "r".into());
+    wrong.insert("no_such_fn".into(), "r".into());
+    let e = libc_unclassed(&calls, &barred, &wrong).expect_err("a list of wrong names");
+    assert!(
+        e.contains("open is barred as well") && e.contains("no_such_fn is no libc call"),
+        "{e}"
+    );
+}
+
+#[test]
+fn a_cfg_predicate_is_read_as_the_doors_build_reads_it() {
+    for (p, want) in [
+        ("debug_assertions", Some(true)),
+        ("not(debug_assertions)", Some(false)),
+        ("target_os = \"linux\"", Some(true)),
+        ("not(target_os = \"linux\")", Some(false)),
+        (
+            "all(target_os = \"linux\", not(supdb_emulated))",
+            Some(true),
+        ),
+        (
+            "not(all(target_os = \"linux\", target_env = \"gnu\"))",
+            Some(false),
+        ),
+        (
+            "any(target_arch = \"x86_64\", target_arch = \"aarch64\")",
+            Some(true),
+        ),
+        ("target_arch = \"aarch64\"", Some(false)),
+        ("not(target_family = \"wasm\")", Some(true)),
+        ("windows", Some(false)),
+        ("feature = \"x\"", None),
+        ("not(somebodys_cfg)", None),
+        ("any(windows, somebodys_cfg)", None),
+        ("all(windows, somebodys_cfg)", Some(false)),
+        // Every name the door's build decides, each way.
+        ("unix", Some(true)),
+        ("test", Some(false)),
+        ("doc", Some(false)),
+        ("miri", Some(false)),
+        ("supdb_emulated", Some(false)),
+        ("target_family = \"unix\"", Some(true)),
+        ("target_family = \"windows\"", Some(false)),
+        ("target_env = \"gnu\"", Some(true)),
+        ("target_env = \"musl\"", Some(false)),
+        ("target_pointer_width = \"64\"", Some(true)),
+        ("target_pointer_width = \"32\"", Some(false)),
+        ("target_endian = \"little\"", Some(true)),
+        ("target_endian = \"big\"", Some(false)),
+        ("target_vendor = \"unknown\"", Some(true)),
+        ("target_vendor = \"apple\"", Some(false)),
+        ("panic = \"unwind\"", Some(true)),
+        ("panic = \"abort\"", Some(false)),
+    ] {
+        assert_eq!(cfg_eval(p), want, "{p}");
+    }
+    // What an outer attribute governs ends with its item, statement, arm
+    // or expression, an `else` and a method chain included.
+    for (src, governed) in [
+        ("fn a() {} fn b() {}", "fn a() {}"),
+        (
+            "let x = if c { 1 } else { 2 }; y();",
+            "let x = if c { 1 } else { 2 };",
+        ),
+        ("{ a() } b();", "{ a() }"),
+        ("A | B => f(x), _ => g(),", "A | B => f(x),"),
+        ("use a::{b, c}; d();", "use a::{b, c};"),
+        ("x.f() }", "x.f() "),
+        ("#[inline] fn a() { b() } c", "#[inline] fn a() { b() }"),
+        ("let y = S { a }.f()?; z", "let y = S { a }.f()?;"),
+    ] {
+        let s: Vec<char> = src.chars().collect();
+        let end = attr_target_end(&s, 0, false);
+        assert_eq!(s[..end].iter().collect::<String>(), governed, "{src}");
+    }
+    let s: Vec<char> = "fn a() {} fn b() {} } fn c() {}".chars().collect();
+    assert_eq!(
+        attr_target_end(&s, 0, true),
+        20,
+        "an inner attribute's scope"
+    );
+}
+
+#[test]
+fn code_the_door_does_not_compile_is_held_by_its_text() {
+    // The deleted text test of db.rs barred these, and the texts the
+    // config gives bar each.
+    let texts = door_texts(&door_conf());
+    for old in [
+        "File::open",
+        "File::create",
+        "OpenOptions",
+        "fs::rename",
+        "fs::hard_link",
+        "fs::remove_file",
+        "fs::read_dir",
+        "fs::metadata",
+        "fs::read",
+        "fs::write",
+        "fs::copy",
+        "MmapBytes::open",
+        ".exists(",
+        "libc::remove",
+        "Command",
+    ] {
+        assert!(texts.iter().any(|t| t == old), "{old} among {texts:?}");
+    }
+    // And every entry of the config, a function by its last two segments,
+    // a type by its last.
+    let conf = door_conf();
+    for p in door_table(&conf, "disallowed-methods") {
+        let segs: Vec<&str> = p.rsplitn(3, "::").collect();
+        let t = format!("{}::{}", segs[1], segs[0]);
+        assert!(texts.contains(&t), "{p}: {t} among the texts");
+    }
+    for p in door_table(&conf, "disallowed-types") {
+        let t = p.rsplit("::").next().unwrap().to_string();
+        assert!(texts.contains(&t), "{p}: {t} among the texts");
+    }
+    assert!(
+        files_compiled_out(&sources(&root()), &texts).contains("src/wasmapi.rs"),
+        "the browser's ABI is a file the door's build does not compile"
+    );
+    // A barred path in code each kind of predicate compiles out.
+    for line in [
+        "#[cfg(not(debug_assertions))] let _ = std::path::Path::new(\"/x\").exists();",
+        "#[cfg(not(target_os = \"linux\"))] let _ = std::fs::read(\"/x\");",
+        "#[cfg(target_arch = \"aarch64\")] unsafe { libc::remove(c\"/x\".as_ptr()) };",
+        "#[cfg(somebodys_cfg)] let _ = std::process::Command::new(\"rm\");",
+        "#[cfg(windows)] let _ = if true { 1 } else { std::fs::write(\"/x\", b\"\").map(|_| 1).unwrap_or(0) };",
+    ] {
+        let (src, listed) = door_edited("src/db.rs", "seal", line);
+        let e = door_check(&src, &listed).expect_err(line);
+        assert!(
+            e.contains("in code the door's build compiles out"),
+            "{line}: {e}"
+        );
+    }
+    // A use that renames, globs or takes a barred function out, in code
+    // compiled out, where the texts would not see the call it leads to.
+    for line in [
+        "#[cfg(not(debug_assertions))] let _ = (1, { use std::fs as f; f::remove_file(\"/\") });",
+        "#[cfg(not(target_os = \"linux\"))] { use std::fs::*; let _ = remove_file(\"/\"); }",
+        "#[cfg(windows)] { use std::fs::{remove_file}; let _ = remove_file(\"/\"); }",
+        "#[cfg(windows)] { extern crate libc as c; unsafe { c::unlink(std::ptr::null()) }; }",
+    ] {
+        let (src, listed) = door_edited("src/db.rs", "seal", line);
+        let e = door_check(&src, &listed).expect_err(line);
+        assert!(
+            e.contains("`a use that") && e.contains("in code the door's build compiles out"),
+            "{line}: {e}"
+        );
+    }
+    // A use that does none of that: the call it leads to is written whole.
+    let (src, listed) = door_edited(
+        "src/db.rs",
+        "seal",
+        "#[cfg(windows)] { use std::path::Path; let _ = Path::new(\"/\"); }",
+    );
+    let e = door_check(&src, &listed).expect_err("a new region");
+    assert!(!e.contains("a use that"), "{e}");
+    // A function, a module whose `cfg` is inside it, and a file brought in
+    // under one.
+    for tail in [
+        "#[cfg(not(target_os = \"linux\"))]\nfn door_probe() { let _ = std::fs::read(\"/x\"); }\n",
+        "mod door_probe {\n    #![cfg(windows)]\n    pub fn f() { let _ = std::fs::read(\"/x\"); }\n}\n",
+    ] {
+        let src = edited("src/db.rs", |t| format!("{t}\n{tail}"));
+        let e = door_check(&src, &door_listed(&root())).expect_err(tail);
+        assert!(e.contains("src/db.rs:") && e.contains("compiles out"), "{tail}: {e}");
+    }
+    let mut src = edited("src/lib.rs", |t| {
+        format!("{t}\n#[cfg(windows)]\nmod door_probe;\n")
+    });
+    src.insert(
+        "src/door_probe.rs".into(),
+        "pub fn f() {\n    let _ = std::fs::read(\"/x\");\n}\n".into(),
+    );
+    let e = door_check(&src, &door_listed(&root())).expect_err("a file compiled out");
+    assert!(e.contains("src/door_probe.rs:2: `fs::read`"), "{e}");
+    // Nothing barred: the region is counted, and a new one grows the door.
+    let (src, listed) = door_edited("src/db.rs", "seal", "#[cfg(windows)] let _ = 1;");
+    let e = door_check(&src, &listed).expect_err("a new region");
+    assert!(e.contains("cfgout src/db.rs Db::seal: 1 > 0 listed"), "{e}");
+    // Compiled in, or test code: nothing.
+    for line in [
+        "#[cfg(target_os = \"linux\")] let _ = 1;",
+        "#[cfg(test)] let _ = std::fs::read(\"/x\");",
+        "#[cfg(all(test, windows))] let _ = std::fs::read(\"/x\");",
+    ] {
+        let (src, listed) = door_edited("src/db.rs", "seal", line);
+        door_check(&src, &listed).unwrap_or_else(|e| panic!("{line}: {e}"));
+    }
+}
+
+#[test]
+fn a_cfg_only_the_doors_run_sets_fails_and_so_does_a_cfg_applied_by_cfg_attr() {
+    for line in [
+        "#[cfg(not(clippy))] let _ = std::fs::remove_file(\"/x\");",
+        "#[cfg(clippy)] let _ = 1;",
+        "#[cfg(any(windows, not(clippy)))] let _ = 1;",
+        "#[cfg_attr(not(clippy), allow(unused))] let _ = 1;",
+        "if !cfg!(clippy) { let _ = 1; }",
+    ] {
+        let (src, listed) = door_edited("src/db.rs", "seal", line);
+        let e = door_check(&src, &listed).expect_err(line);
+        assert!(e.contains("names `clippy`"), "{line}: {e}");
+    }
+    // In a door module too: its compiled-out code is its own, but code
+    // under `clippy` is not the door's lint's to see either.
+    let (src, listed) = door_edited(
+        "src/db/vault.rs",
+        "sync_dir",
+        "#[cfg(not(clippy))] let _ = 1;",
+    );
+    assert!(door_check(&src, &listed)
+        .unwrap_err()
+        .contains("names `clippy`"));
+    let (src, listed) = door_edited(
+        "src/db.rs",
+        "seal",
+        "#[cfg_attr(target_os = \"linux\", cfg(windows))] let _ = 1;",
+    );
+    let e = door_check(&src, &listed).expect_err("cfg_attr applying a cfg");
+    assert!(e.contains("a cfg_attr that applies a cfg"), "{e}");
+    // A lint name in a cfg_attr's attribute is not its predicate.
+    let (src, listed) = door_edited(
+        "src/db.rs",
+        "seal",
+        "#[cfg_attr(target_os = \"linux\", allow(clippy::needless_return))] let _ = 1;",
+    );
+    door_check(&src, &listed).unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn a_door_module_brings_in_no_file_and_its_threads_are_counted() {
+    for tail in [
+        "mod door_helper;\n",
+        "pub(crate) mod door_helper ;\n",
+        "include!(\"door_helper.rs\");\n",
+    ] {
+        let src = edited("src/db/vault.rs", |t| format!("{t}\n{tail}"));
+        let e = door_check(&src, &door_listed(&root())).expect_err(tail);
+        assert!(
+            e.contains("src/db/vault.rs:") && e.contains("takes its allow with it"),
+            "{tail}: {e}"
+        );
+    }
+    // A module written in the file is the file's.
+    let src = edited("src/db/vault.rs", |t| {
+        format!("{t}\nmod door_helper {{}}\n")
+    });
+    door_check(&src, &door_listed(&root())).unwrap_or_else(|e| panic!("{e}"));
+    let (src, listed) = door_edited("src/crypt.rs", "parse", "std::thread::spawn(|| {});");
+    let e = door_check(&src, &listed).expect_err("a thread in a door module");
+    assert!(e.contains("thread src/crypt.rs *: 2 > 1 listed"), "{e}");
+}

@@ -142,6 +142,9 @@
 //! the cache takes the file over, to give its pages back, only once the
 //! last such mapping has gone.
 
+// The door (scripts/door/clippy.toml, tests/data/door.txt): the door itself.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use crate::bytes::MmapBytes;
 use crate::crypt::{self, Aead, EncryptOptions, NONCE, TAG};
 use std::collections::HashMap;
@@ -3408,56 +3411,6 @@ pub(crate) mod tests {
         let mut zeros = file.clone();
         zeros.extend_from_slice(&[0u8; 64]);
         assert_eq!(log.open_records(&zeros, 68, &mut Vec::new()).len(), 3);
-    }
-
-    /// The engine reaches its files through the door and no other way: its
-    /// source, up to its own tests, names none of the standard library's
-    /// calls the door stands for. A call that slipped past would fail under
-    /// a cipher where a test reached it, and write beside the door where
-    /// none did; this is the check for the second.
-    #[test]
-    fn the_engine_names_no_file_but_through_the_door() {
-        let engine = include_str!("../db.rs");
-        let barred = [
-            "File::open(",
-            "File::create(",
-            "OpenOptions",
-            "fs::rename(",
-            "fs::hard_link(",
-            "fs::remove_file(",
-            "fs::read_dir(",
-            "fs::metadata(",
-            "fs::read(",
-            "fs::write(",
-            "fs::copy(",
-            "MmapBytes::open(",
-            ".exists()",
-        ];
-        // The engine's own tests, each a module behind `#[cfg(test)]` that
-        // closes at the first column, are not the engine.
-        let (mut in_tests, mut after_cfg, mut seen) = (false, false, 0);
-        for (i, line) in engine.lines().enumerate() {
-            if in_tests {
-                in_tests = line != "}";
-                continue;
-            }
-            if after_cfg && line.starts_with("mod ") && line.ends_with('{') {
-                (in_tests, seen) = (true, seen + 1);
-                continue;
-            }
-            after_cfg = line == "#[cfg(test)]";
-            let code = line.split("//").next().unwrap();
-            for b in barred {
-                assert!(!code.contains(b), "db.rs:{}: {b} past the door", i + 1);
-            }
-        }
-        assert!(
-            seen > 1,
-            "the engine's test modules are found and passed over"
-        );
-        let index = include_str!("../ordindex.rs");
-        let open = index.find("pub fn open(path: &Path, keys: usize)").unwrap();
-        assert!(index[open..open + 200].contains("crate::db::vault::map(path)"));
     }
 
     /// Nonces under one key never repeat, across the count's end too.

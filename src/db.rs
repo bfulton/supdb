@@ -361,6 +361,8 @@ pub enum BackgroundIo {
 /// elsewhere a no-op. A failure is ignored on purpose: a scheduler that does
 /// not honour classes leaves the writes where they were, which is a fact
 /// about the host that the measurement records rather than an error.
+// The door (tests/data/door.txt): not a file: a thread's I/O class.
+#[allow(clippy::disallowed_methods)]
 fn idle_io_priority() {
     #[cfg(target_os = "linux")]
     unsafe {
@@ -381,6 +383,8 @@ fn idle_io_priority() {
 /// requests wait behind the syncs at the device and not ahead of them
 /// (`Options::zpages_hot_ask_idle`). Linux only; elsewhere `f` runs as it
 /// is.
+// The door (tests/data/door.txt): not a file: a thread's I/O class.
+#[allow(clippy::disallowed_methods)]
 fn with_idle_io<T>(f: impl FnOnce() -> T) -> T {
     #[cfg(target_os = "linux")]
     {
@@ -436,6 +440,8 @@ mod io_class_tests {
 /// The calling thread's I/O class as the kernel reports it: 3 idle, 2 best
 /// effort, 1 real time, 0 none, which the kernel serves as best effort at
 /// the thread's nice level. Zero where the call is not had or fails.
+// The door (tests/data/door.txt): not a file: a thread's I/O class.
+#[allow(clippy::disallowed_methods)]
 fn io_priority_class() -> u64 {
     #[cfg(target_os = "linux")]
     unsafe {
@@ -8296,6 +8302,8 @@ impl Wal {
     /// rotation leaves (`recycle`), and a log with nothing in it. A store
     /// that recycles nothing refuses such a header, which only a changed
     /// byte makes there.
+    // The door (tests/data/door.txt): the log mapped through a handle vault::open gave.
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
     fn replay(
         path: &Path,
         id: u64,
@@ -10531,6 +10539,8 @@ fn pwritev_all(file: &File, at: u64, parts: &[&[u8]], fault: &mut u8) -> std::io
 }
 
 /// `pwritev_all`'s write.
+// The door (tests/data/door.txt): pwritev on a handle the door gave.
+#[allow(clippy::disallowed_methods)]
 #[inline(always)]
 fn pwritev_at(file: &File, at: u64, parts: &[&[u8]]) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
@@ -10654,6 +10664,8 @@ fn run_write_fault(file: &File, at: u64, parts: &[&[u8]], fault: &mut u8) -> std
 /// Linux, where it is a hint the later fsync is shorter for; nothing on
 /// another platform, and nothing on an error, since the fsync that follows
 /// writes whatever this did not.
+// The door (tests/data/door.txt): sync_file_range on a handle the door gave.
+#[allow(clippy::disallowed_methods)]
 fn start_writeback(file: &File, at: u64, len: u64) {
     #[cfg(target_os = "linux")]
     {
@@ -11049,6 +11061,8 @@ type KeyWalk<'s, 'k> = (&'s dyn KeySource, &'k mut dyn FnMut(&[u8]));
 /// ends at, and the key and value bytes of the records, which a segment
 /// records as its payload. The records are read where they lie, through a
 /// mapping of the file the walk keeps; a walk of no record keeps none.
+// The door (tests/data/door.txt): a run's file mapped from a handle the door gave.
+#[allow(clippy::disallowed_types)]
 pub(crate) struct RunWalk {
     map: Option<memmap2::MmapRaw>,
     offs: Vec<u32>,
@@ -11888,6 +11902,8 @@ impl SegmentWriter {
     /// own, two allocations a record, for a caller that wrote each back
     /// into a new file: a third of the instructions of the open of a
     /// killed store of three hundred thousand keys.
+    // The door (tests/data/door.txt): a run's file mapped through a handle vault::open gave.
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
     pub(crate) fn walk_run(path: &Path) -> Result<RunWalk> {
         let base = RunWalk::BASE;
         let file = vault::open(path)?;
@@ -13148,6 +13164,8 @@ impl HelperFault {
 /// `file` opened again, read-only, as a new open file description of the
 /// same file: through `/proc/self/fd/<fd>` on Linux, a path built on the
 /// stack; a duplicate of the descriptor elsewhere.
+// The door (tests/data/door.txt): a second description of a door handle, by /proc/self/fd.
+#[allow(clippy::disallowed_methods)]
 fn reopen(file: &File) -> std::io::Result<File> {
     #[cfg(target_os = "linux")]
     {
@@ -13188,6 +13206,8 @@ fn reopen(file: &File) -> std::io::Result<File> {
 
 /// Whether two files are one open file description (`kcmp`'s
 /// `KCMP_FILE`).
+// The door (tests/data/door.txt): kcmp of two descriptors the door gave.
+#[allow(clippy::disallowed_methods)]
 fn same_description(a: &File, b: &File) -> bool {
     use std::os::unix::io::AsRawFd;
     #[cfg(target_os = "linux")]
@@ -14546,6 +14566,8 @@ const PREFAULT_MAX: usize = 256 << 10;
 /// its end, so the allocation's last partial page faults as it did, and
 /// outward at its start, where the page is the allocation's own. A
 /// failure -- a kernel without the advice -- leaves the pages to fault.
+// The door (tests/data/door.txt): advice on the writer's anonymous buffer, not a file.
+#[allow(clippy::disallowed_methods)]
 #[cfg(target_os = "linux")]
 fn populate_ahead(base: usize, cap: usize, populated: &mut usize, need: usize) {
     if need <= *populated || *populated >= cap {
@@ -15206,6 +15228,8 @@ pub(crate) struct Readers {
 /// off Linux. The commands are `linux/membarrier.h`'s:
 /// `MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED` is bit four,
 /// `MEMBARRIER_CMD_PRIVATE_EXPEDITED` bit three.
+// The door (tests/data/door.txt): not a file: membarrier.
+#[allow(clippy::disallowed_methods)]
 fn register_membarrier() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -15221,6 +15245,8 @@ fn register_membarrier() -> bool {
 /// slots when `Readers::asym`. Registered first, or it fails, which the
 /// caller never relies on: `asym` is set only by a registration that
 /// succeeded.
+// The door (tests/data/door.txt): not a file: membarrier.
+#[allow(clippy::disallowed_methods)]
 fn membarrier_all_threads() {
     #[cfg(target_os = "linux")]
     // SAFETY: a syscall with two integer arguments and no pointer.
@@ -17039,6 +17065,8 @@ impl Drop for MemTable {
 /// end are never reached, since a reference is published only once the
 /// writer has pushed the bytes it names to the file, and the file is
 /// only ever appended to and never truncated under the mapping.
+// The door (tests/data/door.txt): the run's mapping of the file vault::open_mapped gave.
+#[allow(clippy::disallowed_types)]
 struct RunMap {
     map: memmap2::Mmap,
     /// Under a cipher, what keeps the run's memory under this mapping
@@ -17064,6 +17092,8 @@ fn grow_run_map(mem: &MemTable, tmp: &Path, written: u64, shared: &Shared) -> Re
 }
 
 impl RunMap {
+    // The door (tests/data/door.txt): maps the handle vault::open_mapped gave.
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
     fn open(path: &Path, cap: usize) -> Result<RunMap> {
         let (file, held) = vault::open_mapped(path)?;
         // SAFETY: the file is appended to and never truncated or edited in
@@ -19470,6 +19500,8 @@ impl Db {}
 /// time went between three threads.
 /// This thread's minor faults so far, from `/proc/thread-self/stat`; for
 /// the `finishsteps` line alone.
+// The door (tests/data/door.txt): a /proc read for a trace (G3: Memory).
+#[allow(clippy::disallowed_methods)]
 fn thread_minflt() -> u64 {
     std::fs::read_to_string("/proc/thread-self/stat")
         .ok()
@@ -19482,6 +19514,8 @@ fn thread_minflt() -> u64 {
 
 /// This thread's major faults so far, from `/proc/thread-self/stat`; for
 /// the merge trace's `mergejob` line alone.
+// The door (tests/data/door.txt): a /proc read for a trace (G3: Memory).
+#[allow(clippy::disallowed_methods)]
 fn thread_majflt() -> u64 {
     std::fs::read_to_string("/proc/thread-self/stat")
         .ok()
@@ -20883,6 +20917,8 @@ fn settle_write_on(opts: &Options, data_bytes: u64) -> bool {
 /// walk's records come from memory rather than the cache. The size of the
 /// highest-level data or unified cache under
 /// `/sys/devices/system/cpu/cpu0/cache`, and 32 MiB where nothing says.
+// The door (tests/data/door.txt): a /sys read of the machine (G3: Memory).
+#[allow(clippy::disallowed_methods)]
 fn llc_bytes() -> u64 {
     static LLC: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *LLC.get_or_init(|| {
@@ -21861,6 +21897,8 @@ struct Shared {
 /// `POSIX_FADV_DONTNEED` over `len` bytes at `off` of `file`: the clean
 /// pages of that range dropped from the page cache, a mapped page skipped,
 /// which is why `Bytes::advise_dontneed_range` goes first.
+// The door (tests/data/door.txt): advice on a handle the door gave.
+#[allow(clippy::disallowed_methods)]
 #[cfg(target_os = "linux")]
 fn fadvise_dontneed_range(file: &std::fs::File, off: u64, len: u64) {
     use std::os::unix::io::AsRawFd;
@@ -21878,6 +21916,8 @@ fn fadvise_dontneed_range(_file: &std::fs::File, _off: u64, _len: u64) {}
 /// The clean pages of `file` that nothing maps dropped from the page cache,
 /// the whole file (`POSIX_FADV_DONTNEED`); a dirty page is written back
 /// first and dropped by a later reclaim. Nothing elsewhere.
+// The door (tests/data/door.txt): advice on a handle the door gave.
+#[allow(clippy::disallowed_methods)]
 #[cfg(target_os = "linux")]
 fn fadvise_dontneed(file: &std::fs::File) {
     use std::os::unix::io::AsRawFd;
@@ -21907,6 +21947,8 @@ fn map_resident_share(map: &MmapBytes) -> f64 {
         .unwrap_or_else(|| resident_share(map.as_slice()))
 }
 
+// The door (tests/data/door.txt): mincore over a borrowed slice (G3: Memory).
+#[allow(clippy::disallowed_methods)]
 pub(super) fn resident_share(bytes: &[u8]) -> f64 {
     if bytes.is_empty() {
         return 0.0;
@@ -21942,6 +21984,8 @@ pub(super) fn resident_share(bytes: &[u8]) -> f64 {
 mod heap {
     type Mallinfo2 = unsafe extern "C" fn() -> libc::mallinfo2;
 
+    // The door (tests/data/door.txt): dlsym of the allocator's count (G3: Memory).
+    #[allow(clippy::disallowed_methods)]
     fn mallinfo2() -> Option<Mallinfo2> {
         static FOUND: std::sync::OnceLock<Option<Mallinfo2>> = std::sync::OnceLock::new();
         *FOUND.get_or_init(|| {
@@ -21969,6 +22013,8 @@ mod heap {
     /// constant the trim's floor absorbs, and an allocation not yet touched
     /// counts as in use and not as resident, so the reading runs under the
     /// truth and never over it. None where either reading cannot be had.
+    // The door (tests/data/door.txt): a /proc read for the trim (G3: Memory).
+    #[allow(clippy::disallowed_methods)]
     pub fn resident_beyond_use() -> Option<usize> {
         let f = mallinfo2()?;
         let text = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -36898,6 +36944,9 @@ impl Db {
     pub fn create(dir: &Path, mut opts: Options) -> Result<Db> {
         check_options(&opts)?;
         let starts_random = opts.read_advice.starts_random();
+        // The door (tests/data/door.txt): the store's real directory, which holds the marker before
+        // any vault exists.
+        #[allow(clippy::disallowed_methods)]
         std::fs::create_dir_all(dir)?;
         // The key or the cipher is taken out of the options here and is not
         // kept in them. Under the kernel's key the directory is encrypted
@@ -41223,6 +41272,8 @@ impl Db {
     /// store at every instant: a crash before the rename leaves a
     /// directory named `<dest>.checkpoint-tmp`, which the next checkpoint
     /// to `dest` removes.
+    // The door (tests/data/door.txt): the caller's destination; refused under a cipher above it.
+    #[allow(clippy::disallowed_methods)]
     pub fn checkpoint(&mut self, dest: &Path) -> Result<()> {
         // A checkpoint links or copies the store's files into a directory
         // of the caller's, which is neither under the store's cipher -- its
@@ -52994,6 +53045,9 @@ impl Maint {
     /// checkpoint to the same place. An open of a directory with segments
     /// and no manifest takes every segment it finds for the store, which a
     /// half-made checkpoint under its final name would be.
+    // The door (tests/data/door.txt): the caller's destination; refused under a cipher in
+    // Db::checkpoint.
+    #[allow(clippy::disallowed_methods)]
     fn checkpoint_into(&mut self, dest: &Path) -> Result<()> {
         let tmp = checkpoint_tmp(dest)?;
         match std::fs::remove_dir_all(&tmp) {
@@ -56300,6 +56354,8 @@ impl Maint {
     /// records count, or at its merge's output finish -- or its resident
     /// records stand in. The stand-ins count beside a form mostly on disk
     /// (`stands_in`).
+    // The door (tests/data/door.txt): a form file by path: under a cipher the decoy answers no.
+    #[allow(clippy::disallowed_methods)]
     fn z_files_cover(&self) -> ZCover {
         let mut c = ZCover::default();
         let _op = self.op();
@@ -57426,6 +57482,9 @@ impl Maint {
                     else {
                         continue;
                     };
+                    // The door (tests/data/door.txt): a form file by path: under a cipher the decoy
+                    // answers no.
+                    #[allow(clippy::disallowed_methods)]
                     if self.dir.join(zfile::zpg_name(id, end)).is_file()
                         || s.records_resident() >= HOT_RAW_RESIDENT
                     {
