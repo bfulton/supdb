@@ -24,6 +24,13 @@
 # sentence quotes needs (`SUPDB_MIX_COUNTERS=1`, `SUPDB_ZPAGES_TRACE=1`),
 # and its rates are then read knowing supdb timed itself. Run it on an
 # otherwise idle machine: two timing runs at once measure each other.
+#
+# `RESUME=1` keeps a sitting whose table is already whole and runs the
+# other, for a pairing a restart cut between its sittings: a sitting is
+# half an hour against a comparator at ten million keys, and the machine
+# these run on has been restarted inside the second more than once. The
+# head file is then left as the first run wrote it, so the binary has to
+# be the one that run used (`BIN`), which is the caller's to hold.
 set -u
 SETS=""
 while [ $# -gt 0 ]; do
@@ -40,7 +47,9 @@ OUT=${OUT:-pairs}
 NAME=${NAME:-$A-vs-$B}
 [ -x "$BIN" ] || { echo "pair.sh: no bench binary at $BIN (cargo build --release)" >&2; exit 2; }
 mkdir -p "$OUT"
-{ git -C "$HERE" rev-parse --short HEAD; git -C "$HERE" status --short; echo "set:$SETS"; } > "$OUT/$NAME-$SIZE-head.txt"
+if [ "${RESUME:-}" != 1 ] || [ ! -s "$OUT/$NAME-$SIZE-head.txt" ]; then
+  { git -C "$HERE" rev-parse --short HEAD; git -C "$HERE" status --short; echo "set:$SETS"; } > "$OUT/$NAME-$SIZE-head.txt"
+fi
 UNSET="-u GLIBC_TUNABLES -u MALLOC_ARENA_MAX"
 for v in $(env | sed -n 's/^\(SUPDB_[A-Za-z0-9_]*\)=.*/\1/p'); do
   UNSET="$UNSET -u $v"
@@ -48,6 +57,10 @@ done
 for sitting in 1 2; do
   if [ "$sitting" = 1 ]; then arms=$A,$B; else arms=$B,$A; fi
   f="$OUT/$NAME-$SIZE-$sitting"
+  if [ "${RESUME:-}" = 1 ] && grep -q ' quantities: ' "$f.out" 2>/dev/null; then
+    echo "pair.sh: sitting $sitting, $arms, kept: its table is whole"
+    continue
+  fi
   echo "pair.sh: sitting $sitting, $arms, $(date -u +%T)"
   # shellcheck disable=SC2086
   env $UNSET $SETS "$BIN" ab --arms "$arms" --size "$SIZE" "$@" > "$f.out" 2> "$f.err"

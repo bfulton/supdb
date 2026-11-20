@@ -5259,7 +5259,21 @@ bound has a band and the band is arithmetic; a probe that shows what a
 cell allows is a ceiling for that cell and says nothing of its
 neighbours; and an arm made of a sibling's policy inherits what the
 sibling pins, so the options a pairing's question rests on are read off
-the arm before its cells are.
+the arm before its cells are. It came again with the stride form's
+sparse variant, built for keys that are no run of numbers: a hundred and
+eight bytes a key where the block form's are eighty-five, a gibibyte at
+ten million keys, priced for two days at 1.25 GiB and 1 GiB, where the
+store in it fits only while the process is at the sixty megabytes it
+holds after a load and not at the three hundred and forty it holds by
+the scrambled mixes. Three rules for asking the form were built and
+paired at those two bounds, each a different way of losing less, before
+one traced rep at 1.5 GiB, run to show the form where it fits, read the
+store whole in it ahead of the shipping engine in nineteen cells of
+twenty-two (`docs/engine.md`, keys that are no run of numbers). The
+corollary: the arithmetic of a form's band is done with the process at
+the most it holds through a row, read off the group's own samples
+(`scripts/groupmem.py`), and the first pairing of a form is at a bound
+inside the band, whether or not the roster has one there.
 
 **A fit read off a file's size, and an estimator built before the counts
 at hand were held to the answer.** The stride form was written off under
@@ -5728,6 +5742,29 @@ not the question's gate, since a gate that can say "later" to the step
 that is the later is a loop; and a signal that the store has been read is
 taken from every path a read can come by, the path the mechanism itself
 installs first.
+
+**A price waived, and the evidence the price was.** A partition whose
+ask of the sparse stride form a build had left was moved in by the
+conversion at no rent wherever the model said the move paid, on the
+reading that the build would have paid none. The rent is not only what a
+move costs: it is how long the reads have to agree with the model before
+a build is spent on its word, and it is what makes a move priced a little
+either way on a second's touches come to nothing. With it waived, the
+first looks of a read pass at ten million random ids under 1 GiB -- the
+block form itself over its fill, the touches a second old and uneven by
+the sample -- moved five and six partitions in, and every one was moved
+back through the passes after, a build each way, the threaded reads a
+twentieth behind and the scrambled D a sixth to a quarter; and under
+1.25 GiB a partition the hot-raw policy had sent back to its form a look
+before was moved in inside E for a tenth of a millisecond a second, E
+0.8x in six pairs of six, which a traced rep's `zconvert` lines beside
+its `zhot` lines named in one reading. The move is free now where a
+question that needs no evidence says yes, the room's: the forms' bytes
+with the move's own fit the fill, sizes alone; past that it pays the
+rent. The rule: a price set to nothing takes with it whatever else the
+price was doing, so what it guarded against is named first and given a
+guard of its own; and a decision excused from evidence is made on a
+question that needs none.
 
 ## Standing limitations
 

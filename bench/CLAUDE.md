@@ -485,7 +485,12 @@ either: a queue of pairings started as one was cut by a restart twenty
 minutes in. What held every run after it was the run detached with
 `nohup` and the session waiting on it in the foreground, ten minutes a
 wait at most, one wait after another, with the queue's script skipping
-the pairings whose tables were already whole.
+the pairings whose tables were already whole. A restart of the session's
+worker takes a detached run with it all the same, twice in one morning,
+each time inside the second sitting of a pairing against a comparator at
+ten million keys, forty minutes a pairing: `RESUME=1 scripts/pair.sh`
+keeps a sitting whose table is whole and runs the other, so a restart
+costs the sitting in flight and not the pairing.
 
 **A stamp is the build's, a task has a limit, and a script a run reads is
 the run's.** One roster was cut three times in a morning and none of the
