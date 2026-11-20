@@ -2923,6 +2923,16 @@ fn one_pass(
     // store's, since a mix only adds to a key; what an engine adds for
     // an update is its own and is not held to. `size` scans a thread, as
     // above.
+    // A probe's fold before these scans (`SUPDB_SCAN_MIXED_FOLD`,
+    // `Engine::fold`): the store the mixes leave with nothing overlaid, so
+    // that the scans' rate over the files the mixes' merges wrote is read
+    // apart from what a scan pays for the keys left unsealed. Its time on a
+    // `scanfold` line. Never set for a row.
+    if passes.scan_mixed && std::env::var_os("SUPDB_SCAN_MIXED_FOLD").is_some() {
+        let t = std::time::Instant::now();
+        e.fold()?;
+        eprintln!("scanfold {arm} ms {:.0}", t.elapsed().as_secs_f64() * 1e3);
+    }
     let mut scan_mixed_threaded = Vec::with_capacity(plan.threads.len());
     for &threads in &plan.threads {
         if !passes.scan_mixed {

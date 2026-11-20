@@ -8982,6 +8982,12 @@ impl StrideBody {
     /// that fails `good` and the key left as it was. Whether the step wrote
     /// the field alone (`direct`, a sparse form's under
     /// `Options::zpages_stride_step_direct`), which its callers count.
+    ///
+    /// Inline, as the number's read is and with the value's (`values_at`):
+    /// a walk calls each once a record with the same check of a page
+    /// (`good`), and out of line that check is a call through a pointer a
+    /// record where inlined it is a bit's test.
+    #[inline]
     pub(super) fn step_key(
         &self,
         file: &[u8],
@@ -9018,6 +9024,7 @@ impl StrideBody {
     /// the file the body was opened over, whose length the open held to the
     /// layout's (`StrideBody::open`), every value page inside it: a slot of a
     /// rank of the run lies in it, and is indexed where it lies.
+    #[inline]
     pub(super) fn values_at<'f>(
         &self,
         file: &'f [u8],

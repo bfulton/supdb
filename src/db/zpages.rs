@@ -4618,13 +4618,15 @@ impl KeyKind {
     }
 }
 
-/// The sixteen hex digits of `x`, most significant first, its letters from
-/// `a` (`b'a'` or `b'A'`): each half's eight nibbles spread a byte apiece by
-/// three shifts and masks, then every byte made its digit at once -- a byte
-/// of ten or more carries into its bit four when six is added, and that bit
-/// times the letters' distance from the digits is what a letter adds.
+/// The sixteen hex digits of `x` as two words of eight, the first eight in
+/// `.0`, each word's bytes from its top the digits in order; the letters
+/// from `a` (`b'a'` or `b'A'`). Each half's eight nibbles are spread a byte
+/// apiece by three shifts and masks, then every byte made its digit at
+/// once: a byte of ten or more carries into its bit four when six is added,
+/// and that bit times the letters' distance from the digits is what a
+/// letter adds.
 #[inline]
-pub(crate) fn hex16(x: u64, a: u8) -> [u8; 16] {
+fn hex16_words(x: u64, a: u8) -> (u64, u64) {
     #[inline]
     fn spread(v: u32) -> u64 {
         let mut y = u64::from(v);
@@ -4637,20 +4639,22 @@ pub(crate) fn hex16(x: u64, a: u8) -> [u8; 16] {
         let ten = ((y + 0x0606_0606_0606_0606) >> 4) & 0x0101_0101_0101_0101;
         y + 0x3030_3030_3030_3030 + ten * u64::from(a - b'0' - 10)
     }
-    let mut out = [0u8; 16];
-    out[..8].copy_from_slice(&ascii(spread((x >> 32) as u32), a).to_be_bytes());
-    out[8..].copy_from_slice(&ascii(spread(x as u32), a).to_be_bytes());
-    out
+    (
+        ascii(spread((x >> 32) as u32), a),
+        ascii(spread(x as u32), a),
+    )
 }
 
-/// The eight decimal digits of `v`, below 10^8, most significant first: the
-/// number halved into two of four digits, each into two of two and each of
-/// those into two of one, every divide a multiply and a shift that is exact
-/// over the range its lane holds (`n * 5243 >> 19` for `n / 100` below ten
-/// thousand, `n * 103 >> 10` for `n / 10` below a hundred), the lanes of one
-/// word so the three steps are three multiplies.
+/// The eight decimal digits of `v`, below 10^8, as a word whose bytes from
+/// its top are the digits in order: the number halved into two of four
+/// digits, each into two of two and each of those into two of one, every
+/// divide a multiply and a shift that is exact over the range its lane
+/// holds (`n * 5243 >> 19` for `n / 100` below ten thousand, `n * 103 >>
+/// 10` for `n / 10` below a hundred), the lanes of one word so the three
+/// steps are three multiplies. The lanes come out with the first digit in
+/// the lowest byte, and the word is turned end for end.
 #[inline]
-fn dec8(v: u32) -> [u8; 8] {
+fn dec8(v: u32) -> u64 {
     debug_assert!(v < 100_000_000);
     let v = u64::from(v);
     let hi = v / 10_000;
@@ -4659,17 +4663,48 @@ fn dec8(v: u32) -> [u8; 8] {
     x = q | ((x - q * 100) << 16);
     let q = ((x * 103) >> 10) & 0x000F_000F_000F_000F;
     x = q | ((x - q * 10) << 8);
-    (x + 0x3030_3030_3030_3030).to_le_bytes()
+    (x + 0x3030_3030_3030_3030).swap_bytes()
 }
 
-/// The sixteen decimal digits of `x`, below 10^16, most significant first.
+/// The sixteen decimal digits of `x`, below 10^16, as two words of eight,
+/// as `hex16_words` has a number's hex digits.
 #[inline]
-pub(crate) fn dec16(x: u64) -> [u8; 16] {
+fn dec16_words(x: u64) -> (u64, u64) {
     debug_assert!(x < 10_000_000_000_000_000);
     let hi = x / 100_000_000;
+    (dec8(hi as u32), dec8((x - hi * 100_000_000) as u32))
+}
+
+/// The last `field.len()` of sixteen digits held as two words
+/// (`hex16_words`, `dec16_words`), written over `field`, at most sixteen
+/// bytes: each store a whole word from a register -- two that overlap for
+/// a field of eight to fifteen digits, its first eight bytes cut from the
+/// two words and its last eight the second word -- so that nothing loads a
+/// digit back before the key is read. A field under eight digits is the
+/// second word's last bytes.
+#[inline]
+fn put_digits(field: &mut [u8], hi: u64, lo: u64) {
+    let d = field.len();
+    debug_assert!(d <= 16);
+    if d >= 16 {
+        field[..8].copy_from_slice(&hi.to_be_bytes());
+        field[8..16].copy_from_slice(&lo.to_be_bytes());
+    } else if d >= 8 {
+        let both = (u128::from(hi) << 64) | u128::from(lo);
+        let first = (both >> (8 * (d - 8))) as u64;
+        field[..8].copy_from_slice(&first.to_be_bytes());
+        field[d - 8..].copy_from_slice(&lo.to_be_bytes());
+    } else {
+        field.copy_from_slice(&lo.to_be_bytes()[8 - d..]);
+    }
+}
+
+/// The sixteen digits of the two words, in order: a test's reading of them.
+#[cfg(test)]
+fn digits16((hi, lo): (u64, u64)) -> [u8; 16] {
     let mut out = [0u8; 16];
-    out[..8].copy_from_slice(&dec8(hi as u32));
-    out[8..].copy_from_slice(&dec8((x - hi * 100_000_000) as u32));
+    out[..8].copy_from_slice(&hi.to_be_bytes());
+    out[8..].copy_from_slice(&lo.to_be_bytes());
     out
 }
 
@@ -4937,10 +4972,12 @@ impl KeyCodec {
     /// key by, the prefix standing from the key before
     /// (`Options::zpages_stride_step_direct`). The bytes [`render`] writes
     /// after the prefix, and nothing else of them is shared with it: the
-    /// digits are made a word at a time (`hex16`, `dec16`) and stored
-    /// once, where `render`'s loop stores a byte a digit and its caller
-    /// then loads the key whole from those bytes, a load no store forwards.
-    /// A decimal field wider than sixteen digits goes by `render`'s loop.
+    /// digits are made a word at a time (`hex16_words`, `dec16_words`) and
+    /// stored from the two words where they lie (`put_digits`), no byte of
+    /// them through a buffer, where `render`'s loop stores a byte a digit
+    /// and its caller then loads the key whole from those bytes, a load no
+    /// store forwards. A decimal field wider than sixteen digits goes by
+    /// `render`'s loop.
     ///
     /// [`render`]: KeyCodec::render
     #[inline]
@@ -4950,10 +4987,12 @@ impl KeyCodec {
         let d = field.len();
         match self.kind {
             KeyKind::HexLower | KeyKind::HexUpper if d <= 16 => {
-                field.copy_from_slice(&hex16(x, self.kind.hex_a())[16 - d..]);
+                let (hi, lo) = hex16_words(x, self.kind.hex_a());
+                put_digits(field, hi, lo);
             }
             KeyKind::Decimal if d <= 16 => {
-                field.copy_from_slice(&dec16(x)[16 - d..]);
+                let (hi, lo) = dec16_words(x);
+                put_digits(field, hi, lo);
             }
             KeyKind::Decimal => {
                 let mut v = x;
@@ -10194,7 +10233,7 @@ mod tests {
         // Every eight digits, against a counter stepped in place.
         let mut digits = *b"00000000";
         for v in 0..100_000_000u32 {
-            assert_eq!(dec8(v), digits, "{v}");
+            assert_eq!(dec8(v).to_be_bytes(), digits, "{v}");
             for b in digits.iter_mut().rev() {
                 if *b == b'9' {
                     *b = b'0';
@@ -10222,7 +10261,7 @@ mod tests {
         }
         xs.extend((0..100_000).map(|_| rng.word() % top));
         for x in xs.into_iter().filter(|&x| x < top) {
-            assert_eq!(dec16(x), by_digit(x), "{x}");
+            assert_eq!(digits16(dec16_words(x)), by_digit(x), "{x}");
         }
         let hex_by_digit = |x: u64, a: u8| -> [u8; 16] {
             let mut out = [b'0'; 16];
@@ -10245,7 +10284,12 @@ mod tests {
         xs.extend((0..100_000).map(|_| rng.word()));
         for x in xs {
             for a in *b"aA" {
-                assert_eq!(hex16(x, a), hex_by_digit(x, a), "{x:#x} {}", a as char);
+                assert_eq!(
+                    digits16(hex16_words(x, a)),
+                    hex_by_digit(x, a),
+                    "{x:#x} {}",
+                    a as char
+                );
             }
         }
     }
