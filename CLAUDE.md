@@ -1215,6 +1215,27 @@ Those four were the count, and a store's reads through its compact form
 were not in it: a scan through a form was 370 instructions over the main
 line while this paragraph said nothing was, until the form itself went
 under a cipher and was counted (the compact form, below).
+`sh scripts/cost.sh BASE` is the count made one command: the six probes
+(the point read, the scan, the durable and the buffered ordered load, a
+writer's round and a merge) built at BASE from this tree's example
+sources and at the tree, each under callgrind, every function's own
+instructions side by side, and a failure where a function of
+`scripts/cost-hot.txt` gains past half an instruction an operation.
+Counted against the upstream head this branch merged, every probe read
+under it but the scan, eight instructions over, and no function of the
+scan's source had changed: two of upstream's (`forms_off_scan`,
+`scan_seek_seeded`) were inlined in upstream's build and called out of
+line in ours, the scan having grown with the cipher's work, so each
+call paid its frame for a test that answers no in a store in core. Each
+keeps its first test inline now and the rest out of line, and the scan
+reads fifty-two under. Two readings beside it were nothing: `scan_seek`
+fifteen over by its own count, which was upstream's out-of-line `flat`
+inlined into it, thirty-five a call gone; and `memset` 1.2 a key over in
+both loads, which was the reader table zeroed once a store by one `rep
+stosb`, that callgrind counts a byte an instruction. A move by function
+is read beside its callers' and callees' before it is read as a cost,
+and a function whose count moved with no change to its source is first
+asked whether the compiler stopped inlining it into a caller that grew.
 What it took, each a shape:
 
 The question rides a test the operation already makes. Every read looks

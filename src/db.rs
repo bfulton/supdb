@@ -27727,6 +27727,9 @@ impl Reader {
     /// partition's reader with where its first block walks through the
     /// reader, and to let go where it does not; elsewhere, and where the
     /// cursor's seek declines, `scan_seek` as before and no cursor.
+    /// The option's test is in the scan and the seek through the form
+    /// file's cursor out of line: called whole, every scan paid the call.
+    #[inline(always)]
     fn scan_seek_seeded<'a>(
         &'a self,
         seg: &'a Seg,
@@ -27735,18 +27738,27 @@ impl Reader {
         ahead: Option<usize>,
     ) -> (usize, bool, Option<zfile::ZCursor<'a>>) {
         if self.opts.zpages_seek_seeds && self.opts.zpages_scan_cursor && on {
-            if let Some(z) = self.zc(seg) {
-                if let Ok(c) = zfile::ZCursor::seek(&self.zmemo, z, seg.blob.for_zfile(), cursor) {
-                    let keys = seg.blob.keys();
-                    let rank = c.rank().min(keys);
-                    let same = rank < keys && c.key() == Some(cursor);
-                    self.zmemo_take();
-                    return (rank, same, Some(c));
-                }
+            if let Some(seeded) = self.scan_seek_by_cursor(seg, cursor) {
+                return seeded;
             }
         }
         let (rank, same) = self.scan_seek(seg, cursor, ahead);
         (rank, same, None)
+    }
+
+    #[inline(never)]
+    fn scan_seek_by_cursor<'a>(
+        &'a self,
+        seg: &'a Seg,
+        cursor: &[u8],
+    ) -> Option<(usize, bool, Option<zfile::ZCursor<'a>>)> {
+        let z = self.zc(seg)?;
+        let c = zfile::ZCursor::seek(&self.zmemo, z, seg.blob.for_zfile(), cursor).ok()?;
+        let keys = seg.blob.keys();
+        let rank = c.rank().min(keys);
+        let same = rank < keys && c.key() == Some(cursor);
+        self.zmemo_take();
+        Some((rank, same, Some(c)))
     }
 
     /// The rank of the first of `seg`'s keys not below `cursor`, and
@@ -30507,15 +30519,27 @@ impl Reader {
     /// its start: forms given up where recent scans' start blocks recur
     /// under an eighth of the time out of core, and taken back where they
     /// recur over a quarter or the store is back in core.
+    #[inline]
     fn forms_off_scan(&self, from: &[u8]) -> bool {
         // The writer's own scans alone, and only while no handle the
         // caller holds is live: the forms are published for the handles,
         // whose reads of one block across threads are a reuse no handle's
         // own starts show (the threaded scans beside the mixes read 0.85x
-        // with every handle keeping none).
+        // with every handle keeping none). The test is in the scan and
+        // the rest out of line: called whole, the scan paid the call.
         if !self.opts.scan_forms_off_unreused || self.slot.is_some() {
             return false;
         }
+        // Out of the compact form's gate with the forms kept, the answer is
+        // no and nothing is left to do: the store in core, every scan.
+        if self.shared.zgate.load() != zselect::GATE_Z && !self.forms_off_now.get() {
+            return false;
+        }
+        self.forms_off_scan_writer(from)
+    }
+
+    #[inline(never)]
+    fn forms_off_scan_writer(&self, from: &[u8]) -> bool {
         let off = self.forms_off_now.get();
         // The flip a test asks for reaches the writer off beside a live
         // handle too, which a claim makes until the writer's next commit.
