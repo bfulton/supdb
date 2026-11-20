@@ -3876,20 +3876,6 @@ impl ZFile {
                     "a sampled value page's slot is not the segment's key at its rank",
                 ));
             }
-            // And the key found where it is: a sparse form's samples and
-            // the error it searches within, at the sampled ranks, the
-            // segment's own key the one looked for.
-            if let Some(key) = blob.key_at(rank as usize) {
-                match body.rank_of(bytes, key, &mut |q| body.page_ok(bytes, q)) {
-                    Ok(Some(r)) if r == rank => {}
-                    Ok(_) => {
-                        return Err(identity(
-                            "a sampled key is not found at its rank by the form's search",
-                        ))
-                    }
-                    Err(_) => return Err(damage(ZError::PageCrc)),
-                }
-            }
         }
         Ok(StrideAttached {
             body,
@@ -8149,22 +8135,19 @@ fn write_stride(
                 // what the field holds.
                 None => codec.base() + r as u64,
                 // A run with gaps: the key's own number, which the rule
-                // below holds its rendering to, above the number before
-                // it and, at the two ends, the numbers the precheck read
-                // there -- what makes the numbers the file holds the keys
-                // in their order, and the trailer's two ends theirs.
-                Some(last) => {
+                // below holds its rendering to. The numbers ascend as the
+                // keys do, a rendering being in the keys' order
+                // (`KeyCodec`), from the codec's base, the first key's; a
+                // file whose numbers did not would be refused by its own
+                // pages at the read-back (`StrideBody::page_ok`).
+                Some(_) => {
                     let x = decoded.ok_or(StrideNo::NotShaped)?;
-                    let at_end = if r == 0 {
-                        x == codec.base()
-                    } else if r + 1 == nkeys {
-                        x == last
-                    } else {
-                        x < last
-                    };
-                    if !at_end || numbers.last().is_some_and(|&before| before >= x) {
-                        return Err(StrideNo::Holes);
-                    }
+                    debug_assert!(
+                        numbers
+                            .last()
+                            .map_or(x == codec.base(), |&before| before < x),
+                        "rank {r}'s number is the base or above the one before"
+                    );
                     x
                 }
             };
@@ -8207,7 +8190,10 @@ fn write_stride(
     // A sparse form's numbers, a page of them at a time after the values,
     // each page's word into the row as a value page's goes; then, after
     // the row, the samples.
-    let sparse = sf.sparse_last.map(|last| StrideSparse {
+    // The last number is the walk's own last, which the precheck's read
+    // of the last key is where both read one key.
+    debug_assert_eq!(sf.sparse_last, numbers.last().copied());
+    let sparse = numbers.last().map(|&last| StrideSparse {
         last,
         eps: stride_eps(&numbers),
     });
@@ -8354,7 +8340,11 @@ enum StrideCheck {
 /// make and the codec's own test holds. As a leg it would refuse nothing
 /// the two do not and refuse what each of them is for, a guard no file
 /// reaches that leaves either of the two deletable with every damage still
-/// refused.
+/// refused. A sparse form's is its search too, and no leg for the same
+/// reason: the key leg reads every page of numbers through the check that
+/// holds its numbers ascending and its samples the samples
+/// (`StrideBody::page_ok`), and over pages so held the search is exact
+/// whatever the trailer says the line's error is (`StrideBody::search`).
 ///
 /// Whether the read-back read the device is the kernel's count of the
 /// file's pages it holds before the first byte is read, never the plan's
@@ -8383,7 +8373,6 @@ fn check_stride(
     }
     let mut verified = vec![false; body.checked_pages()];
     let mut kbuf = [0u8; STRIDE_KEY_MAX];
-    let searched = body.sparse().is_some();
     for r in 0..images.records() {
         if !each(r) {
             return Ok(StrideCheck::Refused(Outcome::Cancelled));
@@ -8403,15 +8392,6 @@ fn check_stride(
             return Ok(refused);
         }
         if body.key_at_into(bytes, rank, &mut kbuf, &mut good) != Ok(Some(key)) {
-            return Ok(refused);
-        }
-        // A sparse form's third quantity: the rank its search finds the
-        // key at. For a whole run that is the codec's inverse of the
-        // rendering the key leg holds; for a sparse one it is the samples
-        // and the line's error against the numbers, which nothing else
-        // reads and no reader can check short of this walk
-        // (`StrideSparse::eps`).
-        if searched && body.rank_of(bytes, key, &mut good) != Ok(Some(rank)) {
             return Ok(refused);
         }
     }
@@ -8578,7 +8558,8 @@ impl StrideBody {
     }
 
     /// What a sparse form holds of its keys, or `None` for a form whose
-    /// keys are a whole run.
+    /// keys are a whole run: a test's look at the trailer's word.
+    #[cfg(test)]
     pub(super) fn sparse(&self) -> Option<StrideSparse> {
         self.trailer.sparse
     }
@@ -8663,8 +8644,9 @@ impl StrideBody {
 
     /// Whether page `p` of `file` is the page the row says, and, for a
     /// page of a sparse form's numbers, a page a search may read: its
-    /// numbers ascend, each rank of it that is a sample is that sample,
-    /// the form's first number is the codec's base and its last the
+    /// numbers ascend, each rank of it that is a sample is that sample --
+    /// the first of all the codec's base with them, which the samples
+    /// begin at (`StrideBody::with_row`) -- the form's last number is the
     /// trailer's, and nothing follows the last. The CRC alone would let a
     /// file whose samples and numbers disagree, each under a good
     /// checksum, send a key's search to a run the key is not in and answer
@@ -8691,9 +8673,6 @@ impl StrideBody {
             return false;
         }
         if words[held..].iter().any(|w| *w != [0u8; 8]) {
-            return false;
-        }
-        if first == 0 && number(0) != self.trailer.codec.base() {
             return false;
         }
         if first + held as u64 == n && number(held - 1) != sp.last {
@@ -15946,6 +15925,446 @@ mod tests {
             "{made:?}"
         );
         stride_agrees(&fx);
+    }
+
+    /// `n` keys of sixteen lowercase hex digits whose numbers lie in a
+    /// corner of the field but for the last hundred: the first of them a
+    /// few apart from zero up and the rest spread over the top half, so
+    /// that the straight line through the first number and the last is
+    /// wrong for nearly every one by most of the samples -- the spread a
+    /// search's guess is worst for.
+    fn cornered_recs(n: usize, seed: u64) -> Vec<Rec> {
+        let mut rng = Rng(seed | 1);
+        let low = n - 100;
+        (0..n)
+            .map(|i| {
+                let x = if i < low {
+                    7 + 3 * i as u64
+                } else {
+                    (1 << 63) + ((i - low) as u64) * ((1 << 56) + 1)
+                };
+                (
+                    format!("{x:016x}").into_bytes(),
+                    vec![rng.bytes(100)],
+                    false,
+                )
+            })
+            .collect()
+    }
+
+    /// The read-back before the name holds a sparse file's account of its
+    /// keys -- the numbers after the values, the samples after the row, the
+    /// two ends in the trailer -- to the keys it was written from, each
+    /// damage forged under good checksums so that only a check behind them
+    /// reaches it: a number changed and still in order, which the key at
+    /// its rank says; a number out of order, a sample that is not its
+    /// number, a byte past the last number, a last number that is not the
+    /// trailer's, each of which the page's first touch says
+    /// (`StrideBody::page_ok`); and samples out of order or not from the
+    /// first number, which the body refuses whole. The line's error is not
+    /// among them: understated to nothing or overstated to every sample it
+    /// costs a search more and answers every key the same, over a spread
+    /// the line is as wrong for as it gets, which is what lets a reader
+    /// take the trailer's word for it.
+    #[test]
+    fn the_read_back_holds_a_sparse_files_numbers_and_samples_to_its_keys() {
+        let fx = Fixture::new("sparse-check", cornered_recs(1500, 0x5d), 1 << 16);
+        let facts = precheck_sparse_of(&fx).unwrap();
+        let lay = facts.layout;
+        // Three pages of numbers after thirty-seven of values, and a
+        // sample at every sixty-fourth rank.
+        assert_eq!((lay.v_pages, lay.k_pages, lay.samples), (37, 3, 24));
+        type Damage = (&'static str, fn(&Path), bool);
+        // Rank 517 is on the second page of numbers, page 38 of the file.
+        fn number_at(b: &[u8], l: &StrideLayout, rank: usize) -> u64 {
+            let at = l.k_off() as usize + 8 * rank;
+            u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+        }
+        fn set_number(b: &mut [u8], l: &StrideLayout, rank: usize, x: u64) {
+            let at = l.k_off() as usize + 8 * rank;
+            b[at..at + 8].copy_from_slice(&x.to_le_bytes());
+        }
+        fn sample_at(b: &[u8], l: &StrideLayout, i: usize) -> u64 {
+            let at = l.samples_off() as usize + 8 * i;
+            u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+        }
+        fn set_sample(b: &mut [u8], l: &StrideLayout, i: usize, x: u64) {
+            let at = l.samples_off() as usize + 8 * i;
+            b[at..at + 8].copy_from_slice(&x.to_le_bytes());
+        }
+        let damages: [Damage; 11] = [
+            (
+                "a number, in order",
+                |p| {
+                    forge_stride(p, Some(38), |b, _, l| {
+                        let x = number_at(b, l, 517);
+                        assert!(x + 1 < number_at(b, l, 518));
+                        set_number(b, l, 517, x + 1)
+                    })
+                },
+                true,
+            ),
+            (
+                "a number, out of order",
+                |p| {
+                    forge_stride(p, Some(38), |b, _, l| {
+                        let next = number_at(b, l, 518);
+                        set_number(b, l, 517, next + 1)
+                    })
+                },
+                true,
+            ),
+            (
+                "a number that is a sample",
+                |p| {
+                    forge_stride(p, Some(38), |b, _, l| {
+                        // Rank 576, the ninth sample: moved inside its gap.
+                        let x = number_at(b, l, 576);
+                        set_number(b, l, 576, x + 1)
+                    })
+                },
+                true,
+            ),
+            (
+                "a sample",
+                |p| {
+                    forge_stride(p, None, |b, _, l| {
+                        let x = sample_at(b, l, 3);
+                        assert!(x + 1 < sample_at(b, l, 4));
+                        set_sample(b, l, 3, x + 1)
+                    })
+                },
+                true,
+            ),
+            (
+                "the samples out of order",
+                |p| {
+                    forge_stride(p, None, |b, _, l| {
+                        let (x, y) = (sample_at(b, l, 3), sample_at(b, l, 4));
+                        set_sample(b, l, 3, y);
+                        set_sample(b, l, 4, x);
+                    })
+                },
+                true,
+            ),
+            (
+                "the first sample",
+                |p| {
+                    forge_stride(p, None, |b, _, l| {
+                        let x = sample_at(b, l, 0);
+                        set_sample(b, l, 0, x - 1)
+                    })
+                },
+                true,
+            ),
+            (
+                "a byte past the last number",
+                |p| {
+                    forge_stride(p, Some(39), |b, _, l| {
+                        let at = l.k_off() as usize + 8 * 1500;
+                        assert!(at < l.res_off as usize);
+                        b[at] = 1;
+                    })
+                },
+                true,
+            ),
+            (
+                "the last number in the trailer",
+                |p| {
+                    forge_stride(p, None, |_, t, _| {
+                        let sp = t.sparse.unwrap();
+                        t.sparse = Some(StrideSparse {
+                            last: sp.last + 1,
+                            ..sp
+                        })
+                    })
+                },
+                true,
+            ),
+            (
+                "a number page's word of the row",
+                |p| {
+                    // The row's last word, the last page of numbers', with
+                    // the resident part's CRC made good over it: the page
+                    // no longer the one its word says.
+                    forge_stride(p, None, |b, _, l| {
+                        b[(l.res_off + l.row_len()) as usize - 1] ^= 1
+                    })
+                },
+                true,
+            ),
+            (
+                "the line's error, none",
+                |p| {
+                    forge_stride(p, None, |_, t, _| {
+                        let sp = t.sparse.unwrap();
+                        assert!(sp.eps > 4, "a spread the line is wrong for: {}", sp.eps);
+                        t.sparse = Some(StrideSparse { eps: 0, ..sp })
+                    })
+                },
+                false,
+            ),
+            (
+                "the line's error, every sample",
+                |p| {
+                    forge_stride(p, None, |_, t, _| {
+                        let sp = t.sparse.unwrap();
+                        t.sparse = Some(StrideSparse { eps: 24, ..sp })
+                    })
+                },
+                false,
+            ),
+        ];
+        for (name, damage, refused) in damages {
+            let _ = std::fs::remove_file(&fx.out);
+            let cell = AtomicU8::new(0);
+            let plan = BuildPlan {
+                damage: Some(damage),
+                ..sparse_plan(StrideAsk::Only)
+            };
+            let made = build(&fx.seg, &fx.out, ID, END, &plan).unwrap();
+            made.note_stride(&cell);
+            if !refused {
+                assert!(matches!(made, Outcome::Built(_)), "{name}: {made:?}");
+                // Every key found, every key beside the run's absent, and
+                // every seek the keys' own, by the body and by the file a
+                // store attaches.
+                let body = stride_agrees(&fx);
+                assert!(body.sparse().is_some(), "{name}");
+                let zfile = fx.attach().unwrap_or_else(|e| panic!("{name}: {e:?}"));
+                agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
+                assert!(!zfile.damaged(), "{name}");
+                continue;
+            }
+            assert!(
+                matches!(made, Outcome::NotStride(StrideNo::SelfCheck)),
+                "{name}: {made:?}"
+            );
+            assert!(!fx.out.exists(), "{name}: nothing named");
+            assert!(!tmp_of(&fx.out).exists(), "{name}: nothing left");
+            assert_eq!(cell.load(Ordering::Relaxed), StrideNo::SelfCheck.code());
+            let plan = BuildPlan {
+                damage: Some(damage),
+                ..sparse_plan(StrideAsk::OrBlock)
+            };
+            let made = build(&fx.seg, &fx.out, ID, END, &plan).unwrap();
+            let Outcome::Built(b) = made else {
+                panic!("{name}: {made:?}")
+            };
+            assert_eq!(
+                (b.coding, b.stride_no),
+                (FileCoding::Block, Some(StrideNo::SelfCheck)),
+                "{name}"
+            );
+            let zfile = fx.attach().expect("the block file attaches");
+            agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
+        }
+    }
+
+    /// Each thing a sparse file's samples and its pages of numbers are held
+    /// to, alone: a file forged under good checksums so that one clause and
+    /// no other is what it fails. The samples, where the body is taken from
+    /// the bytes: not from the first key's number, not ascending -- two out
+    /// of order, two equal -- and past the last key's number, and a byte
+    /// between the row and the samples where the row's words end off a
+    /// multiple of eight. A page of numbers, at its check, with every other
+    /// page passing: two numbers out of order, two equal, a number that is
+    /// a sample moved and still in order, a byte past the last number, and
+    /// a last number that is not the trailer's. The read-back refuses most
+    /// of these by another route as well, the key at a rank
+    /// (`the_read_back_holds_a_sparse_files_numbers_and_samples_to_its_keys`);
+    /// a reader of a file found on disk has only these.
+    #[test]
+    fn a_sparse_files_samples_and_pages_of_numbers_are_held_clause_by_clause() {
+        let fx = Fixture::new("sparse-clauses", id_recs(1500, 100, 0x61, false), 1 << 16);
+        assert_eq!(fx.recs.len(), 1500, "distinct ids");
+        sparse_built(&fx);
+        let good = std::fs::read(&fx.out).unwrap();
+        let body = StrideBody::from_bytes(&good).unwrap();
+        let (v, pages) = (body.pages() as u32, body.checked_pages() as u32);
+        assert_eq!(pages, v + 3, "three pages of numbers");
+        assert!((0..pages).all(|p| body.page_ok(&good, p)));
+        let last = body.sparse().unwrap().last;
+        type Edit = fn(&mut [u8], &mut StrideTrailer, &StrideLayout);
+        let forged = |reword: Option<u32>, edit: Edit| -> Vec<u8> {
+            std::fs::write(&fx.out, &good).unwrap();
+            forge_stride(&fx.out, reword, edit);
+            std::fs::read(&fx.out).unwrap()
+        };
+        fn word(b: &[u8], at: u64) -> u64 {
+            u64::from_le_bytes(b[at as usize..at as usize + 8].try_into().unwrap())
+        }
+        fn put(b: &mut [u8], at: u64, x: u64) {
+            b[at as usize..at as usize + 8].copy_from_slice(&x.to_le_bytes());
+        }
+        // The samples.
+        let samples: [(&str, Edit); 4] = [
+            ("not from the first number", |b, _, l| {
+                let at = l.samples_off();
+                let x = word(b, at);
+                put(b, at, x - 1)
+            }),
+            ("two out of order", |b, _, l| {
+                let at = l.samples_off() + 8 * 3;
+                let (x, y) = (word(b, at), word(b, at + 8));
+                put(b, at, y);
+                put(b, at + 8, x);
+            }),
+            ("two equal", |b, _, l| {
+                let at = l.samples_off() + 8 * 3;
+                let x = word(b, at);
+                put(b, at + 8, x)
+            }),
+            ("past the last number", |b, t, l| {
+                let at = l.samples_off() + 8 * (l.samples - 1);
+                put(b, at, t.sparse.unwrap().last + 1)
+            }),
+        ];
+        let no = ZError::Resident("the samples are not the first number ascending to the last");
+        for (name, edit) in samples {
+            let b = forged(None, edit);
+            assert_eq!(StrideBody::from_bytes(&b).err(), Some(no), "{name}");
+        }
+        // The pages of numbers: `v`, `v + 1` and `v + 2`.
+        let pages_of: [(&str, u32, Option<u32>, Edit); 6] = [
+            ("two out of order", 1, Some(1), |b, _, l| {
+                let at = l.k_off() + 8 * 517;
+                let (x, y) = (word(b, at), word(b, at + 8));
+                put(b, at, y);
+                put(b, at + 8, x);
+            }),
+            ("two equal", 1, Some(1), |b, _, l| {
+                let at = l.k_off() + 8 * 517;
+                let x = word(b, at);
+                put(b, at + 8, x)
+            }),
+            ("a sample's number moved", 1, Some(1), |b, _, l| {
+                let at = l.k_off() + 8 * 576;
+                let x = word(b, at);
+                assert!(x + 1 < word(b, at + 8));
+                put(b, at, x + 1)
+            }),
+            ("a byte past the last number", 2, Some(2), |b, _, l| {
+                let at = l.k_off() + 8 * 1500;
+                assert!(at < l.res_off);
+                b[at as usize + 3] = 1
+            }),
+            ("the last number moved", 2, Some(2), |b, _, l| {
+                let at = l.k_off() + 8 * 1499;
+                let x = word(b, at);
+                put(b, at, x + 1)
+            }),
+            ("the trailer's last number moved", 2, None, |_, t, _| {
+                let sp = t.sparse.unwrap();
+                t.sparse = Some(StrideSparse {
+                    last: sp.last + 1,
+                    ..sp
+                })
+            }),
+        ];
+        assert!(last < u64::MAX);
+        for (name, k, reword, edit) in pages_of {
+            let b = forged(reword.map(|p| v + p), edit);
+            let body = StrideBody::from_bytes(&b)
+                .unwrap_or_else(|e| panic!("{name}: every checksum is good: {e:?}"));
+            for p in 0..pages {
+                assert_eq!(body.page_ok(&b, p), p != v + k, "{name}: page {p}");
+            }
+        }
+        // A byte between the row and the samples: a file whose row's words
+        // end off a multiple of eight, thirty-two pages of values and three
+        // of numbers.
+        let odd = Fixture::new("sparse-odd-row", id_recs(1300, 100, 0x62, false), 1 << 16);
+        sparse_built(&odd);
+        let lay = StrideBody::from_bytes(&std::fs::read(&odd.out).unwrap())
+            .unwrap()
+            .trailer()
+            .layout()
+            .unwrap();
+        assert_eq!(lay.row_len() % 8, 4, "{lay:?}");
+        forge_stride(&odd.out, None, |b, _, l| {
+            b[(l.res_off + l.row_len()) as usize + 1] = 1
+        });
+        assert_eq!(
+            StrideBody::from_bytes(&std::fs::read(&odd.out).unwrap()).err(),
+            Some(ZError::Resident(
+                "a byte between the row and the samples is not zero"
+            ))
+        );
+    }
+
+    /// A sample that says a run begins later than it does, in a file whose
+    /// every checksum is good, sends the keys from the run's true first
+    /// number up to the sample's to the run before, which does not hold
+    /// them. The search does not answer them absent: a key above a whole
+    /// run is held to the next run's first number where it lies, and that
+    /// page's first touch finds the sample is not its number. The run
+    /// before, on a page of its own, answers as it did; the key the sample
+    /// lies about and a key in the gap below it are a page that failed, the
+    /// raw form's to answer. Forged at a page's first number, the one
+    /// sample whose run is on a page the misled search does not read.
+    #[test]
+    fn a_sample_that_lies_under_good_checksums_is_refused_and_never_an_absence() {
+        let fx = Fixture::new(
+            "sparse-sample-lie",
+            id_recs(1500, 100, 0x5f, false),
+            1 << 16,
+        );
+        assert_eq!(fx.recs.len(), 1500, "distinct ids");
+        sparse_built(&fx);
+        // Sample 8 is rank 512, the first number of the second page of
+        // numbers: raised by one, still below the next sample.
+        forge_stride(&fx.out, None, |b, _, l| {
+            let at = l.samples_off() as usize + 8 * 8;
+            let x = u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+            b[at..at + 8].copy_from_slice(&(x + 1).to_le_bytes());
+        });
+        let bytes = std::fs::read(&fx.out).unwrap();
+        let body = StrideBody::from_bytes(&bytes).expect("every checksum is good");
+        let v = body.pages() as u32;
+        let mut touched = Vec::new();
+        let mut good = |p: u32| {
+            touched.push(p);
+            body.page_ok(&bytes, p)
+        };
+        // The last key of the first page of numbers, in the run before the
+        // lie: found, on its own page.
+        assert_eq!(
+            body.rank_of(&bytes, &fx.recs[511].0, &mut good),
+            Ok(Some(511))
+        );
+        // The key at rank 512: the samples send it to the run before, the
+        // run does not hold it, and the next run's first number is on the
+        // page whose sample lies.
+        assert_eq!(body.rank_of(&bytes, &fx.recs[512].0, &mut good), Err(v + 1));
+        // A key in the gap between the two runs, which the form does not
+        // hold: not absent on the samples' word, but the same page's
+        // failure.
+        let codec = *body.codec();
+        let mut kbuf = [0u8; STRIDE_KEY_MAX];
+        let between = codec.decode(&fx.recs[511].0).unwrap() + 1;
+        assert!(between < codec.decode(&fx.recs[512].0).unwrap());
+        let gap = codec.render(between, &mut kbuf).to_vec();
+        assert_eq!(body.rank_of(&bytes, &gap, &mut good), Err(v + 1));
+        assert_eq!(body.lower_bound(&bytes, &gap, &mut good), Err(v + 1));
+        // A key further into the second page's first run is sent there, and
+        // the page fails as itself.
+        assert_eq!(body.rank_of(&bytes, &fx.recs[530].0, &mut good), Err(v + 1));
+        assert!(
+            touched.contains(&v) && touched.contains(&(v + 1)),
+            "{touched:?}"
+        );
+        // Through a file a store attaches the lie is damage wherever the
+        // attach's sample reads the page, and a fallback to the raw form
+        // where it does not: every key the raw form's answer, none absent.
+        match fx.attach() {
+            Err(Reject::Damage(_)) => {}
+            Err(e) => panic!("{e:?}"),
+            Ok(zfile) => {
+                agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
+                assert!(zfile.damaged(), "the page's failure took the file out");
+            }
+        }
     }
 
     /// The body refuses bytes its trailer does not describe, each check

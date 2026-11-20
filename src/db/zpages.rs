@@ -5025,8 +5025,10 @@ pub struct StrideSparse {
     /// number ([`stride_eps`]): a search of the samples from that many
     /// before the guess to that many after it misses none. A count the
     /// builder made and no reader can check short of reading every number,
-    /// so the build reads every key back through the search before the
-    /// file has a name.
+    /// so a reader takes it for where to look first and never for where
+    /// the number is: a window that does not bracket the number is left
+    /// for a search of every sample, and a wrong count costs that search
+    /// and no answer.
     pub eps: u32,
 }
 
@@ -10642,6 +10644,19 @@ mod tests {
         assert_eq!(
             shape(KeyCodec::detect_any(b"19", b"20", 5, all, &[])),
             Ok((KeyKind::HexLower, Vec::new(), 2, 0x19, false))
+        );
+        // And whatever the order the kinds are asked in: with the bytes
+        // before the digits, the bytes count a run with gaps first and the
+        // digits the whole run after, and the whole run is the answer.
+        assert_eq!(
+            shape(KeyCodec::detect_any(
+                b"19",
+                b"20",
+                2,
+                &[KeyKind::BigEndian, KeyKind::Decimal],
+                &[]
+            )),
+            Ok((KeyKind::Decimal, Vec::new(), 2, 19, true))
         );
         // Keys read from inside the run say which kind the ends cannot:
         // ends of digits around a key with a letter are a hex run, of
