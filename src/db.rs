@@ -606,6 +606,9 @@ pub struct ZCounts {
     pub stride_reads: u64,
     pub stride_page_checks: u64,
     pub stride_cursor_reads: u64,
+    /// Keys the walks of a sparse stride form stepped by writing the next
+    /// key's field (`Options::zpages_stride_step_direct`).
+    pub stride_direct_steps: u64,
     /// Pages decoded to answer them: one for each read or count of a key
     /// that falls in a page's range, the key the page holds and the key it
     /// does not alike, unless the thread's memo holds the group from a
@@ -675,6 +678,9 @@ pub struct ZCounts {
     /// (`Options::zpages_bulk_ahead`).
     pub scan_views: u64,
     pub group_aheads: u64,
+    /// The fence entries the cursor walks stepped to from the entry before
+    /// with no search of the fence (`Options::zpages_cursor_steps`).
+    pub cursor_steps: u64,
     /// Form files built, their pages, bytes, the pages that hold their
     /// group verbatim, the decoded bytes of every group, and compress
     /// calls; builds that failed and builds a merge outran.
@@ -1844,6 +1850,34 @@ pub struct Options {
     /// 1.25 GiB. `supdb-zbulksearch` searches and asks twice, the shape
     /// before.
     pub zpages_bulk_steps: bool,
+    /// EXPERIMENT: the block path's cursor over a form file
+    /// (`zfile::ZCursor`) steps the fence to the next entry where its walk
+    /// ran off the end of one, as the bulk walk does (`zpages_bulk_steps`):
+    /// the cursor's `next_group` at a page's last record placed itself by
+    /// the rank, a binary search over the fence's first ranks at every page
+    /// a walk crossed. The bulk walk serves a partition with nothing
+    /// unsealed over it and the cursor every other -- each block of a
+    /// partition the write mixes have left a key in, the overlay walk and
+    /// the merge path -- so the store the mixes leave searched at every
+    /// page where the store as loaded stepped: a ninth of the cursor's own
+    /// time in a profile of the threaded scans after the mixes at ten
+    /// million random ids under 1.25 GiB. The steps are counted
+    /// (`ZPageCounts::cursor_steps`). Off; `supdb-zcursorsteps` is the arm.
+    #[doc(hidden)]
+    pub zpages_cursor_steps: bool,
+    /// EXPERIMENT: a walk of a sparse stride form steps its key by writing
+    /// the next key's field where it lies (`zpages::KeyCodec::render_field`):
+    /// the digits made a word at a time and stored once over the field, the
+    /// prefix standing from the key before. A sparse form holds each key's
+    /// number, so every record of a walk renders one, where a whole run's
+    /// walk adds one to the key in place; the step before rendered the whole
+    /// key a byte a digit into a buffer of its own and copied it over the
+    /// key, a load of sixteen bytes from sixteen stores of one that nothing
+    /// forwards -- a quarter of the threaded scan pass in the render and a
+    /// ninth in that copy, in a profile at ten million random ids under
+    /// 1.5 GiB. Off; `supdb-zsparsestep` is the arm.
+    #[doc(hidden)]
+    pub zpages_stride_step_direct: bool,
     /// EXPERIMENT: the bulk walk's own decode of the group it ends inside
     /// -- a first touch, decoded into the thread's buffer
     /// (`zpages_bulk_admit`) -- goes only as far as the records it reads,
@@ -6507,6 +6541,8 @@ impl Options {
             )
             .bulk_within(self.zpages_bulk_ahead_within)
             .bulk_steps(self.zpages_bulk_steps)
+            .cursor_steps(self.zpages_cursor_steps)
+            .stride_direct(self.zpages_stride_step_direct)
     }
 }
 
@@ -6603,6 +6639,8 @@ impl Default for Options {
             zpages_bulk_part: false,
             zpages_bulk_ahead_within: false,
             zpages_bulk_steps: true,
+            zpages_cursor_steps: false,
+            zpages_stride_step_direct: false,
             zpages_walk_part: true,
             zpages_cursor_view: true,
             zpages_group_ahead: true,
@@ -13834,6 +13872,9 @@ struct Slot {
     /// (`Options::zpages_cursor_view`, `Options::zpages_group_ahead`).
     zviews: AtomicU64,
     zaheads: AtomicU64,
+    /// The cursor walks' steps to the next fence entry
+    /// (`Options::zpages_cursor_steps`).
+    zsteps: AtomicU64,
     /// The census (`ZPages::Auto`, `zselect` S2): what this handle's
     /// windows summed, written by the handle alone at a window's close
     /// and read by the controller's tick, which differences them. By
@@ -13920,6 +13961,7 @@ impl Slot {
             zprefetches: AtomicU64::new(0),
             zviews: AtomicU64::new(0),
             zaheads: AtomicU64::new(0),
+            zsteps: AtomicU64::new(0),
             zcreads: AtomicU64::new(0),
             zcrflt: AtomicU64::new(0),
             zcscans: AtomicU64::new(0),
@@ -13942,17 +13984,20 @@ impl Slot {
     }
 }
 
-// Four lines: the nine words that were here, the second form's thirteen
+// Five lines: the nine words that were here, the second form's thirteen
 // counters and the census's seventeen sums, thirty-nine words, were a
-// 384-byte slot since the census, and the cursor's two counts (`zviews`,
-// `zaheads`) took it past forty-eight words into a fourth line. What the
-// layout is for is that no other thread writes a slot's lines, which four
-// lines a handle owns keep as one did; the first line's sixteen words
-// were full at the seventh second-form counter, the second's at the
-// census's third sum, the third's at the cursor's first count. The size
-// is pinned so that a counter added moves it here and not in a threaded
-// cell.
-const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() == 512);
+// 384-byte slot since the census, the cursor's two counts (`zviews`,
+// `zaheads`) took it past forty-eight words into a fourth line, and the
+// count of a sparse stride walk's keys stepped by the field
+// (`zstride.direct`), the word after the cursor's steps (`zsteps`) filled
+// the fourth, took it into a fifth. What the layout is for is that no
+// other thread writes a slot's lines, which the lines a handle owns keep
+// as one did; the first line's sixteen words were full at the seventh
+// second-form counter, the second's at the census's third sum, the
+// third's at the cursor's first count, the fourth's at its steps. The
+// size is pinned so that a counter added moves it here and not in a
+// threaded cell.
+const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() == 640);
 
 const READER_SLOTS: usize = 256;
 
@@ -24428,6 +24473,7 @@ impl Reader {
             stride_reads: rd.stat(|s| &s.zstride.reads),
             stride_page_checks: rd.stat(|s| &s.zstride.checks),
             stride_cursor_reads: rd.stat(|s| &s.zstride.cursor),
+            stride_direct_steps: rd.stat(|s| &s.zstride.direct),
             decodes: rd.stat(|s| &s.zdecodes),
             inplace_groups: rd.stat(|s| &s.zinplace),
             rawserves: rd.stat(|s| &s.zraw),
@@ -24464,6 +24510,7 @@ impl Reader {
             prefetches: rd.stat(|s| &s.zprefetches),
             scan_views: rd.stat(|s| &s.zviews),
             group_aheads: rd.stat(|s| &s.zaheads),
+            cursor_steps: rd.stat(|s| &s.zsteps),
             builds: get(&ev.builds),
             build_pages: get(&ev.build_pages),
             build_bytes: get(&ev.build_bytes),
@@ -25543,6 +25590,7 @@ impl Reader {
         self.zbump_by(|s| &s.zprefetches, c.prefetches);
         self.zbump_by(|s| &s.zviews, c.views);
         self.zbump_by(|s| &s.zaheads, c.aheads);
+        self.zbump_by(|s| &s.zsteps, c.steps);
     }
 
     /// `scan_merged` leaves the partition: a served walk with the groups
@@ -25566,6 +25614,7 @@ impl Reader {
                 self.zbump_by(|s| &s.zprefetches, c.prefetches);
                 self.zbump_by(|s| &s.zviews, c.views);
                 self.zbump_by(|s| &s.zaheads, c.aheads);
+                self.zbump_by(|s| &s.zsteps, c.steps);
                 if c.fell_back() {
                     self.zbump(|s| &s.zfallbacks);
                     self.zbump(|s| &s.zscans);

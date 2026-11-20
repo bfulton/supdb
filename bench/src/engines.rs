@@ -1702,6 +1702,14 @@ pub struct Supdb {
     /// (`Options::zpages_stride_sparse_waits`); `Some(false)` asks at the
     /// build, `supdb-zsparsebuild`; the engine's where `None`.
     zsparsewaits: Option<bool>,
+    /// The block path's cursor steps the fence to the next entry
+    /// (`Options::zpages_cursor_steps`): `supdb-zcursorsteps`; the engine's
+    /// where `None`.
+    zcursorsteps: Option<bool>,
+    /// A sparse stride walk steps its key by the field
+    /// (`Options::zpages_stride_step_direct`): `supdb-zsparsebuildstep`;
+    /// the engine's where `None`.
+    zstridestep: Option<bool>,
     /// A job's large per-key arrays mapped by the engine and unmapped at
     /// the job's end (`Options::jobs_mapped`): `supdb-jobsmapped`,
     /// `supdb-zstridealldropagainjobs`.
@@ -2830,6 +2838,15 @@ struct Policy {
     /// form for later (`Options::zpages_stride_sparse_waits`):
     /// `supdb-zsparsebuild` asks at the build, beside `supdb-zsparse`.
     zsparsewaits: Option<bool>,
+    /// The block path's cursor over a form file steps the fence to the
+    /// next entry where its walk ran off the end of one
+    /// (`Options::zpages_cursor_steps`): `supdb-zcursorsteps` beside
+    /// `supdb`.
+    zcursorsteps: Option<bool>,
+    /// A sparse stride form's walk writes the next key's field where it
+    /// lies (`Options::zpages_stride_step_direct`):
+    /// `supdb-zsparsebuildstep` beside `supdb-zsparsebuild`.
+    zstridestep: Option<bool>,
     /// The seals', merges' and closes' large per-key arrays as the
     /// engine's own mappings (`Options::jobs_mapped`): `supdb-jobsmapped`
     /// beside `supdb`, and `supdb-zstridealldropagainjobs` beside
@@ -3144,6 +3161,8 @@ impl Default for Policy {
             zconvdrop: None,
             zsparse: None,
             zsparsewaits: None,
+            zcursorsteps: None,
+            zstridestep: None,
             jobsmapped: false,
             jobsshort: false,
             zmemoslab: false,
@@ -4093,6 +4112,36 @@ impl Supdb {
             Policy {
                 zsparse: Some(true),
                 zsparsewaits: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-zsparsebuild` whose walks of a sparse form step a key by
+    /// writing the next key's field where it lies
+    /// (`Options::zpages_stride_step_direct`): `supdb-zsparsebuildstep`,
+    /// the one option more, priced where every partition is in the form.
+    pub fn create_zsparse_build_step(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zsparse: Some(true),
+                zsparsewaits: Some(false),
+                zstridestep: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// The engine whose block-path cursor over a form file steps the fence
+    /// to the next entry where its walk ran off the end of one
+    /// (`Options::zpages_cursor_steps`): `supdb-zcursorsteps`, beside
+    /// `supdb`, whose cursor searches the fence by rank at every page.
+    pub fn create_zcursor_steps(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zcursorsteps: Some(true),
                 ..Policy::default()
             },
         )
@@ -9365,6 +9414,8 @@ impl Supdb {
             zconvdrop,
             zsparse,
             zsparsewaits,
+            zcursorsteps,
+            zstridestep,
             jobsmapped,
             jobsshort,
             zmemoslab,
@@ -9935,6 +9986,10 @@ impl Supdb {
             zpages_stride_sparse: zsparse.unwrap_or(supdb::Options::default().zpages_stride_sparse),
             zpages_stride_sparse_waits: zsparsewaits
                 .unwrap_or(supdb::Options::default().zpages_stride_sparse_waits),
+            zpages_cursor_steps: zcursorsteps
+                .unwrap_or(supdb::Options::default().zpages_cursor_steps),
+            zpages_stride_step_direct: zstridestep
+                .unwrap_or(supdb::Options::default().zpages_stride_step_direct),
             jobs_mapped: jobsmapped,
             jobs_mapped_when_short: jobsshort,
             zpages_memo_slab: zmemoslab,
@@ -10311,6 +10366,8 @@ impl Supdb {
             zconvdrop,
             zsparse,
             zsparsewaits,
+            zcursorsteps,
+            zstridestep,
             jobsmapped,
             jobsshort,
             zmemoslab,
@@ -10685,11 +10742,17 @@ impl Engine for Supdb {
         if self.zrewarmbeside {
             return "supdb-zrewarmbeside";
         }
+        if self.zcursorsteps == Some(true) {
+            return "supdb-zcursorsteps";
+        }
         if self.zsparse == Some(true) {
-            return if self.zsparsewaits == Some(false) {
-                "supdb-zsparsebuild"
-            } else {
-                "supdb-zsparse"
+            return match (
+                self.zsparsewaits == Some(false),
+                self.zstridestep == Some(true),
+            ) {
+                (true, true) => "supdb-zsparsebuildstep",
+                (true, false) => "supdb-zsparsebuild",
+                (false, _) => "supdb-zsparse",
             };
         }
         if self.zconvdrop == Some(true) {
@@ -12193,6 +12256,7 @@ impl Engine for Supdb {
             ("zpage_stride_reads", z.stride_reads as f64),
             ("zpage_stride_page_checks", z.stride_page_checks as f64),
             ("zpage_stride_cursor_reads", z.stride_cursor_reads as f64),
+            ("zpage_stride_direct_steps", z.stride_direct_steps as f64),
             ("zpage_stride_builds", z.stride_builds as f64),
             ("zpage_stride_sparse_builds", z.stride_sparse_builds as f64),
             ("zpage_stride_no_not_shaped", not_shaped as f64),
@@ -12263,6 +12327,7 @@ impl Engine for Supdb {
             ("zpage_point_key_hits", z.point_key_hits as f64),
             ("zpage_prefetches", z.prefetches as f64),
             ("zpage_scan_views", z.scan_views as f64),
+            ("zpage_cursor_steps", z.cursor_steps as f64),
             ("zpage_group_aheads", z.group_aheads as f64),
             ("zpage_declined_small", z.declined_small as f64),
             ("zpage_declined_small_bytes", z.declined_small_bytes as f64),
@@ -13414,6 +13479,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zstridealldropagaincdrop"
         | "supdb-zsparse"
         | "supdb-zsparsebuild"
+        | "supdb-zsparsebuildstep"
+        | "supdb-zcursorsteps"
         | "supdb-jobsmapped"
         | "supdb-zstridealldropagainjobs"
         | "supdb-zmemoslab"
@@ -14459,6 +14526,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zstridealldropagain" => supdb_arm(Supdb::create_zstride_all_dropagain, dir)?,
         "supdb-zsparse" => supdb_arm(Supdb::create_zsparse, dir)?,
         "supdb-zsparsebuild" => supdb_arm(Supdb::create_zsparse_build, dir)?,
+        "supdb-zsparsebuildstep" => supdb_arm(Supdb::create_zsparse_build_step, dir)?,
+        "supdb-zcursorsteps" => supdb_arm(Supdb::create_zcursor_steps, dir)?,
         "supdb-zstrideallcdrop" => supdb_arm(Supdb::create_zstride_all_cdrop, dir)?,
         "supdb-zstridealldropagaincdrop" => {
             supdb_arm(Supdb::create_zstride_all_dropagain_cdrop, dir)?
@@ -17672,6 +17741,34 @@ mod tests {
                         d.zpages_stride,
                         d.zpages_stride_room,
                         d.zpages_stride_convert
+                    )
+                );
+                assert!(!o.zpages_stride_step_direct && !o.zpages_cursor_steps);
+                // Its walks stepping a key by the field: the one option
+                // more again, and the cursor's steps not with it.
+                let z = Supdb::create_zsparse_build_step(&dir("zsparsebuildstep")).unwrap();
+                assert_eq!(z.name(), "supdb-zsparsebuildstep");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_stride_sparse && !o.zpages_stride_sparse_waits);
+                assert!(o.zpages_stride_step_direct && !d.zpages_stride_step_direct);
+                assert_eq!(o.zpages_cursor_steps, d.zpages_cursor_steps);
+                // The cursor's steps on the engine's arm: the one option.
+                let z = Supdb::create_zcursor_steps(&dir("zcursorsteps")).unwrap();
+                assert_eq!(z.name(), "supdb-zcursorsteps");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_cursor_steps && !d.zpages_cursor_steps);
+                assert_eq!(
+                    (
+                        o.zpages_stride_sparse,
+                        o.zpages_stride_sparse_waits,
+                        o.zpages_stride_step_direct
+                    ),
+                    (
+                        d.zpages_stride_sparse,
+                        d.zpages_stride_sparse_waits,
+                        d.zpages_stride_step_direct
                     )
                 );
                 // The jobs' large arrays as the engine's mappings, on the

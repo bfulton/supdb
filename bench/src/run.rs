@@ -2846,12 +2846,20 @@ fn one_pass(
     // every row; the scans run as long now. Every start is at least
     // `scan_len` below the top, so every scan walks `scan_len` loaded
     // entries.
+    // With `SUPDB_SCAN_COUNTERS` set, the store's counters around each
+    // threaded scan pass, here and after the mixes, as `SUPDB_MIX_COUNTERS`
+    // reads them around a mix: one `scancounters` line a pass on stderr,
+    // read before the pass and after it. The read before takes the writer's
+    // upkeep home, so the pass after it meets a store nothing is filing
+    // into; a probe's variable, never set for a row.
+    let scan_counting = std::env::var_os("SUPDB_SCAN_COUNTERS").is_some();
     let mut scan_entries_s_threaded = Vec::with_capacity(plan.threads.len());
     for &threads in &plan.threads {
         if !passes.scan_threaded {
             break;
         }
         let ops = plan.divided(size) * threads as u64;
+        let sc0 = scan_counting.then(|| e.counters());
         let c0 = counting.begin();
         let got = threaded(
             e.as_ref(),
@@ -2865,6 +2873,18 @@ fn one_pass(
             c0.is_some(),
         )?;
         counting.end(c0, "scan", &format!("_{threads}t"), Some(got.own), ops);
+        if let Some(sc0) = sc0 {
+            let point = format!("scan-{threads}t ops {ops}");
+            counters_line(
+                "scancounters",
+                arm,
+                &point,
+                (0, 0),
+                (0.0, got.secs * 1e3),
+                &sc0,
+                &e.counters(),
+            );
+        }
         let want = ops * (plan.scan_len as u64).min(size) * plan.value_size as u64;
         if got.bytes != want {
             return Err(format!(
@@ -2909,6 +2929,7 @@ fn one_pass(
             break;
         }
         let ops = plan.divided(size) * threads as u64;
+        let sc0 = scan_counting.then(|| e.counters());
         let c0 = counting.begin();
         let got = threaded(
             e.as_ref(),
@@ -2928,6 +2949,18 @@ fn one_pass(
             Some(got.own),
             ops,
         );
+        if let Some(sc0) = sc0 {
+            let point = format!("scan-mixed-{threads}t ops {ops}");
+            counters_line(
+                "scancounters",
+                arm,
+                &point,
+                (0, 0),
+                (0.0, got.secs * 1e3),
+                &sc0,
+                &e.counters(),
+            );
+        }
         let want = ops * (plan.scan_len as u64).min(size) * plan.value_size as u64;
         if got.bytes < want {
             return Err(format!(

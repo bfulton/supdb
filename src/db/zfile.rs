@@ -511,6 +511,9 @@ pub(super) struct ZCursor<'a> {
     pub(super) prefetches: u64,
     pub(super) views: u64,
     pub(super) aheads: u64,
+    /// The fence entries the cursor stepped to from the one before, no
+    /// search of the fence made (`Options::zpages_cursor_steps`).
+    pub(super) steps: u64,
     /// The next open is the walk's, decoded into `buf` under
     /// `ZFile::walk_owns`; taken at the open.
     owns_next: bool,
@@ -566,6 +569,7 @@ impl<'a> ZCursor<'a> {
             prefetches: 0,
             views: 0,
             aheads: 0,
+            steps: 0,
             owns_next: false,
             asked: false,
             fell: false,
@@ -1088,7 +1092,41 @@ impl<'a> ZCursor<'a> {
         // The next page's first group is the walk's as much as the next
         // group of this page.
         self.owns_next = self.zfile.walk_owns;
-        self.load();
+        // The entry after the one held is the rank's wherever the walk ran
+        // off the end of an entry's records, which is every time it comes
+        // here from inside a block file's run: taken by its index, and held
+        // to the rank, where `load` searches the fence's ranks for it
+        // (`Options::zpages_cursor_steps`). A walk of a hundred records
+        // crosses two or three pages, and each crossing was a binary search
+        // of the partition's whole fence for the entry one past the one in
+        // hand. The search stands for every other position: past the last
+        // key, a cursor fallen or a file whose gate is out, and an entry
+        // that does not hold the rank -- an empty one, or a cursor whose
+        // entry is not the one before the rank's.
+        let stepped = self.memo.cursor_steps
+            && self.rank < self.zfile.nkeys
+            && !self.fell
+            && !self.zfile.gate_out()
+            && match self
+                .zfile
+                .fence
+                .entry(self.eidx + 1, self.zfile.nkeys as u32)
+            {
+                Some(entry)
+                    if self.rank >= entry.first_rank as usize
+                        && self.rank - (entry.first_rank as usize) < entry.count as usize =>
+                {
+                    self.off = 0;
+                    self.part = None;
+                    self.steps += 1;
+                    self.load_in(entry);
+                    true
+                }
+                _ => false,
+            };
+        if !stepped {
+            self.load();
+        }
         self.owns_next = false;
     }
 
@@ -1156,6 +1194,20 @@ impl<'a> ZCursor<'a> {
             self.fall();
             return;
         };
+        self.load_in(entry);
+    }
+
+    /// `load` from the entry `self.rank` falls in: the page's group by the
+    /// directory, the group opened and the walk to the rank's record. The
+    /// entry is the caller's to have found, by the fence's search (`load`)
+    /// or by a step from the entry before (`next_group`), and holds the
+    /// rank either way.
+    fn load_in(&mut self, entry: FenceEntry<'a>) {
+        debug_assert!(
+            self.rank >= entry.first_rank as usize
+                && self.rank - (entry.first_rank as usize) < entry.count as usize,
+            "the entry holds the rank"
+        );
         let j = if entry.page == ZNOPAGE {
             0
         } else {
@@ -2007,11 +2059,17 @@ impl<'a> ZCursor<'a> {
         // the rank the cursor now stands at.
         let (zfile, memo, rank, len) = (self.zfile, self.memo, self.rank as u64, self.key_at.1);
         let file = zfile.stride_bytes();
-        let stepped = body.step_key(file, rank, &mut self.stride_key()[..len], &mut |p| {
-            zfile.stride_page(body, memo, p)
-        });
-        if stepped.is_err() {
-            self.fall();
+        let direct = memo.stride_direct;
+        let stepped = body.step_key(
+            file,
+            rank,
+            &mut self.stride_key()[..len],
+            direct,
+            &mut |p| zfile.stride_page(body, memo, p),
+        );
+        match stepped {
+            Err(_) => self.fall(),
+            Ok(by_field) => memo.count_stride_direct(u64::from(by_field)),
         }
     }
 
@@ -2108,9 +2166,12 @@ impl<'a> ZCursor<'a> {
             }
         }
         let (memo, file, len) = (self.memo, zfile.stride_bytes(), self.key_at.1);
+        let direct = memo.stride_direct;
         let key = &mut self.stride_key()[..len];
         let mut r = rank;
         let mut fell = false;
+        // The keys stepped by their field, for the handle's count.
+        let mut steps = 0u64;
         while r < to {
             match body.values_at(file, r as u64, &mut |p| zfile.stride_page(body, memo, p)) {
                 StrideAt::Value(v) => f(key, v),
@@ -2123,17 +2184,19 @@ impl<'a> ZCursor<'a> {
                 }
             }
             r += 1;
-            if r < end
-                && body
-                    .step_key(file, r as u64, key, &mut |p| {
-                        zfile.stride_page(body, memo, p)
-                    })
-                    .is_err()
-            {
-                // The key of the rank the walk now stands at is a sparse
-                // form's page of numbers that failed: fallen there.
-                fell = true;
-                break;
+            if r < end {
+                match body.step_key(file, r as u64, key, direct, &mut |p| {
+                    zfile.stride_page(body, memo, p)
+                }) {
+                    Ok(by_field) => steps += u64::from(by_field),
+                    // The key of the rank the walk now stands at is a
+                    // sparse form's page of numbers that failed: fallen
+                    // there.
+                    Err(_) => {
+                        fell = true;
+                        break;
+                    }
+                }
             }
         }
         let walked = r - rank;
@@ -2142,6 +2205,7 @@ impl<'a> ZCursor<'a> {
             memo.count_stride_cursor(walked as u64);
             zfile.count_stride_touch(walked as u64);
         }
+        memo.count_stride_direct(steps);
         if fell {
             self.fall();
             return (walked, None);
@@ -2552,6 +2616,10 @@ pub(super) struct StrideCounts {
     /// and the covered walk of a scan over the partitions alone
     /// (`Reader::scan_partitions`), each through the cursor.
     pub(super) cursor: u64,
+    /// Keys a walk of a sparse form stepped by writing the next key's field
+    /// (`Options::zpages_stride_step_direct`): none without the option, and
+    /// none over a whole run, whose keys step by one in place.
+    pub(super) direct: u64,
 }
 
 /// `StrideCounts` on a handle's slot line in the reader table, which the
@@ -2562,6 +2630,7 @@ pub(super) struct StrideTally {
     pub(super) checks: AtomicU64,
     pub(super) reads: AtomicU64,
     pub(super) cursor: AtomicU64,
+    pub(super) direct: AtomicU64,
 }
 
 impl StrideTally {
@@ -2570,6 +2639,7 @@ impl StrideTally {
             checks: AtomicU64::new(0),
             reads: AtomicU64::new(0),
             cursor: AtomicU64::new(0),
+            direct: AtomicU64::new(0),
         }
     }
 
@@ -2954,6 +3024,13 @@ pub(super) struct ZMemo {
     /// The bulk walk steps the fence to the next entry where it ran to the
     /// end of one, and asks the memo once a group (`Options::zpages_bulk_steps`).
     bulk_steps: bool,
+    /// A cursor at the end of a fence entry's records takes the entry after
+    /// it where the rank is its first, and searches the fence by rank only
+    /// where it is not (`Options::zpages_cursor_steps`).
+    cursor_steps: bool,
+    /// A sparse stride form's walk steps a key by writing the next number's
+    /// field over the key's (`Options::zpages_stride_step_direct`).
+    stride_direct: bool,
     /// The form file and the fence entry this handle's last seek found
     /// (`ZFile::seek`), which a scan's walk starts in: under
     /// `Options::zpages_bulk_steps` the walk takes it where it covers the
@@ -2999,6 +3076,8 @@ impl ZMemo {
             bulk_part: false,
             bulk_within: false,
             bulk_steps: false,
+            cursor_steps: false,
+            stride_direct: false,
             seek_at: Cell::new(None),
             stride: Cell::new(StrideCounts::default()),
             tally: Cell::new(TallyPtr(std::ptr::null())),
@@ -3043,6 +3122,20 @@ impl ZMemo {
     /// (`Options::zpages_bulk_steps`).
     pub(super) fn bulk_steps(mut self, steps: bool) -> ZMemo {
         self.bulk_steps = steps;
+        self
+    }
+
+    /// The memo with the cursor's step to the next fence entry set
+    /// (`Options::zpages_cursor_steps`).
+    pub(super) fn cursor_steps(mut self, steps: bool) -> ZMemo {
+        self.cursor_steps = steps;
+        self
+    }
+
+    /// The memo with a sparse stride walk's direct key step set
+    /// (`Options::zpages_stride_step_direct`).
+    pub(super) fn stride_direct(mut self, direct: bool) -> ZMemo {
+        self.stride_direct = direct;
         self
     }
 
@@ -3140,6 +3233,14 @@ impl ZMemo {
 
     fn count_stride_cursor(&self, n: u64) {
         self.count_stride(n, |t| &t.cursor, |c| &mut c.cursor);
+    }
+
+    /// `n` keys of a sparse form stepped by the field
+    /// (`Options::zpages_stride_step_direct`); nothing counted for none.
+    fn count_stride_direct(&self, n: u64) {
+        if n > 0 {
+            self.count_stride(n, |t| &t.direct, |c| &mut c.direct);
+        }
     }
 
     /// What a stride file counted on a memo of no handle's since the last
@@ -5890,22 +5991,28 @@ impl ZFile {
             out.end = ScanEnd::Fallback;
             return out;
         }
+        let direct = memo.stride_direct;
+        // The keys stepped by their field, for the handle's count.
+        let mut steps = 0u64;
         for rank in from..from + want {
-            if rank > from
-                && body
-                    .step_key(file, rank, &mut kbuf[..len], &mut |p| {
-                        self.stride_page(body, memo, p)
-                    })
-                    .is_err()
-            {
-                out.end = ScanEnd::Fallback;
-                return out;
+            if rank > from {
+                match body.step_key(file, rank, &mut kbuf[..len], direct, &mut |p| {
+                    self.stride_page(body, memo, p)
+                }) {
+                    Ok(by_field) => steps += u64::from(by_field),
+                    Err(_) => {
+                        memo.count_stride_direct(steps);
+                        out.end = ScanEnd::Fallback;
+                        return out;
+                    }
+                }
             }
             match body.values_at(file, rank, &mut |p| self.stride_page(body, memo, p)) {
                 StrideAt::Value(v) => f(&kbuf[..len], v),
                 // A page taken out of service by its check; never `Absent`,
                 // every rank of the walk being below the key count.
                 StrideAt::Bad(_) | StrideAt::Absent => {
+                    memo.count_stride_direct(steps);
                     out.end = ScanEnd::Fallback;
                     return out;
                 }
@@ -5913,6 +6020,7 @@ impl ZFile {
             out.seen += 1;
         }
         self.count_stride_touch(out.seen as u64);
+        memo.count_stride_direct(steps);
         out
     }
 
@@ -8871,26 +8979,37 @@ impl StrideBody {
     /// (`KeyCodec::increment`), whose next number the field holds, the run
     /// being one the codec holds whole (`KeyCodec::holds`); rendered from
     /// the number a sparse form holds at `next`, `Err` with its page where
-    /// that fails `good` and the key left as it was.
+    /// that fails `good` and the key left as it was. Whether the step wrote
+    /// the field alone (`direct`, a sparse form's under
+    /// `Options::zpages_stride_step_direct`), which its callers count.
     pub(super) fn step_key(
         &self,
         file: &[u8],
         next: u64,
         key: &mut [u8],
+        direct: bool,
         good: &mut dyn FnMut(u32) -> bool,
-    ) -> std::result::Result<(), u32> {
+    ) -> std::result::Result<bool, u32> {
         if self.trailer.sparse.is_some() {
             let x = self.number_at(file, next, good)?;
+            let c = &self.trailer.codec;
+            // The field alone, written where it lies: the prefix is the
+            // key before's, which every key of the run shares
+            // (`Options::zpages_stride_step_direct`).
+            if direct && key.len() == c.key_len() {
+                c.render_field(x, &mut key[c.p()..]);
+                return Ok(true);
+            }
             let mut buf = [0u8; STRIDE_KEY_MAX];
-            key.copy_from_slice(self.trailer.codec.render(x, &mut buf));
-            return Ok(());
+            key.copy_from_slice(c.render(x, &mut buf));
+            return Ok(false);
         }
         let stepped = self.trailer.codec.increment(key);
         debug_assert!(
             stepped,
             "a walk inside the run never passes the field's top"
         );
-        Ok(())
+        Ok(false)
     }
 
     /// Rank `rank`'s value in `file`, every page of its slot -- one, or two
@@ -16740,6 +16859,10 @@ mod tests {
             let zfile = fx.attach().unwrap_or_else(|e| panic!("{name}: {e:?}"));
             let body = zfile.stride().expect("a stride body");
             assert_eq!(body.sparse().is_some(), sparse, "{name}");
+            // A handle's memo whose sparse walks step a key by its field
+            // (`Options::zpages_stride_step_direct`), beside the fixture's,
+            // which renders each whole.
+            let direct = ZMemo::new().stride_direct(true);
             let n = fx.recs.len();
             let mut first = [0u8; STRIDE_KEY_MAX];
             assert_eq!(
@@ -16922,8 +17045,73 @@ mod tests {
                         "{name}: a walk of {limit} from {from}"
                     );
                     assert_eq!((z.decoded, z.inplace, z.nopage), (0, 0, 0), "{name}");
+                    // The same walk of a sparse file with each key stepped
+                    // by its field (`Options::zpages_stride_step_direct`),
+                    // through the file and through a cursor's bulk walk: the
+                    // keys and the values the raw form's, as above. A whole
+                    // run steps no key by its number, so it has no such walk.
+                    if sparse && (from % 5 == 0 || from + 2 >= n) {
+                        let mut dgot = 0u64;
+                        let z = zfile
+                            .scan_at(&direct, &fx.blob, from, limit, &mut |k: &[u8], v: &[u8]| {
+                                fold(&mut dgot, k, v)
+                            })
+                            .unwrap();
+                        assert_eq!(
+                            (z.seen, z.end, dgot),
+                            (raw_seen, ScanEnd::Served, want),
+                            "{name}: a walk of {limit} from {from}, stepped by the field"
+                        );
+                        let mut cgot = 0u64;
+                        let mut c = ZCursor::at(&direct, &zfile, &fx.blob, from);
+                        let (walked, _) = c
+                            .walk_until(None, limit, &mut |k: &[u8], v: &[u8]| {
+                                fold(&mut cgot, k, v)
+                            })
+                            .unwrap();
+                        assert_eq!(
+                            (walked, cgot),
+                            (raw_seen, want),
+                            "{name}: a cursor's walk of {limit} from {from}, stepped by the field"
+                        );
+                        assert!(!c.fell_back(), "{name}");
+                    }
                 }
             }
+            // And a cursor stepped a rank at a time under the option, the
+            // key at each rank the raw form's and none past the run: a step
+            // by the field for every rank after the first, counted, where
+            // the walks above counted theirs and the fixture's memo, which
+            // has the option off, counted none. A whole run counts none
+            // under either memo.
+            let walked_direct = direct.take_stride().direct;
+            assert_eq!(
+                walked_direct > 0,
+                sparse && n > 1,
+                "{name}: keys stepped by the field in the walks: {walked_direct}"
+            );
+            let mut c = ZCursor::at(&direct, &zfile, &fx.blob, 0);
+            for rank in 0..n {
+                assert_eq!(
+                    c.key(),
+                    fx.blob.key_at(rank),
+                    "{name}: stepped by the field to {rank}"
+                );
+                c.advance();
+            }
+            assert_eq!(c.key(), None, "{name}: past the run");
+            assert!(!c.fell_back(), "{name}");
+            drop(c);
+            assert_eq!(
+                direct.take_stride().direct,
+                if sparse { n as u64 - 1 } else { 0 },
+                "{name}: a step by the field for every rank after the first"
+            );
+            assert_eq!(
+                fx.memo.take_stride().direct,
+                0,
+                "{name}: none stepped by the field without the option"
+            );
             assert!(!zfile.damaged() && zfile.bad_pages() == 0, "{name}");
             assert_eq!(
                 zfile.verified_pages(),
@@ -17323,6 +17511,7 @@ mod tests {
             checks: t.checks.load(Ordering::Relaxed),
             reads: t.reads.load(Ordering::Relaxed),
             cursor: t.cursor.load(Ordering::Relaxed),
+            direct: t.direct.load(Ordering::Relaxed),
         };
         let none = |what: &str| {
             assert_eq!(counts(&tally), StrideCounts::default(), "{what}");
@@ -17365,6 +17554,7 @@ mod tests {
             checks: 2,
             reads: 1,
             cursor: 0,
+            direct: 0,
         };
         assert_eq!(counts(&tally), read, "the stride read on the tally");
         assert_eq!(
@@ -17386,7 +17576,8 @@ mod tests {
             StrideCounts {
                 checks: 3,
                 reads: 2,
-                cursor: 0
+                cursor: 0,
+                direct: 0,
             },
             "ranks 0 to 81 end on page 2, the one page not checked before"
         );
@@ -17584,7 +17775,8 @@ mod tests {
                 StrideCounts {
                     checks: 1,
                     reads: 0,
-                    cursor: 0
+                    cursor: 0,
+                    direct: 0,
                 }
             ),
             "the failed check counted, and no read served"

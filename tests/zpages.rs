@@ -14178,6 +14178,87 @@ fn a_cursor_holds_a_pages_view_across_its_groups_and_asks_for_the_next() {
     }
 }
 
+/// A block-path scan's cursor over a covered partition steps the fence to
+/// the next entry where its walk ran off the end of one
+/// (`Options::zpages_cursor_steps`), and searches the fence by rank for it
+/// without: a scan of eight blocks and a bit through a fresh handle crosses
+/// pages, and with the option every page after the cursor's first is a step
+/// -- fewer steps than views, the page the cursor was placed in being a
+/// search's, and a step for every other -- and none is without it. The
+/// entries come back as the model has them either way, across every page
+/// the walk crossed. A few of the lowest keys are written first so the
+/// partition does not take the bulk walk, which steps by an option of its
+/// own (`Options::zpages_bulk_steps`), and the handle builds its own table
+/// (`commit_forms` off), as the cursor's other tests do.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_cursor_steps_to_the_next_fence_entry_where_its_walk_ran_off_one() {
+    for on in [true, false] {
+        let what = format!("cursor steps {on}");
+        let (dir, mut db, model, _inject, r, keys, _at) =
+            compact_store_with(&format!("cursor-steps-{on}"), 1 << 20, |o| {
+                o.zpages_cursor_steps = on;
+                o.commit_forms = false;
+            });
+        drop(r);
+        for k in &keys[..3] {
+            db.append(k, &model[k][0]);
+        }
+        db.commit().unwrap();
+        let r = db.reader().unwrap();
+        let want = 8 * 64 + 10;
+        let start = keys.len() / 3;
+        assert!(
+            start + want < keys.len(),
+            "{what}: keys enough: {}",
+            keys.len()
+        );
+        let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+            .iter()
+            .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+            .collect();
+        let before = db.zpage_counts();
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let n = r
+            .scan(&keys[start], want, |k, v| {
+                got.push((k.to_vec(), v.to_vec()))
+            })
+            .unwrap();
+        let c = db.zpage_counts();
+        assert_eq!(n, want, "{what}: the scan's entries");
+        assert_eq!(got, expect, "{what}: the entries as the model has them");
+        let views = c.scan_views - before.scan_views;
+        let steps = c.cursor_steps - before.cursor_steps;
+        let walks = c.scans - before.scans;
+        assert!(
+            views >= 3,
+            "{what}: the walk crossed pages: {views} views in {walks} walks"
+        );
+        assert_eq!(
+            c.fallbacks - before.fallbacks,
+            0,
+            "{what}: every walk served by the form"
+        );
+        if on {
+            // A view a page a cursor enters: the first by its placing, a
+            // search, and each after it by a step.
+            assert!(
+                steps >= 1 && steps < views,
+                "{what}: a step a page after the first: {steps} steps, {views} views"
+            );
+            assert!(
+                steps + walks >= views,
+                "{what}: no page searched for past a cursor's first: {steps} steps, {views} views, {walks} walks"
+            );
+        } else {
+            assert_eq!(steps, 0, "{what}: every page by the fence's search");
+        }
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// A block-cache scan's start over a covered partition is placed once
 /// (`Options::zpages_seek_seeds`): the writer's scan from a key in the
 /// partition's middle goes through the form file's cursor for its seek and
@@ -17957,6 +18038,115 @@ fn a_run_with_gaps_waits_for_a_reader_and_is_converted_at_no_rent_where_it_fits(
         assert!(c.stride_files < c.partitions, "{what}: {c:?}");
         check(&r, &model, &keys, &format!("{what}: after the move out"));
         drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A walk of a sparse stride form steps each key by writing its field where
+/// it lies (`Options::zpages_stride_step_direct`): a store of keys with gaps
+/// between their numbers, its form forced and sparse, scanned whole through
+/// the writer and through a handle, over the partitions as built and again
+/// with keys written among them -- the bulk walk's steps and the block
+/// path's cursor's -- answers every key and value as the model has them,
+/// and with the option the handles count the keys they stepped by the
+/// field, most of the keys they handed over, and without it none.
+#[test]
+fn a_sparse_stride_walk_steps_its_keys_by_the_field_where_the_option_says() {
+    for on in [true, false] {
+        let what = format!("sparse step direct {on}");
+        let dir = scratch(&format!("sparse-step-{on}"));
+        let mut db = Db::create(
+            &dir,
+            stride_forced(|o| {
+                o.zpages_stride_sparse = true;
+                o.zpages_stride_sparse_waits = false;
+                o.zpages_stride_step_direct = on;
+                o.partition_bytes = Some(400 << 10);
+            }),
+        )
+        .unwrap();
+        let mut model = gapped_soft_load(&mut db, 6_000, 100, 0x57E9);
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert!(
+            c.partitions >= 2 && c.form_files == c.partitions,
+            "{what}: every partition served by a form file: {c:?}"
+        );
+        assert_eq!(
+            (c.stride_files, c.stride_sparse_builds),
+            (c.partitions, c.stride_builds),
+            "{what}: every file a sparse stride file: {c:?}"
+        );
+        let flat = |model: &Model| -> Vec<(Vec<u8>, Vec<u8>)> {
+            model
+                .iter()
+                .flat_map(|(k, vs)| vs.iter().map(move |v| (k.clone(), v.clone())))
+                .collect()
+        };
+        let whole = |db: &Db, what: &str, model: &Model| {
+            let r = db.reader().unwrap();
+            let before = db.zpage_counts();
+            let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            db.scan(
+                b"",
+                usize::MAX,
+                kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+            )
+            .unwrap();
+            assert_eq!(got, flat(model), "{what}: the writer's scan");
+            got.clear();
+            r.scan(
+                b"",
+                usize::MAX,
+                kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+            )
+            .unwrap();
+            assert_eq!(got, flat(model), "{what}: a handle's scan");
+            let c = db.zpage_counts();
+            assert_eq!(c.fallbacks, before.fallbacks, "{what}: served by the form");
+            c.stride_direct_steps - before.stride_direct_steps
+        };
+        // The partitions as built: the bulk walk.
+        let steps = whole(&db, &what, &model);
+        let keys = model.len() as u64;
+        if on {
+            // Two scans of every key, each stepped to but a partition's
+            // first, whose key the walk renders whole.
+            assert!(
+                steps >= keys && steps <= 2 * keys,
+                "{what}: the keys stepped by the field over the built store: {steps} of {keys} twice"
+            );
+        } else {
+            assert_eq!(steps, 0, "{what}: none stepped by the field");
+        }
+        // Keys written among them, in the gaps and over keys there: the
+        // block path's cursor walks the partitions between them.
+        let mut rng = Rng(0x57EA);
+        for i in (0..6_000usize).step_by(97) {
+            let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
+            let k = numbered_key(2 * i + 1);
+            db.append(&k, &v);
+            model.insert(k, vec![v]);
+            let k = numbered_key(2 * i + 40);
+            let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
+            db.append(&k, &v);
+            model.get_mut(&k).unwrap().push(v);
+        }
+        db.commit().unwrap();
+        let steps = whole(
+            &db,
+            &format!("{what}, with keys written among them"),
+            &model,
+        );
+        if on {
+            assert!(
+                steps >= keys / 2,
+                "{what}: the keys stepped by the field between the written keys: {steps} of {keys}"
+            );
+        } else {
+            assert_eq!(steps, 0, "{what}: none stepped by the field");
+        }
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

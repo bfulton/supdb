@@ -320,6 +320,13 @@ struct Cfg {
     /// a quarter of the seeds under `ZFUZZ_OPTVARY`, the side generator's
     /// next draw, and the engine's otherwise.
     hot_starts: u32,
+    /// The block path's cursor steps the fence to the next entry
+    /// (`Options::zpages_cursor_steps`) and a sparse stride walk steps its
+    /// key by the field (`Options::zpages_stride_step_direct`): each on in
+    /// half the seeds under `ZFUZZ_OPTVARY`, the side generator's next two
+    /// draws, and off otherwise, as the engine has them.
+    cursor_steps: bool,
+    stride_direct: bool,
     /// Under `ZFUZZ_STRIDE`, the stride form's steer; `None` without it.
     stride: Option<StrideSteer>,
 }
@@ -608,6 +615,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let (part_off, keys_off, scan_off) = (side.chance(25), side.chance(25), side.chance(25));
     let walk_off = side.chance(25);
     let hot_two = side.chance(25);
+    let (steps_on, direct_on) = (side.chance(50), side.chance(50));
     // A generator of its own, as `side` is, so that the switch moves none
     // of the draws below.
     let stride =
@@ -658,6 +666,8 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         } else {
             Options::default().promote_starts
         },
+        cursor_steps: vary && steps_on,
+        stride_direct: vary && direct_on,
         stride,
     }
 }
@@ -684,6 +694,8 @@ fn opts(c: &Cfg) -> Options {
         zpages_point_keys: c.point_keys,
         zpages_scan_admit: c.scan_admit,
         zpages_walk_part: c.walk_part,
+        zpages_cursor_steps: c.cursor_steps,
+        zpages_stride_step_direct: c.stride_direct,
         promote_starts: c.hot_starts,
         zpages_store_all: c.store_all,
         scan_start_cache: if c.start_cache { 4096 } else { 0 },
@@ -1635,8 +1647,11 @@ struct Stats {
     /// on a copy (`Options::promote_starts`); then the times a writer took
     /// its forms back at a commit, its reading of the scans gone stale
     /// (`Options::scan_forms_off_stale_writes`), what says a run under
-    /// `ZFUZZ_FORMSOFF` reached that exit.
-    point: [u64; 8],
+    /// `ZFUZZ_FORMSOFF` reached that exit; then the fence entries the
+    /// cursors stepped to with no search (`Options::zpages_cursor_steps`),
+    /// what says a run under `ZFUZZ_OPTVARY` and `ZFUZZ_ZPAGES` reached the
+    /// step.
+    point: [u64; 9],
     /// The `z` store's stride form under `ZFUZZ_STRIDE`.
     stride: StrideStats,
 }
@@ -1767,6 +1782,7 @@ fn count_point(st: &mut Stats, db: &Db) {
     st.point[5] += h[0];
     st.point[6] += h[1];
     st.point[7] += db.forms_off_stale_exits();
+    st.point[8] += c.cursor_steps;
 }
 
 /// Under `ZFUZZ_CENSUS`, the store read as out of core: the census gate,
@@ -1933,7 +1949,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         switches: 0,
         recuts: 0,
         heads: [0; 2],
-        point: [0; 8],
+        point: [0; 9],
         stride: StrideStats::default(),
     };
     let mut fails: Vec<String> = Vec::new();
@@ -2369,7 +2385,7 @@ fn fuzz_range() {
     let (mut bad, mut reopens, mut abandons, mut bindings, mut beside, mut switches) =
         (Vec::new(), 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut recuts = 0u64;
-    let mut point = [0u64; 8];
+    let mut point = [0u64; 9];
     let mut heads = [0u64; 2];
     let mut stride = StrideStats::default();
     let ran = seeds.len();
@@ -2396,7 +2412,7 @@ fn fuzz_range() {
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {}, FAILURES {}",
         heads[0],
         heads[1],
         point[0],
@@ -2407,6 +2423,7 @@ fn fuzz_range() {
         point[5],
         point[6],
         point[7],
+        point[8],
         bad.len()
     );
     if stride_on() {
