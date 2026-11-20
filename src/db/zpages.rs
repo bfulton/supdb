@@ -4324,6 +4324,19 @@ pub const STRIDE_KEY_MAX: usize = 64;
 pub const STRIDE_DECIMAL_MAX: usize = 19;
 /// The most big-endian bytes a field holds: a u64's.
 pub const STRIDE_BE_MAX: usize = 8;
+/// The most hex digits a field holds: a u64's.
+pub const STRIDE_HEX_MAX: usize = 16;
+/// The version of a stride trailer whose file holds its keys' numbers
+/// beside the values (the sparse form): what a reader of the first version
+/// refuses without misreading, as it refuses any version it does not know.
+/// A file whose keys are a whole run is written at [`STRIDE_VERSION`]
+/// still, byte for byte what it was.
+pub const STRIDE_VERSION_SPARSE: u32 = 2;
+/// The ranks between two of a sparse stride form's samples: every
+/// sixty-fourth number is a sample, so the run a sample opens is 512 bytes
+/// of numbers, eight cache lines a search asks for together -- the ordered
+/// index's stride, for its reason (`ordindex::TOP_STRIDE`).
+pub const STRIDE_SAMPLE: u64 = 64;
 /// The widest value a stride form holds: a page, so that a slot spans at
 /// most two pages and a read checks at most two of the row's words.
 pub const STRIDE_W_MAX: u32 = ZPAGE as u32;
@@ -4365,6 +4378,37 @@ pub struct StrideLayout {
     pub res_pages: u64,
     /// The file's length: the values, the row padded, the trailer.
     pub file_len: u64,
+    /// Pages of the keys' numbers, `K`, after the values: none in a form
+    /// whose keys are a whole run, which holds no number.
+    pub k_pages: u64,
+    /// The samples of the numbers, every [`STRIDE_SAMPLE`]th: none in a
+    /// form whose keys are a whole run.
+    pub samples: u64,
+}
+
+impl StrideLayout {
+    /// The pages the row has a word for: the values' and the numbers'.
+    pub fn row_pages(&self) -> u64 {
+        self.v_pages + self.k_pages
+    }
+
+    /// The row's own bytes, a word a page it covers; in a sparse form the
+    /// samples follow it at the next multiple of eight
+    /// ([`StrideLayout::samples_off`]).
+    pub fn row_len(&self) -> u64 {
+        self.row_pages() * 4
+    }
+
+    /// Where the numbers begin, the values' end.
+    pub fn k_off(&self) -> u64 {
+        self.v_pages * ZPAGE as u64
+    }
+
+    /// Where the samples begin in the file: the row's end, to a multiple
+    /// of eight.
+    pub fn samples_off(&self) -> u64 {
+        self.res_off + self.row_len().next_multiple_of(8)
+    }
 }
 
 /// The sizes of a stride form of `n` values of `w` bytes each: the one
@@ -4386,7 +4430,60 @@ pub fn stride_layout(n: u64, w: u32) -> Option<StrideLayout> {
         res_len,
         res_pages,
         file_len,
+        k_pages: 0,
+        samples: 0,
     })
+}
+
+/// The sizes of a sparse stride form of `n` values of `w` bytes each: the
+/// values as [`stride_layout`] has them, then the keys' numbers, a u64 a
+/// rank, to a whole page; then the resident part, the row with a word for
+/// every value page and every number page, zeros to a multiple of eight,
+/// and the samples, a u64 for every [`STRIDE_SAMPLE`]th rank, to a whole
+/// page; then the trailer. `res_len` is the row, its padding and the
+/// samples, which the trailer's CRC covers together. `None` where they
+/// overflow.
+pub fn stride_layout_sparse(n: u64, w: u32) -> Option<StrideLayout> {
+    let page = ZPAGE as u64;
+    let v_pages = n.checked_mul(u64::from(w))?.div_ceil(page);
+    let k_pages = n.checked_mul(8)?.div_ceil(page);
+    let samples = n.div_ceil(STRIDE_SAMPLE);
+    let row_pages = v_pages.checked_add(k_pages)?;
+    let res_off = row_pages.checked_mul(page)?;
+    let res_len = row_pages
+        .checked_mul(4)?
+        .next_multiple_of(8)
+        .checked_add(samples.checked_mul(8)?)?;
+    let res_pages = res_len.div_ceil(page);
+    let file_len = row_pages
+        .checked_add(res_pages)?
+        .checked_add(1)?
+        .checked_mul(page)?;
+    Some(StrideLayout {
+        v_pages,
+        res_off,
+        res_len,
+        res_pages,
+        file_len,
+        k_pages,
+        samples,
+    })
+}
+
+/// Where the straight line through a sparse form's first and last number
+/// puts number `x` among its `m` samples: `0` at `lo`, `m` at `hi`, and
+/// in proportion between, `x` held inside the two. The one definition of
+/// the guess a search starts from, which the builder measures the error of
+/// against every sample ([`StrideTrailer::sparse`]) and a reader searches
+/// within that error of.
+#[inline]
+pub fn stride_line(lo: u64, hi: u64, m: u64, x: u64) -> u64 {
+    let x = x.clamp(lo, hi);
+    let span = hi - lo;
+    if span == 0 {
+        return 0;
+    }
+    ((u128::from(x - lo) * u128::from(m)) / u128::from(span)) as u64
 }
 
 /// How a stride form's key field holds its number.
@@ -4396,7 +4493,27 @@ pub enum KeyKind {
     Decimal,
     /// Big-endian unsigned bytes.
     BigEndian,
+    /// Zero-padded ASCII hex digits, the letters lowercase.
+    HexLower,
+    /// Zero-padded ASCII hex digits, the letters uppercase.
+    HexUpper,
 }
+
+/// The kinds a detection tries, narrowest alphabet first: a field of
+/// decimal digits is one of hex digits too, and of bytes, and the first
+/// kind that holds a run is the one whose numbers are closest together.
+pub const KEY_KINDS: [KeyKind; 4] = [
+    KeyKind::Decimal,
+    KeyKind::HexLower,
+    KeyKind::HexUpper,
+    KeyKind::BigEndian,
+];
+/// The kinds every stride reader knows, which a detection is held to
+/// where the sparse form is not allowed: the hex kinds came with it
+/// ([`KeyCodec::detect_any`]), and a whole run of hex keys written where
+/// it is allowed is a first-version file of a kind a reader from before
+/// refuses by its code.
+pub const KEY_KINDS_DENSE: [KeyKind; 2] = [KeyKind::Decimal, KeyKind::BigEndian];
 
 impl KeyKind {
     /// The byte a stride trailer records.
@@ -4404,6 +4521,8 @@ impl KeyKind {
         match self {
             KeyKind::Decimal => 1,
             KeyKind::BigEndian => 2,
+            KeyKind::HexLower => 3,
+            KeyKind::HexUpper => 4,
         }
     }
 
@@ -4412,6 +4531,8 @@ impl KeyKind {
         match c {
             1 => Some(KeyKind::Decimal),
             2 => Some(KeyKind::BigEndian),
+            3 => Some(KeyKind::HexLower),
+            4 => Some(KeyKind::HexUpper),
             _ => None,
         }
     }
@@ -4421,6 +4542,7 @@ impl KeyKind {
         match self {
             KeyKind::Decimal => STRIDE_DECIMAL_MAX,
             KeyKind::BigEndian => STRIDE_BE_MAX,
+            KeyKind::HexLower | KeyKind::HexUpper => STRIDE_HEX_MAX,
         }
     }
 
@@ -4429,6 +4551,44 @@ impl KeyKind {
         match self {
             KeyKind::Decimal => 10,
             KeyKind::BigEndian => 256,
+            KeyKind::HexLower | KeyKind::HexUpper => 16,
+        }
+    }
+
+    /// The first of the six letters a hex kind's digits past nine are.
+    fn hex_a(self) -> u8 {
+        if self == KeyKind::HexUpper {
+            b'A'
+        } else {
+            b'a'
+        }
+    }
+
+    /// The field byte after `b` in the kind's order, or `None` where `b`
+    /// is its last and the field carries: the step a rendered key takes
+    /// to the next number's ([`KeyCodec::increment`]).
+    fn next_byte(self, b: u8) -> Option<u8> {
+        match self {
+            KeyKind::Decimal => (b != b'9').then(|| b + 1),
+            KeyKind::BigEndian => b.checked_add(1),
+            KeyKind::HexLower | KeyKind::HexUpper => {
+                let a = self.hex_a();
+                if b == b'9' {
+                    Some(a)
+                } else if b == a + 5 {
+                    None
+                } else {
+                    Some(b + 1)
+                }
+            }
+        }
+    }
+
+    /// The field byte of value zero, which a field that carries wraps to.
+    fn zero_byte(self) -> u8 {
+        match self {
+            KeyKind::BigEndian => 0,
+            _ => b'0',
         }
     }
 
@@ -4440,6 +4600,20 @@ impl KeyKind {
             KeyKind::Decimal if b > b'9' => (10, false),
             KeyKind::Decimal => (u64::from(b - b'0'), true),
             KeyKind::BigEndian => (u64::from(b), true),
+            KeyKind::HexLower | KeyKind::HexUpper => {
+                let a = self.hex_a();
+                if b < b'0' {
+                    (0, false)
+                } else if b <= b'9' {
+                    (u64::from(b - b'0'), true)
+                } else if b < a {
+                    (10, false)
+                } else if b <= a + 5 {
+                    (10 + u64::from(b - a), true)
+                } else {
+                    (16, false)
+                }
+            }
         }
     }
 }
@@ -4450,9 +4624,10 @@ pub enum KeyShapeNo {
     /// They are not of one length of one to [`STRIDE_KEY_MAX`] bytes: the
     /// empty key renders from no field.
     Length,
-    /// The field past the prefix they share is neither decimal digits, at
-    /// most [`STRIDE_DECIMAL_MAX`] of them, nor at most [`STRIDE_BE_MAX`]
-    /// bytes.
+    /// The field past the prefix they share is of no kind asked: neither
+    /// decimal digits, at most [`STRIDE_DECIMAL_MAX`] of them, nor at most
+    /// [`STRIDE_BE_MAX`] bytes, nor, where the hex kinds are asked, at
+    /// most [`STRIDE_HEX_MAX`] hex digits of one case.
     Field,
     /// No kind counts exactly the run's keys between them.
     Holes,
@@ -4517,17 +4692,58 @@ impl KeyCodec {
     /// count: that the keys between are the renderings is the build's
     /// walk to check, a key at a time.
     pub fn detect(first: &[u8], last: &[u8], n: u64) -> std::result::Result<KeyCodec, KeyShapeNo> {
+        match KeyCodec::detect_any(first, last, n, &KEY_KINDS_DENSE, &[])? {
+            (c, true) => Ok(c),
+            (_, false) => Err(KeyShapeNo::Holes),
+        }
+    }
+
+    /// `detect` over the kinds asked, in their order, for a run that may
+    /// have gaps: the codec under which `first` and `last` are the ends of
+    /// a run of `n` keys each rendered from its number, and whether the
+    /// run is whole -- the numbers between the two ends exactly `n`, so
+    /// rank `r`'s is `base + r` -- or has gaps, more numbers between them
+    /// than keys, where a form must hold each key's number
+    /// ([`StrideTrailer::sparse`]). A kind that counts exactly `n` is
+    /// taken before any that counts more, whatever their order: a whole
+    /// run is one, and the form that holds no number is the smaller. A
+    /// kind that counts fewer than `n` holds no `n` distinct keys between
+    /// the ends and is no kind of this run.
+    ///
+    /// A kind is tried where the field is no wider than it holds and
+    /// every field byte of both ends and of every key of `more` is one of
+    /// its. The ends alone do not say which kind a run with gaps is: two
+    /// keys of hex digits are, once in a while, both of decimal digits,
+    /// and the narrower kind would then be taken for a run it does not
+    /// hold, which the build's walk finds at the first key with a letter
+    /// and gives the whole build up for. `more` is keys from inside the
+    /// run that the caller read for this, and with a few of them the
+    /// narrower kind is taken for a wider run one time in the alphabets'
+    /// ratio to the power of every field byte read. What is proved is the
+    /// count's bound and the read keys' shape: every other key is the
+    /// build's walk to check.
+    pub fn detect_any(
+        first: &[u8],
+        last: &[u8],
+        n: u64,
+        kinds: &[KeyKind],
+        more: &[&[u8]],
+    ) -> std::result::Result<(KeyCodec, bool), KeyShapeNo> {
         let l = first.len();
-        if l == 0 || l > STRIDE_KEY_MAX || last.len() != l {
+        if l == 0 || l > STRIDE_KEY_MAX || last.len() != l || more.iter().any(|k| k.len() != l) {
             return Err(KeyShapeNo::Length);
         }
         let shared = first.iter().zip(last).take_while(|(a, b)| a == b).count();
         let p = shared.min(l - 1);
         let d = l - p;
-        let digits = |k: &[u8]| k[p..].iter().all(u8::is_ascii_digit);
         let mut shaped = false;
-        for kind in [KeyKind::Decimal, KeyKind::BigEndian] {
-            if d > kind.d_max() || (kind == KeyKind::Decimal && !(digits(first) && digits(last))) {
+        let mut gapped = None;
+        for &kind in kinds {
+            let of_kind = |k: &[u8]| k[p..].iter().all(|&b| kind.rank_byte(b).1);
+            if d > kind.d_max()
+                || !(of_kind(first) && of_kind(last))
+                || !more.iter().all(|k| k[..p] == first[..p] && of_kind(k))
+            {
                 continue;
             }
             shaped = true;
@@ -4541,19 +4757,23 @@ impl KeyCodec {
                 .expect("a field of the kind's bytes, no wider than it holds");
             let c = KeyCodec::new(kind, &first[..p], d, base)
                 .expect("a field of one byte to the kind's widest, in a key the form takes");
+            // The numbers from the first to the last, which is one more
+            // than a u64 holds for the whole of an eight-byte field.
             let count = c
                 .decode(last)
                 .and_then(|x| x.checked_sub(base))
-                .and_then(|k| k.checked_add(1));
-            if count == Some(n) {
-                return Ok(c);
+                .map(|k| u128::from(k) + 1);
+            match count {
+                Some(k) if k == u128::from(n) => return Ok((c, true)),
+                Some(k) if k > u128::from(n) && gapped.is_none() => gapped = Some(c),
+                _ => {}
             }
         }
-        Err(if shaped {
-            KeyShapeNo::Holes
-        } else {
-            KeyShapeNo::Field
-        })
+        match gapped {
+            Some(c) => Ok((c, false)),
+            None if shaped => Err(KeyShapeNo::Holes),
+            None => Err(KeyShapeNo::Field),
+        }
     }
 
     /// The kind of the field.
@@ -4586,6 +4806,7 @@ impl KeyCodec {
         match self.kind {
             KeyKind::Decimal => 10u64.pow(u32::from(self.d)) - 1,
             KeyKind::BigEndian => u64::MAX >> (8 * (STRIDE_BE_MAX - self.d())),
+            KeyKind::HexLower | KeyKind::HexUpper => u64::MAX >> (4 * (STRIDE_HEX_MAX - self.d())),
         }
     }
 
@@ -4639,6 +4860,19 @@ impl KeyCodec {
             KeyKind::BigEndian => {
                 field.copy_from_slice(&x.to_be_bytes()[STRIDE_BE_MAX - self.d()..])
             }
+            KeyKind::HexLower | KeyKind::HexUpper => {
+                let a = self.kind.hex_a();
+                let mut v = x;
+                for b in field.iter_mut().rev() {
+                    let digit = (v & 15) as u8;
+                    *b = if digit < 10 {
+                        b'0' + digit
+                    } else {
+                        a + digit - 10
+                    };
+                    v >>= 4;
+                }
+            }
         }
         &buf[..l]
     }
@@ -4652,19 +4886,32 @@ impl KeyCodec {
     /// [`holds`]: KeyCodec::holds
     pub fn increment(&self, key: &mut [u8]) -> bool {
         debug_assert_eq!(key.len(), self.key_len(), "not a rendered key");
-        let (zero, nine) = match self.kind {
-            KeyKind::Decimal => (b'0', b'9'),
-            KeyKind::BigEndian => (0, u8::MAX),
-        };
+        let zero = self.kind.zero_byte();
         for b in key[usize::from(self.p)..].iter_mut().rev() {
-            if *b == nine {
-                *b = zero;
-            } else {
-                *b += 1;
-                return true;
+            match self.kind.next_byte(*b) {
+                Some(next) => {
+                    *b = next;
+                    return true;
+                }
+                None => *b = zero,
             }
         }
         false
+    }
+
+    /// Where `key` falls among the field's numbers: the least number whose
+    /// rendering is at or after `key` in byte order, and whether that
+    /// rendering is `key` itself -- a key the codec renders is its own
+    /// number, and any other key stands just under the first rendering
+    /// above it, the count of the renderings below it. One past the
+    /// field's last number where every rendering is below `key`, which is
+    /// why it is a u128. What a search of a run with gaps looks for
+    /// (`lower_bound` is this less `base`, for a run with none).
+    pub fn at_or_after(&self, key: &[u8]) -> (u128, bool) {
+        match self.decode(key) {
+            Some(x) => (u128::from(x), true),
+            None => (self.below(key), false),
+        }
     }
 
     /// Where `key` falls in the run of `n` keys from `base`: the rank of
@@ -4737,16 +4984,74 @@ impl KeyCodec {
 /// `V`, `res_off`, `res_len` and the file's length are [`stride_layout`]'s
 /// of the key count and the width and are written and checked, not held;
 /// `bind32` and the CRC are derived.
+///
+/// A sparse form's trailer ([`StrideTrailer::sparse`]) is the second
+/// version: the same fields at the same places, and after the prefix's
+/// room the numbers' pages, the last key's number, the line's error and
+/// the sample stride, where the first version holds zeros.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StrideTrailer {
     /// The keys' codec, the first key's number with it.
     pub codec: KeyCodec,
     /// Every value's width, `W`.
     pub w: u32,
-    /// The row's CRC ([`stride_row_crc`]).
+    /// The resident part's CRC ([`stride_row_crc`]): the row's, and in a
+    /// sparse form the row's, its padding's and the samples' together.
     pub res_crc: u32,
     /// The segment, whose key count is the run's.
     pub seg: SegIdent,
+    /// What a form whose keys are numbers with gaps between them holds of
+    /// its keys; `None` where they are a whole run, rank `r`'s number
+    /// `base + r` and nothing held.
+    pub sparse: Option<StrideSparse>,
+}
+
+/// A sparse stride form's keys: the file holds each rank's number after
+/// the values, a little-endian u64 a rank ascending, and every
+/// [`STRIDE_SAMPLE`]th of them again in its resident part, the samples a
+/// reader keeps in memory. A key's rank is searched for: its number's
+/// place among the samples is guessed by the straight line through the
+/// first number and the last ([`stride_line`]), the samples within the
+/// line's error of the guess are searched for the last one at or below the
+/// number, and the run of numbers that sample opens is searched for the
+/// number itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StrideSparse {
+    /// The last key's number, the line's other end; the first is the
+    /// codec's `base`.
+    pub last: u64,
+    /// The most samples the line puts any of the form's numbers from the
+    /// last sample at or below it, which the builder measured over every
+    /// number ([`stride_eps`]): a search of the samples from that many
+    /// before the guess to that many after it misses none. A count the
+    /// builder made and no reader can check short of reading every number,
+    /// so a reader takes it for where to look first and never for where
+    /// the number is: a window that does not bracket the number is left
+    /// for a search of every sample, and a wrong count costs that search
+    /// and no answer.
+    pub eps: u32,
+}
+
+/// The error of the line over `numbers`, a form's keys' numbers in rank
+/// order: the most samples [`stride_line`] puts any of them from the last
+/// sample at or below it. A number between two samples is guessed between
+/// their guesses, the line being monotone, so the samples' own errors
+/// bound it to one more: the measure is taken at each sample and at the
+/// number just before the next, the two ends of every run.
+pub fn stride_eps(numbers: &[u64]) -> u32 {
+    let (Some(&lo), Some(&hi)) = (numbers.first(), numbers.last()) else {
+        return 0;
+    };
+    let m = (numbers.len() as u64).div_ceil(STRIDE_SAMPLE);
+    let step = STRIDE_SAMPLE as usize;
+    let mut worst = 0u64;
+    for (i, run) in numbers.chunks(step).enumerate() {
+        let i = i as u64;
+        for &x in [run[0], run[run.len() - 1]].iter() {
+            worst = worst.max(stride_line(lo, hi, m, x).abs_diff(i));
+        }
+    }
+    worst.min(u64::from(u32::MAX)) as u32
 }
 
 // A stride trailer's fields, past the head every trailer has (`T_MAGIC`
@@ -4764,8 +5069,16 @@ const S_RES_CRC: usize = 56;
 const S_BIND32: usize = 60;
 const S_SEG: usize = 64;
 const S_PREFIX: usize = S_SEG + SI_LEN;
-/// Where the zeros after the prefix's room begin, which run to the CRC.
+/// Where the zeros after the prefix's room begin, which run to the CRC in
+/// a form whose keys are a whole run.
 const S_ZERO: usize = S_PREFIX + STRIDE_KEY_MAX;
+// A sparse form's fields, where the first version holds zeros.
+const S_K: usize = S_ZERO;
+const S_LAST: usize = S_ZERO + 8;
+const S_EPS: usize = S_ZERO + 16;
+const S_SAMPLE: usize = S_ZERO + 20;
+/// Where a sparse trailer's zeros begin.
+const S_ZERO_SPARSE: usize = S_ZERO + 24;
 
 impl StrideTrailer {
     /// The segment the file says it derives from.
@@ -4787,16 +5100,37 @@ impl StrideTrailer {
         if n == 0 || n > u64::from(u32::MAX) {
             return Err(bad("the key count is not one to what a page index counts"));
         }
-        if !self.codec.holds(n) {
-            return Err(bad("the run passes what its key field holds"));
-        }
         if self.w == 0 || self.w > STRIDE_W_MAX {
             return Err(bad("the value width is not one to a page"));
         }
-        // Inside those bounds the values are under 2^44 bytes, and nothing
-        // of the layout overflows: a refusal here would be one no file
-        // could earn.
-        Ok(stride_layout(n, self.w).expect("a u32 of keys of a page each overflows no u64"))
+        let Some(sp) = self.sparse else {
+            if !self.codec.holds(n) {
+                return Err(bad("the run passes what its key field holds"));
+            }
+            // Inside those bounds the values are under 2^44 bytes, and
+            // nothing of the layout overflows: a refusal here would be one
+            // no file could earn.
+            return Ok(
+                stride_layout(n, self.w).expect("a u32 of keys of a page each overflows no u64")
+            );
+        };
+        // A sparse form's numbers ascend from the codec's base to the last
+        // inside the field, and `n` distinct numbers need as many between
+        // the two; the line is never wrong by more samples than there are.
+        let base = self.codec.base();
+        if sp.last > self.codec.top() || sp.last < base {
+            return Err(bad(
+                "the last key's number is not in the field past the first",
+            ));
+        }
+        if u128::from(sp.last - base) + 1 < u128::from(n) {
+            return Err(bad("the numbers between the ends are fewer than the keys"));
+        }
+        if u64::from(sp.eps) > n.div_ceil(STRIDE_SAMPLE) {
+            return Err(bad("the line's error is more samples than the form has"));
+        }
+        Ok(stride_layout_sparse(n, self.w)
+            .expect("a u32 of keys of a page and a word each overflows no u64"))
     }
 
     /// The length the file must have.
@@ -4822,7 +5156,17 @@ impl StrideTrailer {
         put32(&mut b, S_BIND32, self.bind32());
         self.seg.put(&mut b[S_SEG..S_PREFIX]);
         b[S_PREFIX..S_PREFIX + c.prefix().len()].copy_from_slice(c.prefix());
-        seal_trailer(&mut b, &STRIDE_MAGIC, STRIDE_VERSION);
+        let version = match self.sparse {
+            None => STRIDE_VERSION,
+            Some(sp) => {
+                put64(&mut b, S_K, lay.k_pages);
+                put64(&mut b, S_LAST, sp.last);
+                put32(&mut b, S_EPS, sp.eps);
+                put32(&mut b, S_SAMPLE, STRIDE_SAMPLE as u32);
+                STRIDE_VERSION_SPARSE
+            }
+        };
+        seal_trailer(&mut b, &STRIDE_MAGIC, version);
         Ok(b)
     }
 
@@ -4834,7 +5178,18 @@ impl StrideTrailer {
     /// against [`stride_layout`]'s, the zeros, and `bind32` against the
     /// fields it hashes.
     pub fn decode(bytes: &[u8]) -> Result<StrideTrailer, ZError> {
-        open_trailer(bytes, &STRIDE_MAGIC, STRIDE_VERSION)?;
+        // Either version this reader knows, by the word the head holds it
+        // in; a page too short to hold the word fails the head's length.
+        let sparse = bytes.len() == ZTRAILER && get32(bytes, T_VERSION) == STRIDE_VERSION_SPARSE;
+        open_trailer(
+            bytes,
+            &STRIDE_MAGIC,
+            if sparse {
+                STRIDE_VERSION_SPARSE
+            } else {
+                STRIDE_VERSION
+            },
+        )?;
         let bad = ZError::Trailer;
         let kind = KeyKind::from_code(bytes[S_CODEC])
             .ok_or(bad("the key codec is not one this reader knows"))?;
@@ -4863,8 +5218,20 @@ impl StrideTrailer {
             w: get32(bytes, S_W),
             res_crc: get32(bytes, S_RES_CRC),
             seg: SegIdent::get(&bytes[S_SEG..S_PREFIX]),
+            sparse: sparse.then(|| StrideSparse {
+                last: get64(bytes, S_LAST),
+                eps: get32(bytes, S_EPS),
+            }),
         };
         let lay = t.layout()?;
+        if sparse {
+            if get64(bytes, S_K) != lay.k_pages {
+                return Err(bad("K is not the numbers' pages"));
+            }
+            if u64::from(get32(bytes, S_SAMPLE)) != STRIDE_SAMPLE {
+                return Err(bad("the sample stride is not this reader's"));
+            }
+        }
         if get64(bytes, S_V) != lay.v_pages {
             return Err(bad("V is not the values' pages"));
         }
@@ -4877,7 +5244,8 @@ impl StrideTrailer {
         if bytes[S_PREFIX + p..S_ZERO].iter().any(|&b| b != 0) {
             return Err(bad("a byte past the prefix is not zero"));
         }
-        if bytes[S_ZERO..T_CRC].iter().any(|&b| b != 0) {
+        let zeros = if sparse { S_ZERO_SPARSE } else { S_ZERO };
+        if bytes[zeros..T_CRC].iter().any(|&b| b != 0) {
             return Err(bad("a reserved byte is not zero"));
         }
         if get32(bytes, S_BIND32) != t.bind32() {
@@ -9669,7 +10037,7 @@ mod tests {
     /// one, and the longest prefix the key's length leaves room for.
     fn every_codec_shape() -> Vec<KeyCodec> {
         let mut v = Vec::new();
-        for kind in [KeyKind::Decimal, KeyKind::BigEndian] {
+        for kind in KEY_KINDS {
             for d in 1..=kind.d_max() {
                 let long = vec![b'p'; STRIDE_KEY_MAX - d];
                 for prefix in [&b""[..], b"k", &long] {
@@ -9740,14 +10108,17 @@ mod tests {
                     k[i] ^= 1;
                     assert_eq!(c.decode(&k), None, "{c:?} {x} prefix byte {i}");
                 }
-                // A byte at each place of the field that is no digit.
-                if c.kind() == KeyKind::Decimal {
-                    for i in c.prefix().len()..key.len() {
-                        for b in [b'0' - 1, b'9' + 1, 0, 0xff] {
-                            let mut k = key.clone();
-                            k[i] = b;
-                            assert_eq!(c.decode(&k), None, "{c:?} {x} field byte {i} = {b}");
+                // A byte at each place of the field that is none of the
+                // kind's: either side of the digits and of each case's
+                // letters, the other case's letters, the ends of a byte.
+                for i in c.prefix().len()..key.len() {
+                    for b in EDGE_BYTES {
+                        if c.kind().rank_byte(b).1 {
+                            continue;
                         }
+                        let mut k = key.clone();
+                        k[i] = b;
+                        assert_eq!(c.decode(&k), None, "{c:?} {x} field byte {i} = {b}");
                     }
                 }
             }
@@ -9768,7 +10139,7 @@ mod tests {
         // the build walk's second quantity, a key the number renders
         // (`zfile::stride_key_is`), a reason no key earns under this
         // decoder.
-        for kind in [KeyKind::Decimal, KeyKind::BigEndian] {
+        for kind in KEY_KINDS {
             for d in 1..=2usize {
                 let c = KeyCodec::new(kind, b"k", d, 0).unwrap();
                 let mut taken = 0u64;
@@ -9796,8 +10167,33 @@ mod tests {
         );
         let c = KeyCodec::new(KeyKind::BigEndian, b"", STRIDE_BE_MAX, 0).unwrap();
         assert_eq!(c.top(), u64::MAX);
+        // The widest hex field is a u64 in sixteen digits of its case, and
+        // each case refuses the other's letters.
+        for (kind, top, other) in [
+            (KeyKind::HexLower, b"ffffffffffffffff", b"FFFFFFFFFFFFFFFF"),
+            (KeyKind::HexUpper, b"FFFFFFFFFFFFFFFF", b"ffffffffffffffff"),
+        ] {
+            let c = KeyCodec::new(kind, b"", STRIDE_HEX_MAX, 0).unwrap();
+            assert_eq!(c.top(), u64::MAX);
+            assert_eq!(c.decode(top), Some(u64::MAX));
+            assert_eq!(c.render(u64::MAX, &mut buf), &top[..]);
+            assert_eq!(c.decode(other), None);
+            assert_eq!(
+                c.decode(b"0123456789abcdef").is_some(),
+                kind == KeyKind::HexLower
+            );
+            assert_eq!(
+                c.decode(b"0123456789ABCDEF").is_some(),
+                kind == KeyKind::HexUpper
+            );
+            assert_eq!(
+                KeyCodec::new(kind, b"", 3, 0).unwrap().top(),
+                0xfff,
+                "{kind:?}: three digits"
+            );
+        }
         // The constructor refuses what it cannot render.
-        for kind in [KeyKind::Decimal, KeyKind::BigEndian] {
+        for kind in KEY_KINDS {
             let width = "the field's width is not one to the most its kind holds";
             assert_eq!(KeyCodec::new(kind, b"", 0, 0).err(), Some(width));
             assert_eq!(
@@ -9827,6 +10223,26 @@ mod tests {
         assert!(c.holds(1) && !c.holds(2));
     }
 
+    /// Bytes at the edges of every kind's alphabet: either side of the
+    /// digits and of each case's six letters, the letters' ends, and the
+    /// ends of a byte.
+    const EDGE_BYTES: [u8; 14] = [
+        0,
+        b'0' - 1,
+        b'0',
+        b'9',
+        b'9' + 1,
+        b'A' - 1,
+        b'A',
+        b'F',
+        b'F' + 1,
+        b'a' - 1,
+        b'a',
+        b'f',
+        b'f' + 1,
+        0xff,
+    ];
+
     /// The rank of the first rendered key at or after `q`, and whether it is
     /// `q`, by a binary search under the engine's key order: what
     /// `lower_bound` computes, written the other way.
@@ -9844,6 +10260,7 @@ mod tests {
     fn lower_bound_is_the_binary_search_of_the_rendered_keys() {
         let dec = KeyKind::Decimal;
         let be = KeyKind::BigEndian;
+        let (hexl, hexu) = (KeyKind::HexLower, KeyKind::HexUpper);
         let top = |kind, d| KeyCodec::new(kind, b"", d, 0).unwrap().top();
         let runs: Vec<(KeyKind, &[u8], usize, u64, u64)> = vec![
             // A run of one; a run over a carry of the field's first digit.
@@ -9876,6 +10293,15 @@ mod tests {
             (dec, b"0000000009", 6, 999_000, 1000),
             (be, b"\x80", 1, 3, 253),
             (be, b"\x00\x01", 2, 65_000, 536),
+            // Hex runs of each case: over the step from the digits to the
+            // letters, over a carry, to a field's top, behind a prefix of
+            // letters of the other case, and the widest field's last keys.
+            (hexl, b"", 2, 0, 256),
+            (hexl, b"k", 3, 0x9f8, 40),
+            (hexu, b"", 2, 0x08, 0x20),
+            (hexu, b"abc", 4, 0xff00, 256),
+            (hexl, b"ABC", 1, 0, 16),
+            (hexl, b"", STRIDE_HEX_MAX, u64::MAX - 30, 31),
         ];
         let mut buf = [0u8; STRIDE_KEY_MAX];
         for &(kind, prefix, d, base, n) in &runs {
@@ -9890,10 +10316,9 @@ mod tests {
                 prefix[..prefix.len().saturating_sub(1)].to_vec(),
             ];
             for len in 1..=c.key_len() + 1 {
-                qs.push(vec![0xff; len]);
-                qs.push(vec![0; len]);
-                qs.push(vec![b'0'; len]);
-                qs.push(vec![b'9'; len]);
+                for b in EDGE_BYTES {
+                    qs.push(vec![b; len]);
+                }
             }
             for i in 0..prefix.len() {
                 for delta in [1u8, 0xff] {
@@ -9911,13 +10336,13 @@ mod tests {
             for x in lo..=hi {
                 let k = c.render(x, &mut buf).to_vec();
                 qs.push(k[..k.len() - 1].to_vec());
-                for b in [0u8, b'0', b'9', 0xff] {
+                for b in EDGE_BYTES {
                     let mut q = k.clone();
                     q.push(b);
                     qs.push(q);
                 }
                 for i in 0..k.len() {
-                    for b in [b'0' - 1, b'9' + 1, 0, 0xff] {
+                    for b in EDGE_BYTES {
                         let mut q = k.clone();
                         q[i] = b;
                         qs.push(q);
@@ -9931,6 +10356,22 @@ mod tests {
                     search(&keys, q),
                     "{c:?} n {n}: {q:02x?}"
                 );
+                // The same place among the field's numbers, which a run
+                // with gaps is searched by: for a run with none it is the
+                // rank past the base, wherever it falls inside the run.
+                let (at, exact) = c.at_or_after(q);
+                let (r, order) = search(&keys, q);
+                if r > 0 && r < n {
+                    assert_eq!(at, u128::from(base + r), "{c:?}: {q:02x?}");
+                    assert_eq!(exact, order == Ordering::Equal, "{c:?}: {q:02x?}");
+                } else if r == 0 {
+                    assert!(at <= u128::from(base), "{c:?}: {q:02x?} below the run");
+                } else {
+                    assert!(
+                        at >= u128::from(base) + u128::from(n),
+                        "{c:?}: {q:02x?} past it"
+                    );
+                }
             }
             // The run's own keys, each found where it is.
             for (r, k) in keys.iter().enumerate() {
@@ -10082,6 +10523,312 @@ mod tests {
         );
     }
 
+    /// `at_or_after` against the definition, over every number of a small
+    /// field of each kind: the least number whose rendering is at or after
+    /// the key, one past the field's last where none is, and exact only
+    /// for a rendering.
+    #[test]
+    fn at_or_after_is_the_least_number_rendered_at_or_after_the_key() {
+        let mut buf = [0u8; STRIDE_KEY_MAX];
+        for kind in KEY_KINDS {
+            for (prefix, d) in [(&b""[..], 1usize), (b"k", 2), (b"ab", 1)] {
+                let c = KeyCodec::new(kind, prefix, d, 0).unwrap();
+                let keys: Vec<Vec<u8>> = (0..=c.top())
+                    .map(|x| c.render(x, &mut buf).to_vec())
+                    .collect();
+                let mut qs: Vec<Vec<u8>> = vec![Vec::new(), prefix.to_vec()];
+                for len in 1..=c.key_len() + 1 {
+                    for b in EDGE_BYTES {
+                        qs.push(vec![b; len]);
+                        let mut q = prefix.to_vec();
+                        q.resize(len.max(prefix.len()), b);
+                        qs.push(q);
+                    }
+                }
+                for k in &keys {
+                    qs.push(k.clone());
+                    qs.push(k[..k.len() - 1].to_vec());
+                    for b in EDGE_BYTES {
+                        let mut q = k.clone();
+                        q.push(b);
+                        qs.push(q);
+                        let mut q = k.clone();
+                        *q.last_mut().unwrap() = b;
+                        qs.push(q);
+                    }
+                }
+                for q in &qs {
+                    let (r, order) = search(&keys, q);
+                    assert_eq!(
+                        c.at_or_after(q),
+                        (u128::from(r), order == Ordering::Equal),
+                        "{c:?}: {q:02x?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn detect_any_takes_a_run_with_gaps_under_the_narrowest_kind_that_holds_it() {
+        let all = &KEY_KINDS[..];
+        let shape = |r: std::result::Result<(KeyCodec, bool), KeyShapeNo>| {
+            r.map(|(c, whole)| (c.kind(), c.prefix().to_vec(), c.d(), c.base(), whole))
+        };
+        // A whole run under every kind asked is what `detect` finds, and
+        // a whole run of hex keys is one where the hex kinds are asked and
+        // holes where they are not.
+        assert_eq!(
+            shape(KeyCodec::detect_any(b"k0000", b"k0999", 1000, all, &[])),
+            Ok((KeyKind::Decimal, b"k0".to_vec(), 3, 0, true))
+        );
+        assert_eq!(
+            shape(KeyCodec::detect_any(b"k00f0", b"k010f", 32, all, &[])),
+            Ok((KeyKind::HexLower, b"k0".to_vec(), 3, 0x0f0, true))
+        );
+        assert_eq!(
+            shape(KeyCodec::detect_any(b"k00F0", b"k010F", 32, all, &[])),
+            Ok((KeyKind::HexUpper, b"k0".to_vec(), 3, 0x0f0, true))
+        );
+        // Where they are not asked the same two keys are the ends of a run
+        // of bytes with gaps, which `detect`, a whole run's, calls holes.
+        assert_eq!(
+            shape(KeyCodec::detect_any(
+                b"k00f0",
+                b"k010f",
+                32,
+                &KEY_KINDS_DENSE,
+                &[]
+            )),
+            Ok((KeyKind::BigEndian, b"k0".to_vec(), 3, 0x30_6630, false))
+        );
+        assert_eq!(
+            KeyCodec::detect(b"k00f0", b"k010f", 32),
+            Err(KeyShapeNo::Holes)
+        );
+        // Fewer keys than numbers between the ends: a run with gaps, under
+        // the first kind that holds the ends.
+        assert_eq!(
+            shape(KeyCodec::detect_any(b"k0000", b"k0999", 999, all, &[])),
+            Ok((KeyKind::Decimal, b"k0".to_vec(), 3, 0, false))
+        );
+        assert_eq!(
+            shape(KeyCodec::detect_any(b"1a00", b"ff00", 1000, all, &[])),
+            Ok((KeyKind::HexLower, Vec::new(), 4, 0x1a00, false))
+        );
+        // More keys than numbers is no run of the kind: under decimal the
+        // ends hold a thousand numbers, under hex 0x99a, under bytes more
+        // still, and each is taken in its turn as the count passes the
+        // kind before it.
+        for (n, kind) in [
+            (1000u64, KeyKind::Decimal),
+            (1001, KeyKind::HexLower),
+            (0x99a, KeyKind::HexLower),
+            (0x99b, KeyKind::BigEndian),
+        ] {
+            let got = KeyCodec::detect_any(b"k0000", b"k0999", n, all, &[]).unwrap();
+            assert_eq!(got.0.kind(), kind, "{n} keys");
+        }
+        // A kind that counts the run exactly is taken before a narrower
+        // one that counts more: "19" to "20" is two decimal numbers, eight
+        // hex numbers, and the whole run of the bytes between them.
+        let span = u64::from(u16::from_be_bytes(*b"20") - u16::from_be_bytes(*b"19")) + 1;
+        assert_eq!(
+            shape(KeyCodec::detect_any(b"19", b"20", span, all, &[])),
+            Ok((KeyKind::BigEndian, Vec::new(), 2, 0x3139, true))
+        );
+        assert_eq!(
+            shape(KeyCodec::detect_any(b"19", b"20", 8, all, &[])),
+            Ok((KeyKind::HexLower, Vec::new(), 2, 0x19, true))
+        );
+        assert_eq!(
+            shape(KeyCodec::detect_any(b"19", b"20", 5, all, &[])),
+            Ok((KeyKind::HexLower, Vec::new(), 2, 0x19, false))
+        );
+        // And whatever the order the kinds are asked in: with the bytes
+        // before the digits, the bytes count a run with gaps first and the
+        // digits the whole run after, and the whole run is the answer.
+        assert_eq!(
+            shape(KeyCodec::detect_any(
+                b"19",
+                b"20",
+                2,
+                &[KeyKind::BigEndian, KeyKind::Decimal],
+                &[]
+            )),
+            Ok((KeyKind::Decimal, Vec::new(), 2, 19, true))
+        );
+        // Keys read from inside the run say which kind the ends cannot:
+        // ends of digits around a key with a letter are a hex run, of
+        // either case by the letter, and around a key with a byte of
+        // neither they are a run of bytes or, too wide for one, of no kind.
+        let ends = (&b"1000000000"[..], &b"9000000000"[..]);
+        let kind_with = |more: &[&[u8]]| {
+            KeyCodec::detect_any(ends.0, ends.1, 100, all, more).map(|(c, whole)| (c.kind(), whole))
+        };
+        assert_eq!(kind_with(&[]), Ok((KeyKind::Decimal, false)));
+        assert_eq!(kind_with(&[b"2000000000"]), Ok((KeyKind::Decimal, false)));
+        assert_eq!(kind_with(&[b"2000a00000"]), Ok((KeyKind::HexLower, false)));
+        assert_eq!(kind_with(&[b"2000A00000"]), Ok((KeyKind::HexUpper, false)));
+        assert_eq!(
+            kind_with(&[b"2000a00000", b"3000A00000"]),
+            Err(KeyShapeNo::Field)
+        );
+        assert_eq!(kind_with(&[b"2000_00000"]), Err(KeyShapeNo::Field));
+        let short = KeyCodec::detect_any(b"10", b"90", 5, all, &[b"2_"]);
+        assert_eq!(
+            short.map(|(c, whole)| (c.kind(), whole)),
+            Ok((KeyKind::BigEndian, false))
+        );
+        // A key of another length, or outside the prefix the ends share,
+        // is no key of the run.
+        assert_eq!(
+            KeyCodec::detect_any(b"k10", b"k90", 5, all, &[b"k2"]).map(|_| ()),
+            Err(KeyShapeNo::Length)
+        );
+        assert_eq!(
+            KeyCodec::detect_any(b"k10", b"k90", 5, all, &[b"j20"]).map(|_| ()),
+            Err(KeyShapeNo::Field)
+        );
+        // A run counted backwards and a run of nothing are holes under
+        // every kind; every eight-byte number is a run with gaps for any
+        // count, where it was no run at all for a form that held none.
+        assert_eq!(
+            KeyCodec::detect_any(b"k0999", b"k0000", 10, all, &[]).map(|_| ()),
+            Err(KeyShapeNo::Holes)
+        );
+        assert_eq!(
+            shape(KeyCodec::detect_any(b"k0042", b"k0042", 0, all, &[])),
+            Ok((KeyKind::Decimal, b"k004".to_vec(), 1, 2, false))
+        );
+        let whole = KeyCodec::detect_any(&[0; STRIDE_BE_MAX], &[0xff; STRIDE_BE_MAX], 7, all, &[]);
+        assert_eq!(
+            shape(whole),
+            Ok((KeyKind::BigEndian, Vec::new(), STRIDE_BE_MAX, 0, false))
+        );
+    }
+
+    #[test]
+    fn the_sparse_stride_layout_is_its_regions_end_to_end() {
+        let page = ZPAGE as u64;
+        for n in [
+            1u64,
+            2,
+            63,
+            64,
+            65,
+            511,
+            512,
+            513,
+            345_000,
+            10_000_000,
+            u64::from(u32::MAX),
+        ] {
+            for w in [1u32, 99, 100, 4095, STRIDE_W_MAX] {
+                let l = stride_layout_sparse(n, w).expect("no overflow inside a trailer's ranges");
+                let dense = stride_layout(n, w).unwrap();
+                assert_eq!(
+                    l.v_pages, dense.v_pages,
+                    "{n} {w}: the values are the dense form's"
+                );
+                assert_eq!(l.k_off(), l.v_pages * page);
+                assert_eq!(l.k_pages, (n * 8).div_ceil(page), "{n}");
+                assert!(l.k_pages * page >= n * 8 && (l.k_pages - 1) * page < n * 8);
+                assert_eq!(l.samples, n.div_ceil(STRIDE_SAMPLE));
+                assert!((l.samples - 1) * STRIDE_SAMPLE < n && l.samples * STRIDE_SAMPLE >= n);
+                assert_eq!(l.row_pages(), l.v_pages + l.k_pages);
+                assert_eq!(l.res_off, l.row_pages() * page);
+                assert_eq!(l.row_len(), 4 * l.row_pages());
+                assert_eq!(l.samples_off() % 8, 0);
+                assert!(l.samples_off() >= l.res_off + l.row_len());
+                assert!(l.samples_off() < l.res_off + l.row_len() + 8);
+                assert_eq!(l.res_off + l.res_len, l.samples_off() + 8 * l.samples);
+                assert_eq!(l.res_pages, l.res_len.div_ceil(page));
+                assert_eq!(l.file_len, (l.row_pages() + l.res_pages + 1) * page);
+                // A form that holds no number has no page or sample of
+                // them, and its row is its values' alone.
+                assert_eq!((dense.k_pages, dense.samples), (0, 0));
+                assert_eq!(dense.row_len(), dense.res_len);
+            }
+        }
+        assert_eq!(stride_layout_sparse(u64::MAX, 2), None);
+        assert_eq!(stride_layout_sparse(u64::MAX / 4, 1), None);
+    }
+
+    /// The line and its error, against the definition: over numbers of
+    /// several spreads, every number's guess is within the measured error
+    /// of the last sample at or below it, some number's is exactly that
+    /// far, and any value between two numbers is within one more.
+    #[test]
+    fn the_lines_error_bounds_every_numbers_guess_and_is_reached() {
+        let mut rng = Rng::new(0x51_7EED);
+        let step = STRIDE_SAMPLE as usize;
+        let mut spreads: Vec<(&str, Vec<u64>)> = Vec::new();
+        for n in [1usize, 2, 63, 64, 65, 1000, 20_000] {
+            // A whole run, where the line is exact to a sample.
+            spreads.push(("a whole run", (0..n as u64).map(|i| 7 + i).collect()));
+            // Uniform draws.
+            let mut v: Vec<u64> = (0..n).map(|_| rng.word()).collect();
+            v.sort_unstable();
+            v.dedup();
+            spreads.push(("uniform", v));
+            // All but the last in one corner: the line as wrong as it gets.
+            let mut v: Vec<u64> = (0..n as u64).collect();
+            *v.last_mut().unwrap() = u64::MAX;
+            spreads.push(("a corner", v));
+            // Squares: dense at the low end, thin at the high.
+            let mut v: Vec<u64> = (0..n as u64).map(|i| i * i * 1000).collect();
+            v.dedup();
+            spreads.push(("squares", v));
+        }
+        for (what, numbers) in spreads {
+            let n = numbers.len();
+            let (lo, hi) = (numbers[0], numbers[n - 1]);
+            let m = (n as u64).div_ceil(STRIDE_SAMPLE);
+            let eps = u64::from(stride_eps(&numbers));
+            let mut worst = 0;
+            let mut before = 0;
+            for (r, &x) in numbers.iter().enumerate() {
+                let g = stride_line(lo, hi, m, x);
+                assert!(
+                    g <= m,
+                    "{what} {n}: the guess is among the samples or one past"
+                );
+                assert!(g >= before, "{what} {n}: the line never falls");
+                before = g;
+                let s = (r / step) as u64;
+                assert!(
+                    g.abs_diff(s) <= eps,
+                    "{what} {n}: rank {r} guessed {g}, error {eps}"
+                );
+                worst = worst.max(g.abs_diff(s));
+                // A value just past a number, short of the next: its last
+                // sample is this number's.
+                if numbers.get(r + 1).is_some_and(|&next| next > x + 1) {
+                    let g = stride_line(lo, hi, m, x + 1);
+                    assert!(g.abs_diff(s) <= eps + 1, "{what} {n}: past rank {r}");
+                }
+            }
+            assert_eq!(worst, eps, "{what} {n}: the error is one some number has");
+            // Outside the two ends the line is held at them.
+            assert_eq!(stride_line(lo, hi, m, lo.saturating_sub(1)), 0);
+            assert_eq!(
+                stride_line(lo, hi, m, hi.saturating_add(1)),
+                if hi > lo { m } else { 0 }
+            );
+            if what == "a whole run" {
+                assert!(eps <= 1, "{n}: a whole run is on the line: {eps}");
+            }
+            if what == "a corner" && n >= 2 * step {
+                assert!(
+                    eps >= m - 1,
+                    "{n}: a corner is off it by nearly every sample: {eps}"
+                );
+            }
+        }
+        assert_eq!(stride_eps(&[]), 0);
+    }
+
     #[test]
     fn a_stride_page_is_bound_to_its_file_and_its_index() {
         let mut rng = Rng::new(47);
@@ -10147,6 +10894,7 @@ mod tests {
             w: 100,
             res_crc: 0xF00D_CAFE,
             seg: sample_trailer().seg_ident(),
+            sparse: None,
         }
     }
 
@@ -10333,7 +11081,16 @@ mod tests {
         let p = sample_stride_trailer().codec.prefix().len();
         let codec = "the key codec is not one this reader knows";
         assert_eq!(why(bad(&|b| b[S_CODEC] = 0)), codec);
-        assert_eq!(why(bad(&|b| b[S_CODEC] = 3)), codec);
+        assert_eq!(why(bad(&|b| b[S_CODEC] = 5)), codec);
+        assert_eq!(why(bad(&|b| b[S_CODEC] = 0xff)), codec);
+        // The hex kinds' codes are kinds: the same field read as hex
+        // digits is a run its six digits hold, of another codec.
+        for (code, kind) in [(3, KeyKind::HexLower), (4, KeyKind::HexUpper)] {
+            let mut b = base;
+            b[S_CODEC] = code;
+            resign_trailer(&mut b);
+            assert_eq!(StrideTrailer::decode(&b).map(|t| t.codec.kind()), Ok(kind));
+        }
         let length = "the key length is not one to the most a stride form takes";
         assert_eq!(why(bad(&|b| b[S_L] = 0)), length);
         assert_eq!(why(bad(&|b| b[S_L] = STRIDE_KEY_MAX as u8 + 1)), length);
@@ -10431,7 +11188,7 @@ mod tests {
         let t = StrideTrailer::decode(&b).unwrap();
         assert_eq!(t.seg.recs_len, sample_stride_trailer().seg.recs_len ^ 4);
         // A version or a page size the CRC covers is refused before it.
-        for v in [0u32, STRIDE_VERSION + 1] {
+        for v in [0u32, STRIDE_VERSION_SPARSE + 1] {
             let mut b = base;
             put32(&mut b, T_VERSION, v);
             assert_eq!(
@@ -10440,8 +11197,237 @@ mod tests {
                 "version {v}"
             );
         }
+        // The sparse form's version over a trailer that is not one: torn
+        // as it stands, and with its CRC made good a sparse trailer whose
+        // fields, zeros where a whole run's are, name no numbers.
+        let mut b = base;
+        put32(&mut b, T_VERSION, STRIDE_VERSION_SPARSE);
+        assert_eq!(StrideTrailer::decode(&b), Err(ZError::TrailerCrc));
+        resign_trailer(&mut b);
+        assert_eq!(
+            why(StrideTrailer::decode(&b).err()),
+            "the numbers between the ends are fewer than the keys"
+        );
         let mut b = base;
         put32(&mut b, T_PAGE_SIZE, 16_384);
         assert_eq!(StrideTrailer::decode(&b), Err(ZError::PageSize));
+    }
+
+    /// A sparse trailer over the sample's segment: sixteen hex digits
+    /// behind no prefix, the first number and the last a spread apart.
+    fn sample_sparse_trailer() -> StrideTrailer {
+        let plain = sample_stride_trailer();
+        StrideTrailer {
+            codec: KeyCodec::new(KeyKind::HexLower, b"", STRIDE_HEX_MAX, 0x1000).unwrap(),
+            sparse: Some(StrideSparse {
+                last: u64::MAX - 5,
+                eps: 3,
+            }),
+            ..plain
+        }
+    }
+
+    #[test]
+    fn the_sparse_stride_trailer_round_trips_and_is_read_by_an_independent_decoder() {
+        let t = sample_sparse_trailer();
+        let n = t.seg.nkeys;
+        let mut shapes = vec![t];
+        // A run of one key: its number both ends, a line with no error.
+        shapes.push(StrideTrailer {
+            seg: SegIdent { nkeys: 1, ..t.seg },
+            sparse: Some(StrideSparse {
+                last: 0x1000,
+                eps: 0,
+            }),
+            ..t
+        });
+        // Exactly as many numbers as keys: a whole run held as a sparse
+        // one, which the layout takes and no builder writes.
+        shapes.push(StrideTrailer {
+            sparse: Some(StrideSparse {
+                last: 0x1000 + n - 1,
+                eps: 1,
+            }),
+            ..t
+        });
+        // Every kind holds one; the error as large as the samples.
+        for kind in KEY_KINDS {
+            shapes.push(StrideTrailer {
+                codec: KeyCodec::new(kind, b"id-", 5, 7).unwrap(),
+                sparse: Some(StrideSparse {
+                    last: KeyCodec::new(kind, b"id-", 5, 7).unwrap().top(),
+                    eps: n.div_ceil(STRIDE_SAMPLE) as u32,
+                }),
+                seg: SegIdent {
+                    nkeys: n.min(1000),
+                    ..t.seg
+                },
+                ..t
+            });
+        }
+        for t in shapes {
+            let b = t.encode().expect("a sparse trailer of consistent fields");
+            assert_eq!(StrideTrailer::decode(&b), Ok(t), "{t:?}");
+            let l = stride_layout_sparse(t.seg.nkeys, t.w).unwrap();
+            assert_eq!(t.layout(), Ok(l));
+            assert_eq!(t.expected_file_len(), Some(l.file_len));
+            // The same fields without the numbers are the smaller file,
+            // where they make one.
+            let dense = StrideTrailer { sparse: None, ..t };
+            if let Ok(d) = dense.layout() {
+                assert!(d.file_len < l.file_len);
+            }
+        }
+        // The bytes, by offsets written out: the head's version, the
+        // fields a whole run's trailer has at their places, and the four
+        // of a sparse one where that trailer holds zeros.
+        let b = t.encode().unwrap();
+        let v = (n * u64::from(t.w)).div_ceil(4096);
+        let k = (n * 8).div_ceil(4096);
+        let m = n.div_ceil(64);
+        assert_eq!(&b[0..8], b"SUPDZST1");
+        assert_eq!(le32(&b, 8), 2, "the sparse version");
+        assert_eq!(b[16], 3, "the lowercase hex codec");
+        assert_eq!((b[17], b[18], b[19]), (16, 16, 0));
+        assert_eq!(le32(&b, 20), t.w);
+        assert_eq!(le64(&b, 24), 0x1000, "the first number");
+        assert_eq!(le64(&b, 32), v);
+        assert_eq!(
+            le64(&b, 40),
+            4096 * (v + k),
+            "the resident part after the numbers"
+        );
+        assert_eq!(le64(&b, 48), (4 * (v + k)).next_multiple_of(8) + 8 * m);
+        assert_eq!(le32(&b, 56), t.res_crc);
+        assert_eq!(le64(&b, 224), k, "the numbers' pages");
+        assert_eq!(le64(&b, 232), u64::MAX - 5, "the last number");
+        assert_eq!(le32(&b, 240), 3, "the line's error");
+        assert_eq!(le32(&b, 244), 64, "the sample stride");
+        assert!(
+            b[248..4092].iter().all(|&x| x == 0),
+            "zeros past the fields"
+        );
+        assert_eq!(le32(&b, 4092), crc32c(&b[..4092]));
+        assert_eq!(
+            sample_sparse_trailer()
+                .encode()
+                .map(|b| StrideTrailer::decode(&b).unwrap().sparse),
+            Ok(t.sparse)
+        );
+        // A whole run's trailer is the first version's bytes still.
+        let dense = sample_stride_trailer().encode().unwrap();
+        assert_eq!(le32(&dense, 8), 1);
+        assert!(dense[224..4092].iter().all(|&x| x == 0));
+        // The hex kinds' codes.
+        let upper = StrideTrailer {
+            codec: KeyCodec::new(KeyKind::HexUpper, b"", 4, 0).unwrap(),
+            sparse: Some(StrideSparse {
+                last: 0xffff,
+                eps: 0,
+            }),
+            seg: SegIdent { nkeys: 9, ..t.seg },
+            ..t
+        };
+        assert_eq!(upper.encode().unwrap()[16], 4, "the uppercase hex codec");
+    }
+
+    #[test]
+    fn a_sparse_stride_trailers_fields_are_held_to_each_other() {
+        let t = sample_sparse_trailer();
+        let base = t.encode().unwrap();
+        assert!(StrideTrailer::decode(&base).is_ok());
+        // A flipped byte anywhere is the head's or the CRC's to refuse.
+        for at in (0..ZTRAILER).step_by(7).chain([224, 232, 240, 244, 247]) {
+            let mut bad = base;
+            bad[at] ^= 0x40;
+            let want = match at {
+                0..=7 => ZError::Magic,
+                8..=11 => ZError::Version,
+                12..=15 => ZError::PageSize,
+                _ => ZError::TrailerCrc,
+            };
+            assert_eq!(StrideTrailer::decode(&bad), Err(want), "byte {at}");
+        }
+        let bad = |f: &dyn Fn(&mut [u8; ZTRAILER])| {
+            let mut b = base;
+            f(&mut b);
+            resign_trailer(&mut b);
+            StrideTrailer::decode(&b).err()
+        };
+        let why = |e: Option<ZError>| match e {
+            Some(ZError::Trailer(w)) => w,
+            other => panic!("not an inconsistent trailer: {other:?}"),
+        };
+        let n = t.seg.nkeys;
+        // The last number: before the first, and with fewer numbers
+        // between the two than the form has keys; one fewer is refused and
+        // exactly as many is taken.
+        let ends = "the last key's number is not in the field past the first";
+        assert_eq!(why(bad(&|b| put64(b, S_LAST, 0x0fff))), ends);
+        let few = "the numbers between the ends are fewer than the keys";
+        assert_eq!(why(bad(&|b| put64(b, S_LAST, 0x1000 + n - 2))), few);
+        assert_eq!(bad(&|b| put64(b, S_LAST, 0x1000 + n - 1)), None);
+        // Past the field, where the field is narrower than a u64.
+        let narrow = StrideTrailer {
+            codec: KeyCodec::new(KeyKind::HexLower, b"k", 6, 0).unwrap(),
+            sparse: Some(StrideSparse {
+                last: 0xff_ffff,
+                eps: 0,
+            }),
+            ..t
+        };
+        assert!(narrow.encode().is_ok());
+        let past = StrideTrailer {
+            sparse: Some(StrideSparse {
+                last: 0x100_0000,
+                eps: 0,
+            }),
+            ..narrow
+        };
+        assert_eq!(why(past.encode().err()), ends);
+        // The line's error: as many samples as the form has is taken, one
+        // more is not.
+        let m = n.div_ceil(STRIDE_SAMPLE) as u32;
+        assert_eq!(bad(&|b| put32(b, S_EPS, m)), None);
+        assert_eq!(
+            why(bad(&|b| put32(b, S_EPS, m + 1))),
+            "the line's error is more samples than the form has"
+        );
+        // The numbers' pages and the sample stride against this reader's.
+        assert_eq!(why(bad(&|b| b[S_K] ^= 1)), "K is not the numbers' pages");
+        assert_eq!(
+            why(bad(&|b| put32(b, S_SAMPLE, 32))),
+            "the sample stride is not this reader's"
+        );
+        // The sizes are the sparse layout's: a whole run's are refused.
+        let dense = stride_layout(n, t.w).unwrap();
+        assert_eq!(
+            why(bad(&|b| put64(b, S_RES_OFF, dense.res_off))),
+            "res_off is not the values' length"
+        );
+        assert_eq!(
+            why(bad(&|b| put64(b, S_RES_LEN, dense.res_len))),
+            "res_len is not the row's length"
+        );
+        // The zeros after the four fields.
+        for at in [S_ZERO_SPARSE, 2000, T_CRC - 1] {
+            assert_eq!(
+                why(bad(&|b| b[at] = 1)),
+                "a reserved byte is not zero",
+                "byte {at}"
+            );
+        }
+        // The first version over a sparse trailer's bytes: the four fields
+        // are bytes where a whole run's trailer holds zeros.
+        let mut b = base;
+        put32(&mut b, T_VERSION, STRIDE_VERSION);
+        resign_trailer(&mut b);
+        assert!(matches!(StrideTrailer::decode(&b), Err(ZError::Trailer(_))));
+        // A reader that knows the first version alone refuses the second
+        // at the version, before the CRC: the head's order.
+        assert_eq!(
+            open_trailer(&base, &STRIDE_MAGIC, STRIDE_VERSION),
+            Err(ZError::Version)
+        );
     }
 }

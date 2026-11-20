@@ -15642,7 +15642,7 @@ fn stride_oracle(name: &str, cache: bool) {
     // `ZStride::Forced` the build that meets either is the block form's
     // decline and counted there alone, so those two slots stay empty
     // whatever the store holds.
-    let [_, holes, not_one, width, tomb, _, _, check_no, kept] = sum.stride_declines;
+    let [_, holes, not_one, width, tomb, _, _, check_no, _, kept] = sum.stride_declines;
     assert!(
         not_one > 0 && holes + tomb > 0,
         "the second values' and the deletes' partitions declined: {sum:?}"
@@ -17948,6 +17948,229 @@ fn convert_store_with(
         "{name}: partitions to choose from, each in the form its build asks: {c:?}"
     );
     (dir, db, model, inject, keys)
+}
+
+/// `numbered_soft_load` over every other number: keys that are numbers
+/// with a gap between each two, which the stride form declines as holes
+/// and its sparse form takes (`Options::zpages_stride_sparse`).
+fn gapped_soft_load(db: &mut Db, n: usize, w: usize, seed: u64) -> Model {
+    let mut rng = Rng(seed);
+    let mut model = Model::new();
+    for chunk in (0..n).collect::<Vec<_>>().chunks(500) {
+        for &i in chunk {
+            let mut v = vec![0x5Au8; w];
+            for b in v.iter_mut().take(4) {
+                *b = (rng.next() >> 24) as u8;
+            }
+            let k = numbered_key(2 * i);
+            db.append(&k, &v);
+            model.insert(k, vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    model
+}
+
+/// The sparse stride form under the controller waits for a reader
+/// (`Options::zpages_stride_sparse`, `zfile::StrideNo::Deferred`). A store
+/// of keys with gaps between their numbers, loaded with nothing read, has
+/// its form files built ahead in the block form, each partition's ask of
+/// the sparse form left for a conversion and counted so, and none built
+/// sparse: a build made before any reader is of a store still being
+/// written. Read, with the files attached, each partition keeps the
+/// deferred reason and no other. With no room -- the budget at the block
+/// files' own bytes -- no look converts one, however it is read. With room
+/// every partition read is moved into the sparse form at the first looks,
+/// at no rent, under a price for a conversion's build no reads could pay
+/// in the time; each then reads through its stride file as the model has
+/// it and keeps no reason. And a partition that has been in the form and
+/// left it is asked back by the rent like any other: moved out with the
+/// room gone and the price paid, it stays out with the room back, under
+/// the price no reads pay. Without the option the same store's builds
+/// decline for the holes and nothing is ever asked again.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_run_with_gaps_waits_for_a_reader_and_is_converted_at_no_rent_where_it_fits() {
+    let deferred = 9u8;
+    for on in [true, false] {
+        let what = &format!("sparse deferred, option {on}");
+        let (dir, db, model, inject, raw) = land_store_loaded(
+            &format!("auto-sparse-defer-{on}"),
+            50,
+            |o| {
+                o.zpages_stride = ZStride::Forced;
+                o.zpages_stride_convert = true;
+                o.zpages_stride_sparse = on;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+                o.zpages_ahead_builders = 1;
+            },
+            |db| gapped_soft_load(db, 20_000, 100, 0x5DF),
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        // Past the share the builds ahead start at, under the line, and
+        // nothing read: every partition's file built ahead.
+        inject.set_budget(raw * 3 / 2);
+        let parts = db.zpage_counts().partitions;
+        assert!(parts >= 5, "{what}: partitions to choose from: {parts}");
+        assert!(
+            tick_until_built(&db, |c| c.prebuilt >= c.partitions),
+            "{what}: built ahead: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.stride_builds, c.stride_sparse_builds),
+            (0, 0),
+            "{what}: no stride file of a store nothing has read: {c:?}"
+        );
+        let (holes, left) = (c.stride_declines[1], c.stride_declines[8]);
+        if on {
+            assert_eq!((holes, left), (0, parts), "{what}: each ask left: {c:?}");
+        } else {
+            assert_eq!((holes, left), (parts, 0), "{what}: each declined: {c:?}");
+        }
+        // Past the line, and read: the files attached, each partition's
+        // reason its build's.
+        inject.set_budget(raw / 2);
+        {
+            let r = db.reader().unwrap();
+            let mut at = 0usize;
+            assert!(
+                drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+                "{what}: COMPACT: {:?}",
+                db.zpage_counts()
+            );
+        }
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions),
+            "{what}: every file attached: {:?}",
+            db.zpage_counts()
+        );
+        let want = if on { deferred } else { 2 };
+        let nos = db.zpage_stride_nos();
+        assert!(
+            nos.len() as u64 == parts && nos.iter().all(|&n| n == want),
+            "{what}: the builds' reason on every partition: {nos:?}"
+        );
+        let total = db.zpage_counts().file_bytes;
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        // A conversion's build priced past anything the reads here pay.
+        inject.set_convert_price(std::time::Duration::from_secs(3600));
+        let sec = std::time::Duration::from_secs(1);
+        let r = db.reader().unwrap();
+        // No room: nothing moves, deferred or not.
+        inject.set_budget(total);
+        convert_look(&db, sec);
+        let starts = db.zpage_counts().build_starts;
+        for _ in 0..3 {
+            read_round(&db, &keys, keys.len());
+            convert_look(&db, sec);
+        }
+        wait_steps(&db, 5);
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.stride_converts, c.build_starts, c.stride_files),
+            (0, starts, 0),
+            "{what}: no move pays without room: {c:?}"
+        );
+        // Room, and every partition read.
+        inject.set_budget(total * 100);
+        if !on {
+            for _ in 0..3 {
+                read_round(&db, &keys, keys.len());
+                convert_look(&db, sec);
+            }
+            wait_steps(&db, 5);
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.stride_converts, c.build_starts, c.stride_files),
+                (0, starts, 0),
+                "{what}: a partition declined for its holes is not asked: {c:?}"
+            );
+            check(&r, &model, &keys, what);
+            drop(r);
+            db.close().unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            continue;
+        }
+        assert!(
+            convert_alike_until(&db, &keys, 400, |c| c.stride_files >= c.partitions),
+            "{what}: every partition converted at no rent: {:?} {:?}",
+            db.zpage_counts(),
+            db.zpage_stride_nos()
+        );
+        let c = db.zpage_counts();
+        assert_eq!(
+            (
+                c.stride_converts,
+                c.stride_sparse_builds,
+                c.stride_converts_back
+            ),
+            (parts, parts, 0),
+            "{what}: each moved in once, into the sparse form: {c:?}"
+        );
+        assert_eq!(c.recode_failed, 0, "{what}: {c:?}");
+        assert!(
+            db.zpage_stride_nos().iter().all(|&n| n == 0),
+            "{what}: no reason left: {:?}",
+            db.zpage_stride_nos()
+        );
+        let before = c.stride_reads;
+        check(&r, &model, &keys, &format!("{what}: in the sparse form"));
+        // Keys in the gaps, which the form does not hold.
+        for i in (1..40_000usize).step_by(1_999) {
+            if i % 2 == 1 {
+                assert!(read_vec(&r, &numbered_key(i)).is_empty(), "{what}: {i}");
+            }
+        }
+        let c = db.zpage_counts();
+        assert!(
+            c.stride_reads >= before + keys.len() as u64 && c.fallbacks == 0,
+            "{what}: the reads through the stride files: {c:?}"
+        );
+        // The room short by a tenth of the sparse files' bytes and a move
+        // out priced within reach: a partition leaves the form by the rent.
+        let sparse_total = db.zpage_counts().file_bytes;
+        assert!(
+            sparse_total > total,
+            "{what}: the sparse files are the larger"
+        );
+        inject.set_convert_price(std::time::Duration::from_millis(200));
+        inject.set_budget(sparse_total * 9 / 10);
+        assert!(
+            convert_alike_until(&db, &keys, 400, |c| c.stride_converts_back >= 1),
+            "{what}: a partition moved out: {:?}",
+            db.zpage_counts()
+        );
+        // The room back, under the price no reads pay: what has been in
+        // the form and left it is the rent's to ask back, and is not.
+        inject.set_convert_price(std::time::Duration::from_secs(3600));
+        inject.set_budget(total * 100);
+        assert!(
+            tick_until_built(&db, |c| !building(c)),
+            "{what}: the builder idle: {:?}",
+            db.zpage_counts()
+        );
+        let c0 = db.zpage_counts();
+        for _ in 0..3 {
+            read_round(&db, &keys, keys.len());
+            convert_look(&db, sec);
+        }
+        wait_steps(&db, 5);
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.stride_converts, c.build_starts),
+            (c0.stride_converts, c0.build_starts),
+            "{what}: a partition that left the form is not moved back at no rent: {c:?}"
+        );
+        assert!(c.stride_files < c.partitions, "{what}: {c:?}");
+        check(&r, &model, &keys, &format!("{what}: after the move out"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// The conversion between the block and the stride forms under the
