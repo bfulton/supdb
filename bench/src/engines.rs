@@ -1706,6 +1706,14 @@ pub struct Supdb {
     /// (`Options::zpages_cursor_steps`): `supdb-zcursorsteps`; the engine's
     /// where `None`.
     zcursorsteps: Option<bool>,
+    /// A bounds walk places a block boundary by its head
+    /// (`Options::bounds_by_heads`): `supdb-boundsheads`, and with
+    /// `landboundsread` `supdb-boundslean`; the engine's where `None`.
+    boundsheads: Option<bool>,
+    /// A landing leaves its pieces' bounds where no table stands to read
+    /// them (`Options::land_bounds_read`): `supdb-landboundsread`; the
+    /// engine's where `None`.
+    landboundsread: Option<bool>,
     /// A sparse stride walk steps its key by the field
     /// (`Options::zpages_stride_step_direct`): `supdb-zsparsebuildstep`;
     /// the engine's where `None`.
@@ -2843,6 +2851,14 @@ struct Policy {
     /// (`Options::zpages_cursor_steps`): `supdb-zcursorsteps` beside
     /// `supdb`.
     zcursorsteps: Option<bool>,
+    /// A bounds walk places a block boundary by its head and reads its
+    /// record only on a tie (`Options::bounds_by_heads`), and a landing
+    /// leaves its pieces' bounds where no table stands to read them
+    /// (`Options::land_bounds_read`): `supdb-boundsheads`,
+    /// `supdb-landboundsread`, and both as `supdb-boundslean`, beside
+    /// `supdb`.
+    boundsheads: Option<bool>,
+    landboundsread: Option<bool>,
     /// A sparse stride form's walk writes the next key's field where it
     /// lies (`Options::zpages_stride_step_direct`):
     /// `supdb-zsparsebuildstep` beside `supdb-zsparsebuild`.
@@ -3162,6 +3178,8 @@ impl Default for Policy {
             zsparse: None,
             zsparsewaits: None,
             zcursorsteps: None,
+            boundsheads: None,
+            landboundsread: None,
             zstridestep: None,
             jobsmapped: false,
             jobsshort: false,
@@ -4142,6 +4160,48 @@ impl Supdb {
             path,
             Policy {
                 zcursorsteps: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// The engine whose bounds walks place a block boundary by its head
+    /// and read the boundary's record only where a key of the walked
+    /// source ties with it (`Options::bounds_by_heads`):
+    /// `supdb-boundsheads`, beside `supdb`, whose walks read the record at
+    /// every boundary whose head is not the whole of its key.
+    pub fn create_bounds_heads(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                boundsheads: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// The engine whose landings leave their pieces' bounds to a reader
+    /// while the writer keeps no block forms and no handle is live
+    /// (`Options::land_bounds_read`): `supdb-landboundsread`, beside
+    /// `supdb`, whose landings near reads walk them all.
+    pub fn create_land_bounds_read(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                landboundsread: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// Both of the bounds' options (`Options::bounds_by_heads`,
+    /// `Options::land_bounds_read`): `supdb-boundslean`, beside `supdb`.
+    pub fn create_bounds_lean(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                boundsheads: Some(true),
+                landboundsread: Some(true),
                 ..Policy::default()
             },
         )
@@ -9415,6 +9475,8 @@ impl Supdb {
             zsparse,
             zsparsewaits,
             zcursorsteps,
+            boundsheads,
+            landboundsread,
             zstridestep,
             jobsmapped,
             jobsshort,
@@ -9988,6 +10050,8 @@ impl Supdb {
                 .unwrap_or(supdb::Options::default().zpages_stride_sparse_waits),
             zpages_cursor_steps: zcursorsteps
                 .unwrap_or(supdb::Options::default().zpages_cursor_steps),
+            bounds_by_heads: boundsheads.unwrap_or(supdb::Options::default().bounds_by_heads),
+            land_bounds_read: landboundsread.unwrap_or(supdb::Options::default().land_bounds_read),
             zpages_stride_step_direct: zstridestep
                 .unwrap_or(supdb::Options::default().zpages_stride_step_direct),
             jobs_mapped: jobsmapped,
@@ -10367,6 +10431,8 @@ impl Supdb {
             zsparse,
             zsparsewaits,
             zcursorsteps,
+            boundsheads,
+            landboundsread,
             zstridestep,
             jobsmapped,
             jobsshort,
@@ -10744,6 +10810,15 @@ impl Engine for Supdb {
         }
         if self.zcursorsteps == Some(true) {
             return "supdb-zcursorsteps";
+        }
+        match (
+            self.boundsheads == Some(true),
+            self.landboundsread == Some(true),
+        ) {
+            (true, true) => return "supdb-boundslean",
+            (true, false) => return "supdb-boundsheads",
+            (false, true) => return "supdb-landboundsread",
+            (false, false) => {}
         }
         if self.zsparse == Some(true) {
             return match (
@@ -12328,6 +12403,10 @@ impl Engine for Supdb {
             ("zpage_prefetches", z.prefetches as f64),
             ("zpage_scan_views", z.scan_views as f64),
             ("zpage_cursor_steps", z.cursor_steps as f64),
+            ("bounds_by_head", z.bounds_by_head as f64),
+            ("bounds_records", z.bounds_records as f64),
+            ("land_bound_walks", z.land_bound_walks as f64),
+            ("land_bounds_left", z.land_bounds_left as f64),
             ("zpage_group_aheads", z.group_aheads as f64),
             ("zpage_declined_small", z.declined_small as f64),
             ("zpage_declined_small_bytes", z.declined_small_bytes as f64),
@@ -13481,6 +13560,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zsparsebuild"
         | "supdb-zsparsebuildstep"
         | "supdb-zcursorsteps"
+        | "supdb-boundsheads"
+        | "supdb-landboundsread"
+        | "supdb-boundslean"
         | "supdb-jobsmapped"
         | "supdb-zstridealldropagainjobs"
         | "supdb-zmemoslab"
@@ -14528,6 +14610,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zsparsebuild" => supdb_arm(Supdb::create_zsparse_build, dir)?,
         "supdb-zsparsebuildstep" => supdb_arm(Supdb::create_zsparse_build_step, dir)?,
         "supdb-zcursorsteps" => supdb_arm(Supdb::create_zcursor_steps, dir)?,
+        "supdb-boundsheads" => supdb_arm(Supdb::create_bounds_heads, dir)?,
+        "supdb-landboundsread" => supdb_arm(Supdb::create_land_bounds_read, dir)?,
+        "supdb-boundslean" => supdb_arm(Supdb::create_bounds_lean, dir)?,
         "supdb-zstrideallcdrop" => supdb_arm(Supdb::create_zstride_all_cdrop, dir)?,
         "supdb-zstridealldropagaincdrop" => {
             supdb_arm(Supdb::create_zstride_all_dropagain_cdrop, dir)?
@@ -17759,6 +17844,34 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_cursor_steps && !d.zpages_cursor_steps);
+                // The bounds' two options, each alone and both.
+                for (make, name, heads, lands) in [
+                    (
+                        Supdb::create_bounds_heads as fn(&Path) -> Res<Supdb>,
+                        "supdb-boundsheads",
+                        true,
+                        false,
+                    ),
+                    (
+                        Supdb::create_land_bounds_read,
+                        "supdb-landboundsread",
+                        false,
+                        true,
+                    ),
+                    (Supdb::create_bounds_lean, "supdb-boundslean", true, true),
+                ] {
+                    let z = make(&dir(name)).unwrap();
+                    assert_eq!(z.name(), name);
+                    assert_eq!(z.features(), base.features());
+                    let o = z.db.as_ref().unwrap().options();
+                    assert_eq!(
+                        (o.bounds_by_heads, o.land_bounds_read),
+                        (heads || d.bounds_by_heads, lands || d.land_bounds_read),
+                        "{name}"
+                    );
+                    assert!(!d.bounds_by_heads && !d.land_bounds_read);
+                    assert_eq!(o.zpages_cursor_steps, d.zpages_cursor_steps, "{name}");
+                }
                 assert_eq!(
                     (
                         o.zpages_stride_sparse,

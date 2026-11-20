@@ -588,6 +588,18 @@ pub struct ZCounts {
     /// (`Options::bounds_heads_willneed`).
     pub bounds_head_asks: u64,
     pub bounds_head_submitted: u64,
+    /// Block boundaries a bounds walk placed by the boundary's head, no
+    /// record read (`Options::bounds_by_heads`), and the boundary records
+    /// the walks read: one for every boundary whose head is not the whole
+    /// of its key with the option off, and under it only where a key of
+    /// the walked source fell inside the head's bracket.
+    pub bounds_by_head: u64,
+    pub bounds_records: u64,
+    /// Bounds walks made at a landing before its publish, a piece against
+    /// a partition each, and landings that left theirs to a reader because
+    /// no table stood to read them (`Options::land_bounds_read`).
+    pub land_bound_walks: u64,
+    pub land_bounds_left: u64,
     /// Point reads and counts of a partition answered from its form file.
     pub reads: u64,
     pub counts: u64,
@@ -4988,6 +5000,39 @@ pub struct Options {
     /// Off, `supdb-noboundsheadwillneed` and
     /// `supdb-ingestnoboundsheadwillneed`.
     pub bounds_heads_willneed: bool,
+    /// A walk of a source's keys against a partition's block boundaries
+    /// (`block_bounds_of`) places a boundary by its head where the head is
+    /// not the whole of its key, and reads the boundary's record only
+    /// where a key of the source falls inside what the head leaves open
+    /// (`OrdIndex::head_bracket`). The top level has every boundary's head
+    /// in memory; where every key is one length a head covers, the head is
+    /// the key and the walk has read no record since `whole_key_at`. Keys
+    /// longer than their common prefix and eight bytes -- random ids, any
+    /// key with a tail -- had no such path: every boundary of every
+    /// partition a piece met was a record read, a cold line in core and a
+    /// page of the raw form out of core, 156,000 of them at each landing
+    /// of a seal at ten million ids, on the thread every landing goes
+    /// through. Under 1 GiB there the first landing of the lag sweep's
+    /// ten-percent burst took 76,000 major faults in five seconds and had
+    /// not published, the tables frozen behind it stood with their
+    /// snapshot copies, and the group killed the process in the full
+    /// rewrite (`docs/engine.md`, keys that are no run of numbers). The
+    /// bounds are the same vector either way. Off, the record at every
+    /// boundary: `supdb-boundsheads` and `supdb-boundslean` turn it on.
+    #[doc(hidden)]
+    pub bounds_by_heads: bool,
+    /// A landing takes its pieces' bounds before its publish
+    /// (`Maint::rank_before_publish`) only where a table stands to read
+    /// them: not while the writer has given its block forms up
+    /// (`scan_forms_off_unreused`) and no handle is live, when nothing
+    /// makes a table and the walks are the landing thread's time and, out
+    /// of core, its faults, for nobody. A handle claimed later, or the
+    /// writer taking its forms back, walks the bounds its tables need as
+    /// a reader far from the landing always has (`BuildCtx::table_bounds`).
+    /// Off, every landing near reads walks them: `supdb-landboundsread`
+    /// and `supdb-boundslean` turn it on.
+    #[doc(hidden)]
+    pub land_bounds_read: bool,
     /// A seal writes a key whose chain holds one value and no tombstone
     /// -- every key of a load, and most of any table -- through the
     /// writer's one-value path (`SegmentWriter::put_one`), the record
@@ -6829,6 +6874,8 @@ impl Default for Options {
             boundary_keys_from_top: false,
             pieces_dir_willneed: true,
             bounds_heads_willneed: true,
+            bounds_by_heads: false,
+            land_bounds_read: false,
             seal_put_one: true,
             close_presync: true,
             ord_durable: false,
@@ -18816,10 +18863,26 @@ impl BlockTable {
 /// boundary key, reading each boundary key of the partition once. An open
 /// fence is the source's start or end, never a compare against an empty
 /// slice.
+///
+/// With `by_heads` (`Options::bounds_by_heads`) a boundary whose head is
+/// not the whole of its key is placed by the head where the head is
+/// enough: the head brackets the key between two byte strings
+/// (`OrdIndex::head_bracket`), every position below the lower is below the
+/// key and every position at or above the upper is above it, and where
+/// the source holds no key between the two the bound is the one position
+/// both name, with no record read. Only where a key of the source falls
+/// inside the bracket -- the boundary's own key written again, or a key
+/// that shares its head -- is the record read, and the walk goes on from
+/// the lower position. The store's counters take the boundaries placed
+/// by the head and the boundary records read, whichever way the walk
+/// goes: with the option off every boundary whose head is not its key is
+/// a record, and with it on only the ties are, so two walks of one store
+/// read `records` against `placed + records`.
 fn block_bounds_of(
     seg: &Seg,
     nblocks: usize,
     len: usize,
+    (by_heads, counts): (bool, &AskCounts),
     seek: impl Fn(&[u8]) -> usize,
     advance: impl Fn(usize, &[u8]) -> usize,
     key_at: impl Fn(usize, &mut Vec<u8>) -> bool,
@@ -18828,6 +18891,8 @@ fn block_bounds_of(
     let mut i = if seg.lo.is_empty() { 0 } else { seek(&seg.lo) };
     at.push(i as u32);
     let mut kbuf = Vec::new();
+    let mut above = Vec::new();
+    let (mut placed, mut records) = (0u64, 0u64);
     for b in 1..nblocks {
         // Past the source's end no bound moves, and the boundary key is
         // read only to move one: reading it anyway was a cold line per
@@ -18843,12 +18908,45 @@ fn block_bounds_of(
             // the caller's `key_at`, the form file's or the raw form's:
             // the record is a cold line per block for every source the
             // table maps, the top level is in memory.
-            if seg.ord.whole_key_at(rank, &mut kbuf).is_none() && !key_at(rank, &mut kbuf) {
-                return Err(err("block cache: a rank did not resolve"));
+            if seg.ord.whole_key_at(rank, &mut kbuf).is_some() {
+                i = advance(i, &kbuf).min(len);
+            } else if by_heads && seg.ord.head_bracket(rank, &mut kbuf, &mut above) {
+                // Below `lo`, below the key; from `hi` on, above it.
+                let lo = advance(i, &kbuf).min(len);
+                let hi = if lo < len {
+                    advance(lo, &above).min(len)
+                } else {
+                    lo
+                };
+                if lo == hi {
+                    placed += 1;
+                    i = lo;
+                } else {
+                    records += 1;
+                    if !key_at(rank, &mut kbuf) {
+                        return Err(err("block cache: a rank did not resolve"));
+                    }
+                    i = advance(lo, &kbuf).min(len);
+                }
+            } else {
+                records += 1;
+                if !key_at(rank, &mut kbuf) {
+                    return Err(err("block cache: a rank did not resolve"));
+                }
+                i = advance(i, &kbuf).min(len);
             }
-            i = advance(i, &kbuf).min(len);
         }
         at.push(i as u32);
+    }
+    if placed > 0 {
+        counts
+            .bounds_by_head
+            .fetch_add(placed, AtomicOrdering::Relaxed);
+    }
+    if records > 0 {
+        counts
+            .bounds_records
+            .fetch_add(records, AtomicOrdering::Relaxed);
     }
     let end = match &seg.hi {
         Some(h) => seek(h).max(i),
@@ -19600,6 +19698,11 @@ struct Shared {
     /// Handles the caller made and still holds: who the forms are
     /// published for.
     live_handles: AtomicUsize,
+    /// Whether the writer keeps no block forms just now
+    /// (`Options::scan_forms_off_unreused`), mirrored where the segment
+    /// work can read it: with no handle live, nothing makes a table, and
+    /// a landing leaves its pieces' bounds (`Options::land_bounds_read`).
+    writer_forms_off: std::sync::atomic::AtomicBool,
     /// Blocks materialised, by a handle the caller made and by the
     /// engine's own. These were added to size what sharing the block
     /// tables between handles would be worth, the last structure thought
@@ -24462,6 +24565,26 @@ impl Reader {
         (b < seg.blocks()).then(|| self.block_bounds(seg, b))
     }
 
+    /// A test's: the bounds every level-0 piece holds against every
+    /// partition (`block_bounds_of`), as the partition's place among the
+    /// partitions, the piece's among the pieces, and the bounds; nothing
+    /// for a pair no walk has been made for.
+    #[doc(hidden)]
+    pub fn piece_bounds(&self) -> Vec<(usize, usize, Vec<u32>)> {
+        let _entered = self.enter();
+        let segs = self.segs();
+        let np = segs.partition_point(|s| s.level > 0);
+        let mut out = Vec::new();
+        for (pi, seg) in segs[..np].iter().enumerate() {
+            for (j, p) in segs[np..].iter().enumerate() {
+                if let Some(at) = p.bounds.get(seg.blob.id()) {
+                    out.push((pi, j, at.to_vec()));
+                }
+            }
+        }
+        out
+    }
+
     pub fn zpage_counts(&self) -> ZCounts {
         let _entered = self.enter();
         let rd = &self.shared.readers;
@@ -24491,6 +24614,10 @@ impl Reader {
             dir_asks: get(&self.shared.asks.dir_submitted),
             bounds_head_asks: get(&self.shared.asks.bounds_heads),
             bounds_head_submitted: get(&self.shared.asks.bounds_submitted),
+            bounds_by_head: get(&self.shared.asks.bounds_by_head),
+            bounds_records: get(&self.shared.asks.bounds_records),
+            land_bound_walks: get(&self.shared.asks.land_bounds),
+            land_bounds_left: get(&self.shared.asks.land_bounds_left),
             nopage_reads: rd.stat(|s| &s.znopage),
             scans: rd.stat(|s| &s.zscanz),
             scan_groups: rd.stat(|s| &s.zscangroups),
@@ -25496,6 +25623,12 @@ impl Reader {
             seg.hi.clone()
         };
         (lo, hi)
+    }
+
+    /// Whether a bounds walk places boundaries by their heads
+    /// (`Options::bounds_by_heads`), and the store's counters for it.
+    fn bounds_by_heads(&self) -> (bool, &AskCounts) {
+        (self.opts.bounds_by_heads, &self.shared.asks)
     }
 
     fn cache_key_at(&self, seg: &Seg, rank: usize, out: &mut Vec<u8>) -> bool {
@@ -27876,6 +28009,9 @@ impl Reader {
         self.fs().forms_off.set(true);
         self.forms_off_now.set(true);
         self.shared
+            .writer_forms_off
+            .store(true, AtomicOrdering::Release);
+        self.shared
             .forms_off_entries
             .fetch_add(1, AtomicOrdering::Relaxed);
         self.forms_off_trace("off");
@@ -27899,6 +28035,9 @@ impl Reader {
         self.forms_drop_all();
         self.fs().forms_off.set(false);
         self.forms_off_now.set(false);
+        self.shared
+            .writer_forms_off
+            .store(false, AtomicOrdering::Release);
         self.shared
             .forms_off_exits
             .fetch_add(1, AtomicOrdering::Relaxed);
@@ -33927,6 +34066,7 @@ impl Db {
             mode_scans: AtomicU64::new(0),
             mode_points: AtomicU64::new(0),
             live_handles: AtomicUsize::new(0),
+            writer_forms_off: std::sync::atomic::AtomicBool::new(false),
             blk_reader: AtomicU64::new(0),
             blk_engine: AtomicU64::new(0),
             blk_upkeep: AtomicU64::new(0),
@@ -34720,6 +34860,7 @@ impl Db {
             mode_scans: AtomicU64::new(0),
             mode_points: AtomicU64::new(0),
             live_handles: AtomicUsize::new(0),
+            writer_forms_off: std::sync::atomic::AtomicBool::new(false),
             blk_reader: AtomicU64::new(0),
             blk_engine: AtomicU64::new(0),
             blk_upkeep: AtomicU64::new(0),
@@ -42273,6 +42414,18 @@ struct AskCounts {
     /// table's making, and those submitted (`Options::bounds_heads_willneed`).
     bounds_heads: AtomicU64,
     bounds_submitted: AtomicU64,
+    /// Block boundaries a bounds walk placed by the boundary's head with
+    /// no record read (`Options::bounds_by_heads`), and the boundary
+    /// records the walks read: every boundary whose head is not its key
+    /// with the option off, and under it those a key of the source fell
+    /// inside the head's bracket of.
+    bounds_by_head: AtomicU64,
+    bounds_records: AtomicU64,
+    /// Bounds walks a landing made before its publish, a piece against a
+    /// partition each, and those it left to a reader because no table
+    /// stood to read them (`Options::land_bounds_read`).
+    land_bounds: AtomicU64,
+    land_bounds_left: AtomicU64,
 }
 
 /// The most heads a bounds walk asks for at once
@@ -42315,8 +42468,14 @@ fn ask_bounds_heads(shared: &Shared, seg: &Seg, p: &Seg) {
 /// whose range it meets, where the piece has none against that partition
 /// yet: the same walk `BuildCtx::table_bounds` makes when a table is made,
 /// and the same cache. With `ask`, out of core, each walk's heads are
-/// asked for first (`ask_bounds_heads`).
-fn bound_pieces_of(segs: &[std::sync::Arc<Seg>], ask: Option<&Shared>) -> Result<()> {
+/// asked for first (`ask_bounds_heads`); `by_heads` is the walk's
+/// (`block_bounds_of`), and `walks` counts the walks made.
+fn bound_pieces_of(
+    segs: &[std::sync::Arc<Seg>],
+    ask: Option<&Shared>,
+    by_heads: (bool, &AskCounts),
+    walks: &AtomicU64,
+) -> Result<()> {
     for seg in segs.iter().filter(|s| s.level > 0) {
         let nblocks = seg.blocks();
         let against = seg.blob.id();
@@ -42341,10 +42500,12 @@ fn bound_pieces_of(segs: &[std::sync::Arc<Seg>], ask: Option<&Shared>) -> Result
             if let Some(shared) = ask {
                 ask_bounds_heads(shared, seg, p);
             }
+            walks.fetch_add(1, AtomicOrdering::Relaxed);
             let at = block_bounds_of(
                 seg,
                 nblocks,
                 p.blob.keys(),
+                by_heads,
                 |k| p.ord.seek(p.cursor_from(k), |i| p.raw().key_at(i)),
                 |i, bound| p.ord.advance_below(i, bound, |r| p.raw().key_at(r)),
                 |r, out| raw_key_into(seg, r, out),
@@ -42454,6 +42615,7 @@ impl<'s> BuildCtx<'s> {
                         seg,
                         nblocks,
                         p.blob.keys(),
+                        self.rd.bounds_by_heads(),
                         |k| p.ord.seek(p.cursor_from(k), |i| p.raw().key_at(i)),
                         |i, bound| p.ord.advance_below(i, bound, |r| p.raw().key_at(r)),
                         |r, out| self.rd.cache_key_at(seg, r, out),
@@ -42604,6 +42766,7 @@ impl<'s> BuildCtx<'s> {
             seg,
             nblocks,
             unsealed.len(),
+            rd.bounds_by_heads(),
             |k| unsealed.seek(k),
             |i, bound| unsealed.advance_below(i, bound),
             |r, out| rd.cache_key_at(seg, r, out),
@@ -46501,10 +46664,24 @@ impl Maint {
             if self.opts.piece_ranks_whole {
                 rank_pieces_of(segs, self.opts.piece_ranks_by_heads)?;
             }
+            // Only where a table stands to read them
+            // (`Options::land_bounds_read`): the writer with its forms
+            // given up makes none, and a handle that comes walks its own.
+            if self.opts.land_bounds_read
+                && self.shared.writer_forms_off.load(AtomicOrdering::Acquire)
+                && self.shared.live_handles.load(AtomicOrdering::Relaxed) == 0
+            {
+                self.shared
+                    .asks
+                    .land_bounds_left
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                return Ok(());
+            }
             let ask = (self.opts.bounds_heads_willneed
                 && out_of_core(&self.opts, self.shared.zgate.load()))
             .then_some(&*self.shared);
-            bound_pieces_of(segs, ask)?;
+            let by_heads = (self.opts.bounds_by_heads, &self.shared.asks);
+            bound_pieces_of(segs, ask, by_heads, &self.shared.asks.land_bounds)?;
         }
         Ok(())
     }

@@ -548,6 +548,51 @@ impl OrdIndex {
         Some(&buf[..])
     }
 
+    /// What the head of the key at `rank` says of the key where it is not
+    /// the whole of it (`whole_key_at`): `lo`, a byte string the key starts
+    /// with, so no key below `lo` is the key or above it, and `hi`, the
+    /// least byte string above every key with that head, so no key at or
+    /// above `hi` is the key or below it. Read from no page, and so only
+    /// for a rank the top level holds; false for any other, where the
+    /// prefix is not learned, or where the head is all ones and has no
+    /// such `hi`.
+    ///
+    /// A head is the key's bytes after the common prefix, eight of them,
+    /// zero-filled where the key ends first. So the key is the prefix, the
+    /// head's bytes up to some length at or past its last non-zero byte,
+    /// and, where that length is the whole eight, whatever follows: the
+    /// prefix with the head less its trailing zeros is a prefix of every
+    /// such key, and the prefix with the head plus one is above every one
+    /// -- a key the head covers whole differs from it first inside the
+    /// head, and a shorter one ends where the two still agree.
+    ///
+    /// A walk of a sorted source against a partition's block boundaries
+    /// needs each boundary's key only to place the source's keys on either
+    /// side of it (`block_bounds_of`), and a source with no key between
+    /// `lo` and `hi` is placed by the two alone: the record, a page of its
+    /// own out of core, is read only where a key of the source falls
+    /// inside (`Options::bounds_by_heads`).
+    pub fn head_bracket(&self, rank: usize, lo: &mut Vec<u8>, hi: &mut Vec<u8>) -> bool {
+        let Some(prefix) = self.prefix.as_deref() else {
+            return false;
+        };
+        if rank >= self.n || !rank.is_multiple_of(TOP_STRIDE) || prefix.len() != self.pfx {
+            return false;
+        }
+        let h = self.top[rank / TOP_STRIDE];
+        let Some(above) = h.checked_add(1) else {
+            return false;
+        };
+        let kept = HEAD - (h.trailing_zeros() / 8) as usize;
+        lo.clear();
+        lo.extend_from_slice(prefix);
+        lo.extend_from_slice(&h.to_be_bytes()[..kept]);
+        hi.clear();
+        hi.extend_from_slice(prefix);
+        hi.extend_from_slice(&above.to_be_bytes());
+        true
+    }
+
     /// The first rank at or past `from` whose key is not below `key`, or
     /// `n`: `rank_below` run along the heads, with the prefix's verdict
     /// and the query's head taken once. A table walks every key of a
@@ -2176,6 +2221,113 @@ mod tests {
                     );
                 }
             }
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    /// `head_bracket` over keys whose heads are not whole keys: at every
+    /// rank the top level holds, `lo` is a prefix of the key and `hi` is
+    /// above it, and every key of the set at or above `hi` is above the
+    /// key while every key below `lo` is below it, which is all a walk
+    /// places a source by. The sets hold what a head hides: keys that run
+    /// on past the head, keys that end inside it, zero bytes at a key's
+    /// end and inside it, and a head of all ones, which has no `hi`.
+    #[test]
+    fn a_heads_bracket_holds_the_key_and_nothing_it_does_not_say() {
+        let long: Vec<Vec<u8>> = (0u32..900)
+            .map(|i| format!("{:08}-{:05}", i / 7, i % 7).into_bytes())
+            .collect();
+        let mut ragged: Vec<Vec<u8>> = (0u32..800)
+            .map(|i| {
+                let mut k = format!("pp{:04}", i / 5).into_bytes();
+                k.extend(std::iter::repeat_n(0u8, (i % 5) as usize));
+                k
+            })
+            .collect();
+        ragged.sort();
+        ragged.dedup();
+        let mut zeros: Vec<Vec<u8>> = (0u32..700)
+            .map(|i| {
+                let mut k = vec![b'z'];
+                k.extend_from_slice(&(u64::from(i / 3) << 16).to_be_bytes());
+                k.extend(std::iter::repeat_n(b'q', (i % 3) as usize * 5));
+                k
+            })
+            .collect();
+        zeros.sort();
+        zeros.dedup();
+        let mut ones: Vec<Vec<u8>> = (0u32..200)
+            .map(|i| {
+                let mut k = vec![b'm'];
+                k.extend_from_slice(&if i < 64 {
+                    [0xFFu8; 8]
+                } else {
+                    (u64::from(i) << 40).to_be_bytes()
+                });
+                k.extend_from_slice(format!("{i:04}").as_bytes());
+                k
+            })
+            .collect();
+        ones.sort();
+        for (name, owned) in [
+            ("long", &long),
+            ("ragged", &ragged),
+            ("zeros", &zeros),
+            ("ones", &ones),
+        ] {
+            let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+            let p = write(&build(&keys), &format!("bracket-{name}"));
+            let mut idx = OrdIndex::open(&p, keys.len()).expect("opens");
+            let (mut lo, mut hi) = (Vec::new(), Vec::new());
+            assert!(
+                !idx.head_bracket(0, &mut lo, &mut hi),
+                "{name}: no bracket before the prefix is learned"
+            );
+            idx.learn_prefix(keys[0]);
+            assert!(!idx.uniform(), "{name}: the heads are not whole keys");
+            let (mut bracketed, mut refused) = (0usize, 0usize);
+            for (r, k) in keys.iter().enumerate() {
+                let got = idx.head_bracket(r, &mut lo, &mut hi);
+                if !r.is_multiple_of(TOP_STRIDE) {
+                    assert!(!got, "{name}: rank {r} is not the top level's");
+                    continue;
+                }
+                let all_ones = head_of(k, idx.pfx) == u64::MAX;
+                assert_eq!(got, !all_ones, "{name}: a bracket at rank {r}");
+                if !got {
+                    refused += 1;
+                    continue;
+                }
+                bracketed += 1;
+                assert!(k.starts_with(&lo), "{name}: lo is a prefix at {r}");
+                assert!(*k < hi.as_slice(), "{name}: hi is above at {r}");
+                // The bracket is the head's and no wider: the least and the
+                // greatest keys of the set with this rank's head stand at
+                // its two ends.
+                let same: Vec<&&[u8]> = keys
+                    .iter()
+                    .filter(|q| head_of(q, idx.pfx) == head_of(k, idx.pfx))
+                    .collect();
+                for q in &keys {
+                    let inside = lo.as_slice() <= *q && *q < hi.as_slice();
+                    assert_eq!(
+                        inside,
+                        same.iter().any(|s| **s == *q),
+                        "{name}: {:?} against the bracket at {r}",
+                        String::from_utf8_lossy(q)
+                    );
+                }
+            }
+            assert!(bracketed > 0, "{name}: brackets taken");
+            assert_eq!(
+                refused > 0,
+                name == "ones",
+                "{name}: a head of all ones, and no other, has no bracket"
+            );
+            assert!(
+                !idx.head_bracket(keys.len(), &mut lo, &mut hi),
+                "{name}: no bracket past the index"
+            );
             let _ = std::fs::remove_file(&p);
         }
     }
