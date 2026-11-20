@@ -19,7 +19,7 @@ usage:
   bench run --scale ooc --bound BYTES [--ops-div N] [the options above]
   bench run --resume DIR [--reps N] [--resume-passes]
   bench ab --arms A,B [--size KEYS] [--reps N] [--len ENTRIES] [--pairs TEXT] [--bound BYTES] [--passes a,b,...]
-           [--ops-div N] [--compress FRACTION] [--fresh-process|--one-process]
+           [--ops-div N] [--compress FRACTION] [--keys numbered|ids] [--fresh-process|--one-process]
   bench gate ROW.json [--runs DIR]
   bench figures [--runs DIR] [--out DIR] [--scale quick|full|ooc]
   bench machine
@@ -67,6 +67,10 @@ ab     two arms in one process, alternating and paired rep by rep, for choosing
                divided, for a pairing at a rung where the whole pass is an hour.
        --compress the fraction of each value that is a repeated phrase (default 0.5,
                the suite's); 0.0 is the incompressible control for a compact form.
+       --keys  what the stores' keys are: numbered, db_bench's sixteen decimal digits of the
+               key's index and every row's (the default), or ids, sixteen hex digits of a
+               random 64-bit id that ascends with the index, so no key is the next number
+               after another and a key inserted later falls among the loaded ones.
        --fresh-process each pass in a process of its own, --one-process both arms in this one
                (default: fresh under a bound, one in core); a pass killed under the bound
                loses its rep's pair, the pairing goes on, and the command exits 137.
@@ -405,8 +409,21 @@ fn cmd_ab(a: Args) -> i32 {
             }
         }
     }
+    if let Some(text) = a.get("--keys") {
+        match supdb_bench::workload::KeyShape::parse(text) {
+            Some(k) => plan.keys = k,
+            None => {
+                eprintln!("--keys takes numbered or ids\n\n{USAGE}");
+                return 2;
+            }
+        }
+    }
     eprintln!(
-        "bench ab: {a0} against {b0} at {size} keys, scans of {}, {reps} pairs{}{}{}{}{}",
+        "bench ab: {a0} against {b0} at {size} keys{}, scans of {}, {reps} pairs{}{}{}{}{}",
+        match plan.keys {
+            supdb_bench::workload::KeyShape::Numbered => String::new(),
+            k => format!(" ({} for keys)", k.name()),
+        },
         plan.scan_len,
         if plan.fresh_process {
             ", each pass in a process of its own"

@@ -1106,14 +1106,20 @@ pub struct ZCounts {
     /// and found the partition does not qualify, by reason, in the order of
     /// `zfile::StrideNo`: a key not of the run's shape, holes, a record not
     /// one value, a width not the run's, a tombstone flag, a run in a block,
-    /// a partition under the floor, a file that did not read back, a
-    /// segment of a store under a cipher (`zfile::StrideNo::Kept`). The two
-    /// before the last are counted only where a conversion asks for the
-    /// stride form alone; under `ZStride::Forced` a run in a block or a
-    /// partition under the floor is the block form's decline as well, and
-    /// counted once, there (`declined_block_backed`, `declined_small`).
+    /// a partition under the floor, a file that did not read back, a run
+    /// with gaps whose ask of the sparse form the build left for a
+    /// conversion (`zpages_stride_sparse`), which is no refusal, and a
+    /// segment of a store under a cipher (`zfile::StrideNo::Kept`). A run
+    /// in a block and a partition under the floor are counted only where a
+    /// conversion asks for the stride form alone; under `ZStride::Forced`
+    /// either is the block form's decline as well, and counted once, there
+    /// (`declined_block_backed`, `declined_small`).
     pub stride_builds: u64,
     pub stride_declines: [u64; zfile::STRIDE_REASONS],
+    /// The stride files among `stride_builds` built in the sparse form,
+    /// their keys' numbers held beside the values
+    /// (`Options::zpages_stride_sparse`).
+    pub stride_sparse_builds: u64,
     /// The live partitions whose served form file is a stride file.
     pub stride_files: u64,
     /// Partitions live, the ones with a form file installed, the ones of
@@ -6586,6 +6592,37 @@ pub struct Options {
     /// conversion's file in the cache as it is written.
     #[doc(hidden)]
     pub zpages_convert_drops_output: bool,
+    /// The stride form takes a partition whose keys are numbers with gaps
+    /// between them, and keys of hex digits with it (`zfile::BuildPlan::
+    /// stride_sparse`, `zpages::StrideSparse`). The form as it shipped holds
+    /// a partition whose keys are every number of a run, so that a key's
+    /// rank is arithmetic and the file is the values alone; keys that are
+    /// numbers no run -- random ids, a sequence with deletions -- decline as
+    /// holes or as no shape, and the block form serves them, whose point
+    /// read is a group's decode where the stride form's is a load. The
+    /// sparse form holds each key's number after the values, a word a rank
+    /// in order, and every sixty-fourth of them again in memory: a key's
+    /// rank is searched for, the samples first, from the place a straight
+    /// line through the first number and the last puts it and within the
+    /// error the build measured that line to have, then the one run of
+    /// numbers the sample opens. Eight bytes a key more than the values,
+    /// against the block form's compression of them, so which partitions
+    /// take it is the room's and the conversion's to say
+    /// (`zpages_stride_room`, `zpages_stride_convert`), which price it by
+    /// its bytes as they price the form that holds no number. Under the
+    /// controller a build takes such a partition only once a reader has
+    /// come (`Maint::z_sparse_now`): before one the store is partway
+    /// through its first writing, a build's room is the room of the store
+    /// so far, and the partition is built in the block form and left for a
+    /// conversion to ask when reads come, at no rent, where the model says
+    /// the store with it in the form still fits the fill
+    /// (`zfile::StrideNo::Deferred`). A forced store's builds take it where
+    /// they are made, having no conversion to leave it to. A partition
+    /// whose keys are a whole run is built as it was, byte for byte; a
+    /// sparse file is a second version of the stride trailer, which a
+    /// reader from before refuses. Off: `supdb-zsparse` is the arm.
+    #[doc(hidden)]
+    pub zpages_stride_sparse: bool,
 }
 
 impl Options {
@@ -7070,6 +7107,7 @@ impl Default for Options {
             zpages_stride_trust_built: true,
             zpages_stride_convert: true,
             zpages_convert_drops_output: true,
+            zpages_stride_sparse: false,
         }
     }
 }
@@ -27067,6 +27105,7 @@ impl Reader {
             retired: get(&ev.retired),
             stride_builds: get(&ev.stride_builds),
             stride_declines: std::array::from_fn(|i| get(&ev.stride_declines[i])),
+            stride_sparse_builds: get(&ev.stride_sparse_builds),
             ..ZCounts::default()
         };
         for seg in self.segs().iter().filter(|s| s.level > 0) {
@@ -44004,6 +44043,7 @@ impl Db {
                 plan.own_decode = self.opts.zpages_own_decoder;
                 plan.stride = self.opts.z_stride_ask();
                 plan.stride_below = self.opts.zpages_stride_below.clone();
+                plan.stride_sparse = self.opts.zpages_stride_sparse;
                 plan
             })
         };
@@ -50596,6 +50636,10 @@ struct Maint {
     /// once, without waiting out the period, so that a move that has paid
     /// for its build waits for the builder and for nothing after it.
     z_conv_waits: bool,
+    /// A form file has served a read in the store's life, by the counts a
+    /// conversion's look reads of the files (`z_convert_look`): a reader
+    /// has come, whatever the census counted (`z_sparse_now`).
+    z_form_read: bool,
     /// The partitions owed a second drop of their ordered index
     /// (`Options::zpages_drop_again`), by name, and when each is due on the
     /// controller's clock (`z_redrop_look`).
@@ -51344,6 +51388,7 @@ impl Maint {
             z_conv_heat: std::collections::HashMap::new(),
             z_conv_rent: std::collections::HashMap::new(),
             z_conv_waits: false,
+            z_form_read: false,
             z_redrop: Vec::new(),
             z_conv_done: None,
             z_anon_peak: std::cell::Cell::new(zselect::WindowMax::new(zselect::RETAIN_FLOOR)),
@@ -53880,6 +53925,9 @@ impl Maint {
             decodes: u64,
             opens: u64,
             can: bool,
+            /// A build left this partition's ask of the sparse form for a
+            /// conversion (`zfile::StrideNo::Deferred`).
+            deferred: bool,
         }
         // The partition a conversion in flight is moving, which is priced
         // in the form it is going to and offered nothing: the moves after
@@ -53920,12 +53968,16 @@ impl Maint {
                             stride: z.is_stride(),
                             file: z.file_bytes(),
                             records: s.foot().1,
-                            values: s.stride_bytes(),
+                            values: self.z_stride_bytes(s),
                             heads: s.ord.file_bytes(),
                             ns: 16 * z.decode_ns16.load(AtomicOrdering::Relaxed),
                             decodes: 16 * z.decodes16.load(AtomicOrdering::Relaxed),
                             opens: 16 * z.opens16.load(AtomicOrdering::Relaxed),
-                            can: s.z_stride_no.load(AtomicOrdering::Relaxed) == 0,
+                            can: zfile::StrideNo::askable(
+                                s.z_stride_no.load(AtomicOrdering::Relaxed),
+                            ),
+                            deferred: s.z_stride_no.load(AtomicOrdering::Relaxed)
+                                == zfile::StrideNo::Deferred.code(),
                         });
                     }
                     None => other = other.saturating_add(s.raw_bytes()),
@@ -54098,6 +54150,9 @@ impl Maint {
         // `RECODE_TAU` after it ends -- and a gain is as many times itself
         // as the reads are (`zselect::intensity`).
         let now_over_heat = zselect::intensity(rate_sum, heat_sum);
+        if rate_sum > 0.0 {
+            self.z_form_read = true;
+        }
         // The rents the looks before left, of the partitions a form file
         // still serves: a merge's outputs have names of their own and pay
         // theirs from nothing. A move's rent is a balance: what
@@ -54144,11 +54199,20 @@ impl Maint {
             } else {
                 parts[i].block_bytes.saturating_sub(rows[i].heads)
             };
-            let price = inject
-                .as_ref()
-                .and_then(|i| i.convert_price())
-                .map(|c| c.as_secs_f64())
-                .unwrap_or_else(|| zselect::ski_rental_price(built as f64 * per_byte, None));
+            // A move in that a build left for this look is that build's own
+            // ask, made now that the store is read and its size is the
+            // store's: it pays no rent, as the build would have paid none.
+            // What holds it is what holds any move in, that the model says
+            // the store with it in the form still fits the fill.
+            let price = if to_stride && rows[i].deferred {
+                0.0
+            } else {
+                inject
+                    .as_ref()
+                    .and_then(|i| i.convert_price())
+                    .map(|c| c.as_secs_f64())
+                    .unwrap_or_else(|| zselect::ski_rental_price(built as f64 * per_byte, None))
+            };
             if self.z_trace {
                 eprintln!(
                     "zconvert t={:.1} {} seg={} touches_s={:.0} gain_ms_s={:.3} now_x={:.2} rent_ms={:.1} price_ms={:.1} capacity_mb={} fill_mb={} other_mb={}",
@@ -54229,7 +54293,7 @@ impl Maint {
             served[(n - 1) as usize % served.len()].clone()
         };
         let stride = seg.z.get().is_some_and(|z| z.is_stride());
-        if stride || seg.z_stride_no.load(AtomicOrdering::Relaxed) == 0 {
+        if stride || zfile::StrideNo::askable(seg.z_stride_no.load(AtomicOrdering::Relaxed)) {
             self.z_convert(seg);
         }
     }
@@ -56861,11 +56925,76 @@ impl Maint {
         w.get()
     }
 
+    /// Whether a build the controller makes now takes a run with gaps in the
+    /// sparse form, and whether it leaves one for a conversion to ask
+    /// (`zfile::BuildPlan::stride_sparse`, `stride_sparse_later`,
+    /// `Options::zpages_stride_sparse`): taken once a reader has come, and
+    /// left before. A build asks for the stride form where the store in it
+    /// fits the room as the room is (`z_stride_fits`), and before any
+    /// reader the store stands partway through its first writing: every
+    /// build of a load of ten million random ids under 1 GiB found the
+    /// store so far to fit, forty-four partitions were built in the sparse
+    /// form, larger than the block form by a fifth, and the store the load
+    /// left did not fit in either -- twenty-four conversions back to the
+    /// block form through the read and scan passes, the reads at a third to
+    /// two thirds of the rate of the engine that had built the block form
+    /// to begin with. A whole run's ask is made at the build all the same,
+    /// as it was. The reader is the one a pick of the raw tails waits for
+    /// (`z_pick_raw_ok`), or a read a form file has served
+    /// (`z_form_read`): the first counts what the census counted and the
+    /// scans, and a store whose form was bought by attach on the model's
+    /// word alone is read through its form files with no census read ever
+    /// counted.
+    fn z_sparse_now(&self) -> (bool, bool) {
+        let on = self.opts.zpages_stride_sparse;
+        let read = self.z_pick_raw_ok() || self.z_form_read;
+        (on && read, on && !read)
+    }
+
+    /// What partition `s` comes to in the stride form, bytes: its values
+    /// alone (`Seg::stride_bytes`), and with them its keys' numbers, a word
+    /// a key, where its form is the sparse one (`z_number_bytes`). What the
+    /// room and the conversion price a partition by before it has a stride
+    /// file, whose own bytes are its price after.
+    fn z_stride_bytes(&self, s: &Seg) -> u64 {
+        s.stride_bytes().saturating_add(self.z_number_bytes(s))
+    }
+
+    /// The bytes of its keys' numbers partition `s`'s stride form holds, a
+    /// sparse form's and none in a form whose keys are a whole run: the
+    /// file's own account where a stride file serves the partition, and
+    /// elsewhere the store's -- a store that takes the sparse form and has
+    /// built one is taken to be of keys with gaps, every partition of it,
+    /// since a store's keys are of one kind far more often than not and a
+    /// partition priced eight bytes a key short is one the room is given
+    /// to that does not fit it (`Options::zpages_stride_sparse`,
+    /// `ZEvents::stride_sparse_builds`). Before a store's first stride
+    /// build nothing says, and its partitions are priced as whole runs.
+    fn z_number_bytes(&self, s: &Seg) -> u64 {
+        if let Some(body) = s.z.get().and_then(|z| z.stride()) {
+            return body.number_bytes();
+        }
+        // A sparse file built, or a build that left a run with gaps for a
+        // conversion: either says what the store's keys are.
+        let ev = &self.shared.z;
+        let sparse = self.opts.zpages_stride_sparse
+            && ev.stride_sparse_builds.load(AtomicOrdering::Relaxed)
+                + ev.stride_declines[usize::from(zfile::StrideNo::Deferred.code() - 1)]
+                    .load(AtomicOrdering::Relaxed)
+                > 0;
+        if sparse {
+            8 * s.ord.len() as u64
+        } else {
+            0
+        }
+    }
+
     /// Whether the store in the stride form fits the room as it is now
     /// (`Options::zpages_stride_room`, `zselect::stride_fits`): every
-    /// partition's values alone and every level-0 piece's payload, against
-    /// the budget a test injects or the platform reads. With no budget to
-    /// read it fits.
+    /// partition's values alone, a sparse form's keys' numbers with them
+    /// (`z_stride_bytes`), and every level-0 piece's payload, against the
+    /// budget a test injects or the platform reads. With no budget to read
+    /// it fits.
     fn z_stride_fits(&self) -> bool {
         let Some(budget) = self.z_budget_grown() else {
             return true;
@@ -56874,7 +57003,7 @@ impl Maint {
             let _op = self.op();
             self.segs().iter().fold((0u64, 0u64), |(st, pc), s| {
                 if s.level > 0 {
-                    (st.saturating_add(s.stride_bytes()), pc)
+                    (st.saturating_add(self.z_stride_bytes(s)), pc)
                 } else {
                     (st, pc.saturating_add(s.data))
                 }
@@ -56954,7 +57083,7 @@ impl Maint {
                     // that form. Any other is what its file on disk holds,
                     // or its raw form where it has none.
                     None if zfile::in_spans(&last, &s.lo) => {
-                        held = held.saturating_add(s.stride_bytes());
+                        held = held.saturating_add(self.z_stride_bytes(s));
                         spans.push(span());
                     }
                     None => {
@@ -57002,6 +57131,7 @@ impl Maint {
         );
         plan.drop_output = !past;
         plan.sync = self.opts.zpages_build_sync && plan.drop_output;
+        (plan.stride_sparse, plan.stride_sparse_later) = self.z_sparse_now();
         plan.ahead = self.opts.zpages_build_ahead;
         plan.group_bytes = self.opts.zpages_group_bytes;
         let (coding, raw_tails) = match self.z_coding_pick {
@@ -57967,6 +58097,15 @@ impl Maint {
         // where it is taken in: the pages a write leaves in the cache
         // carry buffer heads, and the pages a read brings carry none.
         plan.drop_output = (dormant && !past) || (convert && self.opts.zpages_convert_drops_output);
+        // A conversion's ask is the reads' own, made by a look that priced
+        // them: it takes a run with gaps now and leaves nothing for later,
+        // or the partition it was left for would be left again at every
+        // look.
+        (plan.stride_sparse, plan.stride_sparse_later) = if convert {
+            (self.opts.zpages_stride_sparse, false)
+        } else {
+            self.z_sparse_now()
+        };
         // Only a file written back as it was built: its pages are on the
         // device and its sync asks for the flush alone; one kept dirty for
         // the install wrote its pages in its sync, 50-160 ms each at five

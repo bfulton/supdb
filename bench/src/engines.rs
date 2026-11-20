@@ -1708,6 +1708,10 @@ pub struct Supdb {
     /// (`Options::zpages_convert_drops_output`): `supdb-zstrideallcdrop`,
     /// `supdb-zstridealldropagaincdrop`; the engine's where `None`.
     zconvdrop: Option<bool>,
+    /// The stride form takes keys that are numbers with gaps between them
+    /// (`Options::zpages_stride_sparse`): `supdb-zsparse`; the engine's
+    /// where `None`.
+    zsparse: Option<bool>,
     /// A job's large per-key arrays mapped by the engine and unmapped at
     /// the job's end (`Options::jobs_mapped`): `supdb-jobsmapped`,
     /// `supdb-zstridealldropagainjobs`.
@@ -2864,6 +2868,11 @@ struct Policy {
     /// `supdb-zstrideallcdrop` beside `supdb-zstrideall`, and
     /// `supdb-zstridealldropagaincdrop` beside `supdb-zstridealldropagain`.
     zconvdrop: Option<bool>,
+    /// The stride form's sparse variant, for partitions whose keys are
+    /// numbers with gaps between them -- random ids, a sequence with holes
+    /// -- which the form declined and the block form served
+    /// (`Options::zpages_stride_sparse`): `supdb-zsparse` beside `supdb`.
+    zsparse: Option<bool>,
     /// The seals', merges' and closes' large per-key arrays as the
     /// engine's own mappings (`Options::jobs_mapped`): `supdb-jobsmapped`
     /// beside `supdb`, and `supdb-zstridealldropagainjobs` beside
@@ -3182,6 +3191,7 @@ impl Default for Policy {
             zcrossraw: None,
             zdropagain: None,
             zconvdrop: None,
+            zsparse: None,
             jobsmapped: false,
             jobsshort: false,
             zmemoslab: false,
@@ -3239,6 +3249,7 @@ impl Policy {
             zcrossraw: Some(false),
             zdropagain: Some(false),
             zconvdrop: Some(false),
+            zsparse: Some(false),
             ..Policy::default()
         }
     }
@@ -4218,6 +4229,21 @@ impl Supdb {
                 zdropagain: Some(true),
                 jobsmapped: true,
                 ..Policy::zblock()
+            },
+        )
+    }
+
+    /// The engine with the stride form's sparse variant
+    /// (`Options::zpages_stride_sparse`): `supdb-zsparse`, where a partition
+    /// whose keys are numbers with gaps between them is held with its
+    /// keys' numbers beside its values and read by a search of them, and
+    /// one whose keys are a whole run as `supdb` holds it.
+    pub fn create_zsparse(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zsparse: Some(true),
+                ..Policy::default()
             },
         )
     }
@@ -9504,6 +9530,7 @@ impl Supdb {
             zcrossraw,
             zdropagain,
             zconvdrop,
+            zsparse,
             jobsmapped,
             jobsshort,
             zmemoslab,
@@ -10072,6 +10099,7 @@ impl Supdb {
             zpages_drop_again: zdropagain.unwrap_or(supdb::Options::default().zpages_drop_again),
             zpages_convert_drops_output: zconvdrop
                 .unwrap_or(supdb::Options::default().zpages_convert_drops_output),
+            zpages_stride_sparse: zsparse.unwrap_or(supdb::Options::default().zpages_stride_sparse),
             jobs_mapped: jobsmapped,
             jobs_mapped_when_short: jobsshort,
             zpages_memo_slab: zmemoslab,
@@ -10478,6 +10506,7 @@ impl Supdb {
             zcrossraw,
             zdropagain,
             zconvdrop,
+            zsparse,
             jobsmapped,
             jobsshort,
             zmemoslab,
@@ -10871,6 +10900,9 @@ impl Engine for Supdb {
         }
         if self.zrewarmbeside {
             return "supdb-zrewarmbeside";
+        }
+        if self.zsparse == Some(true) {
+            return "supdb-zsparse";
         }
         if self.zconvdrop == Some(true) {
             return if self.zdropagain == Some(true) {
@@ -12137,7 +12169,7 @@ impl Engine for Supdb {
         // `ZCounts::stride_declines` documents. Bound by a pattern of its
         // length, so a reason the engine adds is a build that fails here
         // and not a slot this list leaves unnamed or names as another.
-        let [not_shaped, holes, not_one_value, width, tomb, block_backed, small, self_check, kept] =
+        let [not_shaped, holes, not_one_value, width, tomb, block_backed, small, self_check, deferred, kept] =
             z.stride_declines;
         vec![
             ("snapshot_builds", db.snapshot_builds() as f64),
@@ -12392,6 +12424,7 @@ impl Engine for Supdb {
             ("zpage_stride_page_checks", z.stride_page_checks as f64),
             ("zpage_stride_cursor_reads", z.stride_cursor_reads as f64),
             ("zpage_stride_builds", z.stride_builds as f64),
+            ("zpage_stride_sparse_builds", z.stride_sparse_builds as f64),
             ("zpage_stride_no_not_shaped", not_shaped as f64),
             ("zpage_stride_no_holes", holes as f64),
             ("zpage_stride_no_not_one_value", not_one_value as f64),
@@ -12400,6 +12433,7 @@ impl Engine for Supdb {
             ("zpage_stride_no_block_backed", block_backed as f64),
             ("zpage_stride_no_small", small as f64),
             ("zpage_stride_no_self_check", self_check as f64),
+            ("zpage_stride_no_deferred", deferred as f64),
             ("zpage_stride_no_kept", kept as f64),
             ("zpage_counts", z.counts as f64),
             ("zpage_decodes", z.decodes as f64),
@@ -13897,6 +13931,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zstridealldropagain"
         | "supdb-zstrideallcdrop"
         | "supdb-zstridealldropagaincdrop"
+        | "supdb-zsparse"
         | "supdb-jobsmapped"
         | "supdb-zstridealldropagainjobs"
         | "supdb-zmemoslab"
@@ -14960,6 +14995,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zblock" => supdb_arm(Supdb::create_zblock, dir)?,
         "supdb-zdropagain" => supdb_arm(Supdb::create_zdropagain, dir)?,
         "supdb-zstridealldropagain" => supdb_arm(Supdb::create_zstride_all_dropagain, dir)?,
+        "supdb-zsparse" => supdb_arm(Supdb::create_zsparse, dir)?,
         "supdb-zstrideallcdrop" => supdb_arm(Supdb::create_zstride_all_cdrop, dir)?,
         "supdb-zstridealldropagaincdrop" => {
             supdb_arm(Supdb::create_zstride_all_dropagain_cdrop, dir)?
@@ -18142,6 +18178,29 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_convert_drops_output && o.zpages_drop_again);
                 assert_eq!(seven(o), (Forced, true, true, true, true, true, true));
+                assert!(!o.zpages_stride_sparse && !b.zpages_stride_sparse);
+                // The sparse form on the engine's arm: the one option, and
+                // every other the engine's.
+                let z = Supdb::create_zsparse(&dir("zsparse")).unwrap();
+                assert_eq!(z.name(), "supdb-zsparse");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_stride_sparse);
+                let d = supdb::Options::default();
+                assert_eq!(
+                    (
+                        two(o),
+                        o.zpages_stride,
+                        o.zpages_stride_room,
+                        o.zpages_stride_convert
+                    ),
+                    (
+                        (d.zpages_drop_again, d.zpages_convert_drops_output),
+                        d.zpages_stride,
+                        d.zpages_stride_room,
+                        d.zpages_stride_convert
+                    )
+                );
                 // The jobs' large arrays as the engine's mappings, on the
                 // engine's arm and on the stride form's with the second
                 // drop.
@@ -19835,7 +19894,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("no counter {name}"))
                 .1
         };
-        const NO: [&str; 9] = [
+        const NO: [&str; 10] = [
             "zpage_stride_no_not_shaped",
             "zpage_stride_no_holes",
             "zpage_stride_no_not_one_value",
@@ -19844,6 +19903,7 @@ mod tests {
             "zpage_stride_no_block_backed",
             "zpage_stride_no_small",
             "zpage_stride_no_self_check",
+            "zpage_stride_no_deferred",
             "zpage_stride_no_kept",
         ];
         for (e, what) in [(&arm, "stride"), (&cached, "cached")] {
