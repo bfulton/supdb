@@ -142,7 +142,28 @@ bulk replacement broke tick-exact tests once; do it test by test. Planned for th
 
 ## What is left, in the owner's order
 
-### 1. The page layer (task 12). Not started.
+### 1. The page layer (task 12). Stage G1 under way: one unit of eight landed.
+
+**As of 20 Nov 09:15 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
+launched one unit a launch: `Workflow {scriptPath, args: {base:
+"ea6352181f342b7bffd75ec8c88df92bc7b78ff6", only: ["G1-<n>"], tail: false}}`, the same base for
+every unit; after G1-8 a launch with `only: ["none"]` and no `tail: false` runs the full gate
+and the critic. A unit is a build, up to three rounds of two reviews and a repair, then its gate
+and one local commit, which whoever launched it pushes. A container restart kills the run and
+leaves its files: resume with `resumeFromRunId` and the same args, plus `args.resume` (a
+build) or `args.notes` (any other step, by its label) to tell the killed step what the tree
+holds; a note for a step changes no earlier prompt, so the steps before it replay.
+
+- **G1-1 `wall` landed: `e7d3fe71`.** `tests/source.rs` over a lexer in `tests/lex/`, the
+  couplings in `tests/data/couplings.txt`, `.github/CODEOWNERS` naming the owner for that file
+  (the owner has not been asked whether they want it: say so). Its notes, mutants and red
+  inputs are in `scratch/plan/build/G1-1/`. Its third review's three findings were repaired and
+  not reviewed again; the stage's closing critic reads the whole.
+- Its gate went red once on a cipher test that bet on the segment work's timing; that test is
+  fixed (`ac512887`).
+- **Next: G1-2 `door`**, then `cost`, `offsets`, `authenticated`, `advice`, `sealed`, `docs`.
+
+What follows was written before the stage began.
 
 Design: `scratch/seam/design.md` (final), decisions in `scratch/seam/decisions.md`, the contract
 in `scratch/seam/forms.md`. One module, `src/db/pagefile.rs`, behind the `vault::` door, that
