@@ -6811,11 +6811,17 @@ pub(super) enum StrideNo {
     /// The file written did not read back as its records through the body
     /// a reader serves it by (`check_stride`).
     SelfCheck,
+    /// A run with gaps the sparse form would take, not asked at this build
+    /// because its plan leaves the ask to a conversion
+    /// (`BuildPlan::stride_sparse_later`). Not a refusal: the one reason a
+    /// conversion still asks of the partition, and at no rent
+    /// (`Maint::z_convert_look`).
+    Deferred,
 }
 
 /// The reasons a partition is not held in the stride form, `StrideNo::code`
 /// running from one to this.
-pub(super) const STRIDE_REASONS: usize = 8;
+pub(super) const STRIDE_REASONS: usize = 9;
 
 impl StrideNo {
     /// The code `Seg::z_stride_no` keeps; zero is none.
@@ -6829,7 +6835,15 @@ impl StrideNo {
             StrideNo::BlockBacked => 6,
             StrideNo::Small => 7,
             StrideNo::SelfCheck => 8,
+            StrideNo::Deferred => 9,
         }
+    }
+
+    /// Whether a partition whose segment keeps `code` may be asked for the
+    /// stride form by a conversion: one with no reason against it, and one
+    /// whose ask a build left for later.
+    pub(super) fn askable(code: u8) -> bool {
+        code == 0 || code == StrideNo::Deferred.code()
     }
 }
 
@@ -7347,6 +7361,14 @@ pub(super) struct BuildPlan {
     /// `stride_precheck`); off, such a partition is no run, as it was
     /// before the form held any.
     pub stride_sparse: bool,
+    /// The sparse form is the store's to take and this build does not ask
+    /// for it: a build made before any reader has come, of a store still
+    /// in its first writing, whose size when it is read no build of it
+    /// knows (`Maint::z_sparse_now`). A partition the sparse form would
+    /// take is then built in the block form with `StrideNo::Deferred` for
+    /// its reason, which a conversion asks again once reads have come.
+    /// Nothing where `stride_sparse` is set.
+    pub stride_sparse_later: bool,
     /// A test's: the stride form's file damaged once it is written and
     /// before it is read back, so that a check the reads go through is
     /// shown to refuse what it is for.
@@ -7383,6 +7405,7 @@ impl BuildPlan {
             stride_below: None,
             stride_spans: None,
             stride_sparse: false,
+            stride_sparse_later: false,
             #[cfg(test)]
             damage: None,
             #[cfg(test)]
@@ -7552,20 +7575,32 @@ fn build_file_seen(
     let made = match ask {
         StrideAsk::No => block(seen),
         ask => {
-            let walked =
-                match stride_precheck(&SegImages::new(recs, dir, nkeys), plan.stride_sparse) {
-                    Ok(sf) => write_stride(
-                        &file, base, recs, dir, nkeys, bind, &tmp, &facts, id, end_seq, &sf, plan,
-                        seen,
-                    ),
-                    // The two ends decide before the temporary name is this
-                    // build's: asked for the stride form alone, their decline
-                    // is the opening's and leaves the name alone, since a way
-                    // out removes only a name its build opened, and the name is
-                    // the partition's, which another build of it may hold.
-                    Err(why) if ask == StrideAsk::Only => return Ok(Outcome::NotStride(why)),
-                    Err(why) => Ok(Outcome::NotStride(why)),
-                };
+            let images = SegImages::new(recs, dir, nkeys);
+            let checked = stride_precheck(&images, plan.stride_sparse).map_err(|why| {
+                // A run with gaps this plan leaves for a conversion to ask:
+                // named as that, and not as the holes a plan that takes no
+                // such run finds in it.
+                let later = plan.stride_sparse_later
+                    && !plan.stride_sparse
+                    && stride_precheck(&images, true).is_ok_and(|f| f.sparse_last.is_some());
+                if later {
+                    StrideNo::Deferred
+                } else {
+                    why
+                }
+            });
+            let walked = match checked {
+                Ok(sf) => write_stride(
+                    &file, base, recs, dir, nkeys, bind, &tmp, &facts, id, end_seq, &sf, plan, seen,
+                ),
+                // The two ends decide before the temporary name is this
+                // build's: asked for the stride form alone, their decline
+                // is the opening's and leaves the name alone, since a way
+                // out removes only a name its build opened, and the name is
+                // the partition's, which another build of it may hold.
+                Err(why) if ask == StrideAsk::Only => return Ok(Outcome::NotStride(why)),
+                Err(why) => Ok(Outcome::NotStride(why)),
+            };
             match walked {
                 // A late decline: the block body is built in the same
                 // call, over records the walk left warm, under the same
@@ -14754,6 +14789,7 @@ mod tests {
             BlockBacked,
             Small,
             SelfCheck,
+            Deferred,
         ];
         let codes: std::collections::HashSet<u8> = all.iter().map(|w| w.code()).collect();
         assert_eq!(codes.len(), all.len());
@@ -14764,6 +14800,12 @@ mod tests {
         assert!(codes
             .iter()
             .all(|&c| (1..=STRIDE_REASONS as u8).contains(&c)));
+        // A conversion asks of a partition with no reason and of one whose
+        // ask was left for it, and of no other.
+        for why in all {
+            assert_eq!(StrideNo::askable(why.code()), why == Deferred, "{why:?}");
+        }
+        assert!(StrideNo::askable(0));
     }
 
     /// Each reason is counted in its own slot of the declines, in the order
@@ -14782,6 +14824,7 @@ mod tests {
             (BlockBacked, 5),
             (Small, 6),
             (SelfCheck, 7),
+            (Deferred, 8),
         ];
         for (why, slot) in slots {
             let ev = ZEvents::default();
@@ -15055,6 +15098,133 @@ mod tests {
         let plain = stride_built(&fx);
         assert_eq!(whole.file_bytes, plain.file_bytes);
         assert_eq!(std::fs::read(&fx.out).unwrap(), sparse_bytes);
+    }
+
+    /// A plan that leaves the sparse form for a conversion to ask
+    /// (`BuildPlan::stride_sparse_later`) builds a run with gaps in the
+    /// block form and names it deferred -- the one reason a conversion
+    /// asks past (`StrideNo::askable`) -- under either ask, nothing on disk
+    /// where the stride form alone was asked. It names nothing so of a
+    /// partition the sparse form would not take either, whose reason is
+    /// the one it has; it builds a whole run in the stride form as any
+    /// plan does; and where the plan takes the sparse form now the later
+    /// says nothing.
+    #[test]
+    fn a_plan_that_leaves_the_sparse_form_for_later_names_a_run_with_gaps_deferred() {
+        let later = |ask| BuildPlan {
+            stride_sparse_later: true,
+            ..stride_plan(ask)
+        };
+        for (name, recs, _) in gapped_cases() {
+            if recs.len() < 100 {
+                continue;
+            }
+            let fx = Fixture::new(&format!("sparse-later-{name}"), recs, 1 << 16);
+            let _ = std::fs::remove_file(&fx.out);
+            let cell = AtomicU8::new(0);
+            let made = build(&fx.seg, &fx.out, ID, END, &later(StrideAsk::Only)).unwrap();
+            made.note_stride(&cell);
+            assert!(
+                matches!(made, Outcome::NotStride(StrideNo::Deferred)),
+                "{name}: {made:?}"
+            );
+            assert!(!fx.out.exists() && !tmp_of(&fx.out).exists(), "{name}");
+            assert_eq!(cell.load(Ordering::Relaxed), StrideNo::Deferred.code());
+            let cell = AtomicU8::new(0);
+            let made = build(&fx.seg, &fx.out, ID, END, &later(StrideAsk::OrBlock)).unwrap();
+            made.note_stride(&cell);
+            let Outcome::Built(b) = made else {
+                panic!("{name}: {made:?}")
+            };
+            assert_eq!(
+                (b.coding, b.stride_no, b.stride_sparse),
+                (FileCoding::Block, Some(StrideNo::Deferred), false),
+                "{name}"
+            );
+            assert!(StrideNo::askable(cell.load(Ordering::Relaxed)), "{name}");
+            let zfile = fx.attach().expect("the block file attaches");
+            assert!(!zfile.is_stride(), "{name}");
+            agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
+            // Taken now, the later says nothing.
+            let _ = std::fs::remove_file(&fx.out);
+            let both = BuildPlan {
+                stride_sparse_later: true,
+                ..sparse_plan(StrideAsk::OrBlock)
+            };
+            let made = build(&fx.seg, &fx.out, ID, END, &both).unwrap();
+            assert!(
+                matches!(
+                    made,
+                    Outcome::Built(Built {
+                        coding: FileCoding::Stride,
+                        stride_sparse: true,
+                        stride_no: None,
+                        ..
+                    })
+                ),
+                "{name}: {made:?}"
+            );
+        }
+        // A partition the sparse form would not take: a record of two
+        // values among a run with gaps keeps its own reason, and a key of
+        // another length keeps the shape's.
+        let mut two = gapped_recs(3, 600, 100, 0x71);
+        let extra = two[300].1[0].clone();
+        two[300].1.push(extra);
+        let mut odd = gapped_recs(3, 600, 100, 0x72);
+        odd[300].0.push(b'x');
+        for (name, recs, why) in [
+            ("two-values", two, StrideNo::NotOneValue),
+            ("odd-key", odd, StrideNo::NotShaped),
+        ] {
+            let fx = Fixture::new(&format!("sparse-later-{name}"), recs, 1 << 16);
+            let _ = std::fs::remove_file(&fx.out);
+            let made = build(&fx.seg, &fx.out, ID, END, &later(StrideAsk::OrBlock)).unwrap();
+            let Outcome::Built(b) = made else {
+                panic!("{name}: {made:?}")
+            };
+            // The two ends are a run with gaps, so the ask is left: what
+            // the walk would find is the conversion's to find.
+            assert_eq!(
+                (b.coding, b.stride_no),
+                (FileCoding::Block, Some(StrideNo::Deferred)),
+                "{name}"
+            );
+            // And the conversion's ask finds it.
+            let _ = std::fs::remove_file(&fx.out);
+            let made = build(&fx.seg, &fx.out, ID, END, &sparse_plan(StrideAsk::Only)).unwrap();
+            assert!(
+                matches!(made, Outcome::NotStride(w) if w == why),
+                "{name}: {made:?}"
+            );
+        }
+        // A run whose ends are no run of any kind keeps its reason: keys of
+        // two lengths at the two ends.
+        let mut ends = gapped_recs(3, 600, 100, 0x73);
+        ends.last_mut().unwrap().0.push(b'9');
+        let fx = Fixture::new("sparse-later-ends", ends, 1 << 16);
+        let _ = std::fs::remove_file(&fx.out);
+        let made = build(&fx.seg, &fx.out, ID, END, &later(StrideAsk::Only)).unwrap();
+        assert!(
+            matches!(made, Outcome::NotStride(StrideNo::NotShaped)),
+            "{made:?}"
+        );
+        // A whole run is built in the stride form, later or not.
+        let fx = Fixture::new("sparse-later-whole", stride_recs(700, 100, 0x74), 1 << 16);
+        let _ = std::fs::remove_file(&fx.out);
+        let made = build(&fx.seg, &fx.out, ID, END, &later(StrideAsk::OrBlock)).unwrap();
+        assert!(
+            matches!(
+                made,
+                Outcome::Built(Built {
+                    coding: FileCoding::Stride,
+                    stride_sparse: false,
+                    stride_no: None,
+                    ..
+                })
+            ),
+            "{made:?}"
+        );
     }
 
     /// Each state a partition can be in that the stride form does not hold,

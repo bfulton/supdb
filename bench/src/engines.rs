@@ -11915,7 +11915,7 @@ impl Engine for Supdb {
         // `ZCounts::stride_declines` documents. Bound by a pattern of its
         // length, so a reason the engine adds is a build that fails here
         // and not a slot this list leaves unnamed or names as another.
-        let [not_shaped, holes, not_one_value, width, tomb, block_backed, small, self_check] =
+        let [not_shaped, holes, not_one_value, width, tomb, block_backed, small, self_check, deferred] =
             z.stride_declines;
         vec![
             ("snapshot_builds", db.snapshot_builds() as f64),
@@ -12169,6 +12169,7 @@ impl Engine for Supdb {
             ("zpage_stride_no_block_backed", block_backed as f64),
             ("zpage_stride_no_small", small as f64),
             ("zpage_stride_no_self_check", self_check as f64),
+            ("zpage_stride_no_deferred", deferred as f64),
             ("zpage_counts", z.counts as f64),
             ("zpage_decodes", z.decodes as f64),
             ("zpage_inplace_groups", z.inplace_groups as f64),
@@ -19311,7 +19312,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("no counter {name}"))
                 .1
         };
-        const NO: [&str; 8] = [
+        const NO: [&str; 9] = [
             "zpage_stride_no_not_shaped",
             "zpage_stride_no_holes",
             "zpage_stride_no_not_one_value",
@@ -19320,6 +19321,7 @@ mod tests {
             "zpage_stride_no_block_backed",
             "zpage_stride_no_small",
             "zpage_stride_no_self_check",
+            "zpage_stride_no_deferred",
         ];
         for (e, what) in [(&arm, "stride"), (&cached, "cached")] {
             let z = e.zpages_state().unwrap();

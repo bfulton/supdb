@@ -1731,7 +1731,7 @@ impl std::fmt::Display for StrideStats {
             "form builds {} block-backed {}, moved in {} out {}, \
              stride builds {} (sparse {}) files {} reads {} cursor {} \
              page checks {} failures {}, \
-             declines [shape, holes, values, width, tomb, block, small, readback] {:?}",
+             declines [shape, holes, values, width, tomb, block, small, readback, deferred] {:?}",
             self.form_builds,
             self.block_backed,
             self.converts,
