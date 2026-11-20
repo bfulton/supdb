@@ -142,9 +142,9 @@ bulk replacement broke tick-exact tests once; do it test by test. Planned for th
 
 ## What is left, in the owner's order
 
-### 1. The page layer (task 12). Stage G1 under way: two units of eight landed.
+### 1. The page layer (task 12). Stage G1 under way: three units of eight landed.
 
-**As of 20 Nov 12:15 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
+**As of 20 Nov 22:55 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
 launched one unit a launch: `Workflow {scriptPath, args: {base:
 "ea6352181f342b7bffd75ec8c88df92bc7b78ff6", only: ["G1-<n>"], tail: false}}`, the same base for
 every unit; after G1-8 a launch with `only: ["none"]` and no `tail: false` runs the full gate
@@ -156,7 +156,7 @@ holds; a note for a step changes no earlier prompt, so the steps before it repla
 
 - **G1-1 `wall` landed: `e7d3fe71`.** `tests/source.rs` over a lexer in `tests/lex/`, the
   couplings in `tests/data/couplings.txt`, `.github/CODEOWNERS` naming the owner for that file
-  (the owner has not been asked whether they want it: say so). Its notes, mutants and red
+  (the owner was asked on 20 Nov and decided against it: see "The owner's decision" below). Its notes, mutants and red
   inputs are in `scratch/plan/build/G1-1/`. Its third review's three findings were repaired and
   not reviewed again; the stage's closing critic reads the whole.
 - Its gate went red once on a cipher test that bet on the segment work's timing; that test is
@@ -176,7 +176,55 @@ holds; a note for a step changes no earlier prompt, so the steps before it repla
   the config's names were resolved on x86_64 only; `CLAUDE.md` still names the deleted
   `the_engine_names_no_file_but_through_the_door` and says no module carries a blanket lint
   allowance, both G1-8's to correct.
-- **Next: G1-3 `cost`**, then `offsets`, `authenticated`, `advice`, `sealed`, `docs`.
+- **G1-3 `cost` landed: `c1546dc1`.** `sh scripts/check.sh cost` (outside the default set, and
+  a CI job) runs `scripts/cost-red.sh`, the gate's red input, and then `scripts/cost.sh BASE`:
+  fifteen probes built at BASE from this tree's example sources and at the tree, each under
+  callgrind, every function's own instructions compared by canonical name
+  (`scripts/cost-diff.py`, the list and the bounds in `scripts/cost-hot.txt`), and
+  `tests/source.rs` holds every public entry point of `Reader`, `Db` and `Blob` to a probe or
+  a reason in `tests/data/cost-entries.txt`. No engine code changed. A container restart at
+  12:30 UTC killed its first build sixteen minutes in; the run was resumed with a note. Its
+  notes, its mutants (reviewers' and its own, four passes) and the two whole runs it rests on
+  are in `scratch/plan/build/G1-3/` (`against-upstream-9bfc4362.log`, `against-itself.log`).
+  All three review rounds asked for repairs; the third repair (the `~` lines given bounds, the
+  `land`, commit and long compact-form scan probes, type aliases and blanket trait impls in the
+  entry-point test) was read by the launcher and by no reviewer: the closing critic's.
+- **What the cost gate says of this branch against upstream `9bfc4362`** (the upstream head
+  last merged): red by function, and by probe total under upstream in thirteen probes of
+  fifteen. The two over are real and are the next work but one (task 17): `scan_at`, the
+  public `Blob::scan_at` with a caller's own callback, +239 instructions a scan of a hundred
+  entries (the probe's own function, where the walk is inlined, +236; `FlatIndex::search`
+  +3); and `land`, +277 a key rewritten, `CachedBlock::lower_bound` and `Reader::splice_run`
+  searching by key where the base patched by rank a copy carried across a merge's rewrite --
+  the price of the fix for "a claim about a partition's records carried across its rewrite"
+  (`324a395a`), on a plain store with merges, to be understood and brought down, not
+  accepted. Everything else red there is a move between functions with the total down (the
+  read's bracket to `Db::op`/`WriterOp`, `flat` to `key_at`/`scan_whole`, the compact form's
+  helpers inlined differently), read by callers and callees in the unit's notes.
+- **What the cost gate cannot do yet, for the closing critic and the integration:** a move
+  between two functions reads red with nothing to say it is a move, so a pull request against
+  the main line fails its cost job as the branch stands, whatever task 17 fixes; the way
+  through is undecided (a declared group of functions held to its net, valid against one
+  base, is the candidate, shaped like the lists' declared raises below). Also open: the `~`
+  bounds rest on two to four self-checks a probe; `land` runs the segment work inline, not
+  on its own thread; the CI job and valgrind's noise on a hosted runner are unmeasured;
+  `sh scripts/check.sh cost` with its default base has not been run; a whole run wants
+  several gigabytes free; libc's and the allocator's functions are held only loosely; `Txn`,
+  `RunWalk` and the `SparseBlob` readers are outside the entry-point list.
+- **The owner's decision (20 Nov 17:38 UTC), task 18, the next work:** a list's "only goes
+  down" is held by a check, not by `.github/CODEOWNERS`, and the check is run by the same
+  command locally and in CI: every CI job is a `sh scripts/check.sh <group>`. So:
+  `scripts/base.sh`, one definition of the commit a change is made on; a ratchet script and
+  its red input over the registered lists (`couplings.txt`, `door.txt`, `door-libc.txt`,
+  `cost-entries.txt`'s reasons, and G2's lists as they are built), failing on growth against
+  the merge-base, an intended raise declared in a file of its own and matched exactly (the
+  launcher's choice, told to the owner, not answered); a group for it in the default set and
+  a `cross-arm` group outside it, so the one CI job that called cargo itself goes through
+  `check.sh`; the cost job's base logic out of the YAML; a test that reads `ci.yml` and fails
+  a step that checks anything except through `check.sh`; `CODEOWNERS` removed. Every later
+  unit is launched with that rule in its build note.
+- **Next, in order:** task 18, then task 17, each its own workflow and commit; then G1-4
+  `offsets`, then `authenticated`, `advice`, `sealed`, `docs`.
 
 What follows was written before the stage began.
 

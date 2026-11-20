@@ -1,0 +1,29 @@
+M1_totals	KILLED	0s	cost-red: A: a hot function's gain under a level total was not red
+M2a_hotfile_empty	KILLED	251s	cost-red: S: the job exited 1 over the tree against itself
+M2b_hotlist_silent	KILLED	0s	cost-red: A: a hot function's gain under a level total was not red
+M3_base_sources	KILLED	254s	cost-red: C: the job exited 1 over a probe that changed with the engine untouched
+M4_exit_swallowed	KILLED	320s	cost-red: B: the job exited 0 over a read that pays a load and a branch
+O1_no_empty_check	KILLED	0s	cost-red: A: a side that collected nothing was not red
+O2_head_ignored	KILLED	317s	cost-red: B: the job exited 0 over a read that pays a load and a branch
+O3_toggle_dropped	KILLED	317s	cost-red: T: the job exited 1 over a cost the point read's probe pays outside its toggle
+O4_verdict_green	KILLED	315s	cost-red: B: the job exited 0 over a read that pays a load and a branch
+O5_test_code_counted	KILLED	12s	test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 68 filtered out; finished in 6.48s
+O6_default_unchecked	KILLED	8s	test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 68 filtered out; finished in 2.22s
+O7_missing_line_unchecked	KILLED	6s	test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 68 filtered out; finished in 0.43s
+O9_substring_match	KILLED	0s	cost-red: A: a function whose name begins with a hot line's was taken for it
+O10_raw_names	KILLED	0s	cost-red: A: a hot function's closure, named as callgrind names it, was not red
+O11_bang_ignored	KILLED	0s	cost-red: A: a function a ! line takes out was counted
+O12_no_hot_unchecked	KILLED	0s	cost-red: A: a probe in which no hot line names a function was not red
+X3_entry_files_two	KILLED	8s	test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 68 filtered out; finished in 2.47s
+X5_group_swallows_cost	KILLED	0s	cost-red: G: the group exited 0 where cost.sh failed
+X9_slack_5	KILLED	0s	cost-red: A: a tenth of an instruction an operation was not red at the default slack
+X9b_slack_0	KILLED	0s	cost-red: A: a hundredth of an instruction an operation was red at the default slack
+X10_threshold_dropped	KILLED	255s	cost-red: S: the job exited 1 over the tree against itself
+R1_own_not_passed	KILLED	324s	cost-red: U: the job exited 0 over a scan that pays a load and a branch
+R2_partial_sum_unchecked	KILLED	0s	cost-red: A: a listing whose functions fall short of its total was not red
+R3_no_total_unchecked	KILLED	0s	cost-red: A: a listing with no program total was not red
+R4_suite_guard_dropped	KILLED	251s	cost-red: V: the job exited 0 over a suite whose per-read code differs from the base's
+R5_over_key_dropped	KILLED	0s	cost-red: A: in a probe with a toggle, a library function instantiated over the suite's gained and was not red
+R6_owned_ignored	KILLED	0s	cost-red: A: in a probe with a toggle, a function of the engine on no line gained and was not red
+R7_group_swallows_red	KILLED	0s	cost-red: G: the group ran cost.sh after cost-red.sh failed
+R8_suite_attrs_ignored	KILLED	247s	cost-red: V: the job exited 1 over a suite whose sink changed its attribute
