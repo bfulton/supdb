@@ -109,15 +109,20 @@ stores, and a run whose store another run's cleanup removed mid-test
 fails with a bare `NotFound` from whatever file operation came next --
 eight tests of one run, one of them in six runs alone, before a syscall
 trace showed the store's directory gone and nothing in the process that
-removed it. A pairing's arm is the other way the allowance is found
-spent: `bench ab` at ten million keys exited 1 after the comparator's
-sweep with its own store left behind and nothing in its table or on its
-stderr naming the cause, at zero bytes free; the three gates of the day
-had left fourteen hundred test stores in the private temp directories
-(1.3 GB), and the bench workspace's `target` held 14 GB, 3.6 of it the
-checked profile's example binaries, which the gate's bench group rebuilds
-and nothing reads. Read `df` of the temp volume before a timing run, and
-delete the test stores and the checked examples first.
+removed it. Spell that `TMPDIR` canonically: the tests that find a
+store's mappings match `/proc/self/maps`, which names the resolved path,
+by the store's directory as a prefix, so a `TMPDIR` written with a `..`
+in it failed four zpages tests and the leak test every run, five of five
+alone, with "one form file mapped: []". A pairing's arm is the other
+way the allowance is found spent: `bench ab` at ten million keys exited
+1 after the comparator's sweep with its own store left behind and
+nothing in its table or on its stderr naming the cause, at zero bytes
+free; the three gates of the day had left fourteen hundred test stores
+in the private temp directories (1.3 GB), and the bench workspace's
+`target` held 14 GB, 3.6 of it the checked profile's example binaries,
+which the gate's bench group rebuilds and nothing reads. Read `df` of
+the temp volume before a timing run, and delete the test stores and the
+checked examples first.
 
 The test group's compile was thirty-three minutes of a gate's
 thirty-seven, for four minutes of tests, and the cause was in the
