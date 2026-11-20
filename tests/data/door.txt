@@ -1,0 +1,105 @@
+# The door where clippy cannot hold it (tests/source.rs,
+# the_door_holds_what_clippy_cannot). Columns, tab-separated:
+#   kind  file  scope  count  reason
+# allow:   an allow or expect that silences the door's lint
+#          (scripts/door/clippy.toml), by the scope it governs, as
+#          tests/lex names it: <file> for a module's own, Type::<item> for
+#          a type's body, a fn of a nested module by its own name.
+# literal: a "/proc" or "/sys" path written outside the door's modules.
+# thread:  thread:: paths in a file's code, the door's modules included,
+#          until S1's pin:: wrappers (decision 11).
+# cfgout:  a cfg whose predicate does not hold in the door's build (the
+#          library under checked on Linux x86_64, glibc), outside the
+#          door's modules: code the door's lint never compiles, held by
+#          text (no path the config bars may be written in it).
+# Every count is exact: one that grows, moves or falls fails until this
+# file says so, with the reason.
+#
+# The door's modules.
+allow	src/bytes.rs	<file>	1	the mapped byte source and its advice (MmapBytes)
+allow	src/crypt.rs	<file>	1	/dev/urandom for an envelope's id, and the reader's anonymous plaintext mapping
+allow	src/db/blocks.rs	<file>	1	the engine's anonymous blocks, mapped, counted and given back
+allow	src/db/dirkey.rs	<file>	1	the kernel-key ioctls on directory descriptors
+allow	src/db/pager.rs	<file>	1	the cache's memory files, their mappings and their advice
+allow	src/db/vault.rs	<file>	1	the door itself
+# The engine: not a file.
+allow	src/db.rs	idle_io_priority	1	syscall(SYS_ioprio_set): a thread's I/O class, not a file
+allow	src/db.rs	with_idle_io	1	syscall(SYS_ioprio_get/set): a thread's I/O class, not a file
+allow	src/db.rs	io_priority_class	1	syscall(SYS_ioprio_get): a thread's I/O class, not a file
+allow	src/db.rs	same_description	1	syscall(SYS_kcmp): compares two descriptors the door gave
+allow	src/db.rs	populate_ahead	1	madvise(POPULATE_WRITE) on the writer's anonymous buffer
+allow	src/db.rs	register_membarrier	1	syscall(SYS_membarrier): not a file
+allow	src/db.rs	membarrier_all_threads	1	syscall(SYS_membarrier): not a file
+# The engine: on a handle the door gave (S1: the typed handle's methods).
+allow	src/db.rs	Wal::replay	1	maps the log through a handle vault::open gave (S1: as_os)
+allow	src/db.rs	pwritev_at	1	pwritev on a handle the door gave (S1: the handle's write)
+allow	src/db.rs	start_writeback	1	sync_file_range on a handle the door gave (S1: writeback)
+allow	src/db.rs	RunWalk::<item>	1	a raw mapping of a run's file, made by walk_run from a door handle
+allow	src/db.rs	SegmentWriter::walk_run	1	maps a run's file through a handle vault::open gave (S1: as_os)
+allow	src/db.rs	reopen	1	a second description of a door handle, by /proc/self/fd (S1: the handle's reopen)
+allow	src/db.rs	RunMap::<item>	1	the run's mapping, of the file vault::open_mapped gave
+allow	src/db.rs	RunMap::open	1	maps the run's file through vault::open_mapped's handle (S1: as_os)
+allow	src/db.rs	fadvise_dontneed_range	1	advice on a door handle (S1, R3)
+allow	src/db.rs	fadvise_dontneed	1	advice on a door handle (S1, R3)
+# The engine: memory and the machine, read (G3: Memory).
+allow	src/db.rs	thread_minflt	1	/proc/thread-self/stat for a trace (G3: Memory)
+allow	src/db.rs	thread_majflt	1	/proc/thread-self/stat for a trace (G3: Memory)
+allow	src/db.rs	llc_bytes	1	the last-level cache's size from /sys (G3: Memory)
+allow	src/db.rs	resident_share	1	mincore over a borrowed slice (G3: Memory)
+allow	src/db.rs	mallinfo2	1	dlsym of glibc's allocator count (G3: Memory)
+allow	src/db.rs	resident_beyond_use	1	/proc/self/status for the trim (G3: Memory)
+# The engine: paths that are not the store's files.
+allow	src/db.rs	Db::create	1	create_dir_all of the store's real directory, which holds the marker before any vault exists
+allow	src/db.rs	Db::checkpoint	1	the caller's destination asked whether it exists; refused under a cipher above it
+allow	src/db.rs	Maint::checkpoint_into	1	the caller's destination, made and removed; refused under a cipher in Db::checkpoint
+# The engine: a form file asked by path, fail closed under a cipher.
+allow	src/db.rs	Maint::z_files_cover	1	is_file of a form file by path: under a cipher the decoy answers no (S5 prices the controller there)
+allow	src/db.rs	Maint::z_cross	1	is_file of a form file by path: under a cipher the decoy answers no (S5 prices the controller there)
+# The compact form's builder and reader.
+allow	src/db/zfile.rs	drop_written_range	1	writeback and drop on the build's own output, a door handle
+allow	src/db/zfile.rs	written_back_range	1	writeback on the build's own output, a door handle
+allow	src/db/zfile.rs	swap_ahead	1	advice on a door handle
+allow	src/db/zfile.rs	ask_file	1	a form file opened by path for an ask: under a cipher the decoy opens nothing (G1-6, S1)
+allow	src/db/zfile.rs	drop_behind	1	advice in the plain build only (Walked::Mapped)
+allow	src/db/zfile.rs	ask_ahead	1	advice in the plain build only
+allow	src/db/zfile.rs	build_file_seen	1	Mmap::map of a plain segment's door handle (SegSrc::File)
+allow	src/db/zfile.rs	check_stride	1	maps the stride build's own output by path: no stride form is built under a cipher (StrideNo::Kept)
+allow	src/db/zfile.rs	thread_major_faults	1	getrusage (G3: Memory)
+allow	src/db/zfile.rs	file_facts	1	maps a form file by path: under a cipher the decoy maps nothing and the reading falls back to a sample (S5)
+allow	src/db/zfile.rs	time_file_decodes	1	maps a form file by path: as file_facts (S5)
+allow	src/db/zfile.rs	read_budget	1	/proc and cgroup reads (G3: Memory)
+# Paths written outside the door's modules.
+literal	src/db.rs	llc_bytes	1	/sys/devices/system/cpu (G3: Memory)
+literal	src/db.rs	reopen	1	/proc/self/fd, a second description of a door handle (S1)
+literal	src/db.rs	resident_beyond_use	1	/proc/self/status (G3: Memory)
+literal	src/db.rs	thread_majflt	1	/proc/thread-self/stat (G3: Memory)
+literal	src/db.rs	thread_minflt	1	/proc/thread-self/stat (G3: Memory)
+literal	src/db/zfile.rs	budget_from	4	/proc meminfo, cgroup, mounts and status, read through read_budget's closure (G3: Memory)
+# Threads, until S1.
+thread	src/crypt.rs	*	1	a reader yields while another thread decrypts its chunk (S1: pin::)
+thread	src/db.rs	*	103	the engine's threads, waits and sleeps (S1: pin::)
+thread	src/db/pager.rs	*	9	the cache's evictor and the waits for it (R1 lets the pager spawn and wait)
+thread	src/flatindex.rs	*	3	the writer's helper thread (S1: pin::)
+# Code the door's build compiles out.
+cfgout	src/blob.rs	Blob::scan_at_in	1	wasm: a lead nobody reads
+cfgout	src/block.rs	crc32_from	1	aarch64: the CRC instructions' dispatch
+cfgout	src/block.rs	crc32c_hw	1	aarch64: the CRC instructions
+cfgout	src/db.rs	<file>	2	not Linux: fadvise_dontneed_range and fadvise_dontneed do nothing
+cfgout	src/db.rs	Reader::convert_walked	1	not debug_assertions: a binding the check below uses
+cfgout	src/db.rs	io_priority_class	1	not Linux: no I/O class
+cfgout	src/db.rs	mod heap	1	not glibc: no allocator counts
+cfgout	src/db.rs	populate_ahead	1	not Linux: nothing populated
+cfgout	src/db.rs	prefetch_lines	1	not x86_64: no prefetch
+cfgout	src/db.rs	reopen	1	not Linux: a clone of the handle
+cfgout	src/db.rs	same_description	1	not Linux: descriptors compared by number
+cfgout	src/db.rs	start_writeback	1	not Linux: no writeback hint
+cfgout	src/db.rs	with_idle_io	1	not Linux: the call as it is
+cfgout	src/db/zfile.rs	<file>	2	not Linux: drop_behind and ask_ahead do nothing
+cfgout	src/db/zfile.rs	ask_file	1	not Linux: nothing asked
+cfgout	src/db/zfile.rs	drop_written_range	1	not Linux: nothing dropped
+cfgout	src/db/zfile.rs	read_budget	1	not Linux: no budget
+cfgout	src/db/zfile.rs	swap_ahead	1	not Linux: nothing swapped
+cfgout	src/db/zfile.rs	written_back_range	1	not Linux: a sync of the handle's data
+cfgout	src/db/zlz4.rs	fast_turn	1	not x86_64: the wide decodes' arm falls to the flat loop
+cfgout	src/flatindex.rs	prefetch_slot	1	not x86_64: no prefetch
+cfgout	src/lib.rs	mod wasmapi	1	wasm: the browser's C ABI, a file the door's build does not compile (its text is held whole)

@@ -1,0 +1,172 @@
+# The door (forms.md R1, gate test G-door), by symbol.
+#
+# Files, mappings, advice, syncs and process reads go through the door's
+# modules: crate::db::vault, crate::bytes, crate::db::pager, crate::crypt,
+# crate::db::dirkey and crate::db::blocks, each of which carries the lint's
+# allow at its top. An allow anywhere else names its reason and is counted
+# by tests/data/door.txt (tests/source.rs, the_door_holds_what_clippy_cannot).
+#
+# The libc entries are a class, held to the source: every libc function
+# the door's builds declare (glibc, x86_64 and aarch64) that takes a string
+# argument, the argument a path is passed in, is either here or in
+# tests/data/door-libc.txt with the reason it acts on no file, and
+# tests/source.rs reads the resolved libc's declarations to hold that
+# (every_libc_call_that_takes_a_string_is_barred_or_said_to_touch_no_file).
+# Beside them the libc calls that act on a descriptor's or a mapping's bytes
+# with no string -- read and write, seek, map, advise, sync, splice, ioctl,
+# syscall, bind and connect -- are a list, written by hand. So are the rest:
+# std's calls that act by path (std::fs, std::os::unix::fs, Path's
+# questions of the filesystem, a unix socket bound or connected by path,
+# the working directory) or run a program (std::process::Command), and
+# memmap2's mappings and every method of a mapping that advises, syncs,
+# locks, remaps or changes its protection. A call outside those is not
+# barred: an fd's own metadata (fchmod, fchown, futimens), dup, close, and
+# the std::fs::File type, whose methods act on a handle the door gave
+# (below). An entry that resolves to nothing, or to a thing of the wrong
+# kind, bars nothing; the run fails on it (scripts/door/lint.sh,
+# door_run), and tests/source.rs holds each table to its kind of path.
+#
+# Run by scripts/door/run.sh (the lint group of scripts/check.sh) over the
+# library alone, on Linux, with its red input, scripts/door/red.sh. The
+# config is here and not at the root so that tests, examples and bench,
+# which read stored files by path on purpose, see none of it.
+#
+# Not barred here: the std::fs::File type and its methods (the door hands
+# out File until S1's typed handles), and the thread calls (decision 11:
+# S1, where the pin:: wrappers are; tests/source.rs counts std::thread:: per
+# file meanwhile). Code the run's build compiles out is held by text
+# against these same entries (tests/source.rs, `cfgout`).
+disallowed-methods = [
+  # std::fs by path
+  { path = "std::fs::File::open", reason = "open through crate::db::vault" },
+  { path = "std::fs::File::create", reason = "create through crate::db::vault" },
+  { path = "std::fs::File::create_new", reason = "create through crate::db::vault" },
+  { path = "std::fs::File::options", reason = "open through crate::db::vault" },
+  { path = "std::fs::OpenOptions::new", reason = "open through crate::db::vault" },
+  { path = "std::fs::OpenOptions::open", reason = "open through crate::db::vault" },
+  "std::fs::read", "std::fs::read_to_string", "std::fs::write",
+  "std::fs::read_dir", "std::fs::rename", "std::fs::remove_file",
+  "std::fs::remove_dir", "std::fs::remove_dir_all", "std::fs::create_dir",
+  "std::fs::create_dir_all", "std::fs::hard_link", "std::fs::copy",
+  "std::fs::metadata", "std::fs::symlink_metadata", "std::fs::canonicalize",
+  "std::fs::read_link", "std::fs::set_permissions", "std::fs::exists",
+  "std::os::unix::fs::symlink", "std::os::unix::fs::chown",
+  "std::os::unix::fs::lchown", "std::os::unix::fs::chroot",
+  "std::fs::DirBuilder::new", "std::fs::DirBuilder::create",
+  "std::fs::soft_link", "std::fs::File::open_buffered",
+  "std::env::set_current_dir",
+  # a unix socket bound or connected by path makes or reads a filesystem entry
+  "std::os::unix::net::UnixListener::bind", "std::os::unix::net::UnixDatagram::bind",
+  "std::os::unix::net::UnixStream::connect", "std::os::unix::net::UnixDatagram::connect",
+  # a program run: `rm`, `cat /proc/..`, anything past every entry here
+  { path = "std::process::Command::new", reason = "a program run acts on files past the door" },
+  # paths asked of the filesystem
+  "std::path::Path::exists", "std::path::Path::try_exists",
+  "std::path::Path::is_file", "std::path::Path::is_dir",
+  "std::path::Path::is_symlink", "std::path::Path::metadata",
+  "std::path::Path::symlink_metadata", "std::path::Path::read_dir",
+  "std::path::Path::canonicalize", "std::path::Path::read_link",
+  # the crate's own plain mapping by path
+  { path = "supdb::bytes::MmapBytes::open", reason = "map through crate::db::vault::map" },
+  # mappings
+  "memmap2::Mmap::map", "memmap2::MmapMut::map_mut", "memmap2::MmapMut::map_anon",
+  "memmap2::MmapRaw::map_raw", "memmap2::MmapOptions::new",
+  "memmap2::MmapOptions::map", "memmap2::MmapOptions::map_exec",
+  "memmap2::MmapOptions::map_mut", "memmap2::MmapOptions::map_copy",
+  "memmap2::MmapOptions::map_copy_read_only", "memmap2::MmapOptions::map_anon",
+  "memmap2::MmapOptions::map_raw", "memmap2::MmapOptions::map_raw_read_only",
+  # a mapping's methods that advise, sync, lock, remap or change protection,
+  # on a mapping a door module handed out without its type being written
+  "memmap2::Mmap::advise", "memmap2::Mmap::advise_range",
+  "memmap2::Mmap::unchecked_advise", "memmap2::Mmap::unchecked_advise_range",
+  "memmap2::Mmap::make_mut", "memmap2::Mmap::lock", "memmap2::Mmap::unlock",
+  "memmap2::Mmap::remap",
+  "memmap2::MmapMut::flush", "memmap2::MmapMut::flush_async",
+  "memmap2::MmapMut::flush_range", "memmap2::MmapMut::flush_async_range",
+  "memmap2::MmapMut::make_read_only", "memmap2::MmapMut::make_exec",
+  "memmap2::MmapMut::advise", "memmap2::MmapMut::advise_range",
+  "memmap2::MmapMut::unchecked_advise", "memmap2::MmapMut::unchecked_advise_range",
+  "memmap2::MmapMut::lock", "memmap2::MmapMut::unlock", "memmap2::MmapMut::remap",
+  "memmap2::MmapRaw::flush", "memmap2::MmapRaw::flush_async",
+  "memmap2::MmapRaw::flush_range", "memmap2::MmapRaw::flush_async_range",
+  "memmap2::MmapRaw::advise", "memmap2::MmapRaw::advise_range",
+  "memmap2::MmapRaw::unchecked_advise", "memmap2::MmapRaw::unchecked_advise_range",
+  "memmap2::MmapRaw::lock", "memmap2::MmapRaw::unlock", "memmap2::MmapRaw::remap",
+  # libc: by path
+  "libc::open", "libc::openat", "libc::creat", "libc::fopen", "libc::opendir",
+  "libc::unlink", "libc::unlinkat", "libc::rename", "libc::renameat",
+  "libc::renameat2", "libc::link", "libc::linkat", "libc::symlink",
+  "libc::symlinkat", "libc::mkdir", "libc::mkdirat", "libc::rmdir",
+  "libc::truncate", "libc::stat", "libc::lstat", "libc::statx", "libc::fstatat",
+  "libc::access", "libc::faccessat", "libc::chmod", "libc::fchmodat",
+  "libc::chown", "libc::fchownat", "libc::readlink", "libc::readlinkat",
+  "libc::realpath", "libc::mknod", "libc::mkfifo", "libc::statfs",
+  "libc::statvfs", "libc::chdir", "libc::mkstemp", "libc::mkdtemp",
+  "libc::remove", "libc::lchown", "libc::chroot", "libc::utimes", "libc::utimensat",
+  "libc::setxattr", "libc::lsetxattr", "libc::fsetxattr", "libc::getxattr",
+  "libc::lgetxattr", "libc::fgetxattr", "libc::listxattr", "libc::llistxattr",
+  "libc::flistxattr", "libc::removexattr", "libc::lremovexattr", "libc::fremovexattr",
+  "libc::pathconf", "libc::shm_open", "libc::shm_unlink", "libc::mkostemp",
+  "libc::mkstemps", "libc::mkostemps", "libc::inotify_add_watch", "libc::fanotify_mark",
+  "libc::mount", "libc::umount", "libc::umount2", "libc::swapon", "libc::swapoff",
+  "libc::acct", "libc::utime", "libc::lutimes", "libc::mknodat", "libc::mkfifoat",
+  "libc::euidaccess", "libc::eaccess", "libc::ftok", "libc::quotactl",
+  "libc::getcwd", "libc::tmpnam", "libc::glob", "libc::glob64",
+  "libc::setmntent", "libc::getmntent_r", "libc::utmpname", "libc::utmpxname",
+  "libc::mq_open", "libc::mq_unlink", "libc::mq_send", "libc::mq_timedsend",
+  "libc::mq_receive", "libc::mq_timedreceive", "libc::sem_open", "libc::sem_unlink",
+  "libc::dlopen", "libc::dlmopen", "libc::dlvsym",
+  "libc::posix_spawn_file_actions_addopen", "libc::posix_spawn_file_actions_addchdir_np",
+  # libc: files read by a fixed path -- the user, group, shadow, network
+  # and service databases, the zone file, locales, converters, the system
+  # log, a thread's name under /proc, the kernel's log, ttys and ptys
+  "libc::getpwnam", "libc::getpwnam_r", "libc::getpwuid_r", "libc::getpwent_r",
+  "libc::fgetpwent_r", "libc::getgrnam", "libc::getgrnam_r", "libc::getgrgid_r",
+  "libc::getgrent_r", "libc::fgetgrent_r", "libc::getgrouplist", "libc::initgroups",
+  "libc::getspnam", "libc::getspnam_r", "libc::getspent_r", "libc::fgetspent_r",
+  "libc::getnetbyname", "libc::getnetbyname_r", "libc::getnetbyaddr_r",
+  "libc::getnetent_r", "libc::getprotobyname", "libc::getservbyname",
+  "libc::getservbyport", "libc::getaddrinfo", "libc::getnameinfo",
+  "libc::ctime_r", "libc::strftime", "libc::strftime_l", "libc::setlocale",
+  "libc::newlocale", "libc::iconv_open", "libc::openlog", "libc::syslog",
+  "libc::pthread_setname_np", "libc::pthread_getname_np", "libc::klogctl",
+  "libc::ttyname_r", "libc::ptsname_r", "libc::openpty", "libc::forkpty",
+  # libc: a socket bound or connected by address, a unix socket's a path
+  "libc::bind", "libc::connect",
+  # libc: a file opened without a path, or as a stream
+  "libc::name_to_handle_at", "libc::open_by_handle_at",
+  "libc::freopen", "libc::freopen64", "libc::tmpfile", "libc::tmpfile64",
+  "libc::fdopen", "libc::popen", "libc::fmemopen",
+  "libc::printf", "libc::fprintf", "libc::puts", "libc::fputs", "libc::perror",
+  "libc::scanf", "libc::fscanf", "libc::fgets",
+  # libc: a program run
+  "libc::system", "libc::execveat", "libc::execve", "libc::execv", "libc::execvp", "libc::execvpe",
+  "libc::execl", "libc::execlp", "libc::execle", "libc::fexecve",
+  "libc::posix_spawn", "libc::posix_spawnp",
+  # libc: a file's bytes on a descriptor
+  "libc::read", "libc::write", "libc::readv", "libc::writev", "libc::lseek",
+  "libc::lseek64", "libc::splice", "libc::tee", "libc::vmsplice",
+  # libc: the large-file twins (glibc's, on every Linux leg CI builds)
+  "libc::open64", "libc::openat64", "libc::creat64", "libc::fopen64",
+  "libc::mmap64", "libc::pread64", "libc::pwrite64", "libc::preadv64",
+  "libc::pwritev64", "libc::fallocate64", "libc::ftruncate64",
+  "libc::posix_fadvise64", "libc::posix_fallocate64", "libc::truncate64",
+  "libc::stat64", "libc::lstat64", "libc::fstatat64", "libc::statfs64",
+  "libc::statvfs64", "libc::sendfile64",
+  # libc: files, mappings, advice, syncs, accounting, escapes
+  "libc::mmap", "libc::munmap", "libc::mremap", "libc::mprotect",
+  "libc::madvise", "libc::posix_madvise", "libc::posix_fadvise",
+  "libc::readahead", "libc::sync_file_range", "libc::mincore", "libc::getrusage",
+  "libc::fallocate", "libc::ftruncate", "libc::posix_fallocate",
+  "libc::memfd_create", "libc::msync", "libc::fsync", "libc::fdatasync",
+  "libc::sync", "libc::syncfs",
+  "libc::pread", "libc::pwrite", "libc::preadv", "libc::pwritev",
+  "libc::preadv2", "libc::pwritev2", "libc::copy_file_range", "libc::sendfile",
+  "libc::ioctl", "libc::syscall", "libc::dlsym",
+]
+disallowed-types = [
+  { path = "std::fs::OpenOptions", reason = "open through crate::db::vault" },
+  { path = "std::fs::DirBuilder", reason = "create through crate::db::vault" },
+  "memmap2::Mmap", "memmap2::MmapMut", "memmap2::MmapRaw", "memmap2::MmapOptions",
+  { path = "std::process::Command", reason = "a program run acts on files past the door" },
+]

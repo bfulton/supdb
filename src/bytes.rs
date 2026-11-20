@@ -36,6 +36,9 @@
 //! browser is little-endian and so is every machine the suite has run on, so
 //! this costs nothing and is checked rather than assumed.
 
+// The door (scripts/door/clippy.toml, tests/data/door.txt): the mapped byte source and its advice.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::io::{Error, ErrorKind, Result};
 
 /// A synchronous, random-access source of bytes.

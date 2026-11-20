@@ -98,6 +98,10 @@
 //! match is an error, the caller's buffer is zeroed, and the chunk is not
 //! kept.
 
+// The door (scripts/door/clippy.toml, tests/data/door.txt): an envelope's id from /dev/urandom, and
+// the reader's anonymous plaintext mapping.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use crate::bytes::{short, Bytes};
 use std::cell::Cell;
 use std::io::{Error, ErrorKind, Result, Write};

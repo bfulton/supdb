@@ -48,6 +48,10 @@
 //! identifier, and that is how a wrong key is told from the right one
 //! without either being stored.
 
+// The door (scripts/door/clippy.toml, tests/data/door.txt): the kernel-key requests on directory
+// descriptors.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::io::{Error, ErrorKind, Result};
 use std::path::Path;
 

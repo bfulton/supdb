@@ -76,6 +76,10 @@
 //! answers with it from then on (`Pager::check`): a store under a cipher
 //! does not answer a read its bytes failed.
 
+// The door (scripts/door/clippy.toml, tests/data/door.txt): the cache's memory files, their
+// mappings and their advice.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use crate::bytes::Paging;
 use crate::crypt::{self, Aead, Header, TAG};
 use std::cell::Cell;

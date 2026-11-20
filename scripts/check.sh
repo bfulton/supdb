@@ -30,7 +30,9 @@
 #            between two hand runs: the adaptations it made of other tests,
 #            and the stride form under threads and under a checkpoint, ran
 #            in no gate
-#   lint     clippy at -D warnings, and the format gate
+#   lint     clippy at -D warnings, the format gate, and on Linux the
+#            door (scripts/door: the library's file, mapping and advice
+#            calls by symbol) with its red input
 #   wasm     the browser reader and its floor, built for wasm32-unknown-unknown
 #            by web/build.sh, and the browser's decrypter held under Node to
 #            the envelope the Rust tests hold the writer to
@@ -87,6 +89,9 @@ for g in $groups; do
       say "lint"
       cargo clippy --release --all-targets -- -D warnings
       sh scripts/fmt.sh --check
+      # The door, by symbol, and its red input (scripts/door/run.sh).
+      say "door"
+      sh scripts/door/run.sh || exit 1
       ;;
     wasm)
       say "wasm"

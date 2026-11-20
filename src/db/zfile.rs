@@ -7079,6 +7079,8 @@ fn drop_written(file: &File) -> Result<()> {
 /// so no later wait or sync of the file sees it, and a page whose writeback
 /// failed and that the drop skipped -- one a mapping holds -- reads right
 /// from the cache and wrong from the device.
+// The door (tests/data/door.txt): writeback and drop on the build's own output, a door handle.
+#[allow(clippy::disallowed_methods)]
 #[cfg(target_os = "linux")]
 fn drop_written_range(file: &File, at: u64, n: u64) -> Result<()> {
     use std::os::unix::io::AsRawFd;
@@ -7124,6 +7126,8 @@ fn fail_next_writeback(on: bool) {
 /// commit and the device for no flush, as an fsync would. Off Linux, where
 /// nothing waits for a range, the file's sync. A test's seam answers an
 /// error once (`fail_next_writeback`).
+// The door (tests/data/door.txt): writeback on the build's own output, a door handle.
+#[allow(clippy::disallowed_methods)]
 fn written_back_range(file: &File, at: u64, n: u64) -> Result<()> {
     #[cfg(test)]
     if WRITEBACK_FAILS.with(|f| f.replace(false)) {
@@ -7181,6 +7185,8 @@ fn read_writeback(file: &File) -> Result<()> {
 /// this machine's 4 MiB requests, a device of 256 KiB requests read 64 pages
 /// of each. The bytes asked for; an error opening the form file asks for
 /// none.
+// The door (tests/data/door.txt): advice on a handle the door gave.
+#[allow(clippy::disallowed_methods)]
 #[cfg(target_os = "linux")]
 pub(super) fn swap_ahead(seg: &File, at: u64, len: u64, form: &Path) -> u64 {
     use std::os::unix::io::AsRawFd;
@@ -7211,6 +7217,9 @@ pub(super) fn swap_ahead(_seg: &File, _at: u64, _len: u64, _form: &Path) -> u64 
 /// bytes asked for, none where the file does not open. The ask starts the
 /// reads and waits for none of them, and a page the cache holds already is
 /// not read again.
+// The door (tests/data/door.txt): a form file opened by path for an ask: under a cipher the decoy
+// opens nothing.
+#[allow(clippy::disallowed_methods)]
 #[cfg(target_os = "linux")]
 pub(super) fn ask_file(form: &Path) -> u64 {
     use std::os::unix::io::AsRawFd;
@@ -7246,6 +7255,8 @@ pub(super) fn ask_file(_form: &Path) -> u64 {
 /// mapping still holds. The window is trimmed to whole pages inside it, and
 /// the pages another mapping holds -- the readers' hot raw pages -- survive
 /// the second call by design.
+// The door (tests/data/door.txt): advice in the plain build only (Walked::Mapped).
+#[allow(clippy::disallowed_methods)]
 #[cfg(target_os = "linux")]
 fn drop_behind(base: usize, file: &File, from: usize, to: usize) {
     use std::os::unix::io::AsRawFd;
@@ -7279,6 +7290,8 @@ fn drop_behind(_base: usize, _file: &File, _from: usize, _to: usize) {}
 /// whole (`crate::bytes::WILLNEED_PIECE`): asked at once, a window past the
 /// device's largest request was read only up to it. The call is advice and
 /// its failure is nobody's.
+// The door (tests/data/door.txt): advice in the plain build only.
+#[allow(clippy::disallowed_methods)]
 #[cfg(target_os = "linux")]
 fn ask_ahead(base: usize, from: usize, to: usize) {
     let mut a = from & !(ZPAGE - 1);
@@ -7584,6 +7597,8 @@ fn build_file_seen(
         SegSrc::File(file) => {
             // SAFETY: the contract `MmapBytes::open` takes: a sealed
             // segment is never truncated under a mapping.
+            // The door (tests/data/door.txt): a plain segment's door handle mapped (SegSrc::File).
+            #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
             let map = MmapBytes::from_map(unsafe { memmap2::Mmap::map(&file)? });
             let base = map.as_slice().as_ptr() as usize;
             let blob = Blob::open_with(map, opts)?;
@@ -8685,6 +8700,9 @@ enum StrideCheck {
 /// word that the pieces were dropped: a drop is advice, and a page it
 /// skips -- dirty, locked, mapped -- is read back from the cache with
 /// nothing said.
+// The door (tests/data/door.txt): the stride build's own output by path: no stride form under a
+// cipher.
+#[allow(clippy::disallowed_methods)]
 #[allow(clippy::too_many_arguments)]
 fn check_stride(
     tmp: &Path,
@@ -9520,6 +9538,8 @@ impl ZInject {
 /// that costs a syscall and no file. `None` off Linux and where the call
 /// fails. `RUSAGE_THREAD` is Linux's 1, named here because the libc
 /// crate this tree builds with does not name it for this target.
+// The door (tests/data/door.txt): getrusage (G3: Memory).
+#[allow(clippy::disallowed_methods)]
 pub(super) fn thread_major_faults() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -9807,6 +9827,8 @@ pub(super) struct FileFacts {
     pub stride: bool,
 }
 
+// The door (tests/data/door.txt): a form file by path: under a cipher the decoy maps nothing.
+#[allow(clippy::disallowed_methods)]
 pub(super) fn file_facts(
     path: &Path,
     blob: &Blob<MmapBytes>,
@@ -9872,6 +9894,8 @@ pub(super) struct DecodeTiming {
     pub faults: u64,
 }
 
+// The door (tests/data/door.txt): a form file by path: under a cipher the decoy maps nothing.
+#[allow(clippy::disallowed_methods)]
 pub(super) fn time_file_decodes(
     path: &Path,
     blob: &Blob<MmapBytes>,
@@ -9952,6 +9976,8 @@ pub(super) fn time_file_decodes(
 /// `MemAvailable` less the margin (`Budget::within_available`), since
 /// neither a group's limit nor the machine's total sees the other processes
 /// beside the store. Off Linux there is no reading.
+// The door (tests/data/door.txt): /proc and cgroup reads (G3: Memory).
+#[allow(clippy::disallowed_methods)]
 #[cfg(target_os = "linux")]
 pub fn read_budget() -> Option<Budget> {
     budget_from(&|p: &Path| std::fs::read_to_string(p).ok())
