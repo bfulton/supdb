@@ -5896,6 +5896,74 @@ short of at one size is the whole shortfall at the next; and a cell lost
 by faults under a bound is read against the process's bytes by owner
 before any form is blamed.
 
+**A path the suite's keys took for free, and every other key paid a
+record for.** A landing near reads walks each of its pieces against the
+block boundaries of the partition under it, for the tables that will
+read the bounds, and takes each boundary's key from the ordered index's
+top level where a head is the whole of a key (`OrdIndex::whole_key_at`).
+That is every key the suite numbers, sixteen digits behind a common
+prefix. An id runs on past its head, so over ids each boundary was a
+record: 156,000 a landing at ten million keys, a cold line each in core,
+and under a bound, where the block form serves and the raw records are
+out of the cache, a major fault each on the one thread every landing
+goes through. The lag sweep over ids under 1 GiB was the first run to
+meet it, and it lost no cell there, it was killed: the landing of the
+ten-percent burst's seal took 76,000 faults in five seconds and had not
+published, three tables stood frozen behind it with their snapshot
+copies, and the full rewrite's burst took the process from 450 MB to the
+limit in under three seconds. Under 1.25 GiB the same sweep survives
+with its writer waiting five seconds for landings. The map of where ids
+trail LMDB had been drawn over the row's passes and left the sweep out,
+and a pairing queued for another option was what ran it. Three readings
+found it in an hour, in this order: the counters of the last point that
+printed, no piece standing and a frozen table with its copy in the
+census where numbered keys read twenty-four pieces, which said a landing
+was missing and not that memory had an owner to find; a sample of every
+thread's state twenty times a second (`/proc/<pid>/task/*/stat` and
+`stack`), which had the seal's thread done inside the burst and the
+landing's thread in a page fault from then to the kill; and every major
+fault by its instruction (`perf record -a -e major-faults -c 1 -d`),
+which named `Maint::rank_before_publish`. And the bounds were for
+nobody: the sweep's scans had the writer give its block forms up for the
+merge path, and the landing asked whether the block cache was on by
+option, not whether a table stood to read them. A walk places a boundary
+by its head now where the head is not its key, between the two byte
+strings the head brackets the key by, and reads the record only where a
+key of the walked source falls inside (`Options::bounds_by_heads`,
+`OrdIndex::head_bracket`), the same bounds to the entry; and a landing
+leaves its bounds while the writer keeps no forms and no handle is live
+(`Options::land_bounds_read`). The rules: a fast path keyed on a
+property of the suite's keys -- a head that is the whole key, one
+length, a run of numbers -- is a slow path the suite has never run, so
+such sites are listed (`whole_key_at`, `uniform`) and a second key shape
+is run over every pass, the sweep with the row, before the map of it is
+called drawn; a process killed under a bound is read from the last
+counters it printed and then from its threads' states before its memory
+is summed by owner, since what piles up behind a stalled thread has an
+owner's name on it and is not the cause; derived work is gated on its
+reader, never on the option that makes a reader possible; and a stall
+on the writer's path is somebody's pace, so its removal is read on the
+phase after it -- the pass after the full rewrite read a seventh slower
+under 1.25 GiB with the stall gone, its burst a quarter faster, the
+merges having had five seconds less to drain. The same walk was pacing
+a second thread. The snapshot's bounds take the same boundary keys, on
+the upkeep thread, and over ids each was a form file's group decoded:
+under the default that thread made six or seven passes over the whole
+of ycsb-A at ten million keys under 1 GiB, fifty milliseconds each and
+nearly all of it that walk. With the heads placing the boundaries it
+kept up and made one pass a commit, 736 of them, filing every commit's
+writes alone as `forms_settle_every` says it should and building twice
+the forms the batched passes had (18,774 against 8,437-9,508), and A's
+commits ran a quarter slower beside it (`SUPDB_MIX_KINDS`: 299-319 ms
+against 228-252), A at 0.84-0.85x of the default in four pairs of four
+and still twice LMDB's. Numbered keys, whose bounds were always free,
+have always run that regime; the slow walk had batched ids out of it by
+accident. The corollary: a thread's pass schedule is a function of how
+long its passes take, so a change to a pass's cost is read on the
+passes counted and the work a pass does, and a regime that holds only
+because something was slow is measured with the slowness gone before it
+is called the regime's cost.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
@@ -5910,6 +5978,16 @@ in the suite's figures, at `full` scale where it says so:
   refuted (`docs/engine.md`); what is left is the drain at the burst's end,
   and the levers on it are the chain's pace through the burst and what a
   pass pays for each piece it meets.
+- The frozen tables are held to a count (`FROZEN_CAP`, three) and not to
+  bytes. A table freezes at the seal's threshold, 109 MB of memtable at
+  ten million keys, and near reads its seal makes a snapshot copy of it,
+  123 MB more: three behind a landing that does not come, with the live
+  table past them, are a gigabyte, and under a bound of that the group
+  kills the process before the writer's wait at a full list holds it.
+  The one landing known to stall so is the bounds walk over keys whose
+  heads are not whole keys (`Options::bounds_by_heads`,
+  `land_bounds_read`). The lever for any other is the writer's wait
+  drawn from what the bound can spare, and is not built.
 - Scans on a store with unsealed keys spread through it pay for the path.
   A few unsealed keys in a partition take every scan of it off the bulk
   walk and through the block loop and the form file's cursor, a fifth to
