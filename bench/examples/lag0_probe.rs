@@ -1,13 +1,17 @@
 //! The lag sweep's first point in its own shape, scan by scan: a fresh
 //! store per round for each arm, the shuffled load of `size` keys through
 //! `Batch` flushes of a thousand, its `sync`, the sweep's `sync` at the 0%
-//! point, then `size / 100` scans of a hundred entries from uniform keys,
+//! point, then `size / 100` scans of `len` entries from uniform keys,
 //! each timed alone. The arms alternate round by round, the order swapped
 //! every other round, and each round prints the first three scans and the
 //! median beside the pass's sum, for a pass whose difference sits in its
 //! first operations.
 //!
-//!     lag0_probe <armA,armB> <size> <rounds>
+//!     lag0_probe <armA,armB> <size> <rounds> [len]
+//!
+//! `len` is the scan's length, a hundred by default: `scripts/cost.sh`'s
+//! `scan_long` probe runs it past the engine's rest stride (`SCAN_REST`,
+//! 1024), which a store in the clear must walk as one scan.
 use std::time::Instant;
 use supdb_bench::engines::{self, Batch};
 use supdb_bench::workload::{db_key_into, KeyDist, KeyGen, Payload, Permutation, Rng};
@@ -23,6 +27,7 @@ fn main() {
         .collect();
     let size: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30_000);
     let rounds: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
+    let len: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(100);
     let payload = Payload::new(100, 0.5, 0xE1);
     let scans = (size / 100).max(100);
     for round in 0..rounds {
@@ -59,7 +64,7 @@ fn main() {
             for _ in 0..scans {
                 db_key_into(g.next(), &mut kb);
                 let t = Instant::now();
-                e.range(&kb, 100).unwrap();
+                e.range(&kb, len).unwrap();
                 ns.push(t.elapsed().as_nanos() as u64);
             }
             let sum: u64 = ns.iter().sum();

@@ -1220,12 +1220,90 @@ Those four were the count, and a store's reads through its compact form
 were not in it: a scan through a form was 370 instructions over the main
 line while this paragraph said nothing was, until the form itself went
 under a cipher and was counted (the compact form, below).
-`sh scripts/cost.sh BASE` is the count made one command: the six probes
-(the point read, the scan, the durable and the buffered ordered load, a
-writer's round and a merge) built at BASE from this tree's example
-sources and at the tree, each under callgrind, every function's own
-instructions side by side, and a failure where a function of
-`scripts/cost-hot.txt` gains past half an instruction an operation.
+`sh scripts/cost.sh BASE` is the count made one command: the probes (the
+point read and the scan, each in the raw form and through the compact
+form, the scan past `SCAN_REST` in both, the durable and the buffered
+ordered load whole and their commits under a toggle, a writer's round, a
+merge, the segment work on the writer's thread, a segment written through
+`SegmentWriter` and `Blob::scan_at` through the public API) built at BASE
+from this tree's example sources and at the tree, each under callgrind,
+every function's own instructions side by side, and a failure where a
+hot function gains past its slack (`scripts/cost-diff.py`, below);
+`sh scripts/cost-red.sh` is its red input, and `sh scripts/check.sh cost`
+runs the two. The first version of the list named
+its functions as paths, `supdb::db::Reader::read_all`, matched as
+substrings of callgrind's names, which print a method as
+`<supdb::db::Reader>::read_all_in::<G>::{closure#5}`: no line named an
+engine function, the only matches were the probes' own functions inside
+other functions' generic arguments, and the point read could have gained
+anything. Its first whole run against upstream said so by printing
+`HOT GAINED` for `read_exts_inline::<coded_record_to<supdb_range::{closure#0}>>`
+in a probe that never scans. The comparator reads canonical names now
+(generic arguments dropped, `<T>::f` read as `T::f`), fails a probe in
+which no line names a function, and names the lines a whole run never
+reached; the red input's first step holds each of those against names
+written as callgrind writes them. A gate's list is held to the names the
+instrument prints, by a fixture in the instrument's own spelling, before
+the list is trusted to name anything. Against itself the count is exact
+for every listed function in a probe with a toggle, while libc's and the
+allocator's counts move between two runs of one build (the point read's
+`memcmp` by most of an instruction a read) and so does the controller's
+look at its budget, which runs on a clock (`!` in the list takes it out).
+And a list is also what a gate does not hold: the list was the only thing
+that could fail, and the review found the scan probe running
+`Reader::install_ahead` and `make_table` once a scan, on no line, so a load
+and a branch in either, or a step moved out of a listed function into a
+helper of its own, read green. A toggle collects the operation on its own
+thread and nothing else, and against itself every function of the engine,
+the suite and the probe it collects has read the same to the instruction,
+but for a few that wait on another thread (the segment writer's look at its
+helper, +16 over the seal probe's run once and +63 over a commit probe's),
+so in a probe with a toggle all of them are hot, listed or not. Where an instrument is exact,
+the gate holds everything it measures; a list is for where it is not.
+The second review found the slack was the same hole. It was a twentieth
+of an instruction an operation, and an operation of the seal, the merge
+and the loads is a key: a load and a branch at every 16 KiB piece of a
+key section is a hundredth an operation and read green, in a probe whose
+every function read the same to the instruction against itself. A slack
+an operation is a slack a key, and the owner's rule names the block and
+the step too. Under a toggle the slack is 64 instructions over the
+probe's whole run, a function, whatever its operations, for every
+function built from source -- the engine's, the suite's, the probe's and
+the standard library's code compiled into the binary, a `#[no_mangle]`
+helper's with them -- and libc's and the allocator's, which move with the
+addresses they are handed, fail past two instructions an operation and a
+twentieth of their own count both. With no toggle (the loads, the round,
+the merge) every function of the engine is hot, listed or not and new
+ones above all, at a hundredth of an instruction an operation: the self
+checks put the rest of their noise at under a two-hundredth. The functions
+that move by more were `~` lines, out of those probes, on the reading that
+each was exact under a toggle; the third review listed the toggled probes'
+functions and found three of them in none -- the writer's sweep at an
+operation's end, the reader table's look, and every function of the
+segment work, which `~supdb::db::Maint::` took out whole on evidence for
+two of its hundred and forty methods -- so a step a landing or a key
+written into a landing, publish or retirement read green in every probe
+that ran it. A `~` line carries a bound now, three times the most two to
+four self-checks moved its function, and names its function, not its type
+(`Maint::collect` and the three others measured past a two-hundredth);
+and the segment work has a toggled probe of its own (`land`: the segment
+work and the upkeep inline, the seal landed before the scan that follows
+it, the store's platform readings through its seam), whose every function
+reads the same against itself but the seal's wait, bounded. A `~` line
+with no bound is refused. The rule: a function taken out of one probe is
+named, with the probe that holds it, and an exclusion with no bound and no
+holder is a function the gate does not measure. The slacks as numbers:
+under a toggle 64 instructions a function over the run; with none, a
+hundredth an operation, which is 1,000 over the loads' 100,000 keys, 3,000
+over the round's 300,000 operations and 2,000 over the merge's 200,000. So
+a fixed cost of up to that much once a store, in its open or its close,
+reads green there -- the owner's rule is a key, an entry, a block or a
+step, and a store's open is none of them -- and a cost of under ten
+instructions a commit of the ordered load's hundred, or a few a 16 KiB
+piece of its stream, is seen by the commit probes (`commit_durable`,
+`commit_buffered`: the toggle on the suite's `write_batch`, the writer's
+appends and its commit) at 64 over the run; a cost a segment by the seal
+probe, four segments of a quarter of its keys, at 16 a segment.
 Counted against the upstream head this branch merged, every probe read
 under it but the scan, eight instructions over, and no function of the
 scan's source had changed: two of upstream's (`forms_off_scan`,

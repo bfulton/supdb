@@ -99,6 +99,38 @@ jobs:
           if-no-files-found: ignore
           path: bench/runs-ci/
 
+  cost:
+    # What a store in the clear pays an operation, counted by function under
+    # callgrind against the commit the change is made on (scripts/cost.sh),
+    # after the count has been shown red on a known-red input and green on
+    # the tree against itself (scripts/cost-red.sh). A job of its own
+    # because it builds the suite's probes three times and runs them under
+    # valgrind, most of an hour; instruction counts are the same on any
+    # runner, so a hosted one serves.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: libclang, for bindgen
+        run: sh bench/scripts/libclang.sh
+      - name: valgrind
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq valgrind
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench -> bench/target
+      - name: The plain store's cost, by function
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          base="$PR_BASE"
+          [ -n "$base" ] || base="$PUSH_BEFORE"
+          case "$base" in ''|0000000000000000000000000000000000000000) base=$(git rev-parse HEAD~1) ;; esac
+          COST_BASE="$base" sh scripts/check.sh cost
+
   cross-arm:
     # Proves the ARM paths build and pass before any ARM hardware is involved.
     runs-on: ubuntu-24.04

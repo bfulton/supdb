@@ -42,6 +42,21 @@
 #   quick    one quick-scale measurement of every arm, the gate against
 #            bench/runs/, and the figures. Not in the default set: it is a
 #            timing run and needs the machine to itself
+#   cost     what a store in the clear pays an operation, by function:
+#            scripts/cost-red.sh (the count shown red on a known-red input,
+#            green on the tree against itself and on a probe-only change),
+#            then scripts/cost.sh against COST_BASE (default origin/main)
+#            over the probes COST_PROBES names (default all of them), which
+#            fails where a hot function gains past its slack: in a probe
+#            with a toggle, more than 64 instructions over the probe's whole
+#            run in any function built from source (libc's: more than 2 an
+#            operation and 5% of its own count), and in a probe with none,
+#            more than a hundredth of an instruction an operation in any
+#            function of the engine, and a function a `~` line of
+#            scripts/cost-hot.txt names past the bound the line gives it
+#            (scripts/cost-diff.py). Not in the
+#            default set: it builds the suite's probes twice more and runs
+#            them under callgrind, most of an hour, and needs valgrind
 #   fscrypt  a store under a key, on a filesystem that can encrypt: the
 #            ignored half of tests/dirkey.rs, each test named and required
 #            to have run. Not in the default set: it needs that filesystem,
@@ -110,6 +125,14 @@ for g in $groups; do
     quick)
       say "quick"
       sh bench/scripts/check.sh quick
+      ;;
+    cost)
+      say "cost"
+      # The red input first: a count that has not failed where it must
+      # has earned no verdict on the head.
+      sh scripts/cost-red.sh || exit 1
+      # shellcheck disable=SC2086
+      sh scripts/cost.sh "${COST_BASE:-origin/main}" ${COST_PROBES:-} || exit 1
       ;;
     fscrypt)
       say "fscrypt"
