@@ -15,6 +15,8 @@ const PLAN = SP + '/plan'
 const W = PLAN + '/build'
 const BASE = (args && args.base) || 'HEAD'
 const ONLY = (args && args.only) || null
+// A launch of some units alone (args.only) may leave the full gate and the critic to a later launch (args.tail === false).
+const TAIL = !(args && args.tail === false)
 
 const CONTEXT = `
 You are working in /home/user/supdb (Rust; a read-optimized embedded store; the engine is src/db.rs and src/db/*.rs, the format's readers src/blob.rs, src/flatindex.rs, src/ordindex.rs, the byte-source seam src/bytes.rs), on the branch that is checked out. The store can be kept under a caller's cipher (src/db/vault.rs, src/db/pager.rs) and the owner's goal for that feature is: reliable, performant, and not fragile to maintain. "Not fragile" has a contract, ${SP}/seam/forms.md (acceptance tests Z, N, K, F and rules R0 to R15), adopted by ${SP}/seam/decisions.md (read items 9 and 11 to 16: they amend forms.md and they stand where the two differ). Stage G1 builds the first gates of that contract on today's code, before the page layer is built under them.
@@ -244,7 +246,7 @@ for (const u of units) {
 }
 
 let gate = null
-if (!stopped) {
+if (!stopped && TAIL) {
   const gatePrompt = `${CONTEXT}
 YOU RUN THE FULL GATE on HEAD, after every unit of this run has committed (git log ${BASE}..HEAD).
 ${RULES}
@@ -256,6 +258,8 @@ Run "sh scripts/check.sh" (every default group: build test stride lint wasm benc
     if (again) gate = again
   }
 }
+
+if (!TAIL) return { stopped, results, gate: null, critic: null }
 
 const critic = await agent(`${CONTEXT}
 YOU ARE THE COMPLETENESS CRITIC for this run. Read-only on the repository (no edits, no builds); you write one file, ${W}/g1-built.md (from the shell if the Write tool refuses).
