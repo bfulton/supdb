@@ -15,7 +15,7 @@ static ALLOC: supdb_bench::alloc_census::Counting = supdb_bench::alloc_census::C
 const USAGE: &str = "\
 usage:
   bench run --scale quick|full [--out DIR] [--arms a,b,...] [--top KEYS] [--bottom KEYS] [--reps N]
-            [--fresh-process|--one-process]
+            [--keys numbered|ids] [--fresh-process|--one-process]
   bench run --scale ooc --bound BYTES [--ops-div N] [the options above]
   bench run --resume DIR [--reps N] [--resume-passes]
   bench ab --arms A,B [--size KEYS] [--reps N] [--len ENTRIES] [--pairs TEXT] [--bound BYTES] [--passes a,b,...]
@@ -34,6 +34,10 @@ run    measures every arm over the size ladder and writes runs/<scale>/<utc>-<sh
                ooc 10000000)
        --bottom the ladder's bottom rung in keys (default: the whole ladder from 10000; ooc 3000000)
        --reps  repetitions per size and arm (default: quick 5, full 7, ooc 3)
+       --keys  what the stores' keys are (default numbered: sixteen digits of the key's index,
+               a dense run of numbers; ids: sixteen hex digits of a random 64-bit id). A row
+               of ids is a series of its own: its class ends in /kids, and the gate and the
+               figures read it beside the numbered rows of the same machine, never with them
        --bound the memory the run may use, in bytes, enforced by a cgroup: required at ooc,
                refused at quick and full. Under cgroup v1 the run makes a group of its own
                and moves into it before anything is measured; under v2 alone it attaches to
@@ -234,6 +238,7 @@ fn cmd_machine() -> i32 {
         machine: m,
         killed: vec![],
         resumptions: vec![],
+        keys: Default::default(),
         measurements: vec![],
     };
     println!("class: {}", probe.class());
@@ -590,6 +595,7 @@ fn cmd_resume(dir: &Path, a: Args) -> i32 {
         "--top",
         "--bottom",
         "--ops-div",
+        "--keys",
         "--fresh-process",
         "--one-process",
     ] {
@@ -767,6 +773,18 @@ fn cmd_run(a: Args) -> i32 {
         },
         None => run::OOC_OPS_DIV,
     };
+    // The keys' shape, refused here with the other options: an unknown one
+    // would otherwise be a row of numbered keys under a flag that said not.
+    let keys = match a.get("--keys") {
+        Some(text) => match supdb_bench::workload::KeyShape::parse(text) {
+            Some(k) => k,
+            None => {
+                eprintln!("--keys takes numbered or ids\n\n{USAGE}");
+                return 2;
+            }
+        },
+        None => supdb_bench::workload::KeyShape::Numbered,
+    };
     // The bound's number, checked before anything is written: a bound
     // that is refused costs no scan floor's file, and the floor file is
     // written and synced before the bound is entered.
@@ -884,6 +902,7 @@ fn cmd_run(a: Args) -> i32 {
     if let Some(r) = reps {
         plan.reps = r as usize;
     }
+    plan.keys = keys;
     if a.has("--fresh-process") {
         plan.fresh_process = true;
     } else if a.has("--one-process") {
@@ -899,7 +918,7 @@ fn cmd_run(a: Args) -> i32 {
     // run that never finishes leaves behind.
     let rungs = supdb_bench::ladder_from(plan.bottom, top);
     eprintln!(
-        "bench run: scale {} on {} ({} reps, rungs {}, arms {}{})",
+        "bench run: scale {} on {} ({} reps, rungs {}, arms {}{}{})",
         scale.as_str(),
         machine.cpu_model,
         plan.reps,
@@ -912,6 +931,10 @@ fn cmd_run(a: Args) -> i32 {
         match machine.mem_limit_bytes {
             Some(b) => format!(", bound {b} bytes, ops divided by {}", plan.ops_div),
             None => String::new(),
+        },
+        match plan.keys {
+            supdb_bench::workload::KeyShape::Numbered => String::new(),
+            k => format!(", {} for keys", k.name()),
         }
     );
     let mut log = |s: &str| eprintln!("{s}");

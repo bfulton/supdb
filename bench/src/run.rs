@@ -1723,6 +1723,7 @@ fn row_of(
         measurements: s.measurements(),
         killed: killed.to_vec(),
         resumptions: resumptions.to_vec(),
+        keys: plan.keys,
     }
 }
 
@@ -5367,6 +5368,30 @@ mod tests {
             ("bytes_per_fortnight", "B/f"),
             1.0,
         );
+    }
+
+    /// A run's row is of its plan's keys: a run over ids writes rows of
+    /// ids from its first banked rung, in the ids' class, and one over the
+    /// numbered keys a row that says nothing of them.
+    #[test]
+    fn a_row_is_of_its_plans_keys() {
+        let machine = crate::env::capture();
+        for keys in [KeyShape::Numbered, KeyShape::Ids] {
+            let mut plan = Plan::new(Scale::Quick, vec!["supdb".into()], 10_000, 4);
+            plan.keys = keys;
+            let row = row_of(
+                "20260101T000000Z",
+                "0123456789abcdef",
+                "rustc",
+                &machine,
+                &plan,
+                &Samples::new(),
+                &[],
+                &[],
+            );
+            assert_eq!(row.keys, keys);
+            assert_eq!(row.class().ends_with("/kids"), keys == KeyShape::Ids);
+        }
     }
 
     #[test]

@@ -195,7 +195,17 @@ pub fn render_all(runs: &Path, out: &Path, scale: Scale) -> io::Result<Vec<Rende
     if !written.is_empty() {
         write_index(out, &written)?;
     }
-    if let Some((class, _)) = latest.iter().max_by_key(|(_, r)| r.utc.clone()) {
+    // The newest class's set, among the classes of the numbered keys: the
+    // series the documents' figures are of. A row of another shape of keys
+    // is a series beside it, drawn under its own class above, and takes
+    // this copy only where no row of numbered keys is there to.
+    let newest = |numbered: bool| {
+        latest
+            .iter()
+            .filter(|(_, r)| !numbered || r.keys.is_numbered())
+            .max_by_key(|(_, r)| r.utc.clone())
+    };
+    if let Some((class, _)) = newest(true).or_else(|| newest(false)) {
         let from = out.join(class.replace('/', "_"));
         let to = out.join(LATEST);
         std::fs::create_dir_all(&to)?;
@@ -823,6 +833,7 @@ mod tests {
                 machine,
                 killed: vec![],
                 resumptions: vec![],
+                keys: Default::default(),
                 measurements: vec![m("supdb", 2.0e6), m("lmdb", 1.0e6)],
             }
         };
@@ -870,6 +881,37 @@ mod tests {
                 "{n}: drawn twice from the same rows, the same bytes"
             );
         }
+        // A row of ids banked after both is a class of its own and is not
+        // the latest: the copy stays the numbered keys' newest.
+        let mut ids = row("20260103T000000Z", "New Host");
+        ids.keys = crate::workload::KeyShape::Ids;
+        ids.write(&runs).unwrap();
+        let with_ids = root.join("figs-ids");
+        render_all(&runs, &with_ids, Scale::Quick).unwrap();
+        let ids_dir = with_ids.join(ids.class().replace('/', "_"));
+        assert!(ids_dir.is_dir() && ids.class() != newer.class());
+        assert_eq!(names(&with_ids.join(LATEST)), names(&latest));
+        for n in names(&latest) {
+            assert_eq!(
+                std::fs::read(latest.join(&n)).unwrap(),
+                std::fs::read(with_ids.join(LATEST).join(&n)).unwrap(),
+                "{n}: the latest is the numbered keys' with a newer row of ids beside it"
+            );
+        }
+        // Alone under a runs directory, the row of ids is what there is.
+        let only = root.join("runs-ids");
+        ids.write(&only).unwrap();
+        let only_out = root.join("figs-only-ids");
+        render_all(&only, &only_out, Scale::Quick).unwrap();
+        for n in names(&only_out.join(LATEST)) {
+            assert!(
+                std::fs::read_to_string(only_out.join(LATEST).join(&n))
+                    .unwrap()
+                    .contains(&ids.class()),
+                "{n} is the ids' where nothing else is"
+            );
+        }
+        assert!(!names(&only_out.join(LATEST)).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

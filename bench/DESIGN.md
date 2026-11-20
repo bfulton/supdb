@@ -36,6 +36,36 @@ the reading thread's own buffer, on every arm, in the workloads above and in
 the mixes. A caller gets a value to use it, and a read that only measured the
 length of what it was lent priced the lookup and nothing after it.
 
+The keys are a stated parameter, as their distribution is, and a row is of
+one shape of them (`bench run --keys`, `bench ab --keys`,
+`workload::KeyShape`):
+
+- `numbered`, the default, and the shape of every row from before it was a
+  parameter: sixteen decimal digits of the key's index, db_bench's keys. The
+  keys of a store are a dense run of numbers, and the next key is the next
+  number.
+- `ids`: sixteen lowercase hex digits of a 64-bit id, what an application's
+  own identifiers look like to a store. The loaded keys' ids are spread as
+  that many independent uniform draws are -- how many fall in any stretch of
+  the space varies as draws' counts do, which a test holds (`workload::Ids`)
+  -- no key is the successor of another, and a key's bytes give a compressor
+  nothing. The ids ascend with the key's index, so a load in key order is
+  still one, a scan still starts at a drawn key and the unscrambled
+  Zipfian's hot keys are still the lowest and contiguous; a key inserted
+  after the load is a uniform draw of the whole space and falls anywhere
+  among the loaded keys, never above them, so an insert is never an append.
+
+The workloads, the sizes and the quantities are the same over either. What
+differs is what an engine can make of a key, which is part of what is
+measured: a partition whose keys are a run of numbers can have its values
+read by arithmetic on the key, and one of random ids cannot. So the two
+shapes are two series: a row of ids carries its shape (`Row::keys`; a row
+of numbered keys says nothing of them, so the rows before the field read as
+they did), its class ends in `/kids`, the gate holds it to rows of ids of
+its machine and bound alone, and the figures draw it under its own class,
+the `latest` copy staying the numbered keys' newest.
+`KEYS=ids sh scripts/check.sh quick` takes the quick row of ids.
+
 Every workload runs at a ladder of store sizes, not one: keys at 1, 3, 10,
 30 ... × 10⁴ up to the scale's cap. A number is a point on a curve, and the
 curve is what shows where an engine's behaviour changes — most importantly
