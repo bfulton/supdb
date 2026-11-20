@@ -142,9 +142,9 @@ bulk replacement broke tick-exact tests once; do it test by test. Planned for th
 
 ## What is left, in the owner's order
 
-### 1. The page layer (task 12). Stage G1 under way: one unit of eight landed.
+### 1. The page layer (task 12). Stage G1 under way: two units of eight landed.
 
-**As of 20 Nov 09:15 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
+**As of 20 Nov 12:25 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
 launched one unit a launch: `Workflow {scriptPath, args: {base:
 "ea6352181f342b7bffd75ec8c88df92bc7b78ff6", only: ["G1-<n>"], tail: false}}`, the same base for
 every unit; after G1-8 a launch with `only: ["none"]` and no `tail: false` runs the full gate
@@ -161,7 +161,22 @@ holds; a note for a step changes no earlier prompt, so the steps before it repla
   not reviewed again; the stage's closing critic reads the whole.
 - Its gate went red once on a cipher test that bet on the segment work's timing; that test is
   fixed (`ac512887`).
-- **Next: G1-2 `door`**, then `cost`, `offsets`, `authenticated`, `advice`, `sealed`, `docs`.
+- **G1-2 `door` landed: `fa7e9356`.** The library's file, mapping, advice, sync and
+  process-read calls are barred by symbol outside the door's modules (vault, bytes, pager,
+  crypt, dirkey, blocks): a clippy run of its own over the library (`scripts/door/run.sh`, in
+  the lint group, config `scripts/door/clippy.toml`), its red input (`scripts/door/red.sh`),
+  and what clippy cannot see held by text in `tests/source.rs` against `tests/data/door.txt`
+  and `tests/data/door-libc.txt`. No compiled engine code changed (lint attributes, one test
+  moved out of `vault.rs`). Its notes and mutants are in `scratch/plan/build/G1-2/`. Open, for
+  the closing critic and the owner: all three review rounds asked for repairs and the third
+  repair was not reviewed again; the unit is 1,845 lines of `tests/source.rs`, and its libc
+  class test reads the libc source Cargo.lock resolves out of cargo's registry, so a libc bump
+  that adds a string-taking call fails it until the call is barred or listed, and a vendored
+  or offline layout fails it outright -- a maintenance cost to weigh against what it holds;
+  the config's names were resolved on x86_64 only; `CLAUDE.md` still names the deleted
+  `the_engine_names_no_file_but_through_the_door` and says no module carries a blanket lint
+  allowance, both G1-8's to correct.
+- **Next: G1-3 `cost`**, then `offsets`, `authenticated`, `advice`, `sealed`, `docs`.
 
 What follows was written before the stage began.
 
