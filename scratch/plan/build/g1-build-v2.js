@@ -19,6 +19,9 @@ const ONLY = (args && args.only) || null
 const TAIL = !(args && args.tail === false)
 // A step a container restart killed is told so when it is run again: args.resume maps a unit's key to a note appended to its build prompt.
 const RESUME = (args && args.resume) || {}
+// A step other than a build that a restart cut short is told so by its label (args.notes maps a label to a note); with no note the prompt is byte for byte what it was, so the steps before it replay.
+const NOTES = (args && args.notes) || {}
+const noted = (label, prompt) => NOTES[label] ? prompt + '\n\nAN EARLIER ATTEMPT AT THIS STEP WAS CUT SHORT: ' + NOTES[label] : prompt
 
 const CONTEXT = `
 You are working in /home/user/supdb (Rust; a read-optimized embedded store; the engine is src/db.rs and src/db/*.rs, the format's readers src/blob.rs, src/flatindex.rs, src/ordindex.rs, the byte-source seam src/bytes.rs), on the branch that is checked out. The store can be kept under a caller's cipher (src/db/vault.rs, src/db/pager.rs) and the owner's goal for that feature is: reliable, performant, and not fragile to maintain. "Not fragile" has a contract, ${SP}/seam/forms.md (acceptance tests Z, N, K, F and rules R0 to R15), adopted by ${SP}/seam/decisions.md (read items 9 and 11 to 16: they amend forms.md and they stand where the two differ). Stage G1 builds the first gates of that contract on today's code, before the page layer is built under them.
@@ -217,14 +220,14 @@ for (const u of units) {
   const MAX_REVIEWS = 3
   for (let round = 0; round < MAX_REVIEWS; round++) {
     const reviews = (await parallel(LENSES.map(l => () =>
-      agent(reviewPrompt(u, l, round, impl), { label: `review:${u.key}:${l.key}:r${round + 1}`, phase: 'Review', model: 'opus', schema: REVIEW_SCHEMA })
+      agent(noted(`review:${u.key}:${l.key}:r${round + 1}`, reviewPrompt(u, l, round, impl)), { label: `review:${u.key}:${l.key}:r${round + 1}`, phase: 'Review', model: 'opus', schema: REVIEW_SCHEMA })
     ))).filter(Boolean)
     const blocking = reviews.flatMap(r => r.blocking || [])
     const extra = reviews.flatMap(r => r.extra_mutants || [])
     log(`unit ${u.key}: review ${round + 1}: ${blocking.length} blocking, ${extra.length} extra mutants`)
     unresolved = blocking
     if (!blocking.length && !extra.length) break
-    const fixed = await agent(repairPrompt(u, round, blocking, extra, 'Two reviewers'), { label: `repair:${u.key}:r${round + 1}`, phase: 'Review', model: 'opus', schema: IMPL_SCHEMA })
+    const fixed = await agent(noted(`repair:${u.key}:r${round + 1}`, repairPrompt(u, round, blocking, extra, 'Two reviewers')), { label: `repair:${u.key}:r${round + 1}`, phase: 'Review', model: 'opus', schema: IMPL_SCHEMA })
     if (fixed) impl = fixed
     if (!blocking.length && !(fixed && fixed.engine_changed)) {
       log(`unit ${u.key}: the reviewers passed it and the extra mutants changed no engine code; no further review`)
@@ -235,7 +238,7 @@ for (const u of units) {
   }
   if (impl.blocked) { results.push({ unit: u.key, name: u.name, impl, unresolved, commit: null }); stopped = `${u.key}: blocked in repair: ${impl.blocked}`; break }
 
-  let c = await agent(commitPrompt(u, impl, unresolved), { label: `commit:${u.key}`, phase: 'Commit', model: 'opus', schema: COMMIT_SCHEMA })
+  let c = await agent(noted(`commit:${u.key}`, commitPrompt(u, impl, unresolved)), { label: `commit:${u.key}`, phase: 'Commit', model: 'opus', schema: COMMIT_SCHEMA })
   if (c && !c.committed) {
     log(`unit ${u.key}: the unit gate was red; one repair and one more try`)
     const fixed = await agent(repairPrompt(u, 9, (c.problems || []).map(p => ({ title: 'the unit gate is red', detail: p, where: 'sh scripts/check.sh' })), [], 'The commit step, whose gate was red,'), { label: `repair:${u.key}:gate`, phase: 'Commit', model: 'opus', schema: IMPL_SCHEMA })
