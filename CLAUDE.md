@@ -82,7 +82,11 @@ caller in `flatindex`, whose writer half carries the wasm allowance; one was
 `Blob::id`, whose callers are the engine's caches, compiled where they are. Use a group name to run one. `quick` is a group too, the
 suite's quick-scale measurement, twenty minutes or so with half of it
 the threaded scans; it is not in the default set because a
-timing run needs the machine to itself, and CI gives it a job of its own.
+timing run needs the machine to itself, and CI gives it a job of its own. The
+`lint` group is the engine's alone: the suite's clippy and its format
+check run in the `bench` group (`sh bench/scripts/check.sh lint` by
+itself, a minute), and a commit that touched `bench/` alone went out
+behind a green `lint` with a doubled `#[allow]` that clippy refuses.
 
 The tests leave their stores under the temp directory, one per test and
 process (`supdb-next-<name>-<pid>`), so a day of test runs on one box is
@@ -5704,6 +5708,26 @@ that asked for it" and "every arm that pins nothing" stop being the
 same set; before a default's quick row, the whole roster is opened at
 the smallest rung with one rep, a ten-second run that says what
 twenty-five minutes would have said at their start.
+
+**An ask left for later, by the step that was the later.** The sparse
+stride form's ask is left by a build made before any reader has come
+(`zfile::StrideNo::Deferred`), for a conversion to make once reads come.
+The conversion's build took its plan from the rule a landing's build takes,
+whether a reader has come, and the rule read the census, which counts the
+reads the raw form serves: a store whose form was bought by attach on the
+model's word is read through its form files with no census read ever
+counted. So the conversion built the block form again and left the ask
+again, the look after it found a partition with its ask left and started
+the next, and a test's minute made thirteen thousand builds in one run of
+three, the other two having had a counted read by chance, until the
+selector left the form for the builds it had wasted. A conversion's plan
+takes the sparse form whatever the rule says now, and the rule counts a
+read a form file has served (`Maint::z_form_read`, `z_sparse_now`). The
+rule: the step that answers a deferred question is given the answer and
+not the question's gate, since a gate that can say "later" to the step
+that is the later is a loop; and a signal that the store has been read is
+taken from every path a read can come by, the path the mechanism itself
+installs first.
 
 ## Standing limitations
 

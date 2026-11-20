@@ -17702,7 +17702,10 @@ fn gapped_soft_load(db: &mut Db, n: usize, w: usize, seed: u64) -> Model {
 /// sparse: a build made before any reader is of a store still being
 /// written. Read, with the files attached, each partition keeps the
 /// deferred reason and no other. With no room -- the budget at the block
-/// files' own bytes -- no look converts one, however it is read. With room
+/// files' own bytes -- no look converts one, however it is read: not read
+/// alike, where no move pays, and not with one partition read alone, where
+/// the model has that one's move pay and the forms with it moved do not
+/// fit the fill, so that the move waits for a rent like any other's. With room
 /// every partition read is moved into the sparse form at the first looks,
 /// at no rent, under a price for a conversion's build no reads could pay
 /// in the time; each then reads through its stride file as the model has
@@ -17797,6 +17800,61 @@ fn a_run_with_gaps_waits_for_a_reader_and_is_converted_at_no_rent_where_it_fits(
             (0, starts, 0),
             "{what}: no move pays without room: {c:?}"
         );
+        // The forms as they stand fitting the fill with sixty-four
+        // kibibytes over, which no partition's move fits in, and one
+        // partition read alone until the others' touches have decayed: by
+        // the touches the model has that one's move pay, the read
+        // partition in the form and the rest left to fault, and its rent
+        // grows. The forms with it moved do not fit the fill, so it is a
+        // move for the rent like any other, under a price nothing here
+        // pays -- the deferred ask is free where the room has a place for
+        // the move and nowhere else, and the room it is held to is the
+        // forms' bytes with the move's own.
+        let over = 64u64 << 10;
+        let c = db.zpage_counts();
+        let (held, fill) = (c.stride_convert_held, c.stride_convert_fill);
+        assert!(held > fill, "{what}: the forms over the fill: {c:?}");
+        // What the look holds a move to is the forms as the partitions
+        // stand: every one in the block form here, its file and the heads
+        // its scans seek.
+        let heads: u64 = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                let n = p.file_name().unwrap().to_string_lossy().into_owned();
+                n.starts_with("ord-") && n.ends_with(".oidx")
+            })
+            .map(|p| std::fs::metadata(p).unwrap().len())
+            .sum();
+        assert_eq!(
+            held,
+            total + heads,
+            "{what}: the block files and their heads: {c:?}"
+        );
+        inject.set_budget(total + ((held + over - fill) as f64 / 0.85).ceil() as u64);
+        let hot = &keys[..keys.len() / (2 * parts as usize)];
+        for _ in 0..40 {
+            read_round(&db, hot, 4 * hot.len());
+            convert_look(&db, sec);
+        }
+        wait_steps(&db, 5);
+        let c = db.zpage_counts();
+        assert!(
+            c.stride_convert_held == held
+                && c.stride_convert_fill >= held
+                && c.stride_convert_fill < held + 2 * over,
+            "{what}: the forms fit the fill as they stand, with less than a move over: {c:?}"
+        );
+        assert_eq!(
+            c.stride_convert_rent_us > 0,
+            on,
+            "{what}: the read partition's move priced as paying: {c:?}"
+        );
+        assert_eq!(
+            (c.stride_converts, c.build_starts, c.stride_files),
+            (0, starts, 0),
+            "{what}: a move the forms do not fit with waits for its rent: {c:?}"
+        );
         // Room, and every partition read.
         inject.set_budget(total * 100);
         if !on {
@@ -17838,6 +17896,15 @@ fn a_run_with_gaps_waits_for_a_reader_and_is_converted_at_no_rent_where_it_fits(
             db.zpage_stride_nos().iter().all(|&n| n == 0),
             "{what}: no reason left: {:?}",
             db.zpage_stride_nos()
+        );
+        // And with every partition in the sparse form, the stride files'
+        // own bytes.
+        read_round(&db, &keys, keys.len());
+        convert_look(&db, sec);
+        let c = db.zpage_counts();
+        assert_eq!(
+            c.stride_convert_held, c.file_bytes,
+            "{what}: the stride files' bytes: {c:?}"
         );
         let before = c.stride_reads;
         check(&r, &model, &keys, &format!("{what}: in the sparse form"));

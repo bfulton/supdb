@@ -886,6 +886,13 @@ pub struct ZCounts {
     /// (`Options::zpages_stride_convert`). A test's, for holding a period's
     /// rent to the period's reads.
     pub stride_convert_rent_us: u64,
+    /// What the conversion's last look held a move in at no rent to: the
+    /// forms' bytes as the partitions stood, a conversion in flight counted
+    /// where it was going, and the fill of the room less what stands in
+    /// the cache beside the forms (`zselect::conversion_room`). A test's,
+    /// for setting a budget a known distance from the forms' own bytes.
+    pub stride_convert_held: u64,
+    pub stride_convert_fill: u64,
     pub builds_raw_tails: u64,
     /// Partitions re-coded while served (`Options::zpages_recode`): to the
     /// raw tails, back to the block coding, and re-codes that installed
@@ -6360,9 +6367,10 @@ pub struct Options {
     /// come (`Maint::z_sparse_now`): before one the store is partway
     /// through its first writing, a build's room is the room of the store
     /// so far, and the partition is built in the block form and left for a
-    /// conversion to ask when reads come, at no rent, where the model says
-    /// the store with it in the form still fits the fill
-    /// (`zfile::StrideNo::Deferred`). A forced store's builds take it where
+    /// conversion to ask when reads come, at no rent where the forms with
+    /// it in the sparse form still fit the fill whole, and for the rent
+    /// like any other move where the model says it pays past that
+    /// (`zfile::StrideNo::Deferred`, `Maint::z_convert_look`). A forced store's builds take it where
     /// they are made, having no conversion to leave it to. A partition
     /// whose keys are a whole run is built as it was, byte for byte; a
     /// sparse file is a second version of the stride trailer, which a
@@ -24540,6 +24548,8 @@ impl Reader {
             stride_converts_back: get(&ev.stride_converts_back),
             stride_convert_looks: get(&ev.stride_convert_looks),
             stride_convert_rent_us: get(&ev.stride_convert_rent_us),
+            stride_convert_held: get(&ev.stride_convert_held),
+            stride_convert_fill: get(&ev.stride_convert_fill),
             builds_raw_tails: get(&ev.builds_raw_tails),
             recodes: get(&ev.recodes),
             recodes_back: get(&ev.recodes_back),
@@ -48650,6 +48660,28 @@ impl Maint {
             .iter()
             .filter_map(|r| Some((r.seg.name.clone(), *self.z_conv_rent.get(&r.seg.name)?)))
             .collect();
+        // The forms' bytes as the partitions stand, a conversion in flight
+        // counted in the form it is going to: what a move in at no rent is
+        // held to, below. A look starts one move, and the look after it
+        // counts that one here, so each is held to the forms as they are.
+        let held: u64 = parts
+            .iter()
+            .map(|p| {
+                if p.stride {
+                    p.stride_bytes
+                } else {
+                    p.block_bytes
+                }
+            })
+            .sum();
+        self.shared
+            .z
+            .stride_convert_held
+            .store(held, AtomicOrdering::Relaxed);
+        self.shared
+            .z
+            .stride_convert_fill
+            .store(fill, AtomicOrdering::Relaxed);
         // The move whose rent has most outgrown its price, with both, and
         // how many are due.
         let mut due: Option<(usize, f64, f64)> = None;
@@ -48680,10 +48712,27 @@ impl Maint {
             };
             // A move in that a build left for this look is that build's own
             // ask, made now that the store is read and its size is the
-            // store's: it pays no rent, as the build would have paid none.
-            // What holds it is what holds any move in, that the model says
-            // the store with it in the form still fits the fill.
-            let price = if to_stride && rows[i].deferred {
+            // store's: it pays no rent, as the build would have paid none,
+            // where the forms with it made still fit the fill whole -- the
+            // room's question, which is one of sizes and which the model
+            // answers with no fault. Past that the model may still say a move in pays, by
+            // the touches: some partitions read and the rest left to fault.
+            // That is a verdict on the reads, and the rent is what holds it
+            // to them: at ten million random ids under 1 GiB the block form
+            // stood over the fill, the first looks of the read pass priced
+            // five and six partitions in on touches a second old and uneven
+            // by the sample, at no rent, and every one was moved back
+            // through the passes after, a build each way; under 1.25 GiB a
+            // partition the hot-raw policy had sent back to its form a look
+            // before was moved in inside E for a tenth of a millisecond a
+            // second, and E read 0.8x in six pairs of six.
+            let free = to_stride
+                && rows[i].deferred
+                && held
+                    .saturating_add(parts[i].stride_bytes)
+                    .saturating_sub(parts[i].block_bytes)
+                    <= fill;
+            let price = if free {
                 0.0
             } else {
                 inject

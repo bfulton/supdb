@@ -6450,6 +6450,11 @@ pub(super) struct ZEvents {
     /// The rents the conversion's last look left, summed, microseconds
     /// (`ZCounts::stride_convert_rent_us`): a level, stored and not added.
     pub stride_convert_rent_us: AtomicU64,
+    /// The forms' bytes as the conversion's last look found them and the
+    /// fill it held a move in to (`ZCounts::stride_convert_held`,
+    /// `stride_convert_fill`): levels, stored and not added.
+    pub stride_convert_held: AtomicU64,
+    pub stride_convert_fill: AtomicU64,
     /// The partitions whose raw pages were dropped at their form file's
     /// install (`Options::zpages_drop_raw`).
     pub raw_dropped: AtomicU64,
@@ -6814,8 +6819,8 @@ pub(super) enum StrideNo {
     /// A run with gaps the sparse form would take, not asked at this build
     /// because its plan leaves the ask to a conversion
     /// (`BuildPlan::stride_sparse_later`). Not a refusal: the one reason a
-    /// conversion still asks of the partition, and at no rent
-    /// (`Maint::z_convert_look`).
+    /// conversion still asks of the partition, and at no rent where the
+    /// forms with it moved fit the fill whole (`Maint::z_convert_look`).
     Deferred,
 }
 
