@@ -5852,6 +5852,26 @@ cheaper of the two to write; a lever whose count says it fired and whose
 target did not move is taken out, not kept as an arm of something that
 does nothing; and what is left unexplained is written down as unexplained.
 
+**A fix given to the walk a drained store takes, and not to the walk a
+written store takes.** The bulk walk was made to step the fence to its
+next entry (`Options::zpages_bulk_steps`) on a profile of the threaded
+scan pass that put a sixth of the walk in a binary search of the fence's
+ranks at every page. The cursor, which walks every partition with an
+unsealed key over it -- every scan after a write mix -- kept the search,
+and was found by the same symbol in a profile of the pass after the
+mixes, a ninth of the cursor's own time (`Options::zpages_cursor_steps`).
+Its pairing then resolved nothing: counted, it stepped ten million times
+a rep, and its cells read three to seven in a hundred lower, as did the
+scan pass and the load, which it cannot reach, the arm's hot-raw policy
+having released less in every pair. The rule is this file's own, that a
+path given the fix for a shape is the occasion to check every path that
+shares it, with the walks' corollary: the scan pass on a drained store is
+the one shape the mixes never show, so a fix to the bulk walk is looked
+for in the cursor the same day. And a lever worth three in a hundred of
+one pass stands on its count and its profile, not on a pairing of three
+reps under a controller that makes a decision a rep, where the decision
+splits the cell before the lever moves it.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
@@ -5866,6 +5886,36 @@ in the suite's figures, at `full` scale where it says so:
   refuted (`docs/engine.md`); what is left is the drain at the burst's end,
   and the levers on it are the chain's pace through the burst and what a
   pass pays for each piece it meets.
+- Scans on a store with unsealed keys spread through it pay for the path.
+  A few unsealed keys in a partition take every scan of it off the bulk
+  walk and through the block loop and the form file's cursor, a fifth to
+  a quarter slower than the same scans on the store folded
+  (`SUPDB_SCAN_MIXED_FOLD`), whatever form serves. Over the suite's
+  numbered keys the inserts land above every key and the stride form's
+  lead covers the rest; over keys that fall anywhere it is the cell lost
+  to LMDB wherever LMDB's file is in memory -- the threaded scans after
+  the mixes at ten million random ids, 0.86x to 0.91x under 1.25 GiB in
+  the block form and 0.89x to 0.92x under 1.5 GiB in the sparse stride
+  form (`docs/engine.md`, keys that are no run of numbers). The levers:
+  the block loop's three loads a block for the published form, each
+  behind the last; what the values' copies wait on in the cursor's walk,
+  two fifths more than in the bulk walk over the same bytes, which is not
+  known; and folding the keys in once a store is only read, which
+  rewrites every partition where the inserts fell in every one.
+- Keys the stride form does not hold are served by the block form
+  wherever the sparse stride form does not fit, a hundred and eight bytes
+  a key against eighty-five, and the block form's scans are a decode a
+  group against a B-tree in memory: the three-thread scan pass at ten
+  million random ids under 1.25 GiB is 0.94x of LMDB's, and was for
+  numbered keys before the stride form took them.
+- The controller reads its budget where a load ends, the process at its
+  smallest. A store whose raw form fits that budget by less than the
+  process then grows -- ten million random ids under 1.5 GiB, by a
+  hundredth -- is served raw until its reads' faults have paid for the
+  form, four cells of a divided row, and a form built ahead for it is
+  dropped as it is written and read back under the first reads. The lever
+  is a budget that counts what the engine's own structures are set to
+  hold, and is not built.
 - Out-of-core reads run at the speed of their misses. Once the file exceeds
   the memory that can cache it, every miss is a synchronous page fault and a
   rate is the faults an operation takes over the device's latency. The faults
