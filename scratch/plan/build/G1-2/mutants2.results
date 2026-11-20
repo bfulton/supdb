@@ -1,0 +1,11 @@
+A0 control: config missing	CONTROL-OK	exit 1	want fail	sh scripts/door/run.sh
+C red status swallowed (| tail -1)	KILLED	exit 0	want fail	sh scripts/door/run.sh
+C0 control: reduced config	CONTROL-OK	exit 1	want fail	sh scripts/door/run.sh
+F red copy not removed (trap gone)	KILLED	exit 1	want pass	sh scripts/door/run.sh
+F0 control: green tree	CONTROL-OK	exit 0	want pass	sh scripts/door/run.sh
+M red.sh checks only the first line	KILLED	exit 0	want fail	sh scripts/door/red.sh
+R0 control: an entry naming nothing	CONTROL-OK	exit 1	want fail	sh scripts/door/run.sh
+R the names-nothing check gone	KILLED	exit 0	want fail	sh scripts/door/run.sh
+S0 control: a run without the config, then a bogus one	CONTROL-OK	exit 1	want fail	mv scripts/door/clippy.toml /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/G1-2/moved_conf && sh scripts/door/run.sh; mv /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/G1-2/moved_conf scripts/door/clippy.toml && sed -i 's|"libc::dlsym",|"libc::dlsym", "libc::no_such_fn_g12",|' scripts/door/clippy.toml && sh scripts/door/run.sh
+S the clean gone	KILLED	exit 0	want fail	mv scripts/door/clippy.toml /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/G1-2/moved_conf && sh scripts/door/run.sh; mv /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/G1-2/moved_conf scripts/door/clippy.toml && sed -i 's|"libc::dlsym",|"libc::dlsym", "libc::no_such_fn_g12",|' scripts/door/clippy.toml && sh scripts/door/run.sh
+U the door run status ignored	KILLED	exit 0	want fail	sh scripts/door/run.sh

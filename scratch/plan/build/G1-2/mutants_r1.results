@@ -1,0 +1,46 @@
+B0 control: round 0 scripts, clean copy	hole (run.sh exit 0)	door red: ok (exit 101, a disallowed diagnostic on each of the six lines) | door: ok
+B1 round 0: .cargo rustflags + std::fs::read	hole (run.sh exit 0)	door red: ok (exit 101, a disallowed diagnostic on each of the six lines) | door: ok
+B2 round 0: libc::unlinkat	hole (run.sh exit 0)	door red: ok (exit 101, a disallowed diagnostic on each of the six lines) | door: ok
+B3 round 0: libc::pread64	hole (run.sh exit 0)	door red: ok (exit 101, a disallowed diagnostic on each of the six lines) | door: ok
+B4 round 0: function in the types table	hole (run.sh exit 0)	door red: ok (exit 101, a disallowed diagnostic on each of the six lines) | door: ok
+B5 round 0: pattern reworded + entry naming nothing	hole (run.sh exit 0)	door red: ok (exit 101, a disallowed diagnostic on each of the six lines) | door: ok
+X1 thread module alias, use + t::spawn	KILLED	test a_new_allow_of_the_door_fails_in_each_spelling ... FAILED; test a_proc_path_outside_the_door_fails_and_a_tests_does_not ... FAILED; test the_door_holds_what_clippy_cannot ... FAILED | #[allow(clippy::disallowed_methods)]: src/db/zfile.rs:18926: a use the thread count cannot follow, it renames std::thread; call it as thread::name, which the count sees
+X2 thread glob, spawn and sleep	KILLED	test a_new_allow_of_the_door_fails_in_each_spelling ... FAILED; test the_door_holds_what_clippy_cannot ... FAILED; test a_proc_path_outside_the_door_fails_and_a_tests_does_not ... FAILED | #[allow(clippy::disallowed_methods)]: src/db/zfile.rs:7074: a use the thread count cannot follow, it globs std::thread; call it as thread::name, which the count sees
+X3 thread re-export from pager	KILLED	test a_new_allow_of_the_door_fails_in_each_spelling ... FAILED; test the_door_holds_what_clippy_cannot ... FAILED; test a_proc_path_outside_the_door_fails_and_a_tests_does_not ... FAILED | #[allow(clippy::disallowed_methods)]: src/db/pager.rs:2147: a use the thread count cannot follow, it renames std::thread; call it as thread::name, which the count sees
+X5 allow made by a macro	KILLED	test the_door_holds_what_clippy_cannot ... FAILED; test a_proc_path_outside_the_door_fails_and_a_tests_does_not ... FAILED; test a_new_allow_of_the_door_fails_in_each_spelling ... FAILED | allow src/db/zfile.rs <item>: 1 > 0 listed: the door grew (lines 18923)
+X11 block use of thread as t	KILLED	test the_door_holds_what_clippy_cannot ... FAILED; test a_new_allow_of_the_door_fails_in_each_spelling ... FAILED; test a_proc_path_outside_the_door_fails_and_a_tests_does_not ... FAILED | src/db/zfile.rs:7072: a use the thread count cannot follow, it renames std::thread; call it as thread::name, which the count sees
+X12 use std::thread::Builder	KILLED	test a_new_allow_of_the_door_fails_in_each_spelling ... FAILED; test the_door_holds_what_clippy_cannot ... FAILED; test a_proc_path_outside_the_door_fails_and_a_tests_does_not ... FAILED | #[allow(clippy::disallowed_methods)]: src/db/zfile.rs:18926: a use the thread count cannot follow, it takes Builder out of std::thread; call it as thread::name, which the count sees
+X9a type moved into the methods table (source test)	KILLED	test each_table_of_the_doors_config_names_its_kind ... FAILED | disallowed-methods: `std::fs::OpenOptions` is a type's path
+X9b function moved into the types table (source test)	KILLED	test each_table_of_the_doors_config_names_its_kind ... FAILED | disallowed-types: `std::fs::read` is a function's path
+M1 silences: metavariable clause gone	KILLED	test a_new_allow_of_the_door_fails_in_each_spelling ... FAILED
+M2 thread_uses: rename not read	KILLED	test a_thread_call_added_fails_and_a_use_of_a_thread_fn_fails ... FAILED
+M3 thread_uses: glob not read	KILLED	test a_thread_call_added_fails_and_a_use_of_a_thread_fn_fails ... FAILED | use std::thread::*;: src/db/zfile.rs:1: a use the thread count cannot follow, it takes * out of std::thread; call it as thread::name, which the count sees
+M4 THREAD_TYPES holds Builder	KILLED	test a_thread_call_added_fails_and_a_use_of_a_thread_fn_fails ... FAILED | use std::thread::Builder;: thread src/db/zfile.rs *: 1 > 0 listed: the door grew (lines 1)
+M5 self as t not read	KILLED	test a_thread_call_added_fails_and_a_use_of_a_thread_fn_fails ... FAILED | use std::thread::{self as t};: thread src/db/zfile.rs *: 1 > 0 listed: the door grew (lines 1)
+M6 conf kind compare always equal	KILLED	test each_table_of_the_doors_config_names_its_kind ... FAILED
+M7 door_table takes reasons too	KILLED	test each_table_of_the_doors_config_names_its_kind ... FAILED | disallowed-types: `open through crate::db::vault` is a function's path
+M8 thread_uses only on non-door files	KILLED	test a_thread_call_added_fails_and_a_use_of_a_thread_fn_fails ... FAILED
+C0 control: clean copy passes	hole (run.sh exit 0)	door red: ok (exit 2, a disallowed diagnostic on each of the eight lines, door_run failing on the entry that names nothing) | door: ok
+X4a .cargo/config.toml rustflags -Aclippy::.. + std::fs::read	KILLED	door: an entry of the config names nothing, or the wrong kind of thing | door red: no disallowed diagnostic on src/db/zfile.rs line(s) 7072 7073 7074 7075 7076 7077 7078 7079
+X13 .cargo/config.toml rustflags [-A, clippy::..] + std::fs::read	KILLED	door: an entry of the config names nothing, or the wrong kind of thing | door red: no disallowed diagnostic on src/db/zfile.rs line(s) 7072 7073 7074 7075 7076 7077 7078 7079
+X4b RUSTFLAGS in the environment + std::fs::read	KILLED	door: an entry of the config names nothing, or the wrong kind of thing | door red: no disallowed diagnostic on src/db/zfile.rs line(s) 7072 7073 7074 7075 7076 7077 7078 7079
+X6 barred call inside a macro defined in vault.rs	KILLED	
+X7 libc::pread64	KILLED	
+X14a libc::unlinkat	KILLED	
+X14b libc::renameat	KILLED	
+X1c std::fs::DirBuilder	KILLED	
+X1d libc::sync	KILLED	
+X8a CLIPPY_CONF_DIR dropped from the door command	KILLED	door red: no disallowed diagnostic on src/db/zfile.rs line(s) 7072 7073 7074 7075 7076 7077 7078 7079
+X8b --release for --profile checked in the door command	KILLED	door: an entry of the config names nothing, or the wrong kind of thing | door red: no disallowed diagnostic on src/db/zfile.rs line(s) 7079
+X9c function in the types table (run.sh)	KILLED	door: an entry of the config names nothing, or the wrong kind of thing
+X10 pattern reworded (stands in for a clippy rewording)	KILLED	door red: door_run did not fail on an entry that names nothing
+R1 entry naming nothing in the main config	KILLED	door: an entry of the config names nothing, or the wrong kind of thing
+R2b door_run's config check gone + entry naming nothing	KILLED	door red: door_run did not fail on an entry that names nothing
+R2c door_run's check gone, nothing else	KILLED	door red: door_run did not fail on an entry that names nothing
+R2d door_run returns clippy's status on a config diag	KILLED	door red: door_run answered 101, not 2, on an entry that names nothing
+R3 red.sh's bogus entry not inserted	KILLED	door red: door_run did not fail on an entry that names nothing
+R4b red.sh's config-diag check gone + pattern reworded + entry naming nothing	KILLED	door red: door_run answered 101, not 2, on an entry that names nothing
+R5 red.sh's debug_assertions line gone + --release	SURVIVED	door red: ok (exit 2, a disallowed diagnostic on each of the eight lines, door_run failing on the entry that names nothing) | door: ok
+R6 red.sh's unlink line gone + libc::unlink entry gone	SURVIVED	door red: ok (exit 2, a disallowed diagnostic on each of the eight lines, door_run failing on the entry that names nothing) | door: ok
+R6b libc::unlink entry gone alone	KILLED	door: an entry of the config names nothing, or the wrong kind of thing | door red: no disallowed diagnostic on src/db/zfile.rs line(s) 7078
+R7 red copy outside the repo again + .cargo rustflags + std::fs::read	SURVIVED	door red: ok (exit 2, a disallowed diagnostic on each of the eight lines, door_run failing on the entry that names nothing) | door: ok

@@ -1,0 +1,20 @@
+A run.sh guard gone, config missing	KILLED	exit 1	sh scripts/door/run.sh
+B both guards gone, config missing	KILLED	exit 1	sh scripts/door/run.sh
+C red status swallowed (| tail -1)	SURVIVED	exit 0	sh scripts/door/run.sh
+C0 control: reduced config, no mutant	KILLED	exit 1	sh scripts/door/run.sh
+D ratchet counts only clippy::disallowed_	KILLED	exit 101	cargo test --profile checked --test source a_new_allow_of_the_door_fails_in_each_spelling -- --exact
+E literal rule does not skip test code	KILLED	exit 101	cargo test --profile checked --test source a_proc_path_outside_the_door_fails_and_a_tests_does_not -- --exact
+F red copy not removed (trap gone)	KILLED	exit 1	sh scripts/door/run.sh
+G red.sh exit-status check gone	KILLED	exit 1	sh scripts/door/red.sh
+H thread paths never counted	KILLED	exit 101	cargo test --profile checked --test source the_door_holds_what_clippy_cannot -- --exact
+I inner attributes not read	KILLED	exit 101	cargo test --profile checked --test source a_new_allow_of_the_door_fails_in_each_spelling -- --exact
+J foreign block: ABI string not skipped	KILLED	exit 101	cargo test --profile checked --test source a_foreign_block_outside_wasmapi_fails -- --exact
+K use of thread::self read as a function	KILLED	exit 101	cargo test --profile checked --test source a_thread_call_added_fails_and_a_use_of_a_thread_fn_fails -- --exact
+L ordindex check gone	KILLED	exit 101	cargo test --profile checked --test source the_ordered_index_opens_through_the_door -- --exact
+M red.sh checks only the first line	SURVIVED	exit 0	sh scripts/door/red.sh
+N a count of zero accepted	KILLED	exit 101	cargo test --profile checked --test source the_door_table_is_read_as_it_says -- --exact
+O a shrink passes	KILLED	exit 101	cargo test --profile checked --test source an_allow_moved_or_taken_away_fails_until_the_list_follows -- --exact
+P an outer allow keyed by its own line	KILLED	exit 101	cargo test --profile checked --test source the_door_holds_what_clippy_cannot -- --exact
+Q allow inside cfg_attr not read	KILLED	exit 101	cargo test --profile checked --test source a_new_allow_of_the_door_fails_in_each_spelling -- --exact
+R0 control: an entry naming nothing, no mutant	SURVIVED	exit 0	sh scripts/door/run.sh
+R an entry naming nothing passes (check gone)	SURVIVED	exit 0	sh scripts/door/run.sh
