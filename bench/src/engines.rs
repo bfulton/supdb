@@ -1698,6 +1698,10 @@ pub struct Supdb {
     /// (`Options::zpages_stride_sparse`): `supdb-zsparse`; the engine's
     /// where `None`.
     zsparse: Option<bool>,
+    /// The sparse form's ask waits for a reader
+    /// (`Options::zpages_stride_sparse_waits`); `Some(false)` asks at the
+    /// build, `supdb-zsparsebuild`; the engine's where `None`.
+    zsparsewaits: Option<bool>,
     /// A job's large per-key arrays mapped by the engine and unmapped at
     /// the job's end (`Options::jobs_mapped`): `supdb-jobsmapped`,
     /// `supdb-zstridealldropagainjobs`.
@@ -2822,6 +2826,10 @@ struct Policy {
     /// -- which the form declined and the block form served
     /// (`Options::zpages_stride_sparse`): `supdb-zsparse` beside `supdb`.
     zsparse: Option<bool>,
+    /// Whether a build made before any reader leaves its ask of the sparse
+    /// form for later (`Options::zpages_stride_sparse_waits`):
+    /// `supdb-zsparsebuild` asks at the build, beside `supdb-zsparse`.
+    zsparsewaits: Option<bool>,
     /// The seals', merges' and closes' large per-key arrays as the
     /// engine's own mappings (`Options::jobs_mapped`): `supdb-jobsmapped`
     /// beside `supdb`, and `supdb-zstridealldropagainjobs` beside
@@ -3135,6 +3143,7 @@ impl Default for Policy {
             zdropagain: None,
             zconvdrop: None,
             zsparse: None,
+            zsparsewaits: None,
             jobsmapped: false,
             jobsshort: false,
             zmemoslab: false,
@@ -4067,6 +4076,23 @@ impl Supdb {
             path,
             Policy {
                 zsparse: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-zsparse` whose builds ask for the sparse form where they are
+    /// made, before any reader (`Options::zpages_stride_sparse_waits`
+    /// off): `supdb-zsparsebuild`, the ask as the stride form's own is
+    /// made, which leaves no conversion to the first readers where the
+    /// store whole comes to fit the form and a conversion back for every
+    /// partition where it does not.
+    pub fn create_zsparse_build(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zsparse: Some(true),
+                zsparsewaits: Some(false),
                 ..Policy::default()
             },
         )
@@ -9338,6 +9364,7 @@ impl Supdb {
             zdropagain,
             zconvdrop,
             zsparse,
+            zsparsewaits,
             jobsmapped,
             jobsshort,
             zmemoslab,
@@ -9906,6 +9933,8 @@ impl Supdb {
             zpages_convert_drops_output: zconvdrop
                 .unwrap_or(supdb::Options::default().zpages_convert_drops_output),
             zpages_stride_sparse: zsparse.unwrap_or(supdb::Options::default().zpages_stride_sparse),
+            zpages_stride_sparse_waits: zsparsewaits
+                .unwrap_or(supdb::Options::default().zpages_stride_sparse_waits),
             jobs_mapped: jobsmapped,
             jobs_mapped_when_short: jobsshort,
             zpages_memo_slab: zmemoslab,
@@ -10281,6 +10310,7 @@ impl Supdb {
             zdropagain,
             zconvdrop,
             zsparse,
+            zsparsewaits,
             jobsmapped,
             jobsshort,
             zmemoslab,
@@ -10656,7 +10686,11 @@ impl Engine for Supdb {
             return "supdb-zrewarmbeside";
         }
         if self.zsparse == Some(true) {
-            return "supdb-zsparse";
+            return if self.zsparsewaits == Some(false) {
+                "supdb-zsparsebuild"
+            } else {
+                "supdb-zsparse"
+            };
         }
         if self.zconvdrop == Some(true) {
             return if self.zdropagain == Some(true) {
@@ -13379,6 +13413,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zstrideallcdrop"
         | "supdb-zstridealldropagaincdrop"
         | "supdb-zsparse"
+        | "supdb-zsparsebuild"
         | "supdb-jobsmapped"
         | "supdb-zstridealldropagainjobs"
         | "supdb-zmemoslab"
@@ -14423,6 +14458,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zdropagain" => supdb_arm(Supdb::create_zdropagain, dir)?,
         "supdb-zstridealldropagain" => supdb_arm(Supdb::create_zstride_all_dropagain, dir)?,
         "supdb-zsparse" => supdb_arm(Supdb::create_zsparse, dir)?,
+        "supdb-zsparsebuild" => supdb_arm(Supdb::create_zsparse_build, dir)?,
         "supdb-zstrideallcdrop" => supdb_arm(Supdb::create_zstride_all_cdrop, dir)?,
         "supdb-zstridealldropagaincdrop" => {
             supdb_arm(Supdb::create_zstride_all_dropagain_cdrop, dir)?
@@ -17614,6 +17650,25 @@ mod tests {
                     ),
                     (
                         (d.zpages_drop_again, d.zpages_convert_drops_output),
+                        d.zpages_stride,
+                        d.zpages_stride_room,
+                        d.zpages_stride_convert
+                    )
+                );
+                assert!(o.zpages_stride_sparse_waits && d.zpages_stride_sparse_waits);
+                // And its ask made at the build: the one option more.
+                let z = Supdb::create_zsparse_build(&dir("zsparsebuild")).unwrap();
+                assert_eq!(z.name(), "supdb-zsparsebuild");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_stride_sparse && !o.zpages_stride_sparse_waits);
+                assert_eq!(
+                    (
+                        o.zpages_stride,
+                        o.zpages_stride_room,
+                        o.zpages_stride_convert
+                    ),
+                    (
                         d.zpages_stride,
                         d.zpages_stride_room,
                         d.zpages_stride_convert

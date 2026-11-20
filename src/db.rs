@@ -6377,6 +6377,21 @@ pub struct Options {
     /// reader from before refuses. Off: `supdb-zsparse` is the arm.
     #[doc(hidden)]
     pub zpages_stride_sparse: bool,
+    /// With `zpages_stride_sparse` under the controller, a build made
+    /// before any reader has come leaves a run with gaps in the block form
+    /// and its ask of the sparse form to a conversion
+    /// (`Maint::z_sparse_now`, `zfile::StrideNo::Deferred`). Off, a build
+    /// asks where it is made, as the stride form's own ask is made: every
+    /// build that finds the store so far to fit the room takes the sparse
+    /// form, which is the shape the ask first had. It is the better of the
+    /// two where the store whole comes to fit -- nothing is converted
+    /// beside the first readers -- and the worse where it does not: at ten
+    /// million random ids under 1 GiB forty-four partitions were built
+    /// sparse and twenty-four converted back through the read and scan
+    /// passes (`docs/engine.md`, keys that are no run of numbers). On;
+    /// `supdb-zsparsebuild` asks at the build.
+    #[doc(hidden)]
+    pub zpages_stride_sparse_waits: bool,
 }
 
 impl Options {
@@ -6853,6 +6868,7 @@ impl Default for Options {
             zpages_stride_convert: true,
             zpages_convert_drops_output: true,
             zpages_stride_sparse: false,
+            zpages_stride_sparse_waits: true,
         }
     }
 }
@@ -51471,7 +51487,8 @@ impl Maint {
     /// counted.
     fn z_sparse_now(&self) -> (bool, bool) {
         let on = self.opts.zpages_stride_sparse;
-        let read = self.z_pick_raw_ok() || self.z_form_read;
+        let read =
+            !self.opts.zpages_stride_sparse_waits || self.z_pick_raw_ok() || self.z_form_read;
         (on && read, on && !read)
     }
 

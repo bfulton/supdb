@@ -17962,6 +17962,53 @@ fn a_run_with_gaps_waits_for_a_reader_and_is_converted_at_no_rent_where_it_fits(
     }
 }
 
+/// The sparse form's ask made at the build
+/// (`Options::zpages_stride_sparse_waits` off): the same store of keys with
+/// gaps, loaded with nothing read, has every partition's file built ahead
+/// in the sparse form, no ask left for later and none declined -- the
+/// stride form's own rule, a build taking the form where the store so far
+/// fits the room.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_run_with_gaps_is_built_sparse_before_any_reader_without_the_wait() {
+    let what = "sparse at the build";
+    let (dir, db, _model, inject, raw) = land_store_loaded(
+        "auto-sparse-build",
+        50,
+        |o| {
+            o.zpages_stride = ZStride::Forced;
+            o.zpages_stride_convert = true;
+            o.zpages_stride_sparse = true;
+            o.zpages_stride_sparse_waits = false;
+            o.zpages_memo = false;
+            o.partition_bytes = Some(400 << 10);
+            o.zpages_ahead_builders = 1;
+        },
+        |db| gapped_soft_load(db, 20_000, 100, 0x5DF),
+    );
+    inject.set_budget(raw * 3 / 2);
+    let parts = db.zpage_counts().partitions;
+    assert!(parts >= 5, "{what}: partitions to choose from: {parts}");
+    assert!(
+        tick_until_built(&db, |c| c.prebuilt >= c.partitions),
+        "{what}: built ahead: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.stride_builds, c.stride_sparse_builds),
+        (parts, parts),
+        "{what}: every file a sparse stride file: {c:?}"
+    );
+    assert_eq!(
+        (c.stride_declines[1], c.stride_declines[8]),
+        (0, 0),
+        "{what}: none declined for its holes and none left for later: {c:?}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The conversion between the block and the stride forms under the
 /// controller (`Options::zpages_stride_convert`, `ZStride::Chosen`). Every
 /// partition is built in the block form. With every partition read alike
