@@ -1,0 +1,5 @@
+# The wall's ratchet (tests/source.rs): a raised count in it is a new
+# coupling between the forms and the encryption modules, and is the owner's
+# to approve. The test sees one tree; this line is what holds the file to
+# going only down across changes.
+/tests/data/couplings.txt @bfulton
