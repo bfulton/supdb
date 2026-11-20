@@ -123,6 +123,20 @@
 //!   never appended or deleted, with a value of one width that says how many
 //!   times it was put, so that its partitions qualify through every merge;
 //!   a range whose stride files answered no read fails there too.
+//! - `ZFUZZ_SPARSE=1`, with `ZFUZZ_ZPAGES` and `ZFUZZ_STRIDE`: the `z`
+//!   store's stride form takes a partition whose keys are numbers with
+//!   gaps between them (`Options::zpages_stride_sparse`), so that what the
+//!   steer made a partition decline for its holes -- a delete, a number
+//!   taken out of the pool -- makes it a sparse file, read by a search of
+//!   its keys' numbers, and the seals and merges rewrite partitions
+//!   between the form that holds no number, the sparse one and the block
+//!   form as the holes come and are filled. Nothing is drawn for it: in
+//!   the seeds whose decimal field is sixteen digits or fewer and whose
+//!   value width is odd the keys are hex digits, of the case the seed's
+//!   trust says, and in the seeds with no number taken out and a field to
+//!   spare the pool is numbers scattered over the field, as ids are, not
+//!   one run of them. The summary counts the sparse builds, and a range
+//!   with none fails.
 //! - `ZFUZZ_CONVERT=1`, with `ZFUZZ_ZPAGES` and `ZFUZZ_STRIDE`: every few
 //!   dozen steps a partition a form file serves is asked to move to its
 //!   other form (`Db::zpages_convert_ask`) -- a stride file's to the block
@@ -316,6 +330,13 @@ fn stride_on() -> bool {
     env_flag("ZFUZZ_STRIDE") && env_flag("ZFUZZ_ZPAGES")
 }
 
+/// Whether the `z` store's stride form takes keys with gaps between their
+/// numbers, in the sparse form (`ZFUZZ_SPARSE`, with the stride form
+/// forced).
+fn sparse_on() -> bool {
+    stride_on() && env_flag("ZFUZZ_SPARSE")
+}
+
 /// Where a stride seed's run of numbers starts: at zero, at the field's top
 /// less the run, which a key past the run's last would overflow, or
 /// anywhere in the field.
@@ -426,10 +447,20 @@ impl StrideSteer {
         }
     }
 
+    /// Under `ZFUZZ_SPARSE`, whether the seed's keys are hex digits and
+    /// not decimal ones, and of which case: from what the seed drew
+    /// already, so that the switch adds no draw -- a decimal field a u64 of
+    /// hex digits fits, an odd value width, and the case the trust says.
+    fn hex(&self) -> Option<bool> {
+        (sparse_on() && !self.be && self.d <= 16 && self.w % 2 == 1).then_some(self.trust)
+    }
+
     /// The largest number the field holds.
     fn top(&self) -> u64 {
         if self.be {
             u64::MAX >> (8 * (8 - self.d))
+        } else if self.hex().is_some() {
+            u64::MAX >> (4 * (16 - self.d))
         } else {
             10u64.pow(self.d as u32) - 1
         }
@@ -440,7 +471,11 @@ impl StrideSteer {
         if self.be {
             k.extend_from_slice(&x.to_be_bytes()[8 - self.d..]);
         } else {
-            k.extend(format!("{x:0w$}", w = self.d).bytes());
+            match self.hex() {
+                Some(true) => k.extend(format!("{x:0w$X}", w = self.d).bytes()),
+                Some(false) => k.extend(format!("{x:0w$x}", w = self.d).bytes()),
+                None => k.extend(format!("{x:0w$}", w = self.d).bytes()),
+            }
         }
         k
     }
@@ -462,6 +497,16 @@ impl StrideSteer {
             RunBase::Any => rng.next() % last_base.saturating_add(1),
         };
         let mut nums: Vec<u64> = (0..n).map(|i| base + i).collect();
+        // Under `ZFUZZ_SPARSE`, where the seed takes no number out of a run
+        // and the field has room, no run at all: numbers scattered over the
+        // field, as random ids are over theirs.
+        if sparse_on() && self.gaps == 0 && top / 8 > n {
+            let mut scattered: BTreeSet<u64> = BTreeSet::new();
+            while (scattered.len() as u64) < n {
+                scattered.insert(rng.next() % top.saturating_add(1).max(1));
+            }
+            nums = scattered.into_iter().collect();
+        }
         for _ in 0..self.gaps {
             if nums.len() > 2 {
                 nums.remove(1 + rng.below(nums.len() - 2));
@@ -682,6 +727,8 @@ fn opts_z(c: &Cfg) -> Options {
     if let Some(s) = &c.stride {
         o.zpages_stride = supdb::ZStride::Forced;
         o.zpages_stride_trust_built = s.trust;
+        // And under `ZFUZZ_SPARSE` the form takes a run with gaps.
+        o.zpages_stride_sparse = sparse_on();
     }
     // Under `ZFUZZ_PROMOTE` with the form forced and the cache on, a block
     // read a few entries' worth is held as a copy in its slot and the
@@ -1626,6 +1673,8 @@ struct StrideStats {
     /// (`ZFUZZ_CONVERT`).
     converts: u64,
     converts_back: u64,
+    /// The stride builds that made a sparse file (`ZFUZZ_SPARSE`).
+    sparse: u64,
 }
 
 impl StrideStats {
@@ -1634,6 +1683,7 @@ impl StrideStats {
         self.block_backed += c.declined_block_backed;
         self.converts += c.stride_converts;
         self.converts_back += c.stride_converts_back;
+        self.sparse += c.stride_sparse_builds;
         self.builds += c.stride_builds;
         self.files = self.files.max(c.stride_files);
         self.reads += c.stride_reads;
@@ -1670,6 +1720,7 @@ impl StrideStats {
         self.block_backed += o.block_backed;
         self.converts += o.converts;
         self.converts_back += o.converts_back;
+        self.sparse += o.sparse;
     }
 }
 
@@ -1678,7 +1729,7 @@ impl std::fmt::Display for StrideStats {
         write!(
             f,
             "form builds {} block-backed {}, moved in {} out {}, \
-             stride builds {} files {} reads {} cursor {} \
+             stride builds {} (sparse {}) files {} reads {} cursor {} \
              page checks {} failures {}, \
              declines [shape, holes, values, width, tomb, block, small, readback] {:?}",
             self.form_builds,
@@ -1686,6 +1737,7 @@ impl std::fmt::Display for StrideStats {
             self.converts,
             self.converts_back,
             self.builds,
+            self.sparse,
             self.files,
             self.reads,
             self.cursor,
@@ -2366,6 +2418,13 @@ fn fuzz_range() {
         if stride.reads == 0 && ran > 0 {
             bad.push(format!(
                 "the stride form served no read in {ran} seeds: the steer reached no partition ({stride})"
+            ));
+        }
+        // Asked for the sparse form, a range that built none read no key
+        // by a search of its numbers.
+        if sparse_on() && stride.sparse == 0 && ran > 0 {
+            bad.push(format!(
+                "no sparse stride file was built in {ran} seeds: the steer made no run with gaps ({stride})"
             ));
         }
         // And asked to move its partitions between the forms, a range in

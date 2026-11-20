@@ -993,6 +993,10 @@ pub struct ZCounts {
     /// counted once, there (`declined_block_backed`, `declined_small`).
     pub stride_builds: u64,
     pub stride_declines: [u64; zfile::STRIDE_REASONS],
+    /// The stride files among `stride_builds` built in the sparse form,
+    /// their keys' numbers held beside the values
+    /// (`Options::zpages_stride_sparse`).
+    pub stride_sparse_builds: u64,
     /// The live partitions whose served form file is a stride file.
     pub stride_files: u64,
     /// Partitions live, the ones with a form file installed, the ones of
@@ -6332,6 +6336,29 @@ pub struct Options {
     /// conversion's file in the cache as it is written.
     #[doc(hidden)]
     pub zpages_convert_drops_output: bool,
+    /// The stride form takes a partition whose keys are numbers with gaps
+    /// between them, and keys of hex digits with it (`zfile::BuildPlan::
+    /// stride_sparse`, `zpages::StrideSparse`). The form as it shipped holds
+    /// a partition whose keys are every number of a run, so that a key's
+    /// rank is arithmetic and the file is the values alone; keys that are
+    /// numbers no run -- random ids, a sequence with deletions -- decline as
+    /// holes or as no shape, and the block form serves them, whose point
+    /// read is a group's decode where the stride form's is a load. The
+    /// sparse form holds each key's number after the values, a word a rank
+    /// in order, and every sixty-fourth of them again in memory: a key's
+    /// rank is searched for, the samples first, from the place a straight
+    /// line through the first number and the last puts it and within the
+    /// error the build measured that line to have, then the one run of
+    /// numbers the sample opens. Eight bytes a key more than the values,
+    /// against the block form's compression of them, so which partitions
+    /// take it is the room's and the conversion's to say
+    /// (`zpages_stride_room`, `zpages_stride_convert`), which price it by
+    /// its bytes as they price the form that holds no number. A partition
+    /// whose keys are a whole run is built as it was, byte for byte; a
+    /// sparse file is a second version of the stride trailer, which a
+    /// reader from before refuses. Off: `supdb-zsparse` is the arm.
+    #[doc(hidden)]
+    pub zpages_stride_sparse: bool,
 }
 
 impl Options {
@@ -6807,6 +6834,7 @@ impl Default for Options {
             zpages_stride_trust_built: true,
             zpages_stride_convert: true,
             zpages_convert_drops_output: true,
+            zpages_stride_sparse: false,
         }
     }
 }
@@ -24550,6 +24578,7 @@ impl Reader {
             retired: get(&ev.retired),
             stride_builds: get(&ev.stride_builds),
             stride_declines: std::array::from_fn(|i| get(&ev.stride_declines[i])),
+            stride_sparse_builds: get(&ev.stride_sparse_builds),
             ..ZCounts::default()
         };
         for seg in self.segs().iter().filter(|s| s.level > 0) {
@@ -38836,6 +38865,7 @@ impl Db {
                 plan.own_decode = self.opts.zpages_own_decoder;
                 plan.stride = self.opts.z_stride_ask();
                 plan.stride_below = self.opts.zpages_stride_below.clone();
+                plan.stride_sparse = self.opts.zpages_stride_sparse;
                 plan
             })
         };
@@ -48399,7 +48429,7 @@ impl Maint {
                             stride: z.is_stride(),
                             file: z.file_bytes(),
                             records: s.foot().1,
-                            values: s.stride_bytes(),
+                            values: self.z_stride_bytes(s),
                             heads: s.ord.file_bytes(),
                             ns: 16 * z.decode_ns16.load(AtomicOrdering::Relaxed),
                             decodes: 16 * z.decodes16.load(AtomicOrdering::Relaxed),
@@ -51336,11 +51366,49 @@ impl Maint {
         w.get()
     }
 
+    /// What partition `s` comes to in the stride form, bytes: its values
+    /// alone (`Seg::stride_bytes`), and with them its keys' numbers, a word
+    /// a key, where its form is the sparse one (`z_number_bytes`). What the
+    /// room and the conversion price a partition by before it has a stride
+    /// file, whose own bytes are its price after.
+    fn z_stride_bytes(&self, s: &Seg) -> u64 {
+        s.stride_bytes().saturating_add(self.z_number_bytes(s))
+    }
+
+    /// The bytes of its keys' numbers partition `s`'s stride form holds, a
+    /// sparse form's and none in a form whose keys are a whole run: the
+    /// file's own account where a stride file serves the partition, and
+    /// elsewhere the store's -- a store that takes the sparse form and has
+    /// built one is taken to be of keys with gaps, every partition of it,
+    /// since a store's keys are of one kind far more often than not and a
+    /// partition priced eight bytes a key short is one the room is given
+    /// to that does not fit it (`Options::zpages_stride_sparse`,
+    /// `ZEvents::stride_sparse_builds`). Before a store's first stride
+    /// build nothing says, and its partitions are priced as whole runs.
+    fn z_number_bytes(&self, s: &Seg) -> u64 {
+        if let Some(body) = s.z.get().and_then(|z| z.stride()) {
+            return body.number_bytes();
+        }
+        let sparse = self.opts.zpages_stride_sparse
+            && self
+                .shared
+                .z
+                .stride_sparse_builds
+                .load(AtomicOrdering::Relaxed)
+                > 0;
+        if sparse {
+            8 * s.ord.len() as u64
+        } else {
+            0
+        }
+    }
+
     /// Whether the store in the stride form fits the room as it is now
     /// (`Options::zpages_stride_room`, `zselect::stride_fits`): every
-    /// partition's values alone and every level-0 piece's payload, against
-    /// the budget a test injects or the platform reads. With no budget to
-    /// read it fits.
+    /// partition's values alone, a sparse form's keys' numbers with them
+    /// (`z_stride_bytes`), and every level-0 piece's payload, against the
+    /// budget a test injects or the platform reads. With no budget to read
+    /// it fits.
     fn z_stride_fits(&self) -> bool {
         let Some(budget) = self.z_budget_grown() else {
             return true;
@@ -51349,7 +51417,7 @@ impl Maint {
             let _op = self.op();
             self.segs().iter().fold((0u64, 0u64), |(st, pc), s| {
                 if s.level > 0 {
-                    (st.saturating_add(s.stride_bytes()), pc)
+                    (st.saturating_add(self.z_stride_bytes(s)), pc)
                 } else {
                     (st, pc.saturating_add(s.data))
                 }
@@ -51429,7 +51497,7 @@ impl Maint {
                     // that form. Any other is what its file on disk holds,
                     // or its raw form where it has none.
                     None if zfile::in_spans(&last, &s.lo) => {
-                        held = held.saturating_add(s.stride_bytes());
+                        held = held.saturating_add(self.z_stride_bytes(s));
                         spans.push(span());
                     }
                     None => {
@@ -51477,6 +51545,7 @@ impl Maint {
         );
         plan.drop_output = !past;
         plan.sync = self.opts.zpages_build_sync && plan.drop_output;
+        plan.stride_sparse = self.opts.zpages_stride_sparse;
         plan.ahead = self.opts.zpages_build_ahead;
         plan.group_bytes = self.opts.zpages_group_bytes;
         let (coding, raw_tails) = match self.z_coding_pick {
@@ -52432,6 +52501,7 @@ impl Maint {
         // where it is taken in: the pages a write leaves in the cache
         // carry buffer heads, and the pages a read brings carry none.
         plan.drop_output = (dormant && !past) || (convert && self.opts.zpages_convert_drops_output);
+        plan.stride_sparse = self.opts.zpages_stride_sparse;
         // Only a file written back as it was built: its pages are on the
         // device and its sync asks for the flush alone; one kept dirty for
         // the install wrote its pages in its sync, 50-160 ms each at five

@@ -40,7 +40,10 @@ use super::zpages::{
     PART_STEP, STRIDE_KEY_MAX, STRIDE_MAGIC, STRIDE_W_MAX, ZCODING_BLOCK, ZCODING_RECORD,
     ZGROUP_BYTES, ZMAX_GROUPS, ZNOPAGE, ZPAGE, ZTRAILER,
 };
-use super::zpages::{stride_page_crc, stride_row_crc};
+use super::zpages::{
+    stride_eps, stride_line, stride_page_crc, stride_row_crc, StrideSparse, KEY_KINDS,
+    STRIDE_SAMPLE,
+};
 use super::zpages::{trailer_crc, trailer_magic};
 use crate::blob::{Blob, BlobOptions, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
@@ -636,7 +639,7 @@ impl<'a> ZCursor<'a> {
             // the path `ZFile::seek` takes (`StrideBody::lower_bound`): no
             // page.
             return match zfile.stride().filter(|_| !zfile.damaged()) {
-                Some(body) => Ok(ZCursor::stride_seek(memo, zfile, raw, body, key)),
+                Some(body) => ZCursor::stride_seek(memo, zfile, raw, body, key),
                 None => Err(ZSeek::Out),
             };
         }
@@ -1680,7 +1683,7 @@ impl<'a> ZCursor<'a> {
                 .stride()
                 .filter(|_| !self.fell && !self.zfile.damaged())
             {
-                Some(body) => Some(self.stride_skip_to(body, until)),
+                Some(body) => self.stride_skip_to(body, until),
                 None => {
                     self.fall();
                     None
@@ -1924,9 +1927,22 @@ impl<'a> ZCursor<'a> {
         self.part = None;
         self.end = self.zfile.nkeys;
         self.page_end = self.zfile.nkeys;
-        match body.key_at_into(self.rank as u64, self.stride_key()) {
-            Some(k) => {
-                self.key_at = (0, k.len());
+        let (zfile, memo, rank) = (self.zfile, self.memo, self.rank as u64);
+        let file = zfile.stride_bytes();
+        let len = match body.key_at_into(file, rank, self.stride_key(), &mut |p| {
+            zfile.stride_page(body, memo, p)
+        }) {
+            Ok(k) => k.map(<[u8]>::len),
+            // A sparse form's page of numbers failed its check, which took
+            // the file out of service: the rest is the raw form's.
+            Err(_) => {
+                self.fall();
+                return;
+            }
+        };
+        match len {
+            Some(len) => {
+                self.key_at = (0, len);
                 self.group = Group::Stride(body);
             }
             None => self.group = Group::None,
@@ -1934,7 +1950,9 @@ impl<'a> ZCursor<'a> {
     }
 
     /// `seek` over a stride file in service: the cursor at the first key at
-    /// or after `key`, by the seek's arithmetic.
+    /// or after `key`, by the seek's arithmetic, or, for a sparse form, its
+    /// search of the numbers; `Fallback` where a page of them failed its
+    /// check, the seek the raw form's.
     #[inline(never)]
     fn stride_seek(
         memo: &'a ZMemo,
@@ -1942,21 +1960,38 @@ impl<'a> ZCursor<'a> {
         raw: &'a Blob<MmapBytes>,
         body: &'a StrideBody,
         key: &[u8],
-    ) -> ZCursor<'a> {
+    ) -> std::result::Result<ZCursor<'a>, ZSeek> {
         let mut c = ZCursor::new(memo, zfile, raw);
-        c.rank = body.lower_bound(key).0 as usize;
+        let file = zfile.stride_bytes();
+        let Ok((rank, _)) = body.lower_bound(file, key, &mut |p| zfile.stride_page(body, memo, p))
+        else {
+            return Err(ZSeek::Fallback);
+        };
+        c.rank = rank as usize;
         c.stride_load(body);
-        c
+        if c.fell {
+            return Err(ZSeek::Fallback);
+        }
+        Ok(c)
     }
 
     /// `skip_to` at a stride position: the cut of `until` by the seek's
     /// arithmetic, from any position, the cursor placed there.
     #[inline(never)]
-    fn stride_skip_to(&mut self, body: &'a StrideBody, until: &[u8]) -> KeyOrder {
-        let (rank, at) = body.lower_bound(until);
+    fn stride_skip_to(&mut self, body: &'a StrideBody, until: &[u8]) -> Option<KeyOrder> {
+        let (zfile, memo) = (self.zfile, self.memo);
+        let file = zfile.stride_bytes();
+        let Ok((rank, at)) =
+            body.lower_bound(file, until, &mut |p| zfile.stride_page(body, memo, p))
+        else {
+            // A sparse form's page of numbers failed its check: the cut is
+            // the raw form's, as it is from a cursor fallen any other way.
+            self.fall();
+            return None;
+        };
         self.rank = rank as usize;
         self.stride_load(body);
-        at
+        (!self.fell).then_some(at)
     }
 
     /// `advance`'s step at a stride position, inside the run: the key moved
@@ -1968,8 +2003,16 @@ impl<'a> ZCursor<'a> {
             self.fall();
             return;
         }
-        let len = self.key_at.1;
-        body.step_key(&mut self.stride_key()[..len]);
+        // `advance` moved the rank before the step: the key is the key of
+        // the rank the cursor now stands at.
+        let (zfile, memo, rank, len) = (self.zfile, self.memo, self.rank as u64, self.key_at.1);
+        let file = zfile.stride_bytes();
+        let stepped = body.step_key(file, rank, &mut self.stride_key()[..len], &mut |p| {
+            zfile.stride_page(body, memo, p)
+        });
+        if stepped.is_err() {
+            self.fall();
+        }
     }
 
     /// The stride position's key, in the group buffer the cursor holds
@@ -2037,7 +2080,16 @@ impl<'a> ZCursor<'a> {
         let cap = rank.saturating_add(limit).min(end);
         let (ur, uat) = match until {
             Some(u) => {
-                let (r, at) = body.lower_bound(u);
+                let memo = self.memo;
+                let cut = body.lower_bound(zfile.stride_bytes(), u, &mut |p| {
+                    zfile.stride_page(body, memo, p)
+                });
+                let Ok((r, at)) = cut else {
+                    // A sparse form's page of numbers failed its check
+                    // before a key was handed over.
+                    self.fall();
+                    return (0, None);
+                };
                 (r as usize, at)
             }
             None => (end, KeyOrder::Greater),
@@ -2071,8 +2123,17 @@ impl<'a> ZCursor<'a> {
                 }
             }
             r += 1;
-            if r < end {
-                body.step_key(key);
+            if r < end
+                && body
+                    .step_key(file, r as u64, key, &mut |p| {
+                        zfile.stride_page(body, memo, p)
+                    })
+                    .is_err()
+            {
+                // The key of the rank the walk now stands at is a sparse
+                // form's page of numbers that failed: fallen there.
+                fell = true;
+                break;
             }
         }
         let walked = r - rank;
@@ -3288,6 +3349,10 @@ pub(super) struct ZFile {
     filter: Option<super::BlockedBloom>,
     nkeys: usize,
     n_pages: usize,
+    /// The pages `verified` and `bad` hold a bit for: `n_pages`, and with
+    /// them a sparse stride form's pages of its keys' numbers
+    /// (`StrideBody::checked_pages`).
+    checked: usize,
     /// The hash every page's CRC is xored with, recomputed from the live
     /// segment and not taken from the file. A stride file's is its
     /// trailer's (`StrideTrailer::bind32`), the trailer having been held to
@@ -3584,7 +3649,7 @@ impl ZFile {
                 memo_ahead,
             );
             if trusted_all {
-                for p in 0..n_pages {
+                for p in 0..zfile.checked {
                     set_bit(&zfile.verified, p);
                 }
             }
@@ -3660,7 +3725,14 @@ impl ZFile {
         memo_first: bool,
         memo_ahead: bool,
     ) -> ZFile {
-        let words = a.n_pages.div_ceil(64);
+        // A bit a page a read checks at its first touch: the pages that
+        // hold the records, and with them a sparse stride form's pages of
+        // its keys' numbers.
+        let checked = match &a.body {
+            ZBody::Block(_) => a.n_pages,
+            ZBody::Stride(body) => body.checked_pages(),
+        };
+        let words = checked.div_ceil(64);
         ZFile {
             map: a.map,
             file: a.file,
@@ -3669,6 +3741,7 @@ impl ZFile {
             filter: a.filter,
             nkeys: a.nkeys,
             n_pages: a.n_pages,
+            checked,
             bind: a.bind,
             own_decoder: false,
             flat_decoder: false,
@@ -3760,11 +3833,19 @@ impl ZFile {
         }
         let n = body.keys();
         let mut kbuf = [0u8; STRIDE_KEY_MAX];
+        // A rank's key as the form has it: rendered from the run's first
+        // number for a whole run, and for a sparse form from the number its
+        // page holds, the page checked first and its failure damage.
+        let key_of = |rank: u64, kbuf: &mut [u8; STRIDE_KEY_MAX]| {
+            body.key_at_into(bytes, rank, kbuf, &mut |q| body.page_ok(bytes, q))
+                .map(|k| k.map(<[u8]>::to_vec))
+                .map_err(|_| damage(ZError::PageCrc))
+        };
         // Both sides answer at either end: the layout refuses a run of no
         // keys and `same_segment` held the count to the segment's, so the
         // compare is of two keys and never of two absences.
         for (rank, which) in [(0, "first"), (n - 1, "last")] {
-            if body.key_at_into(rank, &mut kbuf) != blob.key_at(rank as usize) {
+            if key_of(rank, &mut kbuf)?.as_deref() != blob.key_at(rank as usize) {
                 return Err(Reject::Identity(format!(
                     "the stride form's {which} key is not the segment's"
                 )));
@@ -3789,10 +3870,25 @@ impl ZFile {
                     "a sampled value page's slot is not the segment's value at its rank",
                 ));
             }
-            if body.key_at_into(rank, &mut kbuf) != blob.key_at(rank as usize) {
+            let key = key_of(rank, &mut kbuf)?;
+            if key.as_deref() != blob.key_at(rank as usize) {
                 return Err(identity(
                     "a sampled value page's slot is not the segment's key at its rank",
                 ));
+            }
+            // And the key found where it is: a sparse form's samples and
+            // the error it searches within, at the sampled ranks, the
+            // segment's own key the one looked for.
+            if let Some(key) = blob.key_at(rank as usize) {
+                match body.rank_of(bytes, key, &mut |q| body.page_ok(bytes, q)) {
+                    Ok(Some(r)) if r == rank => {}
+                    Ok(_) => {
+                        return Err(identity(
+                            "a sampled key is not found at its rank by the form's search",
+                        ))
+                    }
+                    Err(_) => return Err(damage(ZError::PageCrc)),
+                }
             }
         }
         Ok(StrideAttached {
@@ -3843,7 +3939,7 @@ impl ZFile {
     /// A check failed on page `p`: it and the form file leave service.
     #[cold]
     fn fail(&self, p: usize) {
-        if p < self.n_pages {
+        if p < self.checked {
             set_bit(&self.bad, p);
         }
         self.gate.fetch_or(GATE_DAMAGED, Ordering::Relaxed);
@@ -5127,7 +5223,7 @@ impl ZFile {
         let r = match self.locate_rank(memo, rank, &mut buf) {
             Locate::Absent { decoded } => ZRead::Served { n: 0, decoded },
             Locate::Out => match self.stride() {
-                Some(body) => self.stride_key_at_into(body, rank, out),
+                Some(body) => self.stride_key_at_into(body, memo, rank, out),
                 None => ZRead::Out,
             },
             Locate::Fallback => ZRead::Fallback,
@@ -5166,7 +5262,7 @@ impl ZFile {
     pub(super) fn seek(&self, memo: &ZMemo, key: &[u8]) -> ZSeek {
         if self.gate_out() {
             return match self.stride() {
-                Some(body) => self.stride_seek(body, key),
+                Some(body) => self.stride_seek(body, memo, key),
                 None => ZSeek::Out,
             };
         }
@@ -5673,11 +5769,28 @@ impl ZFile {
     /// verified where it passes, the page and the file out of service where
     /// it fails. Whether the page may be read.
     fn stride_page(&self, body: &StrideBody, memo: &ZMemo, p: u32) -> bool {
-        let i = p as usize;
-        if bit(&self.verified, i) {
+        if bit(&self.verified, p as usize) {
             return true;
         }
         memo.count_stride_check();
+        self.stride_page_check(body, p)
+    }
+
+    /// `stride_page` for a read with no handle's memo to count the check
+    /// on (`ZFile::count_out`, `ZFile::owner_span_from`): a page of a
+    /// sparse form's numbers, the one page such a read touches. The check
+    /// is the same and so is the bit it leaves; what goes uncounted is a
+    /// check a page, once a process.
+    fn stride_page_uncounted(&self, body: &StrideBody, p: u32) -> bool {
+        bit(&self.verified, p as usize) || self.stride_page_check(body, p)
+    }
+
+    /// Page `p` against its word of the row and, for a page of numbers,
+    /// its samples (`StrideBody::page_ok`): marked verified where it
+    /// passes, and it and the file out of service where it fails.
+    #[inline(never)]
+    fn stride_page_check(&self, body: &StrideBody, p: u32) -> bool {
+        let i = p as usize;
         if body.page_ok(self.stride_bytes(), p) {
             set_bit(&self.verified, i);
             true
@@ -5728,14 +5841,20 @@ impl ZFile {
     }
 
     /// `count` of a stride file: one for a key of the run, none for any
-    /// other, from the key alone; no page is touched.
+    /// other -- from the key alone for a whole run, no page touched, and by
+    /// the search of a sparse form's numbers, whose page failing its check
+    /// is a fallback.
     fn stride_count(&self, body: &StrideBody, key: &[u8]) -> ZRead {
         if self.damaged() {
             return ZRead::Out;
         }
-        ZRead::Served {
-            n: u64::from(body.rank_of(key).is_some()),
-            decoded: false,
+        let file = self.stride_bytes();
+        match body.rank_of(file, key, &mut |p| self.stride_page_uncounted(body, p)) {
+            Ok(rank) => ZRead::Served {
+                n: u64::from(rank.is_some()),
+                decoded: false,
+            },
+            Err(_) => ZRead::Fallback,
         }
     }
 
@@ -5770,14 +5889,31 @@ impl ZFile {
         if self.stride_ask_ahead(body, from, want).is_some() {
             out.prefetches += 1;
         }
-        let codec = body.codec();
-        let len = codec.key_len();
+        let len = body.codec().key_len();
         let mut kbuf = [0u8; STRIDE_KEY_MAX];
-        codec.render(codec.base() + from, &mut kbuf);
         let file = self.stride_bytes();
+        // The first rank's key rendered and each after it stepped to; a
+        // sparse form reads both from its pages of numbers, and one that
+        // fails ends the walk as a value page that fails does, before the
+        // rank whose key it held.
+        if !matches!(
+            body.key_at_into(file, from, &mut kbuf, &mut |p| self
+                .stride_page(body, memo, p)),
+            Ok(Some(_))
+        ) {
+            out.end = ScanEnd::Fallback;
+            return out;
+        }
         for rank in from..from + want {
-            if rank > from {
-                body.step_key(&mut kbuf[..len]);
+            if rank > from
+                && body
+                    .step_key(file, rank, &mut kbuf[..len], &mut |p| {
+                        self.stride_page(body, memo, p)
+                    })
+                    .is_err()
+            {
+                out.end = ScanEnd::Fallback;
+                return out;
             }
             match body.values_at(file, rank, &mut |p| self.stride_page(body, memo, p)) {
                 StrideAt::Value(v) => f(&kbuf[..len], v),
@@ -5855,15 +5991,25 @@ impl ZFile {
     }
 
     /// `key_at_into` of a stride file: rank `rank`'s key rendered, none past
-    /// the run; no page is touched.
+    /// the run; no page is touched for a whole run, and a sparse form's
+    /// page of numbers is, a fallback where it fails its check.
     #[inline(never)]
-    fn stride_key_at_into(&self, body: &StrideBody, rank: usize, out: &mut Vec<u8>) -> ZRead {
+    fn stride_key_at_into(
+        &self,
+        body: &StrideBody,
+        memo: &ZMemo,
+        rank: usize,
+        out: &mut Vec<u8>,
+    ) -> ZRead {
         if self.damaged() {
             return ZRead::Out;
         }
         let mut kbuf = [0u8; STRIDE_KEY_MAX];
-        match body.key_at_into(rank as u64, &mut kbuf) {
-            Some(k) => {
+        let file = self.stride_bytes();
+        match body.key_at_into(file, rank as u64, &mut kbuf, &mut |p| {
+            self.stride_page(body, memo, p)
+        }) {
+            Ok(Some(k)) => {
                 out.clear();
                 out.extend_from_slice(k);
                 ZRead::Served {
@@ -5871,10 +6017,11 @@ impl ZFile {
                     decoded: false,
                 }
             }
-            None => ZRead::Served {
+            Ok(None) => ZRead::Served {
                 n: 0,
                 decoded: false,
             },
+            Err(_) => ZRead::Fallback,
         }
     }
 
@@ -5884,15 +6031,19 @@ impl ZFile {
     /// any other by counting the renderings below it -- with no page touched.
     /// `cut_in` is written over `seek` and answers through it.
     #[inline(never)]
-    fn stride_seek(&self, body: &StrideBody, key: &[u8]) -> ZSeek {
+    fn stride_seek(&self, body: &StrideBody, memo: &ZMemo, key: &[u8]) -> ZSeek {
         if self.damaged() {
             return ZSeek::Out;
         }
-        let (rank, at) = body.lower_bound(key);
-        ZSeek::Served {
-            rank: rank as usize,
-            at,
-            decoded: false,
+        let file = self.stride_bytes();
+        match body.lower_bound(file, key, &mut |p| self.stride_page(body, memo, p)) {
+            Ok((rank, at)) => ZSeek::Served {
+                rank: rank as usize,
+                at,
+                decoded: false,
+            },
+            // A sparse form's page of numbers failed its check.
+            Err(_) => ZSeek::Fallback,
         }
     }
 
@@ -5908,7 +6059,12 @@ impl ZFile {
         if self.damaged() {
             return None;
         }
-        let (rank, at) = body.lower_bound(key);
+        let file = self.stride_bytes();
+        // A sparse form's page of numbers that fails its check leaves the
+        // key no span the form can name, as a file out of service does.
+        let (rank, at) = body
+            .lower_bound(file, key, &mut |p| self.stride_page_uncounted(body, p))
+            .ok()?;
         let r = rank as usize;
         Some(if at == KeyOrder::Equal {
             (r, r + 1)
@@ -6355,6 +6511,13 @@ pub(super) struct ZEvents {
     /// (`ZEvents::declined`).
     pub stride_builds: AtomicU64,
     pub stride_declines: [AtomicU64; STRIDE_REASONS],
+    /// The stride files among `stride_builds` built in the sparse form, the
+    /// keys' numbers held beside the values
+    /// (`Options::zpages_stride_sparse`). What a store's other partitions
+    /// are priced by before they have a file of their own: a store whose
+    /// builds have been sparse ones is taken to be of such keys
+    /// (`Maint::z_stride_bytes`).
+    pub stride_sparse_builds: AtomicU64,
 }
 
 impl ZEvents {
@@ -6412,6 +6575,9 @@ impl ZEvents {
         ZEvents::add(&self.build_synced, u64::from(b.sync_us > 0));
         if b.coding == FileCoding::Stride {
             ZEvents::add(&self.stride_builds, 1);
+        }
+        if b.stride_sparse {
+            ZEvents::add(&self.stride_sparse_builds, 1);
         }
         if let Some(why) = b.stride_no {
             self.stride_declined(why);
@@ -6552,6 +6718,9 @@ pub(super) struct Built {
     /// knows, and not that a read of the device returns it -- a write the
     /// device misplaced or stored wrong is seen only by a read of it.
     pub stride_device: bool,
+    /// A stride file that holds its keys' numbers: the sparse form, of a
+    /// partition whose keys are numbers with gaps between them.
+    pub stride_sparse: bool,
     /// Whether the build wrote its output back and dropped it from the page
     /// cache as it went (`BuildPlan::drop_output`): the file is on the
     /// device alone, and whoever serves it at once asks for its pages
@@ -7186,6 +7355,12 @@ pub(super) struct BuildPlan {
     /// the form the partition it rewrites had (`ZStride::Chosen`,
     /// `Maint::z_stride_ask_finish`). `None` asks every partition.
     pub stride_spans: Option<KeySpans>,
+    /// Whether a build that asks for the stride form takes a partition
+    /// whose keys are numbers with gaps between them, in the sparse form,
+    /// and the hex kinds of key with it (`Options::zpages_stride_sparse`,
+    /// `stride_precheck`); off, such a partition is no run, as it was
+    /// before the form held any.
+    pub stride_sparse: bool,
     /// A test's: the stride form's file damaged once it is written and
     /// before it is read back, so that a check the reads go through is
     /// shown to refuse what it is for.
@@ -7221,6 +7396,7 @@ impl BuildPlan {
             stride: StrideAsk::No,
             stride_below: None,
             stride_spans: None,
+            stride_sparse: false,
             #[cfg(test)]
             damage: None,
             #[cfg(test)]
@@ -7390,18 +7566,20 @@ fn build_file_seen(
     let made = match ask {
         StrideAsk::No => block(seen),
         ask => {
-            let walked = match stride_precheck(&SegImages::new(recs, dir, nkeys)) {
-                Ok(sf) => write_stride(
-                    &file, base, recs, dir, nkeys, bind, &tmp, &facts, id, end_seq, &sf, plan, seen,
-                ),
-                // The two ends decide before the temporary name is this
-                // build's: asked for the stride form alone, their decline
-                // is the opening's and leaves the name alone, since a way
-                // out removes only a name its build opened, and the name is
-                // the partition's, which another build of it may hold.
-                Err(why) if ask == StrideAsk::Only => return Ok(Outcome::NotStride(why)),
-                Err(why) => Ok(Outcome::NotStride(why)),
-            };
+            let walked =
+                match stride_precheck(&SegImages::new(recs, dir, nkeys), plan.stride_sparse) {
+                    Ok(sf) => write_stride(
+                        &file, base, recs, dir, nkeys, bind, &tmp, &facts, id, end_seq, &sf, plan,
+                        seen,
+                    ),
+                    // The two ends decide before the temporary name is this
+                    // build's: asked for the stride form alone, their decline
+                    // is the opening's and leaves the name alone, since a way
+                    // out removes only a name its build opened, and the name is
+                    // the partition's, which another build of it may hold.
+                    Err(why) if ask == StrideAsk::Only => return Ok(Outcome::NotStride(why)),
+                    Err(why) => Ok(Outcome::NotStride(why)),
+                };
             match walked {
                 // A late decline: the block body is built in the same
                 // call, over records the walk left warm, under the same
@@ -7642,6 +7820,7 @@ fn write_pages(
         stride_no: None,
         stride_seal: None,
         stride_device: false,
+        stride_sparse: false,
         dropped: plan.drop_output,
     }))
 }
@@ -7671,14 +7850,23 @@ fn seg_ident_of(facts: &ZSource, id: u64, end_seq: u64) -> SegIdent {
 }
 
 /// What the stride form's precheck found of a partition from its two ends
-/// (`stride_precheck`): the keys' codec, the values' width, and the file's
-/// sizes.
+/// (`stride_precheck`): the keys' codec, the values' width, the file's
+/// sizes, and, for a run with gaps, the last key's number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct StrideFacts {
     pub codec: KeyCodec,
     pub w: u32,
     pub layout: StrideLayout,
+    /// The last key's number where the keys are numbers with gaps between
+    /// them and the form to write is the sparse one; `None` for a whole
+    /// run.
+    pub sparse_last: Option<u64>,
 }
+
+/// The keys from inside a partition a precheck reads to say which kind of
+/// number a run with gaps is of (`KeyCodec::detect_any`): at most this many,
+/// evenly spaced between the ends.
+const STRIDE_KIND_KEYS: usize = 8;
 
 /// Whether a partition's two ends, ranks 0 and `n - 1`, make a run the
 /// stride form holds, and its sizes where they do: both records one inline
@@ -7689,7 +7877,20 @@ pub(super) struct StrideFacts {
 /// which is the build's walk to check rank by rank; what it gives is the
 /// file's sizes, the trailer's own (`StrideTrailer::layout`), exact before
 /// anything past the two ends is read.
-pub(super) fn stride_precheck(images: &impl Images) -> std::result::Result<StrideFacts, StrideNo> {
+///
+/// With `sparse`, ends that bound more numbers than the partition has keys
+/// are a run with gaps, which the sparse form holds
+/// (`KeyCodec::detect_any`, over every kind): asked only where the ends
+/// make no whole run, so a partition the form took before is taken as it
+/// was, from its two ends. Which kind its numbers are of the ends alone do
+/// not say, so a few records from inside it are read for their keys
+/// (`STRIDE_KIND_KEYS`), each held to `stride_record` as the walk will
+/// hold it; the sizes are then the sparse layout's, exact as a whole
+/// run's are.
+pub(super) fn stride_precheck(
+    images: &impl Images,
+    sparse: bool,
+) -> std::result::Result<StrideFacts, StrideNo> {
     let n = images.records();
     let last = n.checked_sub(1).ok_or(StrideNo::NotShaped)?;
     let (k0, v0) = stride_record(images.image(0))?;
@@ -7701,13 +7902,38 @@ pub(super) fn stride_precheck(images: &impl Images) -> std::result::Result<Strid
     if vn.len() != v0.len() {
         return Err(StrideNo::Width);
     }
-    let codec = KeyCodec::detect(k0, kn, n as u64).map_err(|e| match e {
+    let no = |e| match e {
         KeyShapeNo::Holes => StrideNo::Holes,
         KeyShapeNo::Length | KeyShapeNo::Field => StrideNo::NotShaped,
-    })?;
+    };
+    let (codec, sparse_last) = match KeyCodec::detect(k0, kn, n as u64) {
+        Ok(codec) => (codec, None),
+        Err(e) if !sparse => return Err(no(e)),
+        Err(_) => {
+            let mut inside = [&b""[..]; STRIDE_KIND_KEYS];
+            let mut read = 0;
+            for i in 1..=STRIDE_KIND_KEYS {
+                let r = i * n / (STRIDE_KIND_KEYS + 1);
+                if r == 0 || r >= last || (i > 1 && r == (i - 1) * n / (STRIDE_KIND_KEYS + 1)) {
+                    continue;
+                }
+                inside[read] = stride_record(images.image(r))?.0;
+                read += 1;
+            }
+            match KeyCodec::detect_any(k0, kn, n as u64, &KEY_KINDS, &inside[..read]).map_err(no)? {
+                (codec, true) => (codec, None),
+                (codec, false) => {
+                    // The last key is one the codec just counted to.
+                    let last = codec.decode(kn).ok_or(StrideNo::NotShaped)?;
+                    (codec, Some(last))
+                }
+            }
+        }
+    };
     // The trailer's own sizes and the refusals they make, so that what a
     // precheck prices is what the writer can write: a key count past what
-    // a page index counts is no run the form holds.
+    // a page index counts is no run the form holds. A sparse form's sizes
+    // need none of the line's error, which the walk measures.
     let layout = StrideTrailer {
         codec,
         w,
@@ -7716,10 +7942,16 @@ pub(super) fn stride_precheck(images: &impl Images) -> std::result::Result<Strid
             nkeys: n as u64,
             ..SegIdent::default()
         },
+        sparse: sparse_last.map(|last| StrideSparse { last, eps: 0 }),
     }
     .layout()
     .map_err(|_| StrideNo::NotShaped)?;
-    Ok(StrideFacts { codec, w, layout })
+    Ok(StrideFacts {
+        codec,
+        w,
+        layout,
+        sparse_last,
+    })
 }
 
 /// A record as the stride form holds it -- its key and its one value --
@@ -7888,6 +8120,11 @@ fn write_stride(
     let (mut fill, mut p) = (0usize, 0u32);
     let (mut asked, mut asked_bytes, mut looked) = (0usize, 0u64, 0usize);
     let mut kbuf = [0u8; STRIDE_KEY_MAX];
+    // A sparse form's numbers, a word a rank, kept for the pages of them
+    // the file holds after its values, for the samples and for the line's
+    // error, which is a measure over all of them; nothing for a whole run.
+    let mut numbers: Vec<u64> =
+        Vec::with_capacity(if sf.sparse_last.is_some() { nkeys } else { 0 });
     for r in 0..nkeys {
         let at = rec_at(r);
         if r == 0 || at - looked >= plan.window {
@@ -7906,10 +8143,36 @@ fn write_stride(
             if value.len() != width {
                 return Err(StrideNo::Width);
             }
-            // Inside the run the precheck proved: `base + r` is within
-            // what the field holds.
-            let x = codec.base() + r as u64;
-            stride_key_is(&codec, key, x, codec.decode(key), &mut kbuf).map(|()| value)
+            let decoded = codec.decode(key);
+            let x = match sf.sparse_last {
+                // Inside the run the precheck proved: `base + r` is within
+                // what the field holds.
+                None => codec.base() + r as u64,
+                // A run with gaps: the key's own number, which the rule
+                // below holds its rendering to, above the number before
+                // it and, at the two ends, the numbers the precheck read
+                // there -- what makes the numbers the file holds the keys
+                // in their order, and the trailer's two ends theirs.
+                Some(last) => {
+                    let x = decoded.ok_or(StrideNo::NotShaped)?;
+                    let at_end = if r == 0 {
+                        x == codec.base()
+                    } else if r + 1 == nkeys {
+                        x == last
+                    } else {
+                        x < last
+                    };
+                    if !at_end || numbers.last().is_some_and(|&before| before >= x) {
+                        return Err(StrideNo::Holes);
+                    }
+                    x
+                }
+            };
+            stride_key_is(&codec, key, x, decoded, &mut kbuf)?;
+            if sf.sparse_last.is_some() {
+                numbers.push(x);
+            }
+            Ok(value)
         });
         let mut rest = match value {
             Ok(v) => v,
@@ -7941,6 +8204,36 @@ fn write_stride(
         lay.v_pages,
         "the value pages are the layout's"
     );
+    // A sparse form's numbers, a page of them at a time after the values,
+    // each page's word into the row as a value page's goes; then, after
+    // the row, the samples.
+    let sparse = sf.sparse_last.map(|last| StrideSparse {
+        last,
+        eps: stride_eps(&numbers),
+    });
+    if sparse.is_some() {
+        for chunk in numbers.chunks(ZPAGE / 8) {
+            page.fill(0);
+            for (slot, x) in page.as_chunks_mut::<8>().0.iter_mut().zip(chunk) {
+                *slot = x.to_le_bytes();
+            }
+            stride_page_out(&mut w, &mut row, &page, bind, &mut p)?;
+        }
+        debug_assert_eq!(
+            u64::from(p),
+            lay.row_pages(),
+            "the pages of numbers are the layout's"
+        );
+        row.resize(row.len().next_multiple_of(8), 0);
+        for x in numbers.iter().step_by(STRIDE_SAMPLE as usize) {
+            row.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    debug_assert_eq!(
+        row.len() as u64,
+        lay.res_len,
+        "the resident part is the layout's"
+    );
     let res_crc = stride_row_crc(&row, bind);
     w.push(&row)?;
     let pad = usize::try_from(lay.res_pages * ZPAGE as u64 - lay.res_len).unwrap_or(0);
@@ -7950,6 +8243,7 @@ fn write_stride(
         w: sf.w,
         res_crc,
         seg: seg_ident_of(facts, id, end_seq),
+        sparse,
     };
     let sealed = t
         .encode()
@@ -7999,7 +8293,7 @@ fn write_stride(
     }
     Ok(Outcome::Built(Built {
         fill: FillStats {
-            pages: lay.v_pages,
+            pages: lay.row_pages(),
             records: nkeys as u64,
             ..FillStats::default()
         },
@@ -8014,6 +8308,7 @@ fn write_stride(
         stride_no: None,
         stride_seal: trailer_crc(&sealed),
         stride_device: device,
+        stride_sparse: sparse.is_some(),
         dropped: plan.drop_output,
     }))
 }
@@ -8086,8 +8381,9 @@ fn check_stride(
     if same_segment(&body.trailer().seg_ident(), facts, id, end_seq).is_err() {
         return Ok(refused);
     }
-    let mut verified = vec![false; body.pages()];
+    let mut verified = vec![false; body.checked_pages()];
     let mut kbuf = [0u8; STRIDE_KEY_MAX];
+    let searched = body.sparse().is_some();
     for r in 0..images.records() {
         if !each(r) {
             return Ok(StrideCheck::Refused(Outcome::Cancelled));
@@ -8106,7 +8402,16 @@ fn check_stride(
         if body.values_at(bytes, rank, &mut good) != StrideAt::Value(value) {
             return Ok(refused);
         }
-        if body.key_at_into(rank, &mut kbuf) != Some(key) {
+        if body.key_at_into(bytes, rank, &mut kbuf, &mut good) != Ok(Some(key)) {
+            return Ok(refused);
+        }
+        // A sparse form's third quantity: the rank its search finds the
+        // key at. For a whole run that is the codec's inverse of the
+        // rendering the key leg holds; for a sparse one it is the samples
+        // and the line's error against the numbers, which nothing else
+        // reads and no reader can check short of this walk
+        // (`StrideSparse::eps`).
+        if searched && body.rank_of(bytes, key, &mut good) != Ok(Some(rank)) {
             return Ok(refused);
         }
     }
@@ -8128,6 +8433,10 @@ pub(super) struct StrideBody {
     layout: StrideLayout,
     bind: u32,
     row: Box<[u32]>,
+    /// A sparse form's samples, every `STRIDE_SAMPLE`th of its keys'
+    /// numbers, in the heap: what a key's search reads before any page.
+    /// None in a form whose keys are a whole run.
+    samples: Box<[u64]>,
 }
 
 /// What a stride body answers of a rank.
@@ -8178,37 +8487,71 @@ impl StrideBody {
         Ok((trailer, layout))
     }
 
-    /// The body over `file`, whose trailer and sizes `open` gave: the row's
-    /// CRC and the zeros after the row, and the row copied into the heap, a
-    /// word a value page.
+    /// The body over `file`, whose trailer and sizes `open` gave: the
+    /// resident part's CRC and the zeros after it, and the row copied into
+    /// the heap, a word a page it covers. A sparse form's samples follow
+    /// the row under the same CRC and are copied too, after the checks the
+    /// trailer alone lets a reader make of them: the first is the first
+    /// key's number, they ascend, and the last is no more than the last
+    /// key's -- what makes a search of them a search of an ordered list,
+    /// whatever the numbers' pages turn out to hold when they are read
+    /// (`StrideBody::page_ok`).
     pub(super) fn with_row(
         file: &[u8],
         trailer: StrideTrailer,
         layout: StrideLayout,
     ) -> std::result::Result<StrideBody, ZError> {
         let bind = trailer.bind32();
-        // Inside a file of the layout's length: the row and its padding lie
-        // before the trailer.
+        // Inside a file of the layout's length: the resident part and its
+        // padding lie before the trailer.
         let at = layout.res_off as usize;
-        let row = &file[at..at + layout.res_len as usize];
-        if stride_row_crc(row, bind) != trailer.res_crc {
+        let res = &file[at..at + layout.res_len as usize];
+        if stride_row_crc(res, bind) != trailer.res_crc {
             return Err(ZError::ResidentCrc);
         }
-        let pad = &file[at + row.len()..at + (layout.res_pages as usize) * ZPAGE];
+        let pad = &file[at + res.len()..at + (layout.res_pages as usize) * ZPAGE];
         if pad.iter().any(|&b| b != 0) {
             return Err(ZError::Resident("a byte after the row is not zero"));
         }
-        let row = row
+        let row_len = layout.row_len() as usize;
+        let row = res[..row_len]
             .as_chunks::<4>()
             .0
             .iter()
             .map(|w| u32::from_le_bytes(*w))
             .collect();
+        let samples: Box<[u64]> = match trailer.sparse {
+            None => Box::default(),
+            Some(sp) => {
+                let from = (layout.samples_off() - layout.res_off) as usize;
+                if res[row_len..from].iter().any(|&b| b != 0) {
+                    return Err(ZError::Resident(
+                        "a byte between the row and the samples is not zero",
+                    ));
+                }
+                let samples: Box<[u64]> = res[from..]
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|w| u64::from_le_bytes(*w))
+                    .collect();
+                if samples.first() != Some(&trailer.codec.base())
+                    || samples.windows(2).any(|w| w[0] >= w[1])
+                    || samples.last().is_some_and(|&x| x > sp.last)
+                {
+                    return Err(ZError::Resident(
+                        "the samples are not the first number ascending to the last",
+                    ));
+                }
+                samples
+            }
+        };
         Ok(StrideBody {
             trailer,
             layout,
             bind,
             row,
+            samples,
         })
     }
 
@@ -8227,6 +8570,29 @@ impl StrideBody {
         self.layout.v_pages as usize
     }
 
+    /// The pages the row has a word for, which a reader keeps a verified
+    /// bit each for: the value pages, and a sparse form's pages of numbers
+    /// after them.
+    pub(super) fn checked_pages(&self) -> usize {
+        self.layout.row_pages() as usize
+    }
+
+    /// What a sparse form holds of its keys, or `None` for a form whose
+    /// keys are a whole run.
+    pub(super) fn sparse(&self) -> Option<StrideSparse> {
+        self.trailer.sparse
+    }
+
+    /// The bytes a read by key touches a page of beside the value's: a
+    /// sparse form's numbers, none in a form whose keys are a whole run.
+    pub(super) fn number_bytes(&self) -> u64 {
+        if self.trailer.sparse.is_some() {
+            self.keys() * 8
+        } else {
+            0
+        }
+    }
+
     /// The values' bytes, `n * W`: what the file holds of the records, the
     /// stride form's counterpart of the block form's decoded group bytes.
     pub(super) fn value_bytes(&self) -> u64 {
@@ -8236,7 +8602,7 @@ impl StrideBody {
     /// The heap a reader holds of the body: the row, a word a value page,
     /// and the body itself, the trailer among it.
     pub(super) fn heap_bytes(&self) -> usize {
-        self.row.len() * 4 + std::mem::size_of::<StrideBody>()
+        self.row.len() * 4 + self.samples.len() * 8 + std::mem::size_of::<StrideBody>()
     }
 
     /// The rank whose slot value page `p` holds the start of, or, where no
@@ -8257,11 +8623,37 @@ impl StrideBody {
         }
     }
 
-    /// Where `key` falls in the run (`KeyCodec::lower_bound`): the rank of
-    /// the first key at or after it and how that key compares, the key
-    /// count with `Greater` past them all.
-    pub(super) fn lower_bound(&self, key: &[u8]) -> (u64, KeyOrder) {
-        self.trailer.codec.lower_bound(key, self.keys())
+    /// Where `key` falls in the run: the rank of the first key at or after
+    /// it and how that key compares, the key count with `Greater` past
+    /// them all. By arithmetic for a whole run (`KeyCodec::lower_bound`),
+    /// no page touched; by a search of a sparse form's numbers for the
+    /// key's place among the field's (`KeyCodec::at_or_after`,
+    /// `StrideBody::search`), whose pages are held to `good` first, the
+    /// page that failed the answer where one does.
+    pub(super) fn lower_bound(
+        &self,
+        file: &[u8],
+        key: &[u8],
+        good: &mut dyn FnMut(u32) -> bool,
+    ) -> std::result::Result<(u64, KeyOrder), u32> {
+        let n = self.keys();
+        if self.trailer.sparse.is_none() {
+            return Ok(self.trailer.codec.lower_bound(key, n));
+        }
+        let (at, exact) = self.trailer.codec.at_or_after(key);
+        // Past every number the field holds: past every key.
+        let Ok(x) = u64::try_from(at) else {
+            return Ok((n, KeyOrder::Greater));
+        };
+        let (rank, found) = self.search(file, x, good)?;
+        Ok((
+            rank,
+            if exact && found {
+                KeyOrder::Equal
+            } else {
+                KeyOrder::Greater
+            },
+        ))
     }
 
     /// The codec the run's keys are rendered by.
@@ -8269,50 +8661,217 @@ impl StrideBody {
         &self.trailer.codec
     }
 
-    /// Whether value page `p` of `file` is the page the row says.
+    /// Whether page `p` of `file` is the page the row says, and, for a
+    /// page of a sparse form's numbers, a page a search may read: its
+    /// numbers ascend, each rank of it that is a sample is that sample,
+    /// the form's first number is the codec's base and its last the
+    /// trailer's, and nothing follows the last. The CRC alone would let a
+    /// file whose samples and numbers disagree, each under a good
+    /// checksum, send a key's search to a run the key is not in and answer
+    /// it absent; held to each other at a page's first touch, a search
+    /// that reads a run reads the one its samples name.
     pub(super) fn page_ok(&self, file: &[u8], p: u32) -> bool {
         let at = p as usize * ZPAGE;
-        match (file.get(at..at + ZPAGE), self.row.get(p as usize)) {
-            (Some(page), Some(&word)) => stride_page_crc(page, self.bind, p) == word,
-            _ => false,
+        let page = match (file.get(at..at + ZPAGE), self.row.get(p as usize)) {
+            (Some(page), Some(&word)) if stride_page_crc(page, self.bind, p) == word => page,
+            _ => return false,
+        };
+        let Some(sp) = self.trailer.sparse else {
+            return true;
+        };
+        let Some(k) = u64::from(p).checked_sub(self.layout.v_pages) else {
+            return true;
+        };
+        let per = (ZPAGE / 8) as u64;
+        let (first, n) = (k * per, self.keys());
+        let held = per.min(n.saturating_sub(first)) as usize;
+        let words = page.as_chunks::<8>().0;
+        let number = |i: usize| u64::from_le_bytes(words[i]);
+        if held == 0 || (1..held).any(|i| number(i - 1) >= number(i)) {
+            return false;
         }
+        if words[held..].iter().any(|w| *w != [0u8; 8]) {
+            return false;
+        }
+        if first == 0 && number(0) != self.trailer.codec.base() {
+            return false;
+        }
+        if first + held as u64 == n && number(held - 1) != sp.last {
+            return false;
+        }
+        let step = STRIDE_SAMPLE as usize;
+        (0..held)
+            .step_by(step)
+            .all(|i| self.samples.get((first as usize + i) / step) == Some(&number(i)))
     }
 
-    /// The rank `key` is at: its number, where it is a key the codec
-    /// renders, less the run's first, inside the run. Nothing else is: the
-    /// build proved every key of the run shaped and the run whole, so a key
-    /// this answers `None` for is absent, a fact of the run.
-    pub(super) fn rank_of(&self, key: &[u8]) -> Option<u64> {
+    /// Rank `rank`'s number in a sparse form's `file`, its page held to
+    /// `good` first: `Err` with the page where that fails.
+    #[inline]
+    fn number_at(
+        &self,
+        file: &[u8],
+        rank: u64,
+        good: &mut dyn FnMut(u32) -> bool,
+    ) -> std::result::Result<u64, u32> {
+        let at = self.layout.k_off() + rank * 8;
+        let p = (at / ZPAGE as u64) as u32;
+        if !good(p) {
+            return Err(p);
+        }
+        let at = at as usize;
+        Ok(u64::from_le_bytes(
+            file[at..at + 8].try_into().expect("eight bytes of a page"),
+        ))
+    }
+
+    /// Where number `x` falls among a sparse form's numbers: the rank of
+    /// the first at or after it, and whether that number is `x`; the key
+    /// count past them all. The samples say which run of `STRIDE_SAMPLE`
+    /// numbers to read -- the last sample at or below `x`, looked for
+    /// within the line's error of where the line puts `x`
+    /// (`stride_line`, `StrideSparse::eps`) and, where the samples there do
+    /// not bracket `x`, among them all, so the error the trailer records
+    /// bounds a search's cost and never its answer -- and the run is one
+    /// page's, asked for whole and searched. A run is inside one page of
+    /// numbers, a page holding a whole count of them, and the page's check
+    /// held its numbers ascending and its samples the samples
+    /// (`StrideBody::page_ok`); so a number found is the key's, and one not
+    /// found below a later number of the run is absent. Where `x` is above
+    /// the whole run, the next run's first number bounds it, which the
+    /// samples say is above `x`: that number is read where it lies, on
+    /// this page or the next, so that the bound too is the file's numbers'
+    /// and not the samples' word alone.
+    fn search(
+        &self,
+        file: &[u8],
+        x: u64,
+        good: &mut dyn FnMut(u32) -> bool,
+    ) -> std::result::Result<(u64, bool), u32> {
+        let n = self.keys();
+        let (Some(sp), base) = (self.trailer.sparse, self.trailer.codec.base()) else {
+            return Ok((n, false));
+        };
+        if x <= base {
+            return Ok((0, x == base));
+        }
+        if x > sp.last {
+            return Ok((n, false));
+        }
+        let samples = &self.samples[..];
+        let m = samples.len();
+        let reach = sp.eps as usize + 1;
+        let g = stride_line(base, sp.last, m as u64, x) as usize;
+        let (a, z) = (g.saturating_sub(reach).min(m - 1), (g + reach + 1).min(m));
+        let mut s = a + samples[a..z].partition_point(|&v| v <= x);
+        // The window brackets `x` where the sample before the answer is at
+        // or below it and the one at the answer is above it or the end.
+        if (s == a && a > 0) || (s == z && z < m && samples[z] <= x) {
+            s = samples.partition_point(|&v| v <= x);
+        }
+        // `x` is above the first sample, the base.
+        let s = (s - 1) as u64;
+        let lo = s * STRIDE_SAMPLE;
+        let len = STRIDE_SAMPLE.min(n - lo) as usize;
+        let at = (self.layout.k_off() + lo * 8) as usize;
+        let p = (at / ZPAGE) as u32;
+        if !good(p) {
+            return Err(p);
+        }
+        let run = file[at..at + len * 8].as_chunks::<8>().0;
+        prefetch_run(run);
+        let i = run.partition_point(|w| u64::from_le_bytes(*w) < x);
+        if i < len {
+            return Ok((lo + i as u64, u64::from_le_bytes(run[i]) == x));
+        }
+        // Above the whole run, which is not the last: `x` is no more than
+        // the last number, and the last run holds it. The next run's first
+        // number is the bound.
+        let next = lo + len as u64;
+        if next >= n || self.number_at(file, next, good)? <= x {
+            // A run the samples sent `x` to that the numbers do not hold it
+            // in: the file's two accounts of its keys disagree.
+            return Err(p);
+        }
+        Ok((next, false))
+    }
+
+    /// The rank `key` is at, or `None` for a key the form does not hold:
+    /// for a whole run its number, where it is a key the codec renders,
+    /// less the run's first, inside the run -- nothing else is a key of
+    /// it, the build having proved every key shaped and the run whole, and
+    /// no page is touched; for a sparse form the rank its number is found
+    /// at (`StrideBody::search`), `Err` with the page of numbers that
+    /// failed `good`.
+    pub(super) fn rank_of(
+        &self,
+        file: &[u8],
+        key: &[u8],
+        good: &mut dyn FnMut(u32) -> bool,
+    ) -> std::result::Result<Option<u64>, u32> {
         let c = &self.trailer.codec;
-        let r = c.decode(key)?.checked_sub(c.base())?;
-        (r < self.keys()).then_some(r)
+        let Some(x) = c.decode(key) else {
+            return Ok(None);
+        };
+        if self.trailer.sparse.is_none() {
+            return Ok(x.checked_sub(c.base()).filter(|&r| r < self.keys()));
+        }
+        Ok(match self.search(file, x, good)? {
+            (rank, true) => Some(rank),
+            (_, false) => None,
+        })
     }
 
-    /// Rank `rank`'s key, rendered into `buf`; no page is touched.
+    /// Rank `rank`'s key, rendered into `buf`, or `None` past the run: its
+    /// number the run's first and the rank for a whole run, no page
+    /// touched, and the number a sparse form holds at the rank, `Err`
+    /// with its page where that fails `good`.
     pub(super) fn key_at_into<'b>(
         &self,
+        file: &[u8],
         rank: u64,
         buf: &'b mut [u8; STRIDE_KEY_MAX],
-    ) -> Option<&'b [u8]> {
+        good: &mut dyn FnMut(u32) -> bool,
+    ) -> std::result::Result<Option<&'b [u8]>, u32> {
         if rank >= self.keys() {
-            return None;
+            return Ok(None);
         }
         let c = &self.trailer.codec;
-        Some(c.render(c.base() + rank, buf))
+        let x = if self.trailer.sparse.is_some() {
+            self.number_at(file, rank, good)?
+        } else {
+            c.base() + rank
+        };
+        Ok(Some(c.render(x, buf)))
     }
 
-    /// A rank's key, rendered, moved to the next rank's in place
-    /// (`KeyCodec::increment`): the one step a walk makes from a key it
+    /// A rank's key, rendered, moved to the key of `next`, the rank after
+    /// it and inside the run: the one step a walk makes from a key it
     /// rendered once, the file's (`ZFile::stride_scan`) and a cursor's
-    /// (`ZCursor::stride_walk`), each for a rank below the run's last, whose
-    /// next the field holds, since the run is one the codec holds whole
-    /// (`KeyCodec::holds`).
-    pub(super) fn step_key(&self, key: &mut [u8]) {
+    /// (`ZCursor::stride_walk`). In place for a whole run
+    /// (`KeyCodec::increment`), whose next number the field holds, the run
+    /// being one the codec holds whole (`KeyCodec::holds`); rendered from
+    /// the number a sparse form holds at `next`, `Err` with its page where
+    /// that fails `good` and the key left as it was.
+    pub(super) fn step_key(
+        &self,
+        file: &[u8],
+        next: u64,
+        key: &mut [u8],
+        good: &mut dyn FnMut(u32) -> bool,
+    ) -> std::result::Result<(), u32> {
+        if self.trailer.sparse.is_some() {
+            let x = self.number_at(file, next, good)?;
+            let mut buf = [0u8; STRIDE_KEY_MAX];
+            key.copy_from_slice(self.trailer.codec.render(x, &mut buf));
+            return Ok(());
+        }
         let stepped = self.trailer.codec.increment(key);
         debug_assert!(
             stepped,
             "a walk inside the run never passes the field's top"
         );
+        Ok(())
     }
 
     /// Rank `rank`'s value in `file`, every page of its slot -- one, or two
@@ -8362,8 +8921,10 @@ impl StrideBody {
         good: &mut dyn FnMut(u32) -> bool,
         f: &mut dyn FnMut(&[u8]),
     ) -> StrideRead {
-        let Some(rank) = self.rank_of(key) else {
-            return StrideRead::Served(0);
+        let rank = match self.rank_of(file, key, good) {
+            Ok(Some(rank)) => rank,
+            Ok(None) => return StrideRead::Served(0),
+            Err(p) => return StrideRead::Bad(p),
         };
         match self.values_at(file, rank, good) {
             StrideAt::Value(v) => {
@@ -8374,6 +8935,14 @@ impl StrideBody {
             StrideAt::Bad(p) => StrideRead::Bad(p),
         }
     }
+}
+
+/// A run of a sparse stride form's numbers asked of the cache together,
+/// before its search: eight lines at the sample stride, one wait where a
+/// search's probes would each wait in turn (`prefetch_lines`).
+#[inline]
+fn prefetch_run(run: &[[u8; 8]]) {
+    super::prefetch_lines(run.as_ptr().cast(), run.len() * 8);
 }
 
 /// A build run on this thread with its wall, the thread's CPU and its major
@@ -9380,7 +9949,7 @@ mod tests {
             "{a} {proc_majflt} {b}"
         );
     }
-    use crate::db::zpages::ZHDR;
+    use crate::db::zpages::{KeyKind, ZHDR};
     use crate::db::{SegmentOptions, SegmentWriter};
     use std::os::unix::fs::FileExt;
     use std::path::PathBuf;
@@ -11827,6 +12396,7 @@ mod tests {
                 w: 100,
                 res_crc: 0,
                 seg,
+                sparse: None,
             };
             StrideTrailer::decode(&t.encode().unwrap())
                 .unwrap()
@@ -14010,10 +14580,71 @@ mod tests {
         }
     }
 
-    /// The precheck over a fixture's records, as a build makes it.
+    /// The precheck over a fixture's records, as a build makes it where
+    /// its plan takes no run with gaps.
     fn precheck_of(fx: &Fixture) -> std::result::Result<StrideFacts, StrideNo> {
         let (recs, dir) = fx.blob.record_regions().unwrap();
-        stride_precheck(&SegImages::new(recs, dir, fx.blob.keys()))
+        stride_precheck(&SegImages::new(recs, dir, fx.blob.keys()), false)
+    }
+
+    /// The precheck as a build makes it where its plan takes one
+    /// (`BuildPlan::stride_sparse`).
+    fn precheck_sparse_of(fx: &Fixture) -> std::result::Result<StrideFacts, StrideNo> {
+        let (recs, dir) = fx.blob.record_regions().unwrap();
+        stride_precheck(&SegImages::new(recs, dir, fx.blob.keys()), true)
+    }
+
+    /// `stride_plan` taking a run with gaps, in the sparse form.
+    fn sparse_plan(ask: StrideAsk) -> BuildPlan {
+        BuildPlan {
+            stride_sparse: true,
+            ..stride_plan(ask)
+        }
+    }
+
+    /// `n` keys of `k` and six digits whose numbers ascend from `start` by
+    /// steps of one to seven, so that runs of neighbours and gaps of every
+    /// width under eight both occur, each with one value of `w` bytes.
+    fn gapped_recs(start: usize, n: usize, w: usize, seed: u64) -> Vec<Rec> {
+        let mut rng = Rng(seed | 1);
+        let mut x = start;
+        (0..n)
+            .map(|i| {
+                if i > 0 {
+                    x += 1 + rng.below(7);
+                }
+                (format!("k{x:06}").into_bytes(), vec![rng.bytes(w)], false)
+            })
+            .collect()
+    }
+
+    /// `n` keys of sixteen hex digits, the letters of one case, of distinct
+    /// random 64-bit ids in their order, each with one value of `w` bytes:
+    /// what a store of random ids holds in a partition.
+    fn id_recs(n: usize, w: usize, seed: u64, upper: bool) -> Vec<Rec> {
+        let mut rng = Rng(seed | 1);
+        let mut ids: Vec<u64> = (0..n).map(|_| rng.word()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter()
+            .map(|id| {
+                let key = if upper {
+                    format!("{id:016X}")
+                } else {
+                    format!("{id:016x}")
+                };
+                (key.into_bytes(), vec![rng.bytes(w)], false)
+            })
+            .collect()
+    }
+
+    /// The numbers a stride file holds its keys by, in rank order, as the
+    /// fixture's keys decode under the file's codec.
+    fn numbers_of(body: &StrideBody, fx: &Fixture) -> Vec<u64> {
+        fx.recs
+            .iter()
+            .map(|(k, _, _)| body.codec().decode(k).expect("a key of the run"))
+            .collect()
     }
 
     /// The stride file a fixture built, held to the fixture's records and to
@@ -14041,11 +14672,20 @@ mod tests {
                 "rank {r}"
             );
             assert_eq!(
-                body.key_at_into(rank, &mut kbuf),
-                Some(&key[..]),
+                body.key_at_into(&bytes, rank, &mut kbuf, &mut good),
+                Ok(Some(&key[..])),
                 "rank {r}"
             );
-            assert_eq!(body.rank_of(key), Some(rank), "rank {r}");
+            assert_eq!(
+                body.rank_of(&bytes, key, &mut good),
+                Ok(Some(rank)),
+                "rank {r}"
+            );
+            assert_eq!(
+                body.lower_bound(&bytes, key, &mut good),
+                Ok((rank, KeyOrder::Equal)),
+                "rank {r}"
+            );
             let mut got = Vec::new();
             assert_eq!(
                 body.read_all(&bytes, key, &mut good, &mut |v| got.push(v.to_vec())),
@@ -14057,7 +14697,7 @@ mod tests {
         }
         let n = body.keys();
         assert_eq!(body.values_at(&bytes, n, &mut good), StrideAt::Absent);
-        assert_eq!(body.key_at_into(n, &mut kbuf), None);
+        assert_eq!(body.key_at_into(&bytes, n, &mut kbuf, &mut good), Ok(None));
         let (first, last) = (&fx.recs[0].0, &fx.recs[fx.recs.len() - 1].0);
         let codec = body.trailer().codec;
         let mut beside = vec![
@@ -14069,11 +14709,43 @@ mod tests {
         if let Some(below) = codec.base().checked_sub(1) {
             beside.push(codec.render(below, &mut kbuf).to_vec());
         }
-        if codec.holds(n + 1) {
-            beside.push(codec.render(codec.base() + n, &mut kbuf).to_vec());
+        // The number after the last key's, where the field holds one; and,
+        // for a run with gaps, every number in a gap next to a key's, each
+        // a key the codec renders and the form does not hold.
+        let numbers = numbers_of(&body, fx);
+        let top = numbers[numbers.len() - 1];
+        assert_eq!(
+            body.sparse().map(|sp| sp.last),
+            body.sparse().map(|_| top),
+            "a sparse form's last number is its last key's"
+        );
+        if body.sparse().is_none() {
+            assert_eq!(
+                top,
+                codec.base() + n - 1,
+                "a whole run's numbers are its ranks"
+            );
         }
+        if top < codec.top() {
+            beside.push(codec.render(top + 1, &mut kbuf).to_vec());
+        }
+        for pair in numbers.windows(2) {
+            if pair[1] - pair[0] > 1 {
+                beside.push(codec.render(pair[0] + 1, &mut kbuf).to_vec());
+                beside.push(codec.render(pair[1] - 1, &mut kbuf).to_vec());
+            }
+        }
+        let sorted: Vec<&[u8]> = fx.recs.iter().map(|r| r.0.as_slice()).collect();
         for k in &beside {
-            assert_eq!(body.rank_of(k), None, "{k:?}");
+            assert_eq!(body.rank_of(&bytes, k, &mut good), Ok(None), "{k:?}");
+            assert_eq!(
+                body.lower_bound(&bytes, k, &mut good),
+                Ok((
+                    sorted.partition_point(|s| *s < k.as_slice()) as u64,
+                    KeyOrder::Greater
+                )),
+                "{k:?}"
+            );
             assert_eq!(
                 body.read_all(&bytes, k, &mut good, &mut |_| panic!("a value for {k:?}")),
                 StrideRead::Served(0),
@@ -14227,6 +14899,183 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A fixture's sparse stride file, built under `StrideAsk::OrBlock` by a
+    /// plan that takes a run with gaps.
+    fn sparse_built(fx: &Fixture) -> Built {
+        let _ = std::fs::remove_file(&fx.out);
+        let made = build(&fx.seg, &fx.out, ID, END, &sparse_plan(StrideAsk::OrBlock)).unwrap();
+        match made {
+            Outcome::Built(b) if b.coding == FileCoding::Stride => b,
+            other => panic!("not a stride file: {other:?}"),
+        }
+    }
+
+    /// Runs with gaps, of each kind of key and at each edge of the form's
+    /// own layout: decimal numbers with holes, random ids of sixteen hex
+    /// digits of either case, a big-endian field, values of one byte, of a
+    /// hundred and of a page, two keys, and counts on either side of a
+    /// sample's sixty-four numbers and of a page's five hundred and twelve.
+    fn gapped_cases() -> Vec<(&'static str, Vec<Rec>, KeyKind)> {
+        let mut rng = Rng(0x5a55);
+        let mut x = 0x0102_0304_0506_0000u64;
+        let be: Vec<Rec> = (0..900)
+            .map(|_| {
+                x += 1 + rng.word() % 300;
+                let key = [b"be".as_slice(), &x.to_be_bytes()].concat();
+                (key, vec![rng.bytes(100)], false)
+            })
+            .collect();
+        let two = vec![
+            (b"k000001".to_vec(), vec![rng.bytes(100)], false),
+            (b"k000008".to_vec(), vec![rng.bytes(100)], false),
+        ];
+        let (dec, hexl, hexu) = (KeyKind::Decimal, KeyKind::HexLower, KeyKind::HexUpper);
+        vec![
+            ("gap-w100", gapped_recs(3, 3000, 100, 1), dec),
+            ("gap-w1", gapped_recs(0, 5000, 1, 2), dec),
+            ("gap-w4096", gapped_recs(7, 40, 4096, 3), dec),
+            ("two", two, dec),
+            ("ids", id_recs(3000, 100, 4, false), hexl),
+            ("IDS", id_recs(700, 100, 5, true), hexu),
+            ("ids-63", id_recs(63, 100, 6, false), hexl),
+            ("ids-64", id_recs(64, 100, 7, false), hexl),
+            ("ids-65", id_recs(65, 100, 8, false), hexl),
+            ("ids-511", id_recs(511, 100, 9, false), hexl),
+            ("ids-512", id_recs(512, 100, 10, false), hexl),
+            ("ids-513", id_recs(513, 100, 11, false), hexl),
+            ("be-gaps", be, KeyKind::BigEndian),
+        ]
+    }
+
+    /// A partition whose keys are numbers with gaps between them is no run
+    /// to a plan that takes none -- the reason named and nothing on disk
+    /// asked for the stride form alone, the block file with the reason
+    /// beside it asked for either -- and is built in the sparse stride form
+    /// by a plan that takes one, under either ask: the precheck's sizes the
+    /// file's to the byte, the codec the kind its keys are of, the numbers
+    /// the file holds its keys' in rank order, the samples every
+    /// sixty-fourth of them, the line's error the measure over them, and
+    /// every rank read back through the reader's body and through the file a
+    /// store attaches.
+    #[test]
+    fn a_run_with_gaps_is_built_in_the_sparse_form_only_where_the_plan_takes_one() {
+        for (name, recs, kind) in gapped_cases() {
+            let fx = Fixture::new(&format!("sparse-{name}"), recs, 1 << 16);
+            // A plan that takes no run with gaps.
+            let why = precheck_of(&fx).expect_err("a run with gaps is no whole run");
+            assert!(
+                matches!(why, StrideNo::Holes | StrideNo::NotShaped),
+                "{name}: {why:?}"
+            );
+            let _ = std::fs::remove_file(&fx.out);
+            let made = build(&fx.seg, &fx.out, ID, END, &stride_plan(StrideAsk::Only)).unwrap();
+            assert!(
+                matches!(made, Outcome::NotStride(w) if w == why),
+                "{name}: {made:?}"
+            );
+            assert!(!fx.out.exists() && !tmp_of(&fx.out).exists(), "{name}");
+            let made = build(&fx.seg, &fx.out, ID, END, &stride_plan(StrideAsk::OrBlock)).unwrap();
+            match made {
+                Outcome::Built(b) => assert_eq!(
+                    (b.coding, b.stride_no),
+                    (FileCoding::Block, Some(why)),
+                    "{name}"
+                ),
+                // The block form's own decline of a partition that small.
+                Outcome::Declined(_) => assert!(fx.recs.len() < 100, "{name}"),
+                other => panic!("{name}: {other:?}"),
+            }
+            if fx.out.exists() {
+                let zfile = fx.attach().expect("the block file attaches");
+                assert!(!zfile.is_stride(), "{name}");
+                agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
+            }
+            // A plan that takes one.
+            let facts = precheck_sparse_of(&fx).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!(facts.codec.kind(), kind, "{name}");
+            let last_key = &fx.recs[fx.recs.len() - 1].0;
+            assert_eq!(facts.sparse_last, facts.codec.decode(last_key), "{name}");
+            assert!(facts.sparse_last.is_some(), "{name}");
+            for ask in [StrideAsk::Only, StrideAsk::OrBlock] {
+                let _ = std::fs::remove_file(&fx.out);
+                let cell = AtomicU8::new(StrideNo::SelfCheck.code());
+                let made = build(&fx.seg, &fx.out, ID, END, &sparse_plan(ask)).unwrap();
+                made.note_stride(&cell);
+                let Outcome::Built(b) = made else {
+                    panic!("{name} {ask:?}: {made:?}")
+                };
+                assert_eq!(
+                    (b.coding, b.stride_no),
+                    (FileCoding::Stride, None),
+                    "{name}"
+                );
+                assert_eq!(
+                    b.file_bytes, facts.layout.file_len,
+                    "{name}: the precheck's sizes are the file's"
+                );
+                assert_eq!(std::fs::metadata(&fx.out).unwrap().len(), b.file_bytes);
+                assert!(!tmp_of(&fx.out).exists(), "{name}");
+                assert_eq!(cell.load(Ordering::Relaxed), 0, "{name}: no reason");
+                let body = stride_agrees(&fx);
+                assert_eq!(
+                    (body.trailer().codec, body.trailer().w),
+                    (facts.codec, facts.w),
+                    "{name}"
+                );
+                // The file's own account of its keys, from its bytes: the
+                // numbers after the values, the samples after the row.
+                let bytes = std::fs::read(&fx.out).unwrap();
+                let numbers = numbers_of(&body, &fx);
+                let lay = facts.layout;
+                let words = |at: u64, n: usize| -> Vec<u64> {
+                    bytes[at as usize..at as usize + 8 * n]
+                        .chunks_exact(8)
+                        .map(|w| u64::from_le_bytes(w.try_into().unwrap()))
+                        .collect()
+                };
+                assert_eq!(words(lay.k_off(), numbers.len()), numbers, "{name}");
+                assert!(
+                    bytes[lay.k_off() as usize + 8 * numbers.len()..lay.res_off as usize]
+                        .iter()
+                        .all(|&b| b == 0),
+                    "{name}: zeros past the last number"
+                );
+                let samples: Vec<u64> = numbers.iter().step_by(64).copied().collect();
+                assert_eq!(lay.samples, samples.len() as u64, "{name}");
+                assert_eq!(words(lay.samples_off(), samples.len()), samples, "{name}");
+                assert_eq!(
+                    body.sparse(),
+                    Some(StrideSparse {
+                        last: numbers[numbers.len() - 1],
+                        eps: stride_eps(&numbers),
+                    }),
+                    "{name}"
+                );
+                assert_eq!(body.number_bytes(), 8 * numbers.len() as u64, "{name}");
+                assert_eq!(
+                    body.checked_pages() as u64,
+                    lay.v_pages + lay.k_pages,
+                    "{name}"
+                );
+                // And through the file a store attaches.
+                let zfile = fx.attach().unwrap_or_else(|e| panic!("{name}: {e:?}"));
+                assert!(zfile.is_stride(), "{name}");
+                agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
+                assert!(!zfile.damaged() && zfile.bad_pages() == 0, "{name}");
+            }
+            // A whole run is built as it was by a plan that takes a run
+            // with gaps too: no number held.
+        }
+        let fx = Fixture::new("sparse-whole", stride_recs(700, 100, 12), 1 << 16);
+        assert_eq!(precheck_sparse_of(&fx), precheck_of(&fx));
+        let whole = sparse_built(&fx);
+        let sparse_bytes = std::fs::read(&fx.out).unwrap();
+        assert!(stride_agrees(&fx).sparse().is_none());
+        let plain = stride_built(&fx);
+        assert_eq!(whole.file_bytes, plain.file_bytes);
+        assert_eq!(std::fs::read(&fx.out).unwrap(), sparse_bytes);
     }
 
     /// Each state a partition can be in that the stride form does not hold,
@@ -15262,27 +16111,41 @@ mod tests {
         // The last key ...ffff: the run's common prefix is the six bytes
         // before the field, so the field is two bytes and its top is it.
         let be_top = be_from(0x0102_0304_0506_fe80, 384, &mut rng);
-        let cases = [
-            ("w1", stride_recs(5000, 1, 11)),
-            ("w100", stride_recs(3000, 100, 12)),
-            ("w3000", stride_recs(30, 3000, 13)),
-            ("w4095", stride_recs(40, 4095, 14)),
-            ("w4096", stride_recs(40, 4096, 15)),
-            ("one", stride_recs(1, 100, 16)),
-            ("be", be),
-            ("from997", stride_recs_from(997, 1200, 100, 17)),
-            ("carry", stride_recs_from(990, 20, 100, 18)),
-            ("be-carry", be_carry),
+        let mut cases = vec![
+            ("w1", stride_recs(5000, 1, 11), false),
+            ("w100", stride_recs(3000, 100, 12), false),
+            ("w3000", stride_recs(30, 3000, 13), false),
+            ("w4095", stride_recs(40, 4095, 14), false),
+            ("w4096", stride_recs(40, 4096, 15), false),
+            ("one", stride_recs(1, 100, 16), false),
+            ("be", be, false),
+            ("from997", stride_recs_from(997, 1200, 100, 17), false),
+            ("carry", stride_recs_from(990, 20, 100, 18), false),
+            ("be-carry", be_carry, false),
             // k998500 to k999999: the common prefix `k99`, a field of four
             // digits from 8500, and the last key its top.
-            ("top", stride_recs_from(998_500, 1500, 100, 19)),
-            ("be-top", be_top),
+            ("top", stride_recs_from(998_500, 1500, 100, 19), false),
+            ("be-top", be_top, false),
         ];
-        for (name, recs) in cases {
+        // The same reads of sparse files: runs with gaps of each kind of
+        // key (`gapped_cases`), and one whose last key is its field's top,
+        // k999999 behind the prefix the run shares.
+        for (name, recs, _) in gapped_cases() {
+            cases.push((name, recs, true));
+        }
+        let mut to_top = gapped_recs(997_000, 500, 100, 20);
+        to_top.last_mut().unwrap().0 = b"k999999".to_vec();
+        cases.push(("gap-top", to_top, true));
+        for (name, recs, sparse) in cases {
             let fx = Fixture::new(&format!("stride-api-{name}"), recs, 1 << 16);
-            let built = stride_built(&fx);
+            let built = if sparse {
+                sparse_built(&fx)
+            } else {
+                stride_built(&fx)
+            };
             let zfile = fx.attach().unwrap_or_else(|e| panic!("{name}: {e:?}"));
             let body = zfile.stride().expect("a stride body");
+            assert_eq!(body.sparse().is_some(), sparse, "{name}");
             let n = fx.recs.len();
             let mut first = [0u8; STRIDE_KEY_MAX];
             assert_eq!(
@@ -15294,8 +16157,9 @@ mod tests {
             assert!(zfile.is_stride() && !zfile.coded(), "{name}");
             assert_eq!(zfile.kind(), FileCoding::Stride, "{name}");
             let ends_at_top = name.ends_with("top");
+            let numbers = numbers_of(body, &fx);
             assert_eq!(
-                body.codec().base() + n as u64 - 1 == body.codec().top(),
+                numbers[n - 1] == body.codec().top(),
                 ends_at_top,
                 "{name}: the run ends at its field's top only where it says"
             );
@@ -15303,12 +16167,15 @@ mod tests {
             assert_eq!(zfile.group_bytes(), n as u64 * w, "{name}");
             assert_eq!(zfile.file_bytes(), built.file_bytes, "{name}");
             // The empty fence's one key offset, no filter, a word of the row
-            // a value page and the body itself.
+            // a page the row covers, a sparse form's samples, and the body
+            // itself.
+            let samples = if sparse { n.div_ceil(64) } else { 0 };
             assert_eq!(
                 zfile.resident_bytes(),
-                4 + 4 * body.pages() + std::mem::size_of::<StrideBody>(),
+                4 + 4 * body.checked_pages() + 8 * samples + std::mem::size_of::<StrideBody>(),
                 "{name}: an empty fence and no filter beside the row"
             );
+            assert_eq!(body.checked_pages() > body.pages(), sparse, "{name}");
             // By rank: the values and the key, and nothing past the run. The
             // key into a buffer that holds bytes already: a served key is
             // the key alone, and none leaves the bytes.
@@ -15363,17 +16230,20 @@ mod tests {
             let codec = body.trailer().codec;
             let mut keys = probes(&fx.recs);
             let mut r = [0u8; STRIDE_KEY_MAX];
-            for x in [
+            // Numbers beside the run's and inside its gaps: below the
+            // first, past the last, the field's two ends, and either side
+            // of every key's number.
+            let mut beside = vec![
                 codec.base().checked_sub(1),
                 codec.base().checked_add(n as u64),
                 codec.base().checked_add(n as u64 + 7),
                 Some(codec.top()),
                 Some(0),
-            ]
-            .into_iter()
-            .flatten()
-            .filter(|&x| x <= codec.top())
-            {
+            ];
+            for &x in &numbers {
+                beside.extend([x.checked_sub(1), x.checked_add(1)]);
+            }
+            for x in beside.into_iter().flatten().filter(|&x| x <= codec.top()) {
                 keys.push(codec.render(x, &mut r).to_vec());
             }
             let sorted: Vec<&[u8]> = fx.recs.iter().map(|r| r.0.as_slice()).collect();
@@ -15461,7 +16331,11 @@ mod tests {
                 }
             }
             assert!(!zfile.damaged() && zfile.bad_pages() == 0, "{name}");
-            assert_eq!(zfile.verified_pages(), body.pages() as u64, "{name}");
+            assert_eq!(
+                zfile.verified_pages(),
+                body.checked_pages() as u64,
+                "{name}"
+            );
         }
     }
 
