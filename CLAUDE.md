@@ -5872,6 +5872,30 @@ one pass stands on its count and its profile, not on a pairing of three
 reps under a controller that makes a decision a rep, where the decision
 splits the cell before the lever moves it.
 
+**A ceiling priced beside a form that fit, and not priced again when the
+form stopped fitting.** The memory the readers' arenas keep after their
+threads end was priced once, over numbered keys at ten million under
+1 GiB: the allocator's threshold as the ceiling, worth little, and the
+slab that gives a handle's memo back (`Options::zpages_memo_slab`), which
+read no fewer free bytes; both were left off. Over random ids at the same
+bound the row's one cell lost to LMDB, the scrambled E mix at 0.68x and
+0.76x, took 0.40 major faults an operation, and the same three steps that
+note gives found it in an afternoon, each an arm already in the tree: the
+census by owner, 88 MB freed and resident through four mixes and 177 by
+the last, beside a block cache of 25; the ceiling by the allocator's
+threshold, the scrambled mixes 1.05x to 1.45x; and the owners' arms one
+at a time, the slab alone reading those mixes 1.19x to 1.85x and the
+scans after the mixes 1.30x to 1.87x in both orders. Random ids are read
+through the block form in every partition, so every reader's memo is
+full, and their block form is 856 MiB where numbered keys' is under 700:
+the form misses its fit there by about what the arenas hold. The rule: a
+lever written off as worth little is written off at the fit it was priced
+at, and is priced again whenever an input moves the store across a fit
+-- a shape of key, a value's size, a bound -- since memory nothing is
+short of at one size is the whole shortfall at the next; and a cell lost
+by faults under a bound is read against the process's bytes by owner
+before any form is blamed.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
@@ -5902,6 +5926,17 @@ in the suite's figures, at `full` scale where it says so:
   two fifths more than in the bulk walk over the same bytes, which is not
   known; and folding the keys in once a store is only read, which
   rewrites every partition where the inserts fell in every one.
+- The memos of decoded groups keep their memory after their readers
+  end, in arenas the allocator does not return, and where the block form
+  misses its fit by that much the store faults for it: ten million random
+  ids under 1 GiB, the scrambled E mix at 0.68x and 0.76x of LMDB. The
+  memos in slabs (`Options::zpages_memo_slab`) return it, the scrambled
+  mixes 1.19x to 1.85x there, and are off: over numbered keys at the same
+  bound the slab has nothing to return, and the hot-raw policy's one
+  release, asked into memory that stands unused at a look, is never
+  asked under it. What is owed before the default: that policy's room
+  drawn from something the slab does not move, six reps a sitting over
+  numbered keys at both ten-million bounds, the quick row and the gate.
 - Keys the stride form does not hold are served by the block form
   wherever the sparse stride form does not fit, a hundred and eight bytes
   a key against eighty-five, and the block form's scans are a decode a
