@@ -144,7 +144,7 @@ bulk replacement broke tick-exact tests once; do it test by test. Planned for th
 
 ### 1. The page layer (task 12). Stage G1 under way: two units of eight landed.
 
-**As of 20 Nov 12:25 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
+**As of 20 Nov 12:15 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
 launched one unit a launch: `Workflow {scriptPath, args: {base:
 "ea6352181f342b7bffd75ec8c88df92bc7b78ff6", only: ["G1-<n>"], tail: false}}`, the same base for
 every unit; after G1-8 a launch with `only: ["none"]` and no `tail: false` runs the full gate
