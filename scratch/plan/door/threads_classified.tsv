@@ -1,0 +1,159 @@
+src/crypt.rs:992	keep:937	-	yield_now	_ => std::thread::yield_now(),
+src/crypt.rs:1929	threads_decrypt_each_chunk_once_between_them:1923	T	thread::scope	std::thread::scope(|s| {
+src/crypt.rs:1932	threads_decrypt_each_chunk_once_between_them:1923	T	Scope::spawn	s.spawn(move || {
+src/crypt.rs:1933	threads_decrypt_each_chunk_once_between_them:1923	T	Barrier::wait	start.wait();
+src/db.rs:5379	join:5377	-	JoinHandle::join	ZJob::Build(h) => h.join().map(|_| ()),
+src/db.rs:5380	join:5377	-	JoinHandle::join	ZJob::Warm(h) => h.join().map(|_| ()),
+src/db.rs:6792	spawn:6766	-	Builder::spawn	let thread = std::thread::Builder::new()
+src/db.rs:6794	spawn:6766	-	spawn(cont.)	.spawn(move || WriterHelper::run(&s, &dup, ahead, fail.as_deref()))?;
+src/db.rs:6870	run:6801	-	park	std::thread::park();
+src/db.rs:6891	stop:6887	-	JoinHandle::join	let _ = t.join();
+src/db.rs:15991	trim_loop:15979	-	sleep	std::thread::sleep(std::time::Duration::from_millis(1));
+src/db.rs:15996	trim_loop:15979	-	park	std::thread::park();
+src/db.rs:16030	start_trimmer:16017	-	Builder::spawn	let spawned = std::thread::Builder::new()
+src/db.rs:16032	start_trimmer:16017	-	spawn(cont.)	.spawn(move || trim_loop(&held, &flag, stride, by_resident));
+src/db.rs:22764	upkeep_held:22758	-	sleep	std::thread::sleep(std::time::Duration::from_millis(1));
+src/db.rs:22864	install_ahead:22844	-	mpsc try_recv	let built = match a.rx.try_recv() {
+src/db.rs:22866	install_ahead:22844	-	mpsc type	Err(std::sync::mpsc::TryRecvError::Empty) => break,
+src/db.rs:22867	install_ahead:22844	-	mpsc type	Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+src/db.rs:22975	install_ahead:22844	-	JoinHandle::join	let _ = h.join();
+src/db.rs:30422	close_run:30333	-	JoinHandle::join	t.join()
+src/db.rs:30452	close_run:30333	-	Builder::spawn	std::thread::Builder::new()
+src/db.rs:30454	close_run:30333	-	spawn(cont.)	.spawn(move || {
+src/db.rs:30493	close_run:30333	-	park_timeout	std::thread::park_timeout(MAINT_LAND_POLL);
+src/db.rs:31231	take_fresh_mem:31182	-	park_timeout	self.r.unlent(|| std::thread::park_timeout(MAINT_LAND_POLL));
+src/db.rs:32248	start_ahead:32207	-	mpsc::channel	let (_tx, rx) = std::sync::mpsc::channel();
+src/db.rs:32322	start_ahead:32207	-	mpsc::channel	let (tx, rx) = std::sync::mpsc::channel();
+src/db.rs:32325	start_ahead:32207	-	thread::spawn	let handle = std::thread::spawn(move || {
+src/db.rs:32371	stop_ahead:32363	-	JoinHandle::join	let _ = h.join();
+src/db.rs:32382	join_ahead:32379	-	JoinHandle::join	let _ = h.join();
+src/db.rs:32413	go_away:32398	-	mpsc::channel	let (tx, rx) = std::sync::mpsc::channel();
+src/db.rs:32414	go_away:32398	-	Builder::spawn	let handle = std::thread::Builder::new()
+src/db.rs:32416	go_away:32398	-	spawn(cont.)	.spawn(move || m.run(rx))?;
+src/db.rs:32476	land_seal:32453	-	park_timeout	self.r.unlent(|| std::thread::park_timeout(MAINT_LAND_POLL));
+src/db.rs:32522	hand_seal:32503	-	thread::spawn	let handle = std::thread::spawn(move || {
+src/db.rs:32562	maint_request:32558	-	mpsc::channel	let (tx, rx) = std::sync::mpsc::channel();
+src/db.rs:32574	maint_request:32558	-	mpsc recv	.unlent(|| rx.recv())
+src/db.rs:32657	release_seal_landing_after:32652	-	thread::spawn	std::thread::spawn(move || {
+src/db.rs:32658	release_seal_landing_after:32652	-	sleep	std::thread::sleep(after);
+src/db.rs:32680	release_seal_landing_once_taken:32678	-	thread::spawn	std::thread::spawn(move || {
+src/db.rs:32682	release_seal_landing_once_taken:32678	-	sleep	std::thread::sleep(std::time::Duration::from_millis(1));
+src/db.rs:32684	release_seal_landing_once_taken:32678	-	sleep	std::thread::sleep(std::time::Duration::from_millis(200));
+src/db.rs:32700	release_seal_durable_after:32695	-	thread::spawn	std::thread::spawn(move || {
+src/db.rs:32701	release_seal_durable_after:32695	-	sleep	std::thread::sleep(after);
+src/db.rs:33509	zpages_settle_with:33495	-	sleep	std::thread::sleep(std::time::Duration::from_millis(1));
+src/db.rs:34006	cuts_of:33949	-	mpsc type	rx: std::sync::mpsc::Receiver<Built>,
+src/db.rs:34189	build_ahead_job:34185	-	mpsc type	tx: &std::sync::mpsc::Sender<Built>,
+src/db.rs:34422	keep:34405	-	park_timeout	std::thread::park_timeout(idle);
+src/db.rs:34425	keep:34405	-	park_timeout	Want::Scan => std::thread::park_timeout(KEEPER_POLL_MAX),
+src/db.rs:34873	load:34847	-	yield_now	std::thread::yield_now();
+src/db.rs:35001	take_back:34963	-	park_timeout	std::thread::park_timeout(std::time::Duration::from_millis(1));
+src/db.rs:35161	keep_upkeep:35137	-	park_timeout	std::thread::park_timeout(UPKEEP_POLL_MIN);
+src/db.rs:35180	keep_upkeep:35137	-	park_timeout	std::thread::park_timeout(wait);
+src/db.rs:35401	start_upkeep:35394	-	Builder::spawn	let spawned = std::thread::Builder::new()
+src/db.rs:35403	start_upkeep:35394	-	spawn(cont.)	.spawn(move || r.keep_upkeep(&flag));
+src/db.rs:35706	hold_within:35690	-	park_timeout	.unlent(|| std::thread::park_timeout(std::time::Duration::from_millis(1)));
+src/db.rs:35731	hold_for_upkeep:35715	-	park_timeout	.unlent(|| std::thread::park_timeout(std::time::Duration::from_millis(1)));
+src/db.rs:35761	join_upkeep:35741	-	sleep	.unlent(|| std::thread::sleep(std::time::Duration::from_micros(50)));
+src/db.rs:35780	stop_upkeep:35774	-	JoinHandle::join	let _ = h.join();
+src/db.rs:35976	start_keeper:35967	-	Builder::spawn	let spawned = std::thread::Builder::new()
+src/db.rs:35978	start_keeper:35967	-	spawn(cont.)	.spawn(move || {
+src/db.rs:36025	settle_keeper:36007	-	sleep	std::thread::sleep(std::time::Duration::from_micros(50));
+src/db.rs:36036	stop_keeper:36029	-	JoinHandle::join	let _ = h.join();
+src/db.rs:36073	stop_trimmer:36056	-	JoinHandle::join	let _ = h.join();
+src/db.rs:36142	release_trim_after:36140	-	thread::spawn	std::thread::spawn(move || {
+src/db.rs:36145	release_trim_after:36140	-	sleep	std::thread::sleep(std::time::Duration::from_millis(5));
+src/db.rs:38276	advance:38254	-	mpsc type	tx: Option<std::sync::mpsc::Sender<MaintJob>>,
+src/db.rs:38352	zbuild_hold_wait:38346	-	park_timeout	std::thread::park_timeout(MAINT_LAND_POLL);
+src/db.rs:38360	seal_hold_wait:38358	-	park_timeout	std::thread::park_timeout(MAINT_LAND_POLL);
+src/db.rs:38388	seal_readable:38368	-	mpsc type	Ask(MaintAsk, std::sync::mpsc::Sender<Result<()>>),
+src/db.rs:38511	stands_in:38491	-	mpsc type	jobs: Option<std::sync::mpsc::Sender<(File, File, bool)>>,
+src/db.rs:38512	stands_in:38491	-	mpsc type	done: std::sync::mpsc::Receiver<std::io::Result<()>>,
+src/db.rs:38518	spawn:38517	-	mpsc::channel	let (jobs, rx) = std::sync::mpsc::channel::<(File, File, bool)>();
+src/db.rs:38519	spawn:38517	-	mpsc::channel	let (tx, done) = std::sync::mpsc::channel();
+src/db.rs:38520	spawn:38517	-	Builder::spawn	let thread = std::thread::Builder::new()
+src/db.rs:38522	spawn:38517	-	spawn(cont.)	.spawn(move || {
+src/db.rs:38523	spawn:38517	-	mpsc recv	while let Ok((slot, dir, fail)) = rx.recv() {
+src/db.rs:38554	wait:38552	-	mpsc recv	.recv()
+src/db.rs:38563	drop:38560	-	JoinHandle::join	let _ = t.join();
+src/db.rs:38868	run:38868	-	mpsc type	fn run(mut self: Box<Self>, rx: std::sync::mpsc::Receiver<MaintJob>) {
+src/db.rs:38880	run:38868	-	mpsc try_recv	match rx.try_recv() {
+src/db.rs:38885	run:38868	-	mpsc type	Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+src/db.rs:38886	run:38868	-	mpsc type	Err(std::sync::mpsc::TryRecvError::Empty) => {}
+src/db.rs:38894	run:38868	-	park_timeout	std::thread::park_timeout(MAINT_POLL);
+src/db.rs:38899	run:38868	-	mpsc try_recv	while let Ok(job) = rx.try_recv() {
+src/db.rs:38902	run:38868	-	JoinHandle::join	let _ = job.handle.join();
+src/db.rs:38981	answer:38946	-	park_timeout	self.r.unlent(|| std::thread::park_timeout(MAINT_POLL));
+src/db.rs:39150	land_front_readable:39120	-	JoinHandle::join	let _ = s.handle.join();
+src/db.rs:39283	stop:39272	-	JoinHandle::join	let _ = s.handle.join();
+src/db.rs:39290	stop:39272	-	JoinHandle::join	.join()
+src/db.rs:39298	stop:39272	-	JoinHandle::join	let _ = m.handle.join();
+src/db.rs:39301	stop:39272	-	JoinHandle::join	let _ = h.join();
+src/db.rs:39524	join_seal:39502	-	park_timeout	self.r.unlent(|| std::thread::park_timeout(MAINT_LAND_POLL));
+src/db.rs:39561	land_front:39543	-	JoinHandle::join	.unlent(|| handle.join())
+src/db.rs:39701	land_readable:39622	-	helper.wait (custom; recv inside SyncHelper::wait at 38554)	self.sync_helper.as_ref().expect("started above").wait()?;
+src/db.rs:40245	start_tier:40222	-	thread::spawn	let handle = std::thread::spawn(move || {
+src/db.rs:40267	join_tier:40260	-	JoinHandle::join	.unlent(|| handle.join())
+src/db.rs:41708	z_sample_start:41671	-	Builder::spawn	let spawned = std::thread::Builder::new()
+src/db.rs:41710	z_sample_start:41671	-	spawn(cont.)	.spawn(move || {
+src/db.rs:41785	z_sample_collect:41770	-	JoinHandle::join	let Ok(results) = job.handle.join() else {
+src/db.rs:43083	z_start:42931	-	Builder::spawn	let spawned = std::thread::Builder::new()
+src/db.rs:43085	z_start:42931	-	spawn(cont.)	.spawn(move || {
+src/db.rs:43149	z_collect:43131	-	JoinHandle::join	if let Ok(Ok(w)) = h.join() {
+src/db.rs:43156	z_collect:43131	-	JoinHandle::join	.join()
+src/db.rs:43430	z_warm:43423	-	Builder::spawn	let spawned = std::thread::Builder::new()
+src/db.rs:43432	z_warm:43423	-	spawn(cont.)	.spawn(move || {
+src/db.rs:43637	start_compact:43484	-	thread::spawn	let handle = std::thread::spawn(move || {
+src/db.rs:43665	start_compact:43484	-	park_timeout	std::thread::park_timeout(MAINT_LAND_POLL);
+src/db.rs:43735	join_merge:43717	-	JoinHandle::join	.unlent(|| handle.join())
+src/db.rs:43812	drop:43789	-	JoinHandle::join	let _ = h.join();
+src/db.rs:43863	a_long_segment_is_synced_behind_its_writer:43835	T	yield_now	std::thread::yield_now();
+src/db.rs:44200	offsets_cross_blocks_and_two_threads_append_without_overlap:44172	T	thread::spawn	hs.push(std::thread::spawn(move || {
+src/db.rs:44210	offsets_cross_blocks_and_two_threads_append_without_overlap:44172	T	JoinHandle::join	for (off, bytes) in h.join().unwrap() {
+src/db.rs:44329	a_reader_takes_a_commit_whole:44294	T	thread::scope	std::thread::scope(|s| {
+src/db.rs:44330	a_reader_takes_a_commit_whole:44294	T	Scope::spawn	let reader = s.spawn(|| {
+src/db.rs:44348	a_reader_takes_a_commit_whole:44294	T	JoinHandle::join	let reads = reader.join().unwrap();
+src/db.rs:44381	a_retire_list_frees_each_item_once_and_never_early:44373	T	thread::spawn	pushers.push(std::thread::spawn(move || {
+src/db.rs:44395	a_retire_list_frees_each_item_once_and_never_early:44373	T	thread::spawn	sweepers.push(std::thread::spawn(move || {
+src/db.rs:44414	a_retire_list_frees_each_item_once_and_never_early:44373	T	sleep	std::thread::sleep(std::time::Duration::from_millis(1));
+src/db.rs:44417	a_retire_list_frees_each_item_once_and_never_early:44373	T	JoinHandle::join	p.join().unwrap();
+src/db.rs:44421	a_retire_list_frees_each_item_once_and_never_early:44373	T	JoinHandle::join	s.join().unwrap();
+src/db.rs:44447	an_id_cache_answers_each_id_with_its_own_value:44442	T	thread::spawn	hs.push(std::thread::spawn(move || {
+src/db.rs:44458	an_id_cache_answers_each_id_with_its_own_value:44442	T	JoinHandle::join	h.join().unwrap();
+src/db/pager.rs:85	None	-	Condvar (type/ctor)	use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
+src/db/pager.rs:308	oldest:220	-	Condvar (type/ctor)	woken: Condvar,
+src/db/pager.rs:335	new:317	-	Condvar (type/ctor)	woken: Condvar::new(),
+src/db/pager.rs:341	new:317	-	Builder::spawn	let t = std::thread::Builder::new()
+src/db/pager.rs:343	new:317	-	spawn(cont.)	.spawn(move || Pager::run(weak));
+src/db/pager.rs:420	stop:415	-	JoinHandle::join	let _ = t.join();
+src/db/pager.rs:537	breathe_swamped:529	-	sleep	std::thread::sleep(Duration::from_micros(200));
+src/db/pager.rs:565	breathe_unless:557	-	sleep	std::thread::sleep(Duration::from_micros(200));
+src/db/pager.rs:592	run:571	-	Condvar::wait_timeout	.wait_timeout(owed, Duration::from_millis(20))
+src/db/pager.rs:645	pass:605	-	sleep	std::thread::sleep(nap);
+src/db/pager.rs:1108	slow:1027	-	yield_now	_ => std::thread::yield_now(),
+src/db/pager.rs:1123	pause_after_rescue:1116	T	yield_now	std::thread::yield_now();
+src/db/pager.rs:1147	gone:1144	-	yield_now	std::thread::yield_now();
+src/db/pager.rs:1188	mark:1154	-	yield_now	BUSY => std::thread::yield_now(),
+src/db/pager.rs:1223	free:1210	-	yield_now	std::thread::yield_now();
+src/db/pager.rs:1734	a_view_says_what_is_in_memory_and_drops_and_asks_for_what_stands_behind_it:1703	T	sleep	std::thread::sleep(std::time::Duration::from_millis(2));
+src/db/pager.rs:1752	a_view_says_what_is_in_memory_and_drops_and_asks_for_what_stands_behind_it:1703	T	sleep	std::thread::sleep(std::time::Duration::from_millis(2));
+src/db/pager.rs:1833	a_cache_over_its_budget_gives_back_and_reads_again:1810	T	sleep	std::thread::sleep(Duration::from_millis(5));
+src/db/pager.rs:1859	nothing_is_given_back_under_a_hold:1848	T	sleep	std::thread::sleep(Duration::from_millis(100));
+src/db/pager.rs:1871	nothing_is_given_back_under_a_hold:1848	T	sleep	std::thread::sleep(Duration::from_millis(5));
+src/db/pager.rs:1904	a_rest_gives_way_and_a_range_asked_again_is_the_same_bytes:1882	T	sleep	std::thread::sleep(Duration::from_millis(5));
+src/db/pager.rs:1954	a_chunk_is_not_lent_out_of_a_unit_marked_again_under_its_rescue:1932	T	thread::scope	std::thread::scope(|scope| {
+src/db/pager.rs:1955	a_chunk_is_not_lent_out_of_a_unit_marked_again_under_its_rescue:1932	T	Scope::spawn	let reader = scope.spawn(|| {
+src/db/pager.rs:1965	a_chunk_is_not_lent_out_of_a_unit_marked_again_under_its_rescue:1932	T	yield_now	std::thread::yield_now();
+src/db/pager.rs:1974	a_chunk_is_not_lent_out_of_a_unit_marked_again_under_its_rescue:1932	T	JoinHandle::join	assert!(reader.join().unwrap());
+src/db/pager.rs:2004	threads_read_the_plaintext_while_the_cache_turns_over:1994	T	thread::spawn	std::thread::spawn(move || {
+src/db/pager.rs:2020	threads_read_the_plaintext_while_the_cache_turns_over:1994	T	JoinHandle::join	t.join().unwrap();
+src/db/pager.rs:2087	a_file_adopted_is_whole_and_stays_until_it_has_its_envelope:2077	T	sleep	std::thread::sleep(Duration::from_millis(80));
+src/db/pager.rs:2102	a_file_adopted_is_whole_and_stays_until_it_has_its_envelope:2077	T	sleep	std::thread::sleep(Duration::from_millis(5));
+src/db/zfile.rs:7500	an_ask_ahead_brings_the_cold_pages_in:7474	T	sleep	std::thread::sleep(std::time::Duration::from_millis(10));
+src/db/zfile.rs:8245	a_scan_asks_for_the_pages_it_will_cross_once_and_they_come_in_behind_it:8169	T	sleep	std::thread::sleep(std::time::Duration::from_millis(5));
+src/db/zpages.rs:6892	fill_page_is_deterministic:6864	T	thread::spawn	std::thread::spawn(move || {
+src/db/zpages.rs:6898	fill_page_is_deterministic:6864	T	JoinHandle::join	.join()
+src/flatindex.rs:1603	encode_inline:1450	-	thread::scope	std::thread::scope(|sc| {
+src/flatindex.rs:1606	encode_inline:1450	-	Scope::spawn	sc.spawn(move || f(r, d, a, b));
+src/flatindex.rs:1680	encode_inline:1450	-	thread::scope	std::thread::scope(|sc| {
+src/flatindex.rs:1689	encode_inline:1450	-	Scope::spawn	sc.spawn(move || {

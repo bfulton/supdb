@@ -1,0 +1,122 @@
+src/db.rs:310	idle_io_priority:305	-	let _ = libc::syscall(
+src/db.rs:325	io_priority_class:322	-	let v = libc::syscall(libc::SYS_ioprio_get, 1 as libc::c_int, 0 as libc::c_int);
+src/db.rs:6574	pwritev_at:6567	-	libc::pwritev(
+src/db.rs:6696	start_writeback:6689	-	libc::sync_file_range(
+src/db.rs:9806	populate_ahead:9791	-	libc::madvise(
+src/db.rs:10442	register_membarrier:10438	-	return unsafe { libc::syscall(libc::SYS_membarrier, 1i32 << 4, 0i32) } == 0;
+src/db.rs:10457	membarrier_all_threads:10453	-	libc::syscall(libc::SYS_membarrier, 1i32 << 3, 0i32);
+src/db.rs:12167	drop:12146	-	map: memmap2::Mmap,
+src/db.rs:12199	open:12191	-	let map = unsafe { memmap2::MmapOptions::new().len(cap).map(&file)? };
+src/db.rs:13881	thread_minflt:13880	-	std::fs::read_to_string("/proc/thread-self/stat")
+src/db.rs:13893	thread_majflt:13892	-	std::fs::read_to_string("/proc/thread-self/stat")
+src/db.rs:15771	fadvise_dontneed_range:15764	-	libc::posix_fadvise(file.as_raw_fd(), off, len, libc::POSIX_FADV_DONTNEED);
+src/db.rs:15786	fadvise_dontneed:15781	-	libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+src/db.rs:15809	resident_share:15796	-	libc::mincore(
+src/db.rs:15860	resident_beyond_use:15858	-	let text = std::fs::read_to_string("/proc/self/status").ok()?;
+src/db.rs:21157	read_all_in:21156	-	self.advise(true);
+src/db.rs:21718	scan_body:21712	-	self.advise(!self.scan_wants_readahead(limit));
+src/db.rs:27778	count_in:27775	-	self.advise(true);
+src/db.rs:28348	create:28345	-	std::fs::create_dir_all(dir)?;
+src/db.rs:43825	fresh:43823	T	let _ = std::fs::remove_dir_all(&dir);
+src/db.rs:43826	fresh:43823	T	std::fs::create_dir_all(&dir).unwrap();
+src/db.rs:43925	the_helpers_row_is_the_re_reads:43892	T	std::fs::read(&helped).unwrap(),
+src/db.rs:43926	the_helpers_row_is_the_re_reads:43892	T	std::fs::read(&alone).unwrap(),
+src/db.rs:44062	the_writers_facts_are_the_walks:44059	T	let _ = std::fs::remove_dir_all(&dir);
+src/db.rs:44063	the_writers_facts_are_the_walks:44059	T	std::fs::create_dir_all(&dir).unwrap();
+src/db.rs:44083	the_writers_facts_are_the_walks:44059	T	std::fs::rename(&tmp, dir.join(&name)).unwrap();
+src/db.rs:44100	the_writers_facts_are_the_walks:44059	T	let _ = std::fs::remove_dir_all(&dir);
+src/db.rs:44234	the_forms_word_under_a_cipher_is_a_rest_and_stays_one:44228	T	let _ = std::fs::remove_dir_all(&dir);
+src/db.rs:44593	a_writer_that_has_lent_its_upkeep_leaves_the_sweep_to_the_thread_that_has_it:44590	T	let _ = std::fs::remove_dir_all(&dir);
+src/db.rs:44646	a_writer_that_has_lent_its_upkeep_leaves_the_sweep_to_the_thread_that_has_it:44590	T	let _ = std::fs::remove_dir_all(&dir);
+src/db/zfile.rs:3932	drop_written_range:3926	-	libc::sync_file_range(
+src/db/zfile.rs:3940	drop_written_range:3926	-	libc::posix_fadvise(file.as_raw_fd(), at, n, libc::POSIX_FADV_DONTNEED);
+src/db/zfile.rs:3965	swap_ahead:3957	-	libc::posix_fadvise(
+src/db/zfile.rs:3972	swap_ahead:3957	-	let Ok(f) = File::open(form) else {
+src/db/zfile.rs:3979	swap_ahead:3957	-	libc::posix_fadvise(
+src/db/zfile.rs:4013	drop_behind:4002	-	libc::madvise((base + a) as *mut libc::c_void, b - a, libc::MADV_DONTNEED);
+src/db/zfile.rs:4014	drop_behind:4002	-	libc::posix_fadvise(
+src/db/zfile.rs:4042	ask_ahead:4035	-	libc::madvise((base + a) as *mut libc::c_void, n, libc::MADV_WILLNEED);
+src/db/zfile.rs:4265	build_file_seen:4242	-	let map = MmapBytes::from_map(unsafe { memmap2::Mmap::map(&file)? });
+src/db/zfile.rs:4949	thread_major_faults:4942	-	if unsafe { libc::getrusage(RUSAGE_THREAD, &mut ru) } == 0 {
+src/db/zfile.rs:5211	read_budget:5210	-	budget_from(&|p: &Path| std::fs::read_to_string(p).ok())
+src/db/zfile.rs:5279	read_budget:5271	T	use std::fs::OpenOptions;
+src/db/zfile.rs:5450	the_threads_major_faults_are_the_procfs_count:5443	T	let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap();
+src/db/zfile.rs:5486	dir:5483	T	let _ = std::fs::remove_dir_all(&d);
+src/db/zfile.rs:5487	dir:5483	T	std::fs::create_dir_all(&d).unwrap();
+src/db/zfile.rs:5688	drop:5687	T	let _ = std::fs::remove_dir_all(&self.dir);
+src/db/zfile.rs:6037	a_cursor_moved_onto_a_damaged_page_falls_back:6025	T	let f = OpenOptions::new()
+src/db/zfile.rs:6091	a_read_hands_over_nothing_before_its_checks_have_passed:6074	T	let f = OpenOptions::new()
+src/db/zfile.rs:6135	a_partition_that_cannot_have_a_form_file_is_declined_for_its_reason:6130	T	assert!(!fx.out.exists(), "no file for a declined partition");
+src/db/zfile.rs:6136	a_partition_that_cannot_have_a_form_file_is_declined_for_its_reason:6130	T	assert!(!fx.out.with_extension("zpg.tmp").exists());
+src/db/zfile.rs:6147	a_partition_that_cannot_have_a_form_file_is_declined_for_its_reason:6130	T	assert!(!fx.out.exists());
+src/db/zfile.rs:6182	a_partition_that_cannot_have_a_form_file_is_declined_for_its_reason:6130	T	assert!(!alone.out.exists());
+src/db/zfile.rs:6184	a_partition_that_cannot_have_a_form_file_is_declined_for_its_reason:6130	T	assert!(!fx.out.exists());
+src/db/zfile.rs:6660	a_form_file_of_another_segment_is_refused:6653	T	std::fs::copy(&one.out, &two.out).unwrap();
+src/db/zfile.rs:6706	a_form_file_of_another_segment_is_refused:6653	T	let _ = std::fs::remove_file(&one.out);
+src/db/zfile.rs:6722	with_trailer:6721	T	let mut bytes = std::fs::read(path).unwrap();
+src/db/zfile.rs:6727	with_trailer:6721	T	std::fs::write(path, bytes).unwrap();
+src/db/zfile.rs:6734	every_field_of_the_trailer_wrong_is_refused:6731	T	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs:6874	every_field_of_the_trailer_wrong_is_refused:6731	T	std::fs::write(&fx.out, &good).unwrap();
+src/db/zfile.rs:6883	every_field_of_the_trailer_wrong_is_refused:6731	T	std::fs::write(&fx.out, &good).unwrap();
+src/db/zfile.rs:6888	every_field_of_the_trailer_wrong_is_refused:6731	T	std::fs::write(&fx.out, &good).unwrap();
+src/db/zfile.rs:6895	every_field_of_the_trailer_wrong_is_refused:6731	T	std::fs::write(&fx.out, &bad).unwrap();
+src/db/zfile.rs:6905	every_field_of_the_trailer_wrong_is_refused:6731	T	std::fs::write(&fx.out, &bad).unwrap();
+src/db/zfile.rs:6916	every_field_of_the_trailer_wrong_is_refused:6731	T	std::fs::write(&fx.out, &bad).unwrap();
+src/db/zfile.rs:6940	a_flipped_byte_in_the_pages_is_never_an_answer:6931	T	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs:6947	a_flipped_byte_in_the_pages_is_never_an_answer:6931	T	let f = OpenOptions::new().write(true).open(&fx.out).unwrap();
+src/db/zfile.rs:7058	forge_groups:7057	T	let bytes = std::fs::read(path).unwrap();
+src/db/zfile.rs:7081	forge_groups:7057	T	let f = OpenOptions::new().write(true).open(path).unwrap();
+src/db/zfile.rs:7121	a_page_with_a_good_crc_and_the_wrong_records_is_never_an_answer:7111	T	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs:7172	a_page_with_a_good_crc_and_the_wrong_records_is_never_an_answer:7111	T	std::fs::write(&fx.out, &good).unwrap();
+src/db/zfile.rs:7208	a_page_with_a_good_crc_and_the_wrong_records_is_never_an_answer:7111	T	std::fs::write(&fx.out, &good).unwrap();
+src/db/zfile.rs:7217	a_page_with_a_good_crc_and_the_wrong_records_is_never_an_answer:7111	T	std::fs::write(&fx.out, &good).unwrap();
+src/db/zfile.rs:7233	a_sampled_page_with_a_good_crc_and_the_wrong_count_is_refused_at_attach:7228	T	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs:7243	a_sampled_page_with_a_good_crc_and_the_wrong_count_is_refused_at_attach:7228	T	std::fs::write(&fx.out, &good).unwrap();
+src/db/zfile.rs:7257	a_page_that_failed_its_first_decode_is_never_counted_verified:7249	T	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs:7260	a_page_that_failed_its_first_decode_is_never_counted_verified:7249	T	let f = OpenOptions::new().write(true).open(&fx.out).unwrap();
+src/db/zfile.rs:7287	a_verified_page_that_changes_underneath_is_never_answered_absent:7281	T	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs:7340	a_record_that_stops_parsing_after_its_page_was_verified_is_never_answered_absent:7330	T	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs:7397	the_trailer_sums_the_groups_and_the_file_is_the_length_the_build_returns:7391	T	let bytes = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs:7439	a_build_over_records_out_of_order_fails_and_leaves_no_file:7424	T	let mut copy = std::fs::read(&fx.seg).unwrap();
+src/db/zfile.rs:7445	a_build_over_records_out_of_order_fails_and_leaves_no_file:7424	T	std::fs::write(&broken, copy).unwrap();
+src/db/zfile.rs:7449	a_build_over_records_out_of_order_fails_and_leaves_no_file:7424	T	assert!(!out.exists());
+src/db/zfile.rs:7450	a_build_over_records_out_of_order_fails_and_leaves_no_file:7424	T	assert!(!tmp_of(&out).exists(), "a failed build left its temp name");
+src/db/zfile.rs:7458	evict:7456	T	let f = File::open(p).unwrap();
+src/db/zfile.rs:7461	evict:7456	T	let rc = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+src/db/zfile.rs:7479	an_ask_ahead_brings_the_cold_pages_in:7474	T	std::fs::copy(&fx.seg, &p).unwrap();
+src/db/zfile.rs:7782	the_cursor_walks_the_records_in_order_and_falls_to_the_raw_form_on_damage:7702	T	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs:7787	the_cursor_walks_the_records_in_order_and_falls_to_the_raw_form_on_damage:7702	T	std::fs::write(&fx.out, &flipped).unwrap();
+src/db/zfile.rs:7805	the_cursor_walks_the_records_in_order_and_falls_to_the_raw_form_on_damage:7702	T	std::fs::write(&fx.out, &good).unwrap();
+src/db/zfile.rs:7942	a_raw_tail_record_that_lies_about_its_run_falls_the_walk_to_the_raw_form:7937	T	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs:7990	a_raw_tail_record_that_lies_about_its_run_falls_the_walk_to_the_raw_form:7937	T	let f = OpenOptions::new().write(true).open(&fx.out).unwrap();
+src/db/zfile.rs:8136	the_cursors_bulk_walk_stops_at_the_key_asked_and_hands_over_what_the_raw_form_has:8014	T	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs:8141	the_cursors_bulk_walk_stops_at_the_key_asked_and_hands_over_what_the_raw_form_has:8014	T	std::fs::write(&fx.out, &flipped).unwrap();
+src/db/zfile.rs:8155	the_cursors_bulk_walk_stops_at_the_key_asked_and_hands_over_what_the_raw_form_has:8014	T	std::fs::write(&fx.out, &good).unwrap();
+src/db/zfile.rs:8270	a_record_no_page_holds_among_the_pages_is_one_entry_and_the_pages_go_on:8255	T	assert!(fx.out.exists() && !tmp_of(&fx.out).exists());
+src/db/zfile.rs:8311	a_build_over_a_stale_temp_file_is_a_whole_form_file:8305	T	std::fs::write(tmp_of(&fx.out), vec![0xA5u8; 4 << 20]).unwrap();
+src/db/zfile.rs:8317	a_build_over_a_stale_temp_file_is_a_whole_form_file:8305	T	assert!(!tmp_of(&fx.out).exists());
+src/db/zfile.rs:8389	a_form_file_is_the_same_bytes_whatever_the_piece_and_the_window:8365	T	let _ = std::fs::remove_file(&fx.out);
+src/db/zfile.rs:8401	a_form_file_is_the_same_bytes_whatever_the_piece_and_the_window:8365	T	let bytes = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs:8475	a_page_the_form_file_cannot_lend_is_refused_by_a_read_and_not_answered_absent:8460	T	let bytes = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs:8585	records_the_form_holds_no_page_for_are_the_raw_forms_and_pages_are_found_by_number:8575	T	let good = std::fs::read(&fx.out).unwrap();
+src/db/zfile.rs:8620	records_the_form_holds_no_page_for_are_the_raw_forms_and_pages_are_found_by_number:8575	T	std::fs::write(&fx.out, &bytes).unwrap();
+src/db/zpages.rs:7507	scratch:7504	T	let _ = std::fs::remove_dir_all(&d);
+src/db/zpages.rs:7508	scratch:7504	T	std::fs::create_dir_all(&d).unwrap();
+src/db/zpages.rs:7630	a_segments_images_are_the_streamed_records:7567	T	let _ = std::fs::remove_dir_all(&dir);
+src/ordindex.rs:1207	write:1205	T	std::fs::write(&p, bytes).expect("write");
+src/ordindex.rs:1221	check_all:1211	T	let _ = std::fs::remove_file(&p);
+src/ordindex.rs:1260	the_top_level_answers_a_strides_first_key_as_the_records_do:1230	T	std::fs::remove_file(&p).ok();
+src/ordindex.rs:1291	a_heads_page_ends_where_the_next_begins:1265	T	std::fs::remove_file(&p).ok();
+src/ordindex.rs:1351	the_windowed_seek_says_whether_its_rank_is_the_key:1295	T	let _ = std::fs::remove_file(&p);
+src/ordindex.rs:1378	check_from:1359	T	let _ = std::fs::remove_file(&p);
+src/ordindex.rs:1447	the_hinted_seek_names_a_window_of_one_stride_that_holds_its_answer:1415	T	let _ = std::fs::remove_file(&p);
+src/ordindex.rs:1475	a_seek_answers_what_a_lower_bound_answers:1453	T	let _ = std::fs::remove_file(&p);
+src/ordindex.rs:1536	a_query_outside_the_common_prefix_seeks_to_an_end:1510	T	let _ = std::fs::remove_file(&p);
+src/ordindex.rs:1575	a_uniform_index_seeks_without_reading_a_record:1545	T	let _ = std::fs::remove_file(&p);
+src/ordindex.rs:1626	mixed_lengths_keep_the_tie_search:1583	T	let _ = std::fs::remove_file(&p);
+src/ordindex.rs:1664	equal_lengths_past_the_head_keep_the_tie_search:1633	T	let _ = std::fs::remove_file(&p);
+src/ordindex.rs:1766	the_flag_of_an_exact_seek_says_whether_the_key_is_there:1678	T	let _ = std::fs::remove_file(&p);
+src/ordindex.rs:1777	an_empty_segment_builds_and_seeks:1771	T	let _ = std::fs::remove_file(&p);
+src/ordindex.rs:1797	a_flipped_byte_anywhere_fails_the_open:1783	T	let _ = std::fs::remove_file(&p);
+src/ordindex.rs:1811	a_companion_for_another_segment_is_refused:1804	T	let _ = std::fs::remove_file(&p);
+src/ordindex.rs:1906	a_walk_along_the_heads_answers_as_the_records_do:1821	T	let _ = std::fs::remove_file(&p);

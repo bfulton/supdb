@@ -1,0 +1,2926 @@
+src/db/vault.rs:1	-	<item>	
+src/db/vault.rs:2	-	<item>	
+src/db/vault.rs:3	-	<item>	
+src/db/vault.rs:4	-	<item>	
+src/db/vault.rs:5	-	<item>	
+src/db/vault.rs:6	-	<item>	
+src/db/vault.rs:7	-	<item>	
+src/db/vault.rs:8	-	<item>	
+src/db/vault.rs:9	-	<item>	
+src/db/vault.rs:10	-	<item>	
+src/db/vault.rs:11	-	<item>	
+src/db/vault.rs:12	-	<item>	
+src/db/vault.rs:13	-	<item>	
+src/db/vault.rs:14	-	<item>	
+src/db/vault.rs:15	-	<item>	
+src/db/vault.rs:16	-	<item>	
+src/db/vault.rs:17	-	<item>	
+src/db/vault.rs:18	-	<item>	
+src/db/vault.rs:19	-	<item>	
+src/db/vault.rs:20	-	<item>	
+src/db/vault.rs:21	-	<item>	
+src/db/vault.rs:22	-	<item>	
+src/db/vault.rs:23	-	<item>	
+src/db/vault.rs:24	-	<item>	
+src/db/vault.rs:25	-	<item>	
+src/db/vault.rs:26	-	<item>	
+src/db/vault.rs:27	-	<item>	
+src/db/vault.rs:28	-	<item>	
+src/db/vault.rs:29	-	<item>	
+src/db/vault.rs:30	-	<item>	
+src/db/vault.rs:31	-	<item>	
+src/db/vault.rs:32	-	<item>	
+src/db/vault.rs:33	-	<item>	
+src/db/vault.rs:34	-	<item>	
+src/db/vault.rs:35	-	<item>	
+src/db/vault.rs:36	-	<item>	
+src/db/vault.rs:37	-	<item>	
+src/db/vault.rs:38	-	<item>	
+src/db/vault.rs:39	-	<item>	
+src/db/vault.rs:40	-	<item>	
+src/db/vault.rs:41	-	<item>	
+src/db/vault.rs:42	-	<item>	
+src/db/vault.rs:43	-	<item>	
+src/db/vault.rs:44	-	<item>	
+src/db/vault.rs:45	-	<item>	
+src/db/vault.rs:46	-	<item>	
+src/db/vault.rs:47	-	<item>	
+src/db/vault.rs:48	-	<item>	
+src/db/vault.rs:49	-	<item>	
+src/db/vault.rs:50	-	<item>	
+src/db/vault.rs:51	-	<item>	
+src/db/vault.rs:52	-	<item>	
+src/db/vault.rs:53	-	<item>	
+src/db/vault.rs:54	-	<item>	
+src/db/vault.rs:55	-	<item>	
+src/db/vault.rs:56	-	<item>	
+src/db/vault.rs:57	-	<item>	
+src/db/vault.rs:58	-	<item>	
+src/db/vault.rs:59	-	<item>	
+src/db/vault.rs:60	-	<item>	
+src/db/vault.rs:61	-	<item>	
+src/db/vault.rs:62	-	<item>	
+src/db/vault.rs:63	-	<item>	
+src/db/vault.rs:64	-	<item>	
+src/db/vault.rs:65	-	<item>	
+src/db/vault.rs:66	-	<item>	
+src/db/vault.rs:67	-	<item>	
+src/db/vault.rs:68	-	<item>	
+src/db/vault.rs:69	-	<item>	
+src/db/vault.rs:70	-	<item>	
+src/db/vault.rs:71	-	<item>	
+src/db/vault.rs:72	-	<item>	
+src/db/vault.rs:73	-	<item>	
+src/db/vault.rs:74	-	<item>	
+src/db/vault.rs:75	-	<item>	
+src/db/vault.rs:76	-	<item>	
+src/db/vault.rs:77	-	<item>	
+src/db/vault.rs:78	-	<item>	
+src/db/vault.rs:79	-	<item>	
+src/db/vault.rs:80	-	<item>	
+src/db/vault.rs:81	-	<item>	
+src/db/vault.rs:82	-	<item>	
+src/db/vault.rs:83	-	<item>	
+src/db/vault.rs:84	-	<item>	
+src/db/vault.rs:85	-	<item>	
+src/db/vault.rs:86	-	<item>	
+src/db/vault.rs:87	-	<item>	
+src/db/vault.rs:88	-	<item>	
+src/db/vault.rs:89	-	<item>	
+src/db/vault.rs:90	-	<item>	
+src/db/vault.rs:91	-	<item>	
+src/db/vault.rs:92	-	<item>	
+src/db/vault.rs:93	-	<item>	
+src/db/vault.rs:94	-	<item>	
+src/db/vault.rs:95	-	<item>	
+src/db/vault.rs:96	-	<item>	
+src/db/vault.rs:97	-	<item>	
+src/db/vault.rs:98	-	<item>	
+src/db/vault.rs:99	-	<item>	
+src/db/vault.rs:100	-	<item>	
+src/db/vault.rs:101	-	<item>	
+src/db/vault.rs:102	-	<item>	
+src/db/vault.rs:103	-	<item>	
+src/db/vault.rs:104	-	<item>	
+src/db/vault.rs:105	-	<item>	
+src/db/vault.rs:106	-	<item>	
+src/db/vault.rs:107	-	<item>	
+src/db/vault.rs:108	-	<item>	
+src/db/vault.rs:109	-	<item>	
+src/db/vault.rs:110	-	<item>	
+src/db/vault.rs:111	-	<item>	
+src/db/vault.rs:112	-	<item>	
+src/db/vault.rs:113	-	<item>	
+src/db/vault.rs:114	-	<item>	
+src/db/vault.rs:115	-	<item>	
+src/db/vault.rs:116	-	<item>	
+src/db/vault.rs:117	-	<item>	
+src/db/vault.rs:118	-	<item>	
+src/db/vault.rs:119	-	<item>	
+src/db/vault.rs:120	-	<item>	
+src/db/vault.rs:121	-	<item>	
+src/db/vault.rs:122	-	<item>	
+src/db/vault.rs:123	-	<item>	
+src/db/vault.rs:124	-	<item>	
+src/db/vault.rs:125	-	<item>	
+src/db/vault.rs:126	-	<item>	
+src/db/vault.rs:127	-	<item>	
+src/db/vault.rs:128	-	<item>	
+src/db/vault.rs:129	-	<item>	
+src/db/vault.rs:130	-	<item>	
+src/db/vault.rs:131	-	<item>	
+src/db/vault.rs:132	-	<item>	
+src/db/vault.rs:133	-	<item>	
+src/db/vault.rs:134	-	<item>	
+src/db/vault.rs:135	-	<item>	
+src/db/vault.rs:136	-	<item>	
+src/db/vault.rs:137	-	<item>	
+src/db/vault.rs:138	-	<item>	
+src/db/vault.rs:139	-	<item>	
+src/db/vault.rs:140	-	<item>	
+src/db/vault.rs:141	-	<item>	
+src/db/vault.rs:142	-	<item>	
+src/db/vault.rs:143	-	<item>	
+src/db/vault.rs:144	-	<item>	
+src/db/vault.rs:145	-	<item>	use crate::bytes::{Bytes, MmapBytes};
+src/db/vault.rs:146	-	<item>	use crate::crypt::{self, Aead, EncryptOptions, NONCE, TAG};
+src/db/vault.rs:147	-	<item>	use std::collections::HashMap;
+src/db/vault.rs:148	-	<item>	use std::fs::{File, OpenOptions};
+src/db/vault.rs:149	-	<item>	use std::io::{Error, ErrorKind, Read, Result, Write};
+src/db/vault.rs:150	-	<item>	use std::path::{Path, PathBuf};
+src/db/vault.rs:151	-	<item>	use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+src/db/vault.rs:152	-	<item>	use std::sync::{Arc, Mutex, MutexGuard};
+src/db/vault.rs:153	-	<item>	
+src/db/vault.rs:154	-	<item>	pub use super::pager::PagerCounts;
+src/db/vault.rs:155	-	<item>	use super::pager::{self, Back, Paged, Pager};
+src/db/vault.rs:156	-	<item>	use crate::bytes::Paging;
+src/db/vault.rs:157	-	<item>	
+src/db/vault.rs:158	-	<item>	
+src/db/vault.rs:159	-	<item>	pub const KEY: usize = 32;
+src/db/vault.rs:160	-	<item>	
+src/db/vault.rs:161	-	<item>	
+src/db/vault.rs:162	-	<item>	pub(crate) const WRAPPED: usize = NONCE + KEY + TAG;
+src/db/vault.rs:163	-	<item>	
+src/db/vault.rs:164	-	<item>	
+src/db/vault.rs:165	-	<item>	pub(crate) type Token = [u8; 16];
+src/db/vault.rs:166	-	<item>	
+src/db/vault.rs:167	-	<item>	
+src/db/vault.rs:168	-	<item>	
+src/db/vault.rs:169	-	<item>	pub(crate) type FileKey = (Token, [u8; WRAPPED]);
+src/db/vault.rs:170	-	<item>	
+src/db/vault.rs:171	-	<item>	type DynAead = dyn Aead + Send + Sync;
+src/db/vault.rs:172	-	<item>	type Maker = dyn Fn(&[u8; KEY]) -> Box<DynAead> + Send + Sync;
+src/db/vault.rs:173	-	<item>	
+src/db/vault.rs:174	-	<item>	
+src/db/vault.rs:175	-	<item>	
+src/db/vault.rs:176	-	<item>	
+src/db/vault.rs:177	-	<item>	
+src/db/vault.rs:178	-	<item>	
+src/db/vault.rs:179	-	<item>	
+src/db/vault.rs:180	-	<item>	
+src/db/vault.rs:181	-	<item>	
+src/db/vault.rs:182	-	<item>	
+src/db/vault.rs:183	-	<item>	
+src/db/vault.rs:184	-	<item>	
+src/db/vault.rs:185	-	<item>	
+src/db/vault.rs:186	-	<item>	
+src/db/vault.rs:187	-	<item>	
+src/db/vault.rs:188	-	<item>	
+src/db/vault.rs:189	-	<item>	
+src/db/vault.rs:190	-	<item>	#[derive(Clone)]
+src/db/vault.rs:191	-	<item>	pub struct StoreCipher {
+src/db/vault.rs:192	-	<item>	master: Arc<DynAead>,
+src/db/vault.rs:193	-	<item>	data: Arc<Maker>,
+src/db/vault.rs:194	-	<item>	key_id: u64,
+src/db/vault.rs:195	-	<item>	cache: Option<u64>,
+src/db/vault.rs:196	-	<item>	}
+src/db/vault.rs:197	-	<item>	
+src/db/vault.rs:198	-	StoreCipher::<item>	impl StoreCipher {
+src/db/vault.rs:199	-	StoreCipher::<item>	
+src/db/vault.rs:200	-	StoreCipher::<item>	
+src/db/vault.rs:201	-	StoreCipher::<item>	pub fn new<M, A, D>(master: M, data: D) -> StoreCipher
+src/db/vault.rs:202	-	StoreCipher::<item>	where
+src/db/vault.rs:203	-	StoreCipher::<item>	M: Aead + Send + Sync + 'static,
+src/db/vault.rs:204	-	StoreCipher::<item>	A: Aead + Send + Sync + 'static,
+src/db/vault.rs:205	-	StoreCipher::<item>	D: Fn(&[u8; KEY]) -> A + Send + Sync + 'static,
+src/db/vault.rs:206	-	StoreCipher::<item>	{
+src/db/vault.rs:207	-	StoreCipher::<item>	StoreCipher {
+src/db/vault.rs:208	-	StoreCipher::<item>	master: Arc::new(master),
+src/db/vault.rs:209	-	StoreCipher::<item>	data: Arc::new(move |k| Box::new(data(k)) as Box<DynAead>),
+src/db/vault.rs:210	-	StoreCipher::<item>	key_id: 0,
+src/db/vault.rs:211	-	StoreCipher::<item>	cache: None,
+src/db/vault.rs:212	-	StoreCipher::<item>	}
+src/db/vault.rs:213	-	StoreCipher::<item>	}
+src/db/vault.rs:214	-	StoreCipher::<item>	
+src/db/vault.rs:215	-	StoreCipher::<item>	
+src/db/vault.rs:216	-	StoreCipher::<item>	
+src/db/vault.rs:217	-	StoreCipher::<item>	
+src/db/vault.rs:218	-	StoreCipher::<item>	
+src/db/vault.rs:219	-	StoreCipher::<item>	
+src/db/vault.rs:220	-	StoreCipher::<item>	
+src/db/vault.rs:221	-	StoreCipher::<item>	
+src/db/vault.rs:222	-	StoreCipher::<item>	
+src/db/vault.rs:223	-	StoreCipher::<item>	
+src/db/vault.rs:224	-	StoreCipher::<item>	
+src/db/vault.rs:225	-	StoreCipher::<item>	
+src/db/vault.rs:226	-	StoreCipher::<item>	
+src/db/vault.rs:227	-	StoreCipher::<item>	
+src/db/vault.rs:228	-	StoreCipher::<item>	
+src/db/vault.rs:229	-	StoreCipher::<item>	
+src/db/vault.rs:230	-	StoreCipher::<item>	
+src/db/vault.rs:231	-	StoreCipher::<item>	
+src/db/vault.rs:232	-	StoreCipher::<item>	
+src/db/vault.rs:233	-	StoreCipher::cache_bytes	pub fn cache_bytes(mut self, bytes: u64) -> StoreCipher {
+src/db/vault.rs:234	-	StoreCipher::cache_bytes	self.cache = Some(bytes);
+src/db/vault.rs:235	-	StoreCipher::cache_bytes	self
+src/db/vault.rs:236	-	StoreCipher::<item>	}
+src/db/vault.rs:237	-	StoreCipher::<item>	
+src/db/vault.rs:238	-	StoreCipher::<item>	
+src/db/vault.rs:239	-	StoreCipher::<item>	
+src/db/vault.rs:240	-	StoreCipher::<item>	
+src/db/vault.rs:241	-	StoreCipher::key_id	pub fn key_id(mut self, id: u64) -> StoreCipher {
+src/db/vault.rs:242	-	StoreCipher::key_id	self.key_id = id;
+src/db/vault.rs:243	-	StoreCipher::key_id	self
+src/db/vault.rs:244	-	StoreCipher::<item>	}
+src/db/vault.rs:245	-	StoreCipher::<item>	}
+src/db/vault.rs:246	-	<item>	
+src/db/vault.rs:247	-	StoreCipher::<item>	impl std::fmt::Debug for StoreCipher {
+src/db/vault.rs:248	-	StoreCipher::fmt	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+src/db/vault.rs:249	-	StoreCipher::fmt	write!(f, "StoreCipher {{ key_id: {} }}", self.key_id)
+src/db/vault.rs:250	-	StoreCipher::<item>	}
+src/db/vault.rs:251	-	StoreCipher::<item>	}
+src/db/vault.rs:252	-	<item>	
+src/db/vault.rs:253	-	<item>	
+src/db/vault.rs:254	-	<item>	struct Key([u8; KEY]);
+src/db/vault.rs:255	-	<item>	
+src/db/vault.rs:256	-	Key::<item>	impl Key {
+src/db/vault.rs:257	-	Key::draw	fn draw() -> Result<Key> {
+src/db/vault.rs:258	-	Key::draw	let mut k = Key([0u8; KEY]);
+src/db/vault.rs:259	-	Key::draw	random(&mut k.0)?;
+src/db/vault.rs:260	-	Key::draw	Ok(k)
+src/db/vault.rs:261	-	Key::<item>	}
+src/db/vault.rs:262	-	Key::<item>	}
+src/db/vault.rs:263	-	<item>	
+src/db/vault.rs:264	-	Key::<item>	impl Drop for Key {
+src/db/vault.rs:265	-	Key::drop	fn drop(&mut self) {
+src/db/vault.rs:266	-	Key::drop	for b in &mut self.0 {
+src/db/vault.rs:267	-	Key::drop	
+src/db/vault.rs:268	-	Key::drop	
+src/db/vault.rs:269	-	Key::drop	unsafe { std::ptr::write_volatile(b, 0) };
+src/db/vault.rs:270	-	Key::drop	}
+src/db/vault.rs:271	-	Key::<item>	}
+src/db/vault.rs:272	-	Key::<item>	}
+src/db/vault.rs:273	-	<item>	
+src/db/vault.rs:274	-	refused	fn refused(msg: &str) -> Error {
+src/db/vault.rs:275	-	refused	Error::new(ErrorKind::InvalidData, msg)
+src/db/vault.rs:276	-	refused	}
+src/db/vault.rs:277	-	<item>	
+src/db/vault.rs:278	-	<item>	
+src/db/vault.rs:279	-	random	fn random(buf: &mut [u8]) -> Result<()> {
+src/db/vault.rs:280	-	random	#[cfg(target_os = "linux")]
+src/db/vault.rs:281	-	random	{
+src/db/vault.rs:282	-	random	let mut at = 0;
+src/db/vault.rs:283	-	random	while at < buf.len() {
+src/db/vault.rs:284	-	random	
+src/db/vault.rs:285	-	random	
+src/db/vault.rs:286	-	random	let n = unsafe { libc::getrandom(buf[at..].as_mut_ptr().cast(), buf.len() - at, 
+src/db/vault.rs:287	-	random	if n < 0 {
+src/db/vault.rs:288	-	random	let e = Error::last_os_error();
+src/db/vault.rs:289	-	random	if e.kind() == ErrorKind::Interrupted {
+src/db/vault.rs:290	-	random	continue;
+src/db/vault.rs:291	-	random	}
+src/db/vault.rs:292	-	random	return Err(e);
+src/db/vault.rs:293	-	random	}
+src/db/vault.rs:294	-	random	at += n as usize;
+src/db/vault.rs:295	-	random	}
+src/db/vault.rs:296	-	random	Ok(())
+src/db/vault.rs:297	-	random	}
+src/db/vault.rs:298	-	random	#[cfg(not(target_os = "linux"))]
+src/db/vault.rs:299	-	random	{
+src/db/vault.rs:300	-	random	File::open("/dev/urandom")?.read_exact(buf)
+src/db/vault.rs:301	-	random	}
+src/db/vault.rs:302	-	random	}
+src/db/vault.rs:303	-	<item>	
+src/db/vault.rs:304	-	<item>	
+src/db/vault.rs:305	-	<item>	
+src/db/vault.rs:306	-	<item>	struct Nonces {
+src/db/vault.rs:307	-	<item>	prefix: [u8; 8],
+src/db/vault.rs:308	-	<item>	next: u32,
+src/db/vault.rs:309	-	<item>	}
+src/db/vault.rs:310	-	<item>	
+src/db/vault.rs:311	-	Nonces::<item>	impl Nonces {
+src/db/vault.rs:312	-	Nonces::new	fn new() -> Result<Nonces> {
+src/db/vault.rs:313	-	Nonces::new	let mut prefix = [0u8; 8];
+src/db/vault.rs:314	-	Nonces::new	random(&mut prefix)?;
+src/db/vault.rs:315	-	Nonces::new	Ok(Nonces { prefix, next: 0 })
+src/db/vault.rs:316	-	Nonces::<item>	}
+src/db/vault.rs:317	-	Nonces::<item>	
+src/db/vault.rs:318	-	Nonces::<item>	fn take(&mut self) -> Result<[u8; NONCE]> {
+src/db/vault.rs:319	-	Nonces::<item>	let mut n = [0u8; NONCE];
+src/db/vault.rs:320	-	Nonces::<item>	n[..8].copy_from_slice(&self.prefix);
+src/db/vault.rs:321	-	Nonces::<item>	n[8..].copy_from_slice(&self.next.to_le_bytes());
+src/db/vault.rs:322	-	Nonces::<item>	match self.next.checked_add(1) {
+src/db/vault.rs:323	-	Nonces::<item>	Some(next) => self.next = next,
+src/db/vault.rs:324	-	Nonces::<item>	None => {
+src/db/vault.rs:325	-	Nonces::<item>	random(&mut self.prefix)?;
+src/db/vault.rs:326	-	Nonces::<item>	self.next = 0;
+src/db/vault.rs:327	-	Nonces::<item>	}
+src/db/vault.rs:328	-	Nonces::<item>	}
+src/db/vault.rs:329	-	Nonces::<item>	Ok(n)
+src/db/vault.rs:330	-	Nonces::<item>	}
+src/db/vault.rs:331	-	Nonces::<item>	}
+src/db/vault.rs:332	-	<item>	
+src/db/vault.rs:333	-	<item>	
+src/db/vault.rs:334	-	<item>	fn seal(aead: &DynAead, nonce: [u8; NONCE], aad: &[u8], plain: &[u8]) -> Vec<u8>
+src/db/vault.rs:335	-	<item>	let mut out = Vec::with_capacity(NONCE + plain.len() + TAG);
+src/db/vault.rs:336	-	<item>	out.extend_from_slice(&nonce);
+src/db/vault.rs:337	-	<item>	out.extend_from_slice(plain);
+src/db/vault.rs:338	-	<item>	let tag = aead.encrypt(&nonce, aad, &mut out[NONCE..]);
+src/db/vault.rs:339	-	<item>	out.extend_from_slice(&tag);
+src/db/vault.rs:340	-	<item>	out
+src/db/vault.rs:341	-	<item>	}
+src/db/vault.rs:342	-	<item>	
+src/db/vault.rs:343	-	<item>	
+src/db/vault.rs:344	-	unseal	fn unseal(aead: &DynAead, aad: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
+src/db/vault.rs:345	-	unseal	let body = sealed.len().checked_sub(NONCE + TAG)?;
+src/db/vault.rs:346	-	unseal	let nonce: [u8; NONCE] = sealed[..NONCE].try_into().unwrap();
+src/db/vault.rs:347	-	unseal	let tag: [u8; TAG] = sealed[NONCE + body..].try_into().unwrap();
+src/db/vault.rs:348	-	unseal	let mut plain = sealed[NONCE..NONCE + body].to_vec();
+src/db/vault.rs:349	-	unseal	if aead.decrypt(&nonce, aad, &mut plain, &tag) {
+src/db/vault.rs:350	-	unseal	Some(plain)
+src/db/vault.rs:351	-	unseal	} else {
+src/db/vault.rs:352	-	unseal	
+src/db/vault.rs:353	-	unseal	plain.fill(0);
+src/db/vault.rs:354	-	unseal	None
+src/db/vault.rs:355	-	unseal	}
+src/db/vault.rs:356	-	unseal	}
+src/db/vault.rs:357	-	<item>	
+src/db/vault.rs:358	-	<item>	
+src/db/vault.rs:359	-	<item>	
+src/db/vault.rs:360	-	<item>	
+src/db/vault.rs:361	-	<item>	
+src/db/vault.rs:362	-	<item>	pub(crate) const MARKER: &str = "supdb.cipher";
+src/db/vault.rs:363	-	<item>	const MARKER_MAGIC: &[u8; 8] = b"supdbCS\0";
+src/db/vault.rs:364	-	<item>	const MARKER_VERSION: u32 = 1;
+src/db/vault.rs:365	-	<item>	
+src/db/vault.rs:366	-	<item>	
+src/db/vault.rs:367	-	<item>	
+src/db/vault.rs:368	-	<item>	const MARKER_HEAD: usize = 40;
+src/db/vault.rs:369	-	<item>	const MARKER_LEN: usize = MARKER_HEAD + WRAPPED;
+src/db/vault.rs:370	-	<item>	
+src/db/vault.rs:371	-	<item>	fn marker_head(key_id: u64, store_id: &[u8; 16]) -> [u8; MARKER_HEAD] {
+src/db/vault.rs:372	-	<item>	let mut h = [0u8; MARKER_HEAD];
+src/db/vault.rs:373	-	<item>	h[..8].copy_from_slice(MARKER_MAGIC);
+src/db/vault.rs:374	-	<item>	h[8..12].copy_from_slice(&MARKER_VERSION.to_le_bytes());
+src/db/vault.rs:375	-	<item>	h[16..24].copy_from_slice(&key_id.to_le_bytes());
+src/db/vault.rs:376	-	<item>	h[24..40].copy_from_slice(store_id);
+src/db/vault.rs:377	-	<item>	h
+src/db/vault.rs:378	-	<item>	}
+src/db/vault.rs:379	-	<item>	
+src/db/vault.rs:380	-	<item>	
+src/db/vault.rs:381	-	<item>	
+src/db/vault.rs:382	-	marker_key_id	fn marker_key_id(bytes: &[u8]) -> Result<u64> {
+src/db/vault.rs:383	-	marker_key_id	if bytes.len() != MARKER_LEN || &bytes[..8] != MARKER_MAGIC {
+src/db/vault.rs:384	-	marker_key_id	return Err(refused("not the marker of a store under a cipher"));
+src/db/vault.rs:385	-	marker_key_id	}
+src/db/vault.rs:386	-	marker_key_id	let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+src/db/vault.rs:387	-	marker_key_id	if version != MARKER_VERSION || bytes[12..16] != [0u8; 4] {
+src/db/vault.rs:388	-	marker_key_id	return Err(refused(
+src/db/vault.rs:389	-	marker_key_id	"the marker of a store under a cipher is of a version this build does not read",
+src/db/vault.rs:390	-	marker_key_id	));
+src/db/vault.rs:391	-	marker_key_id	}
+src/db/vault.rs:392	-	marker_key_id	Ok(u64::from_le_bytes(bytes[16..24].try_into().unwrap()))
+src/db/vault.rs:393	-	marker_key_id	}
+src/db/vault.rs:394	-	<item>	
+src/db/vault.rs:395	-	<item>	
+src/db/vault.rs:396	-	<item>	
+src/db/vault.rs:397	-	key_id	pub fn key_id(dir: &Path) -> Result<Option<u64>> {
+src/db/vault.rs:398	-	key_id	match std::fs::read(dir.join(MARKER)) {
+src/db/vault.rs:399	-	key_id	Ok(bytes) => marker_key_id(&bytes).map(Some),
+src/db/vault.rs:400	-	key_id	Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+src/db/vault.rs:401	-	key_id	Err(e) => Err(e),
+src/db/vault.rs:402	-	key_id	}
+src/db/vault.rs:403	-	key_id	}
+src/db/vault.rs:404	-	<item>	
+src/db/vault.rs:405	-	<item>	
+src/db/vault.rs:406	-	<item>	
+src/db/vault.rs:407	-	<item>	
+src/db/vault.rs:408	-	<item>	
+src/db/vault.rs:409	-	<item>	
+src/db/vault.rs:410	-	<item>	
+src/db/vault.rs:411	-	<item>	
+src/db/vault.rs:412	-	<item>	
+src/db/vault.rs:413	-	<item>	
+src/db/vault.rs:414	-	<item>	
+src/db/vault.rs:415	-	<item>	
+src/db/vault.rs:416	-	<item>	
+src/db/vault.rs:417	-	rewrap	pub fn rewrap(dir: &Path, from: &StoreCipher, to: &StoreCipher) -> Result<()> {
+src/db/vault.rs:418	-	rewrap	let bytes = std::fs::read(dir.join(MARKER))?;
+src/db/vault.rs:419	-	rewrap	marker_key_id(&bytes)?;
+src/db/vault.rs:420	-	rewrap	let key = unseal(&*from.master, &bytes[..MARKER_HEAD], &bytes[MARKER_HEAD..])
+src/db/vault.rs:421	-	rewrap	.and_then(|k| Some(Key(k.as_slice().try_into().ok()?)))
+src/db/vault.rs:422	-	rewrap	.ok_or_else(|| {
+src/db/vault.rs:423	-	rewrap	Error::new(
+src/db/vault.rs:424	-	rewrap	ErrorKind::PermissionDenied,
+src/db/vault.rs:425	-	rewrap	"the cipher given does not open the store: the key is wrong, or the marker was \
+src/db/vault.rs:426	-	rewrap	changed",
+src/db/vault.rs:427	-	rewrap	)
+src/db/vault.rs:428	-	rewrap	})?;
+src/db/vault.rs:429	-	rewrap	let store_id: [u8; 16] = bytes[24..MARKER_HEAD].try_into().unwrap();
+src/db/vault.rs:430	-	rewrap	write_marker(dir, to, &store_id, &key)
+src/db/vault.rs:431	-	rewrap	}
+src/db/vault.rs:432	-	<item>	
+src/db/vault.rs:433	-	<item>	
+src/db/vault.rs:434	-	<item>	
+src/db/vault.rs:435	-	<item>	fn write_marker(dir: &Path, cipher: &StoreCipher, store_id: &[u8; 16], key: &Key
+src/db/vault.rs:436	-	<item>	let head = marker_head(cipher.key_id, store_id);
+src/db/vault.rs:437	-	<item>	let mut nonce = [0u8; NONCE];
+src/db/vault.rs:438	-	<item>	random(&mut nonce)?;
+src/db/vault.rs:439	-	<item>	let mut bytes = head.to_vec();
+src/db/vault.rs:440	-	<item>	bytes.extend_from_slice(&seal(&*cipher.master, nonce, &head, &key.0));
+src/db/vault.rs:441	-	<item>	let tmp = dir.join(format!("{MARKER}.tmp"));
+src/db/vault.rs:442	-	<item>	{
+src/db/vault.rs:443	-	<item>	let mut f = File::create(&tmp)?;
+src/db/vault.rs:444	-	<item>	f.write_all(&bytes)?;
+src/db/vault.rs:445	-	<item>	f.sync_all()?;
+src/db/vault.rs:446	-	<item>	}
+src/db/vault.rs:447	-	<item>	std::fs::rename(&tmp, dir.join(MARKER))?;
+src/db/vault.rs:448	-	<item>	File::open(dir)?.sync_all()
+src/db/vault.rs:449	-	<item>	}
+src/db/vault.rs:450	-	<item>	
+src/db/vault.rs:451	-	<item>	
+src/db/vault.rs:452	-	<item>	
+src/db/vault.rs:453	-	refuse_marked	pub(crate) fn refuse_marked(dir: &Path) -> Result<()> {
+src/db/vault.rs:454	-	refuse_marked	if dir.join(MARKER).exists() {
+src/db/vault.rs:455	-	refuse_marked	return Err(Error::new(
+src/db/vault.rs:456	-	refuse_marked	ErrorKind::PermissionDenied,
+src/db/vault.rs:457	-	refuse_marked	"the store is kept under a cipher and none was given (Encryption::Cipher)",
+src/db/vault.rs:458	-	refuse_marked	));
+src/db/vault.rs:459	-	refuse_marked	}
+src/db/vault.rs:460	-	refuse_marked	Ok(())
+src/db/vault.rs:461	-	refuse_marked	}
+src/db/vault.rs:462	-	<item>	
+src/db/vault.rs:463	-	<item>	
+src/db/vault.rs:464	-	<item>	
+src/db/vault.rs:465	-	<item>	
+src/db/vault.rs:466	-	<item>	
+src/db/vault.rs:467	-	<item>	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+src/db/vault.rs:468	-	<item>	enum Kind {
+src/db/vault.rs:469	-	<item>	Seg,
+src/db/vault.rs:470	-	<item>	
+src/db/vault.rs:471	-	<item>	Ord,
+src/db/vault.rs:472	-	<item>	
+src/db/vault.rs:473	-	<item>	Form,
+src/db/vault.rs:474	-	<item>	}
+src/db/vault.rs:475	-	<item>	
+src/db/vault.rs:476	-	Kind::<item>	impl Kind {
+src/db/vault.rs:477	-	Kind::suffix	fn suffix(self) -> &'static str {
+src/db/vault.rs:478	-	Kind::suffix	match self {
+src/db/vault.rs:479	-	Kind::suffix	Kind::Seg => "",
+src/db/vault.rs:480	-	Kind::suffix	Kind::Ord => ".o",
+src/db/vault.rs:481	-	Kind::suffix	Kind::Form => ".z",
+src/db/vault.rs:482	-	Kind::suffix	}
+src/db/vault.rs:483	-	Kind::<item>	}
+src/db/vault.rs:484	-	Kind::<item>	}
+src/db/vault.rs:485	-	<item>	
+src/db/vault.rs:486	-	<item>	
+src/db/vault.rs:487	-	<item>	#[derive(Clone)]
+src/db/vault.rs:488	-	<item>	struct Disk {
+src/db/vault.rs:489	-	<item>	token: Token,
+src/db/vault.rs:490	-	<item>	wrapped: [u8; WRAPPED],
+src/db/vault.rs:491	-	<item>	
+src/db/vault.rs:492	-	<item>	kind: Kind,
+src/db/vault.rs:493	-	<item>	}
+src/db/vault.rs:494	-	<item>	
+src/db/vault.rs:495	-	Disk::<item>	impl Disk {
+src/db/vault.rs:496	-	Disk::name	fn name(&self) -> String {
+src/db/vault.rs:497	-	Disk::name	disk_name(&self.token, self.kind)
+src/db/vault.rs:498	-	Disk::<item>	}
+src/db/vault.rs:499	-	Disk::<item>	
+src/db/vault.rs:500	-	Disk::same	fn same(&self, other: &Disk) -> bool {
+src/db/vault.rs:501	-	Disk::same	self.token == other.token && self.kind == other.kind
+src/db/vault.rs:502	-	Disk::<item>	}
+src/db/vault.rs:503	-	Disk::<item>	}
+src/db/vault.rs:504	-	<item>	
+src/db/vault.rs:505	-	disk_name	fn disk_name(token: &Token, kind: Kind) -> String {
+src/db/vault.rs:506	-	disk_name	let mut s = String::with_capacity(36);
+src/db/vault.rs:507	-	disk_name	s.push_str("x-");
+src/db/vault.rs:508	-	disk_name	for b in token {
+src/db/vault.rs:509	-	disk_name	s.push_str(&format!("{b:02x}"));
+src/db/vault.rs:510	-	disk_name	}
+src/db/vault.rs:511	-	disk_name	s.push_str(kind.suffix());
+src/db/vault.rs:512	-	disk_name	s
+src/db/vault.rs:513	-	disk_name	}
+src/db/vault.rs:514	-	<item>	
+src/db/vault.rs:515	-	<item>	
+src/db/vault.rs:516	-	<item>	
+src/db/vault.rs:517	-	<item>	const ENVELOPE_TMP: &str = ".tmp";
+src/db/vault.rs:518	-	<item>	
+src/db/vault.rs:519	-	<item>	
+src/db/vault.rs:520	-	<item>	
+src/db/vault.rs:521	-	disk_parse	fn disk_parse(name: &str) -> Option<(Token, Kind)> {
+src/db/vault.rs:522	-	disk_parse	let rest = name.strip_prefix("x-")?;
+src/db/vault.rs:523	-	disk_parse	let (hex, kind) = if let Some(h) = rest.strip_suffix(".o") {
+src/db/vault.rs:524	-	disk_parse	(h, Kind::Ord)
+src/db/vault.rs:525	-	disk_parse	} else if let Some(h) = rest.strip_suffix(".z") {
+src/db/vault.rs:526	-	disk_parse	(h, Kind::Form)
+src/db/vault.rs:527	-	disk_parse	} else {
+src/db/vault.rs:528	-	disk_parse	(rest, Kind::Seg)
+src/db/vault.rs:529	-	disk_parse	};
+src/db/vault.rs:530	-	disk_parse	if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+src/db/vault.rs:531	-	disk_parse	return None;
+src/db/vault.rs:532	-	disk_parse	}
+src/db/vault.rs:533	-	disk_parse	let mut token = [0u8; 16];
+src/db/vault.rs:534	-	disk_parse	for (i, t) in token.iter_mut().enumerate() {
+src/db/vault.rs:535	-	disk_parse	*t = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
+src/db/vault.rs:536	-	disk_parse	}
+src/db/vault.rs:537	-	disk_parse	Some((token, kind))
+src/db/vault.rs:538	-	disk_parse	}
+src/db/vault.rs:539	-	<item>	
+src/db/vault.rs:540	-	<item>	
+src/db/vault.rs:541	-	<item>	
+src/db/vault.rs:542	-	<item>	
+src/db/vault.rs:543	-	<item>	
+src/db/vault.rs:544	-	<item>	
+src/db/vault.rs:545	-	<item>	
+src/db/vault.rs:546	-	<item>	
+src/db/vault.rs:547	-	<item>	
+src/db/vault.rs:548	-	<item>	
+src/db/vault.rs:549	-	<item>	#[derive(Clone, Default)]
+src/db/vault.rs:550	-	<item>	struct Entry {
+src/db/vault.rs:551	-	<item>	mem: Option<Arc<File>>,
+src/db/vault.rs:552	-	<item>	page: Option<Arc<Paged>>,
+src/db/vault.rs:553	-	<item>	disk: Option<Disk>,
+src/db/vault.rs:554	-	<item>	}
+src/db/vault.rs:555	-	<item>	
+src/db/vault.rs:556	-	<item>	
+src/db/vault.rs:557	-	<item>	
+src/db/vault.rs:558	-	<item>	
+src/db/vault.rs:559	-	<item>	
+src/db/vault.rs:560	-	<item>	
+src/db/vault.rs:561	-	<item>	
+src/db/vault.rs:562	-	passes	fn passes(name: &str) -> bool {
+src/db/vault.rs:563	-	passes	name.starts_with("wal-") || name.starts_with("spare-") || name.starts_with("mani
+src/db/vault.rs:564	-	passes	}
+src/db/vault.rs:565	-	<item>	
+src/db/vault.rs:566	-	<item>	
+src/db/vault.rs:567	-	<item>	#[derive(Default)]
+src/db/vault.rs:568	-	<item>	pub(crate) struct Counts {
+src/db/vault.rs:569	-	<item>	
+src/db/vault.rs:570	-	<item>	pub(crate) persisted: AtomicU64,
+src/db/vault.rs:571	-	<item>	pub(crate) persisted_bytes: AtomicU64,
+src/db/vault.rs:572	-	<item>	
+src/db/vault.rs:573	-	<item>	
+src/db/vault.rs:574	-	<item>	pub(crate) adopted: AtomicU64,
+src/db/vault.rs:575	-	<item>	pub(crate) left: AtomicU64,
+src/db/vault.rs:576	-	<item>	
+src/db/vault.rs:577	-	<item>	pub(crate) swept: AtomicU64,
+src/db/vault.rs:578	-	<item>	
+src/db/vault.rs:579	-	<item>	
+src/db/vault.rs:580	-	<item>	pub(crate) late: AtomicU64,
+src/db/vault.rs:581	-	<item>	}
+src/db/vault.rs:582	-	<item>	
+src/db/vault.rs:583	-	<item>	
+src/db/vault.rs:584	-	<item>	pub(crate) struct Vault {
+src/db/vault.rs:585	-	<item>	
+src/db/vault.rs:586	-	<item>	real: PathBuf,
+src/db/vault.rs:587	-	<item>	
+src/db/vault.rs:588	-	<item>	decoy: PathBuf,
+src/db/vault.rs:589	-	<item>	
+src/db/vault.rs:590	-	<item>	store: Box<DynAead>,
+src/db/vault.rs:591	-	<item>	data: Arc<Maker>,
+src/db/vault.rs:592	-	<item>	files: Mutex<HashMap<String, Entry>>,
+src/db/vault.rs:593	-	<item>	nonces: Mutex<Nonces>,
+src/db/vault.rs:594	-	<item>	
+src/db/vault.rs:595	-	<item>	persisting: Mutex<()>,
+src/db/vault.rs:596	-	<item>	
+src/db/vault.rs:597	-	<item>	
+src/db/vault.rs:598	-	<item>	mapped: Mutex<Vec<MappedFile>>,
+src/db/vault.rs:599	-	<item>	
+src/db/vault.rs:600	-	<item>	pager: Arc<Pager>,
+src/db/vault.rs:601	-	<item>	pub(crate) counts: Counts,
+src/db/vault.rs:602	-	<item>	}
+src/db/vault.rs:603	-	<item>	
+src/db/vault.rs:604	-	<item>	
+src/db/vault.rs:605	-	<item>	
+src/db/vault.rs:606	-	<item>	
+src/db/vault.rs:607	-	<item>	
+src/db/vault.rs:608	-	<item>	
+src/db/vault.rs:609	-	<item>	struct MappedFile {
+src/db/vault.rs:610	-	<item>	
+src/db/vault.rs:611	-	<item>	
+src/db/vault.rs:612	-	<item>	mem: Arc<File>,
+src/db/vault.rs:613	-	<item>	
+src/db/vault.rs:614	-	<item>	maps: usize,
+src/db/vault.rs:615	-	<item>	
+src/db/vault.rs:616	-	<item>	
+src/db/vault.rs:617	-	<item>	
+src/db/vault.rs:618	-	<item>	owed: Option<(Arc<Paged>, Disk)>,
+src/db/vault.rs:619	-	<item>	}
+src/db/vault.rs:620	-	<item>	
+src/db/vault.rs:621	-	<item>	
+src/db/vault.rs:622	-	<item>	
+src/db/vault.rs:623	-	<item>	
+src/db/vault.rs:624	-	<item>	
+src/db/vault.rs:625	-	<item>	
+src/db/vault.rs:626	-	<item>	
+src/db/vault.rs:627	-	<item>	pub(crate) struct Mapped(Option<(Arc<Vault>, Arc<File>)>);
+src/db/vault.rs:628	-	<item>	
+src/db/vault.rs:629	-	Mapped::<item>	impl Drop for Mapped {
+src/db/vault.rs:630	-	Mapped::drop	fn drop(&mut self) {
+src/db/vault.rs:631	-	Mapped::drop	if let Some((v, mem)) = self.0.take() {
+src/db/vault.rs:632	-	Mapped::drop	v.unmapped(&mem);
+src/db/vault.rs:633	-	Mapped::drop	}
+src/db/vault.rs:634	-	Mapped::<item>	}
+src/db/vault.rs:635	-	Mapped::<item>	}
+src/db/vault.rs:636	-	<item>	
+src/db/vault.rs:637	-	<item>	
+src/db/vault.rs:638	-	<item>	
+src/db/vault.rs:639	-	<item>	
+src/db/vault.rs:640	-	default_cache	fn default_cache() -> u64 {
+src/db/vault.rs:641	-	default_cache	#[cfg(target_os = "linux")]
+src/db/vault.rs:642	-	default_cache	if let Some(b) = super::zfile::read_budget() {
+src/db/vault.rs:643	-	default_cache	return (b.budget / 2).max(64 << 20);
+src/db/vault.rs:644	-	default_cache	}
+src/db/vault.rs:645	-	default_cache	1 << 30
+src/db/vault.rs:646	-	default_cache	}
+src/db/vault.rs:647	-	<item>	
+src/db/vault.rs:648	-	lock	fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+src/db/vault.rs:649	-	lock	m.lock().unwrap_or_else(|e| e.into_inner())
+src/db/vault.rs:650	-	lock	}
+src/db/vault.rs:651	-	<item>	
+src/db/vault.rs:652	-	<item>	
+src/db/vault.rs:653	-	<item>	
+src/db/vault.rs:654	-	<item>	
+src/db/vault.rs:655	-	<item>	static VAULTS: AtomicUsize = AtomicUsize::new(0);
+src/db/vault.rs:656	-	<item>	static REGISTRY: Mutex<Vec<Arc<Vault>>> = Mutex::new(Vec::new());
+src/db/vault.rs:657	-	<item>	
+src/db/vault.rs:658	-	<item>	
+src/db/vault.rs:659	-	under	pub(crate) fn under(dir: &Path) -> Option<Arc<Vault>> {
+src/db/vault.rs:660	-	under	if VAULTS.load(Ordering::Acquire) == 0 {
+src/db/vault.rs:661	-	under	return None;
+src/db/vault.rs:662	-	under	}
+src/db/vault.rs:663	-	under	lock(&REGISTRY).iter().find(|v| v.decoy == dir).cloned()
+src/db/vault.rs:664	-	under	}
+src/db/vault.rs:665	-	<item>	
+src/db/vault.rs:666	-	<item>	
+src/db/vault.rs:667	-	locate	fn locate(path: &Path) -> Option<(Arc<Vault>, String)> {
+src/db/vault.rs:668	-	locate	if VAULTS.load(Ordering::Acquire) == 0 {
+src/db/vault.rs:669	-	locate	return None;
+src/db/vault.rs:670	-	locate	}
+src/db/vault.rs:671	-	locate	let vault = under(path.parent()?)?;
+src/db/vault.rs:672	-	locate	Some((vault, path.file_name()?.to_str()?.to_string()))
+src/db/vault.rs:673	-	locate	}
+src/db/vault.rs:674	-	<item>	
+src/db/vault.rs:675	-	<item>	
+src/db/vault.rs:676	-	<item>	
+src/db/vault.rs:677	-	<item>	pub(crate) struct Held(Arc<Vault>);
+src/db/vault.rs:678	-	<item>	
+src/db/vault.rs:679	-	Held::<item>	impl Held {
+src/db/vault.rs:680	-	Held::<item>	
+src/db/vault.rs:681	-	Held::dir	pub(crate) fn dir(&self) -> PathBuf {
+src/db/vault.rs:682	-	Held::dir	self.0.decoy.clone()
+src/db/vault.rs:683	-	Held::<item>	}
+src/db/vault.rs:684	-	Held::<item>	
+src/db/vault.rs:685	-	Held::vault	pub(crate) fn vault(&self) -> &Arc<Vault> {
+src/db/vault.rs:686	-	Held::vault	&self.0
+src/db/vault.rs:687	-	Held::<item>	}
+src/db/vault.rs:688	-	Held::<item>	}
+src/db/vault.rs:689	-	<item>	
+src/db/vault.rs:690	-	Held::<item>	impl Drop for Held {
+src/db/vault.rs:691	-	Held::drop	fn drop(&mut self) {
+src/db/vault.rs:692	-	Held::drop	self.0.pager.stop();
+src/db/vault.rs:693	-	Held::drop	self.0.pager.set_grace(None);
+src/db/vault.rs:694	-	Held::drop	let mut reg = lock(&REGISTRY);
+src/db/vault.rs:695	-	Held::drop	if let Some(i) = reg.iter().position(|v| Arc::ptr_eq(v, &self.0)) {
+src/db/vault.rs:696	-	Held::drop	reg.swap_remove(i);
+src/db/vault.rs:697	-	Held::drop	VAULTS.fetch_sub(1, Ordering::AcqRel);
+src/db/vault.rs:698	-	Held::drop	}
+src/db/vault.rs:699	-	Held::<item>	}
+src/db/vault.rs:700	-	Held::<item>	}
+src/db/vault.rs:701	-	<item>	
+src/db/vault.rs:702	-	<item>	use pager::memfile;
+src/db/vault.rs:703	-	<item>	
+src/db/vault.rs:704	-	<item>	
+src/db/vault.rs:705	-	<item>	
+src/db/vault.rs:706	-	<item>	
+src/db/vault.rs:707	-	reopen	fn reopen(mem: &File, write: bool, append: bool) -> Result<File> {
+src/db/vault.rs:708	-	reopen	use std::os::fd::AsRawFd;
+src/db/vault.rs:709	-	reopen	let path = format!("/proc/self/fd/{}", mem.as_raw_fd());
+src/db/vault.rs:710	-	reopen	let mut o = OpenOptions::new();
+src/db/vault.rs:711	-	reopen	o.read(true);
+src/db/vault.rs:712	-	reopen	if append {
+src/db/vault.rs:713	-	reopen	o.append(true);
+src/db/vault.rs:714	-	reopen	} else if write {
+src/db/vault.rs:715	-	reopen	o.write(true);
+src/db/vault.rs:716	-	reopen	}
+src/db/vault.rs:717	-	reopen	match o.open(path) {
+src/db/vault.rs:718	-	reopen	Ok(f) => Ok(f),
+src/db/vault.rs:719	-	reopen	Err(_) => mem.try_clone(),
+src/db/vault.rs:720	-	reopen	}
+src/db/vault.rs:721	-	reopen	}
+src/db/vault.rs:722	-	<item>	
+src/db/vault.rs:723	-	<item>	
+src/db/vault.rs:724	-	<item>	
+src/db/vault.rs:725	-	<item>	
+src/db/vault.rs:726	-	<item>	
+src/db/vault.rs:727	-	<item>	
+src/db/vault.rs:728	-	<item>	
+src/db/vault.rs:729	-	<item>	
+src/db/vault.rs:730	-	<item>	
+src/db/vault.rs:731	-	<item>	struct Ahead {
+src/db/vault.rs:732	-	<item>	file: File,
+src/db/vault.rs:733	-	<item>	at: u64,
+src/db/vault.rs:734	-	<item>	hint: bool,
+src/db/vault.rs:735	-	<item>	}
+src/db/vault.rs:736	-	<item>	
+src/db/vault.rs:737	-	Ahead::<item>	impl Write for Ahead {
+src/db/vault.rs:738	-	Ahead::write	fn write(&mut self, data: &[u8]) -> Result<usize> {
+src/db/vault.rs:739	-	Ahead::write	self.file.write_all(data)?;
+src/db/vault.rs:740	-	Ahead::write	#[cfg(target_os = "linux")]
+src/db/vault.rs:741	-	Ahead::write	if self.hint {
+src/db/vault.rs:742	-	Ahead::write	use std::os::fd::AsRawFd;
+src/db/vault.rs:743	-	Ahead::write	
+src/db/vault.rs:744	-	Ahead::write	
+src/db/vault.rs:745	-	Ahead::write	unsafe {
+src/db/vault.rs:746	-	Ahead::write	libc::sync_file_range(
+src/db/vault.rs:747	-	Ahead::write	self.file.as_raw_fd(),
+src/db/vault.rs:748	-	Ahead::write	self.at as libc::off64_t,
+src/db/vault.rs:749	-	Ahead::write	data.len() as libc::off64_t,
+src/db/vault.rs:750	-	Ahead::write	libc::SYNC_FILE_RANGE_WRITE,
+src/db/vault.rs:751	-	Ahead::write	);
+src/db/vault.rs:752	-	Ahead::write	}
+src/db/vault.rs:753	-	Ahead::write	}
+src/db/vault.rs:754	-	Ahead::write	#[cfg(not(target_os = "linux"))]
+src/db/vault.rs:755	-	Ahead::write	let _ = self.hint;
+src/db/vault.rs:756	-	Ahead::write	self.at += data.len() as u64;
+src/db/vault.rs:757	-	Ahead::write	Ok(data.len())
+src/db/vault.rs:758	-	Ahead::<item>	}
+src/db/vault.rs:759	-	Ahead::<item>	
+src/db/vault.rs:760	-	Ahead::flush	fn flush(&mut self) -> Result<()> {
+src/db/vault.rs:761	-	Ahead::flush	Ok(())
+src/db/vault.rs:762	-	Ahead::<item>	}
+src/db/vault.rs:763	-	Ahead::<item>	}
+src/db/vault.rs:764	-	<item>	
+src/db/vault.rs:765	-	Vault::<item>	impl Vault {
+src/db/vault.rs:766	-	Vault::new	fn new(real: &Path, store: Box<DynAead>, cipher: &StoreCipher) -> Result<Vault> 
+src/db/vault.rs:767	-	Vault::new	Ok(Vault {
+src/db/vault.rs:768	-	Vault::new	real: real.to_path_buf(),
+src/db/vault.rs:769	-	Vault::new	decoy: real.join(MARKER),
+src/db/vault.rs:770	-	Vault::new	store,
+src/db/vault.rs:771	-	Vault::new	data: cipher.data.clone(),
+src/db/vault.rs:772	-	Vault::new	files: Mutex::new(HashMap::new()),
+src/db/vault.rs:773	-	Vault::new	nonces: Mutex::new(Nonces::new()?),
+src/db/vault.rs:774	-	Vault::new	persisting: Mutex::new(()),
+src/db/vault.rs:775	-	Vault::new	mapped: Mutex::new(Vec::new()),
+src/db/vault.rs:776	-	Vault::new	pager: Pager::new(cipher.cache.unwrap_or_else(default_cache)),
+src/db/vault.rs:777	-	Vault::new	counts: Counts::default(),
+src/db/vault.rs:778	-	Vault::new	})
+src/db/vault.rs:779	-	Vault::<item>	}
+src/db/vault.rs:780	-	Vault::<item>	
+src/db/vault.rs:781	-	Vault::<item>	
+src/db/vault.rs:782	-	Vault::pager	pub(crate) fn pager(&self) -> &Arc<Pager> {
+src/db/vault.rs:783	-	Vault::pager	&self.pager
+src/db/vault.rs:784	-	Vault::<item>	}
+src/db/vault.rs:785	-	Vault::<item>	
+src/db/vault.rs:786	-	Vault::register	fn register(self) -> Result<Held> {
+src/db/vault.rs:787	-	Vault::register	let mut reg = lock(&REGISTRY);
+src/db/vault.rs:788	-	Vault::register	if reg.iter().any(|v| v.decoy == self.decoy) {
+src/db/vault.rs:789	-	Vault::register	return Err(Error::new(
+src/db/vault.rs:790	-	Vault::register	ErrorKind::AlreadyExists,
+src/db/vault.rs:791	-	Vault::register	"the store under a cipher is open in this process already",
+src/db/vault.rs:792	-	Vault::register	));
+src/db/vault.rs:793	-	Vault::register	}
+src/db/vault.rs:794	-	Vault::register	let vault = Arc::new(self);
+src/db/vault.rs:795	-	Vault::register	reg.push(vault.clone());
+src/db/vault.rs:796	-	Vault::register	VAULTS.fetch_add(1, Ordering::AcqRel);
+src/db/vault.rs:797	-	Vault::register	Ok(Held(vault))
+src/db/vault.rs:798	-	Vault::<item>	}
+src/db/vault.rs:799	-	Vault::<item>	
+src/db/vault.rs:800	-	Vault::<item>	
+src/db/vault.rs:801	-	Vault::<item>	
+src/db/vault.rs:802	-	Vault::<item>	
+src/db/vault.rs:803	-	Vault::create	pub(crate) fn create(real: &Path, cipher: &StoreCipher) -> Result<Held> {
+src/db/vault.rs:804	-	Vault::create	if std::fs::read_dir(real)?.next().is_some() {
+src/db/vault.rs:805	-	Vault::create	return Err(refused(
+src/db/vault.rs:806	-	Vault::create	"a store under a cipher is made in an empty directory, and this one is not",
+src/db/vault.rs:807	-	Vault::create	));
+src/db/vault.rs:808	-	Vault::create	}
+src/db/vault.rs:809	-	Vault::create	
+src/db/vault.rs:810	-	Vault::create	drop(memfile()?);
+src/db/vault.rs:811	-	Vault::create	let key = Key::draw()?;
+src/db/vault.rs:812	-	Vault::create	let mut store_id = [0u8; 16];
+src/db/vault.rs:813	-	Vault::create	random(&mut store_id)?;
+src/db/vault.rs:814	-	Vault::create	write_marker(real, cipher, &store_id, &key)?;
+src/db/vault.rs:815	-	Vault::create	Vault::new(real, (cipher.data)(&key.0), cipher)?.register()
+src/db/vault.rs:816	-	Vault::<item>	}
+src/db/vault.rs:817	-	Vault::<item>	
+src/db/vault.rs:818	-	Vault::<item>	
+src/db/vault.rs:819	-	Vault::<item>	
+src/db/vault.rs:820	-	Vault::open	pub(crate) fn open(real: &Path, cipher: &StoreCipher) -> Result<Held> {
+src/db/vault.rs:821	-	Vault::open	
+src/db/vault.rs:822	-	Vault::open	drop(memfile()?);
+src/db/vault.rs:823	-	Vault::open	let bytes = match std::fs::read(real.join(MARKER)) {
+src/db/vault.rs:824	-	Vault::open	Ok(b) => b,
+src/db/vault.rs:825	-	Vault::open	Err(e) if e.kind() == ErrorKind::NotFound => {
+src/db/vault.rs:826	-	Vault::open	return Err(Error::new(
+src/db/vault.rs:827	-	Vault::open	ErrorKind::PermissionDenied,
+src/db/vault.rs:828	-	Vault::open	"a cipher was given to a store that is not kept under one: it would go on in \
+src/db/vault.rs:829	-	Vault::open	the clear",
+src/db/vault.rs:830	-	Vault::open	));
+src/db/vault.rs:831	-	Vault::open	}
+src/db/vault.rs:832	-	Vault::open	Err(e) => return Err(e),
+src/db/vault.rs:833	-	Vault::open	};
+src/db/vault.rs:834	-	Vault::open	marker_key_id(&bytes)?;
+src/db/vault.rs:835	-	Vault::open	let key = unseal(
+src/db/vault.rs:836	-	Vault::open	&*cipher.master,
+src/db/vault.rs:837	-	Vault::open	&bytes[..MARKER_HEAD],
+src/db/vault.rs:838	-	Vault::open	&bytes[MARKER_HEAD..],
+src/db/vault.rs:839	-	Vault::open	)
+src/db/vault.rs:840	-	Vault::open	.and_then(|k| Some(Key(k.as_slice().try_into().ok()?)))
+src/db/vault.rs:841	-	Vault::open	.ok_or_else(|| {
+src/db/vault.rs:842	-	Vault::open	Error::new(
+src/db/vault.rs:843	-	Vault::open	ErrorKind::PermissionDenied,
+src/db/vault.rs:844	-	Vault::open	"the cipher given does not open the store: the key is wrong, or the marker \
+src/db/vault.rs:845	-	Vault::open	was changed",
+src/db/vault.rs:846	-	Vault::open	)
+src/db/vault.rs:847	-	Vault::open	})?;
+src/db/vault.rs:848	-	Vault::open	
+src/db/vault.rs:849	-	Vault::open	
+src/db/vault.rs:850	-	Vault::open	let _ = std::fs::remove_file(real.join(format!("{MARKER}.tmp")));
+src/db/vault.rs:851	-	Vault::open	Vault::new(real, (cipher.data)(&key.0), cipher)?.register()
+src/db/vault.rs:852	-	Vault::<item>	}
+src/db/vault.rs:853	-	Vault::<item>	
+src/db/vault.rs:854	-	Vault::<item>	fn nonce(&self) -> Result<[u8; NONCE]> {
+src/db/vault.rs:855	-	Vault::<item>	lock(&self.nonces).take()
+src/db/vault.rs:856	-	Vault::<item>	}
+src/db/vault.rs:857	-	Vault::<item>	
+src/db/vault.rs:858	-	Vault::<item>	
+src/db/vault.rs:859	-	Vault::counts	pub(crate) fn counts(&self) -> CipherCounts {
+src/db/vault.rs:860	-	Vault::counts	let files = lock(&self.files)
+src/db/vault.rs:861	-	Vault::counts	.values()
+src/db/vault.rs:862	-	Vault::counts	.filter(|e| e.mem.is_some())
+src/db/vault.rs:863	-	Vault::counts	.count();
+src/db/vault.rs:864	-	Vault::counts	self.counts.read(files as u64, self.pager.counts())
+src/db/vault.rs:865	-	Vault::<item>	}
+src/db/vault.rs:866	-	Vault::<item>	
+src/db/vault.rs:867	-	Vault::<item>	
+src/db/vault.rs:868	-	Vault::<item>	fn wrap(&self, of: &[u8], key: &Key) -> Result<[u8; WRAPPED]> {
+src/db/vault.rs:869	-	Vault::<item>	Ok(seal(&*self.store, self.nonce()?, of, &key.0)
+src/db/vault.rs:870	-	Vault::<item>	.as_slice()
+src/db/vault.rs:871	-	Vault::<item>	.try_into()
+src/db/vault.rs:872	-	Vault::<item>	.unwrap())
+src/db/vault.rs:873	-	Vault::<item>	}
+src/db/vault.rs:874	-	Vault::<item>	
+src/db/vault.rs:875	-	Vault::unwrap	fn unwrap(&self, of: &[u8], wrapped: &[u8]) -> Option<Key> {
+src/db/vault.rs:876	-	Vault::unwrap	let k = unseal(&*self.store, of, wrapped)?;
+src/db/vault.rs:877	-	Vault::unwrap	Some(Key(k.as_slice().try_into().ok()?))
+src/db/vault.rs:878	-	Vault::<item>	}
+src/db/vault.rs:879	-	Vault::<item>	
+src/db/vault.rs:880	-	Vault::<item>	fn file_aad(token: &Token) -> [u8; 20] {
+src/db/vault.rs:881	-	Vault::<item>	let mut a = [0u8; 20];
+src/db/vault.rs:882	-	Vault::<item>	a[..4].copy_from_slice(b"file");
+src/db/vault.rs:883	-	Vault::<item>	a[4..].copy_from_slice(token);
+src/db/vault.rs:884	-	Vault::<item>	a
+src/db/vault.rs:885	-	Vault::<item>	}
+src/db/vault.rs:886	-	Vault::<item>	
+src/db/vault.rs:887	-	Vault::<item>	
+src/db/vault.rs:888	-	Vault::<item>	
+src/db/vault.rs:889	-	Vault::make	fn make(&self, name: &str) -> Result<File> {
+src/db/vault.rs:890	-	Vault::make	let mem = memfile()?;
+src/db/vault.rs:891	-	Vault::make	let handle = mem.try_clone()?;
+src/db/vault.rs:892	-	Vault::make	
+src/db/vault.rs:893	-	Vault::make	
+src/db/vault.rs:894	-	Vault::make	
+src/db/vault.rs:895	-	Vault::make	lock(&self.files).insert(
+src/db/vault.rs:896	-	Vault::make	name.to_string(),
+src/db/vault.rs:897	-	Vault::make	Entry {
+src/db/vault.rs:898	-	Vault::make	mem: Some(Arc::new(mem)),
+src/db/vault.rs:899	-	Vault::make	page: None,
+src/db/vault.rs:900	-	Vault::make	disk: None,
+src/db/vault.rs:901	-	Vault::make	},
+src/db/vault.rs:902	-	Vault::make	);
+src/db/vault.rs:903	-	Vault::make	Ok(handle)
+src/db/vault.rs:904	-	Vault::<item>	}
+src/db/vault.rs:905	-	Vault::<item>	
+src/db/vault.rs:906	-	Vault::<item>	
+src/db/vault.rs:907	-	Vault::back_of	fn back_of(&self, disk: &Disk) -> Result<Back> {
+src/db/vault.rs:908	-	Vault::back_of	let key = self
+src/db/vault.rs:909	-	Vault::back_of	.unwrap(&Vault::file_aad(&disk.token), &disk.wrapped)
+src/db/vault.rs:910	-	Vault::back_of	.ok_or_else(|| refused("a file's key does not unwrap under the store's"))?;
+src/db/vault.rs:911	-	Vault::back_of	Back::open(&self.real.join(disk.name()), (self.data)(&key.0))
+src/db/vault.rs:912	-	Vault::<item>	}
+src/db/vault.rs:913	-	Vault::<item>	
+src/db/vault.rs:914	-	Vault::<item>	
+src/db/vault.rs:915	-	Vault::<item>	
+src/db/vault.rs:916	-	Vault::<item>	
+src/db/vault.rs:917	-	Vault::<item>	
+src/db/vault.rs:918	-	Vault::<item>	
+src/db/vault.rs:919	-	Vault::page_of	fn page_of(&self, name: &str) -> Result<Arc<Paged>> {
+src/db/vault.rs:920	-	Vault::page_of	let mut files = lock(&self.files);
+src/db/vault.rs:921	-	Vault::page_of	let e = files
+src/db/vault.rs:922	-	Vault::page_of	.get(name)
+src/db/vault.rs:923	-	Vault::page_of	.cloned()
+src/db/vault.rs:924	-	Vault::page_of	.ok_or_else(|| Error::from(ErrorKind::NotFound))?;
+src/db/vault.rs:925	-	Vault::page_of	if let Some(p) = e.page {
+src/db/vault.rs:926	-	Vault::page_of	return Ok(p);
+src/db/vault.rs:927	-	Vault::page_of	}
+src/db/vault.rs:928	-	Vault::page_of	let page = match (&e.mem, &e.disk) {
+src/db/vault.rs:929	-	Vault::page_of	(Some(mem), disk) => {
+src/db/vault.rs:930	-	Vault::page_of	let p = Paged::adopt(&self.pager, mem, mem.metadata()?.len(), name)?;
+src/db/vault.rs:931	-	Vault::page_of	if let Some(d) = disk {
+src/db/vault.rs:932	-	Vault::page_of	p.back(self.back_of(d)?)?;
+src/db/vault.rs:933	-	Vault::page_of	}
+src/db/vault.rs:934	-	Vault::page_of	p
+src/db/vault.rs:935	-	Vault::page_of	}
+src/db/vault.rs:936	-	Vault::page_of	(None, Some(d)) => Paged::sparse(&self.pager, self.back_of(d)?, name)?,
+src/db/vault.rs:937	-	Vault::page_of	(None, None) => return Err(Error::from(ErrorKind::NotFound)),
+src/db/vault.rs:938	-	Vault::page_of	};
+src/db/vault.rs:939	-	Vault::page_of	let backed = page.backed();
+src/db/vault.rs:940	-	Vault::page_of	for o in files.values_mut() {
+src/db/vault.rs:941	-	Vault::page_of	let same = match (&e.mem, &e.disk) {
+src/db/vault.rs:942	-	Vault::page_of	(Some(mem), _) => o.mem.as_ref().is_some_and(|m| Arc::ptr_eq(m, mem)),
+src/db/vault.rs:943	-	Vault::page_of	(None, Some(d)) => o.mem.is_none() && o.disk.as_ref().is_some_and(|x| x.same(d))
+src/db/vault.rs:944	-	Vault::page_of	(None, None) => false,
+src/db/vault.rs:945	-	Vault::page_of	};
+src/db/vault.rs:946	-	Vault::page_of	if same && o.page.is_none() {
+src/db/vault.rs:947	-	Vault::page_of	o.page = Some(page.clone());
+src/db/vault.rs:948	-	Vault::page_of	if backed {
+src/db/vault.rs:949	-	Vault::page_of	
+src/db/vault.rs:950	-	Vault::page_of	
+src/db/vault.rs:951	-	Vault::page_of	o.mem = None;
+src/db/vault.rs:952	-	Vault::page_of	}
+src/db/vault.rs:953	-	Vault::page_of	}
+src/db/vault.rs:954	-	Vault::page_of	}
+src/db/vault.rs:955	-	Vault::page_of	Ok(page)
+src/db/vault.rs:956	-	Vault::<item>	}
+src/db/vault.rs:957	-	Vault::<item>	
+src/db/vault.rs:958	-	Vault::len	fn len(&self, name: &str) -> Result<u64> {
+src/db/vault.rs:959	-	Vault::len	let disk = {
+src/db/vault.rs:960	-	Vault::len	let files = lock(&self.files);
+src/db/vault.rs:961	-	Vault::len	let e = files
+src/db/vault.rs:962	-	Vault::len	.get(name)
+src/db/vault.rs:963	-	Vault::len	.ok_or_else(|| Error::from(ErrorKind::NotFound))?;
+src/db/vault.rs:964	-	Vault::len	if let Some(mem) = &e.mem {
+src/db/vault.rs:965	-	Vault::len	return Ok(mem.metadata()?.len());
+src/db/vault.rs:966	-	Vault::len	}
+src/db/vault.rs:967	-	Vault::len	if let Some(page) = &e.page {
+src/db/vault.rs:968	-	Vault::len	return Ok(page.size());
+src/db/vault.rs:969	-	Vault::len	}
+src/db/vault.rs:970	-	Vault::len	e.disk
+src/db/vault.rs:971	-	Vault::len	.clone()
+src/db/vault.rs:972	-	Vault::len	.ok_or_else(|| Error::from(ErrorKind::NotFound))?
+src/db/vault.rs:973	-	Vault::len	};
+src/db/vault.rs:974	-	Vault::len	
+src/db/vault.rs:975	-	Vault::len	
+src/db/vault.rs:976	-	Vault::len	let mut head = [0u8; crypt::Header::LEN];
+src/db/vault.rs:977	-	Vault::len	File::open(self.real.join(disk.name()))?.read_exact(&mut head)?;
+src/db/vault.rs:978	-	Vault::len	Ok(crypt::Header::parse(&head)?.plain_len())
+src/db/vault.rs:979	-	Vault::<item>	}
+src/db/vault.rs:980	-	Vault::<item>	
+src/db/vault.rs:981	-	Vault::remove	fn remove(&self, name: &str) -> Result<()> {
+src/db/vault.rs:982	-	Vault::remove	let mut files = lock(&self.files);
+src/db/vault.rs:983	-	Vault::remove	let e = files
+src/db/vault.rs:984	-	Vault::remove	.remove(name)
+src/db/vault.rs:985	-	Vault::remove	.ok_or_else(|| Error::from(ErrorKind::NotFound))?;
+src/db/vault.rs:986	-	Vault::remove	if let Some(d) = e.disk {
+src/db/vault.rs:987	-	Vault::remove	
+src/db/vault.rs:988	-	Vault::remove	let shared = files
+src/db/vault.rs:989	-	Vault::remove	.values()
+src/db/vault.rs:990	-	Vault::remove	.any(|o| o.disk.as_ref().is_some_and(|x| x.same(&d)));
+src/db/vault.rs:991	-	Vault::remove	if !shared {
+src/db/vault.rs:992	-	Vault::remove	let _ = std::fs::remove_file(self.real.join(d.name()));
+src/db/vault.rs:993	-	Vault::remove	if d.kind == Kind::Seg {
+src/db/vault.rs:994	-	Vault::remove	
+src/db/vault.rs:995	-	Vault::remove	
+src/db/vault.rs:996	-	Vault::remove	
+src/db/vault.rs:997	-	Vault::remove	let z = Disk {
+src/db/vault.rs:998	-	Vault::remove	kind: Kind::Form,
+src/db/vault.rs:999	-	Vault::remove	..d
+src/db/vault.rs:1000	-	Vault::remove	};
+src/db/vault.rs:1001	-	Vault::remove	let held = files
+src/db/vault.rs:1002	-	Vault::remove	.values()
+src/db/vault.rs:1003	-	Vault::remove	.any(|o| o.disk.as_ref().is_some_and(|x| x.same(&z)));
+src/db/vault.rs:1004	-	Vault::remove	if !held {
+src/db/vault.rs:1005	-	Vault::remove	let _ = std::fs::remove_file(self.real.join(z.name()));
+src/db/vault.rs:1006	-	Vault::remove	}
+src/db/vault.rs:1007	-	Vault::remove	}
+src/db/vault.rs:1008	-	Vault::remove	}
+src/db/vault.rs:1009	-	Vault::remove	}
+src/db/vault.rs:1010	-	Vault::remove	Ok(())
+src/db/vault.rs:1011	-	Vault::<item>	}
+src/db/vault.rs:1012	-	Vault::<item>	
+src/db/vault.rs:1013	-	Vault::rename	fn rename(&self, from: &str, to: &str) -> Result<()> {
+src/db/vault.rs:1014	-	Vault::rename	let mut files = lock(&self.files);
+src/db/vault.rs:1015	-	Vault::rename	let e = files
+src/db/vault.rs:1016	-	Vault::rename	.remove(from)
+src/db/vault.rs:1017	-	Vault::rename	.ok_or_else(|| Error::from(ErrorKind::NotFound))?;
+src/db/vault.rs:1018	-	Vault::rename	files.insert(to.to_string(), e);
+src/db/vault.rs:1019	-	Vault::rename	Ok(())
+src/db/vault.rs:1020	-	Vault::<item>	}
+src/db/vault.rs:1021	-	Vault::<item>	
+src/db/vault.rs:1022	-	Vault::link	fn link(&self, from: &str, to: &str) -> Result<()> {
+src/db/vault.rs:1023	-	Vault::link	let mut files = lock(&self.files);
+src/db/vault.rs:1024	-	Vault::link	if files.contains_key(to) {
+src/db/vault.rs:1025	-	Vault::link	return Err(Error::from(ErrorKind::AlreadyExists));
+src/db/vault.rs:1026	-	Vault::link	}
+src/db/vault.rs:1027	-	Vault::link	let e = files
+src/db/vault.rs:1028	-	Vault::link	.get(from)
+src/db/vault.rs:1029	-	Vault::link	.cloned()
+src/db/vault.rs:1030	-	Vault::link	.ok_or_else(|| Error::from(ErrorKind::NotFound))?;
+src/db/vault.rs:1031	-	Vault::link	files.insert(to.to_string(), e);
+src/db/vault.rs:1032	-	Vault::link	Ok(())
+src/db/vault.rs:1033	-	Vault::<item>	}
+src/db/vault.rs:1034	-	Vault::<item>	
+src/db/vault.rs:1035	-	Vault::<item>	
+src/db/vault.rs:1036	-	Vault::<item>	
+src/db/vault.rs:1037	-	Vault::<item>	
+src/db/vault.rs:1038	-	Vault::<item>	
+src/db/vault.rs:1039	-	Vault::map_written	fn map_written(&self, name: &str) -> Result<(File, Arc<File>)> {
+src/db/vault.rs:1040	-	Vault::map_written	let files = lock(&self.files);
+src/db/vault.rs:1041	-	Vault::map_written	let mem = files
+src/db/vault.rs:1042	-	Vault::map_written	.get(name)
+src/db/vault.rs:1043	-	Vault::map_written	.ok_or_else(|| Error::from(ErrorKind::NotFound))?
+src/db/vault.rs:1044	-	Vault::map_written	.mem
+src/db/vault.rs:1045	-	Vault::map_written	.clone()
+src/db/vault.rs:1046	-	Vault::map_written	.ok_or_else(|| {
+src/db/vault.rs:1047	-	Vault::map_written	Error::new(
+src/db/vault.rs:1048	-	Vault::map_written	ErrorKind::Unsupported,
+src/db/vault.rs:1049	-	Vault::map_written	"a file of a store under a cipher that has its envelope is read through \
+src/db/vault.rs:1050	-	Vault::map_written	its mapping",
+src/db/vault.rs:1051	-	Vault::map_written	)
+src/db/vault.rs:1052	-	Vault::map_written	})?;
+src/db/vault.rs:1053	-	Vault::map_written	let file = reopen(&mem, false, false)?;
+src/db/vault.rs:1054	-	Vault::map_written	let mut mapped = lock(&self.mapped);
+src/db/vault.rs:1055	-	Vault::map_written	match mapped.iter_mut().find(|m| Arc::ptr_eq(&m.mem, &mem)) {
+src/db/vault.rs:1056	-	Vault::map_written	Some(m) => m.maps += 1,
+src/db/vault.rs:1057	-	Vault::map_written	None => mapped.push(MappedFile {
+src/db/vault.rs:1058	-	Vault::map_written	mem: mem.clone(),
+src/db/vault.rs:1059	-	Vault::map_written	maps: 1,
+src/db/vault.rs:1060	-	Vault::map_written	owed: None,
+src/db/vault.rs:1061	-	Vault::map_written	}),
+src/db/vault.rs:1062	-	Vault::map_written	}
+src/db/vault.rs:1063	-	Vault::map_written	Ok((file, mem))
+src/db/vault.rs:1064	-	Vault::<item>	}
+src/db/vault.rs:1065	-	Vault::<item>	
+src/db/vault.rs:1066	-	Vault::<item>	
+src/db/vault.rs:1067	-	Vault::<item>	
+src/db/vault.rs:1068	-	Vault::<item>	
+src/db/vault.rs:1069	-	Vault::<item>	
+src/db/vault.rs:1070	-	Vault::unmapped	fn unmapped(&self, mem: &Arc<File>) {
+src/db/vault.rs:1071	-	Vault::unmapped	let _files = lock(&self.files);
+src/db/vault.rs:1072	-	Vault::unmapped	let mut mapped = lock(&self.mapped);
+src/db/vault.rs:1073	-	Vault::unmapped	let Some(i) = mapped.iter().position(|m| Arc::ptr_eq(&m.mem, mem)) else {
+src/db/vault.rs:1074	-	Vault::unmapped	return;
+src/db/vault.rs:1075	-	Vault::unmapped	};
+src/db/vault.rs:1076	-	Vault::unmapped	mapped[i].maps -= 1;
+src/db/vault.rs:1077	-	Vault::unmapped	if mapped[i].maps > 0 {
+src/db/vault.rs:1078	-	Vault::unmapped	return;
+src/db/vault.rs:1079	-	Vault::unmapped	}
+src/db/vault.rs:1080	-	Vault::unmapped	if let Some((page, disk)) = mapped.swap_remove(i).owed {
+src/db/vault.rs:1081	-	Vault::unmapped	if let Ok(back) = self.back_of(&disk) {
+src/db/vault.rs:1082	-	Vault::unmapped	let _ = page.back(back);
+src/db/vault.rs:1083	-	Vault::unmapped	}
+src/db/vault.rs:1084	-	Vault::unmapped	}
+src/db/vault.rs:1085	-	Vault::<item>	}
+src/db/vault.rs:1086	-	Vault::<item>	
+src/db/vault.rs:1087	-	Vault::<item>	
+src/db/vault.rs:1088	-	Vault::<item>	
+src/db/vault.rs:1089	-	Vault::<item>	
+src/db/vault.rs:1090	-	Vault::rewrite	fn rewrite(&self, name: &str, append: bool) -> Result<File> {
+src/db/vault.rs:1091	-	Vault::rewrite	let mem = {
+src/db/vault.rs:1092	-	Vault::rewrite	let files = lock(&self.files);
+src/db/vault.rs:1093	-	Vault::rewrite	let e = files
+src/db/vault.rs:1094	-	Vault::rewrite	.get(name)
+src/db/vault.rs:1095	-	Vault::rewrite	.ok_or_else(|| Error::from(ErrorKind::NotFound))?;
+src/db/vault.rs:1096	-	Vault::rewrite	if e.disk.is_some() || e.page.is_some() {
+src/db/vault.rs:1097	-	Vault::rewrite	return Err(Error::new(
+src/db/vault.rs:1098	-	Vault::rewrite	ErrorKind::PermissionDenied,
+src/db/vault.rs:1099	-	Vault::rewrite	"a file of a store under a cipher is written once: it has its envelope, or \
+src/db/vault.rs:1100	-	Vault::rewrite	a reader",
+src/db/vault.rs:1101	-	Vault::rewrite	));
+src/db/vault.rs:1102	-	Vault::rewrite	}
+src/db/vault.rs:1103	-	Vault::rewrite	e.mem
+src/db/vault.rs:1104	-	Vault::rewrite	.clone()
+src/db/vault.rs:1105	-	Vault::rewrite	.ok_or_else(|| Error::from(ErrorKind::NotFound))?
+src/db/vault.rs:1106	-	Vault::rewrite	};
+src/db/vault.rs:1107	-	Vault::rewrite	reopen(&mem, true, append)
+src/db/vault.rs:1108	-	Vault::<item>	}
+src/db/vault.rs:1109	-	Vault::<item>	
+src/db/vault.rs:1110	-	Vault::<item>	
+src/db/vault.rs:1111	-	Vault::<item>	
+src/db/vault.rs:1112	-	Vault::<item>	
+src/db/vault.rs:1113	-	Vault::reopen_written	fn reopen_written(&self, name: &str) -> Result<File> {
+src/db/vault.rs:1114	-	Vault::reopen_written	let mem = lock(&self.files)
+src/db/vault.rs:1115	-	Vault::reopen_written	.get(name)
+src/db/vault.rs:1116	-	Vault::reopen_written	.ok_or_else(|| Error::from(ErrorKind::NotFound))?
+src/db/vault.rs:1117	-	Vault::reopen_written	.mem
+src/db/vault.rs:1118	-	Vault::reopen_written	.clone()
+src/db/vault.rs:1119	-	Vault::reopen_written	.ok_or_else(|| {
+src/db/vault.rs:1120	-	Vault::reopen_written	Error::new(
+src/db/vault.rs:1121	-	Vault::reopen_written	ErrorKind::Unsupported,
+src/db/vault.rs:1122	-	Vault::reopen_written	"a file of a store under a cipher that has its envelope is read through \
+src/db/vault.rs:1123	-	Vault::reopen_written	its mapping",
+src/db/vault.rs:1124	-	Vault::reopen_written	)
+src/db/vault.rs:1125	-	Vault::reopen_written	})?;
+src/db/vault.rs:1126	-	Vault::reopen_written	reopen(&mem, false, false)
+src/db/vault.rs:1127	-	Vault::<item>	}
+src/db/vault.rs:1128	-	Vault::<item>	
+src/db/vault.rs:1129	-	Vault::<item>	
+src/db/vault.rs:1130	-	Vault::<item>	
+src/db/vault.rs:1131	-	Vault::names	fn names(&self) -> Result<Vec<String>> {
+src/db/vault.rs:1132	-	Vault::names	let mut out: Vec<String> = lock(&self.files).keys().cloned().collect();
+src/db/vault.rs:1133	-	Vault::names	for entry in std::fs::read_dir(&self.real)? {
+src/db/vault.rs:1134	-	Vault::names	let name = entry?.file_name().to_string_lossy().into_owned();
+src/db/vault.rs:1135	-	Vault::names	if passes(&name) {
+src/db/vault.rs:1136	-	Vault::names	out.push(name);
+src/db/vault.rs:1137	-	Vault::names	}
+src/db/vault.rs:1138	-	Vault::names	}
+src/db/vault.rs:1139	-	Vault::names	Ok(out)
+src/db/vault.rs:1140	-	Vault::<item>	}
+src/db/vault.rs:1141	-	Vault::<item>	
+src/db/vault.rs:1142	-	Vault::<item>	
+src/db/vault.rs:1143	-	Vault::<item>	
+src/db/vault.rs:1144	-	Vault::<item>	
+src/db/vault.rs:1145	-	Vault::<item>	
+src/db/vault.rs:1146	-	Vault::<item>	
+src/db/vault.rs:1147	-	Vault::<item>	
+src/db/vault.rs:1148	-	Vault::<item>	
+src/db/vault.rs:1149	-	Vault::<item>	
+src/db/vault.rs:1150	-	Vault::<item>	
+src/db/vault.rs:1151	-	Vault::<item>	
+src/db/vault.rs:1152	-	Vault::<item>	
+src/db/vault.rs:1153	-	Vault::<item>	
+src/db/vault.rs:1154	-	Vault::<item>	
+src/db/vault.rs:1155	-	Vault::<item>	
+src/db/vault.rs:1156	-	Vault::<item>	
+src/db/vault.rs:1157	-	Vault::write_envelope	fn write_envelope(&self, mem: &File, disk: &Disk, key: &Key, sync: bool) -> Resu
+src/db/vault.rs:1158	-	Vault::write_envelope	self.write_envelope_at(mem, &self.real.join(disk.name()), key, sync)
+src/db/vault.rs:1159	-	Vault::<item>	}
+src/db/vault.rs:1160	-	Vault::<item>	
+src/db/vault.rs:1161	-	Vault::<item>	
+src/db/vault.rs:1162	-	Vault::write_envelope_at	fn write_envelope_at(&self, mem: &File, path: &Path, key: &Key, sync: bool) -> R
+src/db/vault.rs:1163	-	Vault::write_envelope_at	let aead = (self.data)(&key.0);
+src/db/vault.rs:1164	-	Vault::write_envelope_at	let len = mem.metadata()?.len();
+src/db/vault.rs:1165	-	Vault::write_envelope_at	
+src/db/vault.rs:1166	-	Vault::write_envelope_at	let opts = EncryptOptions::default();
+src/db/vault.rs:1167	-	Vault::write_envelope_at	let mut out = Ahead {
+src/db/vault.rs:1168	-	Vault::write_envelope_at	file: File::create(path)?,
+src/db/vault.rs:1169	-	Vault::write_envelope_at	at: 0,
+src/db/vault.rs:1170	-	Vault::write_envelope_at	hint: sync,
+src/db/vault.rs:1171	-	Vault::write_envelope_at	};
+src/db/vault.rs:1172	-	Vault::write_envelope_at	if len == 0 {
+src/db/vault.rs:1173	-	Vault::write_envelope_at	crypt::encrypt(&crate::bytes::SliceBytes(&[]), &mut out, &*aead, &opts)?;
+src/db/vault.rs:1174	-	Vault::write_envelope_at	} else {
+src/db/vault.rs:1175	-	Vault::write_envelope_at	
+src/db/vault.rs:1176	-	Vault::write_envelope_at	
+src/db/vault.rs:1177	-	Vault::write_envelope_at	let src = MmapBytes::from_map(unsafe { memmap2::Mmap::map(mem)? });
+src/db/vault.rs:1178	-	Vault::write_envelope_at	crypt::encrypt(&src, &mut out, &*aead, &opts)?;
+src/db/vault.rs:1179	-	Vault::write_envelope_at	}
+src/db/vault.rs:1180	-	Vault::write_envelope_at	let out = out.file;
+src/db/vault.rs:1181	-	Vault::write_envelope_at	if sync {
+src/db/vault.rs:1182	-	Vault::write_envelope_at	out.sync_all()?;
+src/db/vault.rs:1183	-	Vault::write_envelope_at	}
+src/db/vault.rs:1184	-	Vault::write_envelope_at	Counts::add(&self.counts.persisted, 1);
+src/db/vault.rs:1185	-	Vault::write_envelope_at	Counts::add(&self.counts.persisted_bytes, len);
+src/db/vault.rs:1186	-	Vault::write_envelope_at	Ok(len)
+src/db/vault.rs:1187	-	Vault::<item>	}
+src/db/vault.rs:1188	-	Vault::<item>	
+src/db/vault.rs:1189	-	Vault::<item>	
+src/db/vault.rs:1190	-	Vault::<item>	
+src/db/vault.rs:1191	-	Vault::<item>	
+src/db/vault.rs:1192	-	Vault::<item>	
+src/db/vault.rs:1193	-	Vault::<item>	
+src/db/vault.rs:1194	-	Vault::<item>	
+src/db/vault.rs:1195	-	Vault::<item>	
+src/db/vault.rs:1196	-	Vault::keeps	fn keeps(&self, mem: &Arc<File>) -> bool {
+src/db/vault.rs:1197	-	Vault::keeps	let viewed = lock(&self.files)
+src/db/vault.rs:1198	-	Vault::keeps	.values()
+src/db/vault.rs:1199	-	Vault::keeps	.any(|e| e.page.is_some() && e.mem.as_ref().is_some_and(|m| Arc::ptr_eq(m, mem))
+src/db/vault.rs:1200	-	Vault::keeps	viewed || mem.metadata().is_ok_and(|m| self.pager.room_for(m.len()))
+src/db/vault.rs:1201	-	Vault::<item>	}
+src/db/vault.rs:1202	-	Vault::<item>	
+src/db/vault.rs:1203	-	Vault::<item>	
+src/db/vault.rs:1204	-	Vault::<item>	
+src/db/vault.rs:1205	-	Vault::<item>	
+src/db/vault.rs:1206	-	Vault::<item>	
+src/db/vault.rs:1207	-	Vault::<item>	
+src/db/vault.rs:1208	-	Vault::<item>	
+src/db/vault.rs:1209	-	Vault::<item>	
+src/db/vault.rs:1210	-	Vault::<item>	
+src/db/vault.rs:1211	-	Vault::<item>	
+src/db/vault.rs:1212	-	Vault::<item>	
+src/db/vault.rs:1213	-	Vault::<item>	
+src/db/vault.rs:1214	-	Vault::<item>	
+src/db/vault.rs:1215	-	Vault::<item>	
+src/db/vault.rs:1216	-	Vault::<item>	
+src/db/vault.rs:1217	-	Vault::<item>	
+src/db/vault.rs:1218	-	Vault::<item>	
+src/db/vault.rs:1219	-	Vault::<item>	
+src/db/vault.rs:1220	-	Vault::<item>	fn settled(
+src/db/vault.rs:1221	-	Vault::<item>	&self,
+src/db/vault.rs:1222	-	Vault::<item>	files: &mut HashMap<String, Entry>,
+src/db/vault.rs:1223	-	Vault::<item>	name: &str,
+src/db/vault.rs:1224	-	Vault::<item>	mem: &Arc<File>,
+src/db/vault.rs:1225	-	Vault::<item>	disk: &Disk,
+src/db/vault.rs:1226	-	Vault::<item>	keep: bool,
+src/db/vault.rs:1227	-	Vault::settled	) -> Result<()> {
+src/db/vault.rs:1228	-	Vault::settled	let over = |e: &Entry| e.mem.as_ref().is_some_and(|m| Arc::ptr_eq(m, mem));
+src/db/vault.rs:1229	-	Vault::settled	let viewed = files
+src/db/vault.rs:1230	-	Vault::settled	.values()
+src/db/vault.rs:1231	-	Vault::settled	.filter(|e| over(e))
+src/db/vault.rs:1232	-	Vault::settled	.find_map(|e| e.page.clone());
+src/db/vault.rs:1233	-	Vault::settled	
+src/db/vault.rs:1234	-	Vault::settled	
+src/db/vault.rs:1235	-	Vault::settled	
+src/db/vault.rs:1236	-	Vault::settled	
+src/db/vault.rs:1237	-	Vault::settled	
+src/db/vault.rs:1238	-	Vault::settled	let mut mapped = lock(&self.mapped);
+src/db/vault.rs:1239	-	Vault::settled	let mut held = mapped.iter_mut().find(|m| Arc::ptr_eq(&m.mem, mem));
+src/db/vault.rs:1240	-	Vault::settled	let mut give = |p: &Arc<Paged>| -> Result<()> {
+src/db/vault.rs:1241	-	Vault::settled	match held.as_mut() {
+src/db/vault.rs:1242	-	Vault::settled	Some(m) => m.owed = Some((p.clone(), disk.clone())),
+src/db/vault.rs:1243	-	Vault::settled	None => p.back(self.back_of(disk)?)?,
+src/db/vault.rs:1244	-	Vault::settled	}
+src/db/vault.rs:1245	-	Vault::settled	Ok(())
+src/db/vault.rs:1246	-	Vault::settled	};
+src/db/vault.rs:1247	-	Vault::settled	let page = match viewed {
+src/db/vault.rs:1248	-	Vault::settled	Some(p) => {
+src/db/vault.rs:1249	-	Vault::settled	give(&p)?;
+src/db/vault.rs:1250	-	Vault::settled	Some(p)
+src/db/vault.rs:1251	-	Vault::settled	}
+src/db/vault.rs:1252	-	Vault::settled	None if keep => {
+src/db/vault.rs:1253	-	Vault::settled	let p = Paged::adopt(&self.pager, mem, mem.metadata()?.len(), name)?;
+src/db/vault.rs:1254	-	Vault::settled	give(&p)?;
+src/db/vault.rs:1255	-	Vault::settled	Counts::add(&self.counts.adopted, 1);
+src/db/vault.rs:1256	-	Vault::settled	Some(p)
+src/db/vault.rs:1257	-	Vault::settled	}
+src/db/vault.rs:1258	-	Vault::settled	None => {
+src/db/vault.rs:1259	-	Vault::settled	Counts::add(&self.counts.left, 1);
+src/db/vault.rs:1260	-	Vault::settled	None
+src/db/vault.rs:1261	-	Vault::settled	}
+src/db/vault.rs:1262	-	Vault::settled	};
+src/db/vault.rs:1263	-	Vault::settled	for e in files.values_mut() {
+src/db/vault.rs:1264	-	Vault::settled	if over(e) {
+src/db/vault.rs:1265	-	Vault::settled	e.page = page.clone();
+src/db/vault.rs:1266	-	Vault::settled	e.mem = None;
+src/db/vault.rs:1267	-	Vault::settled	}
+src/db/vault.rs:1268	-	Vault::settled	}
+src/db/vault.rs:1269	-	Vault::settled	Ok(())
+src/db/vault.rs:1270	-	Vault::<item>	}
+src/db/vault.rs:1271	-	Vault::<item>	
+src/db/vault.rs:1272	-	Vault::<item>	
+src/db/vault.rs:1273	-	Vault::<item>	
+src/db/vault.rs:1274	-	Vault::<item>	
+src/db/vault.rs:1275	-	Vault::<item>	
+src/db/vault.rs:1276	-	Vault::<item>	
+src/db/vault.rs:1277	-	Vault::<item>	
+src/db/vault.rs:1278	-	Vault::<item>	
+src/db/vault.rs:1279	-	Vault::<item>	
+src/db/vault.rs:1280	-	Vault::<item>	
+src/db/vault.rs:1281	-	Vault::<item>	
+src/db/vault.rs:1282	-	Vault::<item>	
+src/db/vault.rs:1283	-	Vault::<item>	
+src/db/vault.rs:1284	-	Vault::<item>	
+src/db/vault.rs:1285	-	Vault::<item>	
+src/db/vault.rs:1286	-	Vault::<item>	
+src/db/vault.rs:1287	-	Vault::<item>	
+src/db/vault.rs:1288	-	Vault::<item>	
+src/db/vault.rs:1289	-	Vault::<item>	
+src/db/vault.rs:1290	-	Vault::<item>	
+src/db/vault.rs:1291	-	Vault::<item>	pub(crate) fn persist(
+src/db/vault.rs:1292	-	Vault::<item>	&self,
+src/db/vault.rs:1293	-	Vault::<item>	pairs: &[(String, Option<String>)],
+src/db/vault.rs:1294	-	Vault::<item>	named: bool,
+src/db/vault.rs:1295	-	Vault::persist	) -> Result<Vec<FileKey>> {
+src/db/vault.rs:1296	-	Vault::persist	self.persist_with(pairs, named, true)
+src/db/vault.rs:1297	-	Vault::<item>	}
+src/db/vault.rs:1298	-	Vault::<item>	
+src/db/vault.rs:1299	-	Vault::<item>	fn persist_with(
+src/db/vault.rs:1300	-	Vault::<item>	&self,
+src/db/vault.rs:1301	-	Vault::<item>	pairs: &[(String, Option<String>)],
+src/db/vault.rs:1302	-	Vault::<item>	named: bool,
+src/db/vault.rs:1303	-	Vault::<item>	dir_sync: bool,
+src/db/vault.rs:1304	-	Vault::persist_with	) -> Result<Vec<FileKey>> {
+src/db/vault.rs:1305	-	Vault::persist_with	let _one = lock(&self.persisting);
+src/db/vault.rs:1306	-	Vault::persist_with	let mut out = Vec::with_capacity(pairs.len());
+src/db/vault.rs:1307	-	Vault::persist_with	let mut made = false;
+src/db/vault.rs:1308	-	Vault::persist_with	for (seg, ord) in pairs {
+src/db/vault.rs:1309	-	Vault::persist_with	let Some(entry) = lock(&self.files).get(seg).cloned() else {
+src/db/vault.rs:1310	-	Vault::persist_with	if named {
+src/db/vault.rs:1311	-	Vault::persist_with	return Err(Error::new(
+src/db/vault.rs:1312	-	Vault::persist_with	ErrorKind::NotFound,
+src/db/vault.rs:1313	-	Vault::persist_with	format!("a manifest names {seg}, which the store does not hold"),
+src/db/vault.rs:1314	-	Vault::persist_with	));
+src/db/vault.rs:1315	-	Vault::persist_with	}
+src/db/vault.rs:1316	-	Vault::persist_with	continue;
+src/db/vault.rs:1317	-	Vault::persist_with	};
+src/db/vault.rs:1318	-	Vault::persist_with	let disk = match entry.disk {
+src/db/vault.rs:1319	-	Vault::persist_with	Some(d) => d,
+src/db/vault.rs:1320	-	Vault::persist_with	None => {
+src/db/vault.rs:1321	-	Vault::persist_with	let mem = entry.mem.ok_or_else(|| Error::from(ErrorKind::NotFound))?;
+src/db/vault.rs:1322	-	Vault::persist_with	let key = Key::draw()?;
+src/db/vault.rs:1323	-	Vault::persist_with	let mut token = [0u8; 16];
+src/db/vault.rs:1324	-	Vault::persist_with	random(&mut token)?;
+src/db/vault.rs:1325	-	Vault::persist_with	let disk = Disk {
+src/db/vault.rs:1326	-	Vault::persist_with	token,
+src/db/vault.rs:1327	-	Vault::persist_with	wrapped: self.wrap(&Vault::file_aad(&token), &key)?,
+src/db/vault.rs:1328	-	Vault::persist_with	kind: Kind::Seg,
+src/db/vault.rs:1329	-	Vault::persist_with	};
+src/db/vault.rs:1330	-	Vault::persist_with	let keep = self.keeps(&mem);
+src/db/vault.rs:1331	-	Vault::persist_with	self.write_envelope(&mem, &disk, &key, true)?;
+src/db/vault.rs:1332	-	Vault::persist_with	made = true;
+src/db/vault.rs:1333	-	Vault::persist_with	if named {
+src/db/vault.rs:1334	-	Vault::persist_with	Counts::add(&self.counts.late, 1);
+src/db/vault.rs:1335	-	Vault::persist_with	}
+src/db/vault.rs:1336	-	Vault::persist_with	let mut files = lock(&self.files);
+src/db/vault.rs:1337	-	Vault::persist_with	
+src/db/vault.rs:1338	-	Vault::persist_with	
+src/db/vault.rs:1339	-	Vault::persist_with	let mut held = false;
+src/db/vault.rs:1340	-	Vault::persist_with	for e in files.values_mut() {
+src/db/vault.rs:1341	-	Vault::persist_with	if e.disk.is_none() && e.mem.as_ref().is_some_and(|m| Arc::ptr_eq(m, &mem))
+src/db/vault.rs:1342	-	Vault::persist_with	{
+src/db/vault.rs:1343	-	Vault::persist_with	e.disk = Some(disk.clone());
+src/db/vault.rs:1344	-	Vault::persist_with	held = true;
+src/db/vault.rs:1345	-	Vault::persist_with	}
+src/db/vault.rs:1346	-	Vault::persist_with	}
+src/db/vault.rs:1347	-	Vault::persist_with	if held {
+src/db/vault.rs:1348	-	Vault::persist_with	
+src/db/vault.rs:1349	-	Vault::persist_with	self.settled(&mut files, seg, &mem, &disk, keep)?;
+src/db/vault.rs:1350	-	Vault::persist_with	} else {
+src/db/vault.rs:1351	-	Vault::persist_with	
+src/db/vault.rs:1352	-	Vault::persist_with	let _ = std::fs::remove_file(self.real.join(disk.name()));
+src/db/vault.rs:1353	-	Vault::persist_with	}
+src/db/vault.rs:1354	-	Vault::persist_with	drop(files);
+src/db/vault.rs:1355	-	Vault::persist_with	disk
+src/db/vault.rs:1356	-	Vault::persist_with	}
+src/db/vault.rs:1357	-	Vault::persist_with	};
+src/db/vault.rs:1358	-	Vault::persist_with	if let Some(ord) = ord {
+src/db/vault.rs:1359	-	Vault::persist_with	let e = lock(&self.files).get(ord).cloned();
+src/db/vault.rs:1360	-	Vault::persist_with	if let Some(Entry {
+src/db/vault.rs:1361	-	Vault::persist_with	mem: Some(mem),
+src/db/vault.rs:1362	-	Vault::persist_with	disk: None,
+src/db/vault.rs:1363	-	Vault::persist_with	..
+src/db/vault.rs:1364	-	Vault::persist_with	}) = e
+src/db/vault.rs:1365	-	Vault::persist_with	{
+src/db/vault.rs:1366	-	Vault::persist_with	let key = self
+src/db/vault.rs:1367	-	Vault::persist_with	.unwrap(&Vault::file_aad(&disk.token), &disk.wrapped)
+src/db/vault.rs:1368	-	Vault::persist_with	.ok_or_else(|| refused("a file's key does not unwrap under the store's"))?;
+src/db/vault.rs:1369	-	Vault::persist_with	let odisk = Disk {
+src/db/vault.rs:1370	-	Vault::persist_with	kind: Kind::Ord,
+src/db/vault.rs:1371	-	Vault::persist_with	..disk.clone()
+src/db/vault.rs:1372	-	Vault::persist_with	};
+src/db/vault.rs:1373	-	Vault::persist_with	let keep = self.keeps(&mem);
+src/db/vault.rs:1374	-	Vault::persist_with	self.write_envelope(&mem, &odisk, &key, false)?;
+src/db/vault.rs:1375	-	Vault::persist_with	made = true;
+src/db/vault.rs:1376	-	Vault::persist_with	let mut files = lock(&self.files);
+src/db/vault.rs:1377	-	Vault::persist_with	let mut held = false;
+src/db/vault.rs:1378	-	Vault::persist_with	if let Some(e) = files.get_mut(ord) {
+src/db/vault.rs:1379	-	Vault::persist_with	if e.mem.as_ref().is_some_and(|m| Arc::ptr_eq(m, &mem)) {
+src/db/vault.rs:1380	-	Vault::persist_with	e.disk = Some(odisk.clone());
+src/db/vault.rs:1381	-	Vault::persist_with	held = true;
+src/db/vault.rs:1382	-	Vault::persist_with	}
+src/db/vault.rs:1383	-	Vault::persist_with	}
+src/db/vault.rs:1384	-	Vault::persist_with	if held {
+src/db/vault.rs:1385	-	Vault::persist_with	self.settled(&mut files, ord, &mem, &odisk, keep)?;
+src/db/vault.rs:1386	-	Vault::persist_with	}
+src/db/vault.rs:1387	-	Vault::persist_with	drop(files);
+src/db/vault.rs:1388	-	Vault::persist_with	}
+src/db/vault.rs:1389	-	Vault::persist_with	}
+src/db/vault.rs:1390	-	Vault::persist_with	out.push((disk.token, disk.wrapped));
+src/db/vault.rs:1391	-	Vault::persist_with	}
+src/db/vault.rs:1392	-	Vault::persist_with	if made && dir_sync {
+src/db/vault.rs:1393	-	Vault::persist_with	File::open(&self.real)?.sync_all()?;
+src/db/vault.rs:1394	-	Vault::persist_with	}
+src/db/vault.rs:1395	-	Vault::persist_with	Ok(out)
+src/db/vault.rs:1396	-	Vault::<item>	}
+src/db/vault.rs:1397	-	Vault::<item>	
+src/db/vault.rs:1398	-	Vault::<item>	
+src/db/vault.rs:1399	-	Vault::<item>	
+src/db/vault.rs:1400	-	Vault::<item>	
+src/db/vault.rs:1401	-	Vault::<item>	
+src/db/vault.rs:1402	-	Vault::<item>	
+src/db/vault.rs:1403	-	Vault::<item>	
+src/db/vault.rs:1404	-	Vault::<item>	
+src/db/vault.rs:1405	-	Vault::<item>	
+src/db/vault.rs:1406	-	Vault::<item>	
+src/db/vault.rs:1407	-	Vault::<item>	
+src/db/vault.rs:1408	-	Vault::<item>	
+src/db/vault.rs:1409	-	Vault::<item>	
+src/db/vault.rs:1410	-	Vault::<item>	
+src/db/vault.rs:1411	-	Vault::<item>	
+src/db/vault.rs:1412	-	Vault::<item>	
+src/db/vault.rs:1413	-	Vault::<item>	
+src/db/vault.rs:1414	-	Vault::<item>	
+src/db/vault.rs:1415	-	Vault::<item>	
+src/db/vault.rs:1416	-	Vault::<item>	
+src/db/vault.rs:1417	-	Vault::<item>	
+src/db/vault.rs:1418	-	Vault::<item>	
+src/db/vault.rs:1419	-	Vault::<item>	
+src/db/vault.rs:1420	-	Vault::<item>	
+src/db/vault.rs:1421	-	Vault::<item>	
+src/db/vault.rs:1422	-	Vault::<item>	
+src/db/vault.rs:1423	-	Vault::<item>	
+src/db/vault.rs:1424	-	Vault::<item>	
+src/db/vault.rs:1425	-	Vault::persist_form	fn persist_form(&self, seg: &str, form: &str, sync: bool, cold: bool) -> Result<
+src/db/vault.rs:1426	-	Vault::persist_form	
+src/db/vault.rs:1427	-	Vault::persist_form	
+src/db/vault.rs:1428	-	Vault::persist_form	
+src/db/vault.rs:1429	-	Vault::persist_form	let (sdisk, mem) = {
+src/db/vault.rs:1430	-	Vault::persist_form	let files = lock(&self.files);
+src/db/vault.rs:1431	-	Vault::persist_form	let Some(sdisk) = files
+src/db/vault.rs:1432	-	Vault::persist_form	.get(seg)
+src/db/vault.rs:1433	-	Vault::persist_form	.and_then(|e| e.disk.clone())
+src/db/vault.rs:1434	-	Vault::persist_form	.filter(|d| d.kind == Kind::Seg)
+src/db/vault.rs:1435	-	Vault::persist_form	else {
+src/db/vault.rs:1436	-	Vault::persist_form	return Ok(false);
+src/db/vault.rs:1437	-	Vault::persist_form	};
+src/db/vault.rs:1438	-	Vault::persist_form	match files.get(form) {
+src/db/vault.rs:1439	-	Vault::persist_form	Some(Entry {
+src/db/vault.rs:1440	-	Vault::persist_form	mem: Some(mem),
+src/db/vault.rs:1441	-	Vault::persist_form	disk: None,
+src/db/vault.rs:1442	-	Vault::persist_form	..
+src/db/vault.rs:1443	-	Vault::persist_form	}) => (sdisk, mem.clone()),
+src/db/vault.rs:1444	-	Vault::persist_form	_ => return Ok(false),
+src/db/vault.rs:1445	-	Vault::persist_form	}
+src/db/vault.rs:1446	-	Vault::persist_form	};
+src/db/vault.rs:1447	-	Vault::persist_form	let key = self
+src/db/vault.rs:1448	-	Vault::persist_form	.unwrap(&Vault::file_aad(&sdisk.token), &sdisk.wrapped)
+src/db/vault.rs:1449	-	Vault::persist_form	.ok_or_else(|| refused("a file's key does not unwrap under the store's"))?;
+src/db/vault.rs:1450	-	Vault::persist_form	let zdisk = Disk {
+src/db/vault.rs:1451	-	Vault::persist_form	kind: Kind::Form,
+src/db/vault.rs:1452	-	Vault::persist_form	..sdisk
+src/db/vault.rs:1453	-	Vault::persist_form	};
+src/db/vault.rs:1454	-	Vault::persist_form	let keep = !cold && self.keeps(&mem);
+src/db/vault.rs:1455	-	Vault::persist_form	let path = self.real.join(zdisk.name());
+src/db/vault.rs:1456	-	Vault::persist_form	let tmp = self.real.join(format!("{}{ENVELOPE_TMP}", zdisk.name()));
+src/db/vault.rs:1457	-	Vault::persist_form	self.write_envelope_at(&mem, &tmp, &key, sync)?;
+src/db/vault.rs:1458	-	Vault::persist_form	if cold {
+src/db/vault.rs:1459	-	Vault::persist_form	if let Ok(f) = File::open(&tmp) {
+src/db/vault.rs:1460	-	Vault::persist_form	drop_cached(&f);
+src/db/vault.rs:1461	-	Vault::persist_form	}
+src/db/vault.rs:1462	-	Vault::persist_form	}
+src/db/vault.rs:1463	-	Vault::persist_form	std::fs::rename(&tmp, &path).inspect_err(|_| {
+src/db/vault.rs:1464	-	Vault::persist_form	let _ = std::fs::remove_file(&tmp);
+src/db/vault.rs:1465	-	Vault::persist_form	})?;
+src/db/vault.rs:1466	-	Vault::persist_form	let mut files = lock(&self.files);
+src/db/vault.rs:1467	-	Vault::persist_form	let held = match files.get_mut(form) {
+src/db/vault.rs:1468	-	Vault::persist_form	Some(e) if e.mem.as_ref().is_some_and(|m| Arc::ptr_eq(m, &mem)) => {
+src/db/vault.rs:1469	-	Vault::persist_form	e.disk = Some(zdisk.clone());
+src/db/vault.rs:1470	-	Vault::persist_form	true
+src/db/vault.rs:1471	-	Vault::persist_form	}
+src/db/vault.rs:1472	-	Vault::persist_form	_ => false,
+src/db/vault.rs:1473	-	Vault::persist_form	};
+src/db/vault.rs:1474	-	Vault::persist_form	if held {
+src/db/vault.rs:1475	-	Vault::persist_form	
+src/db/vault.rs:1476	-	Vault::persist_form	self.settled(&mut files, form, &mem, &zdisk, keep)?;
+src/db/vault.rs:1477	-	Vault::persist_form	} else {
+src/db/vault.rs:1478	-	Vault::persist_form	
+src/db/vault.rs:1479	-	Vault::persist_form	let _ = std::fs::remove_file(&path);
+src/db/vault.rs:1480	-	Vault::persist_form	}
+src/db/vault.rs:1481	-	Vault::persist_form	Ok(held)
+src/db/vault.rs:1482	-	Vault::<item>	}
+src/db/vault.rs:1483	-	Vault::<item>	
+src/db/vault.rs:1484	-	Vault::<item>	
+src/db/vault.rs:1485	-	Vault::<item>	
+src/db/vault.rs:1486	-	Vault::<item>	
+src/db/vault.rs:1487	-	Vault::<item>	
+src/db/vault.rs:1488	-	Vault::<item>	
+src/db/vault.rs:1489	-	Vault::companion	fn companion(&self, seg: &str, form: &str) -> bool {
+src/db/vault.rs:1490	-	Vault::companion	let mut files = lock(&self.files);
+src/db/vault.rs:1491	-	Vault::companion	if files.contains_key(form) {
+src/db/vault.rs:1492	-	Vault::companion	return true;
+src/db/vault.rs:1493	-	Vault::companion	}
+src/db/vault.rs:1494	-	Vault::companion	let Some(sdisk) = files
+src/db/vault.rs:1495	-	Vault::companion	.get(seg)
+src/db/vault.rs:1496	-	Vault::companion	.and_then(|e| e.disk.clone())
+src/db/vault.rs:1497	-	Vault::companion	.filter(|d| d.kind == Kind::Seg)
+src/db/vault.rs:1498	-	Vault::companion	else {
+src/db/vault.rs:1499	-	Vault::companion	return false;
+src/db/vault.rs:1500	-	Vault::companion	};
+src/db/vault.rs:1501	-	Vault::companion	let zdisk = Disk {
+src/db/vault.rs:1502	-	Vault::companion	kind: Kind::Form,
+src/db/vault.rs:1503	-	Vault::companion	..sdisk
+src/db/vault.rs:1504	-	Vault::companion	};
+src/db/vault.rs:1505	-	Vault::companion	if !self.real.join(zdisk.name()).exists() {
+src/db/vault.rs:1506	-	Vault::companion	return false;
+src/db/vault.rs:1507	-	Vault::companion	}
+src/db/vault.rs:1508	-	Vault::companion	
+src/db/vault.rs:1509	-	Vault::companion	let page = files
+src/db/vault.rs:1510	-	Vault::companion	.values()
+src/db/vault.rs:1511	-	Vault::companion	.find(|e| e.page.is_some() && e.disk.as_ref().is_some_and(|x| x.same(&zdisk)))
+src/db/vault.rs:1512	-	Vault::companion	.and_then(|e| e.page.clone());
+src/db/vault.rs:1513	-	Vault::companion	files.insert(
+src/db/vault.rs:1514	-	Vault::companion	form.to_string(),
+src/db/vault.rs:1515	-	Vault::companion	Entry {
+src/db/vault.rs:1516	-	Vault::companion	mem: None,
+src/db/vault.rs:1517	-	Vault::companion	page,
+src/db/vault.rs:1518	-	Vault::companion	disk: Some(zdisk),
+src/db/vault.rs:1519	-	Vault::companion	},
+src/db/vault.rs:1520	-	Vault::companion	);
+src/db/vault.rs:1521	-	Vault::companion	true
+src/db/vault.rs:1522	-	Vault::<item>	}
+src/db/vault.rs:1523	-	Vault::<item>	
+src/db/vault.rs:1524	-	Vault::<item>	
+src/db/vault.rs:1525	-	Vault::<item>	
+src/db/vault.rs:1526	-	Vault::<item>	
+src/db/vault.rs:1527	-	Vault::<item>	fn adopt(&self, seg: &str, token: Token, wrapped: [u8; WRAPPED], ord: Option<&st
+src/db/vault.rs:1528	-	Vault::<item>	let mut files = lock(&self.files);
+src/db/vault.rs:1529	-	Vault::<item>	let disk = Disk {
+src/db/vault.rs:1530	-	Vault::<item>	token,
+src/db/vault.rs:1531	-	Vault::<item>	wrapped,
+src/db/vault.rs:1532	-	Vault::<item>	kind: Kind::Seg,
+src/db/vault.rs:1533	-	Vault::<item>	};
+src/db/vault.rs:1534	-	Vault::<item>	
+src/db/vault.rs:1535	-	Vault::<item>	let page_of = |files: &HashMap<String, Entry>, d: &Disk| {
+src/db/vault.rs:1536	-	Vault::<item>	files
+src/db/vault.rs:1537	-	Vault::<item>	.values()
+src/db/vault.rs:1538	-	Vault::<item>	.find(|e| e.page.is_some() && e.disk.as_ref().is_some_and(|x| x.same(d)))
+src/db/vault.rs:1539	-	Vault::<item>	.and_then(|e| e.page.clone())
+src/db/vault.rs:1540	-	Vault::<item>	};
+src/db/vault.rs:1541	-	Vault::<item>	if !files.contains_key(seg) {
+src/db/vault.rs:1542	-	Vault::<item>	let page = page_of(&files, &disk);
+src/db/vault.rs:1543	-	Vault::<item>	files.insert(
+src/db/vault.rs:1544	-	Vault::<item>	seg.to_string(),
+src/db/vault.rs:1545	-	Vault::<item>	Entry {
+src/db/vault.rs:1546	-	Vault::<item>	mem: None,
+src/db/vault.rs:1547	-	Vault::<item>	page,
+src/db/vault.rs:1548	-	Vault::<item>	disk: Some(disk.clone()),
+src/db/vault.rs:1549	-	Vault::<item>	},
+src/db/vault.rs:1550	-	Vault::<item>	);
+src/db/vault.rs:1551	-	Vault::<item>	}
+src/db/vault.rs:1552	-	Vault::<item>	if let Some(ord) = ord {
+src/db/vault.rs:1553	-	Vault::<item>	let odisk = Disk {
+src/db/vault.rs:1554	-	Vault::<item>	kind: Kind::Ord,
+src/db/vault.rs:1555	-	Vault::<item>	..disk
+src/db/vault.rs:1556	-	Vault::<item>	};
+src/db/vault.rs:1557	-	Vault::<item>	if !files.contains_key(ord) && self.real.join(odisk.name()).exists() {
+src/db/vault.rs:1558	-	Vault::<item>	let page = page_of(&files, &odisk);
+src/db/vault.rs:1559	-	Vault::<item>	files.insert(
+src/db/vault.rs:1560	-	Vault::<item>	ord.to_string(),
+src/db/vault.rs:1561	-	Vault::<item>	Entry {
+src/db/vault.rs:1562	-	Vault::<item>	mem: None,
+src/db/vault.rs:1563	-	Vault::<item>	page,
+src/db/vault.rs:1564	-	Vault::<item>	disk: Some(odisk),
+src/db/vault.rs:1565	-	Vault::<item>	},
+src/db/vault.rs:1566	-	Vault::<item>	);
+src/db/vault.rs:1567	-	Vault::<item>	}
+src/db/vault.rs:1568	-	Vault::<item>	}
+src/db/vault.rs:1569	-	Vault::<item>	}
+src/db/vault.rs:1570	-	Vault::<item>	
+src/db/vault.rs:1571	-	Vault::<item>	
+src/db/vault.rs:1572	-	Vault::<item>	
+src/db/vault.rs:1573	-	Vault::<item>	
+src/db/vault.rs:1574	-	Vault::<item>	
+src/db/vault.rs:1575	-	Vault::<item>	pub(crate) fn adopt_all(
+src/db/vault.rs:1576	-	Vault::<item>	&self,
+src/db/vault.rs:1577	-	Vault::<item>	segs: &[(String, Option<String>)],
+src/db/vault.rs:1578	-	Vault::<item>	files: Vec<FileKey>,
+src/db/vault.rs:1579	-	Vault::adopt_all	) -> Result<()> {
+src/db/vault.rs:1580	-	Vault::adopt_all	if segs.len() != files.len() {
+src/db/vault.rs:1581	-	Vault::adopt_all	return Err(refused("manifest is truncated"));
+src/db/vault.rs:1582	-	Vault::adopt_all	}
+src/db/vault.rs:1583	-	Vault::adopt_all	for ((seg, ord), (token, wrapped)) in segs.iter().zip(files) {
+src/db/vault.rs:1584	-	Vault::adopt_all	self.adopt(seg, token, wrapped, ord.as_deref());
+src/db/vault.rs:1585	-	Vault::adopt_all	}
+src/db/vault.rs:1586	-	Vault::adopt_all	Ok(())
+src/db/vault.rs:1587	-	Vault::<item>	}
+src/db/vault.rs:1588	-	Vault::<item>	
+src/db/vault.rs:1589	-	Vault::<item>	
+src/db/vault.rs:1590	-	Vault::<item>	
+src/db/vault.rs:1591	-	Vault::<item>	
+src/db/vault.rs:1592	-	Vault::<item>	
+src/db/vault.rs:1593	-	Vault::sweep	pub(crate) fn sweep(&self) -> Result<usize> {
+src/db/vault.rs:1594	-	Vault::sweep	let files = lock(&self.files);
+src/db/vault.rs:1595	-	Vault::sweep	let mut swept = 0;
+src/db/vault.rs:1596	-	Vault::sweep	for entry in std::fs::read_dir(&self.real)? {
+src/db/vault.rs:1597	-	Vault::sweep	let name = entry?.file_name().to_string_lossy().into_owned();
+src/db/vault.rs:1598	-	Vault::sweep	if name.starts_with("x-") && name.ends_with(ENVELOPE_TMP) {
+src/db/vault.rs:1599	-	Vault::sweep	
+src/db/vault.rs:1600	-	Vault::sweep	
+src/db/vault.rs:1601	-	Vault::sweep	if std::fs::remove_file(self.real.join(&name)).is_ok() {
+src/db/vault.rs:1602	-	Vault::sweep	swept += 1;
+src/db/vault.rs:1603	-	Vault::sweep	}
+src/db/vault.rs:1604	-	Vault::sweep	continue;
+src/db/vault.rs:1605	-	Vault::sweep	}
+src/db/vault.rs:1606	-	Vault::sweep	let Some((token, kind)) = disk_parse(&name) else {
+src/db/vault.rs:1607	-	Vault::sweep	continue;
+src/db/vault.rs:1608	-	Vault::sweep	};
+src/db/vault.rs:1609	-	Vault::sweep	
+src/db/vault.rs:1610	-	Vault::sweep	
+src/db/vault.rs:1611	-	Vault::sweep	
+src/db/vault.rs:1612	-	Vault::sweep	let held = files.values().any(|e| {
+src/db/vault.rs:1613	-	Vault::sweep	e.disk.as_ref().is_some_and(|d| {
+src/db/vault.rs:1614	-	Vault::sweep	d.token == token
+src/db/vault.rs:1615	-	Vault::sweep	&& (d.kind == kind || (kind == Kind::Form && d.kind == Kind::Seg))
+src/db/vault.rs:1616	-	Vault::sweep	})
+src/db/vault.rs:1617	-	Vault::sweep	});
+src/db/vault.rs:1618	-	Vault::sweep	if !held && std::fs::remove_file(self.real.join(&name)).is_ok() {
+src/db/vault.rs:1619	-	Vault::sweep	swept += 1;
+src/db/vault.rs:1620	-	Vault::sweep	}
+src/db/vault.rs:1621	-	Vault::sweep	}
+src/db/vault.rs:1622	-	Vault::sweep	Counts::add(&self.counts.swept, swept as u64);
+src/db/vault.rs:1623	-	Vault::sweep	Ok(swept)
+src/db/vault.rs:1624	-	Vault::<item>	}
+src/db/vault.rs:1625	-	Vault::<item>	
+src/db/vault.rs:1626	-	Vault::<item>	
+src/db/vault.rs:1627	-	Vault::<item>	
+src/db/vault.rs:1628	-	Vault::<item>	
+src/db/vault.rs:1629	-	Vault::<item>	
+src/db/vault.rs:1630	-	Vault::<item>	
+src/db/vault.rs:1631	-	Vault::<item>	
+src/db/vault.rs:1632	-	Vault::<item>	
+src/db/vault.rs:1633	-	Vault::<item>	pub(crate) fn seal_manifest(
+src/db/vault.rs:1634	-	Vault::<item>	&self,
+src/db/vault.rs:1635	-	Vault::<item>	seq: u64,
+src/db/vault.rs:1636	-	Vault::<item>	manifest: &[u8],
+src/db/vault.rs:1637	-	Vault::<item>	files: &[FileKey],
+src/db/vault.rs:1638	-	Vault::seal_manifest	) -> Result<Vec<u8>> {
+src/db/vault.rs:1639	-	Vault::seal_manifest	let mut body = Vec::with_capacity(4 + manifest.len() + files.len() * (16 + WRAPP
+src/db/vault.rs:1640	-	Vault::seal_manifest	body.extend_from_slice(&(manifest.len() as u32).to_le_bytes());
+src/db/vault.rs:1641	-	Vault::seal_manifest	body.extend_from_slice(manifest);
+src/db/vault.rs:1642	-	Vault::seal_manifest	for (token, wrapped) in files {
+src/db/vault.rs:1643	-	Vault::seal_manifest	body.extend_from_slice(token);
+src/db/vault.rs:1644	-	Vault::seal_manifest	body.extend_from_slice(wrapped);
+src/db/vault.rs:1645	-	Vault::seal_manifest	}
+src/db/vault.rs:1646	-	Vault::seal_manifest	let sealed = seal(&*self.store, self.nonce()?, &slot_aad(seq), &body);
+src/db/vault.rs:1647	-	Vault::seal_manifest	let mut out = Vec::with_capacity(SLOT_HEAD + sealed.len());
+src/db/vault.rs:1648	-	Vault::seal_manifest	out.extend_from_slice(SLOT_MAGIC);
+src/db/vault.rs:1649	-	Vault::seal_manifest	out.extend_from_slice(&seq.to_le_bytes());
+src/db/vault.rs:1650	-	Vault::seal_manifest	out.extend_from_slice(&(sealed.len() as u32).to_le_bytes());
+src/db/vault.rs:1651	-	Vault::seal_manifest	out.extend_from_slice(&sealed);
+src/db/vault.rs:1652	-	Vault::seal_manifest	Ok(out)
+src/db/vault.rs:1653	-	Vault::<item>	}
+src/db/vault.rs:1654	-	Vault::<item>	
+src/db/vault.rs:1655	-	Vault::<item>	
+src/db/vault.rs:1656	-	Vault::<item>	
+src/db/vault.rs:1657	-	Vault::open_manifest	pub(crate) fn open_manifest(&self, slot: &[u8]) -> Result<(Vec<u8>, Vec<FileKey>
+src/db/vault.rs:1658	-	Vault::open_manifest	if slot.len() < SLOT_HEAD || &slot[..SLOT_MAGIC.len()] != SLOT_MAGIC {
+src/db/vault.rs:1659	-	Vault::open_manifest	return Err(refused("manifest magic is wrong"));
+src/db/vault.rs:1660	-	Vault::open_manifest	}
+src/db/vault.rs:1661	-	Vault::open_manifest	let seq = u64::from_le_bytes(slot[9..17].try_into().unwrap());
+src/db/vault.rs:1662	-	Vault::open_manifest	let len = u32::from_le_bytes(slot[17..21].try_into().unwrap()) as usize;
+src/db/vault.rs:1663	-	Vault::open_manifest	let sealed = slot
+src/db/vault.rs:1664	-	Vault::open_manifest	.get(SLOT_HEAD..SLOT_HEAD + len)
+src/db/vault.rs:1665	-	Vault::open_manifest	.ok_or_else(|| refused("manifest is truncated"))?;
+src/db/vault.rs:1666	-	Vault::open_manifest	let body = unseal(&*self.store, &slot_aad(seq), sealed)
+src/db/vault.rs:1667	-	Vault::open_manifest	.ok_or_else(|| refused("manifest failed its check"))?;
+src/db/vault.rs:1668	-	Vault::open_manifest	let short = || refused("manifest is truncated");
+src/db/vault.rs:1669	-	Vault::open_manifest	let mlen = u32::from_le_bytes(body.get(..4).ok_or_else(short)?.try_into().unwrap
+src/db/vault.rs:1670	-	Vault::open_manifest	let manifest = body.get(4..4 + mlen as usize).ok_or_else(short)?;
+src/db/vault.rs:1671	-	Vault::open_manifest	let rest = &body[4 + mlen as usize..];
+src/db/vault.rs:1672	-	Vault::open_manifest	if rest.len() % (16 + WRAPPED) != 0 {
+src/db/vault.rs:1673	-	Vault::open_manifest	return Err(short());
+src/db/vault.rs:1674	-	Vault::open_manifest	}
+src/db/vault.rs:1675	-	Vault::open_manifest	let files = rest
+src/db/vault.rs:1676	-	Vault::open_manifest	.chunks_exact(16 + WRAPPED)
+src/db/vault.rs:1677	-	Vault::open_manifest	.map(|c| (c[..16].try_into().unwrap(), c[16..].try_into().unwrap()))
+src/db/vault.rs:1678	-	Vault::open_manifest	.collect();
+src/db/vault.rs:1679	-	Vault::open_manifest	Ok((manifest.to_vec(), files))
+src/db/vault.rs:1680	-	Vault::<item>	}
+src/db/vault.rs:1681	-	Vault::<item>	
+src/db/vault.rs:1682	-	Vault::<item>	
+src/db/vault.rs:1683	-	Vault::<item>	
+src/db/vault.rs:1684	-	Vault::<item>	
+src/db/vault.rs:1685	-	Vault::<item>	
+src/db/vault.rs:1686	-	Vault::<item>	pub(crate) fn log_begin(&self, id: u64) -> Result<(LogCipher, [u8; WRAPPED])> {
+src/db/vault.rs:1687	-	Vault::<item>	let key = Key::draw()?;
+src/db/vault.rs:1688	-	Vault::<item>	let wrapped = self.wrap(&log_aad(id), &key)?;
+src/db/vault.rs:1689	-	Vault::<item>	Ok((LogCipher::new((self.data)(&key.0), id)?, wrapped))
+src/db/vault.rs:1690	-	Vault::<item>	}
+src/db/vault.rs:1691	-	Vault::<item>	
+src/db/vault.rs:1692	-	Vault::<item>	
+src/db/vault.rs:1693	-	Vault::<item>	
+src/db/vault.rs:1694	-	Vault::log_resume	pub(crate) fn log_resume(&self, id: u64, wrapped: &[u8]) -> Option<LogCipher> {
+src/db/vault.rs:1695	-	Vault::log_resume	let key = self.unwrap(&log_aad(id), wrapped)?;
+src/db/vault.rs:1696	-	Vault::log_resume	LogCipher::new((self.data)(&key.0), id).ok()
+src/db/vault.rs:1697	-	Vault::<item>	}
+src/db/vault.rs:1698	-	Vault::<item>	}
+src/db/vault.rs:1699	-	<item>	
+src/db/vault.rs:1700	-	Counts::<item>	impl Counts {
+src/db/vault.rs:1701	-	Counts::add	fn add(c: &AtomicU64, n: u64) {
+src/db/vault.rs:1702	-	Counts::add	c.fetch_add(n, Ordering::Relaxed);
+src/db/vault.rs:1703	-	Counts::<item>	}
+src/db/vault.rs:1704	-	Counts::<item>	
+src/db/vault.rs:1705	-	Counts::read	fn read(&self, files: u64, cache: pager::PagerCounts) -> CipherCounts {
+src/db/vault.rs:1706	-	Counts::read	let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
+src/db/vault.rs:1707	-	Counts::read	CipherCounts {
+src/db/vault.rs:1708	-	Counts::read	files,
+src/db/vault.rs:1709	-	Counts::read	persisted: get(&self.persisted),
+src/db/vault.rs:1710	-	Counts::read	persisted_bytes: get(&self.persisted_bytes),
+src/db/vault.rs:1711	-	Counts::read	adopted: get(&self.adopted),
+src/db/vault.rs:1712	-	Counts::read	left: get(&self.left),
+src/db/vault.rs:1713	-	Counts::read	swept: get(&self.swept),
+src/db/vault.rs:1714	-	Counts::read	late: get(&self.late),
+src/db/vault.rs:1715	-	Counts::read	cache,
+src/db/vault.rs:1716	-	Counts::read	}
+src/db/vault.rs:1717	-	Counts::<item>	}
+src/db/vault.rs:1718	-	Counts::<item>	}
+src/db/vault.rs:1719	-	<item>	
+src/db/vault.rs:1720	-	<item>	
+src/db/vault.rs:1721	-	<item>	
+src/db/vault.rs:1722	-	<item>	#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+src/db/vault.rs:1723	-	<item>	pub struct CipherCounts {
+src/db/vault.rs:1724	-	<item>	
+src/db/vault.rs:1725	-	<item>	
+src/db/vault.rs:1726	-	<item>	
+src/db/vault.rs:1727	-	<item>	pub files: u64,
+src/db/vault.rs:1728	-	<item>	
+src/db/vault.rs:1729	-	<item>	
+src/db/vault.rs:1730	-	<item>	pub persisted: u64,
+src/db/vault.rs:1731	-	<item>	pub persisted_bytes: u64,
+src/db/vault.rs:1732	-	<item>	
+src/db/vault.rs:1733	-	<item>	
+src/db/vault.rs:1734	-	<item>	
+src/db/vault.rs:1735	-	<item>	pub adopted: u64,
+src/db/vault.rs:1736	-	<item>	pub left: u64,
+src/db/vault.rs:1737	-	<item>	
+src/db/vault.rs:1738	-	<item>	pub swept: u64,
+src/db/vault.rs:1739	-	<item>	
+src/db/vault.rs:1740	-	<item>	
+src/db/vault.rs:1741	-	<item>	
+src/db/vault.rs:1742	-	<item>	
+src/db/vault.rs:1743	-	<item>	
+src/db/vault.rs:1744	-	<item>	pub late: u64,
+src/db/vault.rs:1745	-	<item>	
+src/db/vault.rs:1746	-	<item>	
+src/db/vault.rs:1747	-	<item>	pub cache: PagerCounts,
+src/db/vault.rs:1748	-	<item>	}
+src/db/vault.rs:1749	-	<item>	
+src/db/vault.rs:1750	-	<item>	const SLOT_MAGIC: &[u8; 9] = b"SUPDBMAE\x01";
+src/db/vault.rs:1751	-	<item>	const SLOT_HEAD: usize = 9 + 8 + 4;
+src/db/vault.rs:1752	-	<item>	
+src/db/vault.rs:1753	-	<item>	fn slot_aad(seq: u64) -> [u8; 16] {
+src/db/vault.rs:1754	-	<item>	let mut a = [0u8; 16];
+src/db/vault.rs:1755	-	<item>	a[..8].copy_from_slice(b"manifest");
+src/db/vault.rs:1756	-	<item>	a[8..].copy_from_slice(&seq.to_le_bytes());
+src/db/vault.rs:1757	-	<item>	a
+src/db/vault.rs:1758	-	<item>	}
+src/db/vault.rs:1759	-	<item>	
+src/db/vault.rs:1760	-	<item>	fn log_aad(id: u64) -> [u8; 12] {
+src/db/vault.rs:1761	-	<item>	let mut a = [0u8; 12];
+src/db/vault.rs:1762	-	<item>	a[..4].copy_from_slice(b"log\0");
+src/db/vault.rs:1763	-	<item>	a[4..].copy_from_slice(&id.to_le_bytes());
+src/db/vault.rs:1764	-	<item>	a
+src/db/vault.rs:1765	-	<item>	}
+src/db/vault.rs:1766	-	<item>	
+src/db/vault.rs:1767	-	<item>	
+src/db/vault.rs:1768	-	<item>	pub(crate) const RECORD_HEAD: usize = 4 + NONCE;
+src/db/vault.rs:1769	-	<item>	
+src/db/vault.rs:1770	-	<item>	
+src/db/vault.rs:1771	-	<item>	
+src/db/vault.rs:1772	-	<item>	
+src/db/vault.rs:1773	-	<item>	pub(crate) struct LogCipher {
+src/db/vault.rs:1774	-	<item>	aead: Box<DynAead>,
+src/db/vault.rs:1775	-	<item>	id: u64,
+src/db/vault.rs:1776	-	<item>	nonces: Nonces,
+src/db/vault.rs:1777	-	<item>	}
+src/db/vault.rs:1778	-	<item>	
+src/db/vault.rs:1779	-	LogCipher::<item>	impl LogCipher {
+src/db/vault.rs:1780	-	LogCipher::new	fn new(aead: Box<DynAead>, id: u64) -> Result<LogCipher> {
+src/db/vault.rs:1781	-	LogCipher::new	Ok(LogCipher {
+src/db/vault.rs:1782	-	LogCipher::new	aead,
+src/db/vault.rs:1783	-	LogCipher::new	id,
+src/db/vault.rs:1784	-	LogCipher::new	nonces: Nonces::new()?,
+src/db/vault.rs:1785	-	LogCipher::new	})
+src/db/vault.rs:1786	-	LogCipher::<item>	}
+src/db/vault.rs:1787	-	LogCipher::<item>	
+src/db/vault.rs:1788	-	LogCipher::<item>	
+src/db/vault.rs:1789	-	LogCipher::<item>	
+src/db/vault.rs:1790	-	LogCipher::<item>	
+src/db/vault.rs:1791	-	LogCipher::<item>	fn aad(&self, at: u64, len: u32) -> [u8; 20] {
+src/db/vault.rs:1792	-	LogCipher::<item>	let mut a = [0u8; 20];
+src/db/vault.rs:1793	-	LogCipher::<item>	a[..8].copy_from_slice(&self.id.to_le_bytes());
+src/db/vault.rs:1794	-	LogCipher::<item>	a[8..16].copy_from_slice(&at.to_le_bytes());
+src/db/vault.rs:1795	-	LogCipher::<item>	a[16..].copy_from_slice(&len.to_le_bytes());
+src/db/vault.rs:1796	-	LogCipher::<item>	a
+src/db/vault.rs:1797	-	LogCipher::<item>	}
+src/db/vault.rs:1798	-	LogCipher::<item>	
+src/db/vault.rs:1799	-	LogCipher::<item>	
+src/db/vault.rs:1800	-	LogCipher::<item>	
+src/db/vault.rs:1801	-	LogCipher::seal_into	pub(crate) fn seal_into(&mut self, at: u64, plain: &[u8], out: &mut Vec<u8>) -> 
+src/db/vault.rs:1802	-	LogCipher::seal_into	let len = u32::try_from(plain.len())
+src/db/vault.rs:1803	-	LogCipher::seal_into	.map_err(|_| refused("a commit too large for one log record"))?;
+src/db/vault.rs:1804	-	LogCipher::seal_into	let nonce = self.nonces.take()?;
+src/db/vault.rs:1805	-	LogCipher::seal_into	out.clear();
+src/db/vault.rs:1806	-	LogCipher::seal_into	out.reserve(RECORD_HEAD + plain.len() + TAG);
+src/db/vault.rs:1807	-	LogCipher::seal_into	out.extend_from_slice(&len.to_le_bytes());
+src/db/vault.rs:1808	-	LogCipher::seal_into	out.extend_from_slice(&nonce);
+src/db/vault.rs:1809	-	LogCipher::seal_into	out.extend_from_slice(plain);
+src/db/vault.rs:1810	-	LogCipher::seal_into	let tag = self
+src/db/vault.rs:1811	-	LogCipher::seal_into	.aead
+src/db/vault.rs:1812	-	LogCipher::seal_into	.encrypt(&nonce, &self.aad(at, len), &mut out[RECORD_HEAD..]);
+src/db/vault.rs:1813	-	LogCipher::seal_into	out.extend_from_slice(&tag);
+src/db/vault.rs:1814	-	LogCipher::seal_into	Ok(())
+src/db/vault.rs:1815	-	LogCipher::<item>	}
+src/db/vault.rs:1816	-	LogCipher::<item>	
+src/db/vault.rs:1817	-	LogCipher::<item>	
+src/db/vault.rs:1818	-	LogCipher::<item>	
+src/db/vault.rs:1819	-	LogCipher::<item>	
+src/db/vault.rs:1820	-	LogCipher::<item>	
+src/db/vault.rs:1821	-	LogCipher::<item>	
+src/db/vault.rs:1822	-	LogCipher::<item>	
+src/db/vault.rs:1823	-	LogCipher::<item>	
+src/db/vault.rs:1824	-	LogCipher::<item>	pub(crate) fn open_records(
+src/db/vault.rs:1825	-	LogCipher::<item>	&self,
+src/db/vault.rs:1826	-	LogCipher::<item>	file: &[u8],
+src/db/vault.rs:1827	-	LogCipher::<item>	from: usize,
+src/db/vault.rs:1828	-	LogCipher::<item>	plain: &mut Vec<u8>,
+src/db/vault.rs:1829	-	LogCipher::open_records	) -> Vec<(usize, u64)> {
+src/db/vault.rs:1830	-	LogCipher::open_records	let mut ends = Vec::new();
+src/db/vault.rs:1831	-	LogCipher::open_records	let mut p = from;
+src/db/vault.rs:1832	-	LogCipher::open_records	while file.len() - p >= RECORD_HEAD + TAG {
+src/db/vault.rs:1833	-	LogCipher::open_records	let len = u32::from_le_bytes(file[p..p + 4].try_into().unwrap());
+src/db/vault.rs:1834	-	LogCipher::open_records	let body = p + RECORD_HEAD;
+src/db/vault.rs:1835	-	LogCipher::open_records	let Some(end) = body
+src/db/vault.rs:1836	-	LogCipher::open_records	.checked_add(len as usize)
+src/db/vault.rs:1837	-	LogCipher::open_records	.and_then(|e| e.checked_add(TAG))
+src/db/vault.rs:1838	-	LogCipher::open_records	.filter(|&e| e <= file.len())
+src/db/vault.rs:1839	-	LogCipher::open_records	else {
+src/db/vault.rs:1840	-	LogCipher::open_records	break;
+src/db/vault.rs:1841	-	LogCipher::open_records	};
+src/db/vault.rs:1842	-	LogCipher::open_records	let nonce: [u8; NONCE] = file[p + 4..body].try_into().unwrap();
+src/db/vault.rs:1843	-	LogCipher::open_records	let tag: [u8; TAG] = file[end - TAG..end].try_into().unwrap();
+src/db/vault.rs:1844	-	LogCipher::open_records	let at = plain.len();
+src/db/vault.rs:1845	-	LogCipher::open_records	plain.extend_from_slice(&file[body..end - TAG]);
+src/db/vault.rs:1846	-	LogCipher::open_records	if !self
+src/db/vault.rs:1847	-	LogCipher::open_records	.aead
+src/db/vault.rs:1848	-	LogCipher::open_records	.decrypt(&nonce, &self.aad(p as u64, len), &mut plain[at..], &tag)
+src/db/vault.rs:1849	-	LogCipher::open_records	{
+src/db/vault.rs:1850	-	LogCipher::open_records	plain.truncate(at);
+src/db/vault.rs:1851	-	LogCipher::open_records	break;
+src/db/vault.rs:1852	-	LogCipher::open_records	}
+src/db/vault.rs:1853	-	LogCipher::open_records	ends.push((plain.len(), end as u64));
+src/db/vault.rs:1854	-	LogCipher::open_records	p = end;
+src/db/vault.rs:1855	-	LogCipher::open_records	}
+src/db/vault.rs:1856	-	LogCipher::open_records	ends
+src/db/vault.rs:1857	-	LogCipher::<item>	}
+src/db/vault.rs:1858	-	LogCipher::<item>	}
+src/db/vault.rs:1859	-	<item>	
+src/db/vault.rs:1860	-	<item>	
+src/db/vault.rs:1861	-	<item>	
+src/db/vault.rs:1862	-	<item>	
+src/db/vault.rs:1863	-	create	pub(crate) fn create(path: impl AsRef<Path>) -> Result<File> {
+src/db/vault.rs:1864	-	create	let path = path.as_ref();
+src/db/vault.rs:1865	-	create	match locate(path) {
+src/db/vault.rs:1866	-	create	None => File::create(path),
+src/db/vault.rs:1867	-	create	Some((v, name)) if passes(&name) => File::create(v.real.join(name)),
+src/db/vault.rs:1868	-	create	Some((v, name)) => v.make(&name),
+src/db/vault.rs:1869	-	create	}
+src/db/vault.rs:1870	-	create	}
+src/db/vault.rs:1871	-	<item>	
+src/db/vault.rs:1872	-	<item>	
+src/db/vault.rs:1873	-	<item>	
+src/db/vault.rs:1874	-	create_rw	pub(crate) fn create_rw(path: impl AsRef<Path>) -> Result<File> {
+src/db/vault.rs:1875	-	create_rw	let path = path.as_ref();
+src/db/vault.rs:1876	-	create_rw	let plain = |p: &Path| {
+src/db/vault.rs:1877	-	create_rw	OpenOptions::new()
+src/db/vault.rs:1878	-	create_rw	.read(true)
+src/db/vault.rs:1879	-	create_rw	.create(true)
+src/db/vault.rs:1880	-	create_rw	.write(true)
+src/db/vault.rs:1881	-	create_rw	.truncate(true)
+src/db/vault.rs:1882	-	create_rw	.open(p)
+src/db/vault.rs:1883	-	create_rw	};
+src/db/vault.rs:1884	-	create_rw	match locate(path) {
+src/db/vault.rs:1885	-	create_rw	None => plain(path),
+src/db/vault.rs:1886	-	create_rw	Some((v, name)) if passes(&name) => plain(&v.real.join(name)),
+src/db/vault.rs:1887	-	create_rw	Some((v, name)) => v.make(&name),
+src/db/vault.rs:1888	-	create_rw	}
+src/db/vault.rs:1889	-	create_rw	}
+src/db/vault.rs:1890	-	<item>	
+src/db/vault.rs:1891	-	<item>	
+src/db/vault.rs:1892	-	open	pub(crate) fn open(path: impl AsRef<Path>) -> Result<File> {
+src/db/vault.rs:1893	-	open	let path = path.as_ref();
+src/db/vault.rs:1894	-	open	match locate(path) {
+src/db/vault.rs:1895	-	open	None => File::open(path),
+src/db/vault.rs:1896	-	open	Some((v, name)) if passes(&name) => File::open(v.real.join(name)),
+src/db/vault.rs:1897	-	open	Some((v, name)) => v.reopen_written(&name),
+src/db/vault.rs:1898	-	open	}
+src/db/vault.rs:1899	-	open	}
+src/db/vault.rs:1900	-	<item>	
+src/db/vault.rs:1901	-	<item>	
+src/db/vault.rs:1902	-	<item>	
+src/db/vault.rs:1903	-	open_write	pub(crate) fn open_write(path: impl AsRef<Path>) -> Result<File> {
+src/db/vault.rs:1904	-	open_write	let path = path.as_ref();
+src/db/vault.rs:1905	-	open_write	let plain = |p: &Path| OpenOptions::new().write(true).open(p);
+src/db/vault.rs:1906	-	open_write	match locate(path) {
+src/db/vault.rs:1907	-	open_write	None => plain(path),
+src/db/vault.rs:1908	-	open_write	Some((v, name)) if passes(&name) => plain(&v.real.join(name)),
+src/db/vault.rs:1909	-	open_write	Some((v, name)) => v.rewrite(&name, false),
+src/db/vault.rs:1910	-	open_write	}
+src/db/vault.rs:1911	-	open_write	}
+src/db/vault.rs:1912	-	<item>	
+src/db/vault.rs:1913	-	<item>	
+src/db/vault.rs:1914	-	open_append	pub(crate) fn open_append(path: impl AsRef<Path>) -> Result<File> {
+src/db/vault.rs:1915	-	open_append	let path = path.as_ref();
+src/db/vault.rs:1916	-	open_append	let plain = |p: &Path| {
+src/db/vault.rs:1917	-	open_append	OpenOptions::new()
+src/db/vault.rs:1918	-	open_append	.read(true)
+src/db/vault.rs:1919	-	open_append	.create(true)
+src/db/vault.rs:1920	-	open_append	.append(true)
+src/db/vault.rs:1921	-	open_append	.open(p)
+src/db/vault.rs:1922	-	open_append	};
+src/db/vault.rs:1923	-	open_append	match locate(path) {
+src/db/vault.rs:1924	-	open_append	None => plain(path),
+src/db/vault.rs:1925	-	open_append	Some((v, name)) if passes(&name) => plain(&v.real.join(name)),
+src/db/vault.rs:1926	-	open_append	Some((v, name)) => match v.rewrite(&name, true) {
+src/db/vault.rs:1927	-	open_append	Err(e) if e.kind() == ErrorKind::NotFound => v.make(&name),
+src/db/vault.rs:1928	-	open_append	r => r,
+src/db/vault.rs:1929	-	open_append	},
+src/db/vault.rs:1930	-	open_append	}
+src/db/vault.rs:1931	-	open_append	}
+src/db/vault.rs:1932	-	<item>	
+src/db/vault.rs:1933	-	<item>	
+src/db/vault.rs:1934	-	<item>	
+src/db/vault.rs:1935	-	open_slot	pub(crate) fn open_slot(path: impl AsRef<Path>) -> Result<File> {
+src/db/vault.rs:1936	-	open_slot	let path = path.as_ref();
+src/db/vault.rs:1937	-	open_slot	let plain = |p: &Path| {
+src/db/vault.rs:1938	-	open_slot	OpenOptions::new()
+src/db/vault.rs:1939	-	open_slot	.write(true)
+src/db/vault.rs:1940	-	open_slot	.create(true)
+src/db/vault.rs:1941	-	open_slot	.truncate(false)
+src/db/vault.rs:1942	-	open_slot	.open(p)
+src/db/vault.rs:1943	-	open_slot	};
+src/db/vault.rs:1944	-	open_slot	match locate(path) {
+src/db/vault.rs:1945	-	open_slot	None => plain(path),
+src/db/vault.rs:1946	-	open_slot	Some((v, name)) if passes(&name) => plain(&v.real.join(name)),
+src/db/vault.rs:1947	-	open_slot	Some((v, name)) => match v.rewrite(&name, false) {
+src/db/vault.rs:1948	-	open_slot	Err(e) if e.kind() == ErrorKind::NotFound => v.make(&name),
+src/db/vault.rs:1949	-	open_slot	r => r,
+src/db/vault.rs:1950	-	open_slot	},
+src/db/vault.rs:1951	-	open_slot	}
+src/db/vault.rs:1952	-	open_slot	}
+src/db/vault.rs:1953	-	<item>	
+src/db/vault.rs:1954	-	<item>	
+src/db/vault.rs:1955	-	rename	pub(crate) fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()>
+src/db/vault.rs:1956	-	rename	let (from, to) = (from.as_ref(), to.as_ref());
+src/db/vault.rs:1957	-	rename	match (locate(from), locate(to)) {
+src/db/vault.rs:1958	-	rename	(None, None) => std::fs::rename(from, to),
+src/db/vault.rs:1959	-	rename	(Some((v, a)), Some((w, b))) if Arc::ptr_eq(&v, &w) && passes(&a) == passes(&b) 
+src/db/vault.rs:1960	-	rename	if passes(&a) {
+src/db/vault.rs:1961	-	rename	std::fs::rename(v.real.join(a), v.real.join(b))
+src/db/vault.rs:1962	-	rename	} else {
+src/db/vault.rs:1963	-	rename	v.rename(&a, &b)
+src/db/vault.rs:1964	-	rename	}
+src/db/vault.rs:1965	-	rename	}
+src/db/vault.rs:1966	-	rename	_ => Err(Error::new(
+src/db/vault.rs:1967	-	rename	ErrorKind::Unsupported,
+src/db/vault.rs:1968	-	rename	"a rename between a store under a cipher and somewhere else",
+src/db/vault.rs:1969	-	rename	)),
+src/db/vault.rs:1970	-	rename	}
+src/db/vault.rs:1971	-	rename	}
+src/db/vault.rs:1972	-	<item>	
+src/db/vault.rs:1973	-	<item>	
+src/db/vault.rs:1974	-	<item>	
+src/db/vault.rs:1975	-	<item>	
+src/db/vault.rs:1976	-	<item>	
+src/db/vault.rs:1977	-	open_mapped	pub(crate) fn open_mapped(path: impl AsRef<Path>) -> Result<(File, Mapped)> {
+src/db/vault.rs:1978	-	open_mapped	let path = path.as_ref();
+src/db/vault.rs:1979	-	open_mapped	match locate(path) {
+src/db/vault.rs:1980	-	open_mapped	None => Ok((File::open(path)?, Mapped(None))),
+src/db/vault.rs:1981	-	open_mapped	Some((v, name)) if passes(&name) => Ok((File::open(v.real.join(name))?, Mapped(N
+src/db/vault.rs:1982	-	open_mapped	Some((v, name)) => {
+src/db/vault.rs:1983	-	open_mapped	let (file, mem) = v.map_written(&name)?;
+src/db/vault.rs:1984	-	open_mapped	Ok((file, Mapped(Some((v, mem)))))
+src/db/vault.rs:1985	-	open_mapped	}
+src/db/vault.rs:1986	-	open_mapped	}
+src/db/vault.rs:1987	-	open_mapped	}
+src/db/vault.rs:1988	-	<item>	
+src/db/vault.rs:1989	-	<item>	
+src/db/vault.rs:1990	-	hard_link	pub(crate) fn hard_link(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<
+src/db/vault.rs:1991	-	hard_link	let (from, to) = (from.as_ref(), to.as_ref());
+src/db/vault.rs:1992	-	hard_link	match (locate(from), locate(to)) {
+src/db/vault.rs:1993	-	hard_link	(None, None) => std::fs::hard_link(from, to),
+src/db/vault.rs:1994	-	hard_link	(Some((v, a)), Some((w, b))) if Arc::ptr_eq(&v, &w) && passes(&a) == passes(&b) 
+src/db/vault.rs:1995	-	hard_link	if passes(&a) {
+src/db/vault.rs:1996	-	hard_link	std::fs::hard_link(v.real.join(a), v.real.join(b))
+src/db/vault.rs:1997	-	hard_link	} else {
+src/db/vault.rs:1998	-	hard_link	v.link(&a, &b)
+src/db/vault.rs:1999	-	hard_link	}
+src/db/vault.rs:2000	-	hard_link	}
+src/db/vault.rs:2001	-	hard_link	_ => Err(Error::new(
+src/db/vault.rs:2002	-	hard_link	ErrorKind::Unsupported,
+src/db/vault.rs:2003	-	hard_link	"a link between a store under a cipher and somewhere else",
+src/db/vault.rs:2004	-	hard_link	)),
+src/db/vault.rs:2005	-	hard_link	}
+src/db/vault.rs:2006	-	hard_link	}
+src/db/vault.rs:2007	-	<item>	
+src/db/vault.rs:2008	-	<item>	
+src/db/vault.rs:2009	-	remove_file	pub(crate) fn remove_file(path: impl AsRef<Path>) -> Result<()> {
+src/db/vault.rs:2010	-	remove_file	let path = path.as_ref();
+src/db/vault.rs:2011	-	remove_file	match locate(path) {
+src/db/vault.rs:2012	-	remove_file	None => std::fs::remove_file(path),
+src/db/vault.rs:2013	-	remove_file	Some((v, name)) if passes(&name) => std::fs::remove_file(v.real.join(name)),
+src/db/vault.rs:2014	-	remove_file	Some((v, name)) => v.remove(&name),
+src/db/vault.rs:2015	-	remove_file	}
+src/db/vault.rs:2016	-	remove_file	}
+src/db/vault.rs:2017	-	<item>	
+src/db/vault.rs:2018	-	<item>	
+src/db/vault.rs:2019	-	exists	pub(crate) fn exists(path: impl AsRef<Path>) -> bool {
+src/db/vault.rs:2020	-	exists	let path = path.as_ref();
+src/db/vault.rs:2021	-	exists	match locate(path) {
+src/db/vault.rs:2022	-	exists	None => path.exists(),
+src/db/vault.rs:2023	-	exists	Some((v, name)) if passes(&name) => v.real.join(name).exists(),
+src/db/vault.rs:2024	-	exists	Some((v, name)) => lock(&v.files).contains_key(&name),
+src/db/vault.rs:2025	-	exists	}
+src/db/vault.rs:2026	-	exists	}
+src/db/vault.rs:2027	-	<item>	
+src/db/vault.rs:2028	-	<item>	
+src/db/vault.rs:2029	-	is_file	pub(crate) fn is_file(path: impl AsRef<Path>) -> bool {
+src/db/vault.rs:2030	-	is_file	let path = path.as_ref();
+src/db/vault.rs:2031	-	is_file	match locate(path) {
+src/db/vault.rs:2032	-	is_file	None => path.is_file(),
+src/db/vault.rs:2033	-	is_file	Some((v, name)) if passes(&name) => v.real.join(name).is_file(),
+src/db/vault.rs:2034	-	is_file	Some((v, name)) => lock(&v.files).contains_key(&name),
+src/db/vault.rs:2035	-	is_file	}
+src/db/vault.rs:2036	-	is_file	}
+src/db/vault.rs:2037	-	<item>	
+src/db/vault.rs:2038	-	<item>	
+src/db/vault.rs:2039	-	len	pub(crate) fn len(path: impl AsRef<Path>) -> Result<u64> {
+src/db/vault.rs:2040	-	len	let path = path.as_ref();
+src/db/vault.rs:2041	-	len	match locate(path) {
+src/db/vault.rs:2042	-	len	None => Ok(std::fs::metadata(path)?.len()),
+src/db/vault.rs:2043	-	len	Some((v, name)) if passes(&name) => Ok(std::fs::metadata(v.real.join(name))?.len
+src/db/vault.rs:2044	-	len	Some((v, name)) => v.len(&name),
+src/db/vault.rs:2045	-	len	}
+src/db/vault.rs:2046	-	len	}
+src/db/vault.rs:2047	-	<item>	
+src/db/vault.rs:2048	-	<item>	
+src/db/vault.rs:2049	-	<item>	
+src/db/vault.rs:2050	-	names	pub(crate) fn names(dir: impl AsRef<Path>) -> Result<Vec<String>> {
+src/db/vault.rs:2051	-	names	let dir = dir.as_ref();
+src/db/vault.rs:2052	-	names	match under(dir) {
+src/db/vault.rs:2053	-	names	Some(v) => v.names(),
+src/db/vault.rs:2054	-	names	None => {
+src/db/vault.rs:2055	-	names	let mut out = Vec::new();
+src/db/vault.rs:2056	-	names	for entry in std::fs::read_dir(dir)? {
+src/db/vault.rs:2057	-	names	out.push(entry?.file_name().to_string_lossy().into_owned());
+src/db/vault.rs:2058	-	names	}
+src/db/vault.rs:2059	-	names	Ok(out)
+src/db/vault.rs:2060	-	names	}
+src/db/vault.rs:2061	-	names	}
+src/db/vault.rs:2062	-	names	}
+src/db/vault.rs:2063	-	<item>	
+src/db/vault.rs:2064	-	<item>	
+src/db/vault.rs:2065	-	read	pub(crate) fn read(path: impl AsRef<Path>) -> Result<Vec<u8>> {
+src/db/vault.rs:2066	-	read	let path = path.as_ref();
+src/db/vault.rs:2067	-	read	match locate(path) {
+src/db/vault.rs:2068	-	read	None => std::fs::read(path),
+src/db/vault.rs:2069	-	read	Some((v, name)) if passes(&name) => std::fs::read(v.real.join(name)),
+src/db/vault.rs:2070	-	read	Some((v, name)) => {
+src/db/vault.rs:2071	-	read	let page = v.page_of(&name)?;
+src/db/vault.rs:2072	-	read	let _held = v.pager.hold();
+src/db/vault.rs:2073	-	read	let src = MmapBytes::paged(page);
+src/db/vault.rs:2074	-	read	let mut buf = vec![0u8; src.len() as usize];
+src/db/vault.rs:2075	-	read	src.read_at(0, &mut buf)?;
+src/db/vault.rs:2076	-	read	v.pager.check()?;
+src/db/vault.rs:2077	-	read	Ok(buf)
+src/db/vault.rs:2078	-	read	}
+src/db/vault.rs:2079	-	read	}
+src/db/vault.rs:2080	-	read	}
+src/db/vault.rs:2081	-	<item>	
+src/db/vault.rs:2082	-	<item>	
+src/db/vault.rs:2083	-	sync_dir	pub(crate) fn sync_dir(dir: impl AsRef<Path>) -> Result<()> {
+src/db/vault.rs:2084	-	sync_dir	let dir = dir.as_ref();
+src/db/vault.rs:2085	-	sync_dir	match under(dir) {
+src/db/vault.rs:2086	-	sync_dir	Some(v) => File::open(&v.real)?.sync_all(),
+src/db/vault.rs:2087	-	sync_dir	None => File::open(dir)?.sync_all(),
+src/db/vault.rs:2088	-	sync_dir	}
+src/db/vault.rs:2089	-	sync_dir	}
+src/db/vault.rs:2090	-	<item>	
+src/db/vault.rs:2091	-	<item>	
+src/db/vault.rs:2092	-	<item>	
+src/db/vault.rs:2093	-	<item>	
+src/db/vault.rs:2094	-	<item>	
+src/db/vault.rs:2095	-	<item>	
+src/db/vault.rs:2096	-	real	pub(crate) fn real(path: impl AsRef<Path>) -> PathBuf {
+src/db/vault.rs:2097	-	real	let path = path.as_ref();
+src/db/vault.rs:2098	-	real	match locate(path) {
+src/db/vault.rs:2099	-	real	Some((v, name)) if passes(&name) => v.real.join(name),
+src/db/vault.rs:2100	-	real	_ => path.to_path_buf(),
+src/db/vault.rs:2101	-	real	}
+src/db/vault.rs:2102	-	real	}
+src/db/vault.rs:2103	-	<item>	
+src/db/vault.rs:2104	-	<item>	
+src/db/vault.rs:2105	-	open_dir	pub(crate) fn open_dir(dir: impl AsRef<Path>) -> Result<File> {
+src/db/vault.rs:2106	-	open_dir	let dir = dir.as_ref();
+src/db/vault.rs:2107	-	open_dir	match under(dir) {
+src/db/vault.rs:2108	-	open_dir	Some(v) => File::open(&v.real),
+src/db/vault.rs:2109	-	open_dir	None => File::open(dir),
+src/db/vault.rs:2110	-	open_dir	}
+src/db/vault.rs:2111	-	open_dir	}
+src/db/vault.rs:2112	-	<item>	
+src/db/vault.rs:2113	-	<item>	
+src/db/vault.rs:2114	-	<item>	
+src/db/vault.rs:2115	-	<item>	
+src/db/vault.rs:2116	-	<item>	
+src/db/vault.rs:2117	-	<item>	
+src/db/vault.rs:2118	-	persist	pub(crate) fn persist(dir: impl AsRef<Path>, pairs: &[(String, Option<String>)])
+src/db/vault.rs:2119	-	persist	match under(dir.as_ref()) {
+src/db/vault.rs:2120	-	persist	Some(v) => v.persist(pairs, false).map(|_| ()),
+src/db/vault.rs:2121	-	persist	None => Ok(()),
+src/db/vault.rs:2122	-	persist	}
+src/db/vault.rs:2123	-	persist	}
+src/db/vault.rs:2124	-	<item>	
+src/db/vault.rs:2125	-	<item>	
+src/db/vault.rs:2126	-	<item>	
+src/db/vault.rs:2127	-	<item>	
+src/db/vault.rs:2128	-	<item>	
+src/db/vault.rs:2129	-	persist_one	pub(crate) fn persist_one(dir: impl AsRef<Path>, seg: &str) -> Result<()> {
+src/db/vault.rs:2130	-	persist_one	match under(dir.as_ref()) {
+src/db/vault.rs:2131	-	persist_one	Some(v) => {
+src/db/vault.rs:2132	-	persist_one	let ord = crate::db::Db::ord_name_for(seg);
+src/db/vault.rs:2133	-	persist_one	v.persist_with(&[(seg.to_string(), ord)], false, false)
+src/db/vault.rs:2134	-	persist_one	.map(|_| ())
+src/db/vault.rs:2135	-	persist_one	}
+src/db/vault.rs:2136	-	persist_one	None => Ok(()),
+src/db/vault.rs:2137	-	persist_one	}
+src/db/vault.rs:2138	-	persist_one	}
+src/db/vault.rs:2139	-	<item>	
+src/db/vault.rs:2140	-	<item>	
+src/db/vault.rs:2141	-	<item>	
+src/db/vault.rs:2142	-	<item>	
+src/db/vault.rs:2143	-	<item>	
+src/db/vault.rs:2144	-	<item>	
+src/db/vault.rs:2145	-	<item>	
+src/db/vault.rs:2146	-	<item>	pub(crate) fn persist_form(
+src/db/vault.rs:2147	-	<item>	dir: impl AsRef<Path>,
+src/db/vault.rs:2148	-	<item>	seg: &str,
+src/db/vault.rs:2149	-	<item>	form: &str,
+src/db/vault.rs:2150	-	<item>	sync: bool,
+src/db/vault.rs:2151	-	<item>	cold: bool,
+src/db/vault.rs:2152	-	persist_form	) -> Result<()> {
+src/db/vault.rs:2153	-	persist_form	match under(dir.as_ref()) {
+src/db/vault.rs:2154	-	persist_form	Some(v) => v.persist_form(seg, form, sync, cold).map(|_| ()),
+src/db/vault.rs:2155	-	persist_form	None => Ok(()),
+src/db/vault.rs:2156	-	persist_form	}
+src/db/vault.rs:2157	-	persist_form	}
+src/db/vault.rs:2158	-	<item>	
+src/db/vault.rs:2159	-	<item>	
+src/db/vault.rs:2160	-	<item>	
+src/db/vault.rs:2161	-	<item>	
+src/db/vault.rs:2162	-	drop_cached	fn drop_cached(file: &File) {
+src/db/vault.rs:2163	-	drop_cached	#[cfg(target_os = "linux")]
+src/db/vault.rs:2164	-	drop_cached	{
+src/db/vault.rs:2165	-	drop_cached	use std::os::fd::AsRawFd;
+src/db/vault.rs:2166	-	drop_cached	
+src/db/vault.rs:2167	-	drop_cached	
+src/db/vault.rs:2168	-	drop_cached	unsafe {
+src/db/vault.rs:2169	-	drop_cached	libc::sync_file_range(
+src/db/vault.rs:2170	-	drop_cached	file.as_raw_fd(),
+src/db/vault.rs:2171	-	drop_cached	0,
+src/db/vault.rs:2172	-	drop_cached	0,
+src/db/vault.rs:2173	-	drop_cached	libc::SYNC_FILE_RANGE_WAIT_BEFORE
+src/db/vault.rs:2174	-	drop_cached	| libc::SYNC_FILE_RANGE_WRITE
+src/db/vault.rs:2175	-	drop_cached	| libc::SYNC_FILE_RANGE_WAIT_AFTER,
+src/db/vault.rs:2176	-	drop_cached	);
+src/db/vault.rs:2177	-	drop_cached	libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+src/db/vault.rs:2178	-	drop_cached	}
+src/db/vault.rs:2179	-	drop_cached	}
+src/db/vault.rs:2180	-	drop_cached	#[cfg(not(target_os = "linux"))]
+src/db/vault.rs:2181	-	drop_cached	let _ = file;
+src/db/vault.rs:2182	-	drop_cached	}
+src/db/vault.rs:2183	-	<item>	
+src/db/vault.rs:2184	-	<item>	
+src/db/vault.rs:2185	-	<item>	
+src/db/vault.rs:2186	-	<item>	
+src/db/vault.rs:2187	-	<item>	
+src/db/vault.rs:2188	-	companion	pub(crate) fn companion(dir: impl AsRef<Path>, seg: &str, form: &str) {
+src/db/vault.rs:2189	-	companion	if let Some(v) = under(dir.as_ref()) {
+src/db/vault.rs:2190	-	companion	v.companion(seg, form);
+src/db/vault.rs:2191	-	companion	}
+src/db/vault.rs:2192	-	companion	}
+src/db/vault.rs:2193	-	<item>	
+src/db/vault.rs:2194	-	<item>	
+src/db/vault.rs:2195	-	<item>	
+src/db/vault.rs:2196	-	<item>	
+src/db/vault.rs:2197	-	kept	pub(crate) fn kept(path: impl AsRef<Path>) -> bool {
+src/db/vault.rs:2198	-	kept	matches!(locate(path.as_ref()), Some((_, name)) if !passes(&name))
+src/db/vault.rs:2199	-	kept	}
+src/db/vault.rs:2200	-	<item>	
+src/db/vault.rs:2201	-	<item>	
+src/db/vault.rs:2202	-	<item>	
+src/db/vault.rs:2203	-	<item>	
+src/db/vault.rs:2204	-	<item>	
+src/db/vault.rs:2205	-	map	pub(crate) fn map(path: impl AsRef<Path>) -> Result<MmapBytes> {
+src/db/vault.rs:2206	-	map	let path = path.as_ref();
+src/db/vault.rs:2207	-	map	match locate(path) {
+src/db/vault.rs:2208	-	map	None => MmapBytes::open(path),
+src/db/vault.rs:2209	-	map	Some((v, name)) if passes(&name) => MmapBytes::open(&v.real.join(name)),
+src/db/vault.rs:2210	-	map	Some((v, name)) => Ok(MmapBytes::paged(v.page_of(&name)?)),
+src/db/vault.rs:2211	-	map	}
+src/db/vault.rs:2212	-	map	}
+src/db/vault.rs:2213	-	<item>	
+src/db/vault.rs:2214	-	<item>	
+src/db/vault.rs:2215	-	<item>	
+src/db/vault.rs:2216	-	<item>	
+src/db/vault.rs:2217	-	check	pub(crate) fn check(dir: impl AsRef<Path>) -> Result<()> {
+src/db/vault.rs:2218	-	check	match under(dir.as_ref()) {
+src/db/vault.rs:2219	-	check	Some(v) => v.pager.check(),
+src/db/vault.rs:2220	-	check	None => Ok(()),
+src/db/vault.rs:2221	-	check	}
+src/db/vault.rs:2222	-	check	}
+src/db/vault.rs:2223	-	<item>	
+src/db/vault.rs:2224	-	<item>	
+src/db/vault.rs:2225	-	<item>	
+src/db/vault.rs:2226	-	<item>	
+src/db/vault.rs:2227	-	hold	pub(crate) fn hold(dir: impl AsRef<Path>) -> Option<pager::Hold> {
+src/db/vault.rs:2228	-	hold	under(dir.as_ref()).map(|v| v.pager.hold())
+src/db/vault.rs:2229	-	hold	}
+src/db/vault.rs:2230	-	<item>	
+src/db/vault.rs:2231	T	<item>	#[cfg(all(test, target_os = "linux"))]
+src/db/vault.rs:2232	T	<item:tests>	pub(crate) mod tests {
+src/db/vault.rs:2233	T	<item:tests>	use super::*;
+src/db/vault.rs:2234	T	<item:tests>	
+src/db/vault.rs:2235	T	<item:tests>	
+src/db/vault.rs:2236	T	<item:tests>	
+src/db/vault.rs:2237	T	<item:tests>	
+src/db/vault.rs:2238	T	<item:tests>	struct Toy(u64);
+src/db/vault.rs:2239	T	<item:tests>	
+src/db/vault.rs:2240	T	mix	fn mix(mut h: u64, bytes: &[u8]) -> u64 {
+src/db/vault.rs:2241	T	mix	for &b in bytes {
+src/db/vault.rs:2242	T	mix	h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+src/db/vault.rs:2243	T	mix	}
+src/db/vault.rs:2244	T	mix	h ^ (h >> 29)
+src/db/vault.rs:2245	T	<item:tests>	}
+src/db/vault.rs:2246	T	<item:tests>	
+src/db/vault.rs:2247	T	Toy::<item>	impl Toy {
+src/db/vault.rs:2248	T	Toy::<item>	fn of(key: &[u8; KEY]) -> Toy {
+src/db/vault.rs:2249	T	Toy::<item>	Toy(mix(0x9E37_79B9_7F4A_7C15, key))
+src/db/vault.rs:2250	T	Toy::<item>	}
+src/db/vault.rs:2251	T	Toy::<item>	fn stream(&self, nonce: &[u8; NONCE], buf: &mut [u8]) {
+src/db/vault.rs:2252	T	Toy::<item>	let mut s = mix(self.0 | 1, nonce);
+src/db/vault.rs:2253	T	Toy::<item>	for b in buf {
+src/db/vault.rs:2254	T	Toy::<item>	s ^= s << 13;
+src/db/vault.rs:2255	T	Toy::<item>	s ^= s >> 7;
+src/db/vault.rs:2256	T	Toy::<item>	s ^= s << 17;
+src/db/vault.rs:2257	T	Toy::<item>	*b ^= s as u8;
+src/db/vault.rs:2258	T	Toy::<item>	}
+src/db/vault.rs:2259	T	Toy::<item>	}
+src/db/vault.rs:2260	T	Toy::<item>	fn tag(&self, nonce: &[u8; NONCE], aad: &[u8], body: &[u8]) -> [u8; TAG] {
+src/db/vault.rs:2261	T	Toy::<item>	let a = mix(mix(mix(self.0, nonce), aad), body);
+src/db/vault.rs:2262	T	Toy::<item>	let b = mix(a, &(aad.len() as u64).to_le_bytes());
+src/db/vault.rs:2263	T	Toy::<item>	let mut t = [0u8; TAG];
+src/db/vault.rs:2264	T	Toy::<item>	t[..8].copy_from_slice(&a.to_le_bytes());
+src/db/vault.rs:2265	T	Toy::<item>	t[8..].copy_from_slice(&b.to_le_bytes());
+src/db/vault.rs:2266	T	Toy::<item>	t
+src/db/vault.rs:2267	T	Toy::<item>	}
+src/db/vault.rs:2268	T	<item:tests>	}
+src/db/vault.rs:2269	T	<item:tests>	
+src/db/vault.rs:2270	T	Toy::<item>	impl Aead for Toy {
+src/db/vault.rs:2271	T	Toy::<item>	fn encrypt(&self, nonce: &[u8; NONCE], aad: &[u8], buf: &mut [u8]) -> [u8; TAG] 
+src/db/vault.rs:2272	T	Toy::<item>	self.stream(nonce, buf);
+src/db/vault.rs:2273	T	Toy::<item>	self.tag(nonce, aad, buf)
+src/db/vault.rs:2274	T	Toy::<item>	}
+src/db/vault.rs:2275	T	Toy::<item>	fn decrypt(
+src/db/vault.rs:2276	T	Toy::<item>	&self,
+src/db/vault.rs:2277	T	Toy::<item>	nonce: &[u8; NONCE],
+src/db/vault.rs:2278	T	Toy::<item>	aad: &[u8],
+src/db/vault.rs:2279	T	Toy::<item>	buf: &mut [u8],
+src/db/vault.rs:2280	T	Toy::<item>	tag: &[u8; TAG],
+src/db/vault.rs:2281	T	Toy::<item>	) -> bool {
+src/db/vault.rs:2282	T	Toy::<item>	let ok = self.tag(nonce, aad, buf) == *tag;
+src/db/vault.rs:2283	T	Toy::<item>	self.stream(nonce, buf);
+src/db/vault.rs:2284	T	Toy::<item>	ok
+src/db/vault.rs:2285	T	Toy::<item>	}
+src/db/vault.rs:2286	T	<item:tests>	}
+src/db/vault.rs:2287	T	<item:tests>	
+src/db/vault.rs:2288	T	<item:tests>	
+src/db/vault.rs:2289	T	<item:tests>	
+src/db/vault.rs:2290	T	cipher	pub(crate) fn cipher(key: u8) -> StoreCipher {
+src/db/vault.rs:2291	T	cipher	StoreCipher::new(Toy::of(&[key; KEY]), Toy::of).key_id(u64::from(key))
+src/db/vault.rs:2292	T	<item:tests>	}
+src/db/vault.rs:2293	T	<item:tests>	
+src/db/vault.rs:2294	T	dir	fn dir(tag: &str) -> PathBuf {
+src/db/vault.rs:2295	T	dir	let d = std::env::temp_dir().join(format!("supdb-next-vault-{tag}-{}", std::proc
+src/db/vault.rs:2296	T	dir	let _ = std::fs::remove_dir_all(&d);
+src/db/vault.rs:2297	T	dir	std::fs::create_dir_all(&d).unwrap();
+src/db/vault.rs:2298	T	dir	d
+src/db/vault.rs:2299	T	<item:tests>	}
+src/db/vault.rs:2300	T	<item:tests>	
+src/db/vault.rs:2301	T	put	fn put(path: &Path, bytes: &[u8]) {
+src/db/vault.rs:2302	T	put	create(path).unwrap().write_all(bytes).unwrap();
+src/db/vault.rs:2303	T	<item:tests>	}
+src/db/vault.rs:2304	T	<item:tests>	
+src/db/vault.rs:2305	T	pair	fn pair(seg: &str, ord: Option<&str>) -> Vec<(String, Option<String>)> {
+src/db/vault.rs:2306	T	pair	vec![(seg.to_string(), ord.map(str::to_string))]
+src/db/vault.rs:2307	T	<item:tests>	}
+src/db/vault.rs:2308	T	<item:tests>	
+src/db/vault.rs:2309	T	<item:tests>	
+src/db/vault.rs:2310	T	on_disk	fn on_disk(real: &Path) -> Vec<(String, Vec<u8>)> {
+src/db/vault.rs:2311	T	on_disk	let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(real)
+src/db/vault.rs:2312	T	on_disk	.unwrap()
+src/db/vault.rs:2313	T	on_disk	.map(|e| {
+src/db/vault.rs:2314	T	on_disk	let e = e.unwrap();
+src/db/vault.rs:2315	T	on_disk	(
+src/db/vault.rs:2316	T	on_disk	e.file_name().to_string_lossy().into_owned(),
+src/db/vault.rs:2317	T	on_disk	std::fs::read(e.path()).unwrap(),
+src/db/vault.rs:2318	T	on_disk	)
+src/db/vault.rs:2319	T	on_disk	})
+src/db/vault.rs:2320	T	on_disk	.collect();
+src/db/vault.rs:2321	T	on_disk	v.sort();
+src/db/vault.rs:2322	T	on_disk	v
+src/db/vault.rs:2323	T	<item:tests>	}
+src/db/vault.rs:2324	T	<item:tests>	
+src/db/vault.rs:2325	T	holds	fn holds(hay: &[u8], needle: &[u8]) -> bool {
+src/db/vault.rs:2326	T	holds	hay.windows(needle.len()).any(|w| w == needle)
+src/db/vault.rs:2327	T	<item:tests>	}
+src/db/vault.rs:2328	T	<item:tests>	
+src/db/vault.rs:2329	T	<item:tests>	
+src/db/vault.rs:2330	T	<item:tests>	
+src/db/vault.rs:2331	T	<item:tests>	
+src/db/vault.rs:2332	T	<item:tests>	
+src/db/vault.rs:2333	T	<item:tests>	
+src/db/vault.rs:2334	T	<item:tests>	
+src/db/vault.rs:2335	T	<item:tests>	
+src/db/vault.rs:2336	T	<item:tests>	#[test]
+src/db/vault.rs:2337	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	fn a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first() 
+src/db/vault.rs:2338	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	let real = dir("formagain");
+src/db/vault.rs:2339	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	
+src/db/vault.rs:2340	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	
+src/db/vault.rs:2341	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	let held = Vault::create(&real, &cipher(4).cache_bytes(4096)).unwrap();
+src/db/vault.rs:2342	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	let d = held.dir();
+src/db/vault.rs:2343	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	let v = held.vault();
+src/db/vault.rs:2344	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	put(&d.join("par-1.sup"), &b"a segment ".repeat(100));
+src/db/vault.rs:2345	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	v.persist(&pair("par-1.sup", None), false).unwrap();
+src/db/vault.rs:2346	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	let first = b"the first coding of the form, ".repeat(2000);
+src/db/vault.rs:2347	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	let second = b"another coding of it, and a longer file, ".repeat(3000);
+src/db/vault.rs:2348	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	put(&d.join("zpg-1.zpg"), &first);
+src/db/vault.rs:2349	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	assert!(v
+src/db/vault.rs:2350	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.persist_form("par-1.sup", "zpg-1.zpg", false, false)
+src/db/vault.rs:2351	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.unwrap());
+src/db/vault.rs:2352	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	let forms = |real: &Path| {
+src/db/vault.rs:2353	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	on_disk(real)
+src/db/vault.rs:2354	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.into_iter()
+src/db/vault.rs:2355	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.filter(|(n, _)| n.ends_with(".z"))
+src/db/vault.rs:2356	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.count()
+src/db/vault.rs:2357	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	};
+src/db/vault.rs:2358	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	assert_eq!(forms(&real), 1);
+src/db/vault.rs:2359	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	
+src/db/vault.rs:2360	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	let old = map(d.join("zpg-1.zpg")).unwrap();
+src/db/vault.rs:2361	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	rename(d.join("zpg-1.zpg"), d.join("dead-1")).unwrap();
+src/db/vault.rs:2362	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	put(&d.join("zpg-1.zpg"), &second);
+src/db/vault.rs:2363	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	assert!(v
+src/db/vault.rs:2364	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.persist_form("par-1.sup", "zpg-1.zpg", false, false)
+src/db/vault.rs:2365	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	.unwrap());
+src/db/vault.rs:2366	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	assert_eq!(forms(&real), 1, "one envelope a segment's form");
+src/db/vault.rs:2367	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	{
+src/db/vault.rs:2368	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	let _held = v.pager().hold();
+src/db/vault.rs:2369	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	let mut got = vec![0u8; first.len()];
+src/db/vault.rs:2370	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	old.read_at(0, &mut got).unwrap();
+src/db/vault.rs:2371	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	assert!(got == first, "the first view read other bytes");
+src/db/vault.rs:2372	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	}
+src/db/vault.rs:2373	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	v.pager().check().unwrap();
+src/db/vault.rs:2374	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	assert!(read(d.join("zpg-1.zpg")).unwrap() == second);
+src/db/vault.rs:2375	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	
+src/db/vault.rs:2376	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	
+src/db/vault.rs:2377	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	drop(old);
+src/db/vault.rs:2378	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	remove_file(d.join("dead-1")).unwrap();
+src/db/vault.rs:2379	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	assert_eq!(
+src/db/vault.rs:2380	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	forms(&real),
+src/db/vault.rs:2381	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	1,
+src/db/vault.rs:2382	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	"the second's envelope went with the first's name"
+src/db/vault.rs:2383	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	);
+src/db/vault.rs:2384	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	assert!(read(d.join("zpg-1.zpg")).unwrap() == second);
+src/db/vault.rs:2385	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	
+src/db/vault.rs:2386	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	remove_file(d.join("zpg-1.zpg")).unwrap();
+src/db/vault.rs:2387	T	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	assert_eq!(forms(&real), 0);
+src/db/vault.rs:2388	T	<item:tests>	}
+src/db/vault.rs:2389	T	<item:tests>	
+src/db/vault.rs:2390	T	<item:tests>	
+src/db/vault.rs:2391	T	<item:tests>	
+src/db/vault.rs:2392	T	<item:tests>	
+src/db/vault.rs:2393	T	<item:tests>	
+src/db/vault.rs:2394	T	<item:tests>	#[test]
+src/db/vault.rs:2395	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	fn a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope() {
+src/db/vault.rs:2396	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	let real = dir("kept");
+src/db/vault.rs:2397	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	let held = Vault::create(&real, &cipher(1)).unwrap();
+src/db/vault.rs:2398	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	let d = held.dir();
+src/db/vault.rs:2399	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	let body = b"the fence key-00750 and a value nobody may read".repeat(300);
+src/db/vault.rs:2400	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	put(&d.join("seal-1.tmp"), &body);
+src/db/vault.rs:2401	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert!(exists(d.join("seal-1.tmp")));
+src/db/vault.rs:2402	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert_eq!(len(d.join("seal-1.tmp")).unwrap(), body.len() as u64);
+src/db/vault.rs:2403	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	rename(d.join("seal-1.tmp"), d.join("par-1-key-00750.sup")).unwrap();
+src/db/vault.rs:2404	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert!(!exists(d.join("seal-1.tmp")));
+src/db/vault.rs:2405	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert_eq!(read(d.join("par-1-key-00750.sup")).unwrap(), body);
+src/db/vault.rs:2406	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	let m = map(d.join("par-1-key-00750.sup")).unwrap();
+src/db/vault.rs:2407	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert!(m.piecewise(), "a kept file is read by the piece");
+src/db/vault.rs:2408	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert!(
+src/db/vault.rs:2409	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	m.as_slice().is_empty(),
+src/db/vault.rs:2410	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	"and lends nothing that was not asked for"
+src/db/vault.rs:2411	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	);
+src/db/vault.rs:2412	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	{
+src/db/vault.rs:2413	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	let _held = held.vault().pager().hold();
+src/db/vault.rs:2414	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert_eq!(m.slice_at(0, body.len()).unwrap(), &body[..]);
+src/db/vault.rs:2415	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert_eq!(m.slice_at(77, 5000).unwrap(), &body[77..5077]);
+src/db/vault.rs:2416	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert!(m.slice_at(1, body.len()).is_none(), "past the end");
+src/db/vault.rs:2417	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	}
+src/db/vault.rs:2418	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	let mut again = Vec::new();
+src/db/vault.rs:2419	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	open(d.join("par-1-key-00750.sup"))
+src/db/vault.rs:2420	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.unwrap()
+src/db/vault.rs:2421	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.read_to_end(&mut again)
+src/db/vault.rs:2422	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.unwrap();
+src/db/vault.rs:2423	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert_eq!(again, body);
+src/db/vault.rs:2424	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert_eq!(
+src/db/vault.rs:2425	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	on_disk(&real)
+src/db/vault.rs:2426	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.iter()
+src/db/vault.rs:2427	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.map(|(n, _)| n.as_str())
+src/db/vault.rs:2428	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.collect::<Vec<_>>(),
+src/db/vault.rs:2429	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	vec![MARKER],
+src/db/vault.rs:2430	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	"nothing of a kept file is in the directory before a persist"
+src/db/vault.rs:2431	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	);
+src/db/vault.rs:2432	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	put(&d.join("ord-1.oidx"), b"an index over key-00750");
+src/db/vault.rs:2433	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	let files = held
+src/db/vault.rs:2434	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.vault()
+src/db/vault.rs:2435	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.persist(&pair("par-1-key-00750.sup", Some("ord-1.oidx")), true)
+src/db/vault.rs:2436	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.unwrap();
+src/db/vault.rs:2437	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	let (token, _) = files[0];
+src/db/vault.rs:2438	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	let names: Vec<String> = on_disk(&real).into_iter().map(|(n, _)| n).collect();
+src/db/vault.rs:2439	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert_eq!(
+src/db/vault.rs:2440	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	names,
+src/db/vault.rs:2441	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	vec![
+src/db/vault.rs:2442	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	MARKER.to_string(),
+src/db/vault.rs:2443	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	disk_name(&token, Kind::Seg),
+src/db/vault.rs:2444	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	disk_name(&token, Kind::Ord)
+src/db/vault.rs:2445	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	]
+src/db/vault.rs:2446	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	);
+src/db/vault.rs:2447	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	for (name, bytes) in on_disk(&real) {
+src/db/vault.rs:2448	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert!(!name.contains("00750"), "{name} carries the fence");
+src/db/vault.rs:2449	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert!(!holds(&bytes, b"key-00750"), "{name} holds a key");
+src/db/vault.rs:2450	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert!(!holds(&bytes, b"nobody may read"), "{name} holds a value");
+src/db/vault.rs:2451	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	}
+src/db/vault.rs:2452	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	
+src/db/vault.rs:2453	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	
+src/db/vault.rs:2454	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	
+src/db/vault.rs:2455	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	
+src/db/vault.rs:2456	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert!(held
+src/db/vault.rs:2457	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.vault()
+src/db/vault.rs:2458	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.persist(&pair("pcs-9.sup", None), true)
+src/db/vault.rs:2459	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.is_err());
+src/db/vault.rs:2460	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert!(held
+src/db/vault.rs:2461	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.vault()
+src/db/vault.rs:2462	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.persist(&pair("pcs-9.sup", None), false)
+src/db/vault.rs:2463	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.unwrap()
+src/db/vault.rs:2464	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.is_empty());
+src/db/vault.rs:2465	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	persist(&d, &pair("pcs-9.sup", None)).unwrap();
+src/db/vault.rs:2466	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	persist(&real, &pair("pcs-9.sup", None)).unwrap();
+src/db/vault.rs:2467	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	
+src/db/vault.rs:2468	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	let before = on_disk(&real);
+src/db/vault.rs:2469	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert_eq!(
+src/db/vault.rs:2470	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	held.vault()
+src/db/vault.rs:2471	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.persist(&pair("par-1-key-00750.sup", Some("ord-1.oidx")), true)
+src/db/vault.rs:2472	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.unwrap()[0]
+src/db/vault.rs:2473	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	.0,
+src/db/vault.rs:2474	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	token
+src/db/vault.rs:2475	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	);
+src/db/vault.rs:2476	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert_eq!(on_disk(&real), before);
+src/db/vault.rs:2477	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	
+src/db/vault.rs:2478	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	
+src/db/vault.rs:2479	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	hard_link(d.join("par-1-key-00750.sup"), d.join("par-1-wide.sup")).unwrap();
+src/db/vault.rs:2480	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert!(hard_link(d.join("par-1-key-00750.sup"), d.join("par-1-wide.sup")).is_er
+src/db/vault.rs:2481	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	remove_file(d.join("par-1-key-00750.sup")).unwrap();
+src/db/vault.rs:2482	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert!(real.join(disk_name(&token, Kind::Seg)).exists());
+src/db/vault.rs:2483	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert_eq!(read(d.join("par-1-wide.sup")).unwrap(), body);
+src/db/vault.rs:2484	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	remove_file(d.join("par-1-wide.sup")).unwrap();
+src/db/vault.rs:2485	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert!(!real.join(disk_name(&token, Kind::Seg)).exists());
+src/db/vault.rs:2486	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert!(remove_file(d.join("par-1-wide.sup")).is_err());
+src/db/vault.rs:2487	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	remove_file(d.join("ord-1.oidx")).unwrap();
+src/db/vault.rs:2488	T	a_kept_file_lives_in_memory_and_reaches_the_directory_as_an_envelope	assert!(!real.join(disk_name(&token, Kind::Ord)).exists());
+src/db/vault.rs:2489	T	<item:tests>	}
+src/db/vault.rs:2490	T	<item:tests>	
+src/db/vault.rs:2491	T	<item:tests>	
+src/db/vault.rs:2492	T	<item:tests>	
+src/db/vault.rs:2493	T	<item:tests>	#[test]
+src/db/vault.rs:2494	T	a_path_the_door_is_not_in_front_of_writes_nothing	fn a_path_the_door_is_not_in_front_of_writes_nothing() {
+src/db/vault.rs:2495	T	a_path_the_door_is_not_in_front_of_writes_nothing	let real = dir("decoy");
+src/db/vault.rs:2496	T	a_path_the_door_is_not_in_front_of_writes_nothing	let held = Vault::create(&real, &cipher(1)).unwrap();
+src/db/vault.rs:2497	T	a_path_the_door_is_not_in_front_of_writes_nothing	let d = held.dir();
+src/db/vault.rs:2498	T	a_path_the_door_is_not_in_front_of_writes_nothing	assert!(File::create(d.join("seg-1.sup")).is_err());
+src/db/vault.rs:2499	T	a_path_the_door_is_not_in_front_of_writes_nothing	assert!(std::fs::write(d.join("seg-1.sup"), b"plaintext").is_err());
+src/db/vault.rs:2500	T	a_path_the_door_is_not_in_front_of_writes_nothing	assert!(std::fs::read_dir(&d).is_err());
+src/db/vault.rs:2501	T	a_path_the_door_is_not_in_front_of_writes_nothing	assert_eq!(on_disk(&real).len(), 1, "the marker alone");
+src/db/vault.rs:2502	T	a_path_the_door_is_not_in_front_of_writes_nothing	
+src/db/vault.rs:2503	T	a_path_the_door_is_not_in_front_of_writes_nothing	put(&d.join("something-new"), b"plaintext nobody planned for");
+src/db/vault.rs:2504	T	a_path_the_door_is_not_in_front_of_writes_nothing	assert_eq!(on_disk(&real).len(), 1);
+src/db/vault.rs:2505	T	a_path_the_door_is_not_in_front_of_writes_nothing	drop(held);
+src/db/vault.rs:2506	T	a_path_the_door_is_not_in_front_of_writes_nothing	
+src/db/vault.rs:2507	T	a_path_the_door_is_not_in_front_of_writes_nothing	
+src/db/vault.rs:2508	T	a_path_the_door_is_not_in_front_of_writes_nothing	assert!(create(d.join("seg-1.sup")).is_err());
+src/db/vault.rs:2509	T	<item:tests>	}
+src/db/vault.rs:2510	T	<item:tests>	
+src/db/vault.rs:2511	T	<item:tests>	
+src/db/vault.rs:2512	T	<item:tests>	
+src/db/vault.rs:2513	T	<item:tests>	#[test]
+src/db/vault.rs:2514	T	the_log_and_the_manifest_pass_to_the_directory	fn the_log_and_the_manifest_pass_to_the_directory() {
+src/db/vault.rs:2515	T	the_log_and_the_manifest_pass_to_the_directory	let real = dir("pass");
+src/db/vault.rs:2516	T	the_log_and_the_manifest_pass_to_the_directory	let held = Vault::create(&real, &cipher(1)).unwrap();
+src/db/vault.rs:2517	T	the_log_and_the_manifest_pass_to_the_directory	let d = held.dir();
+src/db/vault.rs:2518	T	the_log_and_the_manifest_pass_to_the_directory	put(&d.join("wal-00000000"), b"sealed by the engine");
+src/db/vault.rs:2519	T	the_log_and_the_manifest_pass_to_the_directory	put(&d.join("manifest.tmp"), b"sealed too");
+src/db/vault.rs:2520	T	the_log_and_the_manifest_pass_to_the_directory	rename(d.join("manifest.tmp"), d.join("manifest")).unwrap();
+src/db/vault.rs:2521	T	the_log_and_the_manifest_pass_to_the_directory	assert_eq!(
+src/db/vault.rs:2522	T	the_log_and_the_manifest_pass_to_the_directory	std::fs::read(real.join("wal-00000000")).unwrap(),
+src/db/vault.rs:2523	T	the_log_and_the_manifest_pass_to_the_directory	b"sealed by the engine"
+src/db/vault.rs:2524	T	the_log_and_the_manifest_pass_to_the_directory	);
+src/db/vault.rs:2525	T	the_log_and_the_manifest_pass_to_the_directory	assert_eq!(std::fs::read(real.join("manifest")).unwrap(), b"sealed too");
+src/db/vault.rs:2526	T	the_log_and_the_manifest_pass_to_the_directory	assert_eq!(len(d.join("manifest")).unwrap(), 10);
+src/db/vault.rs:2527	T	the_log_and_the_manifest_pass_to_the_directory	assert_eq!(super::real(d.join("manifest")), real.join("manifest"));
+src/db/vault.rs:2528	T	the_log_and_the_manifest_pass_to_the_directory	assert_eq!(super::real(d.join("seg-1.sup")), d.join("seg-1.sup"));
+src/db/vault.rs:2529	T	the_log_and_the_manifest_pass_to_the_directory	assert_eq!(super::real(real.join("manifest")), real.join("manifest"));
+src/db/vault.rs:2530	T	the_log_and_the_manifest_pass_to_the_directory	let mut listed = names(&d).unwrap();
+src/db/vault.rs:2531	T	the_log_and_the_manifest_pass_to_the_directory	listed.sort();
+src/db/vault.rs:2532	T	the_log_and_the_manifest_pass_to_the_directory	assert_eq!(listed, vec!["manifest", "wal-00000000"]);
+src/db/vault.rs:2533	T	the_log_and_the_manifest_pass_to_the_directory	assert!(rename(d.join("manifest"), d.join("seg-1.sup")).is_err());
+src/db/vault.rs:2534	T	the_log_and_the_manifest_pass_to_the_directory	sync_dir(&d).unwrap();
+src/db/vault.rs:2535	T	the_log_and_the_manifest_pass_to_the_directory	remove_file(d.join("wal-00000000")).unwrap();
+src/db/vault.rs:2536	T	the_log_and_the_manifest_pass_to_the_directory	assert!(!exists(d.join("wal-00000000")));
+src/db/vault.rs:2537	T	<item:tests>	}
+src/db/vault.rs:2538	T	<item:tests>	
+src/db/vault.rs:2539	T	<item:tests>	
+src/db/vault.rs:2540	T	<item:tests>	
+src/db/vault.rs:2541	T	<item:tests>	
+src/db/vault.rs:2542	T	<item:tests>	#[test]
+src/db/vault.rs:2543	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	fn a_reopened_store_reads_what_was_named_and_sweeps_what_was_not() {
+src/db/vault.rs:2544	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	let real = dir("reopen");
+src/db/vault.rs:2545	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	let body: Vec<u8> = (0..300_000u32).map(|i| (i * 7 + i / 251) as u8).collect();
+src/db/vault.rs:2546	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	let (token, wrapped, orphan) = {
+src/db/vault.rs:2547	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	let held = Vault::create(&real, &cipher(1)).unwrap();
+src/db/vault.rs:2548	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	let d = held.dir();
+src/db/vault.rs:2549	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	put(&d.join("seg-1.sup"), &body);
+src/db/vault.rs:2550	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	put(&d.join("ord-1.oidx"), b"index");
+src/db/vault.rs:2551	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	put(&d.join("seg-2.sup"), b"sealed and never named");
+src/db/vault.rs:2552	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	let v = held.vault();
+src/db/vault.rs:2553	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	let (token, wrapped) = v
+src/db/vault.rs:2554	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	.persist(&pair("seg-1.sup", Some("ord-1.oidx")), true)
+src/db/vault.rs:2555	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	.unwrap()[0];
+src/db/vault.rs:2556	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	let (orphan, _) = v.persist(&pair("seg-2.sup", None), true).unwrap()[0];
+src/db/vault.rs:2557	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	assert_eq!(v.counts.persisted.load(Ordering::Relaxed), 3);
+src/db/vault.rs:2558	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	(token, wrapped, orphan)
+src/db/vault.rs:2559	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	};
+src/db/vault.rs:2560	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	let held = Vault::open(&real, &cipher(1)).unwrap();
+src/db/vault.rs:2561	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	let d = held.dir();
+src/db/vault.rs:2562	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	let v = held.vault();
+src/db/vault.rs:2563	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	assert!(
+src/db/vault.rs:2564	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	names(&d).unwrap().is_empty(),
+src/db/vault.rs:2565	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	"nothing is known before a manifest"
+src/db/vault.rs:2566	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	);
+src/db/vault.rs:2567	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	v.adopt("seg-1.sup", token, wrapped, Some("ord-1.oidx"));
+src/db/vault.rs:2568	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	v.adopt("par-1.sup", token, wrapped, None);
+src/db/vault.rs:2569	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	assert_eq!(v.sweep().unwrap(), 1);
+src/db/vault.rs:2570	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	assert!(!real.join(disk_name(&orphan, Kind::Seg)).exists());
+src/db/vault.rs:2571	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	assert_eq!(len(d.join("seg-1.sup")).unwrap(), body.len() as u64);
+src/db/vault.rs:2572	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	let m = map(d.join("seg-1.sup")).unwrap();
+src/db/vault.rs:2573	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	assert_eq!(
+src/db/vault.rs:2574	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	v.pager().counts().fills,
+src/db/vault.rs:2575	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	0,
+src/db/vault.rs:2576	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	"a length and a map decrypt nothing"
+src/db/vault.rs:2577	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	);
+src/db/vault.rs:2578	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	{
+src/db/vault.rs:2579	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	let _held = v.pager().hold();
+src/db/vault.rs:2580	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	assert_eq!(m.slice_at(100_000, 10).unwrap(), &body[100_000..100_010]);
+src/db/vault.rs:2581	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	}
+src/db/vault.rs:2582	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	assert_eq!(v.pager().counts().fills, 1, "a read decrypts its chunk");
+src/db/vault.rs:2583	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	assert_eq!(read(d.join("seg-1.sup")).unwrap(), body);
+src/db/vault.rs:2584	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	let chunks = body.len().div_ceil(pager::CHUNK) as u64;
+src/db/vault.rs:2585	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	assert_eq!(v.pager().counts().fills, chunks);
+src/db/vault.rs:2586	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	assert_eq!(read(d.join("par-1.sup")).unwrap(), body);
+src/db/vault.rs:2587	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	assert_eq!(
+src/db/vault.rs:2588	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	v.pager().counts().fills,
+src/db/vault.rs:2589	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	chunks,
+src/db/vault.rs:2590	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	"two names, one copy: nothing is decrypted twice"
+src/db/vault.rs:2591	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	);
+src/db/vault.rs:2592	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	assert!(
+src/db/vault.rs:2593	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	open(d.join("seg-1.sup")).is_err(),
+src/db/vault.rs:2594	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	"a file with its envelope has no descriptor to hand out"
+src/db/vault.rs:2595	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	);
+src/db/vault.rs:2596	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	assert_eq!(read(d.join("ord-1.oidx")).unwrap(), b"index");
+src/db/vault.rs:2597	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	assert!(open_write(d.join("seg-1.sup")).is_err(), "written once");
+src/db/vault.rs:2598	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	
+src/db/vault.rs:2599	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	
+src/db/vault.rs:2600	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	remove_file(d.join("par-1.sup")).unwrap();
+src/db/vault.rs:2601	T	a_reopened_store_reads_what_was_named_and_sweeps_what_was_not	assert!(real.join(disk_name(&token, Kind::Seg)).exists());
+src/db/vault.rs:2602	T	<item:tests>	}
+src/db/vault.rs:2603	T	<item:tests>	
+src/db/vault.rs:2604	T	<item:tests>	
+src/db/vault.rs:2605	T	<item:tests>	
+src/db/vault.rs:2606	T	<item:tests>	#[test]
+src/db/vault.rs:2607	T	a_changed_envelope_is_refused	fn a_changed_envelope_is_refused() {
+src/db/vault.rs:2608	T	a_changed_envelope_is_refused	let real = dir("damage");
+src/db/vault.rs:2609	T	a_changed_envelope_is_refused	let body = vec![7u8; 9000];
+src/db/vault.rs:2610	T	a_changed_envelope_is_refused	let (token, wrapped, other) = {
+src/db/vault.rs:2611	T	a_changed_envelope_is_refused	let held = Vault::create(&real, &cipher(1)).unwrap();
+src/db/vault.rs:2612	T	a_changed_envelope_is_refused	let d = held.dir();
+src/db/vault.rs:2613	T	a_changed_envelope_is_refused	put(&d.join("seg-1.sup"), &body);
+src/db/vault.rs:2614	T	a_changed_envelope_is_refused	put(&d.join("seg-2.sup"), &body);
+src/db/vault.rs:2615	T	a_changed_envelope_is_refused	let v = held.vault();
+src/db/vault.rs:2616	T	a_changed_envelope_is_refused	let a = v.persist(&pair("seg-1.sup", None), true).unwrap()[0];
+src/db/vault.rs:2617	T	a_changed_envelope_is_refused	let b = v.persist(&pair("seg-2.sup", None), true).unwrap()[0];
+src/db/vault.rs:2618	T	a_changed_envelope_is_refused	(a.0, a.1, b.1)
+src/db/vault.rs:2619	T	a_changed_envelope_is_refused	};
+src/db/vault.rs:2620	T	a_changed_envelope_is_refused	let path = real.join(disk_name(&token, Kind::Seg));
+src/db/vault.rs:2621	T	a_changed_envelope_is_refused	let good = std::fs::read(&path).unwrap();
+src/db/vault.rs:2622	T	a_changed_envelope_is_refused	for at in (0..good.len()).step_by(97) {
+src/db/vault.rs:2623	T	a_changed_envelope_is_refused	let mut bad = good.clone();
+src/db/vault.rs:2624	T	a_changed_envelope_is_refused	bad[at] ^= 1;
+src/db/vault.rs:2625	T	a_changed_envelope_is_refused	std::fs::write(&path, &bad).unwrap();
+src/db/vault.rs:2626	T	a_changed_envelope_is_refused	let held = Vault::open(&real, &cipher(1)).unwrap();
+src/db/vault.rs:2627	T	a_changed_envelope_is_refused	held.vault().adopt("seg-1.sup", token, wrapped, None);
+src/db/vault.rs:2628	T	a_changed_envelope_is_refused	
+src/db/vault.rs:2629	T	a_changed_envelope_is_refused	
+src/db/vault.rs:2630	T	a_changed_envelope_is_refused	
+src/db/vault.rs:2631	T	a_changed_envelope_is_refused	assert!(read(held.dir().join("seg-1.sup")).is_err(), "byte {at}");
+src/db/vault.rs:2632	T	a_changed_envelope_is_refused	}
+src/db/vault.rs:2633	T	a_changed_envelope_is_refused	std::fs::write(&path, &good).unwrap();
+src/db/vault.rs:2634	T	a_changed_envelope_is_refused	let held = Vault::open(&real, &cipher(1)).unwrap();
+src/db/vault.rs:2635	T	a_changed_envelope_is_refused	held.vault().adopt("seg-1.sup", token, other, None);
+src/db/vault.rs:2636	T	a_changed_envelope_is_refused	assert!(
+src/db/vault.rs:2637	T	a_changed_envelope_is_refused	map(held.dir().join("seg-1.sup")).is_err(),
+src/db/vault.rs:2638	T	a_changed_envelope_is_refused	"another file's key"
+src/db/vault.rs:2639	T	a_changed_envelope_is_refused	);
+src/db/vault.rs:2640	T	a_changed_envelope_is_refused	held.vault().adopt("seg-9.sup", token, wrapped, None);
+src/db/vault.rs:2641	T	a_changed_envelope_is_refused	assert_eq!(read(held.dir().join("seg-9.sup")).unwrap(), body);
+src/db/vault.rs:2642	T	a_changed_envelope_is_refused	
+src/db/vault.rs:2643	T	a_changed_envelope_is_refused	
+src/db/vault.rs:2644	T	a_changed_envelope_is_refused	held.vault()
+src/db/vault.rs:2645	T	a_changed_envelope_is_refused	.adopt("seg-8.sup", token, wrapped, Some("ord-8.oidx"));
+src/db/vault.rs:2646	T	a_changed_envelope_is_refused	assert!(exists(held.dir().join("seg-8.sup")));
+src/db/vault.rs:2647	T	a_changed_envelope_is_refused	assert!(!exists(held.dir().join("ord-8.oidx")));
+src/db/vault.rs:2648	T	<item:tests>	}
+src/db/vault.rs:2649	T	<item:tests>	
+src/db/vault.rs:2650	T	<item:tests>	
+src/db/vault.rs:2651	T	<item:tests>	
+src/db/vault.rs:2652	T	<item:tests>	
+src/db/vault.rs:2653	T	<item:tests>	#[test]
+src/db/vault.rs:2654	T	the_marker_refuses_what_is_not_the_store	fn the_marker_refuses_what_is_not_the_store() {
+src/db/vault.rs:2655	T	the_marker_refuses_what_is_not_the_store	let real = dir("marker");
+src/db/vault.rs:2656	T	the_marker_refuses_what_is_not_the_store	assert_eq!(key_id(&real).unwrap(), None);
+src/db/vault.rs:2657	T	the_marker_refuses_what_is_not_the_store	assert!(
+src/db/vault.rs:2658	T	the_marker_refuses_what_is_not_the_store	Vault::open(&real, &cipher(1)).is_err(),
+src/db/vault.rs:2659	T	the_marker_refuses_what_is_not_the_store	"no store under a cipher here"
+src/db/vault.rs:2660	T	the_marker_refuses_what_is_not_the_store	);
+src/db/vault.rs:2661	T	the_marker_refuses_what_is_not_the_store	refuse_marked(&real).unwrap();
+src/db/vault.rs:2662	T	the_marker_refuses_what_is_not_the_store	{
+src/db/vault.rs:2663	T	the_marker_refuses_what_is_not_the_store	let held = Vault::create(&real, &cipher(1)).unwrap();
+src/db/vault.rs:2664	T	the_marker_refuses_what_is_not_the_store	assert!(Vault::open(&real, &cipher(1)).is_err(), "open already");
+src/db/vault.rs:2665	T	the_marker_refuses_what_is_not_the_store	drop(held);
+src/db/vault.rs:2666	T	the_marker_refuses_what_is_not_the_store	}
+src/db/vault.rs:2667	T	the_marker_refuses_what_is_not_the_store	assert_eq!(key_id(&real).unwrap(), Some(1));
+src/db/vault.rs:2668	T	the_marker_refuses_what_is_not_the_store	assert!(refuse_marked(&real).is_err());
+src/db/vault.rs:2669	T	the_marker_refuses_what_is_not_the_store	assert!(Vault::create(&real, &cipher(1)).is_err(), "not empty");
+src/db/vault.rs:2670	T	the_marker_refuses_what_is_not_the_store	assert!(Vault::open(&real, &cipher(2)).is_err(), "a wrong key");
+src/db/vault.rs:2671	T	the_marker_refuses_what_is_not_the_store	drop(Vault::open(&real, &cipher(1)).unwrap());
+src/db/vault.rs:2672	T	the_marker_refuses_what_is_not_the_store	let good = std::fs::read(real.join(MARKER)).unwrap();
+src/db/vault.rs:2673	T	the_marker_refuses_what_is_not_the_store	assert_eq!(good.len(), MARKER_LEN);
+src/db/vault.rs:2674	T	the_marker_refuses_what_is_not_the_store	for at in 0..good.len() {
+src/db/vault.rs:2675	T	the_marker_refuses_what_is_not_the_store	let mut bad = good.clone();
+src/db/vault.rs:2676	T	the_marker_refuses_what_is_not_the_store	bad[at] ^= 1;
+src/db/vault.rs:2677	T	the_marker_refuses_what_is_not_the_store	std::fs::write(real.join(MARKER), &bad).unwrap();
+src/db/vault.rs:2678	T	the_marker_refuses_what_is_not_the_store	assert!(Vault::open(&real, &cipher(1)).is_err(), "byte {at}");
+src/db/vault.rs:2679	T	the_marker_refuses_what_is_not_the_store	}
+src/db/vault.rs:2680	T	the_marker_refuses_what_is_not_the_store	std::fs::write(real.join(MARKER), &good[..good.len() - 1]).unwrap();
+src/db/vault.rs:2681	T	the_marker_refuses_what_is_not_the_store	assert!(Vault::open(&real, &cipher(1)).is_err(), "cut short");
+src/db/vault.rs:2682	T	the_marker_refuses_what_is_not_the_store	assert!(key_id(&real).is_err());
+src/db/vault.rs:2683	T	the_marker_refuses_what_is_not_the_store	
+src/db/vault.rs:2684	T	the_marker_refuses_what_is_not_the_store	
+src/db/vault.rs:2685	T	the_marker_refuses_what_is_not_the_store	
+src/db/vault.rs:2686	T	the_marker_refuses_what_is_not_the_store	assert_eq!(marker_key_id(&good).unwrap(), 1);
+src/db/vault.rs:2687	T	the_marker_refuses_what_is_not_the_store	for at in [0, 7, 8, 11, 12, 15] {
+src/db/vault.rs:2688	T	the_marker_refuses_what_is_not_the_store	let mut bad = good.clone();
+src/db/vault.rs:2689	T	the_marker_refuses_what_is_not_the_store	bad[at] ^= 1;
+src/db/vault.rs:2690	T	the_marker_refuses_what_is_not_the_store	assert!(marker_key_id(&bad).is_err(), "byte {at}");
+src/db/vault.rs:2691	T	the_marker_refuses_what_is_not_the_store	}
+src/db/vault.rs:2692	T	the_marker_refuses_what_is_not_the_store	let mut long = good.clone();
+src/db/vault.rs:2693	T	the_marker_refuses_what_is_not_the_store	long.push(0);
+src/db/vault.rs:2694	T	the_marker_refuses_what_is_not_the_store	assert!(marker_key_id(&long).is_err());
+src/db/vault.rs:2695	T	the_marker_refuses_what_is_not_the_store	let mut other = good.clone();
+src/db/vault.rs:2696	T	the_marker_refuses_what_is_not_the_store	other[16] ^= 1;
+src/db/vault.rs:2697	T	the_marker_refuses_what_is_not_the_store	assert_eq!(
+src/db/vault.rs:2698	T	the_marker_refuses_what_is_not_the_store	marker_key_id(&other).unwrap(),
+src/db/vault.rs:2699	T	the_marker_refuses_what_is_not_the_store	0,
+src/db/vault.rs:2700	T	the_marker_refuses_what_is_not_the_store	"the key's name is in the clear"
+src/db/vault.rs:2701	T	the_marker_refuses_what_is_not_the_store	);
+src/db/vault.rs:2702	T	<item:tests>	}
+src/db/vault.rs:2703	T	<item:tests>	
+src/db/vault.rs:2704	T	<item:tests>	
+src/db/vault.rs:2705	T	<item:tests>	
+src/db/vault.rs:2706	T	<item:tests>	
+src/db/vault.rs:2707	T	<item:tests>	#[test]
+src/db/vault.rs:2708	T	a_rewrapped_store_opens_under_the_new_key_alone	fn a_rewrapped_store_opens_under_the_new_key_alone() {
+src/db/vault.rs:2709	T	a_rewrapped_store_opens_under_the_new_key_alone	let real = dir("rewrap");
+src/db/vault.rs:2710	T	a_rewrapped_store_opens_under_the_new_key_alone	let (token, wrapped) = {
+src/db/vault.rs:2711	T	a_rewrapped_store_opens_under_the_new_key_alone	let held = Vault::create(&real, &cipher(1)).unwrap();
+src/db/vault.rs:2712	T	a_rewrapped_store_opens_under_the_new_key_alone	put(
+src/db/vault.rs:2713	T	a_rewrapped_store_opens_under_the_new_key_alone	&held.dir().join("seg-1.sup"),
+src/db/vault.rs:2714	T	a_rewrapped_store_opens_under_the_new_key_alone	b"written under the first key",
+src/db/vault.rs:2715	T	a_rewrapped_store_opens_under_the_new_key_alone	);
+src/db/vault.rs:2716	T	a_rewrapped_store_opens_under_the_new_key_alone	held.vault()
+src/db/vault.rs:2717	T	a_rewrapped_store_opens_under_the_new_key_alone	.persist(&pair("seg-1.sup", None), true)
+src/db/vault.rs:2718	T	a_rewrapped_store_opens_under_the_new_key_alone	.unwrap()[0]
+src/db/vault.rs:2719	T	a_rewrapped_store_opens_under_the_new_key_alone	};
+src/db/vault.rs:2720	T	a_rewrapped_store_opens_under_the_new_key_alone	assert!(
+src/db/vault.rs:2721	T	a_rewrapped_store_opens_under_the_new_key_alone	rewrap(&real, &cipher(2), &cipher(3)).is_err(),
+src/db/vault.rs:2722	T	a_rewrapped_store_opens_under_the_new_key_alone	"not the store's key"
+src/db/vault.rs:2723	T	a_rewrapped_store_opens_under_the_new_key_alone	);
+src/db/vault.rs:2724	T	a_rewrapped_store_opens_under_the_new_key_alone	assert_eq!(key_id(&real).unwrap(), Some(1));
+src/db/vault.rs:2725	T	a_rewrapped_store_opens_under_the_new_key_alone	rewrap(&real, &cipher(1), &cipher(2)).unwrap();
+src/db/vault.rs:2726	T	a_rewrapped_store_opens_under_the_new_key_alone	assert_eq!(key_id(&real).unwrap(), Some(2));
+src/db/vault.rs:2727	T	a_rewrapped_store_opens_under_the_new_key_alone	assert!(
+src/db/vault.rs:2728	T	a_rewrapped_store_opens_under_the_new_key_alone	Vault::open(&real, &cipher(1)).is_err(),
+src/db/vault.rs:2729	T	a_rewrapped_store_opens_under_the_new_key_alone	"the old key opens nothing"
+src/db/vault.rs:2730	T	a_rewrapped_store_opens_under_the_new_key_alone	);
+src/db/vault.rs:2731	T	a_rewrapped_store_opens_under_the_new_key_alone	assert!(rewrap(&real, &cipher(1), &cipher(2)).is_err());
+src/db/vault.rs:2732	T	a_rewrapped_store_opens_under_the_new_key_alone	let held = Vault::open(&real, &cipher(2)).unwrap();
+src/db/vault.rs:2733	T	a_rewrapped_store_opens_under_the_new_key_alone	held.vault().adopt("seg-1.sup", token, wrapped, None);
+src/db/vault.rs:2734	T	a_rewrapped_store_opens_under_the_new_key_alone	assert_eq!(
+src/db/vault.rs:2735	T	a_rewrapped_store_opens_under_the_new_key_alone	read(held.dir().join("seg-1.sup")).unwrap(),
+src/db/vault.rs:2736	T	a_rewrapped_store_opens_under_the_new_key_alone	b"written under the first key"
+src/db/vault.rs:2737	T	a_rewrapped_store_opens_under_the_new_key_alone	);
+src/db/vault.rs:2738	T	a_rewrapped_store_opens_under_the_new_key_alone	assert_eq!(
+src/db/vault.rs:2739	T	a_rewrapped_store_opens_under_the_new_key_alone	on_disk(&real)
+src/db/vault.rs:2740	T	a_rewrapped_store_opens_under_the_new_key_alone	.iter()
+src/db/vault.rs:2741	T	a_rewrapped_store_opens_under_the_new_key_alone	.filter(|(n, _)| n.contains("tmp"))
+src/db/vault.rs:2742	T	a_rewrapped_store_opens_under_the_new_key_alone	.count(),
+src/db/vault.rs:2743	T	a_rewrapped_store_opens_under_the_new_key_alone	0
+src/db/vault.rs:2744	T	a_rewrapped_store_opens_under_the_new_key_alone	);
+src/db/vault.rs:2745	T	<item:tests>	}
+src/db/vault.rs:2746	T	<item:tests>	
+src/db/vault.rs:2747	T	<item:tests>	
+src/db/vault.rs:2748	T	<item:tests>	
+src/db/vault.rs:2749	T	<item:tests>	#[test]
+src/db/vault.rs:2750	T	a_sealed_manifest_opens_whole_or_not_at_all	fn a_sealed_manifest_opens_whole_or_not_at_all() {
+src/db/vault.rs:2751	T	a_sealed_manifest_opens_whole_or_not_at_all	let real = dir("slot");
+src/db/vault.rs:2752	T	a_sealed_manifest_opens_whole_or_not_at_all	let held = Vault::create(&real, &cipher(1)).unwrap();
+src/db/vault.rs:2753	T	a_sealed_manifest_opens_whole_or_not_at_all	let v = held.vault();
+src/db/vault.rs:2754	T	a_sealed_manifest_opens_whole_or_not_at_all	let files = vec![([3u8; 16], [4u8; WRAPPED]), ([5u8; 16], [6u8; WRAPPED])];
+src/db/vault.rs:2755	T	a_sealed_manifest_opens_whole_or_not_at_all	let slot = v
+src/db/vault.rs:2756	T	a_sealed_manifest_opens_whole_or_not_at_all	.seal_manifest(9, b"the manifest's own bytes", &files)
+src/db/vault.rs:2757	T	a_sealed_manifest_opens_whole_or_not_at_all	.unwrap();
+src/db/vault.rs:2758	T	a_sealed_manifest_opens_whole_or_not_at_all	assert!(!holds(&slot, b"manifest's own"));
+src/db/vault.rs:2759	T	a_sealed_manifest_opens_whole_or_not_at_all	let (m, f) = v.open_manifest(&slot).unwrap();
+src/db/vault.rs:2760	T	a_sealed_manifest_opens_whole_or_not_at_all	assert_eq!(
+src/db/vault.rs:2761	T	a_sealed_manifest_opens_whole_or_not_at_all	(m.as_slice(), &f),
+src/db/vault.rs:2762	T	a_sealed_manifest_opens_whole_or_not_at_all	(&b"the manifest's own bytes"[..], &files)
+src/db/vault.rs:2763	T	a_sealed_manifest_opens_whole_or_not_at_all	);
+src/db/vault.rs:2764	T	a_sealed_manifest_opens_whole_or_not_at_all	
+src/db/vault.rs:2765	T	a_sealed_manifest_opens_whole_or_not_at_all	let mut long = slot.clone();
+src/db/vault.rs:2766	T	a_sealed_manifest_opens_whole_or_not_at_all	long.extend_from_slice(&[0xAB; 40]);
+src/db/vault.rs:2767	T	a_sealed_manifest_opens_whole_or_not_at_all	assert!(v.open_manifest(&long).is_ok());
+src/db/vault.rs:2768	T	a_sealed_manifest_opens_whole_or_not_at_all	for at in 0..slot.len() {
+src/db/vault.rs:2769	T	a_sealed_manifest_opens_whole_or_not_at_all	let mut bad = slot.clone();
+src/db/vault.rs:2770	T	a_sealed_manifest_opens_whole_or_not_at_all	bad[at] ^= 1;
+src/db/vault.rs:2771	T	a_sealed_manifest_opens_whole_or_not_at_all	assert!(v.open_manifest(&bad).is_err(), "byte {at}");
+src/db/vault.rs:2772	T	a_sealed_manifest_opens_whole_or_not_at_all	}
+src/db/vault.rs:2773	T	a_sealed_manifest_opens_whole_or_not_at_all	assert!(v.open_manifest(&slot[..slot.len() - 1]).is_err());
+src/db/vault.rs:2774	T	a_sealed_manifest_opens_whole_or_not_at_all	assert!(v.open_manifest(&[]).is_err());
+src/db/vault.rs:2775	T	a_sealed_manifest_opens_whole_or_not_at_all	let empty = v.seal_manifest(0, b"", &[]).unwrap();
+src/db/vault.rs:2776	T	a_sealed_manifest_opens_whole_or_not_at_all	assert_eq!(v.open_manifest(&empty).unwrap(), (Vec::new(), Vec::new()));
+src/db/vault.rs:2777	T	a_sealed_manifest_opens_whole_or_not_at_all	
+src/db/vault.rs:2778	T	a_sealed_manifest_opens_whole_or_not_at_all	
+src/db/vault.rs:2779	T	a_sealed_manifest_opens_whole_or_not_at_all	let mut body = 3u32.to_le_bytes().to_vec();
+src/db/vault.rs:2780	T	a_sealed_manifest_opens_whole_or_not_at_all	body.extend_from_slice(b"abc");
+src/db/vault.rs:2781	T	a_sealed_manifest_opens_whole_or_not_at_all	body.extend_from_slice(&[9u8; 16 + WRAPPED + 5]);
+src/db/vault.rs:2782	T	a_sealed_manifest_opens_whole_or_not_at_all	let sealed = seal(&*v.store, v.nonce().unwrap(), &slot_aad(4), &body);
+src/db/vault.rs:2783	T	a_sealed_manifest_opens_whole_or_not_at_all	let mut ragged = SLOT_MAGIC.to_vec();
+src/db/vault.rs:2784	T	a_sealed_manifest_opens_whole_or_not_at_all	ragged.extend_from_slice(&4u64.to_le_bytes());
+src/db/vault.rs:2785	T	a_sealed_manifest_opens_whole_or_not_at_all	ragged.extend_from_slice(&(sealed.len() as u32).to_le_bytes());
+src/db/vault.rs:2786	T	a_sealed_manifest_opens_whole_or_not_at_all	ragged.extend_from_slice(&sealed);
+src/db/vault.rs:2787	T	a_sealed_manifest_opens_whole_or_not_at_all	assert!(v.open_manifest(&ragged).is_err(), "a ragged tail");
+src/db/vault.rs:2788	T	a_sealed_manifest_opens_whole_or_not_at_all	
+src/db/vault.rs:2789	T	a_sealed_manifest_opens_whole_or_not_at_all	let segs = pair("seg-1.sup", None);
+src/db/vault.rs:2790	T	a_sealed_manifest_opens_whole_or_not_at_all	assert!(v.adopt_all(&segs, Vec::new()).is_err());
+src/db/vault.rs:2791	T	a_sealed_manifest_opens_whole_or_not_at_all	assert!(v.adopt_all(&segs, files.clone()).is_err());
+src/db/vault.rs:2792	T	a_sealed_manifest_opens_whole_or_not_at_all	assert!(
+src/db/vault.rs:2793	T	a_sealed_manifest_opens_whole_or_not_at_all	names(held.dir()).unwrap().is_empty(),
+src/db/vault.rs:2794	T	a_sealed_manifest_opens_whole_or_not_at_all	"a refused slot adopts nothing"
+src/db/vault.rs:2795	T	a_sealed_manifest_opens_whole_or_not_at_all	);
+src/db/vault.rs:2796	T	a_sealed_manifest_opens_whole_or_not_at_all	v.adopt_all(&segs, files[..1].to_vec()).unwrap();
+src/db/vault.rs:2797	T	a_sealed_manifest_opens_whole_or_not_at_all	assert_eq!(names(held.dir()).unwrap(), vec!["seg-1.sup"]);
+src/db/vault.rs:2798	T	a_sealed_manifest_opens_whole_or_not_at_all	
+src/db/vault.rs:2799	T	a_sealed_manifest_opens_whole_or_not_at_all	assert_ne!(
+src/db/vault.rs:2800	T	a_sealed_manifest_opens_whole_or_not_at_all	v.seal_manifest(9, b"the manifest's own bytes", &files)
+src/db/vault.rs:2801	T	a_sealed_manifest_opens_whole_or_not_at_all	.unwrap(),
+src/db/vault.rs:2802	T	a_sealed_manifest_opens_whole_or_not_at_all	slot
+src/db/vault.rs:2803	T	a_sealed_manifest_opens_whole_or_not_at_all	);
+src/db/vault.rs:2804	T	a_sealed_manifest_opens_whole_or_not_at_all	let other_real = dir("slot-other");
+src/db/vault.rs:2805	T	a_sealed_manifest_opens_whole_or_not_at_all	let other = Vault::create(&other_real, &cipher(1)).unwrap();
+src/db/vault.rs:2806	T	a_sealed_manifest_opens_whole_or_not_at_all	assert!(
+src/db/vault.rs:2807	T	a_sealed_manifest_opens_whole_or_not_at_all	other.vault().open_manifest(&slot).is_err(),
+src/db/vault.rs:2808	T	a_sealed_manifest_opens_whole_or_not_at_all	"another store's key"
+src/db/vault.rs:2809	T	a_sealed_manifest_opens_whole_or_not_at_all	);
+src/db/vault.rs:2810	T	<item:tests>	}
+src/db/vault.rs:2811	T	<item:tests>	
+src/db/vault.rs:2812	T	<item:tests>	
+src/db/vault.rs:2813	T	<item:tests>	
+src/db/vault.rs:2814	T	<item:tests>	#[test]
+src/db/vault.rs:2815	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	fn a_log_opens_to_its_records_and_ends_at_the_first_that_fails() {
+src/db/vault.rs:2816	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	let real = dir("log");
+src/db/vault.rs:2817	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	let held = Vault::create(&real, &cipher(1)).unwrap();
+src/db/vault.rs:2818	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	let v = held.vault();
+src/db/vault.rs:2819	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	let (mut log, wrapped) = v.log_begin(4).unwrap();
+src/db/vault.rs:2820	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	let batches: [&[u8]; 3] = [b"first batch", b"the second, longer batch", b"3"];
+src/db/vault.rs:2821	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	let mut file = vec![0u8; 68];
+src/db/vault.rs:2822	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	let mut rec = Vec::new();
+src/db/vault.rs:2823	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	let mut ends = Vec::new();
+src/db/vault.rs:2824	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	for b in batches {
+src/db/vault.rs:2825	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	log.seal_into(file.len() as u64, b, &mut rec).unwrap();
+src/db/vault.rs:2826	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	file.extend_from_slice(&rec);
+src/db/vault.rs:2827	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	ends.push(file.len() as u64);
+src/db/vault.rs:2828	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	}
+src/db/vault.rs:2829	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	assert!(!holds(&file, b"second"));
+src/db/vault.rs:2830	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	let log = v.log_resume(4, &wrapped).unwrap();
+src/db/vault.rs:2831	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	let mut plain = b"HEAD".to_vec();
+src/db/vault.rs:2832	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	let got = log.open_records(&file, 68, &mut plain);
+src/db/vault.rs:2833	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	assert_eq!(plain, b"HEADfirst batchthe second, longer batch3");
+src/db/vault.rs:2834	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	assert_eq!(got, vec![(15, ends[0]), (39, ends[1]), (40, ends[2])]);
+src/db/vault.rs:2835	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	
+src/db/vault.rs:2836	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	for at in ends[0] as usize..ends[1] as usize {
+src/db/vault.rs:2837	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	let mut bad = file.clone();
+src/db/vault.rs:2838	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	bad[at] ^= 1;
+src/db/vault.rs:2839	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	let mut plain = Vec::new();
+src/db/vault.rs:2840	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	let got = log.open_records(&bad, 68, &mut plain);
+src/db/vault.rs:2841	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	assert_eq!(
+src/db/vault.rs:2842	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	(plain.as_slice(), got.len()),
+src/db/vault.rs:2843	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	(&b"first batch"[..], 1),
+src/db/vault.rs:2844	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	"byte {at}"
+src/db/vault.rs:2845	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	);
+src/db/vault.rs:2846	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	}
+src/db/vault.rs:2847	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	
+src/db/vault.rs:2848	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	for cut in 68..file.len() {
+src/db/vault.rs:2849	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	let mut plain = Vec::new();
+src/db/vault.rs:2850	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	let got = log.open_records(&file[..cut], 68, &mut plain);
+src/db/vault.rs:2851	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	assert_eq!(
+src/db/vault.rs:2852	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	got.len(),
+src/db/vault.rs:2853	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	ends.iter().filter(|&&e| e as usize <= cut).count()
+src/db/vault.rs:2854	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	);
+src/db/vault.rs:2855	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	}
+src/db/vault.rs:2856	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	
+src/db/vault.rs:2857	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	let mut moved = file[..68].to_vec();
+src/db/vault.rs:2858	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	moved.extend_from_slice(&file[ends[0] as usize..ends[1] as usize]);
+src/db/vault.rs:2859	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	assert!(log.open_records(&moved, 68, &mut Vec::new()).is_empty());
+src/db/vault.rs:2860	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	
+src/db/vault.rs:2861	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	assert!(v.log_resume(5, &wrapped).is_none());
+src/db/vault.rs:2862	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	let (other, _) = v.log_begin(4).unwrap();
+src/db/vault.rs:2863	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	assert!(other.open_records(&file, 68, &mut Vec::new()).is_empty());
+src/db/vault.rs:2864	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	
+src/db/vault.rs:2865	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	let mut zeros = file.clone();
+src/db/vault.rs:2866	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	zeros.extend_from_slice(&[0u8; 64]);
+src/db/vault.rs:2867	T	a_log_opens_to_its_records_and_ends_at_the_first_that_fails	assert_eq!(log.open_records(&zeros, 68, &mut Vec::new()).len(), 3);
+src/db/vault.rs:2868	T	<item:tests>	}
+src/db/vault.rs:2869	T	<item:tests>	
+src/db/vault.rs:2870	T	<item:tests>	
+src/db/vault.rs:2871	T	<item:tests>	
+src/db/vault.rs:2872	T	<item:tests>	
+src/db/vault.rs:2873	T	<item:tests>	
+src/db/vault.rs:2874	T	<item:tests>	
+src/db/vault.rs:2875	T	<item:tests>	#[test]
+src/db/vault.rs:2876	T	the_engine_names_no_file_but_through_the_door	fn the_engine_names_no_file_but_through_the_door() {
+src/db/vault.rs:2877	T	the_engine_names_no_file_but_through_the_door	let engine = include_str!("../db.rs");
+src/db/vault.rs:2878	T	the_engine_names_no_file_but_through_the_door	let tests = engine
+src/db/vault.rs:2879	T	the_engine_names_no_file_but_through_the_door	.rfind("\n#[cfg(test)]\nmod streaming_writes")
+src/db/vault.rs:2880	T	the_engine_names_no_file_but_through_the_door	.unwrap();
+src/db/vault.rs:2881	T	the_engine_names_no_file_but_through_the_door	let barred = [
+src/db/vault.rs:2882	T	the_engine_names_no_file_but_through_the_door	"File::open(",
+src/db/vault.rs:2883	T	the_engine_names_no_file_but_through_the_door	"File::create(",
+src/db/vault.rs:2884	T	the_engine_names_no_file_but_through_the_door	"OpenOptions",
+src/db/vault.rs:2885	T	the_engine_names_no_file_but_through_the_door	"fs::rename(",
+src/db/vault.rs:2886	T	the_engine_names_no_file_but_through_the_door	"fs::hard_link(",
+src/db/vault.rs:2887	T	the_engine_names_no_file_but_through_the_door	"fs::remove_file(",
+src/db/vault.rs:2888	T	the_engine_names_no_file_but_through_the_door	"fs::read_dir(",
+src/db/vault.rs:2889	T	the_engine_names_no_file_but_through_the_door	"fs::metadata(",
+src/db/vault.rs:2890	T	the_engine_names_no_file_but_through_the_door	"fs::read(",
+src/db/vault.rs:2891	T	the_engine_names_no_file_but_through_the_door	"fs::write(",
+src/db/vault.rs:2892	T	the_engine_names_no_file_but_through_the_door	"fs::copy(",
+src/db/vault.rs:2893	T	the_engine_names_no_file_but_through_the_door	"MmapBytes::open(",
+src/db/vault.rs:2894	T	the_engine_names_no_file_but_through_the_door	".exists()",
+src/db/vault.rs:2895	T	the_engine_names_no_file_but_through_the_door	];
+src/db/vault.rs:2896	T	the_engine_names_no_file_but_through_the_door	for (i, line) in engine[..tests].lines().enumerate() {
+src/db/vault.rs:2897	T	the_engine_names_no_file_but_through_the_door	let code = line.split("//").next().unwrap();
+src/db/vault.rs:2898	T	the_engine_names_no_file_but_through_the_door	for b in barred {
+src/db/vault.rs:2899	T	the_engine_names_no_file_but_through_the_door	assert!(!code.contains(b), "db.rs:{}: {b} past the door", i + 1);
+src/db/vault.rs:2900	T	the_engine_names_no_file_but_through_the_door	}
+src/db/vault.rs:2901	T	the_engine_names_no_file_but_through_the_door	}
+src/db/vault.rs:2902	T	the_engine_names_no_file_but_through_the_door	let index = include_str!("../ordindex.rs");
+src/db/vault.rs:2903	T	the_engine_names_no_file_but_through_the_door	let open = index.find("pub fn open(path: &Path, keys: usize)").unwrap();
+src/db/vault.rs:2904	T	the_engine_names_no_file_but_through_the_door	assert!(index[open..open + 200].contains("crate::db::vault::map(path)"));
+src/db/vault.rs:2905	T	<item:tests>	}
+src/db/vault.rs:2906	T	<item:tests>	
+src/db/vault.rs:2907	T	<item:tests>	
+src/db/vault.rs:2908	T	<item:tests>	#[test]
+src/db/vault.rs:2909	T	nonces_do_not_repeat	fn nonces_do_not_repeat() {
+src/db/vault.rs:2910	T	nonces_do_not_repeat	let mut n = Nonces::new().unwrap();
+src/db/vault.rs:2911	T	nonces_do_not_repeat	let (a, b) = (n.take().unwrap(), n.take().unwrap());
+src/db/vault.rs:2912	T	nonces_do_not_repeat	assert_ne!(a, b);
+src/db/vault.rs:2913	T	nonces_do_not_repeat	assert_eq!(a[..8], b[..8]);
+src/db/vault.rs:2914	T	nonces_do_not_repeat	n.next = u32::MAX;
+src/db/vault.rs:2915	T	nonces_do_not_repeat	let last = n.take().unwrap();
+src/db/vault.rs:2916	T	nonces_do_not_repeat	let after = n.take().unwrap();
+src/db/vault.rs:2917	T	nonces_do_not_repeat	assert_eq!(last[8..], u32::MAX.to_le_bytes());
+src/db/vault.rs:2918	T	nonces_do_not_repeat	assert_eq!(after[8..], 0u32.to_le_bytes());
+src/db/vault.rs:2919	T	nonces_do_not_repeat	assert_ne!(
+src/db/vault.rs:2920	T	nonces_do_not_repeat	last[..8],
+src/db/vault.rs:2921	T	nonces_do_not_repeat	after[..8],
+src/db/vault.rs:2922	T	nonces_do_not_repeat	"a spent count draws its eight bytes again"
+src/db/vault.rs:2923	T	nonces_do_not_repeat	);
+src/db/vault.rs:2924	T	<item:tests>	}
+src/db/vault.rs:2925	T	<item:tests>	}
+src/db/vault.rs:2926	-	<item>	

@@ -1,0 +1,9 @@
+{
+ "file name prefix/suffix": "(seg-|pcs-|\\bpar-|\\bord-|zpg|\\bwal-|\\bspare-|\\bdirect-|\\bcompact-|\\btier-|\\bseal-|\\.sup\\b|\\.oidx\\b)",
+ "manifest": "(?i)manifest",
+ "kind of form file": "Kind::(Seg|Ord|Form)\\b|\"\\.o\"|\"\\.z\"",
+ "seg/ord/form ident": "\\b(seg|segs|ord|form)\\b",
+ "form type": "\\b(Blob|SegmentWriter|ZFile|OrdIndex|Wal|MemTable|Manifest|FlatIndex)\\b|\\bDb::",
+ "form module path": "\\b(zfile|zpages|zselect|ordindex|flatindex|blob|block|index|format|reserve)::",
+ "log record": "\\b(LogCipher|log_begin|log_resume|seal_into|open_records|RECORD_HEAD)\\b|b?\"[^\"]*\\blog\\b[^\"]*\""
+}

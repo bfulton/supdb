@@ -1,0 +1,26 @@
+file	fn	first	code_lines	comment_lines	test_lines	code_tokens
+src/db/vault.rs	<item>	26	1	59	0	LogCipher:1
+src/db/vault.rs	Kind::suffix	479	3	0	0	Kind::Seg/Ord/Form:3, .o (suffix):1, .z (suffix):1
+src/db/vault.rs	disk_name	507	1	0	0	x-:1
+src/db/vault.rs	disk_parse	522	6	0	0	Kind::Seg/Ord/Form:3, x-:1, .o (suffix):1, .z (suffix):1
+src/db/vault.rs	passes	563	1	0	0	wal-:1, spare-:1, manifest:1
+src/db/vault.rs	default_cache	642	1	0	0	zfile/zpages/ordindex/flatindex/blob (module):1
+src/db/vault.rs	Vault::remove	993	2	1	0	Kind::Seg/Ord/Form:2
+src/db/vault.rs	Vault::persist_with	1308	13	0	0	seg/ord/form (ident):14, Kind::Seg/Ord/Form:2, manifest:1
+src/db/vault.rs	Vault::persist_form	1425	16	2	0	seg/ord/form (ident):17, Kind::Seg/Ord/Form:2
+src/db/vault.rs	Vault::companion	1489	12	0	0	seg/ord/form (ident):11, Kind::Seg/Ord/Form:2
+src/db/vault.rs	Vault::adopt	1527	11	0	0	seg/ord/form (ident):12, Kind::Seg/Ord/Form:2
+src/db/vault.rs	Vault::adopt_all	1577	5	0	0	seg/ord/form (ident):7, manifest:1
+src/db/vault.rs	Vault::sweep	1598	2	1	0	Kind::Seg/Ord/Form:2, x-:1
+src/db/vault.rs	Vault::seal_manifest	1633	5	0	0	manifest:5
+src/db/vault.rs	Vault::open_manifest	1657	7	0	0	manifest:7
+src/db/vault.rs	Vault::log_begin	1686	2	0	0	LogCipher:2
+src/db/vault.rs	Vault::log_resume	1694	2	0	0	LogCipher:2
+src/db/vault.rs	slot_aad	1755	1	0	0	manifest:1
+src/db/vault.rs	log_aad	1762	1	0	0	log (word):1
+src/db/vault.rs	LogCipher::<item>	1779	1	2	0	LogCipher:1
+src/db/vault.rs	LogCipher::new	1780	2	0	0	LogCipher:2
+src/db/vault.rs	LogCipher::seal_into	1803	1	0	0	log (word):1
+src/db/vault.rs	persist_one	2129	3	0	0	seg/ord/form (ident):5, Db:::1, db:: (module path):1
+src/db/vault.rs	persist_form	2148	3	0	0	seg/ord/form (ident):4
+src/db/vault.rs	companion	2188	2	0	0	seg/ord/form (ident):4

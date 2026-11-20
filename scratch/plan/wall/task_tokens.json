@@ -1,0 +1,23 @@
+{
+"cipher": "cipher",
+"Cipher": "Cipher",
+"vault::kept": "vault::kept\\b",
+"vault::persist": "vault::persist\\b",
+"vault::persist_one": "vault::persist_one\\b",
+"vault::persist_form": "vault::persist_form\\b",
+"vault::companion": "vault::companion\\b",
+"vault::paged": "vault::paged\\b",
+"vault::hold": "vault::hold\\b",
+"vault::check": "vault::check\\b",
+"vault::open_mapped": "vault::open_mapped\\b",
+"Kind": "\\bKind\\b",
+"pager::": "pager::",
+"Pager": "Pager",
+"ATTN_PAGED": "ATTN_PAGED",
+"crypt::": "\\bcrypt::",
+"zpages_under_cipher": "zpages_under_cipher",
+"cipher_controller": "cipher_controller",
+"under_cipher": "under_cipher",
+"paged_": "paged_",
+"piecewise": "piecewise"
+}

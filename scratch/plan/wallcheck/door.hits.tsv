@@ -1,0 +1,160 @@
+src/db.rs	105	code	write_ord	door	1	vault::rename(&tmp, dir.join(&name))?;
+src/db.rs	119	code	write_ord_unsynced	door	1	vault::rename(&tmp, dir.join(&name))?;
+src/db.rs	128	code	write_ord_tmp	door	1	let mut f = vault::create(&tmp)?;
+src/db.rs	4361	code	Wal::create	door	1	let mut file = vault::create(path)?;
+src/db.rs	4465	code	Wal::recycle	door	1	let mut file = vault::open_write(spare)?;
+src/db.rs	4465	code	Wal::recycle	beyondR0	1	let mut file = vault::open_write(spare)?;
+src/db.rs	4468	code	Wal::recycle	door	1	vault::rename(spare, path)?;
+src/db.rs	4487	code	Wal::recycle	door	1	vault::rename(spare, path)?;
+src/db.rs	4488	code	Wal::recycle	door	1	let mut file = vault::open_write(path)?;
+src/db.rs	4488	code	Wal::recycle	beyondR0	1	let mut file = vault::open_write(path)?;
+src/db.rs	4523	code	Wal::open_append	door	1	let mut file = vault::open_append(path)?;
+src/db.rs	4523	code	Wal::open_append	beyondR0	1	let mut file = vault::open_append(path)?;
+src/db.rs	4759	code	Wal::lose_unsynced	door	1	let mut f = vault::open_write(&self.path)?;
+src/db.rs	4759	code	Wal::lose_unsynced	beyondR0	1	let mut f = vault::open_write(&self.path)?;
+src/db.rs	4807	code	Wal::chain	door	1	let mut f = vault::open_write(&self.path)?;
+src/db.rs	4807	code	Wal::chain	beyondR0	1	let mut f = vault::open_write(&self.path)?;
+src/db.rs	4812	code	Wal::chain	door	1	t.push((vault::real(&self.path), None));
+src/db.rs	4812	code	Wal::chain	beyondR0	1	t.push((vault::real(&self.path), None));
+src/db.rs	4812	code	Wal::chain	real	1	t.push((vault::real(&self.path), None));
+src/db.rs	4855	code	Wal::replay	door	1	match vault::open(path) {
+src/db.rs	5425	code	z_retire_cell	door	1	vault::rename(dir.join(zfile::zpg_name(id, end)), &dead)
+src/db.rs	7269	code	SegmentWriter::create	door	1	let file = vault::create_rw(path)?;
+src/db.rs	7269	code	SegmentWriter::create	beyondR0	1	let file = vault::create_rw(path)?;
+src/db.rs	7669	code	SegmentWriter::recover_direct	door	1	let buf = vault::read(path)?;
+src/db.rs	7669	code	SegmentWriter::recover_direct	beyondR0	1	let buf = vault::read(path)?;
+src/db.rs	8924	code	Seg::drop_raw_pages	door	1	if let Ok(f) = vault::open(dir.join(&name)) {
+src/db.rs	9038	code	Seg::open_full	door	1	let src = vault::map(dir.join(name)).map_err(|e| {
+src/db.rs	12418	code	sweep_manifest_spares	door	1	for name in vault::names(dir)? {
+src/db.rs	12420	code	sweep_manifest_spares	door	1	let _ = vault::remove_file(dir.join(name));
+src/db.rs	12527	code	manifest_write_slot_unsynced	door	1	let f = vault::open_slot(dir.join(MANIFEST_SLOTS[slot]))?;
+src/db.rs	12527	code	manifest_write_slot_unsynced	beyondR0	1	let f = vault::open_slot(dir.join(MANIFEST_SLOTS[slot]))?;
+src/db.rs	12543	code	manifest_make_slots	door	1	if !vault::exists(&path) {
+src/db.rs	12543	code	manifest_make_slots	beyondR0	1	if !vault::exists(&path) {
+src/db.rs	12544	code	manifest_make_slots	door	1	vault::create(&path)?;
+src/db.rs	12549	code	manifest_make_slots	door	1	vault::sync_dir(dir)?;
+src/db.rs	12571	code	manifest_write_shape	door	1	let _ = vault::remove_file(spare);
+src/db.rs	12591	code	manifest_write	door	1	let mut f = vault::create(&tmp)?;
+src/db.rs	12602	code	manifest_write	door	1	match vault::hard_link(&cur, &spare_path) {
+src/db.rs	12611	code	manifest_write	door	1	vault::rename(&tmp, &cur)?;
+src/db.rs	12612	code	manifest_write	door	1	vault::sync_dir(dir)?;
+src/db.rs	12714	code	manifest_read_all	door	1	match vault::open(dir.join(slot)) {
+src/db.rs	13366	code	Emitter::enter	door	1	let _ = vault::remove_file(&tmp);
+src/db.rs	13386	code	Emitter::leave	door	1	vault::rename(&p.tmp, self.dir.join(&p.name))?;
+src/db.rs	13539	code	compact_run	door	1	let _ = vault::remove_file(&tmp);
+src/db.rs	13546	code	compact_run	door	1	vault::rename(&tmp, dir.join(&name))?;
+src/db.rs	13584	code	compact_run	door	1	.map(|name| vault::open(dir.join(name)).ok())
+src/db.rs	13686	code	compact_run	door	1	vault::sync_dir(&dir)?;
+src/db.rs	13691	code	compact_run	door	1	.filter_map(|n| vault::len(dir.join(n)).ok())
+src/db.rs	13691	code	compact_run	beyondR0	1	.filter_map(|n| vault::len(dir.join(n)).ok())
+src/db.rs	13737	code	merge_open_inputs	door	1	vault::map(dir.join(name))?,
+src/db.rs	13854	code	tier_walk	door	1	vault::sync_dir(&dir)?;
+src/db.rs	16303	code	Shared::offer_spare	door	1	let _ = vault::remove_file(*spare);
+src/db.rs	28013	code	Db::rotate_wal	door	1	self.loose_wals.retain(|p| vault::exists(p));
+src/db.rs	28013	code	Db::rotate_wal	beyondR0	1	self.loose_wals.retain(|p| vault::exists(p));
+src/db.rs	28048	code	Db::sync_wal	door	1	match vault::open(&p) {
+src/db.rs	28062	code	Db::sync_wal	door	2	t.push((vault::real(&p), vault::len(&p).ok()));
+src/db.rs	28062	code	Db::sync_wal	beyondR0	2	t.push((vault::real(&p), vault::len(&p).ok()));
+src/db.rs	28062	code	Db::sync_wal	real	1	t.push((vault::real(&p), vault::len(&p).ok()));
+src/db.rs	28086	code	Db::sync_wal	door	1	t.push((vault::real(&self.wal.path), Some(self.wal.synced)));
+src/db.rs	28086	code	Db::sync_wal	beyondR0	1	t.push((vault::real(&self.wal.path), Some(self.wal.synced)));
+src/db.rs	28086	code	Db::sync_wal	real	1	t.push((vault::real(&self.wal.path), Some(self.wal.synced)));
+src/db.rs	28104	code	Db::wal_dir_barrier	door	1	vault::sync_dir(&self.dir)
+src/db.rs	28233	code	Db::next_wal	door	2	t.push((vault::real(&path), vault::len(&path).ok()));
+src/db.rs	28233	code	Db::next_wal	beyondR0	2	t.push((vault::real(&path), vault::len(&path).ok()));
+src/db.rs	28233	code	Db::next_wal	real	1	t.push((vault::real(&path), vault::len(&path).ok()));
+src/db.rs	28384	code	Db::create	door	1	vault::sync_dir(dir)?;
+src/db.rs	28765	code	Db::open	door	1	let f = vault::open_slot(dir.join(MANIFEST_SLOTS[m.slot]))?;
+src/db.rs	28765	code	Db::open	beyondR0	1	let f = vault::open_slot(dir.join(MANIFEST_SLOTS[m.slot]))?;
+src/db.rs	28787	code	Db::open	door	1	for name in vault::names(dir)? {
+src/db.rs	28822	code	Db::open	door	1	let _ = vault::remove_file(dir.join(name));
+src/db.rs	28856	code	Db::open	door	1	for name in vault::names(dir)? {
+src/db.rs	28867	code	Db::open	door	1	let _ = vault::remove_file(&tmp);
+src/db.rs	28872	code	Db::open	door	1	let _ = vault::remove_file(&tmp);
+src/db.rs	28890	code	Db::open	door	1	let _ = vault::remove_file(&rebuilt);
+src/db.rs	28902	code	Db::open	door	1	vault::rename(&rebuilt, dir.join(&name))?;
+src/db.rs	28903	code	Db::open	door	1	vault::sync_dir(dir)?;
+src/db.rs	28910	code	Db::open	door	1	let _ = vault::remove_file(&tmp);
+src/db.rs	28922	code	Db::open	door	1	for name in vault::names(dir)? {
+src/db.rs	28924	code	Db::open	door	1	let _ = vault::remove_file(dir.join(name));
+src/db.rs	28996	code	Db::open	door	1	for name in vault::names(dir)? {
+src/db.rs	29005	code	Db::open	door	1	let _ = vault::remove_file(dir.join(&name));
+src/db.rs	29051	code	Db::open	door	1	vault::remove_file(Db::wal_path(dir, later))?;
+src/db.rs	29097	code	Db::open	door	1	if let Ok(len) = vault::len(&wal_path) {
+src/db.rs	29097	code	Db::open	beyondR0	1	if let Ok(len) = vault::len(&wal_path) {
+src/db.rs	29099	code	Db::open	door	1	let f = vault::open_write(&wal_path)?;
+src/db.rs	29099	code	Db::open	beyondR0	1	let f = vault::open_write(&wal_path)?;
+src/db.rs	29101	code	Db::open	door	1	wal_opened = Some((vault::real(&wal_path), f.sync_data().map(|()| valid_len)?));
+src/db.rs	29101	code	Db::open	beyondR0	1	wal_opened = Some((vault::real(&wal_path), f.sync_data().map(|()| valid_len)?));
+src/db.rs	29101	code	Db::open	real	1	wal_opened = Some((vault::real(&wal_path), f.sync_data().map(|()| valid_len)?));
+src/db.rs	30002	code	Db::commit_direct	door	1	let _ = vault::remove_file(&tmp);
+src/db.rs	30398	code	Db::close_run	door	1	let name = if first_partition && !tombs && vault::len(&tmp)? <= limit {
+src/db.rs	30398	code	Db::close_run	beyondR0	1	let name = if first_partition && !tombs && vault::len(&tmp)? <= limit {
+src/db.rs	30405	code	Db::close_run	door	1	vault::hard_link(&tmp, dir.join(&name))?;
+src/db.rs	30845	code	Db::seal_table	door	1	let _ = vault::remove_file(&tmp);
+src/db.rs	30934	code	Db::seal_table	door	1	let name = if whole && first_partition && !tombs && vault::len(&tmp)? <= limit {
+src/db.rs	30934	code	Db::seal_table	beyondR0	1	let name = if whole && first_partition && !tombs && vault::len(&tmp)? <= limit {
+src/db.rs	30949	code	Db::seal_table	door	1	vault::rename(&tmp, dir.join(&name))?;
+src/db.rs	32161	code	Db::store_bytes_of	door	1	.filter_map(|s| vault::len(dir.join(&s.name)).ok())
+src/db.rs	32161	code	Db::store_bytes_of	beyondR0	1	.filter_map(|s| vault::len(dir.join(&s.name)).ok())
+src/db.rs	33171	code	Db::wal_durable	door	1	vault::real(&self.wal.path),
+src/db.rs	33171	code	Db::wal_durable	beyondR0	1	vault::real(&self.wal.path),
+src/db.rs	33171	code	Db::wal_durable	real	1	vault::real(&self.wal.path),
+src/db.rs	33193	code	Db::close_inner	door	1	let _ = vault::remove_file(spare);
+src/db.rs	33238	code	Db::z_on_disk	door	1	vault::is_file(dir.join(name))
+src/db.rs	33238	code	Db::z_on_disk	beyondR0	1	vault::is_file(dir.join(name))
+src/db.rs	33415	code	Db::z_give	door	1	let _ = vault::remove_file(&out);
+src/db.rs	33426	code	Db::z_give	door	1	let _ = vault::remove_file(&out);
+src/db.rs	33460	code	Db::z_sweep	door	1	for name in vault::names(dir)? {
+src/db.rs	33463	code	Db::z_sweep	door	1	&& vault::remove_file(dir.join(&name)).is_ok()
+src/db.rs	33603	code	Db::zpages_settle_with	door	1	let _ = vault::remove_file(self.dir.join(&name));
+src/db.rs	39657	code	Maint::land_readable	door	1	let dir = vault::open_dir(&self.dir)?;
+src/db.rs	39657	code	Maint::land_readable	beyondR0	1	let dir = vault::open_dir(&self.dir)?;
+src/db.rs	39732	code	Maint::land_readable	door	1	vault::sync_dir(&self.dir)?;
+src/db.rs	39852	code	Maint::retire_covered	door	1	if vault::rename(&old, &spare).is_ok() {
+src/db.rs	39857	code	Maint::retire_covered	door	1	let _ = vault::remove_file(old);
+src/db.rs	39860	code	Maint::retire_covered	door	1	let _ = vault::remove_file(tmp);
+src/db.rs	40312	code	Maint::retire_seg	door	1	let _ = vault::remove_file(self.dir.join(name));
+src/db.rs	40321	code	Maint::retire_seg	door	1	let _ = vault::remove_file(self.dir.join(&ord));
+src/db.rs	40350	code	Maint::retire_seg	door	1	if vault::exists(&zpg)
+src/db.rs	40350	code	Maint::retire_seg	beyondR0	1	if vault::exists(&zpg)
+src/db.rs	40366	code	Maint::retire_seg	door	1	if vault::rename(&zpg, &dead).is_ok() {
+src/db.rs	40369	code	Maint::retire_seg	door	1	let _ = vault::remove_file(zpg);
+src/db.rs	40372	code	Maint::retire_seg	door	1	let _ = vault::remove_file(zpg);
+src/db.rs	40502	code	Maint::cap_due	door	1	.filter_map(|s| vault::len(self.dir.join(&s.name)).ok())
+src/db.rs	40502	code	Maint::cap_due	beyondR0	1	.filter_map(|s| vault::len(self.dir.join(&s.name)).ok())
+src/db.rs	40695	code	Maint::promote_unpartitioned	door	1	match vault::len(self.dir.join(&s.name)) {
+src/db.rs	40695	code	Maint::promote_unpartitioned	beyondR0	1	match vault::len(self.dir.join(&s.name)) {
+src/db.rs	40746	code	Maint::apply_promotion	door	1	vault::hard_link(self.dir.join(&old), self.dir.join(&new))?;
+src/db.rs	40764	code	Maint::apply_promotion	door	1	vault::sync_dir(&self.dir)?;
+src/db.rs	40984	code	Maint::publish	door	1	let _ = vault::remove_file(p);
+src/db.rs	42437	code	Maint::z_cross	door	1	if let Ok(z) = vault::map(&form) {
+src/db.rs	42444	code	Maint::z_cross	door	1	let Ok(f) = vault::open(self.dir.join(&s.name)) else {
+src/db.rs	42456	code	Maint::z_cross	door	1	let on_disk = vault::names(&self.dir)
+src/db.rs	42893	code	Maint::z_attach_on_disk	door	1	if vault::rename(self.dir.join(&name), &dead).is_ok() {
+src/db.rs	42896	code	Maint::z_attach_on_disk	door	1	let _ = vault::remove_file(self.dir.join(&name));
+src/db.rs	43326	code	Maint::z_collect	door	1	let _ = vault::remove_file(&out);
+src/db.rs	43376	code	Maint::z_collect	door	1	let _ = vault::remove_file(&out);
+src/db.rs	43387	code	Maint::z_collect	door	1	if vault::rename(&out, &dead).is_ok() {
+src/db.rs	43390	code	Maint::z_collect	door	1	let _ = vault::remove_file(&out);
+src/db.rs	43401	code	Maint::z_collect	door	1	let _ = vault::remove_file(&out);
+src/db.rs	43471	code	Maint::sweep_spares	door	1	let _ = vault::remove_file(p);
+src/db.rs	43584	code	Maint::start_compact	door	1	.filter_map(|n| vault::len(self.dir.join(n)).ok())
+src/db.rs	43584	code	Maint::start_compact	beyondR0	1	.filter_map(|n| vault::len(self.dir.join(n)).ok())
+src/db.rs	43591	code	Maint::start_compact	door	1	.filter_map(|n| vault::len(self.dir.join(n)).ok())
+src/db.rs	43591	code	Maint::start_compact	beyondR0	1	.filter_map(|n| vault::len(self.dir.join(n)).ok())
+src/db.rs	43740	code	Maint::join_merge	door	1	.filter_map(|n| vault::len(self.dir.join(n)).ok())
+src/db.rs	43740	code	Maint::join_merge	beyondR0	1	.filter_map(|n| vault::len(self.dir.join(n)).ok())
+src/db/zfile.rs	2007	code	ZFile::attach	door	1	let map = match super::vault::map(path) {
+src/db/zfile.rs	2023	code	ZFile::attach	door	1	let file = super::vault::open(path).ok();
+src/db/zfile.rs	3783	code	warm_file	door	1	let map = super::vault::map(path)?;
+src/db/zfile.rs	4205	code	open_seg	door	1	Ok(SegSrc::Kept(super::vault::map(path)?))
+src/db/zfile.rs	4207	code	open_seg	door	1	Ok(SegSrc::File(super::vault::open(path)?))
+src/db/zfile.rs	4356	code	build_file_seen	door	1	let _ = super::vault::remove_file(&tmp);
+src/db/zfile.rs	4360	code	build_file_seen	door	1	super::vault::rename(&tmp, out).inspect_err(|_| {
+src/db/zfile.rs	4361	code	build_file_seen	door	1	let _ = super::vault::remove_file(&tmp);
+src/db/zfile.rs	4375	code	build_file_seen	door	1	let _ = super::vault::remove_file(out);
+src/db/zfile.rs	4379	code	build_file_seen	door	1	if let Ok(f) = super::vault::open(out) {
+src/db/zfile.rs	4387	code	build_file_seen	door	1	let _ = super::vault::remove_file(&tmp);
+src/db/zfile.rs	4607	code	write_pages	door	1	let out = super::vault::create(tmp)?;
+src/ordindex.rs	404	code	OrdIndex::open	door	1	let map = crate::db::vault::map(path)?;

@@ -1,0 +1,933 @@
+tests/zpages.rs:159 the_images_of_partitions_the_engine_wrote_are_the_streamed_records
+   helpers=['check_segment']
+   let mut segs: Vec<PathBuf> = std::fs::read_dir(&dir)
+tests/zpages.rs:395 the_oracle_holds_with_zpages_forced_on
+   helpers=['oracle']
+   
+tests/zpages.rs:408 the_oracle_holds_with_the_raw_tails_read_in_place
+   helpers=['oracle']
+   
+tests/zpages.rs:413 the_oracle_holds_when_runs_in_blocks_decline_the_partitions
+   helpers=['oracle']
+   
+tests/zpages.rs:700 absent_keys_are_absent_through_the_form_file
+   helpers=['fence_keys', 'form_files']
+   
+tests/zpages.rs:753 a_run_of_every_shape_reads_the_same
+   helpers=['form_files']
+   
+tests/zpages.rs:838 a_direct_runs_segment_with_markers_inside_its_records_has_a_form_file
+   helpers=['check_segment', 'form_files']
+   for e in std::fs::read_dir(&dir).unwrap().flatten() {
+tests/zpages.rs:942 a_flipped_byte_in_a_form_file_is_never_an_answer
+   helpers=['copy_dir', 'form_files', 'keys_of_page', 'one_partition']
+   let good = std::fs::read(&file).unwrap();
+   let f = std::fs::OpenOptions::new()
+tests/zpages.rs:1030 a_file_that_is_not_a_form_file_is_refused_and_the_partition_is_read_raw
+   helpers=['copy_dir', 'form_files', 'one_partition', 'open_changed']
+   let size = std::fs::metadata(&form_files(&dir)[0]).unwrap().len();
+   ("empty", Box::new(|p| std::fs::write(p, b"").unwrap())),
+   Box::new(move |p| std::fs::write(p, vec![0u8; size as usize]).unwrap()),
+   let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+tests/zpages.rs:1109 every_field_of_the_trailer_wrong_is_refused_and_counted
+   helpers=['form_files', 'one_partition', 'open_changed']
+   let mut bytes = std::fs::read(p).unwrap();
+   std::fs::write(p, bytes).unwrap();
+tests/zpages.rs:1177 a_form_file_of_another_segment_is_refused
+   helpers=['form_files', 'one_partition', 'open_changed']
+   assert_ne!(std::fs::read(&f1).unwrap(), std::fs::read(&f2).unwrap());
+   std::fs::copy(&f1, p).unwrap();
+tests/zpages.rs:1221 a_form_file_under_another_partitions_name_is_refused
+   helpers=['form_files']
+   std::fs::copy(&files[0], &files[1]).unwrap();
+tests/zpages.rs:1246 a_reopened_store_attaches_the_form_files_it_finds_and_off_leaves_them_alone
+   helpers=['form_files', 'one_partition']
+   let stamp = std::fs::metadata(&file).unwrap().modified().unwrap();
+   assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), stamp);
+   assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), stamp);
+tests/zpages.rs:1288 a_build_that_fails_is_counted_and_the_store_reads_raw
+   helpers=['form_files']
+   
+tests/zpages.rs:1319 the_default_floor_declines_a_small_partition_and_says_how_much
+   helpers=['form_files']
+   
+tests/zpages.rs:1357 a_partition_with_a_run_in_a_block_is_declined_and_read_raw
+   helpers=['form_files']
+   
+tests/zpages.rs:1432 the_default_is_the_controller_and_an_off_store_makes_nothing
+   helpers=['form_files']
+   
+tests/zpages.rs:1458 a_scan_of_a_covered_partition_is_served_by_its_form_file_and_counted
+   helpers=['form_files']
+   
+tests/zpages.rs:1507 a_promotion_that_closes_a_fence_keeps_the_form_file_of_the_partition_it_renames
+   helpers=['form_files', 'zpg_of']
+   
+tests/zpages.rs:1714 the_forms_threads_take_the_io_class_the_option_names_and_the_build_records_it
+   helpers=['form_files']
+   
+tests/zpages.rs:1754 the_build_asks_the_records_ahead_when_told_to_and_counts_what_it_asked
+   helpers=['form_files', 'partition_file', 'regions_of']
+   
+tests/zpages.rs:1791 the_build_drops_the_raw_records_it_passed_when_asked_to_and_not_otherwise
+   helpers=['cached_pages', 'form_files', 'partition_file', 'regions_of']
+   
+tests/zpages.rs:1850 a_point_read_from_the_form_file_touches_no_page_of_the_raw_records
+   helpers=['cached_pages', 'evict', 'partition_file', 'regions_of', 'unmap_pages']
+   
+tests/zpages.rs:2037 covered_and_uncovered_partitions_agree_across_their_boundaries
+   helpers=['fence_keys', 'form_files']
+   
+tests/zpages.rs:2146 scans_agree_with_the_model_over_every_window_of_a_covered_store
+   helpers=['windows_over']
+   
+tests/zpages.rs:2152 scans_with_the_block_cache_agree_with_the_model_over_every_window_of_a_covered_store
+   helpers=['windows_over']
+   
+tests/zpages.rs:2160 scans_with_the_block_cache_skipping_a_copys_rank_agree_with_the_model_over_every_window
+   helpers=['windows_over']
+   
+tests/zpages.rs:2171 scans_with_the_block_cache_resolving_every_filed_cut_agree_with_the_model_over_every_window
+   helpers=['windows_over']
+   
+tests/zpages.rs:2179 scans_with_a_cursor_a_run_and_a_seek_a_cut_agree_with_the_model_over_every_window
+   helpers=['windows_over_with']
+   
+tests/zpages.rs:2197 scans_with_every_page_view_checked_agree_with_the_model_over_every_window
+   helpers=['windows_over_with']
+   
+tests/zpages.rs:2215 scans_with_the_memo_asked_before_the_view_agree_with_the_model_over_every_window
+   helpers=['windows_over_with']
+   
+tests/zpages.rs:2233 scans_with_the_blocks_promoted_to_copies_agree_with_the_model_over_every_window
+   helpers=['windows_over']
+   
+tests/zpages.rs:2242 scans_over_a_piece_agree_with_the_model_over_every_window_of_a_covered_store
+   helpers=['fence_keys', 'form_files']
+   
+tests/zpages.rs:2350 the_compact_form_touches_no_raw_page
+   helpers=['no_raw_touches']
+   
+tests/zpages.rs:2361 the_block_cache_under_the_compact_form_touches_no_raw_page
+   helpers=['no_raw_touches']
+   
+tests/zpages.rs:2370 the_block_cache_with_its_reads_raw_touches_the_raw_form
+   helpers=['no_raw_touches']
+   
+tests/zpages.rs:2725 the_memo_serves_repeated_reads_of_a_partition_and_off_every_read_decodes
+   helpers=['form_files']
+   
+tests/zpages.rs:2812 the_overlay_walk_through_the_cursor_opens_a_group_a_group_where_the_walk_by_rank_opened_three_a_key
+   helpers=['form_files']
+   
+tests/zpages.rs:2884 the_heads_arm_seeks_through_the_raw_form_and_scans_the_same
+   helpers=['fence_keys', 'form_files']
+   
+tests/zpages.rs:3574 a_merge_takes_the_form_file_of_the_segment_it_retires
+   helpers=['form_files', 'zpg_of']
+   let segments: Vec<String> = std::fs::read_dir(&dir)
+   .filter(|n| n.ends_with(".sup"))
+   let live = name.strip_suffix(".tmp").unwrap_or(&name);
+   name.starts_with("zpg-dead-") || segments.contains(&live.to_string()),
+tests/zpages.rs:3738 a_form_file_is_advised_random_whatever_mode_the_store_was_in_when_it_was_attached
+   helpers=['advised', 'form_files']
+   assert_eq!(advised(&dir, ".zpg"), vec![true; first as usize]);
+   assert!(advised(&dir, ".sup").iter().all(|r| !r));
+   assert_eq!(advised(&dir, ".zpg"), vec![true; first as usize]);
+   assert!(advised(&dir, ".sup").iter().all(|r| !r), "the segments");
+tests/zpages.rs:3823 a_store_that_does_not_advise_its_mappings_does_not_advise_its_form_files
+   helpers=['advised', 'form_files']
+   assert_eq!(advised(&dir, ".zpg"), vec![want; n], "{advice:?}");
+   assert_eq!(advised(&dir, ".zpg"), vec![want; n], "{advice:?}, reopened");
+tests/zpages.rs:3867 a_stale_temp_name_and_a_form_file_no_segment_claims_are_swept_at_open
+   helpers=['copy_dir', 'form_files', 'one_partition']
+   let good = std::fs::read(&live).unwrap();
+   let stamp = std::fs::metadata(copy.join(&name))
+   std::fs::write(copy.join(format!("{name}.tmp")), &good[..good.len() / 2]).unwrap();
+   std::fs::write(copy.join("zpg-00000998-0000000000000998.zpg.tmp"), b"half").unwrap();
+tests/zpages.rs:3940 a_refused_file_is_counted_once_however_often_it_is_met
+   helpers=['copy_dir', 'form_files', 'one_partition']
+   let mut bytes = std::fs::read(&file).unwrap();
+   std::fs::write(&file, bytes).unwrap();
+tests/zpages.rs:3975 a_refused_file_of_a_partition_the_build_declines_does_not_stay_to_be_met_again
+   helpers=['copy_dir', 'form_files', 'one_partition']
+   let mut bytes = std::fs::read(&file).unwrap();
+   std::fs::write(&file, bytes).unwrap();
+tests/zpages.rs:4022 decodes_count_the_pages_decoded_to_answer_and_no_others
+   helpers=['form_files']
+   
+tests/zpages.rs:4086 the_sizes_the_store_reports_are_the_files_it_holds
+   helpers=['form_files']
+   let bytes = std::fs::read(&f).unwrap();
+tests/zpages.rs:4128 a_scans_walks_are_served_by_the_form_files_it_crosses_and_raw_where_there_is_none
+   helpers=['fence_keys', 'form_files']
+   
+tests/zpages.rs:4247 a_level_zero_piece_is_given_no_form_file_and_is_not_counted_a_partition
+   helpers=['form_files']
+   
+tests/zpages.rs:4285 the_empty_key_is_read_through_a_form_file_as_any_other
+   helpers=['fence_keys', 'form_files']
+   
+tests/zpages.rs:4466 a_build_in_flight_when_a_merge_retires_its_target_is_cancelled_and_counted
+   helpers=['assert_only_live_form_files', 'form_files', 'store_without_form_files']
+   
+tests/zpages.rs:4495 a_finished_build_whose_target_died_leaves_no_file
+   helpers=['assert_only_live_form_files', 'form_files', 'store_without_form_files']
+   
+tests/zpages.rs:4519 a_settle_removes_the_form_files_and_temp_names_that_nothing_claims
+   helpers=['form_files', 'one_partition']
+   let good = std::fs::read(&live).unwrap();
+   std::fs::write(dir.join(format!("{name}.tmp")), &good[..good.len() / 3]).unwrap();
+   std::fs::write(dir.join("zpg-00000998-0000000000000998.zpg.tmp"), b"half").unwrap();
+   std::fs::write(dir.join("zpg-00000999-0000000000000999.zpg"), &good).unwrap();
+tests/zpages.rs:4619 a_damaged_form_file_is_retired_and_rebuilt_at_most_three_times
+   helpers=['an_untouched_page', 'copy_dir', 'flip_page', 'form_files', 'one_partition']
+   
+tests/zpages.rs:4719 a_retired_form_file_outlives_its_last_reader_and_no_longer
+   helpers=['an_untouched_page', 'copy_dir', 'flip_page', 'form_files', 'one_partition', 'zpg_mappings']
+   
+tests/zpages.rs:4794 a_failed_build_is_tried_again_after_its_backoff
+   helpers=['form_files']
+   
+tests/zpages.rs:4878 every_crash_window_of_a_form_file_is_survived_at_open
+   helpers=['an_untouched_page', 'copy_dir', 'fields_of', 'form_files', 'keys_in_page', 'one_partition', 'partition_name']
+   let live = format!("zpg-{id:08}-{end:016}.zpg");
+   let good = std::fs::read(dir.join(&live)).unwrap();
+   let tmp = format!("{live}.tmp");
+   let orphan = format!("zpg-{:08}-{end:016}.zpg", id + 1000);
+tests/zpages.rs:5115 records_larger_than_a_page_are_read_from_the_raw_segment
+   helpers=['form_files']
+   
+tests/zpages.rs:5225 a_filter_of_another_layout_cannot_attach_and_never_answers_absent
+   helpers=['form_files', 'one_partition', 'open_changed']
+   let mut bytes = std::fs::read(p).unwrap();
+   std::fs::write(p, bytes).unwrap();
+tests/zpages.rs:5312 an_attached_form_file_is_warmed_once_per_process_unless_the_warm_is_off
+   helpers=['evict', 'form_files']
+   let f = std::fs::File::open(p).unwrap();
+   let m = MmapBytes::open(p).unwrap();
+tests/zpages.rs:5434 a_refused_form_file_is_built_again_at_the_open_without_a_settle
+   helpers=['copy_dir', 'form_files', 'one_partition']
+   let mut bytes = std::fs::read(&file).unwrap();
+   std::fs::write(&file, bytes).unwrap();
+tests/zpages.rs:5487 the_z_reader_agrees_with_the_blob_on_every_scan_window
+   helpers=['fence_keys', 'form_files']
+   
+tests/zpages.rs:5803 the_samplers_estimate_of_the_form_is_within_a_tenth_of_its_files
+   helpers=['compact_store']
+   
+tests/zpages.rs:5848 the_models_populations_are_the_hash_region_and_the_record_region
+   helpers=['populations_of']
+   
+tests/zpages.rs:5896 a_store_whose_hash_and_records_fit_the_budget_is_fits
+   helpers=['populations_of']
+   
+tests/zpages.rs:5939 an_auto_store_that_fits_builds_nothing
+   helpers=['form_files']
+   let mut v: Vec<String> = std::fs::read_dir(dir)
+   .filter(|n| !n.starts_with("wal-"))
+tests/zpages.rs:6089 the_model_moves_the_rung_between_fits_and_suspect_on_the_injected_budget
+   helpers=['form_files']
+   
+tests/zpages.rs:6474 auto_drops_the_raw_pages_at_the_install_and_not_at_each_attach
+   helpers=['compact_store_with', 'form_files']
+   
+tests/zpages.rs:6505 auto_builds_when_the_measure_says_blocked_and_the_limit_is_below_the_footprint
+   helpers=['compact_store']
+   
+tests/zpages.rs:6534 auto_serves_raw_until_the_form_file_is_whole
+   helpers=['form_files']
+   
+tests/zpages.rs:6573 auto_returns_to_raw_when_the_limit_is_lifted_and_gives_the_disk_back
+   helpers=['compact_store_at', 'form_files']
+   
+tests/zpages.rs:6611 a_skewed_workload_that_fits_never_builds
+   helpers=['form_files']
+   
+tests/zpages.rs:6699 a_cancelled_build_counts_as_a_switch
+   helpers=['form_files']
+   
+tests/zpages.rs:6743 the_gate_decides_the_form_under_auto_as_under_always
+   helpers=['compact_store']
+   
+tests/zpages.rs:6886 the_footprint_counts_the_compact_pages_a_handle_touched
+   helpers=['compact_store']
+   
+tests/zpages.rs:6929 the_trial_judges_the_refilled_state
+   helpers=['compact_store', 'form_files']
+   
+tests/zpages.rs:6986 a_trial_that_finds_the_raw_form_faulting_goes_back
+   helpers=['compact_store']
+   
+tests/zpages.rs:7018 a_form_that_stops_paying_is_left
+   helpers=['compact_store', 'form_files']
+   
+tests/zpages.rs:7067 two_stores_in_one_process_do_not_share_a_measure
+   helpers=['compact_store', 'form_files']
+   
+tests/zpages.rs:7146 form_files_on_disk_are_dormant_under_auto_and_attached_when_the_form_is_wanted
+   helpers=['form_files']
+   
+tests/zpages.rs:7366 a_store_past_its_budget_builds_its_form_files_ahead_and_buys_them_by_attach
+   helpers=['form_files']
+   
+tests/zpages.rs:7471 a_store_that_left_compact_builds_nothing_ahead_again
+   helpers=['compact_store_with', 'form_files']
+   
+tests/zpages.rs:7550 two_builds_ahead_run_beside_each_other_and_build_each_partition_once
+   helpers=['form_files']
+   
+tests/zpages.rs:7812 builds_ahead_at_landing_wait_while_scans_are_around
+   helpers=['form_files']
+   
+tests/zpages.rs:7879 builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
+   helpers=['cached_pages', 'form_files']
+   let len = std::fs::metadata(&f).unwrap().len() as usize;
+   let parts: Vec<PathBuf> = std::fs::read_dir(&dir)
+   .is_some_and(|n| n.starts_with("par-") && n.ends_with(".sup"))
+   let len = std::fs::metadata(&f).unwrap().len() as usize;
+tests/zpages.rs:8181 form_files_are_synced_by_their_build_and_only_with_the_option
+   helpers=['form_files']
+   
+tests/zpages.rs:8224 a_buy_attaches_every_form_file_built_ahead_before_any_warm
+   helpers=['form_files']
+   .map(|f| std::fs::metadata(f).unwrap().modified().unwrap())
+tests/zpages.rs:8319 a_partition_whose_raw_records_are_resident_counts_as_covered
+   helpers=['form_files']
+   .max_by_key(|f| std::fs::metadata(f).unwrap().len())
+   std::fs::remove_file(&largest).unwrap();
+tests/zpages.rs:8447 a_build_ahead_over_resident_records_holds_no_sample
+   helpers=['form_files']
+   .max_by_key(|f| std::fs::metadata(f).unwrap().len())
+   std::fs::remove_file(&largest).unwrap();
+tests/zpages.rs:8565 a_form_file_built_ahead_in_the_coding_the_pick_refuses_is_built_again
+   helpers=['form_files']
+   
+tests/zpages.rs:8632 an_attach_of_form_files_built_ahead_is_bought_on_the_prediction
+   helpers=['form_files']
+   .map(|f| std::fs::metadata(f).unwrap().len())
+   .map(|f| std::fs::metadata(f).unwrap().len())
+   std::fs::remove_file(f).unwrap();
+tests/zpages.rs:8746 the_writers_reads_are_counted_by_the_census_and_only_its_reads
+   helpers=['compact_store_with']
+   
+tests/zpages.rs:9081 the_gate_decides_the_form_an_attached_cell_serves
+   helpers=['form_files']
+   
+tests/zpages.rs:9136 a_block_read_often_enough_under_the_form_is_held_as_a_copy_and_walked_without_the_form
+   helpers=['form_files']
+   
+tests/zpages.rs:9262 a_partition_its_form_serves_drops_its_raw_pages_when_asked
+   helpers=['form_files', 'resident_under']
+   let raw = resident_under(&dir, "par-");
+tests/zpages.rs:9400 the_partition_whose_decodes_cost_most_is_recoded_while_it_serves
+   helpers=['form_files']
+   
+tests/zpages.rs:9571 a_spare_started_as_a_settle_ends_is_not_the_settles_to_sweep
+   helpers=['form_files']
+   
+tests/zpages.rs:9606 both_codings_are_built_at_write_time_and_the_policy_only_exchanges_them
+   helpers=['form_files']
+   
+tests/zpages.rs:9803 the_first_partitions_raw_tailed_and_the_rest_block_coded_answer_as_one_form
+   helpers=['form_files']
+   
+tests/zpages.rs:9865 a_form_stored_whole_answers_as_the_compressed_one_and_decodes_nothing
+   helpers=['form_files']
+   .map(|p| std::fs::metadata(p).unwrap().len())
+tests/zpages.rs:9950 a_form_read_through_the_engines_own_decoder_answers_as_through_lz4_flexs
+   helpers=['form_files']
+   
+tests/zpages.rs:10012 a_form_the_parsing_encoder_wrote_answers_as_the_greedy_ones_in_fewer_bytes
+   helpers=['form_files']
+   .map(|p| std::fs::metadata(p).unwrap().len())
+tests/db.rs:215 a_torn_tail_loses_its_batch_whole_and_earlier_batches_survive
+   helpers=[]
+   let wal = d.join("wal-00000000");
+   let len = std::fs::metadata(&wal).unwrap().len();
+   let f = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
+tests/db.rs:324 crash_between_rename_and_wal_reset_does_not_duplicate
+   helpers=[]
+   let wal = d.join("wal-00000000");
+   let saved = std::fs::read(&wal).unwrap();
+   std::fs::write(&wal, &saved).unwrap();
+tests/db.rs:1102 a_lone_piece_is_promoted_rather_than_rewritten
+   helpers=['seg_names']
+   assert!(names[0].starts_with("par-"), "left unrouted: {names:?}");
+   names[0].starts_with("par-00000000-"),
+tests/db.rs:1147 a_lone_piece_holding_a_tombstone_still_merges
+   helpers=['seg_names']
+   !names[0].starts_with("par-00000000-"),
+tests/db.rs:1202 a_segment_whose_ordered_index_is_missing_or_damaged_rebuilds_it_at_open
+   helpers=['ord_names', 'seg_names']
+   .map(|n| std::fs::read(d.join(n)).unwrap())
+   std::fs::write(d.join(n), &damaged).unwrap();
+   &std::fs::read(d.join(n)).unwrap(),
+   std::fs::remove_file(d.join(&ords[0])).unwrap();
+tests/db.rs:1613 a_rebuilt_ordered_index_serves_point_reads_as_the_one_it_replaced
+   helpers=['ord_names', 'seg_names']
+   .map(|n| std::fs::read(d.join(n)).unwrap())
+   std::fs::write(d.join(n), &damaged).unwrap();
+   std::fs::remove_file(d.join(&ords[0])).unwrap();
+tests/db.rs:1712 an_ordered_index_naming_the_wrong_keys_never_returns_another_keys_values
+   helpers=['ord_names', 'seg_names']
+   std::fs::write(d.join(&ords[0]), b.finish()).unwrap();
+   std::fs::write(d.join(&ords[0]), b.finish()).unwrap();
+tests/db.rs:2232 an_ordered_index_survives_promotion_and_reopen
+   helpers=['ord_names', 'seg_names']
+   
+tests/db.rs:2370 a_crash_before_the_manifest_lands_keeps_the_pre_merge_store
+   helpers=[]
+   let pre: Vec<String> = std::fs::read_dir(&d)
+   .filter(|n| n.ends_with(".sup"))
+   for name in std::fs::read_dir(&d).unwrap() {
+   std::fs::copy(d.join(&name), d2.join(&name)).unwrap();
+tests/db.rs:2624 every_n_loses_the_unsynced_tail_whole_and_never_in_part
+   helpers=[]
+   let wal = d.join("wal-00000000");
+   let len = std::fs::metadata(&wal).unwrap().len();
+   std::fs::OpenOptions::new()
+tests/db.rs:2684 a_buffered_flush_is_answered_by_its_slot_and_needs_nothing_of_its_log
+   helpers=[]
+   for e in std::fs::read_dir(&d).unwrap() {
+   .is_some_and(|n| n.starts_with("wal-"));
+   std::fs::OpenOptions::new()
+tests/db.rs:2732 a_seal_through_the_one_value_path_writes_the_segment_the_general_path_does
+   helpers=['first_difference']
+   for e in std::fs::read_dir(&d).unwrap() {
+   if name.ends_with(".sup") || name.ends_with(".oidx") {
+   m.insert(name, std::fs::read(&p).unwrap());
+tests/db.rs:2898 deleted_values_do_not_survive_the_merge
+   helpers=['dir_bytes']
+   
+tests/db.rs:2960 a_batch_without_its_commit_frame_is_lost_whole
+   helpers=[]
+   let wal = d.join("wal-00000000");
+   let full = std::fs::read(&wal).unwrap();
+   for e in std::fs::read_dir(&d).unwrap() {
+   if e.file_name() != "wal-00000000" {
+tests/db.rs:3054 ordered_pieces_are_promoted_to_partitions_without_a_merge
+   helpers=[]
+   let mut names: Vec<String> = std::fs::read_dir(&d)
+   .filter(|n| n.ends_with(".sup"))
+   names.iter().all(|n| n.starts_with("par-")),
+tests/db.rs:3123 a_wal_header_torn_by_power_loss_opens_and_is_rewritten
+   helpers=[]
+   let mut wals: Vec<std::path::PathBuf> = std::fs::read_dir(d)
+   .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("wal-"))
+   std::fs::metadata(&live).unwrap().len(),
+   std::fs::OpenOptions::new()
+tests/db.rs:3190 a_recycled_wal_never_adopts_a_frame_from_its_previous_life
+   helpers=[]
+   std::fs::metadata(&live).unwrap().len() > 8,
+tests/db.rs:3255 recycling_survives_crashes_and_leaves_no_spare_after_close
+   helpers=[]
+   let spares = std::fs::read_dir(&d)
+   .starts_with("spare-")
+tests/db.rs:3300 a_flipped_byte_anywhere_in_a_batch_loses_that_batch_and_the_ones_after
+   helpers=[]
+   let wal = d.join("wal-00000000");
+   let full = std::fs::read(&wal).unwrap();
+   for e in std::fs::read_dir(&d).unwrap() {
+   if e.file_name() != "wal-00000000" {
+tests/db.rs:3399 a_merge_takes_the_ordered_index_with_the_segment_it_retires
+   helpers=[]
+   std::fs::read_dir(&d)
+   let (segs, ords) = (count(".sup"), count(".oidx"));
+tests/db.rs:5038 the_wal_drops_its_synced_frames_from_the_page_cache
+   helpers=['cached_pages']
+   let wal = std::fs::read_dir(&d)
+   .is_some_and(|n| n.starts_with("wal-"))
+   let len = std::fs::metadata(&wal).unwrap().len() as usize;
+tests/db.rs:5452 a_manifest_publish_leaves_its_spare_to_the_sweep
+   helpers=[]
+   let mut v: Vec<String> = std::fs::read_dir(d)
+   .filter(|n| n.starts_with("manifest.prev-"))
+   assert!(d.join("manifest").is_file(), "the manifest is in place");
+   std::fs::write(d.join("manifest.prev-77"), b"stale").unwrap();
+tests/db.rs:5522 a_manifest_publish_alternates_two_slots_and_the_open_takes_the_newest_valid
+   helpers=['manifest_bytes', 'newest_manifest']
+   d.join("manifest").is_file() && d.join("manifest.alt").is_file(),
+   let other_seq = manifest_seq_of(&std::fs::read(&other).unwrap());
+   assert!(!d.join("manifest.tmp").exists(), "no temp name under slots");
+   std::fs::write(&other, &torn).unwrap();
+tests/db.rs:6452 a_direct_run_streamed_from_its_table_is_the_run_the_copies_write
+   helpers=[]
+   let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(d)
+   .filter(|e| e.file_name().to_string_lossy().ends_with(".sup"))
+   std::fs::read(e.path()).unwrap(),
+   let tmp_of = |d: &std::path::Path| d.join("direct-00000000.tmp");
+tests/db.rs:6669 a_direct_segment_recovers_to_its_last_commit_marker
+   helpers=[]
+   let tmp_of = |d: &std::path::Path| d.join("direct-00000000.tmp");
+   let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
+   let len = std::fs::metadata(&tmp).unwrap().len();
+   std::fs::OpenOptions::new()
+tests/db.rs:6799 a_value_the_record_cannot_hold_sends_its_batch_through_the_wal
+   helpers=[]
+   let tmp = d.join("direct-00000000.tmp");
+tests/db.rs:7584 a_first_flush_seals_the_partition_in_one_publish
+   helpers=[]
+   let mut v: Vec<String> = std::fs::read_dir(d)
+   .filter(|n| n.ends_with(".sup"))
+   names[0].starts_with("par-") && names[0].ends_with("--.sup"),
+   names.len() == 1 && names[0].starts_with("seg-"),
+tests/db.rs:11714 a_segment_the_manifest_does_not_name_is_swept_and_its_wal_replayed
+   helpers=['manifest_bytes', 'segment_files']
+   assert!(d.join("manifest").exists(), "a manifest from birth");
+   for e in std::fs::read_dir(&d).unwrap() {
+   std::fs::copy(d.join(&name), d2.join(&name)).unwrap();
+   moved.iter().any(|n| n.ends_with(".sup")) && moved.iter().any(|n| n.starts_with("ord-")),
+tests/db.rs:11792 a_failed_landing_stops_the_seals_behind_it_and_a_reopen_replays_them
+   helpers=['manifest_bytes']
+   
+tests/db.rs:11855 a_store_from_before_manifests_opens_from_its_segment_names
+   helpers=['remove_manifests', 'segment_files']
+   .filter(|n| n.ends_with(".sup"))
+   !segs.is_empty() && segs.iter().all(|n| n.starts_with("seg-")),
+tests/db.rs:11907 a_merge_that_finishes_while_a_seal_is_between_its_phases_lands_after_it
+   helpers=['manifest_bytes']
+   
+tests/db.rs:13128 an_ordered_tail_handed_at_sync_is_promoted_beside_the_partition
+   helpers=['sup_files']
+   names.len() == 2 && names.iter().all(|nm| nm.starts_with("par-")),
+tests/db.rs:13671 a_crash_with_three_seals_in_flight_replays_them_all
+   helpers=['copy_store']
+   
+tests/db.rs:13952 a_hashed_tail_handed_beside_a_seal_in_flight_lands_as_a_piece
+   helpers=[]
+   !d.join("wal-00000000").exists(),
+   !d.join("wal-00000001").exists(),
+   assert!(d.join("wal-00000002").exists(), "the live WAL");
+tests/db.rs:14128 a_handed_tables_log_is_retired_at_its_landing_and_replays_before_it
+   helpers=['manifest_bytes', 'restore_manifest', 'sup_files']
+   let saved_wal = std::fs::read(&wal1).unwrap();
+   std::fs::write(&wal1, &saved_wal).unwrap();
+   std::fs::write(&wal1, &saved_wal).unwrap();
+   let tmp: Vec<PathBuf> = std::fs::read_dir(&d)
+tests/db.rs:14611 an_open_cut_tail_handed_beside_a_seal_in_flight_is_promoted_on_its_keys
+   helpers=['sup_files']
+   names.len() == parts + 2 && names.iter().all(|nm| nm.starts_with("par-")),
+tests/db.rs:14756 a_seal_that_keeps_the_wal_retires_files_by_sequence
+   helpers=['wal_files']
+   
+tests/db.rs:14847 a_rotated_wal_torn_in_its_new_file_reopens_to_a_prefix
+   helpers=['wal_files']
+   let full = std::fs::read(&wals[1]).unwrap();
+   std::fs::write(&wals[1], &full[..cut]).unwrap();
+   std::fs::write(&wals[1], &full).unwrap();
+tests/db.rs:15191 a_closed_wal_outlives_a_seal_between_its_phases_and_a_crash_there
+   helpers=['manifest_bytes', 'wal_files']
+   
+tests/db.rs:15595 a_pending_manifest_is_the_store_only_once_its_segment_reads_back_whole
+   helpers=['newest_manifest']
+   let f = std::fs::OpenOptions::new().write(true).open(&seg).unwrap();
+tests/db.rs:15670 a_clean_close_leaves_no_pending_name
+   helpers=['newest_manifest']
+   
+tests/db.rs:15697 a_store_from_before_the_pending_flags_opens_with_both_slots_rewritten
+   helpers=['newest_manifest']
+   std::fs::write(d.join(MANIFEST_SLOTS[(seq2 % 2) as usize]), &v2).unwrap();
+   let b = std::fs::read(d.join(slot)).unwrap();
+tests/db.rs:15759 a_run_whose_keys_the_table_keeps_leaves_the_segment_the_copies_leave
+   helpers=[]
+   let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(d)
+   std::fs::read(e.path()).unwrap(),
+   (".sup", 4096usize, &db_),
+   (".oidx", 0, &db_),
+tests/db.rs:16102 the_directory_hint_writes_the_segment_and_the_ordered_index_the_default_does
+   helpers=['first_difference']
+   for e in std::fs::read_dir(&d).unwrap() {
+   if name.ends_with(".sup") || name.ends_with(".oidx") || name.starts_with("ord-") {
+   m.insert(name, std::fs::read(&p).unwrap());
+   m.keys().any(|n| n.ends_with(".sup")),
+tests/db.rs:16379 a_loose_rotation_syncs_nothing_and_a_gap_at_its_boundary_ends_the_log
+   helpers=[]
+   let len = std::fs::metadata(p).unwrap().len();
+   std::fs::OpenOptions::new()
+   std::fs::read(d.join("wal-00000000")).unwrap()[7],
+   std::fs::read(d.join("wal-00000001")).unwrap()[7],
+tests/db.rs:16521 the_first_sync_by_policy_after_a_loose_rotation_syncs_the_closed_file_and_chains_the_header
+   helpers=[]
+   let header = |d: &std::path::Path| std::fs::read(d.join("wal-00000001")).unwrap()[7];
+   let p = d.join("wal-00000000");
+   let len = std::fs::metadata(&p).unwrap().len();
+   std::fs::OpenOptions::new()
+tests/fences.rs:60 a_merge_planned_with_fences_a_landing_old_takes_the_partitions_standing_after_it
+   helpers=['partition_fences']
+   
+tests/fences.rs:224 a_promotion_never_closes_a_partition_at_its_own_lower_fence
+   helpers=['partition_fences']
+   
+tests/fences.rs:343 a_merge_writes_an_empty_partition_for_a_fence_no_input_key_lies_in
+   helpers=['partition_fences', 'seg_names']
+   before.iter().all(|n| n.starts_with("seg-")),
+   .filter(|n| n.starts_with("par-"))
+   seg_names(&dir).iter().any(|n| n.starts_with("seg-")),
+   !names.iter().any(|n| n.starts_with("seg-")),
+tests/fences.rs:479 a_merges_first_pass_over_the_heads_writes_what_the_records_write
+   helpers=['partition_fences', 'seg_names']
+   let a = std::fs::read(dirs[0].join(n)).unwrap();
+   let b = std::fs::read(dirs[1].join(n)).unwrap();
+tests/fences.rs:565 a_merges_walk_with_its_keys_kept_writes_what_a_walk_reading_every_input_writes
+   helpers=['partition_fences', 'seg_names']
+   let a = std::fs::read(dirs[0].join(n)).unwrap();
+   let b = std::fs::read(dirs[1].join(n)).unwrap();
+tests/fences.rs:671 a_merge_drops_its_inputs_pages_behind_its_second_pass
+   helpers=['seg_names']
+   let a = std::fs::read(dirs[0].join(n)).unwrap();
+   let b = std::fs::read(dirs[1].join(n)).unwrap();
+tests/fences.rs:744 a_store_read_with_no_merge_in_flight_plans_one_in_its_loop
+   helpers=['partition_fences', 'seg_names']
+   .filter(|n| !n.starts_with("par-"))
+tests/fences.rs:851 a_merges_landing_plans_the_next_and_a_cap_lands_a_range_at_a_time
+   helpers=['partition_fences', 'seg_names']
+   .filter(|n| !n.starts_with("par-"))
+tests/fences.rs:991 a_second_merge_runs_beside_the_first_over_ranges_it_does_not_hold
+   helpers=['partition_fences']
+   
+tests/settle.rs:109 a_key_written_into_an_empty_partitions_range_is_in_a_scan_through_the_cache
+   helpers=['partition_fences']
+   
+tests/settle.rs:259 a_filed_keys_cut_is_resolved_again_across_its_partitions_rewrite
+   helpers=['partition_fences']
+   
+tests/settle.rs:411 a_snapshot_over_the_empty_key_alone_is_sought_at_a_partitions_fence
+   helpers=['partition_fences']
+   
+tests/settle.rs:535 a_commits_fill_builds_the_blocks_its_settle_filed_into
+   helpers=['partition_fences']
+   
+tests/settle.rs:618 the_fills_build_only_while_the_refaults_hold_still
+   helpers=['partition_fences']
+   
+tests/durable.rs:300 an_append_after_a_delete_survives_a_crash_before_the_deletes_seal_writes
+   helpers=['delete_then_write_crash_while_sealing']
+   
+tests/durable.rs:311 an_append_after_a_delete_survives_a_crash_between_the_deletes_seal_phases
+   helpers=['delete_then_write_crash_while_sealing']
+   
+tests/durable.rs:322 an_append_batch_after_a_delete_survives_a_crash_before_the_deletes_seal_writes
+   helpers=['delete_then_write_crash_while_sealing']
+   
+tests/durable.rs:335 an_append_after_a_transactions_delete_survives_a_crash_before_its_seal_writes
+   helpers=['delete_then_write_crash_while_sealing']
+   
+tests/durable.rs:348 an_append_after_a_delete_second_in_its_batch_survives_a_crash_before_its_seal_writes
+   helpers=['delete_then_write_crash_while_sealing']
+   
+tests/durable.rs:362 an_append_after_a_delete_its_seal_commits_survives_a_crash_before_the_seal_writes
+   helpers=['delete_then_write_crash_while_sealing']
+   
+tests/durable.rs:375 an_append_after_a_lone_delete_survives_a_crash_before_its_seal_writes
+   helpers=['delete_then_write_crash_while_sealing']
+   
+tests/durable.rs:388 a_put_after_a_delete_survives_a_crash_before_the_deletes_seal_writes
+   helpers=['delete_then_write_crash_while_sealing']
+   
+tests/durable.rs:418 an_append_after_a_delete_that_ends_a_run_survives_a_crash_before_its_seal_writes
+   helpers=['copy_store', 'open_run']
+   
+tests/durable.rs:477 an_append_after_a_replayed_delete_survives_a_crash_before_its_seal_writes
+   helpers=['copy_store', 'loaded']
+   
+tests/durable.rs:523 a_buffered_crash_never_recovers_a_batch_without_its_first_key
+   helpers=['copy_store', 'loaded']
+   
+tests/durable.rs:646 a_delete_below_the_greatest_leaves_it_where_it_was
+   helpers=['appends_below_the_greatest_read_back']
+   
+tests/durable.rs:663 an_open_keeps_the_greatest_its_segments_hold
+   helpers=['appends_below_the_greatest_read_back']
+   
+tests/durable.rs:821 a_failed_log_write_loses_no_commit_acknowledged_after_it
+   helpers=['a_failed_write_is_written_again']
+   
+tests/durable.rs:832 a_log_write_that_failed_part_way_loses_no_commit_acknowledged_after_it
+   helpers=['a_failed_write_is_written_again']
+   
+tests/durable.rs:842 a_log_write_that_failed_part_way_in_a_reopened_store_loses_no_commit_acknowledged_after_it
+   helpers=['a_failed_write_is_written_again']
+   
+tests/durable.rs:1085 a_sync_after_a_failed_log_write_makes_every_commit_before_it_durable
+   helpers=['copy_store', 'seg_names']
+   
+tests/durable.rs:1122 a_store_whose_log_rotated_after_a_failed_write_opens_with_every_acknowledged_commit
+   helpers=['copy_store']
+   assert!(crash.join("wal-00000000").exists(), "the closed file");
+   crash.join("wal-00000001").exists(),
+tests/durable.rs:1253 a_write_that_cannot_be_put_back_is_kept_by_a_sync
+   helpers=['a_stray_write_is_kept']
+   
+tests/durable.rs:1258 a_write_that_cannot_be_put_back_is_kept_by_a_flush
+   helpers=['a_stray_write_is_kept']
+   
+tests/durable.rs:1263 a_write_that_cannot_be_put_back_is_kept_by_a_seal
+   helpers=['a_stray_write_is_kept']
+   
+tests/durable.rs:1333 a_commit_answered_ok_after_a_failed_log_sync_survives_a_crash
+   helpers=['a_commit_after_a_failed_sync']
+   
+tests/durable.rs:1346 a_sync_answered_ok_after_a_failed_one_makes_every_commit_before_it_durable
+   helpers=['copy_store']
+   
+tests/durable.rs:1399 a_failed_log_sync_is_kept_until_the_store_is_reopened
+   helpers=['seg_names']
+   
+tests/durable.rs:1738 a_run_write_that_failed_is_written_again_by_a_commit_of_nothing
+   helpers=['a_run_write_that_failed']
+   
+tests/durable.rs:1745 a_run_write_that_failed_is_written_again_by_a_sync
+   helpers=['a_run_write_that_failed']
+   
+tests/durable.rs:1752 a_run_write_that_failed_is_written_again_by_the_runs_next_commit
+   helpers=['a_run_write_that_failed']
+   
+tests/durable.rs:1763 a_run_write_that_failed_part_way_loses_no_commit_acknowledged_after_it
+   helpers=['a_run_write_that_failed']
+   
+tests/durable.rs:1874 a_short_run_write_is_written_whole_at_the_offset_it_reached
+   helpers=['a_short_run_write']
+   
+tests/durable.rs:1882 a_failed_run_piece_write_is_held_and_written_by_the_next_commit
+   helpers=['a_failed_run_piece_write']
+   
+tests/durable.rs:1893 a_run_write_that_failed_part_way_is_flushed_whole
+   helpers=['open_run']
+   
+tests/durable.rs:1991 a_failed_run_fdatasync_is_kept_until_the_store_is_reopened
+   helpers=['a_failed_run_sync_is_kept']
+   
+tests/durable.rs:2006 a_run_whose_fdatasync_failed_is_not_closed_into_a_named_segment
+   helpers=['power_cut', 'run_ino']
+   
+tests/durable.rs:2379 a_buffered_run_piece_write_that_failed_is_answered_and_written_by_a_sync
+   helpers=['a_buffered_run_piece_write_that_failed']
+   
+tests/durable.rs:2386 a_run_write_the_device_refuses_again_is_tried_once_a_sync
+   helpers=['a_buffered_run_piece_write_that_failed']
+   
+tests/durable.rs:2399 a_commit_under_always_is_not_acknowledged_over_a_failed_helper_sync
+   helpers=['open_run']
+   
+tests/durable.rs:2747 a_buffered_runs_failed_first_write_is_tried_again_before_its_sync
+   helpers=['power_cut', 'run_ino', 'run_tmp_name']
+   let len = || std::fs::metadata(d.join(run_tmp_name(&d))).unwrap().len();
+tests/durable.rs:2791 a_run_write_failure_after_one_answered_is_answered_in_its_own_words
+   helpers=['power_cut', 'run_ino', 'run_tmp_name']
+   let len = || std::fs::metadata(d.join(run_tmp_name(&d))).unwrap().len();
+tests/durable.rs:3244 a_sync_after_a_reopen_makes_the_replayed_writes_durable_buffered
+   helpers=['a_sync_after_a_reopen']
+   
+tests/durable.rs:3249 a_sync_after_a_reopen_makes_the_replayed_writes_durable_always
+   helpers=['a_sync_after_a_reopen']
+   
+tests/durable.rs:3323 a_flush_after_a_reopen_is_answered_only_once_its_writes_are_durable_buffered
+   helpers=['a_flush_after_a_reopen']
+   
+tests/durable.rs:3328 a_flush_after_a_reopen_is_answered_only_once_its_writes_are_durable_always
+   helpers=['a_flush_after_a_reopen']
+   
+tests/durable.rs:3356 a_drain_answered_before_its_slots_sync_keeps_the_log_file_the_slot_covers
+   helpers=['copy_store', 'wal_names']
+   let slots = ["manifest", "manifest.alt"];
+   .map(|s| std::fs::read(d.join(s)).ok())
+   Some(bytes) => std::fs::write(crash.join(s), bytes).unwrap(),
+   let _ = std::fs::remove_file(crash.join(s));
+tests/durable.rs:3487 a_sync_after_a_reopen_makes_a_replayed_loose_log_file_durable
+   helpers=['copy_store', 'power_cut_logs', 'rotated_and_killed']
+   
+tests/durable.rs:3519 a_rotation_after_a_reopen_leaves_the_replayed_file_loose
+   helpers=['copy_store', 'life_one', 'power_cut_logs', 'wal_names']
+   assert_eq!(newest, "wal-00000001", "the rotation's file");
+tests/durable.rs:3576 a_header_an_open_writes_beside_an_unsynced_closed_file_is_loose
+   helpers=['copy_store', 'files_of', 'power_cut_logs', 'rotated_and_killed', 'wal_names']
+   let mut bytes = std::fs::read(&live).unwrap();
+   std::fs::write(&live, &bytes).unwrap();
+   std::fs::OpenOptions::new()
+tests/durable.rs:3644 a_reopen_with_nothing_replayed_owes_its_log_no_sync
+   helpers=['copy_store', 'killed', 'wal_names']
+   let wal = d.join("wal-00000000");
+   let mut f = std::fs::OpenOptions::new().append(true).open(&wal).unwrap();
+   !d.join("wal-00000000").exists(),
+   std::fs::copy(before.join("wal-00000000"), d.join("wal-00000000")).unwrap();
+tests/durable.rs:3765 a_sync_that_chains_a_loose_boundary_makes_the_chained_header_durable
+   helpers=['copy_store', 'files_of', 'power_cut_logs', 'wal_names']
+   std::fs::OpenOptions::new()
+tests/durable.rs:3869 a_store_just_created_opens_after_a_power_cut_loses_its_logs_unsynced_header
+   helpers=['a_store_just_created']
+   
+tests/durable.rs:3885 acknowledged_direct_run_commits_survive_a_power_cut_that_loses_the_logs_unsynced_header
+   helpers=['copy_store', 'open_run', 'zero_prefix']
+   std::fs::metadata(d.join("wal-00000000")).unwrap().len(),
+   zero_prefix(&crash.join("wal-00000000"), usize::MAX);
+tests/durable.rs:4001 a_flush_survives_a_power_cut_that_loses_the_first_page_of_a_never_synced_log
+   helpers=['a_flush_survives_a_lost_first_page']
+   
+tests/durable.rs:4016 a_log_file_a_rotation_began_whose_header_a_power_cut_lost_opens_with_every_commit_before_it
+   helpers=['copy_store', 'wal_names', 'zero_prefix']
+   std::fs::metadata(crash.join(&names[1])).unwrap().len(),
+tests/durable.rs:4063 an_older_log_file_whose_unsynced_header_a_power_cut_lost_opens_as_the_logs_end
+   helpers=['copy_store', 'rotated_and_killed', 'wal_names', 'zero_prefix']
+   
+tests/durable.rs:4095 frames_behind_a_lost_first_sector_are_dropped_as_unsynced
+   helpers=['copy_store', 'killed', 'wal_names', 'zero_prefix']
+   assert!(std::fs::metadata(&newest).unwrap().len() > 2 * 4096);
+   let bytes = std::fs::read(&newest).unwrap();
+tests/durable.rs:4159 a_zeroed_header_over_frames_in_its_first_sector_is_refused_as_damage
+   helpers=['files_of', 'killed', 'zero_prefix']
+   zero_prefix(&d.join("wal-00000000"), WAL_HEAD as usize);
+tests/durable.rs:4182 a_foreign_log_header_is_refused
+   helpers=['files_of']
+   let f = std::fs::OpenOptions::new()
+   .open(d.join("wal-00000000"))
+tests/durable.rs:4276 a_zeroed_older_log_file_before_a_chained_one_is_refused_as_damage
+   helpers=['a_zero_older_file_before_a_chained_one']
+   
+tests/durable.rs:4330 a_reopen_that_cuts_a_torn_tail_makes_the_replayed_writes_durable
+   helpers=['a_sync_after_a_reopen_that_cut_a_torn_tail']
+   
+tests/durable.rs:4405 a_failed_sync_of_a_loose_log_file_leaves_the_live_header_loose
+   helpers=['a_failed_loose_sync_leaves_the_header']
+   
+tests/durable.rs:4424 a_sync_after_a_reopen_syncs_every_replayed_older_file_oldest_first
+   helpers=['copy_store', 'power_cut_logs', 'wal_names']
+   std::fs::read(d.join(n)).unwrap()[WAL_KIND_AT as usize],
+tests/durable.rs:4505 a_failed_log_write_in_a_recycled_log_loses_no_commit_acknowledged_after_it
+   helpers=['a_failed_write_is_written_again']
+   
+tests/durable.rs:4519 a_store_whose_log_rotated_after_a_failed_write_survives_a_power_cut
+   helpers=['copy_store', 'power_cut_logs']
+   
+tests/durable.rs:4716 a_sync_puts_an_open_runs_commits_where_a_process_kill_keeps_them
+   helpers=['copy_store', 'killed', 'open_run']
+   
+tests/durable.rs:4750 a_sync_makes_an_open_runs_commits_survive_a_power_cut
+   helpers=['power_cut', 'run_ino']
+   
+tests/durable.rs:4788 a_sync_with_a_run_open_makes_the_logs_unsynced_frames_survive_a_power_cut
+   helpers=['power_cut', 'run_ino']
+   
+tests/durable.rs:4847 a_sync_that_hands_an_open_run_to_a_seal_has_put_its_commits_on_the_file
+   helpers=['copy_store', 'killed', 'open_run']
+   
+tests/durable.rs:4980 a_sync_whose_write_of_the_runs_tail_fails_is_written_by_the_next_sync
+   helpers=['power_cut', 'run_ino']
+   
+tests/durable.rs:5011 a_sync_with_a_run_open_syncs_the_log_before_the_run
+   helpers=['power_cut', 'run_ino']
+   
+tests/durable.rs:5161 a_run_commit_after_a_failed_due_write_is_due
+   helpers=['power_cut', 'run_ino']
+   
+tests/durable.rs:5202 a_flush_after_a_run_closed_into_a_seal_makes_the_runs_commits_durable
+   helpers=['copy_store']
+   if let Ok(f) = std::fs::OpenOptions::new()
+tests/durable.rs:5373 a_sync_syncs_a_run_whose_commits_end_on_a_piece_boundary
+   helpers=['power_cut', 'run_ino']
+   
+tests/durable.rs:5731 a_seal_whose_directory_fsync_failed_is_named_by_no_manifest
+   helpers=['seg_names', 'ss_end_seq', 'ss_named_by_no_manifest', 'ss_new_piece', 'ss_newest']
+   std::fs::remove_file(d.join(&third)).unwrap();
+tests/durable.rs:5792 a_seal_whose_data_fsync_failed_after_its_publish_is_named_by_no_manifest
+   helpers=['seg_names', 'ss_end_seq', 'ss_named_by_no_manifest', 'ss_new_piece', 'ss_newest']
+   std::fs::OpenOptions::new()
+tests/durable.rs:5863 a_later_seal_names_no_seal_whose_fsync_failed_and_retires_none_of_its_log
+   helpers=['seg_names', 'ss_logs', 'ss_named_by_no_manifest', 'ss_new_piece']
+   std::fs::OpenOptions::new()
+tests/durable.rs:6216 a_flush_after_a_failed_presync_is_not_ok_over_the_lost_records
+   helpers=['ss_failed_presync']
+   
+tests/durable.rs:6223 a_flush_after_a_failed_presync_is_not_ok_whichever_way_its_seal_lands
+   helpers=['ss_failed_presync']
+   
+tests/durable.rs:6229 a_flush_after_a_failed_inline_presync_is_not_ok_over_the_lost_records
+   helpers=['ss_failed_presync']
+   
+tests/durable.rs:6344 a_runs_close_whose_fsync_failed_is_named_by_no_manifest
+   helpers=['ss_run_close_fails']
+   
+tests/durable.rs:6420 a_seal_whose_fsync_failed_is_not_named_durable_by_the_close
+   helpers=['ss_pending_close']
+   
+tests/durable.rs:6431 a_run_closed_after_its_kept_sync_failure_answers_the_device_and_reads_on
+   helpers=['copy_store']
+   
+tests/durable.rs:6578 a_write_that_ends_a_run_whose_close_cannot_be_made_is_answered_and_panics_nothing
+   helpers=['ss_no_room_for_the_run']
+   
+tests/durable.rs:6583 a_seal_of_a_run_whose_close_cannot_be_made_leaves_the_run_open
+   helpers=['ss_no_room_for_the_run']
+   
+tests/durable.rs:6594 a_write_that_ends_a_run_beside_a_segment_work_error_waits_for_room_and_is_taken
+   helpers=['copy_store']
+   
+tests/durable.rs:6757 a_write_after_a_hand_off_over_a_stopped_queue_with_room_is_taken
+   helpers=['ss_handed_over_a_stopped_queue']
+   
+tests/durable.rs:6762 a_write_after_a_hand_off_over_a_stopped_queue_without_room_is_answered_until_reopen
+   helpers=['ss_handed_over_a_stopped_queue']
+   
+tests/durable.rs:6774 a_write_that_ends_a_run_over_a_stopped_queue_with_room_is_taken
+   helpers=['copy_store']
+   
+tests/durable.rs:6884 a_presync_that_fails_before_its_seals_publish_stops_every_manifest
+   helpers=['ss_newest']
+   
+tests/durable.rs:6967 a_presync_that_fails_before_its_seals_publish_stops_every_manifest_inline
+   helpers=['ss_newest']
+   
+tests/durable.rs:7074 a_stopped_queue_is_answered_by_every_seal_inline
+   helpers=['copy_store']
+   
+tests/durable.rs:7201 a_merge_finished_beside_a_failing_seal_is_held_in_the_same_look
+   helpers=['seg_names', 'ss_named_by_no_manifest', 'ss_new_piece', 'ss_newest']
+   
+tests/durable.rs:7663 a_publish_after_a_drains_owed_slot_never_overwrites_the_last_durable_slot
+   helpers=['a_publish_after_an_owed_slot']
+   
+tests/durable.rs:7775 a_second_seal_landed_by_a_drain_never_overwrites_the_last_durable_slot
+   helpers=['os_start']
+   
+tests/durable.rs:7903 an_open_that_takes_an_unsynced_slot_never_overwrites_the_durable_one
+   helpers=['an_open_over_an_owed_slot']
+   
+tests/durable.rs:7999 an_open_makes_the_slot_it_takes_durable
+   helpers=['an_open_syncs_its_slot']
+   
+tests/durable.rs:8035 a_drain_after_an_owed_slot_was_synced_keeps_that_slot
+   helpers=['drains_after_an_owed_sync']
+   
+tests/durable.rs:8189 a_slot_write_torn_over_an_owed_slot_is_not_named_durable_by_the_owed_sync
+   helpers=['a_torn_write_over_an_owed_slot']
+   
+tests/durable.rs:8523 a_slot_whose_fdatasync_failed_is_not_the_one_a_publish_keeps_off
+   helpers=['a_failed_slot_sync']
+   
+tests/durable.rs:8533 a_slot_whose_owed_fdatasync_failed_is_not_the_one_a_publish_keeps_off
+   helpers=['a_failed_slot_sync']
+   
+tests/durable.rs:8603 a_second_seals_slot_torn_over_an_owed_slot_is_not_named_durable_by_the_owed_sync
+   helpers=['a_torn_second_seal_slot']
+   
+tests/durable.rs:8702 a_pending_slot_whose_fdatasync_failed_stops_the_slots_until_a_reopen
+   helpers=['a_failed_pending_slot_sync']
+   
+tests/durable.rs:8719 an_upgrade_never_writes_first_over_the_slot_the_store_was_read_from
+   helpers=[]
+   let bytes: [Vec<u8>; 2] = [0, 1].map(|j| std::fs::read(d.join(OS_SLOTS[j])).unwrap());
+   std::fs::write(d.join(OS_SLOTS[newest]), &v2).unwrap();
+   std::fs::write(
+   std::fs::read(d.join(OS_SLOTS[newest])).unwrap() == v2,
+tests/durable.rs:8843 the_first_publish_after_create_keeps_off_the_slot_create_wrote
+   helpers=['the_first_publish_after_create']
+   
+tests/durable.rs:8857 a_store_opened_without_a_manifest_keeps_the_slot_its_open_wrote
+   helpers=['os_after_open']
+   std::fs::remove_file(d.join(s)).unwrap();
+tests/durable.rs:8883 an_open_that_recovers_a_run_keeps_the_slot_that_names_it
+   helpers=['open_run', 'os_after_open', 'os_copy', 'os_sync_slots']
+   
+tests/leak.rs:394 a_closed_store_gives_back_what_it_allocated
+   helpers=['a_zpages_life']
+   
