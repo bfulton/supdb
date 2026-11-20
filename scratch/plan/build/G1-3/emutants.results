@@ -1,0 +1,6 @@
+E1_install_ahead_branch	KILLED	319s	Preparing worktree (detached HEAD 352ec963)
+E7_install_ahead_loop	KILLED	312s	Preparing worktree (detached HEAD 352ec963)
+E2_outlined_helper	KILLED	316s	Preparing worktree (detached HEAD 352ec963)
+E8_read_helper	KILLED	320s	Preparing worktree (detached HEAD 352ec963)
+E4_commit_direct_loop	KILLED	319s	Preparing worktree (detached HEAD 352ec963)
+E6_suite_offsets_engine	KILLED	0s	Preparing worktree (detached HEAD 352ec963)
