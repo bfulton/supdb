@@ -715,6 +715,18 @@ which the kernel counts as minor. Read a thread's
 passes per rep there before reading its cell: a thread that ran in
 two reps of five made a cell that read neither shape.
 
+The threaded scan passes have a counters line of their own
+(`SUPDB_SCAN_COUNTERS=1`, a `scancounters` line a pass, before the mixes
+and after them, the mixes' line's fields): the scans a form file served,
+the groups they decoded, the blocks the handles built and the keys left
+unsealed, which is how the pass after the mixes was read as the same
+decodes down another path. Its read before a pass takes the writer's
+upkeep home, so the pass after it meets a store nothing is filing into,
+and its rates are not a row's. `SUPDB_SCAN_MIXED_FOLD=1` folds the store
+before the scans after the mixes, a probe: the same files with nothing
+overlaid, for telling what those scans pay for the path from what they
+pay for the store.
+
 ## The suite lives in bench/, and it gates this repository
 
 `bench/` is a time series. `bench run` measures every arm -- supdb's
@@ -5765,6 +5777,80 @@ rent. The rule: a price set to nothing takes with it whatever else the
 price was doing, so what it guarded against is named first and given a
 guard of its own; and a decision excused from evidence is made on a
 question that needs none.
+
+**A loss read as the keys', that every form shows and a faster form hid.**
+The threaded scans on the store the mixes leave trailed LMDB over random
+ids, 0.86x to 0.91x at ten million keys under 1.25 GiB, and were written
+down as what ids cost: the block form's decode where numbered keys have
+the stride form's arithmetic. Two readings of rows already banked said
+otherwise before any profile was cut. The rows from before the stride
+form read the same cells 0.78x to 0.95x over numbered keys, in the block
+form. And in every row the scans after the mixes are a fifth to a quarter
+slower than the scan pass before them whatever serves them, numbered keys
+in the stride form among them, 103 million entries a second and then 79,
+where twice LMDB's rate leaves the cell won; LMDB's own two passes read
+alike. Counted (`SUPDB_SCAN_COUNTERS`, a `scancounters` line a threaded
+scan pass), the two passes decode the same groups a scan and differ in
+the path: a few unsealed keys in a partition take every scan of it off
+the bulk walk and through the block loop and the form file's cursor, and
+a random id's insert falls in every partition. A sparse form built to win
+those cells, at a bound where it fits, trailed LMDB in them by the same
+fifth. The rule: before a cell lost over a new input is put on the input,
+the same cell is read in the rows before it under the old input and the
+form the new one is served by, and beside the pass before it in its own
+row; a step between two passes that every form shows has one cause above
+the forms; and a cell a form wins twice over is read for what it loses
+with the lead gone, since the next input is the one that takes the lead
+away.
+
+**A form priced for a week before its walk was profiled once.** The
+sparse stride form was priced by its bytes, by where it fits and by three
+rules for asking it, at two bounds where it does not fit; shown at last
+where it does, its scans read level with LMDB's where the whole-run
+form's read at twice, and that was not asked about. The first profile of
+its scan pass put a quarter of the threads in rendering each record's key
+from its number, a byte a digit, and a ninth more in copying the rendered
+key over the cursor's: sixteen stores of a byte and then a load of
+sixteen, the value built a field at a time and handed back whole, again.
+A whole run's walk adds one to its key in place and a sparse form's
+cannot, so its step had been written as a render and a copy and never
+looked at. The first fix made the digits a word at a time and copied the
+field's out of a buffer of sixteen at a run-time length: for a field of
+fifteen digits, two stores of eight bytes and a load of fifteen across
+them, the same stall at a third its size. What named it was the samples
+inside the library's copy split by their offset, each size's path having
+instructions of its own, read against the copy's disassembly: the
+sixteen-byte path's samples gone and the eight-to-fifteen's arrived. The
+field is stored from two registers now (`zpages::put_digits`,
+`Options::zpages_stride_step_direct`). The rule: a form is profiled where
+it serves before it is priced anywhere, the profile being cheaper than
+the first pairing; a copy of a run-time length out of a buffer just
+written is a load nothing forwards whatever wrote the buffer, so what is
+made in registers is stored from them; and samples in the library's copy
+are split by offset into the sizes copied before any caller is suspected.
+
+**Two causes named for one stall off a flat profile, and the probe that
+told them apart run second.** The values' copies out of a stride file's
+mapping took two fifths more of the threads in the scans after the mixes
+than in the scan pass, the same bytes in the same order. The first
+reading was the pages: the mixes' merges rewrite every partition, the
+files those scans read were written late, and this file's own note on
+memory placement made a slower page plausible. The second was the core's
+prefetch losing the values' stream between the runs a block-by-block walk
+reads a partition in, and a lever was built on it: an ask for the head of
+each run's lines, an option with its arms, tests and fuzz draw. Counted,
+it fired at every run, moved the copies' samples by a fiftieth and cost
+the walk more; its pairing read the scans within a tenth either way
+beside cells it cannot reach leaning a sixth; it was taken out. The first
+reading was then answered by ten lines of harness: the store folded
+before those scans (`SUPDB_SCAN_MIXED_FOLD`), the same late files with
+nothing overlaid, read at the scan pass's rate. So it is the path, and
+which part of the path the copies wait on is still not known. The rule:
+where a stall has two candidate causes, the probe that holds one of them
+fixed is run before a lever for either is built, and it is usually the
+cheaper of the two to write; a lever whose count says it fired and whose
+target did not move is taken out, not kept as an arm of something that
+does nothing; and what is left unexplained is written down as unexplained.
 
 ## Standing limitations
 
