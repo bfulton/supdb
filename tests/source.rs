@@ -4120,3 +4120,549 @@ fn a_door_module_brings_in_no_file_and_its_threads_are_counted() {
     let e = door_check(&src, &listed).expect_err("a thread in a door module");
     assert!(e.contains("thread src/crypt.rs *: 2 > 1 listed"), "{e}");
 }
+
+// ---------------------------------------------------------------------
+// The entry points of the plain-cost job (scripts/cost.sh): every `pub fn`
+// of the inherent impls of `Reader`, `Db` and `Blob`, in whichever file of
+// src/ the impl stands (an `impl super::Reader` in a submodule adds a method
+// as public as one in src/db.rs), every fn of an impl of a trait for one of
+// them (a trait's methods carry no `pub` and are as public as the trait),
+// and every macro invoked where an item of such an impl stands (it makes
+// items the lexer cannot see), outside test code, is either mapped to the
+// probes that count it or listed with the reason no probe does, in
+// tests/data/cost-entries.txt. A new `pub fn` in neither fails, so a read
+// path nobody counts cannot be added without a line that says so; a line
+// whose function has gone fails too, so the list stays the tree's. Every
+// pub fn of `Db` is listed, not only its reads: a `Db` reads through
+// `Deref<Target = Reader>`, `impl Db` holds no read today, and a read added
+// there has to be caught by a rule the lexer can apply. What it cannot see:
+// a missing row inside a probe that is named (a scan at a limit nobody
+// runs), and whether a probe named for a function reaches it.
+
+/// The self types whose `pub fn`s are entry points, each the name of one
+/// type of the crate (`Reader` and `Db` in src/db.rs, `Blob` in src/blob.rs),
+/// so an impl is read as theirs by the last name of its path in any file.
+const ENTRY_TYPES: &[&str] = &["Reader", "Db", "Blob"];
+
+/// The type aliases of src/, alias -> the type it names at the end of its
+/// chain (an entry type's alias is read as the entry type below): a
+/// `type R = Reader;` anywhere in the crate makes `impl R` an impl of
+/// `Reader`, so an impl is read by the type its last name resolves to, an
+/// alias of an alias included.
+fn entry_aliases(src: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut named: BTreeMap<String, String> = BTreeMap::new();
+    for (file, text) in src {
+        if !file.starts_with("src/") || !file.ends_with(".rs") {
+            continue;
+        }
+        let (s, _) = joined(&lex::regions(text), true);
+        for (at, w) in words(&s) {
+            if w != "type" {
+                continue;
+            }
+            let k = skip_ws(&s, at + 4);
+            let Some(alias) = word_at(&s, k) else {
+                continue;
+            };
+            let Some(eq) = (k..s.len()).find(|&e| matches!(s[e], '=' | ';' | '{')) else {
+                continue;
+            };
+            if s[eq] != '=' {
+                continue;
+            }
+            // The target's path, to its generic arguments or its end.
+            let end = (eq..s.len())
+                .find(|&e| matches!(s[e], ';' | '<'))
+                .unwrap_or(s.len());
+            if let Some((_, last)) = words(&s[eq + 1..end]).into_iter().last() {
+                named.insert(alias, last);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    for alias in named.keys() {
+        let mut t = alias.clone();
+        for _ in 0..8 {
+            match named.get(&t) {
+                Some(next) if next != &t => t = next.clone(),
+                _ => break,
+            }
+        }
+        out.insert(alias.clone(), t);
+    }
+    out
+}
+
+/// Every entry point, as `Type::name`, with the file it is in. An impl of a
+/// trait for one of the impl's own generic parameters -- `impl<T:
+/// Deref<Target = Reader>> ReadFast for T` -- is an impl for every type the
+/// bound admits, the entry types among them, and its fns are named `*::`.
+fn entry_points(src: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let aliases = entry_aliases(src);
+    let mut out = BTreeMap::new();
+    for (file, text) in src {
+        if !file.starts_with("src/") || !file.ends_with(".rs") {
+            continue;
+        }
+        let lines = lex::regions(text);
+        let (s, line_of) = joined(&lines, true);
+        for (at, name, generics) in impls(&s) {
+            let Some(open) = (at..s.len()).find(|&k| s[k] == '{') else {
+                continue;
+            };
+            // A trait's methods are as public as the trait, and carry no
+            // `pub` of their own: in an impl of a trait for the type, every
+            // fn is an entry point, named with the trait.
+            let tr = impl_trait(&s, at, open);
+            // Rust has no inherent impl for a type parameter, so a self
+            // type that is one of the impl's parameters is a trait's.
+            let name = if generics.contains(&name) {
+                "*".to_string()
+            } else {
+                aliases.get(&name).cloned().unwrap_or(name)
+            };
+            if name != "*" && !ENTRY_TYPES.contains(&name.as_str()) {
+                continue;
+            }
+            let close = close_of(&s, open);
+            let mut depth = 0i32;
+            let mut k = open + 1;
+            while k < close {
+                match s[k] {
+                    '{' | '(' | '[' => depth += 1,
+                    '}' | ')' | ']' => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 && !lines[line_of[k]].test {
+                    let w = word_at(&s, k);
+                    let fname = match (&tr, w.as_deref()) {
+                        (None, Some("pub")) => pub_fn_name(&s, k + 3),
+                        (Some(_), Some("fn")) => word_at(&s, skip_ws(&s, k + 2)),
+                        _ => None,
+                    };
+                    if let Some(f) = fname {
+                        let at = tr.as_ref().map_or(String::new(), |t| format!("{t}::"));
+                        out.insert(format!("{name}::{at}{f}"), file.clone());
+                    }
+                    // A macro invoked where an item stands makes items no
+                    // lexer can see: it is an entry point of its own name,
+                    // `Type::name!`, listed with what it makes.
+                    if let Some(m) = w.as_deref() {
+                        let after = skip_ws(&s, k + m.chars().count());
+                        if s.get(after) == Some(&'!')
+                            && matches!(s.get(skip_ws(&s, after + 1)), Some('(' | '{' | '['))
+                        {
+                            out.insert(format!("{name}::{m}!"), file.clone());
+                        }
+                    }
+                }
+                k += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The trait of an impl whose header runs from `at` to its body at `open`
+/// -- `impl<G> path::Trait<A> for Type` -- by its last name before `for`,
+/// or None for an inherent impl.
+fn impl_trait(s: &[char], at: usize, open: usize) -> Option<String> {
+    let mut d = 0i32;
+    let mut last = None;
+    let mut k = at + 4;
+    while k < open {
+        match s[k] {
+            '<' => d += 1,
+            '>' if s[k - 1] != '-' => d -= 1,
+            _ => {}
+        }
+        if let Some(w) = word_at(s, k) {
+            let n = w.chars().count();
+            if d == 0 {
+                if w == "for" {
+                    return last;
+                }
+                if w == "where" {
+                    return None;
+                }
+                last = Some(w);
+            }
+            k += n;
+            continue;
+        }
+        k += 1;
+    }
+    None
+}
+
+/// The name of the fn a bare `pub` (ending before `k`) declares: `pub fn`,
+/// with `const`, `unsafe`, `async` or `extern "C"` between; never
+/// `pub(crate)` and the like, which no caller outside the crate reaches.
+fn pub_fn_name(s: &[char], k: usize) -> Option<String> {
+    let mut k = skip_ws(s, k);
+    loop {
+        let w = word_at(s, k)?;
+        k = skip_ws(s, k + w.chars().count());
+        match w.as_str() {
+            "const" | "unsafe" | "async" | "extern" => {
+                // An ABI string is blanked in the flat text.
+                continue;
+            }
+            "fn" => return word_at(s, k),
+            _ => return None,
+        }
+    }
+}
+
+/// The probes scripts/cost.sh has: its `probe` table's names, and the
+/// default list a run without names counts.
+fn cost_probes(root: &Path) -> Result<(BTreeSet<String>, BTreeSet<String>), String> {
+    let text = std::fs::read_to_string(root.join("scripts/cost.sh"))
+        .map_err(|e| format!("scripts/cost.sh: {e}"))?;
+    let mut table = BTreeSet::new();
+    let mut default = BTreeSet::new();
+    let mut in_probe = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("probe() {") {
+            in_probe = true;
+            continue;
+        }
+        if in_probe {
+            if t == "}" {
+                in_probe = false;
+            } else if let Some((name, rest)) = t.split_once(") echo \"") {
+                if !name.is_empty() && !rest.is_empty() && !name.starts_with('*') {
+                    table.insert(name.to_string());
+                }
+            }
+        }
+        if let Some(rest) = t.strip_prefix("PROBES=${*:-") {
+            let list = rest
+                .strip_suffix('}')
+                .ok_or("PROBES' default does not close")?;
+            default.extend(list.split_whitespace().map(String::from));
+        }
+    }
+    if table.is_empty() || default.is_empty() {
+        return Err("scripts/cost.sh: no probe table or no default list read".into());
+    }
+    Ok((table, default))
+}
+
+/// tests/data/cost-entries.txt, as `Type::name` -> what it says: the
+/// probes, or none and a reason.
+fn entries_parse(text: &str) -> Result<BTreeMap<String, (Vec<String>, String)>, String> {
+    let mut out = BTreeMap::new();
+    for (n, line) in text.lines().enumerate() {
+        let ln = n + 1;
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        const SHAPE: &str = "not `Type::fn<TAB>probes` or `Type::fn<TAB>-<TAB>reason`";
+        let (name, probes, reason) = match f.as_slice() {
+            [name, probes] => (*name, *probes, ""),
+            [name, "-", reason] => (*name, "-", *reason),
+            _ => return Err(format!("line {ln}: {SHAPE}: {line}")),
+        };
+        let probes: Vec<String> = if probes == "-" {
+            if reason.trim().is_empty() {
+                return Err(format!(
+                    "line {ln}: {name} is counted by no probe and gives no reason"
+                ));
+            }
+            Vec::new()
+        } else {
+            let p: Vec<String> = probes.split(',').map(|p| p.trim().to_string()).collect();
+            if p.iter().any(|p| p.is_empty()) {
+                return Err(format!("line {ln}: {name}: an empty probe name"));
+            }
+            p
+        };
+        if out
+            .insert(name.to_string(), (probes, reason.to_string()))
+            .is_some()
+        {
+            return Err(format!("line {ln}: {name} is listed twice"));
+        }
+    }
+    Ok(out)
+}
+
+fn entries_check(
+    src: &BTreeMap<String, String>,
+    listed: &str,
+    probes: &(BTreeSet<String>, BTreeSet<String>),
+) -> Result<(), String> {
+    let found = entry_points(src);
+    let listed = entries_parse(listed)?;
+    let mut errs = Vec::new();
+    for (f, file) in &found {
+        if !listed.contains_key(f) {
+            errs.push(format!(
+                "{file}: pub fn {f} is on no line of tests/data/cost-entries.txt: name the probes of scripts/cost.sh that count it, or `-` and the reason none does"
+            ));
+        }
+    }
+    for (f, (ps, _)) in &listed {
+        if !found.contains_key(f) {
+            errs.push(format!(
+                "tests/data/cost-entries.txt: {f} is no pub fn of the tree"
+            ));
+        }
+        for p in ps {
+            if !probes.0.contains(p) {
+                errs.push(format!(
+                    "tests/data/cost-entries.txt: {f} names `{p}`, no probe of scripts/cost.sh"
+                ));
+            } else if !probes.1.contains(p) {
+                errs.push(format!("tests/data/cost-entries.txt: {f} names `{p}`, which scripts/cost.sh does not run by default"));
+            }
+        }
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs.join("\n"))
+    }
+}
+
+fn cost_entries(root: &Path) -> String {
+    std::fs::read_to_string(root.join("tests/data/cost-entries.txt"))
+        .expect("tests/data/cost-entries.txt reads")
+}
+
+#[test]
+fn every_entry_point_is_counted_by_a_probe_or_says_why_not() {
+    let root = root();
+    let probes = cost_probes(&root).unwrap_or_else(|e| panic!("{e}"));
+    if let Err(e) = entries_check(&sources(&root), &cost_entries(&root), &probes) {
+        panic!("the plain-cost job's entry points:\n{e}");
+    }
+}
+
+#[test]
+fn a_new_entry_point_on_no_line_fails() {
+    let root = root();
+    let probes = cost_probes(&root).unwrap();
+    let listed = cost_entries(&root);
+    for (file, header, name) in [
+        ("src/db.rs", "impl Reader {\n", "Reader::cost_red_entry"),
+        ("src/db.rs", "impl Db {\n", "Db::cost_red_entry"),
+        (
+            "src/blob.rs",
+            "impl<B: Bytes> Blob<B> {\n",
+            "Blob::cost_red_entry",
+        ),
+    ] {
+        for decl in [
+            "pub fn cost_red_entry(&self) {}",
+            "pub const fn cost_red_entry(&self) {}",
+            "pub unsafe fn cost_red_entry(&self) {}",
+            "#[inline]\n    pub fn cost_red_entry(&self) {}",
+        ] {
+            let src = edited(file, |t| {
+                assert!(t.contains(header), "{file} has `{header}`");
+                t.replacen(header, &format!("{header}    {decl}\n"), 1)
+            });
+            let e = entries_check(&src, &listed, &probes).expect_err(decl);
+            assert!(
+                e.contains(&format!("pub fn {name} is on no line")),
+                "{decl}: {e}"
+            );
+        }
+    }
+    // An impl in another module of the crate, by any path to the type.
+    for (file, imp, name) in [
+        (
+            "src/db/zfile.rs",
+            "impl super::Reader",
+            "Reader::cost_red_entry",
+        ),
+        (
+            "src/db/vault.rs",
+            "impl crate::db::Db",
+            "Db::cost_red_entry",
+        ),
+        (
+            "src/db/zpages.rs",
+            "impl<B: crate::bytes::Bytes> crate::blob::Blob<B>",
+            "Blob::cost_red_entry",
+        ),
+    ] {
+        let src = edited(file, |t| {
+            format!("{t}\n{imp} {{\n    pub fn cost_red_entry(&self) {{}}\n}}\n")
+        });
+        let e = entries_check(&src, &listed, &probes).expect_err(file);
+        assert!(
+            e.contains(&format!("{file}: pub fn {name} is on no line")),
+            "{file}: {e}"
+        );
+    }
+    // A method of a trait implemented for the type, which carries no `pub`
+    // and is as public as the trait; and a macro invoked where an item
+    // stands, whose items no lexer sees.
+    for (file, add, name) in [
+        (
+            "src/db.rs",
+            "pub trait ReadFast {\n    fn get_fast(&self, k: &[u8]) -> bool;\n}\nimpl ReadFast for Reader {\n    fn get_fast(&self, k: &[u8]) -> bool {\n        self.read_all(k, |_| ()).is_ok()\n    }\n}\n",
+            "Reader::ReadFast::get_fast",
+        ),
+        (
+            "src/blob.rs",
+            "impl<B: Bytes> crate::db::ReadFast for Blob<B> {\n    fn get_fast(&self, _: &[u8]) -> bool {\n        true\n    }\n}\n",
+            "Blob::ReadFast::get_fast",
+        ),
+    ] {
+        let src = edited(file, |t| format!("{t}\n{add}"));
+        let e = entries_check(&src, &listed, &probes).expect_err(name);
+        assert!(e.contains(&format!("pub fn {name} is on no line")), "{name}: {e}");
+    }
+    // An impl that names the type by no name of its own: a trait implemented
+    // for every type a bound admits, `Reader` among them, and an inherent
+    // impl through an alias of the type, in the file or another, an alias of
+    // an alias included.
+    for (file, add, name) in [
+        (
+            "src/db.rs",
+            "pub trait ReadFast {\n    fn get_fast(&self, k: &[u8]) -> bool;\n}\nimpl<T: std::ops::Deref<Target = Reader>> ReadFast for T {\n    fn get_fast(&self, k: &[u8]) -> bool {\n        self.read_all(k, |_| ()).is_ok()\n    }\n}\n",
+            "*::ReadFast::get_fast",
+        ),
+        (
+            "src/db.rs",
+            "pub type R = Reader;\nimpl R {\n    pub fn cost_red_entry(&self) {}\n}\n",
+            "Reader::cost_red_entry",
+        ),
+        (
+            "src/db/vault.rs",
+            "pub type R2 = crate::db::Db;\npub(crate) type R3 = R2;\nimpl R3 {\n    pub fn cost_red_entry(&self) {}\n}\n",
+            "Db::cost_red_entry",
+        ),
+        (
+            "src/blob.rs",
+            "type Bl<B> = Blob<B>;\nimpl<B: Bytes> Bl<B> {\n    pub fn cost_red_entry(&self) {}\n}\n",
+            "Blob::cost_red_entry",
+        ),
+    ] {
+        let src = edited(file, |t| format!("{t}\n{add}"));
+        let e = entries_check(&src, &listed, &probes).expect_err(name);
+        assert!(e.contains(&format!("pub fn {name} is on no line")), "{name}: {e}");
+    }
+    // An alias of another type is not an entry type, and an impl of a trait
+    // for a generic parameter of the type's own is the type's.
+    for add in [
+        "pub type R = Vec<Reader>;\nimpl Foo for R {\n    fn f(&self) {}\n}\n",
+        "impl<B: Bytes> Wrapper<B> {\n    pub fn cost_red_entry(&self) {}\n}\n",
+    ] {
+        let src = edited("src/blob.rs", |t| format!("{t}\n{add}"));
+        entries_check(&src, &listed, &probes).unwrap_or_else(|e| panic!("{add}: {e}"));
+    }
+    for invoke in [
+        "gen!(cost_red_entry);",
+        "gen! {cost_red_entry}",
+        "gen ! [cost_red_entry];",
+    ] {
+        let src = edited("src/db.rs", |t| {
+            let t =
+                format!("macro_rules! gen {{ ($n:ident) => {{ pub fn $n(&self) {{}} }} }}\n{t}");
+            t.replacen(
+                "impl Reader {\n",
+                &format!("impl Reader {{\n    {invoke}\n"),
+                1,
+            )
+        });
+        let e = entries_check(&src, &listed, &probes).expect_err(invoke);
+        assert!(
+            e.contains("pub fn Reader::gen! is on no line"),
+            "{invoke}: {e}"
+        );
+    }
+    // Not entry points: a fn of the crate's own, a fn in test code, a fn
+    // nested in a method, a macro inside a method, and a pub fn of another
+    // type.
+    for decl in [
+        "pub(crate) fn cost_red_entry(&self) {}",
+        "pub(super) fn cost_red_entry(&self) {}",
+        "fn cost_red_entry(&self) {}",
+        "#[cfg(test)]\n    pub fn cost_red_entry(&self) {}",
+        "fn outer(&self) { pub fn cost_red_entry() {} }",
+        "fn outer(&self) { let _ = format!(\"{}\", 1); }",
+    ] {
+        let src = edited("src/db.rs", |t| {
+            t.replacen(
+                "impl Reader {\n",
+                &format!("impl Reader {{\n    {decl}\n"),
+                1,
+            )
+        });
+        entries_check(&src, &listed, &probes).unwrap_or_else(|e| panic!("{decl}: {e}"));
+    }
+    let src = edited("src/db.rs", |t| {
+        format!("{t}\nimpl Options {{\n    pub fn cost_red_entry(&self) {{}}\n}}\n")
+    });
+    entries_check(&src, &listed, &probes).unwrap_or_else(|e| panic!("another type: {e}"));
+}
+
+#[test]
+fn a_line_the_tree_or_the_job_does_not_have_fails() {
+    let root = root();
+    let probes = cost_probes(&root).unwrap();
+    let src = sources(&root);
+    let listed = cost_entries(&root);
+    let e = entries_check(
+        &src,
+        &format!("{listed}Reader::cost_red_gone\tread\n"),
+        &probes,
+    )
+    .expect_err("a line for no fn");
+    assert!(e.contains("Reader::cost_red_gone is no pub fn"), "{e}");
+    let line = "Reader::read_all\t";
+    let at = listed.find(line).expect("read_all is listed");
+    let edit = |with: &str| {
+        let end = at + listed[at..].find('\n').unwrap();
+        format!("{}{line}{with}{}", &listed[..at], &listed[end..])
+    };
+    let e =
+        entries_check(&src, &edit("read,no_such_probe"), &probes).expect_err("an unknown probe");
+    assert!(e.contains("names `no_such_probe`, no probe"), "{e}");
+    let e = entries_check(&src, &edit("-\t  "), &probes).expect_err("no reason");
+    assert!(e.contains("gives no reason"), "{e}");
+    let e = entries_check(&src, &format!("{listed}Reader::read_all\tread\n"), &probes)
+        .expect_err("a second line");
+    assert!(e.contains("listed twice"), "{e}");
+    let e = entries_check(&src, &format!("{listed}Reader::read_all read\n"), &probes)
+        .expect_err("a line without its tab");
+    assert!(e.contains("not `Type::fn<TAB>probes`"), "{e}");
+    // A probe in the table that a run without names skips.
+    let narrowed = (
+        probes.0.clone(),
+        probes.1.iter().filter(|p| *p != "read").cloned().collect(),
+    );
+    let e = entries_check(&src, &listed, &narrowed).expect_err("a probe not run by default");
+    assert!(
+        e.contains("names `read`, which scripts/cost.sh does not run by default"),
+        "{e}"
+    );
+}
+
+#[test]
+fn the_cost_job_names_its_probes_as_the_test_reads_them() {
+    let (table, default) = cost_probes(&root()).unwrap();
+    for p in [
+        "read",
+        "read_z",
+        "scan",
+        "scan_long",
+        "scan_z",
+        "seal",
+        "scan_at",
+        "merge",
+    ] {
+        assert!(
+            table.contains(p) && default.contains(p),
+            "{p}: {table:?} {default:?}"
+        );
+    }
+    assert!(!table.contains("*"), "the fallthrough is no probe");
+}

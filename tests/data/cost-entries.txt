@@ -1,0 +1,342 @@
+# The plain-cost job's entry points (scripts/cost.sh; tests/source.rs holds this
+# file to the tree). One line a pub fn of impl Reader, impl Db and impl Blob, a
+# fn of an impl of a trait for one of them (Type::Trait::fn) or for a generic
+# parameter of the impl's own, which may be any of them (*::Trait::fn), and a
+# macro invoked where an item of such an impl stands (Type::name!); an impl
+# through an alias of a type is that type's:
+#   Type::fn<TAB>probe[,probe]      the probes of scripts/cost.sh that count it
+#   Type::fn<TAB>-<TAB>reason        why no probe does
+# A probe named counts the function where the probe's toggle runs it; a reason
+# says the function is not on an operation's path, or names the gap.
+
+*::Aead::decrypt	-	the cipher hook for a reference to a cipher, forwarding to it: called by an envelope's reader, never by a store in the clear
+*::Aead::encrypt	-	the same hook's writer, forwarding to the cipher it borrows
+Reader::Drop::drop	-	a handle's end, once a handle
+Db::Drop::drop	-	the store's close, once a store
+Db::Deref::deref	-	the borrow of a Db as its Reader, a field's address taken once a call; the suite's reads take a &Reader, so the read probes count the read and not the borrow
+Db::DerefMut::deref_mut	-	the same borrow, mutable, once a call
+Reader::set_isolation	-	a handle's isolation, set once a handle
+Reader::isolation	-	a handle's isolation, read once a handle
+Reader::snapshot	-	pins a snapshot, once a snapshot, not an operation's step
+Reader::release	-	releases a snapshot, once a snapshot
+Reader::seal_threshold	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::cap_pct	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::l0_trigger_now	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::lag_level	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::lag_reads	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::sized_bytes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::advice_random	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::pieces_aligned	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::pieces_ranked	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::pieces_with_ranks	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::merge_key_sources	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::merge_ahead	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::merge_syncs	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::merge_helpers	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::merge_dropped_bytes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::ords_advised	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::zpages_advised	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::raw_touches	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::zpage_raw_heat	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::zpage_heat	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::splice_bounds	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::zpage_counts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::ord_point_reads	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::read_all	read,read_z,work
+Reader::scan	scan,scan_long,scan_z,scan_long_z,work,land
+Reader::forms_trims	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::forms_trim_looks	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::forms_trim_us	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::forms_trims_begun	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::retired_waiting	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::block_state	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::forget_form_unretracted	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::published_kind	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::form_choices	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::hot_start_counts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::lazy_scans	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::settle_density	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::start_cache_counts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::canonical_forms	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::published_form_bytes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::debug_key	-	a debug accessor naming a key's sources, for a failing test
+Reader::block_cache_kinds	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::block_cache_layout	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::refill_forms	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::block_cache_size	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::cache_bindings	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::cache_growths	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::auto_cache_bytes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::forms_tables_complete	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::block_cache_bytes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::block_cache_largest	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::block_cache_wide	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::memory_census	-	the census the suite prints after a pass, never inside one
+Reader::count	work
+Reader::unsealed_keys	-	introspection for tests and the suite: walks the memtables once a call
+Reader::state_gen	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::levels	-	introspection for tests and the suite: the segments by level, once a call
+Reader::hold_seal_durable_from_handle	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::presync_hold_state	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::failed_presync_extent	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::fail_next_presync	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::hold_presync	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::lift_landing_holds_from_handle	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::hold_readable_landing_from_handle	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::dir_prefetches	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::options	-	the options a handle was opened with, no key
+Reader::reader	-	makes a handle, once a handle
+Db::cipher_counts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::restart_cipher_peak	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::drop_record_pages	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::create	-	makes a store, once a store
+Db::open	-	opens a store, once an open; its cost is reopen.rs's, not counted here
+Db::append	load_durable,load_buffered,work,merge
+Db::append_batch	load_durable,load_buffered,commit_durable,commit_buffered
+Db::put	work,land
+Db::delete	work
+Db::begin	-	a transaction's handle: Txn's writes are append, put and delete, counted
+Db::commit	load_durable,load_buffered,commit_durable,commit_buffered,work,merge,land
+Db::seal	merge,land
+Db::settle	work,merge,land
+Db::sync	load_durable,load_buffered,work
+Db::flush	merge
+Db::checkpoint	-	links a checkpoint, once a call, no key
+Db::forms_rebased	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::forms_recut	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::frozen_sorts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::snapshot_builds	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::snapshots_stood	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::same_blocks_asked	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::snapshot_extends	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::snapshot_refreshes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::form_takes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::canonical_tries	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::blocks_built	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::forms_events	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::forms_walks	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::build_kinds	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::wide_walks	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::copy_starts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::seek_seeds	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hot_starts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::sweep_shortcuts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::sweep_walks	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::prefetch_paces	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::settle_density	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::settle_refusals	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::settle_built	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::settle_built_listed	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::settle_shed	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::settle_sheds_declined	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::span_starts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::start_cache_counts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::lazy_cuts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::seeks_planned	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::patch_asks	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::settle_ahead_asks	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::dir_prefetches	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::scan_phases	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::reader_scans	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::forms_position	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::retired_states	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::phase_ns	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::seal_waits	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::tail_swaps	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::table_handed	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::frozen_tables	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::release_seal_landing_after	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::put_segment_work_err	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::release_seal_landing_once_taken	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::release_seal_durable_after	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::promotions	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::zpage_left_seals	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::zpage_left_seals_held	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::zpage_leave_seals	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::zpage_stride_nos	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::zpage_stride_foot	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::segments	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hold_seal_durable	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fail_next_seal_dir_sync	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fail_next_seal_sync	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::trace_dir_io	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::trace_slot_descriptors	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::open_synced_files	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::seal_sync_fault_pending	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::merge_waits_at_landing	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fail_next_wal_write	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fail_next_wal_seal	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fail_next_wal_cut	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fail_next_wal_sync	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::trace_wal_syncs	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::wal_syncs_traced	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hold_owed_slot	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::owed_slots_held	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::tear_next_slot_write	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fail_next_slot_sync	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::watch_slot_writes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fail_next_loose_wal_sync	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fail_next_wal_dir_sync	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fail_next_dir_guard	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::dir_guards	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::is_guarded	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fail_next_dir_barrier	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fail_next_landing	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fail_next_run_write	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fail_next_run_write_partial	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fail_next_run_writes_twice	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::short_next_run_write	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fail_next_run_sync	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::run_synced_bytes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::run_device_synced	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::run_written_and_held	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::run_attends	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::seals_wedged	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hold_seal_landing	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hold_readable_landing	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hold_forms_position	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::pause_segment_work	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::emulate_unraised_deletes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::panic_segment_work	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hold_merge_landing	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hold_merge_start	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::plan_joins_merge	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::merge_plan_joining	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::merges_in_flight	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::forms_short	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::trimmer_started	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::in_flight	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::wal_unsynced	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::wal_durable	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::wal_ahead_counts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::wal_join_ahead	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fail_next_wal_zeroing	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::runs_unsynced	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::run_names_unsynced	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::crash	-	a test seam: drops the store as a crash would
+Db::close	-	closes a store, once a store
+Db::zpages_settle	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::zpages_settle_with	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fail_next_zpage_build	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::forms_off_counts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::forms_off_stale_exits	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::zpages_convert_ask	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::zpages_redrop_owe	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::zgate_set	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hold_zpage_build	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hold_zpage_rename	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hold_zpage_after_settle	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::zpage_build_waiting	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::zpage_last_reject	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::zpage_form_files	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::maint_cpu_us	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::ahead_cold	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fill_deferred	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fill_owed_due	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::pass_steps	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::convert_us	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::ord_rebuilt	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::heads_owned_counts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::writes_since_scan	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::heads_retired_waiting	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::memory_census	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::manifest_seq	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::run_remaps	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::stream_recycled	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::direct_runs	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::forms_cloned	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hold_upkeep_pass	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hold_upkeep_pinned	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::upkeep_holding	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hold_landing_swap	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::landing_holding	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::look_after_a_landing	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::tables_landed	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::upkeep_abandons	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::upkeep_abandons_pinned	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::upkeep_outran	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::upkeep_abandon_state	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::upkeep_behind_writes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::upkeep_counts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::settle_keeper	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::trim_supported	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::resident_beyond_use	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::mapped_bytes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::job_buffers_mapped	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::memo_cells_taken	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::mapped_resident_bytes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::trim_held_bytes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::trim_now	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hold_trim	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::release_trim_after	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::snapshot_switches	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::seal_snapshots	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::seal_table_snapshots	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::snapshot_kept	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Blob::open	-	opens a segment, once a file
+Blob::open_with	-	opens a segment, once a file
+Blob::source	-	an accessor of the byte source, no key
+Blob::index_checksummed	-	read once an open
+Blob::index_offset	-	read once an open
+Blob::decodes	-	a counter
+Blob::keys	-	a count read once an open
+Blob::index_bytes	-	a size read once an open
+Blob::block_table_bytes	-	a size read once an open
+Blob::blocks	-	a count read once an open
+Blob::version	-	the format version, read once an open
+Blob::payload_bytes	-	a size read once an open
+Blob::advise_random	-	advice, once a mode change
+Blob::advise_normal	-	advice, once a mode change
+Blob::advise_dontneed	-	advice, once a drop
+Blob::zero_copy	-	whether the source lends, read once an open
+Blob::lookup	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
+Blob::lookup_full	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
+Blob::with_lookup	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
+Blob::exts_at_full	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
+Blob::seek	scan_at
+Blob::prefetch_ranks	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
+Blob::willneed_ranks	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
+Blob::willneed_dir	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
+Blob::willneed_at	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
+Blob::willneed_span	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
+Blob::open_ahead	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
+Blob::record_offset	-	a fact a form file's build or the controller reads, once a build or a sample
+Blob::drop_records	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
+Blob::prefetch_dir	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
+Blob::prefetch_ranks_est	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
+Blob::record_regions	-	a fact a form file's build or the controller reads, once a build or a sample
+Blob::record_pieces	-	a fact a form file's build or the controller reads, once a build or a sample
+Blob::record_region_bytes	-	a fact a form file's build or the controller reads, once a build or a sample
+Blob::record_region_span	-	a fact a form file's build or the controller reads, once a build or a sample
+Blob::record_region_place	-	a fact a form file's build or the controller reads, once a build or a sample
+Blob::raw_read_span	-	a fact a form file's build or the controller reads, once a build or a sample
+Blob::hash_region_bytes	-	a fact a form file's build or the controller reads, once a build or a sample
+Blob::z_records_len	-	a fact a form file's build or the controller reads, once a build or a sample
+Blob::z_source_facts	-	a fact a form file's build or the controller reads, once a build or a sample
+Blob::key_at	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
+Blob::exts_at	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
+Blob::values_at	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
+Blob::ranges_for	-	the browser's plan of a read's ranges; the wasm reader's path, not a plain store's operation
+Blob::ranges_for_many	-	the browser's plan of a read's ranges; not a plain store's operation
+Blob::ranges_for_exts	-	the browser's plan; not a plain store's operation
+Blob::block_extents	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
+Blob::read_all	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
+Blob::read_all_hashed	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
+Blob::lookup_hashed	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
+Blob::prefetch_slot	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
+Blob::read_all_by_value	-	a pricing arm's read, supdb-extsval, no probe counts it
+Blob::read_exts	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
+Blob::read_exts_inline	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
+Blob::read_concat	-	a caller's read into one buffer, no probe counts it (a gap)
+Blob::intersect_fixed	-	a caller's query over fixed runs, no probe counts it (a gap)
+Blob::count	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
+Blob::count_hashed	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
+Blob::stored_bytes	-	a size, no key
+Blob::count_fixed	-	a caller's count over fixed runs, no probe counts it (a gap)
+Blob::scan_counts	-	a caller's walk of counts, held to SparseBlob by tests/dict.rs, no probe counts it (a gap)
+Blob::scan_counts_fixed	-	a caller's walk of counts, no probe counts it (a gap)
+Blob::prefetch_scan	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
+Blob::scan	-	seek and scan_at, one call each, which the scan_at probe counts
+Blob::scan_at	scan_at
+Blob::scan_at_paced	-	the engine's paced walk out of core, a store in core does not take it
+Blob::run_walk	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
