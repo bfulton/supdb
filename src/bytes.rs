@@ -98,6 +98,17 @@ pub trait Bytes {
         false
     }
 
+    /// Whether every byte this source lends has passed a check of the
+    /// source's own -- an authenticating cipher's tag over the chunk it
+    /// lies in -- before it is lent. A reader skips the checks of its own
+    /// that such a source makes redundant where making them would ask for
+    /// a section whole (`Blob::open`'s key section row, over a source that
+    /// lends by the piece), and makes them over any other source. `false`
+    /// is always a correct answer.
+    fn authenticated(&self) -> bool {
+        false
+    }
+
     /// Whether a reader that has not been told has to ask `piecewise` of a
     /// source of this type. Every type says yes but the mapped file, whose
     /// kind that lends by the piece is made by the engine alone
@@ -499,6 +510,12 @@ impl Bytes for MmapBytes {
     }
     fn piecewise(&self) -> bool {
         matches!(self.own, Own::Paged(_))
+    }
+    /// A paged mapping lends what its pager has decrypted, and the pager
+    /// lends no chunk whose tag it has not checked; a mapped file checks
+    /// nothing.
+    fn authenticated(&self) -> bool {
+        self.map().is_none()
     }
     const ASK_PIECES: bool = false;
     fn piece_end(&self, off: u64) -> u64 {

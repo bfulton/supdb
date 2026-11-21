@@ -550,6 +550,30 @@ fn not_lent<B: Bytes>(src: &B, off: u64, len: usize) -> Error {
     short(off, len, src.len())
 }
 
+/// The open's verification of a key section held by the piece
+/// (`Blob::open_with`): nothing where the source has checked every byte it
+/// lends (`Bytes::authenticated`), since verifying would ask for the
+/// section whole at every open -- under a cipher that is the section
+/// decrypted, which the open is not to pay -- and otherwise the row
+/// against every piece, each asked for on its own
+/// (`flatindex::verify_pieces_in`). Out of line and cold, so that the open
+/// of a section held whole names no second walk.
+#[cold]
+#[inline(never)]
+fn verify_row_by_piece<B: Bytes>(
+    src: &B,
+    sec: Pieces<'_, B>,
+    crc_off: usize,
+    shift: u32,
+    base: u64,
+) -> Result<()> {
+    if src.authenticated() {
+        return Ok(());
+    }
+    flatindex::verify_pieces_in(sec, crc_off, shift, base)
+        .map_err(|p| corrupt(&format!("key index checksum mismatch in piece {p}")))
+}
+
 /// Everything `Blob::open` and `SparseBlob::open` check before either reads
 /// a section: the byte order this reader can address, the superblock, and
 /// the redo-log emptiness probe. One function so the two opens cannot
@@ -1034,43 +1058,49 @@ impl<B: Bytes> Blob<B> {
         // once, and no read path pays anything after.
         let mut open_ahead = (0u64, 0u64);
         // A section held by the piece is not asked for whole, here or
-        // anywhere: the row is not checked, and what such a source lends
-        // has passed the source's own check, which is what makes it one
-        // to hold so.
-        if idx.crc_off != 0 && opts.verify_index && key.pieces(&src).is_none() {
-            let sec = key.get(&src)?;
-            // The walk asked ahead of itself where the option says so: the
-            // frontier of asked bytes over the section, moved a window at a
-            // time as the pieces come within half a window of it, each
-            // window only where its first page is not resident.
-            let window = opts.read_ahead as u64;
-            let (mut asked_to, end) = (sb.key_off, sb.key_off.saturating_add(sec.len() as u64));
-            let verdict = flatindex::verify_pieces_with(
-                sec,
-                idx.crc_off,
-                idx.piece_shift,
-                sb.key_off,
-                |a, _| {
-                    if window == 0 {
-                        return;
-                    }
-                    let off = sb.key_off.saturating_add(a as u64);
-                    if let Some((from, to)) = ahead_span(asked_to, end, off, window) {
-                        asked_to = to;
-                        if src.resident_at(from) != Some(true) {
-                            let n = src.advise_willneed(from, (to - from) as usize);
-                            if n > 0 {
-                                open_ahead.0 += 1;
-                                open_ahead.1 += n as u64;
+        // anywhere: its row is verified a piece an ask where the source
+        // has not checked what it lends, and skipped where it has
+        // (`verify_row_by_piece`).
+        if idx.crc_off != 0 && opts.verify_index {
+            match key.pieces(&src) {
+                Some(p) => verify_row_by_piece(&src, p, idx.crc_off, idx.piece_shift, sb.key_off)?,
+                None => {
+                    let sec = key.get(&src)?;
+                    // The walk asked ahead of itself where the option says so: the
+                    // frontier of asked bytes over the section, moved a window at a
+                    // time as the pieces come within half a window of it, each
+                    // window only where its first page is not resident.
+                    let window = opts.read_ahead as u64;
+                    let (mut asked_to, end) =
+                        (sb.key_off, sb.key_off.saturating_add(sec.len() as u64));
+                    let verdict = flatindex::verify_pieces_with(
+                        sec,
+                        idx.crc_off,
+                        idx.piece_shift,
+                        sb.key_off,
+                        |a, _| {
+                            if window == 0 {
+                                return;
                             }
-                        }
+                            let off = sb.key_off.saturating_add(a as u64);
+                            if let Some((from, to)) = ahead_span(asked_to, end, off, window) {
+                                asked_to = to;
+                                if src.resident_at(from) != Some(true) {
+                                    let n = src.advise_willneed(from, (to - from) as usize);
+                                    if n > 0 {
+                                        open_ahead.0 += 1;
+                                        open_ahead.1 += n as u64;
+                                    }
+                                }
+                            }
+                        },
+                    );
+                    if let Err(p) = verdict {
+                        return Err(corrupt(&format!(
+                            "key index checksum mismatch in piece {p}"
+                        )));
                     }
-                },
-            );
-            if let Err(p) = verdict {
-                return Err(corrupt(&format!(
-                    "key index checksum mismatch in piece {p}"
-                )));
+                }
             }
         }
         let blocks = match blk.pieces(&src) {

@@ -382,6 +382,34 @@ pub fn verify_pieces_with(
     Ok(())
 }
 
+/// `verify_pieces` over a section of any kind (`Sect`): each piece asked
+/// for on its own, and the row once, so a section by the piece is never
+/// asked for whole. `Err(piece)` names the first mismatch or a piece the
+/// section does not lend; `Err(usize::MAX)` a row it does not lend. The row
+/// holds a word for every piece by its length, so each piece is held to
+/// its word as the two are walked together.
+pub fn verify_pieces_in<'a, S: Sect<'a>>(
+    sec: S,
+    crc_off: usize,
+    shift: u32,
+    base: u64,
+) -> std::result::Result<(), usize> {
+    let n = checksum_row_len(crc_off, shift, base);
+    let row = sec
+        .range(crc_off, crc_off.saturating_add(n))
+        .ok_or(usize::MAX)?;
+    for (i, ((a, b), word)) in pieces(crc_off, shift, base)
+        .zip(row.chunks_exact(4))
+        .enumerate()
+    {
+        let got = sec.range(a, b).ok_or(i)?;
+        if crate::block::crc32(got).to_le_bytes()[..] != *word {
+            return Err(i);
+        }
+    }
+    Ok(())
+}
+
 /// Where the fence lies in a section of `sec_len` bytes: from its offset
 /// array to the start of whichever region comes next, or the section end.
 /// `(0, 0)` for a section without a fence. Both writers put the fence

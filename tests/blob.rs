@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 use supdb::bytes::{Bytes, MmapBytes, VecBytes};
 use supdb::SegmentWriter;
-use supdb::{Blob, SegmentOptions};
+use supdb::{Blob, BlobOptions, SegmentOptions};
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-blobtest-{name}"));
@@ -204,16 +204,23 @@ type Lent = std::collections::HashMap<(u64, usize), Box<[u64]>>;
 /// been there in a mapping, so a reader that agrees with the mapped one
 /// through this source has asked for every byte it read. It counts what it
 /// was asked for, since a reader that asked for its sections whole would
-/// agree as well.
+/// agree as well. It checks nothing of what it lends unless it is made
+/// `checked`, where it answers `authenticated` as a paged mapping does.
 struct Piecewise {
     bytes: Vec<u8>,
     piece: u64,
+    checks: bool,
+    /// A byte no range that holds it is lent past (`Piecewise::refusing`),
+    /// as a source refuses a range it cannot read.
+    refuse: Option<u64>,
     /// What has been lent, by the range asked for: a range asked for again
     /// is lent from the copy made for it the first time, since every copy
     /// stands for as long as the source does and a walk asks for the same
     /// windows many times over.
     lent: std::sync::Mutex<Lent>,
     asked: std::sync::atomic::AtomicU64,
+    /// The longest range asked for in one `slice_at`.
+    longest: std::sync::atomic::AtomicU64,
 }
 
 impl Piecewise {
@@ -221,13 +228,36 @@ impl Piecewise {
         Piecewise {
             bytes,
             piece,
+            checks: false,
+            refuse: None,
             lent: std::sync::Mutex::new(std::collections::HashMap::new()),
             asked: std::sync::atomic::AtomicU64::new(0),
+            longest: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// One that says it has checked what it lends (`Bytes::authenticated`).
+    fn checked(bytes: Vec<u8>, piece: u64) -> Piecewise {
+        Piecewise {
+            checks: true,
+            ..Piecewise::new(bytes, piece)
+        }
+    }
+
+    /// One that checks nothing and lends no range that holds byte `at`.
+    fn refusing(bytes: Vec<u8>, piece: u64, at: u64) -> Piecewise {
+        Piecewise {
+            refuse: Some(at),
+            ..Piecewise::new(bytes, piece)
         }
     }
 
     fn asked(&self) -> u64 {
         self.asked.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn longest(&self) -> u64 {
+        self.longest.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -240,11 +270,13 @@ impl Bytes for Piecewise {
     }
     fn slice_at(&self, off: u64, len: usize) -> Option<&[u8]> {
         let end = off.checked_add(len as u64)?;
-        if end > self.len() {
+        if end > self.len() || self.refuse.is_some_and(|r| off <= r && r < end) {
             return None;
         }
         self.asked
             .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+        self.longest
+            .fetch_max(len as u64, std::sync::atomic::Ordering::Relaxed);
         let phase = (off % 8) as usize;
         let mut lent = self.lent.lock().unwrap();
         let buf = lent.entry((off, len)).or_insert_with(|| {
@@ -267,6 +299,9 @@ impl Bytes for Piecewise {
     }
     fn piecewise(&self) -> bool {
         true
+    }
+    fn authenticated(&self) -> bool {
+        self.checks
     }
     fn piece_end(&self, off: u64) -> u64 {
         ((off / self.piece + 1) * self.piece).min(self.len())
@@ -366,7 +401,12 @@ fn a_source_that_lends_by_the_piece_answers_the_same() {
         let raw = std::fs::read(&path).unwrap();
         let mapped = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
         for piece in [24, 64, 4080, 1 << 16] {
-            let blob = Blob::open(Piecewise::new(raw.clone(), piece)).expect("open by the piece");
+            // A source that has checked what it lends, as a paged mapping
+            // has: one that has not has its row verified at the open,
+            // which asks for the section a piece at a time
+            // (`a_source_by_the_piece_that_checks_nothing_has_its_row_verified_at_open`).
+            let blob =
+                Blob::open(Piecewise::checked(raw.clone(), piece)).expect("open by the piece");
             assert!(blob.zero_copy(), "{name}: a piece lent is not a copy");
             let at_open = blob_source(&blob).asked();
             assert!(
@@ -397,6 +437,302 @@ fn a_source_that_lends_by_the_piece_answers_the_same() {
 /// The source a reader was opened over.
 fn blob_source<B: Bytes>(blob: &Blob<B>) -> &B {
     blob.source()
+}
+
+/// A key section's checksum row is the one check of its records a reader
+/// makes, and the open is where a reader that holds the section whole makes
+/// it. A source that lends by the piece is not asked for its section whole
+/// at the open, which is what its kind is for; where it has checked what it
+/// lends itself (`Bytes::authenticated`, a paged mapping's tag over every
+/// chunk) the row is skipped, and where it has not the row is verified
+/// there all the same, a piece an ask: a flipped byte of the records with
+/// the block checksums whole fails that open, as it fails a mapped file's,
+/// and opens over a source that says it checked it.
+#[test]
+fn a_source_by_the_piece_that_checks_nothing_has_its_row_verified_at_open() {
+    let path = scratch("piecewise-unchecked-row");
+    build_opts(&path, 3000, false, 256, false);
+    let clean = std::fs::read(&path).unwrap();
+    let mapped = MmapBytes::open(&path).unwrap();
+    assert!(!mapped.authenticated(), "a mapped file checks nothing");
+    let empty = path.with_file_name("empty");
+    std::fs::write(&empty, b"").unwrap();
+    assert!(
+        !MmapBytes::open(&empty).unwrap().authenticated(),
+        "an empty mapped file checks nothing either"
+    );
+    assert!(!VecBytes(Vec::new()).authenticated());
+    assert!(!Piecewise::new(Vec::new(), 64).authenticated());
+    assert!(Advised::new(Piecewise::checked(Vec::new(), 64)).authenticated());
+    let (key_off, key_len) = {
+        let b = Blob::open(mapped).expect("blob open");
+        assert!(b.index_checksummed(), "a segment's index carries a row");
+        (b.index_offset() as usize, b.index_bytes())
+    };
+    let piece = 1usize << supdb::flatindex::PIECE_SHIFT;
+    assert!(
+        key_len > 4 * piece,
+        "the fixture's key section spans several pieces: {key_len}"
+    );
+    // The pieces are cut at the file's offsets, not the section's: a
+    // section that began on a piece would read the same either way.
+    assert_ne!(
+        key_off % piece,
+        0,
+        "the key section starts off a piece boundary"
+    );
+    let crc_off = supdb::flatindex::Header::parse(&clean[key_off..key_off + key_len])
+        .expect("the section's header")
+        .crc_off;
+    assert!(crc_off > 0 && crc_off < key_len);
+    let off_verify = BlobOptions {
+        verify_index: false,
+        ..BlobOptions::default()
+    };
+    let mut tried = 0;
+    for i in 1..13 {
+        let at = key_off + i * key_len / 13;
+        let mut bytes = clean.clone();
+        bytes[at] ^= 0x40;
+        tried += 1;
+        let whole = refusal(Blob::open(VecBytes(bytes.clone())));
+        assert!(
+            whole.is_some(),
+            "a flip at section offset {} opened whole",
+            at - key_off
+        );
+        assert_eq!(
+            refusal(Blob::open(Piecewise::new(bytes.clone(), 4080))),
+            whole,
+            "a flip at section offset {} opened over a source by the piece that checks nothing, \
+             or was refused for another piece",
+            at - key_off
+        );
+        assert!(
+            Blob::open(Piecewise::checked(bytes.clone(), 4080)).is_ok(),
+            "a flip at section offset {} was checked over a source that checked it",
+            at - key_off
+        );
+        // A wrapper says what the source it wraps says.
+        assert!(
+            Blob::open(Advised::new(Piecewise::checked(bytes.clone(), 4080))).is_ok(),
+            "a flip at section offset {} was checked through a wrapper of a source that checked it",
+            at - key_off
+        );
+        // With the row's verification off, nothing checks it.
+        assert!(
+            Blob::open_with(VecBytes(bytes.clone()), off_verify).is_ok()
+                && Blob::open_with(Piecewise::new(bytes, 4080), off_verify).is_ok(),
+            "a flip at section offset {} was checked with the row's verification off",
+            at - key_off
+        );
+    }
+    assert_eq!(tried, 12);
+    // Every piece's compare is reached, the first and the last above all:
+    // a byte of each, its last, flipped, the whole reader's refusal naming
+    // that piece and the reader by the piece's the same. The first piece is
+    // short, the section not starting on a piece, and its last byte lies
+    // past the header, so the refusal is the row's; the last piece's last
+    // byte is the one before the row.
+    let shift = supdb::flatindex::Header::parse(&clean[key_off..key_off + key_len])
+        .expect("the section's header")
+        .piece_shift;
+    let cut: Vec<(usize, usize)> =
+        supdb::flatindex::pieces(crc_off, shift, key_off as u64).collect();
+    assert!(cut.len() > 4, "the fixture spans several pieces");
+    assert!(
+        cut[0].1 < piece && cut[0].1 > supdb::flatindex::HEADER_BYTES,
+        "the first piece is short and holds bytes past the header: {:?}",
+        cut[0]
+    );
+    assert_eq!(
+        cut[cut.len() - 1].1,
+        crc_off,
+        "the last piece ends at the row"
+    );
+    for (p, &(_, end)) in cut.iter().enumerate() {
+        let mut bytes = clean.clone();
+        bytes[key_off + end - 1] ^= 0x40;
+        let whole = refusal(Blob::open(VecBytes(bytes.clone())));
+        assert!(
+            whole
+                .as_deref()
+                .is_some_and(|m| m.ends_with(&format!("mismatch in piece {p}"))),
+            "a flip at the end of piece {p} is refused by the whole reader for it: {whole:?}"
+        );
+        assert_eq!(
+            refusal(Blob::open(Piecewise::new(bytes, 4080))),
+            whole,
+            "a flip at the end of piece {p} of {} opened over a source by the piece \
+             that checks nothing, or was refused for another piece",
+            cut.len()
+        );
+    }
+    // A piece or the row the source will not lend fails the open, and is
+    // not asked for at an open that verifies nothing.
+    // The piece a byte of the section lies in, cut at the file's offsets.
+    let first = piece - key_off % piece;
+    let piece_of = |x: usize| {
+        if x < first {
+            0
+        } else {
+            1 + (x - first) / piece
+        }
+    };
+    for (what, at, names) in [
+        (
+            "a piece of the records",
+            key_off + key_len / 2,
+            Some(piece_of(key_len / 2)),
+        ),
+        ("the row", key_off + crc_off + 1, None),
+    ] {
+        let said = refusal(Blob::open(Piecewise::refusing(
+            clean.clone(),
+            4080,
+            at as u64,
+        )));
+        assert!(said.is_some(), "{what} not lent opened");
+        if let Some(p) = names {
+            assert!(
+                said.as_deref()
+                    .is_some_and(|m| m.ends_with(&format!("piece {p}"))),
+                "{what} not lent: {said:?}, not piece {p}"
+            );
+        }
+        assert!(
+            Blob::open_with(
+                Piecewise::refusing(clean.clone(), 4080, at as u64),
+                off_verify
+            )
+            .is_ok(),
+            "{what}: the refusal is the verification's"
+        );
+    }
+    // The clean file opens over both, and the one that checks nothing is
+    // asked for every byte of its section, no more than a piece an ask.
+    let unchecked = Blob::open(Piecewise::new(clean.clone(), 4080)).expect("clean open");
+    let (asked, longest) = (
+        blob_source(&unchecked).asked(),
+        blob_source(&unchecked).longest(),
+    );
+    assert!(
+        asked as usize >= key_len - 4 * key_len.div_ceil(piece) && longest as usize <= piece,
+        "the row's verification asked for {asked} bytes of a section of {key_len}, \
+         {longest} at most in one ask"
+    );
+    let checked = Blob::open(Piecewise::checked(clean.clone(), 4080)).expect("clean open");
+    assert!(blob_source(&checked).asked() < 4096);
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+/// What an open's refusal said, or `None` where it opened.
+fn refusal<B: Bytes, E: std::fmt::Display>(open: Result<Blob<B>, E>) -> Option<String> {
+    open.err().map(|e| e.to_string())
+}
+
+/// The row's word is held whole: a change to a piece whose CRC32C differs
+/// from the row's word in its top byte alone is refused over a source by
+/// the piece that checks nothing, as over a whole one. A flip of one byte
+/// changes every byte of the CRC but by a chance of one in sixteen
+/// million, so the flips of the test above cannot tell a compare of three
+/// bytes from one of four; this change is forged for it, from the CRC's
+/// linearity: a set of bits of one piece whose deltas cancel in the low
+/// three bytes.
+#[test]
+fn a_piece_whose_crc_moves_in_its_top_byte_alone_is_refused_by_the_piece() {
+    let path = scratch("piecewise-top-byte");
+    build_opts(&path, 3000, false, 256, false);
+    let clean = std::fs::read(&path).unwrap();
+    let (key_off, key_len) = {
+        let b = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
+        (b.index_offset() as usize, b.index_bytes())
+    };
+    let hdr = supdb::flatindex::Header::parse(&clean[key_off..key_off + key_len])
+        .expect("the section's header");
+    let pieces: Vec<(usize, usize)> =
+        supdb::flatindex::pieces(hdr.crc_off, hdr.piece_shift, key_off as u64).collect();
+    assert!(pieces.len() > 4, "the fixture spans several pieces");
+    let (a, b) = pieces[pieces.len() / 2];
+    // The CRC's change for one bit flipped at byte `p` of the piece, `bit`
+    // of it: the register's linear part from that byte to the piece's end.
+    let len = b - a;
+    let delta = |p: usize, bit: u32| {
+        let mut c = 1u32 << bit;
+        for _ in 0..8 * (len - p) {
+            c = if c & 1 != 0 {
+                (c >> 1) ^ 0x82F6_3B78
+            } else {
+                c >> 1
+            };
+        }
+        c
+    };
+    // Gaussian elimination over the low 24 bits of the last eight bytes'
+    // sixty-four bits: the first combination that cancels there and not
+    // in the top byte.
+    let mut basis: Vec<(u32, u64)> = Vec::new();
+    let mut found = None;
+    for j in 0..64u32 {
+        let (p, bit) = (len - 8 + (j / 8) as usize, j % 8);
+        let d = delta(p, bit);
+        let (mut low, mut mask) = (d & 0xFF_FFFF, 1u64 << j);
+        for &(bl, bm) in &basis {
+            if low ^ bl < low {
+                low ^= bl;
+                mask ^= bm;
+            }
+        }
+        if low == 0 {
+            let full = (0..64)
+                .filter(|k| mask >> k & 1 != 0)
+                .fold(0, |x, k| x ^ delta(len - 8 + (k / 8) as usize, k % 8));
+            if full >> 24 != 0 {
+                found = Some(mask);
+                break;
+            }
+            continue;
+        }
+        basis.push((low, mask));
+        basis.sort_by_key(|x| std::cmp::Reverse(x.0));
+    }
+    let mask = found.expect("a combination of bits that cancels in the low three bytes");
+    let mut bytes = clean.clone();
+    for k in (0..64).filter(|k| mask >> k & 1 != 0) {
+        bytes[key_off + a + len - 8 + (k / 8) as usize] ^= 1 << (k % 8);
+    }
+    let crc = |s: &[u8]| {
+        let mut c = !0u32;
+        for &x in s {
+            c ^= u32::from(x);
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    (c >> 1) ^ 0x82F6_3B78
+                } else {
+                    c >> 1
+                };
+            }
+        }
+        !c
+    };
+    let moved = crc(&clean[key_off + a..key_off + b]) ^ crc(&bytes[key_off + a..key_off + b]);
+    assert!(
+        moved & 0xFF_FFFF == 0 && moved != 0,
+        "the forged change moves the piece's CRC in its top byte alone: {moved:#010x}"
+    );
+    let whole = refusal(Blob::open(VecBytes(bytes.clone())));
+    assert!(
+        whole
+            .as_deref()
+            .is_some_and(|m| m.ends_with(&format!("piece {}", pieces.len() / 2))),
+        "the whole reader refuses the forged piece: {whole:?}"
+    );
+    assert_eq!(
+        refusal(Blob::open(Piecewise::new(bytes, 4080))),
+        whole,
+        "the forged piece opened over a source by the piece that checks nothing"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 
 /// An advice a reader gave its source, by its kind and its range.
@@ -449,6 +785,9 @@ impl<B: Bytes> Bytes for Advised<B> {
     }
     fn piecewise(&self) -> bool {
         self.inner.piecewise()
+    }
+    fn authenticated(&self) -> bool {
+        self.inner.authenticated()
     }
     fn piece_end(&self, off: u64) -> u64 {
         self.inner.piece_end(off)
