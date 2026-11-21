@@ -6041,14 +6041,17 @@ in the suite's figures, at `full` scale where it says so:
 - The memos of decoded groups keep their memory after their readers
   end, in arenas the allocator does not return, and where the block form
   misses its fit by that much the store faults for it: ten million random
-  ids under 1 GiB, the scrambled E mix at 0.68x and 0.76x of LMDB. The
+  ids under 1 GiB, where the scrambled E mix read 0.68x and 0.76x of LMDB
+  while the bounds walk still read a record a boundary, and reads 1.06x
+  and 1.22x with the heads placing them (`Options::bounds_by_heads`). The
   memos in slabs (`Options::zpages_memo_slab`) return it, the scrambled
-  mixes 1.19x to 1.85x there, and are off: over numbered keys at the same
-  bound the slab has nothing to return, and the hot-raw policy's one
-  release, asked into memory that stands unused at a look, is never
-  asked under it. What is owed before the default: that policy's room
-  drawn from something the slab does not move, six reps a sitting over
-  numbered keys at both ten-million bounds, the quick row and the gate.
+  mixes 1.19x to 1.85x there before the heads, and are off: over numbered
+  keys at the same bound the slab has nothing to return, and the hot-raw
+  policy's one release, asked into memory that stands unused at a look,
+  is never asked under it. What is owed before the default: that
+  policy's room drawn from something the slab does not move, the slab
+  priced again beside the heads, six reps a sitting over numbered keys
+  at both ten-million bounds, the quick row and the gate.
 - Keys the stride form does not hold are served by the block form
   wherever the sparse stride form does not fit, a hundred and eight bytes
   a key against eighty-five, and the block form's scans are a decode a
