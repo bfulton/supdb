@@ -4950,8 +4950,8 @@ pub struct Options {
     /// merge running beside their reads (`docs/engine.md`, keys that are
     /// no run of numbers); in a stretch nobody reads, the third merge's
     /// device and CPU are no reader's. A merge started under the room
-    /// runs to its landing whatever comes after it. Zero is the shape
-    /// before: `supdb-boundsleanquiet3` sets three. The room rises only
+    /// runs to its landing whatever comes after it. Three; zero is the
+    /// shape before, `supdb-quiet0`. The room rises only
     /// where the compact form is installed (`zselect::GATE_Z`), the store
     /// out of core by the controller's verdict, unless
     /// `merge_quiet_any_gate` says otherwise.
@@ -4968,7 +4968,7 @@ pub struct Options {
     /// 10-58 ms of a pass of 36-88, and it read 0.69x and 0.74x in one
     /// pairing and 0.64x and 1.62x in the next, nothing the merges reach.
     /// So the room is kept to where the debt it retires is a device's:
-    /// `supdb-boundsleanquiet3any` is the arm at any gate.
+    /// `supdb-quietany` is the arm at any gate.
     #[doc(hidden)]
     pub merge_quiet_any_gate: bool,
     /// Under `merge_chains`, a merge's landing plans the next merge out of
@@ -5055,8 +5055,9 @@ pub struct Options {
     /// not published, the tables frozen behind it stood with their
     /// snapshot copies, and the group killed the process in the full
     /// rewrite (`docs/engine.md`, keys that are no run of numbers). The
-    /// bounds are the same vector either way. Off, the record at every
-    /// boundary: `supdb-boundsheads` and `supdb-boundslean` turn it on.
+    /// bounds are the same vector either way. On; off, the record at every
+    /// boundary: `supdb-boundsbyrecord`, and `supdb-boundsold` with the
+    /// landing's walks.
     #[doc(hidden)]
     pub bounds_by_heads: bool,
     /// A landing takes its pieces' bounds before its publish
@@ -5067,8 +5068,8 @@ pub struct Options {
     /// of core, its faults, for nobody. A handle claimed later, or the
     /// writer taking its forms back, walks the bounds its tables need as
     /// a reader far from the landing always has (`BuildCtx::table_bounds`).
-    /// Off, every landing near reads walks them: `supdb-landboundsread`
-    /// and `supdb-boundslean` turn it on.
+    /// On; off, every landing near reads walks them:
+    /// `supdb-landboundsalways`, and `supdb-boundsold` with the records.
     #[doc(hidden)]
     pub land_bounds_read: bool,
     /// A seal writes a key whose chain holds one value and no tombstone
@@ -6909,13 +6910,13 @@ impl Default for Options {
             merge_plan_idle: true,
             merge_bytes_cap: 64 << 20,
             merge_parallel: 2,
-            merge_parallel_quiet: 0,
+            merge_parallel_quiet: 3,
             merge_quiet_any_gate: false,
             boundary_keys_from_top: false,
             pieces_dir_willneed: true,
             bounds_heads_willneed: true,
-            bounds_by_heads: false,
-            land_bounds_read: false,
+            bounds_by_heads: true,
+            land_bounds_read: true,
             seal_put_one: true,
             close_presync: true,
             ord_durable: false,

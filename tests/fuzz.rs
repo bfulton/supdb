@@ -330,15 +330,15 @@ struct Cfg {
     /// A bounds walk places a block boundary by its head
     /// (`Options::bounds_by_heads`) and a landing leaves its pieces' bounds
     /// where no table stands to read them (`Options::land_bounds_read`):
-    /// each on in half the seeds under `ZFUZZ_OPTVARY`, the side
-    /// generator's next two draws, and off otherwise, as the engine has
+    /// each off in half the seeds under `ZFUZZ_OPTVARY`, the side
+    /// generator's next two draws, and on otherwise, as the engine has
     /// them.
     bounds_heads: bool,
     land_bounds: bool,
     /// A third merge in flight while the writer's commits see no read
-    /// (`Options::merge_parallel_quiet` at three): in half the seeds under
-    /// `ZFUZZ_OPTVARY`, the side generator's next draw, and off otherwise,
-    /// as the engine has it.
+    /// (`Options::merge_parallel_quiet` at three): off in half the seeds
+    /// under `ZFUZZ_OPTVARY`, the side generator's next draw, and on
+    /// otherwise, as the engine has it.
     merge_quiet: bool,
     /// That room at any gate of the controller and not only where the
     /// compact form is installed (`Options::merge_quiet_any_gate`): in half
@@ -688,10 +688,10 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         },
         cursor_steps: vary && steps_on,
         stride_direct: vary && direct_on,
-        bounds_heads: vary && heads_on,
-        land_bounds: vary && land_on,
-        merge_quiet: vary && quiet_on,
-        merge_quiet_any: vary && quiet_on && quiet_any,
+        bounds_heads: !(vary && heads_on),
+        land_bounds: !(vary && land_on),
+        merge_quiet: !(vary && quiet_on),
+        merge_quiet_any: vary && !quiet_on && quiet_any,
         stride,
     }
 }
