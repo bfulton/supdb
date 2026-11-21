@@ -68,6 +68,9 @@ fn a_merge_planned_with_fences_a_landing_old_takes_the_partitions_standing_after
             // One merge in flight: the planner joins the held merge only
             // where it has no room for a second.
             merge_parallel: 1,
+            // No third merge in a write-only stretch: the room is the
+            // test's (`Options::merge_parallel_quiet`).
+            merge_parallel_quiet: 0,
             ..common::options()
         },
     )
@@ -860,6 +863,9 @@ fn a_store_read_with_no_merge_in_flight_plans_one_in_its_loop() {
                 // One merge in flight, so the second range waits for the
                 // held one's landing as the shape this is about does.
                 merge_parallel: 1,
+                // No third merge in a write-only stretch: the room is the
+                // test's (`Options::merge_parallel_quiet`).
+                merge_parallel_quiet: 0,
                 // The in-core shape: a landing chains without a scan where
                 // the gate is away from the raw form
                 // (`Options::merge_chains_writes`), as it is under the
@@ -991,6 +997,9 @@ fn a_merges_landing_plans_the_next_and_a_cap_lands_a_range_at_a_time() {
                 // two, the landing that finds the held merge running plans
                 // a second over the other range.
                 merge_parallel: 1,
+                // No third merge in a write-only stretch: the room is the
+                // test's (`Options::merge_parallel_quiet`).
+                merge_parallel_quiet: 0,
                 // The gate is the test's to set where it is not raw.
                 zpages: if gate == 0 {
                     supdb::ZPages::default()
@@ -1263,6 +1272,9 @@ fn a_second_merge_runs_beside_the_first_over_ranges_it_does_not_hold() {
             partition_bytes: Some(32 << 10),
             l0_trigger: 2,
             merge_parallel: par,
+            // No third merge in a write-only stretch: the room is the
+            // test's (`Options::merge_parallel_quiet`).
+            merge_parallel_quiet: 0,
             ..common::options()
         };
         let mut db = Db::create(&d, opts()).unwrap();
@@ -1399,6 +1411,9 @@ fn a_piece_cut_at_fences_a_re_cut_replaced_reads_older_than_the_pieces_after_it(
         // merge planned at a merge's landing: what plans is the seal the
         // test asks for.
         merge_parallel: 1,
+        // No third merge in a write-only stretch: the room is the
+        // test's (`Options::merge_parallel_quiet`).
+        merge_parallel_quiet: 0,
         promote: false,
         merge_chains: false,
         // The keys go to the memtable, not to a run of ordered ingest.
