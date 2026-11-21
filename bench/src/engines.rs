@@ -1714,6 +1714,10 @@ pub struct Supdb {
     /// them (`Options::land_bounds_read`): `supdb-landboundsread`; the
     /// engine's where `None`.
     landboundsread: Option<bool>,
+    /// The partition merges in flight at once (`Options::merge_parallel`):
+    /// three beside both bounds' options, `supdb-boundsleanmerge3`; the
+    /// engine's where `None`.
+    mergepar: Option<usize>,
     /// A sparse stride walk steps its key by the field
     /// (`Options::zpages_stride_step_direct`): `supdb-zsparsebuildstep`;
     /// the engine's where `None`.
@@ -2859,6 +2863,9 @@ struct Policy {
     /// `supdb`.
     boundsheads: Option<bool>,
     landboundsread: Option<bool>,
+    /// The partition merges in flight at once (`Options::merge_parallel`):
+    /// three beside both bounds' options, `supdb-boundsleanmerge3`.
+    mergepar: Option<usize>,
     /// A sparse stride form's walk writes the next key's field where it
     /// lies (`Options::zpages_stride_step_direct`):
     /// `supdb-zsparsebuildstep` beside `supdb-zsparsebuild`.
@@ -3180,6 +3187,7 @@ impl Default for Policy {
             zcursorsteps: None,
             boundsheads: None,
             landboundsread: None,
+            mergepar: None,
             zstridestep: None,
             jobsmapped: false,
             jobsshort: false,
@@ -4189,6 +4197,23 @@ impl Supdb {
             path,
             Policy {
                 landboundsread: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// Both of the bounds' options with three partition merges in flight
+    /// (`Options::merge_parallel`): `supdb-boundsleanmerge3`, beside
+    /// `supdb-boundslean`, whose two merges leave the chain running through
+    /// the pass after a full rewrite once the landings no longer stall the
+    /// writer.
+    pub fn create_bounds_lean_merge3(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                boundsheads: Some(true),
+                landboundsread: Some(true),
+                mergepar: Some(3),
                 ..Policy::default()
             },
         )
@@ -9477,6 +9502,7 @@ impl Supdb {
             zcursorsteps,
             boundsheads,
             landboundsread,
+            mergepar,
             zstridestep,
             jobsmapped,
             jobsshort,
@@ -9655,7 +9681,7 @@ impl Supdb {
             merge_parallel: if mergeone {
                 1
             } else {
-                supdb::Options::default().merge_parallel
+                mergepar.unwrap_or(supdb::Options::default().merge_parallel)
             },
             seal_floor_out_of_core: sealfloorooc,
             forms_fit_when_short: !nofitshort,
@@ -10433,6 +10459,7 @@ impl Supdb {
             zcursorsteps,
             boundsheads,
             landboundsread,
+            mergepar,
             zstridestep,
             jobsmapped,
             jobsshort,
@@ -10815,6 +10842,7 @@ impl Engine for Supdb {
             self.boundsheads == Some(true),
             self.landboundsread == Some(true),
         ) {
+            (true, true) if self.mergepar == Some(3) => return "supdb-boundsleanmerge3",
             (true, true) => return "supdb-boundslean",
             (true, false) => return "supdb-boundsheads",
             (false, true) => return "supdb-landboundsread",
@@ -13563,6 +13591,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-boundsheads"
         | "supdb-landboundsread"
         | "supdb-boundslean"
+        | "supdb-boundsleanmerge3"
         | "supdb-jobsmapped"
         | "supdb-zstridealldropagainjobs"
         | "supdb-zmemoslab"
@@ -14613,6 +14642,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-boundsheads" => supdb_arm(Supdb::create_bounds_heads, dir)?,
         "supdb-landboundsread" => supdb_arm(Supdb::create_land_bounds_read, dir)?,
         "supdb-boundslean" => supdb_arm(Supdb::create_bounds_lean, dir)?,
+        "supdb-boundsleanmerge3" => supdb_arm(Supdb::create_bounds_lean_merge3, dir)?,
         "supdb-zstrideallcdrop" => supdb_arm(Supdb::create_zstride_all_cdrop, dir)?,
         "supdb-zstridealldropagaincdrop" => {
             supdb_arm(Supdb::create_zstride_all_dropagain_cdrop, dir)?
@@ -17871,7 +17901,14 @@ mod tests {
                     );
                     assert!(!d.bounds_by_heads && !d.land_bounds_read);
                     assert_eq!(o.zpages_cursor_steps, d.zpages_cursor_steps, "{name}");
+                    assert_eq!(o.merge_parallel, d.merge_parallel, "{name}");
                 }
+                let z = Supdb::create_bounds_lean_merge3(&dir("boundsleanmerge3")).unwrap();
+                assert_eq!(z.name(), "supdb-boundsleanmerge3");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.bounds_by_heads && o.land_bounds_read);
+                assert_eq!((o.merge_parallel, d.merge_parallel), (3, 2));
                 assert_eq!(
                     (
                         o.zpages_stride_sparse,
