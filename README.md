@@ -344,9 +344,12 @@ opened the other.
 sh scripts/deps.sh             # the toolchain pieces the checks need, where missing
 cargo build --release
 cargo test --profile checked  # the release profile with overflow checks and debug assertions on
-sh scripts/check.sh            # build, test, lint, wasm, bench -- what CI runs
+sh scripts/check.sh            # build, test, stride, lint, wasm, bench, lists -- the default set
 sh scripts/check.sh quick      # one quick-scale measurement, on an otherwise idle machine
 sh scripts/check.sh fscrypt    # a store under a key, on a filesystem scripts/fscrypt.sh makes
+sh scripts/check.sh cost       # what a store in the clear pays an operation, against the base
+sh scripts/check.sh cross-arm  # the library's tests for aarch64, under qemu-user
+sh scripts/check.sh machine    # the suite's machine capture, on an Apple Silicon host
 sh web/build.sh                # the browser module
 ```
 

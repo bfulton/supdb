@@ -8,7 +8,10 @@
 //! count of one token, with the stage expected to take it to zero. The gate
 //! holds the totals by (file, token, region): a count that grows anywhere
 //! fails, plumbing included, and so does one that falls, until the file is
-//! lowered with it, so the file only goes down. A coupling moved from one
+//! lowered with it, so the file only goes down within a tree; across a
+//! change, `sh scripts/check.sh lists` holds it against the base
+//! (scripts/ratchet.py), as it holds the door's lists and
+//! `tests/data/cost-entries.txt`'s reasons. A coupling moved from one
 //! function to another changes no total and passes; the scopes measured and
 //! listed are printed beside a failure, to say where.
 //!
@@ -4665,4 +4668,1477 @@ fn the_cost_job_names_its_probes_as_the_test_reads_them() {
         );
     }
     assert!(!table.contains("*"), "the fallthrough is no probe");
+}
+
+// CI checks through `sh scripts/check.sh` and nothing else: every check this
+// project makes is one command, run the same locally and in CI, so a run
+// step of a workflow that checks a change (CI_CHECKS) is a call of
+// scripts/check.sh's groups or set-up on the short lists below, every group
+// the script knows is run by some job or says here why not, every other
+// file under .github/workflows is listed as checking no change (CI_OTHER)
+// and runs on no change's event, and set-up writes to the job's environment
+// only what it lists. A cargo, a python or a script of scripts/ called from
+// the YAML, or shell there that decides a base or a verdict, is a second
+// definition of the checks.
+
+/// Run steps that set up and check nothing, matched whole.
+const CI_SETUP: &[(&str, &str)] = &[
+    (
+        "sh bench/scripts/libclang.sh",
+        "installs libclang for bindgen and names it to the build",
+    ),
+    (
+        "sudo sh scripts/fscrypt.sh up /mnt/supdb-fscrypt \"$(id -u):$(id -g)\" >> \"$GITHUB_ENV\"",
+        "makes the filesystem the fscrypt group runs on, and names it in the job's environment",
+    ),
+    (
+        "./bench/target/release/bench machine | tee -a \"$GITHUB_STEP_SUMMARY\"",
+        "prints the runner as a row records it, after the checks: it decides nothing",
+    ),
+];
+
+/// A package install: this prefix, then package names alone.
+const CI_APT: &str = "sudo apt-get update -qq && sudo apt-get install -y -qq ";
+
+/// Actions a step may use, matched whole: each fetches, installs or
+/// publishes, and none checks.
+const CI_ACTIONS: &[(&str, &str)] = &[
+    ("actions/checkout@v4", "the tree"),
+    ("dtolnay/rust-toolchain@stable", "the toolchain"),
+    ("Swatinem/rust-cache@v2", "the build cache"),
+    ("actions/upload-artifact@v4", "publishes the quick row"),
+];
+
+/// Inputs an action may be given, matched by action and name: none
+/// chooses what is checked.
+const CI_WITH: &[(&str, &str, &str)] = &[
+    (
+        "actions/checkout@v4",
+        "fetch-depth",
+        "the whole history, which the base needs",
+    ),
+    (
+        "dtolnay/rust-toolchain@stable",
+        "components",
+        "rustfmt and clippy, which the lint group runs",
+    ),
+    (
+        "dtolnay/rust-toolchain@stable",
+        "targets",
+        "the targets the wasm and cross-arm groups build for",
+    ),
+    (
+        "Swatinem/rust-cache@v2",
+        "workspaces",
+        "which target directories to cache",
+    ),
+    ("actions/upload-artifact@v4", "name", "the artifact's name"),
+    (
+        "actions/upload-artifact@v4",
+        "if-no-files-found",
+        "a run that wrote no row publishes nothing",
+    ),
+    ("actions/upload-artifact@v4", "path", "what is published"),
+];
+
+/// The environment a workflow, a job or a step may set, matched whole,
+/// name and value: the event's values and a person's input, and nothing
+/// that picks a base, a step or a verdict, which are scripts/check.sh's
+/// and scripts/base.sh's to decide.
+const CI_ENV: &[(&str, &str, &str)] = &[
+    (
+        "CARGO_TERM_COLOR",
+        "always",
+        "colours cargo's output in the log",
+    ),
+    (
+        "ARMS",
+        "${{ inputs.arms }}",
+        "the quick group's arms, as the person who dispatched the run named them",
+    ),
+    (
+        "SUPDB_PR_BASE",
+        "${{ github.event.pull_request.base.sha }}",
+        "the event's value scripts/base.sh decides the base from",
+    ),
+    (
+        "SUPDB_PUSH_BEFORE",
+        "${{ github.event.before }}",
+        "the event's value scripts/base.sh decides the base from",
+    ),
+];
+
+/// The conditions a step may carry, matched whole with the action it is
+/// on: a step that publishes may run whether the checks before it passed.
+/// A condition on a check, or on a job, decides in the YAML whether a
+/// check runs.
+const CI_IF: &[(&str, &str, &str)] = &[(
+    "always()",
+    "actions/upload-artifact@v4",
+    "the quick row is published whether or not the run passed: it decides nothing",
+)];
+
+/// The workflow's triggers, by path under `on:` and value, matched whole
+/// both ways (a person's inputs to `workflow_dispatch` are read by the
+/// keys above): a trigger dropped or narrowed is a change on which no job
+/// runs, and so a group nobody runs there.
+const CI_ON: &[(&str, &str, &str)] = &[
+    ("push", "", "a push runs every job"),
+    ("push.branches", "[main]", "the main line, every push to it"),
+    ("push.tags", "['*']", "a tag, every one"),
+    (
+        "pull_request",
+        "",
+        "every pull request, whatever its branch",
+    ),
+    (
+        "workflow_dispatch",
+        "",
+        "a run by hand, which the quick job's arms are for",
+    ),
+];
+
+/// Groups of scripts/check.sh no CI job runs, each with why.
+const CI_NOT_RUN: &[(&str, &str)] = &[];
+
+/// The groups scripts/check.sh's loop knows, by its case's labels (`a)` or
+/// `a | b)`, at the first label's indent, a case inside a group read past
+/// to its own `esac`), or why the test cannot read one: a line that looks
+/// like a label at another indent, or a `case` or `esac` in another shape
+/// than a line that begins `case ... in` or one whose last word is `esac`.
+fn check_groups(check_sh: &str) -> Result<BTreeSet<String>, String> {
+    let lines: Vec<&str> = check_sh.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.trim() == "case \"$g\" in")
+        .ok_or("scripts/check.sh has no `case \"$g\" in`")?;
+    // The depth of cases at each line after the start, ending where the
+    // groups' own case is closed.
+    let mut depth = 1;
+    let mut end = None;
+    let mut at_depth = Vec::new();
+    for (i, l) in lines.iter().enumerate().skip(start + 1) {
+        let words: Vec<&str> = l
+            .split_whitespace()
+            .take_while(|w| !w.starts_with('#'))
+            .collect();
+        let opens = words.first() == Some(&"case");
+        let closes = words.last() == Some(&"esac");
+        if words.iter().any(|w| *w == "case" || *w == "esac")
+            && !(opens && (closes || words.last() == Some(&"in")))
+            && !(closes
+                && words
+                    .iter()
+                    .filter(|w| **w == "case" || **w == "esac")
+                    .count()
+                    == 1)
+        {
+            return Err(format!(
+                "scripts/check.sh line {}: a `case` or `esac` the test cannot read: {l}",
+                i + 1
+            ));
+        }
+        at_depth.push(depth);
+        match (opens, closes) {
+            (true, false) => depth += 1,
+            (false, true) => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            end = Some(i);
+            break;
+        }
+    }
+    let end = end.ok_or("scripts/check.sh's case has no `esac`")?;
+    let label = |t: &str| -> Option<Vec<String>> {
+        let g = t.strip_suffix(')')?;
+        let names: Vec<String> = g.split('|').map(|n| n.trim().to_string()).collect();
+        names
+            .iter()
+            .all(|n| {
+                n == "*"
+                    || (!n.is_empty()
+                        && n.chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
+            })
+            .then_some(names)
+    };
+    let mut at = None;
+    let mut out = BTreeSet::new();
+    for (i, l) in lines[start + 1..end].iter().enumerate() {
+        if at_depth[i] != 1 {
+            continue;
+        }
+        let t = l.trim_start();
+        let Some(names) = label(t.trim_end()) else {
+            continue;
+        };
+        let ind = l.len() - t.len();
+        if *at.get_or_insert(ind) != ind {
+            return Err(format!(
+                "scripts/check.sh line {}: a label of scripts/check.sh the test cannot read, at another indent: {l}",
+                start + 2 + i
+            ));
+        }
+        out.extend(names.into_iter().filter(|n| n != "*"));
+    }
+    Ok(out)
+}
+
+/// A step of a workflow: its job, where it starts, its run commands, its
+/// action, its inputs and its condition, each with its line.
+#[derive(Default)]
+struct CiStep {
+    job: String,
+    line: usize,
+    runs: Vec<(usize, String)>,
+    uses: Option<(usize, String)>,
+    with: Vec<(usize, String)>,
+    cond: Option<(usize, String)>,
+}
+
+/// A workflow read: its steps, the jobs that carry a condition, and every
+/// key the test does not let stand.
+type CiRead = (Vec<CiStep>, BTreeSet<String>, Vec<String>);
+
+/// Every key of a workflow, by the whole path to it (a job named `inputs`
+/// is a job). A key the test does not know, an anchor, an alias, a flow
+/// mapping, a quoted run, a `shell:` or a `continue-on-error:` is an error;
+/// so is an `env:` entry not on CI_ENV, and a trigger other than `on`'s
+/// (CI_ON for ci.yml) or one of `on`'s missing.
+/// A run's block is one command a line, a line ending in `\` going on in
+/// the next.
+fn ci_steps(yaml: &str, on: &[(&str, &str, &str)]) -> CiRead {
+    const TOP: &[&str] = &["name", "on", "permissions", "env", "jobs"];
+    const ON: &[&str] = &["push", "pull_request", "workflow_dispatch"];
+    const JOB: &[&str] = &["strategy", "runs-on", "steps", "timeout-minutes", "env"];
+    const STEP: &[&str] = &["name", "uses", "run", "with", "env"];
+    const FLOW: &[&str] = &["branches", "tags", "runner"];
+    let lines: Vec<&str> = yaml.lines().collect();
+    let (mut steps, mut cond_jobs, mut errs) = (Vec::<CiStep>::new(), BTreeSet::new(), Vec::new());
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    let mut triggers: Vec<(usize, String, String)> = Vec::new();
+    let mut job = String::new();
+    // Whether the last step pushed is one of the steps block being read.
+    let mut open = false;
+    let mut i = 0;
+    while i < lines.len() {
+        let l = lines[i];
+        let ln = i + 1;
+        i += 1;
+        let t = l.trim_start();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let cannot = |why: &str| format!("line {ln}: a step the test cannot read ({why}): {l}");
+        let (item, rest) = match t.strip_prefix("- ") {
+            Some(r) => (true, r.trim_start()),
+            None => (false, t),
+        };
+        let kind = l.len() - rest.len();
+        while stack.last().is_some_and(|(n, _)| *n >= kind) {
+            stack.pop();
+        }
+        // The paths a pull request's trigger is narrowed to: an item each,
+        // held to `on` as a trigger's value.
+        if item
+            && stack
+                .iter()
+                .map(|(_, k)| k.as_str())
+                .eq(["on", "pull_request", "paths"])
+        {
+            triggers.push((ln, "pull_request.paths.-".to_string(), rest.to_string()));
+            continue;
+        }
+        let Some((key, v)) = rest.split_once(':').filter(|(k, v)| {
+            !k.is_empty()
+                && k.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
+                && (v.is_empty() || v.starts_with(' '))
+        }) else {
+            errs.push(cannot("no key the test reads"));
+            continue;
+        };
+        let v = v.trim();
+        let path: Vec<&str> = stack.iter().map(|(_, k)| k.as_str()).collect();
+        // A key is read by the whole path to it, never by its parent's
+        // name alone: a job may be named `inputs`, `with` or `env`.
+        let in_steps = matches!(path.as_slice(), ["jobs", _, "steps"]);
+        if item {
+            if !in_steps {
+                errs.push(cannot("a list outside a job's steps"));
+                continue;
+            }
+            steps.push(CiStep {
+                job: job.clone(),
+                line: ln,
+                ..CiStep::default()
+            });
+            open = true;
+        }
+        if key == "steps" || path == ["jobs"] {
+            open = false;
+        }
+        if v.starts_with(['&', '*']) {
+            errs.push(cannot("an anchor or an alias"));
+        }
+        if v.starts_with(['[', '{']) && !FLOW.contains(&key) {
+            errs.push(cannot("a flow value"));
+        }
+        let block = !v.is_empty()
+            && v.starts_with(['|', '>'])
+            && v[1..].chars().all(|c| "+-0123456789".contains(c));
+        let mut body = Vec::new();
+        if block {
+            while i < lines.len() {
+                let b = lines[i];
+                let bi = b.len() - b.trim_start().len();
+                if !b.trim().is_empty() && bi <= kind {
+                    break;
+                }
+                if !b.trim().is_empty() {
+                    body.push((i + 1, b.trim().to_string()));
+                }
+                i += 1;
+            }
+        }
+        if path.first() == Some(&"on") && path.get(1) != Some(&"workflow_dispatch") {
+            let at: Vec<&str> = path[1..].iter().copied().chain([key]).collect();
+            triggers.push((ln, at.join("."), v.to_string()));
+        }
+        let step = steps.last_mut().filter(|_| open && in_steps);
+        let known = match path.as_slice() {
+            [] => TOP.contains(&key),
+            ["on"] => ON.contains(&key),
+            ["on", "push"] => ["branches", "tags"].contains(&key),
+            ["on", "pull_request"] => key == "paths",
+            // A token that reads the tree and writes nothing.
+            ["permissions"] => key == "contents" && v == "read",
+            ["on", "workflow_dispatch"] => key == "inputs",
+            ["on", "workflow_dispatch", "inputs"] => true,
+            ["on", "workflow_dispatch", "inputs", _] => {
+                ["description", "required", "default"].contains(&key)
+            }
+            ["jobs"] => {
+                job = key.to_string();
+                true
+            }
+            ["jobs", _] => {
+                if key == "if" {
+                    cond_jobs.insert(job.clone());
+                    errs.push(format!(
+                        "line {ln}: a job's `if:` decides in the YAML whether its checks run: {l}"
+                    ));
+                    true
+                } else {
+                    JOB.contains(&key)
+                }
+            }
+            ["jobs", _, "strategy"] => ["fail-fast", "matrix"].contains(&key),
+            ["jobs", _, "strategy", "matrix"] => key == "runner",
+            ["env"] | ["jobs", _, "env"] | ["jobs", _, "steps", "env"] => {
+                if !CI_ENV.iter().any(|(n, x, _)| *n == key && *x == v) {
+                    errs.push(format!(
+                        "line {ln}: the environment `{key}: {v}` is on no list of the test: CI passes the event's values, and the checks decide the rest"
+                    ));
+                }
+                true
+            }
+            ["jobs", _, "steps", "with"] => true,
+            ["jobs", _, "steps"] => {
+                let Some(st) = step else {
+                    errs.push(cannot("a key before any step"));
+                    continue;
+                };
+                match key {
+                    "if" => {
+                        st.cond = Some((ln, v.to_string()));
+                        true
+                    }
+                    "uses" => {
+                        st.uses = Some((ln, v.to_string()));
+                        true
+                    }
+                    "run" => {
+                        match v {
+                            "" => errs.push(format!("line {ln}: a run with no command: {l}")),
+                            _ if block && v.starts_with('>') => {
+                                let all: Vec<String> =
+                                    body.iter().map(|(_, c)| c.clone()).collect();
+                                st.runs.push((ln, all.join(" ")));
+                            }
+                            _ if block => {
+                                let mut cur: Option<(usize, String)> = None;
+                                for (bl, c) in body.drain(..) {
+                                    let (at, mut s) = cur.take().unwrap_or((bl, String::new()));
+                                    if !s.is_empty() {
+                                        s.push(' ');
+                                    }
+                                    match c.strip_suffix('\\') {
+                                        Some(head) => {
+                                            s.push_str(head.trim_end());
+                                            cur = Some((at, s));
+                                        }
+                                        None => {
+                                            s.push_str(&c);
+                                            st.runs.push((at, s));
+                                        }
+                                    }
+                                }
+                                if let Some(c) = cur {
+                                    st.runs.push(c);
+                                }
+                            }
+                            _ if v.starts_with(['"', '\'']) => errs.push(format!(
+                                "line {ln}: a quoted run the test does not read: {l}"
+                            )),
+                            _ => st.runs.push((ln, v.to_string())),
+                        }
+                        true
+                    }
+                    _ => STEP.contains(&key),
+                }
+            }
+            _ => false,
+        };
+        if matches!(path.as_slice(), ["jobs", _, "steps", "with"]) {
+            if let Some(st) = steps.last_mut() {
+                st.with.push((ln, key.to_string()));
+            }
+        }
+        if key == "continue-on-error" {
+            errs.push(format!(
+                "line {ln}: continue-on-error decides in the YAML that a red check reads green: {l}"
+            ));
+        } else if key == "shell" {
+            errs.push(format!("line {ln}: a shell of the step's own: {l}"));
+        } else if !known {
+            errs.push(format!(
+                "line {ln}: the key `{key}` is on no list of the test: {l}"
+            ));
+        }
+        stack.push((kind, key.to_string()));
+    }
+    let got: BTreeSet<(String, String)> = triggers
+        .iter()
+        .map(|(_, k, v)| (k.clone(), v.clone()))
+        .collect();
+    for (ln, k, v) in &triggers {
+        if !on.iter().any(|(x, y, _)| x == k && y == v) {
+            errs.push(format!(
+                "line {ln}: the trigger `{k}: {v}` is on no list of the test"
+            ));
+        }
+    }
+    for (k, v, why) in on {
+        if !got.contains(&(k.to_string(), v.to_string())) {
+            errs.push(format!(
+                "the trigger `{k}` the test lists ({why}) is not in the workflow as `{k}: {v}`"
+            ));
+        }
+    }
+    (steps, cond_jobs, errs)
+}
+
+/// The verdict over ci.yml's text and check.sh's, the other workflows as
+/// they stand.
+fn ci_check(yaml: &str, check_sh: &str) -> Result<(), String> {
+    ci_check_with(yaml, check_sh, CI_NOT_RUN)
+}
+
+/// The same, with the groups no job runs given.
+fn ci_check_with(yaml: &str, check_sh: &str, not_run: &[(&str, &str)]) -> Result<(), String> {
+    let mut files = ci_workflows();
+    for (n, t) in files.iter_mut() {
+        if n == CI_YML {
+            *t = yaml.to_string();
+        }
+    }
+    ci_check_files(&files, check_sh, not_run)
+}
+
+/// The workflow that checks every change.
+const CI_YML: &str = ".github/workflows/ci.yml";
+
+/// The triggers of apple-silicon.yml, as CI_ON is ci.yml's: its group reads
+/// the machine capture, so it runs where the capture's code or the
+/// workflow changes, and by hand.
+const APPLE_ON: &[(&str, &str, &str)] = &[
+    (
+        "pull_request",
+        "",
+        "a pull request that changes what it reads",
+    ),
+    ("pull_request.paths", "", "the files the capture is"),
+    (
+        "pull_request.paths.-",
+        "'bench/src/machine.rs'",
+        "the capture",
+    ),
+    (
+        "pull_request.paths.-",
+        "'bench/src/env.rs'",
+        "what the capture reads the host through",
+    ),
+    (
+        "pull_request.paths.-",
+        "'.github/workflows/apple-silicon.yml'",
+        "the workflow itself",
+    ),
+    (
+        "pull_request.paths.-",
+        "'scripts/check.sh'",
+        "the group the workflow runs",
+    ),
+    ("workflow_dispatch", "", "a run by hand"),
+];
+
+/// A workflow's triggers: the path under `on:`, the value, and why.
+type CiOn = &'static [(&'static str, &'static str, &'static str)];
+
+/// The workflows that check a change, each held as ci.yml is, with its
+/// triggers: every run step a group's call or listed set-up, and the
+/// groups any of them runs counted together.
+const CI_CHECKS: &[(&str, CiOn)] = &[
+    (CI_YML, CI_ON),
+    (".github/workflows/apple-silicon.yml", APPLE_ON),
+];
+
+/// The workflows that check no change, each with why: a measurement or a
+/// proposal, run by hand, on a schedule or after a merge to main. Their
+/// triggers are read and held to that (workflow_dispatch, schedule, and a
+/// push to main alone); one that runs on a change's event is a check, and
+/// belongs on CI_CHECKS.
+const CI_OTHER: &[(&str, &str)] = &[
+    (
+        ".github/workflows/bank-row.yml",
+        "after a merge to main, proposes the hosted runners' quick rows as a pull request, which ci.yml then checks",
+    ),
+    (
+        ".github/workflows/comparators.yml",
+        "a measurement of the comparators against their own tools, by hand and weekly: a finding about an arm, not about a change",
+    ),
+    (
+        ".github/workflows/ooc-hosted.yml",
+        "a bounded measurement, by hand: its row is an artifact for a person to bank",
+    ),
+    (
+        ".github/workflows/quiet-bench.yml",
+        "a full-scale measurement on a self-hosted Mac, by hand",
+    ),
+    (
+        ".github/workflows/rocksdb-alloc.yml",
+        "a table of RocksDB's two allocators for a person to read, by hand and weekly",
+    ),
+    (
+        ".github/workflows/runner-smoke.yml",
+        "prints which runner claimed a job, by hand",
+    ),
+];
+
+/// The triggers a workflow on CI_OTHER may have: none is a change's event.
+fn other_triggers(name: &str, yaml: &str) -> Vec<String> {
+    let mut errs = Vec::new();
+    let lines: Vec<&str> = yaml.lines().collect();
+    let tops: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| {
+            let t = l.trim_start();
+            t.len() == l.len() && !t.is_empty() && !t.starts_with('#')
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let ons: Vec<usize> = tops
+        .iter()
+        .copied()
+        .filter(|&i| {
+            let k = lines[i].split(':').next().unwrap_or("").trim();
+            k == "on"
+        })
+        .collect();
+    let [at] = ons.as_slice() else {
+        errs.push(format!("{name}: no one `on:` the test can read"));
+        return errs;
+    };
+    let end = tops
+        .iter()
+        .copied()
+        .find(|&i| i > *at)
+        .unwrap_or(lines.len());
+    // Each trigger by its indent under `on:`, and push's branches.
+    let mut ind = None;
+    let mut trig = String::new();
+    for (i, l) in lines.iter().enumerate().take(end).skip(at + 1) {
+        let t = l.trim_start();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let d = l.len() - t.len();
+        let first = *ind.get_or_insert(d);
+        let key = t.split(':').next().unwrap_or("").trim();
+        if d == first {
+            trig = key.to_string();
+            if !["workflow_dispatch", "schedule", "push"].contains(&key) || t.starts_with('-') {
+                errs.push(format!(
+                    "{name} line {}: the trigger `{t}` is a change's event, or one the test does not know: a workflow that checks a change is on CI_CHECKS",
+                    i + 1
+                ));
+            } else if t != format!("{key}:") {
+                errs.push(format!(
+                    "{name} line {}: a trigger the test does not read as a block: {t}",
+                    i + 1
+                ));
+            }
+        } else if d < first {
+            errs.push(format!(
+                "{name} line {}: a line the test cannot read: {l}",
+                i + 1
+            ));
+        } else if trig == "push" && t != "branches: [main]" {
+            errs.push(format!(
+                "{name} line {}: a push to anything but main is a change's event: {t}",
+                i + 1
+            ));
+        }
+    }
+    if ind.is_none() {
+        errs.push(format!("{name}: an `on:` with no trigger"));
+    }
+    if lines[*at + 1..end]
+        .iter()
+        .any(|l| l.trim_start().starts_with("push:"))
+        && !lines[*at + 1..end]
+            .iter()
+            .any(|l| l.trim() == "branches: [main]")
+    {
+        errs.push(format!(
+            "{name}: a push to every branch is a change's event"
+        ));
+    }
+    errs
+}
+
+/// The verdict over every workflow file (name, text) and check.sh's text.
+fn ci_check_files(
+    files: &[(String, String)],
+    check_sh: &str,
+    not_run: &[(&str, &str)],
+) -> Result<(), String> {
+    let known = check_groups(check_sh)?;
+    let mut ran = BTreeSet::new();
+    let mut errs = Vec::new();
+    for (name, yaml) in files {
+        if let Some((_, on)) = CI_CHECKS.iter().find(|(n, _)| n == name) {
+            for e in ci_file(yaml, on, &known, &mut ran) {
+                errs.push(format!("{name}: {e}"));
+            }
+        } else if CI_OTHER.iter().any(|(n, _)| n == name) {
+            errs.extend(other_triggers(name, yaml));
+        } else {
+            errs.push(format!(
+                "{name}: a workflow the test does not list: one that checks a change is held as ci.yml is (CI_CHECKS), one that does not says why (CI_OTHER)"
+            ));
+        }
+    }
+    for n in CI_CHECKS
+        .iter()
+        .map(|(n, _)| *n)
+        .chain(CI_OTHER.iter().map(|(n, _)| *n))
+    {
+        if !files.iter().any(|(f, _)| f == n) {
+            errs.push(format!("{n}: listed by the test and not in the tree"));
+        }
+    }
+    for g in &known {
+        let said = not_run.iter().any(|(n, _)| n == g);
+        if !ran.contains(g) && !said {
+            errs.push(format!(
+                "the group `{g}` of scripts/check.sh runs in no CI job, and CI_NOT_RUN says not why"
+            ));
+        }
+        if ran.contains(g) && said {
+            errs.push(format!(
+                "the group `{g}` runs in CI and CI_NOT_RUN says it does not"
+            ));
+        }
+    }
+    for (n, why) in not_run {
+        if why.trim().is_empty() {
+            errs.push(format!("CI_NOT_RUN gives `{n}` no reason"));
+        }
+        if !known.contains(*n) {
+            errs.push(format!(
+                "CI_NOT_RUN names `{n}`, no group of scripts/check.sh"
+            ));
+        }
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs.join("\n"))
+    }
+}
+
+fn ci_texts() -> (String, String) {
+    let r = root();
+    (
+        std::fs::read_to_string(r.join(".github/workflows/ci.yml")).expect("ci.yml reads"),
+        std::fs::read_to_string(r.join("scripts/check.sh")).expect("check.sh reads"),
+    )
+}
+
+/// Every file under .github/workflows, by its path from the root.
+fn ci_workflows() -> Vec<(String, String)> {
+    ci_workflows_in(&root())
+}
+
+/// Every file under `r`'s .github/workflows, whatever its name, in every
+/// directory under it.
+fn ci_workflows_in(r: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut dirs = vec![r.join(".github/workflows")];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).expect("the workflows read") {
+            let p = e.expect("an entry").path();
+            if p.is_dir() {
+                dirs.push(p);
+                continue;
+            }
+            let n = p
+                .strip_prefix(r)
+                .expect("under the root")
+                .to_string_lossy()
+                .into_owned();
+            let t = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{n}: {e}"));
+            out.push((n, t));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// One checking workflow's steps held, the groups its unconditioned runs
+/// call added to `ran`.
+fn ci_file(
+    yaml: &str,
+    on: &[(&str, &str, &str)],
+    known: &BTreeSet<String>,
+    ran: &mut BTreeSet<String>,
+) -> Vec<String> {
+    let (steps, cond_jobs, mut errs) = ci_steps(yaml, on);
+    for st in &steps {
+        let action = st.uses.as_ref().map(|(_, a)| a.as_str()).unwrap_or("");
+        if st.uses.is_some() && !st.runs.is_empty() {
+            errs.push(format!(
+                "line {}: a step that is both a run and an action",
+                st.line
+            ));
+        }
+        if let Some((ln, c)) = &st.cond {
+            if !CI_IF.iter().any(|(x, a, _)| x == c && *a == action) {
+                errs.push(format!(
+                    "line {ln}: an `if:` the test does not list (`{c}` on `{}`): a condition in the YAML decides whether a check runs",
+                    if action.is_empty() { "a run" } else { action }
+                ));
+            }
+        }
+        for (ln, k) in &st.with {
+            if !CI_WITH.iter().any(|(a, x, _)| *a == action && x == k) {
+                errs.push(format!(
+                    "line {ln}: the input `{k}` of `{action}` is on no list of the test"
+                ));
+            }
+        }
+        // A run under a condition is a run the YAML may skip, so it runs
+        // no group.
+        let counts = st.cond.is_none() && !cond_jobs.contains(&st.job);
+        for (ln, cmd) in &st.runs {
+            if let Some(rest) = cmd.strip_prefix("sh scripts/check.sh ") {
+                for g in rest.split_whitespace() {
+                    if known.contains(g) {
+                        if counts {
+                            ran.insert(g.to_string());
+                        }
+                    } else {
+                        errs.push(format!(
+                            "line {ln}: `{g}` in `{cmd}` is no group of scripts/check.sh"
+                        ));
+                    }
+                }
+                continue;
+            }
+            if CI_SETUP.iter().any(|(s, _)| s == cmd) {
+                continue;
+            }
+            if let Some(pkgs) = cmd.strip_prefix(CI_APT) {
+                let name = |w: &str| {
+                    w.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+                        && w.chars().all(|c| {
+                            c.is_ascii_lowercase() || c.is_ascii_digit() || ".+-".contains(c)
+                        })
+                };
+                if pkgs.split_whitespace().count() > 0 && pkgs.split_whitespace().all(name) {
+                    continue;
+                }
+            }
+            errs.push(format!(
+                "line {ln}: `{cmd}` is no call of scripts/check.sh and no set-up the test lists: a check CI makes is a group of scripts/check.sh"
+            ));
+        }
+        if let Some((ln, a)) = &st.uses {
+            if !CI_ACTIONS.iter().any(|(x, _)| x == a) {
+                errs.push(format!(
+                    "line {ln}: the action `{a}` is on no list of the test"
+                ));
+            }
+        }
+    }
+    errs
+}
+
+#[test]
+fn ci_checks_only_through_check_sh_and_runs_every_group() {
+    let (yaml, sh) = ci_texts();
+    if let Err(e) = ci_check(&yaml, &sh) {
+        panic!(".github/workflows:\n{e}");
+    }
+    let files = ci_workflows();
+    assert!(files.iter().any(|(n, _)| n == CI_YML), "{files:?}");
+    let r = root();
+    for (n, _) in CI_SETUP {
+        if let Some(script) = ci_setup_script(n) {
+            let text =
+                std::fs::read_to_string(r.join(script)).unwrap_or_else(|e| panic!("{script}: {e}"));
+            let errs = ci_setup_writes(script, &text, n.contains(">> \"$GITHUB_ENV\""));
+            assert!(errs.is_empty(), "{}", errs.join("\n"));
+        }
+    }
+}
+
+/// What a set-up step may put in the job's environment, by script and
+/// line, matched whole: a line that names one of the runner's files
+/// (CI_RUNNER_FILES), and in a script whose output the step sends to
+/// $GITHUB_ENV, a line that prints to it. A check that set-up could narrow
+/// through the environment (`RATCHET_RED_STEPS`, `COST_PROBES`, a base) is a
+/// check decided outside scripts/check.sh.
+const CI_SETUP_WRITES: &[(&str, &str, &str)] = &[
+    (
+        "bench/scripts/libclang.sh",
+        "if [ -n \"${GITHUB_ENV:-}\" ]; then",
+        "asks whether it runs in a workflow",
+    ),
+    (
+        "bench/scripts/libclang.sh",
+        "echo \"$1=$2\" >> \"$GITHUB_ENV\"",
+        "`emit`'s write, of the names CI_SETUP_VARS lists",
+    ),
+    (
+        "scripts/fscrypt.sh",
+        "echo \"SUPDB_FSCRYPT_DIR=$dir\"",
+        "the filesystem the fscrypt group runs on",
+    ),
+    (
+        "scripts/fscrypt.sh",
+        "echo \"SUPDB_FSCRYPT_IMAGE=$img\"",
+        "the file that filesystem is in",
+    ),
+];
+
+/// The names libclang.sh's `emit` may write, by script and name.
+const CI_SETUP_VARS: &[(&str, &str, &str)] = &[
+    (
+        "bench/scripts/libclang.sh",
+        "LIBCLANG_PATH",
+        "where bindgen finds libclang",
+    ),
+    (
+        "bench/scripts/libclang.sh",
+        "RUSTFLAGS",
+        "macOS's rpath to libclang for the build scripts, appended",
+    ),
+];
+
+/// The runner's files a step writes the job's state through.
+const CI_RUNNER_FILES: &[&str] = &[
+    "GITHUB_ENV",
+    "GITHUB_PATH",
+    "GITHUB_OUTPUT",
+    "GITHUB_STATE",
+    "BASH_ENV",
+];
+
+/// The script a set-up line runs, where it is one (`sh X ...`, `sudo sh X
+/// ...`).
+fn ci_setup_script(cmd: &str) -> Option<&str> {
+    let w: Vec<&str> = cmd.split_whitespace().collect();
+    let w = if w.first() == Some(&"sudo") {
+        &w[1..]
+    } else {
+        &w[..]
+    };
+    (w.first() == Some(&"sh"))
+        .then(|| w.get(1).copied())
+        .flatten()
+}
+
+/// The lines of a set-up script that write the job's environment and are
+/// on no list, each an error.
+fn ci_setup_writes(script: &str, text: &str, to_env: bool) -> Vec<String> {
+    let mut errs = Vec::new();
+    for (i, l) in text.lines().enumerate() {
+        let t = l.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let listed = CI_SETUP_WRITES
+            .iter()
+            .any(|(s, x, _)| *s == script && *x == t);
+        let words: Vec<&str> = t.split_whitespace().collect();
+        if words.first() == Some(&"emit") {
+            let name = words.get(1).copied().unwrap_or("");
+            if !CI_SETUP_VARS
+                .iter()
+                .any(|(s, n, _)| *s == script && *n == name)
+            {
+                errs.push(format!(
+                    "{script} line {}: `emit` of a name CI_SETUP_VARS does not list: {t}",
+                    i + 1
+                ));
+            }
+            continue;
+        }
+        let names_file = CI_RUNNER_FILES.iter().any(|f| t.contains(f));
+        let prints = to_env
+            && words
+                .iter()
+                .any(|w| ["echo", "printf"].contains(&w.trim_start_matches(['{', '(', ';'])))
+            && !t.contains(">&2");
+        if (names_file || prints) && !listed {
+            errs.push(format!(
+                "{script} line {}: a write to the job's environment CI_SETUP_WRITES does not list: {t}",
+                i + 1
+            ));
+        }
+    }
+    errs
+}
+
+#[test]
+fn a_set_up_step_that_writes_the_environment_unlisted_fails() {
+    let r = root();
+    let lib = std::fs::read_to_string(r.join("bench/scripts/libclang.sh")).expect("reads");
+    let fs = std::fs::read_to_string(r.join("scripts/fscrypt.sh")).expect("reads");
+    assert!(ci_setup_writes("bench/scripts/libclang.sh", &lib, false).is_empty());
+    assert!(ci_setup_writes("scripts/fscrypt.sh", &fs, true).is_empty());
+    let at = "    echo \"$1=$2\" >> \"$GITHUB_ENV\"\n";
+    for to in [
+        "    echo RATCHET_RED_STEPS=G >> \"$GITHUB_ENV\"\n",
+        "    echo \"$PWD/fake\" >> \"$GITHUB_PATH\"\n",
+        "    printf 'COST_PROBES=seal\\n' >>\"${GITHUB_ENV}\"\n",
+    ] {
+        let e = ci_setup_writes(
+            "bench/scripts/libclang.sh",
+            &ci_edit(&lib, at, &format!("{at}{to}")),
+            false,
+        );
+        assert!(
+            e.len() == 1 && e[0].contains("CI_SETUP_WRITES does not list"),
+            "{to}: {e:?}"
+        );
+    }
+    let e = ci_setup_writes(
+        "bench/scripts/libclang.sh",
+        &ci_edit(&lib, at, &format!("{at}emit SUPDB_BASE HEAD\n")),
+        false,
+    );
+    assert!(e.len() == 1 && e[0].contains("CI_SETUP_VARS"), "{e:?}");
+    // A script whose output goes to $GITHUB_ENV: a line printed to it is
+    // a write; one to stderr is not. The same line is no write where the
+    // step keeps the output.
+    let at = "    echo \"SUPDB_FSCRYPT_IMAGE=$img\"\n";
+    let more = ci_edit(&fs, at, &format!("{at}    echo \"RATCHET_RED_STEPS=G\"\n"));
+    let e = ci_setup_writes("scripts/fscrypt.sh", &more, true);
+    assert!(e.len() == 1, "{e:?}");
+    assert!(ci_setup_writes("scripts/fscrypt.sh", &more, false).is_empty());
+    let more = ci_edit(&fs, at, &format!("{at}    echo \"a note\" >&2\n"));
+    assert!(ci_setup_writes("scripts/fscrypt.sh", &more, true).is_empty());
+    assert_eq!(
+        ci_setup_script("sudo sh scripts/fscrypt.sh up x"),
+        Some("scripts/fscrypt.sh")
+    );
+    assert_eq!(
+        ci_setup_script("./bench/target/release/bench machine"),
+        None
+    );
+}
+
+#[test]
+fn every_file_under_the_workflows_is_read() {
+    let r = PathBuf::from(std::env::var_os("TMPDIR").unwrap_or_else(|| "/tmp".into()))
+        .join(format!("supdb-next-workflows-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&r);
+    let w = r.join(".github/workflows");
+    std::fs::create_dir_all(w.join("nested/deeper")).expect("dirs");
+    for (f, t) in [
+        ("a.yml", "a"),
+        ("b.yaml", "b"),
+        ("notes", "c"),
+        ("nested/deeper/d.yml", "d"),
+    ] {
+        std::fs::write(w.join(f), t).expect("write");
+    }
+    let got = ci_workflows_in(&r);
+    let _ = std::fs::remove_dir_all(&r);
+    let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            ".github/workflows/a.yml",
+            ".github/workflows/b.yaml",
+            ".github/workflows/nested/deeper/d.yml",
+            ".github/workflows/notes",
+        ],
+        "{got:?}"
+    );
+    assert_eq!(got[2].1, "d");
+}
+
+#[test]
+fn a_workflow_the_test_does_not_hold_fails() {
+    let (yaml, sh) = ci_texts();
+    let files = ci_workflows();
+    ci_check_files(&files, &sh, CI_NOT_RUN).expect("the workflows as they stand are green");
+    let with = |name: &str, text: &str| -> Vec<(String, String)> {
+        let mut f: Vec<(String, String)> =
+            files.iter().filter(|(n, _)| n != name).cloned().collect();
+        f.push((name.to_string(), text.to_string()));
+        f
+    };
+    let text = |name: &str| -> String {
+        files
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("{name}"))
+            .1
+            .clone()
+    };
+    // A new workflow, a check of every pull request outside check.sh, and
+    // one that checks nothing: both unlisted.
+    let extra = "name: extra\non:\n  pull_request:\njobs:\n  t:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/checkout@v4\n      - run: cargo test\n";
+    for (name, t) in [
+        (".github/workflows/extra.yml", extra),
+        (".github/workflows/nested/extra.yml", extra),
+        (".github/workflows/notes.txt", "a note\n"),
+    ] {
+        let e = ci_check_files(&with(name, t), &sh, CI_NOT_RUN).expect_err(name);
+        assert!(
+            e.contains(&format!("{name}: a workflow the test does not list")),
+            "{name}: {e}"
+        );
+    }
+    // apple-silicon.yml is held as ci.yml is: a check of its own in place
+    // of the group's call, a working directory, a trigger narrowed or
+    // widened.
+    let apple = ".github/workflows/apple-silicon.yml";
+    let at = text(apple);
+    for (from, to, want) in [
+        (
+            "run: sh scripts/check.sh machine",
+            "run: cargo test --profile checked",
+            "is no call of scripts/check.sh",
+        ),
+        (
+            "run: sh scripts/check.sh machine",
+            "run: sh scripts/check.sh machine\n        working-directory: bench",
+            "the key `working-directory`",
+        ),
+        (
+            "      - 'bench/src/env.rs'\n",
+            "",
+            "the trigger `pull_request.paths.-` the test lists",
+        ),
+        (
+            "      - 'bench/src/env.rs'\n",
+            "      - 'bench/src/env.rs'\n      - 'src/**'\n",
+            "the trigger `pull_request.paths.-: 'src/**'`",
+        ),
+        (
+            "  workflow_dispatch:\n",
+            "  workflow_dispatch:\n  push:\n",
+            "the trigger `push: ` is on no list",
+        ),
+        ("contents: read", "contents: write", "the key `contents`"),
+    ] {
+        let e =
+            ci_check_files(&with(apple, &ci_edit(&at, from, to)), &sh, CI_NOT_RUN).expect_err(to);
+        assert!(
+            e.contains(&format!("{apple}: ")) && e.contains(want),
+            "{to}: {e}"
+        );
+    }
+    let e = ci_check_files(
+        &with(
+            apple,
+            &ci_edit(
+                &at,
+                "run: sh scripts/check.sh machine",
+                "run: sh bench/scripts/libclang.sh",
+            ),
+        ),
+        &sh,
+        CI_NOT_RUN,
+    )
+    .expect_err("machine run by nobody");
+    assert!(
+        e.contains("the group `machine` of scripts/check.sh runs in no CI job"),
+        "{e}"
+    );
+    // A workflow that checks nothing, given a change's event.
+    let other = ".github/workflows/comparators.yml";
+    let ot = text(other);
+    for (from, to) in [
+        (
+            "  workflow_dispatch:\n",
+            "  workflow_dispatch:\n  pull_request:\n",
+        ),
+        ("  workflow_dispatch:\n", "  pull_request_target:\n"),
+        ("  workflow_dispatch:\n", "  workflow_dispatch:\n  push:\n"),
+        (
+            "  workflow_dispatch:\n",
+            "  workflow_dispatch:\n  push:\n    branches: ['**']\n",
+        ),
+        (
+            "  workflow_dispatch:\n",
+            "  workflow_dispatch:\n  push:\n    branches: [main]\n    tags: ['*']\n",
+        ),
+        ("  workflow_dispatch:\n", "  workflow_run:\n"),
+        ("  workflow_dispatch:\n", "  merge_group:\n"),
+        ("  workflow_dispatch:\n", "  - pull_request\n"),
+        ("\non:\n", "\non: [pull_request]\nx:\n"),
+        ("\non:\n", "\n'on':\n"),
+        ("\non:\n", "\ntrue:\n"),
+    ] {
+        let e =
+            ci_check_files(&with(other, &ci_edit(&ot, from, to)), &sh, CI_NOT_RUN).expect_err(to);
+        assert!(e.contains(other), "{to}: {e}");
+    }
+    // A push to main is not a change's event, and bank-row's is that.
+    let ok = ci_edit(
+        &ot,
+        "  workflow_dispatch:\n",
+        "  workflow_dispatch:\n  push:\n    branches: [main]\n",
+    );
+    ci_check_files(&with(other, &ok), &sh, CI_NOT_RUN).expect("a push to main");
+    // A listed workflow gone.
+    let gone: Vec<(String, String)> = files.iter().filter(|(n, _)| n != other).cloned().collect();
+    let e = ci_check_files(&gone, &sh, CI_NOT_RUN).expect_err("gone");
+    assert!(
+        e.contains(&format!("{other}: listed by the test and not in the tree")),
+        "{e}"
+    );
+    let gone: Vec<(String, String)> = files.iter().filter(|(n, _)| n != apple).cloned().collect();
+    let e = ci_check_files(&gone, &sh, CI_NOT_RUN).expect_err("apple gone");
+    assert!(
+        e.contains(&format!("{apple}: listed by the test and not in the tree")),
+        "{e}"
+    );
+    let _ = yaml;
+}
+
+/// `yaml` with the first occurrence of `from` replaced by `to`.
+fn ci_edit(yaml: &str, from: &str, to: &str) -> String {
+    assert!(yaml.contains(from), "the workflow has `{from}`");
+    yaml.replacen(from, to, 1)
+}
+
+#[test]
+fn a_ci_step_that_checks_outside_check_sh_fails() {
+    let (yaml, sh) = ci_texts();
+    ci_check(&yaml, &sh).expect("the workflow as it stands is green");
+    let call = "run: sh scripts/check.sh wasm";
+    // Each edit adds a step after the wasm group's call, so the verdict is
+    // the step's alone and every group still runs.
+    let red = |to: &str, want: &str| {
+        let e =
+            ci_check(&ci_edit(&yaml, call, &format!("{call}\n      - {to}")), &sh).expect_err(to);
+        assert!(
+            e.contains(want) && !e.contains("runs in no CI job"),
+            "{to}: {e}"
+        );
+    };
+    let outside = "is no call of scripts/check.sh";
+    // A cargo, a python and a script of scripts/ called to check.
+    red("run: cargo test --profile checked --lib", outside);
+    red("run: python3 scripts/ratchet.py HEAD~1", outside);
+    red("run: sh scripts/cost.sh HEAD~1", outside);
+    // Shell that decides a base, in a block.
+    red(
+        "run: |\n          base=\"$PR_BASE\"\n          [ -n \"$base\" ] || base=$(git rev-parse HEAD~1)\n          COST_BASE=\"$base\" sh scripts/check.sh cost",
+        outside,
+    );
+    // An environment set on the call, and a call with more after it.
+    red("run: COST_BASE=HEAD~1 sh scripts/check.sh cost", outside);
+    red(
+        "run: sh scripts/check.sh wasm && cargo test",
+        "no group of scripts/check.sh",
+    );
+    red(
+        "run: sh scripts/check.sh wasm-not",
+        "no group of scripts/check.sh",
+    );
+    // Set-up that hides a check, and a package list that runs something.
+    red("run: sh bench/scripts/libclang.sh && cargo test", outside);
+    red(
+        "run: sudo apt-get update -qq && sudo apt-get install -y -qq valgrind && make",
+        outside,
+    );
+    // A package name is a name: a `;` or a `&` inside one word runs what
+    // follows it.
+    red(
+        "run: sudo apt-get update -qq && sudo apt-get install -y -qq valgrind;cargo test",
+        outside,
+    );
+    red(
+        "run: sudo apt-get update -qq && sudo apt-get install -y -qq valgrind&&cargo test",
+        outside,
+    );
+    red(
+        "run: sudo apt-get update -qq && sudo apt-get install -y -qq valgrind|sh",
+        outside,
+    );
+    red(
+        "run: sh scripts/check.sh wasm\n        shell: python3 {0}",
+        "a shell of the step's own",
+    );
+    red("run: \"sh scripts/check.sh wasm\"", "a quoted run");
+    red("run:", "a run with no command");
+    // A run in flow style, and an action that checks.
+    let e = ci_check(
+        &ci_edit(
+            &yaml,
+            "  wasm:\n",
+            "  wasm:\n    steps: [{run: cargo test}]\n",
+        ),
+        &sh,
+    )
+    .expect_err("a flow-style run");
+    assert!(e.contains("a step the test cannot read"), "{e}");
+    let e = ci_check(
+        &ci_edit(
+            &yaml,
+            "uses: Swatinem/rust-cache@v2",
+            "uses: actions-rs/clippy-check@v1",
+        ),
+        &sh,
+    )
+    .expect_err("an unknown action");
+    assert!(e.contains("the action `actions-rs/clippy-check@v1`"), "{e}");
+    // A continued line is one command.
+    ci_check(
+        &ci_edit(
+            &yaml,
+            call,
+            "run: |\n          sh scripts/check.sh \\\n            wasm",
+        ),
+        &sh,
+    )
+    .unwrap_or_else(|e| panic!("a continued call: {e}"));
+    // The keys around a run: a condition, a verdict ignored, an
+    // environment the test does not list, a key it does not know, an
+    // anchor, and a step that is two things.
+    let lists = "        run: sh scripts/check.sh lists\n";
+    let cost = "          SUPDB_PR_BASE: ${{ github.event.pull_request.base.sha }}\n          SUPDB_PUSH_BEFORE: ${{ github.event.before }}\n        run: sh scripts/check.sh cost\n";
+    let cross = "      - name: Build and test under emulation\n";
+    let edits: &[(&str, &str, &str)] = &[
+        (lists, "        if: false\n        run: sh scripts/check.sh lists\n", "an `if:` the test does not list"),
+        ("  lists:\n", "  lists:\n    if: github.event_name == 'workflow_dispatch'\n", "a job's `if:`"),
+        ("  wasm:\n", "  wasm:\n    if: false\n", "a job's `if:`"),
+        (lists, "        continue-on-error: true\n        run: sh scripts/check.sh lists\n", "continue-on-error"),
+        ("  cost:\n", "  cost:\n    continue-on-error: true\n", "continue-on-error"),
+        (cross, "      - name: Build and test under emulation\n        env:\n          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: --cfg supdb_emulated\n", "the environment `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS"),
+        (cost, "          SUPDB_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}\n        run: sh scripts/check.sh cost\n", "the environment `SUPDB_BASE"),
+        (lists, "        env:\n          SUPDB_BASE: HEAD\n        run: sh scripts/check.sh lists\n", "the environment `SUPDB_BASE: HEAD`"),
+        (lists, "        env:\n          RATCHET_RED_STEPS: B\n        run: sh scripts/check.sh lists\n", "the environment `RATCHET_RED_STEPS: B`"),
+        (cost, "          SUPDB_PR_BASE: ${{ github.event.pull_request.base.sha }}\n          SUPDB_PUSH_BEFORE: ${{ github.event.before }}\n          COST_PROBES: read\n        run: sh scripts/check.sh cost\n", "the environment `COST_PROBES: read`"),
+        ("env:\n  CARGO_TERM_COLOR: always\n", "env:\n  CARGO_TERM_COLOR: always\n  SUPDB_BASE: HEAD\n", "the environment `SUPDB_BASE: HEAD`"),
+        ("  wasm:\n", "  wasm:\n    env:\n      COST_BASE: HEAD\n", "the environment `COST_BASE: HEAD`"),
+        ("  wasm:\n", "  wasm:\n    defaults:\n      run:\n        working-directory: bench\n", "the key `defaults`"),
+        (lists, "        working-directory: bench\n        run: sh scripts/check.sh lists\n", "the key `working-directory`"),
+        ("        with:\n          fetch-depth: 0\n", "        with:\n          fetch-depth: 0\n          ref: HEAD~1\n", "the input `ref` of `actions/checkout@v4`"),
+        (lists, "        uses: actions/checkout@v4\n        run: sh scripts/check.sh lists\n", "both a run and an action"),
+        (cross, "      - <<: *anchor\n      - name: Build and test under emulation\n", "a step the test cannot read"),
+        (cross, "      - name: x\n        <<: *anchor\n        run: cargo test\n      - name: Build and test under emulation\n", "a step the test cannot read"),
+        (cross, "      - name: &a x\n      - name: Build and test under emulation\n", "a step the test cannot read"),
+        ("  wasm:\n", "  wasm:\n    env: {COST_BASE: HEAD}\n", "a step the test cannot read"),
+        ("        if: always()\n", "        if: failure()\n", "an `if:` the test does not list"),
+        // A name the test lists, with a value it does not.
+        ("          SUPDB_PR_BASE: ${{ github.event.pull_request.base.sha }}\n", "          SUPDB_PR_BASE: HEAD~1\n", "the environment `SUPDB_PR_BASE: HEAD~1`"),
+        // An input the test lists for another action.
+        ("        with:\n          fetch-depth: 0\n", "        with:\n          fetch-depth: 0\n          path: elsewhere\n", "the input `path` of `actions/checkout@v4`"),
+        // A list where the workflow has none, and a step's keys with no step.
+        ("env:\n  CARGO_TERM_COLOR: always\n", "env:\n  - CARGO_TERM_COLOR: always\n", "a list outside a job's steps"),
+        ("  wasm:\n", "  wasm:\n    steps:\n      name: x\n", "a key before any step"),
+    ];
+    for (from, to, want) in edits {
+        let e = ci_check(&ci_edit(&yaml, from, to), &sh).expect_err(to);
+        assert!(e.contains(want), "{to}: {e}");
+    }
+    // A condition on a check, or on its job, is a group nobody may run.
+    for (from, to) in [
+        (
+            lists,
+            "        if: false\n        run: sh scripts/check.sh lists\n",
+        ),
+        (
+            "  lists:\n",
+            "  lists:\n    if: github.event_name == 'workflow_dispatch'\n",
+        ),
+    ] {
+        let e = ci_check(&ci_edit(&yaml, from, to), &sh).expect_err(to);
+        assert!(
+            e.contains("the group `lists` of scripts/check.sh runs in no CI job"),
+            "{to}: {e}"
+        );
+    }
+    // The one condition the test lists is on the step that publishes.
+    let moved = ci_edit(&yaml, "        if: always()\n", "");
+    let moved = ci_edit(
+        &moved,
+        lists,
+        "        if: always()\n        run: sh scripts/check.sh lists\n",
+    );
+    let e = ci_check(&moved, &sh).expect_err("always() on a check");
+    assert!(e.contains("an `if:` the test does not list"), "{e}");
+    // A job named as a key of another place is read as a job: its
+    // condition, its other keys, and its groups under the condition.
+    let renamed = ci_edit(&yaml, "  lists:\n", "  inputs:\n    if: false\n");
+    let e = ci_check(&renamed, &sh).expect_err("a job named `inputs` with a condition");
+    assert!(
+        e.contains("a job's `if:`")
+            && e.contains("the group `lists` of scripts/check.sh runs in no CI job"),
+        "{e}"
+    );
+    for name in [
+        "inputs",
+        "push",
+        "workflow_dispatch",
+        "matrix",
+        "with",
+        "on",
+    ] {
+        let e = ci_check(
+            &ci_edit(
+                &yaml,
+                "  lists:\n",
+                &format!("  {name}:\n    needs: test\n"),
+            ),
+            &sh,
+        )
+        .expect_err(name);
+        assert!(e.contains("the key `needs`"), "{name}: {e}");
+    }
+    // An environment is read where an environment stands, and nowhere
+    // else: under a strategy it is a key the test does not know.
+    let e = ci_check(
+        &ci_edit(
+            &yaml,
+            "      fail-fast: false\n",
+            "      fail-fast: false\n      env:\n        CARGO_TERM_COLOR: always\n",
+        ),
+        &sh,
+    )
+    .expect_err("env under a strategy");
+    assert!(e.contains("the key `env`"), "{e}");
+    // The triggers: every one the test lists, with its value, and no other.
+    for (from, to, want) in [
+        ("  pull_request:\n", "", "the trigger `pull_request`"),
+        (
+            "  push:\n    branches: [main]\n",
+            "  push:\n    branches: [never]\n",
+            "the trigger `push.branches: [never]`",
+        ),
+        ("    tags: ['*']\n", "", "the trigger `push.tags`"),
+        (
+            "  workflow_dispatch:\n",
+            "  workflow_dispatch:\n    branches: [main]\n",
+            "the key `branches`",
+        ),
+    ] {
+        let e = ci_check(&ci_edit(&yaml, from, to), &sh).expect_err(to);
+        assert!(e.contains(want), "{to}: {e}");
+    }
+}
+
+#[test]
+fn a_group_no_ci_job_runs_fails() {
+    let (yaml, sh) = ci_texts();
+    ci_check(&yaml, &sh).expect("the workflow as it stands is green");
+    let e = ci_check(
+        &ci_edit(
+            &yaml,
+            "run: sh scripts/check.sh wasm",
+            "run: sh bench/scripts/libclang.sh",
+        ),
+        &sh,
+    )
+    .expect_err("wasm run by nobody");
+    assert!(
+        e.contains("the group `wasm` of scripts/check.sh runs in no CI job"),
+        "{e}"
+    );
+    let more = ci_edit(&sh, "    wasm)\n", "    newgroup)\n      ;;\n    wasm)\n");
+    let e = ci_check(&yaml, &more).expect_err("a new group");
+    assert!(e.contains("the group `newgroup`"), "{e}");
+    let groups = check_groups(&sh).expect("check.sh's labels read");
+    assert!(groups.contains("wasm") && !groups.contains("*"));
+    // Two groups in one label, and a label the test cannot read.
+    let two = ci_edit(&sh, "    wasm)\n", "    newa|newb)\n      ;;\n    wasm)\n");
+    let e = ci_check(&yaml, &two).expect_err("two new groups");
+    assert!(
+        e.contains("the group `newa`") && e.contains("the group `newb`"),
+        "{e}"
+    );
+    // A case inside a group is not the end of the groups' case.
+    for nested in [
+        "    build)\n      case \"$x\" in\n        a) ;;\n      esac\n",
+        "    build)\n      case \"$x\" in\n        a)\n          ;;\n      esac\n",
+        "    build)\n      case \"$x\" in a) ;; esac\n",
+    ] {
+        let more = ci_edit(&sh, "    build)\n", nested);
+        let more = ci_edit(&more, "    wasm)\n", "    newgroup)\n      ;;\n    wasm)\n");
+        let e = ci_check(&yaml, &more).expect_err(nested);
+        assert!(e.contains("the group `newgroup`"), "{nested}: {e}");
+    }
+    let odd = ci_edit(
+        &sh,
+        "    build)\n",
+        "    build)\n      true && case \"$x\" in\n",
+    );
+    let e = ci_check(&yaml, &odd).expect_err("a case the test cannot read");
+    assert!(e.contains("a `case` or `esac` the test cannot read"), "{e}");
+    let deep = ci_edit(&sh, "    wasm)\n", "      newc)\n      ;;\n    wasm)\n");
+    let e = ci_check(&yaml, &deep).expect_err("a label at another indent");
+    assert!(
+        e.contains("a label of scripts/check.sh the test cannot read"),
+        "{e}"
+    );
+    // A group no job runs, said so with a reason, passes; said so without
+    // one, or said of a group a job runs or of no group, fails.
+    let none = ci_edit(
+        &yaml,
+        "run: sh scripts/check.sh wasm",
+        "run: sh bench/scripts/libclang.sh",
+    );
+    ci_check_with(&none, &sh, &[("wasm", "a reason")])
+        .unwrap_or_else(|e| panic!("wasm said not run: {e}"));
+    let e = ci_check_with(&none, &sh, &[("wasm", " ")]).expect_err("no reason");
+    assert!(e.contains("CI_NOT_RUN gives `wasm` no reason"), "{e}");
+    let e = ci_check_with(&yaml, &sh, &[("wasm", "a reason")]).expect_err("run and said not");
+    assert!(
+        e.contains("the group `wasm` runs in CI and CI_NOT_RUN says it does not"),
+        "{e}"
+    );
+    let e = ci_check_with(&yaml, &sh, &[("nogroup", "a reason")]).expect_err("no such group");
+    assert!(e.contains("CI_NOT_RUN names `nogroup`, no group"), "{e}");
 }
