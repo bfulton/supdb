@@ -17883,8 +17883,25 @@ struct CachedBlock {
     /// since, so a walk's start and a patch's entry are a rank less the
     /// block's first (`Options::copy_start_at_rank`). An insert clears it
     /// for good; a delete leaves the entry, with an empty run, so it
-    /// holds.
+    /// holds. True only of the partition `identity_of` names
+    /// (`CachedBlock::identity_for`).
     identity: bool,
+    /// The blob id of the partition whose records the entries are where
+    /// `identity` holds. A table is carried across a merge that rewrites
+    /// its partition over the same block boundaries (`Db::same_blocks`:
+    /// the same key count and the same key at every block's first rank),
+    /// and its copies with it; a delete and an insert in one block that a
+    /// piece carried into the merge before any settle filed them leave
+    /// the boundaries and the count as they were and the records between
+    /// them other keys, so a copy whose entries were the old partition's
+    /// records is not the new one's. Its identity, still claimed, sent the
+    /// settle's patch of the inserted key -- a record of the new partition
+    /// at its cut -- to the entry the old records had at that rank, and a
+    /// walk's start there too: in a checked build the assertion beside
+    /// the patch, one run in a hundred of the differential fuzz's seed
+    /// 1050, and in a release build a patch written over another key's
+    /// entry and a scan started past keys, nothing raised.
+    identity_of: u64,
     /// A copy of a block wide by its count (`Options::forms_copy_hot_wide`),
     /// kept past the wide bound: the settle that grows its overlay past the
     /// bound appends to it where it drops any other form for a wide build.
@@ -17897,6 +17914,12 @@ struct CachedBlock {
 }
 
 impl CachedBlock {
+    /// Whether entry `i` is record `lo + i` of the partition `blob` names:
+    /// the identity holds, and of that partition.
+    #[inline]
+    fn identity_for(&self, blob: u64) -> bool {
+        self.identity && self.identity_of == blob
+    }
     /// The three buffers shrunk to what they hold, where a build asked
     /// for more than it filled (`Options::forms_to_fit`).
     fn fit(&mut self) {
@@ -18161,7 +18184,7 @@ fn copy_entry_at(table: &BlockTable, b: u32, cut: u32) -> Option<(&CachedBlock, 
         return None;
     };
     let j = ((cut >> 1) as usize).checked_sub(b as usize * CACHE_BLOCK)?;
-    (blk.identity && j < blk.ents.len()).then_some((blk, j))
+    (blk.identity_for(table.blob) && j < blk.ents.len()).then_some((blk, j))
 }
 
 /// The lines a walk of `form` over the partition's ranks `from` to `n`
@@ -30837,7 +30860,7 @@ impl Reader {
                 // answered (`Options::copy_start_at_rank`).
                 let lo = b * CACHE_BLOCK;
                 let at_rank = self.opts.copy_start_at_rank
-                    && blk.identity
+                    && blk.identity_for(table.blob)
                     && same
                     && c >= lo
                     && c - lo < blk.ents.len();
@@ -31996,8 +32019,9 @@ impl Reader {
                         // entries are the block's records; the cursor is
                         // above record `start - 1` and not above `start`,
                         // so no entry between them is skipped.
-                        let at_rank =
-                            self.opts.copy_start_at_rank && blk.identity && rank != usize::MAX;
+                        let at_rank = self.opts.copy_start_at_rank
+                            && blk.identity_for(src.seg.blob.id())
+                            && rank != usize::MAX;
                         let i = if !first {
                             0
                         } else if at_rank {
@@ -32372,6 +32396,26 @@ impl Reader {
             }
         }
         (clean, sparse, copies, wide)
+    }
+
+    /// A test's: the writer's copies that claim their entries are their
+    /// partition's records, and of those the ones whose claim is of the
+    /// partition their table now stands over (`CachedBlock::identity_for`).
+    #[doc(hidden)]
+    pub fn block_cache_identity(&self) -> (usize, usize) {
+        let _e = self.enter();
+        let (mut claimed, mut holds) = (0usize, 0usize);
+        for t in self.fs().tables.borrow().iter() {
+            for t in t.borrow().iter() {
+                for c in t.slots.iter().flatten() {
+                    if let Cached::Block(b) = &**c {
+                        claimed += b.identity as usize;
+                        holds += b.identity_for(t.blob) as usize;
+                    }
+                }
+            }
+        }
+        (claimed, holds)
     }
 
     /// PROTOTYPE: the copies' layout, for a measurement: bytes of their
@@ -44385,6 +44429,7 @@ impl<'s> BuildCtx<'s> {
             vals: Vec::with_capacity(n * 128),
             ents: Vec::with_capacity(n),
             identity: false,
+            identity_of: src.seg.blob.id(),
             wide: false,
             dead: 0,
         });
@@ -44454,6 +44499,7 @@ impl<'s> BuildCtx<'s> {
             vals: Vec::with_capacity(sb.vals.len() + kept * 128),
             ents: Vec::with_capacity(sb.ents.len() + kept),
             identity: false,
+            identity_of: seg.blob.id(),
             wide: false,
             dead: 0,
         };

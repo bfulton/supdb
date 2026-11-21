@@ -2985,6 +2985,33 @@ against an object is kept only under that object's identity, and a
 carry that keeps the structure across a replacement of the object
 re-takes every position it holds, not only the ones a form holds.
 
+It came a third time as a flag. A copy whose entries are its block's
+records says so (`CachedBlock::identity`), and a patch writes the
+key's entry at its cut less the block's first rank where it does,
+without a search; the copies are what that carry keeps, on the reading
+that their key range is the same on both sides, which is true of their
+keys and not of their ranks. A delete and an insert in one block keep
+the boundaries and the count, and when their writes were lent to the
+upkeep thread and still unsettled at the freezes, the settle filed them
+after the rebase, through the tables the freezes replaced: the inserted
+key resolved to a record of the new partition, and the copy, still
+claiming its identity, took that rank for the key's entry and wrote
+the value over another key's. In the checked profile the assertion
+beside the patch fired, fourteen runs of eight hundred of the
+differential fuzz's seed 1050 under the cache and the option draws and
+none with the fix; in a release build nothing raised. A copy holds its
+identity of the partition its build read now (`CachedBlock::identity_for`,
+the blob id beside the flag), and `tests/settle.rs` builds the state
+by holding the upkeep thread before its pass while the seals and the
+merge land. The walk's start by rank honours the flag the same way,
+though no state was found that walks such a copy before the insert
+that moved its ranks is filed and clears the flag; the prefetch that
+asks for a patch's lines by rank does too, and only aims a prefetch.
+The corollary: a carry is checked against every claim the carried
+structure makes about the object it was derived from -- its positions,
+and the flag that says its entries are the object's own -- since a
+claim kept in a boolean is a position no search will ever re-take.
+
 **A cache a thread kept of things a store had closed.** The memo of
 decoded groups was the thread's, keyed by the form file's attach identity
 and the page, and a thread that read through one store's form files and

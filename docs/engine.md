@@ -3748,8 +3748,12 @@ exists to warm. After a burst of updates every copy's entries are the
 block's records and nothing else -- an update patches an entry in place
 and inserts none -- and the copy knows it (`CachedBlock::identity`,
 set by the build over updates at known cuts, cleared by an insert for
-good), so the walk starts at the seek's rank less the block's first
-(`Options::copy_start_at_rank`; `supdb-copysearch` searches). On the
+good, and held of the partition the build read: a table carried across
+a merge that rewrites its partition over the same blocks keeps copies
+whose entries are the old partition's records, so they are searched
+there, `CachedBlock::identity_for`), so the walk starts at the seek's
+rank less the block's first (`Options::copy_start_at_rank`;
+`supdb-copysearch` searches). On the
 probe, eighteen passes a shape over nine rotated rounds, the start at
 the rank read 2.90 µs a scan against the search's 2.98 with the first
 block's prefetch kept and 2.83 against 3.23 without it, faster in six

@@ -7340,6 +7340,53 @@ fn a_dense_form_converts_from_its_own_deltas() {
     );
 }
 
+/// A sparse form of updates alone, converted to a copy from its deltas,
+/// is a copy whose entries are its partition's records, and of that
+/// partition (`CachedBlock::identity_for`): a patch after it writes by the
+/// key's rank and a walk starts there.
+#[test]
+fn a_copy_converted_from_updates_alone_is_its_partitions_records() {
+    let d = dir("convert-identity");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(64 << 10),
+        scan_block_cache: true,
+        upkeep: supdb::Upkeep::Inline,
+        ..common::options()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1200 {
+        m.append(&mut db, &key(k), &format!("p{k}"));
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    assert_eq!(db.levels(), (1, 0), "one partition of several blocks");
+    m.check(&db, "clean");
+    let before = db.forms_events()[13];
+    // A part of every block a round, all of them updates of a record: the
+    // first fill leaves sparse forms and the next finds them dense.
+    for off in 0..5u32 {
+        for k in (off..1200).step_by(5) {
+            m.delete(&mut db, &key(k));
+            m.append(&mut db, &key(k), &format!("u{k}"));
+        }
+        db.commit().unwrap();
+        m.check(&db, &format!("round {off}"));
+    }
+    assert!(
+        db.forms_events()[13] > before,
+        "dense forms were converted from their own deltas"
+    );
+    let (claimed, holds) = db.block_cache_identity();
+    assert!(
+        claimed >= 1 && holds == claimed,
+        "the converted copies are their partition's records: {claimed} claimed, {holds} of it"
+    );
+}
+
 /// A light sparse form -- under the dense count, at least
 /// `Options::forms_convert_from` deltas -- is converted to a copy by a fill
 /// on the upkeep thread, where the write mixes' few deltas a block are filed,
