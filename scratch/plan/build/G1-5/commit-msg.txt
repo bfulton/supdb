@@ -1,0 +1,66 @@
+A key section read by the piece has its checksum row verified at open unless its source says it authenticates what it lends
+
+`Bytes::authenticated` says whether a source has checked every byte it
+lends before lending it; it defaults to false. A paged mapping answers
+true, since its pager lends no chunk whose tag it has not checked, and a
+mapped file answers false. `Blob::open_with` used to skip the key
+section's checksum row for any section held by the piece. It now sends
+such a section to `verify_row_by_piece` (cold, out of line), which skips
+the row only over an authenticated source and otherwise verifies it
+through `flatindex::verify_pieces_in`: the row asked for once, each piece
+asked for on its own, never the section whole. The arm for a section
+held whole is the code it was.
+
+How it was shown red: the new test in tests/blob.rs flips a byte of the
+key section of a segment opened over a source that lends by the piece
+and checks nothing, and requires the refusal the whole reader gives, in
+its words. Before the change the flip opened ("a flip at section offset
+18471 opened over a source by the piece that checks nothing"). The test
+now flips the last byte of every piece, the short first piece and the
+piece ending at the row among them, and holds the open of an unchecked
+piece source to asking every byte with no ask longer than a piece. A
+second test forges a piece whose CRC moves in its top byte alone. The
+test that a source by the piece answers the same opens an authenticated
+source now, so its bound of under a page asked at the open is that
+source's bound.
+
+What it cannot see: no source the engine makes takes the new path (every
+piece source the engine makes is a paged mapping, which authenticates),
+so the verify by the piece runs only for an outside `Bytes` that lends by
+the piece and does not say it authenticates. That no third party
+implements `Paging` is not checked; it is doc-hidden public, and only
+the crate's `MmapBytes::paged` builds one.
+
+What a store in the clear pays: counted with callgrind by function
+against the commit this began at, over the load, commit, seal, scan_at,
+merge and land probes, cost: green. `Blob::open_with` reads three
+instructions more for each segment opened in the loads and the same in
+the merge and the landing, where some of its instructions moved between
+inlined lines with the same total. Nothing is added a key, an entry, a
+block or a step, no syscall is added, and the new functions run in no
+probe.
+
+Under a cipher: nothing changes in behaviour. The store's sources answer
+authenticated, so its open still skips the row, and the cipher store's
+open stays within its bound of chunks (tests/cipher.rs), which is what
+fails when a paged mapping answers false. Nothing new starts to work
+there and no pricing is owed.
+
+Mutants: the unit's list and others on the new lines, among them the
+default answering true, the skip keyed on the piece kind alone, the
+verify asking for the section whole, a mapped file or an empty mapped
+file answering true, a paged mapping answering false, the verdict
+dropped, a mismatch passed, three bytes of the word compared, the base
+aligned to the piece, and the first, the last, a short or a middle piece
+asked for and never compared. Each is killed; the first-, last- and
+short-piece mutants survived the test before it flipped a byte in every
+piece, and the empty-file mutant survived until a test mapped an empty
+file.
+
+Left open: `BlobOptions::read_ahead` is not given to the walk by the
+piece, since no library source reaches it and the hook advises a
+mapping. `crypt::Encrypted` keeps the default false; it never lends by
+the piece, so true would change nothing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GEwcALZsCzTm28PHd4bQza

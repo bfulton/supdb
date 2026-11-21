@@ -142,9 +142,9 @@ bulk replacement broke tick-exact tests once; do it test by test. Planned for th
 
 ## What is left, in the owner's order
 
-### 1. The page layer (task 12). Stage G1 under way: four units of eight landed, the lists' check, and the count against upstream brought under.
+### 1. The page layer (task 12). Stage G1 under way: five units of eight landed, the lists' check, and the count against upstream brought under.
 
-**As of 21 Nov 13:19 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
+**As of 21 Nov 16:03 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
 launched one unit a launch: `Workflow {scriptPath, args: {base:
 "ea6352181f342b7bffd75ec8c88df92bc7b78ff6", only: ["G1-<n>"], tail: false, since: <note>}}`,
 the same base for every unit; after G1-8 a launch with `only: ["none"]` and no `tail: false`
@@ -325,7 +325,48 @@ holds; a note for a step changes no earlier prompt, so the steps before it repla
     over the gate probe's run: a cheaper shape for whoever counts those rows next.
   - Owed to S5, no timing taken: `bench/scripts/pair.sh supdb-cipherauto supdb-cipher 5000000
     --bound 671088640 --passes read` at this commit and the one before.
-- **Next, in order:** G1-5 `authenticated`, then `advice`, `sealed`, `docs`.
+- **G1-5 `authenticated` landed: `ce095eb9`.** `Bytes::authenticated` (default false) says
+  whether a source has checked every byte it lends. `Blob::open_with` skipped the key
+  section's checksum row for any section held by the piece; it now sends such a section to
+  `verify_row_by_piece` (`#[cold] #[inline(never)]`), which skips the row only over an
+  authenticated source and otherwise verifies it through `flatindex::verify_pieces_in`, the
+  row asked for once and each piece on its own. `MmapBytes` answers true for a paged mapping
+  and false for a mapped file, so a store under a cipher opens as it did (the open bound in
+  `tests/cipher.rs` is what fails when a paged mapping answers false) and the change is for
+  an outside source that lends by the piece. `tests/blob.rs` flips the last byte of every
+  piece, the short first one and the one ending at the row among them, and forges a piece
+  whose CRC moves in its top byte alone (a one-byte flip cannot tell a three-byte compare
+  from a four-byte one). The plain store's count: `sh scripts/cost.sh ea0962c2 load_durable
+  load_buffered commit_durable commit_buffered seal scan_at merge land` green;
+  `Blob::open_with` reads three instructions more a segment opened in the two loads (265 to
+  268) and the same in the merge and the landing, nothing a key. Three review rounds; the
+  first repair was cut short (its agent ended its turn to wait for a background run, and the
+  harness took its answer as it stood), the second finished what it owed (every mutant, the
+  full test run, lint, wasm, the bench group, the recount), and the third added the per-piece
+  flips, read by the launcher and by no reviewer. Notes, mutants, the mutant scripts, results
+  and count logs are in `scratch/plan/build/G1-5/`. Open, each owed to a named place:
+  - The three instructions a segment opened: a reviewer's shape that may cost nothing (the
+    old `if .. && key.pieces(&src).is_none() { whole arm }` kept, with an `else if let
+    Some(p)` to the cold function) was not counted. G1-7 counts row 6 and edits the same
+    dispatch.
+  - `MmapBytes::authenticated` is `self.map().is_none()`, spelled so that `bytes.rs` gains no
+    wall token; it is exact while `Own` has two variants and `map()` matches both with no
+    wildcard. A third variant that answers `None` there would answer authenticated: say so
+    at `map()` and at `Own` (G1-7, which edits both).
+  - Docs that do not yet say what the code does: `BlobOptions::verify_index` (the row is
+    skipped over an authenticated piece source and verified a piece an ask over any other),
+    `BlobOptions::read_ahead` (the walk by the piece ignores it), `Paging`'s contract (an
+    implementor lends only bytes it has checked; `InMemory` in `src/ordindex.rs`'s tests
+    checks nothing and answers authenticated through `MmapBytes::paged`),
+    `Bytes::authenticated`'s "a reader" (`OrdIndex::open` skips its CRC on `piecewise`
+    alone, which is right only because its sources come from `vault::map`), and
+    `verify_row_by_piece`'s "whole" (it means every byte). G1-8.
+  - `flatindex::verify_pieces_in` is a new public function, and it trusts `Sect::range` to
+    return exactly the length asked for. Not verified: that no outside crate implements the
+    doc-hidden public `Paging` (G1-7 makes it `pub(crate)`).
+- **For every launch from G1-6 on:** an agent never ends its turn to wait for a background
+  command; it waits in a foreground command with a long timeout. The launch note says so.
+- **Next, in order:** G1-6 `advice`, then `sealed`, `docs`.
   Every unit from here is launched with a build note: a CI job it adds is
   `sh scripts/check.sh <group>` with nothing in the YAML but event values, a list it adds is
   registered in `scripts/ratchet.py`, and a move between functions the cost group reads red is

@@ -1,0 +1,10 @@
+START 2026-11-21T15:40:16Z
+     Running tests/blob.rs (target/checked/deps/blob-2820d878040fe64f)
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.64s
+     Running tests/cipher.rs (target/checked/deps/cipher-b004b6a09b51b303)
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.92s
+     Running tests/segwriter.rs (target/checked/deps/segwriter-d2bd642281c342a0)
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.99s
+     Running tests/source.rs (target/checked/deps/source-85d81eb29cea0fb9)
+test result: ok. 75 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 53.85s
+EXIT 0

@@ -1,0 +1,42 @@
+Sat Nov 21 13:25:21 UTC 2026
+ea0962c21dcc52967c7e6fe9577dd7622e31a44c
+ src/bytes.rs  |  17 ++++++++++
+ tests/blob.rs | 103 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 118 insertions(+), 2 deletions(-)
+   Compiling supdb v0.1.0 (/home/user/supdb)
+    Finished `checked` profile [optimized + debuginfo] target(s) in 3.86s
+     Running tests/blob.rs (target/checked/deps/blob-2820d878040fe64f)
+
+running 3 tests
+test the_advice_by_rank_answers_the_same_for_a_source_by_the_piece ... ok
+test a_source_by_the_piece_that_checks_nothing_has_its_row_verified_at_open ... FAILED
+test a_source_that_lends_by_the_piece_answers_the_same ... ok
+
+failures:
+
+---- a_source_by_the_piece_that_checks_nothing_has_its_row_verified_at_open stdout ----
+
+thread 'a_source_by_the_piece_that_checks_nothing_has_its_row_verified_at_open' (18781) panicked at tests/blob.rs:469:9:
+a flip at section offset 18471 opened over a source by the piece that checks nothing
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/panicking.rs:80:14
+   2: blob::a_source_by_the_piece_that_checks_nothing_has_its_row_verified_at_open
+   3: blob::a_source_by_the_piece_that_checks_nothing_has_its_row_verified_at_open::{closure#0}
+             at ./tests/blob.rs:440:76
+   4: <blob::a_source_by_the_piece_that_checks_nothing_has_its_row_verified_at_open::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/ops/function.rs:250:5
+   5: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    a_source_by_the_piece_that_checks_nothing_has_its_row_verified_at_open
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 27.99s
+
+error: test failed, to rerun pass `--test blob`
+EXIT 101
