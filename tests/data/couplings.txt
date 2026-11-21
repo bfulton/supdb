@@ -34,12 +34,12 @@ src/bytes.rs	MmapBytes::advise_willneed	paged	code	1	stays	the seam: Paging, pie
 src/bytes.rs	MmapBytes::map	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::paged	paged	code	2	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::paged	pager	code	4	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
-src/bytes.rs	MmapBytes::paged_resident	paged	code	2	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::piece_at	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::piece_end	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::piecewise	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::piecewise	piecewise/ASK_PIECES	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::resident_at	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
+src/bytes.rs	MmapBytes::resident_share	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::slice_slow	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	Own::<item>	paged	code	2	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	Paging::<item>	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
@@ -177,7 +177,6 @@ src/db.rs	Readers::pin	pager	code	1	stays	pager::debug_pinned hook
 src/db.rs	Readers::unpin	pager	code	1	stays	pager::debug_pinned hook
 src/db.rs	RunMap::<item>	vault::Mapped	code	1	S1	vault::Mapped becomes the door's mapped backing (design 2); add to the door list then
 src/db.rs	RunMap::open	vault::open_mapped	code	1	S1	vault::open_mapped becomes a door verb (design 2)
-src/db.rs	Seg::records_resident	paged	code	1	G1	paged_resident through the byte source (R3)
 src/db.rs	Shared::<item>	pager	code	3	stays	Shared.pager: the cache the read path pins
 src/db.rs	Unlent::<item>	unlent/unlend	code	1	S1	pin::idle guard
 src/db.rs	Wal::<item>	cipher	code	1	S6	Wal.enc: Option<vault::LogCipher>
@@ -213,7 +212,6 @@ src/db.rs	manifest_image	vault/pager method	code	1	S6	v.persist + seal_manifest 
 src/db.rs	manifest_image	vault::under	code	1	S6	v.persist + seal_manifest (tokens part goes at S3)
 src/db.rs	manifest_open	sealed log/manifest	code	2	S6	open_manifest + adopt_all (tokens part goes at S3)
 src/db.rs	manifest_open	vault::under	code	1	S6	open_manifest + adopt_all (tokens part goes at S3)
-src/db.rs	map_resident_share	paged	code	1	G1	paged_resident through the byte source; G1-6 asks residency of the source (R3)
 src/db.rs	merge_keys	MergeRest/NoRest	code	1	R4	R: MergeRest
 src/db.rs	merge_ranks	MergeRest/NoRest	code	1	R4	R: MergeRest
 src/db.rs	mod cipher_looks	cipher	test	1	stays	cipher_looks: the plain/cipher look words of the plumbing
@@ -342,5 +340,6 @@ src/lib.rs	mod crypt	crypt	code	1	stays	the crate root re-exports the encryption
 src/ordindex.rs	OrdIndex::head_absent	piecewise/ASK_PIECES	code	1	stays	the lazy top's assertion for a map read by the piece (the ordered index's skip is left, g1.md change 2)
 src/ordindex.rs	OrdIndex::mapped_heads	piecewise/ASK_PIECES	code	1	stays	no heads lent from a mapping read by the piece (R2's dispatch)
 src/ordindex.rs	OrdIndex::over	piecewise/ASK_PIECES	code	1	stays	the CRC skip and lazy top for a piecewise map; right for every source vault::map gives (G1-5 leaves it)
-src/ordindex.rs	an_index_read_by_the_piece_seeks_as_the_mapped_one	paged	test	2	stays	a test of the reader over the seam's Paging
+src/ordindex.rs	InMemory::<item>	paged	test	1	stays	a test of the reader over the seam's Paging
+src/ordindex.rs	in_memory	paged	test	1	stays	a test of the reader over the seam's Paging
 src/ordindex.rs	an_index_read_by_the_piece_seeks_as_the_mapped_one	piecewise/ASK_PIECES	test	1	stays	a test of the reader over the seam's Paging

@@ -13561,7 +13561,7 @@ impl Seg {
     /// Answers the index's bytes the page cache held before the advice and
     /// after it.
     fn redrop_ord_pages(&self, dir: &Path) -> (u64, u64) {
-        let held = |s: &Seg| (resident_share(s.ord.mapped()) * s.ord.file_bytes() as f64) as u64;
+        let held = |s: &Seg| (s.ord.resident_share() * s.ord.file_bytes() as f64) as u64;
         let before = held(self);
         if let Some(name) = Db::ord_name_for(&self.name) {
             if let Ok(f) = vault::open(dir.join(&name)) {
@@ -13645,20 +13645,28 @@ impl Seg {
         )
     }
 
-    /// The share of the record region's pages the page cache holds now
-    /// (`resident_share`): whether a build would read the records from
-    /// memory or from the device. For a file of a store under a cipher,
-    /// the share of its chunks the store's cache holds or the kernel's
-    /// holds the ciphertext of (`pager::Paged::resident`).
+    /// The share of the record region a read would find in memory now,
+    /// asked of the segment's source (`Bytes::resident_share`): whether a
+    /// build would read the records from memory or from the device. For a
+    /// mapped file the share of its pages the page cache holds; for a file
+    /// read through the store's cache, of its chunks the cache holds or the
+    /// kernel's holds the ciphertext of.
     fn records_resident(&self) -> f64 {
         let raw = self.blob.for_zfile();
-        match raw.record_regions() {
-            Some((recs, _)) => resident_share(recs),
-            None => raw
-                .record_region_place()
-                .and_then(|(off, len)| raw.source().paged_resident(off, len))
-                .unwrap_or(0.0),
-        }
+        raw.record_region_place()
+            .and_then(|(off, len)| crate::bytes::Bytes::resident_share(raw.source(), off, len))
+            .unwrap_or(0.0)
+    }
+
+    /// The record region's place in the segment's file, where the file is
+    /// one the directory holds under its name and its descriptor is what a
+    /// drop of its page cache is given: a reader that holds its section
+    /// whole. `None` for a reader by the piece, whose file is read through
+    /// the store's cache and is dropped and asked for through its source.
+    fn records_by_descriptor(&self) -> Option<(u64, u64)> {
+        let raw = self.blob.for_zfile();
+        raw.record_regions()?;
+        raw.record_region_place().map(|(at, len)| (at, len as u64))
     }
 
     /// The raw form, for a read of the records on purpose (`SegBlob`):
@@ -18255,8 +18263,8 @@ impl MergeAhead {
         let spans: Vec<(u64, u64)> = blobs
             .iter()
             .map(|b| {
-                b.record_region_span()
-                    .map_or((0, 0), |(at, len)| (at, at.saturating_add(len)))
+                b.record_region_place()
+                    .map_or((0, 0), |(at, len)| (at, at.saturating_add(len as u64)))
             })
             .collect();
         Some(MergeAhead {
@@ -21954,47 +21962,15 @@ fn fadvise_dontneed(file: &std::fs::File) {
 #[cfg(not(target_os = "linux"))]
 fn fadvise_dontneed(_file: &std::fs::File) {}
 
-/// The share of the pages under `bytes`, a range of a file's mapping, that
-/// the kernel holds in memory now, by `mincore`; zero for an empty range
-/// or where the kernel will not say.
 /// A mapping's length, a paged one's included, whose slice is empty.
 fn map_len(map: &MmapBytes) -> usize {
     crate::bytes::Bytes::len(map) as usize
 }
 
-/// `resident_share` of a whole mapping: a paged one's from its pager, the
-/// plaintext present or the envelope's pages in the kernel's cache, since
-/// its slice is empty and would read as nothing resident for ever.
+/// The share of a whole mapping a read would find in memory now, asked of
+/// it (`Bytes::resident_share`); zero where it will not say.
 fn map_resident_share(map: &MmapBytes) -> f64 {
-    map.paged_resident(0, map_len(map))
-        .unwrap_or_else(|| resident_share(map.as_slice()))
-}
-
-// The door (tests/data/door.txt): mincore over a borrowed slice (G3: Memory).
-#[allow(clippy::disallowed_methods)]
-pub(super) fn resident_share(bytes: &[u8]) -> f64 {
-    if bytes.is_empty() {
-        return 0.0;
-    }
-    let page = crate::bytes::os_page_size();
-    let start = bytes.as_ptr() as usize / page * page;
-    let end = bytes.as_ptr() as usize + bytes.len();
-    let pages = (end - start).div_ceil(page);
-    let mut vec = vec![0u8; pages];
-    // SAFETY: `start` is the page `bytes` begins in and `end` where it
-    // ends, inside the mapping `bytes` borrows for the call, which holds
-    // the whole of each page it touches; `vec` has a byte for every page.
-    let rc = unsafe {
-        libc::mincore(
-            start as *mut libc::c_void,
-            end - start,
-            vec.as_mut_ptr().cast(),
-        )
-    };
-    if rc != 0 {
-        return 0.0;
-    }
-    vec.iter().filter(|&&b| b & 1 != 0).count() as f64 / pages as f64
+    crate::bytes::Bytes::resident_share(map, 0, map_len(map)).unwrap_or(0.0)
 }
 
 /// What the trim asks of glibc's allocator: the bytes it holds free in its
@@ -36330,14 +36306,14 @@ impl Db {
         let _entered = self.enter();
         let mut dropped = 0u64;
         for seg in self.segs() {
-            let Some((_, len)) = seg.blob.0.record_region_span() else {
+            let Some((_, len)) = seg.blob.0.record_region_place() else {
                 continue;
             };
             seg.blob.advise_dontneed();
             if let Ok(f) = vault::open(self.dir.join(&seg.name)) {
                 fadvise_dontneed_range(&f, 0, 0);
             }
-            dropped += len;
+            dropped += len as u64;
         }
         dropped
     }
@@ -55428,7 +55404,7 @@ impl Maint {
                     let map = vault::map(&form).ok()?;
                     Some(Asked {
                         seg: self.dir.join(&s.name),
-                        records: s.blob.for_zfile().record_region_span(),
+                        records: s.records_by_descriptor(),
                         drop_records: s.z.get().is_some() || !installed,
                         form,
                         map,
@@ -57561,7 +57537,7 @@ impl Maint {
                     continue;
                 }
                 let raw = s.blob.for_zfile();
-                let Some((at, len)) = raw.record_region_span() else {
+                let Some((at, len)) = s.records_by_descriptor() else {
                     // A file of a store under a cipher: the same swap in
                     // the kernel's cache of the two envelopes, the
                     // records' ciphertext dropped and the form file's
@@ -58684,7 +58660,7 @@ impl Maint {
                 if self.opts.zpages_ask_dropped && built.dropped && self.z_crossed {
                     let target = live.as_ref().expect("checked");
                     if let (Some((at, len)), Ok(f)) = (
-                        target.blob.for_zfile().record_region_span(),
+                        target.records_by_descriptor(),
                         vault::open(self.dir.join(&target.name)),
                     ) {
                         let asked = zfile::swap_ahead(&f, at, len, &out);

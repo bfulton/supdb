@@ -1659,18 +1659,6 @@ impl<B: Bytes> Blob<B> {
         }
     }
 
-    /// The record region's offset in the source and its length, bytes:
-    /// `record_regions` placed by offset, for an advice to the file that
-    /// holds it. `None` where there is no region or the source lends none.
-    #[cfg(not(target_family = "wasm"))]
-    #[doc(hidden)]
-    pub fn record_region_span(&self) -> Option<(u64, u64)> {
-        let (recs, _) = self.record_regions()?;
-        let base = self.src.slice_at(0, 1)?.as_ptr() as usize;
-        let at = (recs.as_ptr() as usize).checked_sub(base)?;
-        Some((at as u64, recs.len() as u64))
-    }
-
     /// Where the record region lies in the source, its offset and its
     /// length, bytes, placed by where it starts in the section however the
     /// reader holds it, for an advice to what stands behind the source. `None`
@@ -1688,16 +1676,34 @@ impl<B: Bytes> Blob<B> {
         )
     }
 
+    /// Where the record directory lies in the source, its offset and its
+    /// length, bytes, placed as `record_region_place` places the record
+    /// region: for a walk over the records that gives the directory up
+    /// behind it.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn record_dir_place(&self) -> Option<(u64, usize)> {
+        indexed!(
+            self,
+            |sec, idx| {
+                let (_, dir) = idx.regions(sec)?;
+                Some((self.index_offset() + dir.start_in(sec) as u64, dir.size()))
+            },
+            None
+        )
+    }
+
     /// The span of the file a raw point read touches a page of each
     /// population in -- the hash slots and the records, and whatever lies
     /// between them in the index section -- as offset and length: what the
     /// hot-raw policy asks the kernel for ahead of the reads it sends to the
-    /// raw form (`db::Seg`). `None` for a reader that does not hold the
-    /// section whole.
+    /// raw form (`db::Seg`). Read from the section's header, however the
+    /// reader holds the section; `None` for a sparse reader.
     #[cfg(not(target_family = "wasm"))]
     #[doc(hidden)]
     pub fn raw_read_span(&self) -> Option<(u64, u64)> {
-        let (_, idx) = self.flat()?;
+        let Index::Flat { idx, .. } = &self.index else {
+            return None;
+        };
         let (h, r) = idx.population_spans();
         let (lo, hi) = (h.0.min(r.0), h.1.max(r.1));
         let base = self.index_offset();

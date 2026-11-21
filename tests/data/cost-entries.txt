@@ -307,7 +307,6 @@ Blob::prefetch_ranks_est	-	an ask or a drop of the page cache, made out of core 
 Blob::record_regions	-	a fact a form file's build or the controller reads, once a build or a sample
 Blob::record_pieces	-	a fact a form file's build or the controller reads, once a build or a sample
 Blob::record_region_bytes	-	a fact a form file's build or the controller reads, once a build or a sample
-Blob::record_region_span	-	a fact a form file's build or the controller reads, once a build or a sample
 Blob::record_region_place	-	a fact a form file's build or the controller reads, once a build or a sample
 Blob::raw_read_span	-	a fact a form file's build or the controller reads, once a build or a sample
 Blob::hash_region_bytes	-	a fact a form file's build or the controller reads, once a build or a sample

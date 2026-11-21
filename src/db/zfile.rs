@@ -5491,16 +5491,15 @@ impl ZFile {
         popcount(&self.bad)
     }
 
-    /// The share of the file's pages the page cache holds now (`mincore`
-    /// over the mapping): whether a build that reads the form reads memory
-    /// or the device. Over the whole file whichever body it holds, so a
-    /// stride file's row and trailer count as region B and the trailer do.
+    /// The share of the file a read would find in memory now, asked of
+    /// its mapping (`Bytes::resident_share`): whether a build that reads
+    /// the form reads memory or the device. Over the whole file whichever
+    /// body it holds, so a stride file's row and trailer count as region B
+    /// and the trailer do.
     pub(super) fn pages_resident(&self) -> f64 {
-        let len = self.map.len();
-        match self.map.slice_at(0, len as usize) {
-            Some(bytes) => super::resident_share(bytes),
-            None => 0.0,
-        }
+        self.map
+            .resident_share(0, self.map.len() as usize)
+            .unwrap_or(0.0)
     }
 
     /// Heap bytes the form file keeps resident: the fence and the filter, and
@@ -6886,18 +6885,19 @@ pub(super) struct Warm {
 /// `path` read into the page cache, chunk by chunk, so that the first reads
 /// of a form file that is on disk and cold -- after a restart -- fault on
 /// nothing: a cold file of `P` pages costs `r` reads `P(1 - e^(-r/P))`
-/// major faults, as bad as the raw form. Each chunk the kernel reports
-/// wholly resident is skipped; the rest is asked for with `MADV_WILLNEED`
-/// and then read a page at a time, so the pages are there when this
-/// returns and its time is the read's. `cancel`, looked at between chunks,
-/// stops it where it is; what was read stays read.
+/// major faults, as bad as the raw form. Each chunk its mapping reports
+/// wholly in memory (`Bytes::resident_share`) is skipped; the rest is
+/// asked for (`Bytes::advise_willneed`) and, where the mapping lends its
+/// pages unasked, a mapped file's, then read a page at a time, so the
+/// pages are there when this returns and its time is the read's. A file
+/// read through the store's cache, under a cipher, has what stands behind
+/// it asked for and is not read: a read would decrypt it into the store's
+/// cache, where the warm is for the kernel's. `cancel`, looked at between
+/// chunks, stops it where it is; what was read stays read.
 pub(super) fn warm_file(path: &Path, cancel: Option<&AtomicBool>) -> Result<Warm> {
     let start = std::time::Instant::now();
-    // A form file under a cipher lends nothing whole and has no page cache
-    // to warm: its length here is none, and its pages come as they are
-    // asked for.
     let map = super::vault::map(path)?;
-    let len = map.as_slice().len();
+    let len = map.len() as usize;
     let page = crate::bytes::os_page_size();
     let mut w = Warm::default();
     let mut sum = 0u64;
@@ -6908,16 +6908,22 @@ pub(super) fn warm_file(path: &Path, cancel: Option<&AtomicBool>) -> Result<Warm
         }
         let span = ZWARM_CHUNK.min(len - off);
         let pages = span.div_ceil(page);
-        let resident = map.resident_pages(off, span);
-        if resident >= pages {
+        let share = map.resident_share(off as u64, span).unwrap_or(0.0);
+        if share >= 1.0 {
             w.skipped += span as u64;
         } else {
             map.advise_willneed(off as u64, span);
             let mut at = off;
             while at < off + span {
-                sum = sum.wrapping_add(u64::from(map.as_slice()[at]));
+                // Lent on the bounds check alone, or not at all: a paged
+                // mapping's page is not touched.
+                let Some(b) = map.lend_at(at as u64, 1) else {
+                    break;
+                };
+                sum = sum.wrapping_add(u64::from(b[0]));
                 at += page;
             }
+            let resident = ((share * pages as f64).round() as usize).min(pages);
             w.bytes += ((pages - resident) * page).min(span) as u64;
         }
         off += span;
@@ -7214,16 +7220,16 @@ pub(super) fn swap_ahead(_seg: &File, _at: u64, _len: u64, _form: &Path) -> u64 
 
 /// The file at `form` asked of the kernel whole (`POSIX_FADV_WILLNEED`), in
 /// the pieces the kernel reads whole (`crate::bytes::WILLNEED_PIECE`): the
-/// bytes asked for, none where the file does not open. The ask starts the
-/// reads and waits for none of them, and a page the cache holds already is
-/// not read again.
-// The door (tests/data/door.txt): a form file opened by path for an ask: under a cipher the decoy
-// opens nothing.
+/// bytes asked for, none where the file does not open through the door
+/// (`vault::open`, which opens no form file of a store under a cipher once
+/// it has its envelope). The ask starts the reads and waits for none of
+/// them, and a page the cache holds already is not read again.
+// The door (tests/data/door.txt): advice on a handle the door gave.
 #[allow(clippy::disallowed_methods)]
 #[cfg(target_os = "linux")]
 pub(super) fn ask_file(form: &Path) -> u64 {
     use std::os::unix::io::AsRawFd;
-    let Ok(f) = File::open(form) else {
+    let Ok(f) = super::vault::open(form) else {
         return 0;
     };
     let n = f.metadata().map_or(0, |m| m.len());
@@ -7250,26 +7256,26 @@ pub(super) fn ask_file(_form: &Path) -> u64 {
     0
 }
 
-/// Drop `[from, to)` of the file behind the build: the pages of its own
-/// mapping first, then the page cache's, because the cache skips a page a
-/// mapping still holds. The window is trimmed to whole pages inside it, and
-/// the pages another mapping holds -- the readers' hot raw pages -- survive
-/// the second call by design.
-// The door (tests/data/door.txt): advice in the plain build only (Walked::Mapped).
+/// Drop `[from, to)` of the segment behind the build, offsets in its file:
+/// the pages of its own mapping first (`Bytes::advise_dontneed_range`),
+/// then the page cache's by the file's descriptor, because the cache skips
+/// a page a mapping still holds. The window is trimmed to whole pages
+/// inside it, and the pages another mapping holds -- the readers' hot raw
+/// pages -- survive the second call by design.
+// The door (tests/data/door.txt): the descriptor half of the plain build's drop (Walked::Mapped).
 #[allow(clippy::disallowed_methods)]
 #[cfg(target_os = "linux")]
-fn drop_behind(base: usize, file: &File, from: usize, to: usize) {
+fn drop_behind(map: &MmapBytes, file: &File, from: usize, to: usize) {
     use std::os::unix::io::AsRawFd;
     let a = from.next_multiple_of(ZPAGE);
     let b = to & !(ZPAGE - 1);
     if a >= b {
         return;
     }
-    // SAFETY: a read-only shared mapping of a file, advised over a range
-    // inside it: the call drops this process's page-table entries for the
-    // range and nothing else, and the next touch faults the page back in.
+    map.advise_dontneed_range(a as u64, b - a);
+    // SAFETY: an advice over a file descriptor the build holds open; it
+    // changes no byte of the file.
     unsafe {
-        libc::madvise((base + a) as *mut libc::c_void, b - a, libc::MADV_DONTNEED);
         libc::posix_fadvise(
             file.as_raw_fd(),
             a as libc::off_t,
@@ -7280,34 +7286,27 @@ fn drop_behind(base: usize, file: &File, from: usize, to: usize) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn drop_behind(_base: usize, _file: &File, _from: usize, _to: usize) {}
+fn drop_behind(_map: &MmapBytes, _file: &File, _from: usize, _to: usize) {}
 
-/// Ask the kernel for `[from, to)` of the mapping at `base` ahead of a walk
-/// (`MADV_WILLNEED`): the reads are issued at once and the walk's faults
-/// then find the pages in flight or resident, so one wait of the walk's
-/// fetches the window and not the device's readahead. The start is taken
-/// down to its page, and the window is asked in pieces the kernel reads
-/// whole (`crate::bytes::WILLNEED_PIECE`): asked at once, a window past the
-/// device's largest request was read only up to it. The call is advice and
-/// its failure is nobody's.
-// The door (tests/data/door.txt): advice in the plain build only.
-#[allow(clippy::disallowed_methods)]
+/// Ask for `[from, to)` of the segment's mapping, offsets in its file,
+/// ahead of a walk (`Bytes::advise_willneed`): the reads are issued at
+/// once and the walk's faults then find the pages in flight or resident,
+/// so one wait of the walk's fetches the window and not the device's
+/// readahead. The start is taken down to its page, so that the pieces the
+/// mapping asks in (`crate::bytes::WILLNEED_PIECE`) start on one; asked at
+/// once, a window past the device's largest request was read only up to
+/// it. The call is advice and its failure is nobody's. Off Linux it asks
+/// nothing, as the plain build never has.
 #[cfg(target_os = "linux")]
-fn ask_ahead(base: usize, from: usize, to: usize) {
-    let mut a = from & !(ZPAGE - 1);
-    while a < to {
-        let n = crate::bytes::WILLNEED_PIECE.min(to - a);
-        // SAFETY: a read-only shared mapping of a file, advised over a range
-        // inside it; the kernel reads pages in and changes nothing else.
-        unsafe {
-            libc::madvise((base + a) as *mut libc::c_void, n, libc::MADV_WILLNEED);
-        }
-        a += n;
+fn ask_ahead(map: &MmapBytes, from: usize, to: usize) {
+    let a = from & !(ZPAGE - 1);
+    if a < to {
+        map.advise_willneed(a as u64, to - a);
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn ask_ahead(_base: usize, _from: usize, _to: usize) {}
+fn ask_ahead(_map: &MmapBytes, _from: usize, _to: usize) {}
 
 /// What a build is asked, and the two sizes it works in. The floor and
 /// whether the raw bytes are dropped are the store's options; the piece and
@@ -7600,7 +7599,6 @@ fn build_file_seen(
             // The door (tests/data/door.txt): a plain segment's door handle mapped (SegSrc::File).
             #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
             let map = MmapBytes::from_map(unsafe { memmap2::Mmap::map(&file)? });
-            let base = map.as_slice().as_ptr() as usize;
             let blob = Blob::open_with(map, opts)?;
             blob.advise_normal();
             let facts = blob.z_source_facts().ok_or_else(|| {
@@ -7609,6 +7607,14 @@ fn build_file_seen(
             let (recs, dir) = blob
                 .record_regions()
                 .ok_or_else(|| super::err("z build: the segment's records are not resident"))?;
+            // Where the two regions lie in the file, from the section's
+            // header: what the walk's asks and drops are placed by.
+            let (recs_at, dir_at) = blob
+                .record_region_place()
+                .zip(blob.record_dir_place())
+                .map(|((r, _), (d, _))| (r as usize, d as usize))
+                .ok_or_else(|| super::err("z build: the segment's records are not resident"))?;
+            let map = blob.source();
             let recs_len = usize::try_from(facts.recs_len).unwrap_or(usize::MAX);
             if recs_len < plan.floor {
                 return Ok(plan.declined(Decline::Small(recs_len), StrideNo::Small));
@@ -7622,11 +7628,11 @@ fn build_file_seen(
                 let images = SegImages::new(recs, dir, nkeys);
                 let mut by = Mapped {
                     file: &file,
-                    base,
+                    map,
                     recs,
                     dir,
-                    recs_at: recs.as_ptr() as usize - base,
-                    dir_at: dir.as_ptr() as usize - base,
+                    recs_at,
+                    dir_at,
                     asked: 0,
                     asked_bytes: 0,
                     dropped: 0,
@@ -7670,8 +7676,23 @@ fn build_file_seen(
                     });
                     let walked = match checked {
                         Ok(sf) => write_stride(
-                            &file, base, recs, dir, nkeys, bind, &tmp, &facts, id, end_seq, &sf,
-                            plan, seen,
+                            &file,
+                            Placed {
+                                map,
+                                recs,
+                                dir,
+                                recs_at,
+                                dir_at,
+                            },
+                            nkeys,
+                            bind,
+                            &tmp,
+                            &facts,
+                            id,
+                            end_seq,
+                            &sf,
+                            plan,
+                            seen,
                         ),
                         // The two ends decide before the temporary name is
                         // this build's: asked for the stride form alone,
@@ -7857,13 +7878,24 @@ trait Walked {
     fn asked_bytes(&self) -> u64;
 }
 
+/// A plain store's segment as the stride walk reads it: its mapping, the
+/// two regions lent whole, and where they start in the file, from the
+/// section's header (`Blob::record_region_place`, `record_dir_place`).
+struct Placed<'a> {
+    map: &'a MmapBytes,
+    recs: &'a [u8],
+    dir: &'a [u8],
+    recs_at: usize,
+    dir_at: usize,
+}
+
 /// A plain store's segment, mapped: the raw records asked for ahead of the
 /// walk a window at a time, and dropped from the page cache behind it.
-/// `base` is the address of the segment's mapping and `file` its
-/// descriptor.
+/// `map` is the segment's mapping and `file` its descriptor; `recs_at` and
+/// `dir_at` are where the two regions start in the file, from the header.
 struct Mapped<'a> {
     file: &'a File,
-    base: usize,
+    map: &'a MmapBytes,
     recs: &'a [u8],
     dir: &'a [u8],
     recs_at: usize,
@@ -7879,7 +7911,7 @@ impl Mapped<'_> {
     fn forget(&mut self, from: usize, to: usize, plan: &BuildPlan) {
         if plan.drop_behind && from < to {
             (self.seen)(from, to);
-            drop_behind(self.base, self.file, from, to);
+            drop_behind(self.map, self.file, from, to);
         }
     }
 }
@@ -7898,7 +7930,7 @@ impl Walked for Mapped<'_> {
                 .min(recs.len());
             if at + plan.ahead / 2 >= self.asked {
                 let to = self.asked.saturating_add(plan.ahead).min(recs.len());
-                ask_ahead(self.base, self.recs_at + self.asked, self.recs_at + to);
+                ask_ahead(self.map, self.recs_at + self.asked, self.recs_at + to);
                 self.asked_bytes += (to - self.asked) as u64;
                 self.asked = to;
             }
@@ -8413,9 +8445,7 @@ fn stride_key_is(
 #[allow(clippy::too_many_arguments)]
 fn write_stride(
     file: &File,
-    base: usize,
-    recs: &[u8],
-    dir: &[u8],
+    at: Placed<'_>,
     nkeys: usize,
     bind: u32,
     tmp: &Path,
@@ -8426,13 +8456,18 @@ fn write_stride(
     plan: &BuildPlan,
     seen: &mut dyn FnMut(usize, usize),
 ) -> Result<Outcome> {
+    let Placed {
+        map,
+        recs,
+        dir,
+        recs_at,
+        dir_at,
+    } = at;
     let images = SegImages::new(recs, dir, nkeys);
-    let recs_at = recs.as_ptr() as usize - base;
-    let dir_at = dir.as_ptr() as usize - base;
     let mut forget = |from: usize, to: usize| {
         if plan.drop_behind && from < to {
             seen(from, to);
-            drop_behind(base, file, from, to);
+            drop_behind(map, file, from, to);
         }
     };
     // Where rank `r`'s record begins in the region, the region's end past
@@ -8470,7 +8505,7 @@ fn write_stride(
         }
         if plan.ahead > 0 && asked < recs.len() && at + plan.ahead / 2 >= asked {
             let to = asked.saturating_add(plan.ahead).min(recs.len());
-            ask_ahead(base, recs_at + asked, recs_at + to);
+            ask_ahead(map, recs_at + asked, recs_at + to);
             asked_bytes += (to - asked) as u64;
             asked = to;
         }
@@ -8648,18 +8683,18 @@ fn write_stride(
     }))
 }
 
-/// The kernel's count of the pages of the mapped stride file it holds as
-/// the read-back begins (`MmapBytes::resident_count`), or `None` where it
-/// would not say: a count refused is no count of none, and only a count of
-/// none says the read-back reads the device (`check_stride`). A test's seam
-/// answers `None` (`BuildPlan::residency_unknown`).
-fn read_back_residency(map: &MmapBytes, plan: &BuildPlan) -> Option<usize> {
+/// The share of the mapped stride file in memory as the read-back begins
+/// (`Bytes::resident_share`), or `None` where the source would not say: a
+/// count refused is no count of none, and only a share of none says the
+/// read-back reads the device (`check_stride`). A test's seam answers
+/// `None` (`BuildPlan::residency_unknown`).
+fn read_back_residency(map: &MmapBytes, plan: &BuildPlan) -> Option<f64> {
     #[cfg(test)]
     if plan.residency_unknown {
         return None;
     }
     let _ = plan;
-    map.resident_count(0, map.as_slice().len())
+    map.resident_share(0, map.len() as usize)
 }
 
 /// What the read-back of a stride file found (`check_stride`).
@@ -8715,7 +8750,7 @@ fn check_stride(
 ) -> Result<StrideCheck> {
     let refused = StrideCheck::Refused(Outcome::NotStride(StrideNo::SelfCheck));
     let map = MmapBytes::open(tmp)?;
-    let device = read_back_residency(&map, plan) == Some(0);
+    let device = read_back_residency(&map, plan) == Some(0.0);
     let bytes: &[u8] = map.as_slice();
     let Ok(body) = StrideBody::from_bytes(bytes) else {
         return Ok(refused);
@@ -13665,13 +13700,18 @@ mod tests {
     fn an_ask_ahead_brings_the_cold_pages_in() {
         let fx = Fixture::new("ahead", suite(3000, 9), 1 << 20);
         let page = crate::bytes::os_page_size();
+        let pages = |m: &MmapBytes| {
+            let len = m.len() as usize;
+            let all = len.div_ceil(page);
+            let share = m.resident_share(0, len).expect("the kernel says");
+            ((share * all as f64).round() as usize, all)
+        };
         let cold = |name: &str| {
             let p = fx.dir.join(name);
             std::fs::copy(&fx.seg, &p).unwrap();
             evict(&p);
             let m = MmapBytes::open(&p).unwrap();
-            let all = m.as_slice().len().div_ceil(page);
-            let res = m.resident_pages(0, m.as_slice().len());
+            let (res, all) = pages(&m);
             assert!(
                 res < all / 4,
                 "{name}: {res} of {all} resident after the eviction"
@@ -13679,27 +13719,67 @@ mod tests {
             (m, all)
         };
         let (asked, all) = cold("seg-asked");
-        ask_ahead(
-            asked.as_slice().as_ptr() as usize,
-            0,
-            asked.as_slice().len(),
-        );
+        ask_ahead(&asked, 0, asked.len() as usize);
         let (left, _) = cold("seg-left");
         let t = std::time::Instant::now();
-        let mut res = asked.resident_pages(0, asked.as_slice().len());
+        let mut res = pages(&asked).0;
         while res * 4 < all * 3 && t.elapsed() < std::time::Duration::from_secs(5) {
             std::thread::sleep(std::time::Duration::from_millis(10));
-            res = asked.resident_pages(0, asked.as_slice().len());
+            res = pages(&asked).0;
         }
         assert!(
             res * 4 >= all * 3,
             "{res} of {all} pages resident after the ask"
         );
-        let untouched = left.resident_pages(0, left.as_slice().len());
+        let untouched = pages(&left).0;
         assert!(
             untouched < all / 4,
             "{untouched} of {all} resident with nothing asked"
         );
+    }
+
+    /// The build's drop behind (`drop_behind`) takes the mapping's own
+    /// pages over the whole pages inside its window and none outside it:
+    /// a window from mid-page to mid-page over a file whose every page
+    /// the mapping holds leaves the pages before and after it mapped, by
+    /// the kernel's page table (`/proc/self/pagemap`'s present bit; the
+    /// page cache's count says nothing of a mapping). Not under qemu-user
+    /// (`supdb_emulated`), whose page table is not the program's.
+    #[cfg(all(target_os = "linux", not(supdb_emulated)))]
+    #[test]
+    fn a_drop_behind_unmaps_the_window_and_no_page_past_it() {
+        use std::io::{Read, Seek, SeekFrom};
+        let fx = Fixture::new("dropwin", suite(100, 9), 1 << 20);
+        let p = fx.dir.join("window");
+        let n = 64usize;
+        std::fs::write(&p, vec![7u8; n * ZPAGE]).unwrap();
+        let file = File::open(&p).unwrap();
+        let map = MmapBytes::open(&p).unwrap();
+        let bytes = map.as_slice();
+        let mut pm = File::open("/proc/self/pagemap").unwrap();
+        let mut mapped = || -> Vec<bool> {
+            let base = bytes.as_ptr() as usize;
+            (0..n)
+                .map(|i| {
+                    let at = (base + i * ZPAGE) / crate::bytes::os_page_size();
+                    pm.seek(SeekFrom::Start(at as u64 * 8)).unwrap();
+                    let mut w = [0u8; 8];
+                    pm.read_exact(&mut w).unwrap();
+                    u64::from_le_bytes(w) >> 63 == 1
+                })
+                .collect()
+        };
+        let touched: u64 = (0..n).map(|i| u64::from(bytes[i * ZPAGE])).sum();
+        std::hint::black_box(touched);
+        assert!(
+            mapped().iter().all(|&m| m),
+            "every page touched and mapped first"
+        );
+        // From mid-page 8 to mid-page 24: whole pages 9..24.
+        drop_behind(&map, &file, 8 * ZPAGE + 100, 24 * ZPAGE + 100);
+        let now = mapped();
+        let want: Vec<bool> = (0..n).map(|i| !(9..24).contains(&i)).collect();
+        assert_eq!(now, want, "mapped after a drop behind pages 9..24");
     }
 
     /// A form file evicted from the page cache and warmed: every page
@@ -13716,10 +13796,10 @@ mod tests {
         let page = crate::bytes::os_page_size();
         let pages = |p: &Path| {
             let m = MmapBytes::open(p).unwrap();
-            (
-                m.resident_pages(0, m.as_slice().len()),
-                m.as_slice().len().div_ceil(page),
-            )
+            let len = m.len() as usize;
+            let all = len.div_ceil(page);
+            let share = m.resident_share(0, len).expect("the kernel says");
+            ((share * all as f64).round() as usize, all)
         };
         evict(&fx.out);
         let (res, all) = pages(&fx.out);
@@ -13734,6 +13814,32 @@ mod tests {
         assert_eq!(res, all, "resident after the warm");
         let again = warm_file(&fx.out, None).unwrap();
         assert_eq!((again.bytes, again.skipped), (0, b.file_bytes), "{again:?}");
+        // Three quarters of the file read back, with no readahead past
+        // what is read: a chunk most of whose pages are in the cache is
+        // still warmed, its cold pages read and counted, and is whole after.
+        {
+            use std::io::Read;
+            use std::os::unix::io::AsRawFd;
+            evict(&fx.out);
+            let mut f = File::open(&fx.out).unwrap();
+            // SAFETY: a hint on an open descriptor.
+            unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+            let part = all * 3 / 4 * page;
+            let mut buf = vec![0u8; part];
+            f.read_exact(&mut buf).unwrap();
+            let (res, all) = pages(&fx.out);
+            assert!(
+                res * 2 > all && res < all,
+                "{res} of {all} resident after the partial read"
+            );
+            let w = warm_file(&fx.out, None).unwrap();
+            assert_eq!(
+                (w.bytes, w.skipped),
+                (b.file_bytes - (res * page) as u64, 0),
+                "a chunk {res} of {all} pages resident: {w:?}"
+            );
+            assert_eq!(pages(&fx.out).0, all, "resident after the warm");
+        }
         evict(&fx.out);
         let cancel = AtomicBool::new(true);
         let none = warm_file(&fx.out, Some(&cancel)).unwrap();
@@ -14455,7 +14561,7 @@ mod tests {
                     continue;
                 }
                 all += 1;
-                res += m.resident_pages(p * ZPAGE, ZPAGE);
+                res += usize::from(m.resident_share((p * ZPAGE) as u64, ZPAGE) == Some(1.0));
             }
             (res, all)
         };

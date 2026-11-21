@@ -710,10 +710,12 @@ impl OrdIndex {
         self.map.len()
     }
 
-    /// The file's mapping whole, for whoever asks the kernel about its
-    /// pages (`mincore`): no byte of it is read here.
-    pub fn mapped(&self) -> &[u8] {
-        self.map.slice_at(0, self.map.len() as usize).unwrap_or(&[])
+    /// The share of the file a read would find in memory now, asked of its
+    /// mapping (`Bytes::resident_share`): zero where the source cannot say.
+    pub fn resident_share(&self) -> f64 {
+        self.map
+            .resident_share(0, self.map.len() as usize)
+            .unwrap_or(0.0)
     }
 
     /// Whether `advise_random` was called on this mapping.
@@ -895,20 +897,18 @@ impl OrdIndex {
         self.map.advise_willneed(off, (hi - lo) * HEAD)
     }
 
-    /// Whether every page of the heads is in the page cache now, by one
-    /// `mincore` over the mapping: what a reader about to ask for the heads
-    /// a run or a stride at a time looks at first, since each of those asks
-    /// reads its own page's residency with a call of its own
-    /// (`willneed_heads`), and over an index that is resident whole they
-    /// are calls and nothing else. False where the kernel will not say.
+    /// Whether every page of the heads is in memory now, by one question
+    /// of the mapping (`Bytes::resident_share`, one `mincore` for a mapped
+    /// file): what a reader about to ask for the heads a run or a stride at
+    /// a time looks at first, since each of those asks reads its own
+    /// page's residency with a call of its own (`willneed_heads`), and over
+    /// an index that is resident whole they are calls and nothing else.
+    /// False where the source will not say.
     pub fn heads_all_resident(&self) -> bool {
         if self.n == 0 || self.heads_owned() {
             return true;
         }
-        let len = self.n * HEAD;
-        let page = crate::bytes::os_page_size();
-        let pages = (HEADER + len).div_ceil(page) - HEADER / page;
-        self.map.resident_pages(HEADER, len) == pages
+        self.map.resident_share(HEADER as u64, self.n * HEAD) == Some(1.0)
     }
 
     /// Every head asked of the kernel, resident or not: for a release under
@@ -2003,6 +2003,100 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// A paged mapping over bytes held in memory, which says the share it
+    /// is given of any range that meets its cold range is resident and all
+    /// of any other: what a mapping read by the piece is to an index.
+    struct InMemory(Vec<u8>, f64, std::ops::Range<u64>);
+    impl crate::bytes::Paging for InMemory {
+        fn base(&self) -> *const u8 {
+            self.0.as_ptr()
+        }
+        fn size(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn ensure(&self, off: u64, len: usize) -> bool {
+            off.checked_add(len as u64)
+                .is_some_and(|e| e <= self.size())
+        }
+        fn piece_end(&self, _: u64) -> u64 {
+            self.size()
+        }
+        fn piece_from(&self, off: u64) -> usize {
+            self.size().saturating_sub(off) as usize
+        }
+        fn advise(&self, _: bool) {}
+        fn resident(&self, off: u64, len: usize) -> f64 {
+            let end = off.saturating_add(len as u64);
+            if off < self.2.end && self.2.start < end {
+                self.1
+            } else {
+                1.0
+            }
+        }
+        fn forget(&self, _: u64, _: usize) {}
+        fn willneed(&self, _: u64, _: usize) -> usize {
+            0
+        }
+    }
+
+    /// `bytes` as an index's mapping read by the piece, `share` of any
+    /// range of it that meets `cold` said to be resident.
+    fn in_memory(bytes: Vec<u8>, share: f64, cold: std::ops::Range<u64>) -> MmapBytes {
+        MmapBytes::paged(std::sync::Arc::new(InMemory(bytes, share, cold)))
+    }
+
+    /// Whether every head is in memory is asked of the source, for either
+    /// kind of mapping: an index read by the piece over a source that holds
+    /// all of it answers yes, as a mapped index just written does, and one
+    /// over a source that holds part of it no. Asked of a mapping's lent
+    /// slice, it answered no for ever.
+    #[test]
+    fn the_heads_resident_are_asked_of_the_source_for_either_kind() {
+        let owned: Vec<Vec<u8>> = (0u32..2_000)
+            .map(|i| format!("{:016}", i * 3).into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let p = write(&build(&keys), "heads-resident");
+        let mapped = OrdIndex::open(&p, keys.len()).expect("opens");
+        let over = |share: f64| {
+            OrdIndex::over(
+                in_memory(std::fs::read(&p).unwrap(), share, 0..u64::MAX),
+                keys.len(),
+            )
+            .expect("opens by the piece")
+        };
+        assert!(mapped.heads_all_resident(), "a file just written");
+        assert!(
+            over(1.0).heads_all_resident(),
+            "a source that holds all of it"
+        );
+        assert!(
+            !over(0.99).heads_all_resident(),
+            "one that holds most of it"
+        );
+        assert!(!over(0.0).heads_all_resident(), "one that holds none of it");
+        // The question is of the heads' own bytes, by their place in the
+        // file: the header's being out says nothing of them, and the last
+        // head's being out is an answer of no.
+        let cold = |range: std::ops::Range<u64>| {
+            OrdIndex::over(
+                in_memory(std::fs::read(&p).unwrap(), 0.0, range),
+                keys.len(),
+            )
+            .expect("opens by the piece")
+        };
+        let heads_end = (HEADER + keys.len() * HEAD) as u64;
+        assert!(
+            cold(0..HEADER as u64).heads_all_resident(),
+            "a source whose header alone is out"
+        );
+        assert!(
+            !cold(heads_end - 1..heads_end).heads_all_resident(),
+            "a source whose last head is out"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
     /// An index read by the piece answers every seek as the mapped one
     /// does: its top level is read at the first seek, so a path that reads
     /// the level's field and not `top()` sees an index of no samples --
@@ -2010,33 +2104,6 @@ mod tests {
     /// sample and the settle filed it at rank zero, under a cipher.
     #[test]
     fn an_index_read_by_the_piece_seeks_as_the_mapped_one() {
-        struct InMemory(Vec<u8>);
-        impl crate::bytes::Paging for InMemory {
-            fn base(&self) -> *const u8 {
-                self.0.as_ptr()
-            }
-            fn size(&self) -> u64 {
-                self.0.len() as u64
-            }
-            fn ensure(&self, off: u64, len: usize) -> bool {
-                off.checked_add(len as u64)
-                    .is_some_and(|e| e <= self.size())
-            }
-            fn piece_end(&self, _: u64) -> u64 {
-                self.size()
-            }
-            fn piece_from(&self, off: u64) -> usize {
-                self.size().saturating_sub(off) as usize
-            }
-            fn advise(&self, _: bool) {}
-            fn resident(&self, _: u64, _: usize) -> f64 {
-                1.0
-            }
-            fn forget(&self, _: u64, _: usize) {}
-            fn willneed(&self, _: u64, _: usize) -> usize {
-                0
-            }
-        }
         let owned: Vec<Vec<u8>> = (0u32..2_000)
             .map(|i| format!("{:016}", i * 3).into_bytes())
             .collect();
@@ -2047,7 +2114,7 @@ mod tests {
         let p = write(&build(&keys), "by-the-piece");
         let mapped = OrdIndex::open(&p, keys.len()).expect("opens");
         let bytes = std::fs::read(&p).expect("reads");
-        let paged = MmapBytes::paged(std::sync::Arc::new(InMemory(bytes)));
+        let paged = in_memory(bytes, 1.0, 0..u64::MAX);
         assert!(paged.piecewise());
         let mut by_piece = OrdIndex::over(paged, keys.len()).expect("opens by the piece");
         let mut mapped = mapped;

@@ -1776,12 +1776,102 @@ mod tests {
             assert!(t.elapsed().as_secs() < 20, "the range did not come back");
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        assert_eq!(m.paged_resident(0, len).map(|s| s > 0.99), Some(true));
+        assert_eq!(m.resident_share(0, len).map(|s| s > 0.99), Some(true));
         m.advise_dontneed_range(2_000_000, 1_000_000);
         assert_eq!(m.resident_at(2_500_000), Some(false));
         m.advise_dontneed();
         assert_eq!(m.resident_at(100_000), Some(false), "the whole file");
         assert_eq!(m.resident_at(1_000_000), Some(true), "but the chunk here");
+    }
+
+    /// A paged mapping and a mapped file over the same plaintext say alike
+    /// what of a range is in memory, once both are: the one question the
+    /// engine asks a source about a span of its pages, asked of either
+    /// kind (`Bytes::resident_share`). A paged mapping answered "none" to
+    /// the page count a warm of a form file asked, every page of it
+    /// present. Not under qemu-user
+    /// (`supdb_emulated`), whose ask passes nothing to the kernel.
+    #[cfg(not(supdb_emulated))]
+    #[test]
+    fn a_paged_mapping_and_a_mapped_file_say_alike_what_is_resident() {
+        let dir = scratch("alike");
+        let bytes = plain(1 << 20, 5);
+        let (sealed, flat) = (dir.join("e"), dir.join("f"));
+        envelope(&sealed, &bytes, 9);
+        std::fs::write(&flat, &bytes).unwrap();
+        let pager = Pager::new(u64::MAX);
+        let p = sparse(&pager, &sealed, 9);
+        let len = bytes.len();
+        let _ = p.willneed(0, len);
+        let t = std::time::Instant::now();
+        while p.resident(0, len) < 1.0 {
+            assert!(t.elapsed().as_secs() < 20, "the envelope did not come in");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        use crate::bytes::Bytes;
+        let paged = crate::bytes::MmapBytes::paged(p.clone());
+        let mapped = crate::bytes::MmapBytes::open(&flat).unwrap();
+        let page = crate::bytes::os_page_size();
+        for (off, n) in [(0, len), (page, 2 * page), (len / 2 + 7, 100), (len - 1, 1)] {
+            assert_eq!(
+                paged.resident_share(off as u64, n),
+                mapped.resident_share(off as u64, n),
+                "{n} bytes at {off}"
+            );
+            assert_eq!(paged.resident_share(off as u64, n), Some(1.0));
+        }
+        assert_eq!(
+            paged.resident_share(len as u64, 5),
+            Some(0.0),
+            "past the end"
+        );
+        assert_eq!(
+            mapped.resident_share(len as u64, 5),
+            Some(0.0),
+            "past the end"
+        );
+        use std::os::unix::io::AsRawFd;
+        // Each out of the cache whole and its first quarter asked back: a
+        // range is answered by its own place, whole in or whole out, by
+        // either kind. (Whole: the cache holds a file in folios the size of
+        // the writes that made it, and a drop of part of one leaves it.)
+        for f in [&sealed, &flat] {
+            std::fs::File::open(f).unwrap().sync_all().unwrap();
+        }
+        p.forget(0, len);
+        mapped.advise_dontneed();
+        let f = std::fs::File::open(&flat).unwrap();
+        // SAFETY: a hint on an open descriptor.
+        let rc = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        assert_eq!(rc, 0, "fadvise");
+        assert_eq!(paged.resident_share(0, len), Some(0.0), "paged: out");
+        assert_eq!(mapped.resident_share(0, len), Some(0.0), "mapped: out");
+        let _ = p.willneed(0, len / 4);
+        mapped.advise_willneed(0, len / 4);
+        let t = std::time::Instant::now();
+        while paged.resident_share(0, len / 4) < Some(1.0)
+            || mapped.resident_share(0, len / 4) < Some(1.0)
+        {
+            assert!(t.elapsed().as_secs() < 20, "the quarter did not come in");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        for (off, n, want) in [
+            (0, page, 1.0),
+            (page, 2 * page, 1.0),
+            (len / 4 * 3, 2 * page, 0.0),
+            (len / 4 * 3 + 5000, 1, 0.0),
+        ] {
+            assert_eq!(
+                paged.resident_share(off as u64, n),
+                Some(want),
+                "paged: {n} at {off}"
+            );
+            assert_eq!(
+                mapped.resident_share(off as u64, n),
+                Some(want),
+                "mapped: {n} at {off}"
+            );
+        }
     }
 
     #[test]

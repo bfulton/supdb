@@ -6141,7 +6141,9 @@ fn an_attached_form_file_is_warmed_once_per_process_unless_the_warm_is_off() {
     let resident = |p: &Path| -> (usize, usize) {
         let m = MmapBytes::open(p).unwrap();
         let len = m.len() as usize;
-        (m.resident_pages(0, len), len.div_ceil(page))
+        let all = len.div_ceil(page);
+        let share = m.resident_share(0, len).expect("the kernel says");
+        ((share * all as f64).round() as usize, all)
     };
     let wide = |o: &mut Options| o.partition_bytes = Some(64 << 20);
     let dir = scratch("warm-src");
@@ -6240,6 +6242,108 @@ fn an_attached_form_file_is_warmed_once_per_process_unless_the_warm_is_off() {
         assert_eq!(db.zpage_counts().reads, 300);
         db.close().unwrap();
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Under a cipher a warm measures the form file by its length and asks the
+/// kernel for what of its envelope is not in memory, and decrypts nothing:
+/// what is warmed is the ciphertext a first read would wait on the device
+/// for, and the plaintext stays the store's cache's to take when asked. A
+/// warm that measured the file by the bytes its mapping lends unasked saw
+/// a file of none, and warmed and skipped nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_warm_under_a_cipher_asks_for_the_envelope_and_decrypts_nothing() {
+    use std::os::unix::io::AsRawFd;
+    let cipher = || {
+        supdb::Encryption::Cipher(supdb::StoreCipher::new(
+            common::Gcm::new(&[0x5b; 32]),
+            common::Gcm::new,
+        ))
+    };
+    let opts = |eager: bool| {
+        forced(|o| {
+            o.partition_bytes = Some(64 << 20);
+            o.encryption = cipher();
+            o.zpages_eager = eager;
+        })
+    };
+    let dir = scratch("warm-cipher");
+    let mut db = Db::create(&dir, opts(true)).unwrap();
+    let model = ordered_load(&mut db, 60_000, 0x3A4E);
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!((c.partitions, c.form_files, c.warms), (1, 1, 1), "{c:?}");
+    let seen = c.warm_bytes + c.warm_skipped;
+    assert!(
+        seen > 0 && seen <= c.file_bytes,
+        "the warm measured the file: {c:?}"
+    );
+    db.close().unwrap();
+    // The envelopes cold, and the store opened again: the warm asks for the
+    // pages the attach did not read, which are most of the file.
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let p = e.unwrap().path();
+        let f = std::fs::File::open(&p).unwrap();
+        f.sync_all().unwrap();
+        // SAFETY: a hint on an open descriptor.
+        unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    }
+    let mut db = Db::open(&dir, opts(false)).unwrap();
+    assert_eq!(db.zpage_counts().attached, 1);
+    let fills = db
+        .cipher_counts()
+        .expect("a store under a cipher")
+        .cache
+        .fills;
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!((c.warms, c.builds), (1, 0), "{c:?}");
+    assert!(
+        c.warm_bytes >= c.file_bytes / 2,
+        "the envelope's cold pages measured: {c:?}"
+    );
+    // The ask itself, read off the kernel: the form file's envelope, which
+    // the attach left at most half in the cache (the measure above), is in
+    // it whole once the reads the warm asked for have landed. The ask does
+    // not wait for them, so the cache is polled to a bound.
+    let envelopes: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("x-") && n.ends_with(".z"))
+        })
+        .collect();
+    assert_eq!(
+        envelopes.len(),
+        1,
+        "one form file's envelope: {envelopes:?}"
+    );
+    let env = MmapBytes::open(&envelopes[0]).unwrap();
+    let env_len = env.len() as usize;
+    let t = std::time::Instant::now();
+    let share = loop {
+        let share = env.resident_share(0, env_len).expect("the kernel says");
+        if share >= 0.9 || t.elapsed() > std::time::Duration::from_secs(20) {
+            break share;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(
+        share >= 0.9,
+        "the warm asked for the envelope: {share} of it in the cache, {c:?}"
+    );
+    assert_eq!(
+        db.cipher_counts().unwrap().cache.fills,
+        fills,
+        "the warm decrypted nothing"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    check(&db, &model, &keys[..300], "after the warm");
+    db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -9612,6 +9716,71 @@ fn an_output_being_built_at_its_finish_is_not_built_ahead_again() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The look at landing asks the kernel of the record region and of
+/// nothing beside it (`Seg::records_resident`): with every partition's
+/// records in the page cache and its record directory out of it, the
+/// store is built ahead whole below the selector's line, where a look at
+/// the directory would leave every partition cold. Quiet as the cold
+/// case below, and the sample left to wait for the builds, so that
+/// nothing reads a partition's directory back before its look.
+#[cfg(target_os = "linux")]
+#[test]
+fn builds_ahead_at_landing_read_the_records_residency_and_not_the_directorys() {
+    use std::os::unix::fs::FileExt;
+    use std::os::unix::io::AsRawFd;
+    let (dir, db, model, inject, raw) = land_store_with("auto-land-recs-warm", 50, |o| {
+        o.zpages_suspect_at_crossing = false;
+        o.zpages_attach_eager = false;
+        o.zpages_cover_resident = false;
+    });
+    let pars: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("par-") && n.ends_with(".sup"))
+        })
+        .collect();
+    assert!(!pars.is_empty(), "partitions: {pars:?}");
+    let page = 4096usize;
+    let share = |f: &Path, (at, len): (usize, usize)| {
+        let (a, b) = (at / page * page, (at + len).div_ceil(page) * page);
+        cached_pages(f, a, b - a) as f64 / ((b - a) / page) as f64
+    };
+    for f in &pars {
+        let r = regions_of(f);
+        unmap_pages(f);
+        evict(f);
+        let file = std::fs::File::open(f).unwrap();
+        // SAFETY: a hint about a file this test holds open: the reads
+        // below bring in the pages they ask for and no readahead past them.
+        unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+        let mut buf = vec![0u8; r.rec.1];
+        file.read_exact_at(&mut buf, r.rec.0 as u64).unwrap();
+        let (recs, dirs) = (share(f, r.rec), share(f, r.dir));
+        assert!(
+            recs >= 0.9 && dirs < 0.5,
+            "{}: records {recs:.2} and directory {dirs:.2} in the cache",
+            f.display()
+        );
+    }
+    inject.set_budget(raw * 3 / 2);
+    assert!(
+        tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+        "built ahead from the resident records: {:?}",
+        db.zpage_counts()
+    );
+    assert_eq!(db.zpage_counts().ahead_cold, 0, "none found cold");
+    let keys: Vec<Vec<u8>> = model.keys().step_by(97).cloned().collect();
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, "raw beside the files built ahead");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The builds ahead at landing (`Options::zpages_land_pct`): a store whose
 /// raw populations pass the percent of its budget and stay under the whole
 /// of it builds every partition's form file ahead, dormant, while the
@@ -12353,6 +12522,35 @@ fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
             db.zpage_counts().rewarm_trims,
             u64::from(on && trims),
             "{what}: a trim a rewarm: {:?}",
+            db.zpage_counts()
+        );
+        // A quiet stretch whose scans find every form file in the cache
+        // asks for none: the rewarm reads each file's share resident
+        // (`ZFile::pages_resident`) and leaves a whole one.
+        for p in form_files(&dir) {
+            let _ = std::fs::read(&p).unwrap();
+        }
+        let t = std::time::Instant::now();
+        while form_files(&dir).iter().any(|p| {
+            let m = MmapBytes::open(p).unwrap();
+            m.resident_share(0, m.len() as usize) < Some(1.0)
+        }) {
+            assert!(
+                t.elapsed().as_secs() < 30,
+                "{what}: the form files read back whole"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        for _ in 0..5 {
+            advance_tick(&db, std::time::Duration::from_millis(300));
+        }
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        assert_eq!(
+            db.zpage_counts().rewarms,
+            u64::from(on),
+            "{what}: no rewarm over files in the cache: {:?}",
             db.zpage_counts()
         );
         check(&r, &model, &keys, &format!("{what}: after"));

@@ -1694,7 +1694,9 @@ fn the_tokens_count_as_their_patterns_say() {
     assert_eq!(t.get("vault (field or module word)"), Some(&1));
     assert_eq!(t.get("crypt"), Some(&1));
     assert_eq!(t.get("cipher"), Some(&1));
-    let t = c("PagerGrace m.paged_resident(0) MmapBytes::paged(x) Walked::Held PartWalk::Walked Walked(3)");
+    let t = c(
+        "PagerGrace m.paged_view(0) MmapBytes::paged(x) Walked::Held PartWalk::Walked Walked(3)",
+    );
     assert_eq!(t.get("pager"), Some(&1));
     assert_eq!(t.get("paged"), Some(&2));
     assert_eq!(t.get("held build"), Some(&1));
@@ -3395,21 +3397,21 @@ fn a_new_allow_of_the_door_fails_in_each_spelling() {
 #[test]
 fn an_allow_moved_or_taken_away_fails_until_the_list_follows() {
     let listed = door_listed(&root());
-    // `ask_ahead`'s allow moved onto `drop_written`.
+    // `drop_behind`'s allow moved onto `drop_written`.
     let src = edited("src/db/zfile.rs", |t| {
         let t = t.replacen(
             "fn drop_written(",
             "#[allow(clippy::disallowed_methods)]\nfn drop_written(",
             1,
         );
-        let at = t.find("\nfn ask_ahead(").expect("ask_ahead");
-        let allow = t[..at].rfind("#[allow(").expect("ask_ahead's allow");
+        let at = t.find("\nfn drop_behind(").expect("drop_behind");
+        let allow = t[..at].rfind("#[allow(").expect("drop_behind's allow");
         let end = allow + t[allow..].find('\n').unwrap() + 1;
         format!("{}{}", &t[..allow], &t[end..])
     });
     let e = door_check(&src, &listed).expect_err("a move");
     assert!(e.contains("drop_written: 1 > 0"), "{e}");
-    assert!(e.contains("ask_ahead: 0 < 1 listed: lower"), "{e}");
+    assert!(e.contains("drop_behind: 0 < 1 listed: lower"), "{e}");
 }
 
 #[test]

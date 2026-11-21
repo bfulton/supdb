@@ -182,6 +182,21 @@ pub trait Bytes {
         None
     }
 
+    /// The share of `len` bytes at `off` a read would find in memory now,
+    /// from 0 to 1, `None` where the source cannot say: a mapping with no
+    /// page cache behind it, no mapping at all, or a kernel that will not
+    /// answer. A mapped file answers by `mincore` over the pages the range
+    /// lies in, clamped to the file, each page a byte of it lies in
+    /// counting, the first from its start; a paged mapping by what its
+    /// pager holds present or the kernel holds of the file behind it
+    /// (`Paging::resident`). Zero for a range that is empty or past the
+    /// end. The question a whole range asks, where `resident_at` asks it
+    /// of a page: whether a warm of a file can skip a span, or a partition
+    /// is read from memory or the device.
+    fn resident_share(&self, _off: u64, _len: usize) -> Option<f64> {
+        None
+    }
+
     /// The pages holding `len` bytes at `off` unmapped from the process
     /// (`MADV_DONTNEED` over the whole pages inside the range), so that a
     /// drop of the file's page cache behind them can take them: a merge
@@ -417,35 +432,17 @@ impl MmapBytes {
         Some(unsafe { std::slice::from_raw_parts(self.ptr.add(off as usize), len) })
     }
 
-    /// The share of `len` bytes at `off` a read would find in memory: for
-    /// a paged mapping, present in it or in the kernel's cache of the file
-    /// behind it (`Paging::resident`); for a mapped file, `None`, since its
-    /// residency is asked of the borrowed range itself.
-    pub fn paged_resident(&self, off: u64, len: usize) -> Option<f64> {
-        match &self.own {
-            Own::Paged(p) => Some(p.resident(off, len)),
-            Own::Map(_) => None,
-        }
-    }
-
-    /// How many of the system pages that `len` bytes at `off` lie in the
-    /// kernel holds in memory now, by `mincore`: what a warm of the file can
-    /// skip. The range is clamped to the mapping, and every page a byte of
-    /// it lies in counts, the first one from its start; zero for a range
-    /// that is empty or past the mapping, and where the kernel will not say
-    /// (`resident_count` tells that apart).
-    pub fn resident_pages(&self, off: usize, len: usize) -> usize {
-        self.resident_count(off, len).unwrap_or(0)
-    }
-
-    /// `resident_pages`, with `None` where the kernel will not say: for a
-    /// question whose wrong answer is "none resident", which a count read
-    /// as zero on a refusal would give.
-    pub fn resident_count(&self, off: usize, len: usize) -> Option<usize> {
+    /// How many of the system pages that `len` bytes at `off` of a mapped
+    /// file lie in the kernel holds in memory now, by `mincore`, and how
+    /// many pages that is: the range clamped to the mapping, every page a
+    /// byte of it lies in counting, the first from its start; `(0, 0)` for
+    /// a range that is empty or past the mapping, and `None` where the
+    /// kernel will not say. `Bytes::resident_share` for a mapped file.
+    fn mapped_resident(&self, off: usize, len: usize) -> Option<(usize, usize)> {
         let page = os_page_size();
         let end = off.saturating_add(len).min(self.lend as usize);
         if end <= off {
-            return Some(0);
+            return Some((0, 0));
         }
         let start = off / page * page;
         let span = end - start;
@@ -462,7 +459,7 @@ impl MmapBytes {
         if rc != 0 {
             return None;
         }
-        Some(vec.iter().filter(|&&b| b & 1 != 0).count())
+        Some((vec.iter().filter(|&&b| b & 1 != 0).count(), vec.len()))
     }
 }
 
@@ -605,6 +602,17 @@ impl Bytes for MmapBytes {
         let rc = unsafe { libc::mincore(at as *mut libc::c_void, page, vec.as_mut_ptr()) };
         (rc == 0).then_some(vec[0] & 1 == 1)
     }
+    fn resident_share(&self, off: u64, len: usize) -> Option<f64> {
+        let Own::Paged(p) = &self.own else {
+            let (have, pages) = self.mapped_resident(usize::try_from(off).ok()?, len)?;
+            return Some(if pages == 0 {
+                0.0
+            } else {
+                have as f64 / pages as f64
+            });
+        };
+        Some(p.resident(off, len))
+    }
     fn advise_dontneed(&self) {
         #[cfg(target_os = "linux")]
         if self.lend > 0 {
@@ -672,10 +680,11 @@ mod tests {
 
     /// Every page a byte of the range lies in counts, from the first one's
     /// start, and nothing past the mapping does: a file of three pages and a
-    /// hundred bytes, all of it just written and so in the page cache.
+    /// hundred bytes, all of it just written and so in the page cache. The
+    /// share is of those pages, and none for a range with none.
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    fn resident_pages_counts_every_page_a_range_touches_and_none_past_the_end() {
+    fn residency_counts_every_page_a_range_touches_and_none_past_the_end() {
         let page = os_page_size();
         let len = 3 * page + 100;
         let path =
@@ -684,24 +693,29 @@ mod tests {
         let m = MmapBytes::open(&path).unwrap();
         let sum: u64 = (0..len)
             .step_by(page)
-            .map(|o| u64::from(m.as_slice()[o]))
+            .map(|o| u64::from(m.slice_at(o as u64, 1).unwrap()[0]))
             .sum();
         assert_eq!(sum, 4 * 7, "every page touched");
-        assert_eq!(m.resident_pages(0, len), 4);
+        let pages = |off: usize, n: usize| m.mapped_resident(off, n).unwrap();
+        assert_eq!(pages(0, len), (4, 4));
         assert_eq!(
-            m.resident_pages(page - 1, 2),
-            2,
+            pages(page - 1, 2),
+            (2, 2),
             "two bytes across a page boundary"
         );
-        assert_eq!(m.resident_pages(page, page), 1, "one page exactly");
+        assert_eq!(pages(page, page), (1, 1), "one page exactly");
+        assert_eq!(pages(len - 1, 100), (1, 1), "clamped to the last page");
+        assert_eq!(pages(len, 5), (0, 0), "past the mapping");
+        assert_eq!(pages(len + page, 5), (0, 0), "well past the mapping");
+        assert_eq!(pages(5, 0), (0, 0), "an empty range");
+        assert_eq!(m.resident_share(0, len), Some(1.0));
+        assert_eq!(m.resident_share(page as u64 - 1, 2), Some(1.0));
         assert_eq!(
-            m.resident_pages(len - 1, 100),
-            1,
-            "clamped to the last page"
+            m.resident_share(len as u64, 5),
+            Some(0.0),
+            "past the mapping"
         );
-        assert_eq!(m.resident_pages(len, 5), 0, "past the mapping");
-        assert_eq!(m.resident_pages(len + page, 5), 0, "well past the mapping");
-        assert_eq!(m.resident_pages(5, 0), 0, "an empty range");
+        assert_eq!(m.resident_share(5, 0), Some(0.0), "an empty range");
         drop(m);
         let _ = std::fs::remove_file(&path);
     }

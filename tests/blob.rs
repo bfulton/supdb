@@ -746,8 +746,9 @@ enum Advice {
 /// is given (`advise_willneed`, `advise_dontneed_range`), so that two
 /// readers over the same bytes, one that lends whole and one by the piece,
 /// can be held to asking for the same ranges. It says the bytes of one
-/// range are resident (`resident_at`), none by default, so that an ask is
-/// held to being skipped over resident pages and only there.
+/// range are resident (`resident_at`, `resident_share`), none by default,
+/// so that an ask is held to being skipped over resident pages and only
+/// there.
 struct Advised<B> {
     inner: B,
     said: std::sync::Mutex<Vec<Advice>>,
@@ -802,6 +803,10 @@ impl<B: Bytes> Bytes for Advised<B> {
     fn resident_at(&self, off: u64) -> Option<bool> {
         let (a, b) = *self.resident.lock().unwrap();
         (a <= off && off < b).then_some(true)
+    }
+    fn resident_share(&self, off: u64, len: usize) -> Option<f64> {
+        let (a, b) = *self.resident.lock().unwrap();
+        (a <= off && off.saturating_add(len as u64) <= b).then_some(1.0)
     }
 }
 
@@ -950,16 +955,34 @@ fn holds_to_the_file<B: Bytes>(
         );
         assert_eq!(offsets[r], mapped.record_offset(r), "{name}: mapped at {r}");
     }
-    let span = mapped.record_region_span().expect("the region's span");
+    let span = mapped
+        .record_region_place()
+        .map(|(o, l)| (o, l as u64))
+        .expect("the region's place");
     assert_eq!(
         place.map(|(o, l)| (o, l as u64)),
         Some(span),
-        "{name}: the region's place is its span"
+        "{name}: the region's place is the mapped reader's"
     );
     assert_eq!(
         Some(span.0),
         offsets[0],
         "{name}: the region starts at rank 0"
+    );
+    // The span a raw point read touches, from the hash slots through the
+    // records, is the header's, whoever holds the section: it holds the
+    // record region and lies in the file.
+    let read = blob.raw_read_span().expect("a raw read's span");
+    assert_eq!(
+        Some(read),
+        mapped.raw_read_span(),
+        "{name}: a raw read's span"
+    );
+    assert!(
+        read.0 <= span.0
+            && span.0 + span.1 <= read.0 + read.1
+            && read.0 + read.1 <= raw.len() as u64,
+        "{name}: the read span {read:?} against the region {span:?}"
     );
     // Every ask over ranks lies in the record region, and asks for
     // something; past the last rank there is nothing to ask for.

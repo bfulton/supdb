@@ -45,7 +45,6 @@ allow	src/db.rs	fadvise_dontneed	1	advice on a door handle (S1, R3)
 allow	src/db.rs	thread_minflt	1	/proc/thread-self/stat for a trace (G3: Memory)
 allow	src/db.rs	thread_majflt	1	/proc/thread-self/stat for a trace (G3: Memory)
 allow	src/db.rs	llc_bytes	1	the last-level cache's size from /sys (G3: Memory)
-allow	src/db.rs	resident_share	1	mincore over a borrowed slice (G3: Memory)
 allow	src/db.rs	mallinfo2	1	dlsym of glibc's allocator count (G3: Memory)
 allow	src/db.rs	resident_beyond_use	1	/proc/self/status for the trim (G3: Memory)
 # The engine: paths that are not the store's files.
@@ -59,9 +58,8 @@ allow	src/db.rs	Maint::z_cross	1	is_file of a form file by path: under a cipher 
 allow	src/db/zfile.rs	drop_written_range	1	writeback and drop on the build's own output, a door handle
 allow	src/db/zfile.rs	written_back_range	1	writeback on the build's own output, a door handle
 allow	src/db/zfile.rs	swap_ahead	1	advice on a door handle
-allow	src/db/zfile.rs	ask_file	1	a form file opened by path for an ask: under a cipher the decoy opens nothing (G1-6, S1)
-allow	src/db/zfile.rs	drop_behind	1	advice in the plain build only (Walked::Mapped)
-allow	src/db/zfile.rs	ask_ahead	1	advice in the plain build only
+allow	src/db/zfile.rs	ask_file	1	advice on a door handle (S1)
+allow	src/db/zfile.rs	drop_behind	1	the descriptor half of the plain build's drop, on a door handle (S1)
 allow	src/db/zfile.rs	build_file_seen	1	Mmap::map of a plain segment's door handle (SegSrc::File)
 allow	src/db/zfile.rs	check_stride	1	maps the stride build's own output by path: no stride form is built under a cipher (StrideNo::Kept)
 allow	src/db/zfile.rs	thread_major_faults	1	getrusage (G3: Memory)

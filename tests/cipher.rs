@@ -2217,3 +2217,64 @@ fn a_store_handed_to_another_key_opens_under_that_one() {
     assert_eq!(snapshot(&dir), after, "a refused open changes nothing");
     holds(&Db::open(&dir, under(9)).unwrap(), n);
 }
+
+/// A merge under a cipher asks ahead for what stands behind its cold
+/// inputs (`Options::merge_read_ahead`), as it does over a plain store's
+/// files: the record region's place is read from the section's header
+/// however the reader holds the section, where it was a span of the
+/// mapping's lent bytes, which a file read through the store's cache has
+/// none of, so every window was empty and nothing was asked. The inputs
+/// are made cold by a cache a twentieth of them, which gives their chunks
+/// back, and by the drop of their ciphertext from the kernel's cache.
+#[test]
+fn a_merge_under_a_cipher_asks_ahead_for_its_cold_inputs() {
+    let _quiet = one_at_a_time();
+    let build = |name: &str, window: usize| -> (u64, u64, u64) {
+        let d = scratch(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                encryption: Encryption::Cipher(cipher(11).cache_bytes(1 << 20)),
+                seal_bytes: 4 << 20,
+                partition_bytes: None,
+                l0_trigger: 1,
+                merge_read_ahead: window,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let value = |round: u32, k: u32| format!("value-{round}-{k}-{}", "z".repeat(60));
+        for round in 0u32..4 {
+            for k in 0u32..24_000 {
+                db.append(
+                    format!("key-{:06}", k * 4 + round).as_bytes(),
+                    value(round, k).as_bytes(),
+                );
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+        }
+        db.settle().unwrap();
+        let before = db.merge_ahead();
+        let dropped = db.drop_record_pages();
+        for k in 0u32..96_000 {
+            db.append(format!("key-{k:06}").as_bytes(), value(9, k).as_bytes());
+        }
+        db.commit().unwrap();
+        db.settle().unwrap();
+        let (_, pieces) = db.levels();
+        assert_eq!(pieces, 0, "the fifth round's piece was not folded in");
+        let after = db.merge_ahead();
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+        (dropped, after.0 - before.0, after.1 - before.1)
+    };
+    let (dropped, asks, bytes) = build("mergeahead-cold", 1 << 20);
+    assert!(dropped > 6 << 20, "dropped {dropped} bytes of records");
+    assert!(
+        asks > 0 && bytes > 0,
+        "cold inputs: {asks} asks of {bytes} bytes"
+    );
+    let (_, asks, bytes) = build("mergeahead-off", 0);
+    assert_eq!((asks, bytes), (0, 0), "the option off asked");
+}
