@@ -715,6 +715,10 @@ pub trait Sect<'a>: Copy {
     fn key(self, off: usize) -> Option<&'a [u8]>;
     /// The section's length in bytes.
     fn size(self) -> usize;
+    /// Where this section, a part of `outer` (`part`), begins in it,
+    /// bytes: a pointer's difference for a slice, the sources' offsets'
+    /// for a section by the piece.
+    fn start_in(self, outer: Self) -> usize;
 }
 
 impl<'a> Sect<'a> for &'a [u8] {
@@ -745,6 +749,10 @@ impl<'a> Sect<'a> for &'a [u8] {
     #[inline(always)]
     fn size(self) -> usize {
         self.len()
+    }
+    #[inline(always)]
+    fn start_in(self, outer: Self) -> usize {
+        self.as_ptr() as usize - outer.as_ptr() as usize
     }
 }
 
@@ -874,6 +882,10 @@ impl<'a, B: crate::bytes::Bytes + ?Sized> Sect<'a> for Pieces<'a, B> {
     #[inline]
     fn size(self) -> usize {
         self.len
+    }
+    #[inline]
+    fn start_in(self, outer: Self) -> usize {
+        (self.off - outer.off) as usize
     }
 }
 

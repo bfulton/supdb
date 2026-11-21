@@ -300,7 +300,7 @@ Blob::willneed_dir	-	an ask or a drop of the page cache, made out of core or at 
 Blob::willneed_at	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
 Blob::willneed_span	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
 Blob::open_ahead	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
-Blob::record_offset	-	a fact a form file's build or the controller reads, once a build or a sample
+Blob::record_offset	-	a fact a merge reads once an input, and a rank at a time only under merge_drop_behind, merge_drops_covered or merge_read_ahead, each off by default and run by no probe
 Blob::drop_records	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
 Blob::prefetch_dir	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
 Blob::prefetch_ranks_est	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation

@@ -490,6 +490,17 @@ impl Sec {
         }
     }
 
+    /// `get` with no error made where the source does not lend the
+    /// section whole: for a caller whose other arm is a call, so that the
+    /// error's call is not one its arguments are saved across.
+    #[inline(always)]
+    fn lend<'a, B: Bytes>(&'a self, src: &'a B) -> Option<&'a [u8]> {
+        match self {
+            Sec::Lent { off, len } => src.lend_at(*off, *len),
+            Sec::Owned(v, _) => Some(v),
+        }
+    }
+
     /// The section as its source lends it by the piece, where it is held
     /// so.
     fn pieces<'a, B: Bytes>(&self, src: &'a B) -> Option<Pieces<'a, B>> {
@@ -1099,6 +1110,19 @@ impl<B: Bytes> Blob<B> {
         }
     }
 
+    /// `flat` with no error made for a section not lent whole (`Sec::lend`):
+    /// for a function whose arm by the piece is a call of its own, which
+    /// then takes the function's arguments as they came, with nothing
+    /// saved across a call before it (`record_offset`, `willneed_ranks`,
+    /// `willneed_dir`).
+    #[inline(always)]
+    fn flat_lent(&self) -> Option<(&[u8], &FlatIndex)> {
+        match &self.index {
+            Index::Flat { key, idx } => Some((key.lend(&self.src)?, idx)),
+            Index::Sparse(_) => None,
+        }
+    }
+
     /// The source this reader was opened over.
     pub fn source(&self) -> &B {
         &self.src
@@ -1333,9 +1357,37 @@ impl<B: Bytes> Blob<B> {
     /// (`Bytes::resident_at`).
     #[cfg(not(target_family = "wasm"))]
     pub fn willneed_ranks(&self, rank: usize, n: usize, cap: usize) -> usize {
-        let Some((sec, idx)) = self.flat() else {
+        let Some((sec, idx)) = self.flat_lent() else {
+            return self.willneed_ranks_by_piece(rank, n, cap);
+        };
+        self.willneed_ranks_in(sec, idx, rank, n, cap)
+    }
+
+    /// `willneed_ranks` for a source that lends by the piece, out of line
+    /// so that the whole reader's function stays what it was.
+    #[cfg(not(target_family = "wasm"))]
+    #[cold]
+    #[inline(never)]
+    fn willneed_ranks_by_piece(&self, rank: usize, n: usize, cap: usize) -> usize {
+        let Some((sec, idx)) = self.pieces() else {
             return 0;
         };
+        self.willneed_ranks_in(sec, idx, rank, n, cap)
+    }
+
+    /// `willneed_ranks` over the section however it is held: the span by
+    /// the directory, placed in the file by where the record region starts
+    /// in the section.
+    #[cfg(not(target_family = "wasm"))]
+    #[inline(always)]
+    fn willneed_ranks_in<'a, S: Sect<'a>>(
+        &self,
+        sec: S,
+        idx: &FlatIndex,
+        rank: usize,
+        n: usize,
+        cap: usize,
+    ) -> usize {
         let Some((recs, dir)) = idx.regions(sec) else {
             return 0;
         };
@@ -1345,11 +1397,11 @@ impl<B: Bytes> Blob<B> {
         let b = b
             .saturating_add(256)
             .min(a.saturating_add(cap))
-            .min(recs.len());
+            .min(recs.size());
         if a >= b {
             return 0;
         }
-        let recs_at = recs.as_ptr() as usize - sec.as_ptr() as usize;
+        let recs_at = recs.start_in(sec);
         let off = self.index_offset() + recs_at as u64 + a as u64;
         // A span whose first page is resident is taken as resident whole,
         // and nothing is asked: the records of a run or a block are a few
@@ -1361,8 +1413,6 @@ impl<B: Bytes> Blob<B> {
         self.src.advise_willneed(off, b - a)
     }
 
-    /// Where the record at `rank` begins in the file, by the directory:
-    /// `None` past the last rank or for a source with no flat index.
     /// The directory words of ranks `rank..rank + n` and the one past them
     /// asked of the kernel ahead of the reads that will want them
     /// (`willneed_ranks`, `key_at`), nothing where their first page is
@@ -1370,20 +1420,41 @@ impl<B: Bytes> Blob<B> {
     /// over a burst's pieces read each piece's directory page one fault at
     /// a time before it could ask for the records it names.
     pub fn willneed_dir(&self, rank: usize, n: usize) -> usize {
-        let Some((sec, idx)) = self.flat() else {
+        let Some((sec, idx)) = self.flat_lent() else {
+            return self.willneed_dir_by_piece(rank, n);
+        };
+        self.willneed_dir_in(sec, idx, rank, n)
+    }
+
+    /// `willneed_dir` for a source that lends by the piece, out of line.
+    #[cold]
+    #[inline(never)]
+    fn willneed_dir_by_piece(&self, rank: usize, n: usize) -> usize {
+        let Some((sec, idx)) = self.pieces() else {
             return 0;
         };
+        self.willneed_dir_in(sec, idx, rank, n)
+    }
+
+    /// `willneed_dir` over the section however it is held, placed in the
+    /// file by where the directory starts in the section.
+    #[inline(always)]
+    fn willneed_dir_in<'a, S: Sect<'a>>(
+        &self,
+        sec: S,
+        idx: &FlatIndex,
+        rank: usize,
+        n: usize,
+    ) -> usize {
         let Some((_, dir)) = idx.regions(sec) else {
             return 0;
         };
+        // Inside the directory and never empty: `dir_span` ends at the last
+        // rank's word, and an index that parses has a word for each rank.
         let Some((a, b)) = idx.dir_span(rank, n.saturating_add(1)) else {
             return 0;
         };
-        let b = b.min(dir.len());
-        if a >= b {
-            return 0;
-        }
-        let dir_at = dir.as_ptr() as usize - sec.as_ptr() as usize;
+        let dir_at = dir.start_in(sec);
         let off = self.index_offset() + dir_at as u64 + a as u64;
         if self.src.resident_at(off) == Some(true) {
             return 0;
@@ -1421,11 +1492,39 @@ impl<B: Bytes> Blob<B> {
         self.open_ahead
     }
 
+    /// Where the record at `rank` begins in the file, by the directory,
+    /// however the reader holds its section: `None` past the last rank or
+    /// for a sparse reader. Out of line, as its callers in a merge have it:
+    /// a merge's walk with it inlined kept a register less for its own loop.
+    #[inline(never)]
     pub fn record_offset(&self, rank: usize) -> Option<u64> {
-        let (sec, idx) = self.flat()?;
+        let Some((sec, idx)) = self.flat_lent() else {
+            return self.record_offset_by_piece(rank);
+        };
+        self.record_offset_in(sec, idx, rank)
+    }
+
+    /// `record_offset` for a source that lends by the piece, out of line.
+    #[cold]
+    #[inline(never)]
+    fn record_offset_by_piece(&self, rank: usize) -> Option<u64> {
+        let (sec, idx) = self.pieces()?;
+        self.record_offset_in(sec, idx, rank)
+    }
+
+    /// `record_offset` over the section however it is held: the record's
+    /// word in the directory, placed in the file by where the record region
+    /// starts in the section.
+    #[inline(always)]
+    fn record_offset_in<'a, S: Sect<'a>>(
+        &self,
+        sec: S,
+        idx: &FlatIndex,
+        rank: usize,
+    ) -> Option<u64> {
         let (recs, dir) = idx.regions(sec)?;
         let (a, _) = idx.record_span(dir, rank, 0)?;
-        let recs_at = recs.as_ptr() as usize - sec.as_ptr() as usize;
+        let recs_at = recs.start_in(sec);
         Some(self.index_offset() + recs_at as u64 + a as u64)
     }
 
@@ -1542,17 +1641,21 @@ impl<B: Bytes> Blob<B> {
         Some((at as u64, recs.len() as u64))
     }
 
-    /// Where the record region lies in a source that lends by the piece,
-    /// its offset and its length, bytes: `record_region_span` for a reader
-    /// that holds no section whole, placed by the header's words, for an
-    /// advice to what stands behind the source. `None` for a reader that
-    /// holds the section whole.
+    /// Where the record region lies in the source, its offset and its
+    /// length, bytes, placed by where it starts in the section however the
+    /// reader holds it, for an advice to what stands behind the source. `None`
+    /// where there is no region.
     #[cfg(not(target_family = "wasm"))]
     #[doc(hidden)]
     pub fn record_region_place(&self) -> Option<(u64, usize)> {
-        let (sec, idx) = self.pieces()?;
-        let (recs, _) = idx.regions(sec)?;
-        Some((recs.offset(), recs.size()))
+        indexed!(
+            self,
+            |sec, idx| {
+                let (recs, _) = idx.regions(sec)?;
+                Some((self.index_offset() + recs.start_in(sec) as u64, recs.size()))
+            },
+            None
+        )
     }
 
     /// The span of the file a raw point read touches a page of each
@@ -1571,8 +1674,8 @@ impl<B: Bytes> Blob<B> {
         Some((base + lo as u64, (hi - lo) as u64))
     }
 
-    /// The hash region's bytes, the slots a point read probes one page of;
-    /// 0 for a reader that does not hold the section whole.
+    /// The hash region's bytes, the slots a point read probes one page of,
+    /// however the reader holds its section; 0 for a sparse reader.
     #[cfg(not(target_family = "wasm"))]
     #[doc(hidden)]
     pub fn hash_region_bytes(&self) -> usize {

@@ -399,6 +399,315 @@ fn blob_source<B: Bytes>(blob: &Blob<B>) -> &B {
     blob.source()
 }
 
+/// An advice a reader gave its source, by its kind and its range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Advice {
+    Willneed(u64, usize),
+    Dontneed(u64, usize),
+}
+
+/// A source that answers as the one it wraps and records every advice it
+/// is given (`advise_willneed`, `advise_dontneed_range`), so that two
+/// readers over the same bytes, one that lends whole and one by the piece,
+/// can be held to asking for the same ranges. It says the bytes of one
+/// range are resident (`resident_at`), none by default, so that an ask is
+/// held to being skipped over resident pages and only there.
+struct Advised<B> {
+    inner: B,
+    said: std::sync::Mutex<Vec<Advice>>,
+    resident: std::sync::Mutex<(u64, u64)>,
+}
+
+impl<B> Advised<B> {
+    fn new(inner: B) -> Advised<B> {
+        Advised {
+            inner,
+            said: std::sync::Mutex::new(Vec::new()),
+            resident: std::sync::Mutex::new((0, 0)),
+        }
+    }
+
+    /// The bytes `a..b` said to be resident from now on.
+    fn resident(&self, a: u64, b: u64) {
+        *self.resident.lock().unwrap() = (a, b);
+    }
+
+    fn take(&self) -> Vec<Advice> {
+        std::mem::take(&mut *self.said.lock().unwrap())
+    }
+}
+
+impl<B: Bytes> Bytes for Advised<B> {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+    fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
+        self.inner.read_at(off, dst)
+    }
+    fn slice_at(&self, off: u64, len: usize) -> Option<&[u8]> {
+        self.inner.slice_at(off, len)
+    }
+    fn piecewise(&self) -> bool {
+        self.inner.piecewise()
+    }
+    fn piece_end(&self, off: u64) -> u64 {
+        self.inner.piece_end(off)
+    }
+    fn advise_willneed(&self, off: u64, len: usize) -> usize {
+        self.said.lock().unwrap().push(Advice::Willneed(off, len));
+        len
+    }
+    fn advise_dontneed_range(&self, off: u64, len: usize) {
+        self.said.lock().unwrap().push(Advice::Dontneed(off, len));
+    }
+    fn resident_at(&self, off: u64) -> Option<bool> {
+        let (a, b) = *self.resident.lock().unwrap();
+        (a <= off && off < b).then_some(true)
+    }
+}
+
+/// What a reader answers and advises for the ranks of a segment: every
+/// record's offset, the record region's place, and the asks and drops of
+/// a fixed set of calls, each with the advice it gave.
+type AdviceTrace = (
+    Vec<Option<u64>>,
+    Option<(u64, usize)>,
+    Vec<(usize, Vec<Advice>)>,
+);
+
+fn advice_trace<B: Bytes>(blob: &Blob<Advised<B>>) -> AdviceTrace {
+    let keys = blob.keys();
+    let offsets: Vec<Option<u64>> = (0..keys + 2).map(|r| blob.record_offset(r)).collect();
+    let place = blob.record_region_place();
+    let src = blob_source(blob);
+    let _ = src.take();
+    let mut calls = Vec::new();
+    for (rank, n, cap) in [
+        (0, keys, usize::MAX),
+        (0, 1, usize::MAX),
+        (keys / 2, 10, 64),
+        (keys / 3, 40, 1 << 20),
+        (keys - 1, 5, 1 << 20),
+        (keys, 3, 1 << 20),
+        (keys / 2, 4, 0),
+    ] {
+        let got = blob.willneed_ranks(rank, n, cap);
+        calls.push((got, src.take()));
+    }
+    for (rank, n) in [(0, keys), (0, 0), (keys / 3, 20), (keys - 1, 9), (keys, 1)] {
+        let got = blob.willneed_dir(rank, n);
+        calls.push((got, src.take()));
+    }
+    if let (Some(a), Some(b)) = (offsets[1], offsets[keys / 2]) {
+        blob.drop_records(a, b);
+    }
+    calls.push((0, src.take()));
+    (offsets, place, calls)
+}
+
+/// The advice a reader asks of its source for a span of ranks or of
+/// directory words, and the file offset of a record, answer the same for
+/// a source that lends by the piece as for one that lends whole, and the
+/// same offsets as the file itself says: the record's key at its offset,
+/// and the directory word the ask for a rank's word starts at naming that
+/// record. A reader by the piece once answered nothing to all of them, so
+/// that every ask ahead and every drop behind of a store under a cipher
+/// was a call that did nothing.
+#[test]
+fn the_advice_by_rank_answers_the_same_for_a_source_by_the_piece() {
+    for (name, compact) in [("plain", false), ("compact", true)] {
+        let path = scratch(&format!("advice-{name}"));
+        let want = build_opts(&path, 600, false, 256, compact);
+        let raw = std::fs::read(&path).unwrap();
+        let keys = want.len();
+        let mapped = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
+        let whole = Blob::open(Advised::new(VecBytes(raw.clone()))).expect("open whole");
+        assert!(!blob_source(&whole).piecewise() && whole.zero_copy());
+        let whole_trace = advice_trace(&whole);
+        // A reader that copied its section at the open answers as the one
+        // that lends it.
+        let copied = Blob::open(Advised::new(Copying(raw.clone()))).expect("open copying");
+        assert!(!blob_source(&copied).piecewise() && !copied.zero_copy());
+        let copied_trace = advice_trace(&copied);
+        holds_to_the_file(
+            &format!("{name}, copied"),
+            &copied,
+            &copied_trace,
+            &raw,
+            &want,
+            &mapped,
+        );
+        assert_eq!(copied_trace, whole_trace, "{name}: the copying reader");
+        for piece in [24, 64, 4080] {
+            let blob = Blob::open(Advised::new(Piecewise::new(raw.clone(), piece)))
+                .expect("open by the piece");
+            assert!(blob_source(&blob).piecewise());
+            let before = blob_source(&blob).inner.asked();
+            let trace = advice_trace(&blob);
+            let asked = blob_source(&blob).inner.asked() - before;
+            let (offsets, place, calls) = &trace;
+            // What the calls read they asked the source for by the piece:
+            // a few words of the directory and the header a call, never the
+            // key section whole, which a reader that borrowed it whole would
+            // ask for at every call.
+            let region = place.map_or(0, |(_, l)| l as u64);
+            assert!(
+                asked < region / 4,
+                "{name}, pieces of {piece}: asked for {asked} bytes, the region is {region}"
+            );
+            for (r, off) in offsets.iter().enumerate() {
+                assert_eq!(
+                    off.is_some(),
+                    r < keys,
+                    "{name}, pieces of {piece}: record offset at {r}"
+                );
+            }
+            assert!(place.is_some(), "{name}, pieces of {piece}: region place");
+            for (i, (got, said)) in calls.iter().enumerate().take(4) {
+                assert!(
+                    *got > 0 && !said.is_empty(),
+                    "{name}, pieces of {piece}: ask {i} answered {got} with {said:?}"
+                );
+            }
+            holds_to_the_file(
+                &format!("{name}, pieces of {piece}"),
+                &blob,
+                &trace,
+                &raw,
+                &want,
+                &mapped,
+            );
+            assert_eq!(
+                trace, whole_trace,
+                "{name}, pieces of {piece}: the piece reader against the whole one"
+            );
+        }
+        holds_to_the_file(name, &whole, &whole_trace, &raw, &want, &mapped);
+    }
+}
+
+/// A reader's answers held to the file they are about: each record's key
+/// at its offset, the offsets a mapped reader answers, the region's place
+/// its span, every ask over ranks inside the region and each directory ask
+/// at the word that names its rank's record.
+fn holds_to_the_file<B: Bytes>(
+    name: &str,
+    blob: &Blob<Advised<B>>,
+    trace: &AdviceTrace,
+    raw: &[u8],
+    want: &[(Vec<u8>, Vec<Vec<u8>>)],
+    mapped: &Blob<MmapBytes>,
+) {
+    let keys = want.len();
+    // The offsets are the file's: each record's key lies at its offset,
+    // and they are the ones a mapped reader answers.
+    let (offsets, place, calls) = trace;
+    for (r, (key, _)) in want.iter().enumerate() {
+        let off = offsets[r].expect("a record's offset") as usize;
+        let near = &raw[off..(off + key.len() + 16).min(raw.len())];
+        assert!(
+            near.windows(key.len()).any(|w| w == key.as_slice()),
+            "{name}: record {r}'s key is not at its offset {off}"
+        );
+        assert_eq!(offsets[r], mapped.record_offset(r), "{name}: mapped at {r}");
+    }
+    let span = mapped.record_region_span().expect("the region's span");
+    assert_eq!(
+        place.map(|(o, l)| (o, l as u64)),
+        Some(span),
+        "{name}: the region's place is its span"
+    );
+    assert_eq!(
+        Some(span.0),
+        offsets[0],
+        "{name}: the region starts at rank 0"
+    );
+    // Every ask over ranks lies in the record region, and asks for
+    // something; past the last rank there is nothing to ask for.
+    for (got, said) in &calls[..7] {
+        for a in said {
+            let Advice::Willneed(o, l) = *a else {
+                panic!("{name}: an ask over ranks gave {a:?}");
+            };
+            assert!(
+                o >= span.0 && o + l as u64 <= span.0 + span.1 && l == *got && l > 0,
+                "{name}: the ask {a:?} against the region {span:?}"
+            );
+        }
+    }
+    assert_eq!(
+        calls[5],
+        (0, Vec::new()),
+        "{name}: an ask past the last rank"
+    );
+    assert_eq!(calls[6], (0, Vec::new()), "{name}: an ask of no bytes");
+    for (got, said) in &calls[7..12] {
+        for a in said {
+            assert!(
+                matches!(*a, Advice::Willneed(_, l) if l > 0 && l == *got),
+                "{name}: a directory ask {a:?}"
+            );
+        }
+    }
+    // The ask for a rank's directory word starts at the word that names
+    // the rank's record, read out of the file.
+    let word = |o: u64| u32::from_le_bytes(raw[o as usize..o as usize + 4].try_into().unwrap());
+    let dir_at = |rank: usize| match blob.willneed_dir(rank, 1) {
+        0 => panic!("{name}: no ask for the directory word of rank {rank}"),
+        _ => match blob_source(blob).take().as_slice() {
+            [Advice::Willneed(o, 8)] => *o,
+            other => panic!("{name}: the directory ask at {rank} was {other:?}"),
+        },
+    };
+    let d0 = dir_at(0);
+    for r in [1, keys / 3, keys - 2] {
+        let d = dir_at(r);
+        assert_eq!(d, d0 + 4 * r as u64, "{name}: directory word of {r}");
+        assert_eq!(
+            (word(d) - word(d0)) as u64,
+            offsets[r].unwrap() - offsets[0].unwrap(),
+            "{name}: the word at {d} names record {r}"
+        );
+    }
+    // The asks over ranks start at the first rank's record and the drop
+    // runs between the two offsets it was given.
+    assert_eq!(
+        calls[1].1.first(),
+        Some(&Advice::Willneed(offsets[0].unwrap(), calls[1].0)),
+        "{name}: the ask for rank 0"
+    );
+    let (a, b) = (offsets[1].unwrap(), offsets[keys / 2].unwrap());
+    assert_eq!(
+        calls.last().unwrap().1,
+        vec![Advice::Dontneed(a, (b - a) as usize)],
+        "{name}: the drop"
+    );
+    // An ask whose first page is resident is skipped, by the residency of
+    // the offset the ask would start at and of no other.
+    let src = blob_source(blob);
+    let o0 = offsets[0].unwrap();
+    src.resident(o0, o0 + 1);
+    assert_eq!(
+        blob.willneed_ranks(0, 4, usize::MAX),
+        0,
+        "{name}: rank 0 resident"
+    );
+    assert!(
+        blob.willneed_ranks(keys / 2, 4, usize::MAX) > 0,
+        "{name}: rank {}",
+        keys / 2
+    );
+    src.resident(d0, d0 + 1);
+    assert_eq!(blob.willneed_dir(0, 1), 0, "{name}: word 0 resident");
+    assert!(blob.willneed_dir(1, 1) > 0, "{name}: word 1 not resident");
+    assert!(
+        blob.willneed_ranks(0, 4, usize::MAX) > 0,
+        "{name}: rank 0 again"
+    );
+    src.resident(0, 0);
+    let _ = src.take();
+}
+
 /// Compact records, through a source that lends and one that copies: the
 /// same answers as each other and as what was written, and the lending one
 /// still copies nothing. The fixture's runs straddle the inline bound, so
