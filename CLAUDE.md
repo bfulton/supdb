@@ -6003,11 +6003,12 @@ in the suite's figures, at `full` scale where it says so:
   (`Options::merge_parallel_quiet`) -- and as the working set the burst
   leaves, which under 1 GiB is about 1.2 GB against the bound: form files
   that do not fit, the pieces, and the memtables' unsealed keys, whose sort
-  is the pass's first scan. There the pass reads at about LMDB's rate for
-  both key shapes, a third of it user time, a quarter the kernel's fault
-  handling and the rest device waits, and the rewarm trades its faults for
-  device reads one for one (`docs/engine.md`, keys that are no run of
-  numbers). The levers left are the bytes of that working set -- the form,
+  is the pass's first scan. There the pass over ids reads 0.6x to 0.9x of
+  LMDB and the pass over numbered keys 1.1x to 1.3x (`docs/engine.md`,
+  paired at the head), a third of it user time, a quarter the kernel's
+  fault handling and the rest device waits, and the rewarm trades its
+  faults for device reads one for one (`docs/engine.md`, keys that are no
+  run of numbers). The levers left are the bytes of that working set -- the form,
   the pieces standing, the unsealed keys -- and the merge path's user time
   over them; the idle I/O class for the merges and their inputs asked ahead
   were priced on it and refuted.
