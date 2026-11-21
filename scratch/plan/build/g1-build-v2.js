@@ -21,6 +21,8 @@ const TAIL = !(args && args.tail === false)
 const RESUME = (args && args.resume) || {}
 // A step other than a build that a restart cut short is told so by its label (args.notes maps a label to a note); with no note the prompt is byte for byte what it was, so the steps before it replay.
 const NOTES = (args && args.notes) || {}
+// What landed after this script and the plan were written, said once a launch (args.since) and read by every step of it: the same args give the same prompts, so a resume replays.
+const SINCE = (args && args.since) ? "\nSINCE THIS SCRIPT AND THE PLAN WERE WRITTEN (the launcher's note; it stands where it differs from the text above, from the RULES below and from the plan):\n" + args.since + "\n" : ''
 const noted = (label, prompt) => NOTES[label] ? prompt + '\n\nAN EARLIER ATTEMPT AT THIS STEP WAS CUT SHORT: ' + NOTES[label] : prompt
 
 const CONTEXT = `
@@ -31,7 +33,7 @@ The plan is ${PLAN}/g1.md: eight units, each a section, with a section "What eve
 Tests known to fail now and then for reasons that are not a unit's, each to be read as its own before it is read as yours: under load the checked zpages binary's wall-clock waits (scratch/HANDOFF.md lists them; the gate's one copy passes), and tests/cipher.rs the_compact_form_is_built_and_read_within_a_cache_the_store_does_not_fit ("the builds gave nothing back"), undiagnosed. A red run on one of those, in a test your diff does not touch, is run again alone five times and reported with both outputs; it is never skipped, ignored or loosened, and a second red of the group is a red.
 
 The container this runs in is restarted every few hours without warning (uptime says when), and its files survive: a background command may be started again from its beginning by the harness, so a log is read by its own EXIT line and its start time, never by its presence. Keep ${W}/<unit>/notes.md current as you work (the step you are on, where a runner writes its results, which copy of each file is the finished one). Before the first mutant, keep the files you changed under ${W}/<unit>/keep/ with their sha256 sums; a mutant runner writes each verdict to its results file as it gets it and puts the file back, checked by its sum, after each.
-`
+${SINCE}`
 
 const RULES = `
 RULES (the owner's; they are not yours to reopen)
@@ -187,8 +189,8 @@ Return the structured result for the unit as it now stands (all of it). Set engi
 }
 
 function commitPrompt(u, impl, unresolved) {
-  const more = u.key === 'G1-7' ? ' and then "sh scripts/check.sh wasm" and "sh scripts/check.sh bench" (a public signature of Bytes changed)' : (u.key === 'G1-3' ? ' and then "sh scripts/check.sh bench" (the suite gained probes)' : '')
-  const groups = u.engine ? 'build test stride lint' : 'build test lint'
+  const more = u.key === 'G1-7' ? ' and then "sh scripts/check.sh wasm" and "sh scripts/check.sh bench" (a public signature of Bytes changed)' : (u.key === 'G1-3' ? ' and then "sh scripts/check.sh bench" (the suite gained probes)' : (u.engine ? ' and then "sh scripts/check.sh wasm" (src/blob.rs, src/flatindex.rs and src/bytes.rs compile into the wasm module, whose size is budgeted and which denies warnings)' : ''))
+  const groups = u.engine ? 'build test stride lint lists' : 'build test lint lists'
   return `${CONTEXT}
 YOU COMMIT: ${sectionOf(u)} Its work is uncommitted in the working tree; its notes are under ${W}/${u.key}/.
 ${RULES}
@@ -255,7 +257,7 @@ if (!stopped && TAIL) {
   const gatePrompt = `${CONTEXT}
 YOU RUN THE FULL GATE on HEAD, after every unit of this run has committed (git log ${BASE}..HEAD).
 ${RULES}
-Run "sh scripts/check.sh" (every default group: build test stride lint wasm bench) in the background from a clean TMPDIR of your own, exit status captured, and wait for it; the bench group builds the suite. How to wait: write the exit status to the log after the command ("...; echo EXIT $? >> log"), then block on that line with the Monitor tool (an until-loop that greps the log for "^EXIT") or a foreground command that does the same, again and again until the line is there. A turn that ends while the gate still runs is taken as your answer, and the gate goes on running under whoever comes next: if you must answer without a verdict, stop the gate's processes first and say so. Nobody else writes the branch or the tree while you run: if HEAD's tree changes under you, say so and run again. Then the groups this run added outside the default set, each on its own (read scripts/check.sh for their names: the cost group at least), one at a time. Read each group's verdict from its exit status, never through a pipe. If a group is red for something a unit's commit broke mechanically (formatting, a lint, a struct literal in bench/), fix it and commit it as its own small follow-up commit in the repository's manner, ending with the same two attribution lines the unit commits end with (read one with git log -1), then run that group again. Red for anything else: report the failing test and its output; never skip, ignore or loosen a test. Report each new group's run time and the disk it used. Do not push. Finish with git status --porcelain empty and return HEAD.`
+Run "sh scripts/check.sh" (every default group: build test stride lint wasm bench lists) in the background from a clean TMPDIR of your own, exit status captured, and wait for it; the bench group builds the suite. How to wait: write the exit status to the log after the command ("...; echo EXIT $? >> log"), then block on that line with the Monitor tool (an until-loop that greps the log for "^EXIT") or a foreground command that does the same, again and again until the line is there. A turn that ends while the gate still runs is taken as your answer, and the gate goes on running under whoever comes next: if you must answer without a verdict, stop the gate's processes first and say so. Nobody else writes the branch or the tree while you run: if HEAD's tree changes under you, say so and run again. Then the groups this run added outside the default set, each on its own (read scripts/check.sh for their names: the cost group at least), one at a time. Read each group's verdict from its exit status, never through a pipe. If a group is red for something a unit's commit broke mechanically (formatting, a lint, a struct literal in bench/), fix it and commit it as its own small follow-up commit in the repository's manner, ending with the same two attribution lines the unit commits end with (read one with git log -1), then run that group again. Red for anything else: report the failing test and its output; never skip, ignore or loosen a test. Report each new group's run time and the disk it used. Do not push. Finish with git status --porcelain empty and return HEAD.`
   gate = await agent(gatePrompt, { label: 'gate:full', phase: 'Gate', model: 'opus', schema: GATE_SCHEMA })
   if (!gate || !gate.green) {
     log('the full gate answered without a green verdict; one more run of it before anything is counted')

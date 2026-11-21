@@ -146,9 +146,13 @@ bulk replacement broke tick-exact tests once; do it test by test. Planned for th
 
 **As of 21 Nov 08:47 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
 launched one unit a launch: `Workflow {scriptPath, args: {base:
-"ea6352181f342b7bffd75ec8c88df92bc7b78ff6", only: ["G1-<n>"], tail: false}}`, the same base for
-every unit; after G1-8 a launch with `only: ["none"]` and no `tail: false` runs the full gate
-and the critic. A unit is a build, up to three rounds of two reviews and a repair, then its gate
+"ea6352181f342b7bffd75ec8c88df92bc7b78ff6", only: ["G1-<n>"], tail: false, since: <note>}}`,
+the same base for every unit; after G1-8 a launch with `only: ["none"]` and no `tail: false`
+runs the full gate and the critic. `since` (from G1-4 on) is the launcher's note of what landed
+after the plan was written, read by every step of the launch; G1-4's is in
+`scratch/plan/build/G1-4/launch-args.json` and the later units take the same text with what
+has landed added. From G1-4 on a unit's gate also runs the `lists` group, and `wasm` for a
+unit that changes compiled engine code. A unit is a build, up to three rounds of two reviews and a repair, then its gate
 and one local commit, which whoever launched it pushes. A container restart kills the run and
 leaves its files: resume with `resumeFromRunId` and the same args, plus `args.resume` (a
 build) or `args.notes` (any other step, by its label) to tell the killed step what the tree
