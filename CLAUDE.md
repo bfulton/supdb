@@ -73,9 +73,48 @@ failed at RocksDB's build script, `unable to find library -lclang`.
 `deps.sh` cleans an output that names a directory with no libclang in
 it.
 
-`sh scripts/check.sh` runs every group -- build, test, stride, lint, wasm, bench --
-and CI calls the same script with the same names, so a green run here is a
-green run there. Every group denies warnings, the wasm group since it was
+`sh scripts/check.sh` runs every group -- build, test, stride, lint, wasm, bench,
+lists -- and CI calls the same script with the same names, so a green run
+here is a green run there. tests/source.rs reads every file under
+`.github/workflows`: a workflow that runs on a change's event (`ci.yml`,
+and `apple-silicon.yml`, which runs the `machine` group where a pull
+request changes the machine capture) is held to run steps that are a
+group's call or set-up on its short list, one that checks no change (the
+measurements, the rows' proposal) to triggers that are no change's -- by
+hand, on a schedule, after a merge to main -- and one it does not list is
+red, as is a group no job runs and a line of a set-up script that writes
+the job's environment unlisted (`$GITHUB_ENV` is a way to set a check's
+knobs from outside it). The first version read `ci.yml` alone, and review
+found `apple-silicon.yml` checking pull requests by hand beside it: a
+check whose scope is one member of a set passes the next member, so it
+reads the whole set and fails a member it does not list. Two checks the
+YAML used to make itself are groups now, `cross-arm` (the linker, the
+qemu runner and the `--cfg` the job's environment carried) and the cost
+job's base, which `scripts/base.sh` decides from the event's values for
+every check that compares the tree with the commit before it. The lists
+that only go down -- `tests/data/couplings.txt`, the door's two,
+`tests/data/cost-entries.txt`'s reasons -- are held across a change by the
+`lists` group against that base, since each list's test sees one tree: a
+raise is declared in `scripts/raises.txt` and matched exactly, where it was
+once a CODEOWNERS line, a check that ran on nobody's machine. The workflow's
+test first read the `run:` lines and nothing else, and review found three
+ways round it that it passed: an `if: false` on the step or the job, which
+left the group counted as run; a `continue-on-error`, which reads a red
+group green; and an `env:` that set the base (`SUPDB_BASE: HEAD`, the tree
+against itself) or narrowed a group (`RATCHET_RED_STEPS`, `COST_PROBES`).
+It reads every key of the workflow now, against lists of its own, and the
+second review found the reader of keys keyed on the parent's name: a job
+named `inputs` took any key as an input's, its `if: false` among them, and
+its group counted as run; the triggers were read by their keys alone, so a
+workflow that ran on no pull request read green; and the groups' `case`
+ended at the first `esac` at any depth, so a group after a nested case was
+read by nobody. A key is read by the whole path to it. The lists'
+check had the same shape one level up: it held each list the tree's
+registry named, and a change that moved a list from the registry to its
+not-held table, with a raise beside it, read green; the registry is held to
+the base's now. A check over one kind of line passes everything written in
+another kind, and a check whose scope is written in the tree it checks is
+held to the scope at the base. Every group denies warnings, the wasm group since it was
 found printing six dead-code warnings and reporting green: the module built
 under cargo's default of warn, and nobody reads a build log that ends in
 sizes. Four were `format`'s superblock constants, which `blob` kept copies

@@ -121,15 +121,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: bench -> bench/target
+      # The event's values, and nothing decided here: scripts/base.sh takes
+      # the base from them, as it does on a contributor's clone.
       - name: The plain store's cost, by function
         env:
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PUSH_BEFORE: ${{ github.event.before }}
-        run: |
-          base="$PR_BASE"
-          [ -n "$base" ] || base="$PUSH_BEFORE"
-          case "$base" in ''|0000000000000000000000000000000000000000) base=$(git rev-parse HEAD~1) ;; esac
-          COST_BASE="$base" sh scripts/check.sh cost
+          SUPDB_PR_BASE: ${{ github.event.pull_request.base.sha }}
+          SUPDB_PUSH_BEFORE: ${{ github.event.before }}
+        run: sh scripts/check.sh cost
+
+  lists:
+    # The lists that only go down (tests/data's, registered in
+    # scripts/ratchet.py) against the commit the change is made on: a list
+    # grown past what scripts/raises.txt declares fails. The tests in the
+    # test job see one tree; this job sees the base as well, so it needs
+    # the whole history.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The lists, against the base
+        env:
+          SUPDB_PR_BASE: ${{ github.event.pull_request.base.sha }}
+          SUPDB_PUSH_BEFORE: ${{ github.event.before }}
+        run: sh scripts/check.sh lists
 
   cross-arm:
     # Proves the ARM paths build and pass before any ARM hardware is involved.
@@ -142,20 +157,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Cross toolchain
         run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu qemu-user-static
-      # The linker and the emulator belong to this job, not to the
-      # repository: `.cargo/config.toml` set them for the aarch64 target,
-      # which is also the *host* target on the native ARM runner, so that
-      # leg tried to run its own tests through a qemu it does not have.
-      # qemu-user answers `madvise` advice with success and passes it to no
-      # kernel, so the unit tests that read the kernel's answer to it cannot
-      # pass here; `supdb_emulated` compiles them out of this job alone, and
-      # the native ARM leg of `test` runs them.
+      # The linker, the emulator and `--cfg supdb_emulated` are the
+      # group's (scripts/check.sh cross-arm), not the repository's:
+      # `.cargo/config.toml` set the first two for the aarch64 target, which
+      # is also the *host* target on the native ARM runner, so that leg
+      # tried to run its own tests through a qemu it does not have.
       - name: Build and test under emulation
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64-static -L /usr/aarch64-linux-gnu
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: --cfg supdb_emulated
-        run: cargo test --profile checked --target aarch64-unknown-linux-gnu --lib
+        run: sh scripts/check.sh cross-arm
 
   fscrypt:
     # A store under a key (`Encryption::Kernel`) asks the kernel to encrypt

@@ -4,8 +4,9 @@ name: apple-silicon
 # a parsing question, not a timing one, so a hosted -- and therefore
 # virtualised -- Apple Silicon runner answers it. It was silently wrong once:
 # the detector read a /sys path that does not exist on macOS and defaulted to
-# a 64-byte line on a machine whose lines are 128. `bench machine` exits
-# non-zero here if the line size was defaulted rather than read.
+# a 64-byte line on a machine whose lines are 128. The check is the
+# `machine` group of scripts/check.sh: `bench machine` exits non-zero if the
+# line size was defaulted rather than read, and the capture has to say 128.
 #
 # Timing on Apple Silicon is `quiet-bench`, on a self-hosted Mac.
 
@@ -15,6 +16,7 @@ on:
       - 'bench/src/machine.rs'
       - 'bench/src/env.rs'
       - '.github/workflows/apple-silicon.yml'
+      - 'scripts/check.sh'
   workflow_dispatch:
 
 permissions:
@@ -31,13 +33,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: bench -> bench/target
-      - name: Build
-        working-directory: bench
-        run: cargo build --release --bin bench
-      - name: Detect
-        working-directory: bench
-        run: |
-          set -eu
-          ./target/release/bench machine | tee machine.json
-          grep -q '"cache_line_detected": true' machine.json
-          grep -q '"cache_line": 128' machine.json
+      - name: The machine capture, read
+        run: sh scripts/check.sh machine

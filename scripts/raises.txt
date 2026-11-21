@@ -1,0 +1,12 @@
+# Raises of the lists scripts/ratchet.py holds (sh scripts/check.sh lists),
+# each declared by the change that makes it. Tab-separated columns:
+#   list    a list of the registry, by its path
+#   key     the key as the check prints it (couplings.txt: file token
+#           region; door.txt: kind file scope; door-libc.txt: the name;
+#           cost-entries.txt: Type::fn)
+#   from    its number at the base
+#   to      its number in the tree
+#   reason
+# A line passes only where it matches what the check observed, all four
+# columns. A line the base already has is spent: printed, never matched,
+# and removed by any later change at will.
