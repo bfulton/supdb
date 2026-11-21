@@ -142,9 +142,9 @@ bulk replacement broke tick-exact tests once; do it test by test. Planned for th
 
 ## What is left, in the owner's order
 
-### 1. The page layer (task 12). Stage G1 under way: three units of eight landed.
+### 1. The page layer (task 12). Stage G1 under way: three units of eight landed, and the lists' check.
 
-**As of 20 Nov 22:55 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
+**As of 21 Nov 02:20 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
 launched one unit a launch: `Workflow {scriptPath, args: {base:
 "ea6352181f342b7bffd75ec8c88df92bc7b78ff6", only: ["G1-<n>"], tail: false}}`, the same base for
 every unit; after G1-8 a launch with `only: ["none"]` and no `tail: false` runs the full gate
@@ -211,20 +211,43 @@ holds; a note for a step changes no earlier prompt, so the steps before it repla
   `sh scripts/check.sh cost` with its default base has not been run; a whole run wants
   several gigabytes free; libc's and the allocator's functions are held only loosely; `Txn`,
   `RunWalk` and the `SparseBlob` readers are outside the entry-point list.
-- **The owner's decision (20 Nov 17:38 UTC), task 18, the next work:** a list's "only goes
-  down" is held by a check, not by `.github/CODEOWNERS`, and the check is run by the same
-  command locally and in CI: every CI job is a `sh scripts/check.sh <group>`. So:
-  `scripts/base.sh`, one definition of the commit a change is made on; a ratchet script and
-  its red input over the registered lists (`couplings.txt`, `door.txt`, `door-libc.txt`,
-  `cost-entries.txt`'s reasons, and G2's lists as they are built), failing on growth against
-  the merge-base, an intended raise declared in a file of its own and matched exactly (the
-  launcher's choice, told to the owner, not answered); a group for it in the default set and
-  a `cross-arm` group outside it, so the one CI job that called cargo itself goes through
-  `check.sh`; the cost job's base logic out of the YAML; a test that reads `ci.yml` and fails
-  a step that checks anything except through `check.sh`; `CODEOWNERS` removed. Every later
-  unit is launched with that rule in its build note.
-- **Next, in order:** task 18, then task 17, each its own workflow and commit; then G1-4
-  `offsets`, then `authenticated`, `advice`, `sealed`, `docs`.
+- **The owner's decision (20 Nov 17:38 UTC), task 18, landed: `4ceda21e`.** A list's "only goes
+  down" is held by a check, not by `.github/CODEOWNERS` (removed), and every workflow that
+  runs on a change checks only through `sh scripts/check.sh <group>`. `scripts/base.sh` is the
+  one definition of the commit a change is made on (an override, a pull request's base, a
+  push's before, else the merge-base with `origin/main`; an unresolvable base fails, never a
+  fallback), and the cost group takes its base from it. The `lists` group (in the default
+  set) runs `scripts/ratchet-red.sh` and then `scripts/ratchet.py` through `ratchet.sh`: each
+  registered list (`couplings.txt`, `door.txt`, `door-libc.txt`, `cost-entries.txt`'s reasons
+  in place of a probe) at the merge-base against the tree, growth read by the list's own key
+  and number, the registry itself held to the base's; an intended raise is a line of
+  `scripts/raises.txt` (list, key, from, to, reason) matched in all four, and a line the base
+  already has is spent. `cross-arm` and `machine` (the Apple Silicon capture, which
+  `apple-silicon.yml` checked by hand) are groups outside the default set. `tests/source.rs`
+  reads every file under `.github/workflows`: a workflow on a change's event is read key by
+  key (an `if`, a `continue-on-error`, an `env` that sets a base or narrows a group, a check
+  outside `check.sh` are red; a group no job runs is red), the measurement workflows are
+  listed with why and held to their triggers, and any other file is red. Run as change `T18`
+  with `scratch/plan/build/change-v1.js` (the stage's script with the unit taken from its
+  args); its notes, mutants and launch arguments are in `scratch/plan/build/T18/`. All three
+  review rounds asked for repairs; the third (every workflow read, the `machine` group, the
+  set-up scripts' writes to the job's environment) was read by the launcher and by no
+  reviewer. Open: the `machine` group has not run on a Mac; what a set-up's binary or an
+  action writes to a job's environment is not read; the cost gate's declared moves are not
+  built (`raises.txt` is shaped to take them); the launcher's choice that a raise is declared
+  rather than impossible has not been answered by the owner.
+- **`19d078d1`: the pager's residency test compiled out under `supdb_emulated`.** The change
+  above installed the cross toolchain and qemu-user here and ran `cross-arm` for the first
+  time on this branch: one test red, five runs of five, the pager's ask ahead that qemu-user
+  passes to no kernel. Green after (519 passed). No hosted runner has run any job of this
+  branch: the first pull request is where `cross-arm`, `machine`, `cost` and `lists` first run
+  there.
+- **Next, in order:** task 17 as change `T17` (the two probes over upstream, above), its own
+  workflow and commit; then G1-4 `offsets`, then `authenticated`, `advice`, `sealed`, `docs`.
+  Every unit from here is launched with a build note: a CI job it adds is
+  `sh scripts/check.sh <group>` with nothing in the YAML but event values, a list it adds is
+  registered in `scripts/ratchet.py`, and a move between functions the cost group reads red is
+  said in its notes with callers and callees, the gate not weakened.
 
 What follows was written before the stage began.
 
