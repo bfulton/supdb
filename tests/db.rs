@@ -20542,6 +20542,12 @@ fn a_second_open_of_a_store_is_refused_until_the_first_is_gone() {
     db.commit().unwrap();
     db.flush().unwrap();
     db.settle().unwrap();
+    // Under the forced form (the stride group's `SUPDB_TEST_STRIDE`) a
+    // partition's form file is built on demand on the segment work's
+    // thread, and a build still writing its temp name between the two
+    // listings below read as a refused open's change: every partition has
+    // its file or its reason before the first.
+    db.zpages_settle().unwrap();
     std::fs::write(d.join("seg-00000000000000ff.sup"), b"an orphan").unwrap();
     let before = the_directory(&d);
     for (what, e) in [
