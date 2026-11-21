@@ -340,6 +340,10 @@ struct Cfg {
     /// `ZFUZZ_OPTVARY`, the side generator's next draw, and off otherwise,
     /// as the engine has it.
     merge_quiet: bool,
+    /// That room at any gate of the controller and not only where the
+    /// compact form is installed (`Options::merge_quiet_any_gate`): in half
+    /// the seeds that draw the third merge.
+    merge_quiet_any: bool,
     /// Under `ZFUZZ_STRIDE`, the stride form's steer; `None` without it.
     stride: Option<StrideSteer>,
 }
@@ -631,6 +635,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let (steps_on, direct_on) = (side.chance(50), side.chance(50));
     let (heads_on, land_on) = (side.chance(50), side.chance(50));
     let quiet_on = side.chance(50);
+    let quiet_any = side.chance(50);
     // A generator of its own, as `side` is, so that the switch moves none
     // of the draws below.
     let stride =
@@ -686,6 +691,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         bounds_heads: vary && heads_on,
         land_bounds: vary && land_on,
         merge_quiet: vary && quiet_on,
+        merge_quiet_any: vary && quiet_on && quiet_any,
         stride,
     }
 }
@@ -717,6 +723,7 @@ fn opts(c: &Cfg) -> Options {
         bounds_by_heads: c.bounds_heads,
         land_bounds_read: c.land_bounds,
         merge_parallel_quiet: if c.merge_quiet { 3 } else { 0 },
+        merge_quiet_any_gate: c.merge_quiet_any,
         promote_starts: c.hot_starts,
         zpages_store_all: c.store_all,
         scan_start_cache: if c.start_cache { 4096 } else { 0 },

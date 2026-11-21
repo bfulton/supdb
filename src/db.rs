@@ -4951,9 +4951,26 @@ pub struct Options {
     /// no run of numbers); in a stretch nobody reads, the third merge's
     /// device and CPU are no reader's. A merge started under the room
     /// runs to its landing whatever comes after it. Zero is the shape
-    /// before: `supdb-boundsleanquiet3` sets three.
+    /// before: `supdb-boundsleanquiet3` sets three. The room rises only
+    /// where the compact form is installed (`zselect::GATE_Z`), the store
+    /// out of core by the controller's verdict, unless
+    /// `merge_quiet_any_gate` says otherwise.
     #[doc(hidden)]
     pub merge_parallel_quiet: usize,
+    /// EXPERIMENT: `merge_parallel_quiet`'s room at any gate of the
+    /// controller, the shape before. The third merge was paired at every
+    /// bounded rung of ten million keys and at three million under
+    /// 1.25 GiB, and read ahead in one cell alone, the pass after the full
+    /// rewrite over random ids at ten million under 1.25 GiB, where the
+    /// form is installed from the load on; at three million, where the
+    /// store sits at the census with no form installed, that pass is the
+    /// first scan's wait for the upkeep thread's last pass in both arms,
+    /// 10-58 ms of a pass of 36-88, and it read 0.69x and 0.74x in one
+    /// pairing and 0.64x and 1.62x in the next, nothing the merges reach.
+    /// So the room is kept to where the debt it retires is a device's:
+    /// `supdb-boundsleanquiet3any` is the arm at any gate.
+    #[doc(hidden)]
+    pub merge_quiet_any_gate: bool,
     /// Under `merge_chains`, a merge's landing plans the next merge out of
     /// core -- the controller's gate away from the raw form -- whether or
     /// not a scan has come since the last landing, so the merges a burst's
@@ -6893,6 +6910,7 @@ impl Default for Options {
             merge_bytes_cap: 64 << 20,
             merge_parallel: 2,
             merge_parallel_quiet: 0,
+            merge_quiet_any_gate: false,
             boundary_keys_from_top: false,
             pieces_dir_willneed: true,
             bounds_heads_willneed: true,
@@ -47505,12 +47523,14 @@ impl Maint {
 
     /// The most partition merges that may be in flight now:
     /// `Options::merge_parallel`, or `merge_parallel_quiet` where it is
-    /// more and the writer's last commit saw no read since the one before,
-    /// no read having come since (`Shared::write_quiet`).
+    /// more, the writer's last commit saw no read since the one before, no
+    /// read having come since (`Shared::write_quiet`), and the compact form
+    /// is installed (`Options::merge_quiet_any_gate` for any gate).
     fn merges_room(&self) -> usize {
         let base = self.opts.merge_parallel.max(1);
         if self.opts.merge_parallel_quiet > base
             && self.shared.write_quiet.load(AtomicOrdering::Acquire)
+            && (self.opts.merge_quiet_any_gate || self.shared.zgate.load() == zselect::GATE_Z)
         {
             self.opts.merge_parallel_quiet
         } else {

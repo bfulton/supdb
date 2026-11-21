@@ -1098,14 +1098,16 @@ fn a_merges_landing_plans_the_next_and_a_cap_lands_a_range_at_a_time() {
 }
 
 /// A third merge in flight only while the writer's commits see no read
-/// (`Options::merge_parallel_quiet` at three over `merge_parallel` at two).
-/// Three ranges are made due in turn with every merge held before its
-/// landing: with the commits of a write-only stretch the third starts
-/// beside the two, and it does not where the option is off, where a point
-/// read comes before every commit, or where a read through the writer or
-/// a handle comes after the last commit and before the seal whose landing
-/// would plan it. Released, every merge lands, the partitions tile, and
-/// every key reads back.
+/// and the compact form is installed (`Options::merge_parallel_quiet` at
+/// three over `merge_parallel` at two). Three ranges are made due in turn
+/// with every merge held before its landing: with the commits of a
+/// write-only stretch under the forced form the third starts beside the
+/// two, and it does not where the option is off, where a point read comes
+/// before every commit, where a read through the writer or a handle comes
+/// after the last commit and before the seal whose landing would plan it,
+/// or where the store reads the raw form -- unless the room is asked for
+/// at any gate (`Options::merge_quiet_any_gate`). Released, every merge
+/// lands, the partitions tile, and every key reads back.
 #[test]
 fn a_third_merge_runs_only_in_a_stretch_of_writes_nobody_reads() {
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1115,6 +1117,8 @@ fn a_third_merge_runs_only_in_a_stretch_of_writes_nobody_reads() {
         BeforeEachCommit,
         WriterAfterLastCommit,
         HandleAfterLastCommit,
+        RawForm,
+        RawFormAnyGate,
     }
     for case in [
         Reads::Off,
@@ -1122,7 +1126,10 @@ fn a_third_merge_runs_only_in_a_stretch_of_writes_nobody_reads() {
         Reads::BeforeEachCommit,
         Reads::WriterAfterLastCommit,
         Reads::HandleAfterLastCommit,
+        Reads::RawForm,
+        Reads::RawFormAnyGate,
     ] {
+        let raw = matches!(case, Reads::RawForm | Reads::RawFormAnyGate);
         let d = scratch(&format!("merge-quiet-{case:?}"));
         let opts = || Options {
             seal_bytes: 32 << 10,
@@ -1130,6 +1137,13 @@ fn a_third_merge_runs_only_in_a_stretch_of_writes_nobody_reads() {
             l0_trigger: 2,
             merge_parallel: 2,
             merge_parallel_quiet: if case == Reads::Off { 0 } else { 3 },
+            merge_quiet_any_gate: case == Reads::RawFormAnyGate,
+            zpages: if raw {
+                supdb::ZPages::Off
+            } else {
+                supdb::ZPages::Always
+            },
+            zpages_min_bytes: 0,
             ..common::options()
         };
         let mut db = Db::create(&d, opts()).unwrap();
@@ -1193,7 +1207,11 @@ fn a_third_merge_runs_only_in_a_stretch_of_writes_nobody_reads() {
             );
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        let want = if case == Reads::None { 3 } else { 2 };
+        let want = if matches!(case, Reads::None | Reads::RawFormAnyGate) {
+            3
+        } else {
+            2
+        };
         assert_eq!(
             db.merges_in_flight(),
             want,
