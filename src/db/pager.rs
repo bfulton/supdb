@@ -1719,7 +1719,11 @@ mod tests {
     /// A view says what of a range is in memory, here or in the kernel's
     /// cache of the envelope, gives the kernel's up, and asks it back: the
     /// three things the engine asks of a mapped file's pages, asked of the
-    /// file a paged mapping stands in front of.
+    /// file a paged mapping stands in front of. Not under qemu-user
+    /// (`supdb_emulated`), which answers the ask with success and passes
+    /// nothing to the kernel, so the file dropped never comes back there;
+    /// the native ARM leg runs it.
+    #[cfg(not(supdb_emulated))]
     #[test]
     fn a_view_says_what_is_in_memory_and_drops_and_asks_for_what_stands_behind_it() {
         let dir = scratch("resident");
