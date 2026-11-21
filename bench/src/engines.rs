@@ -1718,6 +1718,10 @@ pub struct Supdb {
     /// three beside both bounds' options, `supdb-boundsleanmerge3`; the
     /// engine's where `None`.
     mergepar: Option<usize>,
+    /// The partition merges in flight in a stretch of writes nobody reads
+    /// (`Options::merge_parallel_quiet`): three beside both bounds'
+    /// options, `supdb-boundsleanquiet3`; the engine's where `None`.
+    mergequiet: Option<usize>,
     /// A sparse stride walk steps its key by the field
     /// (`Options::zpages_stride_step_direct`): `supdb-zsparsebuildstep`;
     /// the engine's where `None`.
@@ -2866,6 +2870,10 @@ struct Policy {
     /// The partition merges in flight at once (`Options::merge_parallel`):
     /// three beside both bounds' options, `supdb-boundsleanmerge3`.
     mergepar: Option<usize>,
+    /// The partition merges in flight in a stretch of writes nobody reads
+    /// (`Options::merge_parallel_quiet`): three beside both bounds'
+    /// options, `supdb-boundsleanquiet3`.
+    mergequiet: Option<usize>,
     /// A sparse stride form's walk writes the next key's field where it
     /// lies (`Options::zpages_stride_step_direct`):
     /// `supdb-zsparsebuildstep` beside `supdb-zsparsebuild`.
@@ -3188,6 +3196,7 @@ impl Default for Policy {
             boundsheads: None,
             landboundsread: None,
             mergepar: None,
+            mergequiet: None,
             zstridestep: None,
             jobsmapped: false,
             jobsshort: false,
@@ -4214,6 +4223,22 @@ impl Supdb {
                 boundsheads: Some(true),
                 landboundsread: Some(true),
                 mergepar: Some(3),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// Both of the bounds' options with a third merge in flight only in
+    /// a stretch of writes nobody reads (`Options::merge_parallel_quiet`):
+    /// `supdb-boundsleanquiet3`, beside `supdb-boundsleanmerge3`, whose
+    /// third merge runs beside the mixes' reads too.
+    pub fn create_bounds_lean_quiet3(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                boundsheads: Some(true),
+                landboundsread: Some(true),
+                mergequiet: Some(3),
                 ..Policy::default()
             },
         )
@@ -9503,6 +9528,7 @@ impl Supdb {
             boundsheads,
             landboundsread,
             mergepar,
+            mergequiet,
             zstridestep,
             jobsmapped,
             jobsshort,
@@ -10078,6 +10104,8 @@ impl Supdb {
                 .unwrap_or(supdb::Options::default().zpages_cursor_steps),
             bounds_by_heads: boundsheads.unwrap_or(supdb::Options::default().bounds_by_heads),
             land_bounds_read: landboundsread.unwrap_or(supdb::Options::default().land_bounds_read),
+            merge_parallel_quiet: mergequiet
+                .unwrap_or(supdb::Options::default().merge_parallel_quiet),
             zpages_stride_step_direct: zstridestep
                 .unwrap_or(supdb::Options::default().zpages_stride_step_direct),
             jobs_mapped: jobsmapped,
@@ -10460,6 +10488,7 @@ impl Supdb {
             boundsheads,
             landboundsread,
             mergepar,
+            mergequiet,
             zstridestep,
             jobsmapped,
             jobsshort,
@@ -10843,6 +10872,7 @@ impl Engine for Supdb {
             self.landboundsread == Some(true),
         ) {
             (true, true) if self.mergepar == Some(3) => return "supdb-boundsleanmerge3",
+            (true, true) if self.mergequiet == Some(3) => return "supdb-boundsleanquiet3",
             (true, true) => return "supdb-boundslean",
             (true, false) => return "supdb-boundsheads",
             (false, true) => return "supdb-landboundsread",
@@ -12189,6 +12219,7 @@ impl Engine for Supdb {
             ("merges_landed", db.seal_waits().merges as f64),
             ("merge_plans", db.seal_waits().plans as f64),
             ("merges_beside", db.seal_waits().merges_beside as f64),
+            ("merges_quiet", db.seal_waits().merges_quiet as f64),
             ("pieces_aligned", db.pieces_aligned() as u8 as f64),
             // What the forms' upkeep did: see `Db::forms_events`.
             ("blk_by_upkeep", ev[0] as f64),
@@ -13592,6 +13623,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-landboundsread"
         | "supdb-boundslean"
         | "supdb-boundsleanmerge3"
+        | "supdb-boundsleanquiet3"
         | "supdb-jobsmapped"
         | "supdb-zstridealldropagainjobs"
         | "supdb-zmemoslab"
@@ -14643,6 +14675,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-landboundsread" => supdb_arm(Supdb::create_land_bounds_read, dir)?,
         "supdb-boundslean" => supdb_arm(Supdb::create_bounds_lean, dir)?,
         "supdb-boundsleanmerge3" => supdb_arm(Supdb::create_bounds_lean_merge3, dir)?,
+        "supdb-boundsleanquiet3" => supdb_arm(Supdb::create_bounds_lean_quiet3, dir)?,
         "supdb-zstrideallcdrop" => supdb_arm(Supdb::create_zstride_all_cdrop, dir)?,
         "supdb-zstridealldropagaincdrop" => {
             supdb_arm(Supdb::create_zstride_all_dropagain_cdrop, dir)?
@@ -17909,6 +17942,13 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.bounds_by_heads && o.land_bounds_read);
                 assert_eq!((o.merge_parallel, d.merge_parallel), (3, 2));
+                let z = Supdb::create_bounds_lean_quiet3(&dir("boundsleanquiet3")).unwrap();
+                assert_eq!(z.name(), "supdb-boundsleanquiet3");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.bounds_by_heads && o.land_bounds_read);
+                assert_eq!(o.merge_parallel, d.merge_parallel);
+                assert_eq!((o.merge_parallel_quiet, d.merge_parallel_quiet), (3, 0));
                 assert_eq!(
                     (
                         o.zpages_stride_sparse,

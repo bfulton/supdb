@@ -4933,6 +4933,27 @@ pub struct Options {
     /// shape before: `supdb-mergeone`, `supdb-ingestmergeone` and
     /// `supdb-nozpagesmergeone`.
     pub merge_parallel: usize,
+    /// The most partition merges in flight while the writer's commits see
+    /// no read at all -- no scan and no point read through the writer or
+    /// any handle since the commit before (`Db::read_mode`, published as
+    /// `Shared::write_quiet` and cleared by the first read) -- where it is
+    /// above `merge_parallel`; zero, or no more than it, leaves the room
+    /// at `merge_parallel` always. A burst of writes nobody reads makes
+    /// merge debt faster than two merges retire it once nothing stalls
+    /// the writer: under 1.25 GiB at ten million random ids, with the
+    /// bounds walk no longer faulting (`Options::bounds_by_heads`), the
+    /// full rewrite's burst ran six seconds shorter and the chain was
+    /// still writing at the device through the pass after it, 0.45x and
+    /// 0.54x of LMDB's where the writer's stall had let it finish. Three
+    /// merges at all times brought that pass level with the shipping
+    /// engine and cost the mixes after it a tenth to a quarter, the third
+    /// merge running beside their reads (`docs/engine.md`, keys that are
+    /// no run of numbers); in a stretch nobody reads, the third merge's
+    /// device and CPU are no reader's. A merge started under the room
+    /// runs to its landing whatever comes after it. Zero is the shape
+    /// before: `supdb-boundsleanquiet3` sets three.
+    #[doc(hidden)]
+    pub merge_parallel_quiet: usize,
     /// Under `merge_chains`, a merge's landing plans the next merge out of
     /// core -- the controller's gate away from the raw form -- whether or
     /// not a scan has come since the last landing, so the merges a burst's
@@ -6871,6 +6892,7 @@ impl Default for Options {
             merge_plan_idle: true,
             merge_bytes_cap: 64 << 20,
             merge_parallel: 2,
+            merge_parallel_quiet: 0,
             boundary_keys_from_top: false,
             pieces_dir_willneed: true,
             bounds_heads_willneed: true,
@@ -17741,6 +17763,9 @@ struct SealCounts {
     merges: AtomicU64,
     plans: AtomicU64,
     merges_beside: AtomicU64,
+    /// Partition merges started past `merge_parallel`, in a write-only
+    /// stretch (`Options::merge_parallel_quiet`).
+    merges_quiet: AtomicU64,
     held_landings: AtomicU64,
     /// The seal thread's phases, summed over seals: the sort of the frozen
     /// table, the snapshot's build and publish, and the record loop.
@@ -17798,6 +17823,7 @@ impl SealCounts {
             merges: get(&self.merges),
             plans: get(&self.plans),
             merges_beside: get(&self.merges_beside),
+            merges_quiet: get(&self.merges_quiet),
             seal_sort_ns: get(&self.seal_sort_ns),
             seal_snap_ns: get(&self.seal_snap_ns),
             seal_records_ns: get(&self.seal_records_ns),
@@ -17841,6 +17867,9 @@ pub struct SealWaits {
     /// Partition merges started while another was in flight
     /// (`Options::merge_parallel`).
     pub merges_beside: u64,
+    /// Partition merges started past `merge_parallel` in a write-only
+    /// stretch (`Options::merge_parallel_quiet`).
+    pub merges_quiet: u64,
     /// The seal thread's phases, summed over seals: sorting the frozen
     /// table, building and publishing its snapshot (`Options::seal_snapshot`),
     /// writing the records, and the thread's whole run.
@@ -19726,6 +19755,12 @@ struct Shared {
     /// work can read it: with no handle live, nothing makes a table, and
     /// a landing leaves its pieces' bounds (`Options::land_bounds_read`).
     writer_forms_off: std::sync::atomic::AtomicBool,
+    /// Whether the writer's last commit came after no read at all since
+    /// the commit before, no read having come since: what lets a third
+    /// merge start (`Options::merge_parallel_quiet`). Set by the writer's
+    /// commit and cleared by the first read through the writer or a
+    /// handle (`Reader::note_read`).
+    write_quiet: std::sync::atomic::AtomicBool,
     /// Blocks materialised, by a handle the caller made and by the
     /// engine's own. These were added to size what sharing the block
     /// tables between handles would be worth, the last structure thought
@@ -21894,6 +21929,9 @@ struct ModeNote {
     points: u64,
     /// The writer's: its last commit came after no read at all.
     quiet: bool,
+    /// The writer's: whether it has published the stretch as quiet and no
+    /// read of its own has cleared it since (`Shared::write_quiet`).
+    quiet_out: bool,
 }
 
 impl Default for ModeNote {
@@ -21904,6 +21942,7 @@ impl Default for ModeNote {
             scans: 0,
             points: 0,
             quiet: false,
+            quiet_out: false,
         }
     }
 }
@@ -24311,7 +24350,7 @@ impl Reader {
     /// more than once a commit.
     #[inline]
     fn note_read(&self, scan: bool) {
-        if !self.opts.seal_idle {
+        if !(self.opts.seal_idle || self.opts.merge_parallel_quiet > 0) {
             return;
         }
         let mut m = self.mode_note.get();
@@ -24320,6 +24359,14 @@ impl Reader {
                 m.scans += 1;
             } else {
                 m.points += 1;
+            }
+            // The first read since a quiet commit ends the write-only
+            // stretch for the segment work (`Shared::write_quiet`), once.
+            if m.quiet_out {
+                m.quiet_out = false;
+                self.shared
+                    .write_quiet
+                    .store(false, AtomicOrdering::Release);
             }
             self.mode_note.set(m);
             return;
@@ -24334,6 +24381,13 @@ impl Reader {
             *at = now;
             self.mode_note.set(m);
             shared.fetch_add(1, AtomicOrdering::Relaxed);
+            // A handle's read ends the write-only stretch too, said once a
+            // commit as its count is.
+            if self.opts.merge_parallel_quiet > 0 {
+                self.shared
+                    .write_quiet
+                    .store(false, AtomicOrdering::Release);
+            }
         }
     }
 
@@ -33793,7 +33847,7 @@ impl Db {
     /// Whether the commit is in a write-only stretch, counted at its look
     /// (`Db::read_mode`).
     fn note_read_mode(&mut self) {
-        if !self.opts.seal_idle {
+        if !(self.opts.seal_idle || self.opts.merge_parallel_quiet > 0) {
             return;
         }
         let own = self.mode_note.get();
@@ -33804,6 +33858,17 @@ impl Db {
         self.read_mode = (scans, points, quiet);
         let mut note = self.mode_note.get();
         note.quiet = quiet;
+        // Published for the segment work's room (`Shared::write_quiet`),
+        // on a change of the flag itself: a handle's read clears it behind
+        // the writer's back, and the next quiet commit sets it again.
+        if self.opts.merge_parallel_quiet > 0 {
+            note.quiet_out = quiet;
+            if self.shared.write_quiet.load(AtomicOrdering::Relaxed) != quiet {
+                self.shared
+                    .write_quiet
+                    .store(quiet, AtomicOrdering::Release);
+            }
+        }
         self.mode_note.set(note);
     }
 
@@ -34111,6 +34176,7 @@ impl Db {
             mode_points: AtomicU64::new(0),
             live_handles: AtomicUsize::new(0),
             writer_forms_off: std::sync::atomic::AtomicBool::new(false),
+            write_quiet: std::sync::atomic::AtomicBool::new(false),
             blk_reader: AtomicU64::new(0),
             blk_engine: AtomicU64::new(0),
             blk_upkeep: AtomicU64::new(0),
@@ -34905,6 +34971,7 @@ impl Db {
             mode_points: AtomicU64::new(0),
             live_handles: AtomicUsize::new(0),
             writer_forms_off: std::sync::atomic::AtomicBool::new(false),
+            write_quiet: std::sync::atomic::AtomicBool::new(false),
             blk_reader: AtomicU64::new(0),
             blk_engine: AtomicU64::new(0),
             blk_upkeep: AtomicU64::new(0),
@@ -46853,7 +46920,7 @@ impl Maint {
         // promotion the plan makes publishes a manifest that would name
         // the seal's segments before they are durable; the count is left
         // as it was, so the next turn of the loop looks again.
-        if self.compacting.len() >= self.opts.merge_parallel.max(1)
+        if self.compacting.len() >= self.merges_room()
             || self.tiering.is_some()
             || self.seal_between_phases()
         {
@@ -47402,7 +47469,7 @@ impl Maint {
                 // they hold are not due again: the next merge takes the
                 // next capped run of the rest. At one, a merge in flight
                 // defers the start whatever is due, as it always has.
-                let due = if self.opts.merge_parallel > 1 && !self.compacting.is_empty() {
+                let due = if self.merges_room() > 1 && !self.compacting.is_empty() {
                     let held: Vec<Fence> = self
                         .compacting
                         .iter()
@@ -47436,6 +47503,21 @@ impl Maint {
         }
     }
 
+    /// The most partition merges that may be in flight now:
+    /// `Options::merge_parallel`, or `merge_parallel_quiet` where it is
+    /// more and the writer's last commit saw no read since the one before,
+    /// no read having come since (`Shared::write_quiet`).
+    fn merges_room(&self) -> usize {
+        let base = self.opts.merge_parallel.max(1);
+        if self.opts.merge_parallel_quiet > base
+            && self.shared.write_quiet.load(AtomicOrdering::Acquire)
+        {
+            self.opts.merge_parallel_quiet
+        } else {
+            base
+        }
+    }
+
     /// The landing's chain and the idle plan: merges planned at `trigger`
     /// until as many run as may (`Options::merge_parallel`) or a plan
     /// starts none, then a piece merge.
@@ -47444,7 +47526,7 @@ impl Maint {
             let before = self.compacting.len();
             self.maybe_compact_at(trigger)?;
             let after = self.compacting.len();
-            if after <= before || after >= self.opts.merge_parallel.max(1) {
+            if after <= before || after >= self.merges_room() {
                 break;
             }
         }
@@ -53588,7 +53670,7 @@ impl Maint {
             // the first partitioning. Deferring rather than blocking keeps
             // it off the commit path; the range it would have merged waits
             // for the next plan.
-            let room = self.opts.merge_parallel.max(1);
+            let room = self.merges_room();
             if !self.compacting.is_empty() && (fences.is_none() || self.compacting.len() >= room) {
                 return Ok(());
             }
@@ -53783,6 +53865,9 @@ impl Maint {
         });
         if !self.compacting.is_empty() {
             SealCounts::add(&self.shared.seal_counts.merges_beside, 1);
+        }
+        if self.compacting.len() >= self.opts.merge_parallel.max(1) {
+            SealCounts::add(&self.shared.seal_counts.merges_quiet, 1);
         }
         self.compacting.push(Merging {
             inputs,

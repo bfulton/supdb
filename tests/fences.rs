@@ -1097,6 +1097,138 @@ fn a_merges_landing_plans_the_next_and_a_cap_lands_a_range_at_a_time() {
     }
 }
 
+/// A third merge in flight only while the writer's commits see no read
+/// (`Options::merge_parallel_quiet` at three over `merge_parallel` at two).
+/// Three ranges are made due in turn with every merge held before its
+/// landing: with the commits of a write-only stretch the third starts
+/// beside the two, and it does not where the option is off, where a point
+/// read comes before every commit, or where a read through the writer or
+/// a handle comes after the last commit and before the seal whose landing
+/// would plan it. Released, every merge lands, the partitions tile, and
+/// every key reads back.
+#[test]
+fn a_third_merge_runs_only_in_a_stretch_of_writes_nobody_reads() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Reads {
+        Off,
+        None,
+        BeforeEachCommit,
+        WriterAfterLastCommit,
+        HandleAfterLastCommit,
+    }
+    for case in [
+        Reads::Off,
+        Reads::None,
+        Reads::BeforeEachCommit,
+        Reads::WriterAfterLastCommit,
+        Reads::HandleAfterLastCommit,
+    ] {
+        let d = scratch(&format!("merge-quiet-{case:?}"));
+        let opts = || Options {
+            seal_bytes: 32 << 10,
+            partition_bytes: Some(32 << 10),
+            l0_trigger: 2,
+            merge_parallel: 2,
+            merge_parallel_quiet: if case == Reads::Off { 0 } else { 3 },
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts()).unwrap();
+        let key = |k: u32| format!("key-{k:05}").into_bytes();
+        let mut keys: Vec<Vec<u8>> = (0..4000).map(key).collect();
+        for k in &keys {
+            db.append(k, b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let fences = partition_fences(&d);
+        assert!(fences.len() >= 4, "partitions: {fences:?}");
+        let (merges0, plans0) = (db.seal_waits().merges, db.seal_waits().plans);
+        let quiet0 = db.seal_waits().merges_quiet;
+        let in_range = |r: usize, round: u32, i: u32| -> Vec<u8> {
+            let (lo, hi) = &fences[r];
+            let k = [lo.as_slice(), format!("-{round}{i:03}").as_bytes()].concat();
+            if let Some(h) = hi {
+                assert!(k.as_slice() < h.as_slice(), "{k:?} below {h:?}");
+            }
+            k
+        };
+        let handle = db.reader().unwrap();
+        db.hold_merge_landing(true);
+        // Ranges 1, 2 and 3 twice each: each second seal makes one due.
+        let rounds = [1usize, 1, 2, 2, 3, 3];
+        for (round, &r) in rounds.iter().enumerate() {
+            for i in 0..200u32 {
+                let k = in_range(r, round as u32, i);
+                db.append(&k, b"n");
+                keys.push(k);
+            }
+            if case == Reads::BeforeEachCommit {
+                let mut n = 0;
+                db.read_all(&keys[0], vf(&mut |_| n += 1)).unwrap();
+                assert_eq!(n, 1);
+            }
+            db.commit().unwrap();
+            if round == rounds.len() - 1 {
+                let mut n = 0;
+                match case {
+                    Reads::WriterAfterLastCommit => {
+                        db.read_all(&keys[1], vf(&mut |_| n += 1)).unwrap();
+                        assert_eq!(n, 1);
+                    }
+                    Reads::HandleAfterLastCommit => {
+                        handle.read_all(&keys[1], vf(&mut |_| n += 1)).unwrap();
+                        assert_eq!(n, 1);
+                    }
+                    _ => {}
+                }
+            }
+            db.seal().unwrap();
+        }
+        let t = std::time::Instant::now();
+        while db.seal_waits().plans < plans0 + rounds.len() as u64 {
+            assert!(
+                t.elapsed().as_secs() < 30,
+                "{case:?}: the seals' landings never planned"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let want = if case == Reads::None { 3 } else { 2 };
+        assert_eq!(
+            db.merges_in_flight(),
+            want,
+            "{case:?}: merges in flight while held"
+        );
+        assert_eq!(
+            db.seal_waits().merges_quiet - quiet0,
+            want as u64 - 2,
+            "{case:?}: merges started past the two"
+        );
+        assert_eq!(
+            db.seal_waits().merges,
+            merges0,
+            "{case:?}: nothing landed while held"
+        );
+        db.hold_merge_landing(false);
+        drop(handle);
+        db.settle().unwrap();
+        assert_eq!(db.merges_in_flight(), 0, "{case:?}: settled");
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let after = partition_fences(&d);
+        for w in after.windows(2) {
+            assert_eq!(
+                w[0].1.as_ref(),
+                Some(&w[1].0),
+                "{case:?}: the partitions tile: {after:?}"
+            );
+        }
+        hold_to(&db, &keys);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 /// Merges in flight beside each other (`Options::merge_parallel`). A
 /// merge held before its landing over one range, and a second range made
 /// due while it runs: at one the second waits, at two it starts beside the

@@ -335,6 +335,11 @@ struct Cfg {
     /// them.
     bounds_heads: bool,
     land_bounds: bool,
+    /// A third merge in flight while the writer's commits see no read
+    /// (`Options::merge_parallel_quiet` at three): in half the seeds under
+    /// `ZFUZZ_OPTVARY`, the side generator's next draw, and off otherwise,
+    /// as the engine has it.
+    merge_quiet: bool,
     /// Under `ZFUZZ_STRIDE`, the stride form's steer; `None` without it.
     stride: Option<StrideSteer>,
 }
@@ -625,6 +630,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let hot_two = side.chance(25);
     let (steps_on, direct_on) = (side.chance(50), side.chance(50));
     let (heads_on, land_on) = (side.chance(50), side.chance(50));
+    let quiet_on = side.chance(50);
     // A generator of its own, as `side` is, so that the switch moves none
     // of the draws below.
     let stride =
@@ -679,6 +685,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         stride_direct: vary && direct_on,
         bounds_heads: vary && heads_on,
         land_bounds: vary && land_on,
+        merge_quiet: vary && quiet_on,
         stride,
     }
 }
@@ -709,6 +716,7 @@ fn opts(c: &Cfg) -> Options {
         zpages_stride_step_direct: c.stride_direct,
         bounds_by_heads: c.bounds_heads,
         land_bounds_read: c.land_bounds,
+        merge_parallel_quiet: if c.merge_quiet { 3 } else { 0 },
         promote_starts: c.hot_starts,
         zpages_store_all: c.store_all,
         scan_start_cache: if c.start_cache { 4096 } else { 0 },
@@ -1666,8 +1674,10 @@ struct Stats {
     /// step; then the block boundaries a bounds walk placed by a head and
     /// the landings that left their bounds (`Options::bounds_by_heads`,
     /// `land_bounds_read`), what says a run under `ZFUZZ_OPTVARY` reached
-    /// each, the second with `ZFUZZ_FORMSOFF`.
-    point: [u64; 11],
+    /// each, the second with `ZFUZZ_FORMSOFF`; then the merges started
+    /// past `merge_parallel` in a stretch of writes nobody read
+    /// (`Options::merge_parallel_quiet`).
+    point: [u64; 12],
     /// The `z` store's stride form under `ZFUZZ_STRIDE`.
     stride: StrideStats,
 }
@@ -1801,6 +1811,7 @@ fn count_point(st: &mut Stats, db: &Db) {
     st.point[8] += c.cursor_steps;
     st.point[9] += c.bounds_by_head;
     st.point[10] += c.land_bounds_left;
+    st.point[11] += db.seal_waits().merges_quiet;
 }
 
 /// Under `ZFUZZ_CENSUS`, the store read as out of core: the census gate,
@@ -1967,7 +1978,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         switches: 0,
         recuts: 0,
         heads: [0; 2],
-        point: [0; 11],
+        point: [0; 12],
         stride: StrideStats::default(),
     };
     let mut fails: Vec<String> = Vec::new();
@@ -2403,7 +2414,7 @@ fn fuzz_range() {
     let (mut bad, mut reopens, mut abandons, mut bindings, mut beside, mut switches) =
         (Vec::new(), 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut recuts = 0u64;
-    let mut point = [0u64; 11];
+    let mut point = [0u64; 12];
     let mut heads = [0u64; 2];
     let mut stride = StrideStats::default();
     let ran = seeds.len();
@@ -2430,7 +2441,7 @@ fn fuzz_range() {
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {}, FAILURES {}",
         heads[0],
         heads[1],
         point[0],
@@ -2444,6 +2455,7 @@ fn fuzz_range() {
         point[8],
         point[9],
         point[10],
+        point[11],
         bad.len()
     );
     if stride_on() {
