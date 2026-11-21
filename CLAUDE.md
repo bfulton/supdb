@@ -6017,10 +6017,11 @@ in the suite's figures, at `full` scale where it says so:
   123 MB more: three behind a landing that does not come, with the live
   table past them, are a gigabyte, and under a bound of that the group
   kills the process before the writer's wait at a full list holds it.
-  The one landing known to stall so is the bounds walk over keys whose
-  heads are not whole keys (`Options::bounds_by_heads`,
-  `land_bounds_read`). The lever for any other is the writer's wait
-  drawn from what the bound can spare, and is not built.
+  The one landing known to stall so was the bounds walk over keys whose
+  heads are not whole keys, which the heads place now
+  (`Options::bounds_by_heads`, `land_bounds_read`). The lever for any
+  other is the writer's wait drawn from what the bound can spare, and is
+  not built.
 - Scans on a store with unsealed keys spread through it pay for the path.
   A few unsealed keys in a partition take every scan of it off the bulk
   walk and through the block loop and the form file's cursor, a fifth to
