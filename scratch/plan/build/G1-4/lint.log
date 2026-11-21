@@ -1,0 +1,13 @@
+
+=== lint ===
+    Checking supdb v0.1.0 (/home/user/supdb)
+    Finished `release` profile [optimized + debuginfo] target(s) in 16.37s
+
+=== door ===
+    Checking supdb v0.1.0 (/home/user/supdb)
+    Finished `checked` profile [optimized + debuginfo] target(s) in 8.98s
+door red: ok (a disallowed diagnostic on each of the 11 lines and door_run failing on an entry that names nothing; without the lines' entries none and a clean run)
+door: ok
+
+all checks passed: lint
+EXIT 0

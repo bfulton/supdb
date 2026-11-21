@@ -1,0 +1,107 @@
+ <_RNvCs9YNjgc7u1Iq_9g14_count7offsets>:
+ push %rbp
+ push %r15
+ push %r14
+ push %r13
+ push %r12
+ push %rbx
+ push %rax
+ xor %eax,%eax
+ cmpl $0xffffffff,0x30(%rdi)
+ setne %al
+ mov 0xa8(%rdi,%rax,8),%r15
+ test %r15,%r15
+ je L
+ mov %rdi,%rbx
+ xor %r12d,%r12d
+ mov %rsp,%r13
+ xor %r14d,%r14d
+ xor %ebp,%ebp
+ jmp L
+ data16 cs nopw 0x0(%rax,%rax,1)
+ xor %eax,%eax
+ inc %rbp
+ test $0x1,%al
+ cmove %r12,%rdx
+ add %rdx,%r14
+ cmp %rbp,%r15
+ je L
+ mov %rbx,(%rsp)
+ mov (%rsp),%rdi
+ mov %rbp,(%rsp)
+ mov (%rsp),%rsi
+ cmpl $0xffffffff,0x30(%rdi)
+ je L
+ mov 0x120(%rdi),%rax
+ mov 0x130(%rdi),%r8
+ cmp $0xffffffffffffffff,%rax
+ je L
+ mov 0x128(%rdi),%rcx
+ jmp L
+ xchg %ax,%ax
+ mov 0x128(%rdi),%rdx
+ mov %rdx,%rcx
+ add %r8,%rcx
+ jb L
+ cmp 0x20(%rdi),%rcx
+ ja L
+ mov 0x18(%rdi),%rcx
+ test %rcx,%rcx
+ je L
+ add %rdx,%rcx
+ mov 0x90(%rdi),%rdx
+ mov 0x98(%rdi),%r9
+ cmp %rdx,%r9
+ setb %r10b
+ cmp %r8,%r9
+ seta %r9b
+ or %r10b,%r9b
+ jne L
+ mov 0x70(%rdi),%r9
+ mov 0x78(%rdi),%r11
+ mov %r11,%r10
+ sub %r9,%r10
+ setb %r12b
+ cmp %r8,%r11
+ seta %r8b
+ or %r12b,%r8b
+ je L
+ xor %eax,%eax
+ xor %r12d,%r12d
+ jmp L
+ nopw 0x0(%rax,%rax,1)
+ cmp 0xb0(%rdi),%rsi
+ mov $0x0,%r12d
+ jae L
+ lea 0x3(,%rsi,4),%r8
+ cmp %r10,%r8
+ jae L
+ add %r9,%rcx
+ shl $0x2,%rsi
+ xor %r8d,%r8d
+ cmp $0xffffffffffffffff,%rax
+ setne %r8b
+ mov (%rcx,%rsi,1),%eax
+ shl $0x4,%r8d
+ add %rax,%rdx
+ add 0x128(%rdi,%r8,1),%rdx
+ mov $0x1,%eax
+ jmp L
+ call L
+ jmp L
+ xor %r14d,%r14d
+ mov %r14,%rax
+ add $0x8,%rsp
+ pop %rbx
+ pop %r12
+ pop %r13
+ pop %r14
+ pop %r15
+ pop %rbp
+ ret
+
+ of section .init:
+
+ of section .fini:
+
+ of section .plt:

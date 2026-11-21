@@ -142,9 +142,9 @@ bulk replacement broke tick-exact tests once; do it test by test. Planned for th
 
 ## What is left, in the owner's order
 
-### 1. The page layer (task 12). Stage G1 under way: three units of eight landed, the lists' check, and the count against upstream brought under.
+### 1. The page layer (task 12). Stage G1 under way: four units of eight landed, the lists' check, and the count against upstream brought under.
 
-**As of 21 Nov 08:47 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
+**As of 21 Nov 13:19 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
 launched one unit a launch: `Workflow {scriptPath, args: {base:
 "ea6352181f342b7bffd75ec8c88df92bc7b78ff6", only: ["G1-<n>"], tail: false, since: <note>}}`,
 the same base for every unit; after G1-8 a launch with `only: ["none"]` and no `tail: false`
@@ -290,7 +290,42 @@ holds; a note for a step changes no earlier prompt, so the steps before it repla
   passes to no kernel. Green after (519 passed). No hosted runner has run any job of this
   branch: the first pull request is where `cross-arm`, `machine`, `cost` and `lists` first run
   there.
-- **Next, in order:** G1-4 `offsets`, then `authenticated`, `advice`, `sealed`, `docs`.
+- **G1-4 `offsets` landed: `97412a31`.** `Blob::willneed_ranks`, `willneed_dir` and
+  `record_offset` answer for a reader by the piece as for a whole one (they answered 0 or
+  `None`), and `record_region_place` for both kinds. Each dispatches on `Blob::flat_lent` (a
+  borrow through `Sec::lend`, the `lend_at` test with no error made) to a
+  `#[cold] #[inline(never)]` `*_by_piece` arm over the same `Sect`-generic helper; the offset is
+  `Sect::start_in`. `tests/blob.rs` holds the two kinds of reader to each other and to the
+  file through a source that records every ask (`Advised`), and holds the piece reader to
+  asking for under a quarter of the record region; `tests/fences.rs` holds where a merge's
+  drops behind it begin (the base's mechanism, held by no test before). The plain store's
+  count: `sh scripts/cost.sh 869a4fee read read_z scan scan_long scan_z scan_long_z merge
+  land` green; `record_offset` 51 instructions a call where the base had 55, and kept
+  `#[inline(never)]` because inlined into `compact_run` the merge row read RED (+4.0 an
+  operation; `r2/red9.sh` is that red input by script). Two review rounds: the first asked
+  for a repair (a callee-saved register kept across `not_lent`'s call cost the slice arm two
+  instructions a call), the second passed with no blocking item, and its repair added tests
+  only, read by the launcher and by no reviewer. Notes, mutants, the scratch probes
+  (`g14_count.rs`, `g14_drop.rs`, `g14_gate.rs`), the listings and the count logs are in
+  `scratch/plan/build/G1-4/`. Open, each owed to a named place:
+  - No `cost.sh` probe reaches the arms that call these a key or a block at a time: one with
+    the gate set away from the raw form (`Db::zgate_set`, a toggle on the main thread's scans)
+    and one merging under `merge_drop_behind` and `merge_read_ahead` are owed to the cost job.
+    Until then three cost-only mutants (the attributes off the piece arms, `flat_lent` made
+    through `flat`) are held by the unit's scratch counts and by no gate.
+  - What the pager does with the advice it is now given (`Paging::willneed`, `forget`) was
+    not run: no store under a cipher with `ZPages::Always` had its asks counted. S5 or G1-6.
+  - `compact_run` takes `record_offset(0)` of every input of every merge, dropping or not
+    (`src/db.rs`, where `dropped_to` is made): under a cipher that is now a directory word
+    read through the pager an input and then ignored. Take it only where the input drops.
+  - `Sect::start_in` is a new required method of a public trait (no implementor outside the
+    crate's own two); `record_region_place` answers the file's offset for a whole reader
+    now, which G1-6, where `record_region_span` goes, has to know.
+  - The attributes off `willneed_dir_by_piece` alone read about 12,000 instructions fewer
+    over the gate probe's run: a cheaper shape for whoever counts those rows next.
+  - Owed to S5, no timing taken: `bench/scripts/pair.sh supdb-cipherauto supdb-cipher 5000000
+    --bound 671088640 --passes read` at this commit and the one before.
+- **Next, in order:** G1-5 `authenticated`, then `advice`, `sealed`, `docs`.
   Every unit from here is launched with a build note: a CI job it adds is
   `sh scripts/check.sh <group>` with nothing in the YAML but event values, a list it adds is
   registered in `scripts/ratchet.py`, and a move between functions the cost group reads red is

@@ -1,0 +1,13 @@
+      1 <... fadvise64 resumed>)          
+      5 <... madvise resumed>)            
+      6 <... mincore resumed>[1])         
+      1 fadvise64(FD, 0, 0, POSIX_FADV_DONTNEED <unfinished ...>
+      1 fadvise64(FD, 0, 2678784, POSIX_FADV_DONTNEED) 
+      1 fadvise64(FD, 2678784, 2678784, POSIX_FADV_DONTNEED) 
+      1 fadvise64(FD, 5357568, 2678784, POSIX_FADV_DONTNEED) 
+      1 madvise(A, N, MADV_DONTNEED <unfinished ...>
+      8 madvise(A, N, MADV_DONTNEED) 
+      8 madvise(A, N, MADV_RANDOM) 
+      4 madvise(A, N, MADV_WILLNEED <unfinished ...>
+      6 mincore(A, N,  <unfinished ...>
+   5788 mincore(A, N, [1]) 

@@ -1,0 +1,14 @@
+==27067== Callgrind, a call-graph generating cache profiler
+==27067== Copyright (C) 2002-2017, and GNU GPL'd, by Josef Weidendorfer et al.
+==27067== Using Valgrind-3.22.0 and LibVEX; rerun with -h for copyright info
+==27067== Command: /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/G1-4/r2/drop.tree merge /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/tmp/G1-4c/db-tree /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/tmp/G1-4c/tr-tree
+==27067== 
+==27067== For interactive control, run 'callgrind_control -h'.
+==27067== warning: connection to image /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/tmp/G1-4c/tr-tree/direct-00000005.tmp failed
+==27067==          cannot read program headers 
+levels (1, 0)
+==27067== 
+==27067== Events    : Ir
+==27067== Collected : 283027956
+==27067== 
+==27067== I   refs:      283,027,956

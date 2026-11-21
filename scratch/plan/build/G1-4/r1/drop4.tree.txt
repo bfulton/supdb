@@ -1,0 +1,14 @@
+==13661== Callgrind, a call-graph generating cache profiler
+==13661== Copyright (C) 2002-2017, and GNU GPL'd, by Josef Weidendorfer et al.
+==13661== Using Valgrind-3.22.0 and LibVEX; rerun with -h for copyright info
+==13661== Command: /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/G1-4/r1/drop.tree merge /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/tmp/G1-4c/db /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/tmp/G1-4c/tr
+==13661== 
+==13661== For interactive control, run 'callgrind_control -h'.
+==13661== warning: connection to image /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/tmp/G1-4c/tr/direct-00000005.tmp failed
+==13661==          cannot read program headers 
+levels (1, 0)
+==13661== 
+==13661== Events    : Ir
+==13661== Collected : 282848629
+==13661== 
+==13661== I   refs:      282,848,629

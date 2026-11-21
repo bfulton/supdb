@@ -1,0 +1,40 @@
+== merge (whole): total 1,730,670,923 -> 1,733,770,016 (+15.50 an op over 200,000)
+  120 functions moved
+     +7.626 an op   +1,525,164       3,452,436 ->      4,977,600  supdb::db::Reader::sweep_retired_states
+     +6.086 an op   +1,217,263     117,065,932 ->    118,283,195  __memcpy_avx_unaligned_erms
+     -4.990 an op     -998,029      57,350,844 ->     56,352,815  __memcmp_avx2_movbe
+     +4.003 an op     +800,580     228,105,339 ->    228,905,919  supdb::db::compact_run
+     +2.031 an op     +406,198         868,142 ->      1,274,340  supdb::db::Readers::oldest_for
+     +0.375 an op      +75,003       7,550,902 ->      7,625,905  supdb::db::WriterOp::drop
+     -0.181 an op      -36,110      39,575,067 ->     39,538,957  __memset_avx2_unaligned_erms
+     +0.122 an op      +24,413         439,434 ->        463,847  supdb::db::zselect::parse_mount
+     +0.113 an op      +22,609         390,434 ->        413,043  supdb::db::zfile::read_budget
+     +0.083 an op      +16,611         371,869 ->        388,480  core::str::pattern::CharSearcher::next_match
+     +0.083 an op      +16,603         518,678 ->        535,281  _int_malloc
+     +0.034 an op       +6,880      21,887,864 ->     21,894,744  _int_free
+     +0.020 an op       +3,982       8,569,993 ->      8,573,975  realloc
+     +0.017 an op       +3,467         125,301 ->        128,768  _int_realloc
+     +0.012 an op       +2,430          53,688 ->         56,118  __vfscanf_internal
+     +0.012 an op       +2,408         137,061 ->        139,469  _int_free_merge_chunk
+     +0.011 an op       +2,125          40,906 ->         43,031  core::str::converts::from_utf8
+     +0.007 an op       +1,448          27,886 ->         29,334  std::io::default_read_to_end
+     +0.007 an op       +1,340      11,874,069 ->     11,875,409  alloc::raw_vec::RawVecInner::finish_grow
+     -0.006 an op       -1,294          40,590 ->         39,296  malloc_consolidate
+     -0.006 an op       -1,205          11,963 ->         10,758  std::sys::backtrace::__rust_begin_short_backtrace
+     +0.006 an op       +1,182          25,054 ->         26,236  ____strtoul_l_internal
+     +0.005 an op         +998          17,964 ->         18,962  supdb::db::zselect::parse_kb
+     +0.005 an op         +978          81,011 ->         81,989  unlink_chunk.isra.0
+     +0.004 an op         +774          24,120 ->         24,894  __pthread_enable_asynccancel
+  286 hot functions ran (189 on no line), 37 of them moved, +14.271 an op between them; slack 2,000 instructions a function over the run, 10 of them held to a bound of their own
+  bound 0.035 an op: supdb::db::Maint::collect -0.002 an op
+  bound 0.020 an op: supdb::db::Maint::join_seal +0.002 an op
+  bound 0.030 an op: supdb::db::Maint::sweep_spares -0.001 an op
+  bound 0.025 an op: supdb::db::Maint::z_step -0.001 an op
+  bound 35.000 an op: supdb::db::Reader::sweep_retired_states +7.626 an op
+  bound 6.000 an op: supdb::db::Readers::oldest_for +2.031 an op
+  bound 1.200 an op: supdb::db::WriterOp::drop +0.375 an op
+  bound 2.500 an op: supdb::db::zfile::read_budget +0.113 an op
+  bound 0.060 an op: supdb::db::zselect::parse_kb +0.005 an op
+  bound 3.000 an op: supdb::db::zselect::parse_mount +0.122 an op
+  HOT GAINED: supdb::db::compact_run +4.003 an op, +800,580 over the run
+cost: RED
