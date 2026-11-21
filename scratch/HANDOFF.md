@@ -142,9 +142,9 @@ bulk replacement broke tick-exact tests once; do it test by test. Planned for th
 
 ## What is left, in the owner's order
 
-### 1. The page layer (task 12). Stage G1 under way: five units of eight landed, the lists' check, and the count against upstream brought under.
+### 1. The page layer (task 12). Stage G1 under way: six units of eight landed, the lists' check, and the count against upstream brought under; a merge of upstream is next, then the last two.
 
-**As of 21 Nov 16:03 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
+**As of 21 Nov 19:49 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
 launched one unit a launch: `Workflow {scriptPath, args: {base:
 "ea6352181f342b7bffd75ec8c88df92bc7b78ff6", only: ["G1-<n>"], tail: false, since: <note>}}`,
 the same base for every unit; after G1-8 a launch with `only: ["none"]` and no `tail: false`
@@ -366,7 +366,72 @@ holds; a note for a step changes no earlier prompt, so the steps before it repla
     doc-hidden public `Paging` (G1-7 makes it `pub(crate)`).
 - **For every launch from G1-6 on:** an agent never ends its turn to wait for a background
   command; it waits in a foreground command with a long timeout. The launch note says so.
-- **Next, in order:** G1-6 `advice`, then `sealed`, `docs`.
+- **G1-6 `advice` landed: `eab987d1`.** A store's residency and advice are asked of its byte
+  source by offset. One span question, `Bytes::resident_share(off, len) -> Option<f64>`,
+  answered for a mapped file (by `mincore`) and a paged mapping (by the pager) alike, in place
+  of `MmapBytes::resident_pages`, `paged_resident` and `resident_count`, `db::resident_share`
+  over a borrowed slice, `OrdIndex::mapped` and `Blob::record_region_span`, all gone with
+  every caller moved. `Blob::record_region_place` and `record_dir_place` give a region's
+  place in the file for both kinds of reader; the plain build's asks and drops
+  (`ask_ahead`, `drop_behind`, the block form's and `write_stride`'s) go by offset through
+  the mapping, Linux-only as they were; the three descriptor sites go through
+  `Seg::records_by_descriptor`; `warm_file` measures `map.len()` and asks through
+  `advise_willneed`. Sites the plan did not name were found by the unit's own list and
+  handled (`ZFile::pages_resident`, `Seg::redrop_ord_pages`, `read_back_residency`,
+  `heads_all_resident`, `raw_read_span`). Under a cipher, behind `ZPages::Always` or
+  `merge_read_ahead` and on no default's path: the warm asks for the envelope and decrypts
+  nothing, the form file's and the ordered index's residency are asked of the pager where
+  they had decrypted the whole file to `mincore` it, a merge asks ahead for its inputs'
+  ciphertext, and a paged reader's records are dropped. The plain store: `sh scripts/cost.sh
+  f9e83900 read read_z scan scan_long scan_z scan_long_z merge land` green, and the plain
+  build's `madvise`/`fadvise`/`mincore` call shapes held to the base's by strace, made a gate
+  with an exit status over the one test whose shapes are stable
+  (`scratch/plan/build/G1-6/strace/gate.sh`). Two review rounds: the first found the plain
+  build issuing `madvise(WILLNEED)` off Linux where the base issued nothing (the Linux gate
+  put back) and the cipher warm's ask held by no assertion (a test reads the envelope's
+  residency after the warm); the second passed, and its repair added tests only, read by the
+  launcher and by no reviewer. Notes, mutants, scripts, results, the strace scripts and count
+  logs are in `scratch/plan/build/G1-6/`. Open, each owed to a named place:
+  - The pager keeps no count of the advice it is given, so what the crossing and the build
+    ask of it under a cipher is held by outcomes only. S5.
+  - `warm_file` touches pages through `Bytes::lend_at`, and a new test
+    (`a_drop_behind_unmaps_the_window_and_no_page_past_it`) reads the mapping's address
+    through `MmapBytes::as_slice()`: G1-7 seals the first and deletes the second, and has to
+    give each another way.
+  - The item allow on `ask_file` (kept for its `posix_fadvise`) covers any barred call added
+    to the same function: a mutant that opens by `File::open` there survives. Move the
+    advice into a small allowed helper, as `db.rs` does, so the function carries no allow
+    (S1, or the door's next edit).
+  - The stride form's plain build is not under the strace (no test builds one there); the
+    strace's merge test read four new shapes in one head run of three, put down to which
+    partition a background build took and not confirmed by more base runs.
+  - The merge row's libc `memcpy` read +3.6 and then +12.9 an operation over the base in two
+    runs of the same code, green under the libc rule and above the base both times: count
+    the tree against itself twice before it is called noise.
+  - Not built for macOS or aarch64; `cross-arm` not run. `tests/blob.rs`'s
+    `holds_to_the_file` now compares `record_region_place` of two readers where one side was
+    taken by pointer subtraction; the independent check left is `record_offset(0)`.
+  - Owed to S5, no timing taken: `bench/scripts/pair.sh supdb-cipher64 supdb-cipher 1000000
+    --reps 4` with an arm that sets `merge_read_ahead`, and `pair.sh supdb-cipherauto
+    supdb-cipher 5000000 --bound 671088640 --passes read`.
+- **The owner asked for upstream to be merged again (21 Nov: "May want to merge upstream
+  changes again."), and it is next, before G1-7.** Upstream
+  (`origin/claude/e-recode-stride-selector-g5f6hl`) was 31 commits past the last merge
+  (`9bfc4362`) at `7c62153e`, in the files G1-7 edits. A trial merge over `eab987d1`
+  conflicts in three files: `src/db.rs` (six hunks, one cause: both sides fixed a copy's
+  claim about a partition's records carried across its rewrite, `identity: u64` with a key
+  compare at the patch here, `identity: bool` beside `identity_of` upstream, `c5491c59`),
+  `tests/fuzz.rs` (the summary line's counters) and `CLAUDE.md` (entries of both sides).
+  It runs as a change called M1 through `scratch/plan/build/change-v1.js` (the script T17
+  and T18 ran through), its brief `scratch/plan/build/M1/brief.txt` and its arguments
+  `scratch/plan/build/M1/launch-args.json`: the merge, one shape of the identity fix chosen
+  on soundness, then the count against upstream, then less code; this branch's gates answered
+  for upstream's new code; what each new upstream mechanism does under a cipher, with the
+  fuzz under a cipher beyond the gate's range; every arm opened once at the smallest rung;
+  the whole count against the upstream head merged; the full gate. Upstream's new defaults
+  (the bounds options, the quiet third merge) come as upstream set them, and the pairings
+  the cipher arms owe for them are named, not run.
+- **Next, in order:** M1 (the merge), then G1-7 `sealed`, G1-8 `docs`.
   Every unit from here is launched with a build note: a CI job it adds is
   `sh scripts/check.sh <group>` with nothing in the YAML but event values, a list it adds is
   registered in `scripts/ratchet.py`, and a move between functions the cost group reads red is

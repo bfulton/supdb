@@ -1,0 +1,24 @@
+
+=== lists ===
+ratchet-red: 63 cases, each as it must be
+ratchet-red: green
+base: 5aad09dd5d0e828846549f5fb9623f2b1540bbb0, the merge-base of HEAD and origin/main (no override and no event)
+ratchet: the lists at 5aad09dd5d0e828846549f5fb9623f2b1540bbb0 (the merge-base of HEAD and 5aad09dd5d0e828846549f5fb9623f2b1540bbb0) against the tree
+  tests/data/cost-entries.txt: new since the base, nothing to hold yet (330 keys)
+  tests/data/couplings.txt: new since the base, nothing to hold yet (74 keys)
+  tests/data/door-libc.txt: new since the base, nothing to hold yet (68 keys)
+  tests/data/door.txt: new since the base, nothing to hold yet (76 keys)
+ratchet: green
+
+=== lint ===
+    Checking supdb v0.1.0 (/home/user/supdb)
+    Finished `release` profile [optimized + debuginfo] target(s) in 14.25s
+
+=== door ===
+    Checking supdb v0.1.0 (/home/user/supdb)
+    Finished `checked` profile [optimized + debuginfo] target(s) in 8.86s
+door red: ok (a disallowed diagnostic on each of the 11 lines and door_run failing on an entry that names nothing; without the lines' entries none and a clean run)
+door: ok
+
+all checks passed: lists lint
+EXIT 0

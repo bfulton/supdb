@@ -1,0 +1,15 @@
+19:01:32 C0 control: no change: SURVIVED rcs [0]
+19:02:06 E1 drop_behind passes its end as a length: KILLED rcs [101, 1]
+19:02:34 E2 records_resident asks the directory: SURVIVED rcs [0, 0]
+19:02:59 E3 warm_file measures the slice: KILLED rcs [101]
+19:03:34 E4 recs_at and dir_at swapped: KILLED rcs [101, 101, 101, 101]
+19:04:16 E5 ask_ahead without the alignment: KILLED rcs [0, 1]
+19:04:50 E6 the warm skips a chunk half resident: SURVIVED rcs [0, 0]
+19:09:57 E7 records_resident: no answer reads resident: KILLED rcs [101, 0, 0]
+19:13:01 E8 records_by_descriptor answers a reader by the piece: KILLED rcs [101]
+--- second run (tests added for E2 and E6; E7's first kill was the new test's own precondition, a store of one partition)
+19:17:40 E2 records_resident asks the directory: KILLED rcs [101, 0, 0]
+19:18:21 E6 the warm skips a chunk half resident: KILLED rcs [0, 101]
+19:20:33 E7 records_resident: no answer reads resident: SURVIVED rcs [0, 0, 0]
+19:21:06 E9 a read-back under half resident reads as the device: KILLED rcs [101]
+EXIT 0
