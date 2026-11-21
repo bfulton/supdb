@@ -1429,7 +1429,12 @@ the excess around it: the query's head and its position in the top
 level kept on the stack across the two calls, reloaded at each compare,
 in a plan stored and copied through memory. Both arms out of line, each
 a function the plain path does not name (`plan_seek_late`,
-`seek_planned_by_piece`), took the rest to eight a key. A cold call that
+`seek_planned_by_piece`), took the rest to eight a key, and those eight
+are still there, the plan stored and copied through the stack: the
+function reads nine a key under the main line because the stride's
+probes read unchecked over the slice the plan cuts, bounded once at the
+slice, two instructions a probe the main line pays, so the growth is
+outweighed inside the function and not removed. A cold call that
 returns is a call the caller's registers are saved across, and a panic
 is not. The rules: a cold path that returns into a hot path is priced in
 the caller, by its instructions, before it is called free for being

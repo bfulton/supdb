@@ -142,9 +142,9 @@ bulk replacement broke tick-exact tests once; do it test by test. Planned for th
 
 ## What is left, in the owner's order
 
-### 1. The page layer (task 12). Stage G1 under way: three units of eight landed, and the lists' check.
+### 1. The page layer (task 12). Stage G1 under way: three units of eight landed, the lists' check, and the count against upstream brought under.
 
-**As of 21 Nov 02:20 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
+**As of 21 Nov 08:47 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
 launched one unit a launch: `Workflow {scriptPath, args: {base:
 "ea6352181f342b7bffd75ec8c88df92bc7b78ff6", only: ["G1-<n>"], tail: false}}`, the same base for
 every unit; after G1-8 a launch with `only: ["none"]` and no `tail: false` runs the full gate
@@ -190,22 +190,66 @@ holds; a note for a step changes no earlier prompt, so the steps before it repla
   `land`, commit and long compact-form scan probes, type aliases and blanket trait impls in the
   entry-point test) was read by the launcher and by no reviewer: the closing critic's.
 - **What the cost gate says of this branch against upstream `9bfc4362`** (the upstream head
-  last merged): red by function, and by probe total under upstream in thirteen probes of
-  fifteen. The two over are real and are the next work but one (task 17): `scan_at`, the
-  public `Blob::scan_at` with a caller's own callback, +239 instructions a scan of a hundred
-  entries (the probe's own function, where the walk is inlined, +236; `FlatIndex::search`
-  +3); and `land`, +277 a key rewritten, `CachedBlock::lower_bound` and `Reader::splice_run`
-  searching by key where the base patched by rank a copy carried across a merge's rewrite --
-  the price of the fix for "a claim about a partition's records carried across its rewrite"
-  (`324a395a`), on a plain store with merges, to be understood and brought down, not
-  accepted. Everything else red there is a move between functions with the total down (the
-  read's bracket to `Db::op`/`WriterOp`, `flat` to `key_at`/`scan_whole`, the compact form's
-  helpers inlined differently), read by callers and callees in the unit's notes.
+  last merged), since task 17 landed as change `T17`, **`c584cdc3`**: every one of the fifteen
+  probes is at or under upstream by its total, and the gate still exits red by function, on
+  moves. Before the change two probes were over: `scan_at`, the public `Blob::scan_at` with a
+  caller's own callback, +239 instructions a scan of a hundred entries, and `land`, +274 a key
+  rewritten. What was found and done, each by function and by instruction
+  (`scratch/plan/build/T17/notes.md`):
+  - `scan_at`, now 373 a scan under: the public walk moves its rank once where its loop ends,
+    `Blob::seek`'s arm by the piece is out of line, and `FlatIndex::search` resolves its two
+    regions once before its loop (the engine's own scans read about 300 a scan lower for that
+    too).
+  - `land`, now 55 to 62 a key under: the cause was `324a395a`'s search by key in
+    `Reader::splice_run` wherever a copy's claim names another partition (the reading of G1-3's
+    one run, verified). The fix stays; the patch takes the entry its rank names only where a
+    key compare (`key_eq`) proves that entry is the key in hand, and searches otherwise, so the
+    shape is sound by a check it makes. `tests/settle.rs` holds it over keys of 4, 16, 17 and
+    19 bytes and a whole block, red with the compare removed, with `324a395a` taken out, and
+    with the search dropped.
+  - `Reader::settle_each`, whose source is upstream's, read 37 a key over: the ordered index's
+    cold arms that return (`head_absent`, `top_late`) were inlined into it and kept the query's
+    head on the stack across the calls. Both arms are out of line (`plan_seek_late`,
+    `seek_planned_by_piece`) and the stride's probes read unchecked over the slice the plan
+    cuts; it reads 9 a key under, with 8 of codegen growth still inside it, outweighed and not
+    removed. `CLAUDE.md` has the rule (a cold path that returns into a hot path is priced in
+    the caller).
+  - The whole run and the pairs: `scratch/plan/build/T17/r1/cost-whole-R1e.log` and
+    `pairs-whole-R1e.txt` (probe, gained, lost, net). Every gainer in the other thirteen probes
+    is paired with its loser but two, neither this change's and both small: `read_z`'s
+    `zpages::view_with` +3 a read, and `merge`'s small gainers inside that probe's slack. The
+    pairs for `scan_z`, `scan_long_z` and `merge` were read off function totals, not by
+    instruction.
+  - Under a cipher, by the cipher's twins of the probes: the scan by the piece 199 a scan
+    lower, the patch into a carried copy 231 a key lower in all, and inside that the settle's
+    planned seek 67 a key higher, since an index read by the piece takes the two arms out of
+    line now. Two shapes that took the 67 back each cost the plain store and were refused; it
+    is the page layer's to take back (its index is not read by the piece through a cold arm).
+    The cipher twin of `land` was a scratch copy of the probe
+    (`scratch/plan/build/T17/r1/land_cipher_scratch.rs`), not a probe of the gate.
+  - Two review rounds; the second passed in both lenses with items that a second repair then
+    worked (ten more mutants, a test of the walk by the piece across several windows, a
+    checked-build assertion that a plan is in order). That repair's diff was read by the
+    launcher and by no reviewer: one `debug_assert!` and two tests.
+  - **Owed, none taken:** timing. `sh scripts/check.sh quick` at the tree for the scan pass
+    and the lag sweep's bursts, and `bench/scripts/pair.sh supdb-cipher supdb 300000 --passes
+    lag` beside the same pairing at `c7a0c933` for the planned seek under a cipher. The hints
+    ahead of a patch and a walk take any claim, as upstream's did, so a carried copy is
+    prefetched as upstream prefetched it.
+  - **Open:** the scan's start over a carried copy (`blk.identity == seg.blob.id()`,
+    `324a395a`'s line) is held by no test: a mutant that takes any claim there survives the
+    tests and 2,950 fuzz seeds, which reach a stale claim at a scan's start 1,808 times and
+    every time at the block's first entry, where the rank and the search agree. `key_eq`'s
+    arm for keys under sixteen bytes compares two empty slices by a call of no bytes, which
+    this file's own rule says to guard (the empty key in a carried copy, one key a store).
+    The new tests in `tests/blob.rs` hand closures straight to `Blob::scan_at`, where
+    `tests/common`'s `kv` would compile one copy.
 - **What the cost gate cannot do yet, for the closing critic and the integration:** a move
   between two functions reads red with nothing to say it is a move, so a pull request against
-  the main line fails its cost job as the branch stands, whatever task 17 fixes; the way
-  through is undecided (a declared group of functions held to its net, valid against one
-  base, is the candidate, shaped like the lists' declared raises below). Also open: the `~`
+  the main line fails its cost job as the branch stands, with every total under upstream; the
+  way through is undecided, and `T17`'s paired table is its input (a declared group of
+  functions held to its net, valid against one base, is the candidate, shaped like the
+  lists' declared raises below). Also open: the `~`
   bounds rest on two to four self-checks a probe; `land` runs the segment work inline, not
   on its own thread; the CI job and valgrind's noise on a hosted runner are unmeasured;
   `sh scripts/check.sh cost` with its default base has not been run; a whole run wants
@@ -242,8 +286,7 @@ holds; a note for a step changes no earlier prompt, so the steps before it repla
   passes to no kernel. Green after (519 passed). No hosted runner has run any job of this
   branch: the first pull request is where `cross-arm`, `machine`, `cost` and `lists` first run
   there.
-- **Next, in order:** task 17 as change `T17` (the two probes over upstream, above), its own
-  workflow and commit; then G1-4 `offsets`, then `authenticated`, `advice`, `sealed`, `docs`.
+- **Next, in order:** G1-4 `offsets`, then `authenticated`, `advice`, `sealed`, `docs`.
   Every unit from here is launched with a build note: a CI job it adds is
   `sh scripts/check.sh <group>` with nothing in the YAML but event values, a list it adds is
   registered in `scripts/ratchet.py`, and a move between functions the cost group reads red is
