@@ -741,6 +741,21 @@ impl OrdIndex {
         u64::from_be(unsafe { p.add(i * HEAD).cast::<u64>().read_unaligned() })
     }
 
+    /// The heads in memory, `lim` of them, for a search that reads several
+    /// under one pin: the pointer loaded once, where `head` loads it a
+    /// head. Empty for a mapping read by the piece.
+    #[inline]
+    fn heads_held(&self) -> &[[u8; HEAD]] {
+        if self.lim == 0 {
+            return &[];
+        }
+        let p = self.heads.load(std::sync::atomic::Ordering::Acquire);
+        // SAFETY: as `head`'s: the pointer names `n` heads (`lim` of them,
+        // where `lim` is not zero) for as long as the caller's pin stands,
+        // and a head is eight bytes with no alignment of its own.
+        unsafe { std::slice::from_raw_parts(p as *const [u8; HEAD], self.lim) }
+    }
+
     /// The address of head `lo`, or one past the last; `None` for a mapping
     /// read by the piece, whose heads are not in memory to point at.
     #[inline]
@@ -1188,10 +1203,34 @@ impl OrdIndex {
     /// the heads or cannot be planned from memory -- an empty index, a
     /// query outside the common prefix, a prefix not learned -- and the
     /// caller seeks as it did.
+    #[inline]
     pub fn plan_seek(&self, key: &[u8], t: &mut usize) -> Option<SeekPlan> {
+        // An empty top level is an index of no keys for a mapped file, the
+        // test this made of `n` before a mapping read by the piece left it
+        // empty until its first seek (`top`): one test for both, and the
+        // second kind planned out of line (`plan_seek_late`), so that a
+        // caller this is inlined into keeps no call that returns.
+        if self.top_eager.is_empty() {
+            return self.plan_seek_late(key, t);
+        }
+        self.plan_over(&self.top_eager, key, t)
+    }
+
+    /// `plan_seek` for an index with no top level read at its open: none
+    /// for an index of no keys, and the level read at the first seek for
+    /// a mapping read by the piece (`top_late`).
+    #[cold]
+    #[inline(never)]
+    fn plan_seek_late(&self, key: &[u8], t: &mut usize) -> Option<SeekPlan> {
         if self.n == 0 {
             return None;
         }
+        self.plan_over(self.top_late(), key, t)
+    }
+
+    /// `plan_seek` over the top level `top`.
+    #[inline(always)]
+    fn plan_over(&self, top: &[u64], key: &[u8], t: &mut usize) -> Option<SeekPlan> {
         if self.pfx > 0 {
             let prefix = self.prefix.as_deref()?;
             if key.len() < self.pfx
@@ -1203,7 +1242,6 @@ impl OrdIndex {
         }
         let h = head_of(key, self.pfx);
         let was = *t;
-        let top = self.top();
         let same = was < top.len() && top[was] >= h && (was == 0 || top[was - 1] < h);
         let at = if same { was } else { lower_bound(top, h) };
         *t = at;
@@ -1238,6 +1276,48 @@ impl OrdIndex {
     ) -> (usize, Option<bool>) {
         let h = plan.head;
         debug_assert_eq!(h, head_of(key, self.pfx), "a plan is its own key's");
+        // The heads of a mapped file are in memory, every one of them
+        // (`lim` is `n`), and are read here with a bound that cannot fail
+        // and panics if it does; a mapping read by the piece, whose heads
+        // are asked for by a call that returns (`head_absent`), is sought
+        // out of line (`seek_planned_by_piece`). Kept in the function a
+        // settle inlines this into, the call that returns cost the settle
+        // instructions a key in values it kept across the call.
+        if self.lim == 0 {
+            return self.seek_planned_by_piece(plan, key, key_at);
+        }
+        let heads = self.heads_held();
+        debug_assert!(
+            plan.lo <= plan.hi && plan.hi as usize <= heads.len(),
+            "a plan's stride ends before it begins or past the heads"
+        );
+        let (base, hi) = (plan.lo as usize, (plan.hi as usize).min(heads.len()));
+        let stride = &heads[base.min(hi)..hi];
+        let lo = base
+            + crate::db::select_lower_bound(stride.len(), |i| {
+                debug_assert!(i < stride.len(), "a probe past the stride");
+                // SAFETY: `select_lower_bound` probes below its `n`, the
+                // stride's length, and nowhere else.
+                u64::from_be_bytes(*unsafe { stride.get_unchecked(i) }) < h
+            });
+        // `exact_at`'s test of the head at `lo`, over the heads in hand:
+        // `lim` is `n`, so the one bound is both of its tests.
+        match heads.get(lo) {
+            Some(x) if u64::from_be_bytes(*x) == h => self.exact_tied(lo, h, key, key_at),
+            _ => (lo, self.uniform_len.map(|_| false)),
+        }
+    }
+
+    /// `seek_exact_planned` for a mapping read by the piece.
+    #[cold]
+    #[inline(never)]
+    fn seek_planned_by_piece<'a>(
+        &self,
+        plan: SeekPlan,
+        key: &[u8],
+        key_at: impl Fn(usize) -> Option<&'a [u8]>,
+    ) -> (usize, Option<bool>) {
+        let h = plan.head;
         let (base, hi) = (plan.lo as usize, (plan.hi as usize).min(self.n));
         let lo = base + crate::db::select_lower_bound(hi - base, |i| self.head(base + i) < h);
         self.exact_at(lo, h, key, key_at)
@@ -1293,6 +1373,18 @@ impl OrdIndex {
             // would have to say.
             return (lo, self.uniform_len.map(|_| false));
         }
+        self.exact_tied(lo, h, key, key_at)
+    }
+
+    /// `exact_at` where the head at `lo` ties the query's.
+    #[inline(always)]
+    fn exact_tied<'a>(
+        &self,
+        lo: usize,
+        h: u64,
+        key: &[u8],
+        key_at: impl Fn(usize) -> Option<&'a [u8]>,
+    ) -> (usize, Option<bool>) {
         if let Some(len) = self.uniform_len {
             // A head is a whole key. A query no longer than the keys that
             // ties one is that key or a proper prefix of it, so not below
@@ -1641,6 +1733,92 @@ mod tests {
             k
         };
         check_from(&keys, &[b"x", longer.as_slice(), b"zz"], "from-headtie");
+    }
+
+    /// A plan's stride begins at or before it ends and within the heads:
+    /// `plan_seek` makes no other, and the planned seek holds it to that in
+    /// a checked build, where its slice of the heads would otherwise read a
+    /// disordered plan as an empty stride, or one past the heads as a stride
+    /// cut to them, and answer as if the plan were another.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_plan_out_of_order_or_past_the_heads_is_refused_in_a_checked_build() {
+        let owned: Vec<Vec<u8>> = (0u32..1_000)
+            .map(|i| format!("{:016}", i * 3).into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let p = write(&build(&keys), "planned-disordered");
+        let mut idx = OrdIndex::open(&p, keys.len()).expect("opens");
+        idx.learn_prefix(keys[0]);
+        let key = keys[500];
+        let mut t = usize::MAX;
+        let good = idx.plan_seek(key, &mut t).expect("a mapped index plans");
+        assert!(good.lo <= good.hi, "plan_seek's own plan is in order");
+        let bad = SeekPlan {
+            lo: good.hi + 5,
+            hi: good.hi,
+            head: good.head,
+        };
+        let past = SeekPlan {
+            lo: good.lo,
+            hi: keys.len() as u32 + 10,
+            head: good.head,
+        };
+        for (plan, what) in [
+            (bad, "ends before it begins"),
+            (past, "ends past the heads"),
+        ] {
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                idx.seek_exact_planned(plan, key, |_| None)
+            }));
+            assert!(
+                refused.is_err(),
+                "a plan whose stride {what} was searched as a stride cut to the heads"
+            );
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A mapped index of no keys plans no seek (`plan_seek`'s `None`), and
+    /// its seek answers rank zero.
+    #[test]
+    fn an_index_of_no_keys_plans_nothing() {
+        let p = write(&build(&[]), "planned-empty");
+        let idx = OrdIndex::open(&p, 0).expect("opens");
+        let mut t = usize::MAX;
+        for k in [&b""[..], b"k", b"0000000000000000"] {
+            assert!(
+                idx.plan_seek(k, &mut t).is_none(),
+                "an empty index plans {k:?}"
+            );
+            assert_eq!(idx.seek_exact(k, |_| None).0, 0);
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A mapped file's planned seeks read the top level its open read,
+    /// and never the one a mapping read by the piece makes at its first
+    /// seek (`top_late`).
+    #[test]
+    fn a_mapped_index_plans_from_the_top_level_read_at_its_open() {
+        let owned: Vec<Vec<u8>> = (0u32..3_000)
+            .map(|i| format!("{:016}", i * 3).into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let p = write(&build(&keys), "planned-eager-top");
+        let mut idx = OrdIndex::open(&p, keys.len()).expect("opens");
+        idx.learn_prefix(keys[0]);
+        let mut t = usize::MAX;
+        for k in &keys {
+            assert!(
+                idx.plan_seek(k, &mut t).is_some(),
+                "a key of the index plans"
+            );
+        }
+        assert!(
+            idx.top_late.get().is_none(),
+            "a mapped file's plans read its top level again, which its open read already"
+        );
     }
 
     /// A planned seek answers as `seek_exact` does, for keys and for

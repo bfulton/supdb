@@ -874,6 +874,63 @@ fn a_walk_over_a_compressed_block_decompresses_each_chunk_once() {
     );
 }
 
+/// The walk by the piece over the common record -- values of one width,
+/// inline -- answers as the mapping's for scans that cross several of its
+/// windows of ranks: each window moves the rank by what it walked, and a
+/// rank moved by the count walked since the scan began, or since anything
+/// but the window's start, hands out the records of the wrong ranks from
+/// the second window on. The shapes of `a_source_that_lends_by_the_piece_
+/// answers_the_same` are records of mixed lengths, which that walk hands to
+/// the general one at the first record, so they never reach a second window.
+#[test]
+fn a_walk_by_the_piece_across_its_windows_answers_as_the_mapped_one() {
+    for compact in [false, true] {
+        let path = scratch(&format!("piecewise-windows-{compact}"));
+        let opts = SegmentOptions {
+            compact_records: compact,
+            ..SegmentOptions::default()
+        };
+        let mut w = SegmentWriter::create(&path, &opts).expect("create");
+        w.set_inline_max(256);
+        let mut want = Vec::new();
+        for k in 0..300usize {
+            let key = format!("term={k:08}").into_bytes();
+            let n = if k % 5 == 0 { 3 } else { 1 };
+            w.begin(&key).expect("begin");
+            let vals: Vec<Vec<u8>> = (0..n).map(|i| format!("{k:06}.{i}").into_bytes()).collect();
+            for v in &vals {
+                w.value(v);
+            }
+            w.end().expect("end");
+            want.push((key, vals));
+        }
+        w.finish(1).expect("finish");
+        let raw = std::fs::read(&path).unwrap();
+        let mapped = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
+        for piece in [64, 4080, 1 << 16] {
+            let blob = Blob::open(Piecewise::new(raw.clone(), piece)).expect("open by the piece");
+            reads_what_was_written(&blob, &want);
+            agree(&mapped, &blob);
+            for from in [0usize, 1, 63, 64, 65, 130] {
+                for limit in [65usize, 128, 200, usize::MAX] {
+                    let (mut sa, mut sb) = (Vec::new(), Vec::new());
+                    let na = mapped
+                        .scan_at(from, limit, |k, v| sa.push((k.to_vec(), v.to_vec())))
+                        .unwrap();
+                    let nb = blob
+                        .scan_at(from, limit, |k, v| sb.push((k.to_vec(), v.to_vec())))
+                        .unwrap();
+                    assert_eq!(
+                        (na, sa),
+                        (nb, sb),
+                        "compact {compact}, pieces of {piece}: a scan of {limit} from rank {from}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn a_paced_walk_hands_out_what_the_plain_walk_does() {
     // `scan_at_paced` asks for the records ahead of its walk and is
@@ -909,6 +966,94 @@ fn a_paced_walk_hands_out_what_the_plain_walk_does() {
             }
         }
     }
+}
+
+/// The walks over a reader that holds its key section whole --
+/// `scan_at_paced` and a `run_walk`'s -- refuse a source that lends by the
+/// piece before they walk anything, with `Unsupported`: that refusal is the
+/// engine's word that a segment is to be walked by the piece, a window of
+/// records an ask, and a walk that took such a source a record at a time
+/// would answer the same and ask for every record on its own. `scan_at`
+/// walks it.
+#[test]
+fn the_whole_walks_refuse_a_source_that_lends_by_the_piece() {
+    let path = scratch("whole-walks-refuse");
+    build_opts(&path, 300, false, 256, false);
+    let raw = std::fs::read(&path).unwrap();
+    let blob = Blob::open(Piecewise::new(raw, 4080)).expect("open by the piece");
+    let keys = blob.keys();
+    assert!(keys > 100);
+    let mut seen = 0usize;
+    let mut count = |_: &[u8], _: &[u8]| seen += 1;
+    let cb: &mut dyn FnMut(&[u8], &[u8]) = &mut count;
+    for lead in [0usize, 64] {
+        let e = blob
+            .scan_at_paced(0, keys, lead, &mut *cb)
+            .expect_err("a paced walk over a source by the piece is refused");
+        assert_eq!(e.kind(), std::io::ErrorKind::Unsupported, "lead={lead}");
+    }
+    let e = blob
+        .run_walk()
+        .scan_at(0, keys, &mut *cb)
+        .expect_err("a run walk over a source by the piece is refused");
+    assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
+    let walked = blob.scan_at(0, keys, &mut *cb).expect("scan_at walks it");
+    assert_eq!(walked, keys);
+    let after = seen;
+    let mut seen = 0usize;
+    let mut count = |_: &[u8], _: &[u8]| seen += 1;
+    let cb: &mut dyn FnMut(&[u8], &[u8]) = &mut count;
+    let _ = blob.scan_at_paced(0, keys, 0, &mut *cb);
+    let _ = blob.run_walk().scan_at(0, keys, &mut *cb);
+    assert!(after > 0, "`scan_at` handed out the records");
+    assert_eq!(seen, 0, "a refused walk handed nothing out");
+}
+
+/// A source that lends whole until it is told to stop, and then lends
+/// nothing and is not one that lends by the piece: a reader over it has
+/// its key section neither whole nor by the piece.
+struct StopsLending {
+    bytes: Vec<u8>,
+    lends: std::sync::atomic::AtomicBool,
+}
+
+impl Bytes for StopsLending {
+    fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+    fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
+        Copying(self.bytes.clone()).read_at(off, dst)
+    }
+    fn slice_at(&self, off: u64, len: usize) -> Option<&[u8]> {
+        if !self.lends.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let end = off.checked_add(len as u64)?;
+        self.bytes.get(off as usize..usize::try_from(end).ok()?)
+    }
+}
+
+/// A seek over a reader whose key section cannot be read, whole or by the
+/// piece, answers the end: no key is at or after the query, and a scan
+/// from there walks nothing.
+#[test]
+fn a_seek_over_a_section_that_does_not_read_answers_the_end() {
+    let path = scratch("seek-unread");
+    let want = build_opts(&path, 300, false, 256, false);
+    let src = StopsLending {
+        bytes: std::fs::read(&path).unwrap(),
+        lends: std::sync::atomic::AtomicBool::new(true),
+    };
+    let blob = Blob::open(src).expect("open while it lends");
+    let keys = blob.keys();
+    assert_eq!(blob.seek(&want[0].0), 0, "the first key, while it lends");
+    blob.source()
+        .lends
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    for (key, _) in want.iter().step_by(37) {
+        assert_eq!(blob.seek(key), keys, "a seek with nothing to read");
+    }
+    assert_eq!(blob.seek(b""), keys);
 }
 
 #[test]

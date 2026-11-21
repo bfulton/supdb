@@ -1408,6 +1408,37 @@ one look it is for, the walk of the unsealed keys is sixteen
 instructions an entry under the main line, and a callback that reads
 through the handle no longer runs under a borrow of the handle's state.
 
+The same shape twice more, each read at the
+instruction (`--dump-instr=yes`, each instruction's count beside the
+disassembly, `addr2line -i` for whose inlined code it is) and by
+neither function's source. A caller's function that `Blob::seek` was
+inlined into carried `seek`'s arm by the piece beside the slice's, and
+the public `scan_at`'s loop in the same function read two register
+copies an entry more; `seek`'s arm out of line put the loop back to the
+instruction. And the settle that inlines the ordered index's planned
+seek read thirty-seven instructions a key over the main line with its
+own source unchanged, once `head` bounded its read by a call that
+returns (`head_absent`, the read by the piece) where it had asserted and
+the top level a mapping read by the piece builds at its first seek was
+reached by another (`top_late`). The first fix read the cost as spills
+in the search's loop, held the heads as one slice (`heads_held`), took
+seventeen of the thirty-seven, and was called the compiler's for the
+rest; the count by instruction, made only when a review asked for it,
+put the loop at twelve instructions a probe on both sides all along and
+the excess around it: the query's head and its position in the top
+level kept on the stack across the two calls, reloaded at each compare,
+in a plan stored and copied through memory. Both arms out of line, each
+a function the plain path does not name (`plan_seek_late`,
+`seek_planned_by_piece`), took the rest to eight a key. A cold call that
+returns is a call the caller's registers are saved across, and a panic
+is not. The rules: a cold path that returns into a hot path is priced in
+the caller, by its instructions, before it is called free for being
+cold; where a function's count moved with its source unchanged, its
+inlined callees are diffed by instruction before its own lines are, and
+before a fix is built on where the cost is thought to be; and a remainder
+is not called the compiler's until the instruction listing says which
+values it keeps where.
+
 What a plain store is still asked is where something is made or waited
 for, never in an operation's path a key, an entry, a block or a step: a
 handle made (`paged_bits`), a snapshot taken or released, a file

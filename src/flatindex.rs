@@ -2707,9 +2707,27 @@ impl FlatIndex {
     }
 
     fn search<'a, S: Sect<'a>>(&self, sec: S, key: &[u8], mut lo: usize, mut hi: usize) -> usize {
+        // The two regions once, before the loop, and `key_at`'s body over
+        // them in it: resolved at every probe, the section's base was one
+        // more value the loop kept across each compare's call. A region
+        // that will not resolve is a key that will not read at every
+        // probe, which narrows `hi` to `lo`: the answer is `lo`. (The
+        // parse holds every region inside the section, so this is the
+        // answer `key_at`'s loop gave on a path nothing reaches.)
+        let (Some(recs), Some(dir)) = (
+            sec.part(self.recs.0, self.recs.1),
+            sec.part(self.dir.0, self.dir.1),
+        ) else {
+            return lo;
+        };
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            match self.key_at(sec, mid).map(|k| k.cmp(key)) {
+            let at = if mid < self.nkeys {
+                dir.u32_at(mid * 4).and_then(|off| recs.key(off as usize))
+            } else {
+                None
+            };
+            match at.map(|k| k.cmp(key)) {
                 Some(std::cmp::Ordering::Less) => lo = mid + 1,
                 // A record that will not decode sorts as "not less", which
                 // keeps the search terminating on damaged input.

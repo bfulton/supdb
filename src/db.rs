@@ -19834,12 +19834,16 @@ struct CachedBlock {
     /// in since, so a walk's start and a patch's entry are a rank less the
     /// block's first (`Options::copy_start_at_rank`). An insert clears it
     /// for good; a delete leaves the entry, with an empty run, so it
-    /// holds. It names the partition and is asked of the one a read is
-    /// in (`identity_of`): a table carried across a merge that rewrote
-    /// its partition over the same blocks keeps its copies, and a key the
-    /// merge folded in or dropped inside a block moves every record after
-    /// it, so a claim about the records before the merge is no claim about
-    /// the ones after.
+    /// holds. It names the partition: a walk's start takes the entry by
+    /// its rank in that partition alone, and a patch in another only where
+    /// a compare there proves it (`Reader::splice_run`): a table carried
+    /// across a merge that rewrote its partition over the same blocks
+    /// keeps its copies, and a key the merge folded in or dropped inside a
+    /// block moves every record after it, so a claim about the records
+    /// before the merge is no claim about the ones after. The hints ahead
+    /// of a patch or a walk (`copy_entry_at`, `prefetch_block`) take any
+    /// claim, as they did before it named one: a hint at a rank a rewrite
+    /// moved asks for lines nothing reads, and answers nothing.
     identity: u64,
     /// A copy of a block wide by its count (`Options::forms_copy_hot_wide`),
     /// kept past the wide bound: the settle that grows its overlay past the
@@ -19894,12 +19898,6 @@ impl CachedBlock {
             && (other.identity == 0 || self.identity == other.identity)
     }
 
-    /// Whether the entries are partition `blob`'s records, entry for record
-    /// (`identity`).
-    #[inline]
-    fn identity_of(&self, blob: u64) -> bool {
-        self.identity != 0 && self.identity == blob
-    }
     /// Whether a walk of this copy emits what a walk of `other` emits:
     /// the keys that hold a value, each with its run, an entry of no
     /// values on either side passed over. What `agrees` holds less the
@@ -20029,6 +20027,25 @@ fn key_cmp(a: &[u8], b: &[u8]) -> Ordering {
     }
 }
 
+/// Whether `a` and `b` are one key: `key_cmp`'s two words for keys of
+/// sixteen bytes or more, and no call for the rest of a key of sixteen,
+/// where the order's compare of the tails is a call of no bytes.
+#[inline]
+fn key_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    if a.len() >= 16 {
+        let word =
+            |s: &[u8], i: usize| u64::from_ne_bytes(s[i..i + 8].try_into().expect("eight bytes"));
+        word(a, 0) == word(b, 0)
+            && word(a, 8) == word(b, 8)
+            && (a.len() == 16 || a[16..] == b[16..])
+    } else {
+        a == b
+    }
+}
+
 /// PROTOTYPE: a hint to the core to fetch the lines of a buffer, none of
 /// which it waits for; on any other architecture, nothing.
 #[inline]
@@ -20067,7 +20084,9 @@ pub(crate) fn prefetch_lines(ptr: *const u8, bytes: usize) {
 /// hundred thousand keys and three hundred, six rounds interleaved, it
 /// moved nothing the machine's own predictor was not already hiding,
 /// and it stays because the ordered index's doc says the top search
-/// selects, which it now does.
+/// selects, which it now does. `below` is asked only of indices in
+/// `0..n`, which a caller's unchecked read may rest on
+/// (`OrdIndex::seek_exact_planned`).
 #[inline(always)]
 pub(crate) fn select_lower_bound(n: usize, below: impl Fn(usize) -> bool) -> usize {
     let mut lo = 0usize;
@@ -20111,11 +20130,13 @@ fn prefetch_form(form: &Cached, whole: bool) {
     }
 }
 
-/// The copy a settle's patch of the key at `cut` writes by its rank, and
-/// the entry: block `b`'s form where it is a copy whose entries are the
-/// block's records (`CachedBlock::identity`) and the cut is the key's own
-/// record's, as `Reader::splice_run` decides it. `None` for every other
-/// form and cut, which a patch searches the form for.
+/// The copy a settle's patch of the key at `cut` looks at by its rank, and
+/// the entry: block `b`'s form where it is a copy that claims some
+/// partition's records (`CachedBlock::identity`) and the cut is the key's
+/// own record's, as `Reader::splice_run` decides it -- the entry it writes
+/// or, under a claim of another partition, the one it compares first.
+/// `None` for every other form and cut, which a patch searches the form
+/// for. For the hints ahead of the patch alone.
 fn copy_entry_at(table: &BlockTable, b: u32, cut: u32) -> Option<(&CachedBlock, usize)> {
     if cut == LAZY_CUT || cut & 1 == 0 {
         return None;
@@ -20124,7 +20145,7 @@ fn copy_entry_at(table: &BlockTable, b: u32, cut: u32) -> Option<(&CachedBlock, 
         return None;
     };
     let j = ((cut >> 1) as usize).checked_sub(b as usize * CACHE_BLOCK)?;
-    (blk.identity_of(table.blob) && j < blk.ents.len()).then_some((blk, j))
+    (blk.identity != 0 && j < blk.ents.len()).then_some((blk, j))
 }
 
 /// The lines a walk of `form` over the partition's ranks `from` to `n`
@@ -20209,10 +20230,12 @@ fn prefetch_block(
     };
     match form {
         // An identity copy walked from the entry `at` names is prefetched
-        // from there (`Options::copy_prefetch_from_start`); a copy the walk
-        // will search, whole.
+        // from there (`Options::copy_prefetch_from_start`), a claim of the
+        // partition before a rewrite too, whose entries a rewrite of
+        // updates alone leaves where they were; a copy the walk will
+        // search, whole.
         Cached::Block(blk) => match at {
-            Some(i) if blob.is_some_and(|p| blk.identity_of(p.id())) => blk.prefetch_from(i),
+            Some(i) if blk.identity != 0 => blk.prefetch_from(i),
             _ => blk.prefetch(whole),
         },
         Cached::Sparse(sb) => {
@@ -33224,8 +33247,8 @@ impl Reader {
             if let Some((at2, b2, exact)) = ahead.take() {
                 if at2 == at as u32 {
                     if let Some(form) = table.slots.get(b2 as usize).and_then(|s| s.as_deref()) {
-                        let by_cut = exact
-                            && matches!(form, Cached::Block(blk) if blk.identity_of(table.blob));
+                        let by_cut =
+                            exact && matches!(form, Cached::Block(blk) if blk.identity != 0);
                         if !by_cut {
                             prefetch_form(form, self.opts.copy_prefetch_whole);
                         }
@@ -33497,14 +33520,18 @@ impl Reader {
         let mut bloated = false;
         let mut dense = false;
         // The shared clean form is not a clone of anything.
-        if table.slots[b]
+        let cloned = table.slots[b]
             .as_ref()
-            .is_some_and(|a| std::sync::Arc::strong_count(a) > 1 && !matches!(**a, Cached::Clean))
-        {
+            .is_some_and(|a| std::sync::Arc::strong_count(a) > 1 && !matches!(**a, Cached::Clean));
+        if cloned {
             self.shared
                 .forms_cloned
                 .fetch_add(1, AtomicOrdering::Relaxed);
         }
+        // A run written over the one it replaces in a copy this patch did
+        // not clone leaves every buffer's length and capacity as they
+        // were, so the form's bytes are `before` and are not counted again.
+        let mut bytes_kept = false;
         match std::sync::Arc::make_mut(table.slots[b].as_mut().expect("checked above")) {
             Cached::Block(blk) => {
                 // The cut is the key's rank in the partition, and while
@@ -33514,12 +33541,23 @@ impl Reader {
                 // a patch, was a tenth of the upkeep thread's time over a
                 // burst of updates, repeating what the resolve had
                 // answered (`Options::copy_start_at_rank`).
+                //
+                // A copy carried across a rewrite of its partition over
+                // the same blocks claims the partition before it
+                // (`identity`), which says nothing of the records after
+                // it: a key the rewrite folded in or dropped inside the
+                // block moves every rank after it. The entry the rank
+                // names is still this key's wherever its key is the key
+                // in hand, since a copy holds each key once and in order,
+                // so the one compare proves it for this patch and the
+                // search is for where it does not.
                 let lo = b * CACHE_BLOCK;
                 let at_rank = self.opts.copy_start_at_rank
-                    && blk.identity_of(table.blob)
+                    && blk.identity != 0
                     && same
                     && c >= lo
-                    && c - lo < blk.ents.len();
+                    && c - lo < blk.ents.len()
+                    && (blk.identity == table.blob || key_eq(blk.key(&blk.ents[c - lo]), key));
                 let (i, found) = if at_rank {
                     debug_assert!(
                         key_cmp(blk.key(&blk.ents[c - lo]), key) == Ordering::Equal,
@@ -33547,6 +33585,7 @@ impl Reader {
                     blk.vals[at..at + run.len()].copy_from_slice(run);
                     blk.dead += blk.ents[i][3] as usize - run.len();
                     blk.ents[i][3] = run.len() as u32;
+                    bytes_kept = !cloned;
                 } else if found {
                     if self.fits() {
                         fit_room(&mut blk.vals, run.len());
@@ -33687,11 +33726,17 @@ impl Reader {
         }
         if was_clean {
             self.list_built(at, b, table);
-        } else {
+        } else if !bytes_kept {
             let after = table.slots[b].as_ref().map_or(0, |c| self.fbytes(c));
             self.fs()
                 .cache_bytes
                 .set(self.fs().cache_bytes.get() + after - before);
+        } else {
+            debug_assert_eq!(
+                table.slots[b].as_ref().map_or(0, |c| self.fbytes(c)),
+                before,
+                "a run written in place moved its form's bytes"
+            );
         }
         if dense && self.opts.commit_forms && self.slot.is_none() && self.fs().convert_dense.get() {
             self.fs().tables_complete.set(false);
@@ -34676,7 +34721,7 @@ impl Reader {
                         // above record `start - 1` and not above `start`,
                         // so no entry between them is skipped.
                         let at_rank = self.opts.copy_start_at_rank
-                            && blk.identity_of(seg.blob.id())
+                            && blk.identity == seg.blob.id()
                             && rank != usize::MAX;
                         let i = if !first {
                             0

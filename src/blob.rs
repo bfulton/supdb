@@ -822,6 +822,10 @@ pub struct ZSource {
 macro_rules! walk_fixed {
     ($recs:ident, $whole:expr, $words:expr, $f:ident, $seen:ident, $rank:ident,
      $w:ident, $off:ident, $place:stmt) => {
+        // `$rank` moves with `$seen`, a record each, so it is moved once
+        // where the loop ends and not at every record: an instruction an
+        // entry of the loop.
+        let walked_from = $seen;
         for $w in $words {
             // `$off`, the record's place in `$recs`, from the word `$w`.
             $place
@@ -909,8 +913,8 @@ macro_rules! walk_fixed {
                 }
             }
             $seen += 1;
-            $rank += 1;
         }
+        $rank += $seen - walked_from;
     };
 }
 
@@ -1275,7 +1279,23 @@ impl<B: Bytes> Blob<B> {
 
     /// Rank of the first key at or after `key`, in key order.
     pub fn seek(&self, key: &[u8]) -> usize {
-        indexed!(self, |sec, idx| idx.seek_with(sec, key, true), self.keys())
+        match self.flat() {
+            Some((sec, idx)) => idx.seek_with(sec, key, true),
+            None => self.seek_pieces(key),
+        }
+    }
+
+    /// `seek` for a reader with no key section held whole: a function of
+    /// its own, out of line, so that a caller's function `seek` is inlined
+    /// into holds the search over a slice and nothing of the search by
+    /// the piece.
+    #[cold]
+    #[inline(never)]
+    fn seek_pieces(&self, key: &[u8]) -> usize {
+        match self.pieces() {
+            Some((sec, idx)) => idx.seek_with(sec, key, true),
+            None => self.keys(),
+        }
     }
 
     /// PROTOTYPE: a hint to fetch the lines of the records from `rank`
@@ -2634,6 +2654,9 @@ impl<B: Bytes> Blob<B> {
     /// then each line as the walk comes within `lead` of it, so the fetch
     /// runs beside the walk rather than before it. A hint, nothing waited
     /// for; the common record shape only, as the walk's fast loop is.
+    /// A source that lends by the piece is refused with `Unsupported`
+    /// before anything is walked, as every walk for a reader that holds
+    /// its key section whole refuses it; `scan_at` walks such a source.
     #[cfg(not(target_family = "wasm"))]
     pub fn scan_at_paced<F: FnMut(&[u8], &[u8])>(
         &self,
@@ -2795,7 +2818,9 @@ pub struct RunWalk<'a, B: Bytes> {
 }
 
 impl<B: Bytes> RunWalk<'_, B> {
-    /// `Blob::scan_at` over the regions this walker holds.
+    /// `Blob::scan_at` over the regions this walker holds, for a reader
+    /// that holds its key section whole: a source that lends by the piece
+    /// is refused with `Unsupported` before anything is walked.
     pub fn scan_at<F: FnMut(&[u8], &[u8])>(
         &self,
         from_rank: usize,
