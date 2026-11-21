@@ -1377,12 +1377,63 @@ fn a_patch_by_its_rank_asks_for_its_lines_by_the_cut() {
 /// is folded in, which is what lets the table be carried.
 #[test]
 fn a_copys_claim_to_its_records_is_no_claim_across_its_partitions_rewrite() {
-    let dir = scratch("copy-identity-rewrite");
+    claim_across_rewrite("copy-identity-rewrite", 4096, |i| {
+        format!("k{i:03}").into_bytes()
+    });
+}
+
+/// The same with keys of sixteen bytes, which the patch's compare of the
+/// key at its rank reads as two words (`db::key_eq`).
+#[test]
+fn a_copys_claim_across_its_partitions_rewrite_with_keys_of_sixteen_bytes() {
+    claim_across_rewrite("copy-identity-rewrite-16", 4096, |i| {
+        format!("k{i:015}").into_bytes()
+    });
+}
+
+/// The same with keys of nineteen bytes, four at a time sharing their
+/// first sixteen, which the compare reads as two words that agree and a
+/// tail that decides.
+#[test]
+fn a_copys_claim_across_its_partitions_rewrite_with_keys_past_sixteen_bytes() {
+    claim_across_rewrite("copy-identity-rewrite-19", 4096, |i| {
+        format!("k{:015}{i:03}", i / 8).into_bytes()
+    });
+}
+
+/// The same with keys of seventeen bytes, four at a time sharing their
+/// first sixteen, so that the one byte past the two words decides.
+#[test]
+fn a_copys_claim_across_its_partitions_rewrite_with_keys_of_seventeen_bytes() {
+    claim_across_rewrite("copy-identity-rewrite-17", 4096, |i| {
+        let mut k = format!("k{:015}", i / 8).into_bytes();
+        k.push(b'a' + (i % 8) as u8);
+        k
+    });
+}
+
+/// The same in a partition of more than a block, so that the copy the
+/// fold and the drop fall in is a block's whole sixty-four entries.
+#[test]
+fn a_copys_claim_across_its_partitions_rewrite_in_a_full_block() {
+    claim_across_rewrite("copy-identity-rewrite-full", 16384, |i| {
+        format!("k{i:015}").into_bytes()
+    });
+}
+
+/// A copy over updates alone, carried across a merge that folds one key
+/// into its block and drops another, keeps its block's boundaries and its
+/// claim to the records before the merge; a write filed after it, and one
+/// after that, are read back right by the writer's scan and a handle's.
+/// `key(i)` is the `i`th key, in order; `part` the partitions' bytes,
+/// at most a block of keys a partition at 4096 and more past it.
+fn claim_across_rewrite(name: &str, part: usize, key: impl Fn(usize) -> Vec<u8>) {
+    let dir = scratch(name);
     let mut db = Db::create(
         &dir,
         Options {
             seal_bytes: 1 << 20,
-            partition_bytes: Some(4096),
+            partition_bytes: Some(part),
             partition_on_flush: true,
             publish_in_background: true,
             upkeep: Upkeep::Inline,
@@ -1398,9 +1449,7 @@ fn a_copys_claim_to_its_records_is_no_claim_across_its_partitions_rewrite() {
     )
     .unwrap();
     let value = [b'v'; 100];
-    let keys: Vec<Vec<u8>> = (0..300)
-        .map(|i| format!("k{:03}", i * 2).into_bytes())
-        .collect();
+    let keys: Vec<Vec<u8>> = (0..300).map(|i| key(i * 2)).collect();
     let mut want = std::collections::BTreeMap::new();
     for k in &keys {
         db.put(k, &value);
@@ -1421,10 +1470,16 @@ fn a_copys_claim_to_its_records_is_no_claim_across_its_partitions_rewrite() {
         .cloned()
         .collect();
     let n = inside.len();
-    assert!(
-        (5..64).contains(&n),
-        "one block of keys inside the range: {n}"
-    );
+    if part <= 4096 {
+        assert!(
+            (5..64).contains(&n),
+            "one block of keys inside the range: {n}"
+        );
+    } else {
+        // The fold, the drop and the early record in the first block,
+        // which is whole.
+        assert!(n > 64 && n / 3 < 64, "a whole first block: {n}");
+    }
     // Every key of the partition updated and scanned, so its block is a
     // copy over updates alone.
     for k in &inside {
@@ -1451,6 +1506,15 @@ fn a_copys_claim_to_its_records_is_no_claim_across_its_partitions_rewrite() {
     // A record dropped beside it, so the rewrite keeps the partition's
     // count and its first and last keys (`same_blocks`).
     let dropped = inside[1].clone();
+    // A record between the dropped one and the folded one, written first
+    // and left unfiled with them: filed after the rewrite and before the
+    // folded key's insert, its rank names the entry of the record before
+    // it in the copy carried across the drop, so the patch's compare of
+    // the key at the rank is what sends it to the search.
+    let early = inside[2].clone();
+    assert!(early < folded, "the early record is below the folded key");
+    db.put(&early, b"early");
+    want.insert(early.clone(), vec![b"early".to_vec()]);
     db.put(&folded, b"folded");
     want.insert(folded.clone(), vec![b"folded".to_vec()]);
     db.delete(&dropped);
