@@ -2003,7 +2003,18 @@ writer waits in `land_seal` for a landing a dead thread will not make
 (`ROADMAP.md`). The runner stops a test binary after seven minutes and
 reads that as the mutant's death, and removes the stores a mutant's
 tests left, after a hung one's filled the disk under the run and took
-its verdicts with it.
+its verdicts with it. A fifth outlived everything for longer, and was
+found fixing a flake of the test that names it: a build that never
+rests (`Held::passed` without its rest) passed every test under a
+cipher, the one whose comment says "read under one hold with no rest,
+the builds hold the store" among them, because that test's partitions
+are an eighth of its cache and a build holds one partition at a time.
+`a_form_build_holds_its_cache_and_not_its_partition` builds one ordered
+run's segment, thirteen times the cache, in a store reopened for it --
+a file being written is in memory whole until its envelope, so only a
+reopened store's peak is its builds' alone -- and reads the mutant at
+eleven times the budget. A comment that says what a test holds is held
+to the mutant like any other claim.
 
 A chunk of a form file that fails its tag was a read of the store that
 failed, and the store refused every read after it, where a plain store
