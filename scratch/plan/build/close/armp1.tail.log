@@ -1,0 +1,6 @@
+test crypt::tests::a_chunk_moved_or_borrowed_is_refused ... ok
+qemu-aarch64-static: QEMU internal SIGSEGV {code=MAPERR, addr=0x20}
+error: test failed, to rerun pass `--lib`
+
+Caused by:
+  process didn't exit successfully: `qemu-aarch64-static -L /usr/aarch64-linux-gnu /home/user/supdb/target/aarch64-unknown-linux-gnu/checked/deps/supdb-f73fa21bb2eb2ba6` (signal: 11, SIGSEGV: invalid memory reference)

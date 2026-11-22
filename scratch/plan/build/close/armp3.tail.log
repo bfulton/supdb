@@ -1,0 +1,6 @@
+test db::zselect::tests::constant_workloads_come_to_rest_eager_at_937_mb ... ok
+
+test result: ok. 530 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 183.23s
+
+
+all checks passed: cross-arm

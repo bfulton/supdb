@@ -1,0 +1,7 @@
+seal red red: home red (does not compile in the module allowed)
+seal red red: abroad red (no error at src/db/zfile.rs)
+seal red red: placed red (of the list's)
+seal red red: words held
+seal red red: ok
+EXIT 0 secs 43
+min avail MB  6190 start  6288 end  6288

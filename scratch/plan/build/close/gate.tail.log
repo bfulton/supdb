@@ -1,0 +1,30 @@
+
+== lint ==
+   Compiling supdb-bench v0.2.0 (/home/user/supdb/bench)
+    Checking supdb v0.1.0 (/home/user/supdb)
+    Finished `release` profile [optimized + debuginfo] target(s) in 12.21s
+workflows: every run block parses, none interpolates (42 blocks); every Linux job names its image
+policy_defaults: 210 fields follow the engine
+
+== figures ==
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.10s
+figures: docs/figures is what runs/ draws
+
+all checks passed: build test lint figures
+
+=== lists ===
+ratchet-red: 66 cases, each as it must be
+ratchet-red: green
+base: 5aad09dd5d0e828846549f5fb9623f2b1540bbb0, the merge-base of HEAD and origin/main (no override and no event)
+ratchet: the lists at 5aad09dd5d0e828846549f5fb9623f2b1540bbb0 (the merge-base of HEAD and 5aad09dd5d0e828846549f5fb9623f2b1540bbb0) against the tree
+  tests/data/cost-entries.txt: new since the base, nothing to hold yet (330 keys)
+  tests/data/couplings.txt: new since the base, nothing to hold yet (75 keys)
+  tests/data/door-libc.txt: new since the base, nothing to hold yet (68 keys)
+  tests/data/door.txt: new since the base, nothing to hold yet (76 keys)
+  not held yet (its list is new since the base): tests/data/cost-entries.txt Reader::block_cache_identity 0 -> 1
+  not held yet (its list is new since the base): tests/data/cost-entries.txt Reader::piece_bounds 0 -> 1
+  not held yet (its list is new since the base): tests/data/couplings.txt src/bytes.rs path out of the encryption modules code 0 -> 3
+ratchet: green
+
+all checks passed: build test stride lint wasm bench lists
+EXIT 0

@@ -1,0 +1,4 @@
+
+=== machine ===
+machine: an Apple Silicon host's check, and this is Linux x86_64
+EXIT 2

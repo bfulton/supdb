@@ -142,9 +142,9 @@ bulk replacement broke tick-exact tests once; do it test by test. Planned for th
 
 ## What is left, in the owner's order
 
-### 1. The page layer (task 12). Stage G1's eight units have landed, with the lists' check, the count against upstream brought under, and upstream merged again; the closing gate and the critic are left, then G2.
+### 1. The page layer (task 12). Stage G1 is closed: eight units, the full gate green on `31b33339`, the critic's account in `scratch/plan/build/close/g1-built.md`. Five changes stand between it and G2, in the order below.
 
-**As of 22 Nov 09:39 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
+**As of 22 Nov 11:24 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
 launched one unit a launch: `Workflow {scriptPath, args: {base:
 "ea6352181f342b7bffd75ec8c88df92bc7b78ff6", only: ["G1-<n>"], tail: false, since: <note>}}`,
 the same base for every unit; after G1-8 a launch with `only: ["none"]` and no `tail: false`
@@ -581,11 +581,64 @@ holds; a note for a step changes no earlier prompt, so the steps before it repla
   heads' copy under a cipher (the docs say both from the code; owed to S5); the look that
   would copy the heads still asks the kernel for their ciphertext before it finds nothing
   to copy, where the compact form is on under a cipher (in `ROADMAP.md`).
-- **Next:** the closing launch (`only: ["none"]`): the full gate, the cost group against
-  upstream's head, and the critic, with the questions `scratch/plan/build/close/since.txt`
-  puts to it. Then what the critic and the open items above call for, each a change of its
-  own (the seal's source test lightened; the cost gate made able to fail against upstream,
-  task 20; the cipher flake, task 14), then G2 (`scratch/plan/g2.md`).
+- **The stage's closing gate and critic (22 Nov, on `31b33339`).** `sh scripts/check.sh`
+  green, every default group in one run (build test stride lint wasm bench lists); the
+  lists group against the stage's base green; the count against upstream's head `7c62153e`
+  with every probe's total under upstream (read -40 an operation, scan -382, merge -198,
+  land -337, the loads and commits -6 to -8) and no flagged function new beside the merge's
+  logs but one of 140 instructions over the seal probe's whole run
+  (`std::fs::OpenOptions::_open`, unexplained). The critic read the tree and the units'
+  notes and wrote `scratch/plan/build/close/g1-built.md`: what each gate holds, the red
+  input that showed it, and a way to write the barred thing that passes it. Read it before
+  touching a gate. What it found, by weight, and what each calls for:
+  1. **Three gates give no verdict on a pull request into the main line.** The cost group
+     exits red by function against any base (moves) and against the main line counts weeks
+     of upstream's work; the lists hold nothing against a base that predates them, which the
+     main line does until this branch lands; and `cross-arm` died in two parallel runs of
+     five with a crash inside QEMU ("QEMU internal SIGSEGV", never a test's failure; green
+     one thread at a time, 530 tests; green five of five at `19d078d1` with 519).
+  2. **The seal's source test trips on ordinary code.** Any `lent` or `lend` inside a macro
+     is red (the engine has `to.lent`), its exceptions and `SEAL_DECLS` lines are keyed by
+     exact text that rustfmt can rewrap, and any `.base(x)` call anywhere in `src` reads as
+     the seal's. Recommended: rename the seal's words to names nothing else uses, drop the
+     exceptions and read the word anywhere.
+  3. **`OrdIndex::whole_key_at` is probably a real cost a key in a merge** (+10.9
+     instructions an operation in the merge probe since T17): it reads `top()` and `head()`,
+     each with a cold arm that returns, where upstream read a field and asserted. Three
+     smaller gainers beside it are undecomposed.
+  4. **Three mechanisms do nothing under a cipher**, which the owner's rule does not allow
+     as a property: the stride form (declined at the build), the heads' copy (not made), the
+     quiet third merge (runs only where the compact form is installed). `README.md`'s
+     "every option a store in the clear runs with, a store under a cipher runs with" is true
+     of what is accepted and false of what acts. G2's conformance run needs the first two
+     fixed, or it lists them as seams.
+  5. **A whole borrow the seal does not see**: a new walk inside `src/blob.rs` over `flat()`,
+     `Sec::get` or `flat_lent`, or a new caller of `ZFile::stride_bytes`, compiles, passes
+     every gate and answers nothing under a cipher. G2's conformance pass is what holds it,
+     at run time.
+  6. Smaller: red inputs kept out of the tree run nowhere (G1-6's strace gate, G1-8's
+     `docs_red.py`, G1-4's two probes); the door's libc test reads cargo's registry and
+     fails offline; `compact_run` reads a directory word an input of every merge under a
+     cipher and throws it away; the ordered index's CRC skip keys on `piecewise` where
+     `Bytes::authenticated` now exists.
+  It found nothing wrong in the commits it read (the merge's two engine edits, the lists'
+  fix, the durable helpers' fix, the merge's bench test); it did not read the last repairs
+  of G1-1, G1-2, G1-3, T18, T17 and G1-5 line by line.
+- **Next, each a change of its own through `scratch/plan/build/change-v1.js`, in this
+  order:** (1) the seal's words renamed and its source test lightened; (2) the `cross-arm`
+  crash found and the test QEMU cannot run kept from the emulated run alone; (3) the cipher
+  test that fails now and then diagnosed (task 14); (4) `whole_key_at` and the three small
+  gainers decomposed and brought down, then a baseline of accepted moves the cost group
+  reads against a named base, so that its exit status means something (task 20); (5) the
+  stride form and the heads' copy made to work under a cipher by the piece, with tests, and
+  the docs' sentence made true. Then G2 (`scratch/plan/g2.md`), its plan first brought up
+  to this tree: the critic's section "For G2" lists what moved. Upstream is fetched by name
+  before each launch and merged if it is ahead.
+- **The owner's to decide, none of it blocking:** whether the lists should land on the
+  main line ahead of this branch so that a pull request is held by them (today they hold
+  pushes only); what the cost job's base is in CI before upstream itself is on the main
+  line (a named base in the baseline file is what will be built); whether the door's libc
+  test should keep reading cargo's registry.
   Every unit from here is launched with a build note: a CI job it adds is
   `sh scripts/check.sh <group>` with nothing in the YAML but event values, a list it adds is
   registered in `scripts/ratchet.py`, and a move between functions the cost group reads red is
