@@ -1,0 +1,5 @@
+binary /home/user/supdb/target/checked/deps/fuzz-b95676fc811c3756
+width 10ms: 0 red of 6
+width 100ms: 0 red of 6
+width 1000ms: 0 red of 6
+EXIT 0

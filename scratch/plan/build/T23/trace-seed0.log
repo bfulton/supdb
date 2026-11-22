@@ -1,0 +1,353 @@
+
+running 1 test
+ZTR 662734771 settle begin zbuild=true ask=0
+ZTR 662734783 settle end zbuild=true ask=0
+ZTR 662734846 zsettle begin zbuild=true ask=0
+ZTR 662757878 settle begin zbuild=false ask=1
+ZTR 662757892 settle end zbuild=false ask=1
+ZTR 662757913 ask taken n=1 settling=false
+ZTR 662757919 ask picks 0 of 2
+ZTR 662757923 ask seg=par-00000002-0000000000000467--633030313137.sup stride=true askable=true
+ZTR 662760458 settle begin zbuild=true ask=2
+ZTR 662761881 settle end zbuild=true ask=2
+ZTR 662762252 settle begin zbuild=true ask=2
+ZTR 662762259 settle end zbuild=true ask=2
+ZTR 662762267 collect convert seg=par-00000002-0000000000000467--633030313137.sup settling=false
+ZTR 662762434 counted out
+ZTR 662762592 ask taken n=3 settling=false
+ZTR 662762597 ask picks 0 of 2
+ZTR 662762601 ask seg=par-00000002-0000000000000467--633030313137.sup stride=false askable=true
+ZTR 662766702 collect convert seg=par-00000002-0000000000000467--633030313137.sup settling=false
+ZTR 662767199 counted in
+ZTR 662768441 settle begin zbuild=false ask=0
+ZTR 662778042 settle end zbuild=false ask=0
+ZTR 662780811 settle begin zbuild=true ask=0
+ZTR 662780820 settle end zbuild=true ask=0
+ZTR 662782824 settle begin zbuild=true ask=4
+ZTR 662783589 settle end zbuild=true ask=4
+ZTR 662783917 settle begin zbuild=true ask=4
+ZTR 662783923 settle end zbuild=true ask=4
+ZTR 662807529 settle begin zbuild=true ask=7
+ZTR 662807891 settle end zbuild=true ask=7
+ZTR 662808233 ask taken n=8 settling=false
+ZTR 662808238 ask picks 1 of 2
+ZTR 662808241 ask seg=par-00000039-0000000000000983-633030313137-.sup stride=true askable=true
+ZTR 662811191 settle begin zbuild=true ask=9
+ZTR 662818164 settle end zbuild=true ask=9
+ZTR 662818175 collect convert seg=par-00000039-0000000000000983-633030313137-.sup settling=false
+ZTR 662820095 settle begin zbuild=true ask=10
+ZTR 662820101 settle end zbuild=true ask=10
+ZTR 662821583 settle begin zbuild=true ask=11
+ZTR 662822975 settle end zbuild=true ask=11
+ZTR 662823885 settle begin zbuild=true ask=11
+ZTR 662823891 settle end zbuild=true ask=11
+ZTR 662824445 settle begin zbuild=true ask=12
+ZTR 662824453 settle end zbuild=true ask=12
+ZTR 662824461 ask taken n=12 settling=false
+ZTR 662824464 ask picks 1 of 2
+ZTR 662824467 ask seg=par-00000055-0000000000001219-633030313137-.sup stride=true askable=true
+ZTR 662825715 settle begin zbuild=true ask=13
+ZTR 662825724 settle end zbuild=true ask=13
+ZTR 662830253 collect convert seg=par-00000055-0000000000001219-633030313137-.sup settling=false
+ZTR 662833915 settle begin zbuild=true ask=14
+ZTR 662833924 settle end zbuild=true ask=14
+ZTR 662834006 settle begin zbuild=true ask=14
+ZTR 662834009 settle end zbuild=true ask=14
+ZTR 662843346 settle begin zbuild=true ask=17
+ZTR 662843596 settle end zbuild=true ask=17
+ZTR 662849861 settle begin zbuild=true ask=17
+ZTR 662850357 settle end zbuild=true ask=17
+ZTR 662850777 ask taken n=18 settling=false
+ZTR 662850783 ask picks 1 of 2
+ZTR 662850786 ask seg=par-00000079-0000000000002133-633030313137-.sup stride=true askable=true
+ZTR 662850814 settle begin zbuild=true ask=0
+ZTR 662850818 settle end zbuild=true ask=0
+ZTR 662853553 settle begin zbuild=true ask=0
+ZTR 662865062 settle end zbuild=true ask=0
+ZTR 662865145 collect convert seg=par-00000079-0000000000002133-633030313137-.sup settling=false
+ZTR 662869095 settle begin zbuild=true ask=19
+ZTR 662870725 settle end zbuild=true ask=19
+ZTR 662879469 settle begin zbuild=true ask=20
+ZTR 662879476 settle end zbuild=true ask=20
+ZTR 662879620 settle begin zbuild=true ask=20
+ZTR 662879623 settle end zbuild=true ask=20
+ZTR 662879762 settle begin zbuild=true ask=21
+ZTR 662879766 settle end zbuild=true ask=21
+ZTR 662885901 settle begin zbuild=true ask=21
+ZTR 662887768 settle end zbuild=true ask=21
+ZTR 662888277 settle begin zbuild=true ask=21
+ZTR 662888282 settle end zbuild=true ask=21
+ZTR 662890597 settle begin zbuild=true ask=23
+ZTR 662892121 settle end zbuild=true ask=23
+ZTR 662892570 settle begin zbuild=true ask=23
+ZTR 662892575 settle end zbuild=true ask=23
+ZTR 662892722 settle begin zbuild=true ask=23
+ZTR 662892725 settle end zbuild=true ask=23
+ZTR 662892735 ask taken n=23 settling=false
+ZTR 662892739 ask picks 0 of 2
+ZTR 662892742 ask seg=par-00000114-0000000000002723--633030313137.sup stride=true askable=true
+ZTR 662892783 settle begin zbuild=true ask=0
+ZTR 662892786 settle end zbuild=true ask=0
+ZTR 662898152 collect convert seg=par-00000114-0000000000002723--633030313137.sup settling=false
+ZTR 662901921 settle begin zbuild=true ask=25
+ZTR 662902434 settle end zbuild=true ask=25
+ZTR 662903012 settle begin zbuild=true ask=26
+ZTR 662903017 settle end zbuild=true ask=26
+ZTR 662903267 settle begin zbuild=true ask=26
+ZTR 662903272 settle end zbuild=true ask=26
+ZTR 662903299 settle begin zbuild=true ask=26
+ZTR 662903302 settle end zbuild=true ask=26
+ZTR 662904464 settle begin zbuild=true ask=27
+ZTR 662904470 settle end zbuild=true ask=27
+ZTR 662904912 settle begin zbuild=true ask=27
+ZTR 662904917 settle end zbuild=true ask=27
+ZTR 662906060 ask taken n=28 settling=false
+ZTR 662906068 ask picks 1 of 2
+ZTR 662906071 ask seg=par-00000129-0000000000003136-633030313137-.sup stride=true askable=true
+ZTR 662916674 collect convert seg=par-00000129-0000000000003136-633030313137-.sup settling=false
+ZTR 662926036 settle begin zbuild=true ask=29
+ZTR 662928355 settle end zbuild=true ask=29
+ZTR 662928681 settle begin zbuild=true ask=29
+ZTR 662928686 settle end zbuild=true ask=29
+ZTR 662936315 settle begin zbuild=true ask=30
+ZTR 662936323 settle end zbuild=true ask=30
+ZTR 662940214 settle begin zbuild=true ask=32
+ZTR 662940222 settle end zbuild=true ask=32
+ZTR 662940779 settle begin zbuild=true ask=32
+ZTR 662940792 settle end zbuild=true ask=32
+ZTR 662940797 ask taken n=32 settling=false
+ZTR 662940801 ask picks 1 of 2
+ZTR 662940804 ask seg=par-00000167-0000000000003728-633030313137-.sup stride=true askable=true
+ZTR 662940919 settle begin zbuild=true ask=0
+ZTR 662940924 settle end zbuild=true ask=0
+ZTR 662945714 collect convert seg=par-00000167-0000000000003728-633030313137-.sup settling=false
+ZTR 662948806 settle begin zbuild=true ask=33
+ZTR 662948812 settle end zbuild=true ask=33
+ZTR 662950727 settle begin zbuild=true ask=34
+ZTR 662951317 settle end zbuild=true ask=34
+ZTR 662951777 settle begin zbuild=true ask=35
+ZTR 662955318 settle end zbuild=true ask=35
+ZTR 662955972 ask taken n=35 settling=false
+ZTR 662955979 ask picks 0 of 2
+ZTR 662955983 ask seg=par-00000180-0000000000004039--633030313137.sup stride=true askable=true
+ZTR 662956859 settle begin zbuild=true ask=0
+ZTR 662956865 settle end zbuild=true ask=0
+ZTR 662956902 settle begin zbuild=true ask=0
+ZTR 662956906 settle end zbuild=true ask=0
+ZTR 662956964 settle begin zbuild=true ask=0
+ZTR 662956968 settle end zbuild=true ask=0
+ZTR 662957428 collect convert seg=par-00000180-0000000000004039--633030313137.sup settling=false
+ZTR 662957614 counted out
+ZTR 662957670 ask taken n=37 settling=false
+ZTR 662957676 ask picks 0 of 2
+ZTR 662957679 ask seg=par-00000180-0000000000004039--633030313137.sup stride=false askable=true
+ZTR 662957739 settle begin zbuild=true ask=0
+ZTR 662969295 settle end zbuild=true ask=0
+ZTR 662969314 collect convert seg=par-00000180-0000000000004039--633030313137.sup settling=false
+ZTR 662987189 settle begin zbuild=true ask=39
+ZTR 662987198 settle end zbuild=true ask=39
+ZTR 662987397 settle begin zbuild=true ask=39
+ZTR 662987401 settle end zbuild=true ask=39
+ZTR 662987451 settle begin zbuild=true ask=40
+ZTR 662987456 settle end zbuild=true ask=40
+ZTR 662989369 settle begin zbuild=true ask=41
+ZTR 662990878 settle end zbuild=true ask=41
+ZTR 662991719 settle begin zbuild=true ask=42
+ZTR 662991726 settle end zbuild=true ask=42
+ZTR 662991741 settle begin zbuild=true ask=42
+ZTR 662991744 settle end zbuild=true ask=42
+ZTR 662991955 settle begin zbuild=true ask=42
+ZTR 662991960 settle end zbuild=true ask=42
+ZTR 662991988 settle begin zbuild=true ask=42
+ZTR 662991991 settle end zbuild=true ask=42
+ZTR 662992246 settle begin zbuild=true ask=43
+ZTR 662992250 settle end zbuild=true ask=43
+ZTR 662993089 settle begin zbuild=true ask=44
+ZTR 662993096 settle end zbuild=true ask=44
+ZTR 662999008 ask taken n=45 settling=false
+ZTR 662999084 ask dropped: none served
+ZTR 662999110 settle begin zbuild=false ask=0
+ZTR 663002408 settle end zbuild=false ask=0
+ZTR 663005447 settle begin zbuild=true ask=46
+ZTR 663005455 settle end zbuild=true ask=46
+ZTR 663005614 settle begin zbuild=true ask=46
+ZTR 663005619 settle end zbuild=true ask=46
+ZTR 663005642 settle begin zbuild=true ask=46
+ZTR 663005645 settle end zbuild=true ask=46
+ZTR 663005703 settle begin zbuild=true ask=46
+ZTR 663005708 settle end zbuild=true ask=46
+ZTR 663005735 settle begin zbuild=true ask=46
+ZTR 663005739 settle end zbuild=true ask=46
+ZTR 663005760 settle begin zbuild=true ask=47
+ZTR 663005763 settle end zbuild=true ask=47
+ZTR 663005774 settle begin zbuild=true ask=47
+ZTR 663005777 settle end zbuild=true ask=47
+ZTR 663008176 settle begin zbuild=true ask=48
+ZTR 663008875 settle end zbuild=true ask=48
+ZTR 663026324 settle begin zbuild=true ask=50
+ZTR 663026334 settle end zbuild=true ask=50
+ZTR 663026360 settle begin zbuild=true ask=50
+ZTR 663026363 settle end zbuild=true ask=50
+ZTR 663026554 settle begin zbuild=true ask=50
+ZTR 663026559 settle end zbuild=true ask=50
+ZTR 663026573 settle begin zbuild=true ask=50
+ZTR 663026576 settle end zbuild=true ask=50
+ZTR 663041372 settle begin zbuild=true ask=52
+ZTR 663042593 settle end zbuild=true ask=52
+ZTR 663043190 settle begin zbuild=true ask=52
+ZTR 663043198 settle end zbuild=true ask=52
+ZTR 663043296 settle begin zbuild=true ask=53
+ZTR 663043301 settle end zbuild=true ask=53
+ZTR 663043367 settle begin zbuild=true ask=53
+ZTR 663043371 settle end zbuild=true ask=53
+ZTR 663043623 settle begin zbuild=true ask=53
+ZTR 663043628 settle end zbuild=true ask=53
+ZTR 663044421 ask taken n=54 settling=false
+ZTR 663044428 ask picks 1 of 2
+ZTR 663044433 ask seg=par-00000283-0000000000006186-633030313137-.sup stride=true askable=true
+ZTR 663044600 settle begin zbuild=true ask=0
+ZTR 663044605 settle end zbuild=true ask=0
+ZTR 663044884 settle begin zbuild=true ask=0
+ZTR 663044889 settle end zbuild=true ask=0
+ZTR 663045171 settle begin zbuild=true ask=55
+ZTR 663045175 settle end zbuild=true ask=55
+ZTR 663046083 collect convert seg=par-00000283-0000000000006186-633030313137-.sup settling=false
+ZTR 663046207 counted out
+ZTR 663046313 ask taken n=55 settling=false
+ZTR 663046318 ask picks 0 of 2
+ZTR 663046322 ask seg=par-00000282-0000000000006186--633030313137.sup stride=true askable=true
+ZTR 663047559 settle begin zbuild=true ask=56
+ZTR 663054007 settle end zbuild=true ask=56
+ZTR 663054438 collect convert seg=par-00000282-0000000000006186--633030313137.sup settling=false
+ZTR 663062743 settle begin zbuild=true ask=56
+ZTR 663062754 settle end zbuild=true ask=56
+ZTR 663062919 settle begin zbuild=true ask=56
+ZTR 663062924 settle end zbuild=true ask=56
+ZTR 663074209 settle begin zbuild=true ask=57
+ZTR 663074220 settle end zbuild=true ask=57
+ZTR 663074244 settle begin zbuild=true ask=57
+ZTR 663074248 settle end zbuild=true ask=57
+ZTR 663074403 settle begin zbuild=true ask=57
+ZTR 663074407 settle end zbuild=true ask=57
+ZTR 663074428 settle begin zbuild=true ask=58
+ZTR 663074431 settle end zbuild=true ask=58
+ZTR 663088708 settle begin zbuild=true ask=60
+ZTR 663091269 settle end zbuild=true ask=60
+ZTR 663092128 settle begin zbuild=true ask=60
+ZTR 663092136 settle end zbuild=true ask=60
+ZTR 663092153 settle begin zbuild=true ask=60
+ZTR 663092155 settle end zbuild=true ask=60
+ZTR 663092176 settle begin zbuild=true ask=61
+ZTR 663092179 settle end zbuild=true ask=61
+ZTR 663092743 settle begin zbuild=true ask=61
+ZTR 663092751 settle end zbuild=true ask=61
+ZTR 663093817 settle begin zbuild=true ask=61
+ZTR 663098627 settle end zbuild=true ask=61
+ZTR 663109492 settle begin zbuild=true ask=62
+ZTR 663110178 settle end zbuild=true ask=62
+ZTR 663116151 settle begin zbuild=true ask=62
+ZTR 663116162 settle end zbuild=true ask=62
+ZTR 663116329 settle begin zbuild=true ask=62
+ZTR 663116334 settle end zbuild=true ask=62
+ZTR 663122401 settle begin zbuild=true ask=62
+ZTR 663122411 settle end zbuild=true ask=62
+ZTR 663122620 settle begin zbuild=true ask=63
+ZTR 663122625 settle end zbuild=true ask=63
+ZTR 663122649 settle begin zbuild=true ask=63
+ZTR 663122653 settle end zbuild=true ask=63
+ZTR 663122967 settle begin zbuild=true ask=65
+ZTR 663122974 settle end zbuild=true ask=65
+ZTR 663122996 settle begin zbuild=true ask=65
+ZTR 663122999 settle end zbuild=true ask=65
+ZTR 663125428 settle begin zbuild=true ask=66
+ZTR 663125436 settle end zbuild=true ask=66
+ZTR 663125955 settle begin zbuild=true ask=66
+ZTR 663125965 settle end zbuild=true ask=66
+ZTR 663126248 settle begin zbuild=true ask=66
+ZTR 663130050 settle end zbuild=true ask=66
+ZTR 663130635 settle begin zbuild=true ask=68
+ZTR 663130643 settle end zbuild=true ask=68
+ZTR 663131360 settle begin zbuild=true ask=68
+ZTR 663131368 settle end zbuild=true ask=68
+ZTR 663131418 settle begin zbuild=true ask=68
+ZTR 663131423 settle end zbuild=true ask=68
+ZTR 663131829 settle begin zbuild=true ask=69
+ZTR 663131836 settle end zbuild=true ask=69
+ZTR 663132309 ask taken n=70 settling=false
+ZTR 663132315 ask picks 1 of 2
+ZTR 663132319 ask seg=par-00000387-0000000000007340-633030313137-.sup stride=true askable=true
+ZTR 663132407 settle begin zbuild=true ask=0
+ZTR 663134189 settle end zbuild=true ask=0
+ZTR 663134402 settle begin zbuild=true ask=0
+ZTR 663134409 settle end zbuild=true ask=0
+ZTR 663134795 settle begin zbuild=true ask=0
+ZTR 663139553 settle end zbuild=true ask=0
+ZTR 663139675 collect convert seg=par-00000387-0000000000007340-633030313137-.sup settling=false
+ZTR 663142398 settle begin zbuild=true ask=0
+ZTR 663142408 settle end zbuild=true ask=0
+ZTR 663142593 settle begin zbuild=true ask=0
+ZTR 663142597 settle end zbuild=true ask=0
+ZTR 663143351 settle begin zbuild=true ask=71
+ZTR 663143358 settle end zbuild=true ask=71
+ZTR 663143848 settle begin zbuild=true ask=72
+ZTR 663143854 settle end zbuild=true ask=72
+ZTR 663144044 settle begin zbuild=true ask=72
+ZTR 663144049 settle end zbuild=true ask=72
+ZTR 663146156 settle begin zbuild=true ask=73
+ZTR 663147467 settle end zbuild=true ask=73
+ZTR 663147696 settle begin zbuild=true ask=74
+ZTR 663147704 settle end zbuild=true ask=74
+ZTR 663147798 settle begin zbuild=true ask=74
+ZTR 663147803 settle end zbuild=true ask=74
+ZTR 663147822 settle begin zbuild=true ask=74
+ZTR 663147825 settle end zbuild=true ask=74
+ZTR 663148405 settle begin zbuild=true ask=75
+ZTR 663150073 settle end zbuild=true ask=75
+ZTR 663150262 settle begin zbuild=true ask=75
+ZTR 663150269 settle end zbuild=true ask=75
+ZTR 663150280 ask taken n=75 settling=false
+ZTR 663150285 ask picks 0 of 2
+ZTR 663150289 ask seg=par-00000400-0000000000008191--633030313137.sup stride=true askable=true
+ZTR 663151294 settle begin zbuild=true ask=0
+ZTR 663151303 settle end zbuild=true ask=0
+ZTR 663156243 collect convert seg=par-00000400-0000000000008191--633030313137.sup settling=false
+ZTR 663158744 settle begin zbuild=true ask=76
+ZTR 663158755 settle end zbuild=true ask=76
+ZTR 663159197 settle begin zbuild=true ask=76
+ZTR 663159204 settle end zbuild=true ask=76
+ZTR 663159241 TEST seed 0 before read: in 1 out 3
+ZTR 663159246 TEST seed 0 asked 0
+ZTR 663159283 settle begin zbuild=true ask=1
+ZTR 663159287 settle end zbuild=true ask=1
+ZTR 663159297 zsettle begin zbuild=true ask=1
+ZTR 663190612 ask taken n=1 settling=true
+ZTR 663190636 ask picks 0 of 2
+ZTR 663190640 ask seg=par-00000414-0000000000008819--633030313137.sup stride=true askable=true
+ZTR 663201964 collect convert seg=par-00000414-0000000000008819--633030313137.sup settling=true
+ZTR 663202204 counted out
+ZTR 663202771 TEST seed 0 zsettled
+ZTR 663202781 TEST seed 0 asked 0
+ZTR 663202797 settle begin zbuild=false ask=1
+ZTR 663202802 settle end zbuild=false ask=1
+ZTR 663202811 ask taken n=1 settling=false
+ZTR 663202815 ask picks 0 of 2
+ZTR 663202819 ask seg=par-00000414-0000000000008819--633030313137.sup stride=false askable=true
+ZTR 663202903 zsettle begin zbuild=true ask=0
+ZTR 663214000 collect convert seg=par-00000414-0000000000008819--633030313137.sup settling=true
+ZTR 663214173 counted in
+ZTR 663214634 TEST seed 0 zsettled
+ZTR 663214644 TEST seed 0 asked 0
+ZTR 663214660 settle begin zbuild=false ask=1
+ZTR 663214674 settle end zbuild=false ask=1
+ZTR 663214688 zsettle begin zbuild=false ask=1
+ZTR 663214693 ask taken n=1 settling=true
+ZTR 663214697 ask picks 0 of 2
+ZTR 663214701 ask seg=par-00000414-0000000000008819--633030313137.sup stride=true askable=true
+ZTR 663225907 collect convert seg=par-00000414-0000000000008819--633030313137.sup settling=true
+ZTR 663226136 counted out
+ZTR 663226603 TEST seed 0 zsettled
+concurrent seed 0: reads 1963312, heads owned 0 given back 0, stride files 1 builds 35 reads 529356, moved in 2 out 5
+test concurrent_range ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.57s
+

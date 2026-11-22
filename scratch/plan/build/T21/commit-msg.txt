@@ -1,0 +1,68 @@
+The seal's words are names nothing else in the tree uses, and its source check holds each by file and scope wherever it stands
+
+The seal's text half (tests/source.rs) refused `lent` and `lend` inside any
+macro's tokens, keyed its declarations and macro exceptions by a line's exact
+text, and read any `.base(x)` in src as the seal's. Its words are renamed to
+identifiers that appear nowhere else: MmapBytes::lent is lend_whole_map, the
+three token modules `lend` are lend_seal, the readers' trait's module
+bytes::whole is whole_map_readers, Paging::base is base_address and
+bytes::Base is BaseAddressToken (Bytes::lend_at and the three re-exports were
+unique already and stay). `lent`, `lend`, `base` and `whole` are ordinary
+words again.
+
+The check reads every seal word as an identifier on the lexer's flat text,
+macros included, with no rule for macros: a word is a call at a listed file
+and scope (non-test code, the token's constructor inside the call's own
+parentheses, one token a call), a declaration at a listed file and item, a
+`use` that binds a listed name with no group or glob, or a listed impl head.
+Sites are named by file and scope, never by a line's text; the token modules'
+shapes are compared as items, whitespace aside. The failure message says what
+its author is to do: a reader that holds a mapped file or a section whole
+answers nothing under a cipher without an arm by the piece, where the list of
+sites is, and that anything else asks with slice_at.
+
+Red first: a new test of ordinary code and rewrapped listed lines (a
+signature split, a declaration grown, a call rewrapped, the engine's own words
+in a debug_assert, another type's base, a test's local) failed on the old
+check, every case refused; green after. Every red case of the two tests of
+ways round the seal is kept under the new names, with cases added: a public
+field or second function on a token module, zeroed and transmuted tokens at a
+listed call, a token bound to a local in a listed scope and spent later, a
+function value at a listed scope, groups in a use, a listed scope's name taken
+by test code, an associated const in Paging, the help's words. Review rounds
+added item spans at declaration sites, one definition a listed scope, and the
+token taken from the call's own row, each shown red before. scripts/seal-red.sh
+and seal-red-red.sh, the compile-fail doctests, couplings.txt's reason text and
+CLAUDE.md's paragraph follow the names.
+
+Held by the unit gate (build, test, stride, lint with the door and both seal
+scripts), the lists against the commit this began at, and wasm at the base's
+size to the byte. The src diff is the renames alone, compared with comments
+and whitespace stripped.
+
+A store in the clear pays nothing: scripts/cost.sh against the commit this
+began at over read, scan, read_z, scan_z, land and seal reads green, no engine
+function moved in any probe (libc, the allocator and join_seal within their
+bounds), and no renamed function reads as gone or new. Nothing changes under a
+cipher.
+
+Mutants: a seal word left out of the list, a scope removed, sites keyed by file
+alone, the constructor-at-its-call rule dropped, the readers' trait given to
+every type, and own ones on the new lines (a use's bound name, a use's group,
+a call in test code at a listed scope's name, a call word with no parentheses,
+a constructor at a declaration, the help left off, the module's shape, a home
+row of any call word, the token from the last seal word): each killed by a
+named case.
+
+Left open: a closure in a listed scope taken as a function value passes, as it
+passed the old check (a nested fn is refused); a name a macro builds from
+pieces and code from outside a listed file are not read; a listed scope's name
+reused by a second non-test function in its home file reads as listed; the seal
+section is longer than before, since the call-span parse, the use and impl
+rules and the declaration table replace the exact text the old check compared,
+and the red tests grew. The stride group's concurrent fuzz range met a
+convert-steer race once during this work (a form build in flight is not joined
+by settle), unrelated to this change and tracked on its own.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GEwcALZsCzTm28PHd4bQza

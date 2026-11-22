@@ -1,0 +1,56 @@
+   Compiling supdb v0.1.0 (/home/user/supdb)
+    Finished `checked` profile [optimized + debuginfo] target(s) in 10.66s
+     Running tests/source.rs (target/checked/deps/source-85d81eb29cea0fb9)
+
+running 4 tests
+test the_seals_tokens_are_made_only_where_they_are_spent ... ok
+test the_seal_leaves_ordinary_code_alone ... ok
+test a_seals_token_spelled_another_way_fails ... ok
+test a_seals_token_made_another_way_fails ... FAILED
+
+failures:
+
+---- a_seals_token_made_another_way_fails stdout ----
+
+thread 'a_seals_token_made_another_way_fails' (16646) panicked at tests/source.rs:6775:9:
+wanted `src/ordindex.rs (OrdIndex::over)` in:
+src/db/zfile.rs (ZFile::attach_stride): `let bytes: &[u8] = map.lend_whole_map(lend_seal::Token::new());` calls `lend_whole_map` with no token made in its parentheses as `BaseAddressToken(())`
+src/db/zfile.rs (ZFile::stride_bytes): `self.map.lend_whole_map(lend_seal::Token::new())` calls `lend_whole_map` with no token made in its parentheses as `BaseAddressToken(())`
+src/db/zfile.rs (check_stride): `let bytes: &[u8] = map.lend_whole_map(lend_seal::Token::new());` calls `lend_whole_map` with no token made in its parentheses as `BaseAddressToken(())`
+src/db/zfile.rs (file_facts): `let (t, lay) = StrideBody::open(map.lend_whole_map(lend_seal::Token::new())).ok()?;` calls `lend_whole_map` with no token made in its parentheses as `BaseAddressToken(())`
+src/ordindex.rs (OrdIndex::mapped_heads): `.lend_whole_map(lend_seal::Token::new())` calls `lend_whole_map` with no token made in its parentheses as `BaseAddressToken(())`
+A line above names a word of the seal outside the sites that may. A reader that holds a mapped file or a section whole answers nothing under a cipher unless it has an arm by the piece (forms.md R2; CLAUDE.md, the paragraph on the seal): such a reader is a scope added to SEAL_CALLS in tests/source.rs, in review. Anything else asks the source for its bytes with `slice_at`, which every kind of source answers.
+wanted `calls `lend_whole_map` with no token made in its parentheses as `lend_seal::Token::new()`` in:
+src/db/zfile.rs (ZFile::attach_stride): `let bytes: &[u8] = map.lend_whole_map(lend_seal::Token::new());` calls `lend_whole_map` with no token made in its parentheses as `BaseAddressToken(())`
+src/db/zfile.rs (ZFile::stride_bytes): `self.map.lend_whole_map(lend_seal::Token::new())` calls `lend_whole_map` with no token made in its parentheses as `BaseAddressToken(())`
+src/db/zfile.rs (check_stride): `let bytes: &[u8] = map.lend_whole_map(lend_seal::Token::new());` calls `lend_whole_map` with no token made in its parentheses as `BaseAddressToken(())`
+src/db/zfile.rs (file_facts): `let (t, lay) = StrideBody::open(map.lend_whole_map(lend_seal::Token::new())).ok()?;` calls `lend_whole_map` with no token made in its parentheses as `BaseAddressToken(())`
+src/ordindex.rs (OrdIndex::mapped_heads): `.lend_whole_map(lend_seal::Token::new())` calls `lend_whole_map` with no token made in its parentheses as `BaseAddressToken(())`
+A line above names a word of the seal outside the sites that may. A reader that holds a mapped file or a section whole answers nothing under a cipher unless it has an arm by the piece (forms.md R2; CLAUDE.md, the paragraph on the seal): such a reader is a scope added to SEAL_CALLS in tests/source.rs, in review. Anything else asks the source for its bytes with `slice_at`, which every kind of source answers.
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/panicking.rs:80:14
+   2: core::panicking::panic_display::<alloc::string::String>
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/panicking.rs:259:5
+   3: <source::SealReds>::done
+             at ./tests/source.rs:6775:9
+   4: source::a_seals_token_made_another_way_fails
+             at ./tests/source.rs:7112:7
+   5: source::a_seals_token_made_another_way_fails::{closure#0}
+             at ./tests/source.rs:6782:42
+   6: <source::a_seals_token_made_another_way_fails::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    a_seals_token_made_another_way_fails
+
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 75 filtered out; finished in 16.72s
+
+error: test failed, to rerun pass `--test source`
+EXIT 101

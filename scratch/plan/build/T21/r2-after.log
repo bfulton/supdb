@@ -1,0 +1,13 @@
+   Compiling supdb v0.1.0 (/home/user/supdb)
+    Finished `checked` profile [optimized + debuginfo] target(s) in 8.81s
+     Running tests/source.rs (target/checked/deps/source-85d81eb29cea0fb9)
+
+running 4 tests
+test the_seals_tokens_are_made_only_where_they_are_spent ... ok
+test the_seal_leaves_ordinary_code_alone ... ok
+test a_seals_token_spelled_another_way_fails ... ok
+test a_seals_token_made_another_way_fails ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 75 filtered out; finished in 16.88s
+
+EXIT 0

@@ -1,0 +1,40 @@
+test src/lib.rs - (line 94) - compile fail ... ok
+test src/lib.rs - (line 89) - compile fail ... ok
+
+test result: ok. 16 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+    Finished `checked` profile [optimized + debuginfo] target(s) in 0.02s
+     Running tests/fuzz.rs (target/checked/deps/fuzz-b95676fc811c3756)
+
+running 1 test
+test fuzz_range ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 9.59s
+
+    Finished `checked` profile [optimized + debuginfo] target(s) in 0.02s
+     Running tests/fuzz.rs (target/checked/deps/fuzz-b95676fc811c3756)
+
+running 1 test
+test concurrent_range ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 4.45s
+
+    Finished `checked` profile [optimized + debuginfo] target(s) in 0.01s
+     Running tests/fuzz.rs (target/checked/deps/fuzz-b95676fc811c3756)
+
+running 1 test
+test fuzz_range ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 12.44s
+
+    Finished `checked` profile [optimized + debuginfo] target(s) in 0.02s
+     Running tests/fuzz.rs (target/checked/deps/fuzz-b95676fc811c3756)
+
+running 1 test
+test concurrent_range ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 6.48s
+
+
+all checks passed: stride
+EXIT 0

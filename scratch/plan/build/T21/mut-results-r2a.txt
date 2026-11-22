@@ -1,0 +1,35 @@
+X7 the defs count's `>{next}` arm dropped: SURVIVED (exit 0) 
+X8 `made.len() != 1` made `made.is_empty()`: SURVIVED (exit 0) 
+DONE mid
+X9 the item spans' impl arm stops at `{` only: KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED
+X9b the impl heads stop at `{` only: KILLED (exit 101) test the_seal_leaves_ordinary_code_alone ... FAILED
+X10 the `struct ` exemption dropped: KILLED (exit 101) test the_seals_tokens_are_made_only_where_they_are_spent ... FAILED; test a_seals_token_made_another_way_fails ... FAILED; test the_seal_leaves_ordinary_code_alone ... FAILED
+R1 seal_until counts parentheses only: SURVIVED (exit 0) 
+R2 the token taken from the word's first row, not its home row: KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED
+R2b the token taken from the word's last row: SURVIVED (exit 0) 
+R3 the address token's attributes: any `#[cfg(` taken: KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED
+R4 a declaration's word held by its line containing `use `/`impl `: KILLED (exit 101) test the_seals_tokens_are_made_only_where_they_are_spent ... FAILED; test a_seals_token_made_another_way_fails ... FAILED; test the_seal_leaves_ordinary_code_alone ... FAILED
+O1 (own) a call's home row of any call word: KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED
+O2 (own) the token read from the last word of the seal inside the call: SURVIVED (exit 0) 
+X6 (review) a closure in a listed scope (probe: SURVIVED means the check passes it): SURVIVED (exit 0) 
+M1 a word left out of SEAL_WORDS (OrdLendToken): KILLED (exit 101) test a_seals_token_spelled_another_way_fails ... FAILED; test a_seals_token_made_another_way_fails ... FAILED
+M2 a scope removed from the allowed sites (Sec::get): KILLED (exit 101) test the_seals_tokens_are_made_only_where_they_are_spent ... FAILED; test a_seals_token_made_another_way_fails ... FAILED; test the_seal_leaves_ordinary_code_alone ... FAILED
+M3 the allowed sites keyed by file alone: KILLED (exit 101) test a_seals_token_spelled_another_way_fails ... FAILED; test a_seals_token_made_another_way_fails ... FAILED
+M3b the declarations keyed by file alone: KILLED (exit 101) test a_seals_token_spelled_another_way_fails ... FAILED; test a_seals_token_made_another_way_fails ... FAILED
+M4 the constructor's at-its-call rule dropped: KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED
+M5 the readers' trait given to every type (the impl check takes any header): KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED
+M6 (own r0) a use's bound name not held: KILLED (exit 101) test a_seals_token_spelled_another_way_fails ... FAILED
+M7 (own r0) a use's group not refused: KILLED (exit 101) test a_seals_token_spelled_another_way_fails ... FAILED
+M9 (own r0) a call word with no parentheses let through: KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED
+M11 (own r0) the help left off the failure: KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED
+M12 (own r0) the token module's shape not held: KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED
+E3 (r1) a definition of a call word let through anywhere: KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED
+E4 (r1) the token compared without trimming its trailing comma: KILLED (exit 101) test the_seal_leaves_ordinary_code_alone ... FAILED
+N1 (r1) a declaration's word let stand outside its use, impl or signature: KILLED (exit 101) test the_seals_tokens_are_made_only_where_they_are_spent ... FAILED; test a_seals_token_made_another_way_fails ... FAILED; test the_seal_leaves_ordinary_code_alone ... FAILED
+N2 (r1) a listed scope's definitions not counted: KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED
+N3 (r1) a use is no item a declaration may name a word in: KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED; test the_seals_tokens_are_made_only_where_they_are_spent ... FAILED; test the_seal_leaves_ordinary_code_alone ... FAILED
+N4 (r1) any fn's signature, not only a call's, is such an item: KILLED (exit 101) test a_seals_token_spelled_another_way_fails ... FAILED; test a_seals_token_made_another_way_fails ... FAILED
+N5 (r1) a module or struct scope not taken as held whole: KILLED (exit 101) test the_seals_tokens_are_made_only_where_they_are_spent ... FAILED; test a_seals_token_made_another_way_fails ... FAILED; test the_seal_leaves_ordinary_code_alone ... FAILED
+N1b (r1) a declaration's word let stand anywhere in its scope: KILLED (exit 101) test a_seals_token_spelled_another_way_fails ... FAILED; test a_seals_token_made_another_way_fails ... FAILED
+O3 (own) a test line at a home row let through: KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED
+DONE final

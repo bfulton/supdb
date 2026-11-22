@@ -1,0 +1,14 @@
+M1 a word left out of SEAL_WORDS (OrdLendToken): KILLED (exit 101) test a_seals_token_spelled_another_way_fails ... FAILED
+M2 a scope removed from the allowed sites (Sec::get): KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED; test the_seals_tokens_are_made_only_where_they_are_spent ... FAILED; test the_seal_leaves_ordinary_code_alone ... FAILED
+M3 the allowed sites keyed by file alone: KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED; test a_seals_token_spelled_another_way_fails ... FAILED
+M3b the declarations keyed by file alone: KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED; test a_seals_token_spelled_another_way_fails ... FAILED
+M4 the constructor's at-its-call rule dropped: KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED
+M5 the readers' trait given to every type (the impl check takes any header): KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED
+M6 (own) a use's bound name not held: KILLED (exit 101) test a_seals_token_spelled_another_way_fails ... FAILED
+M7 (own) a use's group not refused: KILLED (exit 101) test a_seals_token_spelled_another_way_fails ... FAILED
+M8 (own) a call in test code at a listed scope's name: KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED
+M9 (own) a call word with no parentheses let through: KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED
+M10 (own) a constructor at a declaration let through: KILLED (exit 101) test a_seals_token_spelled_another_way_fails ... FAILED
+M11 (own) the help left off the failure: KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED
+M12 (own) the token module's shape not held: KILLED (exit 101) test a_seals_token_made_another_way_fails ... FAILED
+DONE

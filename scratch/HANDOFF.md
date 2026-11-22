@@ -155,7 +155,7 @@ bulk replacement broke tick-exact tests once; do it test by test. Planned for th
 
 ## What is left, in the owner's order
 
-### 1. The page layer (task 12). Stage G1 is closed: eight units, the full gate green on `31b33339`, the critic's account in `scratch/plan/build/close/g1-built.md`. Five changes stand between it and G2, in the order below.
+### 1. The page layer (task 12). Stage G1 is closed: eight units, the full gate green on `31b33339`, the critic's account in `scratch/plan/build/close/g1-built.md`. Of five changes that stood between it and G2 the first is done (the seal's names, `89da086f`); four are left, in the order below.
 
 **As of 22 Nov 11:24 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
 launched one unit a launch: `Workflow {scriptPath, args: {base:
@@ -637,8 +637,39 @@ holds; a note for a step changes no earlier prompt, so the steps before it repla
   It found nothing wrong in the commits it read (the merge's two engine edits, the lists'
   fix, the durable helpers' fix, the merge's bench test); it did not read the last repairs
   of G1-1, G1-2, G1-3, T18, T17 and G1-5 line by line.
+- **The seal's words renamed, its source test rebuilt: `89da086f` (change T21, 22 Nov).**
+  The critic's second finding. `MmapBytes::lent` is `lend_whole_map`, the three token modules
+  `lend` are `lend_seal`, the readers' trait's module `bytes::whole` is `whole_map_readers`,
+  `Paging::base` is `base_address` and `bytes::Base` is `BaseAddressToken`; `Bytes::lend_at`
+  and the three re-exports (`LendToken`, `OrdLendToken`, `StrideLendToken`) were unique
+  already and stay. `lent`, `lend`, `base` and `whole` are ordinary words again. The check
+  reads every seal word as an identifier wherever it stands, macros included with no rule
+  for them, at sites named by file and scope and never by a line's text; a new test of
+  ordinary code and rewrapped listed lines was red on the old check and is green. Two review
+  rounds found ways through the first rebuild (a top-level line at a declaration row, a type
+  alias hand-out, a token taken from another call's row), each closed with a red case first.
+  No engine behaviour changed: the src diff is the renames alone (compared with comments and
+  whitespace stripped), the count against `60921870` over six probes is green with no engine
+  function moved, the wasm module is the base's size to the byte. The check and its helpers
+  went from 552 lines to 457; the seal's whole section of `tests/source.rs` grew, 970 lines
+  to about 1,280 (the file 7,133 to 7,441), because the red and green cases grew: the
+  critic expected two hundred lines fewer and that was not reached. Left open, in the
+  commit's words: a closure in a listed scope taken as a function value passes (it passed
+  the old check); a second non-test function with a listed scope's name in its home file
+  reads as listed; a name a macro builds from pieces is not read. Records:
+  `scratch/plan/build/T21/`.
+- **A flake of the stride group found in that change's gate and fixed (T23, 22 Nov).** The
+  concurrent fuzz with conversions on asks a partition to change form three times and holds
+  the moves to three; it read four, "(1, 3)", once, and passed fifty-three times after. Its
+  baseline was read behind a plain `settle`, which joins no form build and takes no
+  conversion ask: where the loop's last ask was untaken with the builder free, the segment
+  work's turn behind that settle started it and it was counted inside the first settled ask.
+  Two forced schedules guessed before a trace made nothing red; the trace named the state,
+  the state built was red in every seed of four runs of four, and with `zpages_settle()`
+  before the baseline green in six of six. Test only; `CLAUDE.md` has the case under "Two
+  counts compared across a worker's race". Records: `scratch/plan/build/T23/`.
 - **Next, each a change of its own through `scratch/plan/build/change-v1.js`, in this
-  order:** (1) the seal's words renamed and its source test lightened; (2) the `cross-arm`
+  order:** (1) done, above; (2) the `cross-arm`
   crash found and the test QEMU cannot run kept from the emulated run alone; (3) the cipher
   test that fails now and then diagnosed (task 14); (4) `whole_key_at` and the three small
   gainers decomposed and brought down, each held by the count against the commit before it
