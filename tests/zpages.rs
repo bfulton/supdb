@@ -11974,6 +11974,7 @@ fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
                 // The raw form's files asked for too, with room for them:
                 // a partition its form file serves has none to ask for.
                 o.zpages_rewarm_raw = true;
+                o.zpages_rewarm_raw_scans = true;
                 o.zpages_hot_raw = false;
                 o.zpages_memo = false;
                 o.partition_bytes = Some(400 << 10);
@@ -12124,7 +12125,10 @@ fn raw_resident(dir: &Path) -> (u64, u64) {
 /// partition and ordered index out of the cache, a second and a half of the
 /// injected clock with no scan, then a scan of one entry, and the look
 /// after it asks for each file and the files come back; a scan with no
-/// quiet stretch before it asks for nothing again. Without the option
+/// quiet stretch before it asks for nothing again; a settle asks for them
+/// and returns with them back. Those asks where the scans come back are
+/// `Options::zpages_rewarm_raw_scans`'s: with the settle's option alone the
+/// scans ask nothing and the settle brings the files back. Without either
 /// nothing is asked and the files stay out. With no room in the group
 /// (`ZInject::set_slack`, the group's unused memory less the margin) the
 /// look asks for nothing and counts every file short of the line short,
@@ -12134,15 +12138,21 @@ fn raw_resident(dir: &Path) -> (u64, u64) {
 #[cfg(target_os = "linux")]
 #[test]
 fn scans_after_a_quiet_stretch_have_the_cold_raw_files_asked_for() {
-    for (on, room) in [(true, 1u64 << 30), (false, 1 << 30), (true, 0)] {
-        let what = format!("raw rewarm {on} room {room}");
+    for (on, scans, room) in [
+        (true, true, 1u64 << 30),
+        (false, false, 1 << 30),
+        (true, true, 0),
+        (true, false, 1 << 30),
+    ] {
+        let what = format!("raw rewarm {on} at scans {scans} room {room}");
         let (dir, db, model, inject) = auto_store_with(
-            &format!("auto-rawrewarm-{on}-{room}"),
+            &format!("auto-rawrewarm-{on}-{scans}-{room}"),
             1 << 30,
             0.0,
             FAULT_1MS,
             |o| {
                 o.zpages_rewarm_raw = on;
+                o.zpages_rewarm_raw_scans = scans;
                 o.zpages_hot_raw = false;
                 o.partition_bytes = Some(400 << 10);
             },
@@ -12190,11 +12200,11 @@ fn scans_after_a_quiet_stretch_have_the_cold_raw_files_asked_for() {
         // The asks are made and counted on the rewarm's own thread.
         let t = std::time::Instant::now();
         let done = |c: &supdb::db::ZCounts| c.raw_rewarm_files + c.raw_rewarm_short > 0;
-        while on && !done(&db.zpage_counts()) && t.elapsed().as_secs() < 30 {
+        while on && scans && !done(&db.zpage_counts()) && t.elapsed().as_secs() < 30 {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let c = db.zpage_counts();
-        match (on, room > 0) {
+        match (on && scans, room > 0) {
             (true, true) => {
                 assert_eq!(c.raw_rewarms, 1, "{what}: one raw rewarm: {c:?}");
                 assert_eq!(
@@ -12222,7 +12232,7 @@ fn scans_after_a_quiet_stretch_have_the_cold_raw_files_asked_for() {
             ),
         }
         // The asks land in the cache; without them the files stay out.
-        let asked = on && room > 0;
+        let asked = on && scans && room > 0;
         let t = std::time::Instant::now();
         let mut warm = raw_resident(&dir).1;
         while asked && warm * 10 < size * 9 && t.elapsed().as_secs() < 30 {
@@ -12265,7 +12275,7 @@ fn scans_after_a_quiet_stretch_have_the_cold_raw_files_asked_for() {
         db.settle().unwrap();
         let c = db.zpage_counts();
         let warm = raw_resident(&dir).1;
-        if asked {
+        if on && room > 0 {
             assert_eq!(c.raw_settles, 1, "{what}: the settle's asks: {c:?}");
             assert!(
                 warm * 10 >= size * 9,

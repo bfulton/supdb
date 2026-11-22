@@ -6238,8 +6238,8 @@ pub struct Options {
     /// own thread; an arena's lock is held while its pages go. Off;
     /// `supdb-rewarmtrim` trims.
     pub zpages_rewarm_trims: bool,
-    /// EXPERIMENT: a rewarm due (`zpages_rewarm_scans`) asks for the raw
-    /// form's files as well, with or without a form installed: each
+    /// EXPERIMENT: a settle asks for the raw form's files and waits for
+    /// them (`Maint::z_raw_settle`), with or without a form installed: each
     /// partition the raw form serves, the level-0 pieces, and their
     /// ordered indexes, where the page cache holds under
     /// `HOT_RAW_RESIDENT` of one, the indexes first and the pieces last,
@@ -6253,11 +6253,27 @@ pub struct Options {
     /// the cache, the group's file pages at 308 MB and the process at 68
     /// of a limit of 1,024, and 2,147 major faults in a pass of 166 ms; the
     /// rewarm asked for nothing, since it asks for form files and only
-    /// once a form is installed. Counted (`ZCounts::raw_rewarms`,
-    /// `raw_rewarm_files`, `raw_rewarm_bytes`, `raw_rewarm_short`). Off;
-    /// `supdb-zrewarmraw` asks.
+    /// once a form is installed. At a settle, every seal and merge landed,
+    /// the store is at rest and the scans after it find the files back:
+    /// the default took refaults in that pass in 7 reps of 20 and the arm
+    /// in none. Where scans come back is too late
+    /// (`zpages_rewarm_raw_scans`). Counted (`ZCounts::raw_settles`,
+    /// `raw_settle_ms`, `raw_rewarm_files`, `raw_rewarm_bytes`,
+    /// `raw_rewarm_short`). Off; `supdb-zrewarmraw` asks.
     #[doc(hidden)]
     pub zpages_rewarm_raw: bool,
+    /// REFUTED: with `zpages_rewarm_raw`, the raw form's files are asked
+    /// for at the rewarm due where scans come back (`zpages_rewarm_scans`)
+    /// as well as at a settle. Those asks are made as the readers arrive
+    /// and the reads they start share the device with the readers' faults:
+    /// at three million keys under 1 GiB the clean store's pass, a tenth of
+    /// a second, read 135-160 MB inside it and ran no faster; at ten
+    /// million random ids under 1 GiB they asked about 200 MB a rep, mostly
+    /// as the full rewrite's merges landed in its pass, and that pass read
+    /// 0.68x and 0.63x of the arm without them in both orders. Off;
+    /// `supdb-zrewarmrawscans` asks there too.
+    #[doc(hidden)]
+    pub zpages_rewarm_raw_scans: bool,
     /// A rewarm due (`zpages_rewarm_scans`) is made while merges are in
     /// flight, for the form files of the partitions no merge in flight
     /// holds, where off it waits for the merges to land. It was made beside
@@ -7018,6 +7034,7 @@ impl Default for Options {
             zpages_settle_joins_asks: true,
             zpages_rewarm_trims: false,
             zpages_rewarm_raw: false,
+            zpages_rewarm_raw_scans: false,
             zpages_rewarm_beside_merges: false,
             zpages_rewarm_quiet_ms: 250,
             zpages_stride: ZStride::Forced,
@@ -50199,7 +50216,7 @@ impl Maint {
             self.zsel.counts().installs > 0 && self.shared.zgate.load() != zselect::GATE_RAW;
         // The raw form's files (`Options::zpages_rewarm_raw`), asked within
         // the group's room, and only where the room is known.
-        let room = if self.opts.zpages_rewarm_raw {
+        let room = if self.opts.zpages_rewarm_raw && self.opts.zpages_rewarm_raw_scans {
             self.raw_rewarm_room()
         } else {
             None
