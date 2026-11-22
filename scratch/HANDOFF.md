@@ -37,6 +37,18 @@ encryption) is designed and planned and **not started**. That is the next piece 
 - No pull request unless asked. No model ids in commits. Commit trailer: the `Co-Authored-By`
   and `Claude-Session` lines the session gives.
 - Preferences: be logical, test locally, do not speculate, no shortcuts.
+- **Stay off upstream (the owner, 22 Nov, in full: "On main vs upstream. Stay wholly off of
+  upstream.").** It answered a report that had asked what the lists' and the cost job's base
+  should be while upstream's work is not on the main line. Read here as: from that message on,
+  nothing is done with `origin/claude/e-recode-stride-selector-g5f6hl`. It is not fetched,
+  merged, pushed to, counted against or named as any gate's or CI job's base; a base is the main
+  line (what `scripts/base.sh` takes from the event) or the commit a change began at. This
+  replaces "Merging upstream is fine" (20 Nov) and "May want to merge upstream changes again"
+  (21 Nov) for everything after it. What the branch already holds of upstream (five merges, the
+  last a row at `7c712c1f`, merged as `60921870` an hour before the message) is left as it is:
+  taking it out was not asked and would be a rewrite of the branch. The reading is the
+  launcher's, said back to the owner the same hour; if the owner meant less (the bases alone)
+  or more, this bullet is what changes.
 
 ## Where the branch stands
 
@@ -47,9 +59,10 @@ encryption) is designed and planned and **not started**. That is the next piece 
 | `6365fdf` | last merge of upstream, at upstream `4358827` | full gate green after `e1de138` |
 
 Upstream (`origin/claude/e-recode-stride-selector-g5f6hl`) was merged again on 21 Nov at
-`7c62153e` (`22dcd115`; section 1 below has what the merge held and left). It moves daily: fetch
-it by name and count `git rev-list --count HEAD..origin/claude/e-recode-stride-selector-g5f6hl`
-before saying how far behind the branch is.
+`7c62153e` (`22dcd115`; section 1 below has what the merge held and left), and its rows twice
+after, the last at `7c712c1f` (`60921870`, 22 Nov). **That was the last: the owner's instruction
+of 22 Nov (standing instructions, above) is to stay wholly off upstream**, so it is no longer
+fetched or merged, and how far behind it the branch is, is not this work's question.
 
 The history holds "In progress:" snapshot commits from 18 Nov (`7421505`, `ccc2d7b`, `e0badc1`).
 Their code has passed the full gate several times since; the main line merges by squash.
@@ -628,16 +641,21 @@ holds; a note for a step changes no earlier prompt, so the steps before it repla
   order:** (1) the seal's words renamed and its source test lightened; (2) the `cross-arm`
   crash found and the test QEMU cannot run kept from the emulated run alone; (3) the cipher
   test that fails now and then diagnosed (task 14); (4) `whole_key_at` and the three small
-  gainers decomposed and brought down, then a baseline of accepted moves the cost group
-  reads against a named base, so that its exit status means something (task 20); (5) the
+  gainers decomposed and brought down, each held by the count against the commit before it
+  (task 20; the baseline of accepted moves against a named upstream commit that this note
+  planned is not built, since no base is upstream's now: the cost job's base is the event's,
+  the main line for a pull request, and against the main line it counts everything this
+  branch merged from upstream until the main line holds that work, so until then the rule
+  "a plain store pays nothing" is held change by change, against the commit before); (5) the
   stride form and the heads' copy made to work under a cipher by the piece, with tests, and
   the docs' sentence made true. Then G2 (`scratch/plan/g2.md`), its plan first brought up
-  to this tree: the critic's section "For G2" lists what moved. Upstream is fetched by name
-  before each launch and merged if it is ahead.
+  to this tree: the critic's section "For G2" lists what moved. Upstream is not fetched or merged
+  (the owner, 22 Nov; it was, before each launch, until then).
 - **The owner's to decide, none of it blocking:** whether the lists should land on the
   main line ahead of this branch so that a pull request is held by them (today they hold
   pushes only); what the cost job's base is in CI before upstream itself is on the main
-  line (a named base in the baseline file is what will be built); whether the door's libc
+  line (answered 22 Nov, as read here: the main line and never upstream, which is what
+  `scripts/base.sh` already takes for a pull request); whether the door's libc
   test should keep reading cargo's registry.
   Every unit from here is launched with a build note: a CI job it adds is
   `sh scripts/check.sh <group>` with nothing in the YAML but event values, a list it adds is
@@ -704,7 +722,10 @@ Read before starting:
 
 ### 4. Integrate once (task 14)
 
-Merge upstream's head (9 hunks at the stop), fix the fragile zpages tests above, run
+(Written 20 Nov, before the owner's instruction of 22 Nov to stay wholly off upstream: the
+integration is with the main line, when the owner asks for it, and no step of it fetches,
+merges or counts against upstream's branch. What follows is the old plan, kept for its other
+steps.) Merge upstream's head (9 hunks at the stop), fix the fragile zpages tests above, run
 `scripts/cost.sh` against the new upstream head, run the gate, then a stress of the `zpages`,
 `durable` and `cipher` binaries, then the quick row (`sh scripts/check.sh quick`, a timing run,
 machine to itself; after a default changes, open the whole roster at the smallest rung first).
