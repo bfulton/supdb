@@ -155,7 +155,7 @@ bulk replacement broke tick-exact tests once; do it test by test. Planned for th
 
 ## What is left, in the owner's order
 
-### 1. The page layer (task 12). Stage G1 is closed: eight units, the full gate green on `31b33339`, the critic's account in `scratch/plan/build/close/g1-built.md`. Of five changes that stood between it and G2 two are done (the seal's names, `89da086f`; the `cross-arm` group, `f1cbced5`); three are left, in the order below.
+### 1. The page layer (task 12). Stage G1 is closed: eight units, the full gate green on `31b33339`, the critic's account in `scratch/plan/build/close/g1-built.md`. Of five changes that stood between it and G2 three are done (the seal's names, `89da086f`; the `cross-arm` group, `f1cbced5`; the cipher test's flake, `620e4c5a`); two are left, in the order below.
 
 **As of 22 Nov 11:24 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
 launched one unit a launch: `Workflow {scriptPath, args: {base:
@@ -696,9 +696,26 @@ holds; a note for a step changes no earlier prompt, so the steps before it repla
   (so whether CI would have met the crash at all; the case holds either way), whether QEMU
   has since fixed the race, and that no dependency of the library reads the file at run
   time. Records: `scratch/plan/build/T22/`.
+- **The cipher test that failed now and then, diagnosed and fixed: `620e4c5a` (task 14,
+  22 Nov), and a mutant it uncovered held: `3c2b64d2`.** Both by the launcher, test only.
+  `the_compact_form_is_built_and_read_within_a_cache_the_store_does_not_fit` required the
+  cache's evictions to grow between its fill and the form's settle ("the builds gave nothing
+  back"; red twice, the second time in a stride group). A store under `ZPages::Always`
+  builds as partitions land (`Options::zpages_eager`): a print at the first reading showed
+  30 to 40 of 93 builds already run in six runs of six, and with the test's thread made four
+  seconds late to that reading all 93 had, red three runs of three with the gate's message.
+  The test runs twice now: builds left to the settle (the count exact, a build before the
+  reading a failure of its own) and builds begun at landing (held to having been made).
+  Its mutant check then found that **a form build under a cipher that never rests
+  (`Held::passed` without `self.hold.rest()`) passed every cipher test**, this one's comment
+  notwithstanding: its partitions are an eighth of its cache. The new
+  `a_form_build_holds_its_cache_and_not_its_partition` builds one ordered run's segment of
+  27 MiB under a cache of 2 MiB from a reopened store (a file being written is in memory
+  whole until its envelope, so only a reopened store's peak is its builds' alone): peak
+  2.2 MiB as the engine is, 23 MiB and red three runs of three with the rest taken out.
+  `CLAUDE.md` has both cases. Records: `scratch/plan/build/T14/`, `T25/`.
 - **Next, each a change of its own through `scratch/plan/build/change-v1.js`, in this
-  order:** (1) and (2) done, above; (3) the cipher
-  test that fails now and then diagnosed (task 14); (4) `whole_key_at` and the three small
+  order:** (1), (2) and (3) done, above; (4) `whole_key_at` and the three small
   gainers decomposed and brought down, each held by the count against the commit before it
   (task 20; the baseline of accepted moves against a named upstream commit that this note
   planned is not built, since no base is upstream's now: the cost job's base is the event's,
