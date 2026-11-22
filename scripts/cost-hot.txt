@@ -103,8 +103,12 @@ supdb::db::zlz4::
 ~merge: supdb::db::WriterOp::drop 1.2
 # Under a toggle: the seal's wait in `land` (join_seal +332 over the run,
 # its clock +64) and the segment writer's look at its helper thread in the
-# commit probes (landed +63).
-~land: supdb::db::Maint::join_seal 0.01
+# commit probes (landed +63). The wait's line was 0.01 on that first pair,
+# and five later counts of one source read 5,752 5,835 5,918 6,001 and
+# 7,080 instructions over the run's 100,000 operations, 1,328 between the
+# least and the most: a bound under what the function moves by itself reads
+# red on no change.
+~land: supdb::db::Maint::join_seal 0.04
 ~land: std::sys::pal::unix::time::Timespec::now 0.002
 ~commit_durable,commit_buffered: supdb::db::AlignedWriter::landed 0.002
 # The writer (load_durable, load_buffered, work, merge): a commit, its log,

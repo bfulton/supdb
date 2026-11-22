@@ -19083,11 +19083,12 @@ impl Emitter<'_> {
                 )));
             }
         }
-        let (from, to, tmp) = (p.from, p.to, p.tmp.clone());
+        let (from, to) = (p.from, p.to);
         if self.r == from {
-            let _ = vault::remove_file(&tmp);
+            let tmp = p.tmp.as_path();
+            let _ = vault::remove_file(tmp);
             self.w = Some(
-                PieceWriter::create(&tmp, self.opts, self.sync_every, self.inline_max)
+                PieceWriter::create(tmp, self.opts, self.sync_every, self.inline_max)
                     .map_err(|e| err(&format!("compact create: {e}")))?,
             );
         }
@@ -19446,7 +19447,7 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<Vec<String>> {
     // given, a key short of its values or a rank short of its key, and
     // its outputs replace its inputs: refused here, before they are named.
     vault::check(&dir)?;
-    vault::persist(&dir, &Db::with_ords(&out))?;
+    vault::persist(&dir, || Db::with_ords(&out))?;
     vault::sync_dir(&dir)?;
     steps.step("finish");
     if steps.on {
@@ -19658,7 +19659,7 @@ fn tier_walk<R: MergeRest>(plan: TierPlan, rest: R) -> Result<Vec<String>> {
     // As `compact_run` refuses outputs written from a file that did not
     // read.
     vault::check(&dir)?;
-    vault::persist(&dir, &Db::with_ords(&out))?;
+    vault::persist(&dir, || Db::with_ords(&out))?;
     vault::sync_dir(&dir)?;
     Ok(out)
 }
@@ -40738,7 +40739,7 @@ impl Db {
                 {
                     return Err(err("a test failed this seal's fsync"));
                 }
-                vault::persist(&dir, &Db::with_ords(&names))?;
+                vault::persist(&dir, || Db::with_ords(&names))?;
                 if let Some(t) = presynced {
                     t.join()
                         .map_err(|_| err("the records' sync thread panicked"))??;
@@ -41174,6 +41175,10 @@ impl Db {
             // read, where the walk through the memtable was the entry,
             // the chain and the value, three dependent misses a key.
             let stream = snap.as_ref().filter(|_| from_snapshot);
+            // The table itself, one pointer for the walk to keep, where
+            // the walk through the capture reloaded the capture and then
+            // the table from it at each of a key's eight uses.
+            let mem: &MemTable = &mem;
             let key_at = |at: usize| -> &[u8] {
                 match stream {
                     Some(s) => s.key_of(&s.ents[at]),
@@ -41205,7 +41210,7 @@ impl Db {
                 }
                 let id = first_id + ri as u64;
                 let tmp = dir.join(format!("seal-{id:08}.tmp"));
-                let _ = vault::remove_file(&tmp);
+                let _ = vault::remove_file(tmp.as_path());
                 let ord;
                 let seg;
                 let tombs;
@@ -41294,22 +41299,23 @@ impl Db {
                 }
                 shared.drain_steps.stamp(3);
                 let whole = ranges.len() == 1 && lo.is_empty() && hi.is_none();
-                let name = if whole && first_partition && !tombs && vault::len(&tmp)? <= limit {
-                    Db::first_partition_name(id, end_seq)
-                } else if whole {
-                    Db::seg_name(id, end_seq)
-                } else {
-                    format!(
-                        "pcs-{id:08}-{end_seq:016}-{}-{}.sup",
-                        hex(lo),
-                        hi.as_deref().map(hex).unwrap_or_default()
-                    )
-                };
+                let name =
+                    if whole && first_partition && !tombs && vault::len(tmp.as_path())? <= limit {
+                        Db::first_partition_name(id, end_seq)
+                    } else if whole {
+                        Db::seg_name(id, end_seq)
+                    } else {
+                        format!(
+                            "pcs-{id:08}-{end_seq:016}-{}-{}.sup",
+                            hex(lo),
+                            hi.as_deref().map(hex).unwrap_or_default()
+                        )
+                    };
                 // Before the segment's own rename, so the segment never
                 // exists without it.
                 let ordf = write_ord_unsynced(&dir, &name, &ord)?;
                 shared.drain_steps.stamp(4);
-                vault::rename(&tmp, dir.join(&name))?;
+                vault::rename(tmp.as_path(), dir.join(&name))?;
                 shared.drain_steps.stamp(5);
                 names.push(name);
                 facts.push(fact);
@@ -41328,7 +41334,7 @@ impl Db {
             {
                 return Err(err("a test failed this seal's fsync"));
             }
-            vault::persist(&dir, &Db::with_ords(&names))?;
+            vault::persist(&dir, || Db::with_ords(&names))?;
             for (seg, ordf) in files {
                 seg.sync_all()?;
                 shared.drain_steps.stamp(7);

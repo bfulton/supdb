@@ -2612,10 +2612,14 @@ pub(crate) fn open_dir(dir: impl AsRef<Path>) -> Result<File> {
 /// durable where their fsync is not what makes them so: for a store under
 /// a cipher, their envelopes written and synced now (`Vault::persist`),
 /// on the thread that would have paid the fsync. Nothing for a plain
-/// store, whose caller's fsync is the whole of it.
-pub(crate) fn persist(dir: impl AsRef<Path>, pairs: &[(String, Option<String>)]) -> Result<()> {
+/// store, whose caller's fsync is the whole of it: `pairs` is asked for
+/// only under a cipher, so a plain store makes no list of them.
+pub(crate) fn persist(
+    dir: impl AsRef<Path>,
+    pairs: impl FnOnce() -> Vec<(String, Option<String>)>,
+) -> Result<()> {
     match under(dir.as_ref()) {
-        Some(v) => v.persist(pairs, false).map(|_| ()),
+        Some(v) => v.persist(&pairs(), false).map(|_| ()),
         None => Ok(()),
     }
 }
@@ -3022,8 +3026,8 @@ pub(crate) mod tests {
             .persist(&pair("pcs-9.sup", None), false)
             .unwrap()
             .is_empty());
-        persist(&d, &pair("pcs-9.sup", None)).unwrap();
-        persist(&real, &pair("pcs-9.sup", None)).unwrap();
+        persist(&d, || pair("pcs-9.sup", None)).unwrap();
+        persist(&real, || pair("pcs-9.sup", None)).unwrap();
         // A second persist writes nothing: the envelope is the file.
         let before = on_disk(&real);
         assert_eq!(

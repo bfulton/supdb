@@ -641,7 +641,38 @@ impl OrdIndex {
     /// first scan at three hundred thousand keys, an eighth of the
     /// suite's threaded scan pass, and the writer paid the same at its
     /// first scan over every state a seal or a merge published.
+    ///
+    /// The one bound is `lim`'s: a mapped file's is `n`, so a rank under
+    /// it reads its head in memory, and a mapping read by the piece has
+    /// none, so every rank of it goes to `whole_key_at_by_piece`, which
+    /// answers as this half does with the heads asked for. That half is a
+    /// tail call, so this half keeps no register across a call for it.
+    /// Out of line, as it was before it had halves: inlined into a
+    /// caller's walk, its instructions are counted as the caller's.
+    #[inline(never)]
     pub fn whole_key_at<'b>(&self, rank: usize, buf: &'b mut Vec<u8>) -> Option<&'b [u8]> {
+        let len = self.uniform_len?;
+        let prefix = self.prefix.as_deref()?;
+        if rank >= self.lim || prefix.len() != self.pfx {
+            return self.whole_key_at_by_piece(rank, buf);
+        }
+        let h = if rank.is_multiple_of(TOP_STRIDE) {
+            self.top_eager[rank / TOP_STRIDE]
+        } else {
+            // SAFETY: `rank` is under `lim`, which a mapped file's heads in
+            // memory number (`head`'s own bound).
+            unsafe { self.head_in_memory(rank) }
+        };
+        Some(Self::key_from_head(prefix, h, len - self.pfx, buf))
+    }
+
+    /// `whole_key_at` past `lim`: a rank past the index, a prefix learned
+    /// short, or a mapping read by the piece, whose top level is read at
+    /// the first seek (`top`) and whose heads are asked for
+    /// (`head_absent`).
+    #[cold]
+    #[inline(never)]
+    fn whole_key_at_by_piece<'b>(&self, rank: usize, buf: &'b mut Vec<u8>) -> Option<&'b [u8]> {
         let len = self.uniform_len?;
         let prefix = self.prefix.as_deref()?;
         if rank >= self.n || prefix.len() != self.pfx {
@@ -652,10 +683,17 @@ impl OrdIndex {
         } else {
             self.head(rank)
         };
+        Some(Self::key_from_head(prefix, h, len - self.pfx, buf))
+    }
+
+    /// The key a head is the whole of: the prefix and the head's first
+    /// `kept` bytes, written into `buf`.
+    #[inline(always)]
+    fn key_from_head<'b>(prefix: &[u8], h: u64, kept: usize, buf: &'b mut Vec<u8>) -> &'b [u8] {
         buf.clear();
         buf.extend_from_slice(prefix);
-        buf.extend_from_slice(&h.to_be_bytes()[..len - self.pfx]);
-        Some(&buf[..])
+        buf.extend_from_slice(&h.to_be_bytes()[..kept]);
+        &buf[..]
     }
 
     /// What the head of the key at `rank` says of the key where it is not
@@ -803,10 +841,23 @@ impl OrdIndex {
         if i >= self.lim {
             return self.head_absent(i);
         }
+        // SAFETY: `i` is under `lim`, tested above.
+        unsafe { self.head_in_memory(i) }
+    }
+
+    /// Head `i` read from memory, for a caller that has held `i` under
+    /// `lim` itself.
+    ///
+    /// # Safety
+    /// `i < self.lim`.
+    #[inline(always)]
+    unsafe fn head_in_memory(&self, i: usize) -> u64 {
+        debug_assert!(i < self.lim, "head {i} of {} in memory", self.lim);
         let p = self.heads.load(std::sync::atomic::Ordering::Acquire);
         // SAFETY: the pointer names `n` heads -- the mapping's, which `open`
         // held to that many, or a copy of exactly those (`set_heads`) --
-        // and `i` is one of them.
+        // and `i` is one of them, being under `lim`, which is `n` where it
+        // is not zero.
         u64::from_be(unsafe { p.add(i * HEAD).cast::<u64>().read_unaligned() })
     }
 
@@ -2252,6 +2303,51 @@ mod tests {
             }
         }
         assert!(bracketed > 1, "brackets taken: {bracketed}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A key from the heads of an index read by the piece is the mapped
+    /// one's, at every rank and one past the last, a top level's rank and
+    /// a head's alike: the mapped index reads its heads in memory under
+    /// one bound (`lim`), and the one read by the piece, whose bound is
+    /// zero, answers through `whole_key_at_by_piece` -- a half that read
+    /// the mapped one's top level or heads saw none under a cipher. A
+    /// prefix learned short sends a mapped index there too, and answers
+    /// nothing.
+    #[test]
+    fn a_whole_key_by_the_piece_is_the_mapped_ones() {
+        let owned: Vec<Vec<u8>> = (0u32..1_000)
+            .map(|i| format!("{:016}", i * 7).into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let p = write(&build(&keys), "whole-by-the-piece");
+        let mut mapped = OrdIndex::open(&p, keys.len()).expect("opens");
+        let paged = in_memory(std::fs::read(&p).expect("reads"), 1.0, 0..u64::MAX);
+        let mut by_piece = OrdIndex::over(paged, keys.len()).expect("opens by the piece");
+        mapped.learn_prefix(keys[0]);
+        by_piece.learn_prefix(keys[0]);
+        assert!(
+            mapped.uniform() && by_piece.uniform(),
+            "heads are whole keys"
+        );
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for r in 0..keys.len() + 2 {
+            let want = keys.get(r).copied();
+            assert_eq!(mapped.whole_key_at(r, &mut a), want, "mapped, rank {r}");
+            assert_eq!(
+                by_piece.whole_key_at(r, &mut b),
+                want,
+                "by the piece, rank {r}"
+            );
+        }
+        mapped.learn_prefix(&keys[0][..2]);
+        for r in [0, 1, TOP_STRIDE, keys.len() - 1] {
+            assert_eq!(
+                mapped.whole_key_at(r, &mut a),
+                None,
+                "prefix short, rank {r}"
+            );
+        }
         let _ = std::fs::remove_file(&p);
     }
 
