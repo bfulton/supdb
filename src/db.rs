@@ -1239,9 +1239,14 @@ pub enum Encryption {
     /// the clear, with one choice made differently: the controller leaves
     /// such a store in the raw form (`Options::zpages_under_cipher`),
     /// where the compact form has measured slower; `ZPages::Always` builds
-    /// it there as anywhere. `Db::create` makes a store under the cipher in an empty
-    /// directory; `Db::open` refuses a store that is not under it, and a
-    /// store under a cipher is refused where none is given.
+    /// it there as anywhere. Two mechanisms read a file as its mapping lies,
+    /// which a store under a cipher does not lend, and so do not act there:
+    /// the stride form is not built, a partition it would serve being built
+    /// and served in the block form (`Options::zpages_stride`), and the
+    /// heads' copy is not made (`Options::heads_owned`). `Db::create`
+    /// makes a store under the cipher in an empty directory; `Db::open`
+    /// refuses a store that is not under it, and a store under a cipher is
+    /// refused where none is given.
     Cipher(vault::StoreCipher),
 }
 
@@ -6211,6 +6216,9 @@ pub struct Options {
     /// the process's own memory they are not the cache's to take, and the
     /// bound counts them either way. In core nothing moves: the copy is
     /// made away from the raw gate alone, and only while scans are near.
+    /// Under a cipher no copy is made: the copy is taken from the mapping
+    /// as it lies, and a store under a cipher reads its index by the piece
+    /// through its own cache (`OrdIndex::mapped_heads`).
     /// `supdb-headsmapped` reads the mapping throughout.
     pub heads_owned: bool,
     /// The hot-raw policy's skew bar read against the room
@@ -6590,7 +6598,11 @@ pub struct Options {
     /// the block cache's reads, the merge path's walks and the covered walk
     /// of a scan over the partitions alone (`Options::zpages_walk_cursor`)
     /// through the form file's cursor, which stands at a rank there
-    /// (`zfile::ZCursor`).
+    /// (`zfile::ZCursor`). Under a cipher the stride form is not built: it
+    /// is written from records lent whole and read from its file as it
+    /// lies, and a store under a cipher lends neither, so a build that asks
+    /// for it builds the block form and counts the decline
+    /// (`ZCounts::stride_declines`, `zfile::StrideNo::Kept`).
     #[doc(hidden)]
     pub zpages_stride: ZStride,
     /// EXPERIMENT: under `zpages_stride` `Forced`, the key at and above
@@ -24337,9 +24349,9 @@ const NO_RUN: u32 = u32::MAX;
 /// What a handle last said of its reads for the read mode
 /// (`Reader::note_read`): the commits it last said a scan and a point
 /// read at, and the writer's own counts, which it says to no one. A cell
-/// a field: every read of the writer's counts one of them and looks at
-/// `quiet_out`, and a note held whole in one cell was copied in and out
-/// whole at each, a load and a store a word of it.
+/// a field, since every read of the writer's counts one of them and looks
+/// at `quiet_out`: a note held whole in one cell is copied in and out whole
+/// at each, a load and a store a word of it.
 struct ModeNote {
     scan_at: std::cell::Cell<(u64, usize)>,
     point_at: std::cell::Cell<(u64, usize)>,

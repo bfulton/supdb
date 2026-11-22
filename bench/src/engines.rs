@@ -10397,7 +10397,8 @@ impl Supdb {
             },
             None => opts,
         };
-        // Set in place: a struct update copies the whole of `Options`.
+        // From here each field is set on its own, behind the flags that ask
+        // for it.
         let mut opts = opts;
         // The shapes a store under a cipher is priced against itself in:
         // an ordered load through the log with no run, the shape before,

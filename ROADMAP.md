@@ -556,6 +556,25 @@ What an engine picker would hit, roughly in order.
   and the store reads the partition raw as a plain store does
   (`a_changed_byte_in_a_form_file_takes_the_form_out_of_service_and_not_the_store`,
   `tests/cipher.rs`, at the attach and in service).
+- [ ] **The stride form under a cipher.** A stride file is written from
+  a partition's records lent whole and read at its offsets from its
+  mapping as it lies, and a store under a cipher lends neither, so there
+  a build that asks for the stride form builds the block form and counts
+  the decline (`zfile::StrideNo::Kept`). Done when the stride writer takes
+  its records by the piece, as the block form's builder does, and its
+  readers ask the file for each value page (`slice_at`), with a test that
+  a store under a cipher builds, attaches and serves a stride file, and a
+  pairing of `supdb-cipher` with the form forced against it with the form
+  off, out of core.
+- [ ] **The heads' copy under a cipher.** The copy of a partition's
+  ordered-index heads in the process's own memory (`Options::heads_owned`)
+  is made from the index's mapping as it lies, which a store under a
+  cipher does not lend, so none is made there and every seek reads its
+  heads through the store's cache. Done when the copy is made by asking
+  the index for its heads by the piece, and priced under a bound against
+  the store without it; until then, the look that would make it still
+  asks the kernel for the heads' ciphertext at each look before it finds
+  it has nothing to copy, where the compact form is on under a cipher.
 - [ ] **The controller's model held to a measurement under a cipher.**
   Its budget there is of two caches in series, the store's own and the
   kernel's of the envelopes, and at five million keys under 640 MiB it

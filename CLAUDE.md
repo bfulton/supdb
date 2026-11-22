@@ -45,6 +45,11 @@ of the change that produced the text.
 | `web/` | the browser reader, its byte sources, the fetcher that decrypts, the Worker it runs in, and the size control -- `web/README.md` |
 | `tests/` | the engine's contract, the read paths held to each other, the format's damage cases, a checkpoint held to the store it was made of, a crashed store's runs held to its log; `tests/common` holds what more than one file needs, and `tests/data` the envelope on record |
 | `bench/` | the benchmark suite: its own cargo workspace, the arms, the runner, the gate and the figures -- `bench/DESIGN.md` |
+| `tests/source.rs` | the gates over the tree's own text, over a lexer in `tests/lex/`: the wall between the forms and the encryption modules (`tests/data/couplings.txt`), what the door's clippy run cannot see (`tests/data/door.txt`, `door-libc.txt`), every public entry point of `Reader`, `Db` and `Blob` to a cost probe or a reason (`tests/data/cost-entries.txt`), the seal's tokens to the calls they are made for, and every workflow under `.github/workflows` to the groups of `scripts/check.sh` |
+| `scripts/door/` | the door by symbol: a clippy run of its own over the library with the barred calls in `clippy.toml` (`run.sh`, in the `lint` group), and its red input (`red.sh`) |
+| `scripts/cost.sh`, `cost-diff.py`, `cost-hot.txt`, `cost-red.sh` | what a store in the clear pays, counted: the probes built at a base and at the tree under callgrind and compared by function, and the count's red input -- the `cost` group |
+| `scripts/ratchet.sh`, `ratchet.py`, `raises.txt`, `ratchet-red.sh`, `base.sh` | the lists that only go down, held across a change against the base `base.sh` takes from the event, a raise declared in `raises.txt` -- the `lists` group |
+| `scripts/seal-red.sh`, `seal-red-red.sh` | the seal's red input: a copy of the crate in which each whole borrow the read path keeps compiles in its own module and fails abroad, and that check's own red input -- in the `lint` group |
 | `experiments/ffi/` | what a C ABI and a Python binding cost a point read, borrowed against copied, beside LMDB's and RocksDB's C APIs; its own manifest and dated results, and not built by the gate -- its `README.md` |
 
 One writer produces the format, `SegmentWriter`, with two callers -- `Db`
@@ -53,10 +58,15 @@ three readers parse what it wrote: `Blob` over a mapped file, `Blob` over a
 copying source, and `SparseBlob` over ranges. That is why `format.rs`
 belongs to none of them.
 
-No module carries a blanket lint allowance; `block` and `flatindex` allow
-`dead_code` on the wasm target only, where their writer halves have no
-caller. Nothing is exempt from the format gate, and everything holds to
-`-D warnings`.
+Six modules carry a blanket allowance of the door's two lints
+(`clippy::disallowed_methods`, `clippy::disallowed_types`), and they are
+the door: `vault`, `bytes`, `pager`, `crypt`, `dirkey` and `blocks`, the
+modules that open, map, advise and sync files and read the process's own
+counters for everyone else. An allowance anywhere else is an item's, with
+its reason, and `tests/data/door.txt` counts it. No other module carries a
+blanket lint allowance; `block` and `flatindex` allow `dead_code` on the
+wasm target only, where their writer halves have no caller. Nothing is
+exempt from the format gate, and everything holds to `-D warnings`.
 
 ## Running the checks
 
@@ -139,6 +149,38 @@ timing run needs the machine to itself, and CI gives it a job of its own. The
 check run in the `bench` group (`sh bench/scripts/check.sh lint` by
 itself, a minute), and a commit that touched `bench/` alone went out
 behind a green `lint` with a doubled `#[allow]` that clippy refuses.
+
+The forms and the encryption are kept apart by two gates, so that a change
+to a form needs no change under the cipher and one that would be wrong
+under it fails in the clear. The wall: `tests/source.rs`
+(`the_forms_and_the_cipher_do_not_name_each_other`) counts the tokens by
+which a form module names the encryption (`vault::kept`, `ATTN_PAGED`,
+`piecewise`, the word `cipher` and their kin) and by which an
+encryption module names a form, by file, token and region, against
+`tests/data/couplings.txt`: a total above the file's is growth and red, one
+below it is red until the file is lowered in the same change, and a
+coupling moved between functions changes no total. Its tokens are a list,
+and each spelling review found it passing is a test of its own -- a
+renamed re-export at the crate root, an alias of the crate, a vault call
+written as a path or broken across lines, a macro the encryption side
+exports -- but a branch on the cipher in words the list does not have
+passes until the list grows. The door: no file, mapping, advice, sync or
+process read in the library outside the six modules above, by symbol --
+clippy's barred calls over the library under the checked profile on Linux
+(`scripts/door/run.sh`, config `scripts/door/clippy.toml`), red first by
+`scripts/door/red.sh`, which writes a barred call of each family into a
+copy of `zfile.rs` and requires each refused by its own entry. It
+replaced a unit test that read `db.rs` for the calls by text, which never
+read `zfile.rs`'s `File::open`, `File::options()` and `fs::read_to_string`:
+a check by text over one file passes the next file and every alias, where
+clippy resolves the path. What clippy cannot see the source test holds by
+text against `tests/data/door.txt` -- an item's allow and its reason, a
+`/proc` path, an `extern` block, code a `cfg` compiles out of the door's
+build -- and the barred libc calls are held to the libc Cargo.lock
+resolves, read out of cargo's registry
+(`every_libc_call_that_takes_a_string_is_barred_or_said_to_touch_no_file`),
+so a vendored or offline layout fails that test outright. Threads are not
+barred yet: `std::thread::` is counted by file there, and grows red.
 
 The tests leave their stores under the temp directory, one per test and
 process (`supdb-next-<name>-<pid>`), so a day of test runs on one box is
@@ -1680,10 +1722,10 @@ The engine reaches its files through `vault::` (`create`, `open`, `map`,
 where no store under a cipher is open in the process. A store under a
 cipher is given a directory that cannot exist, its marker file's path with
 a name after it, so a file operation the door is not in front of fails
-with "not a directory" and writes nothing; and a unit test reads `db.rs`'s
-own source for the calls the door stands for
-(`the_engine_names_no_file_but_through_the_door`), since the first only
-fires where a test under a cipher reaches the call. A name nobody classed
+with "not a directory" and writes nothing; and the library is linted for
+the calls the door stands for, by symbol (`scripts/door/run.sh`, under
+"Running the checks"), since the first only fires where a test under a
+cipher reaches the call. A name nobody classed
 is kept in memory: the log and the manifest alone pass to the directory
 under their own names, and the engine seals what it writes into those
 itself, a record a commit and a slot a publish. A new kind of file is
@@ -5303,7 +5345,7 @@ search at every patch into a carried copy was the land probe's cost
 (`scripts/cost.sh`), and the compare is the check that makes the rank
 sound for that one patch: against the upstream head merged, the land
 probe's `CachedBlock::lower_bound` and `Reader::splice_run` read 280
-instructions a patch under it. The hint ahead of the patch
+instructions under it an operation of the probe, a key rewritten. The hint ahead of the patch
 (`copy_entry_at`) takes the claim of the partition in hand alone, as
 upstream's did, and the walk's and the form's (`prefetch_block`,
 `by_cut`) take any claim; each only aims a prefetch. `tests/settle.rs` builds both states: the fold, the drop that
@@ -5347,8 +5389,9 @@ line in each tree) said where they were: the read's note was one
 `Cell<ModeNote>` of six fields, taken whole at every read and put back
 whole at its end, seventeen instructions of `Cell::get` and fifteen of
 `Cell::set` a scan in upstream's build too, for a read that bumps one
-counter and looks at one flag. A cell a field, the scan reads twenty-one
-under upstream and the point read thirty-eight. The same count found
+counter and looks at one flag. A cell a field, `Reader::scan` reads
+twenty-one instructions a scan under upstream by function, and the point
+read probe's total thirty-eight a read under upstream's. The same count found
 `cut_raw`'s gain, called codegen beside it, in the heads' search inlined
 into it: a probe through `head()`, whose bound test for the read by the
 piece calls a function that returns, against upstream's assertion; the

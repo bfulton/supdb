@@ -43,9 +43,10 @@
 //! answers. The read path's own borrows of a section whole -- a section
 //! lent on the bounds check alone, which a source that lends by the piece
 //! refuses, and the record regions as slices -- and the address behind a
-//! paged mapping are not reachable from outside the crate. Each example
-//! below that does not compile has a twin beside it that differs only in
-//! the call it makes, and compiles.
+//! paged mapping are not reachable from outside the crate. The examples
+//! that do not compile come in groups, and each group is followed, or
+//! preceded where it continues the one before, by an example that does:
+//! the call a caller outside the crate makes instead.
 //!
 //! A mapping is not lent as it lies by a call of its own:
 //!
@@ -67,7 +68,7 @@
 //!
 //! A section lent on the bounds check alone, which answers nothing for a
 //! source that lends by the piece, is the read path's own; it is not called
-//! from outside as it was before it was sealed, and a caller asks:
+//! from outside the crate, and a caller asks instead:
 //!
 //! ```compile_fail
 //! fn lent<B: supdb::Bytes>(b: &B) -> Option<&[u8]> {

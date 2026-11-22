@@ -99,8 +99,8 @@ pub trait Bytes {
     /// nothing for one that lends by the piece, where the borrow would be
     /// the section made present whole. A reader asks this of its key
     /// section at every lookup and goes by the piece where it is refused
-    /// (`flatindex::Pieces`), so for a mapped file it is the one range
-    /// check it always was.
+    /// (`flatindex::Pieces`), so for a mapped file it is a range check and
+    /// nothing else.
     ///
     /// Sealed: the token is the read path's (`LendToken`, `blob::lend`), whose
     /// module alone makes one, so the read path's dispatch is the one
@@ -130,11 +130,13 @@ pub trait Bytes {
 
     /// Whether every byte this source lends has passed a check of the
     /// source's own -- an authenticating cipher's tag over the chunk it
-    /// lies in -- before it is lent. A reader skips the checks of its own
-    /// that such a source makes redundant where making them would ask for
-    /// a section whole (`Blob::open`'s key section row, over a source that
-    /// lends by the piece), and makes them over any other source. `false`
-    /// is always a correct answer.
+    /// lies in -- before it is lent. `Blob::open` reads this: over a source
+    /// that lends by the piece it skips the key section's checksum row
+    /// where the answer is yes, and verifies the row a piece at a time
+    /// where it is no. The ordered index (`OrdIndex::open`) skips its
+    /// checksum over any source that lends by the piece without asking
+    /// this, since its one such source is a paged mapping (`vault::map`),
+    /// which answers yes. `false` is always a correct answer.
     fn authenticated(&self) -> bool {
         false
     }
@@ -214,8 +216,9 @@ pub trait Bytes {
 
     /// The share of `len` bytes at `off` a read would find in memory now,
     /// from 0 to 1, `None` where the source cannot say: a mapping with no
-    /// page cache behind it, no mapping at all, or a kernel that will not
-    /// answer. A mapped file answers by `mincore` over the pages the range
+    /// page cache behind it, no mapping at all, or, for a mapped file, a
+    /// kernel that will not answer; a paged mapping always answers. A
+    /// mapped file answers by `mincore` over the pages the range
     /// lies in, clamped to the file, each page a byte of it lies in
     /// counting, the first from its start; a paged mapping by what its
     /// pager holds present or the kernel holds of the file behind it
@@ -363,6 +366,13 @@ unsafe impl Sync for MmapBytes {}
 /// The engine's: crate-private, and its address asked for only with a token
 /// this module alone makes (`Base`), so the one reader of it is
 /// `MmapBytes::paged`, which lends nothing of it unasked.
+///
+/// A paged mapping answers `Bytes::authenticated` with yes, and the readers
+/// over it skip the checks of their own that would ask for a section whole
+/// (the key section's checksum row, the ordered index's checksum). So an
+/// implementor answers `ensure` and `piece_from` only for bytes it has
+/// checked: the pager does, by each chunk's tag. A stand-in that checks
+/// nothing, as a test's does, leaves those bytes checked by nobody.
 #[cfg(not(target_family = "wasm"))]
 pub(crate) trait Paging: Send + Sync {
     /// The mapping's first byte; it does not move.

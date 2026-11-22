@@ -9,7 +9,11 @@
 > design was written against, whose commits are in the history of PR #6
 > (`refs/pull/6/head`); the probe its commands run is
 > `bench/examples/zprobe/`, and the `$Z` they set is the scratchpad of the
-> session that wrote them.
+> session that wrote them. The accessor this design calls
+> `Blob::record_regions` is the crate's own `Blob::records` in the tree,
+> which answers the record region and the directory lent whole
+> (`Records::Whole`) or by their place, for a reader over a source that
+> lends by the piece (`Records::Pieces`).
 
 Pre-registered design for the first instance of the principle in `CLAUDE.md:526-543` ("a cell a
 comparator wins is a workload the engine has no strategy for"). Written against HEAD `4ea80c4` and revised

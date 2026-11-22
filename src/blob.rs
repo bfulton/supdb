@@ -567,10 +567,10 @@ fn not_lent<B: Bytes>(src: &B, off: u64, len: usize) -> Error {
 
 /// The open's verification of a key section held by the piece
 /// (`Blob::open_with`): nothing where the source has checked every byte it
-/// lends (`Bytes::authenticated`), since verifying would ask for the
-/// section whole at every open -- under a cipher that is the section
-/// decrypted, which the open is not to pay -- and otherwise the row
-/// against every piece, each asked for on its own
+/// lends (`Bytes::authenticated`), since verifying would ask for every
+/// byte of the section at every open -- under a cipher that is the
+/// section decrypted, which the open is not to pay -- and otherwise the
+/// row against every piece, each asked for on its own
 /// (`flatindex::verify_pieces_in`). Out of line and cold, so that the open
 /// of a section held whole names no second walk.
 #[cold]
@@ -701,11 +701,17 @@ pub struct BlobOptions {
     /// is the one sequential read of the section, and a merge's inputs
     /// out of core read it one kernel readahead window a wait behind the
     /// readers' faults (`Options::merge_read_ahead`). Zero asks nothing;
-    /// the asks made are `Blob::open_ahead`.
+    /// the asks made are `Blob::open_ahead`. Only a section held whole is
+    /// walked this way: a section held by the piece is verified through its
+    /// source's asks, one piece at a time, and this window is not used.
     pub read_ahead: usize,
-    /// Verify the key index's checksum row when the section carries one:
-    /// every piece at a resident open, each piece as it is first used in a
-    /// sparse reader. On by default for the same reason.
+    /// Verify the key index's checksum row when the section carries one.
+    /// A section held whole is verified every piece at the open; a section
+    /// held by the piece, every piece at the open, each asked for on its
+    /// own, except over a source that says it has checked every byte it
+    /// lends (`Bytes::authenticated`), where the row is not read; a sparse
+    /// reader verifies each piece as it is first used. On by default for
+    /// the same reason.
     pub verify_index: bool,
     /// Sparse reader only: fetch the whole directory in the open wave and
     /// answer every directory slice from memory, so a lookup after open is
