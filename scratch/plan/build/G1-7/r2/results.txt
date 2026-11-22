@@ -1,0 +1,21 @@
+E1	killed	[0, 101]	ordindex hands a token out by a qualified path; db.rs borrows a mapping whole by type with it
+E2	killed	[0, 101]	zfile: an unlisted reader by type with a qualified token
+E3	killed	[0, 101]	blob: a renamed import of the token and lend_at through a function value
+E4	killed	[0, 101]	tests/blob.rs: lend_at with a token made by mem::zeroed
+E5	killed	[101]	the vault fixture zeroed at every page start, and a paged mapping lending whole
+E5b	killed	[101]	a paged mapping lending whole, the fixture as it is
+E5c	killed	[101]	the vault fixture zeroed at every page start, the paged mapping as it is (the premise alone)
+T1	killed	[101]	MmapBytes::touch: at += page / 2
+W1	killed	[101]	warm_file touches only the span's first page
+D1	killed	[101]	records_by_descriptor: the Pieces arm answers the region's place
+B1	SURVIVED	[0, 0]	Blob::records: the pieces asked before the whole lend
+S1	killed	[1]	seal-red-red.sh: case_'s words check deleted
+O1	killed	[101]	seal_names: a `use` item's `lend` not counted (in_use dropped)
+O2	killed	[101]	seal_check: a listed call's token names not counted against its calls
+O3	killed	[101]	outside_sources: the suite not read
+O4	killed	[101]	seal_names: `lent` reached by a path (`::lent`) not counted
+O5	SURVIVED	[0]	seal_names: a re-export's name not counted
+W1	killed	[101]	warm_file touches only the span's first page
+O6	killed	[101]	seal_names: the stride form's re-export's name not counted
+O5	killed	[101]	seal_names: a re-export's name not counted
+W1	killed	[101]	warm_file touches only the span's first page

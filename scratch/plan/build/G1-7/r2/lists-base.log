@@ -1,0 +1,18 @@
+Sun Nov 22 07:18:27 UTC 2026
+
+=== lists ===
+ratchet-red: 66 cases, each as it must be
+ratchet-red: green
+base: e9a6abff2e24dd45139d630befe4d686417a40ee, the merge-base of HEAD and SUPDB_BASE (an explicit override)
+ratchet: the lists at e9a6abff2e24dd45139d630befe4d686417a40ee (the merge-base of HEAD and e9a6abff2e24dd45139d630befe4d686417a40ee) against the tree
+  tests/data/cost-entries.txt: held, 332 keys at the base, 330 in the tree, 0 raised
+  tests/data/couplings.txt: held, 74 keys at the base, 75 in the tree, 1 raised
+  tests/data/door-libc.txt: held, 68 keys at the base, 68 in the tree, 0 raised
+  tests/data/door.txt: held, 76 keys at the base, 76 in the tree, 0 raised
+  spent (at the base): tests/data/cost-entries.txt Reader::block_cache_identity 0 -> 1
+  spent (at the base): tests/data/cost-entries.txt Reader::piece_bounds 0 -> 1
+ratchet: raise let through: tests/data/couplings.txt src/bytes.rs path out of the encryption modules code 0 -> 3: plan G1-7: the seam names the three tokens its whole borrows take, each made in its reader alone: Bytes::lend_at the read path's (blob::lend), and MmapBytes::lent the ordered index's (ordindex::lend) and the stride form's (db::zfile::lend), the plan's token for lent and a second for upstream's stride readers, which the plan predates; a token defined in bytes cannot have its constructor confined to its reader, the tokenless lend_at (a lendable length and a private lend in blob) cost the plain scan 6 instructions a scan and Blob::key_at, scan_whole and copy_block about one a key by the count, and a tokenless lent is a whole borrow any module of the crate can write
+ratchet: green
+
+all checks passed: lists
+EXIT 0

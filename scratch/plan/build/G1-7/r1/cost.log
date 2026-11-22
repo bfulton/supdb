@@ -1,0 +1,281 @@
+START Sun Nov 22 06:03:09 UTC 2026
+== read (toggle): total 181,465,627 -> 181,579,057 (+0.57 an op over 200,000)
+  3 functions moved
+     +0.568 an op     +113,564       3,962,968 ->      4,076,532  __memcmp_avx2_movbe
+     -0.001 an op         -113             492 ->            379  _int_malloc
+     -0.000 an op          -21              42 ->             21  unlink_chunk.isra.0
+  14 hot functions ran (4 on no line), 0 of them moved, +0.000 an op between them; slack 64 instructions a function over the run, 0 of them held to a bound of their own
+== read_z (toggle): total 889,767,302 -> 889,759,853 (-0.04 an op over 200,000)
+  11 functions moved
+     +0.176 an op      +35,273       7,333,050 ->      7,368,323  __memcmp_avx2_movbe
+     -0.172 an op      -34,336       1,135,887 ->      1,101,551  _int_malloc
+     -0.026 an op       -5,247          18,093 ->         12,846  unlink_chunk.isra.0
+     -0.017 an op       -3,479      16,000,080 ->     15,996,601  __memset_avx2_unaligned_erms
+     +0.004 an op         +752          28,388 ->         29,140  alloc_perturb
+     -0.002 an op         -325             650 ->            325  _int_free_merge_chunk
+     -0.001 an op         -120             240 ->            120  _int_free_maybe_consolidate
+     +0.000 an op          +45       2,010,762 ->      2,010,807  _int_free
+     -0.000 an op          -16       1,910,627 ->      1,910,611  malloc
+     +0.000 an op           +6         343,825 ->        343,831  calloc
+     -0.000 an op           -2           7,720 ->          7,718  0x0000000004c09740
+  60 hot functions ran (10 on no line), 0 of them moved, +0.000 an op between them; slack 64 instructions a function over the run, 0 of them held to a bound of their own
+== scan (toggle): total 13,439,895 -> 13,439,973 (+0.08 an op over 1,000)
+  3 functions moved
+     +0.077 an op          +77           2,949 ->          3,026  _int_malloc
+     +0.004 an op           +4               0 ->              4  alloc_perturb
+     -0.003 an op           -3             454 ->            451  calloc
+  44 hot functions ran (27 on no line), 0 of them moved, +0.000 an op between them; slack 64 instructions a function over the run, 0 of them held to a bound of their own
+== scan_long (toggle): total 228,243,416 -> 228,243,820 (+0.40 an op over 1,000)
+  3 functions moved
+     +0.382 an op         +382           2,757 ->          3,139  _int_malloc
+     +0.018 an op          +18             288 ->            306  unlink_chunk.isra.0
+     +0.004 an op           +4               0 ->              4  alloc_perturb
+  44 hot functions ran (27 on no line), 0 of them moved, +0.000 an op between them; slack 64 instructions a function over the run, 0 of them held to a bound of their own
+== scan_z (toggle): total 89,254,489 -> 89,267,681 (+13.19 an op over 1,000)
+  7 functions moved
+     +8.247 an op       +8,247         481,807 ->        490,054  _int_malloc
+     +3.873 an op       +3,873       6,667,677 ->      6,671,550  __memset_avx2_unaligned_erms
+     +1.683 an op       +1,683           7,266 ->          8,949  unlink_chunk.isra.0
+     -0.372 an op         -372       1,776,049 ->      1,775,677  __memcmp_avx2_movbe
+     -0.232 an op         -232          12,100 ->         11,868  alloc_perturb
+     -0.009 an op           -9         145,453 ->        145,444  calloc
+     +0.002 an op           +2           3,260 ->          3,262  0x0000000004c09740
+  78 hot functions ran (18 on no line), 0 of them moved, +0.000 an op between them; slack 64 instructions a function over the run, 0 of them held to a bound of their own
+== scan_long_z (toggle): total 734,545,647 -> 734,538,379 (-7.27 an op over 1,000)
+  9 functions moved
+     -4.746 an op       -4,746       2,210,791 ->      2,206,045  __memcmp_avx2_movbe
+     -2.335 an op       -2,335       1,131,611 ->      1,129,276  _int_malloc
+     -0.882 an op         -882          17,613 ->         16,731  unlink_chunk.isra.0
+     +0.629 an op         +629      15,818,565 ->     15,819,194  __memset_avx2_unaligned_erms
+     +0.140 an op         +140          28,420 ->         28,560  alloc_perturb
+     -0.065 an op          -65             585 ->            520  _int_free_merge_chunk
+     -0.024 an op          -24             216 ->            192  _int_free_maybe_consolidate
+     +0.009 an op           +9       1,601,127 ->      1,601,136  _int_free
+     +0.006 an op           +6         343,297 ->        343,303  calloc
+  79 hot functions ran (18 on no line), 0 of them moved, +0.000 an op between them; slack 64 instructions a function over the run, 0 of them held to a bound of their own
+== load_durable (whole): total 340,086,377 -> 340,183,678 (+0.97 an op over 100,000)
+  107 functions moved
+     +0.244 an op      +24,413         366,195 ->        390,608  supdb::db::zselect::parse_mount
+     +0.225 an op      +22,477         326,367 ->        348,844  supdb::db::zfile::read_budget
+     +0.182 an op      +18,195         254,980 ->        273,175  core::str::pattern::CharSearcher::next_match
+     +0.086 an op       +8,628       8,475,445 ->      8,484,073  __memcpy_avx_unaligned_erms
+     +0.077 an op       +7,749         752,267 ->        760,016  _int_malloc
+     -0.060 an op       -6,027       4,466,887 ->      4,460,860  __memcmp_avx2_movbe
+     +0.045 an op       +4,452          71,349 ->         75,801  realloc
+     +0.026 an op       +2,574          28,863 ->         31,437  unlink_chunk.isra.0
+     +0.025 an op       +2,548          50,897 ->         53,445  _int_realloc
+     -0.023 an op       -2,325          40,530 ->         38,205  malloc_consolidate
+     +0.023 an op       +2,299          33,422 ->         35,721  core::str::converts::from_utf8
+     -0.020 an op       -2,037       6,837,269 ->      6,835,232  __memset_avx2_unaligned_erms
+     +0.019 an op       +1,881          19,183 ->         21,064  supdb::db::Maint::z_tick
+     +0.014 an op       +1,448          22,930 ->         24,378  std::io::default_read_to_end
+     +0.012 an op       +1,236          24,547 ->         25,783  alloc::raw_vec::RawVecInner::finish_grow
+     +0.012 an op       +1,163         492,062 ->        493,225  _int_free
+     +0.011 an op       +1,144          35,859 ->         37,003  _int_free_maybe_consolidate
+     +0.011 an op       +1,139           5,054 ->          6,193  core::slice::sort::stable::quicksort::quicksort::'2
+     -0.010 an op       -1,029          81,694 ->         80,665  _int_free_merge_chunk
+     +0.010 an op         +998          14,970 ->         15,968  supdb::db::zselect::parse_kb
+     +0.010 an op         +980         287,285 ->        288,265  malloc
+     +0.009 an op         +897         196,295 ->        197,192  free
+     +0.008 an op         +849           3,175 ->          4,024  core::slice::sort::stable::quicksort::quicksort
+     -0.007 an op         -675             751 ->             76  supdb::db::Maint::join_seal
+     +0.007 an op         +672           9,360 ->         10,032  read
+  213 hot functions ran (157 on no line), 24 of them moved, +0.501 an op between them; slack 1,000 instructions a function over the run, 8 of them held to a bound of their own
+  bound 0.035 an op: supdb::db::Maint::collect +0.001 an op
+  bound 0.020 an op: supdb::db::Maint::join_seal -0.007 an op
+  bound 0.030 an op: supdb::db::Maint::sweep_spares +0.001 an op
+  bound 0.025 an op: supdb::db::Maint::z_step +0.001 an op
+  bound 0.120 an op: supdb::db::Maint::z_tick +0.019 an op
+  bound 2.500 an op: supdb::db::zfile::read_budget +0.225 an op
+  bound 0.060 an op: supdb::db::zselect::parse_kb +0.010 an op
+  bound 3.000 an op: supdb::db::zselect::parse_mount +0.244 an op
+== load_buffered (whole): total 339,361,736 -> 339,482,931 (+1.21 an op over 100,000)
+  104 functions moved
+     +0.311 an op      +31,111       4,459,093 ->      4,490,204  __memcmp_avx2_movbe
+     +0.244 an op      +24,413         195,304 ->        219,717  supdb::db::zselect::parse_mount
+     +0.228 an op      +22,773         173,992 ->        196,765  supdb::db::zfile::read_budget
+     -0.197 an op      -19,704       6,838,791 ->      6,819,087  __memset_avx2_unaligned_erms
+     +0.190 an op      +18,998         137,337 ->        156,335  core::str::pattern::CharSearcher::next_match
+     +0.099 an op       +9,860       8,468,773 ->      8,478,633  __memcpy_avx_unaligned_erms
+     +0.093 an op       +9,345         724,407 ->        733,752  _int_malloc
+     +0.041 an op       +4,110          40,185 ->         44,295  realloc
+     +0.034 an op       +3,447         466,660 ->        470,107  _int_free
+     +0.030 an op       +2,952          27,048 ->         30,000  unlink_chunk.isra.0
+     +0.028 an op       +2,765          29,587 ->         32,352  _int_realloc
+     -0.025 an op       -2,550          39,852 ->         37,302  malloc_consolidate
+     +0.022 an op       +2,213          18,428 ->         20,641  core::str::converts::from_utf8
+     +0.017 an op       +1,740           6,619 ->          8,359  supdb::db::Maint::z_tick
+     +0.014 an op       +1,448          12,794 ->         14,242  std::io::default_read_to_end
+     +0.013 an op       +1,326          15,445 ->         16,771  alloc::raw_vec::RawVecInner::finish_grow
+     +0.011 an op       +1,111           5,121 ->          6,232  core::slice::sort::stable::quicksort::quicksort::'2
+     +0.010 an op         +998           7,984 ->          8,982  supdb::db::zselect::parse_kb
+     +0.009 an op         +932         188,916 ->        189,848  free
+     -0.009 an op         -899          70,481 ->         69,582  _int_free_merge_chunk
+     -0.007 an op         -684           1,368 ->            684  core::slice::sort::shared::smallsort::sort8_stable
+     +0.007 an op         +672           4,656 ->          5,328  read
+     +0.006 an op         +648           6,930 ->          7,578  __pthread_enable_asynccancel
+     +0.006 an op         +636           7,710 ->          8,346  std::fs::read_to_string::inner
+     +0.005 an op         +540           5,775 ->          6,315  __pthread_disable_asynccancel
+  213 hot functions ran (156 on no line), 22 of them moved, +0.508 an op between them; slack 1,000 instructions a function over the run, 8 of them held to a bound of their own
+  bound 0.035 an op: supdb::db::Maint::collect +0.001 an op
+  bound 0.020 an op: supdb::db::Maint::join_seal -0.005 an op
+  bound 0.030 an op: supdb::db::Maint::sweep_spares +0.000 an op
+  bound 0.025 an op: supdb::db::Maint::z_step +0.000 an op
+  bound 0.120 an op: supdb::db::Maint::z_tick +0.017 an op
+  bound 2.500 an op: supdb::db::zfile::read_budget +0.228 an op
+  bound 0.060 an op: supdb::db::zselect::parse_kb +0.010 an op
+  bound 3.000 an op: supdb::db::zselect::parse_mount +0.244 an op
+== commit_durable (toggle): total 87,772,762 -> 87,803,377 (+0.31 an op over 100,000)
+  11 functions moved
+     +0.299 an op      +29,857       4,444,560 ->      4,474,417  __memcmp_avx2_movbe
+     +0.010 an op       +1,034          11,293 ->         12,327  _int_malloc
+     -0.001 an op         -137           1,785 ->          1,648  _int_free_merge_chunk
+     -0.000 an op          -39           1,455 ->          1,416  unlink_chunk.isra.0
+     -0.000 an op          -36             660 ->            624  _int_free_maybe_consolidate
+     -0.000 an op          -36          14,544 ->         14,508  _int_free
+     -0.000 an op          -32          12,154 ->         12,122  malloc
+     +0.000 an op          +24       5,505,584 ->      5,505,608  __memcpy_avx_unaligned_erms
+     -0.000 an op          -14             684 ->            670  _int_realloc
+     -0.000 an op           -8              92 ->             84  alloc_perturb
+     +0.000 an op           +2              12 ->             14  0x0000000004c096b0
+  83 hot functions ran (50 on no line), 0 of them moved, +0.000 an op between them; slack 64 instructions a function over the run, 1 of them held to a bound of their own
+== commit_buffered (toggle): total 87,760,963 -> 87,791,540 (+0.31 an op over 100,000)
+  13 functions moved
+     +0.299 an op      +29,857       4,444,560 ->      4,474,417  __memcmp_avx2_movbe
+     +0.010 an op       +1,034          11,293 ->         12,327  _int_malloc
+     -0.001 an op         -137           1,785 ->          1,648  _int_free_merge_chunk
+     -0.000 an op          -39           1,455 ->          1,416  unlink_chunk.isra.0
+     -0.000 an op          -36             660 ->            624  _int_free_maybe_consolidate
+     -0.000 an op          -36          14,544 ->         14,508  _int_free
+     -0.000 an op          -32          12,154 ->         12,122  malloc
+     +0.000 an op          +24       5,505,584 ->      5,505,608  __memcpy_avx_unaligned_erms
+     -0.000 an op          -24              60 ->             36  syscall
+     -0.000 an op          -14           3,229 ->          3,215  supdb::db::AlignedWriter::landed
+     -0.000 an op          -14             684 ->            670  _int_realloc
+     -0.000 an op           -8              92 ->             84  alloc_perturb
+     +0.000 an op           +2              12 ->             14  0x0000000004c096b0
+  82 hot functions ran (48 on no line), 1 of them moved, -0.000 an op between them; slack 64 instructions a function over the run, 1 of them held to a bound of their own
+  bound 0.002 an op: supdb::db::AlignedWriter::landed -0.000 an op
+== work (whole): total 699,664,073 -> 699,942,976 (+0.93 an op over 300,000)
+  99 functions moved
+     +0.307 an op      +92,034       7,313,965 ->      7,405,999  __memcmp_avx2_movbe
+     +0.163 an op      +48,826         585,912 ->        634,738  supdb::db::zselect::parse_mount
+     +0.151 an op      +45,354         521,528 ->        566,882  supdb::db::zfile::read_budget
+     +0.117 an op      +35,056         403,412 ->        438,468  core::str::pattern::CharSearcher::next_match
+     +0.030 an op       +8,904         108,400 ->        117,304  realloc
+     +0.020 an op       +6,034          74,493 ->         80,527  _int_realloc
+     +0.020 an op       +6,013       8,322,562 ->      8,328,575  _int_free
+     +0.018 an op       +5,354      11,140,279 ->     11,145,633  __memcpy_avx_unaligned_erms
+     +0.015 an op       +4,532          52,954 ->         57,486  core::str::converts::from_utf8
+     -0.012 an op       -3,746           7,120 ->          3,374  malloc_consolidate
+     +0.012 an op       +3,744          48,419 ->         52,163  std::fs::read_to_string::inner
+     +0.009 an op       +2,592         146,487 ->        149,079  alloc::raw_vec::RawVecInner::finish_grow
+     +0.008 an op       +2,498          37,678 ->         40,176  _int_free_merge_chunk
+     +0.008 an op       +2,402          27,867 ->         30,269  _int_free_maybe_consolidate
+     +0.008 an op       +2,372       6,628,731 ->      6,631,103  malloc
+     +0.007 an op       +2,106       4,757,115 ->      4,759,221  free
+     +0.007 an op       +2,090          31,274 ->         33,364  supdb::db::Maint::z_tick
+     +0.007 an op       +1,996          23,952 ->         25,948  supdb::db::zselect::parse_kb
+     +0.005 an op       +1,571         116,275 ->        117,846  _int_malloc
+     +0.004 an op       +1,344          15,408 ->         16,752  read
+     +0.004 an op       +1,314          19,692 ->         21,006  __pthread_enable_asynccancel
+     -0.004 an op       -1,215          56,118 ->         54,903  __vfscanf_internal
+     +0.004 an op       +1,095          16,410 ->         17,505  __pthread_disable_asynccancel
+     +0.004 an op       +1,074          81,860 ->         82,934  std::sys::backtrace::__rust_begin_short_backtrace
+     +0.003 an op         +872          12,055 ->         12,927  std::sys::fs::unix::try_statx
+  130 hot functions ran (91 on no line), 25 of them moved, +0.336 an op between them; slack 3,000 instructions a function over the run, 8 of them held to a bound of their own
+  bound 0.035 an op: supdb::db::Maint::collect +0.001 an op
+  bound 0.030 an op: supdb::db::Maint::sweep_spares +0.001 an op
+  bound 0.025 an op: supdb::db::Maint::z_step +0.001 an op
+  bound 0.120 an op: supdb::db::Maint::z_tick +0.007 an op
+  bound 2.500 an op: supdb::db::zfile::read_budget +0.151 an op
+  bound 0.060 an op: supdb::db::zselect::parse_kb +0.007 an op
+  bound 3.000 an op: supdb::db::zselect::parse_mount +0.163 an op
+== merge (whole): total 1,730,768,087 -> 1,729,611,071 (-5.79 an op over 200,000)
+  111 functions moved
+     -6.459 an op   -1,291,796     118,290,351 ->    116,998,555  __memcpy_avx_unaligned_erms
+     +0.169 an op      +33,868      39,183,829 ->     39,217,697  __memset_avx2_unaligned_erms
+     +0.128 an op      +25,666         520,333 ->        545,999  _int_malloc
+     +0.122 an op      +24,413         439,434 ->        463,847  supdb::db::zselect::parse_mount
+     +0.112 an op      +22,329         392,194 ->        414,523  supdb::db::zfile::read_budget
+     -0.105 an op      -21,034      56,352,014 ->     56,330,980  __memcmp_avx2_movbe
+     +0.087 an op      +17,387         372,520 ->        389,907  core::str::pattern::CharSearcher::next_match
+     +0.023 an op       +4,647       8,568,772 ->      8,573,419  realloc
+     +0.019 an op       +3,808         133,148 ->        136,956  _int_free_merge_chunk
+     +0.015 an op       +3,071           1,416 ->          4,487  supdb::db::Maint::join_seal
+     +0.015 an op       +3,056         124,905 ->        127,961  _int_realloc
+     -0.012 an op       -2,430          56,118 ->         53,688  __vfscanf_internal
+     +0.012 an op       +2,342          41,178 ->         43,520  core::str::converts::from_utf8
+     +0.011 an op       +2,291      17,529,578 ->     17,531,869  malloc
+     +0.011 an op       +2,116      21,890,640 ->     21,892,756  _int_free
+     +0.010 an op       +2,020          60,230 ->         62,250  _int_free_maybe_consolidate
+     +0.008 an op       +1,632          81,780 ->         83,412  unlink_chunk.isra.0
+     +0.007 an op       +1,448          27,886 ->         29,334  std::io::default_read_to_end
+     +0.006 an op       +1,296      11,874,069 ->     11,875,365  alloc::raw_vec::RawVecInner::finish_grow
+     +0.006 an op       +1,281          36,728 ->         38,009  malloc_consolidate
+     -0.006 an op       -1,182          26,242 ->         25,060  ____strtoul_l_internal
+     +0.005 an op       +1,020      14,104,974 ->     14,105,994  free
+     +0.005 an op         +998          17,964 ->         18,962  supdb::db::zselect::parse_kb
+     +0.004 an op         +836           2,404 ->          3,240  syscall
+     +0.003 an op         +672          11,760 ->         12,432  read
+  286 hot functions ran (189 on no line), 30 of them moved, +0.257 an op between them; slack 2,000 instructions a function over the run, 10 of them held to a bound of their own
+  bound 0.035 an op: supdb::db::Maint::collect +0.001 an op
+  bound 0.020 an op: supdb::db::Maint::join_seal +0.015 an op
+  bound 0.030 an op: supdb::db::Maint::sweep_spares +0.000 an op
+  bound 0.025 an op: supdb::db::Maint::z_step +0.000 an op
+  bound 35.000 an op: supdb::db::Reader::sweep_retired_states +0.001 an op
+  bound 6.000 an op: supdb::db::Readers::oldest_for +0.000 an op
+  bound 2.500 an op: supdb::db::zfile::read_budget +0.112 an op
+  bound 0.060 an op: supdb::db::zselect::parse_kb +0.005 an op
+  bound 3.000 an op: supdb::db::zselect::parse_mount +0.122 an op
+== land (toggle): total 476,899,881 -> 476,730,060 (-1.70 an op over 100,000)
+  26 functions moved
+     -3.009 an op     -300,888      19,872,082 ->     19,571,194  __memcpy_avx_unaligned_erms
+     +1.207 an op     +120,726       8,808,798 ->      8,929,524  __memcmp_avx2_movbe
+     +0.074 an op       +7,420          46,426 ->         53,846  malloc_consolidate
+     -0.067 an op       -6,736       2,487,407 ->      2,480,671  _int_malloc
+     +0.054 an op       +5,376         751,999 ->        757,375  _int_free
+     +0.023 an op       +2,293         449,955 ->        452,248  _int_free_merge_chunk
+     +0.018 an op       +1,812         292,741 ->        294,553  unlink_chunk.isra.0
+     -0.011 an op       -1,136          13,388 ->         12,252  alloc_perturb
+     +0.009 an op         +923         492,009 ->        492,932  _int_realloc
+     +0.006 an op         +562         172,437 ->        172,999  _int_free_maybe_consolidate
+     -0.004 an op         -432         606,758 ->        606,326  realloc
+     +0.002 an op         +224         555,583 ->        555,807  malloc
+     +0.002 an op         +166           5,669 ->          5,835  supdb::db::Maint::join_seal
+     -0.001 an op         -144         232,548 ->        232,404  free
+     +0.001 an op          +56           9,448 ->          9,504  0x000000000498b6b0
+     -0.001 an op          -52             156 ->            104  __futex_abstimed_wait_cancelable64
+     -0.000 an op          -42           9,252 ->          9,210  _int_memalign
+     +0.000 an op          +32           3,424 ->          3,456  std::sys::pal::unix::time::Timespec::now
+     +0.000 an op          +32             912 ->            944  syscall
+     +0.000 an op          +22           2,354 ->          2,376  clock_gettime@@GLIBC_2.17
+     -0.000 an op          -18           2,214 ->          2,196  __pthread_enable_asynccancel
+     +0.000 an op          +18             336 ->            354  __strncmp_avx2
+     -0.000 an op          -16       6,393,448 ->      6,393,432  __memset_avx2_unaligned_erms
+     -0.000 an op          -15           1,845 ->          1,830  __pthread_disable_asynccancel
+     -0.000 an op          -12             726 ->            714  __pthread_clockjoin_ex
+  267 hot functions ran (225 on no line), 2 of them moved, +0.002 an op between them; slack 64 instructions a function over the run, 2 of them held to a bound of their own
+  bound 0.002 an op: std::sys::pal::unix::time::Timespec::now +0.000 an op
+  bound 0.010 an op: supdb::db::Maint::join_seal +0.002 an op
+== seal (toggle): total 109,283,330 -> 109,280,800 (-0.03 an op over 100,000)
+  2 functions moved
+     -0.026 an op       -2,629       2,214,539 ->      2,211,910  __memcmp_avx2_movbe
+     +0.001 an op          +99             750 ->            849  __strncmp_avx2
+  46 hot functions ran (28 on no line), 0 of them moved, +0.000 an op between them; slack 64 instructions a function over the run, 0 of them held to a bound of their own
+== scan_at (toggle): total 6,814,202 -> 6,814,136 (-0.07 an op over 1,000)
+  1 functions moved
+     -0.066 an op          -66         409,846 ->        409,780  __memcmp_avx2_movbe
+  1 hot functions ran (0 on no line), 0 of them moved, +0.000 an op between them; slack 64 instructions a function over the run, 0 of them held to a bound of their own
+== hot line reached by no probe of this run: supdb::db::Reader::read_all
+== hot line reached by no probe of this run: supdb::flatindex::lookup
+== hot line reached by no probe of this run: supdb::flatindex::parse_record
+== hot line reached by no probe of this run: supdb::blob::Blob::scan_at
+== hot line reached by no probe of this run: supdb::blob::Blob::seek
+== hot line reached by no probe of this run: supdb::flatindex::FlatIndex::search
+== hot line reached by no probe of this run: supdb::db::Db::put
+== hot line reached by no probe of this run: supdb::db::Db::delete
+== hot line reached by no probe of this run: supdb::db::merge_ranks
+== hot line reached by no probe of this run: supdb::blob::Blob::values_at
+cost: green
+EXIT 0

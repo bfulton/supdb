@@ -1,0 +1,40 @@
+test the_reading_at_the_crossing_comes_from_the_files_on_disk ... ok
+test the_stride_switch_gives_the_stores_it_reaches_the_stride_form ... ok
+test the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the_block_coding_otherwise ... ok
+test the_words_kept_for_stride_files_are_held_to_the_live_partitions ... ok
+test the_writers_reads_are_counted_by_the_census_and_only_its_reads ... ok
+test the_z_reader_agrees_with_the_blob_on_every_scan_window ... ok
+test two_builds_ahead_run_beside_each_other_and_build_each_partition_once ... ok
+test the_stride_form_touches_no_raw_page ... ok
+test two_stores_in_one_process_do_not_share_a_measure ... ok
+test under_the_forms_gate_a_declined_partitions_heads_are_copied_and_a_waiting_ones_are_not ... ok
+test windows_with_commits_count_for_the_rate_and_not_for_the_price_of_a_fault ... ok
+test the_sample_starts_between_builds_ahead_when_told_to ... ok
+test the_trial_judges_the_refilled_state ... ok
+
+test result: ok. 233 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 58.04s
+
+   Doc-tests supdb
+
+running 17 tests
+test src/db/vault.rs - db::vault::StoreCipher (line 188) ... ignored
+test src/db.rs - db::SegmentWriter::create_with (line 11477) - compile ... ok
+test src/lib.rs - (line 117) - compile fail ... ok
+test src/lib.rs - (line 102) - compile fail ... ok
+test src/lib.rs - (line 150) - compile fail ... ok
+test src/lib.rs - (line 160) - compile fail ... ok
+test src/lib.rs - (line 132) ... ok
+test src/lib.rs - (line 165) - compile fail ... ok
+test src/lib.rs - (line 52) - compile fail ... ok
+test src/lib.rs - (line 153) ... ok
+test src/lib.rs - (line 57) - compile fail ... ok
+test src/lib.rs - (line 77) - compile ... ok
+test src/lib.rs - (line 62) - compile ... ok
+test src/lib.rs - (line 72) - compile fail ... ok
+test src/lib.rs - (line 93) - compile fail ... ok
+test src/lib.rs - (line 170) ... ok
+test src/lib.rs - (line 88) - compile fail ... ok
+
+test result: ok. 16 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+EXIT 0

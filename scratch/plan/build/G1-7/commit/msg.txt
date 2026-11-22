@@ -1,0 +1,77 @@
+The read path's whole borrows are sealed to their readers: lend_at takes the format reader's token, the mapping's whole slice the ordered index's or the stride form's, and the records answer by kind
+
+What is held. Bytes::lend_at, the borrow of a range held whole, takes a
+token made in blob alone (blob::lend::Token, its constructor
+pub(in crate::blob)), so no code outside the format's reader can call it
+and no source outside the crate can override it. MmapBytes::as_slice is
+deleted; its crate-private successor MmapBytes::lent takes a token of each
+reader that borrows a mapping whole, the ordered index's and the stride
+form's, through a trait of a private module of the seam. Paging is
+crate-private and its base takes bytes::Base, which only the seam makes.
+Blob::record_regions and record_pieces are one crate-private
+Blob::records answering Whole or Pieces, and every caller names both
+arms. The warm's touch of a mapped file's pages is MmapBytes::touch, the
+seam's own, which touches nothing of a paged mapping; the pagemap test
+reads the mapping's address through a test-only accessor. The sentences
+owed at Own and MmapBytes::map() say that a third kind answering None
+there would read as authenticated.
+
+How it was shown red. Compile-fail doctests in the crate docs, each beside
+a twin that compiles (as_slice, lend_at without and with a token, an
+outside override, naming Paging, record_regions, record_pieces): six
+compiled before the change and fail after. scripts/seal-red.sh, in the
+lint group, compiles each sealed call at home and refuses it abroad at its
+own line; scripts/seal-red-red.sh is its own red input, failing it by exit
+status at each check. tests/source.rs reads the tree for the seal: every
+token made only where it is spent, every lent call in a listed reader,
+lend_at named nowhere outside blob, and each name read by every spelling
+that reaches it -- a qualified path, a renamed or glob import, a call by
+type or through a function value, and inside a macro's tokens the words
+lent and lend in any position but four listed test assertions. Its red
+cases are the spellings review wrote that compiled and passed earlier
+versions of the check, the macro-forwarded hand-out and spend among them.
+
+What it cannot see. A seal is as wide as its token's constructor: a
+derive, a Default, a function of the reader's module handing a token out,
+or unsafe code all compile, and the source test is what refuses them, as
+text. It cannot read a name a macro builds from pieces or code included
+from outside a file. The compile-fail doctests check that a snippet fails,
+not why. A call whose argument diverges compiles and never reaches the
+method.
+
+A store in the clear pays nothing. Counted by function against the commit
+this began at, over the read, scan, compact-form, load, commit, merge,
+work, seal, scan_at and land probes: cost green, every toggled probe with
+no hot function moved, the untoggled probes' moves inside their slack;
+OrdIndex::head, seek_in_exact, plan_seek and Reader::cut_raw level in
+land. Two shapes were counted and refused: a lendable length on Bytes with
+the lend a function of blob, whose second compare did not fold
+(Blob::scan_whole and the public scan_at probe over), and the old
+open_with row test with a cold else arm (Blob::open_with over in the merge
+and land probes); G1-5's match stays, at three instructions a segment
+opened and nothing a key. No syscall is added: the touch is the same loads
+through the seam. The wasm module's size is the same.
+
+The wall's count of the seam's paths out rises from none to three, one use
+a token, declared in scripts/raises.txt: no shape that seals the borrow
+names no token in the seam, and the one that tried read red by the count.
+The lists' red fixture takes the raises file's header alone, so a case
+that deregisters a list fails for that and not for a declared raise. Two
+cost entries go with the public methods they named.
+
+Under a cipher nothing changes on any path: the warm touches nothing of a
+paged mapping as before, and the records' arms are the ones the code took.
+
+Mutants. The plan's and the unit's own over four rounds, each recorded
+with what killed it; one survivor is equivalent (Blob::records asking for
+pieces before the whole borrow, where no source answers both).
+
+Left open. The prose of lend_at, lent, Paging, touch and the crate docs'
+section on what the read path does not hand out is for the docs unit to
+read against the code, as is docs/zpages-design.md's name for
+record_regions. One durable test failed once in a whole run, on a path
+this diff does not reach, and passed alone five times; not diagnosed.
+Not built for macOS or aarch64. No timing was taken.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GEwcALZsCzTm28PHd4bQza

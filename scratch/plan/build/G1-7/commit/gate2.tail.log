@@ -1,0 +1,16 @@
+
+=== wasm ===
+# building the reader for wasm32-unknown-unknown
+   Compiling supdb v0.1.0 (/home/user/supdb)
+    Finished `release` profile [optimized] target(s) in 3.68s
+# building the floor
+    Finished `release` profile [optimized] target(s) in 0.01s
+# wrote web/supdb.wasm
+wasm_bytes 130094
+wasm_gzip 53425
+floor_bytes 29292
+floor_gzip 13032
+crypt.mjs: 5413 checks passed
+
+all checks passed: wasm
+EXIT 0

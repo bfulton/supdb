@@ -1,0 +1,25 @@
+src/ordindex.rs:2858:154: error[E0624]: associated function `new` is private: private associated function
+src/ordindex.rs:2860:124: error[E0624]: associated function `new` is private: private associated function
+seal red: ok (the 9 lines with a home compile there; all 20 fail abroad, each at its line)
+seal red red: home red (does not compile in the module allowed)
+seal red red: abroad red (no error at src/db/zfile.rs)
+seal red red: placed red (of the list's)
+seal red red: words held
+seal red red: ok
+
+=== lists ===
+ratchet-red: 66 cases, each as it must be
+ratchet-red: green
+base: 5aad09dd5d0e828846549f5fb9623f2b1540bbb0, the merge-base of HEAD and origin/main (no override and no event)
+ratchet: the lists at 5aad09dd5d0e828846549f5fb9623f2b1540bbb0 (the merge-base of HEAD and 5aad09dd5d0e828846549f5fb9623f2b1540bbb0) against the tree
+  tests/data/cost-entries.txt: new since the base, nothing to hold yet (330 keys)
+  tests/data/couplings.txt: new since the base, nothing to hold yet (75 keys)
+  tests/data/door-libc.txt: new since the base, nothing to hold yet (68 keys)
+  tests/data/door.txt: new since the base, nothing to hold yet (76 keys)
+  not held yet (its list is new since the base): tests/data/cost-entries.txt Reader::block_cache_identity 0 -> 1
+  not held yet (its list is new since the base): tests/data/cost-entries.txt Reader::piece_bounds 0 -> 1
+  not held yet (its list is new since the base): tests/data/couplings.txt src/bytes.rs path out of the encryption modules code 0 -> 3
+ratchet: green
+
+all checks passed: build test stride lint lists
+EXIT 0

@@ -142,9 +142,9 @@ bulk replacement broke tick-exact tests once; do it test by test. Planned for th
 
 ## What is left, in the owner's order
 
-### 1. The page layer (task 12). Stage G1 under way: six units of eight landed, the lists' check, the count against upstream brought under, and upstream merged again at `7c62153e`; two units left.
+### 1. The page layer (task 12). Stage G1 under way: seven units of eight landed, the lists' check, the count against upstream brought under, and upstream merged again; the docs unit and the closing gate are left.
 
-**As of 22 Nov 03:42 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
+**As of 22 Nov 08:30 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
 launched one unit a launch: `Workflow {scriptPath, args: {base:
 "ea6352181f342b7bffd75ec8c88df92bc7b78ff6", only: ["G1-<n>"], tail: false, since: <note>}}`,
 the same base for every unit; after G1-8 a launch with `only: ["none"]` and no `tail: false`
@@ -503,8 +503,68 @@ holds; a note for a step changes no earlier prompt, so the steps before it repla
     struct update): the suite's open, not the engine's.
   - The walk's start under a stale claim is still reached by no store test (T17's M4b); a
     unit test of `identity_for` holds the predicate.
-- **Next, in order:** G1-7 `sealed`, then G1-8 `docs`; then the full gate and the critic
-  (a launch with `only: ["none"]`). The count's base against upstream is `7c62153e` now.
+- **G1-7 `sealed` landed: `41a07cf6`.** The read path's whole borrows are sealed to their
+  readers by the compiler. `Bytes::lend_at` takes a zero-sized `blob::lend::Token` whose
+  constructor is `pub(in crate::blob)`, so outside the crate it can be neither called nor
+  overridden. `MmapBytes::as_slice` is gone; `MmapBytes::lent<T: whole::Reader>(&self, _: T)`
+  takes the token of the reader that may hold a mapped file whole, the ordered index's
+  (`OrdIndex::over`, `mapped_heads`) or the stride form's (four functions of
+  `src/db/zfile.rs`, upstream code the plan predates), the trait sealed in a private module
+  of `src/bytes.rs`. `Paging` is crate-private and `Paging::base` takes `bytes::Base(())`.
+  `Blob::record_regions` and `record_pieces` are one crate-private `Blob::records()`
+  returning `Records::{Whole, Pieces}`, every caller naming both arms. `warm_file` touches
+  through `MmapBytes::touch` (nothing of a paged mapping). Red inputs: compile-fail doctests
+  in `src/lib.rs`, each beside a twin that compiles; `scripts/seal-red.sh` in the lint group
+  (a copy of the crate in which each barred call compiles at home and fails at its own line
+  abroad), with `scripts/seal-red-red.sh` as its own red input; and a source test
+  (`tests/source.rs`, `seal_check`) for what the compiler cannot see: a token's module
+  growing a second way to make one, a token made apart from its call, a new caller inside a
+  reader's module. The plain store: `sh scripts/cost.sh e9a6abff` over all fifteen probes
+  green, no hot function moved. The wall's count of the seam's paths out goes 0 to 3, one
+  `use` a token, declared in `scripts/raises.txt`. Three review rounds: the first held the
+  unit to a token on `lent` (built without one to save the raise), the second and third to
+  spellings the source test missed (a renamed import, a call by type, a name handed to a
+  macro); the third repair, the check alone, read by the launcher and by no reviewer. Notes,
+  mutants, scripts and count logs: `scratch/plan/build/G1-7/`. Open, each owed to a named
+  place:
+  - **The source test's weight, for the closing critic.** It is some nine hundred lines of
+    `tests/source.rs`: a reading of identifiers off the lexer, three lists of allowed sites
+    (`SEAL_DECLS`, `SEAL_CALLS`, `SEAL_MACRO_WORDS`) and a rule that refuses the words `lent`
+    and `lend` inside any macro's tokens, with four test assertions excepted by file, scope
+    and text. `lent` is a common word in this engine (the upkeep is lent), so an ordinary
+    `assert!` that names such a local trips it, and a reformatted excepted line does too. It
+    guards against a colleague routing round the seal on purpose. Two ways to lighten it,
+    neither built: give the seal's method and token modules names nothing else uses, so the
+    macro rule needs no exceptions and the reading by position could become the word
+    anywhere; or cut the text half back to the construction sites. Decide with the critic's
+    read, as a change of its own.
+  - **The stride form does not work under a cipher.** Its four readers take the mapped file
+    whole (`lent`), which is nothing for a paged mapping, so under `ZPages::Always` with a
+    cipher `attach_stride` and `check_stride` refuse silently and the partition is served in
+    the block form. From before this unit (through `as_slice`). Owed to the page layer's
+    stage for the compact form (S5), with a test of today's behaviour first.
+  - Two shapes counted and refused are in the notes for whoever tries them again: a lendable
+    length on `Bytes` with the lend a function of `blob` (`Blob::scan_whole` and the public
+    `scan_at` over), and G1-5's reviewer's dispatch in `Blob::open_with` (over in the merge
+    and land probes), so G1-5's three instructions a segment opened stay.
+  - `scripts/seal-red.sh` and `seal-red-red.sh` add `cargo check` builds of a copy of the
+    crate to every lint run; their time is in the closing gate's log.
+  - Docs for G1-8: the prose of `lend_at`, `lent`, `Paging`, `touch` and the crate docs'
+    section on what the read path does not hand out (one sentence of it is history);
+    `docs/zpages-design.md` still names `record_regions`.
+  - Not built for macOS or aarch64; `cross-arm` not run.
+- **Two more durable helpers answered the segment work's failure by the stop's flag
+  (`067d9fa8`, the launcher's).** `ss_no_room_for_the_run` and
+  `ss_handed_over_a_stopped_queue` waited for the stopped queue's flag and then read commits
+  and seals on the bet that the first commit would answer the failure; one went red once in
+  G1-7's whole run. Both take the failure with `ss_commit_answer` now. Shown by a scratch
+  spin of a set width between the flag and the failure's leaving (in the engine for the hunt,
+  taken out): the tests as they stood red 24 runs of 25 at a millisecond, the fixed ones
+  never at eleven widths, the whole durable binary under three widths with no test red.
+  `scratch/plan/build/T20/` has the sweep.
+- **Next, in order:** G1-8 `docs`; then the full gate and the critic (a launch with
+  `only: ["none"]`). The count's base against upstream is `7c62153e` (upstream's later
+  commits, merged since, are bench rows).
   Every unit from here is launched with a build note: a CI job it adds is
   `sh scripts/check.sh <group>` with nothing in the YAML but event values, a list it adds is
   registered in `scripts/ratchet.py`, and a move between functions the cost group reads red is

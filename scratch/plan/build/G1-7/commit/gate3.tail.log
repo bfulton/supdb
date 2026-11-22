@@ -1,0 +1,25 @@
+running 5 tests
+test a_pairing_loses_a_killed_reps_pair_and_goes_on ... ok
+test a_resume_refuses_another_binary_and_a_plan_of_its_own ... ok
+test a_killed_pass_is_a_cell_of_the_row_and_the_run_goes_on ... ok
+test a_rep_cut_between_arms_is_taken_again_whole_unless_passes_are_kept ... ok
+test a_run_cut_between_reps_is_taken_up_at_the_next_and_composes_the_row ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.60s
+
+
+== lint ==
+   Compiling supdb-bench v0.2.0 (/home/user/supdb/bench)
+    Checking supdb v0.1.0 (/home/user/supdb)
+    Finished `release` profile [optimized + debuginfo] target(s) in 14.13s
+workflows: every run block parses, none interpolates (42 blocks); every Linux job names its image
+policy_defaults: 210 fields follow the engine
+
+== figures ==
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.10s
+figures: docs/figures is what runs/ draws
+
+all checks passed: build test lint figures
+
+all checks passed: bench
+EXIT 0

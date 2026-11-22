@@ -1,0 +1,22 @@
+src/db.rs:60773:97: error[E0423]: cannot initialize a tuple struct which contains private fields
+src/db.rs:60775:100: error[E0423]: cannot initialize a tuple struct which contains private fields
+src/db/zfile.rs:19272:151: error[E0603]: tuple struct constructor `Token` is private: private tuple struct constructor
+src/db/pager.rs:2241:104: error[E0603]: tuple struct constructor `Base` is private: private tuple struct constructor
+src/db/vault.rs:3442:110: error[E0603]: tuple struct constructor `Base` is private: private tuple struct constructor
+src/db.rs:60769:60: error[E0603]: module `whole` is private: private module
+src/blob.rs:3659:124: error[E0624]: associated function `new` is private: private associated function
+src/bytes.rs:881:155: error[E0624]: associated function `new` is private: private associated function
+src/db/zfile.rs:19266:150: error[E0624]: associated function `new` is private: private associated function
+src/db/zfile.rs:19268:84: error[E0599]: no method named `as_slice` found for reference `&MmapBytes` in the current scope: method not found in `&MmapBytes`
+src/db/zfile.rs:19270:132: error[E0277]: the trait bound `blob::lend::Token: Default` is not satisfied: the trait `Default` is not implemented for `blob::lend::Token`
+src/db/pager.rs:2243:98: error[E0277]: the trait bound `Base: Default` is not satisfied: the trait `Default` is not implemented for `Base`
+src/db.rs:60759:119: error[E0624]: associated function `new` is private: private associated function
+src/db.rs:60761:120: error[E0624]: associated function `new` is private: private associated function
+src/db.rs:60763:85: error[E0061]: this method takes 1 argument but 0 arguments were supplied
+src/db.rs:60765:130: error[E0277]: the trait bound `ordindex::lend::Token: Default` is not satisfied: the trait `Default` is not implemented for `ordindex::lend::Token`
+src/db.rs:60767:130: error[E0277]: the trait bound `zfile::lend::Token: Default` is not satisfied: the trait `Default` is not implemented for `zfile::lend::Token`
+src/db.rs:60771:90: error[E0277]: the trait bound `(): whole::Reader` is not satisfied: the trait `whole::Reader` is not implemented for `()`
+src/ordindex.rs:2858:154: error[E0624]: associated function `new` is private: private associated function
+src/ordindex.rs:2860:124: error[E0624]: associated function `new` is private: private associated function
+seal red: ok (the 9 lines with a home compile there; all 20 fail abroad, each at its line)
+EXIT 0

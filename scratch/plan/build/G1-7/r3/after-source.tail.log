@@ -1,0 +1,12 @@
+test the_forms_and_the_cipher_do_not_name_each_other ... ok
+test the_newer_token_patterns_count_as_they_say ... ok
+test the_ordered_index_opens_through_the_door ... ok
+test the_seals_tokens_are_made_only_where_they_are_spent ... ok
+test the_tokens_count_as_their_patterns_say ... ok
+test the_encryption_side_naming_the_engine_fails ... ok
+test a_thread_call_added_fails_and_a_use_of_a_thread_fn_fails ... ok
+test code_the_door_does_not_compile_is_held_by_its_text ... ok
+
+test result: ok. 78 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 59.32s
+
+EXIT 0
