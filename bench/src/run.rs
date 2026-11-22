@@ -3511,6 +3511,17 @@ fn lag_sweep(
             e.sync()?;
             e.settle()?;
         }
+        // A probe, under `SUPDB_LAG_FORMS`: the block cache by partition
+        // where the pass starts (`Engine::forms_by_partition`). It takes the
+        // writer's upkeep home, which the pass after it would otherwise
+        // wait out or race, so a run that prints it is a probe of where the
+        // forms stand and its rates are not read.
+        let forms_probe = std::env::var_os("SUPDB_LAG_FORMS").is_some();
+        if forms_probe {
+            for l in e.forms_by_partition() {
+                eprintln!("lagforms {arm} {pct} start {l}");
+            }
+        }
         let mut g3 = KeyGen::new(KeyDist::Uniform, scan_keys, 0x1A7);
         // With `SUPDB_SCAN_OPS` set, every scan of the point's pass is timed
         // on its own, as the scan pass's are, and a `lagops` line per point
@@ -3643,6 +3654,11 @@ fn lag_sweep(
                 &c1,
             );
             census_line("lagcensus", arm, &pct.to_string(), e, true);
+        }
+        if forms_probe {
+            for l in e.forms_by_partition() {
+                eprintln!("lagforms {arm} {pct} end {l}");
+            }
         }
     }
     Ok(())

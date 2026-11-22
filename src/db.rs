@@ -32782,6 +32782,60 @@ impl Reader {
         self.memory_census_with(&[])
     }
 
+    /// A probe of the block cache by partition, for a question the census
+    /// by kind cannot answer -- which partitions the forms' bytes stand over
+    /// and whether the page cache holds those partitions' own pages: for
+    /// each partition in key order, the segment's id and level, whether its
+    /// table was built over this very segment, the forms by kind with their
+    /// buffers' bytes, the blocks with no form, and the share of its records
+    /// and of its ordered index resident. It takes the writer's upkeep home
+    /// as the census does, so it is read where a pass is not timed, or
+    /// where the pass it precedes is a probe's.
+    #[doc(hidden)]
+    pub fn forms_by_partition(&self) -> Vec<String> {
+        let _e = self.enter();
+        let segs = self.segs();
+        let np = segs.partition_point(|s| s.level > 0);
+        let fs = self.fs();
+        let tables = fs.tables.borrow();
+        let mut out = Vec::new();
+        for (i, s) in segs[..np].iter().enumerate() {
+            let id = Db::name_id(&s.name).unwrap_or(0);
+            let ord = resident_share(s.ord.mapped());
+            let rec = s.records_resident();
+            let Some(cell) = tables.get(i) else {
+                out.push(format!("p{i} id {id} notable rec {rec:.2} ord {ord:.2}"));
+                continue;
+            };
+            let held = cell.borrow();
+            let Some(t) = held.as_ref() else {
+                out.push(format!("p{i} id {id} none rec {rec:.2} ord {ord:.2}"));
+                continue;
+            };
+            let mut tally = FormTally::default();
+            let mut empty = 0u64;
+            for a in t.slots.iter() {
+                match a {
+                    Some(a) => tally.add(a),
+                    None => empty += 1,
+                }
+            }
+            out.push(format!(
+                "p{i} id {id} own {} blocks {} copy {}/{:.1}MB sparse {}/{:.1}MB clean {} wide {} empty {empty} rec {rec:.2} ord {ord:.2}",
+                t.blob == s.blob.id(),
+                t.slots.len(),
+                tally.n[2],
+                tally.cap[2] as f64 / 1e6,
+                tally.n[1],
+                tally.cap[1] as f64 / 1e6,
+                tally.n[0],
+                tally.n[3],
+            ));
+        }
+        out.push(format!("pieces {}", segs.len() - np));
+        out
+    }
+
     fn memory_census_with(&self, handed: &[std::sync::Arc<MemTable>]) -> Vec<(String, u64)> {
         let _e = self.enter();
         let st = self.state();
@@ -42182,6 +42236,12 @@ impl Db {
     pub fn memory_census(&self) -> Vec<(String, u64)> {
         let handed: Vec<_> = self.mem_handed.iter().cloned().collect();
         self.r.memory_census_with(&handed)
+    }
+
+    /// The writer's block cache by partition (`Reader::forms_by_partition`).
+    #[doc(hidden)]
+    pub fn forms_by_partition(&self) -> Vec<String> {
+        self.r.forms_by_partition()
     }
 
     /// The sequence of the last manifest this store published

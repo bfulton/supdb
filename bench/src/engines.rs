@@ -346,6 +346,13 @@ pub trait Engine {
         Vec::new()
     }
 
+    /// The block cache by partition (`Db::forms_by_partition`), a probe
+    /// read under `SUPDB_LAG_FORMS` at the lag sweep's points; empty for an
+    /// engine with nothing to say.
+    fn forms_by_partition(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Each form file's keys, megabytes and decodes, by partition in key
     /// order (`Db::zpage_heat`): where a mix's decodes land, printed after
     /// each mix under `SUPDB_MIX_HEAT`. Empty for an engine with no form.
@@ -12703,6 +12710,12 @@ impl Engine for Supdb {
             })
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    fn forms_by_partition(&self) -> Vec<String> {
+        self.db
+            .as_ref()
+            .map_or(Vec::new(), |db| db.forms_by_partition())
     }
 
     fn memory_census(&self) -> Vec<(String, u64)> {
