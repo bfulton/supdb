@@ -1,0 +1,10 @@
+M1-bypiece-top-field KILLED rc=101 test ordindex::tests::a_whole_key_by_the_piece_is_the_mapped_ones ... FAILED
+M2-bypiece-head-in-memory KILLED rc=101 test ordindex::tests::a_whole_key_by_the_piece_is_the_mapped_ones ... FAILED
+M3-top-test-inverted KILLED rc=101 test ordindex::tests::a_whole_key_by_the_piece_is_the_mapped_ones ... FAILED
+M4-lim-off-by-one KILLED rc=101 test ordindex::tests::a_whole_key_by_the_piece_is_the_mapped_ones ... FAILED
+M5-top-test-no-prefix KILLED rc=101 test ordindex::tests::a_whole_key_by_the_piece_is_the_mapped_ones ... FAILED
+M6-bypiece-n-off-by-one KILLED rc=101 test ordindex::tests::a_whole_key_by_the_piece_is_the_mapped_ones ... FAILED
+M7-enter-first-pieces-tmp KILLED rc=101 test a_merge_drops_its_inputs_pages_behind_its_second_pass ... FAILED; test a_merge_planned_with_fences_a_landing_old_takes_the_partitions_standing_after_it ... FAILED; test a_merge_writes_an_empty_partition_for_a_fence_no_input_key_lies_in ... FAILED; test a_merges_first_pass_over_the_heads_writes_what_the_records_write ... FAILED
+M8-seal-rename-from-dir KILLED rc=101 test a_merge_writes_an_empty_partition_for_a_fence_no_input_key_lies_in ... FAILED; test a_merges_drops_behind_begin_at_each_inputs_first_record ... FAILED; test a_merge_planned_with_fences_a_landing_old_takes_the_partitions_standing_after_it ... FAILED; test a_merge_drops_its_inputs_pages_behind_its_second_pass ... FAILED
+M9-persist-no-pairs KILLED rc=101 test a_closed_runs_segment_is_sealed_where_it_closes ... FAILED
+M10-key-from-head-kept-one-short KILLED rc=101 test ordindex::tests::a_whole_key_by_the_piece_is_the_mapped_ones ... FAILED

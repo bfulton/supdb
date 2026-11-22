@@ -1,0 +1,285 @@
+diff --git a/src/db.rs b/src/db.rs
+index cad4c772..c74a87e6 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -19083,11 +19083,12 @@ impl Emitter<'_> {
+                 )));
+             }
+         }
+-        let (from, to, tmp) = (p.from, p.to, p.tmp.clone());
++        let (from, to) = (p.from, p.to);
+         if self.r == from {
+-            let _ = vault::remove_file(&tmp);
++            let tmp = p.tmp.as_path();
++            let _ = vault::remove_file(tmp);
+             self.w = Some(
+-                PieceWriter::create(&tmp, self.opts, self.sync_every, self.inline_max)
++                PieceWriter::create(tmp, self.opts, self.sync_every, self.inline_max)
+                     .map_err(|e| err(&format!("compact create: {e}")))?,
+             );
+         }
+@@ -19446,7 +19447,7 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<Vec<String>> {
+     // given, a key short of its values or a rank short of its key, and
+     // its outputs replace its inputs: refused here, before they are named.
+     vault::check(&dir)?;
+-    vault::persist(&dir, &Db::with_ords(&out))?;
++    vault::persist(&dir, || Db::with_ords(&out))?;
+     vault::sync_dir(&dir)?;
+     steps.step("finish");
+     if steps.on {
+@@ -19658,7 +19659,7 @@ fn tier_walk<R: MergeRest>(plan: TierPlan, rest: R) -> Result<Vec<String>> {
+     // As `compact_run` refuses outputs written from a file that did not
+     // read.
+     vault::check(&dir)?;
+-    vault::persist(&dir, &Db::with_ords(&out))?;
++    vault::persist(&dir, || Db::with_ords(&out))?;
+     vault::sync_dir(&dir)?;
+     Ok(out)
+ }
+@@ -40738,7 +40739,7 @@ impl Db {
+                 {
+                     return Err(err("a test failed this seal's fsync"));
+                 }
+-                vault::persist(&dir, &Db::with_ords(&names))?;
++                vault::persist(&dir, || Db::with_ords(&names))?;
+                 if let Some(t) = presynced {
+                     t.join()
+                         .map_err(|_| err("the records' sync thread panicked"))??;
+@@ -41174,6 +41175,10 @@ impl Db {
+             // read, where the walk through the memtable was the entry,
+             // the chain and the value, three dependent misses a key.
+             let stream = snap.as_ref().filter(|_| from_snapshot);
++            // The table itself, one pointer for the walk to keep, where
++            // the walk through the capture reloaded the capture and then
++            // the table from it at each of a key's eight uses.
++            let mem: &MemTable = &mem;
+             let key_at = |at: usize| -> &[u8] {
+                 match stream {
+                     Some(s) => s.key_of(&s.ents[at]),
+@@ -41205,7 +41210,7 @@ impl Db {
+                 }
+                 let id = first_id + ri as u64;
+                 let tmp = dir.join(format!("seal-{id:08}.tmp"));
+-                let _ = vault::remove_file(&tmp);
++                let _ = vault::remove_file(tmp.as_path());
+                 let ord;
+                 let seg;
+                 let tombs;
+@@ -41294,22 +41299,23 @@ impl Db {
+                 }
+                 shared.drain_steps.stamp(3);
+                 let whole = ranges.len() == 1 && lo.is_empty() && hi.is_none();
+-                let name = if whole && first_partition && !tombs && vault::len(&tmp)? <= limit {
+-                    Db::first_partition_name(id, end_seq)
+-                } else if whole {
+-                    Db::seg_name(id, end_seq)
+-                } else {
+-                    format!(
+-                        "pcs-{id:08}-{end_seq:016}-{}-{}.sup",
+-                        hex(lo),
+-                        hi.as_deref().map(hex).unwrap_or_default()
+-                    )
+-                };
++                let name =
++                    if whole && first_partition && !tombs && vault::len(tmp.as_path())? <= limit {
++                        Db::first_partition_name(id, end_seq)
++                    } else if whole {
++                        Db::seg_name(id, end_seq)
++                    } else {
++                        format!(
++                            "pcs-{id:08}-{end_seq:016}-{}-{}.sup",
++                            hex(lo),
++                            hi.as_deref().map(hex).unwrap_or_default()
++                        )
++                    };
+                 // Before the segment's own rename, so the segment never
+                 // exists without it.
+                 let ordf = write_ord_unsynced(&dir, &name, &ord)?;
+                 shared.drain_steps.stamp(4);
+-                vault::rename(&tmp, dir.join(&name))?;
++                vault::rename(tmp.as_path(), dir.join(&name))?;
+                 shared.drain_steps.stamp(5);
+                 names.push(name);
+                 facts.push(fact);
+@@ -41328,7 +41334,7 @@ impl Db {
+             {
+                 return Err(err("a test failed this seal's fsync"));
+             }
+-            vault::persist(&dir, &Db::with_ords(&names))?;
++            vault::persist(&dir, || Db::with_ords(&names))?;
+             for (seg, ordf) in files {
+                 seg.sync_all()?;
+                 shared.drain_steps.stamp(7);
+diff --git a/src/db/vault.rs b/src/db/vault.rs
+index 4397bdaf..21e717d7 100644
+--- a/src/db/vault.rs
++++ b/src/db/vault.rs
+@@ -2612,10 +2612,14 @@ pub(crate) fn open_dir(dir: impl AsRef<Path>) -> Result<File> {
+ /// durable where their fsync is not what makes them so: for a store under
+ /// a cipher, their envelopes written and synced now (`Vault::persist`),
+ /// on the thread that would have paid the fsync. Nothing for a plain
+-/// store, whose caller's fsync is the whole of it.
+-pub(crate) fn persist(dir: impl AsRef<Path>, pairs: &[(String, Option<String>)]) -> Result<()> {
++/// store, whose caller's fsync is the whole of it: `pairs` is asked for
++/// only under a cipher, so a plain store makes no list of them.
++pub(crate) fn persist(
++    dir: impl AsRef<Path>,
++    pairs: impl FnOnce() -> Vec<(String, Option<String>)>,
++) -> Result<()> {
+     match under(dir.as_ref()) {
+-        Some(v) => v.persist(pairs, false).map(|_| ()),
++        Some(v) => v.persist(&pairs(), false).map(|_| ()),
+         None => Ok(()),
+     }
+ }
+@@ -3022,8 +3026,8 @@ pub(crate) mod tests {
+             .persist(&pair("pcs-9.sup", None), false)
+             .unwrap()
+             .is_empty());
+-        persist(&d, &pair("pcs-9.sup", None)).unwrap();
+-        persist(&real, &pair("pcs-9.sup", None)).unwrap();
++        persist(&d, || pair("pcs-9.sup", None)).unwrap();
++        persist(&real, || pair("pcs-9.sup", None)).unwrap();
+         // A second persist writes nothing: the envelope is the file.
+         let before = on_disk(&real);
+         assert_eq!(
+diff --git a/src/ordindex.rs b/src/ordindex.rs
+index 8f431cf8..5022ff20 100644
+--- a/src/ordindex.rs
++++ b/src/ordindex.rs
+@@ -641,7 +641,38 @@ impl OrdIndex {
+     /// first scan at three hundred thousand keys, an eighth of the
+     /// suite's threaded scan pass, and the writer paid the same at its
+     /// first scan over every state a seal or a merge published.
++    ///
++    /// The one bound is `lim`'s: a mapped file's is `n`, so a rank under
++    /// it reads its head in memory, and a mapping read by the piece has
++    /// none, so every rank of it goes to `whole_key_at_by_piece`, which
++    /// answers as this half does with the heads asked for. That half is a
++    /// tail call, so this half keeps no register across a call for it.
++    /// Out of line, as it was before it had halves: inlined into a
++    /// caller's walk, its instructions are counted as the caller's.
++    #[inline(never)]
+     pub fn whole_key_at<'b>(&self, rank: usize, buf: &'b mut Vec<u8>) -> Option<&'b [u8]> {
++        let len = self.uniform_len?;
++        let prefix = self.prefix.as_deref()?;
++        if rank >= self.lim || prefix.len() != self.pfx {
++            return self.whole_key_at_by_piece(rank, buf);
++        }
++        let h = if rank.is_multiple_of(TOP_STRIDE) {
++            self.top_eager[rank / TOP_STRIDE]
++        } else {
++            // SAFETY: `rank` is under `lim`, which a mapped file's heads in
++            // memory number (`head`'s own bound).
++            unsafe { self.head_in_memory(rank) }
++        };
++        Some(Self::key_from_head(prefix, h, len - self.pfx, buf))
++    }
++
++    /// `whole_key_at` past `lim`: a rank past the index, a prefix learned
++    /// short, or a mapping read by the piece, whose top level is read at
++    /// the first seek (`top`) and whose heads are asked for
++    /// (`head_absent`).
++    #[cold]
++    #[inline(never)]
++    fn whole_key_at_by_piece<'b>(&self, rank: usize, buf: &'b mut Vec<u8>) -> Option<&'b [u8]> {
+         let len = self.uniform_len?;
+         let prefix = self.prefix.as_deref()?;
+         if rank >= self.n || prefix.len() != self.pfx {
+@@ -652,10 +683,17 @@ impl OrdIndex {
+         } else {
+             self.head(rank)
+         };
++        Some(Self::key_from_head(prefix, h, len - self.pfx, buf))
++    }
++
++    /// The key a head is the whole of: the prefix and the head's first
++    /// `kept` bytes, written into `buf`.
++    #[inline(always)]
++    fn key_from_head<'b>(prefix: &[u8], h: u64, kept: usize, buf: &'b mut Vec<u8>) -> &'b [u8] {
+         buf.clear();
+         buf.extend_from_slice(prefix);
+-        buf.extend_from_slice(&h.to_be_bytes()[..len - self.pfx]);
+-        Some(&buf[..])
++        buf.extend_from_slice(&h.to_be_bytes()[..kept]);
++        &buf[..]
+     }
+ 
+     /// What the head of the key at `rank` says of the key where it is not
+@@ -803,10 +841,23 @@ impl OrdIndex {
+         if i >= self.lim {
+             return self.head_absent(i);
+         }
++        // SAFETY: `i` is under `lim`, tested above.
++        unsafe { self.head_in_memory(i) }
++    }
++
++    /// Head `i` read from memory, for a caller that has held `i` under
++    /// `lim` itself.
++    ///
++    /// # Safety
++    /// `i < self.lim`.
++    #[inline(always)]
++    unsafe fn head_in_memory(&self, i: usize) -> u64 {
++        debug_assert!(i < self.lim, "head {i} of {} in memory", self.lim);
+         let p = self.heads.load(std::sync::atomic::Ordering::Acquire);
+         // SAFETY: the pointer names `n` heads -- the mapping's, which `open`
+         // held to that many, or a copy of exactly those (`set_heads`) --
+-        // and `i` is one of them.
++        // and `i` is one of them, being under `lim`, which is `n` where it
++        // is not zero.
+         u64::from_be(unsafe { p.add(i * HEAD).cast::<u64>().read_unaligned() })
+     }
+ 
+@@ -2255,6 +2306,51 @@ mod tests {
+         let _ = std::fs::remove_file(&p);
+     }
+ 
++    /// A key from the heads of an index read by the piece is the mapped
++    /// one's, at every rank and one past the last, a top level's rank and
++    /// a head's alike: the mapped index reads its heads in memory under
++    /// one bound (`lim`), and the one read by the piece, whose bound is
++    /// zero, answers through `whole_key_at_by_piece` -- a half that read
++    /// the mapped one's top level or heads saw none under a cipher. A
++    /// prefix learned short sends a mapped index there too, and answers
++    /// nothing.
++    #[test]
++    fn a_whole_key_by_the_piece_is_the_mapped_ones() {
++        let owned: Vec<Vec<u8>> = (0u32..1_000)
++            .map(|i| format!("{:016}", i * 7).into_bytes())
++            .collect();
++        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
++        let p = write(&build(&keys), "whole-by-the-piece");
++        let mut mapped = OrdIndex::open(&p, keys.len()).expect("opens");
++        let paged = in_memory(std::fs::read(&p).expect("reads"), 1.0, 0..u64::MAX);
++        let mut by_piece = OrdIndex::over(paged, keys.len()).expect("opens by the piece");
++        mapped.learn_prefix(keys[0]);
++        by_piece.learn_prefix(keys[0]);
++        assert!(
++            mapped.uniform() && by_piece.uniform(),
++            "heads are whole keys"
++        );
++        let (mut a, mut b) = (Vec::new(), Vec::new());
++        for r in 0..keys.len() + 2 {
++            let want = keys.get(r).copied();
++            assert_eq!(mapped.whole_key_at(r, &mut a), want, "mapped, rank {r}");
++            assert_eq!(
++                by_piece.whole_key_at(r, &mut b),
++                want,
++                "by the piece, rank {r}"
++            );
++        }
++        mapped.learn_prefix(&keys[0][..2]);
++        for r in [0, 1, TOP_STRIDE, keys.len() - 1] {
++            assert_eq!(
++                mapped.whole_key_at(r, &mut a),
++                None,
++                "prefix short, rank {r}"
++            );
++        }
++        let _ = std::fs::remove_file(&p);
++    }
++
+     /// A prefix learned short of the index's common prefix -- from a key
+     /// shorter than it, which `learn_prefix` takes -- brackets nothing: a
+     /// head is the key's bytes after `pfx` of them, and a bracket built from

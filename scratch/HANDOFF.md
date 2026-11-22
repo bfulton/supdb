@@ -1,11 +1,99 @@
-# Handoff: encryption branch, stopped 2026-11-20 04:10 UTC
+# Handoff: encryption branch, stopped 2026-11-22 about 22:20 UTC for quota
 
 Branch `claude/inspiring-brahmagupta-d7y8n7`. No pull request exists and none was asked for.
-Everything is on the remote and the working tree is clean. Nothing is running. The handoff
-before this one (18 Nov) is in history at `a4f3764`; this file replaces it.
+Everything is on the remote and the working tree is clean. Nothing is running and no check-in is
+scheduled. The handoffs before this one (18 and 20 Nov) are in history; this file replaces them,
+and its older sections below are kept because they are still true of what they describe.
 
 `scratch/` is session notes kept in the repo so they survive the container. **Remove it before
 any merge or pull request.**
+
+## Start here (written 22 Nov, for a session with no memory of this one)
+
+**The owner's instructions that bind everything** (the full list is under "Standing instructions
+from the owner" below; these are the ones a new session gets wrong first):
+- "Use your best judgement. The goal is an encryption feature which is reliable, performant, and
+  not fragile to maintain." A store with no encryption pays nothing per key, entry, block or
+  step (`scripts/cost.sh`, by function, against the commit before a change). Nothing is switched
+  off or limited under a cipher as a design property. Fix bugs and flaky tests; no shortcuts; do
+  not speculate.
+- **"On main vs upstream. Stay wholly off of upstream." (22 Nov.)** Do not fetch, merge, push to,
+  count against, build or name as a base `origin/claude/e-recode-stride-selector-g5f6hl`. A base
+  is the main line or the commit a change began at. What the branch already holds of it stays.
+- An engine default changes only after benchmarks confirm it is better and `sh scripts/check.sh`
+  has passed with it. Push whenever there is a commit. No pull request unless asked.
+- The owner (22 Nov, on the bound of `Maint::join_seal` in `scripts/cost-hot.txt`): "You can do
+  whatever you think is right on that threshold." It is 0.04 now, by the file's own rule.
+
+**Where the work is.** The page layer (one module behind the `vault::` door that isolates
+encryption from the forms) is being built in stages. Stage G1, its first gates on today's code,
+is **closed** (eight units, the full gate green, a critic's account in
+`scratch/plan/build/close/g1-built.md`). Five changes stood between G1 and stage G2; on 22 Nov:
+
+| # | change | state |
+|---|---|---|
+| 1 | the seal's words renamed, its source test rebuilt (T21) | landed `89da086f` |
+| 2 | the `cross-arm` CI group's crash inside QEMU (T22) | landed `f1cbced5` |
+| 3 | the cipher test that failed now and then (task 14), and a mutant it uncovered (T25) | landed `620e4c5a`, `3c2b64d2` |
+| - | a flake of the stride group's concurrent fuzz, met on the way (T23) | landed `bc9cdd84` |
+| - | a flake of the pager's residency unit test, met on the way | landed `a711e083` |
+| 4 | the merge probe's functions that gained instructions (T26) | **landed `594fe3ca`, built, counted and gated, but reviewed by nobody; see below** |
+| 5 | the stride form and the heads' copy made to work by the piece under a cipher (task 23) | not started |
+
+Then stage G2 (`scratch/plan/g2.md`, ten units, a conformance group), its plan first brought up
+to this tree (the critic's section "For G2" lists what moved), then the layer itself
+(`scratch/seam/design.md`, stages S1 to S7). Section 1 under "What is left" has every one of the
+above in detail, newest first near its end.
+
+**Change 4 (T26), exactly where it stopped.** Its builder finished and its work is committed as
+`594fe3ca` by the launcher, after the run was stopped for quota. What stands behind it: the instruction count against the commit it began at
+(`3c2b64d2`) green over eight probes, each reshaped function down (merge probe: `whole_key_at`
+-32.0 instructions an operation, `Emitter::enter` -21.0, `Db::seal_table`'s closure -12.0, the
+probe -268; `Db::append` unchanged, its +4 shown not to be the cipher's by a floor build); ten
+mutants killed; the builder's fuzz under a cipher in a small cache over seeds beyond the gate's
+range, eight workers, each ending green (`fuzz.summary.log`; the launcher read their last lines
+and no more); and the launcher's own gate (build, test, stride, lint, the lists against
+`3c2b64d2`, wasm: green, after one red of an unrelated unit test fixed in `a711e083`). What
+does **not** stand behind it: **no reviewer read it** (the workflow's two review lenses and
+their repair rounds never ran; the launcher read the diff's shape and not every line), and
+`scripts/cost-red.sh` was not run again after `join_seal`'s bound moved to 0.04. First
+task of the next session: read `scratch/plan/build/T26/` (notes.md, change.diff, the listings)
+and review that commit as the workflow's reviewers would (the brief is
+`scratch/plan/build/T26/brief.txt`, its section "How reviewers read it"), or run its review
+rounds by launching `scratch/plan/build/change-v1.js` with a brief that says the build is done.
+
+**How this session worked, so the next can go on the same way.** Each change is one run of the
+workflow script `scratch/plan/build/change-v1.js` (build, up to three review rounds each with a
+repair, a gate, one local commit; the launcher pushes), launched with a brief kept as a file
+(`scratch/plan/build/<key>/brief.txt` and `launch-args.json`; T21, T22 and T26 are the models).
+A brief says what is known and no more, what must be shown red first, the mutants, what must
+not be done, how an agent waits, the commit it begins at, and the disk. Small test-only fixes
+the launcher did itself, with the same discipline (T20, T23, T14, T25: a trace of the state
+first, then the state forced red, then the fix, then green under the same forcing, then a
+mutant). The scripts live in the scratchpad of the session that ran them and in
+`scratch/plan/build/`; a new session copies them from the repository. One cargo, one valgrind,
+one emulator at a time; every run its own canonical `TMPDIR`, removed by its literal path.
+
+**Lessons of 22 Nov that are also in `CLAUDE.md`:** trace the state before forcing a schedule
+(two guessed schedules cost a build and a sweep each and reproduced nothing); a count's
+baseline is read behind the join of every worker that moves it; a comment that says what a
+test holds is held to the mutant; an instrument's crash is traced to the calls in flight before
+it is read as any test's.
+
+**Open with the owner (none blocks work):** whether the lists land on the main line ahead of
+this branch (today they hold pushes only); whether the door's libc test keeps reading cargo's
+registry. The cost job's base in CI is the main line (answered by "stay wholly off of
+upstream"); against the main line it counts everything this branch merged from upstream until
+the main line holds that work, so until then the plain-store rule is held change by change.
+
+**Known to fail now and then, each to be read as its own before it is read as a change's:**
+the checked `zpages` binary's wall-clock waits under load (listed further down). Fixed on 22 Nov
+and worth knowing by name if they come back: the stride group's `concurrent_range` with
+conversions ("three settled asks ... (1, 3)"), `tests/cipher.rs`'s "the builds gave nothing
+back", and `db::pager::tests::a_view_says_what_is_in_memory_and_drops_and_asks_for_what_stands_behind_it`
+(its wait was for one page and its assertion for the whole file's share; red once in the unit
+binary and once in six runs alone, forty green after the fix; the race was read off the two
+lines and not forced by a seam).
 
 ## The story in one paragraph
 
@@ -54,15 +142,24 @@ encryption) is designed and planned and **not started**. That is the next piece 
 
 | commit | what | checked how |
 |---|---|---|
-| tip | this note only | not gated; no code changed since `3f65bfb` |
-| `3f65bfb` | count-back fix and its notes in `CLAUDE.md` | full gate green (build test stride lint wasm bench), 20 Nov |
-| `6365fdf` | last merge of upstream, at upstream `4358827` | full gate green after `e1de138` |
+| tip | this note and the records under `scratch/plan/build/` | not gated: `scratch/` only |
+| `a711e083` | the pager's residency unit test waits for what it asserts | forty runs alone, lint |
+| `594fe3ca` | change 4 (T26): three merge functions under their earlier cost, `join_seal`'s bound 0.04 | count green against `3c2b64d2`; launcher's gate: build test stride lint, lists, wasm. **Not reviewed** |
+| `3c2b64d2`, `620e4c5a` | a form build under a cipher held to resting; the cipher test's flake | cipher binary under the test and stride environments, lint; forced state and mutants |
+| `f1cbced5` | change 2 (T22): the `cross-arm` group | its unit gate, `cross-arm` three times running |
+| `bc9cdd84` | the concurrent fuzz's convert-steer flake | fuzz under every gate environment, lint |
+| `89da086f` | change 1 (T21): the seal's names | its unit gate, count green, wasm size unchanged |
+| `60921870` | the last merge of upstream's rows (before the owner's instruction) | figures redrawn, bench group |
+| `31b33339` | stage G1's last commit | **the whole default gate in one run** (build test stride lint wasm bench lists), 22 Nov |
 
-Upstream (`origin/claude/e-recode-stride-selector-g5f6hl`) was merged again on 21 Nov at
-`7c62153e` (`22dcd115`; section 1 below has what the merge held and left), and its rows twice
-after, the last at `7c712c1f` (`60921870`, 22 Nov). **That was the last: the owner's instruction
-of 22 Nov (standing instructions, above) is to stay wholly off upstream**, so it is no longer
-fetched or merged, and how far behind it the branch is, is not this work's question.
+No whole default gate has run since `31b33339`: each commit after it was held by its own unit
+gate. `bench/target/checked` was removed for disk by change 4's builder, so the next
+`sh scripts/check.sh` rebuilds it (a few minutes, 3.5 GB). A whole gate, the `cost` group and
+`cross-arm` once more are a reasonable first hour of the next session.
+
+Upstream (`origin/claude/e-recode-stride-selector-g5f6hl`) was merged five times, the last a row
+at `7c712c1f` (`60921870`, 22 Nov). **That was the last: the owner's instruction of 22 Nov is to
+stay wholly off upstream.** It is not fetched, merged, counted against or built.
 
 The history holds "In progress:" snapshot commits from 18 Nov (`7421505`, `ccc2d7b`, `e0badc1`).
 Their code has passed the full gate several times since; the main line merges by squash.
@@ -155,7 +252,7 @@ bulk replacement broke tick-exact tests once; do it test by test. Planned for th
 
 ## What is left, in the owner's order
 
-### 1. The page layer (task 12). Stage G1 is closed: eight units, the full gate green on `31b33339`, the critic's account in `scratch/plan/build/close/g1-built.md`. Of five changes that stood between it and G2 three are done (the seal's names, `89da086f`; the `cross-arm` group, `f1cbced5`; the cipher test's flake, `620e4c5a`); two are left, in the order below.
+### 1. The page layer (task 12). Stage G1 is closed: eight units, the full gate green on `31b33339`, the critic's account in `scratch/plan/build/close/g1-built.md`. Of five changes that stood between it and G2 four have landed (the seal's names, `89da086f`; the `cross-arm` group, `f1cbced5`; the cipher test's flake, `620e4c5a`; the merge probe's gainers, `594fe3ca`, which no reviewer has read); the fifth (the stride form and the heads' copy under a cipher) is not started.
 
 **As of 22 Nov 11:24 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
 launched one unit a launch: `Workflow {scriptPath, args: {base:
@@ -714,8 +811,24 @@ holds; a note for a step changes no earlier prompt, so the steps before it repla
   whole until its envelope, so only a reopened store's peak is its builds' alone): peak
   2.2 MiB as the engine is, 23 MiB and red three runs of three with the rest taken out.
   `CLAUDE.md` has both cases. Records: `scratch/plan/build/T14/`, `T25/`.
+- **The merge probe's gainers: `594fe3ca` (change T26, 22 Nov), built, counted, gated, NOT
+  reviewed.** Stopped for quota after its build step; the launcher committed the builder's
+  finished copy (its `keep/v3`, by sha256) after running the gate itself. Method, per function:
+  the instruction listing laid to source lines, then a floor from a scratch copy with the
+  cipher's arm taken out as text (no other tree built), which reproduced the earlier counts to
+  the instruction for three of the four. `OrdIndex::whole_key_at`: one limit test in the plain
+  half (the limit is zero for an index read by the piece), the old body out of line as
+  `whole_key_at_by_piece`; kept `#[inline(never)]` because inlined it read as a caller's gain.
+  `Emitter::enter`: a path clone a rank gone. `Db::seal_table`'s closure: the table bound once.
+  `vault::persist` takes its pairs as a closure called only under a cipher. `Db::append`:
+  unchanged, its floor is its count. Merge probe -268 instructions an operation.
+  `Maint::join_seal`'s bound is 0.04 (five counts of one source spread by 1,328 over the run;
+  the owner left it to judgement). Owed: the two review lenses over the diff; `sh
+  scripts/check.sh cost` once (its red input after the bound moved). Records:
+  `scratch/plan/build/T26/` (`notes.md`, `change.diff`, `cost.log`, `results.txt`, the
+  listings' scripts, `brief.txt`).
 - **Next, each a change of its own through `scratch/plan/build/change-v1.js`, in this
-  order:** (1), (2) and (3) done, above; (4) `whole_key_at` and the three small
+  order:** (1), (2) and (3) done, above; (4) landed unreviewed, above: review it first. As planned, (4) was `whole_key_at` and the three small
   gainers decomposed and brought down, each held by the count against the commit before it
   (task 20; the baseline of accepted moves against a named upstream commit that this note
   planned is not built, since no base is upstream's now: the cost job's base is the event's,

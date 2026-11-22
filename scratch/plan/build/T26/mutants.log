@@ -1,0 +1,13 @@
+START Sun Nov 22 21:22:41 UTC 2026
+M1-bypiece-top-field KILLED
+M2-bypiece-head-in-memory KILLED
+M3-top-test-inverted KILLED
+M4-lim-off-by-one KILLED
+M5-top-test-no-prefix KILLED
+M6-bypiece-n-off-by-one KILLED
+M7-enter-first-pieces-tmp KILLED
+M8-seal-rename-from-dir KILLED
+M9-persist-no-pairs KILLED
+M10-key-from-head-kept-one-short KILLED
+RESTORED-OK
+EXIT 0
