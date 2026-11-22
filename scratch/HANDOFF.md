@@ -8,6 +8,50 @@ and its older sections below are kept because they are still true of what they d
 `scratch/` is session notes kept in the repo so they survive the container. **Remove it before
 any merge or pull request.**
 
+## Correction from the owner, after the note below was written (22 Nov)
+
+The note below reads the owner's "Stay wholly off of upstream" as: never fetch, merge, count
+against or build upstream. **That reading was too wide.** The owner, asked again, in full: "It's
+fine to fetch the upstream and even to merge the upstream here, just don't modify the upstream
+or main branches. Our goal is to stay current and eventually have an encryption feature we can
+merge." So:
+
+- Fetching `origin/claude/e-recode-stride-selector-g5f6hl` and `origin/main`, merging either
+  into this branch, building them and counting against them are all fine.
+- **Never push to, or otherwise modify, upstream's branch or `main`.** Push to
+  `claude/inspiring-brahmagupta-d7y8n7` only.
+- The goal has two halves: stay current with upstream, and end with an encryption feature that
+  can be merged. The owner is worried by the branch's size and has lost its thread; say plainly
+  where things stand, in few words, whenever reporting.
+
+Wherever the text below says upstream is not fetched or merged, this section replaces it.
+
+Measured at that moment (`b05e881`):
+
+- `main` is `5aad09d`. Upstream is 323 commits ahead of it, with no pull request open; no pull
+  request is open in the repository at all. This branch is 160 commits on top of upstream (475
+  ahead of `main`), so nothing here reaches `main` before upstream's work does.
+- Upstream is 8 commits ahead of this branch (head `558606d`: rewarm options, probes, a full
+  row). A trial merge: **one conflict, in a generated file** (`docs/figures/full/index.html`,
+  redrawn by `sh bench/scripts/figures.sh`). Not merged yet.
+- This branch against upstream (`git diff 7c712c1f HEAD`), lines added:
+
+  | part | lines | what |
+  |---|---|---|
+  | `scratch/` | 123,000 | session notes; deleted before any merge |
+  | bench rows and figures | 29,000 | regenerated files |
+  | `tests/` | 31,600 | `durable.rs` 16,300 (crash states), `source.rs` and its lexer 8,300 (the gates), `cipher.rs` 2,400 |
+  | `src/` | 18,500 | the four encryption modules 8,400; `db.rs` 6,800; the readers 3,400 |
+  | docs and notes | 4,100 | `CLAUDE.md` 2,600 |
+  | scripts and CI | 3,000 | the cost count, the lists, the door, the seal |
+  | bench code, web | 1,900 | arms, probes, `web/crypt.mjs` |
+
+  About 59,000 lines a reviewer would read, of which about 16,000 is one crash-test file and
+  about 12,000 is gate machinery.
+- Put to the owner, unanswered at the time of writing: whether to get what exists merged before
+  building the page layer (the launcher's recommendation), and whether as one pull request or a
+  series.
+
 ## Start here (written 22 Nov, for a session with no memory of this one)
 
 **The owner's instructions that bind everything** (the full list is under "Standing instructions
@@ -17,9 +61,8 @@ from the owner" below; these are the ones a new session gets wrong first):
   step (`scripts/cost.sh`, by function, against the commit before a change). Nothing is switched
   off or limited under a cipher as a design property. Fix bugs and flaky tests; no shortcuts; do
   not speculate.
-- **"On main vs upstream. Stay wholly off of upstream." (22 Nov.)** Do not fetch, merge, push to,
-  count against, build or name as a base `origin/claude/e-recode-stride-selector-g5f6hl`. A base
-  is the main line or the commit a change began at. What the branch already holds of it stays.
+- **Never modify upstream's branch or `main`** (the owner, 22 Nov; see the correction above:
+  fetching, merging into this branch, building and counting against upstream are fine).
 - An engine default changes only after benchmarks confirm it is better and `sh scripts/check.sh`
   has passed with it. Push whenever there is a commit. No pull request unless asked.
 - The owner (22 Nov, on the bound of `Maint::join_seal` in `scripts/cost-hot.txt`): "You can do
@@ -125,8 +168,10 @@ encryption) is designed and planned and **not started**. That is the next piece 
 - No pull request unless asked. No model ids in commits. Commit trailer: the `Co-Authored-By`
   and `Claude-Session` lines the session gives.
 - Preferences: be logical, test locally, do not speculate, no shortcuts.
-- **Stay off upstream (the owner, 22 Nov, in full: "On main vs upstream. Stay wholly off of
-  upstream.").** It answered a report that had asked what the lists' and the cost job's base
+- **Superseded by the correction at the top of this file: fetching and merging upstream are
+  fine, modifying upstream or `main` is not.** What follows is the first reading, kept as it
+  was written. Stay off upstream (the owner, 22 Nov, in full: "On main vs upstream. Stay wholly
+  off of upstream."). It answered a report that had asked what the lists' and the cost job's base
   should be while upstream's work is not on the main line. Read here as: from that message on,
   nothing is done with `origin/claude/e-recode-stride-selector-g5f6hl`. It is not fetched,
   merged, pushed to, counted against or named as any gate's or CI job's base; a base is the main
@@ -159,7 +204,8 @@ gate. `bench/target/checked` was removed for disk by change 4's builder, so the 
 
 Upstream (`origin/claude/e-recode-stride-selector-g5f6hl`) was merged five times, the last a row
 at `7c712c1f` (`60921870`, 22 Nov). **That was the last: the owner's instruction of 22 Nov is to
-stay wholly off upstream.** It is not fetched, merged, counted against or built.
+stay wholly off upstream.** (Corrected the same day, at the top of this file: fetch and merge
+are fine; upstream is 8 commits ahead and its merge is owed.)
 
 The history holds "In progress:" snapshot commits from 18 Nov (`7421505`, `ccc2d7b`, `e0badc1`).
 Their code has passed the full gate several times since; the main line merges by squash.
@@ -837,8 +883,8 @@ holds; a note for a step changes no earlier prompt, so the steps before it repla
   "a plain store pays nothing" is held change by change, against the commit before); (5) the
   stride form and the heads' copy made to work under a cipher by the piece, with tests, and
   the docs' sentence made true. Then G2 (`scratch/plan/g2.md`), its plan first brought up
-  to this tree: the critic's section "For G2" lists what moved. Upstream is not fetched or merged
-  (the owner, 22 Nov; it was, before each launch, until then).
+  to this tree: the critic's section "For G2" lists what moved. Upstream may be fetched and
+  merged again (the correction at the top of this file).
 - **The owner's to decide, none of it blocking:** whether the lists should land on the
   main line ahead of this branch so that a pull request is held by them (today they hold
   pushes only); what the cost job's base is in CI before upstream itself is on the main
@@ -910,10 +956,9 @@ Read before starting:
 
 ### 4. Integrate once (task 14)
 
-(Written 20 Nov, before the owner's instruction of 22 Nov to stay wholly off upstream: the
-integration is with the main line, when the owner asks for it, and no step of it fetches,
-merges or counts against upstream's branch. What follows is the old plan, kept for its other
-steps.) Merge upstream's head (9 hunks at the stop), fix the fragile zpages tests above, run
+(Written 20 Nov. The owner's word since, at the top of this file: stay current with upstream
+by merging it here, never modify upstream or `main`, and end with a feature that can be merged.
+The steps below stand.) Merge upstream's head (9 hunks at the stop), fix the fragile zpages tests above, run
 `scripts/cost.sh` against the new upstream head, run the gate, then a stress of the `zpages`,
 `durable` and `cipher` binaries, then the quick row (`sh scripts/check.sh quick`, a timing run,
 machine to itself; after a default changes, open the whole roster at the smallest rung first).
