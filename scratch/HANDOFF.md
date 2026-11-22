@@ -48,9 +48,37 @@ Measured at that moment (`b05e881`):
 
   About 59,000 lines a reviewer would read, of which about 16,000 is one crash-test file and
   about 12,000 is gate machinery.
-- Put to the owner, unanswered at the time of writing: whether to get what exists merged before
-  building the page layer (the launcher's recommendation), and whether as one pull request or a
-  series.
+- Put to the owner and **answered (22 Nov): "We're not going to merge partial."** The page layer
+  is built on this branch before anything merges, upstream conflicts and all: "I encourage you
+  to have the cleanest design possible to that end." And the bar for the merge, in the owner's
+  words: "this is a performance first project, so our eventual bar for merging requires no
+  impact for unencrypted runs, and beating competitors on added encryption benchmarks."
+
+### The merge bar, and what it needs that does not exist yet
+
+1. **No impact for unencrypted runs.** Held by instruction count, change by change
+   (`scripts/cost.sh`, the `cost` group). Owed beside it before a merge is proposed: the timing
+   rows (quick, full, ooc) at the branch's head against upstream's at the commit merged, since a
+   count sees no stall.
+2. **Beating competitors on added encryption benchmarks.** At the time of writing the suite has
+   **no encrypted comparator arm**: `bench/src/engines.rs` runs LMDB (`heed` 0.20) and RocksDB
+   (`rocksdb` 0.23) in the clear only, and every encryption pairing so far is supdb against
+   itself. What the dependencies offer, read off cargo's registry on 22 Nov:
+   - RocksDB ships `include/rocksdb/env_encryption.h` (`NewEncryptedEnv`, an
+     `EncryptionProvider`, a CTR stream over a block cipher of which only ROT13 is built in),
+     but neither the C API (`c.h`) nor the `rocksdb` crate exposes it: an encrypted RocksDB arm
+     needs a small C++ shim with a real block cipher. CTR authenticates nothing, so the arm's
+     guarantee is weaker than `Encryption::Cipher`'s and the row says so.
+   - `heed` 0.20 and `lmdb-master-sys` 0.2.6 have no encryption. LMDB's page encryption
+     (`mdb_env_set_encrypt`) is on its `mdb.master3` line, which the `heed3` crate wraps with a
+     caller's AEAD: a second LMDB dependency beside the first.
+   - Both comparators on a directory the kernel encrypts stand beside `supdb-dirkey`
+     (`scripts/fscrypt.sh`); this guest's kernel has no AES instructions in its cipher
+     (`CLAUDE.md`), so its write cells there are the kernel's.
+   Order this implies: the encrypted comparator arms and one row of them come **before** the
+   page layer's stages, since the cells supdb loses under a cipher are what the layer has to be
+   designed to win (in its cache `supdb-cipher` reads 0.8-0.92x of `supdb`; out of its cache a
+   miss is four microseconds and the scans are 0.11-0.39x of the store in its cache).
 
 ## Start here (written 22 Nov, for a session with no memory of this one)
 
