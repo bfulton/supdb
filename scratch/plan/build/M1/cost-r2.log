@@ -1,0 +1,122 @@
+START Sat Nov 21 21:23:32 UTC 2026
+== land (toggle): total 510,586,035 -> 476,255,995 (-343.30 an op over 100,000)
+  129 functions moved
+   -193.366 an op  -19,336,638      19,337,799 ->          1,161  supdb::db::CachedBlock::lower_bound::{closure#0}
+    -90.258 an op   -9,025,754      21,583,481 ->     12,557,727  supdb::db::Reader::splice_run
+    -50.035 an op   -5,003,469       5,004,189 ->            720  supdb::db::Reader::leave
+    -40.435 an op   -4,043,469       4,043,469 ->              0  supdb::db::BuildCtx::emit_over
+    +38.011 an op   +3,801,083               0 ->      3,801,083  supdb::db::WriterOp::drop
+    +35.010 an op   +3,501,028               0 ->      3,501,028  supdb::db::Db::op
+    -35.010 an op   -3,501,028       3,501,993 ->            965  supdb::db::Reader::enter
+    +29.589 an op   +2,958,931       2,623,444 ->      5,582,375  supdb::db::BuildCtx::copy_block
+    -17.587 an op   -1,758,750       1,758,750 ->              0  supdb::blob::Blob::flat
+    -14.875 an op   -1,487,470       1,487,470 ->              0  supdb::blob::Blob::values_at::{closure#0}
+    +14.875 an op   +1,487,470               0 ->      1,487,470  supdb::blob::Blob::values_at_pieces::{closure#0}
+    -11.928 an op   -1,192,838      10,001,978 ->      8,809,140  __memcmp_avx2_movbe
+     -9.836 an op     -983,574      81,483,334 ->     80,499,760  supdb::db::Reader::settle_each
+     +7.895 an op     +789,453               0 ->        789,453  supdb::blob::Blob::key_at
+     +7.763 an op     +776,347               0 ->        776,347  supdb::blob::Blob::scan_whole
+     -4.796 an op     -479,642       3,506,940 ->      3,027,298  supdb::db::BuildCtx::overlay_runs
+     -4.199 an op     -419,927         839,468 ->        419,541  supdb::db::Reader::raw_scan
+     +3.375 an op     +337,544      21,498,471 ->     21,836,015  supdb::db::Reader::patch_block
+     -3.000 an op     -300,025      43,855,226 ->     43,555,201  land_probe::rounds
+     -2.548 an op     -254,757       2,138,927 ->      1,884,170  supdb::db::SnapBounds::cuts_of
+     -1.974 an op     -197,421      19,367,067 ->     19,169,646  __memcpy_avx_unaligned_erms
+     -1.264 an op     -126,415       2,440,894 ->      2,314,479  supdb::blob::Blob::scan_at_in
+     -1.230 an op     -123,005       1,523,926 ->      1,400,921  supdb::db::bound_pieces_of::{closure#5}
+     +1.125 an op     +112,500       1,000,000 ->      1,112,500  supdb::blob::Blob::exts_at
+     +0.547 an op      +54,716       2,325,287 ->      2,380,003  supdb::db::Reader::cut_raw
+  283 hot functions ran (237 on no line), 109 of them moved, -329.480 an op between them; slack 64 instructions a function over the run, 2 of them held to a bound of their own
+  bound 0.002 an op: std::sys::pal::unix::time::Timespec::now +0.000 an op
+  bound 0.010 an op: supdb::db::Maint::join_seal +0.032 an op
+  HOT GAINED: [usize]::sort_by_key::{closure#0} (over the engine) +0.007 an op, +652 over the run
+  HOT GAINED: alloc::raw_vec::RawVec::grow_one +0.004 an op, +384 over the run
+  HOT GAINED: core::ptr::drop_glue (over the engine) +0.001 an op, +90 over the run
+  HOT GAINED: memmap2::os::file_len +0.004 an op, +400 over the run
+  HOT GAINED: std::path::Components::eq +0.006 an op, +592 over the run
+  HOT GAINED: supdb::blob::Blob::exts_at +1.125 an op, +112,500 over the run
+  HOT GAINED: supdb::blob::Blob::key_at +7.895 an op, +789,453 over the run
+  HOT GAINED: supdb::blob::Blob::scan_whole +7.763 an op, +776,347 over the run
+  HOT GAINED: supdb::blob::Blob::values_at_pieces::{closure#0} +14.875 an op, +1,487,470 over the run
+  HOT GAINED: supdb::db::BuildCtx::copy_block +29.589 an op, +2,958,931 over the run
+  HOT GAINED: supdb::db::BuildCtx::deltas_for +0.011 an op, +1,130 over the run
+  HOT GAINED: supdb::db::BuildCtx::give_offs +0.211 an op, +21,087 over the run
+  HOT GAINED: supdb::db::Db::commit +0.003 an op, +296 over the run
+  HOT GAINED: supdb::db::Db::op +35.010 an op, +3,501,028 over the run
+  HOT GAINED: supdb::db::Db::seal +0.057 an op, +5,712 over the run
+  HOT GAINED: supdb::db::Db::sync_wal +0.002 an op, +192 over the run
+  HOT GAINED: supdb::db::Maint::join_seal +0.032 an op, +3,208 over the run (its bound 0.010 an op)
+  HOT GAINED: supdb::db::Maint::land_front +0.003 an op, +272 over the run
+  HOT GAINED: supdb::db::Maint::publish +0.003 an op, +310 over the run
+  HOT GAINED: supdb::db::Maint::publish_segs_with +0.001 an op, +70 over the run
+  HOT GAINED: supdb::db::Maint::retire_covered +0.001 an op, +80 over the run
+  HOT GAINED: supdb::db::Maint::slot_needs_log +0.006 an op, +612 over the run
+  HOT GAINED: supdb::db::Maint::sync_owed_slot +0.001 an op, +144 over the run
+  HOT GAINED: supdb::db::Maint::watch_slot +0.002 an op, +190 over the run
+  HOT GAINED: supdb::db::Maint::write_slot +0.006 an op, +570 over the run
+  HOT GAINED: supdb::db::Options::clone +0.006 an op, +576 over the run
+  HOT GAINED: supdb::db::PartReader::raw_walk +0.464 an op, +46,408 over the run
+  HOT GAINED: supdb::db::Reader::build_settled +0.016 an op, +1,559 over the run
+  HOT GAINED: supdb::db::Reader::complete_forms +0.053 an op, +5,277 over the run
+  HOT GAINED: supdb::db::Reader::cut_raw +0.547 an op, +54,716 over the run
+  HOT GAINED: supdb::db::Reader::patch_block +3.375 an op, +337,544 over the run
+  HOT GAINED: supdb::db::Reader::scan +0.003 an op, +279 over the run
+  HOT GAINED: supdb::db::Reader::scan_seek +0.001 an op, +120 over the run
+  HOT GAINED: supdb::db::Reader::sweep_retired_states +0.016 an op, +1,574 over the run
+  HOT GAINED: supdb::db::Wal::write +0.004 an op, +368 over the run
+  HOT GAINED: supdb::db::WriterOp::drop +38.011 an op, +3,801,083 over the run
+  HOT GAINED: supdb::db::manifest_encode_with +0.023 an op, +2,344 over the run
+  HOT GAINED: supdb::db::manifest_image +0.004 an op, +420 over the run
+  HOT GAINED: supdb::db::manifest_write_slot_unsynced +0.003 an op, +270 over the run
+  HOT GAINED: supdb::db::vault::exists +0.004 an op, +380 over the run
+  HOT GAINED: supdb::db::vault::len +0.008 an op, +780 over the run
+  HOT GAINED: supdb::db::vault::locate +0.014 an op, +1,440 over the run
+  HOT GAINED: supdb::db::vault::map +0.006 an op, +560 over the run
+  HOT GAINED: supdb::db::vault::remove_file +0.007 an op, +740 over the run
+  HOT GAINED: supdb::db::vault::sync_dir_as +0.002 an op, +160 over the run
+  HOT GAINED: supdb::db::vault::sync_dir_seamed +0.016 an op, +1,560 over the run
+  HOT GAINED: supdb::db::vault::under +0.004 an op, +378 over the run
+  HOT GAINED: supdb::flatindex::FlatIndex::parse_head::{closure#0} +0.010 an op, +1,030 over the run
+  HOT GAINED: supdb::flatindex::MappedBlocks::parse +0.003 an op, +340 over the run
+  HOT GAINED: supdb::ordindex::OrdIndex::open +0.005 an op, +520 over the run
+  HOT GAINED: supdb::ordindex::OrdIndex::whole_key_at +0.524 an op, +52,441 over the run
+== scan (toggle): total 13,821,856 -> 13,471,973 (-349.88 an op over 1,000)
+  15 functions moved
+   -301.000 an op     -301,000       5,871,000 ->      5,570,000  supdb::blob::Blob::scan_at_in
+    -69.000 an op      -69,000          69,000 ->              0  supdb::blob::Blob::scan_at
+    +61.000 an op      +61,000               0 ->         61,000  supdb::blob::Blob::scan_whole
+    -52.000 an op      -52,000          52,000 ->              0  supdb::db::Reader::leave
+    +36.000 an op      +36,000               0 ->         36,000  supdb::db::Reader::leave_looked
+    -35.035 an op      -35,035          35,035 ->              0  supdb::blob::Blob::flat
+    -17.000 an op      -17,000         482,498 ->        465,498  supdb::db::Reader::scan_blocks
+    +15.000 an op      +15,000         534,530 ->        549,530  supdb::db::Reader::scan_seek
+    +11.002 an op      +11,002         249,013 ->        260,015  supdb::db::Reader::scan
+     +1.000 an op       +1,000          34,000 ->         35,000  supdb::db::Reader::raw_scan
+     +0.120 an op         +120           2,906 ->          3,026  _int_malloc
+     +0.063 an op          +63               0 ->             63  supdb::blob::Blob::key_at
+     -0.039 an op          -39              94 ->             55  supdb::db::Reader::cache_key_at
+     +0.004 an op           +4               0 ->              4  alloc_perturb
+     +0.002 an op           +2       2,292,902 ->      2,292,904  __memcpy_avx_unaligned_erms
+  47 hot functions ran (28 on no line), 12 of them moved, -350.009 an op between them; slack 64 instructions a function over the run, 0 of them held to a bound of their own
+  HOT GAINED: supdb::blob::Blob::scan_whole +61.000 an op, +61,000 over the run
+  HOT GAINED: supdb::db::Reader::leave_looked +36.000 an op, +36,000 over the run
+  HOT GAINED: supdb::db::Reader::raw_scan +1.000 an op, +1,000 over the run
+  HOT GAINED: supdb::db::Reader::scan +11.002 an op, +11,002 over the run
+  HOT GAINED: supdb::db::Reader::scan_seek +15.000 an op, +15,000 over the run
+== read (toggle): total 189,245,334 -> 187,012,976 (-11.16 an op over 200,000)
+  9 functions moved
+   +189.357 an op  +37,871,428               0 ->     37,871,428  supdb::db::Reader::read_all_in::{closure#5}
+   -187.348 an op  -37,469,682      37,469,682 ->              0  supdb::db::Reader::read_all::{closure#5}
+    -52.000 an op  -10,400,000      10,400,000 ->              0  supdb::db::Reader::leave
+    +36.000 an op   +7,200,000               0 ->      7,200,000  supdb::db::Reader::leave_looked
+     +3.000 an op     +600,001      69,200,002 ->     69,800,003  supdb_bench::engines::supdb_get
+     -1.000 an op     -200,000      19,000,000 ->     18,800,000  supdb::blob::Blob::read_exts
+     +0.831 an op     +166,104       3,944,416 ->      4,110,520  __memcmp_avx2_movbe
+     -0.001 an op         -197             507 ->            310  _int_malloc
+     -0.000 an op          -12              33 ->             21  unlink_chunk.isra.0
+  16 hot functions ran (4 on no line), 6 of them moved, -11.991 an op between them; slack 64 instructions a function over the run, 0 of them held to a bound of their own
+  HOT GAINED: supdb::db::Reader::leave_looked +36.000 an op, +7,200,000 over the run
+  HOT GAINED: supdb::db::Reader::read_all_in::{closure#5} +189.357 an op, +37,871,428 over the run
+  HOT GAINED: supdb_bench::engines::supdb_get +3.000 an op, +600,001 over the run
+cost: RED
+EXIT 1

@@ -1,0 +1,14 @@
+
+=== lists ===
+ratchet-red: 63 cases, each as it must be
+ratchet-red: green
+base: b1e9a809dd2f9ac8e6aa87beb5f74a76be042d22, the merge-base of HEAD and SUPDB_BASE (an explicit override)
+ratchet: the lists at b1e9a809dd2f9ac8e6aa87beb5f74a76be042d22 (the merge-base of HEAD and b1e9a809dd2f9ac8e6aa87beb5f74a76be042d22) against the tree
+  tests/data/cost-entries.txt: held, 330 keys at the base, 332 in the tree, 2 raised
+  tests/data/couplings.txt: held, 74 keys at the base, 74 in the tree, 0 raised
+  tests/data/door-libc.txt: held, 68 keys at the base, 68 in the tree, 0 raised
+  tests/data/door.txt: held, 76 keys at the base, 76 in the tree, 0 raised
+ratchet: tests/data/cost-entries.txt: Reader::block_cache_identity: 0 -> 1, a raise scripts/raises.txt does not declare (list, key, from, to, reason)
+ratchet: tests/data/cost-entries.txt: Reader::piece_bounds: 0 -> 1, a raise scripts/raises.txt does not declare (list, key, from, to, reason)
+ratchet: RED
+EXIT 1

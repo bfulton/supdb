@@ -1,0 +1,48 @@
+---- a_ci_step_that_checks_outside_check_sh_fails stdout ----
+
+thread 'a_ci_step_that_checks_outside_check_sh_fails' (31547) panicked at tests/source.rs:5860:26:
+the workflow as it stands is green: ".github/workflows/ci.yml: line 98: the environment `KEYS: ${{ inputs.keys }}` is on no list of the test: CI passes the event's values, and the checks decide the rest"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/std/src/panicking.rs:689:5
+--
+---- a_group_no_ci_job_runs_fails stdout ----
+
+thread 'a_group_no_ci_job_runs_fails' (31558) panicked at tests/source.rs:6078:26:
+the workflow as it stands is green: ".github/workflows/ci.yml: line 98: the environment `KEYS: ${{ inputs.keys }}` is on no list of the test: CI passes the event's values, and the checks decide the rest"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/std/src/panicking.rs:689:5
+--
+---- a_new_entry_point_on_no_line_fails stdout ----
+
+thread 'a_new_entry_point_on_no_line_fails' (31564) panicked at tests/source.rs:4564:66:
+pub type R = Vec<Reader>;
+impl Foo for R {
+    fn f(&self) {}
+}
+--
+---- a_workflow_the_test_does_not_hold_fails stdout ----
+
+thread 'a_workflow_the_test_does_not_hold_fails' (31581) panicked at tests/source.rs:5713:45:
+the workflows as they stand are green: ".github/workflows/ci.yml: line 98: the environment `KEYS: ${{ inputs.keys }}` is on no list of the test: CI passes the event's values, and the checks decide the rest"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/std/src/panicking.rs:689:5
+--
+---- ci_checks_only_through_check_sh_and_runs_every_group stdout ----
+
+thread 'ci_checks_only_through_check_sh_and_runs_every_group' (31584) panicked at tests/source.rs:5506:9:
+.github/workflows:
+.github/workflows/ci.yml: line 98: the environment `KEYS: ${{ inputs.keys }}` is on no list of the test: CI passes the event's values, and the checks decide the rest
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+--
+---- every_entry_point_is_counted_by_a_probe_or_says_why_not stdout ----
+
+thread 'every_entry_point_is_counted_by_a_probe_or_says_why_not' (31592) panicked at tests/source.rs:4446:9:
+the plain-cost job's entry points:
+src/db.rs: pub fn Reader::block_cache_identity is on no line of tests/data/cost-entries.txt: name the probes of scripts/cost.sh that count it, or `-` and the reason none does
+src/db.rs: pub fn Reader::piece_bounds is on no line of tests/data/cost-entries.txt: name the probes of scripts/cost.sh that count it, or `-` and the reason none does
+stack backtrace:
+EXIT 0

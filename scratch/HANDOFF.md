@@ -46,10 +46,10 @@ encryption) is designed and planned and **not started**. That is the next piece 
 | `3f65bfb` | count-back fix and its notes in `CLAUDE.md` | full gate green (build test stride lint wasm bench), 20 Nov |
 | `6365fdf` | last merge of upstream, at upstream `4358827` | full gate green after `e1de138` |
 
-Upstream (`origin/claude/e-recode-stride-selector-g5f6hl`) has moved since: **6 commits ahead,
-head `9bfc436`** (a sparse stride form, off by default; bench key shapes; an ooc row). A trial
-merge at the stop: **9 conflict hunks in 4 files** (`bench/src/engines.rs` 3, `src/db/zfile.rs`
-4, `src/db.rs` 1, `tests/zpages.rs` 1). Not merged, by the owner's "integrate once".
+Upstream (`origin/claude/e-recode-stride-selector-g5f6hl`) was merged again on 21 Nov at
+`7c62153e` (`22dcd115`; section 1 below has what the merge held and left). It moves daily: fetch
+it by name and count `git rev-list --count HEAD..origin/claude/e-recode-stride-selector-g5f6hl`
+before saying how far behind the branch is.
 
 The history holds "In progress:" snapshot commits from 18 Nov (`7421505`, `ccc2d7b`, `e0badc1`).
 Their code has passed the full gate several times since; the main line merges by squash.
@@ -142,9 +142,9 @@ bulk replacement broke tick-exact tests once; do it test by test. Planned for th
 
 ## What is left, in the owner's order
 
-### 1. The page layer (task 12). Stage G1 under way: six units of eight landed, the lists' check, and the count against upstream brought under; a merge of upstream is next, then the last two.
+### 1. The page layer (task 12). Stage G1 under way: six units of eight landed, the lists' check, the count against upstream brought under, and upstream merged again at `7c62153e`; two units left.
 
-**As of 21 Nov 19:49 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
+**As of 22 Nov 03:42 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
 launched one unit a launch: `Workflow {scriptPath, args: {base:
 "ea6352181f342b7bffd75ec8c88df92bc7b78ff6", only: ["G1-<n>"], tail: false, since: <note>}}`,
 the same base for every unit; after G1-8 a launch with `only: ["none"]` and no `tail: false`
@@ -414,24 +414,97 @@ holds; a note for a step changes no earlier prompt, so the steps before it repla
   - Owed to S5, no timing taken: `bench/scripts/pair.sh supdb-cipher64 supdb-cipher 1000000
     --reps 4` with an arm that sets `merge_read_ahead`, and `pair.sh supdb-cipherauto
     supdb-cipher 5000000 --bound 671088640 --passes read`.
-- **The owner asked for upstream to be merged again (21 Nov: "May want to merge upstream
-  changes again."), and it is next, before G1-7.** Upstream
-  (`origin/claude/e-recode-stride-selector-g5f6hl`) was 31 commits past the last merge
-  (`9bfc4362`) at `7c62153e`, in the files G1-7 edits. A trial merge over `eab987d1`
-  conflicts in three files: `src/db.rs` (six hunks, one cause: both sides fixed a copy's
-  claim about a partition's records carried across its rewrite, `identity: u64` with a key
-  compare at the patch here, `identity: bool` beside `identity_of` upstream, `c5491c59`),
-  `tests/fuzz.rs` (the summary line's counters) and `CLAUDE.md` (entries of both sides).
-  It runs as a change called M1 through `scratch/plan/build/change-v1.js` (the script T17
-  and T18 ran through), its brief `scratch/plan/build/M1/brief.txt` and its arguments
-  `scratch/plan/build/M1/launch-args.json`: the merge, one shape of the identity fix chosen
-  on soundness, then the count against upstream, then less code; this branch's gates answered
-  for upstream's new code; what each new upstream mechanism does under a cipher, with the
-  fuzz under a cipher beyond the gate's range; every arm opened once at the smallest rung;
-  the whole count against the upstream head merged; the full gate. Upstream's new defaults
-  (the bounds options, the quiet third merge) come as upstream set them, and the pairings
-  the cipher arms owe for them are named, not run.
-- **Next, in order:** M1 (the merge), then G1-7 `sealed`, G1-8 `docs`.
+- **Upstream merged again: `22dcd115` (a change called M1), with `2a0d750a` after it.** The
+  owner asked (21 Nov: "May want to merge upstream changes again."); it went in before G1-7,
+  which edits the files upstream is editing. Merged: `origin/claude/e-recode-stride-selector-g5f6hl`
+  at `7c62153e`, 31 commits past `9bfc4362`. It ran through `scratch/plan/build/change-v1.js`
+  from the brief `scratch/plan/build/M1/brief.txt`, three review rounds. What stands:
+  - **One shape of the copy's identity.** Both sides had fixed a copy's claim about a
+    partition's records carried across its rewrite. The merged tree has upstream's
+    representation (`identity: bool`, `identity_of`, `CachedBlock::identity_for`) with this
+    branch's key compare kept at the patch (`Reader::splice_run` takes the rank's entry where
+    the claim is of the table's partition or one key compare at that entry proves it, and
+    searches otherwise), chosen on the land probe's count. Both sides' `tests/settle.rs` tests
+    stay, each red with the fix out. `CLAUDE.md`'s two entries are one.
+  - **Text-clean and wrong, twice.** Upstream's `OrdIndex::head_bracket` read `self.top`, a
+    field this branch made a method (`top()`, which is also what is right for an index by
+    the piece; a new ordindex test holds the bracket by the piece to the mapped one). Both
+    sides added `tests/settle.rs` tests whose stores were named `copy-identity-rewrite`: one
+    directory for two tests of one process, red 15 runs of 15 until this branch's were
+    renamed. Then every function both sides touched was listed and its merged body held to
+    the base plus both sides' changes (`both/both.py`, `union.py`), and every changed file
+    to the exact per-line sum (`whole3.py`: 74 of 84, the other ten the hand-resolved ones).
+  - **Two engine edits beyond the merge, for the count.** Upstream's read-mode note
+    (`ModeNote`) is a cell a field where it was one cell copied whole in and out a read:
+    `Reader::scan` reads 21 instructions a scan under upstream where the plain merge read 11
+    over. `OrdIndex::seek_in_exact` searches the heads held in memory unchecked with the
+    window bounded once (a mapping by the piece holds none and takes the head-at-a-time
+    loop): `Reader::cut_raw` under upstream. Both read by two reviewers and by the launcher.
+  - **This branch's gates over upstream's code.** The workflows test admits the quick job's
+    `KEYS` beside `ARMS`. Two cost entries for upstream's doc-hidden test seams
+    (`Reader::block_cache_identity`, `Reader::piece_bounds`), their raises declared in
+    `scripts/raises.txt`, the first raises this branch declared. The wall needed none; the
+    door is clean; upstream's added code calls nothing G1-6 removed. `docs/figures` was
+    behind upstream's own ooc rows and the bench group red on it: redrawn by
+    `sh bench/scripts/figures.sh`.
+  - **Under a cipher.** Each new upstream mechanism read for what bytes it reads: the bounds
+    walk (the index's top level, a record by the piece on a tie), the landing that leaves
+    bounds unread and the quiet third merge (atomics), the fence-stepping cursor (the fence in
+    memory, the page by `slice_at`), the sparse walk's key step (a field). The differential
+    fuzz beyond the gate: seeds 1000 to 4000 under a cipher with a 16 KiB cache and in the
+    clear, block cache on, options varied, and 1000 to 2000 with the compact form forced: no
+    failure; the counters show the cipher runs draw upstream's options. Every arm of the
+    roster and every cipher arm opened once at ten thousand keys, no refusal.
+  - **The count against `7c62153e`.** All fifteen probes under upstream by their totals
+    (`cost-r3.log`; the four that run the bench code again in `cost-r4.log`): read -38 an
+    operation, scan -382, merge -215, land -344, the loads -6 to -8. The gate still exits red
+    by function, as it did against `9bfc4362`: each gainer is paired with its loser in the
+    notes, is once a store, or is on the list below.
+  - **Two of upstream's tests were flaky, each red on upstream's head alone, each fixed in
+    the test.** `a_bounds_walk_places_a_boundary_by_its_head_and_reads_its_record_only_on_a_tie`:
+    every store walks the keys twice (the upkeep thread's fill, the landing's walk), and a
+    seal that freezes the burst before the lent fill runs leaves one store a walk short; red
+    5 of 5 with the upkeep thread held; the test fills inline and counts the walks since the
+    burst was filed. The stride group's conversion steer in the fuzz: a seed's asks, each
+    replaced by the next and taken only at the segment work's turn, can all go untaken beside
+    seals and merges (16 of 24 red on upstream's head six at once); the test asks the first
+    served partition three times after the writer's last settle, settling each, and holds a
+    move each way. A durable test that read a stopped queue's flag and then a commit's answer
+    waits for the answer it reads.
+  - **The lists' check answered by its base** (`2a0d750a`, the launcher's, after the merge):
+    the two raises were let through against the branch's tip before the merge and read red
+    against the main line, which predates every list. A declaration for a list the base does
+    not have holds nothing now and is said so; three cases in `scripts/ratchet-red.sh`, three
+    mutants red. `sh scripts/check.sh lists` is green against both bases.
+  Notes, mutants, scripts, results and count logs: `scratch/plan/build/M1/` (and `T19/` under
+  it for the lists' fix). Open, each owed to a named place:
+  - **The cost gate against upstream cannot fail usefully**: its verdict is red before and
+    after any change, so a new regression reads like the reconciled list. A baseline of
+    accepted gainers, or a declared group held to its net, that `scripts/cost-diff.py` reads
+    (`scripts/raises.txt` is shaped to carry it). And four gainers in the merge probe have no
+    loser named since T17: `OrdIndex::whole_key_at` +10.9 an operation,
+    `Db::seal_table`'s closure +5, `Db::append` +4, `Emitter::enter` +3; `Maint::join_seal`
+    reads +0.034 against its bound of 0.010 in the land probe (0.027 at T17). A change of its
+    own, before the integration.
+  - `tests/cipher.rs` `the_compact_form_is_built_and_read_within_a_cache_the_store_does_not_fit`
+    ("the builds gave nothing back") went red once more, in the stride group, and is still
+    undiagnosed: `scratch/plan/build/M1/cipherflake-red.txt` has its counts. Task 14.
+  - `heads owned` is never reached under a cipher (the heads' copy is a mapped file's):
+    an option that silently does nothing there. The page layer's, or a change of its own.
+  - Upstream's new defaults (`bounds_by_heads`, `land_bounds_read`,
+    `merge_parallel_quiet: 3`) were priced on plain stores; the cipher arms inherit them
+    unpriced, and no cipher arm with them off exists. Owed to S5: each cipher arm against
+    the same arm with the option off, at 300,000 keys and, for the bounds options, under a
+    bound at ten million.
+  - The bounds test no longer runs the walk on the lent-fill path, and its fills' room was
+    not driven closed by real refaults (a forced fill-off stands in). The fuzz's three-ask
+    shape ran over the gate's seeds only. The suite's `Supdb::with_policy` costs about 9,000
+    instructions more once a store than upstream's (an `Options` that holds `Arc`s, built by
+    struct update): the suite's open, not the engine's.
+  - The walk's start under a stale claim is still reached by no store test (T17's M4b); a
+    unit test of `identity_for` holds the predicate.
+- **Next, in order:** G1-7 `sealed`, then G1-8 `docs`; then the full gate and the critic
+  (a launch with `only: ["none"]`). The count's base against upstream is `7c62153e` now.
   Every unit from here is launched with a build note: a CI job it adds is
   `sh scripts/check.sh <group>` with nothing in the YAML but event values, a list it adds is
   registered in `scripts/ratchet.py`, and a move between functions the cost group reads red is

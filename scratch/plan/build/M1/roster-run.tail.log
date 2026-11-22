@@ -1,0 +1,20 @@
+      3s  size     10000  rep 0 (warmup)  rocksdb-tuned   load     821885 ops/s  read    1457361/s  3t    2896000/s  scan     8838630/s  3t    24219149/s  ycsb-A    348956/s  prime  1.05 us/pg  rss 0.04 GB
+      4s  size     10000  rep 0 (warmup)  supdb-ingest    load    1573950 ops/s  read    3991345/s  3t   13214765/s  scan    63903480/s  3t   220380009/s  ycsb-A   2605670/s  prime  1.03 us/pg  rss 0.04 GB
+      4s  size     10000  rep 0 (warmup)  lmdb-nosync     load    1617031 ops/s  read    2562755/s  3t   10059424/s  scan    56293944/s  3t   122378305/s  ycsb-A   1388995/s  prime  1.10 us/pg  rss 0.04 GB
+      5s  size     10000  rep 0 (warmup)  rocksdb-tuned-nosync load    1284079 ops/s  read    1425765/s  3t    4614282/s  scan     8611076/s  3t    22285262/s  ycsb-A   1236286/s  prime  1.07 us/pg  rss 0.04 GB
+      5s  size     10000  rep 1  supdb           load     756753 ops/s  read    4015463/s  3t   18394977/s  scan    76175386/s  3t   261757538/s  ycsb-A    481105/s  prime  1.10 us/pg  rss 0.05 GB
+      5s  size     10000  rep 1  supdb-nozpages  load     824575 ops/s  read    3354507/s  3t   12065453/s  scan    72411296/s  3t   202053728/s  ycsb-A    619155/s  prime  1.25 us/pg  rss 0.05 GB
+      5s  size     10000  rep 1  supdb-forms     load     966669 ops/s  read    3896103/s  3t   19201106/s  scan    72026909/s  3t   295779172/s  ycsb-A    702200/s  prime  1.06 us/pg  rss 0.05 GB
+      6s  size     10000  rep 1  supdb-settle    load     848609 ops/s  read    2665856/s  3t   12538483/s  scan    59936228/s  3t   170961514/s  ycsb-A    452713/s  prime  1.09 us/pg  rss 0.05 GB
+      6s  size     10000  rep 1  supdb-nosnap    load     882461 ops/s  read    2703925/s  3t   17396175/s  scan    49943065/s  3t   293520391/s  ycsb-A    492715/s  prime  1.32 us/pg  rss 0.05 GB
+      6s  size     10000  rep 1  supdb-noadvice  load     911690 ops/s  read    3865421/s  3t   17708528/s  scan    68411151/s  3t   277548286/s  ycsb-A    487179/s  prime  1.26 us/pg  rss 0.05 GB
+      7s  size     10000  rep 1  supdb-nocache   load    1009490 ops/s  read    3873468/s  3t   12482473/s  scan    60691028/s  3t   178000682/s  ycsb-A    554158/s  prime  1.17 us/pg  rss 0.05 GB
+      7s  size     10000  rep 1  supdb-cache256  load     886350 ops/s  read    3881151/s  3t   19237835/s  scan    74497884/s  3t   288489999/s  ycsb-A    672976/s  prime  1.09 us/pg  rss 0.05 GB
+      7s  size     10000  rep 1  lmdb            load    1063154 ops/s  read    2595540/s  3t    6666819/s  scan    57925681/s  3t   137993820/s  ycsb-A    250108/s  prime  1.12 us/pg  rss 0.05 GB
+      8s  size     10000  rep 1  rocksdb-tuned   load     923251 ops/s  read    1476416/s  3t    4550985/s  scan     8907670/s  3t    19848050/s  ycsb-A    427620/s  prime  1.08 us/pg  rss 0.05 GB
+      8s  size     10000  rep 1  supdb-ingest    load    1643210 ops/s  read    3178927/s  3t   12981640/s  scan    61800114/s  3t   204070832/s  ycsb-A   2304893/s  prime  1.06 us/pg  rss 0.05 GB
+      9s  size     10000  rep 1  lmdb-nosync     load    1435212 ops/s  read    2603138/s  3t    7437836/s  scan    47187618/s  3t   111155367/s  ycsb-A   1524927/s  prime  1.11 us/pg  rss 0.05 GB
+      9s  size     10000  rep 1  rocksdb-tuned-nosync load    1258997 ops/s  read    1418226/s  3t    4396817/s  scan     8356083/s  3t    23583819/s  ycsb-A    836707/s  prime  1.18 us/pg  rss 0.05 GB
+      9s  banked rungs through 10000 to /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/M1/roster/out/quick/20261121T205533Z-b1e9a80.json
+/tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/M1/roster/out/quick/20261121T205533Z-b1e9a80.json
+EXIT 0

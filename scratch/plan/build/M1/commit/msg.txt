@@ -1,0 +1,98 @@
+Merge upstream's head 7c62153e (bounds placed by the heads, the quiet third merge, the fence-stepping cursor, the copy's identity of its partition)
+
+This merges origin/claude/e-recode-stride-selector-g5f6hl at 7c62153e, upstream's
+commits since 9bfc4362. Every gate this branch has built holds over the merged
+tree.
+
+The one semantic collision. Both sides fixed the same bug, a copy's claim about
+a partition's records carried across its rewrite, each in its own shape. The
+merged tree keeps one. It is upstream's representation: `identity: bool` beside
+`identity_of: u64`, `CachedBlock::identity_for`, `Reader::block_cache_identity`.
+This branch's key compare stays at the patch: `splice_run` takes the rank's
+entry where the claim is of the table's partition, or where one key compare at
+that entry proves it, and searches otherwise. The patch's hint (`copy_entry_at`)
+takes upstream's shape. Both sides' tests in tests/settle.rs stay, and each is
+red with the fix taken out. The key compare was chosen over upstream's search
+under a stale claim on the land probe's count. CLAUDE.md's two entries for the
+bug are one entry now.
+
+Conflicts by text were in src/db.rs (the identity), tests/fuzz.rs (both sides'
+summary counters, all kept) and CLAUDE.md (both sides' entries, all kept). Some
+parts merged cleanly by text and still needed hand work:
+- upstream's `OrdIndex::head_bracket` read a field this branch had made a
+  method. It now calls `top()`, which is also what makes it right under a
+  cipher. A new ordindex test holds the bracket by the piece to the mapped one.
+- two tests/settle.rs tests from the two sides shared one store name. This
+  branch's tests were renamed.
+- bench/src/engines.rs's cipher arms now set their one option in place. A test
+  holds each arm's options against `supdb-cipher` and the encryption each arm
+  asks for.
+- docs/figures was behind upstream's own rows, and the bench check was red on
+  that. It was redrawn by bench/scripts/figures.sh.
+For every function both sides touched, the merged body is the base plus both
+sides' changes.
+
+Gates answered for upstream's code, each shown red first:
+- the workflows test, for the quick job's `KEYS` env;
+- the cost entries, for two upstream test seams, with their raises declared in
+  scripts/raises.txt (the lists group was red before the declaration).
+The wall needed no raise. The door is clean. Upstream's added code calls none
+of the residency or advice methods G1-6 removed.
+
+Two upstream tests failed intermittently on the merged tree, and both are fixed
+in the tests:
+- the bounds-walk test's race, red when made wide by a held upkeep pass, here
+  and on upstream's head;
+- the stride steer in the fuzz's concurrent run, red when the writer's asks are
+  taken out. It now asks the first served partition three times, settles each
+  ask, and holds the moves both ways.
+A durable test that read a stopped queue's flag and then a commit's answer now
+waits for the answer it reads.
+
+Under a cipher: each of upstream's engine mechanisms was read for what bytes it
+reads and how.
+- The bounds walk reads the index's top level, and a record by the piece where
+  a key ties.
+- The landing that leaves bounds unread, and the quiet merge, read atomics only.
+- The cursor's fence is in memory, and its page is read by `slice_at`.
+- The sparse stride walk renders its key from a field.
+Each runs right under a cipher. The differential fuzz showed no failures over
+seeds 1000 to 4000, both under a cipher with a 16 KiB cache and in the clear,
+with the block cache on and the options varied. The summary counters show the
+cipher runs draw upstream's new options. Every arm of the roster opened and ran
+once at the smallest rung. That run was a check, not a timing.
+
+A store in the clear: `sh scripts/cost.sh 7c62153e` over all fifteen probes has
+every probe's total at or under upstream's head. The probes that hold the bench
+code were counted again after its last edit. The per-function check reads red,
+as it did against 9bfc4362. The notes pair each gainer with the function that
+lost the same instructions, or give its cause.
+
+No default changed by this change and no arm removed. Upstream made
+`bounds_by_heads`, `land_bounds_read` and `merge_parallel_quiet` defaults on
+plain-store pairings, and the cipher arms inherit them unpriced. The pairing
+owed is each cipher arm against the same arm with the option off, for S5.
+
+Mutants: the identity fix taken out, the shape's check inverted, the bracket's
+`top()` read as the field, the cipher arms' options and budget, and the fuzz's
+asks. Every survivor was answered by a test, or by being taken out as a check
+nothing reached.
+
+Left open:
+- the lists group's verdict depends on which base it is given. Against this
+  change's base (b1e9a809, the branch's remote tip and a push's before) it is
+  green. Against the default base when no event names one (origin/main, which
+  predates the lists) it is red. The reason: the ratchet reads a declared raise
+  for a list that is new since the base as a declaration that matches nothing.
+  A pull request into main would read it that way.
+- the per-function cost check stays red. Among the gainers is
+  `OrdIndex::whole_key_at`, about +11 an op in the merge probe.
+- `the_compact_form_is_built_and_read_within_a_cache_the_store_does_not_fit`
+  is still undiagnosed.
+- the fills' room was not driven closed by real refaults in the bounds test. A
+  forced fill-off stands in for it.
+- the fuzz's three-ask shape was run over the gate's seeds only.
+- `heads owned` is never reached under a cipher. That predates this merge.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GEwcALZsCzTm28PHd4bQza

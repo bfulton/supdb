@@ -1,0 +1,12 @@
+   Compiling supdb v0.1.0 (/home/user/supdb)
+    Finished `checked` profile [optimized + debuginfo] target(s) in 37.45s
+  Executable tests/fuzz.rs (target/checked/deps/fuzz-b95676fc811c3756)
+BINARY target/checked/deps/fuzz-b95676fc811c3756
+r1.c1: thread 'concurrent_range' (7701) panicked at tests/fuzz.rs:3106:5:
+r1.c1: test concurrent_range ... FAILED
+r1.c1: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 33.23s
+r2.c1: thread 'concurrent_range' (8488) panicked at tests/fuzz.rs:3106:5:
+r2.c1: test concurrent_range ... FAILED
+r2.c1: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 13.01s
+VERDICT mut-fd: red 2 of 2
+RESTORED

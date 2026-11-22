@@ -1,0 +1,2 @@
+X1	probe land	total 476,640,929 -> 476,980,930 (clean -> mutant)	Reader>::splice_run 12,557,727 -> 12,908,644; key_eq 0 -> 0
+O5	probe scan	total 13,439,957 -> 13,441,954 (clean -> mutant)	Reader>::scan< 0 -> 0

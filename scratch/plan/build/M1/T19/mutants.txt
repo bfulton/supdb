@@ -1,0 +1,3 @@
+M1 the skip unconditional: exit 1: KILLED by l_declared; l_for_nothing; l_new_list_declared_held; l_raise_on_branch; l_raised_again_declared
+M2 the skip wherever the list shows no growth: exit 1: KILLED by l_for_nothing; l_new_list_declared_held
+M3 a new list never noted: exit 1: KILLED by l_new_list_declared

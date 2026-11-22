@@ -1,0 +1,3 @@
+   Compiling supdb v0.1.0 (/tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/M1/upwt)
+    Finished `checked` profile [optimized + debuginfo] target(s) in 9.80s
+  Executable tests/fuzz.rs (/tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/M1/upwt-target/checked/deps/fuzz-310f368a79925e2a)

@@ -1,0 +1,41 @@
+   Compiling supdb v0.1.0 (/home/user/supdb)
+    Finished `checked` profile [optimized + debuginfo] target(s) in 23.81s
+  Executable tests/fuzz.rs (target/checked/deps/fuzz-b95676fc811c3756)
+    Finished `checked` profile [optimized + debuginfo] target(s) in 0.01s
+     Running tests/fuzz.rs (target/checked/deps/fuzz-b95676fc811c3756)
+
+running 1 test
+concurrent seed 0: reads 2031618, heads owned 0 given back 0, stride files 1 builds 33 reads 478212, moved in 0 out 1
+concurrent seed 1: reads 4521269, heads owned 0 given back 0, stride files 11 builds 61 reads 932066, moved in 0 out 1
+concurrent seed 2: reads 1696915, heads owned 0 given back 0, stride files 3 builds 40 reads 145605, moved in 0 out 1
+concurrent seed 3: reads 5527800, heads owned 0 given back 0, stride files 12 builds 73 reads 689936, moved in 0 out 1
+test concurrent_range ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.38s
+
+    Finished `checked` profile [optimized + debuginfo] target(s) in 0.01s
+     Running tests/fuzz.rs (target/checked/deps/fuzz-b95676fc811c3756)
+
+running 1 test
+concurrent seed 0: reads 2107822, heads owned 0 given back 0, stride files 1 builds 25 reads 481111, moved in 0 out 1
+concurrent seed 1: reads 5541968, heads owned 0 given back 0, stride files 11 builds 59 reads 1093520, moved in 0 out 1
+concurrent seed 2: reads 2247123, heads owned 0 given back 0, stride files 3 builds 46 reads 260068, moved in 0 out 1
+concurrent seed 3: reads 5720612, heads owned 0 given back 0, stride files 12 builds 83 reads 710191, moved in 0 out 1
+test concurrent_range ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.85s
+
+    Finished `checked` profile [optimized + debuginfo] target(s) in 0.02s
+     Running tests/fuzz.rs (target/checked/deps/fuzz-b95676fc811c3756)
+
+running 1 test
+concurrent seed 0: reads 1956680, heads owned 0 given back 0, stride files 1 builds 32 reads 508059, moved in 0 out 1
+concurrent seed 1: reads 4514302, heads owned 0 given back 0, stride files 11 builds 52 reads 183417, moved in 0 out 1
+concurrent seed 2: reads 2376223, heads owned 0 given back 0, stride files 3 builds 63 reads 690143, moved in 0 out 1
+concurrent seed 3: reads 6904245, heads owned 0 given back 0, stride files 12 builds 79 reads 799643, moved in 0 out 1
+test concurrent_range ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.82s
+
+VERDICT after-noasks: red 0 of 3
+RESTORED

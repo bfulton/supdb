@@ -1,0 +1,6 @@
+Default for Policy::default: UNION (upstream 8 lines, branch 6, merged 325 lines)
+Supdb::with_policy: UNION (upstream 30 lines, branch 39, merged 1322 lines)
+Engine for Supdb::name: UNION (upstream 30 lines, branch 23, merged 1542 lines)
+Engine for Supdb::counters: UNION (upstream 7 lines, branch 18, merged 501 lines)
+guarantee: UNION (upstream 9 lines, branch 19, merged 520 lines)
+open: UNION (upstream 9 lines, branch 18, merged 1704 lines)

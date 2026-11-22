@@ -1,0 +1,113 @@
+   Compiling supdb v0.1.0 (/home/user/supdb)
+    Finished `checked` profile [optimized + debuginfo] target(s) in 23.73s
+  Executable tests/fuzz.rs (target/checked/deps/fuzz-b95676fc811c3756)
+    Finished `checked` profile [optimized + debuginfo] target(s) in 0.01s
+     Running tests/fuzz.rs (target/checked/deps/fuzz-b95676fc811c3756)
+
+running 1 test
+concurrent seed 0: reads 1502785, heads owned 0 given back 0, stride files 0 builds 35 reads 245317, moved in 0 out 0
+concurrent seed 1: reads 3043318, heads owned 0 given back 0, stride files 1 builds 48 reads 122922, moved in 0 out 0
+concurrent seed 2: reads 1142113, heads owned 0 given back 0, stride files 1 builds 61 reads 171074, moved in 0 out 0
+concurrent seed 3: reads 3833439, heads owned 0 given back 0, stride files 4 builds 74 reads 176822, moved in 0 out 0
+FAIL: no partition left the stride form in seeds 0..4
+
+thread 'concurrent_range' (11620) panicked at tests/fuzz.rs:3071:5:
+1 seeds failed
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/panicking.rs:80:14
+   2: fuzz::concurrent_range
+             at ./tests/fuzz.rs:3071:5
+   3: fuzz::concurrent_range::{closure#0}
+             at ./tests/fuzz.rs:3029:22
+   4: <fuzz::concurrent_range::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/ops/function.rs:250:5
+   5: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test concurrent_range ... FAILED
+
+failures:
+
+failures:
+    concurrent_range
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 2.78s
+
+error: test failed, to rerun pass `--test fuzz`
+    Finished `checked` profile [optimized + debuginfo] target(s) in 0.01s
+     Running tests/fuzz.rs (target/checked/deps/fuzz-b95676fc811c3756)
+
+running 1 test
+concurrent seed 0: reads 1754334, heads owned 0 given back 0, stride files 0 builds 34 reads 296360, moved in 0 out 0
+concurrent seed 1: reads 2911159, heads owned 0 given back 0, stride files 1 builds 48 reads 143630, moved in 0 out 0
+concurrent seed 2: reads 1314874, heads owned 0 given back 0, stride files 1 builds 64 reads 200681, moved in 0 out 0
+concurrent seed 3: reads 4798164, heads owned 0 given back 0, stride files 4 builds 76 reads 257022, moved in 0 out 0
+FAIL: no partition left the stride form in seeds 0..4
+
+thread 'concurrent_range' (12482) panicked at tests/fuzz.rs:3071:5:
+1 seeds failed
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/panicking.rs:80:14
+   2: fuzz::concurrent_range
+             at ./tests/fuzz.rs:3071:5
+   3: fuzz::concurrent_range::{closure#0}
+             at ./tests/fuzz.rs:3029:22
+   4: <fuzz::concurrent_range::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/ops/function.rs:250:5
+   5: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test concurrent_range ... FAILED
+
+failures:
+
+failures:
+    concurrent_range
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 2.99s
+
+error: test failed, to rerun pass `--test fuzz`
+    Finished `checked` profile [optimized + debuginfo] target(s) in 0.01s
+     Running tests/fuzz.rs (target/checked/deps/fuzz-b95676fc811c3756)
+
+running 1 test
+concurrent seed 0: reads 1653984, heads owned 0 given back 0, stride files 1 builds 35 reads 328861, moved in 0 out 0
+concurrent seed 1: reads 4111887, heads owned 0 given back 0, stride files 1 builds 50 reads 149369, moved in 0 out 0
+concurrent seed 2: reads 1953260, heads owned 0 given back 0, stride files 1 builds 63 reads 332076, moved in 0 out 0
+concurrent seed 3: reads 5082058, heads owned 0 given back 0, stride files 3 builds 70 reads 275172, moved in 0 out 0
+FAIL: no partition left the stride form in seeds 0..4
+
+thread 'concurrent_range' (13354) panicked at tests/fuzz.rs:3071:5:
+1 seeds failed
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/panicking.rs:80:14
+   2: fuzz::concurrent_range
+             at ./tests/fuzz.rs:3071:5
+   3: fuzz::concurrent_range::{closure#0}
+             at ./tests/fuzz.rs:3029:22
+   4: <fuzz::concurrent_range::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/ops/function.rs:250:5
+   5: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test concurrent_range ... FAILED
+
+failures:
+
+failures:
+    concurrent_range
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.38s
+
+error: test failed, to rerun pass `--test fuzz`
+VERDICT before-noasks: red 3 of 3
+RESTORED

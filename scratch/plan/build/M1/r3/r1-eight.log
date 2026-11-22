@@ -1,0 +1,30 @@
+   Compiling supdb v0.1.0 (/home/user/supdb)
+    Finished `checked` profile [optimized + debuginfo] target(s) in 47.96s
+  Executable tests/db.rs (target/checked/deps/db-43b12b92294de8a5)
+BINARY target/checked/deps/db-43b12b92294de8a5
+r1.c1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 2.88s
+r1.c2: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 3.00s
+r1.c3: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 2.97s
+r1.c4: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 2.89s
+r1.c5: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 2.88s
+r1.c6: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 2.92s
+r1.c7: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 2.99s
+r1.c8: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 2.74s
+r2.c1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 2.98s
+r2.c2: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 2.89s
+r2.c3: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 3.36s
+r2.c4: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 3.30s
+r2.c5: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 3.26s
+r2.c6: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 3.29s
+r2.c7: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 3.15s
+r2.c8: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 3.30s
+r3.c1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 3.27s
+r3.c2: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 3.37s
+r3.c3: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 3.37s
+r3.c4: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 3.34s
+r3.c5: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 3.11s
+r3.c6: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 3.34s
+r3.c7: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 3.08s
+r3.c8: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264 filtered out; finished in 3.32s
+VERDICT r1-eight: red 0 of 24
+RESTORED

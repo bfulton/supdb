@@ -1,0 +1,12 @@
+   Compiling supdb v0.1.0 (/home/user/supdb)
+    Finished `checked` profile [optimized + debuginfo] target(s) in 46.57s
+  Executable tests/db.rs (target/checked/deps/db-43b12b92294de8a5)
+BINARY target/checked/deps/db-43b12b92294de8a5
+r1.c1: test a_bounds_walk_places_a_boundary_by_its_head_and_reads_its_record_only_on_a_tie ... FAILED
+r1.c1: thread 'a_bounds_walk_places_a_boundary_by_its_head_and_reads_its_record_only_on_a_tie' (10768) panicked at tests/db.rs:20931:9:
+r1.c1: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 264 filtered out; finished in 0.80s
+r2.c1: test a_bounds_walk_places_a_boundary_by_its_head_and_reads_its_record_only_on_a_tie ... FAILED
+r2.c1: thread 'a_bounds_walk_places_a_boundary_by_its_head_and_reads_its_record_only_on_a_tie' (10787) panicked at tests/db.rs:20931:9:
+r2.c1: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 264 filtered out; finished in 0.71s
+VERDICT bt-new-filldiff: red 2 of 2
+RESTORED

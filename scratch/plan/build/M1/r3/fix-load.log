@@ -1,0 +1,24 @@
+   Compiling supdb v0.1.0 (/home/user/supdb)
+    Finished `checked` profile [optimized + debuginfo] target(s) in 23.15s
+  Executable tests/fuzz.rs (target/checked/deps/fuzz-b95676fc811c3756)
+BINARY target/checked/deps/fuzz-b95676fc811c3756
+r1.c1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 28.16s
+r1.c2: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 30.16s
+r1.c3: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 30.18s
+r1.c4: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 26.43s
+r1.c5: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 29.21s
+r1.c6: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 28.97s
+r2.c1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 30.83s
+r2.c2: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 29.65s
+r2.c3: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 31.23s
+r2.c4: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 28.25s
+r2.c5: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 30.97s
+r2.c6: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 29.07s
+r3.c1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 32.44s
+r3.c2: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 32.73s
+r3.c3: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 33.00s
+r3.c4: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 32.87s
+r3.c5: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 32.82s
+r3.c6: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 30.14s
+VERDICT fix-load: red 0 of 18
+RESTORED

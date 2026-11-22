@@ -1,0 +1,244 @@
+START Sat Nov 21 20:55:06 UTC 2026
+
+=== bench ===
+
+== build ==
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.05s
+
+== test ==
+    Finished `checked` profile [optimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/checked/deps/supdb_bench-48354fbccae3c331)
+
+running 137 tests
+test bound::attached::a_deserialized_bound_is_attached_and_its_drop_touches_nothing ... ok
+test bound::tests::a_controller_without_the_process_group_refuses_naming_it ... ok
+test bound::tests::a_stale_sibling_with_contents_is_reported_not_removed ... ok
+test bound::tests::a_delegated_v2_group_puts_the_run_in_a_leaf_and_each_pass_in_one_of_its_own ... ok
+test bound::tests::stat_takes_the_groups_own_keys_and_not_the_totals ... ok
+test bound::tests::the_controllers_mount_is_the_cgroup_mount_with_memory_in_its_options ... ok
+test bound::tests::the_memory_controllers_path_is_read_off_its_own_line ... ok
+test bound::tests::the_unified_path_is_the_zero_line_and_its_mount_the_cgroup2_one ... ok
+test bound::tests::the_v2_stat_is_read_under_v1s_names_and_the_events_max_is_the_failcnt ... ok
+test bound::tests::a_pass_process_writes_its_own_pid_into_its_group_before_the_exec ... ok
+test bound::tests::a_v1_run_group_holds_no_process_and_each_pass_gets_its_own ... ok
+test bound::tests::a_v2_group_that_is_not_delegated_is_shared_at_its_bound_and_refused_at_any_other ... ok
+test engines::dense::tests::the_dense_probe_reads_back_what_it_was_given_across_a_reopen ... ok
+test engines::tests::durability_is_an_axis_the_matching_checks ... ok
+test engines::dense::tests::a_shuffled_load_fills_its_slots_out_of_order ... ok
+test engines::tests::a_segment_reads_the_same_plain_and_through_an_envelope ... ok
+test engines::tests::each_auto_arm_is_its_base_and_the_nozpages_arm_differs_in_the_form_alone ... ok
+test engines::tests::each_two_form_arm_is_the_stride_arm_and_the_key_its_name_says ... ok
+test engines::tests::each_stride_arm_is_its_sibling_and_the_one_option_its_name_says ... ok
+test engines::tests::each_single_option_arm_differs_from_the_zpages_arm_in_that_option_alone ... ok
+test engines::tests::the_auto_drop_arms_differ_from_their_bases_in_the_drop_alone ... ok
+test engines::tests::the_buffered_comparators_differ_from_the_durable_ones_in_the_sync ... ok
+test engines::tests::the_arms_state_says_what_a_damaged_form_file_did ... ok
+test engines::tests::the_compressing_rocksdb_is_the_tuned_arm_with_lz4 ... ok
+test engines::tests::the_dirplain_arms_differ_from_their_defaults_in_the_directory_hint_alone ... ok
+test engines::tests::the_fair_io_arm_differs_from_the_controllers_in_the_io_class_alone ... ok
+test engines::tests::a_store_reopened_where_its_predecessor_was_is_a_fresh_store ... ok
+test engines::tests::the_fixed_coding_arm_differs_from_the_combined_arm_in_the_choice_alone ... ok
+test engines::tests::the_nodrop_arm_differs_from_the_zpages_arm_in_the_drop_alone ... ok
+test engines::tests::the_auto_shift_arms_differ_from_their_bases_in_their_option_alone ... ok
+test engines::tests::the_lz4_arms_differ_from_their_bases_in_the_codec_alone ... ok
+test engines::tests::the_parallel_merge_arms_differ_from_their_bases_in_the_merges_alone ... ok
+test engines::tests::the_readahead_arm_differs_from_lmdb_in_one_flag ... ok
+test engines::tests::the_removal_arms_differ_from_their_default_in_the_one_option ... ok
+test engines::tests::the_ordread_arm_differs_from_nocache_in_the_partition_read_path_alone ... ok
+test engines::tests::the_settlefar_arms_differ_from_their_defaults_in_the_far_filing_alone ... ok
+test engines::tests::the_tofit_arms_differ_from_their_defaults_in_the_one_option ... ok
+test engines::tests::the_raw_cache_arm_differs_from_the_combined_arm_in_the_cache_reads_alone ... ok
+test env::tests::a_mapped_volume_is_ram_backed_only_where_what_it_maps_is ... ok
+test env::tests::a_virtual_block_device_is_told_from_a_disk_by_its_link ... ok
+test figures::tests::a_row_keeps_the_arms_the_rosters_no_longer_name ... ok
+test figures::tests::every_roster_arm_has_a_legend_name ... ok
+test figures::tests::nice_axes_end_on_a_round_number_above_the_max ... ok
+test figures::tests::power_labels ... ok
+test figures::tests::si_suffixes ... ok
+test figures::tests::the_latest_copy_is_the_newest_rows_class_and_the_drawing_is_a_function_of_the_rows ... ok
+test gate::tests::a_byte_ratio_is_judged_whatever_the_floors_say ... ok
+test gate::tests::a_comparator_alone_never_fails_the_gate ... ok
+test gate::tests::a_comparator_below_its_window_withholds_the_arms_verdict_there ... ok
+test gate::tests::a_floor_alone_never_fails_the_gate ... ok
+test gate::tests::a_floor_below_the_window_withholds_every_machine_verdict ... ok
+test gate::tests::a_missing_runs_directory_is_no_history ... ok
+test gate::tests::a_regression_on_a_machine_in_band_still_fails ... ok
+test gate::tests::a_row_within_the_band_passes ... ok
+test gate::tests::a_seek_floor_faster_than_its_window_withholds_as_a_slow_one_does ... ok
+test gate::tests::a_window_without_floors_says_it_has_no_control ... ok
+test gate::tests::an_unknown_quantity_is_an_error_not_a_guess ... ok
+test gate::tests::another_class_is_not_history ... ok
+test engines::tests::the_zpages_arm_differs_from_nocache_in_the_option_alone ... ok
+test gate::tests::another_key_shape_is_not_history ... ok
+test gate::tests::every_arm_is_named_as_engine_or_comparator ... ok
+test gate::tests::every_count_per_op_is_a_cost_whatever_its_suffix ... ok
+test gate::tests::better_than_every_prior_is_flagged_not_failed ... ok
+test gate::tests::every_threaded_quantity_is_named ... ok
+test gate::tests::slower_reads_regress_and_higher_p99_regresses ... ok
+test gate::tests::the_window_is_the_last_ten ... ok
+test hist::boundary_tests::every_reported_percentile_is_monotonic ... ok
+test hist::boundary_tests::exact_percentile_boundaries_do_not_skip_a_bucket ... ok
+test hist::tests::a_rare_stall_shows_in_the_tail_and_not_the_mean ... ok
+test hist::tests::empty_histogram_is_not_a_panic ... ok
+test hist::tests::merge_preserves_total_and_extremes ... ok
+test hist::tests::percentiles_are_within_precision ... ok
+test hist::tests::small_values_are_exact ... ok
+test gate::tests::two_prior_rows_is_not_a_band ... ok
+test ledger::tests::a_resume_is_refused_by_stamp_or_class_and_names_which ... ok
+test ledger::tests::a_rep_is_whole_by_its_file_and_a_cut_rep_names_what_it_holds ... ok
+test machine::tests::detects_something_sane ... ok
+test row::tests::a_bound_is_its_own_class ... ok
+test row::tests::a_key_shape_is_its_own_class ... ok
+test row::tests::a_row_round_trips ... ok
+test ledger::tests::floors_and_head_round_trip_and_a_headless_directory_is_not_a_ledger ... ok
+test row::tests::civil_dates ... ok
+test row::tests::slugs ... ok
+test run::tests::a_count_is_named_under_every_suffix_a_rate_carries ... ok
+test engines::tests::the_stride_arms_count_the_files_they_built_and_the_reads_those_served ... ok
+test run::tests::a_forced_form_that_is_not_in_use_is_refused ... ok
+test run::tests::a_forced_form_with_a_form_file_out_of_service_or_reads_gone_raw_is_refused ... ok
+test row::tests::every_banked_row_keeps_its_class ... ok
+test run::tests::a_reopened_store_is_held_to_what_was_acknowledged ... ok
+test run::tests::a_row_is_of_its_plans_keys ... ok
+test run::tests::a_stride_arm_with_no_stride_file_after_the_load_is_refused ... ok
+test run::tests::a_threaded_quantity_names_its_count_and_nothing_else_does ... ok
+test run::tests::every_quantity_the_runner_records_has_a_direction ... ok
+test run::tests::holm_holds_what_the_family_supports_and_stops_at_the_first_miss ... ok
+test run::tests::shares_sum_to_the_work_and_differ_by_at_most_one ... ok
+test run::tests::the_devices_read_ios_and_ticks_are_its_first_and_fourth_fields ... ok
+test run::tests::the_divisor_floors_at_a_thousand_and_divides_nothing_at_quick_and_full ... ok
+test run::tests::the_latest_mix_reads_the_keys_it_has_committed_and_no_others ... ok
+test run::tests::the_major_faults_are_the_tenth_field_past_the_comm ... ok
+test engines::tests::the_memory_arms_differ_from_supdb_in_their_option_alone ... ok
+test run::tests::a_quantity_the_gate_cannot_judge_is_refused_where_it_is_recorded - should panic ... ok
+test run::tests::the_passes_parse_by_name_and_refuse_a_name_they_lack ... ok
+test run::tests::the_prime_under_a_bound_is_at_most_an_eighth_of_it ... ok
+test run::tests::the_read_phase_asks_whether_a_forced_arm_read_through_its_form ... ok
+test run::tests::the_recovery_workloads_run_in_core_rows_and_elsewhere_by_name ... ok
+test run::tests::the_ordered_load_asks_whether_a_stride_arm_built_the_stride_form ... ok
+test run::tests::the_scrambled_mixes_read_existing_keys_from_a_spread_head ... ok
+test run::tests::the_seek_floor_reads_the_same_offsets_each_time ... ok
+test run::tests::the_shuffled_load_asks_whether_a_forced_arm_covers_the_second_store ... ok
+test run::tests::the_stop_seam_names_a_rep_or_an_arm_of_it ... ok
+test run::tests::the_thread_counts_stop_one_short_of_the_cores ... ok
+test run::tests::the_warmup_rep_is_run_only_where_the_arms_share_the_process ... ok
+test run::tests::a_dropped_stores_freed_memory_is_returned_before_the_next_pass ... ok
+test stats::tests::ci_is_deterministic_and_inside_the_range ... ok
+test stats::tests::median_of_odd_and_even ... ok
+test tests::a_bottom_drops_the_rungs_below_it ... ok
+test tests::every_scale_round_trips_by_name_and_has_its_reps ... ok
+test tests::ladder_is_one_three_ten ... ok
+test tests::the_ooc_ladder_is_the_two_rungs_either_side_of_the_bound ... ok
+test workload::perm_tests::is_a_permutation ... ok
+test workload::perm_tests::is_not_the_identity ... ok
+test workload::tests::a_grown_zipfian_is_the_zipfian_over_the_grown_space ... ok
+test workload::tests::compressibility_is_actually_a_dial ... ok
+test workload::tests::every_generator_stays_in_range ... ok
+test workload::tests::keys_are_sixteen_digits_and_distinct ... ok
+test workload::tests::sequential_covers_the_space_in_order ... ok
+test workload::tests::the_hash_is_ycsbs_fnv ... ok
+test workload::tests::the_ids_are_spread_as_independent_draws_are ... ok
+test run::tests::the_second_mix_family_reports_six_rates_under_its_pass ... ok
+test workload::tests::the_latest_distribution_follows_the_newest_key ... ok
+test workload::tests::the_ids_ascend_with_the_index_and_an_insert_falls_among_them ... ok
+test workload::tests::the_scrambled_zipfian_spreads_the_hot_keys_it_keeps ... ok
+test run::tests::threaded_readers_read_the_loaded_store ... ok
+test workload::tests::zipfian_is_skewed_and_uniform_is_not ... ok
+test workload::tests::values_do_not_share_an_identical_prefix ... ok
+test workload::tests::the_scrambled_zipfians_constant_is_ycsbs_sum ... ok
+test run::tests::the_pass_refuses_a_forced_arm_that_covers_nothing_and_runs_one_that_does ... ok
+
+test result: ok. 137 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s
+
+     Running unittests src/main.rs (target/checked/deps/bench-2cc244012c9919d9)
+
+running 1 test
+test tests::a_bound_not_in_whole_mebibytes_is_refused ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/bound_isolation.rs (target/checked/deps/bound_isolation-5b0b153584293054)
+
+running 1 test
+test a_pass_bound_sees_nothing_the_run_holds ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+
+     Running tests/fresh_process.rs (target/checked/deps/fresh_process-8ed9ed01105d672e)
+
+running 2 tests
+one-pass SPEC: the spec file `run` wrote is required
+bench run: scale quick on Intel(R) Xeon(R) Processor @ 2.10GHz (1 reps, rungs 10000, arms supdb)
+one-pass failed: the pass's spec /nonexistent/supdb-next-no-such-spec.json: No such file or directory (os error 2)
+test the_pass_command_without_its_spec_is_refused ... ok
+      0s  floors rep 0 (warmup)  wal    1511513 ops/s  mmap    10.19 GB/s  chase  13435916/s  page  1.54 us
+      0s  floors rep 1  wal    1282181 ops/s  mmap     9.09 GB/s  chase  10667221/s  page  1.71 us
+      0s  reclaimed the scan floor's file, 0.0 GB
+      0s  size     10000  rep 1  supdb           load     717885 ops/s  read    3546087/s  3t   10875365/s  scan    41107096/s  3t   138915926/s  ycsb-A    371577/s  prime  1.16 us/pg  rss 0.04 GB
+      0s  banked rungs through 10000 to /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/tmp/M1/supdb-next-freshproc-21609/fresh/quick/20261121T205508Z-b1e9a80.json
+/tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/tmp/M1/supdb-next-freshproc-21609/fresh/quick/20261121T205508Z-b1e9a80.json
+bench run: scale quick on Intel(R) Xeon(R) Processor @ 2.10GHz (1 reps, rungs 10000, arms supdb)
+      0s  floors rep 0 (warmup)  wal    1550821 ops/s  mmap     8.36 GB/s  chase   9405814/s  page  1.74 us
+      0s  floors rep 1  wal    2099570 ops/s  mmap     8.08 GB/s  chase  10487945/s  page  1.63 us
+      0s  reclaimed the scan floor's file, 0.0 GB
+      0s  size     10000  rep 0 (warmup)  supdb           load     875526 ops/s  read    3900631/s  3t    9942377/s  scan    48960567/s  3t   137816137/s  ycsb-A    501817/s  prime  1.41 us/pg  rss 0.04 GB
+      1s  size     10000  rep 1  supdb           load     730329 ops/s  read    3742677/s  3t   17160901/s  scan    47292504/s  3t   168136931/s  ycsb-A    532047/s  prime  1.12 us/pg  rss 0.04 GB
+      1s  banked rungs through 10000 to /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/tmp/M1/supdb-next-freshproc-21609/one/quick/20261121T205509Z-b1e9a80.json
+/tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/tmp/M1/supdb-next-freshproc-21609/one/quick/20261121T205509Z-b1e9a80.json
+test a_pass_in_its_own_process_answers_the_row_the_pass_in_this_one_does ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.01s
+
+     Running tests/recover.rs (target/checked/deps/recover-b60e9a2a2d42406e)
+
+running 2 tests
+crash-load SPEC: the spec file a pass wrote is required
+bench run: scale quick on Intel(R) Xeon(R) Processor @ 2.10GHz (1 reps, rungs 10000, arms supdb,lmdb,rocksdb-tuned,supdb-ingest,lmdb-nosync,rocksdb-tuned-nosync)
+crash-load failed: the crash load's spec /nonexistent/supdb-next-no-such-crash-spec.json: No such file or directory (os error 2)
+test a_crash_load_with_no_spec_or_no_store_is_refused ... ok
+      0s  floors rep 0 (warmup)  wal    2115376 ops/s  mmap    13.01 GB/s  chase   9401940/s  page  1.64 us
+      0s  floors rep 1  wal     993530 ops/s  mmap     8.01 GB/s  chase  10955249/s  page  1.64 us
+      0s  reclaimed the scan floor's file, 0.0 GB
+      0s  size     10000  rep 0 (warmup)  supdb           load     907293 ops/s  read    3844397/s  3t   10391104/s  scan    43082835/s  3t   119149369/s  ycsb-A    453217/s  prime  1.34 us/pg  rss 0.04 GB
+      1s  size     10000  rep 0 (warmup)  lmdb            load     705072 ops/s  read    1901381/s  3t    9606551/s  scan    34324982/s  3t    85772349/s  ycsb-A    192130/s  prime  1.28 us/pg  rss 0.04 GB
+      2s  size     10000  rep 0 (warmup)  rocksdb-tuned   load     937414 ops/s  read    1387301/s  3t    4558790/s  scan     5772366/s  3t    27530246/s  ycsb-A    357606/s  prime  1.35 us/pg  rss 0.04 GB
+      2s  size     10000  rep 0 (warmup)  supdb-ingest    load    1193273 ops/s  read    3581292/s  3t   10300723/s  scan    42864185/s  3t   169274214/s  ycsb-A   2520023/s  prime  1.03 us/pg  rss 0.04 GB
+      2s  size     10000  rep 0 (warmup)  lmdb-nosync     load    1133303 ops/s  read    1915179/s  3t    8879730/s  scan    31774477/s  3t    68789531/s  ycsb-A   1373897/s  prime  1.15 us/pg  rss 0.04 GB
+      3s  size     10000  rep 0 (warmup)  rocksdb-tuned-nosync load    1364409 ops/s  read    1440915/s  3t    4918752/s  scan     7822443/s  3t    28054311/s  ycsb-A   1156496/s  prime  1.10 us/pg  rss 0.04 GB
+      3s  size     10000  rep 1  supdb           load     865054 ops/s  read    3727723/s  3t   17958512/s  scan    48535443/s  3t   114619040/s  ycsb-A    373557/s  prime  1.07 us/pg  rss 0.05 GB
+      4s  size     10000  rep 1  lmdb            load     882254 ops/s  read    2481880/s  3t    6704233/s  scan    31931743/s  3t    70692586/s  ycsb-A    211453/s  prime  1.07 us/pg  rss 0.05 GB
+      5s  size     10000  rep 1  rocksdb-tuned   load     695345 ops/s  read    1340535/s  3t    4850953/s  scan     9008985/s  3t    16692599/s  ycsb-A    491860/s  prime  1.07 us/pg  rss 0.05 GB
+      5s  size     10000  rep 1  supdb-ingest    load    1645853 ops/s  read    3782233/s  3t   10265637/s  scan    49098792/s  3t   169250835/s  ycsb-A   2330021/s  prime  1.07 us/pg  rss 0.05 GB
+      5s  size     10000  rep 1  lmdb-nosync     load    1536766 ops/s  read    2497774/s  3t    2838897/s  scan    36518608/s  3t    80155825/s  ycsb-A   1405513/s  prime  1.10 us/pg  rss 0.05 GB
+      6s  size     10000  rep 1  rocksdb-tuned-nosync load    1357028 ops/s  read    1400927/s  3t    2940430/s  scan     8836077/s  3t    26698804/s  ycsb-A   1153781/s  prime  1.10 us/pg  rss 0.05 GB
+      6s  banked rungs through 10000 to /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/tmp/M1/supdb-next-recover-21709/quick/20261121T205510Z-b1e9a80.json
+/tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/tmp/M1/supdb-next-recover-21709/quick/20261121T205510Z-b1e9a80.json
+test a_row_carries_both_recoveries_for_every_arm ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.38s
+
+     Running tests/resume.rs (target/checked/deps/resume-f54429449f036ef0)
+
+running 5 tests
+test a_pairing_loses_a_killed_reps_pair_and_goes_on ... ok
+test a_resume_refuses_another_binary_and_a_plan_of_its_own ... ok
+test a_killed_pass_is_a_cell_of_the_row_and_the_run_goes_on ... ok
+test a_rep_cut_between_arms_is_taken_again_whole_unless_passes_are_kept ... ok
+test a_run_cut_between_reps_is_taken_up_at_the_next_and_composes_the_row ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.49s
+
+
+== lint ==
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+workflows: every run block parses, none interpolates (42 blocks); every Linux job names its image
+policy_defaults: 210 fields follow the engine
+
+== figures ==
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+figures: docs/figures is what runs/ draws
+
+all checks passed: build test lint figures
+
+all checks passed: bench
+EXIT 0

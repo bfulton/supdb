@@ -1,0 +1,15 @@
+
+=== lists ===
+ratchet-red: 66 cases, each as it must be
+ratchet-red: green
+base: b1e9a809dd2f9ac8e6aa87beb5f74a76be042d22, the merge-base of HEAD and SUPDB_BASE (an explicit override)
+ratchet: the lists at b1e9a809dd2f9ac8e6aa87beb5f74a76be042d22 (the merge-base of HEAD and b1e9a809dd2f9ac8e6aa87beb5f74a76be042d22) against the tree
+  tests/data/cost-entries.txt: held, 330 keys at the base, 332 in the tree, 2 raised
+  tests/data/couplings.txt: held, 74 keys at the base, 74 in the tree, 0 raised
+  tests/data/door-libc.txt: held, 68 keys at the base, 68 in the tree, 0 raised
+  tests/data/door.txt: held, 76 keys at the base, 76 in the tree, 0 raised
+ratchet: raise let through: tests/data/cost-entries.txt Reader::block_cache_identity 0 -> 1: upstream c5491c59: a test seam that counts the copies claiming their partition, read by tests/db.rs and tests/settle.rs, at no key, entry, block or step of an operation
+ratchet: raise let through: tests/data/cost-entries.txt Reader::piece_bounds 0 -> 1: upstream 00745f1a: a test seam that lists the bounds every piece holds, read by tests, at no key, entry, block or step of an operation
+ratchet: green
+
+all checks passed: lists

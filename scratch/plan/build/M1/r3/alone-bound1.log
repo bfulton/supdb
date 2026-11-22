@@ -1,0 +1,12 @@
+   Compiling supdb v0.1.0 (/home/user/supdb)
+    Finished `checked` profile [optimized + debuginfo] target(s) in 23.79s
+  Executable tests/fuzz.rs (target/checked/deps/fuzz-b95676fc811c3756)
+BINARY target/checked/deps/fuzz-b95676fc811c3756
+r1.c1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.30s
+r2.c1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.63s
+r3.c1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 4.57s
+r4.c1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 6.11s
+r5.c1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 5.88s
+r6.c1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 4.25s
+VERDICT alone-bound1: red 0 of 6
+RESTORED

@@ -1,0 +1,15 @@
+
+=== lists ===
+ratchet-red: 66 cases, each as it must be
+ratchet-red: green
+base: 5aad09dd5d0e828846549f5fb9623f2b1540bbb0, the merge-base of HEAD and origin/main (no override and no event)
+ratchet: the lists at 5aad09dd5d0e828846549f5fb9623f2b1540bbb0 (the merge-base of HEAD and 5aad09dd5d0e828846549f5fb9623f2b1540bbb0) against the tree
+  tests/data/cost-entries.txt: new since the base, nothing to hold yet (332 keys)
+  tests/data/couplings.txt: new since the base, nothing to hold yet (74 keys)
+  tests/data/door-libc.txt: new since the base, nothing to hold yet (68 keys)
+  tests/data/door.txt: new since the base, nothing to hold yet (76 keys)
+  not held yet (its list is new since the base): tests/data/cost-entries.txt Reader::block_cache_identity 0 -> 1
+  not held yet (its list is new since the base): tests/data/cost-entries.txt Reader::piece_bounds 0 -> 1
+ratchet: green
+
+all checks passed: lists

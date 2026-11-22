@@ -1,0 +1,8 @@
+  tests/data/door-libc.txt: new since the base, nothing to hold yet (68 keys)
+  tests/data/door.txt: new since the base, nothing to hold yet (76 keys)
+  not held yet (its list is new since the base): tests/data/cost-entries.txt Reader::block_cache_identity 0 -> 1
+  not held yet (its list is new since the base): tests/data/cost-entries.txt Reader::piece_bounds 0 -> 1
+ratchet: green
+
+all checks passed: lint lists
+EXIT 0

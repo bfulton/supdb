@@ -1,0 +1,36 @@
+   Compiling supdb v0.1.0 (/home/user/supdb)
+    Finished `checked` profile [optimized + debuginfo] target(s) in 23.67s
+  Executable tests/fuzz.rs (target/checked/deps/fuzz-b95676fc811c3756)
+BINARY target/checked/deps/fuzz-b95676fc811c3756
+r1.c1: ASKS seed 0: 2
+r1.c1: ASKS seed 1: 2
+r1.c1: ASKS seed 2: 2
+r1.c1: ASKS seed 3: 2
+r1.c1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 2.97s
+r2.c1: ASKS seed 0: 2
+r2.c1: ASKS seed 1: 2
+r2.c1: ASKS seed 2: 2
+r2.c1: ASKS seed 3: 2
+r2.c1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 4.08s
+r3.c1: ASKS seed 0: 2
+r3.c1: ASKS seed 1: 2
+r3.c1: ASKS seed 2: 2
+r3.c1: ASKS seed 3: 2
+r3.c1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.88s
+r4.c1: ASKS seed 0: 2
+r4.c1: ASKS seed 1: 2
+r4.c1: ASKS seed 2: 2
+r4.c1: ASKS seed 3: 2
+r4.c1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.59s
+r5.c1: ASKS seed 0: 2
+r5.c1: ASKS seed 1: 2
+r5.c1: ASKS seed 2: 2
+r5.c1: ASKS seed 3: 2
+r5.c1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 4.09s
+r6.c1: ASKS seed 0: 2
+r6.c1: ASKS seed 1: 2
+r6.c1: ASKS seed 2: 2
+r6.c1: ASKS seed 3: 2
+r6.c1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 4.26s
+VERDICT new-alone-count: red 0 of 6
+RESTORED
