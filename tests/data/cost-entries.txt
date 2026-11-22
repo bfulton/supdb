@@ -74,6 +74,7 @@ Reader::block_cache_bytes	-	a test seam or a counter: reads or sets the store's 
 Reader::block_cache_largest	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::block_cache_wide	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::memory_census	-	the census the suite prints after a pass, never inside one
+Reader::forms_by_partition	-	a probe's listing of the block cache by partition, printed by the suite where no pass is timed, never inside one
 Reader::count	work
 Reader::unsealed_keys	-	introspection for tests and the suite: walks the memtables once a call
 Reader::state_gen	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
@@ -242,6 +243,8 @@ Db::heads_owned_counts	-	a test seam or a counter: reads or sets the store's boo
 Db::writes_since_scan	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::heads_retired_waiting	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::memory_census	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::forms_by_partition	-	the writer's handle on the same probe's listing, never inside a pass
+Db::forms_drop_reasons	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::manifest_seq	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::run_remaps	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::stream_recycled	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation

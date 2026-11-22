@@ -1083,6 +1083,18 @@ pub struct ZCounts {
     /// trims gave back.
     pub rewarm_trims: u64,
     pub rewarm_trim_bytes: u64,
+    /// The rewarms that asked for the raw form's files
+    /// (`Options::zpages_rewarm_raw`), the files asked, the bytes of them
+    /// the page cache did not hold, and the files short of the line left
+    /// for want of room.
+    pub raw_rewarms: u64,
+    pub raw_rewarm_files: u64,
+    pub raw_rewarm_bytes: u64,
+    pub raw_rewarm_short: u64,
+    /// The settles that asked for the raw form's files and waited for them
+    /// (`Options::zpages_rewarm_raw`), and the milliseconds they waited.
+    pub raw_settles: u64,
+    pub raw_settle_ms: u64,
     /// Block-coded partitions re-parsed while served
     /// (`Options::zpages_reparse`).
     pub reparses: u64,
@@ -4491,6 +4503,22 @@ pub struct Options {
     /// `supdb-formson` keeps the forms on.
     #[doc(hidden)]
     pub scan_forms_off_unreused: bool,
+    /// EXPERIMENT: `scan_forms_off_unreused`'s reading counts a scan that
+    /// starts in a block the writer holds a form for already as a reuse, as
+    /// it counts one that starts where a recent scan started. The rule
+    /// gives the forms up because a build is repaid only where a later scan
+    /// walks the block again, and a form the burst's fills built is paid
+    /// for: walking it costs no build. At three million keys under 1 GiB
+    /// the lag sweep's full rewrite had the upkeep thread build a form for
+    /// every block, 330 MB of copies and 60 of sparse forms, beside which
+    /// the controller's budget, the limit less the process, fell from 794
+    /// MB to 288 and the compact form was installed; the pass's uniform
+    /// starts then gave every form up at its 512th scan, the merge path
+    /// read partitions the crossing had dropped from the cache, and the
+    /// process ended the pass holding 589 MB with 15 in use. Off;
+    /// `supdb-formsoffbuilt` counts the built forms.
+    #[doc(hidden)]
+    pub scan_forms_off_counts_built: bool,
     /// `scan_forms_off_unreused`'s reading taken as stale: the writer that
     /// gave its forms up takes them back at the commit that makes this many
     /// writes in a row in commits under `UPKEEP_WAKE_WRITES` each, with no
@@ -6498,6 +6526,42 @@ pub struct Options {
     /// own thread; an arena's lock is held while its pages go. Off;
     /// `supdb-rewarmtrim` trims.
     pub zpages_rewarm_trims: bool,
+    /// EXPERIMENT: a settle asks for the raw form's files and waits for
+    /// them (`Maint::z_raw_settle`), with or without a form installed: each
+    /// partition the raw form serves, the level-0 pieces, and their
+    /// ordered indexes, where the page cache holds under
+    /// `HOT_RAW_RESIDENT` of one, the indexes first and the pieces last,
+    /// up to the group's unused memory less the margin
+    /// (`zselect::Budget::slack`), so that an ask never takes the pages of
+    /// one of the store's files for another's. Under a bound a merge's
+    /// outputs are written once and read by nobody until the scans come,
+    /// and those are the pages the kernel reclaims first: at three million
+    /// keys under 1 GiB the lag sweep's clean store read 1.8M entries a
+    /// second against LMDB's 10.4M, with 271 of its partitions' 417 MB in
+    /// the cache, the group's file pages at 308 MB and the process at 68
+    /// of a limit of 1,024, and 2,147 major faults in a pass of 166 ms; the
+    /// rewarm asked for nothing, since it asks for form files and only
+    /// once a form is installed. At a settle, every seal and merge landed,
+    /// the store is at rest and the scans after it find the files back:
+    /// the default took refaults in that pass in 7 reps of 20 and the arm
+    /// in none. Where scans come back is too late
+    /// (`zpages_rewarm_raw_scans`). Counted (`ZCounts::raw_settles`,
+    /// `raw_settle_ms`, `raw_rewarm_files`, `raw_rewarm_bytes`,
+    /// `raw_rewarm_short`). Off; `supdb-zrewarmraw` asks.
+    #[doc(hidden)]
+    pub zpages_rewarm_raw: bool,
+    /// REFUTED: with `zpages_rewarm_raw`, the raw form's files are asked
+    /// for at the rewarm due where scans come back (`zpages_rewarm_scans`)
+    /// as well as at a settle. Those asks are made as the readers arrive
+    /// and the reads they start share the device with the readers' faults:
+    /// at three million keys under 1 GiB the clean store's pass, a tenth of
+    /// a second, read 135-160 MB inside it and ran no faster; at ten
+    /// million random ids under 1 GiB they asked about 200 MB a rep, mostly
+    /// as the full rewrite's merges landed in its pass, and that pass read
+    /// 0.68x and 0.63x of the arm without them in both orders. Off;
+    /// `supdb-zrewarmrawscans` asks there too.
+    #[doc(hidden)]
+    pub zpages_rewarm_raw_scans: bool,
     /// A rewarm due (`zpages_rewarm_scans`) is made while merges are in
     /// flight, for the form files of the partitions no merge in flight
     /// holds, where off it waits for the merges to land. It was made beside
@@ -7151,6 +7215,7 @@ impl Default for Options {
             overlay_merge: true,
             scan_lazy_snapshot: false,
             scan_forms_off_unreused: true,
+            scan_forms_off_counts_built: false,
             scan_forms_off_stale_writes: 512,
             scan_forms_off_window: 512,
             scan_forms_off_ghost_bits: 10,
@@ -7270,6 +7335,8 @@ impl Default for Options {
             zpages_rewarm_at_install: false,
             zpages_settle_joins_asks: true,
             zpages_rewarm_trims: false,
+            zpages_rewarm_raw: false,
+            zpages_rewarm_raw_scans: false,
             zpages_rewarm_beside_merges: false,
             zpages_rewarm_quiet_ms: 250,
             zpages_stride: ZStride::Forced,
@@ -22184,6 +22251,11 @@ struct Shared {
     /// The times the upkeep thread gave its forms up, on an ask and on
     /// what its own pin held.
     abandons: AtomicU64,
+    /// The writer's tables dropped whole, by the site that asked
+    /// (`Reader::drop_blocks_for`), and `rebase_tables`'s refusals by the
+    /// check that refused: a probe's counts (`Db::forms_drop_reasons`).
+    drop_reasons: [AtomicU64; 16],
+    rebase_refusals: [AtomicU64; 16],
     abandons_pinned: AtomicU64,
     /// `Options::scan_forms_off_unreused`: the times a handle gave its
     /// forms up and took them back, and the scans it made without them.
@@ -22291,6 +22363,57 @@ fn map_len(map: &MmapBytes) -> usize {
 /// it (`Bytes::resident_share`); zero where it will not say.
 fn map_resident_share(map: &MmapBytes) -> f64 {
     crate::bytes::Bytes::resident_share(map, 0, map_len(map)).unwrap_or(0.0)
+}
+
+/// A rewarm's asks for the raw form's files (`Options::zpages_rewarm_raw`),
+/// on the rewarm's thread: each file mapped by its path, so the thread
+/// holds nothing a landing retires, asked for whole where the page cache
+/// holds under `HOT_RAW_RESIDENT` of it and the bytes it lacks fit what
+/// is left of `room`; a file that does not fit is left and counted short,
+/// and a smaller one after it may still be asked. A file gone since the
+/// look is passed over.
+fn raw_rewarm_ask(
+    shared: &Shared,
+    files: Vec<PathBuf>,
+    mut room: u64,
+    trace: bool,
+) -> Vec<MmapBytes> {
+    let (mut asked, mut bytes, mut short) = (0u64, 0u64, 0u64);
+    let mut maps = Vec::new();
+    for p in files {
+        let Ok(map) = vault::map(&p) else {
+            continue;
+        };
+        let len = map_len(&map);
+        let share = map_resident_share(&map);
+        if len == 0 || share >= HOT_RAW_RESIDENT {
+            continue;
+        }
+        let missing = ((1.0 - share) * len as f64) as u64;
+        if missing > room {
+            short += 1;
+            continue;
+        }
+        room -= missing;
+        let _ = crate::bytes::Bytes::advise_willneed(&map, 0, len);
+        asked += 1;
+        bytes += missing;
+        maps.push(map);
+    }
+    if asked > 0 {
+        zfile::ZEvents::add(&shared.z.raw_rewarms, 1);
+    }
+    zfile::ZEvents::add(&shared.z.raw_rewarm_files, asked);
+    zfile::ZEvents::add(&shared.z.raw_rewarm_bytes, bytes);
+    zfile::ZEvents::add(&shared.z.raw_rewarm_short, short);
+    if trace {
+        eprintln!(
+            "zrewarm raw asked {asked} mb {:.1} short {short} room_left_mb {:.1}",
+            bytes as f64 / 1e6,
+            room as f64 / 1e6
+        );
+    }
+    maps
 }
 
 /// What the trim asks of glibc's allocator: the bytes it holds free in its
@@ -27486,6 +27609,12 @@ impl Reader {
             ask_join_ms: get(&ev.ask_join_ms),
             rewarm_trims: get(&ev.rewarm_trims),
             rewarm_trim_bytes: get(&ev.rewarm_trim_bytes),
+            raw_rewarms: get(&ev.raw_rewarms),
+            raw_rewarm_files: get(&ev.raw_rewarm_files),
+            raw_rewarm_bytes: get(&ev.raw_rewarm_bytes),
+            raw_rewarm_short: get(&ev.raw_rewarm_short),
+            raw_settles: get(&ev.raw_settles),
+            raw_settle_ms: get(&ev.raw_settle_ms),
             reparses: get(&ev.reparses),
             recode_flips: get(&ev.recode_flips),
             spare_builds: get(&ev.spare_builds),
@@ -29490,7 +29619,7 @@ impl Reader {
                 self.fs().snap_stale.borrow_mut().clear();
             }
             self.fs().pending.borrow_mut().clear();
-            self.drop_blocks();
+            self.drop_blocks_for(1);
             if self.fs().tables.borrow().len() != st.segs.len() {
                 *self.fs().tables.borrow_mut() = Db::tables_for(st.segs.len());
             }
@@ -29699,10 +29828,10 @@ impl Reader {
             || !(self.opts.forms_carry && self.opts.commit_forms && self.opts.scan_block_cache)
             || !self.fs().cache_used.get()
         {
-            return false;
+            return self.refuse_rebase(1);
         }
         let Some(over) = self.fs().over.borrow_mut().take() else {
-            return false;
+            return self.refuse_rebase(2);
         };
         // The live table is the one the log position is of, or freezes
         // that leave their carry to the look (`Options::freeze_settles`
@@ -29714,23 +29843,23 @@ impl Reader {
         // makes itself and carries at once (`carry_switch`).
         let changes = match st.lives.checked_sub(over.lives) {
             Some(d) => d as usize,
-            None => return false,
+            None => return self.refuse_rebase(3),
         };
         let k = st.frozen.len();
         let read_from: Vec<std::sync::Arc<MemTable>> = if changes == 0 {
             if !std::ptr::eq(over.mem.as_ptr(), std::sync::Arc::as_ptr(&st.mem)) {
-                return false;
+                return self.refuse_rebase(4);
             }
             Vec::new()
         } else if self.opts.freeze_settles {
-            return false;
+            return self.refuse_rebase(5);
         } else {
             let replaced = st.replaced();
             let Some(at) = replaced.len().checked_sub(changes) else {
-                return false;
+                return self.refuse_rebase(6);
             };
             if !std::ptr::eq(over.mem.as_ptr(), std::sync::Arc::as_ptr(&replaced[at])) {
-                return false;
+                return self.refuse_rebase(7);
             }
             replaced[at..].to_vec()
         };
@@ -29749,24 +29878,24 @@ impl Reader {
         let landed = before.len() < over.frozen.len()
             && same_tables(&over.frozen[over.frozen.len() - before.len()..], before);
         if !same_frozen && !landed {
-            return false;
+            return self.refuse_rebase(8);
         }
         let np = st.segs.partition_point(|s| s.level > 0);
         if np == 0 || st.layout.len() != np || st.forms.len() < np {
-            return false;
+            return self.refuse_rebase(9);
         }
         // Everything that can fail first, so a failure leaves the tables
         // as they were for the caller to drop.
         let l0 = &st.segs[np..];
         let ctx = self.build_ctx();
         if ctx.rank_pieces().is_err() {
-            return false;
+            return self.refuse_rebase(10);
         }
         let mut bounds = Vec::with_capacity(np);
         for seg in &st.segs[..np] {
             match ctx.table_bounds(seg, l0) {
                 Ok(b) => bounds.push(b),
-                Err(_) => return false,
+                Err(_) => return self.refuse_rebase(11),
             }
         }
         drop(ctx);
@@ -29968,7 +30097,7 @@ impl Reader {
                             .fold_piece_block(p, b, t, seg, piece, (r0..r1, cuts))
                             .is_err()
                         {
-                            return false;
+                            return self.refuse_rebase(12);
                         }
                     }
                 }
@@ -30385,7 +30514,7 @@ impl Reader {
         *self.fs().scan_keys.borrow_mut() = None;
         self.fs().snap_added.borrow_mut().clear();
         self.fs().snap_stale.borrow_mut().clear();
-        self.drop_blocks();
+        self.drop_blocks_for(7);
         self.shared
             .upkeep_lives
             .store(u64::MAX, AtomicOrdering::Relaxed);
@@ -30403,6 +30532,19 @@ impl Reader {
                 .fetch_add(1, AtomicOrdering::Relaxed);
         }
         true
+    }
+
+    /// A refusal of `rebase_tables`, counted by where it was made
+    /// (`Db::forms_drop_reasons`), for the caller to drop everything on.
+    fn refuse_rebase(&self, at: usize) -> bool {
+        self.shared.rebase_refusals[at.min(15)].fetch_add(1, AtomicOrdering::Relaxed);
+        false
+    }
+
+    /// `drop_blocks`, counted by the site that asked (`Db::forms_drop_reasons`).
+    fn drop_blocks_for(&self, why: usize) {
+        self.shared.drop_reasons[why.min(15)].fetch_add(1, AtomicOrdering::Relaxed);
+        self.drop_blocks();
     }
 
     fn drop_blocks(&self) {
@@ -31024,7 +31166,8 @@ impl Reader {
             return self.fs().forms_off.get();
         }
         let np = self.segs().partition_point(|s| s.level > 0);
-        let seg = &self.segs()[self.first_reaching(np, from).min(np - 1)];
+        let pi = self.first_reaching(np, from).min(np - 1);
+        let seg = &self.segs()[pi];
         let Some(b) = seg.ord.floor_stride(from) else {
             return off;
         };
@@ -31038,6 +31181,9 @@ impl Reader {
             }
             std::mem::replace(&mut ghost[slot], id) == id
         };
+        // A start in a block whose form is built already is a walk that
+        // costs no build (`Options::scan_forms_off_counts_built`).
+        let hit = hit || (self.opts.scan_forms_off_counts_built && self.block_built(pi, b));
         let (n, hits) = self.fs().reuse.get();
         let (n, hits) = (n + 1, hits + u32::from(hit));
         if n < self.opts.scan_forms_off_window.max(1) {
@@ -31051,6 +31197,23 @@ impl Reader {
             self.forms_off_leave();
         }
         self.fs().forms_off.get()
+    }
+
+    /// Whether the writer's table for partition `pi` holds a form for block
+    /// `b` -- a copy, a sparse form or a wide one, not a clean mark, which
+    /// stands for a block with nothing to fold and so for no build at all.
+    fn block_built(&self, pi: usize, b: usize) -> bool {
+        let tables = self.fs().tables.borrow();
+        let Some(cell) = tables.get(pi) else {
+            return false;
+        };
+        let held = cell.borrow();
+        held.as_ref().is_some_and(|t| {
+            t.blob == self.segs()[pi].blob.id()
+                && t.slots
+                    .get(b)
+                    .is_some_and(|a| a.as_ref().is_some_and(|a| !matches!(**a, Cached::Clean)))
+        })
     }
 
     /// The forms given up for the merge path, as a change of generation
@@ -31107,7 +31270,7 @@ impl Reader {
         *self.fs().scan_keys.borrow_mut() = None;
         self.fs().snap_added.borrow_mut().clear();
         self.fs().snap_stale.borrow_mut().clear();
-        self.drop_blocks();
+        self.drop_blocks_for(8);
         if self.slot.is_none() {
             self.shared
                 .upkeep_lives
@@ -33126,7 +33289,7 @@ impl Reader {
             budget -= take;
             let later = writes.split_off(take);
             if let Err(e) = self.settle_each(&writes, &table) {
-                self.drop_blocks();
+                self.drop_blocks_for(2);
                 return Err(e);
             }
             if self.abandon_pending() {
@@ -33157,7 +33320,7 @@ impl Reader {
         // stale, so an error drops every table rather than leave one.
         let settled = self.settle_each(&pending, self.mem());
         if settled.is_err() {
-            self.drop_blocks();
+            self.drop_blocks_for(2);
         }
         pending.clear();
         *self.fs().pending.borrow_mut() = pending;
@@ -35504,7 +35667,7 @@ impl Reader {
     pub fn refill_forms(&mut self) -> Result<()> {
         std::mem::forget(self.enter());
         let op = Op(self);
-        self.drop_blocks();
+        self.drop_blocks_for(3);
         self.fs().publish_due.set(true);
         let done = self.maintain_forms();
         drop(op);
@@ -35654,6 +35817,60 @@ impl Reader {
     #[doc(hidden)]
     pub fn memory_census(&self) -> Vec<(String, u64)> {
         self.memory_census_with(&[])
+    }
+
+    /// A probe of the block cache by partition, for a question the census
+    /// by kind cannot answer -- which partitions the forms' bytes stand over
+    /// and whether the page cache holds those partitions' own pages: for
+    /// each partition in key order, the segment's id and level, whether its
+    /// table was built over this very segment, the forms by kind with their
+    /// buffers' bytes, the blocks with no form, and the share of its records
+    /// and of its ordered index resident. It takes the writer's upkeep home
+    /// as the census does, so it is read where a pass is not timed, or
+    /// where the pass it precedes is a probe's.
+    #[doc(hidden)]
+    pub fn forms_by_partition(&self) -> Vec<String> {
+        let _e = self.enter();
+        let segs = self.segs();
+        let np = segs.partition_point(|s| s.level > 0);
+        let fs = self.fs();
+        let tables = fs.tables.borrow();
+        let mut out = Vec::new();
+        for (i, s) in segs[..np].iter().enumerate() {
+            let id = Db::name_id(&s.name).unwrap_or(0);
+            let ord = s.ord.resident_share();
+            let rec = s.records_resident();
+            let Some(cell) = tables.get(i) else {
+                out.push(format!("p{i} id {id} notable rec {rec:.2} ord {ord:.2}"));
+                continue;
+            };
+            let held = cell.borrow();
+            let Some(t) = held.as_ref() else {
+                out.push(format!("p{i} id {id} none rec {rec:.2} ord {ord:.2}"));
+                continue;
+            };
+            let mut tally = FormTally::default();
+            let mut empty = 0u64;
+            for a in t.slots.iter() {
+                match a {
+                    Some(a) => tally.add(a),
+                    None => empty += 1,
+                }
+            }
+            out.push(format!(
+                "p{i} id {id} own {} blocks {} copy {}/{:.1}MB sparse {}/{:.1}MB clean {} wide {} empty {empty} rec {rec:.2} ord {ord:.2}",
+                t.blob == s.blob.id(),
+                t.slots.len(),
+                tally.n[2],
+                tally.cap[2] as f64 / 1e6,
+                tally.n[1],
+                tally.cap[1] as f64 / 1e6,
+                tally.n[0],
+                tally.n[3],
+            ));
+        }
+        out.push(format!("pieces {}", segs.len() - np));
+        out
     }
 
     fn memory_census_with(&self, handed: &[std::sync::Arc<MemTable>]) -> Vec<(String, u64)> {
@@ -37608,6 +37825,8 @@ impl Db {
             abandon_at: AtomicU64::new(u64::MAX),
             outran_at: AtomicU64::new(u64::MAX),
             abandons: AtomicU64::new(0),
+            drop_reasons: Default::default(),
+            rebase_refusals: Default::default(),
             forms_off_entries: AtomicU64::new(0),
             forms_off_exits: AtomicU64::new(0),
             forms_off_scans: AtomicU64::new(0),
@@ -38874,6 +39093,8 @@ impl Db {
             abandon_at: AtomicU64::new(u64::MAX),
             outran_at: AtomicU64::new(u64::MAX),
             abandons: AtomicU64::new(0),
+            drop_reasons: Default::default(),
+            rebase_refusals: Default::default(),
             forms_off_entries: AtomicU64::new(0),
             forms_off_exits: AtomicU64::new(0),
             forms_off_scans: AtomicU64::new(0),
@@ -40599,7 +40820,7 @@ impl Db {
         self.make_run_spare();
         *self.fs().scan_keys.borrow_mut() = None;
         self.fs().snap_added.borrow_mut().clear();
-        self.drop_blocks();
+        self.drop_blocks_for(4);
         self.mem_bytes = 0;
         let Some(d) = self.direct.take() else {
             // A run forming with nothing committed: no file, nothing to close.
@@ -41913,7 +42134,7 @@ impl Db {
             *self.fs().scan_keys.borrow_mut() = None;
             self.fs().snap_added.borrow_mut().clear();
             self.fs().snap_stale.borrow_mut().clear();
-            self.drop_blocks();
+            self.drop_blocks_for(5);
         }
         self.published(old);
         true
@@ -42123,7 +42344,7 @@ impl Db {
             *self.fs().scan_keys.borrow_mut() = None;
             self.fs().snap_added.borrow_mut().clear();
             self.fs().snap_stale.borrow_mut().clear();
-            self.drop_blocks();
+            self.drop_blocks_for(6);
             return;
         };
         // The snapshot carried rather than dropped: its live entries made
@@ -47408,6 +47629,12 @@ impl Db {
         self.r.memory_census_with(&handed)
     }
 
+    /// The writer's block cache by partition (`Reader::forms_by_partition`).
+    #[doc(hidden)]
+    pub fn forms_by_partition(&self) -> Vec<String> {
+        self.r.forms_by_partition()
+    }
+
     /// The sequence of the last manifest this store published
     /// (`Options::manifest_slots`): what the open read, plus one for every
     /// publish since. A landing in flight counts once it has published;
@@ -47535,6 +47762,27 @@ impl Db {
     #[doc(hidden)]
     pub fn upkeep_abandons(&self) -> u64 {
         self.shared.abandons.load(AtomicOrdering::Relaxed)
+    }
+
+    /// The writer's tables dropped whole by the site that asked -- 1 the
+    /// log read when the rebase refused, 2 a settle's error, 3 a refill,
+    /// 4 a direct run's close, 5 a freeze, 6 a freeze's carry, 7 the
+    /// upkeep's abandon, 8 the forms given up -- and the rebase's refusals
+    /// by the check that made them, in the order they stand in
+    /// `Reader::rebase_tables`: a probe's counts.
+    #[doc(hidden)]
+    pub fn forms_drop_reasons(&self) -> ([u64; 16], [u64; 16]) {
+        let get = |a: &[AtomicU64; 16]| {
+            let mut out = [0u64; 16];
+            for (o, x) in out.iter_mut().zip(a.iter()) {
+                *o = x.load(AtomicOrdering::Relaxed);
+            }
+            out
+        };
+        (
+            get(&self.shared.drop_reasons),
+            get(&self.shared.rebase_refusals),
+        )
     }
 
     /// Of those, the ones the thread's own pin decided.
@@ -51412,6 +51660,7 @@ impl Maint {
                 z_finish_wait(&self.shared);
                 self.z_rewarm_join();
                 self.z_join_asks();
+                self.z_raw_settle();
                 self.sync_owed_slot()
             }
             MaintAsk::Checkpoint(dest) => {
@@ -55762,11 +56011,27 @@ impl Maint {
         } else {
             HOT_RAW_RESIDENT
         };
-        if self.zsel.counts().installs == 0 || self.shared.zgate.load() == zselect::GATE_RAW {
+        let forms =
+            self.zsel.counts().installs > 0 && self.shared.zgate.load() != zselect::GATE_RAW;
+        // The raw form's files (`Options::zpages_rewarm_raw`), asked within
+        // the group's room, and only where the room is known.
+        let room = if self.opts.zpages_rewarm_raw && self.opts.zpages_rewarm_raw_scans {
+            self.raw_rewarm_room()
+        } else {
+            None
+        };
+        let raw = if room.is_some() {
+            self.raw_rewarm_files(merging)
+        } else {
+            Vec::new()
+        };
+        if !forms && raw.is_empty() {
             return;
         }
         let mut whole = (0.0f64, 0u64);
-        let paths: Vec<(PathBuf, f64, u64)> = {
+        let paths: Vec<(PathBuf, f64, u64)> = if !forms {
+            Vec::new()
+        } else {
             let _op = self.op();
             self.segs()
                 .iter()
@@ -55797,24 +56062,29 @@ impl Maint {
                 .iter()
                 .map(|(_, r, b)| format!("{:.2}/{}", r, b >> 20))
                 .collect();
-            let room = zfile::read_budget().and_then(|b| b.slack());
+            let slack = zfile::read_budget().and_then(|b| b.slack());
             eprintln!(
-                "zrewarm t={:.1} files {} line {line} of_all {:.3}/{} life {life} merging {merging} room_mb {} resident {}",
+                "zrewarm t={:.1} files {} line {line} of_all {:.3}/{} life {life} merging {merging} room_mb {} resident {} raw_files {} raw_room_mb {}",
                 now.as_secs_f64(),
                 paths.len(),
                 whole.0 / whole.1.max(1) as f64,
                 whole.1 >> 20,
+                slack.map_or("-".to_string(), |r| (r >> 20).to_string()),
+                shares.join(","),
+                raw.len(),
                 room.map_or("-".to_string(), |r| (r >> 20).to_string()),
-                shares.join(",")
             );
         }
         let paths: Vec<PathBuf> = paths.into_iter().map(|(p, _, _)| p).collect();
-        if paths.is_empty() {
+        if paths.is_empty() && raw.is_empty() {
             return;
         }
-        zfile::ZEvents::add(&self.shared.z.rewarms, 1);
-        zfile::ZEvents::add(&self.shared.z.rewarm_files, paths.len() as u64);
-        self.z_ask_pending = true;
+        if !paths.is_empty() {
+            zfile::ZEvents::add(&self.shared.z.rewarms, 1);
+            zfile::ZEvents::add(&self.shared.z.rewarm_files, paths.len() as u64);
+            self.z_ask_pending = true;
+        }
+        let room = room.unwrap_or(0);
         let (trims, shared, trace) = (
             self.opts.zpages_rewarm_trims,
             self.shared.clone(),
@@ -55849,8 +56119,112 @@ impl Maint {
                         let _ = crate::bytes::Bytes::advise_willneed(&map, 0, map_len(&map));
                     }
                 }
+                if !raw.is_empty() {
+                    let _ = raw_rewarm_ask(&shared, raw, room, trace);
+                }
             })
             .ok();
+    }
+
+    /// The room a rewarm's asks for the raw form's files may take
+    /// (`Options::zpages_rewarm_raw`): the group's unused memory less the
+    /// margin, the seam's where a test set the budget, else the platform's;
+    /// `None` where neither says.
+    fn raw_rewarm_room(&self) -> Option<u64> {
+        let inject = self.opts.zpages_inject.as_ref();
+        match inject.and_then(|i| i.budget()) {
+            Some(_) => inject.and_then(|i| i.slack()),
+            None => zfile::read_budget().and_then(|b| b.slack()),
+        }
+    }
+
+    /// The raw form's files a rewarm may ask for
+    /// (`Options::zpages_rewarm_raw`), in the order it asks: the ordered
+    /// indexes, which every scan's start seeks, then the partitions the raw
+    /// form serves -- every one under the raw gate, else those no form
+    /// file serves -- then the level-0 pieces. Beside merges in flight
+    /// (`zpages_rewarm_beside_merges`) the segments they hold are left, as
+    /// the form files are: their files go at the landing.
+    fn raw_rewarm_files(&self, merging: bool) -> Vec<PathBuf> {
+        let raw_gate = self.shared.zgate.load() == zselect::GATE_RAW;
+        let _op = self.op();
+        let (mut files, mut parts, mut pieces) = (Vec::new(), Vec::new(), Vec::new());
+        for s in self.segs().iter() {
+            if merging && self.in_flight_input(&s.name) {
+                continue;
+            }
+            if s.level > 0 && !raw_gate && s.z.get().is_some() {
+                continue;
+            }
+            if let Some(n) = Db::ord_name_for(&s.name) {
+                files.push(self.dir.join(n));
+            }
+            if s.level > 0 {
+                parts.push(self.dir.join(&s.name));
+            } else {
+                pieces.push(self.dir.join(&s.name));
+            }
+        }
+        files.extend(parts);
+        files.extend(pieces);
+        files
+    }
+
+    /// A settle's ask for the raw form's files (`Options::zpages_rewarm_raw`)
+    /// and its wait for them: with every seal and merge landed the store is
+    /// at rest, and a rest is when the files the writes pushed out can come
+    /// back into the room the writes left -- the scans that follow a
+    /// settle find them where a rewarm made as they come is a read the
+    /// first of them waits behind: at three million keys under 1 GiB the
+    /// lag sweep's clean store, whose pass is a tenth of a second, read 135
+    /// to 160 MB from the device inside it with the asks made at its start,
+    /// and ran no faster for the faults it saved. The files are asked as a
+    /// rewarm asks them, within the group's room, on this thread, and waited
+    /// for as the form files are (`z_join_asks`): a look every
+    /// `ASK_JOIN_POLL` until `HOT_RAW_RESIDENT` of what was asked is
+    /// resident, `ASK_JOIN_STALLS` looks with no page more, or
+    /// `ASK_JOIN_CAP`. Counted (`ZCounts::raw_settles`, `raw_settle_ms`).
+    fn z_raw_settle(&mut self) {
+        if !self.opts.zpages_rewarm_raw {
+            return;
+        }
+        let Some(room) = self.raw_rewarm_room() else {
+            return;
+        };
+        let files = self.raw_rewarm_files(false);
+        if files.is_empty() {
+            return;
+        }
+        let maps = raw_rewarm_ask(&self.shared, files, room, self.z_trace);
+        if maps.is_empty() {
+            return;
+        }
+        let t = std::time::Instant::now();
+        let total: u64 = maps.iter().map(|m| map_len(m) as u64).sum();
+        let want = (total as f64 * HOT_RAW_RESIDENT) as u64;
+        let held = |maps: &[MmapBytes]| -> u64 {
+            maps.iter()
+                .map(|m| (map_resident_share(m) * map_len(m) as f64) as u64)
+                .sum()
+        };
+        let (mut last, mut stalls) = (held(&maps), 0u32);
+        while last < want && t.elapsed() < ASK_JOIN_CAP && stalls < ASK_JOIN_STALLS {
+            std::thread::sleep(ASK_JOIN_POLL);
+            let now = held(&maps);
+            stalls = if now > last { 0 } else { stalls + 1 };
+            last = now;
+        }
+        let ms = t.elapsed().as_millis() as u64;
+        zfile::ZEvents::add(&self.shared.z.raw_settles, 1);
+        zfile::ZEvents::add(&self.shared.z.raw_settle_ms, ms);
+        if self.z_trace {
+            eprintln!(
+                "zrawsettle asked {} held_mb {:.1} of {:.1} ms {ms}",
+                maps.len(),
+                last as f64 / 1e6,
+                total as f64 / 1e6
+            );
+        }
     }
 
     /// The thread of `Options::zpages_rewarm_scans` joined, where a settle

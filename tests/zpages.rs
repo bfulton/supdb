@@ -12418,12 +12418,17 @@ fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
             |o| {
                 o.zpages_rewarm_scans = on;
                 o.zpages_rewarm_trims = trims;
+                // The raw form's files asked for too, with room for them:
+                // a partition its form file serves has none to ask for.
+                o.zpages_rewarm_raw = true;
+                o.zpages_rewarm_raw_scans = true;
                 o.zpages_hot_raw = false;
                 o.zpages_memo = false;
                 o.partition_bytes = Some(400 << 10);
             },
             |_| {},
         );
+        inject.set_slack(1 << 30);
         let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
         let r = db.reader().unwrap();
         let mut at = 0usize;
@@ -12466,6 +12471,11 @@ fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
             assert!(
                 c.rewarm_files + 1 >= n,
                 "{what}: every cold file asked for: {c:?}"
+            );
+            assert_eq!(
+                (c.raw_rewarm_files, c.raw_rewarm_short),
+                (0, 0),
+                "{what}: no raw file of a partition its form serves: {c:?}"
             );
         } else {
             assert_eq!((c.rewarms, c.rewarm_files), (0, 0), "{what}: {c:?}");
@@ -12553,6 +12563,329 @@ fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
             "{what}: no rewarm over files in the cache: {:?}",
             db.zpage_counts()
         );
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The store's raw files paged out under it: every partition and ordered
+/// index of `dir` with this process's mappings of it unmapped and its pages
+/// dropped, and what they hold and what of it the cache holds after.
+#[cfg(target_os = "linux")]
+fn evict_raw(dir: &Path) -> (u64, u64) {
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        if name.starts_with("par-") || name.starts_with("ord-") {
+            unmap_pages(&p);
+            evict(&p);
+        }
+    }
+    raw_resident(dir)
+}
+
+/// What the store's partitions and ordered indexes hold, and what of it
+/// the page cache holds.
+#[cfg(target_os = "linux")]
+fn raw_resident(dir: &Path) -> (u64, u64) {
+    let (ps, pr) = resident_under(dir, "par-");
+    let (os, or) = resident_under(dir, "ord-");
+    (ps + os, pr + or)
+}
+
+/// With the raw form serving -- the store in core, no form installed --
+/// the scans that come back after a stretch without one have the raw files
+/// the page cache has lost asked for (`Options::zpages_rewarm_raw`): every
+/// partition and ordered index out of the cache, a second and a half of the
+/// injected clock with no scan, then a scan of one entry, and the look
+/// after it asks for each file and the files come back; a scan with no
+/// quiet stretch before it asks for nothing again; a settle asks for them
+/// and returns with them back. Those asks where the scans come back are
+/// `Options::zpages_rewarm_raw_scans`'s: with the settle's option alone the
+/// scans ask nothing and the settle brings the files back. Without either
+/// nothing is asked and the files stay out. With no room in the group
+/// (`ZInject::set_slack`, the group's unused memory less the margin) the
+/// look asks for nothing and counts every file short of the line short,
+/// since an ask beyond the room takes one of the store's pages for
+/// another's. The scan that brings the look is of one entry, so that its
+/// own faults are not what brings the files back.
+#[cfg(target_os = "linux")]
+#[test]
+fn scans_after_a_quiet_stretch_have_the_cold_raw_files_asked_for() {
+    for (on, scans, room) in [
+        (true, true, 1u64 << 30),
+        (false, false, 1 << 30),
+        (true, true, 0),
+        (true, false, 1 << 30),
+    ] {
+        let what = format!("raw rewarm {on} at scans {scans} room {room}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-rawrewarm-{on}-{scans}-{room}"),
+            1 << 30,
+            0.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_rewarm_raw = on;
+                o.zpages_rewarm_raw_scans = scans;
+                o.zpages_hot_raw = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        inject.set_slack(room);
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        for _ in 0..3 {
+            advance_tick(&db, std::time::Duration::from_millis(100));
+        }
+        let c = db.zpage_counts();
+        assert_eq!(c.gate, 0, "{what}: the raw form serves: {c:?}");
+        assert!(c.partitions >= 4, "{what}: partitions: {c:?}");
+        let (size, cold) = evict_raw(&dir);
+        assert!(
+            size > 0 && cold * 10 < size,
+            "{what}: the raw files out of the cache: {cold} of {size}"
+        );
+        // One ordered index read back whole: a file the cache holds is not
+        // asked for, nor counted short.
+        let raw_files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                let n = p.file_name().unwrap().to_string_lossy().into_owned();
+                (n.starts_with("par-") || n.starts_with("ord-"))
+                    && std::fs::metadata(p).unwrap().len() > 0
+            })
+            .collect();
+        let warm_one = raw_files
+            .iter()
+            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("ord-"))
+            .unwrap();
+        let _ = std::fs::read(warm_one).unwrap();
+        let cold_files = raw_files.len() as u64 - 1;
+        // A stretch with no scan, then a scan of one entry.
+        for _ in 0..5 {
+            advance_tick(&db, std::time::Duration::from_millis(300));
+        }
+        let mut one = 0usize;
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        assert_eq!(one, 1, "{what}: the scan");
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        // The asks are made and counted on the rewarm's own thread.
+        let t = std::time::Instant::now();
+        let done = |c: &supdb::db::ZCounts| c.raw_rewarm_files + c.raw_rewarm_short > 0;
+        while on && scans && !done(&db.zpage_counts()) && t.elapsed().as_secs() < 30 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let c = db.zpage_counts();
+        match (on && scans, room > 0) {
+            (true, true) => {
+                assert_eq!(c.raw_rewarms, 1, "{what}: one raw rewarm: {c:?}");
+                assert_eq!(
+                    c.raw_rewarm_files, cold_files,
+                    "{what}: every cold partition and index asked for, and the warm one not: {c:?}"
+                );
+                assert!(c.raw_rewarm_bytes > 0, "{what}: {c:?}");
+                assert_eq!(c.raw_rewarm_short, 0, "{what}: {c:?}");
+            }
+            (true, false) => {
+                assert_eq!(
+                    (c.raw_rewarms, c.raw_rewarm_files),
+                    (0, 0),
+                    "{what}: nothing asked beyond the room: {c:?}"
+                );
+                assert_eq!(
+                    c.raw_rewarm_short, cold_files,
+                    "{what}: every cold file short, and the warm one not: {c:?}"
+                );
+            }
+            (false, _) => assert_eq!(
+                (c.raw_rewarms, c.raw_rewarm_files, c.raw_rewarm_short),
+                (0, 0, 0),
+                "{what}: {c:?}"
+            ),
+        }
+        // The asks land in the cache; without them the files stay out.
+        let asked = on && scans && room > 0;
+        let t = std::time::Instant::now();
+        let mut warm = raw_resident(&dir).1;
+        while asked && warm * 10 < size * 9 && t.elapsed().as_secs() < 30 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            warm = raw_resident(&dir).1;
+        }
+        if asked {
+            assert!(
+                warm * 10 >= size * 9,
+                "{what}: the raw files back in the cache: {warm} of {size}"
+            );
+        } else {
+            assert!(
+                warm * 2 < size,
+                "{what}: the raw files left out: {warm} of {size}"
+            );
+        }
+        // A scan with no quiet stretch before it asks for nothing more, the
+        // files out of the cache again so that there would be something to
+        // ask for.
+        let (size, cold) = evict_raw(&dir);
+        assert!(
+            cold * 10 < size,
+            "{what}: the raw files out of the cache again: {cold} of {size}"
+        );
+        let before = db.zpage_counts();
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.raw_rewarms, c.raw_rewarm_short),
+            (before.raw_rewarms, before.raw_rewarm_short),
+            "{what}: no raw rewarm without the quiet: {c:?}"
+        );
+        // A settle is a rest: it asks for the cold raw files within the
+        // room and returns with them back, with nothing to wait for after.
+        let mut db = db;
+        db.settle().unwrap();
+        let c = db.zpage_counts();
+        let warm = raw_resident(&dir).1;
+        if on && room > 0 {
+            assert_eq!(c.raw_settles, 1, "{what}: the settle's asks: {c:?}");
+            assert!(
+                warm * 10 >= size * 9,
+                "{what}: the raw files back as the settle returns: {warm} of {size}"
+            );
+        } else {
+            assert_eq!(c.raw_settles, 0, "{what}: no settle's asks: {c:?}");
+            assert!(
+                warm * 2 < size,
+                "{what}: the raw files left out by the settle: {warm} of {size}"
+            );
+        }
+        let r = db.reader().unwrap();
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Under a cipher a settle's asks for the raw form's files
+/// (`Options::zpages_rewarm_raw`) are asks for their envelopes: the store's
+/// files are read through its cache from the kernel's cache of the
+/// ciphertext, which is what a first read waits on the device for, so the
+/// asks go through the mapping each file is read by and reach the envelope
+/// behind it. A store reopened with every envelope out of the page cache
+/// and room in the group has them asked for and back as the settle
+/// returns, with nothing decrypted for the asking; with no room every one
+/// is counted short and left; and without the option nothing is asked. An
+/// ask made of the bytes a paged mapping lends unasked measured files of
+/// none and asked for nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_settles_raw_rewarm_under_a_cipher_asks_for_the_envelopes_and_decrypts_nothing() {
+    for (on, room) in [(true, 1u64 << 30), (true, 0), (false, 1 << 30)] {
+        let what = format!("raw rewarm under a cipher {on} room {room}");
+        let dir = scratch(&format!("rawrewarm-cipher-{on}-{room}"));
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_budget(1 << 30);
+        inject.set_slack(room);
+        let opts = || Options {
+            zpages_inject: Some(inject.clone()),
+            zpages_rewarm_raw: on,
+            partition_bytes: Some(400 << 10),
+            encryption: supdb::Encryption::Cipher(supdb::StoreCipher::new(
+                common::Gcm::new(&[0x5c; 32]),
+                common::Gcm::new,
+            )),
+            ..Options::default()
+        };
+        let mut db = Db::create(&dir, opts()).unwrap();
+        let model = ordered_load(&mut db, 20_000, 0x4A9);
+        db.settle().unwrap();
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.raw_settles, c.raw_rewarm_files),
+            (0, 0),
+            "{what}: nothing asked of files just written: {c:?}"
+        );
+        db.close().unwrap();
+        // Every envelope out of the page cache, with no mapping of this
+        // process over it: the store is closed.
+        for e in std::fs::read_dir(&dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.file_name().unwrap().to_string_lossy().starts_with("x-") {
+                evict(&p);
+            }
+        }
+        let (size, cold) = resident_under(&dir, "x-");
+        assert!(
+            size > 0 && cold * 10 < size,
+            "{what}: the envelopes out of the cache: {cold} of {size}"
+        );
+        let mut db = Db::open(&dir, opts()).unwrap();
+        let (_, opened) = resident_under(&dir, "x-");
+        assert!(
+            opened * 2 < size,
+            "{what}: the open read a few chunks a file: {opened} of {size}"
+        );
+        let fills = db
+            .cipher_counts()
+            .expect("a store under a cipher")
+            .cache
+            .fills;
+        db.settle().unwrap();
+        let c = db.zpage_counts();
+        let (_, warm) = resident_under(&dir, "x-");
+        match (on, room > 0) {
+            (true, true) => {
+                assert_eq!(c.raw_settles, 1, "{what}: the settle's asks: {c:?}");
+                assert!(
+                    c.raw_rewarm_files >= 4 && c.raw_rewarm_bytes * 2 > size,
+                    "{what}: the cold envelopes measured and asked for: {c:?} of {size}"
+                );
+                assert_eq!(c.raw_rewarm_short, 0, "{what}: {c:?}");
+                assert!(
+                    warm * 10 >= size * 8,
+                    "{what}: the envelopes back as the settle returns: {warm} of {size}"
+                );
+            }
+            (true, false) => {
+                assert_eq!(
+                    (c.raw_settles, c.raw_rewarm_files),
+                    (0, 0),
+                    "{what}: nothing asked beyond the room: {c:?}"
+                );
+                assert!(
+                    c.raw_rewarm_short >= 4,
+                    "{what}: every cold envelope short: {c:?}"
+                );
+                assert!(
+                    warm * 2 < size,
+                    "{what}: the envelopes left out: {warm} of {size}"
+                );
+            }
+            (false, _) => {
+                assert_eq!(
+                    (c.raw_settles, c.raw_rewarm_files, c.raw_rewarm_short),
+                    (0, 0, 0),
+                    "{what}: {c:?}"
+                );
+                assert!(
+                    warm * 2 < size,
+                    "{what}: the envelopes left out: {warm} of {size}"
+                );
+            }
+        }
+        assert_eq!(
+            db.cipher_counts().unwrap().cache.fills,
+            fills,
+            "{what}: the asks decrypted nothing"
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
         check(&r, &model, &keys, &format!("{what}: after"));
         drop(r);
         db.close().unwrap();

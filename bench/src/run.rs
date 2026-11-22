@@ -3534,6 +3534,29 @@ fn lag_sweep(
             e.sync()?;
             e.settle()?;
         }
+        // A probe, under `SUPDB_LAG_FORMS`: the block cache by partition
+        // where the pass starts (`Engine::forms_by_partition`). It takes the
+        // writer's upkeep home, which the pass after it would otherwise
+        // wait out or race, so a run that prints it is a probe of where the
+        // forms stand and its rates are not read.
+        let forms_probe = std::env::var_os("SUPDB_LAG_FORMS").is_some();
+        // A probe, under `SUPDB_LAG_TRIM_BEFORE`: the allocator's free pages
+        // returned between the burst and its pass, the anonymous bytes
+        // printed before and after (`lagtrimbefore`). For the question
+        // whether the free chunks a burst leaves are what its pass is short
+        // of; the pass after it is the probe's, and its rates are not read.
+        if std::env::var_os("SUPDB_LAG_TRIM_BEFORE").is_some() {
+            let before = anon_resident_bytes().map_or(0, |b| b >> 20);
+            release_freed_memory();
+            let after = anon_resident_bytes().map_or(0, |b| b >> 20);
+            eprintln!("lagtrimbefore {arm} {pct} anon_mb {before} -> {after}");
+        }
+        if forms_probe {
+            for l in e.forms_by_partition() {
+                eprintln!("lagforms {arm} {pct} start {l}");
+            }
+            eprintln!("lagdrops {arm} {pct} start {}", e.forms_drop_reasons());
+        }
         let mut g3 = KeyGen::new(KeyDist::Uniform, scan_keys, 0x1A7);
         // With `SUPDB_SCAN_OPS` set, every scan of the point's pass is timed
         // on its own, as the scan pass's are, and a `lagops` line per point
@@ -3666,6 +3689,12 @@ fn lag_sweep(
                 &c1,
             );
             census_line("lagcensus", arm, &pct.to_string(), e, true);
+        }
+        if forms_probe {
+            for l in e.forms_by_partition() {
+                eprintln!("lagforms {arm} {pct} end {l}");
+            }
+            eprintln!("lagdrops {arm} {pct} end {}", e.forms_drop_reasons());
         }
     }
     Ok(())
