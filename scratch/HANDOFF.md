@@ -155,7 +155,7 @@ bulk replacement broke tick-exact tests once; do it test by test. Planned for th
 
 ## What is left, in the owner's order
 
-### 1. The page layer (task 12). Stage G1 is closed: eight units, the full gate green on `31b33339`, the critic's account in `scratch/plan/build/close/g1-built.md`. Of five changes that stood between it and G2 the first is done (the seal's names, `89da086f`); four are left, in the order below.
+### 1. The page layer (task 12). Stage G1 is closed: eight units, the full gate green on `31b33339`, the critic's account in `scratch/plan/build/close/g1-built.md`. Of five changes that stood between it and G2 two are done (the seal's names, `89da086f`; the `cross-arm` group, `f1cbced5`); three are left, in the order below.
 
 **As of 22 Nov 11:24 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
 launched one unit a launch: `Workflow {scriptPath, args: {base:
@@ -668,9 +668,36 @@ holds; a note for a step changes no earlier prompt, so the steps before it repla
   the state built was red in every seed of four runs of four, and with `zpages_settle()`
   before the baseline green in six of six. Test only; `CLAUDE.md` has the case under "Two
   counts compared across a worker's race". Records: `scratch/plan/build/T23/`.
+- **The `cross-arm` group's crash found and the group made to give a verdict: `f1cbced5`
+  (change T22, 22 Nov).** The critic's third concern. The crash is the emulator's own and no
+  test's: qemu-user 8.2.2 fakes `/proc/self/maps` from its own record of the guest's
+  mappings and crashes reading it while another thread maps or unmaps; a panic's backtrace is
+  symbolized by reading that file; this shell has `RUST_BACKTRACE=1`, so the crypt test that
+  panics on purpose read it beside the crypt tests' loop of `mmap` and `munmap` of their own
+  ranges. Evidence: qemu's `-strace` of a dead run ends in the open of `/proc/self/maps`
+  beside a `munmap` of the address the `mmap` before it returned; the crypt tests died in 8
+  runs of 30 with backtraces on, 0 of 30 with them off and 0 of 30 with the one panicking
+  test skipped; a C program of four threads and no engine (`scratch/plan/build/T22/repro/
+  maps_race.c`) dies 10 runs of 10 with the same message, and lives with its reader on
+  `/proc/self/status`, with no mapper thread, and built natively. The whole binary: 15 dead
+  of 32 with backtraces on, 42 clean of 42 with them off. The fix is in the group's case of
+  `scripts/check.sh`: `RUST_BACKTRACE=0` for the emulated run. No test is compiled out,
+  skipped or loosened. Both reviewers passed it; their mutants then found two ways round the
+  variable, each closed in the repair round, which **no reviewer read and the launcher did**:
+  the variable written after `--lib` is a test-name filter (the group ran no test and exited
+  0), so the case now captures its output and requires a `test result: ok` line with tests
+  passed and `0 filtered out`; and a unit test that formats `Backtrace::force_capture()`
+  killed one run in twelve under the fix, so `tests/source.rs` refuses any line of `src/`,
+  unit tests included, that reads `/proc/self/maps`, names `Backtrace` or names
+  `RUST_BACKTRACE` (`the_library_reads_no_maps_and_makes_no_backtrace`, with a fixture test).
+  The group green three times running under the caller's `RUST_BACKTRACE=1`, 530 tests each.
+  Lost: a failing test under the emulator prints no backtrace, and the job's log shows
+  nothing until the run ends. Not verified: whether a hosted runner exports `RUST_BACKTRACE`
+  (so whether CI would have met the crash at all; the case holds either way), whether QEMU
+  has since fixed the race, and that no dependency of the library reads the file at run
+  time. Records: `scratch/plan/build/T22/`.
 - **Next, each a change of its own through `scratch/plan/build/change-v1.js`, in this
-  order:** (1) done, above; (2) the `cross-arm`
-  crash found and the test QEMU cannot run kept from the emulated run alone; (3) the cipher
+  order:** (1) and (2) done, above; (3) the cipher
   test that fails now and then diagnosed (task 14); (4) `whole_key_at` and the three small
   gainers decomposed and brought down, each held by the count against the commit before it
   (task 20; the baseline of accepted moves against a named upstream commit that this note

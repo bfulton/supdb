@@ -1,0 +1,3 @@
+start 2026-11-22T18:38:40Z check.sh sha=70a29333504a
+run 1 exit 1 segv 1  0
+EXIT done 2026-11-22T18:38:41Z

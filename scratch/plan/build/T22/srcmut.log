@@ -1,0 +1,15 @@
+force-capture: exit 101; failed: test the_library_reads_no_maps_and_makes_no_backtrace ... FAILED test a_maps_reader_or_a_backtrace_in_the_library_fails ... FAILED  test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 79 filtered out; finished in 2.02s
+force-capture: restored crypt.rs
+no-maps: exit 101; failed: test a_maps_reader_or_a_backtrace_in_the_library_fails ... FAILED  test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 79 filtered out; finished in 0.40s
+no-maps: restored source.rs
+no-lib: exit 101; failed: test a_maps_reader_or_a_backtrace_in_the_library_fails ... FAILED  test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 79 filtered out; finished in 1.61s
+no-lib: restored source.rs
+no-rust-bt: exit 101; failed: test a_maps_reader_or_a_backtrace_in_the_library_fails ... FAILED  test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 79 filtered out; finished in 1.35s
+no-rust-bt: restored source.rs
+no-word: exit 101; failed: test a_maps_reader_or_a_backtrace_in_the_library_fails ... FAILED  test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 79 filtered out; finished in 0.76s
+no-word: restored source.rs
+comments-read: exit 101; failed: test a_maps_reader_or_a_backtrace_in_the_library_fails ... FAILED  test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 79 filtered out; finished in 2.11s
+comments-read: restored source.rs
+tests-skipped: exit 101; failed: test a_maps_reader_or_a_backtrace_in_the_library_fails ... FAILED  test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 79 filtered out; finished in 0.46s
+tests-skipped: restored source.rs
+EXIT done 2026-11-22T19:08:46Z

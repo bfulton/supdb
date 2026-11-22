@@ -1,0 +1,1 @@
+qemu-aarch64-static: QEMU internal SIGSEGV {code=MAPERR, addr=0x20}

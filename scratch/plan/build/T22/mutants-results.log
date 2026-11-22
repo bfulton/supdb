@@ -1,0 +1,3 @@
+wrong-var: 1 red of 1 runs; run 1 exit 101 segv 1  0
+wrong-var: restored 40702f87641dee702690d113423a2cae990b0c74db34aa80b473de23303f864d
+EXIT done

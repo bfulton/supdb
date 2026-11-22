@@ -1,0 +1,265 @@
+{
+  "summary": "One change taken between two units of stage G1 of the encryption seam, from a brief passed in args: its red input shown red, the change, mutants, two read-only reviews, repair, its gate and a local commit. Nothing is pushed.",
+  "agentCount": 5,
+  "logs": [
+    "unit T22 cross-arm: building",
+    "unit T22: review 1: 0 blocking, 7 extra mutants",
+    "unit T22: the reviewers passed it and the extra mutants changed no engine code; no further review",
+    "unit T22: committed f1cbced5"
+  ],
+  "result": {
+    "stopped": null,
+    "results": [
+      {
+        "unit": "T22",
+        "name": "cross-arm",
+        "impl": {
+          "unit": "T22 cross-arm (repair round 1)",
+          "summary": "The cross-arm group's crash is QEMU's own bug (cause i). qemu-user 8.2.2 builds a fake /proc/self/maps from its own record of the guest's mappings, and it crashes while reading that file if another thread maps or unmaps at the same moment. A panic's backtrace is symbolized by reading /proc/self/maps. With RUST_BACKTRACE=1, the crypt test that panics on purpose therefore read that file beside the crypt tests' mmap/munmap loop. A C program with four threads and no engine dies the same way 10 runs of 10 (repro/). The fix sets RUST_BACKTRACE=0 in the cross-arm case of scripts/check.sh. No test is compiled out, skipped or loosened.\n\nRepair round 1 ran every extra mutant. Two of them found holes, and both are now closed:\n(1) Putting RUST_BACKTRACE=0 after `--lib` turns it into a test-name filter. The group ran 0 tests and still exited 0, so that mutant survived. The case now captures the run's output, prints it, and requires a `test result: ok. N passed (N>=1) ... 0 filtered out` line. The same mutant is now red (exit 1).\n(2) A lib unit test that formats `Backtrace::force_capture()` killed the group 1 run in 12 with the fix in place, a flaky red. A new source gate in tests/source.rs (`maps_readers`, with a tree test and a fixture test) refuses any line of src/, unit tests included, that has a /proc/self/maps literal, the word `Backtrace`, or a RUST_BACKTRACE / RUST_LIB_BACKTRACE literal. On the native target this mutant now fails deterministically.\n\nThe empty value, `=short`, and the line moved to the `test` case were each killed by the group with the QEMU SIGSEGV. So `0` is the only safe value. With the fix and the new check, cross-arm passed 3 of 3 runs by exit status with 530 tests run. The test, lint and lists (SUPDB_BASE=bc9cdd84) groups all exited 0. Notes, mutants.md and CLAUDE.md are updated. Nothing is committed.",
+          "red_inputs": [
+            {
+              "what": "RUST_BACKTRACE=0 moved after --lib (a test filter): the group must not pass a run of 0 tests",
+              "red_before": "against the round's starting check.sh it survived: runs/mut3-after-lib exit 0, '0 passed; ... 530 filtered out', 'all checks passed'",
+              "green_after": true
+            },
+            {
+              "what": "a lib unit test that formats Backtrace::force_capture(), held by the new source gate the_library_reads_no_maps_and_makes_no_backtrace",
+              "red_before": "the group with the fix died once in 12 (runs/mut3-force-capture); the source test with the mutant applied by srcmut.sh: exit 101, FAILED (runs/srcmut/force-capture.log)",
+              "green_after": true
+            },
+            {
+              "what": "the original crash: cross-arm under the caller's RUST_BACKTRACE=1 (round 0)",
+              "red_before": "8/12 direct runs dead (before.log), 7/20 in interleaved runs",
+              "green_after": true
+            }
+          ],
+          "files_changed": [
+            "scripts/check.sh",
+            "tests/source.rs",
+            "CLAUDE.md"
+          ],
+          "mutants": [
+            {
+              "mutant": "the case's RUST_BACKTRACE=0 line dropped (round 0)",
+              "killed_by": "runs/mut-drop-line run 1: QEMU SIGSEGV, exit 101"
+            },
+            {
+              "mutant": "RUST_BACKTRACE=1 in place of 0 (round 0)",
+              "killed_by": "runs/mut-value-one run 1: SIGSEGV"
+            },
+            {
+              "mutant": "RUST_LIB_BACKTRACE=0 in place of RUST_BACKTRACE=0 (round 0)",
+              "killed_by": "runs/mut2-wrong-var run 1: SIGSEGV (it survived 8 runs of a first batch; interleaved direct runs: 7/20 dead)"
+            },
+            {
+              "mutant": "RUST_BACKTRACE= (empty)",
+              "killed_by": "runs/mut3-empty run 3: exit 1, SIGSEGV (2 clean before it)"
+            },
+            {
+              "mutant": "RUST_BACKTRACE=short",
+              "killed_by": "runs/mut3-short run 2: exit 1, SIGSEGV"
+            },
+            {
+              "mutant": "RUST_BACKTRACE=0 moved after --lib (becomes a test filter)",
+              "killed_by": "survived against the old case (0 tests, exit 0); killed by the new count check: runs/mut3-after-lib-new exit 1 'the run did not run every test it compiled'"
+            },
+            {
+              "mutant": "the RUST_BACKTRACE=0 line moved to the test case",
+              "killed_by": "runs/mut3-moved-to-test run 1: exit 1, SIGSEGV"
+            },
+            {
+              "mutant": "a lib unit test calling Backtrace::force_capture() beside the crypt tests",
+              "killed_by": "the group only flakily (dead in run 12 of 12); deterministically by the new source gate: runs/srcmut/force-capture.log FAILED"
+            },
+            {
+              "mutant": "source gate: /proc/self/maps check made `if false`",
+              "killed_by": "a_maps_reader_or_a_backtrace_in_the_library_fails FAILED (srcmut no-maps)"
+            },
+            {
+              "mutant": "source gate: RUST_LIB_BACKTRACE half dropped",
+              "killed_by": "fixture test FAILED (srcmut no-lib)"
+            },
+            {
+              "mutant": "source gate: RUST_BACKTRACE half made false",
+              "killed_by": "fixture test FAILED (srcmut no-rust-bt)"
+            },
+            {
+              "mutant": "source gate: word Backtrace misspelt",
+              "killed_by": "fixture test FAILED (srcmut no-word)"
+            },
+            {
+              "mutant": "source gate: comments read as code",
+              "killed_by": "fixture test FAILED, its comment case (srcmut comments-read)"
+            },
+            {
+              "mutant": "source gate: unit-test lines skipped",
+              "killed_by": "fixture test FAILED (srcmut tests-skipped)"
+            }
+          ],
+          "survivors": [],
+          "callgrind": [],
+          "plain_store_cost": "None. No compiled engine code changed; the diff is scripts/check.sh, tests/source.rs and CLAUDE.md. A plain store's paths, syscalls and instructions are unchanged.",
+          "cipher_changes": "None. Nothing under a cipher changed; no option, arm or default was touched.",
+          "plan_departures": [
+            "Not option (a), (b) or (c) of the brief. The trigger is the run's environment: a symbolized backtrace reads the emulated /proc/self/maps. No test's own code triggers it, so the fix is the variable set in the group's case and no test is compiled out (round 0).",
+            "Round 1 adds two checks the brief did not ask for, each forced by a reviewer's mutant. The cross-arm case holds its run to `0 filtered out` and at least one test passed. A source gate in tests/source.rs refuses /proc/self/maps, Backtrace and RUST_BACKTRACE in src/.",
+            "The cross-arm case now captures its output and prints it at the end, as the fscrypt case does. A CI log of the job shows no progress during the roughly three minutes of the run.",
+            "Two lines of the new gate were removed before their mutants because nothing could reach them: the `.rs` filter (src/ holds no other file) and the lower-case `backtrace` word (a capture always names `Backtrace`)."
+          ],
+          "not_built": [],
+          "not_verified": [
+            "That GitHub's runner exports RUST_BACKTRACE (dtolnay/rust-toolchain is remembered to set =short). The case does not depend on it either way.",
+            "That no dependency of the lib reads /proc/self/maps at run time: the gate reads the lib's own source only.",
+            "A path to /proc/self/maps built at run time is not seen by the gate (one built with concat! is already refused by the door outside its modules).",
+            "QEMU's own stack: the static-pie binary is stripped (round 0).",
+            "Whether QEMU upstream has fixed the /proc/self/maps race: not looked up."
+          ],
+          "engine_changed": false,
+          "blocked": ""
+        },
+        "unresolved": [],
+        "commit": {
+          "committed": true,
+          "sha": "f1cbced5",
+          "gate": "All gates green by exit status, run from a TMPDIR of their own (since removed). \"sh scripts/check.sh build test lint\": EXIT 0, 27 \"test result: ok\" lines, \"all checks passed: build test lint\". The two new source tests passed. \"SUPDB_BASE=bc9cdd8472591d6343a74e467dc79827724d404e sh scripts/check.sh lists\": EXIT 0. \"sh scripts/check.sh cross-arm\" three times in a row, with RUST_BACKTRACE=1 in the caller's environment: EXIT 0 each time, and each printed \"test result: ok. 530 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\". The stride group was not run because no compiled engine code changed. Logs are in /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/T22/commit/ (btl.log, lists.log, arm1.log, arm2.log, arm3.log). The commit message is msg.txt in the same directory.",
+          "fixed_in_passing": [],
+          "problems": [
+            "Nothing stray was removed: the working tree held only the change's three files (CLAUDE.md, scripts/check.sh, tests/source.rs). The ignored build outputs web/floor/target/ and web/supdb.wasm were left in place.",
+            "Not verified by me: whether GitHub's runner exports RUST_BACKTRACE (the case holds either way), whether QEMU upstream has fixed the /proc/self/maps race, and QEMU's own stack (its binary is stripped). These are left open in the commit body.",
+            "The source gate does not see a dependency that reads /proc/self/maps at run time, or a path to it put together at run time.",
+            "The unit's notes.md was not updated for the commit step. The gate's logs and the commit message are under the T22/commit/ directory."
+          ]
+        }
+      }
+    ]
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Build"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 2,
+      "title": "Review"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 3,
+      "title": "Commit"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "build:T22:cross-arm",
+      "phaseIndex": 1,
+      "phaseTitle": "Build",
+      "agentId": "a96d806236491a43c",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1795359479858,
+      "queuedAt": 1795359479826,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "T22 cross-arm",
+      "promptPreview": "You are working in /home/user/supdb (Rust; a read-optimized embedded store; the engine is src/db.rs and src/db/*.rs, the format's readers src/blob.rs, src/flatindex.rs, src/ordindex.rs, the byte-source seam src/bytes.rs), on the branch that is checked out. The store can be kept under a caller's cipher (src/db/vault.rs, src/db/pager.rs) and the owner's goal for that feature is: reliable, performant…",
+      "promptFramed": true,
+      "lastProgressAt": 1795371945104,
+      "tokens": 377483,
+      "toolCalls": 97,
+      "durationMs": 12465246,
+      "resultPreview": "{\"unit\":\"T22 cross-arm\",\"summary\":\"The crash is QEMU's own bug (cause i), and a test is not what sets it off. The trigger is the environment the run inherits. This shell has RUST_BACKTRACE=1, so every panic gets its backtrace symbolized: the tests that panic on purpose, and any real failure. Rust's symbolizer reads /proc/self/maps to do that. qemu-user 8.2.2 fakes /proc/self/maps from its own reco…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "review:T22:holds:r1",
+      "phaseIndex": 2,
+      "phaseTitle": "Review",
+      "agentId": "a4b7fdacf2a7b58a1",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1795371945146,
+      "queuedAt": 1795371945110,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "pass",
+      "promptPreview": "You are working in /home/user/supdb (Rust; a read-optimized embedded store; the engine is src/db.rs and src/db/*.rs, the format's readers src/blob.rs, src/flatindex.rs, src/ordindex.rs, the byte-source seam src/bytes.rs), on the branch that is checked out. The store can be kept under a caller's cipher (src/db/vault.rs, src/db/pager.rs) and the owner's goal for that feature is: reliable, performant…",
+      "promptFramed": true,
+      "lastProgressAt": 1795372022207,
+      "tokens": 286100,
+      "toolCalls": 7,
+      "durationMs": 77060,
+      "resultPreview": "{\"verdict\":\"pass\",\"blocking\":[],\"nonblocking\":[\"The verdict (cause i) holds up when read against the kept evidence. The C reproducer (repro/maps_race.c) makes calls only on ranges its own thread mapped, and it died 10 of 10 with the same message; both controls were clean 10 of 10. Removing the one reader of the emulated /proc/self/maps takes crypt:: from 8/30 dead to 0/30, both by unsetting RUST_B…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "review:T22:cost:r1",
+      "phaseIndex": 2,
+      "phaseTitle": "Review",
+      "agentId": "af7401b90a77bc86e",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1795371945147,
+      "queuedAt": 1795371945111,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "pass",
+      "promptPreview": "You are working in /home/user/supdb (Rust; a read-optimized embedded store; the engine is src/db.rs and src/db/*.rs, the format's readers src/blob.rs, src/flatindex.rs, src/ordindex.rs, the byte-source seam src/bytes.rs), on the branch that is checked out. The store can be kept under a caller's cipher (src/db/vault.rs, src/db/pager.rs) and the owner's goal for that feature is: reliable, performant…",
+      "promptFramed": true,
+      "lastProgressAt": 1795372014061,
+      "tokens": 285412,
+      "toolCalls": 7,
+      "durationMs": 63912,
+      "resultPreview": "{\"verdict\":\"pass\",\"blocking\":[],\"nonblocking\":[\"Plain-store cost: the diff is scripts/check.sh (one `RUST_BACKTRACE=0 \\\\` line in the cross-arm case, lines ~209-213, plus its comment) and one CLAUDE.md paragraph. Nothing compiled changes, so no callgrind rows, strace or stride group are owed. The binary the group runs is the base's (supdb-f73fa21bb2eb2ba6, sha f26d8b77...), and every run reads '53…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 4,
+      "label": "repair:T22:r1",
+      "phaseIndex": 2,
+      "phaseTitle": "Review",
+      "agentId": "a05911320744da7bc",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1795372022211,
+      "queuedAt": 1795372022209,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "T22 cross-arm (repair round 1)",
+      "promptPreview": "You are working in /home/user/supdb (Rust; a read-optimized embedded store; the engine is src/db.rs and src/db/*.rs, the format's readers src/blob.rs, src/flatindex.rs, src/ordindex.rs, the byte-source seam src/bytes.rs), on the branch that is checked out. The store can be kept under a caller's cipher (src/db/vault.rs, src/db/pager.rs) and the owner's goal for that feature is: reliable, performant…",
+      "promptFramed": true,
+      "lastProgressAt": 1795375598226,
+      "tokens": 336979,
+      "toolCalls": 44,
+      "durationMs": 3576014,
+      "resultPreview": "{\"unit\":\"T22 cross-arm (repair round 1)\",\"summary\":\"The cross-arm group's crash is QEMU's own bug (cause i). qemu-user 8.2.2 builds a fake /proc/self/maps from its own record of the guest's mappings, and it crashes while reading that file if another thread maps or unmaps at the same moment. A panic's backtrace is symbolized by reading /proc/self/maps. With RUST_BACKTRACE=1, the crypt test that pan…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 5,
+      "label": "commit:T22",
+      "phaseIndex": 3,
+      "phaseTitle": "Commit",
+      "agentId": "a688c9b212e4053f9",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1795375598252,
+      "queuedAt": 1795375598230,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "f1cbced5",
+      "promptPreview": "You are working in /home/user/supdb (Rust; a read-optimized embedded store; the engine is src/db.rs and src/db/*.rs, the format's readers src/blob.rs, src/flatindex.rs, src/ordindex.rs, the byte-source seam src/bytes.rs), on the branch that is checked out. The store can be kept under a caller's cipher (src/db/vault.rs, src/db/pager.rs) and the owner's goal for that feature is: reliable, performant…",
+      "promptFramed": true,
+      "lastProgressAt": 1795376692497,
+      "tokens": 285530,
+      "toolCalls": 11,
+      "durationMs": 1094245,
+      "resultPreview": "{\"committed\":true,\"sha\":\"f1cbced5\",\"gate\":\"All gates green by exit status, run from a TMPDIR of their own (since removed). \\\"sh scripts/check.sh build test lint\\\": EXIT 0, 27 \\\"test result: ok\\\" lines, \\\"all checks passed: build test lint\\\". The two new source tests passed. \\\"SUPDB_BASE=bc9cdd8472591d6343a74e467dc79827724d404e sh scripts/check.sh lists\\\": EXIT 0. \\\"sh scripts/check.sh cross-arm\\\" …"
+    }
+  ],
+  "totalTokens": 1571504,
+  "totalToolCalls": 166
+}

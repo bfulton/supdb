@@ -1,0 +1,25 @@
+test ordindex::tests::the_hinted_seek_names_a_window_of_one_stride_that_holds_its_answer ... ok
+test ordindex::tests::the_select_search_answers_as_partition_point_does ... ok
+test ordindex::tests::the_short_compare_answers_as_the_slice_compare_does ... ok
+test ordindex::tests::the_top_level_answers_a_strides_first_key_as_the_records_do ... ok
+test ordindex::tests::the_windowed_seek_says_whether_its_rank_is_the_key ... ok
+test reserve::tests::a_huge_run_does_not_wrap_the_block_cut ... ok
+test reserve::tests::a_key_too_long_to_frame_is_refused_rather_than_sized ... ok
+test reserve::tests::a_run_of_one_width_carries_no_prefixes ... ok
+test reserve::tests::a_run_past_what_an_extent_addresses_is_refused_rather_than_sized ... ok
+test reserve::tests::a_small_segment_reserves_kilobytes_not_the_old_floor ... ok
+test reserve::tests::blocks_are_cut_where_the_writer_cuts_them ... ok
+test reserve::tests::no_keys_still_reserves_room_for_the_table ... ok
+test reserve::tests::record_bytes_that_would_wrap_refuse_rather_than_return_the_wrapped_sum ... ok
+test reserve::tests::the_bound_is_never_below_the_exact_answer ... ok
+test reserve::tests::the_directory_copy_is_four_bytes_a_key_and_the_only_optional_piece ... ok
+test reserve::tests::the_planner_and_the_slice_agree ... ok
+test reserve::tests::the_planner_holds_aggregates_rather_than_the_input ... ok
+test db::zselect::tests::constant_workloads_come_to_rest_eager_at_700_mb ... ok
+test db::zselect::tests::workloads_that_change_without_warning_obey_the_rules ... ok
+test db::zselect::tests::constant_workloads_come_to_rest_eager_at_937_mb ... ok
+
+test result: ok. 530 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 151.59s
+
+all checks passed: cross-arm
+EXIT 0

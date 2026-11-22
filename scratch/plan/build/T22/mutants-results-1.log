@@ -1,0 +1,7 @@
+drop-line: 1 red of 1 runs; run 1 exit 101 segv 1  0
+drop-line: restored 40702f87641dee702690d113423a2cae990b0c74db34aa80b473de23303f864d
+value-one: 1 red of 1 runs; run 1 exit 101 segv 1  0
+value-one: restored 40702f87641dee702690d113423a2cae990b0c74db34aa80b473de23303f864d
+wrong-var: 0 red of 8 runs; run 8 exit 0 segv 0 test result: ok. 530 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 159.96s 1
+wrong-var: restored 40702f87641dee702690d113423a2cae990b0c74db34aa80b473de23303f864d
+EXIT done

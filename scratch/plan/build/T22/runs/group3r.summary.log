@@ -1,0 +1,5 @@
+start 2026-11-22T19:09:25Z check.sh sha=0d5bb2a76fe2
+run 1 exit 0 segv 0 test result: ok. 530 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 151.92s 1
+run 2 exit 0 segv 0 test result: ok. 530 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 146.63s 1
+run 3 exit 0 segv 0 test result: ok. 530 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 143.43s 1
+EXIT done 2026-11-22T19:17:20Z

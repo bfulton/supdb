@@ -1,0 +1,22 @@
+start 2026-11-22T15:13:44Z bin=f26d8b77d424 qa=-strace -D /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/T22/runs/cryptstrace/trace@I@.log args=crypt::
+run 1 exit 139 segv 1 
+run 2 exit 139 segv 1 
+run 3 exit 139 segv 1 
+run 4 exit 0 segv 0 test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 506 filtered out; finished in 1.68s
+run 5 exit 0 segv 0 test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 506 filtered out; finished in 1.73s
+run 6 exit 139 segv 1 
+run 7 exit 0 segv 0 test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 506 filtered out; finished in 1.89s
+run 8 exit 0 segv 0 test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 506 filtered out; finished in 1.67s
+run 9 exit 0 segv 0 test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 506 filtered out; finished in 1.71s
+run 10 exit 0 segv 0 test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 506 filtered out; finished in 1.77s
+run 11 exit 0 segv 0 test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 506 filtered out; finished in 1.68s
+run 12 exit 139 segv 1 
+run 13 exit 139 segv 1 
+run 14 exit 0 segv 0 test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 506 filtered out; finished in 1.89s
+run 15 exit 139 segv 1 
+run 16 exit 139 segv 1 
+run 17 exit 139 segv 1 
+run 18 exit 139 segv 1 
+run 19 exit 0 segv 0 test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 506 filtered out; finished in 1.56s
+run 20 exit 139 segv 1 
+EXIT done 2026-11-22T15:14:02Z

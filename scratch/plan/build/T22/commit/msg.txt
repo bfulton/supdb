@@ -1,0 +1,59 @@
+The cross-arm group runs its emulated unit tests with backtraces off, every test it compiled, and the library reads no /proc/self/maps
+
+The group (the library's unit tests built for aarch64 and run under
+qemu-user 8.2.2) died in runs of the whole binary with "QEMU internal
+SIGSEGV {code=MAPERR, addr=0x20}" and no test failed. The cause is the
+emulator's: qemu-user fakes /proc/self/maps from its own record of the
+guest's mappings and crashes reading it while another thread maps or
+unmaps. A panic's backtrace is symbolized by reading that file, so under
+the caller's RUST_BACKTRACE a test that panics on purpose, beside the
+crypt tests' loop of mmap and munmap of their own ranges, killed the run.
+qemu's own syscall trace named the open of /proc/self/maps beside a
+munmap of the address the mmap before it returned; a C program of four
+threads and no engine, built for aarch64, dies the same way every run
+and lives with the reader pointed at /proc/self/status, and the same
+tests with backtraces off never died.
+
+What is now held:
+- scripts/check.sh's cross-arm case sets RUST_BACKTRACE=0 for its run.
+  Shown red by the binary run straight under the emulator with
+  backtraces on (most of a dozen runs dead, a third of twenty runs
+  interleaved with clean ones), green by forty-odd straight runs and the
+  group itself with backtraces off. No test is compiled out, skipped or
+  loosened; the emulated run's test list is unchanged.
+- The case captures the run's output and holds it to a "test result:
+  ok" line with at least one test passed and none filtered out, since a
+  word after --lib is a test-name filter and a run of no test exits 0.
+  Shown red by the variable moved after --lib, which passed the case as
+  it was and fails it now.
+- tests/source.rs refuses any line of the library's code, unit tests
+  included and comments not, that reads /proc/self/maps, names
+  Backtrace or names RUST_BACKTRACE / RUST_LIB_BACKTRACE, with a fixture
+  test for each spelling. Shown red by a unit test formatting
+  Backtrace::force_capture(), which killed the group about one run in
+  twelve with the variable set and fails the source test every time.
+
+What it cannot see: a dependency that reads /proc/self/maps at run time,
+or a path to it put together at run time; a test compiled out by a cfg
+or marked ignored is not counted as filtered. A failing test under the
+emulator prints no backtrace; the native legs print theirs.
+
+A store in the clear pays nothing: no compiled engine code changed (the
+diff is a shell case, a source test and CLAUDE.md), so there are no
+rows by function and no stride group. Nothing changes under a cipher;
+no option, arm or default is touched.
+
+Mutants: the line dropped, the value 1, the empty value, "short",
+RUST_LIB_BACKTRACE in its place and the line moved to the test case,
+each killed by the group dying in the emulator; the line after --lib,
+killed by the count check; the force-capture test, killed by the source
+gate; and in the gate each half disabled, the word misspelt, comments
+read as code and unit-test lines skipped, each killed by the fixture
+test.
+
+Left open: whether GitHub's runner exports RUST_BACKTRACE (the case
+holds either way); whether QEMU upstream has fixed the race (not looked
+up); QEMU's own stack, its binary being stripped.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GEwcALZsCzTm28PHd4bQza
