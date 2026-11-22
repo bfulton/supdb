@@ -3517,6 +3517,17 @@ fn lag_sweep(
         // wait out or race, so a run that prints it is a probe of where the
         // forms stand and its rates are not read.
         let forms_probe = std::env::var_os("SUPDB_LAG_FORMS").is_some();
+        // A probe, under `SUPDB_LAG_TRIM_BEFORE`: the allocator's free pages
+        // returned between the burst and its pass, the anonymous bytes
+        // printed before and after (`lagtrimbefore`). For the question
+        // whether the free chunks a burst leaves are what its pass is short
+        // of; the pass after it is the probe's, and its rates are not read.
+        if std::env::var_os("SUPDB_LAG_TRIM_BEFORE").is_some() {
+            let before = anon_resident_bytes().map_or(0, |b| b >> 20);
+            release_freed_memory();
+            let after = anon_resident_bytes().map_or(0, |b| b >> 20);
+            eprintln!("lagtrimbefore {arm} {pct} anon_mb {before} -> {after}");
+        }
         if forms_probe {
             for l in e.forms_by_partition() {
                 eprintln!("lagforms {arm} {pct} start {l}");
