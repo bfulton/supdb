@@ -523,6 +523,39 @@ pub fn thread_switches() -> (u64, u64) {
 }
 
 /// This thread's minor page faults so far.
+/// Major faults so far of this process's threads named `comm`, and of this
+/// thread: `[upkeep, segment work, this thread]` for the lag sweep's
+/// `lagmajflt` line. A thread that has ended took its count with it, so
+/// the two named are the store's long-lived ones and a job's thread, a
+/// seal's or a merge's, is in neither.
+pub fn lag_majflt() -> [u64; 3] {
+    let of = |comm: &str| -> u64 {
+        let Ok(rd) = std::fs::read_dir("/proc/self/task") else {
+            return 0;
+        };
+        let mut total = 0u64;
+        for e in rd.flatten() {
+            let p = e.path();
+            if std::fs::read_to_string(p.join("comm"))
+                .unwrap_or_default()
+                .trim()
+                != comm
+            {
+                continue;
+            }
+            if let Ok(stat) = std::fs::read_to_string(p.join("stat")) {
+                total += stat_majflt(&stat).unwrap_or(0);
+            }
+        }
+        total
+    };
+    [
+        of("supdb-upkeep"),
+        of("supdb-maint"),
+        majflt_self().unwrap_or(0),
+    ]
+}
+
 pub fn minflt_self() -> u64 {
     std::fs::read_to_string("/proc/thread-self/stat").map_or(0, |s| stat_minflt(&s))
 }
@@ -3448,6 +3481,11 @@ fn lag_sweep(
         } else {
             (0, 0)
         };
+        // The long-lived threads' major faults, read before the burst, at
+        // its end and after the pass (`lagmajflt`): whose reads of the
+        // store's files went to the device, in the burst and in the pass
+        // apart, where `lagdev` has the group's whole count over the pass.
+        let mf0 = if counting_store { lag_majflt() } else { [0; 3] };
         let cb = if wrote > 0 { counting.begin() } else { None };
         let burst_cpu0 = thread_cpu_us();
         let tw = Instant::now();
@@ -3494,6 +3532,7 @@ fn lag_sweep(
                 lag_arenas("lagburstarenas", arm, &pct.to_string());
             }
         }
+        let mf1 = if counting_store { lag_majflt() } else { [0; 3] };
         if pct == 0 {
             // The shuffled load's own tail is drained here and the merge
             // the drain hands to the segment work is joined, so no merge
@@ -3666,6 +3705,17 @@ fn lag_sweep(
                 &c1,
             );
             census_line("lagcensus", arm, &pct.to_string(), e, true);
+            let mf2 = lag_majflt();
+            let d = |a: [u64; 3], b: [u64; 3], i: usize| b[i].saturating_sub(a[i]);
+            eprintln!(
+                "lagmajflt {arm} {pct} burst up {} maint {} main {} | pass up {} maint {} main {}",
+                d(mf0, mf1, 0),
+                d(mf0, mf1, 1),
+                d(mf0, mf1, 2),
+                d(mf1, mf2, 0),
+                d(mf1, mf2, 1),
+                d(mf1, mf2, 2),
+            );
         }
         if forms_probe {
             for l in e.forms_by_partition() {

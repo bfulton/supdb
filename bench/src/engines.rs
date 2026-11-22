@@ -7533,6 +7533,36 @@ impl Supdb {
         )
     }
 
+    /// A probe's arm: `supdb-nozpages` with a job's arrays mapped
+    /// (`Options::zpages` off and `Options::jobs_mapped`), for what the
+    /// store reads at three million keys under 1 GiB with neither the
+    /// controller's preparations for the compact form nor the arenas the
+    /// jobs' threads leave. `supdb-nozjobs`.
+    pub fn create_nozjobs(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zpages_off: true,
+                jobsmapped: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-nozjobs` with a settle asking the raw form's files back
+    /// (`Options::zpages_rewarm_raw`). `supdb-nozjobsrewarm`.
+    pub fn create_nozjobsrewarm(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zpages_off: true,
+                jobsmapped: true,
+                rewarmraw: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with the forms-off rule counting a start in a built form as
     /// a reuse (`Options::scan_forms_off_counts_built`).
     pub fn create_formsoffbuilt(path: &Path) -> Res<Supdb> {
@@ -10680,6 +10710,15 @@ impl Engine for Supdb {
         let zdropraw = self.zdropraw == Some(true);
         let zlandpct = self.zlandpct.unwrap_or(0);
         let zstride = self.zstride == Some(supdb::ZStride::Forced);
+        // The probe's combinations first, which the single fields below
+        // would name by one of their parts.
+        if self.zpages_off && self.jobsmapped {
+            return if self.rewarmraw == Some(true) {
+                "supdb-nozjobsrewarm"
+            } else {
+                "supdb-nozjobs"
+            };
+        }
         // Before the budget branch, which would name the policy the cache
         // arm whatever else it carries.
         if self.budget > 0 && self.tofit && self.zpages_auto {
@@ -13660,6 +13699,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zrewarmraw"
         | "supdb-zrewarmrawscans"
         | "supdb-formsoffbuilt"
+        | "supdb-nozjobs"
+        | "supdb-nozjobsrewarm"
         | "supdb-formson"
         | "supdb-formsoffkept"
         | "supdb-snapdrops"
@@ -15593,6 +15634,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zrewarmraw" => supdb_arm(Supdb::create_zrewarmraw, dir)?,
         "supdb-zrewarmrawscans" => supdb_arm(Supdb::create_zrewarmrawscans, dir)?,
         "supdb-formsoffbuilt" => supdb_arm(Supdb::create_formsoffbuilt, dir)?,
+        "supdb-nozjobs" => supdb_arm(Supdb::create_nozjobs, dir)?,
+        "supdb-nozjobsrewarm" => supdb_arm(Supdb::create_nozjobsrewarm, dir)?,
         "supdb-formson" => supdb_arm(Supdb::create_formson, dir)?,
         "supdb-formsoffkept" => supdb_arm(Supdb::create_formsoffkept, dir)?,
         "supdb-snapdrops" => supdb_arm(Supdb::create_snapdrops, dir)?,
