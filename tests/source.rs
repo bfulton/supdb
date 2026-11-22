@@ -4759,6 +4759,11 @@ const CI_ENV: &[(&str, &str, &str)] = &[
         "the quick group's arms, as the person who dispatched the run named them",
     ),
     (
+        "KEYS",
+        "${{ inputs.keys }}",
+        "the quick group's keys, numbered or ids, as the person who dispatched the run named them",
+    ),
+    (
         "SUPDB_PR_BASE",
         "${{ github.event.pull_request.base.sha }}",
         "the event's value scripts/base.sh decides the base from",

@@ -14,7 +14,8 @@
 # quick  a quick-scale run of every arm, written under runs-ci/ (ignored),
 #        then the gate against runs/ and the figures; proves the runner,
 #        the gate and the renderer work end to end on this host. A timing
-#        run: nothing else may be running on the machine
+#        run: nothing else may be running on the machine. ARMS=a,b runs
+#        those arms alone, and KEYS=ids the row over random ids
 #
 # Every gate this repository has broken has broken the same way: a check
 # that was not running, or one reporting a verdict it had not earned. This
@@ -58,12 +59,21 @@ for g in $groups; do
       rm -rf runs-ci
       # `ARMS`, where set, names the arms to run (`ci`'s `arms` input): a
       # reader reproducing a row runs two arms in a fraction of the time.
+      # `KEYS`, where set, names the keys' shape (`ci`'s `keys` input,
+      # `bench run --keys`): `ids` takes the row of random ids, a series
+      # of its own beside the numbered keys'. The loop above runs over
+      # `$groups`, so the positional parameters are free to hold the
+      # run's options.
       arms="${ARMS:-}"
+      keys="${KEYS:-}"
+      set -- --scale quick --out runs-ci
       if [ -n "$arms" ]; then
-        ./target/release/bench run --scale quick --out runs-ci --arms "$arms"
-      else
-        ./target/release/bench run --scale quick --out runs-ci
+        set -- "$@" --arms "$arms"
       fi
+      if [ -n "$keys" ]; then
+        set -- "$@" --keys "$keys"
+      fi
+      ./target/release/bench run "$@"
       # Then the gate against the committed series. With no rows yet for
       # this class it says so and passes; the first regression it catches
       # is the day the series earns its keep.

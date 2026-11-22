@@ -479,7 +479,18 @@ ledger is what makes that limit harmless. And nothing reads the scratch
 logs wholesale beside one: a search over a gigabyte of old logs for a
 counter's name ran two minutes beside a ten-million-key pass, on the
 device the pass was faulting from, and the rep was taken again from its
-start. Beside a timing run only named files are opened.
+start. Beside a timing run only named files are opened. And a
+tracked task with nothing in the foreground did not hold a later session
+either: a queue of pairings started as one was cut by a restart twenty
+minutes in. What held every run after it was the run detached with
+`nohup` and the session waiting on it in the foreground, ten minutes a
+wait at most, one wait after another, with the queue's script skipping
+the pairings whose tables were already whole. A restart of the session's
+worker takes a detached run with it all the same, twice in one morning,
+each time inside the second sitting of a pairing against a comparator at
+ten million keys, forty minutes a pairing: `RESUME=1 scripts/pair.sh`
+keeps a sitting whose table is whole and runs the other, so a restart
+costs the sitting in flight and not the pairing.
 
 **A stamp is the build's, a task has a limit, and a script a run reads is
 the run's.** One roster was cut three times in a morning and none of the
@@ -661,6 +672,36 @@ its image by name that day, and the five workflows that run by hand or
 after a merge kept the label for another day, each to fail the same way
 the first time it was wanted. A workflow nobody runs is fixed with the
 ones that ran, by a rule the lint holds, and not when it is next needed.
+
+**A generator more regular than the thing it stood for.** The first
+ids were one to a stratum of the whole 64-bit space, key `n` a random
+point of the `n`th of as many strata as keys: ascending with the index,
+no two alike, and nothing like random ids to a structure that guesses a
+key's place from its value, since key `n` lies within one stride of `n`
+strides in and a straight line through the first id and the last puts
+every key within a key of its place. The search the sparse stride form
+was to be priced on guesses by that line, and over those ids its guess
+was never off by more than two of its samples, which the probe of the
+search said before the form was built on it: a search that never has to
+look is not the one random ids get. The ids are dealt to cells by a hash of the key's number now, so a
+stretch of the space holds as many as independent draws would put there,
+some cells half again their share and some none, and a test holds the
+cells' counts to that spread (`workload::Ids`,
+`the_ids_are_spread_as_independent_draws_are`). The rule: a synthetic
+input is held to the statistic the code under test is priced by -- here
+the count of keys in a stretch, at every scale -- and not to looking
+random, which a stratified sample does to the eye.
+
+**A loop of independent loads times the core's width, not a load.** The
+probe of a key's search (`examples/keysearch.rs`) first drew its keys
+ahead and read them in a loop, and read a dense stride's read at 39 ns
+over ten million keys, where a miss alone is twice that: the reads share
+nothing, so the core had ten of them in flight at once and the loop's
+time a read was a tenth of one. A point read in a store is the next thing
+its caller does with the last one's answer, so the probe feeds each read's
+result into the next key's choice, which makes them one at a time. A
+probe of a read that misses is serial by a data dependency, or it
+measures how many misses the core overlaps.
 
 ## One repository
 

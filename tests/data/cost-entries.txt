@@ -62,6 +62,8 @@ Reader::published_form_bytes	-	a test seam or a counter: reads or sets the store
 Reader::debug_key	-	a debug accessor naming a key's sources, for a failing test
 Reader::block_cache_kinds	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::block_cache_layout	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::block_cache_identity	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::piece_bounds	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::refill_forms	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::block_cache_size	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::cache_bindings	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation

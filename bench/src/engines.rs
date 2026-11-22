@@ -1712,6 +1712,39 @@ pub struct Supdb {
     /// (`Options::zpages_stride_sparse`): `supdb-zsparse`; the engine's
     /// where `None`.
     zsparse: Option<bool>,
+    /// The sparse form's ask waits for a reader
+    /// (`Options::zpages_stride_sparse_waits`); `Some(false)` asks at the
+    /// build, `supdb-zsparsebuild`; the engine's where `None`.
+    zsparsewaits: Option<bool>,
+    /// The block path's cursor steps the fence to the next entry
+    /// (`Options::zpages_cursor_steps`): `supdb-zcursorsteps`; the engine's
+    /// where `None`.
+    zcursorsteps: Option<bool>,
+    /// A bounds walk places a block boundary by its head
+    /// (`Options::bounds_by_heads`): `Some(false)` reads every boundary's
+    /// record, `supdb-boundsbyrecord`, and with `landboundsread` off too
+    /// `supdb-boundsold`; the engine's where `None`.
+    boundsheads: Option<bool>,
+    /// A landing leaves its pieces' bounds where no table stands to read
+    /// them (`Options::land_bounds_read`): `Some(false)` walks them at
+    /// every landing near reads, `supdb-landboundsalways`; the engine's
+    /// where `None`.
+    landboundsread: Option<bool>,
+    /// The partition merges in flight at once (`Options::merge_parallel`):
+    /// three, `supdb-merge3`; the engine's where `None`.
+    mergepar: Option<usize>,
+    /// The partition merges in flight in a stretch of writes nobody reads
+    /// (`Options::merge_parallel_quiet`): zero, the shape before,
+    /// `supdb-quiet0`; the engine's where `None`.
+    mergequiet: Option<usize>,
+    /// That room at any gate of the controller and not only where the
+    /// compact form is installed (`Options::merge_quiet_any_gate`):
+    /// `supdb-quietany`; the engine's where `None`.
+    mergequietany: Option<bool>,
+    /// A sparse stride walk steps its key by the field
+    /// (`Options::zpages_stride_step_direct`): `supdb-zsparsebuildstep`;
+    /// the engine's where `None`.
+    zstridestep: Option<bool>,
     /// A job's large per-key arrays mapped by the engine and unmapped at
     /// the job's end (`Options::jobs_mapped`): `supdb-jobsmapped`,
     /// `supdb-zstridealldropagainjobs`.
@@ -2873,6 +2906,35 @@ struct Policy {
     /// -- which the form declined and the block form served
     /// (`Options::zpages_stride_sparse`): `supdb-zsparse` beside `supdb`.
     zsparse: Option<bool>,
+    /// Whether a build made before any reader leaves its ask of the sparse
+    /// form for later (`Options::zpages_stride_sparse_waits`):
+    /// `supdb-zsparsebuild` asks at the build, beside `supdb-zsparse`.
+    zsparsewaits: Option<bool>,
+    /// The block path's cursor over a form file steps the fence to the
+    /// next entry where its walk ran off the end of one
+    /// (`Options::zpages_cursor_steps`): `supdb-zcursorsteps` beside
+    /// `supdb`.
+    zcursorsteps: Option<bool>,
+    /// A bounds walk places a block boundary by its head and reads its
+    /// record only on a tie (`Options::bounds_by_heads`), and a landing
+    /// leaves its pieces' bounds where no table stands to read them
+    /// (`Options::land_bounds_read`), the engine's: `supdb-boundsbyrecord`
+    /// and `supdb-landboundsalways` turn each off, `supdb-boundsold` both.
+    boundsheads: Option<bool>,
+    landboundsread: Option<bool>,
+    /// The partition merges in flight at once (`Options::merge_parallel`):
+    /// three, `supdb-merge3`.
+    mergepar: Option<usize>,
+    /// The partition merges in flight in a stretch of writes nobody reads
+    /// (`Options::merge_parallel_quiet`): zero, `supdb-quiet0`.
+    mergequiet: Option<usize>,
+    /// That room at any gate (`Options::merge_quiet_any_gate`):
+    /// `supdb-quietany`.
+    mergequietany: Option<bool>,
+    /// A sparse stride form's walk writes the next key's field where it
+    /// lies (`Options::zpages_stride_step_direct`):
+    /// `supdb-zsparsebuildstep` beside `supdb-zsparsebuild`.
+    zstridestep: Option<bool>,
     /// The seals', merges' and closes' large per-key arrays as the
     /// engine's own mappings (`Options::jobs_mapped`): `supdb-jobsmapped`
     /// beside `supdb`, and `supdb-zstridealldropagainjobs` beside
@@ -3192,6 +3254,14 @@ impl Default for Policy {
             zdropagain: None,
             zconvdrop: None,
             zsparse: None,
+            zsparsewaits: None,
+            zcursorsteps: None,
+            boundsheads: None,
+            landboundsread: None,
+            mergepar: None,
+            mergequiet: None,
+            mergequietany: None,
+            zstridestep: None,
             jobsmapped: false,
             jobsshort: false,
             zmemoslab: false,
@@ -3341,6 +3411,24 @@ impl Policy {
             zstride_first: Some(first),
             ..Policy::cache64_tofit_zstride_drop()
         }
+    }
+}
+
+/// The encryption an arm's store is under: the kernel's key for the arm
+/// that asks for it, a cipher of the suite's for the cipher arms (with the
+/// cache the arm bounds it to), and none for the rest. One way or neither:
+/// the engine takes one choice, and no arm is under both.
+fn encryption_of(dir_key: bool, cipher: bool, cipher_cache: u64) -> supdb::Encryption {
+    match (dir_key, cipher) {
+        (true, _) => supdb::Encryption::Kernel(supdb::DirKey::new([0x5a; 32])),
+        (false, true) => {
+            let c = supdb::StoreCipher::new(Gcm::new(), Gcm::of);
+            supdb::Encryption::Cipher(match cipher_cache {
+                0 => c,
+                bytes => c.cache_bytes(bytes),
+            })
+        }
+        (false, false) => supdb::Encryption::None,
     }
 }
 
@@ -4243,6 +4331,133 @@ impl Supdb {
             path,
             Policy {
                 zsparse: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-zsparse` whose builds ask for the sparse form where they are
+    /// made, before any reader (`Options::zpages_stride_sparse_waits`
+    /// off): `supdb-zsparsebuild`, the ask as the stride form's own is
+    /// made, which leaves no conversion to the first readers where the
+    /// store whole comes to fit the form and a conversion back for every
+    /// partition where it does not.
+    pub fn create_zsparse_build(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zsparse: Some(true),
+                zsparsewaits: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-zsparsebuild` whose walks of a sparse form step a key by
+    /// writing the next key's field where it lies
+    /// (`Options::zpages_stride_step_direct`): `supdb-zsparsebuildstep`,
+    /// the one option more, priced where every partition is in the form.
+    pub fn create_zsparse_build_step(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zsparse: Some(true),
+                zsparsewaits: Some(false),
+                zstridestep: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// The engine whose block-path cursor over a form file steps the fence
+    /// to the next entry where its walk ran off the end of one
+    /// (`Options::zpages_cursor_steps`): `supdb-zcursorsteps`, beside
+    /// `supdb`, whose cursor searches the fence by rank at every page.
+    pub fn create_zcursor_steps(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zcursorsteps: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// The engine whose bounds walks read the record at every boundary
+    /// whose head is not the whole of its key (`Options::bounds_by_heads`
+    /// off): `supdb-boundsbyrecord`, beside `supdb`, whose walks place a
+    /// boundary by its head and read the record only on a tie.
+    pub fn create_bounds_by_record(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                boundsheads: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// The engine whose landings near reads walk their pieces' bounds
+    /// whoever stands to read them (`Options::land_bounds_read` off):
+    /// `supdb-landboundsalways`, beside `supdb`, whose landings leave them
+    /// while the writer keeps no block forms and no handle is live.
+    pub fn create_land_bounds_always(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                landboundsread: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// Three partition merges in flight at all times
+    /// (`Options::merge_parallel`): `supdb-merge3`, beside `supdb`, whose
+    /// third merge runs only in a stretch of writes nobody reads.
+    pub fn create_merge3(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                mergepar: Some(3),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// The engine with no third merge in a stretch of writes nobody reads
+    /// (`Options::merge_parallel_quiet` zero): `supdb-quiet0`, beside
+    /// `supdb`.
+    pub fn create_quiet0(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                mergequiet: Some(0),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// The engine with its third merge at any gate of the controller
+    /// (`Options::merge_quiet_any_gate`), the shape before the room was
+    /// kept to where the compact form is installed: `supdb-quietany`.
+    pub fn create_quiet_any(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                mergequietany: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// Both of the bounds' options off (`Options::bounds_by_heads`,
+    /// `Options::land_bounds_read`): `supdb-boundsold`, beside `supdb`.
+    pub fn create_bounds_old(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                boundsheads: Some(false),
+                landboundsread: Some(false),
                 ..Policy::default()
             },
         )
@@ -9531,6 +9746,14 @@ impl Supdb {
             zdropagain,
             zconvdrop,
             zsparse,
+            zsparsewaits,
+            zcursorsteps,
+            boundsheads,
+            landboundsread,
+            mergepar,
+            mergequiet,
+            mergequietany,
+            zstridestep,
             jobsmapped,
             jobsshort,
             zmemoslab,
@@ -9708,7 +9931,7 @@ impl Supdb {
             merge_parallel: if mergeone {
                 1
             } else {
-                supdb::Options::default().merge_parallel
+                mergepar.unwrap_or(supdb::Options::default().merge_parallel)
             },
             seal_floor_out_of_core: sealfloorooc,
             forms_fit_when_short: !nofitshort,
@@ -10100,6 +10323,18 @@ impl Supdb {
             zpages_convert_drops_output: zconvdrop
                 .unwrap_or(supdb::Options::default().zpages_convert_drops_output),
             zpages_stride_sparse: zsparse.unwrap_or(supdb::Options::default().zpages_stride_sparse),
+            zpages_stride_sparse_waits: zsparsewaits
+                .unwrap_or(supdb::Options::default().zpages_stride_sparse_waits),
+            zpages_cursor_steps: zcursorsteps
+                .unwrap_or(supdb::Options::default().zpages_cursor_steps),
+            bounds_by_heads: boundsheads.unwrap_or(supdb::Options::default().bounds_by_heads),
+            land_bounds_read: landboundsread.unwrap_or(supdb::Options::default().land_bounds_read),
+            merge_parallel_quiet: mergequiet
+                .unwrap_or(supdb::Options::default().merge_parallel_quiet),
+            merge_quiet_any_gate: mergequietany
+                .unwrap_or(supdb::Options::default().merge_quiet_any_gate),
+            zpages_stride_step_direct: zstridestep
+                .unwrap_or(supdb::Options::default().zpages_stride_step_direct),
             jobs_mapped: jobsmapped,
             jobs_mapped_when_short: jobsshort,
             zpages_memo_slab: zmemoslab,
@@ -10162,32 +10397,18 @@ impl Supdb {
             },
             None => opts,
         };
+        // Set in place: a struct update copies the whole of `Options`.
+        let mut opts = opts;
         // The shapes a store under a cipher is priced against itself in:
         // an ordered load through the log with no run, the shape before,
         // and the compact form's controller on, the shape not shipped.
-        let opts = if cipher {
-            supdb::Options {
-                zpages_under_cipher: cipher_auto,
-                direct_ingest: opts.direct_ingest && !cipher_log,
-                ..opts
+        if cipher {
+            opts.zpages_under_cipher = cipher_auto;
+            if cipher_log {
+                opts.direct_ingest = false;
             }
-        } else {
-            opts
-        };
-        // One way or neither: the engine takes one choice, and no arm is
-        // under both.
-        let encryption = match (dir_key, cipher) {
-            (true, _) => supdb::Encryption::Kernel(supdb::DirKey::new([0x5a; 32])),
-            (false, true) => {
-                let c = supdb::StoreCipher::new(Gcm::new(), Gcm::of);
-                supdb::Encryption::Cipher(match cipher_cache {
-                    0 => c,
-                    bytes => c.cache_bytes(bytes),
-                })
-            }
-            (false, false) => supdb::Encryption::None,
-        };
-        let opts = supdb::Options { encryption, ..opts };
+        }
+        opts.encryption = encryption_of(dir_key, cipher, cipher_cache);
         let db = if REOPEN.with(|r| r.get()) {
             supdb::Db::open(path, opts)
         } else {
@@ -10507,6 +10728,14 @@ impl Supdb {
             zdropagain,
             zconvdrop,
             zsparse,
+            zsparsewaits,
+            zcursorsteps,
+            boundsheads,
+            landboundsread,
+            mergepar,
+            mergequiet,
+            mergequietany,
+            zstridestep,
             jobsmapped,
             jobsshort,
             zmemoslab,
@@ -10901,8 +11130,36 @@ impl Engine for Supdb {
         if self.zrewarmbeside {
             return "supdb-zrewarmbeside";
         }
+        if self.zcursorsteps == Some(true) {
+            return "supdb-zcursorsteps";
+        }
+        match (
+            self.boundsheads == Some(false),
+            self.landboundsread == Some(false),
+        ) {
+            (true, true) => return "supdb-boundsold",
+            (true, false) => return "supdb-boundsbyrecord",
+            (false, true) => return "supdb-landboundsalways",
+            (false, false) => {}
+        }
+        if self.mergepar == Some(3) {
+            return "supdb-merge3";
+        }
+        if self.mergequiet == Some(0) {
+            return "supdb-quiet0";
+        }
+        if self.mergequietany == Some(true) {
+            return "supdb-quietany";
+        }
         if self.zsparse == Some(true) {
-            return "supdb-zsparse";
+            return match (
+                self.zsparsewaits == Some(false),
+                self.zstridestep == Some(true),
+            ) {
+                (true, true) => "supdb-zsparsebuildstep",
+                (true, false) => "supdb-zsparsebuild",
+                (false, _) => "supdb-zsparse",
+            };
         }
         if self.zconvdrop == Some(true) {
             return if self.zdropagain == Some(true) {
@@ -12253,6 +12510,7 @@ impl Engine for Supdb {
             ("merges_landed", db.seal_waits().merges as f64),
             ("merge_plans", db.seal_waits().plans as f64),
             ("merges_beside", db.seal_waits().merges_beside as f64),
+            ("merges_quiet", db.seal_waits().merges_quiet as f64),
             ("pieces_aligned", db.pieces_aligned() as u8 as f64),
             // What the forms' upkeep did: see `Db::forms_events`.
             ("blk_by_upkeep", ev[0] as f64),
@@ -12423,6 +12681,7 @@ impl Engine for Supdb {
             ("zpage_stride_reads", z.stride_reads as f64),
             ("zpage_stride_page_checks", z.stride_page_checks as f64),
             ("zpage_stride_cursor_reads", z.stride_cursor_reads as f64),
+            ("zpage_stride_direct_steps", z.stride_direct_steps as f64),
             ("zpage_stride_builds", z.stride_builds as f64),
             ("zpage_stride_sparse_builds", z.stride_sparse_builds as f64),
             ("zpage_stride_no_not_shaped", not_shaped as f64),
@@ -12494,6 +12753,11 @@ impl Engine for Supdb {
             ("zpage_point_key_hits", z.point_key_hits as f64),
             ("zpage_prefetches", z.prefetches as f64),
             ("zpage_scan_views", z.scan_views as f64),
+            ("zpage_cursor_steps", z.cursor_steps as f64),
+            ("bounds_by_head", z.bounds_by_head as f64),
+            ("bounds_records", z.bounds_records as f64),
+            ("land_bound_walks", z.land_bound_walks as f64),
+            ("land_bounds_left", z.land_bounds_left as f64),
             ("zpage_group_aheads", z.group_aheads as f64),
             ("zpage_declined_small", z.declined_small as f64),
             ("zpage_declined_small_bytes", z.declined_small_bytes as f64),
@@ -13932,6 +14196,15 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zstrideallcdrop"
         | "supdb-zstridealldropagaincdrop"
         | "supdb-zsparse"
+        | "supdb-zsparsebuild"
+        | "supdb-zsparsebuildstep"
+        | "supdb-zcursorsteps"
+        | "supdb-boundsbyrecord"
+        | "supdb-landboundsalways"
+        | "supdb-boundsold"
+        | "supdb-merge3"
+        | "supdb-quiet0"
+        | "supdb-quietany"
         | "supdb-jobsmapped"
         | "supdb-zstridealldropagainjobs"
         | "supdb-zmemoslab"
@@ -14996,6 +15269,15 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zdropagain" => supdb_arm(Supdb::create_zdropagain, dir)?,
         "supdb-zstridealldropagain" => supdb_arm(Supdb::create_zstride_all_dropagain, dir)?,
         "supdb-zsparse" => supdb_arm(Supdb::create_zsparse, dir)?,
+        "supdb-zsparsebuild" => supdb_arm(Supdb::create_zsparse_build, dir)?,
+        "supdb-zsparsebuildstep" => supdb_arm(Supdb::create_zsparse_build_step, dir)?,
+        "supdb-zcursorsteps" => supdb_arm(Supdb::create_zcursor_steps, dir)?,
+        "supdb-boundsbyrecord" => supdb_arm(Supdb::create_bounds_by_record, dir)?,
+        "supdb-landboundsalways" => supdb_arm(Supdb::create_land_bounds_always, dir)?,
+        "supdb-boundsold" => supdb_arm(Supdb::create_bounds_old, dir)?,
+        "supdb-merge3" => supdb_arm(Supdb::create_merge3, dir)?,
+        "supdb-quiet0" => supdb_arm(Supdb::create_quiet0, dir)?,
+        "supdb-quietany" => supdb_arm(Supdb::create_quiet_any, dir)?,
         "supdb-zstrideallcdrop" => supdb_arm(Supdb::create_zstride_all_cdrop, dir)?,
         "supdb-zstridealldropagaincdrop" => {
             supdb_arm(Supdb::create_zstride_all_dropagain_cdrop, dir)?
@@ -16032,6 +16314,125 @@ mod tests {
                 "{arm}: the second store read the first's key"
             );
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The cipher arms are `supdb` under a cipher, and each of the two
+    /// shapes they are priced against differs from `supdb-cipher` in its
+    /// one option: `supdb-cipherlog` loads an ordered run through the log
+    /// (`direct_ingest` off), `supdb-cipherauto` lets the compact form's
+    /// controller in (`zpages_under_cipher`).
+    #[test]
+    fn the_cipher_arms_differ_from_supdb_cipher_in_their_one_option() {
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-cipherarms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let arm = |name: &str, f: fn(&Path) -> Res<Supdb>| {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            let a = f(&d).unwrap();
+            assert_eq!(a.name(), name);
+            a
+        };
+        let plain = arm("supdb", Supdb::create);
+        let cipher = arm("supdb-cipher", Supdb::create_cipher);
+        let log = arm("supdb-cipherlog", Supdb::create_cipherlog);
+        let auto = arm("supdb-cipherauto", Supdb::create_cipherauto);
+        let o = |a: &Supdb| a.db.as_ref().unwrap().options().clone();
+        let (p, c, l, z) = (o(&plain), o(&cipher), o(&log), o(&auto));
+        // The store's options give the cipher to the store, which holds it
+        // where the options do not (`Db::cipher_counts` answers for it).
+        let under = |a: &Supdb| a.db.as_ref().unwrap().cipher_counts().is_some();
+        assert!(!under(&plain), "supdb is in the clear");
+        for (name, a) in [
+            ("supdb-cipher", &cipher),
+            ("supdb-cipherlog", &log),
+            ("supdb-cipherauto", &auto),
+        ] {
+            assert!(under(a), "{name}: under a cipher");
+        }
+        assert_eq!(
+            c.direct_ingest, p.direct_ingest,
+            "supdb-cipher keeps supdb's ordered ingest"
+        );
+        assert!(p.direct_ingest, "supdb's ordered loads go to a run");
+        assert!(
+            !c.zpages_under_cipher,
+            "supdb-cipher leaves the controller out"
+        );
+        assert!(!l.direct_ingest, "supdb-cipherlog loads through the log");
+        assert_eq!(
+            l.zpages_under_cipher, c.zpages_under_cipher,
+            "supdb-cipherlog"
+        );
+        assert!(
+            z.zpages_under_cipher,
+            "supdb-cipherauto lets the controller in"
+        );
+        assert_eq!(z.direct_ingest, c.direct_ingest, "supdb-cipherauto");
+        drop((plain, cipher, log, auto));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The arms' encryption by their policy's two switches: the dirkey arm's
+    /// store asks the kernel (`supdb-dirkey` opens only on a filesystem that
+    /// encrypts, so no test here opens it), the cipher arms' a cipher with
+    /// their cache, and the rest nothing.
+    #[test]
+    fn the_dirkey_arm_asks_the_kernel_and_the_cipher_arms_a_cipher() {
+        use supdb::Encryption;
+        assert!(matches!(
+            encryption_of(true, false, 0),
+            Encryption::Kernel(_)
+        ));
+        assert!(matches!(
+            encryption_of(true, true, 0),
+            Encryption::Kernel(_)
+        ));
+        assert!(matches!(
+            encryption_of(false, true, 0),
+            Encryption::Cipher(_)
+        ));
+        assert!(matches!(
+            encryption_of(false, true, 64 << 20),
+            Encryption::Cipher(_)
+        ));
+        assert!(matches!(encryption_of(false, false, 0), Encryption::None));
+        // And the bound reaches the store: `supdb-cipher64`'s cache is its
+        // policy's sixty-four mebibytes, `supdb-cipher`'s the engine's own.
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-encryption-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let budget = |name: &str, f: fn(&Path) -> Res<Supdb>| {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            let a = f(&d).unwrap();
+            assert_eq!(a.name(), name);
+            a.db.as_ref().unwrap().cipher_counts().unwrap().cache.budget
+        };
+        assert_eq!(budget("supdb-cipher64", Supdb::create_cipher64), 64 << 20);
+        let arm = budget("supdb-cipher", Supdb::create_cipher);
+        assert_ne!(arm, 64 << 20);
+        // `supdb-cipher`'s is the engine's own: the budget a store under the
+        // same cipher with no bound reads, opened beside it. The engine reads
+        // that default off the process's memory at the open, so the two are
+        // held within a quarter of each other and not to the byte.
+        let d = root.join("unbounded");
+        std::fs::create_dir_all(&d).unwrap();
+        let db = supdb::Db::create(
+            &d,
+            supdb::Options {
+                encryption: Encryption::Cipher(supdb::StoreCipher::new(Gcm::new(), Gcm::of)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let own = db.cipher_counts().unwrap().cache.budget;
+        drop(db);
+        assert!(
+            arm.abs_diff(own) <= arm.max(own) / 4,
+            "supdb-cipher's cache {arm} is the engine's default {own}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -18199,6 +18600,103 @@ mod tests {
                         d.zpages_stride,
                         d.zpages_stride_room,
                         d.zpages_stride_convert
+                    )
+                );
+                assert!(o.zpages_stride_sparse_waits && d.zpages_stride_sparse_waits);
+                // And its ask made at the build: the one option more.
+                let z = Supdb::create_zsparse_build(&dir("zsparsebuild")).unwrap();
+                assert_eq!(z.name(), "supdb-zsparsebuild");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_stride_sparse && !o.zpages_stride_sparse_waits);
+                assert_eq!(
+                    (
+                        o.zpages_stride,
+                        o.zpages_stride_room,
+                        o.zpages_stride_convert
+                    ),
+                    (
+                        d.zpages_stride,
+                        d.zpages_stride_room,
+                        d.zpages_stride_convert
+                    )
+                );
+                assert!(!o.zpages_stride_step_direct && !o.zpages_cursor_steps);
+                // Its walks stepping a key by the field: the one option
+                // more again, and the cursor's steps not with it.
+                let z = Supdb::create_zsparse_build_step(&dir("zsparsebuildstep")).unwrap();
+                assert_eq!(z.name(), "supdb-zsparsebuildstep");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_stride_sparse && !o.zpages_stride_sparse_waits);
+                assert!(o.zpages_stride_step_direct && !d.zpages_stride_step_direct);
+                assert_eq!(o.zpages_cursor_steps, d.zpages_cursor_steps);
+                // The cursor's steps on the engine's arm: the one option.
+                let z = Supdb::create_zcursor_steps(&dir("zcursorsteps")).unwrap();
+                assert_eq!(z.name(), "supdb-zcursorsteps");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_cursor_steps && !d.zpages_cursor_steps);
+                // The bounds' two options, each off alone and both.
+                for (make, name, heads, lands) in [
+                    (
+                        Supdb::create_bounds_by_record as fn(&Path) -> Res<Supdb>,
+                        "supdb-boundsbyrecord",
+                        false,
+                        true,
+                    ),
+                    (
+                        Supdb::create_land_bounds_always,
+                        "supdb-landboundsalways",
+                        true,
+                        false,
+                    ),
+                    (Supdb::create_bounds_old, "supdb-boundsold", false, false),
+                ] {
+                    let z = make(&dir(name)).unwrap();
+                    assert_eq!(z.name(), name);
+                    assert_eq!(z.features(), base.features());
+                    let o = z.db.as_ref().unwrap().options();
+                    assert_eq!(
+                        (o.bounds_by_heads, o.land_bounds_read),
+                        (heads, lands),
+                        "{name}"
+                    );
+                    assert!(d.bounds_by_heads && d.land_bounds_read);
+                    assert_eq!(o.zpages_cursor_steps, d.zpages_cursor_steps, "{name}");
+                    assert_eq!(o.merge_parallel, d.merge_parallel, "{name}");
+                }
+                let z = Supdb::create_merge3(&dir("merge3")).unwrap();
+                assert_eq!(z.name(), "supdb-merge3");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.bounds_by_heads && o.land_bounds_read);
+                assert_eq!((o.merge_parallel, d.merge_parallel), (3, 2));
+                assert_eq!(o.merge_parallel_quiet, d.merge_parallel_quiet);
+                let z = Supdb::create_quiet0(&dir("quiet0")).unwrap();
+                assert_eq!(z.name(), "supdb-quiet0");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.bounds_by_heads && o.land_bounds_read);
+                assert_eq!(o.merge_parallel, d.merge_parallel);
+                assert_eq!((o.merge_parallel_quiet, d.merge_parallel_quiet), (0, 3));
+                assert!(!o.merge_quiet_any_gate && !d.merge_quiet_any_gate);
+                let z = Supdb::create_quiet_any(&dir("quietany")).unwrap();
+                assert_eq!(z.name(), "supdb-quietany");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert_eq!(o.merge_parallel_quiet, d.merge_parallel_quiet);
+                assert!(o.merge_quiet_any_gate);
+                assert_eq!(
+                    (
+                        o.zpages_stride_sparse,
+                        o.zpages_stride_sparse_waits,
+                        o.zpages_stride_step_direct
+                    ),
+                    (
+                        d.zpages_stride_sparse,
+                        d.zpages_stride_sparse_waits,
+                        d.zpages_stride_step_direct
                     )
                 );
                 // The jobs' large arrays as the engine's mappings, on the

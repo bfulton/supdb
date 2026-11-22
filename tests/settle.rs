@@ -255,6 +255,153 @@ fn a_key_written_into_an_empty_partitions_range_is_in_a_scan_through_the_cache()
 /// put the filed key at the wrong record: a scan emitted the record the
 /// key was to mask and the key itself after its successors, with the
 /// point read beside it right.
+/// A copy whose entries are its partition's records, kept across a merge
+/// that rewrites the partition over the same blocks, holds the old
+/// partition's records: a key dropped and a key folded in one block keep
+/// the boundaries and the count, and every record between them moves a
+/// rank. The writes that did it reach the copy only after the rebase --
+/// lent to the upkeep thread, held before its pass, and settled through
+/// the tables the freezes replaced -- so the folded key's patch is made
+/// against the new partition's cut. A copy that still claimed its
+/// identity took that cut for its own entry: in the checked profile the
+/// assertion beside the patch, in a release build the folded key's value
+/// written over another key's entry.
+#[test]
+fn a_copys_identity_is_its_partitions_and_not_the_one_a_rewrite_left() {
+    let dir = scratch("copy-identity-rewrite");
+    let mut db = Db::create(
+        &dir,
+        Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(4096),
+            partition_on_flush: true,
+            publish_in_background: true,
+            upkeep: Upkeep::Background(1),
+            upkeep_pace_syncs_bp: 0,
+            scan_block_cache: true,
+            l0_trigger: 2,
+            ..common::options()
+        },
+    )
+    .unwrap();
+    let value = [b'v'; 100];
+    let keys: Vec<Vec<u8>> = (0..300).map(|i| format!("k{i:05}").into_bytes()).collect();
+    for k in &keys {
+        db.put(k, &value);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let fences = partition_fences(&dir);
+    assert!(fences.len() >= 3, "partitions: {}", fences.len());
+    let (lo, hi) = {
+        let (lo, hi) = &fences[fences.len() / 2];
+        (lo.clone(), hi.clone().expect("a closed partition"))
+    };
+    let inside: Vec<Vec<u8>> = keys
+        .iter()
+        .filter(|k| **k >= lo && **k < hi)
+        .cloned()
+        .collect();
+    let n = inside.len();
+    assert!((26..=64).contains(&n), "keys inside the range: {n}");
+    // The block's copy, built over updates alone: every entry a record.
+    let _ = scan_model(&db);
+    for k in &inside[10..] {
+        db.put(k, b"updated");
+    }
+    db.commit().unwrap();
+    db.settle().unwrap();
+    let _ = scan_model(&db);
+    let (claimed, holds) = db.block_cache_identity();
+    assert!(
+        claimed >= 1 && holds == claimed,
+        "a copy of the partition's records: {claimed} claimed, {holds} of its partition"
+    );
+    // A key dropped below a key folded in, in the copy's block: the
+    // records between them move down a rank and the block's first key and
+    // count stay, so the merge's rewrite keeps the layout and the copy.
+    let dropped = inside[2].clone();
+    let folded = {
+        let mut k = inside[5].clone();
+        k.push(b'x');
+        k
+    };
+    let rebased_before = db.forms_rebased();
+    let merges_before = db.seal_waits().merges;
+    db.hold_upkeep_pass(true);
+    db.hold_seal_durable(true);
+    for _ in 0..2 {
+        db.delete(&dropped);
+        db.put(&folded, b"folded");
+        db.commit().unwrap();
+        db.seal().unwrap();
+    }
+    db.hold_seal_durable(false);
+    let t = std::time::Instant::now();
+    while db.seal_waits().merges == merges_before {
+        assert!(t.elapsed().as_secs() < 60, "the merge never landed");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    db.hold_upkeep_pass(false);
+    db.settle().unwrap();
+    db.settle().unwrap();
+    assert!(
+        db.forms_rebased() > rebased_before,
+        "the rewrite kept the partition's layout: {} before, {} after",
+        rebased_before,
+        db.forms_rebased()
+    );
+    let mut want = std::collections::BTreeMap::new();
+    for k in &keys {
+        let v = if inside[10..].contains(k) {
+            b"updated".to_vec()
+        } else {
+            value.to_vec()
+        };
+        want.insert(k.clone(), vec![v]);
+    }
+    want.remove(&dropped);
+    want.insert(folded.clone(), vec![b"folded".to_vec()]);
+    assert_eq!(scan_model(&db), want, "the writer's scan");
+    let r = db.reader().unwrap();
+    let mut via_handle = std::collections::BTreeMap::new();
+    r.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| {
+            via_handle
+                .entry(k.to_vec())
+                .or_insert_with(Vec::new)
+                .push(v.to_vec());
+        }),
+    )
+    .unwrap();
+    assert_eq!(via_handle, want, "the handle's scan");
+    drop(r);
+    // The writes after the rewrite patch the copy where its entries are,
+    // found by search now that the identity is of the old partition.
+    db.put(&folded, b"again");
+    db.put(&inside[6], b"again");
+    db.commit().unwrap();
+    db.settle().unwrap();
+    want.insert(folded.clone(), vec![b"again".to_vec()]);
+    want.insert(inside[6].clone(), vec![b"again".to_vec()]);
+    assert_eq!(scan_model(&db), want, "the writer's scan after the patches");
+    for (k, v) in &want {
+        let mut got = Vec::new();
+        db.read_all(k, vf(&mut |x| got.push(x.to_vec()))).unwrap();
+        assert_eq!(
+            &got,
+            v,
+            "the point read of {:?}",
+            String::from_utf8_lossy(k)
+        );
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_filed_keys_cut_is_resolved_again_across_its_partitions_rewrite() {
     let dir = scratch("rebase-filed-cuts");
@@ -1377,7 +1524,7 @@ fn a_patch_by_its_rank_asks_for_its_lines_by_the_cut() {
 /// is folded in, which is what lets the table be carried.
 #[test]
 fn a_copys_claim_to_its_records_is_no_claim_across_its_partitions_rewrite() {
-    claim_across_rewrite("copy-identity-rewrite", 4096, |i| {
+    claim_across_rewrite("copy-claim-rewrite", 4096, |i| {
         format!("k{i:03}").into_bytes()
     });
 }
@@ -1386,7 +1533,7 @@ fn a_copys_claim_to_its_records_is_no_claim_across_its_partitions_rewrite() {
 /// key at its rank reads as two words (`db::key_eq`).
 #[test]
 fn a_copys_claim_across_its_partitions_rewrite_with_keys_of_sixteen_bytes() {
-    claim_across_rewrite("copy-identity-rewrite-16", 4096, |i| {
+    claim_across_rewrite("copy-claim-rewrite-16", 4096, |i| {
         format!("k{i:015}").into_bytes()
     });
 }
@@ -1396,7 +1543,7 @@ fn a_copys_claim_across_its_partitions_rewrite_with_keys_of_sixteen_bytes() {
 /// tail that decides.
 #[test]
 fn a_copys_claim_across_its_partitions_rewrite_with_keys_past_sixteen_bytes() {
-    claim_across_rewrite("copy-identity-rewrite-19", 4096, |i| {
+    claim_across_rewrite("copy-claim-rewrite-19", 4096, |i| {
         format!("k{:015}{i:03}", i / 8).into_bytes()
     });
 }
@@ -1405,7 +1552,7 @@ fn a_copys_claim_across_its_partitions_rewrite_with_keys_past_sixteen_bytes() {
 /// first sixteen, so that the one byte past the two words decides.
 #[test]
 fn a_copys_claim_across_its_partitions_rewrite_with_keys_of_seventeen_bytes() {
-    claim_across_rewrite("copy-identity-rewrite-17", 4096, |i| {
+    claim_across_rewrite("copy-claim-rewrite-17", 4096, |i| {
         let mut k = format!("k{:015}", i / 8).into_bytes();
         k.push(b'a' + (i % 8) as u8);
         k
@@ -1416,7 +1563,7 @@ fn a_copys_claim_across_its_partitions_rewrite_with_keys_of_seventeen_bytes() {
 /// fold and the drop fall in is a block's whole sixty-four entries.
 #[test]
 fn a_copys_claim_across_its_partitions_rewrite_in_a_full_block() {
-    claim_across_rewrite("copy-identity-rewrite-full", 16384, |i| {
+    claim_across_rewrite("copy-claim-rewrite-full", 16384, |i| {
         format!("k{i:015}").into_bytes()
     });
 }

@@ -574,6 +574,7 @@ mod tests {
             machine: machine(cpus),
             killed: vec![],
             resumptions: vec![],
+            keys: Default::default(),
             measurements: vec![m("reads_per_s", "reads/s", reads), m("p99_us", "µs", p99)],
         }
     }
@@ -696,6 +697,7 @@ mod tests {
                 machine: machine(4),
                 killed: vec![],
                 resumptions: vec![],
+                keys: Default::default(),
                 measurements: vec![
                     q("scan", "supdb", "entries_per_s", "entries/s", scan_supdb),
                     q("scan", "lmdb", "entries_per_s", "entries/s", scan_lmdb),
@@ -767,6 +769,7 @@ mod tests {
                 machine: machine(4),
                 killed: vec![],
                 resumptions: vec![],
+                keys: Default::default(),
                 measurements: vec![q("supdb", 100.0), q("lmdb", lmdb)],
             }
         };
@@ -1004,6 +1007,54 @@ mod tests {
         );
         let rep = gate(&new, &dir).unwrap();
         assert_eq!(rep.prior_rows, 0);
+        assert!(!rep.regressed());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A row of ids has no history among rows of numbered keys on its own
+    /// machine, however alike the numbers, and the rows of ids are its
+    /// history once there are some: the two shapes are two series under
+    /// one directory (`Row::class`). A regression among the ids is caught
+    /// against the ids, and a numbered row beside them still counts only
+    /// its own.
+    #[test]
+    fn another_key_shape_is_not_history() {
+        use crate::workload::KeyShape;
+        let (dir, _) = fixture(6);
+        let ids = |utc: &str, reads: [f64; 5]| {
+            let mut r = row(utc, 4, reads, [5.0, 5.1, 5.0, 5.2, 4.9]);
+            r.keys = KeyShape::Ids;
+            r
+        };
+        // A tenth of the numbered rows' rate: red against them, and no
+        // verdict at all with no row of ids to hold it to.
+        let slow = [10.0, 10.1, 9.9, 10.0, 10.2];
+        let first = ids("20260201T000000Z", slow);
+        let rep = gate(&first, &dir).unwrap();
+        assert_eq!(rep.prior_rows, 0);
+        assert!(!rep.regressed());
+        // Its own shape's rows are its history.
+        for i in 0..4 {
+            ids(&format!("20260110T{i:02}0000Z"), slow)
+                .write(&dir)
+                .unwrap();
+        }
+        let rep = gate(&first, &dir).unwrap();
+        assert_eq!(rep.prior_rows, 4);
+        assert!(!rep.regressed());
+        let worse = ids("20260202T000000Z", [1.0, 1.01, 0.99, 1.0, 1.02]);
+        let rep = gate(&worse, &dir).unwrap();
+        assert_eq!(rep.prior_rows, 4);
+        assert!(rep.regressed());
+        // And a numbered row sees the six numbered rows, not the four.
+        let numbered = row(
+            "20260203T000000Z",
+            4,
+            [100.0, 101.0, 99.5, 100.2, 100.8],
+            [5.0, 5.1, 5.0, 5.2, 4.9],
+        );
+        let rep = gate(&numbered, &dir).unwrap();
+        assert_eq!(rep.prior_rows, 6);
         assert!(!rep.regressed());
         let _ = std::fs::remove_dir_all(dir);
     }

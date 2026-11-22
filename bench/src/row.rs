@@ -6,6 +6,7 @@
 //! fields are what was read; the class that decides which rows are
 //! comparable is derived from them by `Row::class` at read time.
 
+use crate::workload::KeyShape;
 use crate::Scale;
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -147,6 +148,11 @@ pub struct Row {
     /// empty, and absent, for a run in one sitting.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resumptions: Vec<Resumption>,
+    /// What the stores' keys were (`KeyShape`): absent from the file for
+    /// the numbered keys, which every row before the field was of, so
+    /// those rows' bytes stand as they were written.
+    #[serde(default, skip_serializing_if = "KeyShape::is_numbered")]
+    pub keys: KeyShape,
 }
 
 impl Row {
@@ -199,9 +205,17 @@ impl Row {
     /// mebibytes (`/b1536m`): the bound decides what the store reads
     /// from, so two bounds are two classes, and an unbounded row's class
     /// is the string it always was, which `every_banked_row_keeps_its_class`
-    /// holds over every row under `runs/`.
+    /// holds over every row under `runs/`. A row over keys that are not
+    /// the numbered ones appends their shape last (`/kids`): the shape
+    /// decides which form of a partition an engine can serve its reads
+    /// from, so two shapes are two series, and a row of numbered keys
+    /// keeps the class it had before the shape was a parameter.
     pub fn class(&self) -> String {
-        self.machine.class()
+        let class = self.machine.class();
+        match self.keys {
+            KeyShape::Numbered => class,
+            k => format!("{class}/k{}", k.name()),
+        }
     }
 }
 
@@ -322,6 +336,7 @@ mod tests {
             },
             killed: vec![],
             resumptions: vec![],
+            keys: KeyShape::Numbered,
             measurements: vec![Measurement {
                 workload: "read".into(),
                 arm: "supdb".into(),
@@ -343,6 +358,33 @@ mod tests {
         );
         assert_eq!(back.machine.read_ahead_kb, Some(128));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The keys' shape is a class of its own, after the bound: a row of
+    /// ids is no history for a row of numbered keys on the same machine
+    /// under the same bound, and the other way. A row of numbered keys
+    /// says nothing of its keys, in its class or in its file, so every row
+    /// from before the shape was a parameter reads as it did.
+    #[test]
+    fn a_key_shape_is_its_own_class() {
+        let mut row = Row::read(&first_banked_row()).unwrap();
+        assert_eq!(row.keys, KeyShape::Numbered, "a row from before the field");
+        let base = row.class();
+        assert_eq!(base, row.machine.class());
+        let text = serde_json::to_string(&row).unwrap();
+        assert!(!text.contains("\"keys\""), "{text}");
+        row.keys = KeyShape::Ids;
+        assert_eq!(row.class(), format!("{base}/kids"));
+        let text = serde_json::to_string(&row).unwrap();
+        assert!(text.contains("\"keys\":\"Ids\""), "{text}");
+        let back: Row = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.keys, KeyShape::Ids);
+        assert_eq!(back.class(), row.class());
+        // After the bound, which is the machine's.
+        row.machine.mem_limit_bytes = Some(1536 << 20);
+        assert_eq!(row.class(), format!("{base}/b1536m/kids"));
+        row.keys = KeyShape::Numbered;
+        assert_eq!(row.class(), format!("{base}/b1536m"));
     }
 
     /// A bound is a class of its own, in exact mebibytes, and two bounds
@@ -479,11 +521,21 @@ mod tests {
             if row.scale != Scale::Ooc {
                 assert_eq!(row.machine.mem_limit_bytes, None, "{rel}");
                 assert_eq!(
-                    row.class().rsplit('/').next().unwrap(),
+                    row.machine.class().rsplit('/').next().unwrap(),
                     row.machine.virtualised,
                     "{rel}: {}",
                     row.class()
                 );
+            }
+            // The keys' shape is the class's last part and nothing else of
+            // it: a row of numbered keys has the machine's class whole.
+            match row.keys {
+                KeyShape::Numbered => assert_eq!(row.class(), row.machine.class(), "{rel}"),
+                k => assert_eq!(
+                    row.class(),
+                    format!("{}/k{}", row.machine.class(), k.name()),
+                    "{rel}"
+                ),
             }
             if let Some((_, class)) = snapshot.iter().find(|(f, _)| *f == rel) {
                 assert_eq!(row.class(), *class, "{rel}");

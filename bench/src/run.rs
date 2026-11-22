@@ -1743,6 +1743,7 @@ fn row_of(
         measurements: s.measurements(),
         killed: killed.to_vec(),
         resumptions: resumptions.to_vec(),
+        keys: plan.keys,
     }
 }
 
@@ -2865,12 +2866,20 @@ fn one_pass(
     // every row; the scans run as long now. Every start is at least
     // `scan_len` below the top, so every scan walks `scan_len` loaded
     // entries.
+    // With `SUPDB_SCAN_COUNTERS` set, the store's counters around each
+    // threaded scan pass, here and after the mixes, as `SUPDB_MIX_COUNTERS`
+    // reads them around a mix: one `scancounters` line a pass on stderr,
+    // read before the pass and after it. The read before takes the writer's
+    // upkeep home, so the pass after it meets a store nothing is filing
+    // into; a probe's variable, never set for a row.
+    let scan_counting = std::env::var_os("SUPDB_SCAN_COUNTERS").is_some();
     let mut scan_entries_s_threaded = Vec::with_capacity(plan.threads.len());
     for &threads in &plan.threads {
         if !passes.scan_threaded {
             break;
         }
         let ops = plan.divided(size) * threads as u64;
+        let sc0 = scan_counting.then(|| e.counters());
         let c0 = counting.begin();
         let got = threaded(
             e.as_ref(),
@@ -2884,6 +2893,18 @@ fn one_pass(
             c0.is_some(),
         )?;
         counting.end(c0, "scan", &format!("_{threads}t"), Some(got.own), ops);
+        if let Some(sc0) = sc0 {
+            let point = format!("scan-{threads}t ops {ops}");
+            counters_line(
+                "scancounters",
+                arm,
+                &point,
+                (0, 0),
+                (0.0, got.secs * 1e3),
+                &sc0,
+                &e.counters(),
+            );
+        }
         let want = ops * (plan.scan_len as u64).min(size) * plan.value_size as u64;
         if got.bytes != want {
             return Err(format!(
@@ -2922,12 +2943,23 @@ fn one_pass(
     // store's, since a mix only adds to a key; what an engine adds for
     // an update is its own and is not held to. `size` scans a thread, as
     // above.
+    // A probe's fold before these scans (`SUPDB_SCAN_MIXED_FOLD`,
+    // `Engine::fold`): the store the mixes leave with nothing overlaid, so
+    // that the scans' rate over the files the mixes' merges wrote is read
+    // apart from what a scan pays for the keys left unsealed. Its time on a
+    // `scanfold` line. Never set for a row.
+    if passes.scan_mixed && std::env::var_os("SUPDB_SCAN_MIXED_FOLD").is_some() {
+        let t = std::time::Instant::now();
+        e.fold()?;
+        eprintln!("scanfold {arm} ms {:.0}", t.elapsed().as_secs_f64() * 1e3);
+    }
     let mut scan_mixed_threaded = Vec::with_capacity(plan.threads.len());
     for &threads in &plan.threads {
         if !passes.scan_mixed {
             break;
         }
         let ops = plan.divided(size) * threads as u64;
+        let sc0 = scan_counting.then(|| e.counters());
         let c0 = counting.begin();
         let got = threaded(
             e.as_ref(),
@@ -2947,6 +2979,18 @@ fn one_pass(
             Some(got.own),
             ops,
         );
+        if let Some(sc0) = sc0 {
+            let point = format!("scan-mixed-{threads}t ops {ops}");
+            counters_line(
+                "scancounters",
+                arm,
+                &point,
+                (0, 0),
+                (0.0, got.secs * 1e3),
+                &sc0,
+                &e.counters(),
+            );
+        }
         let want = ops * (plan.scan_len as u64).min(size) * plan.value_size as u64;
         if got.bytes < want {
             return Err(format!(
@@ -5390,6 +5434,30 @@ mod tests {
             ("bytes_per_fortnight", "B/f"),
             1.0,
         );
+    }
+
+    /// A run's row is of its plan's keys: a run over ids writes rows of
+    /// ids from its first banked rung, in the ids' class, and one over the
+    /// numbered keys a row that says nothing of them.
+    #[test]
+    fn a_row_is_of_its_plans_keys() {
+        let machine = crate::env::capture();
+        for keys in [KeyShape::Numbered, KeyShape::Ids] {
+            let mut plan = Plan::new(Scale::Quick, vec!["supdb".into()], 10_000, 4);
+            plan.keys = keys;
+            let row = row_of(
+                "20260101T000000Z",
+                "0123456789abcdef",
+                "rustc",
+                &machine,
+                &plan,
+                &Samples::new(),
+                &[],
+                &[],
+            );
+            assert_eq!(row.keys, keys);
+            assert_eq!(row.class().ends_with("/kids"), keys == KeyShape::Ids);
+        }
     }
 
     #[test]

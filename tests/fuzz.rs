@@ -362,6 +362,30 @@ struct Cfg {
     /// a quarter of the seeds under `ZFUZZ_OPTVARY`, the side generator's
     /// next draw, and the engine's otherwise.
     hot_starts: u32,
+    /// The block path's cursor steps the fence to the next entry
+    /// (`Options::zpages_cursor_steps`) and a sparse stride walk steps its
+    /// key by the field (`Options::zpages_stride_step_direct`): each on in
+    /// half the seeds under `ZFUZZ_OPTVARY`, the side generator's next two
+    /// draws, and off otherwise, as the engine has them.
+    cursor_steps: bool,
+    stride_direct: bool,
+    /// A bounds walk places a block boundary by its head
+    /// (`Options::bounds_by_heads`) and a landing leaves its pieces' bounds
+    /// where no table stands to read them (`Options::land_bounds_read`):
+    /// each off in half the seeds under `ZFUZZ_OPTVARY`, the side
+    /// generator's next two draws, and on otherwise, as the engine has
+    /// them.
+    bounds_heads: bool,
+    land_bounds: bool,
+    /// A third merge in flight while the writer's commits see no read
+    /// (`Options::merge_parallel_quiet` at three): off in half the seeds
+    /// under `ZFUZZ_OPTVARY`, the side generator's next draw, and on
+    /// otherwise, as the engine has it.
+    merge_quiet: bool,
+    /// That room at any gate of the controller and not only where the
+    /// compact form is installed (`Options::merge_quiet_any_gate`): in half
+    /// the seeds that draw the third merge.
+    merge_quiet_any: bool,
     /// Under `ZFUZZ_STRIDE`, the stride form's steer; `None` without it.
     stride: Option<StrideSteer>,
 }
@@ -650,6 +674,10 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let (part_off, keys_off, scan_off) = (side.chance(25), side.chance(25), side.chance(25));
     let walk_off = side.chance(25);
     let hot_two = side.chance(25);
+    let (steps_on, direct_on) = (side.chance(50), side.chance(50));
+    let (heads_on, land_on) = (side.chance(50), side.chance(50));
+    let quiet_on = side.chance(50);
+    let quiet_any = side.chance(50);
     // A generator of its own, as `side` is, so that the switch moves none
     // of the draws below.
     let stride =
@@ -705,6 +733,12 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         } else {
             Options::default().promote_starts
         },
+        cursor_steps: vary && steps_on,
+        stride_direct: vary && direct_on,
+        bounds_heads: !(vary && heads_on),
+        land_bounds: !(vary && land_on),
+        merge_quiet: !(vary && quiet_on),
+        merge_quiet_any: vary && !quiet_on && quiet_any,
         stride,
     }
 }
@@ -731,6 +765,12 @@ fn opts(c: &Cfg) -> Options {
         zpages_point_keys: c.point_keys,
         zpages_scan_admit: c.scan_admit,
         zpages_walk_part: c.walk_part,
+        zpages_cursor_steps: c.cursor_steps,
+        zpages_stride_step_direct: c.stride_direct,
+        bounds_by_heads: c.bounds_heads,
+        land_bounds_read: c.land_bounds,
+        merge_parallel_quiet: if c.merge_quiet { 3 } else { 0 },
+        merge_quiet_any_gate: c.merge_quiet_any,
         promote_starts: c.hot_starts,
         zpages_store_all: c.store_all,
         scan_start_cache: if c.start_cache { 4096 } else { 0 },
@@ -1724,8 +1764,16 @@ struct Stats {
     /// on a copy (`Options::promote_starts`); then the times a writer took
     /// its forms back at a commit, its reading of the scans gone stale
     /// (`Options::scan_forms_off_stale_writes`), what says a run under
-    /// `ZFUZZ_FORMSOFF` reached that exit.
-    point: [u64; 8],
+    /// `ZFUZZ_FORMSOFF` reached that exit; then the fence entries the
+    /// cursors stepped to with no search (`Options::zpages_cursor_steps`),
+    /// what says a run under `ZFUZZ_OPTVARY` and `ZFUZZ_ZPAGES` reached the
+    /// step; then the block boundaries a bounds walk placed by a head and
+    /// the landings that left their bounds (`Options::bounds_by_heads`,
+    /// `land_bounds_read`), what says a run under `ZFUZZ_OPTVARY` reached
+    /// each, the second with `ZFUZZ_FORMSOFF`; then the merges started
+    /// past `merge_parallel` in a stretch of writes nobody read
+    /// (`Options::merge_parallel_quiet`).
+    point: [u64; 12],
     /// The `z` store's stride form under `ZFUZZ_STRIDE`.
     stride: StrideStats,
 }
@@ -1856,6 +1904,10 @@ fn count_point(st: &mut Stats, db: &Db) {
     st.point[5] += h[0];
     st.point[6] += h[1];
     st.point[7] += db.forms_off_stale_exits();
+    st.point[8] += c.cursor_steps;
+    st.point[9] += c.bounds_by_head;
+    st.point[10] += c.land_bounds_left;
+    st.point[11] += db.seal_waits().merges_quiet;
 }
 
 /// Under `ZFUZZ_CENSUS`, the store read as out of core: the census gate,
@@ -2036,7 +2088,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         switches: 0,
         recuts: 0,
         heads: [0; 2],
-        point: [0; 8],
+        point: [0; 12],
         stride: StrideStats::default(),
     };
     let mut fails: Vec<String> = Vec::new();
@@ -2536,7 +2588,7 @@ fn run_range() {
     let (mut bad, mut reopens, mut abandons, mut bindings, mut beside, mut switches) =
         (Vec::new(), 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut recuts = 0u64;
-    let mut point = [0u64; 8];
+    let mut point = [0u64; 12];
     let mut heads = [0u64; 2];
     let mut stride = StrideStats::default();
     let ran = seeds.len();
@@ -2567,7 +2619,7 @@ fn run_range() {
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, cache units given back {evicted}, chunks decrypted {fills}, reads through a form {zreads}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, cache units given back {evicted}, chunks decrypted {fills}, reads through a form {zreads}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {}, FAILURES {}",
         heads[0],
         heads[1],
         point[0],
@@ -2578,6 +2630,10 @@ fn run_range() {
         point[5],
         point[6],
         point[7],
+        point[8],
+        point[9],
+        point[10],
+        point[11],
         bad.len()
     );
     if stride_on() {
@@ -2938,6 +2994,40 @@ fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<(u64, u
         committed[j].store(pack(epoch[j], n[j]), Ordering::SeqCst);
     }
     db.settle().map_err(|e| format!("settle: {e}"))?;
+    if convert {
+        // The asks above are taken at the segment work's turn with the
+        // builder free and nothing due it, each one replaced by the next:
+        // beside the seals' and merges' builds a seed's asks were all
+        // replaced untaken in one run of the stride group, and the range's
+        // check that a partition left the stride form went red over a
+        // store that was never asked. With the readers still at it, the
+        // first served partition is asked three times and each ask settled,
+        // which takes it, so it moves to the form it is not in three times
+        // over: a stride file to the block form, and a block file back --
+        // the keys here are numbers of one width, which a block file's move
+        // into the stride form asks of them (`StrideNo::askable`). Out,
+        // in, out, or in, out, in where the asks above left it a block
+        // file: a move each way at the least. (Asked by turns until one
+        // left, the served partitions were asked once in every run, the
+        // first a stride file each time, so the turns and their bound were
+        // reached by nothing.)
+        let before = db.zpage_counts();
+        for _ in 0..3 {
+            db.zpages_convert_ask(0);
+            db.zpages_settle()
+                .map_err(|e| format!("zpages settle: {e}"))?;
+        }
+        let after = db.zpage_counts();
+        let moved = (
+            after.stride_converts - before.stride_converts,
+            after.stride_converts_back - before.stride_converts_back,
+        );
+        if moved.0 + moved.1 != 3 || moved.0.abs_diff(moved.1) != 1 {
+            return Err(format!(
+                "seed {seed} ({cfg:?}): three settled asks of the first partition moved it in and out {moved:?} times"
+            ));
+        }
+    }
     stop.store(true, Ordering::Relaxed);
     for t in threads {
         t.join().map_err(|_| "reader thread panicked".to_string())?;

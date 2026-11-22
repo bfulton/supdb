@@ -18,6 +18,10 @@ on:
         description: 'Arms for the quick job, comma-separated (empty runs every arm)'
         required: false
         default: ''
+      keys:
+        description: 'Keys for the quick job: numbered (the default) or ids, random 64-bit ids'
+        required: false
+        default: ''
 
 env:
   CARGO_TERM_COLOR: always
@@ -91,6 +95,7 @@ jobs:
       - name: One quick-scale run of every arm
         env:
           ARMS: ${{ inputs.arms }}
+          KEYS: ${{ inputs.keys }}
         run: sh scripts/check.sh quick
       - uses: actions/upload-artifact@v4
         if: always()

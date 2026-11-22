@@ -296,6 +296,12 @@ impl KeyShape {
             KeyShape::Ids => "ids",
         }
     }
+
+    /// Whether these are the numbered keys, the shape a row says nothing
+    /// of (`Row::keys`).
+    pub fn is_numbered(&self) -> bool {
+        *self == KeyShape::Numbered
+    }
 }
 
 /// SplitMix64's finalizer: a bijection of the 64-bit words whose output

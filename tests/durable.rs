@@ -7224,16 +7224,38 @@ fn a_write_that_ends_a_run_over_a_stopped_queue_with_room_is_taken() {
         }
         assert!(db.seals_wedged(), "{tag}: the queue stopped");
         assert!(db.frozen_tables() < 3, "{tag}: the frozen list has room");
+        if background {
+            // The segment work stops the queue and then, its look done,
+            // leaves the failure for the writer's next commit: the stop's
+            // flag is read above, and the failure is answered once, by a
+            // commit with nothing staged, before the commits this test
+            // reads. Read on the flag alone, the failure fell to the
+            // commit after the run's close in one whole-suite run.
+            let t = std::time::Instant::now();
+            loop {
+                match db.commit() {
+                    Ok(()) => {
+                        assert!(
+                            t.elapsed().as_secs() < 60,
+                            "{tag}: the segment work's failure is answered"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(e) => {
+                        assert!(
+                            e.to_string().contains(cause),
+                            "{tag}: the segment work's own error, answered once: {e}"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
         for k in 0..300u32 {
             ss_put(&mut db, &mut model, &ss_key(100_000 + k), "r");
         }
-        if db.commit().is_err() {
-            assert!(
-                background,
-                "{tag}: only the segment work's error is answered"
-            );
-            db.commit().unwrap();
-        }
+        db.commit()
+            .unwrap_or_else(|e| panic!("{tag}: the commit of the run's batch: {e}"));
         assert!(db.run_synced_bytes().is_some(), "{tag}: a run is open");
         ss_put(&mut db, &mut model, &ss_key(7), "low");
         assert!(db.run_synced_bytes().is_none(), "{tag}: the run closed");

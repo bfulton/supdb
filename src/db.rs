@@ -714,6 +714,18 @@ pub struct ZCounts {
     /// (`Options::bounds_heads_willneed`).
     pub bounds_head_asks: u64,
     pub bounds_head_submitted: u64,
+    /// Block boundaries a bounds walk placed by the boundary's head, no
+    /// record read (`Options::bounds_by_heads`), and the boundary records
+    /// the walks read: one for every boundary whose head is not the whole
+    /// of its key with the option off, and under it only where a key of
+    /// the walked source fell inside the head's bracket.
+    pub bounds_by_head: u64,
+    pub bounds_records: u64,
+    /// Bounds walks made at a landing before its publish, a piece against
+    /// a partition each, and landings that left theirs to a reader because
+    /// no table stood to read them (`Options::land_bounds_read`).
+    pub land_bound_walks: u64,
+    pub land_bounds_left: u64,
     /// Point reads and counts of a partition answered from its form file.
     pub reads: u64,
     pub counts: u64,
@@ -732,6 +744,9 @@ pub struct ZCounts {
     pub stride_reads: u64,
     pub stride_page_checks: u64,
     pub stride_cursor_reads: u64,
+    /// Keys the walks of a sparse stride form stepped by writing the next
+    /// key's field (`Options::zpages_stride_step_direct`).
+    pub stride_direct_steps: u64,
     /// Pages decoded to answer them: one for each read or count of a key
     /// that falls in a page's range, the key the page holds and the key it
     /// does not alike, unless the thread's memo holds the group from a
@@ -801,6 +816,9 @@ pub struct ZCounts {
     /// (`Options::zpages_bulk_ahead`).
     pub scan_views: u64,
     pub group_aheads: u64,
+    /// The fence entries the cursor walks stepped to from the entry before
+    /// with no search of the fence (`Options::zpages_cursor_steps`).
+    pub cursor_steps: u64,
     /// Form files built, their pages, bytes, the pages that hold their
     /// group verbatim, the decoded bytes of every group, and compress
     /// calls; builds that failed and builds a merge outran.
@@ -1012,6 +1030,13 @@ pub struct ZCounts {
     /// (`Options::zpages_stride_convert`). A test's, for holding a period's
     /// rent to the period's reads.
     pub stride_convert_rent_us: u64,
+    /// What the conversion's last look held a move in at no rent to: the
+    /// forms' bytes as the partitions stood, a conversion in flight counted
+    /// where it was going, and the fill of the room less what stands in
+    /// the cache beside the forms (`zselect::conversion_room`). A test's,
+    /// for setting a budget a known distance from the forms' own bytes.
+    pub stride_convert_held: u64,
+    pub stride_convert_fill: u64,
     pub builds_raw_tails: u64,
     /// Partitions re-coded while served (`Options::zpages_recode`): to the
     /// raw tails, back to the block coding, and re-codes that installed
@@ -2062,6 +2087,34 @@ pub struct Options {
     /// 1.25 GiB. `supdb-zbulksearch` searches and asks twice, the shape
     /// before.
     pub zpages_bulk_steps: bool,
+    /// EXPERIMENT: the block path's cursor over a form file
+    /// (`zfile::ZCursor`) steps the fence to the next entry where its walk
+    /// ran off the end of one, as the bulk walk does (`zpages_bulk_steps`):
+    /// the cursor's `next_group` at a page's last record placed itself by
+    /// the rank, a binary search over the fence's first ranks at every page
+    /// a walk crossed. The bulk walk serves a partition with nothing
+    /// unsealed over it and the cursor every other -- each block of a
+    /// partition the write mixes have left a key in, the overlay walk and
+    /// the merge path -- so the store the mixes leave searched at every
+    /// page where the store as loaded stepped: a ninth of the cursor's own
+    /// time in a profile of the threaded scans after the mixes at ten
+    /// million random ids under 1.25 GiB. The steps are counted
+    /// (`ZPageCounts::cursor_steps`). Off; `supdb-zcursorsteps` is the arm.
+    #[doc(hidden)]
+    pub zpages_cursor_steps: bool,
+    /// EXPERIMENT: a walk of a sparse stride form steps its key by writing
+    /// the next key's field where it lies (`zpages::KeyCodec::render_field`):
+    /// the digits made a word at a time and stored once over the field, the
+    /// prefix standing from the key before. A sparse form holds each key's
+    /// number, so every record of a walk renders one, where a whole run's
+    /// walk adds one to the key in place; the step before rendered the whole
+    /// key a byte a digit into a buffer of its own and copied it over the
+    /// key, a load of sixteen bytes from sixteen stores of one that nothing
+    /// forwards -- a quarter of the threaded scan pass in the render and a
+    /// ninth in that copy, in a profile at ten million random ids under
+    /// 1.5 GiB. Off; `supdb-zsparsestep` is the arm.
+    #[doc(hidden)]
+    pub zpages_stride_step_direct: bool,
     /// EXPERIMENT: the bulk walk's own decode of the group it ends inside
     /// -- a first touch, decoded into the thread's buffer
     /// (`zpages_bulk_admit`) -- goes only as far as the records it reads,
@@ -5119,6 +5172,44 @@ pub struct Options {
     /// shape before: `supdb-mergeone`, `supdb-ingestmergeone` and
     /// `supdb-nozpagesmergeone`.
     pub merge_parallel: usize,
+    /// The most partition merges in flight while the writer's commits see
+    /// no read at all -- no scan and no point read through the writer or
+    /// any handle since the commit before (`Db::read_mode`, published as
+    /// `Shared::write_quiet` and cleared by the first read) -- where it is
+    /// above `merge_parallel`; zero, or no more than it, leaves the room
+    /// at `merge_parallel` always. A burst of writes nobody reads makes
+    /// merge debt faster than two merges retire it once nothing stalls
+    /// the writer: under 1.25 GiB at ten million random ids, with the
+    /// bounds walk no longer faulting (`Options::bounds_by_heads`), the
+    /// full rewrite's burst ran six seconds shorter and the chain was
+    /// still writing at the device through the pass after it, 0.45x and
+    /// 0.54x of LMDB's where the writer's stall had let it finish. Three
+    /// merges at all times brought that pass level with the shipping
+    /// engine and cost the mixes after it a tenth to a quarter, the third
+    /// merge running beside their reads (`docs/engine.md`, keys that are
+    /// no run of numbers); in a stretch nobody reads, the third merge's
+    /// device and CPU are no reader's. A merge started under the room
+    /// runs to its landing whatever comes after it. Three; zero is the
+    /// shape before, `supdb-quiet0`. The room rises only
+    /// where the compact form is installed (`zselect::GATE_Z`), the store
+    /// out of core by the controller's verdict, unless
+    /// `merge_quiet_any_gate` says otherwise.
+    #[doc(hidden)]
+    pub merge_parallel_quiet: usize,
+    /// EXPERIMENT: `merge_parallel_quiet`'s room at any gate of the
+    /// controller, the shape before. The third merge was paired at every
+    /// bounded rung of ten million keys and at three million under
+    /// 1.25 GiB, and read ahead in one cell alone, the pass after the full
+    /// rewrite over random ids at ten million under 1.25 GiB, where the
+    /// form is installed from the load on; at three million, where the
+    /// store sits at the census with no form installed, that pass is the
+    /// first scan's wait for the upkeep thread's last pass in both arms,
+    /// 10-58 ms of a pass of 36-88, and it read 0.69x and 0.74x in one
+    /// pairing and 0.64x and 1.62x in the next, nothing the merges reach.
+    /// So the room is kept to where the debt it retires is a device's:
+    /// `supdb-quietany` is the arm at any gate.
+    #[doc(hidden)]
+    pub merge_quiet_any_gate: bool,
     /// Under `merge_chains`, a merge's landing plans the next merge out of
     /// core -- the controller's gate away from the raw form -- whether or
     /// not a scan has come since the last landing, so the merges a burst's
@@ -5186,6 +5277,40 @@ pub struct Options {
     /// Off, `supdb-noboundsheadwillneed` and
     /// `supdb-ingestnoboundsheadwillneed`.
     pub bounds_heads_willneed: bool,
+    /// A walk of a source's keys against a partition's block boundaries
+    /// (`block_bounds_of`) places a boundary by its head where the head is
+    /// not the whole of its key, and reads the boundary's record only
+    /// where a key of the source falls inside what the head leaves open
+    /// (`OrdIndex::head_bracket`). The top level has every boundary's head
+    /// in memory; where every key is one length a head covers, the head is
+    /// the key and the walk has read no record since `whole_key_at`. Keys
+    /// longer than their common prefix and eight bytes -- random ids, any
+    /// key with a tail -- had no such path: every boundary of every
+    /// partition a piece met was a record read, a cold line in core and a
+    /// page of the raw form out of core, 156,000 of them at each landing
+    /// of a seal at ten million ids, on the thread every landing goes
+    /// through. Under 1 GiB there the first landing of the lag sweep's
+    /// ten-percent burst took 76,000 major faults in five seconds and had
+    /// not published, the tables frozen behind it stood with their
+    /// snapshot copies, and the group killed the process in the full
+    /// rewrite (`docs/engine.md`, keys that are no run of numbers). The
+    /// bounds are the same vector either way. On; off, the record at every
+    /// boundary: `supdb-boundsbyrecord`, and `supdb-boundsold` with the
+    /// landing's walks.
+    #[doc(hidden)]
+    pub bounds_by_heads: bool,
+    /// A landing takes its pieces' bounds before its publish
+    /// (`Maint::rank_before_publish`) only where a table stands to read
+    /// them: not while the writer has given its block forms up
+    /// (`scan_forms_off_unreused`) and no handle is live, when nothing
+    /// makes a table and the walks are the landing thread's time and, out
+    /// of core, its faults, for nobody. A handle claimed later, or the
+    /// writer taking its forms back, walks the bounds its tables need as
+    /// a reader far from the landing always has (`BuildCtx::table_bounds`).
+    /// On; off, every landing near reads walks them:
+    /// `supdb-landboundsalways`, and `supdb-boundsold` with the records.
+    #[doc(hidden)]
+    pub land_bounds_read: bool,
     /// A seal writes a key whose chain holds one value and no tombstone
     /// -- every key of a load, and most of any table -- through the
     /// writer's one-value path (`SegmentWriter::put_one`), the record
@@ -6620,15 +6745,31 @@ pub struct Options {
     /// come (`Maint::z_sparse_now`): before one the store is partway
     /// through its first writing, a build's room is the room of the store
     /// so far, and the partition is built in the block form and left for a
-    /// conversion to ask when reads come, at no rent, where the model says
-    /// the store with it in the form still fits the fill
-    /// (`zfile::StrideNo::Deferred`). A forced store's builds take it where
+    /// conversion to ask when reads come, at no rent where the forms with
+    /// it in the sparse form still fit the fill whole, and for the rent
+    /// like any other move where the model says it pays past that
+    /// (`zfile::StrideNo::Deferred`, `Maint::z_convert_look`). A forced store's builds take it where
     /// they are made, having no conversion to leave it to. A partition
     /// whose keys are a whole run is built as it was, byte for byte; a
     /// sparse file is a second version of the stride trailer, which a
     /// reader from before refuses. Off: `supdb-zsparse` is the arm.
     #[doc(hidden)]
     pub zpages_stride_sparse: bool,
+    /// With `zpages_stride_sparse` under the controller, a build made
+    /// before any reader has come leaves a run with gaps in the block form
+    /// and its ask of the sparse form to a conversion
+    /// (`Maint::z_sparse_now`, `zfile::StrideNo::Deferred`). Off, a build
+    /// asks where it is made, as the stride form's own ask is made: every
+    /// build that finds the store so far to fit the room takes the sparse
+    /// form, which is the shape the ask first had. It is the better of the
+    /// two where the store whole comes to fit -- nothing is converted
+    /// beside the first readers -- and the worse where it does not: at ten
+    /// million random ids under 1 GiB forty-four partitions were built
+    /// sparse and twenty-four converted back through the read and scan
+    /// passes (`docs/engine.md`, keys that are no run of numbers). On;
+    /// `supdb-zsparsebuild` asks at the build.
+    #[doc(hidden)]
+    pub zpages_stride_sparse_waits: bool,
 }
 
 impl Options {
@@ -6744,6 +6885,8 @@ impl Options {
             )
             .bulk_within(self.zpages_bulk_ahead_within)
             .bulk_steps(self.zpages_bulk_steps)
+            .cursor_steps(self.zpages_cursor_steps)
+            .stride_direct(self.zpages_stride_step_direct)
     }
 }
 
@@ -6848,6 +6991,8 @@ impl Default for Options {
             zpages_bulk_part: false,
             zpages_bulk_ahead_within: false,
             zpages_bulk_steps: true,
+            zpages_cursor_steps: false,
+            zpages_stride_step_direct: false,
             zpages_walk_part: true,
             zpages_cursor_view: true,
             zpages_group_ahead: true,
@@ -7033,9 +7178,13 @@ impl Default for Options {
             merge_plan_idle: true,
             merge_bytes_cap: 64 << 20,
             merge_parallel: 2,
+            merge_parallel_quiet: 3,
+            merge_quiet_any_gate: false,
             boundary_keys_from_top: false,
             pieces_dir_willneed: true,
             bounds_heads_willneed: true,
+            bounds_by_heads: true,
+            land_bounds_read: true,
             seal_put_one: true,
             close_presync: true,
             ord_durable: false,
@@ -7114,6 +7263,7 @@ impl Default for Options {
             zpages_stride_convert: true,
             zpages_convert_drops_output: true,
             zpages_stride_sparse: false,
+            zpages_stride_sparse_waits: true,
         }
     }
 }
@@ -15385,6 +15535,9 @@ struct Slot {
     /// (`Options::zpages_cursor_view`, `Options::zpages_group_ahead`).
     zviews: AtomicU64,
     zaheads: AtomicU64,
+    /// The cursor walks' steps to the next fence entry
+    /// (`Options::zpages_cursor_steps`).
+    zsteps: AtomicU64,
     /// The census (`ZPages::Auto`, `zselect` S2): what this handle's
     /// windows summed, written by the handle alone at a window's close
     /// and read by the controller's tick, which differences them. By
@@ -15472,6 +15625,7 @@ impl Slot {
             zprefetches: AtomicU64::new(0),
             zviews: AtomicU64::new(0),
             zaheads: AtomicU64::new(0),
+            zsteps: AtomicU64::new(0),
             zcreads: AtomicU64::new(0),
             zcrflt: AtomicU64::new(0),
             zcscans: AtomicU64::new(0),
@@ -15494,17 +15648,20 @@ impl Slot {
     }
 }
 
-// Four lines: the nine words that were here, the second form's thirteen
+// Five lines: the nine words that were here, the second form's thirteen
 // counters and the census's seventeen sums, thirty-nine words, were a
-// 384-byte slot since the census, and the cursor's two counts (`zviews`,
-// `zaheads`) took it past forty-eight words into a fourth line. What the
-// layout is for is that no other thread writes a slot's lines, which four
-// lines a handle owns keep as one did; the first line's sixteen words
-// were full at the seventh second-form counter, the second's at the
-// census's third sum, the third's at the cursor's first count. The size
-// is pinned so that a counter added moves it here and not in a threaded
-// cell.
-const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() == 512);
+// 384-byte slot since the census, the cursor's two counts (`zviews`,
+// `zaheads`) took it past forty-eight words into a fourth line, and the
+// count of a sparse stride walk's keys stepped by the field
+// (`zstride.direct`), the word after the cursor's steps (`zsteps`) filled
+// the fourth, took it into a fifth. What the layout is for is that no
+// other thread writes a slot's lines, which the lines a handle owns keep
+// as one did; the first line's sixteen words were full at the seventh
+// second-form counter, the second's at the census's third sum, the
+// third's at the cursor's first count, the fourth's at its steps. The
+// size is pinned so that a counter added moves it here and not in a
+// threaded cell.
+const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() == 640);
 
 const READER_SLOTS: usize = 256;
 
@@ -19682,6 +19839,9 @@ struct SealCounts {
     merges: AtomicU64,
     plans: AtomicU64,
     merges_beside: AtomicU64,
+    /// Partition merges started past `merge_parallel`, in a write-only
+    /// stretch (`Options::merge_parallel_quiet`).
+    merges_quiet: AtomicU64,
     held_landings: AtomicU64,
     /// The seal thread's phases, summed over seals: the sort of the frozen
     /// table, the snapshot's build and publish, and the record loop.
@@ -19742,6 +19902,7 @@ impl SealCounts {
             merges: get(&self.merges),
             plans: get(&self.plans),
             merges_beside: get(&self.merges_beside),
+            merges_quiet: get(&self.merges_quiet),
             seal_sort_ns: get(&self.seal_sort_ns),
             seal_snap_ns: get(&self.seal_snap_ns),
             seal_records_ns: get(&self.seal_records_ns),
@@ -19788,6 +19949,9 @@ pub struct SealWaits {
     /// Partition merges started while another was in flight
     /// (`Options::merge_parallel`).
     pub merges_beside: u64,
+    /// Partition merges started past `merge_parallel` in a write-only
+    /// stretch (`Options::merge_parallel_quiet`).
+    pub merges_quiet: u64,
     /// The seal thread's phases, summed over seals: sorting the frozen
     /// table, building and publishing its snapshot (`Options::seal_snapshot`),
     /// writing the records, and the thread's whole run.
@@ -19836,23 +20000,37 @@ struct CachedBlock {
     /// key offset, key length, run offset, run length; the run is values
     /// each behind a u32 length.
     ents: Vec<[u32; 4]>,
-    /// The partition (its blob's id) whose records the entries are, entry
-    /// `i` the block's record `lo + i` for every `i`, or 0 for none: the
+    /// Whether the entries are the records of the partition `identity_of`
+    /// names, entry `i` the block's record `lo + i` for every `i`: the
     /// copy was built over updates alone and no insert has been spliced
     /// in since, so a walk's start and a patch's entry are a rank less the
     /// block's first (`Options::copy_start_at_rank`). An insert clears it
     /// for good; a delete leaves the entry, with an empty run, so it
-    /// holds. It names the partition: a walk's start takes the entry by
-    /// its rank in that partition alone, and a patch in another only where
-    /// a compare there proves it (`Reader::splice_run`): a table carried
-    /// across a merge that rewrote its partition over the same blocks
-    /// keeps its copies, and a key the merge folded in or dropped inside a
-    /// block moves every record after it, so a claim about the records
-    /// before the merge is no claim about the ones after. The hints ahead
-    /// of a patch or a walk (`copy_entry_at`, `prefetch_block`) take any
-    /// claim, as they did before it named one: a hint at a rank a rewrite
+    /// holds. A walk's start takes the entry by its rank only where the
+    /// claim is of the partition in hand (`CachedBlock::identity_for`); a
+    /// patch under a claim of another takes it only where one key compare
+    /// proves it (`Reader::splice_run`), and searches otherwise. The hint
+    /// ahead of a patch takes the claim of the partition in hand alone
+    /// (`copy_entry_at`); the walk's prefetch (`prefetch_block`) and the
+    /// form's (`by_cut`) take any claim, and a hint at a rank a rewrite
     /// moved asks for lines nothing reads, and answers nothing.
-    identity: u64,
+    identity: bool,
+    /// The blob id of the partition whose records the entries are where
+    /// `identity` holds. A table is carried across a merge that rewrites
+    /// its partition over the same block boundaries (`Db::same_blocks`:
+    /// the same key count and the same key at every block's first rank),
+    /// and its copies with it; a delete and an insert in one block that a
+    /// piece carried into the merge before any settle filed them leave
+    /// the boundaries and the count as they were and the records between
+    /// them other keys, so a copy whose entries were the old partition's
+    /// records is not the new one's. Its identity, still claimed, sent the
+    /// settle's patch of the inserted key -- a record of the new partition
+    /// at its cut -- to the entry the old records had at that rank, and a
+    /// walk's start there too: in a checked build the assertion beside
+    /// the patch, one run in a hundred of the differential fuzz's seed
+    /// 1050, and in a release build a patch written over another key's
+    /// entry and a scan started past keys, nothing raised.
+    identity_of: u64,
     /// A copy of a block wide by its count (`Options::forms_copy_hot_wide`),
     /// kept past the wide bound: the settle that grows its overlay past the
     /// bound appends to it where it drops any other form for a wide build.
@@ -19865,6 +20043,12 @@ struct CachedBlock {
 }
 
 impl CachedBlock {
+    /// Whether entry `i` is record `lo + i` of the partition `blob` names:
+    /// the identity holds, and of that partition.
+    #[inline]
+    fn identity_for(&self, blob: u64) -> bool {
+        self.identity && self.identity_of == blob
+    }
     /// The three buffers shrunk to what they hold, where a build asked
     /// for more than it filled (`Options::forms_to_fit`).
     fn fit(&mut self) {
@@ -19903,7 +20087,7 @@ impl CachedBlock {
         self.keys == other.keys
             && self.vals == other.vals
             && self.ents == other.ents
-            && (other.identity == 0 || self.identity == other.identity)
+            && (!other.identity || self.identity_for(other.identity_of))
     }
 
     /// Whether a walk of this copy emits what a walk of `other` emits:
@@ -20138,13 +20322,66 @@ fn prefetch_form(form: &Cached, whole: bool) {
     }
 }
 
+/// A copy's claim to be its block's records answers for the partition its
+/// build read and no other: the walk's start takes the entry by its rank on
+/// that answer alone (`Reader::splice_run`'s compare covers the patch, so no
+/// store state the tests build tells the two apart there).
+#[cfg(test)]
+mod copy_claim {
+    use super::*;
+
+    #[test]
+    fn a_copys_claim_answers_for_the_partition_its_build_read_alone() {
+        let mut blk = CachedBlock {
+            identity: true,
+            identity_of: 7,
+            ..CachedBlock::default()
+        };
+        assert!(blk.identity_for(7), "the partition it was built over");
+        assert!(!blk.identity_for(8), "a partition a rewrite made of it");
+        blk.identity = false;
+        assert!(!blk.identity_for(7), "no claim, cleared by an insert");
+    }
+
+    /// The checked profile's comparison of a copy converted from a form
+    /// with the one built from the sources holds the claim to the
+    /// partition: a converted copy that claims the records of another
+    /// partition than the build's does not agree with it, though both
+    /// claim some.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_copy_agrees_with_a_build_only_where_it_claims_the_builds_partition() {
+        let built = CachedBlock {
+            identity: true,
+            identity_of: 7,
+            ..CachedBlock::default()
+        };
+        let of = |identity, identity_of| CachedBlock {
+            identity,
+            identity_of,
+            ..CachedBlock::default()
+        };
+        assert!(of(true, 7).agrees(&built), "the same partition's records");
+        assert!(!of(true, 8).agrees(&built), "another partition's records");
+        assert!(
+            !of(false, 7).agrees(&built),
+            "no claim where the build has one"
+        );
+        assert!(
+            of(true, 8).agrees(&of(false, 7)),
+            "the build claims nothing"
+        );
+    }
+}
+
 /// The copy a settle's patch of the key at `cut` looks at by its rank, and
 /// the entry: block `b`'s form where it is a copy that claims some
-/// partition's records (`CachedBlock::identity`) and the cut is the key's
-/// own record's, as `Reader::splice_run` decides it -- the entry it writes
-/// or, under a claim of another partition, the one it compares first.
-/// `None` for every other form and cut, which a patch searches the form
-/// for. For the hints ahead of the patch alone.
+/// partition's records, of the partition the table stands over
+/// (`CachedBlock::identity_for`), and the cut is the key's own record's:
+/// the entry the patch writes. `None` for every other form and cut, a
+/// claim of the partition before a rewrite among them, where the patch
+/// compares the entry its rank names before it takes it or searches the
+/// form (`Reader::splice_run`). For the hints ahead of the patch alone.
 fn copy_entry_at(table: &BlockTable, b: u32, cut: u32) -> Option<(&CachedBlock, usize)> {
     if cut == LAZY_CUT || cut & 1 == 0 {
         return None;
@@ -20153,7 +20390,7 @@ fn copy_entry_at(table: &BlockTable, b: u32, cut: u32) -> Option<(&CachedBlock, 
         return None;
     };
     let j = ((cut >> 1) as usize).checked_sub(b as usize * CACHE_BLOCK)?;
-    (blk.identity != 0 && j < blk.ents.len()).then_some((blk, j))
+    (blk.identity_for(table.blob) && j < blk.ents.len()).then_some((blk, j))
 }
 
 /// The lines a walk of `form` over the partition's ranks `from` to `n`
@@ -20243,7 +20480,7 @@ fn prefetch_block(
         // updates alone leaves where they were; a copy the walk will
         // search, whole.
         Cached::Block(blk) => match at {
-            Some(i) if blk.identity != 0 => blk.prefetch_from(i),
+            Some(i) if blk.identity => blk.prefetch_from(i),
             _ => blk.prefetch(whole),
         },
         Cached::Sparse(sb) => {
@@ -20857,10 +21094,26 @@ impl BlockTable {
 /// boundary key, reading each boundary key of the partition once. An open
 /// fence is the source's start or end, never a compare against an empty
 /// slice.
+///
+/// With `by_heads` (`Options::bounds_by_heads`) a boundary whose head is
+/// not the whole of its key is placed by the head where the head is
+/// enough: the head brackets the key between two byte strings
+/// (`OrdIndex::head_bracket`), every position below the lower is below the
+/// key and every position at or above the upper is above it, and where
+/// the source holds no key between the two the bound is the one position
+/// both name, with no record read. Only where a key of the source falls
+/// inside the bracket -- the boundary's own key written again, or a key
+/// that shares its head -- is the record read, and the walk goes on from
+/// the lower position. The store's counters take the boundaries placed
+/// by the head and the boundary records read, whichever way the walk
+/// goes: with the option off every boundary whose head is not its key is
+/// a record, and with it on only the ties are, so two walks of one store
+/// read `records` against `placed + records`.
 fn block_bounds_of(
     seg: &Seg,
     nblocks: usize,
     len: usize,
+    (by_heads, counts): (bool, &AskCounts),
     seek: impl Fn(&[u8]) -> usize,
     advance: impl Fn(usize, &[u8]) -> usize,
     key_at: impl Fn(usize, &mut Vec<u8>) -> bool,
@@ -20869,6 +21122,8 @@ fn block_bounds_of(
     let mut i = if seg.lo.is_empty() { 0 } else { seek(&seg.lo) };
     at.push(i as u32);
     let mut kbuf = Vec::new();
+    let mut above = Vec::new();
+    let (mut placed, mut records) = (0u64, 0u64);
     for b in 1..nblocks {
         // Past the source's end no bound moves, and the boundary key is
         // read only to move one: reading it anyway was a cold line per
@@ -20884,12 +21139,45 @@ fn block_bounds_of(
             // the caller's `key_at`, the form file's or the raw form's:
             // the record is a cold line per block for every source the
             // table maps, the top level is in memory.
-            if seg.ord.whole_key_at(rank, &mut kbuf).is_none() && !key_at(rank, &mut kbuf) {
-                return Err(err("block cache: a rank did not resolve"));
+            if seg.ord.whole_key_at(rank, &mut kbuf).is_some() {
+                i = advance(i, &kbuf).min(len);
+            } else if by_heads && seg.ord.head_bracket(rank, &mut kbuf, &mut above) {
+                // Below `lo`, below the key; from `hi` on, above it.
+                let lo = advance(i, &kbuf).min(len);
+                let hi = if lo < len {
+                    advance(lo, &above).min(len)
+                } else {
+                    lo
+                };
+                if lo == hi {
+                    placed += 1;
+                    i = lo;
+                } else {
+                    records += 1;
+                    if !key_at(rank, &mut kbuf) {
+                        return Err(err("block cache: a rank did not resolve"));
+                    }
+                    i = advance(lo, &kbuf).min(len);
+                }
+            } else {
+                records += 1;
+                if !key_at(rank, &mut kbuf) {
+                    return Err(err("block cache: a rank did not resolve"));
+                }
+                i = advance(i, &kbuf).min(len);
             }
-            i = advance(i, &kbuf).min(len);
         }
         at.push(i as u32);
+    }
+    if placed > 0 {
+        counts
+            .bounds_by_head
+            .fetch_add(placed, AtomicOrdering::Relaxed);
+    }
+    if records > 0 {
+        counts
+            .bounds_records
+            .fetch_add(records, AtomicOrdering::Relaxed);
     }
     let end = match &seg.hi {
         Some(h) => seek(h).max(i),
@@ -21652,6 +21940,17 @@ struct Shared {
     /// Handles the caller made and still holds: who the forms are
     /// published for.
     live_handles: AtomicUsize,
+    /// Whether the writer keeps no block forms just now
+    /// (`Options::scan_forms_off_unreused`), mirrored where the segment
+    /// work can read it: with no handle live, nothing makes a table, and
+    /// a landing leaves its pieces' bounds (`Options::land_bounds_read`).
+    writer_forms_off: std::sync::atomic::AtomicBool,
+    /// Whether the writer's last commit came after no read at all since
+    /// the commit before, no read having come since: what lets a third
+    /// merge start (`Options::merge_parallel_quiet`). Set by the writer's
+    /// commit and cleared by the first read through the writer or a
+    /// handle (`Reader::note_read`).
+    write_quiet: std::sync::atomic::AtomicBool,
     /// Blocks materialised, by a handle the caller made and by the
     /// engine's own. These were added to size what sharing the block
     /// tables between handles would be worth, the last structure thought
@@ -22763,7 +23062,7 @@ pub struct Reader {
     signalled: std::cell::Cell<(u64, usize)>,
     /// Under `Options::seal_idle`, the commits this handle last said a
     /// scan and a point read at, and the writer's own counts of each.
-    mode_note: std::cell::Cell<ModeNote>,
+    mode_note: ModeNote,
     /// How far into the write log this handle may look: the log's length
     /// at the commit whose watermark it reads under, taken before the
     /// watermark so it never runs ahead of it, or unbounded under `Dirty`
@@ -24030,25 +24329,31 @@ const NO_RUN: u32 = u32::MAX;
 
 /// What a handle last said of its reads for the read mode
 /// (`Reader::note_read`): the commits it last said a scan and a point
-/// read at, and the writer's own counts, which it says to no one.
-#[derive(Clone, Copy)]
+/// read at, and the writer's own counts, which it says to no one. A cell
+/// a field: every read of the writer's counts one of them and looks at
+/// `quiet_out`, and a note held whole in one cell was copied in and out
+/// whole at each, a load and a store a word of it.
 struct ModeNote {
-    scan_at: (u64, usize),
-    point_at: (u64, usize),
-    scans: u64,
-    points: u64,
+    scan_at: std::cell::Cell<(u64, usize)>,
+    point_at: std::cell::Cell<(u64, usize)>,
+    scans: std::cell::Cell<u64>,
+    points: std::cell::Cell<u64>,
     /// The writer's: its last commit came after no read at all.
-    quiet: bool,
+    quiet: std::cell::Cell<bool>,
+    /// The writer's: whether it has published the stretch as quiet and no
+    /// read of its own has cleared it since (`Shared::write_quiet`).
+    quiet_out: std::cell::Cell<bool>,
 }
 
 impl Default for ModeNote {
     fn default() -> ModeNote {
         ModeNote {
-            scan_at: (0, usize::MAX),
-            point_at: (0, usize::MAX),
-            scans: 0,
-            points: 0,
-            quiet: false,
+            scan_at: std::cell::Cell::new((0, usize::MAX)),
+            point_at: std::cell::Cell::new((0, usize::MAX)),
+            scans: std::cell::Cell::new(0),
+            points: std::cell::Cell::new(0),
+            quiet: std::cell::Cell::new(false),
+            quiet_out: std::cell::Cell::new(false),
         }
     }
 }
@@ -26678,29 +26983,39 @@ impl Reader {
     /// more than once a commit.
     #[inline]
     fn note_read(&self, scan: bool) {
-        if !self.opts.seal_idle {
+        if !(self.opts.seal_idle || self.opts.merge_parallel_quiet > 0) {
             return;
         }
-        let mut m = self.mode_note.get();
+        let m = &self.mode_note;
         if self.slot.is_none() {
-            if scan {
-                m.scans += 1;
-            } else {
-                m.points += 1;
+            let n = if scan { &m.scans } else { &m.points };
+            n.set(n.get() + 1);
+            // The first read since a quiet commit ends the write-only
+            // stretch for the segment work (`Shared::write_quiet`), once.
+            if m.quiet_out.get() {
+                m.quiet_out.set(false);
+                self.shared
+                    .write_quiet
+                    .store(false, AtomicOrdering::Release);
             }
-            self.mode_note.set(m);
             return;
         }
         let now = (self.state().gen, self.mem().committed_log());
         let (at, shared) = if scan {
-            (&mut m.scan_at, &self.shared.mode_scans)
+            (&m.scan_at, &self.shared.mode_scans)
         } else {
-            (&mut m.point_at, &self.shared.mode_points)
+            (&m.point_at, &self.shared.mode_points)
         };
-        if *at != now {
-            *at = now;
-            self.mode_note.set(m);
+        if at.get() != now {
+            at.set(now);
             shared.fetch_add(1, AtomicOrdering::Relaxed);
+            // A handle's read ends the write-only stretch too, said once a
+            // commit as its count is.
+            if self.opts.merge_parallel_quiet > 0 {
+                self.shared
+                    .write_quiet
+                    .store(false, AtomicOrdering::Release);
+            }
         }
     }
 
@@ -26955,6 +27270,26 @@ impl Reader {
         (b < seg.blocks()).then(|| self.block_bounds(seg, b))
     }
 
+    /// A test's: the bounds every level-0 piece holds against every
+    /// partition (`block_bounds_of`), as the partition's place among the
+    /// partitions, the piece's among the pieces, and the bounds; nothing
+    /// for a pair no walk has been made for.
+    #[doc(hidden)]
+    pub fn piece_bounds(&self) -> Vec<(usize, usize, Vec<u32>)> {
+        let _entered = self.enter();
+        let segs = self.segs();
+        let np = segs.partition_point(|s| s.level > 0);
+        let mut out = Vec::new();
+        for (pi, seg) in segs[..np].iter().enumerate() {
+            for (j, p) in segs[np..].iter().enumerate() {
+                if let Some(at) = p.bounds.get(seg.blob.id()) {
+                    out.push((pi, j, at.to_vec()));
+                }
+            }
+        }
+        out
+    }
+
     pub fn zpage_counts(&self) -> ZCounts {
         let _entered = self.enter();
         let rd = &self.shared.readers;
@@ -26966,6 +27301,7 @@ impl Reader {
             stride_reads: rd.stat(|s| &s.zstride.reads),
             stride_page_checks: rd.stat(|s| &s.zstride.checks),
             stride_cursor_reads: rd.stat(|s| &s.zstride.cursor),
+            stride_direct_steps: rd.stat(|s| &s.zstride.direct),
             decodes: rd.stat(|s| &s.zdecodes),
             inplace_groups: rd.stat(|s| &s.zinplace),
             rawserves: rd.stat(|s| &s.zraw),
@@ -26983,6 +27319,10 @@ impl Reader {
             dir_asks: get(&self.shared.asks.dir_submitted),
             bounds_head_asks: get(&self.shared.asks.bounds_heads),
             bounds_head_submitted: get(&self.shared.asks.bounds_submitted),
+            bounds_by_head: get(&self.shared.asks.bounds_by_head),
+            bounds_records: get(&self.shared.asks.bounds_records),
+            land_bound_walks: get(&self.shared.asks.land_bounds),
+            land_bounds_left: get(&self.shared.asks.land_bounds_left),
             nopage_reads: rd.stat(|s| &s.znopage),
             scans: rd.stat(|s| &s.zscanz),
             scan_groups: rd.stat(|s| &s.zscangroups),
@@ -27002,6 +27342,7 @@ impl Reader {
             prefetches: rd.stat(|s| &s.zprefetches),
             scan_views: rd.stat(|s| &s.zviews),
             group_aheads: rd.stat(|s| &s.zaheads),
+            cursor_steps: rd.stat(|s| &s.zsteps),
             builds: get(&ev.builds),
             build_pages: get(&ev.build_pages),
             build_bytes: get(&ev.build_bytes),
@@ -27102,6 +27443,8 @@ impl Reader {
             stride_converts_back: get(&ev.stride_converts_back),
             stride_convert_looks: get(&ev.stride_convert_looks),
             stride_convert_rent_us: get(&ev.stride_convert_rent_us),
+            stride_convert_held: get(&ev.stride_convert_held),
+            stride_convert_fill: get(&ev.stride_convert_fill),
             builds_raw_tails: get(&ev.builds_raw_tails),
             recodes: get(&ev.recodes),
             recodes_back: get(&ev.recodes_back),
@@ -28030,6 +28373,12 @@ impl Reader {
         (lo, hi)
     }
 
+    /// Whether a bounds walk places boundaries by their heads
+    /// (`Options::bounds_by_heads`), and the store's counters for it.
+    fn bounds_by_heads(&self) -> (bool, &AskCounts) {
+        (self.opts.bounds_by_heads, &self.shared.asks)
+    }
+
     fn cache_key_at(&self, seg: &Seg, rank: usize, out: &mut Vec<u8>) -> bool {
         // A block's first rank is in the ordered index's top level, in
         // memory, where the heads are whole keys: no page read, where the
@@ -28122,6 +28471,7 @@ impl Reader {
         self.zbump_by(|s| &s.zprefetches, c.prefetches);
         self.zbump_by(|s| &s.zviews, c.views);
         self.zbump_by(|s| &s.zaheads, c.aheads);
+        self.zbump_by(|s| &s.zsteps, c.steps);
     }
 
     /// `scan_merged` leaves the partition: a served walk with the groups
@@ -28145,6 +28495,7 @@ impl Reader {
                 self.zbump_by(|s| &s.zprefetches, c.prefetches);
                 self.zbump_by(|s| &s.zviews, c.views);
                 self.zbump_by(|s| &s.zaheads, c.aheads);
+                self.zbump_by(|s| &s.zsteps, c.steps);
                 if c.fell_back() {
                     self.zbump(|s| &s.zfallbacks);
                     self.zbump(|s| &s.zscans);
@@ -30691,6 +31042,9 @@ impl Reader {
         self.fs().forms_off.set(true);
         self.forms_off_now.set(true);
         self.shared
+            .writer_forms_off
+            .store(true, AtomicOrdering::Release);
+        self.shared
             .forms_off_entries
             .fetch_add(1, AtomicOrdering::Relaxed);
         self.forms_off_trace("off");
@@ -30714,6 +31068,9 @@ impl Reader {
         self.forms_drop_all();
         self.fs().forms_off.set(false);
         self.forms_off_now.set(false);
+        self.shared
+            .writer_forms_off
+            .store(false, AtomicOrdering::Release);
         self.shared
             .forms_off_exits
             .fetch_add(1, AtomicOrdering::Relaxed);
@@ -31687,7 +32044,7 @@ impl Reader {
             self.settle_refuse(consume, 1);
             return Some(false);
         }
-        let quiet = self.opts.seal_idle && self.mode_note.get().quiet && far;
+        let quiet = self.opts.seal_idle && self.mode_note.quiet.get() && far;
         // A burst's batch on the upkeep thread is filed at once
         // (`Options::upkeep_files_bursts`): the bound below is for a mix's
         // small commits and for a commit that files on its own path.
@@ -33223,8 +33580,7 @@ impl Reader {
             if let Some((at2, b2, exact)) = ahead.take() {
                 if at2 == at as u32 {
                     if let Some(form) = table.slots.get(b2 as usize).and_then(|s| s.as_deref()) {
-                        let by_cut =
-                            exact && matches!(form, Cached::Block(blk) if blk.identity != 0);
+                        let by_cut = exact && matches!(form, Cached::Block(blk) if blk.identity);
                         if !by_cut {
                             prefetch_form(form, self.opts.copy_prefetch_whole);
                         }
@@ -33529,11 +33885,11 @@ impl Reader {
                 // search is for where it does not.
                 let lo = b * CACHE_BLOCK;
                 let at_rank = self.opts.copy_start_at_rank
-                    && blk.identity != 0
+                    && blk.identity
                     && same
                     && c >= lo
                     && c - lo < blk.ents.len()
-                    && (blk.identity == table.blob || key_eq(blk.key(&blk.ents[c - lo]), key));
+                    && (blk.identity_of == table.blob || key_eq(blk.key(&blk.ents[c - lo]), key));
                 let (i, found) = if at_rank {
                     debug_assert!(
                         key_cmp(blk.key(&blk.ents[c - lo]), key) == Ordering::Equal,
@@ -33583,7 +33939,7 @@ impl Reader {
                     blk.keys.extend_from_slice(key);
                     blk.ents
                         .insert(i, [key_at, key.len() as u32, at_run, run.len() as u32]);
-                    blk.identity = 0;
+                    blk.identity = false;
                 }
                 // Bloated only past twice the floor: below that the sum
                 // over the entries, a load an entry a write, cannot say so.
@@ -34697,7 +35053,7 @@ impl Reader {
                         // above record `start - 1` and not above `start`,
                         // so no entry between them is skipped.
                         let at_rank = self.opts.copy_start_at_rank
-                            && blk.identity == seg.blob.id()
+                            && blk.identity_for(src.seg.blob.id())
                             && rank != usize::MAX;
                         let i = if !first {
                             0
@@ -35073,6 +35429,26 @@ impl Reader {
             }
         }
         (clean, sparse, copies, wide)
+    }
+
+    /// A test's: the writer's copies that claim their entries are their
+    /// partition's records, and of those the ones whose claim is of the
+    /// partition their table now stands over (`CachedBlock::identity_for`).
+    #[doc(hidden)]
+    pub fn block_cache_identity(&self) -> (usize, usize) {
+        let _e = self.enter();
+        let (mut claimed, mut holds) = (0usize, 0usize);
+        for t in self.fs().tables.borrow().iter() {
+            for t in t.borrow().iter() {
+                for c in t.slots.iter().flatten() {
+                    if let Cached::Block(b) = &**c {
+                        claimed += b.identity as usize;
+                        holds += b.identity_for(t.blob) as usize;
+                    }
+                }
+            }
+        }
+        (claimed, holds)
     }
 
     /// PROTOTYPE: the copies' layout, for a measurement: bytes of their
@@ -36754,18 +37130,28 @@ impl Db {
     /// Whether the commit is in a write-only stretch, counted at its look
     /// (`Db::read_mode`).
     fn note_read_mode(&mut self) {
-        if !self.opts.seal_idle {
+        if !(self.opts.seal_idle || self.opts.merge_parallel_quiet > 0) {
             return;
         }
-        let own = self.mode_note.get();
-        let scans = self.shared.mode_scans.load(AtomicOrdering::Relaxed) + own.scans;
-        let points = self.shared.mode_points.load(AtomicOrdering::Relaxed) + own.points;
+        let own = &self.mode_note;
+        let scans = self.shared.mode_scans.load(AtomicOrdering::Relaxed) + own.scans.get();
+        let points = self.shared.mode_points.load(AtomicOrdering::Relaxed) + own.points.get();
         let (s0, p0, _) = self.read_mode;
         let quiet = scans == s0 && points == p0;
         self.read_mode = (scans, points, quiet);
-        let mut note = self.mode_note.get();
-        note.quiet = quiet;
-        self.mode_note.set(note);
+        let note = &self.mode_note;
+        note.quiet.set(quiet);
+        // Published for the segment work's room (`Shared::write_quiet`),
+        // on a change of the flag itself: a handle's read clears it behind
+        // the writer's back, and the next quiet commit sets it again.
+        if self.opts.merge_parallel_quiet > 0 {
+            note.quiet_out.set(quiet);
+            if self.shared.write_quiet.load(AtomicOrdering::Relaxed) != quiet {
+                self.shared
+                    .write_quiet
+                    .store(quiet, AtomicOrdering::Release);
+            }
+        }
     }
 
     /// The new live WAL for a rotation: a recycled retiree when the pool
@@ -37147,6 +37533,8 @@ impl Db {
             mode_scans: AtomicU64::new(0),
             mode_points: AtomicU64::new(0),
             live_handles: AtomicUsize::new(0),
+            writer_forms_off: std::sync::atomic::AtomicBool::new(false),
+            write_quiet: std::sync::atomic::AtomicBool::new(false),
             blk_reader: AtomicU64::new(0),
             blk_engine: AtomicU64::new(0),
             blk_upkeep: AtomicU64::new(0),
@@ -37261,7 +37649,7 @@ impl Db {
             opts,
             fs: FormsCell::new(),
             signalled: std::cell::Cell::new((0, usize::MAX)),
-            mode_note: std::cell::Cell::new(ModeNote::default()),
+            mode_note: ModeNote::default(),
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
@@ -38411,6 +38799,8 @@ impl Db {
             mode_scans: AtomicU64::new(0),
             mode_points: AtomicU64::new(0),
             live_handles: AtomicUsize::new(0),
+            writer_forms_off: std::sync::atomic::AtomicBool::new(false),
+            write_quiet: std::sync::atomic::AtomicBool::new(false),
             blk_reader: AtomicU64::new(0),
             blk_engine: AtomicU64::new(0),
             blk_upkeep: AtomicU64::new(0),
@@ -38525,7 +38915,7 @@ impl Db {
             opts,
             fs: FormsCell::with_tables(Db::tables_for(ntables)),
             signalled: std::cell::Cell::new((0, usize::MAX)),
-            mode_note: std::cell::Cell::new(ModeNote::default()),
+            mode_note: ModeNote::default(),
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
@@ -42198,7 +42588,7 @@ impl Reader {
             opts: self.opts.clone(),
             fs: FormsCell::new(),
             signalled: std::cell::Cell::new((0, usize::MAX)),
-            mode_note: std::cell::Cell::new(ModeNote::default()),
+            mode_note: ModeNote::default(),
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
@@ -42240,7 +42630,7 @@ impl Reader {
                 opts: self.opts.clone(),
                 fs: FormsCell::new(),
                 signalled: std::cell::Cell::new((0, usize::MAX)),
-                mode_note: std::cell::Cell::new(ModeNote::default()),
+                mode_note: ModeNote::default(),
                 log_bound: std::cell::Cell::new(usize::MAX),
                 len_bound: std::cell::Cell::new(usize::MAX),
                 force_due: std::cell::Cell::new(false),
@@ -42291,7 +42681,7 @@ impl Reader {
             opts: self.opts.clone(),
             fs: FormsCell::new(),
             signalled: std::cell::Cell::new((0, usize::MAX)),
-            mode_note: std::cell::Cell::new(ModeNote::default()),
+            mode_note: ModeNote::default(),
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
@@ -46098,7 +46488,7 @@ impl Reader {
             wm: std::cell::Cell::new(SEE_ALL),
             opts: self.opts.clone(),
             signalled: std::cell::Cell::new((0, usize::MAX)),
-            mode_note: std::cell::Cell::new(ModeNote::default()),
+            mode_note: ModeNote::default(),
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
@@ -47471,6 +47861,18 @@ struct AskCounts {
     /// table's making, and those submitted (`Options::bounds_heads_willneed`).
     bounds_heads: AtomicU64,
     bounds_submitted: AtomicU64,
+    /// Block boundaries a bounds walk placed by the boundary's head with
+    /// no record read (`Options::bounds_by_heads`), and the boundary
+    /// records the walks read: every boundary whose head is not its key
+    /// with the option off, and under it those a key of the source fell
+    /// inside the head's bracket of.
+    bounds_by_head: AtomicU64,
+    bounds_records: AtomicU64,
+    /// Bounds walks a landing made before its publish, a piece against a
+    /// partition each, and those it left to a reader because no table
+    /// stood to read them (`Options::land_bounds_read`).
+    land_bounds: AtomicU64,
+    land_bounds_left: AtomicU64,
 }
 
 /// The most heads a bounds walk asks for at once
@@ -47513,8 +47915,14 @@ fn ask_bounds_heads(shared: &Shared, seg: &Seg, p: &Seg) {
 /// whose range it meets, where the piece has none against that partition
 /// yet: the same walk `BuildCtx::table_bounds` makes when a table is made,
 /// and the same cache. With `ask`, out of core, each walk's heads are
-/// asked for first (`ask_bounds_heads`).
-fn bound_pieces_of(segs: &[std::sync::Arc<Seg>], ask: Option<&Shared>) -> Result<()> {
+/// asked for first (`ask_bounds_heads`); `by_heads` is the walk's
+/// (`block_bounds_of`), and `walks` counts the walks made.
+fn bound_pieces_of(
+    segs: &[std::sync::Arc<Seg>],
+    ask: Option<&Shared>,
+    by_heads: (bool, &AskCounts),
+    walks: &AtomicU64,
+) -> Result<()> {
     for seg in segs.iter().filter(|s| s.level > 0) {
         let nblocks = seg.blocks();
         let against = seg.blob.id();
@@ -47539,10 +47947,12 @@ fn bound_pieces_of(segs: &[std::sync::Arc<Seg>], ask: Option<&Shared>) -> Result
             if let Some(shared) = ask {
                 ask_bounds_heads(shared, seg, p);
             }
+            walks.fetch_add(1, AtomicOrdering::Relaxed);
             let at = block_bounds_of(
                 seg,
                 nblocks,
                 p.blob.keys(),
+                by_heads,
                 |k| p.ord.seek(p.cursor_from(k), |i| p.raw().key_at(i)),
                 |i, bound| p.ord.advance_below(i, bound, |r| p.raw().key_at(r)),
                 |r, out| raw_key_into(seg, r, out),
@@ -47652,6 +48062,7 @@ impl<'s> BuildCtx<'s> {
                         seg,
                         nblocks,
                         p.blob.keys(),
+                        self.rd.bounds_by_heads(),
                         |k| p.ord.seek(p.cursor_from(k), |i| p.raw().key_at(i)),
                         |i, bound| p.ord.advance_below(i, bound, |r| p.raw().key_at(r)),
                         |r, out| self.rd.cache_key_at(seg, r, out),
@@ -47802,6 +48213,7 @@ impl<'s> BuildCtx<'s> {
             seg,
             nblocks,
             unsealed.len(),
+            rd.bounds_by_heads(),
             |k| unsealed.seek(k),
             |i, bound| unsealed.advance_below(i, bound),
             |r, out| rd.cache_key_at(seg, r, out),
@@ -49419,7 +49831,8 @@ impl<'s> BuildCtx<'s> {
             keys: Vec::with_capacity(n * 16),
             vals: Vec::with_capacity(n * 128),
             ents: Vec::with_capacity(n),
-            identity: 0,
+            identity: false,
+            identity_of: src.seg.blob.id(),
             wide: false,
             dead: 0,
         });
@@ -49456,11 +49869,7 @@ impl<'s> BuildCtx<'s> {
         // off) also left a copy searched where a cut had to be searched for.
         let updates = all_same
             && (self.rd.opts.zpages_block_cursor || ov.over.iter().all(|o| o.cut != u32::MAX));
-        blk.identity = if updates && blk.ents.len() == hi - lo {
-            src.seg.blob.id()
-        } else {
-            0
-        };
+        blk.identity = updates && blk.ents.len() == hi - lo;
         if self.fit {
             blk.fit();
         }
@@ -49492,7 +49901,8 @@ impl<'s> BuildCtx<'s> {
             keys: Vec::with_capacity(sb.keys.len() + kept * 16),
             vals: Vec::with_capacity(sb.vals.len() + kept * 128),
             ents: Vec::with_capacity(sb.ents.len() + kept),
-            identity: 0,
+            identity: false,
+            identity_of: seg.blob.id(),
             wide: false,
             dead: 0,
         };
@@ -49556,11 +49966,7 @@ impl<'s> BuildCtx<'s> {
         }
         // Every delta an update of a record, and a key emitted per record:
         // `copy_block`'s rule, which the form's cuts answer exactly.
-        blk.identity = if updates && blk.ents.len() == hi - lo {
-            src.seg.blob.id()
-        } else {
-            0
-        };
+        blk.identity = updates && blk.ents.len() == hi - lo;
         if self.fit {
             blk.fit();
         }
@@ -51878,10 +52284,24 @@ impl Maint {
             if self.opts.piece_ranks_whole {
                 rank_pieces_of(segs, self.opts.piece_ranks_by_heads)?;
             }
+            // Only where a table stands to read them
+            // (`Options::land_bounds_read`): the writer with its forms
+            // given up makes none, and a handle that comes walks its own.
+            if self.opts.land_bounds_read
+                && self.shared.writer_forms_off.load(AtomicOrdering::Acquire)
+                && self.shared.live_handles.load(AtomicOrdering::Relaxed) == 0
+            {
+                self.shared
+                    .asks
+                    .land_bounds_left
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                return Ok(());
+            }
             let ask = (self.opts.bounds_heads_willneed
                 && out_of_core(&self.opts, self.shared.zgate.load()))
             .then_some(&*self.shared);
-            bound_pieces_of(segs, ask)?;
+            let by_heads = (self.opts.bounds_by_heads, &self.shared.asks);
+            bound_pieces_of(segs, ask, by_heads, &self.shared.asks.land_bounds)?;
         }
         Ok(())
     }
@@ -52011,7 +52431,7 @@ impl Maint {
         // promotion the plan makes publishes a manifest that would name
         // the seal's segments before they are durable; the count is left
         // as it was, so the next turn of the loop looks again.
-        if self.compacting.len() >= self.opts.merge_parallel.max(1)
+        if self.compacting.len() >= self.merges_room()
             || self.tiering.is_some()
             || self.seal_between_phases()
         {
@@ -52565,7 +52985,7 @@ impl Maint {
                 // they hold are not due again: the next merge takes the
                 // next capped run of the rest. At one, a merge in flight
                 // defers the start whatever is due, as it always has.
-                let due = if self.opts.merge_parallel > 1 && !self.compacting.is_empty() {
+                let due = if self.merges_room() > 1 && !self.compacting.is_empty() {
                     let held: Vec<Fence> = self
                         .compacting
                         .iter()
@@ -52599,6 +53019,23 @@ impl Maint {
         }
     }
 
+    /// The most partition merges that may be in flight now:
+    /// `Options::merge_parallel`, or `merge_parallel_quiet` where it is
+    /// more, the writer's last commit saw no read since the one before, no
+    /// read having come since (`Shared::write_quiet`), and the compact form
+    /// is installed (`Options::merge_quiet_any_gate` for any gate).
+    fn merges_room(&self) -> usize {
+        let base = self.opts.merge_parallel.max(1);
+        if self.opts.merge_parallel_quiet > base
+            && self.shared.write_quiet.load(AtomicOrdering::Acquire)
+            && (self.opts.merge_quiet_any_gate || self.shared.zgate.load() == zselect::GATE_Z)
+        {
+            self.opts.merge_parallel_quiet
+        } else {
+            base
+        }
+    }
+
     /// The landing's chain and the idle plan: merges planned at `trigger`
     /// until as many run as may (`Options::merge_parallel`) or a plan
     /// starts none, then a piece merge.
@@ -52607,7 +53044,7 @@ impl Maint {
             let before = self.compacting.len();
             self.maybe_compact_at(trigger)?;
             let after = self.compacting.len();
-            if after <= before || after >= self.opts.merge_parallel.max(1) {
+            if after <= before || after >= self.merges_room() {
                 break;
             }
         }
@@ -54246,6 +54683,28 @@ impl Maint {
             .iter()
             .filter_map(|r| Some((r.seg.name.clone(), *self.z_conv_rent.get(&r.seg.name)?)))
             .collect();
+        // The forms' bytes as the partitions stand, a conversion in flight
+        // counted in the form it is going to: what a move in at no rent is
+        // held to, below. A look starts one move, and the look after it
+        // counts that one here, so each is held to the forms as they are.
+        let held: u64 = parts
+            .iter()
+            .map(|p| {
+                if p.stride {
+                    p.stride_bytes
+                } else {
+                    p.block_bytes
+                }
+            })
+            .sum();
+        self.shared
+            .z
+            .stride_convert_held
+            .store(held, AtomicOrdering::Relaxed);
+        self.shared
+            .z
+            .stride_convert_fill
+            .store(fill, AtomicOrdering::Relaxed);
         // The move whose rent has most outgrown its price, with both, and
         // how many are due.
         let mut due: Option<(usize, f64, f64)> = None;
@@ -54276,10 +54735,27 @@ impl Maint {
             };
             // A move in that a build left for this look is that build's own
             // ask, made now that the store is read and its size is the
-            // store's: it pays no rent, as the build would have paid none.
-            // What holds it is what holds any move in, that the model says
-            // the store with it in the form still fits the fill.
-            let price = if to_stride && rows[i].deferred {
+            // store's: it pays no rent, as the build would have paid none,
+            // where the forms with it made still fit the fill whole -- the
+            // room's question, which is one of sizes and which the model
+            // answers with no fault. Past that the model may still say a move in pays, by
+            // the touches: some partitions read and the rest left to fault.
+            // That is a verdict on the reads, and the rent is what holds it
+            // to them: at ten million random ids under 1 GiB the block form
+            // stood over the fill, the first looks of the read pass priced
+            // five and six partitions in on touches a second old and uneven
+            // by the sample, at no rent, and every one was moved back
+            // through the passes after, a build each way; under 1.25 GiB a
+            // partition the hot-raw policy had sent back to its form a look
+            // before was moved in inside E for a tenth of a millisecond a
+            // second, and E read 0.8x in six pairs of six.
+            let free = to_stride
+                && rows[i].deferred
+                && held
+                    .saturating_add(parts[i].stride_bytes)
+                    .saturating_sub(parts[i].block_bytes)
+                    <= fill;
+            let price = if free {
                 0.0
             } else {
                 inject
@@ -57024,7 +57500,8 @@ impl Maint {
     /// counted.
     fn z_sparse_now(&self) -> (bool, bool) {
         let on = self.opts.zpages_stride_sparse;
-        let read = self.z_pick_raw_ok() || self.z_form_read;
+        let read =
+            !self.opts.zpages_stride_sparse_waits || self.z_pick_raw_ok() || self.z_form_read;
         (on && read, on && !read)
     }
 
@@ -58865,7 +59342,7 @@ impl Maint {
             // the first partitioning. Deferring rather than blocking keeps
             // it off the commit path; the range it would have merged waits
             // for the next plan.
-            let room = self.opts.merge_parallel.max(1);
+            let room = self.merges_room();
             if !self.compacting.is_empty() && (fences.is_none() || self.compacting.len() >= room) {
                 return Ok(());
             }
@@ -59065,6 +59542,9 @@ impl Maint {
         });
         if !self.compacting.is_empty() {
             SealCounts::add(&self.shared.seal_counts.merges_beside, 1);
+        }
+        if self.compacting.len() >= self.opts.merge_parallel.max(1) {
+            SealCounts::add(&self.shared.seal_counts.merges_quiet, 1);
         }
         self.compacting.push(Merging {
             inputs,

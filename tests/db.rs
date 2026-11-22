@@ -7315,6 +7315,53 @@ fn a_dense_form_converts_from_its_own_deltas() {
     );
 }
 
+/// A sparse form of updates alone, converted to a copy from its deltas,
+/// is a copy whose entries are its partition's records, and of that
+/// partition (`CachedBlock::identity_for`): a patch after it writes by the
+/// key's rank and a walk starts there.
+#[test]
+fn a_copy_converted_from_updates_alone_is_its_partitions_records() {
+    let d = dir("convert-identity");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(64 << 10),
+        scan_block_cache: true,
+        upkeep: supdb::Upkeep::Inline,
+        ..common::options()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1200 {
+        m.append(&mut db, &key(k), &format!("p{k}"));
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    assert_eq!(db.levels(), (1, 0), "one partition of several blocks");
+    m.check(&db, "clean");
+    let before = db.forms_events()[13];
+    // A part of every block a round, all of them updates of a record: the
+    // first fill leaves sparse forms and the next finds them dense.
+    for off in 0..5u32 {
+        for k in (off..1200).step_by(5) {
+            m.delete(&mut db, &key(k));
+            m.append(&mut db, &key(k), &format!("u{k}"));
+        }
+        db.commit().unwrap();
+        m.check(&db, &format!("round {off}"));
+    }
+    assert!(
+        db.forms_events()[13] > before,
+        "dense forms were converted from their own deltas"
+    );
+    let (claimed, holds) = db.block_cache_identity();
+    assert!(
+        claimed >= 1 && holds == claimed,
+        "the converted copies are their partition's records: {claimed} claimed, {holds} of it"
+    );
+}
+
 /// A light sparse form -- under the dense count, at least
 /// `Options::forms_convert_from` deltas -- is converted to a copy by a fill
 /// on the upkeep thread, where the write mixes' few deltas a block are filed,
@@ -19089,6 +19136,75 @@ fn the_directory_hint_writes_the_segment_and_the_ordered_index_the_default_does(
     }
 }
 
+/// Under the idle seals (`seal_idle`) a commit in a stretch nobody reads
+/// files no backlog into the forms, even under the arm that files far from
+/// a scan (`forms_settle_far`): the writer's commit says whether a read
+/// came before it (`Db::note_read_mode`, the note's `quiet`), and a quiet
+/// one leaves the backlog for the first scan. With a point read before
+/// every commit the same writes file as the arm files them. The segment
+/// work is inline, so no idle seal runs and the forms the backlog builds
+/// are the count's alone.
+#[test]
+fn a_quiet_stretch_under_the_idle_seals_files_no_backlog() {
+    let mut built_by = Vec::new();
+    for reads in [false, true] {
+        let d = dir(&format!("forms-quiet-{reads}"));
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            forms_settle_far: true,
+            seal_idle: true,
+            upkeep: supdb::Upkeep::Inline,
+            publish_in_background: false,
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let key = |i: u32| format!("k{i:08}").into_bytes();
+        let n = 40_000u32;
+        for i in 0..n {
+            db.append(&key(i), b"v0");
+            if i % 1000 == 999 {
+                db.commit().unwrap();
+            }
+        }
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert!(db.levels().0 > 0, "the load left partitions");
+        let built0 = db.blocks_built().1;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for step in 0..8_000u32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let i = (state % n as u64) as u32;
+            db.append(&key(i), b"v1");
+            if step % 1000 == 999 {
+                if reads {
+                    let mut got = 0usize;
+                    db.read_all(&key(i), vf(&mut |_| got += 1)).unwrap();
+                    assert!(got >= 2, "the key reads its values");
+                }
+                db.commit().unwrap();
+            }
+        }
+        let built = db.blocks_built().1 - built0;
+        let did = format!(
+            "events {:?}, refusals {:?}",
+            db.forms_events(),
+            db.settle_refusals()
+        );
+        built_by.push((reads, built, did));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    let (_, quiet, did) = &built_by[0];
+    assert_eq!(*quiet, 0, "the quiet stretch filed its backlog: {did}");
+    let (_, read, did) = &built_by[1];
+    assert!(
+        *read > 0,
+        "the stretch read before its commits filed nothing: {did}"
+    );
+}
+
 /// A load nobody reads files no forms. With the forms maintained at
 /// every commit, a stretch of random writes over a partitioned store had
 /// the upkeep thread copying every block the writes overlaid into forms
@@ -20532,6 +20648,12 @@ fn a_second_open_of_a_store_is_refused_until_the_first_is_gone() {
     db.commit().unwrap();
     db.flush().unwrap();
     db.settle().unwrap();
+    // Under the forced form (the stride group's `SUPDB_TEST_STRIDE`) a
+    // partition's form file is built on demand on the segment work's
+    // thread, and a build still writing its temp name between the two
+    // listings below read as a refused open's change: every partition has
+    // its file or its reason before the first.
+    db.zpages_settle().unwrap();
     std::fs::write(d.join("seg-00000000000000ff.sup"), b"an orphan").unwrap();
     let before = the_directory(&d);
     for (what, e) in [
@@ -20611,4 +20733,402 @@ fn a_store_open_in_one_process_is_refused_to_another() {
         "another process's open once the first closed: {err}"
     );
     let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A walk of a source's keys against a partition's block boundaries places
+/// a boundary by its head where the head is not the whole of its key, and
+/// reads the boundary's record only on a tie (`Options::bounds_by_heads`):
+/// the bounds are the vector the walk that reads every record makes, and
+/// every scan answers the model.
+///
+/// The keys run in groups of three that share everything a head covers and
+/// differ in their last byte, so a block's boundary -- every sixty-fourth
+/// rank, the first, the second or the third of its group by turns -- has
+/// neighbours on either side inside its head's bracket. The piece over the
+/// partitions writes a quarter of the groups whole again, the boundary's
+/// own key and the keys beside it under one head, and puts three new keys
+/// into another quarter, below the group, inside it and above it; the rest
+/// it leaves, and those boundaries no key of the piece ties with. So the
+/// walk meets a boundary with a source key below it under its head, one
+/// equal to it, one above it, and none, and a walk that took any tie for
+/// the head's verdict would put a key in the block beside its own. A
+/// table of unsealed keys of the same kinds is walked the same way
+/// (`BuildCtx::snap_bounds`), and held by the scans.
+///
+/// Near reads the landing walks the bounds, through the raw form's records
+/// (`bound_pieces_of`); far from them a handle's tables do, through the
+/// reader's (`BuildCtx::table_bounds`). Both are run.
+#[test]
+fn a_bounds_walk_places_a_boundary_by_its_head_and_reads_its_record_only_on_a_tie() {
+    const TAILS: [&str; 3] = ["tail-of-a-key-a", "tail-of-a-key-c", "tail-of-a-key-e"];
+    const NEW: [&str; 3] = ["tail-of-a-key-0", "tail-of-a-key-b", "tail-of-a-key-z"];
+    let groups = 10_000u32;
+    let key = |g: u32, tail: &str| format!("{g:07}/{tail}").into_bytes();
+    let all = |r: &Reader| {
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        r.scan(
+            b"",
+            usize::MAX,
+            kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+        )
+        .unwrap();
+        got
+    };
+    for near in [true, false] {
+        let mut bounds: Vec<Vec<(usize, usize, Vec<u32>)>> = Vec::new();
+        let mut counts: Vec<(u64, u64)> = Vec::new();
+        for on in [true, false] {
+            let d = dir(&format!("bounds-by-heads-{near}-{on}"));
+            let mut db = Db::create(
+                &d,
+                Options {
+                    zpages: supdb::ZPages::Off,
+                    partition_bytes: Some(64 << 10),
+                    // One seal's pieces stand until the test is done.
+                    seal_bytes: 1 << 30,
+                    l0_trigger: 1 << 20,
+                    scan_block_cache: true,
+                    bounds_by_heads: on,
+                    // The commit's fill on the writer's thread: lent to the
+                    // upkeep thread, the fill's walk of the burst's snapshot
+                    // raced the seal's freeze, and a store whose seal came
+                    // first walked once where the other walked twice.
+                    upkeep: supdb::Upkeep::Inline,
+                    ..common::options()
+                },
+            )
+            .unwrap();
+            let mut want: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+            for g in 0..groups {
+                for t in TAILS {
+                    db.append(&key(g, t), b"loaded");
+                    want.insert(key(g, t), b"loaded".to_vec());
+                }
+                if g % 500 == 499 {
+                    db.commit().unwrap();
+                }
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+            assert!(db.levels().0 > 4, "partitions: {:?}", db.levels());
+            if near {
+                // A scan, so the seal after it lands near reads.
+                let mut n = 0;
+                db.scan(b"", 5, kv(&mut |_, _| n += 1)).unwrap();
+                assert_eq!(n, 5);
+            }
+            let write = |db: &mut Db, want: &mut BTreeMap<Vec<u8>, Vec<u8>>, round: u32| {
+                let v = format!("round-{round}").into_bytes();
+                for g in 0..groups {
+                    match (g + round) % 4 {
+                        0 => {
+                            for t in TAILS {
+                                db.put(&key(g, t), &v);
+                                want.insert(key(g, t), v.clone());
+                            }
+                        }
+                        2 => {
+                            for t in NEW {
+                                db.put(&key(g, t), &v);
+                                want.insert(key(g, t), v.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                db.commit().unwrap();
+            };
+            write(&mut db, &mut want, 0);
+            // Taken after the commit's fill of the burst's snapshot: whether
+            // a commit fills is the fills' room's to say, read off the
+            // group's refaults (`Options::forms_settle_room_pressure`), so
+            // one store's commit may walk the snapshot where the other's
+            // does not, and the walks held below are the ones after it.
+            let before = db.zpage_counts();
+            db.seal().unwrap();
+            db.settle().unwrap();
+            assert!(db.levels().1 > 0, "a piece stands");
+            let landed = db.zpage_counts();
+            assert_eq!(
+                landed.land_bound_walks > before.land_bound_walks,
+                near,
+                "the landing walks the bounds near reads and not far from them: {landed:?}"
+            );
+            let h = db.reader().unwrap();
+            let expect: Vec<(Vec<u8>, Vec<u8>)> =
+                want.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            assert!(all(&h) == expect, "a handle over the piece, {near} {on}");
+            assert!(all(&db) == expect, "the writer over the piece, {near} {on}");
+            // The walks since the burst was filed: the landing's near reads,
+            // the handle's table far from them, and nothing else.
+            let c = db.zpage_counts();
+            let c = (
+                c.bounds_by_head - before.bounds_by_head,
+                c.bounds_records - before.bounds_records,
+            );
+            if on {
+                assert!(
+                    c.0 > 0 && c.1 > 0,
+                    "boundaries placed by the head, and records read on ties: {c:?}"
+                );
+                // A quarter of the groups written again and a quarter
+                // written into: about half the boundaries tie, and by no
+                // count all of them.
+                assert!(c.1 < 3 * c.0 && c.0 < 3 * c.1, "{c:?}");
+            } else {
+                assert!(
+                    c.0 == 0 && c.1 > 0,
+                    "every boundary a record with the option off: {c:?}"
+                );
+            }
+            counts.push(c);
+            let mut b = h.piece_bounds();
+            b.sort();
+            assert!(
+                b.len() > 4 && b.iter().all(|(_, _, at)| at.len() > 2),
+                "bounds for every partition the piece meets: {}",
+                b.len()
+            );
+            bounds.push(b);
+            // Unsealed keys of the same kinds over the piece: the snapshot's
+            // walk against the same boundaries.
+            write(&mut db, &mut want, 1);
+            let expect: Vec<(Vec<u8>, Vec<u8>)> =
+                want.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            assert!(all(&h) == expect, "a handle over the unsealed, {near} {on}");
+            assert!(
+                all(&db) == expect,
+                "the writer over the unsealed, {near} {on}"
+            );
+            // And from every third boundary's neighbourhood, short windows.
+            for g in (0..groups).step_by(211) {
+                for t in [TAILS[0], NEW[1], TAILS[2]] {
+                    let from = key(g, t);
+                    let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                    h.scan(
+                        &from,
+                        70,
+                        kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+                    )
+                    .unwrap();
+                    let expect: Vec<(Vec<u8>, Vec<u8>)> = want
+                        .range(from.clone()..)
+                        .take(70)
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    assert!(got == expect, "a window from group {g} {t}, {near} {on}");
+                }
+            }
+            drop(h);
+            db.close().unwrap();
+            let _ = std::fs::remove_dir_all(&d);
+        }
+        assert!(
+            bounds[0] == bounds[1],
+            "the bounds by the heads are the bounds by the records, near {near}"
+        );
+        // One store walked twice: what the heads placed and the ties read
+        // are together the records the other walk read.
+        assert_eq!(
+            counts[0].0 + counts[0].1,
+            counts[1].1,
+            "the two walks' boundaries, near {near}: {counts:?}"
+        );
+    }
+}
+
+/// A landing near reads walks its pieces' bounds before it publishes, for
+/// the tables that will read them, and leaves them where no table stands to
+/// (`Options::land_bounds_read`): while the writer has given its block
+/// forms up (`scan_forms_off_unreused`) and no handle is live. A handle
+/// claimed after such a landing walks what its tables need and answers the
+/// model, and a landing beside a live handle walks them as before. Off,
+/// every landing near reads walks them, the writer's forms given up or
+/// not.
+#[test]
+fn a_landing_leaves_its_pieces_bounds_where_no_table_stands_to_read_them() {
+    for on in [true, false] {
+        let d = dir(&format!("land-bounds-read-{on}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                scan_forms_off_unreused: true,
+                scan_forms_off_window: 32,
+                scan_forms_off_ghost_bits: 6,
+                zpages: supdb::ZPages::Off,
+                partition_bytes: Some(256 << 10),
+                seal_bytes: 1 << 30,
+                l0_trigger: 1 << 20,
+                scan_block_cache: true,
+                land_bounds_read: on,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let keys = 100_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+            want.insert(key(k), "0".into());
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        let parts = db.levels().0;
+        assert!(parts > 1, "partitions for the forms to hang on");
+        let check = |r: &Reader, want: &BTreeMap<Vec<u8>, String>, start: u32, when: &str| {
+            let mut got: Vec<(Vec<u8>, String)> = Vec::new();
+            r.scan(
+                &key(start),
+                20,
+                kv(&mut |k, v| {
+                    got.push((k.to_vec(), std::str::from_utf8(v).unwrap().to_string()));
+                }),
+            )
+            .unwrap();
+            let expect: Vec<(Vec<u8>, String)> = want
+                .range(key(start)..)
+                .take(20)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            assert_eq!(got, expect, "scan from {start} {when}, {on}");
+        };
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        // A piece's worth of updates over every partition.
+        let write = |db: &mut Db, want: &mut BTreeMap<Vec<u8>, String>, round: u32| {
+            for k in (round % 7..keys).step_by(7) {
+                db.put(&key(k), format!("w{round}").as_bytes());
+                want.insert(key(k), format!("w{round}"));
+            }
+            db.commit().unwrap();
+        };
+        // In core the writer keeps its forms, and a landing near its
+        // scans walks the bounds its tables read, handle or none.
+        check(&db, &want, 0, "in core");
+        let before = db.zpage_counts();
+        write(&mut db, &mut want, 0);
+        db.seal().unwrap();
+        db.settle().unwrap();
+        assert_eq!(db.levels().1, parts, "a piece over every partition");
+        let after = db.zpage_counts();
+        assert_eq!(
+            (
+                after.land_bound_walks - before.land_bound_walks,
+                after.land_bounds_left - before.land_bounds_left
+            ),
+            (parts as u64, 0),
+            "the writer's forms kept: the landing walks its bounds: {after:?}"
+        );
+        assert_eq!(db.piece_bounds().len(), parts);
+        // Out of core by hand, starts uniform over the blocks: the writer
+        // gives its forms up.
+        db.zgate_set(2);
+        for _ in 0..256 {
+            check(&db, &want, (next() % keys as u64) as u32, "uniform");
+        }
+        let c = db.forms_off_counts();
+        assert!(c[0] >= 1 && c[0] > c[1], "the forms given up: {c:?}");
+        // A seal lands near those scans with nothing to read its bounds.
+        let before = db.zpage_counts();
+        write(&mut db, &mut want, 1);
+        db.seal().unwrap();
+        db.settle().unwrap();
+        assert_eq!(db.levels().1, 2 * parts, "a second piece over each");
+        let c = db.forms_off_counts();
+        assert!(c[0] > c[1], "the forms still given up: {c:?}");
+        let after = db.zpage_counts();
+        let (walked, left) = (
+            after.land_bound_walks - before.land_bound_walks,
+            after.land_bounds_left - before.land_bounds_left,
+        );
+        if on {
+            assert_eq!(
+                (walked, left > 0),
+                (0, true),
+                "the landing left its bounds: {after:?}"
+            );
+            assert_eq!(
+                db.piece_bounds().len(),
+                parts,
+                "no bounds on the pieces it landed"
+            );
+        } else {
+            assert_eq!(
+                (walked, left),
+                (parts as u64, 0),
+                "the landing walked a piece against every partition: {after:?}"
+            );
+        }
+        for _ in 0..16 {
+            check(&db, &want, (next() % keys as u64) as u32, "the merge path");
+        }
+        // A handle claimed: its tables walk what the landing left, and it
+        // answers the model.
+        let h = db.reader().unwrap();
+        for start in (0..keys).step_by(4999) {
+            check(&h, &want, start, "a handle after the landing");
+        }
+        assert!(
+            h.piece_bounds().len() > parts,
+            "the handle's tables walked the bounds they read"
+        );
+        drop(h);
+        // A handle claimed while a seal is in flight, the writer's forms
+        // still given up and no commit of its since to take them back: the
+        // landing walks its bounds for the handle's tables either way.
+        db.hold_seal_landing(true);
+        write(&mut db, &mut want, 2);
+        db.seal().unwrap();
+        assert_eq!(db.frozen_tables(), 1, "the seal in flight");
+        let h = db.reader().unwrap();
+        let c = db.forms_off_counts();
+        assert!(c[0] > c[1], "the writer's forms still given up: {c:?}");
+        let before = db.zpage_counts();
+        db.hold_seal_landing(false);
+        db.settle().unwrap();
+        let after = db.zpage_counts();
+        assert!(
+            after.land_bound_walks > before.land_bound_walks,
+            "a landing beside a live handle walks its bounds: {after:?}"
+        );
+        assert_eq!(
+            after.land_bounds_left, before.land_bounds_left,
+            "and leaves none: {after:?}"
+        );
+        for start in (0..keys).step_by(3331) {
+            check(&h, &want, start, "a handle after the landing beside it");
+            check(&db, &want, start, "the writer after the landing beside it");
+        }
+        drop(h);
+        // The handle gone and the scans back in one block: the writer has
+        // its forms, by its own reading this time, and the landing after
+        // walks its bounds for them.
+        let taken = db.forms_off_counts();
+        for _ in 0..512 {
+            check(&db, &want, 2_000 + (next() % 30) as u32, "hot");
+        }
+        let c = db.forms_off_counts();
+        assert_eq!(c[0], c[1], "the forms kept: {taken:?} {c:?}");
+        let before = db.zpage_counts();
+        write(&mut db, &mut want, 3);
+        db.seal().unwrap();
+        db.settle().unwrap();
+        let after = db.zpage_counts();
+        assert!(
+            after.land_bound_walks > before.land_bound_walks
+                && after.land_bounds_left == before.land_bounds_left,
+            "the forms taken back: the landing walks its bounds: {after:?}"
+        );
+        for start in (0..keys).step_by(2777) {
+            check(&db, &want, start, "the writer after the last landing");
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
