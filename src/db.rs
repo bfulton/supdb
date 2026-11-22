@@ -953,6 +953,14 @@ pub struct ZCounts {
     /// trims gave back.
     pub rewarm_trims: u64,
     pub rewarm_trim_bytes: u64,
+    /// The rewarms that asked for the raw form's files
+    /// (`Options::zpages_rewarm_raw`), the files asked, the bytes of them
+    /// the page cache did not hold, and the files short of the line left
+    /// for want of room.
+    pub raw_rewarms: u64,
+    pub raw_rewarm_files: u64,
+    pub raw_rewarm_bytes: u64,
+    pub raw_rewarm_short: u64,
     /// Block-coded partitions re-parsed while served
     /// (`Options::zpages_reparse`).
     pub reparses: u64,
@@ -6226,6 +6234,26 @@ pub struct Options {
     /// own thread; an arena's lock is held while its pages go. Off;
     /// `supdb-rewarmtrim` trims.
     pub zpages_rewarm_trims: bool,
+    /// EXPERIMENT: a rewarm due (`zpages_rewarm_scans`) asks for the raw
+    /// form's files as well, with or without a form installed: each
+    /// partition the raw form serves, the level-0 pieces, and their
+    /// ordered indexes, where the page cache holds under
+    /// `HOT_RAW_RESIDENT` of one, the indexes first and the pieces last,
+    /// up to the group's unused memory less the margin
+    /// (`zselect::Budget::slack`), so that an ask never takes the pages of
+    /// one of the store's files for another's. Under a bound a merge's
+    /// outputs are written once and read by nobody until the scans come,
+    /// and those are the pages the kernel reclaims first: at three million
+    /// keys under 1 GiB the lag sweep's clean store read 1.8M entries a
+    /// second against LMDB's 10.4M, with 271 of its partitions' 417 MB in
+    /// the cache, the group's file pages at 308 MB and the process at 68
+    /// of a limit of 1,024, and 2,147 major faults in a pass of 166 ms; the
+    /// rewarm asked for nothing, since it asks for form files and only
+    /// once a form is installed. Counted (`ZCounts::raw_rewarms`,
+    /// `raw_rewarm_files`, `raw_rewarm_bytes`, `raw_rewarm_short`). Off;
+    /// `supdb-zrewarmraw` asks.
+    #[doc(hidden)]
+    pub zpages_rewarm_raw: bool,
     /// A rewarm due (`zpages_rewarm_scans`) is made while merges are in
     /// flight, for the form files of the partitions no merge in flight
     /// holds, where off it waits for the merges to land. It was made beside
@@ -6985,6 +7013,7 @@ impl Default for Options {
             zpages_rewarm_at_install: false,
             zpages_settle_joins_asks: true,
             zpages_rewarm_trims: false,
+            zpages_rewarm_raw: false,
             zpages_rewarm_beside_merges: false,
             zpages_rewarm_quiet_ms: 250,
             zpages_stride: ZStride::Forced,
@@ -20061,6 +20090,49 @@ pub(super) fn resident_share(bytes: &[u8]) -> f64 {
     vec.iter().filter(|&&b| b & 1 != 0).count() as f64 / pages as f64
 }
 
+/// A rewarm's asks for the raw form's files (`Options::zpages_rewarm_raw`),
+/// on the rewarm's thread: each file mapped by its path, so the thread
+/// holds nothing a landing retires, asked for whole where the page cache
+/// holds under `HOT_RAW_RESIDENT` of it and the bytes it lacks fit what
+/// is left of `room`; a file that does not fit is left and counted short,
+/// and a smaller one after it may still be asked. A file gone since the
+/// look is passed over.
+fn raw_rewarm_ask(shared: &Shared, files: Vec<PathBuf>, mut room: u64, trace: bool) {
+    let (mut asked, mut bytes, mut short) = (0u64, 0u64, 0u64);
+    for p in files {
+        let Ok(map) = MmapBytes::open(&p) else {
+            continue;
+        };
+        let len = map.0.len();
+        let share = resident_share(&map.0[..]);
+        if len == 0 || share >= HOT_RAW_RESIDENT {
+            continue;
+        }
+        let missing = ((1.0 - share) * len as f64) as u64;
+        if missing > room {
+            short += 1;
+            continue;
+        }
+        room -= missing;
+        let _ = crate::bytes::Bytes::advise_willneed(&map, 0, len);
+        asked += 1;
+        bytes += missing;
+    }
+    if asked > 0 {
+        zfile::ZEvents::add(&shared.z.raw_rewarms, 1);
+    }
+    zfile::ZEvents::add(&shared.z.raw_rewarm_files, asked);
+    zfile::ZEvents::add(&shared.z.raw_rewarm_bytes, bytes);
+    zfile::ZEvents::add(&shared.z.raw_rewarm_short, short);
+    if trace {
+        eprintln!(
+            "zrewarm raw asked {asked} mb {:.1} short {short} room_left_mb {:.1}",
+            bytes as f64 / 1e6,
+            room as f64 / 1e6
+        );
+    }
+}
+
 /// What the trim asks of glibc's allocator: the bytes it holds free in its
 /// arenas, and the return of the whole pages inside its free chunks to
 /// the system. The free count is `mallinfo2`'s, looked up by name when
@@ -24856,6 +24928,10 @@ impl Reader {
             ask_join_ms: get(&ev.ask_join_ms),
             rewarm_trims: get(&ev.rewarm_trims),
             rewarm_trim_bytes: get(&ev.rewarm_trim_bytes),
+            raw_rewarms: get(&ev.raw_rewarms),
+            raw_rewarm_files: get(&ev.raw_rewarm_files),
+            raw_rewarm_bytes: get(&ev.raw_rewarm_bytes),
+            raw_rewarm_short: get(&ev.raw_rewarm_short),
             reparses: get(&ev.reparses),
             recode_flips: get(&ev.recode_flips),
             spare_builds: get(&ev.spare_builds),
@@ -50104,11 +50180,27 @@ impl Maint {
         } else {
             HOT_RAW_RESIDENT
         };
-        if self.zsel.counts().installs == 0 || self.shared.zgate.load() == zselect::GATE_RAW {
+        let forms =
+            self.zsel.counts().installs > 0 && self.shared.zgate.load() != zselect::GATE_RAW;
+        // The raw form's files (`Options::zpages_rewarm_raw`), asked within
+        // the group's room, and only where the room is known.
+        let room = if self.opts.zpages_rewarm_raw {
+            self.raw_rewarm_room()
+        } else {
+            None
+        };
+        let raw = if room.is_some() {
+            self.raw_rewarm_files(merging)
+        } else {
+            Vec::new()
+        };
+        if !forms && raw.is_empty() {
             return;
         }
         let mut whole = (0.0f64, 0u64);
-        let paths: Vec<(PathBuf, f64, u64)> = {
+        let paths: Vec<(PathBuf, f64, u64)> = if !forms {
+            Vec::new()
+        } else {
             let _op = self.op();
             self.segs()
                 .iter()
@@ -50139,24 +50231,29 @@ impl Maint {
                 .iter()
                 .map(|(_, r, b)| format!("{:.2}/{}", r, b >> 20))
                 .collect();
-            let room = zfile::read_budget().and_then(|b| b.slack());
+            let slack = zfile::read_budget().and_then(|b| b.slack());
             eprintln!(
-                "zrewarm t={:.1} files {} line {line} of_all {:.3}/{} life {life} merging {merging} room_mb {} resident {}",
+                "zrewarm t={:.1} files {} line {line} of_all {:.3}/{} life {life} merging {merging} room_mb {} resident {} raw_files {} raw_room_mb {}",
                 now.as_secs_f64(),
                 paths.len(),
                 whole.0 / whole.1.max(1) as f64,
                 whole.1 >> 20,
+                slack.map_or("-".to_string(), |r| (r >> 20).to_string()),
+                shares.join(","),
+                raw.len(),
                 room.map_or("-".to_string(), |r| (r >> 20).to_string()),
-                shares.join(",")
             );
         }
         let paths: Vec<PathBuf> = paths.into_iter().map(|(p, _, _)| p).collect();
-        if paths.is_empty() {
+        if paths.is_empty() && raw.is_empty() {
             return;
         }
-        zfile::ZEvents::add(&self.shared.z.rewarms, 1);
-        zfile::ZEvents::add(&self.shared.z.rewarm_files, paths.len() as u64);
-        self.z_ask_pending = true;
+        if !paths.is_empty() {
+            zfile::ZEvents::add(&self.shared.z.rewarms, 1);
+            zfile::ZEvents::add(&self.shared.z.rewarm_files, paths.len() as u64);
+            self.z_ask_pending = true;
+        }
+        let room = room.unwrap_or(0);
         let (trims, shared, trace) = (
             self.opts.zpages_rewarm_trims,
             self.shared.clone(),
@@ -50191,8 +50288,55 @@ impl Maint {
                         let _ = crate::bytes::Bytes::advise_willneed(&map, 0, map.0.len());
                     }
                 }
+                if !raw.is_empty() {
+                    raw_rewarm_ask(&shared, raw, room, trace);
+                }
             })
             .ok();
+    }
+
+    /// The room a rewarm's asks for the raw form's files may take
+    /// (`Options::zpages_rewarm_raw`): the group's unused memory less the
+    /// margin, the seam's where a test set the budget, else the platform's;
+    /// `None` where neither says.
+    fn raw_rewarm_room(&self) -> Option<u64> {
+        let inject = self.opts.zpages_inject.as_ref();
+        match inject.and_then(|i| i.budget()) {
+            Some(_) => inject.and_then(|i| i.slack()),
+            None => zfile::read_budget().and_then(|b| b.slack()),
+        }
+    }
+
+    /// The raw form's files a rewarm may ask for
+    /// (`Options::zpages_rewarm_raw`), in the order it asks: the ordered
+    /// indexes, which every scan's start seeks, then the partitions the raw
+    /// form serves -- every one under the raw gate, else those no form
+    /// file serves -- then the level-0 pieces. Beside merges in flight
+    /// (`zpages_rewarm_beside_merges`) the segments they hold are left, as
+    /// the form files are: their files go at the landing.
+    fn raw_rewarm_files(&self, merging: bool) -> Vec<PathBuf> {
+        let raw_gate = self.shared.zgate.load() == zselect::GATE_RAW;
+        let _op = self.op();
+        let (mut files, mut parts, mut pieces) = (Vec::new(), Vec::new(), Vec::new());
+        for s in self.segs().iter() {
+            if merging && self.in_flight_input(&s.name) {
+                continue;
+            }
+            if s.level > 0 && !raw_gate && s.z.get().is_some() {
+                continue;
+            }
+            if let Some(n) = Db::ord_name_for(&s.name) {
+                files.push(self.dir.join(n));
+            }
+            if s.level > 0 {
+                parts.push(self.dir.join(&s.name));
+            } else {
+                pieces.push(self.dir.join(&s.name));
+            }
+        }
+        files.extend(parts);
+        files.extend(pieces);
+        files
     }
 
     /// The thread of `Options::zpages_rewarm_scans` joined, where a settle

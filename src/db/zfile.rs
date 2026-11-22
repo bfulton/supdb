@@ -6391,6 +6391,13 @@ pub(super) struct ZEvents {
     /// trims gave back.
     pub rewarm_trims: AtomicU64,
     pub rewarm_trim_bytes: AtomicU64,
+    /// The rewarms that asked for the raw form's files
+    /// (`Options::zpages_rewarm_raw`), the files asked, the bytes of them
+    /// the page cache did not hold, and the files left for want of room.
+    pub raw_rewarms: AtomicU64,
+    pub raw_rewarm_files: AtomicU64,
+    pub raw_rewarm_bytes: AtomicU64,
+    pub raw_rewarm_short: AtomicU64,
     /// Re-codes made by exchanging the served form file with the kept one.
     pub recode_flips: AtomicU64,
     /// Spares built and kept (`Options::zpages_both`), and spares that kept

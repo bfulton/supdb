@@ -11971,12 +11971,16 @@ fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
             |o| {
                 o.zpages_rewarm_scans = on;
                 o.zpages_rewarm_trims = trims;
+                // The raw form's files asked for too, with room for them:
+                // a partition its form file serves has none to ask for.
+                o.zpages_rewarm_raw = true;
                 o.zpages_hot_raw = false;
                 o.zpages_memo = false;
                 o.partition_bytes = Some(400 << 10);
             },
             |_| {},
         );
+        inject.set_slack(1 << 30);
         let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
         let r = db.reader().unwrap();
         let mut at = 0usize;
@@ -12019,6 +12023,11 @@ fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
             assert!(
                 c.rewarm_files + 1 >= n,
                 "{what}: every cold file asked for: {c:?}"
+            );
+            assert_eq!(
+                (c.raw_rewarm_files, c.raw_rewarm_short),
+                (0, 0),
+                "{what}: no raw file of a partition its form serves: {c:?}"
             );
         } else {
             assert_eq!((c.rewarms, c.rewarm_files), (0, 0), "{what}: {c:?}");
@@ -12077,6 +12086,180 @@ fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
             "{what}: a trim a rewarm: {:?}",
             db.zpage_counts()
         );
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The store's raw files paged out under it: every partition and ordered
+/// index of `dir` with this process's mappings of it unmapped and its pages
+/// dropped, and what they hold and what of it the cache holds after.
+#[cfg(target_os = "linux")]
+fn evict_raw(dir: &Path) -> (u64, u64) {
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        if name.starts_with("par-") || name.starts_with("ord-") {
+            unmap_pages(&p);
+            evict(&p);
+        }
+    }
+    raw_resident(dir)
+}
+
+/// What the store's partitions and ordered indexes hold, and what of it
+/// the page cache holds.
+#[cfg(target_os = "linux")]
+fn raw_resident(dir: &Path) -> (u64, u64) {
+    let (ps, pr) = resident_under(dir, "par-");
+    let (os, or) = resident_under(dir, "ord-");
+    (ps + os, pr + or)
+}
+
+/// With the raw form serving -- the store in core, no form installed --
+/// the scans that come back after a stretch without one have the raw files
+/// the page cache has lost asked for (`Options::zpages_rewarm_raw`): every
+/// partition and ordered index out of the cache, a second and a half of the
+/// injected clock with no scan, then a scan of one entry, and the look
+/// after it asks for each file and the files come back; a scan with no
+/// quiet stretch before it asks for nothing again. Without the option
+/// nothing is asked and the files stay out. With no room in the group
+/// (`ZInject::set_slack`, the group's unused memory less the margin) the
+/// look asks for nothing and counts every file short of the line short,
+/// since an ask beyond the room takes one of the store's pages for
+/// another's. The scan that brings the look is of one entry, so that its
+/// own faults are not what brings the files back.
+#[cfg(target_os = "linux")]
+#[test]
+fn scans_after_a_quiet_stretch_have_the_cold_raw_files_asked_for() {
+    for (on, room) in [(true, 1u64 << 30), (false, 1 << 30), (true, 0)] {
+        let what = format!("raw rewarm {on} room {room}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-rawrewarm-{on}-{room}"),
+            1 << 30,
+            0.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_rewarm_raw = on;
+                o.zpages_hot_raw = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        inject.set_slack(room);
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        for _ in 0..3 {
+            advance_tick(&db, std::time::Duration::from_millis(100));
+        }
+        let c = db.zpage_counts();
+        assert_eq!(c.gate, 0, "{what}: the raw form serves: {c:?}");
+        assert!(c.partitions >= 4, "{what}: partitions: {c:?}");
+        let (size, cold) = evict_raw(&dir);
+        assert!(
+            size > 0 && cold * 10 < size,
+            "{what}: the raw files out of the cache: {cold} of {size}"
+        );
+        // One ordered index read back whole: a file the cache holds is not
+        // asked for, nor counted short.
+        let raw_files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                let n = p.file_name().unwrap().to_string_lossy().into_owned();
+                (n.starts_with("par-") || n.starts_with("ord-"))
+                    && std::fs::metadata(p).unwrap().len() > 0
+            })
+            .collect();
+        let warm_one = raw_files
+            .iter()
+            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("ord-"))
+            .unwrap();
+        let _ = std::fs::read(warm_one).unwrap();
+        let cold_files = raw_files.len() as u64 - 1;
+        // A stretch with no scan, then a scan of one entry.
+        for _ in 0..5 {
+            advance_tick(&db, std::time::Duration::from_millis(300));
+        }
+        let mut one = 0usize;
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        assert_eq!(one, 1, "{what}: the scan");
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        // The asks are made and counted on the rewarm's own thread.
+        let t = std::time::Instant::now();
+        let done = |c: &supdb::db::ZCounts| c.raw_rewarm_files + c.raw_rewarm_short > 0;
+        while on && !done(&db.zpage_counts()) && t.elapsed().as_secs() < 30 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let c = db.zpage_counts();
+        match (on, room > 0) {
+            (true, true) => {
+                assert_eq!(c.raw_rewarms, 1, "{what}: one raw rewarm: {c:?}");
+                assert_eq!(
+                    c.raw_rewarm_files, cold_files,
+                    "{what}: every cold partition and index asked for, and the warm one not: {c:?}"
+                );
+                assert!(c.raw_rewarm_bytes > 0, "{what}: {c:?}");
+                assert_eq!(c.raw_rewarm_short, 0, "{what}: {c:?}");
+            }
+            (true, false) => {
+                assert_eq!(
+                    (c.raw_rewarms, c.raw_rewarm_files),
+                    (0, 0),
+                    "{what}: nothing asked beyond the room: {c:?}"
+                );
+                assert_eq!(
+                    c.raw_rewarm_short, cold_files,
+                    "{what}: every cold file short, and the warm one not: {c:?}"
+                );
+            }
+            (false, _) => assert_eq!(
+                (c.raw_rewarms, c.raw_rewarm_files, c.raw_rewarm_short),
+                (0, 0, 0),
+                "{what}: {c:?}"
+            ),
+        }
+        // The asks land in the cache; without them the files stay out.
+        let asked = on && room > 0;
+        let t = std::time::Instant::now();
+        let mut warm = raw_resident(&dir).1;
+        while asked && warm * 10 < size * 9 && t.elapsed().as_secs() < 30 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            warm = raw_resident(&dir).1;
+        }
+        if asked {
+            assert!(
+                warm * 10 >= size * 9,
+                "{what}: the raw files back in the cache: {warm} of {size}"
+            );
+        } else {
+            assert!(
+                warm * 2 < size,
+                "{what}: the raw files left out: {warm} of {size}"
+            );
+        }
+        // A scan with no quiet stretch before it asks for nothing more, the
+        // files out of the cache again so that there would be something to
+        // ask for.
+        let (size, cold) = evict_raw(&dir);
+        assert!(
+            cold * 10 < size,
+            "{what}: the raw files out of the cache again: {cold} of {size}"
+        );
+        let before = db.zpage_counts();
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.raw_rewarms, c.raw_rewarm_short),
+            (before.raw_rewarms, before.raw_rewarm_short),
+            "{what}: no raw rewarm without the quiet: {c:?}"
+        );
+        let r = db.reader().unwrap();
         check(&r, &model, &keys, &format!("{what}: after"));
         drop(r);
         db.close().unwrap();
