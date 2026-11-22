@@ -449,7 +449,7 @@ const SCAN_WINDOW_BYTES: usize = 4 << 20;
 /// (`Bytes::lend_at`): this module alone makes one, so the read path's
 /// dispatch (`Sec::get`, `Sec::lend`) is the one caller of that lend, by the
 /// compiler. A zero-sized value.
-pub(crate) mod lend {
+pub(crate) mod lend_seal {
     pub struct Token(());
 
     impl Token {
@@ -499,7 +499,7 @@ impl Sec {
     fn get<'a, B: Bytes>(&'a self, src: &'a B) -> Result<&'a [u8]> {
         match self {
             Sec::Lent { off, len } => src
-                .lend_at(*off, *len, lend::Token::new())
+                .lend_at(*off, *len, lend_seal::Token::new())
                 .ok_or_else(|| not_lent(src, *off, *len)),
             Sec::Owned(v, _) => Ok(v),
         }
@@ -511,7 +511,7 @@ impl Sec {
     #[inline(always)]
     fn lend<'a, B: Bytes>(&'a self, src: &'a B) -> Option<&'a [u8]> {
         match self {
-            Sec::Lent { off, len } => src.lend_at(*off, *len, lend::Token::new()),
+            Sec::Lent { off, len } => src.lend_at(*off, *len, lend_seal::Token::new()),
             Sec::Owned(v, _) => Some(v),
         }
     }

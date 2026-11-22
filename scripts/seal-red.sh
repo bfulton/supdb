@@ -2,13 +2,14 @@
 # The seal's red input (forms.md R2, plan G1-7), run by the lint group of
 # scripts/check.sh after the door. The read path's lend of a section on the
 # bounds check alone, which a source that lends by the piece refuses
-# (`Bytes::lend_at`), takes a token only `blob` can make (`blob::lend`,
-# whose constructor is `pub(in crate::blob)`); the address behind a
-# paged mapping (`Paging::base`) takes a token only `bytes` can make
-# (`bytes::Base`, whose field is private); a mapping as it lies
-# (`MmapBytes::lent`) takes a token only its readers make, the ordered
-# index (`ordindex::lend`) and the stride form (`db::zfile::lend`); no
-# token is had by `Default::default()`; and `MmapBytes::as_slice` is gone.
+# (`Bytes::lend_at`), takes a token only `blob` can make
+# (`blob::lend_seal`, whose constructor is `pub(in crate::blob)`); the
+# address behind a paged mapping (`Paging::base_address`) takes a token
+# only `bytes` can make (`bytes::BaseAddressToken`, whose field is
+# private); a mapping as it lies (`MmapBytes::lend_whole_map`) takes a
+# token only its readers make, the ordered index (`ordindex::lend_seal`)
+# and the stride form (`db::zfile::lend_seal`); no token is had by
+# `Default::default()`; and `MmapBytes::as_slice` is gone.
 # A token made by any other route, and a new caller inside a reader's own
 # module, are held by tests/source.rs
 # (`the_seals_tokens_are_made_only_where_they_are_spent`).
@@ -39,26 +40,26 @@ trap 'exit 130' INT TERM
 
 # The lines: the home module, a tab, the module abroad, a tab, the line.
 cat > "$copy/lines" <<'EOF'
-src/blob.rs	src/db/zfile.rs	#[allow(dead_code)] fn seal_red_lend(m: &crate::bytes::MmapBytes) -> Option<&[u8]> { crate::bytes::Bytes::lend_at(m, 0, 1, crate::blob::lend::Token::new()) }
-src/blob.rs	src/ordindex.rs	#[allow(dead_code)] fn seal_red_lend_ord(m: &crate::bytes::MmapBytes) -> Option<&[u8]> { crate::bytes::Bytes::lend_at(m, 0, 1, crate::blob::lend::Token::new()) }
-src/blob.rs	src/bytes.rs	#[allow(dead_code)] fn seal_red_lend_seam(m: &crate::bytes::MmapBytes) -> Option<&[u8]> { crate::bytes::Bytes::lend_at(m, 0, 1, crate::blob::lend::Token::new()) }
-src/bytes.rs	src/db/pager.rs	#[allow(dead_code)] fn seal_red_base(p: &dyn crate::bytes::Paging) -> *const u8 { p.base(crate::bytes::Base(())) }
-src/bytes.rs	src/db/vault.rs	#[allow(dead_code)] fn seal_red_base_vault(p: &dyn crate::bytes::Paging) -> *const u8 { p.base(crate::bytes::Base(())) }
+src/blob.rs	src/db/zfile.rs	#[allow(dead_code)] fn seal_red_lend(m: &crate::bytes::MmapBytes) -> Option<&[u8]> { crate::bytes::Bytes::lend_at(m, 0, 1, crate::blob::lend_seal::Token::new()) }
+src/blob.rs	src/ordindex.rs	#[allow(dead_code)] fn seal_red_lend_ord(m: &crate::bytes::MmapBytes) -> Option<&[u8]> { crate::bytes::Bytes::lend_at(m, 0, 1, crate::blob::lend_seal::Token::new()) }
+src/blob.rs	src/bytes.rs	#[allow(dead_code)] fn seal_red_lend_seam(m: &crate::bytes::MmapBytes) -> Option<&[u8]> { crate::bytes::Bytes::lend_at(m, 0, 1, crate::blob::lend_seal::Token::new()) }
+src/bytes.rs	src/db/pager.rs	#[allow(dead_code)] fn seal_red_base(p: &dyn crate::bytes::Paging) -> *const u8 { p.base_address(crate::bytes::BaseAddressToken(())) }
+src/bytes.rs	src/db/vault.rs	#[allow(dead_code)] fn seal_red_base_vault(p: &dyn crate::bytes::Paging) -> *const u8 { p.base_address(crate::bytes::BaseAddressToken(())) }
 -	src/db/zfile.rs	#[allow(dead_code)] fn seal_red_as_slice(m: &crate::bytes::MmapBytes) -> &[u8] { m.as_slice() }
-src/ordindex.rs	src/db.rs	#[allow(dead_code)] fn seal_red_lent_ord(m: &crate::bytes::MmapBytes) -> &[u8] { m.lent(crate::ordindex::lend::Token::new()) }
-src/ordindex.rs	src/blob.rs	#[allow(dead_code)] fn seal_red_lent_ord_blob(m: &crate::bytes::MmapBytes) -> &[u8] { m.lent(crate::ordindex::lend::Token::new()) }
-src/db/zfile.rs	src/db.rs	#[allow(dead_code)] fn seal_red_lent_stride(m: &crate::bytes::MmapBytes) -> &[u8] { m.lent(crate::db::StrideLendToken::new()) }
-src/db/zfile.rs	src/ordindex.rs	#[allow(dead_code)] fn seal_red_lent_stride_ord(m: &crate::bytes::MmapBytes) -> &[u8] { m.lent(crate::db::StrideLendToken::new()) }
--	src/db.rs	#[allow(dead_code)] fn seal_red_lent_bare(m: &crate::bytes::MmapBytes) -> &[u8] { m.lent() }
+src/ordindex.rs	src/db.rs	#[allow(dead_code)] fn seal_red_whole_ord(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_whole_map(crate::ordindex::lend_seal::Token::new()) }
+src/ordindex.rs	src/blob.rs	#[allow(dead_code)] fn seal_red_whole_ord_blob(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_whole_map(crate::ordindex::lend_seal::Token::new()) }
+src/db/zfile.rs	src/db.rs	#[allow(dead_code)] fn seal_red_whole_stride(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_whole_map(crate::db::StrideLendToken::new()) }
+src/db/zfile.rs	src/ordindex.rs	#[allow(dead_code)] fn seal_red_whole_stride_ord(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_whole_map(crate::db::StrideLendToken::new()) }
+-	src/db.rs	#[allow(dead_code)] fn seal_red_whole_bare(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_whole_map() }
 -	src/db/zfile.rs	#[allow(dead_code)] fn seal_red_lend_default(m: &crate::bytes::MmapBytes) -> Option<&[u8]> { crate::bytes::Bytes::lend_at(m, 0, 1, Default::default()) }
--	src/db.rs	#[allow(dead_code)] fn seal_red_lent_ord_default(m: &crate::bytes::MmapBytes) -> &[u8] { m.lent::<crate::ordindex::OrdLendToken>(Default::default()) }
--	src/db.rs	#[allow(dead_code)] fn seal_red_lent_stride_default(m: &crate::bytes::MmapBytes) -> &[u8] { m.lent::<crate::db::StrideLendToken>(Default::default()) }
--	src/db/pager.rs	#[allow(dead_code)] fn seal_red_base_default(p: &dyn crate::bytes::Paging) -> *const u8 { p.base(Default::default()) }
--	src/db.rs	#[allow(dead_code)] struct SealRedMine; impl crate::bytes::whole::Reader for SealRedMine {}
--	src/db.rs	#[allow(dead_code)] fn seal_red_lent_unit(m: &crate::bytes::MmapBytes) -> &[u8] { m.lent(()) }
--	src/db/zfile.rs	#[allow(dead_code)] fn seal_red_lend_literal(m: &crate::bytes::MmapBytes) -> Option<&[u8]> { crate::bytes::Bytes::lend_at(m, 0, 1, crate::blob::lend::Token(())) }
--	src/db.rs	#[allow(dead_code)] fn seal_red_lent_ord_literal(m: &crate::bytes::MmapBytes) -> &[u8] { m.lent(crate::ordindex::OrdLendToken(())) }
--	src/db.rs	#[allow(dead_code)] fn seal_red_lent_stride_literal(m: &crate::bytes::MmapBytes) -> &[u8] { m.lent(crate::db::StrideLendToken(())) }
+-	src/db.rs	#[allow(dead_code)] fn seal_red_whole_ord_default(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_whole_map::<crate::ordindex::OrdLendToken>(Default::default()) }
+-	src/db.rs	#[allow(dead_code)] fn seal_red_whole_stride_default(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_whole_map::<crate::db::StrideLendToken>(Default::default()) }
+-	src/db/pager.rs	#[allow(dead_code)] fn seal_red_base_default(p: &dyn crate::bytes::Paging) -> *const u8 { p.base_address(Default::default()) }
+-	src/db.rs	#[allow(dead_code)] struct SealRedMine; impl crate::bytes::whole_map_readers::Reader for SealRedMine {}
+-	src/db.rs	#[allow(dead_code)] fn seal_red_whole_unit(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_whole_map(()) }
+-	src/db/zfile.rs	#[allow(dead_code)] fn seal_red_lend_literal(m: &crate::bytes::MmapBytes) -> Option<&[u8]> { crate::bytes::Bytes::lend_at(m, 0, 1, crate::blob::lend_seal::Token(())) }
+-	src/db.rs	#[allow(dead_code)] fn seal_red_whole_ord_literal(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_whole_map(crate::ordindex::OrdLendToken(())) }
+-	src/db.rs	#[allow(dead_code)] fn seal_red_whole_stride_literal(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_whole_map(crate::db::StrideLendToken(())) }
 EOF
 # The script's own red input (scripts/seal-red-red.sh) adds lines of its
 # own, in the same form, to show that each check below fails.

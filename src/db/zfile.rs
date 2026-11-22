@@ -60,13 +60,13 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
-/// The token `MmapBytes::lent` takes from the stride form, made in this
-/// module alone (its constructor is `pub(in crate::db::zfile)`): a whole
-/// borrow of a mapping as it lies is written here, where a stride file is
+/// The token `MmapBytes::lend_whole_map` takes from the stride form, made
+/// in this module alone (its constructor is `pub(in crate::db::zfile)`): a
+/// whole borrow of a mapping as it lies is written here, where a stride file is
 /// opened, checked and read at its offsets, and a paged mapping, which lends
 /// none of it so, is read as no stride file; the compiler refuses it in any
 /// other module (forms.md R2).
-pub(crate) mod lend {
+pub(crate) mod lend_seal {
     pub struct Token(());
 
     impl Token {
@@ -3947,7 +3947,7 @@ impl ZFile {
     ) -> std::result::Result<StrideAttached, Reject> {
         let damage = |e: ZError| Reject::Damage(e.to_string());
         let identity = |why: &str| Reject::Identity(why.into());
-        let bytes: &[u8] = map.lent(lend::Token::new());
+        let bytes: &[u8] = map.lend_whole_map(lend_seal::Token::new());
         let (trailer, layout) = StrideBody::open(bytes).map_err(damage)?;
         let facts = blob
             .z_source_facts()
@@ -5883,7 +5883,7 @@ impl ZFile {
     /// The mapping whole, which a stride file's value pages are read from
     /// at their offsets.
     fn stride_bytes(&self) -> &[u8] {
-        self.map.lent(lend::Token::new())
+        self.map.lend_whole_map(lend_seal::Token::new())
     }
 
     /// Value page `p` of a stride file, checked against its word of the row
@@ -8888,7 +8888,7 @@ fn check_stride(
     let refused = StrideCheck::Refused(Outcome::NotStride(StrideNo::SelfCheck));
     let map = MmapBytes::open(tmp)?;
     let device = read_back_residency(&map, plan) == Some(0.0);
-    let bytes: &[u8] = map.lent(lend::Token::new());
+    let bytes: &[u8] = map.lend_whole_map(lend_seal::Token::new());
     let Ok(body) = StrideBody::from_bytes(bytes) else {
         return Ok(refused);
     };
@@ -10042,7 +10042,7 @@ pub(super) fn file_facts(
         if *stride == StrideAttach::Refuse {
             return None;
         }
-        let (t, lay) = StrideBody::open(map.lent(lend::Token::new())).ok()?;
+        let (t, lay) = StrideBody::open(map.lend_whole_map(lend_seal::Token::new())).ok()?;
         same_segment(&t.seg_ident(), &blob.z_source_facts()?, id, end_seq).ok()?;
         return Some(FileFacts {
             bytes: len,

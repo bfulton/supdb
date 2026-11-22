@@ -42,27 +42,28 @@
 use std::io::{Error, ErrorKind, Result};
 
 /// The read path's token, which `Bytes::lend_at` takes and only `blob` makes.
-use crate::blob::lend::Token as LendToken;
-/// The stride form's token, which `MmapBytes::lent` takes and only
-/// `db::zfile` makes.
+use crate::blob::lend_seal::Token as LendToken;
+/// The stride form's token, which `MmapBytes::lend_whole_map` takes and
+/// only `db::zfile` makes.
 #[cfg(not(target_family = "wasm"))]
 use crate::db::StrideLendToken;
-/// The ordered index's token, which `MmapBytes::lent` takes and only
-/// `ordindex` makes.
+/// The ordered index's token, which `MmapBytes::lend_whole_map` takes and
+/// only `ordindex` makes.
 #[cfg(not(target_family = "wasm"))]
 use crate::ordindex::OrdLendToken;
 
 /// The readers of a mapping as it lies, one token each; a trait in a
 /// private module, so no module but this one can give it to a type, and
-/// `MmapBytes::lent` takes a token of these readers and of nobody else.
+/// `MmapBytes::lend_whole_map` takes a token of these readers and of
+/// nobody else.
 #[cfg(not(target_family = "wasm"))]
-mod whole {
+mod whole_map_readers {
     pub trait Reader {}
 }
 #[cfg(not(target_family = "wasm"))]
-impl whole::Reader for OrdLendToken {}
+impl whole_map_readers::Reader for OrdLendToken {}
 #[cfg(not(target_family = "wasm"))]
-impl whole::Reader for StrideLendToken {}
+impl whole_map_readers::Reader for StrideLendToken {}
 
 /// A synchronous, random-access source of bytes.
 ///
@@ -102,11 +103,12 @@ pub trait Bytes {
     /// (`flatindex::Pieces`), so for a mapped file it is a range check and
     /// nothing else.
     ///
-    /// Sealed: the token is the read path's (`LendToken`, `blob::lend`), whose
-    /// module alone makes one, so the read path's dispatch is the one
-    /// caller of this, by the compiler, and no source outside the crate can
-    /// write the method to override it -- a reader written elsewhere asks
-    /// with `slice_at`, which every kind of source answers. The token is a
+    /// Sealed: the token is the read path's (`LendToken`,
+    /// `blob::lend_seal`), whose module alone makes one, so the read path's
+    /// dispatch is the one caller of this, by the compiler, and no source
+    /// outside the crate can write the method to override it -- a reader
+    /// written elsewhere asks with `slice_at`, which every kind of source
+    /// answers. The token is a
     /// zero-sized value and costs the call nothing.
     #[inline]
     fn lend_at(&self, off: u64, len: usize, _: LendToken) -> Option<&[u8]> {
@@ -364,7 +366,7 @@ unsafe impl Sync for MmapBytes {}
 /// and for as long as the caller's protection holds (`db::pager`).
 ///
 /// The engine's: crate-private, and its address asked for only with a token
-/// this module alone makes (`Base`), so the one reader of it is
+/// this module alone makes (`BaseAddressToken`), so the one reader of it is
 /// `MmapBytes::paged`, which lends nothing of it unasked.
 ///
 /// A paged mapping answers `Bytes::authenticated` with yes, and the readers
@@ -376,7 +378,7 @@ unsafe impl Sync for MmapBytes {}
 #[cfg(not(target_family = "wasm"))]
 pub(crate) trait Paging: Send + Sync {
     /// The mapping's first byte; it does not move.
-    fn base(&self, _: Base) -> *const u8;
+    fn base_address(&self, _: BaseAddressToken) -> *const u8;
     /// The file's length in bytes.
     fn size(&self) -> u64;
     /// `len` bytes at `off` made present; false where they cannot be (a
@@ -406,11 +408,11 @@ pub(crate) trait Paging: Send + Sync {
     fn willneed(&self, off: u64, len: usize) -> usize;
 }
 
-/// The token `Paging::base` takes: made in this module alone (its field is
-/// private), so the address behind a paged mapping is asked for by
+/// The token `Paging::base_address` takes: made in this module alone (its
+/// field is private), so the address behind a paged mapping is asked for by
 /// `MmapBytes::paged` and by nobody else.
 #[cfg(not(target_family = "wasm"))]
-pub(crate) struct Base(());
+pub(crate) struct BaseAddressToken(());
 
 /// The most of a mapping one `MADV_WILLNEED` asks for. Linux reads a
 /// will-need range ahead only up to the larger of the device's largest
@@ -447,7 +449,7 @@ impl MmapBytes {
     #[doc(hidden)]
     pub(crate) fn paged(pager: std::sync::Arc<dyn Paging>) -> MmapBytes {
         MmapBytes {
-            ptr: pager.base(Base(())),
+            ptr: pager.base_address(BaseAddressToken(())),
             lend: 0,
             len: pager.size(),
             own: Own::Paged(pager),
@@ -456,16 +458,16 @@ impl MmapBytes {
 
     /// The mapping as it lies: all of a mapped file, and nothing of a
     /// paged mapping, whose bytes are asked for through `slice_at`. Sealed:
-    /// the token is a reader's that may read a mapping so (`whole::Reader`,
-    /// implemented here alone): the ordered index, which checks its
-    /// checksum over its heads and reads them where they lie
-    /// (`ordindex::lend`), and the stride form, which reads its value pages
-    /// at their offsets (`db::zfile::lend`), each token made in its own
-    /// module alone, so the compiler refuses this call in any other. Any
+    /// the token is a reader's that may read a mapping so
+    /// (`whole_map_readers::Reader`, implemented here alone): the ordered
+    /// index, which checks its checksum over its heads and reads them where
+    /// they lie (`ordindex::lend_seal`), and the stride form, which reads
+    /// its value pages at their offsets (`db::zfile::lend_seal`), each
+    /// token made in its own module alone, so the compiler refuses this call in any other. Any
     /// other reader asks with `slice_at`. The token is a zero-sized value
     /// and costs the call nothing.
     #[inline]
-    pub(crate) fn lent<T: whole::Reader>(&self, _: T) -> &[u8] {
+    pub(crate) fn lend_whole_map<T: whole_map_readers::Reader>(&self, _: T) -> &[u8] {
         // SAFETY: `lend` bytes at `ptr` are a mapped file's, kept by `own`.
         unsafe { std::slice::from_raw_parts(self.ptr, self.lend as usize) }
     }

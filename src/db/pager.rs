@@ -1321,7 +1321,7 @@ impl Drop for Paged {
 }
 
 impl Paging for Paged {
-    fn base(&self, _: crate::bytes::Base) -> *const u8 {
+    fn base_address(&self, _: crate::bytes::BaseAddressToken) -> *const u8 {
         self.base
     }
 

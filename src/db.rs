@@ -74,9 +74,10 @@ pub mod zlz4;
 // and nothing outside `db` names it.
 pub(crate) mod blocks;
 mod zfile;
-/// The stride form's token for `MmapBytes::lent`, named here for the seam,
-/// which cannot reach into this private module; made in `zfile` alone.
-pub(crate) use zfile::lend::Token as StrideLendToken;
+/// The stride form's token for `MmapBytes::lend_whole_map`, named here for
+/// the seam, which cannot reach into this private module; made in `zfile`
+/// alone.
+pub(crate) use zfile::lend_seal::Token as StrideLendToken;
 pub use zfile::ZInject;
 // A store's directory encrypted by the kernel, under a key the caller gives
 // (`Encryption::Kernel`).

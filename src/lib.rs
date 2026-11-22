@@ -57,7 +57,7 @@
 //! ```
 //! ```compile_fail
 //! fn whole(p: &std::path::Path) -> std::io::Result<usize> {
-//!     Ok(supdb::MmapBytes::open(p)?.lent().len())
+//!     Ok(supdb::MmapBytes::open(p)?.lend_whole_map().len())
 //! }
 //! ```
 //! ```no_run
@@ -71,12 +71,12 @@
 //! from outside the crate, and a caller asks instead:
 //!
 //! ```compile_fail
-//! fn lent<B: supdb::Bytes>(b: &B) -> Option<&[u8]> {
+//! fn section<B: supdb::Bytes>(b: &B) -> Option<&[u8]> {
 //!     b.lend_at(0, 1)
 //! }
 //! ```
 //! ```no_run
-//! fn lent<B: supdb::Bytes>(b: &B) -> Option<&[u8]> {
+//! fn section<B: supdb::Bytes>(b: &B) -> Option<&[u8]> {
 //!     b.slice_at(0, 1)
 //! }
 //! ```
@@ -87,12 +87,12 @@
 //! refuse):
 //!
 //! ```compile_fail
-//! fn lent<B: supdb::Bytes>(b: &B) -> Option<&[u8]> {
-//!     b.lend_at(0, 1, supdb::blob::lend::Token::new())
+//! fn section<B: supdb::Bytes>(b: &B) -> Option<&[u8]> {
+//!     b.lend_at(0, 1, supdb::blob::lend_seal::Token::new())
 //! }
 //! ```
 //! ```compile_fail
-//! fn lent<B: supdb::Bytes>(b: &B) -> Option<&[u8]> {
+//! fn section<B: supdb::Bytes>(b: &B) -> Option<&[u8]> {
 //!     b.lend_at(0, 1, Default::default())
 //! }
 //! ```
@@ -110,7 +110,7 @@
 //!         dst.copy_from_slice(&self.0[off as usize..off as usize + dst.len()]);
 //!         Ok(())
 //!     }
-//!     fn lend_at(&self, off: u64, len: usize, _: supdb::blob::lend::Token) -> Option<&[u8]> {
+//!     fn lend_at(&self, off: u64, len: usize, _: supdb::blob::lend_seal::Token) -> Option<&[u8]> {
 //!         self.0.get(off as usize..off as usize + len)
 //!     }
 //! }

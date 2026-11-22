@@ -1488,48 +1488,67 @@ check that two inlined functions make of one quantity is counted before
 it is called one check.
 
 And a count is chosen among the shapes that hold a rule, never in place
-of one. `MmapBytes::lent`, the successor of the public `as_slice`, went in
-crate-private with no token, on the reading that a token a reader would
-raise the wall's count of the seam's paths out: any module of the crate
-could then write the whole borrow that answers the empty slice for a
-paged mapping, which is the hazard the seal is for, and review read it off
-the signature. It takes the ordered index's token or the stride form's,
-each made in its own module (`bytes::whole::Reader`, implemented in the
-seam alone), with the raise declared. A seal is as wide as its token's
-constructor and holds nothing the compiler cannot see: a derive or a
-`Default` on the token, a function of the reader's module that hands one
-out, one made by unsafe code, or a new caller inside the reader's own
-module all compile, and a red line abroad tries only the routes it names.
-tests/source.rs holds each token's module to its one text and every token
-to the call it is made for (`the_seals_tokens_are_made_only_where_they_are_spent`),
-and its first version read both as text, `Token::new` and `.lent(`: review
-wrote the route this paragraph names in spellings rustfmt keeps and the
-check read none of -- a function of the ordered index returning
-`<lend::Token>::new()`, spent abroad as `MmapBytes::lent(&m, hand())` -- and
-a renamed import and a call through a function value beside them, each
-compiling with no unsafe. It reads names now, as identifiers off the line
-with its literals blanked: a call by its method's name where a call puts
-it (after `.` with its arguments, after `::`), a token by every name it can
-be reached by (its module as a path, the names it is imported and
-re-exported under), each line that names one a listed declaration or a
-call that makes its token as its argument, and `lend_at` named nowhere
-outside the crate, where only unsafe code can make its token
-(`a_seals_token_spelled_another_way_fails` holds each spelling). The second
-review then handed the names to macros: `mk!(lend)` expanding to
-`$m::Token::new()` in the ordered index, and `call!(m, lent, hand())`
-expanding to `$b.$m($t)` in db.rs, the same hand-out and spend with no
-unsafe, where a reading by position finds `lend` before `)` and `lent`
-after `,`. Inside a macro's tokens -- an invocation's delimiters, a
-`macro_rules!` body -- a name's place is the macro's to choose, so the
-words `lent` and `lend` are refused there in any position but four
-assertions of tests, listed by file, scope and text. A check over source
-holds a name by every spelling the language gives it, and where a
-construct takes a name's position out of the text, as a macro's argument
-does, it holds the name in every position inside that construct; its red
-inputs are the spellings and not the one its author wrote. What it still
-cannot read is a name a macro builds from pieces (`concat_idents!` is
-unstable, `paste` is no dependency) or code from outside a file, which the
-wall refuses at a count of zero.
+of one. `MmapBytes::lend_whole_map`, the successor of the public
+`as_slice`, went in crate-private with no token, on the reading that a
+token a reader would raise the wall's count of the seam's paths out: any
+module of the crate could then write the whole borrow that answers the
+empty slice for a paged mapping, which is the hazard the seal is for, and
+review read it off the signature. It takes the ordered index's token or
+the stride form's, each made in its own module (`lend_seal`, the trait
+`bytes::whole_map_readers::Reader` implemented in the seam alone), with
+the raise declared. A seal is as wide as its token's constructor and
+holds nothing the compiler cannot see: a derive or a `Default` on the
+token, a function of the reader's module that hands one out, one made by
+unsafe code, or a new caller inside the reader's own module all compile,
+and a red line abroad tries only the routes it names. tests/source.rs
+holds each token's module to its one text and every token to the call it
+is made for (`the_seals_tokens_are_made_only_where_they_are_spent`), and
+its first version read both as text: review wrote the route this
+paragraph names in spellings rustfmt keeps and the check read none of --
+a function of the ordered index returning `<lend::Token>::new()`, spent
+abroad by type -- and a renamed import, a call through a function value
+and the names handed to macros as identifiers beside them, each compiling
+with no unsafe. The second version read the words by their position (a
+method after `.`, a module before `::`) and, inside a macro's tokens,
+refused `lent` and `lend` wherever they stood, with an exception list
+keyed by a line's text; and the stage's closing critic found it red on
+ordinary code -- `debug_assert!(to.lent <= n)` in the engine, any
+`.base(x)` of another type, a listed signature rustfmt split -- since
+`lent`, `lend` and `base` are common words here. The seal's words are
+names nothing else in the tree uses now (`lend_at`, `lend_whole_map`,
+`base_address`, `lend_seal`, the tokens' re-exports, `BaseAddressToken`,
+`whole_map_readers`), so each is read as an identifier wherever it
+stands, a macro's tokens included, with no rule for macros: every line of
+src that names one is a call at a site listed by file and scope with its
+token made inside its own parentheses, or a declaration at a site listed
+the same way and standing in a `use`, a listed impl's header, a call's
+signature or a token's module held whole; a `use` of one binds a
+re-export's name and nothing else, and each listed scope is one function
+of its file (`the_seal_leaves_ordinary_code_alone` holds the ordinary
+code and the rewrapped lines; the two `a_seals_token_*` tests hold each
+route). The first version of that held a declaration by its scope alone,
+and review found the scope of a top-level line is the whole top level: a
+macro handed the token's name there (`hand!(OrdLendToken);`) handed a
+token out, gave it an impl or gave the readers' trait to another type,
+where the exact text before it had refused every such line, and a second
+`fn file_facts` in a nested module of zfile took a listed scope's name.
+The rule: a check over source that holds a name holds it by every
+spelling the language gives it, and a name it holds is one the tree uses
+for nothing else, since a check over a common word is a check over
+everyone's code, and an exception list keyed by text is red at the next
+rustfmt; and a site keyed by scope admits whatever that scope can hold,
+so a scope as wide as the top level is keyed by the kind of item too.
+The second review found the call's token read from the word's first row
+of the table, which every row shared, so a row of another token would
+have held every call of the word to it: a value a table's row carries is
+read from the row that matched, and a case with two rows that differ
+holds it. What it still cannot read is a name a macro builds from pieces
+(`concat_idents!` is unstable, `paste` is no dependency), code from
+outside a file, which the wall refuses at a count of zero, and a closure:
+a call inside a closure of a listed scope is that scope's, as the lexer
+has it, so a listed reader that returns the closure, or a function value
+of it, hands the borrow out, and what a listed scope returns is read in
+review (a nested `fn` is a scope of its own, and refused).
 
 The same shape twice more, each read at the
 instruction (`--dump-instr=yes`, each instruction's count beside the

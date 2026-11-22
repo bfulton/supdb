@@ -175,13 +175,13 @@ use crate::bytes::{Bytes, MmapBytes};
 use std::io::{Error, ErrorKind, Result};
 use std::path::Path;
 
-/// The token `MmapBytes::lent` takes from the ordered index, made in this
-/// module alone (its constructor is `pub(in crate::ordindex)`): a whole
-/// borrow of a mapping as it lies is written here, where the index takes its
+/// The token `MmapBytes::lend_whole_map` takes from the ordered index, made
+/// in this module alone (its constructor is `pub(in crate::ordindex)`): a
+/// whole borrow of a mapping as it lies is written here, where the index takes its
 /// checksum over a mapped file and reads its heads where they lie, and asks
 /// a paged mapping by the piece; the compiler refuses it in any other
 /// module (forms.md R2).
-pub(crate) mod lend {
+pub(crate) mod lend_seal {
     pub struct Token(());
 
     impl Token {
@@ -193,7 +193,7 @@ pub(crate) mod lend {
 }
 
 /// The token by a name of its own, for the seam.
-pub(crate) use lend::Token as OrdLendToken;
+pub(crate) use lend_seal::Token as OrdLendToken;
 
 /// "SUPDORD1", little-endian. The trailing digit is the version, and it
 /// moves whenever an older reader would misread rather than refuse.
@@ -480,7 +480,7 @@ impl OrdIndex {
         let body = len - 4;
         // The mapping as it lies: all of a mapped file, and nothing of a
         // paged one, of which none is read below.
-        let whole = map.lent(lend::Token::new());
+        let whole = map.lend_whole_map(lend_seal::Token::new());
         let head = map
             .slice_at(0, HEADER)
             .ok_or_else(|| bad("its header does not read"))?;
@@ -840,7 +840,7 @@ impl OrdIndex {
     /// given a copy.
     pub(crate) fn mapped_heads(&self) -> Option<&[u8]> {
         self.map
-            .lent(lend::Token::new())
+            .lend_whole_map(lend_seal::Token::new())
             .get(HEADER..HEADER + self.n * HEAD)
             .filter(|_| !self.map.piecewise())
     }
@@ -2096,7 +2096,7 @@ mod tests {
     /// of any other: what a mapping read by the piece is to an index.
     struct InMemory(Vec<u8>, f64, std::ops::Range<u64>);
     impl crate::bytes::Paging for InMemory {
-        fn base(&self, _: crate::bytes::Base) -> *const u8 {
+        fn base_address(&self, _: crate::bytes::BaseAddressToken) -> *const u8 {
             self.0.as_ptr()
         }
         fn size(&self) -> u64 {

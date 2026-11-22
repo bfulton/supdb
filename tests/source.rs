@@ -6167,17 +6167,40 @@ fn a_group_no_ci_job_runs_fails() {
 // borrow takes; what the compiler cannot see is the token's own module
 // growing a second way to make one (a derive, an impl, a function that
 // hands one out), a token made by unsafe code, or a new caller inside the
-// reader's own module. This holds each of those by the source, reading
-// names as identifiers and not text, so a qualified path, a renamed import,
-// a call by type or through a function value is read as the plain spelling
-// is (`a_seals_token_spelled_another_way_fails`); inside a macro's tokens,
-// where a name handed in as an identifier is put where the macro chooses
-// (`mk!(lend)` making `$m::Token::new()`, `call!(m, lent, t)` making
-// `$b.$m($t)`), `lent` and `lend` are refused in every position; and
-// outside the crate, where only unsafe code can make a token, `lend_at` is
-// not named at all. What it cannot read is a name a macro builds from
-// pieces (`concat_idents!` is unstable, `paste` is no dependency), and code
-// from outside a listed file is the wall's to refuse.
+// reader's own module. The seal's words are names nothing else in the tree
+// uses (`SEAL_CALLS`' calls and `SEAL_WORDS`), so this reads each as an
+// identifier wherever it stands -- in a path, a call by type, a function
+// value, a macro's tokens -- with comments and literals aside, and holds
+// every line that names one to a site listed for it, by file and scope
+// (`SEAL_CALLS`, `SEAL_DECLS`), a declaration's word by the item it stands
+// in as well (a `use`, an impl's header, a call's signature, a token's
+// module), and each listed scope to one function of its file. Nothing is
+// keyed by a line's text, so rustfmt rewrapping a listed line cannot turn
+// it red. A token is made only inside the parentheses of the call it is
+// for, read on the file's flat text with whitespace aside. Outside the
+// crate, where only unsafe code can make a token, `lend_at` is not named at
+// all. What it cannot read is a name a macro builds from pieces
+// (`concat_idents!` is unstable, `paste` is no dependency), code from
+// outside a listed file, which is the wall's to refuse, and a closure: a
+// listed scope's call inside a closure, or a function value of one, is the
+// scope's as the lexer has it, so a listed reader that returns such a
+// closure hands the borrow out (a nested `fn` is a scope of its own and
+// is refused). What a listed scope returns is read in review.
+
+/// The names a token or the readers' trait is reached by: the token
+/// modules, the names the tokens are imported and re-exported under, the
+/// address token, and the trait's module. The calls are `SEAL_CALLS`'.
+const SEAL_WORDS: &[&str] = &[
+    "lend_seal",
+    "LendToken",
+    "OrdLendToken",
+    "StrideLendToken",
+    "BaseAddressToken",
+    "whole_map_readers",
+];
+
+/// The names a `use` of a seal's word may bind: the re-exports'.
+const SEAL_BOUND: &[&str] = &["LendToken", "OrdLendToken", "StrideLendToken"];
 
 /// The token modules: the file, the module path the constructor is
 /// confined to.
@@ -6187,458 +6210,357 @@ const SEAL_TOKENS: &[(&str, &str)] = &[
     ("src/db/zfile.rs", "crate::db::zfile"),
 ];
 
-/// The calls a token is made for, by the name the call is made by: the
-/// files and scopes that may make it, and the token as it is written at the
-/// call. A name is read as an identifier, whatever path or receiver it is
-/// reached by -- `m.lent(..)`, `MmapBytes::lent(m, ..)`, `<B as
-/// Bytes>::lend_at` as a value -- so the spelling of the call does not
-/// matter; `lent` and `base` are common names and are read only where they
-/// are a method's (after `.` with a call, after `::`), `fn` ahead of a name
-/// being its definition -- outside a macro: inside one `lent` and `lend`
-/// are refused wherever they stand (`seal_in_macro`, `SEAL_MACRO_WORDS`).
-type SealHomes = &'static [(&'static str, &'static [&'static str])];
-const SEAL_CALLS: &[(&str, SealHomes, &str)] = &[
-    (
-        "lend_at",
-        &[("src/blob.rs", &["Sec::lend", "Sec::get"])],
-        "lend::Token::new())",
-    ),
-    (
-        "lent",
-        &[
-            (
-                "src/ordindex.rs",
-                &["OrdIndex::over", "OrdIndex::mapped_heads"],
-            ),
-            (
-                "src/db/zfile.rs",
-                &[
-                    "ZFile::attach_stride",
-                    "ZFile::stride_bytes",
-                    "check_stride",
-                    "file_facts",
-                ],
-            ),
-        ],
-        "lend::Token::new())",
-    ),
-    (
-        "base",
-        &[("src/bytes.rs", &["MmapBytes::paged"])],
-        "Base(()))",
-    ),
-];
+/// The calls, each with its token as it is made inside the call's own
+/// parentheses (its last argument, whitespace aside), and the files and
+/// scopes of the code that may make it -- the readers of a mapped file or
+/// a section whole. A new such reader is a scope added here, in review.
+/// One file a row: call | token | file | scopes.
+const SEAL_CALLS: &str = "
+lend_at        | lend_seal::Token::new() | src/blob.rs     | Sec::lend Sec::get
+lend_whole_map | lend_seal::Token::new() | src/ordindex.rs | OrdIndex::over OrdIndex::mapped_heads
+lend_whole_map | lend_seal::Token::new() | src/db/zfile.rs | ZFile::attach_stride ZFile::stride_bytes
+lend_whole_map | lend_seal::Token::new() | src/db/zfile.rs | check_stride file_facts
+base_address   | BaseAddressToken(())    | src/bytes.rs    | MmapBytes::paged
+";
 
-/// The lines that name a seal's token and make no call, by file and text:
-/// the token modules, the imports and re-exports of the tokens, the
-/// signatures that take one, and the seam's impls of the readers' trait.
-/// A token's names are the module `lend` as a path (`lend::`, `mod lend`,
-/// any `use` of it), the three names the tokens are imported and
-/// re-exported under, and `Base` (in the seam, and as `bytes::Base`
-/// elsewhere). Every other line that names one is a call's, made at the
-/// call, or red: a token made apart from its call, by any path, under a
-/// renamed import or the re-export's name, cannot be spent.
-const SEAL_DECLS: &[(&str, &str)] = &[
-    ("src/blob.rs", "pub(crate) mod lend {"),
-    ("src/ordindex.rs", "pub(crate) mod lend {"),
-    ("src/db/zfile.rs", "pub(crate) mod lend {"),
-    ("src/bytes.rs", "use crate::blob::lend::Token as LendToken;"),
-    ("src/bytes.rs", "use crate::db::StrideLendToken;"),
-    ("src/bytes.rs", "use crate::ordindex::OrdLendToken;"),
-    ("src/bytes.rs", "impl whole::Reader for OrdLendToken {}"),
-    ("src/bytes.rs", "impl whole::Reader for StrideLendToken {}"),
-    (
-        "src/bytes.rs",
-        "fn lend_at(&self, off: u64, len: usize, _: LendToken) -> Option<&[u8]> {",
-    ),
-    ("src/bytes.rs", "fn base(&self, _: Base) -> *const u8;"),
-    ("src/bytes.rs", "pub(crate) struct Base(());"),
-    (
-        "src/ordindex.rs",
-        "pub(crate) use lend::Token as OrdLendToken;",
-    ),
-    (
-        "src/ordindex.rs",
-        "fn base(&self, _: crate::bytes::Base) -> *const u8 {",
-    ),
-    (
-        "src/db/pager.rs",
-        "fn base(&self, _: crate::bytes::Base) -> *const u8 {",
-    ),
-    (
-        "src/db.rs",
-        "pub(crate) use zfile::lend::Token as StrideLendToken;",
-    ),
-];
+/// The scopes that may name a seal's word outside a call, with the words
+/// each may name: the token modules, the uses and re-exports of the
+/// tokens, the readers' trait and its impls, the definitions of the calls
+/// and the signatures that take a token. A word at one of them stands in
+/// a `use`, an impl's header or a call's signature, none of which can
+/// make a token, or in a token's module or struct, held whole above.
+/// `Paging::<item>` is the trait's one-line signature, which the lexer
+/// reads as the trait's items since its `;` closes it before the line
+/// ends. One scope a row: file | scope | words.
+const SEAL_DECLS: &str = "
+src/blob.rs     | mod lend_seal             | lend_seal
+src/ordindex.rs | mod lend_seal             | lend_seal
+src/ordindex.rs | <item>                    | lend_seal OrdLendToken
+src/ordindex.rs | InMemory::base_address    | base_address BaseAddressToken
+src/db/zfile.rs | mod lend_seal             | lend_seal
+src/db.rs       | <item>                    | lend_seal StrideLendToken
+src/db/pager.rs | Paged::base_address       | base_address BaseAddressToken
+src/bytes.rs    | <item>                    | lend_seal LendToken OrdLendToken StrideLendToken
+src/bytes.rs    | <item>                    | whole_map_readers
+src/bytes.rs    | mod whole_map_readers     | whole_map_readers
+src/bytes.rs    | Bytes::lend_at            | lend_at LendToken
+src/bytes.rs    | MmapBytes::lend_at        | lend_at LendToken
+src/bytes.rs    | Paging::base_address      | base_address BaseAddressToken
+src/bytes.rs    | Paging::<item>            | base_address BaseAddressToken
+src/bytes.rs    | struct BaseAddressToken   | BaseAddressToken
+src/bytes.rs    | MmapBytes::lend_whole_map | lend_whole_map whole_map_readers
+";
 
-/// The names a line calls a seal's call by, and the names of a seal's
-/// token it holds, read off the line with its literals blanked. `in_use`:
-/// the line is inside a `use` item.
-fn seal_names(file: &str, flat: &str, in_use: bool) -> (Vec<&'static str>, usize) {
-    let c: Vec<char> = flat.chars().collect();
-    let before = |i: usize| -> String {
-        let mut j = i;
-        while j > 0 && c[j - 1].is_whitespace() {
-            j -= 1;
-        }
-        let st = j.saturating_sub(2);
-        c[st..j].iter().collect()
-    };
-    let after = |i: usize| -> String {
-        let mut j = i;
-        while j < c.len() && c[j].is_whitespace() {
-            j += 1;
-        }
-        let mut k = j;
-        let mut out = String::new();
-        while k < c.len() && out.len() < 2 {
-            if !c[k].is_whitespace() {
-                out.push(c[k]);
-            }
-            k += 1;
-        }
-        out
-    };
-    let ws = words(&c);
-    let mut calls = Vec::new();
-    let mut toks = 0;
-    for (n, (i, w)) in ws.iter().enumerate() {
-        let end = i + w.chars().count();
-        let (pre, post) = (before(*i), after(end));
-        let def = n > 0 && ws[n - 1].1 == "fn";
-        let dot = pre.ends_with('.') && !pre.ends_with("..");
-        let path = pre == "::";
-        match w.as_str() {
-            "lend_at" if !def => calls.push("lend_at"),
-            "lent" if !def && (path || (dot && (post.starts_with('(') || post == "::"))) => {
-                calls.push("lent")
-            }
-            "base"
-                if !def
-                    && ((dot && post.starts_with('(') && post != "()")
-                        || (path && post != "()")) =>
-            {
-                calls.push("base")
-            }
-            "lend" if post == "::" || in_use || (n > 0 && ws[n - 1].1 == "mod") => toks += 1,
-            "LendToken" | "OrdLendToken" | "StrideLendToken" => toks += 1,
-            "Base" if file == "src/bytes.rs" || (path && n > 0 && ws[n - 1].1 == "bytes") => {
-                toks += 1
-            }
-            _ => {}
-        }
-    }
-    (calls, toks)
+/// The impls a seal's word may stand in, by file and header (whitespace
+/// aside): the readers' trait for its two tokens. The constructor's impl
+/// is the token module's, held whole.
+const SEAL_IMPLS: &str = "
+src/bytes.rs | impl whole_map_readers::Reader for OrdLendToken
+src/bytes.rs | impl whole_map_readers::Reader for StrideLendToken
+";
+
+/// A table's rows, each cut at `|` and trimmed.
+fn seal_rows(t: &str) -> Vec<Vec<&str>> {
+    let rows = t.lines().filter(|l| !l.trim().is_empty());
+    rows.map(|l| l.split('|').map(str::trim).collect())
+        .collect()
 }
 
-/// The lines that name `lent` or `lend` inside a macro's tokens and are not
-/// the seal's, by file, scope and text: locals of those names in the
-/// assertions of tests. Keyed by the scope as well, so the same text in a
-/// macro of another function -- `lent,` as a macro's argument -- is red.
-const SEAL_MACRO_WORDS: &[(&str, &str, &str)] = &[
-    (
-        "src/crypt.rs",
-        "every_range_reads_as_the_plaintext_does",
-        "Some(lent) => assert_eq!(lent, &p[a..b], \"lent {a}..{b}, {what}\"),",
-    ),
-    (
-        "src/db.rs",
-        "a_writer_that_has_lent_its_upkeep_leaves_the_sweep_to_the_thread_that_has_it",
-        "lent,",
-    ),
-    (
-        "src/db/pager.rs",
-        "nothing_is_given_back_under_a_hold",
-        "assert_eq!(lent, &bytes[..], \"the bytes lent are still the bytes\");",
-    ),
-    (
-        "src/flatindex.rs",
-        "rank_order_matches_key_order",
-        "assert_eq!(lent.as_deref(), Some(e.as_slice()));",
-    ),
-];
-
-/// Which characters of a flat line are inside a macro's tokens -- an
-/// invocation's delimiters and what they hold, or a `macro_rules!`
-/// definition's -- carrying the bracket depth and the open macros' depths
-/// across lines. Inside a macro a name's position is the macro's to choose
-/// (`$b.$m($t)`, `$m::Token`), so no reading by position holds it there.
-fn seal_in_macro(c: &[char], depth: &mut i64, open: &mut Vec<i64>) -> Vec<bool> {
-    const KEYWORDS: &[&str] = &[
-        "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
-        "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move",
-        "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait",
-        "true", "type", "unsafe", "use", "where", "while", "yield",
-    ];
-    let skip = |mut j: usize| {
-        while j < c.len() && c[j].is_whitespace() {
-            j += 1;
-        }
-        j
-    };
-    // The delimiters that open a macro: after `name!`, or `macro_rules!
-    // name`, with any whitespace between.
-    let mut opener = vec![false; c.len()];
-    for (i, &ch) in c.iter().enumerate() {
-        if ch != '!' {
-            continue;
-        }
-        let mut b = i;
-        while b > 0 && c[b - 1].is_whitespace() {
-            b -= 1;
-        }
-        let mut a = b;
-        while a > 0 && lex::is_word(c[a - 1]) {
-            a -= 1;
-        }
-        let name: String = c[a..b].iter().collect();
-        if name.is_empty() || KEYWORDS.contains(&name.as_str()) {
-            continue;
-        }
-        let mut j = skip(i + 1);
-        if name == "macro_rules" {
-            while j < c.len() && lex::is_word(c[j]) {
-                j += 1;
-            }
-            j = skip(j);
-        }
-        if j < c.len() && matches!(c[j], '(' | '[' | '{') {
-            opener[j] = true;
-        }
-    }
-    let mut inside = vec![false; c.len()];
-    for (i, &ch) in c.iter().enumerate() {
-        match ch {
-            '(' | '[' | '{' => {
-                if opener[i] {
-                    open.push(*depth);
-                }
-                *depth += 1;
-                inside[i] = !open.is_empty();
-            }
-            ')' | ']' | '}' => {
-                inside[i] = !open.is_empty();
-                *depth -= 1;
-                if open.last() == Some(depth) {
-                    open.pop();
-                }
-            }
-            _ => inside[i] = !open.is_empty(),
-        }
-    }
-    inside
-}
+/// What a failure tells its author to do.
+const SEAL_HELP: &str = "A line above names a word of the seal outside the sites that may. A \
+reader that holds a mapped file or a section whole answers nothing under a cipher unless it \
+has an arm by the piece (forms.md R2; CLAUDE.md, the paragraph on the seal): such a reader is \
+a scope added to SEAL_CALLS in tests/source.rs, in review. Anything else asks the source for \
+its bytes with `slice_at`, which every kind of source answers.";
 
 fn squash(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn seal_check(src: &BTreeMap<String, String>) -> Result<(), String> {
-    let mut errs = Vec::new();
-    let code_of = |f: &str| -> Vec<(String, String, bool)> {
-        regions(&src[f])
-            .into_iter()
-            .map(|l| (l.code, l.scope, l.test))
-            .collect()
-    };
-    // 1. Each token module is a struct with a private field and one
-    // constructor confined to its module: no derive, no impl, no field.
-    for (f, path) in SEAL_TOKENS {
-        let lines = code_of(f);
-        let text: String = lines.iter().map(|(c, _, _)| format!("{c}\n")).collect();
-        let starts: Vec<usize> = text.match_indices("mod lend").map(|(i, _)| i).collect();
-        if starts.len() != 1 {
-            errs.push(format!(
-                "{f}: {} `mod lend` where one is the seal's",
-                starts.len()
-            ));
-            continue;
+/// The text from `from` to the first of `ends` at depth zero of the
+/// parentheses between, and where it stops. Brackets are not counted: a
+/// `;` or `{` inside brackets at depth zero of the parentheses ends a span
+/// early, which leaves the words after it to the scope they stand in.
+fn seal_until(c: &[char], from: usize, ends: &[char]) -> (String, usize) {
+    let mut depth = 0i64;
+    let mut j = from;
+    while j < c.len() {
+        match c[j] {
+            ch if depth == 0 && ends.contains(&ch) => break,
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
         }
-        let at = text[..starts[0]].rfind('\n').map_or(0, |i| i + 1);
-        let Some(open) = text[at..].find('{').map(|i| at + i) else {
-            errs.push(format!("{f}: `mod lend` has no body"));
-            continue;
-        };
-        let mut depth = 0usize;
-        let mut end = None;
-        for (i, c) in text[open..].char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(open + i + 1);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let Some(end) = end else {
-            errs.push(format!("{f}: `mod lend` does not close"));
-            continue;
-        };
-        let want = format!(
-            "pub(crate) mod lend {{ pub struct Token(()); impl Token {{ #[inline(always)] \
-             pub(in {path}) fn new() -> Token {{ Token(()) }} }} }}"
-        );
-        let got = squash(&text[at..end]);
-        if got != want {
-            errs.push(format!(
-                "{f}: the token's module is `{got}`, where the seal's is `{want}`"
-            ));
-        }
+        j += 1;
     }
-    // 2. The address token: a unit struct with a private field, no derive,
-    // made at the one call.
-    let bytes = code_of("src/bytes.rs");
-    let defs: Vec<usize> = bytes
+    (c[from..j].iter().collect(), j)
+}
+
+/// A file's module `name`, from its line's start to its closing brace,
+/// whitespace aside; an error where the file has none or several.
+fn seal_module(f: &str, text: &str, name: &str) -> Result<String, String> {
+    let code: String = regions(text)
         .iter()
-        .enumerate()
-        .filter(|(_, (c, _, _))| c.contains("struct Base"))
+        .map(|l| format!("{}\n", l.code))
+        .collect();
+    let starts: Vec<usize> = code
+        .match_indices(&format!("mod {name}"))
         .map(|(i, _)| i)
         .collect();
-    match defs.as_slice() {
-        [i] => {
-            if squash(&bytes[*i].0) != "pub(crate) struct Base(());" {
-                errs.push(format!(
-                    "src/bytes.rs: `Base` is `{}`",
-                    squash(&bytes[*i].0)
-                ));
-            }
-            let mut j = *i;
-            while j > 0 {
-                j -= 1;
-                let c = bytes[j].0.trim();
-                if c.is_empty() {
-                    continue;
+    let [start] = starts[..] else {
+        return Err(format!(
+            "{f}: {} `mod {name}` where one is the seal's",
+            starts.len()
+        ));
+    };
+    let at = code[..start].rfind('\n').map_or(0, |i| i + 1);
+    let open = code[at..].find('{').map_or(code.len(), |i| at + i);
+    let mut depth = 0usize;
+    for (i, c) in code[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(squash(&code[at..open + i + 1]));
                 }
-                if !c.starts_with("#[") {
+            }
+            _ => {}
+        }
+    }
+    Err(format!("{f}: `mod {name}` does not close"))
+}
+
+fn seal_check(src: &BTreeMap<String, String>) -> Result<(), String> {
+    seal_check_with(src, SEAL_CALLS)
+}
+
+/// `seal_check` with the calls' table given, so a case can hold how a
+/// table is read.
+fn seal_check_with(src: &BTreeMap<String, String>, calls: &str) -> Result<(), String> {
+    let mut errs = Vec::new();
+    // 1. Each token module is a struct with a private field and one
+    // constructor confined to its module: no derive, no impl, no field;
+    // and the readers' trait is one empty trait in a private module.
+    let mut shapes: Vec<(&str, &str, String)> = SEAL_TOKENS
+        .iter()
+        .map(|(f, path)| {
+            let want = format!(
+                "pub(crate) mod lend_seal {{ pub struct Token(()); impl Token {{ \
+                 #[inline(always)] pub(in {path}) fn new() -> Token {{ Token(()) }} }} }}"
+            );
+            (*f, "lend_seal", want)
+        })
+        .collect();
+    shapes.push((
+        "src/bytes.rs",
+        "whole_map_readers",
+        "mod whole_map_readers { pub trait Reader {} }".into(),
+    ));
+    for (f, name, want) in shapes {
+        match seal_module(f, &src[f], name) {
+            Ok(got) if got == want => {}
+            Ok(got) => errs.push(format!(
+                "{f}: `mod {name}` is `{got}`, where the seal's is `{want}`"
+            )),
+            Err(e) => errs.push(e),
+        }
+    }
+    // 2. The address token: a unit struct with a private field and no
+    // derive.
+    let bytes = regions(&src["src/bytes.rs"]);
+    let defs: Vec<usize> = (0..bytes.len())
+        .filter(|&i| bytes[i].scope == "struct BaseAddressToken")
+        .collect();
+    match defs.as_slice() {
+        &[i] => {
+            let got = squash(&bytes[i].code);
+            if got != "pub(crate) struct BaseAddressToken(());" {
+                errs.push(format!("src/bytes.rs: `BaseAddressToken` is `{got}`"));
+            }
+            for l in bytes[..i].iter().rev().map(|l| l.code.trim()) {
+                if !l.is_empty() && !l.starts_with("#[") {
                     break;
                 }
-                if c != "#[cfg(not(target_family = \"wasm\"))]" {
-                    errs.push(format!("src/bytes.rs: `Base` carries `{c}`"));
+                if !l.is_empty() && l != "#[cfg(not(target_family = \"wasm\"))]" {
+                    errs.push(format!("src/bytes.rs: `BaseAddressToken` carries `{l}`"));
                 }
             }
         }
-        _ => errs.push(format!(
-            "src/bytes.rs: {} definitions of `Base`",
-            defs.len()
+        d => errs.push(format!(
+            "src/bytes.rs: {} definitions of `BaseAddressToken`",
+            d.len()
         )),
     }
-    // 3. No impl gives a token anything but the seal's own (the
-    // constructor in its module, the readers' trait in the seam).
-    let allowed_impls = [
-        "impl Token {",
-        "impl whole::Reader for OrdLendToken {}",
-        "impl whole::Reader for StrideLendToken {}",
-    ];
-    for f in src.keys() {
+    // 3. Every line that names a word of the seal is a site listed for it.
+    let (calls, decls) = (seal_rows(calls), seal_rows(SEAL_DECLS));
+    for (f, text) in src {
         if !f.ends_with(".rs") {
             continue;
         }
-        let home = SEAL_TOKENS.iter().any(|(h, _)| h == f);
-        for (c, scope, _) in code_of(f) {
-            let t = squash(&c);
-            if !t.contains("impl") {
-                continue;
-            }
-            let names_token = t.contains("lend::Token")
-                || t.contains("LendToken")
-                || t.contains("whole::Reader")
-                || (home
-                    && words(&t.chars().collect::<Vec<_>>())
-                        .iter()
-                        .any(|(_, w)| w == "Token"))
-                || (f == "src/bytes.rs"
-                    && words(&t.chars().collect::<Vec<_>>())
-                        .iter()
-                        .any(|(_, w)| w == "Base"));
-            if names_token && !allowed_impls.contains(&t.as_str()) {
-                errs.push(format!("{f} ({scope}): `{t}` gives a seal's token an impl"));
+        let lines = regions(text);
+        let (mut c, mut at) = (Vec::new(), Vec::new());
+        for (n, l) in lines.iter().enumerate() {
+            for ch in l.flat.chars().chain(['\n']) {
+                c.push(ch);
+                at.push(n);
             }
         }
-    }
-    // 4. A seal's call is made only by its readers, in the scopes listed,
-    // with its token made as its last argument; a line that names a token
-    // and makes no call is one of the listed lines. A new reader of a
-    // mapping as it lies is a line of SEAL_CALLS, read in review.
-    for f in src.keys() {
-        if !f.ends_with(".rs") {
-            continue;
+        let ws = words(&c);
+        let line = |i: usize| &lines[at[i]];
+        // The items a declaration may name a word in: a `use`, an impl's
+        // header, the signature of a call's definition; and each listed
+        // site a function defined once, so no second reader takes its name.
+        let mut items = Vec::new();
+        let mut defs: BTreeMap<&str, usize> = BTreeMap::new();
+        for (k, (i, w)) in ws.iter().enumerate() {
+            let next = ws.get(k + 1).map(|x| x.1.as_str()).unwrap_or("");
+            let end = match w.as_str() {
+                "use" => seal_until(&c, *i, &[';']).1,
+                "impl" => seal_until(&c, *i, &['{', ';']).1,
+                "fn" if calls.iter().any(|r| r[0] == next) => seal_until(&c, *i, &['{', ';']).1,
+                _ => 0,
+            };
+            if end > 0 {
+                items.push((*i, end));
+            }
+            if w == "fn" && k + 1 < ws.len() {
+                let s = line(ws[k + 1].0).scope.as_str();
+                // A nested fn's scope is `outer>inner`, which no row lists.
+                if s == next || s.ends_with(&format!("::{next}")) {
+                    *defs.entry(s).or_default() += 1;
+                }
+            }
         }
-        let mut in_use = false;
-        let (mut depth, mut open) = (0i64, Vec::new());
-        for l in regions(&src[f]) {
-            let t = squash(&l.code);
-            let ft = squash(&l.flat);
-            let fc: Vec<char> = l.flat.chars().collect();
-            let inside = seal_in_macro(&fc, &mut depth, &mut open);
-            let in_macro = words(&fc)
-                .iter()
-                .any(|(i, w)| (w == "lent" || w == "lend") && inside[*i]);
-            if in_macro && !SEAL_MACRO_WORDS.contains(&(f.as_str(), l.scope.as_str(), t.as_str())) {
-                errs.push(format!(
-                    "{f} ({}): `{t}` names `lent` or `lend` inside a macro, where the macro \
-                     chooses its place (SEAL_MACRO_WORDS)",
-                    l.scope
-                ));
-            }
-            let opens_use = ft.starts_with("use ")
-                || ft.starts_with("pub use ")
-                || (ft.starts_with("pub(") && ft.contains(") use "));
-            in_use |= opens_use;
-            let (calls, toks) = seal_names(f, &l.flat, in_use);
-            if in_use && ft.contains(';') {
-                in_use = false;
-            }
-            let scope = &l.scope;
-            if SEAL_DECLS.contains(&(f.as_str(), t.as_str())) && calls.is_empty() {
-                continue;
-            }
-            if calls.is_empty() {
-                if toks > 0 {
+        for r in calls.iter().filter(|r| r[2] == f) {
+            for s in r[3].split_whitespace() {
+                let n = defs.get(s).copied().unwrap_or(0);
+                if n != 1 {
+                    let name = s.rsplit(':').next().unwrap_or(s);
                     errs.push(format!(
-                        "{f} ({scope}): `{t}` names a seal's token outside the call it is made for"
+                        "{f}: {n} definitions of `{name}`, where a site of the seal is one"
                     ));
                 }
+            }
+        }
+        let mut say = |i: usize, why: String| {
+            let l = line(i);
+            errs.push(format!("{f} ({}): `{}` {why}", l.scope, squash(&l.code)));
+        };
+        let decl = |i: usize, w: &str| {
+            decls.iter().any(|r| {
+                r[0] == f && r[1] == line(i).scope && r[2].split_whitespace().any(|x| x == w)
+            })
+        };
+        let outside =
+            |w: &str| format!("names `{w}`, a word of the seal, outside the sites that may");
+        // A call: at a listed site, with its token made in its own
+        // parentheses; a definition: at a declaration.
+        let mut spans = Vec::new();
+        for (k, (i, w)) in ws.iter().enumerate() {
+            if !calls.iter().any(|r| r[0] == w) {
                 continue;
             }
-            let mut made = 0;
-            for (call, homes, token) in SEAL_CALLS {
-                if !calls.contains(call) {
-                    continue;
+            if k > 0 && ws[k - 1].1 == "fn" {
+                if !decl(*i, w) {
+                    say(*i, outside(w));
                 }
-                let named: Vec<&str> = homes.iter().map(|(h, _)| *h).collect();
-                match homes.iter().find(|(h, _)| h == f) {
-                    None => errs.push(format!(
-                        "{f} ({scope}): `{t}` calls `{call}` outside {}",
-                        named.join(", ")
-                    )),
-                    Some((_, scopes)) if !scopes.contains(&scope.as_str()) => errs.push(format!(
-                        "{f} ({scope}): `{t}`: a caller of `{call}` that is not listed (SEAL_CALLS)"
-                    )),
-                    Some(_) => made += t.matches(token).count(),
+                continue;
+            }
+            let l = line(*i);
+            let home = calls
+                .iter()
+                .find(|r| r[0] == w && r[2] == f && r[3].split_whitespace().any(|s| s == l.scope));
+            let Some(token) = home.filter(|_| !l.test).map(|r| r[1]) else {
+                say(*i, outside(w));
+                continue;
+            };
+            let mut j = i + w.chars().count();
+            while j < c.len() && c[j].is_whitespace() {
+                j += 1;
+            }
+            if c.get(j) != Some(&'(') {
+                say(*i, format!("names `{w}` without calling it"));
+                continue;
+            }
+            let (_, close) = seal_until(&c, j + 1, &[')']);
+            spans.push((j, close));
+            // From the first word of the seal inside to the close, so a
+            // second token there is text the token is not.
+            let made: Option<String> = ws
+                .iter()
+                .find(|(p, x)| *p > j && *p < close && SEAL_WORDS.contains(&x.as_str()))
+                .map(|(p, _)| c[*p..close].iter().filter(|c| !c.is_whitespace()).collect());
+            if made.as_deref().map(|m| m.trim_end_matches(',')) != Some(token) {
+                say(
+                    *i,
+                    format!("calls `{w}` with no token made in its parentheses as `{token}`"),
+                );
+            }
+        }
+        for (i, w) in &ws {
+            // A token's name outside a call: at a declaration, in a module
+            // or a struct held whole above, or in a `use`, an impl's header
+            // or a call's signature, none of which can make a token.
+            if SEAL_WORDS.contains(&w.as_str()) && !spans.iter().any(|(a, b)| a < i && i < b) {
+                let s = &line(*i).scope;
+                if !decl(*i, w) {
+                    say(*i, outside(w));
+                } else if !s.starts_with("mod ")
+                    && !s.starts_with("struct ")
+                    && !items.iter().any(|(a, b)| a <= i && i < b)
+                {
+                    say(
+                        *i,
+                        format!("names `{w}` at a declaration of the seal, outside its `use`, its listed impl or its call's signature"),
+                    );
                 }
             }
-            if made != calls.len() || toks != calls.len() {
-                errs.push(format!(
-                    "{f} ({scope}): `{t}`: `{}` with a token not made at the call",
-                    calls.join("`, `")
-                ));
+            // A `use` of a seal's word binds a re-export's name, one at a
+            // time; an impl that names one is listed.
+            let (head, _) = match w.as_str() {
+                "use" => seal_until(&c, *i, &[';']),
+                "impl" => seal_until(&c, *i, &['{', ';']),
+                _ => continue,
+            };
+            let hw = words(&head.chars().collect::<Vec<_>>());
+            if !hw.iter().any(|(_, x)| SEAL_WORDS.contains(&x.as_str())) {
+                continue;
+            }
+            let head = squash(&head);
+            if w == "impl" {
+                if !seal_rows(SEAL_IMPLS)
+                    .iter()
+                    .any(|r| r[0] == f && r[1] == head)
+                {
+                    say(
+                        *i,
+                        "gives a seal's token or the readers' trait an impl".into(),
+                    );
+                }
+            } else {
+                let bound = hw.last().map(|(_, x)| x.as_str()).unwrap_or("");
+                if head.contains(['{', '*']) || !SEAL_BOUND.contains(&bound) {
+                    say(
+                        *i,
+                        format!(
+                            "imports a seal's word as `{bound}`, a name that is not the seal's"
+                        ),
+                    );
+                }
             }
         }
     }
     if errs.is_empty() {
         Ok(())
     } else {
-        Err(errs.join("\n"))
+        Err(format!("{}\n{SEAL_HELP}", errs.join("\n")))
     }
 }
 
 /// The Rust files of the tests, the examples and the suite: code outside
-/// the crate, which reaches `Bytes::lend_at` by its name alone (`lent` and
-/// `Paging` are the crate's), with a token made by unsafe code
+/// the crate, which reaches `Bytes::lend_at` by its name alone (the seal's
+/// other words are the crate's), with a token made by unsafe code
 /// (`std::mem::zeroed()`) since none can be made safely there.
 fn outside_sources(root: &Path) -> BTreeMap<String, String> {
     fn walk(dir: &Path, root: &Path, out: &mut BTreeMap<String, String>) {
@@ -6678,10 +6600,12 @@ fn seal_outside_check(out: &BTreeMap<String, String>) -> Result<(), String> {
     let mut errs = Vec::new();
     for (f, text) in out {
         for l in regions(text) {
-            let (calls, _) = seal_names(f, &l.flat, false);
-            if calls.contains(&"lend_at") {
+            if words(&l.flat.chars().collect::<Vec<_>>())
+                .iter()
+                .any(|(_, w)| w == "lend_at")
+            {
                 errs.push(format!(
-                    "{f} ({}): `{}` calls `lend_at` outside the crate",
+                    "{f} ({}): `{}` names `lend_at` outside the crate",
                     l.scope,
                     squash(&l.code)
                 ));
@@ -6713,421 +6637,805 @@ fn the_seals_tokens_are_made_only_where_they_are_spent() {
     }
 }
 
+/// What the check leaves alone, and must: a listed site as rustfmt may
+/// rewrap it, and ordinary code that uses the seal's old words -- `lent`,
+/// `lend`, `base` -- for its own things. Every case is run and every
+/// refusal said.
+#[test]
+fn the_seal_leaves_ordinary_code_alone() {
+    let src = sources(&root());
+    let mut refused = Vec::new();
+    let mut green = |what: &str, s: &BTreeMap<String, String>| {
+        if let Err(e) = seal_check(s) {
+            refused.push(format!("{what}:\n{e}"));
+        }
+    };
+    // A listed signature split over lines, as rustfmt splits one that
+    // grows past the width.
+    green(
+        "a signature split",
+        &seal_edit(
+            &src,
+            "src/bytes.rs",
+            "    #[inline]\n    fn lend_at(&self, off: u64, len: usize, _: LendToken) -> Option<&[u8]> {\n        if self.piecewise() {",
+            "    #[inline]\n    fn lend_at(\n        &self,\n        off: u64,\n        len: usize,\n        _: LendToken,\n    ) -> Option<&[u8]> {\n        if self.piecewise() {",
+        ),
+    );
+    green(
+        "a declaration grown",
+        &seal_edit(
+            &src,
+            "src/bytes.rs",
+            "    fn base_address(&self, _: BaseAddressToken) -> *const u8;",
+            "    fn base_address(\n        &self,\n        // the token\n        _: BaseAddressToken,\n    ) -> *const u8;",
+        ),
+    );
+    // A listed call rewrapped, its token on a line of its own.
+    green(
+        "a call rewrapped",
+        &seal_edit(
+            &src,
+            "src/blob.rs",
+            "Sec::Lent { off, len } => src.lend_at(*off, *len, lend_seal::Token::new()),",
+            "Sec::Lent { off, len } => src.lend_at(\n                *off,\n                *len,\n                lend_seal::Token::new(),\n            ),",
+        ),
+    );
+    // The words as ordinary code has them: a field and a local in a debug
+    // assertion of the engine, a method `base` with an argument on
+    // another type, by value and by type, and a test that names a local.
+    green(
+        "the engine's own words",
+        &seal_edit(
+            &src,
+            "src/db.rs",
+            "use std::cell::UnsafeCell;\n",
+            "use std::cell::UnsafeCell;\n#[allow(dead_code)]\nstruct SealGreen {\n    lent: usize,\n}\n#[allow(dead_code)]\nfn seal_green(to: &SealGreen, n: usize) -> usize {\n    debug_assert!(to.lent <= n);\n    let lend = n - to.lent;\n    debug_assert!(lend <= n, \"lend {lend}\");\n    lend\n}\n",
+        ),
+    );
+    green(
+        "another type's base",
+        &seal_edit(
+            &src,
+            "src/db/zfile.rs",
+            "use std::sync::Arc;\n",
+            "use std::sync::Arc;\n#[allow(dead_code)]\nfn seal_green(codec: &Others, x: u64) -> u64 {\n    codec.base(3) + Others::base(x)\n}\n",
+        ),
+    );
+    green(
+        "a test's local",
+        &seal_edit(
+            &src,
+            "src/db/pager.rs",
+            "use crate::bytes::Paging;\n",
+            "use crate::bytes::Paging;\n#[cfg(test)]\nmod seal_green {\n    #[test]\n    fn a_local() {\n        let lent = [1u8];\n        assert_eq!(lent, [1u8], \"the bytes lent\");\n    }\n}\n",
+        ),
+    );
+    green(
+        "a closure named lent",
+        &seal_edit(
+            &src,
+            "src/db/pager.rs",
+            "use crate::bytes::Paging;\n",
+            "use crate::bytes::Paging;\n#[allow(dead_code)]\nfn others(n: usize) -> usize {\n    let lent = |k: usize| k + 1;\n    if !(lent(n) > 1) {\n        return 0;\n    }\n    let b = Others::base();\n    (0..lent(n)).count() + b\n}\n",
+        ),
+    );
+    // A listed signature grown by a parameter.
+    green(
+        "a signature grown",
+        &seal_edit(
+            &src,
+            "src/bytes.rs",
+            "    fn lend_at(&self, off: u64, len: usize, _: LendToken) -> Option<&[u8]> {\n        if self.piecewise() {",
+            "    fn lend_at(&self, off: u64, len: usize, _pad: [u8; 0], _: LendToken) -> Option<&[u8]> {\n        if self.piecewise() {",
+        ),
+    );
+    // A trait whose signature returns `impl Trait`, beside a listed impl:
+    // the `impl` there is a type and ends at the signature's `;`.
+    green(
+        "a signature that returns impl Trait",
+        &seal_edit(
+            &src,
+            "src/bytes.rs",
+            "#[cfg(not(target_family = \"wasm\"))]\nimpl whole_map_readers::Reader for OrdLendToken {}",
+            "#[allow(dead_code)]\ntrait SealGreen {\n    fn q(&self) -> impl Sized;\n}\n#[cfg(not(target_family = \"wasm\"))]\nimpl whole_map_readers::Reader for OrdLendToken {}",
+        ),
+    );
+    assert!(refused.is_empty(), "{}", refused.join("\n"));
+}
+
+/// The tree with `old` in `f` replaced by `new`, `old` standing once.
+fn seal_edit(
+    s: &BTreeMap<String, String>,
+    f: &str,
+    old: &str,
+    new: &str,
+) -> BTreeMap<String, String> {
+    let mut s = s.clone();
+    let t = s.get_mut(f).expect("the file");
+    assert_eq!(t.matches(old).count(), 1, "{f}: {old}");
+    *t = t.replacen(old, new, 1);
+    s
+}
+
+/// Runs `seal_check` on each tree and says every case that passed or
+/// failed without the words wanted, so a red run names each route the
+/// check let through.
+struct SealReds(Vec<String>);
+impl SealReds {
+    fn red(&mut self, s: &BTreeMap<String, String>, want: &[&str]) {
+        self.red_by(seal_check(s), want);
+    }
+    fn red_by(&mut self, got: Result<(), String>, want: &[&str]) {
+        match got {
+            Ok(()) => self.0.push(format!("passed the check: {}", want[0])),
+            Err(e) => {
+                for w in want {
+                    if !e.contains(w) {
+                        self.0.push(format!("wanted `{w}` in:\n{e}"));
+                    }
+                }
+            }
+        }
+    }
+    fn done(self) {
+        assert!(self.0.is_empty(), "{}", self.0.join("\n"));
+    }
+}
+
 /// The check's red inputs: the tree with one change each, every one a way
 /// round the seal that compiles.
 #[test]
 fn a_seals_token_made_another_way_fails() {
     let src = sources(&root());
-    let edit = |f: &str, old: &str, new: &str| {
-        let mut s = src.clone();
-        let t = s.get_mut(f).expect("the file");
-        assert_eq!(t.matches(old).count(), 1, "{f}: {old}");
-        *t = t.replacen(old, new, 1);
-        s
-    };
-    let red = |s: &BTreeMap<String, String>, want: &str| {
-        let e = seal_check(s).expect_err(want);
-        assert!(e.contains(want), "wanted `{want}` in:\n{e}");
-    };
+    let edit = |f: &str, old: &str, new: &str| seal_edit(&src, f, old, new);
     seal_check(&src).expect("the tree");
-    // A derive on the token, which an inferred `Default::default()` takes.
-    red(
+    let mut r = SealReds(Vec::new());
+    let bl = "/// A section of the file: lent by the source";
+    let get = "Sec::Lent { off, len } => src.lend_at(*off, *len, lend_seal::Token::new()),";
+    // A derive on the token, which an inferred `Default::default()` takes,
+    // and a public field.
+    r.red(
         &edit(
             "src/blob.rs",
-            "pub(crate) mod lend {\n    pub struct Token(());",
-            "pub(crate) mod lend {\n    #[derive(Default)]\n    pub struct Token(());",
+            "pub(crate) mod lend_seal {\n    pub struct Token(());",
+            "pub(crate) mod lend_seal {\n    #[derive(Default)]\n    pub struct Token(());",
         ),
-        "src/blob.rs: the token's module is",
+        &["src/blob.rs: `mod lend_seal` is"],
     );
-    // A constructor widened.
-    red(
+    r.red(
+        &edit(
+            "src/db/zfile.rs",
+            "pub(crate) mod lend_seal {\n    pub struct Token(());",
+            "pub(crate) mod lend_seal {\n    pub struct Token(pub ());",
+        ),
+        &["src/db/zfile.rs: `mod lend_seal` is"],
+    );
+    // A constructor widened, and a second function in the token's module.
+    r.red(
         &edit(
             "src/ordindex.rs",
             "pub(in crate::ordindex) fn new()",
             "pub(crate) fn new()",
         ),
-        "src/ordindex.rs: the token's module is",
+        &["src/ordindex.rs: `mod lend_seal` is"],
+    );
+    r.red(
+        &edit(
+            "src/ordindex.rs",
+            "        pub(in crate::ordindex) fn new() -> Token {\n            Token(())\n        }\n",
+            "        pub(in crate::ordindex) fn new() -> Token {\n            Token(())\n        }\n        pub(crate) fn hand() -> Token {\n            Token(())\n        }\n",
+        ),
+        &["src/ordindex.rs: `mod lend_seal` is"],
     );
     // An impl outside the module.
-    red(
+    r.red(
         &edit(
             "src/blob.rs",
-            "/// A section of the file: lent by the source",
-            "impl Default for lend::Token {\n    fn default() -> Self {\n        lend::Token::new()\n    }\n}\n\n/// A section of the file: lent by the source",
+            bl,
+            &format!("impl Default for lend_seal::Token {{\n    fn default() -> Self {{\n        lend_seal::Token::new()\n    }}\n}}\n\n{bl}"),
         ),
-        "gives a seal's token an impl",
+        &["gives a seal's token or the readers' trait an impl"],
     );
     // A function of blob that hands a token out.
-    red(
+    r.red(
         &edit(
             "src/blob.rs",
-            "/// A section of the file: lent by the source",
-            "pub(crate) fn token() -> lend::Token {\n    lend::Token::new()\n}\n\n/// A section of the file: lent by the source",
+            bl,
+            &format!("pub(crate) fn token() -> lend_seal::Token {{\n    lend_seal::Token::new()\n}}\n\n{bl}"),
         ),
-        "names a seal's token outside the call it is made for",
+        &["src/blob.rs (token): `pub(crate) fn token() -> lend_seal::Token {` names `lend_seal`, a word of the seal, outside the sites that may"],
     );
     // A call abroad, whatever its token (one made by unsafe code here).
-    red(
+    r.red(
         &edit(
             "src/db/zfile.rs",
             "use std::sync::Arc;\n",
             "use std::sync::Arc;\n#[allow(dead_code)]\nfn conjured(m: &MmapBytes) -> Option<&[u8]> {\n    m.lend_at(0, 1, unsafe { std::mem::zeroed() })\n}\n",
         ),
-        "calls `lend_at` outside src/blob.rs",
+        &["src/db/zfile.rs (conjured)", "names `lend_at`, a word of the seal, outside the sites that may"],
     );
-    // A token made apart from its call, and spent through a binding.
-    red(
+    // A token made by unsafe code at a listed call, zeroed or transmuted.
+    r.red(
         &edit(
             "src/blob.rs",
-            "Sec::Lent { off, len } => src.lend_at(*off, *len, lend::Token::new()),",
-            "Sec::Lent { off, len } => {\n                let t = lend::Token::new();\n                src.lend_at(*off, *len, t)\n            }",
+            get,
+            "Sec::Lent { off, len } => src.lend_at(*off, *len, unsafe { std::mem::zeroed() }),",
         ),
-        "with a token not made at the call",
+        &[
+            "src/blob.rs (Sec::lend)",
+            "calls `lend_at` with no token made in its parentheses",
+        ],
+    );
+    r.red(
+        &edit(
+            "src/blob.rs",
+            get,
+            "Sec::Lent { off, len } => src.lend_at(*off, *len, unsafe { std::mem::transmute(()) }),",
+        ),
+        &["calls `lend_at` with no token made in its parentheses"],
+    );
+    // A token bound to a local in a listed scope and spent later.
+    r.red(
+        &edit(
+            "src/blob.rs",
+            get,
+            "Sec::Lent { off, len } => {\n                let t = lend_seal::Token::new();\n                src.lend_at(*off, *len, t)\n            }",
+        ),
+        &[
+            "src/blob.rs (Sec::lend): `let t = lend_seal::Token::new();` names `lend_seal`",
+            "src/blob.rs (Sec::lend): `src.lend_at(*off, *len, t)` calls `lend_at` with no token made in its parentheses",
+        ],
+    );
+    // A second token made inside a listed call's parentheses.
+    r.red(
+        &edit(
+            "src/blob.rs",
+            get,
+            "Sec::Lent { off, len } => src.lend_at(*off, *len, {\n                keep(lend_seal::Token::new());\n                lend_seal::Token::new()\n            }),",
+        ),
+        &["src/blob.rs (Sec::lend)", "calls `lend_at` with no token made in its parentheses"],
+    );
+    // A second token in an earlier argument, handed away, the call's own
+    // token last.
+    r.red(
+        &edit(
+            "src/blob.rs",
+            get,
+            "Sec::Lent { off, len } => src.lend_at(*off, keep(lend_seal::Token::new()), lend_seal::Token::new()),",
+        ),
+        &["src/blob.rs (Sec::lend)", "calls `lend_at` with no token made in its parentheses"],
+    );
+    // A listed scope's name taken by a test, which is no reader.
+    let zend = src["src/db/zfile.rs"].trim_end().to_string();
+    let tail = &zend[zend.len() - 40..];
+    r.red(
+        &edit(
+            "src/db/zfile.rs",
+            tail,
+            &format!("{tail}\n\n#[cfg(test)]\nmod seal_red {{\n    use super::*;\n    #[allow(dead_code)]\n    fn file_facts(m: &MmapBytes) -> usize {{\n        m.lend_whole_map(lend_seal::Token::new()).len()\n    }}\n}}"),
+        ),
+        &["src/db/zfile.rs (file_facts): `m.lend_whole_map(lend_seal::Token::new()).len()` names `lend_whole_map`"],
+    );
+    // A function value taken in a listed scope.
+    r.red(
+        &edit(
+            "src/blob.rs",
+            get,
+            "Sec::Lent { off, len } => {\n                let f = <B as Bytes>::lend_at;\n                f(src, *off, *len, unsafe { std::mem::zeroed() })\n            }",
+        ),
+        &["src/blob.rs (Sec::lend): `let f = <B as Bytes>::lend_at;` names `lend_at` without calling it"],
     );
     // A new reader of a mapping as it lies, at home.
-    red(
+    r.red(
         &edit(
             "src/db/zfile.rs",
             "use std::sync::Arc;\n",
-            "use std::sync::Arc;\n#[allow(dead_code)]\nfn another(m: &MmapBytes) -> Option<usize> {\n    let all = m.lent(lend::Token::new());\n    if all.is_empty() {\n        return None;\n    }\n    Some(all.len())\n}\n",
+            "use std::sync::Arc;\n#[allow(dead_code)]\nfn another(m: &MmapBytes) -> Option<usize> {\n    let all = m.lend_whole_map(lend_seal::Token::new());\n    if all.is_empty() {\n        return None;\n    }\n    Some(all.len())\n}\n",
         ),
-        "a caller of `lent` that is not listed",
+        &["src/db/zfile.rs (another)", "names `lend_whole_map`, a word of the seal, outside the sites that may"],
     );
-    // The readers' trait given to every type, which takes any value.
-    red(
+    // The readers' trait given to every type, which takes any value, and
+    // given an item.
+    r.red(
         &edit(
             "src/bytes.rs",
-            "impl whole::Reader for StrideLendToken {}",
-            "impl whole::Reader for StrideLendToken {}\n#[cfg(not(target_family = \"wasm\"))]\nimpl<T> whole::Reader for (T,) {}",
+            "impl whole_map_readers::Reader for StrideLendToken {}",
+            "impl whole_map_readers::Reader for StrideLendToken {}\n#[cfg(not(target_family = \"wasm\"))]\nimpl<T> whole_map_readers::Reader for (T,) {}",
         ),
-        "gives a seal's token an impl",
+        &["gives a seal's token or the readers' trait an impl"],
     );
-    // The address token given a derive, or a constructor.
-    red(
+    r.red(
         &edit(
             "src/bytes.rs",
-            "pub(crate) struct Base(());",
-            "#[derive(Default)]\npub(crate) struct Base(());",
+            "    pub trait Reader {}",
+            "    pub trait Reader {\n        fn any() {}\n    }",
         ),
-        "src/bytes.rs: `Base` carries `#[derive(Default)]`",
+        &["src/bytes.rs: `mod whole_map_readers` is"],
     );
-    red(
+    // The address token given a derive, a public field or a constructor.
+    r.red(
         &edit(
             "src/bytes.rs",
-            "pub(crate) struct Base(());",
-            "pub(crate) struct Base(());\nimpl Base {\n    pub(crate) fn new() -> Base {\n        Base(())\n    }\n}",
+            "pub(crate) struct BaseAddressToken(());",
+            "#[derive(Default)]\npub(crate) struct BaseAddressToken(());",
         ),
-        "gives a seal's token an impl",
+        &["src/bytes.rs: `BaseAddressToken` carries `#[derive(Default)]`"],
+    );
+    r.red(
+        &edit(
+            "src/bytes.rs",
+            "pub(crate) struct BaseAddressToken(());",
+            "pub(crate) struct BaseAddressToken(pub ());",
+        ),
+        &["src/bytes.rs: `BaseAddressToken` is `pub(crate) struct BaseAddressToken(pub ());`"],
+    );
+    r.red(
+        &edit(
+            "src/bytes.rs",
+            "pub(crate) struct BaseAddressToken(());",
+            "pub(crate) struct BaseAddressToken(());\nimpl BaseAddressToken {\n    pub(crate) fn new() -> BaseAddressToken {\n        BaseAddressToken(())\n    }\n}",
+        ),
+        &["gives a seal's token or the readers' trait an impl"],
     );
     // The address asked for outside the seam.
-    red(
+    r.red(
         &edit(
             "src/db/pager.rs",
             "use crate::bytes::Paging;\n",
-            "use crate::bytes::Paging;\n#[allow(dead_code)]\nfn addr(p: &dyn crate::bytes::Paging, b: crate::bytes::Base) -> *const u8 {\n    p.base(b)\n}\n",
+            "use crate::bytes::Paging;\n#[allow(dead_code)]\nfn addr(p: &dyn crate::bytes::Paging, b: crate::bytes::BaseAddressToken) -> *const u8 {\n    p.base_address(b)\n}\n",
         ),
-        "calls `base` outside src/bytes.rs",
+        &["src/db/pager.rs (addr)", "names `base_address`, a word of the seal, outside the sites that may"],
     );
-}
-
-/// The same routes in the other spellings Rust gives them: a token made by
-/// a qualified path, a renamed import or the re-export's name, and a call
-/// made by type or through a function value. Each compiles with no unsafe.
-#[test]
-fn a_seals_token_spelled_another_way_fails() {
-    let src = sources(&root());
-    let edit = |s: &BTreeMap<String, String>, f: &str, old: &str, new: &str| {
-        let mut s = s.clone();
-        let t = s.get_mut(f).expect("the file");
-        assert_eq!(t.matches(old).count(), 1, "{f}: {old}");
-        *t = t.replacen(old, new, 1);
-        s
-    };
-    // Every case is run and every miss said, so a red run names each route
-    // the check let through.
-    let misses = std::cell::RefCell::new(Vec::new());
-    let red = |s: &BTreeMap<String, String>, want: &[&str]| match seal_check(s) {
-        Ok(()) => misses
-            .borrow_mut()
-            .push(format!("passed the check: {}", want[0])),
+    // A word of the seal at a top-level line of a token's home that is no
+    // `use` and no listed impl: a macro handed the token's name that hands
+    // a token out or gives it an impl, the readers' trait handed to a macro
+    // that gives it to another type, a one-line hand-out by unsafe code, and
+    // an alias of the token in front of a hand-out.
+    let ord = "use std::path::Path;\n";
+    let mac = |body: &str| edit("src/ordindex.rs", ord, &format!("{ord}{body}"));
+    r.red(
+        &mac("macro_rules! hand {\n    ($t:ident) => {\n        pub(crate) fn hand() -> $t {\n            $t::new()\n        }\n    };\n}\nhand!(OrdLendToken);\n"),
+        &["src/ordindex.rs (<item>): `hand!(OrdLendToken);` names `OrdLendToken`"],
+    );
+    r.red(
+        &mac("macro_rules! cl {\n    ($t:ty) => {\n        impl Clone for $t {\n            fn clone(&self) -> Self {\n                Self::new()\n            }\n        }\n    };\n}\ncl!(OrdLendToken);\n"),
+        &["src/ordindex.rs (<item>): `cl!(OrdLendToken);` names `OrdLendToken`"],
+    );
+    r.red(
+        &edit(
+            "src/bytes.rs",
+            "impl whole_map_readers::Reader for StrideLendToken {}",
+            "impl whole_map_readers::Reader for StrideLendToken {}\n#[cfg(not(target_family = \"wasm\"))]\nmacro_rules! give {\n    ($p:path) => {\n        impl $p for crate::bytes::MmapBytes {}\n    };\n}\n#[cfg(not(target_family = \"wasm\"))]\ngive!(whole_map_readers::Reader);",
+        ),
+        &["src/bytes.rs (<item>): `give!(whole_map_readers::Reader);` names `whole_map_readers`"],
+    );
+    r.red(
+        &mac("#[allow(dead_code)]\npub(crate) fn hand() -> OrdLendToken { unsafe { std::mem::zeroed() } }\n"),
+        &["src/ordindex.rs (<item>): `pub(crate) fn hand() -> OrdLendToken { unsafe { std::mem::zeroed() } }` names `OrdLendToken`"],
+    );
+    r.red(
+        &mac("type Tk = lend_seal::Token;\n#[allow(dead_code)]\npub(crate) fn hand() -> Tk {\n    Tk::new()\n}\n"),
+        &["src/ordindex.rs (type Tk): `type Tk = lend_seal::Token;` names `lend_seal`"],
+    );
+    r.red(
+        &mac("type Tk = OrdLendToken;\n#[allow(dead_code)]\npub(crate) fn hand() -> Tk {\n    Tk::new()\n}\n"),
+        &["src/ordindex.rs (type Tk): `type Tk = OrdLendToken;` names `OrdLendToken`"],
+    );
+    // A second definition under a listed scope's name, which is a new
+    // reader the scope's name would let through.
+    r.red(
+        &edit(
+            "src/db/zfile.rs",
+            "use std::sync::Arc;\n",
+            "use std::sync::Arc;\nmod x {\n    use super::*;\n    #[allow(dead_code)]\n    pub(crate) fn file_facts(m: &MmapBytes) -> &[u8] {\n        m.lend_whole_map(super::lend_seal::Token::new())\n    }\n}\n",
+        ),
+        &["src/db/zfile.rs: 2 definitions of `file_facts`, where a site of the seal is one"],
+    );
+    // A test block inside a listed scope, which is no reader.
+    r.red(
+        &edit(
+            "src/blob.rs",
+            get,
+            "Sec::Lent { off, len } => {\n                #[cfg(test)]\n                {\n                    let _ = src.lend_at(0, 1, lend_seal::Token::new());\n                }\n                src.lend_at(*off, *len, lend_seal::Token::new())\n            }",
+        ),
+        &["src/blob.rs (Sec::lend): `let _ = src.lend_at(0, 1, lend_seal::Token::new());` names `lend_at`"],
+    );
+    // A token made by unsafe code in the body of a declaration of the seal.
+    r.red(
+        &edit(
+            "src/db/pager.rs",
+            "    fn base_address(&self, _: crate::bytes::BaseAddressToken) -> *const u8 {\n        self.base",
+            "    fn base_address(&self, _: crate::bytes::BaseAddressToken) -> *const u8 {\n        let _t: crate::bytes::BaseAddressToken = unsafe { std::mem::zeroed() };\n        self.base",
+        ),
+        &["src/db/pager.rs (Paged::base_address): `let _t: crate::bytes::BaseAddressToken = unsafe { std::mem::zeroed() };` names `BaseAddressToken`"],
+    );
+    // A definition of a call abroad: `Bytes` given to another type.
+    r.red(
+        &edit(
+            "src/db/zfile.rs",
+            "use std::sync::Arc;\n",
+            "use std::sync::Arc;\n#[allow(dead_code)]\nstruct Fake;\nimpl crate::bytes::Bytes for Fake {\n    fn len(&self) -> u64 {\n        0\n    }\n    fn read_at(&self, _: u64, _: &mut [u8]) -> std::io::Result<()> {\n        Ok(())\n    }\n    fn lend_at(&self, _: u64, _: usize, t: T) -> Option<&[u8]> {\n        None\n    }\n}\n",
+        ),
+        &["src/db/zfile.rs (Fake::lend_at): `fn lend_at(&self, _: u64, _: usize, t: T) -> Option<&[u8]> {` names `lend_at`"],
+    );
+    // A function nested in a listed scope, which is a scope of its own.
+    r.red(
+        &edit(
+            "src/db/zfile.rs",
+            "    fn stride_bytes(&self) -> &[u8] {\n        self.map.lend_whole_map(lend_seal::Token::new())\n    }",
+            "    fn stride_bytes(&self) -> &[u8] {\n        fn inner(m: &MmapBytes) -> &[u8] {\n            m.lend_whole_map(lend_seal::Token::new())\n        }\n        inner(&self.map)\n    }",
+        ),
+        &["src/db/zfile.rs (ZFile::stride_bytes>inner)", "names `lend_whole_map`, a word of the seal, outside the sites that may"],
+    );
+    // A token's name after a bodiless signature that returns `impl Trait`:
+    // the `impl` there is a type, which ends at the signature's `;`.
+    r.red(
+        &edit(
+            "src/bytes.rs",
+            "impl whole_map_readers::Reader for StrideLendToken {}",
+            "impl whole_map_readers::Reader for StrideLendToken {}\n#[allow(dead_code)]\ntrait SealRed {\n    fn q(&self) -> impl Sized;\n}\ngive!(OrdLendToken);",
+        ),
+        &["src/bytes.rs (<item>): `give!(OrdLendToken);` names `OrdLendToken` at a declaration of the seal"],
+    );
+    // A declaration's word on a line that holds a `use` after it: the word
+    // is held by the item it stands in, not by its line.
+    r.red(
+        &mac("hand!(OrdLendToken); use std::fmt as _;\n"),
+        &["src/ordindex.rs (<item>): `hand!(OrdLendToken); use std::fmt as _;` names `OrdLendToken` at a declaration of the seal"],
+    );
+    // The address token under an attribute other than its one `cfg`.
+    for a in ["#[cfg(not(test))]", "#[cfg_attr(test, derive(Default))]"] {
+        r.red(
+            &edit(
+                "src/bytes.rs",
+                "pub(crate) struct BaseAddressToken(());",
+                &format!("{a}\npub(crate) struct BaseAddressToken(());"),
+            ),
+            &[&format!("src/bytes.rs: `BaseAddressToken` carries `{a}`")],
+        );
+    }
+    // A call at a scope listed for another call, with that call's token.
+    r.red(
+        &edit(
+            "src/ordindex.rs",
+            "let whole = map.lend_whole_map(lend_seal::Token::new());",
+            "let _ = map.lend_at(0, 1, lend_seal::Token::new());\n        let whole = map.lend_whole_map(lend_seal::Token::new());",
+        ),
+        &["src/ordindex.rs (OrdIndex::over): `let _ = map.lend_at(0, 1, lend_seal::Token::new());` names `lend_at`, a word of the seal, outside the sites that may"],
+    );
+    // A call's token is its own row's: where the word has rows of other
+    // tokens, before its row or after it, the token of the row that lists
+    // the call's scope.
+    let other = "lend_whole_map | BaseAddressToken(()) | src/bytes.rs | MmapBytes::paged";
+    for calls in [
+        format!("{other}\n{SEAL_CALLS}"),
+        format!("{SEAL_CALLS}\n{other}\n"),
+    ] {
+        r.red_by(
+            seal_check_with(
+                &edit(
+                    "src/ordindex.rs",
+                    "let whole = map.lend_whole_map(lend_seal::Token::new());",
+                    "let whole = map.lend_whole_map(BaseAddressToken(()));",
+                ),
+                &calls,
+            ),
+            &["src/ordindex.rs (OrdIndex::over)", "calls `lend_whole_map` with no token made in its parentheses as `lend_seal::Token::new()`"],
+        );
+    }
+    // What a failure tells its author to do.
+    match seal_check(&edit("src/blob.rs", bl, &format!("fn x() -> LendToken {{\n    todo!()\n}}\n{bl}"))) {
+        Ok(()) => r.0.push("passed the check: the help".into()),
         Err(e) => {
-            for w in want {
+            for w in [
+                "names a word of the seal outside the sites that may",
+                "a mapped file or a section whole answers nothing under a cipher unless it has an arm by the piece",
+                "forms.md R2",
+                "SEAL_CALLS in tests/source.rs",
+                "`slice_at`",
+            ] {
                 if !e.contains(w) {
-                    misses.borrow_mut().push(format!("wanted `{w}` in:\n{e}"));
+                    r.0.push(format!("the help does not say `{w}`:\n{e}"));
                 }
             }
         }
-    };
+    }
+    r.done();
+}
+
+/// The same routes in the other spellings Rust gives them: a token made by
+/// a qualified path, a renamed import or the re-export's name, a call made
+/// by type or through a function value, and the names handed to macros.
+/// Each compiles with no unsafe.
+#[test]
+fn a_seals_token_spelled_another_way_fails() {
+    let src = sources(&root());
+    let mut r = SealReds(Vec::new());
     let ord = "use std::path::Path;\n";
     let zf = "use std::sync::Arc;\n";
     let bl = "/// A section of the file: lent by the source";
     let db = "use std::cell::UnsafeCell;\n";
     // A function of the ordered index that hands a token out by a qualified
     // path, spent by type abroad: a whole borrow outside the readers.
-    let hand = edit(
+    let hand = seal_edit(
         &src,
         "src/ordindex.rs",
         ord,
-        &format!(
-            "{ord}#[allow(dead_code)]\npub(crate) fn hand() -> lend::Token {{\n    <lend::Token>::new()\n}}\n"
-        ),
+        &format!("{ord}#[allow(dead_code)]\npub(crate) fn hand() -> lend_seal::Token {{\n    <lend_seal::Token>::new()\n}}\n"),
     );
-    red(
+    r.red(
         &hand,
         &[
             "src/ordindex.rs (hand)",
-            "names a seal's token outside the call it is made for",
+            "names `lend_seal`, a word of the seal, outside the sites that may",
         ],
     );
-    let both = edit(
+    let both = seal_edit(
         &hand,
         "src/db.rs",
         db,
-        &format!(
-            "{db}#[allow(dead_code)]\nfn sneak(m: &crate::bytes::MmapBytes) -> usize {{\n    crate::bytes::MmapBytes::lent(m, crate::ordindex::hand()).len()\n}}\n"
-        ),
+        &format!("{db}#[allow(dead_code)]\nfn sneak(m: &crate::bytes::MmapBytes) -> usize {{\n    crate::bytes::MmapBytes::lend_whole_map(m, crate::ordindex::hand()).len()\n}}\n"),
     );
-    red(&both, &["src/db.rs (sneak)", "calls `lent` outside"]);
+    r.red(&both, &["src/db.rs (sneak)", "names `lend_whole_map`"]);
     // A new reader at home, by type and a qualified token.
-    red(
-        &edit(
+    r.red(
+        &seal_edit(
             &src,
             "src/db/zfile.rs",
             zf,
-            &format!(
-                "{zf}#[allow(dead_code)]\nfn another(m: &MmapBytes) -> usize {{\n    MmapBytes::lent(m, <lend::Token>::new()).len()\n}}\n"
-            ),
+            &format!("{zf}#[allow(dead_code)]\nfn another(m: &MmapBytes) -> usize {{\n    MmapBytes::lend_whole_map(m, <lend_seal::Token>::new()).len()\n}}\n"),
         ),
-        &["src/db/zfile.rs (another)", "a caller of `lent` that is not listed"],
+        &["src/db/zfile.rs (another)", "names `lend_whole_map`"],
     );
     // A renamed import and a call through a function value, in blob.
-    red(
-        &edit(
+    r.red(
+        &seal_edit(
             &src,
             "src/blob.rs",
             bl,
-            &format!(
-                "use lend::Token as Tk;\n#[allow(dead_code)]\nfn lend_any<B: Bytes>(src: &B) -> Option<&[u8]> {{\n    let f = <B as Bytes>::lend_at;\n    f(src, 0, 1, Tk::new())\n}}\n\n{bl}"
-            ),
+            &format!("use lend_seal::Token as Tk;\n#[allow(dead_code)]\nfn lend_any<B: Bytes>(src: &B) -> Option<&[u8]> {{\n    let f = <B as Bytes>::lend_at;\n    f(src, 0, 1, Tk::new())\n}}\n\n{bl}"),
         ),
         &[
-            "src/blob.rs (<item>): `use lend::Token as Tk;`",
-            "src/blob.rs (lend_any)",
-            "a caller of `lend_at` that is not listed",
+            "src/blob.rs (<item>): `use lend_seal::Token as Tk;` names `lend_seal`",
+            "src/blob.rs (<item>): `use lend_seal::Token as Tk;` imports a seal's word as `Tk`",
+            "src/blob.rs (lend_any): `let f = <B as Bytes>::lend_at;` names `lend_at`",
         ],
+    );
+    // A renamed import where the module's name may stand: the ordered
+    // index's re-export beside one that is not the seal's.
+    r.red(
+        &seal_edit(
+            &src,
+            "src/ordindex.rs",
+            "pub(crate) use lend_seal::Token as OrdLendToken;",
+            "pub(crate) use lend_seal::Token as OrdLendToken;\nuse self::lend_seal as mk;",
+        ),
+        &["src/ordindex.rs (<item>): `use self::lend_seal as mk;` imports a seal's word as `mk`"],
+    );
+    r.red(
+        &seal_edit(
+            &src,
+            "src/ordindex.rs",
+            "pub(crate) use lend_seal::Token as OrdLendToken;",
+            "pub(crate) use lend_seal::{Token as OrdLendToken, Token as Tk};",
+        ),
+        &["imports a seal's word as `Tk`"],
+    );
+    r.red(
+        &seal_edit(
+            &src,
+            "src/ordindex.rs",
+            "pub(crate) use lend_seal::Token as OrdLendToken;",
+            "pub(crate) use lend_seal::{Token as Tk, Token as OrdLendToken};",
+        ),
+        &["src/ordindex.rs (<item>): `pub(crate) use lend_seal::{Token as Tk, Token as OrdLendToken};` imports a seal's word"],
     );
     // The re-export's name at home, a glob of the token's module, and the
     // address asked for by a function value.
-    red(
-        &edit(
+    r.red(
+        &seal_edit(
             &src,
             "src/ordindex.rs",
             ord,
-            &format!(
-                "{ord}#[allow(dead_code)]\nfn by_name(m: &MmapBytes) -> usize {{\n    m.lent(OrdLendToken::new()).len()\n}}\n"
-            ),
+            &format!("{ord}#[allow(dead_code)]\nfn by_name(m: &MmapBytes) -> usize {{\n    m.lend_whole_map(OrdLendToken::new()).len()\n}}\n"),
         ),
-        &["src/ordindex.rs (by_name)", "a caller of `lent` that is not listed"],
+        &["src/ordindex.rs (by_name)", "names `lend_whole_map`"],
     );
-    red(
-        &edit(
+    r.red(
+        &seal_edit(
             &src,
             "src/db/zfile.rs",
             zf,
-            &format!("{zf}#[allow(unused_imports)]\nuse lend::*;\n"),
+            &format!("{zf}#[allow(unused_imports)]\nuse lend_seal::*;\n"),
         ),
-        &["src/db/zfile.rs (<item>): `use lend::*;`"],
+        &["src/db/zfile.rs (<item>): `use lend_seal::*;`"],
     );
-    red(
-        &edit(
+    r.red(
+        &seal_edit(
             &src,
             "src/db/pager.rs",
             "use crate::bytes::Paging;\n",
-            "use crate::bytes::Paging;\n#[allow(dead_code)]\nfn addr(p: &dyn crate::bytes::Paging) -> fn(&dyn crate::bytes::Paging, crate::bytes::Base) -> *const u8 {\n    let _ = p;\n    <dyn crate::bytes::Paging>::base\n}\n",
+            "use crate::bytes::Paging;\n#[allow(dead_code)]\nfn addr(p: &dyn crate::bytes::Paging) -> fn(&dyn crate::bytes::Paging, crate::bytes::BaseAddressToken) -> *const u8 {\n    let _ = p;\n    <dyn crate::bytes::Paging>::base_address\n}\n",
         ),
-        &["src/db/pager.rs (addr)", "calls `base` outside src/bytes.rs"],
+        &["src/db/pager.rs (addr)", "names `base_address`"],
     );
-    // The token's module imported under another name, by a path that does
-    // not go on past it.
-    red(
-        &edit(
+    // The token's module imported under another name, and re-exported
+    // crate-wide so.
+    r.red(
+        &seal_edit(
             &src,
             "src/blob.rs",
             bl,
-            &format!("use self::lend as mk;\n\n{bl}"),
+            &format!("use self::lend_seal as mk;\n\n{bl}"),
         ),
-        &["src/blob.rs (<item>): `use self::lend as mk;`"],
+        &["src/blob.rs (<item>): `use self::lend_seal as mk;`"],
     );
-    // A listed call that makes a second token beside its own.
-    red(
-        &edit(
+    r.red(
+        &seal_edit(
             &src,
             "src/blob.rs",
-            "Sec::Lent { off, len } => src.lend_at(*off, *len, lend::Token::new()),",
-            "Sec::Lent { off, len } => src.lend_at(*off, *len, lend::Token::new()).filter(|_| keep(<lend::Token>::new())),",
+            bl,
+            &format!("pub(crate) use self::lend_seal as mk;\n\n{bl}"),
         ),
-        &["`lend_at` with a token not made at the call"],
+        &["src/blob.rs (<item>): `pub(crate) use self::lend_seal as mk;`"],
+    );
+    // A listed call that makes a second token beside its own, on its line.
+    r.red(
+        &seal_edit(
+            &src,
+            "src/blob.rs",
+            "Sec::Lent { off, len } => src.lend_at(*off, *len, lend_seal::Token::new()),",
+            "Sec::Lent { off, len } => src.lend_at(*off, *len, lend_seal::Token::new()).filter(|_| keep(<lend_seal::Token>::new())),",
+        ),
+        &["src/blob.rs (Sec::lend)", "names `lend_seal`, a word of the seal, outside the sites that may"],
     );
     // A token handed out under a re-export's name, at home.
-    red(
-        &edit(
+    r.red(
+        &seal_edit(
             &src,
             "src/ordindex.rs",
             ord,
             &format!("{ord}#[allow(dead_code)]\npub(crate) fn hand() -> OrdLendToken {{\n    OrdLendToken::new()\n}}\n"),
         ),
-        &["src/ordindex.rs (hand): `OrdLendToken::new()` names a seal's token outside the call"],
+        &["src/ordindex.rs (hand): `OrdLendToken::new()` names `OrdLendToken`"],
     );
-    red(
-        &edit(
+    r.red(
+        &seal_edit(
             &src,
             "src/db/zfile.rs",
             zf,
             &format!("{zf}#[allow(dead_code)]\npub(crate) fn hand() -> crate::db::StrideLendToken {{\n    crate::db::StrideLendToken::new()\n}}\n"),
         ),
-        &["src/db/zfile.rs (hand): `crate::db::StrideLendToken::new()` names a seal's token outside the call"],
+        &["src/db/zfile.rs (hand): `crate::db::StrideLendToken::new()` names `StrideLendToken`"],
+    );
+    // A token made apart from its call where the re-export's name may
+    // stand.
+    r.red(
+        &seal_edit(
+            &src,
+            "src/db.rs",
+            "pub(crate) use zfile::lend_seal::Token as StrideLendToken;",
+            "pub(crate) use zfile::lend_seal::Token as StrideLendToken;\npub(crate) const _T: fn() -> StrideLendToken = StrideLendToken::new;",
+        ),
+        &["src/db.rs"],
+    );
+    // A token made at a declaration: an associated const of the trait that
+    // takes the address token, which hands one to every implementor.
+    r.red(
+        &seal_edit(
+            &src,
+            "src/bytes.rs",
+            "    fn base_address(&self, _: BaseAddressToken) -> *const u8;",
+            "    fn base_address(&self, _: BaseAddressToken) -> *const u8;\n    const TOKEN: BaseAddressToken = BaseAddressToken(());",
+        ),
+        &["src/bytes.rs (Paging::<item>): `const TOKEN: BaseAddressToken = BaseAddressToken(());` names `BaseAddressToken` at a declaration of the seal"],
+    );
+    // A further signature of that trait that hands the token out.
+    r.red(
+        &seal_edit(
+            &src,
+            "src/bytes.rs",
+            "    fn base_address(&self, _: BaseAddressToken) -> *const u8;",
+            "    fn base_address(&self, _: BaseAddressToken) -> *const u8;\n    fn hand(&self) -> BaseAddressToken;",
+        ),
+        &["src/bytes.rs (Paging::<item>): `fn hand(&self) -> BaseAddressToken;` names `BaseAddressToken` at a declaration of the seal"],
     );
     // A macro of the reader's module that makes the call where it is
     // invoked: its text is at home, in a scope SEAL_CALLS does not list.
-    red(
-        &edit(
+    r.red(
+        &seal_edit(
             &src,
             "src/ordindex.rs",
             ord,
-            &format!(
-                "{ord}macro_rules! whole_of {{\n    ($m:expr) => {{\n        $m.lent(lend::Token::new())\n    }};\n}}\n"
-            ),
+            &format!("{ord}macro_rules! whole_of {{\n    ($m:expr) => {{\n        $m.lend_whole_map(lend_seal::Token::new())\n    }};\n}}\n"),
         ),
-        &["a caller of `lent` that is not listed"],
+        &["src/ordindex.rs (whole_of!)", "names `lend_whole_map`"],
     );
-    // The names handed to macros as identifiers, in positions the reading
-    // by position does not count: the token's module as a macro's argument
-    // in ordindex, made into a path inside the macro, and `lent` as a
-    // method name a macro of db.rs calls. Each compiles with no unsafe.
-    let mac_hand = edit(
+    // The names handed to macros as identifiers: the token's module as a
+    // macro's argument in ordindex, made into a path inside the macro, and
+    // the call's name as a method a macro of db.rs calls.
+    let mac_hand = seal_edit(
         &src,
         "src/ordindex.rs",
         ord,
-        &format!(
-            "{ord}macro_rules! ty {{\n    ($m:ident) => {{\n        $m::Token\n    }};\n}}\nmacro_rules! mk {{\n    ($m:ident) => {{\n        $m::Token::new()\n    }};\n}}\n#[allow(dead_code)]\npub(crate) fn hand() -> ty!(lend) {{\n    mk!(lend)\n}}\n"
-        ),
+        &format!("{ord}macro_rules! ty {{\n    ($m:ident) => {{\n        $m::Token\n    }};\n}}\nmacro_rules! mk {{\n    ($m:ident) => {{\n        $m::Token::new()\n    }};\n}}\n#[allow(dead_code)]\npub(crate) fn hand() -> ty!(lend_seal) {{\n    mk!(lend_seal)\n}}\n"),
     );
-    red(
+    r.red(
         &mac_hand,
-        &["src/ordindex.rs (hand): `mk!(lend)` names `lent` or `lend` inside a macro"],
+        &["src/ordindex.rs (hand): `mk!(lend_seal)` names `lend_seal`"],
     );
-    red(
-        &edit(
+    let call = "macro_rules! call {\n        ($b:expr, $m:ident, $t:expr) => {\n            $b.$m($t)\n        };\n    }";
+    r.red(
+        &seal_edit(
             &mac_hand,
             "src/db.rs",
             db,
-            &format!(
-                "{db}#[allow(dead_code)]\nfn sneak(m: &crate::bytes::MmapBytes) -> usize {{\n    macro_rules! call {{\n        ($b:expr, $m:ident, $t:expr) => {{\n            $b.$m($t)\n        }};\n    }}\n    call!(m, lent, crate::ordindex::hand()).len()\n}}\n"
-            ),
+            &format!("{db}#[allow(dead_code)]\nfn sneak(m: &crate::bytes::MmapBytes) -> usize {{\n    {call}\n    call!(m, lend_whole_map, crate::ordindex::hand()).len()\n}}\n"),
         ),
-        &["src/db.rs (sneak): `call!(m, lent, crate::ordindex::hand()).len()` names `lent` or `lend` inside a macro"],
+        &["src/db.rs (sneak): `call!(m, lend_whole_map, crate::ordindex::hand()).len()` names `lend_whole_map`"],
+    );
+    // The same call with the name on a line of its own.
+    r.red(
+        &seal_edit(
+            &mac_hand,
+            "src/db.rs",
+            db,
+            &format!("{db}#[allow(dead_code)]\nfn sneak(m: &crate::bytes::MmapBytes) -> usize {{\n    {call}\n    call!(\n        m,\n        lend_whole_map,\n        crate::ordindex::hand()\n    )\n    .len()\n}}\n"),
+        ),
+        &["src/db.rs (sneak): `lend_whole_map,` names `lend_whole_map`"],
     );
     // An unlisted whole reader in a token home, by the same forwarding.
-    red(
-        &edit(
+    r.red(
+        &seal_edit(
             &src,
             "src/db/zfile.rs",
             zf,
-            &format!(
-                "{zf}impl ZFile {{\n    #[allow(dead_code)]\n    fn sneak(&self) -> &[u8] {{\n        macro_rules! call {{\n            ($b:expr, $m:ident, $t:expr) => {{\n                $b.$m($t)\n            }};\n        }}\n        macro_rules! mk {{\n            ($m:ident) => {{\n                $m::Token::new()\n            }};\n        }}\n        call!(self.map, lent, mk!(lend))\n    }}\n}}\n"
-            ),
+            &format!("{zf}impl ZFile {{\n    #[allow(dead_code)]\n    fn sneak(&self) -> &[u8] {{\n        macro_rules! call {{\n            ($b:expr, $m:ident, $t:expr) => {{\n                $b.$m($t)\n            }};\n        }}\n        macro_rules! mk {{\n            ($m:ident) => {{\n                $m::Token::new()\n            }};\n        }}\n        call!(self.map, lend_whole_map, mk!(lend_seal))\n    }}\n}}\n"),
         ),
-        &["src/db/zfile.rs (ZFile::sneak): `call!(self.map, lent, mk!(lend))` names `lent` or `lend` inside a macro"],
+        &["src/db/zfile.rs (ZFile::sneak): `call!(self.map, lend_whole_map, mk!(lend_seal))` names `lend_whole_map`"],
     );
-    // The same call with `lent` on a line of its own, the text of a line
-    // SEAL_MACRO_WORDS lets through in another function.
-    red(
-        &edit(
-            &mac_hand,
-            "src/db.rs",
-            db,
-            &format!(
-                "{db}#[allow(dead_code)]\nfn sneak(m: &crate::bytes::MmapBytes) -> usize {{\n    macro_rules! call {{\n        ($b:expr, $m:ident, $t:expr) => {{\n            $b.$m($t)\n        }};\n    }}\n    call!(\n        m,\n        lent,\n        crate::ordindex::hand()\n    )\n    .len()\n}}\n"
-            ),
-        ),
-        &["src/db.rs (sneak): `lent,` names `lent` or `lend` inside a macro"],
-    );
-    // A definition whose body imports the token's module under another
+    // A one-line macro body that imports the token's module under another
     // name, which the macro's invocation does not name at all.
-    red(
-        &edit(
+    r.red(
+        &seal_edit(
             &src,
             "src/ordindex.rs",
             ord,
-            &format!(
-                "{ord}macro_rules! u {{\n    () => {{ use self::lend as mk; }};\n}}\nu!();\n#[allow(dead_code)]\npub(crate) fn hand() -> mk::Token {{\n    mk::Token::new()\n}}\n"
-            ),
+            &format!("{ord}macro_rules! u {{\n    () => {{ use self::lend_seal as mk; }};\n}}\nu!();\n#[allow(dead_code)]\npub(crate) fn hand() -> mk::Token {{\n    mk::Token::new()\n}}\n"),
         ),
-        &["`() => { use self::lend as mk; };` names `lent` or `lend` inside a macro"],
+        &["`() => { use self::lend_seal as mk; };` names `lend_seal`"],
     );
-    // The control: `lend_at` forwarded the same way is read as a call.
-    red(
-        &edit(
-            &edit(
+    // The control: `lend_at` forwarded the same way.
+    r.red(
+        &seal_edit(
+            &seal_edit(
                 &src,
                 "src/blob.rs",
                 bl,
-                &format!(
-                    "macro_rules! ty {{\n    ($m:ident) => {{\n        $m::Token\n    }};\n}}\nmacro_rules! mk {{\n    ($m:ident) => {{\n        $m::Token::new()\n    }};\n}}\n#[allow(dead_code)]\npub(crate) fn hand() -> ty!(lend) {{\n    mk!(lend)\n}}\n\n{bl}"
-                ),
+                &format!("macro_rules! mk {{\n    ($m:ident) => {{\n        $m::Token::new()\n    }};\n}}\n#[allow(dead_code)]\npub(crate) fn hand() -> LendToken {{\n    mk!(lend_seal)\n}}\n\n{bl}"),
             ),
             "src/db/zfile.rs",
             zf,
-            &format!(
-                "{zf}#[allow(dead_code)]\nfn sneak(src: &MmapBytes) -> Option<&[u8]> {{\n    macro_rules! call {{\n        ($b:expr, $m:ident, $o:expr, $l:expr, $t:expr) => {{\n            $b.$m($o, $l, $t)\n        }};\n    }}\n    call!(src, lend_at, 0, 1, crate::blob::hand())\n}}\n"
-            ),
+            &format!("{zf}#[allow(dead_code)]\nfn sneak(src: &MmapBytes) -> Option<&[u8]> {{\n    macro_rules! call {{\n        ($b:expr, $m:ident, $o:expr, $l:expr, $t:expr) => {{\n            $b.$m($o, $l, $t)\n        }};\n    }}\n    call!(src, lend_at, 0, 1, crate::blob::hand())\n}}\n"),
         ),
         &[
-            "src/db/zfile.rs (sneak): `call!(src, lend_at, 0, 1, crate::blob::hand())` calls `lend_at` outside src/blob.rs",
-            "src/blob.rs (hand): `mk!(lend)` names `lent` or `lend` inside a macro",
+            "src/db/zfile.rs (sneak): `call!(src, lend_at, 0, 1, crate::blob::hand())` names `lend_at`",
+            "src/blob.rs (hand): `mk!(lend_seal)` names `lend_seal`",
         ],
     );
-    // The token's module re-exported crate-wide under another name.
-    red(
-        &edit(
-            &src,
-            "src/blob.rs",
-            bl,
-            &format!("pub(crate) use self::lend as mk;\n\n{bl}"),
-        ),
-        &["src/blob.rs (<item>): `pub(crate) use self::lend as mk;`"],
-    );
-    // What the check leaves alone, and must: a `base()` of
-    // no argument by type (another thing's: the address's takes a token),
-    // a range whose end is a local closure named `lent`, and that closure
-    // negated in parentheses, which is no macro's.
-    let green = edit(
-        &src,
-        "src/db/pager.rs",
-        "use crate::bytes::Paging;\n",
-        "use crate::bytes::Paging;\n#[allow(dead_code)]\nfn others(n: usize) -> usize {\n    let lent = |k: usize| k + 1;\n    if !(lent(n) > 1) {\n        return 0;\n    }\n    let b = Others::base();\n    (0..lent(n)).count() + b\n}\n",
-    );
-    if let Err(e) = seal_check(&green) {
-        misses
-            .borrow_mut()
-            .push(format!("refused what is not the seal's:\n{e}"));
-    }
     // A call from outside the crate, its token made by unsafe code.
     let mut out = outside_sources(&root());
     seal_outside_check(&out).expect("the tests, the examples and the suite");
     let t = out.get_mut("tests/blob.rs").expect("tests/blob.rs");
-    t.push_str(
-        "\n#[allow(dead_code)]\nfn conjured(b: &MmapBytes) -> Option<&[u8]> {\n    b.lend_at(0, 1, unsafe { std::mem::zeroed() })\n}\n",
-    );
+    t.push_str("\n#[allow(dead_code)]\nfn conjured(b: &MmapBytes) -> Option<&[u8]> {\n    b.lend_at(0, 1, unsafe { std::mem::zeroed() })\n}\n");
     match seal_outside_check(&out) {
-        Ok(()) => misses
-            .borrow_mut()
-            .push("passed the check: tests/blob.rs (conjured)".into()),
-        Err(e) if !e.contains("tests/blob.rs (conjured)") => misses
-            .borrow_mut()
-            .push(format!("wanted `tests/blob.rs (conjured)` in:\n{e}")),
+        Ok(()) => {
+            r.0.push("passed the check: tests/blob.rs (conjured)".into())
+        }
+        Err(e) if !e.contains("tests/blob.rs (conjured)") => {
+            r.0.push(format!("wanted `tests/blob.rs (conjured)` in:\n{e}"))
+        }
         Err(_) => {}
     }
-    let misses = misses.into_inner();
-    assert!(misses.is_empty(), "{}", misses.join("\n"));
+    r.done();
 }

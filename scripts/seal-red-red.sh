@@ -36,7 +36,7 @@ case_() {
 T="$(printf '\t')"
 # A line that does not compile where its call is allowed: the home phase.
 case_ home "does not compile in the module allowed" \
-  "src/blob.rs${T}src/db/zfile.rs${T}#[allow(dead_code)] fn seal_red_typo() -> u8 { crate::blob::lend::Tokne::new() }"
+  "src/blob.rs${T}src/db/zfile.rs${T}#[allow(dead_code)] fn seal_red_typo() -> u8 { crate::blob::lend_seal::Tokne::new() }"
 # A line that compiles abroad: the abroad phase's error at the line.
 case_ abroad "no error at src/db/zfile.rs" \
   "src/blob.rs${T}src/db/zfile.rs${T}#[allow(dead_code)] fn seal_red_asks(m: &crate::bytes::MmapBytes) -> Option<&[u8]> { crate::bytes::Bytes::slice_at(m, 0, 1) }"
@@ -47,7 +47,7 @@ case_ placed "of the list's" \
 # and not the one named is not a red case. The home typo again, named with
 # words seal-red.sh never prints, must fail case_.
 if (case_ words "words seal-red.sh never prints" \
-  "src/blob.rs${T}src/db/zfile.rs${T}#[allow(dead_code)] fn seal_red_typo() -> u8 { crate::blob::lend::Tokne::new() }") >/dev/null 2>&1; then
+  "src/blob.rs${T}src/db/zfile.rs${T}#[allow(dead_code)] fn seal_red_typo() -> u8 { crate::blob::lend_seal::Tokne::new() }") >/dev/null 2>&1; then
   fail "words: a case that failed without its words read as red"
 fi
 echo "seal red red: words held"
