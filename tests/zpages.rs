@@ -12259,6 +12259,25 @@ fn scans_after_a_quiet_stretch_have_the_cold_raw_files_asked_for() {
             (before.raw_rewarms, before.raw_rewarm_short),
             "{what}: no raw rewarm without the quiet: {c:?}"
         );
+        // A settle is a rest: it asks for the cold raw files within the
+        // room and returns with them back, with nothing to wait for after.
+        let mut db = db;
+        db.settle().unwrap();
+        let c = db.zpage_counts();
+        let warm = raw_resident(&dir).1;
+        if asked {
+            assert_eq!(c.raw_settles, 1, "{what}: the settle's asks: {c:?}");
+            assert!(
+                warm * 10 >= size * 9,
+                "{what}: the raw files back as the settle returns: {warm} of {size}"
+            );
+        } else {
+            assert_eq!(c.raw_settles, 0, "{what}: no settle's asks: {c:?}");
+            assert!(
+                warm * 2 < size,
+                "{what}: the raw files left out by the settle: {warm} of {size}"
+            );
+        }
         let r = db.reader().unwrap();
         check(&r, &model, &keys, &format!("{what}: after"));
         drop(r);

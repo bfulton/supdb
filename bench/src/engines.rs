@@ -12626,6 +12626,8 @@ impl Engine for Supdb {
             ("zpage_raw_rewarm_files", z.raw_rewarm_files as f64),
             ("zpage_raw_rewarm_bytes", z.raw_rewarm_bytes as f64),
             ("zpage_raw_rewarm_short", z.raw_rewarm_short as f64),
+            ("zpage_raw_settles", z.raw_settles as f64),
+            ("zpage_raw_settle_ms", z.raw_settle_ms as f64),
             ("forms_off_entries", db.forms_off_counts()[0] as f64),
             ("forms_off_exits", db.forms_off_counts()[1] as f64),
             ("forms_off_scans", db.forms_off_counts()[2] as f64),

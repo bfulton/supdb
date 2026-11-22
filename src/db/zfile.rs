@@ -6398,6 +6398,10 @@ pub(super) struct ZEvents {
     pub raw_rewarm_files: AtomicU64,
     pub raw_rewarm_bytes: AtomicU64,
     pub raw_rewarm_short: AtomicU64,
+    /// The settles that asked for the raw form's files and waited for them,
+    /// and the milliseconds they waited.
+    pub raw_settles: AtomicU64,
+    pub raw_settle_ms: AtomicU64,
     /// Re-codes made by exchanging the served form file with the kept one.
     pub recode_flips: AtomicU64,
     /// Spares built and kept (`Options::zpages_both`), and spares that kept

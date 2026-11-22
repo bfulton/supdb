@@ -961,6 +961,10 @@ pub struct ZCounts {
     pub raw_rewarm_files: u64,
     pub raw_rewarm_bytes: u64,
     pub raw_rewarm_short: u64,
+    /// The settles that asked for the raw form's files and waited for them
+    /// (`Options::zpages_rewarm_raw`), and the milliseconds they waited.
+    pub raw_settles: u64,
+    pub raw_settle_ms: u64,
     /// Block-coded partitions re-parsed while served
     /// (`Options::zpages_reparse`).
     pub reparses: u64,
@@ -20097,8 +20101,14 @@ pub(super) fn resident_share(bytes: &[u8]) -> f64 {
 /// is left of `room`; a file that does not fit is left and counted short,
 /// and a smaller one after it may still be asked. A file gone since the
 /// look is passed over.
-fn raw_rewarm_ask(shared: &Shared, files: Vec<PathBuf>, mut room: u64, trace: bool) {
+fn raw_rewarm_ask(
+    shared: &Shared,
+    files: Vec<PathBuf>,
+    mut room: u64,
+    trace: bool,
+) -> Vec<MmapBytes> {
     let (mut asked, mut bytes, mut short) = (0u64, 0u64, 0u64);
+    let mut maps = Vec::new();
     for p in files {
         let Ok(map) = MmapBytes::open(&p) else {
             continue;
@@ -20117,6 +20127,7 @@ fn raw_rewarm_ask(shared: &Shared, files: Vec<PathBuf>, mut room: u64, trace: bo
         let _ = crate::bytes::Bytes::advise_willneed(&map, 0, len);
         asked += 1;
         bytes += missing;
+        maps.push(map);
     }
     if asked > 0 {
         zfile::ZEvents::add(&shared.z.raw_rewarms, 1);
@@ -20131,6 +20142,7 @@ fn raw_rewarm_ask(shared: &Shared, files: Vec<PathBuf>, mut room: u64, trace: bo
             room as f64 / 1e6
         );
     }
+    maps
 }
 
 /// What the trim asks of glibc's allocator: the bytes it holds free in its
@@ -24932,6 +24944,8 @@ impl Reader {
             raw_rewarm_files: get(&ev.raw_rewarm_files),
             raw_rewarm_bytes: get(&ev.raw_rewarm_bytes),
             raw_rewarm_short: get(&ev.raw_rewarm_short),
+            raw_settles: get(&ev.raw_settles),
+            raw_settle_ms: get(&ev.raw_settle_ms),
             reparses: get(&ev.reparses),
             recode_flips: get(&ev.recode_flips),
             spare_builds: get(&ev.spare_builds),
@@ -46077,6 +46091,7 @@ impl Maint {
                 z_finish_wait(&self.shared);
                 self.z_rewarm_join();
                 self.z_join_asks();
+                self.z_raw_settle();
                 self.sync_owed_slot()
             }
             MaintAsk::Checkpoint(dest) => {
@@ -50289,7 +50304,7 @@ impl Maint {
                     }
                 }
                 if !raw.is_empty() {
-                    raw_rewarm_ask(&shared, raw, room, trace);
+                    let _ = raw_rewarm_ask(&shared, raw, room, trace);
                 }
             })
             .ok();
@@ -50337,6 +50352,63 @@ impl Maint {
         files.extend(parts);
         files.extend(pieces);
         files
+    }
+
+    /// A settle's ask for the raw form's files (`Options::zpages_rewarm_raw`)
+    /// and its wait for them: with every seal and merge landed the store is
+    /// at rest, and a rest is when the files the writes pushed out can come
+    /// back into the room the writes left -- the scans that follow a
+    /// settle find them where a rewarm made as they come is a read the
+    /// first of them waits behind: at three million keys under 1 GiB the
+    /// lag sweep's clean store, whose pass is a tenth of a second, read 135
+    /// to 160 MB from the device inside it with the asks made at its start,
+    /// and ran no faster for the faults it saved. The files are asked as a
+    /// rewarm asks them, within the group's room, on this thread, and waited
+    /// for as the form files are (`z_join_asks`): a look every
+    /// `ASK_JOIN_POLL` until `HOT_RAW_RESIDENT` of what was asked is
+    /// resident, `ASK_JOIN_STALLS` looks with no page more, or
+    /// `ASK_JOIN_CAP`. Counted (`ZCounts::raw_settles`, `raw_settle_ms`).
+    fn z_raw_settle(&mut self) {
+        if !self.opts.zpages_rewarm_raw {
+            return;
+        }
+        let Some(room) = self.raw_rewarm_room() else {
+            return;
+        };
+        let files = self.raw_rewarm_files(false);
+        if files.is_empty() {
+            return;
+        }
+        let maps = raw_rewarm_ask(&self.shared, files, room, self.z_trace);
+        if maps.is_empty() {
+            return;
+        }
+        let t = std::time::Instant::now();
+        let total: u64 = maps.iter().map(|m| m.0.len() as u64).sum();
+        let want = (total as f64 * HOT_RAW_RESIDENT) as u64;
+        let held = |maps: &[MmapBytes]| -> u64 {
+            maps.iter()
+                .map(|m| (resident_share(&m.0[..]) * m.0.len() as f64) as u64)
+                .sum()
+        };
+        let (mut last, mut stalls) = (held(&maps), 0u32);
+        while last < want && t.elapsed() < ASK_JOIN_CAP && stalls < ASK_JOIN_STALLS {
+            std::thread::sleep(ASK_JOIN_POLL);
+            let now = held(&maps);
+            stalls = if now > last { 0 } else { stalls + 1 };
+            last = now;
+        }
+        let ms = t.elapsed().as_millis() as u64;
+        zfile::ZEvents::add(&self.shared.z.raw_settles, 1);
+        zfile::ZEvents::add(&self.shared.z.raw_settle_ms, ms);
+        if self.z_trace {
+            eprintln!(
+                "zrawsettle asked {} held_mb {:.1} of {:.1} ms {ms}",
+                maps.len(),
+                last as f64 / 1e6,
+                total as f64 / 1e6
+            );
+        }
     }
 
     /// The thread of `Options::zpages_rewarm_scans` joined, where a settle
