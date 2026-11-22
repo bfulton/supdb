@@ -4046,7 +4046,15 @@ the stop's flag (or for the seal counted out) and then committed a batch
 read the commit's answer as the failure's -- in about one run of three
 of a mutant pass once the stop moved ahead of the count. A test that
 waits on one signal and reads another waits for the one it reads: here a
-commit with nothing staged, until one answers.
+commit with nothing staged, until one answers. Two more helpers of that
+file had the bet and were left when the first was fixed: one went red in
+a whole run a day later, at a seal the failure fell to. The window is a
+few microseconds, so the helpers were found by making it wide, a spin of
+a set width between the stop's flag and the failure's leaving, put into
+the engine for the hunt and taken out after: at a millisecond the two
+were red in twenty-four runs of twenty-five, and the whole binary run
+under the same width named no third. A fix of one test for a race is
+followed by the race made wide under every test of its binary.
 
 **A mark taken whole and then read in part.** A commit publishes the
 log's length, the entry count and the watermark as one mark, and a

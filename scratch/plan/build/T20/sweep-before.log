@@ -1,0 +1,11 @@
+window 0us: 0 red of 25
+window 50us: 1 red of 25
+window 100us: 1 red of 25
+window 150us: 1 red of 25
+window 200us: 2 red of 25
+window 300us: 14 red of 25
+window 400us: 13 red of 25
+window 600us: 23 red of 25
+window 800us: 21 red of 25
+window 1200us: 24 red of 25
+window 2000us: 24 red of 25

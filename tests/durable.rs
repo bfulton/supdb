@@ -6933,23 +6933,27 @@ fn ss_no_room_for_the_run(tag: &str, seal_first: bool) {
     db.seal().unwrap();
     wait_for("the failed landing", || db.seals_wedged());
     let cause = "a test failed this landing";
+    // The segment work stops the queue and then, its look done, leaves
+    // its failure for the writer: answered here, once, by a commit with
+    // nothing staged, before any call whose answer this test reads. Read
+    // on the stop's flag alone, the failure fell to whichever call came
+    // after it was left -- a seal below, in one whole run of the binary.
+    let e = ss_commit_answer(&mut db);
+    assert!(
+        e.to_string().contains(cause),
+        "{tag}: the segment work's own error, answered once: {e}"
+    );
     // The frozen tables filled behind it: each seal is handed, lands
-    // nothing, and keeps its table frozen.
-    let mut first = true;
-    // The failed landing's table stays frozen: two more fill the list.
+    // nothing, and keeps its table frozen. The failed landing's table
+    // stays frozen: two more fill the list.
     for t in 0..2u32 {
         for k in (0..100u32).rev() {
             ss_put(&mut db, &mut model, &ss_key(1000 * (t + 1) + k), "f");
         }
-        if db.commit().is_err() {
-            assert!(
-                first,
-                "{tag}: only the first commit answers the segment work's error"
-            );
-            db.commit().unwrap();
-        }
-        first = false;
-        db.seal().unwrap();
+        db.commit()
+            .unwrap_or_else(|e| panic!("{tag}: a commit after the failure was answered: {e}"));
+        db.seal()
+            .unwrap_or_else(|e| panic!("{tag}: a seal handed behind the stopped queue: {e}"));
     }
     // A run above every key, committed and acknowledged.
     for k in 0..300u32 {
@@ -7103,20 +7107,22 @@ fn ss_handed_over_a_stopped_queue(tag: &str, full: bool) {
     db.fail_next_landing();
     db.seal().unwrap();
     wait_for("the failed landing", || db.seals_wedged());
-    let mut first = true;
+    // The failure the segment work leaves once its look is done, answered
+    // here by a commit with nothing staged (`ss_no_room_for_the_run` says
+    // why): every commit after it is read for itself.
+    let e = ss_commit_answer(&mut db);
+    assert!(
+        e.to_string().contains(cause),
+        "{tag}: the segment work's own error, answered once: {e}"
+    );
     for t in 0..if full { 2u32 } else { 0 } {
         for k in (0..100u32).rev() {
             ss_put(&mut db, &mut model, &ss_key(1000 * (t + 1) + k), "f");
         }
-        if db.commit().is_err() {
-            assert!(
-                first,
-                "{tag}: only the first commit answers the segment work's error"
-            );
-            db.commit().unwrap();
-        }
-        first = false;
-        db.seal().unwrap();
+        db.commit()
+            .unwrap_or_else(|e| panic!("{tag}: a commit after the failure was answered: {e}"));
+        db.seal()
+            .unwrap_or_else(|e| panic!("{tag}: a seal handed behind the stopped queue: {e}"));
     }
     assert_eq!(
         db.frozen_tables() == 3,
@@ -7127,13 +7133,8 @@ fn ss_handed_over_a_stopped_queue(tag: &str, full: bool) {
     for k in (0..50u32).rev() {
         ss_put(&mut db, &mut model, &ss_key(500 + k), "s");
     }
-    if db.commit().is_err() {
-        assert!(
-            first,
-            "{tag}: only the first commit answers the segment work's error"
-        );
-        db.commit().unwrap();
-    }
+    db.commit()
+        .unwrap_or_else(|e| panic!("{tag}: a commit after the failure was answered: {e}"));
     db.sync()
         .unwrap_or_else(|e| panic!("{tag}: the sync that hands the table: {e}"));
     assert!(db.table_handed(), "{tag}: the sync handed the live table");
