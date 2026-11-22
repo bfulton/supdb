@@ -7439,3 +7439,91 @@ fn a_seals_token_spelled_another_way_fails() {
     }
     r.done();
 }
+
+// The cross-arm group (scripts/check.sh) runs the library's unit tests under
+// qemu-user 8.2, which fakes /proc/self/maps from its own record of the
+// guest's mappings and dies reading it ("QEMU internal SIGSEGV") while
+// another thread maps or unmaps: one read in a run beside the tests that map
+// killed it at a rate. A panic's backtrace is symbolized by reading that
+// file, and the group runs with RUST_BACKTRACE=0 for it; what the variable
+// cannot reach is the library's own code, a unit test's included, reading
+// the file, making a backtrace of its own (`std::backtrace`) or setting the
+// variable back, and that is held here, so the crash comes back as a red
+// that names the line and not as a run that dies one time in three.
+
+/// Each line of the library's code, unit tests included, that reads
+/// `/proc/self/maps`, names `std::backtrace`'s `Backtrace` (a capture is
+/// made by naming it, an alias's `use` included) or writes `RUST_BACKTRACE`
+/// (`RUST_LIB_BACKTRACE` with it): `file:line: what`. Comments are not
+/// code; a path put together by `concat!` is refused by the door outside
+/// its modules, and one put together at run time is not read.
+fn maps_readers(src: &BTreeMap<String, String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for (f, text) in src {
+        for (i, l) in lex::regions(text).iter().enumerate() {
+            if l.code.contains("/proc/self/maps") {
+                out.push(format!("{f}:{}: reads /proc/self/maps", i + 1));
+            }
+            if l.code.contains("RUST_BACKTRACE") || l.code.contains("RUST_LIB_BACKTRACE") {
+                out.push(format!("{f}:{}: names RUST_BACKTRACE", i + 1));
+            }
+            let c: Vec<char> = l.flat.chars().collect();
+            if words(&c).iter().any(|(_, w)| w == "Backtrace") {
+                out.push(format!("{f}:{}: names std::backtrace", i + 1));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn the_library_reads_no_maps_and_makes_no_backtrace() {
+    let hits = maps_readers(&sources(&root()));
+    assert!(
+        hits.is_empty(),
+        "under qemu-user a read of /proc/self/maps beside a thread that maps kills the \
+         cross-arm run (scripts/check.sh), and a backtrace is symbolized by reading it:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn a_maps_reader_or_a_backtrace_in_the_library_fails() {
+    let file = "src/crypt.rs";
+    let red = |line: &str, want: &str| {
+        let src = edited(file, |t| {
+            format!("{t}\n#[cfg(test)]\nmod maps_probe {{\n    #[test]\n    fn p() {{\n        {line}\n    }}\n}}\n")
+        });
+        let hits = maps_readers(&src);
+        assert!(
+            hits.iter()
+                .any(|h| h.starts_with(&format!("{file}:")) && h.ends_with(want)),
+            "`{line}` was not refused as `{want}`: {hits:?}"
+        );
+    };
+    red(
+        "let _ = std::fs::read_to_string(\"/proc/self/maps\");",
+        "reads /proc/self/maps",
+    );
+    red(
+        "let _ = std::backtrace::Backtrace::force_capture().to_string();",
+        "names std::backtrace",
+    );
+    red(
+        "use std::backtrace::Backtrace as B; let _ = B::capture();",
+        "names std::backtrace",
+    );
+    red(
+        "std::env::set_var(\"RUST_BACKTRACE\", \"1\");",
+        "names RUST_BACKTRACE",
+    );
+    red(
+        "std::env::set_var(\"RUST_LIB_BACKTRACE\", \"1\");",
+        "names RUST_BACKTRACE",
+    );
+    // A comment is not code.
+    let src = edited(file, |t| {
+        format!("{t}\n// reads /proc/self/maps for a Backtrace under RUST_BACKTRACE\n")
+    });
+    assert_eq!(maps_readers(&src), Vec::<String>::new());
+}

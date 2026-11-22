@@ -92,7 +92,17 @@
 #            supdb_emulated` (qemu-user answers `madvise` advice with
 #            success and passes it to no kernel, so the unit tests that read
 #            the kernel's answer are compiled out; the native ARM leg runs
-#            them). Not in the default set: it needs the aarch64 target,
+#            them), and with backtraces off: qemu-user 8.2 fakes
+#            /proc/self/maps from its own record of the guest's mappings
+#            and dies reading it ("QEMU internal SIGSEGV") while another
+#            thread maps or unmaps, and a panic's backtrace is symbolized
+#            by reading that file, so under RUST_BACKTRACE every panic --
+#            a test's on purpose or a real failure's -- beside the other
+#            tests' mappings killed the run (tests/source.rs holds the
+#            library's own code to reading no such file and making no
+#            backtrace); the run is held to having filtered no test out,
+#            since a word after `--lib` is a filter and a run of none is
+#            green. Not in the default set: it needs the aarch64 target,
 #            aarch64-linux-gnu-gcc and qemu-aarch64-static, which
 #            `rustup target add aarch64-unknown-linux-gnu` and `apt-get
 #            install gcc-aarch64-linux-gnu qemu-user-static` give
@@ -200,10 +210,22 @@ for g in $groups; do
           exit 2
         }
       done
-      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+      out=$(CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
         CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64-static -L /usr/aarch64-linux-gnu" \
         CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="--cfg supdb_emulated" \
-        cargo test --profile checked --target aarch64-unknown-linux-gnu --lib
+        RUST_BACKTRACE=0 \
+        cargo test --profile checked --target aarch64-unknown-linux-gnu --lib 2>&1) || {
+        printf '%s\n' "$out"
+        exit 1
+      }
+      printf '%s\n' "$out"
+      # A word after `--lib` is a filter, and a run that filtered every
+      # test out is green by its exit status: the run has to have run some
+      # and filtered none.
+      printf '%s\n' "$out" | grep -q '^test result: ok\. [1-9][0-9]* passed; 0 failed; [0-9]* ignored; 0 measured; 0 filtered out' || {
+        echo "cross-arm: the run did not run every test it compiled" >&2
+        exit 1
+      }
       ;;
     machine)
       say "machine"

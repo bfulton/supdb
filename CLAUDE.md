@@ -149,6 +149,30 @@ timing run needs the machine to itself, and CI gives it a job of its own. The
 check run in the `bench` group (`sh bench/scripts/check.sh lint` by
 itself, a minute), and a commit that touched `bench/` alone went out
 behind a green `lint` with a doubled `#[allow]` that clippy refuses.
+The `cross-arm` group died in two runs of five with "QEMU internal
+SIGSEGV" and no test failed, and the first reading put it on the
+tests added since the last green run. It was the shell's
+`RUST_BACKTRACE=1`: a test that panics on purpose has its backtrace
+symbolized, the symbolizer reads `/proc/self/maps`, and qemu-user 8.2
+fakes that file from its own record of the guest's mappings and crashes
+reading it while another thread maps or unmaps -- a C program of four
+threads and no engine dies the same way every run, and the same tests
+with backtraces off never do. qemu's `-strace -D` named it in one
+batch, the test binary run straight under the emulator with no cargo in
+the loop (eight of twelve dead there against two of five through
+cargo), and the group sets `RUST_BACKTRACE=0` for its run. An
+instrument's crash is traced to the calls in flight before it is read
+as any test's, and a variable of the caller's environment is one of the
+inputs a group fixes for itself. Review then found two ways round the
+variable that it passed: the library's own code reading the file or
+making a backtrace -- a unit test that formats `Backtrace::force_capture()`
+killed one run in twelve under the fix -- which tests/source.rs now
+refuses by line (`the_library_reads_no_maps_and_makes_no_backtrace`); and
+the variable moved after `--lib`, where cargo takes it for a test-name
+filter and the group ran no test and exited 0, so the case holds its run
+to `0 filtered out`. A fix that rests on an input is held where the input
+can be undone, and a group's verdict by exit status is held to the count
+of what it ran.
 
 The forms and the encryption are kept apart by two gates, so that a change
 to a form needs no change under the cipher and one that would be wrong
