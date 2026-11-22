@@ -20037,6 +20037,110 @@ fn a_syncing_commits_burst_batches_are_paced_behind_the_thread() {
     }
 }
 
+/// Out of core, a scan that starts in a block the writer holds a form for
+/// counts as a reuse under `Options::scan_forms_off_counts_built`: the
+/// forms are given up because a build is repaid only where a later scan
+/// walks the block again, and a built form costs no build. A store with an
+/// update in every block has every block formed by scans in core; then,
+/// with the gate set to the compact form's by hand, uniform starts that no
+/// recent scan started in keep the forms with the option and give them up
+/// without it; a store with an update in a few blocks has the rest marked
+/// clean, which is no build, and gives the forms up with the option too.
+/// Every scan answers as the model in each.
+#[test]
+fn a_form_built_already_is_a_reuse_for_the_forms_off_rule() {
+    // An update every sixteenth key forms every block; every two
+    // thousandth leaves most blocks clean, and a clean mark is no build.
+    for (counts, step) in [(true, 16u32), (false, 16), (true, 2_000)] {
+        let kept = counts && step == 16;
+        let d = dir(&format!("forms-off-built-{counts}-{step}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                scan_forms_off_unreused: true,
+                scan_forms_off_counts_built: counts,
+                scan_forms_off_window: 32,
+                scan_forms_off_ghost_bits: 6,
+                zpages: supdb::ZPages::Off,
+                partition_bytes: Some(256 << 10),
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let keys = 100_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+            want.insert(key(k), "0".into());
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(db.levels().0 > 1, "partitions for the forms to hang on");
+        // An update in every block, and scans in core over the whole store,
+        // so that every block has a form.
+        for k in (0..keys).step_by(step as usize) {
+            db.put(&key(k), b"1");
+            want.insert(key(k), "1".into());
+        }
+        db.commit().unwrap();
+        let check = |r: &Reader, want: &BTreeMap<Vec<u8>, String>, start: u32, n: usize| {
+            let mut got: Vec<(Vec<u8>, String)> = Vec::new();
+            r.scan(
+                &key(start),
+                n,
+                kv(&mut |k, v| {
+                    got.push((k.to_vec(), std::str::from_utf8(v).unwrap().to_string()));
+                }),
+            )
+            .unwrap();
+            let expect: Vec<(Vec<u8>, String)> = want
+                .range(key(start)..)
+                .take(n)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            assert_eq!(got, expect, "counts {counts}: scan from {start}");
+        };
+        let mut start = 0u32;
+        while start < keys {
+            check(&db, &want, start, 2_000);
+            start += 2_000;
+        }
+        let formed = db.block_cache_size().0;
+        assert!(
+            step != 16 || formed > 1_000,
+            "counts {counts}: every block formed: {formed}"
+        );
+        assert_eq!(db.forms_off_counts(), [0, 0, 0], "counts {counts}: in core");
+        // Out of core, starts uniform over the store's blocks in a table of
+        // 64 slots: no recent start recurs, every start's block is formed.
+        db.zgate_set(2);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..256 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            check(&db, &want, (x % keys as u64) as u32, 20);
+        }
+        let c = db.forms_off_counts();
+        if kept {
+            assert_eq!(c[0], 0, "the built forms kept: {c:?}");
+            assert!(
+                db.block_cache_size().0 >= formed,
+                "counts {counts}: no form dropped"
+            );
+        } else {
+            assert!(
+                c[0] >= 1 && c[2] > 0,
+                "counts {counts} step {step}: the forms given up: {c:?}"
+            );
+            assert_eq!(db.block_cache_size().0, 0, "no form kept while off");
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 /// Out of core -- the gate set to the compact form's by hand, the
 /// controller off -- a writer whose scans start in blocks no recent scan
 /// started in gives its forms up and takes the merge path

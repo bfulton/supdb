@@ -4269,6 +4269,22 @@ pub struct Options {
     /// `supdb-formson` keeps the forms on.
     #[doc(hidden)]
     pub scan_forms_off_unreused: bool,
+    /// EXPERIMENT: `scan_forms_off_unreused`'s reading counts a scan that
+    /// starts in a block the writer holds a form for already as a reuse, as
+    /// it counts one that starts where a recent scan started. The rule
+    /// gives the forms up because a build is repaid only where a later scan
+    /// walks the block again, and a form the burst's fills built is paid
+    /// for: walking it costs no build. At three million keys under 1 GiB
+    /// the lag sweep's full rewrite had the upkeep thread build a form for
+    /// every block, 330 MB of copies and 60 of sparse forms, beside which
+    /// the controller's budget, the limit less the process, fell from 794
+    /// MB to 288 and the compact form was installed; the pass's uniform
+    /// starts then gave every form up at its 512th scan, the merge path
+    /// read partitions the crossing had dropped from the cache, and the
+    /// process ended the pass holding 589 MB with 15 in use. Off;
+    /// `supdb-formsoffbuilt` counts the built forms.
+    #[doc(hidden)]
+    pub scan_forms_off_counts_built: bool,
     /// `scan_forms_off_unreused`'s reading taken as stale: the writer that
     /// gave its forms up takes them back at the commit that makes this many
     /// writes in a row in commits under `UPKEEP_WAKE_WRITES` each, with no
@@ -6915,6 +6931,7 @@ impl Default for Options {
             overlay_merge: true,
             scan_lazy_snapshot: false,
             scan_forms_off_unreused: true,
+            scan_forms_off_counts_built: false,
             scan_forms_off_stale_writes: 512,
             scan_forms_off_window: 512,
             scan_forms_off_ghost_bits: 10,
@@ -28173,7 +28190,8 @@ impl Reader {
             return self.fs().forms_off.get();
         }
         let np = self.segs().partition_point(|s| s.level > 0);
-        let seg = &self.segs()[self.first_reaching(np, from).min(np - 1)];
+        let pi = self.first_reaching(np, from).min(np - 1);
+        let seg = &self.segs()[pi];
         let Some(b) = seg.ord.floor_stride(from) else {
             return off;
         };
@@ -28187,6 +28205,9 @@ impl Reader {
             }
             std::mem::replace(&mut ghost[slot], id) == id
         };
+        // A start in a block whose form is built already is a walk that
+        // costs no build (`Options::scan_forms_off_counts_built`).
+        let hit = hit || (self.opts.scan_forms_off_counts_built && self.block_built(pi, b));
         let (n, hits) = self.fs().reuse.get();
         let (n, hits) = (n + 1, hits + u32::from(hit));
         if n < self.opts.scan_forms_off_window.max(1) {
@@ -28200,6 +28221,23 @@ impl Reader {
             self.forms_off_leave();
         }
         self.fs().forms_off.get()
+    }
+
+    /// Whether the writer's table for partition `pi` holds a form for block
+    /// `b` -- a copy, a sparse form or a wide one, not a clean mark, which
+    /// stands for a block with nothing to fold and so for no build at all.
+    fn block_built(&self, pi: usize, b: usize) -> bool {
+        let tables = self.fs().tables.borrow();
+        let Some(cell) = tables.get(pi) else {
+            return false;
+        };
+        let held = cell.borrow();
+        held.as_ref().is_some_and(|t| {
+            t.blob == self.segs()[pi].blob.id()
+                && t.slots
+                    .get(b)
+                    .is_some_and(|a| a.as_ref().is_some_and(|a| !matches!(**a, Cached::Clean)))
+        })
     }
 
     /// The forms given up for the merge path, as a change of generation

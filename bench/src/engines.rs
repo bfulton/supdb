@@ -950,6 +950,11 @@ pub struct Supdb {
     /// (`Options::zpages_rewarm_raw_scans`), `None` for the engine's
     /// default. `supdb-zrewarmrawscans`.
     rewarmrawscans: Option<bool>,
+    /// A scan that starts in a block the writer holds a form for counted
+    /// as a reuse by the forms-off rule
+    /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
+    /// default. `supdb-formsoffbuilt`.
+    formsoffbuilt: Option<bool>,
     /// The writer's block forms kept out of core whatever its scans meet,
     /// the shape before `Options::scan_forms_off_unreused`.
     /// `supdb-formson`.
@@ -2281,6 +2286,11 @@ struct Policy {
     /// (`Options::zpages_rewarm_raw_scans`), `None` for the engine's
     /// default. `supdb-zrewarmrawscans`.
     rewarmrawscans: Option<bool>,
+    /// A scan that starts in a block the writer holds a form for counted
+    /// as a reuse by the forms-off rule
+    /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
+    /// default. `supdb-formsoffbuilt`.
+    formsoffbuilt: Option<bool>,
     /// The writer's block forms kept out of core whatever its scans meet,
     /// the shape before `Options::scan_forms_off_unreused`.
     /// `supdb-formson`.
@@ -3066,6 +3076,7 @@ impl Default for Policy {
             rewarmtrim: false,
             rewarmraw: None,
             rewarmrawscans: None,
+            formsoffbuilt: None,
             formson: false,
             formsoffkept: false,
             snapdrops: false,
@@ -7515,6 +7526,18 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with the forms-off rule counting a start in a built form as
+    /// a reuse (`Options::scan_forms_off_counts_built`).
+    pub fn create_formsoffbuilt(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                formsoffbuilt: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-zrewarmraw` asking for the raw form's files where scans come
     /// back as well as at a settle (`Options::zpages_rewarm_raw_scans`), the
     /// shape refuted at ten million keys under 1 GiB.
@@ -9412,6 +9435,7 @@ impl Supdb {
             rewarmtrim,
             rewarmraw,
             rewarmrawscans,
+            formsoffbuilt,
             formson,
             formsoffkept,
             snapdrops,
@@ -9911,6 +9935,8 @@ impl Supdb {
             zpages_rewarm_raw: rewarmraw.unwrap_or(supdb::Options::default().zpages_rewarm_raw),
             zpages_rewarm_raw_scans: rewarmrawscans
                 .unwrap_or(supdb::Options::default().zpages_rewarm_raw_scans),
+            scan_forms_off_counts_built: formsoffbuilt
+                .unwrap_or(supdb::Options::default().scan_forms_off_counts_built),
             scan_forms_off_unreused: !formson,
             forms_settle_room_pressure: !settleroomstill,
             scan_forms_off_stale_writes: if formsoffkept {
@@ -10380,6 +10406,7 @@ impl Supdb {
             rewarmtrim,
             rewarmraw,
             rewarmrawscans,
+            formsoffbuilt,
             formson,
             formsoffkept,
             snapdrops,
@@ -11926,6 +11953,9 @@ impl Engine for Supdb {
         }
         if self.rewarmrawscans == Some(true) {
             return "supdb-zrewarmrawscans";
+        }
+        if self.formsoffbuilt == Some(true) {
+            return "supdb-formsoffbuilt";
         }
         if self.rewarmraw == Some(true) {
             return "supdb-zrewarmraw";
@@ -13607,6 +13637,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-rewarmtrim"
         | "supdb-zrewarmraw"
         | "supdb-zrewarmrawscans"
+        | "supdb-formsoffbuilt"
         | "supdb-formson"
         | "supdb-formsoffkept"
         | "supdb-snapdrops"
@@ -15539,6 +15570,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-rewarmtrim" => supdb_arm(Supdb::create_rewarmtrim, dir)?,
         "supdb-zrewarmraw" => supdb_arm(Supdb::create_zrewarmraw, dir)?,
         "supdb-zrewarmrawscans" => supdb_arm(Supdb::create_zrewarmrawscans, dir)?,
+        "supdb-formsoffbuilt" => supdb_arm(Supdb::create_formsoffbuilt, dir)?,
         "supdb-formson" => supdb_arm(Supdb::create_formson, dir)?,
         "supdb-formsoffkept" => supdb_arm(Supdb::create_formsoffkept, dir)?,
         "supdb-snapdrops" => supdb_arm(Supdb::create_snapdrops, dir)?,
@@ -17536,6 +17568,13 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_rewarm_raw && o.zpages_rewarm_raw_scans);
+            }
+            {
+                let z = Supdb::create_formsoffbuilt(&dir("formsoffbuilt")).unwrap();
+                assert_eq!(z.name(), "supdb-formsoffbuilt");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.scan_forms_off_counts_built && !b.scan_forms_off_counts_built);
             }
             {
                 let z = Supdb::create_formson(&dir("formson")).unwrap();
