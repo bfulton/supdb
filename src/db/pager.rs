@@ -1771,12 +1771,17 @@ mod tests {
         assert_eq!(m.resident_at(100_000), Some(true));
         assert_eq!(m.resident_at(len as u64), None, "past the end");
         assert!(m.advise_willneed(2_000_000, 1_000_000) >= 1_000_000);
+        // The ask is advice and its read is on the kernel's time: the page
+        // in the middle of what was asked is back before the last of it, so
+        // the whole file's share is waited for as that page is. Read once
+        // behind the page alone, the share was short in one run of six.
         let t = std::time::Instant::now();
-        while m.resident_at(2_500_000) != Some(true) {
+        while m.resident_at(2_500_000) != Some(true)
+            || m.resident_share(0, len).map(|s| s > 0.99) != Some(true)
+        {
             assert!(t.elapsed().as_secs() < 20, "the range did not come back");
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        assert_eq!(m.resident_share(0, len).map(|s| s > 0.99), Some(true));
         m.advise_dontneed_range(2_000_000, 1_000_000);
         assert_eq!(m.resident_at(2_500_000), Some(false));
         m.advise_dontneed();
