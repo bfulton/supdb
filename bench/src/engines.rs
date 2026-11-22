@@ -353,6 +353,13 @@ pub trait Engine {
         Vec::new()
     }
 
+    /// The writer's tables dropped whole by the site that asked, and the
+    /// rebase's refusals by check (`Db::forms_drop_reasons`), one line, for
+    /// the same probe; empty for an engine with nothing to say.
+    fn forms_drop_reasons(&self) -> String {
+        String::new()
+    }
+
     /// Each form file's keys, megabytes and decodes, by partition in key
     /// order (`Db::zpage_heat`): where a mix's decodes land, printed after
     /// each mix under `SUPDB_MIX_HEAT`. Empty for an engine with no form.
@@ -12746,6 +12753,21 @@ impl Engine for Supdb {
         self.db
             .as_ref()
             .map_or(Vec::new(), |db| db.forms_by_partition())
+    }
+
+    fn forms_drop_reasons(&self) -> String {
+        self.db.as_ref().map_or(String::new(), |db| {
+            let (drops, refusals) = db.forms_drop_reasons();
+            let f = |a: &[u64; 16]| {
+                a.iter()
+                    .enumerate()
+                    .filter(|(_, n)| **n > 0)
+                    .map(|(i, n)| format!("{i}:{n}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            format!("drops {} refusals {}", f(&drops), f(&refusals))
+        })
     }
 
     fn memory_census(&self) -> Vec<(String, u64)> {

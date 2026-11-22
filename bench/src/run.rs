@@ -3521,6 +3521,7 @@ fn lag_sweep(
             for l in e.forms_by_partition() {
                 eprintln!("lagforms {arm} {pct} start {l}");
             }
+            eprintln!("lagdrops {arm} {pct} start {}", e.forms_drop_reasons());
         }
         let mut g3 = KeyGen::new(KeyDist::Uniform, scan_keys, 0x1A7);
         // With `SUPDB_SCAN_OPS` set, every scan of the point's pass is timed
@@ -3659,6 +3660,7 @@ fn lag_sweep(
             for l in e.forms_by_partition() {
                 eprintln!("lagforms {arm} {pct} end {l}");
             }
+            eprintln!("lagdrops {arm} {pct} end {}", e.forms_drop_reasons());
         }
     }
     Ok(())

@@ -20006,6 +20006,11 @@ struct Shared {
     /// The times the upkeep thread gave its forms up, on an ask and on
     /// what its own pin held.
     abandons: AtomicU64,
+    /// The writer's tables dropped whole, by the site that asked
+    /// (`Reader::drop_blocks_for`), and `rebase_tables`'s refusals by the
+    /// check that refused: a probe's counts (`Db::forms_drop_reasons`).
+    drop_reasons: [AtomicU64; 16],
+    rebase_refusals: [AtomicU64; 16],
     abandons_pinned: AtomicU64,
     /// `Options::scan_forms_off_unreused`: the times a handle gave its
     /// forms up and took them back, and the scans it made without them.
@@ -26742,7 +26747,7 @@ impl Reader {
                 self.fs().snap_stale.borrow_mut().clear();
             }
             self.fs().pending.borrow_mut().clear();
-            self.drop_blocks();
+            self.drop_blocks_for(1);
             if self.fs().tables.borrow().len() != st.segs.len() {
                 *self.fs().tables.borrow_mut() = Db::tables_for(st.segs.len());
             }
@@ -26951,10 +26956,10 @@ impl Reader {
             || !(self.opts.forms_carry && self.opts.commit_forms && self.opts.scan_block_cache)
             || !self.fs().cache_used.get()
         {
-            return false;
+            return self.refuse_rebase(1);
         }
         let Some(over) = self.fs().over.borrow_mut().take() else {
-            return false;
+            return self.refuse_rebase(2);
         };
         // The live table is the one the log position is of, or freezes
         // that leave their carry to the look (`Options::freeze_settles`
@@ -26966,23 +26971,23 @@ impl Reader {
         // makes itself and carries at once (`carry_switch`).
         let changes = match st.lives.checked_sub(over.lives) {
             Some(d) => d as usize,
-            None => return false,
+            None => return self.refuse_rebase(3),
         };
         let k = st.frozen.len();
         let read_from: Vec<std::sync::Arc<MemTable>> = if changes == 0 {
             if !std::ptr::eq(over.mem.as_ptr(), std::sync::Arc::as_ptr(&st.mem)) {
-                return false;
+                return self.refuse_rebase(4);
             }
             Vec::new()
         } else if self.opts.freeze_settles {
-            return false;
+            return self.refuse_rebase(5);
         } else {
             let replaced = st.replaced();
             let Some(at) = replaced.len().checked_sub(changes) else {
-                return false;
+                return self.refuse_rebase(6);
             };
             if !std::ptr::eq(over.mem.as_ptr(), std::sync::Arc::as_ptr(&replaced[at])) {
-                return false;
+                return self.refuse_rebase(7);
             }
             replaced[at..].to_vec()
         };
@@ -27001,24 +27006,24 @@ impl Reader {
         let landed = before.len() < over.frozen.len()
             && same_tables(&over.frozen[over.frozen.len() - before.len()..], before);
         if !same_frozen && !landed {
-            return false;
+            return self.refuse_rebase(8);
         }
         let np = st.segs.partition_point(|s| s.level > 0);
         if np == 0 || st.layout.len() != np || st.forms.len() < np {
-            return false;
+            return self.refuse_rebase(9);
         }
         // Everything that can fail first, so a failure leaves the tables
         // as they were for the caller to drop.
         let l0 = &st.segs[np..];
         let ctx = self.build_ctx();
         if ctx.rank_pieces().is_err() {
-            return false;
+            return self.refuse_rebase(10);
         }
         let mut bounds = Vec::with_capacity(np);
         for seg in &st.segs[..np] {
             match ctx.table_bounds(seg, l0) {
                 Ok(b) => bounds.push(b),
-                Err(_) => return false,
+                Err(_) => return self.refuse_rebase(11),
             }
         }
         drop(ctx);
@@ -27220,7 +27225,7 @@ impl Reader {
                             .fold_piece_block(p, b, t, seg, piece, (r0..r1, cuts))
                             .is_err()
                         {
-                            return false;
+                            return self.refuse_rebase(12);
                         }
                     }
                 }
@@ -27563,7 +27568,7 @@ impl Reader {
         *self.fs().scan_keys.borrow_mut() = None;
         self.fs().snap_added.borrow_mut().clear();
         self.fs().snap_stale.borrow_mut().clear();
-        self.drop_blocks();
+        self.drop_blocks_for(7);
         self.shared
             .upkeep_lives
             .store(u64::MAX, AtomicOrdering::Relaxed);
@@ -27581,6 +27586,19 @@ impl Reader {
                 .fetch_add(1, AtomicOrdering::Relaxed);
         }
         true
+    }
+
+    /// A refusal of `rebase_tables`, counted by where it was made
+    /// (`Db::forms_drop_reasons`), for the caller to drop everything on.
+    fn refuse_rebase(&self, at: usize) -> bool {
+        self.shared.rebase_refusals[at.min(15)].fetch_add(1, AtomicOrdering::Relaxed);
+        false
+    }
+
+    /// `drop_blocks`, counted by the site that asked (`Db::forms_drop_reasons`).
+    fn drop_blocks_for(&self, why: usize) {
+        self.shared.drop_reasons[why.min(15)].fetch_add(1, AtomicOrdering::Relaxed);
+        self.drop_blocks();
     }
 
     fn drop_blocks(&self) {
@@ -28294,7 +28312,7 @@ impl Reader {
         *self.fs().scan_keys.borrow_mut() = None;
         self.fs().snap_added.borrow_mut().clear();
         self.fs().snap_stale.borrow_mut().clear();
-        self.drop_blocks();
+        self.drop_blocks_for(8);
         if self.slot.is_none() {
             self.shared
                 .upkeep_lives
@@ -30312,7 +30330,7 @@ impl Reader {
             budget -= take;
             let later = writes.split_off(take);
             if let Err(e) = self.settle_each(&writes, &table) {
-                self.drop_blocks();
+                self.drop_blocks_for(2);
                 return Err(e);
             }
             if self.abandon_pending() {
@@ -30343,7 +30361,7 @@ impl Reader {
         // stale, so an error drops every table rather than leave one.
         let settled = self.settle_each(&pending, self.mem());
         if settled.is_err() {
-            self.drop_blocks();
+            self.drop_blocks_for(2);
         }
         pending.clear();
         *self.fs().pending.borrow_mut() = pending;
@@ -32668,7 +32686,7 @@ impl Reader {
     pub fn refill_forms(&mut self) -> Result<()> {
         std::mem::forget(self.enter());
         let op = Op(self);
-        self.drop_blocks();
+        self.drop_blocks_for(3);
         self.fs().publish_due.set(true);
         let done = self.maintain_forms();
         drop(op);
@@ -34434,6 +34452,8 @@ impl Db {
             abandon_at: AtomicU64::new(u64::MAX),
             outran_at: AtomicU64::new(u64::MAX),
             abandons: AtomicU64::new(0),
+            drop_reasons: Default::default(),
+            rebase_refusals: Default::default(),
             forms_off_entries: AtomicU64::new(0),
             forms_off_exits: AtomicU64::new(0),
             forms_off_scans: AtomicU64::new(0),
@@ -35229,6 +35249,8 @@ impl Db {
             abandon_at: AtomicU64::new(u64::MAX),
             outran_at: AtomicU64::new(u64::MAX),
             abandons: AtomicU64::new(0),
+            drop_reasons: Default::default(),
+            rebase_refusals: Default::default(),
             forms_off_entries: AtomicU64::new(0),
             forms_off_exits: AtomicU64::new(0),
             forms_off_scans: AtomicU64::new(0),
@@ -36228,7 +36250,7 @@ impl Db {
     fn close_direct(&mut self) -> Result<()> {
         *self.fs().scan_keys.borrow_mut() = None;
         self.fs().snap_added.borrow_mut().clear();
-        self.drop_blocks();
+        self.drop_blocks_for(4);
         self.mem_bytes = 0;
         let Some(d) = self.direct.take() else {
             // A run forming with nothing committed: no file, nothing to close.
@@ -37445,7 +37467,7 @@ impl Db {
             *self.fs().scan_keys.borrow_mut() = None;
             self.fs().snap_added.borrow_mut().clear();
             self.fs().snap_stale.borrow_mut().clear();
-            self.drop_blocks();
+            self.drop_blocks_for(5);
         }
         self.published(old);
         true
@@ -37655,7 +37677,7 @@ impl Db {
             *self.fs().scan_keys.borrow_mut() = None;
             self.fs().snap_added.borrow_mut().clear();
             self.fs().snap_stale.borrow_mut().clear();
-            self.drop_blocks();
+            self.drop_blocks_for(6);
             return;
         };
         // The snapshot carried rather than dropped: its live entries made
@@ -42397,6 +42419,27 @@ impl Db {
     #[doc(hidden)]
     pub fn upkeep_abandons(&self) -> u64 {
         self.shared.abandons.load(AtomicOrdering::Relaxed)
+    }
+
+    /// The writer's tables dropped whole by the site that asked -- 1 the
+    /// log read when the rebase refused, 2 a settle's error, 3 a refill,
+    /// 4 a direct run's close, 5 a freeze, 6 a freeze's carry, 7 the
+    /// upkeep's abandon, 8 the forms given up -- and the rebase's refusals
+    /// by the check that made them, in the order they stand in
+    /// `Reader::rebase_tables`: a probe's counts.
+    #[doc(hidden)]
+    pub fn forms_drop_reasons(&self) -> ([u64; 16], [u64; 16]) {
+        let get = |a: &[AtomicU64; 16]| {
+            let mut out = [0u64; 16];
+            for (o, x) in out.iter_mut().zip(a.iter()) {
+                *o = x.load(AtomicOrdering::Relaxed);
+            }
+            out
+        };
+        (
+            get(&self.shared.drop_reasons),
+            get(&self.shared.rebase_refusals),
+        )
     }
 
     /// Of those, the ones the thread's own pin decided.
