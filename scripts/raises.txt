@@ -9,6 +9,8 @@
 #   reason
 # A line passes only where it matches what the check observed, all four
 # columns. A line the base already has is spent: printed, never matched,
-# and removed by any later change at will.
+# and removed by any later change at will. A line for a list the base does
+# not have yet holds nothing, as its list holds nothing: printed as not
+# held yet, and spent with the first base that has it.
 tests/data/cost-entries.txt	Reader::block_cache_identity	0	1	upstream c5491c59: a test seam that counts the copies claiming their partition, read by tests/db.rs and tests/settle.rs, at no key, entry, block or step of an operation
 tests/data/cost-entries.txt	Reader::piece_bounds	0	1	upstream 00745f1a: a test seam that lists the bounds every piece holds, read by tests, at no key, entry, block or step of an operation

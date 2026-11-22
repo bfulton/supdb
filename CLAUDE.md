@@ -114,7 +114,16 @@ registry named, and a change that moved a list from the registry to its
 not-held table, with a raise beside it, read green; the registry is held to
 the base's now. A check over one kind of line passes everything written in
 another kind, and a check whose scope is written in the tree it checks is
-held to the scope at the base. Every group denies warnings, the wasm group since it was
+held to the scope at the base. And the lists' check answered by its
+base: the first raises a change declared (two cost entries for test seams
+a merge of upstream brought) read green against the branch's tip before
+the change, which is a push's before, and red against the main line, which
+predates every list -- there a list is new, nothing of it is held, and the
+declarations matched no raise. One raises.txt is read under both events,
+so a line for a list the base does not have holds nothing and is said so
+(`ratchet-red.sh` has the case, and the same line red against a base that
+has the list). A check that takes a base is run against every base an
+event can hand it before it is called green. Every group denies warnings, the wasm group since it was
 found printing six dead-code warnings and reporting green: the module built
 under cargo's default of warn, and nobody reads a build log that ends in
 sizes. Four were `format`'s superblock constants, which `blob` kept copies

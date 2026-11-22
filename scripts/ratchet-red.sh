@@ -26,8 +26,9 @@
 #    that does not parse (a count, a region or a door kind that is none, on
 #    one side or both), a registry its own reader cannot read, a base
 #    whose registry cannot be read and a base that is no commit are red; a list new since the base
-#    is green and says so; a declaration at the base is spent, and green
-#    with the raise kept or the line removed.
+#    is green and says so, and so is a raise declared for such a list,
+#    which is red against a base that has the list; a declaration at the
+#    base is spent, and green with the raise kept or the line removed.
 # G. the group: `sh scripts/check.sh lists` exits non-zero where this script
 #    fails, and runs no check after it, and where scripts/ratchet.sh fails;
 #    and `sh scripts/check.sh cost` takes its base from COST_BASE before the
@@ -272,6 +273,20 @@ expect l_entry_new_reason 1 check "$c1"
 at "$c1"
 expect l_new_list 0 check "$c0"
 has l_new_list "tests/data/door-libc.txt: new since the base, nothing to hold yet"
+# A raise declared for a list the base does not have yet holds nothing, as
+# its list holds nothing: green, and said so. The same line against a base
+# that has the list names no growth and is red, and a line for a path that
+# is no list is refused as it always is, a list being new or not.
+libc=tests/data/door-libc.txt
+at "$c1"; decl $libc red_new_libc 0 1 "a list not at the base yet"
+expect l_new_list_declared 0 check "$c0"
+last l_new_list_declared "ratchet: green"
+has l_new_list_declared "not held yet (its list is new since the base): $libc red_new_libc 0 -> 1"
+expect l_new_list_declared_held 1 check "$c1"
+has l_new_list_declared_held "$libc red_new_libc 0 -> 1, which matches no raise"
+at "$c1"; decl tests/data/no-list.txt red_new_libc 0 1 "no list of the registry"
+expect l_new_list_no_list 2 check "$c0"
+has l_new_list_no_list "tests/data/no-list.txt is no list of the registry"
 at "$c0"
 expect l_neither 1 check "$c0"
 has l_neither "neither the base nor the tree has it"

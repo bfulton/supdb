@@ -24,9 +24,14 @@ What fails, exit 1, the last line `ratchet: RED`:
   - a text file under tests/data (valid UTF-8, no NUL byte: any extension)
     the registry does not name, held or not held, and a NOT_HELD entry for a
     file that is not there.
-A list new since the base has nothing to hold yet, and is said so. A list
-or a declaration file that does not parse, or a base that is no commit, is
-exit 2. The verdict prints every raise it let through.
+A list new since the base has nothing to hold yet, and is said so; a
+declaration that names such a list has nothing to match and holds nothing
+either, so it is printed as not held yet and is no failure: a change whose
+base has no lists (a pull request into a line that predates them) and a
+push whose before has them read the same raises.txt, and the line that the
+second needs must not fail the first. It is spent with the first base that
+has it. A list or a declaration file that does not parse, or a base that is
+no commit, is exit 2. The verdict prints every raise it let through.
 
 A declaration present at the base, the same line, is spent: it was the
 raise of a change already made, and it holds nothing now, so it is printed
@@ -250,6 +255,7 @@ def main(root, base):
         if in_tree(root, f) is None:
             red.append(f"{f}: NOT_HELD names a file the tree does not have")
     growth = {}
+    new = set()
     for path, (read, _why) in sorted(REGISTRY.items()):
         t, b = in_tree(root, path), at_base(root, mb, path)
         if t is None and b is None:
@@ -261,6 +267,7 @@ def main(root, base):
         tv = read(t, path)
         if b is None:
             print(f"  {path}: new since the base, nothing to hold yet ({len(tv)} keys)")
+            new.add(path)
             continue
         bv = read(b, path)
         up = 0
@@ -277,6 +284,9 @@ def main(root, base):
     let = []
     for d in sorted(fresh.elements()):
         g = (d[0], d[1], d[2], d[3])
+        if d[0] in new:
+            print(f"  not held yet (its list is new since the base): {d[0]} {d[1]} {d[2]} -> {d[3]}")
+            continue
         if g in growth and growth[g] is None:
             growth[g] = d[4]
             let.append(d)
