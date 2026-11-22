@@ -1321,7 +1321,7 @@ impl Drop for Paged {
 }
 
 impl Paging for Paged {
-    fn base(&self) -> *const u8 {
+    fn base(&self, _: crate::bytes::Base) -> *const u8 {
         self.base
     }
 

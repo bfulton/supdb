@@ -46,9 +46,11 @@
 #            between two hand runs: the adaptations it made of other tests,
 #            and the stride form under threads and under a checkpoint, ran
 #            in no gate
-#   lint     clippy at -D warnings, the format gate, and on Linux the
+#   lint     clippy at -D warnings, the format gate, on Linux the
 #            door (scripts/door: the library's file, mapping and advice
-#            calls by symbol) with its red input
+#            calls by symbol) with its red input, and the seal's red input
+#            (scripts/seal-red.sh: the whole borrows of the read path
+#            refused by the compiler outside their readers)
 #   wasm     the browser reader and its floor, built for wasm32-unknown-unknown
 #            by web/build.sh, and the browser's decrypter held under Node to
 #            the envelope the Rust tests hold the writer to
@@ -146,6 +148,14 @@ for g in $groups; do
       # The door, by symbol, and its red input (scripts/door/run.sh).
       say "door"
       sh scripts/door/run.sh || exit 1
+      # The seal: the read path's whole borrows take tokens only their
+      # readers make, and the compiler refuses them elsewhere
+      # (scripts/seal-red.sh, the red input that shows it does).
+      say "seal"
+      sh scripts/seal-red.sh || exit 1
+      # ... and the red input of that red input: each of its checks made to
+      # fail by a line of its own (scripts/seal-red-red.sh).
+      sh scripts/seal-red-red.sh || exit 1
       ;;
     wasm)
       say "wasm"

@@ -2951,8 +2951,17 @@ pub(crate) mod tests {
         assert_eq!(read(d.join("par-1-key-00750.sup")).unwrap(), body);
         let m = map(d.join("par-1-key-00750.sup")).unwrap();
         assert!(m.piecewise(), "a kept file is read by the piece");
+        assert_eq!(m.lends(), 0, "a paged mapping lends nothing whole");
+        // The touches below read a byte at each page's start; a sum of zero
+        // says none was read only while those bytes are not zero.
+        let page = crate::bytes::os_page_size();
         assert!(
-            m.as_slice().is_empty(),
+            body.iter().step_by(page).all(|&b| b != 0),
+            "the body has a byte that is not zero at every page's start"
+        );
+        assert_eq!(
+            m.touch(0, body.len()),
+            0,
             "and lends nothing that was not asked for"
         );
         {
@@ -2960,6 +2969,11 @@ pub(crate) mod tests {
             assert_eq!(m.slice_at(0, body.len()).unwrap(), &body[..]);
             assert_eq!(m.slice_at(77, 5000).unwrap(), &body[77..5077]);
             assert!(m.slice_at(1, body.len()).is_none(), "past the end");
+            assert_eq!(
+                m.touch(0, body.len()),
+                0,
+                "a paged mapping is not touched, its pages present or not"
+            );
         }
         let mut again = Vec::new();
         open(d.join("par-1-key-00750.sup"))

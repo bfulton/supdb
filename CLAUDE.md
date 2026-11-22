@@ -1433,6 +1433,62 @@ one look it is for, the walk of the unsealed keys is sixteen
 instructions an entry under the main line, and a callback that reads
 through the handle no longer runs under a borrow of the handle's state.
 
+A bound restated in a generic caller ahead of the override that made it
+did not fold either. Sealing `Bytes::lend_at` was first tried with the
+method taken off the trait: a lendable length on `Bytes` (`self.lend` for
+a mapping) and the lend a private function of `blob` that refused past
+it and then called `slice_at`, whose own check against the same field
+was to be the same compare. It read `Blob::scan_whole` six instructions
+a scan over the commit before and the public `Blob::scan_at` probe 127 a
+scan, with `key_at` and `copy_block` near one a key in the landing:
+the zero-sized token on the method as it was read level everywhere. A
+check that two inlined functions make of one quantity is counted before
+it is called one check.
+
+And a count is chosen among the shapes that hold a rule, never in place
+of one. `MmapBytes::lent`, the successor of the public `as_slice`, went in
+crate-private with no token, on the reading that a token a reader would
+raise the wall's count of the seam's paths out: any module of the crate
+could then write the whole borrow that answers the empty slice for a
+paged mapping, which is the hazard the seal is for, and review read it off
+the signature. It takes the ordered index's token or the stride form's,
+each made in its own module (`bytes::whole::Reader`, implemented in the
+seam alone), with the raise declared. A seal is as wide as its token's
+constructor and holds nothing the compiler cannot see: a derive or a
+`Default` on the token, a function of the reader's module that hands one
+out, one made by unsafe code, or a new caller inside the reader's own
+module all compile, and a red line abroad tries only the routes it names.
+tests/source.rs holds each token's module to its one text and every token
+to the call it is made for (`the_seals_tokens_are_made_only_where_they_are_spent`),
+and its first version read both as text, `Token::new` and `.lent(`: review
+wrote the route this paragraph names in spellings rustfmt keeps and the
+check read none of -- a function of the ordered index returning
+`<lend::Token>::new()`, spent abroad as `MmapBytes::lent(&m, hand())` -- and
+a renamed import and a call through a function value beside them, each
+compiling with no unsafe. It reads names now, as identifiers off the line
+with its literals blanked: a call by its method's name where a call puts
+it (after `.` with its arguments, after `::`), a token by every name it can
+be reached by (its module as a path, the names it is imported and
+re-exported under), each line that names one a listed declaration or a
+call that makes its token as its argument, and `lend_at` named nowhere
+outside the crate, where only unsafe code can make its token
+(`a_seals_token_spelled_another_way_fails` holds each spelling). The second
+review then handed the names to macros: `mk!(lend)` expanding to
+`$m::Token::new()` in the ordered index, and `call!(m, lent, hand())`
+expanding to `$b.$m($t)` in db.rs, the same hand-out and spend with no
+unsafe, where a reading by position finds `lend` before `)` and `lent`
+after `,`. Inside a macro's tokens -- an invocation's delimiters, a
+`macro_rules!` body -- a name's place is the macro's to choose, so the
+words `lent` and `lend` are refused there in any position but four
+assertions of tests, listed by file, scope and text. A check over source
+holds a name by every spelling the language gives it, and where a
+construct takes a name's position out of the text, as a macro's argument
+does, it holds the name in every position inside that construct; its red
+inputs are the spellings and not the one its author wrote. What it still
+cannot read is a name a macro builds from pieces (`concat_idents!` is
+unstable, `paste` is no dependency) or code from outside a file, which the
+wall refuses at a count of zero.
+
 The same shape twice more, each read at the
 instruction (`--dump-instr=yes`, each instruction's count beside the
 disassembly, `addr2line -i` for whose inlined code it is) and by

@@ -35,6 +35,143 @@
 //! Sealing is also where the data is sorted by key, because the batch is
 //! already in hand and being copied. That produces sorted runs, which is what
 //! ordered scans will need later, at close to no cost.
+//!
+//! ## What the read path does not hand out
+//!
+//! A reader asks its byte source for the bytes it is about to read
+//! (`Bytes::slice_at`, `Bytes::read_at`), which every kind of source
+//! answers. The read path's own borrows of a section whole -- a section
+//! lent on the bounds check alone, which a source that lends by the piece
+//! refuses, and the record regions as slices -- and the address behind a
+//! paged mapping are not reachable from outside the crate. Each example
+//! below that does not compile has a twin beside it that differs only in
+//! the call it makes, and compiles.
+//!
+//! A mapping is not lent as it lies by a call of its own:
+//!
+//! ```compile_fail
+//! fn whole(p: &std::path::Path) -> std::io::Result<usize> {
+//!     Ok(supdb::MmapBytes::open(p)?.as_slice().len())
+//! }
+//! ```
+//! ```compile_fail
+//! fn whole(p: &std::path::Path) -> std::io::Result<usize> {
+//!     Ok(supdb::MmapBytes::open(p)?.lent().len())
+//! }
+//! ```
+//! ```no_run
+//! fn whole(p: &std::path::Path) -> std::io::Result<usize> {
+//!     Ok(supdb::Bytes::len(&supdb::MmapBytes::open(p)?) as usize)
+//! }
+//! ```
+//!
+//! A section lent on the bounds check alone, which answers nothing for a
+//! source that lends by the piece, is the read path's own; it is not called
+//! from outside as it was before it was sealed, and a caller asks:
+//!
+//! ```compile_fail
+//! fn lent<B: supdb::Bytes>(b: &B) -> Option<&[u8]> {
+//!     b.lend_at(0, 1)
+//! }
+//! ```
+//! ```no_run
+//! fn lent<B: supdb::Bytes>(b: &B) -> Option<&[u8]> {
+//!     b.slice_at(0, 1)
+//! }
+//! ```
+//!
+//! nor with the token it takes, which only the read path makes, whether it
+//! is named or inferred (a call whose argument diverges compiles, and never
+//! reaches the method; one made in unsafe code is outside what a type can
+//! refuse):
+//!
+//! ```compile_fail
+//! fn lent<B: supdb::Bytes>(b: &B) -> Option<&[u8]> {
+//!     b.lend_at(0, 1, supdb::blob::lend::Token::new())
+//! }
+//! ```
+//! ```compile_fail
+//! fn lent<B: supdb::Bytes>(b: &B) -> Option<&[u8]> {
+//!     b.lend_at(0, 1, Default::default())
+//! }
+//! ```
+//!
+//! and a source outside the crate keeps the default lend, since it cannot
+//! write the method's signature:
+//!
+//! ```compile_fail
+//! struct Mine(Vec<u8>);
+//! impl supdb::Bytes for Mine {
+//!     fn len(&self) -> u64 {
+//!         self.0.len() as u64
+//!     }
+//!     fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
+//!         dst.copy_from_slice(&self.0[off as usize..off as usize + dst.len()]);
+//!         Ok(())
+//!     }
+//!     fn lend_at(&self, off: u64, len: usize, _: supdb::blob::lend::Token) -> Option<&[u8]> {
+//!         self.0.get(off as usize..off as usize + len)
+//!     }
+//! }
+//! ```
+//! ```compile_fail
+//! struct Mine(Vec<u8>);
+//! impl supdb::Bytes for Mine {
+//!     fn len(&self) -> u64 {
+//!         self.0.len() as u64
+//!     }
+//!     fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
+//!         dst.copy_from_slice(&self.0[off as usize..off as usize + dst.len()]);
+//!         Ok(())
+//!     }
+//!     fn lend_at(&self, off: u64, len: usize) -> Option<&[u8]> {
+//!         self.0.get(off as usize..off as usize + len)
+//!     }
+//! }
+//! ```
+//! ```
+//! struct Mine(Vec<u8>);
+//! impl supdb::Bytes for Mine {
+//!     fn len(&self) -> u64 {
+//!         self.0.len() as u64
+//!     }
+//!     fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
+//!         dst.copy_from_slice(&self.0[off as usize..off as usize + dst.len()]);
+//!         Ok(())
+//!     }
+//!     fn slice_at(&self, off: u64, len: usize) -> Option<&[u8]> {
+//!         self.0.get(off as usize..off as usize + len)
+//!     }
+//! }
+//! ```
+//!
+//! What stands behind a paged mapping is the engine's to implement:
+//!
+//! ```compile_fail
+//! fn named<T: supdb::bytes::Paging>(_: &T) {}
+//! ```
+//! ```
+//! fn named<T: supdb::bytes::Bytes>(_: &T) {}
+//! ```
+//!
+//! A segment's record regions are not handed out as slices; where they lie
+//! is:
+//!
+//! ```compile_fail
+//! fn regions(b: &supdb::Blob<supdb::MmapBytes>) -> usize {
+//!     b.record_regions().map_or(0, |(r, _)| r.len())
+//! }
+//! ```
+//! ```compile_fail
+//! fn regions(b: &supdb::Blob<supdb::MmapBytes>) -> usize {
+//!     usize::from(b.record_pieces().is_some())
+//! }
+//! ```
+//! ```
+//! fn regions(b: &supdb::Blob<supdb::MmapBytes>) -> usize {
+//!     b.record_region_place().map_or(0, |(_, n)| n)
+//! }
+//! ```
 
 // The format modules below came from the design artifact rather than being
 // written here; every one holds to -D warnings now, `block` and `flatindex`

@@ -41,6 +41,29 @@
 
 use std::io::{Error, ErrorKind, Result};
 
+/// The read path's token, which `Bytes::lend_at` takes and only `blob` makes.
+use crate::blob::lend::Token as LendToken;
+/// The stride form's token, which `MmapBytes::lent` takes and only
+/// `db::zfile` makes.
+#[cfg(not(target_family = "wasm"))]
+use crate::db::StrideLendToken;
+/// The ordered index's token, which `MmapBytes::lent` takes and only
+/// `ordindex` makes.
+#[cfg(not(target_family = "wasm"))]
+use crate::ordindex::OrdLendToken;
+
+/// The readers of a mapping as it lies, one token each; a trait in a
+/// private module, so no module but this one can give it to a type, and
+/// `MmapBytes::lent` takes a token of these readers and of nobody else.
+#[cfg(not(target_family = "wasm"))]
+mod whole {
+    pub trait Reader {}
+}
+#[cfg(not(target_family = "wasm"))]
+impl whole::Reader for OrdLendToken {}
+#[cfg(not(target_family = "wasm"))]
+impl whole::Reader for StrideLendToken {}
+
 /// A synchronous, random-access source of bytes.
 ///
 /// Implementors must be consistent for the life of the reader: supdb's file
@@ -78,8 +101,15 @@ pub trait Bytes {
     /// section at every lookup and goes by the piece where it is refused
     /// (`flatindex::Pieces`), so for a mapped file it is the one range
     /// check it always was.
+    ///
+    /// Sealed: the token is the read path's (`LendToken`, `blob::lend`), whose
+    /// module alone makes one, so the read path's dispatch is the one
+    /// caller of this, by the compiler, and no source outside the crate can
+    /// write the method to override it -- a reader written elsewhere asks
+    /// with `slice_at`, which every kind of source answers. The token is a
+    /// zero-sized value and costs the call nothing.
     #[inline]
-    fn lend_at(&self, off: u64, len: usize) -> Option<&[u8]> {
+    fn lend_at(&self, off: u64, len: usize, _: LendToken) -> Option<&[u8]> {
         if self.piecewise() {
             return None;
         }
@@ -307,6 +337,11 @@ pub struct MmapBytes {
     own: Own,
 }
 
+// Two kinds and no third: `MmapBytes::map` answers `None` for every kind
+// but `Map`, and `Bytes::authenticated` reads that `None` as "a paged
+// mapping, which lends only what its pager has checked". A third kind that
+// answered `None` there would be read as authenticated whether or not it
+// checks anything, so a third kind is given its own answer in both.
 #[cfg(not(target_family = "wasm"))]
 enum Own {
     Map(memmap2::Mmap),
@@ -324,11 +359,14 @@ unsafe impl Sync for MmapBytes {}
 /// What stands behind a paged mapping: address space `len` bytes long at
 /// `base`, of which a range is readable once `ensure` has answered for it
 /// and for as long as the caller's protection holds (`db::pager`).
+///
+/// The engine's: crate-private, and its address asked for only with a token
+/// this module alone makes (`Base`), so the one reader of it is
+/// `MmapBytes::paged`, which lends nothing of it unasked.
 #[cfg(not(target_family = "wasm"))]
-#[doc(hidden)]
-pub trait Paging: Send + Sync {
+pub(crate) trait Paging: Send + Sync {
     /// The mapping's first byte; it does not move.
-    fn base(&self) -> *const u8;
+    fn base(&self, _: Base) -> *const u8;
     /// The file's length in bytes.
     fn size(&self) -> u64;
     /// `len` bytes at `off` made present; false where they cannot be (a
@@ -357,6 +395,12 @@ pub trait Paging: Send + Sync {
     /// mapping holds present.
     fn willneed(&self, off: u64, len: usize) -> usize;
 }
+
+/// The token `Paging::base` takes: made in this module alone (its field is
+/// private), so the address behind a paged mapping is asked for by
+/// `MmapBytes::paged` and by nobody else.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) struct Base(());
 
 /// The most of a mapping one `MADV_WILLNEED` asks for. Linux reads a
 /// will-need range ahead only up to the larger of the device's largest
@@ -393,7 +437,7 @@ impl MmapBytes {
     #[doc(hidden)]
     pub(crate) fn paged(pager: std::sync::Arc<dyn Paging>) -> MmapBytes {
         MmapBytes {
-            ptr: pager.base(),
+            ptr: pager.base(Base(())),
             lend: 0,
             len: pager.size(),
             own: Own::Paged(pager),
@@ -401,13 +445,58 @@ impl MmapBytes {
     }
 
     /// The mapping as it lies: all of a mapped file, and nothing of a
-    /// paged mapping, whose bytes are asked for through `slice_at`.
-    pub fn as_slice(&self) -> &[u8] {
+    /// paged mapping, whose bytes are asked for through `slice_at`. Sealed:
+    /// the token is a reader's that may read a mapping so (`whole::Reader`,
+    /// implemented here alone): the ordered index, which checks its
+    /// checksum over its heads and reads them where they lie
+    /// (`ordindex::lend`), and the stride form, which reads its value pages
+    /// at their offsets (`db::zfile::lend`), each token made in its own
+    /// module alone, so the compiler refuses this call in any other. Any
+    /// other reader asks with `slice_at`. The token is a zero-sized value
+    /// and costs the call nothing.
+    #[inline]
+    pub(crate) fn lent<T: whole::Reader>(&self, _: T) -> &[u8] {
         // SAFETY: `lend` bytes at `ptr` are a mapped file's, kept by `own`.
         unsafe { std::slice::from_raw_parts(self.ptr, self.lend as usize) }
     }
 
-    /// The mapped file, where this is one.
+    /// The first byte of each system page of `len` bytes at `off` read,
+    /// and their wrapping sum, for a warm that makes the pages present
+    /// before the reads that want them: a mapped file's pages, clamped to
+    /// it; nothing of a paged mapping, whose pages are made present only by
+    /// asking for them, so a touch here is none (its lendable length is
+    /// zero).
+    pub(crate) fn touch(&self, off: u64, len: usize) -> u64 {
+        let page = os_page_size() as u64;
+        let end = off.saturating_add(len as u64).min(self.lend);
+        let mut sum = 0u64;
+        let mut at = off;
+        while at < end {
+            // SAFETY: `at` is inside the `lend` bytes of a mapped file,
+            // which `own` keeps for this value's life.
+            sum = sum.wrapping_add(u64::from(unsafe { *self.ptr.add(at as usize) }));
+            at += page;
+        }
+        sum
+    }
+
+    /// How many bytes from the start the mapping lends whole: a test's
+    /// look, which holds a paged mapping to none whatever its bytes are.
+    #[cfg(test)]
+    pub(crate) fn lends(&self) -> u64 {
+        self.lend
+    }
+
+    /// Where the mapping lies in the process, for a test that reads the
+    /// kernel's page table over it.
+    #[cfg(all(test, target_os = "linux", not(supdb_emulated)))]
+    pub(crate) fn addr(&self) -> usize {
+        self.ptr as usize
+    }
+
+    /// The mapped file, where this is one. `None` for every other kind,
+    /// which `authenticated` reads as a paged mapping's: a kind added to
+    /// `Own` answers here and there on its own terms.
     fn map(&self) -> Option<&memmap2::Mmap> {
         match &self.own {
             Own::Map(m) => Some(m),
@@ -497,7 +586,7 @@ impl Bytes for MmapBytes {
     /// lendable length is zero: the range check a mapped file passes is
     /// the refusal, with no test of which kind this is.
     #[inline]
-    fn lend_at(&self, off: u64, len: usize) -> Option<&[u8]> {
+    fn lend_at(&self, off: u64, len: usize, _: LendToken) -> Option<&[u8]> {
         let end = off.checked_add(len as u64)?;
         if end > self.lend {
             return None;
@@ -716,6 +805,41 @@ mod tests {
             "past the mapping"
         );
         assert_eq!(m.resident_share(5, 0), Some(0.0), "an empty range");
+        drop(m);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A touch reads the first byte of every page of the range from the
+    /// range's start, the last page of the file too where it is short, and
+    /// nothing past the mapping: a file of five pages and a hundred bytes
+    /// whose pages begin with 1, 2, 3, 4, 5 and 7 and hold zeroes after.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_touch_reads_each_page_of_its_range_once_and_nothing_past_the_file() {
+        let page = os_page_size();
+        let len = 5 * page + 100;
+        let mut body = vec![0u8; len];
+        for (i, first) in [1u8, 2, 3, 4, 5, 7].into_iter().enumerate() {
+            body[i * page] = first;
+        }
+        // Bytes inside every whole page that a touch reads none of: a
+        // stride shorter than a page, or one that starts past a page's
+        // first byte, reads one of them.
+        for i in 0..5 {
+            for at in [1, page / 4, page / 2, page - 1] {
+                body[i * page + at] = 100;
+            }
+        }
+        let path = std::env::temp_dir().join(format!("supdb-next-touch-{}", std::process::id()));
+        std::fs::write(&path, &body).unwrap();
+        let m = MmapBytes::open(&path).unwrap();
+        assert_eq!(m.touch(0, len), 22, "every page, the short last one too");
+        assert_eq!(m.touch(0, len + 3 * page), 22, "clamped to the file");
+        assert_eq!(m.touch(0, 1), 1, "the range's first page");
+        assert_eq!(m.touch(page as u64, 2 * page), 2 + 3, "two pages exactly");
+        assert_eq!(m.touch(5 * page as u64, 1), 7, "the last page alone");
+        assert_eq!(m.touch(len as u64, page), 0, "past the file");
+        assert_eq!(m.touch(3, 0), 0, "an empty range");
         drop(m);
         let _ = std::fs::remove_file(&path);
     }

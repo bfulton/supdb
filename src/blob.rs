@@ -445,6 +445,21 @@ fn merge_ranges(v: &mut Vec<(u64, u64)>) {
 const SCAN_WINDOW: usize = 64;
 const SCAN_WINDOW_BYTES: usize = 4 << 20;
 
+/// The token a source's lend of a section on the bounds check alone takes
+/// (`Bytes::lend_at`): this module alone makes one, so the read path's
+/// dispatch (`Sec::get`, `Sec::lend`) is the one caller of that lend, by the
+/// compiler. A zero-sized value.
+pub(crate) mod lend {
+    pub struct Token(());
+
+    impl Token {
+        #[inline(always)]
+        pub(in crate::blob) fn new() -> Token {
+            Token(())
+        }
+    }
+}
+
 /// A section of the file: lent by the source, or copied out of it once.
 ///
 /// Copied *once*, at open, and never per lookup. A source that cannot lend --
@@ -484,7 +499,7 @@ impl Sec {
     fn get<'a, B: Bytes>(&'a self, src: &'a B) -> Result<&'a [u8]> {
         match self {
             Sec::Lent { off, len } => src
-                .lend_at(*off, *len)
+                .lend_at(*off, *len, lend::Token::new())
                 .ok_or_else(|| not_lent(src, *off, *len)),
             Sec::Owned(v, _) => Ok(v),
         }
@@ -496,7 +511,7 @@ impl Sec {
     #[inline(always)]
     fn lend<'a, B: Bytes>(&'a self, src: &'a B) -> Option<&'a [u8]> {
         match self {
-            Sec::Lent { off, len } => src.lend_at(*off, *len),
+            Sec::Lent { off, len } => src.lend_at(*off, *len, lend::Token::new()),
             Sec::Owned(v, _) => Some(v),
         }
     }
@@ -716,6 +731,15 @@ impl Default for BlobOptions {
 enum Index {
     Flat { key: Sec, idx: FlatIndex },
     Sparse(SparseIndex),
+}
+
+/// A segment's record region and directory as its reader holds them
+/// (`Blob::records`): lent whole, or by their place for a reader over a
+/// source that lends by the piece.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) enum Records<'a, B: Bytes> {
+    Whole(&'a [u8], &'a [u8]),
+    Pieces(Pieces<'a, B>, Pieces<'a, B>),
 }
 
 /// What `SparseBlob` keeps of the key index: where the section is, its
@@ -1622,29 +1646,23 @@ impl<B: Bytes> Blob<B> {
         }
     }
 
-    /// The record region and the directory as they lie in the mapping: the
-    /// bytes a derived file copies records from, and the words that say
-    /// where each record starts. The directory is the authority for where a
-    /// record lies and never the difference of two of its words -- a segment
-    /// closed from a direct run keeps its commit markers inside the record
-    /// region, counted in every later word. `None` for a reader that does
-    /// not hold the section whole.
+    /// The record region and the directory: the bytes a derived file
+    /// copies records from, and the words that say where each record
+    /// starts, as the reader holds them -- lent whole, for a reader over a
+    /// source that lends whole, or by their place, each read by asking for
+    /// the range it wants, for one over a source that lends by the piece.
+    /// The directory is the authority for where a record lies and never the
+    /// difference of two of its words -- a segment closed from a direct run
+    /// keeps its commit markers inside the record region, counted in every
+    /// later word. One accessor of two arms, so that a caller names what it
+    /// does with each. `None` where there is no region.
     #[cfg(not(target_family = "wasm"))]
-    #[doc(hidden)]
-    pub fn record_regions(&self) -> Option<(&[u8], &[u8])> {
-        let (sec, idx) = self.flat()?;
-        idx.regions(sec)
-    }
-
-    /// `record_regions` for a reader over a source that lends by the
-    /// piece: the two regions by their place, each read by asking for the
-    /// range it wants. `None` for a reader that holds the section whole,
-    /// which `record_regions` answers.
-    #[cfg(not(target_family = "wasm"))]
-    #[doc(hidden)]
-    pub fn record_pieces(&self) -> Option<(Pieces<'_, B>, Pieces<'_, B>)> {
+    pub(crate) fn records(&self) -> Option<Records<'_, B>> {
+        if let Some((sec, idx)) = self.flat_lent() {
+            return idx.regions(sec).map(|(r, d)| Records::Whole(r, d));
+        }
         let (sec, idx) = self.pieces()?;
-        idx.regions(sec)
+        idx.regions(sec).map(|(r, d)| Records::Pieces(r, d))
     }
 
     /// The record region's length, bytes, however the reader holds its

@@ -45,7 +45,7 @@ use super::zpages::{
     STRIDE_SAMPLE,
 };
 use super::zpages::{trailer_crc, trailer_magic};
-use crate::blob::{Blob, BlobOptions, ZSource};
+use crate::blob::{Blob, BlobOptions, Records, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
 use crate::flatindex::{
     compact_fixed_at, compact_fixed_tomb_at, parse_record, parse_record_tail, rd_u32, record_key,
@@ -59,6 +59,23 @@ use std::io::{ErrorKind, Result, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+
+/// The token `MmapBytes::lent` takes from the stride form, made in this
+/// module alone (its constructor is `pub(in crate::db::zfile)`): a whole
+/// borrow of a mapping as it lies is written here, where a stride file is
+/// opened, checked and read at its offsets, and a paged mapping, which lends
+/// none of it so, is read as no stride file; the compiler refuses it in any
+/// other module (forms.md R2).
+pub(crate) mod lend {
+    pub struct Token(());
+
+    impl Token {
+        #[inline(always)]
+        pub(in crate::db::zfile) fn new() -> Token {
+            Token(())
+        }
+    }
+}
 
 /// The size floor: a partition whose record region is under this many bytes
 /// is declined and no file is written (`Options::zpages_min_bytes`). The form
@@ -3930,7 +3947,7 @@ impl ZFile {
     ) -> std::result::Result<StrideAttached, Reject> {
         let damage = |e: ZError| Reject::Damage(e.to_string());
         let identity = |why: &str| Reject::Identity(why.into());
-        let bytes: &[u8] = map.as_slice();
+        let bytes: &[u8] = map.lent(lend::Token::new());
         let (trailer, layout) = StrideBody::open(bytes).map_err(damage)?;
         let facts = blob
             .z_source_facts()
@@ -5866,7 +5883,7 @@ impl ZFile {
     /// The mapping whole, which a stride file's value pages are read from
     /// at their offsets.
     fn stride_bytes(&self) -> &[u8] {
-        self.map.as_slice()
+        self.map.lent(lend::Token::new())
     }
 
     /// Value page `p` of a stride file, checked against its word of the row
@@ -7026,16 +7043,9 @@ pub(super) fn warm_file(path: &Path, cancel: Option<&AtomicBool>) -> Result<Warm
             w.skipped += span as u64;
         } else {
             map.advise_willneed(off as u64, span);
-            let mut at = off;
-            while at < off + span {
-                // Lent on the bounds check alone, or not at all: a paged
-                // mapping's page is not touched.
-                let Some(b) = map.lend_at(at as u64, 1) else {
-                    break;
-                };
-                sum = sum.wrapping_add(u64::from(b[0]));
-                at += page;
-            }
+            // A page a time, of a mapped file; a paged mapping's page is
+            // not touched.
+            sum = sum.wrapping_add(map.touch(off as u64, span));
             let resident = ((share * pages as f64).round() as usize).min(pages);
             w.bytes += ((pages - resident) * page).min(span) as u64;
         }
@@ -7717,9 +7727,16 @@ fn build_file_seen(
             let facts = blob.z_source_facts().ok_or_else(|| {
                 super::err("z build: the segment has no checksum row to bind a form file to")
             })?;
-            let (recs, dir) = blob
-                .record_regions()
-                .ok_or_else(|| super::err("z build: the segment's records are not resident"))?;
+            let (recs, dir) = match blob.records() {
+                Some(Records::Whole(recs, dir)) => (recs, dir),
+                // A mapped file lends whole: its records by the piece, or
+                // none, are a segment this build cannot read.
+                Some(Records::Pieces(..)) | None => {
+                    return Err(super::err(
+                        "z build: the segment's records are not resident",
+                    ))
+                }
+            };
             // Where the two regions lie in the file, from the section's
             // header: what the walk's asks and drops are placed by.
             let (recs_at, dir_at) = blob
@@ -7854,9 +7871,16 @@ fn build_file_seen(
             let facts = blob.z_source_facts().ok_or_else(|| {
                 super::err("z build: the segment has no checksum row to bind a form file to")
             })?;
-            let (recs, words) = blob
-                .record_pieces()
-                .ok_or_else(|| super::err("z build: the segment's records are not to be had"))?;
+            let (recs, words) = match blob.records() {
+                Some(Records::Pieces(recs, words)) => (recs, words),
+                // A kept file lends by the piece: its records lent whole,
+                // or none, are a segment this build was not handed.
+                Some(Records::Whole(..)) | None => {
+                    return Err(super::err(
+                        "z build: the segment's records are not to be had",
+                    ))
+                }
+            };
             let recs_len = usize::try_from(facts.recs_len).unwrap_or(usize::MAX);
             if recs_len < plan.floor {
                 return Ok(plan.declined(Decline::Small(recs_len), StrideNo::Small));
@@ -8864,7 +8888,7 @@ fn check_stride(
     let refused = StrideCheck::Refused(Outcome::NotStride(StrideNo::SelfCheck));
     let map = MmapBytes::open(tmp)?;
     let device = read_back_residency(&map, plan) == Some(0.0);
-    let bytes: &[u8] = map.as_slice();
+    let bytes: &[u8] = map.lent(lend::Token::new());
     let Ok(body) = StrideBody::from_bytes(bytes) else {
         return Ok(refused);
     };
@@ -9832,8 +9856,8 @@ pub(super) fn sample(
     // The records where the reader holds them whole, and by the piece
     // where its source lends so: a store under a cipher's, each record
     // asked of the store's cache, under the caller's pin or hold.
-    match blob.record_regions() {
-        Some((recs, dir)) => sample_of(
+    match blob.records() {
+        Some(Records::Whole(recs, dir)) => sample_of(
             &SegImages::new(recs, dir, blob.keys()),
             blob,
             &facts,
@@ -9842,10 +9866,7 @@ pub(super) fn sample(
             floor,
             shape,
         ),
-        None => {
-            let (recs, dir) = blob
-                .record_pieces()
-                .ok_or_else(|| super::err("z sample: the segment's records are not resident"))?;
+        Some(Records::Pieces(recs, dir)) => {
             let images = PieceImages {
                 recs,
                 dir,
@@ -9853,6 +9874,9 @@ pub(super) fn sample(
             };
             sample_of(&images, blob, &facts, id, end_seq, floor, shape)
         }
+        None => Err(super::err(
+            "z sample: the segment's records are not resident",
+        )),
     }
 }
 
@@ -10018,7 +10042,7 @@ pub(super) fn file_facts(
         if *stride == StrideAttach::Refuse {
             return None;
         }
-        let (t, lay) = StrideBody::open(map.as_slice()).ok()?;
+        let (t, lay) = StrideBody::open(map.lent(lend::Token::new())).ok()?;
         same_segment(&t.seg_ident(), &blob.z_source_facts()?, id, end_seq).ok()?;
         return Some(FileFacts {
             bytes: len,
@@ -10218,6 +10242,14 @@ pub fn read_budget() -> Option<Budget> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mapped segment's record region and directory, lent whole.
+    fn whole_records<B: Bytes>(blob: &Blob<B>) -> (&[u8], &[u8]) {
+        match blob.records() {
+            Some(Records::Whole(recs, dir)) => (recs, dir),
+            Some(Records::Pieces(..)) | None => panic!("the records lent whole"),
+        }
+    }
     use crate::db::zpages::ZCODING_RECORD;
     use std::fs::OpenOptions;
 
@@ -13788,7 +13820,7 @@ mod tests {
         let map = MmapBytes::open(&fx.seg).unwrap();
         let base = map.slice_at(0, 1).unwrap().as_ptr() as usize;
         let blob = Blob::open(map).unwrap();
-        let (_, dir) = blob.record_regions().unwrap();
+        let (_, dir) = whole_records(&blob);
         let dir_off = dir.as_ptr() as usize - base;
         drop(blob);
         // Two directory words swapped in a copy of the segment: ranks 40 and
@@ -13886,10 +13918,9 @@ mod tests {
         std::fs::write(&p, vec![7u8; n * ZPAGE]).unwrap();
         let file = File::open(&p).unwrap();
         let map = MmapBytes::open(&p).unwrap();
-        let bytes = map.as_slice();
+        let base = map.addr();
         let mut pm = File::open("/proc/self/pagemap").unwrap();
         let mut mapped = || -> Vec<bool> {
-            let base = bytes.as_ptr() as usize;
             (0..n)
                 .map(|i| {
                     let at = (base + i * ZPAGE) / crate::bytes::os_page_size();
@@ -13900,7 +13931,9 @@ mod tests {
                 })
                 .collect()
         };
-        let touched: u64 = (0..n).map(|i| u64::from(bytes[i * ZPAGE])).sum();
+        let touched: u64 = (0..n)
+            .map(|i| u64::from(map.slice_at((i * ZPAGE) as u64, 1).unwrap()[0]))
+            .sum();
         std::hint::black_box(touched);
         assert!(
             mapped().iter().all(|&m| m),
@@ -14864,7 +14897,7 @@ mod tests {
         let map = MmapBytes::open(&fx.seg).unwrap();
         let base = map.slice_at(0, 1).unwrap().as_ptr() as usize;
         let blob = Blob::open(map).unwrap();
-        let (recs, dir) = blob.record_regions().unwrap();
+        let (recs, dir) = whole_records(&blob);
         let recs_at = recs.as_ptr() as usize - base;
         let (recs_end, dir_at) = (recs_at + recs.len(), dir.as_ptr() as usize - base);
         let dir_end = dir_at + dir.len();
@@ -15200,14 +15233,14 @@ mod tests {
     /// The precheck over a fixture's records, as a build makes it where
     /// its plan takes no run with gaps.
     fn precheck_of(fx: &Fixture) -> std::result::Result<StrideFacts, StrideNo> {
-        let (recs, dir) = fx.blob.record_regions().unwrap();
+        let (recs, dir) = whole_records(&fx.blob);
         stride_precheck(&SegImages::new(recs, dir, fx.blob.keys()), false)
     }
 
     /// The precheck as a build makes it where its plan takes one
     /// (`BuildPlan::stride_sparse`).
     fn precheck_sparse_of(fx: &Fixture) -> std::result::Result<StrideFacts, StrideNo> {
-        let (recs, dir) = fx.blob.record_regions().unwrap();
+        let (recs, dir) = whole_records(&fx.blob);
         stride_precheck(&SegImages::new(recs, dir, fx.blob.keys()), true)
     }
 
@@ -16235,7 +16268,7 @@ mod tests {
         let map = MmapBytes::open(&fx.seg).unwrap();
         let base = map.slice_at(0, 1).unwrap().as_ptr() as usize;
         let blob = Blob::open(map).unwrap();
-        let (recs, dir) = blob.record_regions().unwrap();
+        let (recs, dir) = whole_records(&blob);
         let at = rd_u32(dir, 300 * 4).unwrap() as usize;
         let key = record_key(&recs[at..], 0).unwrap();
         assert_eq!(key, b"k000300");
@@ -16271,7 +16304,7 @@ mod tests {
         };
         let n = 400;
         let fx = full("stride-full", stride_recs(n, 100, 0x59));
-        let (recs, dir) = fx.blob.record_regions().unwrap();
+        let (recs, dir) = whole_records(&fx.blob);
         let images = SegImages::new(recs, dir, n);
         for r in 0..n {
             assert!(
@@ -16355,7 +16388,7 @@ mod tests {
                 w.finish(1).unwrap();
             },
         );
-        let (recs, dir) = fx.blob.record_regions().unwrap();
+        let (recs, dir) = whole_records(&fx.blob);
         let images = SegImages::new(recs, dir, n);
         let at = |r: usize| rd_u32(dir, r * 4).unwrap() as usize;
         let gaps = (0..n - 1)
@@ -16386,7 +16419,7 @@ mod tests {
         let map = MmapBytes::open(&fx.seg).unwrap();
         let base = map.slice_at(0, 1).unwrap().as_ptr() as usize;
         let blob = Blob::open(map).unwrap();
-        let (recs, dir) = blob.record_regions().unwrap();
+        let (recs, dir) = whole_records(&blob);
         let recs_at = recs.as_ptr() as usize - base;
         let (recs_end, dir_at) = (recs_at + recs.len(), dir.as_ptr() as usize - base);
         let dir_end = dir_at + dir.len();
@@ -16519,7 +16552,7 @@ mod tests {
         let map = MmapBytes::open(&fx.seg).unwrap();
         let base = map.slice_at(0, 1).unwrap().as_ptr() as usize;
         let blob = Blob::open(map).unwrap();
-        let (recs, dir) = blob.record_regions().unwrap();
+        let (recs, dir) = whole_records(&blob);
         let recs_at = recs.as_ptr() as usize - base;
         let past = recs_at + rd_u32(dir, (mid + 1) * 4).unwrap() as usize;
         let dir_at = dir.as_ptr() as usize - base;
@@ -17715,7 +17748,7 @@ mod tests {
 
     fn hold_a_page_mapped(tmp: &Path) {
         let map = MmapBytes::open(tmp).unwrap();
-        std::hint::black_box(map.as_slice()[ZPAGE]);
+        std::hint::black_box(map.slice_at(ZPAGE as u64, 1).unwrap()[0]);
         *HELD_MAPPING.lock().unwrap() = Some(map);
     }
 

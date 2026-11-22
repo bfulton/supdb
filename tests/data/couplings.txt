@@ -43,6 +43,7 @@ src/bytes.rs	MmapBytes::resident_share	paged	code	1	stays	the seam: Paging, piec
 src/bytes.rs	MmapBytes::slice_slow	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	Own::<item>	paged	code	2	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	Paging::<item>	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
+src/bytes.rs	<item>	path out of the encryption modules	code	3	stays	the tokens the seam's whole borrows take (plan G1-7, R2 sealed by the compiler), each named once by a use: the read path's, which Bytes::lend_at takes and only blob makes; the ordered index's and the stride form's, which MmapBytes::lent takes and only ordindex and db::zfile make
 src/db.rs	Db::<item>	vault (field or module word)	code	1	stays	Db.vault field: the open store under a cipher
 src/db.rs	Db::<item>	vault::Held	code	1	stays	Db.vault field: the open store under a cipher
 src/db.rs	Db::adopt_run_spare	pager	code	1	S6	the run spare is a plain directory entry; under the envelope arm a run file is a memory file

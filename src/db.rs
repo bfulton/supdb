@@ -74,6 +74,9 @@ pub mod zlz4;
 // and nothing outside `db` names it.
 pub(crate) mod blocks;
 mod zfile;
+/// The stride form's token for `MmapBytes::lent`, named here for the seam,
+/// which cannot reach into this private module; made in `zfile` alone.
+pub(crate) use zfile::lend::Token as StrideLendToken;
 pub use zfile::ZInject;
 // A store's directory encrypted by the kernel, under a key the caller gives
 // (`Encryption::Kernel`).
@@ -13815,8 +13818,12 @@ impl Seg {
     /// the store's cache and is dropped and asked for through its source.
     fn records_by_descriptor(&self) -> Option<(u64, u64)> {
         let raw = self.blob.for_zfile();
-        raw.record_regions()?;
-        raw.record_region_place().map(|(at, len)| (at, len as u64))
+        match raw.records()? {
+            crate::blob::Records::Whole(..) => {
+                raw.record_region_place().map(|(at, len)| (at, len as u64))
+            }
+            crate::blob::Records::Pieces(..) => None,
+        }
     }
 
     /// The raw form, for a read of the records on purpose (`SegBlob`):

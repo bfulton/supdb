@@ -152,7 +152,12 @@ mkdir -p "$L/tests/data" "$L/scripts"
 git init -q "$L"
 cp "$ROOT"/tests/data/couplings.txt "$ROOT"/tests/data/door.txt "$ROOT"/tests/data/cost-entries.txt \
   "$ROOT"/tests/data/crypt-v1.bin "$L/tests/data/"
-cp "$ROOT/scripts/raises.txt" "$L/scripts/raises.txt"
+# The file's header and none of the tree's own raises: the fixture's lists
+# are the tree's, each case declares the raises it needs (decl), and a raise
+# the tree declares for a list a case takes out of the registry would make
+# that case's verdict the raise's (no list of the registry) and not the one
+# it is for.
+grep '^#' "$ROOT/scripts/raises.txt" >"$L/scripts/raises.txt"
 # The check itself, so a case can change the tree's registry and run it.
 cp "$ROOT/scripts/ratchet.py" "$ROOT/scripts/ratchet.sh" "$ROOT/scripts/base.sh" "$L/scripts/"
 commit "$L" "c0: no door-libc.txt"
