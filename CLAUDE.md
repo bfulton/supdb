@@ -5458,7 +5458,25 @@ whose asks a worker may replace untaken drives its asks to answers the
 test can name before the run's count is read, and a loop that retries
 until something happens is counted for the turns it took before its
 bound is believed; and a red met once is found by printing who did each
-counted thing, not by running it again until it does not come.
+counted thing, not by running it again until it does not come. The
+second test's repair had the first rule's hole in it: its three asks were
+counted from a reading taken behind a plain `settle`, which joins no form
+build and takes no ask (`zpages_settle` does both), so where the loop's
+last ask was still untaken with the builder free, the segment work's turn
+behind that settle started it, it landed inside the first settled ask,
+and three asks read as four moves, "(1, 3)", once in a gate's stride
+group and in none of fifty-three runs after. Two schedules were forced on
+a guess before anything was printed -- a conversion's build made long,
+the thread's own turns made rare -- and neither made one red in fifty
+runs; a trace of each ask taken and each move counted, beside the test's
+reading, showed a build in flight and an ask pending at the reading in
+its first run, and the state built from that (the builder settled, one
+ask stored, then the plain settle) was red in every seed of every run and
+green with the count begun behind the form's own settle. A count's
+baseline is read behind the join of every worker that moves it, by the
+call that joins that worker and not by a call with a like name; and the
+schedule to force is read off a trace of the state at the reading, since
+a guess at it costs a build and a sweep each time it is wrong.
 
 **A cache a thread kept of things a store had closed.** The memo of
 decoded groups was the thread's, keyed by the form file's attach identity
