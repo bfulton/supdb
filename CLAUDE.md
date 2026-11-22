@@ -4093,7 +4093,18 @@ that thread ran behind the writer every rotation made its file, three
 runs of forty-eight under eight-way load, once in a unit's gate whose
 diff the binary could not see. It rotates, flushes and settles, so that a
 retired log stands as the spare, and holds the next rotation's log to
-that file's inode now. The
+that file's inode now. And as work left for a step: the cipher test of
+form files built within a cache the store does not fit read the cache's
+evictions after its fill and again after the form's settle, on the bet
+that the builds fall between the two. A store under `ZPages::Always`
+builds as its partitions land (`Options::zpages_eager`), a third of the
+builds had run by the first reading in every run printed, and in one run
+of a gate's stride group all of them had: "the builds gave nothing back"
+over a cache that had given back 690 units. With the test's thread made
+four seconds late to its reading it was red three runs of three. It runs
+twice now, with the builds left to the settle, where the count is exact
+and a build before the reading is itself a failure, and with the builds
+begun at landing, held to having been made. The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; a mutant's kill is read again once a
