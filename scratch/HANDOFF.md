@@ -142,9 +142,9 @@ bulk replacement broke tick-exact tests once; do it test by test. Planned for th
 
 ## What is left, in the owner's order
 
-### 1. The page layer (task 12). Stage G1 under way: seven units of eight landed, the lists' check, the count against upstream brought under, and upstream merged again; the docs unit and the closing gate are left.
+### 1. The page layer (task 12). Stage G1's eight units have landed, with the lists' check, the count against upstream brought under, and upstream merged again; the closing gate and the critic are left, then G2.
 
-**As of 22 Nov 08:30 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
+**As of 22 Nov 09:39 UTC.** The stage's workflow script is `scratch/plan/build/g1-build-v2.js`,
 launched one unit a launch: `Workflow {scriptPath, args: {base:
 "ea6352181f342b7bffd75ec8c88df92bc7b78ff6", only: ["G1-<n>"], tail: false, since: <note>}}`,
 the same base for every unit; after G1-8 a launch with `only: ["none"]` and no `tail: false`
@@ -562,9 +562,30 @@ holds; a note for a step changes no earlier prompt, so the steps before it repla
   taken out): the tests as they stood red 24 runs of 25 at a millisecond, the fixed ones
   never at eleven widths, the whole durable binary under three widths with no test red.
   `scratch/plan/build/T20/` has the sweep.
-- **Next, in order:** G1-8 `docs`; then the full gate and the critic (a launch with
-  `only: ["none"]`). The count's base against upstream is `7c62153e` (upstream's later
-  commits, merged since, are bench rows).
+- **G1-8 `docs` landed: `581e11cc`.** Comments and docs alone (the diff of `src` and
+  `bench/src` with comments aside is empty). `CLAUDE.md` says what holds the wall, the door,
+  the seal, the lists and the count as the gates are now, and its Layout table has the
+  stage's scripts and lists; the docs the earlier units left untrue or with history in them
+  are corrected (`BlobOptions::verify_index` and `read_ahead`, `Bytes::authenticated` and
+  `resident_share`, `Paging`, `lend_at`, `lent`, `touch`, `verify_row_by_piece`, `ModeNote`,
+  the crate docs' section on what the read path does not hand out, `docs/zpages-design.md`'s
+  header). `README.md` and the crate docs say what a store under a cipher does, each from
+  the code: the controller leaves it in the raw form unless `zpages_under_cipher` is set
+  and `ZPages::Always` builds the compact form; the stride form is not built there (a build
+  that asks for it builds the block form and counts the decline, `zfile::StrideNo::Kept`);
+  the heads' copy (`Options::heads_owned`) is not made. `ROADMAP.md` has an entry for each
+  of the last two with what would make it work. Its red input is a scratch script
+  (`scratch/plan/build/G1-8/docs_red.py`, sixteen checks that hold a doc sentence to a line
+  of code or a test's name; 62 findings on the tree before, none after), not a gate in the
+  tree. Two review rounds. Open: no test holds the stride form's decline or the missing
+  heads' copy under a cipher (the docs say both from the code; owed to S5); the look that
+  would copy the heads still asks the kernel for their ciphertext before it finds nothing
+  to copy, where the compact form is on under a cipher (in `ROADMAP.md`).
+- **Next:** the closing launch (`only: ["none"]`): the full gate, the cost group against
+  upstream's head, and the critic, with the questions `scratch/plan/build/close/since.txt`
+  puts to it. Then what the critic and the open items above call for, each a change of its
+  own (the seal's source test lightened; the cost gate made able to fail against upstream,
+  task 20; the cipher flake, task 14), then G2 (`scratch/plan/g2.md`).
   Every unit from here is launched with a build note: a CI job it adds is
   `sh scripts/check.sh <group>` with nothing in the YAML but event values, a list it adds is
   registered in `scripts/ratchet.py`, and a move between functions the cost group reads red is
