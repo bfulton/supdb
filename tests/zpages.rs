@@ -3980,6 +3980,170 @@ fn under_the_forms_gate_a_declined_partitions_heads_are_copied_and_a_waiting_one
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A block cache granted the raw records' place
+/// (`Options::scan_cache_copies_fit`) makes the controller's model say the
+/// raw form does not fit, of a store nothing will be bought for: the page
+/// cache's budget falls by the copies, the records they stand in for are
+/// still counted against it, and the grant stands only far from the point
+/// reads whose faults buy a form. At the census a misfit withholds the
+/// copies of the heads, so every partition landed after the grant read
+/// them through a mapping the bound could take. Under
+/// `Options::heads_owned_beside_copies` a grant standing reads as the store
+/// left raw, and every partition's heads are copied; without it none is,
+/// the model's word alone; and a grant a point read took back leaves the
+/// model's word alone under the option too. The page cache's budget is the
+/// test's seam and falls by what the cache holds, as the platform's does.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Case {
+        /// The option, a grant standing.
+        Beside,
+        /// A grant standing, the option off.
+        ModelAlone,
+        /// The option, the grant taken back by a point read.
+        TakenBack,
+    }
+    // What the bound leaves beside the raw form, to begin with.
+    const SLACK: u64 = 64 << 10;
+    let run = |name: &str, case: Case| {
+        let (dir, mut db, mut model, inject) = auto_store_loaded(
+            name,
+            1 << 30,
+            0.0,
+            FAULT_40US,
+            |o| {
+                o.seal_bytes = 4 << 20;
+                o.partition_bytes = Some(64 << 10);
+                o.l0_trigger = 64;
+                o.scan_block_cache = true;
+                o.scan_cache_ahead = false;
+                o.commit_forms = true;
+                o.forms_settle_backlog_pct = 0;
+                o.scan_cache_auto_bytes = 1 << 10;
+                o.scan_cache_auto_room = true;
+                o.scan_cache_copies_fit = true;
+                o.heads_owned = true;
+                o.heads_owned_beside_copies = case != Case::ModelAlone;
+                o.upkeep = supdb::Upkeep::Inline;
+            },
+            |_| {},
+            |db| ordered_load(db, 3000, 0x4EAD5),
+        );
+        let scan = |db: &Db, model: &Model, what: &str| {
+            for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
+                same_window(
+                    &scanned(db, &start, 57),
+                    &window(model, &start, 57),
+                    &format!("{name}: {what}, from {:?}", String::from_utf8_lossy(&start)),
+                );
+            }
+        };
+        let c = db.zpage_counts();
+        let parts = c.partitions;
+        assert!(parts >= 2, "{name}: {c:?}");
+        assert_eq!((c.phase, c.gate), (0, 0), "{name}: FITS to begin with");
+        scan(&db, &model, "loaded");
+        assert!(db.points_far(), "{name}: a store only scanned");
+        // The raw form's bytes, from the room under a budget past them.
+        let (_, _, room, _) = db.cache_place(1 << 30);
+        let raw = (1u64 << 30) - room as u64;
+        let budget = |db: &Db| (raw + SLACK).saturating_sub(db.block_cache_bytes() as u64);
+        // Twenty blocks, a key of each a round, until every one is dense
+        // and a copy: the first crossing of the cache's budget grows into
+        // the slack, and the second is granted the records' place.
+        let mut rng = Rng(0xBE51DE);
+        for round in 1..=24usize {
+            for b in 0..20usize {
+                let k = spaced_key(b * 64 + 1 + round % 24);
+                let v = suite_value(&mut rng);
+                db.append(&k, &v);
+                model.get_mut(&k).unwrap().push(v);
+            }
+            inject.set_budget(budget(&db));
+            db.commit().unwrap();
+            scan(&db, &model, &format!("round {round}"));
+        }
+        assert_eq!(
+            db.cache_copies_grants(),
+            (1, 0),
+            "{name}: the records' place granted, {} B held",
+            db.block_cache_bytes()
+        );
+        assert_eq!(
+            db.heads_owned_counts(),
+            (0, 0, 0),
+            "{name}: nothing copied at the raw gate"
+        );
+        if case == Case::TakenBack {
+            let last = spaced_key(2999);
+            assert_eq!(db.count(&last).unwrap(), 1);
+            assert!(!db.points_far(), "{name}: a point read is near");
+            let k = spaced_key(2);
+            let v = suite_value(&mut rng);
+            db.append(&k, &v);
+            model.get_mut(&k).unwrap().push(v);
+            inject.set_budget(budget(&db));
+            db.commit().unwrap();
+            assert_eq!(db.cache_copies_grants(), (1, 1), "{name}: taken back");
+        }
+        // The model's misfit, held at the census by the group's pressure.
+        // The misfit a grant made goes with the copies a taking back
+        // sheds, so there the seam says one for the model to read.
+        let seam = if case == Case::TakenBack {
+            SLACK
+        } else {
+            budget(&db)
+        };
+        inject.set_budget(seam);
+        inject.set_refault_rate(1_000_000.0);
+        wait_secs(&db, 3, 1);
+        let c = db.zpage_counts();
+        assert_eq!((c.phase, c.gate), (1, 1), "{name}: SUSPECT: {c:?}");
+        assert!(
+            c.model_hash_bytes + c.model_record_bytes > seam,
+            "{name}: the model's populations past a budget of {seam}: {c:?}"
+        );
+        scan(&db, &model, "the census");
+        let t = std::time::Instant::now();
+        while case == Case::Beside
+            && db.heads_owned_counts().0 < parts
+            && t.elapsed().as_secs() < 20
+        {
+            wait_secs(&db, 1, 1);
+        }
+        if case != Case::Beside {
+            wait_secs(&db, 3, 1);
+        }
+        let c = db.zpage_counts();
+        assert_eq!((c.phase, c.gate), (1, 1), "{name}: still SUSPECT: {c:?}");
+        let (made, given, bytes) = db.heads_owned_counts();
+        if case == Case::Beside {
+            assert_eq!((made, given), (parts, 0), "{name}: every partition's heads");
+            assert_eq!(bytes, 8 * model.len() as u64, "{name}: eight bytes a key");
+            assert_eq!(
+                db.heads_beside_copies(),
+                parts,
+                "{name}: each for the grant alone, the model saying misfit"
+            );
+        } else {
+            assert_eq!(
+                (made, given, bytes),
+                (0, 0, 0),
+                "{name}: the model's word alone, and it says misfit"
+            );
+            assert_eq!(db.heads_beside_copies(), 0, "{name}");
+        }
+        scan(&db, &model, "after the look");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    };
+    run("heads-beside-copies", Case::Beside);
+    run("heads-beside-model", Case::ModelAlone);
+    run("heads-beside-taken-back", Case::TakenBack);
+}
+
 /// At the census under the controller a copy is for a store the model says
 /// fits, whose census is the group's pressure: such a store sits there for
 /// as long as its writes make the group refault, every seek of it reads
@@ -4012,6 +4176,11 @@ fn at_the_census_the_controller_copies_heads_only_where_the_model_says_the_store
     let (made, given, bytes) = db.heads_owned_counts();
     assert_eq!((made, given), (parts, 0), "every partition's heads copied");
     assert_eq!(bytes, 8 * model.len() as u64);
+    assert_eq!(
+        db.heads_beside_copies(),
+        0,
+        "by the model's word, none for a grant of the records' place"
+    );
     scan(&db, &model, "the heads copied");
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);

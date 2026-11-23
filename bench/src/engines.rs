@@ -961,6 +961,11 @@ pub struct Supdb {
     /// page tables (`Options::zpages_rewarm_raw_maps`), `None` for the
     /// engine's default. `supdb-rewarmrawnomap` asks and maps nothing.
     rewarmrawmaps: Option<bool>,
+    /// The partitions' heads copied at the controller's census while the
+    /// block cache holds the raw records' place, whatever the model says
+    /// of the raw form (`Options::heads_owned_beside_copies`), `None` for
+    /// the engine's default. `supdb-headscopies` copies them.
+    headscopies: Option<bool>,
     /// The block cache granted the raw records' place where its own budget
     /// would bind and no point read is near
     /// (`Options::scan_cache_copies_fit`), `None` for the engine's default.
@@ -2312,6 +2317,11 @@ struct Policy {
     /// page tables (`Options::zpages_rewarm_raw_maps`), `None` for the
     /// engine's default. `supdb-rewarmrawnomap` asks and maps nothing.
     rewarmrawmaps: Option<bool>,
+    /// The partitions' heads copied at the controller's census while the
+    /// block cache holds the raw records' place, whatever the model says
+    /// of the raw form (`Options::heads_owned_beside_copies`), `None` for
+    /// the engine's default. `supdb-headscopies` copies them.
+    headscopies: Option<bool>,
     /// The block cache granted the raw records' place where its own budget
     /// would bind and no point read is near
     /// (`Options::scan_cache_copies_fit`), `None` for the engine's default.
@@ -3114,6 +3124,7 @@ impl Default for Policy {
             rewarmraw: None,
             rewarmrawscans: None,
             rewarmrawmaps: None,
+            headscopies: None,
             copiesfit: None,
             chainuncovered: None,
             formsoffbuilt: None,
@@ -7678,6 +7689,22 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with the partitions' heads copied at the controller's census
+    /// while the block cache holds the raw records' place
+    /// (`Options::heads_owned_beside_copies`): a partition a merge lands
+    /// after the grant has its heads in memory at the scans after the
+    /// burst, where the default reads them through a mapping the burst's
+    /// writes pushed out.
+    pub fn create_headscopies(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                headscopies: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with the form's pages cut into groups of a kibibyte of
     /// records where the default cuts at two (`Options::zpages_group_bytes`
     /// 1024): half the decode for a point read's first touch of a group,
@@ -9562,6 +9589,7 @@ impl Supdb {
             rewarmraw,
             rewarmrawscans,
             rewarmrawmaps,
+            headscopies,
             copiesfit,
             chainuncovered,
             formsoffbuilt,
@@ -10066,6 +10094,8 @@ impl Supdb {
                 .unwrap_or(supdb::Options::default().zpages_rewarm_raw_scans),
             zpages_rewarm_raw_maps: rewarmrawmaps
                 .unwrap_or(supdb::Options::default().zpages_rewarm_raw_maps),
+            heads_owned_beside_copies: headscopies
+                .unwrap_or(supdb::Options::default().heads_owned_beside_copies),
             scan_cache_copies_fit: copiesfit
                 .unwrap_or(supdb::Options::default().scan_cache_copies_fit),
             merge_chains_writes_uncovered: chainuncovered
@@ -10542,6 +10572,7 @@ impl Supdb {
             rewarmraw,
             rewarmrawscans,
             rewarmrawmaps,
+            headscopies,
             copiesfit,
             chainuncovered,
             formsoffbuilt,
@@ -12104,6 +12135,9 @@ impl Engine for Supdb {
         if self.rewarmrawmaps == Some(false) {
             return "supdb-rewarmrawnomap";
         }
+        if self.headscopies == Some(true) {
+            return "supdb-headscopies";
+        }
         match (
             self.copiesfit == Some(false),
             self.chainuncovered == Some(false),
@@ -12565,6 +12599,7 @@ impl Engine for Supdb {
             ("heads_owned", db.heads_owned_counts().0 as f64),
             ("heads_disowned", db.heads_owned_counts().1 as f64),
             ("heads_owned_mb", (db.heads_owned_counts().2 >> 20) as f64),
+            ("heads_beside_copies", db.heads_beside_copies() as f64),
             ("form_heads_ahead", db.settle_ahead_asks()[0] as f64),
             ("table_lines_ahead", db.settle_ahead_asks()[1] as f64),
             // The writer's settles: see `Db::settle_density`.
@@ -13816,6 +13851,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-norewarmraw"
         | "supdb-zrewarmrawscans"
         | "supdb-rewarmrawnomap"
+        | "supdb-headscopies"
         | "supdb-nocopiesfit"
         | "supdb-chaincovered"
         | "supdb-nocopiesfitchain"
@@ -15755,6 +15791,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-norewarmraw" => supdb_arm(Supdb::create_norewarmraw, dir)?,
         "supdb-zrewarmrawscans" => supdb_arm(Supdb::create_zrewarmrawscans, dir)?,
         "supdb-rewarmrawnomap" => supdb_arm(Supdb::create_rewarmrawnomap, dir)?,
+        "supdb-headscopies" => supdb_arm(Supdb::create_headscopies, dir)?,
         "supdb-nocopiesfit" => supdb_arm(Supdb::create_nocopiesfit, dir)?,
         "supdb-chaincovered" => supdb_arm(Supdb::create_chaincovered, dir)?,
         "supdb-nocopiesfitchain" => supdb_arm(Supdb::create_nocopiesfitchain, dir)?,
@@ -17758,6 +17795,14 @@ mod tests {
                 assert!(
                     o.zpages_rewarm_raw && !o.zpages_rewarm_raw_maps && b.zpages_rewarm_raw_maps
                 );
+            }
+            {
+                let z = Supdb::create_headscopies(&dir("headscopies")).unwrap();
+                assert_eq!(z.name(), "supdb-headscopies");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.heads_owned_beside_copies && !b.heads_owned_beside_copies);
+                assert!(o.heads_owned && o.scan_cache_copies_fit);
             }
             {
                 let z = Supdb::create_nocopiesfit(&dir("nocopiesfit")).unwrap();

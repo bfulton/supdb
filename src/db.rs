@@ -6021,6 +6021,33 @@ pub struct Options {
     /// made away from the raw gate alone, and only while scans are near.
     /// `supdb-headsmapped` reads the mapping throughout.
     pub heads_owned: bool,
+    /// EXPERIMENT: whether the heads are copied (`heads_owned`) at the
+    /// controller's census while the block cache holds the raw records'
+    /// place (`scan_cache_copies_fit`), whatever the controller's model
+    /// says of the raw form. At the census a copy is made while the model
+    /// says the raw form fits and none while it says it does not, since a
+    /// misfit there is the stretch between a crossing and the install its
+    /// reads' faults buy (`Maint::z_heads_look`). A grant of the records'
+    /// place makes the model say so of a store nothing will be bought
+    /// for: the page cache's budget is the limit less the process's
+    /// anonymous memory, the copies are that memory, and the records they
+    /// stand in for are still counted as pages the raw form needs -- at
+    /// three million keys under 1 GiB a budget of 880 MB before the lag
+    /// sweep's full rewrite and 265 after the grant, against records of
+    /// 372 -- while the grant stands only far from point reads, whose
+    /// faults are what buys a form. So every partition a merge landed
+    /// after the grant kept its heads in a mapping, eight megabytes of
+    /// them at the pass after the burst, the burst's writes pushed their
+    /// pages out, and the scans' start seeks read them back a page a
+    /// fault behind a merge's reads: every major fault of the scanning
+    /// thread in six traced passes but one was `Reader::scan_seek` on one
+    /// such index, nine to thirty-six a pass and a hundred and ninety in
+    /// the slowest of twelve paired, a hundred and fifty to a hundred and
+    /// eighty in the two slow reps of three a row took. Under this option
+    /// a grant standing reads as the store left raw. Off: the model
+    /// alone.
+    #[doc(hidden)]
+    pub heads_owned_beside_copies: bool,
     /// The hot-raw policy's skew bar read against the room
     /// (`Maint::z_hot_look`): the candidate partition is asked for where its
     /// raw bytes fit the group's unused memory and it is read more a key
@@ -7107,6 +7134,7 @@ impl Default for Options {
             settle_table_ahead: 12,
             heads_look_ms: 0,
             heads_owned: true,
+            heads_owned_beside_copies: false,
             zpages_hot_skew_room: false,
             zpages_hot_room_margin_pct: 0,
             zpages_walk_owns_decodes: false,
@@ -19757,8 +19785,11 @@ struct Shared {
     /// its giving up bumped, freed past every pinned reader by the look
     /// that gives them up (`Maint::z_heads_look`), on a later turn.
     retired_heads: RetireList<HeadsBuf>,
-    /// Copies of heads made, and copies given up.
-    heads_events: [AtomicU64; 2],
+    /// Copies of heads made, copies given up, and of the copies made
+    /// those made for a grant of the records' place alone, the model
+    /// saying the raw form does not fit
+    /// (`Options::heads_owned_beside_copies`).
+    heads_events: [AtomicU64; 3],
     /// The dead names given to retired form files (`zfile::zpg_dead_name`).
     next_dead: AtomicU64,
     /// A test's holds on the builder's thread (`ZHOLD_START`,
@@ -20065,6 +20096,12 @@ struct Shared {
     /// taken back for a point read come near.
     cache_copies_grants: AtomicU64,
     cache_copies_revokes: AtomicU64,
+    /// Whether a grant of the raw records' place stands
+    /// (`Options::scan_cache_copies_fit`): set by the writer's side where
+    /// it grants one and cleared where it takes one back, for the segment
+    /// work's look at the heads (`Options::heads_owned_beside_copies`),
+    /// which cannot read the writer's own record of it.
+    copies_stand: std::sync::atomic::AtomicBool,
     /// Whether the store reads as far from point reads: none in its life,
     /// or two stores' worth of writes since the last, as scans are read
     /// (`reads_around`). Published by the writer's commit
@@ -30291,6 +30328,9 @@ impl Reader {
         }
         fs.auto_grown.set(place);
         self.shared
+            .copies_stand
+            .store(true, AtomicOrdering::Release);
+        self.shared
             .cache_copies_grants
             .fetch_add(1, AtomicOrdering::Relaxed);
         true
@@ -30314,6 +30354,9 @@ impl Reader {
         if !self.shared.points_far.load(AtomicOrdering::Acquire) {
             fs.auto_credit.set(false);
             fs.auto_grown.set(fs.auto_base.get());
+            self.shared
+                .copies_stand
+                .store(false, AtomicOrdering::Release);
             self.shared
                 .cache_copies_revokes
                 .fetch_add(1, AtomicOrdering::Relaxed);
@@ -34790,7 +34833,7 @@ impl Db {
             z: zfile::ZEvents::default(),
             retired_z: RetireList::new(),
             retired_heads: RetireList::new(),
-            heads_events: [AtomicU64::new(0), AtomicU64::new(0)],
+            heads_events: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
             next_dead: AtomicU64::new(1),
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
             z_finish_live: std::sync::atomic::AtomicUsize::new(0),
@@ -34870,6 +34913,7 @@ impl Db {
             cache_growths: AtomicU64::new(0),
             cache_copies_grants: AtomicU64::new(0),
             cache_copies_revokes: AtomicU64::new(0),
+            copies_stand: std::sync::atomic::AtomicBool::new(false),
             points_far: std::sync::atomic::AtomicBool::new(true),
             cache_bound_any: std::sync::atomic::AtomicBool::new(false),
             abandon_at: AtomicU64::new(u64::MAX),
@@ -35594,7 +35638,7 @@ impl Db {
             z: zev,
             retired_z: RetireList::new(),
             retired_heads: RetireList::new(),
-            heads_events: [AtomicU64::new(0), AtomicU64::new(0)],
+            heads_events: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
             next_dead: AtomicU64::new(1),
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
             z_finish_live: std::sync::atomic::AtomicUsize::new(0),
@@ -35674,6 +35718,7 @@ impl Db {
             cache_growths: AtomicU64::new(0),
             cache_copies_grants: AtomicU64::new(0),
             cache_copies_revokes: AtomicU64::new(0),
+            copies_stand: std::sync::atomic::AtomicBool::new(false),
             points_far: std::sync::atomic::AtomicBool::new(true),
             cache_bound_any: std::sync::atomic::AtomicBool::new(false),
             abandon_at: AtomicU64::new(u64::MAX),
@@ -42708,6 +42753,14 @@ impl Db {
         )
     }
 
+    /// The copies of heads made for a grant of the records' place alone,
+    /// the controller's model saying the raw form does not fit
+    /// (`Options::heads_owned_beside_copies`).
+    #[doc(hidden)]
+    pub fn heads_beside_copies(&self) -> u64 {
+        self.shared.heads_events[2].load(AtomicOrdering::Relaxed)
+    }
+
     /// A test's: the writes counted since the store's last scan, by the
     /// commit's hand-over (`upkeep_since_scan`) and by the pass
     /// (`Reader::settle_due`), each of which reads whether scans are
@@ -48733,7 +48786,10 @@ impl Maint {
     /// the controller's model says the raw form fits (`heads_left_raw`),
     /// the census being the group's pressure, and none while the model
     /// says it does not, which is the stretch between a crossing and the
-    /// install its reads' faults buy. The first version copied whatever
+    /// install its reads' faults buy -- but for a store whose block cache
+    /// holds the raw records' place (`Options::heads_owned_beside_copies`),
+    /// where the misfit is the cache's own bytes and no read is near to
+    /// buy anything. The first version copied whatever
     /// the raw form was serving at the look: at ten million keys under the
     /// same bound it made ninety-two copies over a lag sweep and gave back
     /// ninety-two, and the ones at the crossing read the index files from
@@ -48765,16 +48821,27 @@ impl Maint {
             return;
         }
         let near = self.scans_near();
-        let census_raw = !self.z_auto || self.z_leaves_raw;
+        // A grant of the records' place reads as the store left raw
+        // (`Options::heads_owned_beside_copies`): the model's misfit is
+        // then the grant's own bytes, and it stands only far from the
+        // point reads whose faults would buy a form.
+        let beside = self.opts.heads_owned_beside_copies
+            && self.shared.copies_stand.load(AtomicOrdering::Acquire);
+        let model_raw = !self.z_auto || self.z_leaves_raw;
+        let census_raw = model_raw || beside;
         let _op = self.op();
         let mut made = 0usize;
         for seg in self.segs().iter().filter(|s| s.level > 0) {
             let served = seg.z.get().is_some_and(|z| !z.damaged());
             let covered = gate == zselect::GATE_Z && served;
-            let left_raw = if gate == zselect::GATE_Z {
-                !served && seg.z_declined.load(AtomicOrdering::Relaxed) != 0
+            // Left raw, and whether by a grant of the records' place alone.
+            let (left_raw, by_place) = if gate == zselect::GATE_Z {
+                (
+                    !served && seg.z_declined.load(AtomicOrdering::Relaxed) != 0,
+                    false,
+                )
             } else {
-                census_raw
+                (census_raw, !model_raw)
             };
             let owned = seg.ord.heads_owned();
             if covered && owned {
@@ -48786,6 +48853,9 @@ impl Maint {
             } else if near && left_raw && !owned && made < HEADS_A_LOOK && seg.own_heads() {
                 made += 1;
                 self.shared.heads_events[0].fetch_add(1, AtomicOrdering::Relaxed);
+                if by_place {
+                    self.shared.heads_events[2].fetch_add(1, AtomicOrdering::Relaxed);
+                }
                 // The mapping's pages are no seek's now: out of this
                 // process's tables, and out of the cache where it lets
                 // them go.
