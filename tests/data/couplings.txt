@@ -158,15 +158,15 @@ src/db.rs	Reader::not_asked	attn/rest word	code	2	stays	Reader read path: ATTN_P
 src/db.rs	Reader::paged_begin	paged	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
 src/db.rs	Reader::paged_begin	pager	code	2	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
 src/db.rs	Reader::paged_begin	vault/pager method	code	2	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
-src/db.rs	Reader::paged_bits	attn/rest word	code	2	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::paged_bits	attn/rest word	code	3	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
 src/db.rs	Reader::paged_bits	paged	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
 src/db.rs	Reader::paged_bits	pager	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
 src/db.rs	Reader::release	attn/rest word	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
 src/db.rs	Reader::release	pager	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
 src/db.rs	Reader::rest	pager	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
 src/db.rs	Reader::rest	vault/pager method	code	2	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
-src/db.rs	Reader::scan_rested	pager	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
-src/db.rs	Reader::scan_rested	vault/pager method	code	2	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::read_rest	pager	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
+src/db.rs	Reader::read_rest	vault/pager method	code	2	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
 src/db.rs	Reader::seal_reader	paged	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
 src/db.rs	Reader::snapshot	attn/rest word	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
 src/db.rs	Reader::start_ahead	attn/rest word	code	2	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)
@@ -204,11 +204,23 @@ src/db.rs	a_close_that_joins_a_merge_holds_nothing_of_the_cache	cipher	test	4	st
 src/db.rs	a_close_that_joins_a_merge_holds_nothing_of_the_cache	crypt	test	2	stays	cipher_looks: the close's joins under a cipher, the cache read through its own handle past the store
 src/db.rs	a_close_that_joins_a_merge_holds_nothing_of_the_cache	pager	test	9	stays	cipher_looks: the close's joins under a cipher, the cache read through its own handle past the store
 src/db.rs	a_close_that_joins_a_merge_holds_nothing_of_the_cache	vault::tests	test	1	stays	cipher_looks: the close's joins under a cipher, the cache read through its own handle past the store
+src/db.rs	a_look_rests_in_a_handles_outermost_read_and_in_no_read_inside_it	attn/rest word	test	1	stays	cipher_looks: where a look inside a read rests, by the slot's page at depth one and at depth two
+src/db.rs	a_look_rests_in_a_handles_outermost_read_and_in_no_read_inside_it	cipher	test	3	stays	cipher_looks: where a look inside a read rests, by the slot's page at depth one and at depth two
+src/db.rs	a_look_rests_in_a_handles_outermost_read_and_in_no_read_inside_it	crypt	test	2	stays	cipher_looks: where a look inside a read rests, by the slot's page at depth one and at depth two
+src/db.rs	a_look_rests_in_a_handles_outermost_read_and_in_no_read_inside_it	vault::tests	test	1	stays	cipher_looks: where a look inside a read rests, by the slot's page at depth one and at depth two
 src/db.rs	a_merge_writing_an_envelope_holds_nothing_of_the_cache	cipher	test	4	stays	cipher_looks: a merge parked at its output's envelope, the cache read through its own handle while it stands there
 src/db.rs	a_merge_writing_an_envelope_holds_nothing_of_the_cache	crypt	test	2	stays	cipher_looks: a merge parked at its output's envelope, the cache read through its own handle while it stands there
 src/db.rs	a_merge_writing_an_envelope_holds_nothing_of_the_cache	envelope	test	4	stays	cipher_looks: a merge parked at its output's envelope, the cache read through its own handle while it stands there
 src/db.rs	a_merge_writing_an_envelope_holds_nothing_of_the_cache	pager	test	7	stays	cipher_looks: a merge parked at its output's envelope, the cache read through its own handle while it stands there
 src/db.rs	a_merge_writing_an_envelope_holds_nothing_of_the_cache	vault::tests	test	5	stays	cipher_looks: a merge parked at its output's envelope, the cache read through its own handle while it stands there
+src/db.rs	a_reads_rest_waits_for_a_cache_another_reader_holds	cipher	test	4	stays	cipher_looks: a read's rest counted as a breath where another reader holds the cache
+src/db.rs	a_reads_rest_waits_for_a_cache_another_reader_holds	crypt	test	2	stays	cipher_looks: a read's rest counted as a breath where another reader holds the cache
+src/db.rs	a_reads_rest_waits_for_a_cache_another_reader_holds	pager	test	5	stays	cipher_looks: a read's rest counted as a breath where another reader holds the cache
+src/db.rs	a_reads_rest_waits_for_a_cache_another_reader_holds	vault::tests	test	1	stays	cipher_looks: a read's rest counted as a breath where another reader holds the cache
+src/db.rs	a_reads_settle_ahead_of_its_walk_gives_the_cache_back	cipher	test	4	stays	cipher_looks: one scan's settle of a backlog, the cache's peak read through its own handle
+src/db.rs	a_reads_settle_ahead_of_its_walk_gives_the_cache_back	crypt	test	2	stays	cipher_looks: one scan's settle of a backlog, the cache's peak read through its own handle
+src/db.rs	a_reads_settle_ahead_of_its_walk_gives_the_cache_back	pager	test	9	stays	cipher_looks: one scan's settle of a backlog, the cache's peak read through its own handle
+src/db.rs	a_reads_settle_ahead_of_its_walk_gives_the_cache_back	vault::tests	test	1	stays	cipher_looks: one scan's settle of a backlog, the cache's peak read through its own handle
 src/db.rs	check_options	cipher	code	2	stays	an unpinned writer is refused under a cipher, by the mode and in the refusal's words: the rule for an unpinned writer, with the store's cache as the party that frees
 src/db.rs	check_options	crypt	code	2	stays	the same refusal reads the mode out of the options (opts.encryption, Encryption::Cipher)
 src/db.rs	cipher_controller	cipher	code	2	S5	controller off under a cipher

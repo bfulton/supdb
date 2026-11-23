@@ -23452,6 +23452,10 @@ const ATTN_COUNTING: u8 = 4;
 const LOOKS_NONE: u8 = 0;
 const LOOKS_UNDERSTUDY: u8 = 1;
 const LOOKS_WRITER_RESTS: u8 = 2;
+/// A handle that is not the writer's, in a store under a cipher: its
+/// looks are rests too, where they fall ahead of its outermost read's
+/// walk (`Reader::abandon_slow`).
+const LOOKS_READER_RESTS: u8 = 3;
 
 /// `FormsState::abandoned` for "not asked" in a store under a cipher,
 /// where it is `u64::MAX` in one in the clear: every look of a fill finds
@@ -26349,6 +26353,15 @@ impl Reader {
         if self.shared.pager.is_some() {
             self.attn |= ATTN_PAGED;
             self.attn_open.set(self.attn_open.get() | ATTN_PAGED);
+            // A handle with forms of its own looks as the writer's does,
+            // for the rest a look is ahead of a read's walk: the word its
+            // forms have for "not asked" is the cipher's (`not_asked`).
+            if self.looks == LOOKS_NONE {
+                if let Some(f) = self.fs.0.get_mut() {
+                    self.looks = LOOKS_READER_RESTS;
+                    f.abandoned.set(REST_HERE);
+                }
+            }
         }
         self
     }
@@ -29493,15 +29506,7 @@ impl Reader {
                 return Ok(seen);
             }
             if let Some(slot) = slot {
-                // And a wait for the cache where the scan has read it
-                // well past its budget, holding nothing.
-                if let Some(p) = self.shared.pager.as_ref().filter(|p| p.swamped()) {
-                    self.shared.readers.page_idle(slot);
-                    p.breathe_swamped();
-                    self.shared.readers.page_back(slot);
-                } else {
-                    self.shared.readers.page_pin(slot);
-                }
+                self.read_rest(slot);
             }
             // The least key above the last: the last with a zero after it.
             next.clear();
@@ -30610,6 +30615,8 @@ impl Reader {
         if !self.understudy {
             if self.depth.get() >= WRITER_OP {
                 let _ = self.build_rest();
+            } else if self.depth.get() == 1 {
+                self.rest_ahead();
             }
             return false;
         }
@@ -30622,6 +30629,49 @@ impl Reader {
             return true;
         }
         self.abandon_by_pin(now)
+    }
+
+    /// A look's rest inside a read, in a store under a cipher: where the
+    /// read is its handle's outermost. Every look a read reaches falls
+    /// ahead of the read's walk -- the settle of what was written since
+    /// the handle last looked (`settle_each`), the install of the builder
+    /// ahead's forms (`install_ahead`) -- where the read has lent its
+    /// caller nothing and holds nothing it was lent itself, each key
+    /// resolved being asked for and done with. A read inside another
+    /// read's callback is lent what that read is, and rests nothing.
+    ///
+    /// Without it a read's settle was one pin as long as the backlog: the
+    /// first scan after write mixes that had left fifty thousand
+    /// scattered writes unfiled resolved each through the store's cache,
+    /// an index's stride and a record a key, and the cache, which gives
+    /// nothing back that a pinned reader could hold, took in a hundred
+    /// and thirty megabytes in half a second and was killed at its
+    /// group's limit. A caller's read waits at the cache's second line
+    /// (`pager::Pager::swamped`), as a long scan does between two walks.
+    #[cold]
+    fn rest_ahead(&self) {
+        let slot = self
+            .slot
+            .or(self.pin_slot.filter(|_| self.opts.writer_pins));
+        if let Some(slot) = slot.filter(|_| !self.page_snap.get()) {
+            self.read_rest(slot);
+        }
+    }
+
+    /// A caller's read rested, at a point where it holds nothing it was
+    /// lent: `slot` holds from here (`Readers::page_pin`), and where the
+    /// read has taken the cache well past its budget it waits for it
+    /// first, holding nothing (`pager::Pager::breathe_swamped`). Between
+    /// two walks of a long scan (`scan_rested`) and at a look ahead of a
+    /// read's walk (`rest_ahead`).
+    fn read_rest(&self, slot: usize) {
+        if let Some(p) = self.shared.pager.as_ref().filter(|p| p.swamped()) {
+            self.shared.readers.page_idle(slot);
+            p.breathe_swamped();
+            self.shared.readers.page_back(slot);
+        } else {
+            self.shared.readers.page_pin(slot);
+        }
     }
 
     /// The writer's ask, where no scan has made it stale (`abandon_asked`).
@@ -61459,6 +61509,278 @@ mod cipher_looks {
             from = last;
         }
         drop(r);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read settles what was written since its handle last looked before
+    /// it walks, and in a store under a cipher that settle rests as it
+    /// goes (`Reader::rest_ahead`): the cache gives back what the keys
+    /// before were resolved through. One pin long, a scan after a backlog
+    /// of scattered writes read an index's stride and a record a key into
+    /// a cache that could give none of it back.
+    ///
+    /// Keys whose heads are not the whole of them, so that a resolve
+    /// reads its record, in a store many times its cache; a backlog the
+    /// commits leave unfiled, a write every sixtieth key; then one scan,
+    /// through the writer and through a handle of its own, with the
+    /// cache's peak over the scan held to its budget and a read's slack.
+    #[test]
+    fn a_reads_settle_ahead_of_its_walk_gives_the_cache_back() {
+        for through_handle in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "supdb-next-cipher-settle-rests-{through_handle}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let cache: u64 = 2 << 20;
+            let opts = Options {
+                encryption: Encryption::Cipher(vault::tests::cipher(8).cache_bytes(cache)),
+                seal_bytes: 256 << 10,
+                partition_bytes: Some(256 << 10),
+                l0_trigger: 2,
+                // The backlog is the read's to settle: no commit files it.
+                upkeep: Upkeep::Inline,
+                forms_settle_every: false,
+                forms_settle_backlog_pct: 100,
+                ..Options::default()
+            };
+            let n = 300_000u32;
+            let key = |i: u32| format!("k{i:08}-of-a-key-longer-than-its-head").into_bytes();
+            let val = |i: u32, round: u8| {
+                let mut v = format!("value {i:08} of round {round} ").into_bytes();
+                v.resize(100, b'x');
+                v
+            };
+            let mut db = Db::create(&dir, opts).unwrap();
+            for i in 0..n {
+                db.append(&key(i), &val(i, 0));
+                if i % 500 == 499 {
+                    db.commit().unwrap();
+                }
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+            db.settle().unwrap();
+            let h = db.reader().unwrap();
+            // Through the writer or through the handle, as the turn says.
+            fn scan10(db: &Db, h: &Reader, handle: bool, from: &[u8]) -> usize {
+                let mut got = 0usize;
+                let f = |_: &[u8], _: &[u8]| got += 1;
+                if handle {
+                    h.scan(from, 10, f).unwrap();
+                } else {
+                    db.scan(from, 10, f).unwrap();
+                }
+                got
+            }
+            fn values(db: &Db, h: &Reader, handle: bool, k: &[u8]) -> Vec<Vec<u8>> {
+                let mut got = Vec::new();
+                let f = |v: &[u8]| got.push(v.to_vec());
+                if handle {
+                    h.read_all(k, f).unwrap();
+                } else {
+                    db.read_all(k, f).unwrap();
+                }
+                got
+            }
+            // A scan first: the block cache is in use and scans are near.
+            assert_eq!(scan10(&db, &h, through_handle, &key(0)), 10);
+            let step = 60u32;
+            for (c, i) in (0..n).step_by(step as usize).enumerate() {
+                db.append(&key(i), &val(i, 1));
+                if c % 100 == 99 {
+                    db.commit().unwrap();
+                }
+            }
+            db.commit().unwrap();
+            let pager = db.shared.pager.clone().expect("a store under a cipher");
+            let t = std::time::Instant::now();
+            while pager.held() > pager.budget() {
+                assert!(
+                    t.elapsed() < std::time::Duration::from_secs(20),
+                    "handle {through_handle}: the cache stayed over its budget before the \
+                     scan: {:?}",
+                    pager.counts()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            pager.restart_peak();
+            let before = pager.counts();
+            assert_eq!(scan10(&db, &h, through_handle, &key(1)), 10);
+            let c = pager.counts();
+            let read = (c.fills - before.fills) * pager::CHUNK as u64;
+            assert!(
+                read > 6 * cache,
+                "handle {through_handle}: the scan's settle read {read} bytes through the \
+                 cache, which is no test of it: {c:?}"
+            );
+            // Past the budget by what a caller's read may be before it
+            // waits (`pager::Pager::swamped`) and the megabyte the cache
+            // gives back at a time.
+            let slack: u64 = 10 << 20;
+            assert!(
+                c.peak < cache + slack,
+                "handle {through_handle}: the cache held {} bytes through one scan's settle, \
+                 over a budget of {cache}: {c:?}",
+                c.peak
+            );
+            // And what was written reads back, a key written twice and
+            // its neighbour written once.
+            let twice = step * 7;
+            assert_eq!(
+                values(&db, &h, through_handle, &key(twice)),
+                [val(twice, 0), val(twice, 1)]
+            );
+            assert_eq!(
+                values(&db, &h, through_handle, &key(twice + 1)),
+                [val(twice + 1, 0)]
+            );
+            drop(h);
+            drop(db);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A read's rest waits where the cache is far past its budget
+    /// (`Reader::read_rest`, `pager::Pager::breathe_swamped`): a wait with
+    /// an end, holding nothing, counted as a breath. Another handle stands
+    /// inside a scan's callback here, so nothing the cache holds can be
+    /// given back, and a scan through the writer settles a backlog several
+    /// times the cache beside it: every look of that settle finds the
+    /// cache past its second line and waits a breath before it reads on,
+    /// which is what bounds a cache nobody can empty to what its readers
+    /// read between two waits.
+    #[test]
+    fn a_reads_rest_waits_for_a_cache_another_reader_holds() {
+        let dir = std::env::temp_dir().join(format!(
+            "supdb-next-cipher-rest-waits-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache: u64 = 2 << 20;
+        let opts = Options {
+            encryption: Encryption::Cipher(vault::tests::cipher(10).cache_bytes(cache)),
+            seal_bytes: 256 << 10,
+            partition_bytes: Some(256 << 10),
+            l0_trigger: 2,
+            upkeep: Upkeep::Inline,
+            forms_settle_every: false,
+            forms_settle_backlog_pct: 100,
+            ..Options::default()
+        };
+        let n = 300_000u32;
+        let key = |i: u32| format!("k{i:08}-of-a-key-longer-than-its-head").into_bytes();
+        let val = |i: u32, round: u8| {
+            let mut v = format!("value {i:08} of round {round} ").into_bytes();
+            v.resize(100, b'x');
+            v
+        };
+        let mut db = Db::create(&dir, opts).unwrap();
+        for i in 0..n {
+            db.append(&key(i), &val(i, 0));
+            if i % 500 == 499 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert_eq!(db.scan(&key(0), 10, |_, _| {}).unwrap(), 10);
+        // The other handle first: a handle made over a backlog settles it
+        // where it is made.
+        let g = db.reader().unwrap();
+        for (c, i) in (0..n).step_by(60).enumerate() {
+            db.append(&key(i), &val(i, 1));
+            if c % 100 == 99 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+        let pager = db.shared.pager.clone().expect("a store under a cipher");
+        let first = key(n - 1);
+        std::thread::scope(|s| {
+            // The other reader, inside its callback until the channel's
+            // sender goes, which it does when this closure ends, a failed
+            // assertion's unwinding included.
+            let (parked, here) = std::sync::mpsc::channel::<()>();
+            let (go, wait) = std::sync::mpsc::channel::<()>();
+            s.spawn(move || {
+                g.scan(&first, 1, |_, _| {
+                    let _ = parked.send(());
+                    let _ = wait.recv();
+                })
+                .unwrap();
+            });
+            here.recv().unwrap();
+            let before = pager.counts();
+            assert_eq!(db.scan(&key(1), 10, |_, _| {}).unwrap(), 10);
+            let c = pager.counts();
+            let read = (c.fills - before.fills) * pager::CHUNK as u64;
+            assert!(
+                read > 6 * cache,
+                "the scan's settle read {read} bytes through the cache, which is no test of \
+                 it: {c:?}"
+            );
+            assert_eq!(
+                c.evicted_units, before.evicted_units,
+                "the cache gave back under a reader that held it: {c:?}"
+            );
+            assert!(
+                c.breaths > before.breaths,
+                "a read's rest never waited for a cache it had taken to {} bytes over a \
+                 budget of {cache}: {c:?}",
+                c.held
+            );
+            drop(go);
+        });
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A look inside a read rests where the read is its handle's
+    /// outermost, and nowhere else: a read inside another read's callback
+    /// is lent what the outer read is, whose callback reads the key and
+    /// value it was handed after the inner read returns, and a rest there
+    /// would let the cache give their page back. A rest is the slot's
+    /// `page` moved to the epoch as it stands (`Readers::page_pin`), which
+    /// is what the cache's evictor reads; the epoch is moved between the
+    /// pin and each look so that a rest shows.
+    #[test]
+    fn a_look_rests_in_a_handles_outermost_read_and_in_no_read_inside_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "supdb-next-cipher-look-depth-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let opts = Options {
+            encryption: Encryption::Cipher(vault::tests::cipher(9)),
+            ..Options::default()
+        };
+        let db = Db::create(&dir, opts).unwrap();
+        let h = db.reader().unwrap();
+        assert_eq!(h.looks, LOOKS_READER_RESTS);
+        assert_eq!(h.fs().abandoned.get(), REST_HERE);
+        let readers = &db.shared.readers;
+        for (r, slot, who) in [
+            (&h, h.slot.unwrap(), "a handle"),
+            (&db.r, db.r.pin_slot.unwrap(), "the writer in a read"),
+        ] {
+            let page = || readers.slots[slot].page.load(AtomicOrdering::SeqCst);
+            let outer = r.enter();
+            let epoch = readers.bump();
+            assert!(page() < epoch, "{who}: nothing has rested yet");
+            {
+                let inner = r.enter();
+                assert!(!r.abandon_asked(), "{who}: a look gives nothing up");
+                assert!(page() < epoch, "{who}: a look inside a nested read rested");
+                drop(inner);
+            }
+            assert!(!r.abandon_asked());
+            assert_eq!(page(), epoch, "{who}: a look in the outermost read rests");
+            drop(outer);
+        }
+        drop(h);
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
