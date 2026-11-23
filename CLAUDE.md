@@ -2875,7 +2875,19 @@ allocate, and the count of anonymous bytes resident beyond the allocator's
 use is lowered by any allocation from a free chunk already resident: a
 dead arena of thirty-two megabytes read as nine in one run of the whole
 `db` binary, so that test has a binary of its own (`tests/resident.rs`), as
-the allocation count has (`tests/leak.rs`).
+the allocation count has (`tests/leak.rs`). A fork is such an effect on
+every descriptor the process holds. The crash oracle in `tests/runlog.rs`
+spawns its writers beside tests that open stores, a child holds a copy of
+each store's `LOCK` from its fork to its exec, and a `flock` is the open
+file description's and not the descriptor's: a store one test closed and
+opened again inside that window was refused as open elsewhere, the
+child's copy holding the lock the close had given up. Once on a hosted
+runner; with the child held 30 ms before its exec, two runs of the binary
+in eight, the same test at the same line; none of thirty without the
+oracle. The tests there hold a lock for read while they open stores and
+the oracle spawns under it for write (`no_fork`). The engine's own answer
+to a caller that forks is the same refusal, for as long as a child takes
+to reach its exec.
 
 **A call site no real input reaches red.** The suite's refusals after the
 read pass and after the shuffled load were green-side only, because a real
