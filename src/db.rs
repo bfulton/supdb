@@ -1634,7 +1634,8 @@ pub struct Options {
     /// the shape before it, kept to price it, and a store refuses it
     /// beside another publisher -- `publish_in_background` or
     /// `snapshot_keeper` -- since the segment work would free a state the
-    /// writer is reading.
+    /// writer is reading, and under a cipher (`Encryption::Cipher`), whose
+    /// cache gives back the pages of a file no pinned reader holds.
     pub writer_pins: bool,
     /// EXPERIMENT: the pin is a plain store and a load, and the sweep
     /// that frees fences for it, once, through `membarrier` (`Readers`);
@@ -17437,6 +17438,19 @@ fn check_options(opts: &Options) -> Result<()> {
         return Err(err(
             "writer_pins off needs every publish on the writer's thread: \
              publish_in_background and snapshot_keeper off",
+        ));
+    }
+    // The cache a store under a cipher reads through gives a file's pages
+    // back once no reader pinned in the reader table could hold them
+    // (`pager`), and a writer that pins nothing is a reader it does not
+    // wait for: its reads, and the landings the segment work makes on its
+    // thread, would be of pages given back under them. The same rule as
+    // the one above, with the cache as the other party that frees.
+    if !opts.writer_pins && matches!(opts.encryption, Encryption::Cipher(_)) {
+        return Err(err(
+            "writer_pins off cannot run under a cipher: the store's cache gives a file's \
+             pages back once no pinned reader holds them, and an unpinned writer reads \
+             them unpinned",
         ));
     }
     // The form file a read follows hangs on its segment and is freed with it,

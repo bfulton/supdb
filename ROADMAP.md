@@ -757,16 +757,16 @@ cipher. Then that pass, then the layer.
   under a cipher. Three mechanisms were found doing nothing there after
   they shipped: the stride form, the heads' copy, and the third merge of a
   stretch nobody reads (`Options::merge_parallel_quiet`), which waits for
-  the compact form's gate, where the controller is off. And
-  `check_options` accepts `writer_pins` off beside `Encryption::Cipher`,
-  where the writer's reads take no slot and the store's cache does not
-  wait for them. Done when a group of `scripts/check.sh` runs every test
+  the compact form's gate, where the controller is off. A fourth was
+  unsound and not idle: an unpinned writer (`writer_pins` off) was
+  accepted under a cipher, where the store's cache does not wait for its
+  reads, and is refused at the open now. Done when a group of
+  `scripts/check.sh` runs every test
   that opens a plain store as a store under an identity cipher, with
   eviction forced at every rest and the guard on (`SUPDB_PAGER_GUARD`);
   the differential fuzz runs so at a small cache; every field of
   `Options` is drawn there or exempt with a reason; the asks a read, a
-  scan entry and a merge step make are a list that only goes down; and
-  the unpinned writer is refused at the open.
+  scan entry and a merge step make are a list that only goes down.
 - [ ] **The page layer.** The cipher's code is threaded through the
   engine as an envelope a file, a memory file while a file is written
   and a sealed record in the log, which is why a merge of the line this

@@ -276,6 +276,64 @@ fn a_store_under_a_cipher_opens_under_no_other() {
     holds(&Db::open(&plain, small()).unwrap(), n);
 }
 
+/// An unpinned writer is refused under a cipher, before the directory
+/// is touched. `writer_pins` off is sound only while nothing frees what
+/// the writer reads, which is why it is refused beside a second
+/// publisher; under a cipher the store's cache gives a file's pages back
+/// once no pinned reader could hold them, and a writer that pins nothing
+/// is a reader it does not wait for. The refusal is held to its words
+/// and to a directory left as it was: one that was not there is not
+/// made, and a store is opened under its pinned writer after an open
+/// that was refused.
+#[test]
+fn an_unpinned_writer_is_refused_under_a_cipher() {
+    let unpinned = |n: u8| Options {
+        writer_pins: false,
+        publish_in_background: false,
+        snapshot_keeper: false,
+        ..under(n)
+    };
+    // The same options in the clear are a store: the arm the suite prices.
+    let plain = scratch("unpinned-plain");
+    let mut db = Db::create(
+        &plain,
+        Options {
+            encryption: Encryption::None,
+            ..unpinned(1)
+        },
+    )
+    .expect("an unpinned writer that is the one publisher, in the clear");
+    fill(&mut db, 600);
+    holds(&db, 600);
+    drop(db);
+
+    let dir = scratch("unpinned");
+    let e = Db::create(&dir, unpinned(1))
+        .err()
+        .expect("an unpinned writer under a cipher was not refused at the creation");
+    let e = e.to_string();
+    assert!(e.contains("writer_pins") && e.contains("cipher"), "{e}");
+    assert!(!dir.exists(), "the refused creation made the directory");
+
+    let n = 2_000;
+    {
+        let mut db = Db::create(&dir, under(1)).unwrap();
+        fill(&mut db, n);
+    }
+    let before = snapshot(&dir);
+    let e = Db::open(&dir, unpinned(1))
+        .err()
+        .expect("an unpinned writer under a cipher was not refused at the open");
+    let e = e.to_string();
+    assert!(e.contains("writer_pins") && e.contains("cipher"), "{e}");
+    assert_eq!(
+        snapshot(&dir),
+        before,
+        "the refused open changed the directory"
+    );
+    holds(&Db::open(&dir, under(1)).unwrap(), n);
+}
+
 fn mix(mut h: u64, bytes: &[u8]) -> u64 {
     for &b in bytes {
         h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);

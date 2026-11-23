@@ -196,6 +196,8 @@ src/db.rs	Wal::resume	sealed log/manifest	code	3	S6	log_resume
 src/db.rs	Wal::resume	vault::LogCipher	code	1	S6	log_resume
 src/db.rs	Wal::resume	vault::Vault	code	1	S6	log_resume
 src/db.rs	Wal::write_sealed	sealed log/manifest	code	1	S6	enc.seal_into, split out of Wal::write
+src/db.rs	check_options	cipher	code	2	stays	an unpinned writer is refused under a cipher, by the mode and in the refusal's words: the rule for an unpinned writer, with the store's cache as the party that frees
+src/db.rs	check_options	crypt	code	2	stays	the same refusal reads the mode out of the options (opts.encryption, Encryption::Cipher)
 src/db.rs	cipher_controller	cipher	code	2	S5	controller off under a cipher
 src/db.rs	compact_job	MergeRest/NoRest	code	1	R4	the hold picks MergeRest: the lease
 src/db.rs	compact_job	vault::hold	code	1	S1	vault::hold -> pin::hold; the MergeRest it picks falls at R4

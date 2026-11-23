@@ -19,3 +19,5 @@ tests/data/cost-entries.txt	Reader::forms_by_partition	0	1	upstream 91e56da: a p
 tests/data/cost-entries.txt	Db::forms_by_partition	0	1	upstream 91e56da: the writer's handle on that listing
 tests/data/cost-entries.txt	Db::forms_drop_reasons	0	1	upstream 50c171b: a probe's counts of the writer's tables dropped whole, by the site that asked, read by the suite's counters line
 tests/data/door.txt	thread src/db.rs *	103	104	upstream 83cf293: a settle's wait for the raw form's files it asked for (Maint::z_raw_settle) sleeps between its looks, as the wait for the form files beside it does; no thread is made
+tests/data/couplings.txt	src/db.rs cipher code	23	25	check_options refuses writer_pins off under Encryption::Cipher, where the store's cache gives pages back under a writer that pins nothing (the checked build's assertion fired at such a store's first landing): the options' check names the mode once in its test and once in the refusal's words, which the test holds
+tests/data/couplings.txt	src/db.rs crypt code	14	16	the same line of check_options: opts.encryption matched against Encryption::Cipher

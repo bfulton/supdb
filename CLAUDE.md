@@ -4312,7 +4312,19 @@ refuses an unpinned writer beside another publisher, and the arm runs
 its segment work inline as it did when the pins were priced. The rule:
 an option sound only under another's value is checked against it where
 the store opens, and an arm that keeps an old shape keeps that shape's
-other settings with it.
+other settings with it. It came back as a mode. The condition was
+never "the one thread that publishes" but "nothing else frees what the
+writer reads", and under a cipher the store's cache gives a file's pages
+back once no reader pinned in the reader table could hold them: an
+unpinned writer there was accepted at the open for as long as the cipher
+shipped, the checked build's assertion fired at such a store's first
+landing ("read with nothing pinned"), a release build has no assertion
+and reads pages the cache is free to give back, and nothing opened one,
+the arm being the suite's and plain. It is refused at the open (`tests/cipher.rs`, by its words and a
+directory left as it was). The corollary: a soundness condition is
+written down as the property it rests on, and read again against every
+new party that can break the property, since the list of parties it was
+first checked against is only who existed that day.
 
 **A sweep that read the pins before it took the list.** A retired
 item is freed once every pinned reader is past the epoch its
