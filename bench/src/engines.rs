@@ -1028,6 +1028,11 @@ pub struct Supdb {
     /// the engine's default. `supdb-headsmodel` copies them by the model's
     /// word alone.
     headscopies: Option<bool>,
+    /// The merge path's scan snapshot kept to the commit by the commit's
+    /// maintenance while the writer's forms are given up
+    /// (`Options::forms_off_snapshot_kept`), `None` for the engine's
+    /// default. `supdb-snapkept` keeps it.
+    snapkept: Option<bool>,
     /// The block cache granted the raw records' place where its own budget
     /// would bind and no point read is near
     /// (`Options::scan_cache_copies_fit`), `None` for the engine's default.
@@ -2385,6 +2390,11 @@ struct Policy {
     /// the engine's default. `supdb-headsmodel` copies them by the model's
     /// word alone.
     headscopies: Option<bool>,
+    /// The merge path's scan snapshot kept to the commit by the commit's
+    /// maintenance while the writer's forms are given up
+    /// (`Options::forms_off_snapshot_kept`), `None` for the engine's
+    /// default. `supdb-snapkept` keeps it.
+    snapkept: Option<bool>,
     /// The block cache granted the raw records' place where its own budget
     /// would bind and no point read is near
     /// (`Options::scan_cache_copies_fit`), `None` for the engine's default.
@@ -3188,6 +3198,7 @@ impl Default for Policy {
             rewarmrawscans: None,
             rewarmrawmaps: None,
             headscopies: None,
+            snapkept: None,
             copiesfit: None,
             chainuncovered: None,
             formsoffbuilt: None,
@@ -7752,6 +7763,21 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with the merge path's scan snapshot kept to the commit by
+    /// the upkeep thread while the writer's forms are given up
+    /// (`Options::forms_off_snapshot_kept`): the first scan after a burst
+    /// files the thread's trail, where the default sorts every unsealed
+    /// key.
+    pub fn create_snapkept(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                snapkept: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with the partitions' heads copied at the controller's census
     /// by the model's word alone (`Options::heads_owned_beside_copies`
     /// off): a partition a merge lands after the block cache was granted
@@ -9653,6 +9679,7 @@ impl Supdb {
             rewarmrawscans,
             rewarmrawmaps,
             headscopies,
+            snapkept,
             copiesfit,
             chainuncovered,
             formsoffbuilt,
@@ -10159,6 +10186,8 @@ impl Supdb {
                 .unwrap_or(supdb::Options::default().zpages_rewarm_raw_maps),
             heads_owned_beside_copies: headscopies
                 .unwrap_or(supdb::Options::default().heads_owned_beside_copies),
+            forms_off_snapshot_kept: snapkept
+                .unwrap_or(supdb::Options::default().forms_off_snapshot_kept),
             scan_cache_copies_fit: copiesfit
                 .unwrap_or(supdb::Options::default().scan_cache_copies_fit),
             merge_chains_writes_uncovered: chainuncovered
@@ -10636,6 +10665,7 @@ impl Supdb {
             rewarmrawscans,
             rewarmrawmaps,
             headscopies,
+            snapkept,
             copiesfit,
             chainuncovered,
             formsoffbuilt,
@@ -12224,6 +12254,9 @@ impl Engine for Supdb {
         if self.headscopies == Some(false) {
             return "supdb-headsmodel";
         }
+        if self.snapkept == Some(true) {
+            return "supdb-snapkept";
+        }
         match (
             self.copiesfit == Some(false),
             self.chainuncovered == Some(false),
@@ -12549,6 +12582,7 @@ impl Engine for Supdb {
             ("snapshots_stood", db.snapshots_stood() as f64),
             ("snapshot_extends", db.snapshot_extends() as f64),
             ("snapshot_refreshes", db.snapshot_refreshes() as f64),
+            ("snapshots_kept", db.snapshots_kept() as f64),
             ("form_takes", db.form_takes() as f64),
             ("blk_by_reader", db.blocks_built().0 as f64),
             ("blk_by_engine", db.blocks_built().1 as f64),
@@ -14351,6 +14385,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zrewarmrawscans"
         | "supdb-rewarmrawnomap"
         | "supdb-headsmodel"
+        | "supdb-snapkept"
         | "supdb-nocopiesfit"
         | "supdb-chaincovered"
         | "supdb-nocopiesfitchain"
@@ -16292,6 +16327,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zrewarmrawscans" => supdb_arm(Supdb::create_zrewarmrawscans, dir)?,
         "supdb-rewarmrawnomap" => supdb_arm(Supdb::create_rewarmrawnomap, dir)?,
         "supdb-headsmodel" => supdb_arm(Supdb::create_headsmodel, dir)?,
+        "supdb-snapkept" => supdb_arm(Supdb::create_snapkept, dir)?,
         "supdb-nocopiesfit" => supdb_arm(Supdb::create_nocopiesfit, dir)?,
         "supdb-chaincovered" => supdb_arm(Supdb::create_chaincovered, dir)?,
         "supdb-nocopiesfitchain" => supdb_arm(Supdb::create_nocopiesfitchain, dir)?,
@@ -18372,6 +18408,11 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.heads_owned_beside_copies && b.heads_owned_beside_copies);
                 assert!(o.heads_owned && o.scan_cache_copies_fit);
+                let z = Supdb::create_snapkept(&dir("snapkept")).unwrap();
+                assert_eq!(z.name(), "supdb-snapkept");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.forms_off_snapshot_kept && !b.forms_off_snapshot_kept);
             }
             {
                 let z = Supdb::create_nocopiesfit(&dir("nocopiesfit")).unwrap();

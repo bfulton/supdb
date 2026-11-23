@@ -4333,6 +4333,22 @@ pub struct Options {
     /// (`supdb-formsoffkept`).
     #[doc(hidden)]
     pub scan_forms_off_stale_writes: u32,
+    /// EXPERIMENT: while the writer's forms are given up for the merge
+    /// path (`scan_forms_off_unreused`) and scans are near, the commit's
+    /// maintenance keeps the merge path's scan snapshot to the commit
+    /// (`Reader::keep_merge_snapshot`): the log read and the keys created
+    /// since filed into the snapshot, as a scan's preamble does, on the
+    /// upkeep thread where the upkeep is lent. With the forms off the
+    /// maintenance did nothing -- nine hundred passes of the thread in
+    /// 1.3 ms over the lag sweep's ten-percent burst at ten million keys
+    /// -- and the first scan after a burst sorted every unsealed key
+    /// itself: 16-22 ms of the pass after the one-percent burst there,
+    /// 45-115 after the ten-percent and 42-118 after the full rewrite, a
+    /// tenth to a fifth of each divided pass under either bound, for a
+    /// hundred to three hundred and ninety thousand keys. Off: the first
+    /// scan builds it.
+    #[doc(hidden)]
+    pub forms_off_snapshot_kept: bool,
     /// The scans a window of `scan_forms_off_unreused`'s share is taken
     /// over. A test sets a few.
     #[doc(hidden)]
@@ -7028,6 +7044,7 @@ impl Default for Options {
             scan_forms_off_unreused: true,
             scan_forms_off_counts_built: false,
             scan_forms_off_stale_writes: 512,
+            forms_off_snapshot_kept: false,
             scan_forms_off_window: 512,
             scan_forms_off_ghost_bits: 10,
             scan_forms_off_flip: false,
@@ -20067,6 +20084,9 @@ struct Shared {
     /// PROTOTYPE: handles that took the published snapshot over their
     /// own under the keeper's rule; for a test.
     snap_switched: AtomicU64,
+    /// The times a commit's maintenance kept the merge path's snapshot to
+    /// its commit with the forms off (`Options::forms_off_snapshot_kept`).
+    snaps_kept: AtomicU64,
     /// Snapshots the seal thread published over the frozen table it was
     /// writing (`Options::seal_snapshot`); for a test.
     snap_sealed: AtomicU64,
@@ -29298,10 +29318,40 @@ impl Reader {
     /// may be shed.
     fn maintain_forms(&self) -> Result<()> {
         self.hold_copies_look();
+        self.keep_merge_snapshot();
         if self.settle_due(true) != Some(true) {
             return Ok(());
         }
         self.fill_forms()
+    }
+
+    /// The merge path's scan snapshot kept to this commit while the
+    /// writer's forms are given up (`Options::forms_off_snapshot_kept`):
+    /// what a scan's preamble does before its walk -- the log read to the
+    /// commit, the keys created since the snapshot filed into its side
+    /// runs, or the snapshot carried forward or built where it is behind
+    /// or absent (`refresh_snapshot`) -- done at the commit's maintenance,
+    /// so that the first scan after a burst reads the log from where the
+    /// last pass left it and files that much. Only while scans are near,
+    /// by the seals' reading of it (`Shared::scans_far_at`): a store
+    /// nobody scans keeps nothing. The writer's own upkeep alone: a handle
+    /// keeps no forms to give up.
+    fn keep_merge_snapshot(&self) {
+        if !self.opts.forms_off_snapshot_kept || self.slot.is_some() || !self.fs().forms_off.get() {
+            return;
+        }
+        // The forms go off at a scan, so the store has been scanned: far
+        // is the seals' mark at the scan count as it stands.
+        let life = self.shared.scans_life.load(AtomicOrdering::Relaxed)
+            + self.shared.scans_merged.load(AtomicOrdering::Relaxed);
+        if self.shared.scans_far_at.load(AtomicOrdering::Acquire) == life {
+            return;
+        }
+        let gen = self.state().gen;
+        if self.sync_log() {
+            self.refresh_snapshot(gen, false, true);
+            self.shared.snaps_kept.fetch_add(1, AtomicOrdering::Relaxed);
+        }
     }
 
     /// Under `forms_pieces_only`, on the writer's upkeep: once a
@@ -34906,6 +34956,7 @@ impl Db {
             snap_kept: AtomicU64::new(0),
             snap_carried: AtomicU64::new(0),
             snap_switched: AtomicU64::new(0),
+            snaps_kept: AtomicU64::new(0),
             snap_sealed: AtomicU64::new(0),
             snap_on_table: AtomicU64::new(0),
             upkeep: Lend::default(),
@@ -35711,6 +35762,7 @@ impl Db {
             snap_kept: AtomicU64::new(0),
             snap_carried: AtomicU64::new(0),
             snap_switched: AtomicU64::new(0),
+            snaps_kept: AtomicU64::new(0),
             snap_sealed: AtomicU64::new(0),
             snap_on_table: AtomicU64::new(0),
             upkeep: Lend::default(),
@@ -38331,6 +38383,13 @@ impl Db {
 
     /// EXPERIMENT: snapshots republished with their stale runs copied
     /// again; see `Snapshot::refreshed`.
+    /// The times a commit's maintenance kept the merge path's snapshot to
+    /// its commit with the forms off (`Options::forms_off_snapshot_kept`).
+    #[doc(hidden)]
+    pub fn snapshots_kept(&self) -> u64 {
+        self.shared.snaps_kept.load(AtomicOrdering::Relaxed)
+    }
+
     pub fn snapshot_refreshes(&self) -> u64 {
         self.shared.snap_refreshes.load(AtomicOrdering::Relaxed)
     }
