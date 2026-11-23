@@ -87,6 +87,15 @@ timing run needs the machine to itself, and CI gives it a job of its own. The
 check run in the `bench` group (`sh bench/scripts/check.sh lint` by
 itself, a minute), and a commit that touched `bench/` alone went out
 behind a green `lint` with a doubled `#[allow]` that clippy refuses.
+And a green `lint` here is the runner's only under the runner's
+toolchain: CI installs the stable of the day and a container keeps the
+one it was made with, which `scripts/deps.sh` leaves as it finds it. Two
+`chunks_exact` calls over a constant passed here under 1.97 and failed on
+every hosted leg under 1.100, whose clippy asks for `as_chunks`, and
+nothing had said so, CI running on a pull request and none having run it
+over the branch since they were written. `rustup update stable` before
+the gate, or the group under the runner's version
+(`RUSTUP_TOOLCHAIN=1.100.0 sh scripts/check.sh lint`).
 
 The tests leave their stores under the temp directory, one per test and
 process (`supdb-next-<name>-<pid>`), so a day of test runs on one box is
