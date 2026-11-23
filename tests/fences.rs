@@ -1116,8 +1116,8 @@ fn a_merges_landing_plans_the_next_and_a_cap_lands_a_range_at_a_time() {
 /// scanned and holds a form for every block its pieces overlay leaves the
 /// second range to the seals' plans; one whose store was never scanned, has
 /// no block cache or files none at its commits, has a budget given or its
-/// own bound, or has given its forms up for the merge path, chains as
-/// before, as does every store with the option off.
+/// own bound, has given its forms up for the merge path, or has a point
+/// read near, chains as before, as does every store with the option off.
 #[test]
 fn a_burst_the_writers_forms_cover_is_not_chained_through() {
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1131,6 +1131,8 @@ fn a_burst_the_writers_forms_cover_is_not_chained_through() {
         BudgetGiven,
         BudgetBound,
         FormsOff,
+        /// Covered, and a point read made before the burst.
+        PointRead,
     }
     for (opt, store, left, merges) in [
         (false, Store::Covered, 0usize, 2u64),
@@ -1142,6 +1144,7 @@ fn a_burst_the_writers_forms_cover_is_not_chained_through() {
         (true, Store::BudgetGiven, 0, 2),
         (true, Store::BudgetBound, 0, 2),
         (true, Store::FormsOff, 0, 2),
+        (true, Store::PointRead, 0, 2),
     ] {
         let d = scratch(&format!("chain-covered-{opt}-{store:?}"));
         let mut db = Db::create(
@@ -1200,6 +1203,10 @@ fn a_burst_the_writers_forms_cover_is_not_chained_through() {
         };
         if store != Store::NeverScanned {
             scan(&db);
+        }
+        // A point read probes every piece over its key, forms or none.
+        if store == Store::PointRead {
+            assert_eq!(db.count(&key(7)).unwrap(), 1);
         }
         let (merges0, plans0) = (db.seal_waits().merges, db.seal_waits().plans);
         let in_range = |r: usize, round: u32, i: u32| -> Vec<u8> {
