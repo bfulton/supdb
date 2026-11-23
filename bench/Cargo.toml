@@ -65,8 +65,9 @@ snap = { version = "1", optional = true }
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
 
 [build-dependencies]
-# For LZAV under `codecs` alone; already in the graph for the comparators.
-cc = { version = "1", optional = true }
+# For FASTER's C++ store and its shim (`vendor/faster`), and for LZAV under
+# `codecs`; already in the graph for the comparators.
+cc = "1"
 
 [features]
 # `zsize` built with the crate's safe encoder and decoder, to be run beside
@@ -81,7 +82,7 @@ lz4-c = ["dep:lz4"]
 rocksdb-jemalloc = ["rocksdb/jemalloc"]
 # `zcodec` built with zstd, Snappy and LZAV (`vendor/lzav`, compiled by
 # `build.rs`) beside LZ4. Off for everything the suite measures.
-codecs = ["lz4-c", "dep:zstd", "dep:snap", "dep:cc"]
+codecs = ["lz4-c", "dep:zstd", "dep:snap"]
 # The process's allocations counted by the thread that made them, a
 # `mixthreads` line beside each census (`SUPDB_MIX_CENSUS=2`): whose memory
 # an arena left free and resident was (`src/alloc_census.rs`). A count on
