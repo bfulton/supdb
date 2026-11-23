@@ -6164,10 +6164,19 @@ in the suite's figures, at `full` scale where it says so:
   full rewrite at three million keys under 1 GiB has left against LMDB's,
   level to a tenth ahead where the same pass in memory is 1.8x. The
   levers: the share the syncing pace lets the thread trail by
-  (`upkeep_pace_syncs_bp`, `supdb-pacesyncs5`), which trades the burst
-  for it; and the reads' chain and the idle plan held off a store whose
-  forms cover it and no point read is near, as the chain through writes
-  is (`Options::merge_chains_writes_uncovered`), which is not built.
+  (`upkeep_pace_syncs_bp`), which trades the burst for it -- at five
+  basis points for the engine's twenty-five (`pair.sh supdb-pacesyncs5
+  supdb 3000000 --bound 1073741824 --reps 8 --ops-div 10 --passes
+  load,lag`, at `b2d0dfc`) the first scan's phases fell from 3.9 ms to
+  0.8 at the median, the pass after the full rewrite read 14.6 ms
+  against 19.9 and the pass after the one-percent burst 14.9 against
+  22.2, and the one- and ten-percent bursts ran an eighth slower, a
+  third and a tenth under 1.25 GiB, where the one-percent burst's cell
+  against RocksDB has a twentieth to give; and the merge the idle plan
+  starts at that scan, held off or run at the idle I/O class where the
+  writer's forms cover the store and no point read is near, as the chain
+  through writes is held (`Options::merge_chains_writes_uncovered`),
+  which is not built.
 - The lag pass after a full rewrite under a bound pays for the burst's
   merge debt twice: as a merge writing beside it, in the reps where the
   chain has not drained -- the pass's slow shape at ten million keys under
