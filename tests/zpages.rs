@@ -17934,6 +17934,7 @@ fn a_merges_outputs_are_built_in_the_block_form_where_the_room_is_short() {
 /// With `twice`, the last key is given a second value in a batch of its
 /// own, so that the stride form declines the last partition
 /// (`StrideNo::NotOneValue`).
+#[cfg(target_os = "linux")]
 fn numbered_soft_load(db: &mut Db, n: usize, w: usize, seed: u64, twice: bool) -> Model {
     let mut rng = Rng(seed);
     let mut model = Model::new();
@@ -17997,6 +17998,7 @@ fn convert_look(db: &Db, by: std::time::Duration) {
 
 /// `heat_up` over keys that may hold more than one value: `n` reads of
 /// `keys`, round and round, each answering something.
+#[cfg(target_os = "linux")]
 fn read_round(db: &Db, keys: &[Vec<u8>], n: usize) {
     for i in 0..n {
         let k = &keys[i % keys.len()];
@@ -18028,6 +18030,7 @@ fn convert_alike_until(
 }
 
 /// Each partition's form by key order: whether a stride file serves it.
+#[cfg(target_os = "linux")]
 fn strides(db: &Db) -> Vec<bool> {
     db.zpage_heat().iter().map(|h| h.stride).collect()
 }

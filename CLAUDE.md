@@ -95,7 +95,12 @@ every hosted leg under 1.100, whose clippy asks for `as_chunks`, and
 nothing had said so, CI running on a pull request and none having run it
 over the branch since they were written. `rustup update stable` before
 the gate, or the group under the runner's version
-(`RUSTUP_TOOLCHAIN=1.100.0 sh scripts/check.sh lint`).
+(`RUSTUP_TOOLCHAIN=1.100.0 sh scripts/check.sh lint`). The macOS leg's
+lint is another the gate here does not run: three helpers in
+`tests/zpages.rs` that only Linux's tests call were dead code there. It
+type-checks without a cross toolchain, once
+`rustup target add aarch64-apple-darwin`: `cargo clippy --release
+--all-targets --target aarch64-apple-darwin -- -D warnings`.
 
 The tests leave their stores under the temp directory, one per test and
 process (`supdb-next-<name>-<pid>`), so a day of test runs on one box is
