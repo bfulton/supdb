@@ -9014,6 +9014,22 @@ regime's and not the mechanism's; and resident is not mapped --
 `mincore` answers the first and `/proc/self/pagemap` the second, and a
 test of the second reads the second.
 
+**A mutant's binary, kept by the restore that undid the mutant.** A
+mutant runner copies a source file aside, writes the mutant, runs the
+tests and moves the copy back. The copy carries the time it was made,
+which is before the mutant's build, and cargo calls a unit fresh by its
+sources' times: the tests after the last mutant ran that mutant's
+binary, with the tree clean and the commit made. A gate's test group
+went red on two of the form's unit tests at an assertion the last mutant
+had been written to trip, the same two that had killed it ten minutes
+before, over the source as committed; the two alone were red three runs
+of three, and an edit of the assertion's words made them green. The
+runner sets the restored file's time to now. The rule: whatever puts a
+source back puts it back as a change, at a time after the last build;
+and a red met behind a mutant pass is read against the pass's last
+mutant before it is read as the tree's -- the tests that failed were its
+kills, and the pass's own log named them.
+
 **A count held under one compiler, read under the next.** The count
 against upstream's head, taken at a merge on the toolchain the runners
 had moved to (1.100, from the container's 1.97), read four probes over
