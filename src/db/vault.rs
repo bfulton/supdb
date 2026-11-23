@@ -633,6 +633,7 @@ pub(crate) struct Counts {
     /// Segments whose envelope a manifest's own call wrote, no seal, run
     /// or merge having written it where it finished the file.
     pub(crate) late: AtomicU64,
+    pub(crate) expected: AtomicU64,
 }
 
 /// A store under a cipher: its directory, its key, and its files.
@@ -656,6 +657,9 @@ pub(crate) struct Vault {
     /// Whether that cache follows the platform's room, which the stores
     /// of a process that do share (`PlatformRoom`).
     follows: bool,
+    /// What the store's writers have said is coming, which the room its
+    /// cache follows has as well (`Coming`).
+    coming: Arc<Coming>,
     pub(crate) counts: Counts,
 }
 
@@ -692,15 +696,86 @@ impl Drop for Mapped {
     }
 }
 
+/// What a store's writers have said is on its way into its memory files
+/// (`expect`): a file and the bytes it is to hold. A file being written is
+/// memory the kernel cannot take back and no count of the cache has, and
+/// the platform's reading sees it a page at a time, as it is written: a
+/// merge's output, sixty megabytes in a fifth of a second, landed on a
+/// cache steered to within its margin of the limit, with the merge's own
+/// arrays and the output's form file beside it, and the store was killed
+/// before two readings of its room had passed. Said where the file is
+/// opened, the bytes still to come are out of the room from then, and the
+/// cache gives way ahead of them.
+#[derive(Default)]
+struct Coming {
+    files: Mutex<Vec<(std::sync::Weak<File>, u64)>>,
+    /// Every byte announced, ever: what the cache gives way to at once,
+    /// between two readings of its room (`Room::claimed`).
+    said: AtomicU64,
+}
+
+impl Coming {
+    fn expect(&self, mem: &Arc<File>, bytes: u64) {
+        lock(&self.files).push((Arc::downgrade(mem), bytes));
+        self.said.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// The bytes still to come: what each file was said to be, less what
+    /// it holds, over the files still in a writer's hands. A file with
+    /// its envelope is the cache's own, and one removed is nobody's:
+    /// either way its memory file has gone from the table, and with the
+    /// last writer's handle from here.
+    fn bytes(&self) -> u64 {
+        let mut c = lock(&self.files);
+        c.retain(|(f, _)| f.strong_count() > 0);
+        c.iter()
+            .filter_map(|(f, want)| {
+                let len = f.upgrade()?.metadata().ok()?.len();
+                Some(want.saturating_sub(len))
+            })
+            .sum()
+    }
+}
+
 /// The room a store's cache follows where its cipher names no size: the
-/// platform's, or the one a test handed it (`StoreCipher::cache_room`).
-struct PlatformRoom(Option<Arc<RoomFn>>);
+/// platform's, or the one a test handed it (`StoreCipher::cache_room`),
+/// less what the store's writers have said is coming (`Coming`).
+struct PlatformRoom(Option<Arc<RoomFn>>, Arc<Coming>);
 
 impl super::pager::Room for PlatformRoom {
     fn read(&self, held: u64) -> Option<u64> {
-        if let Some(room) = &self.0 {
-            return room(held);
+        let room = match &self.0 {
+            Some(room) => room(held)?,
+            None => PlatformRoom::platform(held)?,
+        };
+        // Less what this store's own writers have said is coming: each
+        // store's off its own share.
+        Some(room.saturating_sub(self.1.bytes()))
+    }
+    fn floor(&self) -> u64 {
+        match self.0 {
+            Some(_) => 0,
+            None => ROOM_FLOOR,
         }
+    }
+    /// What the cache gives way to at once: this store's announcements,
+    /// and beside the platform's room the buffers the process has mapped
+    /// -- none of those with a room a test gives, since they are every
+    /// store's in the process, and beside a room that is one store's alone
+    /// they took its budget to nothing whenever another test mapped a
+    /// table.
+    fn claimed(&self) -> u64 {
+        let said = self.1.said.load(Ordering::Relaxed);
+        match self.0 {
+            Some(_) => said,
+            None => super::zfile::buffers_mapped().saturating_add(said),
+        }
+    }
+}
+
+impl PlatformRoom {
+    /// The platform's room for a store that holds `held`.
+    fn platform(held: u64) -> Option<u64> {
         // The platform's room is the process's, and every store of the
         // process that follows it takes an equal share of what is left of
         // it: what the store holds, and its share of how much more the
@@ -724,22 +799,6 @@ impl super::pager::Room for PlatformRoom {
             trace_room(slack);
         }
         Some(u64::try_from(room).unwrap_or(0))
-    }
-    fn floor(&self) -> u64 {
-        match self.0 {
-            Some(_) => 0,
-            None => ROOM_FLOOR,
-        }
-    }
-    /// The platform's claim with the platform's room, and none with a
-    /// room a test gives: the buffers counted are the process's, every
-    /// store's in it, and beside a room that is one store's alone they
-    /// took its budget to nothing whenever another test mapped a table.
-    fn claimed(&self) -> u64 {
-        match self.0 {
-            Some(_) => 0,
-            None => super::zfile::buffers_mapped(),
-        }
     }
 }
 
@@ -822,10 +881,11 @@ fn trace_room(slack: i64) {
         let (wn, wb) = sum(false);
         let (vn, vb) = sum(true);
         line.push_str(&format!(
-            " | writing {wn} {} viewed {vn} {} mapped {}",
+            " | writing {wn} {} viewed {vn} {} mapped {} coming {}",
             mib(wb),
             mib(vb),
-            lock(&v.mapped).len()
+            lock(&v.mapped).len(),
+            mib(v.coming.bytes())
         ));
         seen.sort_by_key(|s| std::cmp::Reverse(s.2));
         for (_, name, len, viewed) in seen.iter().take(6) {
@@ -975,6 +1035,7 @@ impl Write for Ahead {
 
 impl Vault {
     fn new(real: &Path, store: Box<DynAead>, cipher: &StoreCipher) -> Result<Vault> {
+        let coming = Arc::new(Coming::default());
         Ok(Vault {
             real: real.to_path_buf(),
             decoy: real.join(MARKER),
@@ -989,11 +1050,15 @@ impl Vault {
                 let pager = match (cipher.cache, cipher.half) {
                     (Some(bytes), _) => Pager::new(bytes),
                     (None, true) => Pager::new(default_cache()),
-                    (None, false) => Pager::following(Box::new(PlatformRoom(cipher.room.clone()))),
+                    (None, false) => Pager::following(Box::new(PlatformRoom(
+                        cipher.room.clone(),
+                        coming.clone(),
+                    ))),
                 };
                 pager.keep_apart(cipher.apart);
                 pager
             },
+            coming,
             counts: Counts::default(),
         })
     }
@@ -1121,6 +1186,15 @@ impl Vault {
             },
         );
         Ok(handle)
+    }
+
+    /// `name`, a file just made, is to hold `bytes` (`Coming`).
+    fn expect(&self, name: &str, bytes: u64) {
+        let mem = lock(&self.files).get(name).and_then(|e| e.mem.clone());
+        if let Some(mem) = mem {
+            self.coming.expect(&mem, bytes);
+            Counts::add(&self.counts.expected, bytes);
+        }
     }
 
     /// The envelope `disk` names, opened under its file's key.
@@ -1955,6 +2029,7 @@ impl Counts {
             left: get(&self.left),
             swept: get(&self.swept),
             late: get(&self.late),
+            expected: get(&self.expected),
             cache,
         }
     }
@@ -1985,6 +2060,10 @@ pub struct CipherCounts {
     /// it, and this counts the ones that were not -- a piece renamed
     /// while its writer was on its way to seal it.
     pub late: u64,
+    /// The bytes the store's writers announced before they wrote them: a
+    /// merge's outputs, each said where it was opened, for the cache to
+    /// give way ahead of.
+    pub expected: u64,
     /// The cache the store reads through: what it may hold and holds, and
     /// what it has decrypted and given back.
     pub cache: PagerCounts,
@@ -2109,6 +2188,18 @@ pub(crate) fn create(path: impl AsRef<Path>) -> Result<File> {
         None => File::create(path),
         Some((v, name)) if passes(&name) => File::create(v.real.join(name)),
         Some((v, name)) => v.make(&name),
+    }
+}
+
+/// The file at `path`, just made, is to hold `bytes`: said to the store's
+/// cache where the store is under a cipher, which gives way ahead of a
+/// file it would otherwise learn of a page at a time (`Coming`). Nothing
+/// for a plain store, whose files are the page cache's.
+pub(crate) fn expect(path: impl AsRef<Path>, bytes: u64) {
+    if let Some((v, name)) = locate(path.as_ref()) {
+        if !passes(&name) {
+            v.expect(&name, bytes);
+        }
     }
 }
 
@@ -2987,10 +3078,25 @@ pub(crate) mod tests {
         }
     }
 
-    /// The store at `real` gated: its next segment envelope waits.
-    pub(crate) fn gate_persists(real: &Path) {
+    /// The store at `real` gated: its next segment envelope waits, until
+    /// the guard goes. A guard and not a call to open it, so that a test
+    /// that fails with a writer at the gate lets the writer go as it
+    /// unwinds: the first version opened the gate by hand after its
+    /// assertions, and a failed assertion left a merge standing there and
+    /// the store's drop waiting for it, a test that hung where it should
+    /// have failed.
+    pub(crate) fn gate_persists(real: &Path) -> PersistGate {
         *PERSIST_GATE.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((real.to_path_buf(), false, false));
+        PersistGate(real.to_path_buf())
+    }
+
+    pub(crate) struct PersistGate(PathBuf);
+
+    impl Drop for PersistGate {
+        fn drop(&mut self) {
+            open_persist_gate(&self.0);
+        }
     }
 
     /// Whether an envelope of the gated store is waiting at the gate.
@@ -3003,7 +3109,7 @@ pub(crate) mod tests {
     }
 
     /// The gate opened for good: the waiting envelope and every one after.
-    pub(crate) fn open_persist_gate(real: &Path) {
+    fn open_persist_gate(real: &Path) {
         let mut g = PERSIST_GATE.lock().unwrap_or_else(|e| e.into_inner());
         if g.as_ref().is_some_and(|g| g.0 == real) {
             *g = None;
@@ -3205,6 +3311,105 @@ pub(crate) mod tests {
         // And with the last name, it goes.
         remove_file(d.join("zpg-1.zpg")).unwrap();
         assert_eq!(forms(&real), 0);
+    }
+
+    /// A room gives way at once to what its store announces: the bytes
+    /// said, every one ever, are what the cache's budget is lowered by
+    /// between two readings (`Room::claimed`), a test's room carrying its
+    /// own store's alone and the platform's the buffers the process has
+    /// mapped as well; and a reading is less what is still to come.
+    #[test]
+    fn a_room_carries_what_its_store_announces() {
+        use super::super::pager::Room;
+        let coming = Arc::new(Coming::default());
+        let mem = Arc::new(memfile().unwrap());
+        let fixed: Arc<RoomFn> = Arc::new(|_| Some(1 << 30));
+        let room = PlatformRoom(Some(fixed), coming.clone());
+        assert_eq!(room.claimed(), 0);
+        assert_eq!(room.read(0), Some(1 << 30));
+        coming.expect(&mem, 5 << 20);
+        assert_eq!(room.claimed(), 5 << 20);
+        assert_eq!(room.read(0), Some((1 << 30) - (5 << 20)));
+        // Beside the platform's room: over a room with nothing announced
+        // by exactly what was, read where the buffers stood still.
+        let (plat, bare) = (
+            PlatformRoom(None, coming.clone()),
+            PlatformRoom(None, Arc::default()),
+        );
+        let over = loop {
+            let before = bare.claimed();
+            let with = plat.claimed();
+            if bare.claimed() == before {
+                break with - before;
+            }
+        };
+        assert_eq!(over, 5 << 20);
+        // The file gone, nothing is coming, and what was said was said.
+        drop(mem);
+        assert_eq!(coming.bytes(), 0);
+        assert_eq!(room.read(0), Some(1 << 30));
+        assert_eq!(room.claimed(), 5 << 20);
+    }
+
+    /// A file a writer announces (`expect`) is out of the room its store's
+    /// cache follows from where it is announced: the bytes it is still to
+    /// hold, which shrink as it is written and are nothing once it holds
+    /// what was said, has its envelope, or is gone. The room here is a
+    /// test's, one figure, and the cache holds nothing, so its budget is
+    /// the room less what is coming.
+    #[test]
+    fn a_file_announced_is_out_of_the_room_until_it_is_written() {
+        const MIB: u64 = 1 << 20;
+        let real = dir("coming");
+        let room = 64 * MIB;
+        let held = Vault::create(&real, &cipher(3).cache_room(move |_| Some(room))).unwrap();
+        let (v, d) = (held.vault().clone(), held.dir());
+        let budget = |want: u64, what: &str| {
+            let t = std::time::Instant::now();
+            while v.pager().budget() != want {
+                assert!(
+                    t.elapsed() < std::time::Duration::from_secs(10),
+                    "{what}: a budget of {} for {want}, {} coming",
+                    v.pager().budget(),
+                    v.coming.bytes()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        budget(room, "the room alone");
+        // Written in two parts, the second past what was said.
+        let mut f = create(d.join("compact-1.tmp")).unwrap();
+        expect(d.join("compact-1.tmp"), 20 * MIB);
+        assert_eq!(v.counts().expected, 20 * MIB);
+        budget(room - 20 * MIB, "less the file announced");
+        f.write_all(&vec![7u8; 8 << 20]).unwrap();
+        budget(room - 12 * MIB, "less what of it is still to come");
+        f.write_all(&vec![7u8; 16 << 20]).unwrap();
+        budget(room, "a file written past what was said");
+        drop(f);
+        remove_file(d.join("compact-1.tmp")).unwrap();
+        // Removed short of what was said.
+        let f = create(d.join("compact-2.tmp")).unwrap();
+        expect(d.join("compact-2.tmp"), 10 * MIB);
+        budget(room - 10 * MIB, "less a second file");
+        drop(f);
+        remove_file(d.join("compact-2.tmp")).unwrap();
+        budget(room, "a file removed");
+        // Given its envelope short of what was said: the cache's own from
+        // there, counted in what it holds.
+        put(&d.join("par-3-key.sup"), &vec![9u8; 2 << 20]);
+        expect(d.join("par-3-key.sup"), 9 * MIB);
+        budget(room - 7 * MIB, "less a third");
+        persist(&d, || vec![("par-3-key.sup".to_string(), None)]).unwrap();
+        budget(room, "a file with its envelope");
+        // A name the store does not hold, and a file that passes to the
+        // directory under its own name, are announced to nobody.
+        expect(d.join("compact-9.tmp"), 5 * MIB);
+        expect(d.join("manifest"), 5 * MIB);
+        assert_eq!(v.counts().expected, 39 * MIB);
+        assert_eq!(v.coming.bytes(), 0);
+        drop(held);
+        let _ = std::fs::remove_dir_all(&real);
     }
 
     /// A kept file is written, read, mapped, renamed, linked and removed

@@ -19204,6 +19204,24 @@ struct Piece {
     hi: Option<Vec<u8>>,
     name: String,
     tmp: PathBuf,
+    /// What the piece is to hold, as near as its merge can say before it
+    /// writes it: its share of the inputs' bytes by its ranks, for a store
+    /// under a cipher to give way ahead of (`vault::expect`). Nothing for
+    /// a plain store.
+    bytes: u64,
+}
+
+/// What a merge's inputs hold together, where the store is under a cipher
+/// and the merge announces its outputs (`Piece::bytes`); nothing asked of
+/// a plain store's.
+fn announced_inputs(dir: &Path, inputs: &[String]) -> u64 {
+    if vault::under(dir).is_none() {
+        return 0;
+    }
+    inputs
+        .iter()
+        .filter_map(|n| vault::len(dir.join(n)).ok())
+        .sum()
 }
 
 /// Pass two of a merge: keys arrive in rank order and go into the piece
@@ -19292,6 +19310,9 @@ impl<R: MergeRest> Emitter<'_, R> {
                 PieceWriter::create(tmp, self.opts, self.sync_every, self.inline_max)
                     .map_err(|e| err(&format!("compact create: {e}")))?,
             );
+            if p.bytes > 0 {
+                vault::expect(tmp, p.bytes);
+            }
         }
         Ok(to)
     }
@@ -19473,6 +19494,7 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<Vec<String>> {
 
     let mut pieces = Vec::with_capacity(slices.len());
     let mut empties: Vec<String> = Vec::new();
+    let of_inputs = announced_inputs(&dir, &inputs);
     for (pi, &(from, to)) in slices.iter().enumerate() {
         let id = first_id + pi as u64;
         let (lo, hi) = given[pi].clone();
@@ -19504,6 +19526,7 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<Vec<String>> {
             hi,
             name,
             tmp,
+            bytes: (u128::from(of_inputs) * (to - from) as u128 / total.max(1) as u128) as u64,
         });
     }
 
@@ -19817,6 +19840,7 @@ fn tier_walk<R: MergeRest>(plan: TierPlan, rest: R) -> Result<Vec<String>> {
             hi,
             name,
             tmp,
+            bytes: announced_inputs(&dir, &inputs),
         }],
         pi: 0,
         r: 0,
@@ -61440,7 +61464,7 @@ mod cipher_looks {
         wait("a merge over the pieces and the seals' landings", &|| {
             db.in_flight() == (false, true)
         });
-        vault::tests::gate_persists(&dir);
+        let gate = vault::tests::gate_persists(&dir);
         db.hold_merge_start(false);
         wait("the merge's first output at its envelope", &|| {
             vault::tests::persist_gate_reached(&dir)
@@ -61477,9 +61501,17 @@ mod cipher_looks {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let (gave, c) = (gave(), pager.counts());
+        // The output at the gate was announced where it was opened
+        // (`vault::expect`): its share of the inputs' bytes, a partition's
+        // worth, which the file holds by now.
+        let said = db.cipher_counts().unwrap().expected;
         let parked = vault::tests::persist_gate_reached(&dir);
-        vault::tests::open_persist_gate(&dir);
+        drop(gate);
         assert!(parked, "the merge left its gate");
+        assert!(
+            (128 << 10..=1 << 20).contains(&said),
+            "a merge's first output announced as {said} bytes"
+        );
         assert!(
             gave >= read - 2 * cache,
             "the cache gave back {gave} bytes of the {read} a handle read while a merge wrote \
@@ -61490,6 +61522,13 @@ mod cipher_looks {
         // before the write is asked for again, and the store reads as it
         // was written.
         db.settle().unwrap();
+        // Every output of the merges was announced, at about what the
+        // store holds: twenty megabytes of records and their index.
+        let said = db.cipher_counts().unwrap().expected;
+        assert!(
+            (16 << 20..=64 << 20).contains(&said),
+            "the merges' outputs announced as {said} bytes"
+        );
         let mut at = 0u32;
         let mut from = key(0);
         while at < n {

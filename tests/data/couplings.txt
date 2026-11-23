@@ -113,6 +113,7 @@ src/db.rs	Db::z_attach	vault::companion	code	1	S6	vault::companion
 src/db.rs	Db::z_on_disk	vault::companion	code	1	S6	vault::companion
 src/db.rs	Direct::<item>	run logged	code	1	S4 (conditional; else stays)	Direct.logged
 src/db.rs	Emitter::<item>	MergeRest/NoRest	code	2	R4	the emitter takes the walk's rest, for the wait an output's envelope is (MergeRest::unheld)
+src/db.rs	Emitter::enter	vault::expect	code	1	S6	a merge's output said to the store's cache where it is opened (vault::expect); the door's call, nothing for a plain store
 src/db.rs	Emitter::leave	vault::persist_one	code	1	S6	vault::persist_one
 src/db.rs	Encryption::<item>	cipher	code	2	stays	the public mode enum
 src/db.rs	Encryption::<item>	crypt	code	1	stays	the public mode enum
@@ -208,11 +209,11 @@ src/db.rs	a_look_rests_in_a_handles_outermost_read_and_in_no_read_inside_it	attn
 src/db.rs	a_look_rests_in_a_handles_outermost_read_and_in_no_read_inside_it	cipher	test	3	stays	cipher_looks: where a look inside a read rests, by the slot's page at depth one and at depth two
 src/db.rs	a_look_rests_in_a_handles_outermost_read_and_in_no_read_inside_it	crypt	test	2	stays	cipher_looks: where a look inside a read rests, by the slot's page at depth one and at depth two
 src/db.rs	a_look_rests_in_a_handles_outermost_read_and_in_no_read_inside_it	vault::tests	test	1	stays	cipher_looks: where a look inside a read rests, by the slot's page at depth one and at depth two
-src/db.rs	a_merge_writing_an_envelope_holds_nothing_of_the_cache	cipher	test	4	stays	cipher_looks: a merge parked at its output's envelope, the cache read through its own handle while it stands there
+src/db.rs	a_merge_writing_an_envelope_holds_nothing_of_the_cache	cipher	test	6	stays	cipher_looks: a merge parked at its output's envelope, the cache read through its own handle while it stands there
 src/db.rs	a_merge_writing_an_envelope_holds_nothing_of_the_cache	crypt	test	2	stays	cipher_looks: a merge parked at its output's envelope, the cache read through its own handle while it stands there
 src/db.rs	a_merge_writing_an_envelope_holds_nothing_of_the_cache	envelope	test	4	stays	cipher_looks: a merge parked at its output's envelope, the cache read through its own handle while it stands there
 src/db.rs	a_merge_writing_an_envelope_holds_nothing_of_the_cache	pager	test	7	stays	cipher_looks: a merge parked at its output's envelope, the cache read through its own handle while it stands there
-src/db.rs	a_merge_writing_an_envelope_holds_nothing_of_the_cache	vault::tests	test	5	stays	cipher_looks: a merge parked at its output's envelope, the cache read through its own handle while it stands there
+src/db.rs	a_merge_writing_an_envelope_holds_nothing_of_the_cache	vault::tests	test	4	stays	cipher_looks: a merge parked at its output's envelope, the cache read through its own handle while it stands there
 src/db.rs	a_reads_rest_waits_for_a_cache_another_reader_holds	cipher	test	4	stays	cipher_looks: a read's rest counted as a breath where another reader holds the cache
 src/db.rs	a_reads_rest_waits_for_a_cache_another_reader_holds	crypt	test	2	stays	cipher_looks: a read's rest counted as a breath where another reader holds the cache
 src/db.rs	a_reads_rest_waits_for_a_cache_another_reader_holds	pager	test	5	stays	cipher_looks: a read's rest counted as a breath where another reader holds the cache
@@ -221,6 +222,7 @@ src/db.rs	a_reads_settle_ahead_of_its_walk_gives_the_cache_back	cipher	test	4	st
 src/db.rs	a_reads_settle_ahead_of_its_walk_gives_the_cache_back	crypt	test	2	stays	cipher_looks: one scan's settle of a backlog, the cache's peak read through its own handle
 src/db.rs	a_reads_settle_ahead_of_its_walk_gives_the_cache_back	pager	test	9	stays	cipher_looks: one scan's settle of a backlog, the cache's peak read through its own handle
 src/db.rs	a_reads_settle_ahead_of_its_walk_gives_the_cache_back	vault::tests	test	1	stays	cipher_looks: one scan's settle of a backlog, the cache's peak read through its own handle
+src/db.rs	announced_inputs	vault::under	code	1	S6	whether the merge's store is under a cipher, asked once a merge before its inputs' lengths are
 src/db.rs	check_options	cipher	code	2	stays	an unpinned writer is refused under a cipher, by the mode and in the refusal's words: the rule for an unpinned writer, with the store's cache as the party that frees
 src/db.rs	check_options	crypt	code	2	stays	the same refusal reads the mode out of the options (opts.encryption, Encryption::Cipher)
 src/db.rs	cipher_controller	cipher	code	2	S5	controller off under a cipher
@@ -288,6 +290,8 @@ src/db/vault.rs	Vault::sweep	kind of form file	code	2	S6	envelope naming by kind
 src/db/vault.rs	a_changed_envelope_is_refused	file name prefix/suffix	test	28	S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
 src/db/vault.rs	a_changed_envelope_is_refused	kind of form file	test	1	S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
 src/db/vault.rs	a_changed_envelope_is_refused	seg/ord/form ident	test	14	S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
+src/db/vault.rs	a_file_announced_is_out_of_the_room_until_it_is_written	file name prefix/suffix	test	13	stays	the door's test of a file announced: the names a merge and a manifest give their files
+src/db/vault.rs	a_file_announced_is_out_of_the_room_until_it_is_written	manifest	test	1	stays	the door's test of a file announced: the names a merge and a manifest give their files
 src/db/vault.rs	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	file name prefix/suffix	test	26	S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
 src/db/vault.rs	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	kind of form file	test	1	S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
 src/db/vault.rs	a_form_file_written_again_leaves_the_view_over_the_first_reading_the_first	seg/ord/form ident	test	2	S6	vault unit tests by stored name; rewritten or die with the envelope arm (design.md 10, test table)
@@ -319,6 +323,7 @@ src/db/vault.rs	PlatformRoom::claimed	form module path	code	1	G3	zfile::buffers_
 src/db/vault.rs	PlatformRoom::claimed	path out of the encryption modules	code	1	G3	super::zfile::buffers_mapped: as the line above
 src/db/vault.rs	disk_parse	kind of form file	code	5	S6	envelope naming by kind, the persist and companion cascade, the sweep rule
 src/db/vault.rs	exists	passes(	code	1	S6	the log, the spare and the manifest pass to the directory by name
+src/db/vault.rs	expect	passes(	code	1	stays	the door: a name that passes to the directory is announced to nobody
 src/db/vault.rs	hard_link	passes(	code	3	S6	the log, the spare and the manifest pass to the directory by name
 src/db/vault.rs	is_file	passes(	code	1	S6	the log, the spare and the manifest pass to the directory by name
 src/db/vault.rs	kept	passes(	code	1	S6	the log, the spare and the manifest pass to the directory by name
