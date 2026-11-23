@@ -107,12 +107,22 @@ The lint group type-checks the engine for the macOS target too (`cargo
 clippy --release --all-targets --target aarch64-apple-darwin -- -D
 warnings`, which needs the target's rust-std and no cross toolchain):
 three helpers in `tests/zpages.rs` that only Linux's tests call were dead
-code there, and no lint on Linux could say so. The suite has
-no such leg: its comparators compile C in their build scripts, the first
-of them to run (`lz4-sys`'s) hands the host's `cc` `-arch arm64`, and a
-Linux `cc` refuses it, so the suite's would take a cross compiler. What
-is left for the hosted runners alone to show is timing on their hardware and the tests run, not only
-type-checked, on ARM and macOS.
+code there, and no lint on Linux could say so. The suite has no such
+leg: its comparators compile C in their build scripts, the first of them
+to run (`lz4-sys`'s) hands the host's `cc` `-arch arm64`, and a Linux
+`cc` refuses it, so the suite's would take a cross compiler. What is left
+for the hosted runners alone to show is timing on their hardware and the
+tests run, not only type-checked, on ARM and macOS.
+
+A hosted job's log cannot be read while the job runs, so one that is
+overdue is read by its groups once it ends before it is called anything:
+the macOS leg ran fifty-five minutes where it had run twenty-five, was
+taken for a hang in the fork tests that were new to it, and had spent the
+excess in RocksDB's two builds, the same sources on the same image at
+three times their time, with the tests a quarter slower beside them. A
+runner is that much slower some days. Every job of `ci` has a
+`timeout-minutes` a few times its longest run, since a job without one
+runs to GitHub's six hours, as `cross-arm` did once inside its `apt-get`.
 
 The tests leave their stores under the temp directory, one per test and
 process (`supdb-next-<name>-<pid>`), so a day of test runs on one box is
@@ -205,8 +215,18 @@ wrapped, passed every check green, and panicked in the first debug build
 that reached it; the tests now run under `profile.checked`, the release
 profile with both on, and the wasm module and the suite's binaries keep the
 release profile because the checks cost code size there and time in a
-measurement. A second definition of "the checks" is how the next one of
-those starts.
+measurement. The workflows' cache step named the suite's target directory
+as `bench -> bench/target`, which `rust-cache` reads as bench/bench/target,
+a path inside the workspace: no such directory, so for as long as the
+suite has been in CI the step restored nothing, saved a cache with none of
+the suite's build in it, and reported both done, while every job built
+RocksDB from its sources twice, half of a test leg's time. It was found
+in the step's own log, which prints the directories it caches, on the
+day somebody read one. `bench/scripts/workflows.sh` holds a cache's
+target to a workspace's own now, and the libclang directory is in the
+cache's key, since a cached clang-sys output naming a directory since
+gone is the failure `scripts/deps.sh` cleans and a workflow does not. A
+second definition of "the checks" is how the next one of those starts.
 
 A change to an engine default lands only once `sh scripts/check.sh`
 has passed with the new default in place.

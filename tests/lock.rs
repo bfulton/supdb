@@ -47,18 +47,23 @@ fn a_store_closed_while_a_forked_child_holds_its_lock_opens_again() {
 
     let (mut forked_r, forked_w) = std::io::pipe().unwrap();
     let (go_r, mut go_w) = std::io::pipe().unwrap();
-    let (forked_fd, go_fd) = (forked_w.as_raw_fd(), go_r.as_raw_fd());
+    let (forked_fd, go_fd, go_w_fd) = (forked_w.as_raw_fd(), go_r.as_raw_fd(), go_w.as_raw_fd());
     // This binary run on no test: a process that starts and ends.
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.args(["--exact", "no test has this name"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // SAFETY: the closure runs in the forked child and makes two system
-    // calls on descriptors the fork copied, a write and a read, each
-    // async-signal-safe; it allocates nothing and takes no lock.
+    // SAFETY: the closure runs in the forked child and makes three system
+    // calls on descriptors the fork copied, a close, a write and a read,
+    // each async-signal-safe; it allocates nothing and takes no lock.
     unsafe {
         cmd.pre_exec(move || {
+            // The child's own copy of the end it is let go through, closed:
+            // with it open the read below never sees that end closed, and a
+            // test that failed before letting the child go left it waiting
+            // for good, a process for every such run.
+            libc::close(go_w_fd);
             let mut b = [1u8];
             libc::write(forked_fd, b.as_ptr().cast(), 1);
             while libc::read(go_fd, b.as_mut_ptr().cast(), 1) < 0

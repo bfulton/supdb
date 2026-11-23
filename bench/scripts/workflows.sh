@@ -30,6 +30,14 @@
 #      same way on the day somebody needed one. A Linux job names its image,
 #      and moving to a newer one is a change made in the workflow, with the
 #      scripts it needs. A comment may say the label; nothing else may.
+#   4. A cache's target directory is where cargo builds. `rust-cache` takes
+#      `workspace -> target` with the target a path inside the workspace,
+#      and every workflow said `bench -> bench/target`, which names
+#      bench/bench/target: no such directory, so the step restored nothing,
+#      saved a cache with none of the suite's build in it, and reported
+#      both as done, while RocksDB was built from its sources twice in every
+#      job. A target is held to sitting directly in a directory with a
+#      Cargo.toml, which is what a workspace's own target directory does.
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -39,6 +47,7 @@ trap 'rm -rf "$work"' EXIT
 
 status=0
 total=0
+maps=0
 for wf in ../.github/workflows/*.yml; do
   rm -rf "$work"/blocks
   mkdir -p "$work"/blocks
@@ -92,6 +101,23 @@ for wf in ../.github/workflows/*.yml; do
     fi
   done < "$work"/index
 
+  # The fourth rule: each `workspace -> target` line names a directory
+  # whose parent is a cargo workspace's root.
+  grep -n -E -- '^[[:space:]]*(workspaces:[[:space:]]*)?[^[:space:]#]+ -> [^[:space:]]+[[:space:]]*$' "$wf" > "$work"/maps || true
+  while IFS= read -r m; do
+    line=${m%%:*}
+    pair=$(printf '%s\n' "${m#*:}" | sed 's/^[[:space:]]*\(workspaces:\)\{0,1\}[[:space:]]*//')
+    ws=$(printf '%s\n' "${pair%% -> *}" | sed 's/[[:space:]]*$//')
+    target=$(printf '%s\n' "${pair#* -> }" | sed 's/[[:space:]]*$//')
+    parent=$(dirname "../$ws/$target")
+    maps=$((maps + 1))
+    if [ ! -f "$parent/Cargo.toml" ]; then
+      echo "$wf:$line: the cache's target is $ws/$target, and $ws/$(dirname "$target") is no workspace's root;" >&2
+      echo "  the target of \`$ws -> $target\` is a path inside $ws" >&2
+      status=1
+    fi
+  done < "$work"/maps
+
   # The third rule, over the file's lines that are not comments.
   if floating=$(grep -n 'ubuntu-latest' "$wf" | grep -v '^[0-9]*:[[:space:]]*#'); then
     echo "$wf: a job runs on ubuntu-latest; name the image (ubuntu-24.04)" >&2
@@ -103,4 +129,8 @@ done
 if [ "$status" -ne 0 ]; then
   exit 1
 fi
-echo "workflows: every run block parses, none interpolates ($total blocks); every Linux job names its image"
+if [ "$maps" -eq 0 ]; then
+  echo "workflows: no \`workspace -> target\` line was found to check; the fourth rule ran over nothing" >&2
+  exit 1
+fi
+echo "workflows: every run block parses, none interpolates ($total blocks); every Linux job names its image; every cache's target is a workspace's ($maps)"
