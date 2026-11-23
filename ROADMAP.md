@@ -753,8 +753,18 @@ until the run is its own log). What it loses:
   scan of a hundred where RocksDB reads the same bytes from the device
   with none and are not yet taken apart, then the controller on under a
   cipher, all under
-  "Engine". Done when `supdb-cipher` reads and scans ahead of
-  `rocksdb-tuned-enc` in both sittings.
+  "Engine". With the cache following the room (`a166b4c`, the same
+  command, three reps): the forced stride form reads at 2.7x and 3.1x of
+  encrypted RocksDB and scans at 0.59-0.75x of it; the store as shipped,
+  in the raw form, which the room cannot hold, still reads at 0.75-0.78x
+  and scans at 0.35-0.39x, though ahead of itself at the half in both
+  orders (`pair.sh supdb-cipher supdb-cipherhalf 5000000 --bound 671088640
+  --passes read,read-threaded,scan,scan-threaded,mixes --reps 2 --ops-div
+  10`: reads 1.11-1.25x, the threaded scans 1.6-1.7x, the six mixes
+  1.2-1.9x, the one-thread scan level). So what the cell wants now is
+  the store under a cipher taking the stride form of itself, which is
+  the controller on there, and the scans. Done when `supdb-cipher` reads
+  and scans ahead of `rocksdb-tuned-enc` in both sittings.
 - [ ] **The ordered load.** In the row the durable ordered load is behind
   both encrypted comparators at ten thousand keys (0.66x, resolved) and
   lower and unresolved at the three rungs above (0.83-0.94x); the

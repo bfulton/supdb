@@ -2269,7 +2269,16 @@ and the page cache at nothing; following the room it gets through the
 rewrite and its pass, and is killed at the pass's end with 359 MiB of
 its own and 270 in files being written, which is the writer piling up
 behind landings a cipher makes slower and no budget's to fix
-(`ROADMAP.md`). The rules: what a store counts itself holding is not
+(`ROADMAP.md`). Priced at `a166b4c` at that store and bound: against the
+half in both orders (`pair.sh supdb-cipher supdb-cipherhalf 5000000
+--bound 671088640 --passes read,read-threaded,scan,scan-threaded,mixes
+--reps 2 --ops-div 10`) the store as shipped reads 1.11-1.25x, scans
+1.6-1.7x on two and three threads and level on one, and runs the six
+mixes at 1.2-1.9x; against encrypted RocksDB (`... supdb-cipherzstride
+rocksdb-tuned-enc ... --passes read,scan --reps 3`) the stride form
+forced reads 2.7x and 3.1x and scans 0.59-0.75x, and the store as
+shipped, whose raw form the room cannot hold, still 0.75-0.78x and
+0.35-0.39x. The rules: what a store counts itself holding is not
 what the platform charges it, so a budget drawn near a limit is steered
 by the platform's reading of the thing limited; a process killed under
 a bound is read from the group's memory by kind, at ten milliseconds, up
