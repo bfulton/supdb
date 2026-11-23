@@ -6021,10 +6021,10 @@ pub struct Options {
     /// made away from the raw gate alone, and only while scans are near.
     /// `supdb-headsmapped` reads the mapping throughout.
     pub heads_owned: bool,
-    /// EXPERIMENT: whether the heads are copied (`heads_owned`) at the
-    /// controller's census while the block cache holds the raw records'
-    /// place (`scan_cache_copies_fit`), whatever the controller's model
-    /// says of the raw form. At the census a copy is made while the model
+    /// Whether the heads are copied (`heads_owned`) at the controller's
+    /// census while the block cache holds the raw records' place
+    /// (`scan_cache_copies_fit`), whatever the controller's model says of
+    /// the raw form. At the census a copy is made while the model
     /// says the raw form fits and none while it says it does not, since a
     /// misfit there is the stretch between a crossing and the install its
     /// reads' faults buy (`Maint::z_heads_look`). A grant of the records'
@@ -6044,8 +6044,10 @@ pub struct Options {
     /// such index, nine to thirty-six a pass and a hundred and ninety in
     /// the slowest of twelve paired, a hundred and fifty to a hundred and
     /// eighty in the two slow reps of three a row took. Under this option
-    /// a grant standing reads as the store left raw. Off: the model
-    /// alone.
+    /// a grant standing reads as the store left raw: the scanning thread
+    /// took a fault at most in twenty-four passes paired, where the
+    /// model's word alone left passes of sixty-three to a hundred and
+    /// ninety. On; `supdb-headsmodel` is the model's word alone.
     #[doc(hidden)]
     pub heads_owned_beside_copies: bool,
     /// The hot-raw policy's skew bar read against the room
@@ -7134,7 +7136,7 @@ impl Default for Options {
             settle_table_ahead: 12,
             heads_look_ms: 0,
             heads_owned: true,
-            heads_owned_beside_copies: false,
+            heads_owned_beside_copies: true,
             zpages_hot_skew_room: false,
             zpages_hot_room_margin_pct: 0,
             zpages_walk_owns_decodes: false,

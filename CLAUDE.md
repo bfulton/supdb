@@ -6150,6 +6150,75 @@ regime's and not the mechanism's; and resident is not mapped --
 `mincore` answers the first and `/proc/self/pagemap` the second, and a
 test of the second reads the second.
 
+**A reservation in a budget's arithmetic, read as pages the kernel would
+keep; and a model that took its tenant's bytes for a misfit.** The first
+bounded row taken with the cache in the raw records' place read the cell
+it was built for, the pass after the lag sweep's full rewrite at three
+million keys under 1 GiB, at 0.52x of LMDB: two reps of three at 57-70 ms
+where the pairings of the fix had read 14-27 in eleven reps of twelve.
+The row said what kind of thing it was before any trace. Its per-rep
+quantities put 146-183 major faults on the scanning thread in the slow
+reps and one in the fast, at 220-340 µs a read behind 50-60 MB that other
+threads read; and the arm that advises nothing (`supdb-noadvice`), whose
+every fault brings a readahead window, took none in three reps of three
+and read the cell at 1.6-2x. Traced in the row's shape (`perf record -e
+major-faults -c 1 -d` over `bench ab --arms supdb,supdb --size 3000000
+--bound 1073741824 --reps 3 --ops-div 10` under `SUPDB_LAG_MARK` and
+`SUPDB_ZPAGES_TRACE`, at `b2d0dfc`), every major fault of the scanning
+thread in six passes but one was `Reader::scan_seek` on the ordered index
+of one partition a merge had landed a second and a half before the pass,
+and the upkeep thread took twenty to seventy on each index landed in the
+burst, a second or so after its landing. The place the cache is granted
+is the budget "less each unserved partition's ordered index, which a
+scan's start seeks whatever holds its blocks": bytes left for the index
+in an arithmetic, and no page held by it. What holds them is the heads'
+copy (`Options::heads_owned`), and at the census a copy is made only
+while the controller's model says the raw form fits, a misfit there being
+the stretch before a purchase. The model's budget is the limit less the
+process's anonymous memory: the grant put 265 MB of copies into that
+memory, the records they stand in for stayed in the populations the
+budget is held against, and the model read 0.39-0.43 faults a read from
+the third second of the burst on, under a budget of 262-276 MB against
+records of 372, of a store nothing would be bought for, the grant
+standing only far from the point reads whose faults buy a form. It is the
+double count of the room that reserved the thing its tenant replaces,
+fixed there for the cache's own budget and left standing in the next
+reader of the same budget. Every partition landed after the grant kept
+its heads in a mapping, eight megabytes of them at the pass. A grant
+standing reads as the store left raw now
+(`Options::heads_owned_beside_copies`; `supdb-headsmodel` is the model's
+word alone). Paired at `15178d9` with the arm as it was then named
+(`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh supdb-headscopies supdb
+3000000 --bound 1073741824 --reps 8 --ops-div 10 --passes load,lag`, and
+the row's whole order at four reps): seven copies a sweep made for the
+grant alone, the scanning thread's major faults one at most in
+twenty-four passes where the model's word left passes of 63 to 190 in
+four of thirty-six, and the lag-only pass 16.5 ms against 22 at the
+median;
+under 1.25 GiB at that rung and at ten million keys under either bound no
+grant is made and the count is nothing. The pairings had not shown the
+row's two reps in three: the heavy shape was a rep in eight to twelve of
+theirs, at a hundred microseconds a fault where the row's took two to
+three hundred, and which index's pages the kernel takes just before a
+pass is the host's. The same trace named two costs of the burst that are
+not fixed: the upkeep thread took 8,000-46,000 major faults a burst
+building copies from raw records the cache had let go (`Blob::scan_at_in`
+under `BuildCtx`, its copies, `prefetch_ranks`), the burst 6.9 s at the
+first count and 9.3 at the second, and the controller's sampler
+2,800-4,300 more, sampling at every landing for a purchase no read was
+near to make. The rules: bytes a budget's arithmetic leaves for a
+structure are a claim about the kernel, held to the structure's
+residency at the pass that reads it (`scripts/resident.py`) or made true
+by holding the pages; when a double count is found in one reader of a
+quantity, every other reader of it is read the same day -- the model,
+the builds' line and the form's room all read the budget the cache had
+just been found charged twice in; a row's per-rep quantities and its
+sibling arms are read before a trace is cut, since the arm that differs
+in one option and does not show the shape names the mechanism's kind;
+and a fix read in pairings is the row's only once the row's own harness
+has taken it, the rate of a shape the kernel's timing makes being the
+sitting's.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

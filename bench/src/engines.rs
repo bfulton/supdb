@@ -964,7 +964,8 @@ pub struct Supdb {
     /// The partitions' heads copied at the controller's census while the
     /// block cache holds the raw records' place, whatever the model says
     /// of the raw form (`Options::heads_owned_beside_copies`), `None` for
-    /// the engine's default. `supdb-headscopies` copies them.
+    /// the engine's default. `supdb-headsmodel` copies them by the model's
+    /// word alone.
     headscopies: Option<bool>,
     /// The block cache granted the raw records' place where its own budget
     /// would bind and no point read is near
@@ -2320,7 +2321,8 @@ struct Policy {
     /// The partitions' heads copied at the controller's census while the
     /// block cache holds the raw records' place, whatever the model says
     /// of the raw form (`Options::heads_owned_beside_copies`), `None` for
-    /// the engine's default. `supdb-headscopies` copies them.
+    /// the engine's default. `supdb-headsmodel` copies them by the model's
+    /// word alone.
     headscopies: Option<bool>,
     /// The block cache granted the raw records' place where its own budget
     /// would bind and no point read is near
@@ -7690,16 +7692,16 @@ impl Supdb {
     }
 
     /// `supdb` with the partitions' heads copied at the controller's census
-    /// while the block cache holds the raw records' place
-    /// (`Options::heads_owned_beside_copies`): a partition a merge lands
-    /// after the grant has its heads in memory at the scans after the
-    /// burst, where the default reads them through a mapping the burst's
-    /// writes pushed out.
-    pub fn create_headscopies(path: &Path) -> Res<Supdb> {
+    /// by the model's word alone (`Options::heads_owned_beside_copies`
+    /// off): a partition a merge lands after the block cache was granted
+    /// the raw records' place keeps its heads in a mapping, which the
+    /// burst's writes push out and the scans after it read back a page a
+    /// fault.
+    pub fn create_headsmodel(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                headscopies: Some(true),
+                headscopies: Some(false),
                 ..Policy::default()
             },
         )
@@ -12135,8 +12137,8 @@ impl Engine for Supdb {
         if self.rewarmrawmaps == Some(false) {
             return "supdb-rewarmrawnomap";
         }
-        if self.headscopies == Some(true) {
-            return "supdb-headscopies";
+        if self.headscopies == Some(false) {
+            return "supdb-headsmodel";
         }
         match (
             self.copiesfit == Some(false),
@@ -13851,7 +13853,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-norewarmraw"
         | "supdb-zrewarmrawscans"
         | "supdb-rewarmrawnomap"
-        | "supdb-headscopies"
+        | "supdb-headsmodel"
         | "supdb-nocopiesfit"
         | "supdb-chaincovered"
         | "supdb-nocopiesfitchain"
@@ -15791,7 +15793,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-norewarmraw" => supdb_arm(Supdb::create_norewarmraw, dir)?,
         "supdb-zrewarmrawscans" => supdb_arm(Supdb::create_zrewarmrawscans, dir)?,
         "supdb-rewarmrawnomap" => supdb_arm(Supdb::create_rewarmrawnomap, dir)?,
-        "supdb-headscopies" => supdb_arm(Supdb::create_headscopies, dir)?,
+        "supdb-headsmodel" => supdb_arm(Supdb::create_headsmodel, dir)?,
         "supdb-nocopiesfit" => supdb_arm(Supdb::create_nocopiesfit, dir)?,
         "supdb-chaincovered" => supdb_arm(Supdb::create_chaincovered, dir)?,
         "supdb-nocopiesfitchain" => supdb_arm(Supdb::create_nocopiesfitchain, dir)?,
@@ -17797,11 +17799,11 @@ mod tests {
                 );
             }
             {
-                let z = Supdb::create_headscopies(&dir("headscopies")).unwrap();
-                assert_eq!(z.name(), "supdb-headscopies");
+                let z = Supdb::create_headsmodel(&dir("headsmodel")).unwrap();
+                assert_eq!(z.name(), "supdb-headsmodel");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(o.heads_owned_beside_copies && !b.heads_owned_beside_copies);
+                assert!(!o.heads_owned_beside_copies && b.heads_owned_beside_copies);
                 assert!(o.heads_owned && o.scan_cache_copies_fit);
             }
             {
