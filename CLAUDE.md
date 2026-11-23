@@ -6044,7 +6044,25 @@ the budget binding and the chain resuming with it. Together, at
 the comparators in both orders, the burst 1.22-1.24x of RocksDB's and
 the pass 1.08-1.13x of LMDB's, ahead in five pairs of eight, what is
 left of it the first scan's wait for the upkeep thread's pass in
-flight and a merge the idle plan starts beside it. The rules: a budget
+flight and a merge the idle plan starts beside it. Under 1.25 GiB the
+budget never binds and the chain's option alone acts, the burst
+1.21-1.26x in four sittings of four and the pass after it 1.17-1.22x;
+at ten million keys under either bound neither acts, the copies fitting
+no place and the writer's forms given up before the first burst
+(`cache_copies_grants` 0, the merges landed the same), and in memory
+neither can. The first version of the chain's option then failed its
+own control: it asked what a scan needs of the pieces and nothing of a
+point read, which probes every piece over its key whatever the forms
+hold, and four of the suite's six mixes are point reads and writes with
+no scan between them, so in the row's own store it left the mixes'
+pieces to the seals' plans. The pairings without the lag sweep, six reps
+an order (`--passes
+load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled`),
+read five and six cells behind in both orders, D, E and F at the smaller
+bound and the read-only C at the larger, with every count the option
+keeps the same in both arms; a store with a point read near is
+uncovered now (`Maint::forms_uncovered`, at `e57fc5c`), and the same
+pairings read three behind and two ahead, and one and four. The rules: a budget
 for one tenant is drawn against what the others need given what this
 one holds, since a cache that replaces pages is charged for them twice
 by a room that reserves them; a limit that stops work is read for
@@ -6054,7 +6072,10 @@ the reading feeds before it is taken for the mechanism, and the arm
 that removes the threshold is paired before anything is built; and a
 cell is read beside every other cell of its pass before one is paid for
 with the other, the burst here a tie nobody had looked at because the
-pass beside it was lost twenty-five times over. Beside it, three things
+pass beside it was lost twenty-five times over; and an option written
+for what one kind of read needs is asked what every other kind needs of
+the same structure before its control is run, since the control found
+it only as a lean no count explained. Beside it, three things
 the mutants found, twenty-five of them: the model's `check` makes point
 reads, which a test of a store far from them cannot use
 (`check_scans`); a budget held to a place under the budget before its
@@ -6064,8 +6085,19 @@ mutant, the patches' shed (`patch_block`) making it already, and came
 out. And the floor under every pairing here: the default paired with
 itself at this rung (`pair.sh supdb supdb` in the same shape, at
 `558606d`) read twelve cells of twenty-nine apart in one direction in
-both orders, by up to 1.39x, so no verdict above rests on a rate that a count beside it
-does not carry.
+both orders, by up to 1.39x, so no verdict above rests on a rate that a
+count beside it does not carry. It was needed twice more the same day:
+the clean store's one-thread scan pass read a tenth to three tenths
+behind for the options in four sittings of four, a pass they cannot
+reach, and the default against itself read the same pass 1.13x and
+1.27x apart for the arm listed second, thirteen pairs of sixteen
+(`pair.sh supdb supdb 3000000 --bound 1342177280 --passes
+load,read,read-threaded,scan --ops-div 10 --reps 8`); and the one- and
+ten-percent bursts at ten million keys leaned a twentieth against in
+thirteen readings of sixteen, a hundred and a thousand fdatasyncs each,
+with the upkeep thread idle and the pieces and the segment work's time
+the same in both arms. A lean that agrees across sittings is read
+against the same cell under identical arms before it is read at all.
 
 ## Standing limitations
 
