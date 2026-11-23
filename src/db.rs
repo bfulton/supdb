@@ -20278,7 +20278,8 @@ pub(super) fn mapped_share(bytes: &[u8]) -> Option<f64> {
     f.seek(SeekFrom::Start((start * 8) as u64)).ok()?;
     let mut buf = vec![0u8; (end - start) * 8];
     f.read_exact(&mut buf).ok()?;
-    let present = buf.chunks_exact(8).filter(|c| c[7] & 0x80 != 0).count();
+    let (words, _) = buf.as_chunks::<8>();
+    let present = words.iter().filter(|c| c[7] & 0x80 != 0).count();
     Some(present as f64 / (end - start) as f64)
 }
 

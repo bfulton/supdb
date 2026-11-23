@@ -28,6 +28,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: libclang, for bindgen
         run: sh bench/scripts/libclang.sh
+      # FASTER is a comparator too, and not a crate: the script fetches its
+      # sources at the pinned commit and installs the libraries they link.
+      # It does nothing off Linux x86-64, where there is no `faster` arm.
+      - name: FASTER, for the `faster` arm
+        run: sh bench/scripts/faster.sh
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: bench -> bench/target

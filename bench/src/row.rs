@@ -21,6 +21,11 @@ pub enum Guarantee {
     Durable,
     /// Written to the OS; the OS gets to it.
     Buffered,
+    /// In the process's memory when the call returns, and on the device at
+    /// the engine's next checkpoint: a process that is killed loses what it
+    /// wrote since. FASTER's, which has no stronger promise to configure
+    /// and so no place in the two groups above.
+    Memory,
 }
 
 /// The machine, as read. Nothing here is classified.
