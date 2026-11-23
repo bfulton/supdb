@@ -314,7 +314,9 @@ engine, interleaved in one process where the comparison allows:
   actually lives on a barrier-bound device is fewer barriers per record:
   larger batches, or a bounded-loss sync policy. **Built and measured:**
   `SyncPolicy::EveryN` syncs every Nth commit and writes the WAL on every
-  one. Every-16 ingests **1.634x** every-batch (p=0.0022, commit phase
+  one (`SyncPolicy::Explicit`, which writes nothing at a commit and
+  promises nothing until a `sync`, came later and for another reason:
+  "A log held in the process", below). Every-16 ingests **1.634x** every-batch (p=0.0022, commit phase
   0.84s to 0.28s, device bytes unchanged), every-64 adds only 1.087x over
   that, and a torn unsynced tail is lost whole and never in part. That is
   the same 1.6x sharding would buy, for a policy bit instead of N writers;
@@ -455,6 +457,93 @@ holds, a hundred nanoseconds of the kernel's a put in the profile of the A
 mix where FASTER makes no call, and first-touches fresh arena pages where
 FASTER rewrites a record in place. Those are the structures to change
 next, and none of them is a path to shorten.
+
+#### A log held in the process
+
+FASTER promises nothing of a write until a checkpoint, and the buffered
+arm it was read beside promises more: its every commit is in the kernel.
+`SyncPolicy::Explicit` is the engine's policy of FASTER's promise. A
+commit's frames stay in the buffer they were built in, behind the batch
+being staged, and reach the log's file at a `sync`, which syncs them, at a
+rotation, past a cap (`Options::wal_hold_bytes`) or where the store is
+dropped; and the frames whose records a seal has made durable meanwhile
+are dropped and never written, which leaves the file with a gap below
+every later open's start, where a replay checks nothing. `CLAUDE.md` has
+the three rules that hold it to the crash discipline, and `tests/runlog.rs`
+the states: a held commit in no file, a covered gap reopened over, a seal
+between its phases with its segment torn, a run begun over held frames,
+and twelve rounds of the kill oracle. `supdb-held` is `supdb-ingest` under
+it, in FASTER's row (`bench/DESIGN.md`).
+
+What it was worth was priced before it was built, by a scratch build
+whose log write returned at once: an update of `bench/examples/point_ops.rs`
+at a hundred thousand keys read 311 ns with the write and 242 without, and
+the half-and-half phase 269 and 236, beside FASTER's 166 and 142. The arm
+reads what the scratch build did, 313 and 242 (`point_ops supdb-held 100000
+4 zipf` beside `supdb-ingest` and `faster`, alternated five times, the
+medians of the last three reps).
+
+In the suite it reads level. Paired with the buffered arm at ten thousand,
+a hundred thousand and three hundred thousand keys (`bench/scripts/pair.sh
+supdb-held supdb-ingest SIZE --reps 6 --passes
+load,read,read-threaded,mixes,mixes-scrambled`, at `1090033`), no cell is
+further from level than 0.84x or 1.13x in either sitting, and the ones
+that lean furthest in both are the read passes on two and three threads,
+1.03-1.13x at the two larger rungs, over a drained store the policy cannot
+reach: the pairing resolves an eighth, and nothing in it is the policy's.
+Timed by kind (`SUPDB_MIX_KINDS=1 bench ab --arms
+supdb-held,supdb-ingest --size 100000 --reps 4 --passes
+load,read,mixes,mixes-scrambled`), a commit of a hundred updates is 22 to
+30 µs under either policy and 8 to 10% shorter held, in the A and F mixes,
+which is two or three percent of the mix: the probe's phase is updates
+alone over a scrambled Zipfian, and a mix's commits are a third of its
+time beside its gets and the harness. The cap moves nothing either: a
+mebibyte against the engine's sixty-four read level in both sittings at
+both rungs (`pair.sh supdb-held1m supdb-held`).
+
+The first shape of the buffer was a vector left to grow, and it copied
+everything it held each time it doubled: with eight megabytes and more
+held by the scrambled A mix, that mix's commits read 63 µs against 49 and
+the arm
+0.82x and 0.84x of the buffered one in both orders, in a pairing whose
+other cells were level. The buffer is reserved whole at the cap now, which
+is address space until it is written into, and a batch dropped with much
+still held behind it stays where it lay (`Wal::set_hold`,
+`Wal::drop_covered`); the same pairing reads that mix 0.99x twice.
+
+Beside FASTER under one guarantee (`pair.sh supdb-held faster SIZE`, the
+same passes; the held arm's rate over FASTER's, both sittings):
+
+| | 10,000 | 100,000 | 300,000 |
+|---|---|---|---|
+| ordered load | 31, 25 | 5.0, 6.6 | 4.4, 4.7 |
+| shuffled load | 12, 16 | 2.2, 2.3 | 1.9, 1.7 |
+| read pass | 1.46, 1.40 | 1.08, 1.25 | 1.01, 1.09 |
+| on two and three threads | 0.81-1.32 | 1.01-1.17 | 1.03-1.16 |
+| C | 1.32, 1.03 | 1.09, 0.80 | 0.96, 0.96 |
+| B, A, D | 0.74-1.14 | 0.76-0.92 | 0.75-0.84 |
+| F | 0.54, 0.87 | 0.65, 0.71 | 0.60, 0.60 |
+| scrambled B and C | 0.74-1.17 | 0.75-0.84 | 0.75-0.81 |
+| scrambled A, D and F | 0.51-0.96 | 0.55-0.68 | 0.52-0.65 |
+
+The smallest rung is a pass of a millisecond or two and its sittings
+disagree by more than the cells differ. From a hundred thousand keys the
+loads and the read passes are ours, the read-only mix is level or a
+twentieth behind, and every mix that writes is FASTER's by what it was
+beside the buffered arm. The
+update bursts of the lag sweep are the widest of it: at three hundred
+thousand keys (`pair.sh supdb-held faster 300000 --reps 4 --passes
+load,lag`, and the same with `supdb-ingest`) the held arm's bursts run at
+0.41-0.42x, 0.34-0.36x and 0.24-0.25x of FASTER's at one, ten and a
+hundred percent of the store, and the buffered arm's at 0.34-0.39x,
+0.32-0.33x and 0.23-0.25x.
+
+So the log's write was never what separated the two, and matching the
+guarantee moves the comparison by a few percent of a commit. What is left
+is what the paragraph above this section names. The bursts, where an
+update of ours costs a microsecond and a half against the quarter to half
+of one a mix's does, have not been taken apart beside FASTER's yet, and
+are the next thing to count.
 
 ### The seal wait
 
