@@ -728,8 +728,15 @@ impl super::pager::Room for PlatformRoom {
             None => ROOM_FLOOR,
         }
     }
+    /// The platform's claim with the platform's room, and none with a
+    /// room a test gives: the buffers counted are the process's, every
+    /// store's in it, and beside a room that is one store's alone they
+    /// took its budget to nothing whenever another test mapped a table.
     fn claimed(&self) -> u64 {
-        super::zfile::buffers_mapped()
+        match self.0 {
+            Some(_) => 0,
+            None => super::zfile::buffers_mapped(),
+        }
     }
 }
 
