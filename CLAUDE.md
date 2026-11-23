@@ -1351,8 +1351,9 @@ were not in it: a scan through a form was 370 instructions over the main
 line while this paragraph said nothing was, until the form itself went
 under a cipher and was counted (the compact form, below).
 `sh scripts/cost.sh BASE` is the count made one command: the probes (the
-point read and the scan, each in the raw form and through the compact
-form, the scan past `SCAN_REST` in both, the durable and the buffered
+point read and the scan, each in the raw form, through the compact
+form's blocks and through its stride file, the scan past `SCAN_REST` in
+each, the durable and the buffered
 ordered load whole and their commits under a toggle, a writer's round, a
 merge, the segment work on the writer's thread, a segment written through
 `SegmentWriter` and `Blob::scan_at` through the public API) built at BASE

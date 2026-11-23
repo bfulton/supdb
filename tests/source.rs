@@ -4668,9 +4668,12 @@ fn the_cost_job_names_its_probes_as_the_test_reads_them() {
     for p in [
         "read",
         "read_z",
+        "read_s",
         "scan",
         "scan_long",
         "scan_z",
+        "scan_s",
+        "scan_long_s",
         "seal",
         "scan_at",
         "merge",

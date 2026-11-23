@@ -42,7 +42,7 @@ HEAD_TREE=${COST_HEAD:-$ROOT}
 HT=${COST_HEAD_TARGET:-$HEAD_TREE/bench/target}
 W=${COST_DIR:-${TMPDIR:-/tmp}/supdb-cost-$$}
 TB=${COST_BASE_TARGET:-$W/tb}
-PROBES=${*:-read read_z scan scan_long scan_z scan_long_z load_durable load_buffered commit_durable commit_buffered work merge land seal scan_at}
+PROBES=${*:-read read_z read_s scan scan_long scan_z scan_long_z scan_s scan_long_s load_durable load_buffered commit_durable commit_buffered work merge land seal scan_at}
 WHOLE=0
 [ $# -ne 0 ] || WHOLE=1
 GET='<supdb_bench::engines::Supdb as supdb_bench::engines::Engine>::get'
@@ -52,10 +52,13 @@ probe() { # name -> "ops|toggle|binary|args"; the toggle one argument, spaces an
     case $1 in
     read) echo "200000|$GET|read_only|supdb 100000 1 n-none" ;;
     read_z) echo "200000|$GET|read_only|supdb-nocachezpages 100000 1 n-none" ;;
+    read_s) echo "200000|$GET|read_only|supdb-nocachezstride 100000 1 n-none" ;;
     scan) echo "1000|$SCAN|lag0_probe|supdb 100000 1" ;;
     scan_long) echo "1000|$SCAN|lag0_probe|supdb 100000 1 2000" ;;
     scan_z) echo "1000|$SCAN|lag0_probe|supdb-nocachezpages 100000 1" ;;
     scan_long_z) echo "1000|$SCAN|lag0_probe|supdb-nocachezpages 100000 1 2000" ;;
+    scan_s) echo "1000|$SCAN|lag0_probe|supdb-nocachezstride 100000 1" ;;
+    scan_long_s) echo "1000|$SCAN|lag0_probe|supdb-nocachezstride 100000 1 2000" ;;
     load_durable) echo "100000||load_only|supdb 100000 1" ;;
     load_buffered) echo "100000||load_only|supdb-ingest 100000 1" ;;
     commit_durable) echo "100000|$WB|load_only|supdb 100000 1" ;;
@@ -99,7 +102,7 @@ fi
 # probe that counts through them runs.
 SUITE=""
 for p in $PROBES; do
-    case $p in read | read_z | scan | scan_long | scan_z | scan_long_z | commit_durable | commit_buffered) SUITE=1 ;; esac
+    case $p in read | read_z | read_s | scan | scan_long | scan_z | scan_long_z | scan_s | scan_long_s | commit_durable | commit_buffered) SUITE=1 ;; esac
 done
 if [ -n "$SUITE" ] && ! python3 - "$W/base/bench/src/engines.rs" "$HEAD_TREE/bench/src/engines.rs" <<'PY'
 import sys

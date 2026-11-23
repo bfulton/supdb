@@ -42,8 +42,8 @@ Reader::zpage_heat	-	a test seam or a counter: reads or sets the store's bookkee
 Reader::splice_bounds	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::zpage_counts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::ord_point_reads	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
-Reader::read_all	read,read_z,work
-Reader::scan	scan,scan_long,scan_z,scan_long_z,work,land
+Reader::read_all	read,read_z,read_s,work
+Reader::scan	scan,scan_long,scan_z,scan_long_z,scan_s,scan_long_s,work,land
 Reader::forms_trims	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::forms_trim_looks	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::forms_trim_us	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation

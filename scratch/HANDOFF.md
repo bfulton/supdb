@@ -113,11 +113,14 @@ what the bounded cells are lost by. Read on 23 Nov, not started.
   form's search a page of numbers after the samples in the heap. The writer takes the
   records' images through the trait the block form's builder already reads kept files by
   (`PieceImages`), under a hold with a rest a page (`zfile::Walked`).
-- **Before any of it: the plain stride path into the count.** `scripts/cost.sh` has no probe
-  that reads or scans through a stride file (its `_z` probes force the block form), so "a
-  store in the clear pays nothing" does not cover the path this unit touches. Add probes over
-  a forced stride arm (point read, scan, long scan), red-input them, and count the unit
-  against the commit before it by function.
+- **Done first: the plain stride path is in the count.** `scripts/cost.sh` had no probe that
+  reads or scans through a stride file (its `_z` probes force the block form), so "a store in
+  the clear pays nothing" did not cover the path this unit touches. `read_s`, `scan_s` and
+  `scan_long_s` run the probes over `supdb-nocachezstride`: 1,013 instructions a point read
+  through `ZFile::stride_read_all`, 22,900 a scan of a hundred through
+  `ZCursor::stride_walk`, level to the instruction against themselves. Count the unit against
+  the commit before it with them (`sh scripts/cost.sh <that commit> read_s scan_s
+  scan_long_s`, then the whole list).
 - **The wall.** A form module names nothing of the encryption (`tests/data/couplings.txt`):
   the reader asks its mapping through `Bytes`, as the block form's `page_bytes` does.
 - **Tests owed.** The stride tests of `tests/zpages.rs` under a cipher beside the clear; the

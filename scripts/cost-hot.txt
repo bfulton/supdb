@@ -28,7 +28,7 @@
 # The lines name the per-key, per-entry, per-block and per-step functions
 # so that the run says which of them no probe reached.
 #
-# The point read (read, read_z, work).
+# The point read (read, read_z, read_s, work).
 supdb::db::Reader::read_all
 supdb::db::Reader::read_all_in
 supdb::db::Reader::part_read_z
@@ -66,8 +66,9 @@ supdb::blob::Blob::scan_at_in
 supdb::blob::Blob::scan_whole
 supdb::blob::Blob::seek
 supdb::flatindex::FlatIndex::search
-# The compact form's read and walk (read_z, scan_z): the form file, its
-# pages and groups, and the decoder, whole.
+# The compact form's read and walk (read_z, scan_z, and the stride form's
+# read_s, scan_s): the form file, its pages and groups, the stride body
+# and the decoder, whole.
 supdb::db::zfile::
 supdb::db::zpages::
 supdb::db::zlz4::
