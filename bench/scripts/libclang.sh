@@ -62,11 +62,18 @@ case "$(uname -s)" in
     if command -v apt-get >/dev/null && { [ -z "$root" ] || command -v sudo >/dev/null; }; then
       $root apt-get update -qq >/dev/null
       $root apt-get install -y -qq --no-install-recommends libclang-dev >/dev/null
-      d=$(ls -d /usr/lib/llvm-*/lib 2>/dev/null | sort -V | tail -1)
-      if [ -n "$d" ] && ls "$d"/libclang.so >/dev/null 2>&1; then
-        emit LIBCLANG_PATH "$d"
-        exit 0
-      fi
+      # The package is the distribution's default LLVM, which need not be
+      # the highest an image carries. Ubuntu 26.04's runner image has LLVM
+      # 20, 21 and 22 and the package is 21's: the first version of this
+      # looked in the highest directory alone, found llvm-22 with only its
+      # versioned file, and failed with libclang.so one directory down.
+      # Every directory is asked, the highest first.
+      for d in $(ls -d /usr/lib/llvm-*/lib 2>/dev/null | sort -rV); do
+        if ls "$d"/libclang.so >/dev/null 2>&1; then
+          emit LIBCLANG_PATH "$d"
+          exit 0
+        fi
+      done
     fi
     echo "no libclang.so found; point LIBCLANG_PATH at a directory holding one" >&2
     exit 1
