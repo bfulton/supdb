@@ -6102,6 +6102,54 @@ with the upkeep thread idle and the pieces and the segment work's time
 the same in both arms. A lean that agrees across sittings is read
 against the same cell under identical arms before it is read at all.
 
+**A page asked back into the cache and left out of the page tables, and
+three cells sunk by one rep's start.** The first row taken at the
+defaults above read the fixed cell at 0.97x of LMDB at three million
+keys under 1 GiB, and beside it the passes after the one- and
+ten-percent bursts at 0.96x and 0.89x where the row before had them at
+1.47x and 1.26x. Read by rep and not by median, it was one thing: in two
+reps of three the sweep began on a store whose raw files the load's last
+merges had written and nothing had read, the first pages a reclaim takes
+-- the clean store's pass at two million entries a second where the
+third rep read thirty-two -- and the sparse walks after the small bursts
+and the conversions of the full rewrite paid for the same cold pages,
+the burst a sixth slower with them. It had been one rep in three in the
+row before, five reps of twenty-eight and six of forty-eight in that
+morning's pairings, and thirteen of sixteen and fourteen of fourteen in
+the evening's, the engine's shape the same. The settle's ask for the raw
+files (`Options::zpages_rewarm_raw`), built for that pass and left off,
+took the cold start away in sixteen reps of sixteen
+(`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh supdb-zrewarmraw supdb
+3000000 --bound 1073741824 --reps 8 --ops-div 10 --passes load,lag`, at
+`f686686`) and left its own passes at 17-41 ms where a store never
+pushed out runs 10-14: the pass took 1,400-2,260 minor faults in three
+thousand scans against 621, the pass's time over the reps a line through
+them at about eight microseconds a fault, since a page the cache drops
+leaves the page tables with it and comes back resident and unmapped.
+Mapping at a release had been built once and taken out on a test's
+count, seven faults over ninety-one pages in memory, where a fault
+maps sixteen pages and costs a tenth of that; under the bound the count
+was two thousand a pass and the price the regime's. A settle that asked
+maps what came back (`Options::zpages_rewarm_raw_maps`,
+`MADV_POPULATE_READ` over each segment's records and ordered index where
+nine tenths are resident, 14 ms for twelve segments): the clean store's
+pass 12-15 ms at the median with 658 faults and no cold rep in
+twenty-seven, 1.6x the ask alone (`pair.sh supdb-zrewarmrawmaps
+supdb-zrewarmraw`, at `4c0e886`), the passes after the bursts level or
+ahead, and the full rewrite's burst 7.8 s against 9.9 beside a default
+that started cold in every rep of that sitting. At ten million keys the
+ask finds no room under either bound and maps nothing. Both are the
+engine's now; `supdb-norewarmraw` asks for nothing and
+`supdb-rewarmrawnomap` asks and maps nothing. The rules: a row's cell is
+read by its reps before its median, since one start can sink every cell
+of a sweep in the reps it strikes and a median of three flips on one of
+them; a shape whose rate is the host's is counted in the sitting at
+hand, never carried from the morning's; a lever refuted by a count is
+counted again in the regime in front of it, the fault's price being the
+regime's and not the mechanism's; and resident is not mapped --
+`mincore` answers the first and `/proc/self/pagemap` the second, and a
+test of the second reads the second.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

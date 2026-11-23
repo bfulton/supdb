@@ -951,7 +951,7 @@ pub struct Supdb {
     rewarmtrim: bool,
     /// The rewarm asking for the raw form's files as well
     /// (`Options::zpages_rewarm_raw`), `None` for the engine's default.
-    /// `supdb-zrewarmraw`.
+    /// `supdb-norewarmraw` asks for nothing.
     rewarmraw: Option<bool>,
     /// With it, the raw form's files asked for where scans come back too
     /// (`Options::zpages_rewarm_raw_scans`), `None` for the engine's
@@ -959,7 +959,7 @@ pub struct Supdb {
     rewarmrawscans: Option<bool>,
     /// With `rewarmraw`, what the settle's ask brought back mapped into the
     /// page tables (`Options::zpages_rewarm_raw_maps`), `None` for the
-    /// engine's default. `supdb-zrewarmrawmaps`.
+    /// engine's default. `supdb-rewarmrawnomap` asks and maps nothing.
     rewarmrawmaps: Option<bool>,
     /// The block cache granted the raw records' place where its own budget
     /// would bind and no point read is near
@@ -2302,7 +2302,7 @@ struct Policy {
     rewarmtrim: bool,
     /// The rewarm asking for the raw form's files as well
     /// (`Options::zpages_rewarm_raw`), `None` for the engine's default.
-    /// `supdb-zrewarmraw`.
+    /// `supdb-norewarmraw` asks for nothing.
     rewarmraw: Option<bool>,
     /// With it, the raw form's files asked for where scans come back too
     /// (`Options::zpages_rewarm_raw_scans`), `None` for the engine's
@@ -2310,7 +2310,7 @@ struct Policy {
     rewarmrawscans: Option<bool>,
     /// With `rewarmraw`, what the settle's ask brought back mapped into the
     /// page tables (`Options::zpages_rewarm_raw_maps`), `None` for the
-    /// engine's default. `supdb-zrewarmrawmaps`.
+    /// engine's default. `supdb-rewarmrawnomap` asks and maps nothing.
     rewarmrawmaps: Option<bool>,
     /// The block cache granted the raw records' place where its own budget
     /// would bind and no point read is near
@@ -7553,14 +7553,15 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with the rewarm asking for the raw form's files as well
-    /// (`Options::zpages_rewarm_raw`): the partitions the raw form serves,
-    /// the pieces and their ordered indexes, within the group's room.
-    pub fn create_zrewarmraw(path: &Path) -> Res<Supdb> {
+    /// `supdb` with no settle asking for the raw form's files
+    /// (`Options::zpages_rewarm_raw` off), the shape before: the partitions
+    /// the raw form serves, the pieces and their ordered indexes are read
+    /// back by whichever scan first wants them.
+    pub fn create_norewarmraw(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                rewarmraw: Some(true),
+                rewarmraw: Some(false),
                 ..Policy::default()
             },
         )
@@ -7664,14 +7665,14 @@ impl Supdb {
         )
     }
 
-    /// `supdb-zrewarmraw` with what the settle's ask brought back mapped
-    /// into the page tables (`Options::zpages_rewarm_raw_maps`).
-    pub fn create_zrewarmrawmaps(path: &Path) -> Res<Supdb> {
+    /// `supdb` with the settle's ask for the raw form's files and nothing
+    /// of them mapped at its return (`Options::zpages_rewarm_raw_maps`
+    /// off): resident and unmapped, each first touch a fault.
+    pub fn create_rewarmrawnomap(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                rewarmraw: Some(true),
-                rewarmrawmaps: Some(true),
+                rewarmrawmaps: Some(false),
                 ..Policy::default()
             },
         )
@@ -12100,8 +12101,8 @@ impl Engine for Supdb {
         if self.rewarmrawscans == Some(true) {
             return "supdb-zrewarmrawscans";
         }
-        if self.rewarmrawmaps == Some(true) {
-            return "supdb-zrewarmrawmaps";
+        if self.rewarmrawmaps == Some(false) {
+            return "supdb-rewarmrawnomap";
         }
         match (
             self.copiesfit == Some(false),
@@ -12115,8 +12116,8 @@ impl Engine for Supdb {
         if self.formsoffbuilt == Some(true) {
             return "supdb-formsoffbuilt";
         }
-        if self.rewarmraw == Some(true) {
-            return "supdb-zrewarmraw";
+        if self.rewarmraw == Some(false) {
+            return "supdb-norewarmraw";
         }
         if self.formson {
             return "supdb-formson";
@@ -13812,9 +13813,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zbacknow"
         | "supdb-norewarm"
         | "supdb-rewarmtrim"
-        | "supdb-zrewarmraw"
+        | "supdb-norewarmraw"
         | "supdb-zrewarmrawscans"
-        | "supdb-zrewarmrawmaps"
+        | "supdb-rewarmrawnomap"
         | "supdb-nocopiesfit"
         | "supdb-chaincovered"
         | "supdb-nocopiesfitchain"
@@ -15751,9 +15752,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zbacknow" => supdb_arm(Supdb::create_zbacknow, dir)?,
         "supdb-norewarm" => supdb_arm(Supdb::create_norewarm, dir)?,
         "supdb-rewarmtrim" => supdb_arm(Supdb::create_rewarmtrim, dir)?,
-        "supdb-zrewarmraw" => supdb_arm(Supdb::create_zrewarmraw, dir)?,
+        "supdb-norewarmraw" => supdb_arm(Supdb::create_norewarmraw, dir)?,
         "supdb-zrewarmrawscans" => supdb_arm(Supdb::create_zrewarmrawscans, dir)?,
-        "supdb-zrewarmrawmaps" => supdb_arm(Supdb::create_zrewarmrawmaps, dir)?,
+        "supdb-rewarmrawnomap" => supdb_arm(Supdb::create_rewarmrawnomap, dir)?,
         "supdb-nocopiesfit" => supdb_arm(Supdb::create_nocopiesfit, dir)?,
         "supdb-chaincovered" => supdb_arm(Supdb::create_chaincovered, dir)?,
         "supdb-nocopiesfitchain" => supdb_arm(Supdb::create_nocopiesfitchain, dir)?,
@@ -17744,12 +17745,19 @@ mod tests {
                 assert!(o.zpages_rewarm_trims && !b.zpages_rewarm_trims);
             }
             {
-                let z = Supdb::create_zrewarmraw(&dir("zrewarmraw")).unwrap();
-                assert_eq!(z.name(), "supdb-zrewarmraw");
+                let z = Supdb::create_norewarmraw(&dir("norewarmraw")).unwrap();
+                assert_eq!(z.name(), "supdb-norewarmraw");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_rewarm_raw && !b.zpages_rewarm_raw);
+                assert!(!o.zpages_rewarm_raw && b.zpages_rewarm_raw);
                 assert!(!o.zpages_rewarm_raw_scans && !b.zpages_rewarm_raw_scans);
+                let z = Supdb::create_rewarmrawnomap(&dir("rewarmrawnomap")).unwrap();
+                assert_eq!(z.name(), "supdb-rewarmrawnomap");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(
+                    o.zpages_rewarm_raw && !o.zpages_rewarm_raw_maps && b.zpages_rewarm_raw_maps
+                );
             }
             {
                 let z = Supdb::create_nocopiesfit(&dir("nocopiesfit")).unwrap();

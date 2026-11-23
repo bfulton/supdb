@@ -6318,7 +6318,7 @@ pub struct Options {
     /// in none. Where scans come back is too late
     /// (`zpages_rewarm_raw_scans`). Counted (`ZCounts::raw_settles`,
     /// `raw_settle_ms`, `raw_rewarm_files`, `raw_rewarm_bytes`,
-    /// `raw_rewarm_short`). Off; `supdb-zrewarmraw` asks.
+    /// `raw_rewarm_short`). On; `supdb-norewarmraw` asks for nothing.
     #[doc(hidden)]
     pub zpages_rewarm_raw: bool,
     /// REFUTED: with `zpages_rewarm_raw`, the raw form's files are asked
@@ -6333,7 +6333,7 @@ pub struct Options {
     /// `supdb-zrewarmrawscans` asks there too.
     #[doc(hidden)]
     pub zpages_rewarm_raw_scans: bool,
-    /// EXPERIMENT: a settle that asked for the raw form's files
+    /// A settle that asked for the raw form's files
     /// (`zpages_rewarm_raw`) maps what came back into the process's page
     /// tables as well (`MADV_POPULATE_READ`, `Maint::raw_map`): the record
     /// region and the ordered index of every segment the ask could have
@@ -6345,8 +6345,8 @@ pub struct Options {
     /// minor faults in 3,000 scans where a store never pushed out takes 621,
     /// about eight microseconds each under the bound by the fit across
     /// reps, and ran 17-28 ms where the unpushed store runs 10-14. Counted
-    /// (`ZCounts::raw_maps`, `raw_map_ms`). Off; `supdb-zrewarmrawmaps`
-    /// maps.
+    /// (`ZCounts::raw_maps`, `raw_map_ms`). On; `supdb-rewarmrawnomap`
+    /// asks and maps nothing.
     #[doc(hidden)]
     pub zpages_rewarm_raw_maps: bool,
     /// A rewarm due (`zpages_rewarm_scans`) is made while merges are in
@@ -7117,9 +7117,9 @@ impl Default for Options {
             zpages_rewarm_at_install: false,
             zpages_settle_joins_asks: true,
             zpages_rewarm_trims: false,
-            zpages_rewarm_raw: false,
+            zpages_rewarm_raw: true,
             zpages_rewarm_raw_scans: false,
-            zpages_rewarm_raw_maps: false,
+            zpages_rewarm_raw_maps: true,
             zpages_rewarm_beside_merges: false,
             zpages_rewarm_quiet_ms: 250,
             zpages_stride: ZStride::Forced,
