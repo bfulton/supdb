@@ -2707,6 +2707,43 @@ ahead of any lever on the part that is known; and the waits under a pin
 are every join, the close's among them, since a path that runs once a
 store is a path nobody reads under a cache.
 
+The trace that named the close named the next wait in the sitting it
+was built for. The evictor's longest waits had been a figure in every
+row (`longest_ever_ms`), two to three hundred milliseconds, and nobody's:
+laid to what each file in flight held, 205 of the 246 waits of sixty
+milliseconds or more in twelve sittings fell where a merge's finished
+output left the files being written, 120 ms apiece. A merge gives each
+output its envelope where the output is finished, on its own thread,
+fifty megabytes sealed, written and synced (`Emitter::leave`), and it
+did so under its hold of the cache, where the holds had been taught to
+give way at a walk's rests and nowhere else. The stacks were had by
+stopping the process from inside the evictor's wait, sixty milliseconds
+in (`SIGSTOP` to itself, a scratch line), with a watcher reading every
+thread by gdb before letting it go: a merge in `persist_one`, sealing
+or under its `fsync`, in seventeen stops of twenty, and a thread's own
+cold reads between two rests in two. The write runs unheld now
+(`MergeRest::unheld`, `pager::Hold::idle`), and an idle is a rest: the
+walk keeps each input's key from one step to the next
+(`merge_walk_cached`), so the step after is told and asks for them
+again. `a_merge_writing_an_envelope_holds_nothing_of_the_cache` parks a
+merge at a gate before its first output's envelope, reads four times
+the cache through a handle, requires the cache to have given that back
+while the merge stands there, and reads the store whole once the merge
+has gone on over inputs the cache gave back under it. Five mutants, and
+the one that outlived that test is the dangerous one: a hold left at
+nothing after its wait, which reads on to the walk's next rest with
+nobody waiting for it, and passes because the evictor's hand goes by a
+unit just read once before it takes it. The hold has a test of its own
+for it (`a_hold_idles_for_a_wait_and_stands_again_after_it`). For a
+plain store's merge the method is the bare call, a type's as the rests
+are, and the count read level (`sh scripts/cost.sh 2476938 merge land
+work` at `2a23cc4`). The rules: a hold is a pin, so the waits under one
+are found and said as the waits under a slot were, a file write on the
+holder's own thread among them; an instrument kept in the tree is read
+again over the next sitting's lines before the figure it explains is
+left as the machine's; and a guard that protects a reader for a window
+its test cannot open is held where the guard is, by its own state.
+
 The rules: a second way to hold the same bytes is priced on the first
 operation of every pass as well as on its rate, since a mapping's first
 touch is where two kinds of memory differ; a write slower than its cipher
