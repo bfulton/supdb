@@ -960,13 +960,13 @@ pub struct Supdb {
     /// The block cache granted the raw records' place where its own budget
     /// would bind and no point read is near
     /// (`Options::scan_cache_copies_fit`), `None` for the engine's default.
-    /// `supdb-copiesfit`.
+    /// `supdb-nocopiesfit` is the budget that binds beside the raw form.
     copiesfit: Option<bool>,
     /// The chain through a write-only stretch only where the writer's
     /// forms do not cover the store
     /// (`Options::merge_chains_writes_uncovered`), `None` for the engine's
-    /// default. `supdb-chainuncovered`, and `supdb-copiesfitchain` with
-    /// both.
+    /// default. `supdb-chaincovered` chains through a covered burst, and
+    /// `supdb-nocopiesfitchain` is both shapes before.
     chainuncovered: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
@@ -2307,13 +2307,13 @@ struct Policy {
     /// The block cache granted the raw records' place where its own budget
     /// would bind and no point read is near
     /// (`Options::scan_cache_copies_fit`), `None` for the engine's default.
-    /// `supdb-copiesfit`.
+    /// `supdb-nocopiesfit` is the budget that binds beside the raw form.
     copiesfit: Option<bool>,
     /// The chain through a write-only stretch only where the writer's
     /// forms do not cover the store
     /// (`Options::merge_chains_writes_uncovered`), `None` for the engine's
-    /// default. `supdb-chainuncovered`, and `supdb-copiesfitchain` with
-    /// both.
+    /// default. `supdb-chaincovered` chains through a covered burst, and
+    /// `supdb-nocopiesfitchain` is both shapes before.
     chainuncovered: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
@@ -7613,42 +7613,43 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with the block cache granted the raw records' place where
-    /// its own budget would bind for want of room beside them and no point
-    /// read is near (`Options::scan_cache_copies_fit`). The pair against
-    /// `supdb` differs by that one option.
-    pub fn create_copiesfit(path: &Path) -> Res<Supdb> {
+    /// `supdb` with its block cache's own budget binding where there is no
+    /// room for it beside the raw form, whatever the store's reads
+    /// (`Options::scan_cache_copies_fit` off), the shape before. The pair
+    /// against `supdb` differs by that one option.
+    pub fn create_nocopiesfit(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                copiesfit: Some(true),
+                copiesfit: Some(false),
                 ..Policy::default()
             },
         )
     }
 
-    /// `supdb` chaining its merges through a write-only stretch only where
-    /// the writer's forms do not cover the store
-    /// (`Options::merge_chains_writes_uncovered`). The pair against `supdb`
-    /// differs by that one option.
-    pub fn create_chainuncovered(path: &Path) -> Res<Supdb> {
+    /// `supdb` chaining its merges through every write-only stretch out of
+    /// core, a burst its forms cover among them
+    /// (`Options::merge_chains_writes_uncovered` off), the shape before.
+    /// The pair against `supdb` differs by that one option.
+    pub fn create_chaincovered(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                chainuncovered: Some(true),
+                chainuncovered: Some(false),
                 ..Policy::default()
             },
         )
     }
 
-    /// `supdb-copiesfit` and `supdb-chainuncovered` together: the cache in
-    /// the records' place, and no chain through a burst it covers.
-    pub fn create_copiesfitchain(path: &Path) -> Res<Supdb> {
+    /// `supdb-nocopiesfit` and `supdb-chaincovered` together, the shape
+    /// before both: the budget that binds beside the raw form, and the
+    /// chain through a burst the forms cover.
+    pub fn create_nocopiesfitchain(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                copiesfit: Some(true),
-                chainuncovered: Some(true),
+                copiesfit: Some(false),
+                chainuncovered: Some(false),
                 ..Policy::default()
             },
         )
@@ -12074,12 +12075,12 @@ impl Engine for Supdb {
             return "supdb-zrewarmrawscans";
         }
         match (
-            self.copiesfit == Some(true),
-            self.chainuncovered == Some(true),
+            self.copiesfit == Some(false),
+            self.chainuncovered == Some(false),
         ) {
-            (true, true) => return "supdb-copiesfitchain",
-            (true, false) => return "supdb-copiesfit",
-            (false, true) => return "supdb-chainuncovered",
+            (true, true) => return "supdb-nocopiesfitchain",
+            (true, false) => return "supdb-nocopiesfit",
+            (false, true) => return "supdb-chaincovered",
             (false, false) => {}
         }
         if self.formsoffbuilt == Some(true) {
@@ -13782,9 +13783,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-rewarmtrim"
         | "supdb-zrewarmraw"
         | "supdb-zrewarmrawscans"
-        | "supdb-copiesfit"
-        | "supdb-chainuncovered"
-        | "supdb-copiesfitchain"
+        | "supdb-nocopiesfit"
+        | "supdb-chaincovered"
+        | "supdb-nocopiesfitchain"
         | "supdb-formsoffbuilt"
         | "supdb-nozjobs"
         | "supdb-nozjobsrewarm"
@@ -15720,9 +15721,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-rewarmtrim" => supdb_arm(Supdb::create_rewarmtrim, dir)?,
         "supdb-zrewarmraw" => supdb_arm(Supdb::create_zrewarmraw, dir)?,
         "supdb-zrewarmrawscans" => supdb_arm(Supdb::create_zrewarmrawscans, dir)?,
-        "supdb-copiesfit" => supdb_arm(Supdb::create_copiesfit, dir)?,
-        "supdb-chainuncovered" => supdb_arm(Supdb::create_chainuncovered, dir)?,
-        "supdb-copiesfitchain" => supdb_arm(Supdb::create_copiesfitchain, dir)?,
+        "supdb-nocopiesfit" => supdb_arm(Supdb::create_nocopiesfit, dir)?,
+        "supdb-chaincovered" => supdb_arm(Supdb::create_chaincovered, dir)?,
+        "supdb-nocopiesfitchain" => supdb_arm(Supdb::create_nocopiesfitchain, dir)?,
         "supdb-formsoffbuilt" => supdb_arm(Supdb::create_formsoffbuilt, dir)?,
         "supdb-nozjobs" => supdb_arm(Supdb::create_nozjobs, dir)?,
         "supdb-nozjobsrewarm" => supdb_arm(Supdb::create_nozjobsrewarm, dir)?,
@@ -17718,30 +17719,30 @@ mod tests {
                 assert!(!o.zpages_rewarm_raw_scans && !b.zpages_rewarm_raw_scans);
             }
             {
-                let z = Supdb::create_copiesfit(&dir("copiesfit")).unwrap();
-                assert_eq!(z.name(), "supdb-copiesfit");
+                let z = Supdb::create_nocopiesfit(&dir("nocopiesfit")).unwrap();
+                assert_eq!(z.name(), "supdb-nocopiesfit");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(o.scan_cache_copies_fit && !b.scan_cache_copies_fit);
+                assert!(!o.scan_cache_copies_fit && b.scan_cache_copies_fit);
                 assert_eq!(
                     o.merge_chains_writes_uncovered,
                     b.merge_chains_writes_uncovered
                 );
             }
             {
-                let z = Supdb::create_chainuncovered(&dir("chainuncovered")).unwrap();
-                assert_eq!(z.name(), "supdb-chainuncovered");
+                let z = Supdb::create_chaincovered(&dir("chaincovered")).unwrap();
+                assert_eq!(z.name(), "supdb-chaincovered");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(o.merge_chains_writes_uncovered && !b.merge_chains_writes_uncovered);
+                assert!(!o.merge_chains_writes_uncovered && b.merge_chains_writes_uncovered);
                 assert_eq!(o.scan_cache_copies_fit, b.scan_cache_copies_fit);
             }
             {
-                let z = Supdb::create_copiesfitchain(&dir("copiesfitchain")).unwrap();
-                assert_eq!(z.name(), "supdb-copiesfitchain");
+                let z = Supdb::create_nocopiesfitchain(&dir("nocopiesfitchain")).unwrap();
+                assert_eq!(z.name(), "supdb-nocopiesfitchain");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(o.scan_cache_copies_fit && o.merge_chains_writes_uncovered);
+                assert!(!o.scan_cache_copies_fit && !o.merge_chains_writes_uncovered);
             }
             {
                 let z = Supdb::create_zrewarmrawscans(&dir("zrewarmrawscans")).unwrap();

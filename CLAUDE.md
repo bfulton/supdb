@@ -6062,7 +6062,10 @@ read five and six cells behind in both orders, D, E and F at the smaller
 bound and the read-only C at the larger, with every count the option
 keeps the same in both arms; a store with a point read near is
 uncovered now (`Maint::forms_uncovered`, at `e57fc5c`), and the same
-pairings read three behind and two ahead, and one and four. The rules: a budget
+pairings read three behind and two ahead, and one and four. Both
+options are the engine's since; `supdb-nocopiesfit`,
+`supdb-chaincovered` and `supdb-nocopiesfitchain` are the shapes
+before, and the arms the pairings above name are those commits'. The rules: a budget
 for one tenant is drawn against what the others need given what this
 one holds, since a cache that replaces pages is charged for them twice
 by a room that reserves them; a limit that stops work is read for
@@ -6104,6 +6107,19 @@ against the same cell under identical arms before it is read at all.
 These are the engine's, as opposed to refuted predictions. Each is a curve
 in the suite's figures, at `full` scale where it says so:
 
+- The scan pass after a burst pays its first scan for the burst's end:
+  the wait for the upkeep thread's pass in flight, the log read, the
+  settle of what the thread trailed by and the snapshot's extension,
+  0.4-14 ms at three million keys where the rest of a divided pass of
+  three thousand scans is 12-15, and a merge the idle plan starts at
+  that scan beside it in a rep in four. It is what the pass after the
+  full rewrite at three million keys under 1 GiB has left against LMDB's,
+  level to a tenth ahead where the same pass in memory is 1.8x. The
+  levers: the share the syncing pace lets the thread trail by
+  (`upkeep_pace_syncs_bp`, `supdb-pacesyncs5`), which trades the burst
+  for it; and the reads' chain and the idle plan held off a store whose
+  forms cover it and no point read is near, as the chain through writes
+  is (`Options::merge_chains_writes_uncovered`), which is not built.
 - The lag pass after a full rewrite under a bound pays for the burst's
   merge debt twice: as a merge writing beside it, in the reps where the
   chain has not drained -- the pass's slow shape at ten million keys under

@@ -3198,7 +3198,7 @@ pub struct Options {
     /// held as given unless the test's seam gives the page cache's budget
     /// (`zpages_inject`). `supdb-cacheeighth` is the eighth as it was.
     pub scan_cache_auto_room: bool,
-    /// EXPERIMENT: where the store's own budget would bind for want of room
+    /// Where the store's own budget would bind for want of room
     /// beside the raw form, a store no point read is near may hold its
     /// block cache in the raw records' place instead
     /// (`Reader::grant_copies`): the budget becomes what the bound leaves
@@ -3217,7 +3217,8 @@ pub struct Options {
     /// copy does not replace, so the grant waits for a store far from them
     /// (`Shared::points_far`: none in its life, or two stores' worth of
     /// writes since the last) and is taken back at the first that comes,
-    /// the budget returning to what it was before the grant.
+    /// the budget returning to what it was before the grant. On;
+    /// `supdb-nocopiesfit` is the budget that binds beside the raw form.
     #[doc(hidden)]
     pub scan_cache_copies_fit: bool,
     /// PROTOTYPE: with the block cache, build ahead of the reader on a
@@ -5040,7 +5041,7 @@ pub struct Options {
     /// `supdb-ingestnochainwrites` chain only while reads are around.
     #[doc(hidden)]
     pub merge_chains_writes: bool,
-    /// EXPERIMENT: the chain through a write-only stretch
+    /// The chain through a write-only stretch
     /// (`merge_chains_writes`) only where the writer's block forms do not
     /// cover the store (`Maint::forms_uncovered`): no block cache, a budget
     /// given or bound, the forms given up for the merge path, scans far, or
@@ -5051,7 +5052,8 @@ pub struct Options {
     /// keys under 1 GiB the chain landed forty merges in the lag sweep where
     /// the seals' own plans land twenty, and the full rewrite's burst ran
     /// 9.1 s with it and 6.7 without, its upkeep thread's settle 5.9 s
-    /// against 3.6.
+    /// against 3.6. On; `supdb-chaincovered` chains through a burst the
+    /// forms cover, and `supdb-nocopiesfitchain` is both shapes before.
     #[doc(hidden)]
     pub merge_chains_writes_uncovered: bool,
     /// Under `merge_chains`, the segment work's own loop plans a merge
@@ -6903,7 +6905,7 @@ impl Default for Options {
             scan_cache_auto: true,
             scan_cache_auto_bytes: 0,
             scan_cache_auto_room: true,
-            scan_cache_copies_fit: false,
+            scan_cache_copies_fit: true,
             scan_cache_ahead: true,
             scan_run_builds: true,
             scan_prefetch: true,
@@ -7015,7 +7017,7 @@ impl Default for Options {
             heads_willneed: true,
             merge_chains: true,
             merge_chains_writes: true,
-            merge_chains_writes_uncovered: false,
+            merge_chains_writes_uncovered: true,
             merge_plan_idle: true,
             merge_bytes_cap: 64 << 20,
             merge_parallel: 2,
