@@ -49,9 +49,22 @@ jobs:
         run: sh bench/scripts/libclang.sh
       - uses: Swatinem/rust-cache@v2
         with:
+          # rust-cache takes the directory after `->` relative to the
+          # workspace before it, so the suite's is `target`. Written
+          # `bench/target` it named bench/bench/target, which nothing builds
+          # into: the step saved a cache of the registry and the engine's
+          # few dependencies, and every run built the comparators cold.
+          #
+          # LIBCLANG_PATH is in the key because clang-sys's build script
+          # declares nothing to rerun on, so a cached output keeps the
+          # directory it found libclang in. Restored on an image where that
+          # directory has gone, it fails the link of RocksDB's build script,
+          # `unable to find library -lclang`; with the variable in the key,
+          # a libclang that moves is a cache that misses.
           workspaces: |
             . -> target
-            bench -> bench/target
+            bench -> target
+          env-vars: LIBCLANG_PATH
       # `scripts/check.sh` is the single definition of what this project
       # checks, so a contributor running it locally runs exactly this.
       - name: Build, test and lint the engine and the suite
@@ -74,7 +87,10 @@ jobs:
         run: sh bench/scripts/libclang.sh
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: bench -> bench/target
+          # The target relative to its workspace, and libclang's directory
+          # in the key: see the `test` job.
+          workspaces: bench -> target
+          env-vars: LIBCLANG_PATH
       - name: One quick-scale run of every arm
         run: sh scripts/check.sh quick
       - uses: actions/upload-artifact@v4

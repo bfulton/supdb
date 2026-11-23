@@ -30,7 +30,12 @@ jobs:
         run: sh bench/scripts/libclang.sh
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: bench -> bench/target
+          # rust-cache takes the directory after `->` relative to the
+          # workspace before it, so the suite's is `target`; and libclang's
+          # directory is in the key, since clang-sys's cached build output
+          # names it (the `test` job in ci.yml has the failure).
+          workspaces: bench -> target
+          env-vars: LIBCLANG_PATH
       - name: Build
         working-directory: bench
         run: cargo build --release --bin bench
