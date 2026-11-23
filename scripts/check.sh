@@ -106,6 +106,15 @@
 #            aarch64-linux-gnu-gcc and qemu-aarch64-static, which
 #            `rustup target add aarch64-unknown-linux-gnu` and `apt-get
 #            install gcc-aarch64-linux-gnu qemu-user-static` give
+#   enc      the encrypted comparators (bench/Cargo.toml, feature `enc`):
+#            the suite built with LMDB's 1.0 line behind its page hook and
+#            RocksDB on its encrypted Env, which stand beside `supdb-cipher`
+#            as what a user who needs a store encrypted would otherwise
+#            pick; linted, their tests each required by name, and every arm
+#            of the encrypted roster run once at the smallest rung, through
+#            bench/scripts/check.sh. Not in the default set: it is a second
+#            build of the comparators, ten minutes of C++ the first time,
+#            and needs OpenSSL's headers (`sh scripts/deps.sh openssl`)
 #   machine  the suite's machine capture on an Apple Silicon host: `bench
 #            machine` read its line size and read 128. Not in the default
 #            set: it is that host's alone, and refuses any other.
@@ -184,6 +193,10 @@ for g in $groups; do
     quick)
       say "quick"
       sh bench/scripts/check.sh quick
+      ;;
+    enc)
+      say "enc"
+      sh bench/scripts/check.sh enc
       ;;
     cost)
       say "cost"
@@ -279,7 +292,7 @@ for g in $groups; do
       ;;
     *)
       echo "unknown group: $g" >&2
-      echo "groups: $ALL (the default), quick cost fscrypt cross-arm machine" >&2
+      echo "groups: $ALL (the default), quick cost fscrypt cross-arm machine enc" >&2
       exit 2
       ;;
   esac

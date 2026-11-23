@@ -27,7 +27,9 @@ usage:
 
 run    measures every arm over the size ladder and writes runs/<scale>/<utc>-<sha7>.json
        --out   directory holding runs/ (default: runs)
-       --arms  comma-separated subset of the arms (default: all; at ooc the bounded roster)
+       --arms  comma-separated subset of the arms (default: all; at ooc the bounded roster);
+               `enc` is the stores encrypted at rest beside their plain twins, in the build
+               that holds the encrypted comparators (--no-default-features --features enc)
        --fresh-process  each arm's rep in a process of its own, --one-process all in this one
                (default: fresh at ooc, one in core; see Plan::fresh_process)
        --top   the ladder's top rung in keys (default: quick 300000; full sized to 1.5x memory;
@@ -796,6 +798,14 @@ fn cmd_run(a: Args) -> i32 {
         }
     };
     let arms: Vec<String> = match a.get("--arms") {
+        // The stores encrypted at rest, each beside its plain twin, both
+        // guarantee groups: one name for the list, so that the row and the
+        // check that opens every arm of it run the same arms.
+        Some("enc") => engines::ENC_ARMS
+            .iter()
+            .chain(engines::ENC_BUFFERED_ARMS.iter())
+            .map(|s| s.to_string())
+            .collect(),
         Some(list) => list
             .split(',')
             .map(str::trim)

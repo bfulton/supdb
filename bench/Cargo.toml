@@ -28,8 +28,10 @@ serde = { version = "1", features = ["derive"] }
 memmap2 = "0.9"
 serde_json = "1"
 # Comparators. Every arm is in-process Rust so the comparison carries no
-# binding overhead.
-heed = "0.20"
+# binding overhead. LMDB is a feature, on by default, for one reason: the
+# encrypted comparators (`enc`, below) link LMDB's 1.0 line, which defines
+# the C symbols this one does, and the two cannot share a binary.
+heed = { version = "0.20", optional = true }
 # Built with LZ4 alone of the compression libraries, for the arm that
 # compresses (`rocksdb-tuned-lz4`, the bounded roster's); every other arm
 # turns compression off explicitly. Not optional: RocksDB is a headline
@@ -46,6 +48,23 @@ rocksdb = { version = "0.23", default-features = false, features = ["lz4"] }
 # its cipher from the caller, and here the suite is the caller. `ring`'s
 # AES-GCM, as the engine's own tests and examples link.
 ring = "0.17"
+
+# The encrypted comparators (feature `enc`): what a user who needs a store
+# encrypted at rest would otherwise pick, beside `supdb-cipher`.
+#
+# LMDB encrypts on its 1.0 line alone (`mdb.master3`, a page an AEAD call
+# through a hook the application fills). The binding crate of that line,
+# pinned, since a comparator's version is part of what is measured, and
+# used directly: the hook is the suite's own (`shim/lmdb_enc.c`), written
+# from the input to the output as LMDB's sample module writes it, which the
+# wrapper crate over these bindings does not do and concurrent readers need
+# (`src/enc.rs`).
+lmdb-master3-sys = { version = "=0.2.6", optional = true }
+# RocksDB encrypts through an Env a deployment supplies the cipher for
+# (`shim/rocks_enc.cc`, AES-256-CTR through OpenSSL, compiled by
+# `build.rs`). Named directly for the one thing a direct dependent gets:
+# its build script's word for where RocksDB's headers are.
+librocksdb-sys = { version = "0.17", default-features = false, optional = true }
 
 # liblz4's decoder, for the probe that prices it against `lz4_flex` on the
 # form's own pages (`examples/zdecode.rs`, `--features lz4-c`). Optional, so
@@ -69,10 +88,24 @@ snap = { version = "1", optional = true }
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
 
 [build-dependencies]
-# For LZAV under `codecs` alone; already in the graph for the comparators.
+# For LZAV under `codecs` and RocksDB's encrypted Env under `enc`; already
+# in the graph for the comparators.
 cc = { version = "1", optional = true }
 
 [features]
+default = ["lmdb"]
+# LMDB as released, through `heed`: the `lmdb` arms.
+lmdb = ["dep:heed"]
+# The encrypted comparators, in LMDB's place: `lmdb3` and `lmdb3-enc` (LMDB
+# 1.0, plain and encrypted) and `rocksdb-tuned-enc`, with their buffered
+# twins. A build of its own, since LMDB's two lines cannot be linked
+# together, and one that needs OpenSSL's headers on the host:
+#
+#   cargo build --release --no-default-features --features enc --bin bench
+#
+# Every other arm is in that binary as it is in the default one, so a
+# pairing against `supdb-cipher`, or against the plain arms, is one process.
+enc = ["dep:lmdb-master3-sys", "dep:librocksdb-sys", "dep:cc"]
 # `zsize` built with the crate's safe encoder and decoder, to be run beside
 # the build without it: the pages come out byte for byte the same, and the
 # decode is what moves. Off for everything the suite measures.

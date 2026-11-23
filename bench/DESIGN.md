@@ -412,6 +412,36 @@ the chunk it decrypts and gives back. The suite does not reopen a store,
 so an open under a cipher is `cargo run --release --example cipher_store`
 and no cell.
 
+And the comparators encrypted, which is what `supdb-cipher` is for being
+read against: a user who needs a store encrypted at rest would otherwise
+pick one of these, each the comparator's own mechanism under a cipher the
+application supplies, as the engine's is (`src/enc.rs`). LMDB encrypts on
+its 1.0 line alone, a page through a hook: `lmdb3-enc` is that under
+AES-256-GCM, and `lmdb3` the same library with no hook, so the pair prices
+the encryption on LMDB's own side. RocksDB encrypts through an Env that
+wraps every file in a cipher stream: `rocksdb-tuned-enc` is `rocksdb-tuned`
+on that Env under AES-256-CTR, which authenticates nothing where the
+other two stores authenticate every byte, and the arm says so rather than
+being given a tag RocksDB's mechanism does not have. Both ciphers are
+OpenSSL's, a context a thread keyed once, the shape their deployments run;
+each has a buffered twin (`-nosync`). They are a build of their own,
+`--no-default-features --features enc`, since LMDB's two lines define the
+same C symbols and one binary links one of them: in that build the `lmdb`
+arms are refused by name and every other arm is as it is in the default
+one, so a pairing against `supdb-cipher` or the plain arms is one process.
+`bench run --arms enc` is the encrypted roster, both guarantee groups, each
+encrypted store beside its plain twin; its rows are no part of the
+standing series, whose class they would otherwise share, so they are
+written with `--out` somewhere of their own. LMDB's encryption is on a
+line it has not released, and the arm is that line as it stands: its
+sample hook's shape is load-bearing under reader threads
+(`shim/lmdb_enc.c`), and an encrypted environment fails a write
+transaction that reaches across some two thousand of its sixteen-page
+chunks, which the suite's shuffled load does between three hundred
+thousand keys and a million (`src/enc.rs`, with the test that reproduces
+it on LMDB's C API alone). So the encrypted roster runs to the quick
+scale's top, and past it the encrypted comparator is RocksDB's.
+
 ## Scale
 
 Three. `quick` gates pull requests; `full` is the number; `ooc` is the

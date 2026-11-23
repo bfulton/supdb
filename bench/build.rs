@@ -39,6 +39,33 @@ fn main() {
     println!("cargo:rustc-env=SUPDB_RUSTC={}", rustc());
     #[cfg(feature = "codecs")]
     lzav();
+    #[cfg(feature = "enc")]
+    enc_shims();
+}
+
+/// The encrypted comparators' ciphers (`shim/`), each linked against the
+/// host's OpenSSL: LMDB's page hook under AES-256-GCM (`lmdb_enc.c`), and
+/// RocksDB's encrypted Env under AES-256-CTR (`rocks_enc.cc`), compiled
+/// against the headers of the RocksDB the `rocksdb` crate builds --
+/// `librocksdb-sys` names its directory to its direct dependents -- at
+/// that build's language level and with its `NDEBUG`.
+#[cfg(feature = "enc")]
+fn enc_shims() {
+    println!("cargo:rerun-if-changed=shim/lmdb_enc.c");
+    println!("cargo:rerun-if-changed=shim/rocks_enc.cc");
+    cc::Build::new()
+        .file("shim/lmdb_enc.c")
+        .compile("supdb_lmdb_enc");
+    let root = std::env::var("DEP_ROCKSDB_CARGO_MANIFEST_DIR")
+        .expect("librocksdb-sys says where its sources are");
+    cc::Build::new()
+        .cpp(true)
+        .flag_if_supported("-std=c++17")
+        .define("NDEBUG", Some("1"))
+        .file("shim/rocks_enc.cc")
+        .include(format!("{root}/rocksdb/include"))
+        .compile("supdb_rocks_enc");
+    println!("cargo:rustc-link-lib=crypto");
 }
 
 /// LZAV for the codec probe (`examples/zcodec.rs`), from upstream's header

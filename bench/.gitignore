@@ -1,4 +1,6 @@
 /target
+# The encrypted comparators' build (scripts/check.sh enc), a target of its own.
+/target-enc
 
 # Profiler output. A bare `valgrind --tool=cachegrind` drops one of these in
 # the cwd, and one of them reached the repository root and stayed there.

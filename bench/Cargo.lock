@@ -401,6 +401,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lmdb-master3-sys"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78b1f49b7494125af9b87ddb83cb4828d4ddbaf83c3ed132d5ebd0d43d02f525"
+dependencies = [
+ "cc",
+ "doxygen-rs",
+ "libc",
+]
+
+[[package]]
 name = "lz4"
 version = "1.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -731,6 +742,8 @@ dependencies = [
  "cc",
  "heed",
  "libc",
+ "librocksdb-sys",
+ "lmdb-master3-sys",
  "lz4",
  "lz4_flex",
  "memmap2",

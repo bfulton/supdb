@@ -43,6 +43,11 @@ use std::path::{Path, PathBuf};
 #[path = "dense.rs"]
 mod dense;
 
+/// The encrypted comparators, a build of their own (feature `enc`).
+#[cfg(feature = "enc")]
+#[path = "enc.rs"]
+mod enc;
+
 /// What an engine actually guarantees. Reported beside every number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Features {
@@ -13188,12 +13193,18 @@ pub struct Rocks {
     /// load window carries the same drain the engine's default does
     /// and the reads run against a fully compacted tree.
     drain: bool,
+    /// Whether the store's files are encrypted (`rocksdb-tuned-enc`,
+    /// feature `enc`): the tuned arm on RocksDB's encrypted Env under
+    /// AES-256-CTR (`enc.rs`, `shim/rocks_enc.cc`), the WAL and the
+    /// manifest with the tables. Its pair is `rocksdb-tuned`, which it
+    /// differs from in the Env alone.
+    enc: bool,
     read: rocksdb::ReadOptions,
 }
 
 impl Rocks {
     pub fn create(path: &Path, sync: bool) -> Res<Rocks> {
-        Rocks::with(path, sync, false, false, false)
+        Rocks::with(path, sync, false, false, false, false)
     }
 
     /// The deployed shape rather than the shipped one, stated in full so the
@@ -13205,7 +13216,7 @@ impl Rocks {
     /// load (see `with`). Not a tuning contest: one stated configuration a
     /// reader can recognise as a deployment.
     pub fn create_tuned(path: &Path) -> Res<Rocks> {
-        Rocks::with(path, true, true, false, false)
+        Rocks::with(path, true, true, false, false, false)
     }
 
     /// The tuned configuration with commits that do not reach the device:
@@ -13216,7 +13227,7 @@ impl Rocks {
     /// would choose; this is the one stated configuration in both groups,
     /// differing from `rocksdb-tuned` in the sync alone.
     pub fn create_tuned_nosync(path: &Path) -> Res<Rocks> {
-        Rocks::with(path, false, true, false, false)
+        Rocks::with(path, false, true, false, false, false)
     }
 
     /// The tuned configuration with its SSTs LZ4-compressed, the one
@@ -13226,20 +13237,36 @@ impl Rocks {
     /// suite's own values are a hundred bytes of the payload generator's,
     /// so what LZ4 makes of them is the row's `bytes_on_disk_per_byte`.
     pub fn create_tuned_lz4(path: &Path) -> Res<Rocks> {
-        Rocks::with(path, true, true, false, true)
+        Rocks::with(path, true, true, false, true, false)
     }
 
     /// Tuned, and drained at `sync`: memtable flushed, every level
     /// compacted into one, inside the window -- the engine's default
     /// shape, charged to RocksDB.
     pub fn create_tuned_drain(path: &Path) -> Res<Rocks> {
-        Rocks::with(path, true, true, true, false)
+        Rocks::with(path, true, true, true, false, false)
     }
 
-    fn with(path: &Path, sync: bool, tuned: bool, drain: bool, lz4: bool) -> Res<Rocks> {
+    /// The tuned configuration on the encrypted Env, durable
+    /// (`rocksdb-tuned-enc`) or buffered (`rocksdb-tuned-nosync-enc`).
+    #[cfg(feature = "enc")]
+    pub fn create_tuned_enc(path: &Path, sync: bool) -> Res<Rocks> {
+        Rocks::with(path, sync, true, false, false, true)
+    }
+
+    fn with(path: &Path, sync: bool, tuned: bool, drain: bool, lz4: bool, enc: bool) -> Res<Rocks> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         let mut o = rocksdb::Options::default();
         o.create_if_missing(true);
+        // The options keep the Env alive for the store they open.
+        #[cfg(feature = "enc")]
+        if enc {
+            o.set_env(&enc::rocks_env());
+        }
+        #[cfg(not(feature = "enc"))]
+        if enc {
+            return Err(NO_ENC.to_string());
+        }
         o.set_compression_type(if lz4 {
             rocksdb::DBCompressionType::Lz4
         } else {
@@ -13275,6 +13302,7 @@ impl Rocks {
             tuned,
             lz4,
             drain,
+            enc,
             read,
         })
     }
@@ -13330,6 +13358,12 @@ impl Engine for Rocks {
     fn name(&self) -> &'static str {
         if self.lz4 {
             return "rocksdb-tuned-lz4";
+        }
+        if self.enc {
+            return match self.sync {
+                true => "rocksdb-tuned-enc",
+                false => "rocksdb-tuned-nosync-enc",
+            };
         }
         match (self.sync, self.tuned, self.drain) {
             (_, true, true) => "rocksdb-tuned-drain",
@@ -13399,6 +13433,7 @@ impl Engine for Rocks {
 
 // ------------------------------------------------------------------- lmdb --
 
+#[cfg(feature = "lmdb")]
 /// LMDB through heed.
 ///
 /// The engine the design document names as the one Supdb had to beat for the
@@ -13437,6 +13472,7 @@ pub struct Lmdb {
     nordahead: bool,
 }
 
+#[cfg(feature = "lmdb")]
 impl Lmdb {
     pub fn create(path: &Path, map_gb: usize) -> Res<Lmdb> {
         Lmdb::with_flags(path, map_gb, true, false)
@@ -13510,6 +13546,7 @@ impl Lmdb {
     }
 }
 
+#[cfg(feature = "lmdb")]
 /// heed keeps every environment it opens in a registry of its own, and an
 /// environment closes only once `prepare_for_closing` has taken the
 /// registry's handle and every other handle is gone. Dropping the arm alone
@@ -13525,8 +13562,10 @@ impl Drop for Lmdb {
     }
 }
 
+#[cfg(feature = "lmdb")]
 type LmdbDb = heed::Database<heed::types::Bytes, heed::types::Bytes>;
 
+#[cfg(feature = "lmdb")]
 /// One read under whichever transaction: the arm's held one or a thread's.
 fn lmdb_get(db: LmdbDb, r: &heed::RoTxn<'_>, key: &[u8]) -> Res<usize> {
     // Lent from the mapping; the caller's copy is `consume`.
@@ -13537,6 +13576,7 @@ fn lmdb_get(db: LmdbDb, r: &heed::RoTxn<'_>, key: &[u8]) -> Res<usize> {
         .unwrap_or(0))
 }
 
+#[cfg(feature = "lmdb")]
 fn lmdb_range(db: LmdbDb, r: &heed::RoTxn<'_>, from: &[u8], n: usize) -> Res<usize> {
     let mut bytes = 0usize;
     let range = (std::ops::Bound::Included(from), std::ops::Bound::Unbounded);
@@ -13547,6 +13587,7 @@ fn lmdb_range(db: LmdbDb, r: &heed::RoTxn<'_>, from: &[u8], n: usize) -> Res<usi
     Ok(bytes)
 }
 
+#[cfg(feature = "lmdb")]
 /// A reader thread's LMDB: a read transaction begun on the thread, over
 /// the shared environment it holds a handle to.
 struct LmdbReader {
@@ -13554,6 +13595,7 @@ struct LmdbReader {
     txn: heed::RoTxn<'static>,
 }
 
+#[cfg(feature = "lmdb")]
 impl ThreadReader for LmdbReader {
     fn get(&mut self, key: &[u8]) -> Res<usize> {
         lmdb_get(self.db, &self.txn, key)
@@ -13563,6 +13605,7 @@ impl ThreadReader for LmdbReader {
     }
 }
 
+#[cfg(feature = "lmdb")]
 impl Engine for Lmdb {
     fn name(&self) -> &'static str {
         match (self.nosync, self.nordahead) {
@@ -13951,6 +13994,45 @@ pub const OOC_ARMS: [&str; 8] = [
     "rocksdb-tuned",
     "rocksdb-tuned-lz4",
 ];
+
+/// The stores encrypted at rest, each beside the plain store it is the
+/// encryption of: the engine under a cipher of the caller's
+/// (`supdb-cipher`), and the two comparators under theirs (`enc.rs`) --
+/// LMDB's 1.0 line behind its page hook and RocksDB on its encrypted Env.
+/// Never the roster's: they are a build of their own (feature `enc`), and
+/// what they are for is one question, whether the engine under a cipher
+/// reads and writes ahead of what a user who needs a store encrypted would
+/// otherwise pick. `bench run --arms` with this list, in that build, is the
+/// row that answers it; the buffered group is `ENC_BUFFERED_ARMS`.
+pub const ENC_ARMS: [&str; 6] = [
+    "supdb",
+    "supdb-cipher",
+    "lmdb3",
+    "lmdb3-enc",
+    "rocksdb-tuned",
+    "rocksdb-tuned-enc",
+];
+
+/// `ENC_ARMS`' buffered group.
+pub const ENC_BUFFERED_ARMS: [&str; 6] = [
+    "supdb-ingest",
+    "supdb-ingestcipher",
+    "lmdb3-nosync",
+    "lmdb3-nosync-enc",
+    "rocksdb-tuned-nosync",
+    "rocksdb-tuned-nosync-enc",
+];
+
+/// What an encrypted comparator's name answers in a build without them.
+#[cfg(not(feature = "enc"))]
+const NO_ENC: &str = "the encrypted comparators are a build of their own: \
+    cargo build --release --no-default-features --features enc --bin bench";
+
+/// What an `lmdb` arm's name answers in the build of the encrypted
+/// comparators, where LMDB's 1.0 line stands in the released one's place.
+#[cfg(not(feature = "lmdb"))]
+const NO_LMDB: &str = "this build holds LMDB's 1.0 line in the released one's place \
+    (feature enc): lmdb3, lmdb3-nosync, lmdb3-enc, lmdb3-nosync-enc";
 
 /// Whether the arm writes one file, once, from keys in order: the segment
 /// arms. Such an arm has the ordered load and the reads over it and
@@ -14369,8 +14451,11 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-bglag"
         | "lmdb"
         | "lmdb-nordahead"
+        | "lmdb3"
+        | "lmdb3-enc"
         | "dense"
         | "rocksdb-tuned-lz4"
+        | "rocksdb-tuned-enc"
         | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest"
         | "supdb-ingestleave"
@@ -14467,8 +14552,11 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestbglag"
         | "supdb-ingesthold"
         | "lmdb-nosync"
+        | "lmdb3-nosync"
+        | "lmdb3-nosync-enc"
         | "rocksdb-nosync"
         | "rocksdb-tuned-nosync"
+        | "rocksdb-tuned-nosync-enc"
         | "supdb-ingestdirkey"
         | "supdb-ingestcipher"
         | "supdb-ingestcipherlog"
@@ -16236,10 +16324,34 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-segmentblocks-encbounded" => {
             Box::new(Segment::create(dir, Envelope::Bounded, true)?)
         }
+        #[cfg(feature = "lmdb")]
         "lmdb" => Box::new(Lmdb::create(dir, map_gb)?),
+        #[cfg(feature = "lmdb")]
         "lmdb-nordahead" => Box::new(Lmdb::create_nordahead(dir, map_gb)?),
         "dense" => Box::new(dense::Dense::open(dir)?),
+        #[cfg(feature = "lmdb")]
         "lmdb-nosync" => Box::new(Lmdb::create_nosync(dir, map_gb)?),
+        #[cfg(not(feature = "lmdb"))]
+        "lmdb" | "lmdb-nordahead" | "lmdb-nosync" => return Err(NO_LMDB.to_string()),
+        #[cfg(feature = "enc")]
+        "lmdb3" => Box::new(enc::Lmdb3::create(dir, map_gb, true, false)?),
+        #[cfg(feature = "enc")]
+        "lmdb3-nosync" => Box::new(enc::Lmdb3::create(dir, map_gb, false, false)?),
+        #[cfg(feature = "enc")]
+        "lmdb3-enc" => Box::new(enc::Lmdb3::create(dir, map_gb, true, true)?),
+        #[cfg(feature = "enc")]
+        "lmdb3-nosync-enc" => Box::new(enc::Lmdb3::create(dir, map_gb, false, true)?),
+        #[cfg(feature = "enc")]
+        "rocksdb-tuned-enc" => Box::new(Rocks::create_tuned_enc(dir, true)?),
+        #[cfg(feature = "enc")]
+        "rocksdb-tuned-nosync-enc" => Box::new(Rocks::create_tuned_enc(dir, false)?),
+        #[cfg(not(feature = "enc"))]
+        "lmdb3"
+        | "lmdb3-nosync"
+        | "lmdb3-enc"
+        | "lmdb3-nosync-enc"
+        | "rocksdb-tuned-enc"
+        | "rocksdb-tuned-nosync-enc" => return Err(NO_ENC.to_string()),
         "rocksdb-tuned" => Box::new(Rocks::create_tuned(dir)?),
         "rocksdb-tuned-lz4" => Box::new(Rocks::create_tuned_lz4(dir)?),
         "rocksdb-nosync" => Box::new(Rocks::create(dir, false)?),
@@ -16304,6 +16416,7 @@ mod tests {
     /// with exactly `NO_READ_AHEAD` over the flags `lmdb` is opened with.
     /// Copied from the matching test's shape: a difference that is not
     /// the one the arm is for is a second arm nobody declared.
+    #[cfg(feature = "lmdb")]
     #[test]
     fn the_readahead_arm_differs_from_lmdb_in_one_flag() {
         assert_eq!(guarantee("lmdb-nordahead"), Some(Guarantee::Durable));
@@ -16358,6 +16471,7 @@ mod tests {
     /// roster ran before was RocksDB as it ships beside a tuned durable
     /// one: a difference that was not the one the group is for, and the
     /// roster holds the tuned one now.
+    #[cfg(feature = "lmdb")]
     #[test]
     fn the_buffered_comparators_differ_from_the_durable_ones_in_the_sync() {
         assert_eq!(guarantee("rocksdb-tuned-nosync"), Some(Guarantee::Buffered));

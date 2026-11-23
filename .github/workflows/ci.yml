@@ -170,6 +170,29 @@ jobs:
       - name: Build and test under emulation
         run: sh scripts/check.sh cross-arm
 
+  enc:
+    # The encrypted comparators: LMDB's 1.0 line behind its page hook and
+    # RocksDB on its encrypted Env, each under a cipher from OpenSSL, which
+    # `supdb-cipher` is read against. A build of the suite of their own
+    # (bench/Cargo.toml, feature `enc`), which nothing else in this workflow
+    # compiles: the arms' tests, and every arm of the encrypted roster run
+    # once.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: libclang, for bindgen
+        run: sh bench/scripts/libclang.sh
+      - name: OpenSSL's headers, for the comparators' ciphers
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libssl-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench -> bench/target-enc
+      - name: The encrypted comparators, built, tested and run once
+        run: sh scripts/check.sh enc
+
   fscrypt:
     # A store under a key (`Encryption::Kernel`) asks the kernel to encrypt
     # its directory, and the kernel does that on a filesystem made for it,

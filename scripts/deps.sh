@@ -14,6 +14,8 @@
 # libclang  bindgen's libclang, for the comparators (bench, quick); the one
 #           definition is bench/scripts/libclang.sh, which CI calls too
 # profile   perf and valgrind; not in the default set
+# openssl   OpenSSL's headers, for the encrypted comparators' ciphers (enc);
+#           not in the default set
 #
 # It ends with one line, `all deps ready: <groups>`, which is the verdict a
 # caller gates on.
@@ -101,9 +103,20 @@ for g in $groups; do
       "$perf" --version
       valgrind --version
       ;;
+    openssl)
+      say openssl
+      # The shims under bench/shim include <openssl/evp.h> and link
+      # libcrypto; the compiler is asked, since where the headers live is
+      # the host's.
+      if ! echo '#include <openssl/evp.h>' | cc -E -x c - >/dev/null 2>&1; then
+        apt_install libssl-dev
+      fi
+      echo '#include <openssl/evp.h>' | cc -E -x c - >/dev/null
+      echo "openssl headers found"
+      ;;
     *)
       echo "unknown group: $g" >&2
-      echo "groups: rust node libclang profile" >&2
+      echo "groups: rust node libclang profile openssl" >&2
       exit 2
       ;;
   esac
