@@ -1,0 +1,53 @@
+name: pr-caches
+
+# A pull request's caches are its own. rust-cache saves them under the pull
+# request's merge ref, where no branch and no other pull request can restore
+# them, so once it closes nothing reads them again; they go on counting
+# against the repository's ten gigabytes until a week has passed with no
+# read. One set, the three `test` legs, `quick` and `detect`, is about six
+# and a half, so a closed pull request's set beside an open one's is over
+# the limit, and GitHub then evicts by last read, oldest first, whoever's
+# it is: an open pull request's cache it has not read since saving goes
+# before a closed one's saved an hour later. This deletes a pull request's
+# caches when it closes, merged or not.
+#
+# Not `save-if` on main alone, which bounds the storage by never saving
+# from a pull request: a pull request's later pushes restore what its first
+# saved, and that is the cache's whole use where the work is a stack of
+# pull requests between branches and main moves at the end.
+#
+# A pull request from a fork runs with a token that cannot delete, so the
+# job is this repository's own pull requests'.
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  actions: write
+
+jobs:
+  delete:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Delete the caches under the pull request's merge ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REF: refs/pull/${{ github.event.pull_request.number }}/merge
+        run: |
+          set -eu
+          ids=$(gh cache list --ref "$REF" --limit 100 --json id --jq '.[].id')
+          deleted=0
+          failed=0
+          for id in $ids; do
+            if gh cache delete "$id"; then
+              deleted=$((deleted + 1))
+            else
+              failed=$((failed + 1))
+            fi
+          done
+          echo "under $REF: $deleted deleted, $failed not"
+          test "$failed" -eq 0
