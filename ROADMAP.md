@@ -632,42 +632,60 @@ What an engine picker would hit, roughly in order.
   a lag sweep among them, ten sittings each; a caller whose own memory
   grows beside the store; and the controller's model reading the same
   room (`zpages_under_cipher`).
-- [ ] **A store under a cipher is killed by its own writes under a
-  bound.** At five million keys under 640 MiB the lag sweep's full
-  rewrite kills it, as it did before its cache followed the room (three
-  reps of three then, at the rewrite's start; four of four now, at the
-  pass's end): `bench ab --arms supdb-cipher,supdb --size 5000000 --bound
-  671088640 --passes lag --reps 1 --ops-div 10`, the plain store beside it
-  alive. At the kill the process holds 359 MiB of its own memory, where
-  the plain store peaks at 186, and 270 MiB of plaintext in files being
-  written, which the cache counts and cannot give back; nothing of the
-  page cache is left. Two things pile up, both behind landings that take
-  longer under a cipher, an envelope sealed and written where a plain
-  segment is synced: the tables the writer froze, held to a count and not
-  to bytes (`FROZEN_CAP`, a standing limitation in `CLAUDE.md`), and the
-  outputs of seals and merges, each held whole until its envelope, the
-  envelopes written one at a time (`Vault::persisting`). And a third
-  thing the counters name (`SUPDB_LAG_COUNTERS=1` before that command,
-  the `lagmem` and `lagarenas` lines at the last point, in a rep that
-  lives): of the process's own memory the allocator has 141 MiB in use
-  and 248 free and resident, 124 of it in one arena, where the plain
-  store has 35 and 133. A scratch build that asked the allocator for its
-  free memory wherever the cache's room read less than the cache held
-  asked forty-five times through the pass and got 3 to 35 MiB a time,
-  the process still killed in three reps of four, so it was taken out:
-  the memory is not the kind a trim returns, and whose arenas those are
-  is the count by thread that has not been made
-  (`bench/examples/arena.rs`, `alloc-census`, and `Options::jobs_mapped`,
-  which is off). At the kill itself the cache stood at 270 MiB for half
-  a second over a room of about 217 without giving any back, and what
-  held it is not known either. The levers, none
-  built: the writer's wait drawn from the room, by bytes, tables and
-  files in flight together; an envelope sealed as its file is written, so
-  that a file's pages can be given back as they go home (the page
-  layer's write-through, and the load's double write with it). Done when
-  the lag sweep and the write mixes run under each bound of the bounded
-  roster with no process killed in ten sittings, the plain store's cells
-  beside them unmoved.
+- [ ] **A store under a cipher under a bound, past the close that killed
+  it.** At five million keys under 640 MiB the lag sweep killed it in
+  four sittings of ten, and this item had that down as the writer piling
+  up behind landings a cipher makes slower. It was the store's close: a
+  drop joins the merges in flight with the writer's operation pinned, the
+  cache gave nothing back for as long as they ran, and they read on into
+  it a breath at a time (`CLAUDE.md`, the close's pin). The drop's joins
+  say they hold nothing now, held by
+  `a_close_that_joins_a_merge_holds_nothing_of_the_cache` and its two
+  mutants. With it, at `b8b7e28`: the lag sweep in twelve sittings of
+  twelve (`bench ab --arms supdb-cipherauto,supdb-cipher --size 5000000
+  --bound 671088640 --passes lag --reps 6 --ops-div 10`), the most the
+  kernel could not take back 582-615 MiB of the 640 where the killed
+  passes sat at 629-630 for six to twelve seconds; and the row's other
+  passes with both mix families in ten of ten (`... --passes
+  load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+  --reps 5`). What is left:
+  - The other bounds of the bounded roster, three and ten million keys
+    under 1 GiB and 1.25 GiB, ten sittings each of the lag sweep and of
+    the mixes, with `scripts/stallwatch.py` beside them. Done when none
+    is killed.
+  - The evictor's longest waits, 170-300 ms in every sitting
+    (`longest_ever_ms` on the `lagcounterscipher` line). In the trace
+    (`SUPDB_PAGER_TRACE=1`) each falls where a merge's finished output,
+    fifty megabytes, leaves the files being written, and a run's where it
+    closes: the output's envelope is sealed and written on the thread
+    that wrote it (`Emitter::leave`, `vault::persist_one`), under that
+    thread's hold of the cache, and the evictor waits out the write. Not
+    confirmed by the stack of who was waited for. The lever: the envelope
+    written at the walk's next rest, where the merge holds nothing it was
+    lent (`MergeRest`), counted on the plain merge first (`sh
+    scripts/cost.sh HEAD merge`), since the rest is a type that compiles
+    to nothing there.
+  - The margin. At its worst instants the group had 25-58 MiB between
+    what the kernel cannot take back and its limit, and what puts it
+    there is the process's own memory beside the cache: 330-405 MiB at
+    the full rewrite where the plain store holds 199 and the same store
+    with its controller on 265-300 (`SUPDB_LAG_COUNTERS=1`, the
+    `lagcensus` line at the last point). A store under a cipher has its
+    controller off (`cipher_controller`), so it never reads as out of
+    core and keeps the writer's block forms through the sweep, 65 MB of
+    copies in every sitting, which the plain store and the controller's
+    arm have given up there; the items on the controller under a cipher,
+    below, are this one's as well. The allocator's free and resident
+    bytes, 145-250 MiB of the process in either arm, are the readers' and
+    the jobs' arenas (`CLAUDE.md`, a lever built for the largest peak
+    known) and no trim returns them.
+  - What the shape still is, and what did not kill it: the frozen tables
+    held to a count and not to bytes (`FROZEN_CAP`, a standing limitation
+    in `CLAUDE.md`), a file in flight held whole until its envelope, and
+    the envelopes written one at a time (`Vault::persisting`). The levers
+    for those, the writer's wait drawn from the room by bytes and an
+    envelope sealed as its file is written, wait for a kill that names
+    them.
 - [ ] **The heads' copy under a cipher.** The copy of a partition's
   ordered-index heads in the process's own memory (`Options::heads_owned`)
   is made from the index's mapping as it lies, which a store under a

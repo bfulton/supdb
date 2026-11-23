@@ -2296,10 +2296,11 @@ five million keys under 640 MiB the half shape was killed in every rep of
 the lag sweep's full rewrite, the process at 291 MiB of its own memory
 where the plain store peaks at 186, the cache holding its 297 beside it
 and the page cache at nothing; following the room it gets through the
-rewrite and its pass, and is killed at the pass's end with 359 MiB of
-its own and 270 in files being written, which is the writer piling up
-behind landings a cipher makes slower and no budget's to fix
-(`ROADMAP.md`). Priced at `a166b4c` at that store and bound: against the
+rewrite and its pass, and was killed after the pass with 359 MiB of its
+own and 270 in files being written, which this paragraph called the
+writer piling up behind landings a cipher makes slower, on those two
+figures, and which was the store's close (the close's pin, below).
+Priced at `a166b4c` at that store and bound: against the
 half in both orders (`pair.sh supdb-cipher supdb-cipherhalf 5000000
 --bound 671088640 --passes read,read-threaded,scan,scan-threaded,mixes
 --reps 2 --ops-div 10`) the store as shipped reads 1.11-1.25x, scans
@@ -2663,6 +2664,48 @@ different lines for work that can wait and a read that cannot; a count
 that includes what cannot be given back fires the wait for nothing; and
 the instrument that names who is waited for is built before the first
 guess, as it was the first time, and was taken out both times.
+
+It came once more as the close, and was on record for a month as
+something else. A store dropped with merges in flight joins them, they
+run to their end and land nothing, and the drop is an operation of the
+writer's, pinned from its first line: the evictor waited for that pin
+for as long as the merges ran, and each merge, resting at a cache past
+its line, read on a breath later (`Hold::rest`), so the cache grew by
+what two merges read between two breaths, four megabytes a second,
+until the group had no page of its file cache left to give. At five
+million keys under 640 MiB the lag sweep ended in it in four sittings of
+ten, the group at its limit for seven to twelve seconds with the
+process's own memory flat, and then the kill. It had been written down
+as the writer piling up behind landings a cipher makes slower, with two
+levers designed for that, on two figures read at a kill and no reading
+of what any thread was doing; the same item said the cache had stood
+over its room for half a second giving nothing back, "and what held it
+is not known either". Three readings named it in an hour. The harness's
+own line: the kill came after the sweep's last pass, where all that is
+left is the store's drop. A trace of the cache's counts beside what
+each file in flight holds (`SUPDB_PAGER_TRACE=1`, a `pagertrace` line a
+tenth of a second from the evictor's reading of its room), which went
+silent seven seconds before the kill: the evictor reads its room at
+every turn and was inside one pass's wait. And every thread's stack
+taken while the group sat at its limit (`scripts/stallwatch.py`, two
+seconds there and then each thread's kernel stack and `gdb -batch`),
+which had every thread asleep: the writer in `Db::drop` joining the
+segment work, the segment work in `Maint::stop` joining a merge, two
+merges in a breath, the evictor in its nap. The drop's joins say they
+hold nothing now (`Reader::unlent`, `unlend`), and
+`a_close_that_joins_a_merge_holds_nothing_of_the_cache` holds a merge
+before its first read, drops the store over it and reads the cache's
+peak through the drop, with the segment work on its thread and inline:
+twenty-eight megabytes over a budget of two with either join left
+pinned, in one wait of fourteen seconds. The rules: a process killed
+under a bound whose own memory is flat through its last seconds is
+waiting and not growing, so its threads' stacks are read before its
+memory is summed by owner; a kill the harness places after a pass is
+read for what runs after the pass, the close first; a note that says
+what held a thing is not known has named the next thing to find out,
+ahead of any lever on the part that is known; and the waits under a pin
+are every join, the close's among them, since a path that runs once a
+store is a path nobody reads under a cache.
 
 The rules: a second way to hold the same bytes is priced on the first
 operation of every pass as well as on its rate, since a mapping's first
