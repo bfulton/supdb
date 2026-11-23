@@ -1628,7 +1628,9 @@ ordinary code -- `debug_assert!(to.lent <= n)` in the engine, any
 `.base(x)` of another type, a listed signature rustfmt split -- since
 `lent`, `lend` and `base` are common words here. The seal's words are
 names nothing else in the tree uses now (`lend_at`, `lend_whole_map`,
-`base_address`, `lend_seal`, the tokens' re-exports, `BaseAddressToken`,
+`lend_asked_map`, the stride form's borrow of a mapping's whole range
+for readers that ask for each page before they read it, `base_address`,
+`lend_seal`, the tokens' re-exports, `BaseAddressToken`,
 `whole_map_readers`), so each is read as an identifier wherever it
 stands, a macro's tokens included, with no rule for macros: every line of
 src that names one is a call at a site listed by file and scope with its
@@ -8623,6 +8625,60 @@ long its passes take, so a change to a pass's cost is read on the
 passes counted and the work a pass does, and a regime that holds only
 because something was slow is measured with the slowness gone before it
 is called the regime's cost.
+
+**A second way for a check to say yes, counted three times before it
+cost nothing.** The stride form under a cipher reads as a plain store's
+does, its readers indexing the file's range at its offsets, and a page
+of a file whose mapping lends nothing whole has to be asked for before
+it is read, at every read. The ask went where a page's check already
+goes out of line, the first touch of a page, and the first shape made
+it a tail call on the check's failing branch: every reader and walk read
+the same to the instruction, and the check itself read one instruction a
+page over (`sh scripts/cost.sh HEAD read_s scan_s scan_long_s`). The
+check had answered `true` where it passed and `false` where it failed,
+which the compiler returns as the page's own check's result, still in
+its register; with an arm that returns an answer of its own the passing
+branch loads a `true`. The second shape took the ask off the check: a
+file that asks was given no word in the verified bitmap, and the bound a
+mapped file's lookup always checked sent it to the ask. The check read
+level, the point read one instruction a read under, and the cursor's
+walk 3.9 instructions a record over, a returning call on a loop's cold
+edge where a panic had been, of which `#[cold]` took back one. The third
+has the check answer a word and not a `bool` (`zfile::PageOk`): the bit
+it set, or the ask's word, each in the register it was made in, through
+the closures the readers take. No function moved. Each shape was first
+built in the engine and counted, ten minutes a count; the question was
+one function's own instructions, and twenty lines in a file of their own
+under `rustc -O --emit asm` answered it in seconds once that was tried,
+the three shapes side by side. And the second count was read off the
+first: the wait was for a marker line in a log the run before had left,
+it returned at once, and a shape was called a failure on the numbers of
+the one before it. The rules: a function given a second way to answer
+answers each way in the register that way made, or the first way pays
+for the second; a returning call on a hot loop's cold edge is counted in
+the loop, every time one is added, whatever its attribute; a question
+about one function's instructions is put to a file of that function's
+shape before the engine is built for it; and a wait reads a marker in a
+log that did not exist when the wait began.
+
+The whole count of that change then read red in a probe no line of it
+runs: the writer's round, `work_probe::main` one instruction a key over,
+100,018 in 148 million, with the suite's point read level (`sh
+scripts/cost.sh 83e63ed work read` at the commit). Summed by mnemonic
+over the function's instructions in the two builds (`--dump-instr=yes`,
+each instruction's count laid to its disassembly), the gain was 100,001
+`nop`s and seventeen moves of code run once. The read as `main` inlines
+it holds the loop over the frozen tables, whose head the compiler puts
+on a sixteen-byte boundary; the stride read's cold arm, inlined ahead of
+it, had come out forty-four bytes shorter, so the head that had landed
+on a boundary by itself now wanted three bytes of padding, and the fall
+into the loop runs the padding. The count takes a `nop` for an
+instruction and the gate cannot tell padding from code (`ROADMAP.md`, a
+verdict from the count), so the red stands and is read here. The rule: a
+gain of a whole instruction an operation in a function whose hot code
+did not change is summed by mnemonic before it is read by line, and
+padding is said to be padding only by that sum, never by the absence of
+any other suspect.
 
 ## Standing limitations
 

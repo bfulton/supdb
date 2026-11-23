@@ -461,15 +461,48 @@ impl MmapBytes {
     /// the token is a reader's that may read a mapping so
     /// (`whole_map_readers::Reader`, implemented here alone): the ordered
     /// index, which checks its checksum over its heads and reads them where
-    /// they lie (`ordindex::lend_seal`), and the stride form, which reads
-    /// its value pages at their offsets (`db::zfile::lend_seal`), each
-    /// token made in its own module alone, so the compiler refuses this call in any other. Any
-    /// other reader asks with `slice_at`. The token is a zero-sized value
-    /// and costs the call nothing.
+    /// they lie (`ordindex::lend_seal`), and the stride form, which holds a
+    /// mapped file's page to its check over it (`db::zfile::lend_seal`),
+    /// each token made in its own module alone, so the compiler refuses
+    /// this call in any other. Any other reader asks with `slice_at`. The
+    /// token is a zero-sized value and costs the call nothing.
     #[inline]
     pub(crate) fn lend_whole_map<T: whole_map_readers::Reader>(&self, _: T) -> &[u8] {
         // SAFETY: `lend` bytes at `ptr` are a mapped file's, kept by `own`.
         unsafe { std::slice::from_raw_parts(self.ptr, self.lend as usize) }
+    }
+
+    /// The mapping's whole range, for a reader that asks for every page of
+    /// it before it reads the page. All of a mapped file, as
+    /// `lend_whole_map` lends it, the asking nothing. Of a paged mapping it
+    /// is address space and not yet bytes: a range of it holds the file's
+    /// bytes once it has been asked for (`slice_at`), for as long as the
+    /// pin or the hold it was asked under stands, and what was never asked
+    /// for, or was asked for under a pin that has ended, reads as anything
+    /// at all. So the borrow says where a page is and never that it may be
+    /// read, which is the ask's to say.
+    ///
+    /// Sealed to the stride form's token alone (`db::zfile::lend_seal`):
+    /// its readers hold every page a value or a number lies in to the
+    /// page's check before the bytes are read (`StrideBody`'s `good`), and
+    /// for a file that lends nothing whole that check is where the page is
+    /// asked for (`ZFile::stride_page_check`), so a value read through this
+    /// borrow is read out of a page asked for under the read's own pin. A
+    /// reader with no such check a page asks with `slice_at` and reads what
+    /// it is handed.
+    #[inline]
+    pub(crate) fn lend_asked_map(&self, _: StrideLendToken) -> &[u8] {
+        // SAFETY: `len` bytes at `ptr` are the mapping's address range,
+        // kept mapped by `own` for as long as `self` stands. A mapped
+        // file's bytes never change under a name. A paged mapping's do: a
+        // page is filled by the thread that first asks for it and given
+        // back once no pinned reader could hold it, so this borrow spans
+        // bytes other threads write, and it is sound by what is read
+        // through it and not by its type. Nothing reads through a slice
+        // but at the offsets its reader wrote, the seal's readers read
+        // only inside a page they asked for under a pin that still stands,
+        // and no thread writes such a page.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len as usize) }
     }
 
     /// The first byte of each system page of `len` bytes at `off` read,

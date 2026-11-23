@@ -322,11 +322,10 @@ well as to its segment, and it is Linux only. Every option a store in the
 clear runs with, a store under a cipher runs with; one choice is made
 differently, in that `ZPages::Auto` leaves such a store in the raw form
 unless `Options::zpages_under_cipher` is set, and `ZPages::Always` builds
-the compact form there as anywhere. Two mechanisms that read a file as its
-mapping lies do not act under a cipher: the stride form is not built, a
-partition it would serve being built and served in the compact form's
-block layout, and the copy of the ordered index's heads
-(`Options::heads_owned`) is not made. `Db::cipher_counts` says what
+the compact form there as anywhere, in either of its layouts. One mechanism
+that reads a file as its mapping lies does not act under a cipher: the
+copy of the ordered index's heads (`Options::heads_owned`) is not made.
+`Db::cipher_counts` says what
 the cache holds, has decrypted and has given back. `cargo run --release
 --example cipher_store` has the adapter and opens a store under a cache
 smaller than it, and the `supdb::db::vault` module docs have the layout,

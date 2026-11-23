@@ -556,32 +556,34 @@ What an engine picker would hit, roughly in order.
   and the store reads the partition raw as a plain store does
   (`a_changed_byte_in_a_form_file_takes_the_form_out_of_service_and_not_the_store`,
   `tests/cipher.rs`, at the attach and in service).
-- [ ] **The stride form under a cipher.** A stride file is written from
-  a partition's records lent whole (`write_stride`) and every read of one
-  goes through the file borrowed whole (`ZFile::stride_bytes`, handed as
-  a slice to `StrideBody`'s readers at some fifteen sites of `zfile.rs`),
-  and a store under a cipher lends neither, so there a build that asks
-  for the stride form builds the block form and counts the decline
-  (`zfile::StrideNo::Kept`). It is the first thing the bounded cells the
-  encrypted comparators win are lost by ("Reads and scans out of core",
-  below). The shape is the one `flatindex` took for the key section: the
-  body's readers over a source that is the slice, where they are the
-  code they were, or a reader by the piece, each read a `slice_at` of the
-  range it wants -- a value one stride, a page check one page, a walk a
-  window of pages, a sparse form's search a page of numbers behind the
-  samples in memory -- and the writer taking its records through the
-  trait the block form's builder reads a kept file by (`PieceImages`),
-  under a hold with a rest a page (`zfile::Walked`). A form module names
-  nothing of the encryption (`tests/data/couplings.txt`), and the plain
-  path is held by the stride probes of the count (`sh scripts/cost.sh
-  BASE read_s scan_s scan_long_s`). Done when a store under a cipher
-  builds, attaches and serves a stride file under the stride tests of
-  `tests/zpages.rs`; the differential fuzz passes with the form forced
-  under a cipher in a small cache (`ZFUZZ_STRIDE` and `ZFUZZ_CONVERT`
-  with `ZFUZZ_CIPHER=1 ZFUZZ_CIPHERCACHE=16384`); a damaged chunk of a
-  stride file takes the form out of service and not the store; and
-  `supdb-cipher` with the form is paired against itself without, and
-  against `rocksdb-tuned-enc`, at five million keys under 640 MiB.
+- [ ] **The stride form under a cipher.** Built, and not yet priced. A
+  stride file is written from a kept segment's records read by the piece
+  (`StrideWalked for Held`), read back and attached through the store's
+  cache, and served by the readers a plain store's is: they index the
+  file's range at its offsets, each page after the page's check, and for
+  a file whose mapping lends nothing whole that check is where the page
+  is asked for, at every read (`ZFile::asks`,
+  `MmapBytes::lend_asked_map`). A store in the clear runs the code it
+  ran: no function moved in the count's three stride probes (`sh
+  scripts/cost.sh 83e63ed read_s scan_s scan_long_s`). Held by the
+  stride oracle under a cipher in a small cache, with the block cache
+  and without (`tests/zpages.rs`); by a stride file's damage and its
+  build's rests (`tests/cipher.rs`); and by the differential fuzz with
+  the form forced there (`ZFUZZ_ZPAGES=1 ZFUZZ_STRIDE=1 ZFUZZ_CIPHER=1
+  ZFUZZ_CIPHERCACHE=16384`, with `ZFUZZ_SPARSE` and `ZFUZZ_CONVERT`, and
+  under `SUPDB_PAGER_GUARD`, where a page read without its ask is a
+  fault). It is the first thing the bounded cells the encrypted
+  comparators win are lost by ("Reads and scans out of core", below),
+  and a read through it asks the cache for a page a value, which nothing
+  has counted. And the borrow its readers index spans the cache's whole
+  range, pages other threads fill among them: it holds by what the
+  readers read, each page asked for first, and not by the borrow's type
+  (`lend_asked_map`'s safety note). Readers generic over a source that
+  hands each range, as `flatindex`'s are over `Sect`, would hold it by
+  type, at a count of the plain store's eight readers. Done when the
+  read and the walk under a cipher are counted beside the plain store's,
+  and an arm that builds the form there is paired against `supdb-cipher`
+  and against `rocksdb-tuned-enc` at five million keys under 640 MiB.
 - [ ] **The heads' copy under a cipher.** The copy of a partition's
   ordered-index heads in the process's own memory (`Options::heads_owned`)
   is made from the index's mapping as it lies, which a store under a
@@ -693,10 +695,11 @@ until the run is its own log). What it loses:
   key, which fits, and it reads at seventeen times the store under a
   cipher (the same pairing against `supdb`). What loses the cells is that
   a store under a cipher is kept out of the compact forms: the stride
-  form is declined there, and the controller is off because a form page
-  lies across two chunks. The items, in the order they are worked: "The
-  stride form under a cipher", "An envelope whose chunks are whole pages"
-  and the controller on behind it, all under "Engine". One thing is
+  form was declined there when the pairing ran, and the controller is off
+  because a form page lies across two chunks. The items, in the order
+  they are worked: "The stride form under a cipher", built since and not
+  yet paired, "An envelope whose chunks are whole pages" and the
+  controller on behind it, all under "Engine". One thing is
   arithmetic and not yet a measurement: the stride file is 500 MB at five
   million keys, which the bound cannot hold twice, as the kernel's cache
   of the ciphertext and the store's of the plaintext, so what the stride
@@ -745,17 +748,19 @@ until the run is its own log). What it loses:
 
 ### The order of the work
 
-First the two "Engine" items the bounded cells above are lost by, "The
-stride form under a cipher" and then "The heads' copy under a cipher":
-the pass below cannot be green while a mechanism does nothing under a
-cipher. Then that pass, then the layer.
+First the two "Engine" items the bounded cells above are lost by: "The
+stride form under a cipher", which is built and is to be priced, and
+then "The heads' copy under a cipher". The pass below cannot be green
+while a mechanism does nothing under a cipher. Then that pass, then the
+layer.
 
 - [ ] **Every mechanism held to acting under a cipher.** The seal bars
   a whole borrow at the sites it lists, and a new walk over a section
   borrowed whole inside a reader's own module, or a new caller of a
   form's whole-file read, compiles, passes every gate and answers nothing
   under a cipher. Three mechanisms were found doing nothing there after
-  they shipped: the stride form, the heads' copy, and the third merge of a
+  they shipped: the stride form, built there since, the heads' copy, and
+  the third merge of a
   stretch nobody reads (`Options::merge_parallel_quiet`), which waits for
   the compact form's gate, where the controller is off. A fourth was
   unsound and not idle: an unpinned writer (`writer_pins` off) was
@@ -813,7 +818,17 @@ cipher. Then that pass, then the layer.
   are called a key or a block at a time; `Txn`, `RunWalk` and the
   `SparseBlob` readers are outside the entry-point list; the bounds on
   the `~` lines rest on two to four self-checks a probe; and valgrind's
-  noise on a hosted runner is unmeasured.
+  noise on a hosted runner is unmeasured. And the count takes a loop
+  head's alignment padding for an instruction: a `nop` the fall into a
+  loop runs, which comes and goes with the length of whatever was
+  inlined ahead of the loop. The writer's round has read red by it since
+  the stride form went under a cipher, `work_probe::main` one
+  instruction a key over the commit before with no instruction of its
+  hot code changed (`CLAUDE.md`, "A second way for a check to say yes").
+  Done for that when the count is taken by instruction and a function's
+  sum leaves its padding out, with a red input in which a gain of
+  padding alone reads green beside a gain of one instruction that reads
+  red.
 - [ ] **The gates that have run on no hosted runner.** The `cost`,
   `lists`, `cross-arm`, `machine`, `enc` and `fscrypt` jobs first run
   where the first pull request is opened, and the `machine` group has not

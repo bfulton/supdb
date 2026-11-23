@@ -61,7 +61,7 @@ allow	src/db/zfile.rs	swap_ahead	1	advice on a door handle
 allow	src/db/zfile.rs	ask_file	1	advice on a door handle (S1)
 allow	src/db/zfile.rs	drop_behind	1	the descriptor half of the plain build's drop, on a door handle (S1)
 allow	src/db/zfile.rs	build_file_seen	1	Mmap::map of a plain segment's door handle (SegSrc::File)
-allow	src/db/zfile.rs	check_stride	1	maps the stride build's own output by path: no stride form is built under a cipher (StrideNo::Kept)
+allow	src/db/zfile.rs	PlacedWalk::map_out	1	maps a plain store's stride build's own output by path, for its read-back; a kept file's is mapped through the door (StrideWalked for Held)
 allow	src/db/zfile.rs	thread_major_faults	1	getrusage (G3: Memory)
 allow	src/db/zfile.rs	file_facts	1	maps a form file by path: under a cipher the decoy maps nothing and the reading falls back to a sample (S5)
 allow	src/db/zfile.rs	time_file_decodes	1	maps a form file by path: as file_facts (S5)

@@ -8,7 +8,10 @@
 # only `bytes` can make (`bytes::BaseAddressToken`, whose field is
 # private); a mapping as it lies (`MmapBytes::lend_whole_map`) takes a
 # token only its readers make, the ordered index (`ordindex::lend_seal`)
-# and the stride form (`db::zfile::lend_seal`); no token is had by
+# and the stride form (`db::zfile::lend_seal`); a mapping's whole range,
+# whose pages its reader asks for before it reads them
+# (`MmapBytes::lend_asked_map`), takes the stride form's token and no
+# other; no token is had by
 # `Default::default()`; and `MmapBytes::as_slice` is gone.
 # A token made by any other route, and a new caller inside a reader's own
 # module, are held by tests/source.rs
@@ -50,6 +53,11 @@ src/ordindex.rs	src/db.rs	#[allow(dead_code)] fn seal_red_whole_ord(m: &crate::b
 src/ordindex.rs	src/blob.rs	#[allow(dead_code)] fn seal_red_whole_ord_blob(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_whole_map(crate::ordindex::lend_seal::Token::new()) }
 src/db/zfile.rs	src/db.rs	#[allow(dead_code)] fn seal_red_whole_stride(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_whole_map(crate::db::StrideLendToken::new()) }
 src/db/zfile.rs	src/ordindex.rs	#[allow(dead_code)] fn seal_red_whole_stride_ord(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_whole_map(crate::db::StrideLendToken::new()) }
+src/db/zfile.rs	src/db.rs	#[allow(dead_code)] fn seal_red_asked_stride(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_asked_map(crate::db::StrideLendToken::new()) }
+src/db/zfile.rs	src/ordindex.rs	#[allow(dead_code)] fn seal_red_asked_stride_ord(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_asked_map(crate::db::StrideLendToken::new()) }
+-	src/ordindex.rs	#[allow(dead_code)] fn seal_red_asked_ord(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_asked_map(lend_seal::Token::new()) }
+-	src/db.rs	#[allow(dead_code)] fn seal_red_asked_default(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_asked_map(Default::default()) }
+-	src/db.rs	#[allow(dead_code)] fn seal_red_asked_literal(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_asked_map(crate::db::StrideLendToken(())) }
 -	src/db.rs	#[allow(dead_code)] fn seal_red_whole_bare(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_whole_map() }
 -	src/db/zfile.rs	#[allow(dead_code)] fn seal_red_lend_default(m: &crate::bytes::MmapBytes) -> Option<&[u8]> { crate::bytes::Bytes::lend_at(m, 0, 1, Default::default()) }
 -	src/db.rs	#[allow(dead_code)] fn seal_red_whole_ord_default(m: &crate::bytes::MmapBytes) -> &[u8] { m.lend_whole_map::<crate::ordindex::OrdLendToken>(Default::default()) }

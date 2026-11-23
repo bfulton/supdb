@@ -6221,8 +6221,9 @@ const SEAL_TOKENS: &[(&str, &str)] = &[
 const SEAL_CALLS: &str = "
 lend_at        | lend_seal::Token::new() | src/blob.rs     | Sec::lend Sec::get
 lend_whole_map | lend_seal::Token::new() | src/ordindex.rs | OrdIndex::over OrdIndex::mapped_heads
-lend_whole_map | lend_seal::Token::new() | src/db/zfile.rs | ZFile::attach_stride ZFile::stride_bytes
-lend_whole_map | lend_seal::Token::new() | src/db/zfile.rs | check_stride file_facts
+lend_whole_map | lend_seal::Token::new() | src/db/zfile.rs | ZFile::stride_lent file_facts
+lend_asked_map | lend_seal::Token::new() | src/db/zfile.rs | ZFile::attach_stride ZFile::stride_bytes
+lend_asked_map | lend_seal::Token::new() | src/db/zfile.rs | check_stride
 base_address   | BaseAddressToken(())    | src/bytes.rs    | MmapBytes::paged
 ";
 
@@ -6252,6 +6253,7 @@ src/bytes.rs    | Paging::base_address      | base_address BaseAddressToken
 src/bytes.rs    | Paging::<item>            | base_address BaseAddressToken
 src/bytes.rs    | struct BaseAddressToken   | BaseAddressToken
 src/bytes.rs    | MmapBytes::lend_whole_map | lend_whole_map whole_map_readers
+src/bytes.rs    | MmapBytes::lend_asked_map | lend_asked_map StrideLendToken
 ";
 
 /// The impls a seal's word may stand in, by file and header (whitespace
@@ -7065,10 +7067,10 @@ fn a_seals_token_made_another_way_fails() {
     r.red(
         &edit(
             "src/db/zfile.rs",
-            "    fn stride_bytes(&self) -> &[u8] {\n        self.map.lend_whole_map(lend_seal::Token::new())\n    }",
-            "    fn stride_bytes(&self) -> &[u8] {\n        fn inner(m: &MmapBytes) -> &[u8] {\n            m.lend_whole_map(lend_seal::Token::new())\n        }\n        inner(&self.map)\n    }",
+            "    fn stride_lent(&self) -> &[u8] {\n        self.map.lend_whole_map(lend_seal::Token::new())\n    }",
+            "    fn stride_lent(&self) -> &[u8] {\n        fn inner(m: &MmapBytes) -> &[u8] {\n            m.lend_whole_map(lend_seal::Token::new())\n        }\n        inner(&self.map)\n    }",
         ),
-        &["src/db/zfile.rs (ZFile::stride_bytes>inner)", "names `lend_whole_map`, a word of the seal, outside the sites that may"],
+        &["src/db/zfile.rs (ZFile::stride_lent>inner)", "names `lend_whole_map`, a word of the seal, outside the sites that may"],
     );
     // A token's name after a bodiless signature that returns `impl Trait`:
     // the `impl` there is a type, which ends at the signature's `;`.

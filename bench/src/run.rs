@@ -782,7 +782,6 @@ fn counters_line(
             "zpage_stride_no_block_backed",
             "zpage_stride_no_small",
             "zpage_stride_no_self_check",
-            "zpage_stride_no_kept",
             // The writer's settles over the mix: runs, keys, the blocks
             // the keys grouped into, the blocks dropped for a rebuild, and
             // the keys filed with their cut unresolved against those

@@ -1155,8 +1155,7 @@ pub struct ZCounts {
     /// one value, a width not the run's, a tombstone flag, a run in a block,
     /// a partition under the floor, a file that did not read back, a run
     /// with gaps whose ask of the sparse form the build left for a
-    /// conversion (`zpages_stride_sparse`), which is no refusal, and a
-    /// segment of a store under a cipher (`zfile::StrideNo::Kept`). A run
+    /// conversion (`zpages_stride_sparse`), which is no refusal. A run
     /// in a block and a partition under the floor are counted only where a
     /// conversion asks for the stride form alone; under `ZStride::Forced`
     /// either is the block form's decline as well, and counted once, there
@@ -1252,11 +1251,11 @@ pub enum Encryption {
     /// the clear, with one choice made differently: the controller leaves
     /// such a store in the raw form (`Options::zpages_under_cipher`),
     /// where the compact form has measured slower; `ZPages::Always` builds
-    /// it there as anywhere. Two mechanisms read a file as its mapping lies,
-    /// which a store under a cipher does not lend, and so do not act there:
-    /// the stride form is not built, a partition it would serve being built
-    /// and served in the block form (`Options::zpages_stride`), and the
-    /// heads' copy is not made (`Options::heads_owned`). `Db::create`
+    /// it there as anywhere, in either of its layouts
+    /// (`Options::zpages_stride`). One mechanism reads a file as its mapping
+    /// lies, which a store under a cipher does not lend, and so does not
+    /// act there: the heads' copy is not made (`Options::heads_owned`).
+    /// `Db::create`
     /// makes a store under the cipher in an empty directory; `Db::open`
     /// refuses a store that is not under it, and a store under a cipher is
     /// refused where none is given.
@@ -6664,11 +6663,11 @@ pub struct Options {
     /// the block cache's reads, the merge path's walks and the covered walk
     /// of a scan over the partitions alone (`Options::zpages_walk_cursor`)
     /// through the form file's cursor, which stands at a rank there
-    /// (`zfile::ZCursor`). Under a cipher the stride form is not built: it
-    /// is written from records lent whole and read from its file as it
-    /// lies, and a store under a cipher lends neither, so a build that asks
-    /// for it builds the block form and counts the decline
-    /// (`ZCounts::stride_declines`, `zfile::StrideNo::Kept`).
+    /// (`zfile::ZCursor`). Under a cipher the stride form is built from
+    /// its segment's records read by the piece and read back, attached and
+    /// served through the store's cache, a page of the file asked for
+    /// where a read holds it to its check, at every read
+    /// (`zfile::ZFile::asks`).
     #[doc(hidden)]
     pub zpages_stride: ZStride,
     /// EXPERIMENT: under `zpages_stride` `Forced`, the key at and above

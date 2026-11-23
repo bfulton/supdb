@@ -91,6 +91,12 @@ fn v(i: u32, round: u32) -> Vec<u8> {
     .into_bytes()
 }
 
+/// A value of one width for every key: what the stride form takes, with
+/// the numbered keys `k` renders.
+fn w(i: u32) -> Vec<u8> {
+    format!("value {i:08}, {MARK}, one width").into_bytes()
+}
+
 /// A few megabytes through every way the store writes: keys in order, the
 /// same keys again out of order, and enough of both for seals and the
 /// merges behind them.
@@ -1966,10 +1972,24 @@ fn a_form_larger_than_its_cache(eager: bool) {
 /// whatever its builds do, and a reopened store's peak is its builds'.
 #[test]
 fn a_form_build_holds_its_cache_and_not_its_partition() {
+    form_build_rests("formrests", false);
+}
+
+/// The same of the stride form, whose walk reads a kept segment's records
+/// by the piece and reads its own file back through the store's cache: a
+/// partition of one width of values, several times the cache, built
+/// within it, the file a stride file and read by its arithmetic after.
+#[test]
+fn a_stride_build_holds_its_cache_and_not_its_partition() {
+    form_build_rests("striderests", true);
+}
+
+fn form_build_rests(name: &str, stride: bool) {
     let _quiet = one_at_a_time();
     let n = 250_000;
     let cache: u64 = 2 << 20;
     let slack: u64 = 8 << 20;
+    let val = |i: u32| if stride { w(i) } else { v(i, 0) };
     let opts = || Options {
         encryption: Encryption::Cipher(cipher(18).cache_bytes(cache)),
         zpages: supdb::ZPages::Always,
@@ -1979,11 +1999,11 @@ fn a_form_build_holds_its_cache_and_not_its_partition() {
         zpages_eager: false,
         ..Options::default()
     };
-    let dir = scratch("formrests");
+    let dir = scratch(name);
     {
         let mut db = Db::create(&dir, opts()).unwrap();
         for i in 0..n {
-            db.append(&k(i), &v(i, 0));
+            db.append(&k(i), &val(i));
             if i % 500 == 499 {
                 db.commit().unwrap();
             }
@@ -2021,21 +2041,59 @@ fn a_form_build_holds_its_cache_and_not_its_partition() {
         !forms.is_empty() && forms.iter().all(|f| !f.3),
         "the form files: {forms:?}"
     );
+    // The body the values' widths call for: the stride form for one width,
+    // every partition of it, and the block form for the widths `v` gives.
+    assert_eq!(
+        (z.stride_files, z.stride_builds > 0),
+        if stride {
+            (z.partitions, true)
+        } else {
+            (0, false)
+        },
+        "the bodies built: {z:?}"
+    );
+    // A file being written is in memory whole until it has its envelope,
+    // the build's own output among them, which the cache counts and cannot
+    // give back: a stride file is its partition's values as they are, the
+    // better part of the segment, where the block form's is a fraction, so
+    // the stride build's line is drawn past its output. A build that held
+    // its segment would hold the segment beside it.
+    let out: u64 = if stride {
+        names(&dir)
+            .iter()
+            .filter(|n| n.ends_with(".z"))
+            .map(|n| std::fs::metadata(dir.join(n)).unwrap().len())
+            .sum()
+    } else {
+        0
+    };
+    assert!(
+        largest > out + cache + slack,
+        "premise: a segment of {largest} bytes held whole is past the line with an output of {out}"
+    );
     let c = db.cipher_counts().unwrap().cache;
     assert!(
-        c.peak < cache + slack,
-        "the cache held {} bytes of a budget of {cache} through the build of a segment of {largest}: {c:?}",
+        c.peak < out + cache + slack,
+        "the cache held {} bytes of a budget of {cache} through the build of a segment of {largest}, its output {out}: {c:?}",
         c.peak
     );
     for i in (0..n).step_by(997) {
         let mut got: Vec<Vec<u8>> = Vec::new();
         db.read_all(&k(i), vf(&mut |x| got.push(x.to_vec())))
             .unwrap();
-        assert_eq!(got, [v(i, 0)], "key {i}");
+        assert_eq!(got, [val(i)], "key {i}");
     }
+    let after = db.zpage_counts();
+    assert!(after.reads > z.reads, "no read through the form");
+    // A page's check is made the first time the page is read and kept: a
+    // stride file under a cipher keeps it apart from the bit that would
+    // keep a read from asking for the page.
     assert!(
-        db.zpage_counts().reads > z.reads,
-        "no read through the form"
+        after.verified_pages > z.verified_pages && after.verified_pages <= after.pages,
+        "the pages the reads checked, kept: {} of {}, {} before",
+        after.verified_pages,
+        after.pages,
+        z.verified_pages
     );
 }
 
@@ -2251,7 +2309,20 @@ fn a_form_file_goes_with_its_segment_whether_or_not_this_open_knew_it() {
 /// was in a page a read wanted.
 #[test]
 fn a_changed_byte_in_a_form_file_takes_the_form_out_of_service_and_not_the_store() {
-    let dir = scratch("tamperz");
+    form_file_damage("tamperz", false);
+}
+
+/// The same of a stride file, whose pages are asked for a page at a time
+/// where a read's check of the page is made: a chunk that fails its tag
+/// is a page the file does not lend, the page and the file leave service
+/// there, and the read is the raw form's.
+#[test]
+fn a_changed_byte_in_a_stride_file_takes_the_form_out_of_service_and_not_the_store() {
+    form_file_damage("tamperstride", true);
+}
+
+fn form_file_damage(name: &str, stride: bool) {
+    let dir = scratch(name);
     let opts = || Options {
         zpages: supdb::ZPages::Always,
         zpages_min_bytes: 0,
@@ -2259,17 +2330,35 @@ fn a_changed_byte_in_a_form_file_takes_the_form_out_of_service_and_not_the_store
     };
     let want = {
         let mut db = Db::create(&dir, opts()).unwrap();
-        for c in 0..40u32 {
-            for j in 0..30 {
-                let i = (c * 37 + j * 101) % 700;
-                db.put(&k(i), &v(i, c));
+        if stride {
+            // Numbered keys once each, in order, a value of one width:
+            // every partition a run the stride form holds.
+            for i in 0..700u32 {
+                db.append(&k(i), &w(i));
+                if i % 30 == 29 {
+                    db.commit().unwrap();
+                }
             }
             db.commit().unwrap();
+        } else {
+            for c in 0..40u32 {
+                for j in 0..30 {
+                    let i = (c * 37 + j * 101) % 700;
+                    db.put(&k(i), &v(i, c));
+                }
+                db.commit().unwrap();
+            }
         }
         db.flush().unwrap();
         db.settle().unwrap();
         db.zpages_settle().unwrap();
         assert!(!db.zpage_form_files().is_empty(), "no form file to change");
+        let z = db.zpage_counts();
+        assert_eq!(
+            z.stride_files > 0,
+            stride,
+            "premise: the body under test is the one built: {z:?}"
+        );
         digest_of(&db)
     };
     let pristine = snapshot(&dir);
@@ -2323,9 +2412,10 @@ fn a_changed_byte_in_a_form_file_takes_the_form_out_of_service_and_not_the_store
         db.read_all(&k(i), vf(&mut |x| got.push(x.to_vec())))
             .unwrap();
     }
+    let z = db.zpage_counts();
     assert!(
-        db.zpage_counts().reads > 0,
-        "premise: reads through the form"
+        z.reads > 0 && (z.stride_reads > 0) == stride,
+        "premise: reads through the form, the body under test's: {z:?}"
     );
     // Every form file changed, a byte a chunk: which of them the store
     // serves is the controller's, and a file it does not is read by nobody.

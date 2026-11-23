@@ -16003,7 +16003,30 @@ fn the_stride_switch_gives_the_stores_it_reaches_the_stride_form() {
 /// are counted, under a piece among them.
 #[test]
 fn the_oracle_holds_with_the_stride_form_forced() {
-    stride_oracle("stride-oracle", false);
+    stride_oracle("stride-oracle", false, None);
+}
+
+/// The stride oracle with the store under a cipher, in a cache of
+/// plaintext a small part of the store: the stride form built from records
+/// read by the piece, read back, attached and served through the store's
+/// cache, every page of a stride file asked for before it is read and
+/// asked for again once the cache has given it back -- which it has to
+/// have done, a run in a cache that gave nothing back being the test in
+/// the clear. The store beside it stays in the clear and in the raw form.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_oracle_holds_with_the_stride_form_forced_under_a_cipher() {
+    stride_oracle("stride-oracle-cipher", false, Some(64 << 10));
+}
+
+/// The same with the block cache on: its walks, cuts and builds read a
+/// stride partition under a cipher through the cursor's stride position,
+/// and its builders rest between two blocks, after which what they read
+/// is asked for again.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_oracle_holds_with_the_stride_form_forced_and_the_block_cache_on_under_a_cipher() {
+    stride_oracle("stride-oracle-cache-cipher", true, Some(64 << 10));
 }
 
 /// The stride oracle with the block cache on: the scans are the block
@@ -16013,7 +16036,7 @@ fn the_oracle_holds_with_the_stride_form_forced() {
 /// settles of the writes filed by the codec's arithmetic.
 #[test]
 fn the_oracle_holds_with_the_stride_form_forced_and_the_block_cache_on() {
-    stride_oracle("stride-oracle-cache", true);
+    stride_oracle("stride-oracle-cache", true, None);
 }
 
 /// The entries `got` of a window from `start` are the live model's from
@@ -16032,9 +16055,18 @@ fn live_prefix(model: &Model, start: &[u8], got: &Window, least: usize, what: &s
     );
 }
 
-fn stride_oracle(name: &str, cache: bool) {
+fn stride_oracle(name: &str, cache: bool, cipher: Option<u64>) {
     const N: usize = 2400;
     let opts = |on: bool| Options {
+        // The store under test under a cipher, in a cache of `budget`
+        // bytes of plaintext; the store beside it in the clear.
+        encryption: match cipher.filter(|_| on) {
+            Some(budget) => supdb::Encryption::Cipher(
+                supdb::StoreCipher::new(common::Gcm::new(&[0x5d; 32]), common::Gcm::new)
+                    .cache_bytes(budget),
+            ),
+            None => supdb::Encryption::None,
+        },
         zpages: if on { ZPages::Always } else { ZPages::Off },
         zpages_stride: if on { ZStride::Forced } else { ZStride::Off },
         scan_block_cache: cache,
@@ -16254,20 +16286,28 @@ fn stride_oracle(name: &str, cache: bool) {
     // `ZStride::Forced` the build that meets either is the block form's
     // decline and counted there alone, so those two slots stay empty
     // whatever the store holds.
-    let [_, holes, not_one, width, tomb, _, _, check_no, _, kept] = sum.stride_declines;
+    let [_, holes, not_one, width, tomb, _, _, check_no, _] = sum.stride_declines;
     assert!(
         not_one > 0 && holes + tomb > 0,
         "the second values' and the deletes' partitions declined: {sum:?}"
     );
     assert_eq!(
-        (width, check_no, kept),
-        (0, 0, 0),
+        (width, check_no),
+        (0, 0),
         "declines no partition here can give: {sum:?}"
     );
     assert!(
         c.stride_files > 0 && c.stride_files < c.partitions,
         "both bodies in one store at the end: {c:?}"
     );
+    if cipher.is_some() {
+        let cc = z.cipher_counts().expect("the store is under a cipher");
+        assert!(
+            cc.cache.evicted_units > 0 && cc.cache.fills > cc.cache.evicted_units,
+            "the cache gave nothing back, and the run was the clear one's: {:?}",
+            cc.cache
+        );
+    }
     let _ = std::fs::remove_dir_all(&dz);
     let _ = std::fs::remove_dir_all(&dr);
 }
