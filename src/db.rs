@@ -2282,7 +2282,10 @@ pub struct Options {
     /// in core the advice is a syscall for pages that are there. The design
     /// gates it on the census's fault rate, which is a later stage's, so it
     /// is an option and an arm, `supdb-nocachezpagesprefetch`, counted
-    /// `prefetches`. Off.
+    /// `prefetches`. Off. A form file that is read by asking for each
+    /// page, a store's under a cipher, asks whatever this says: its pages
+    /// are bytes of an envelope mapped for reads far apart, so nothing
+    /// reads ahead of its walk but the ask (`zfile::ZFile::attach`).
     #[doc(hidden)]
     pub zpages_scan_prefetch: bool,
     /// The overlay walk of a covered partition (`scan_partitions`) through

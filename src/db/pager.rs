@@ -240,6 +240,7 @@ struct Counts {
     longest_wait_us: AtomicU64,
     breaths: AtomicU64,
     adopted_bytes: AtomicU64,
+    together: AtomicU64,
 }
 
 /// The longest a reader waits for a crowded cache (`Pager::breathe`).
@@ -278,6 +279,10 @@ pub struct PagerCounts {
     /// Waits of a reader for the cache to come back from well past its
     /// budget, each twenty milliseconds at most (`StoreCipher::cache_bytes`).
     pub breaths: u64,
+    /// Asks of several chunks, two or more of them not here, whose
+    /// ciphertext was asked of the kernel in one piece before the first
+    /// was decrypted (`StoreCipher::chunks_apart` off).
+    pub together: u64,
 }
 
 /// A store's cache of plaintext: its budget, what it holds, and the thread
@@ -295,6 +300,8 @@ pub(crate) struct Pager {
     /// there is somewhere to read it again from.
     unbacked: AtomicU64,
     peak: AtomicU64,
+    /// `StoreCipher::chunks_apart`.
+    apart: AtomicBool,
     files: Mutex<Vec<Weak<Paged>>>,
     /// The era the holds stand in (`Hold`), and the holds.
     era: AtomicU64,
@@ -328,6 +335,7 @@ impl Pager {
             held: AtomicU64::new(0),
             unbacked: AtomicU64::new(0),
             peak: AtomicU64::new(0),
+            apart: AtomicBool::new(false),
             files: Mutex::new(Vec::new()),
             era: AtomicU64::new(1),
             holds: Mutex::new(Vec::new()),
@@ -400,6 +408,12 @@ impl Pager {
         self.peak.store(self.held(), Ordering::Relaxed);
     }
 
+    /// Whether an ask of several chunks leaves each chunk's ciphertext to
+    /// its own fault (`StoreCipher::chunks_apart`).
+    pub(crate) fn keep_apart(&self, apart: bool) {
+        self.apart.store(apart, Ordering::Relaxed);
+    }
+
     pub(crate) fn counts(&self) -> PagerCounts {
         let c = &self.counts;
         let r = |a: &AtomicU64| a.load(Ordering::Relaxed);
@@ -418,6 +432,7 @@ impl Pager {
             waited_us: r(&c.waited_us),
             longest_wait_us: r(&c.longest_wait_us),
             breaths: r(&c.breaths),
+            together: r(&c.together),
         }
     }
 
@@ -1041,6 +1056,58 @@ impl Paged {
         Ok(())
     }
 
+    /// The ciphertext of chunks `c..=b` asked of the kernel in one piece,
+    /// where two or more of them are not here: `c` is the first chunk of
+    /// an ask of several that is not lent as it stands. The envelope is
+    /// mapped for reads far apart, so each chunk's fill faults its own
+    /// page of ciphertext and waits for the device by itself, and an ask
+    /// that lies across two chunks, which is every page of a form file
+    /// and one record in thirty, waited twice for two pages that lie side
+    /// by side on the device. Asked for first, they come in one read.
+    /// Nothing for an ask with one chunk gone, whose fault is the whole of
+    /// its read, and nothing where the store keeps its chunks apart
+    /// (`StoreCipher::chunks_apart`). A hint, read with no claim on the
+    /// chunks: one that another thread fills meanwhile was asked for
+    /// nothing.
+    #[cold]
+    #[inline(never)]
+    fn ask_together(&self, c: usize, b: usize) {
+        if self.pager.apart.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some((first, last)) = self.gone_span(c, b) else {
+            return;
+        };
+        let Some(back) = self.back.get() else {
+            return;
+        };
+        let ps = page_size();
+        let from = back.hdr.stored_off(first as u64) as usize / ps * ps;
+        let to = (back.hdr.stored_off(last as u64) as usize + self.chunk_len(last) + TAG)
+            .min(back.map.len());
+        if to <= from {
+            return;
+        }
+        // SAFETY: an advice over pages of the envelope's mapping.
+        unsafe {
+            libc::madvise(
+                back.map.as_ptr().add(from).cast_mut().cast(),
+                to - from,
+                libc::MADV_WILLNEED,
+            );
+        }
+        self.pager.counts.together.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The first and the last of chunks `c..=b` that are not here, where
+    /// two or more are not: what `ask_together` asks for.
+    fn gone_span(&self, c: usize, b: usize) -> Option<(usize, usize)> {
+        let mut gone = (c..=b).filter(|&i| self.state[i].load(Ordering::Relaxed) == EMPTY);
+        let first = gone.next()?;
+        let last = gone.next_back()?;
+        Some((first, last))
+    }
+
     /// `ensure` for a chunk that is not `HOT`.
     #[inline(never)]
     fn slow(&self, c: usize) -> bool {
@@ -1356,7 +1423,16 @@ impl Paging for Paged {
         if b >= self.state.len() {
             return false;
         }
-        (a..=b).all(|c| self.state[c].load(Ordering::SeqCst) == HOT || self.slow(c))
+        let mut first = true;
+        (a..=b).all(|c| {
+            if self.state[c].load(Ordering::SeqCst) == HOT {
+                return true;
+            }
+            if std::mem::take(&mut first) && c < b {
+                self.ask_together(c, b);
+            }
+            self.slow(c)
+        })
     }
 
     fn piece_end(&self, off: u64) -> u64 {
@@ -2031,6 +2107,62 @@ mod tests {
             &bytes[..100],
             "asked for again, the borrow reads as it did"
         );
+        drop(p);
+        pager.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An ask that lies across chunks asks the kernel for the ciphertext
+    /// of the ones that are gone in one piece where two or more are, and
+    /// for nothing otherwise: an ask inside one chunk, an ask with one
+    /// chunk gone, an ask whose chunks are all here, and any ask of a
+    /// store that keeps its chunks apart. And what is read is the
+    /// plaintext, whichever way the ciphertext came.
+    #[test]
+    fn an_ask_of_several_chunks_asks_for_their_ciphertext_together() {
+        let dir = scratch("together");
+        let bytes = plain(1024 * 1024, 5);
+        envelope(&dir.join("e"), &bytes, 31);
+        let pager = Pager::new(u64::MAX);
+        let p = sparse(&pager, &dir.join("e"), 31);
+        let _h = pager.hold();
+        let together = || pager.counts().together;
+        let at = |chunk: usize, back: usize| (chunk * CHUNK - back) as u64;
+        let same = |off: u64, len: usize| {
+            let got = read(&p, off, len).expect("a range of the file");
+            assert_eq!(got, &bytes[off as usize..off as usize + len], "at {off}");
+        };
+        // Inside one chunk: its own fault is the whole of its read.
+        same(10, 100);
+        assert_eq!(together(), 0, "an ask inside one chunk");
+        // Across two chunks, the first of them here.
+        same(at(1, 50), 100);
+        assert_eq!(together(), 0, "an ask with one chunk gone");
+        // Across two chunks, both gone.
+        same(at(4, 50), 100);
+        assert_eq!(together(), 1, "an ask with two chunks gone");
+        // Again: both are here, and nothing is asked of the kernel.
+        same(at(4, 50), 100);
+        assert_eq!(together(), 1, "an ask whose chunks are here");
+        // Three chunks, the middle one here: the two gone are a span.
+        same(at(11, 0), 10);
+        assert_eq!(p.gone_span(10, 12), Some((10, 12)));
+        same(at(10, 0), 3 * CHUNK);
+        assert_eq!(together(), 2, "two gone about one that is here");
+        assert_eq!(p.gone_span(10, 12), None, "none gone");
+        // Three chunks, the middle one gone: no span, and nothing asked.
+        same(at(20, 0), 10);
+        same(at(22, 0), 10);
+        assert_eq!(p.gone_span(20, 22), None, "one gone");
+        same(at(20, 0), 3 * CHUNK);
+        assert_eq!(together(), 2, "one gone between two that are here");
+        // Kept apart, an ask with two gone asks for nothing together.
+        pager.keep_apart(true);
+        same(at(31, 50), 100);
+        assert_eq!(together(), 2, "kept apart");
+        pager.keep_apart(false);
+        same(at(41, 50), 100);
+        assert_eq!(together(), 3, "and together again");
         drop(p);
         pager.stop();
         let _ = std::fs::remove_dir_all(&dir);

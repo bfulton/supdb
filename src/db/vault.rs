@@ -196,6 +196,7 @@ pub struct StoreCipher {
     data: Arc<Maker>,
     key_id: u64,
     cache: Option<u64>,
+    apart: bool,
 }
 
 impl StoreCipher {
@@ -212,6 +213,7 @@ impl StoreCipher {
             data: Arc::new(move |k| Box::new(data(k)) as Box<DynAead>),
             key_id: 0,
             cache: None,
+            apart: false,
         }
     }
 
@@ -235,6 +237,19 @@ impl StoreCipher {
     /// the page cache for a plain store (`Options::scan_cache_bytes`).
     pub fn cache_bytes(mut self, bytes: u64) -> StoreCipher {
         self.cache = Some(bytes);
+        self
+    }
+
+    /// Whether a read that wants several chunks of a file at once leaves
+    /// each chunk's ciphertext to be read from the device as that chunk is
+    /// decrypted. As shipped, off: where two or more of the chunks are not
+    /// in the cache, the store asks the kernel for the ciphertext of all
+    /// of them before it decrypts the first, so chunks that lie side by
+    /// side on the device come in one read (`CipherCounts`' cache counts
+    /// them, `together`). On is the shape that is priced against.
+    #[doc(hidden)]
+    pub fn chunks_apart(mut self, apart: bool) -> StoreCipher {
+        self.apart = apart;
         self
     }
 
@@ -776,7 +791,11 @@ impl Vault {
             nonces: Mutex::new(Nonces::new()?),
             persisting: Mutex::new(()),
             mapped: Mutex::new(Vec::new()),
-            pager: Pager::new(cipher.cache.unwrap_or_else(default_cache)),
+            pager: {
+                let pager = Pager::new(cipher.cache.unwrap_or_else(default_cache));
+                pager.keep_apart(cipher.apart);
+                pager
+            },
             counts: Counts::default(),
         })
     }

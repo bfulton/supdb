@@ -454,6 +454,8 @@ pub struct Supdb {
     cipher_cache: u64,
     /// `Policy::cipher_log`.
     cipher_log: bool,
+    /// `Policy::cipher_apart`.
+    cipher_apart: bool,
     /// False for the ingest-first arm: a flush stops partitioning what it
     /// sealed and leaves that to the background -- promotion at once, a
     /// merge for the rest (`Options::flush_schedules`). Both arms exist so
@@ -1864,6 +1866,12 @@ struct Policy {
     /// controller buys under a cipher priced against the raw form it
     /// stays in otherwise.
     cipher_auto: bool,
+    /// The store under a cipher with each chunk's ciphertext left to its
+    /// own read of the device (`StoreCipher::chunks_apart`), where the
+    /// store as shipped asks for the ciphertext of an ask's chunks
+    /// together: `supdb-cipherzstrideapart`, beside `supdb-cipherzstride`,
+    /// whose every page is two chunks.
+    cipher_apart: bool,
     partition: bool,
     drain: bool,
     advice: Option<supdb::ReadAdvice>,
@@ -3015,6 +3023,7 @@ impl Default for Policy {
             cipher_auto: false,
             cipher_cache: 0,
             cipher_log: false,
+            cipher_apart: false,
             partition: true,
             drain: true,
             advice: None,
@@ -3466,11 +3475,16 @@ impl Policy {
 /// that asks for it, a cipher of the suite's for the cipher arms (with the
 /// cache the arm bounds it to), and none for the rest. One way or neither:
 /// the engine takes one choice, and no arm is under both.
-fn encryption_of(dir_key: bool, cipher: bool, cipher_cache: u64) -> supdb::Encryption {
+fn encryption_of(
+    dir_key: bool,
+    cipher: bool,
+    cipher_cache: u64,
+    cipher_apart: bool,
+) -> supdb::Encryption {
     match (dir_key, cipher) {
         (true, _) => supdb::Encryption::Kernel(supdb::DirKey::new([0x5a; 32])),
         (false, true) => {
-            let c = supdb::StoreCipher::new(Gcm::new(), Gcm::of);
+            let c = supdb::StoreCipher::new(Gcm::new(), Gcm::of).chunks_apart(cipher_apart);
             supdb::Encryption::Cipher(match cipher_cache {
                 0 => c,
                 bytes => c.cache_bytes(bytes),
@@ -3604,6 +3618,25 @@ impl Supdb {
             path,
             Policy {
                 cipher: true,
+                zpages: true,
+                zstride: Some(supdb::ZStride::Forced),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherzstride` with each chunk's ciphertext left to its own
+    /// read (`StoreCipher::chunks_apart`): `supdb-cipherzstrideapart`. A
+    /// stride page lies across two chunks of its envelope, so the pair
+    /// prices the one read of both against two, read by the cache's count
+    /// of asks made together (`cipher_asked_together`) and the passes'
+    /// major faults before their rates.
+    pub fn create_cipher_zstride_apart(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_apart: true,
                 zpages: true,
                 zstride: Some(supdb::ZStride::Forced),
                 ..Policy::default()
@@ -9564,6 +9597,7 @@ impl Supdb {
             cipher_auto,
             cipher_cache,
             cipher_log,
+            cipher_apart,
             partition,
             drain,
             advice,
@@ -10540,7 +10574,7 @@ impl Supdb {
                 opts.direct_ingest = false;
             }
         }
-        opts.encryption = encryption_of(dir_key, cipher, cipher_cache);
+        opts.encryption = encryption_of(dir_key, cipher, cipher_cache, cipher_apart);
         let db = if REOPEN.with(|r| r.get()) {
             supdb::Db::open(path, opts)
         } else {
@@ -10555,6 +10589,7 @@ impl Supdb {
             cipher_auto,
             cipher_cache,
             cipher_log,
+            cipher_apart,
             partition,
             drain,
             advice,
@@ -10959,6 +10994,7 @@ impl Engine for Supdb {
         if self.cipher {
             let zstride = self.zstride == Some(supdb::ZStride::Forced);
             return match self.durable {
+                true if self.zpages && zstride && self.cipher_apart => "supdb-cipherzstrideapart",
                 true if self.zpages && zstride => "supdb-cipherzstride",
                 true if self.zpages => "supdb-cipherzpages",
                 true if self.cipher_log => "supdb-cipherlog",
@@ -12603,6 +12639,7 @@ impl Engine for Supdb {
             ("cipher_breaths", pc.breaths as f64),
             ("cipher_evictor_waited_us", pc.waited_us as f64),
             ("cipher_evictor_longest_wait_us", pc.longest_wait_us as f64),
+            ("cipher_asked_together", pc.together as f64),
             ("cipher_evictor_passes", pc.passes as f64),
             ("lazy_scans_done", db.lazy_scans().0 as f64),
             ("lazy_scans_resumed", db.lazy_scans().1 as f64),
@@ -14130,6 +14167,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cipherauto"
         | "supdb-cipherzpages"
         | "supdb-cipherzstride"
+        | "supdb-cipherzstrideapart"
         | "supdb-nocacheordread"
         | "supdb-nocachezpages"
         | "supdb-nocachezpagesnodrop"
@@ -14723,6 +14761,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cipherauto" => supdb_arm(Supdb::create_cipherauto, dir)?,
         "supdb-cipherzpages" => supdb_arm(Supdb::create_cipher_zpages, dir)?,
         "supdb-cipherzstride" => supdb_arm(Supdb::create_cipher_zstride, dir)?,
+        "supdb-cipherzstrideapart" => supdb_arm(Supdb::create_cipher_zstride_apart, dir)?,
         "supdb-ingestcipher" => supdb_arm(Supdb::create_ingest_cipher, dir)?,
         "supdb-ingestcipherauto" => supdb_arm(Supdb::create_ingest_cipherauto, dir)?,
         "supdb-nocacheordread" => supdb_arm(Supdb::create_nocache_ordread, dir)?,
@@ -16650,6 +16689,25 @@ mod tests {
         // where the options do not (`Db::cipher_counts` answers for it).
         let under = |a: &Supdb| a.db.as_ref().unwrap().cipher_counts().is_some();
         assert!(!under(&plain), "supdb is in the clear");
+        // The arm that keeps its chunks apart is the stride arm in every
+        // option: what it changes is the cipher's, which the options hand
+        // to the store.
+        let apart = arm(
+            "supdb-cipherzstrideapart",
+            Supdb::create_cipher_zstride_apart,
+        );
+        assert!(under(&apart), "supdb-cipherzstrideapart: under a cipher");
+        let za = o(&apart);
+        assert_eq!(za.zpages, zs.zpages, "supdb-cipherzstrideapart");
+        assert_eq!(
+            za.zpages_stride, zs.zpages_stride,
+            "supdb-cipherzstrideapart"
+        );
+        assert_eq!(
+            guarantee("supdb-cipherzstrideapart"),
+            guarantee("supdb-cipher")
+        );
+        drop(apart);
         for (name, a) in [
             ("supdb-cipher", &cipher),
             ("supdb-cipherlog", &log),
@@ -16710,22 +16768,25 @@ mod tests {
     fn the_dirkey_arm_asks_the_kernel_and_the_cipher_arms_a_cipher() {
         use supdb::Encryption;
         assert!(matches!(
-            encryption_of(true, false, 0),
+            encryption_of(true, false, 0, false),
             Encryption::Kernel(_)
         ));
         assert!(matches!(
-            encryption_of(true, true, 0),
+            encryption_of(true, true, 0, false),
             Encryption::Kernel(_)
         ));
         assert!(matches!(
-            encryption_of(false, true, 0),
+            encryption_of(false, true, 0, false),
             Encryption::Cipher(_)
         ));
         assert!(matches!(
-            encryption_of(false, true, 64 << 20),
+            encryption_of(false, true, 64 << 20, false),
             Encryption::Cipher(_)
         ));
-        assert!(matches!(encryption_of(false, false, 0), Encryption::None));
+        assert!(matches!(
+            encryption_of(false, false, 0, false),
+            Encryption::None
+        ));
         // And the bound reaches the store: `supdb-cipher64`'s cache is its
         // policy's sixty-four mebibytes, `supdb-cipher`'s the engine's own.
         let root =

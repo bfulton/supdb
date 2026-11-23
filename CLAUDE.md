@@ -2376,7 +2376,13 @@ cipher a tenth (`perf record -e cpu-clock --call-graph dwarf` over `cargo
 run --release --example cipher_store 1000000 64`, the samples under
 `Paged::slow` by their leaf). That is a fault a page where a plain store
 out of memory pays a device's answer, and a store larger than memory pays
-both; a run of chunks populated and decrypted as one is the open item.
+both. Where one ask wants several chunks and two or more of them are
+gone, the ciphertext of them all is asked of the kernel before the first
+is decrypted (`Paged::ask_together`; `StoreCipher::chunks_apart` is the
+shape before, `supdb-cipherzstrideapart` its arm), since the envelope is
+mapped for reads far apart and each chunk's fill otherwise waits for the
+device by itself; the fresh pages of a run of chunks populated as one is
+the open item.
 The budget is of the files' plaintext. A file being written is in memory
 whole until it has its envelope, a seal's output or a merge's piece,
 which the cache counts and cannot give back; and the block cache held

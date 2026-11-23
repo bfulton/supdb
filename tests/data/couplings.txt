@@ -324,7 +324,7 @@ src/db/zfile.rs	Held::<item>	held build	code	1	R4	impl Walked for Held
 src/db/zfile.rs	Held::<item>	pager	code	1	R4	impl Walked for Held
 src/db/zfile.rs	Mapped::<item>	held build	code	1	R4	impl Walked for Mapped
 src/db/zfile.rs	Walked::<item>	held build	code	1	R4	
-src/db/zfile.rs	ZFile::attach	piecewise/ASK_PIECES	code	1	stays	the form asks its source once, at the attach, whether it lends by the piece (ZFile::asks): a stride file that asks has each page asked for at the page's check
+src/db/zfile.rs	ZFile::attach	piecewise/ASK_PIECES	code	1	stays	the form asks its source once, at the attach, whether it lends by the piece (ZFile::asks): a stride file that asks has each page asked for at the page's check, and a file that asks has its walks ask ahead
 src/db/zfile.rs	ZFile::attach	vault::hold	code	1	S1	vault::hold -> pin::hold
 src/db/zfile.rs	build_file_seen	cipher	code	1	R4	the held build's error string
 src/db/zfile.rs	build_file_seen	held build	code	1	R4	the SegSrc::Kept arm of the held build

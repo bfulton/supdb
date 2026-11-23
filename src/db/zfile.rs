@@ -3760,6 +3760,15 @@ impl ZFile {
         // of it asked for before it is read: the one place the form asks
         // its source which kind it is (`ZFile::asks`).
         let asks = map.piecewise();
+        // A file that asks has its walks ask ahead whatever the option
+        // says (`Options::zpages_scan_prefetch`, `ZFile::ask_ahead`,
+        // `stride_ask_ahead`): the pages a walk will cross are bytes of an
+        // envelope mapped for reads far apart, each read from the device
+        // by itself where its chunk is decrypted, and asked for as the
+        // walk begins they come while it reads its first. A mapped file's
+        // walk is left to the option, which is the kernel's readahead
+        // priced against the ask.
+        let prefetch = prefetch || asks;
         let len = map.len();
         if len < ZTRAILER as u64 || !len.is_multiple_of(ZPAGE as u64) {
             return Err(damage(ZError::Length));

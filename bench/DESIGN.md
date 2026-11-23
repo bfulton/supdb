@@ -406,7 +406,10 @@ and `supdb-ingestcipherauto`, the controller on
 (`Options::zpages_under_cipher`). And two that force the compact form
 there, each coding priced by itself: `supdb-cipherzpages`, every
 partition's form file in the block coding, and `supdb-cipherzstride`,
-every build asking for the stride form. That
+every build asking for the stride form; `supdb-cipherzstrideapart` is the
+second with each chunk's ciphertext read from the device by itself
+(`StoreCipher::chunks_apart`), where the store asks for the chunks of one
+ask together. That
 cache is half of what the process may use unless an arm says otherwise,
 which at the suite's in-core rungs is a store that fits it;
 `supdb-cipher64` is the same store with a cache of sixty-four mebibytes,

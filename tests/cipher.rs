@@ -1984,6 +1984,99 @@ fn a_stride_build_holds_its_cache_and_not_its_partition() {
     form_build_rests("striderests", true);
 }
 
+/// A walk through a form file under a cipher asks for the pages it will
+/// cross as it begins, the scans' prefetch off as shipped
+/// (`Options::zpages_scan_prefetch`): each is bytes of an envelope mapped
+/// for reads far apart, read from the device by itself where its chunk is
+/// decrypted, so a walk that asked for nothing waited once a page. In
+/// either body; a walk of a few keys, inside its page, asks for nothing;
+/// and the same store in the clear leaves its walks to the option.
+#[test]
+fn a_walk_through_a_form_file_under_a_cipher_asks_for_the_pages_it_will_cross() {
+    for (stride, name) in [(true, "walkasks-stride"), (false, "walkasks-block")] {
+        for clear in [false, true] {
+            let dir = scratch(&format!("{name}-{clear}"));
+            let n = 20_000u32;
+            let opts = Options {
+                encryption: if clear {
+                    Encryption::None
+                } else {
+                    Encryption::Cipher(cipher(41))
+                },
+                zpages: supdb::ZPages::Always,
+                zpages_min_bytes: 0,
+                ..Options::default()
+            };
+            assert!(!opts.zpages_scan_prefetch, "the option as shipped");
+            let mut db = Db::create(&dir, opts).unwrap();
+            for i in 0..n {
+                db.append(&k(i), &if stride { w(i) } else { v(i, 0) });
+                if i % 500 == 499 {
+                    db.commit().unwrap();
+                }
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+            db.settle().unwrap();
+            db.zpages_settle().unwrap();
+            let z = db.zpage_counts();
+            assert_eq!(
+                z.stride_files > 0,
+                stride,
+                "{name}: the body the values call for: {z:?}"
+            );
+            // Short walks: inside a page, nothing to ask for.
+            let before = db.zpage_counts();
+            for i in (0..n).step_by(997) {
+                let mut seen = 0;
+                db.scan(&k(i), 2, kv(&mut |_, _| seen += 1)).unwrap();
+                assert!(seen >= 1);
+            }
+            let short = db.zpage_counts();
+            assert!(
+                short.scans > before.scans,
+                "{name}: no walk through the form"
+            );
+            // Long ones: several pages each.
+            let mut walks = 0u64;
+            for i in (0..n - 1000).step_by(997) {
+                let mut seen = 0u32;
+                db.scan(
+                    &k(i),
+                    600,
+                    kv(&mut |key, _| {
+                        assert_eq!(key, &k(i + seen)[..], "{name}: the walk's order");
+                        seen += 1;
+                    }),
+                )
+                .unwrap();
+                assert_eq!(seen, 600, "{name}");
+                walks += 1;
+            }
+            let long = db.zpage_counts();
+            assert_eq!(long.fallbacks, 0, "{name}: {long:?}");
+            if clear {
+                assert_eq!(
+                    long.prefetches, 0,
+                    "{name}: a mapped file's walk is the option's: {long:?}"
+                );
+            } else {
+                assert!(
+                    short.prefetches - before.prefetches <= 2,
+                    "{name}: walks of two keys asked ahead: {short:?}"
+                );
+                assert!(
+                    long.prefetches - short.prefetches >= walks,
+                    "{name}: {walks} walks of several pages asked {} times: {long:?}",
+                    long.prefetches - short.prefetches
+                );
+            }
+            drop(db);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
 fn form_build_rests(name: &str, stride: bool) {
     let _quiet = one_at_a_time();
     let n = 250_000;
