@@ -174,11 +174,11 @@ is current with upstream as of that commit. What the merge took and what was che
   function upstream's build inlines where ours calls it, beside the caller that lost more.
   Nothing new gained with these eight commits.
 
-Still owed from before this merge: `sh scripts/cost-red.sh` since `join_seal`'s bound moved to
-0.04 (`594fe3ca`), and that commit's review -- read on 22 Nov by this session and found sound
-(`OrdIndex::whole_key_at`'s plain half indexes `top_eager` within its length for a mapped file,
-`vault::persist`'s pairs are made only under a cipher, the seal's closure borrows), but read by
-one reader only.
+No longer owed from before this merge: `sh scripts/cost-red.sh`, run on 23 Nov at `7020bd7`
+after `join_seal`'s bound moved to 0.04 (`594fe3ca`), all ten steps ok. That commit's review:
+read on 22 Nov by this session and found sound (`OrdIndex::whole_key_at`'s plain half indexes
+`top_eager` within its length for a mapped file, `vault::persist`'s pairs are made only under a
+cipher, the seal's closure borrows), by one reader only.
 
 ## Correction from the owner, after the note below was written (22 Nov)
 
