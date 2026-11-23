@@ -75,19 +75,35 @@ owner's:
   upstream's new code maps a file by its path (`MmapBytes::open`) or
   reads residency over a mapping's lent bytes, the two things this
   branch moved behind the seam (`vault::map`, `map_len`,
-  `map_resident_share`, `OrdIndex::resident_share`), three sites at the
-  last merge. What each merge is shown to hold: nothing of either side
-  lost, every function both sides touched read once in its merged body;
-  this branch's gates over upstream's new code, each answered in its own
-  terms (a count raised in its list with the raise declared in
-  `scripts/raises.txt`, and the lists run against the main line and
-  against the branch's tip before the merge, `SUPDB_BASE=<that tip> sh
-  scripts/check.sh lists`); each new mechanism of upstream's read for
-  which bytes it reads and through what, and held under a cipher by a
-  test where it reads a file; the differential fuzz beyond the gate's
-  range, under a cipher in a small cache, in the clear, and with the
-  compact form forced under a cipher (`ZFUZZ_CACHE=all ZFUZZ_OPTVARY=1`
-  in each); every arm of the rosters opened once at the smallest rung;
+  `map_resident_share`, `OrdIndex::resident_share`), three sites at one
+  merge; at the next an advice and a count over those bytes with a read
+  of `/proc/self/pagemap` beside them, which a source answers now
+  (`Bytes::populate_read`, `Bytes::mapped_share`, and a paged mapping's
+  pager for it). It is wrong outside the engine too, where nothing
+  conflicts: that merge gave a set-up step upstream's suite had come to
+  need (FASTER's sources, which its build script stops without) to
+  upstream's CI jobs and to neither job this branch had added that
+  builds the suite, nor to the worktree the count builds its base in.
+  What each merge is shown to hold: nothing of either side lost, every
+  function both sides touched read once in its merged body; the
+  toolchain the runners use (`rustup update stable`, upstream's own
+  note), under which the lint and the count are the runner's (the entry
+  on a count held under one compiler, below); this branch's gates over
+  upstream's new code, each answered in its own terms (a count raised in
+  its list with the raise declared in `scripts/raises.txt`, and the
+  lists run against the main line and against the branch's tip before
+  the merge, `SUPDB_BASE=<that tip> sh scripts/check.sh lists`);
+  whatever set-up upstream's jobs gained given to this branch's
+  (`tests/source.rs` holds the comparators' pair); each new mechanism of
+  upstream's read for which bytes it reads and through what, and held
+  under a cipher by a test where it reads a file; the differential fuzz
+  beyond the gate's range, under a cipher in a small cache, in the
+  clear, and with the compact form forced under a cipher
+  (`ZFUZZ_CACHE=all ZFUZZ_OPTVARY=1` in each); every arm of the rosters
+  opened once at the smallest rung, the encrypted roster's by the `enc`
+  group, and a forced arm at a rung the harness takes it at (at three
+  hundred thousand keys upstream's own build refuses one: a partition
+  under the form's floor holds over a hundredth of the keys);
   `sh scripts/cost.sh <upstream's head>`, every probe at or under
   upstream by its total and no function's gain new (it exits red by
   function there, on moves: `ROADMAP.md`); and the whole gate.
@@ -5476,7 +5492,19 @@ in eight, the same test at the same line; none of thirty without the
 oracle. The tests there hold a lock for read while they open stores and
 the oracle spawns under it for write (`no_fork`). The engine's own answer
 to a caller that forks is the same refusal, for as long as a child takes
-to reach its exec.
+to reach its exec. And it came back as a claim. The cache of a store
+under a cipher gives way, between two readings of its room, to what the
+process's large buffers have mapped and not yet touched
+(`pager::Room::claimed`), a count of every store in the process; the
+test of a cache following a room read it beside thirty other tests'
+stores, under a seam that gave the room and left the claim the
+platform's, so another test mapping a table took this store's budget to
+nothing: "budget: 0, held: 0" under a room of ten mebibytes, in a
+merge's first gate, where it read as the merge's until the whole binary
+was run eight times at the commit and was red in two. A room a test
+gives carries no claim. The corollary: a seam that replaces one input of
+a mechanism replaces every input the mechanism reads from the process,
+or the test is of the process.
 
 **A call site no real input reaches red.** The suite's refusals after the
 read pass and after the shuffled load were green-side only, because a real
@@ -8985,6 +9013,54 @@ counted again in the regime in front of it, the fault's price being the
 regime's and not the mechanism's; and resident is not mapped --
 `mincore` answers the first and `/proc/self/pagemap` the second, and a
 test of the second reads the second.
+
+**A count held under one compiler, read under the next.** The count
+against upstream's head, taken at a merge on the toolchain the runners
+had moved to (1.100, from the container's 1.97), read four probes over
+upstream by total where the count before had every one under: the scans
+through the compact form's blocks by ten instructions a record and
+through its stride file by one. Counted against this branch's own
+commits under the one compiler, the stride step's one was the page
+check's answer made a word (`PageOk`, "A second way for a check to say
+yes"), which the older compiler had read level: the failing branch of
+the sparse number's read, never taken in a store with no damage, was
+laid ahead of the step's return, and the whole run's path jumped over
+it. Marked cold (`core::hint::cold_path`) the step is an instruction
+under upstream's. The block form's ten were no commit's: the same
+source, in which the reader of a parsed record's values that this
+branch had written for that loop under the older compiler
+(`Blob::read_exts_inline`, out of line to give the loop a register
+back) now cost it several. Upstream's own text at that call read two a
+record over upstream's build, the reader as a call three, the common
+records in a loop of their own inside the walk three; the loop in a
+function of its own (`zfile::walk_fixed`), entered on a record the walk
+has already found to be of the common shape, with the limit and the
+group's end one count, reads five under with what the walk does a group
+counted in, and a record of any other shape takes the path it took. Of
+five mutants of its bounds one outlived the form's tests, the bound by
+the group's end, which no store's group can exceed since a group's bytes
+hold exactly its records, and has a test that lowers the end by hand;
+and one hung them, a stop the run did not say to the walk, whose turn
+then took nothing for good: the walk asserts under the checked profile
+that a turn took its limit or met its end. What is left over upstream by function
+there is the form's open path, seventy instructions a scan of a hundred
+records in `zpages::view_with` and its neighbours, from a source file
+that is byte for byte upstream's and reads the same to the instruction
+against this branch's own commits: the release profile is one unit
+under link-time optimization, and an unchanged function's code follows
+the rest of the program. The rules: a fix that rests on what a compiler
+keeps in registers is a fix under that compiler, so the count is taken
+again on each toolchain the runners move to, before a gate is called
+green on it; a hot loop inside a large function is given a function of
+its own, since moving a callee out of its way moves the pressure and
+does not remove it, and four shapes of the callee were counted before
+the loop was moved; a branch a healthy store never takes says so where
+its place is the hot path's cost; a change that was not counted is
+counted before the next is built on it -- two of this branch's were
+not, and the bisect that cleared them is the count they were owed; and
+a move by function with no source behind it is read against the
+profile's unit of optimization before a cause is looked for in the
+function.
 
 ## Standing limitations
 

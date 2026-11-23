@@ -852,6 +852,17 @@ until the run is its own log). What it loses:
   the bounded scale's bounds are paired against it, and the three stores
   are paired on an encrypted directory under a kernel that names
   `xts-aes-aesni`.
+- [ ] **The threaded mixes in the encrypted roster.** Gets and puts from
+  several threads at once (`threads-A`, `threads-RMW` and their uniform
+  twins, `bench run --passes mixes-threaded`) are no pass of a row unless
+  asked for, and no encrypted row has carried them. `supdb-cipher` runs
+  them, its threads a reader each and a turn at the one writer, and so
+  does encrypted RocksDB through its shared handle; `lmdb3` and
+  `lmdb3-enc` stop with "takes no writes from threads here"
+  (`Engine::thread_writers`), the arm being on LMDB's C API with a
+  decrypting context a thread and no writer a thread yet. Done when the
+  two arms have one, a test of three threads reads back every value they
+  wrote, and the encrypted roster carries the cells in both groups.
 
 ### The order of the work
 
@@ -941,7 +952,23 @@ turned on neither.
   Done for that when the count is taken by instruction and a function's
   sum leaves its padding out, with a red input in which a gain of
   padding alone reads green beside a gain of one instruction that reads
-  red.
+  red. And the count is a function of the compiler: against one
+  line's head it moved four probes from under to over with a toolchain
+  and no commit (`CLAUDE.md`, "A count held under one compiler"), and
+  what stands over upstream by function since is the block form's open
+  path -- `zpages::view_with` five instructions a page view, with
+  `parse_page`, `ZCursor::open_at`, `ask_group_ahead`,
+  `ZFile::open_group_with` and `first_checks` about seventy a scan of a
+  hundred records between them (`sh scripts/cost.sh 94356bc scan_z`) --
+  from a source file identical on both sides, in probes that are under
+  by total. Which of the program's differences the link-time optimizer
+  answers with that is not known; it is to be found, by building
+  upstream's tree with this branch's files added one at a time, or shown
+  to be the unit's and held as a declared group. And the walk through a
+  form of records that are not the common shape -- several values of
+  different widths, a value in a block -- is on no probe of either
+  line's: `walk_fixed` leaves that path as it was by construction, and
+  nothing counts it.
 - [ ] **The gates that have run on no hosted runner.** The `cost`,
   `lists`, `cross-arm`, `machine`, `enc` and `fscrypt` jobs first run
   where the first pull request is opened, and the `machine` group has not

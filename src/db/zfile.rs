@@ -431,13 +431,14 @@ fn emit_fixed<F: FnMut(&[u8], &[u8])>(k: &[u8], run: &[u8], records: usize, f: &
     }
 }
 
-/// A walk's run of common records, in a function of its own: from `off`
-/// of `group`, at most `left` of them, each held to `until` and handed to
-/// `f` (`compact_fixed_at`, `emit_fixed`). Returns where it stopped, how
-/// many it handed over, and how the key it stopped at compares with
-/// `until` where it stopped for that; it stops short of `left` with no
-/// order at a record of any other shape, which the caller reads through
-/// the parse.
+/// A walk's run of common records, in a function of its own: `first`, the
+/// record the walk found at its position (`compact_fixed_at`), and the
+/// records of that shape after it in `group`, at most `left` in all, each
+/// held to `until` and handed to `f` (`emit_fixed`). Returns where it
+/// stopped, how many it handed over, and how the key it stopped at
+/// compares with `until` where it stopped for that; it stops short of
+/// `left` with no order at a record of any other shape, which the walk
+/// reads through the parse.
 ///
 /// Out of line because the walk is not: `ZCursor::walk_inner` holds the
 /// coded groups' walk, the parse of every other shape of record and their
@@ -447,20 +448,21 @@ fn emit_fixed<F: FnMut(&[u8], &[u8])>(k: &[u8], run: &[u8], records: usize, f: &
 /// reader three calls away (`Blob::read_exts_inline`), and three other
 /// shapes of that reader read 82, 82 and 83. Here the loop holds a group,
 /// a position, a count and the callback and nothing else, and the limit
-/// and the group's end are one count (`left`).
+/// and the group's end are one count (`left`). Entered on a record the
+/// walk has already found to be of the shape, so a record of another
+/// shape is read as it was, with no call that finds nothing.
 #[inline(never)]
-fn walk_fixed<F: FnMut(&[u8], &[u8])>(
-    group: &[u8],
+fn walk_fixed<'g, F: FnMut(&[u8], &[u8])>(
+    group: &'g [u8],
     mut off: usize,
+    first: (&'g [u8], &'g [u8], usize, usize),
     left: usize,
     until: Option<&[u8]>,
     f: &mut F,
 ) -> (usize, usize, Option<KeyOrder>) {
     let mut took = 0usize;
-    while took < left {
-        let Some((k, run, records, next)) = compact_fixed_at(group, off) else {
-            break;
-        };
+    let mut rec = Some(first);
+    while let Some((k, run, records, next)) = rec {
         if let Some(u) = until {
             match k.cmp(u) {
                 KeyOrder::Less => {}
@@ -470,6 +472,10 @@ fn walk_fixed<F: FnMut(&[u8], &[u8])>(
         emit_fixed(k, run, records, f);
         off = next;
         took += 1;
+        if took == left {
+            break;
+        }
+        rec = compact_fixed_at(group, off);
     }
     (off, took, None)
 }
@@ -1610,17 +1616,17 @@ impl<'a> ZCursor<'a> {
                 while n < limit && rank < end {
                     // The common records in place, a run of them at a time
                     // (`walk_fixed`); any other shape through the parse.
-                    let left = (limit - n).min(end - rank);
-                    let (at, took, met) = walk_fixed(group, off, left, until, f);
-                    off = at;
-                    rank += took;
-                    n += took;
-                    if met.is_some() {
-                        stop = met;
-                        break;
-                    }
-                    if took == left {
-                        break;
+                    if let Some(first) = compact_fixed_at(group, off) {
+                        let left = (limit - n).min(end - rank);
+                        let (at, took, met) = walk_fixed(group, off, first, left, until, f);
+                        off = at;
+                        rank += took;
+                        n += took;
+                        if met.is_some() {
+                            stop = met;
+                            break;
+                        }
+                        continue;
                     }
                     let Some((k, exts, tail, len)) = parse_record(group, off) else {
                         if partial {
@@ -1692,6 +1698,13 @@ impl<'a> ZCursor<'a> {
             if let Some(order) = stop {
                 return Ok((n, order));
             }
+            // Here short of the group's end with nothing wrong, the turn
+            // took its limit: a turn that neither took a record nor met
+            // `until` would be taken again for good.
+            debug_assert!(
+                n >= limit,
+                "a walk's turn that took nothing and met nothing"
+            );
         }
         Ok((n, KeyOrder::Greater))
     }
@@ -12251,6 +12264,40 @@ mod tests {
         ]);
         assert!(!cur.fell_back(), "start {start} limit {limit}");
         (seen, marks, counts)
+    }
+
+    /// A walk hands over no record past the end the cursor holds for its
+    /// group, whatever the group's bytes go on to hold: the run of common
+    /// records is counted against the limit and the group's end both
+    /// (`walk_fixed`'s `left`). The end is the group's count, held under
+    /// its page's entry and the partition's keys, and a group's bytes hold
+    /// exactly its records, so no store's walk can tell the two bounds
+    /// from one. The test lowers the end by hand: a run bounded by the
+    /// limit alone hands over the group's next records, and the walk as
+    /// written moves on to the next group three records in.
+    #[test]
+    fn a_walk_hands_over_no_record_past_its_groups_end() {
+        let fx = Fixture::new("walk-end", suite(1200, 43), 256);
+        let mut zfile = fx.zfile();
+        zfile.own_decoder = true;
+        zfile.cursor_view = true;
+        let v = page_view(zfile.page_bytes(0).unwrap()).unwrap();
+        let c0 = usize::from(v.group(0).unwrap().count);
+        assert!(c0 > 5 && v.groups() > 1, "a first group of {c0} records");
+        let memo = ZMemo::new();
+        let mut cur = ZCursor::at(&memo, &zfile, &fx.blob, 0);
+        assert_eq!((cur.rank, cur.end), (0, c0), "opened whole");
+        cur.end = 3;
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let (got, _) = cur
+            .walk_until(None, 5, &mut |k: &[u8], _: &[u8]| keys.push(k.to_vec()))
+            .unwrap();
+        assert_eq!(got, 5);
+        let want: Vec<Vec<u8>> = [0, 1, 2, c0, c0 + 1]
+            .iter()
+            .map(|&i| fx.recs[i].0.clone())
+            .collect();
+        assert_eq!(keys, want, "three of the first group, then the second's");
     }
 
     /// A walk's partial decode (`Options::zpages_walk_part`): a walk that
