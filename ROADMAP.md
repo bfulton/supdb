@@ -653,18 +653,23 @@ What an engine picker would hit, roughly in order.
     under 1 GiB and 1.25 GiB, ten sittings each of the lag sweep and of
     the mixes, with `scripts/stallwatch.py` beside them. Done when none
     is killed.
-  - The evictor's longest waits, 170-300 ms in every sitting
-    (`longest_ever_ms` on the `lagcounterscipher` line). In the trace
-    (`SUPDB_PAGER_TRACE=1`) each falls where a merge's finished output,
-    fifty megabytes, leaves the files being written, and a run's where it
-    closes: the output's envelope is sealed and written on the thread
-    that wrote it (`Emitter::leave`, `vault::persist_one`), under that
-    thread's hold of the cache, and the evictor waits out the write. Not
-    confirmed by the stack of who was waited for. The lever: the envelope
-    written at the walk's next rest, where the merge holds nothing it was
-    lent (`MergeRest`), counted on the plain merge first (`sh
-    scripts/cost.sh HEAD merge`), since the rest is a type that compiles
-    to nothing there.
+  - The evictor's waits, of which the long ones were a merge's. A merge
+    wrote each output's envelope under its hold of the cache, and writes
+    it unheld now (`CLAUDE.md`, the trace that named the close;
+    `a_merge_writing_an_envelope_holds_nothing_of_the_cache`). The same
+    sweep at `2a23cc4`, twelve sittings: 60 waits of sixty milliseconds
+    or more where it read 246, five and a half seconds of them for
+    thirty, and the longest of a sitting 107 ms at the median for 220.
+    What is left of them is no wait on a file: a thread's own cold reads
+    between two rests (a merge's `MERGE_REST` steps through the device,
+    the ordered index's top level built by the piece at a first seek),
+    and the upkeep thread freeing its forms under its pin.
+  - What that did not move. The most the kernel could not take back is
+    where it was, 581-612 MiB a sitting, each peak a tenth of a second
+    in a load: an ordered run's file in flight beside the cache with the
+    process at 50 MiB, or a shuffled load's tables at 400 beside 200 of
+    plaintext. The budget follows the room at twenty milliseconds, and
+    what the writer puts in flight between two readings is the excursion.
   - The margin. At its worst instants the group had 25-58 MiB between
     what the kernel cannot take back and its limit, and what puts it
     there is the process's own memory beside the cache: 330-405 MiB at
