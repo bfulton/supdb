@@ -412,13 +412,27 @@ written by five calls where one reservation holds both
 counters only the writer writes.
 
 With those, the same counts read 539 for the clean get and 979 for the
-update, and paired in the suite at a hundred thousand keys the read pass,
-the threaded reads and the read-only mix went from behind FASTER to level
-with it, with the write mixes still behind (`bench/scripts/pair.sh
-supdb-ingest faster 100000 --passes
-load,read,read-threaded,mixes,mixes-scrambled`). `supdb-pointexts` and
-`supdb-pointsources`, and their `supdb-ingest` siblings, are the reads
-before.
+update. Paired in the suite at a hundred thousand keys, the binary before
+and the binary after alternated three times, each against FASTER in both
+orders (`bench/scripts/pair.sh supdb-ingest faster 100000 --reps 6 --passes
+load,read,read-threaded,mixes,mixes-scrambled`, at `0053be5` and at
+`ca2306e`), the buffered arm's rate over FASTER's read, at the median of
+the six sittings: the read pass 0.97x before and 1.11x after, on two
+reader threads 0.95x and 1.07x, on three 0.86x and 1.00x; the read-only
+mix 0.79x and 0.93x; B, A and D 0.67-0.71x and 0.74-0.79x; F 0.48x and
+0.55x; and the scrambled family, read on the store the first family
+leaves, a piece standing and unsealed keys over it, 0.47-0.69x and
+0.51-0.78x. So the read cells are level or ours, the read-only mix is
+nearly level, and every mix that writes is FASTER's by a quarter to a
+half. `supdb-pointexts` and `supdb-pointsources`, and their `supdb-ingest`
+siblings, are the reads before.
+
+The pairing is read with the environment clean. Under `SUPDB_MIX_KINDS`
+every arm reads the clock twice an operation, a fixed fifty nanoseconds on
+both sides of a ratio of operations that take a hundred: the first
+sittings of this work ran under it for the split by kind and read the
+read-only mix level with FASTER where the clean pairing reads 0.93x. The
+split is what the variable is for; a ratio is taken without it.
 
 Two readings on the way were wrong and are kept here so they are not made
 again. The pin is a locked store on every read, a full fence FASTER's reads
