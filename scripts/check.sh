@@ -30,7 +30,8 @@
 #            between two hand runs: the adaptations it made of other tests,
 #            and the stride form under threads and under a checkpoint, ran
 #            in no gate
-#   lint     clippy at -D warnings, and the format gate
+#   lint     clippy at -D warnings, for this host and for the macOS target,
+#            and the format gate
 #   wasm     the browser reader and its floor, built for wasm32-unknown-unknown
 #            by web/build.sh
 #   bench    the benchmark suite in bench/: its build, tests and lint, through
@@ -39,6 +40,9 @@
 #   quick    one quick-scale measurement of every arm, the gate against
 #            bench/runs/, and the figures. Not in the default set: it is a
 #            timing run and needs the machine to itself
+#
+# Every group runs under the toolchain rust-toolchain.toml names, which
+# scripts/deps.sh installs here and scripts/toolchain.sh in CI.
 #
 # Not here, deliberately: cross-arm, which needs a cross toolchain and qemu
 # and so is CI-only.
@@ -80,6 +84,15 @@ for g in $groups; do
     lint)
       say "lint"
       cargo clippy --release --all-targets -- -D warnings
+      # The macOS side of the tree's cfg guards, type-checked: three test
+      # helpers only Linux's tests call were dead code there, and no Linux
+      # lint could say so. Clippy links nothing, so the target's rust-std,
+      # which rust-toolchain.toml lists, is all it needs. Skipped where the
+      # host is that target and the line above was this one.
+      mac=aarch64-apple-darwin
+      if [ "$(rustc -vV | sed -n 's/^host: //p')" != "$mac" ]; then
+        cargo clippy --release --all-targets --target "$mac" -- -D warnings
+      fi
       sh scripts/fmt.sh --check
       ;;
     wasm)

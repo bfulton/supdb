@@ -1,0 +1,13 @@
+# The one definition of the toolchain: the gate here, every CI job and a
+# session's container build, lint and format with this version, installed
+# by scripts/toolchain.sh. Moving it is a change to this file, with the
+# lints the new clippy asks for fixed in the same commit. The manifests'
+# `rust-version` is the oldest toolchain the crates build with, and is not
+# this.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
+# wasm32 for the browser reader (web/build.sh); aarch64-apple-darwin for the
+# lint group's type-check of the macOS side of the tree's cfg guards.
+targets = ["wasm32-unknown-unknown", "aarch64-apple-darwin"]

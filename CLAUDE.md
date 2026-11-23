@@ -58,8 +58,9 @@ caller. Nothing is exempt from the format gate, and everything holds to
 
 `sh scripts/deps.sh` readies a host for every group, installing only
 what is missing and ending in an `all deps ready` line to gate on; run it
-first in a fresh container, which has no wasm target and libclang only as
-versioned files. It names libclang through `bench/scripts/libclang.sh`,
+first in a fresh container, which has the stable it was made with and not
+the toolchain `rust-toolchain.toml` names, and libclang only as versioned
+files. It names libclang through `bench/scripts/libclang.sh`,
 the one definition CI uses, and keeps no variable. clang-sys's build
 script declares nothing to rerun on, so the directory it found libclang
 in at the first build stays in its cached output for good: a
@@ -87,20 +88,31 @@ timing run needs the machine to itself, and CI gives it a job of its own. The
 check run in the `bench` group (`sh bench/scripts/check.sh lint` by
 itself, a minute), and a commit that touched `bench/` alone went out
 behind a green `lint` with a doubled `#[allow]` that clippy refuses.
-And a green `lint` here is the runner's only under the runner's
-toolchain: CI installs the stable of the day and a container keeps the
-one it was made with, which `scripts/deps.sh` leaves as it finds it. Two
-`chunks_exact` calls over a constant passed here under 1.97 and failed on
-every hosted leg under 1.100, whose clippy asks for `as_chunks`, and
-nothing had said so, CI running on a pull request and none having run it
-over the branch since they were written. `rustup update stable` before
-the gate, or the group under the runner's version
-(`RUSTUP_TOOLCHAIN=1.100.0 sh scripts/check.sh lint`). The macOS leg's
-lint is another the gate here does not run: three helpers in
-`tests/zpages.rs` that only Linux's tests call were dead code there. It
-type-checks without a cross toolchain, once
-`rustup target add aarch64-apple-darwin`: `cargo clippy --release
---all-targets --target aarch64-apple-darwin -- -D warnings`.
+And a green `lint` here is the runner's because the toolchain is one:
+`rust-toolchain.toml` names the version, with clippy, rustfmt and the
+wasm and macOS targets, `scripts/toolchain.sh` installs what the file
+names and holds the active rustc to it, and `scripts/deps.sh` and every
+workflow call that script, so no workflow names a channel. Before the pin
+CI installed the stable of the day and a container kept the one it was
+made with: two `chunks_exact` calls over a constant passed here under
+1.97 and failed on every hosted leg under 1.100, whose clippy asks for
+`as_chunks`, and nothing had said so, CI running on a pull request and
+none having run it over the branch since they were written. Moving the
+version is a change to that one file, with whatever the new clippy asks
+for fixed in the same commit and the whole gate run under it; the
+manifests' `rust-version` is the oldest toolchain the crates build with
+and does not move with it. A `RUSTUP_TOOLCHAIN` in the environment
+outranks the file, which the script refuses and a bare `cargo` does not.
+The lint group type-checks the engine for the macOS target too (`cargo
+clippy --release --all-targets --target aarch64-apple-darwin -- -D
+warnings`, which needs the target's rust-std and no cross toolchain):
+three helpers in `tests/zpages.rs` that only Linux's tests call were dead
+code there, and no lint on Linux could say so. The suite has
+no such leg: its comparators compile C in their build scripts, the first
+of them to run (`lz4-sys`'s) hands the host's `cc` `-arch arm64`, and a
+Linux `cc` refuses it, so the suite's would take a cross compiler. What
+is left for the hosted runners alone to show is timing on their hardware and the tests run, not only
+type-checked, on ARM and macOS.
 
 The tests leave their stores under the temp directory, one per test and
 process (`supdb-next-<name>-<pid>`), so a day of test runs on one box is

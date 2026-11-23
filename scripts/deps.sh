@@ -9,7 +9,9 @@
 #   sh scripts/deps.sh              # what every group of scripts/check.sh needs
 #   sh scripts/deps.sh profile      # the profilers CLAUDE.md's recipes use
 #
-# rust      rustfmt, clippy and the wasm32-unknown-unknown target (lint, wasm)
+# rust      the toolchain rust-toolchain.toml names, with rustfmt, clippy
+#           and the wasm32 and macOS targets (every group); the one
+#           definition is scripts/toolchain.sh, which CI calls too
 # libclang  bindgen's libclang, for the comparators (bench, quick); the one
 #           definition is bench/scripts/libclang.sh, which CI calls too
 # faster    FASTER's sources at the pinned commit and the libraries they
@@ -39,12 +41,11 @@ for g in $groups; do
   case "$g" in
     rust)
       say rust
-      if ! command -v rustup >/dev/null; then
-        echo "no rustup; install Rust stable from https://rustup.rs" >&2
-        exit 1
-      fi
-      rustup component add rustfmt clippy
-      rustup target add wasm32-unknown-unknown
+      # The toolchain rust-toolchain.toml names, with its components and
+      # targets, and not whatever toolchain the host came with: a container
+      # kept the stable it was made with, CI installed the stable of the
+      # day, and a lint green under the first was red under the second.
+      sh scripts/toolchain.sh
       ;;
     libclang)
       say libclang

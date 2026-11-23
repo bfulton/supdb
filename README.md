@@ -187,7 +187,7 @@ Worker.
 ## Building
 
 ```sh
-sh scripts/deps.sh             # the toolchain pieces the checks need, where missing
+sh scripts/deps.sh             # the pinned toolchain and what else the checks need, where missing
 cargo build --release
 cargo test --profile checked  # the release profile with overflow checks and debug assertions on
 sh scripts/check.sh            # build, test, lint, wasm, bench -- what CI runs
