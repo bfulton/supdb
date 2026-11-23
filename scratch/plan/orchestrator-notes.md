@@ -173,4 +173,4 @@
 - Workflow wf_ea7d1698-f94 stopped (task w5hh0xpf8) in fix:tests-tidy; its stress workers and test binaries killed; the check-in trigger trig_01N8Ncu2jhnmyZxE47jUuSm8 disabled (not deleted).
 - Tree checked equal to tests-tidy's keep/ by sums and to the remote snapshot ccc2d7b6 by blob; local branch moved onto ccc2d7b6 (reset --mixed, tree untouched). cargo test --profile checked --no-run: exit 0, 19 executables.
 - Stress at the stop: 37 green runs of 160, one OOM kill (exit 137, no test failed).
-- Notes of the pricing run copied into the repo's scratch/ (per-unit notes, mutants, measuring and not-landed patches, the journal, land.sh, snapk.sh, the flake logs) with scratch/HANDOFF.md, committed and pushed as the checkpoint.
+- Notes of the pricing run copied into the repo's scratch/ (per-unit notes, mutants, measuring and not-landed patches, the journal, land.sh, snapk.sh, the flake logs), committed and pushed as the checkpoint.

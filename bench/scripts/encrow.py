@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
-"""Read an encrypted-roster row: each encrypted comparator against the engine
-under a cipher, cell by cell. usage: encrow.py ROW.json [--all]"""
+"""A row of the encrypted roster, cell by cell.
+
+Reads a row `bench run --arms enc` wrote (DESIGN.md, the comparators
+encrypted) and prints, for the store under a cipher against each encrypted
+comparator and against its plain twin, in both guarantee groups: how many
+cells it is ahead in, behind in and unresolved in, and each cell it is
+behind in or lower in by its median. A cell is resolved when every rep of
+one arm lies on one side of every rep of the other; the ratio is of the
+medians, turned so that over 1 is the store under a cipher ahead. `--all`
+prints every cell.
+
+usage: encrow.py ROW.json [--all]
+"""
 import json, sys, statistics as st
 row = json.load(open(sys.argv[1]))
 show_all = '--all' in sys.argv

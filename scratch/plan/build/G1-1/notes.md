@@ -315,7 +315,7 @@ Findings:
    landing and its slot sync. When that thread lags the writer's rotations, every rotation finds no
    spare and creates its file, and the test's 16 rounds make about 5 rotations. That is a timing bet
    in the test (CLAUDE.md, "A test that bet a seal would still be running"); the engine does nothing
-   wrong. Its detection was already repaired once for another race (840fd254, HANDOFF item 4).
+   wrong. Its detection was already repaired once for another race (840fd254).
    Not fixed here: tests/cipher.rs is outside the unit's diff. The fix belongs to whoever owns the
    test: the test should hold the state it needs, e.g. settle the segment work (or hold the
    rotation) until a spare has been offered before the commit that rotates, instead of betting on

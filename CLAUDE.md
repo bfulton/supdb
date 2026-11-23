@@ -26,6 +26,87 @@ reader gets a checked number instead of a snapshot; a figure attached to a
 *change* belongs in the PR that made it, rounded), no history, and no narrative
 of the change that produced the text.
 
+## The encryption work on this branch
+
+This branch carries the encryption feature -- `Encryption::Cipher`,
+`Encryption::Kernel`, `supdb::crypt` -- and the crash-safety fixes found
+building it, on top of a line of the owner's engine work that is not on
+the main line yet (`origin/claude/e-recode-stride-selector-g5f6hl`,
+"upstream" here and in the notes). What is left of it is in `ROADMAP.md`
+("Encryption: what is left before it merges"). What it is held to is the
+owner's:
+
+- **It merges whole, against two bars.** "We're not going to merge
+  partial", and "our eventual bar for merging requires no impact for
+  unencrypted runs, and beating competitors on added encryption
+  benchmarks." The first is the count, by function, against the commit
+  before each change (`scripts/cost.sh`), with timing rows against
+  upstream before a merge is proposed, since a count sees no stall. The
+  second is the encrypted roster (`bench run --arms enc`,
+  `bench/DESIGN.md`), read cell by cell (`bench/scripts/encrow.py`).
+  Bytes on disk is no cell of it ("I don't care much about bytes on
+  disk"). The layer that is to clear the second bar was designed while
+  every pairing under a cipher was the engine against itself; the
+  comparators' first row and pairings put the bounded reads and scans
+  first, and the stride form under a cipher, last of five small changes
+  in the plan, ahead of every stage of it. A bar that names a competitor
+  is measured against the competitor before the design that is to clear
+  it is fixed.
+- **Nothing is switched off, refused or limited under a cipher as a
+  property of the design**, and a cost is never accepted: it is
+  understood, by a count or a probe, and taken back. "The goal is an
+  encryption feature which is reliable, performant, and not fragile to
+  maintain." A bug or a flaky test met on the way is fixed where it is
+  met, whichever line wrote it.
+- **Upstream is merged here and never written to.** Fetch it, merge it
+  into this branch, build it and count against it; never push to it or
+  to `main`. Push here whenever there is a commit: the gate is for what
+  a commit claims, not for the push. No pull request until the owner
+  asks for one. "Stay wholly off of upstream" was read for half a day as
+  never fetch, merge or count against it, where it meant never modify
+  it: an instruction about another line is said back as the operations
+  it forbids before the widest reading is acted on.
+- **A report to the owner is short and says where things stand.** The
+  owner reads this branch from outside it, and has said that they lost
+  its thread and that its size worries them: the bar and what stands
+  against it first, in plain sentences, and the detail where it lives.
+- **A merge of upstream is held to more than its conflicts.** Its text
+  merges nearly clean each time and is wrong in the same places:
+  upstream's new code maps a file by its path (`MmapBytes::open`) or
+  reads residency over a mapping's lent bytes, the two things this
+  branch moved behind the seam (`vault::map`, `map_len`,
+  `map_resident_share`, `OrdIndex::resident_share`), three sites at the
+  last merge. What each merge is shown to hold: nothing of either side
+  lost, every function both sides touched read once in its merged body;
+  this branch's gates over upstream's new code, each answered in its own
+  terms (a count raised in its list with the raise declared in
+  `scripts/raises.txt`, and the lists run against the main line and
+  against the branch's tip before the merge, `SUPDB_BASE=<that tip> sh
+  scripts/check.sh lists`); each new mechanism of upstream's read for
+  which bytes it reads and through what, and held under a cipher by a
+  test where it reads a file; the differential fuzz beyond the gate's
+  range, under a cipher in a small cache, in the clear, and with the
+  compact form forced under a cipher (`ZFUZZ_CACHE=all ZFUZZ_OPTVARY=1`
+  in each); every arm of the rosters opened once at the smallest rung;
+  `sh scripts/cost.sh <upstream's head>`, every probe at or under
+  upstream by its total and no function's gain new (it exits red by
+  function there, on moves: `ROADMAP.md`); and the whole gate.
+- **`scratch/` is this branch's working records, and comes off before a
+  merge or a pull request**, as it came off PR #6. The layer's design
+  (`scratch/seam/design.md`, its decisions and the forms' contract
+  beside it); the stage plans (`scratch/plan/g1.md`, closed, with a
+  critic's account of what each gate holds and a way to write past it
+  in `scratch/plan/build/close/g1-built.md`, to be read before a gate is
+  touched; `g2.md`, the pass under a cipher, whose line numbers and
+  counts are of a tree several merges old); each unit's notes and mutants
+  (`scratch/plan/build/<unit>/`, `scratch/stage0/`); the encrypted
+  roster's first row and pairings (`scratch/enc/`). It held a handoff
+  note as well, written again at every stop, which grew to twelve hundred
+  lines of rules, open items and measurements that each had a home
+  already, beside a status the history has; the owner had it removed. A
+  rule goes in this file, an open item in `ROADMAP.md`, a fact of the
+  suite in `bench/`, and a session's status nowhere.
+
 ## Layout
 
 | path | what |
@@ -305,8 +386,14 @@ release profile because the checks cost code size there and time in a
 measurement. A second definition of "the checks" is how the next one of
 those starts.
 
-A change to an engine default lands only once `sh scripts/check.sh`
-has passed with the new default in place.
+A change to an engine default lands only once the suite has read it
+better (the owner's rule: a default changes after benchmarks confirm it,
+and nothing else waits for them) and `sh scripts/check.sh` has passed
+with the new default in place. A gate's later groups compile the tree as
+it stands when they start, and `scripts/cost.sh` builds its base from
+this tree's example sources, so an edit made while either runs is in the
+verdict of a run that began before it: nothing edits the tree until the
+run's last line, and one cargo runs at a time.
 
 ## Profiling
 

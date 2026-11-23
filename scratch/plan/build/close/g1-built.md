@@ -48,7 +48,7 @@ Most important first. File:line is of this tree.
   1. A whole-range `slice_at(0, len)`, which compiles. G2's conform pass is meant to catch it at run time.
   2. A new walk inside blob.rs over `self.flat()`, `Sec::get` or `flat_lent`. Only callers of `lend_at` are listed (tests/source.rs:6200); callers of the wrappers are not. Such a walk passes every gate and silently answers None or absent under a cipher. That is A6 exactly.
      - The same hole exists in zfile.rs: a new caller of `ZFile::stride_bytes`.
-     - forms.md's "As built" lists "a new caller inside a reader's own module" as unseen. HANDOFF says the source test holds it. Both are half right: callers of lend_at and lent are held by scope; callers of the wrappers are not.
+     - forms.md's "As built" lists "a new caller inside a reader's own module" as unseen. The stage's running account said the source test holds it. Both are half right: callers of lend_at and lent are held by scope; callers of the wrappers are not.
   3. The ordered index's CRC skip keys on `piecewise`, not `authenticated`.
   4. The stride form's four readers lend nothing under a cipher, so the form is silently declined.
 

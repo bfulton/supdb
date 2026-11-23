@@ -504,7 +504,7 @@ due (`Maint::z_convert_asked`, from `z_step` and the policy's look). Beside the 
 builds a seed's asks can all be replaced untaken, and the range's check (`no partition left the
 stride form in seeds 0..4`) is then red over stores that were never asked: the green runs alone
 already read most seeds at `moved in 0 out 0` (seed 0 alone moving, 1-6 out). Not the controller's
-clock (HANDOFF's class): the seam, not the policy, and no clock in it. Red before under load:
+clock (the class ROADMAP.md lists under the zpages tests' waits): the seam, not the policy, and no clock in it. Red before under load:
 r2/convert-load-before.log, the round-1 test (r2/pre/fuzz.rs) six copies at once, four rounds: 13
 of 24 red with that line; and on upstream's head 7c62153e the same: r2/convert-load-upstream.log, 16
 of 24 red (UPSTREAM'S). Red on demand: r2/fmut.py's `noasks` (the writer's timed asks taken out,

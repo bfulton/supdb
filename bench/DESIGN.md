@@ -432,7 +432,12 @@ one, so a pairing against `supdb-cipher` or the plain arms is one process.
 `bench run --arms enc` is the encrypted roster, both guarantee groups, each
 encrypted store beside its plain twin; its rows are no part of the
 standing series, whose class they would otherwise share, so they are
-written with `--out` somewhere of their own. LMDB's encryption is on a
+written with `--out` somewhere of their own, and `scripts/encrow.py
+ROW.json` reads one cell by cell: the store under a cipher against each
+encrypted comparator and against its plain twin, a cell resolved where
+every rep of one lies on one side of every rep of the other. A pairing
+against one is `scripts/pair.sh` with `BIN` naming that build's binary
+(`BIN=$PWD/target-enc/release/bench`). LMDB's encryption is on a
 line it has not released, and the arm is that line as it stands: its
 sample hook's shape is load-bearing under reader threads
 (`shim/lmdb_enc.c`), and an encrypted environment fails a write

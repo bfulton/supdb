@@ -146,7 +146,7 @@ this unit's edit.
   mapping. FOR THE LAUNCHER: no test holds any of this. tests/zpages.rs's stride
   test asserts kept == 0 in the clear; no cipher test reads stride_declines. The
   docs say it from the code, not as tested. A test of today's behaviour is owed
-  first (HANDOFF already owes it to S5).
+  first (ROADMAP.md, "The stride form under a cipher").
 - The heads' copy under a cipher: Seg::own_heads asks OrdIndex::mapped_heads,
   None for a paged mapping, so no copy. FOR THE LAUNCHER: no test holds it; and
   own_heads calls `ord.willneed_heads_all()` before that None, so under a cipher

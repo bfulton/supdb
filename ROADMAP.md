@@ -557,15 +557,31 @@ What an engine picker would hit, roughly in order.
   (`a_changed_byte_in_a_form_file_takes_the_form_out_of_service_and_not_the_store`,
   `tests/cipher.rs`, at the attach and in service).
 - [ ] **The stride form under a cipher.** A stride file is written from
-  a partition's records lent whole and read at its offsets from its
-  mapping as it lies, and a store under a cipher lends neither, so there
-  a build that asks for the stride form builds the block form and counts
-  the decline (`zfile::StrideNo::Kept`). Done when the stride writer takes
-  its records by the piece, as the block form's builder does, and its
-  readers ask the file for each value page (`slice_at`), with a test that
-  a store under a cipher builds, attaches and serves a stride file, and a
-  pairing of `supdb-cipher` with the form forced against it with the form
-  off, out of core.
+  a partition's records lent whole (`write_stride`) and every read of one
+  goes through the file borrowed whole (`ZFile::stride_bytes`, handed as
+  a slice to `StrideBody`'s readers at some fifteen sites of `zfile.rs`),
+  and a store under a cipher lends neither, so there a build that asks
+  for the stride form builds the block form and counts the decline
+  (`zfile::StrideNo::Kept`). It is the first thing the bounded cells the
+  encrypted comparators win are lost by ("Reads and scans out of core",
+  below). The shape is the one `flatindex` took for the key section: the
+  body's readers over a source that is the slice, where they are the
+  code they were, or a reader by the piece, each read a `slice_at` of the
+  range it wants -- a value one stride, a page check one page, a walk a
+  window of pages, a sparse form's search a page of numbers behind the
+  samples in memory -- and the writer taking its records through the
+  trait the block form's builder reads a kept file by (`PieceImages`),
+  under a hold with a rest a page (`zfile::Walked`). A form module names
+  nothing of the encryption (`tests/data/couplings.txt`), and the plain
+  path is held by the stride probes of the count (`sh scripts/cost.sh
+  BASE read_s scan_s scan_long_s`). Done when a store under a cipher
+  builds, attaches and serves a stride file under the stride tests of
+  `tests/zpages.rs`; the differential fuzz passes with the form forced
+  under a cipher in a small cache (`ZFUZZ_STRIDE` and `ZFUZZ_CONVERT`
+  with `ZFUZZ_CIPHER=1 ZFUZZ_CIPHERCACHE=16384`); a damaged chunk of a
+  stride file takes the form out of service and not the store; and
+  `supdb-cipher` with the form is paired against itself without, and
+  against `rocksdb-tuned-enc`, at five million keys under 640 MiB.
 - [ ] **The heads' copy under a cipher.** The copy of a partition's
   ordered-index heads in the process's own memory (`Options::heads_owned`)
   is made from the index's mapping as it lies, which a store under a
@@ -613,7 +629,11 @@ What an engine picker would hit, roughly in order.
   asks for a window of records at a time already. Done when the walks by
   rank do too, a point read asks once for each piece it touches, and what
   a read does at its start and its end under a cipher is a look and not
-  two calls. `bench/scripts/pair.sh supdb-cipher supdb 300000`
+  two calls. One cost there was taken on for the plain store's count: the
+  ordered index's two cold arms went out of line (`plan_seek_late`,
+  `seek_planned_by_piece`), and the settle's planned seek reads
+  sixty-seven instructions a key more under a cipher for it; two shapes that
+  took it back each cost the plain store and were refused. `bench/scripts/pair.sh supdb-cipher supdb 300000`
   is the pairing, and `bench/examples/read_only.rs supdb-cipher 100000 1
   n-none` under callgrind beside `supdb` the count; a shape
   that takes an instruction from the read under a cipher is counted on
@@ -638,6 +658,217 @@ What an engine picker would hit, roughly in order.
   call took a quarter off the open and is the default
   (`ReadOptions::populate`); huge pages added four tenths to it and are off
   (`ReadOptions::huge_pages`). `examples/crypt_cost.rs` has both arms.
+
+## Encryption: what is left before it merges
+
+The encryption work (`Encryption::Cipher`, `Encryption::Kernel`,
+`supdb::crypt`) merges whole, and its bar is the owner's: no impact for a
+store with no encryption, and ahead of the stores a user would otherwise
+pick on the encrypted roster (`CLAUDE.md`, the encryption work on this
+branch). The engine's open items under a cipher are under "Engine" above.
+This section is what the roster says, the order those items are worked
+in, and what stands between the branch and a pull request.
+
+### What the encrypted roster says
+
+The roster is `bench run --scale quick --arms enc --out DIR` in the `enc`
+build (`bench/DESIGN.md`), read cell by cell by `python3
+bench/scripts/encrow.py ROW.json`; what follows is that row at `b12bd36`.
+From ten to three hundred thousand keys the store under a cipher is ahead
+of each encrypted comparator, every rep of it on the better side of every
+rep of theirs, in about five cells of six of the durable group and four
+of five of the buffered: every read, scan, shuffled load, lag point and
+mix. Bytes on disk is no cell of
+the bar (the owner's word; the plain format's is an accepted loss above,
+and under a cipher an ordered load's records are on the device twice
+until the run is its own log). What it loses:
+
+- [ ] **Reads and scans out of core.** `BIN=$PWD/bench/target-enc/release/bench
+  bench/scripts/pair.sh supdb-cipher rocksdb-tuned-enc 5000000 --bound
+  671088640 --passes read,scan --reps 2 --ops-div 10` at `b12bd36`:
+  encrypted RocksDB reads at 1.3-1.4x the store under a cipher and scans
+  at 3.5x; encrypted LMDB (the same pairing against `lmdb3-enc`) scans at
+  1.3x and reads at a quarter. The plain store is not out of core at that
+  bound at all: its numbered keys take the stride form, a hundred bytes a
+  key, which fits, and it reads at seventeen times the store under a
+  cipher (the same pairing against `supdb`). What loses the cells is that
+  a store under a cipher is kept out of the compact forms: the stride
+  form is declined there, and the controller is off because a form page
+  lies across two chunks. The items, in the order they are worked: "The
+  stride form under a cipher", "An envelope whose chunks are whole pages"
+  and the controller on behind it, all under "Engine". One thing is
+  arithmetic and not yet a measurement: the stride file is 500 MB at five
+  million keys, which the bound cannot hold twice, as the kernel's cache
+  of the ciphertext and the store's of the plaintext, so what the stride
+  form buys there depends on which of the two the budget is given to, and
+  holding it once is the page layer's last stage. Done when `supdb-cipher`
+  reads and scans ahead of `rocksdb-tuned-enc` in both sittings.
+- [ ] **The ordered load.** In the row the durable ordered load is behind
+  both encrypted comparators at ten thousand keys (0.66x, resolved) and
+  lower and unresolved at the three rungs above (0.83-0.94x); the
+  buffered is behind encrypted LMDB's at every rung (0.65-0.75x) and
+  encrypted RocksDB's at ten thousand (0.75x). Against the plain store it
+  is 0.72-0.75x durable and 0.53-0.66x buffered, which is the records
+  written twice and the envelope sealed whole at the close ("An ordered
+  run under a cipher as its own log", "An envelope written beside its
+  segment", "A log file retired off the drain"); at about 0.9x of the
+  plain load durable and 0.72-0.88x buffered it is ahead of both from
+  thirty thousand keys. At ten thousand keys the plain store's durable
+  ordered load trails both plain comparators too, and its buffered one
+  LMDB's, so no encryption work wins that rung. Done when the ordered load is ahead of both encrypted comparators
+  from thirty thousand keys in both groups; at ten thousand, where the
+  owner has not said, the reading taken is that it stands to them as the
+  plain store stands to the plain ones.
+- [ ] **The open after a crash, under a cipher.** The `recover` workloads
+  of the same row: after an ordered load the open under a cipher is 1.2x
+  the plain store's at ten thousand keys and 2.6x at three hundred
+  thousand (2x buffered), and 1.4-1.7x after a shuffled load. It is ahead
+  of encrypted RocksDB's at every rung (1.3-5.8x) and behind LMDB's, which
+  recovers nothing (an accepted loss above, the plain store's too). The
+  difference from the plain store is not attributed: a run under a cipher
+  has no file in the directory to finish where it lies, so its commits
+  are replayed from the log into a table, and what else the open
+  decrypts has not been stamped. Done when the open's phases are stamped
+  over both stores and the store under a cipher opens within what its
+  decryption costs of the plain one.
+- [ ] **The roster past the quick scale, and the kernel's side.** The row
+  is the quick scale's and the bounded cells are two pairs an order at
+  one bound. Encrypted LMDB stops at three hundred thousand keys
+  (`bench/DESIGN.md`), so past it the comparator is RocksDB's. Neither
+  comparator has been run on a directory the kernel encrypts, beside
+  `supdb-dirkey`, and this guest's kernel has no AES instructions built
+  in ("A store under a key, priced on a kernel with hardware AES").
+  Done when a `full` row of the roster is taken with encrypted RocksDB,
+  the bounded scale's bounds are paired against it, and the three stores
+  are paired on an encrypted directory under a kernel that names
+  `xts-aes-aesni`.
+
+### The order of the work
+
+First the two "Engine" items the bounded cells above are lost by, "The
+stride form under a cipher" and then "The heads' copy under a cipher":
+the pass below cannot be green while a mechanism does nothing under a
+cipher. Then that pass, then the layer.
+
+- [ ] **Every mechanism held to acting under a cipher.** The seal bars
+  a whole borrow at the sites it lists, and a new walk over a section
+  borrowed whole inside a reader's own module, or a new caller of a
+  form's whole-file read, compiles, passes every gate and answers nothing
+  under a cipher. Three mechanisms were found doing nothing there after
+  they shipped: the stride form, the heads' copy, and the third merge of a
+  stretch nobody reads (`Options::merge_parallel_quiet`), which waits for
+  the compact form's gate, where the controller is off. And
+  `check_options` accepts `writer_pins` off beside `Encryption::Cipher`,
+  where the writer's reads take no slot and the store's cache does not
+  wait for them. Done when a group of `scripts/check.sh` runs every test
+  that opens a plain store as a store under an identity cipher, with
+  eviction forced at every rest and the guard on (`SUPDB_PAGER_GUARD`);
+  the differential fuzz runs so at a small cache; every field of
+  `Options` is drawn there or exempt with a reason; the asks a read, a
+  scan entry and a merge step make are a list that only goes down; and
+  the unpinned writer is refused at the open.
+- [ ] **The page layer.** The cipher's code is threaded through the
+  engine as an envelope a file, a memory file while a file is written
+  and a sealed record in the log, which is why a merge of the line this
+  is built on costs what it does and why the items under "Engine" are
+  each a special case: the double write of a run, the envelope written
+  after its segment, a form page across two chunks, an unclassed file
+  lost at the close. The layer is one module behind the `vault::` door
+  that knows pages, lengths, versions, sync points, sealed names and a
+  durability class a file, and no format, with a page of plaintext
+  stored as one page and its tag kept apart. Its stages: the door's file
+  type over the plain store alone, counted equal; the module standing
+  alone under a stand-in cipher, its torn states built by hand; segments,
+  merge pieces, ordered indexes and form files wired behind an option and
+  an arm of its own, the envelope staying the default; a run's temp file
+  as its own log; the controller on under a cipher; the log, its spare
+  and the manifest's slots under the layer, and the default flipped; and
+  files that fit the budget lent whole, which is where the design
+  predicts a read under a cipher within tens of instructions of the plain
+  read's. Each stage ends on the gate, the count and the pairings its
+  predictions name. Done when `supdb-cipher` is that shape and the
+  envelope is left to `supdb::crypt`, a published file's.
+
+### Before a pull request
+
+- [ ] **Timing rows against the line this is built on.** "No impact for
+  a store with no encryption" is held by instruction count, change by
+  change, and a count sees no stall. Done when the quick, full and
+  bounded rows at the branch's head stand beside the same rows at the
+  commit of that line last merged, on one host, and no cell of the plain
+  arms is on the worse side.
+- [ ] **A verdict from the count against a line it did not grow from.**
+  `sh scripts/cost.sh` against that line's head reads every probe under
+  it by its total and exits red by function: a function the other build
+  inlines and ours calls reads as a gain beside the caller that lost
+  more, so a new regression reads like the list already reconciled, and
+  against the main line the count takes in everything merged from the
+  other line. Done when `scripts/cost-diff.py` reads a declared group of
+  functions held to its net, valid against one named base and shaped as
+  `scripts/raises.txt` is, and the job's verdict against a pull request's
+  base is green for a tree that pays nothing. Beside it, what the count
+  does not reach: no probe runs with the form's gate away from raw
+  (`Db::zgate_set`) or merges under `merge_drop_behind` and
+  `merge_read_ahead`, which is where `Blob::willneed_ranks` and its kin
+  are called a key or a block at a time; `Txn`, `RunWalk` and the
+  `SparseBlob` readers are outside the entry-point list; the bounds on
+  the `~` lines rest on two to four self-checks a probe; and valgrind's
+  noise on a hosted runner is unmeasured.
+- [ ] **The gates that have run on no hosted runner.** The `cost`,
+  `lists`, `cross-arm`, `machine`, `enc` and `fscrypt` jobs first run
+  where the first pull request is opened, and the `machine` group has not
+  run on a Mac at all. Two are known to give no verdict there as they
+  stand: the count, above, and the lists, which hold nothing against a
+  base that predates them, as the main line does until this lands. The
+  door's libc test reads the libc `Cargo.lock` resolves out of cargo's
+  registry and fails a vendored or offline layout outright, and of
+  `tests/durable.rs` one test holds about a thousand descriptors open
+  and two ask `kcmp`, none tried against a hosted runner's limits. The
+  owner's to choose: the lists landed on the main line ahead of the rest,
+  and the libc test kept or its class list kept in the tree.
+- [ ] **The `zpages` tests' waits under load.** Four copies of the
+  checked `zpages` binary at once fail most rounds, on this branch and on
+  the other line's own build alike, in the same tests: wall-clock waits
+  and controller states never reached
+  (`scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for` most
+  often, `the_trial_judges_the_refilled_state`, the hot-raw policy's,
+  `readers_read_through_a_partitions_conversions_both_ways`,
+  `handles_on_threads_read_stride_files_while_merges_retire_them`). The
+  gate's one copy passes. What fixed the ones already done is a wait on
+  the state and not on a count of rounds (`drive_to` to `drive_to_built`,
+  `tick_until` to `tick_until_built`), test by test: a bulk replacement
+  broke the tests that are exact to a tick. Done when four copies at once
+  pass three rounds.
+- [ ] **Defaults inherited unpriced under a cipher.** `bounds_by_heads`
+  and `land_bounds_read` were made defaults on pairings of plain stores,
+  and the cipher arms run them as inherited with no arm that has them
+  off. Done when each is paired under a cipher against the same arm
+  without it, at three hundred thousand keys and under a bound at ten
+  million.
+- [ ] **What no second reader has read.** The last repair of several
+  units was read by whoever launched it and by no reviewer: the wall, the
+  door, the count, the lists' check, the count against the other line,
+  the seal's rebuild, the `cross-arm` group's repair, and five of the
+  durability pricing units before them; `594fe3ca`, the merge probe's
+  functions, was read by one reader. Done when the branch's whole diff of
+  `src`, `tests/source.rs` and `scripts` has had a review that did not
+  write it.
+- [ ] **Small things left where they were found.** `key_eq`'s arm for a
+  key under sixteen bytes compares two empty slices by a call of no bytes
+  (the empty key in a carried copy, one key a store). `compact_run` takes
+  `record_offset(0)` of every input of every merge, dropping or not,
+  which under a cipher is a directory word read through the cache and
+  thrown away. Three tests of `tests/blob.rs` hand closures straight to
+  `Blob::scan_at`, a copy of the read path each. `zfile::ask_file`'s item
+  allowance covers any barred call added to that function. The ordered
+  index skips its checksum over any source that lends by the piece, where
+  `Bytes::authenticated` now says which sources checked their bytes. The
+  store's cache keeps no count of the advice it is given
+  (`Paging::willneed`, `forget`), so what a build and the crossing ask of
+  it under a cipher is held by outcomes alone. And three red inputs live
+  outside the tree and run nowhere: a strace gate
+  over the plain build's advice calls, a check of doc sentences against
+  the code, and two probes of the readers' offsets.
 
 ## Out of core
 

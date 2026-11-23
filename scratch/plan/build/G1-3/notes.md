@@ -11,7 +11,7 @@ Started 2026-11-20 12:20 UTC at HEAD 352ec963 (tree clean).
 - No feature is needed for symbols: bench's [profile.release] has debug = 1 (line tables);
   the script sets no RUSTFLAGS. The plan's "a cargo feature" has nothing to carry.
 - Upstream head the branch last merged: merge-base HEAD origin/claude/e-recode-stride-selector-g5f6hl
-  = 9bfc4362 (merged as bb365602, after HANDOFF's 4358827). Upstream is now at cd7e9dc5 (10 more).
+  = 9bfc4362 (merged as bb365602, after 4358827, the head counted against before it). Upstream is now at cd7e9dc5 (10 more).
 - No bench/examples/seal_probe.rs, scan_at_probe.rs; no tests/data/cost-entries.txt.
 - tests/source.rs exists (G1-1 wall, G1-2 door), lexer tests/lex/mod.rs.
 - impl Db has no read method: reads reach a Db through Deref<Target = Reader> (db.rs, impl
