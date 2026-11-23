@@ -612,7 +612,21 @@ What an engine picker would hit, roughly in order.
   segment is synced: the tables the writer froze, held to a count and not
   to bytes (`FROZEN_CAP`, a standing limitation in `CLAUDE.md`), and the
   outputs of seals and merges, each held whole until its envelope, the
-  envelopes written one at a time (`Vault::persisting`). The levers, none
+  envelopes written one at a time (`Vault::persisting`). And a third
+  thing the counters name (`SUPDB_LAG_COUNTERS=1` before that command,
+  the `lagmem` and `lagarenas` lines at the last point, in a rep that
+  lives): of the process's own memory the allocator has 141 MiB in use
+  and 248 free and resident, 124 of it in one arena, where the plain
+  store has 35 and 133. A scratch build that asked the allocator for its
+  free memory wherever the cache's room read less than the cache held
+  asked forty-five times through the pass and got 3 to 35 MiB a time,
+  the process still killed in three reps of four, so it was taken out:
+  the memory is not the kind a trim returns, and whose arenas those are
+  is the count by thread that has not been made
+  (`bench/examples/arena.rs`, `alloc-census`, and `Options::jobs_mapped`,
+  which is off). At the kill itself the cache stood at 270 MiB for half
+  a second over a room of about 217 without giving any back, and what
+  held it is not known either. The levers, none
   built: the writer's wait drawn from the room, by bytes, tables and
   files in flight together; an envelope sealed as its file is written, so
   that a file's pages can be given back as they go home (the page
