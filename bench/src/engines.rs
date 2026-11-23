@@ -957,6 +957,17 @@ pub struct Supdb {
     /// (`Options::zpages_rewarm_raw_scans`), `None` for the engine's
     /// default. `supdb-zrewarmrawscans`.
     rewarmrawscans: Option<bool>,
+    /// The block cache granted the raw records' place where its own budget
+    /// would bind and no point read is near
+    /// (`Options::scan_cache_copies_fit`), `None` for the engine's default.
+    /// `supdb-copiesfit`.
+    copiesfit: Option<bool>,
+    /// The chain through a write-only stretch only where the writer's
+    /// forms do not cover the store
+    /// (`Options::merge_chains_writes_uncovered`), `None` for the engine's
+    /// default. `supdb-chainuncovered`, and `supdb-copiesfitchain` with
+    /// both.
+    chainuncovered: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
     /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
@@ -2293,6 +2304,17 @@ struct Policy {
     /// (`Options::zpages_rewarm_raw_scans`), `None` for the engine's
     /// default. `supdb-zrewarmrawscans`.
     rewarmrawscans: Option<bool>,
+    /// The block cache granted the raw records' place where its own budget
+    /// would bind and no point read is near
+    /// (`Options::scan_cache_copies_fit`), `None` for the engine's default.
+    /// `supdb-copiesfit`.
+    copiesfit: Option<bool>,
+    /// The chain through a write-only stretch only where the writer's
+    /// forms do not cover the store
+    /// (`Options::merge_chains_writes_uncovered`), `None` for the engine's
+    /// default. `supdb-chainuncovered`, and `supdb-copiesfitchain` with
+    /// both.
+    chainuncovered: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
     /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
@@ -3083,6 +3105,8 @@ impl Default for Policy {
             rewarmtrim: false,
             rewarmraw: None,
             rewarmrawscans: None,
+            copiesfit: None,
+            chainuncovered: None,
             formsoffbuilt: None,
             formson: false,
             formsoffkept: false,
@@ -7589,6 +7613,47 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with the block cache granted the raw records' place where
+    /// its own budget would bind for want of room beside them and no point
+    /// read is near (`Options::scan_cache_copies_fit`). The pair against
+    /// `supdb` differs by that one option.
+    pub fn create_copiesfit(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                copiesfit: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` chaining its merges through a write-only stretch only where
+    /// the writer's forms do not cover the store
+    /// (`Options::merge_chains_writes_uncovered`). The pair against `supdb`
+    /// differs by that one option.
+    pub fn create_chainuncovered(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                chainuncovered: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-copiesfit` and `supdb-chainuncovered` together: the cache in
+    /// the records' place, and no chain through a burst it covers.
+    pub fn create_copiesfitchain(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                copiesfit: Some(true),
+                chainuncovered: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with the form's pages cut into groups of a kibibyte of
     /// records where the default cuts at two (`Options::zpages_group_bytes`
     /// 1024): half the decode for a point read's first touch of a group,
@@ -9472,6 +9537,8 @@ impl Supdb {
             rewarmtrim,
             rewarmraw,
             rewarmrawscans,
+            copiesfit,
+            chainuncovered,
             formsoffbuilt,
             formson,
             formsoffkept,
@@ -9972,6 +10039,10 @@ impl Supdb {
             zpages_rewarm_raw: rewarmraw.unwrap_or(supdb::Options::default().zpages_rewarm_raw),
             zpages_rewarm_raw_scans: rewarmrawscans
                 .unwrap_or(supdb::Options::default().zpages_rewarm_raw_scans),
+            scan_cache_copies_fit: copiesfit
+                .unwrap_or(supdb::Options::default().scan_cache_copies_fit),
+            merge_chains_writes_uncovered: chainuncovered
+                .unwrap_or(supdb::Options::default().merge_chains_writes_uncovered),
             scan_forms_off_counts_built: formsoffbuilt
                 .unwrap_or(supdb::Options::default().scan_forms_off_counts_built),
             scan_forms_off_unreused: !formson,
@@ -10443,6 +10514,8 @@ impl Supdb {
             rewarmtrim,
             rewarmraw,
             rewarmrawscans,
+            copiesfit,
+            chainuncovered,
             formsoffbuilt,
             formson,
             formsoffkept,
@@ -12000,6 +12073,15 @@ impl Engine for Supdb {
         if self.rewarmrawscans == Some(true) {
             return "supdb-zrewarmrawscans";
         }
+        match (
+            self.copiesfit == Some(true),
+            self.chainuncovered == Some(true),
+        ) {
+            (true, true) => return "supdb-copiesfitchain",
+            (true, false) => return "supdb-copiesfit",
+            (false, true) => return "supdb-chainuncovered",
+            (false, false) => {}
+        }
         if self.formsoffbuilt == Some(true) {
             return "supdb-formsoffbuilt";
         }
@@ -12365,6 +12447,8 @@ impl Engine for Supdb {
             // (`Options::scan_cache_auto`).
             ("cache_bindings", db.cache_bindings() as f64),
             ("cache_growths", db.cache_growths() as f64),
+            ("cache_copies_grants", db.cache_copies_grants().0 as f64),
+            ("cache_copies_revokes", db.cache_copies_grants().1 as f64),
             ("merge_syncs", db.merge_syncs() as f64),
             ("snap_switches", db.snapshot_switches() as f64),
             // The store's shape as it stands: what a read has to consult.
@@ -13698,6 +13782,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-rewarmtrim"
         | "supdb-zrewarmraw"
         | "supdb-zrewarmrawscans"
+        | "supdb-copiesfit"
+        | "supdb-chainuncovered"
+        | "supdb-copiesfitchain"
         | "supdb-formsoffbuilt"
         | "supdb-nozjobs"
         | "supdb-nozjobsrewarm"
@@ -15633,6 +15720,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-rewarmtrim" => supdb_arm(Supdb::create_rewarmtrim, dir)?,
         "supdb-zrewarmraw" => supdb_arm(Supdb::create_zrewarmraw, dir)?,
         "supdb-zrewarmrawscans" => supdb_arm(Supdb::create_zrewarmrawscans, dir)?,
+        "supdb-copiesfit" => supdb_arm(Supdb::create_copiesfit, dir)?,
+        "supdb-chainuncovered" => supdb_arm(Supdb::create_chainuncovered, dir)?,
+        "supdb-copiesfitchain" => supdb_arm(Supdb::create_copiesfitchain, dir)?,
         "supdb-formsoffbuilt" => supdb_arm(Supdb::create_formsoffbuilt, dir)?,
         "supdb-nozjobs" => supdb_arm(Supdb::create_nozjobs, dir)?,
         "supdb-nozjobsrewarm" => supdb_arm(Supdb::create_nozjobsrewarm, dir)?,
@@ -17626,6 +17716,32 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_rewarm_raw && !b.zpages_rewarm_raw);
                 assert!(!o.zpages_rewarm_raw_scans && !b.zpages_rewarm_raw_scans);
+            }
+            {
+                let z = Supdb::create_copiesfit(&dir("copiesfit")).unwrap();
+                assert_eq!(z.name(), "supdb-copiesfit");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.scan_cache_copies_fit && !b.scan_cache_copies_fit);
+                assert_eq!(
+                    o.merge_chains_writes_uncovered,
+                    b.merge_chains_writes_uncovered
+                );
+            }
+            {
+                let z = Supdb::create_chainuncovered(&dir("chainuncovered")).unwrap();
+                assert_eq!(z.name(), "supdb-chainuncovered");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.merge_chains_writes_uncovered && !b.merge_chains_writes_uncovered);
+                assert_eq!(o.scan_cache_copies_fit, b.scan_cache_copies_fit);
+            }
+            {
+                let z = Supdb::create_copiesfitchain(&dir("copiesfitchain")).unwrap();
+                assert_eq!(z.name(), "supdb-copiesfitchain");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.scan_cache_copies_fit && o.merge_chains_writes_uncovered);
             }
             {
                 let z = Supdb::create_zrewarmrawscans(&dir("zrewarmrawscans")).unwrap();
