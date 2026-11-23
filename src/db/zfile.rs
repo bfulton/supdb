@@ -15198,10 +15198,8 @@ mod tests {
                 let numbers = numbers_of(&body, &fx);
                 let lay = facts.layout;
                 let words = |at: u64, n: usize| -> Vec<u64> {
-                    bytes[at as usize..at as usize + 8 * n]
-                        .chunks_exact(8)
-                        .map(|w| u64::from_le_bytes(w.try_into().unwrap()))
-                        .collect()
+                    let (words, _) = bytes[at as usize..at as usize + 8 * n].as_chunks::<8>();
+                    words.iter().map(|w| u64::from_le_bytes(*w)).collect()
                 };
                 assert_eq!(words(lay.k_off(), numbers.len()), numbers, "{name}");
                 assert!(

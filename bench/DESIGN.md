@@ -21,6 +21,7 @@ The workloads below, plus four floors. Each yields one or more quantities.
 | `ycsb` | core A–F on the loaded store, a Zipfian over the key space itself (the hot keys the lowest, contiguous) and D's reads uniform, a sixth of the keys in operations per mix | ops/s per mix |
 | `scan-mixed` | the threaded `scan` passes again on the store the six mixes leave | entries/s per thread count |
 | `ycsbs` | core A–F again, on the store `scan-mixed` leaves, with YCSB's own key distributions: its scrambled Zipfian for A, B, C, E and F, and the latest distribution for D | ops/s per mix |
+| `threads` | `threads-A`, `threads-A-uniform`, `threads-RMW` and `threads-RMW-uniform`, on a store of their own, loaded in key order: point reads and updates from several threads at once, half reads and half updates (`A`) or every operation a read-modify-write (`RMW`), under YCSB's scrambled Zipfian or uniform keys; on one thread and then on each of the class's reader-thread counts, a store's worth of operations a thread, each thread's updates committed a hundred at a time. In no row of the series: `bench run --passes mixes-threaded` runs them, and writes its row under `runs/passes/` | ops/s per thread count |
 | `scan-lag` | on the store the shuffled load leaves, the keys updated in slices to 0, 1, 10 and 100% of the store, each slice a burst of batches followed by the `scan` workload's scans with nothing merged between | entries/s of each point's scans; updates/s of each point's burst |
 | `recover` | a fresh store given the `load` workload's batches by a process of its own, each committed under the arm's guarantee with no sync behind the last, and one batch more staged and never committed; the process killed there, and the store it left opened in the run's process | open ms, first read µs; for a buffered arm, acknowledged batches not recovered |
 | `recover-shuffled` | the same after the `load-shuffled` workload's batches | the same |
@@ -308,6 +309,30 @@ comparator a user would otherwise pick.
 |---|---|---|
 | durable per batch | `supdb` (default), `supdb-forms`, `supdb-settle`, `supdb-nosnap`, `supdb-noadvice`, `supdb-nocache`, `supdb-cache256` | `lmdb`, `rocksdb-tuned`, and in the bounded roster `rocksdb-tuned-lz4` |
 | buffered | `supdb-ingest` | `lmdb-nosync`, `rocksdb-tuned-nosync` |
+| in memory until a checkpoint | | `faster`, where it is built |
+
+`faster` is Microsoft's FASTER, its C++ store: the comparator a user would
+otherwise pick for point gets and puts alone, a hash index over a log that
+updates in place. Its promise is weaker than a buffered commit's and it has
+no stronger one to configure. A write is in the process's memory when it
+returns and reaches the device at a checkpoint, so a process that is killed
+loses what it wrote since, where a buffered arm's every commit is in the
+kernel. That is a guarantee of its own with one arm in it: the suite
+compares `faster` with nothing and draws no figure of it, and its cells are
+in the row for a reader who sets them beside the buffered group's and says
+what differs. It has no ordered scan and the arm does not reopen a store, so
+it runs no scan workload, no YCSB E and no recovery workload, and its row
+has no cell there. A load's window ends where the arm's guarantee is met,
+which for FASTER is a checkpoint of its log, written in whole pages of
+32 MiB. Read-modify-write in the `threads` workloads is FASTER's own single
+operation, and a read and then a write for every other arm.
+
+The store is not a crate. `scripts/faster.sh` fetches its sources at the
+commit `vendor/faster/PIN` names and installs the libraries they link, and
+the build fails without them; the upstream repository is no longer
+maintained, so the pin is its last commit. It is built on Linux x86-64
+alone, the one platform the store supports that the suite runs on, and a
+row from an ARM or macOS host has no `faster` cells.
 
 A comparator runs one stated configuration in both groups, the two
 differing in the sync alone: RocksDB as its tuning guide sets it for this

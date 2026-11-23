@@ -1156,6 +1156,17 @@ fn a_burst_the_writers_forms_cover_is_not_chained_through() {
                 merge_chains: true,
                 merge_chains_writes: true,
                 merge_chains_writes_uncovered: opt,
+                // The planners here are the seals' landings and the chain.
+                // The scans below would have the segment work's loop plan
+                // as well (`Options::merge_plan_idle`), and its plan is
+                // counted with the landings': where it was counted after
+                // `plans0` was read, the wait for four plans ended with
+                // three seals landed, the hold came off, and the last
+                // seal's landing found the first merge finished and planned
+                // the second range itself -- three runs in a hundred of the
+                // covered store under the option, alone, and every run with
+                // the last landing held back.
+                merge_plan_idle: false,
                 merge_parallel: 1,
                 merge_parallel_quiet: 0,
                 zpages: supdb::ZPages::Off,

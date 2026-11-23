@@ -79,6 +79,9 @@ fn pretty(arm: &str) -> &'static str {
         "rocksdb-tuned-nosync" => "RocksDB (nosync)",
         "rocksdb-tuned-lz4" => "RocksDB (LZ4)",
         "rocksdb-nosync" => "RocksDB (untuned, nosync)",
+        // Named for a legend it is not yet in: its guarantee holds it alone
+        // and no figure is drawn of one arm (`render_row`).
+        "faster" => "FASTER",
         _ => "?",
     }
 }
@@ -307,6 +310,11 @@ fn render_row(row: &Row, out: &Path) -> io::Result<Vec<Rendered>> {
         let g = match guarantee {
             Guarantee::Durable => "durable",
             Guarantee::Buffered => "buffered",
+            // A figure is a comparison within a guarantee, and this one
+            // holds FASTER alone (`engines::ARMS`): nothing to draw it
+            // against. Its cells are the row's, for a reader who sets
+            // them beside another group's and says what differs.
+            Guarantee::Memory => continue,
         };
         let name = format!("{}-{workload}-{quantity}-{g}.svg", row.scale.as_str());
         let (svg, title) = figure(row, &workload, &quantity, &unit, guarantee, &curves, floors);
@@ -618,6 +626,7 @@ fn message(
     let g = match guarantee {
         Guarantee::Durable => "durable per batch",
         Guarantee::Buffered => "buffered",
+        Guarantee::Memory => "in memory until a checkpoint",
     };
     let context = format!("{noun}, {what}, {g}, to {} keys", pow_label(top));
     let mut ahead = Vec::new();

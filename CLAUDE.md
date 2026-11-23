@@ -87,6 +87,20 @@ timing run needs the machine to itself, and CI gives it a job of its own. The
 check run in the `bench` group (`sh bench/scripts/check.sh lint` by
 itself, a minute), and a commit that touched `bench/` alone went out
 behind a green `lint` with a doubled `#[allow]` that clippy refuses.
+And a green `lint` here is the runner's only under the runner's
+toolchain: CI installs the stable of the day and a container keeps the
+one it was made with, which `scripts/deps.sh` leaves as it finds it. Two
+`chunks_exact` calls over a constant passed here under 1.97 and failed on
+every hosted leg under 1.100, whose clippy asks for `as_chunks`, and
+nothing had said so, CI running on a pull request and none having run it
+over the branch since they were written. `rustup update stable` before
+the gate, or the group under the runner's version
+(`RUSTUP_TOOLCHAIN=1.100.0 sh scripts/check.sh lint`). The macOS leg's
+lint is another the gate here does not run: three helpers in
+`tests/zpages.rs` that only Linux's tests call were dead code there. It
+type-checks without a cross toolchain, once
+`rustup target add aarch64-apple-darwin`: `cargo clippy --release
+--all-targets --target aarch64-apple-darwin -- -D warnings`.
 
 The tests leave their stores under the temp directory, one per test and
 process (`supdb-next-<name>-<pid>`), so a day of test runs on one box is
@@ -2056,10 +2070,21 @@ three defaults turned off alone named the one. The test of the
 conversion's order holds the first job before its rename and the second
 at its start now, under either turn, and fails on a tick that starts a
 conversion ahead of a partition's own build; the test whose order is
-read off the warms taken in a job a step pins the turn at the step. The
+read off the warms taken in a job a step pins the turn at the step. And
+as a poll: two tests of the builds at a merge's output finish sealed
+their last piece and waited to see its merge in flight, a merge of one
+partition that is in flight for five milliseconds, under a poll every
+five. A poll a few milliseconds late found it landed and nothing left to
+merge, and sat out its ten seconds: one run in 240 beside seven other
+processes, the first run on a hosted runner, and every run with the wait
+made 300 ms late. The wait reads the merges landed since the seal beside
+the one in flight (`wait_for_merge`), which a merge that came and went
+satisfies as one caught does. The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
-thing it bets against gets faster; and a test that passes is read for
+thing it bets against gets faster; a state the test needs only to have
+happened is waited for by the count it leaves behind, never by catching
+it; and a test that passes is read for
 the path that passed it, since a fallback that does the same work
 passes it too.
 
@@ -2850,7 +2875,19 @@ allocate, and the count of anonymous bytes resident beyond the allocator's
 use is lowered by any allocation from a free chunk already resident: a
 dead arena of thirty-two megabytes read as nine in one run of the whole
 `db` binary, so that test has a binary of its own (`tests/resident.rs`), as
-the allocation count has (`tests/leak.rs`).
+the allocation count has (`tests/leak.rs`). A fork is such an effect on
+every descriptor the process holds. The crash oracle in `tests/runlog.rs`
+spawns its writers beside tests that open stores, a child holds a copy of
+each store's `LOCK` from its fork to its exec, and a `flock` is the open
+file description's and not the descriptor's: a store one test closed and
+opened again inside that window was refused as open elsewhere, the
+child's copy holding the lock the close had given up. Once on a hosted
+runner; with the child held 30 ms before its exec, two runs of the binary
+in eight, the same test at the same line; none of thirty without the
+oracle. The tests there hold a lock for read while they open stores and
+the oracle spawns under it for write (`no_fork`). The engine's own answer
+to a caller that forks is the same refusal, for as long as a child takes
+to reach its exec.
 
 **A call site no real input reaches red.** The suite's refusals after the
 read pass and after the shuffled load were green-side only, because a real
@@ -5669,7 +5706,20 @@ everything of it that reads what the test changes next, so it names the
 counter the turn moves last; a fix for a race is held to the race made
 wide before it is believed, since a fix that narrows the window passes
 every run that the unfixed test passes; and a failure met under a switch
-is run without the switch, as many times, before it is the switch's.
+is run without the switch, as many times, before it is the switch's. It
+came again as a count two planners move. The test of a burst the
+writer's forms cover waits for four plans to know its four seals have
+landed, as the test it was written from does, and scans before the seals
+where that one scans after them: the idle planner's look at the scan
+(`Options::merge_plan_idle`) is a plan too, counted with the landings'.
+Counted after the baseline was read, it ended the wait with three seals
+landed, the hold on the first merge came off, and the fourth seal's
+landing found that merge finished and planned the second range itself,
+which the test read as the chain run through a burst it was to leave
+alone: three runs in a hundred alone, and every run with the last
+landing held back. The engine had chained nothing; the idle planner is
+off in that test. A wait copied from a sibling is read against what this
+test does that the sibling does not.
 
 **A lever built for the largest peak known, before a count said whose
 memory stayed.** At ten million keys under 1 GiB the allocator held 57-68
