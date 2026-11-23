@@ -92,6 +92,49 @@ bytes on disk, the open against LMDB). No encryption work wins those. The readin
 told otherwise: on such a cell the bar is that the store under a cipher does no worse against
 the encrypted comparator than the plain store does against the plain one.
 
+### The next unit, scoped: the stride form read by the piece under a cipher
+
+This was the fifth between-stage change and the measurements above make it the first: it is
+what the bounded cells are lost by. Read on 23 Nov, not started.
+
+- **Where it is declined today.** A build over a kept file answers
+  `Outcome::NotStride(StrideNo::Kept)` (`src/db/zfile.rs`, `SegSrc::Kept`): the stride writer
+  takes its records lent whole (`write_stride`), which a file read by the piece lends none of.
+  And every read of a stride file goes through `ZFile::stride_bytes`, the whole borrow
+  (`lend_whole_map` under the stride form's seal token), which a paged mapping answers with
+  the empty slice: about fourteen call sites in `zfile.rs` (`stride_read_all`, `stride_scan`,
+  `stride_walk`, `stride_values`, `stride_values_at`, `stride_page_check`, the cursor, the
+  count, the attach at `from_bytes`), each handing `file: &[u8]` to a `StrideBody` method
+  (`read_all`, `lower_bound`, `page_ok`, the walks, `open`, `with_row`), which index it.
+- **The shape that fits the tree.** What `flatindex` did for the key section: the body's
+  readers take a source that is either the slice, over which they are the code they were, or a
+  reader by the piece whose each read is a `slice_at` of the range it wants (`Sect` and
+  `Pieces`). A value is one stride, a page check one page, a walk a window of pages, a sparse
+  form's search a page of numbers after the samples in the heap. The writer takes the
+  records' images through the trait the block form's builder already reads kept files by
+  (`PieceImages`), under a hold with a rest a page (`zfile::Walked`).
+- **Before any of it: the plain stride path into the count.** `scripts/cost.sh` has no probe
+  that reads or scans through a stride file (its `_z` probes force the block form), so "a
+  store in the clear pays nothing" does not cover the path this unit touches. Add probes over
+  a forced stride arm (point read, scan, long scan), red-input them, and count the unit
+  against the commit before it by function.
+- **The wall.** A form module names nothing of the encryption (`tests/data/couplings.txt`):
+  the reader asks its mapping through `Bytes`, as the block form's `page_bytes` does.
+- **Tests owed.** The stride tests of `tests/zpages.rs` under a cipher beside the clear; the
+  differential fuzz with the stride form forced under a cipher in a small cache
+  (`ZFUZZ_STRIDE` with `ZFUZZ_CIPHER`, `ZFUZZ_CIPHERCACHE=16384`), the conversion steer
+  included; a damaged chunk of a stride file taking the form out of service and not the
+  store; mutants of each reader's by-the-piece arm.
+- **Then price it where it was lost**: `pair.sh` of the arm against `rocksdb-tuned-enc` at
+  five million keys under 640 MiB, read and scan, and against `supdb-cipher` as it is today.
+  What to expect, as arithmetic and not yet a measurement: the stride file is 500 MB at five
+  million keys, which the bound cannot hold twice (the kernel's cache of the ciphertext and
+  the store's of the plaintext), so the win over today's 38,000 reads a second depends on
+  which of the two the budget is given to; the design's WARM (S7) is the shape that holds it
+  once.
+- The heads' copy under a cipher (`Options::heads_owned`) is the smaller half of the same
+  change and can follow it.
+
 ## Upstream merged again, and what was held over it (23 Nov, `b35f519`)
 
 Upstream's head `558606d` (eight commits: the raw rewarm, `scan_forms_off_counts_built`, the
