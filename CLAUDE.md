@@ -6414,6 +6414,37 @@ beside the cell that reads two shapes; and "the raw form fits the budget"
 is a statement about a store at rest, which a store being loaded under a
 bound is not.
 
+**A fix keyed on the road into a state, and the next change took another
+road.** The heads of a partition landed beside a block cache in the raw
+records' place were left in a mapping because the controller's model
+charges the cache's copies and the records they stand in for both, and the
+fix of the morning read "a grant of the records' place stands" as the
+store left raw (`Options::heads_owned_beside_copies`). A grant is made
+where the cache's own budget binds. With the jobs' arrays mapped the
+process has a hundred megabytes less beside the cache, the budget grows
+into the room and never binds, and no grant was made in six sweeps of six:
+the cache held the same 436 MB of copies, the model read the same misfit,
+thirteen partitions of twenty had their heads copied, and the pass after
+the full rewrite at three million keys under 1 GiB took 49 and 178 major
+faults on the late indexes in two reps of six, 47 and 55 ms where the
+others ran 16 to 23 -- the cell of the morning, 0.76x of the allocator's
+arm in both orders, in the pairing that was to confirm the new default
+(`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh supdb supdb-jobsheap 3000000
+--bound 1073741824 --reps 3 --ops-div 10`, at `a4dc700`). The count that
+named it was the first fix's own: `heads_beside_copies` at nothing, beside
+`cache_copies_grants` at nothing. The look asks the state now: whether the
+misfit the model reads is the cache's bytes, the raw populations within
+the budget once those bytes are given back to it, with no point read near
+(`Maint::z_misfit_is_the_caches`), grant or none. The rules: a fix is
+keyed on the state that is wrong and not on the event that led to it when
+it was found, since the next change reaches the state another way; a
+default's confirming pairing is read for the counts of every earlier fix
+on the cells it touches before its rates, a fix that has stopped firing
+reading as a loss of the new change; and a guard written beside such a
+predicate is held to a mutant like the rest -- a test for the cache
+holding nothing survived its own removal, the model answering the same
+without it, and came out.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

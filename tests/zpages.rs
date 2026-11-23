@@ -4004,7 +4004,17 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
         ModelAlone,
         /// The option, the grant taken back by a point read.
         TakenBack,
+        /// The option, and no grant: the cache's own budget never binds,
+        /// and the misfit is its bytes all the same.
+        NoGrant,
+        /// No grant, the misfit the cache's, and a point read near.
+        NoGrantNear,
+        /// No grant, far from point reads, and a misfit the cache's
+        /// bytes given back would not mend.
+        NotTheCaches,
     }
+    let no_grant = |c: Case| matches!(c, Case::NoGrant | Case::NoGrantNear | Case::NotTheCaches);
+    let copies = |c: Case| matches!(c, Case::Beside | Case::NoGrant);
     // What the bound leaves beside the raw form, to begin with.
     const SLACK: u64 = 64 << 10;
     let run = |name: &str, case: Case| {
@@ -4021,9 +4031,9 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
                 o.scan_cache_ahead = false;
                 o.commit_forms = true;
                 o.forms_settle_backlog_pct = 0;
-                o.scan_cache_auto_bytes = 1 << 10;
+                o.scan_cache_auto_bytes = if no_grant(case) { 1 << 30 } else { 1 << 10 };
                 o.scan_cache_auto_room = true;
-                o.scan_cache_copies_fit = true;
+                o.scan_cache_copies_fit = !no_grant(case);
                 o.heads_owned = true;
                 o.heads_owned_beside_copies = case != Case::ModelAlone;
                 o.upkeep = supdb::Upkeep::Inline;
@@ -4053,8 +4063,11 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
         // Twenty blocks, a key of each a round, until every one is dense
         // and a copy: the first crossing of the cache's budget grows into
         // the slack, and the second is granted the records' place.
+        // A cache of two rounds is a sliver of the raw form, for the case
+        // whose misfit its bytes are not to cover.
+        let rounds = if case == Case::NotTheCaches { 2 } else { 24 };
         let mut rng = Rng(0xBE51DE);
-        for round in 1..=24usize {
+        for round in 1..=rounds {
             for b in 0..20usize {
                 let k = spaced_key(b * 64 + 1 + round % 24);
                 let v = suite_value(&mut rng);
@@ -4067,10 +4080,11 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
         }
         assert_eq!(
             db.cache_copies_grants(),
-            (1, 0),
-            "{name}: the records' place granted, {} B held",
+            (u64::from(!no_grant(case)), 0),
+            "{name}: the records' place granted or not, {} B held",
             db.block_cache_bytes()
         );
+        assert!(db.block_cache_bytes() > 0, "{name}: copies held");
         assert_eq!(
             db.heads_owned_counts(),
             (0, 0, 0),
@@ -4088,14 +4102,28 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
             db.commit().unwrap();
             assert_eq!(db.cache_copies_grants(), (1, 1), "{name}: taken back");
         }
+        if case == Case::NoGrantNear {
+            let last = spaced_key(2999);
+            assert_eq!(db.count(&last).unwrap(), 1);
+            assert!(!db.points_far(), "{name}: a point read is near");
+            let k = spaced_key(2);
+            let v = suite_value(&mut rng);
+            db.append(&k, &v);
+            model.get_mut(&k).unwrap().push(v);
+            db.commit().unwrap();
+        }
         // The model's misfit, held at the census by the group's pressure.
         // The misfit a grant made goes with the copies a taking back
         // sheds, so there the seam says one for the model to read.
-        let seam = if case == Case::TakenBack {
+        let seam = if matches!(case, Case::TakenBack | Case::NotTheCaches) {
             SLACK
         } else {
             budget(&db)
         };
+        assert!(
+            case != Case::NotTheCaches || SLACK + (db.block_cache_bytes() as u64) < raw,
+            "{name}: a misfit the cache's bytes do not cover"
+        );
         inject.set_budget(seam);
         inject.set_refault_rate(1_000_000.0);
         wait_secs(&db, 3, 1);
@@ -4107,25 +4135,22 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
         );
         scan(&db, &model, "the census");
         let t = std::time::Instant::now();
-        while case == Case::Beside
-            && db.heads_owned_counts().0 < parts
-            && t.elapsed().as_secs() < 20
-        {
+        while copies(case) && db.heads_owned_counts().0 < parts && t.elapsed().as_secs() < 20 {
             wait_secs(&db, 1, 1);
         }
-        if case != Case::Beside {
+        if !copies(case) {
             wait_secs(&db, 3, 1);
         }
         let c = db.zpage_counts();
         assert_eq!((c.phase, c.gate), (1, 1), "{name}: still SUSPECT: {c:?}");
         let (made, given, bytes) = db.heads_owned_counts();
-        if case == Case::Beside {
+        if copies(case) {
             assert_eq!((made, given), (parts, 0), "{name}: every partition's heads");
             assert_eq!(bytes, 8 * model.len() as u64, "{name}: eight bytes a key");
             assert_eq!(
                 db.heads_beside_copies(),
                 parts,
-                "{name}: each for the grant alone, the model saying misfit"
+                "{name}: each for the cache in the records' place, the model saying misfit"
             );
         } else {
             assert_eq!(
@@ -4142,6 +4167,9 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
     run("heads-beside-copies", Case::Beside);
     run("heads-beside-model", Case::ModelAlone);
     run("heads-beside-taken-back", Case::TakenBack);
+    run("heads-beside-no-grant", Case::NoGrant);
+    run("heads-beside-no-grant-near", Case::NoGrantNear);
+    run("heads-beside-not-the-caches", Case::NotTheCaches);
 }
 
 /// At the census under the controller a copy is for a store the model says

@@ -6151,7 +6151,16 @@ pub struct Options {
     /// a grant standing reads as the store left raw: the scanning thread
     /// took a fault at most in twenty-four passes paired, where the
     /// model's word alone left passes of sixty-three to a hundred and
-    /// ninety. On; `supdb-headsmodel` is the model's word alone.
+    /// ninety. A process with less beside the cache has room for every
+    /// copy with no grant, the cache's own budget never binding, and the
+    /// same misfit by the same count: with the jobs' arrays mapped
+    /// (`jobs_mapped`) no grant was made in six sweeps of six, thirteen
+    /// partitions of twenty had their heads copied, and two passes of six
+    /// took 49 and 178 faults on the late indexes, 47 and 55 ms where the
+    /// others ran 16 to 23. So the look asks the model's question with
+    /// the cache's bytes given back to the budget
+    /// (`Maint::z_misfit_is_the_caches`), far from point reads, grant or
+    /// none. On; `supdb-headsmodel` is the model's word alone.
     #[doc(hidden)]
     pub heads_owned_beside_copies: bool,
     /// The hot-raw policy's skew bar read against the room
@@ -20239,6 +20248,11 @@ struct Shared {
     /// work's look at the heads (`Options::heads_owned_beside_copies`),
     /// which cannot read the writer's own record of it.
     copies_stand: std::sync::atomic::AtomicBool,
+    /// The writer's block cache, bytes, as its last commit's maintenance
+    /// counted it (`Reader::maintain_forms`): what the controller's tick
+    /// gives back to the model's budget to ask whose the misfit is
+    /// (`Maint::z_misfit_is_the_caches`).
+    cache_seen: AtomicUsize,
     /// Whether the store reads as far from point reads: none in its life,
     /// or two stores' worth of writes since the last, as scans are read
     /// (`reads_around`). Published by the writer's commit
@@ -29443,6 +29457,13 @@ impl Reader {
     /// may be shed.
     fn maintain_forms(&self) -> Result<()> {
         self.hold_copies_look();
+        // The cache as it stands, for the controller's tick
+        // (`Maint::z_misfit_is_the_caches`); the writer's alone.
+        if self.slot.is_none() {
+            self.shared
+                .cache_seen
+                .store(self.fs().cache_bytes.get(), AtomicOrdering::Relaxed);
+        }
         self.keep_merge_snapshot();
         if self.settle_due(true) != Some(true) {
             return Ok(());
@@ -35095,6 +35116,7 @@ impl Db {
             cache_copies_grants: AtomicU64::new(0),
             cache_copies_revokes: AtomicU64::new(0),
             copies_stand: std::sync::atomic::AtomicBool::new(false),
+            cache_seen: AtomicUsize::new(0),
             points_far: std::sync::atomic::AtomicBool::new(true),
             cache_bound_any: std::sync::atomic::AtomicBool::new(false),
             abandon_at: AtomicU64::new(u64::MAX),
@@ -35902,6 +35924,7 @@ impl Db {
             cache_copies_grants: AtomicU64::new(0),
             cache_copies_revokes: AtomicU64::new(0),
             copies_stand: std::sync::atomic::AtomicBool::new(false),
+            cache_seen: AtomicUsize::new(0),
             points_far: std::sync::atomic::AtomicBool::new(true),
             cache_bound_any: std::sync::atomic::AtomicBool::new(false),
             abandon_at: AtomicU64::new(u64::MAX),
@@ -46604,6 +46627,10 @@ struct Maint {
     /// Whether the controller leaves the store raw at the census by its
     /// last steps (`heads_left_raw`): what `z_heads_look` copies heads on.
     z_leaves_raw: bool,
+    /// Whether the misfit the model last read is the block cache's own
+    /// bytes (`z_misfit_is_the_caches`): with no point read near, the
+    /// store reads as left raw for `z_heads_look` all the same.
+    z_misfit_caches: bool,
     /// The coding the selector chose at its last reading
     /// (`Options::zpages_coding_auto`, `zselect::choose_coding`), which the
     /// builds after it are planned in; none until a reading with both
@@ -47351,6 +47378,7 @@ impl Maint {
             z_handed_gen: u64::MAX,
             z_refresh_due: false,
             z_leaves_raw: false,
+            z_misfit_caches: false,
             z_coding_pick: None,
             z_pick_size: None,
             z_ops_life: 0,
@@ -49032,8 +49060,13 @@ impl Maint {
         // (`Options::heads_owned_beside_copies`): the model's misfit is
         // then the grant's own bytes, and it stands only far from the
         // point reads whose faults would buy a form.
+        // And so does a cache that holds that place with no grant, its
+        // own budget never having bound: the misfit is its bytes either
+        // way (`z_misfit_is_the_caches`), and no point read is near to
+        // buy anything.
         let beside = self.opts.heads_owned_beside_copies
-            && self.shared.copies_stand.load(AtomicOrdering::Acquire);
+            && (self.shared.copies_stand.load(AtomicOrdering::Acquire)
+                || (self.z_misfit_caches && self.shared.points_far.load(AtomicOrdering::Acquire)));
         let model_raw = !self.z_auto || self.z_leaves_raw;
         let census_raw = model_raw || beside;
         let _op = self.op();
@@ -51207,6 +51240,28 @@ impl Maint {
             .ok();
     }
 
+    /// Whether the misfit the model reads under `budget` is the block
+    /// cache's own bytes (`Options::heads_owned_beside_copies`): the raw
+    /// populations within the budget once what the writer's cache holds
+    /// is given back to it. The model's budget is the limit less the
+    /// process's anonymous memory, the cache's copies are in that memory,
+    /// and a copy stands in for its block's records for every scan, so a
+    /// store only scanned is charged for both; with the cache's bytes
+    /// given back the model is asked the question the heads' look has,
+    /// whether anything is to be bought. A grant of the records' place is
+    /// the case where the cache's own budget bound first
+    /// (`Shared::copies_stand`); a process with less beside the cache has
+    /// room for the copies without one, and the same misfit. Asked where
+    /// the model is read, once a second, with the populations it read.
+    fn z_misfit_is_the_caches(&self, budget: u64) -> bool {
+        let cache = self.shared.cache_seen.load(AtomicOrdering::Relaxed) as u64;
+        let z = &self.shared.z;
+        let hash = z.model_hash.load(AtomicOrdering::Relaxed);
+        let records = z.model_records.load(AtomicOrdering::Relaxed);
+        zselect::model_raw(budget.saturating_add(cache), hash, records)
+            < self.zsel.theta_sus(zselect::Class::Read)
+    }
+
     /// The room a rewarm's asks for the raw form's files may take
     /// (`Options::zpages_rewarm_raw`): the group's unused memory less the
     /// margin, the seam's where a test set the budget, else the platform's;
@@ -51642,6 +51697,11 @@ impl Maint {
         // crossing's first and its buy are of the last kind or ask.
         self.z_leaves_raw =
             heads_left_raw(self.z_leaves_raw, &d, model.as_ref().map(|m| m.phi_raw));
+        // And whose the misfit is, where the model was read
+        // (`Options::heads_owned_beside_copies`).
+        if let Some(m) = model.as_ref() {
+            self.z_misfit_caches = self.z_misfit_is_the_caches(m.budget);
+        }
         self.z_apply(&d, model.as_ref(), &input);
         // The form installed is the form every read is served from, so its
         // files' cold pages are asked for now and not a fault at a time
