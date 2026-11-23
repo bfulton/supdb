@@ -431,6 +431,49 @@ fn emit_fixed<F: FnMut(&[u8], &[u8])>(k: &[u8], run: &[u8], records: usize, f: &
     }
 }
 
+/// A walk's run of common records, in a function of its own: from `off`
+/// of `group`, at most `left` of them, each held to `until` and handed to
+/// `f` (`compact_fixed_at`, `emit_fixed`). Returns where it stopped, how
+/// many it handed over, and how the key it stopped at compares with
+/// `until` where it stopped for that; it stops short of `left` with no
+/// order at a record of any other shape, which the caller reads through
+/// the parse.
+///
+/// Out of line because the walk is not: `ZCursor::walk_inner` holds the
+/// coded groups' walk, the parse of every other shape of record and their
+/// values' reads beside this loop, and what the loop kept in registers
+/// followed whatever those inlined. The same source read 80 instructions a
+/// record in one build and 90 in another whose only difference was a
+/// reader three calls away (`Blob::read_exts_inline`), and three other
+/// shapes of that reader read 82, 82 and 83. Here the loop holds a group,
+/// a position, a count and the callback and nothing else, and the limit
+/// and the group's end are one count (`left`).
+#[inline(never)]
+fn walk_fixed<F: FnMut(&[u8], &[u8])>(
+    group: &[u8],
+    mut off: usize,
+    left: usize,
+    until: Option<&[u8]>,
+    f: &mut F,
+) -> (usize, usize, Option<KeyOrder>) {
+    let mut took = 0usize;
+    while took < left {
+        let Some((k, run, records, next)) = compact_fixed_at(group, off) else {
+            break;
+        };
+        if let Some(u) = until {
+            match k.cmp(u) {
+                KeyOrder::Less => {}
+                order => return (off, took, Some(order)),
+            }
+        }
+        emit_fixed(k, run, records, f);
+        off = next;
+        took += 1;
+    }
+    (off, took, None)
+}
+
 /// Record `i` of a coded group handed to `f` as the walk hands a decoded
 /// record: its key assembled into `key`, and its values read where the raw
 /// tail lies when the record parses there, else from the record decoded on
@@ -1565,23 +1608,19 @@ impl<'a> ZCursor<'a> {
             {
                 let group = self.group();
                 while n < limit && rank < end {
-                    // The common record in place; any other shape through
-                    // the parse.
-                    if let Some((k, run, records, next)) = compact_fixed_at(group, off) {
-                        if let Some(u) = until {
-                            match k.cmp(u) {
-                                KeyOrder::Less => {}
-                                order => {
-                                    stop = Some(order);
-                                    break;
-                                }
-                            }
-                        }
-                        emit_fixed(k, run, records, f);
-                        off = next;
-                        rank += 1;
-                        n += 1;
-                        continue;
+                    // The common records in place, a run of them at a time
+                    // (`walk_fixed`); any other shape through the parse.
+                    let left = (limit - n).min(end - rank);
+                    let (at, took, met) = walk_fixed(group, off, left, until, f);
+                    off = at;
+                    rank += took;
+                    n += took;
+                    if met.is_some() {
+                        stop = met;
+                        break;
+                    }
+                    if took == left {
+                        break;
                     }
                     let Some((k, exts, tail, len)) = parse_record(group, off) else {
                         if partial {
@@ -9581,6 +9620,7 @@ impl StrideBody {
         let at = self.layout.k_off() + rank * 8;
         let p = (at / ZPAGE as u64) as u32;
         if !good(p).ok() {
+            core::hint::cold_path();
             return Err(p);
         }
         let at = at as usize;
