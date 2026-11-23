@@ -43,17 +43,54 @@ sh scripts/check.sh enc
 - **OpenSSL's headers** are needed for that build (`sh scripts/deps.sh openssl`); this
   container has them.
 
-**The first look** (`bench ab`, 3 to 4 pairs, one order, so directions and not verdicts; logs
-in the session's scratchpad, not kept): `supdb-cipher` ahead of both encrypted comparators in
-every read, scan, shuffled load, lag point and mix at 100,000 and 300,000 keys and of RocksDB's
-at a million, by 1.1x to 30x. **Behind in one cell: the durable ordered load**, by a third at
-100,000 keys against both, a fifth at 300,000 against LMDB's, level with RocksDB's at a
-million. And its store is 1.9 to 2.5 bytes on the device a byte stored where theirs are 1.0 to
-1.2. Both are the same known cost: a run's commits written twice under a cipher (the log and
-the run's file) with the envelope written at the close (`CLAUDE.md`, the run under a cipher),
-which is what the page layer's pages sealed as they are written remove. So the layer's first
-measurable target is that cell. Not yet measured against the comparators: the buffered group,
-and anything out of core, where `supdb-cipher` is known weakest against itself.
+### What the comparators say (the row and four bounded pairings, 23 Nov, at `b12bd36`)
+
+Everything here is under `scratch/enc/`: the row `quick/20261123T014642Z-b12bd36.json`
+(`bench run --scale quick --arms enc`, five reps, four rungs, twelve arms), read cell by cell by
+`python3 scratch/enc/encrow.py ROW.json` (a cell is resolved when every rep of one arm lies on
+one side of every rep of the other), and `pairs/` (`pair.sh`, both orders, two pairs a sitting).
+
+**In core, 10,000 to 300,000 keys: ahead in about 120 of 145 cells against each encrypted
+comparator, in both guarantee groups.** Every read, scan, shuffled load, lag point and mix.
+Behind in three families:
+
+| family | cipher store | its plain twin | LMDB encrypted | RocksDB encrypted | whose to win |
+|---|---|---|---|---|---|
+| ordered load, durable, k ops/s by rung | 690, 974, 927, 1007 | 921, 1345, 1237, 1351 | 1028, 1078, 1111, 1069 | 1038, 1177, 1096, 1163 | the layer's from 30,000 keys (it needs 0.85-0.9x of plain); at 10,000 **the plain store trails both too** |
+| ordered load, buffered | 1206, 1528, 1473, 1716 | 1821, 2383, 2650, 3214 | 1868, 2095, 2265, 2300 | 1602, 1630, 1794, 1832 | the layer's (it needs 0.72-0.88x of plain); at 10,000 plain trails LMDB's too |
+| bytes on disk a byte stored | 2.5 | 1.3-1.4 | 1.15-1.2 | 1.03-1.09 | the double write is the layer's; **the plain format's 1.3 is above both comparators whatever the layer does** |
+| open after a crash, ms by rung | 5, 14, 53, 169 | 4, 7, 22, 65 | 0.9 at every size | 13, 28, 79, 224 | ahead of RocksDB's; LMDB recovers nothing and **the plain store is 4 to 70 times its open too**; the cipher's 2.6x over plain is this branch's (task 13) |
+
+The ordered load is 0.72-0.75x of plain durable and 0.53-0.66x buffered, the known double
+write and the envelope at the close; the design's S4 predicts 0.85-0.95x and 0.78-0.90x, which
+is ahead of both comparators from 100,000 keys and about level at 30,000.
+
+**Out of core, five million keys under 640 MiB (`--bound 671088640 --passes read,scan
+--ops-div 10`): behind.**
+
+| cell | `supdb-cipher` | RocksDB encrypted | LMDB encrypted | `supdb` | `rocksdb-tuned` |
+|---|---|---|---|---|---|
+| point reads a second | 38-42 k | 54-55 k | 9 k | 630-760 k | 63-74 k |
+| scan entries a second | 0.42-0.47 M | 1.58-1.62 M | 0.59-0.60 M | 27-36 M | 1.7-1.8 M |
+| major faults a read | 0.47-0.50 | (0.42-0.44 refaults) | 0.73 | 0.004-0.008 | |
+
+- Encrypted RocksDB reads 1.3-1.4x faster and scans 3.5x faster than `supdb-cipher`; encrypted
+  LMDB scans 1.3x faster and reads 4x slower.
+- **The plain store is not out of core at this bound any more**: numbered keys take the stride
+  form upstream made the default, 100 bytes a key, and five million keys of it fit 640 MiB. So
+  `supdb-cipher` is at a seventeenth of `supdb` on reads and a seventieth on scans here, where
+  the design's table (written before the stride form shipped) says 0.29x.
+- That is the layer's largest target and it reorders the plan: what loses these cells is that a
+  store under a cipher is kept out of the compact forms (the stride form declined, the
+  controller off because a form page straddles two 4080-byte chunks). Pages stored whole (S3),
+  the controller on (S5) and the stride form read by the piece (the fifth between-stage change)
+  are what put the cipher store in the regime its plain twin is in.
+
+**For the owner to rule on** (asked in the session's report of 23 Nov): three of the cells
+above are lost by the *plain* store to the same comparators (the smallest rung's ordered load,
+bytes on disk, the open against LMDB). No encryption work wins those. The reading taken until
+told otherwise: on such a cell the bar is that the store under a cipher does no worse against
+the encrypted comparator than the plain store does against the plain one.
 
 ## Upstream merged again, and what was held over it (23 Nov, `b35f519`)
 

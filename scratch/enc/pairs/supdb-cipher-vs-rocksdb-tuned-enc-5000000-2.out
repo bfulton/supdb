@@ -1,0 +1,25 @@
+
+quantity                           rocksdb-tuned-enc  supdb-cipher      B/A B above A   sign p
+bound-start group_bytes             1835008.0000  1572864.0000   0.857x     0/1      1.000
+bound-start process_bytes          13574144.0000 13664256.0000   1.007x     1/2      1.000
+load bg_read_bytes_per_op                 0.0090        0.0033   0.364x     0/2      0.500
+load majfaults_per_op                     0.0000        0.0000     NaNx     0/0      1.000
+load read_bytes_per_op                    0.0000        3.4505     NaNx     2/2      0.500
+load read_us_per_io                    1750.0000       74.0038   0.042x     1/2      1.000
+load refaults_per_op                      0.0000        0.0000   0.000x     0/2      0.500
+prime us_per_page                         1.2176        1.3746   1.129x     2/2      0.500
+read bg_read_bytes_per_op                 0.0000        0.0000     NaNx     0/0      1.000
+read majfaults_per_op                     0.0000        0.4914     NaNx     2/2      0.500
+read p99_us                              87.0390      109.0550   1.253x     2/2      0.500
+read read_bytes_per_op                 1728.0614     2012.9300   1.165x     2/2      0.500
+read read_us_per_io                      38.5502       36.2813   0.941x     0/2      0.500
+read reads_per_s                      54739.5547    38845.8938   0.710x     0/2      0.500
+read refaults_per_op                      0.4219        0.4914   1.165x     2/2      0.500
+scan bg_read_bytes_per_op                 0.0000        0.0000     NaNx     0/0      1.000
+scan entries_per_s                  1580567.7115   443359.8389   0.281x     0/2      0.500
+scan majfaults_per_op                     0.0000        4.6152     NaNx     2/2      0.500
+scan read_bytes_per_op                 8672.8704    18903.8592   2.180x     2/2      0.500
+scan read_us_per_io                      42.7315       36.2336   0.848x     1/2      1.000
+scan refaults_per_op                      2.1174        4.6152   2.180x     2/2      0.500
+
+21 quantities: 0 marked *, where a coin marks about 1.1; 0 marked **, which holds for the table as a whole (Holm)

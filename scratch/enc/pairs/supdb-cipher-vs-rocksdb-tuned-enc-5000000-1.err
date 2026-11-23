@@ -1,0 +1,5 @@
+bench: bound 671088640 bytes in group /sys/fs/cgroup/memory/process_api/01a20568-236a-71e5-925d-84ac1ea06d67/claude-code-bash/supdb-bench-8834
+bench: each pass in a group of its own with the bound on it, this process in none
+bench ab: supdb-cipher against rocksdb-tuned-enc at 5000000 keys, scans of 100, 2 pairs, each pass in a process of its own, under a bound of 671088640 bytes, passes read,scan, ops divided by 10
+    35s  rep 1/2
+    67s  rep 2/2
