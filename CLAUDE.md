@@ -2232,6 +2232,51 @@ competitor in the cell the bar names, since the two things this plan
 was built around, the form page's two chunks and the load's double
 write, were each worth a fraction of the lever it had left for last.
 
+The cache follows the room now (`pager::Room`, `Pager::following`;
+`StoreCipher::cache_half_at_open` is the shape before, `supdb-cipherhalf`
+and `supdb-cipherzstridehalf` its arms): where the cipher names no size
+the evictor reads the platform every twenty milliseconds and sets the
+budget to what the store holds and how much more the process may hold in
+memory the kernel cannot take back, gives way between two readings to
+what the store's large buffers have mapped and not yet touched
+(`Room::claimed`, `blocks::mapped_bytes`), and keeps back what the cache
+lately held past its budget. Its first version was the room less the
+process's memory and a margin, and it was killed under the bound in the
+write mixes, where the half had never been. Two fixes went to models of
+that before the count that named it. The first model was a margin eaten
+by overshoot, a file being written or a reader waited for, and the
+budget was made to keep back what it had overshot: killed the same. The
+second was an evictor stalled behind a pin, and a trace of its waits
+printed nothing through the fatal second. What named it was the group's
+`memory.stat` by kind every ten milliseconds up to the kill beside the
+cache's own count on the evictor's turn: 581 MiB of shared memory
+charged where the cache counted 514 held, with the process's own memory
+at 52. A chunk is 4,080 bytes of plaintext and the memory it takes is
+pages: a chunk decrypted by itself lies across two, so over reads far
+apart the memory resident is the bytes held times two less the share of
+chunks present, a twelfth more at that store, and
+`scratch/seam/design.md` had the ratio on record from the first
+out-of-core pairing (337 MiB of shmem for 274 held). Under half of the
+room nothing had needed the count to be right. The budget is steered by
+the platform's own reading of the shared memory it charges
+(`zfile::unreclaimable_slack`), so the count's error, and a memory file
+not yet counted, are corrected within a reading. The same samples said
+what the store under a cipher had been dying of before any of this: at
+five million keys under 640 MiB the half shape was killed in every rep of
+the lag sweep's full rewrite, the process at 291 MiB of its own memory
+where the plain store peaks at 186, the cache holding its 297 beside it
+and the page cache at nothing; following the room it gets through the
+rewrite and its pass, and is killed at the pass's end with 359 MiB of
+its own and 270 in files being written, which is the writer piling up
+behind landings a cipher makes slower and no budget's to fix
+(`ROADMAP.md`). The rules: what a store counts itself holding is not
+what the platform charges it, so a budget drawn near a limit is steered
+by the platform's reading of the thing limited; a process killed under
+a bound is read from the group's memory by kind, at ten milliseconds, up
+to the kill, before a model of the kill is fixed; and a shape that ran
+with half its room to spare has had none of its accounting tested, so
+the accounting is held to the platform before the spare is taken away.
+
 A plain store's partition is named by its fences, sixteen bytes of two
 keys, so the names cannot go to the directory either: an envelope is named
 by a token drawn for it, the names live in the sealed manifest beside the

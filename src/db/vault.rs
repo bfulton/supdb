@@ -197,7 +197,14 @@ pub struct StoreCipher {
     key_id: u64,
     cache: Option<u64>,
     apart: bool,
+    half: bool,
+    room: Option<Arc<RoomFn>>,
 }
+
+/// A room handed to a store in place of the platform's
+/// (`StoreCipher::cache_room`): what its plaintext may hold, given what it
+/// holds.
+type RoomFn = dyn Fn(u64) -> Option<u64> + Send + Sync;
 
 impl StoreCipher {
     /// A store's cipher from the cipher under the caller's key and the
@@ -214,6 +221,8 @@ impl StoreCipher {
             key_id: 0,
             cache: None,
             apart: false,
+            half: false,
+            room: None,
         }
     }
 
@@ -223,10 +232,16 @@ impl StoreCipher {
     /// decrypting a chunk of a file where it is first read and giving the
     /// chunks least lately read back once the cache is past this, so a
     /// store of any size runs in it, at the rate of its misses. Unset, it
-    /// is half of the memory the process may use (its control group's
-    /// limit or the machine's, less what the process already holds), and
-    /// sixty-four mebibytes at least; the other half is for the kernel's
-    /// cache of the store's files, which is what a miss is read from.
+    /// follows the room: the memory the process may use (its control
+    /// group's limit or the machine's) less what the process itself
+    /// holds, less a margin, read again as the store runs, shared between
+    /// the stores of the process that follow it, and sixty-four mebibytes
+    /// at least. Plaintext the store holds is memory the kernel cannot
+    /// take back, where a store in the clear's page cache gives way to
+    /// whatever the process allocates, so the store gives way itself: its
+    /// cache shrinks as the process grows and grows as it shrinks. A size
+    /// set here is held to whatever the process does beside it, and one
+    /// near the limit under a process that grows is a process killed.
     ///
     /// The budget is of the files' plaintext, and it is where the cache
     /// gives back, not a line it never passes: a file being written is in
@@ -237,6 +252,28 @@ impl StoreCipher {
     /// the page cache for a plain store (`Options::scan_cache_bytes`).
     pub fn cache_bytes(mut self, bytes: u64) -> StoreCipher {
         self.cache = Some(bytes);
+        self
+    }
+
+    /// The cache as it was before it followed the room: half of what the
+    /// process may use as its store opens, read once, the other half left
+    /// to the kernel's cache of the store's files. The shape the room is
+    /// priced against; nothing where `cache_bytes` is set.
+    #[doc(hidden)]
+    pub fn cache_half_at_open(mut self, half: bool) -> StoreCipher {
+        self.half = half;
+        self
+    }
+
+    /// A room in the platform's place, for a test: what the store's
+    /// plaintext may hold, given what it holds, asked as the platform is
+    /// asked. Nothing where `cache_bytes` is set.
+    #[doc(hidden)]
+    pub fn cache_room(
+        mut self,
+        room: impl Fn(u64) -> Option<u64> + Send + Sync + 'static,
+    ) -> StoreCipher {
+        self.room = Some(Arc::new(room));
         self
     }
 
@@ -616,6 +653,9 @@ pub(crate) struct Vault {
     mapped: Mutex<Vec<MappedFile>>,
     /// The cache the store's files are read through.
     pager: Arc<Pager>,
+    /// Whether that cache follows the platform's room, which the stores
+    /// of a process that do share (`PlatformRoom`).
+    follows: bool,
     pub(crate) counts: Counts,
 }
 
@@ -652,9 +692,55 @@ impl Drop for Mapped {
     }
 }
 
-/// The cache a store is given where its cipher names none: half of what
-/// `zfile::read_budget` says the process may use, the other half being the
-/// kernel's cache of the envelopes a miss is read from.
+/// The room a store's cache follows where its cipher names no size: the
+/// platform's, or the one a test handed it (`StoreCipher::cache_room`).
+struct PlatformRoom(Option<Arc<RoomFn>>);
+
+impl super::pager::Room for PlatformRoom {
+    fn read(&self, held: u64) -> Option<u64> {
+        if let Some(room) = &self.0 {
+            return room(held);
+        }
+        // The platform's room is the process's, and every store of the
+        // process that follows it takes an equal share of what is left of
+        // it: what the store holds, and its share of how much more the
+        // process may hold, or less by its share of what has to go.
+        let (mut all, mut sharing) = (0u64, 0i64);
+        for v in lock(&REGISTRY).iter().filter(|v| v.follows) {
+            all += v.pager.held();
+            sharing += 1;
+        }
+        // A store reads its room before it is registered: itself alone.
+        let (all, sharing) = if sharing == 0 {
+            (held, 1)
+        } else {
+            (all, sharing)
+        };
+        let slack = super::zfile::unreclaimable_slack(all)?;
+        let room = i64::try_from(held)
+            .unwrap_or(i64::MAX)
+            .saturating_add(slack / sharing);
+        Some(u64::try_from(room).unwrap_or(0))
+    }
+    fn floor(&self) -> u64 {
+        match self.0 {
+            Some(_) => 0,
+            None => ROOM_FLOOR,
+        }
+    }
+    fn claimed(&self) -> u64 {
+        super::zfile::buffers_mapped()
+    }
+}
+
+/// The least a cache that follows the platform's room is given: sixty-four
+/// mebibytes, as a cache of half the room at the open had at least.
+const ROOM_FLOOR: u64 = 64 << 20;
+
+/// The cache of a store whose cipher asks for the shape before the room
+/// (`StoreCipher::cache_half_at_open`): half of what `zfile::read_budget`
+/// says the process may use, the other half being the kernel's cache of
+/// the envelopes a miss is read from.
 fn default_cache() -> u64 {
     #[cfg(target_os = "linux")]
     if let Some(b) = super::zfile::read_budget() {
@@ -791,8 +877,13 @@ impl Vault {
             nonces: Mutex::new(Nonces::new()?),
             persisting: Mutex::new(()),
             mapped: Mutex::new(Vec::new()),
+            follows: cipher.cache.is_none() && !cipher.half && cipher.room.is_none(),
             pager: {
-                let pager = Pager::new(cipher.cache.unwrap_or_else(default_cache));
+                let pager = match (cipher.cache, cipher.half) {
+                    (Some(bytes), _) => Pager::new(bytes),
+                    (None, true) => Pager::new(default_cache()),
+                    (None, false) => Pager::following(Box::new(PlatformRoom(cipher.room.clone()))),
+                };
                 pager.keep_apart(cipher.apart);
                 pager
             },

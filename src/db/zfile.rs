@@ -10551,6 +10551,7 @@ fn budget_from(read: &dyn Fn(&Path) -> Option<String>) -> Option<Budget> {
                 return Some(
                     Budget::of(limit, st.rss.saturating_add(st.rss_huge), st.refaults)
                         .with_cache(st.cache)
+                        .with_shmem(st.shmem)
                         .within_available(available),
                 );
             }
@@ -10580,20 +10581,68 @@ fn budget_from(read: &dyn Fn(&Path) -> Option<String>) -> Option<Budget> {
                 return Some(
                     Budget::of(limit, st.anon, st.refaults)
                         .with_cache(st.file)
+                        .with_shmem(st.shmem)
                         .within_available(available),
                 );
             }
         }
     }
-    let anon = read(Path::new("/proc/self/status"))
-        .and_then(|t| parse_status_rss_anon(&t))
+    let status = read(Path::new("/proc/self/status"));
+    let anon = status
+        .as_deref()
+        .and_then(parse_status_rss_anon)
         .unwrap_or(0);
-    Some(Budget::of(total, anon, None).within_available(available))
+    let shmem = status
+        .as_deref()
+        .and_then(super::zselect::parse_status_rss_shmem);
+    Some(
+        Budget::of(total, anon, None)
+            .with_shmem(shmem)
+            .within_available(available),
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn read_budget() -> Option<Budget> {
     None
+}
+
+/// How much more the process may hold in memory the kernel cannot take
+/// back, or, below nothing, how much of it has to go: the limit in effect
+/// less the process's anonymous memory and the margin, as `read_budget`
+/// has them, less the shared memory the platform is charging now -- memory
+/// files' pages, read from the platform and not from a count of what was
+/// put in them, since a count by the byte is under what the pages take and
+/// a file not yet counted is charged all the same; `held` stands in where
+/// the platform does not say -- held under what the machine has available,
+/// which has such memory out of it already, and less what the store's
+/// large buffers have mapped and not touched, which no reading of the
+/// process's memory sees until they are written (`blocks::mapped_bytes`
+/// less `blocks::mapped_resident_bytes`). `None` where the platform gives
+/// no reading.
+pub(crate) fn unreclaimable_slack(held: u64) -> Option<i64> {
+    let b = read_budget()?;
+    let coming =
+        super::blocks::mapped_bytes().saturating_sub(super::blocks::mapped_resident_bytes());
+    Some(slack_of(&b, held, coming as u64))
+}
+
+/// `unreclaimable_slack` over a reading: `coming` the bytes mapped and not
+/// yet touched.
+fn slack_of(b: &Budget, held: u64, coming: u64) -> i64 {
+    let signed = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    let by_limit = b
+        .limit
+        .saturating_sub(b.anon)
+        .saturating_sub(super::zselect::margin(b.limit));
+    (signed(by_limit) - signed(b.shmem.unwrap_or(held))).min(signed(b.budget)) - signed(coming)
+}
+
+/// The bytes of large buffers the store has mapped (`blocks::mapped_bytes`):
+/// what rises as the process is about to take memory, read where a load is
+/// all there is time for.
+pub(crate) fn buffers_mapped() -> u64 {
+    super::blocks::mapped_bytes() as u64
 }
 
 #[cfg(test)]
@@ -10609,6 +10658,33 @@ mod tests {
     }
     use crate::db::zpages::ZCODING_RECORD;
     use std::fs::OpenOptions;
+
+    /// What more the process may hold in memory the kernel cannot take
+    /// back: the limit less the process's own memory, the margin and the
+    /// shared memory the platform charges, below nothing where that much
+    /// has to go; `held` in the platform's place where it does not say;
+    /// under what the machine has available; and less what is mapped and
+    /// not yet touched.
+    #[test]
+    fn the_slack_for_memory_the_kernel_cannot_take_back() {
+        const MIB: u64 = 1 << 20;
+        let at = |shmem: Option<u64>| Budget::of(640 * MIB, 50 * MIB, None).with_shmem(shmem);
+        let mib = |v: i64| v / MIB as i64;
+        // 640 less 50 of the process, less the margin's 64: 526 for all
+        // of it, of which 400 is charged.
+        assert_eq!(mib(slack_of(&at(Some(400 * MIB)), 0, 0)), 126);
+        assert_eq!(mib(slack_of(&at(Some(400 * MIB)), 0, 20 * MIB)), 106);
+        // Charged past the room: that much has to go, whatever the stores
+        // count themselves holding.
+        assert_eq!(mib(slack_of(&at(Some(581 * MIB)), 514 * MIB, 0)), -55);
+        // The platform silent on what it charges: the stores' own count.
+        assert_eq!(mib(slack_of(&at(None), 514 * MIB, 0)), 12);
+        // A machine with less available than the limit leaves: that less.
+        let tight = at(Some(100 * MIB)).within_available(Some(94 * MIB));
+        assert_eq!(tight.budget, 30 * MIB);
+        assert_eq!(mib(slack_of(&tight, 0, 0)), 30);
+        assert_eq!(mib(slack_of(&tight, 0, 40 * MIB)), -10);
+    }
 
     /// A machine of 16 GiB with `available` free of it, the process in a
     /// v1 group limited to `v1` or a v2 group limited to `v2` where given,

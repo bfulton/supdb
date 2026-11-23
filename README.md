@@ -300,13 +300,16 @@ plain store borrows from the page cache, and given back once the cache is
 past `cache_bytes` and the chunk has not been read lately. A store runs in
 the cache it is given whatever its size, at the rate of its misses, and an
 `open` decrypts what an open reads of each file, not the store. Unset, the
-cache is half of the memory the process may use; the kernel's own cache
-holds the ciphertext a miss is read from. A file being written is in memory
-whole until it is sealed into the directory, so beside the cache the store
-holds what it has in flight, a seal's or a merge's output
-(`Options::seal_bytes`, `partition_bytes`). The store's own work waits for a
-cache that has run past its budget, and a read of yours waits only for one
-half as large again. What the cache does not count is what any store holds
+cache follows the room: the memory the process may use, less what the
+process itself holds and a margin, read again as the store runs. What the
+store holds in plaintext is memory the kernel cannot take back, as it can
+take back a plain store's page cache, so the store gives way itself as the
+process grows. A size you set is held whatever the process does beside it.
+A file being written is in memory whole until it is sealed into the
+directory, so beside the cache the store holds what it has in flight, a
+seal's or a merge's output (`Options::seal_bytes`, `partition_bytes`). The
+store's own work waits for a cache that has run past its budget, and a read
+of yours waits only for one further past it. What the cache does not count is what any store holds
 in the process: its unsealed writes and the block cache, which has a bound
 of its own (`Options::scan_cache_bytes`).
 

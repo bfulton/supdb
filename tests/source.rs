@@ -1919,7 +1919,7 @@ fn the_encryption_side_naming_the_engine_fails() {
     )
     .expect_err("impl super::Db in the vault");
     assert!(
-        e.contains("src/db/vault.rs path out of the encryption modules code: 3 > 2"),
+        e.contains("src/db/vault.rs path out of the encryption modules code: 5 > 4"),
         "{e}"
     );
     assert!(
@@ -1932,7 +1932,7 @@ fn the_encryption_side_naming_the_engine_fails() {
     });
     let e = check(&src, &listed).expect_err("use super::{Options, Shared}");
     assert!(
-        e.contains("src/db/vault.rs path out of the encryption modules code: 4 > 2"),
+        e.contains("src/db/vault.rs path out of the encryption modules code: 6 > 4"),
         "{e}"
     );
     // A method given to a seam type by the pager, named by a form.

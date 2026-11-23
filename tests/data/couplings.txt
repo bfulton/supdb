@@ -288,6 +288,10 @@ src/db/vault.rs	create	passes(	code	1	S6	the log, the spare and the manifest pas
 src/db/vault.rs	create_rw	passes(	code	1	S6	the log, the spare and the manifest pass to the directory by name
 src/db/vault.rs	default_cache	form module path	code	1	G3	zfile::read_budget: the budget moves behind Memory (R12)
 src/db/vault.rs	default_cache	path out of the encryption modules	code	1	G3	super::zfile::read_budget: the budget moves behind Memory (R12); new token (round 2)
+src/db/vault.rs	PlatformRoom::read	form module path	code	1	G3	zfile::unreclaimable_slack: what the cache's budget follows is the platform's reading, which the form side reads; the budget moves behind Memory (R12)
+src/db/vault.rs	PlatformRoom::read	path out of the encryption modules	code	1	G3	super::zfile::unreclaimable_slack: as the line above
+src/db/vault.rs	PlatformRoom::claimed	form module path	code	1	G3	zfile::buffers_mapped: the large buffers the store has mapped, which a following cache gives way to at once; behind Memory with the budget (R12)
+src/db/vault.rs	PlatformRoom::claimed	path out of the encryption modules	code	1	G3	super::zfile::buffers_mapped: as the line above
 src/db/vault.rs	disk_parse	kind of form file	code	5	S6	envelope naming by kind, the persist and companion cascade, the sweep rule
 src/db/vault.rs	exists	passes(	code	1	S6	the log, the spare and the manifest pass to the directory by name
 src/db/vault.rs	hard_link	passes(	code	3	S6	the log, the spare and the manifest pass to the directory by name

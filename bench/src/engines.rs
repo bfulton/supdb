@@ -456,6 +456,8 @@ pub struct Supdb {
     cipher_log: bool,
     /// `Policy::cipher_apart`.
     cipher_apart: bool,
+    /// `Policy::cipher_half`.
+    cipher_half: bool,
     /// False for the ingest-first arm: a flush stops partitioning what it
     /// sealed and leaves that to the background -- promotion at once, a
     /// merge for the rest (`Options::flush_schedules`). Both arms exist so
@@ -1872,6 +1874,12 @@ struct Policy {
     /// together: `supdb-cipherzstrideapart`, beside `supdb-cipherzstride`,
     /// whose every page is two chunks.
     cipher_apart: bool,
+    /// The store under a cipher with its cache of plaintext half of what
+    /// the process may use as the store opens, read once
+    /// (`StoreCipher::cache_half_at_open`), where the store as shipped
+    /// follows the room as the process runs: `supdb-cipherzstridehalf`,
+    /// beside `supdb-cipherzstride`.
+    cipher_half: bool,
     partition: bool,
     drain: bool,
     advice: Option<supdb::ReadAdvice>,
@@ -3024,6 +3032,7 @@ impl Default for Policy {
             cipher_cache: 0,
             cipher_log: false,
             cipher_apart: false,
+            cipher_half: false,
             partition: true,
             drain: true,
             advice: None,
@@ -3480,11 +3489,14 @@ fn encryption_of(
     cipher: bool,
     cipher_cache: u64,
     cipher_apart: bool,
+    cipher_half: bool,
 ) -> supdb::Encryption {
     match (dir_key, cipher) {
         (true, _) => supdb::Encryption::Kernel(supdb::DirKey::new([0x5a; 32])),
         (false, true) => {
-            let c = supdb::StoreCipher::new(Gcm::new(), Gcm::of).chunks_apart(cipher_apart);
+            let c = supdb::StoreCipher::new(Gcm::new(), Gcm::of)
+                .chunks_apart(cipher_apart)
+                .cache_half_at_open(cipher_half);
             supdb::Encryption::Cipher(match cipher_cache {
                 0 => c,
                 bytes => c.cache_bytes(bytes),
@@ -3639,6 +3651,39 @@ impl Supdb {
                 cipher_apart: true,
                 zpages: true,
                 zstride: Some(supdb::ZStride::Forced),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherzstride` with its cache half of what the process may
+    /// use at the open (`StoreCipher::cache_half_at_open`):
+    /// `supdb-cipherzstridehalf`, the cache as it was before it followed
+    /// the room, read by the cache's budget and its readings of the room
+    /// (`cipher_budget_at_end`, `cipher_room_readings`) before its rates.
+    pub fn create_cipher_zstride_half(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_half: true,
+                zpages: true,
+                zstride: Some(supdb::ZStride::Forced),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipher` with its cache half of what the process may use at
+    /// the open (`StoreCipher::cache_half_at_open`): `supdb-cipherhalf`,
+    /// the store under a cipher as it was before its cache followed the
+    /// room.
+    pub fn create_cipher_half(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_half: true,
                 ..Policy::default()
             },
         )
@@ -9598,6 +9643,7 @@ impl Supdb {
             cipher_cache,
             cipher_log,
             cipher_apart,
+            cipher_half,
             partition,
             drain,
             advice,
@@ -10574,7 +10620,7 @@ impl Supdb {
                 opts.direct_ingest = false;
             }
         }
-        opts.encryption = encryption_of(dir_key, cipher, cipher_cache, cipher_apart);
+        opts.encryption = encryption_of(dir_key, cipher, cipher_cache, cipher_apart, cipher_half);
         let db = if REOPEN.with(|r| r.get()) {
             supdb::Db::open(path, opts)
         } else {
@@ -10590,6 +10636,7 @@ impl Supdb {
             cipher_cache,
             cipher_log,
             cipher_apart,
+            cipher_half,
             partition,
             drain,
             advice,
@@ -10995,6 +11042,8 @@ impl Engine for Supdb {
             let zstride = self.zstride == Some(supdb::ZStride::Forced);
             return match self.durable {
                 true if self.zpages && zstride && self.cipher_apart => "supdb-cipherzstrideapart",
+                true if self.zpages && zstride && self.cipher_half => "supdb-cipherzstridehalf",
+                true if self.cipher_half => "supdb-cipherhalf",
                 true if self.zpages && zstride => "supdb-cipherzstride",
                 true if self.zpages => "supdb-cipherzpages",
                 true if self.cipher_log => "supdb-cipherlog",
@@ -12640,6 +12689,10 @@ impl Engine for Supdb {
             ("cipher_evictor_waited_us", pc.waited_us as f64),
             ("cipher_evictor_longest_wait_us", pc.longest_wait_us as f64),
             ("cipher_asked_together", pc.together as f64),
+            ("cipher_budget_at_end", pc.budget as f64),
+            ("cipher_room_readings", pc.rooms as f64),
+            ("cipher_gave_way", pc.gave_way as f64),
+            ("cipher_spared_at_end", pc.spared as f64),
             ("cipher_evictor_passes", pc.passes as f64),
             ("lazy_scans_done", db.lazy_scans().0 as f64),
             ("lazy_scans_resumed", db.lazy_scans().1 as f64),
@@ -14168,6 +14221,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cipherzpages"
         | "supdb-cipherzstride"
         | "supdb-cipherzstrideapart"
+        | "supdb-cipherzstridehalf"
+        | "supdb-cipherhalf"
         | "supdb-nocacheordread"
         | "supdb-nocachezpages"
         | "supdb-nocachezpagesnodrop"
@@ -14762,6 +14817,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cipherzpages" => supdb_arm(Supdb::create_cipher_zpages, dir)?,
         "supdb-cipherzstride" => supdb_arm(Supdb::create_cipher_zstride, dir)?,
         "supdb-cipherzstrideapart" => supdb_arm(Supdb::create_cipher_zstride_apart, dir)?,
+        "supdb-cipherzstridehalf" => supdb_arm(Supdb::create_cipher_zstride_half, dir)?,
+        "supdb-cipherhalf" => supdb_arm(Supdb::create_cipher_half, dir)?,
         "supdb-ingestcipher" => supdb_arm(Supdb::create_ingest_cipher, dir)?,
         "supdb-ingestcipherauto" => supdb_arm(Supdb::create_ingest_cipherauto, dir)?,
         "supdb-nocacheordread" => supdb_arm(Supdb::create_nocache_ordread, dir)?,
@@ -16708,6 +16765,27 @@ mod tests {
             guarantee("supdb-cipher")
         );
         drop(apart);
+        // The two with the cache as it was: each its sibling in every
+        // option, the cache's size being the cipher's.
+        for (name, f, sib) in [
+            (
+                "supdb-cipherhalf",
+                Supdb::create_cipher_half as fn(&Path) -> Res<Supdb>,
+                &c,
+            ),
+            (
+                "supdb-cipherzstridehalf",
+                Supdb::create_cipher_zstride_half,
+                &zs,
+            ),
+        ] {
+            let half = arm(name, f);
+            assert!(under(&half), "{name}: under a cipher");
+            let h = o(&half);
+            assert_eq!(h.zpages, sib.zpages, "{name}");
+            assert_eq!(h.zpages_stride, sib.zpages_stride, "{name}");
+            assert_eq!(guarantee(name), guarantee("supdb-cipher"), "{name}");
+        }
         for (name, a) in [
             ("supdb-cipher", &cipher),
             ("supdb-cipherlog", &log),
@@ -16768,23 +16846,23 @@ mod tests {
     fn the_dirkey_arm_asks_the_kernel_and_the_cipher_arms_a_cipher() {
         use supdb::Encryption;
         assert!(matches!(
-            encryption_of(true, false, 0, false),
+            encryption_of(true, false, 0, false, false),
             Encryption::Kernel(_)
         ));
         assert!(matches!(
-            encryption_of(true, true, 0, false),
+            encryption_of(true, true, 0, false, false),
             Encryption::Kernel(_)
         ));
         assert!(matches!(
-            encryption_of(false, true, 0, false),
+            encryption_of(false, true, 0, false, false),
             Encryption::Cipher(_)
         ));
         assert!(matches!(
-            encryption_of(false, true, 64 << 20, false),
+            encryption_of(false, true, 64 << 20, false, false),
             Encryption::Cipher(_)
         ));
         assert!(matches!(
-            encryption_of(false, false, 0, false),
+            encryption_of(false, false, 0, false, false),
             Encryption::None
         ));
         // And the bound reaches the store: `supdb-cipher64`'s cache is its

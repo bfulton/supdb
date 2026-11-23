@@ -241,6 +241,9 @@ struct Counts {
     breaths: AtomicU64,
     adopted_bytes: AtomicU64,
     together: AtomicU64,
+    rooms: AtomicU64,
+    gave_way: AtomicU64,
+    spared: AtomicU64,
 }
 
 /// The longest a reader waits for a crowded cache (`Pager::breathe`).
@@ -283,16 +286,107 @@ pub struct PagerCounts {
     /// ciphertext was asked of the kernel in one piece before the first
     /// was decrypted (`StoreCipher::chunks_apart` off).
     pub together: u64,
+    /// Readings of the room by a cache whose budget follows it, and the
+    /// times the budget was lowered between two readings for memory the
+    /// process had claimed since (`StoreCipher::cache_bytes` unset).
+    pub rooms: u64,
+    pub gave_way: u64,
+    /// What the last reading of the room kept back from the budget for
+    /// the cache's own overshoot, bytes.
+    pub spared: u64,
 }
+
+/// What a cache whose budget follows the room asks of the platform
+/// (`Pager::following`).
+///
+/// Plaintext in a memory file is memory the kernel cannot take back: a
+/// group at its limit gives up its page cache to a process whose own
+/// memory grows, and has nothing of this to give, so the process is
+/// killed. A budget read once is therefore either small, half of the room
+/// at the open as it was, or a store killed in its first burst of writes;
+/// one that follows the room holds what there is and gives way as the
+/// process grows.
+pub(crate) trait Room: Send + Sync {
+    /// The bytes this cache's plaintext may hold now, `held` being what it
+    /// holds: the limit in effect less the process's own memory, less
+    /// what it has mapped and not yet touched, less a margin, and where
+    /// several stores of the process follow the room, this one's share.
+    /// `None` where the platform does not say, which leaves the budget as
+    /// it stands.
+    fn read(&self, held: u64) -> Option<u64>;
+    /// The least the cache is given, whatever the room: under it a store
+    /// reads at the rate of its misses however little there is.
+    fn floor(&self) -> u64;
+    /// A count that rises with memory the process is about to take: the
+    /// bytes of large buffers it has mapped. Read at every turn of the
+    /// evictor, which is a load, where `read` is files; a rise since the
+    /// last reading comes off the budget at once.
+    fn claimed(&self) -> u64;
+}
+
+/// How often a following cache reads the room while it is within a line
+/// of its budget, and how often while it is not: a reading is half a
+/// dozen small files, a cache far under its budget has nothing to give
+/// way with, and a store left open and idle should not be read fifty
+/// times a second for it.
+const ROOM_EVERY: Duration = Duration::from_millis(20);
+const ROOM_SELDOM: Duration = Duration::from_millis(200);
+
+/// How long a following cache's evictor waits with nothing to do while
+/// the cache is near its budget, where `claimed` is what it is waiting to
+/// see move: a seal's copy of its table is a hundred megabytes mapped and
+/// filled in tens of milliseconds.
+const ROOM_WATCH: Duration = Duration::from_millis(5);
+
+/// How far past its budget a following cache may hold before the store's
+/// own work waits, and before a caller's read does, at most: the lines of
+/// a cache whose budget is the room are drawn inside the margin the room
+/// leaves, where a fixed budget's are shares of the budget.
+const ROOM_HARD: u64 = 16 << 20;
+const ROOM_SWAMP: u64 = 32 << 20;
+
+struct Follow {
+    room: Box<dyn Room>,
+    at: Mutex<Followed>,
+}
+
+/// Where a following cache stands with its room.
+#[derive(Default)]
+struct Followed {
+    /// When the room was last read, and what was claimed then.
+    read: Option<std::time::Instant>,
+    claimed: u64,
+    /// The most the cache has held past its budget, over the span in
+    /// progress and the one before it (`ROOM_OVER_SPAN`): what comes off
+    /// the room before it is the budget.
+    over: (u64, u64),
+    over_since: Option<std::time::Instant>,
+    /// What the cache holds past its budget because the budget fell, not
+    /// yet given back: no overshoot of the cache's, so it is taken out of
+    /// what `over` remembers. Up by each fall of the budget, down by what
+    /// the evictor has given back since (`evicted`), nothing once the
+    /// cache is under its budget.
+    debt: u64,
+    evicted: u64,
+}
+
+/// How long an overshoot is remembered, once to twice this: a cache that
+/// was past its budget a moment ago, by a file being written that it could
+/// not give back or a reader it waited for, will be again. A tenth of a
+/// second under the unit tests, which wait for it to be forgotten.
+const ROOM_OVER_SPAN: Duration = Duration::from_millis(if cfg!(test) { 100 } else { 2000 });
 
 /// A store's cache of plaintext: its budget, what it holds, and the thread
 /// that gives back.
 pub(crate) struct Pager {
     /// Where the cache is `crowded`: its budget and the slack past it,
-    /// worked out once, since every read of the store asks.
-    hard: u64,
+    /// worked out where the budget is set, since every read of the store
+    /// asks.
+    hard: AtomicU64,
     /// Where it is `swamped`.
-    swamp: u64,
+    swamp: AtomicU64,
+    /// The room the budget follows, where it follows one.
+    follow: Option<Follow>,
     limit: AtomicU64,
     held: AtomicU64,
     /// Of `held`, what is in files with no envelope yet: a file just
@@ -326,10 +420,29 @@ impl Pager {
     /// A cache that may hold `limit` bytes of plaintext, with its evictor
     /// started.
     pub(crate) fn new(limit: u64) -> Arc<Pager> {
-        let unit = (unit_chunks() * CHUNK) as u64;
+        Pager::make(limit, None)
+    }
+
+    /// A cache whose budget is what `room` says, read again as the process
+    /// runs (`Room`), with its evictor started. A gibibyte until the
+    /// platform first says.
+    pub(crate) fn following(room: Box<dyn Room>) -> Arc<Pager> {
+        let p = Pager::make(
+            1 << 30,
+            Some(Follow {
+                room,
+                at: Mutex::new(Followed::default()),
+            }),
+        );
+        p.follow_room();
+        p
+    }
+
+    fn make(limit: u64, follow: Option<Follow>) -> Arc<Pager> {
         let p = Arc::new(Pager {
-            hard: limit.saturating_add((limit / 16).max(4 * unit)),
-            swamp: limit.saturating_add((limit / 2).max(6 * unit)),
+            hard: AtomicU64::new(0),
+            swamp: AtomicU64::new(0),
+            follow,
             told: AtomicBool::new(false),
             limit: AtomicU64::new(limit),
             held: AtomicU64::new(0),
@@ -349,6 +462,7 @@ impl Pager {
             thread: Mutex::new(None),
             counts: Counts::default(),
         });
+        p.set_budget(limit);
         let weak = Arc::downgrade(&p);
         let t = std::thread::Builder::new()
             .name("supdb-pager".into())
@@ -359,6 +473,105 @@ impl Pager {
             *lock(&p.thread) = Some(t);
         }
         p
+    }
+
+    /// The budget and the two lines past it. A fixed budget's lines are
+    /// shares of it, a sixteenth and a half, and four and six units at
+    /// least; a following cache's are those held inside the margin its
+    /// room leaves (`ROOM_HARD`, `ROOM_SWAMP`), since half of a budget
+    /// that is the room is past the limit the room was read from.
+    fn set_budget(&self, limit: u64) {
+        let unit = (unit_chunks() * CHUNK) as u64;
+        let (hard, swamp) = ((limit / 16).max(4 * unit), (limit / 2).max(6 * unit));
+        let (hard, swamp) = match self.follow {
+            Some(_) => (
+                hard.min(ROOM_HARD.max(4 * unit)),
+                swamp.min(ROOM_SWAMP.max(6 * unit)),
+            ),
+            None => (hard, swamp),
+        };
+        self.limit.store(limit, Ordering::Relaxed);
+        self.hard
+            .store(limit.saturating_add(hard), Ordering::Relaxed);
+        self.swamp
+            .store(limit.saturating_add(swamp), Ordering::Relaxed);
+    }
+
+    /// The budget brought to the room, for a cache that follows one: read
+    /// whole where the last reading is `ROOM_EVERY` old, and the room's
+    /// floor at least; and between two readings lowered at once by
+    /// whatever the process has claimed since the last (`Room::claimed`),
+    /// which a reading does not see until the memory is touched. What the
+    /// cache has lately held past its budget comes off the room first: a
+    /// budget is where the cache gives back and not a line it holds under,
+    /// a file being written is held whole and a reader is waited for, and
+    /// a budget that is all of the room leaves that overshoot nowhere to
+    /// be but past the limit. The evictor's, at every turn of it.
+    fn follow_room(&self) {
+        let Some(f) = &self.follow else {
+            return;
+        };
+        let mut at = lock(&f.at);
+        let now = std::time::Instant::now();
+        let evicted = self.counts.evicted_bytes.load(Ordering::Relaxed);
+        at.debt = at.debt.saturating_sub(evicted - at.evicted);
+        at.evicted = evicted;
+        if self.over() == 0 {
+            at.debt = 0;
+        }
+        let over = self.over().saturating_sub(at.debt);
+        if at
+            .over_since
+            .is_none_or(|t| now.duration_since(t) >= ROOM_OVER_SPAN)
+        {
+            at.over = (0, at.over.0);
+            at.over_since = Some(now);
+        }
+        at.over.0 = at.over.0.max(over);
+        let spare = at.over.0.max(at.over.1);
+        let claimed = f.room.claimed();
+        let floor = f.room.floor();
+        let every = if self.near_budget() {
+            ROOM_EVERY
+        } else {
+            ROOM_SELDOM
+        };
+        if at.read.is_none_or(|t| now.duration_since(t) >= every) {
+            if let Some(room) = f.room.read(self.held()) {
+                at.read = Some(now);
+                at.claimed = claimed;
+                Counts::bump(&self.counts.rooms);
+                self.counts.spared.store(spare, Ordering::Relaxed);
+                let (was, now) = (self.budget(), room.saturating_sub(spare).max(floor));
+                at.debt += was.saturating_sub(now);
+                self.set_budget(now);
+                return;
+            }
+            // The platform said nothing: the budget stands, less what has
+            // been claimed since it last spoke.
+        }
+        if claimed > at.claimed {
+            let more = claimed - at.claimed;
+            at.claimed = claimed;
+            Counts::bump(&self.counts.gave_way);
+            let (was, now) = (self.budget(), self.budget().saturating_sub(more).max(floor));
+            at.debt += was.saturating_sub(now);
+            self.set_budget(now);
+        }
+    }
+
+    /// Whether the cache is within a line of its budget (`ROOM_SWAMP`).
+    fn near_budget(&self) -> bool {
+        self.held().saturating_add(ROOM_SWAMP) >= self.budget()
+    }
+
+    /// How long the evictor waits with nothing to give back: a following
+    /// cache within a line of its budget watches what the process claims.
+    fn idle_wait(&self) -> Duration {
+        match self.follow {
+            Some(_) if self.near_budget() => ROOM_WATCH,
+            _ => Duration::from_millis(20),
+        }
     }
 
     /// Hold this thread's reads of the store's files (`Hold`).
@@ -433,6 +646,9 @@ impl Pager {
             longest_wait_us: r(&c.longest_wait_us),
             breaths: r(&c.breaths),
             together: r(&c.together),
+            rooms: r(&c.rooms),
+            gave_way: r(&c.gave_way),
+            spared: r(&c.spared),
         }
     }
 
@@ -521,7 +737,7 @@ impl Pager {
     /// (`Reader::build_rest`, `Db::same_blocks`).
     #[inline]
     pub(crate) fn crowded(&self) -> bool {
-        self.could_give() > self.hard
+        self.could_give() > self.hard.load(Ordering::Relaxed)
     }
 
     /// What the cache holds that it could give back: all of it but the
@@ -547,7 +763,7 @@ impl Pager {
     /// for an overshoot of megabytes.
     #[inline]
     pub(crate) fn swamped(&self) -> bool {
-        self.could_give() > self.swamp
+        self.could_give() > self.swamp.load(Ordering::Relaxed)
     }
 
     /// `breathe` for a caller's read: a wait for a cache that is `swamped`
@@ -605,6 +821,7 @@ impl Pager {
             // Cleared before the look: a fill counted before this is in
             // what the look reads, and one after it tells again (`nudge`).
             p.told.store(false, Ordering::Release);
+            p.follow_room();
             let idle = p.over() == 0 || !p.pass();
             if idle {
                 // Nothing to give back, or nothing that may be: wait to be
@@ -615,7 +832,7 @@ impl Pager {
                     owed
                 } else {
                     p.woken
-                        .wait_timeout(owed, Duration::from_millis(20))
+                        .wait_timeout(owed, p.idle_wait())
                         .unwrap_or_else(|e| e.into_inner())
                         .0
                 };
@@ -2107,6 +2324,195 @@ mod tests {
             &bytes[..100],
             "asked for again, the borrow reads as it did"
         );
+        drop(p);
+        pager.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A room a test moves: what it says, whether it says anything, and
+    /// what the process has claimed.
+    struct TestRoom {
+        room: Arc<AtomicU64>,
+        quiet: Arc<AtomicBool>,
+        claimed: Arc<AtomicU64>,
+    }
+
+    impl Room for TestRoom {
+        fn read(&self, _held: u64) -> Option<u64> {
+            (!self.quiet.load(Ordering::SeqCst)).then(|| self.room.load(Ordering::SeqCst))
+        }
+        fn floor(&self) -> u64 {
+            0
+        }
+        fn claimed(&self) -> u64 {
+            self.claimed.load(Ordering::SeqCst)
+        }
+    }
+
+    fn until(what: &str, done: impl Fn() -> bool) {
+        let t = std::time::Instant::now();
+        while !done() {
+            assert!(t.elapsed() < Duration::from_secs(10), "never: {what}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// A cache that follows its room holds what the room says as the room
+    /// moves, with nobody reading: it gives back when the room falls,
+    /// holds more when it rises, and between two readings gives way at
+    /// once to what the process claims, which a reading sees only once the
+    /// memory is touched. A fall of the room is no overshoot of the
+    /// cache's: once it has given back, its budget is the room. Its lines
+    /// stand inside the room's margin, where a fixed budget's are shares
+    /// of it.
+    #[test]
+    fn a_cache_that_follows_its_room_gives_way_as_the_room_does() {
+        let dir = scratch("room");
+        let bytes = plain(24 * 1024 * 1024, 7);
+        envelope(&dir.join("e"), &bytes, 3);
+        let unit = (unit_chunks() * CHUNK) as u64;
+        let room = Arc::new(AtomicU64::new(16 * unit));
+        let quiet = Arc::new(AtomicBool::new(false));
+        let claimed = Arc::new(AtomicU64::new(0));
+        let pager = Pager::following(Box::new(TestRoom {
+            room: room.clone(),
+            quiet: quiet.clone(),
+            claimed: claimed.clone(),
+        }));
+        assert_eq!(pager.budget(), 16 * unit, "the room as the cache is made");
+        let p = sparse(&pager, &dir.join("e"), 3);
+        let read_through = || {
+            let step = 64 * 1024;
+            let mut off = 0usize;
+            while off < bytes.len() {
+                let _h = pager.hold();
+                let len = step.min(bytes.len() - off);
+                assert_eq!(
+                    read(&p, off as u64, len).unwrap(),
+                    &bytes[off..off + len],
+                    "at {off}"
+                );
+                off += len;
+            }
+        };
+        // Settled: under its budget, and whatever it overshot while it was
+        // read through forgotten, so the budget is the room.
+        let settled = |at: u64| {
+            until("the budget at its room", || pager.budget() == at);
+            until("the cache under its room", || pager.held() <= at);
+        };
+        read_through();
+        settled(16 * unit);
+        assert!(
+            pager.held() > 8 * unit,
+            "premise: more held than the room is about to be: {}",
+            pager.held()
+        );
+        // The room falls: the cache gives back to it, nobody having read,
+        // and what it held past the new budget meanwhile was no overshoot.
+        let before = pager.counts();
+        room.store(8 * unit, Ordering::SeqCst);
+        settled(8 * unit);
+        let after = pager.counts();
+        assert!(after.evicted_units > before.evicted_units);
+        assert_eq!(after.spared, 0, "a fall of the room kept back: {after:?}");
+        // What the process claims comes off at once and stays off until
+        // the platform is read again.
+        quiet.store(true, Ordering::SeqCst);
+        std::thread::sleep(2 * ROOM_SELDOM);
+        claimed.fetch_add(3 * unit, Ordering::SeqCst);
+        until("the budget less what was claimed", || {
+            pager.budget() == 5 * unit
+        });
+        until("the cache under it", || pager.held() <= 5 * unit);
+        assert!(pager.counts().gave_way >= 1, "{:?}", pager.counts());
+        std::thread::sleep(2 * ROOM_SELDOM);
+        assert_eq!(
+            pager.budget(),
+            5 * unit,
+            "nothing said by the platform, nothing given back to the cache"
+        );
+        // A claim that falls is nothing given back either: what was
+        // unmapped is the platform's to say.
+        claimed.fetch_sub(3 * unit, Ordering::SeqCst);
+        std::thread::sleep(2 * ROOM_SELDOM);
+        assert_eq!(pager.budget(), 5 * unit);
+        // The room rises and the platform says so: the cache holds more.
+        room.store(20 * unit, Ordering::SeqCst);
+        quiet.store(false, Ordering::SeqCst);
+        until("the budget up with the room", || pager.budget() > 12 * unit);
+        read_through();
+        settled(20 * unit);
+        assert!(pager.held() > 12 * unit, "held {}", pager.held());
+        assert!(pager.counts().rooms >= 3, "{:?}", pager.counts());
+        // The lines: inside the margin for a cache whose budget is the
+        // room, shares of the budget for one whose budget is fixed.
+        room.store(1 << 34, Ordering::SeqCst);
+        until("the lines of a room of sixteen gibibytes", || {
+            let b = pager.budget();
+            b == 1 << 34
+                && pager.hard.load(Ordering::Relaxed) == b + ROOM_HARD.max(4 * unit)
+                && pager.swamp.load(Ordering::Relaxed) == b + ROOM_SWAMP.max(6 * unit)
+        });
+        let fixed = Pager::new(1 << 34);
+        assert_eq!(fixed.hard.load(Ordering::Relaxed), (1u64 << 34) + (1 << 30));
+        assert_eq!(
+            fixed.swamp.load(Ordering::Relaxed),
+            (1u64 << 34) + (1 << 33)
+        );
+        fixed.stop();
+        drop(p);
+        pager.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a following cache holds past its budget and cannot give back
+    /// comes off the room before the room is its budget: a file with no
+    /// envelope yet is held whole, and a budget that is all of the room
+    /// would leave it past the limit the room was read from. Kept back by
+    /// what it is and no more -- the budget's own fall is not counted
+    /// again as overshoot, which would walk the budget to nothing -- and
+    /// forgotten a span after the file has its envelope.
+    #[test]
+    fn a_following_cache_keeps_back_what_it_overshot() {
+        let dir = scratch("spare");
+        let unit = (unit_chunks() * CHUNK) as u64;
+        let bytes = plain(12 * unit as usize, 4);
+        let room = Arc::new(AtomicU64::new(8 * unit));
+        let pager = Pager::following(Box::new(TestRoom {
+            room: room.clone(),
+            quiet: Arc::new(AtomicBool::new(false)),
+            claimed: Arc::new(AtomicU64::new(0)),
+        }));
+        assert_eq!(pager.budget(), 8 * unit);
+        let mut mem = memfile().unwrap();
+        mem.write_all(&bytes).unwrap();
+        let p = Paged::adopt(&pager, &mem, bytes.len() as u64, "unbacked").unwrap();
+        drop(mem);
+        assert_eq!(pager.held(), 12 * unit);
+        // Four units past the room, none of it the cache's to give back.
+        until("the overshoot kept back", || pager.budget() == 4 * unit);
+        for _ in 0..10 {
+            std::thread::sleep(ROOM_SELDOM / 2);
+            assert_eq!(
+                pager.budget(),
+                4 * unit,
+                "the room less what was overshot, and no less: {:?}",
+                pager.counts()
+            );
+        }
+        let c = pager.counts();
+        assert_eq!((c.spared, c.evicted_units), (4 * unit, 0), "{c:?}");
+        // With its envelope the file is given back, and the overshoot is
+        // forgotten: the budget is the room again.
+        envelope(&dir.join("e"), &bytes, 23);
+        p.back(Back::open(&dir.join("e"), Box::new(Toy(23))).unwrap())
+            .unwrap();
+        until("the cache under its budget", || {
+            pager.held() <= pager.budget()
+        });
+        until("the budget at its room", || pager.budget() == 8 * unit);
+        assert_eq!(pager.counts().spared, 0);
         drop(p);
         pager.stop();
         let _ = std::fs::remove_dir_all(&dir);

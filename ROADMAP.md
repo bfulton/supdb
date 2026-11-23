@@ -582,29 +582,44 @@ What an engine picker would hit, roughly in order.
   that hands each range, as `flatindex`'s are over `Sect`, would hold it
   by type at a count of the plain store's eight readers.
 - [ ] **The plaintext a store under a cipher holds follows the room.**
-  The store's cache of plaintext is half of what the process may use,
-  read once at the open, and the other half is left to the kernel's
-  cache of the ciphertext a miss is read from. The two hold the same
-  chunks, a chunk just decrypted being the newest page of both, so their
-  sum is little more than one of them, and the bounded cells are decided
-  by how much plaintext is held ("Reads and scans out of core", below:
-  3.2x of encrypted RocksDB with 500 MiB of 640 given to it, 0.76x at
-  the half). Half is what it is because plaintext in a memory file is
-  memory the kernel cannot take back: a process whose own memory grows
-  beside a cache near the limit is killed, where a plain store's page
-  cache gives way. So the budget is recomputed as the process runs: the
-  group's limit less its anonymous memory, less what the store's own
-  large buffers are about to take (`src/db/blocks.rs` is the one place
-  they are mapped, and can say so before it maps), less the files being
-  written that cannot be given back, less a reserve for the kernel's own
-  use of the group, with the two lines a reader waits at drawn against
-  the same room and not as multiples of a budget. Done when a store
-  under a cipher holds what the room allows through the row's passes
-  under each bound, a load and a lag sweep among them, with no process
-  killed in ten sittings of each, two stores in one process and a caller
-  whose own memory grows beside it; and the controller's model reads the
-  same room (`zpages_under_cipher`, "An envelope whose chunks are whole
-  pages").
+  Built: where the cipher names no size the cache's budget is what the
+  store holds and how much more the process may hold in memory the
+  kernel cannot take back, read from the platform every twenty
+  milliseconds, with what the store's large buffers have mapped coming
+  off at once and what the cache lately overshot kept back
+  (`pager::Room`, `zfile::unreclaimable_slack`; `CLAUDE.md` has the
+  kills that shaped it). Held by the cache's unit tests under a room a
+  test moves, a store whose room falls and rises under it
+  (`tests/cipher.rs`), and six mutants. Under 640 MiB at five million
+  keys it survives the row's passes in five reps of five and holds
+  about 530 MiB where the half held 290. What is left: two stores in one
+  process share the platform's room in equal parts, which no test holds;
+  the bounds and rungs of the bounded roster beyond that one, a load and
+  a lag sweep among them, ten sittings each; a caller whose own memory
+  grows beside the store; and the controller's model reading the same
+  room (`zpages_under_cipher`).
+- [ ] **A store under a cipher is killed by its own writes under a
+  bound.** At five million keys under 640 MiB the lag sweep's full
+  rewrite kills it, as it did before its cache followed the room (three
+  reps of three then, at the rewrite's start; four of four now, at the
+  pass's end): `bench ab --arms supdb-cipher,supdb --size 5000000 --bound
+  671088640 --passes lag --reps 1 --ops-div 10`, the plain store beside it
+  alive. At the kill the process holds 359 MiB of its own memory, where
+  the plain store peaks at 186, and 270 MiB of plaintext in files being
+  written, which the cache counts and cannot give back; nothing of the
+  page cache is left. Two things pile up, both behind landings that take
+  longer under a cipher, an envelope sealed and written where a plain
+  segment is synced: the tables the writer froze, held to a count and not
+  to bytes (`FROZEN_CAP`, a standing limitation in `CLAUDE.md`), and the
+  outputs of seals and merges, each held whole until its envelope, the
+  envelopes written one at a time (`Vault::persisting`). The levers, none
+  built: the writer's wait drawn from the room, by bytes, tables and
+  files in flight together; an envelope sealed as its file is written, so
+  that a file's pages can be given back as they go home (the page
+  layer's write-through, and the load's double write with it). Done when
+  the lag sweep and the write mixes run under each bound of the bounded
+  roster with no process killed in ten sittings, the plain store's cells
+  beside them unmoved.
 - [ ] **The heads' copy under a cipher.** The copy of a partition's
   ordered-index heads in the process's own memory (`Options::heads_owned`)
   is made from the index's mapping as it lies, which a store under a
@@ -784,8 +799,10 @@ until the run is its own log). What it loses:
 
 First the "Engine" items the bounded cells above are lost by, by what
 the pairings against the encrypted comparators put first: "The plaintext
-a store under a cipher holds follows the room", the scans behind it, the
-controller on, and "The heads' copy under a cipher". The pass below
+a store under a cipher holds follows the room", built and to be held at
+the roster's other bounds, "A store under a cipher is killed by its own
+writes under a bound", the scans, the controller on, and "The heads'
+copy under a cipher". The pass below
 cannot be green while a mechanism does nothing under a cipher. Then that
 pass, then the layer, whose stages are read again against those
 pairings before one is built: it was designed for the ordered load's

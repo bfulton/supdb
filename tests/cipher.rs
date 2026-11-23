@@ -1984,6 +1984,99 @@ fn a_stride_build_holds_its_cache_and_not_its_partition() {
     form_build_rests("striderests", true);
 }
 
+/// A store whose cipher names no size for its cache follows its room as
+/// the room moves under it: it holds what the room allows, gives back with
+/// nobody reading when the room falls and reads right through what is
+/// left, and holds more when the room rises. A cache whose size is named
+/// reads no room at all.
+#[test]
+fn a_store_whose_cache_follows_its_room_holds_what_the_room_allows() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    let _quiet = one_at_a_time();
+    let n = 150_000;
+    let room = Arc::new(AtomicU64::new(4 << 20));
+    let opts = |room: &Arc<AtomicU64>| {
+        let room = room.clone();
+        Options {
+            encryption: Encryption::Cipher(
+                cipher(52).cache_room(move |_| Some(room.load(Ordering::SeqCst))),
+            ),
+            ..small()
+        }
+    };
+    let dir = scratch("follows");
+    let slack: u64 = 8 << 20;
+    let until = |db: &Db, what: &str, done: &dyn Fn(&supdb::PagerCounts) -> bool| {
+        let t = std::time::Instant::now();
+        loop {
+            let c = db.cipher_counts().unwrap().cache;
+            if done(&c) {
+                return c;
+            }
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(20),
+                "never: {what}: {c:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    let mut db = Db::create(&dir, opts(&room)).unwrap();
+    fill(&mut db, n);
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let size = stored_bytes(&dir);
+    assert!(
+        size > 4 * (4 << 20),
+        "the store is {size} bytes, not several times its room"
+    );
+    holds(&db, n);
+    let c = until(&db, "under the first room", &|c| c.held <= c.budget);
+    assert!(c.rooms > 0, "the room was never read: {c:?}");
+    assert!(c.budget <= 4 << 20, "a budget past the room: {c:?}");
+    assert!(
+        c.peak < (4 << 20) + slack,
+        "held {} of a room of four mebibytes: {c:?}",
+        c.peak
+    );
+    // The room falls to a half: given back with nobody reading, and the
+    // store reads as itself through what is left.
+    room.store(2 << 20, Ordering::SeqCst);
+    let c = until(&db, "under the lower room", &|c| {
+        c.budget <= 2 << 20 && c.held <= c.budget
+    });
+    assert!(c.held <= 2 << 20, "{c:?}");
+    holds(&db, n);
+    // And rises: the store holds more than the lower room let it.
+    room.store(10 << 20, Ordering::SeqCst);
+    until(&db, "the budget up with the room", &|c| c.budget > 5 << 20);
+    holds(&db, n);
+    let c = until(&db, "under the higher room", &|c| c.held <= c.budget);
+    assert!(
+        c.held > 3 << 20,
+        "no more held under a room of ten mebibytes: {c:?}"
+    );
+    db.close().unwrap();
+    // A size the cipher names is the budget, whatever a room says.
+    let named = {
+        let room = room.clone();
+        Options {
+            encryption: Encryption::Cipher(
+                cipher(52)
+                    .cache_bytes(3 << 20)
+                    .cache_room(move |_| Some(room.load(Ordering::SeqCst))),
+            ),
+            ..small()
+        }
+    };
+    let db = Db::open(&dir, named).unwrap();
+    holds(&db, n);
+    let c = db.cipher_counts().unwrap().cache;
+    assert_eq!((c.budget, c.rooms), (3 << 20, 0), "{c:?}");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A walk through a form file under a cipher asks for the pages it will
 /// cross as it begins, the scans' prefetch off as shipped
 /// (`Options::zpages_scan_prefetch`): each is bytes of an envelope mapped

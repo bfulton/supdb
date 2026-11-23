@@ -410,8 +410,12 @@ every build asking for the stride form; `supdb-cipherzstrideapart` is the
 second with each chunk's ciphertext read from the device by itself
 (`StoreCipher::chunks_apart`), where the store asks for the chunks of one
 ask together. That
-cache is half of what the process may use unless an arm says otherwise,
-which at the suite's in-core rungs is a store that fits it;
+cache follows the room the process has, read as the store runs, unless an
+arm says otherwise, which at the suite's in-core rungs is a store that
+fits it; `supdb-cipherhalf` and `supdb-cipherzstridehalf` are
+`supdb-cipher` and `supdb-cipherzstride` with the cache as it was before,
+half of what the process may use as the store opens
+(`StoreCipher::cache_half_at_open`);
 `supdb-cipher64` is the same store with a cache of sixty-four mebibytes,
 which from a million keys up is a store several times its cache, read by
 the chunk it decrypts and gives back. The suite does not reopen a store,
