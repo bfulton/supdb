@@ -315,6 +315,45 @@ banked on its controls -- floors and comparators in band -- so the next
 window carries the new definition; the engine's part of the step was
 read by alternating two binaries in one sitting, never from the row.
 
+**The harness's copy carried a vector's bookkeeping, and one arm's did
+not.** `consume` copied each value into a thread-local `Vec` behind a
+`RefCell`: a borrow flag set and cleared, the vector's length and
+capacity checked, and a call into libc's copy with a run-time length, on
+every value of every arm that lends one. FASTER's arm, whose read copies
+the value out itself, copies a constant hundred bytes into a fixed array
+and paid none of it. Counted by callgrind over the clean point reads of
+`examples/point_ops.rs` (`valgrind --tool=callgrind --collect-atstart=no
+--toggle-collect='point_ops::phase_reads_clean'
+target/release/examples/point_ops ARM 100000 1 zipf 1`, at `69b3b63` and
+at the commit of this entry), the bookkeeping was 42 instructions of
+`supdb-ingest`'s 539 a read and 38 of `lmdb-nosync`'s 1,895, beside
+FASTER's 415: a thirteenth of supdb's read, and a third of what
+separated it from FASTER's, in a cell read as the engine's. The copy goes
+into a fixed thread-local array now, at a constant size where the value is
+the suite's (`run::VALUE_SIZE`) and at its own length otherwise, the
+vector kept for a value longer than the array. RocksDB's count is no
+measure of it: between the two binaries its read moved by ninety
+instructions the other way in its memtable's own search, so the step is
+read there in the harness's symbols, libc's copy gone at 55 a read and 14
+in its place. Two readings on the way were short of it. A scratch
+version built to check an estimate off the listing counted 25, with every
+length's path inline, where the one that landed, the other lengths behind
+a call, counts 42. And reading the value where it lies, a fold of its
+words with no copy at all, counted 32 *more* than the vector's copy at a
+run-time length, a loop a word at a time against libc's vector moves; in
+FASTER's arm, over a buffer of a constant hundred bytes, the same fold
+counted 13. Every arm's read and scan
+series step with it, comparators included, by a few percent of a point
+read, and the first row after it banks on its controls as a definition
+step. The entry on allocation above says an overhead every arm pays is
+invisible in every ratio. It is not quite: an equal cost is a larger share
+of the faster arm's cell, so it draws every ratio toward one, and an arm
+that does not pay it is flattered by the whole of it. The rule: what the harness adds to an operation is counted
+in instructions beside the operation, per arm, and held to the arm that
+pays least; and a test holds the copy to having been made
+(`a_consumed_value_is_copied_into_the_threads_buffer`), since a `consume`
+that copied nothing would post a rate like any other.
+
 **A host that moved on an axis no floor read.** A quick row read the
 buffered arm's load at three hundred thousand keys at 0.41x of LMDB,
 five slow reps of five, where the two rows before read 1.1-1.2x and

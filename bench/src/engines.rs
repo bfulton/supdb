@@ -11114,10 +11114,19 @@ impl Supdb {
     }
 }
 
+/// The longest value `consume` copies into its fixed buffer; a longer one
+/// goes through the thread's vector.
+const SINK_FIXED: usize = 256;
+const _: () = assert!(crate::run::VALUE_SIZE <= SINK_FIXED);
+
 thread_local! {
-    /// Where a read puts the value it consumes: one per thread, reused
-    /// across calls, so a threaded pass copies into buffers no other
-    /// thread writes and no call allocates once the first has grown it.
+    /// Where a read puts the value it consumes: one per thread, so a
+    /// threaded pass copies into buffers no other thread writes, and a
+    /// fixed array, with nothing to grow, to borrow or to drop.
+    static SINK_BUF: std::cell::UnsafeCell<[u8; SINK_FIXED]> =
+        const { std::cell::UnsafeCell::new([0u8; SINK_FIXED]) };
+    /// The same for a value longer than `SINK_FIXED`: reused across calls,
+    /// so no call allocates once the first has grown it.
     static SINK: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -11135,15 +11144,73 @@ thread_local! {
 /// point read that consumed the value at a hundred bytes read 1.6x of
 /// LMDB where the row's read said 2x. The copy is the same bytes on every
 /// arm, so what it adds to one arm and not another is where they lay.
+///
+/// A value of the suite's size (`run::VALUE_SIZE`) is copied at that
+/// size, a constant the compiler lays out as a few moves, into a fixed
+/// array: the copy and nothing around it. It went into a `Vec` behind a
+/// `RefCell` before, a borrow flag, the vector's length and capacity and
+/// a call into libc's copy with a run-time length on every value, 25
+/// instructions of a point read's 539, which FASTER's arm, copying a
+/// constant hundred bytes into an array of its own, never paid
+/// (`bench/CLAUDE.md`).
 #[inline]
 fn consume(v: &[u8]) -> usize {
-    SINK.with(|s| {
-        let mut s = s.borrow_mut();
-        s.clear();
-        s.extend_from_slice(v);
-        std::hint::black_box(s.as_slice());
-    });
+    const N: usize = crate::run::VALUE_SIZE;
+    if v.len() == N {
+        SINK_BUF.with(|s| {
+            let p = s.get().cast::<u8>();
+            // SAFETY: the buffer is this thread's, `N` bytes of it are in
+            // bounds by the assertion beside `SINK_FIXED`, and no borrow
+            // of it outlives a call of this module; `v` is a slice an
+            // engine lent, never this buffer, so the two cannot overlap.
+            unsafe {
+                std::ptr::copy_nonoverlapping(v.as_ptr(), p, N);
+                std::hint::black_box(std::slice::from_raw_parts(p, N));
+            }
+        });
+    } else {
+        consume_any(v);
+    }
     v.len()
+}
+
+/// `consume` for a value that is not the suite's size: at its own length
+/// into the fixed buffer where it fits, and into the thread's vector past
+/// that. Apart from the suite's case, so that one stays a branch and a few
+/// moves where it is inlined.
+#[inline(never)]
+fn consume_any(v: &[u8]) {
+    if v.len() <= SINK_FIXED {
+        SINK_BUF.with(|s| {
+            let p = s.get().cast::<u8>();
+            // SAFETY: as in `consume`, with `v.len()` bytes in bounds by
+            // the test above.
+            unsafe {
+                std::ptr::copy_nonoverlapping(v.as_ptr(), p, v.len());
+                std::hint::black_box(std::slice::from_raw_parts(p, v.len()));
+            }
+        });
+    } else {
+        SINK.with(|s| {
+            let mut s = s.borrow_mut();
+            s.clear();
+            s.extend_from_slice(v);
+            std::hint::black_box(s.as_slice());
+        });
+    }
+}
+
+/// A test's: whether this thread's buffer holds `v`, as the `consume` of
+/// it leaves it.
+#[cfg(test)]
+fn sink_holds(v: &[u8]) -> bool {
+    if v.len() <= SINK_FIXED {
+        // SAFETY: read on the thread that owns the buffer, with no call
+        // of `consume` in flight.
+        SINK_BUF.with(|s| unsafe { (&(*s.get()))[..v.len()] == *v })
+    } else {
+        SINK.with(|s| s.borrow().as_slice() == v)
+    }
 }
 
 /// One read, whichever handle answers it: the writer's own in `Engine`,
@@ -16844,6 +16911,44 @@ pub fn every_arm() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A consumed value is in the thread's buffer afterwards, every byte of
+    /// it, at the suite's length, at the lengths either side of it and of
+    /// the fixed buffer's end, and past that through the vector; and a
+    /// second value of the same length replaces the first, so the check is
+    /// of this call's copy and not of what the last one left. A `consume`
+    /// that copied nothing would post a rate like any other, which is what
+    /// the reads did before there was one.
+    #[test]
+    fn a_consumed_value_is_copied_into_the_threads_buffer() {
+        let n = crate::run::VALUE_SIZE;
+        for len in [
+            0,
+            1,
+            n - 1,
+            n,
+            n + 1,
+            SINK_FIXED - 1,
+            SINK_FIXED,
+            SINK_FIXED + 1,
+            4096,
+        ] {
+            for salt in [3usize, 11] {
+                let v: Vec<u8> = (0..len).map(|i| (i * 7 + salt * 31 + len) as u8).collect();
+                assert_eq!(consume(&v), len);
+                assert!(
+                    sink_holds(&v),
+                    "a value of {len} bytes was not copied whole"
+                );
+            }
+        }
+        // A shorter value after a longer one: its own bytes, at its length.
+        let (long, short) = (vec![0xA5u8; n], vec![0x5Au8; n / 2]);
+        consume(&long);
+        consume(&short);
+        assert!(sink_holds(&short));
+        assert!(!sink_holds(&long[..n / 2]));
+    }
 
     /// The handles a threaded mix gives its threads write the store the
     /// arm opened, and read what they wrote: three threads at once, each
