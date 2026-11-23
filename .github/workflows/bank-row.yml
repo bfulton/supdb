@@ -17,7 +17,8 @@ name: bank-row
 
 on:
   push:
-    branches: [main]
+    branches: [main, claude/funny-faraday-1ipfti]
+    paths: ['.github/workflows/bank-row.yml']
   workflow_dispatch:
 
 permissions:
@@ -77,7 +78,7 @@ jobs:
 
   propose:
     needs: row
-    if: always()
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:

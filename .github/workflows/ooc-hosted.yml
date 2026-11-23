@@ -19,6 +19,9 @@ name: ooc-hosted
 # `all`; more reps are `reps`.
 
 on:
+  push:
+    branches: [claude/funny-faraday-1ipfti]
+    paths: ['.github/workflows/ooc-hosted.yml']
   workflow_dispatch:
     inputs:
       arms:
@@ -77,9 +80,9 @@ jobs:
       - name: The bounded run, inside a transient service delegated to it
         working-directory: bench
         env:
-          ARMS: ${{ inputs.arms }}
-          BOUND_MIB: ${{ inputs.bound_mib }}
-          REPS: ${{ inputs.reps }}
+          ARMS: ${{ inputs.arms || 'supdb' }}
+          BOUND_MIB: ${{ inputs.bound_mib || '1280' }}
+          REPS: ${{ inputs.reps || '1' }}
         run: |
           set -eu
           BOUND=$(( BOUND_MIB * 1048576 ))

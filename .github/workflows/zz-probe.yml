@@ -1,0 +1,57 @@
+name: zz-probe
+
+# Throwaway, on this branch only: what bench/scripts/libclang.sh meets on
+# each image, and whether RocksDB's build finds what it names.
+
+on:
+  push:
+    branches: [claude/funny-faraday-1ipfti]
+    paths: ['.github/workflows/zz-probe.yml', 'bench/scripts/libclang.sh']
+
+jobs:
+  libclang:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-26.04, ubuntu-latest, ubuntu-24.04, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Before the script
+        run: |
+          uname -a
+          cat /etc/os-release 2>/dev/null | head -4 || sw_vers
+          echo "--- llvm directories:"
+          ls -d /usr/lib/llvm-*/lib 2>/dev/null || echo none
+          echo "--- libclang files:"
+          ls -la /usr/lib/llvm-*/lib/libclang* /usr/lib/*/libclang* 2>/dev/null || echo none
+          echo "--- the package:"
+          if command -v apt-cache >/dev/null; then apt-cache policy libclang-dev; apt-cache depends libclang-dev; fi
+      - name: The script
+        id: script
+        continue-on-error: true
+        run: sh -x bench/scripts/libclang.sh
+      - name: After the script
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "LIBCLANG_PATH=${LIBCLANG_PATH:-unset}"
+          echo "--- llvm directories:"
+          ls -d /usr/lib/llvm-*/lib 2>/dev/null || echo none
+          echo "--- libclang files:"
+          ls -la /usr/lib/llvm-*/lib/libclang* /usr/lib/*/libclang* 2>/dev/null || echo none
+        env:
+          OUTCOME: ${{ steps.script.outcome }}
+      # RocksDB's build is what the directory is for: bindgen links libclang
+      # in librocksdb-sys's build script and loads it when the script runs.
+      - name: RocksDB's build, where the script named a directory
+        if: steps.script.outcome == 'success' && startsWith(matrix.runner, 'ubuntu-2') && !endsWith(matrix.runner, 'arm') && matrix.runner != 'ubuntu-24.04'
+        run: |
+          set -eu
+          sh scripts/toolchain.sh
+          cd bench
+          cargo build --release --locked -p librocksdb-sys
+      - name: The verdict
+        run: test "$OUTCOME" = success
+        env:
+          OUTCOME: ${{ steps.script.outcome }}
