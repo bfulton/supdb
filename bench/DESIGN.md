@@ -403,7 +403,10 @@ under a cipher against itself: `supdb-cipherlog` and
 `supdb-ingestcipherlog`, an ordered load through the log with no run,
 which is the shape before the run was kept there; and `supdb-cipherauto`
 and `supdb-ingestcipherauto`, the controller on
-(`Options::zpages_under_cipher`). That
+(`Options::zpages_under_cipher`). And two that force the compact form
+there, each coding priced by itself: `supdb-cipherzpages`, every
+partition's form file in the block coding, and `supdb-cipherzstride`,
+every build asking for the stride form. That
 cache is half of what the process may use unless an arm says otherwise,
 which at the suite's in-core rungs is a store that fits it;
 `supdb-cipher64` is the same store with a cache of sixty-four mebibytes,

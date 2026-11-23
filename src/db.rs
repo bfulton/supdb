@@ -737,9 +737,12 @@ pub struct ZCounts {
     /// reads a stride file answered; the value pages the reads checked
     /// against a stride file's row at their first touch in this process,
     /// none for a file the attach trusted as this process's build
-    /// (`Options::zpages_stride_trust_built`); and the values a form file
-    /// cursor's stride position handed over, its walks' records and the
-    /// values read at it -- the block cache's reads of a stride partition,
+    /// (`Options::zpages_stride_trust_built`), and under a cipher every
+    /// page a read asked the store's cache for, which is each page of each
+    /// read, checked or not (`ZFile::stride_page_asked`); and the values a
+    /// form file cursor's stride position handed over, its walks' records
+    /// and the values read at it -- the block cache's reads of a stride
+    /// partition,
     /// the merge path's walks over it beside the pieces, and the covered
     /// walk of a scan over the partitions alone (`scan_partitions` under
     /// `Options::zpages_walk_cursor`, its unsealed keys' emits among them),

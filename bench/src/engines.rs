@@ -3575,6 +3575,42 @@ impl Supdb {
         )
     }
 
+    /// `supdb-cipher` with the compact form forced in its block coding
+    /// (`ZPages::Always`, the stride form off): `supdb-cipherzpages`, every
+    /// partition's form file built at its landing and every read of a
+    /// covered partition through it, which is the form priced by itself
+    /// under a cipher where `supdb-cipherauto` prices the controller's
+    /// choice of it.
+    pub fn create_cipher_zpages(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                zpages: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherzpages` with every build asking for the stride form
+    /// (`ZStride::Forced`): `supdb-cipherzstride`, a partition's values
+    /// alone at their stride, read through the store's cache by the page
+    /// each read asks for. The pair against `supdb-cipher` prices the form
+    /// against the raw form under a cipher, and against `supdb-cipherzpages`
+    /// against the block coding there; read by the stride counts
+    /// (`zpage_stride_*`) and the cache's before its rates.
+    pub fn create_cipher_zstride(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                zpages: true,
+                zstride: Some(supdb::ZStride::Forced),
+                ..Policy::default()
+            },
+        )
+    }
+
     pub fn create_ingest_cipherauto(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
@@ -10921,7 +10957,10 @@ impl Engine for Supdb {
             };
         }
         if self.cipher {
+            let zstride = self.zstride == Some(supdb::ZStride::Forced);
             return match self.durable {
+                true if self.zpages && zstride => "supdb-cipherzstride",
+                true if self.zpages => "supdb-cipherzpages",
                 true if self.cipher_log => "supdb-cipherlog",
                 false if self.cipher_log => "supdb-ingestcipherlog",
                 true if self.cipher_auto => "supdb-cipherauto",
@@ -13070,6 +13109,17 @@ impl Engine for Supdb {
             .flatten()
         {
             let name = e.file_name().to_string_lossy().into_owned();
+            // Under a cipher a form file is an envelope under its
+            // segment's token (`x-<token>.z`), written first under that
+            // name and `.tmp`, which is the stray one.
+            if self.cipher {
+                if name.starts_with("x-") && name.ends_with(".z") {
+                    files += 1;
+                } else if name.starts_with("x-") && name.ends_with(".z.tmp") {
+                    stray += 1;
+                }
+                continue;
+            }
             if name.starts_with("zpg-") {
                 if name.ends_with(".zpg") {
                     files += 1;
@@ -14078,6 +14128,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cipher64"
         | "supdb-cipherlog"
         | "supdb-cipherauto"
+        | "supdb-cipherzpages"
+        | "supdb-cipherzstride"
         | "supdb-nocacheordread"
         | "supdb-nocachezpages"
         | "supdb-nocachezpagesnodrop"
@@ -14669,6 +14721,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cipherlog" => supdb_arm(Supdb::create_cipherlog, dir)?,
         "supdb-ingestcipherlog" => supdb_arm(Supdb::create_ingest_cipherlog, dir)?,
         "supdb-cipherauto" => supdb_arm(Supdb::create_cipherauto, dir)?,
+        "supdb-cipherzpages" => supdb_arm(Supdb::create_cipher_zpages, dir)?,
+        "supdb-cipherzstride" => supdb_arm(Supdb::create_cipher_zstride, dir)?,
         "supdb-ingestcipher" => supdb_arm(Supdb::create_ingest_cipher, dir)?,
         "supdb-ingestcipherauto" => supdb_arm(Supdb::create_ingest_cipherauto, dir)?,
         "supdb-nocacheordread" => supdb_arm(Supdb::create_nocache_ordread, dir)?,
@@ -16587,8 +16641,11 @@ mod tests {
         let cipher = arm("supdb-cipher", Supdb::create_cipher);
         let log = arm("supdb-cipherlog", Supdb::create_cipherlog);
         let auto = arm("supdb-cipherauto", Supdb::create_cipherauto);
+        let zblock = arm("supdb-cipherzpages", Supdb::create_cipher_zpages);
+        let zstride = arm("supdb-cipherzstride", Supdb::create_cipher_zstride);
         let o = |a: &Supdb| a.db.as_ref().unwrap().options().clone();
         let (p, c, l, z) = (o(&plain), o(&cipher), o(&log), o(&auto));
+        let (zb, zs) = (o(&zblock), o(&zstride));
         // The store's options give the cipher to the store, which holds it
         // where the options do not (`Db::cipher_counts` answers for it).
         let under = |a: &Supdb| a.db.as_ref().unwrap().cipher_counts().is_some();
@@ -16597,8 +16654,30 @@ mod tests {
             ("supdb-cipher", &cipher),
             ("supdb-cipherlog", &log),
             ("supdb-cipherauto", &auto),
+            ("supdb-cipherzpages", &zblock),
+            ("supdb-cipherzstride", &zstride),
         ] {
             assert!(under(a), "{name}: under a cipher");
+        }
+        // The forced arms: the form at every build, in the coding each
+        // names, and nothing else of `supdb-cipher` moved.
+        for (name, f) in [("supdb-cipherzpages", &zb), ("supdb-cipherzstride", &zs)] {
+            assert_eq!(f.zpages, supdb::ZPages::Always, "{name}: the form forced");
+            assert!(
+                !f.zpages_stride_room,
+                "{name}: no room asked of a forced form"
+            );
+            assert_eq!(f.direct_ingest, c.direct_ingest, "{name}");
+            assert_eq!(f.scan_cache_bytes, c.scan_cache_bytes, "{name}");
+        }
+        assert_eq!(zb.zpages_stride, supdb::ZStride::Off, "supdb-cipherzpages");
+        assert_eq!(
+            zs.zpages_stride,
+            supdb::ZStride::Forced,
+            "supdb-cipherzstride"
+        );
+        for name in ["supdb-cipherzpages", "supdb-cipherzstride"] {
+            assert_eq!(guarantee(name), guarantee("supdb-cipher"), "{name}");
         }
         assert_eq!(
             c.direct_ingest, p.direct_ingest,
@@ -16619,7 +16698,7 @@ mod tests {
             "supdb-cipherauto lets the controller in"
         );
         assert_eq!(z.direct_ingest, c.direct_ingest, "supdb-cipherauto");
-        drop((plain, cipher, log, auto));
+        drop((plain, cipher, log, auto, zblock, zstride));
         let _ = std::fs::remove_dir_all(&root);
     }
 
