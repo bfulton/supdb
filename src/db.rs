@@ -26377,17 +26377,28 @@ impl Reader {
         if self.shared.pager.is_some() {
             self.attn |= ATTN_PAGED;
             self.attn_open.set(self.attn_open.get() | ATTN_PAGED);
-            // A handle with forms of its own looks as the writer's does,
-            // for the rest a look is ahead of a read's walk: the word its
-            // forms have for "not asked" is the cipher's (`not_asked`).
-            if self.looks == LOOKS_NONE {
-                if let Some(f) = self.fs.0.get_mut() {
-                    self.looks = LOOKS_READER_RESTS;
-                    f.abandoned.set(REST_HERE);
-                }
-            }
+            self.reader_rests();
         }
         self
+    }
+
+    /// A handle with forms of its own looks as the writer's does under a
+    /// cipher, for the rest a look is ahead of a read's walk: the word
+    /// its forms have for "not asked" is the cipher's (`not_asked`). Out
+    /// of line: written into `paged_bits`, which every handle's
+    /// constructor ends in, it changed what the compiler kept in
+    /// registers through the writer's round of a plain store, two and a
+    /// half instructions a key by the count (`sh scripts/cost.sh 884443b
+    /// work` at `c1eeafb`), in a function no line of it runs.
+    #[cold]
+    #[inline(never)]
+    fn reader_rests(&mut self) {
+        if self.looks == LOOKS_NONE {
+            if let Some(f) = self.fs.0.get_mut() {
+                self.looks = LOOKS_READER_RESTS;
+                f.abandoned.set(REST_HERE);
+            }
+        }
     }
 
     /// The writer's own handle, after `paged_bits`: in a store under a
