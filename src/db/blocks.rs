@@ -1175,6 +1175,32 @@ mod tests {
         unsafe { pool.give(t, most, KEEP_MAX) };
         assert_eq!(pool.counts(), [4, 11, 9, KEEP_MAX], "the longest kept");
         assert_eq!(pool.drain(), KEEP_MAX);
+        // An array past its room gives up its own buffers, the smallest
+        // first, and none of another array's, however small that is.
+        let third = Site::SortOrder;
+        let small = lent(other, m);
+        unsafe { pool.give(other, small, m) };
+        let (p1, p2) = (lent(third, 2 * m), lent(third, 4 * m));
+        unsafe {
+            pool.give(third, p1, 2 * m);
+            pool.give(third, p2, 4 * m);
+        }
+        assert_eq!(pool.counts(), [4, 14, 10, 7 * m]);
+        let p3 = lent(third, 4 * m);
+        unsafe { pool.give(third, p3, 4 * m) };
+        assert_eq!(
+            pool.counts(),
+            [4, 15, 12, 5 * m],
+            "two of its own went, the smaller and one of the larger"
+        );
+        assert_eq!(
+            pool.take(other, 1, false),
+            Some((small, m)),
+            "the other array's smaller buffer stayed"
+        );
+        pool.lend(other, m);
+        unsafe { pool.give(other, small, m) };
+        assert_eq!(pool.drain(), 5 * m);
     }
 
     /// A vector with a pool has its buffer from it and gives it back: the

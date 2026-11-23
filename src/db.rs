@@ -2390,7 +2390,7 @@ pub struct Options {
     /// On; `supdb-znocrossraw` asks for the form files alone.
     #[doc(hidden)]
     pub zpages_cross_asks_raw: bool,
-    /// EXPERIMENT: the selector's first buy makes the crossing where the
+    /// The selector's first buy makes the crossing where the
     /// land look has not (`Maint::z_cross`, `zpages_land_drop_past`),
     /// before the buy attaches anything. The crossing is what turns the
     /// partitions built ahead under the line -- records kept, form files
@@ -2416,7 +2416,8 @@ pub struct Options {
     /// --ops-div 10 --passes load,read,read-threaded`, at `ca2306e`). A
     /// buy is the selector's own word that the store is past the line,
     /// whatever the look's model reads. Counted
-    /// (`ZCounts::buy_crosses`). Off; `supdb-zbuycross` turns it on.
+    /// (`ZCounts::buy_crosses`). On; `supdb-nobuycross` leaves the
+    /// crossing to the look.
     #[doc(hidden)]
     pub zpages_buy_crosses: bool,
     /// The drop of a served partition's ordered index from the
@@ -4648,7 +4649,7 @@ pub struct Options {
     /// were touched before. `supdb-heapblocks` is the arm that keeps the
     /// heap shape.
     pub blocks_mapped: bool,
-    /// EXPERIMENT: a job's large per-key arrays -- a seal's sort of its
+    /// A job's large per-key arrays -- a seal's sort of its
     /// table, a segment writer's copy of every key with its span, its
     /// record's offset and its hash, the ordered index builder's keys, a
     /// merge's key list and the trailer a finish composes -- are mapped
@@ -4664,7 +4665,17 @@ pub struct Options {
     /// each, beside a group at its limit whose form files' pages then
     /// faulted (`docs/engine.md`, which form a workload calls for). A
     /// mapping's pages are fresh at every job, where the arena's were
-    /// touched by the job before. Off; `supdb-jobsmapped` turns it on.
+    /// touched by the job before, and priced in memory that costs
+    /// nothing a pairing resolves: loads 0.98-1.08x at three hundred
+    /// thousand and three million keys, where the default beside itself
+    /// stood 0.83-1.19x apart cell by cell. Under 1 GiB at ten million
+    /// keys the scan passes after the ten-percent burst and after the
+    /// full rewrite read 1.3-1.6x and 1.2-1.6x with a quarter and two
+    /// thirds of the scanning thread's major faults, and at three million
+    /// the process holds 21-30 MB after its load for the allocator's
+    /// 45-108, which is what keeps that store under the line the builds
+    /// ahead start at (`zpages_land_pct`; `docs/engine.md` has the
+    /// pairings). On; `supdb-jobsheap` keeps the allocator's.
     #[doc(hidden)]
     pub jobs_mapped: bool,
     /// EXPERIMENT: `jobs_mapped` only while the store is short of memory,
@@ -4697,8 +4708,21 @@ pub struct Options {
     /// short (`jobs_mapped_when_short`) leaves in the arenas what the
     /// jobs before then kept. The pool is the arena's warmth where memory
     /// is spare and the mapping's return where it is not, with what was
-    /// kept before returned at the crossing. Off, and nothing without
-    /// `jobs_mapped`; `supdb-jobspooled` turns both on.
+    /// kept before returned at the crossing. Refuted on both counts.
+    /// The fresh mappings' cost in memory, which the pool was built to
+    /// buy back, is none a pairing resolves (`jobs_mapped`), and the pool
+    /// read no better there. And "the raw form fits the budget" is no
+    /// word on memory to spare while a load has the group at its limit:
+    /// at three million keys under 1 GiB the pool held 110-140 MB after
+    /// the load, the store sat over the line the builds ahead start at,
+    /// and the one-percent burst ran 78-97 ms in nine reps of twelve
+    /// where the mapped arrays alone ran 40-65 in twelve of twelve
+    /// (`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh
+    /// supdb-jobspooledbuycross supdb 3000000 --bound 1073741824 --reps 6
+    /// --ops-div 10 --passes load,lag`, at `c7570a9`). At ten million
+    /// keys, where the store reads short from the middle of its load, it
+    /// is the mapped arrays and no more. Off, and nothing without
+    /// `jobs_mapped`; `supdb-jobspooled` is the arm.
     #[doc(hidden)]
     pub jobs_pooled: bool,
     /// Whether a fill on the upkeep thread leaves the rest of its
@@ -6989,7 +7013,7 @@ impl Default for Options {
             zpages_hot_raw_beside_stride: true,
             zpages_drive_at_job_end: true,
             zpages_cross_asks_raw: true,
-            zpages_buy_crosses: false,
+            zpages_buy_crosses: true,
             zpages_drop_again: true,
             zpages_ahead_past_scans: false,
             zpages_build_at_finish: true,
@@ -7125,7 +7149,7 @@ impl Default for Options {
             upkeep_fill_yields: true,
             upkeep_fill_skips_posted: true,
             blocks_mapped: true,
-            jobs_mapped: false,
+            jobs_mapped: true,
             jobs_mapped_when_short: false,
             jobs_pooled: false,
             forms_convert_yield: true,
