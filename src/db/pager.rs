@@ -609,6 +609,12 @@ impl Pager {
         self.held.load(Ordering::Relaxed)
     }
 
+    /// Of `held`, the bytes of files with no envelope yet, which nothing
+    /// can give back (`could_give`).
+    pub(crate) fn unbacked(&self) -> u64 {
+        self.unbacked.load(Ordering::Relaxed)
+    }
+
     /// Whether `bytes` more would fit under the budget.
     pub(crate) fn room_for(&self, bytes: u64) -> bool {
         self.held().saturating_add(bytes) <= self.budget()

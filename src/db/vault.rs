@@ -720,6 +720,9 @@ impl super::pager::Room for PlatformRoom {
         let room = i64::try_from(held)
             .unwrap_or(i64::MAX)
             .saturating_add(slack / sharing);
+        if room_traced() {
+            trace_room(slack);
+        }
         Some(u64::try_from(room).unwrap_or(0))
     }
     fn floor(&self) -> u64 {
@@ -738,6 +741,107 @@ impl super::pager::Room for PlatformRoom {
             None => super::zfile::buffers_mapped(),
         }
     }
+}
+
+/// Whether the room's readings are traced (`SUPDB_PAGER_TRACE`), read once.
+fn room_traced() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SUPDB_PAGER_TRACE").is_some())
+}
+
+/// `SUPDB_PAGER_TRACE=1`: what the memory the kernel cannot take back is
+/// made of, a `pagertrace` line on stderr from a cache's reading of its
+/// room, ten a second at the most. The time on the clock the suite's
+/// phase marks are on (`SUPDB_LAG_MARK`); the platform's reading of the
+/// limit, the process's own memory, the shared memory it charges and the
+/// slack the room is drawn from, mebibytes; and for each store under a
+/// cipher what its cache holds, what of that is files with no envelope
+/// yet, its budget and the evictor's passes and stalls, then its memory
+/// files -- the ones being written, which no count of the cache has, and
+/// the ones a reader has a view of -- with the largest by name.
+///
+/// A process killed under a bound is read from this beside the group's
+/// memory by kind (`scripts/groupmem.py`) and its threads' stacks at the
+/// limit (`scripts/stallwatch.py`): the cache's own counts see nothing
+/// of a file until it has a view or an envelope, and the evictor reads
+/// its room at every turn, so a trace that stops while the store runs is
+/// the evictor inside one pass's wait for a reader -- which is how the
+/// close's pin was found (`Db::drop`).
+fn trace_room(slack: i64) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: the monotonic clock read into a timespec of this frame.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    let ms = ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000;
+    let last = LAST.load(Ordering::Relaxed);
+    if ms < last + 100
+        || LAST
+            .compare_exchange(last, ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let mib = |v: u64| v >> 20;
+    let mut line = format!("pagertrace {}.{:03}", ms / 1000, ms % 1000);
+    if let Some(b) = super::zfile::read_budget() {
+        line.push_str(&format!(
+            " limit {} anon {} shmem {} cache {} slack {}",
+            mib(b.limit),
+            mib(b.anon),
+            b.shmem.map_or(-1, |v| mib(v) as i64),
+            b.cache.map_or(-1, |v| mib(v) as i64),
+            slack >> 20
+        ));
+    }
+    for v in lock(&REGISTRY).iter() {
+        let c = v.pager.counts();
+        line.push_str(&format!(
+            " | held {} unbacked {} budget {} passes {} stalls {} waited_ms {}",
+            mib(c.held),
+            mib(v.pager.unbacked()),
+            mib(c.budget),
+            c.passes,
+            c.stalls,
+            c.waited_us / 1000
+        ));
+        // Each memory file once, by the name it was first met under.
+        let mut seen: Vec<(*const File, &str, u64, bool)> = Vec::new();
+        let files = lock(&v.files);
+        for (name, e) in files.iter() {
+            let Some(mem) = &e.mem else { continue };
+            let at = Arc::as_ptr(mem);
+            if seen.iter().any(|s| s.0 == at) {
+                continue;
+            }
+            let len = mem.metadata().map_or(0, |m| m.len());
+            seen.push((at, name.as_str(), len, e.page.is_some()));
+        }
+        let sum = |viewed: bool| -> (usize, u64) {
+            let of = seen.iter().filter(|s| s.3 == viewed);
+            (of.clone().count(), of.map(|s| s.2).sum())
+        };
+        let (wn, wb) = sum(false);
+        let (vn, vb) = sum(true);
+        line.push_str(&format!(
+            " | writing {wn} {} viewed {vn} {} mapped {}",
+            mib(wb),
+            mib(vb),
+            lock(&v.mapped).len()
+        ));
+        seen.sort_by_key(|s| std::cmp::Reverse(s.2));
+        for (_, name, len, viewed) in seen.iter().take(6) {
+            let short: String = name.chars().take(28).collect();
+            line.push_str(&format!(
+                " {short}{}={}",
+                if *viewed { "*" } else { "" },
+                mib(*len)
+            ));
+        }
+    }
+    eprintln!("{line}");
 }
 
 /// The least a cache that follows the platform's room is given: sixty-four

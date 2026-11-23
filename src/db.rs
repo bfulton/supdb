@@ -60621,8 +60621,22 @@ impl Drop for Db {
         self.stop_keeper();
         self.stop_trimmer();
         self.stop_ahead();
+        // The segment work's stop joins every seal and merge in flight,
+        // which run to their end, and this operation is pinned across it:
+        // a wait, with nothing of the store's files lent to this thread
+        // (`Reader::unlent`). Left as a reader's pin it kept the store's
+        // cache under a cipher from giving anything back for as long as
+        // the merges ran, while they read their inputs into it a breath
+        // at a time (`pager::Hold::rest`): a store of five million keys
+        // under a bound of 640 MiB, dropped with two merges running, sat
+        // at its group's limit for seven seconds and was killed there.
         match &mut self.maint {
-            MaintHome::Here(m) => m.stop(),
+            MaintHome::Here(m) => {
+                // What the stop reads of the store it reads inside an
+                // operation of the segment work's own (`Maint::stop`).
+                let _waits = self.r.unlend();
+                m.stop()
+            }
             MaintHome::Away(a) => {
                 self.r
                     .shared
@@ -60633,7 +60647,7 @@ impl Drop for Db {
                     t.unpark();
                 }
                 if let Some(h) = a.handle.take() {
-                    let _ = h.join();
+                    let _ = self.r.unlent(|| h.join());
                 }
             }
         }
@@ -61170,6 +61184,113 @@ mod cipher_looks {
             assert!(db.r.abandon_forms());
             assert_eq!(db.r.fs().abandoned.get(), word, "after the forms went");
             assert!(!db.r.abandon_pending());
+        }
+    }
+
+    /// A store dropped with a merge in flight joins the merge, which runs
+    /// to its end inside the drop, and the drop is an operation of the
+    /// writer's, pinned for its length: the join is a wait that holds
+    /// nothing of the store's files (`Reader::unlent`), so the cache goes
+    /// on giving back under the merge. Read as a reader's pin, the drop
+    /// kept every page the merge read in the cache until the merge ended:
+    /// a store many times its cache was held whole through its own close.
+    ///
+    /// The merge is held before it reads anything and the drop lifts the
+    /// hold, so the whole of its reading falls inside the drop; the test
+    /// keeps the cache's handle past the store to read what it peaked at.
+    /// With the segment work on its thread, where the drop joins that
+    /// thread, and inline, where the drop's own thread joins the merge.
+    #[test]
+    fn a_close_that_joins_a_merge_holds_nothing_of_the_cache() {
+        for away in [true, false] {
+            let dir = std::env::temp_dir().join(format!(
+                "supdb-next-cipher-close-{away}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let cache: u64 = 2 << 20;
+            let opts = Options {
+                encryption: Encryption::Cipher(vault::tests::cipher(4).cache_bytes(cache)),
+                seal_bytes: 256 << 10,
+                partition_bytes: Some(256 << 10),
+                l0_trigger: 2,
+                publish_in_background: away,
+                ..Options::default()
+            };
+            let n = 200_000u32;
+            let key = |i: u32| format!("k{i:08}").into_bytes();
+            let val = |i: u32, round: u8| {
+                let mut v = format!("value {i:08} of round {round} ").into_bytes();
+                v.resize(100, b'x');
+                v
+            };
+            let mut db = Db::create(&dir, opts).unwrap();
+            for i in 0..n {
+                db.append(&key(i), &val(i, 0));
+                if i % 500 == 499 {
+                    db.commit().unwrap();
+                }
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+            db.settle().unwrap();
+            // Pieces over every partition, twice, with the merge they make
+            // due held before it reads.
+            db.hold_merge_start(true);
+            for round in 1..=3u8 {
+                for i in (0..n).step_by(41) {
+                    db.put(&key(i), &val(i, round));
+                    if i % 500 < 41 {
+                        db.commit().unwrap();
+                    }
+                }
+                db.commit().unwrap();
+                db.seal().unwrap();
+            }
+            let t = std::time::Instant::now();
+            while db.merges_in_flight() == 0 {
+                assert!(
+                    t.elapsed() < std::time::Duration::from_secs(60),
+                    "away {away}: no merge started over the pieces"
+                );
+                // The segment work inline lands and plans at a commit.
+                db.commit().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let pager = db.shared.pager.clone().expect("a store under a cipher");
+            // The cache back under its budget with nothing reading, and
+            // its peak started again there: what follows is the drop's.
+            let t = std::time::Instant::now();
+            while pager.held() > pager.budget() {
+                assert!(
+                    t.elapsed() < std::time::Duration::from_secs(20),
+                    "away {away}: the cache stayed over its budget before the drop: {:?}",
+                    pager.counts()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            pager.restart_peak();
+            let before = pager.counts();
+            drop(db);
+            let c = pager.counts();
+            // The merge read its inputs inside the drop: most of the
+            // store's chunks, several times what the cache may hold.
+            let read = (c.fills - before.fills) * pager::CHUNK as u64;
+            assert!(
+                read > 6 * cache,
+                "away {away}: the merge read {read} bytes inside the drop, which is no test of \
+                 it: {c:?}"
+            );
+            // What a merge may hold past the budget between two rests, and
+            // the megabyte the cache gives back at a time.
+            let slack: u64 = 8 << 20;
+            assert!(
+                c.peak < cache + slack,
+                "away {away}: the cache held {} bytes through the store's close, over a budget \
+                 of {cache}: {c:?}",
+                c.peak
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
