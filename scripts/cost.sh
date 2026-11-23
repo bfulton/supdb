@@ -152,6 +152,21 @@ for e in $EX; do
     cp "$HEAD_TREE/bench/examples/$e.rs" "$W/base/bench/examples/$e.rs" ||
         { echo "cost: the head's probe $e could not be copied into the base"; exit 2; }
 done
+# FASTER's sources, for a side whose suite builds the `faster` arm
+# (bench/build.rs): they are fetched and never the repository's
+# (bench/scripts/faster.sh), so a worktree of the base and a scratch copy of
+# the tree (cost-red.sh) come without them, and the suite's build stops
+# there. Handed over from this tree where it holds the commit the side
+# pins; a side they do not fit fails its own build, which says what to run.
+faster_for() { # tree
+    v="$1/bench/vendor/faster"
+    if [ ! -f "$v/PIN" ] || [ -f "$v/src/core/faster.h" ]; then return 0; fi
+    have="$ROOT/bench/vendor/faster"
+    if [ "$(cat "$have/COMMIT" 2>/dev/null || true)" != "$(tr -d '[:space:]' <"$v/PIN")" ]; then return 0; fi
+    cp -R "$have/src" "$v/src" && cp "$have/COMMIT" "$v/COMMIT"
+}
+faster_for "$W/base"
+faster_for "$HEAD_TREE"
 build() { # tree target side
     args=""
     for e in $EX; do args="$args --example $e"; done

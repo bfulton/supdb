@@ -5520,8 +5520,36 @@ fn ci_file(
             }
         }
     }
+    // The suite's comparators are readied together. A job that readies
+    // libclang builds the suite, and the suite's build fails without
+    // FASTER's sources (bench/build.rs), which are fetched and never the
+    // repository's: a job added on one line before the other line gave the
+    // suite a comparator of that kind builds here, where a host is readied
+    // once, and nowhere a runner starts clean.
+    let line_of = |job: &str, what: &str| {
+        steps
+            .iter()
+            .filter(|st| st.job == job)
+            .flat_map(|st| &st.runs)
+            .find(|(_, cmd)| cmd == what)
+            .map(|(ln, _)| *ln)
+    };
+    let jobs: BTreeSet<&str> = steps.iter().map(|st| st.job.as_str()).collect();
+    for job in jobs {
+        if let (Some(ln), None) = (line_of(job, CI_LIBCLANG), line_of(job, CI_FASTER)) {
+            errs.push(format!(
+                "line {ln}: the job `{job}` readies libclang for the suite's comparators and \
+                 not FASTER (`{CI_FASTER}`): the suite's build fails without its sources"
+            ));
+        }
+    }
     errs
 }
+
+/// The two set-up steps of a job that builds the suite, each as CI_SETUP
+/// lists it.
+const CI_LIBCLANG: &str = "sh bench/scripts/libclang.sh";
+const CI_FASTER: &str = "sh bench/scripts/faster.sh";
 
 #[test]
 fn ci_checks_only_through_check_sh_and_runs_every_group() {
@@ -6096,6 +6124,38 @@ fn a_ci_step_that_checks_outside_check_sh_fails() {
     }
 }
 
+/// A job that readies one of the suite's comparators and not the other
+/// fails: the `cost` and `enc` jobs, this line's, came through a merge of
+/// the line that added FASTER with libclang alone, clean by text, and
+/// would have failed at the suite's build script on a runner that starts
+/// with no sources.
+#[test]
+fn a_job_that_builds_the_suite_without_faster_fails() {
+    let (yaml, sh) = ci_texts();
+    ci_check(&yaml, &sh).expect("the workflow as it stands is green");
+    assert!(CI_SETUP.iter().any(|(s, _)| *s == CI_LIBCLANG));
+    assert!(CI_SETUP.iter().any(|(s, _)| *s == CI_FASTER));
+    let faster = format!("run: {CI_FASTER}");
+    let jobs = yaml.matches(&faster).count();
+    assert!(jobs >= 4, "{jobs} jobs ready FASTER");
+    // Each job's step taken away in turn, a second libclang step in its
+    // place so that every other rule still holds.
+    for nth in 0..jobs {
+        let at = yaml.match_indices(&faster).nth(nth).expect("counted").0;
+        let without = format!(
+            "{}run: {CI_LIBCLANG}{}",
+            &yaml[..at],
+            &yaml[at + faster.len()..]
+        );
+        let e = ci_check(&without, &sh).expect_err("a job with no FASTER");
+        assert!(
+            e.contains("readies libclang for the suite's comparators and not FASTER"),
+            "the {nth}th: {e}"
+        );
+        assert_eq!(e.matches("and not FASTER").count(), 1, "one job: {e}");
+    }
+}
+
 #[test]
 fn a_group_no_ci_job_runs_fails() {
     let (yaml, sh) = ci_texts();
@@ -6104,7 +6164,7 @@ fn a_group_no_ci_job_runs_fails() {
         &ci_edit(
             &yaml,
             "run: sh scripts/check.sh wasm",
-            "run: sh bench/scripts/libclang.sh",
+            "run: sh bench/scripts/faster.sh",
         ),
         &sh,
     )
@@ -6154,7 +6214,7 @@ fn a_group_no_ci_job_runs_fails() {
     let none = ci_edit(
         &yaml,
         "run: sh scripts/check.sh wasm",
-        "run: sh bench/scripts/libclang.sh",
+        "run: sh bench/scripts/faster.sh",
     );
     ci_check_with(&none, &sh, &[("wasm", "a reason")])
         .unwrap_or_else(|e| panic!("wasm said not run: {e}"));

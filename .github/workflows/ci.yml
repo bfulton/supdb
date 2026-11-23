@@ -131,6 +131,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: libclang, for bindgen
         run: sh bench/scripts/libclang.sh
+      # FASTER is a comparator too, and not a crate: the suite's build needs
+      # its sources, which the script fetches at the pinned commit.
+      - name: FASTER, for the `faster` arm
+        run: sh bench/scripts/faster.sh
       - name: valgrind
         run: sudo apt-get update -qq && sudo apt-get install -y -qq valgrind
       - uses: Swatinem/rust-cache@v2
@@ -195,6 +199,10 @@ jobs:
           components: rustfmt, clippy
       - name: libclang, for bindgen
         run: sh bench/scripts/libclang.sh
+      # FASTER is a comparator too, and not a crate: the suite's build needs
+      # its sources, which the script fetches at the pinned commit.
+      - name: FASTER, for the `faster` arm
+        run: sh bench/scripts/faster.sh
       - name: OpenSSL's headers, for the comparators' ciphers
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libssl-dev
       - uses: Swatinem/rust-cache@v2
