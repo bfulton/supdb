@@ -8999,6 +8999,14 @@ struct Seg {
     /// reads to tell a sliver left raw for its size from one that could not
     /// be covered.
     z_declined: std::sync::atomic::AtomicU8,
+    /// Which of this partition's pages the hot-raw policy had asked the
+    /// kernel for and not yet acted on at its last look: `HOT_ASKED_RAW`
+    /// its raw records, ahead of a release, `HOT_ASKED_FILE` its form file,
+    /// ahead of the way back, or zero (`Maint::z_hot_asks_say`). Read by
+    /// nothing in the engine: `Db::zpage_hot_asks_in` answers a test from
+    /// it, which waits there for the kernel in its own time before it moves
+    /// an injected clock toward the policy's wait.
+    z_hot_asked: std::sync::atomic::AtomicU8,
     /// Set where this partition's raw file and ordered index were dropped
     /// from the page cache (`drop_raw_pages`) and the segment work has not
     /// yet noted the drop: its look takes the flag and owes the ordered
@@ -12636,6 +12644,7 @@ impl Seg {
                 z_spare: zfile::ZCell::new(),
                 hot_reads16: AtomicU64::new(0),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
+                z_hot_asked: std::sync::atomic::AtomicU8::new(0),
                 z_drop_noted: std::sync::atomic::AtomicBool::new(false),
                 z_stride_no: std::sync::atomic::AtomicU8::new(0),
                 key0_len,
@@ -12683,6 +12692,7 @@ impl Seg {
                 z_spare: zfile::ZCell::new(),
                 hot_reads16: AtomicU64::new(0),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
+                z_hot_asked: std::sync::atomic::AtomicU8::new(0),
                 z_drop_noted: std::sync::atomic::AtomicBool::new(false),
                 z_stride_no: std::sync::atomic::AtomicU8::new(0),
                 key0_len,
@@ -12722,6 +12732,7 @@ impl Seg {
             z_spare: zfile::ZCell::new(),
             hot_reads16: AtomicU64::new(0),
             z_declined: std::sync::atomic::AtomicU8::new(0),
+            z_hot_asked: std::sync::atomic::AtomicU8::new(0),
             z_drop_noted: std::sync::atomic::AtomicBool::new(false),
             z_stride_no: std::sync::atomic::AtomicU8::new(0),
             key0_len,
@@ -34366,6 +34377,39 @@ impl Reader {
 }
 
 impl Db {
+    /// A test's: whether the kernel holds the pages of every ask the
+    /// hot-raw policy's last look left in flight, by the count the look
+    /// itself reads (`mincore`, against `HOT_RAW_RESIDENT`): a partition's
+    /// raw records ahead of its release, and a released one's form file
+    /// ahead of its way back. True with no ask in flight.
+    ///
+    /// The policy gives an ask `HOT_RAW_ASK_WAIT` on the store's clock and
+    /// drops a release whose pages are under half there when it is out. A
+    /// test's clock is injected and runs through that wait in the time its
+    /// looks take, tens of milliseconds, while the kernel reads the pages
+    /// in in its own: on a hosted runner the read lost once, the ask was
+    /// dropped, and a test of the release failed with the engine right. A
+    /// test waits here before each look, so the wait it moves its clock
+    /// through is one the pages have already met.
+    #[doc(hidden)]
+    pub fn zpage_hot_asks_in(&self) -> bool {
+        let _entered = self.enter();
+        self.segs().iter().filter(|s| s.level > 0).all(|seg| {
+            match seg.z_hot_asked.load(AtomicOrdering::Relaxed) {
+                HOT_ASKED_RAW => seg.records_resident() >= HOT_RAW_RESIDENT,
+                HOT_ASKED_FILE => {
+                    let name = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name));
+                    let (Some(id), Some(end)) = name else {
+                        return true;
+                    };
+                    MmapBytes::open(&self.dir.join(zfile::zpg_name(id, end)))
+                        .map_or(true, |map| resident_share(&map.0[..]) >= HOT_RAW_RESIDENT)
+                }
+                _ => true,
+            }
+        })
+    }
+
     /// A test's seam: every live segment's pages dropped from this
     /// process's mapping and then from the file's cache, as the drop of a
     /// served raw form does (`Options::zpages_drop_raw`), so that a merge
@@ -46255,6 +46299,10 @@ pub const HOT_RAW_WINDOW: usize = 8;
 /// raw reads would queue behind it -- and no ask is made again for this
 /// long.
 const HOT_RAW_RESIDENT: f64 = 0.9;
+/// `Seg::z_hot_asked`: the raw records asked for ahead of a release, and
+/// the form file asked for ahead of the way back.
+const HOT_ASKED_RAW: u8 = 1;
+const HOT_ASKED_FILE: u8 = 2;
 /// A settle's wait for the form files the store asked the kernel for
 /// (`Options::zpages_settle_joins_asks`): how often it looks at their
 /// residency, how many looks in a row with no page more end it once it has
@@ -50234,8 +50282,9 @@ impl Maint {
 
     /// The hot-raw policy's turn (`Options::zpages_hot_raw`), with the form
     /// installed and nothing to build: once a `HOT_RAW_PERIOD`, a look
-    /// (`z_hot_look`), counted once it is done so that a test that waits for
-    /// one reads the decision it made.
+    /// (`z_hot_look`), counted once it is done and the asks it left in
+    /// flight are said (`z_hot_asks_say`), so that a test that waits for one
+    /// reads the decision it made.
     fn z_hot_raw_tick(&mut self) {
         let now = self.z_now();
         if self
@@ -50247,7 +50296,38 @@ impl Maint {
         let dt = self.z_hot_last.map(|t| now.saturating_sub(t));
         self.z_hot_last = Some(now);
         self.z_hot_look(now, dt);
+        self.z_hot_asks_say();
         zfile::ZEvents::add(&self.shared.z.hot_looks, 1);
+    }
+
+    /// The asks a look left in flight, said on the partitions they are of
+    /// (`Seg::z_hot_asked`) for a test's wait (`Db::zpage_hot_asks_in`):
+    /// every partition's word written from the lists the next look will
+    /// read, after every look. Not a word stored at each ask and cleared
+    /// at each end: a look ends an ask by a release, by a drop, and by
+    /// forgetting it where its partition was merged or is held by a job,
+    /// and a word left standing at any of those is a wait for pages nobody
+    /// asked for -- the raw records of a partition whose form was
+    /// installed over them since, which the install drops.
+    fn z_hot_asks_say(&self) {
+        let _op = self.op();
+        for seg in self.segs().iter().filter(|s| s.level > 0) {
+            let of = |lo: &Vec<u8>| *lo == seg.lo;
+            let word = if self.z_hot_ask.as_ref().is_some_and(|(lo, _)| of(lo))
+                || self.z_hot_fill_asks.iter().any(|(lo, _)| of(lo))
+            {
+                HOT_ASKED_RAW
+            } else if self.z_hot_back_ask.as_ref().is_some_and(|(lo, ..)| of(lo)) {
+                HOT_ASKED_FILE
+            } else {
+                0
+            };
+            // A store only where the word moves: the line is the
+            // segment's, which every read of the partition loads.
+            if seg.z_hot_asked.load(AtomicOrdering::Relaxed) != word {
+                seg.z_hot_asked.store(word, AtomicOrdering::Relaxed);
+            }
+        }
     }
 
     /// One look of the hot-raw policy at `now`, `dt` after the last one

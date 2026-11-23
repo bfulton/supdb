@@ -11878,9 +11878,26 @@ fn the_controller_recodes_the_hottest_partition_within_the_budget() {
 /// The hot-raw policy's next look waited for (`Options::zpages_hot_raw`):
 /// the injected clock moved `by`, and the counts read once the segment
 /// work's turn has looked at it.
+///
+/// The pages of whatever the policy has asked the kernel for are waited
+/// for first, in this process's own time (`Db::zpage_hot_asks_in`). The
+/// policy gives an ask two seconds of the store's clock, which ten of
+/// these looks move it through in some tens of milliseconds, and drops a
+/// release whose pages are under half there when they are out: the looks
+/// were a bet that the kernel's read would win, and on a hosted runner it
+/// lost once, `hot_dropped` one where every test here holds it to none.
 #[cfg(target_os = "linux")]
 fn hot_look(db: &Db, by: std::time::Duration) {
     let inject = db.options().zpages_inject.clone().unwrap();
+    let asked = std::time::Instant::now();
+    while !db.zpage_hot_asks_in() {
+        assert!(
+            asked.elapsed().as_secs() < 60,
+            "the kernel brought in the pages the hot-raw policy asked for: {:?}",
+            db.zpage_counts()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     let was = db.zpage_counts().hot_looks;
     inject.advance(by);
     let t = std::time::Instant::now();
@@ -11904,6 +11921,60 @@ fn hot_until(db: &Db, max: u32, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> b
         hot_look(db, std::time::Duration::from_millis(200));
     }
     cond(&db.zpage_counts())
+}
+
+/// The store's partitions: each put out of this process's page tables and
+/// out of the cache where `out`, and read back into the cache otherwise.
+#[cfg(target_os = "linux")]
+fn partitions_cached(dir: &Path, out: bool) {
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        if !p.file_name().unwrap().to_string_lossy().starts_with("par-") {
+            continue;
+        }
+        if out {
+            unmap_pages(&p);
+            evict(&p);
+        } else {
+            drop(std::fs::read(&p).unwrap());
+        }
+    }
+}
+
+/// What a look waits for is the kernel's own count of the pages the policy
+/// asked for (`Db::zpage_hot_asks_in`), not a word the engine keeps of
+/// having asked. With a release's ask in flight (`asked`): once the ask's
+/// read is in, the partitions out of the cache again read as not in, and
+/// read back as in. With none: the partitions out of the cache are nobody's
+/// to wait for, the word of an ask being taken back at the look that ends
+/// it. The partitions are left in the cache either way, as an ask met
+/// leaves the asked one.
+#[cfg(target_os = "linux")]
+fn hot_asks_follow_the_kernel(db: &Db, dir: &Path, asked: bool, what: &str) {
+    let came = std::time::Instant::now();
+    while !db.zpage_hot_asks_in() {
+        assert!(
+            came.elapsed().as_secs() < 60,
+            "{what}: the asked partition's pages came: {:?}",
+            db.zpage_counts()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    partitions_cached(dir, true);
+    assert_eq!(
+        db.zpage_hot_asks_in(),
+        !asked,
+        "{what}: the partitions out of the cache, an ask in flight {asked}: {:?} {:?}",
+        resident_under(dir, "par-"),
+        db.zpage_counts()
+    );
+    partitions_cached(dir, false);
+    assert!(
+        db.zpage_hot_asks_in(),
+        "{what}: the partitions read back: {:?} {:?}",
+        resident_under(dir, "par-"),
+        db.zpage_counts()
+    );
 }
 
 /// Under the controller with the hot-raw policy (`Options::zpages_hot_raw`),
@@ -11999,11 +12070,28 @@ fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
                 (1, 0, partitions),
                 "{what}: asked, still served: {c:?}"
             );
+            hot_asks_follow_the_kernel(&db, &dir, true, &format!("{what}: asked"));
+            // And the looks wait for it (`hot_look`). The asked pages are
+            // put out of the cache again and come back a third of a second
+            // on, a kernel slower than the looks by more than the hosted
+            // runner's was: ten looks take some tens of milliseconds and
+            // move the store's clock through the whole of the ask's wait,
+            // so looks that did not wait would find the pages gone when it
+            // is out and drop the ask.
+            partitions_cached(&dir, true);
+            let late = {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    partitions_cached(&dir, false);
+                })
+            };
             assert!(
                 hot_until(&db, 10, |c| c.hot_raw >= 1),
                 "{what}: the hot partition released: {:?}",
                 db.zpage_counts()
             );
+            late.join().unwrap();
             let c = db.zpage_counts();
             assert_eq!(
                 (
@@ -12016,6 +12104,7 @@ fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
                 (1, 0, 1, 1, partitions - 1),
                 "{what}: the hot partition released: {c:?}"
             );
+            hot_asks_follow_the_kernel(&db, &dir, false, &format!("{what}: released"));
             assert_eq!(c.hot_back, 0, "{what}: {c:?}");
             // Its reads go raw and are counted; the others' still through
             // the form. Every value as the model has it.
@@ -12087,8 +12176,40 @@ fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
                     after.rawserves > before.rawserves,
                     "{what}: read raw while asked: {before:?} {after:?}"
                 );
-                // The pages come by the ask, well inside the wait's ten
-                // looks, and the file is attached with them there.
+                // What a look waits for is the kernel's own count of the
+                // asked file (`Db::zpage_hot_asks_in`), not a word the
+                // engine keeps of having asked: once the ask's read is in,
+                // the file out of the cache again reads as not in, and
+                // read back as in.
+                let zpgs = || {
+                    std::fs::read_dir(&dir)
+                        .unwrap()
+                        .map(|e| e.unwrap().path())
+                        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("zpg-"))
+                };
+                let came = std::time::Instant::now();
+                while !db.zpage_hot_asks_in() {
+                    assert!(
+                        came.elapsed().as_secs() < 60,
+                        "{what}: the asked file's pages came: {:?}",
+                        db.zpage_counts()
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                zpgs().for_each(|p| evict(&p));
+                assert!(
+                    !db.zpage_hot_asks_in(),
+                    "{what}: the asked file out of the cache reads as not in: {:?}",
+                    resident_under(&dir, "zpg-")
+                );
+                zpgs().for_each(|p| drop(std::fs::read(&p).unwrap()));
+                assert!(
+                    db.zpage_hot_asks_in(),
+                    "{what}: the asked file read back reads as in: {:?}",
+                    resident_under(&dir, "zpg-")
+                );
+                // The pages are there at the next look, which waits for
+                // them (`hot_look`), and the file is attached with them.
                 assert!(
                     hot_until(&db, 8, |c| c.hot_back >= 1),
                     "{what}: the way back taken: {:?}",
@@ -13366,6 +13487,7 @@ fn the_hot_raw_fill_releases_partitions_read_alike_into_the_room_and_gives_them_
             let asks = db.zpage_counts().hot_asks - before;
             if asks > 0 && first.is_none() {
                 first = Some(asks);
+                hot_asks_follow_the_kernel(&db, &dir, true, &format!("{what}: the fill's asks"));
             }
         }
         if !on {

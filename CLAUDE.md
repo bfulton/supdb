@@ -2113,14 +2113,40 @@ merge, and sat out its ten seconds: one run in 240 beside seven other
 processes, the first run on a hosted runner, and every run with the wait
 made 300 ms late. The wait reads the merges landed since the seal beside
 the one in flight (`wait_for_merge`), which a merge that came and went
-satisfies as one caught does. The
+satisfies as one caught does. And as a clock: the hot-raw policy gives
+an ask for a partition's pages two seconds of the store's clock and
+drops it where under half of them have come when the wait is out, and
+its tests move an injected clock a fifth of a second a look, so ten
+looks ran through the whole wait in the tens of milliseconds they take
+while the kernel read the pages in its own time. On a hosted ARM runner
+the read lost once, on a re-run of a commit that had passed there: the
+ask was dropped, eighteen looks and no release, and a test of the
+release failed with the engine right. Each look waits first for the
+kernel's count of what the policy asked for (`Db::zpage_hot_asks_in`,
+over the asks the last look left in flight, which the look says on
+their partitions, `Maint::z_hot_asks_say`), and the test holds the race
+wide: the asked pages put out of the cache and read back a third of a
+second on, which looks that do not wait failed ten runs of ten, no
+release made, and looks that wait none of ten. The word of an ask was
+first stored at each ask and cleared at each end of one, and a mutant
+without one of the clears passed: a look ends an ask in more places than
+were listed, a partition merged or held by a job among them, and a word
+left standing would have every later look wait on pages nobody had asked
+for, the raw records of a partition whose form is installed over them
+again among them, which the install drops. It is written from the
+policy's own lists after every look now, one site. The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; a state the test needs only to have
 happened is waited for by the count it leaves behind, never by catching
-it; and a test that passes is read for
+it; a test that passes is read for
 the path that passed it, since a fallback that does the same work
-passes it too.
+passes it too; an injected clock moves the engine's side of a wait
+alone, so whatever the wait is for that the kernel does in its own time
+is waited for before the clock is moved; and a copy of a state kept for
+a reader is written from the state at one place, since a copy kept in
+step at every site that changes the state is wrong at the site nobody
+listed.
 
 **A test whose answer was a function of the clock, or of a thread's
 turn.** The superblock records the second a segment finished in, in each
