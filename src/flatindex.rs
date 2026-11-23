@@ -399,11 +399,11 @@ pub fn verify_pieces_in<'a, S: Sect<'a>>(
         .range(crc_off, crc_off.saturating_add(n))
         .ok_or(usize::MAX)?;
     for (i, ((a, b), word)) in pieces(crc_off, shift, base)
-        .zip(row.chunks_exact(4))
+        .zip(row.as_chunks::<4>().0)
         .enumerate()
     {
         let got = sec.range(a, b).ok_or(i)?;
-        if crate::block::crc32(got).to_le_bytes()[..] != *word {
+        if crate::block::crc32(got).to_le_bytes() != *word {
             return Err(i);
         }
     }

@@ -1802,12 +1802,12 @@ impl Vault {
         let short = || refused("manifest is truncated");
         let mlen = u32::from_le_bytes(body.get(..4).ok_or_else(short)?.try_into().unwrap());
         let manifest = body.get(4..4 + mlen as usize).ok_or_else(short)?;
-        let rest = &body[4 + mlen as usize..];
-        if rest.len() % (16 + WRAPPED) != 0 {
+        let (rest, over) = body[4 + mlen as usize..].as_chunks::<{ 16 + WRAPPED }>();
+        if !over.is_empty() {
             return Err(short());
         }
         let files = rest
-            .chunks_exact(16 + WRAPPED)
+            .iter()
             .map(|c| (c[..16].try_into().unwrap(), c[16..].try_into().unwrap()))
             .collect();
         Ok((manifest.to_vec(), files))
