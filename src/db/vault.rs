@@ -749,16 +749,17 @@ fn room_traced() -> bool {
     *ON.get_or_init(|| std::env::var_os("SUPDB_PAGER_TRACE").is_some())
 }
 
-/// `SUPDB_PAGER_TRACE=1`: what the memory the kernel cannot take back is
-/// made of, a `pagertrace` line on stderr from a cache's reading of its
-/// room, ten a second at the most. The time on the clock the suite's
-/// phase marks are on (`SUPDB_LAG_MARK`); the platform's reading of the
-/// limit, the process's own memory, the shared memory it charges and the
-/// slack the room is drawn from, mebibytes; and for each store under a
-/// cipher what its cache holds, what of that is files with no envelope
-/// yet, its budget and the evictor's passes and stalls, then its memory
+/// `SUPDB_PAGER_TRACE=1`: what the plaintext a process holds under its
+/// ciphers is made of, a `pagertrace` line on stderr from a cache's
+/// reading of its room, ten a second at the most. The time on the clock
+/// the suite's phase marks are on (`SUPDB_LAG_MARK`) and the slack the
+/// room was drawn from, mebibytes; and for each store under a cipher what
+/// its cache holds, what of that is files with no envelope yet, its
+/// budget and the evictor's passes, stalls and waits, then its memory
 /// files -- the ones being written, which no count of the cache has, and
-/// the ones a reader has a view of -- with the largest by name.
+/// the ones a reader has a view of -- with the largest by name. The
+/// group's own memory by kind is `scripts/groupmem.py`'s, on the same
+/// clock.
 ///
 /// A process killed under a bound is read from this beside the group's
 /// memory by kind (`scripts/groupmem.py`) and its threads' stacks at the
@@ -785,17 +786,12 @@ fn trace_room(slack: i64) {
         return;
     }
     let mib = |v: u64| v >> 20;
-    let mut line = format!("pagertrace {}.{:03}", ms / 1000, ms % 1000);
-    if let Some(b) = super::zfile::read_budget() {
-        line.push_str(&format!(
-            " limit {} anon {} shmem {} cache {} slack {}",
-            mib(b.limit),
-            mib(b.anon),
-            b.shmem.map_or(-1, |v| mib(v) as i64),
-            b.cache.map_or(-1, |v| mib(v) as i64),
-            slack >> 20
-        ));
-    }
+    let mut line = format!(
+        "pagertrace {}.{:03} slack {}",
+        ms / 1000,
+        ms % 1000,
+        slack >> 20
+    );
     for v in lock(&REGISTRY).iter() {
         let c = v.pager.counts();
         line.push_str(&format!(

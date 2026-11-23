@@ -72,6 +72,7 @@ src/db.rs	Db::create	vault/pager method	code	3	stays	the open names the mode; S5
 src/db.rs	Db::create	vault::Held	code	1	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
 src/db.rs	Db::create	vault::Vault	code	1	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
 src/db.rs	Db::create	vault::refuse_marked	code	2	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
+src/db.rs	Db::drop	unlent/unlend	code	2	S1	a wait under no pin: pin::idle (R6)
 src/db.rs	Db::guard_names	vault::under	code	1	S6	the lost-directory mark is a plain name; under the envelope arm an unclassed name is memory
 src/db.rs	Db::hold_for_upkeep	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
 src/db.rs	Db::hold_within	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
@@ -198,6 +199,10 @@ src/db.rs	Wal::resume	sealed log/manifest	code	3	S6	log_resume
 src/db.rs	Wal::resume	vault::LogCipher	code	1	S6	log_resume
 src/db.rs	Wal::resume	vault::Vault	code	1	S6	log_resume
 src/db.rs	Wal::write_sealed	sealed log/manifest	code	1	S6	enc.seal_into, split out of Wal::write
+src/db.rs	a_close_that_joins_a_merge_holds_nothing_of_the_cache	cipher	test	4	stays	cipher_looks: the close's joins under a cipher, the cache read through its own handle past the store
+src/db.rs	a_close_that_joins_a_merge_holds_nothing_of_the_cache	crypt	test	2	stays	cipher_looks: the close's joins under a cipher, the cache read through its own handle past the store
+src/db.rs	a_close_that_joins_a_merge_holds_nothing_of_the_cache	pager	test	9	stays	cipher_looks: the close's joins under a cipher, the cache read through its own handle past the store
+src/db.rs	a_close_that_joins_a_merge_holds_nothing_of_the_cache	vault::tests	test	1	stays	cipher_looks: the close's joins under a cipher, the cache read through its own handle past the store
 src/db.rs	check_options	cipher	code	2	stays	an unpinned writer is refused under a cipher, by the mode and in the refusal's words: the rule for an unpinned writer, with the store's cache as the party that frees
 src/db.rs	check_options	crypt	code	2	stays	the same refusal reads the mode out of the options (opts.encryption, Encryption::Cipher)
 src/db.rs	cipher_controller	cipher	code	2	S5	controller off under a cipher
