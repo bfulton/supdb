@@ -2065,10 +2065,21 @@ three defaults turned off alone named the one. The test of the
 conversion's order holds the first job before its rename and the second
 at its start now, under either turn, and fails on a tick that starts a
 conversion ahead of a partition's own build; the test whose order is
-read off the warms taken in a job a step pins the turn at the step. The
+read off the warms taken in a job a step pins the turn at the step. And
+as a poll: two tests of the builds at a merge's output finish sealed
+their last piece and waited to see its merge in flight, a merge of one
+partition that is in flight for five milliseconds, under a poll every
+five. A poll a few milliseconds late found it landed and nothing left to
+merge, and sat out its ten seconds: one run in 240 beside seven other
+processes, the first run on a hosted runner, and every run with the wait
+made 300 ms late. The wait reads the merges landed since the seal beside
+the one in flight (`wait_for_merge`), which a merge that came and went
+satisfies as one caught does. The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
-thing it bets against gets faster; and a test that passes is read for
+thing it bets against gets faster; a state the test needs only to have
+happened is waited for by the count it leaves behind, never by catching
+it; and a test that passes is read for
 the path that passed it, since a fallback that does the same work
 passes it too.
 

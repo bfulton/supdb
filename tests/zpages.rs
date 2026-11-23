@@ -7392,6 +7392,21 @@ fn wait_for(what: &str, cond: impl Fn() -> bool) {
     }
 }
 
+/// A partition merge in flight at some moment since `landed` of them had
+/// landed (`Db::seal_waits`), waited for: one in flight now, or one landed
+/// since. A wait for one in flight alone is a bet on the poll: the merge a
+/// seal's landing plans over one partition of these stores is in flight for
+/// five milliseconds and a poll comes every five, so a poll a few
+/// milliseconds late found it landed and nothing left to merge, and sat out
+/// its ten seconds -- one run in 240 beside seven other processes, and the
+/// first run on a hosted runner.
+#[cfg(target_os = "linux")]
+fn wait_for_merge(db: &Db, landed: u64) {
+    wait_for("a merge of the pieces", || {
+        db.merges_in_flight() >= 1 || db.seal_waits().merges > landed
+    });
+}
+
 /// A blocked store driven to COMPACT by faulting reads through a handle:
 /// the price paid, the form built and installed, the gate at the form.
 #[allow(clippy::type_complexity)]
@@ -9159,8 +9174,9 @@ fn a_merges_outputs_have_their_form_files_when_it_lands() {
             }
             db.commit().unwrap();
         }
+        let before = db.seal_waits().merges;
         db.seal().unwrap();
-        wait_for("a merge of the pieces", || db.merges_in_flight() >= 1);
+        wait_for_merge(&db, before);
         if on {
             wait_for("builds at the outputs' finish, at their hold", || {
                 db.zpage_build_waiting() && db.zpage_counts().finish_live >= 1
@@ -9307,8 +9323,9 @@ fn an_output_being_built_at_its_finish_is_not_built_ahead_again() {
         }
         db.commit().unwrap();
     }
+    let before = db.seal_waits().merges;
     db.seal().unwrap();
-    wait_for("a merge of the pieces", || db.merges_in_flight() >= 1);
+    wait_for_merge(&db, before);
     wait_for("builds at the outputs' finish, at their hold", || {
         db.zpage_build_waiting() && db.zpage_counts().finish_live >= 1
     });
