@@ -8,6 +8,53 @@ and its older sections below are kept because they are still true of what they d
 `scratch/` is session notes kept in the repo so they survive the container. **Remove it before
 any merge or pull request.**
 
+## The encrypted comparators exist now (23 Nov, `b12bd36`)
+
+The second half of the merge bar ("beating competitors on added encryption benchmarks") has
+its instrument. `bench/src/enc.rs`, behind the suite's feature `enc`, in a build of its own:
+
+```bash
+cd bench && cargo build --release --no-default-features --features enc --target-dir target-enc --bin bench
+```
+
+```bash
+sh scripts/check.sh enc
+```
+
+- **Arms**: `lmdb3` and `lmdb3-enc` (LMDB's 1.0 line, plain and behind its page hook under
+  AES-256-GCM), `rocksdb-tuned-enc` (RocksDB's encrypted Env under AES-256-CTR, which
+  authenticates nothing), each with a `-nosync` twin. `bench run --arms enc` is the roster:
+  `supdb`, `supdb-cipher` and those, both guarantee groups. In that build the `lmdb` arms are
+  refused by name (LMDB's two lines define the same C symbols); every other arm is as it is.
+- **Rows of it go under `scratch/enc/`** (`--out`), never under `bench/runs`: they would share
+  the standing series' class. Pairings: `BIN=bench/target-enc/release/bench OUT=scratch/enc/pairs
+  bench/scripts/pair.sh supdb-cipher rocksdb-tuned-enc SIZE [options]`.
+- **Encrypted LMDB stops at 300,000 keys.** Past that its shuffled load fails inside LMDB
+  (`MDB_PROBLEM` at a commit): a write transaction that reaches across about two thousand
+  decrypted chunks, on LMDB's unreleased line, reproduced on its C API alone
+  (`a_write_transaction_over_two_thousand_chunks`, ignored). The arm is not reshaped to pass.
+  Past the quick scale's top the encrypted comparator is RocksDB's. Its ordered load and reads
+  do run at any size (`--passes read` loads in order), so a bounded read pairing against it is
+  possible.
+- **Why the LMDB arm is on the C API**: through `heed3` an encrypted environment fails under
+  reader threads (`MDB_PAGE_NOTFOUND`), the wrapper's hook writing ciphertext into a buffer
+  another transaction reads. `bench/CLAUDE.md` has the whole of it ("A comparator's wrapper is
+  not the comparator").
+- **OpenSSL's headers** are needed for that build (`sh scripts/deps.sh openssl`); this
+  container has them.
+
+**The first look** (`bench ab`, 3 to 4 pairs, one order, so directions and not verdicts; logs
+in the session's scratchpad, not kept): `supdb-cipher` ahead of both encrypted comparators in
+every read, scan, shuffled load, lag point and mix at 100,000 and 300,000 keys and of RocksDB's
+at a million, by 1.1x to 30x. **Behind in one cell: the durable ordered load**, by a third at
+100,000 keys against both, a fifth at 300,000 against LMDB's, level with RocksDB's at a
+million. And its store is 1.9 to 2.5 bytes on the device a byte stored where theirs are 1.0 to
+1.2. Both are the same known cost: a run's commits written twice under a cipher (the log and
+the run's file) with the envelope written at the close (`CLAUDE.md`, the run under a cipher),
+which is what the page layer's pages sealed as they are written remove. So the layer's first
+measurable target is that cell. Not yet measured against the comparators: the buffered group,
+and anything out of core, where `supdb-cipher` is known weakest against itself.
+
 ## Upstream merged again, and what was held over it (23 Nov, `b35f519`)
 
 Upstream's head `558606d` (eight commits: the raw rewarm, `scan_forms_off_counts_built`, the
