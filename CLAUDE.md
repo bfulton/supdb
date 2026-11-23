@@ -5991,6 +5991,82 @@ passes counted and the work a pass does, and a regime that holds only
 because something was slow is measured with the slowness gone before it
 is called the regime's cost.
 
+**A room that reserved the thing its tenant replaces, and a bind that
+stopped the work that would have made the room.** The row at three
+million keys under 1 GiB read the scan pass after the lag sweep's full
+rewrite at 0.04x of LMDB, 410-520 ms across five sittings where LMDB
+reads 22-24. The block cache's own budget grows into the room the
+partitions leave (`scan_cache_auto_room`), and the room charges every
+unserved partition's whole key section beside the cache, while a block's
+copy stands in for its records for every scan: the first crossing grew
+into the room, the second found none, and the budget bound twenty to
+sixty megabytes short of a copy for every block. A bound cache's fill
+and its conversions stop for the store's life (`maintain_forms`), so a
+quarter of the blocks stood sparse at the pass over records the bound
+had pushed out, one to four thousand sparse walks and half to three
+thousand major faults in 3,000 scans. Three readings came first, each true of the slow reps and
+none their cause: the conversions' reads leaving the raw pages the
+cache's newest, a fix designed and not built; the controller's crossing
+in the middle of the burst; and the memory the jobs' threads leave in
+their arenas, where mapping the jobs' arrays made every block a copy in
+nine reps of twelve -- by lowering the anonymous memory the budget's one
+growth was drawn from, a reading and not the mechanism. What named it
+was removal by arms the tree already had, twelve reps a pairing with the
+counts by rep (`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh A supdb
+3000000 --bound 1073741824 --reps 6 --ops-div 10 --passes load,lag`, at
+`cf8417a`): the controller off read the pass no better, the controller
+off with the jobs mapped 36-54 ms at the median, and the cache's budget
+off (`supdb-cachenoauto`) 30 ms with every block a copy in eleven reps
+of twelve and nothing else changed; and one count split every arm's
+reps before any of it, the forms shed, two thousand a sweep where the
+budget bound and eight where it did not. The cache is granted the raw
+records' place now where the budget would bind and no point read is
+near (`Options::scan_cache_copies_fit`): what the bound leaves once the
+unserved key sections are given up, where a copy of every block fits in
+it, taken back at the first point read (`Shared::points_far`) and held
+to the place as the page cache's budget is read again. Alone it read
+the pass 19-45 ms in twelve reps of twelve and the burst a sixteenth
+slower, and the row's burst there stood level with RocksDB's. The burst
+was the second finding: the store sits at the controller's census from
+its load on, the chain through writes (`merge_chains_writes`) landed
+forty merges in the sweep where the seals' own plans land twenty, and
+every landing leaves its partition's copies without their identity, so
+the settle's patches and the scans' starts search where they had
+indexed -- the upkeep thread's settle 5.9 s of a burst of 9.1 against
+3.6 of 6.7 with the chain off (`supdb-nochainwrites`), and the head
+asks, the other census switch, saved faults and cost nothing
+(`supdb-oocz`). A writer whose forms cover the store walks no piece, so
+the chain runs through a burst only where they do not
+(`Options::merge_chains_writes_uncovered`), which alone did nothing,
+the budget binding and the chain resuming with it. Together, at
+`3f46cb4` (`pair.sh supdb-copiesfitchain supdb` as above): the pass
+15-24 ms in twelve reps of twelve, the burst 7.7 s against 9.1; against
+the comparators in both orders, the burst 1.22-1.24x of RocksDB's and
+the pass 1.08-1.13x of LMDB's, ahead in five pairs of eight, what is
+left of it the first scan's wait for the upkeep thread's pass in
+flight and a merge the idle plan starts beside it. The rules: a budget
+for one tenant is drawn against what the others need given what this
+one holds, since a cache that replaces pages is charged for them twice
+by a room that reserves them; a limit that stops work is read for
+whether the work stopped is the work that would have relieved it; a
+lever that fixes a cell by moving a reading is asked which threshold
+the reading feeds before it is taken for the mechanism, and the arm
+that removes the threshold is paired before anything is built; and a
+cell is read beside every other cell of its pass before one is paid for
+with the other, the burst here a tie nobody had looked at because the
+pass beside it was lost twenty-five times over. Beside it, three things
+the mutants found, twenty-five of them: the model's `check` makes point
+reads, which a test of a store far from them cannot use
+(`check_scans`); a budget held to a place under the budget before its
+grant was reached only by squeezing at the grant itself; and an
+enforcement added on a misread of that case's failure survived its own
+mutant, the patches' shed (`patch_block`) making it already, and came
+out. And the floor under every pairing here: the default paired with
+itself at this rung (`pair.sh supdb supdb` in the same shape, at
+`558606d`) read twelve cells of twenty-nine apart in one direction in
+both orders, by up to 1.39x, so no verdict above rests on a rate that a count beside it
+does not carry.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
