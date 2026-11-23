@@ -349,6 +349,15 @@ struct Cfg {
     /// compact form is installed (`Options::merge_quiet_any_gate`): in half
     /// the seeds that draw the third merge.
     merge_quiet_any: bool,
+    /// A point read takes the common record where it lies
+    /// (`Options::point_fixed`) and reads a store's sources in their
+    /// common shape by the two-source and the layered read
+    /// (`Options::point_lone`): each off in a quarter of the seeds under
+    /// `ZFUZZ_OPTVARY`, the side generator's next two draws, and on
+    /// otherwise, as the engine has them, so the general read is held to
+    /// the model beside the reads that stand in for it.
+    point_fixed: bool,
+    point_lone: bool,
     /// Under `ZFUZZ_STRIDE`, the stride form's steer; `None` without it.
     stride: Option<StrideSteer>,
 }
@@ -641,6 +650,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let (heads_on, land_on) = (side.chance(50), side.chance(50));
     let quiet_on = side.chance(50);
     let quiet_any = side.chance(50);
+    let (fixed_off, lone_off) = (side.chance(25), side.chance(25));
     // A generator of its own, as `side` is, so that the switch moves none
     // of the draws below.
     let stride =
@@ -697,6 +707,8 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         land_bounds: !(vary && land_on),
         merge_quiet: !(vary && quiet_on),
         merge_quiet_any: vary && !quiet_on && quiet_any,
+        point_fixed: !(vary && fixed_off),
+        point_lone: !(vary && lone_off),
         stride,
     }
 }
@@ -729,6 +741,8 @@ fn opts(c: &Cfg) -> Options {
         land_bounds_read: c.land_bounds,
         merge_parallel_quiet: if c.merge_quiet { 3 } else { 0 },
         merge_quiet_any_gate: c.merge_quiet_any,
+        point_fixed: c.point_fixed,
+        point_lone: c.point_lone,
         promote_starts: c.hot_starts,
         zpages_store_all: c.store_all,
         scan_start_cache: if c.start_cache { 4096 } else { 0 },

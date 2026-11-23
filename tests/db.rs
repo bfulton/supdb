@@ -2338,6 +2338,224 @@ fn a_point_read_hashed_once_answers_as_one_hashed_per_source() {
     }
 }
 
+/// `Options::point_fixed` and `Options::point_lone` change the path a point
+/// read takes and nothing it returns: the fixture's store -- a partition, a
+/// piece with tombstones and a live table over both -- read with each of
+/// the four settings through the writer and through a handle answers every
+/// probe as the model does, with a table frozen in a held seal between the
+/// piece and the live table, after the seal lands, and after a flush has
+/// folded everything into the partition, with nothing unsealed and then
+/// with puts and deletes over it. The counts say which read answered: the
+/// layered one while a piece or a frozen table stands, the two-source one
+/// over the partition alone, and neither with the option off -- a store
+/// read by the general path alone would pass every comparison here.
+#[test]
+fn a_lean_point_read_answers_as_the_general_one() {
+    let d = Options::default();
+    assert!(d.point_fixed && d.point_lone, "the default");
+    for shape in [
+        OrdShape::Short,
+        OrdShape::Mixed,
+        OrdShape::Wide,
+        OrdShape::Binary,
+    ] {
+        for (fixed, lone) in [(true, true), (true, false), (false, true), (false, false)] {
+            let name = format!("leanread-{shape:?}-{fixed}-{lone}");
+            let mut fx = ord_fixture_with(
+                &name,
+                shape,
+                Options {
+                    point_fixed: fixed,
+                    point_lone: lone,
+                    ..common::options()
+                },
+            );
+            let key = |k: u32| ord_key(shape, k);
+            let show = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
+            let probes = ord_probes(shape);
+            // Every probe through the writer and through a handle, and what
+            // the two made of them: (two-source, layered) reads.
+            let check = |fx: &OrdFixture, when: &str| -> (u64, u64) {
+                let h = fx.db.reader().unwrap();
+                let before = fx.db.point_lean_reads();
+                for p in &probes {
+                    let want = fx.model.get(p).cloned().unwrap_or_default();
+                    assert_eq!(read_vec(&fx.db, p), want, "{name} {when}: {}", show(p));
+                    assert_eq!(
+                        read_vec(&h, p),
+                        want,
+                        "{name} {when}, a handle: {}",
+                        show(p)
+                    );
+                }
+                let after = fx.db.point_lean_reads();
+                assert_eq!(
+                    h.point_lean_reads(),
+                    (after.0 - before.0, after.1 - before.1),
+                    "{name} {when}: a handle takes the path the writer takes"
+                );
+                (after.0 - before.0, after.1 - before.1)
+            };
+            let reads = probes.len() as u64;
+            // Which read a store may take: both options, or neither path.
+            // And neither where the compact form is forced, as the stride
+            // switch forces it (`common::stride_switch`): a partition a
+            // form file may serve is dispatched by the general read, so
+            // there the four settings are held to the model alone.
+            let lean = fixed && lone && !common::stride_switch();
+            // A partition, a piece and the live table: the layered read,
+            // for every key whose records are the common shape.
+            let (two, layered) = check(&fx, "over a piece");
+            assert_eq!(two, 0, "{name}: a piece stands");
+            if lean {
+                assert!(
+                    layered * 2 > reads,
+                    "{name}: {layered} of {reads} reads layered"
+                );
+            } else {
+                assert_eq!(layered, 0, "{name}: the option is off");
+            }
+            // A table frozen in a seal that does not land, and a live table
+            // over it with tombstones over all four sources and values
+            // after some. Three values on some keys of the table about to
+            // freeze and three on some keys of the live one after it, since
+            // a chain is read newest first and handed over oldest first,
+            // and a chain of one value reads the same either way.
+            for k in (2u32..4_010).step_by(11) {
+                for i in 0..3 {
+                    let v = format!("v3{i}-{k}").into_bytes();
+                    fx.db.append(&key(k), &v);
+                    fx.model.entry(key(k)).or_default().push(v);
+                }
+            }
+            fx.db.commit().unwrap();
+            fx.db.hold_seal_landing(true);
+            fx.db.seal().unwrap();
+            assert!(fx.db.frozen_tables() >= 1, "{name}: a frozen table");
+            for k in (1u32..4_010).step_by(9) {
+                if k.is_multiple_of(2) {
+                    fx.db.delete(&key(k));
+                    fx.model.insert(key(k), Vec::new());
+                } else {
+                    let v = format!("v4-{k}").into_bytes();
+                    fx.db.append(&key(k), &v);
+                    fx.model.entry(key(k)).or_default().push(v);
+                }
+            }
+            for k in (3u32..4_010).step_by(13) {
+                for i in 0..3 {
+                    let v = format!("v4{i}-{k}").into_bytes();
+                    fx.db.append(&key(k), &v);
+                    fx.model.entry(key(k)).or_default().push(v);
+                }
+            }
+            fx.db.commit().unwrap();
+            let (two, layered) = check(&fx, "with the seal held");
+            assert_eq!(two, 0, "{name}: a frozen table stands");
+            assert_eq!(layered > 0, lean, "{name}: with the seal held");
+            // A second table frozen behind the first, with a value on keys
+            // the first holds three of: the frozen tables are read newest
+            // first and their values handed over oldest table first.
+            for k in (2u32..4_010).step_by(11) {
+                let v = format!("v6-{k}").into_bytes();
+                fx.db.append(&key(k), &v);
+                fx.model.entry(key(k)).or_default().push(v);
+            }
+            fx.db.commit().unwrap();
+            fx.db.seal().unwrap();
+            assert!(fx.db.frozen_tables() >= 2, "{name}: two frozen tables");
+            let (two, layered) = check(&fx, "with two seals held");
+            assert_eq!(two, 0, "{name}: two frozen tables stand");
+            assert_eq!(layered > 0, lean, "{name}: with two seals held");
+            // Writes staged and not committed: the writer reads its own,
+            // and a handle reads the store as the last commit left it. On
+            // keys the live table holds a committed value of, so that the
+            // staged one is a chunk past the handle's watermark on a chain
+            // it reads, and on keys it does not, whose entry is one past
+            // the handle's count.
+            {
+                let staged: Vec<u32> = (5u32..4_010).step_by(17).collect();
+                for &k in staged.iter().step_by(2) {
+                    let v = format!("v7a-{k}").into_bytes();
+                    fx.db.append(&key(k), &v);
+                    fx.model.entry(key(k)).or_default().push(v);
+                }
+                fx.db.commit().unwrap();
+                let h = fx.db.reader().unwrap();
+                for &k in &staged {
+                    fx.db.append(&key(k), format!("v7-{k}").as_bytes());
+                }
+                for &k in &staged {
+                    let before = fx.model.get(&key(k)).cloned().unwrap_or_default();
+                    assert_eq!(
+                        read_vec(&h, &key(k)),
+                        before,
+                        "{name}: a handle beside a staged write of {k}"
+                    );
+                    let mut own = before;
+                    own.push(format!("v7-{k}").into_bytes());
+                    assert_eq!(
+                        read_vec(&fx.db, &key(k)),
+                        own,
+                        "{name}: the writer's own staged write of {k}"
+                    );
+                }
+                fx.db.commit().unwrap();
+                for &k in &staged {
+                    fx.model
+                        .entry(key(k))
+                        .or_default()
+                        .push(format!("v7-{k}").into_bytes());
+                }
+            }
+            fx.db.hold_seal_landing(false);
+            fx.db.settle().unwrap();
+            let (_, layered) = check(&fx, "after the landing");
+            assert_eq!(layered > 0, lean, "{name}: after the landing");
+            // Everything folded into the partition: one source.
+            fx.db.flush().unwrap();
+            fx.db.settle().unwrap();
+            assert_eq!(fx.db.levels().1, 0, "{name}: no piece after the flush");
+            let (two, layered) = check(&fx, "over the partitions alone");
+            assert_eq!(layered, 0, "{name}: no piece and no frozen table");
+            if lean {
+                assert!(two * 2 > reads, "{name}: {two} of {reads} reads two-source");
+            } else {
+                assert_eq!(two, 0, "{name}: the option is off");
+            }
+            // And the live table over it: a put, a delete, an append and a
+            // key nothing held.
+            for k in (0u32..4_020).step_by(7) {
+                match k % 4 {
+                    0 => {
+                        let v = format!("v5-{k}").into_bytes();
+                        fx.db.put(&key(k), &v);
+                        fx.model.insert(key(k), vec![v]);
+                    }
+                    1 => {
+                        fx.db.delete(&key(k));
+                        fx.model.insert(key(k), Vec::new());
+                    }
+                    _ => {
+                        // Two values, for the order a chain is handed
+                        // over in.
+                        for i in 0..2 {
+                            let v = format!("v5{i}-{k}").into_bytes();
+                            fx.db.append(&key(k), &v);
+                            fx.model.entry(key(k)).or_default().push(v);
+                        }
+                    }
+                }
+            }
+            fx.db.commit().unwrap();
+            let (two, layered) = check(&fx, "under a live table");
+            assert_eq!(layered, 0, "{name}: no piece under the live table");
+            assert_eq!(two > 0, lean, "{name}: under a live table");
+            fx.db.close().unwrap();
+        }
+    }
+}
+
 /// The same store read with the option and without answers every key as
 /// the model does -- the partition's values, the piece's, the memtable's,
 /// tombstones over each, keys of several values, empty values and values

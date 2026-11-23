@@ -1419,6 +1419,15 @@ pub struct Supdb {
     /// again after its tombstone pass (`Options::read_probes_once` off):
     /// `supdb-probestwice` and `supdb-ingestprobestwice`.
     probestwice: bool,
+    /// A point read of every record through its extents, the common
+    /// record rebuilt as one too (`Options::point_fixed` off, which takes
+    /// the reads that stand on it with it): `supdb-pointexts` and
+    /// `supdb-ingestpointexts`.
+    pointexts: bool,
+    /// A point read of every store by the general read of its sources,
+    /// the two-source and the layered reads off (`Options::point_lone`
+    /// off): `supdb-pointsources` and `supdb-ingestpointsources`.
+    pointsources: bool,
     /// EXPERIMENT: the deltas from which the upkeep thread converts a sparse
     /// form the walks have read `CONVREADS` entries of to a copy
     /// (`Options::forms_convert_from`, `forms_convert_reads`), from
@@ -2764,6 +2773,10 @@ struct Policy {
     pacesyncsthresholds: bool,
     /// Every source probed again after the tombstone pass: `...probestwice`.
     probestwice: bool,
+    /// Every record read through its extents: `...pointexts`.
+    pointexts: bool,
+    /// Every point read the general one: `...pointsources`.
+    pointsources: bool,
     /// A filed burst's builds in the commit: `...settlebuildsfiled`.
     settlebuildsfiled: bool,
     /// The walk's own decodes: `supdb-zwalkowns`.
@@ -3338,6 +3351,8 @@ impl Default for Policy {
             pacesyncsbatch: false,
             pacesyncsthresholds: false,
             probestwice: false,
+            pointexts: false,
+            pointsources: false,
             settlebuildsfiled: false,
             zwalkowns: false,
             zviewperopen: false,
@@ -9995,6 +10010,8 @@ impl Supdb {
             pacesyncsbatch,
             pacesyncsthresholds,
             probestwice,
+            pointexts,
+            pointsources,
             settlebuildsfiled,
             zwalkowns,
             zviewperopen,
@@ -10623,6 +10640,8 @@ impl Supdb {
             upkeep_pace_syncs_to_share: !pacesyncsbatch,
             upkeep_pace_syncs_model: !pacesyncsbatch && !pacesyncsthresholds,
             read_probes_once: !probestwice,
+            point_fixed: !pointexts,
+            point_lone: !pointsources,
             forms_settle_builds_filed: settlebuildsfiled,
             zpages_rewarm_quiet_ms: if zrewarmwait {
                 supdb::db::REWARM_QUIET_BEFORE_MS
@@ -10994,6 +11013,8 @@ impl Supdb {
             pacesyncsbatch,
             pacesyncsthresholds,
             probestwice,
+            pointexts,
+            pointsources,
             settlebuildsfiled,
             zwalkowns,
             zviewperopen,
@@ -11166,9 +11187,7 @@ impl ThreadWriter for SupdbWriter<'_> {
             .db
             .lock()
             .map_err(|_| "a writer thread panicked holding the store".to_string())?;
-        for &(k, v) in items {
-            db.put(k, v);
-        }
+        db.put_batch(items);
         db.commit().map_err(|e| e.to_string())
     }
 }
@@ -11915,6 +11934,20 @@ impl Engine for Supdb {
                 "supdb-probestwice"
             } else {
                 "supdb-ingestprobestwice"
+            };
+        }
+        if self.pointexts {
+            return if self.partition {
+                "supdb-pointexts"
+            } else {
+                "supdb-ingestpointexts"
+            };
+        }
+        if self.pointsources {
+            return if self.partition {
+                "supdb-pointsources"
+            } else {
+                "supdb-ingestpointsources"
             };
         }
         if self.widewalks {
@@ -12799,9 +12832,9 @@ impl Engine for Supdb {
     }
     fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
         let db = self.db.as_mut().ok_or("db closed")?;
-        for &(k, v) in items {
-            db.put(k, v);
-        }
+        // One call for the batch, as `write_batch` makes of a load's: the
+        // store pins once for all of it (`Db::put_batch`).
+        db.put_batch(items);
         db.commit().map_err(|e| e.to_string())
     }
     fn stage_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
@@ -14761,6 +14794,10 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-pacesyncsthresholds"
         | "supdb-probestwice"
         | "supdb-ingestprobestwice"
+        | "supdb-pointexts"
+        | "supdb-ingestpointexts"
+        | "supdb-pointsources"
+        | "supdb-ingestpointsources"
         | "supdb-settlebuildsfiled"
         | "supdb-ingestsettlebuildsfiled"
         | "supdb-ingestpromote"
@@ -15501,6 +15538,58 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         partition: false,
                         durable: false,
                         probestwice: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-pointexts" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        pointexts: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestpointexts" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        pointexts: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-pointsources" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        pointsources: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestpointsources" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        pointsources: true,
                         ..Policy::default()
                     },
                 )
@@ -18480,6 +18569,36 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.read_probes_once && b.read_probes_once);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("pointexts"),
+                    Policy {
+                        pointexts: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-pointexts");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.point_fixed && b.point_fixed);
+                assert!(o.point_lone, "the one option moved");
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("pointsources"),
+                    Policy {
+                        pointsources: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-pointsources");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.point_lone && b.point_lone);
+                assert!(o.point_fixed, "the one option moved");
             }
             {
                 let z = Supdb::with_policy(

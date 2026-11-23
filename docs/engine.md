@@ -356,6 +356,92 @@ background threads) its read moved 1.19x and its scan 1.09x at 1M keys,
 so the pair reads **6.45x** and scans **4.70x** either way; the load stays
 at 0.688x, the shuffled load a tie.
 
+### Point gets and puts beside FASTER
+
+FASTER is the store the suite sets beside the buffered group for point
+operations alone (`bench/DESIGN.md`, the arms): a hash index over a log
+updated in place, with no write-ahead log, no ordered scan and a write that
+is in the process's memory until a checkpoint. In the first row that
+carried it, it led every point-read and write-mix cell and trailed only the
+loads. `bench ab --arms supdb-ingest,faster` reproduces the row's cells in
+one process, and under `SUPDB_MIX_KINDS=1` splits each mix into its gets
+and its commits; `bench/examples/point_ops.rs` runs the operations a mix is
+made of with the key generator out of the loop, one function a phase, which
+callgrind toggles on:
+
+    valgrind --tool=callgrind --collect-atstart=no \
+      --toggle-collect='point_ops::phase_reads_clean' \
+      bench/target/release/examples/point_ops supdb-ingest 100000 1 zipf 1
+
+and the same with `faster` for the arm, and `phase_updates`,
+`phase_reads_dirty` and `phase_half` for the phase. Counted so at a hundred
+thousand keys, a get over a store just loaded was 959 instructions against
+FASTER's 415, a get after a sixth of the store was rewritten 1,476 against
+417, and an update 1,213 against 555: two to three and a half times the
+instructions, over the same two dependent misses a get takes in either
+store (the slot and the record; the bucket and the record). No one function
+held them. The read was written for a key in any number of sources, each in
+any record shape, and with one source in the common shape it still set
+every layer up:
+
+- the record's extent rebuilt from its header, handed up and its run walked
+  by it, where the scan's walk had read the common record in place since
+  `compact_fixed_at`: 354 instructions. A point read takes the common
+  record's values where they lie (`Options::point_fixed`,
+  `FlatIndex::find_fixed_hashed`).
+- the multi-source machinery around one source: the tombstone pass and its
+  record of what it probed, the pieces over the range found by two
+  searches of an empty list, the frozen tables' loop set up, the
+  partition's read through a closure of six captures. A store whose
+  sources are its partition and the live table is read by those two alone
+  (`Options::point_lone`, `Reader::read_lone`), and one with pieces or
+  frozen tables in one newest-first pass that keeps what it finds on its
+  own frame (`Reader::read_layers`), where the general read asked each
+  source twice or carried the answers in a structure a single-source read
+  built too, and allocated a vector for a chain of one value.
+- bookkeeping at every read's edges: the read-mode note copied out of its
+  cell and back for one count, the advice asked through a call, the
+  sweeps' frames inlined into every unpin, a sixteen-byte key hashed by a
+  loop over a slice's length and compared through the library's compare.
+
+A put was the same shape on the write side: a pin and an unpin a record
+where a batch needs one (`Db::put_batch`), its two log frames grown seven
+`Vec` extensions each (`wal_record`), a tombstone and a value reserved and
+written by five calls where one reservation holds both
+(`MemTable::push_tomb_chunk`), and three or four locked adds a put to
+counters only the writer writes.
+
+With those, the same counts read 539 for the clean get and 979 for the
+update, and paired in the suite at a hundred thousand keys the read pass,
+the threaded reads and the read-only mix went from behind FASTER to level
+with it, with the write mixes still behind (`bench/scripts/pair.sh
+supdb-ingest faster 100000 --passes
+load,read,read-threaded,mixes,mixes-scrambled`). `supdb-pointexts` and
+`supdb-pointsources`, and their `supdb-ingest` siblings, are the reads
+before.
+
+Two readings on the way were wrong and are kept here so they are not made
+again. The pin is a locked store on every read, a full fence FASTER's reads
+do not have, and it was taken for what kept consecutive reads' misses from
+overlapping; the arm without the fence (`supdb-asympin`) read level with
+the default at 959 instructions and again at 530, in both sittings each.
+And a count taken under callgrind is of the store the slowed clock makes:
+an idle seal fired inside the phase after the updates, the gets went
+through a piece that the native run does not have, and the counts of that
+phase moved by a fifth between builds with nothing changed in its path.
+The store's shape is read natively before a phase's count is believed
+(`POINT_OPS_SHAPE=1`), and the counts quoted here are of the two phases
+whose store the clock does not shape.
+
+What is left is the write path and the gets beside it. A get of a key the
+live table holds reads the table's slot, its entry, its key and its chunk,
+four places where FASTER reads two, and a key in no table pays a slot and
+a filter line before the partition; a put appends to a log the kernel
+holds, a hundred nanoseconds of the kernel's a put in the profile of the A
+mix where FASTER makes no call, and first-touches fresh arena pages where
+FASTER rewrites a record in place. Those are the structures to change
+next, and none of them is a path to shorten.
+
 ### The seal wait
 
 `Db::seal_waits` splits the seal phase the commit thread pays. Under

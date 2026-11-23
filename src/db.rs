@@ -1528,6 +1528,52 @@ pub struct Options {
     /// Off, the value pass probes every source again, the shape before:
     /// `supdb-probestwice`, and `supdb-ingestprobestwice` buffered.
     pub read_probes_once: bool,
+    /// A point read takes a key's values from its record where it lies,
+    /// where the record is the common one -- the compact record with a
+    /// fixed run, the shipped writer's for values of one width
+    /// (`FlatIndex::read_fixed_hashed`) -- and reads every other record
+    /// through its extents as before. The general read rebuilds the
+    /// record's extent from its header, hands it up and walks the run by
+    /// it (`with_lookup_hashed`, `Blob::read_exts`), layers a scan's walk
+    /// had been spared since `compact_fixed_at` and the point read had
+    /// not: 354 instructions of a get's 959 over a store just loaded,
+    /// against FASTER's 415 for the whole get, by callgrind at a hundred
+    /// thousand keys (`bench/examples/point_ops.rs`). The values are the
+    /// same bytes in the same order. Needs `read_hash_once`. Off, every
+    /// record is read through its extents: `supdb-pointexts`, and
+    /// `supdb-ingestpointexts` buffered.
+    pub point_fixed: bool,
+    /// A point read of a store whose sources hold the key in their common
+    /// shape reads them in one pass, newest first, on its own frame. Two
+    /// reads stand in for the general one. A store with no frozen table
+    /// and no level-0 piece, which is every store between a drain and the
+    /// next seal, is read as its partition and the live table alone
+    /// (`Reader::read_lone`): the key hashed once, the live table's chain
+    /// for it read once to its newest tombstone, the partition found by
+    /// its fence and the record read where no tombstone masks it. A store
+    /// with pieces or frozen tables is read the same way over each of them
+    /// (`Reader::read_layers`), a piece asked once for its record, which
+    /// is kept. The general read is written for a key in any number of
+    /// sources in any record shape: the newest tombstone found by a pass
+    /// of its own, what it probed carried in a structure, the pieces over
+    /// the range found by two searches, the frozen tables and the live one
+    /// each asked in turn, a chain's offsets in a vector; with one source
+    /// it still set each of those up, about three hundred instructions of
+    /// a get's 747 over a store just loaded once the record was read in
+    /// place (`point_fixed`), by callgrind at a hundred thousand keys
+    /// (`bench/examples/point_ops.rs`). The same values in the same order:
+    /// the newest tombstone the pass finds is the newest of the read's
+    /// sources, and with none the partition's values come first. A
+    /// partition a form file may serve, a run of ordered ingest in
+    /// progress, a store with no partition yet, a chain of more live
+    /// values than the read's frame holds, a range under more pieces than
+    /// it holds, a record of another shape in a piece and a store under
+    /// any option that reads a partition another way (`point_via_ord`,
+    /// `exts_by_value`) take the general read; `Reader::point_lean_reads`
+    /// counts the reads that did not. Needs `read_hash_once` and
+    /// `point_fixed`. Off: `supdb-pointsources`, and
+    /// `supdb-ingestpointsources` buffered.
+    pub point_lone: bool,
     /// EXPERIMENT: a point read of a partition whose ordered index holds
     /// whole keys (`OrdIndex::uniform`: every key one length, no longer
     /// than the common prefix and eight bytes) finds its rank through the
@@ -6866,6 +6912,18 @@ pub struct Options {
 }
 
 impl Options {
+    /// Whether a point read takes the two-source or the layered read
+    /// where the store allows one (`point_lone`): the option, the two it
+    /// needs, and none of the arms that read a partition another way.
+    #[inline(always)]
+    fn point_lone_on(&self) -> bool {
+        self.point_lone
+            && self.point_fixed
+            && self.read_hash_once
+            && !self.exts_by_value
+            && !self.point_via_ord
+    }
+
     /// Whether the store keeps `Shared::points_far`, for the options that
     /// read it: `scan_cache_copies_fit` and `merge_chains_writes_uncovered`.
     fn tracks_points(&self) -> bool {
@@ -7045,6 +7103,8 @@ impl Default for Options {
             asym_pins: false,
             exts_by_value: false,
             read_hash_once: true,
+            point_fixed: true,
+            point_lone: true,
             read_lines_ahead: true,
             read_probes_once: true,
             point_via_ord: false,
@@ -7598,6 +7658,91 @@ const WAL_PUT: u8 = 0;
 const WAL_DEL: u8 = 1;
 const WAL_COMMIT: u8 = 2;
 
+/// One frame appended to `pending` (`Wal::frame` says the layout), under
+/// sequence number `seq` and the log's CRC seed: the commit frame's
+/// builder, and the definition a record frame written in one reservation
+/// is held to (`wal_record`).
+fn wal_frame(pending: &mut Vec<u8>, seq: u64, seed: u32, kind: u8, key: &[u8], value: &[u8]) {
+    // `pending` holds exactly this batch's record frames: `write`
+    // empties it at every commit.
+    let batch_crc = if kind == WAL_COMMIT {
+        crc32(pending) ^ seed
+    } else {
+        0
+    };
+    let body_at = pending.len() + FRAME_HEADER;
+    pending.extend_from_slice(&[0u8; FRAME_HEADER]);
+    pending.extend_from_slice(&seq.to_le_bytes());
+    pending.push(kind);
+    if kind == WAL_COMMIT {
+        pending.extend_from_slice(&batch_crc.to_le_bytes());
+    } else {
+        put_uvarint(pending, key.len() as u64);
+        pending.extend_from_slice(key);
+        if kind == WAL_PUT {
+            pending.extend_from_slice(value);
+        }
+    }
+    let body_len = (pending.len() - body_at) as u32;
+    let crc = if kind == WAL_COMMIT {
+        crc32(&pending[body_at..]) ^ seed
+    } else {
+        0
+    };
+    pending[body_at - 8..body_at - 4].copy_from_slice(&body_len.to_le_bytes());
+    pending[body_at - 4..body_at].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// A record frame of `Wal::frame`'s layout appended to `pending`, byte for
+/// byte what `frame` makes of the same record under sequence number `seq`:
+/// `value` is a put's and empty for a delete. One reservation and the bytes
+/// written where they go, where `frame` grew the buffer seven times a
+/// record and patched its head: 195 instructions a put's two frames, of
+/// 1,213 (callgrind, `bench/examples/point_ops.rs`).
+#[inline]
+fn wal_record(pending: &mut Vec<u8>, seq: u64, kind: u8, key: &[u8], value: &[u8]) {
+    debug_assert!(kind == WAL_PUT || (kind == WAL_DEL && value.is_empty()));
+    let klen = key.len();
+    // The key length's uvarint, as `put_uvarint` writes it.
+    let mut var = [0u8; 10];
+    let mut vn = 0;
+    let mut v = klen as u64;
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            var[vn] = b;
+            vn += 1;
+            break;
+        }
+        var[vn] = b | 0x80;
+        vn += 1;
+    }
+    let body = 8 + 1 + vn + klen + value.len();
+    let total = FRAME_HEADER + body;
+    pending.reserve(total);
+    let at = pending.len();
+    // SAFETY: `total` bytes past the length are reserved above, and every
+    // one of them is written below before the length covers it; the
+    // sources are slices that cannot overlap the vector's spare capacity.
+    unsafe {
+        let p = pending.as_mut_ptr().add(at);
+        std::ptr::copy_nonoverlapping((body as u32).to_le_bytes().as_ptr(), p, 4);
+        // A record frame's CRC word is zero: the batch's is the commit
+        // frame's.
+        std::ptr::write_bytes(p.add(4), 0, 4);
+        std::ptr::copy_nonoverlapping(seq.to_le_bytes().as_ptr(), p.add(8), 8);
+        p.add(16).write(kind);
+        let mut q = p.add(17);
+        std::ptr::copy_nonoverlapping(var.as_ptr(), q, vn);
+        q = q.add(vn);
+        std::ptr::copy_nonoverlapping(key.as_ptr(), q, klen);
+        q = q.add(klen);
+        std::ptr::copy_nonoverlapping(value.as_ptr(), q, value.len());
+        pending.set_len(at + total);
+    }
+}
+
 /// A helper still writing the reach joined at the file's close, since a
 /// closed file is a spare to recycle, and a helper still writing zeros into
 /// a recycled file would write them over its next life's frames
@@ -7830,43 +7975,23 @@ impl Wal {
     /// frame bought, at one CRC setup and finish per batch instead of per
     /// record: 92 of the 677 instructions a record cost.
     fn frame(&mut self, kind: u8, key: &[u8], value: &[u8]) {
-        // `pending` holds exactly this batch's record frames: `write`
-        // empties it at every commit.
-        let batch_crc = if kind == WAL_COMMIT {
-            crc32(&self.pending) ^ self.seed
-        } else {
-            0
-        };
-        let body_at = self.pending.len() + FRAME_HEADER;
-        self.pending.extend_from_slice(&[0u8; FRAME_HEADER]);
-        self.pending.extend_from_slice(&self.seq.to_le_bytes());
-        self.pending.push(kind);
-        if kind == WAL_COMMIT {
-            self.pending.extend_from_slice(&batch_crc.to_le_bytes());
-        } else {
-            put_uvarint(&mut self.pending, key.len() as u64);
-            self.pending.extend_from_slice(key);
-            if kind == WAL_PUT {
-                self.pending.extend_from_slice(value);
-            }
-        }
-        let body_len = (self.pending.len() - body_at) as u32;
-        let crc = if kind == WAL_COMMIT {
-            crc32(&self.pending[body_at..]) ^ self.seed
-        } else {
-            0
-        };
-        self.pending[body_at - 8..body_at - 4].copy_from_slice(&body_len.to_le_bytes());
-        self.pending[body_at - 4..body_at].copy_from_slice(&crc.to_le_bytes());
+        wal_frame(&mut self.pending, self.seq, self.seed, kind, key, value);
+        self.seq += 1;
+    }
+
+    /// A record frame appended to `pending` (`wal_record`).
+    #[inline]
+    fn record(&mut self, kind: u8, key: &[u8], value: &[u8]) {
+        wal_record(&mut self.pending, self.seq, kind, key, value);
         self.seq += 1;
     }
 
     fn append(&mut self, key: &[u8], value: &[u8]) {
-        self.frame(WAL_PUT, key, value);
+        self.record(WAL_PUT, key, value);
     }
 
     fn delete(&mut self, key: &[u8]) {
-        self.frame(WAL_DEL, key, &[]);
+        self.record(WAL_DEL, key, &[]);
     }
 
     /// Close the batch: a commit frame after its records, so replay applies
@@ -13066,7 +13191,7 @@ impl Seg {
 
     /// `may_hold` for a key whose FNV word (`flatindex::key_hash`) the
     /// caller has taken (`Options::read_hash_once`).
-    #[inline]
+    #[inline(always)]
     fn may_hold_fnv(&self, key: &[u8], fnv: u64) -> bool {
         if self.below_lo(key) {
             return false;
@@ -13456,6 +13581,15 @@ fn slot_of(hash: u64, mask: usize) -> usize {
 
 const NO_CHUNK: u64 = u64::MAX;
 
+/// The live chunks of a key a point read holds on its own frame
+/// (`MemTable::live_offs_small`).
+const LIVE_SMALL: usize = 8;
+
+/// The pieces over a range a point read keeps the records of on its own
+/// frame (`Reader::read_layers`); a range under more takes the general
+/// read.
+const LAYERS_PIECES: usize = 8;
+
 /// No watermark: every chunk in a chain is visible, committed or not.
 const SEE_ALL: u64 = u64::MAX;
 
@@ -13808,7 +13942,12 @@ impl ByteArena {
         }
         let off = t.at;
         t.at += n;
-        self.used.fetch_add(n, AtomicOrdering::Relaxed);
+        // One writer, so a load and a store: the locked add was twenty
+        // cycles a reservation, three or four a put.
+        self.used.store(
+            self.used.load(AtomicOrdering::Relaxed) + n,
+            AtomicOrdering::Relaxed,
+        );
         off
     }
 
@@ -13857,7 +13996,12 @@ impl ByteArena {
                 t.at - t.block_start,
             );
         }
-        self.used.fetch_add(n, AtomicOrdering::Relaxed);
+        // One writer, so a load and a store: the locked add was twenty
+        // cycles a reservation, three or four a put.
+        self.used.store(
+            self.used.load(AtomicOrdering::Relaxed) + n,
+            AtomicOrdering::Relaxed,
+        );
         off
     }
 
@@ -13966,6 +14110,11 @@ impl ByteArena {
         unsafe { (*self.tail.get()).at }
     }
 
+    // Inlined: a dozen instructions that every read of a key, a chunk's
+    // header or a value makes, and a call each, six or seven a point read
+    // of an unsealed key and twelve a put, 94 and 162 instructions by
+    // callgrind (`bench/examples/point_ops.rs`).
+    #[inline]
     fn block(&self, off: usize, len: usize) -> (*mut u8, usize) {
         let b = off >> self.shift;
         let w = off & (self.block_len() - 1);
@@ -13979,6 +14128,17 @@ impl ByteArena {
             "memtable arena: a read past its block"
         );
         (p, w)
+    }
+
+    /// Writer: a reserved range at `off`, `len` long, handed to `f` to
+    /// fill: one block lookup for a chunk's header and its value, where a
+    /// `write` each was three.
+    #[inline]
+    fn fill(&self, off: usize, len: usize, f: impl FnOnce(&mut [u8])) {
+        let (p, w) = self.block(off, len);
+        // SAFETY: inside the block, a range this writer reserved and no
+        // reader can reach until it is published, borrowed for the call.
+        f(unsafe { std::slice::from_raw_parts_mut(p.add(w), len) })
     }
 
     /// Writer: `bytes` into a reserved range at `off`.
@@ -15109,7 +15269,10 @@ impl MemTable {
             e.head.store(off + 1, AtomicOrdering::Release);
             match value {
                 Some(_) => {
-                    e.count.fetch_add(1, AtomicOrdering::Relaxed);
+                    e.count.store(
+                        e.count.load(AtomicOrdering::Relaxed) + 1,
+                        AtomicOrdering::Relaxed,
+                    );
                 }
                 None => e.count.store(0, AtomicOrdering::Relaxed),
             }
@@ -15132,8 +15295,7 @@ impl MemTable {
         assert!(!self.ordered, "a put never reaches an ordered memtable");
         if let Some(id) = self.probe(hash, key) {
             let e = self.fat(id);
-            let tomb = self.push_tomb(e.chain_head());
-            let off = self.push_chunk(tomb, value);
+            let off = self.push_tomb_chunk(e.chain_head(), value);
             e.head.store(off + 1, AtomicOrdering::Release);
             e.count.store(1, AtomicOrdering::Relaxed);
             self.log_write(id, false);
@@ -15560,8 +15722,40 @@ impl MemTable {
         let off = self.vals.reserve(CHUNK_HDR);
         self.vals.write(off, &prev.to_le_bytes());
         self.vals.write(off + 8, &TOMB_LEN.to_le_bytes());
-        self.tombs.fetch_add(1, AtomicOrdering::Relaxed);
+        self.note_tomb();
         off as u64
+    }
+
+    /// Writer: one more tombstone in the table. A load and a store, the
+    /// table having one writer.
+    #[inline]
+    fn note_tomb(&self) {
+        self.tombs.store(
+            self.tombs.load(AtomicOrdering::Relaxed) + 1,
+            AtomicOrdering::Relaxed,
+        );
+    }
+
+    /// Writer: a tombstone over `prev` and `value` over the tombstone, the
+    /// two chunks a put makes of a key the table holds, in one
+    /// reservation and one block lookup; the value's chunk is returned,
+    /// the tombstone the header's length before it. What `push_tomb` and
+    /// then `push_chunk` lay down, except that the two are never parted
+    /// by a block's end.
+    fn push_tomb_chunk(&self, prev: u64, value: &[u8]) -> u64 {
+        debug_assert!(!self.refs && !self.stream, "a hashed table's chunks");
+        let len = 2 * CHUNK_HDR + value.len();
+        let off = self.vals.reserve(len);
+        let chunk = (off + CHUNK_HDR) as u64;
+        self.vals.fill(off, len, |b| {
+            b[..8].copy_from_slice(&prev.to_le_bytes());
+            b[8..CHUNK_HDR].copy_from_slice(&TOMB_LEN.to_le_bytes());
+            b[CHUNK_HDR..CHUNK_HDR + 8].copy_from_slice(&(off as u64).to_le_bytes());
+            b[CHUNK_HDR + 8..2 * CHUNK_HDR].copy_from_slice(&(value.len() as u32).to_le_bytes());
+            b[2 * CHUNK_HDR..].copy_from_slice(value);
+        });
+        self.note_tomb();
+        chunk
     }
 
     /// A tagged head's arena and the offset in it (`refs` only).
@@ -15777,6 +15971,39 @@ impl MemTable {
         tomb
     }
 
+    /// `live_offs_into` for a short chain, into a buffer on the caller's
+    /// frame: the live chunks newest first in `buf`, how many, and whether
+    /// a tombstone cut the chain; `None` for a chain of more live chunks
+    /// than `buf` holds, which `live_chain` reads. A key written by `put`
+    /// has one, and a point read of it allocated and freed a vector for
+    /// that one offset, 49 instructions of the allocator's by callgrind.
+    #[inline]
+    fn live_offs_small(
+        &self,
+        e: Entry<'_>,
+        wm: u64,
+        buf: &mut [usize; LIVE_SMALL],
+    ) -> Option<(usize, bool)> {
+        let mut at = MemTable::head(e);
+        let mut n = 0;
+        while at != NO_CHUNK {
+            if at >= wm {
+                at = self.chunk_prev(at);
+                continue;
+            }
+            if self.is_tomb(at) {
+                return Some((n, true));
+            }
+            if n == LIVE_SMALL {
+                return None;
+            }
+            buf[n] = at as usize;
+            n += 1;
+            at = self.chunk_prev(at);
+        }
+        Some((n, false))
+    }
+
     /// Whether a tombstone sits anywhere in the key's chain below `wm`.
     fn has_tomb(&self, e: Entry<'_>, wm: u64) -> bool {
         let mut at = MemTable::head(e);
@@ -15914,7 +16141,7 @@ impl MemTable {
             if s >> 32 == hash >> 32 {
                 let id = ((s & 0xffff_ffff) - 1) as usize;
                 let e = self.entry(id);
-                if self.key_of(e) == key {
+                if crate::flatindex::key_eq(self.key_of(e), key) {
                     return Some(id);
                 }
             }
@@ -21408,6 +21635,12 @@ pub struct Reader {
     /// ones: a count every reader thread bumped on one line is what the
     /// threaded cells it is meant to be read beside would price.
     ord_served: std::cell::Cell<u64>,
+    /// Point reads this handle answered by the two-source read and by the
+    /// layered one (`Reader::read_lone`, `Reader::read_layers`,
+    /// `Options::point_lone`), for a test that has to know which read its
+    /// store took (`point_lean_reads`).
+    lone_reads: std::cell::Cell<u64>,
+    layer_reads: std::cell::Cell<u64>,
     ord_declined: std::cell::Cell<u64>,
     /// This handle's memo of decoded groups (`zfile::ZMemo`,
     /// `Options::zpages_memo`), which goes with the handle.
@@ -24770,11 +25003,25 @@ impl State {
     }
 
     /// The level-0 pieces a read of a key in partition `at` consults.
+    #[inline]
     fn pieces_over(&self, np: usize, at: usize) -> &[std::sync::Arc<Seg>] {
         let l0 = &self.segs[np..];
-        if !self.l0_aligned || at >= np {
+        // No piece at all is the store a drain left, and every read of
+        // one paid the call and the two searches below to learn it: 49
+        // instructions of a point read's 959, by callgrind.
+        if l0.is_empty() || !self.l0_aligned || at >= np {
             return l0;
         }
+        self.pieces_aligned_over(l0, at)
+    }
+
+    /// `pieces_over` for a store whose pieces are aligned to its
+    /// partitions: the run of them over partition `at`.
+    fn pieces_aligned_over<'a>(
+        &'a self,
+        l0: &'a [std::sync::Arc<Seg>],
+        at: usize,
+    ) -> &'a [std::sync::Arc<Seg>] {
         // The first partition's lower fence is empty, and so is that of
         // every piece aligned to it; see `below_lo` for why an empty fence
         // is never handed to a compare.
@@ -25113,8 +25360,14 @@ impl Reader {
         {
             return;
         }
-        let mut m = self.mode_note.get();
         if self.slot.is_none() {
+            // The writer's note where it lies: taken out of its cell and
+            // put back, the whole note was copied twice a read for one
+            // count, 33 instructions of a point read by callgrind.
+            // SAFETY: the handle is one thread's (`Reader` is not `Sync`)
+            // and nothing below reaches the cell again while the borrow
+            // is out.
+            let m = unsafe { &mut *self.mode_note.as_ptr() };
             if scan {
                 m.scans += 1;
             } else {
@@ -25136,9 +25389,9 @@ impl Reader {
                     .write_quiet
                     .store(false, AtomicOrdering::Release);
             }
-            self.mode_note.set(m);
             return;
         }
+        let mut m = self.mode_note.get();
         let now = (self.state().gen, self.mem().committed_log());
         let (at, shared) = if scan {
             (&mut m.scan_at, &self.shared.mode_scans)
@@ -25167,10 +25420,20 @@ impl Reader {
         }
     }
 
+    #[inline]
     fn advise(&self, random: bool) {
         if self.opts.read_advice != ReadAdvice::Adaptive || self.advice_random() == random {
             return;
         }
+        self.advise_switch(random);
+    }
+
+    /// `advise` where the mode changes: out of line, since every read asks
+    /// and one in a phase switches, and the call alone was 23
+    /// instructions of a point read.
+    #[cold]
+    #[inline(never)]
+    fn advise_switch(&self, random: bool) {
         self.set_advice_random(random);
         // Segments only. A segment's pages are walked in whichever way the
         // workload is walking them, so the advice follows the phase; the
@@ -25693,6 +25956,15 @@ impl Reader {
     /// `Reader` for its own.
     pub fn ord_point_reads(&self) -> (u64, u64) {
         (self.ord_served.get(), self.ord_declined.get())
+    }
+
+    /// Point reads this handle answered by the read of a partition and
+    /// the live table alone, and by the layered read of every source in
+    /// its common shape (`Options::point_lone`); both zero without the
+    /// option, and a read counted in neither took the general read. A
+    /// handle's own count, as `ord_point_reads` is.
+    pub fn point_lean_reads(&self) -> (u64, u64) {
+        (self.lone_reads.get(), self.layer_reads.get())
     }
 
     /// `key`'s values in a partition read through the partition's ordered
@@ -26706,6 +26978,202 @@ impl Reader {
         // an accessor at every step, thirty nanoseconds on a read of two
         // hundred at three hundred thousand keys.
         let st = self.state();
+        if let Some(n) = self.read_lone(st, key, &mut f) {
+            return n;
+        }
+        if let Some(n) = self.read_layers(st, key, &mut f) {
+            return n;
+        }
+        self.read_sources(st, key, f)
+    }
+
+    /// A point read over a partition, the pieces over its range, the
+    /// frozen tables and the live one, where each holds the key in its
+    /// common shape (`Options::point_lone`): `None`, with nothing handed
+    /// to `f`, for any other store or key, which `read_sources` reads.
+    ///
+    /// One pass, newest source first, to the newest tombstone: the live
+    /// table's chain and each frozen table's read once onto this frame
+    /// (`MemTable::live_offs_small`), each piece that may hold the key
+    /// asked once for its record (`Blob::find_fixed_hashed`), which is
+    /// kept. Then the values oldest first from that tombstone on, the
+    /// partition's first where no tombstone masks it, as `read_sources`
+    /// orders them and from the same sources: its pass for the tombstone
+    /// asks the same tables and pieces, and what it finds live it reads
+    /// again, or carries in a structure a read of one source builds too.
+    #[inline(never)]
+    fn read_layers<F: FnMut(&[u8])>(
+        &self,
+        st: &State,
+        key: &[u8],
+        f: &mut F,
+    ) -> Option<Result<u64>> {
+        if !self.opts.point_lone_on() {
+            return None;
+        }
+        let (segs, mem) = (&st.segs, &*st.mem);
+        let nf = st.frozen.len();
+        if mem.ordered || nf > FROZEN_CAP {
+            return None;
+        }
+        if self.opts.zpages != ZPages::Off && self.z_on() {
+            return None;
+        }
+        // No partition yet is the general read's to count
+        // (`count_unshaped`).
+        let np = segs.partition_point(|s| s.level > 0);
+        if np == 0 {
+            return None;
+        }
+        let at = segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+        let l0 = st.pieces_over(np, at);
+        if l0.len() > LAYERS_PIECES {
+            return None;
+        }
+        let fnv = crate::flatindex::key_hash(key);
+        let mh = mem_hash_of(fnv);
+        if self.opts.read_lines_ahead {
+            for seg in l0 {
+                seg.prefetch_probe(fnv);
+            }
+        }
+        // A point read pays lag per piece it consults, as the general
+        // read counts it.
+        if !l0.is_empty() && self.lag_adapts() {
+            self.count_lag();
+        }
+        // Newest first, to the newest tombstone: `cut` once one is found.
+        // A source the pass does not reach, being older than the
+        // tombstone, keeps a count of no values, so the values after the
+        // pass are every source's in order with nothing to skip.
+        let mut cut = false;
+        let mut live_offs = [0usize; LIVE_SMALL];
+        let mut live_n = 0;
+        if !mem.is_empty() {
+            if let Some(e) = mem.get_with(mh, key, self.len_bound.get()) {
+                (live_n, cut) = mem.live_offs_small(e, self.wm(), &mut live_offs)?;
+            }
+        }
+        let mut fr_offs = [[0usize; LIVE_SMALL]; FROZEN_CAP];
+        let mut fr_n = [0usize; FROZEN_CAP];
+        if !cut {
+            for i in (0..nf).rev() {
+                let fr = &st.frozen[i];
+                if let Some(e) = fr.get_with(mh, key, MemTable::ALL) {
+                    (fr_n[i], cut) = fr.live_offs_small(e, SEE_ALL, &mut fr_offs[i])?;
+                    if cut {
+                        break;
+                    }
+                }
+            }
+        }
+        let mut runs: [(&[u8], usize); LAYERS_PIECES] = [(&[], 0); LAYERS_PIECES];
+        if !cut {
+            for i in (0..l0.len()).rev() {
+                let seg = &l0[i];
+                if !seg.may_hold_fnv(key, fnv) {
+                    continue;
+                }
+                if let Some(c) = seg.raw().find_fixed_hashed(key, fnv)? {
+                    runs[i] = (c.run, c.records);
+                    if c.tomb {
+                        cut = true;
+                        break;
+                    }
+                }
+            }
+        }
+        // Oldest first from the tombstone on.
+        let mut n = 0u64;
+        if !cut {
+            if let Some(seg) = segs[..np].get(at).filter(|s| s.may_hold_fnv(key, fnv)) {
+                match seg.raw().read_all_fixed_hashed(key, fnv, f) {
+                    Ok(k) => n += k,
+                    Err(e) => return Some(Err(err(&format!("segment read: {e}")))),
+                }
+            }
+        }
+        for &(run, records) in &runs[..l0.len()] {
+            if records > 0 {
+                n += crate::flatindex::each_fixed(run, records, f);
+            }
+        }
+        for i in 0..nf {
+            for &off in fr_offs[i][..fr_n[i]].iter().rev() {
+                f(st.frozen[i].value_at(off));
+            }
+            n += fr_n[i] as u64;
+        }
+        for &off in live_offs[..live_n].iter().rev() {
+            f(mem.value_at(off));
+        }
+        self.layer_reads.set(self.layer_reads.get() + 1);
+        Some(Ok(n + live_n as u64))
+    }
+
+    /// A point read where the key's sources are the partition and the
+    /// live table (`Options::point_lone`): `None`, with nothing handed to
+    /// `f`, for every other store, which `read_sources` reads.
+    #[inline(always)]
+    fn read_lone<F: FnMut(&[u8])>(&self, st: &State, key: &[u8], f: &mut F) -> Option<Result<u64>> {
+        if !self.opts.point_lone_on() {
+            return None;
+        }
+        // Partitions sort first, so a last segment that is one says there
+        // is no piece; no segment at all is the general read's to count
+        // (`count_unshaped`).
+        let segs = &st.segs;
+        let mem = &*st.mem;
+        if !segs.last().is_some_and(|s| s.level > 0) || !st.frozen.is_empty() || mem.ordered {
+            return None;
+        }
+        // A partition a form file may serve is dispatched by the general
+        // read.
+        if self.opts.zpages != ZPages::Off && self.z_on() {
+            return None;
+        }
+        let fnv = crate::flatindex::key_hash(key);
+        // The live table over the partition: the key's chain there read
+        // once, newest first to its newest tombstone, which masks the
+        // partition; then the partition where none does, and the chain's
+        // live values oldest first, as `read_sources` orders them.
+        let mut offs = [0usize; LIVE_SMALL];
+        let (n, tomb) = if mem.is_empty() {
+            (0, false)
+        } else {
+            match mem.get_with(mem_hash_of(fnv), key, self.len_bound.get()) {
+                Some(e) => mem.live_offs_small(e, self.wm(), &mut offs)?,
+                None => (0, false),
+            }
+        };
+        let mut below = 0;
+        if !tomb {
+            let at = if segs.len() == 1 {
+                0
+            } else {
+                segs.partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key))
+            };
+            if let Some(seg) = segs.get(at).filter(|s| s.may_hold_fnv(key, fnv)) {
+                match seg.raw().read_all_fixed_hashed(key, fnv, f) {
+                    Ok(k) => below = k,
+                    Err(e) => return Some(Err(err(&format!("segment read: {e}")))),
+                }
+            }
+        }
+        for &off in offs[..n].iter().rev() {
+            f(mem.value_at(off));
+        }
+        self.lone_reads.set(self.lone_reads.get() + 1);
+        Some(Ok(below + n as u64))
+    }
+
+    /// A point read over every source that may hold the key: the
+    /// partition, the pieces over its range, the frozen tables and the
+    /// live one, from the newest tombstone on. Never inlined: beside the
+    /// single-source read its frame, eight hundred bytes and six saved
+    /// registers, was every read's.
+    #[inline(never)]
+    fn read_sources<F: FnMut(&[u8])>(&self, st: &State, key: &[u8], mut f: F) -> Result<u64> {
         let (segs, mem) = (&st.segs, &*st.mem);
         let mem_empty = mem.is_empty();
         // The key's FNV word once, every source's hash taken from it
@@ -26781,9 +27249,12 @@ impl Reader {
         // The segment read lends the extents on the index's frame; the arm
         // takes them by value, the shape before (`Options::exts_by_value`).
         let by_value = self.opts.exts_by_value;
+        let fixed = self.opts.point_fixed;
         let seg_read = |seg: &Seg, f: &mut F| {
             if by_value {
                 seg.raw().read_all_by_value(key, f)
+            } else if once && fixed {
+                seg.raw().read_all_fixed_hashed(key, fnv, f)
             } else if once {
                 seg.raw().read_all_hashed(key, fnv, f)
             } else {
@@ -28830,6 +29301,10 @@ impl Reader {
     }
 
     /// The replaced states no pinned reader can still be walking.
+    // Out of line: `leave` asks at every operation's end and one in
+    // thousands sweeps, and inlined there the sweep's frame was thirteen
+    // instructions of every read's end.
+    #[inline(never)]
     fn sweep_retired_states(&self) {
         self.shared
             .retired
@@ -28838,6 +29313,10 @@ impl Reader {
 
     /// The form files taken out of their cells that no pinned reader can
     /// still be walking, freed.
+    // Out of line: `leave` asks at every operation's end and one in
+    // thousands sweeps, and inlined there the sweep's frame was thirteen
+    // instructions of every read's end.
+    #[inline(never)]
     fn sweep_retired_z(&self) {
         if self.shared.retired_z.len() == 0 {
             return;
@@ -28877,6 +29356,10 @@ impl Reader {
     /// identity -- some freed and as many retired since read the same --
     /// and the retry bounds what that costs. A call is a few relaxed
     /// loads, and a sweep one in the span of a retry.
+    // Out of line: `leave` asks at every operation's end and one in
+    // thousands sweeps, and inlined there the sweep's frame was thirteen
+    // instructions of every read's end.
+    #[inline(never)]
     fn sweep_at_leave(&self) {
         let sh = &self.shared;
         let waiting = sh.retired_snaps.len() + sh.retired_forms.len() + sh.retired_z.len();
@@ -35670,6 +36153,8 @@ impl Db {
             scan_ns: std::cell::Cell::new([0; 6]),
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
+            lone_reads: std::cell::Cell::new(0),
+            layer_reads: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -36479,6 +36964,8 @@ impl Db {
             scan_ns: std::cell::Cell::new([0; 6]),
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
+            lone_reads: std::cell::Cell::new(0),
+            layer_reads: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -36944,6 +37431,21 @@ impl Db {
     /// onto its key until each read walked the pile.
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
         let _op = self.op();
+        self.put_pinned(key, value);
+    }
+
+    /// `put` for every record of `items`, pinned once for all of them, as
+    /// `append_batch` is for a load's: the pin, its fence and the unpin a
+    /// record were 88 instructions of an update's 1,213 by callgrind
+    /// (`bench/examples/point_ops.rs`), and the fence a locked store.
+    pub fn put_batch(&mut self, items: &[(&[u8], &[u8])]) {
+        let _op = self.op();
+        for &(key, value) in items {
+            self.put_pinned(key, value);
+        }
+    }
+
+    fn put_pinned(&mut self, key: &[u8], value: &[u8]) {
         if !self.writes_go() {
             return;
         }
@@ -39362,6 +39864,8 @@ impl Reader {
             scan_ns: std::cell::Cell::new([0; 6]),
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
+            lone_reads: std::cell::Cell::new(0),
+            layer_reads: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: self.opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -39402,6 +39906,8 @@ impl Reader {
                 scan_ns: std::cell::Cell::new([0; 6]),
                 forms_off_now: std::cell::Cell::new(false),
                 ord_served: std::cell::Cell::new(0),
+                lone_reads: std::cell::Cell::new(0),
+                layer_reads: std::cell::Cell::new(0),
                 ord_declined: std::cell::Cell::new(0),
                 zmemo: self.opts.handle_memo(),
                 zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -39449,6 +39955,8 @@ impl Reader {
             scan_ns: std::cell::Cell::new([0; 6]),
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
+            lone_reads: std::cell::Cell::new(0),
+            layer_reads: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: self.opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -42637,6 +43145,8 @@ impl Reader {
             scan_ns: std::cell::Cell::new([0; 6]),
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
+            lone_reads: std::cell::Cell::new(0),
+            layer_reads: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: self.opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -56800,5 +57310,41 @@ mod finish_coding {
         );
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod wal_frames {
+    use super::*;
+
+    /// A record frame written in one reservation (`wal_record`) is the
+    /// frame `wal_frame` grows, byte for byte, for a put and for a delete,
+    /// over keys whose length's uvarint is one byte, two and three, the
+    /// empty key and the empty value, appended after frames already in
+    /// the buffer and under any sequence number.
+    #[test]
+    fn a_record_written_in_one_reservation_is_the_frame_grown() {
+        let key_lens = [0usize, 1, 16, 127, 128, 129, 300, 16_383, 16_384, 20_000];
+        let val_lens = [0usize, 1, 100, 4_096];
+        let (mut grown, mut once) = (Vec::new(), Vec::new());
+        let mut seq = 0xfedc_ba98_7654_3210u64;
+        for &kl in &key_lens {
+            let key: Vec<u8> = (0..kl).map(|i| (i * 7 + kl) as u8).collect();
+            for &vl in &val_lens {
+                let value: Vec<u8> = (0..vl).map(|i| (i * 13 + vl) as u8).collect();
+                wal_frame(&mut grown, seq, 0x5eed, WAL_PUT, &key, &value);
+                wal_record(&mut once, seq, WAL_PUT, &key, &value);
+                seq = seq.wrapping_add(1);
+                assert_eq!(
+                    grown, once,
+                    "a put of a {kl}-byte key and a {vl}-byte value"
+                );
+            }
+            wal_frame(&mut grown, seq, 0x5eed, WAL_DEL, &key, &[]);
+            wal_record(&mut once, seq, WAL_DEL, &key, &[]);
+            seq = seq.wrapping_add(1);
+            assert_eq!(grown, once, "a delete of a {kl}-byte key");
+        }
+        assert!(grown.len() > 100_000, "the frames compared were written");
     }
 }

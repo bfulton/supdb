@@ -1706,11 +1706,60 @@ pub struct FlatIndex {
 #[inline]
 pub fn key_hash(key: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    // A sixteen-byte key, the suite's, by a loop of a constant count: the
+    // same bytes in the same order, three instructions each where the
+    // loop over a slice's length was five and a dispatch on the length,
+    // 75 instructions of a point read against 52.
+    if let Ok(k) = <&[u8; 16]>::try_from(key) {
+        for &b in k {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        return h;
+    }
     for &b in key {
         h ^= b as u64;
         h = h.wrapping_mul(0x1000_0000_01b3);
     }
     h
+}
+
+/// Each value of a fixed run of `records` values (`CompactFixed`), in
+/// order, and how many: what `index::each_value` hands over for the
+/// extent `compact_ext` makes of the same header. `records` divides the
+/// run's length and is not zero, which `compact_fixed_tomb_at` holds.
+#[inline(always)]
+pub(crate) fn each_fixed(run: &[u8], records: usize, f: &mut impl FnMut(&[u8])) -> u64 {
+    if records == 1 {
+        f(run);
+    } else {
+        for v in run.chunks_exact(run.len() / records) {
+            f(v);
+        }
+    }
+    records as u64
+}
+
+/// Whether two keys are the same bytes. Keys of eight to sixteen bytes,
+/// the suite's and most stores', compare as two words each, the first
+/// eight bytes and the last eight, which overlap where the key is short of
+/// sixteen: the library's compare is a call and a dispatch on the length,
+/// twenty instructions of a point read for sixteen bytes.
+#[inline(always)]
+pub(crate) fn key_eq(a: &[u8], b: &[u8]) -> bool {
+    let n = a.len();
+    if n != b.len() {
+        return false;
+    }
+    if !(8..=16).contains(&n) {
+        return a == b;
+    }
+    let w = |k: &[u8], at: usize| {
+        let mut x = [0u8; 8];
+        x.copy_from_slice(&k[at..at + 8]);
+        u64::from_ne_bytes(x)
+    };
+    (w(a, 0) ^ w(b, 0)) | (w(a, n - 8) ^ w(b, n - 8)) == 0
 }
 
 /// True if `sec` looks like this format rather than the varint one.
@@ -1985,6 +2034,69 @@ impl FlatIndex {
             s = (s + 1) & self.mask;
         }
         None
+    }
+
+    /// A key's record where it is the common one, the compact record with
+    /// a fixed run (`compact_fixed_tomb_at`): its run where it lies, the
+    /// count of values in it and its tombstone flag. `Some(None)` for a
+    /// key the index does not hold. `None` where a record the probe has to
+    /// judge is any other shape, which `with_lookup_hashed` reads, as it
+    /// reads every record with this off (`Options::point_fixed`).
+    ///
+    /// The same record `with_lookup_hashed` finds, without the extent it
+    /// rebuilds from the record's header for `Blob::read_exts` to walk the
+    /// run by: that path was 354 of a point read's 959 instructions over a
+    /// store just loaded, by callgrind at a hundred thousand keys
+    /// (`bench/examples/point_ops.rs`), for one slot, one key compare and
+    /// one slice.
+    #[inline(always)]
+    pub(crate) fn find_fixed_hashed<'a>(
+        &self,
+        sec: &'a [u8],
+        key: &[u8],
+        h: u64,
+    ) -> Option<Option<CompactFixed<'a>>> {
+        let hash = sec.get(self.hash.0..self.hash.1)?;
+        let recs = sec.get(self.recs.0..self.recs.1)?;
+        let tag = ((h >> 56) | 1) & 0xff;
+        let mut s = (h as usize) & self.mask;
+        for _ in 0..self.hash_cap {
+            let packed = rd_u64(hash, s * SLOT)?;
+            if packed == 0 {
+                return Some(None);
+            }
+            if packed >> 56 == tag {
+                let off = (packed & 0x00ff_ffff_ffff_ffff) as usize;
+                let c = compact_fixed_tomb_at(recs, off)?;
+                if key_eq(c.key, key) {
+                    return Some(Some(c));
+                }
+            }
+            s = (s + 1) & self.mask;
+        }
+        Some(None)
+    }
+
+    /// A point read's values where the key's record is the common one
+    /// (`find_fixed_hashed`): each value handed to `f` from the record
+    /// where it lies, and the count; `Some(0)` for a key the index does
+    /// not hold, and `None`, with nothing handed to `f`, for a record of
+    /// any other shape. The same values as `with_lookup_hashed` and
+    /// `Blob::read_exts` hand over for such a record. A run's tombstone
+    /// flag is read past, as `Blob::read_exts` reads past it: which
+    /// sources' values are live is the caller's to say.
+    #[inline]
+    pub fn read_fixed_hashed(
+        &self,
+        sec: &[u8],
+        key: &[u8],
+        h: u64,
+        f: &mut impl FnMut(&[u8]),
+    ) -> Option<u64> {
+        Some(match self.find_fixed_hashed(sec, key, h)? {
+            Some(c) => each_fixed(c.run, c.records, f),
+            None => 0,
+        })
     }
 
     /// `lookup`, with the record's tail of inline runs.

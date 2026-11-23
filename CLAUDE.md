@@ -654,6 +654,32 @@ suite's own arms answer most of these questions without a probe at all,
 and `bench ab` prices two of them in one process; reach for a probe only
 when no pair of arms isolates what you are asking.
 
+An operation that trails a comparator by a constant factor at every
+rung is counted against the comparator's own instructions before any
+hypothesis about its misses. The point get and the put trailed FASTER by
+a quarter to four fifths in every cell of the first row that carried it,
+and the first three readings were of memory: the fence in the pin, the
+hash's serial multiplies, the record a line apart from its slot. FASTER's
+hash is the same serial chain, its get takes the same two dependent
+misses, and the arm without the fence read level twice. Callgrind toggled
+on one phase of `bench/examples/point_ops.rs`, the same keys through both
+arms, read 959 instructions a get against 415 and 1,213 a put against
+555, and the listing by executed instruction (`--dump-instr=yes`, joined
+to `objdump -d -l` by address) read as layers each setting up for a case
+the store was not in: no line over three percent, and two fifths of the
+whole gone once the common store had a read of its own (`docs/engine.md`,
+point gets and puts beside FASTER). Three things about the instrument
+cost an hour each. The linker folds identical functions, so three phase
+functions with one body were one symbol and one toggle; each holds a
+constant of its own now. Valgrind's clock is fifty times slow, so a timer
+the engine runs by fires inside a phase it never fires in natively: an
+idle seal put a piece under a phase's gets and its count moved by a fifth
+between builds, which read as the build's. And a phase of a sixth of a
+small store's keys is two milliseconds, where this host's two speeds are a
+quarter apart: the read phases go over their keys several times, and a
+rate is the median of alternated runs of two binaries, never one run of
+each.
+
 A decoder timed on one input is timed on an input it has learned. The
 form's LZ4 decode read 1.1 µs a page decoding one page over and over
 and 3.4 cycling the file's pages, and the cache level was not it:

@@ -1664,6 +1664,49 @@ impl<B: Bytes> Blob<B> {
             .unwrap_or(Ok(0))
     }
 
+    /// `read_all_hashed` with the common record read where it lies
+    /// (`FlatIndex::read_fixed_hashed`, `Options::point_fixed`), and every
+    /// other record as `read_all_hashed` reads it, out of line: with the
+    /// general read's frame beside it, the common read saved and restored
+    /// six registers it never used.
+    #[inline]
+    pub fn read_all_fixed_hashed<F: FnMut(&[u8])>(
+        &self,
+        key: &[u8],
+        h: u64,
+        f: &mut F,
+    ) -> Result<u64> {
+        if let Some((sec, idx)) = self.flat() {
+            if let Some(n) = idx.read_fixed_hashed(sec, key, h, f) {
+                return Ok(n);
+            }
+        }
+        self.read_all_hashed_apart(key, h, f)
+    }
+
+    /// A key's record where it is the common one
+    /// (`FlatIndex::find_fixed_hashed`): `Some(None)` for a key this
+    /// segment does not hold, `None` for a record of another shape and
+    /// for a reader with no whole index. The engine's layered read is its
+    /// caller, which the wasm reader does not carry.
+    #[cfg(not(target_family = "wasm"))]
+    #[inline]
+    pub(crate) fn find_fixed_hashed(
+        &self,
+        key: &[u8],
+        h: u64,
+    ) -> Option<Option<crate::flatindex::CompactFixed<'_>>> {
+        let (sec, idx) = self.flat()?;
+        idx.find_fixed_hashed(sec, key, h)
+    }
+
+    /// `read_all_hashed`, never inlined (`read_all_fixed_hashed`).
+    #[cold]
+    #[inline(never)]
+    fn read_all_hashed_apart<F: FnMut(&[u8])>(&self, key: &[u8], h: u64, f: &mut F) -> Result<u64> {
+        self.read_all_hashed(key, h, f)
+    }
+
     /// `lookup` for a key whose index hash the caller has taken.
     pub fn lookup_hashed(&self, key: &[u8], h: u64) -> Option<Exts<'_>> {
         let Some((sec, idx)) = self.flat() else {

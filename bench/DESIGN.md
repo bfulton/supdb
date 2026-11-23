@@ -817,6 +817,15 @@ refuted);
 store with tombstones probe every source again after its tombstone pass,
 where the default keeps what the pass found of each source
 (`Options::read_probes_once`);
+`supdb-pointexts` and `supdb-ingestpointexts` have a point read rebuild
+the extent of every record it reads and walk the run by it, where the
+default takes the values of the common record, the compact record with a
+fixed run, from the record where it lies (`Options::point_fixed`), and
+`supdb-pointsources` and `supdb-ingestpointsources` have every point read
+take the general read of its sources, where the default reads a partition
+and the live table alone, or the partition, its pieces, the frozen tables
+and the live one in a single pass, wherever each holds the key in its
+common shape (`Options::point_lone`);
 `supdb-zhotresident` is `supdb` with the hot-raw fill asking for the
 partitions the reads have not skewed by how much of their records the cache
 holds, most first (`Options::zpages_hot_fill_resident_first`);
