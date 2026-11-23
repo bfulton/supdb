@@ -703,6 +703,41 @@ result into the next key's choice, which makes them one at a time. A
 probe of a read that misses is serial by a data dependency, or it
 measures how many misses the core overlaps.
 
+**An arm with no stronger promise to configure is a guarantee of its
+own.** FASTER has no setting under which a write outlives its process
+before a checkpoint, and the arm was first filed with the buffered group,
+whose every commit is in the kernel. The matching check refused it beside
+RocksDB, on `reopen_for_write`, and the first fix made the check skip that
+axis and `ordered_scan` for everybody, which is the shape of the entry
+above: an axis dropped so that an arm would fit a group it is not in. The
+arm is `Guarantee::Memory` now, alone there, and the check is as it was.
+Its cells beside the buffered group's are a reader's comparison, made
+with the difference said, never the suite's.
+
+**A cell an arm cannot have is no sample, not a NaN one.** A phase a
+pass leaves out leaves a NaN where its rate would be, which was every
+phase `bench ab --passes` left out and nothing in a row, since a row was
+always every phase of every arm. `faster` has no ordered scan, its scan
+rate went into the row as five NaNs, serde wrote them as null, and the
+first quick row with the arm in it ran its eighteen minutes, was banked,
+and was then refused whole by `Row::read` at the gate: one null among ten
+thousand lines. A sample enters a row in one place (`Samples::push`), and
+that place drops a NaN now, so an arm that cannot run a workload and a row
+of some passes (`bench run --passes`) both write rows the gate and the
+figures read. The check that found it was the quick group, the only one
+that reads a row it has just written.
+
+**A comparator's own benchmark can be the broken one.** FASTER's C++
+benchmark at the pinned commit tests `result == Status::Ok` after an
+upsert (`cc/benchmark-dir/benchmark.h`, since a commit of February 2025)
+and so logs a line for every upsert that succeeds: its half-reads run on
+one thread came in at an eighth of what the same store does with the test
+turned round, and the first reading of it was that the suite's shim was
+four times faster than the store's own tool. A comparator held to its own
+tool is held to the tool as somebody last ran it; read the loop before
+the rate. The upstream repository is no longer maintained, which is why
+the pin is its last commit and why nobody else will have met this.
+
 **A comparator's wrapper is not the comparator, and a comparator's
 unreleased line is what it is.** The encrypted comparators (`src/enc.rs`,
 feature `enc`) were first built the way a Rust user reaches them. LMDB's
@@ -755,7 +790,14 @@ built RocksDB at all failed on both Linux (only a versioned `.so` on the
 image) and macOS (dyld could not find `@rpath/libclang.dylib` at run time);
 naming the directory fixed Linux and not macOS, because SIP strips `DYLD_*`
 before a workflow step's shell starts, so on macOS the script adds an rpath
-to `RUSTFLAGS`. Cargo takes profiles from the root of the workspace being
+to `RUSTFLAGS`. FASTER is the other comparator a host has to be readied for, and
+`scripts/faster.sh` is its one definition, called wherever
+`scripts/libclang.sh` is: it is not a crate, so the script fetches its
+sources at the commit `vendor/faster/PIN` names into a directory git
+ignores and installs the three libraries they link, and `build.rs` fails
+the build where they are missing or another commit's. The arm exists on
+Linux x86-64 alone (`cfg(faster)`, set by `build.rs`), so nothing on
+macOS or ARM builds or needs it. Cargo takes profiles from the root of the workspace being
 built, which here is this directory, so the engine's release profile is
 repeated in `Cargo.toml` and cargo warns on every build that it is ignoring
 the engine's -- the warning is expected, the repetition is what keeps the

@@ -240,6 +240,32 @@ pub trait Bytes {
     /// the readers beside it are using. The bytes do not change; a later
     /// touch faults the page back. A no-op where there is no mapping.
     fn advise_dontneed_range(&self, _off: u64, _len: usize) {}
+
+    /// The whole pages inside `len` bytes at `off` mapped into this
+    /// process's page tables now (`MADV_POPULATE_READ` on a mapped file),
+    /// whichever of them the page cache does not hold read in first: true
+    /// where the kernel took the advice. A page resident and unmapped
+    /// costs its first reader a fault, and under a bound that fault is not
+    /// the cheap one. A paged mapping forwards it to what stands behind
+    /// the bytes it does not hold present (`Paging::populate`), which is
+    /// where a read of them faults. False where there is no mapping, or no
+    /// whole page inside the range.
+    fn populate_read(&self, _off: u64, _len: usize) -> bool {
+        false
+    }
+
+    /// The share of `len` bytes at `off` a read reaches with no fault of
+    /// the page tables' now, from 0 to 1: for a mapped file the pages the
+    /// range lies in that this process's page tables map, by the present
+    /// bit of `/proc/self/pagemap`; for a paged mapping what its pager
+    /// holds present or has mapped of what stands behind the rest
+    /// (`Paging::mapped`). `None` for an empty range, a source with no
+    /// mapping, or where the kernel will not say. What `populate_read`
+    /// changes and `resident_share` cannot see, since a page may be
+    /// resident and unmapped.
+    fn mapped_share(&self, _off: u64, _len: usize) -> Option<f64> {
+        None
+    }
 }
 
 /// Read `len` bytes at `off`, borrowing when the source allows it.
@@ -406,6 +432,16 @@ pub(crate) trait Paging: Send + Sync {
     /// the background, and the bytes asked for: nothing for bytes the
     /// mapping holds present.
     fn willneed(&self, off: u64, len: usize) -> usize;
+    /// What stands behind the bytes of `len` at `off` that the mapping
+    /// does not hold present, mapped into this process's page tables
+    /// (`Bytes::populate_read`): true where the kernel took the advice for
+    /// any of it. Nothing for bytes the mapping holds present.
+    fn populate(&self, off: u64, len: usize) -> bool;
+    /// The share of `len` bytes at `off` a read reaches with no fault of
+    /// the page tables': present in the mapping, or what stands behind
+    /// them mapped (`Bytes::mapped_share`). `None` for an empty range or
+    /// where the kernel will not say.
+    fn mapped(&self, off: u64, len: usize) -> Option<f64>;
 }
 
 /// The token `Paging::base_address` takes: made in this module alone (its
@@ -605,6 +641,27 @@ pub fn os_page_size() -> usize {
     usize::try_from(n).unwrap_or(4096).max(1)
 }
 
+/// Whether this process's page tables map each page from the one holding
+/// address `start` to the one holding `end - 1`, by the present bit of
+/// `/proc/self/pagemap`: a flag a page, in order. `None` for an empty
+/// range or where the file cannot be read. What `mincore` cannot say,
+/// since a page may be resident and unmapped.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn pagemap_present(start: usize, end: usize) -> Option<Vec<bool>> {
+    use std::io::{Read, Seek, SeekFrom};
+    if end <= start {
+        return None;
+    }
+    let page = os_page_size();
+    let (a, b) = (start / page, end.div_ceil(page));
+    let mut f = std::fs::File::open("/proc/self/pagemap").ok()?;
+    f.seek(SeekFrom::Start((a * 8) as u64)).ok()?;
+    let mut buf = vec![0u8; (b - a) * 8];
+    f.read_exact(&mut buf).ok()?;
+    let (words, _) = buf.as_chunks::<8>();
+    Some(words.iter().map(|w| w[7] & 0x80 != 0).collect())
+}
+
 #[cfg(not(target_family = "wasm"))]
 impl Bytes for MmapBytes {
     fn len(&self) -> u64 {
@@ -747,6 +804,47 @@ impl Bytes for MmapBytes {
         };
         Some(p.resident(off, len))
     }
+    fn populate_read(&self, off: u64, len: usize) -> bool {
+        if let Own::Paged(p) = &self.own {
+            return p.populate(off, len);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(off) = usize::try_from(off) else {
+                return false;
+            };
+            let end = off.saturating_add(len).min(self.lend as usize);
+            if end <= off {
+                return false;
+            }
+            let page = os_page_size();
+            let base = self.ptr as usize;
+            let a = (base + off).next_multiple_of(page);
+            let b = (base + end) / page * page;
+            if a >= b {
+                return false;
+            }
+            // SAFETY: `a..b` are whole pages inside this read-only shared
+            // file mapping, which lives for the call; the advice maps them
+            // and changes no byte.
+            unsafe { libc::madvise(a as *mut libc::c_void, b - a, libc::MADV_POPULATE_READ) == 0 }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (off, len);
+            false
+        }
+    }
+    fn mapped_share(&self, off: u64, len: usize) -> Option<f64> {
+        if let Own::Paged(p) = &self.own {
+            return p.mapped(off, len);
+        }
+        let off = usize::try_from(off).ok()?;
+        let end = off.saturating_add(len).min(self.lend as usize);
+        let base = self.ptr as usize;
+        let pages = pagemap_present(base + off.min(end), base + end)?;
+        Some(pages.iter().filter(|&&p| p).count() as f64 / pages.len() as f64)
+    }
     fn advise_dontneed(&self) {
         #[cfg(target_os = "linux")]
         if self.lend > 0 {
@@ -850,6 +948,69 @@ mod tests {
             "past the mapping"
         );
         assert_eq!(m.resident_share(5, 0), Some(0.0), "an empty range");
+        drop(m);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A page resident and unmapped is not one a read reaches for free: a
+    /// file in the page cache and out of this process's page tables reads
+    /// as resident and as not mapped (`mincore` answers the first and
+    /// `/proc/self/pagemap` the second); a populate maps every whole page
+    /// inside its range, and nothing far from it -- a fault maps the pages
+    /// around it, sixteen by default, so "far" is past that; and a range
+    /// with no whole page inside it, an empty one or one past the mapping
+    /// maps nothing. Written a page a write, since the cache holds a file
+    /// in folios the size of the writes that made it and a fault maps a
+    /// folio's pages together. Not under qemu-user (`supdb_emulated`),
+    /// which answers an advice with success and passes nothing to the
+    /// kernel.
+    #[cfg(all(target_os = "linux", not(supdb_emulated)))]
+    #[test]
+    fn a_populate_maps_the_whole_pages_inside_its_range_and_nothing_far_from_it() {
+        use std::io::Write;
+        let page = os_page_size();
+        let pages = 512;
+        let len = pages * page + 100;
+        let path =
+            std::env::temp_dir().join(format!("supdb-next-populate-pages-{}", std::process::id()));
+        let mut f = std::fs::File::create(&path).unwrap();
+        for _ in 0..pages {
+            f.write_all(&vec![9u8; page]).unwrap();
+        }
+        f.write_all(&[9u8; 100]).unwrap();
+        drop(f);
+        let m = MmapBytes::open(&path).unwrap();
+        assert_eq!(m.resident_share(0, len), Some(1.0), "in the page cache");
+        assert_eq!(
+            m.mapped_share(0, len),
+            Some(0.0),
+            "and no page of it mapped"
+        );
+        assert_eq!(m.mapped_share(len as u64, 5), None, "past the mapping");
+        assert_eq!(m.mapped_share(5, 0), None, "an empty range");
+        // From the middle of one page to the middle of another: the whole
+        // pages between them, 201 to 263.
+        let (a, b) = (200 * page + page / 2, 264 * page + page / 2);
+        assert!(m.populate_read(a as u64, b - a), "the kernel took it");
+        assert_eq!(
+            m.mapped_share((201 * page) as u64, 63 * page),
+            Some(1.0),
+            "every whole page inside"
+        );
+        assert_eq!(m.mapped_share(0, 150 * page), Some(0.0), "well below");
+        assert_eq!(
+            m.mapped_share((320 * page) as u64, len - 320 * page),
+            Some(0.0),
+            "well above"
+        );
+        assert!(!m.populate_read(10, page - 20), "no whole page inside");
+        assert!(!m.populate_read(len as u64, 5), "past the mapping");
+        assert!(!m.populate_read(5, 0), "an empty range");
+        assert_eq!(
+            m.mapped_share(0, 150 * page),
+            Some(0.0),
+            "and nothing mapped"
+        );
         drop(m);
         let _ = std::fs::remove_file(&path);
     }

@@ -34,6 +34,25 @@ fn dir(name: &str) -> PathBuf {
     d
 }
 
+/// The oracle's spawns, kept apart from every other test's stores. A child
+/// holds a copy of every descriptor this process has from its fork to its
+/// exec, each open store's `LOCK` among them, and a `flock` belongs to the
+/// open file description and not to the descriptor: a store one test
+/// closed and opened again inside that window was refused as open
+/// elsewhere, the child's copy still holding the lock its own close had
+/// given up. Once on a hosted runner, in the reopen after a close; with the
+/// child held 30 ms before its exec, two runs of this binary in eight, the
+/// same test at the same line; and in none of thirty runs without the
+/// oracle. A test holds this for read while it has stores to open, and the
+/// oracle spawns under it for write.
+static SPAWNING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Held by a test for as long as it opens stores: no child of this process
+/// is between its fork and its exec meanwhile.
+fn no_fork() -> std::sync::RwLockReadGuard<'static, ()> {
+    SPAWNING.read().unwrap_or_else(|e| e.into_inner())
+}
+
 fn key(i: u64) -> Vec<u8> {
     format!("{i:016}").into_bytes()
 }
@@ -131,6 +150,7 @@ fn two_runs(db: &mut Db, d: &Path, more: u64) -> (u64, u64) {
 /// and served the second run's batches without the ones before them.
 #[test]
 fn a_run_cut_short_ends_the_history_before_the_run_after_it() {
+    let _no_fork = no_fork();
     let d = dir("short");
     let mut db = Db::create(&d, buffered()).unwrap();
     let (n, second) = two_runs(&mut db, &d, 3);
@@ -194,6 +214,7 @@ fn a_run_cut_short_ends_the_history_before_the_run_after_it() {
 /// served over a store without the keys it updated.
 #[test]
 fn frames_behind_a_run_that_is_gone_are_not_served() {
+    let _no_fork = no_fork();
     let d = dir("gone");
     let mut db = Db::create(&d, buffered()).unwrap();
     db.hold_seal_landing(true);
@@ -238,6 +259,7 @@ fn frames_behind_a_run_that_is_gone_are_not_served() {
 /// is not taken.
 #[test]
 fn a_run_behind_frames_that_are_gone_is_not_served() {
+    let _no_fork = no_fork();
     let d = dir("tail");
     let mut db = Db::create(&d, buffered()).unwrap();
     db.hold_seal_landing(true);
@@ -288,6 +310,7 @@ fn a_run_behind_frames_that_are_gone_is_not_served() {
 /// notes are gone.
 #[test]
 fn runs_and_frames_come_back_whole_and_stay_so() {
+    let _no_fork = no_fork();
     for sync in [
         SyncPolicy::EveryN(u32::MAX),
         SyncPolicy::Always,
@@ -371,6 +394,7 @@ fn runs_and_frames_come_back_whole_and_stay_so() {
 /// record missing, and serves nothing from behind the hole.
 #[test]
 fn a_synced_run_that_is_gone_is_a_record_lost() {
+    let _no_fork = no_fork();
     let d = dir("damage");
     let mut db = Db::create(&d, common::options()).unwrap();
     db.hold_seal_landing(true);
@@ -399,6 +423,7 @@ fn a_synced_run_that_is_gone_is_a_record_lost() {
 /// the run in progress, which holds none of its records in the log.
 #[test]
 fn a_sync_covers_the_runs_as_well_as_the_log() {
+    let _no_fork = no_fork();
     let d = dir("sync");
     let mut db = Db::create(
         &d,
@@ -479,6 +504,7 @@ fn a_sync_covers_the_runs_as_well_as_the_log() {
 /// the barriers the writer made.
 #[test]
 fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
+    let _no_fork = no_fork();
     // Every commit synced: the run's first commit carries the barrier, and
     // no commit after it.
     let d = dir("name-always");
@@ -683,6 +709,7 @@ fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
 /// have to put back.
 #[test]
 fn a_spare_a_directory_fsync_has_covered_owes_its_run_no_barrier() {
+    let _no_fork = no_fork();
     let d = dir("name-spare");
     let mut db = Db::create(
         &d,
@@ -812,6 +839,7 @@ fn copy_without(from: &Path, to: &Path, leave: &Path) {
 /// the run recovered, its temp name gone and its guard first.
 #[test]
 fn a_barrier_that_fails_is_made_by_a_guard() {
+    let _no_fork = no_fork();
     let d = dir("name-guard");
     let crash = dir("name-guard-crash");
     let opts = inline(Options {
@@ -868,6 +896,7 @@ fn a_barrier_that_fails_is_made_by_a_guard() {
 /// batch whole or not at all.
 #[test]
 fn a_barrier_whose_guard_fails_is_kept() {
+    let _no_fork = no_fork();
     for link in [true, false] {
         let d = dir(&format!("name-guard-fails-{link}"));
         let mut db = Db::create(
@@ -949,6 +978,7 @@ fn logged_batch(db: &mut Db, b: u64) {
 /// before it, where it once found the log "synced" and returned.
 #[test]
 fn a_sync_after_a_reopen_covers_what_the_open_replayed() {
+    let _no_fork = no_fork();
     let d = dir("reopen-sync");
     let mut db = Db::create(&d, inline(buffered())).unwrap();
     logged_batch(&mut db, 0);
@@ -1009,6 +1039,7 @@ fn a_sync_after_a_reopen_covers_what_the_open_replayed() {
 /// with the tail a crash took, as the tests above hold.
 #[test]
 fn a_run_begun_behind_a_sync_refuses_a_gap_before_it() {
+    let _no_fork = no_fork();
     // Every commit synced: the first run closed by a seal, a second run
     // behind it, and the first run's file gone -- which no crash does to a
     // file whose every commit was synced and whose name is behind a
@@ -1092,6 +1123,7 @@ fn a_run_begun_behind_a_sync_refuses_a_gap_before_it() {
 /// before it takes the run with it and no more: the store opens.
 #[test]
 fn a_run_begun_over_something_unsynced_does_not_say_otherwise() {
+    let _no_fork = no_fork();
     // Frames replayed at a reopen, never synced; a seal; a run.
     let d = dir("unchained-reopen");
     let mut db = Db::create(&d, inline(buffered())).unwrap();
@@ -1147,6 +1179,7 @@ fn a_run_begun_over_something_unsynced_does_not_say_otherwise() {
 /// before was killed over opens with what that release would have found.
 #[test]
 fn a_run_that_names_no_start_is_taken_as_it_stands() {
+    let _no_fork = no_fork();
     let d = dir("legacy");
     let mut db = Db::create(&d, buffered()).unwrap();
     db.hold_seal_landing(true);
@@ -1182,6 +1215,7 @@ fn a_run_that_names_no_start_is_taken_as_it_stands() {
 /// disagree.
 #[test]
 fn a_replayed_delete_above_every_put_is_the_greatest_key() {
+    let _no_fork = no_fork();
     let d = dir("replayed-delete");
     let mut db = Db::create(&d, buffered()).unwrap();
     for i in [40u64, 10, 30] {
@@ -1236,6 +1270,7 @@ fn one_segment(d: &Path, what: &str) -> (String, Vec<u8>) {
 /// was most of the open of a killed store whose load arrived in order.
 #[test]
 fn a_run_an_open_takes_is_finished_where_it_lies() {
+    let _no_fork = no_fork();
     use std::os::unix::fs::MetadataExt;
     for sync in [SyncPolicy::EveryN(u32::MAX), SyncPolicy::Always] {
         let opts = || Options {
@@ -1310,6 +1345,7 @@ fn a_run_an_open_takes_is_finished_where_it_lies() {
 /// again -- or, once a manifest names it, not touched at all.
 #[test]
 fn an_open_cut_short_in_a_runs_finish_is_made_again() {
+    let _no_fork = no_fork();
     let opts = || Options {
         seal_bytes: 1 << 30,
         ..buffered()
@@ -1674,13 +1710,18 @@ fn a_torn_store_is_a_prefix_of_what_was_committed() {
         let torn = !always && round % 4 != 0;
         let d = dir(&format!("oracle-{round}"));
         let sync = if always { "always" } else { "never" };
-        let mut c = Command::new(&exe)
-            .args(["--exact", ORACLE_TEST, "--nocapture", "--test-threads=1"])
-            .env(ORACLE_ENV, format!("{seed}:{sync}:{}", d.display()))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        // Spawned with no other test's store open (`no_fork`): `spawn`
+        // returns once the child has made its exec.
+        let mut c = {
+            let _alone = SPAWNING.write().unwrap_or_else(|e| e.into_inner());
+            Command::new(&exe)
+                .args(["--exact", ORACLE_TEST, "--nocapture", "--test-threads=1"])
+                .env(ORACLE_ENV, format!("{seed}:{sync}:{}", d.display()))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
         let mut lines = BufReader::new(c.stdout.take().unwrap()).lines();
         let want = 20 + pick.draw(if always { 60 } else { 400 });
         let mut last: Option<u64> = None;

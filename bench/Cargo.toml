@@ -88,9 +88,10 @@ snap = { version = "1", optional = true }
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
 
 [build-dependencies]
-# For LZAV under `codecs` and RocksDB's encrypted Env under `enc`; already
+# For FASTER's C++ store and its shim (`vendor/faster`), for LZAV under
+# `codecs` and for the encrypted comparators' ciphers under `enc`; already
 # in the graph for the comparators.
-cc = { version = "1", optional = true }
+cc = "1"
 
 [features]
 default = ["lmdb"]
@@ -105,7 +106,7 @@ lmdb = ["dep:heed"]
 #
 # Every other arm is in that binary as it is in the default one, so a
 # pairing against `supdb-cipher`, or against the plain arms, is one process.
-enc = ["dep:lmdb-master3-sys", "dep:librocksdb-sys", "dep:cc"]
+enc = ["dep:lmdb-master3-sys", "dep:librocksdb-sys"]
 # `zsize` built with the crate's safe encoder and decoder, to be run beside
 # the build without it: the pages come out byte for byte the same, and the
 # decode is what moves. Off for everything the suite measures.
@@ -118,7 +119,7 @@ lz4-c = ["dep:lz4"]
 rocksdb-jemalloc = ["rocksdb/jemalloc"]
 # `zcodec` built with zstd, Snappy and LZAV (`vendor/lzav`, compiled by
 # `build.rs`) beside LZ4. Off for everything the suite measures.
-codecs = ["lz4-c", "dep:zstd", "dep:snap", "dep:cc"]
+codecs = ["lz4-c", "dep:zstd", "dep:snap"]
 # The process's allocations counted by the thread that made them, a
 # `mixthreads` line beside each census (`SUPDB_MIX_CENSUS=2`): whose memory
 # an arena left free and resident was (`src/alloc_census.rs`). A count on

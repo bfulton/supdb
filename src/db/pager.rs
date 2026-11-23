@@ -1812,6 +1812,93 @@ impl Paging for Paged {
         }
         to - from
     }
+
+    /// The envelope's pages for the chunks of the range that are not
+    /// present here, mapped into this process's page tables
+    /// (`MADV_POPULATE_READ`): the pages a fill of such a chunk reads its
+    /// ciphertext through, each a fault where the kernel's cache holds it
+    /// unmapped. A run of chunks at a time, so nothing of a chunk
+    /// decrypted already is read back from the device. A hint, read with
+    /// no pin, as `resident` is.
+    fn populate(&self, off: u64, len: usize) -> bool {
+        let Some(back) = self.back.get() else {
+            return false;
+        };
+        if len == 0 || off >= self.len {
+            return false;
+        }
+        let ps = page_size();
+        let here = |c: usize| matches!(self.state[c].load(Ordering::Relaxed), HOT | COLD);
+        let a = (off / CHUNK as u64) as usize;
+        let b = (((off + len as u64).min(self.len) - 1) / CHUNK as u64) as usize;
+        let (mut c, mut any) = (a, false);
+        while c <= b {
+            if here(c) {
+                c += 1;
+                continue;
+            }
+            let first = c;
+            while c <= b && !here(c) {
+                c += 1;
+            }
+            let lo = back.hdr.stored_off(first as u64) as usize / ps * ps;
+            let hi = (back.hdr.stored_off(c as u64 - 1) as usize + self.chunk_len(c - 1) + TAG)
+                .min(back.map.len());
+            if lo < hi {
+                // SAFETY: an advice over pages of the envelope's read-only
+                // mapping, which lives as long as this view: it maps them
+                // and changes no byte.
+                any |= unsafe {
+                    libc::madvise(
+                        back.map.as_ptr().add(lo).cast_mut().cast(),
+                        hi - lo,
+                        libc::MADV_POPULATE_READ,
+                    )
+                } == 0;
+            }
+        }
+        any
+    }
+
+    /// The chunks of the range a read reaches with no fault of the page
+    /// tables': present here, or every page their ciphertext lies in
+    /// mapped in the envelope's mapping, by `/proc/self/pagemap`. `None`
+    /// where a chunk is not present and the kernel will not say.
+    fn mapped(&self, off: u64, len: usize) -> Option<f64> {
+        if len == 0 || off >= self.len {
+            return None;
+        }
+        let ps = page_size();
+        let a = (off / CHUNK as u64) as usize;
+        let b = (((off + len as u64).min(self.len) - 1) / CHUNK as u64) as usize;
+        let back = self.back.get();
+        let behind = back.and_then(|back| {
+            let from = back.hdr.stored_off(a as u64) as usize / ps * ps;
+            let to = (back.hdr.stored_off(b as u64) as usize + self.chunk_len(b) + TAG)
+                .min(back.map.len());
+            let base = back.map.as_ptr() as usize;
+            crate::bytes::pagemap_present(base + from, base + to).map(|bits| (from, bits))
+        });
+        let mut have = 0usize;
+        for c in a..=b {
+            if matches!(self.state[c].load(Ordering::Relaxed), HOT | COLD) {
+                have += 1;
+                continue;
+            }
+            let (Some(back), Some((from, bits))) = (back, &behind) else {
+                return None;
+            };
+            let at = back.hdr.stored_off(c as u64) as usize;
+            let end = (at + self.chunk_len(c) + TAG).min(back.map.len());
+            if (at / ps * ps..end)
+                .step_by(ps)
+                .all(|p| bits.get((p - from) / ps).is_some_and(|&b| b))
+            {
+                have += 1;
+            }
+        }
+        Some(have as f64 / (b - a + 1) as f64)
+    }
 }
 
 impl Paged {
@@ -2170,6 +2257,73 @@ mod tests {
                 "mapped: {n} at {off}"
             );
         }
+    }
+
+    /// What a populate maps is the ciphertext a fill would fault on
+    /// (`Paging::populate`, `Paging::mapped`): an envelope in the kernel's
+    /// cache and out of this process's page tables reads as resident and
+    /// as not mapped; a populate of a range maps the envelope's pages for
+    /// its chunks and decrypts nothing, and maps nothing far from it; a
+    /// chunk present here reads as mapped whatever the tables hold of its
+    /// ciphertext, and a populate of it asks the kernel for nothing. And
+    /// as the engine asks, through the mapping a reader holds. Not under
+    /// qemu-user (`supdb_emulated`), whose ask passes nothing to the
+    /// kernel.
+    #[cfg(all(target_os = "linux", not(supdb_emulated)))]
+    #[test]
+    fn a_populate_maps_the_ciphertext_of_what_is_not_present_and_decrypts_nothing() {
+        let dir = scratch("populate");
+        let bytes = plain(8 * 1024 * 1024, 3);
+        let path = dir.join("e");
+        envelope(&path, &bytes, 9);
+        File::open(&path).unwrap().sync_all().unwrap();
+        let pager = Pager::new(u64::MAX);
+        let p = sparse(&pager, &path, 9);
+        let len = bytes.len();
+        // Out of the tables and the cache, then back into the cache alone.
+        p.forget(0, len);
+        let _ = p.willneed(0, len);
+        let t = std::time::Instant::now();
+        while p.resident(0, len) < 0.99 {
+            assert!(t.elapsed().as_secs() < 20, "the envelope did not come in");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(p.mapped(0, len), Some(0.0), "resident and not mapped");
+        assert_eq!(p.mapped(0, 0), None, "an empty range");
+        assert_eq!(p.mapped(len as u64, 5), None, "past the end");
+        let fills = pager.counts().fills;
+        assert!(p.populate(2_000_000, 1_000_000), "the kernel took it");
+        assert_eq!(p.mapped(2_000_000, 1_000_000), Some(1.0), "the range");
+        assert_eq!(p.mapped(6_000_000, 2_000_000), Some(0.0), "and nothing far");
+        assert_eq!(p.mapped(0, 500_000), Some(0.0), "on either side");
+        assert_eq!(pager.counts().fills, fills, "nothing decrypted");
+        assert!(!p.populate(0, 0), "an empty range");
+        assert!(!p.populate(len as u64, 5), "past the end");
+        // A chunk here is reached with no fault whatever the tables hold
+        // of its ciphertext, and nothing is asked for it.
+        {
+            let _h = pager.hold();
+            read(&p, 7_000_000, 10).unwrap();
+        }
+        p.forget(0, len);
+        assert_eq!(p.mapped(7_000_000, 10), Some(1.0), "a chunk present");
+        assert_eq!(p.mapped(6_500_000, 10), Some(0.0), "a chunk nobody holds");
+        assert!(!p.populate(7_000_000, 10), "nothing mapped for it");
+        assert_eq!(p.resident(6_500_000, 10), 0.0, "and nothing read back");
+        // As the engine asks, through the mapping a reader holds.
+        use crate::bytes::Bytes;
+        let m = crate::bytes::MmapBytes::paged(p.clone());
+        let _ = m.advise_willneed(0, len);
+        let t = std::time::Instant::now();
+        while m.resident_share(0, len).map(|s| s > 0.99) != Some(true) {
+            assert!(t.elapsed().as_secs() < 20, "the envelope did not come back");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(m.mapped_share(3_000_000, 1_000_000), Some(0.0));
+        assert!(m.populate_read(3_000_000, 1_000_000));
+        assert_eq!(m.mapped_share(3_000_000, 1_000_000), Some(1.0));
+        assert_eq!(m.mapped_share(len as u64, 5), None, "past the end");
+        assert_eq!(pager.counts().fills, fills + 1, "one chunk read, no other");
     }
 
     #[test]

@@ -32,12 +32,14 @@ src/bytes.rs	MmapBytes::advise_normal	paged	code	1	stays	the seam: Paging, piece
 src/bytes.rs	MmapBytes::advise_random	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::advise_willneed	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::map	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
+src/bytes.rs	MmapBytes::mapped_share	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::paged	paged	code	2	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::paged	pager	code	4	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::piece_at	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::piece_end	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::piecewise	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::piecewise	piecewise/ASK_PIECES	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
+src/bytes.rs	MmapBytes::populate_read	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::resident_at	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::resident_share	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::slice_slow	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary

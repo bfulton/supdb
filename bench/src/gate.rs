@@ -116,6 +116,7 @@ pub fn is_comparator(arm: &str) -> bool {
             | "rocksdb-nosync"
             | "rocksdb-tuned-nosync"
             | "rocksdb-tuned-nosync-enc"
+            | "faster"
     )
 }
 
@@ -1091,19 +1092,21 @@ mod tests {
     }
 
     /// One name per thread count the runner measures at, on any machine
-    /// the suite runs on: the names are a pattern over the two bases a
-    /// threaded pass has, and nothing else carries the suffix.
+    /// the suite runs on: the names are a pattern over the three bases a
+    /// threaded pass has -- the reads', the scans' and the threaded mixes',
+    /// which also run on one thread -- and nothing else carries the suffix.
     #[test]
     fn every_threaded_quantity_is_named() {
         for cpus in 1..=64 {
             for t in crate::run::thread_counts(cpus) {
-                for base in ["reads_per_s", "entries_per_s"] {
+                for base in ["reads_per_s", "entries_per_s", "ops_per_s"] {
                     let q = crate::run::threaded_quantity(base, t);
                     assert_eq!(higher_is_better(&q), Some(true), "{q} is not named");
                 }
             }
         }
-        assert_eq!(higher_is_better("ops_per_s_2t"), None);
+        assert_eq!(higher_is_better("ops_per_s_1t"), Some(true));
+        assert_eq!(higher_is_better("p99_us_2t"), None);
     }
 
     /// A seek floor is judged on both sides: faster than every prior

@@ -78,7 +78,7 @@ pub fn threaded_quantity(base: &str, threads: usize) -> String {
 /// single-threaded quantity.
 pub fn threads_of(quantity: &str) -> Option<usize> {
     let (base, count) = quantity.rsplit_once('_')?;
-    if !matches!(base, "reads_per_s" | "entries_per_s") {
+    if !matches!(base, "reads_per_s" | "entries_per_s" | "ops_per_s") {
         return None;
     }
     count.strip_suffix('t')?.parse().ok()
@@ -151,10 +151,16 @@ pub struct Passes {
     /// workloads, where it reads as off.
     #[serde(default)]
     pub recover: bool,
+    /// The threaded mixes, `threads-A` and its kin (`THREADED`): gets and
+    /// puts from several threads at once, on a store of their own. In no
+    /// row of the series: off in `all`, and run where `--passes` names
+    /// them, for what they cost every arm (`DESIGN.md`).
+    #[serde(default)]
+    pub mixes_threaded: bool,
 }
 
 impl Passes {
-    pub const NAMES: [&'static str; 10] = [
+    pub const NAMES: [&'static str; 11] = [
         "load",
         "read",
         "read-threaded",
@@ -165,6 +171,7 @@ impl Passes {
         "mixes-scrambled",
         "lag",
         "recover",
+        "mixes-threaded",
     ];
 
     pub fn all() -> Passes {
@@ -179,6 +186,7 @@ impl Passes {
             mixes_scrambled: true,
             lag: true,
             recover: true,
+            mixes_threaded: false,
         }
     }
 
@@ -206,6 +214,7 @@ impl Passes {
             mixes_scrambled: false,
             lag: false,
             recover: false,
+            mixes_threaded: false,
         };
         let mut any = false;
         for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -221,6 +230,7 @@ impl Passes {
                 "mixes-scrambled" => p.mixes_scrambled = true,
                 "lag" => p.lag = true,
                 "recover" => p.recover = true,
+                "mixes-threaded" => p.mixes_threaded = true,
                 other => {
                     return Err(format!(
                         "no pass named {other:?}; the passes are {}",
@@ -406,6 +416,44 @@ const YCSBS_SEED_SALT: u64 = 0x5300;
 const YCSB_BATCH: usize = 100;
 const YCSB_SCAN: usize = 50;
 
+/// What each operation of a threaded mix is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadedMix {
+    /// Half point reads and half updates, YCSB's A.
+    HalfUpdates,
+    /// Every operation a read-modify-write: the key's value read and then
+    /// replaced.
+    Rmw,
+}
+
+/// The threaded mixes, the workloads `threads-A`, `threads-A-uniform`,
+/// `threads-RMW` and `threads-RMW-uniform`: point gets and puts from
+/// several threads at once, which no other workload here has -- the
+/// threaded passes read with the writer idle, and the mixes write from
+/// one thread. They are the two workloads FASTER's own benchmark runs
+/// (`cc/benchmark-dir`: 50:50 reads and upserts, and 100% read-modify-
+/// write), each under YCSB's Zipfian (`KeyDist::Scrambled`) and uniform,
+/// as that benchmark's key files are. Every key is one the load wrote:
+/// the mixes update and never insert, so the store they leave holds what
+/// it held.
+///
+/// They run on a store of their own, loaded in key order and synced, each
+/// on one thread and then on each count of `Plan::threads`,
+/// `Plan::divided(size)` operations a thread, as the threaded reads run:
+/// the quantities `ops_per_s_1t`, `ops_per_s_2t` and so on. In table
+/// order on the store the one before leaves, so a cell is that workload at
+/// that point of the sequence for every engine alike, and a rate's growth
+/// from one count to the next carries the store's history as well as the
+/// threads: an engine that pays more for a key's first update than for its
+/// later ones pays most of it in the first cells.
+const THREADED: [(&str, ThreadedMix, KeyDist); 4] = [
+    ("A", ThreadedMix::HalfUpdates, KeyDist::Scrambled),
+    ("A-uniform", ThreadedMix::HalfUpdates, KeyDist::Uniform),
+    ("RMW", ThreadedMix::Rmw, KeyDist::Scrambled),
+    ("RMW-uniform", ThreadedMix::Rmw, KeyDist::Uniform),
+];
+const THREADED_MIX_SEED: u64 = 0x7417;
+
 /// The seeds the read and scan passes draw their keys with, named once
 /// since `replay_row` draws the same keys for a model of a store.
 const READ_SEED: u64 = 7;
@@ -523,6 +571,39 @@ pub fn thread_switches() -> (u64, u64) {
 }
 
 /// This thread's minor page faults so far.
+/// Major faults so far of this process's threads named `comm`, and of this
+/// thread: `[upkeep, segment work, this thread]` for the lag sweep's
+/// `lagmajflt` line. A thread that has ended took its count with it, so
+/// the two named are the store's long-lived ones and a job's thread, a
+/// seal's or a merge's, is in neither.
+pub fn lag_majflt() -> [u64; 3] {
+    let of = |comm: &str| -> u64 {
+        let Ok(rd) = std::fs::read_dir("/proc/self/task") else {
+            return 0;
+        };
+        let mut total = 0u64;
+        for e in rd.flatten() {
+            let p = e.path();
+            if std::fs::read_to_string(p.join("comm"))
+                .unwrap_or_default()
+                .trim()
+                != comm
+            {
+                continue;
+            }
+            if let Ok(stat) = std::fs::read_to_string(p.join("stat")) {
+                total += stat_majflt(&stat).unwrap_or(0);
+            }
+        }
+        total
+    };
+    [
+        of("supdb-upkeep"),
+        of("supdb-maint"),
+        majflt_self().unwrap_or(0),
+    ]
+}
+
 pub fn minflt_self() -> u64 {
     std::fs::read_to_string("/proc/thread-self/stat").map_or(0, |s| stat_minflt(&s))
 }
@@ -959,6 +1040,17 @@ impl Samples {
             gate::higher_is_better(quantity).is_some(),
             "quantity {quantity:?} has no direction; add it to gate::higher_is_better"
         );
+        // A phase that did not run has no sample. Its rate is the NaN the
+        // pass left where the rate would be: the plan's passes left the
+        // phase out (`bench run --passes`), or the arm cannot run it (one
+        // with no ordered scan has no scan pass). JSON has no NaN, serde
+        // writes one as null, and a null among a row's samples is a row
+        // that `Row::read` refuses whole -- the first quick row with
+        // `faster` in it was written and then read by neither the gate nor
+        // the figures.
+        if v.is_nan() {
+            return;
+        }
         self.map
             .entry((
                 workload.to_string(),
@@ -1252,6 +1344,11 @@ fn pass_measurements(size: u64, arm: &str, g: Guarantee, one: &OnePass) -> Vec<M
         let q = threaded_quantity("entries_per_s", *threads);
         s.push("scan-mixed", sz, arm, g, (q.as_str(), "entries/s"), *v);
     }
+    for (name, threads, v) in &one.mix_threaded {
+        let q = threaded_quantity("ops_per_s", *threads);
+        let w = format!("threads-{name}");
+        s.push(&w, sz, arm, g, (q.as_str(), "ops/s"), *v);
+    }
     for (workload, r) in one.recoveries() {
         s.push(workload, sz, arm, g, ("open_ms", "ms"), r.open_ms);
         if let Some(us) = r.first_read_us {
@@ -1535,7 +1632,9 @@ pub fn run(
                 let outcome = if plan.fresh_process {
                     pass_in_child(arm, &dir, size, rep, map_gb, plan)?
                 } else {
-                    PassOutcome::Done(one_pass(arm, &dir, size, map_gb, plan, &payload, None)?)
+                    PassOutcome::Done(Box::new(one_pass(
+                        arm, &dir, size, map_gb, plan, &payload, None,
+                    )?))
                 };
                 let _ = std::fs::remove_dir_all(&dir);
                 match outcome {
@@ -1813,6 +1912,10 @@ pub struct OnePass {
     /// keys they updated and inserted are unsealed: (threads, aggregate
     /// throughput).
     scan_mixed_threaded: Vec<(usize, f64)>,
+    /// The threaded mixes (`THREADED`): (name, threads, aggregate
+    /// operations a second). Absent from a pass taken before them.
+    #[serde(default)]
+    mix_threaded: Vec<(String, usize, f64)>,
     /// What the engine says it did, rather than how fast; see
     /// `Engine::counters`. Owned names, since a pass crosses a process
     /// boundary as JSON (`pass_in_child`).
@@ -2491,7 +2594,10 @@ fn shuffled_load(
 /// once the row is written (`main`), which is the status a bounded run's
 /// wrapper reads.
 pub enum PassOutcome {
-    Done(OnePass),
+    /// Boxed: a pass's result is three times a kill's size, and the
+    /// threaded mixes' rates took it past what the two are passed around
+    /// as one type at.
+    Done(Box<OnePass>),
     Killed(Kill),
 }
 
@@ -2666,7 +2772,7 @@ fn pass_in_child(
         .map_err(|e| format!("the pass's result for {arm} at {size} keys: {e}"))?;
     let _ = std::fs::remove_file(&out);
     serde_json::from_str(&text)
-        .map(PassOutcome::Done)
+        .map(|one| PassOutcome::Done(Box::new(one)))
         .map_err(|e| format!("the pass's result for {arm}: {e}"))
 }
 
@@ -2737,7 +2843,17 @@ fn one_pass(
     // The directory first, since the counting finds the device through it.
     let mut counting = Counting::new(plan.bound.as_ref(), dir, trace)?;
     let prime_a = prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
+    engines::set_store_keys(size);
     let mut e = engines::open(arm, dir, map_gb)?;
+    // An engine with no ordered scan (FASTER's hash store) runs every
+    // workload made of point operations and none of the scans: the scan
+    // passes, the scan-bearing mix (YCSB E) and the scans after each burst
+    // of the lag sweep are left out for it, and its row has no cell there.
+    let can_scan = e.features().ordered_scan;
+    // And an engine whose arm does not reopen a store for writing (FASTER's,
+    // which does not recover from its checkpoint here) runs no recovery
+    // workload, which is a store reopened after its writer was killed.
+    let can_reopen = e.features().reopen_for_write;
     let (load_s, wrote) = ordered_load(e.as_mut(), arm, size, plan, payload, &mut counting)?;
     let stored = size as f64 * (KEY_SIZE + plan.value_size) as f64;
     // Read here so that this and the device bytes describe one moment: what
@@ -2819,7 +2935,7 @@ fn one_pass(
     let per_op = std::env::var_os("SUPDB_SCAN_OPS").is_some();
     let mut op_us: Vec<f64> = Vec::new();
     let mut scan_s = f64::NAN;
-    if passes.scan {
+    if passes.scan && can_scan {
         let c0 = counting.begin();
         phase_mark(arm, "scan", "start");
         let t = Instant::now();
@@ -2874,7 +2990,7 @@ fn one_pass(
     let scan_counting = std::env::var_os("SUPDB_SCAN_COUNTERS").is_some();
     let mut scan_entries_s_threaded = Vec::with_capacity(plan.threads.len());
     for &threads in &plan.threads {
-        if !passes.scan_threaded {
+        if !passes.scan_threaded || !can_scan {
             break;
         }
         let ops = plan.divided(size) * threads as u64;
@@ -2954,7 +3070,7 @@ fn one_pass(
     }
     let mut scan_mixed_threaded = Vec::with_capacity(plan.threads.len());
     for &threads in &plan.threads {
-        if !passes.scan_mixed {
+        if !passes.scan_mixed || !can_scan {
             break;
         }
         let ops = plan.divided(size) * threads as u64;
@@ -3020,6 +3136,7 @@ fn one_pass(
     } else {
         Vec::new()
     };
+
     // A pass opens two stores -- this one, and a fresh one below for the
     // shuffled load and the lag sweep -- so the counts of the first are
     // taken before it goes. Read from the second alone they described the
@@ -3044,6 +3161,7 @@ fn one_pass(
     if (passes.load && !engines::write_once(arm)) || passes.lag {
         prime_b = prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        engines::set_store_keys(size);
         let mut e = engines::open(arm, dir, map_gb)?;
         shuf_s = shuffled_load(e.as_mut(), arm, size, plan, payload, &mut counting)?;
         // What the shuffled load freed, returned before the sweep: its
@@ -3078,12 +3196,65 @@ fn one_pass(
         release_freed_memory();
     }
 
+    // The threaded mixes, on a store of their own that the ordered load
+    // fills and syncs: a cell of theirs is then the same cell whichever
+    // other passes ran, where on the first store it would be of whatever
+    // the mixes before it had left. Each on one thread and then on each
+    // count, the threaded reads' operations a thread. Every key they draw
+    // was loaded and every write is an update of a value of `value_size`
+    // bytes, so every read must hand back exactly that, as the threaded
+    // reads' must. In memory only: no count is read around them, so a
+    // bounded row carries none.
+    let mut mix_threaded = Vec::new();
+    if passes.mixes_threaded && plan.bound.is_none() {
+        prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
+        // The lag store's files are still here where that store was built.
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        engines::set_store_keys(size);
+        let mut e = engines::open(arm, dir, map_gb)?;
+        load(e.as_mut(), size, plan, payload, |i| i)?;
+        release_freed_memory();
+        let per_thread = plan.divided(size);
+        for (i, &(name, mix, dist)) in THREADED.iter().enumerate() {
+            for threads in std::iter::once(1).chain(plan.threads.iter().copied()) {
+                let ops = per_thread * threads as u64;
+                let seed = THREADED_MIX_SEED ^ ((i as u64) << 8) ^ threads as u64;
+                let got = threaded_mix(
+                    e.as_mut(),
+                    &format!("threads-{name}"),
+                    threads,
+                    ops,
+                    size,
+                    &km,
+                    seed,
+                    mix,
+                    dist,
+                    payload,
+                )?;
+                let want = got.reads * plan.value_size as u64;
+                if got.bytes != want {
+                    return Err(format!(
+                        "{arm} at {size}: threads-{name} on {threads} threads read back {} bytes \
+                         over {} reads of keys the store holds at {} bytes each; \
+                         a mix over a different store is not a measurement",
+                        got.bytes, got.reads, plan.value_size
+                    ));
+                }
+                mix_threaded.push((name.to_string(), threads, ops as f64 / got.secs));
+            }
+        }
+        drop(e);
+        release_freed_memory();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     // The recovery workloads, each on a store of its own: the ordered
     // load's batches and then the shuffled load's, committed by a process
     // that is killed where the last was acknowledged, and the store it
     // left opened here (`recover_store`).
     let mut recovered = None;
-    if passes.recover {
+    if passes.recover && can_reopen {
         recovered = Some(Box::new([
             recover_store(arm, dir, size, map_gb, plan, false)?,
             recover_store(arm, dir, size, map_gb, plan, true)?,
@@ -3129,6 +3300,7 @@ fn one_pass(
         ycsb_ops_s,
         ycsbs_ops_s,
         scan_mixed_threaded,
+        mix_threaded,
         counters: counters
             .into_iter()
             .map(|(n, v)| (n.to_string(), v))
@@ -3470,6 +3642,11 @@ fn lag_sweep(
         } else {
             (0, 0)
         };
+        // The long-lived threads' major faults, read before the burst, at
+        // its end and after the pass (`lagmajflt`): whose reads of the
+        // store's files went to the device, in the burst and in the pass
+        // apart, where `lagdev` has the group's whole count over the pass.
+        let mf0 = if counting_store { lag_majflt() } else { [0; 3] };
         let cb = if wrote > 0 { counting.begin() } else { None };
         let burst_cpu0 = thread_cpu_us();
         let tw = Instant::now();
@@ -3516,6 +3693,7 @@ fn lag_sweep(
                 lag_arenas("lagburstarenas", arm, &pct.to_string());
             }
         }
+        let mf1 = if counting_store { lag_majflt() } else { [0; 3] };
         if pct == 0 {
             // The shuffled load's own tail is drained here and the merge
             // the drain hands to the segment work is joined, so no merge
@@ -3532,6 +3710,11 @@ fn lag_sweep(
             // some reps and not others, and `lagcounters` counts them.
             e.sync()?;
             e.settle()?;
+        }
+        // The burst is timed and kept for an engine with no ordered scan;
+        // the scans after it are not run, and the point has no scan cell.
+        if !e.features().ordered_scan {
+            continue;
         }
         // A probe, under `SUPDB_LAG_FORMS`: the block cache by partition
         // where the pass starts (`Engine::forms_by_partition`). It takes the
@@ -3688,6 +3871,17 @@ fn lag_sweep(
                 &c1,
             );
             census_line("lagcensus", arm, &pct.to_string(), e, true);
+            let mf2 = lag_majflt();
+            let d = |a: [u64; 3], b: [u64; 3], i: usize| b[i].saturating_sub(a[i]);
+            eprintln!(
+                "lagmajflt {arm} {pct} burst up {} maint {} main {} | pass up {} maint {} main {}",
+                d(mf0, mf1, 0),
+                d(mf0, mf1, 1),
+                d(mf0, mf1, 2),
+                d(mf1, mf2, 0),
+                d(mf1, mf2, 1),
+                d(mf1, mf2, 2),
+            );
         }
         if forms_probe {
             for l in e.forms_by_partition() {
@@ -4019,7 +4213,9 @@ pub fn ab(
             let outcome = if plan.fresh_process {
                 pass_in_child(arm, &dir, size, rep, map_gb, plan)?
             } else {
-                PassOutcome::Done(one_pass(arm, &dir, size, map_gb, plan, &payload, None)?)
+                PassOutcome::Done(Box::new(one_pass(
+                    arm, &dir, size, map_gb, plan, &payload, None,
+                )?))
             };
             let _ = std::fs::remove_dir_all(&dir);
             let one = match outcome {
@@ -4434,6 +4630,132 @@ struct Threaded {
     own: (u64, u64),
 }
 
+/// What a threaded mix measured: the span from the first thread's release
+/// to the last's finish, and the reads every thread made with the bytes
+/// they handed back.
+struct ThreadedMixed {
+    secs: f64,
+    reads: u64,
+    bytes: u64,
+}
+
+/// `ops` operations of `mix`, keys drawn by `dist` below `keys`, split
+/// across `threads` threads that read and write the one store at once,
+/// each through a handle of its own (`Engine::thread_writers`) -- made on
+/// this thread, opened on its own -- with a key generator, a coin and a
+/// value stream seeded apart from the others'. A thread's updates are
+/// batched by `YCSB_BATCH` and committed as the mixes commit theirs, its
+/// tail inside its window; an engine with a read-modify-write of its own
+/// runs it, one operation at a time (`ThreadWriter::rmw`). The clock is
+/// `threaded`'s: the threads are released together and the result is the
+/// span from the first release to the last finish.
+///
+/// Nothing syncs inside the window. A buffered arm's commit is in the
+/// kernel when it returns, and what an engine promises less than that is
+/// its arm's to say (`Features`).
+#[allow(clippy::too_many_arguments)]
+fn threaded_mix(
+    e: &mut dyn Engine,
+    pass: &str,
+    threads: usize,
+    ops: u64,
+    keys: u64,
+    km: &KeyMap,
+    seed: u64,
+    mix: ThreadedMix,
+    dist: KeyDist,
+    payload: &Payload,
+) -> Result<ThreadedMixed, String> {
+    if threads == 0 {
+        return Err("a threaded mix needs at least one thread".to_string());
+    }
+    let name = e.name();
+    let openers = e.thread_writers(threads)?;
+    let barrier = std::sync::Barrier::new(threads + 1);
+    type Timed = Result<(Instant, Instant, u64, u64), String>;
+    let results: Vec<Timed> = std::thread::scope(|s| {
+        let workers: Vec<_> = openers
+            .into_iter()
+            .enumerate()
+            .map(|(i, open)| {
+                let barrier = &barrier;
+                let share = share(ops, threads, i);
+                let seed = thread_seed(seed, i);
+                s.spawn(move || -> Timed {
+                    // Every thread reaches the barrier whatever opening
+                    // did, as in `threaded`.
+                    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(open))
+                        .unwrap_or_else(|_| Err("the writer's opener panicked".to_string()));
+                    let mut g = KeyGen::new(dist, keys, seed);
+                    let mut pick = Rng::new(seed ^ 0x5EED);
+                    let mut vrng = Rng::new(seed ^ 0xE2);
+                    let mut kb = [0u8; KEY_SIZE];
+                    let mut wbuf = Batch::with_capacity(YCSB_BATCH, payload.value_size());
+                    barrier.wait();
+                    let start = Instant::now();
+                    let mut w = opened?;
+                    let (mut reads, mut bytes) = (0u64, 0u64);
+                    for _ in 0..share {
+                        km.key_into(g.next(), &mut kb);
+                        match mix {
+                            ThreadedMix::HalfUpdates => {
+                                if pick.below(100) < 50 {
+                                    bytes += w.get(&kb)? as u64;
+                                    reads += 1;
+                                } else {
+                                    wbuf.push(&kb, payload.get(&mut vrng));
+                                }
+                            }
+                            ThreadedMix::Rmw => {
+                                let v = payload.get(&mut vrng);
+                                reads += 1;
+                                match w.rmw(&kb, v) {
+                                    Some(read) => bytes += read? as u64,
+                                    None => {
+                                        bytes += w.get(&kb)? as u64;
+                                        wbuf.push(&kb, v);
+                                    }
+                                }
+                            }
+                        }
+                        if wbuf.len() >= YCSB_BATCH {
+                            wbuf.flush_updates_to(w.as_mut())?;
+                        }
+                    }
+                    wbuf.flush_updates_to(w.as_mut())?;
+                    let end = Instant::now();
+                    Ok((start, end, reads, bytes))
+                })
+            })
+            .collect();
+        phase_mark(name, &format!("{pass}-{threads}t"), "start");
+        barrier.wait();
+        workers
+            .into_iter()
+            .map(|w| {
+                w.join()
+                    .unwrap_or_else(|_| Err("a writer thread panicked".to_string()))
+            })
+            .collect()
+    });
+    phase_mark(name, &format!("{pass}-{threads}t"), "end");
+    let (mut reads, mut bytes) = (0u64, 0u64);
+    let mut first: Option<Instant> = None;
+    let mut last: Option<Instant> = None;
+    for r in results {
+        let (start, end, n, b) = r?;
+        reads += n;
+        bytes += b;
+        first = Some(first.map_or(start, |f| f.min(start)));
+        last = Some(last.map_or(end, |l| l.max(end)));
+    }
+    let secs = match (first, last) {
+        (Some(f), Some(l)) => l.duration_since(f).as_secs_f64(),
+        _ => 0.0,
+    };
+    Ok(ThreadedMixed { secs, reads, bytes })
+}
+
 /// One YCSB workload over a loaded store: `ops` operations (`ycsb_ops`,
 /// divided out of core), writes batched by `YCSB_BATCH` and the tail
 /// flushed inside the timed region, inserts taking fresh keys past the
@@ -4522,8 +4844,12 @@ fn mix_family(
     // chunk under each arena's lock, asked for and not given.
     let mix_census = std::env::var_os("SUPDB_MIX_CENSUS").is_some();
     let mix_census_detail = std::env::var("SUPDB_MIX_CENSUS").is_ok_and(|v| v == "2");
+    let can_scan = e.features().ordered_scan;
     for letter in YCSB_ORDER {
         let w = table.iter().find(|w| w.0 == letter).unwrap();
+        if w.4 > 0 && !can_scan {
+            continue;
+        }
         let c0 = if mix_counting {
             e.counters()
         } else {
@@ -5544,7 +5870,8 @@ mod tests {
         assert_eq!(threads_of("reads_per_s"), None);
         assert_eq!(threads_of("entries_per_s"), None);
         assert_eq!(threads_of("p99_us"), None);
-        assert_eq!(threads_of("ops_per_s_2t"), None);
+        assert_eq!(threads_of("ops_per_s_2t"), Some(2));
+        assert_eq!(threads_of("ops_per_s"), None);
     }
 
     /// Every engine's threaded readers read the store the writer loaded:
@@ -6657,8 +6984,18 @@ mod tests {
     /// refused naming it, and an empty list is refused too.
     #[test]
     fn the_passes_parse_by_name_and_refuse_a_name_they_lack() {
+        // Every name is every pass of a row and the one that is in none
+        // unless it is named.
         let all = Passes::parse(&Passes::NAMES.join(",")).unwrap();
-        assert_eq!(all, Passes::all());
+        assert_eq!(
+            all,
+            Passes {
+                mixes_threaded: true,
+                ..Passes::all()
+            }
+        );
+        assert!(!Passes::all().mixes_threaded && !Passes::paired().mixes_threaded);
+        assert!(Passes::parse("mixes-threaded").unwrap().mixes_threaded);
         let some = Passes::parse("read, scan-threaded,lag").unwrap();
         assert!(some.read && some.scan_threaded && some.lag);
         assert!(!some.load && !some.read_threaded && !some.scan && !some.mixes);

@@ -6566,6 +6566,10 @@ pub(super) struct ZEvents {
     /// and the milliseconds they waited.
     pub raw_settles: AtomicU64,
     pub raw_settle_ms: AtomicU64,
+    /// The segments such a settle mapped after its ask, and the
+    /// milliseconds the mapping took.
+    pub raw_maps: AtomicU64,
+    pub raw_map_ms: AtomicU64,
     /// Re-codes made by exchanging the served form file with the kept one.
     pub recode_flips: AtomicU64,
     /// Spares built and kept (`Options::zpages_both`), and spares that kept
@@ -16121,10 +16125,8 @@ mod tests {
                 let numbers = numbers_of(&body, &fx);
                 let lay = facts.layout;
                 let words = |at: u64, n: usize| -> Vec<u64> {
-                    bytes[at as usize..at as usize + 8 * n]
-                        .chunks_exact(8)
-                        .map(|w| u64::from_le_bytes(w.try_into().unwrap()))
-                        .collect()
+                    let (words, _) = bytes[at as usize..at as usize + 8 * n].as_chunks::<8>();
+                    words.iter().map(|w| u64::from_le_bytes(*w)).collect()
                 };
                 assert_eq!(words(lay.k_off(), numbers.len()), numbers, "{name}");
                 assert!(

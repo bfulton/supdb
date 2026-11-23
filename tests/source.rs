@@ -4704,6 +4704,11 @@ const CI_SETUP: &[(&str, &str)] = &[
         "installs libclang for bindgen and names it to the build",
     ),
     (
+        "sh bench/scripts/faster.sh",
+        "fetches FASTER's sources at the pinned commit and installs the libraries they link, \
+         for the suite's `faster` arm; writes nothing to the job's environment",
+    ),
+    (
         "sudo sh scripts/fscrypt.sh up /mnt/supdb-fscrypt \"$(id -u):$(id -g)\" >> \"$GITHUB_ENV\"",
         "makes the filesystem the fscrypt group runs on, and names it in the job's environment",
     ),

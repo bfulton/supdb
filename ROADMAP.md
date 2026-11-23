@@ -132,6 +132,20 @@ The suite has to be fair before any of its numbers are quoted.
   store is under a cgroup bound, where free memory is page cache the
   store does not have (`Options::forms_to_fit`'s trim, priced in core
   before it is the default under a bound); and 1 GiB.
+- [ ] **An arm at FASTER's promise.** `faster` is in the roster with a
+  guarantee of its own, in memory until a checkpoint, and nothing to be
+  compared with there: the buffered arms hand every commit to the kernel
+  and FASTER hands it to nobody. A supdb arm whose log stays in the
+  process's memory between checkpoints would be the matched one, and is
+  an arm for that comparison and not a default. Done when the group has a
+  supdb arm in it and the figures draw it.
+- [ ] **The threaded mixes in a row, or not.** `threads-A` and `threads-RMW`
+  are the workloads FASTER is picked for, gets and puts from several
+  threads at once, and they run only where `--passes mixes-threaded` asks:
+  a store's worth of operations a thread, on one thread and each thread
+  count, for every arm, is hours more a full row. Done when a row carries
+  them for the arms and at the operation count somebody chose, or the
+  suite says why it does not.
 - [ ] **Match the checksum work, or state it.** RocksDB reads with
   `verify_checksums(false)`, under which it verifies no data block it
   reads, from the file or into its cache. supdb verifies a segment's key
@@ -221,6 +235,26 @@ What an engine picker would hit, roughly in order.
   with a count; add an end bound and reverse order.
 - [ ] **Batched point reads (`MultiGet`).** Cheap to add, and a natural new
   benchmark workload.
+- [ ] **A conditional write.** A put or delete that applies only if the key
+  is still as its caller read it, and says whether it applied:
+  compare-and-swap. A read-modify-write is atomic today only through the
+  writer (a `Txn` borrows it, reads through it and commits as one batch),
+  so threads that share a store either queue their reads behind the writer
+  or read through a `Reader` and write later, where another thread's write
+  to the key can land in between and be lost. It matters to an engine
+  picker who has several threads and one counter, and to the suite: the
+  `threads-RMW` workloads run FASTER's read-modify-write, which is atomic,
+  beside a read and a later write for supdb, which is not. It buys
+  correctness and costs speed: `put` looks nothing up in the store, so
+  there is no second lookup to save, and the check is work inside the one
+  writer. It is not concurrent writers with conflict detection, which
+  stays under proposed out of scope: the writer is still one, and it
+  applies or refuses. Done when the writer and a `Txn` take a conditional
+  put and delete, a refused one leaves the store and its batch as they
+  were, a test holds read-modify-writes from several threads over a few
+  hot keys to no lost update, and `threads-RMW` runs supdb through it.
+  Open for the design: whether the condition is the value or the position
+  it was read at.
 - [x] **One sequence for the log and the runs.** A recovery orders the
   log's replayed frames above every piece, the one it rebuilds from a
   direct run's file included, so a run is sound only above every key the

@@ -5152,6 +5152,12 @@ impl ScanModel {
                 String::from_utf8_lossy(k)
             );
         }
+        self.check_scans(db, state);
+    }
+
+    /// The scans of `check` alone, for a store that must stay far from
+    /// point reads (`Options::scan_cache_copies_fit`).
+    fn check_scans(&self, db: &Reader, state: &str) {
         let visited = self.visited();
         // Every visited key is a start while there are few; past a few
         // hundred, every scan still streams every key but the starts are
@@ -5440,6 +5446,394 @@ fn the_caches_own_budget_grows_into_the_room_the_partitions_leave() {
         grew == 0 && bound > 0,
         "with the option off the budget bound whatever the room: {grew} growths, {bound} bindings"
     );
+}
+
+/// Where the store's own budget would bind for want of room beside the raw
+/// form, a store no point read is near holds its cache in the raw records'
+/// place (`Options::scan_cache_copies_fit`): the budget becomes what the
+/// bound leaves once the key sections are given up, where a copy of every
+/// block fits in it, and nothing binds. The page cache's budget is the
+/// test's seam and falls by what the cache takes, as the platform's does:
+/// the first crossing grows into the little room beside the raw form, and
+/// at the second there is none. There the option grants the place; without
+/// it the budget binds, and it binds with it where a point read has come
+/// near, through the writer or through a handle, and where a copy of every
+/// block does not fit the place. A point read after the grant takes it
+/// back: the budget returns to what it was, binds there, and the cache
+/// sheds to it. And a place that the process's other memory has taken
+/// since the grant is given up the same way, with no read at all. The
+/// scans answer the model in every case.
+#[test]
+fn a_scanned_stores_cache_takes_the_raw_records_place() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Case {
+        /// No point read.
+        Far,
+        WriterBefore,
+        HandleBefore,
+        WriterAfter,
+        /// No point read, and the process's other memory grown past the
+        /// place.
+        Squeezed,
+        /// No point read, and a place short of a copy of every block.
+        TooBig,
+        /// No point read, and the place gone the moment it was granted,
+        /// while the cache is still about the budget before it.
+        SqueezedEarly,
+        /// No point read, and every partition served by a form file, so
+        /// that there is no record to hold a copy in the place of.
+        Served,
+    }
+    // What the bound leaves beside the raw form, to begin with.
+    const SLACK: u64 = 64 << 10;
+    let run = |name: &str, fit: bool, case: Case| {
+        let d = dir(name);
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_budget(1 << 30);
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 4 << 20,
+                partition_bytes: Some(64 << 10),
+                l0_trigger: 64,
+                scan_block_cache: true,
+                scan_cache_ahead: false,
+                commit_forms: true,
+                forms_settle_backlog_pct: 0,
+                scan_cache_auto_bytes: 1 << 10,
+                scan_cache_auto_room: true,
+                scan_cache_copies_fit: fit,
+                zpages: if case == Case::Served {
+                    supdb::ZPages::Always
+                } else {
+                    supdb::ZPages::Off
+                },
+                zpages_min_bytes: 0,
+                zpages_inject: Some(inject.clone()),
+                upkeep: supdb::Upkeep::Inline,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        // Values of a hundred bytes, whose records are most of a key
+        // section; of one, where a copy's entries outweigh the hash slots
+        // it would stand in for and no place holds a copy of every block.
+        let pad = if case == Case::TooBig { 0 } else { 96 };
+        let val = |round: u32| format!("{}{}", round % 10, "x".repeat(pad));
+        for k in 0..3000u32 {
+            m.append(&mut db, &key(k), &val(0));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        m.check_scans(&db, &format!("{name}: loaded"));
+        assert!(
+            db.points_far() || !fit,
+            "{name}: a store only scanned is far from point reads"
+        );
+        // The raw form's bytes, from the room under a budget past them,
+        // and its key sections', from the place under the same.
+        if case == Case::Served {
+            // The forced form's files attach at the segment work's turn.
+            let t = std::time::Instant::now();
+            while db.cache_place(1 << 30).1 > 0 {
+                assert!(
+                    t.elapsed().as_secs() < 30,
+                    "{name}: the form files attached"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                db.settle().unwrap();
+            }
+        }
+        let (place, copies, room, _) = db.cache_place(1 << 30);
+        let raw = (1u64 << 30) - room as u64;
+        let sections = raw - ((1u64 << 30) + db.block_cache_bytes() as u64 - place);
+        assert!(
+            (copies > 0 && sections > 0) || case == Case::Served,
+            "{name}: raw {raw} copies {copies}"
+        );
+        let slack = if case == Case::Served {
+            // Room beside the form files, and under the eighth of the
+            // budget a growth into it asks: the budget binds at its first
+            // crossing unless something else grants it.
+            100
+        } else if case == Case::TooBig {
+            assert!(
+                copies > sections + (8 << 10),
+                "{name}: copies of {copies} B outweigh key sections of {sections}"
+            );
+            (copies - sections) / 2
+        } else {
+            assert!(
+                copies < sections + SLACK,
+                "{name}: copies of {copies} B fit the key sections' {sections} and the slack"
+            );
+            SLACK
+        };
+        let point = |db: &mut Db| {
+            if case == Case::HandleBefore {
+                let h = db.reader().unwrap();
+                assert_eq!(h.count(b"key-02999").unwrap(), 1);
+            } else {
+                assert_eq!(db.count(b"key-02999").unwrap(), 1);
+            }
+            assert!(!db.points_far(), "{name}: a point read is near at once");
+        };
+        if matches!(case, Case::WriterBefore | Case::HandleBefore) {
+            point(&mut db);
+        }
+        // Twenty blocks, a key of each a round, until every one is dense
+        // and a copy: the page cache's budget before each commit is the
+        // bound less what the cache holds.
+        let budget = |db: &Db| {
+            if case == Case::Served {
+                raw + slack
+            } else {
+                (raw + slack).saturating_sub(db.block_cache_bytes() as u64)
+            }
+        };
+        // A block a round where the squeeze is to come at the grant, so
+        // that the cache is then little past the budget it crossed.
+        let (rounds, blocks) = if case == Case::SqueezedEarly {
+            (480u32, 1u32)
+        } else {
+            (24, 20)
+        };
+        for round in 1..=rounds {
+            for b in 0..blocks {
+                m.append(&mut db, &key(b * 64 + 1 + round % 24), &val(round));
+            }
+            inject.set_budget(budget(&db));
+            db.commit().unwrap();
+            if blocks > 1 || round % 16 == 0 {
+                m.check_scans(&db, &format!("{name}: round {round}"));
+            }
+            if case == Case::SqueezedEarly && db.cache_copies_grants().0 > 0 {
+                break;
+            }
+        }
+        let before = db.block_cache_bytes();
+        match case {
+            Case::WriterAfter => {
+                point(&mut db);
+                m.append(&mut db, &key(2), &val(99));
+                inject.set_budget(budget(&db));
+                db.commit().unwrap();
+                m.check_scans(&db, &format!("{name}: after the point read"));
+            }
+            Case::Squeezed | Case::SqueezedEarly => {
+                // The page cache's budget read again finds the place gone
+                // to the process's other memory: the cache holds to what
+                // is left. The look reads the budget once a period.
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                for round in 0..2u32 {
+                    m.append(&mut db, &key(2 + round), &val(98));
+                    inject.set_budget(1);
+                    db.commit().unwrap();
+                    m.check_scans(&db, &format!("{name}: squeezed, round {round}"));
+                }
+            }
+            _ => {}
+        }
+        if case == Case::SqueezedEarly {
+            // The place under the squeezed budget is below the budget
+            // from before the grant, which is what the cache is left.
+            let (place, _, _, budget) = db.cache_place(1);
+            assert!(
+                budget as u64 > place,
+                "{name}: a budget of {budget} B stands over a place of {place}"
+            );
+        }
+        let (grants, revokes) = db.cache_copies_grants();
+        let out = (
+            db.cache_growths(),
+            grants,
+            revokes,
+            db.cache_bindings(),
+            before,
+            db.block_cache_bytes(),
+        );
+        let h = db.reader().unwrap();
+        m.check_scans(&h, &format!("{name}: a handle"));
+        out
+    };
+    let (grew, grants, revokes, bound, held, _) = run("copies-fit", true, Case::Far);
+    assert!(
+        grew > 0 && grants > 0 && revokes == 0 && bound == 0 && held as u64 > SLACK,
+        "far from point reads the cache took the records' place and nothing bound: \
+         {grew} growths, {grants} grants, {revokes} taken back, {bound} bindings, {held} B held"
+    );
+    let (grew, grants, _, bound, off, _) = run("copies-fit-off", false, Case::Far);
+    assert!(
+        grew > 0 && grants == 0 && bound > 0 && off < held,
+        "without the option the budget bound beside the raw form: \
+         {grew} growths, {grants} grants, {bound} bindings, {off} B held against {held}"
+    );
+    for (name, case) in [
+        ("copies-fit-writer-read", Case::WriterBefore),
+        ("copies-fit-handle-read", Case::HandleBefore),
+    ] {
+        let (_, grants, _, bound, _, _) = run(name, true, case);
+        assert!(
+            grants == 0 && bound > 0,
+            "{case:?}: a point read near, the records are wanted and the budget bound: \
+             {grants} grants, {bound} bindings"
+        );
+    }
+    let (_, grants, _, bound, _, _) = run("copies-fit-too-big", true, Case::TooBig);
+    assert!(
+        grants == 0 && bound > 0,
+        "a place short of a copy of every block is not granted: {grants} grants, {bound} bindings"
+    );
+    let (_, grants, revokes, bound, before, after) =
+        run("copies-fit-taken-back", true, Case::WriterAfter);
+    assert!(
+        grants > 0 && revokes == 1 && bound == 1 && after < before && after as u64 > SLACK / 2,
+        "a point read after the grant took it back, and the cache shed to the budget before it: \
+         {grants} grants, {revokes} taken back, {bound} bindings, {before} B then {after}"
+    );
+    let (_, grants, _, bound, _, _) = run("copies-fit-served", true, Case::Served);
+    assert!(
+        grants == 0 && bound > 0,
+        "no partition's records to stand in for, nothing is granted: {grants} grants, {bound} bindings"
+    );
+    let (_, grants, revokes, bound, before, after) =
+        run("copies-fit-squeezed-early", true, Case::SqueezedEarly);
+    assert!(
+        grants > 0 && revokes == 0 && bound <= 1 && after <= before,
+        "a place under the budget before the grant leaves the cache that budget: \
+         {grants} grants, {revokes} taken back, {bound} bindings, {before} B then {after}"
+    );
+    let (_, grants, revokes, bound, before, after) =
+        run("copies-fit-squeezed", true, Case::Squeezed);
+    assert!(
+        grants > 0 && revokes == 0 && bound == 1 && after < before,
+        "the place gone to other memory, the cache held to what was left of it: \
+         {grants} grants, {revokes} taken back, {bound} bindings, {before} B then {after}"
+    );
+}
+
+/// The records' place counts a copy for the blocks of the partitions the
+/// raw form serves and none for a partition a form file serves, whose file
+/// is what its reads need whatever the cache holds
+/// (`Reader::copies_place`).
+#[test]
+fn the_records_place_holds_no_copy_of_a_served_partition() {
+    let run = |name: &str, zpages: supdb::ZPages| {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                partition_bytes: Some(64 << 10),
+                zpages,
+                zpages_min_bytes: 0,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        for k in 0..3000u32 {
+            db.append(format!("key-{k:05}").as_bytes(), &[b'x'; 100]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        // A forced form's builds are joined by the settle; its attach is
+        // the segment work's next turn.
+        let t = std::time::Instant::now();
+        let want_none = zpages == supdb::ZPages::Always;
+        loop {
+            let (place, copies, _, _) = db.cache_place(1 << 30);
+            if (copies == 0) == want_none {
+                break (place, copies);
+            }
+            assert!(
+                t.elapsed().as_secs() < 30,
+                "{name}: copies of {copies} B, served {want_none}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            db.settle().unwrap();
+        }
+    };
+    let (place, copies) = run("place-raw", supdb::ZPages::Off);
+    assert!(
+        copies > 3000 * 100 && place < 1 << 30,
+        "the raw form's blocks each have a copy to hold, and its ordered indexes are taken \
+         from the place: place {place}, copies {copies} B"
+    );
+    let (place, copies) = run("place-served", supdb::ZPages::Always);
+    assert!(
+        copies == 0 && place < 1 << 30,
+        "a served partition has no copy in the place, and its file is taken from it: \
+         place {place}, copies {copies}"
+    );
+}
+
+/// Point reads are near from the first, the writer's or a handle's, until
+/// two stores' worth of writes have come since the last
+/// (`Db::points_far`), as scans are read; a scan brings none near.
+#[test]
+fn point_reads_are_near_until_two_stores_of_writes_since_the_last() {
+    for handle in [false, true] {
+        let d = dir(&format!("points-far-{handle}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                scan_cache_copies_fit: true,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let key = |k: u32| format!("key-{k:05}").into_bytes();
+        for k in 0..1000u32 {
+            db.append(&key(k), b"v");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert!(db.points_far(), "a store nobody has read");
+        let mut seen = 0usize;
+        db.scan(b"", 5, kv(&mut |_, _| seen += 1)).unwrap();
+        db.append(&key(1), b"w");
+        db.commit().unwrap();
+        assert!(db.points_far(), "a scan is no point read");
+        if handle {
+            let h = db.reader().unwrap();
+            assert_eq!(h.count(&key(3)).unwrap(), 1);
+        } else {
+            assert_eq!(db.count(&key(3)).unwrap(), 1);
+        }
+        assert!(
+            !db.points_far(),
+            "handle {handle}: near at the read, before any commit"
+        );
+        // The commit that finds the read, and two stores' worth of writes
+        // after it and no more: still near.
+        for round in 0..3u32 {
+            for k in 0..1000u32 {
+                db.append(&key(k), format!("r{round}").as_bytes());
+            }
+            db.commit().unwrap();
+            assert!(
+                !db.points_far(),
+                "handle {handle}: near {} writes past the commit that found the read",
+                round * 1000
+            );
+        }
+        db.append(&key(0), b"over");
+        db.commit().unwrap();
+        assert!(
+            db.points_far(),
+            "handle {handle}: far past two stores' worth of writes"
+        );
+        // And near again at the next.
+        assert!(db.count(&key(4)).unwrap() > 0);
+        assert!(!db.points_far(), "handle {handle}: near again");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
 
 /// A covered partition's settle files a written key under the block the

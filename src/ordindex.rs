@@ -823,6 +823,20 @@ impl OrdIndex {
             .unwrap_or(0.0)
     }
 
+    /// The file mapped into this process's page tables, asked of its
+    /// mapping (`Bytes::populate_read`): true where the kernel took the
+    /// advice. No byte of it is read here.
+    pub fn populate_read(&self) -> bool {
+        self.map.populate_read(0, self.map.len() as usize)
+    }
+
+    /// The share of the file a read reaches with no fault of the page
+    /// tables' now, asked of its mapping (`Bytes::mapped_share`); `None`
+    /// where the source will not say.
+    pub fn mapped_share(&self) -> Option<f64> {
+        self.map.mapped_share(0, self.map.len() as usize)
+    }
+
     /// Whether `advise_random` was called on this mapping.
     pub fn advised(&self) -> bool {
         self.advised.load(std::sync::atomic::Ordering::Relaxed)
@@ -2175,6 +2189,12 @@ mod tests {
         fn forget(&self, _: u64, _: usize) {}
         fn willneed(&self, _: u64, _: usize) -> usize {
             0
+        }
+        fn populate(&self, _: u64, _: usize) -> bool {
+            false
+        }
+        fn mapped(&self, _: u64, _: usize) -> Option<f64> {
+            None
         }
     }
 

@@ -1098,6 +1098,11 @@ pub struct ZCounts {
     /// (`Options::zpages_rewarm_raw`), and the milliseconds they waited.
     pub raw_settles: u64,
     pub raw_settle_ms: u64,
+    /// The segments such a settle mapped into the page tables after its
+    /// ask, and the milliseconds the mapping took
+    /// (`Options::zpages_rewarm_raw_maps`).
+    pub raw_maps: u64,
+    pub raw_map_ms: u64,
     /// Block-coded partitions re-parsed while served
     /// (`Options::zpages_reparse`).
     pub reparses: u64,
@@ -3438,6 +3443,29 @@ pub struct Options {
     /// held as given unless the test's seam gives the page cache's budget
     /// (`zpages_inject`). `supdb-cacheeighth` is the eighth as it was.
     pub scan_cache_auto_room: bool,
+    /// Where the store's own budget would bind for want of room
+    /// beside the raw form, a store no point read is near may hold its
+    /// block cache in the raw records' place instead
+    /// (`Reader::grant_copies`): the budget becomes what the bound leaves
+    /// once the unserved partitions' key sections are given up -- the page
+    /// cache's budget and the cache it already counts, less the ordered
+    /// indexes and the served partitions' form files -- where a copy of
+    /// every block of those partitions fits in it. The room
+    /// (`scan_cache_auto_room`) reserves the whole raw form beside the
+    /// cache, and a block's copy stands in for its records for every scan:
+    /// at three million keys under 1 GiB the lag sweep's full rewrite bound
+    /// the budget twenty to sixty megabytes short of a copy for every block,
+    /// the fill and its conversions stop for good at a bind, and the pass
+    /// after it walked a quarter of its blocks as sparse forms over records
+    /// the bound had pushed out, 410-520 ms where the arm with no budget
+    /// read it in 30 and LMDB in 23-35. A point read needs the records a
+    /// copy does not replace, so the grant waits for a store far from them
+    /// (`Shared::points_far`: none in its life, or two stores' worth of
+    /// writes since the last) and is taken back at the first that comes,
+    /// the budget returning to what it was before the grant. On;
+    /// `supdb-nocopiesfit` is the budget that binds beside the raw form.
+    #[doc(hidden)]
+    pub scan_cache_copies_fit: bool,
     /// PROTOTYPE: with the block cache, build ahead of the reader on a
     /// thread of its own. At the writer's first scan over a published
     /// state, a reader handle pins the store as of the last commit and
@@ -5272,6 +5300,21 @@ pub struct Options {
     /// `supdb-ingestnochainwrites` chain only while reads are around.
     #[doc(hidden)]
     pub merge_chains_writes: bool,
+    /// The chain through a write-only stretch
+    /// (`merge_chains_writes`) only where the writer's block forms do not
+    /// cover the store (`Maint::forms_uncovered`): no block cache, a budget
+    /// given or bound, the forms given up for the merge path, scans far, or
+    /// a point read near.
+    /// The chain pays a burst's merge debt beside its writes so that the
+    /// scans after it meet fewer pieces, and a writer that holds a form for
+    /// every block a piece overlays walks no piece at all: at three million
+    /// keys under 1 GiB the chain landed forty merges in the lag sweep where
+    /// the seals' own plans land twenty, and the full rewrite's burst ran
+    /// 9.1 s with it and 6.7 without, its upkeep thread's settle 5.9 s
+    /// against 3.6. On; `supdb-chaincovered` chains through a burst the
+    /// forms cover, and `supdb-nocopiesfitchain` is both shapes before.
+    #[doc(hidden)]
+    pub merge_chains_writes_uncovered: bool,
     /// Under `merge_chains`, the segment work's own loop plans a merge
     /// when none is in flight and a scan has come since its last look,
     /// at the base trigger as a landing's chain does: the chain plans
@@ -6256,6 +6299,33 @@ pub struct Options {
     /// through its own cache (`OrdIndex::mapped_heads`).
     /// `supdb-headsmapped` reads the mapping throughout.
     pub heads_owned: bool,
+    /// EXPERIMENT: whether the heads are copied (`heads_owned`) at the
+    /// controller's census while the block cache holds the raw records'
+    /// place (`scan_cache_copies_fit`), whatever the controller's model
+    /// says of the raw form. At the census a copy is made while the model
+    /// says the raw form fits and none while it says it does not, since a
+    /// misfit there is the stretch between a crossing and the install its
+    /// reads' faults buy (`Maint::z_heads_look`). A grant of the records'
+    /// place makes the model say so of a store nothing will be bought
+    /// for: the page cache's budget is the limit less the process's
+    /// anonymous memory, the copies are that memory, and the records they
+    /// stand in for are still counted as pages the raw form needs -- at
+    /// three million keys under 1 GiB a budget of 880 MB before the lag
+    /// sweep's full rewrite and 265 after the grant, against records of
+    /// 372 -- while the grant stands only far from point reads, whose
+    /// faults are what buys a form. So every partition a merge landed
+    /// after the grant kept its heads in a mapping, eight megabytes of
+    /// them at the pass after the burst, the burst's writes pushed their
+    /// pages out, and the scans' start seeks read them back a page a
+    /// fault behind a merge's reads: every major fault of the scanning
+    /// thread in six traced passes but one was `Reader::scan_seek` on one
+    /// such index, nine to thirty-six a pass and a hundred and ninety in
+    /// the slowest of twelve paired, a hundred and fifty to a hundred and
+    /// eighty in the two slow reps of three a row took. Under this option
+    /// a grant standing reads as the store left raw. Off: the model
+    /// alone.
+    #[doc(hidden)]
+    pub heads_owned_beside_copies: bool,
     /// The hot-raw policy's skew bar read against the room
     /// (`Maint::z_hot_look`): the candidate partition is asked for where its
     /// raw bytes fit the group's unused memory and it is read more a key
@@ -6553,7 +6623,7 @@ pub struct Options {
     /// in none. Where scans come back is too late
     /// (`zpages_rewarm_raw_scans`). Counted (`ZCounts::raw_settles`,
     /// `raw_settle_ms`, `raw_rewarm_files`, `raw_rewarm_bytes`,
-    /// `raw_rewarm_short`). Off; `supdb-zrewarmraw` asks.
+    /// `raw_rewarm_short`). On; `supdb-norewarmraw` asks for nothing.
     #[doc(hidden)]
     pub zpages_rewarm_raw: bool,
     /// REFUTED: with `zpages_rewarm_raw`, the raw form's files are asked
@@ -6568,6 +6638,22 @@ pub struct Options {
     /// `supdb-zrewarmrawscans` asks there too.
     #[doc(hidden)]
     pub zpages_rewarm_raw_scans: bool,
+    /// A settle that asked for the raw form's files
+    /// (`zpages_rewarm_raw`) maps what came back into the process's page
+    /// tables as well (`MADV_POPULATE_READ`, `Maint::raw_map`): the record
+    /// region and the ordered index of every segment the ask could have
+    /// named, where `HOT_RAW_RESIDENT` of it is resident, so that mapping
+    /// reads at most the tenth the ask left. A page the cache dropped went
+    /// out of the page tables with it, and a page asked back is resident
+    /// and unmapped: at three million keys under 1 GiB the clean store's
+    /// pass after a settle that had asked 178 MB back took 1,400-2,260
+    /// minor faults in 3,000 scans where a store never pushed out takes 621,
+    /// about eight microseconds each under the bound by the fit across
+    /// reps, and ran 17-28 ms where the unpushed store runs 10-14. Counted
+    /// (`ZCounts::raw_maps`, `raw_map_ms`). On; `supdb-rewarmrawnomap`
+    /// asks and maps nothing.
+    #[doc(hidden)]
+    pub zpages_rewarm_raw_maps: bool,
     /// A rewarm due (`zpages_rewarm_scans`) is made while merges are in
     /// flight, for the form files of the partitions no merge in flight
     /// holds, where off it waits for the merges to land. It was made beside
@@ -6859,6 +6945,12 @@ pub struct Options {
 }
 
 impl Options {
+    /// Whether the store keeps `Shared::points_far`, for the options that
+    /// read it: `scan_cache_copies_fit` and `merge_chains_writes_uncovered`.
+    fn tracks_points(&self) -> bool {
+        self.scan_cache_copies_fit || self.merge_chains_writes_uncovered
+    }
+
     /// Whether a form file times one decode in sixteen and counts a
     /// raw-tailed group's opens (`zfile::ZFile::time_decodes`): the heat the
     /// re-code policy reads, under the forced form or the controller.
@@ -7151,6 +7243,7 @@ impl Default for Options {
             scan_cache_auto: true,
             scan_cache_auto_bytes: 0,
             scan_cache_auto_room: true,
+            scan_cache_copies_fit: true,
             scan_cache_ahead: true,
             scan_run_builds: true,
             scan_prefetch: true,
@@ -7262,6 +7355,7 @@ impl Default for Options {
             heads_willneed: true,
             merge_chains: true,
             merge_chains_writes: true,
+            merge_chains_writes_uncovered: true,
             merge_plan_idle: true,
             merge_bytes_cap: 64 << 20,
             merge_parallel: 2,
@@ -7331,6 +7425,7 @@ impl Default for Options {
             settle_table_ahead: 12,
             heads_look_ms: 0,
             heads_owned: true,
+            heads_owned_beside_copies: false,
             zpages_hot_skew_room: false,
             zpages_hot_room_margin_pct: 0,
             zpages_walk_owns_decodes: false,
@@ -7341,8 +7436,9 @@ impl Default for Options {
             zpages_rewarm_at_install: false,
             zpages_settle_joins_asks: true,
             zpages_rewarm_trims: false,
-            zpages_rewarm_raw: false,
+            zpages_rewarm_raw: true,
             zpages_rewarm_raw_scans: false,
+            zpages_rewarm_raw_maps: true,
             zpages_rewarm_beside_merges: false,
             zpages_rewarm_quiet_ms: 250,
             zpages_stride: ZStride::Forced,
@@ -21896,8 +21992,11 @@ struct Shared {
     /// its giving up bumped, freed past every pinned reader by the look
     /// that gives them up (`Maint::z_heads_look`), on a later turn.
     retired_heads: RetireList<HeadsBuf>,
-    /// Copies of heads made, and copies given up.
-    heads_events: [AtomicU64; 2],
+    /// Copies of heads made, copies given up, and of the copies made
+    /// those made for a grant of the records' place alone, the model
+    /// saying the raw form does not fit
+    /// (`Options::heads_owned_beside_copies`).
+    heads_events: [AtomicU64; 3],
     /// The dead names given to retired form files (`zfile::zpg_dead_name`).
     next_dead: AtomicU64,
     /// A test's holds on the builder's thread (`ZHOLD_START`,
@@ -22256,6 +22355,29 @@ struct Shared {
     /// The times a handle's automatic budget grew into the room the
     /// partitions leave instead of binding (`Options::scan_cache_auto_room`).
     cache_growths: AtomicU64,
+    /// The times a handle's automatic budget was granted the raw records'
+    /// place (`Options::scan_cache_copies_fit`), and the times a grant was
+    /// taken back for a point read come near.
+    cache_copies_grants: AtomicU64,
+    cache_copies_revokes: AtomicU64,
+    /// Whether a grant of the raw records' place stands
+    /// (`Options::scan_cache_copies_fit`): set by the writer's side where
+    /// it grants one and cleared where it takes one back, for the segment
+    /// work's look at the heads (`Options::heads_owned_beside_copies`),
+    /// which cannot read the writer's own record of it.
+    copies_stand: std::sync::atomic::AtomicBool,
+    /// Whether the store reads as far from point reads: none in its life,
+    /// or two stores' worth of writes since the last, as scans are read
+    /// (`reads_around`). Published by the writer's commit
+    /// (`Db::points_far_now`) and cleared at once by the first point read
+    /// after it, the writer's or a handle's (`Reader::note_read`). Kept
+    /// only where an option reads it (`Options::tracks_points`): the
+    /// cache's grant of the records' place and the chain through writes.
+    points_far: std::sync::atomic::AtomicBool,
+    /// The writer's own cache budget has bound, so its tables hold no form
+    /// for the blocks it sheds (`Reader::bind_cache`): what the chain
+    /// through writes reads (`Options::merge_chains_writes_uncovered`).
+    cache_bound_any: std::sync::atomic::AtomicBool,
     /// The store's scans (`Shared::scans_all`) when a publish kept fewer
     /// tables than the upkeep was behind and asked the thread to give up
     /// its forms (`Options::upkeep_abandons`), `u64::MAX` when nothing is
@@ -23730,6 +23852,14 @@ struct FormsState {
     /// has: a handle's own, since each handle's cache is its own and the
     /// room is read with every cache in it.
     auto_grown: std::cell::Cell<usize>,
+    /// Whether `auto_grown` is a grant of the raw records' place
+    /// (`Options::scan_cache_copies_fit`), and the budget from before the
+    /// grant, which a point read come near returns it to
+    /// (`Reader::cache_budget`).
+    auto_credit: std::cell::Cell<bool>,
+    auto_base: std::cell::Cell<usize>,
+    /// When a grant was last held to its place (`Reader::hold_copies_look`).
+    credit_looked: std::cell::Cell<Option<std::time::Instant>>,
     /// `Shared::tables_landed` as the upkeep thread's pass in flight
     /// pinned its state, and what a table landed under the pin costs
     /// (`MemTable::kept_bytes` of the largest table the state stands on),
@@ -23957,6 +24087,9 @@ impl FormsState {
             forms_off: std::cell::Cell::new(false),
             cache_bound: std::cell::Cell::new(false),
             auto_grown: std::cell::Cell::new(0),
+            auto_credit: std::cell::Cell::new(false),
+            auto_base: std::cell::Cell::new(0),
+            credit_looked: std::cell::Cell::new(None),
             pass_landed: std::cell::Cell::new(0),
             pass_unit: std::cell::Cell::new(0),
             abandon_pinned: std::cell::Cell::new(false),
@@ -24187,6 +24320,12 @@ pub struct Db {
     /// committed log length at the last hand-over, the store's scan count as last seen, and the
     /// writes committed since it last moved.
     upkeep_log: (u64, usize),
+    /// The live table and its committed log at the last look for point
+    /// reads, the count of them then, and the writes since it last moved
+    /// (`Db::points_far_now`).
+    points_log: (u64, usize),
+    points_seen: u64,
+    since_point: u64,
     upkeep_life: u64,
     upkeep_since_scan: u64,
     /// The runs of commits between scans (`Options::upkeep_pace_syncs_model`).
@@ -24506,6 +24645,11 @@ struct ModeNote {
     /// The writer's: whether it has published the stretch as quiet and no
     /// read of its own has cleared it since (`Shared::write_quiet`).
     quiet_out: std::cell::Cell<bool>,
+    /// The writer's: the store reads as near point reads as published
+    /// (`Shared::points_far` false), by its last commit's look or by a
+    /// point read of its own since. Where it is not, the writer's next
+    /// point read says so.
+    near_out: std::cell::Cell<bool>,
 }
 
 impl Default for ModeNote {
@@ -24517,6 +24661,7 @@ impl Default for ModeNote {
             points: std::cell::Cell::new(0),
             quiet: std::cell::Cell::new(false),
             quiet_out: std::cell::Cell::new(false),
+            near_out: std::cell::Cell::new(false),
         }
     }
 }
@@ -27146,13 +27291,25 @@ impl Reader {
     /// more than once a commit.
     #[inline]
     fn note_read(&self, scan: bool) {
-        if !(self.opts.seal_idle || self.opts.merge_parallel_quiet > 0) {
+        if !(self.opts.seal_idle || self.opts.merge_parallel_quiet > 0 || self.opts.tracks_points())
+        {
             return;
         }
         let m = &self.mode_note;
         if self.slot.is_none() {
-            let n = if scan { &m.scans } else { &m.points };
-            n.set(n.get() + 1);
+            if scan {
+                m.scans.set(m.scans.get() + 1);
+            } else {
+                m.points.set(m.points.get() + 1);
+                // The first point read since a commit that found the store
+                // far from them says so at once, since the cache's grant of
+                // the records' place is taken back on it
+                // (`Options::scan_cache_copies_fit`).
+                if !m.near_out.get() {
+                    m.near_out.set(true);
+                    self.shared.points_far.store(false, AtomicOrdering::Release);
+                }
+            }
             // The first read since a quiet commit ends the write-only
             // stretch for the segment work (`Shared::write_quiet`), once.
             if m.quiet_out.get() {
@@ -27172,6 +27329,14 @@ impl Reader {
         if at.get() != now {
             at.set(now);
             shared.fetch_add(1, AtomicOrdering::Relaxed);
+            // A handle's point read brings point reads near, said once a
+            // commit as its count is (`Shared::points_far`).
+            if !scan
+                && self.opts.tracks_points()
+                && self.shared.points_far.load(AtomicOrdering::Relaxed)
+            {
+                self.shared.points_far.store(false, AtomicOrdering::Release);
+            }
             // A handle's read ends the write-only stretch too, said once a
             // commit as its count is.
             if self.opts.merge_parallel_quiet > 0 {
@@ -27634,6 +27799,8 @@ impl Reader {
             raw_rewarm_short: get(&ev.raw_rewarm_short),
             raw_settles: get(&ev.raw_settles),
             raw_settle_ms: get(&ev.raw_settle_ms),
+            raw_maps: get(&ev.raw_maps),
+            raw_map_ms: get(&ev.raw_map_ms),
             reparses: get(&ev.reparses),
             recode_flips: get(&ev.recode_flips),
             spare_builds: get(&ev.spare_builds),
@@ -32054,6 +32221,7 @@ impl Reader {
     /// lands in. Under a cache budget it is never complete, since a form
     /// may be shed.
     fn maintain_forms(&self) -> Result<()> {
+        self.hold_copies_look();
         if self.settle_due(true) != Some(true) {
             return Ok(());
         }
@@ -33041,17 +33209,155 @@ impl Reader {
         let room = self.settle_room_bytes(page_cache);
         let now = self.cache_budget();
         if room <= 0 || (room as u64) < (now as u64) / 8 {
-            return false;
+            return self.grant_copies(page_cache, now);
         }
         let grown = self.fs().cache_bytes.get().saturating_add(room as usize);
         if grown <= now {
             return false;
+        }
+        // A growth into the room beside the raw form is the budget a
+        // grant returns to, where one stands.
+        if self.fs().auto_credit.get() {
+            self.fs().auto_base.set(grown);
         }
         self.fs().auto_grown.set(grown);
         self.shared
             .cache_growths
             .fetch_add(1, AtomicOrdering::Relaxed);
         true
+    }
+
+    /// The cache granted the raw records' place, where there is no room
+    /// for it beside them (`Options::scan_cache_copies_fit`): true where
+    /// the budget grew. A block's copy stands in for its records for every
+    /// scan, so a store no point read is near needs one of the two and the
+    /// room that reserves both binds a cache the bound could hold whole.
+    /// The place is what the bound leaves the cache once the unserved
+    /// partitions' key sections are given up (`copies_place`), and it is
+    /// granted where a copy of every block of those partitions fits in it,
+    /// since a cache that fills it short of that leaves the blocks it does
+    /// not hold no page for their records. `now` is the budget crossed,
+    /// which a grant taken back returns to.
+    fn grant_copies(&self, page_cache: u64, now: usize) -> bool {
+        if !self.opts.scan_cache_copies_fit || !self.shared.points_far.load(AtomicOrdering::Acquire)
+        {
+            return false;
+        }
+        let (place, copies) = self.copies_place(page_cache);
+        if copies == 0 || copies > place || place <= now as u64 {
+            return false;
+        }
+        let Ok(place) = usize::try_from(place) else {
+            return false;
+        };
+        let fs = self.fs();
+        if !fs.auto_credit.replace(true) {
+            fs.auto_base.set(now);
+        }
+        fs.auto_grown.set(place);
+        self.shared
+            .copies_stand
+            .store(true, AtomicOrdering::Release);
+        self.shared
+            .cache_copies_grants
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        true
+    }
+
+    /// The look at a grant of the records' place, at the commit's
+    /// maintenance and only while one stands
+    /// (`Options::scan_cache_copies_fit`). A point read come near takes the
+    /// grant back: the budget is what it was before it. Otherwise the grant
+    /// is held to the place as it stands (`hold_copies_place`), the page
+    /// cache's budget read at most once a `SETTLE_ROOM_PERIOD` -- the seam's
+    /// where a test has set one, as the growth reads it. Either way a cache
+    /// left over its budget is brought to it by the settle that follows the
+    /// look, whose patches shed to the budget while it has not bound
+    /// (`patch_block`), and bind it there.
+    fn hold_copies_look(&self) {
+        let fs = self.fs();
+        if !fs.auto_credit.get() {
+            return;
+        }
+        if !self.shared.points_far.load(AtomicOrdering::Acquire) {
+            fs.auto_credit.set(false);
+            fs.auto_grown.set(fs.auto_base.get());
+            self.shared
+                .copies_stand
+                .store(false, AtomicOrdering::Release);
+            self.shared
+                .cache_copies_revokes
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        } else {
+            let now = std::time::Instant::now();
+            if fs
+                .credit_looked
+                .get()
+                .is_none_or(|t| now.duration_since(t) >= SETTLE_ROOM_PERIOD)
+            {
+                fs.credit_looked.set(Some(now));
+                let seam = self.opts.zpages_inject.as_ref().and_then(|i| i.budget());
+                if let Some(b) = seam.or_else(|| zfile::read_budget().map(|b| b.budget)) {
+                    self.hold_copies_place(b);
+                }
+            }
+        }
+    }
+
+    /// A grant of the records' place held to the place as it stands
+    /// (`Options::scan_cache_copies_fit`), wherever the page cache's budget
+    /// is read again (`hold_copies_look`): the budget is the place under that
+    /// reading, never under what it was before the grant. The place is a
+    /// function of the process's other anonymous memory, which a burst's
+    /// frozen tables move by a hundred megabytes, and the raw form a grant
+    /// gives up was the pages the kernel could take when they came: a
+    /// cache past its place is shed to it by the look, where the budget
+    /// binds.
+    fn hold_copies_place(&self, page_cache: u64) {
+        let fs = self.fs();
+        if !fs.auto_credit.get() {
+            return;
+        }
+        let (place, _) = self.copies_place(page_cache);
+        let place = usize::try_from(place)
+            .unwrap_or(usize::MAX)
+            .max(fs.auto_base.get());
+        if place != fs.auto_grown.get() {
+            fs.auto_grown.set(place);
+        }
+    }
+
+    /// What the bound leaves the block cache once the raw records are
+    /// given up, bytes, and what a copy of every block they hold comes to:
+    /// the page cache's budget with the cache it already counts -- the
+    /// limit less the margin and the process's other anonymous memory --
+    /// less each served partition's form file, with its key section and
+    /// ordered index where they are kept beside it, and each unserved
+    /// partition's ordered index, which a scan's start seeks whatever
+    /// holds its blocks. A copy holds its block's keys and values and an
+    /// entry a record (`CachedBlock`), so an unserved partition's copies
+    /// are its record region and `COPY_ENTRY_BYTES` a key.
+    fn copies_place(&self, page_cache: u64) -> (u64, u64) {
+        let np = self.segs().partition_point(|s| s.level > 0);
+        let (mut need, mut copies) = (0u64, 0u64);
+        for s in &self.segs()[..np] {
+            match s.z.get() {
+                Some(z) => {
+                    need += z.file_bytes();
+                    if !self.opts.zpages_drop_raw {
+                        need += s.blob.index_bytes() as u64 + s.ord.file_bytes();
+                    }
+                }
+                None => {
+                    need += s.ord.file_bytes();
+                    copies += s.foot().1 + COPY_ENTRY_BYTES * s.blob.keys() as u64;
+                }
+            }
+        }
+        let place = page_cache
+            .saturating_add(self.fs().cache_bytes.get() as u64)
+            .saturating_sub(need);
+        (place, copies)
     }
 
     /// Whether the budget is kept: a budget given from the start, the
@@ -33080,6 +33386,14 @@ impl Reader {
             return;
         }
         self.fs().tables_complete.set(false);
+        // The writer's tables hold no form for what they shed from here
+        // (`Options::merge_chains_writes_uncovered`); a handle's cache is
+        // its own and says nothing of them.
+        if self.slot.is_none() {
+            self.shared
+                .cache_bound_any
+                .store(true, AtomicOrdering::Release);
+        }
         self.shared
             .cache_bindings
             .fetch_add(1, AtomicOrdering::Relaxed);
@@ -35757,6 +36071,66 @@ impl Reader {
         self.shared.cache_growths.load(AtomicOrdering::Relaxed)
     }
 
+    /// The times a handle's own cache budget was granted the raw records'
+    /// place, and the times a grant was taken back
+    /// (`Options::scan_cache_copies_fit`).
+    #[doc(hidden)]
+    pub fn cache_copies_grants(&self) -> (u64, u64) {
+        (
+            self.shared
+                .cache_copies_grants
+                .load(AtomicOrdering::Relaxed),
+            self.shared
+                .cache_copies_revokes
+                .load(AtomicOrdering::Relaxed),
+        )
+    }
+
+    /// A test's: the shares of the partitions' record regions and of their
+    /// ordered indexes that a read reaches with no fault of the page
+    /// tables' now, asked of each one's source (`Bytes::mapped_share`), by
+    /// bytes; `None` where the kernel will not say.
+    #[doc(hidden)]
+    pub fn raw_mapped_share(&self) -> Option<(f64, f64)> {
+        let _e = self.enter();
+        let (mut recs_at, mut recs_of) = (0f64, 0f64);
+        let (mut ord_at, mut ord_of) = (0f64, 0f64);
+        for s in self.segs().iter().filter(|s| s.level > 0) {
+            let raw = s.blob.for_zfile();
+            if let Some((off, len)) = raw.record_region_place() {
+                let share = crate::bytes::Bytes::mapped_share(raw.source(), off, len)?;
+                recs_at += share * len as f64;
+                recs_of += len as f64;
+            }
+            let ord = s.ord.file_bytes() as f64;
+            ord_at += s.ord.mapped_share()? * ord;
+            ord_of += ord;
+        }
+        (recs_of > 0.0 && ord_of > 0.0).then(|| (recs_at / recs_of, ord_at / ord_of))
+    }
+
+    /// Whether the store reads as far from point reads (`Shared::points_far`).
+    #[doc(hidden)]
+    pub fn points_far(&self) -> bool {
+        self.shared.points_far.load(AtomicOrdering::Acquire)
+    }
+
+    /// A test's: under a page-cache budget of `page_cache`, the raw
+    /// records' place and what a copy of every unserved block comes to
+    /// (`Reader::copies_place`), the room beside the raw form
+    /// (`Reader::settle_room_bytes`), and the cache's budget as it stands.
+    #[doc(hidden)]
+    pub fn cache_place(&self, page_cache: u64) -> (u64, u64, i64, usize) {
+        let _e = self.enter();
+        let (place, copies) = self.copies_place(page_cache);
+        (
+            place,
+            copies,
+            self.settle_room_bytes(page_cache),
+            self.cache_budget(),
+        )
+    }
+
     /// The store's own cache budget as resolved at open, zero for none.
     #[doc(hidden)]
     pub fn auto_cache_bytes(&self) -> usize {
@@ -37387,17 +37761,20 @@ impl Db {
     /// Whether the commit is in a write-only stretch, counted at its look
     /// (`Db::read_mode`).
     fn note_read_mode(&mut self) {
-        if !(self.opts.seal_idle || self.opts.merge_parallel_quiet > 0) {
+        if !(self.opts.seal_idle || self.opts.merge_parallel_quiet > 0 || self.opts.tracks_points())
+        {
             return;
         }
         let own = &self.mode_note;
         let scans = self.shared.mode_scans.load(AtomicOrdering::Relaxed) + own.scans.get();
         let points = self.shared.mode_points.load(AtomicOrdering::Relaxed) + own.points.get();
+        let far = self.opts.tracks_points() && self.points_far_now(points);
         let (s0, p0, _) = self.read_mode;
         let quiet = scans == s0 && points == p0;
         self.read_mode = (scans, points, quiet);
         let note = &self.mode_note;
         note.quiet.set(quiet);
+        note.near_out.set(!far);
         // Published for the segment work's room (`Shared::write_quiet`),
         // on a change of the flag itself: a handle's read clears it behind
         // the writer's back, and the next quiet commit sets it again.
@@ -37409,6 +37786,44 @@ impl Db {
                     .store(quiet, AtomicOrdering::Release);
             }
         }
+    }
+
+    /// Whether the store reads as far from point reads at this commit,
+    /// published where it has changed (`Shared::points_far`): no point read
+    /// in the store's life, or more than two stores' worth of writes since
+    /// the count of them last moved, as the seals and the hand-over read
+    /// scans (`reads_around`). `points` is the count, the handles' and the
+    /// writer's own; the commit's writes are the live table's log since the
+    /// last look, by the table (`State::lives`), since a landing moves the
+    /// generation over the same table.
+    fn points_far_now(&mut self, points: u64) -> bool {
+        let (lives, log, keys) = {
+            let st = self.state();
+            let keys: usize = st
+                .segs
+                .iter()
+                .filter(|s| s.level > 0)
+                .map(|s| s.blob.keys())
+                .sum();
+            (st.lives, st.mem.committed_at().0, keys)
+        };
+        let batch = if self.points_log.0 == lives {
+            log.saturating_sub(self.points_log.1)
+        } else {
+            log
+        };
+        self.points_log = (lives, log);
+        if points != self.points_seen {
+            self.points_seen = points;
+            self.since_point = 0;
+        } else {
+            self.since_point = self.since_point.saturating_add(batch as u64);
+        }
+        let far = !reads_around(points, self.since_point, keys);
+        if self.shared.points_far.load(AtomicOrdering::Relaxed) != far {
+            self.shared.points_far.store(far, AtomicOrdering::Release);
+        }
+        far
     }
 
     /// The new live WAL for a rotation: a recycled retiree when the pool
@@ -37749,7 +38164,7 @@ impl Db {
             z: zfile::ZEvents::default(),
             retired_z: RetireList::new(),
             retired_heads: RetireList::new(),
-            heads_events: [AtomicU64::new(0), AtomicU64::new(0)],
+            heads_events: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
             next_dead: AtomicU64::new(1),
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
             z_finish_live: std::sync::atomic::AtomicUsize::new(0),
@@ -37841,6 +38256,11 @@ impl Db {
             auto_cache_bytes: Db::resolve_auto_cache(&opts),
             cache_bindings: AtomicU64::new(0),
             cache_growths: AtomicU64::new(0),
+            cache_copies_grants: AtomicU64::new(0),
+            cache_copies_revokes: AtomicU64::new(0),
+            copies_stand: std::sync::atomic::AtomicBool::new(false),
+            points_far: std::sync::atomic::AtomicBool::new(true),
+            cache_bound_any: std::sync::atomic::AtomicBool::new(false),
             abandon_at: AtomicU64::new(u64::MAX),
             outran_at: AtomicU64::new(u64::MAX),
             abandons: AtomicU64::new(0),
@@ -37956,6 +38376,9 @@ impl Db {
             keeper: None,
             upkeeper: None,
             upkeep_log: (0, 0),
+            points_log: (0, 0),
+            points_seen: 0,
+            since_point: 0,
             upkeep_life: 0,
             upkeep_since_scan: 0,
             pace_runs: PaceRuns::default(),
@@ -39017,7 +39440,7 @@ impl Db {
             z: zev,
             retired_z: RetireList::new(),
             retired_heads: RetireList::new(),
-            heads_events: [AtomicU64::new(0), AtomicU64::new(0)],
+            heads_events: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
             next_dead: AtomicU64::new(1),
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
             z_finish_live: std::sync::atomic::AtomicUsize::new(0),
@@ -39109,6 +39532,11 @@ impl Db {
             auto_cache_bytes: Db::resolve_auto_cache(&opts),
             cache_bindings: AtomicU64::new(0),
             cache_growths: AtomicU64::new(0),
+            cache_copies_grants: AtomicU64::new(0),
+            cache_copies_revokes: AtomicU64::new(0),
+            copies_stand: std::sync::atomic::AtomicBool::new(false),
+            points_far: std::sync::atomic::AtomicBool::new(true),
+            cache_bound_any: std::sync::atomic::AtomicBool::new(false),
             abandon_at: AtomicU64::new(u64::MAX),
             outran_at: AtomicU64::new(u64::MAX),
             abandons: AtomicU64::new(0),
@@ -39224,6 +39652,9 @@ impl Db {
             keeper: None,
             upkeeper: None,
             upkeep_log: (0, 0),
+            points_log: (0, 0),
+            points_seen: 0,
+            since_point: 0,
             upkeep_life: 0,
             upkeep_since_scan: 0,
             pace_runs: PaceRuns::default(),
@@ -46943,6 +47374,12 @@ impl Reader {
     }
 }
 
+/// What a copy holds for a record beside its key and value: its entry
+/// and the length its value's run begins with (`CachedBlock::ents`,
+/// `CachedBlock::vals`), what `Reader::copies_place` prices a partition's
+/// copies by.
+const COPY_ENTRY_BYTES: u64 = (std::mem::size_of::<[u32; 4]>() + std::mem::size_of::<u32>()) as u64;
+
 /// Whether reads are around: a scan over the store in its life, and no
 /// more than two stores' worth of writes since the last. The upkeep's
 /// hand-over and the idle seals' filing ask it alike.
@@ -47617,6 +48054,14 @@ impl Db {
             self.shared.heads_events[1].load(AtomicOrdering::Relaxed),
             bytes as u64,
         )
+    }
+
+    /// The copies of heads made for a grant of the records' place alone,
+    /// the controller's model saying the raw form does not fit
+    /// (`Options::heads_owned_beside_copies`).
+    #[doc(hidden)]
+    pub fn heads_beside_copies(&self) -> u64 {
+        self.shared.heads_events[2].load(AtomicOrdering::Relaxed)
     }
 
     /// A test's: the writes counted since the store's last scan, by the
@@ -51797,8 +52242,9 @@ impl Maint {
             // Out of core a write-only stretch chains as well under
             // `Options::merge_chains_writes`, so a burst's merge debt is paid
             // beside its writes rather than beside the scans after it.
-            let writes =
-                self.opts.merge_chains_writes && self.shared.zgate.load() != zselect::GATE_RAW;
+            let writes = self.opts.merge_chains_writes
+                && self.shared.zgate.load() != zselect::GATE_RAW
+                && (!self.opts.merge_chains_writes_uncovered || self.forms_uncovered());
             if (reads || writes) && self.opts.merge_chains && self.opts.compact {
                 let base = self.opts.l0_trigger.max(1);
                 self.merge_why.1 = true;
@@ -52744,6 +53190,28 @@ impl Maint {
             self.shared.put_maint_err(e);
         }
         drop(op);
+    }
+
+    /// Whether the writer's block forms leave the store's pieces to its
+    /// scans (`Options::merge_chains_writes_uncovered`): no block cache or
+    /// none kept at commits, a budget given or the store's own bound, so
+    /// that a block may hold no form; the forms given up for the merge
+    /// path; scans far, where a commit files into none; or a point read
+    /// near (`Shared::points_far`), since a point read probes every piece
+    /// over its key whatever the forms hold, and four of the suite's six
+    /// mixes are point reads and writes with no scan between them. Covered,
+    /// a scan walks a form for every block a piece overlays and no piece. A store
+    /// that files no form at its commits counts no scan either unless a
+    /// keeper counts them for it (`Reader::signal_scan`), which is the one
+    /// way the second term is reached.
+    fn forms_uncovered(&self) -> bool {
+        !self.opts.scan_block_cache
+            || !self.opts.commit_forms
+            || self.opts.scan_cache_bytes > 0
+            || self.shared.cache_bound_any.load(AtomicOrdering::Acquire)
+            || self.shared.writer_forms_off.load(AtomicOrdering::Acquire)
+            || !self.scans_near()
+            || !self.shared.points_far.load(AtomicOrdering::Acquire)
     }
 
     /// Whether scans are near (`Shared::scans_far_at`): a scan in the
@@ -53714,7 +54182,7 @@ impl Maint {
         let owed = self.slot_sync_due.take().is_some();
         if owed && self.shared.seal_hold.load(AtomicOrdering::Relaxed) & SEAL_HOLD_OWED_SLOT != 0 {
             // A test's: the slot it counted owed is owed no longer.
-            let _ = self.shared.owed_slots_held.fetch_update(
+            let _ = self.shared.owed_slots_held.try_update(
                 AtomicOrdering::AcqRel,
                 AtomicOrdering::Acquire,
                 |n| n.checked_sub(1),
@@ -53948,7 +54416,10 @@ impl Maint {
     /// the controller's model says the raw form fits (`heads_left_raw`),
     /// the census being the group's pressure, and none while the model
     /// says it does not, which is the stretch between a crossing and the
-    /// install its reads' faults buy. The first version copied whatever
+    /// install its reads' faults buy -- but for a store whose block cache
+    /// holds the raw records' place (`Options::heads_owned_beside_copies`),
+    /// where the misfit is the cache's own bytes and no read is near to
+    /// buy anything. The first version copied whatever
     /// the raw form was serving at the look: at ten million keys under the
     /// same bound it made ninety-two copies over a lag sweep and gave back
     /// ninety-two, and the ones at the crossing read the index files from
@@ -53980,16 +54451,27 @@ impl Maint {
             return;
         }
         let near = self.scans_near();
-        let census_raw = !self.z_auto || self.z_leaves_raw;
+        // A grant of the records' place reads as the store left raw
+        // (`Options::heads_owned_beside_copies`): the model's misfit is
+        // then the grant's own bytes, and it stands only far from the
+        // point reads whose faults would buy a form.
+        let beside = self.opts.heads_owned_beside_copies
+            && self.shared.copies_stand.load(AtomicOrdering::Acquire);
+        let model_raw = !self.z_auto || self.z_leaves_raw;
+        let census_raw = model_raw || beside;
         let _op = self.op();
         let mut made = 0usize;
         for seg in self.segs().iter().filter(|s| s.level > 0) {
             let served = seg.z.get().is_some_and(|z| !z.damaged());
             let covered = gate == zselect::GATE_Z && served;
-            let left_raw = if gate == zselect::GATE_Z {
-                !served && seg.z_declined.load(AtomicOrdering::Relaxed) != 0
+            // Left raw, and whether by a grant of the records' place alone.
+            let (left_raw, by_place) = if gate == zselect::GATE_Z {
+                (
+                    !served && seg.z_declined.load(AtomicOrdering::Relaxed) != 0,
+                    false,
+                )
             } else {
-                census_raw
+                (census_raw, !model_raw)
             };
             let owned = seg.ord.heads_owned();
             if covered && owned {
@@ -54001,6 +54483,9 @@ impl Maint {
             } else if near && left_raw && !owned && made < HEADS_A_LOOK && seg.own_heads() {
                 made += 1;
                 self.shared.heads_events[0].fetch_add(1, AtomicOrdering::Relaxed);
+                if by_place {
+                    self.shared.heads_events[2].fetch_add(1, AtomicOrdering::Relaxed);
+                }
                 // The mapping's pages are no seek's now: out of this
                 // process's tables, and out of the cache where it lets
                 // them go.
@@ -56243,6 +56728,45 @@ impl Maint {
                 last as f64 / 1e6,
                 total as f64 / 1e6
             );
+        }
+        drop(maps);
+        if self.opts.zpages_rewarm_raw_maps {
+            self.raw_map();
+        }
+    }
+
+    /// What a settle's ask brought back, mapped
+    /// (`Options::zpages_rewarm_raw_maps`): the record region and the
+    /// ordered index of every segment, through the mappings the readers
+    /// read them by, each only where `HOT_RAW_RESIDENT` of it is resident
+    /// -- a region the ask left out for want of room, or one a form file
+    /// serves in its place, is not read in here, and one the ask brought
+    /// back is read by a tenth at most. The hash slots are left: no scan
+    /// touches them. Each is asked of its source
+    /// (`Bytes::resident_share`, `Bytes::populate_read`), so a file read
+    /// through the store's cache has mapped what its reads fault on: the
+    /// kernel's pages of the ciphertext its cache does not hold decrypted.
+    fn raw_map(&self) {
+        use crate::bytes::Bytes;
+        let t = std::time::Instant::now();
+        let _op = self.op();
+        let mut n = 0u64;
+        for s in self.segs().iter() {
+            let mut any = false;
+            let raw = s.blob.for_zfile();
+            if let Some((off, len)) = raw.record_region_place() {
+                let src = raw.source();
+                any |= Bytes::resident_share(src, off, len).unwrap_or(0.0) >= HOT_RAW_RESIDENT
+                    && Bytes::populate_read(src, off, len);
+            }
+            any |= s.ord.resident_share() >= HOT_RAW_RESIDENT && s.ord.populate_read();
+            n += u64::from(any);
+        }
+        let ms = t.elapsed().as_millis() as u64;
+        zfile::ZEvents::add(&self.shared.z.raw_maps, n);
+        zfile::ZEvents::add(&self.shared.z.raw_map_ms, ms);
+        if self.z_trace {
+            eprintln!("zrawmap segments {n} ms {ms}");
         }
     }
 

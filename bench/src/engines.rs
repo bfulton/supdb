@@ -199,6 +199,26 @@ impl Batch {
         Ok(())
     }
 
+    /// As `flush_updates`, through a thread's writer
+    /// (`ThreadWriter::update_batch`).
+    pub fn flush_updates_to(&mut self, w: &mut dyn ThreadWriter) -> Res<()> {
+        if self.ends.is_empty() {
+            return Ok(());
+        }
+        let mut pairs: Vec<(&[u8], &[u8])> = Vec::with_capacity(self.ends.len());
+        let (mut ks, mut vs) = (0usize, 0usize);
+        for &(ke, ve) in &self.ends {
+            pairs.push((&self.keys[ks..ke as usize], &self.vals[vs..ve as usize]));
+            ks = ke as usize;
+            vs = ve as usize;
+        }
+        w.update_batch(&pairs)?;
+        self.keys.clear();
+        self.vals.clear();
+        self.ends.clear();
+        Ok(())
+    }
+
     /// As `flush`, through `Engine::update_batch`: the keys may exist and
     /// the values replace.
     pub fn flush_updates(&mut self, e: &mut dyn Engine) -> Res<()> {
@@ -327,6 +347,22 @@ pub trait Engine {
     /// the opening.
     fn thread_reader(&self) -> Res<ReaderOpener>;
 
+    /// `n` handles that read and write the store from a thread each, at
+    /// once: made here, opened on their threads, as `thread_reader`'s
+    /// are. Each engine takes writes from several threads the way a user
+    /// of it would. FASTER's store is written by every thread through a
+    /// session of its own, which is what it is built for. RocksDB's
+    /// handle is shared and groups the threads' batches itself. LMDB's
+    /// environment is shared and a write transaction is one thread's at a
+    /// time, the others waiting on its writer lock. supdb is
+    /// single-writer (`Db`'s writes take `&mut`), so its threads read
+    /// through a `Reader` each and take turns at the one writer behind a
+    /// mutex, a batch a turn. `&mut self`, since the handles together are
+    /// the engine's writer while they live.
+    fn thread_writers(&mut self, _n: usize) -> Res<Vec<WriterOpener<'_>>> {
+        Err(format!("{} takes no writes from threads here", self.name()))
+    }
+
     /// What the engine did to get here, rather than how fast: the counts
     /// a mechanism is made of. Throughput over a whole pass is the noisy
     /// quantity -- a run of it cannot tell a 15% option apart from the
@@ -397,6 +433,31 @@ pub trait ThreadReader {
 /// Becomes a `ThreadReader` on the thread that calls it; see
 /// `Engine::thread_reader`.
 pub type ReaderOpener = Box<dyn FnOnce() -> Res<Box<dyn ThreadReader>> + Send>;
+
+/// What a thread of the threaded mixes reads and writes through
+/// (`run::threaded_mix`): point reads, and updates to keys that exist,
+/// from several threads at once over one store. Not `Send`, as a
+/// `ThreadReader` is not.
+pub trait ThreadWriter {
+    /// Bytes returned for the key; 0 for a miss.
+    fn get(&mut self, key: &[u8]) -> Res<usize>;
+    /// A batch of updates to keys that exist, committed as the engine
+    /// commits a batch: `Engine::update_batch`, from this thread.
+    fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()>;
+    /// Read the key's value and replace it, as one operation of the
+    /// engine's own where it has one, returning the bytes read: FASTER's
+    /// `Rmw`, the operation its own benchmark runs. `None` for an engine
+    /// whose read-modify-write is a read and then a write, which the mix
+    /// then makes of `get` and `update_batch` as YCSB's F does.
+    fn rmw(&mut self, _key: &[u8], _value: &[u8]) -> Option<Res<usize>> {
+        None
+    }
+}
+
+/// Becomes a `ThreadWriter` on the thread that calls it; see
+/// `Engine::thread_writers`. It borrows the engine, which the threads
+/// write through for as long as their handles live.
+pub type WriterOpener<'a> = Box<dyn FnOnce() -> Res<Box<dyn ThreadWriter + 'a>> + Send + 'a>;
 
 /// Every file under `p` at any depth, in the blocks the filesystem has
 /// given them rather than their lengths: a file's length can run past what
@@ -974,12 +1035,32 @@ pub struct Supdb {
     rewarmtrim: bool,
     /// The rewarm asking for the raw form's files as well
     /// (`Options::zpages_rewarm_raw`), `None` for the engine's default.
-    /// `supdb-zrewarmraw`.
+    /// `supdb-norewarmraw` asks for nothing.
     rewarmraw: Option<bool>,
     /// With it, the raw form's files asked for where scans come back too
     /// (`Options::zpages_rewarm_raw_scans`), `None` for the engine's
     /// default. `supdb-zrewarmrawscans`.
     rewarmrawscans: Option<bool>,
+    /// With `rewarmraw`, what the settle's ask brought back mapped into the
+    /// page tables (`Options::zpages_rewarm_raw_maps`), `None` for the
+    /// engine's default. `supdb-rewarmrawnomap` asks and maps nothing.
+    rewarmrawmaps: Option<bool>,
+    /// The partitions' heads copied at the controller's census while the
+    /// block cache holds the raw records' place, whatever the model says
+    /// of the raw form (`Options::heads_owned_beside_copies`), `None` for
+    /// the engine's default. `supdb-headscopies` copies them.
+    headscopies: Option<bool>,
+    /// The block cache granted the raw records' place where its own budget
+    /// would bind and no point read is near
+    /// (`Options::scan_cache_copies_fit`), `None` for the engine's default.
+    /// `supdb-nocopiesfit` is the budget that binds beside the raw form.
+    copiesfit: Option<bool>,
+    /// The chain through a write-only stretch only where the writer's
+    /// forms do not cover the store
+    /// (`Options::merge_chains_writes_uncovered`), `None` for the engine's
+    /// default. `supdb-chaincovered` chains through a covered burst, and
+    /// `supdb-nocopiesfitchain` is both shapes before.
+    chainuncovered: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
     /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
@@ -2359,12 +2440,32 @@ struct Policy {
     rewarmtrim: bool,
     /// The rewarm asking for the raw form's files as well
     /// (`Options::zpages_rewarm_raw`), `None` for the engine's default.
-    /// `supdb-zrewarmraw`.
+    /// `supdb-norewarmraw` asks for nothing.
     rewarmraw: Option<bool>,
     /// With it, the raw form's files asked for where scans come back too
     /// (`Options::zpages_rewarm_raw_scans`), `None` for the engine's
     /// default. `supdb-zrewarmrawscans`.
     rewarmrawscans: Option<bool>,
+    /// With `rewarmraw`, what the settle's ask brought back mapped into the
+    /// page tables (`Options::zpages_rewarm_raw_maps`), `None` for the
+    /// engine's default. `supdb-rewarmrawnomap` asks and maps nothing.
+    rewarmrawmaps: Option<bool>,
+    /// The partitions' heads copied at the controller's census while the
+    /// block cache holds the raw records' place, whatever the model says
+    /// of the raw form (`Options::heads_owned_beside_copies`), `None` for
+    /// the engine's default. `supdb-headscopies` copies them.
+    headscopies: Option<bool>,
+    /// The block cache granted the raw records' place where its own budget
+    /// would bind and no point read is near
+    /// (`Options::scan_cache_copies_fit`), `None` for the engine's default.
+    /// `supdb-nocopiesfit` is the budget that binds beside the raw form.
+    copiesfit: Option<bool>,
+    /// The chain through a write-only stretch only where the writer's
+    /// forms do not cover the store
+    /// (`Options::merge_chains_writes_uncovered`), `None` for the engine's
+    /// default. `supdb-chaincovered` chains through a covered burst, and
+    /// `supdb-nocopiesfitchain` is both shapes before.
+    chainuncovered: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
     /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
@@ -3163,6 +3264,10 @@ impl Default for Policy {
             rewarmtrim: false,
             rewarmraw: None,
             rewarmrawscans: None,
+            rewarmrawmaps: None,
+            headscopies: None,
+            copiesfit: None,
+            chainuncovered: None,
             formsoffbuilt: None,
             formson: false,
             formsoffkept: false,
@@ -7844,13 +7949,44 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with the rewarm asking for the raw form's files as well
-    /// (`Options::zpages_rewarm_raw`): the partitions the raw form serves,
-    /// the pieces and their ordered indexes, within the group's room.
-    pub fn create_zrewarmraw(path: &Path) -> Res<Supdb> {
+    /// `supdb` with no settle asking for the raw form's files
+    /// (`Options::zpages_rewarm_raw` off), the shape before: the partitions
+    /// the raw form serves, the pieces and their ordered indexes are read
+    /// back by whichever scan first wants them.
+    pub fn create_norewarmraw(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
+                rewarmraw: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// A probe's arm: `supdb-nozpages` with a job's arrays mapped
+    /// (`Options::zpages` off and `Options::jobs_mapped`), for what the
+    /// store reads at three million keys under 1 GiB with neither the
+    /// controller's preparations for the compact form nor the arenas the
+    /// jobs' threads leave. `supdb-nozjobs`.
+    pub fn create_nozjobs(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zpages_off: true,
+                jobsmapped: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-nozjobs` with a settle asking the raw form's files back
+    /// (`Options::zpages_rewarm_raw`). `supdb-nozjobsrewarm`.
+    pub fn create_nozjobsrewarm(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zpages_off: true,
+                jobsmapped: true,
                 rewarmraw: Some(true),
                 ..Policy::default()
             },
@@ -7878,6 +8014,77 @@ impl Supdb {
             Policy {
                 rewarmraw: Some(true),
                 rewarmrawscans: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with its block cache's own budget binding where there is no
+    /// room for it beside the raw form, whatever the store's reads
+    /// (`Options::scan_cache_copies_fit` off), the shape before. The pair
+    /// against `supdb` differs by that one option.
+    pub fn create_nocopiesfit(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                copiesfit: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` chaining its merges through every write-only stretch out of
+    /// core, a burst its forms cover among them
+    /// (`Options::merge_chains_writes_uncovered` off), the shape before.
+    /// The pair against `supdb` differs by that one option.
+    pub fn create_chaincovered(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                chainuncovered: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-nocopiesfit` and `supdb-chaincovered` together, the shape
+    /// before both: the budget that binds beside the raw form, and the
+    /// chain through a burst the forms cover.
+    pub fn create_nocopiesfitchain(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                copiesfit: Some(false),
+                chainuncovered: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the settle's ask for the raw form's files and nothing
+    /// of them mapped at its return (`Options::zpages_rewarm_raw_maps`
+    /// off): resident and unmapped, each first touch a fault.
+    pub fn create_rewarmrawnomap(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                rewarmrawmaps: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the partitions' heads copied at the controller's census
+    /// while the block cache holds the raw records' place
+    /// (`Options::heads_owned_beside_copies`): a partition a merge lands
+    /// after the grant has its heads in memory at the scans after the
+    /// burst, where the default reads them through a mapping the burst's
+    /// writes pushed out.
+    pub fn create_headscopies(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                headscopies: Some(true),
                 ..Policy::default()
             },
         )
@@ -9774,6 +9981,10 @@ impl Supdb {
             rewarmtrim,
             rewarmraw,
             rewarmrawscans,
+            rewarmrawmaps,
+            headscopies,
+            copiesfit,
+            chainuncovered,
             formsoffbuilt,
             formson,
             formsoffkept,
@@ -10275,6 +10486,14 @@ impl Supdb {
             zpages_rewarm_raw: rewarmraw.unwrap_or(supdb::Options::default().zpages_rewarm_raw),
             zpages_rewarm_raw_scans: rewarmrawscans
                 .unwrap_or(supdb::Options::default().zpages_rewarm_raw_scans),
+            zpages_rewarm_raw_maps: rewarmrawmaps
+                .unwrap_or(supdb::Options::default().zpages_rewarm_raw_maps),
+            heads_owned_beside_copies: headscopies
+                .unwrap_or(supdb::Options::default().heads_owned_beside_copies),
+            scan_cache_copies_fit: copiesfit
+                .unwrap_or(supdb::Options::default().scan_cache_copies_fit),
+            merge_chains_writes_uncovered: chainuncovered
+                .unwrap_or(supdb::Options::default().merge_chains_writes_uncovered),
             scan_forms_off_counts_built: formsoffbuilt
                 .unwrap_or(supdb::Options::default().scan_forms_off_counts_built),
             scan_forms_off_unreused: !formson,
@@ -10767,6 +10986,10 @@ impl Supdb {
             rewarmtrim,
             rewarmraw,
             rewarmrawscans,
+            rewarmrawmaps,
+            headscopies,
+            copiesfit,
+            chainuncovered,
             formsoffbuilt,
             formson,
             formsoffkept,
@@ -11018,6 +11241,29 @@ impl ThreadReader for supdb::Reader {
     }
 }
 
+/// A writer thread's supdb: a `Reader` of its own for the reads, and the
+/// store's one writer, shared with the other threads, for the batches.
+struct SupdbWriter<'a> {
+    db: std::sync::Arc<std::sync::Mutex<&'a mut supdb::Db>>,
+    r: supdb::Reader,
+}
+
+impl ThreadWriter for SupdbWriter<'_> {
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        supdb_get(&self.r, key)
+    }
+    fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
+        let mut db = self
+            .db
+            .lock()
+            .map_err(|_| "a writer thread panicked holding the store".to_string())?;
+        for &(k, v) in items {
+            db.put(k, v);
+        }
+        db.commit().map_err(|e| e.to_string())
+    }
+}
+
 impl ThreadReader for TallyReader {
     fn get(&mut self, key: &[u8]) -> Res<usize> {
         supdb_get(&self.r, key)
@@ -11060,6 +11306,15 @@ impl Engine for Supdb {
         let zdropraw = self.zdropraw == Some(true);
         let zlandpct = self.zlandpct.unwrap_or(0);
         let zstride = self.zstride == Some(supdb::ZStride::Forced);
+        // The probe's combinations first, which the single fields below
+        // would name by one of their parts.
+        if self.zpages_off && self.jobsmapped {
+            return if self.rewarmraw == Some(true) {
+                "supdb-nozjobsrewarm"
+            } else {
+                "supdb-nozjobs"
+            };
+        }
         // Before the budget branch, which would name the policy the cache
         // arm whatever else it carries.
         if self.budget > 0 && self.tofit && self.zpages_auto {
@@ -12344,11 +12599,26 @@ impl Engine for Supdb {
         if self.rewarmrawscans == Some(true) {
             return "supdb-zrewarmrawscans";
         }
+        if self.rewarmrawmaps == Some(false) {
+            return "supdb-rewarmrawnomap";
+        }
+        if self.headscopies == Some(true) {
+            return "supdb-headscopies";
+        }
+        match (
+            self.copiesfit == Some(false),
+            self.chainuncovered == Some(false),
+        ) {
+            (true, true) => return "supdb-nocopiesfitchain",
+            (true, false) => return "supdb-nocopiesfit",
+            (false, true) => return "supdb-chaincovered",
+            (false, false) => {}
+        }
         if self.formsoffbuilt == Some(true) {
             return "supdb-formsoffbuilt";
         }
-        if self.rewarmraw == Some(true) {
-            return "supdb-zrewarmraw";
+        if self.rewarmraw == Some(false) {
+            return "supdb-norewarmraw";
         }
         if self.formson {
             return "supdb-formson";
@@ -12729,6 +12999,8 @@ impl Engine for Supdb {
             // (`Options::scan_cache_auto`).
             ("cache_bindings", db.cache_bindings() as f64),
             ("cache_growths", db.cache_growths() as f64),
+            ("cache_copies_grants", db.cache_copies_grants().0 as f64),
+            ("cache_copies_revokes", db.cache_copies_grants().1 as f64),
             ("merge_syncs", db.merge_syncs() as f64),
             ("snap_switches", db.snapshot_switches() as f64),
             // The store's shape as it stands: what a read has to consult.
@@ -12814,6 +13086,7 @@ impl Engine for Supdb {
             ("heads_owned", db.heads_owned_counts().0 as f64),
             ("heads_disowned", db.heads_owned_counts().1 as f64),
             ("heads_owned_mb", (db.heads_owned_counts().2 >> 20) as f64),
+            ("heads_beside_copies", db.heads_beside_copies() as f64),
             ("form_heads_ahead", db.settle_ahead_asks()[0] as f64),
             ("table_lines_ahead", db.settle_ahead_asks()[1] as f64),
             // The writer's settles: see `Db::settle_density`.
@@ -13104,6 +13377,8 @@ impl Engine for Supdb {
             ("zpage_raw_rewarm_short", z.raw_rewarm_short as f64),
             ("zpage_raw_settles", z.raw_settles as f64),
             ("zpage_raw_settle_ms", z.raw_settle_ms as f64),
+            ("zpage_raw_maps", z.raw_maps as f64),
+            ("zpage_raw_map_ms", z.raw_map_ms as f64),
             ("forms_off_entries", db.forms_off_counts()[0] as f64),
             ("forms_off_exits", db.forms_off_counts()[1] as f64),
             ("forms_off_scans", db.forms_off_counts()[2] as f64),
@@ -13246,6 +13521,27 @@ impl Engine for Supdb {
             }));
         }
         Ok(Box::new(move || Ok(Box::new(r) as Box<dyn ThreadReader>)))
+    }
+    fn thread_writers(&mut self, n: usize) -> Res<Vec<WriterOpener<'_>>> {
+        let db = self.db.as_mut().ok_or("db closed")?;
+        // The readers claimed here, as `thread_reader` claims them, and
+        // the one writer lent to the threads behind a mutex: supdb takes
+        // writes from one handle, so a thread's batch is the handle held
+        // for the batch's puts and its commit. The reads take no lock:
+        // a `Reader` under `Latest` sees every commit before a read.
+        let mut readers = Vec::with_capacity(n);
+        for _ in 0..n {
+            readers.push(db.reader().map_err(|e| e.to_string())?);
+        }
+        let db = std::sync::Arc::new(std::sync::Mutex::new(db));
+        Ok(readers
+            .into_iter()
+            .map(|r| {
+                let db = db.clone();
+                Box::new(move || Ok(Box::new(SupdbWriter { db, r }) as Box<dyn ThreadWriter + '_>))
+                    as WriterOpener<'_>
+            })
+            .collect())
     }
     fn sync(&mut self) -> Res<()> {
         if let Some(db) = self.db.as_mut() {
@@ -13493,6 +13789,29 @@ impl ThreadReader for RocksReader {
     }
 }
 
+/// A writer thread's RocksDB: the shared handle, read options of the
+/// thread's own, and the arm's write options.
+struct RocksWriter {
+    db: std::sync::Arc<rocksdb::DB>,
+    read: rocksdb::ReadOptions,
+    sync: bool,
+}
+
+impl ThreadWriter for RocksWriter {
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        rocks_get(&self.db, &self.read, key)
+    }
+    fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
+        let mut b = rocksdb::WriteBatch::default();
+        for &(k, v) in items {
+            b.put(k, v);
+        }
+        let mut wo = rocksdb::WriteOptions::default();
+        wo.set_sync(self.sync);
+        self.db.write_opt(b, &wo).map_err(|e| e.to_string())
+    }
+}
+
 impl Engine for Rocks {
     fn name(&self) -> &'static str {
         if self.lz4 {
@@ -13551,6 +13870,21 @@ impl Engine for Rocks {
             read.set_verify_checksums(false);
             Ok(Box::new(RocksReader { db, read }) as Box<dyn ThreadReader>)
         }))
+    }
+    fn thread_writers(&mut self, n: usize) -> Res<Vec<WriterOpener<'_>>> {
+        // The handle is shared for writes as for reads: RocksDB queues the
+        // threads' batches and writes them as a group.
+        let sync = self.sync;
+        Ok((0..n)
+            .map(|_| {
+                let db = self.db.clone();
+                Box::new(move || {
+                    let mut read = rocksdb::ReadOptions::default();
+                    read.set_verify_checksums(false);
+                    Ok(Box::new(RocksWriter { db, read, sync }) as Box<dyn ThreadWriter>)
+                }) as WriterOpener<'_>
+            })
+            .collect())
     }
     fn sync(&mut self) -> Res<()> {
         // Everything written reaches the device: the WAL is fsynced, which
@@ -13744,6 +14078,41 @@ impl ThreadReader for LmdbReader {
     }
 }
 
+/// A writer thread's LMDB, as the arm itself runs on its one thread: a read
+/// transaction held across the thread's reads and dropped at its next
+/// write, which is a write transaction of the thread's own. LMDB admits
+/// one write transaction at a time, so a thread's batch waits for the
+/// others'.
+#[cfg(feature = "lmdb")]
+struct LmdbWriter {
+    env: heed::Env,
+    db: LmdbDb,
+    txn: Option<heed::RoTxn<'static>>,
+}
+
+#[cfg(feature = "lmdb")]
+impl ThreadWriter for LmdbWriter {
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        if self.txn.is_none() {
+            self.txn = Some(
+                self.env
+                    .clone()
+                    .static_read_txn()
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        lmdb_get(self.db, self.txn.as_ref().expect("just filled"), key)
+    }
+    fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
+        self.txn = None;
+        let mut w = self.env.write_txn().map_err(|e| e.to_string())?;
+        for &(k, v) in items {
+            self.db.put(&mut w, k, v).map_err(|e| e.to_string())?;
+        }
+        w.commit().map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(feature = "lmdb")]
 impl Engine for Lmdb {
     fn name(&self) -> &'static str {
@@ -13796,9 +14165,315 @@ impl Engine for Lmdb {
             Ok(Box::new(LmdbReader { db, txn }) as Box<dyn ThreadReader>)
         }))
     }
+    fn thread_writers(&mut self, n: usize) -> Res<Vec<WriterOpener<'_>>> {
+        // The arm's own held read transaction goes first: it would pin the
+        // pages of the store as it stood for as long as the threads write.
+        self.txn = None;
+        Ok((0..n)
+            .map(|_| {
+                let env = self.env.clone();
+                let db = self.db;
+                Box::new(move || {
+                    Ok(Box::new(LmdbWriter { env, db, txn: None }) as Box<dyn ThreadWriter>)
+                }) as WriterOpener<'_>
+            })
+            .collect())
+    }
     fn sync(&mut self) -> Res<()> {
         self.txn = None;
         self.env.force_sync().map_err(|e| e.to_string())
+    }
+    fn size_bytes(&self) -> u64 {
+        dir_size(&self.path)
+    }
+}
+
+// ----------------------------------------------------------------- faster --
+
+/// The keys a store is about to hold, set by the pass before it opens one,
+/// for an engine that sizes a table up front: FASTER's hash index takes its
+/// bucket count at open and does not grow it on its own. Zero: not said.
+static STORE_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Said by the pass before each store it opens (`run.rs`).
+pub fn set_store_keys(n: u64) {
+    STORE_KEYS.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(faster)]
+mod faster_ffi {
+    use std::os::raw::{c_char, c_int, c_void};
+    extern "C" {
+        pub fn fkv_open(dir: *const c_char, table_size: u64, log_bytes: u64) -> *mut c_void;
+        pub fn fkv_close(h: *mut c_void);
+        pub fn fkv_start_session(h: *mut c_void);
+        pub fn fkv_stop_session(h: *mut c_void);
+        pub fn fkv_upsert(h: *mut c_void, key: *const u8, value: *const u8) -> c_int;
+        pub fn fkv_read(h: *mut c_void, key: *const u8, out: *mut u8) -> c_int;
+        pub fn fkv_rmw(h: *mut c_void, key: *const u8, value: *const u8, out: *mut u8) -> c_int;
+        pub fn fkv_checkpoint(h: *mut c_void) -> c_int;
+        pub fn fkv_checkpoint_index(h: *mut c_void) -> c_int;
+    }
+}
+
+/// FASTER's key-value store (Microsoft's, its C++ store; the sources are
+/// fetched to `vendor/faster/src` at a pinned commit by `scripts/faster.sh`
+/// and called through the shim `vendor/faster/shim.cc`), the store the
+/// conventional advice names for unordered point gets and puts at the
+/// most throughput the cores give: a hash index over a hybrid log that
+/// updates in place while a record is in its mutable region.
+///
+/// Its guarantee is its own, `Guarantee::Memory`: a write is in the
+/// process's memory when it returns and FASTER has no setting that makes
+/// it more, so it sits in neither the durable group nor the buffered one,
+/// whose every commit is in the kernel. Its durability point is a
+/// checkpoint, as CPR runs it: the index checkpointed once on the store as
+/// opened, outside every timed window, and the hybrid log at each `sync`
+/// (waited for), which is where the buffered arms reach the device too.
+/// The log goes to the device by FASTER's own direct, asynchronous writes,
+/// in whole pages of 32 MiB, so a load's window, which ends at `sync`,
+/// carries one such write at the least. It has no ordered scan, so it runs
+/// every workload made of point operations and the harness leaves its scan
+/// workloads out (`Features::ordered_scan`); the arm does not recover a
+/// store, so it runs no recovery workload (`Features::reopen_for_write`);
+/// and it has no atomic batch: `write_batch` is its records upserted one
+/// by one.
+///
+/// Sized as FASTER's own benchmark sizes it: a hash index of half the
+/// store's keys in buckets, rounded up to a power of two, and the hybrid
+/// log's memory at four times the store's records, so every rung the
+/// in-memory scales run stays in memory and updates in place.
+#[cfg(faster)]
+pub struct Faster {
+    h: FasterHandle,
+    path: PathBuf,
+}
+
+/// The store's handle, which every session's thread uses: FASTER's store is
+/// thread-safe, and each thread runs a session of its own on it.
+#[cfg(faster)]
+#[derive(Clone, Copy)]
+struct FasterHandle(*mut std::os::raw::c_void);
+#[cfg(faster)]
+unsafe impl Send for FasterHandle {}
+#[cfg(faster)]
+unsafe impl Sync for FasterHandle {}
+
+#[cfg(faster)]
+const FASTER_VALUE: usize = 100;
+
+#[cfg(faster)]
+thread_local! {
+    /// Where a read's value lands: FASTER copies a value out under its
+    /// epoch and cannot lend it, so that copy is the caller's copy the
+    /// other engines make with `consume`, and no second one is made.
+    static FASTER_OUT: std::cell::RefCell<[u8; FASTER_VALUE]> =
+        const { std::cell::RefCell::new([0u8; FASTER_VALUE]) };
+}
+
+#[cfg(faster)]
+impl Faster {
+    pub fn create(path: &Path) -> Res<Faster> {
+        std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+        let keys = match STORE_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => 1 << 20,
+            n => n,
+        };
+        let table = (keys / 2).max(1024).next_power_of_two();
+        // A record is an 8-byte header, the key, the generation word and the
+        // value, rounded to eight: 136 bytes.
+        let record = 8 + 16 + 8 + FASTER_VALUE as u64;
+        let record = record.div_ceil(8) * 8;
+        let gib = 1u64 << 30;
+        let log = (keys * record * 4).div_ceil(gib).max(1) * gib;
+        let dir =
+            std::ffi::CString::new(path.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
+        let h = unsafe { faster_ffi::fkv_open(dir.as_ptr(), table, log) };
+        if h.is_null() {
+            return Err(format!(
+                "FASTER would not open a store at {}",
+                path.display()
+            ));
+        }
+        unsafe { faster_ffi::fkv_start_session(h) };
+        let f = Faster {
+            h: FasterHandle(h),
+            path: path.to_path_buf(),
+        };
+        if unsafe { faster_ffi::fkv_checkpoint_index(h) } != 0 {
+            return Err("FASTER's index checkpoint failed".to_string());
+        }
+        Ok(f)
+    }
+}
+
+#[cfg(faster)]
+fn faster_get(h: FasterHandle, key: &[u8]) -> Res<usize> {
+    if key.len() != 16 {
+        return Err(format!(
+            "FASTER's arm takes 16-byte keys, not {}",
+            key.len()
+        ));
+    }
+    FASTER_OUT.with(|o| {
+        let mut o = o.borrow_mut();
+        match unsafe { faster_ffi::fkv_read(h.0, key.as_ptr(), o.as_mut_ptr()) } {
+            1 => {
+                std::hint::black_box(o.as_slice());
+                Ok(FASTER_VALUE)
+            }
+            0 => Ok(0),
+            _ => Err("FASTER failed a read".to_string()),
+        }
+    })
+}
+
+#[cfg(faster)]
+impl Drop for Faster {
+    fn drop(&mut self) {
+        unsafe {
+            faster_ffi::fkv_stop_session(self.h.0);
+            faster_ffi::fkv_close(self.h.0);
+        }
+    }
+}
+
+/// A reader thread's FASTER: a session begun on the thread over the shared
+/// store, stopped when the reader goes.
+#[cfg(faster)]
+struct FasterReader {
+    h: FasterHandle,
+}
+
+#[cfg(faster)]
+impl ThreadReader for FasterReader {
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        faster_get(self.h, key)
+    }
+    fn range(&mut self, _from: &[u8], _n: usize) -> Res<usize> {
+        Err("FASTER has no ordered scan".to_string())
+    }
+}
+
+#[cfg(faster)]
+impl Drop for FasterReader {
+    fn drop(&mut self) {
+        unsafe { faster_ffi::fkv_stop_session(self.h.0) };
+    }
+}
+
+/// One batch as FASTER takes it: its records upserted one by one.
+#[cfg(faster)]
+fn faster_upserts(h: FasterHandle, items: &[(&[u8], &[u8])]) -> Res<()> {
+    for &(k, v) in items {
+        if k.len() != 16 || v.len() != FASTER_VALUE {
+            return Err(format!(
+                "FASTER's arm takes 16-byte keys and {FASTER_VALUE}-byte values, not {} and {}",
+                k.len(),
+                v.len()
+            ));
+        }
+        if unsafe { faster_ffi::fkv_upsert(h.0, k.as_ptr(), v.as_ptr()) } != 0 {
+            return Err("FASTER refused a write".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// A writer thread's FASTER: a session begun on the thread over the shared
+/// store, stopped when the writer goes. Reads, upserts and FASTER's own
+/// read-modify-write, each as the store takes it from any thread.
+#[cfg(faster)]
+struct FasterWriter {
+    h: FasterHandle,
+}
+
+#[cfg(faster)]
+impl ThreadWriter for FasterWriter {
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        faster_get(self.h, key)
+    }
+    fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
+        faster_upserts(self.h, items)
+    }
+    fn rmw(&mut self, key: &[u8], value: &[u8]) -> Option<Res<usize>> {
+        if key.len() != 16 || value.len() != FASTER_VALUE {
+            return Some(Err(format!(
+                "FASTER's arm takes 16-byte keys and {FASTER_VALUE}-byte values, not {} and {}",
+                key.len(),
+                value.len()
+            )));
+        }
+        Some(FASTER_OUT.with(|o| {
+            let mut o = o.borrow_mut();
+            match unsafe {
+                faster_ffi::fkv_rmw(self.h.0, key.as_ptr(), value.as_ptr(), o.as_mut_ptr())
+            } {
+                1 => {
+                    std::hint::black_box(o.as_slice());
+                    Ok(FASTER_VALUE)
+                }
+                0 => Ok(0),
+                _ => Err("FASTER failed a read-modify-write".to_string()),
+            }
+        }))
+    }
+}
+
+#[cfg(faster)]
+impl Drop for FasterWriter {
+    fn drop(&mut self) {
+        unsafe { faster_ffi::fkv_stop_session(self.h.0) };
+    }
+}
+
+#[cfg(faster)]
+impl Engine for Faster {
+    fn name(&self) -> &'static str {
+        "faster"
+    }
+    fn features(&self) -> Features {
+        Features {
+            durable_commit: false,
+            transactions: false,
+            checksums: false,
+            reopen_for_write: false,
+            read_your_writes: true,
+            ordered_scan: false,
+        }
+    }
+    fn write_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
+        faster_upserts(self.h, items)
+    }
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        faster_get(self.h, key)
+    }
+    fn range(&mut self, _from: &[u8], _n: usize) -> Res<usize> {
+        Err("FASTER has no ordered scan".to_string())
+    }
+    fn thread_reader(&self) -> Res<ReaderOpener> {
+        let h = self.h;
+        Ok(Box::new(move || {
+            unsafe { faster_ffi::fkv_start_session(h.0) };
+            Ok(Box::new(FasterReader { h }) as Box<dyn ThreadReader>)
+        }))
+    }
+    fn thread_writers(&mut self, n: usize) -> Res<Vec<WriterOpener<'_>>> {
+        let h = self.h;
+        Ok((0..n)
+            .map(|_| {
+                Box::new(move || {
+                    unsafe { faster_ffi::fkv_start_session(h.0) };
+                    Ok(Box::new(FasterWriter { h }) as Box<dyn ThreadWriter>)
+                }) as WriterOpener<'_>
+            })
+            .collect())
+    }
+    fn sync(&mut self) -> Res<()> {
+        match unsafe { faster_ffi::fkv_checkpoint(self.h.0) } {
+            0 => Ok(()),
+            _ => Err("FASTER's checkpoint failed".to_string()),
+        }
     }
     fn size_bytes(&self) -> u64 {
         dir_size(&self.path)
@@ -14086,21 +14761,36 @@ use crate::row::Guarantee;
 /// Every arm a run measures, in the order they are interleaved. Each is a
 /// shipping supdb configuration or the comparator a user would otherwise
 /// pick. Comparisons are made within a guarantee, never across one.
-pub const ARMS: [&str; 13] = [
-    "supdb",
-    "supdb-nozpages",
-    "supdb-forms",
-    "supdb-settle",
-    "supdb-nosnap",
-    "supdb-noadvice",
-    "supdb-nocache",
-    "supdb-cache256",
-    "lmdb",
-    "rocksdb-tuned",
-    "supdb-ingest",
-    "lmdb-nosync",
-    "rocksdb-tuned-nosync",
-];
+///
+/// `faster` is last, and in the roster where it is built (`cfg(faster)`,
+/// Linux x86-64): the store a user would otherwise pick for point gets and
+/// puts alone. Its guarantee is its own (`Guarantee::Memory`), so the suite
+/// compares it with no other arm, and a reader who sets its cells beside
+/// the buffered group's says what that group promises that it does not.
+macro_rules! roster {
+    ($($also:literal),*) => {
+        [
+            "supdb",
+            "supdb-nozpages",
+            "supdb-forms",
+            "supdb-settle",
+            "supdb-nosnap",
+            "supdb-noadvice",
+            "supdb-nocache",
+            "supdb-cache256",
+            "lmdb",
+            "rocksdb-tuned",
+            "supdb-ingest",
+            "lmdb-nosync",
+            "rocksdb-tuned-nosync",
+            $($also),*
+        ]
+    };
+}
+#[cfg(faster)]
+pub const ARMS: [&str; 14] = roster!("faster");
+#[cfg(not(faster))]
+pub const ARMS: [&str; 13] = roster!();
 
 /// The arms a bounded run (`Scale::Ooc`) measures by default: the default
 /// and the three shipping options whose difference is what a read past
@@ -14441,9 +15131,16 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zbacknow"
         | "supdb-norewarm"
         | "supdb-rewarmtrim"
-        | "supdb-zrewarmraw"
+        | "supdb-norewarmraw"
         | "supdb-zrewarmrawscans"
+        | "supdb-rewarmrawnomap"
+        | "supdb-headscopies"
+        | "supdb-nocopiesfit"
+        | "supdb-chaincovered"
+        | "supdb-nocopiesfitchain"
         | "supdb-formsoffbuilt"
+        | "supdb-nozjobs"
+        | "supdb-nozjobsrewarm"
         | "supdb-formson"
         | "supdb-formsoffkept"
         | "supdb-snapdrops"
@@ -14712,17 +15409,11 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-segmentblocks"
         | "supdb-segmentblocks-enc"
         | "supdb-segmentblocks-encbounded" => Guarantee::Buffered,
+        "faster" => Guarantee::Memory,
         _ => return None,
     })
 }
 
-/// Open an arm on a fresh directory. `map_gb` sizes LMDB's map; the other
-/// engines grow on their own.
-/// A supdb arm opened by its constructor, outside `open`: a `Supdb` is a
-/// few kilobytes, and the match built every arm's in a slot of its own in
-/// `open`'s frame, two megabytes at three hundred arms -- the default
-/// stack of a test's thread, which the first arm past it overflowed.
-#[inline(never)]
 /// The reads a light form takes before its conversion for
 /// `supdb-densefrom`, from `CONVREADS` (none where unset).
 fn conv_reads_env() -> u32 {
@@ -14742,6 +15433,11 @@ fn dense_from_env() -> usize {
         .max(1)
 }
 
+/// A supdb arm opened by its constructor, outside `open`: a `Supdb` is a
+/// few kilobytes, and the match built every arm's in a slot of its own in
+/// `open`'s frame, two megabytes at three hundred arms -- the default
+/// stack of a test's thread, which the first arm past it overflowed.
+#[inline(never)]
 fn supdb_arm(make: fn(&Path) -> Res<Supdb>, dir: &Path) -> Res<Box<dyn Engine>> {
     Ok(Box::new(make(dir)?))
 }
@@ -16406,9 +17102,16 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zbacknow" => supdb_arm(Supdb::create_zbacknow, dir)?,
         "supdb-norewarm" => supdb_arm(Supdb::create_norewarm, dir)?,
         "supdb-rewarmtrim" => supdb_arm(Supdb::create_rewarmtrim, dir)?,
-        "supdb-zrewarmraw" => supdb_arm(Supdb::create_zrewarmraw, dir)?,
+        "supdb-norewarmraw" => supdb_arm(Supdb::create_norewarmraw, dir)?,
         "supdb-zrewarmrawscans" => supdb_arm(Supdb::create_zrewarmrawscans, dir)?,
+        "supdb-rewarmrawnomap" => supdb_arm(Supdb::create_rewarmrawnomap, dir)?,
+        "supdb-headscopies" => supdb_arm(Supdb::create_headscopies, dir)?,
+        "supdb-nocopiesfit" => supdb_arm(Supdb::create_nocopiesfit, dir)?,
+        "supdb-chaincovered" => supdb_arm(Supdb::create_chaincovered, dir)?,
+        "supdb-nocopiesfitchain" => supdb_arm(Supdb::create_nocopiesfitchain, dir)?,
         "supdb-formsoffbuilt" => supdb_arm(Supdb::create_formsoffbuilt, dir)?,
+        "supdb-nozjobs" => supdb_arm(Supdb::create_nozjobs, dir)?,
+        "supdb-nozjobsrewarm" => supdb_arm(Supdb::create_nozjobsrewarm, dir)?,
         "supdb-formson" => supdb_arm(Supdb::create_formson, dir)?,
         "supdb-formsoffkept" => supdb_arm(Supdb::create_formsoffkept, dir)?,
         "supdb-snapdrops" => supdb_arm(Supdb::create_snapdrops, dir)?,
@@ -16505,6 +17208,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "rocksdb-tuned-lz4" => Box::new(Rocks::create_tuned_lz4(dir)?),
         "rocksdb-nosync" => Box::new(Rocks::create(dir, false)?),
         "rocksdb-tuned-nosync" => Box::new(Rocks::create_tuned_nosync(dir)?),
+        #[cfg(faster)]
+        "faster" => Box::new(Faster::create(dir)?),
+        #[cfg(not(faster))]
+        "faster" => return Err("faster: FASTER's C++ store is built on Linux x86-64 alone".into()),
         other => return Err(format!("no such arm: {other}")),
     })
 }
@@ -16559,6 +17266,69 @@ pub fn every_arm() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The handles a threaded mix gives its threads write the store the
+    /// arm opened, and read what they wrote: three threads at once, each
+    /// over keys of its own, read every key at the length the load gave it,
+    /// replace it in batches with a value of another length, and read it
+    /// back at the new one through the same handle. The arm's own read
+    /// path then finds every key at the new length. A writer over another
+    /// store, or one whose commits the readers do not see, would post a
+    /// rate like any other.
+    #[test]
+    fn thread_writers_write_the_store_the_arm_reads() {
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-threadwriters-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let keys: Vec<Vec<u8>> = (0..3000u64)
+            .map(|i| format!("{i:016}").into_bytes())
+            .collect();
+        let (was, now) = (vec![7u8; 100], vec![9u8; 60]);
+        for arm in ["supdb-ingest", "lmdb-nosync", "rocksdb-tuned-nosync"] {
+            let mut e = open(arm, &root.join(arm), 1).unwrap();
+            let pairs: Vec<(&[u8], &[u8])> = keys
+                .iter()
+                .map(|k| (k.as_slice(), was.as_slice()))
+                .collect();
+            e.write_batch(&pairs).unwrap();
+            e.sync().unwrap();
+            let openers = e.thread_writers(3).unwrap();
+            let barrier = std::sync::Barrier::new(3);
+            std::thread::scope(|s| {
+                for (i, open) in openers.into_iter().enumerate() {
+                    let (keys, now, barrier) = (&keys, &now, &barrier);
+                    s.spawn(move || {
+                        let mut w = open().unwrap();
+                        let mine: Vec<&Vec<u8>> = keys.iter().skip(i).step_by(3).collect();
+                        barrier.wait();
+                        for batch in mine.chunks(100) {
+                            for k in batch {
+                                assert_eq!(w.get(k).unwrap(), 100, "{arm}: as loaded");
+                            }
+                            let pairs: Vec<(&[u8], &[u8])> = batch
+                                .iter()
+                                .map(|k| (k.as_slice(), now.as_slice()))
+                                .collect();
+                            w.update_batch(&pairs).unwrap();
+                            for k in batch {
+                                assert_eq!(w.get(k).unwrap(), 60, "{arm}: its own commit");
+                            }
+                        }
+                    });
+                }
+            });
+            for k in &keys {
+                assert_eq!(e.get(k).unwrap(), 60, "{arm}: through the arm");
+            }
+            assert_eq!(
+                e.range(&keys[0], keys.len()).unwrap(),
+                60 * keys.len(),
+                "{arm}"
+            );
+            drop(e);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// The readahead arm is the durable LMDB arm with one flag more, and
     /// nothing else: named, durable, in the bounded roster, and opened
@@ -16686,7 +17456,9 @@ mod tests {
     fn a_store_reopened_where_its_predecessor_was_is_a_fresh_store() {
         let root = std::env::temp_dir().join(format!("supdb-bench-reopen-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let (k, v) = (b"k0000000000000001".as_slice(), [7u8; 100]);
+        // Sixteen bytes and a hundred, the suite's shape, which is the only
+        // one the `faster` arm's fixed-size records take.
+        let (k, v) = (b"k000000000000001".as_slice(), [7u8; 100]);
         for arm in every_arm() {
             let dir = root.join(arm);
             std::fs::create_dir_all(&dir).unwrap();
@@ -18614,12 +19386,53 @@ mod tests {
                 assert!(o.zpages_rewarm_trims && !b.zpages_rewarm_trims);
             }
             {
-                let z = Supdb::create_zrewarmraw(&dir("zrewarmraw")).unwrap();
-                assert_eq!(z.name(), "supdb-zrewarmraw");
+                let z = Supdb::create_norewarmraw(&dir("norewarmraw")).unwrap();
+                assert_eq!(z.name(), "supdb-norewarmraw");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_rewarm_raw && !b.zpages_rewarm_raw);
+                assert!(!o.zpages_rewarm_raw && b.zpages_rewarm_raw);
                 assert!(!o.zpages_rewarm_raw_scans && !b.zpages_rewarm_raw_scans);
+                let z = Supdb::create_rewarmrawnomap(&dir("rewarmrawnomap")).unwrap();
+                assert_eq!(z.name(), "supdb-rewarmrawnomap");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(
+                    o.zpages_rewarm_raw && !o.zpages_rewarm_raw_maps && b.zpages_rewarm_raw_maps
+                );
+            }
+            {
+                let z = Supdb::create_headscopies(&dir("headscopies")).unwrap();
+                assert_eq!(z.name(), "supdb-headscopies");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.heads_owned_beside_copies && !b.heads_owned_beside_copies);
+                assert!(o.heads_owned && o.scan_cache_copies_fit);
+            }
+            {
+                let z = Supdb::create_nocopiesfit(&dir("nocopiesfit")).unwrap();
+                assert_eq!(z.name(), "supdb-nocopiesfit");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.scan_cache_copies_fit && b.scan_cache_copies_fit);
+                assert_eq!(
+                    o.merge_chains_writes_uncovered,
+                    b.merge_chains_writes_uncovered
+                );
+            }
+            {
+                let z = Supdb::create_chaincovered(&dir("chaincovered")).unwrap();
+                assert_eq!(z.name(), "supdb-chaincovered");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.merge_chains_writes_uncovered && b.merge_chains_writes_uncovered);
+                assert_eq!(o.scan_cache_copies_fit, b.scan_cache_copies_fit);
+            }
+            {
+                let z = Supdb::create_nocopiesfitchain(&dir("nocopiesfitchain")).unwrap();
+                assert_eq!(z.name(), "supdb-nocopiesfitchain");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.scan_cache_copies_fit && !o.merge_chains_writes_uncovered);
             }
             {
                 let z = Supdb::create_zrewarmrawscans(&dir("zrewarmrawscans")).unwrap();

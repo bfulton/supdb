@@ -16,3 +16,10 @@ perf.data*
 # composed into its row and removed when the row is written. One left behind
 # is a run that was cut, for `bench run --resume` to take up, never a row.
 /runs/inflight
+
+# FASTER's sources, which `scripts/faster.sh` fetches at the commit in
+# `vendor/faster/PIN` for the `faster` arm: only the shim and the pin are
+# this repository's.
+/vendor/faster/src
+/vendor/faster/LICENSE
+/vendor/faster/COMMIT

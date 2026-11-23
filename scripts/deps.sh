@@ -13,6 +13,9 @@
 # node      Node, for the browser decrypter's test (wasm)
 # libclang  bindgen's libclang, for the comparators (bench, quick); the one
 #           definition is bench/scripts/libclang.sh, which CI calls too
+# faster    FASTER's sources at the pinned commit and the libraries they
+#           link, for the suite's `faster` arm (bench, quick; Linux x86-64
+#           alone); the one definition is bench/scripts/faster.sh
 # profile   perf and valgrind; not in the default set
 # openssl   OpenSSL's headers, for the encrypted comparators' ciphers (enc);
 #           not in the default set
@@ -22,7 +25,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-groups="${*:-rust node libclang}"
+groups="${*:-rust node libclang faster}"
 say() { printf '\n== %s ==\n' "$1"; }
 # A container runs as root and may have no sudo; anywhere else, ask for it.
 if [ "$(id -u)" = 0 ]; then root=; else root=sudo; fi
@@ -93,6 +96,13 @@ for g in $groups; do
         done
       done
       ;;
+    faster)
+      say faster
+      # FASTER's sources at the pinned commit and the libraries they link,
+      # for the suite's `faster` arm; the one definition is
+      # bench/scripts/faster.sh, which CI calls too. Linux x86-64 alone.
+      sh bench/scripts/faster.sh
+      ;;
     profile)
       say profile
       # This guest's kernel has no linux-tools package of its own, and the
@@ -116,7 +126,7 @@ for g in $groups; do
       ;;
     *)
       echo "unknown group: $g" >&2
-      echo "groups: rust node libclang profile openssl" >&2
+      echo "groups: rust node libclang faster profile openssl" >&2
       exit 2
       ;;
   esac

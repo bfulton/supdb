@@ -3980,6 +3980,170 @@ fn under_the_forms_gate_a_declined_partitions_heads_are_copied_and_a_waiting_one
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A block cache granted the raw records' place
+/// (`Options::scan_cache_copies_fit`) makes the controller's model say the
+/// raw form does not fit, of a store nothing will be bought for: the page
+/// cache's budget falls by the copies, the records they stand in for are
+/// still counted against it, and the grant stands only far from the point
+/// reads whose faults buy a form. At the census a misfit withholds the
+/// copies of the heads, so every partition landed after the grant read
+/// them through a mapping the bound could take. Under
+/// `Options::heads_owned_beside_copies` a grant standing reads as the store
+/// left raw, and every partition's heads are copied; without it none is,
+/// the model's word alone; and a grant a point read took back leaves the
+/// model's word alone under the option too. The page cache's budget is the
+/// test's seam and falls by what the cache holds, as the platform's does.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Case {
+        /// The option, a grant standing.
+        Beside,
+        /// A grant standing, the option off.
+        ModelAlone,
+        /// The option, the grant taken back by a point read.
+        TakenBack,
+    }
+    // What the bound leaves beside the raw form, to begin with.
+    const SLACK: u64 = 64 << 10;
+    let run = |name: &str, case: Case| {
+        let (dir, mut db, mut model, inject) = auto_store_loaded(
+            name,
+            1 << 30,
+            0.0,
+            FAULT_40US,
+            |o| {
+                o.seal_bytes = 4 << 20;
+                o.partition_bytes = Some(64 << 10);
+                o.l0_trigger = 64;
+                o.scan_block_cache = true;
+                o.scan_cache_ahead = false;
+                o.commit_forms = true;
+                o.forms_settle_backlog_pct = 0;
+                o.scan_cache_auto_bytes = 1 << 10;
+                o.scan_cache_auto_room = true;
+                o.scan_cache_copies_fit = true;
+                o.heads_owned = true;
+                o.heads_owned_beside_copies = case != Case::ModelAlone;
+                o.upkeep = supdb::Upkeep::Inline;
+            },
+            |_| {},
+            |db| ordered_load(db, 3000, 0x4EAD5),
+        );
+        let scan = |db: &Db, model: &Model, what: &str| {
+            for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
+                same_window(
+                    &scanned(db, &start, 57),
+                    &window(model, &start, 57),
+                    &format!("{name}: {what}, from {:?}", String::from_utf8_lossy(&start)),
+                );
+            }
+        };
+        let c = db.zpage_counts();
+        let parts = c.partitions;
+        assert!(parts >= 2, "{name}: {c:?}");
+        assert_eq!((c.phase, c.gate), (0, 0), "{name}: FITS to begin with");
+        scan(&db, &model, "loaded");
+        assert!(db.points_far(), "{name}: a store only scanned");
+        // The raw form's bytes, from the room under a budget past them.
+        let (_, _, room, _) = db.cache_place(1 << 30);
+        let raw = (1u64 << 30) - room as u64;
+        let budget = |db: &Db| (raw + SLACK).saturating_sub(db.block_cache_bytes() as u64);
+        // Twenty blocks, a key of each a round, until every one is dense
+        // and a copy: the first crossing of the cache's budget grows into
+        // the slack, and the second is granted the records' place.
+        let mut rng = Rng(0xBE51DE);
+        for round in 1..=24usize {
+            for b in 0..20usize {
+                let k = spaced_key(b * 64 + 1 + round % 24);
+                let v = suite_value(&mut rng);
+                db.append(&k, &v);
+                model.get_mut(&k).unwrap().push(v);
+            }
+            inject.set_budget(budget(&db));
+            db.commit().unwrap();
+            scan(&db, &model, &format!("round {round}"));
+        }
+        assert_eq!(
+            db.cache_copies_grants(),
+            (1, 0),
+            "{name}: the records' place granted, {} B held",
+            db.block_cache_bytes()
+        );
+        assert_eq!(
+            db.heads_owned_counts(),
+            (0, 0, 0),
+            "{name}: nothing copied at the raw gate"
+        );
+        if case == Case::TakenBack {
+            let last = spaced_key(2999);
+            assert_eq!(db.count(&last).unwrap(), 1);
+            assert!(!db.points_far(), "{name}: a point read is near");
+            let k = spaced_key(2);
+            let v = suite_value(&mut rng);
+            db.append(&k, &v);
+            model.get_mut(&k).unwrap().push(v);
+            inject.set_budget(budget(&db));
+            db.commit().unwrap();
+            assert_eq!(db.cache_copies_grants(), (1, 1), "{name}: taken back");
+        }
+        // The model's misfit, held at the census by the group's pressure.
+        // The misfit a grant made goes with the copies a taking back
+        // sheds, so there the seam says one for the model to read.
+        let seam = if case == Case::TakenBack {
+            SLACK
+        } else {
+            budget(&db)
+        };
+        inject.set_budget(seam);
+        inject.set_refault_rate(1_000_000.0);
+        wait_secs(&db, 3, 1);
+        let c = db.zpage_counts();
+        assert_eq!((c.phase, c.gate), (1, 1), "{name}: SUSPECT: {c:?}");
+        assert!(
+            c.model_hash_bytes + c.model_record_bytes > seam,
+            "{name}: the model's populations past a budget of {seam}: {c:?}"
+        );
+        scan(&db, &model, "the census");
+        let t = std::time::Instant::now();
+        while case == Case::Beside
+            && db.heads_owned_counts().0 < parts
+            && t.elapsed().as_secs() < 20
+        {
+            wait_secs(&db, 1, 1);
+        }
+        if case != Case::Beside {
+            wait_secs(&db, 3, 1);
+        }
+        let c = db.zpage_counts();
+        assert_eq!((c.phase, c.gate), (1, 1), "{name}: still SUSPECT: {c:?}");
+        let (made, given, bytes) = db.heads_owned_counts();
+        if case == Case::Beside {
+            assert_eq!((made, given), (parts, 0), "{name}: every partition's heads");
+            assert_eq!(bytes, 8 * model.len() as u64, "{name}: eight bytes a key");
+            assert_eq!(
+                db.heads_beside_copies(),
+                parts,
+                "{name}: each for the grant alone, the model saying misfit"
+            );
+        } else {
+            assert_eq!(
+                (made, given, bytes),
+                (0, 0, 0),
+                "{name}: the model's word alone, and it says misfit"
+            );
+            assert_eq!(db.heads_beside_copies(), 0, "{name}");
+        }
+        scan(&db, &model, "after the look");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    };
+    run("heads-beside-copies", Case::Beside);
+    run("heads-beside-model", Case::ModelAlone);
+    run("heads-beside-taken-back", Case::TakenBack);
+}
+
 /// At the census under the controller a copy is for a store the model says
 /// fits, whose census is the group's pressure: such a store sits there for
 /// as long as its writes make the group refault, every seek of it reads
@@ -4012,6 +4176,11 @@ fn at_the_census_the_controller_copies_heads_only_where_the_model_says_the_store
     let (made, given, bytes) = db.heads_owned_counts();
     assert_eq!((made, given), (parts, 0), "every partition's heads copied");
     assert_eq!(bytes, 8 * model.len() as u64);
+    assert_eq!(
+        db.heads_beside_copies(),
+        0,
+        "by the model's word, none for a grant of the records' place"
+    );
     scan(&db, &model, "the heads copied");
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
@@ -7496,6 +7665,21 @@ fn wait_for(what: &str, cond: impl Fn() -> bool) {
     }
 }
 
+/// A partition merge in flight at some moment since `landed` of them had
+/// landed (`Db::seal_waits`), waited for: one in flight now, or one landed
+/// since. A wait for one in flight alone is a bet on the poll: the merge a
+/// seal's landing plans over one partition of these stores is in flight for
+/// five milliseconds and a poll comes every five, so a poll a few
+/// milliseconds late found it landed and nothing left to merge, and sat out
+/// its ten seconds -- one run in 240 beside seven other processes, and the
+/// first run on a hosted runner.
+#[cfg(target_os = "linux")]
+fn wait_for_merge(db: &Db, landed: u64) {
+    wait_for("a merge of the pieces", || {
+        db.merges_in_flight() >= 1 || db.seal_waits().merges > landed
+    });
+}
+
 /// A blocked store driven to COMPACT by faulting reads through a handle:
 /// the price paid, the form built and installed, the gate at the form.
 #[allow(clippy::type_complexity)]
@@ -9532,8 +9716,9 @@ fn a_merges_outputs_have_their_form_files_when_it_lands() {
             }
             db.commit().unwrap();
         }
+        let before = db.seal_waits().merges;
         db.seal().unwrap();
-        wait_for("a merge of the pieces", || db.merges_in_flight() >= 1);
+        wait_for_merge(&db, before);
         if on {
             wait_for("builds at the outputs' finish, at their hold", || {
                 db.zpage_build_waiting() && db.zpage_counts().finish_live >= 1
@@ -9680,8 +9865,9 @@ fn an_output_being_built_at_its_finish_is_not_built_ahead_again() {
         }
         db.commit().unwrap();
     }
+    let before = db.seal_waits().merges;
     db.seal().unwrap();
-    wait_for("a merge of the pieces", || db.merges_in_flight() >= 1);
+    wait_for_merge(&db, before);
     wait_for("builds at the outputs' finish, at their hold", || {
         db.zpage_build_waiting() && db.zpage_counts().finish_live >= 1
     });
@@ -12595,6 +12781,137 @@ fn raw_resident(dir: &Path) -> (u64, u64) {
     (ps + os, pr + or)
 }
 
+/// A settle that asked for the raw form's files maps what came back
+/// (`Options::zpages_rewarm_raw_maps`). Every partition and ordered index
+/// is put out of the cache and out of the store's page tables; the settle
+/// asks for them and waits, and with the option the partitions' record
+/// regions are mapped when it returns, where without it they are resident
+/// and unmapped, each first touch a fault. With no room in the group
+/// nothing is asked, and nothing is mapped: the mapping reads no region
+/// the ask left out. And a region the scans have faulted in is mapped
+/// either way, which is what the count is of.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_settle_maps_the_raw_files_it_asked_back() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Room {
+        All,
+        Half,
+        /// For half of the ordered indexes and no partition.
+        Indexes,
+        None,
+    }
+    for (maps, room) in [
+        (true, Room::All),
+        (false, Room::All),
+        (true, Room::Half),
+        (true, Room::Indexes),
+        (true, Room::None),
+    ] {
+        let what = format!("raw maps {maps} room {room:?}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-rawmaps-{maps}-{room:?}"),
+            1 << 30,
+            0.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_rewarm_raw = true;
+                o.zpages_rewarm_raw_scans = false;
+                o.zpages_rewarm_raw_maps = maps;
+                o.zpages_hot_raw = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        for _ in 0..3 {
+            advance_tick(&db, std::time::Duration::from_millis(100));
+        }
+        let c = db.zpage_counts();
+        assert_eq!(c.gate, 0, "{what}: the raw form serves: {c:?}");
+        let (size, cold) = evict_raw(&dir);
+        assert!(
+            size > 0 && cold * 10 < size,
+            "{what}: the raw files out of the cache: {cold} of {size}"
+        );
+        inject.set_slack(match room {
+            Room::All => 1 << 30,
+            Room::Half => size / 2,
+            Room::Indexes => resident_under(&dir, "ord-").0 / 2,
+            Room::None => 0,
+        });
+        let (recs, ord) = db.raw_mapped_share().expect("the page tables are readable");
+        assert!(
+            recs < 0.1 && ord < 0.1,
+            "{what}: the files out of the page tables: records {recs:.2}, indexes {ord:.2}"
+        );
+        let mut db = db;
+        db.settle().unwrap();
+        let c = db.zpage_counts();
+        let (recs, ord) = db.raw_mapped_share().unwrap();
+        let warm = raw_resident(&dir).1;
+        match (maps, room) {
+            (true, Room::All) => {
+                assert!(c.raw_settles == 1 && c.raw_maps > 0, "{what}: {c:?}");
+                assert!(
+                    warm * 10 >= size * 9 && recs >= 0.9 && ord >= 0.9,
+                    "{what}: the files back and mapped: {warm} of {size} resident, \
+                     records {recs:.2} and indexes {ord:.2} mapped"
+                );
+            }
+            (false, _) => {
+                assert!(c.raw_settles == 1 && c.raw_maps == 0, "{what}: {c:?}");
+                assert!(
+                    warm * 10 >= size * 9 && recs < 0.1 && ord < 0.1,
+                    "{what}: the files back and nothing of them mapped: {warm} of {size} \
+                     resident, records {recs:.2} and indexes {ord:.2} mapped"
+                );
+            }
+            (true, Room::Half) => {
+                // The ordered indexes are asked first and all come back;
+                // the room ends among the partitions, and a partition the
+                // ask left out is neither read nor mapped.
+                assert!(
+                    c.raw_settles == 1 && c.raw_maps > 0 && c.raw_rewarm_short > 0,
+                    "{what}: {c:?}"
+                );
+                assert!(
+                    warm * 10 < size * 8 && recs > 0.1 && recs < 0.8 && ord >= 0.9,
+                    "{what}: what was asked back is mapped and the rest left out: {warm} of \
+                     {size} resident, records {recs:.2} and indexes {ord:.2} mapped"
+                );
+            }
+            (true, Room::Indexes) => {
+                assert!(
+                    c.raw_settles == 1 && c.raw_maps > 0 && c.raw_rewarm_short > 0,
+                    "{what}: {c:?}"
+                );
+                assert!(
+                    recs < 0.1 && ord > 0.1 && ord < 0.8,
+                    "{what}: the indexes asked back are mapped, and no index or partition \
+                     the ask left out: records {recs:.2} and indexes {ord:.2} mapped"
+                );
+            }
+            (true, Room::None) => {
+                assert!(c.raw_settles == 0 && c.raw_maps == 0, "{what}: {c:?}");
+                assert!(
+                    warm * 10 < size && recs < 0.1 && ord < 0.1,
+                    "{what}: nothing asked beyond the room, and nothing read to be \
+                     mapped: {warm} of {size} resident, records {recs:.2}"
+                );
+            }
+        }
+        // The scans answer the model, and what they read is mapped whatever
+        // the option.
+        check_scan(&db, &model, &what);
+        assert!(
+            db.raw_mapped_share().unwrap().0 > 0.5,
+            "{what}: a scan of the store maps what it reads"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// With the raw form serving -- the store in core, no form installed --
 /// the scans that come back after a stretch without one have the raw files
 /// the page cache has lost asked for (`Options::zpages_rewarm_raw`): every
@@ -12783,18 +13100,33 @@ fn scans_after_a_quiet_stretch_have_the_cold_raw_files_asked_for() {
 /// is counted short and left; and without the option nothing is asked. An
 /// ask made of the bytes a paged mapping lends unasked measured files of
 /// none and asked for nothing.
+///
+/// And what the ask brought back is mapped
+/// (`Options::zpages_rewarm_raw_maps`), which under a cipher is the
+/// ciphertext a fill reads its chunk through: the envelopes' pages for the
+/// record regions and the ordered indexes are in this process's page
+/// tables as the settle returns, where without the option they are
+/// resident and no more mapped than the open left them, and where nothing
+/// was asked nothing is mapped. A map made of the bytes a paged mapping
+/// lends unasked would have mapped none either; it decrypts nothing.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_settles_raw_rewarm_under_a_cipher_asks_for_the_envelopes_and_decrypts_nothing() {
-    for (on, room) in [(true, 1u64 << 30), (true, 0), (false, 1 << 30)] {
-        let what = format!("raw rewarm under a cipher {on} room {room}");
-        let dir = scratch(&format!("rawrewarm-cipher-{on}-{room}"));
+    for (on, room, maps) in [
+        (true, 1u64 << 30, true),
+        (true, 1 << 30, false),
+        (true, 0, true),
+        (false, 1 << 30, true),
+    ] {
+        let what = format!("raw rewarm under a cipher {on} room {room} maps {maps}");
+        let dir = scratch(&format!("rawrewarm-cipher-{on}-{room}-{maps}"));
         let inject = std::sync::Arc::new(supdb::ZInject::new());
         inject.set_budget(1 << 30);
         inject.set_slack(room);
         let opts = || Options {
             zpages_inject: Some(inject.clone()),
             zpages_rewarm_raw: on,
+            zpages_rewarm_raw_maps: maps,
             partition_bytes: Some(400 << 10),
             encryption: supdb::Encryption::Cipher(supdb::StoreCipher::new(
                 common::Gcm::new(&[0x5c; 32]),
@@ -12836,9 +13168,18 @@ fn a_settles_raw_rewarm_under_a_cipher_asks_for_the_envelopes_and_decrypts_nothi
             .expect("a store under a cipher")
             .cache
             .fills;
+        // What the open's few reads left a read of the records to fault
+        // on. The ordered indexes of this store are a few chunks each and
+        // the open has read them whole, so nothing is said of them before.
+        let (recs0, _) = db.raw_mapped_share().expect("the page tables are readable");
+        assert!(
+            recs0 < 0.5,
+            "{what}: the records' ciphertext all but out of the page tables: {recs0:.2}"
+        );
         db.settle().unwrap();
         let c = db.zpage_counts();
         let (_, warm) = resident_under(&dir, "x-");
+        let (recs, ord) = db.raw_mapped_share().unwrap();
         match (on, room > 0) {
             (true, true) => {
                 assert_eq!(c.raw_settles, 1, "{what}: the settle's asks: {c:?}");
@@ -12851,26 +13192,45 @@ fn a_settles_raw_rewarm_under_a_cipher_asks_for_the_envelopes_and_decrypts_nothi
                     warm * 10 >= size * 8,
                     "{what}: the envelopes back as the settle returns: {warm} of {size}"
                 );
+                if maps {
+                    assert!(c.raw_maps > 0, "{what}: the settle mapped: {c:?}");
+                    assert!(
+                        recs >= 0.9 && ord >= 0.9,
+                        "{what}: what came back is mapped: records {recs:.2}, indexes {ord:.2}"
+                    );
+                } else {
+                    assert_eq!(c.raw_maps, 0, "{what}: {c:?}");
+                    assert!(
+                        recs <= recs0 + 0.05,
+                        "{what}: back and no more of it mapped: records {recs0:.2} -> {recs:.2}"
+                    );
+                }
             }
             (true, false) => {
                 assert_eq!(
-                    (c.raw_settles, c.raw_rewarm_files),
-                    (0, 0),
-                    "{what}: nothing asked beyond the room: {c:?}"
+                    (c.raw_settles, c.raw_rewarm_files, c.raw_maps),
+                    (0, 0, 0),
+                    "{what}: nothing asked beyond the room, and nothing mapped: {c:?}"
                 );
                 assert!(
                     c.raw_rewarm_short >= 4,
                     "{what}: every cold envelope short: {c:?}"
                 );
                 assert!(
-                    warm * 2 < size,
-                    "{what}: the envelopes left out: {warm} of {size}"
+                    warm * 2 < size && recs <= recs0 + 0.05,
+                    "{what}: the envelopes left out and unmapped: {warm} of {size}, \
+                     records {recs0:.2} -> {recs:.2}"
                 );
             }
             (false, _) => {
                 assert_eq!(
-                    (c.raw_settles, c.raw_rewarm_files, c.raw_rewarm_short),
-                    (0, 0, 0),
+                    (
+                        c.raw_settles,
+                        c.raw_rewarm_files,
+                        c.raw_rewarm_short,
+                        c.raw_maps
+                    ),
+                    (0, 0, 0, 0),
                     "{what}: {c:?}"
                 );
                 assert!(
@@ -12882,7 +13242,7 @@ fn a_settles_raw_rewarm_under_a_cipher_asks_for_the_envelopes_and_decrypts_nothi
         assert_eq!(
             db.cipher_counts().unwrap().cache.fills,
             fills,
-            "{what}: the asks decrypted nothing"
+            "{what}: the asks and the mapping decrypted nothing"
         );
         let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
         let r = db.reader().unwrap();
@@ -18423,6 +18783,7 @@ fn a_merges_outputs_are_built_in_the_block_form_where_the_room_is_short() {
 /// With `twice`, the last key is given a second value in a batch of its
 /// own, so that the stride form declines the last partition
 /// (`StrideNo::NotOneValue`).
+#[cfg(target_os = "linux")]
 fn numbered_soft_load(db: &mut Db, n: usize, w: usize, seed: u64, twice: bool) -> Model {
     let mut rng = Rng(seed);
     let mut model = Model::new();
@@ -18486,6 +18847,7 @@ fn convert_look(db: &Db, by: std::time::Duration) {
 
 /// `heat_up` over keys that may hold more than one value: `n` reads of
 /// `keys`, round and round, each answering something.
+#[cfg(target_os = "linux")]
 fn read_round(db: &Db, keys: &[Vec<u8>], n: usize) {
     for i in 0..n {
         let k = &keys[i % keys.len()];
@@ -18517,6 +18879,7 @@ fn convert_alike_until(
 }
 
 /// Each partition's form by key order: whether a stride file serves it.
+#[cfg(target_os = "linux")]
 fn strides(db: &Db) -> Vec<bool> {
     db.zpage_heat().iter().map(|h| h.stride).collect()
 }

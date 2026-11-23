@@ -15,7 +15,7 @@ static ALLOC: supdb_bench::alloc_census::Counting = supdb_bench::alloc_census::C
 const USAGE: &str = "\
 usage:
   bench run --scale quick|full [--out DIR] [--arms a,b,...] [--top KEYS] [--bottom KEYS] [--reps N]
-            [--keys numbered|ids] [--fresh-process|--one-process]
+            [--keys numbered|ids] [--fresh-process|--one-process] [--passes a,b,...]
   bench run --scale ooc --bound BYTES [--ops-div N] [the options above]
   bench run --resume DIR [--reps N] [--resume-passes]
   bench ab --arms A,B [--size KEYS] [--reps N] [--len ENTRIES] [--pairs TEXT] [--bound BYTES] [--passes a,b,...]
@@ -48,6 +48,10 @@ run    measures every arm over the size ladder and writes runs/<scale>/<utc>-<sh
                row's class, and a bound too small for the floors is refused before the floors
        --ops-div what the read passes' operation counts are divided by at ooc (default 10);
                loads and bursts are never divided, and no divided count goes below 1000
+       --passes as for ab: the passes the row is made of, where it is not to be the series'
+               whole row; it is then written under <out>/passes/<scale>/, which neither the
+               gate nor the figures read. mixes-threaded, the gets and puts from several
+               threads at once, is in no row unless named here
        --resume DIR  take up the run whose ledger is DIR (<out>/inflight/<utc>-<sha7>, what a run
                that was cut leaves): the same binary, class and bound, the plan the ledger's,
                every whole rep kept and a cut rep taken again whole. --reps may raise the
@@ -67,7 +71,8 @@ ab     two arms in one process, alternating and paired rep by rep, for choosing
        --bound as for run: the pairing under a memory bound, with the counts per
                operation a bounded row records paired like any other quantity.
        --passes a comma-separated subset of load,read,read-threaded,scan,scan-threaded,
-               mixes,scan-mixed,mixes-scrambled,lag,recover (default: all but recover),
+               mixes,scan-mixed,mixes-scrambled,lag,recover,mixes-threaded (default: all but
+               recover and mixes-threaded),
                for a question one phase answers at a rung where the whole pass is an hour.
        --ops-div as for run, here at any scale (default 1): the read passes' counts
                divided, for a pairing at a rung where the whole pass is an hour.
@@ -913,6 +918,22 @@ fn cmd_run(a: Args) -> i32 {
         plan.reps = r as usize;
     }
     plan.keys = keys;
+    // A row of some passes is not a row of the series: the gate's window
+    // and the figures read `<out>/<scale>/`, and a row there that lacks most
+    // of its quantities would stand in both as one of the last ten. It is
+    // written under `<out>/passes/<scale>/`, its ledger beside it.
+    let out = if let Some(list) = a.get("--passes") {
+        match run::Passes::parse(list) {
+            Ok(p) => plan.passes = p,
+            Err(e) => {
+                eprintln!("{e}\n\n{USAGE}");
+                return 2;
+            }
+        }
+        out.join("passes")
+    } else {
+        out
+    };
     if a.has("--fresh-process") {
         plan.fresh_process = true;
     } else if a.has("--one-process") {
