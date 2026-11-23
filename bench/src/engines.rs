@@ -1895,6 +1895,13 @@ pub struct Supdb {
     /// (`Options::zpages_memo_slab`): `supdb-zmemoslab`,
     /// `supdb-zstrideallslab`.
     zmemoslab: bool,
+    /// The log held in the process, with nothing written or synced at a
+    /// commit (`SyncPolicy::Explicit`): what FASTER promises between two
+    /// checkpoints, and the one supdb arm of its guarantee, `supdb-held`;
+    /// and the cap its log spills at where the arm pins one
+    /// (`Options::wal_hold_bytes`), `supdb-held1m` and `supdb-held8m`.
+    held: bool,
+    holdcap: Option<usize>,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -3121,6 +3128,13 @@ struct Policy {
     /// (`Options::zpages_memo_slab`): `supdb-zmemoslab` beside `supdb`, and
     /// `supdb-zstrideallslab` beside `supdb-zstridealldropagain`.
     zmemoslab: bool,
+    /// The log held in the process and no commit written
+    /// (`SyncPolicy::Explicit`), of an arm that is not durable:
+    /// `supdb-held` beside `supdb-ingest`.
+    held: bool,
+    /// The bytes the held log spills at (`Options::wal_hold_bytes`), the
+    /// engine's where the arm pins none: `supdb-held1m`, `supdb-held8m`.
+    holdcap: Option<usize>,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -3447,6 +3461,8 @@ impl Default for Policy {
             jobsheap: false,
             jobspooled: false,
             zmemoslab: false,
+            held: false,
+            holdcap: None,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3607,6 +3623,26 @@ impl Supdb {
             Policy {
                 partition: false,
                 durable: false,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` with its log held in the process
+    /// (`SyncPolicy::Explicit`): no commit is written, and nothing is
+    /// promised of one until the arm's `sync`, which is its drain, as
+    /// FASTER's is its checkpoint. The frames a seal makes durable are
+    /// dropped unwritten, so a pass that ends in `sync` writes its log to
+    /// no file; what the log holds past `cap` it writes, unsynced, the
+    /// engine's cap where `None` (`Options::wal_hold_bytes`).
+    pub fn create_held(path: &Path, cap: Option<usize>) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                held: true,
+                holdcap: cap,
                 ..Policy::default()
             },
         )
@@ -10106,6 +10142,8 @@ impl Supdb {
             jobsheap,
             jobspooled,
             zmemoslab,
+            held,
+            holdcap,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -10757,9 +10795,14 @@ impl Supdb {
             // buffer.
             sync: if durable {
                 supdb::SyncPolicy::Always
+            } else if held {
+                // Nothing written at a commit: the guarantee is FASTER's
+                // and the arm sits in its row (`Guarantee::Memory`).
+                supdb::SyncPolicy::Explicit
             } else {
                 supdb::SyncPolicy::EveryN(u32::MAX)
             },
+            wal_hold_bytes: holdcap.unwrap_or(supdb::Options::default().wal_hold_bytes),
             ..Default::default()
         };
         let opts = match advice {
@@ -11109,6 +11152,8 @@ impl Supdb {
             jobsheap,
             jobspooled,
             zmemoslab,
+            held,
+            holdcap,
             ord_threads: Default::default(),
         })
     }
@@ -11275,6 +11320,15 @@ impl Engine for Supdb {
         let zdropraw = self.zdropraw == Some(true);
         let zlandpct = self.zlandpct.unwrap_or(0);
         let zstride = self.zstride == Some(supdb::ZStride::Forced);
+        // The guarantee first: an arm that holds its log is no shape of
+        // `supdb-ingest`, whose name the fields below would give it.
+        if self.held {
+            return match self.holdcap {
+                None => "supdb-held",
+                Some(c) if c <= 1 << 20 => "supdb-held1m",
+                Some(_) => "supdb-held8m",
+            };
+        }
         // The probe's combinations first, which the single fields below
         // would name by one of their parts.
         if self.zpages_off && self.jobsmapped {
@@ -12946,6 +13000,13 @@ impl Engine for Supdb {
         let [not_shaped, holes, not_one_value, width, tomb, block_backed, small, self_check, deferred] =
             z.stride_declines;
         vec![
+            // What a log held in the process holds, has dropped unwritten
+            // behind a durable seal and has written at a spill
+            // (`SyncPolicy::Explicit`); zeros for every other arm.
+            ("wal_held", db.wal_held().held as f64),
+            ("wal_dropped", db.wal_held().dropped as f64),
+            ("wal_spilled", db.wal_held().spilled as f64),
+            ("wal_spills", db.wal_held().spills as f64),
             ("snapshot_builds", db.snapshot_builds() as f64),
             ("snapshots_stood", db.snapshots_stood() as f64),
             ("snapshot_extends", db.snapshot_extends() as f64),
@@ -15035,7 +15096,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "lmdb-nosync"
         | "rocksdb-nosync"
         | "rocksdb-tuned-nosync" => Guarantee::Buffered,
-        "faster" => Guarantee::Memory,
+        // FASTER's promise and no stronger one: a commit is in the process
+        // when the call returns and on the device at the next `sync`.
+        "supdb-held" | "supdb-held1m" | "supdb-held8m" | "faster" => Guarantee::Memory,
         _ => return None,
     })
 }
@@ -15370,6 +15433,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocacheautozpageseager" => supdb_arm(Supdb::create_nocache_auto_zpages_eager, dir)?,
         "supdb-cache256" => supdb_arm(Supdb::create_cache256, dir)?,
         "supdb-ingest" => supdb_arm(Supdb::create_ingest, dir)?,
+        "supdb-held" => supdb_arm(|d| Supdb::create_held(d, None), dir)?,
+        "supdb-held1m" => supdb_arm(|d| Supdb::create_held(d, Some(1 << 20)), dir)?,
+        "supdb-held8m" => supdb_arm(|d| Supdb::create_held(d, Some(8 << 20)), dir)?,
         "supdb-ingestleave" => supdb_arm(Supdb::create_ingest_leave, dir)?,
         "supdb-l0" => supdb_arm(Supdb::create_l0, dir)?,
         "supdb-nopin" => supdb_arm(Supdb::create_nopin, dir)?,
@@ -16948,6 +17014,114 @@ mod tests {
         consume(&short);
         assert!(sink_holds(&short));
         assert!(!sink_holds(&long[..n / 2]));
+    }
+
+    /// `supdb-held` is `supdb-ingest` with its log held in the process
+    /// (`SyncPolicy::Explicit`) and nothing else moved, and the row it sits
+    /// in is FASTER's. A batch it takes is read back and is in no file;
+    /// its `sync`, a drain as its sibling's is, leaves every commit in a
+    /// segment with the frames it covered dropped and never written, so
+    /// the log's files hold their headers alone. The arms that pin the
+    /// log's cap pin that and are the same arm otherwise.
+    #[test]
+    fn the_held_arm_writes_no_commit_and_sits_in_fasters_row() {
+        let root = std::env::temp_dir().join(format!("supdb-bench-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let frames = |d: &Path| -> u64 {
+            std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("wal-"))
+                .map(|e| e.metadata().unwrap().len().saturating_sub(8))
+                .sum()
+        };
+        let count = |e: &Supdb, name: &str| -> f64 {
+            let c = e.counters();
+            c.iter().find(|(n, _)| *n == name).unwrap().1
+        };
+        let keys: Vec<Vec<u8>> = (0..2_000u64)
+            .rev()
+            .map(|i| format!("{i:016}").into_bytes())
+            .collect();
+        let value = vec![7u8; crate::run::VALUE_SIZE];
+        let pairs: Vec<(&[u8], &[u8])> = keys
+            .iter()
+            .map(|k| (k.as_slice(), value.as_slice()))
+            .collect();
+
+        let mut base = Supdb::create_ingest(&root.join("ingest")).unwrap();
+        let b = base.db.as_ref().unwrap().options().clone();
+        assert!(matches!(b.sync, supdb::SyncPolicy::EveryN(u32::MAX)));
+        assert_eq!(guarantee("supdb-ingest"), Some(Guarantee::Buffered));
+        base.update_batch(&pairs).unwrap();
+        assert!(
+            frames(&root.join("ingest")) > 0,
+            "the buffered arm's batch is on its log: the control"
+        );
+        assert_eq!(count(&base, "wal_held"), 0.0);
+
+        for (arm, cap) in [
+            ("supdb-held", None),
+            ("supdb-held1m", Some(1usize << 20)),
+            ("supdb-held8m", Some(8 << 20)),
+        ] {
+            assert_eq!(guarantee(arm), Some(Guarantee::Memory), "{arm}");
+            let dir = root.join(arm);
+            let mut z = Supdb::create_held(&dir, cap).unwrap();
+            assert_eq!(z.name(), arm);
+            assert_eq!(
+                open(arm, &root.join(format!("{arm}-by-name")), 1)
+                    .unwrap()
+                    .name(),
+                arm
+            );
+            assert_eq!(z.features(), base.features(), "{arm}");
+            let o = z.db.as_ref().unwrap().options().clone();
+            assert!(matches!(o.sync, supdb::SyncPolicy::Explicit), "{arm}");
+            assert_eq!(o.wal_hold_bytes, cap.unwrap_or(b.wal_hold_bytes), "{arm}");
+            // The sibling's shape otherwise, on the options a commit's and
+            // a drain's paths turn on.
+            assert_eq!(
+                (
+                    o.seal_bytes,
+                    o.flush_schedules,
+                    o.adaptive_shape,
+                    o.scan_block_cache
+                ),
+                (
+                    b.seal_bytes,
+                    b.flush_schedules,
+                    b.adaptive_shape,
+                    b.scan_block_cache
+                ),
+                "{arm}"
+            );
+            z.update_batch(&pairs).unwrap();
+            assert_eq!(frames(&dir), 0, "{arm}: a commit reached the log's file");
+            assert!(count(&z, "wal_held") > 200_000.0, "{arm}: nothing is held");
+            for k in &keys {
+                assert_eq!(
+                    z.get(k).unwrap(),
+                    value.len(),
+                    "{arm}: a held batch is read"
+                );
+            }
+            z.sync().unwrap();
+            // The counts are as the writer last looked; its next commit
+            // is the look.
+            z.update_batch(&pairs[..1]).unwrap();
+            assert!(
+                count(&z, "wal_dropped") > 200_000.0,
+                "{arm}: the drain covered nothing"
+            );
+            assert_eq!(count(&z, "wal_spilled"), 0.0, "{arm}");
+            assert_eq!(frames(&dir), 0, "{arm}: the drain wrote the log it covered");
+            for k in &keys {
+                assert_eq!(z.get(k).unwrap(), value.len(), "{arm}: after its sync");
+            }
+        }
+        drop(base);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The handles a threaded mix gives its threads write the store the

@@ -197,10 +197,11 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
     }
 }
 
-/// When a commit reaches the device. A commit is WRITTEN on every commit
-/// under every policy, to the WAL or, for a run of ordered ingest, to the
-/// run's own file, so a process's death takes nothing a commit returned
-/// for; this decides only the barrier. `EveryN(n)` bounds loss at n
+/// When a commit reaches the device. Under `Always` and `EveryN` a commit
+/// is WRITTEN at the commit, to the WAL or, for a run of ordered ingest, to
+/// the run's own file, so a process's death takes nothing a commit
+/// returned for, and the policy decides only the barrier; `Explicit` is the
+/// one policy that writes nothing at a commit. `EveryN(n)` bounds loss at n
 /// batches: on a crash, replay stops at the first frame that is torn or
 /// missing and the sequence-gap check refuses anything past a hole, so an
 /// unsynced tail is lost whole and never served in part. A run's records
@@ -219,6 +220,37 @@ pub enum SyncPolicy {
     /// One sync per `n` commits, of everything committed so far, and
     /// always at `sync`, flush and close.
     EveryN(u32),
+    /// Nothing at a commit: the commit's frames stay in the process, and
+    /// nothing is promised of it until a `sync`, a `flush` or the close,
+    /// each of which promises everything committed before it as it does
+    /// under the other policies. A process's death, like a machine's,
+    /// takes the commits since the last of those, whole and never in
+    /// part, which is what FASTER promises between two checkpoints, for
+    /// the caller who would otherwise pick it.
+    ///
+    /// The frames the log holds (`Options::wal_hold_bytes` of them at
+    /// most) are written to its file by a `sync`, which syncs them, and
+    /// unsynced at a rotation, at the cap and where the store is dropped;
+    /// and the frames whose records a seal has made durable meanwhile, in
+    /// a segment a manifest on the device names, are dropped and never
+    /// written, so a store that seals as it goes and is flushed at its
+    /// end writes its log to no file at all. A run of ordered ingest
+    /// writes each commit to its own file as it does under `EveryN`,
+    /// unsynced, and stands or falls with the frames before it.
+    Explicit,
+}
+
+/// What a log that holds its commits in the process is holding, and what
+/// its holding has come to (`Db::wal_held`, `SyncPolicy::Explicit`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalHeld {
+    /// Bytes of committed batches in the process now, in no file.
+    pub held: u64,
+    /// Bytes dropped unwritten, their records durable in a segment.
+    pub dropped: u64,
+    /// Bytes written to the log's file by a spill, and the spills.
+    pub spilled: u64,
+    pub spills: u64,
 }
 
 /// The window the merge asks ahead of its second pass where
@@ -5873,6 +5905,15 @@ pub struct Options {
     /// sittings, with the write mixes' commits 2-3% slower in both
     /// (`docs/engine.md`). Off is `supdb-walkeep`.
     pub wal_drop_bytes: usize,
+    /// Under `SyncPolicy::Explicit`, the most bytes of committed frames
+    /// the log keeps in the process before it writes them to its file,
+    /// unsynced: the bound on the memory a store that never calls `sync`
+    /// holds for its log, and the size of the one write that then stands
+    /// in for a write a commit. The frames a durable segment has covered
+    /// are dropped first and never written, so a store whose seals keep
+    /// up with its writes reaches the cap in a burst alone. Nothing under
+    /// the other policies.
+    pub wal_hold_bytes: usize,
     /// How many of the controller's builds ahead run at once
     /// (`zpages_land_pct`): the second in a slot of its own beside the
     /// builder's, which the controller's own jobs keep. An ordered load of
@@ -7374,6 +7415,7 @@ impl Default for Options {
             forms_trim_bytes: 32 << 20,
             forms_fit_when_short: true,
             wal_drop_bytes: 1 << 20,
+            wal_hold_bytes: 64 << 20,
             zpages_ahead_builders: 2,
             zpages_sample_between: false,
             zpages_cover_resident: true,
@@ -7503,8 +7545,38 @@ struct Wal {
     path: PathBuf,
     /// Sequence of the next record to be written.
     seq: u64,
-    /// Buffered frames since the last commit.
+    /// The frames the file does not hold: the batch being staged, from
+    /// `batch_at`, behind the committed batches a holding log keeps
+    /// (`SyncPolicy::Explicit`), of which a policy that writes every
+    /// commit has none.
     pending: Vec<u8>,
+    /// Where the batch being staged begins in `pending`: the end of the
+    /// committed batches held before it, and zero under a policy that
+    /// writes every commit.
+    batch_at: usize,
+    /// Where the held batches begin in `pending`: the bytes before it are
+    /// batches dropped as covered and left where they lay
+    /// (`drop_covered`), dead until the buffer next empties. Zero under a
+    /// policy that writes every commit.
+    held_from: usize,
+    /// The most of `pending` ever written into: what of its reservation
+    /// the process has touched (`Db::memory_census`).
+    touched: usize,
+    /// The held batches, oldest first: the sequence number after each
+    /// one's commit frame, and where the batch ends in `pending`. One a
+    /// manifest on the device covers is dropped unwritten
+    /// (`drop_covered`).
+    marks: std::collections::VecDeque<(u64, usize)>,
+    /// The bytes of committed batches the log holds before it writes
+    /// them out (`Options::wal_hold_bytes`); none under a policy that
+    /// writes every commit.
+    hold: Option<usize>,
+    /// What this file's held batches came to: the bytes dropped unwritten
+    /// as covered, the bytes written out by a spill, and the spills
+    /// (`Db::wal_held`).
+    held_dropped: u64,
+    held_spilled: u64,
+    spills: u64,
     /// Bytes handed to the file so far, and how many of them were behind a
     /// barrier at the last `sync`. The difference is exactly what a power
     /// loss may take, and `Db::wal_durable` reports it so a crash
@@ -7579,6 +7651,29 @@ fn wal_ahead(opts: &Options) -> Option<(u64, bool, u64)> {
         opts.wal_ahead_small_runs,
         opts.seal_bytes as u64 + ahead,
     ))
+}
+
+/// The most a holding log reserves for its buffer at once, whatever its
+/// cap (`Wal::set_hold`), and the room past the cap for the batch that
+/// crosses it; a buffer past either grows as any vector does.
+const HOLD_RESERVE_MAX: usize = 256 << 20;
+const HOLD_ROOM: usize = 1 << 20;
+
+/// The most a holding log moves to close the gap its dropped batches left
+/// (`Wal::drop_covered`): with fewer bytes than this still held behind
+/// them, the held bytes go to the buffer's head and the next commits
+/// reuse pages already touched; with more, the dropped bytes stay where
+/// they lay, dead, until the buffer empties. Moved whatever their size,
+/// the bytes still held were megabytes on the writer's path at a seal's
+/// landing.
+const HOLD_COMPACT: usize = 64 << 10;
+
+/// How much of its committed frames the log holds in the process, where
+/// the policy is to hold them (`SyncPolicy::Explicit`,
+/// `Options::wal_hold_bytes`); none under a policy that writes every
+/// commit.
+fn wal_hold(opts: &Options) -> Option<usize> {
+    matches!(opts.sync, SyncPolicy::Explicit).then_some(opts.wal_hold_bytes)
 }
 
 /// The largest commit that pre-writes, and that counts toward a run
@@ -7659,14 +7754,24 @@ const WAL_DEL: u8 = 1;
 const WAL_COMMIT: u8 = 2;
 
 /// One frame appended to `pending` (`Wal::frame` says the layout), under
-/// sequence number `seq` and the log's CRC seed: the commit frame's
-/// builder, and the definition a record frame written in one reservation
-/// is held to (`wal_record`).
-fn wal_frame(pending: &mut Vec<u8>, seq: u64, seed: u32, kind: u8, key: &[u8], value: &[u8]) {
-    // `pending` holds exactly this batch's record frames: `write`
-    // empties it at every commit.
+/// sequence number `seq` and the log's CRC seed, in the batch that begins
+/// at `batch_at`: the commit frame's builder, and the definition a record
+/// frame written in one reservation is held to (`wal_record`).
+fn wal_frame(
+    pending: &mut Vec<u8>,
+    batch_at: usize,
+    seq: u64,
+    seed: u32,
+    kind: u8,
+    key: &[u8],
+    value: &[u8],
+) {
+    // From `batch_at`, `pending` holds exactly this batch's record frames:
+    // the whole of it where `write` empties it at every commit, and what
+    // follows the committed batches where the log holds them
+    // (`SyncPolicy::Explicit`).
     let batch_crc = if kind == WAL_COMMIT {
-        crc32(pending) ^ seed
+        crc32(&pending[batch_at..]) ^ seed
     } else {
         0
     };
@@ -7747,8 +7852,16 @@ fn wal_record(pending: &mut Vec<u8>, seq: u64, kind: u8, key: &[u8], value: &[u8
 /// closed file is a spare to recycle, and a helper still writing zeros into
 /// a recycled file would write them over its next life's frames
 /// (`Options::wal_ahead_beside`).
+///
+/// And what the log holds in the process goes to its file first
+/// (`SyncPolicy::Explicit`), unsynced: a store dropped without its close
+/// is left as a process that ended is under the policies that write every
+/// commit, its commits in the file and none of them promised. A store
+/// left as a crash leaves it is not dropped (`Db::crash`), and takes what
+/// it held with it.
 impl Drop for Wal {
     fn drop(&mut self) {
+        let _ = self.spill();
         if let Some(h) = self.zeroing.take() {
             let _ = h.join();
         }
@@ -7768,6 +7881,14 @@ impl Wal {
             path: path.to_path_buf(),
             seq: 0,
             pending: Vec::new(),
+            batch_at: 0,
+            held_from: 0,
+            touched: 0,
+            marks: std::collections::VecDeque::new(),
+            hold: None,
+            held_dropped: 0,
+            held_spilled: 0,
+            spills: 0,
             written: WAL_MAGIC.len() as u64,
             synced: 0,
             seed: wal_seed(id),
@@ -7840,6 +7961,14 @@ impl Wal {
             path: path.to_path_buf(),
             seq: 0,
             pending: Vec::new(),
+            batch_at: 0,
+            held_from: 0,
+            touched: 0,
+            marks: std::collections::VecDeque::new(),
+            hold: None,
+            held_dropped: 0,
+            held_spilled: 0,
+            spills: 0,
             written: WAL_MAGIC.len() as u64,
             synced: 0,
             seed: wal_seed(id),
@@ -7940,6 +8069,14 @@ impl Wal {
             path: path.to_path_buf(),
             seq,
             pending: Vec::new(),
+            batch_at: 0,
+            held_from: 0,
+            touched: 0,
+            marks: std::collections::VecDeque::new(),
+            hold: None,
+            held_dropped: 0,
+            held_spilled: 0,
+            spills: 0,
             written,
             synced,
             seed: wal_seed(id),
@@ -7975,7 +8112,15 @@ impl Wal {
     /// frame bought, at one CRC setup and finish per batch instead of per
     /// record: 92 of the 677 instructions a record cost.
     fn frame(&mut self, kind: u8, key: &[u8], value: &[u8]) {
-        wal_frame(&mut self.pending, self.seq, self.seed, kind, key, value);
+        wal_frame(
+            &mut self.pending,
+            self.batch_at,
+            self.seq,
+            self.seed,
+            kind,
+            key,
+            value,
+        );
         self.seq += 1;
     }
 
@@ -7995,25 +8140,141 @@ impl Wal {
     }
 
     /// Close the batch: a commit frame after its records, so replay applies
-    /// them all or none of them. Nothing pending, nothing to close.
+    /// them all or none of them. Nothing staged, nothing to close.
     fn mark_commit(&mut self) {
-        if !self.pending.is_empty() {
+        if self.staged() {
             self.frame(WAL_COMMIT, &[], &[]);
         }
     }
 
+    /// Whether a batch is being staged: frames no commit frame has closed
+    /// and given to the log.
+    fn staged(&self) -> bool {
+        self.pending.len() > self.batch_at
+    }
+
+    /// The log made to hold its committed batches in the process, `cap`
+    /// bytes of them at most (`SyncPolicy::Explicit`,
+    /// `Options::wal_hold_bytes`), in a buffer reserved whole here: the
+    /// reservation is address space until it is written into, and a
+    /// buffer left to grow copied everything it held each time it
+    /// doubled, fourteen megabytes inside one mix of the suite's, whose
+    /// commits ran a third longer for it than with the log written.
+    fn set_hold(&mut self, cap: usize) {
+        self.hold = Some(cap);
+        self.pending.reserve(cap.min(HOLD_RESERVE_MAX) + HOLD_ROOM);
+    }
+
+    /// The batch `mark_commit` closed, given to the log: written to the
+    /// file, or kept where the log holds its commits
+    /// (`SyncPolicy::Explicit`), its end noted so that a batch a manifest
+    /// on the device comes to cover is dropped unwritten (`drop_covered`),
+    /// and the held batches written out once they pass the cap (`spill`).
     fn write(&mut self) -> Result<()> {
-        if self.pending.is_empty() {
+        let Some(cap) = self.hold else {
+            return self.put_out(0);
+        };
+        if self.staged() {
+            self.batch_at = self.pending.len();
+            self.touched = self.touched.max(self.batch_at);
+            self.marks.push_back((self.seq, self.batch_at));
+        }
+        // The cap is of the buffer, the dropped batches left in it among
+        // them: what the process holds for its log.
+        if self.batch_at > cap {
+            self.spill()?;
+        }
+        Ok(())
+    }
+
+    /// The batches the log holds written to its file, unsynced, in the
+    /// order they committed and as one write: at a sync, which syncs them
+    /// (`sync`); at a rotation, since a batch's CRC is seeded by the file
+    /// it committed under and the file after it would refuse it
+    /// (`Db::rotate_wal_as`); at the cap; and where the store is dropped.
+    /// A batch still being staged stays staged. Nothing where nothing is
+    /// held, which is every call under a policy that writes each commit.
+    /// A write that fails leaves every batch held, as it was.
+    fn spill(&mut self) -> Result<()> {
+        if self.batch_at == self.held_from {
+            return Ok(());
+        }
+        let staged = self.staged().then(|| self.pending.split_off(self.batch_at));
+        let bytes = (self.batch_at - self.held_from) as u64;
+        let out = self.put_out(self.held_from);
+        if out.is_ok() {
+            self.batch_at = 0;
+            self.held_from = 0;
+            self.marks.clear();
+            self.held_spilled += bytes;
+            self.spills += 1;
+        }
+        if let Some(s) = staged {
+            self.pending.extend_from_slice(&s);
+        }
+        out
+    }
+
+    /// The held batches whose every record a manifest on the device
+    /// covers -- those that end at or before `covered` -- dropped, never
+    /// written: their records are in segments that manifest names, and no
+    /// open replays a frame below what its manifest covers. The file is
+    /// left with a gap where they would have stood, below the sequence
+    /// every open from here on starts at, where a replay checks no
+    /// continuity (`Wal::replay`).
+    ///
+    /// `covered` is a sequence a manifest that is on the device covers,
+    /// and never one a landing has only published (`Shared::log_covered`):
+    /// dropped behind a manifest a crash can take back, the frames are a
+    /// gap above where the open replays from, which it reads as a record
+    /// lost, and the store does not open. Answers the bytes dropped.
+    fn drop_covered(&mut self, covered: u64) -> usize {
+        let mut cut = 0;
+        while let Some(&(end_seq, end)) = self.marks.front() {
+            if end_seq > covered {
+                break;
+            }
+            cut = end;
+            self.marks.pop_front();
+        }
+        if cut == 0 {
+            return 0;
+        }
+        let dropped = cut - self.held_from;
+        self.held_from = cut;
+        self.held_dropped += dropped as u64;
+        // What is left behind the dropped batches goes to the buffer's
+        // head where it is little, and the commits to come write over
+        // pages already touched; where it is much, it stays, and the
+        // dropped bytes with it (`HOLD_COMPACT`).
+        if self.pending.len() - cut <= HOLD_COMPACT {
+            self.pending.drain(..cut);
+            for m in &mut self.marks {
+                m.1 -= cut;
+            }
+            self.batch_at -= cut;
+            self.held_from = 0;
+        }
+        dropped
+    }
+
+    /// `pending` from `from` written to the file and the buffer emptied:
+    /// the batch a commit closed, the whole buffer, under a policy that
+    /// writes each commit, or the batches a holding log spills, past the
+    /// dropped ones it left at the buffer's head (`spill`).
+    fn put_out(&mut self, from: usize) -> Result<()> {
+        if self.pending.len() == from {
+            self.pending.clear();
             return Ok(());
         }
         self.join_zeroing()?;
-        let end = self.written + self.pending.len() as u64;
+        let end = self.written + (self.pending.len() - from) as u64;
         let grow = if self.ahead == 0 {
             false
         } else if !self.ahead_runs {
             // The whole reach, kept at least half ahead of every write.
             end + self.ahead / 2 > self.extent
-        } else if self.pending.len() as u64 > WAL_AHEAD_COMMIT {
+        } else if (self.pending.len() - from) as u64 > WAL_AHEAD_COMMIT {
             // A large write appends, pre-writes nothing and ends the run
             // (`Options::wal_ahead_small_runs`).
             self.ahead_run = 0;
@@ -8022,7 +8283,7 @@ impl Wal {
             // A small write counts toward its run, and one that grows the
             // file, and so pays the journal commit either way, pre-writes
             // a reach once the run has written one itself.
-            self.ahead_run += self.pending.len() as u64;
+            self.ahead_run += (self.pending.len() - from) as u64;
             end > self.extent && self.ahead_run >= self.ahead
         };
         let mut due = None;
@@ -8056,11 +8317,17 @@ impl Wal {
             0
         };
         if pad > 0 {
-            self.pending.resize(self.pending.len() + pad, 0);
-            self.file.write_all(&self.pending)?;
+            // The zeros leave the buffer whether the write succeeds or
+            // not: left in after a failed one, they stood between the
+            // batches a holding log still keeps and the next one it takes.
+            let len = self.pending.len();
+            self.pending.resize(len + pad, 0);
+            let wrote = self.file.write_all(&self.pending[from..]);
+            self.pending.truncate(len);
+            wrote?;
             self.file.seek(SeekFrom::Start(end))?;
         } else {
-            self.file.write_all(&self.pending)?;
+            self.file.write_all(&self.pending[from..])?;
         }
         self.written = end;
         self.pending.clear();
@@ -8074,6 +8341,9 @@ impl Wal {
     }
 
     fn sync(&mut self) -> Result<()> {
+        // What the log holds is written first: a sync acknowledges every
+        // commit before it, wherever the commit left its frames.
+        self.spill()?;
         self.join_zeroing()?;
         self.file.sync_data()?;
         self.synced = self.written;
@@ -8175,8 +8445,14 @@ impl Wal {
     /// fdatasync, 0.4 to 0.9 ms on the drain for frames the log did
     /// not hold. The header needs no sync of its own: an open takes a
     /// file short of it, or torn inside it, as a log with nothing in it.
+    ///
+    /// A batch the log holds in the process (`SyncPolicy::Explicit`) is a
+    /// frame of this file's that no sync has covered, and that nothing
+    /// has written either: everything that asks whether the log is behind
+    /// a sync -- a run's note, a rotation's header, a drain's wait for
+    /// its slot -- is asking about it too.
     fn frames_unsynced(&self) -> bool {
-        self.written > self.synced.max(WAL_MAGIC.len() as u64)
+        self.batch_at > self.held_from || self.written > self.synced.max(WAL_MAGIC.len() as u64)
     }
 
     /// The header rewritten chained once no file before this one is
@@ -8198,7 +8474,9 @@ impl Wal {
 
     /// Whether the file holds no frame: its header and nothing after it.
     fn holds_no_frame(&self) -> bool {
-        self.written <= WAL_MAGIC.len() as u64 && self.pending.is_empty()
+        // What a holding log dropped and left in its buffer is no frame
+        // of the file's (`held_from`).
+        self.written <= WAL_MAGIC.len() as u64 && self.pending.len() == self.held_from
     }
 
     /// The header of a file that holds no frame yet rewritten to say a run
@@ -20321,6 +20599,15 @@ struct Shared {
     /// the publish once the slot or the rename is durable; see
     /// `Db::manifest_seq`.
     manifest_seq: AtomicU64,
+    /// The sequence a manifest that is on the device covers, as this
+    /// process has made one so: stored by the segment work once a slot
+    /// or a rename is durable, with the sequence that manifest carries,
+    /// and never with the one a readable landing has only published
+    /// (`Maint::note_covered`). The writer drops the frames its log
+    /// holds below it (`Db::log_trim`, `SyncPolicy::Explicit`). Zero
+    /// until this process has made a manifest durable: the one the open
+    /// read may have been in the page cache alone.
+    log_covered: AtomicU64,
     /// Patches that found the form shared with a published copy and had
     /// to copy it before writing (`Arc::make_mut` on a shared form).
     forms_cloned: AtomicU64,
@@ -22510,6 +22797,10 @@ pub struct Db {
     /// The pre-writes the log's closed files made and the writer's time on
     /// them (`Wal::ahead_writes`), for `Db::wal_ahead_counts`.
     wal_ahead_done: (u64, u64),
+    /// What the batches the log's closed files held came to: the bytes
+    /// dropped unwritten, the bytes spilled, and the spills
+    /// (`Wal::held_dropped`), for `Db::wal_held`.
+    wal_held_done: (u64, u64, u64),
     /// `Options::scan_forms_off_stale_writes`: the writes made in small
     /// commits, with the forms given up, since the store's last scan or
     /// the last batch of a burst; and what the count is taken against, the
@@ -35455,6 +35746,26 @@ impl Db {
         dir.join(format!("spare-{id:08}"))
     }
 
+    /// The batch being staged closed and given to the log (`Wal::write`):
+    /// what a commit does with its frames under every policy. Where the
+    /// log holds its commits (`SyncPolicy::Explicit`), the batches a
+    /// manifest on the device has come to cover are dropped first, so the
+    /// cap is met by frames nothing covers yet.
+    fn log_commit(&mut self) -> Result<()> {
+        self.wal.mark_commit();
+        self.log_trim();
+        self.wal.write()
+    }
+
+    /// The log's held batches that a manifest on the device covers,
+    /// dropped unwritten (`Wal::drop_covered`, `Shared::log_covered`).
+    fn log_trim(&mut self) {
+        if self.wal.batch_at > self.wal.held_from {
+            let covered = self.shared.log_covered.load(AtomicOrdering::Acquire);
+            self.wal.drop_covered(covered);
+        }
+    }
+
     /// The live WAL rotated once it passes `seal_bytes`, where seals no
     /// longer rotate it (`Options::seal_rotates_wal` off): synced first,
     /// since replay carries each file's sequence into the next and refuses
@@ -35503,6 +35814,12 @@ impl Db {
     /// header says so (`WAL_LOOSE_RUN`), so that a replay which finds the
     /// run short ends the log at that file's start and nowhere inside one.
     fn rotate_wal_as(&mut self, after_run: bool) -> Result<()> {
+        // What the log holds goes to the file it committed under, less
+        // what a durable segment has covered: the next file's seed would
+        // refuse a batch of this one's, and its header is to say what
+        // this file was left with (`SyncPolicy::Explicit`).
+        self.log_trim();
+        self.wal.spill()?;
         let unsynced = self.wal.frames_unsynced();
         let loose = unsynced || after_run;
         let kind = if after_run {
@@ -35518,6 +35835,9 @@ impl Db {
         self.wal_id += 1;
         self.wal_ahead_done.0 += old_wal.ahead_writes;
         self.wal_ahead_done.1 += old_wal.ahead_wait_ns;
+        self.wal_held_done.0 += old_wal.held_dropped;
+        self.wal_held_done.1 += old_wal.held_spilled;
+        self.wal_held_done.2 += old_wal.spills;
         SealCounts::add(
             &self.shared.seal_counts.rotated_unsynced,
             old_wal.written - old_wal.synced.min(old_wal.written),
@@ -35583,6 +35903,9 @@ impl Db {
             self.loose_wals.remove(0);
         }
         self.wal.chain()?;
+        // With what the log holds (`Wal::sync`, `SyncPolicy::Explicit`),
+        // less what a durable segment covers, which the commit every
+        // caller has just made dropped (`log_commit`).
         self.wal.sync()?;
         self.wal.drop_synced(self.opts.wal_drop_bytes as u64);
         self.unsynced = 0;
@@ -35766,6 +36089,14 @@ impl Db {
     /// has one, else a fresh file -- never over the live file's own name,
     /// which a create would truncate and a retirement would delete.
     fn next_wal(&mut self, id: u64, kind: u8) -> Result<Wal> {
+        let mut wal = self.next_wal_file(id, kind)?;
+        if let Some(cap) = wal_hold(&self.opts) {
+            wal.set_hold(cap);
+        }
+        Ok(wal)
+    }
+
+    fn next_wal_file(&mut self, id: u64, kind: u8) -> Result<Wal> {
         let path = Db::wal_path(&self.dir, id);
         if path == self.wal.path {
             return Err(err("a rotation named the live WAL"));
@@ -35926,6 +36257,9 @@ impl Db {
         std::fs::create_dir_all(dir)?;
         let lock = StoreLock::take(dir)?;
         let mut wal = Wal::create(&Db::wal_path(dir, 0), 0, WAL_CHAINED)?;
+        if let Some(cap) = wal_hold(&opts) {
+            wal.set_hold(cap);
+        }
         let mut spare_wal: *mut PathBuf = std::ptr::null_mut();
         let next_seg = 0u64;
         if let Some((ahead, runs, cap)) = wal_ahead(&opts) {
@@ -36042,6 +36376,7 @@ impl Db {
             run_remaps: AtomicU64::new(0),
             stream_recycled: AtomicU64::new(0),
             manifest_seq: AtomicU64::new(0),
+            log_covered: AtomicU64::new(0),
             forms_cloned: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
@@ -36215,6 +36550,7 @@ impl Db {
             upkeep_since_scan: 0,
             pace_runs: PaceRuns::default(),
             wal_ahead_done: (0, 0),
+            wal_held_done: (0, 0, 0),
             forms_off_quiet: 0,
             forms_off_log: (0, 0),
             forms_off_life: 0,
@@ -36754,6 +37090,9 @@ impl Db {
             }
         }
         let mut wal = Wal::open_append(&wal_path, wal_id, from)?;
+        if let Some(cap) = wal_hold(&opts) {
+            wal.set_hold(cap);
+        }
         if let Some((ahead, runs, cap)) = wal_ahead(&opts) {
             wal.set_ahead(
                 ahead,
@@ -36853,6 +37192,7 @@ impl Db {
             run_remaps: AtomicU64::new(0),
             stream_recycled: AtomicU64::new(0),
             manifest_seq: AtomicU64::new(0),
+            log_covered: AtomicU64::new(0),
             forms_cloned: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
@@ -37030,6 +37370,7 @@ impl Db {
             upkeep_since_scan: 0,
             pace_runs: PaceRuns::default(),
             wal_ahead_done: (0, 0),
+            wal_held_done: (0, 0, 0),
             forms_off_quiet: 0,
             forms_off_log: (0, 0),
             forms_off_life: 0,
@@ -37342,7 +37683,7 @@ impl Db {
     }
 
     fn direct_can_open(&self) -> bool {
-        self.opts.direct_ingest && self.mem().is_empty() && self.wal.pending.is_empty()
+        self.opts.direct_ingest && self.mem().is_empty() && !self.wal.staged()
     }
 
     /// Whether a write goes into the direct run: a key above the store's
@@ -37534,13 +37875,13 @@ impl Db {
         if self.mem().ordered {
             self.commit_direct()?;
         } else {
-            self.wal.mark_commit();
-            self.wal.write()?;
+            self.log_commit()?;
             self.mem().commit();
-            self.unsynced += 1;
+            self.unsynced = self.unsynced.saturating_add(1);
             let due = match self.opts.sync {
                 SyncPolicy::Always => true,
                 SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
+                SyncPolicy::Explicit => false,
             };
             // The upkeep handed over before the barrier, so the thread
             // works while the device syncs -- unless a seal's phase is to
@@ -37702,17 +38043,17 @@ impl Db {
             // (`Options::drain_syncs_wal`). A sync owed and not yet paid
             // -- a failed one, or the staged frames under `Always` -- is
             // paid here; one the log holds nothing for is skipped.
-            let staged = !self.wal.pending.is_empty();
-            self.wal.mark_commit();
-            self.wal.write()?;
+            let staged = self.wal.staged();
+            self.log_commit()?;
             self.mem().commit();
             if staged {
-                self.unsynced += 1;
+                self.unsynced = self.unsynced.saturating_add(1);
             }
             let due = self.opts.drain_syncs_wal
                 || match self.opts.sync {
                     SyncPolicy::Always => true,
                     SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
+                    SyncPolicy::Explicit => false,
                 };
             if due
                 && (self.wal.frames_unsynced()
@@ -37851,10 +38192,11 @@ impl Db {
         d.committed = mem.len();
         d.unsynced = true;
         mem.commit();
-        self.unsynced += 1;
+        self.unsynced = self.unsynced.saturating_add(1);
         let due = match self.r.opts.sync {
             SyncPolicy::Always => true,
             SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
+            SyncPolicy::Explicit => false,
         };
         if due {
             // What the policy acknowledges here is every commit so far,
@@ -38217,24 +38559,23 @@ impl Db {
             return self.close_direct();
         }
         if self.opts.seal_rotates_wal {
-            self.wal.mark_commit();
-            self.wal.write()?;
+            self.log_commit()?;
             self.mem().commit();
             self.sync_wal()?;
         } else {
             // What is staged commits as any commit does, synced when the
             // policy is due and not otherwise: the seal no longer rotates
             // the file, so nothing about the seal needs the log synced.
-            let staged = !self.wal.pending.is_empty();
-            self.wal.mark_commit();
-            self.wal.write()?;
+            let staged = self.wal.staged();
+            self.log_commit()?;
             self.mem().commit();
             if staged {
-                self.unsynced += 1;
+                self.unsynced = self.unsynced.saturating_add(1);
             }
             let due = match self.opts.sync {
                 SyncPolicy::Always => staged,
                 SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
+                SyncPolicy::Explicit => false,
             };
             if due {
                 self.sync_wal()?;
@@ -40879,6 +41220,22 @@ impl Db {
             self.wal_ahead_done.0 + self.wal.ahead_writes,
             self.wal_ahead_done.1 + self.wal.ahead_wait_ns,
         )
+    }
+
+    /// What the log holds in the process and what its holding has come to
+    /// (`SyncPolicy::Explicit`): the bytes of committed batches held now,
+    /// the bytes dropped unwritten behind a manifest on the device, the
+    /// bytes written out by a spill, and the spills. Zeros under a policy
+    /// that writes every commit. The held bytes are as the last commit,
+    /// sync or rotation left them: a landing since has dropped nothing
+    /// until the writer next looks.
+    pub fn wal_held(&self) -> WalHeld {
+        WalHeld {
+            held: (self.wal.batch_at - self.wal.held_from) as u64,
+            dropped: self.wal_held_done.0 + self.wal.held_dropped,
+            spilled: self.wal_held_done.1 + self.wal.held_spilled,
+            spills: self.wal_held_done.2 + self.wal.spills,
+        }
     }
 
     /// A test's: the log's pre-write in flight joined, and the length of
@@ -44052,7 +44409,21 @@ impl Db {
     #[doc(hidden)]
     pub fn memory_census(&self) -> Vec<(String, u64)> {
         let handed: Vec<_> = self.mem_handed.iter().cloned().collect();
-        self.r.memory_census_with(&handed)
+        let mut c = self.r.memory_census_with(&handed);
+        // The log's buffer, by what it allocates: a batch's frames under a
+        // policy that writes every commit, and every batch the log holds
+        // under the one that does not (`SyncPolicy::Explicit`), up to its
+        // cap, which is an owner of the process's memory as a table is. Of
+        // a holding log's reservation, what it has written into: the rest
+        // is address space no page stands behind.
+        let wal = self.wal.touched.max(self.wal.pending.len());
+        let wal = if self.wal.hold.is_some() {
+            wal
+        } else {
+            self.wal.pending.capacity()
+        };
+        c.push(("wal_buffer".to_string(), wal as u64));
+        c
     }
 
     /// The writer's block cache by partition (`Reader::forms_by_partition`).
@@ -48764,6 +49135,9 @@ impl Maint {
         self.rank_before_publish(&segs)?;
         self.publish_segs_with(segs, false, Some(table));
         self.shared.drain_steps.stamp(17);
+        // What the manifests on the device cover as this landing begins:
+        // the seal before this one's end, durable before this one landed.
+        let covered_before = self.covered_seq;
         for name in names {
             self.covered_seq = self.covered_seq.max(Db::name_end_seq(name).unwrap_or(0));
         }
@@ -48777,6 +49151,11 @@ impl Maint {
             self.shared
                 .manifest_seq
                 .store(self.manifest_seq, AtomicOrdering::Release);
+            // The pending slot covers this seal's records only once its
+            // segments read back whole, and the slot before otherwise:
+            // what is covered whichever the open takes is what stood
+            // before this landing.
+            self.note_covered(covered_before);
             self.retire_covered();
             SealCounts::add(
                 &self.shared.seal_counts.publish_ns,
@@ -49933,6 +50312,21 @@ impl Maint {
         Ok(())
     }
 
+    /// `covered` is on the device, in a manifest whose every name is a
+    /// segment on the device: told to the writer, whose log may drop the
+    /// frames it holds below it (`Shared::log_covered`). Only ever with
+    /// the sequence a manifest was written with, after the write that
+    /// made it durable returned. A slot a drain left owed its sync
+    /// (`publish_unsynced`) is not told when the sync is paid: a drain is
+    /// answered ahead of its slot only where the log held nothing as its
+    /// seal was handed (`SealJob::wal_unsynced`), so nothing the log holds
+    /// ends below what that slot covers, and the next publish tells it.
+    fn note_covered(&self, covered: u64) {
+        self.shared
+            .log_covered
+            .fetch_max(covered, AtomicOrdering::AcqRel);
+    }
+
     /// The slot a drain left unsynced made durable, and the WAL and temp
     /// names it covers retired: after the drain's answer, before a
     /// settle returns, and at the close.
@@ -50018,6 +50412,7 @@ impl Maint {
             self.shared
                 .manifest_seq
                 .store(self.manifest_seq, AtomicOrdering::Release);
+            self.note_covered(self.covered_seq);
             // A slot owed its sync is superseded by this one, durable and
             // newer, and what waited behind it retires now.
             let owed = self.slot_sync_due.take().is_some();
@@ -50039,6 +50434,7 @@ impl Maint {
         self.shared
             .manifest_seq
             .store(self.manifest_seq, AtomicOrdering::Release);
+        self.note_covered(self.covered_seq);
         if let Some(p) = spare {
             if self.wake.is_some() {
                 // On a thread of its own: unlinked at the idle tick, off the
@@ -56385,6 +56781,12 @@ impl Drop for Db {
                 }
             }
         }
+        // Behind the segment work's last landing: what the log still
+        // holds that a durable segment covers is dropped here, and the
+        // rest goes to the file as the log itself drops
+        // (`SyncPolicy::Explicit`), so a store flushed and closed writes
+        // none of what its flush made durable.
+        self.log_trim();
         // The jobs' pool (`Options::jobs_pooled`): this store's hold on it
         // let go, and what its jobs left in it unmapped, every one of them
         // having ended above.
@@ -57332,7 +57734,7 @@ mod wal_frames {
             let key: Vec<u8> = (0..kl).map(|i| (i * 7 + kl) as u8).collect();
             for &vl in &val_lens {
                 let value: Vec<u8> = (0..vl).map(|i| (i * 13 + vl) as u8).collect();
-                wal_frame(&mut grown, seq, 0x5eed, WAL_PUT, &key, &value);
+                wal_frame(&mut grown, 0, seq, 0x5eed, WAL_PUT, &key, &value);
                 wal_record(&mut once, seq, WAL_PUT, &key, &value);
                 seq = seq.wrapping_add(1);
                 assert_eq!(
@@ -57340,11 +57742,251 @@ mod wal_frames {
                     "a put of a {kl}-byte key and a {vl}-byte value"
                 );
             }
-            wal_frame(&mut grown, seq, 0x5eed, WAL_DEL, &key, &[]);
+            wal_frame(&mut grown, 0, seq, 0x5eed, WAL_DEL, &key, &[]);
             wal_record(&mut once, seq, WAL_DEL, &key, &[]);
             seq = seq.wrapping_add(1);
             assert_eq!(grown, once, "a delete of a {kl}-byte key");
         }
         assert!(grown.len() > 100_000, "the frames compared were written");
+    }
+
+    fn held_log(name: &str) -> (PathBuf, Wal) {
+        let dir = std::env::temp_dir().join(format!("supdb-next-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wal-00000007");
+        let mut w = Wal::create(&path, 7, WAL_CHAINED).unwrap();
+        w.set_hold(16 << 20);
+        (path, w)
+    }
+
+    /// What a replay of `path` applies from `from`, as `key=value` and
+    /// `-key` for a delete, or the open's refusal.
+    fn replayed(path: &Path, from: u64) -> Result<Vec<String>> {
+        let mut got = Vec::new();
+        let s = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        Wal::replay(
+            path,
+            7,
+            from,
+            true,
+            |kind, k, v| {
+                got.push(match kind {
+                    WAL_PUT => format!("{}={}", s(k), s(v)),
+                    _ => format!("-{}", s(k)),
+                })
+            },
+            |next, _| Ok(next),
+        )?;
+        Ok(got)
+    }
+
+    /// A log that holds its commits (`SyncPolicy::Explicit`) writes none of
+    /// them until it spills, each batch under a CRC of its own frames and
+    /// no other batch's; a batch dropped as covered is in the file never,
+    /// and the batches after it are, behind a gap a replay from the
+    /// covered sequence reads past and a replay from below it refuses; and
+    /// a batch still being staged when the held ones spill stays staged,
+    /// to commit behind them.
+    #[test]
+    fn a_holding_log_writes_what_it_was_not_told_was_covered() {
+        let (path, mut w) = held_log("wal-hold");
+        let header = WAL_MAGIC.len() as u64;
+        let mut ends = Vec::new();
+        for (k, v) in [("a", "1"), ("b", "2"), ("c", "3")] {
+            w.delete(k.as_bytes());
+            w.append(k.as_bytes(), v.as_bytes());
+            w.mark_commit();
+            w.write().unwrap();
+            ends.push(w.seq);
+        }
+        assert_eq!(w.marks.len(), 3, "a mark a batch");
+        assert!(!w.staged() && w.batch_at == w.pending.len());
+        assert!(w.frames_unsynced(), "held frames are frames no sync covers");
+        assert!(!w.holds_no_frame());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            header,
+            "a held batch reached the file"
+        );
+        assert!(replayed(&path, 0).unwrap().is_empty());
+
+        // Nothing is covered below the first batch's end.
+        assert_eq!(w.drop_covered(ends[0] - 1), 0);
+        assert_eq!(w.marks.len(), 3);
+        // The first batch covered: dropped, the two after it kept.
+        let held = w.batch_at;
+        let cut = w.drop_covered(ends[0]);
+        assert!(cut > 0 && w.batch_at == held - cut && w.pending.len() == held - cut);
+        assert_eq!(w.marks.len(), 2);
+        assert_eq!(
+            w.marks.back().unwrap().1,
+            w.batch_at,
+            "the marks moved with the bytes"
+        );
+        assert_eq!((w.held_dropped, w.held_spilled), (cut as u64, 0));
+
+        // A batch being staged as the held ones spill.
+        w.append(b"d", b"4");
+        assert!(w.staged());
+        w.spill().unwrap();
+        assert_eq!((w.batch_at, w.marks.len(), w.spills), (0, 0, 1));
+        assert!(w.staged(), "the staged batch went with the spill");
+        assert_eq!(w.held_spilled, (held - cut) as u64);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), w.written);
+        assert_eq!(
+            replayed(&path, ends[0]).unwrap(),
+            ["-b", "b=2", "-c", "c=3"],
+            "the batches behind the dropped one, each under its own CRC"
+        );
+        // The staged batch commits behind them, held, and a sync writes it.
+        w.mark_commit();
+        w.write().unwrap();
+        assert_eq!(w.marks.len(), 1);
+        assert_eq!(
+            replayed(&path, ends[0]).unwrap().len(),
+            4,
+            "held, not written"
+        );
+        w.sync().unwrap();
+        assert!(!w.frames_unsynced());
+        assert_eq!(
+            replayed(&path, ends[0]).unwrap(),
+            ["-b", "b=2", "-c", "c=3", "d=4"]
+        );
+        // From the covered sequence on, as above; from inside what was
+        // dropped, the gap is a record lost.
+        assert_eq!(replayed(&path, ends[1]).unwrap(), ["-c", "c=3", "d=4"]);
+        assert!(
+            replayed(&path, 0).is_err(),
+            "a replay from below the dropped batch read past the gap"
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A holding log spills once it holds more than its cap, at the commit
+    /// that crosses it and with that commit's batch; and what it holds as
+    /// it is dropped goes to its file, where a log left as a crash leaves
+    /// it takes what it held with it.
+    #[test]
+    fn a_holding_log_spills_at_its_cap_and_at_its_drop() {
+        let (path, mut w) = held_log("wal-cap");
+        let header = WAL_MAGIC.len() as u64;
+        w.set_hold(64);
+        w.append(b"a", b"1");
+        w.mark_commit();
+        w.write().unwrap();
+        assert!(
+            w.batch_at > 0 && w.batch_at <= 64,
+            "one small batch is under the cap"
+        );
+        assert_eq!(w.spills, 0);
+        w.append(b"b", &[b'2'; 64]);
+        w.mark_commit();
+        w.write().unwrap();
+        assert_eq!(
+            (w.spills, w.batch_at),
+            (1, 0),
+            "the commit that crossed the cap"
+        );
+        assert_eq!(replayed(&path, 0).unwrap().len(), 2);
+        assert!(w.written > header && w.synced == 0, "a spill syncs nothing");
+        // Held at the drop: written. Held at a crash: gone.
+        w.append(b"c", b"3");
+        w.mark_commit();
+        w.write().unwrap();
+        assert_eq!(replayed(&path, 0).unwrap().len(), 2);
+        let seq = w.seq;
+        drop(w);
+        assert_eq!(
+            replayed(&path, 0).unwrap().len(),
+            3,
+            "the drop wrote what was held"
+        );
+        let mut w = Wal::open_append(&path, 7, seq).unwrap();
+        w.set_hold(16 << 20);
+        w.append(b"d", b"4");
+        w.mark_commit();
+        w.write().unwrap();
+        std::mem::forget(w);
+        assert_eq!(
+            replayed(&path, 0).unwrap().len(),
+            3,
+            "a crashed log wrote what it held"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A batch dropped with much still held behind it is left where it
+    /// lay and nothing is moved: the held batches begin past it, a second
+    /// drop counts from the first, a spill writes from where they begin
+    /// and no byte of what was dropped, and the buffer starts over at its
+    /// head once it is empty, in the memory it reserved at the start,
+    /// which it never outgrew.
+    #[test]
+    fn a_holding_log_leaves_a_large_drop_where_it_lay() {
+        let (path, mut w) = held_log("wal-dead");
+        let header = WAL_MAGIC.len() as u64;
+        let (at, cap) = (w.pending.as_ptr(), w.pending.capacity());
+        assert!(cap >= 16 << 20, "the buffer is reserved at its cap");
+        // Each batch more than the log moves to close a gap.
+        let big = vec![b'v'; HOLD_COMPACT];
+        let mut ends = Vec::new();
+        for k in [b"a", b"b", b"c"] {
+            w.append(k, &big);
+            w.mark_commit();
+            w.write().unwrap();
+            ends.push((w.seq, w.batch_at));
+        }
+        let (held, len) = (w.batch_at, w.pending.len());
+        let (one, two) = (ends[0].1, ends[1].1);
+        assert_eq!(w.drop_covered(ends[0].0), one);
+        assert_eq!(
+            (w.held_from, w.batch_at, w.pending.len()),
+            (one, held, len),
+            "the batches behind a large drop were moved"
+        );
+        assert!(w.frames_unsynced() && !w.holds_no_frame());
+        assert_eq!(
+            w.drop_covered(ends[1].0),
+            two - one,
+            "counted from the drop before"
+        );
+        assert_eq!((w.held_from, w.held_dropped), (two, two as u64));
+        // A batch staged behind them, and the spill: the third batch
+        // alone reaches the file.
+        w.append(b"d", &big);
+        let staged = w.pending.len() - len;
+        w.spill().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            header + (held - two) as u64,
+            "a spill wrote what the log had dropped"
+        );
+        assert_eq!((w.held_from, w.batch_at), (0, 0));
+        assert!(
+            w.staged() && w.pending.len() == staged,
+            "the staged batch is at the head"
+        );
+        assert_eq!(replayed(&path, ends[1].0).unwrap().len(), 1);
+        // Committed, covered and dropped with nothing behind it: the
+        // buffer is empty and starts over.
+        w.mark_commit();
+        w.write().unwrap();
+        assert!(w.drop_covered(w.seq) > 0);
+        assert_eq!((w.held_from, w.batch_at, w.pending.len()), (0, 0, 0));
+        assert!(!w.staged() && w.marks.is_empty());
+        assert_eq!(
+            (w.pending.as_ptr(), w.pending.capacity()),
+            (at, cap),
+            "the buffer was allocated again"
+        );
+        assert!(
+            w.touched >= held,
+            "what the buffer was written into is counted"
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

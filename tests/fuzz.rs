@@ -62,7 +62,10 @@
 //!   under a small budget (`Options::zpages_promote_copies`).
 //! - `ZFUZZ_OPTVARY`: set, a seed turns compaction, promotion, the trusted
 //!   page views of the compact form or its block cursor off, or its
-//!   memo-first ask on, each with a chance of 15%.
+//!   memo-first ask on, each with a chance of 15%; and holds its log in
+//!   the process in a quarter of the seeds (`SyncPolicy::Explicit`,
+//!   `Cfg::hold_small`), dropped at half its reopens and closed at the
+//!   rest.
 //! - `ZFUZZ_SHAPES`: the key shapes a seed may draw from, as indexes from 0
 //!   to 7 separated by commas.
 //! - `ZFUZZ_SETTLEBUILDS=1`: the `z` store's commits near reads file their
@@ -358,6 +361,14 @@ struct Cfg {
     /// the model beside the reads that stand in for it.
     point_fixed: bool,
     point_lone: bool,
+    /// The log held in the process (`SyncPolicy::Explicit`, which `sync`
+    /// then is) in a quarter of the seeds under `ZFUZZ_OPTVARY`, and in
+    /// half of those to a cap of two kibibytes (`Options::wal_hold_bytes`),
+    /// so that it spills between its seals: the side generator's next two
+    /// draws. Such a seed's store is dropped at half its reopens and
+    /// closed at the rest, so the open replays what the drop wrote over
+    /// the gaps the dropped frames left.
+    hold_small: bool,
     /// Under `ZFUZZ_STRIDE`, the stride form's steer; `None` without it.
     stride: Option<StrideSteer>,
 }
@@ -651,6 +662,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let quiet_on = side.chance(50);
     let quiet_any = side.chance(50);
     let (fixed_off, lone_off) = (side.chance(25), side.chance(25));
+    let (explicit_on, hold_small) = (side.chance(25), side.chance(50));
     // A generator of its own, as `side` is, so that the switch moves none
     // of the draws below.
     let stride =
@@ -673,10 +685,19 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
             _ => Upkeep::Background(1),
         },
         bg: rng.chance(75),
-        sync: if rng.chance(50) {
-            SyncPolicy::Always
-        } else {
-            SyncPolicy::EveryN(8)
+        sync: {
+            // Drawn as it always was, so that the draws after it stand,
+            // and replaced where the seed holds its log.
+            let drawn = if rng.chance(50) {
+                SyncPolicy::Always
+            } else {
+                SyncPolicy::EveryN(8)
+            };
+            if vary && explicit_on {
+                SyncPolicy::Explicit
+            } else {
+                drawn
+            }
         },
         ops: 600 + rng.below(1800),
         keys: 40 + rng.below(500),
@@ -709,6 +730,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         merge_quiet_any: vary && !quiet_on && quiet_any,
         point_fixed: !(vary && fixed_off),
         point_lone: !(vary && lone_off),
+        hold_small: vary && explicit_on && hold_small,
         stride,
     }
 }
@@ -743,6 +765,11 @@ fn opts(c: &Cfg) -> Options {
         merge_quiet_any_gate: c.merge_quiet_any,
         point_fixed: c.point_fixed,
         point_lone: c.point_lone,
+        wal_hold_bytes: if c.hold_small {
+            2 << 10
+        } else {
+            Options::default().wal_hold_bytes
+        },
         promote_starts: c.hot_starts,
         zpages_store_all: c.store_all,
         scan_start_cache: if c.start_cache { 4096 } else { 0 },
@@ -1700,6 +1727,11 @@ struct Stats {
     /// gave back (`Options::heads_owned`), summed as `abandons` is: what
     /// says a run under `ZFUZZ_CENSUS` or `ZFUZZ_ZPAGES` reached them.
     heads: [u64; 2],
+    /// The bytes of frames either store's log dropped unwritten behind a
+    /// durable seal, and wrote out at a spill (`SyncPolicy::Explicit`),
+    /// summed as `abandons` is: what says a run under `ZFUZZ_OPTVARY`
+    /// reached each.
+    held: [u64; 2],
     /// Through either store's form files: groups a point read decoded in
     /// part, groups the memo took at a second touch, reads the key table
     /// sent to their record, groups a walk decoded into its own buffer and
@@ -1869,6 +1901,9 @@ fn count_heads(st: &mut Stats, db: &Db) {
     let (made, given, _) = db.heads_owned_counts();
     st.heads[0] += made;
     st.heads[1] += given;
+    let h = db.wal_held();
+    st.held[0] += h.dropped;
+    st.held[1] += h.spilled;
 }
 
 fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
@@ -2021,6 +2056,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         kept: 0,
         recuts: 0,
         heads: [0; 2],
+        held: [0; 2],
         point: [0; 12],
         stride: StrideStats::default(),
     };
@@ -2232,7 +2268,10 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     count_heads(&mut st, &z);
                     count_heads(&mut st, &r);
                     st.stride.add(&z.zpage_counts());
-                    let clean = rng.chance(50) || !matches!(cfg.sync, SyncPolicy::Always);
+                    // A store that holds its log is dropped too: what it
+                    // held goes to the file as it drops, every commit of
+                    // it, and the open replays them.
+                    let clean = rng.chance(50) || matches!(cfg.sync, SyncPolicy::EveryN(_));
                     if clean {
                         for op in staged.drain(..) {
                             // close commits the staged batch.
@@ -2462,6 +2501,7 @@ fn fuzz_range() {
     let mut kept = 0u64;
     let mut point = [0u64; 12];
     let mut heads = [0u64; 2];
+    let mut held = [0u64; 2];
     let mut stride = StrideStats::default();
     let ran = seeds.len();
     for seed in seeds {
@@ -2483,12 +2523,14 @@ fn fuzz_range() {
                 }
                 heads[0] += s.heads[0];
                 heads[1] += s.heads[1];
+                held[0] += s.held[0];
+                held[1] += s.held[1];
             }
             Err(e) => bad.push(format!("seed {seed}: {e}")),
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {}, snapshots kept {kept}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {}, snapshots kept {kept}, log frames dropped {} spilled {}, FAILURES {}",
         heads[0],
         heads[1],
         point[0],
@@ -2503,6 +2545,8 @@ fn fuzz_range() {
         point[9],
         point[10],
         point[11],
+        held[0],
+        held[1],
         bad.len()
     );
     if stride_on() {

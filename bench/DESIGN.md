@@ -309,7 +309,7 @@ comparator a user would otherwise pick.
 |---|---|---|
 | durable per batch | `supdb` (default), `supdb-forms`, `supdb-settle`, `supdb-nosnap`, `supdb-noadvice`, `supdb-nocache`, `supdb-cache256` | `lmdb`, `rocksdb-tuned`, and in the bounded roster `rocksdb-tuned-lz4` |
 | buffered | `supdb-ingest` | `lmdb-nosync`, `rocksdb-tuned-nosync` |
-| in memory until a checkpoint | | `faster`, where it is built |
+| in memory until a checkpoint | `supdb-held`, in no roster | `faster`, where it is built |
 
 `faster` is Microsoft's FASTER, its C++ store: the comparator a user would
 otherwise pick for point gets and puts alone, a hash index over a log that
@@ -326,6 +326,19 @@ has no cell there. A load's window ends where the arm's guarantee is met,
 which for FASTER is a checkpoint of its log, written in whole pages of
 32 MiB. Read-modify-write in the `threads` workloads is FASTER's own single
 operation, and a read and then a write for every other arm.
+
+`supdb-held` is `supdb-ingest` opened under the one policy of the engine's
+that promises what FASTER does (`SyncPolicy::Explicit`): a commit's frames
+stay in the process, the arm's `sync` is its drain as its sibling's is,
+and a process that is killed loses what it committed since. It is in no
+roster. A row that held it beside `faster` would be refused where a run
+starts, since the two differ on the ordered scan and the reopen, which
+`faster` has not got and the check holds a guarantee's arms to; so the two
+are read by a pairing (`scripts/pair.sh supdb-held faster SIZE`), which is
+a reader's comparison as `faster` beside the buffered group is, with the
+difference this time on the side of the arm that promises more.
+`supdb-held1m` and `supdb-held8m` pin the bytes the held log spills at
+(`Options::wal_hold_bytes`) where the arm takes the engine's.
 
 The store is not a crate. `scripts/faster.sh` fetches its sources at the
 commit `vendor/faster/PIN` names and installs the libraries they link, and

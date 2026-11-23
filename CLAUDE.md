@@ -1376,6 +1376,35 @@ write and a fresh page a thousand that said nothing the entry count
 did not, and whose tail the truncation of an uncommitted run never
 trimmed. A run that kept no table at all is the shape left to price.
 
+A third policy holds the log in the process (`SyncPolicy::Explicit`): a
+commit's frames stay in the buffer they were built in, the committed
+batches behind the one being staged, and reach the log's file at a `sync`,
+which syncs them, and unsynced at a rotation, at a cap
+(`Options::wal_hold_bytes`) and where the store is dropped. Nothing is
+promised of a commit until a `sync`, a `flush` or the close, which is what
+FASTER promises between two checkpoints, and the suite's arm of it sits in
+FASTER's row (`supdb-held`). Three rules hold it to the order above. A held
+batch is a frame of the live file that no sync has covered and that
+nothing has written either: `frames_unsynced` and `holds_no_frame` count
+it, so a run that begins over it does not say everything before it was
+synced, a rotation behind it leaves a loose header, and a drain that
+covers it waits for its slot's fdatasync. A held batch goes to the file it
+committed under, ahead of the rotation: its CRC carries that file's seed,
+and the next file's would refuse it. And a held batch is dropped unwritten
+only below a sequence a manifest *on the device* covers
+(`Shared::log_covered`, stored by a publish after its synced write, with
+the sequence that manifest carries): `Maint::covered_seq` rises at a seal's
+readable landing, ahead of its fsyncs and its manifest, and frames dropped
+behind that are a gap above where the open after a crash replays from,
+which it reads as a record lost and refuses. Under the pending slot the
+sequence told is the one that stood before the landing, since that slot
+covers its seal only where the segments read back whole. Dropped so, the
+frames leave a gap in the file below every later open's start, where a
+replay checks nothing, which is how a store that seals as it goes and is
+flushed at its end writes its log to no file at all. `Db::crash` forgets
+the store without dropping it, so a test's crash takes what the log held,
+and a store dropped without its close writes it.
+
 **A file a store names never changes.** A segment, its ordered index
 and its form file are each written under a temp name and renamed or
 linked into place, and nothing writes one after that: no patch in place,
