@@ -10808,6 +10808,94 @@ fn an_attach_of_form_files_built_ahead_is_bought_on_the_prediction() {
     }
 }
 
+/// A store bought before the land look has found it past the selector's
+/// line makes the crossing at the buy (`Options::zpages_buy_crosses`).
+/// Built ahead under its budget, the records kept and the files dropped
+/// as they were written; then two percent past it under the group's
+/// pressure, where the model's saving is under the line to enter, the
+/// look crosses nothing and nothing is bought on the prediction; then
+/// bought on what its reads measure. With the option the buy swaps every
+/// partition built ahead, once and before it attaches any -- a crossing
+/// that came after the attaches would find none to swap -- and without
+/// it the buy attaches the files as they lie and nothing is swapped. A
+/// store the look took past the line first makes its crossing there, and
+/// its buy makes none.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_buy_before_the_crossing_makes_the_crossing() {
+    for (on, far) in [(true, false), (false, false), (true, true)] {
+        let what = format!("buy crosses {on}, far {far}");
+        let (dir, db, model, inject, raw) =
+            land_store_with(&format!("auto-buy-cross-{on}-{far}"), 50, |o| {
+                o.partition_bytes = Some(160 << 10);
+                o.zpages_buy_crosses = on;
+            });
+        inject.set_budget(raw * 3 / 2);
+        assert!(
+            tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+            "{what}: built ahead: {:?}",
+            db.zpage_counts()
+        );
+        let n = db.zpage_counts().partitions;
+        assert!(n >= 4, "{what}: partitions: {n}");
+        inject.set_budget(if far { raw * 2 / 3 } else { raw * 98 / 100 });
+        inject.set_refault_rate(1_000_000.0);
+        if far {
+            assert!(
+                tick_until(&db, 200, |c| c.ahead_swapped >= c.partitions),
+                "{what}: crossed by the look: {:?}",
+                db.zpage_counts()
+            );
+        } else {
+            wait_steps(&db, 30);
+            let c = db.zpage_counts();
+            assert_eq!(
+                (
+                    c.phase,
+                    c.ahead_swapped,
+                    c.buy_crosses,
+                    c.attached,
+                    c.prebuilt
+                ),
+                (1, 0, 0, 0, n),
+                "{what}: SUSPECT under the line, nothing crossed or bought: {c:?}"
+            );
+        }
+        // The reads' faults are the evidence, and the buy.
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= n),
+            "{what}: every partition attached: {:?}",
+            db.zpage_counts()
+        );
+        wait_steps(&db, 10);
+        let c = db.zpage_counts();
+        let want = match (far, on) {
+            (true, _) => (0, n),
+            (false, true) => (1, n),
+            (false, false) => (0, 0),
+        };
+        assert_eq!(
+            (c.buy_crosses, c.ahead_swapped),
+            want,
+            "{what}: the crossing and what it swapped: {c:?}"
+        );
+        let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+        check(&r, &model, &some, &what);
+        assert!(db.zpage_counts().reads > 0, "{what}: through the form");
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The reading at the crossing comes from the form files on disk where
 /// they cover the keys the install needs (`Options::zpages_reading_from_files`):
 /// no fill sample runs, the reading stands in the tick that wanted it, and

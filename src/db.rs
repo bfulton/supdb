@@ -763,6 +763,10 @@ pub struct ZCounts {
     /// Partitions with no form file whose raw pages the crossing asked for
     /// (`Options::zpages_cross_asks_raw`).
     pub cross_raw_asks: u64,
+    /// Crossings made at the selector's buy, the land look not having
+    /// found the store past its line by then
+    /// (`Options::zpages_buy_crosses`): one a store at most.
+    pub buy_crosses: u64,
     /// Served partitions whose ordered index was dropped a second time
     /// (`Options::zpages_drop_again`), and the bytes of those indexes the
     /// page cache held before the second drop and after it.
@@ -2386,6 +2390,35 @@ pub struct Options {
     /// On; `supdb-znocrossraw` asks for the form files alone.
     #[doc(hidden)]
     pub zpages_cross_asks_raw: bool,
+    /// EXPERIMENT: the selector's first buy makes the crossing where the
+    /// land look has not (`Maint::z_cross`, `zpages_land_drop_past`),
+    /// before the buy attaches anything. The crossing is what turns the
+    /// partitions built ahead under the line -- records kept, form files
+    /// dropped as they were written -- into what the form's install
+    /// needs, the records dropped and the files asked back, and it runs
+    /// where the land look's model reads the store past the line to
+    /// enter. The selector buys by its own rule, on what the reads
+    /// measured or on the prediction priced with the reading's costs,
+    /// and a store whose model sits at that line is bought under it: at
+    /// ten million keys under 1.25 GiB the model reads 0.133 faults a
+    /// read at the load's end and the line was crossed half a second
+    /// before the buy, and with thirty megabytes less in the process
+    /// (`supdb-jobsmapped`) it reads 0.121-0.124, the selector suspected,
+    /// read its files and bought in a third of a second, and the land
+    /// look crossed a quarter second after the attach, where it found
+    /// five partitions without a form file and none of the twenty-four
+    /// attached to swap. Their files, dropped at their builds, came in
+    /// through the warm job one at a time and through the reads' own
+    /// faults, 0.06 major faults a read against 0.005 and the one-thread
+    /// read pass at 255,000 reads a second against 980,000 in the slow
+    /// shape (`SUPDB_ZPAGES_TRACE=1 SUPDB_LAG_MARK=1 bench/scripts/pair.sh
+    /// supdb-jobsmapped supdb 10000000 --bound 1342177280 --reps 2
+    /// --ops-div 10 --passes load,read,read-threaded`, at `ca2306e`). A
+    /// buy is the selector's own word that the store is past the line,
+    /// whatever the look's model reads. Counted
+    /// (`ZCounts::buy_crosses`). Off; `supdb-zbuycross` turns it on.
+    #[doc(hidden)]
+    pub zpages_buy_crosses: bool,
     /// The drop of a served partition's ordered index from the
     /// page cache (`zpages_drop_raw`) is made again a second later, for the
     /// pages that were dirty at the first. The index is written unsynced
@@ -4647,6 +4680,27 @@ pub struct Options {
     /// `supdb-jobsshort` turns both on.
     #[doc(hidden)]
     pub jobs_mapped_when_short: bool,
+    /// EXPERIMENT: with `jobs_mapped`, a job's mapped buffer goes to a
+    /// pool at the job's end and the next job's array of the same kind
+    /// takes it (`blocks::Maps::Pooled`, `blocks::Pool`), for as long as
+    /// the store does not read short of memory; the look that finds it
+    /// short empties the pool and holds it off (`Maint::short_look`), and
+    /// from then a job maps its arrays and unmaps them, as `jobs_mapped`
+    /// alone has every job do. The pool keeps of each array no more than
+    /// the jobs have held of it at once, and no buffer longer than the
+    /// allocator itself keeps warm (`blocks::KEEP_MAX`). The allocator's arena keeps a job's arrays warm
+    /// for the next job and keeps them when the store has no room for
+    /// them, a hundred megabytes and more of a bound of a thousand at ten
+    /// million keys, which nothing a library can call gives back; a
+    /// mapping of the job's own is fresh at every job, a fourteenth of an
+    /// ordered load in memory; and mapping only once the store reads
+    /// short (`jobs_mapped_when_short`) leaves in the arenas what the
+    /// jobs before then kept. The pool is the arena's warmth where memory
+    /// is spare and the mapping's return where it is not, with what was
+    /// kept before returned at the crossing. Off, and nothing without
+    /// `jobs_mapped`; `supdb-jobspooled` turns both on.
+    #[doc(hidden)]
+    pub jobs_pooled: bool,
     /// Whether a fill on the upkeep thread leaves the rest of its
     /// conversions of dense forms the moment a newer commit is posted or
     /// the writer wants the upkeep back, so that through a burst the
@@ -6935,6 +6989,7 @@ impl Default for Options {
             zpages_hot_raw_beside_stride: true,
             zpages_drive_at_job_end: true,
             zpages_cross_asks_raw: true,
+            zpages_buy_crosses: false,
             zpages_drop_again: true,
             zpages_ahead_past_scans: false,
             zpages_build_at_finish: true,
@@ -7072,6 +7127,7 @@ impl Default for Options {
             blocks_mapped: true,
             jobs_mapped: false,
             jobs_mapped_when_short: false,
+            jobs_pooled: false,
             forms_convert_yield: true,
             forms_convert_behind: usize::MAX,
             convert_from_form: true,
@@ -10390,9 +10446,10 @@ pub struct SegmentWriter {
     /// the arrays, as a seal's writer does.
     deferred: Option<usize>,
     last_key: Vec<u8>,
-    /// `SegmentOptions::buffers_mapped`: where the per-key arrays above
-    /// and the finish's trailer live once they are large.
-    buffers_mapped: bool,
+    /// `SegmentOptions::buffers_mapped` and `buffers_pooled`: where the
+    /// per-key arrays above and the finish's trailer live once they are
+    /// large.
+    buffers_mapped: blocks::Maps,
 }
 
 /// The two layouts the writer produces. Same format, same readers, one
@@ -10591,12 +10648,12 @@ impl SegmentWriter {
             lookahead: opts.lookahead,
             deferred: None,
             last_key: Vec::new(),
-            buffers_mapped: opts.buffers_mapped,
+            buffers_mapped: opts.maps(),
             builder: BlockBuilder::new(block_size),
             block_size,
             blocks: Vec::new(),
-            key_arena: blocks::BigVec::new(blocks::Site::WriterKeys, opts.buffers_mapped),
-            spans: blocks::BigVec::new(blocks::Site::WriterSpans, opts.buffers_mapped),
+            key_arena: blocks::BigVec::new(blocks::Site::WriterKeys, opts.maps()),
+            spans: blocks::BigVec::new(blocks::Site::WriterSpans, opts.maps()),
             exts: Vec::new(),
             open_key: None,
             run: Vec::new(),
@@ -10622,8 +10679,8 @@ impl SegmentWriter {
             tail_spans: Vec::new(),
             mode: None,
             recs_len: 0,
-            rec_offs: blocks::BigVec::new(blocks::Site::WriterOffs, opts.buffers_mapped),
-            hashes: blocks::BigVec::new(blocks::Site::WriterHashes, opts.buffers_mapped),
+            rec_offs: blocks::BigVec::new(blocks::Site::WriterOffs, opts.maps()),
+            hashes: blocks::BigVec::new(blocks::Site::WriterHashes, opts.maps()),
             rec_buf: Vec::new(),
             batch_buf: Vec::new(),
             pending_blocks: Vec::new(),
@@ -12061,6 +12118,19 @@ pub struct SegmentOptions {
     /// which a `Db` sets this from. Off.
     #[doc(hidden)]
     pub buffers_mapped: bool,
+    /// EXPERIMENT: with `buffers_mapped`, those mappings come from the
+    /// engine's pool and go back to it (`Options::jobs_pooled`, which a
+    /// `Db` sets this from). Off.
+    #[doc(hidden)]
+    pub buffers_pooled: bool,
+}
+
+impl SegmentOptions {
+    /// Where this writer's large arrays get their buffers
+    /// (`buffers_mapped`, `buffers_pooled`).
+    fn maps(&self) -> blocks::Maps {
+        blocks::Maps::of(self.buffers_mapped, self.buffers_pooled)
+    }
 }
 
 impl Default for SegmentOptions {
@@ -12077,6 +12147,7 @@ impl Default for SegmentOptions {
             lookahead: true,
             prefault: false,
             buffers_mapped: false,
+            buffers_pooled: false,
         }
     }
 }
@@ -12107,7 +12178,7 @@ impl PieceWriter {
         w.set_inline_max(inline_max);
         Ok(PieceWriter(
             Box::new(w),
-            crate::ordindex::Builder::new_in(opts.buffers_mapped),
+            crate::ordindex::Builder::new_in(opts.maps()),
             false,
             false,
         ))
@@ -15508,7 +15579,7 @@ impl MemTable {
     /// `mapped` is where the sort's two arrays of a record a key and the
     /// order it answers live (`Options::jobs_mapped`): fifty-two bytes a
     /// key between them, on the seal's thread, for the length of the sort.
-    fn slots_in_key_order(&self, mapped: bool) -> blocks::BigVec<u32> {
+    fn slots_in_key_order(&self, mapped: blocks::Maps) -> blocks::BigVec<u32> {
         let n = self.len();
         let mut recs: blocks::BigVec<(u64, u64, u32)> =
             blocks::BigVec::with_capacity(n, blocks::Site::SortRecs, mapped);
@@ -16767,7 +16838,7 @@ struct KeyList {
 impl KeyList {
     /// An empty list; `mapped` is where its buffers live once they are
     /// large (`Options::jobs_mapped`).
-    fn new(mapped: bool) -> KeyList {
+    fn new(mapped: blocks::Maps) -> KeyList {
         let mut offs = blocks::BigVec::new(blocks::Site::ListOffs, mapped);
         offs.push(0);
         KeyList {
@@ -16835,15 +16906,20 @@ struct Slicer<'a> {
     from: usize,
     /// Its keys cut to the fence's length; every key, with no fences.
     held: KeyList,
-    /// `Options::jobs_mapped`, for the lists it makes.
-    mapped: bool,
+    /// `Options::jobs_mapped` and `jobs_pooled`, for the lists it makes.
+    mapped: blocks::Maps,
     total: usize,
     slices: Vec<(usize, usize)>,
     given: Vec<Fence>,
 }
 
 impl<'a> Slicer<'a> {
-    fn new(fences: Option<&'a [Fence]>, parts: usize, max_keys: usize, mapped: bool) -> Slicer<'a> {
+    fn new(
+        fences: Option<&'a [Fence]>,
+        parts: usize,
+        max_keys: usize,
+        mapped: blocks::Maps,
+    ) -> Slicer<'a> {
         Slicer {
             fences,
             parts,
@@ -17380,7 +17456,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
 
     // Pass one: every distinct key once, in order, into the slicer, which
     // holds only what the slices are taken from (`Slicer`).
-    let mut slicer = Slicer::new(fences.as_deref(), parts, max_keys, opts.buffers_mapped);
+    let mut slicer = Slicer::new(fences.as_deref(), parts, max_keys, opts.maps());
     let all: Vec<Vec<u8>> = if cursors {
         merge_keys(&blobs, &ords, walk_cached, |k, _| {
             slicer.push(k);
@@ -20041,6 +20117,11 @@ struct Shared {
     /// over the budget, as the segment work last looked
     /// (`Options::forms_fit_when_short`).
     forms_short: std::sync::atomic::AtomicBool,
+    /// Whether this store holds the jobs' pool off (`blocks::Pool::hold`,
+    /// `Options::jobs_pooled`): taken by the look that finds the store
+    /// short of memory, let go by the look that finds it no longer is,
+    /// and by the store's close.
+    pool_held: std::sync::atomic::AtomicBool,
     /// A test's: bits under which a seal thread waits, so a test can hold
     /// the store at a point of the seal and ask what it sees there.
     /// `SEAL_HOLD_LANDING` holds it before its segments are renamed into
@@ -20978,6 +21059,15 @@ impl Shared {
     fn jobs_map(&self, opts: &Options) -> bool {
         opts.jobs_mapped
             && (!opts.jobs_mapped_when_short || self.forms_short.load(AtomicOrdering::Relaxed))
+    }
+
+    /// A job's writer told where its large arrays get their buffers, as
+    /// the job starts: mapped by `jobs_map`, and from the pool under
+    /// `Options::jobs_pooled`. The one place a job's options take either
+    /// from the store.
+    fn job_buffers(&self, opts: &Options, s: &mut SegmentOptions) {
+        s.buffers_mapped = self.jobs_map(opts);
+        s.buffers_pooled = opts.jobs_pooled;
     }
 
     /// Every scan over the store, the block path's and the merge path's:
@@ -25136,6 +25226,7 @@ impl Reader {
             convert_dropped: get(&ev.convert_dropped),
             job_end_drives: get(&ev.job_end_drives),
             cross_raw_asks: get(&ev.cross_raw_asks),
+            buy_crosses: get(&ev.buy_crosses),
             raw_redrops: get(&ev.raw_redrops),
             raw_redrop_before: get(&ev.raw_redrop_before),
             raw_redrop_after: get(&ev.raw_redrop_after),
@@ -34777,6 +34868,7 @@ impl Db {
         // a store that maps only while short asks the store
         // (`Shared::jobs_map`).
         s.buffers_mapped = opts.jobs_mapped && !opts.jobs_mapped_when_short;
+        s.buffers_pooled = opts.jobs_pooled;
         s
     }
 
@@ -34951,6 +35043,7 @@ impl Db {
             in_seal: AtomicUsize::new(0),
             in_merge: AtomicUsize::new(0),
             forms_short: std::sync::atomic::AtomicBool::new(false),
+            pool_held: std::sync::atomic::AtomicBool::new(false),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
             merge_hold: std::sync::atomic::AtomicU8::new(0),
             forms_position_hold: std::sync::atomic::AtomicBool::new(false),
@@ -35757,6 +35850,7 @@ impl Db {
             in_seal: AtomicUsize::new(0),
             in_merge: AtomicUsize::new(0),
             forms_short: std::sync::atomic::AtomicBool::new(false),
+            pool_held: std::sync::atomic::AtomicBool::new(false),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
             merge_hold: std::sync::atomic::AtomicU8::new(0),
             forms_position_hold: std::sync::atomic::AtomicBool::new(false),
@@ -36584,7 +36678,7 @@ impl Db {
             let tmp = self.dir.join(format!("direct-{id:08}.tmp"));
             let _ = std::fs::remove_file(&tmp);
             let mut opts = Db::segment_opts(&self.opts);
-            opts.buffers_mapped = self.shared.jobs_map(&self.opts);
+            self.shared.job_buffers(&self.opts, &mut opts);
             let mut w = PieceWriter::create(&tmp, &opts, 0, self.opts.inline_bytes)?;
             // Where the run stands in the history: its records take the
             // sequence numbers from here, one each, as they commit. And
@@ -37137,7 +37231,7 @@ impl Db {
             .fetch_add(fences.len().max(1) as u64, AtomicOrdering::Relaxed);
         let dir = self.dir.clone();
         let mut opts = Db::segment_opts(&self.opts);
-        opts.buffers_mapped = self.shared.jobs_map(&self.opts);
+        self.shared.job_buffers(&self.opts, &mut opts);
         let background_io = self.opts.background_io;
         let sync_every = self.opts.seal_sync_every;
         let inline_max = self.opts.inline_bytes;
@@ -37202,7 +37296,8 @@ impl Db {
             near || self.opts.seal_snapshot_far
         };
         let put_one = self.opts.seal_put_one;
-        let jobs_mapped = self.shared.jobs_map(&self.opts);
+        // As the seal's writer has them (`Shared::job_buffers`, above).
+        let jobs_mapped = opts.maps();
         let job = move |readable: &SealReadable| -> Result<Vec<String>> {
             if background_io == BackgroundIo::Idle {
                 idle_io_priority();
@@ -43208,6 +43303,22 @@ impl Db {
         blocks::big_maps()
     }
 
+    /// The jobs' pool (`Options::jobs_pooled`), process-wide: buffers a
+    /// job took from it, buffers it kept and buffers it unmapped, ever,
+    /// and the bytes it holds now.
+    #[doc(hidden)]
+    pub fn job_pool_counts() -> [usize; 4] {
+        blocks::POOL.counts()
+    }
+
+    /// The buffers the jobs' arrays have taken from the pool
+    /// (`Options::jobs_pooled`), process-wide and ever, by which array
+    /// took each, as `job_buffers_mapped` names them.
+    #[doc(hidden)]
+    pub fn job_pool_takes() -> Vec<(&'static str, usize)> {
+        blocks::POOL.takes()
+    }
+
     /// How many cells the handles' memos have taken of their slabs
     /// (`Options::zpages_memo_slab`), process-wide and ever.
     #[doc(hidden)]
@@ -47345,7 +47456,7 @@ impl Maint {
     /// mapped where a job that starts now has them so (`Shared::jobs_map`).
     fn merge_opts(&self) -> SegmentOptions {
         let mut s = Db::merge_segment_opts(&self.opts);
-        s.buffers_mapped = self.shared.jobs_map(&self.opts);
+        self.shared.job_buffers(&self.opts, &mut s);
         s
     }
 
@@ -51485,6 +51596,20 @@ impl Maint {
                 || !self.sealing.is_empty(),
         };
         let d = self.zsel.step(&input);
+        // The buy before the crossing (`Options::zpages_buy_crosses`):
+        // the crossing made now, ahead of the attaches this step's drive
+        // makes, since a partition with its form attached is none the
+        // crossing swaps.
+        if self.opts.zpages_buy_crosses
+            && self.opts.zpages_land_drop_past
+            && !self.z_crossed
+            && matches!(d.event, Some(zselect::Event::BuildStart))
+        {
+            self.z_crossed = true;
+            self.z_cross();
+            self.z_ask_pending = true;
+            zfile::ZEvents::add(&self.shared.z.buy_crosses, 1);
+        }
         // Whether the controller is leaving the store raw at the census
         // (`z_heads_look`): a step that had the model's reading and asked
         // for neither a sample nor a build says so, a step that asks for
@@ -53538,7 +53663,10 @@ impl Maint {
         // (`Options::jobs_mapped_when_short`); the trim thread is the
         // fit's alone.
         let jobs = self.opts.jobs_mapped && self.opts.jobs_mapped_when_short;
-        if !self.opts.forms_fit_when_short && !jobs {
+        // And by the jobs' pool (`Options::jobs_pooled`), which a store
+        // that reads short empties and holds off.
+        let pooled = self.opts.jobs_mapped && self.opts.jobs_pooled;
+        if !self.opts.forms_fit_when_short && !jobs && !pooled {
             return;
         }
         let now = std::time::Instant::now();
@@ -53564,6 +53692,12 @@ impl Maint {
         // store short and asks for a trim finds a thread to ask.
         if short && self.opts.forms_fit_when_short {
             start_trimmer(&self.shared, &self.opts);
+        }
+        // The pool before the word, emptied and held off where the store
+        // has come short and let go where it no longer is, so that whoever
+        // reads the word finds the pool as this look left it.
+        if pooled && self.shared.pool_held.swap(short, AtomicOrdering::AcqRel) != short {
+            blocks::POOL.hold(short);
         }
         self.shared
             .forms_short
@@ -55048,6 +55182,15 @@ impl Drop for Db {
                     let _ = h.join();
                 }
             }
+        }
+        // The jobs' pool (`Options::jobs_pooled`): this store's hold on it
+        // let go, and what its jobs left in it unmapped, every one of them
+        // having ended above.
+        if self.shared.pool_held.swap(false, AtomicOrdering::AcqRel) {
+            blocks::POOL.hold(false);
+        }
+        if self.opts.jobs_mapped && self.opts.jobs_pooled {
+            blocks::POOL.drain();
         }
     }
 }
