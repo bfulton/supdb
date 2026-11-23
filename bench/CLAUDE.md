@@ -466,6 +466,52 @@ what its ledger holds; a result the run discards is work the run does
 not do; and a failure a process boundary was built to contain is
 reported by the boundary, not relayed through it.
 
+**A run the session does not hold is the container's to end.** A roster
+of two hours was started detached, with a message scheduled for its end,
+and the container was restarted within minutes of the session going
+idle, twice, each time taking the rep in flight; the ledger took the run
+up from its last whole rep, and four hours went to learning that a
+scheduled message wakes a session and keeps no machine. A long run is
+held by a tracked background task for its whole length -- a watcher that
+ends when the ledger's next `rep-<size>-<n>.json` appears, armed again
+rep by rep, since a tracked task has a limit of its own -- and the
+ledger is what makes that limit harmless. And nothing reads the scratch
+logs wholesale beside one: a search over a gigabyte of old logs for a
+counter's name ran two minutes beside a ten-million-key pass, on the
+device the pass was faulting from, and the rep was taken again from its
+start. Beside a timing run only named files are opened. And a
+tracked task with nothing in the foreground did not hold a later session
+either: a queue of pairings started as one was cut by a restart twenty
+minutes in. What held every run after it was the run detached with
+`nohup` and the session waiting on it in the foreground, ten minutes a
+wait at most, one wait after another, with the queue's script skipping
+the pairings whose tables were already whole. A restart of the session's
+worker takes a detached run with it all the same, twice in one morning,
+each time inside the second sitting of a pairing against a comparator at
+ten million keys, forty minutes a pairing: `RESUME=1 scripts/pair.sh`
+keeps a sitting whose table is whole and runs the other, so a restart
+costs the sitting in flight and not the pairing.
+
+**A stamp is the build's, a task has a limit, and a script a run reads is
+the run's.** One roster was cut three times in a morning and none of the
+three was the engine's. Its binary was built with the batch's docs still
+uncommitted, so its stamp read `-dirty` and the row it was banking rung by
+rung was no row of the series, which nothing said until the container's
+restart cut the run and the partial row was opened; the restart had moved
+the session to a host of another class, which a resume refuses, as it must.
+The run after it was held by a tracked task of two hours, the most one may
+have, and the roster on that host takes two and three quarters: stopped in
+its last rep and taken up from the ledger. And that resume was refused by
+the roster's own script, edited an hour earlier to ask the binary for its
+stamp, a command the binary in flight predated. `scripts/ooc.sh` refuses a
+binary stamped dirty before anything is measured now (`bench stamp`;
+`OOC_DIRTY=1` for a look that will not be banked); a roster is planned as
+sittings of under two hours with the ledger between them; and nothing a
+run in flight reads, its binary or its scripts, is edited until it has
+banked. The rule: a row's provenance is fixed at the build and checked at
+the start, since a check at the end is two hours late; and a run that can
+be resumed is resumed by exactly what started it.
+
 **A device the series does not measure.** Out of core a rate is the
 faults an operation takes times the device's answer to one, about 40 µs
 on this fleet's disk, and the faults are the kernel's reclaim over the
@@ -505,10 +551,198 @@ the one it takes, so the value is built behind a call the match does
 not inline; and a stack overflow is read off the frames' sizes before
 the stack is made larger.
 
+**A pairing has a control too, and it is the cells its option cannot reach.**
+Six pairings of one afternoon, four reps each with the arms' order
+alternating, at ten million keys under the bound, read the ordered load, the
+threaded reads or the first read-only mix a twentieth to a sixth apart in one
+direction in every pair of four, or in three: cells that run before the
+option under test can act, the same code in both arms. The arm listed second
+was the slower in four of the pairings and the faster in a fifth, whichever
+arm it was. So four pairs of four at a tenth was inside what a sitting did to
+identical code, and one such reading, the scan pass 8% against an option that
+only removes decoding from it, with the load 6% the same way in the same
+table, would have been written down as the option's cost. `ab`'s sign test
+answers whether the pairs agree, not whether the sitting leaned. The cells an
+option cannot reach are read first, as a row's comparators are: an effect is
+read against their lean in the same sitting, one no larger than it is
+unresolved however many pairs agree, and the second sitting lists the arms
+the other way. It was measured once with nothing to reach: an arm of
+the stride form paired with the default at three million keys under
+1.25 GiB, where the raw form fits and neither arm builds, installs or
+converts a form file, so the two ran the same code through the row's
+passes, one rep an order. A read 0.71x and 0.81x, the scrambled D 0.73x and
+0.85x, the threaded reads 0.83-0.95x, and the scrambled A, B and F 1.1-1.3x,
+each in both orders (`pair.sh supdb-zstrideroomconv supdb 3000000 --bound
+1342177280 --passes load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+--reps 1 --ops-div 10`, at `52c6d51`, read beside its counts: no build, no
+install). A tenth or more apart in one direction in both orders is what
+identical code read in five cells of twenty-two here, three tenths in the
+worst; a pairing of one rep an order resolves a factor and a half and
+nothing under it.
+
+**A floor held inside the bound it runs beside.** The page floor holds
+the pages it touched to the row's end, so that a floor that gave them
+back would not hand the next pass a cheaper load (the entries above).
+Under a bound the parent that holds them is inside the group, and every
+sample is 4 MB: taken at a sitting's start and after every rep of every
+rung, it left the roster's parent at 37-45 MB of anonymous memory through
+the ten-million rung, where a pairing's parent holds 9. The arms of a
+rep share the parent, so the row is fair between them; but the bound a
+pass runs under shrinks by 4 MB a rep, and it is 30-40 MB under the bound
+a pairing at the same `--bound` runs under. LMDB at ten million keys under
+1.25 GiB sits at the edge of fitting: paired against itself under the
+bound less 32 MiB, its faults matched the roster's to two figures -- 0.058
+a read against the roster's 0.054-0.060 and 0.034 at the full bound, 0.143
+a scan on three threads against 0.112-0.150 and 0.039 -- and its
+three-thread scan rate fell from 45 to 25-26 million entries a second,
+while the supdb arm faulted in neither harness (`sh scripts/pair.sh
+lmdb-nordahead lmdb-nordahead 10000000 --bound 1308622848 --passes
+load,read,read-threaded,scan,scan-threaded,mixes --ops-div 10 --reps 2`
+against the same at `--bound 1342177280`, at `03fdbe9`). The bound is the
+pass's now: each pass's process joins a group of its own with the limit
+on it before it runs anything, the run's process is in none of them, and
+each pass records what its group held at its start (`bound-start`), so
+the arms' equal memory is a recorded fact and not an assumption
+(`bound::Bound::pass`, `run::audit_note`). LMDB against itself in a
+pairing and LMDB in the roster at ten million keys under 1.25 GiB then read
+the same faults to two figures, 0.067 a scan and 0.029 a read on one
+thread and 0.023 a scan on three, in both positions of the pairing and in
+the roster, every pass beginning with a megabyte or so charged to its
+group (`bench ab --arms lmdb-nordahead,lmdb-nordahead --size 10000000
+--bound 1342177280 --ops-div 10 --reps 1` beside `sh scripts/ooc.sh
+1342177280`, at `c9599c2`); the roster runs a second time
+under 1 GiB at ten million keys, where LMDB is clearly out of core, so a
+cell at the edge is read beside one that is not. The first row after it
+is a definition step, banked on its controls. The rule: whatever the
+harness holds is kept out of the bound the measured process runs under,
+by the structure and not by holding little, and the bound each pass got
+is read from the kernel at the pass's start; and a quantity that grows
+rep by rep in the parent is a drift in every cell that can feel it.
+
+**A guarantee matched on one kind of crash.** The buffered group was
+matched on the sync: no arm in it reaches the device at a commit. The
+recovery workloads' first run held each arm's reopened store to every
+batch its killed writer had been acknowledged, on the reading that an
+unsynced commit is in the kernel and outlives its process, which LMDB's
+and RocksDB's documentation says of theirs and the engine's says of its
+WAL. `supdb-ingest` failed it at the first rung: the ordered load
+bypasses the WAL, and a direct run's records go to the file a megabyte
+piece at a time, so the commits behind the last whole piece were in the
+dead process's memory -- two batches of ten at ten thousand keys, eight
+of a hundred at a hundred thousand, the same count every rep, and none
+after the shuffled load, which the WAL takes. The durable arm, whose
+every commit syncs the run, held every batch. So a buffered arm's loss
+is a quantity of the row (`unrecovered_batches`) and a durable arm's is
+a failed pass. The engine writes every commit of a run to its file now,
+the quantity reads zero for every arm, and the test of the workload
+holds it there (`tests/recover.rs`); the rows banked before that read
+the count the paragraph gives. The rule: a guarantee has more than one axis -- what a machine's
+crash may take and what a process's may -- and a group is matched on
+each one a user could mean, by a workload that kills something, since
+an axis nobody tested is matched by assumption.
+
+**A device filed as virtual that was a disk's.** `run` refuses a
+RAM-backed device under its stores, and asked whether the device's entry
+in sysfs lies under the kernel's virtual devices, where zram, brd and
+loop devices are filed. A device-mapper volume and an md array are filed
+there too, and are the disks under them. A hosted x86 runner whose work
+disk was a device-mapper volume (`dm-0`) was refused as RAM-backed, and
+`tests/fresh_process.rs` failed there with the engine and the suite
+unchanged, in a job the ARM runner beside it passed. A mapped volume is
+judged by the devices its `slaves` directory names now, each link
+resolved before it is read, since a slave beside its volume is linked as
+`../../zram0` and names no directory on the way
+(`env::virtual_block_device`); the test builds sysfs's tree, a volume
+over a partition, over zram, over another volume and over both. The
+rule: a class read off where the kernel files a thing is held to
+everything else filed there, so the directory's other members are listed
+before its name is trusted; and a refusal that guards the series is run
+on the hosts the series' CI runs on, where the first one to differ finds
+it.
+
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`
-block and rejects any `${{ }}` inside one; it runs in `lint`.
+block and rejects any `${{ }}` inside one; it runs in `lint`. It refuses
+`ubuntu-latest` as a job's runner too. That label moved to Ubuntu 26.04
+between two runs of one afternoon, where the libclang lookup finds
+nothing and `qemu-user-static` is not a package, and three jobs of `ci`
+failed in their set-up on a tree that had not changed; `ci` was given
+its image by name that day, and the five workflows that run by hand or
+after a merge kept the label for another day, each to fail the same way
+the first time it was wanted. A workflow nobody runs is fixed with the
+ones that ran, by a rule the lint holds, and not when it is next needed.
+And it holds a cache step's `workspace -> target` to a target that is a
+workspace's own directory: every workflow said `bench -> bench/target`,
+the action takes the target as a path inside the workspace, and the step
+cached a directory that does not exist while each job built RocksDB from
+its sources twice (the engine's `CLAUDE.md`, running the checks). A
+setting whose effect nothing reads is held to the thing it names existing.
+
+**A generator more regular than the thing it stood for.** The first
+ids were one to a stratum of the whole 64-bit space, key `n` a random
+point of the `n`th of as many strata as keys: ascending with the index,
+no two alike, and nothing like random ids to a structure that guesses a
+key's place from its value, since key `n` lies within one stride of `n`
+strides in and a straight line through the first id and the last puts
+every key within a key of its place. The search the sparse stride form
+was to be priced on guesses by that line, and over those ids its guess
+was never off by more than two of its samples, which the probe of the
+search said before the form was built on it: a search that never has to
+look is not the one random ids get. The ids are dealt to cells by a hash of the key's number now, so a
+stretch of the space holds as many as independent draws would put there,
+some cells half again their share and some none, and a test holds the
+cells' counts to that spread (`workload::Ids`,
+`the_ids_are_spread_as_independent_draws_are`). The rule: a synthetic
+input is held to the statistic the code under test is priced by -- here
+the count of keys in a stretch, at every scale -- and not to looking
+random, which a stratified sample does to the eye.
+
+**A loop of independent loads times the core's width, not a load.** The
+probe of a key's search (`examples/keysearch.rs`) first drew its keys
+ahead and read them in a loop, and read a dense stride's read at 39 ns
+over ten million keys, where a miss alone is twice that: the reads share
+nothing, so the core had ten of them in flight at once and the loop's
+time a read was a tenth of one. A point read in a store is the next thing
+its caller does with the last one's answer, so the probe feeds each read's
+result into the next key's choice, which makes them one at a time. A
+probe of a read that misses is serial by a data dependency, or it
+measures how many misses the core overlaps.
+
+**An arm with no stronger promise to configure is a guarantee of its
+own.** FASTER has no setting under which a write outlives its process
+before a checkpoint, and the arm was first filed with the buffered group,
+whose every commit is in the kernel. The matching check refused it beside
+RocksDB, on `reopen_for_write`, and the first fix made the check skip that
+axis and `ordered_scan` for everybody, which is the shape of the entry
+above: an axis dropped so that an arm would fit a group it is not in. The
+arm is `Guarantee::Memory` now, alone there, and the check is as it was.
+Its cells beside the buffered group's are a reader's comparison, made
+with the difference said, never the suite's.
+
+**A cell an arm cannot have is no sample, not a NaN one.** A phase a
+pass leaves out leaves a NaN where its rate would be, which was every
+phase `bench ab --passes` left out and nothing in a row, since a row was
+always every phase of every arm. `faster` has no ordered scan, its scan
+rate went into the row as five NaNs, serde wrote them as null, and the
+first quick row with the arm in it ran its eighteen minutes, was banked,
+and was then refused whole by `Row::read` at the gate: one null among ten
+thousand lines. A sample enters a row in one place (`Samples::push`), and
+that place drops a NaN now, so an arm that cannot run a workload and a row
+of some passes (`bench run --passes`) both write rows the gate and the
+figures read. The check that found it was the quick group, the only one
+that reads a row it has just written.
+
+**A comparator's own benchmark can be the broken one.** FASTER's C++
+benchmark at the pinned commit tests `result == Status::Ok` after an
+upsert (`cc/benchmark-dir/benchmark.h`, since a commit of February 2025)
+and so logs a line for every upsert that succeeds: its half-reads run on
+one thread came in at an eighth of what the same store does with the test
+turned round, and the first reading of it was that the suite's shim was
+four times faster than the store's own tool. A comparator held to its own
+tool is held to the tool as somebody last ran it; read the loop before
+the rate. The upstream repository is no longer maintained, which is why
+the pin is its last commit and why nobody else will have met this.
 
 ## One repository
 
@@ -527,7 +761,14 @@ built RocksDB at all failed on both Linux (only a versioned `.so` on the
 image) and macOS (dyld could not find `@rpath/libclang.dylib` at run time);
 naming the directory fixed Linux and not macOS, because SIP strips `DYLD_*`
 before a workflow step's shell starts, so on macOS the script adds an rpath
-to `RUSTFLAGS`. Cargo takes profiles from the root of the workspace being
+to `RUSTFLAGS`. FASTER is the other comparator a host has to be readied for, and
+`scripts/faster.sh` is its one definition, called wherever
+`scripts/libclang.sh` is: it is not a crate, so the script fetches its
+sources at the commit `vendor/faster/PIN` names into a directory git
+ignores and installs the three libraries they link, and `build.rs` fails
+the build where they are missing or another commit's. The arm exists on
+Linux x86-64 alone (`cfg(faster)`, set by `build.rs`), so nothing on
+macOS or ARM builds or needs it. Cargo takes profiles from the root of the workspace being
 built, which here is this directory, so the engine's release profile is
 repeated in `Cargo.toml` and cargo warns on every build that it is ignoring
 the engine's -- the warning is expected, the repetition is what keeps the
@@ -547,3 +788,29 @@ same rows twice and holds the bytes equal, since a check that compares a
 drawing to a redrawing is only as good as the drawing's determinism. The
 rule: a derived file may be committed when a check regenerates it and
 fails on a difference, and never otherwise.
+
+**Rows from the hosted runners.** `bank-row.yml` runs the quick ladder on
+each hosted runner after a merge to `main` and proposes the rows as one
+pull request, the figures redrawn and each row's gate verdict in the body;
+merging it is a person's decision, as `quiet-bench.yml`'s rule already
+says, and the workflow never runs on a pull request or a self-hosted
+runner. The runner label is not the class: the three most recent quick
+jobs on `ubuntu-latest` ran on an EPYC 9V45, an EPYC 7763 and an EPYC
+9V74, three classes under one label, so a band for a hosted class forms
+as its own rows arrive, slowly for that label and faster for the ARM and
+macOS runners. A hosted row is never read against a Firecracker row, which
+the class key forbids anyway, and no default changes on a hosted number
+alone: the runners are shared machines whose model varies between runs,
+and the row's floors judge the machine before its cells are read. A
+bounded row can be taken there too, by hand (`ooc-hosted.yml`): the
+runners are cgroup v2, where a process cannot bound itself from inside a
+leaf -- a group with processes in it may not hand the memory controller to
+a child -- so the job starts the run inside a transient systemd service
+with the limit on it and no swap, and the suite attaches to the group it
+finds itself in, holding its `memory.max` to the `--bound` it was asked
+for and refusing a `max` or any other number (`bound::Bound::attach_at`).
+That path cannot run on this host, which is v1 with nothing delegated on
+its unified mount, so it is held by its parsers' tests and an attach
+against a directory of plain files, and the job's first run is its first
+exercise. A hosted bounded row is a class of its own, the bound in it, and
+is read against nothing from here.

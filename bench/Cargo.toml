@@ -8,6 +8,8 @@
 name = "supdb-bench"
 version = "0.2.0"
 edition = "2021"
+# The engine's floor (`../Cargo.toml`).
+rust-version = "1.95"
 build = "build.rs"
 
 [lib]
@@ -28,18 +30,28 @@ serde_json = "1"
 # Comparators. Every arm is in-process Rust so the comparison carries no
 # binding overhead.
 heed = "0.20"
-# Built without compression libraries: every arm stores values uncompressed
-# and the adapter turns compression off explicitly. Not optional: RocksDB is
-# a headline comparator, and a comparison that is off by default is one that
-# does not get run. The build needs libclang for bindgen; on a host where
-# clang-sys does not find one, `scripts/libclang.sh` names the directory
-# holding it (libclang.so, or libclang.dylib on macOS).
-rocksdb = { version = "0.23", default-features = false }
+# Built with LZ4 alone of the compression libraries, for the arm that
+# compresses (`rocksdb-tuned-lz4`, the bounded roster's); every other arm
+# turns compression off explicitly. Not optional: RocksDB is a headline
+# comparator, and a comparison that is off by default is one that does not
+# get run. The allocator is the system's, RocksDB's own guidance being
+# jemalloc: the `rocksdb-jemalloc` feature below builds it on the prefixed
+# jemalloc the crate links, which touches no Rust allocation, and the
+# `rocksdb-alloc` workflow pairs the two builds. The build needs libclang
+# for bindgen; on a host where clang-sys does not find one,
+# `scripts/libclang.sh` names the directory holding it (libclang.so, or
+# libclang.dylib on macOS).
+rocksdb = { version = "0.23", default-features = false, features = ["lz4"] }
 
 # liblz4's decoder, for the probe that prices it against `lz4_flex` on the
 # form's own pages (`examples/zdecode.rs`, `--features lz4-c`). Optional, so
 # nothing the suite measures links the C library.
 lz4 = { version = "1", optional = true }
+# Other codecs beside LZ4, for the probe that prices each on the form's own
+# groups (`examples/zcodec.rs`, `--features codecs`). Optional, so nothing
+# the suite measures links them.
+zstd = { version = "0.13", optional = true }
+snap = { version = "1", optional = true }
 
 [dev-dependencies]
 # The payload test checks that values compress to the compressibility asked
@@ -52,6 +64,11 @@ lz4 = { version = "1", optional = true }
 # is the feature below.
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
 
+[build-dependencies]
+# For FASTER's C++ store and its shim (`vendor/faster`), and for LZAV under
+# `codecs`; already in the graph for the comparators.
+cc = "1"
+
 [features]
 # `zsize` built with the crate's safe encoder and decoder, to be run beside
 # the build without it: the pages come out byte for byte the same, and the
@@ -60,10 +77,25 @@ lz4-safe = ["lz4_flex/safe-encode", "lz4_flex/safe-decode"]
 # `zdecode` built with liblz4 beside the engine's decoder. Off for
 # everything the suite measures.
 lz4-c = ["dep:lz4"]
+# RocksDB on the jemalloc its own guidance names, prefixed, so that only
+# RocksDB's allocations change (`rocksdb-alloc.yml` pairs the builds).
+rocksdb-jemalloc = ["rocksdb/jemalloc"]
+# `zcodec` built with zstd, Snappy and LZAV (`vendor/lzav`, compiled by
+# `build.rs`) beside LZ4. Off for everything the suite measures.
+codecs = ["lz4-c", "dep:zstd", "dep:snap"]
+# The process's allocations counted by the thread that made them, a
+# `mixthreads` line beside each census (`SUPDB_MIX_CENSUS=2`): whose memory
+# an arena left free and resident was (`src/alloc_census.rs`). A count on
+# every allocation of every arm, so off for everything the suite measures.
+alloc-census = []
 
 [[example]]
 name = "zdecode"
 required-features = ["lz4-c"]
+
+[[example]]
+name = "zcodec"
+required-features = ["codecs"]
 
 # Cargo takes profiles from the root of the workspace being built, which is
 # this manifest, so the engine's own [profile.release] is ignored here and

@@ -54,6 +54,7 @@ fn style(arm: &str) -> (&'static str, &'static str) {
         "lmdb" | "lmdb-nosync" => (GREY, ""),
         "lmdb-nordahead" => (GREY, "4,2"),
         "rocksdb-tuned" | "rocksdb-tuned-nosync" | "rocksdb-nosync" => (GREY, "7,4"),
+        "rocksdb-tuned-lz4" => (GREY, "1,3"),
         _ => (GREY, "2,3"),
     }
 }
@@ -62,19 +63,25 @@ fn style(arm: &str) -> (&'static str, &'static str) {
 fn pretty(arm: &str) -> &'static str {
     match arm {
         "supdb" => "supdb",
+        "supdb-nozpages" => "supdb (no compact form)",
         "supdb-noadvice" => "supdb (no advice)",
         "supdb-nocache" => "supdb (no block cache)",
         "supdb-forms" => "supdb (forms at ingest)",
         "supdb-nosnap" => "supdb (a snapshot per handle)",
         "supdb-settle" => "supdb (settle at commit, no forms)",
         "supdb-cache256" => "supdb (256 MB block cache)",
+        "supdb-cache256tofit" => "supdb (256 MB cache, fitted)",
         "supdb-ingest" => "supdb (buffered)",
         "lmdb" => "LMDB",
         "lmdb-nordahead" => "LMDB (no readahead)",
         "lmdb-nosync" => "LMDB (nosync)",
         "rocksdb-tuned" => "RocksDB",
         "rocksdb-tuned-nosync" => "RocksDB (nosync)",
+        "rocksdb-tuned-lz4" => "RocksDB (LZ4)",
         "rocksdb-nosync" => "RocksDB (untuned, nosync)",
+        // Named for a legend it is not yet in: its guarantee holds it alone
+        // and no figure is drawn of one arm (`render_row`).
+        "faster" => "FASTER",
         _ => "?",
     }
 }
@@ -88,12 +95,20 @@ fn workload_noun(w: &str) -> &'static str {
         "scan-mixed" => "Ordered scans on the store the mixes leave",
         "scan-lag" => "Ordered scans against merge lag",
         "lag-burst" => "The lag sweep's bursts",
+        "recover" => "Recovery after a crash at the end of an ordered load",
+        "recover-shuffled" => "Recovery after a crash at the end of a shuffled load",
         "ycsb-A" => "YCSB-A, update-heavy (50/50 read/update, zipfian)",
         "ycsb-B" => "YCSB-B, read-mostly (95/5 read/update, zipfian)",
         "ycsb-C" => "YCSB-C, read-only (zipfian)",
         "ycsb-D" => "YCSB-D, read-latest (95/5 read/insert)",
         "ycsb-E" => "YCSB-E, short ranges (95/5 scan/insert, zipfian)",
         "ycsb-F" => "YCSB-F, read-modify-write (50/50, zipfian)",
+        "ycsbs-A" => "YCSB-A, update-heavy (50/50 read/update, scrambled zipfian)",
+        "ycsbs-B" => "YCSB-B, read-mostly (95/5 read/update, scrambled zipfian)",
+        "ycsbs-C" => "YCSB-C, read-only (scrambled zipfian)",
+        "ycsbs-D" => "YCSB-D, read-latest (95/5 read/insert, latest)",
+        "ycsbs-E" => "YCSB-E, short ranges (95/5 scan/insert, scrambled zipfian)",
+        "ycsbs-F" => "YCSB-F, read-modify-write (50/50, scrambled zipfian)",
         _ => "",
     }
 }
@@ -183,7 +198,17 @@ pub fn render_all(runs: &Path, out: &Path, scale: Scale) -> io::Result<Vec<Rende
     if !written.is_empty() {
         write_index(out, &written)?;
     }
-    if let Some((class, _)) = latest.iter().max_by_key(|(_, r)| r.utc.clone()) {
+    // The newest class's set, among the classes of the numbered keys: the
+    // series the documents' figures are of. A row of another shape of keys
+    // is a series beside it, drawn under its own class above, and takes
+    // this copy only where no row of numbered keys is there to.
+    let newest = |numbered: bool| {
+        latest
+            .iter()
+            .filter(|(_, r)| !numbered || r.keys.is_numbered())
+            .max_by_key(|(_, r)| r.utc.clone())
+    };
+    if let Some((class, _)) = newest(true).or_else(|| newest(false)) {
         let from = out.join(class.replace('/', "_"));
         let to = out.join(LATEST);
         std::fs::create_dir_all(&to)?;
@@ -226,7 +251,11 @@ fn arm_order<'a>(present: impl Iterator<Item = &'a String>) -> Vec<String> {
 fn render_row(row: &Row, out: &Path) -> io::Result<Vec<Rendered>> {
     let mut groups: Groups = BTreeMap::new();
     let mut floors = Floors::default();
-    for m in &row.measurements {
+    for m in row
+        .measurements
+        .iter()
+        .filter(|m| !crate::gate::is_audit(&m.workload))
+    {
         let Some(size) = m.size else {
             if m.arm == FLOOR_ARM {
                 let med = Samples::new(m.samples.clone()).median();
@@ -281,6 +310,11 @@ fn render_row(row: &Row, out: &Path) -> io::Result<Vec<Rendered>> {
         let g = match guarantee {
             Guarantee::Durable => "durable",
             Guarantee::Buffered => "buffered",
+            // A figure is a comparison within a guarantee, and this one
+            // holds FASTER alone (`engines::ARMS`): nothing to draw it
+            // against. Its cells are the row's, for a reader who sets
+            // them beside another group's and says what differs.
+            Guarantee::Memory => continue,
         };
         let name = format!("{}-{workload}-{quantity}-{g}.svg", row.scale.as_str());
         let (svg, title) = figure(row, &workload, &quantity, &unit, guarantee, &curves, floors);
@@ -579,6 +613,9 @@ fn message(
     let what = match quantity {
         "ops_per_s" | "reads_per_s" | "entries_per_s" => "throughput".to_string(),
         "p99_us" => "p99 latency".to_string(),
+        "open_ms" => "time to open".to_string(),
+        "first_read_us" => "first read".to_string(),
+        "unrecovered_batches" => "acknowledged batches not recovered".to_string(),
         "device_bytes_per_byte" => "device bytes per byte".to_string(),
         "bytes_on_disk_per_byte" => "bytes on disk per byte".to_string(),
         q => match crate::run::threads_of(q) {
@@ -589,6 +626,7 @@ fn message(
     let g = match guarantee {
         Guarantee::Durable => "durable per batch",
         Guarantee::Buffered => "buffered",
+        Guarantee::Memory => "in memory until a checkpoint",
     };
     let context = format!("{noun}, {what}, {g}, to {} keys", pow_label(top));
     let mut ahead = Vec::new();
@@ -599,6 +637,7 @@ fn message(
         "lmdb-nordahead",
         "lmdb-nosync",
         "rocksdb-tuned",
+        "rocksdb-tuned-lz4",
         "rocksdb-tuned-nosync",
         "rocksdb-nosync",
     ] {
@@ -718,6 +757,16 @@ fn write_index(out: &Path, written: &[Rendered]) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// Every arm a roster names has its name in a legend: `supdb-nozpages`
+    /// joined both rosters and was drawn as "?" in every figure after.
+    #[test]
+    fn every_roster_arm_has_a_legend_name() {
+        use crate::engines::{ARMS, OOC_ARMS};
+        for arm in ARMS.iter().chain(OOC_ARMS.iter()) {
+            assert_ne!(pretty(arm), "?", "{arm} has no name in a legend");
+        }
+    }
+
     #[test]
     fn power_labels() {
         assert_eq!(pow_label(10_000), "10⁴");
@@ -793,6 +842,7 @@ mod tests {
                 machine,
                 killed: vec![],
                 resumptions: vec![],
+                keys: Default::default(),
                 measurements: vec![m("supdb", 2.0e6), m("lmdb", 1.0e6)],
             }
         };
@@ -840,6 +890,37 @@ mod tests {
                 "{n}: drawn twice from the same rows, the same bytes"
             );
         }
+        // A row of ids banked after both is a class of its own and is not
+        // the latest: the copy stays the numbered keys' newest.
+        let mut ids = row("20260103T000000Z", "New Host");
+        ids.keys = crate::workload::KeyShape::Ids;
+        ids.write(&runs).unwrap();
+        let with_ids = root.join("figs-ids");
+        render_all(&runs, &with_ids, Scale::Quick).unwrap();
+        let ids_dir = with_ids.join(ids.class().replace('/', "_"));
+        assert!(ids_dir.is_dir() && ids.class() != newer.class());
+        assert_eq!(names(&with_ids.join(LATEST)), names(&latest));
+        for n in names(&latest) {
+            assert_eq!(
+                std::fs::read(latest.join(&n)).unwrap(),
+                std::fs::read(with_ids.join(LATEST).join(&n)).unwrap(),
+                "{n}: the latest is the numbered keys' with a newer row of ids beside it"
+            );
+        }
+        // Alone under a runs directory, the row of ids is what there is.
+        let only = root.join("runs-ids");
+        ids.write(&only).unwrap();
+        let only_out = root.join("figs-only-ids");
+        render_all(&only, &only_out, Scale::Quick).unwrap();
+        for n in names(&only_out.join(LATEST)) {
+            assert!(
+                std::fs::read_to_string(only_out.join(LATEST).join(&n))
+                    .unwrap()
+                    .contains(&ids.class()),
+                "{n} is the ids' where nothing else is"
+            );
+        }
+        assert!(!names(&only_out.join(LATEST)).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

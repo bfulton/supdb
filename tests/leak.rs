@@ -66,7 +66,7 @@ fn a_store_life(name: &str, blocks_mapped: bool) {
         partition_bytes: Some(64 << 20),
         scan_block_cache: true,
         blocks_mapped,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let keys = 20_000u32;
@@ -120,7 +120,7 @@ fn a_handed_life(name: &str) {
         seal_bytes: 1 << 20,
         partition_bytes: Some(64 << 20),
         scan_block_cache: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let keys = 20_000u32;
@@ -170,7 +170,7 @@ fn a_three_frozen_life(name: &str) {
         seal_bytes: 1 << 30,
         partition_bytes: Some(64 << 10),
         scan_block_cache: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let keys = 20_000u32;
@@ -232,7 +232,13 @@ fn a_zpages_life(name: &str) {
         scan_block_cache: false,
         seal_bytes: 1 << 20,
         partition_bytes: Some(256 << 10),
-        ..Options::default()
+        // The page flipped below is met by the check a page takes at its
+        // first touch, which a stride file this process built is trusted
+        // past (`Options::zpages_stride_trust_built`): under the stride
+        // switch, whose keys and values here the stride form holds, the
+        // check is asked for, so the flip reaches the retire list.
+        zpages_stride_trust_built: false,
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let keys = 20_000u32;
@@ -385,6 +391,146 @@ fn a_zpages_life(name: &str) {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// A store under the stride form: its partitions' stride files, reopened so
+/// that each is a file found on disk and checked page by page as the reads
+/// touch them; a handle pinned at a snapshot; a value page flipped in place
+/// under the mappings once the open has attached them, which a read meets
+/// at the page's first touch and the settle takes out of its live cell into
+/// the retire list -- the path a merge never reaches, the form file
+/// outliving the segment that held it -- and builds again. The store closes
+/// with the pin held, so nothing sweeps: the handle's drop frees what the
+/// list held, and nothing of the directory stays mapped after it.
+fn a_stride_life(name: &str) {
+    let d = std::env::temp_dir().join(format!("supdb-next-leak-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let opts = Options {
+        zpages: supdb::ZPages::Always,
+        zpages_stride: supdb::ZStride::Forced,
+        zpages_min_bytes: 0,
+        scan_block_cache: false,
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(256 << 10),
+        ..common::options()
+    };
+    let keys = 12_000u32;
+    let key = |k: u32| format!("k{k:06}").into_bytes();
+    let value = |k: u32| -> Vec<u8> {
+        let mut x = (u64::from(k) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (0..100)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    };
+    {
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        for k in 0..keys {
+            db.append(&key(k), &value(k));
+            if k % 2000 == 1999 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert!(
+            c.stride_files > 1 && c.stride_files == c.form_files,
+            "{c:?}"
+        );
+        db.close().unwrap();
+    }
+    let mut db = Db::open(&d, opts.clone()).unwrap();
+    let read_all = |r: &supdb::Reader| {
+        for k in 0..keys {
+            let mut n = 0;
+            r.read_all(
+                &key(k),
+                vf(&mut |v| {
+                    assert_eq!(v, value(k).as_slice());
+                    n += 1;
+                }),
+            )
+            .unwrap();
+            assert!(n <= 1);
+        }
+    };
+    let pinned = db.reader().unwrap();
+    pinned.snapshot();
+    // The largest stride file's second value page. The open attached every
+    // file before this, so what meets the flip is a read's first touch of
+    // the page and never the attach's sample.
+    let mut files: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(&d)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with("zpg-") && n.ends_with(".zpg")
+        })
+        .map(|e| (e.metadata().unwrap().len(), e.path()))
+        .collect();
+    files.sort();
+    let (len, file) = files.pop().expect("a stride file");
+    assert!(len > 20 * ZPAGE as u64, "a stride file of {len} bytes");
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file)
+            .unwrap();
+        let at = ZPAGE as u64 + 100;
+        let mut byte = [0u8; 1];
+        f.read_at(&mut byte, at).unwrap();
+        byte[0] ^= 0x40;
+        f.write_at(&byte, at).unwrap();
+    }
+    let before = db.zpage_counts();
+    read_all(&db);
+    let c = db.zpage_counts();
+    assert_eq!((c.damaged, c.bad_pages), (1, 1), "the flipped page: {c:?}");
+    assert!(
+        c.stride_page_checks > 0,
+        "pages found on disk, checked: {c:?}"
+    );
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.rebuilds - before.rebuilds, c.damaged, c.stride_files),
+        (1, 0, before.stride_files),
+        "retired into the list and built again: {c:?}"
+    );
+    read_all(&db);
+    read_all(&pinned);
+    drop(db);
+    // The retired file by its own mapping: the retire renamed it to a dead
+    // name (`zfile::zpg_dead_name`) and the settle's sweep unlinked that, so
+    // the pinned mapping shows the dead name deleted. The pinned state maps
+    // the rebuilt files too, under their names, and those alone are no sign
+    // of the retired one.
+    #[cfg(target_os = "linux")]
+    {
+        let maps = common::zpg_mappings(&d);
+        assert!(
+            maps.iter()
+                .any(|p| p.contains("/zpg-dead-") && p.ends_with(" (deleted)")),
+            "the pin holds the retired stride file, under its dead name, past the store's close: {maps:?}"
+        );
+    }
+    drop(pinned);
+    #[cfg(target_os = "linux")]
+    assert!(
+        common::zpg_mappings(&d).is_empty(),
+        "no mapping of the store's stride files survives the last handle: {:?}",
+        common::zpg_mappings(&d)
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A store's blocks come from the kernel by default (`Options::blocks_mapped`)
 /// and the allocator the count below sees nothing of them, so they are
 /// counted on their own (`Db::mapped_bytes`): zero past every store's
@@ -400,6 +546,7 @@ fn a_closed_store_gives_back_what_it_allocated() {
     a_handed_life("warm-handed");
     a_three_frozen_life("warm-three");
     a_zpages_life("warm-zpages");
+    a_stride_life("warm-stride");
     assert_eq!(
         Db::mapped_bytes(),
         0,
@@ -407,13 +554,14 @@ fn a_closed_store_gives_back_what_it_allocated() {
     );
     let before = LIVE.load(Ordering::SeqCst);
     let lives = 4;
-    let kinds = 5;
+    let kinds = 6;
     for i in 0..lives {
         a_store_life(&format!("life-{i}"), true);
         a_store_life(&format!("heap-{i}"), false);
         a_handed_life(&format!("handed-{i}"));
         a_three_frozen_life(&format!("three-{i}"));
         a_zpages_life(&format!("zpages-{i}"));
+        a_stride_life(&format!("stride-{i}"));
     }
     let after = LIVE.load(Ordering::SeqCst);
     let kept = after - before;

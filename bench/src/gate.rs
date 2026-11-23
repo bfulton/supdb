@@ -49,6 +49,12 @@ pub fn higher_is_better(quantity: &str) -> Option<bool> {
         "entries_per_s_lag10pct" | "entries_per_s_lag100pct" => true,
         "updates_per_s_lag1pct" | "updates_per_s_lag10pct" | "updates_per_s_lag100pct" => true,
         "p50_us" | "p99_us" | "device_bytes_per_byte" | "bytes_on_disk_per_byte" => false,
+        // The recovery workloads': the open of a crashed store, and the
+        // first read through it.
+        // And a buffered arm's batches that went with its process.
+        "open_ms" | "first_read_us" | "unrecovered_batches" => false,
+        // The audit's (`is_audit`): named, and judged by nobody.
+        "group_bytes" | "process_bytes" => false,
         _ => return None,
     })
 }
@@ -64,6 +70,16 @@ pub fn is_floor(workload: &str) -> bool {
         workload,
         "wal-floor" | "scan-floor" | "mem-floor" | "page-floor" | "seek-floor" | "seek-floor-again"
     )
+}
+
+/// The workloads a row carries as a record and not a measurement: what each
+/// bounded pass's group and process held at the pass's start
+/// (`run::AUDIT_WORKLOAD`). The gate judges none of them -- a pass that
+/// began with more than its own process charged to its bound is the run's
+/// to report (`run::audit_note`), not a regression of anything -- and the
+/// figures draw none.
+pub fn is_audit(workload: &str) -> bool {
+    workload == crate::run::AUDIT_WORKLOAD
 }
 
 /// The floors a bounded row carries for the device's random read, which
@@ -91,8 +107,10 @@ pub fn is_comparator(arm: &str) -> bool {
             | "lmdb-nordahead"
             | "lmdb-nosync"
             | "rocksdb-tuned"
+            | "rocksdb-tuned-lz4"
             | "rocksdb-nosync"
             | "rocksdb-tuned-nosync"
+            | "faster"
     )
 }
 
@@ -375,7 +393,7 @@ pub fn gate(row: &Row, runs: &Path) -> io::Result<Report> {
     let mut prior: HashMap<Key, Vec<(f64, f64)>> = HashMap::new();
     let mut prior_med: HashMap<Key, Vec<f64>> = HashMap::new();
     for r in &window {
-        for m in &r.measurements {
+        for m in r.measurements.iter().filter(|m| !is_audit(&m.workload)) {
             let k = (
                 m.workload.clone(),
                 m.arm.clone(),
@@ -392,7 +410,7 @@ pub fn gate(row: &Row, runs: &Path) -> io::Result<Report> {
     }
 
     let mut findings = Vec::with_capacity(row.measurements.len());
-    for m in &row.measurements {
+    for m in row.measurements.iter().filter(|m| !is_audit(&m.workload)) {
         let Some(up) = higher_is_better(&m.quantity) else {
             return Err(io::Error::other(format!(
                 "quantity {:?} has no recorded direction; add it to gate::higher_is_better",
@@ -557,6 +575,7 @@ mod tests {
             machine: machine(cpus),
             killed: vec![],
             resumptions: vec![],
+            keys: Default::default(),
             measurements: vec![m("reads_per_s", "reads/s", reads), m("p99_us", "µs", p99)],
         }
     }
@@ -679,6 +698,7 @@ mod tests {
                 machine: machine(4),
                 killed: vec![],
                 resumptions: vec![],
+                keys: Default::default(),
                 measurements: vec![
                     q("scan", "supdb", "entries_per_s", "entries/s", scan_supdb),
                     q("scan", "lmdb", "entries_per_s", "entries/s", scan_lmdb),
@@ -750,6 +770,7 @@ mod tests {
                 machine: machine(4),
                 killed: vec![],
                 resumptions: vec![],
+                keys: Default::default(),
                 measurements: vec![q("supdb", 100.0), q("lmdb", lmdb)],
             }
         };
@@ -991,6 +1012,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A row of ids has no history among rows of numbered keys on its own
+    /// machine, however alike the numbers, and the rows of ids are its
+    /// history once there are some: the two shapes are two series under
+    /// one directory (`Row::class`). A regression among the ids is caught
+    /// against the ids, and a numbered row beside them still counts only
+    /// its own.
+    #[test]
+    fn another_key_shape_is_not_history() {
+        use crate::workload::KeyShape;
+        let (dir, _) = fixture(6);
+        let ids = |utc: &str, reads: [f64; 5]| {
+            let mut r = row(utc, 4, reads, [5.0, 5.1, 5.0, 5.2, 4.9]);
+            r.keys = KeyShape::Ids;
+            r
+        };
+        // A tenth of the numbered rows' rate: red against them, and no
+        // verdict at all with no row of ids to hold it to.
+        let slow = [10.0, 10.1, 9.9, 10.0, 10.2];
+        let first = ids("20260201T000000Z", slow);
+        let rep = gate(&first, &dir).unwrap();
+        assert_eq!(rep.prior_rows, 0);
+        assert!(!rep.regressed());
+        // Its own shape's rows are its history.
+        for i in 0..4 {
+            ids(&format!("20260110T{i:02}0000Z"), slow)
+                .write(&dir)
+                .unwrap();
+        }
+        let rep = gate(&first, &dir).unwrap();
+        assert_eq!(rep.prior_rows, 4);
+        assert!(!rep.regressed());
+        let worse = ids("20260202T000000Z", [1.0, 1.01, 0.99, 1.0, 1.02]);
+        let rep = gate(&worse, &dir).unwrap();
+        assert_eq!(rep.prior_rows, 4);
+        assert!(rep.regressed());
+        // And a numbered row sees the six numbered rows, not the four.
+        let numbered = row(
+            "20260203T000000Z",
+            4,
+            [100.0, 101.0, 99.5, 100.2, 100.8],
+            [5.0, 5.1, 5.0, 5.2, 4.9],
+        );
+        let rep = gate(&numbered, &dir).unwrap();
+        assert_eq!(rep.prior_rows, 6);
+        assert!(!rep.regressed());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn the_window_is_the_last_ten() {
         let (dir, _) = fixture(14);
@@ -1017,19 +1086,21 @@ mod tests {
     }
 
     /// One name per thread count the runner measures at, on any machine
-    /// the suite runs on: the names are a pattern over the two bases a
-    /// threaded pass has, and nothing else carries the suffix.
+    /// the suite runs on: the names are a pattern over the three bases a
+    /// threaded pass has -- the reads', the scans' and the threaded mixes',
+    /// which also run on one thread -- and nothing else carries the suffix.
     #[test]
     fn every_threaded_quantity_is_named() {
         for cpus in 1..=64 {
             for t in crate::run::thread_counts(cpus) {
-                for base in ["reads_per_s", "entries_per_s"] {
+                for base in ["reads_per_s", "entries_per_s", "ops_per_s"] {
                     let q = crate::run::threaded_quantity(base, t);
                     assert_eq!(higher_is_better(&q), Some(true), "{q} is not named");
                 }
             }
         }
-        assert_eq!(higher_is_better("ops_per_s_2t"), None);
+        assert_eq!(higher_is_better("ops_per_s_1t"), Some(true));
+        assert_eq!(higher_is_better("p99_us_2t"), None);
     }
 
     /// A seek floor is judged on both sides: faster than every prior

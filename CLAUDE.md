@@ -32,14 +32,14 @@ of the change that produced the text.
 |---|---|
 | `src/db.rs` | the engine: WAL with atomic batches, memtable, sealed segments, partitioned compaction, tombstones, `Txn`, and the `SegmentWriter` every segment is written by -- `docs/engine.md` |
 | `src/db/zpages.rs` | the compact form's layout: the page, the directory of the groups it holds, the group, the fill that cuts records into groups and packs them into pages, the fence, the trailer and the identity a form file is bound by, with no file, thread or clock in it -- the module's own docs, and `bench/examples/zsize.rs` for what it makes of the engine's bytes |
-| `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`) -- the module's own docs |
-| `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, and the replays that hold it -- the module's own docs |
+| `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`); and the stride form (`Options::zpages_stride`; `zpages_stride_room` keeps it to the builds made while the store in it fits, `zpages_stride_convert` moves a served partition between it and the block form, and `zpages_stride_below`, an arm's, keeps it to the partitions under a key), a partition's values alone at their stride where its keys are one run of numbers -- the module's own docs, and `docs/engine.md` for where it wins and where it does not fit |
+| `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, the replays that hold it, the model of a cache's faults over populations of pages (`model_populations`), and what the reads of a store in two forms cost with the moves between the forms that pay (`forms_cost`, `conversions`) -- the module's own docs |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
 | `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index -- `docs/index-theory.md` |
 | `src/bytes.rs`, `src/blob.rs` | the read path over any byte source; compiles for wasm |
 | `src/wasmapi.rs` | the C ABI the browser calls; hand-written because the module's size is budgeted |
 | `web/` | the browser reader, its byte sources, the Worker it runs in, and the size control -- `web/README.md` |
-| `tests/` | the engine's contract, the read paths held to each other, the format's damage cases; `tests/common` holds what more than one file needs |
+| `tests/` | the engine's contract, the read paths held to each other, the format's damage cases, a checkpoint held to the store it was made of, a crashed store's runs held to its log, the store's lock beside a forked child; `tests/common` holds what more than one file needs |
 | `bench/` | the benchmark suite: its own cargo workspace, the arms, the runner, the gate and the figures -- `bench/DESIGN.md` |
 | `experiments/ffi/` | what a C ABI and a Python binding cost a point read, borrowed against copied, beside LMDB's and RocksDB's C APIs; its own manifest and dated results, and not built by the gate -- its `README.md` |
 
@@ -58,8 +58,9 @@ caller. Nothing is exempt from the format gate, and everything holds to
 
 `sh scripts/deps.sh` readies a host for every group, installing only
 what is missing and ending in an `all deps ready` line to gate on; run it
-first in a fresh container, which has no wasm target and libclang only as
-versioned files. It names libclang through `bench/scripts/libclang.sh`,
+first in a fresh container, which has the stable it was made with and not
+the toolchain `rust-toolchain.toml` names, and libclang only as versioned
+files. It names libclang through `bench/scripts/libclang.sh`,
 the one definition CI uses, and keeps no variable. clang-sys's build
 script declares nothing to rerun on, so the directory it found libclang
 in at the first build stays in its cached output for good: a
@@ -69,12 +70,59 @@ failed at RocksDB's build script, `unable to find library -lclang`.
 `deps.sh` cleans an output that names a directory with no libclang in
 it.
 
-`sh scripts/check.sh` runs every group -- build, test, lint, wasm, bench --
+`sh scripts/check.sh` runs every group -- build, test, stride, lint, wasm, bench --
 and CI calls the same script with the same names, so a green run here is a
-green run there. Use a group name to run one. `quick` is a group too, the
+green run there. Every group denies warnings, the wasm group since it was
+found printing six dead-code warnings and reporting green: the module built
+under cargo's default of warn, and nobody reads a build log that ends in
+sizes. Four were `format`'s superblock constants, which `blob` kept copies
+of from the time they lived in the write path, so on wasm the originals had
+no reader; the copies are gone and the reader names the one definition. One
+was a writer's phase timer that sat in `format` and belongs beside its
+caller in `flatindex`, whose writer half carries the wasm allowance; one was
+`Blob::id`, whose callers are the engine's caches, compiled where they are. Use a group name to run one. `quick` is a group too, the
 suite's quick-scale measurement, twenty minutes or so with half of it
 the threaded scans; it is not in the default set because a
-timing run needs the machine to itself, and CI gives it a job of its own.
+timing run needs the machine to itself, and CI gives it a job of its own. The
+`lint` group is the engine's alone: the suite's clippy and its format
+check run in the `bench` group (`sh bench/scripts/check.sh lint` by
+itself, a minute), and a commit that touched `bench/` alone went out
+behind a green `lint` with a doubled `#[allow]` that clippy refuses.
+And a green `lint` here is the runner's because the toolchain is one:
+`rust-toolchain.toml` names the version, with clippy, rustfmt and the
+wasm and macOS targets, `scripts/toolchain.sh` installs what the file
+names and holds the active rustc to it, and `scripts/deps.sh` and every
+workflow call that script, so no workflow names a channel. Before the pin
+CI installed the stable of the day and a container kept the one it was
+made with: two `chunks_exact` calls over a constant passed here under
+1.97 and failed on every hosted leg under 1.100, whose clippy asks for
+`as_chunks`, and nothing had said so, CI running on a pull request and
+none having run it over the branch since they were written. Moving the
+version is a change to that one file, with whatever the new clippy asks
+for fixed in the same commit and the whole gate run under it; the
+manifests' `rust-version` is the oldest toolchain the crates build with
+and does not move with it. A `RUSTUP_TOOLCHAIN` in the environment
+outranks the file, which the script refuses and a bare `cargo` does not.
+The lint group type-checks the engine for the macOS target too (`cargo
+clippy --release --all-targets --target aarch64-apple-darwin -- -D
+warnings`, which needs the target's rust-std and no cross toolchain):
+three helpers in `tests/zpages.rs` that only Linux's tests call were dead
+code there, and no lint on Linux could say so. The suite has no such
+leg: its comparators compile C in their build scripts, the first of them
+to run (`lz4-sys`'s) hands the host's `cc` `-arch arm64`, and a Linux
+`cc` refuses it, so the suite's would take a cross compiler. What is left
+for the hosted runners alone to show is timing on their hardware and the
+tests run, not only type-checked, on ARM and macOS.
+
+A hosted job's log cannot be read while the job runs, so one that is
+overdue is read by its groups once it ends before it is called anything:
+the macOS leg ran fifty-five minutes where it had run twenty-five, was
+taken for a hang in the fork tests that were new to it, and had spent the
+excess in RocksDB's two builds, the same sources on the same image at
+three times their time, with the tests a quarter slower beside them. A
+runner is that much slower some days. Every job of `ci` has a
+`timeout-minutes` a few times its longest run, since a job without one
+runs to GitHub's six hours, as `cross-arm` did once inside its `apt-get`.
 
 The tests leave their stores under the temp directory, one per test and
 process (`supdb-next-<name>-<pid>`), so a day of test runs on one box is
@@ -97,7 +145,15 @@ stores, and a run whose store another run's cleanup removed mid-test
 fails with a bare `NotFound` from whatever file operation came next --
 eight tests of one run, one of them in six runs alone, before a syscall
 trace showed the store's directory gone and nothing in the process that
-removed it.
+removed it. A pairing's arm is the other way the allowance is found
+spent: `bench ab` at ten million keys exited 1 after the comparator's
+sweep with its own store left behind and nothing in its table or on its
+stderr naming the cause, at zero bytes free; the three gates of the day
+had left fourteen hundred test stores in the private temp directories
+(1.3 GB), and the bench workspace's `target` held 14 GB, 3.6 of it the
+checked profile's example binaries, which the gate's bench group rebuilds
+and nothing reads. Read `df` of the temp volume before a timing run, and
+delete the test stores and the checked examples first.
 
 The test group's compile was thirty-three minutes of a gate's
 thirty-seven, for four minutes of tests, and the cause was in the
@@ -159,16 +215,21 @@ wrapped, passed every check green, and panicked in the first debug build
 that reached it; the tests now run under `profile.checked`, the release
 profile with both on, and the wasm module and the suite's binaries keep the
 release profile because the checks cost code size there and time in a
-measurement. A second definition of "the checks" is how the next one of
-those starts.
+measurement. The workflows' cache step named the suite's target directory
+as `bench -> bench/target`, which `rust-cache` reads as bench/bench/target,
+a path inside the workspace: no such directory, so for as long as the
+suite has been in CI the step restored nothing, saved a cache with none of
+the suite's build in it, and reported both done, while every job built
+RocksDB from its sources twice, half of a test leg's time. It was found
+in the step's own log, which prints the directories it caches, on the
+day somebody read one. `bench/scripts/workflows.sh` holds a cache's
+target to a workspace's own now, and the libclang directory is in the
+cache's key, since a cached clang-sys output naming a directory since
+gone is the failure `scripts/deps.sh` cleans and a workflow does not. A
+second definition of "the checks" is how the next one of those starts.
 
-The same failure has a shell-script form, and this environment invites
-it: `set -e` does nothing here -- a subshell walks straight past a
-failed `grep -q` with status 0 -- so a chain of `checks; then commit;
-then push` that relied on it committed and pushed a tree the format gate
-had just rejected. Gate on `&&`, on the verdict line and not on a `|
-tail` that swallows the exit status, and prove the gate fires on a
-known-red input before trusting it with a push.
+A change to an engine default lands only once `sh scripts/check.sh`
+has passed with the new default in place.
 
 ## Profiling
 
@@ -182,7 +243,12 @@ not what the probe times -- a warmup loop inside the toggle doubled every
 figure once. Name the function exactly: the toggle flips at every
 function the pattern matches, so `*Reader*scan*` turned collection off
 again inside `scan_blocks` and counted a scan without its walk, three
-runs before anyone read the function list. And valgrind runs one thread
+runs before anyone read the function list. Read a recursive function by
+its self rows: callgrind's inclusive figure for a recursive quicksort
+counts each level's children again, so the settle's sort of its pending
+writes read a fifth of a settle's instructions at ten thousand keys, a
+radix was built to replace it, and the settle came out 0.9M of 48M
+instructions lighter, the two percent the self rows had said. And valgrind runs one thread
 at a time: a state the upkeep thread must build while the probe sleeps
 -- the copies after a burst -- is never reached under it, however long
 the sleep, so the copy walk's instruction count cannot be had this way.
@@ -273,7 +339,12 @@ hints them, an fdatasync costs a third of a millisecond and then about
 is free and a sync issued while the CPU has a millisecond of work ahead
 of it is a millisecond of device time hidden (`Options::close_presync`,
 the records synced by the waiting writer while the seal thread composes
-the trailer); a write to the file under a concurrent fdatasync stalls
+the trailer), and a sync handed to a helper is hidden only while nothing
+needs the file before it ends: the log's pre-write moved to a helper
+after the buying commit's sync was waited out whole by the next commit,
+which a write mix makes a few hundred microseconds later, where inline
+its zeros had ridden the commit's own flush (`Options::wal_ahead_beside`,
+refuted); a write to the file under a concurrent fdatasync stalls
 until the journal's commit is through, in some reps and not others, so
 the overlap is read in the drain's stamps and not assumed. So price a
 sync by who issues the fsync and when, not by how much is dirty, and
@@ -565,7 +636,14 @@ the whole page slower (`bench/examples/zlines.rs`), where fewer tokens
 to parse did (`zdecode --hc`: liblz4's high-compression mode, 16% off
 the cold decode and 4% off the form at level 9). A software prefetch is
 a lever on a stall the profile shows as a load; a cold decode's stall is
-its branches. And a decode removed is priced by what it cost: raw tails on
+its branches, and the lever on those is a loop with none on the common
+sequence: the one length byte read whether the token asks for it or not
+and taken by a select, the run and the match moved a fixed sixty-four,
+read a cold group in three quarters of the branching loop's time and a
+learned one in more than its, and every decode the engine makes is a
+cold one, so the scans read a fifth to a quarter faster with the same
+decodes counted (`Options::zpages_flat_decode`). A loop priced on its hot
+figure would have been refuted. And a decode removed is priced by what it cost: raw tails on
 the partition that held half the E mix's decodes took them away and moved
 E by two percent, since that partition's groups came back warm, and the
 next three partitions' third as many decodes moved it by ten -- a heat
@@ -683,6 +761,18 @@ which the kernel counts as minor. Read a thread's
 passes per rep there before reading its cell: a thread that ran in
 two reps of five made a cell that read neither shape.
 
+The threaded scan passes have a counters line of their own
+(`SUPDB_SCAN_COUNTERS=1`, a `scancounters` line a pass, before the mixes
+and after them, the mixes' line's fields): the scans a form file served,
+the groups they decoded, the blocks the handles built and the keys left
+unsealed, which is how the pass after the mixes was read as the same
+decodes down another path. Its read before a pass takes the writer's
+upkeep home, so the pass after it meets a store nothing is filing into,
+and its rates are not a row's. `SUPDB_SCAN_MIXED_FOLD=1` folds the store
+before the scans after the mixes, a probe: the same files with nothing
+overlaid, for telling what those scans pay for the path from what they
+pay for the store.
+
 ## The suite lives in bench/, and it gates this repository
 
 `bench/` is a time series. `bench run` measures every arm -- supdb's
@@ -784,7 +874,15 @@ whole is taken out under a fresh epoch, its pointer nulled, and reused
 for a later block only once no reader is pinned at or before that epoch;
 a reader that finds the block gone reads the record through the run's
 mapping, and one that loaded the pointer first is pinned below the
-epoch and keeps the memory until it leaves. Everyone
+epoch and keeps the memory until it leaves. A segment has one of the
+same kind: its ordered index reads its heads through a pointer the
+segment work moves between the index's mapping and a copy of them in
+the process's own memory (`Options::heads_owned`, `Maint::z_heads_look`),
+the copy whole before the pointer names it, and a copy given up is
+retired under a fresh epoch and freed only past every reader pinned
+before it, by the look that gave it up; every thread that seeks an index
+holds a pin, which is what the rule rests on, so a seek from a thread
+that pins nothing is a seek of freed memory. Everyone
 who reads a state
 pins the epoch it reads in through a slot in the reader table -- a handle
 for each read, the writer for each of its operations, the segment work
@@ -847,8 +945,27 @@ a pass, for longer passes while the writer ran ahead, read level, since
 the trailing thread took several batches a pass already and the share
 bounds the trail that lending's long passes amortise, so a lever on a
 pass's length is read against the passes counted before it is built.
+And the share is the first scan's to pay: a paced batch is held now
+until the thread has filed it (`Options::upkeep_pace_holds`;
+`supdb-ingestpacelends` lends it within the share), since the trail is
+a linear trade -- each write of it saves the burst its filing at every
+batch and costs the first scan after the burst its filing once -- that a
+sum over the burst and the pass reads lending's way at any depth, while
+the cells read it the other way: at a hundred thousand keys the share is
+one batch, the first scan after the full rewrite paid the pass in flight
+and the batch after it, and the pass read 0.9x of `lmdb-nosync` with the
+burst at 2x; held, 1.2-1.3x and 1.5-1.6x.
 `supdb-ingestlendbursts` is the arm that lends every batch and
-`supdb-ingestnopace` the one that files every batch.
+`supdb-ingestnopace` the one that files every batch. A syncing commit
+lends every batch, since its thread files through the fsync, and in core
+it is paced too, within a quarter of a percent of the store's keys
+(`Options::upkeep_pace_syncs_bp`; `supdb-nopacesyncs` lends unpaced):
+unbounded, the thread's trail at the end of a full rewrite was the first
+scan's to wait out or settle, the pass's largest part. Out of core it is
+not paced, since there the thread's resolves are major faults and the
+hold paced the writer by the device; out of core is the compact form
+installed, not the controller's census, which a full rewrite in core
+can enter (`Options::upkeep_pace_syncs_census`).
 One thread holds it at a time, and one word says which:
 every hand-over is a single operation on that word, the side giving it
 up fills the cell before it and the side taking it empties the cell
@@ -910,7 +1027,17 @@ key-section checksum row, whose header words are zero in every older file
 and unread by every older reader, nor the segment's payload in a spare word
 of the superblock extension, for the same reason: a zero there reads as
 "not recorded" and the engine estimates it. Decide which case a change is
-before writing it.
+before writing it. A magic that moves moves the store's format version
+with it (`STORE_FORMAT`, in every manifest's body behind the names, which
+a reader from before it never reads), and `STORE_FORMAT_OLDEST` says
+whether the release still reads the version before; a unit test holds the
+version to the files' magics, so a magic moved alone fails it. Version 2
+is the run's place in the sequence: no segment's magic moved, since a
+reader of segments reads them as it did, but a reader of the log from
+before takes a run's numbers for records missing and the WAL's new kind
+for no WAL at all, so the manifest refuses it first, and a version-1 store
+is rewritten as version 2 at its first open, before anything of the new
+kind is written into it.
 
 **A checksum that cannot see a corruption is not a checksum for it.** Block
 checksums cannot see a flipped bit in an index record -- a flipped `FIXED`
@@ -999,7 +1126,15 @@ list's back only when the writer freezes it; the writer freezes into
 room and waits only when the list is full, for the oldest's readable
 landing; and the count of seals
 (`in_seal`) is read before the state whoever decides against it, so a
-count of zero is one whose landings the state shows. A crash between any
+count of zero is one whose landings the state shows. A store is held by one open at a time, under an exclusive `flock` of
+its `LOCK` taken before the open reads its directory -- an open sweeps the
+segments its manifest does not name, which beside a live store are the
+seals and merges in flight -- and given up last at the close, by an
+unlock and not by the descriptor's close, since a child the process forked
+holds a copy of the descriptor and the lock with it (`StoreLock`); a test
+that emulates a crash calls `Db::crash`, which gives the lock up as a dead
+process's is given up, since a `mem::forget` keeps it and the reopen is
+refused as a second open. A crash between any
 two of those leaves either a WAL that replays the whole memtable, with a
 segment the manifest never named --
 possibly torn -- swept at open, or a complete, named segment plus a WAL
@@ -1041,10 +1176,45 @@ segment open for append: the batch's records, then a commit marker carrying
 their CRC, length and count, then one fdatasync on that file. The WAL never
 sees them (`direct_ingest: false` is the arm that still sends them there).
 Recovery walks the temp file's record stream to the last marker whose three
-quantities agree with the records before it and rewrites what precedes it as
-a piece; what follows is a batch nobody was told was durable. The CRC is
+quantities agree with the records before it and makes what precedes it a
+piece where it lies: the file cut back to that marker and finished as the
+run's close would have finished it (`SegmentWriter::resume_run`), the walk
+standing in for the table as the keys' source; what follows is a batch
+nobody was told was durable. The CRC is
 there because a crash can land the page a marker is on and not a page of its
-batch, and a record whose bytes came back zero still parses. The close is
+batch, and a record whose bytes came back zero still parses. A run stands in
+the store's sequence: its records take one number each, as a WAL record
+does, from the number its file names in its superblock page (`run_note`),
+so the frames and the runs written after it stand past it by exactly what it
+holds, and the manifest's covered sequence is the one watermark for both.
+The open walks the log from that watermark -- frames in their files, and at
+each gap in them and at their end the run that starts there
+(`Db::fill_runs`) -- and takes a run only where the walk reaches its start:
+one that starts past the walk's end is commits a machine's crash kept
+without the ones before them, and is removed with the frames past that
+point -- unless its note says it began with everything before it behind
+a sync (`RUN_NOTE_CHAINED`, a run begun where `Db::owes_sync` finds
+nothing a sync would have to do), where what is missing before it was
+promised: a record lost, and the open refuses, having asked every run
+left before it removes one. A gap no run fills is the log's end where a header says something
+before the file was left unsynced -- `WAL_LOOSE`, and `WAL_LOOSE_RUN`, the
+kind a run that closes unsynced leaves on the file the next frame goes to
+-- and a record lost anywhere else. A run the open takes becomes a piece,
+and until the manifest covers its numbers an empty file named by the range
+(`cov-`) says the gap is held. Every commit writes its batch to the run's
+file, synced or not, as a commit writes the WAL; a sync by policy syncs
+whatever was left unsynced before it, the loose files and the runs that
+closed loose, ahead of the live log or the run in progress, and `sync`
+syncs the run in progress too. The first sync that acknowledges a commit
+of a run fsyncs the directory once, after the run's file, for the temp
+name the file is under (`Db::sync_run`, `Db::dir_barrier`): a file's sync
+does not promise the entry that names it, and a run whose name a crash
+took is every commit of it gone. One barrier a run, none where a
+rotation's barrier for its new log file had the name in the directory
+already, and none in a store whose commits never sync, whose landings'
+directory fsyncs carry it; a barrier that fails fails the commit, and a
+run that closes owing one is the next sync's, as a run that closed
+unsynced is. The close is
 the seal's shape with one difference: the finished segment is hard-linked
 under its piece name rather than renamed, and the temp name stays until the
 manifest names the segment, because a name the manifest lacks is swept at
@@ -1064,9 +1234,10 @@ writer's CPU and moved the load 4% in twelve pairs, short of the tenth it
 was predicted to, so the references are an arm. What ships is the table
 whose arena is the record stream (`Options::direct_stream`): a value is
 laid out as its record at the append and the commit writes the batch to
-the file from the arena, a whole write piece at a time as the buffer
-path's pieces reached it, so the staged copy and the piece buffer's pages
-are gone from the writer's faults and the copies are the arm
+the file from the arena, the whole write pieces it completes as the buffer
+path's pieces reached it and the rest behind them, so the staged copy and
+the piece buffer's pages are gone from the writer's faults and the copies
+are the arm
 (`supdb-copyvals`, `supdb-ingestcopyvals`). The segment writer kept two
 more copies of every key for the close -- its own key, span, offset and
 hash for the key section and the Bloom, and the ordered index builder's
@@ -1114,6 +1285,24 @@ the entries' range (`Options::direct_log_range`; `supdb-ordlog` and
 write and a fresh page a thousand that said nothing the entry count
 did not, and whose tail the truncation of an uncommitted run never
 trimmed. A run that kept no table at all is the shape left to price.
+
+**A file a store names never changes.** A segment, its ordered index
+and its form file are each written under a temp name and renamed or
+linked into place, and nothing writes one after that: no patch in place,
+no writable mapping. `Db::checkpoint` rests on it. A checkpoint is hard
+links to the files the manifest names, with a manifest of its own, so a
+byte changed in place under a name is changed in every checkpoint that
+shares the file, with nothing raised in either store, and a file rebuilt
+in place -- truncated and written again -- is torn under whoever has it
+mapped from the other one. A change that needs other bytes under a name
+writes a new file and renames it over the old, which leaves the other
+store's link on the old inode: an ordered index an open finds torn is
+composed again that way (`write_ord`), which is why a checkpoint may
+share one that was never synced. The checkpoint is made by the segment
+work, the one side that retires a segment, so no name goes while it is
+being linked; and it is built under a temp name and renamed, because an
+open of a directory with segments and no manifest takes every segment
+it finds for the store.
 
 ## Shapes the bugs come in
 
@@ -1266,7 +1455,19 @@ through a handle bumped seven to thirteen shared statistics, and four
 handles read the threaded scan mix at ten thousand keys at 0.46x of
 LMDB, 0.91x with the counters off. A handle's statistics live on its
 slot's line now, and the one word the writer must see, the regime's
-scan signal, a handle bumps once per commit and not once per scan.
+scan signal, a handle bumps once per commit and not once per scan. And
+a third time as a count kept on the thing counted: a form file counted
+the groups its walks decoded into their own buffers in one word of the
+file's, which was once a scan while such decodes were an arm's and
+became once a group when a walk's first touch of every group was made
+one (`Options::zpages_scan_admit`). Every single-threaded cell of that
+pairing read ahead and the threaded scan pass read 0.90-0.96x in both
+orders, two and three handles storing to one line a group; with the
+count on the handle's memo, beside its hits and misses, the same pass
+read level. A statistic of a shared structure is kept by whoever does
+the counting and summed where it is read, and a counter is priced again
+when a change moves the path it sits on from the rare case to every
+operation.
 
 **A join that walked the long side for an empty short one.** A block
 table maps a source's positions against a partition's block boundaries
@@ -1320,6 +1521,30 @@ before a read met the pair, and reader threads beside a writer that sealed
 every few hundred puts met it in their first minute. The pieces over one
 fence now order by the sequence their names carry, and a read's
 "oldest to newest" is a property of that order and not of the names.
+
+**An order that held by fence.** The pieces sorted by fence and then by
+sequence, which is an age order wherever the pieces that meet share a
+fence -- every piece aligned -- and wherever a piece cut at fences a merge
+replaced meets only pieces cut finer, which every merge over given ranges
+cuts. A first partitioning planned against a store with none joined a merge
+in flight that was a first partitioning too, and went on with no fences
+over the store the join had partitioned, cutting it again from every key at
+fences that refine nothing. A seal frozen while it ran was cut at the old
+fences and a seal after its landing at the new, a new range opened below
+the old piece's fence, and the newer piece over a key sorted ahead of the
+older: a read took the older piece's tombstone for the newest source and
+answered the value before the last put, the merge that folded the two
+wrote it, and a store kept from the differential fuzz's failure read it
+so at every open. The doc that said reads were ready for a piece over ranges it was not
+cut at was right about the ranges and silent on the order. Once a piece is
+unaligned the pieces sort by sequence alone (`sort_segs`), every sort holds
+each piece behind every older piece it meets under a debug assertion, and
+`tests/fences.rs` builds the re-cut with the old piece sealed beside it
+(`Db::hold_merge_start`). The rule: an order a rule rests on is the order
+of the quantity the rule is about, and where a cheaper key gives the same
+order only under a property of the history -- that every re-cut refines --
+the order is taken from the quantity wherever the property can fail, and
+asserted where it is made.
 
 **A form dropped by its writer stayed published.** The writer keeps
 its own copy of every block form and publishes a clone for readers to
@@ -1377,7 +1602,15 @@ on one line; the divider's latency is what it cost. The rule: in a
 loop measured in cycles an entry, read the assembly for the
 instructions whose cost is not their count -- a divide, a call through
 a pointer, a store the next load depends on -- and give the common
-shape a path without them.
+shape a path without them. It came again where the compact form's walk
+was given the raw walk's fast path: the check that a fixed run's length
+is a whole number of its values divided by the count, a sixteen-bit
+divide with its remainder tested at once, for a count that is one in
+the common record -- a twentieth of the threaded scan pass over the
+compact form at ten million keys under 1.25 GiB, every sample on the
+test after the divide (`perf annotate` of the scan threads' window, cut
+by `SUPDB_LAG_MARK`'s phase marks). A fast path copied from another walk
+is read for its divides again, since its guards came with it.
 
 **A value built a field at a time and handed back whole.** The scan
 snapshot's cursor, generalised to a base a frozen table, folded each
@@ -1844,9 +2077,50 @@ of a piece kept across a merge bet that a merge of four hundred thousand
 keys would outlast a seal of twenty, and the bet lost once under the
 gate's load, with a guard naming the case not reached; it holds the
 merge's landing now (`hold_merge_landing`) until the piece has published.
-The rule: a test that
+And as a builder: the test that a publish's builder has its forms
+installed by the next commit under the upkeep thread passed, in most
+runs, because the commit's fill built the blocks -- the builder had
+started at the seal's freeze, its forms were dropped as another
+generation's once the landing published, and the builder for the landed
+state started at the commit after the hand-over, installed only where
+its post beat the thread's pass, which it lost one run in sixty. The
+engine's counters printed at the assertion (`forms_events`) told the
+three shapes apart, and `settle` now starts and joins the builder for
+the state that stands under that arm. And as an fsync: the test that a
+syncing commit with the pace's model off
+(`Options::upkeep_pace_syncs_model`) returns with its batch unfiled bet
+that the upkeep thread's pass would outlast the commit's fdatasync,
+and on a host whose fsync outlasted the pass every batch was filed at
+the return, two runs of the whole binary in five; it holds the thread
+before its pass now (`hold_upkeep_pass`), and a commit that waited would
+never return, which its watchdog says. And as a step: two controller
+tests read the state between the builder's first job and its second by
+the counts after a tick, on the bet that the second waited for the
+controller's next step, a tenth of a second on. With the builder's turn
+at a job's end made the default (`Options::zpages_drive_at_job_end`)
+the second job followed the first in milliseconds and both tests failed
+every run, the gate's first under that default among them; each of the
+three defaults turned off alone named the one. The test of the
+conversion's order holds the first job before its rename and the second
+at its start now, under either turn, and fails on a tick that starts a
+conversion ahead of a partition's own build; the test whose order is
+read off the warms taken in a job a step pins the turn at the step. And
+as a poll: two tests of the builds at a merge's output finish sealed
+their last piece and waited to see its merge in flight, a merge of one
+partition that is in flight for five milliseconds, under a poll every
+five. A poll a few milliseconds late found it landed and nothing left to
+merge, and sat out its ten seconds: one run in 240 beside seven other
+processes, the first run on a hosted runner, and every run with the wait
+made 300 ms late. The wait reads the merges landed since the seal beside
+the one in flight (`wait_for_merge`), which a merge that came and went
+satisfies as one caught does. The
+rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
-thing it bets against gets faster.
+thing it bets against gets faster; a state the test needs only to have
+happened is waited for by the count it leaves behind, never by catching
+it; and a test that passes is read for
+the path that passed it, since a fallback that does the same work
+passes it too.
 
 **A test whose answer was a function of the clock, or of a thread's
 turn.** The superblock records the second a segment finished in, in each
@@ -2211,6 +2485,142 @@ injects the failure for the test. The rule: an fsync's error is consumed
 by the call that sees it, so the result of every sync on a path is
 checked by that path and never left to a later sync of the same file.
 
+**A hand-off that left the old run's end with its new owner while the
+giver went on.** A run of ordered ingest goes to its file a write piece
+at a time, and a run that closed was handed to its seal with its last
+piece still in the writer's buffer, for the seal's thread to write with
+the trailer. Under a policy that syncs at every commit the buffer is
+empty at every commit. Under one that does not, the writer went on into
+the next run, and that run's first whole piece reached its own file
+before the seal's thread had written the old run's end: a process killed
+between the two left the first run's file short of its last commits and
+the second holding later ones, and the open recovered both --
+acknowledged batches gone from the middle of the history, batch 290 of a
+load there and 287 to 289 not, where `SyncPolicy`'s own words are that an
+unsynced tail is lost whole and never served in part. Nothing raised and
+every file was well-formed; `tests/kill.rs` killed a durable writer and
+no other. The suite's recovery workload found it in its first whole row,
+at the one rung whose load crosses the seal threshold just before its
+end (`bench/CLAUDE.md`, a guarantee matched on one kind of crash), and
+the engine's test holds the seal's thread so that the window is as wide
+as the kill needs. The writer wrote a closing run's records before the
+hand-off first (`Db::close_run`), which left a process's death the open
+run's end to take: up to a megabyte of acknowledged commits, two to eight
+batches of the suite's load, where a commit to the WAL and the
+comparators' unsynced commits lose none. Every commit writes its batch
+now (`Db::commit_direct`), priced in the tree that measured by an arm
+that wrote at every commit beside one that did not: nothing resolved in
+thirty-six pairs at ten, a hundred and three hundred thousand keys, the
+reads and the scans level, where the stream's second shape, written at
+every commit, had read every pass over the segment behind. Two builds
+alternated, each against its comparator in one process, put the price
+on the buffered ordered load: three to four percent at ten thousand
+keys in two sittings, where the load is ten commits and each is now a
+write, and nothing at a hundred or three hundred thousand, with the
+mixes level; and the load's device bytes rise by a page for
+every sync that lands inside a run -- the writer helper's and the
+drain's -- since the file now ends mid-page where it ended on a write
+piece, and the page a sync catches half full is written again when the
+next commit fills it. The durable arm's file has always ended so. The
+rule: where work is handed to another
+thread and the giver goes on, whatever orders the giver's later effects
+behind its earlier ones is finished before the hand-off, never left with
+the receiver; and a guarantee stated of one path, here the WAL's, is
+tested on every path that bypasses it. What a machine's crash could
+still take is the entry after this one.
+
+**A history in several files, ordered by nothing a crash keeps.** A run
+of ordered ingest kept its records in a file of its own and took no
+sequence numbers, so nothing on disk said where it stood: the open took
+every run it found, each to its own last marker, and replayed the log
+beside them. A process's death leaves every file whole, and with the
+hand-off above fixed the order no longer mattered to it. A machine's
+crash under a policy that does not sync every commit keeps whichever
+pages the kernel had written, and those are not the oldest: a later run's
+megabytes written back while an earlier run's last pages sat dirty, or
+frames in the log behind a run whose file had not reached the directory,
+came back as commits served without the ones before them. Three more of
+the family stood beside it, each read off the code while the fix was
+being placed and none with a test. `sync` over a run in progress synced
+nothing, since it synced the log and the log holds none of a run's
+records. A sync by policy under `EveryN` synced the file it was writing
+and started its count over, leaving frames, or a run, written before it
+and never synced behind an acknowledgement that covered them. And the
+open made a recovered run durable, as a piece the manifest named, in
+front of log frames a killed writer had left in the page cache alone. A
+run's records take sequence numbers now and its file says where it
+starts; the open walks the frames and the runs as one history from the
+manifest's watermark and ends it at the first loss (the ordered ingest
+paragraph under the crash discipline has the whole of it); every sync
+that acknowledges covers every file written before it; and the open
+syncs the log before it names a run's piece. `tests/runlog.rs` builds
+each state a lost page leaves, by stopping a writer with its seals held
+and cutting a file back or taking it away, since no test can pull the
+plug. A directory barrier for a run's temp name went in beside the fix,
+on the engine's own word that a file's sync does not promise the entry
+that names it, came out on its price, and went back in. The price was
+real and small: the durable ordered load at ten thousand keys a
+thirtieth slower in the before-and-after pairing, `strace -T` putting
+the barrier at a tenth to a quarter of a millisecond once a run, on a
+load of ten commits -- a flush of the device with nothing to write,
+since the file's own sync has forced the journal commit that carries the
+entry -- and nothing that resolves from a hundred thousand keys. Priced
+again as it went back, the two builds alternated eight times, each
+against its comparator, it read a tenth of a millisecond on a run's first
+commit in every pair (`SUPDB_LOAD_PHASES`, the `first` column), the
+commits after it level, and the load's total slower in three pairs of
+eight; the rate against the comparator leaned a twentieth, and so did
+the comparator's own load between the two builds, code the change cannot
+reach. What it
+had been traded for was the wording of the guarantee: without it a
+commit acknowledged as durable rested on what ext4 and XFS do with a new
+file's first sync, which POSIX does not promise, and a name that went
+missing was refused at the open only where log frames followed the run.
+The rules: a history kept in more than one file is ordered by a
+number every file carries and one durable watermark, so that what stands
+behind a loss is found by arithmetic and not by which files happen to be
+there; a sync that acknowledges is a sync of everything written before
+it, wherever it went, and its test is a count of what it left unsynced on
+every path that writes; a recovery that makes something durable makes
+durable what stands before it first; a crash a test cannot cause is
+built, since the kill tests had killed processes for a year and a
+process's death cannot tell `EveryN` from `Always`; a barrier added
+beside a fix is a change of its own, priced on the smallest rung, where
+one of anything is a share of the pass; and the price is then weighed
+against what the barrier promises and not against the pass, since a
+thirtieth of the smallest rung had bought back a durable commit that
+depended on the filesystem under it, which no row measures and a reader
+of the guarantee takes for granted.
+
+**A flag set on the word of a comment, found by the next thing to trust
+it.** A reopened log counted the frames it had replayed as synced, under
+a comment that said they were "read back from the device". A killed
+writer leaves its unsynced frames in the page cache, and the open reads
+them from there: a `sync` after the reopen found nothing to sync and
+returned over them, and the log's older files were on no list at all, so
+the first sync by policy after the reopen marked the live file's header
+chained over files it had not synced. Nothing found it for as long as
+the flag stood, since no test reopened a killed store and then asked
+what a sync had left.
+What found it was a new reader of the same predicate: a run of ordered
+ingest now says in its note whether everything before it was synced as
+it began (`RUN_NOTE_CHAINED`), the open refuses a gap before a run that
+says so, and a run that said so falsely is a store that will not open
+after a crash it should have survived -- so every state that reaches the
+question was read for whether its answer was true, and two were not: the
+reopen, and a drain that failed, whose closed run was unsynced and on no
+list. The replayed frames count as unsynced now and the older files are
+the first sync's; a failed drain's run is loose as any run that closed
+unsynced is (`Db::drain_run`); and the question has one definition
+(`Db::owes_sync`), asked by the syncs and by the run. The rules: read
+back is not synced, and a flag that says "durable" is set by a sync this
+process issued or by nothing; a predicate a new mechanism leans on is
+audited at every state that reaches it, the recovery's and the failure's
+first, since the old callers only ever asked it to decide a sync that a
+wrong answer made cheaper and never one that a wrong answer made fatal;
+and where a wrong "yes" refuses a store, the tests build the states
+where the answer is "no" and hold the open to opening.
+
 **A length read off the slab that held the exceptions.** The ordered
 table's write log became the range of its entries, its length the
 entries' count, and read that count off the entries' slab; the one-word
@@ -2499,7 +2909,33 @@ allocate, and the count of anonymous bytes resident beyond the allocator's
 use is lowered by any allocation from a free chunk already resident: a
 dead arena of thirty-two megabytes read as nine in one run of the whole
 `db` binary, so that test has a binary of its own (`tests/resident.rs`), as
-the allocation count has (`tests/leak.rs`).
+the allocation count has (`tests/leak.rs`). A fork is such an effect on
+every descriptor the process holds. The crash oracle in `tests/runlog.rs`
+spawns its writers beside tests that open stores, a child holds a copy of
+each store's `LOCK` from its fork to its exec, and a `flock` is the open
+file description's and not the descriptor's: a store one test closed and
+opened again inside that window was refused as open elsewhere, the
+child's copy holding the lock the close had given up. Once on a hosted
+runner; with the child held 30 ms before its exec, two runs of the binary
+in eight, the same test at the same line; none of thirty without the
+oracle. The tests there were kept apart from the oracle's spawns by a lock of
+their own for a while, and the engine answered a caller that forks with
+the same refusal for as long as the child took to reach its exec, or for
+the child's life where it never does: a `fork` with no exec, which is
+what Python's `multiprocessing` makes of a process holding a store
+through a binding. The close unlocks the `LOCK` now, which gives it up
+for every copy of the descriptor at once, where closing the descriptor
+gave it up only with the last copy (`StoreLock`'s `Drop`). With the
+tests' lock taken out and the child held 30 ms before its exec, the
+binary failed nine runs of thirty before the unlock, at the same test and
+line, and none of sixty with it, nor any of twelve with the child held
+300 ms; the tests' lock stays out, since it would hide the
+close's going back, and `tests/lock.rs` builds the window on purpose, the
+child stopped in `pre_exec` while the store is closed and opened. The
+unlock is the taking process's alone, by its pid: it reaches every copy,
+so a forked child that dropped its copy of a `Db` would give up its
+parent's lock with the parent's store still open, which the unit test
+beside the type forks to hold.
 
 **A call site no real input reaches red.** The suite's refusals after the
 read pass and after the shuffled load were green-side only, because a real
@@ -2633,6 +3069,33 @@ piece's ranks gave, applied to the keys a table files: a position taken
 against an object is kept only under that object's identity, and a
 carry that keeps the structure across a replacement of the object
 re-takes every position it holds, not only the ones a form holds.
+
+It came a third time as a flag. A copy whose entries are its block's
+records says so (`CachedBlock::identity`), and a patch writes the
+key's entry at its cut less the block's first rank where it does,
+without a search; the copies are what that carry keeps, on the reading
+that their key range is the same on both sides, which is true of their
+keys and not of their ranks. A delete and an insert in one block keep
+the boundaries and the count, and when their writes were lent to the
+upkeep thread and still unsettled at the freezes, the settle filed them
+after the rebase, through the tables the freezes replaced: the inserted
+key resolved to a record of the new partition, and the copy, still
+claiming its identity, took that rank for the key's entry and wrote
+the value over another key's. In the checked profile the assertion
+beside the patch fired, fourteen runs of eight hundred of the
+differential fuzz's seed 1050 under the cache and the option draws and
+none with the fix; in a release build nothing raised. A copy holds its
+identity of the partition its build read now (`CachedBlock::identity_for`,
+the blob id beside the flag), and `tests/settle.rs` builds the state
+by holding the upkeep thread before its pass while the seals and the
+merge land. The walk's start by rank honours the flag the same way,
+though no state was found that walks such a copy before the insert
+that moved its ranks is filed and clears the flag; the prefetch that
+asks for a patch's lines by rank does too, and only aims a prefetch.
+The corollary: a carry is checked against every claim the carried
+structure makes about the object it was derived from -- its positions,
+and the flag that says its entries are the object's own -- since a
+claim kept in a boolean is a position no search will ever re-take.
 
 **A cache a thread kept of things a store had closed.** The memo of
 decoded groups was the thread's, keyed by the form file's attach identity
@@ -3417,11 +3880,2581 @@ count moves, so it is read with that count beside it; and a burst slower
 than its commits is read against the writer's CPU and its holds before a
 syscall is suspected.
 
+**A background job's I/O class, priced by the device's queue.** The
+full rewrite's lag pass under a bound ran beside its merge chain, the
+scans' faults waiting behind the merges' reads and writes, and the obvious
+lever was the block layer's idle class for the merge thread, so the
+readers' faults would be served first. Paired at ten million keys under
+1.25 GiB the pass read three times slower under it: the merges, served
+last, never drained inside the pass, 160 pieces stood at its end where
+the default left 6, and every scan touched a page of every piece over its
+range -- four times the major faults, and the tenths flat where the
+default's fall tenfold as its chain drains. Under a bound a merge's I/O is
+the readers' I/O deferred, and a class that puts the readers first hands
+them the pieces. The rule: a background job that reduces what the readers
+have to walk is priced by the pieces the readers meet, never by the device
+queue it stands in; and a lever on a shared device is read against the
+count of what the other side left undone before it is read against the
+rate.
+
+**A prefetch aimed at a device that was not waiting.** The merge chain
+inside the full rewrite's lag pass reads each input through a mapping, one
+kernel readahead window a wait behind the scans' faults, the shape whose
+ask-ahead had halved the controller's build; the same ask ahead of the
+merge's walk fired -- six hundred windows, two gigabytes asked, counted --
+and the pass did not move by a tenth of a second in either rep, with the
+device bytes inside it identical. A prefetch moves a wait earlier; it
+moves no byte, and a device carrying 4.5 GB in eleven seconds beside the
+scans is not waiting for anyone's request. The rule: before a prefetch is
+built, read the device's bytes over the window beside the thread's waits
+-- a walk whose device is saturated gains nothing from asking sooner, and
+the lever on it is the bytes or when they are paid; and a lever that
+worked on one walk is priced on the next by the counter that says it
+fired, since a mechanism firing to no effect is a refutation and not a
+bug.
+
+**A thing kept for a reader, freed by whoever published next.** The tables
+a publish replaced are kept for the writer's upkeep's look
+(`State::replaced`), and a publish trimmed the list to the tables since the
+look; the look itself, having read a table, dropped nothing. A store only
+read after its writes publishes nothing for seconds, so a replaced memtable
+of a hundred megabytes and the seal's snapshot copy of it, another hundred,
+stood through a pass of scans under a bound that could not spare them,
+named by the lag census (`mem_replaced`, `snap_tables`) in one arm of a
+pairing and absent in the other, since the other's chain of landings had
+happened to publish after the look. The list is behind a lock and the look
+drops what it has read where the state stands (`tests/db.rs`). The rule:
+whatever is kept for a reader is freed by that reader when it is done,
+never by an event that may not come; and a retention that a pairing's
+census shows in one arm alone is read as a timing the other arm escaped
+before it is read as that arm's.
+
+**A rule right for a build and wrong for an attach, and a reading dropped
+at every landing of a chain.** The form files a merge's outputs are given
+at their finish (`Options::zpages_build_at_finish`) stood on disk beside
+every partition through a sweep of scans while the controller read raw,
+in three reps of four, and the arm's pairing read as a loss; the trace
+line, given the buy clause's inputs (`ZSelect::buy_state`), said
+`suspended true` from the load's end on. The wasted-build budget suspends
+building for a dwell of sixty seconds once more than half the last eight
+builds were superseded, the load's merge chain had superseded the builds
+ahead it ran beside, and the suspension refused an attach as it refuses
+a build -- a rule for the builder's wasted CPU applied to a purchase that
+wastes none. And where the attach was not refused the reading was never
+there: a sampler's reading is of the partitions at a generation and is
+dropped when one arrives at another, so under a chain of merges -- a
+landing every half second, a sample longer than that -- no reading ever
+reached a step, and forty-one samples ran through one pass of fifteen
+seconds, each over every partition's pages on the thread the landings go
+through. The suspension holds off builds and never an attach now, a trip
+during an attach suspends the building of the rest without cancelling it,
+and where files land under the store's own writing the reading is
+refreshed against a count of them in place of a sample
+(`Maint::z_sample_refresh`). The default flipped under the gate then found
+what the arm had never met: the refresh stood in for every sample, and one
+made from a sample that had declined -- taken over no partition, before
+the drain's first landing -- priced a build at nothing, refused the
+attach and stood at the generation, so fourteen tests never reached
+COMPACT; the refresh hands a reading only where the files on disk cover
+the keys, from a sample that did not decline, and elsewhere the selector
+samples as before. The rule: a guard is tested against the kind
+of purchase it was written for, and a reading that a changing input
+invalidates is refreshed from the part of it that changed, or it never
+stands for long enough to be read -- and a stand-in for a measurement
+stands in only where it carries what the measurement would have carried;
+and a controller's refusal is read off its clause's inputs on the trace
+before its evidence is reasoned about, since four clauses looked satisfied
+from the fields the line carried.
+
+**A pick at the budget's edge, flipped by a partition in flight.** The
+coding gear picked the raw-tail form wherever the model predicted it fit
+the budget, and a pick holds for the builds after it while the budget
+moves: a form that fits at the load's end is a form the mixes may not
+hold, since the budget subtracts the process's memory at the sample and
+fell by a quarter through the mixes at ten million keys under 1.25 GiB.
+There the raw-tail form sat at 97-99% of the budget, and one pass of four
+sampled 28 partitions with one in flight where the others sampled 29: the
+pick flipped with the count, that pass built every form file again at the
+larger coding and refaulted through every mix, C and E at 2.6-2.8 and
+2.0-2.3 times the others', with the engine and the arm the same in all
+four. The
+cells had been read as bimodal, the shape the host's two speeds have,
+until the table's `zpage_builds_raw_tails` read 29 in one arm and 0 in the
+other and the trace's `zsample` line named the pick. The line is at the
+share of the budget the re-code policy already leaves to the page cache's
+other tenants (`zselect::FORM_FILL`), one constant for both; a fix for a
+wrong answer and not an arm, since the shape before is the pick at the
+edge. `tests/zpages.rs` builds the shape, a budget the raw-tail form fits
+whole and fills past the share, and the selector's unit test holds the
+two partition counts to one pick. The rule: a choice made once for a
+store's life is made with the headroom its inputs will lose, never
+against their value at the sample, since a line at the inputs' edge is
+crossed by whatever moves them next -- here a partition in flight; a cell
+that reads bimodal under one engine and one arm is two decisions and not
+noise, and the counter that names the decision is read before the cells
+are read as the host's; and two policies that bound one quantity bound it
+at one line, named once. It came again from the other input. A reading
+taken while the lag sweep's store at ten million keys was still being
+loaded, fourteen partitions of the twenty-four it would hold, picked the
+raw tails at 601 MB under a fill share of 940; the store doubled, every
+output's form file was built raw-tailed at its finish, and a form the size
+of the raw records was installed and served through the sweep, its passes
+two to three times the other reps'. The count that named it was the groups
+decoded, zero through the whole sweep, and the trace's reading line was
+nineteen seconds into a load of thirty-six. A raw-tail pick is taken back
+where the records have grown past the fill share since it
+(`Maint::z_repick`), and a file on record in the refused coding covers
+nothing. The corollary: a decision held for a store's life is taken again
+wherever an input it is a function of is read again, and a pick made over
+a store still being written is a pick over a store that does not exist
+yet. And the take-back was a second cost of the first: the arm whose
+reading came in the load built a sixth more form files and gave back up to
+twenty-four of them. A pick for readers waits for a reader now
+(`Maint::z_pick_raw_ok`). The corollary's corollary: a decision that has
+to be repaired when its input moves is not made before the input exists,
+since the repair costs what the early decision bought.
+
+**A fill that held the writer for forms nobody read, and a wait that was
+faults in disguise.** The upkeep thread's pass settles the commit it was
+lent and then fills the table: a form for every block an unsealed key
+overlays that holds none, the builder ahead's work done on the pass where
+no builder runs, as out of core. The writer's next scan takes the upkeep
+back and waits for the pass in flight, and nothing in the fill asked
+whether it was wanted: at ten million keys under 1.25 GiB E's scans waited
+735 ms of 6.7 s on 832 passes whose settles took 19 ms and whose fills
+built 143 forms each, 119,000 over the mix, for blocks the scans never
+read -- the walks met the same forms with those builds and without them.
+The pass's whole yield (`upkeep_yields`) had been priced as a trade and
+left off, since it cut the settle and the scan then settled the residue
+itself; only the pass's steps timed apart on the thread's clock
+(`Db::pass_steps`) told the step the writer needed from the one it did
+not, where a profile of the thread put its time in builds and decodes,
+which is what a fill is made of, and said nothing about who waited for
+them. The fill gives the writer its upkeep back at its next block now,
+the settle whole and the pass published (`Options::upkeep_fill_yields`;
+`tests/db.rs` holds the fill cut at a block for the writer and whole
+without the option) -- and the pairing read level, the wait gone and the
+writer's minor faults doubled: E is the only mix that scans, so it builds
+its whole block cache inside its own window, 137,000 forms and 97 MB of
+first touches that are reclaims of about 10 µs each under a group at its
+limit, and the thread's builds had been taking them while the writer
+waited, leaving the pages warm for the writer's own builds once the forms
+were dropped. The trim thread trimmed nothing in either arm (`trims 0` in
+the census) and an arm with no trim thread read the same faults: not a
+churn, the cache's building itself. The yield stands; the building is the
+lever. The rule: a wait for a worker is decomposed by the worker's steps
+before it is priced as the worker's work, since a step the waiter needs
+and a step it does not are one wait from the waiter's side; a yield is
+placed per step, because the steps differ in what stopping them costs;
+and a wait removed is read beside the waiter's own counts after the
+removal -- faults, CPU -- since work a worker did for nobody can still
+have been paying a bill the waiter inherits.
+
+**A reading that waited for the period of the thing it fed.** The controller's sampler took 0.4 s at the crossing to fill thirty-two ranks of every partition in two codings and estimate a form whose files were on disk to be measured, and the reading it gave was bought only when the model was next recomputed with it, at the model's period of a second: the buy on the prediction compares the model's raw and compact predictions, the compact one has no value until the model has the form's size, and nothing recomputed the model when the size arrived. The install came 1.1 s after the crossing, two thirds of the row's divided C at ten million keys under 1.25 GiB, every read before it raw, and C read 0.68x of LMDB. The event-level trace had shown the sample land and the buy come with nothing between them; the step-level one (`zselect t=`, printed at every SUSPECT step with the census's ops and the rewriting flag) named both waits. A reading's landing resets the model's period now, and where the files on disk cover the keys the reading is made from the files in the tick that wants it (`Options::zpages_reading_from_files`). The rule: an input that arrives on its own clock recomputes whatever is a function of it, since a period alone leaves the function stale for the rest of the period; and a measurement that estimates a thing already built is replaced by reading the thing, since the estimate is paid while the thing stands there; and a wait inside a controller is read off a trace of every step, not of the events, because the step that declines is the one with nothing to print.
+
+**A comparator's warmth is the passes before the cell.** The pairings that priced C and E out of core ran the load and the mixes alone, and read C 1.43x and E 1.10x of LMDB at ten million keys under 1.25 GiB; the banked row, whose read and scan passes and their threaded passes run before the mixes, read 0.74x and 0.60x, since those passes bring LMDB's B-tree in until it faults on half a percent of its reads and runs near its in-core rate. Our compact form is unmoved by the warm-up -- it faults on nothing in either shape -- so the ratio turned on the comparator's cache alone, and the cells became a race of instructions against a B-tree in core, which the form's decode loses. Under a gigabyte, where LMDB's file leaves core too, every cell is ours by 1.6x to 4.5x. The rule: a pairing against a comparator is run in the row's pass order, not in the passes the question names, because the comparator's cache is a function of everything that ran before the cell and the engine's own form may not be; and a cell lost against a comparator in core is read for the regime it is in before it is read as the engine's -- the bound under which both engines read from the device is where the second form is for, and a row's bound is checked against the comparator's fault rate, not against the file sizes it was drawn from.
+
+**A policy that took its gate from the policy beside it, and read its heat in the units of two counters.** The hot-raw policy's turn (`Options::zpages_hot_raw`, the hot partitions served raw beside the form files of the rest) was written beside the re-code policy's and took its condition -- the builder idle and nothing to build -- which a re-code needs, since a re-code is a build, and a release does not. At the bounded rung the load's drain lands its last five partitions after the crossing and the controller builds their form files through the first mixes, so in a pairing of the mixes the policy never looked (`zpage_hot_looks` 0 in both arms) and the pairing read the instrument's cost alone, a tenth against the policy's arm in one rep: the shape a policy that costs and does nothing has. Then three readings of its heat were wrong before one was right. A served form file's heat was its decode *time*, and a decode's time holds the fault on a page not yet in, so under the uniform read pass the partitions whose files were coldest read hottest and two were released for it; the counts are the heat now, every count priced at the store's mean decode. The skew was the partition's share of the heat over its share of the keys, and the first window after the install is thin -- the files attached and warmed inside it -- so one partition in twenty-four read 1.3x its share on noise and was released; the skew is read against the median partition's reads a key now, over a window of at least thirty-two sampled events, which a uniform pass never crosses and the Zipfian's second to fourth partitions, at 1.2x their share of the keys but two to four times the median, do. And the window's count was taken as the form files keep it, sixteen times the samples, beside the raw partitions' count in samples, so a raw partition read sixteen times colder than a served one and the swap rule would have churned; the test's trace showed a heat sixteen times the arithmetic before any pairing ran on it. The rules: a gate copied from another mechanism is derived again from what this one needs, and a pairing of a policy is read after the counts that say it acted in its arm -- its looks and its moves -- since a policy that never acted prices nothing but its hooks; a measure of heat is a count and not a time wherever the time can hold a wait; a share read from a window is read with the window's size beside it, and against the median of its peers rather than a nominal share, since the peers carry the same noise; and two counters compared are brought to one unit first, the trace printing both so that a factor of sixteen is read off the arithmetic and not off a pairing.
+
+**An instrument of the profile read as the engine's.** The row's E at
+ten million keys under 1.25 GiB, the hot partitions raw and the rest
+compact, put 73 of its thread's 962 samples in `clock_gettime` where
+LMDB's E put 11, and the difference was read as the census window's two
+stamps an operation, the clock at every counted operation's start and end
+for the busy wall its fault price is drawn from. A lever was built for
+them -- one operation in sixteen stamped once a window is a thousand
+operations long (`Options::zpages_census_sample`), every operation of a
+shorter window still, since a window that short is one of slow operations,
+the faulting regime the price is for -- and paired in the row's shape
+against the arm that stamps every one (`supdb-zbusyevery`) E read 0.98x in
+both reps, under the pairing's resolution. The profile taken again
+without the harness's counter variable put the thread's clock samples at
+one of 973: the profiling script had set `SUPDB_MIX_COUNTERS`, which turns
+the scan timers on for the supdb arm and for no comparator
+(`bench/src/engines.rs`), ten clock reads a scan the row never pays, and
+the census's stamps were the rest. This file already said that a cell
+against a comparator is read from a pairing with the counters off; a
+profile is the same measurement, and the symbols the comparator lacks are
+the first place the instruments the environment turned on show. The rule:
+a profile is taken under the row's environment and nothing more, and a
+symbol the comparator does not have is checked against the instruments
+before it is checked against the engine; and a lever built on a reading
+is held to the reading after it is built -- here the clock samples --
+before it is held to the rate.
+
+**A run written for the store with nothing unsealed, measured on the one
+with something.** The block walk's clean run joins every clean block after
+the one it stands on into one walk of the partition, so that a scan of a
+hundred over a drained store is one dispatch and not three; it took a
+block as clean by the form in the table's slot, which a block no walk had
+built does not have, and the canonical table's null forms only while that
+table was complete. A drained store has every block built or every form
+null and complete, and the run was priced there. The write mixes leave a
+few unsealed keys in every partition, so no partition takes the bulk walk,
+the table is incomplete at every commit, and the cold partitions' blocks
+are ones no scan has visited: a scan there built one block, ran one block,
+and dispatched into the form file again at the next. The run builds the
+block it reaches now, where it has the snapshot, and takes it when it
+comes out clean (`Options::scan_run_builds`; `supdb-norunbuilds` is the
+run that stops), and a canonical table that is incomplete reads a null
+form through the slot as the walk itself does; paired in the row's shape
+E read 0.96x for the arm without it in both reps of one sitting and 3.5%
+in a second with the counters on, under the resolution. The promotion
+after a walk (`Options::promote_entries`) had credited every key a run
+took to the run's last block and copied the first block's ranks into the
+last block's slot, which the gate's promotion test caught once the run
+extended over unvisited blocks: it credits each block of the run with
+what the run took from it and judges each on its own ranks. The rule: a
+shortcut is priced on the store the workload leaves, not the store the
+pass before left, since a store with nothing unsealed is the one shape the
+mixes never show; and bookkeeping written for one block is read again
+when the thing it books becomes several.
+
+**A cursor a block for a scan that crosses two, and a count that named it.**
+A block's reads of its covered partition went through one cursor since
+the per-run dispatch was priced (`Options::zpages_block_cursor`), and each
+block's walk and each block's build placed its own, while a clean run
+dispatched into the form afresh; a scan of fifty crosses 1.8 blocks, and
+the distinct keys the write mixes leave are spread flatter than the draws
+that made them, so two in three of a covered scan's blocks in E at ten
+million keys under 1.25 GiB held an unsealed key, and the scan placed 2.5
+cursors or dispatches, each a rank search over a cold fence, a group
+opened again and a page header checked, 6.5 groups opened where the scan
+spans 2.7. The clean run's extension, built on the reading that the
+dispatches were the block boundaries', moved the dispatch count by nothing
+(`zpage_scans` 66,228 against 65,946 in E) and the clean walks by a
+quarter: the count said the boundaries were not the cause and the sparse
+blocks' cursors were. One cursor is held across the blocks a scan walks in
+a partition now, the clean runs and the sparse walks through it
+(`Options::zpages_scan_cursor`; `supdb-blockcursors` is the arm), and a
+cursor behind the rank a read asks for steps over a few records and is
+placed afresh past sixteen (`CURSOR_STEP`), since each step across a group
+decodes it. The first shape lent the scan's cursor to the builds as well
+and read E 4% slower with the groups opened up 6%: a build moves the
+cursor to its keys' cuts and the walk after it starts behind them, so the
+cursor was placed afresh and decoded the group it held again, where a
+build's own cursor leaves its groups in the memo for the walk. Builds
+place their own, the walks share: E's dispatches 48,800 against 59,800
+and its groups 171,000 against 178,000 in one rep with the counters on, E
+1.06x there and 1.00x over a sitting of two whose untouched cells -- the
+point-read mixes, the scan pass -- moved a tenth and more, so the count is
+the verdict and the rate unresolved. The rule: a lever built on a reading
+of a count is held to the count after it is built, before it is held to
+the rate, since a rate that moves a little in the right direction can be
+the lever's side effect and not its mechanism; a per-block structure is
+read against the blocks a scan crosses, since a scan of fifty over blocks
+of sixty-four is two blocks more often than one; and a cursor lent to a
+step that moves it is lent at the cost of the step after, which starts
+where the lender left off and not where the borrower did.
+
+**A room modeled as a share, measured as a quarter of the limit unused.**
+The hot-raw policy asked for a release where the form files and the raw
+partitions together would stay within three quarters of the budget
+(`HOT_RAW_FILL`), the rest a share for the page cache's other tenants, and
+the budget itself the limit less the process's anonymous memory and a
+margin: at ten million keys under 1.25 GiB it released three partitions and
+read the room as full, while the group's `memory.stat` at E's start held
+845 MB of page cache and 121 MB of anon under the 1,342 MB limit -- 270 to
+370 MB unused through the mix -- and the other tenants measured a quarter
+of the share reserved for them, the ordered indexes 25 MB resident, the
+WAL 30, the rest 15 (`scripts/resident.py` over the store and
+`memory.stat`, both at the mixes' phase marks). The release is asked into
+the room the group measures now (`Options::zpages_hot_raw_slack`: the
+limit less its anon and its cache, the margin, and a tenth of the budget
+for the write mixes' growth; `supdb-zhotline` is the line), and the first
+pairing of it read level: the room asked for a fourth partition at E's own
+start, where the line had said full, and for nothing before it, because the
+skew a candidate is rated on was the look's own hundred milliseconds and
+the Zipfian's fourth to eighth partitions read forty to eighty sampled
+events a look under the point-read mixes against a floor of a hundred and
+twenty-eight, so nothing past the third was hot enough to ask for until
+E's scans made it so, and E is half a second. The skew is read over the
+last eight looks' samples under the option now (`HOT_RAW_WINDOW`), and the
+pairing in the row's shape read six releases a rep against three -- the
+first four by A's end, the fifth in D, the sixth at E's start -- E 1.05x
+in both reps and 1.13x in a sitting with the counters on, D 1.06x, and the
+point-read mixes both ways by where the releases fell (B 0.75x in one
+sitting and 0.96x in the next, A 0.90x and 1.04x), since a release's
+device read of 42 MB and its form's drop land on the mix it happens in. A
+fourth part was built and taken out: the raw pages mapped into the page
+tables at the release (`MADV_POPULATE_READ`), on the reading that ten
+thousand pages were ten thousand minor faults on the mix that first read
+them; the test written for it read seven faults over ninety-one pages
+without it, the kernel's fault-around mapping sixteen a fault, so a release
+costs its first mix a millisecond of faults and the lever had nothing to
+save. The rules: a room modeled as a share of a budget is held against the
+group's own accounting -- `memory.stat`'s cache beside its rss -- before a
+policy is read as bound by room; a floor on a window's samples is read
+against the rate the window's workload gives the candidates it is for,
+since a floor drawn under one mix's rate silences the next's; and a lever
+on faults is priced after the kernel's fault-around is counted, by the
+faults a reader takes and never by the pages it touches.
+
+**A view an open, for a cursor that opens seven groups a scan.** The
+block path's cursor over a form file built the page's view at every group
+it opened -- the header parsed and checked, the directory's keys walked --
+and twice more where it was placed by rank, for a page it had the view of
+already, and asked the memo for the group only after; a covered scan of a
+hundred records in E at ten million keys under 1.25 GiB opens seven groups
+over two or three pages, and the profile put the view's parse and the
+header line's first touch at a tenth of a covered scan beside the decodes
+at half. The cursor holds the view across the page's groups now and asks
+the memo before any view is built (`Options::zpages_cursor_view`;
+`supdb-zviewperopen` is the view an open): the views over the row's scans
+fell by half (63,800 against 117,400) and E read 1.07x in both reps of a
+sitting. The decodes themselves were half a covered scan at 0.74 µs for a
+1.6 KB group, which is a quarter of the decoder's warm rate, and the
+profile put more than half their samples on the decoder's copy of its
+compressed input: the input's lines cold at every group. The cursor asks
+for the next group's lines at a group's open now -- the next group of the
+page by the directory, else the first kilobyte of the next entry's page --
+and a group's walk is lead enough to bring them
+(`Options::zpages_group_ahead`; `supdb-znogroupahead` asks for nothing):
+E read 1.21x in both reps of a sitting, with the arm's hot-raw policy
+releasing one partition more than the default's, which should have helped
+the arm. The first shape of the ask fell to the next page's lines after a
+group the memo had held, since that open had built no view, so the view is
+built at the ask where it is missing and held for the groups after. The
+rules: a structure a walk rebuilds at every step is counted per step
+against the steps the walk takes -- a view per open against seven opens a
+scan -- before the step's own cost is read as small; and a decode's cold
+figure is read for its input's misses before its branches, since a
+prefetch of the next group's lines, a dozen instructions behind a walk
+that is lead enough, moved E by a fifth where the probe over hot pages
+had read the whole page's lines as a tenth of a decode.
+
+**A prefetch read as a stall of its own instructions, and a pace that lost
+to the burst.** The block walk's prefetch of the next copy block, forty-eight
+lines in one burst at a block's start, had been priced by taking it away (E
+1.23x in core with it) and stood; the profile of E at ten million keys under
+1.25 GiB put 8.7% of the thread in it, and the source lines put fifty-nine
+of its seventy-three samples on the prefetch instructions themselves, which
+read as a burst outrunning the core's fill buffers, each prefetch past them
+waiting a memory round trip. Paced through the walk of the block before --
+four lines of each of the next block's three buffers every sixteen entries,
+the whole by the forty-eighth and the rest at the walk's end
+(`Options::scan_prefetch_paced`) -- the walk read E 0.90x in both reps of
+the row's shape, with the arm's own hot-raw policy releasing a partition
+more, so the burst stands and the pace is the arm (`supdb-pacedprefetch`).
+The samples on the prefetch instructions were the lines' arrival, not the
+issuing: a prefetch that finds no fill buffer waits for one, and whether it
+waits at the block's start or spread through the walk, the lines cost what
+they cost, while the burst at the block's start has the whole walk of the
+block as its lead where the pace's last step had sixteen entries. Two more
+things the same profile named were bookkeeping with the wrong shape. The
+sparse form's search for a key within a cut's run walked the run by key, and
+the keys past a partition's end all share its last cut, so E's inserts,
+eight thousand above every key in the store, each walked past every one
+before it; the run is searched by binary search now, with one compare for a
+key above the last. And the retired form files' sweep at an operation's end
+walked the reader table's two hundred and sixty-five slots at every
+operation for as long as a pin held the files -- the hot-raw policy's
+releases through a mix -- where the forms' and snapshots' sweep beside it
+had a retry guard; the files are under the same guard now. The rules: a
+profile's samples on a prefetch instruction price the lines it waits for,
+not the issuing, and a lever that moves where the waiting happens is held to
+the pairing before the reading is believed; a search within a run keyed by
+one quantity is a search, never a walk, since a workload exists that puts
+every key in one run; and a sweep at every operation's end is held to the
+guard its siblings have, since a pin that stands for a mix makes the sweep
+run for the mix.
+
+**A profile's largest symbol, read for its callers before it was read as
+anyone's.** The flat profile of E at ten million keys under 1.25 GiB put
+22% of the mixes thread in `memmove`, and the reading was the harness's
+copy of every value into its sink, the same bytes the comparator copies at
+12% of its thread, so the lever built on it was the copy block's values
+prefetched whole ahead of the walk where the first kilobyte had been
+(`Options::copy_prefetch_whole`), built before the callers were known. The
+profile with call graphs put the sink at 3% of the thread and the copies in
+the scan path's own block builds (`BuildCtx::materialize` 6.6% with its
+copies, `deltas_for` 5.3%) and the covered path's group opens (15.6%, the
+decode 11.2% of it); the counted run put the writer's builds at 15,396
+sparse, 29,538 clean and 619 copies over 158,000 scans, and 144,349 group
+decodes for about 17,000 covered scans, nine opens each, with the memo
+answering 7%. Paired in the row's shape the whole prefetch read E 0.95x in
+one sitting and 1.23x in the next, the scan pass 0.95x and 0.89x, the
+releases falling differently in each: unresolved, the kilobyte stays and
+`supdb-copyprefetchwhole` is the arm. The rule: a library symbol's share
+is attributed by its callers before a lever is built on it -- `memmove`
+has every copy in the process behind it and names none of them -- and a
+profile read beside the comparator's counts the symbols the comparator
+lacks before the ones both have.
+
+**A seed the shortcut beside it threw away.** The covered scan's start
+seek found its rank through the fence and one group, and the first block's
+walk then placed a second cursor at that rank: a second fence search, a
+view and a memo hit for the group the seek had just opened. Seeded -- the
+seek through the form file's cursor, kept as the partition's reader's and
+resumed by the walk (`Options::zpages_seek_seeds`) -- E read 1.20x in one
+rep of two and the scan pass 0.82x in both, with the form's dispatches
+doubled (`zpage_scans` 10.06 million against 5.05): a drained store's scans
+take the one-walk shortcut ahead of the block loop, which dispatched afresh
+and left the seeded cursor to be closed unused, so every scan of the
+drained passes paid the seek's placement and a second. A test of a handle's
+scan over a drained covered store reproduced it, two dispatches and a view
+where the shape before had one and none; the shortcut goes through the
+seeded cursor now. The gate then found the same leak in the other
+direction: a first block held as a copy, the promotion's, walks from the
+copy and never through the reader, so the seeded cursor was closed unused
+there too and counted as a form walk under a scan that walked none. The
+seek hands its cursor to the walk, which seeds the reader only where the
+first block walks through it -- a sparse block, a clean run -- and lets it
+go otherwise with its counts filed and no walk counted (`pwalk_discard`).
+The scan pass read 1.25x for the seed in both reps of
+the sitting after, with the form's dispatches one a scan in both arms and
+the memo's hits down by the second placements' (368,000 against 5.4
+million over a sitting), and 0.87x in one rep of a clean third whose E
+read 0.89x for the seed in both -- a spread the remembered pin's sittings
+also showed, 0.97x one way and then 1.10x the other for a mechanism that
+touches no scan, so the count was read as the verdict and the seed
+shipped on. A fourth sitting in the row's whole order, the scrambled mixes
+after the mixes, read E 0.97x for it and the scan pass level: E against the
+seed in three sittings of four. A count stands for a verdict only where the
+mechanism strictly removes work, and the seed replaces one placement with
+another, so it is off and `supdb-zseekseed` is the arm. The rule: a structure handed to a walk is checked at every dispatch that can
+take the walk's place and at every form the walk can take, and a count
+that moves the wrong way under a lever names the path the lever never
+reached, before any rate is read; a cursor that opened a group and walked
+nothing is the seek's and not a scan's, so its close counts no walk.
+
+**A bar taken for the policy's limit, and room the kernel was using.** The
+hot-raw policy released five partitions in one rep and eight in another
+while its trace showed 55-115 MB of room unused and the sixth partition
+held cold at 1.09x the median partition's reads a key against a bar of
+1.5x, so the bar read as the binding constraint and the room as E's gain
+to take: the covered scans, eight decodes each, were 11% of E's scans and a
+third of its thread. The bar relaxed to the median where the candidate fit
+the room (`Options::zpages_hot_skew_room`) released eighteen partitions a
+rep, and E read 0.72x in both reps of two sittings, D 0.86x, F 0.88x, with
+C 1.23x and 2.0x and B 1.28x: E took 0.037 major faults an operation
+against 0.0014 and read 153 bytes an operation at the device against 5.7,
+the group's cache at its limit with 765 MB of raw partitions in it, and the
+policy made twenty-one back moves, five swaps and six fulls across the
+mixes. The room `memory.stat` showed unused was room the kernel needed for
+what the policy itself had asked in, and a release's costs -- a 42 MB
+device read, the form's drop, the eviction behind both -- land in the mix
+it happens in, where its gain accrues over the mixes after; C won because
+the partitions released by chance during the uniform read passes were raw
+when its Zipfian began, which no policy can arrange. Off;
+`supdb-zhotskewroom` is the arm. The rule: a policy's bound that reads as
+the binding constraint is relaxed in a pairing before it is called slack,
+and a release is priced by the costs that land in its window -- the device
+bytes, the faults, the moves -- beside the rep's release count, since the
+same engine with more releases is a slower engine in a short enough
+window; and a lever that trades one lost cell for another has not won
+either.
+
+**A sweep that walked the table at every end a pin held it, and the pin
+remembered.** The retired form files' and snapshots' sweeps at an
+operation's end walked every slot of the reader table, in sequentially
+consistent loads, at every operation for as long as a pin held what they
+would free -- the upkeep thread's passes through E, hundreds of them, each
+pinning the state a landing had replaced -- 3% of the mixes thread, and the
+retry guard moved only the guarded arm's share. The sweep remembers the
+slot the last walk found pinned below every tag and the epoch it was
+pinned at, and reads that one slot until it moves
+(`Options::sweep_remembers_pin`, `Readers::oldest_for`): exact, since a
+later pin is at a later epoch and a later retirement has a later tag, so
+nothing retired since the walk can be freed while the slot still shows the
+epoch, and the answer is the one that walk gave. Paired in the row's shape
+the shortcut answered 27,000-50,000 sweeps a sitting with no walk where
+the shape before walked every one, and the rates read E 0.97x for the walks
+in one sitting and 1.10x in the next, with the mixes both ways: the count
+is the verdict and the rate unresolved, as the scan's one cursor was read;
+`supdb-sweepwalks` is the arm. The rule: a check that re-reads a whole set
+to confirm a blocker it found last time reads the blocker first, and a
+guard put on one path's sweep is checked on every path that sweeps.
+
+**A memo that took every decode of a walk that reads each group once.**
+The memo of decoded groups took every group a cursor decoded: a buffer
+recycled thousands of decodes ago and cold, an `Arc` allocated for it, the
+displaced entry's freed, and the group's lines written into a slot the
+walk would read once. A walk's groups after its first decoded into the
+cursor's own buffer, the memo asked and not written
+(`Options::zpages_walk_owns_decodes`), owned 31 million of the row's
+decodes and read the scan pass 1.02-1.05x in three reps of four, E 0.98x
+and 1.05x, C both ways: unresolved, so the memo's path is the default and
+`supdb-zwalkowns` is the arm; the walk's groups after the first were
+fourteen of twenty-two until the page's first group, opened by the
+cursor's load and not its next-group step, carried the flag too, which the
+test found by count. The rule: a flag that marks one step's opens is
+carried by every path the step takes to an open, and an option is held to
+the count that says its mechanism fired before its rate is read.
+
+**A policy priced on the mixes it was built for, and paid for in the mixes
+after them.** The hot-raw policy's room (`Options::zpages_hot_raw_slack`)
+was paired in the row's shape up to its unscrambled mixes, and every pairing
+read E ahead. The row runs the scrambled mixes after those, and the first row
+banked with the room read the scrambled E at 0.59x of LMDB at ten million
+keys under 1.25 GiB where the row before had read 0.86x. Paired through the
+whole order, the room read E 1.10x and the scrambled E 0.76x, with 0.077
+major faults an operation against 0.021, from sixteen releases a sitting
+against four: the partitions the unscrambled Zipfian's head had made raw
+stayed raw where no partition is hot, their records holding cache the form
+files needed. A way back for a raw partition read under the median was built
+against it (`Options::zpages_hot_cold_back`), and its first reading was in
+two units. A raw partition's scan counted one read where the same scan over a
+form file counted the seven groups it opened, so a raw partition under the
+scans read a seventh as hot as it was, went back in the middle of E and was
+released again a look later. Counted in the groups a form walk would open
+(`Seg::hot_scan`), the way back still made fifteen to nineteen moves a
+sitting. It read E 0.73x in one sitting and level in the next, and the
+scrambled E 1.42x and 1.12x, while the scrambled E's faults stayed at
+0.06-0.08 an operation in every arm with the room, with the way back or
+without it. So the way back is the arm (`supdb-zhotcoldback`), the units are
+a fix, and the scrambled E's faults were read as the room's -- they were the
+way back's own, as the entry on a move made in one step says. The rules: a
+pairing runs the row's whole order, through every pass after the cell it was
+built for, since a policy whose state outlives the mix it was made in pays in
+the mixes after it. And a policy's way back is a move with the way out's
+costs, the device read and the drop, so a policy that flaps is priced by its
+moves before its rates.
+
+**A budget drawn as a share of the limit, binding under a store that
+fit.** The block cache's own budget was an eighth of the memory limit, set
+so that the cache would not grow to the store's size at ten million keys
+and have the process killed. At three million keys under 1.25 GiB the
+store and a cache of its own size both fit, and the eighth bound anyway:
+after the lag sweep's full rewrite the pass's working set was 388 MB of
+forms against a budget of 160. A bound cache sheds what it builds, so the
+scans built 11,000 blocks in a pass of 3,000 scans. The builder ahead
+started again at every merge landing and posted forms the scans installed
+and then shed, and the scanner's frees of the builder's chunks met the
+builder's allocations at the allocator's arena locks: 4,500 voluntary
+switches. The pass ran 430-560 ms against LMDB's 27. The phase timers
+named the install and the builds, a pairing of one arm at a time against
+the default named the budget (the arm with no budget read the pass 12.6x
+faster, the arm with no builder 4x), and a profile cut to the pass named
+the locks. The budget grows now, at each crossing, into the room the
+partitions leave of the controller's page-cache budget
+(`Options::scan_cache_auto_room`), and binds only once that room is gone.
+Paired against the eighth, the pass read 6.7x and 9.1x in two sittings and
+the sweep's weighted sum 2.0x. It never fired at ten million keys under
+the same bound, where the partitions fill the page cache's budget, nor in
+the row's other passes at three million, where the cache never crossed.
+What is left of the pass is its first scan, which waits 10-50 ms for the
+upkeep thread's last fill of the burst. The rules: a budget for one
+structure is drawn from what the process's other tenants measure to need,
+never as a fixed share of the limit, since a share binds below the
+working set of a store that fits as surely as it holds back one that does
+not. And a cache bound below its working set is slower than no cache, so
+a bound is priced against the arm without the structure as well as the
+arm without the bound.
+
+**A loss read on the thread's CPU when the thread was waiting.** The
+scrambled E mix at three million keys in core read 0.84x of LMDB in the
+row, and its first decomposition, with the counters on, put 43 ms of its
+235 ms of scans in the settle of the scattered writes the scrambled
+write mixes before it had left, filed by an exact seek a key into
+blocks E mostly never builds. A filing by the ordered index's samples
+was built for that (`Options::settle_lazy_raw`) and read 1.06x and 1.02x
+in two sittings, under what a pairing resolves. The profile of the mix
+undivided then read the scanning thread's CPU at 1.84 s against LMDB's
+1.88 in windows of 2.47 s and 2.29, with 2,310 samples of merge threads
+beside it, and the run queue's wait at 11 ms: not the CPU and not a
+core, but blocking. The mix timed by kind put the gap in the commits,
+710 ms against LMDB's 244 for the same 249 commits, where the scans
+were within 5%, and a trace of the syncs read the commits' fdatasync at
+0.81 ms in the unscrambled E and spread to 10 ms and past in the
+scrambled one, beside the merges' writer helpers syncing 8 MB every
+20 ms. A merge sync every megabyte (`Options::merge_sync_ahead`) was the
+obvious lever on a device cache the merges fill between syncs; it made
+seven times the syncs and moved the commits nothing, and cost the lag
+sweep a tenth. The seals' and merges' threads at the idle I/O class
+(`supdb-bgidle`), on a device whose scheduler honours the classes
+(`mq-deadline`), read the commits slower still, 863 ms against 724 and
+756 against 673: what the commits wait on beside the merges is neither
+the device cache's backlog nor the queue's order, and is open. The rules: a mix's loss is timed by kind before its
+thread's profile is read, since a profile of a thread that waits shows
+its work and not the wait; and a lever on a device's queue is held to
+the latency it is for, the commits', not to the count of what it
+changed.
+
+**A move made in two steps one way and in one the other.** The hot-raw
+policy's release asks the kernel for a partition's raw pages and flips only
+once nine tenths of them are resident; its way back attached the form file at
+the look that decided it. A form file is advised random from its attach, which
+is right for the point reads it was advised for, so a file attached cold came
+in a 4 KB fault at a time under the scans it served. Every mix that took a
+major fault at ten million keys under 1.25 GiB had a back move in it, and every
+mix with releases alone took none: the scrambled E made two or three backs as
+its block cache took the budget under the fill share, and took 0.07-0.08 faults
+an operation, about two form files' pages. Two notes before this one had put
+those faults on the room's releases and on the raw partitions staying raw; the
+phase each move fell in, printed beside the mixes' fault counts, said otherwise
+in one run. The way back asks for the form file's pages now and attaches the
+file a look later, the raw form serving meanwhile
+(`Options::zpages_hot_back_ask`; `supdb-zbacknow` is the move in one step),
+and the scrambled E read 1.72x and 1.21x in two sittings with no faults. The
+rules: a move between two forms is made in the same steps both ways, the pages
+asked ahead of the flip, since a mapping advised for one access pattern reads a
+cold file at the worst rate it has; and an effect put on a policy is read
+against the moves the policy made, mix by mix, before it is put on the
+policy's choice of what to move.
+
+**A sum that traded a cell won for a cell lost.** The merge chain run
+through a burst was turned off on the lag sweep's weighted sum, the burst's
+time and twice the undivided pass's, which read it 6% behind: the burst
+slower by a quarter, the pass faster by less than twice that. The row reads
+neither the sum nor the undivided pass. It divides the sweep's passes by ten,
+so the pass after the full rewrite is the tenth of its scans where the
+chain's drain sits, and compares each cell with its comparator: the pass at
+0.15x of LMDB, the burst at 29x. Re-paired on the row's own division, the
+chain read the pass 3.1x and 3.0x in two sittings and the burst 0.7x, twenty
+times LMDB's still, and the sum level. The rules: an option is priced on the
+cells the bar reads, each against its comparator, and a sum over two of them
+is read beside them and never in place of them, since a cell won twenty-nine
+times over has room to give that a cell lost at a seventh does not; and a
+verdict is taken again when the division or the order it was read under is
+not the row's.
+
+**A structure kept for readers, reclaimed first because nobody had read
+it.** The form files a merge's finish builds are kept in the page cache for
+the scans to come, and the burst before the lag sweep's full-rewrite pass
+took a third of them back out: a page written once and never read sits on
+the kernel's inactive list, the first reclaimed, whatever the store meant
+it for, and the burst's last seconds of writes -- pieces, merge outputs, the
+log -- were newer. The pass then read eleven form files of twenty-nine cold,
+a 4 KB fault at a time under an advice of random, 97% of its major faults,
+while the first reading had put them on the pieces; the faults by file and
+the cache's residency by kind at the pass's start (`scripts/resident.py`)
+said where they were in one run each. The form files under nine tenths
+resident are asked for whole when scans come back after a quiet stretch,
+once no merge is in flight (`Options::zpages_rewarm_scans`), since asked
+beside the chain's last merges they were pushed out again and refaulted
+fivefold. The rules: under a bound, what the store writes for its readers
+is asked for again when the readers come, because the kernel ranks a page
+by its reads and not by its writer's intent; an ask for pages is made when
+nothing is writing beside it, or it pays twice; and a test of a trigger
+that counts scans counts the writer's, since a handle says so once a
+commit.
+
+**A shortcut taken where the structure being decoded agreed, beside a
+structure in memory that knew.** A covered partition's settle files a
+written key under its block with the cut left for the build, and asked the
+form file which block: the fence and the page's directory name the group a
+key falls in, and the answer was a block only where that group lay inside
+one block of sixty-four records. A group straddles a block's edge often
+enough that the rest of a burst's keys fell to the exact seek, which opens
+the group and decodes it, so the upkeep thread's passes over the lag
+sweep's one-percent burst at ten million keys under 1.25 GiB ran long
+enough that the first scan after the burst waited 89-172 ms to take the
+upkeep back, with the decoder and the page views a third of the scanning
+thread. The ordered index's top level holds one sample a block, in memory,
+and names the block of any key whose head ties no sample without reading
+the form; asked first (`Options::settle_covered_samples`), the thread kept
+up, the scan waited a millisecond at most and the pass read 1.46x and
+1.72x in two sittings. The scan's own counters named the wait (`take` in
+the lag counters) and the profile named the decode, where the pass's time
+alone read as the settle's. The rules: a shortcut valid on a subset is
+priced by how often its input falls outside the subset, since every miss
+pays the full path; a question one structure answers from memory is asked
+of it before a structure that has to be decoded to answer it; and a wait
+for a worker is read as the worker's slowness before the waiter's own work
+is profiled.
+
+**A bound written for one kind of commit, left off its sibling.** The
+pace that holds a buffered commit until the upkeep thread trails by at
+most a share of the store was written for the commits that would
+otherwise file their batch themselves, and a syncing commit, which lends
+every batch so its thread files through the fsync, was given no bound at
+all: the thread trailed by whatever the burst left it, and the first scan
+after the lag sweep's full rewrite at three million keys either waited up
+to 40 ms for the pass in flight or settled up to a hundred milliseconds of
+the residue itself, three fifths of a pass LMDB ran in a third of the time.
+The lag counters said which (`take`, `settle`), in every rep. Paced in core
+(`Options::upkeep_pace_syncs_bp`) the pass read 2.4-3.3x in two sittings
+and the bursts gave a seventh to a quarter of their rate and stayed ahead
+of RocksDB's. Paced out of core it lost: there the thread's resolves are
+major faults, and the hold held the writer to them, the one-percent burst
+at a third of its rate and under RocksDB's. The rules: a bound on how far
+a worker may trail is set on every path that hands it work, since the
+reader after the burst meets the trail whichever path made it; and a bound
+that holds a producer to a consumer is priced in each regime the
+consumer's rate changes in, since a hold is only as cheap as what it waits
+for.
+
+**A trade priced while two other losses stood in its cells.** Two merges
+in flight paid the full rewrite's merge debt sooner under a bound and
+read as a trade: the full rewrite's pass ahead, the clean store's pass and
+the one-percent pass behind in three reps of four. The losses were not the
+merges': the clean store's pass met form files the burst had pushed cold,
+and the one-percent pass's first scan settled through the form's decodes.
+Each got a lever of its own, and the same pairing then read every lag pass
+but the tenth ahead, 1.14-1.88x, in two sittings, and in core 1.13-1.80x.
+The rule: an arm left as a trade is priced again once the effects it was
+traded against are fixed, since the verdict was a reading of the cells,
+and the cells had more in them than the arm.
+
+**A seam that priced one of a path's two costs.** The reading made from
+the form files on disk prices the form by timing a few of its pages'
+decodes, and the test seam pins the decode (`ZInject::set_decode_cost`)
+since the line to enter is a function of it; the same timing's faults
+priced a fault at their own wait, and the seam's fault cost was read by the
+census and not there. A store two percent past its budget, which the
+attach test holds to waiting for reads, was bought on the prediction once
+in a gate run and in none of thirty-three runs after it: the files' pages
+had been dropped behind the builds, the timed decodes faulted, and under
+the gate's load a stalled fault raised the price of a fault until the line
+to enter fell under the model's saving. The reading prices its faults at
+the seam's cost where one is set, publishes the price it carried
+(`sample_t_f_ns`), and the test puts the files out of the cache and holds
+the price to the seam's. The rule is the one the decode's seam was written
+for, read across the path: every measured cost a test's premise depends
+on goes through the seam, and a path that takes two costs from one timing
+takes both from it.
+
+**A regime read off a state the regulated work can enter.** The pace that
+holds a syncing commit behind the upkeep thread is for a store in core, and
+it read "in core" as the controller's gate at the raw form. The controller
+leaves the raw form for its census on the group's refault rate, and a full
+rewrite at three million keys under 1.25 GiB raises it itself: with its
+block cache grown to 439 MB of the bound and its merges running, the rate
+went from 39 a second to 13,000 between two steps, the trace put the census
+four seconds into a burst of eight, the pace stopped there with the store
+still read from memory, and the first scan after the burst settled the rest of the
+burst's trail, 40-130 ms of a pass LMDB ran in 28. The lag-only pairings
+that priced the gate met the same census and a smaller residue, and the
+regime the gate was added for, ten million keys, had the compact form's
+gate from its load on, so the two gates had never been told apart. The pace
+stops at the compact form's gate now. The rule: a switch keyed on a
+controller's state is keyed on the state that means what the switch needs
+-- the form installed is the controller's verdict, the census a question it
+is still asking -- and a state the switched work can itself bring about is
+read off the trace of the run before it is read as the regime. The seal's
+floor, the asks ahead for pieces, blocks and heads, the builder ahead and
+the chain through writes read the census as out of core the same way, and
+each was priced where the gate was the compact form's. Beside it: the write
+mixes of that pairing, which run the same code in both arms, read 0.8x for
+one arm in two sittings, and timed by kind the gap was the commits'
+fdatasyncs, 0.41-0.78 ms a commit from process to process in both arms; a
+cell an option cannot reach is read by its kinds and its counters before
+its rate is read as anyone's.
+
+**A cache that measured its benefit where the benefit was another handle's.**
+The block cache out of core repays a block's build only where a later scan
+walks the block again, and the lag sweep's uniform passes meet each block
+about once, so a writer whose scans' start blocks do not recur now gives its
+forms up and takes the merge path, 2.2-2.6x on the full rewrite's pass at ten
+million keys under 1.25 GiB. The first version ran the measure on every
+handle, each over its own starts, and the threaded scans beside the mixes
+read 0.85x: the writer publishes its forms for the handles, and three
+threads reading the same blocks through them is a reuse none of their own
+starts shows, so each handle gave up what the others were paying for. The
+regime is the writer's, and a live handle takes the forms back at the
+writer's next commit, since the writer may make no scan while the handles
+read. The rule: a measure of a shared structure's reuse is taken where the
+structure is shared, or confined to the one consumer whose measure is whole;
+and a mode that turns a producer off is undone by a consumer's arrival at a
+point the producer passes whether or not it reads. Beside it: a test of the
+switch that wrote nothing where the scans after it read passed with the
+switch's drop removed, and the fuzz's stores, a few blocks each, never left
+the forms on under a real measure, so a seam flips the regime every few
+scans there (`scan_forms_off_flip`, `ZFUZZ_FORMSOFF`); a mechanism a test's
+input cannot drive is driven by a seam, and the seam is checked to have
+fired by its own count.
+
+**A fixed cost a pass, paid at the batches' rate.** The upkeep thread's
+fill walks every block of every partition whenever its tables are
+incomplete, a millisecond a pass at three million keys, and under the
+syncing pace a burst's passes come a few batches apart, so the walk was a
+sixth of the thread over the full rewrite and the writer was held for a
+quarter of the burst; the one-percent pass's first scan then waited for the
+pass in flight, the cell that lost to LMDB. A smaller pace share, the
+obvious lever on the scan's wait, made every batch a pass and paid the walk
+at every batch. The fill is left for a later pass while the writer has
+posted a newer commit now. The rule: a per-pass cost is priced at the
+rate passes come, and a regulator that shortens the passes multiplies it;
+work whose product the next pass rebuilds anyway is done by the pass that
+finds nothing waiting behind it.
+
+**A footprint priced on the stores the suite makes.** The WAL's recycling
+pre-wrote the live file and a spare whole at create, 64 MiB written and
+synced, and kept 32 MiB at rest in every store, which no pairing sees: the
+suite makes a store a pass, and a pairing prices the passes. The tests make
+hundreds, and the gate with that shape as the default would have left tens
+of gigabytes on an allowance of eighteen. The pre-write follows the tail
+now, a mebibyte ahead, flushed by the commit that reaches it (ahead of
+which commits, the megabyte's own shape below says). And the test
+written for the recycled file's stale frames passed under the whole-file
+pre-write for the wrong reason: its keys ascended, went to a segment
+directly and never touched the log, and its assertion that the live file
+was longer than its header was satisfied by the zeros; with the pre-write
+following the tail it failed, and its keys are permuted now. Six more
+took the file's length for the log's tail, tearing zeros where they meant
+to tear a batch, and read the tail from the store now. The rules: a
+default is priced on every store the library makes, the smallest
+included, at create and at rest as well as in the passes; and an
+assertion that a structure exists is held to the structure's content,
+since a fallback that makes something of the same size satisfies its
+length.
+
+**Advice taken for an order, and a wait for work nobody was doing.** The
+lag sweep's clean-store pass at ten million keys under 1.25 GiB read two
+shapes, its scans taking a seventh of LMDB's major faults in one rep and
+four fifths in two, and the row's own per-rep quantities split them --
+the scans' major faults, the bytes other threads read, the device's time
+a read -- before any probe; twelve sweeps then failed to reproduce it at
+its worst, and the one line that separated the mild cases was the
+sampler's fault price on the trace. A shuffled load's last merge drops its outputs' form files as
+it builds them, its landing takes the store past the selector's line, and
+the crossing asks all of them back a second before the first scan. Read
+as a race with the read-in, that got two fixes its pairings refuted. Files
+kept at their build were gone by the landing, the rule this file already
+had for a page written once and never read, and were left dirty besides.
+A settle that waited for the read found no read: the residency it polled
+stood at half the files and did not move, because `POSIX_FADV_WILLNEED`
+is advice and a group at its limit reads what it has pages for and drops
+the rest without a word. The settle asks again where its looks stall,
+with room made first, and the slow shape went from two sweeps of seven to
+none (`Options::zpages_settle_joins_asks`). The rules: an ask of the
+kernel is held to the kernel's count of what it did (`mincore`), at the
+point that depends on it, and made again where it fell short, since
+advice declined raises nothing; a wait is written against the state it
+waits for and prints that state, since the first version of the wait
+would have read as a fix that did nothing until its trace line said
+`360.9 -> 360.9`; and a mechanism read off timing -- a read "still
+running" -- is confirmed by a count of the thing itself before a fix is
+built on it, twice here it was not.
+
+**A megabyte bought at the first commit, and three policies built before
+the device was priced.** The WAL's pre-write went in as a mebibyte of
+zeros ahead of every commit, priced on the write mixes at three and ten
+million keys, and the quick row a day later read ycsb-B at ten thousand
+keys at half of LMDB's: B there is one commit in a pass of a millisecond
+and a half, and it wrote and flushed the megabyte the mixes after it
+rode. Paired against the appended log, B read 0.32-0.40x, the shuffled
+load 0.73-0.83x and the full rewrite's burst 0.76-0.86x, with A and F as
+far ahead as before: the megabyte's price had moved from the cells that
+used it to whichever commit came first, and onto every commit of a
+thousand writes, which gains nothing by it. Two fixes were then built on
+a reading of that and paired -- a reach as long as the file, and steps
+doubling from sixty-four kibibytes under a size gate -- and each moved
+the megabyte between cells, B to A and F, the first commit to the first
+after a load. A probe of the primitives (`bench/examples/walsync.rs`)
+then said in a minute what four sittings had circled: zeros cost what
+frames do, a megabyte two and a half milliseconds, and an extension a
+fifth to two thirds of one beside; a pre-written commit saves a tenth of
+a millisecond; so the purchase pays where a megabyte holds sixty
+commits, loses by a third and more where it holds eight, and at ten
+thousand keys, where the mixes write two thirds of a megabyte in forty
+commits, no schedule comes out ahead of the appended log and each only
+chooses the cell that pays.
+And the size gate first written sat at sixteen kibibytes, under a guess
+that the mixes' commits were thirteen kilobytes; an `strace` of the
+writes read 16.8. A commit over thirty-two kibibytes appends now and
+ends the run, and a run of small commits pre-writes a reach once it has
+written one itself (`Options::wal_ahead_small_runs`). The rules: a cost
+bought ahead is bought on the evidence of the run it is for, since a
+store's first operation may be its only one -- the smallest write set
+again, under a rule this file had for it already, and the default went
+in without the quick row; a lever is priced on every size of the
+operation it touches, a commit of one write, of a hundred and of a
+thousand, and the sizes are read off the syscalls before a threshold is
+drawn between them; a lever that moves a fixed cost between cells is
+read on the cells' sum at the smallest rung, where a schedule that only
+relocates it shows as one cell up and another down in every pairing; and
+when two policies in a row trade the same cost, the primitive is priced
+before a third is built. Beside it: the first pairings of the last shape
+under a bound read the passes after two of the bursts a fifth slower in
+six pairs of six, a mechanism was written for it -- faster syncs leaving
+the upkeep thread a longer trail -- and the counters of the next sitting
+read the trail at nothing in both arms and the passes in two shapes
+under either, which a third sitting put on the builder ahead's install.
+A difference in a pass of twenty milliseconds is read off its counters
+before it is given a cause, and a cell that reads bimodal within one arm
+is not a verdict between two.
+
+**A shed the same pass undid.** The forms the commits' fills build at
+write time are listed, and shed unwalked when the group's refaults move,
+to give the page cache back what they took. That was priced where the
+cache's budget binds, and under a budget that binds a block with no form
+is left to the scan that wants it. At three million keys under 1.25 GiB
+the budget grows into the room the partitions leave and never binds, and
+there the commit's own fill builds a form for every overlaid block that
+holds none: the pass that shed forty thousand forms built each again in
+its next step, from the sources and sized for an overlay as large as the
+block, a hundred thousand builds a burst where the store has forty-seven
+thousand blocks, a hundred megabytes more in use and a second on the
+burst, in the sweeps where the refaults moved inside the burst and not
+in the others. The cell it lost was the scan pass after, and five
+readings went elsewhere first -- the allocator's free bytes, the copies'
+capacity, the page cache's tenants, the builder ahead, the first scan's
+wait -- each true of the slow sweeps and none their cause. What named it
+was a count every log already carried: the blocks the upkeep built over
+the burst, fifty thousand in the fast sweeps and a hundred thousand in
+the slow, and then the events line of the points before it, which split
+the same sweeps at the one-percent burst by who had built their forms.
+There is no shed while the fill stands to undo it
+(`Options::forms_settle_sheds_unbound`), and the list the shed reads,
+which only a shed had emptied, is pruned
+(`Reader::prune_settle_built`): in memory, where the room never goes, it
+had grown by an entry a build for the store's life. The rules: a
+mechanism that gives work back is checked against whatever takes the same
+work up in the regime it runs in, since a shed beside an unconditional
+fill is two builds; when a cell reads two shapes, the count that
+separates them is looked for among the counters already printed, at every
+point of the sweep and not only the slow one, before a mechanism is
+reasoned from the slow shape's symptoms; and a list something appends to
+is read for who empties it where the emptying event never comes.
+
+**A form dropped for a position that could be asked for again.** The
+look that carries a table across the merge that rewrites its partition
+over the same blocks kept the block's copies and dropped its sparse
+forms, because a delta's cut is a rank in the old records -- and in the
+same loop resolved again the cuts of the keys filed since the snapshot,
+by the seek the settle uses. The dropped blocks went back to the fill,
+two thousand a burst, and the ones a late landing left with few keys
+since stood sparse at the scan pass, where a sparse walk reads the
+partition's records between its deltas: under a bound those were records
+the merge had just written and nothing had read, the first pages
+reclaimed, a major fault a walk and the pass's whole wait. The look
+resolves each delta's cut again and keeps the form now
+(`Options::rebase_recuts_sparse`). The checked profile's comparison of a
+conversion against a build from the sources had assumed the drop twice:
+that a dense form's block is dense in the sources, and that the two
+copies agree entry for entry. A kept form is dense with deltas the merge
+folded in, and holds an entry of no values for a key the merge dropped,
+which the sources have no key for at all; forty seeds of a hundred and
+sixty failed on those two assertions with every answer right, and the
+check is held now to a copy forced from the sources and to what the two
+emit. The rules: where one loop re-derives a position for some of a
+structure's entries and drops the rest for holding the same kind of
+position, the drop is a choice and is priced as one; and an assertion
+that compares a derived thing with a rebuild encodes how the derived
+thing was made, so a change to what may be kept is read against every
+such check before a fuzz failure is read as a wrong answer.
+
+**A loop tuned under one regulator's batches, run under another's.** The
+settle's loops were tuned while the buffered pace set a pass's size: a
+hundredth of the store, fourteen thousand keys at three million, a few of
+them to a block and two hundred ranks apart. There the resolve's gallop
+from the last answer reads heads the seek before left warm, the next
+block's form is asked for whole because several keys land in it, and a
+seek from the index's top level, priced against the gallop, read level
+and was not kept. The syncing pace is a quarter of a percent, and the
+thread under it takes what a few commits left: over the full rewrite at
+three million keys a pass held nineteen hundred keys, sixteen hundred
+ranks apart, and the counters the sweep already printed said the rest,
+2.62 million block visits for 2.70 million keys. Every visit was one
+key's. The gallop over that distance was a dozen probes and a binary
+search of ten more, each waiting on the one before, a sixth of the thread;
+the whole-form ask was forty-eight lines for a patch that reads one entry
+and writes one run, two of whose lines it never asked for; the form's
+header, the slot that names it and the block's list of created keys were
+each a line nothing had touched since the block's last visit. Five asks
+ahead took the settle's cost a key down by two fifths
+(`docs/engine.md`), each sized by what a pass holds now: the stride a
+seek will search, named from the top level a few keys before the seek;
+the header by the slot's pointer; the patch's own lines by the key's cut;
+the value with its chunk; the table's lines further ahead still. The
+rules: an ask ahead is sized by the batch's density in the structure it
+is for, so when a regulator changes what a pass holds, every loop tuned
+under the old size is profiled again; a refutation at one density is a
+refutation at that density, and the lever comes back when the density
+moves by an order; and the count that says which regime a loop is in --
+here the keys against the blocks they were grouped into -- is read off
+the counters before the profile is.
+
+**A call saved and a wait bought.** Out of core a settle asks the kernel
+for the heads its resolves will seek, and each ask first reads its own
+page's residency, a `mincore` a key: a tenth of the upkeep thread at
+three million keys under 1.25 GiB, where the store sits at the
+controller's census with nearly all of its ordered indexes in memory. One
+look at a partition's whole index, standing for a hundred milliseconds,
+took that tenth off the thread's CPU, and the burst read one to three
+percent longer in both orders with the writer held a quarter to a half
+longer: under the bound the indexes' pages leave the cache all through
+the burst, and three to five thousand of the thread's seeks faulted on a
+page gone since its partition's look where six hundred did with an ask a
+key (`perf record -a -e major-faults -c 1 -d`, the faults laid to their
+files by address). The thread's CPU had been the measure and its wall was
+the price. The same record named what the calls had been standing in for:
+the scan after the burst took eleven to twenty major faults on those
+pages in one pass of three, in its start seek, and those were the passes
+that ran two and three times the others. The rules: a lever on a thread
+that paces another is priced by that thread's wall, the holds and the
+burst, before its CPU; a cache of an answer the kernel can change is as
+stale as the kernel is fast, so the rate the answer changes at is counted
+before the cache is built; and a call a key that guards against a fault
+is a sign the pages should not be the kind that leave.
+
+**A count keyed on a generation a landing moves.** The engine reads
+whether scans are around from the writes since the last one, two stores'
+worth being far from reads, and kept the count twice: the commit's
+hand-over by its batch (`upkeep_since_scan`), which paces a burst only
+while scans are around, and the pass by the log's growth
+(`Reader::settle_due`), which files only then. Each took "the whole log
+where the generation has changed since", which was a new memtable while
+the writer was the one publisher. Since the segment work has a thread of
+its own, a landing publishes a new generation over the live table it
+leaves alone, and every landing added that table's whole log to both
+counts again. Over the lag sweep's full rewrite at three million keys, a
+seal's two landings and a merge's for every hundred commits, the counts
+passed two stores' worth with one written: for the burst's last one to
+twelve percent the hand-over stopped pacing and the pass stopped filing,
+and the first scan after the burst read up to ten milliseconds of log and
+settled up to a hundred and twenty, a pass of a hundred milliseconds at
+the median where the others took sixteen. It was a third of the bursts
+on one host, thirty of ninety, and none of thirty on the host before it,
+where the same count had ended just under the line, and the pairings of
+that day read it as the host's until two counters every sweep prints
+were read rep by rep: the commits held, 2,363 to 2,668 of 2,700 in every
+stalled burst and 2,700 in every other, and the first scan's `sync` and
+`settle` phases. Both counts are keyed on
+the live table now (`State::lives`), as the lag tick's had been since the
+same mistake was found there. The rule is the one "a pass that reported
+done for a turn it skipped" gave, a check that a thing is the one named
+compares the quantity the work depends on and not a counter other things
+also move, with three corollaries: when a second publisher is given the
+pointer, every counter keyed on what only the first used to move is read
+again, not only the one that failed; a regulator that stops regulating
+raises nothing, so the count of the operations it held is printed beside
+the count it should have held and read per rep; and a cell that moves
+between hosts with the engine unchanged is read for a threshold the
+engine sits at before it is read as the host's.
+
+**Whatever the raw form serves now, taken for what it is left to
+serve.** The ordered index's heads are eight bytes a key that every seek
+of a raw partition reads, and under a bound their mapping's pages leave
+the cache between two seeks however often they are read; held in the
+process's own memory they are not the cache's to take, and the bound
+counts them either way (`Options::heads_owned`, the entry before this
+one's last rule). The first version copied the heads of every partition
+the raw form was serving at the look, and at three million keys, where
+the store sits at the controller's census through a full rewrite, it
+took a quarter off the upkeep thread's settle and the stalls of a device
+wait out of the pass after. One run of the same lever at ten
+million keys read its counters before its rates: ninety-two copies made
+over a lag sweep and ninety-two given back. A partition a merge lands is
+served raw until the controller attaches the file the merge built for
+it, a tick later, and at the load's end every partition is served raw
+for the second between the crossing and the install; copied in that
+second, the copies read every index file from the device beside the
+first scans, a pass of five hundred milliseconds against four hundred.
+The second version waited for a controller's step that had bought
+nothing, and the crossing still made eight to twenty, since the
+controller sits a moment on a purchase its model has already predicted
+while the reads' faults make the price. A copy is made now for a
+partition the controller is leaving raw by its own account: under the
+form's gate one it has declined, and at the census every one while its
+model says the raw form fits (`Maint::z_heads_look`, `heads_left_raw`).
+The rules: a state read off what serves at this instant is a state read
+between two steps of whoever decides what serves, so the decider's own
+account is asked -- its decline, its model -- and not the cell it has
+not filled yet; a lever built at one rung is run once at the other for
+its counters before any pairing of it, where a copy made and given back
+ninety-two times is one line of one run; and a memory economy that
+copies is priced by the reads the copy makes, on the thread and in the
+window it makes them.
+
+**A decode as long as its container for a read that wanted one record,
+into a cache that took whatever it was shown.** C at ten million keys
+under 1.25 GiB was one of the four cells the row at `7b90eb8` read at or
+under LMDB's, and its point read through the block-coded form decoded a
+group whole at every miss of the memo of decoded groups, into a buffer of
+the memo's, which the group then held a slot for. A divided C is 167,000
+reads; 71,000 of them decoded a group, and most of those groups were read
+once in the mix, a Zipfian's tail being most of its distinct keys, so each
+such read wrote eighteen hundred bytes to answer for a hundred and thirty
+and turned a group the head would read again out of one of the memo's four
+thousand slots. The profile named the decoder only after it was cut twice:
+the mix's window between the harness's marks was two fifths `pow`, the key
+generator's zeta sum over ten million terms, which the harness computes
+inside the marks and outside its clock, and of the engine's samples left
+the decoder was 35-39%. Three things were built, each an option priced by
+taking it away. A read's first touch of a group decodes it only as far as
+the walk for its key reads, into the read's own buffer, three fifths of
+the group's bytes at the mean, and the memo takes a group at its second
+touch while a tag of the first stands (`Options::zpages_point_part`,
+`zlz4::decompress_more`, `zfile::Memo::admit`): the read pass read
+1.2-1.4x on one thread and to 1.7x on three, and B, C, D and the scrambled
+B and C ahead in both orders. A walk's first touch of a group is its
+cursor's own decode by the same rule (`Options::zpages_scan_admit`): the
+threaded scans beside the mixes read 1.1-1.2x in both orders, with the
+threaded scan pass level. And a table of where the keys read through the
+memo lie, asked ahead of the filter and the fence
+(`Options::zpages_point_keys`), answered half of C's reads and a quarter
+of the scrambled C's: C read 1.02x to 1.19x for it in four sittings of
+four and the scrambled C ahead in three, and D, which reads the latest
+inserts and no key twice through the form, 0.95-0.98x in all four, the
+price of a probe of a megabyte the core's cache does not hold. The table
+was turned off between its second sitting and its fourth. The first two
+read the six scrambled mixes four to six percent lower by their geometric
+mean, and the scrambled D's count, a hit in two hundred and seventy reads,
+was written down as the scrambled mixes'; the next two read that mean
+three and eleven percent higher, every pairing of the lever was run again
+for a default that then moved back, and the counts by mix had said from
+the first counted run which cells the table reaches. One cell moved with
+nothing to move it. The scrambled E mix, which makes no point read, read
+0.87x, 0.92x, 1.00x and 0.90x for the partial decode over four sittings,
+and a counted rep of the two arms read its scans' groups, memo hits,
+misses and admissions the same per scan to two figures, the main thread's
+faults the same, and the hot-raw policy's releases the same in every run;
+E beside it read 1.13x and 0.81x in both pairings, the pair's first arm
+ahead, E's time being the price of its block cache's fresh pages, which a
+pair's second place pays more for. The lean is left as read, a tenth with
+every count against a cause. The partial decode is licensed by the page's
+first decode, which walks every group whole: a decode that stops at a
+record does not see what the block's end would have said, and the test
+that first asserted it did was the one wrong. The rules: a cache admits on
+evidence of a second reference where what it is shown is mostly seen once,
+since what a first touch displaces is the price of taking it; a decoder
+that runs to the end of its container is asked how far its reader reads;
+an option's verdict is read cell by cell where its mechanism counts, never
+as a mean over cells it reaches differently, and a count read in one mix
+is not its family's; a cell that moves under an option is held to a count
+of the option's mechanism in that cell before it is read for or against,
+since two sittings can agree about the pair's order or about nothing; and
+a profile cut to a phase by the harness's marks is cut again to the
+engine's symbols before a share of it is read, since the marks bracket the
+harness's own setup.
+
+**What a reader dropped in place, a publish in flight brought back.** A
+look that passes a table drops it from `State::replaced` where the state
+stands, and the list is copied into the next state by whoever publishes
+it. A publish reads where the look stood, copies the list and swaps its
+state in, three steps on a thread that is not the look's, and a look that
+fell between the first and the third stored its new position and cleared
+the list of a state the swap then replaced: the table it had passed, and
+the seal's snapshot copy it holds, stood in the new state until the next
+look, whenever that came. The test written for the drop found it, once in
+a gate and once in fifteen runs under eight-way load, never alone, after
+passing for a week on a wait for the wrong event: it waited for a landing
+to be counted, the count that moved was the load's table's in every run,
+and the table it froze landed later, under the look, in the runs that
+failed. A trace of the store's four counts at each step read the same to
+the last step in the runs that passed and the runs that failed, which is
+what said the wait was not waiting for what came next. Every publisher's
+swap is one function now, which trims the list of the state it swapped in
+by where the look stands after the swap (`Db::swap_state`), and the look
+trims whichever state is current after it has stored where it stands
+(`Reader::note_over`); the swap and the load after it, the store and the
+load after it, are sequentially consistent, so one of the two sees the
+other. Two seams leave each order standing (`Db::hold_landing_swap`,
+`Db::look_after_a_landing`), and the first test waits for the table it
+froze. A third seam, for the writer's own freeze under the upkeep thread's
+look, was built and taken out: the writer holds its upkeep through a
+commit's freeze, the look it was to race could not run, and a second copy
+of the trim that nothing could reach became the one function instead. The
+rules: a drop made in place on a structure others copy forward is made
+again by whoever copies, after the copy is published, and by the dropper
+on whatever was published since, both where neither can see the other
+first; a wait in a test names its event by something only that event
+moves, since a count another event also moves is moved by it in every run;
+and a check two callers need is one function, so that the test of one
+caller holds it for both.
+
+**A reading kept past the workload it was of, and a gate that read a counter across a gap.**
+The writer gives its block forms up where its scans' start blocks do not recur
+and takes them back where they do (`Options::scan_forms_off_unreused`), and it
+decides at a scan: between two scans the last reading stands, and while it
+stands the commits file nothing. In the row's order the uniform scan pass gave
+the forms up and the writer's next scan was E's first, five mixes later: B, A,
+F and D committed a hundred and eighty thousand writes into no forms, and E
+took the forms back at its 512th scan and built its block cache inside its own
+window -- fifteen thousand sparse forms, twenty thousand more from the builder
+ahead and seven thousand first touches on the scanning thread, in half a
+second. That was the one cell the row at `e4021f7` lost at ten million keys,
+0.94x of LMDB's and two shapes by rep. The regime's own pairing had read E
+level against the arm that keeps its forms, and a later note had named what E
+pays, "the price of its block cache's fresh pages", without asking why E was
+the mix paying it. The reading is stale now after a stretch of a mix's small
+commits with no scan between them (`Options::scan_forms_off_stale_writes`; a
+burst's batches, the lag sweep's, leave it standing, since filing a burst is
+the writer's to pay), and that moved E in three counted reps of four. In the
+fourth the write mixes still filed nothing, and a count of the commits that
+file nothing by the clause that refused them (`Db::settle_refusals`: the forms
+off, far from a scan, no room, nothing due) put every one on the fills' room.
+The room closes for a second when the memory group's refaults grow, and it
+read growth as any growth since its last reading, however old: the first
+commit to ask after the read passes compared the counter with a reading
+twenty-six seconds old, the read pass's twenty-four thousand refaults, and
+closed the room for B and A; and three pages refaulted in a hundred
+milliseconds closed it for F and D, with three hundred megabytes of room by
+the gate's own byte count on the same line of the trace. The room reads the
+refaults against the line the controller's pressure term is drawn at, over a
+reading no older than its quiet (`Options::forms_settle_room_pressure`,
+`refaults_moved`). With both, the write mixes file at every commit on the
+upkeep thread in every rep, E builds no sparse form and takes four hundred
+first touches, and paired against the forms kept off until a scan E read
+1.56x and 1.24x with the arms listed either way, ahead in every pair of eight. The rules: a regime entered on a measurement of one kind of operation
+is looked at again when the workload stops making that operation, not only
+when the operation comes back to be measured, since the cost of the stale
+reading falls on whatever comes first after the stretch; a difference of two
+readings of a counter is a rate over the time between them, so a reading
+after a gap is a baseline and says nothing of now; a gate on a platform's
+counter is drawn where the counter's owner draws it, one line named once,
+since any growth at all is the background of a group at its limit; a lever
+behind two gates is read with the refusals counted by gate, since with one
+gate open it reads as a lever that works in some reps; and a note that names
+what a cell pays is half a finding until it says why that cell is the one
+paying.
+
+**A decode halved for a read whose cost was not its bytes, at the price of
+the room another cell lives in.** C's time at ten million keys under 1.25 GiB
+is three quarters first touches of tail groups, each a partial decode, and the
+obvious lever was the group cut: a kibibyte of records a group where the form
+ships two (`Options::zpages_group_bytes`, `supdb-zgroup1k`). The arm decoded
+0.60 of the bytes on its first touches, as designed, and C read 0.97x: a first
+touch is the page's header and directory, the payload's first lines and the
+tables beside them, misses a group's size does not change, and the bytes the
+decoder then runs over are the cheap part. And the cut costs the form a
+twentieth more of its bytes, which at this bound is the room the hot-raw
+policy releases into: five partitions released a rep where the default
+releases eight, E 0.75x in four pairs of four and the threaded scans 0.89x,
+for the scrambled point-read mixes a seventh ahead. The rules: a read's cold
+cost is counted in the lines it touches before a lever is built on the bytes
+it decodes, and the arm that changes only the bytes is the test; and a format
+parameter that trades size for speed under a bound is priced on the cells the
+size pays in, which are whichever tenants of the page cache the bound was
+already squeezing, not on the cell the speed was for.
+
+**A structure dropped by a generation that counts what it was not derived
+from.** A handle's scan snapshot is the memtables' unsealed keys, sorted,
+and the look at the log dropped it at every new generation, which a merge's
+landing moves as surely as a freeze does. The writer's own look carried it
+across such a landing with its tables (`rebase_tables`); the look without
+tables -- every reader handle, and the writer on the merge paths, which is
+where it scans once it has given its forms up -- dropped it, and the scan
+after sorted every unsealed key again: 388,000 of them at the pass after the
+lag sweep's full rewrite at ten million keys under 1.25 GiB, 50-60 ms a
+build, fourteen or fifteen builds in a pass where the merge chain landed
+inside it. The snapshot stands across a publish that leaves the memtables
+now (`Options::snapshot_stands`), trimmed of a landed table's base. The
+rule is the one "a count keyed on a generation a landing moves" gave, for
+a cache: a derived structure is invalidated by the identity of what it was
+derived from, and a generation that every publish moves invalidates it at
+publishes that changed nothing it holds.
+
+**A question answered from the pages a step had just let go.** A merge was
+made to drop behind it the raw records of an input partition its form file
+serves, which nothing reads once the form serves it, so the pages it read
+back would not stand as the cache's newest through the landing
+(`Options::merge_drops_covered`). The burst ran faster with it and the pass
+after it ten times slower, 124 pieces standing where 26-31 had: its merges
+took as long, and a third as many started, because of each pair the
+second landed half a second after its job had ended. A CPU profile of the
+thread every landing goes through named `Db::same_blocks`, the landing's
+question whether a rewritten partition cuts the same blocks, which read the
+old partition's key every sixty-fourth rank through its records -- the
+pages the merge had just dropped, read back a page at a time while the next
+merge waited to be planned. Without the drop the merge had left them warm,
+and nobody had priced the question at all. It reads the ordered indexes
+now, whose top level holds a block's first key in memory
+(`Options::same_blocks_from_index`), and the drop, repriced with the
+question answered there, bought nothing and is off. The rules: a step that
+gives pages back is priced at every later reader of those pages, on every
+thread, and the thread that serialises the landings is one of them; a
+question one structure answers from memory is asked of it before one that
+has to be paged in; and a phase that runs faster under a lever is read for
+the work it pushed out of itself, since a burst whose merges did not start
+is a burst with less beside it.
+
+**A gate drawn at the largest burst, read at a smaller one.** The rewarm
+asks for the form files the cache has dropped when scans come back after a
+stretch without one, and waited for a second of quiet and for every merge
+in flight to land, both drawn at the full rewrite, whose merges hold every
+partition and pushed out what a rewarm beside them brought in. Under a
+gibibyte at ten million keys the ten-percent burst lasts 1.0-1.1 s and
+leaves a chain of merges running through the pass after it, so the rewarm
+fired at that pass in two reps of eight, and the pass read the burst's new
+form files a 4 KB fault at a time -- nine thousand faults, every one in the
+page view's first read of a file written once and read by nobody, the
+first pages a reclaim takes -- and trailed RocksDB, whose compactions' files
+stayed in its cache. A rewarm beside the merges, for the partitions they do
+not hold, after a quarter second (`Options::zpages_rewarm_beside_merges`,
+`Options::zpages_rewarm_quiet_ms`) read the pass 1.3-1.7x in every sitting
+with a third of the faults; under 1.25 GiB it found no cold file to ask
+for. The faults by file were read with `perf record -e major-faults -c 1
+-d` cut to the pass's lag marks and the process's maps. The rules: a gate
+drawn at one case is checked at the cases between it and the next, since a
+threshold a burst crosses by a few milliseconds fires in some reps and not
+others; and a pairing in which the mechanism never fired is the noise
+floor, read before any other -- the same pair under 1.25 GiB, no rewarm in
+either arm, moved its cells 10-20% each way between sittings.
+
+**Two levers priced as one, and the half that was the cost.** That rewarm
+shipped as two changes paired together, the quarter second and the asks
+beside the merges, and the next 1.25 GiB row read the pass after the full
+rewrite at 0.54x of LMDB where the row before had read 1.81x. The row
+before was another host's; on this host class the cell had read 0.7-1.1M
+entries a second in every row since the chain, so the drop was the host's
+and the loss was a cell to win. The faults by file put the pass's major
+faults on form files in their page view's first read and on the burst's
+last pieces, and the rewarm's trace, given each asked file's residency, the
+room and whether merges ran, split the sweeps on one column: every pass
+whose rewarm asked beside the chain took 7,200-10,900 faults under 1.25
+GiB, every one whose rewarm found no merge 74-3,300. An asked file is read
+in by evicting what the kernel ranks last, and after a burst that is the
+burst's own pieces, written once and read next by the pass. Two levers
+were built on the way and taken out by their counts: skipping the files of
+partitions a merge was due to rewrite never fired, since the asked
+partitions held one or two pieces under a trigger of four; and bounding
+the asks by the room the group measured asked the moment room opened, and
+the merges' writes took the room back -- 7,300 faults in such a sweep, as
+many as the asks it replaced. The ten-percent pass the asks were for found
+no merge running at its rewarm in every sweep since, so the quarter second
+was its gain, and the rewarm waits for the merges again
+(`Options::zpages_rewarm_beside_merges` off; `supdb-zrewarmbeside`). The
+rules: a lever made of two changes is priced by taking each away; a cell
+that drops between two rows is read against its own history on the row's
+host class before it is read as the engine's; and a measured room is a
+reading of a moment, so an ask that the next writer will take the room
+from is not made into it.
+
+**A key hashed by every source it was looked up in.** A point read
+consults the partition, each level-0 piece over its range, the frozen
+tables and the live one, and each hashed the key itself, the same FNV a
+byte and a multiply at a time, and only once the source before it had
+been read: the piece's filter probe, its fence and the hash in front of
+it were a fifth of the scrambled D mix's thread at a hundred and three
+hundred thousand keys, the whole of the gap to LMDB, because the
+scrambled write mixes leave a piece below the merge trigger and the
+unscrambled ones leave none. The read takes the index's FNV word once
+and every source's hash from it, and asks for each piece's filter block
+before it reads the partition (`Options::read_hash_once`,
+`Options::read_lines_ahead`). The first shape of the asks also asked for
+the partition's first slot on every read, an ask the lookup followed at
+once: callgrind over the read pass counted it at 44 instructions a read,
+and the pairing read the pass 0.94x for it while the mixes with a piece
+gained a fifth. The rules: a quantity every source derives from the key
+is derived once by the caller; an ask ahead is made only where there is
+work between it and the load it is for, and its instructions are counted
+on the path that has none; and a mix family that leaves a different
+store shape -- a piece standing, a frozen table -- is read for which
+sources its operations consult before its cells are compared with the
+family that leaves none.
+
+**A form given up for a cost that had since gone, and the costs that
+scaled with it when it came back.** The last block of the last partition
+collects every key inserted past the store's greatest, and it had been a
+copy once and was made a merge of its sources (the wide form) because the
+copy was rebuilt after every inserting commit, 12 ms a rebuild at three
+million keys. A patch has spliced into a copy since, so the reason was gone
+and the rule stayed: the scrambled E's scans that started among the inserts
+merged a window of every source over the block, 50,000 instructions a walk
+and 385 walks a mix at a hundred thousand keys, about a tenth of the mix's instructions.
+Copied once its walks had paid for the build and kept past the wide bound,
+the block read slower at three hundred thousand keys before it read faster,
+because two costs no copy had paid scaled with its size: the patch summed
+every entry's run to ask whether the copy had bloated, and the walk into it
+asked for its whole entry and key buffers ahead, a few hundred kilobytes of
+lines a walk. A running count of dead bytes and the copy's first lines took
+both away (`Options::forms_copy_hot_wide`, `CachedBlock::dead`). The same
+work found the window's merge taking a scan's limit from every source and
+merging them all for the limit it read (`Options::scan_wide_capped`), and the
+tombstone search run for a key one source held (`Options::emit_lone_unsearched`).
+The rules: a structure retired for a cost is looked at again when the cost
+goes, since the rule outlives its reason; a form allowed past a bound its
+code was written under is read for every per-operation step that is linear
+in its size, since none of them was ever priced at that size; and a test of
+a form that stands across writes writes the way the workload does -- an
+ascending run of inserts into an empty table opens a direct run, whose close
+drops every block table, which read as the form being dropped until a
+backtrace on its drop named `close_direct`.
+
+**A second pass that asked again what the first had found.** A point
+read over a store with tombstones runs a pass newest source first for the
+newest tombstone and then reads the values oldest first, and the second
+pass asked every source again: the live table's probe, each frozen
+table's, each piece's filter and, where the filter passed, its index. A
+`put` is a delete and an append, so every store an update mix has reached
+has tombstones, and every point read after the first write mix paid the
+second probe; the scrambled D read 0.93x of LMDB in the row's order with a
+seventh of its thread in the pieces' filters, and the read pass, over a
+store with none, never showed it. The pass keeps what it found of each
+source for the reads after it (`Options::read_probes_once`): callgrind
+over three hundred thousand keys with two pieces of puts and puts in the
+live table counted 1,492 instructions a read against 1,658, and the read
+pass with no tombstones level. The rule: a pass over sources a pass
+before it probed takes that pass's answers, since a probe asked twice is
+paid twice; and a cost that appears only once a store has a property the
+workloads give it after their first write is priced in that store, not in
+the clean one the read pass meets.
+
+**A recovery that made again what it had been left, and that nobody had
+timed.** The open made a piece of a run a killed writer left by reading
+the run's file whole, copying every key and every value out of it into
+vectors of their own, feeding each back through a segment writer into a
+new file, syncing that and removing the old one, and then opened the
+piece and walked its records again for a Bloom. The log beside it was
+read whole into a buffer before a frame of it was parsed, and the store's
+greatest key was found by a walk of the table the replay had just filled.
+Nothing was wrong, and the open of a store of three hundred thousand keys
+took a fifth of a second: the suite had opened no store until the
+recovery workloads, their first rows read supdb's open of an ordered
+load level with RocksDB's replay of its log and two hundred times
+LMDB's, which recovers nothing, and were read as what a recovery costs,
+and the profile of one open was taken only when somebody asked what
+there was to do while a pull request waited (`bench/examples/reopen.rs`; the counts are
+in `docs/engine.md`, crash injection). A third of the ordered open's
+instructions were the allocator's and most of the rest the second
+writing of bytes the file already held in the form a segment keeps them.
+The open finishes the run's file where it lies now, by the finish its
+close would have run (`SegmentWriter::resume_run`), over a walk that
+keeps offsets and copies nothing; the log is parsed through a mapping,
+and the greatest key kept as the records go by. A recovery that edits
+the file it recovers has crash windows the file never had, since an open
+cut short leaves the writer's file with part of an index, or whole, or
+linked, or named: `tests/runlog.rs` builds each, and holds the finished
+piece to the segment a clean close of the same commits makes, byte for
+byte. One line written beside the change was a hazard: a removal of
+whatever stood under the piece's name before the link, against a stale
+name an earlier open might have left. A mutant without it passed every
+test, and reading for a state that reaches it found the open's sweep of
+unnamed files ahead of it -- so the only file that could stand there was
+one the manifest names, and the removal would have unlinked it. The
+rules: a recovery path is a path, profiled when a workload first takes
+it and never excused as rare or as the design's price; in one, look
+first for work that reproduces what is already on disk in the form the
+format keeps; a recovery that writes into what it recovers is tested at
+each of its own crash windows, built from the states before and after
+it; and a defensive step that no test can reach is read for what it
+would do in the state that could reach it, before it is kept as
+harmless.
+
+**A turn left for the next one, which had no reason to come.** The
+upkeep thread's fill is left for a later pass while the writer has a
+newer commit posted (`Options::upkeep_fill_skips_posted`), on the reading
+that the pass for that commit would make it. A pass files and fills only
+where it is due, and it is due by what its own commit brought -- a backlog
+past the bound, a burst's batch, a scan since -- so the commit posted
+behind a pass could bring one that did nothing: a commit with nothing
+staged, or a mix's hundred writes under the bound. The fill was left by
+the first pass and taken up by no other until some later pass was due of
+itself. `a_load_nobody_reads_files_no_forms` ends its writes with a commit
+of nothing; where that commit was posted while the pass for the last batch
+was in flight, the settle after it returned with no form built, and the
+arm that files far from reads read as filing nothing: once on a hosted
+runner, in none of three hundred runs of the test alone under load and
+none of twenty on one CPU. Three reconstructions through the seams
+reproduced nothing, each a guess at the schedule: the fills' room closed,
+the thread held before each pass, a held pass under the wrong commit's
+name. What reproduced it was the test's own store in a loop beside the
+whole test binary's load, seven trials of a hundred and fifty, and what
+read it was the counters the assertion had been given before the hunt:
+four to seven fills left, no fresh build, the last pass refused as
+nothing due. A fill left is owed now (`FormsState::fill_owed`) and the
+thread's next pass is due by the debt, none of four hundred trials under
+the same load; the test holds the pass and posts the empty commit behind
+it (`hold_upkeep_pinned`), near reads in the store as it ships and far
+from them under the arm, and fails without either half of the fix. Across
+the suite's mixes and lag sweep at ten, a hundred and three hundred
+thousand keys under both policies, a fill was left in 2,519 passes of
+9,038 and no pass was due by the debt alone (`Db::fill_owed_due`, `owed`
+on the counters line; `docs/engine.md` has the command): every commit
+behind a deferral there brings a pass due of itself, so no cell can have
+moved and none was priced. The rule: work a step leaves to the next step
+is recorded as owed where it is left and makes the next step due, since
+whether a next step runs is decided by its own inputs and never by what
+was left for it; a flake no run of the test alone reproduces is run
+beside the load it failed under before its schedule is guessed at, and
+its assertion is given the counters first, since a failure that comes
+once is read from whatever it printed; and a change to when work is done
+is held to a count of how often it fires in the suite's own passes before
+it is priced, since a mechanism that fires in none of them leaves a
+pairing nothing to read.
+
+**A form priced at the one bound it fits, and an arm that kept its
+sibling's setting.** The stride form -- a partition's values alone at
+their stride, read by arithmetic on the key -- was built for the C mix at
+ten million keys under 1.25 GiB, and its forced arm read C there at three
+times LMDB's with no fault. Its bytes are the payload's, a gigabyte at
+that store between the block form's 0.72 and the raw form's 1.45, so it
+fits beside a lean process under that bound and on neither side of it:
+under 1 GiB it took 0.085 faults a read and lost five of the six
+scrambled mixes to the default, at three million keys, where the raw form fits, it traded
+its point reads for the scans, E and the loads, and the budgets at which
+it passes the fill share the coding gear keeps while the raw form does
+not fit are 1.18 to 1.45 GB, which the suite's bounds lie under. That
+arithmetic needs the three sizes and nothing else, and it was done after
+the form was built, reviewed six times and gated. And its first pairing
+beside the block cache read E at 0.6x of LMDB with 0.028 faults a read in
+the first read pass, which was the arm's and not the form's:
+`supdb-cache64tofitzstride` is its block sibling's policy with one field
+moved, and the sibling keeps the raw records in the page cache
+(`zdropraw` off), so the stride files stood beside the form they replace.
+The rules: a second form's size is set against the budgets on either side
+of the cell it is built for -- the bound below it, the rung where the raw
+form fits -- before the form is built, since a form that wins at one
+bound has a band and the band is arithmetic; a probe that shows what a
+cell allows is a ceiling for that cell and says nothing of its
+neighbours; and an arm made of a sibling's policy inherits what the
+sibling pins, so the options a pairing's question rests on are read off
+the arm before its cells are. It came again with the stride form's
+sparse variant, built for keys that are no run of numbers: a hundred and
+eight bytes a key where the block form's are eighty-five, a gibibyte at
+ten million keys, priced for two days at 1.25 GiB and 1 GiB, where the
+store in it fits only while the process is at the sixty megabytes it
+holds after a load and not at the three hundred and forty it holds by
+the scrambled mixes. Three rules for asking the form were built and
+paired at those two bounds, each a different way of losing less, before
+one traced rep at 1.5 GiB, run to show the form where it fits, read the
+store whole in it ahead of the shipping engine in nineteen cells of
+twenty-two (`docs/engine.md`, keys that are no run of numbers). The
+corollary: the arithmetic of a form's band is done with the process at
+the most it holds through a row, read off the group's own samples
+(`scripts/groupmem.py`), and the first pairing of a form is at a bound
+inside the band, whether or not the roster has one there.
+
+**A fit read off a file's size, and an estimator built before the counts
+at hand were held to the answer.** The stride form was written off under
+1 GiB as a form that does not fit, its gigabyte against a fill share of
+the budget, and paired form against form in the row's order
+(`docs/engine.md`, which form a workload calls for) it read C at four
+times the block form there and the scans at twice, with no fault until
+the write mixes had grown the process. Its faults were the same to three
+figures in both orders, and a model of the page cache with one unknown,
+the bytes the pass left to the form, solved to a capacity that rose 75 MB
+through the read passes and fell a hundred through the mixes, every kind
+of pass in a stretch agreeing on it (`bench/examples/formfit.rs`). So a
+form fits or does not by the pass, a line drawn at a share of a budget is
+crossed both ways inside one row, and the store that reads fastest at
+such a bound is in two forms. How much of each the model then got wrong:
+priced at the capacity the stride arm's faults implied, a store half to
+three quarters stride was to read ahead everywhere, and built
+(`Options::zpages_stride_below`, the arms `...zstridedrop2m` to `...7m`)
+it faulted through every pass after the write mixes. The one unknown was
+three things a census of the page cache by file counted in one run: the
+process, a hundred megabytes larger after the mixes than before; the
+ordered index's heads, which the block form's scans keep in the cache
+and the stride form's never touch; and, over the read passes, no limit
+at all, the group standing a sixth under its bound while the form files
+were read back after the load. With the room counted so, three tenths
+of the keys in the stride form fit, and that store read ahead of the
+block form or level with it in sixteen cells of twenty in both orders,
+C at two and a half times. The
+estimator went the way the form had: a sketch of reuse distances that
+every form would read at its own bytes a key was built first, read the
+forms 8% to 50% off because a granule of ranks is no form's page, and was
+taken out for two things already there, a miniature of the cache itself
+and Che's approximation over the reads the store counts a partition
+(`zselect::model_populations`), neither of which put a store that faults
+on the side of one that fits in any line of the probe. The rules: a fit is
+priced as faults an operation in the pass that would take them, never as
+a size against a share; a model of faults is held to the measured ones by
+solving for the capacity pass by pass and asking whether it moves like one
+quantity; an unknown solved from one arm's faults is that arm's, so
+before it prices another store what it is made of is counted, by file
+and by owner, at the pass it is to be used in; and before an estimator
+is built, what the store's existing counts already predict is held to
+the exact answer first.
+
+**A form priced in the arm that forces it, without the lifecycle the
+controller gives one.** The stride form's forced arm read the lag sweep
+at ten million keys under 1.25 GiB with its one-percent burst at a sixth
+of the default's rate, the pass after the ten-percent burst at 0.6 major
+faults a scan and the pass after the full rewrite at half the default's,
+and the first reading was fit again: a gigabyte of stride files beside
+the burst's pieces. The counts said otherwise for two of the three. At
+the ten-percent pass the group stood 180 MiB under its limit while the
+scans refaulted the form 4 KiB at a time: the burst had pushed the pages
+out and nothing asked them back, since the rewarm runs only once the
+selector has installed a form (`Maint::z_rewarm_look`) and a forced arm
+installs none. The burst's writer was waiting and not working, with no
+hold, behind form files built just before it and never synced, since a
+build syncs only a file it drops (`BuildPlan::sync`). Only the third was
+the form's. `supdb-zstride` is the default with every build asking for
+the stride form, and under the controller the first two went. What was
+left is a fit the selector's model cannot see: its budget is the limit
+less the process and a margin, and after a full rewrite 400 MiB of the
+page cache is the burst's pieces, the indexes, the log and the merges'
+own traffic, so it predicted no fault for a form the pass found a
+quarter short of its pages (`docs/engine.md`, which form a workload
+calls for). The rules: a mechanism measured in an arm that forces it is
+measured without whatever the controller does around it, so before a
+forced arm's loss is read as the mechanism's the gates on `installs` and
+on the gate's state are listed and the arm that leaves the controller in
+charge is built; a fit is read against the group's own count at the pass
+before it is reasoned from sizes -- room unused beside refaults is an
+ask not made, and no room is a fit; and a budget is named for what it
+subtracts, since one that leaves out a tenant says yes on that tenant's
+behalf.
+
+**A rule taken build by build, of a store whose size its builds do not
+know.** The stride form asked for only where the store in it fits the
+room (`Options::zpages_stride_room`) was right at ten million keys under
+1.25 GiB, where the store whole in the form fits, and at 1 GiB it built
+24 of 29 partitions in the form, each while the store so far fit: the
+store that stood at the load's end did not, and from the write mixes on,
+the process a hundred megabytes larger, it read the scans beside the
+mixes at 0.3-0.5x of the default at 0.3 major faults a scan
+(`docs/engine.md`, which form a workload calls for). It is the raw-tail
+pick's shape, read a third time: a choice that holds for a store's life,
+made over a store still being written and a process at its smallest. A
+rule at the build can only be the load's half of the choice; the other
+half is a way to take the choice back once the store's size and the
+process's are known, and the room that half is judged in is read with
+the process at the most it has lately held (`Maint::z_budget_grown`),
+since the budget read after a load is the largest the store will see.
+
+**A mutant that survived because the defect was already there.** The
+test that a merge's outputs keep the form of the partition they rewrite
+passed with the key ranges taken out of the plan, every output asked for
+the stride form. The test was not weak: the plan read the ranges from
+the partitions a form file serves, a merge's outputs are served by
+nothing until a tick attaches their files, and a store's merges are
+planned one at the landing of the one before -- so after the first merge
+the plan found no range at all and built every later output in the block
+form, with the ranges or without them. The independent review named the
+same defect from the code the same hour. The plan takes an output no
+form file serves yet for the form its range was last asked in
+(`Maint::z_stride_spans`), and the test rewrites the store twice with no
+tick between. The rule: a surviving mutant is read as a question about
+the code under test before it is read as a hole in the test, since a
+defect that makes two behaviours alike hides the mutant that tells them
+apart; and a plan made at a landing reads the state the landing leaves,
+which is not the state a tick later.
+
+**A second form kept beside the first, under the name of neither.** The
+conversion between the block and the stride forms first kept the file it
+replaced, unserved, so that the way back would be an exchange and not a
+build. A build renames its file over the partition's name, so the kept
+file was an inode with no name, and after an exchange the file under the
+name was the kept one: the rewarm, a settle's wait for the asked files
+and a reopen each reach a form file by its path, and each would have
+taken the kept file for the served one -- read it in, waited on it,
+attached it. The review found it by listing every use of the name; no
+test could have, since every answer stays right. The kept file is gone
+and each way is a build. The rule: a file reached by its name in one
+place and by a handle in another is one file only while the two agree,
+so whatever can make them differ is checked against every use of the
+name; and a cheaper move is priced after the plain one has been
+measured, not built beside it.
+
+**A model's edge that reads as its opposite.** `model_populations`
+answers every touch a fault where the cache it is given is no bytes,
+whatever the populations are, so two stores compared there differ only
+by their decodes, and the conversion read a move into the larger form
+as its decodes saved for nothing, in a room that was not there -- the
+room it judges a move in is a share of the budget less what stands
+beside the forms, and a burst's pieces alone can take it to nothing.
+Nothing moves in where the room is nothing now. The rule: a model used
+to compare two states is checked where its answer stops depending on
+the states, since there the comparison is decided by whatever term is
+left.
+
+**A gap in a trace that printed only what was on offer.** The
+conversion's trace printed a line for each move a look offered and none
+for a look that offered nothing, so two stretches of two and three
+seconds between one build's end and the next one's start read as
+stretches with no look. The look's guard, which holds the next look off
+a hundred times what the last one took, was the one mechanism that
+could hold a look off for seconds; a look of thirty milliseconds was
+supposed for it, the look was re-timed without the build it starts, and
+the commit said the thirty milliseconds as found (`c24b7cd`). The trace
+given a line a look read a look at half a millisecond and 2.4 at the
+most, and looks every 0.3 s through each stretch with no move on offer:
+the store fitted its room as the model had it until the next pass's
+threads grew the process. The rule: a trace that prints on events
+cannot tell nothing happening from nothing to print, so the turn itself
+gets a line before a gap in it is read; and a duration nobody timed is
+not written into a commit as measured, the message being the one place
+a guess stands as a finding for good.
+
+**An effect put on a window it was not in.** B at ten million keys
+under 1 GiB read 0.76-0.78x for the conversion arm in four pairs of
+six. The conversions were the arm's difference there, each one syncs
+its file and B commits, and the note said so: a write mix in the
+window, its commits beside the conversions' syncs. No pass's edges were
+on the conversions' clock. Stamped there (`SUPDB_LAG_MARK` beside
+`SUPDB_ZPAGES_TRACE`, the store's `zepoch` line giving the controller's
+zero on the marks' clock), the last conversion was in at 35 s and B
+began at 42. What B read behind by was the hot-raw policy, which stood
+down wherever the stride form was asked for, so that the arm served no
+partition raw where the default serves its hottest -- and the arm
+whose load is built in the block form, with no conversion in its run,
+had read B the same 0.8x two paragraphs away, which was the count to
+hold the reading to before it was written. The rule: a cell is put on a
+mechanism once the pass's edges and the mechanism's events are read on
+one clock, and not before; and where two arms that share a cause and
+not the suspected mechanism read the cell alike, the cause is the
+shared one.
+
+**A read-back named for all the files, taken by two.** The one-thread
+read pass after the load at ten million keys under a bound was known as
+the read-back of the form files: built ahead under the selector's line,
+so dropped as they are written, and asked back at the crossing a
+fraction of a second before the reads begin. A rewarm at the install
+had been built on that reading, found every file on disk resident and
+moved nothing (`Options::zpages_rewarm_at_install`). Every major fault
+of the pass laid to its file (`perf record -e major-faults
+-c 1 -d -k CLOCK_MONOTONIC` cut to the pass's marks, each address
+through the process's maps) put 22,000 of the default's 26,400 and
+30,300 of the stride arm's 40,100 in two form files and none in the
+other 24: the two builds ahead in flight at the crossing, not on disk
+for its ask, taken in after the install with nothing of them in the
+cache and read a page a fault under the random advice. With those asked
+at their collect (`Options::zpages_ask_dropped`) four fifths of what
+was left was one partition's raw records, the tail partition the cache
+had let go, which no build ahead takes and which waits third for the
+builder (`Options::zpages_cross_asks_raw`). The pass was two shapes all
+along, 0.004 and 0.027 faults a read, by whether a build happened to be
+in flight at the crossing, and had been written down as the pass's own
+churn. The rule: faults are laid to files before a mechanism is named
+for them, since a fault count says how many and a kind of file says
+nothing of which; an ask covers what is on disk when it is made, so
+whatever lands after it is asked for where it lands; and a cell that
+reads two shapes with every count the same is two events, one of which
+nobody has counted yet.
+
+**An exchange priced with an actual against an estimate.** The
+conversion prices a partition's other form from what it has: a block
+file's own bytes for a partition in the block form, and for one in the
+stride form its records at the ratio the block files served come to.
+Where no move pays alone it prices an exchange, the hottest block
+partition in and the coldest stride one out. A store that had moved one
+partition out, and fitted, was offered a second move a period later and
+made it: the exchange set the moved partition's actual block size
+against the estimate of another's, the estimate was the shorter, and
+at the fill the model read the shortfall as room made, thirty-four
+milliseconds a second of faults saved by swapping two partitions read
+alike. A test that held one move
+to be all a store needed found it; the pairings had not, since under 1
+GiB every stride file has to go anyway. The exchange is priced with the
+cold partition's block form in the share the hot one's is of its own
+stride form, both of whose sizes are known. The rule: two quantities
+compared are measured the same way or the comparison is of the
+instruments, and a decision that turns on a difference is checked at
+the difference the estimate's error can make.
+
+**A rent dropped by every look that did not offer the move.** A move's
+rent was kept in a table the look rebuilt from the moves it offered, so
+a move offered at one look and not at the next began again from
+nothing. The moves out of a store over its room are priced one after
+another with the ones before them made, and between partitions read
+alike the order is the noise's: a move the pricing had put behind two
+others for one look, when two were all the room wanted, lost the 0.6 s
+of rent it had been paid and was started 0.7 s later, the store over
+its room meanwhile. Kept across looks instead, a rent that only grows would have
+bought moves on noise: a swap that pays a little in half the looks and
+loses a little in the other half would come to its price in time. A
+rent is a balance now, grown by what the move would have saved over a
+period at the period's own reads and cut by what it would have lost
+where the partition is the better as it is, never under nothing
+(`zselect::conversions_priced`, `Maint::z_convert_look`). The rule: an
+accumulator that is reset by the absence of its own input measures the
+input's continuity and not its sum; and one that is kept has to take
+the losses with the gains, or it sums the noise.
+
+**A job a step.** The controller takes a finished build or warm in and
+starts the next at its step, and it steps once a census interval, a
+tenth of a second. Nobody had counted what that makes of a chain: at
+ten million keys under 1 GiB the warms of 29 form files the cache
+already held took two and a half seconds, a job a step, and each of 24
+conversions was taken in 20-90 ms after it ended, a second and a half
+of nine and a half. The builder's thread wakes the segment work's as it
+ends, and the turn it wakes into did nothing with it
+(`Options::zpages_drive_at_job_end`). The rule: a worker polled at a
+period is priced by the period times the jobs in its longest chain, and
+a wake that the woken side does not act on is a wake nobody made.
+
+**Both orders agreed, about a cell the options could not reach.** Three
+options that act at the load's end -- a dropped form file asked back, the
+crossing's ask for raw pages, the builder's turn at a job's end -- read
+C at ten million keys under 1.25 GiB at 1.60x and 1.52x of the default,
+five pairs of six, with the arms listed both ways. Nothing in any of
+them runs in C. Each priced alone read C both ways, 0.80x and 1.27x,
+0.69x and 1.56x, whichever arm was listed second ahead, and the default
+beside them read both rates itself: C there is one cell in two shapes,
+by whether the Zipfian's head partition is raw as its reads begin, and
+the count that names the shape was on every table (the reads the
+point-key table answered, 2,500 or 85,000 through the mixes). What
+decided the shape in the traced pair was a threshold at the value it is
+compared with: the fill's quiet look asks for a partition where its raw
+bytes fit the room less a reserve, 43 MB and 94 at that store, and the
+room as the threaded scans end is 130 to 136. The rule: two sittings in
+both orders are a verdict on an option only where the option's own
+mechanism is counted in the cell; where it cannot be, the option is
+split into its parts and each priced alone before the cell is written
+down as its gain, since a cell in two shapes agrees with any option in
+both orders one time in eight; and a cell found on a threshold is
+recorded as the threshold's, with the two values beside each other.
+
+**A drop that met a page still dirty.** A served partition's raw file
+and its ordered index are dropped from the page cache as the form is
+installed over them (`Options::zpages_drop_raw`), and the ordered index
+is written unsynced by design: `POSIX_FADV_DONTNEED` over a dirty page
+starts its writeback and leaves the page, so the indexes of a load's last
+landings, 14 to 21 MB at ten million keys, stood in the cache with
+nothing to read them until a reclaim came. Under the block form the read
+pass runs at the group's limit and the reclaim comes at once; in the
+stride form the store is under its limit through every pass before the
+scrambled mixes, the pages stood, and the hot-raw policy's room, the
+group's memory unused, which counts a cached page whatever is in it, was
+short of the Zipfian's head partition by less than the idle indexes
+held. The arm of a form that reads faster made no release where the
+default made its one, and A, B and the scrambled D read 0.8x for it in
+eleven pairs of twelve. `scripts/resident.py` by file at each pass's
+start named it, 20 MB of ordered indexes against 6. The segment work
+notes each drop and advises the index's file again a second later
+(`Options::zpages_drop_again`, off). The rules: an advice to drop is held
+to the kernel's count after it (`mincore`), as an ask to read is, and a
+file written unsynced is dropped once its writeback is through or twice;
+a room read off a group's unused memory is short by whatever idles in its
+cache, so the cache is laid to files by residency before a policy is read
+as bound by room; and a leak one arm shows because the other arm's
+reclaim hides it is both arms' -- the default paid nothing for it only
+by being at its limit already.
+
+**A decision made once a rep, read at the median of three.** The stride
+arm under 1 GiB was paired with the default three reps a sitting first:
+the hot-raw policy's releases read one a rep in both arms at the median
+of both sittings, A level and B the arm's, and the default's flip was
+drafted in the tree -- the options' defaults, their docs, the bench's
+policy -- while a six-rep sitting ran. Six reps read no release at the
+arm's median in either sitting, and A, B and the scrambled D behind in
+eleven pairs of twelve. The release is one decision a rep at a threshold
+that sits at its own value, and the arms' releases differed in one pair
+of the six the three-rep sittings held and in seven of the twelve after
+them: a median over such reps is the side the coin fell on, and the
+table's own column of pairs that differed had said a coin was there. The
+rules: where a cell follows a decision made once a rep, the reps are
+counted by the decision before the median of any rate is read, and the
+cell is read as two shapes with the share of each; a count that reads
+level at the median is read in its pairs column too; and a default is not
+drafted in the tree while its last pairing runs, since a draft taken back
+out is a second edit of the files the fix that follows has to touch. It came again
+as the pass a decision falls in. F under 1 GiB read 0.90x to 0.94x for
+the stride arm in four sittings of six reps, behind in both orders of two
+pairings, and was written down as the arm's. A sitting traced and timed
+by kind laid each rep's F to the mix the hot-raw policy sent its raw
+head partition back to the form in, which is whichever mix the group's
+slack runs out in: a rep whose way back fell in F read it at 565 to 642
+ms and one whose way back fell in D or E at 510 to 593, in either arm
+and but for one rep at 726 on its commits, and the arm's fell in F in
+three reps of six where the default's fell there in one. In the same shape the arm was not behind. The corollary: a
+decision every rep makes once still splits a cell in two when the pass
+it is made in varies, so the reps are counted by the pass it fell in.
+
+**A wait on the first counter of a turn, and a fix for it that the race
+made wide refuted.** The tests step the controller by moving its injected
+clock and waiting for the selector's step count to move (`advance_tick`),
+and a tick steps the selector first and its policies look after: the
+hot-raw policy's, the conversion's. The test of the ordered index's second
+drop read, after one such wait, whether the hot-raw policy had asked for a
+partition, between that tick's step and its look: one run in ten beside a
+build, none of ten alone. It surfaced in a run of the whole suite under
+another option's switch and read as that option's for the quarter of an
+hour it took to run the test ten times each way. The first fix waited for
+the look's own count at the one step whose result was read, and passed
+twenty runs of twenty beside the build. Held to the race made wide, sixty
+milliseconds of sleep put before the look, it failed every run and the
+test without it passed every run: the tick before's look, late, ran after
+the test had moved the budget and heated the partition, and asked a tick
+early, which the unfixed test read as the ask it was waiting for and the
+fixed one waited past, into the release. Every tick's wait has to cover
+the tick, not the one whose counts are read. A tick counts its end now
+(`ZCounts::tick_ends`), behind its builder's turn and its looks, and the
+tests' wait is on that; the test passes with the sleep in. The rules: a
+wait covers everything of the turn that the test will read, and
+everything of it that reads what the test changes next, so it names the
+counter the turn moves last; a fix for a race is held to the race made
+wide before it is believed, since a fix that narrows the window passes
+every run that the unfixed test passes; and a failure met under a switch
+is run without the switch, as many times, before it is the switch's. It
+came again as a count two planners move. The test of a burst the
+writer's forms cover waits for four plans to know its four seals have
+landed, as the test it was written from does, and scans before the seals
+where that one scans after them: the idle planner's look at the scan
+(`Options::merge_plan_idle`) is a plan too, counted with the landings'.
+Counted after the baseline was read, it ended the wait with three seals
+landed, the hold on the first merge came off, and the fourth seal's
+landing found that merge finished and planned the second range itself,
+which the test read as the chain run through a burst it was to leave
+alone: three runs in a hundred alone, and every run with the last
+landing held back. The engine had chained nothing; the idle planner is
+off in that test. A wait copied from a sibling is read against what this
+test does that the sibling does not.
+
+**A lever built for the largest peak known, before a count said whose
+memory stayed.** At ten million keys under 1 GiB the allocator held 57-68
+MB free and resident through the mixes, in arenas of one free chunk each,
+and a group at its limit faulted on form files for the want of it. A
+merge's thread peaks at 84 MB in the allocator, by a probe that counts by
+thread, so the arenas were read as the jobs': the jobs' large arrays were
+made mappings of the engine's own (`Options::jobs_mapped`), tested,
+mutated and gated, and a traced rep with them read the same free bytes at
+the same mixes. The diagnostic queued to tell the allocator's two
+behaviours apart had been cancelled to compile the lever sooner. The next
+reading took the arenas' sizes, 7.5 to 8.3 MB beside a memo budgeted at
+eight, for the readers' memos, and the memos went into slabs
+(`Options::zpages_memo_slab`), also tested, mutated and gated; the traced
+rep with those read more free bytes, not fewer, and its pairing read a
+cell behind in both orders for a policy that had stopped firing. What
+answered the question was three counts no reading of sizes replaces, each
+an hour or less to make: the allocator on its own (`bench/examples/arena.rs`:
+a dead arena keeps all a thread held under the trim threshold and nothing
+over it, and `malloc_trim` returns none of it), every allocation by its
+thread in the suite's own shape (`alloc-census`: the readers 17 to 24 MB,
+the seals 14 to 16, the closes 8), and the arm that already made the
+allocator return everything, paired for the ceiling (`supdb-mmapthr`: the
+read pass after the load a third faster, two write mixes a twelfth
+slower, the rest level). The arenas were several owners', what stood
+varied threefold between reps of one arm by which thread took whose arena
+next, a smaller reader left more behind than a larger one because the
+larger freed a seal's arena past the threshold, and the whole of it was
+worth less than either lever had been built to win. The rules: memory
+that stays is laid to its owner by a count by thread, in the suite's
+shape and the phase it stays in, before a lever is built on the largest
+peak anyone has measured; a quantity that varies between reps of one arm
+is read over several before one rep attributes it; the ceiling of a
+family of levers is priced by the cheapest arm that reaches it before any
+member is built, and here that arm was in the tree; a diagnostic queued
+to decide between two mechanisms is run before either is built; and a
+budget is held to what its structure costs wherever one is found counting
+what the structure holds -- the memo's was the second.
+
+**A tenant of the bound that no census counted, charged by how a page
+came into the cache.** The stride arm's scrambled D mix under 1 GiB read
+0.77x of the default in twelve pairs of twelve, and three levers were
+built on readings of what its mixes were short of -- the ordered
+indexes' second drop, the jobs' arrays, the readers' memos -- each read
+off the process's bytes by owner or the cache's by file. A rep counted
+by mix (`SUPDB_MIX_COUNTERS`, `SUPDB_MIX_KINDS`) then read the mix in
+two shapes with every counter level, and by that mix both arms' stores
+were in one form, the same bytes in the same files. What split them was
+the group's own `memory.stat` at each pass's start: cache and rss came
+12 MB short of the group's usage in the default and 23 in the arm. The
+rest is kernel memory, which a group is charged for and bounded on with
+everything else (`memory.kmem.usage_in_bytes`), and `/proc/slabinfo`
+named it: 111,000 buffer heads, 104 bytes a block of every page the
+cache held because the process had written it. A page read back from
+the device carries none, so the store's own form files, dropped as they
+are built and asked back, cost nothing there, and a conversion's file,
+written whole into the cache and kept, cost a fortieth of its size for
+as long as it served: 11 MB at that store, and the group at its limit a
+mix early. A conversion's file goes the way the others do under an
+option now (`Options::zpages_convert_drops_output`;
+`scripts/groupmem.py` is the sampler). The rule: a bound is held against
+the group's own usage, and whatever of it the census by owner and the
+residency by file leave unexplained is counted, the kernel's accounts
+being a file's read away, before a lever is built on the part already
+laid to an owner; a page's price under a bound depends on how it came
+into the cache, written or read, which no count of residency shows; and
+a cell that reads behind with every counter level is short of something
+no counter counts, so the next instrument is the accounting a level
+down and not another counter of the same kind.
+
+**A default gated green over a roster the gate never opens.** The
+stride form's options became the engine's on pairings at every bounded
+rung and a green `sh scripts/check.sh`, and the quick run that followed
+stopped at its first rung in two seconds: the harness refuses a stride
+arm whose store holds no stride file after the ordered load, asked it of
+any arm whose options say the form, and `supdb-nozpages`, the arm with
+the compact form off, carried the engine's new option and no form file
+of any kind. The refusal had been right for as long as only an arm that
+set the stride form had it; the controller's arms were exempt by name
+and the form-off arm by nobody. The gate's bench group opens the dozen
+arms its tests name, and the fifteen controller tests the flip broke
+were found by running the tests before the gate; the roster's arms are
+opened by the quick group alone, which is not in the gate's default set
+because it is a timing run. The refusal holds a forced arm now, and its
+test has the form-off arm. The rule: a default is gated on every place
+an arm that inherits it is opened, and a check keyed on an option's
+value is read again when the option becomes everyone's, since "the arm
+that asked for it" and "every arm that pins nothing" stop being the
+same set; before a default's quick row, the whole roster is opened at
+the smallest rung with one rep, a ten-second run that says what
+twenty-five minutes would have said at their start.
+
+**An ask left for later, by the step that was the later.** The sparse
+stride form's ask is left by a build made before any reader has come
+(`zfile::StrideNo::Deferred`), for a conversion to make once reads come.
+The conversion's build took its plan from the rule a landing's build takes,
+whether a reader has come, and the rule read the census, which counts the
+reads the raw form serves: a store whose form was bought by attach on the
+model's word is read through its form files with no census read ever
+counted. So the conversion built the block form again and left the ask
+again, the look after it found a partition with its ask left and started
+the next, and a test's minute made thirteen thousand builds in one run of
+three, the other two having had a counted read by chance, until the
+selector left the form for the builds it had wasted. A conversion's plan
+takes the sparse form whatever the rule says now, and the rule counts a
+read a form file has served (`Maint::z_form_read`, `z_sparse_now`). The
+rule: the step that answers a deferred question is given the answer and
+not the question's gate, since a gate that can say "later" to the step
+that is the later is a loop; and a signal that the store has been read is
+taken from every path a read can come by, the path the mechanism itself
+installs first.
+
+**A price waived, and the evidence the price was.** A partition whose
+ask of the sparse stride form a build had left was moved in by the
+conversion at no rent wherever the model said the move paid, on the
+reading that the build would have paid none. The rent is not only what a
+move costs: it is how long the reads have to agree with the model before
+a build is spent on its word, and it is what makes a move priced a little
+either way on a second's touches come to nothing. With it waived, the
+first looks of a read pass at ten million random ids under 1 GiB -- the
+block form itself over its fill, the touches a second old and uneven by
+the sample -- moved five and six partitions in, and every one was moved
+back through the passes after, a build each way, the threaded reads a
+twentieth behind and the scrambled D a sixth to a quarter; and under
+1.25 GiB a partition the hot-raw policy had sent back to its form a look
+before was moved in inside E for a tenth of a millisecond a second, E
+0.8x in six pairs of six, which a traced rep's `zconvert` lines beside
+its `zhot` lines named in one reading. The move is free now where a
+question that needs no evidence says yes, the room's: the forms' bytes
+with the move's own fit the fill, sizes alone; past that it pays the
+rent. The rule: a price set to nothing takes with it whatever else the
+price was doing, so what it guarded against is named first and given a
+guard of its own; and a decision excused from evidence is made on a
+question that needs none.
+
+**A loss read as the keys', that every form shows and a faster form hid.**
+The threaded scans on the store the mixes leave trailed LMDB over random
+ids, 0.86x to 0.91x at ten million keys under 1.25 GiB, and were written
+down as what ids cost: the block form's decode where numbered keys have
+the stride form's arithmetic. Two readings of rows already banked said
+otherwise before any profile was cut. The rows from before the stride
+form read the same cells 0.78x to 0.95x over numbered keys, in the block
+form. And in every row the scans after the mixes are a fifth to a quarter
+slower than the scan pass before them whatever serves them, numbered keys
+in the stride form among them, 103 million entries a second and then 79,
+where twice LMDB's rate leaves the cell won; LMDB's own two passes read
+alike. Counted (`SUPDB_SCAN_COUNTERS`, a `scancounters` line a threaded
+scan pass), the two passes decode the same groups a scan and differ in
+the path: a few unsealed keys in a partition take every scan of it off
+the bulk walk and through the block loop and the form file's cursor, and
+a random id's insert falls in every partition. A sparse form built to win
+those cells, at a bound where it fits, trailed LMDB in them by the same
+fifth. The rule: before a cell lost over a new input is put on the input,
+the same cell is read in the rows before it under the old input and the
+form the new one is served by, and beside the pass before it in its own
+row; a step between two passes that every form shows has one cause above
+the forms; and a cell a form wins twice over is read for what it loses
+with the lead gone, since the next input is the one that takes the lead
+away.
+
+**A form priced for a week before its walk was profiled once.** The
+sparse stride form was priced by its bytes, by where it fits and by three
+rules for asking it, at two bounds where it does not fit; shown at last
+where it does, its scans read level with LMDB's where the whole-run
+form's read at twice, and that was not asked about. The first profile of
+its scan pass put a quarter of the threads in rendering each record's key
+from its number, a byte a digit, and a ninth more in copying the rendered
+key over the cursor's: sixteen stores of a byte and then a load of
+sixteen, the value built a field at a time and handed back whole, again.
+A whole run's walk adds one to its key in place and a sparse form's
+cannot, so its step had been written as a render and a copy and never
+looked at. The first fix made the digits a word at a time and copied the
+field's out of a buffer of sixteen at a run-time length: for a field of
+fifteen digits, two stores of eight bytes and a load of fifteen across
+them, the same stall at a third its size. What named it was the samples
+inside the library's copy split by their offset, each size's path having
+instructions of its own, read against the copy's disassembly: the
+sixteen-byte path's samples gone and the eight-to-fifteen's arrived. The
+field is stored from two registers now (`zpages::put_digits`,
+`Options::zpages_stride_step_direct`). The rule: a form is profiled where
+it serves before it is priced anywhere, the profile being cheaper than
+the first pairing; a copy of a run-time length out of a buffer just
+written is a load nothing forwards whatever wrote the buffer, so what is
+made in registers is stored from them; and samples in the library's copy
+are split by offset into the sizes copied before any caller is suspected.
+
+**Two causes named for one stall off a flat profile, and the probe that
+told them apart run second.** The values' copies out of a stride file's
+mapping took two fifths more of the threads in the scans after the mixes
+than in the scan pass, the same bytes in the same order. The first
+reading was the pages: the mixes' merges rewrite every partition, the
+files those scans read were written late, and this file's own note on
+memory placement made a slower page plausible. The second was the core's
+prefetch losing the values' stream between the runs a block-by-block walk
+reads a partition in, and a lever was built on it: an ask for the head of
+each run's lines, an option with its arms, tests and fuzz draw. Counted,
+it fired at every run, moved the copies' samples by a fiftieth and cost
+the walk more; its pairing read the scans within a tenth either way
+beside cells it cannot reach leaning a sixth; it was taken out. The first
+reading was then answered by ten lines of harness: the store folded
+before those scans (`SUPDB_SCAN_MIXED_FOLD`), the same late files with
+nothing overlaid, read at the scan pass's rate. So it is the path, and
+which part of the path the copies wait on is still not known. The rule:
+where a stall has two candidate causes, the probe that holds one of them
+fixed is run before a lever for either is built, and it is usually the
+cheaper of the two to write; a lever whose count says it fired and whose
+target did not move is taken out, not kept as an arm of something that
+does nothing; and what is left unexplained is written down as unexplained.
+
+**A fix given to the walk a drained store takes, and not to the walk a
+written store takes.** The bulk walk was made to step the fence to its
+next entry (`Options::zpages_bulk_steps`) on a profile of the threaded
+scan pass that put a sixth of the walk in a binary search of the fence's
+ranks at every page. The cursor, which walks every partition with an
+unsealed key over it -- every scan after a write mix -- kept the search,
+and was found by the same symbol in a profile of the pass after the
+mixes, a ninth of the cursor's own time (`Options::zpages_cursor_steps`).
+Its pairing then resolved nothing: counted, it stepped ten million times
+a rep, and its cells read three to seven in a hundred lower, as did the
+scan pass and the load, which it cannot reach, the arm's hot-raw policy
+having released less in every pair. The rule is this file's own, that a
+path given the fix for a shape is the occasion to check every path that
+shares it, with the walks' corollary: the scan pass on a drained store is
+the one shape the mixes never show, so a fix to the bulk walk is looked
+for in the cursor the same day. And a lever worth three in a hundred of
+one pass stands on its count and its profile, not on a pairing of three
+reps under a controller that makes a decision a rep, where the decision
+splits the cell before the lever moves it.
+
+**A ceiling priced beside a form that fit, and not priced again when the
+form stopped fitting.** The memory the readers' arenas keep after their
+threads end was priced once, over numbered keys at ten million under
+1 GiB: the allocator's threshold as the ceiling, worth little, and the
+slab that gives a handle's memo back (`Options::zpages_memo_slab`), which
+read no fewer free bytes; both were left off. Over random ids at the same
+bound the row's one cell lost to LMDB, the scrambled E mix at 0.68x and
+0.76x, took 0.40 major faults an operation, and the same three steps that
+note gives found it in an afternoon, each an arm already in the tree: the
+census by owner, 88 MB freed and resident through four mixes and 177 by
+the last, beside a block cache of 25; the ceiling by the allocator's
+threshold, the scrambled mixes 1.05x to 1.45x; and the owners' arms one
+at a time, the slab alone reading those mixes 1.19x to 1.85x and the
+scans after the mixes 1.30x to 1.87x in both orders. Random ids are read
+through the block form in every partition, so every reader's memo is
+full, and their block form is 856 MiB where numbered keys' is under 700:
+the form misses its fit there by about what the arenas hold. The rule: a
+lever written off as worth little is written off at the fit it was priced
+at, and is priced again whenever an input moves the store across a fit
+-- a shape of key, a value's size, a bound -- since memory nothing is
+short of at one size is the whole shortfall at the next; and a cell lost
+by faults under a bound is read against the process's bytes by owner
+before any form is blamed.
+
+**A path the suite's keys took for free, and every other key paid a
+record for.** A landing near reads walks each of its pieces against the
+block boundaries of the partition under it, for the tables that will
+read the bounds, and takes each boundary's key from the ordered index's
+top level where a head is the whole of a key (`OrdIndex::whole_key_at`).
+That is every key the suite numbers, sixteen digits behind a common
+prefix. An id runs on past its head, so over ids each boundary was a
+record: 156,000 a landing at ten million keys, a cold line each in core,
+and under a bound, where the block form serves and the raw records are
+out of the cache, a major fault each on the one thread every landing
+goes through. The lag sweep over ids under 1 GiB was the first run to
+meet it, and it lost no cell there, it was killed: the landing of the
+ten-percent burst's seal took 76,000 faults in five seconds and had not
+published, three tables stood frozen behind it with their snapshot
+copies, and the full rewrite's burst took the process from 450 MB to the
+limit in under three seconds. Under 1.25 GiB the same sweep survives
+with its writer waiting five seconds for landings. The map of where ids
+trail LMDB had been drawn over the row's passes and left the sweep out,
+and a pairing queued for another option was what ran it. Three readings
+found it in an hour, in this order: the counters of the last point that
+printed, no piece standing and a frozen table with its copy in the
+census where numbered keys read twenty-four pieces, which said a landing
+was missing and not that memory had an owner to find; a sample of every
+thread's state twenty times a second (`/proc/<pid>/task/*/stat` and
+`stack`), which had the seal's thread done inside the burst and the
+landing's thread in a page fault from then to the kill; and every major
+fault by its instruction (`perf record -a -e major-faults -c 1 -d`),
+which named `Maint::rank_before_publish`. And the bounds were for
+nobody: the sweep's scans had the writer give its block forms up for the
+merge path, and the landing asked whether the block cache was on by
+option, not whether a table stood to read them. A walk places a boundary
+by its head now where the head is not its key, between the two byte
+strings the head brackets the key by, and reads the record only where a
+key of the walked source falls inside (`Options::bounds_by_heads`,
+`OrdIndex::head_bracket`), the same bounds to the entry; and a landing
+leaves its bounds while the writer keeps no forms and no handle is live
+(`Options::land_bounds_read`). The rules: a fast path keyed on a
+property of the suite's keys -- a head that is the whole key, one
+length, a run of numbers -- is a slow path the suite has never run, so
+such sites are listed (`whole_key_at`, `uniform`) and a second key shape
+is run over every pass, the sweep with the row, before the map of it is
+called drawn; a process killed under a bound is read from the last
+counters it printed and then from its threads' states before its memory
+is summed by owner, since what piles up behind a stalled thread has an
+owner's name on it and is not the cause; derived work is gated on its
+reader, never on the option that makes a reader possible; and a stall
+on the writer's path is somebody's pace, so its removal is read on the
+phase after it -- the pass after the full rewrite read a seventh slower
+under 1.25 GiB with the stall gone, its burst a quarter faster, the
+merges having had five seconds less to drain. The same walk was pacing
+a second thread. The snapshot's bounds take the same boundary keys, on
+the upkeep thread, and over ids each was a form file's group decoded:
+under the default that thread made six or seven passes over the whole
+of ycsb-A at ten million keys under 1 GiB, fifty milliseconds each and
+nearly all of it that walk. With the heads placing the boundaries it
+kept up and made one pass a commit, 736 of them, filing every commit's
+writes alone as `forms_settle_every` says it should and building twice
+the forms the batched passes had (18,774 against 8,437-9,508), and A's
+commits ran a quarter slower beside it (`SUPDB_MIX_KINDS`: 299-319 ms
+against 228-252), A at 0.84-0.85x of the default in four pairs of four
+and still twice LMDB's. Numbered keys, whose bounds were always free,
+have always run that regime; the slow walk had batched ids out of it by
+accident. The corollary: a thread's pass schedule is a function of how
+long its passes take, so a change to a pass's cost is read on the
+passes counted and the work a pass does, and a regime that holds only
+because something was slow is measured with the slowness gone before it
+is called the regime's cost.
+
+**A room that reserved the thing its tenant replaces, and a bind that
+stopped the work that would have made the room.** The row at three
+million keys under 1 GiB read the scan pass after the lag sweep's full
+rewrite at 0.04x of LMDB, 410-520 ms across five sittings where LMDB
+reads 22-24. The block cache's own budget grows into the room the
+partitions leave (`scan_cache_auto_room`), and the room charges every
+unserved partition's whole key section beside the cache, while a block's
+copy stands in for its records for every scan: the first crossing grew
+into the room, the second found none, and the budget bound twenty to
+sixty megabytes short of a copy for every block. A bound cache's fill
+and its conversions stop for the store's life (`maintain_forms`), so a
+quarter of the blocks stood sparse at the pass over records the bound
+had pushed out, one to four thousand sparse walks and half to three
+thousand major faults in 3,000 scans. Three readings came first, each true of the slow reps and
+none their cause: the conversions' reads leaving the raw pages the
+cache's newest, a fix designed and not built; the controller's crossing
+in the middle of the burst; and the memory the jobs' threads leave in
+their arenas, where mapping the jobs' arrays made every block a copy in
+nine reps of twelve -- by lowering the anonymous memory the budget's one
+growth was drawn from, a reading and not the mechanism. What named it
+was removal by arms the tree already had, twelve reps a pairing with the
+counts by rep (`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh A supdb
+3000000 --bound 1073741824 --reps 6 --ops-div 10 --passes load,lag`, at
+`cf8417a`): the controller off read the pass no better, the controller
+off with the jobs mapped 36-54 ms at the median, and the cache's budget
+off (`supdb-cachenoauto`) 30 ms with every block a copy in eleven reps
+of twelve and nothing else changed; and one count split every arm's
+reps before any of it, the forms shed, two thousand a sweep where the
+budget bound and eight where it did not. The cache is granted the raw
+records' place now where the budget would bind and no point read is
+near (`Options::scan_cache_copies_fit`): what the bound leaves once the
+unserved key sections are given up, where a copy of every block fits in
+it, taken back at the first point read (`Shared::points_far`) and held
+to the place as the page cache's budget is read again. Alone it read
+the pass 19-45 ms in twelve reps of twelve and the burst a sixteenth
+slower, and the row's burst there stood level with RocksDB's. The burst
+was the second finding: the store sits at the controller's census from
+its load on, the chain through writes (`merge_chains_writes`) landed
+forty merges in the sweep where the seals' own plans land twenty, and
+every landing leaves its partition's copies without their identity, so
+the settle's patches and the scans' starts search where they had
+indexed -- the upkeep thread's settle 5.9 s of a burst of 9.1 against
+3.6 of 6.7 with the chain off (`supdb-nochainwrites`), and the head
+asks, the other census switch, saved faults and cost nothing
+(`supdb-oocz`). A writer whose forms cover the store walks no piece, so
+the chain runs through a burst only where they do not
+(`Options::merge_chains_writes_uncovered`), which alone did nothing,
+the budget binding and the chain resuming with it. Together, at
+`3f46cb4` (`pair.sh supdb-copiesfitchain supdb` as above): the pass
+15-24 ms in twelve reps of twelve, the burst 7.7 s against 9.1; against
+the comparators in both orders, the burst 1.22-1.24x of RocksDB's and
+the pass 1.08-1.13x of LMDB's, ahead in five pairs of eight, what is
+left of it the first scan's wait for the upkeep thread's pass in
+flight and a merge the idle plan starts beside it. Under 1.25 GiB the
+budget never binds and the chain's option alone acts, the burst
+1.21-1.26x in four sittings of four and the pass after it 1.17-1.22x;
+at ten million keys under either bound neither acts, the copies fitting
+no place and the writer's forms given up before the first burst
+(`cache_copies_grants` 0, the merges landed the same), and in memory
+neither can. The first version of the chain's option then failed its
+own control: it asked what a scan needs of the pieces and nothing of a
+point read, which probes every piece over its key whatever the forms
+hold, and four of the suite's six mixes are point reads and writes with
+no scan between them, so in the row's own store it left the mixes'
+pieces to the seals' plans. The pairings without the lag sweep, six reps
+an order (`--passes
+load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled`),
+read five and six cells behind in both orders, D, E and F at the smaller
+bound and the read-only C at the larger, with every count the option
+keeps the same in both arms; a store with a point read near is
+uncovered now (`Maint::forms_uncovered`, at `e57fc5c`), and the same
+pairings read three behind and two ahead, and one and four. Both
+options are the engine's since; `supdb-nocopiesfit`,
+`supdb-chaincovered` and `supdb-nocopiesfitchain` are the shapes
+before, and the arms the pairings above name are those commits'. The rules: a budget
+for one tenant is drawn against what the others need given what this
+one holds, since a cache that replaces pages is charged for them twice
+by a room that reserves them; a limit that stops work is read for
+whether the work stopped is the work that would have relieved it; a
+lever that fixes a cell by moving a reading is asked which threshold
+the reading feeds before it is taken for the mechanism, and the arm
+that removes the threshold is paired before anything is built; and a
+cell is read beside every other cell of its pass before one is paid for
+with the other, the burst here a tie nobody had looked at because the
+pass beside it was lost twenty-five times over; and an option written
+for what one kind of read needs is asked what every other kind needs of
+the same structure before its control is run, since the control found
+it only as a lean no count explained. Beside it, three things
+the mutants found, twenty-five of them: the model's `check` makes point
+reads, which a test of a store far from them cannot use
+(`check_scans`); a budget held to a place under the budget before its
+grant was reached only by squeezing at the grant itself; and an
+enforcement added on a misread of that case's failure survived its own
+mutant, the patches' shed (`patch_block`) making it already, and came
+out. And the floor under every pairing here: the default paired with
+itself at this rung (`pair.sh supdb supdb` in the same shape, at
+`558606d`) read twelve cells of twenty-nine apart in one direction in
+both orders, by up to 1.39x, so no verdict above rests on a rate that a
+count beside it does not carry. It was needed twice more the same day:
+the clean store's one-thread scan pass read a tenth to three tenths
+behind for the options in four sittings of four, a pass they cannot
+reach, and the default against itself read the same pass 1.13x and
+1.27x apart for the arm listed second, thirteen pairs of sixteen
+(`pair.sh supdb supdb 3000000 --bound 1342177280 --passes
+load,read,read-threaded,scan --ops-div 10 --reps 8`); and the one- and
+ten-percent bursts at ten million keys leaned a twentieth against in
+thirteen readings of sixteen, a hundred and a thousand fdatasyncs each,
+with the upkeep thread idle and the pieces and the segment work's time
+the same in both arms. A lean that agrees across sittings is read
+against the same cell under identical arms before it is read at all.
+
+**A page asked back into the cache and left out of the page tables, and
+three cells sunk by one rep's start.** The first row taken at the
+defaults above read the fixed cell at 0.97x of LMDB at three million
+keys under 1 GiB, and beside it the passes after the one- and
+ten-percent bursts at 0.96x and 0.89x where the row before had them at
+1.47x and 1.26x. Read by rep and not by median, it was one thing: in two
+reps of three the sweep began on a store whose raw files the load's last
+merges had written and nothing had read, the first pages a reclaim takes
+-- the clean store's pass at two million entries a second where the
+third rep read thirty-two -- and the sparse walks after the small bursts
+and the conversions of the full rewrite paid for the same cold pages,
+the burst a sixth slower with them. It had been one rep in three in the
+row before, five reps of twenty-eight and six of forty-eight in that
+morning's pairings, and thirteen of sixteen and fourteen of fourteen in
+the evening's, the engine's shape the same. The settle's ask for the raw
+files (`Options::zpages_rewarm_raw`), built for that pass and left off,
+took the cold start away in sixteen reps of sixteen
+(`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh supdb-zrewarmraw supdb
+3000000 --bound 1073741824 --reps 8 --ops-div 10 --passes load,lag`, at
+`f686686`) and left its own passes at 17-41 ms where a store never
+pushed out runs 10-14: the pass took 1,400-2,260 minor faults in three
+thousand scans against 621, the pass's time over the reps a line through
+them at about eight microseconds a fault, since a page the cache drops
+leaves the page tables with it and comes back resident and unmapped.
+Mapping at a release had been built once and taken out on a test's
+count, seven faults over ninety-one pages in memory, where a fault
+maps sixteen pages and costs a tenth of that; under the bound the count
+was two thousand a pass and the price the regime's. A settle that asked
+maps what came back (`Options::zpages_rewarm_raw_maps`,
+`MADV_POPULATE_READ` over each segment's records and ordered index where
+nine tenths are resident, 14 ms for twelve segments): the clean store's
+pass 12-15 ms at the median with 658 faults and no cold rep in
+twenty-seven, 1.6x the ask alone (`pair.sh supdb-zrewarmrawmaps
+supdb-zrewarmraw`, at `4c0e886`), the passes after the bursts level or
+ahead, and the full rewrite's burst 7.8 s against 9.9 beside a default
+that started cold in every rep of that sitting. At ten million keys the
+ask finds no room under either bound and maps nothing. Both are the
+engine's now; `supdb-norewarmraw` asks for nothing and
+`supdb-rewarmrawnomap` asks and maps nothing. The rules: a row's cell is
+read by its reps before its median, since one start can sink every cell
+of a sweep in the reps it strikes and a median of three flips on one of
+them; a shape whose rate is the host's is counted in the sitting at
+hand, never carried from the morning's; a lever refuted by a count is
+counted again in the regime in front of it, the fault's price being the
+regime's and not the mechanism's; and resident is not mapped --
+`mincore` answers the first and `/proc/self/pagemap` the second, and a
+test of the second reads the second.
+
+**A reservation in a budget's arithmetic, read as pages the kernel would
+keep; and a model that took its tenant's bytes for a misfit.** The first
+bounded row taken with the cache in the raw records' place read the cell
+it was built for, the pass after the lag sweep's full rewrite at three
+million keys under 1 GiB, at 0.52x of LMDB: two reps of three at 57-70 ms
+where the pairings of the fix had read 14-27 in eleven reps of twelve.
+The row said what kind of thing it was before any trace. Its per-rep
+quantities put 146-183 major faults on the scanning thread in the slow
+reps and one in the fast, at 220-340 µs a read behind 50-60 MB that other
+threads read; and the arm that advises nothing (`supdb-noadvice`), whose
+every fault brings a readahead window, took none in three reps of three
+and read the cell at 1.6-2x. Traced in the row's shape (`perf record -e
+major-faults -c 1 -d` over `bench ab --arms supdb,supdb --size 3000000
+--bound 1073741824 --reps 3 --ops-div 10` under `SUPDB_LAG_MARK` and
+`SUPDB_ZPAGES_TRACE`, at `b2d0dfc`), every major fault of the scanning
+thread in six passes but one was `Reader::scan_seek` on the ordered index
+of one partition a merge had landed a second and a half before the pass,
+and the upkeep thread took twenty to seventy on each index landed in the
+burst, a second or so after its landing. The place the cache is granted
+is the budget "less each unserved partition's ordered index, which a
+scan's start seeks whatever holds its blocks": bytes left for the index
+in an arithmetic, and no page held by it. What holds them is the heads'
+copy (`Options::heads_owned`), and at the census a copy is made only
+while the controller's model says the raw form fits, a misfit there being
+the stretch before a purchase. The model's budget is the limit less the
+process's anonymous memory: the grant put 265 MB of copies into that
+memory, the records they stand in for stayed in the populations the
+budget is held against, and the model read 0.39-0.43 faults a read from
+the third second of the burst on, under a budget of 262-276 MB against
+records of 372, of a store nothing would be bought for, the grant
+standing only far from the point reads whose faults buy a form. It is the
+double count of the room that reserved the thing its tenant replaces,
+fixed there for the cache's own budget and left standing in the next
+reader of the same budget. Every partition landed after the grant kept
+its heads in a mapping, eight megabytes of them at the pass. A grant
+standing reads as the store left raw now
+(`Options::heads_owned_beside_copies`; `supdb-headsmodel` is the model's
+word alone). Paired at `15178d9` with the arm as it was then named
+(`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh supdb-headscopies supdb
+3000000 --bound 1073741824 --reps 8 --ops-div 10 --passes load,lag`, and
+the row's whole order at four reps): seven copies a sweep made for the
+grant alone, the scanning thread's major faults one at most in
+twenty-four passes where the model's word left passes of 63 to 190 in
+four of thirty-six, and the lag-only pass 16.5 ms against 22 at the
+median;
+under 1.25 GiB at that rung and at ten million keys under either bound no
+grant is made and the count is nothing. The pairings had not shown the
+row's two reps in three: the heavy shape was a rep in eight to twelve of
+theirs, at a hundred microseconds a fault where the row's took two to
+three hundred, and which index's pages the kernel takes just before a
+pass is the host's. The same trace named two costs of the burst that are
+not fixed: the upkeep thread took 8,000-46,000 major faults a burst
+building copies from raw records the cache had let go (`Blob::scan_at_in`
+under `BuildCtx`, its copies, `prefetch_ranks`), the burst 6.9 s at the
+first count and 9.3 at the second, and the controller's sampler
+2,800-4,300 more, sampling at every landing for a purchase no read was
+near to make. The rules: bytes a budget's arithmetic leaves for a
+structure are a claim about the kernel, held to the structure's
+residency at the pass that reads it (`scripts/resident.py`) or made true
+by holding the pages; when a double count is found in one reader of a
+quantity, every other reader of it is read the same day -- the model,
+the builds' line and the form's room all read the budget the cache had
+just been found charged twice in; a row's per-rep quantities and its
+sibling arms are read before a trace is cut, since the arm that differs
+in one option and does not show the shape names the mechanism's kind;
+and a fix read in pairings is the row's only once the row's own harness
+has taken it, the rate of a shape the kernel's timing makes being the
+sitting's.
+
+**A cost taken off the reader's path, and paid back by the reader in
+pages.** At ten million keys the writer gives its block forms up for the
+merge path, the commit's maintenance then does nothing, and the first
+scan after a burst sorts every unsealed key itself: by the sweep's own
+phase timers 16-22 ms of the pass after the one-percent burst, 45-115
+after the ten-percent and 42-118 after the full rewrite, a tenth to a
+fifth of each divided pass under either bound, while the upkeep thread
+made nine hundred passes in 1.3 ms. So the maintenance was given the
+scan's preamble to do at each commit (`Options::forms_off_snapshot_kept`,
+`supdb-snapkept`), on a thread that had nothing else to do, with seven
+mutants failing its test and 460 seeds of the fuzz clean. Its counter
+fired 3,700 times a sweep, the scan's snapshot phase read 2-4 ms, 5-18
+and 0.5-8, and no pass was faster. Under 1 GiB the pass after the full
+rewrite read 0.82x and 0.84x, and under 1.25 GiB 0.62x and 0.44x, the
+ten-percent burst 0.87x and 0.89x there (`SUPDB_LAG_COUNTERS=1
+bench/scripts/pair.sh supdb-snapkept supdb 10000000 --bound 1073741824
+--reps 3 --ops-div 10 --passes load,lag`, and under 1342177280, at
+`8876f01`). A snapshot does not stand across a freeze, so the
+maintenance built one from every unsealed key at each: 173 builds and
+120 carried forward in a sweep where the scans make three, fourteen
+seconds of the thread over a rewrite of twenty-eight. And what those
+builds freed stayed the process's: 70-80 MB more anonymous memory at the
+pass, which under 1 GiB was a quarter more major faults on the scanning
+thread, and under 1.25 GiB took a store that had fitted, thirteen faults
+a pass, to 4,400. Off, and the arm stands as the refutation. The rules:
+a lever that moves work off a path is priced under a bound by the
+anonymous memory the work leaves, read at the pass (`lagmem`) beside the
+phase it saved, since at the edge of fitting a megabyte the process
+keeps is a megabyte of the store read from the device; work moved to a
+thread "that is idle anyway" is counted by the events it will run at --
+a build a freeze here, 173 for the scans' three -- before it is called
+free; and a structure that is rebuilt whole when its base changes is not
+kept current by rebuilding it more often. What the refutation named is
+the lever: the same sweep with the allocator told to map every
+allocation of 128 KB or more (`supdb-mmapthr`, which is the host's
+policy and no shape of the engine's) held 110-150 MB less at every
+point, took the scanning thread's faults from 4,300 to 460 after the
+ten-percent burst and from 10,200 to 4,300 after the full rewrite, and
+read that pass 1.22x in both orders.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
 in the suite's figures, at `full` scale where it says so:
 
+- The scan pass after a burst pays its first scan for the burst's end:
+  the wait for the upkeep thread's pass in flight, the log read, the
+  settle of what the thread trailed by and the snapshot's extension,
+  0.4-14 ms at three million keys where the rest of a divided pass of
+  three thousand scans is 12-15, and a merge the idle plan starts at
+  that scan beside it in a rep in four. It is what the pass after the
+  full rewrite at three million keys under 1 GiB has left against LMDB's,
+  level to a tenth ahead where the same pass in memory is 1.8x. The
+  levers: the share the syncing pace lets the thread trail by
+  (`upkeep_pace_syncs_bp`), which trades the burst for it -- at five
+  basis points for the engine's twenty-five (`pair.sh supdb-pacesyncs5
+  supdb 3000000 --bound 1073741824 --reps 8 --ops-div 10 --passes
+  load,lag`, at `b2d0dfc`) the first scan's phases fell from 3.9 ms to
+  0.8 at the median, the pass after the full rewrite read 14.6 ms
+  against 19.9 and the pass after the one-percent burst 14.9 against
+  22.2, and the one- and ten-percent bursts ran an eighth slower, a
+  third and a tenth under 1.25 GiB, where the one-percent burst's cell
+  against RocksDB has a twentieth to give; and the merge the idle plan
+  starts at that scan, held off or run at the idle I/O class where the
+  writer's forms cover the store and no point read is near, as the chain
+  through writes is held (`Options::merge_chains_writes_uncovered`),
+  which is not built.
+- The lag pass after a full rewrite under a bound pays for the burst's
+  merge debt twice: as a merge writing beside it, in the reps where the
+  chain has not drained -- the pass's slow shape at ten million keys under
+  1.25 GiB, which a third merge in the write-only stretch retires for ids
+  (`Options::merge_parallel_quiet`) -- and as the working set the burst
+  leaves, which under 1 GiB is about 1.2 GB against the bound: form files
+  that do not fit, the pieces, and the memtables' unsealed keys, whose sort
+  is the pass's first scan. There the pass over ids reads 0.6x to 0.9x of
+  LMDB and the pass over numbered keys 1.1x to 1.3x (`docs/engine.md`,
+  paired at the head), a third of it user time, a quarter the kernel's
+  fault handling and the rest device waits, and the rewarm trades its
+  faults for device reads one for one (`docs/engine.md`, keys that are no
+  run of numbers). The levers left are the bytes of that working set -- the form,
+  the pieces standing, the unsealed keys -- and the merge path's user time
+  over them; the idle I/O class for the merges and their inputs asked ahead
+  were priced on it and refuted.
+- The frozen tables are held to a count (`FROZEN_CAP`, three) and not to
+  bytes. A table freezes at the seal's threshold, 109 MB of memtable at
+  ten million keys, and near reads its seal makes a snapshot copy of it,
+  123 MB more: three behind a landing that does not come, with the live
+  table past them, are a gigabyte, and under a bound of that the group
+  kills the process before the writer's wait at a full list holds it.
+  The one landing known to stall so was the bounds walk over keys whose
+  heads are not whole keys, which the heads place now
+  (`Options::bounds_by_heads`, `land_bounds_read`). The lever for any
+  other is the writer's wait drawn from what the bound can spare, and is
+  not built.
+- Scans on a store with unsealed keys spread through it pay for the path.
+  A few unsealed keys in a partition take every scan of it off the bulk
+  walk and through the block loop and the form file's cursor, a fifth to
+  a quarter slower than the same scans on the store folded
+  (`SUPDB_SCAN_MIXED_FOLD`), whatever form serves. Over the suite's
+  numbered keys the inserts land above every key and the stride form's
+  lead covers the rest; over keys that fall anywhere it is the cell lost
+  to LMDB wherever LMDB's file is in memory -- the threaded scans after
+  the mixes at ten million random ids, 0.86x to 0.91x under 1.25 GiB in
+  the block form and 0.89x to 0.92x under 1.5 GiB in the sparse stride
+  form (`docs/engine.md`, keys that are no run of numbers). The levers:
+  the block loop's three loads a block for the published form, each
+  behind the last; what the values' copies wait on in the cursor's walk,
+  two fifths more than in the bulk walk over the same bytes, which is not
+  known; and folding the keys in once a store is only read, which
+  rewrites every partition where the inserts fell in every one.
+- The memos of decoded groups keep their memory after their readers
+  end, in arenas the allocator does not return, and where the block form
+  misses its fit by that much the store faults for it: ten million random
+  ids under 1 GiB, where the scrambled E mix read 0.68x and 0.76x of LMDB
+  while the bounds walk still read a record a boundary, and reads 1.06x
+  and 1.22x with the heads placing them (`Options::bounds_by_heads`). The
+  memos in slabs (`Options::zpages_memo_slab`) return it, the scrambled
+  mixes 1.19x to 1.85x there before the heads, and are off: over numbered
+  keys at the same bound the slab has nothing to return, and the hot-raw
+  policy's one release, asked into memory that stands unused at a look,
+  is never asked under it. What is owed before the default: that
+  policy's room drawn from something the slab does not move, the slab
+  priced again beside the heads, six reps a sitting over numbered keys
+  at both ten-million bounds, the quick row and the gate.
+- Keys the stride form does not hold are served by the block form
+  wherever the sparse stride form does not fit, a hundred and eight bytes
+  a key against eighty-five, and the block form's scans are a decode a
+  group against a B-tree in memory: the three-thread scan pass at ten
+  million random ids under 1.25 GiB is 0.94x of LMDB's, and was for
+  numbered keys before the stride form took them.
+- The controller reads its budget where a load ends, the process at its
+  smallest. A store whose raw form fits that budget by less than the
+  process then grows -- ten million random ids under 1.5 GiB, by a
+  hundredth -- is served raw until its reads' faults have paid for the
+  form, four cells of a divided row, and a form built ahead for it is
+  dropped as it is written and read back under the first reads. The lever
+  is a budget that counts what the engine's own structures are set to
+  hold, and is not built.
 - Out-of-core reads run at the speed of their misses. Once the file exceeds
   the memory that can cache it, every miss is a synchronous page fault and a
   rate is the faults an operation takes over the device's latency. The faults

@@ -154,7 +154,7 @@ fn read_vec(db: &Reader, key: &[u8]) -> Vec<Vec<u8>> {
 #[test]
 fn values_come_back_in_append_order_across_seals() {
     let d = dir("order");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
     for round in 0u32..3 {
         for k in 0u32..50 {
@@ -181,7 +181,7 @@ fn values_come_back_in_append_order_across_seals() {
 #[test]
 fn reads_see_uncommitted_and_unsealed_state() {
     let d = dir("ryw");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     db.append(b"k", b"one");
     assert_eq!(
         read_vec(&db, b"k"),
@@ -197,14 +197,14 @@ fn reads_see_uncommitted_and_unsealed_state() {
 fn killed_before_first_seal_opens_from_the_wal_alone() {
     // P-E: no segment exists, only a WAL.
     let d = dir("preseal");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     for i in 0u32..500 {
         db.append(format!("k{i}").as_bytes(), &i.to_le_bytes());
     }
     db.commit().unwrap();
     drop(db); // no close, no seal: the crash
 
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     assert_eq!(db.segments(), 0, "nothing was sealed");
     for i in 0u32..500 {
         assert_eq!(
@@ -217,13 +217,13 @@ fn killed_before_first_seal_opens_from_the_wal_alone() {
 #[test]
 fn uncommitted_tail_is_lost_whole_and_committed_state_survives() {
     let d = dir("tail");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     db.append(b"durable", b"yes");
     db.commit().unwrap();
     db.append(b"volatile", b"never-synced");
     drop(db); // pending buffer never reached the file
 
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     assert_eq!(read_vec(&db, b"durable"), vec![b"yes".to_vec()]);
     assert_eq!(read_vec(&db, b"volatile"), Vec::<Vec<u8>>::new());
 }
@@ -239,20 +239,22 @@ fn a_torn_tail_loses_its_batch_whole_and_earlier_batches_survive() {
     db.append(b"b", b"2");
     db.append(b"c", b"3");
     db.commit().unwrap();
+    let (_, _, tail) = db.wal_durable();
     drop(db);
 
     // Tear the tail: chop bytes off the WAL, the state a crash mid-write
     // leaves. The cut lands in the second batch's commit frame, so `b` is an
     // intact frame -- and it must NOT be served, because its batch never
     // committed. Before the commit frame existed this test expected the
-    // intact frame back; that was a partial batch replayed as whole.
+    // intact frame back; that was a partial batch replayed as whole. The
+    // cut is from the log's tail and not the file's end, which runs on in
+    // the zeros a pre-write leaves (`Options::wal_ahead_bytes`).
     let wal = d.join("wal-00000000");
-    let len = std::fs::metadata(&wal).unwrap().len();
     let f = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
-    f.set_len(len - 3).unwrap();
+    f.set_len(tail - 3).unwrap();
     drop(f);
 
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     assert_eq!(
         read_vec(&db, b"a"),
         vec![b"1".to_vec()],
@@ -273,7 +275,7 @@ fn a_torn_tail_loses_its_batch_whole_and_earlier_batches_survive() {
 #[test]
 fn a_transaction_is_all_or_nothing_and_sees_its_own_writes() {
     let d = dir("txn");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     db.append(b"z", b"old");
     db.commit().unwrap();
     {
@@ -327,7 +329,7 @@ fn a_transaction_is_all_or_nothing_and_sees_its_own_writes() {
         "dropped without commit is abort"
     );
     drop(db);
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     assert_eq!(
         read_vec(&db, b"x"),
         vec![b"1".to_vec(), b"2".to_vec()],
@@ -348,7 +350,7 @@ fn crash_between_rename_and_wal_reset_does_not_duplicate() {
     // `a_segment_the_manifest_does_not_name_is_swept_and_its_wal_replayed`
     // has it.)
     let d = dir("renamewin");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     for i in 0u32..40 {
         db.append(b"dup-window", &i.to_le_bytes());
     }
@@ -364,7 +366,7 @@ fn crash_between_rename_and_wal_reset_does_not_duplicate() {
     drop(db);
     std::fs::write(&wal, &saved).unwrap();
 
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     assert_eq!(db.segments(), 1);
     let got = read_vec(&db, b"dup-window");
     assert_eq!(
@@ -380,7 +382,7 @@ fn crash_between_rename_and_wal_reset_does_not_duplicate() {
 #[test]
 fn reopen_after_seal_serves_both_old_and_new_writes() {
     let d = dir("reopen");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     db.append(b"k", b"sealed");
     db.commit().unwrap();
     db.seal().unwrap();
@@ -388,7 +390,7 @@ fn reopen_after_seal_serves_both_old_and_new_writes() {
     db.commit().unwrap();
     drop(db); // crash with one segment and one live WAL record
 
-    let mut db = Db::open(&d, Options::default()).unwrap();
+    let mut db = Db::open(&d, common::options()).unwrap();
     assert_eq!(
         read_vec(&db, b"k"),
         vec![b"sealed".to_vec(), b"walled".to_vec()]
@@ -398,7 +400,7 @@ fn reopen_after_seal_serves_both_old_and_new_writes() {
     db.seal().unwrap();
     drop(db);
 
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     assert_eq!(
         read_vec(&db, b"k"),
         vec![b"sealed".to_vec(), b"walled".to_vec(), b"after".to_vec()],
@@ -415,7 +417,7 @@ fn oracle(cursors: bool, upkeep: supdb::Upkeep) {
         Options {
             cursor_merge: cursors,
             upkeep,
-            ..Options::default()
+            ..common::options()
         },
     );
 }
@@ -551,7 +553,7 @@ fn the_oracle_holds_with_the_carry_left_to_the_next_look() {
         Options {
             freeze_settles: false,
             upkeep: supdb::Upkeep::Background(1),
-            ..Options::default()
+            ..common::options()
         },
     );
 }
@@ -571,7 +573,7 @@ fn the_oracle_holds_with_the_lag_bounded_and_the_passes_batched() {
             upkeep_lag_pct: 50,
             upkeep_batch_pct: 50,
             upkeep: supdb::Upkeep::Background(1),
-            ..Options::default()
+            ..common::options()
         },
     );
 }
@@ -587,7 +589,7 @@ fn the_oracle_holds_on_a_buffered_store_filing_its_bursts() {
             upkeep_inline_bursts: true,
             sync: supdb::SyncPolicy::EveryN(u32::MAX),
             upkeep: supdb::Upkeep::Background(1),
-            ..Options::default()
+            ..common::options()
         },
     );
 }
@@ -601,9 +603,215 @@ fn the_oracle_holds_on_a_buffered_store_that_lends_every_batch() {
             upkeep_inline_bursts: false,
             sync: supdb::SyncPolicy::EveryN(u32::MAX),
             upkeep: supdb::Upkeep::Background(1),
-            ..Options::default()
+            ..common::options()
         },
     );
+}
+
+/// A look that passes a table drops it from `State::replaced` where the
+/// state stands, with the seal's snapshot copy it holds, and not at the
+/// next publish: a store only read after its writes may publish nothing
+/// for seconds, and a replaced memtable and its copy, a hundred megabytes
+/// each at ten million keys, stood through a pass of scans for a look that
+/// had come. The thread is held before its pass while a table freezes and
+/// lands, so the table is kept for a look that has not come; the look --
+/// the thread's pass, or the scan that takes the upkeep home -- then
+/// leaves nothing kept, with no publish between.
+#[test]
+fn a_look_drops_the_tables_it_passed_before_any_publish() {
+    let d = dir("look-drops-replaced");
+    let mut db = Db::create(
+        &d,
+        Options {
+            upkeep: supdb::Upkeep::Background(1),
+            seal_bytes: 64 << 10,
+            ..common::options()
+        },
+    )
+    .unwrap();
+    let put = |db: &mut Db, i: u32, v: &str| {
+        db.append(format!("k{:08}", i).as_bytes(), v.as_bytes());
+    };
+    for i in 0..20_000 {
+        put(&mut db, i, "a");
+    }
+    db.commit().unwrap();
+    db.sync().unwrap();
+    // A scan makes the forms and the look the tables are kept for.
+    let mut n = 0;
+    db.scan(b"", 100, kv(&mut |_, _| n += 1)).unwrap();
+    assert!(n > 0);
+    db.hold_upkeep_pass(true);
+    let (_, _, lives0, _) = db.upkeep_abandon_state();
+    let landed0 = db.tables_landed();
+    let t = std::time::Instant::now();
+    let mut i = 0u32;
+    while db.upkeep_abandon_state().2 == lives0 {
+        assert!(t.elapsed().as_secs() < 60, "no freeze");
+        for _ in 0..100 {
+            put(&mut db, (i * 37) % 20_000, "b");
+            i += 1;
+        }
+        db.commit().unwrap();
+    }
+    // The table the loop froze, and not the load's, whose landing may come
+    // inside the loop: the count of landings moved for the load's table in
+    // every run of this test and for the frozen one in none, until the
+    // frozen one landed under the look it was written to precede.
+    while db.frozen_tables() > 0 || db.tables_landed() == landed0 {
+        assert!(t.elapsed().as_secs() < 60, "the frozen table never landed");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let (_, kept, lives, look) = db.upkeep_abandon_state();
+    assert!(
+        kept >= 1 && look < lives,
+        "a table kept for the look that has not come: kept {kept}, lives {lives}, look {look}"
+    );
+    let landed = db.tables_landed();
+    db.hold_upkeep_pass(false);
+    let mut n = 0;
+    db.scan(b"", 100, kv(&mut |_, _| n += 1)).unwrap();
+    assert!(n > 0);
+    let (_, kept, lives_now, look) = db.upkeep_abandon_state();
+    assert_eq!(
+        (kept, look, lives_now, db.tables_landed()),
+        (0, lives, lives, landed),
+        "the look dropped the tables it passed, with no publish between"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The store the two tests below start from: loaded, drained and scanned,
+/// with nothing of the load's in flight, the upkeep thread held before its
+/// pass, and writes made until a table froze. Answers the store, `lives`
+/// at the freeze and the landings counted before it.
+fn frozen_under_a_held_look(
+    name: &str,
+    before: impl Fn(&Db),
+) -> (Db, std::path::PathBuf, u64, u64) {
+    let d = dir(name);
+    let mut db = Db::create(
+        &d,
+        Options {
+            upkeep: supdb::Upkeep::Background(1),
+            seal_bytes: 64 << 10,
+            ..common::options()
+        },
+    )
+    .unwrap();
+    let put = |db: &mut Db, i: u32, v: &str| {
+        db.append(format!("k{:08}", i).as_bytes(), v.as_bytes());
+    };
+    for i in 0..20_000 {
+        put(&mut db, i, "a");
+    }
+    db.commit().unwrap();
+    db.sync().unwrap();
+    let mut n = 0;
+    db.scan(b"", 100, kv(&mut |_, _| n += 1)).unwrap();
+    assert!(n > 0);
+    // Every landing of the load's behind it, so that the next table a
+    // landing retires is the one frozen below.
+    db.settle().unwrap();
+    db.hold_upkeep_pass(true);
+    before(&db);
+    let (_, _, lives0, _) = db.upkeep_abandon_state();
+    let landed0 = db.tables_landed();
+    let t = std::time::Instant::now();
+    let mut i = 0u32;
+    while db.upkeep_abandon_state().2 == lives0 {
+        assert!(t.elapsed().as_secs() < 60, "no freeze");
+        for _ in 0..100 {
+            put(&mut db, (i * 37) % 20_000, "b");
+            i += 1;
+        }
+        db.commit().unwrap();
+    }
+    let (_, kept, lives, look) = db.upkeep_abandon_state();
+    assert!(
+        kept >= 1 && look < lives,
+        "a table kept for the look that has not come: kept {kept}, lives {lives}, look {look}"
+    );
+    (db, d, lives, landed0)
+}
+
+/// A landing that read where the look stood, copied the kept tables into
+/// the state it made, and swapped that state in after a look had passed
+/// them brings none of them back. The look drops its tables from the
+/// state it holds, which is the one the landing replaces; the landing's
+/// copy was made before, and without its trim after the swap the table
+/// and the seal's snapshot copy of it stood in the new state until the
+/// next look, whenever that came. The landing is held between its copy
+/// and its swap, the look made, and the landing let go.
+#[test]
+fn a_landing_that_swaps_after_a_look_keeps_none_of_the_tables_the_look_passed() {
+    let (db, d, lives, landed0) =
+        frozen_under_a_held_look("look-then-swap", |db| db.hold_landing_swap(true));
+    let t = std::time::Instant::now();
+    while !db.landing_holding() {
+        assert!(t.elapsed().as_secs() < 60, "no landing reached its swap");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(db.tables_landed(), landed0, "the landing has not swapped");
+    db.hold_upkeep_pass(false);
+    let mut n = 0;
+    db.scan(b"", 100, kv(&mut |_, _| n += 1)).unwrap();
+    assert!(n > 0);
+    let (_, kept, _, look) = db.upkeep_abandon_state();
+    assert_eq!(
+        (kept, look),
+        (0, lives),
+        "the look dropped the tables it passed"
+    );
+    db.hold_landing_swap(false);
+    while db.tables_landed() == landed0 {
+        assert!(t.elapsed().as_secs() < 60, "the held landing never swapped");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let (_, kept, lives_now, look) = db.upkeep_abandon_state();
+    assert_eq!(
+        (kept, look, lives_now),
+        (0, lives, lives),
+        "the landing's state keeps nothing the look had passed"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The other order: a look that took its state, and stores where it stands
+/// after a landing has replaced that state, drops its tables from the
+/// state that stands as well as from its own. The landing read the look's
+/// old position and trimmed by it after its swap, both before the look
+/// stored the new one, so only the look can drop them. The seal is held
+/// before it writes, the look held before its store, the seal let go, and
+/// the look let go once the landing has published.
+#[test]
+fn a_look_over_a_state_a_landing_replaced_drops_its_tables_from_the_state_that_stands() {
+    let (db, d, lives, landed0) =
+        frozen_under_a_held_look("swap-then-look", |db| db.hold_seal_landing(true));
+    assert_eq!(
+        db.tables_landed(),
+        landed0,
+        "the frozen table's seal is held"
+    );
+    let landing = db.look_after_a_landing();
+    db.hold_upkeep_pass(false);
+    let mut n = 0;
+    db.scan(b"", 100, kv(&mut |_, _| n += 1)).unwrap();
+    assert!(n > 0);
+    assert!(
+        landing.join().unwrap(),
+        "a look waited and a landing published under it"
+    );
+    let (_, kept, lives_now, look) = db.upkeep_abandon_state();
+    assert_eq!(
+        (kept, look, lives_now, db.tables_landed()),
+        (0, lives, lives, landed0 + 1),
+        "the state the landing published keeps nothing the look passed"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
 }
 
 /// A thread the writes have outrun gives its forms up until the next scan
@@ -622,7 +830,7 @@ fn an_upkeep_thread_the_writes_outran_gives_its_forms_up_until_a_scan() {
             upkeep: supdb::Upkeep::Background(1),
             upkeep_keep_bytes: 1,
             seal_bytes: 64 << 10,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -716,7 +924,7 @@ fn an_upkeep_pass_that_pins_a_landed_table_gives_its_forms_up() {
             upkeep: supdb::Upkeep::Background(1),
             upkeep_keep_bytes: 1,
             seal_bytes: 64 << 10,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -809,7 +1017,11 @@ fn a_burst_lent_to_the_upkeep_thread_is_filed_before_the_first_scan() {
                 forms_settle_backlog_pct: 50,
                 partition_bytes: Some(256 << 10),
                 seal_max_pct: 0,
-                ..Options::default()
+                // The burst's filing left to the backlog bound and the first scan, the shape before a commit near reads filed its own
+                // (`Options::forms_settle_every` and `forms_settle_builds` off).
+                forms_settle_every: false,
+                forms_settle_builds: false,
+                ..common::options()
             },
         )
         .unwrap();
@@ -932,7 +1144,7 @@ fn a_pass_the_writer_wants_its_upkeep_back_from_yields_at_its_next_step() {
                 upkeep_yields: yields,
                 partition_bytes: Some(256 << 10),
                 seal_max_pct: 0,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -1005,6 +1217,437 @@ fn a_pass_the_writer_wants_its_upkeep_back_from_yields_at_its_next_step() {
     );
 }
 
+/// The builder ahead builds a partition's blocks only where the page cache
+/// holds at least `Options::ahead_resident_pct` of the pages a build reads
+/// (the kernel's answer, or the test's seam `ZInject::set_records_resident`):
+/// out of core a partition the bound has pushed out is read from the
+/// device, a round trip a page, for scans that read a few of its blocks.
+/// Every partition read as half resident, the builder skips them all,
+/// counted, builds nothing, and the scans build their own blocks; read as
+/// resident whole, it builds every partition, as it does in core. The keys
+/// read right either way.
+#[test]
+fn the_builder_ahead_leaves_the_partitions_whose_pages_are_not_in_memory() {
+    let run = |name: &str, share: f64| {
+        let d = dir(name);
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_records_resident(share);
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 1 << 20,
+                partition_bytes: Some(2 << 10),
+                l0_trigger: 64,
+                scan_block_cache: true,
+                scan_cache_ahead: true,
+                scan_cache_ahead_min_blocks: 0,
+                // The builder at the state's first scan, the one this
+                // test makes.
+                ahead_in_core_scans_div: 0,
+                zpages_inject: Some(inject),
+                // In memory, as `a_builder_ahead_of_the_reader_fills_the_cache`.
+                zpages: supdb::ZPages::Auto,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in (0..1200).step_by(3) {
+            m.append(&mut db, &key(k), &format!("p{k}"));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        let parts = db.levels().0;
+        assert!(parts > 1);
+        for k in (0..1200).step_by(3) {
+            m.append(&mut db, &key(k), "r1");
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        db.settle().unwrap();
+        // The first scan over the published state starts the builder;
+        // `settle` waits for it.
+        let mut sink = 0usize;
+        db.scan(key(0).as_bytes(), 3, kv(&mut |_k, v| sink += v.len()))
+            .unwrap();
+        db.settle().unwrap();
+        let cold = db.ahead_cold();
+        let built = db.forms_events()[10];
+        m.check(&db, "every key right whatever the builder left");
+        (parts as u64, cold, built)
+    };
+    let (parts, cold_skipped, cold_built) = run("ahead-cold", 0.5);
+    let (_, warm_skipped, warm_built) = run("ahead-warm", 1.0);
+    assert_eq!(
+        (cold_skipped, cold_built),
+        (parts, 0),
+        "every partition read as half resident is left to the scans"
+    );
+    assert_eq!(warm_skipped, 0, "none left where the pages are in memory");
+    assert!(
+        warm_built > 0,
+        "the builder built where the pages are in memory"
+    );
+}
+
+/// The complete-table fill of a pass on the upkeep thread gives the writer
+/// its upkeep back at the fill's next block once the writer wants it
+/// (`Options::upkeep_fill_yields`), the settle before it standing and the
+/// pass published. The store: reads around from one short scan, so no
+/// block holds a form but the one it walked; a burst over every block is
+/// lent, and the thread's pass holds inside until the scan asks for the
+/// upkeep, so the pass settles the burst whole and begins its fill -- a
+/// form for every block of the store -- with the writer wanting it, and
+/// the scan reads every key as written. With the fill's yield the fill
+/// stops at a block and the pass is whole; without it the scan waits the
+/// fill out over every block, the pass whole too, since the fill's yield
+/// is not the pass's (`upkeep_yields`).
+#[test]
+fn a_fill_the_writer_wants_its_upkeep_back_from_stops_at_its_next_block() {
+    const KEYS: u32 = 300_000;
+    let run = |name: &str, yields: bool| {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                upkeep: supdb::Upkeep::Background(1),
+                upkeep_fill_yields: yields,
+                // The fill is the commit's where no builder ahead runs, as
+                // out of core (`Options::ahead_out_of_core`).
+                scan_cache_ahead: false,
+                partition_bytes: Some(256 << 10),
+                seal_max_pct: 0,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: HashMap<u32, &str> = HashMap::new();
+        for k in 0..KEYS {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+        let check = |db: &Reader, want: &HashMap<u32, &str>, when: &str| {
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                KEYS as usize,
+                kv(&mut |k, v| {
+                    let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                    let expect = want.get(&kn).copied().unwrap_or("0");
+                    assert_eq!(std::str::from_utf8(v).unwrap(), expect, "key {kn} {when}");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, KEYS, "every key {when}");
+        };
+        // Reads around: one short scan by the writer, which forms the one
+        // block it walks and no other.
+        let mut n = 0usize;
+        db.scan(&key(0), 8, kv(&mut |_, _| n += 1)).unwrap();
+        assert_eq!(n, 8);
+        // The thread's next pass holds inside, pinned, until released: a
+        // burst over every block lent to it, every block of the store the
+        // fill's to form after the settle.
+        db.hold_upkeep_pinned(true);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % KEYS as u64) as u32;
+            db.put(&key(k), b"b");
+            want.insert(k, "b");
+        }
+        db.commit().unwrap();
+        let t = std::time::Instant::now();
+        while !db.upkeep_holding() {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(20),
+                "the pass began"
+            );
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        // Released as the scan asks for the upkeep: the pass settles the
+        // burst whole and begins its fill with the writer wanting it.
+        db.hold_upkeep_pinned(false);
+        check(&db, &want, "after the burst");
+        let (steps, walked, _passes, cuts) = db.pass_steps();
+        let c = db.upkeep_counts();
+        let h = db.reader().unwrap();
+        check(&h, &want, "through a handle after the burst");
+        // Fills cut for the writer, the blocks the fill walked, its builds'
+        // microseconds, and the passes cut short.
+        (cuts, walked, steps[3], c[8])
+    };
+    let (cuts_on, walked_on, build_on, short_on) = run("fill-yield-on", true);
+    let (cuts_off, walked_off, build_off, short_off) = run("fill-yield-off", false);
+    eprintln!(
+        "fill yield: cut {cuts_on} walked {walked_on} built {build_on} us; \
+         holds: cut {cuts_off} walked {walked_off} built {build_off} us"
+    );
+    let blocks = u64::from(KEYS / 64);
+    assert!(
+        cuts_on >= 1 && walked_on < walked_off,
+        "the fill stopped at a block for the writer: cut {cuts_on}, walked {walked_on} of {walked_off}"
+    );
+    assert_eq!(cuts_off, 0, "the fill that holds is never cut");
+    assert!(
+        walked_off >= blocks && build_off > 0,
+        "the fill that holds walked the store: walked {walked_off} of {blocks} blocks, built {build_off} us"
+    );
+    assert_eq!(
+        (short_on, short_off),
+        (0, 0),
+        "neither pass is cut short: the fill's yield is not the pass's"
+    );
+}
+
+/// The upkeep thread's fill is left for a later pass while the writer has
+/// posted a newer commit (`Options::upkeep_fill_skips_posted`): a burst
+/// over every block is lent and the thread's pass holds inside, a second
+/// burst is posted behind it, and the held pass, released, settles the
+/// first burst and leaves its fill (`Db::fill_deferred`); the pass after,
+/// caught up with nothing posted, fills the store, every block walked. The
+/// scans read every key as the second burst wrote it, through the writer
+/// and through a handle. Without the option the held pass fills with the
+/// second burst waiting and defers nothing. The syncing pace is off here,
+/// so that the second commit posts and returns where the paced one would
+/// wait for the held thread.
+#[test]
+fn a_fill_with_a_newer_commit_posted_is_left_for_the_pass_caught_up() {
+    const KEYS: u32 = 300_000;
+    let run = |name: &str, skips: bool| {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                upkeep: supdb::Upkeep::Background(1),
+                upkeep_fill_skips_posted: skips,
+                upkeep_pace_syncs_bp: 0,
+                scan_cache_ahead: false,
+                partition_bytes: Some(256 << 10),
+                seal_max_pct: 0,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: HashMap<u32, &str> = HashMap::new();
+        for k in 0..KEYS {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+        let check = |db: &Reader, want: &HashMap<u32, &str>, when: &str| {
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                KEYS as usize,
+                kv(&mut |k, v| {
+                    let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                    let expect = want.get(&kn).copied().unwrap_or("0");
+                    assert_eq!(std::str::from_utf8(v).unwrap(), expect, "key {kn} {when}");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, KEYS, "every key {when}");
+        };
+        let mut n = 0usize;
+        db.scan(&key(0), 8, kv(&mut |_, _| n += 1)).unwrap();
+        assert_eq!(n, 8);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut burst = |db: &mut Db, want: &mut HashMap<u32, &str>, v: &'static str| {
+            for _ in 0..100_000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % KEYS as u64) as u32;
+                db.put(&key(k), v.as_bytes());
+                want.insert(k, v);
+            }
+            db.commit().unwrap();
+        };
+        db.hold_upkeep_pinned(true);
+        burst(&mut db, &mut want, "b");
+        let t = std::time::Instant::now();
+        while !db.upkeep_holding() {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(20),
+                "the pass began"
+            );
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        // The second burst posted behind the held pass.
+        burst(&mut db, &mut want, "c");
+        db.hold_upkeep_pinned(false);
+        // The thread's passes run out with no reader asking: the fill of
+        // the pass caught up walks the store.
+        let blocks = u64::from(KEYS / 64);
+        let t = std::time::Instant::now();
+        while db.pass_steps().1 < blocks {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(60),
+                "a fill walked the store: {:?}",
+                db.pass_steps()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let deferred = db.fill_deferred();
+        check(&db, &want, "after the bursts");
+        let h = db.reader().unwrap();
+        check(&h, &want, "through a handle after the bursts");
+        deferred
+    };
+    let deferred_on = run("fill-skip-on", true);
+    let deferred_off = run("fill-skip-off", false);
+    assert!(
+        deferred_on >= 1,
+        "the held pass left its fill with a newer commit posted: {deferred_on}"
+    );
+    assert_eq!(deferred_off, 0, "without the option no fill is left");
+}
+
+/// A fill the upkeep thread leaves for a later pass
+/// (`Options::upkeep_fill_skips_posted`) is that pass's to make whatever
+/// it has to file. A commit's writes are lent and the thread's pass holds
+/// inside it; a commit with nothing staged, which adds nothing to the
+/// log, is posted behind the held pass; released, the pass settles the
+/// writes and leaves its fill, and the pass for the empty commit has no
+/// backlog to be due by. It fills the store all the same, every block
+/// walked, since the fill is owed (`Db::fill_owed_due`). Before the fill
+/// was kept as owed, the later pass was due by its own backlog or by a
+/// burst's batch near reads and by nothing else, so a fill left before a
+/// commit that filed nothing was made by no pass and the store's forms
+/// waited for a scan to build them. Both shapes that reach it: a
+/// mix's small commit near reads, in the store as it ships, and a burst
+/// far from reads under the arm that files there
+/// (`Options::forms_settle_far`) -- where a test that ends its writes
+/// with a commit of nothing read no form built at all, in seven runs of a
+/// hundred and fifty beside the whole binary's load and once on a hosted
+/// runner.
+#[test]
+fn a_fill_left_for_a_later_pass_is_made_by_a_pass_with_nothing_to_file() {
+    const KEYS: u32 = 40_000;
+    let run = |name: &str, far: bool, batch: u32| {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                upkeep: supdb::Upkeep::Background(1),
+                // Unpaced, so that a commit posts and returns where a
+                // paced one would wait for the held thread.
+                upkeep_pace_syncs_bp: 0,
+                forms_settle_far: far,
+                scan_cache_ahead: false,
+                partition_bytes: Some(256 << 10),
+                seal_max_pct: 0,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        for k in 0..KEYS {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert!(db.levels().0 > 0, "{name}: partitions for the forms");
+        if !far {
+            // Reads around: a scan over the store before the writes.
+            let mut n = 0usize;
+            db.scan(&key(0), 8, kv(&mut |_, _| n += 1)).unwrap();
+            assert_eq!(n, 8);
+        }
+        let built0 = db.blocks_built().1;
+        let walked0 = db.pass_steps().1;
+        let _held = Watchdog::arm("the held pass or a commit behind it never returned");
+        db.hold_upkeep_pinned(true);
+        let mut want: HashMap<u32, &str> = HashMap::new();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..batch {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % KEYS as u64) as u32;
+            db.put(&key(k), b"b");
+            want.insert(k, "b");
+        }
+        db.commit().unwrap();
+        // The thread takes the commit at its next poll and holds inside
+        // the pass; no commit is made while it is awaited, since one with
+        // writes behind the pass would be due by them.
+        let t = std::time::Instant::now();
+        while !db.upkeep_holding() {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(20),
+                "{name}: the pass began"
+            );
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        // Nothing staged: a commit that adds nothing to the log, posted
+        // behind the pass in flight.
+        db.commit().unwrap();
+        db.hold_upkeep_pinned(false);
+        // The thread brought to the last commit named, no reader asking.
+        db.settle().unwrap();
+        let did = format!(
+            "steps {:?}, upkeep {:?}, refusals {:?}",
+            db.pass_steps(),
+            db.upkeep_counts(),
+            db.settle_refusals()
+        );
+        assert!(
+            db.fill_deferred() >= 1,
+            "{name}: the held pass left its fill with the empty commit behind it: {did}"
+        );
+        assert!(
+            db.fill_owed_due() >= 1,
+            "{name}: the empty commit's pass was due by the fill owed alone: {did}"
+        );
+        assert!(
+            db.pass_steps().1 - walked0 >= u64::from(KEYS / 64),
+            "{name}: the fill the held pass left was made by no pass: {did}"
+        );
+        assert!(
+            db.blocks_built().1 > built0,
+            "{name}: no form was built over the writes: {did}"
+        );
+        let check = |db: &Reader, when: &str| {
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                KEYS as usize,
+                kv(&mut |k, v| {
+                    let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                    let expect = want.get(&kn).copied().unwrap_or("0");
+                    assert_eq!(
+                        std::str::from_utf8(v).unwrap(),
+                        expect,
+                        "{name}: key {kn} {when}"
+                    );
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, KEYS, "{name}: every key {when}");
+        };
+        check(&db, "after the writes");
+        let h = db.reader().unwrap();
+        check(&h, "through a handle after the writes");
+    };
+    run("fill-owed-near", false, 100);
+    run("fill-owed-far", true, 10_000);
+}
+
 /// The probe merge stays behind `cursor_merge` as the comparison arm -- and
 /// a path only one arm exercises is a path nothing tests.
 #[test]
@@ -1032,7 +1675,7 @@ fn an_unpinned_writer_is_refused_beside_another_publisher() {
         "nopin-background",
         Options {
             writer_pins: false,
-            ..Options::default()
+            ..common::options()
         },
     );
     refused(
@@ -1041,7 +1684,7 @@ fn an_unpinned_writer_is_refused_beside_another_publisher() {
             writer_pins: false,
             publish_in_background: false,
             snapshot_keeper: true,
-            ..Options::default()
+            ..common::options()
         },
     );
     oracle_in(
@@ -1049,7 +1692,10 @@ fn an_unpinned_writer_is_refused_beside_another_publisher() {
         Options {
             writer_pins: false,
             publish_in_background: false,
-            ..Options::default()
+            // The forced form is refused beside an unpinned writer
+            // (`check_options`); the controller is inert there.
+            zpages: supdb::ZPages::Auto,
+            ..common::options()
         },
     );
 }
@@ -1066,7 +1712,7 @@ fn the_oracle_holds_with_seals_that_keep_the_wal() {
         Options {
             seal_rotates_wal: false,
             seal_bytes: 2 << 10,
-            ..Options::default()
+            ..common::options()
         },
     );
     assert!(w.wal_rotations > 0, "the log rotated by size: {w:?}");
@@ -1088,7 +1734,7 @@ fn the_oracle_holds_under_the_shape_with_seals_that_keep_the_wal() {
             seal_rotates_wal: false,
             adaptive_shape: true,
             seal_bytes: 2 << 10,
-            ..Options::default()
+            ..common::options()
         },
     );
     assert!(w.wal_rotations > 0 && w.publishes > 0, "{w:?}");
@@ -1118,7 +1764,7 @@ fn seg_names(d: &std::path::Path) -> Vec<String> {
 #[test]
 fn a_lone_piece_is_promoted_rather_than_rewritten() {
     let d = dir("promote-one");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
     for k in 0u32..2_000 {
         let key = format!("key-{k:05}").into_bytes();
@@ -1163,7 +1809,7 @@ fn a_lone_piece_is_promoted_rather_than_rewritten() {
 #[test]
 fn a_lone_piece_holding_a_tombstone_still_merges() {
     let d = dir("promote-tomb");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     for k in 0u32..2_000 {
         db.append(
             format!("key-{k:05}").as_bytes(),
@@ -1188,6 +1834,100 @@ fn a_lone_piece_holding_a_tombstone_still_merges() {
     assert_eq!(read_vec(&db, b"key-00041"), vec![b"v-41".to_vec()]);
     assert_eq!(read_vec(&db, b"key-00043"), vec![b"v-43".to_vec()]);
     db.close().unwrap();
+}
+
+/// A point read over a store with tombstones in every kind of source --
+/// level-0 pieces carrying puts, a frozen table held short of its landing
+/// with deletes and appends, and the live table over both -- answers the
+/// model with the tombstone pass's probes kept for the reads after it
+/// (`Options::read_probes_once`) and with every source probed again, the
+/// shape before: through the writer, whose reads honour no watermark, and
+/// through a handle, whose live table is bounded by its mark; `read_all`
+/// and `count` both, every key the model has touched and one no source
+/// holds.
+#[test]
+fn a_point_read_over_tombstones_in_every_source_answers_from_one_probe_of_each() {
+    for once in [true, false] {
+        let name = if once { "probes-once" } else { "probes-twice" };
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                read_probes_once: once,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let mut m = ScanModel::default();
+        for k in 0u32..3000 {
+            m.append(&mut db, &format!("key-{k:05}"), &format!("v0-{k}"));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        // Two pieces of puts, each a delete and an append.
+        for round in 1..=2u32 {
+            for k in (round..3000u32).step_by(7) {
+                let key = format!("key-{k:05}");
+                m.delete(&mut db, &key);
+                m.append(&mut db, &key, &format!("v{round}-{k}"));
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+            db.settle().unwrap();
+        }
+        let pieces = seg_names(&d)
+            .iter()
+            .filter(|n| !n.starts_with("par-"))
+            .count();
+        assert!(pieces >= 2, "{name}: the pieces: {:?}", seg_names(&d));
+        // A frozen table with deletes and appends, its landing held.
+        db.hold_seal_landing(true);
+        for k in (0..3000u32).step_by(11) {
+            m.delete(&mut db, &format!("key-{k:05}"));
+        }
+        for k in (5..3000u32).step_by(13) {
+            m.append(&mut db, &format!("key-{k:05}"), &format!("v3-{k}"));
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        assert_eq!(db.frozen_tables(), 1, "{name}: the frozen table");
+        // The live table over it: puts, second values and a key nothing
+        // older holds.
+        for k in (3..3000u32).step_by(5) {
+            let key = format!("key-{k:05}");
+            m.delete(&mut db, &key);
+            m.append(&mut db, &key, &format!("v4-{k}"));
+        }
+        for k in (1..3000u32).step_by(17) {
+            m.append(&mut db, &format!("key-{k:05}"), &format!("v5-{k}"));
+        }
+        m.append(&mut db, "key-99999", "past-the-end");
+        db.commit().unwrap();
+        let h = db.reader().unwrap();
+        let mut keys: Vec<Vec<u8>> = m.vals.keys().cloned().collect();
+        keys.push(b"key-77777x".to_vec());
+        for k in &keys {
+            let want = m.vals.get(k).cloned().unwrap_or_default();
+            let lossy = String::from_utf8_lossy(k);
+            assert_eq!(read_vec(&db, k), want, "{name}: the writer reads {lossy}");
+            assert_eq!(read_vec(&h, k), want, "{name}: the handle reads {lossy}");
+            assert_eq!(
+                db.count(k).unwrap(),
+                want.len() as u64,
+                "{name}: the writer counts {lossy}"
+            );
+            assert_eq!(
+                h.count(k).unwrap(),
+                want.len() as u64,
+                "{name}: the handle counts {lossy}"
+            );
+        }
+        drop(h);
+        db.hold_seal_landing(false);
+        db.settle().unwrap();
+        db.close().unwrap();
+    }
 }
 
 fn ord_names(d: &std::path::Path) -> Vec<String> {
@@ -1221,7 +1961,7 @@ fn a_segment_whose_ordered_index_is_missing_or_damaged_rebuilds_it_at_open() {
     // partition instead of folding into it.
     let no_merge = || Options {
         compact: false,
-        ..Options::default()
+        ..common::options()
     };
     let d = dir("ord-required");
     let mut db = Db::create(&d, no_merge()).unwrap();
@@ -1324,7 +2064,10 @@ fn a_segment_whose_ordered_index_is_missing_or_damaged_rebuilds_it_at_open() {
 // and nothing it returns, so what these hold it to is the model, the same
 // files read without the option, and a count that says the path was taken
 // where it can be and was not where it cannot or was not asked for: "a
-// path only one arm exercises is a path nothing tests".
+// path only one arm exercises is a path nothing tests". The path is the
+// raw form's, which a partition's form file takes the read from, so the
+// stores here name the controller (`ZPages::Auto`), raw in memory, where
+// the stride switch (`common::stride_switch`) would force the form.
 
 /// How a fixture's keys are cut, which is what `OrdIndex::uniform` asks of
 /// a partition.
@@ -1379,19 +2122,24 @@ struct OrdFixture {
 }
 
 fn ord_fixture(name: &str, shape: OrdShape, via_ord: bool) -> OrdFixture {
+    ord_fixture_with(
+        name,
+        shape,
+        Options {
+            point_via_ord: via_ord,
+            zpages: supdb::ZPages::Auto,
+            ..common::options()
+        },
+    )
+}
+
+fn ord_fixture_with(name: &str, shape: OrdShape, opts: Options) -> OrdFixture {
     // The first flush makes the store's partition, whole, under its own
     // name. The second step is a seal and not a flush: a flush drains, and
     // a drain merges every piece into its partition, tombstones with them,
     // where a lone seal leaves its piece beside the partition until
     // `l0_trigger` of them pile up.
-    let mut db = Db::create(
-        &dir(name),
-        Options {
-            point_via_ord: via_ord,
-            ..Options::default()
-        },
-    )
-    .unwrap();
+    let mut db = Db::create(&dir(name), opts).unwrap();
     let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
     let mut masked = BTreeSet::new();
     let key = |k: u32| ord_key(shape, k);
@@ -1514,6 +2262,82 @@ fn ord_probes(shape: OrdShape) -> Vec<Vec<u8>> {
     v
 }
 
+/// `Options::read_hash_once` and `Options::read_lines_ahead` change how a
+/// point read hashes its key and what it asks for ahead, and nothing it
+/// returns: the fixture's store -- a partition, a piece with tombstones and
+/// a live table over both -- with a table frozen in a held seal between
+/// the piece and the live table, read with each of the four settings
+/// through the writer and through a handle, answers every probe as the
+/// model does, held and after the seal lands; and the count with it.
+#[test]
+fn a_point_read_hashed_once_answers_as_one_hashed_per_source() {
+    let d = Options::default();
+    assert!(d.read_hash_once && d.read_lines_ahead, "the default");
+    for shape in [
+        OrdShape::Short,
+        OrdShape::Mixed,
+        OrdShape::Wide,
+        OrdShape::Binary,
+    ] {
+        for (once, ahead) in [(true, true), (true, false), (false, true), (false, false)] {
+            let name = format!("hashonce-{shape:?}-{once}-{ahead}");
+            let mut fx = ord_fixture_with(
+                &name,
+                shape,
+                Options {
+                    read_hash_once: once,
+                    read_lines_ahead: ahead,
+                    ..common::options()
+                },
+            );
+            let key = |k: u32| ord_key(shape, k);
+            // The table the fixture left live, frozen in a seal that does
+            // not land, and a live table over it with tombstones over all
+            // four sources and values after some.
+            fx.db.hold_seal_landing(true);
+            fx.db.seal().unwrap();
+            assert!(fx.db.frozen_tables() >= 1, "{name}: a frozen table");
+            for k in (1u32..4_010).step_by(9) {
+                if k.is_multiple_of(2) {
+                    fx.db.delete(&key(k));
+                    fx.model.insert(key(k), Vec::new());
+                } else {
+                    let v = format!("v4-{k}").into_bytes();
+                    fx.db.append(&key(k), &v);
+                    fx.model.entry(key(k)).or_default().push(v);
+                }
+            }
+            fx.db.commit().unwrap();
+            let show = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
+            let probes = ord_probes(shape);
+            let check = |fx: &OrdFixture, when: &str| {
+                let h = fx.db.reader().unwrap();
+                for p in &probes {
+                    let want = fx.model.get(p).cloned().unwrap_or_default();
+                    assert_eq!(read_vec(&fx.db, p), want, "{name} {when}: {}", show(p));
+                    assert_eq!(
+                        read_vec(&h, p),
+                        want,
+                        "{name} {when}, a handle: {}",
+                        show(p)
+                    );
+                    assert_eq!(
+                        fx.db.count(p).unwrap(),
+                        want.len() as u64,
+                        "{name} {when}: the count of {}",
+                        show(p)
+                    );
+                }
+            };
+            check(&fx, "with the seal held");
+            fx.db.hold_seal_landing(false);
+            fx.db.settle().unwrap();
+            check(&fx, "after the landing");
+            fx.db.close().unwrap();
+        }
+    }
+}
+
 /// The same store read with the option and without answers every key as
 /// the model does -- the partition's values, the piece's, the memtable's,
 /// tombstones over each, keys of several values, empty values and values
@@ -1593,7 +2417,8 @@ fn each_partition_of_a_store_reads_through_its_own_ordered_index() {
                 partition_bytes: Some(64 << 10),
                 l0_trigger: 2,
                 point_via_ord: via_ord,
-                ..Options::default()
+                zpages: supdb::ZPages::Auto,
+                ..common::options()
             },
         )
         .unwrap();
@@ -1630,7 +2455,8 @@ fn each_partition_of_a_store_reads_through_its_own_ordered_index() {
 fn a_rebuilt_ordered_index_serves_point_reads_as_the_one_it_replaced() {
     let opts = || Options {
         point_via_ord: true,
-        ..Options::default()
+        zpages: supdb::ZPages::Auto,
+        ..common::options()
     };
     let key = |k: u32| format!("key-{k:05}").into_bytes();
     let d = dir("ordread-rebuild");
@@ -1729,7 +2555,8 @@ fn a_rebuilt_ordered_index_serves_point_reads_as_the_one_it_replaced() {
 fn an_ordered_index_naming_the_wrong_keys_never_returns_another_keys_values() {
     let opts = || Options {
         point_via_ord: true,
-        ..Options::default()
+        zpages: supdb::ZPages::Auto,
+        ..common::options()
     };
     let n = 1_000u32;
     let key = |k: u32| format!("key-{k:05}").into_bytes();
@@ -1816,7 +2643,8 @@ fn an_ordered_index_naming_the_wrong_keys_never_returns_another_keys_values() {
 fn the_oracle_holds_with_point_reads_through_the_ordered_index() {
     let opts = Options {
         point_via_ord: true,
-        ..Options::default()
+        zpages: supdb::ZPages::Auto,
+        ..common::options()
     };
     let d = dir("oracle-ordread");
     let mut db = Db::create(&d, opts.clone()).unwrap();
@@ -1893,7 +2721,8 @@ fn readers_on_threads_keep_answering_through_the_ordered_index() {
         partition_bytes: Some(64 << 10),
         l0_trigger: 2,
         point_via_ord: true,
-        ..Options::default()
+        zpages: supdb::ZPages::Auto,
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let keys = 3000u32;
@@ -1991,7 +2820,7 @@ fn a_direct_runs_table_reads_its_values_through_the_runs_segment() {
             write_piece: 4096,
             ..Default::default()
         },
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let key = |k: u32| format!("key-{k:06}").into_bytes();
@@ -2115,7 +2944,7 @@ fn a_streamed_runs_recycled_blocks_read_through_the_runs_segment() {
             write_piece: 4096,
             ..Default::default()
         },
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let key = |k: u32| format!("key-{k:06}").into_bytes();
@@ -2217,7 +3046,7 @@ fn a_streamed_runs_recycled_blocks_read_through_the_runs_segment() {
 #[test]
 fn a_direct_runs_table_that_copies_its_values_reads_the_same() {
     let d = dir("direct-copies");
-    let opts = Options::default();
+    let opts = common::options();
     let mut db = Db::create(&d, opts).unwrap();
     let key = |k: u32| format!("key-{k:06}").into_bytes();
     let val = |k: u32| format!("value-{k}").into_bytes();
@@ -2289,7 +3118,7 @@ fn an_ordered_index_survives_promotion_and_reopen() {
 fn wal_arm() -> Options {
     Options {
         direct_ingest: false,
-        ..Options::default()
+        ..common::options()
     }
 }
 
@@ -2303,7 +3132,7 @@ fn small_opts(l0_trigger: usize) -> Options {
         seal_bytes: 4 << 10,
         l0_trigger,
         partition_bytes: None,
-        ..Options::default()
+        ..common::options()
     }
 }
 
@@ -2495,7 +3324,7 @@ fn a_full_flush_over_partitions_does_not_promote_its_pieces() {
             l0_trigger: 1000,
             partition_bytes: None,
             flush_ranges: false,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -2548,7 +3377,7 @@ fn scale(flush_ranges: bool) {
             l0_trigger: 3,
             partition_bytes: None,
             flush_ranges,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -2794,10 +3623,19 @@ fn a_seal_through_the_one_value_path_writes_the_segment_the_general_path_does() 
     }
 }
 
+/// The bytes of a store's files but its log's: the live WAL and its spare
+/// are pre-written and recycled at sizes of their own
+/// (`Options::recycle_wal`), and say nothing of what the store holds.
 fn dir_bytes(d: &std::path::Path) -> u64 {
     std::fs::read_dir(d)
         .unwrap()
-        .map(|e| e.unwrap().metadata().unwrap().len())
+        .map(|e| e.unwrap())
+        .filter(|e| {
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            !n.starts_with("wal-") && !n.starts_with("spare-")
+        })
+        .map(|e| e.metadata().unwrap().len())
         .sum()
 }
 
@@ -2810,7 +3648,7 @@ fn dir_bytes(d: &std::path::Path) -> u64 {
 #[test]
 fn an_empty_key_may_be_the_first_write_into_a_memtable() {
     let d = dir("emptykey-first");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     db.append(b"", b"first");
     db.append(b"after", b"");
     db.commit().unwrap();
@@ -2833,7 +3671,7 @@ fn an_empty_key_may_be_the_first_write_into_a_memtable() {
     assert_eq!(read_vec(&db, b"k"), vec![Vec::<u8>::new()]);
     // And through a reopen, whose replay writes the same way.
     drop(db);
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     assert_eq!(
         read_vec(&db, b""),
         vec![b"first".to_vec(), b"second".to_vec()]
@@ -2845,7 +3683,7 @@ fn an_empty_key_may_be_the_first_write_into_a_memtable() {
 #[test]
 fn a_delete_ends_older_values_and_later_appends_start_fresh() {
     let d = dir("delete");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     db.append(b"k", b"v1");
     db.append(b"k", b"v2");
     db.commit().unwrap();
@@ -2874,7 +3712,7 @@ fn a_delete_ends_older_values_and_later_appends_start_fresh() {
         "through a sealed tombstone"
     );
     drop(db);
-    let mut db = Db::open(&d, Options::default()).unwrap();
+    let mut db = Db::open(&d, common::options()).unwrap();
     assert_eq!(read_vec(&db, b"k"), vec![b"v4".to_vec()], "after reopen");
     db.flush().unwrap();
     assert_eq!(read_vec(&db, b"k"), vec![b"v4".to_vec()], "after the merge");
@@ -2917,7 +3755,7 @@ fn deleted_values_do_not_survive_the_merge() {
     let opts = Options {
         seal_bytes: 256 << 10,
         l0_trigger: 3,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let filler = vec![b'x'; 200];
@@ -2990,9 +3828,12 @@ fn a_batch_without_its_commit_frame_is_lost_whole() {
         db.append(format!("b{i}").as_bytes(), b"B");
     }
     db.commit().unwrap();
+    let tail = db.wal_durable().2 as usize;
     drop(db);
+    // Cut from the log's tail, not the file's end: the file runs on in the
+    // zeros its pre-write left (`Options::wal_ahead_bytes`).
     let wal = d.join("wal-00000000");
-    let full = std::fs::read(&wal).unwrap();
+    let full = std::fs::read(&wal).unwrap()[..tail].to_vec();
     for cut in [3usize, 17, 17 + 12] {
         let dd = dir(&format!("torn-batch-{cut}"));
         for e in std::fs::read_dir(&d).unwrap() {
@@ -3043,7 +3884,7 @@ fn idle_io_priority_and_sync_spreading_change_nothing_observable() {
         background_io: BackgroundIo::Idle,
         seal_sync_every: 64 << 10,
         partition_bytes: Some(512 << 10),
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let filler = vec![b'y'; 120];
@@ -3078,7 +3919,7 @@ fn ordered_pieces_are_promoted_to_partitions_without_a_merge() {
         seal_bytes: 256 << 10,
         l0_trigger: 3,
         partition_bytes: None,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let filler = vec![b'p'; 100];
@@ -3149,7 +3990,13 @@ fn a_wal_header_torn_by_power_loss_opens_and_is_rewritten() {
         seal_bytes: 1 << 10,
         // The seal's rotation; a rotation by size has its own test.
         seal_rotates_wal: true,
-        ..Options::default()
+        // A fresh file's header, which a power loss can leave a prefix of.
+        // A recycled file is whole, and its header is rewritten in place
+        // within its first page, so a lost write leaves the old header over
+        // frames whose CRCs fail under the new file's id
+        // (`a_recycled_wal_never_adopts_a_frame_from_its_previous_life`).
+        recycle_wal: false,
+        ..common::options()
     };
     let newest_wal = |d: &std::path::Path| -> std::path::PathBuf {
         let mut wals: Vec<std::path::PathBuf> = std::fs::read_dir(d)
@@ -3215,23 +4062,47 @@ fn a_recycled_wal_never_adopts_a_frame_from_its_previous_life() {
     let opts = Options {
         recycle_wal: true,
         seal_bytes: 64 << 10,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     // Life 1 of wal-00000000: about 3 seals' worth, so the file is long.
-    for i in 0u32..3000 {
+    // Out of order, so the writes go through the log: keys in order above
+    // the store's greatest go to a segment directly and leave the log
+    // empty, and a test of them under a file pre-written whole found a
+    // long live file without one stale frame in it.
+    for n in 0u32..3000 {
+        let i = n * 7919 % 3000;
         db.append(format!("k{i:05}").as_bytes(), &[1u8; 64]);
-        if i % 50 == 49 {
+        if n % 50 == 49 {
             db.commit().unwrap();
         }
     }
     db.commit().unwrap();
     db.flush().unwrap();
-    let (live, _, _) = db.wal_durable();
-    // After the flush the live WAL is a recycled file with a long stale
-    // tail behind an eight-byte header.
+    db.settle().unwrap();
+    // The flush's landing retired the files it covers and kept one as the
+    // spare; the next rotation takes it, and the live WAL is then a
+    // recycled file with a long stale tail behind an eight-byte header.
     assert!(
-        std::fs::metadata(&live).unwrap().len() > 8,
+        std::fs::read_dir(&d).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("spare-")),
+        "a retired WAL is kept as the spare"
+    );
+    let (before, _, _) = db.wal_durable();
+    let mut fills = 0u32;
+    while db.wal_durable().0 == before {
+        db.append(format!("f{fills:05}").as_bytes(), &[2u8; 64]);
+        db.commit().unwrap();
+        fills += 1;
+        assert!(fills < 10_000, "the log never rotated");
+    }
+    let (live, _, _) = db.wal_durable();
+    let bytes = std::fs::read(&live).unwrap();
+    assert!(
+        bytes.len() > 4096 && bytes[8..].iter().any(|&b| b != 0),
         "the live WAL should be a recycled file with old frames behind the header"
     );
     // Life 2: two small batches, then a crash.
@@ -3253,6 +4124,9 @@ fn a_recycled_wal_never_adopts_a_frame_from_its_previous_life() {
             got.len()
         );
     }
+    for i in 0..fills {
+        assert_eq!(read_vec(&db, format!("f{i:05}").as_bytes()).len(), 1);
+    }
     drop(db);
     // And again after another commit and reopen: the truncation at open
     // must have cut the stale tail so nothing behind the new frames is
@@ -3269,13 +4143,505 @@ fn a_recycled_wal_never_adopts_a_frame_from_its_previous_life() {
 }
 
 #[test]
+fn a_syncing_store_pre_writes_its_wal_ahead_of_the_tail_and_not_whole() {
+    // `wal_ahead_bytes`: nothing pre-written whole and no spare at create,
+    // the live file pre-written a reach past a commit's end and no further
+    // than the rotation's size and a reach, the frames after a reopen
+    // landing at the tail and not past the zeros, and a store whose commits
+    // do not sync pre-writing nothing. `wal_ahead_small_runs`: a commit of
+    // at most thirty-two kibibytes counts toward a run, and one that does
+    // not fit what is pre-written pre-writes a reach once the run has
+    // written a reach itself, so the run's first commits append; a commit
+    // over thirty-two kibibytes appends, pre-writes nothing and ends the
+    // run; a reopened store begins a run; and a run goes on across a
+    // rotation. Without the option, the whole reach past every commit from
+    // a file's first.
+    let spares = |d: &std::path::Path| {
+        std::fs::read_dir(d)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("spare-")
+            })
+            .count()
+    };
+    let page = |n: u64| (n + 4095) & !4095;
+    let ahead = 256u64 << 10;
+    let opts = Options {
+        wal_ahead_bytes: ahead as usize,
+        ..common::options()
+    };
+    assert!(opts.recycle_wal && matches!(opts.sync, supdb::SyncPolicy::Always));
+    assert!(opts.wal_ahead_small_runs);
+    let d = dir("wal-ahead");
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let (live, _, _) = db.wal_durable();
+    assert!(
+        std::fs::metadata(&live).unwrap().len() < 4096,
+        "nothing is pre-written at create"
+    );
+    assert_eq!(spares(&d), 0, "no spare is made at create");
+    let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+    // Sixty writes, about five kilobytes of frames: a small commit.
+    let write = |db: &mut Db, round: u32, model: &mut HashMap<Vec<u8>, Vec<Vec<u8>>>| {
+        for i in 0u32..60 {
+            let k = format!("k{:04}", (i * 13 + round) % 400).into_bytes();
+            let v = format!("r{round}i{i}").repeat(8).into_bytes();
+            db.append(&k, &v);
+            model.entry(k).or_default().push(v);
+        }
+        db.commit().unwrap();
+    };
+    // Forty writes of a kilobyte: a large commit.
+    let big = |db: &mut Db, round: u32, model: &mut HashMap<Vec<u8>, Vec<Vec<u8>>>| {
+        for i in 0u32..40 {
+            let k = format!("b{round:02}{i:03}").into_bytes();
+            let v = vec![b'a' + (i % 26) as u8; 1024];
+            db.append(&k, &v);
+            model.entry(k).or_default().push(v);
+        }
+        db.commit().unwrap();
+    };
+    // Small commits until the file has been pre-written `reaches` times,
+    // each commit's file held to the rule: `run` is what the run has
+    // written and `extent` what is pre-written. Answers how many commits
+    // appended before the first pre-write.
+    let small_run = |db: &mut Db,
+                     round: &mut u32,
+                     run: &mut u64,
+                     extent: &mut u64,
+                     reaches: u32,
+                     model: &mut HashMap<Vec<u8>, Vec<Vec<u8>>>| {
+        let (mut reached, mut appended, mut into) = (0u32, 0u32, 0u32);
+        while into < 5 {
+            assert!(
+                *round < 2000,
+                "{reaches} reaches in two thousand small commits"
+            );
+            let before = db.wal_durable().2;
+            write(db, *round, model);
+            let (live, synced, written) = db.wal_durable();
+            let len = std::fs::metadata(&live).unwrap().len();
+            assert_eq!(synced, written, "round {round}: the commit synced");
+            assert!(written - before < 32 << 10, "round {round}: a small commit");
+            *run += written - before;
+            if written > *extent && *run >= ahead {
+                *extent = page(written + ahead);
+                reached += 1;
+            }
+            assert_eq!(
+                len,
+                (*extent).max(written),
+                "round {round}: {len} bytes for a tail at {written}, a run of {run} and {extent} pre-written"
+            );
+            appended += (reached == 0) as u32;
+            into += (reached >= reaches) as u32;
+            *round += 1;
+        }
+        appended
+    };
+    let (mut round, mut run, mut extent) = (0u32, 0u64, 0u64);
+    let appended = small_run(&mut db, &mut round, &mut run, &mut extent, 3, &mut model);
+    assert!(
+        appended >= 40,
+        "a run's first commits append until they have written a reach: {appended}"
+    );
+    // Large commits, into what is pre-written and past it: nothing more is
+    // pre-written, and the run ends.
+    let mut past = 0;
+    for r in 0u32..12 {
+        let before = db.wal_durable().2;
+        big(&mut db, r, &mut model);
+        let (live, _, written) = db.wal_durable();
+        assert!(written - before > 32 << 10, "a large commit");
+        let len = std::fs::metadata(&live).unwrap().len();
+        assert_eq!(
+            len,
+            extent.max(written),
+            "large round {r}: {len} bytes for a tail at {written} with {extent} pre-written"
+        );
+        past += (written > extent) as u32;
+    }
+    assert!(past >= 2, "the large commits ran past what was pre-written");
+    run = 0;
+    let appended = small_run(&mut db, &mut round, &mut run, &mut extent, 1, &mut model);
+    assert!(
+        appended >= 40,
+        "a run after a large commit starts again from nothing: {appended}"
+    );
+    drop(db); // crash, zeros past the tail
+    let mut db = Db::open(&d, opts.clone()).unwrap();
+    for (k, want) in &model {
+        assert_eq!(&read_vec(&db, k), want, "after the first crash");
+    }
+    // The replay cut the file at its tail, and a reopened store's run
+    // starts from nothing.
+    let (live, _, written) = db.wal_durable();
+    assert_eq!(std::fs::metadata(&live).unwrap().len(), written);
+    (run, extent) = (0, written);
+    let appended = small_run(&mut db, &mut round, &mut run, &mut extent, 1, &mut model);
+    assert!(
+        appended >= 40,
+        "a reopened store's run appends first: {appended}"
+    );
+    drop(db); // crash again: the frames after the reopen are at the tail
+    let db = Db::open(&d, opts.clone()).unwrap();
+    for (k, want) in &model {
+        assert_eq!(&read_vec(&db, k), want, "after the second crash");
+    }
+    drop(db);
+
+    // A run goes on across a rotation: the first rotation finds no spare,
+    // and the fresh file's first commit, which does not fit, pre-writes.
+    let d = dir("wal-ahead-rotate");
+    let small = 64u64 << 10;
+    let rot = Options {
+        wal_ahead_bytes: small as usize,
+        seal_bytes: 256 << 10,
+        ..common::options()
+    };
+    let mut db = Db::create(&d, rot).unwrap();
+    let first = db.wal_durable().0;
+    let mut rotated = false;
+    for round in 0u32..400 {
+        write(&mut db, round, &mut HashMap::new());
+        if db.wal_durable().0 != first {
+            // The commit that crossed the size rotated the log behind
+            // itself; the next is the fresh file's first.
+            write(&mut db, 1000 + round, &mut HashMap::new());
+            let (live, _, written) = db.wal_durable();
+            assert_eq!(
+                std::fs::metadata(&live).unwrap().len(),
+                page(written + small),
+                "the first commit after a rotation in a run pre-writes a reach"
+            );
+            rotated = true;
+            break;
+        }
+    }
+    assert!(
+        rotated,
+        "four hundred small commits rotate a log of 256 KiB"
+    );
+    drop(db);
+
+    // Without the runs, the whole reach from a file's first write, kept
+    // at least half ahead of every commit, a large one too.
+    let d = dir("wal-ahead-flat");
+    let flat = Options {
+        wal_ahead_bytes: ahead as usize,
+        wal_ahead_small_runs: false,
+        ..common::options()
+    };
+    let mut db = Db::create(&d, flat).unwrap();
+    write(&mut db, 0, &mut HashMap::new());
+    let (live, _, written) = db.wal_durable();
+    let len = std::fs::metadata(&live).unwrap().len();
+    assert_eq!(
+        len,
+        page(written + ahead),
+        "flat: the whole reach at the first commit"
+    );
+    for round in 0u32..8 {
+        big(&mut db, round, &mut HashMap::new());
+        let (live, _, written) = db.wal_durable();
+        let len = std::fs::metadata(&live).unwrap().len();
+        assert!(
+            len >= written + ahead / 2 && len <= written + ahead + 4096,
+            "flat: {len} bytes for a tail at {written} after a large commit"
+        );
+    }
+    drop(db);
+
+    let d = dir("wal-ahead-buffered");
+    let opts = Options {
+        sync: supdb::SyncPolicy::EveryN(u32::MAX),
+        wal_ahead_bytes: ahead as usize,
+        ..common::options()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    for round in 0u32..10 {
+        write(&mut db, round, &mut HashMap::new());
+    }
+    let (live, _, written) = db.wal_durable();
+    assert_eq!(
+        std::fs::metadata(&live).unwrap().len(),
+        written,
+        "a store whose commits do not sync pre-writes nothing"
+    );
+    assert_eq!(spares(&d), 0);
+}
+
+/// The log's pre-write made beside the commit that buys it
+/// (`Options::wal_ahead_beside`): the buying commit's file holds its frames
+/// and no reach when it returns, the reach is the file's once the helper is
+/// joined, and the next commit lands in it; a crash with a helper's reach
+/// written past the tail reopens to every commit; and a helper's failure
+/// is the next commit's error, never swallowed.
+#[test]
+fn a_syncing_stores_pre_write_is_made_beside_the_commit_that_buys_it() {
+    let page = |n: u64| (n + 4095) & !4095;
+    let ahead = 256u64 << 10;
+    let opts = Options {
+        wal_ahead_bytes: ahead as usize,
+        wal_ahead_beside: true,
+        ..common::options()
+    };
+    assert!(opts.wal_ahead_small_runs);
+    let d = dir("wal-beside");
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+    let write = |db: &mut Db, round: u32, model: &mut HashMap<Vec<u8>, Vec<Vec<u8>>>| {
+        for i in 0u32..60 {
+            let k = format!("k{:04}", (i * 13 + round) % 400).into_bytes();
+            let v = format!("r{round}i{i}").repeat(8).into_bytes();
+            db.append(&k, &v);
+            model.entry(k).or_default().push(v);
+        }
+        db.commit().unwrap();
+    };
+    // Small commits until one buys a reach: the run has written a reach
+    // and the commit runs past the file's end.
+    let mut round = 0u32;
+    let bought = loop {
+        assert!(round < 2000, "a reach bought in two thousand small commits");
+        let (writes, _) = db.wal_ahead_counts();
+        write(&mut db, round, &mut model);
+        round += 1;
+        if db.wal_ahead_counts().0 > writes {
+            break db.wal_durable().2;
+        }
+    };
+    let (live, synced, written) = db.wal_durable();
+    assert_eq!(
+        (synced, written),
+        (bought, bought),
+        "the buying commit synced its frames"
+    );
+    let len = db.wal_join_ahead().unwrap();
+    assert_eq!(
+        len,
+        page(bought + ahead),
+        "the reach is the file's once the helper is joined"
+    );
+    // The next commit lands inside the reach and buys nothing.
+    let (writes, _) = db.wal_ahead_counts();
+    write(&mut db, round, &mut model);
+    round += 1;
+    let (_, _, written) = db.wal_durable();
+    assert!(written < len, "the next commit lands in the reach");
+    assert_eq!(db.wal_ahead_counts().0, writes, "and buys none");
+    assert_eq!(std::fs::metadata(&live).unwrap().len(), len);
+    // Commits until the next reach is bought, then a crash with the reach
+    // past the tail: every commit is there after the reopen.
+    loop {
+        let (w, _) = db.wal_ahead_counts();
+        write(&mut db, round, &mut model);
+        round += 1;
+        if db.wal_ahead_counts().0 > w {
+            break;
+        }
+    }
+    db.crash();
+    let mut db = Db::open(&d, opts.clone()).unwrap();
+    for (k, want) in &model {
+        assert_eq!(&read_vec(&db, k), want, "after the crash");
+    }
+    // A helper that fails: the commit that bought the reach is answered,
+    // and the next write answers the helper's error.
+    db.fail_next_wal_zeroing();
+    let mut failed = None;
+    for _ in 0..2000 {
+        for i in 0u32..60 {
+            let k = format!("k{:04}", (i * 13 + round) % 400).into_bytes();
+            db.append(&k, b"after");
+        }
+        round += 1;
+        if let Err(e) = db.commit() {
+            failed = Some(e);
+            break;
+        }
+    }
+    let e = failed.expect("the helper's failure reached a commit");
+    assert!(
+        e.to_string()
+            .contains("injected failure of the log's pre-write"),
+        "the helper's own error: {e}"
+    );
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+
+    // A commit that reaches the rotation's size buys no reach, since the
+    // log rotates behind it: with the reach as long as the rotation's
+    // size, a fresh store's run has written one only at the commit that
+    // rotates, and the fresh file's first commit is the first to buy.
+    let d = dir("wal-beside-rotate");
+    let size = 256u64 << 10;
+    let rot = Options {
+        wal_ahead_bytes: size as usize,
+        seal_bytes: size as usize,
+        wal_ahead_beside: true,
+        ..common::options()
+    };
+    let mut db = Db::create(&d, rot).unwrap();
+    let first = db.wal_durable().0;
+    let mut rotated = false;
+    for round in 0u32..400 {
+        write(&mut db, round, &mut HashMap::new());
+        if db.wal_durable().0 != first {
+            rotated = true;
+            break;
+        }
+    }
+    assert!(
+        rotated,
+        "four hundred small commits rotate a log of 256 KiB"
+    );
+    assert_eq!(
+        db.wal_ahead_counts().0,
+        0,
+        "the commit that rotates buys nothing"
+    );
+    write(&mut db, 1000, &mut HashMap::new());
+    let (_, _, written) = db.wal_durable();
+    assert_eq!(
+        db.wal_ahead_counts().0,
+        1,
+        "the fresh file's first commit buys"
+    );
+    assert_eq!(db.wal_join_ahead().unwrap(), page(written + size));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A reach a commit bought and never handed over, since its sync failed,
+/// is not the next commit's to write: a large commit after it ends the run
+/// and buys nothing, and its frames, which lie inside the reach the failed
+/// commit named, are never written over in zeros by a helper launched at
+/// its sync (`Options::wal_ahead_beside`). The failure is a directory
+/// barrier's, the rotation's and then the first sync's after it, which
+/// fails with the buying commit's frames written and the reach not
+/// launched.
+#[test]
+fn a_reach_a_failed_commit_bought_is_not_written_over_the_next_commit() {
+    let small = 64u64 << 10;
+    let opts = Options {
+        wal_ahead_bytes: small as usize,
+        seal_bytes: 256 << 10,
+        wal_ahead_beside: true,
+        ..common::options()
+    };
+    assert!(opts.wal_ahead_small_runs);
+    let d = dir("wal-beside-failed");
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+    let small_batch = |db: &mut Db, round: u32| {
+        for i in 0u32..60 {
+            let k = format!("k{:04}", (i * 13 + round) % 400).into_bytes();
+            let v = format!("r{round}i{i}").repeat(8).into_bytes();
+            db.append(&k, &v);
+        }
+    };
+    let keep = |round: u32, model: &mut HashMap<Vec<u8>, Vec<Vec<u8>>>| {
+        for i in 0u32..60 {
+            let k = format!("k{:04}", (i * 13 + round) % 400).into_bytes();
+            let v = format!("r{round}i{i}").repeat(8).into_bytes();
+            model.entry(k).or_default().push(v);
+        }
+    };
+    // Past the first commits, where a run of ordered ingest may take a
+    // barrier of its own, before the injection.
+    let mut round = 0u32;
+    while round < 20 {
+        small_batch(&mut db, round);
+        db.commit().unwrap();
+        keep(round, &mut model);
+        round += 1;
+    }
+    // The rotation's barrier fails, and the commit after it answers so
+    // with nothing written: its records go out with the next.
+    let first = db.wal_durable().0;
+    db.fail_next_dir_barrier();
+    loop {
+        assert!(
+            round < 400,
+            "four hundred small commits rotate a log of 256 KiB"
+        );
+        small_batch(&mut db, round);
+        db.commit().unwrap();
+        keep(round, &mut model);
+        round += 1;
+        if db.wal_durable().0 != first {
+            break;
+        }
+    }
+    let failed = |db: &mut Db, tag: &str| {
+        for i in 0u32..60 {
+            let k = format!("f{tag}{i:02}").into_bytes();
+            db.append(&k, b"failed");
+        }
+        db.commit()
+            .expect_err("the commit answers the injected barrier")
+    };
+    let e = failed(&mut db, "a");
+    assert!(
+        e.to_string().contains("injected"),
+        "the rotation's barrier: {e}"
+    );
+    // The fresh file's first frames buy a reach, and the sync after them
+    // fails at the barrier, before the reach is handed to a helper.
+    db.fail_next_dir_barrier();
+    let (writes, _) = db.wal_ahead_counts();
+    let e = failed(&mut db, "b");
+    assert!(
+        e.to_string().contains("injected"),
+        "the retried barrier: {e}"
+    );
+    assert_eq!(db.wal_ahead_counts().0, writes, "no reach handed over");
+    let (live, _, bought) = db.wal_durable();
+    assert!(
+        std::fs::metadata(&live).unwrap().len() <= bought,
+        "nothing past the frames"
+    );
+    // A large commit, which ends the run: its frames start inside the
+    // reach the failed commit named and run past the page after it.
+    for i in 0u32..60 {
+        let k = format!("big{i:02}").into_bytes();
+        let v = format!("big{i:02}").repeat(150).into_bytes();
+        db.append(&k, &v);
+        model.insert(k, vec![v]);
+    }
+    db.commit().unwrap();
+    let (_, synced, written) = db.wal_durable();
+    assert!(written - bought > 32 << 10, "a commit larger than a run's");
+    assert_eq!(synced, written);
+    let len = db.wal_join_ahead().unwrap();
+    assert_eq!(
+        db.wal_ahead_counts().0,
+        writes,
+        "the large commit buys nothing"
+    );
+    assert_eq!(len, written, "and nothing is written past its frames");
+    db.crash();
+    let db = Db::open(&d, opts.clone()).unwrap();
+    for (k, want) in &model {
+        assert_eq!(&read_vec(&db, k), want, "after the crash");
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn recycling_survives_crashes_and_leaves_no_spare_after_close() {
     let d = dir("recycle-crash");
     let opts = Options {
         recycle_wal: true,
         seal_bytes: 32 << 10,
         l0_trigger: 2,
-        ..Options::default()
+        ..common::options()
     };
     let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
     let mut db = Db::create(&d, opts.clone()).unwrap();
@@ -3321,7 +4687,7 @@ fn a_flipped_byte_anywhere_in_a_batch_loses_that_batch_and_the_ones_after() {
     // batch and every batch after it, and nothing before it. Every byte
     // offset of a three-batch WAL is flipped in turn.
     let d = dir("flip");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     let mut ends = Vec::new();
     for b in 0u32..3 {
         for i in 0..4u32 {
@@ -3338,9 +4704,13 @@ fn a_flipped_byte_anywhere_in_a_batch_loses_that_batch_and_the_ones_after() {
     }
     drop(db);
     let wal = d.join("wal-00000000");
+    // The file runs on past the last batch in the zeros its pre-write
+    // left (`Options::wal_ahead_bytes`); every byte of the batches is
+    // flipped, with the zeros behind them as the log leaves them.
     let full = std::fs::read(&wal).unwrap();
-    assert_eq!(full.len(), *ends.last().unwrap());
-    for off in 8..full.len() {
+    let tail = *ends.last().unwrap();
+    assert!(full.len() >= tail && full[tail..].iter().all(|&b| b == 0));
+    for off in 8..tail {
         let dd = dir(&format!("flip-{off}"));
         for e in std::fs::read_dir(&d).unwrap() {
             let e = e.unwrap();
@@ -3353,7 +4723,7 @@ fn a_flipped_byte_anywhere_in_a_batch_loses_that_batch_and_the_ones_after() {
         std::fs::write(dd.join("wal-00000000"), &damaged).unwrap();
         // The batch that holds this byte, and so the number that survive.
         let survive = ends.iter().position(|&e| off < e).unwrap();
-        let db = match Db::open(&dd, Options::default()) {
+        let db = match Db::open(&dd, common::options()) {
             Ok(db) => db,
             Err(e) => panic!("offset {off}: open refused the store: {e}"),
         };
@@ -3382,7 +4752,7 @@ fn put_replaces_and_append_accumulates() {
     // external harness confused them once and every Zipfian rewrite piled
     // onto its key until reads walked the pile.
     let d = dir("put");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     db.append(b"k", b"1");
     db.append(b"k", b"2");
     db.commit().unwrap();
@@ -3399,7 +4769,7 @@ fn put_replaces_and_append_accumulates() {
         "appends after a put accumulate again"
     );
     drop(db);
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     assert_eq!(
         read_vec(&db, b"k"),
         vec![b"3".to_vec(), b"4".to_vec()],
@@ -3449,6 +4819,86 @@ fn a_merge_takes_the_ordered_index_with_the_segment_it_retires() {
         ords, segs,
         "{ords} ordered indexes for {segs} segments: the retired ones leaked"
     );
+}
+
+/// The merge's second pass asks the kernel for its inputs' records a window
+/// ahead of its walk (`Options::merge_read_ahead`), and only where the
+/// window's first page is not resident. Four rounds of distinct keys,
+/// interleaved so that each round's piece overlaps every partition, leave
+/// partitions of single-value records (a key with several values keeps them
+/// in blocks, and this holds the records to the region the asks cover);
+/// their pages dropped as a bound would drop them, a fifth round over every
+/// key is sealed by size at its commit -- a flush's landing is counted near
+/// reads and walks the partitions' records for the piece's bounds, where a
+/// commit's seal lands far from reads and only plans the merge -- and the
+/// merge that folds it in asks for windows that cover the cold inputs. The
+/// same merge over resident inputs asks for nothing, and with the option
+/// off nothing is asked cold either.
+#[test]
+fn a_merge_asks_ahead_only_where_its_inputs_are_not_resident() {
+    let build = |name: &str, window: usize, cold: bool| -> (u64, u64) {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 4 << 20,
+                partition_bytes: None,
+                l0_trigger: 1,
+                merge_read_ahead: window,
+                // The raw form in memory: a form file drops the raw records
+                // it serves (`Options::zpages_drop_raw`), and the inputs
+                // this holds resident would be cold under the forced form.
+                zpages: supdb::ZPages::Auto,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let value = |round: u32, k: u32| format!("value-{round}-{k}-{}", "z".repeat(60));
+        for round in 0u32..4 {
+            for k in 0u32..24_000 {
+                db.append(
+                    format!("key-{:06}", k * 4 + round).as_bytes(),
+                    value(round, k).as_bytes(),
+                );
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+        }
+        db.settle().unwrap();
+        let (parts, pieces) = db.levels();
+        assert!(
+            parts >= 2 && pieces == 0,
+            "{parts} partitions, {pieces} pieces"
+        );
+        let before = db.merge_ahead();
+        if cold {
+            let dropped = db.drop_record_pages();
+            assert!(dropped > 6 << 20, "dropped {dropped} bytes of records");
+        }
+        for k in 0u32..96_000 {
+            db.append(format!("key-{k:06}").as_bytes(), value(9, k).as_bytes());
+        }
+        db.commit().unwrap();
+        db.settle().unwrap();
+        let (_, pieces_after) = db.levels();
+        assert_eq!(pieces_after, 0, "the fifth round's piece was not folded in");
+        let after = db.merge_ahead();
+        (after.0 - before.0, after.1 - before.1)
+    };
+    let (asks, bytes) = build("mergeahead-cold", 1 << 20, true);
+    assert!(asks >= 6, "cold inputs: {asks} asks of {bytes} bytes");
+    assert!(bytes >= 4 << 20, "{bytes} bytes over {asks} asks");
+    let (asks, bytes) = build("mergeahead-warm", 1 << 20, false);
+    // A mapping says whether a page is resident on Linux alone
+    // (`Bytes::resident_at`); elsewhere it cannot say, and every window is
+    // asked for.
+    if cfg!(target_os = "linux") {
+        assert_eq!((asks, bytes), (0, 0), "resident inputs were asked for");
+    } else {
+        assert!(asks > 0, "a mapping that cannot say asked for nothing");
+    }
+    let (asks, bytes) = build("mergeahead-off", 0, true);
+    assert_eq!((asks, bytes), (0, 0), "the option off asked");
 }
 
 #[test]
@@ -3727,6 +5177,12 @@ impl ScanModel {
                 String::from_utf8_lossy(k)
             );
         }
+        self.check_scans(db, state);
+    }
+
+    /// The scans of `check` alone, for a store that must stay far from
+    /// point reads (`Options::scan_cache_copies_fit`).
+    fn check_scans(&self, db: &Reader, state: &str) {
         let visited = self.visited();
         // Every visited key is a start while there are few; past a few
         // hundred, every scan still streams every key but the starts are
@@ -3891,7 +5347,7 @@ fn a_cache_bound_after_its_tables_were_complete_reads_no_shed_block_as_clean() {
                 forms_settle_backlog_pct: 0,
                 scan_cache_auto_bytes: auto,
                 upkeep: supdb::Upkeep::Inline,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -3941,6 +5397,654 @@ fn a_cache_bound_after_its_tables_were_complete_reads_no_shed_block_as_clean() {
         bound > 0,
         "the burst's patches crossed the budget and it bound"
     );
+}
+
+/// The store's own budget, crossed, grows into the room the partitions
+/// leave of the page cache's budget instead of binding
+/// (`Options::scan_cache_auto_room`): with a page-cache budget past the
+/// partitions it grows and nothing binds, with one the partitions fill it
+/// binds as it did, and with the option off it binds whatever the room.
+/// The budget is a kilobyte, which the first forms pass, and the page
+/// cache's budget is the test's seam; the scans answer the model in all
+/// three, the bound one shedding as it goes.
+#[test]
+fn the_caches_own_budget_grows_into_the_room_the_partitions_leave() {
+    let run = |name: &str, page_cache: u64, room: bool| {
+        let d = dir(name);
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_budget(page_cache);
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 1 << 20,
+                partition_bytes: Some(2 << 10),
+                l0_trigger: 64,
+                scan_block_cache: true,
+                scan_cache_ahead: false,
+                commit_forms: true,
+                forms_settle_backlog_pct: 0,
+                scan_cache_auto_bytes: 1 << 10,
+                scan_cache_auto_room: room,
+                zpages_inject: Some(inject),
+                upkeep: supdb::Upkeep::Inline,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..3000u32 {
+            m.append(&mut db, &key(k), "v0-0123456789");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        for round in 0..4u32 {
+            for b in 0..40u32 {
+                m.append(&mut db, &key(b * 64 + 1 + round), &format!("v{round}"));
+            }
+            db.commit().unwrap();
+            m.check(&db, &format!("{name}: round {round}"));
+        }
+        let h = db.reader().unwrap();
+        m.check(&h, &format!("{name}: a handle"));
+        (
+            db.cache_growths(),
+            db.cache_bindings(),
+            db.block_cache_bytes(),
+        )
+    };
+    let (grew, bound, bytes) = run("auto-room-grows", 1 << 30, true);
+    assert!(
+        grew > 0 && bound == 0 && bytes > 1 << 10,
+        "with room the budget grew past its kilobyte and nothing bound: \
+         {grew} growths, {bound} bindings, {bytes} B held"
+    );
+    let (grew, bound, _) = run("auto-room-none", 1, true);
+    assert!(
+        grew == 0 && bound > 0,
+        "with no room past the partitions the budget bound: {grew} growths, {bound} bindings"
+    );
+    let (grew, bound, _) = run("auto-room-off", 1 << 30, false);
+    assert!(
+        grew == 0 && bound > 0,
+        "with the option off the budget bound whatever the room: {grew} growths, {bound} bindings"
+    );
+}
+
+/// Where the store's own budget would bind for want of room beside the raw
+/// form, a store no point read is near holds its cache in the raw records'
+/// place (`Options::scan_cache_copies_fit`): the budget becomes what the
+/// bound leaves once the key sections are given up, where a copy of every
+/// block fits in it, and nothing binds. The page cache's budget is the
+/// test's seam and falls by what the cache takes, as the platform's does:
+/// the first crossing grows into the little room beside the raw form, and
+/// at the second there is none. There the option grants the place; without
+/// it the budget binds, and it binds with it where a point read has come
+/// near, through the writer or through a handle, and where a copy of every
+/// block does not fit the place. A point read after the grant takes it
+/// back: the budget returns to what it was, binds there, and the cache
+/// sheds to it. And a place that the process's other memory has taken
+/// since the grant is given up the same way, with no read at all. The
+/// scans answer the model in every case.
+#[test]
+fn a_scanned_stores_cache_takes_the_raw_records_place() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Case {
+        /// No point read.
+        Far,
+        WriterBefore,
+        HandleBefore,
+        WriterAfter,
+        /// No point read, and the process's other memory grown past the
+        /// place.
+        Squeezed,
+        /// No point read, and a place short of a copy of every block.
+        TooBig,
+        /// No point read, and the place gone the moment it was granted,
+        /// while the cache is still about the budget before it.
+        SqueezedEarly,
+        /// No point read, and every partition served by a form file, so
+        /// that there is no record to hold a copy in the place of.
+        Served,
+    }
+    // What the bound leaves beside the raw form, to begin with.
+    const SLACK: u64 = 64 << 10;
+    let run = |name: &str, fit: bool, case: Case| {
+        let d = dir(name);
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_budget(1 << 30);
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 4 << 20,
+                partition_bytes: Some(64 << 10),
+                l0_trigger: 64,
+                scan_block_cache: true,
+                scan_cache_ahead: false,
+                commit_forms: true,
+                forms_settle_backlog_pct: 0,
+                scan_cache_auto_bytes: 1 << 10,
+                scan_cache_auto_room: true,
+                scan_cache_copies_fit: fit,
+                zpages: if case == Case::Served {
+                    supdb::ZPages::Always
+                } else {
+                    supdb::ZPages::Off
+                },
+                zpages_min_bytes: 0,
+                zpages_inject: Some(inject.clone()),
+                upkeep: supdb::Upkeep::Inline,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        // Values of a hundred bytes, whose records are most of a key
+        // section; of one, where a copy's entries outweigh the hash slots
+        // it would stand in for and no place holds a copy of every block.
+        let pad = if case == Case::TooBig { 0 } else { 96 };
+        let val = |round: u32| format!("{}{}", round % 10, "x".repeat(pad));
+        for k in 0..3000u32 {
+            m.append(&mut db, &key(k), &val(0));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        m.check_scans(&db, &format!("{name}: loaded"));
+        assert!(
+            db.points_far() || !fit,
+            "{name}: a store only scanned is far from point reads"
+        );
+        // The raw form's bytes, from the room under a budget past them,
+        // and its key sections', from the place under the same.
+        if case == Case::Served {
+            // The forced form's files attach at the segment work's turn.
+            let t = std::time::Instant::now();
+            while db.cache_place(1 << 30).1 > 0 {
+                assert!(
+                    t.elapsed().as_secs() < 30,
+                    "{name}: the form files attached"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                db.settle().unwrap();
+            }
+        }
+        let (place, copies, room, _) = db.cache_place(1 << 30);
+        let raw = (1u64 << 30) - room as u64;
+        let sections = raw - ((1u64 << 30) + db.block_cache_bytes() as u64 - place);
+        assert!(
+            (copies > 0 && sections > 0) || case == Case::Served,
+            "{name}: raw {raw} copies {copies}"
+        );
+        let slack = if case == Case::Served {
+            // Room beside the form files, and under the eighth of the
+            // budget a growth into it asks: the budget binds at its first
+            // crossing unless something else grants it.
+            100
+        } else if case == Case::TooBig {
+            assert!(
+                copies > sections + (8 << 10),
+                "{name}: copies of {copies} B outweigh key sections of {sections}"
+            );
+            (copies - sections) / 2
+        } else {
+            assert!(
+                copies < sections + SLACK,
+                "{name}: copies of {copies} B fit the key sections' {sections} and the slack"
+            );
+            SLACK
+        };
+        let point = |db: &mut Db| {
+            if case == Case::HandleBefore {
+                let h = db.reader().unwrap();
+                assert_eq!(h.count(b"key-02999").unwrap(), 1);
+            } else {
+                assert_eq!(db.count(b"key-02999").unwrap(), 1);
+            }
+            assert!(!db.points_far(), "{name}: a point read is near at once");
+        };
+        if matches!(case, Case::WriterBefore | Case::HandleBefore) {
+            point(&mut db);
+        }
+        // Twenty blocks, a key of each a round, until every one is dense
+        // and a copy: the page cache's budget before each commit is the
+        // bound less what the cache holds.
+        let budget = |db: &Db| {
+            if case == Case::Served {
+                raw + slack
+            } else {
+                (raw + slack).saturating_sub(db.block_cache_bytes() as u64)
+            }
+        };
+        // A block a round where the squeeze is to come at the grant, so
+        // that the cache is then little past the budget it crossed.
+        let (rounds, blocks) = if case == Case::SqueezedEarly {
+            (480u32, 1u32)
+        } else {
+            (24, 20)
+        };
+        for round in 1..=rounds {
+            for b in 0..blocks {
+                m.append(&mut db, &key(b * 64 + 1 + round % 24), &val(round));
+            }
+            inject.set_budget(budget(&db));
+            db.commit().unwrap();
+            if blocks > 1 || round % 16 == 0 {
+                m.check_scans(&db, &format!("{name}: round {round}"));
+            }
+            if case == Case::SqueezedEarly && db.cache_copies_grants().0 > 0 {
+                break;
+            }
+        }
+        let before = db.block_cache_bytes();
+        match case {
+            Case::WriterAfter => {
+                point(&mut db);
+                m.append(&mut db, &key(2), &val(99));
+                inject.set_budget(budget(&db));
+                db.commit().unwrap();
+                m.check_scans(&db, &format!("{name}: after the point read"));
+            }
+            Case::Squeezed | Case::SqueezedEarly => {
+                // The page cache's budget read again finds the place gone
+                // to the process's other memory: the cache holds to what
+                // is left. The look reads the budget once a period.
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                for round in 0..2u32 {
+                    m.append(&mut db, &key(2 + round), &val(98));
+                    inject.set_budget(1);
+                    db.commit().unwrap();
+                    m.check_scans(&db, &format!("{name}: squeezed, round {round}"));
+                }
+            }
+            _ => {}
+        }
+        if case == Case::SqueezedEarly {
+            // The place under the squeezed budget is below the budget
+            // from before the grant, which is what the cache is left.
+            let (place, _, _, budget) = db.cache_place(1);
+            assert!(
+                budget as u64 > place,
+                "{name}: a budget of {budget} B stands over a place of {place}"
+            );
+        }
+        let (grants, revokes) = db.cache_copies_grants();
+        let out = (
+            db.cache_growths(),
+            grants,
+            revokes,
+            db.cache_bindings(),
+            before,
+            db.block_cache_bytes(),
+        );
+        let h = db.reader().unwrap();
+        m.check_scans(&h, &format!("{name}: a handle"));
+        out
+    };
+    let (grew, grants, revokes, bound, held, _) = run("copies-fit", true, Case::Far);
+    assert!(
+        grew > 0 && grants > 0 && revokes == 0 && bound == 0 && held as u64 > SLACK,
+        "far from point reads the cache took the records' place and nothing bound: \
+         {grew} growths, {grants} grants, {revokes} taken back, {bound} bindings, {held} B held"
+    );
+    let (grew, grants, _, bound, off, _) = run("copies-fit-off", false, Case::Far);
+    assert!(
+        grew > 0 && grants == 0 && bound > 0 && off < held,
+        "without the option the budget bound beside the raw form: \
+         {grew} growths, {grants} grants, {bound} bindings, {off} B held against {held}"
+    );
+    for (name, case) in [
+        ("copies-fit-writer-read", Case::WriterBefore),
+        ("copies-fit-handle-read", Case::HandleBefore),
+    ] {
+        let (_, grants, _, bound, _, _) = run(name, true, case);
+        assert!(
+            grants == 0 && bound > 0,
+            "{case:?}: a point read near, the records are wanted and the budget bound: \
+             {grants} grants, {bound} bindings"
+        );
+    }
+    let (_, grants, _, bound, _, _) = run("copies-fit-too-big", true, Case::TooBig);
+    assert!(
+        grants == 0 && bound > 0,
+        "a place short of a copy of every block is not granted: {grants} grants, {bound} bindings"
+    );
+    let (_, grants, revokes, bound, before, after) =
+        run("copies-fit-taken-back", true, Case::WriterAfter);
+    assert!(
+        grants > 0 && revokes == 1 && bound == 1 && after < before && after as u64 > SLACK / 2,
+        "a point read after the grant took it back, and the cache shed to the budget before it: \
+         {grants} grants, {revokes} taken back, {bound} bindings, {before} B then {after}"
+    );
+    let (_, grants, _, bound, _, _) = run("copies-fit-served", true, Case::Served);
+    assert!(
+        grants == 0 && bound > 0,
+        "no partition's records to stand in for, nothing is granted: {grants} grants, {bound} bindings"
+    );
+    let (_, grants, revokes, bound, before, after) =
+        run("copies-fit-squeezed-early", true, Case::SqueezedEarly);
+    assert!(
+        grants > 0 && revokes == 0 && bound <= 1 && after <= before,
+        "a place under the budget before the grant leaves the cache that budget: \
+         {grants} grants, {revokes} taken back, {bound} bindings, {before} B then {after}"
+    );
+    let (_, grants, revokes, bound, before, after) =
+        run("copies-fit-squeezed", true, Case::Squeezed);
+    assert!(
+        grants > 0 && revokes == 0 && bound == 1 && after < before,
+        "the place gone to other memory, the cache held to what was left of it: \
+         {grants} grants, {revokes} taken back, {bound} bindings, {before} B then {after}"
+    );
+}
+
+/// The records' place counts a copy for the blocks of the partitions the
+/// raw form serves and none for a partition a form file serves, whose file
+/// is what its reads need whatever the cache holds
+/// (`Reader::copies_place`).
+#[test]
+fn the_records_place_holds_no_copy_of_a_served_partition() {
+    let run = |name: &str, zpages: supdb::ZPages| {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                partition_bytes: Some(64 << 10),
+                zpages,
+                zpages_min_bytes: 0,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        for k in 0..3000u32 {
+            db.append(format!("key-{k:05}").as_bytes(), &[b'x'; 100]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        // A forced form's builds are joined by the settle; its attach is
+        // the segment work's next turn.
+        let t = std::time::Instant::now();
+        let want_none = zpages == supdb::ZPages::Always;
+        loop {
+            let (place, copies, _, _) = db.cache_place(1 << 30);
+            if (copies == 0) == want_none {
+                break (place, copies);
+            }
+            assert!(
+                t.elapsed().as_secs() < 30,
+                "{name}: copies of {copies} B, served {want_none}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            db.settle().unwrap();
+        }
+    };
+    let (place, copies) = run("place-raw", supdb::ZPages::Off);
+    assert!(
+        copies > 3000 * 100 && place < 1 << 30,
+        "the raw form's blocks each have a copy to hold, and its ordered indexes are taken \
+         from the place: place {place}, copies {copies} B"
+    );
+    let (place, copies) = run("place-served", supdb::ZPages::Always);
+    assert!(
+        copies == 0 && place < 1 << 30,
+        "a served partition has no copy in the place, and its file is taken from it: \
+         place {place}, copies {copies}"
+    );
+}
+
+/// Point reads are near from the first, the writer's or a handle's, until
+/// two stores' worth of writes have come since the last
+/// (`Db::points_far`), as scans are read; a scan brings none near.
+#[test]
+fn point_reads_are_near_until_two_stores_of_writes_since_the_last() {
+    for handle in [false, true] {
+        let d = dir(&format!("points-far-{handle}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                scan_cache_copies_fit: true,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let key = |k: u32| format!("key-{k:05}").into_bytes();
+        for k in 0..1000u32 {
+            db.append(&key(k), b"v");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert!(db.points_far(), "a store nobody has read");
+        let mut seen = 0usize;
+        db.scan(b"", 5, kv(&mut |_, _| seen += 1)).unwrap();
+        db.append(&key(1), b"w");
+        db.commit().unwrap();
+        assert!(db.points_far(), "a scan is no point read");
+        if handle {
+            let h = db.reader().unwrap();
+            assert_eq!(h.count(&key(3)).unwrap(), 1);
+        } else {
+            assert_eq!(db.count(&key(3)).unwrap(), 1);
+        }
+        assert!(
+            !db.points_far(),
+            "handle {handle}: near at the read, before any commit"
+        );
+        // The commit that finds the read, and two stores' worth of writes
+        // after it and no more: still near.
+        for round in 0..3u32 {
+            for k in 0..1000u32 {
+                db.append(&key(k), format!("r{round}").as_bytes());
+            }
+            db.commit().unwrap();
+            assert!(
+                !db.points_far(),
+                "handle {handle}: near {} writes past the commit that found the read",
+                round * 1000
+            );
+        }
+        db.append(&key(0), b"over");
+        db.commit().unwrap();
+        assert!(
+            db.points_far(),
+            "handle {handle}: far past two stores' worth of writes"
+        );
+        // And near again at the next.
+        assert!(db.count(&key(4)).unwrap() > 0);
+        assert!(!db.points_far(), "handle {handle}: near again");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A covered partition's settle files a written key under the block the
+/// ordered index's samples name, its cut left for the build
+/// (`Options::settle_covered_samples`): over a store whose partitions are
+/// all served by their form files, scattered writes, deletes and inserts
+/// read back as the model has them through every window and every handle,
+/// with more keys filed by the samples than the form's span alone files.
+#[test]
+fn a_covered_partitions_settle_files_a_key_under_the_block_its_samples_name() {
+    let mut filed_by = [0u64; 2];
+    for samples in [true, false] {
+        let name = format!("settle-covered-samples-{samples}");
+        let d = dir(&name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 1 << 20,
+                partition_bytes: Some(32 << 10),
+                l0_trigger: 64,
+                scan_block_cache: true,
+                scan_cache_ahead: false,
+                commit_forms: true,
+                forms_settle_backlog_pct: 0,
+                zpages: supdb::ZPages::Always,
+                zpages_min_bytes: 0,
+                // The block form's span: a group that straddles a block's
+                // edge is what the samples are for, and the stride form,
+                // which these keys and values would take, names a key's
+                // block by its rank and files every one by its span.
+                zpages_stride: supdb::ZStride::Off,
+                settle_covered_samples: samples,
+                upkeep: supdb::Upkeep::Inline,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..6000u32 {
+            m.append(&mut db, &key(k), "v0-0123456789");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert!(
+            c.form_files > 1 && c.form_files == c.partitions,
+            "{name}: every partition served by its form file: {c:?}"
+        );
+        m.check_one(&db, key(0).as_bytes(), 10, &format!("{name}: before"));
+        let before = db.lazy_cuts();
+        let mut x = 0x5E77_1A2Bu64;
+        let mut rng = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for round in 0..3u32 {
+            for i in 0..150u32 {
+                let k = (rng() % 6000) as u32;
+                match rng() % 4 {
+                    0 => m.delete(&mut db, &key(k)),
+                    1 => m.append(&mut db, &format!("{}x{round}-{i}", key(k)), "n"),
+                    _ => m.append(&mut db, &key(k), &format!("s{round}-{i}")),
+                }
+            }
+            db.commit().unwrap();
+            for w in 0..20u32 {
+                let from = key((rng() % 6100) as u32);
+                let limit = 1 + (w as usize * 7) % 150;
+                m.check_one(
+                    &db,
+                    from.as_bytes(),
+                    limit,
+                    &format!("{name}: round {round} window {w}"),
+                );
+            }
+        }
+        m.check(&db, &format!("{name}: the writer at the end"));
+        let h = db.reader().unwrap();
+        m.check(&h, &format!("{name}: a handle at the end"));
+        let [filed, _] = db.lazy_cuts();
+        filed_by[usize::from(samples)] = filed - before[0];
+    }
+    assert!(
+        filed_by[1] > filed_by[0],
+        "more keys filed by the samples than by the form's span alone: {filed_by:?}"
+    );
+}
+
+/// A raw partition's settle files a written key under the block the
+/// ordered index's samples name, its cut left for the build that reads
+/// the block (`Options::settle_lazy_raw`), and the scans answer the model:
+/// updates, keys between records and deletes over every partition after a
+/// short scan has stood the tables with most of their blocks unbuilt, with
+/// the option on and off. On, the settle filed keys with their cuts left
+/// and the builds resolved them, each to the block it was filed under,
+/// which a debug assertion in the build holds; off, it filed none so.
+#[test]
+fn a_raw_partitions_settle_files_a_key_under_the_block_its_samples_name() {
+    for lazy in [true, false] {
+        let name = format!("settle-lazy-raw-{lazy}");
+        let d = dir(&name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 1 << 20,
+                partition_bytes: Some(32 << 10),
+                l0_trigger: 64,
+                scan_block_cache: true,
+                scan_cache_ahead: false,
+                commit_forms: true,
+                forms_settle_backlog_pct: 0,
+                settle_lazy_raw: lazy,
+                upkeep: supdb::Upkeep::Inline,
+                // Raw partitions, in memory: a partition a form file serves
+                // files its keys with their cuts left by the covered
+                // settle's samples (`Options::settle_covered_samples`),
+                // which the forced form's builds give it once they land.
+                zpages: supdb::ZPages::Auto,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..6000u32 {
+            m.append(&mut db, &key(k), "v0-0123456789");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        m.check_one(
+            &db,
+            key(0).as_bytes(),
+            10,
+            &format!("{name}: before the writes"),
+        );
+        let before = db.lazy_cuts();
+        let mut x = 0x5E77_1A2Bu64;
+        let mut rng = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for round in 0..3u32 {
+            for i in 0..150u32 {
+                let k = (rng() % 6000) as u32;
+                match rng() % 4 {
+                    0 => m.delete(&mut db, &key(k)),
+                    1 => m.append(&mut db, &format!("{}x{round}-{i}", key(k)), "n"),
+                    _ => m.append(&mut db, &key(k), &format!("s{round}-{i}")),
+                }
+            }
+            db.commit().unwrap();
+            for w in 0..20u32 {
+                let from = key((rng() % 6100) as u32);
+                let limit = 1 + (w as usize * 7) % 150;
+                m.check_one(
+                    &db,
+                    from.as_bytes(),
+                    limit,
+                    &format!("{name}: round {round} window {w}"),
+                );
+            }
+        }
+        m.check(&db, &format!("{name}: the writer at the end"));
+        let h = db.reader().unwrap();
+        m.check(&h, &format!("{name}: a handle at the end"));
+        let [filed, resolved] = db.lazy_cuts();
+        let (filed, resolved) = (filed - before[0], resolved - before[1]);
+        if lazy {
+            assert!(
+                filed > 0 && resolved > 0,
+                "{name}: keys filed by the samples ({filed}) and resolved by the builds ({resolved})"
+            );
+        } else {
+            assert_eq!(filed, 0, "{name}: no key filed with its cut left");
+        }
+    }
 }
 
 /// And a budget the cache never reaches keeps the unbounded shape: the
@@ -4028,7 +6132,7 @@ fn burst_into_forms_prepared(
         // The commit's own maintenance, step by step.
         upkeep: supdb::Upkeep::Inline,
         forms_to_fit: fit,
-        ..Options::default()
+        ..common::options()
     };
     tune(&mut opts);
     let mut db = Db::create(&d, opts).unwrap();
@@ -4102,7 +6206,13 @@ fn a_burst_filed_into_the_forms_is_kept_to_the_budget_when_they_are_kept_to_fit(
     assert_eq!(counted as u64, forms_bytes_of(&c, "cap"), "{c:?}");
     m.check(&db, "a burst filed into forms kept to fit");
 
-    let (db, m) = burst_into_forms("burst-unfit", budget, false);
+    // The patches of a burst the scans' builds formed, the shape before a
+    // commit near reads built its own forms under the budget
+    // (`Options::forms_settle_every` and `forms_settle_builds` off).
+    let (db, m) = burst_into_forms_with("burst-unfit", budget, false, |o| {
+        o.forms_settle_every = false;
+        o.forms_settle_builds = false;
+    });
     let counted = db.block_cache_bytes();
     assert!(
         counted > 2 * budget,
@@ -4116,7 +6226,12 @@ fn a_burst_filed_into_the_forms_is_kept_to_the_budget_when_they_are_kept_to_fit(
     // The patch's shed is a part of the flag of its own: with it off the
     // forms are counted by their buffers and the burst builds the cache
     // past the budget, as it does not kept to fit at all.
-    let (db, m) = burst_into_forms_with("burst-noshed", budget, true, |o| o.forms_fit_shed = false);
+    let (db, m) = burst_into_forms_with("burst-noshed", budget, true, |o| {
+        o.forms_fit_shed = false;
+        // The same shape: the patches are of forms the scans built.
+        o.forms_settle_every = false;
+        o.forms_settle_builds = false;
+    });
     let counted = db.block_cache_bytes();
     assert!(
         counted > 2 * budget,
@@ -4425,7 +6540,7 @@ fn shed_over_published_forms_with(
         commit_forms: true,
         upkeep: supdb::Upkeep::Inline,
         forms_to_fit: fit,
-        ..Options::default()
+        ..common::options()
     };
     tune(&mut opts);
     let mut db = Db::create(&d, opts).unwrap();
@@ -4508,6 +6623,97 @@ fn a_block_shed_from_any_partition_takes_its_published_form_with_it() {
             m.check(&r, &format!("{name}: the handle after round {round}"));
             m.check(&db, &format!("{name}: the writer after round {round}"));
         }
+    }
+}
+
+/// The sweep at an operation's end that a handle's pin holds remembers
+/// the pin (`Options::sweep_remembers_pin`): under a snapshot held, a
+/// flush's landing retires the state before it and the writer's scans
+/// after a commit retire snapshots, and each waits for that pin, so the
+/// sweep at every operation's end finds it. The first finds it by a walk
+/// of the reader table and remembers the slot; the ends after read that
+/// slot and walk no more -- the shortcut count moves by about one an
+/// operation and the walk count by a few, where without the option every
+/// end walks and nothing is shortcut. The pin released, the next
+/// commit's and scan's sweeps free what waited, so what the shortcut
+/// skipped was a walk and not a free.
+#[test]
+fn a_sweep_a_pin_holds_remembers_the_pin() {
+    for on in [true, false] {
+        let name = format!("sweep-remembers-{on}");
+        let (mut db, r, mut m) = shed_over_published_forms_with(&name, false, |o| {
+            // The commits leave their batches to the reads, so the pin
+            // this test releases is the one thing a sweep waits behind
+            // (`Options::forms_settle_every` and `forms_settle_builds` off).
+            o.forms_settle_every = false;
+            o.forms_settle_builds = false;
+            o.sweep_remembers_pin = on;
+            // Room for the forms the rounds below make: nothing sheds.
+            o.scan_cache_bytes = 1 << 30;
+        });
+        let key = |k: u32| format!("key-{k:05}");
+        let mut sink = 0usize;
+        r.snapshot();
+        // A state retired under the pin: the flush's landing replaces the
+        // one the handle holds.
+        for k in (0..3000u32).step_by(40) {
+            m.delete(&mut db, &key(k));
+            m.append(&mut db, &key(k), "v5-0123456789");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        let (hits0, walks0) = (db.sweep_shortcuts(), db.sweep_walks());
+        let ops = 40u64;
+        for i in 0..ops as u32 {
+            if i % 10 == 0 {
+                m.append(&mut db, &key(3000 + i), "v6-0123456789");
+                db.commit().unwrap();
+            }
+            db.scan(
+                key(i * 70 % 3000).as_bytes(),
+                120,
+                kv(&mut |_k, v| sink += v.len()),
+            )
+            .unwrap();
+        }
+        let hits = db.sweep_shortcuts() - hits0;
+        let walks = db.sweep_walks() - walks0;
+        if on {
+            assert!(
+                hits >= ops / 2 && walks <= ops / 4,
+                "{name}: the ends read the remembered pin: {hits} shortcuts, {walks} walks over {ops} operations"
+            );
+        } else {
+            assert!(
+                hits == 0 && walks >= ops,
+                "{name}: every end walks: {hits} shortcuts, {walks} walks over {ops} operations"
+            );
+        }
+        let held = db.retired_waiting();
+        assert!(
+            held.0 + held.1 > 0,
+            "{name}: the pin held nothing back, so nothing tested the sweep"
+        );
+        r.release();
+        // The forms a commit's sweep frees, the snapshots a scan's
+        // publish sweeps: one of each after the pin, and nothing waits.
+        m.append(&mut db, &key(3100), "v7-0123456789");
+        db.commit().unwrap();
+        db.scan(key(0).as_bytes(), 120, kv(&mut |_k, v| sink += v.len()))
+            .unwrap();
+        let after = db.retired_waiting();
+        assert_eq!(
+            after,
+            (0, 0),
+            "{name}: the pin released, the ends after free what waited: {after:?}"
+        );
+        std::hint::black_box(sink);
+        m.check(&r, &format!("{name}: the handle"));
+        m.check(&db, &format!("{name}: the writer"));
+        drop(r);
+        db.close().unwrap();
     }
 }
 
@@ -4602,7 +6808,7 @@ fn one_delta_a_block(name: &str, fit: bool) -> (Db, ScanModel) {
         commit_forms: true,
         upkeep: supdb::Upkeep::Inline,
         forms_to_fit: fit,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -4786,7 +6992,7 @@ fn differential_budgeted(
         commit_forms: true,
         upkeep,
         forms_to_fit: fit,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -4947,7 +7153,7 @@ fn the_seal_grows_with_the_store() {
             seal_bytes: 64 << 10,
             partition_bytes: Some(256 << 10),
             seal_grows: grows,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let val = vec![7u8; 200];
@@ -5013,7 +7219,7 @@ fn the_store_is_short_of_memory_while_its_raw_form_exceeds_the_budget() {
             forms_fit_when_short: on,
             zpages: supdb::ZPages::Off,
             zpages_inject: Some(inject.clone()),
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let val = vec![7u8; 200];
@@ -5061,7 +7267,7 @@ fn the_wal_drops_its_synced_frames_from_the_page_cache() {
             direct_ingest: false,
             seal_bytes: 256 << 20,
             wal_drop_bytes: if on { stride } else { 0 },
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let val = vec![9u8; 1000];
@@ -5072,6 +7278,10 @@ fn the_wal_drops_its_synced_frames_from_the_page_cache() {
             }
             db.commit().unwrap();
         }
+        // The log's tail, short of the file's end by the zeros its
+        // pre-write keeps ahead (`Options::wal_ahead_bytes`), which were
+        // written and not synced frames.
+        let len = db.wal_durable().2 as usize;
         let wal = std::fs::read_dir(&d)
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -5081,7 +7291,6 @@ fn the_wal_drops_its_synced_frames_from_the_page_cache() {
                     .is_some_and(|n| n.starts_with("wal-"))
             })
             .expect("a WAL");
-        let len = std::fs::metadata(&wal).unwrap().len() as usize;
         assert!(len > 3 << 20, "the log holds {len} bytes");
         // Everything below the last stride before the tail was synced and
         // dropped; the tail's own stretch, and its page, stay.
@@ -5123,7 +7332,7 @@ fn the_seal_holds_at_its_floor_out_of_core() {
             seal_floor_out_of_core: floor_ooc,
             // The gate is the test's to set.
             zpages: supdb::ZPages::Off,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let val = vec![7u8; 200];
@@ -5184,7 +7393,16 @@ fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
 /// The fold with the forms holding the pieces' fold alone.
 #[test]
 fn the_fold_answers_the_same_model_with_pieces_only_forms() {
-    fold_model_with(true, true);
+    fold_model_with(true, true, false);
+}
+
+/// The fold with the blocks the bursts make wide copied once their walks
+/// have paid (`Options::forms_copy_hot_wide`): every phase -- the rebuilds
+/// of the snapshot, the rehash, the seal and the landing -- with the copies
+/// standing where the other runs walk the blocks wide.
+#[test]
+fn the_fold_answers_the_same_model_with_hot_wide_copies() {
+    fold_model_with(true, false, true);
 }
 
 /// The same phases on the merge path, where the keys written since the
@@ -5197,17 +7415,23 @@ fn the_merge_path_files_the_keys_written_since_its_snapshot() {
 }
 
 fn fold_model(block_cache: bool) {
-    fold_model_with(block_cache, false)
+    fold_model_with(block_cache, false, false)
 }
 
-fn fold_model_with(block_cache: bool, pieces_only: bool) {
-    let d = dir(&format!("overlay-fold-{block_cache}-{pieces_only}"));
+/// `hot_copy` lets the wide blocks be copied once their walks pay
+/// (`Options::forms_copy_hot_wide`); without it they stay wide, the form
+/// these phases are written for.
+fn fold_model_with(block_cache: bool, pieces_only: bool, hot_copy: bool) {
+    let d = dir(&format!(
+        "overlay-fold-{block_cache}-{pieces_only}-{hot_copy}"
+    ));
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(2 << 10),
         scan_block_cache: block_cache,
         forms_pieces_only: pieces_only,
-        ..Options::default()
+        forms_copy_hot_wide: hot_copy,
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -5255,7 +7479,7 @@ fn fold_model_with(block_cache: bool, pieces_only: bool) {
     // With the forms holding the pieces' fold alone, a block dense with
     // memtable keys overlays the snapshot and is not held wide.
     assert!(
-        !block_cache || pieces_only || db.block_cache_wide() > 0,
+        !block_cache || pieces_only || hot_copy || db.block_cache_wide() > 0,
         "the burst's blocks are walked wide"
     );
     // Fewer than the snapshot holds, so no rebuild: the wide blocks take
@@ -5291,8 +7515,12 @@ fn fold_model_with(block_cache: bool, pieces_only: bool) {
     m.check(&db, "keys filed into wide blocks after the rebuild");
     held(&db, 0);
     assert!(
-        !block_cache || pieces_only || db.block_cache_wide() > 0,
+        !block_cache || pieces_only || hot_copy || db.block_cache_wide() > 0,
         "the wide blocks stand after the rebuild"
+    );
+    assert!(
+        !hot_copy || db.build_kinds().1 > 0,
+        "the bursts' wide blocks were copied once their walks paid"
     );
     m.delete(&mut db, &key(303));
     m.append(&mut db, &key(309), "l-after-rebuild");
@@ -5357,7 +7585,7 @@ fn a_copy_of_updates_starts_a_scan_at_the_seeks_rank() {
         seal_bytes: 1 << 20,
         partition_bytes: Some(64 << 10),
         scan_block_cache: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -5394,6 +7622,54 @@ fn a_copy_of_updates_starts_a_scan_at_the_seeks_rank() {
     assert!(searched2 > 0, "the block with the insert is searched");
 }
 
+/// A copy walk paces the prefetch of the copy block it reaches next through
+/// itself (`Options::scan_prefetch_paced`): over a partition of several
+/// blocks, every one a copy, the model's scans across block boundaries pace
+/// one with the option and none without, and read the same entries either
+/// way.
+#[test]
+fn a_copy_walk_paces_the_next_blocks_prefetch_through_itself() {
+    for on in [true, false] {
+        let d = dir(&format!("copy-prefetch-paced-{on}"));
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(64 << 10),
+            scan_block_cache: true,
+            scan_prefetch_paced: on,
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in (0..1200).step_by(3) {
+            m.append(&mut db, &key(k), &format!("p{k}"));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        assert_eq!(db.levels(), (1, 0), "one partition of several blocks");
+        for k in (0..1200).step_by(3) {
+            m.append(&mut db, &key(k), &format!("u{k}"));
+        }
+        db.commit().unwrap();
+        m.check(
+            &db,
+            &format!("paced {on}: every key updated once, copies of the records"),
+        );
+        let [at_rank, _] = db.copy_starts();
+        assert!(at_rank > 0, "paced {on}: the scans walked copies");
+        let paces = db.prefetch_paces();
+        if on {
+            assert!(
+                paces > 0,
+                "paced {on}: walks across a block paced the next's prefetch"
+            );
+        } else {
+            assert_eq!(paces, 0, "paced {on}: the burst paces nothing");
+        }
+    }
+}
+
 /// A dense sparse form is converted into a copy from its own deltas and the
 /// partition's records (`Options::convert_from_form`), where the build from
 /// the sources gathered every key's run again. The forms here grow dense
@@ -5416,7 +7692,7 @@ fn a_dense_form_converts_from_its_own_deltas() {
         partition_bytes: Some(64 << 10),
         scan_block_cache: true,
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -5458,6 +7734,134 @@ fn a_dense_form_converts_from_its_own_deltas() {
     );
 }
 
+/// A sparse form of updates alone, converted to a copy from its deltas,
+/// is a copy whose entries are its partition's records, and of that
+/// partition (`CachedBlock::identity_for`): a patch after it writes by the
+/// key's rank and a walk starts there.
+#[test]
+fn a_copy_converted_from_updates_alone_is_its_partitions_records() {
+    let d = dir("convert-identity");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(64 << 10),
+        scan_block_cache: true,
+        upkeep: supdb::Upkeep::Inline,
+        ..common::options()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1200 {
+        m.append(&mut db, &key(k), &format!("p{k}"));
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    assert_eq!(db.levels(), (1, 0), "one partition of several blocks");
+    m.check(&db, "clean");
+    let before = db.forms_events()[13];
+    // A part of every block a round, all of them updates of a record: the
+    // first fill leaves sparse forms and the next finds them dense.
+    for off in 0..5u32 {
+        for k in (off..1200).step_by(5) {
+            m.delete(&mut db, &key(k));
+            m.append(&mut db, &key(k), &format!("u{k}"));
+        }
+        db.commit().unwrap();
+        m.check(&db, &format!("round {off}"));
+    }
+    assert!(
+        db.forms_events()[13] > before,
+        "dense forms were converted from their own deltas"
+    );
+    let (claimed, holds) = db.block_cache_identity();
+    assert!(
+        claimed >= 1 && holds == claimed,
+        "the converted copies are their partition's records: {claimed} claimed, {holds} of it"
+    );
+}
+
+/// A light sparse form -- under the dense count, at least
+/// `Options::forms_convert_from` deltas -- is converted to a copy by a fill
+/// on the upkeep thread, where the write mixes' few deltas a block are filed,
+/// and by no pass over a burst's batch (`Reader::burst_pass`), whose pace
+/// holds the writer to the thread; at the dense count alone it stays deltas.
+/// Each case gives sixty blocks one delta a round for six rounds, in commits
+/// of sixty writes, or of three hundred where the case is a burst's -- under
+/// the paced share of a store of 32,000 keys and past `UPKEEP_WAKE_WRITES`,
+/// so the batches are lent to the thread rather than filed in the commit --
+/// with one write a round into a block no write has reached, which has the
+/// fill walk the table, and the scans after hold every block to the model.
+#[test]
+fn a_light_form_converts_on_the_upkeep_thread_and_not_over_a_burst() {
+    for (line, burst, converts) in [(4usize, false, true), (0, false, false), (4, true, false)] {
+        let d = dir(&format!("convert-light-{line}-{burst}"));
+        let opts = Options {
+            seal_bytes: 1 << 26,
+            partition_bytes: Some(1 << 20),
+            scan_block_cache: true,
+            forms_convert_from: line,
+            // In memory, the controller's FITS: a light form converts
+            // only while the gate is at the raw form, and the forced
+            // form's is not.
+            zpages: supdb::ZPages::Auto,
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..32_000u32 {
+            m.append(&mut db, &key(k), "p");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        // A scan, so that the commits after it maintain the forms.
+        m.check_one(&db, key(0).as_bytes(), 100, "clean");
+        let before = db.forms_events()[13];
+        let passes = db.upkeep_counts()[0];
+        for round in 0..6u32 {
+            for b in 0..60u32 {
+                let k = b * 64 + 2 + round * 9;
+                for i in 0..if burst { 5 } else { 1 } {
+                    m.append(&mut db, &key(k), &format!("u{round}-{i}"));
+                }
+            }
+            // And a block no write has reached, as the mixes' writes keep
+            // reaching: a write into a block the table holds no form for is
+            // what has the next fill walk the table, and the walk is where
+            // a light form is met.
+            m.append(&mut db, &key((100 + round) * 64 + 5), "fresh");
+            db.commit().unwrap();
+            db.settle().unwrap();
+        }
+        assert!(
+            db.upkeep_counts()[0] > passes,
+            "line {line}, burst {burst}: the thread made no pass, so nothing above tested it"
+        );
+        let converted = db.forms_events()[13] - before;
+        if converts {
+            assert!(
+                converted >= 30,
+                "line {line}: the thread converted {converted} light forms of sixty"
+            );
+        } else {
+            assert_eq!(
+                converted, 0,
+                "line {line}, burst {burst}: a light form converted"
+            );
+        }
+        for b in (0..60u32).step_by(7) {
+            m.check_one(
+                &db,
+                key(b * 64).as_bytes(),
+                200,
+                &format!("line {line}, burst {burst}: block {b} after the rounds"),
+            );
+        }
+    }
+}
+
 /// A manifest publish keeps the manifest it replaces linked under a spare
 /// name, so that the rename frees no inode on the publish's path, and the
 /// spare is unlinked by the segment work when idle and at open
@@ -5472,7 +7876,7 @@ fn a_manifest_publish_leaves_its_spare_to_the_sweep() {
         seal_bytes: 1 << 20,
         partition_bytes: Some(64 << 10),
         manifest_slots: false,
-        ..Options::default()
+        ..common::options()
     };
     let spares = |d: &std::path::Path| -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(d)
@@ -5537,7 +7941,7 @@ fn a_manifest_publish_alternates_two_slots_and_the_open_takes_the_newest_valid()
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(64 << 10),
-        ..Options::default()
+        ..common::options()
     };
     let key = |k: u32| format!("key-{k:05}");
     let mut db = Db::create(&d, opts.clone()).unwrap();
@@ -5707,7 +8111,7 @@ fn a_write_settles_into_the_block_it_lands_in() {
         seal_bytes: 1 << 20,
         partition_bytes: Some(64 << 10),
         scan_block_cache: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -5769,7 +8173,7 @@ fn a_write_settles_into_the_block_it_lands_in() {
             seal_bytes: 1 << 20,
             partition_bytes: Some(64 << 10),
             scan_block_cache: true,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -5798,7 +8202,14 @@ fn a_builder_ahead_of_the_reader_fills_the_cache() {
         scan_block_cache: true,
         scan_cache_ahead: true,
         scan_cache_ahead_min_blocks: 0,
-        ..Options::default()
+        // The builder at the state's first scan: one scan here stands for
+        // a state that is being scanned.
+        ahead_in_core_scans_div: 0,
+        // In memory, the controller's FITS: the forced form's gate reads
+        // as out of core, where the builder waits for a state scanned
+        // many times (`Options::ahead_out_of_core_scans`).
+        zpages: supdb::ZPages::Auto,
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -5864,7 +8275,7 @@ fn a_builder_ahead_of_the_reader_fills_the_cache() {
             scan_block_cache: true,
             scan_cache_ahead: true,
             scan_cache_ahead_min_blocks: 0,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -5924,7 +8335,9 @@ fn a_key_held_by_many_pieces_counts_once_toward_a_wide_block() {
         scan_block_cache: true,
         // The premise is sixteen pieces over every range, so none merge.
         tier_pieces: 0,
-        ..Options::default()
+        // What is counted is the wide form: the block stays wide.
+        forms_copy_hot_wide: false,
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -5965,6 +8378,256 @@ fn a_key_held_by_many_pieces_counts_once_toward_a_wide_block() {
     m.check(&db, "three hundred keys past the end in one source");
     held(&db, 0);
     assert_eq!(db.block_cache_wide(), 1, "the tail's block is wide");
+}
+
+/// A wide block's walk takes at most a scan's limit of the overlay's keys,
+/// and the window that merges its sources for the scan stops there
+/// (`Options::scan_wide_capped`); a key one source holds is emitted without
+/// the tombstone search (`Options::emit_lone_unsearched`). Each held to the
+/// model, and so to the shape before it, over a block whose keys past the
+/// end sit in four pieces interleaved key by key, every seventh in two
+/// pieces, every eleventh deleted in another, and the live memtable over
+/// some of them and between them.
+#[test]
+fn a_wide_blocks_window_stops_at_the_scans_limit() {
+    for (capped, lone) in [(true, true), (false, true), (true, false), (false, false)] {
+        let d = dir(&format!("wide-window-{capped}-{lone}"));
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(2 << 10),
+            l0_trigger: 64,
+            scan_block_cache: true,
+            // Four pieces over the last range, none merged.
+            tier_pieces: 0,
+            scan_wide_capped: capped,
+            emit_lone_unsearched: lone,
+            // The window is what is tested: the block stays wide.
+            forms_copy_hot_wide: false,
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in (0..600).step_by(3) {
+            m.append(&mut db, &key(k), &format!("p{k}"));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        let tail = |k: u32| format!("key-00600x{k:04}");
+        for round in 0..4u32 {
+            for k in 0..1280u32 {
+                if k % 4 == round || (k % 7 == 0 && (k + 1) % 4 == round) {
+                    m.append(&mut db, &tail(k), &format!("r{round}"));
+                }
+                if k % 11 == 0 && (k + 2) % 4 == round {
+                    m.delete(&mut db, &tail(k));
+                }
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+            db.settle().unwrap();
+        }
+        assert!(db.levels().1 >= 4, "the tail's four pieces stand");
+        for k in (0..1280u32).step_by(5) {
+            m.append(&mut db, &tail(k), "live");
+        }
+        for k in (0..1280u32).step_by(13) {
+            m.append(&mut db, &format!("{}+", tail(k)), "live-new");
+        }
+        m.delete(&mut db, &tail(40));
+        db.commit().unwrap();
+        let state = format!("pieces and the live table past the end, capped {capped} lone {lone}");
+        m.check(&db, &state);
+        held(&db, 0);
+        assert!(
+            db.block_cache_wide() > 0,
+            "{state}: the tail's block is wide"
+        );
+        // That table frozen and held, and a live one over it and between
+        // its keys: the window's memtable sources are a base and the live
+        // run, a key in both folded from both, a live tombstone over a
+        // frozen key.
+        db.hold_seal_landing(true);
+        db.seal().unwrap();
+        for k in (0..1280u32).step_by(10) {
+            m.append(&mut db, &tail(k), "over-frozen");
+        }
+        for k in (3..1280u32).step_by(17) {
+            m.append(&mut db, &format!("{}-", tail(k)), "live-between");
+        }
+        m.delete(&mut db, &tail(65));
+        db.commit().unwrap();
+        assert!(db.in_flight().0, "the seal is held");
+        let state =
+            format!("a frozen table and a live one past the end, capped {capped} lone {lone}");
+        m.check(&db, &state);
+        held(&db, 0);
+        db.hold_seal_landing(false);
+        db.settle().unwrap();
+        m.check(&db, &format!("{state}, landed"));
+        held(&db, 0);
+    }
+}
+
+/// A block wide by its count of keys past the end is copied once its walks
+/// have paid for the copy, and the copy stands past the wide bound: the
+/// inserts after it are appended to it, a delete and an update of keys in it
+/// are spliced in, and every scan answers what the model holds
+/// (`Options::forms_copy_hot_wide`). Without the option the block stays
+/// wide.
+#[test]
+fn a_hot_wide_block_is_copied_and_kept_past_the_bound() {
+    for on in [true, false] {
+        let d = dir(&format!("hot-wide-{on}"));
+        let opts = Options {
+            seal_bytes: 1 << 26,
+            partition_bytes: Some(2 << 10),
+            scan_block_cache: true,
+            forms_copy_hot_wide: on,
+            // The walk at which the copy pays by the fixed ratio; the
+            // priced rule has a test of its own.
+            forms_copy_wide_priced: false,
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in (0..600).step_by(3) {
+            m.append(&mut db, &key(k), &format!("p{k}"));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        let tail = |k: u32| format!("key-00600x{k:04}");
+        // An update first, as the mixes' batches have, so the inserts past
+        // the end go to the hash table and open no direct run.
+        m.append(&mut db, &key(3), "u");
+        for k in 0..600u32 {
+            m.append(&mut db, &tail(k), "t");
+        }
+        db.commit().unwrap();
+        let state = format!("hot wide {on}");
+        // Six hundred keys past the end: the block is copied at its eighth
+        // walk.
+        for i in 0..12u32 {
+            m.check_one(
+                &db,
+                tail(i * 37).as_bytes(),
+                1 + (i as usize * 7) % 60,
+                &state,
+            );
+        }
+        let (_, recopies, _) = db.build_kinds();
+        if on {
+            assert_eq!(recopies, 1, "{state}: the tail's block copied once");
+            assert_eq!(db.block_cache_wide(), 0, "{state}: and no longer wide");
+        } else {
+            assert_eq!(recopies, 0, "{state}: never copied");
+            assert_eq!(db.block_cache_wide(), 1, "{state}: and wide");
+        }
+        // Inserts past the end, a delete and an update in the copy, filed
+        // by the settle after a scan.
+        m.append(&mut db, &key(6), "u2");
+        for k in 600..900u32 {
+            m.append(&mut db, &tail(k), "t2");
+        }
+        m.delete(&mut db, &tail(5));
+        m.append(&mut db, &tail(77), "updated");
+        db.commit().unwrap();
+        for i in 0..12u32 {
+            m.check_one(
+                &db,
+                tail(i * 61).as_bytes(),
+                1 + (i as usize * 11) % 90,
+                &state,
+            );
+        }
+        m.check(&db, &format!("{state}, after the inserts"));
+        held(&db, 0);
+        let (_, recopies, _) = db.build_kinds();
+        if on {
+            assert_eq!(recopies, 1, "{state}: the copy stood across the inserts");
+            assert_eq!(db.block_cache_wide(), 0, "{state}: and is a copy still");
+        } else {
+            assert_eq!(db.block_cache_wide(), 1, "{state}: still wide");
+        }
+    }
+}
+
+/// A hot wide block's copy is bought once the keys its earlier walks
+/// merged reach the entries the copy will merge, every source's run over
+/// the block and its records (`Options::forms_copy_wide_priced`): six
+/// hundred keys past the end and the block's eight records are 608
+/// entries, a scan of fifty from the tail merges fifty, and the fourteenth
+/// walk copies -- the keys all in the live table, or half of them in a
+/// frozen table under it, where the largest source's run alone would have
+/// copied at the eighth. The fixed ratio copies at the eighth
+/// (`a_hot_wide_block_is_copied_and_kept_past_the_bound`).
+#[test]
+fn a_hot_wide_blocks_copy_is_bought_once_its_walks_have_paid() {
+    for frozen in [false, true] {
+        let d = dir(&format!("wide-priced-{frozen}"));
+        let opts = Options {
+            seal_bytes: 1 << 26,
+            partition_bytes: Some(2 << 10),
+            scan_block_cache: true,
+            ..common::options()
+        };
+        assert!(opts.forms_copy_hot_wide && opts.forms_copy_wide_priced);
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in (0..600).step_by(3) {
+            m.append(&mut db, &key(k), &format!("p{k}"));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        let tail = |k: u32| format!("key-00600x{k:04}");
+        // An update first in each table, so the inserts past the end go to
+        // the hash table and open no direct run.
+        m.append(&mut db, &key(3), "u");
+        let split = if frozen { 300 } else { 600 };
+        for k in 0..split {
+            m.append(&mut db, &tail(k), "t");
+        }
+        db.commit().unwrap();
+        if frozen {
+            db.hold_seal_landing(true);
+            db.seal().unwrap();
+            assert_eq!(db.frozen_tables(), 1, "the frozen table");
+            m.append(&mut db, &key(6), "u");
+            for k in split..600 {
+                m.append(&mut db, &tail(k), "t");
+            }
+            db.commit().unwrap();
+        }
+        let state = format!("priced, frozen {frozen}");
+        let copies_at = 14;
+        for walk in 1..=copies_at {
+            let (_, recopies, _) = db.build_kinds();
+            assert_eq!(recopies, 0, "{state}: no copy before walk {walk}");
+            if walk > 1 {
+                assert_eq!(db.block_cache_wide(), 1, "{state}: wide before walk {walk}");
+            }
+            m.check_one(&db, tail(walk * 7).as_bytes(), 50, &state);
+        }
+        let (_, recopies, _) = db.build_kinds();
+        assert_eq!(recopies, 1, "{state}: copied at walk {copies_at}");
+        assert_eq!(db.block_cache_wide(), 0, "{state}: and no longer wide");
+        assert_eq!(
+            db.wide_walks(),
+            u64::from(copies_at) - 1,
+            "{state}: the walks before the copy"
+        );
+        m.check(&db, &format!("{state}, after the copy"));
+        if frozen {
+            db.hold_seal_landing(false);
+            db.settle().unwrap();
+        }
+        held(&db, 0);
+    }
 }
 
 /// A read consults the level-0 pieces over its key, found by their
@@ -6120,7 +8783,7 @@ fn a_seal_drops_the_scan_snapshot_before_the_next_rehash() {
         seal_bytes: 1 << 20,
         partition_bytes: Some(64 << 10),
         scan_block_cache: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -6166,7 +8829,7 @@ fn a_direct_run_opened_after_a_landing_the_writer_has_not_seen_keeps_the_piece()
             seal_bytes: 1 << 20,
             partition_bytes: Some(64 << 10),
             scan_block_cache: true,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -6222,7 +8885,7 @@ fn a_scan_starts_at_the_first_partition_that_reaches_it() {
             seal_bytes: 1 << 20,
             partition_bytes: Some(1 << 10),
             scan_block_cache: block_cache,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -6256,7 +8919,7 @@ fn a_seek_brackets_its_search_in_the_top_level() {
             seal_bytes: 8 << 20,
             partition_bytes: Some(64 << 20),
             scan_block_cache: block_cache,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -6323,7 +8986,7 @@ fn an_ordered_load_goes_straight_into_segments() {
             scan_block_cache: block_cache,
             // The segments as the threshold left them, none merged.
             tier_pieces: 0,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts.clone()).unwrap();
         let mut m = ScanModel::default();
@@ -6464,7 +9127,7 @@ fn a_direct_run_streamed_from_its_table_is_the_run_the_copies_write() {
         seal_bytes: 64 << 20,
         partition_bytes: Some(1 << 20),
         direct_stream: stream,
-        ..Options::default()
+        ..common::options()
     };
     let drive = |d: &std::path::Path, stream: bool| -> (Db, ScanModel) {
         let mut db = Db::create(d, opts(stream)).unwrap();
@@ -6569,7 +9232,7 @@ fn a_direct_run_streamed_from_its_table_is_the_run_the_copies_write() {
     {
         let d = dir("stream-torn-tail");
         let (db, m) = load(&d);
-        std::mem::forget(db);
+        db.crash();
         let tmp = tmp_of(&d);
         assert!(tmp.exists(), "the open run's temp file");
         let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
@@ -6585,7 +9248,7 @@ fn a_direct_run_streamed_from_its_table_is_the_run_the_copies_write() {
     {
         let d = dir("stream-torn-marker");
         let (db, mut m) = load(&d);
-        std::mem::forget(db);
+        db.crash();
         let tmp = tmp_of(&d);
         let len = std::fs::metadata(&tmp).unwrap().len();
         std::fs::OpenOptions::new()
@@ -6607,11 +9270,13 @@ fn a_direct_run_streamed_from_its_table_is_the_run_the_copies_write() {
             );
         }
     }
-    // Buffered, no sync at the commits: the stream's tail is held in the
-    // table until a write piece is whole, as the copies path's buffer
-    // holds its records, so the file a crash leaves is the copies path's
-    // byte for byte -- the whole pieces, with the batches and markers
-    // they hold -- and recovers the same batches, nothing of the tail.
+    // Buffered, no sync at the commits: every commit writes its batch to
+    // the file all the same, records and marker, from the stream's arena
+    // as from the copies path's buffer, so the file a crash leaves is the
+    // copies path's byte for byte and holds every batch. The tail waited
+    // for a whole write piece once, in the table as in the buffer, and a
+    // crash left the whole pieces alone: up to a megabyte of acknowledged
+    // batches gone with the process.
     let buffered = |d: &std::path::Path, stream: bool| {
         let o = Options {
             sync: supdb::SyncPolicy::EveryN(u32::MAX),
@@ -6626,7 +9291,7 @@ fn a_direct_run_streamed_from_its_table_is_the_run_the_copies_write() {
             }
             db.commit().unwrap();
         }
-        std::mem::forget(db);
+        db.crash();
     };
     let (dc, ds) = (dir("stream-buffered-copies"), dir("stream-buffered-stream"));
     buffered(&dc, false);
@@ -6636,8 +9301,8 @@ fn a_direct_run_streamed_from_its_table_is_the_run_the_copies_write() {
         std::fs::read(tmp_of(&ds)).unwrap(),
     );
     assert!(
-        fc.len() >= 1 << 20 && fc.len() < 12_000 * 130,
-        "the whole pieces on the file and the tail held: {} bytes",
+        fc.len() > 12_000 * 100,
+        "every batch is on the file: {} bytes",
         fc.len()
     );
     assert_eq!(
@@ -6654,10 +9319,7 @@ fn a_direct_run_streamed_from_its_table_is_the_run_the_copies_write() {
     };
     let (rc, rs) = (recovered(&dc, false), recovered(&ds, true));
     assert_eq!(rc, rs, "the same keys recovered from the two shapes");
-    assert!(
-        (7000..12_000).contains(&rc) && rc % 1000 == 0,
-        "whole batches up to the last marker on the file: {rc}"
-    );
+    assert_eq!(rc, 12_000, "every batch committed is recovered");
 }
 
 /// A direct segment's crash windows, emulated on the file a dropped store
@@ -6672,7 +9334,7 @@ fn a_direct_segment_recovers_to_its_last_commit_marker() {
         let opts = Options {
             seal_bytes: 1 << 20,
             partition_bytes: Some(1 << 20),
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -6689,13 +9351,13 @@ fn a_direct_segment_recovers_to_its_last_commit_marker() {
     {
         let d = dir("direct-torn-tail");
         let (db, m) = load(&d);
-        std::mem::forget(db);
+        db.crash();
         let tmp = tmp_of(&d);
         assert!(tmp.exists(), "the open segment's temp file");
         let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
         std::io::Write::write_all(&mut f, &[0x2a; 777]).unwrap();
         drop(f);
-        let db = Db::open(&d, Options::default()).unwrap();
+        let db = Db::open(&d, common::options()).unwrap();
         assert!(!tmp.exists(), "recovered and removed");
         m.check(
             &db,
@@ -6706,7 +9368,7 @@ fn a_direct_segment_recovers_to_its_last_commit_marker() {
     {
         let d = dir("direct-torn-marker");
         let (db, mut m) = load(&d);
-        std::mem::forget(db);
+        db.crash();
         let tmp = tmp_of(&d);
         let len = std::fs::metadata(&tmp).unwrap().len();
         std::fs::OpenOptions::new()
@@ -6719,7 +9381,7 @@ fn a_direct_segment_recovers_to_its_last_commit_marker() {
             m.vals.remove(key(k).as_bytes());
             m.touched.remove(key(k).as_bytes());
         }
-        let mut db = Db::open(&d, Options::default()).unwrap();
+        let mut db = Db::open(&d, common::options()).unwrap();
         m.check(&db, "two batches");
         for k in 200..300u32 {
             assert!(
@@ -6740,7 +9402,7 @@ fn a_direct_segment_recovers_to_its_last_commit_marker() {
     {
         let d = dir("direct-lost-page");
         let (db, mut m) = load(&d);
-        std::mem::forget(db);
+        db.crash();
         let tmp = tmp_of(&d);
         let mut bytes = std::fs::read(&tmp).unwrap();
         let last = key(299);
@@ -6754,7 +9416,7 @@ fn a_direct_segment_recovers_to_its_last_commit_marker() {
             m.vals.remove(key(k).as_bytes());
             m.touched.remove(key(k).as_bytes());
         }
-        let db = Db::open(&d, Options::default()).unwrap();
+        let db = Db::open(&d, common::options()).unwrap();
         m.check(
             &db,
             "two batches, the third's record damaged under its marker",
@@ -6783,7 +9445,7 @@ fn a_direct_segment_recovers_to_its_last_commit_marker() {
             .expect("the closed segment as a partition");
         drop(db);
         std::fs::copy(d.join(&par), tmp_of(&d)).unwrap();
-        let db = Db::open(&d, Options::default()).unwrap();
+        let db = Db::open(&d, common::options()).unwrap();
         assert!(!tmp_of(&d).exists());
         assert_eq!(db.levels(), (parts, 0), "not recovered twice");
         m.check(&db, "the stale temp file removed");
@@ -6803,7 +9465,7 @@ fn a_value_the_record_cannot_hold_sends_its_batch_through_the_wal() {
         let opts = Options {
             seal_bytes: 1 << 20,
             partition_bytes: Some(1 << 20),
-            ..Options::default()
+            ..common::options()
         };
         let val = "x".repeat(opts.inline_bytes + usize::from(big));
         let mut db = Db::create(&d, opts).unwrap();
@@ -6823,8 +9485,8 @@ fn a_value_the_record_cannot_hold_sends_its_batch_through_the_wal() {
             assert!(written <= 8, "{name}: the WAL untouched");
             assert!(tmp.exists(), "{name}: a segment open");
         }
-        std::mem::forget(db);
-        let db = Db::open(&d, Options::default()).unwrap();
+        db.crash();
+        let db = Db::open(&d, common::options()).unwrap();
         m.check(&db, &format!("{name}: every batch back after a crash"));
     }
 }
@@ -6964,7 +9626,7 @@ fn overlay_model_z(
             supdb::ZPages::Off
         },
         zpages_min_bytes: 0,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -7165,7 +9827,7 @@ fn a_reader_handle_sees_what_its_isolation_says() {
         seal_bytes: 64 << 10,
         partition_bytes: Some(128 << 10),
         l0_trigger: 2,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let key = |k: u32| format!("key-{k:05}").into_bytes();
@@ -7304,7 +9966,7 @@ fn readers_through_seals_and_merges(name: &str, zpages: bool, cache: bool) {
         partition_bytes: Some(64 << 10),
         l0_trigger: 2,
         scan_block_cache: cache,
-        ..Options::default()
+        ..common::options()
     };
     if zpages {
         opts.zpages = supdb::ZPages::Always;
@@ -7434,7 +10096,7 @@ fn readers_through_seals_and_merges(name: &str, zpages: bool, cache: bool) {
 #[test]
 fn the_reader_table_has_a_slot_for_each_handle() {
     let d = dir("reader-slots");
-    let db = Db::create(&d, Options::default()).unwrap();
+    let db = Db::create(&d, common::options()).unwrap();
     let mut held = Vec::new();
     while let Ok(r) = db.reader() {
         held.push(r);
@@ -7454,7 +10116,7 @@ fn the_reader_table_has_a_slot_for_each_handle() {
 #[test]
 fn a_reader_sees_the_replayed_writes_from_the_open_on() {
     let d = dir("reopen-watermark");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     for k in 0..300u32 {
         db.append(format!("key-{k:05}").as_bytes(), b"v0");
     }
@@ -7466,7 +10128,7 @@ fn a_reader_sees_the_replayed_writes_from_the_open_on() {
     db.delete(b"key-00001");
     db.commit().unwrap();
     drop(db);
-    let db = Db::open(&d, Options::default()).unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
     let reader = db.reader().unwrap();
     assert_eq!(reader.isolation(), Isolation::Latest);
     assert_eq!(
@@ -7512,7 +10174,7 @@ fn a_reader_under_latest_sees_the_commit_of_a_key_it_settled_uncommitted() {
         l0_trigger: 64,
         scan_block_cache: true,
         scan_cache_ahead: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let key = |k: u32| format!("key-{k:05}");
@@ -7597,7 +10259,7 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
         ("first-partition-shuffled", true),
     ] {
         let d = dir(name);
-        let mut db = Db::create(&d, Options::default()).unwrap();
+        let mut db = Db::create(&d, common::options()).unwrap();
         let mut x = 0x9E37_79B9_7F4A_7C15u64;
         for i in 0..3000u32 {
             let k = if shuffled {
@@ -7634,7 +10296,7 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
         assert_eq!(n, 3000, "{name}");
     }
     let d = dir("first-partition-tombstone");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     for i in 0..3000u32 {
         db.append(&key(i), b"v");
     }
@@ -7657,7 +10319,7 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
         Options {
             partition_on_flush: false,
             flush_schedules: false,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -7684,7 +10346,7 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
         &d,
         Options {
             partition_on_flush: false,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -7717,7 +10379,7 @@ fn a_durable_only_sync_seals_an_ordered_load_as_its_first_partition() {
         &d,
         Options {
             adaptive_shape: true,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -7762,7 +10424,7 @@ fn a_lone_piece_is_promoted_at_open_without_a_read() {
     let n = 20_000u32;
     {
         // Without the shaping, a seal that is not a flush's leaves a piece.
-        let mut db = Db::create(&d, Options::default()).unwrap();
+        let mut db = Db::create(&d, common::options()).unwrap();
         for i in 0..n {
             db.append(format!("k{i:08}").as_bytes(), &val(i));
             if i % 1000 == 999 {
@@ -7778,7 +10440,7 @@ fn a_lone_piece_is_promoted_at_open_without_a_read() {
         &d,
         Options {
             adaptive_shape: true,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -7812,7 +10474,7 @@ fn overlapping_pieces_are_merged_once_the_store_is_read() {
             Options {
                 seal_bytes: 512 << 10,
                 l0_trigger: 100,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -7837,7 +10499,7 @@ fn overlapping_pieces_are_merged_once_the_store_is_read() {
         Options {
             adaptive_shape: true,
             l0_trigger: 100,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -7872,7 +10534,7 @@ fn a_seal_lands_while_the_writer_is_away() {
     let d = dir("seal-lands-away");
     let opts = Options {
         publish_in_background: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let key = |k: u32| format!("key-{k:06}");
@@ -7935,7 +10597,7 @@ fn a_flush_that_does_not_partition_merges_the_rest_in_the_background() {
                 // No merge of the seals' own: the pieces the flush leaves
                 // are the whole of what happens to the store.
                 l0_trigger: 100,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -8025,7 +10687,7 @@ fn a_reader_walks_the_forms_the_writer_maintains_at_commit() {
         // The commit's own maintenance, step by step: on the thread, which
         // commit a pass files is the thread's timing.
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -8237,7 +10899,7 @@ fn a_handle_reads_replaced_keys_over_pieces_only_forms() {
         scan_block_cache: true,
         commit_forms: true,
         forms_pieces_only: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let key = |k: u32| format!("key-{k:05}").into_bytes();
@@ -8412,7 +11074,7 @@ fn reader_threads_over_blocks_tuned(
         scan_block_cache: true,
         commit_forms,
         forms_pieces_only: pieces_only,
-        ..Options::default()
+        ..common::options()
     };
     tune(&mut opts);
     let budgeted = opts.scan_cache_bytes > 0;
@@ -8617,7 +11279,11 @@ fn the_adaptive_upkeep_holds_only_for_what_a_commit_leaves_to_a_read() {
         partition_bytes: Some(256 << 10),
         // The plain seal, so the few hundred writes below seal nothing.
         seal_max_pct: 0,
-        ..Options::default()
+        // A commit leaves its batch to the next read, which is what the hold is for
+        // (`Options::forms_settle_every` and `forms_settle_builds` off).
+        forms_settle_every: false,
+        forms_settle_builds: false,
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     // The settle bound is 2% of the partitions' keys: 400.
@@ -8690,7 +11356,7 @@ fn a_buffered_commit_near_reads_files_its_burst_and_lends_a_small_batch() {
         partition_bytes: Some(256 << 10),
         // The plain seal, so the few hundred writes below seal nothing.
         seal_max_pct: 0,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     // The settle bound is 2% of the partitions' keys, 400: the batches
@@ -8776,18 +11442,131 @@ fn a_buffered_commit_near_reads_files_its_burst_and_lends_a_small_batch() {
     drop(live);
 }
 
+/// The first batch after a scan, filed in the commit on the writer's own
+/// path, files into the forms that stand and builds nothing -- neither the
+/// settle's builds nor the commit's fill -- for the walks after it to build
+/// (`Options::forms_settle_builds_filed` off); with the option on the
+/// commit builds them. Every write reads back through the writer and
+/// through a handle, after it and after the batches that follow.
+#[test]
+fn a_burst_filed_in_the_commit_leaves_its_builds_to_the_walk() {
+    for filed in [false, true] {
+        let d = dir(&format!("settle-builds-filed-{filed}"));
+        let opts = Options {
+            upkeep: supdb::Upkeep::Background(1),
+            upkeep_inline_bursts: true,
+            sync: supdb::SyncPolicy::EveryN(u32::MAX),
+            partition_bytes: Some(256 << 10),
+            seal_max_pct: 0,
+            forms_settle_builds_filed: filed,
+            ..common::options()
+        };
+        assert!(opts.forms_settle_every && opts.forms_settle_builds);
+        let mut db = Db::create(&d, opts).unwrap();
+        let keys = 20_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+        let live = db.reader().unwrap();
+        let mut want: HashMap<u32, String> = HashMap::new();
+        let check = |db: &Db, want: &HashMap<u32, String>, when: &str| {
+            let verify = |k: &[u8], v: &[u8], who: &str| {
+                let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                let got = std::str::from_utf8(v).unwrap();
+                let expect = want.get(&kn).map_or("0", |s| s.as_str());
+                assert_eq!(got, expect, "key {kn} {when} through {who}, filed {filed}");
+            };
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    verify(k, v, "the writer");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "every key {when} through the writer");
+            let r = db.reader().unwrap();
+            let mut seen = 0u32;
+            r.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    verify(k, v, "a handle");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "every key {when} through a handle");
+        };
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut write = |db: &mut Db, want: &mut HashMap<u32, String>, n: usize, v: &str| {
+            for _ in 0..n {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), v.as_bytes());
+                want.insert(k, v.to_string());
+            }
+            db.commit().unwrap();
+        };
+        // Reads around, and nothing unsealed: the first batch after the
+        // scan is filed in the commit, into blocks none of which holds a
+        // form.
+        check(&db, &want, "before any write");
+        let built = (db.settle_built(), db.blocks_built().1);
+        let passes = db.upkeep_counts()[0];
+        write(&mut db, &mut want, 300, "a");
+        assert_eq!(
+            db.upkeep_counts()[0],
+            passes,
+            "no pass of the thread filed it"
+        );
+        let by_commit = (db.settle_built() - built.0) + (db.blocks_built().1 - built.1);
+        if filed {
+            assert!(by_commit > 0, "the commit built the blocks it filed into");
+        } else {
+            assert_eq!(
+                by_commit, 0,
+                "the commit built none of the blocks it filed into"
+            );
+        }
+        // A batch after scans over forms, and two with no scan between
+        // them, the second over the pace's share and filed in the commit
+        // with its builds.
+        check(&db, &want, "after the first batch");
+        write(&mut db, &mut want, 300, "b");
+        check(&db, &want, "after the second batch");
+        write(&mut db, &mut want, 300, "c");
+        write(&mut db, &mut want, 300, "d");
+        check(&db, &want, "after a burst of two");
+        drop(live);
+        db.close().unwrap();
+    }
+}
+
 /// A commit that syncs lends the same burst, option or no option: the
 /// thread works through the fsync, and holds for nothing. The forms stand
-/// at the commit's position once the thread has run.
+/// at the commit's position once the thread has run. The pace a syncing
+/// commit's burst takes in core is off here, since it counts a hold for
+/// every paced commit, and is its own test's
+/// (`a_syncing_commits_burst_batches_are_paced_behind_the_thread`).
 #[test]
 fn a_commit_that_syncs_lends_its_burst_to_the_thread() {
     let d = dir("upkeep-inline-bursts-durable");
     let opts = Options {
         upkeep: supdb::Upkeep::Background(1),
         upkeep_inline_bursts: true,
+        upkeep_pace_syncs_bp: 0,
         partition_bytes: Some(256 << 10),
         seal_max_pct: 0,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let keys = 20_000u32;
@@ -8873,7 +11652,7 @@ fn a_block_the_reads_pay_for_is_held_as_a_copy_too() {
         // for no block and promotes nothing, which is the point of the
         // maintenance rather than a fault in it.
         commit_forms: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -9004,7 +11783,7 @@ fn a_piece_kept_across_a_merge_is_ranked_against_the_partition_it_meets() {
         seal_bytes: 1 << 20,
         partition_bytes: Some(64 << 20),
         l0_trigger: 2,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
@@ -9114,6 +11893,248 @@ fn a_piece_kept_across_a_merge_is_ranked_against_the_partition_it_meets() {
     }
 }
 
+/// A handle's scan snapshot is the sorted keys of the memtables, and it
+/// stands across a publish that leaves them (`Options::snapshot_stands`): a
+/// merge's landing, which changes the segments alone, and a seal's, whose
+/// frozen table leaves with its base. The look that carries the writer's
+/// tables kept it across both; the look with no tables to carry -- the
+/// writer on the merge paths, every reader handle -- dropped it at each, and
+/// the scan after sorted every unsealed key again: one to three builds of
+/// 50-60 ms inside the pass after the lag sweep's full rewrite at ten
+/// million keys under 1.25 GiB, beside the merge chain's landings.
+///
+/// The merge is held before its landing (`Db::hold_merge_landing`) while
+/// the unsealed keys are written and scanned, so the snapshot is built
+/// over a state the landing then replaces, every run; the seal likewise
+/// (`Db::hold_seal_landing`). Without the option each landing is a build,
+/// and with it none is, the scans the same against the model either way:
+/// before the publish, after it, and after writes filed into the snapshot
+/// that stood.
+#[test]
+fn a_scan_snapshot_stands_across_a_publish_that_leaves_the_memtables() {
+    for (label, stands, block_cache, runs) in [
+        ("stands", true, false, false),
+        ("drops", false, false, false),
+        ("stands-cache", true, true, false),
+        // With the runs copied, so the slots written since the copy, which
+        // a stood snapshot keeps reading the chains for, matter.
+        ("stands-runs", true, false, true),
+    ] {
+        let d = dir(&format!("snap-stands-{label}"));
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(64 << 20),
+            l0_trigger: 2,
+            scan_block_cache: block_cache,
+            snapshot_stands: stands,
+            snapshot_runs: runs,
+            // The builds counted below are the scans' own.
+            forms_settle_backlog_pct: 0,
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:06}");
+        let between = |k: u32, i: u32| format!("key-{k:06}x{i}");
+        for k in 0..6000 {
+            m.append(&mut db, &key(k), "p");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        assert_eq!(db.levels(), (1, 0), "{label}: one partition over every key");
+        // Two pieces over keys the partition holds, so the range is merged
+        // and not promoted; the second's landing starts the merge, held
+        // before its own.
+        for i in 0..10 {
+            m.append(&mut db, &key(1000 + i), "a");
+            m.append(&mut db, &between(1000, i), "a");
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        for i in 0..10 {
+            m.append(&mut db, &key(2000 + i), "b");
+            m.append(&mut db, &between(2000, i), "b");
+        }
+        db.commit().unwrap();
+        db.hold_merge_landing(true);
+        db.seal().unwrap();
+        let t = std::time::Instant::now();
+        while !db.in_flight().1 && t.elapsed() < std::time::Duration::from_secs(10) {
+            db.commit().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(db.in_flight().1, "{label}: the merge did not start");
+        while db.in_flight().0 {
+            db.commit().unwrap();
+            std::thread::yield_now();
+        }
+        // The unsealed keys the snapshot is of: keys the partition holds,
+        // keys the pieces hold, and new ones between and past them.
+        for k in (0..6000u32).step_by(13) {
+            m.append(&mut db, &key(k), "u");
+        }
+        for i in 0..10 {
+            m.append(&mut db, &between(1000, i), "u");
+            m.append(&mut db, &between(4000, i), "n");
+            m.append(&mut db, &key(7000 + i), "n");
+        }
+        db.commit().unwrap();
+        m.check(&db, &format!("{label}: the writer before the landing"));
+        let reader = db.reader().unwrap();
+        m.check(&reader, &format!("{label}: a handle before the landing"));
+        assert!(
+            db.in_flight().1,
+            "{label}: the merge landed before the snapshot was built; the case was not reached"
+        );
+        // Writes between the scans and the landing: keys created since the
+        // snapshot and updates of keys it holds, read by a scan of the
+        // writer's and the handle's, so the lists of keys since the
+        // snapshot and of slots written since its runs are not empty at
+        // the landing; and then more, read by no scan, which the stood
+        // snapshot takes from the log where its look left it.
+        for i in 0..10 {
+            m.append(&mut db, &between(6000, i), "pre");
+        }
+        for k in (11..6000u32).step_by(29) {
+            m.append(&mut db, &key(k), "pre");
+        }
+        db.commit().unwrap();
+        m.check_one(
+            &db,
+            b"",
+            usize::MAX,
+            &format!("{label}: the writer after the pre-writes"),
+        );
+        m.check_one(
+            &reader,
+            b"",
+            usize::MAX,
+            &format!("{label}: a handle after the pre-writes"),
+        );
+        for i in 0..10 {
+            m.append(&mut db, &between(6100, i), "pre2");
+        }
+        for k in (13..6000u32).step_by(31) {
+            m.append(&mut db, &key(k), "pre2");
+        }
+        db.commit().unwrap();
+        let (builds, stood) = (db.snapshot_builds(), db.snapshots_stood());
+        assert!(builds > 0, "{label}: a snapshot was built");
+        // The landing: the segments change and the memtables do not.
+        db.hold_merge_landing(false);
+        // The wait is for the landing itself, the pieces gone: the merge's
+        // count drops when the segment work takes the merge home, before
+        // it joins the merge's thread and publishes the outputs, so a wait
+        // on the count alone read the store before its landing, once under
+        // the gate's load.
+        let t = std::time::Instant::now();
+        while (db.in_flight().1 || db.levels() != (1, 0))
+            && t.elapsed() < std::time::Duration::from_secs(20)
+        {
+            db.commit().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!db.in_flight().1, "{label}: the merge did not land");
+        assert_eq!(db.levels(), (1, 0), "{label}: the pieces merged");
+        m.check(&db, &format!("{label}: the writer after the landing"));
+        m.check(&reader, &format!("{label}: a handle after the landing"));
+        if stands {
+            assert_eq!(
+                db.snapshot_builds(),
+                builds,
+                "{label}: nothing sorted again across the merge's landing"
+            );
+            // The handle's look has no tables to carry; the writer's has
+            // them with the cache and carries the snapshot with them.
+            let want = if block_cache { 1 } else { 2 };
+            assert!(
+                db.snapshots_stood() >= stood + want,
+                "{label}: the snapshot stood for the writer and the handle: {} from {stood}",
+                db.snapshots_stood()
+            );
+        } else {
+            assert!(
+                db.snapshot_builds() > builds,
+                "{label}: without the option the landing is a build"
+            );
+            assert_eq!(db.snapshots_stood(), 0, "{label}: and nothing stands");
+        }
+        // Writes after it: updates of keys the snapshot holds and keys
+        // created since, filed into the snapshot that stood.
+        for k in (5..6000u32).step_by(17) {
+            m.append(&mut db, &key(k), "v");
+        }
+        for i in 0..10 {
+            m.append(&mut db, &between(5000, i), "n2");
+            m.append(&mut db, &key(7000 + i), "n2");
+        }
+        db.commit().unwrap();
+        m.check(
+            &db,
+            &format!("{label}: the writer after writes over the stood snapshot"),
+        );
+        m.check(&reader, &format!("{label}: a handle after writes over it"));
+        // A seal held before its landing: the freeze is the writer's own
+        // publish and changes the memtables, so the scan after it builds;
+        // the landing then retires the frozen table and leaves the live
+        // one, and the snapshot stands without its base.
+        db.hold_seal_landing(true);
+        db.seal().unwrap();
+        for k in (3..6000u32).step_by(19) {
+            m.append(&mut db, &key(k), "w");
+        }
+        for i in 0..10 {
+            m.append(&mut db, &between(3000, i), "n3");
+        }
+        db.commit().unwrap();
+        m.check(&db, &format!("{label}: the writer over the frozen table"));
+        m.check(&reader, &format!("{label}: a handle over the frozen table"));
+        assert!(db.in_flight().0, "{label}: the seal is held");
+        let (builds, stood) = (db.snapshot_builds(), db.snapshots_stood());
+        db.hold_seal_landing(false);
+        let t = std::time::Instant::now();
+        while db.in_flight().0 && t.elapsed() < std::time::Duration::from_secs(20) {
+            db.commit().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!db.in_flight().0, "{label}: the seal did not land");
+        m.check(
+            &db,
+            &format!("{label}: the writer after the seal's landing"),
+        );
+        m.check(
+            &reader,
+            &format!("{label}: a handle after the seal's landing"),
+        );
+        if stands {
+            assert_eq!(
+                db.snapshot_builds(),
+                builds,
+                "{label}: nothing sorted again across the seal's landing"
+            );
+            assert!(
+                db.snapshots_stood() > stood,
+                "{label}: the snapshot stood without the landed table's base"
+            );
+        } else {
+            assert!(
+                db.snapshot_builds() > builds,
+                "{label}: without the option the seal's landing is a build"
+            );
+        }
+        for k in (7..6000u32).step_by(23) {
+            m.append(&mut db, &key(k), "x");
+        }
+        db.commit().unwrap();
+        m.check(&db, &format!("{label}: the writer at the end"));
+        m.check(&reader, &format!("{label}: a handle at the end"));
+        drop(reader);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 /// The scan snapshot is the sorted keys of everything unsealed, and a
 /// handle that builds its own sorts all of them: at a hundred thousand
 /// keys each updated once, 9 ms, paid again by every handle that reads
@@ -9132,7 +12153,7 @@ fn every_handle_after_the_first_adopts_the_snapshot_it_published() {
         // its own; the backlog bound would, so it is off here.
         forms_settle_backlog_pct: 0,
         share_snapshot: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -9203,7 +12224,7 @@ fn a_handle_that_adopts_a_snapshot_sees_the_keys_written_past_it() {
         // adoptable, which is what this test is about.
         snapshot_adopt_behind: 4096,
         commit_forms: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -9337,7 +12358,7 @@ fn extend_order_model_with(block_cache: bool, pieces_only: bool) {
         // store before its seal: built whatever the reads
         // (`Options::seal_snapshot_far`).
         seal_snapshot_far: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -9443,7 +12464,7 @@ fn the_cap_and_the_trigger_follow_the_reads_and_relax_over_a_write_only_stretch(
         adaptive_trigger: true,
         trigger_reading: 2,
         lag_relax_pct: 100,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let key = |k: u32| format!("key-{k:06}");
@@ -9540,7 +12561,7 @@ fn carry_model_with(block_cache: bool, pieces_only: bool) {
         // store before its seal: built whatever the reads
         // (`Options::seal_snapshot_far`).
         seal_snapshot_far: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -9639,7 +12660,7 @@ fn the_writer_maintains_the_forms_once_a_reader_handle_is_live() {
         // The commit's own maintenance, step by step: on the thread, which
         // commit a pass files is the thread's timing.
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -9728,7 +12749,7 @@ fn the_writers_own_handle_takes_the_forms_it_maintains() {
             // The commit's own maintenance, step by step: on the thread, which
             // commit a pass files is the thread's timing.
             upkeep: supdb::Upkeep::Inline,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -9796,7 +12817,7 @@ fn a_store_below_the_seal_floor_still_seals_once_it_has_bytes() {
             seal_bytes: 32 << 20,
             seal_max_pct: cap,
             partition_bytes: Some(2 << 20),
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         for k in 0..9000u32 {
@@ -9860,7 +12881,7 @@ fn the_seal_is_sized_by_the_data_and_not_by_the_file() {
                 ..Default::default()
             },
             seal_on_file: on_file,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts.clone()).unwrap();
         for k in 0..n {
@@ -9940,7 +12961,11 @@ fn a_write_burst_is_settled_once_its_backlog_passes_the_bound() {
             // The commit's own rules, whose deferred burst the upkeep
             // thread would file ahead of the read.
             upkeep: supdb::Upkeep::Inline,
-            ..Options::default()
+            // The settle waits for the backlog bound, which is what is measured here
+            // (`Options::forms_settle_every` and `forms_settle_builds` off).
+            forms_settle_every: false,
+            forms_settle_builds: false,
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -10008,7 +13033,11 @@ fn the_settle_bound_is_a_share_of_the_partitions_keys() {
             forms_settle_keys_all: all,
             // The commit's own rules; see the test above.
             upkeep: supdb::Upkeep::Inline,
-            ..Options::default()
+            // The settle waits for the backlog bound, which is what is measured here
+            // (`Options::forms_settle_every` and `forms_settle_builds` off).
+            forms_settle_every: false,
+            forms_settle_builds: false,
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -10085,7 +13114,7 @@ fn a_reader_meets_a_block_gone_wide_through_the_forms() {
         // The commit's own maintenance, step by step: on the thread, which
         // commit a pass files is the thread's timing.
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -10181,7 +13210,7 @@ fn the_copies_survive_a_merge_with(compact: bool) {
         // The freeze's own carry, which this is about: off, the next look
         // at the log carries the tables (`the_next_look_carries_the_forms_across_a_freeze`).
         freeze_settles: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -10258,6 +13287,184 @@ fn the_copies_survive_a_merge_with(compact: bool) {
     std::hint::black_box(sink);
 }
 
+/// Whether a merge rewrote a partition over the same blocks -- the same
+/// key count and the same key at every block's first rank and at the last --
+/// is asked of the two ordered indexes where their heads are whole keys
+/// (`Options::same_blocks_from_index`) and of the records otherwise, and the
+/// two answer alike: over keys a head holds whole and keys it does not, the
+/// same partitions are carried across a merge that keeps every key and one
+/// that replaces the store's first key with another below it, the count
+/// kept; over the short keys, every partition across the first and every
+/// one but the changed partition across the second, and again across a
+/// merge that replaces the store's last key. Asked of the records the landing
+/// read the old partition's key every sixty-fourth rank, which under a
+/// bound are the pages the merge has just read past.
+#[test]
+fn a_rewrite_over_the_same_blocks_is_found_by_the_index_as_by_the_records() {
+    for long in [false, true] {
+        let mut seen = Vec::new();
+        for from_index in [true, false] {
+            let (carried, after, last, asked) = same_blocks_carries(long, from_index);
+            let label = format!("long {long}, from the index {from_index}");
+            assert!(
+                carried > 0,
+                "{label}: the forms were carried across the merge"
+            );
+            // Over the short keys every partition holds forms at both
+            // merges, so the count is exact; over the long ones a partition
+            // the first merge left without forms makes it inexact, and the
+            // agreement below is what holds.
+            if !long {
+                assert_eq!(
+                    after,
+                    carried - 1,
+                    "{label}: the partition whose first key changed is not carried, and only it"
+                );
+                assert_eq!(
+                    last,
+                    carried - 1,
+                    "{label}: the partition whose last key changed is not carried, and only it"
+                );
+            }
+            if from_index && !long {
+                assert!(
+                    asked[0] > 0 && asked[1] == 0,
+                    "{label}: every question answered from the indexes: {asked:?}"
+                );
+            } else {
+                assert!(
+                    asked[0] == 0 && asked[1] > 0,
+                    "{label}: every question answered from the records: {asked:?}"
+                );
+            }
+            seen.push((carried, after, last));
+        }
+        assert_eq!(
+            seen[0], seen[1],
+            "long {long}: the index and the records agree"
+        );
+    }
+}
+
+/// The body of the test above: the forms carried across a merge that keeps
+/// every key, across one that replaces the store's first key, and the
+/// landings' questions by how they were answered.
+fn same_blocks_carries(long: bool, from_index: bool) -> (u64, u64, u64, [u64; 2]) {
+    let d = dir(&format!("same-blocks-{long}-{from_index}"));
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(4 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        forms_settle_backlog_pct: 0,
+        commit_forms: true,
+        forms_carry: true,
+        forms_rebase: true,
+        upkeep: supdb::Upkeep::Inline,
+        freeze_settles: true,
+        same_blocks_from_index: from_index,
+        ..common::options()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    // Forty bytes past the number: one length, longer than a head holds.
+    let pad = "p".repeat(40);
+    let key = |k: &str| {
+        if long {
+            format!("key-{k}-{pad}")
+        } else {
+            format!("key-{k}")
+        }
+    };
+    let num = |k: u32| format!("{k:05}");
+    for k in 0..3000u32 {
+        m.append(&mut db, &key(&num(k)), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    let parts = db.levels().0;
+    assert!(parts > 1, "several partitions");
+    let mut sink = 0usize;
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(&num(k)), "v1");
+    }
+    for k in (1500..3000u32).step_by(40) {
+        m.append(&mut db, &key(&num(k)), "v1");
+    }
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    r.scan(
+        key(&num(0)).as_bytes(),
+        3000,
+        kv(&mut |_k, v| sink += v.len()),
+    )
+    .unwrap();
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    let rebased0 = db.forms_rebased();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert_eq!(db.levels(), (parts, 0), "the pieces merged");
+    let carried = db.forms_rebased() - rebased0;
+    m.check(&db, "after a merge that keeps every key");
+    // Writes over every partition, and the store's first key replaced by
+    // one below it of the same length: the count kept, the first block's
+    // first key not.
+    for k in (0..3000u32).step_by(9) {
+        m.append(&mut db, &key(&num(k)), "after");
+    }
+    m.delete(&mut db, &key(&num(0)));
+    m.append(&mut db, &key("0000/"), "first");
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    r.scan(
+        key(&num(0)).as_bytes(),
+        10,
+        kv(&mut |_k, v| sink += v.len()),
+    )
+    .unwrap();
+    db.commit().unwrap();
+    let rebased1 = db.forms_rebased();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    let after = db.forms_rebased() - rebased1;
+    m.check(&db, "after a merge that replaced the first key");
+    // And the store's last key replaced by one above it of the same
+    // length: every block's first key kept, the last key not.
+    for k in (4..3000u32).step_by(9) {
+        m.append(&mut db, &key(&num(k)), "last");
+    }
+    m.delete(&mut db, &key(&num(2999)));
+    m.append(&mut db, &key("0299:"), "last");
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    r.scan(
+        key(&num(0)).as_bytes(),
+        10,
+        kv(&mut |_k, v| sink += v.len()),
+    )
+    .unwrap();
+    db.commit().unwrap();
+    let rebased2 = db.forms_rebased();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    let last = db.forms_rebased() - rebased2;
+    m.check(&db, "after a merge that replaced the last key");
+    std::hint::black_box(sink);
+    let asked = db.same_blocks_asked();
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+    (carried, after, last, asked)
+}
+
 #[test]
 fn the_forms_survive_a_seal() {
     // And with `snapshot_carry`, which carries the scan snapshot across
@@ -10293,7 +13500,7 @@ fn the_forms_survive_a_seal_with(snapshot_carry: bool) {
         // The freeze's own carry, which this is about: off, the next look
         // at the log carries the tables (`the_next_look_carries_the_forms_across_a_freeze`).
         freeze_settles: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -10427,7 +13634,7 @@ fn the_forms_survive_a_direct_runs_start() {
         // The freeze's own carry, which this is about: off, the next look
         // at the log carries the tables (`the_next_look_carries_the_forms_across_a_freeze`).
         freeze_settles: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -10514,7 +13721,9 @@ fn a_publish_starts_the_builder_and_a_commit_installs_its_forms_with(upkeep: sup
         commit_forms: true,
         build_ahead_on_publish: true,
         upkeep,
-        ..Options::default()
+        // In memory, as `a_builder_ahead_of_the_reader_fills_the_cache`.
+        zpages: supdb::ZPages::Auto,
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -10599,7 +13808,7 @@ fn the_splice_bounds_off_the_top_level_are_the_records_bounds() {
                         partition_bytes: Some(32 << 10),
                         scan_block_cache: true,
                         boundary_keys_from_top: on,
-                        ..Options::default()
+                        ..common::options()
                     },
                 )
                 .unwrap();
@@ -10653,17 +13862,27 @@ fn the_splice_bounds_off_the_top_level_are_the_records_bounds() {
 }
 
 /// The builder ahead starts while the store is in core, the controller's
-/// gate at the raw form, and not while it is out of core
-/// (`Options::ahead_out_of_core`): a burst out of core dirties every block,
-/// and the builder built each from pages the bound pushed out for scans
-/// that read a few. A publish over a piece starts the builder and the next
+/// gate at the raw form, and out of core only under the option
+/// (`Options::ahead_out_of_core`, on as shipped for the partitions whose
+/// pages are in memory; off is the shape before, `supdb-aheadincore`) and
+/// once the state has been scanned `Options::ahead_out_of_core_scans`
+/// times: a burst out of core dirties every block, and the builder built
+/// each from pages the bound pushed out for scans that read a few. A
+/// publish over a piece starts the builder and the next
 /// commit installs its forms with the gate at raw, installs nothing with
-/// the gate away from it, and installs them again under the option; the
-/// model holds through a handle and the writer in every case.
+/// the gate away from it, installs them again under the option where the
+/// scans are counted enough, and nothing where they are not; the model
+/// holds through a handle and the writer in every case.
 #[test]
 fn the_builder_ahead_starts_in_core_and_out_of_core_only_under_the_option() {
-    for (gate, ooc, builds) in [(0u8, false, true), (1, false, false), (1, true, true)] {
-        let d = dir(&format!("ahead-gate-{gate}-{ooc}"));
+    for (gate, ooc, scans, builds) in [
+        (0u8, false, 0u64, true),
+        (1, false, 0, false),
+        (1, true, 0, true),
+        (1, true, 3, true),
+        (1, true, u64::MAX, false),
+    ] {
+        let d = dir(&format!("ahead-gate-{gate}-{ooc}-{scans}"));
         let opts = Options {
             seal_bytes: 1 << 20,
             partition_bytes: Some(2 << 10),
@@ -10676,7 +13895,8 @@ fn the_builder_ahead_starts_in_core_and_out_of_core_only_under_the_option() {
             upkeep: supdb::Upkeep::Inline,
             zpages: supdb::ZPages::Off,
             ahead_out_of_core: ooc,
-            ..Options::default()
+            ahead_out_of_core_scans: scans,
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         db.zgate_set(gate);
@@ -10697,6 +13917,16 @@ fn the_builder_ahead_starts_in_core_and_out_of_core_only_under_the_option() {
         db.seal().unwrap();
         db.settle().unwrap();
         assert_eq!(db.canonical_forms().0, 0, "the seal emptied the table");
+        // Scans over the published state, one more than the count the
+        // builder waits for where it waits for one it can reach.
+        if scans > 0 && scans < u64::MAX {
+            let mut sink = 0usize;
+            for _ in 0..=scans {
+                db.scan(key(7).as_bytes(), 1, kv(&mut |_k, v| sink += v.len()))
+                    .unwrap();
+            }
+            db.settle().unwrap();
+        }
         for k in (1..1500u32).step_by(11) {
             m.append(&mut db, &key(k), "v2");
         }
@@ -10705,7 +13935,7 @@ fn the_builder_ahead_starts_in_core_and_out_of_core_only_under_the_option() {
         assert_eq!(
             forms > 0,
             builds,
-            "gate {gate}, out of core {ooc}: the builder's forms installed: {forms}"
+            "gate {gate}, out of core {ooc}, scans {scans}: the builder's forms installed: {forms}"
         );
         let r = db.reader().unwrap();
         m.check(&r, "a reader");
@@ -10713,6 +13943,99 @@ fn the_builder_ahead_starts_in_core_and_out_of_core_only_under_the_option() {
         m.check(&db, "the writer");
         db.close().unwrap();
     }
+}
+
+/// In core a scan starts the builder ahead once the state's scans number
+/// its blocks over `Options::ahead_in_core_scans_div`, and at the state's
+/// first scan where the option is zero, the shape before: a pass shorter
+/// than the builder's run paid for the install of forms it never walked.
+/// The scans it waits through build what they walk and answer the model,
+/// the count of scans it waits for is the blocks over the option at two
+/// values of it, and out of core the option decides nothing.
+#[test]
+fn a_scan_starts_the_builder_ahead_in_core_once_the_state_is_scanned() {
+    // The scans a state takes before a builder starts, capped.
+    let scans_to_start = |div: u64, gate: u8| -> (u64, bool) {
+        let d = dir(&format!("ahead-scanned-{div}-{gate}"));
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(2 << 10),
+            l0_trigger: 64,
+            scan_block_cache: true,
+            scan_cache_ahead_min_blocks: 0,
+            // The scans start the builder here and no commit does.
+            commit_forms_build: false,
+            upkeep: supdb::Upkeep::Inline,
+            zpages: supdb::ZPages::Off,
+            ahead_in_core_scans_div: div,
+            ahead_out_of_core_scans: 0,
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..6000u32 {
+            m.append(&mut db, &key(k), "v0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        db.zgate_set(gate);
+        for k in (0..6000u32).step_by(5) {
+            m.append(&mut db, &key(k), "v1");
+        }
+        db.commit().unwrap();
+        let started = |db: &Db| db.forms_events()[2];
+        assert_eq!(started(&db), 0, "div {div}: no commit started a builder");
+        let mut sink = 0usize;
+        let mut n = 0u64;
+        while started(&db) == 0 && n < 2000 {
+            let from = key(((n * 37) % 6000) as u32);
+            db.scan(from.as_bytes(), 5, kv(&mut |_k, v| sink += v.len()))
+                .unwrap();
+            n += 1;
+        }
+        let did = started(&db) > 0;
+        // A state's one builder, however many scans come after.
+        for i in 0..50u32 {
+            db.scan(key(i * 100).as_bytes(), 5, kv(&mut |_k, v| sink += v.len()))
+                .unwrap();
+        }
+        assert!(started(&db) <= 1, "div {div}: one builder a state");
+        db.settle().unwrap();
+        m.check(&db, "the writer");
+        let r = db.reader().unwrap();
+        m.check(&r, "a reader");
+        drop(r);
+        db.close().unwrap();
+        (n, did)
+    };
+    let (first, did) = scans_to_start(0, 0);
+    assert!(
+        did && first == 1,
+        "zero starts it at the first scan: {first}"
+    );
+    let (n8, did8) = scans_to_start(8, 0);
+    let (n2, did2) = scans_to_start(2, 0);
+    assert!(did8 && did2);
+    assert!(
+        n8 > 4,
+        "an eighth of the blocks is more than a few scans: {n8}"
+    );
+    // `n` is the first count with `n * div >= blocks`: the two readings
+    // bracket one block count.
+    let (lo, hi) = (((n8 - 1) * 8).max((n2 - 1) * 2), (n8 * 8).min(n2 * 2));
+    assert!(
+        lo < hi,
+        "the scans waited for are the blocks over the option: {n8} at an eighth, {n2} at a half"
+    );
+    // Out of core the builder's own count decides, here none.
+    let (ooc, did) = scans_to_start(8, 1);
+    assert!(
+        did && ooc == 1,
+        "out of core the option decides nothing: {ooc}"
+    );
 }
 
 /// EXPERIMENT: the forms are published for a handle and not before.
@@ -10735,7 +14058,7 @@ fn the_forms_are_published_when_a_handle_asks() {
         // The commit's own maintenance, step by step: on the thread, which
         // commit a pass files is the thread's timing.
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -10841,7 +14164,7 @@ fn a_table_the_commit_filled_takes_the_writes_after_it() {
         // The commit's own maintenance, step by step: on the thread, which
         // commit a pass files is the thread's timing.
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -10894,7 +14217,7 @@ fn a_handle_claimed_after_a_burst_adopts_the_writers_snapshot() {
         scan_block_cache: true,
         scan_cache_ahead: false,
         commit_forms: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -10981,7 +14304,7 @@ fn a_burst_is_settled_by_its_backlog_only_near_a_scan() {
         // The commit's own rules, whose deferred burst the upkeep thread
         // would file ahead of the read.
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -11064,7 +14387,7 @@ fn pieces_merge_case(tier_pieces: usize, l0_trigger: usize) {
         tier_pieces: tier,
         scan_block_cache: true,
         commit_forms: true,
-        ..Options::default()
+        ..common::options()
     };
     let key = |i: u64| format!("{i:016}");
     let (da, dbd) = (
@@ -11161,7 +14484,7 @@ fn the_snapshots_runs_answer_as_the_chains_do() {
             // every step below, so the reads meet its versions too.
             snapshot_keeper: keeper,
             snapshot_keeper_recent_pct: 0,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -11275,7 +14598,7 @@ fn the_snapshots_runs_answer_as_the_chains_do() {
         drop(reader);
         drop(later);
         drop(db);
-        let db = Db::open(&d, Options::default()).unwrap();
+        let db = Db::open(&d, common::options()).unwrap();
         m.check(&db, &format!("cache {block_cache}: reopened"));
     }
 }
@@ -11307,7 +14630,7 @@ fn the_run_keeper_keeps_the_published_snapshot_current() {
             // burst's commit, whose upkeep sorted the live table again
             // where the keeper carries it across a landing anywhere else.
             publish_in_background: false,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -11458,7 +14781,7 @@ fn the_run_keeper_keeps_the_published_snapshot_current() {
         drop(reader);
         drop(later);
         drop(db);
-        let db = Db::open(&d, Options::default()).unwrap();
+        let db = Db::open(&d, common::options()).unwrap();
         m.check(&db, &format!("{block_cache} {pct}: reopened"));
     }
 }
@@ -11488,7 +14811,7 @@ fn a_replacing_write_patches_a_copy_in_place() {
         // commit a pass files is the thread's timing, and a count read
         // before the pass began counts a table nothing has been filed into.
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -11572,7 +14895,11 @@ fn a_scan_builds_the_snapshot_only_where_a_block_needs_it() {
             // The freeze's own carry, which this is about: off, the next look
             // at the log carries the tables (`the_next_look_carries_the_forms_across_a_freeze`).
             freeze_settles: true,
-            ..Options::default()
+            // The forms are the scans' to build, the shape whose first scan this counts
+            // (`Options::forms_settle_every` and `forms_settle_builds` off).
+            forms_settle_every: false,
+            forms_settle_builds: false,
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
@@ -11794,7 +15121,7 @@ fn a_failed_landing_stops_the_seals_behind_it_and_a_reopen_replays_them() {
     let opts = Options {
         seal_bytes: 1 << 30,
         adaptive_shape: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
@@ -11910,7 +15237,7 @@ fn a_merge_that_finishes_while_a_seal_is_between_its_phases_lands_after_it() {
         seal_bytes: 1 << 20,
         partition_bytes: Some(64 << 20),
         l0_trigger: 2,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
@@ -12009,7 +15336,7 @@ fn a_merge_that_finishes_while_a_seal_is_between_its_phases_lands_after_it() {
 #[test]
 fn a_held_handle_never_names_an_entry_a_direct_run_left_uncommitted() {
     let d = dir("held-direct-exit");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     let r = db.reader().unwrap();
     // The first key of an empty store opens an ordered run, left
     // uncommitted.
@@ -12054,7 +15381,7 @@ fn a_handles_scan_limit_counts_only_committed_keys() {
     let d = dir("scan-limit-committed");
     let opts = Options {
         direct_ingest: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     for k in 0..20u32 {
@@ -12090,7 +15417,7 @@ fn a_handle_adopts_no_snapshot_past_its_commit() {
     let d = dir("adopt-past-commit");
     let opts = Options {
         direct_ingest: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     for k in 0..20u32 {
@@ -12158,7 +15485,7 @@ fn reader_handles_across_seals_see_every_value_once_and_in_order() {
         seal_bytes: 1 << 30,
         partition_bytes: Some(1 << 30),
         l0_trigger: 1 << 20,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let keys = 2000u32;
@@ -12306,7 +15633,7 @@ fn seal_snapshot_store(name: &str) -> (Db, ScanModel) {
             // store before its seal: built whatever the reads
             // (`Options::seal_snapshot_far`).
             seal_snapshot_far: true,
-            ..Options::default()
+            ..common::options()
         },
     )
 }
@@ -12406,7 +15733,7 @@ fn a_seal_far_from_reads_builds_no_copy() {
             &format!("seal-copy-far-{far}"),
             Options {
                 seal_snapshot_far: far,
-                ..Options::default()
+                ..common::options()
             },
         );
         db.hold_seal_landing(true);
@@ -12471,7 +15798,7 @@ fn a_seal_far_from_reads_builds_no_copy() {
                 l0_trigger: 1 << 20,
                 seal_snapshot_far: far,
                 land_ranks_far: far,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -12539,7 +15866,7 @@ fn a_seal_far_from_reads_builds_no_copy() {
             &d,
             Options {
                 drain_snapshot,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -12586,7 +15913,7 @@ fn the_pieces_are_ranked_whole_only_under_the_arm() {
                 // One seal's pieces stand until the test is done with them.
                 l0_trigger: 1 << 20,
                 piece_ranks_whole: whole,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -12658,7 +15985,7 @@ fn a_frozen_tables_snapshot_outlives_the_state_it_was_published_in() {
             Options {
                 frozen_snaps,
                 seal_snapshot_far: true,
-                ..Options::default()
+                ..common::options()
             },
         );
         db.hold_seal_landing(true);
@@ -12711,7 +16038,7 @@ fn the_seal_takes_the_order_the_writers_freeze_carried() {
         // The order set at the freeze itself, which this is about: off,
         // the look that carries the snapshot races the seal's own sort.
         freeze_settles: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -12864,7 +16191,7 @@ fn a_live_write_over_the_frozen_table_is_one_key_on_every_scan_path() {
 /// of their own.
 fn scan_path_arms() -> [(&'static str, Options); 10] {
     [
-        ("default", Options::default()),
+        ("default", common::options()),
         // The compact form forced, with the block cache and without it: the
         // block path over the form files, and the merge and bulk-walk paths
         // through them.
@@ -12873,7 +16200,7 @@ fn scan_path_arms() -> [(&'static str, Options); 10] {
             Options {
                 zpages: supdb::ZPages::Always,
                 zpages_min_bytes: 0,
-                ..Options::default()
+                ..common::options()
             },
         ),
         (
@@ -12882,7 +16209,7 @@ fn scan_path_arms() -> [(&'static str, Options); 10] {
                 zpages: supdb::ZPages::Always,
                 zpages_min_bytes: 0,
                 scan_block_cache: false,
-                ..Options::default()
+                ..common::options()
             },
         ),
         // The overlay walk cut by rank, as it was before the cursor.
@@ -12893,7 +16220,7 @@ fn scan_path_arms() -> [(&'static str, Options); 10] {
                 zpages_min_bytes: 0,
                 scan_block_cache: false,
                 zpages_walk_cursor: false,
-                ..Options::default()
+                ..common::options()
             },
         ),
         (
@@ -12901,42 +16228,42 @@ fn scan_path_arms() -> [(&'static str, Options); 10] {
             Options {
                 scan_merge: false,
                 scan_block_cache: false,
-                ..Options::default()
+                ..common::options()
             },
         ),
         (
             "nocache",
             Options {
                 scan_block_cache: false,
-                ..Options::default()
+                ..common::options()
             },
         ),
         (
             "lazy",
             Options {
                 scan_lazy_snapshot: true,
-                ..Options::default()
+                ..common::options()
             },
         ),
         (
             "runs",
             Options {
                 snapshot_runs: true,
-                ..Options::default()
+                ..common::options()
             },
         ),
         (
             "unshared",
             Options {
                 share_snapshot: false,
-                ..Options::default()
+                ..common::options()
             },
         ),
         (
             "nofrozen",
             Options {
                 frozen_snaps: false,
-                ..Options::default()
+                ..common::options()
             },
         ),
     ]
@@ -12956,7 +16283,7 @@ fn the_writer_keeps_its_live_snapshot_across_a_landing() {
             seal_bytes: 1 << 30,
             partition_bytes: Some(64 << 10),
             direct_ingest: false,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -13092,7 +16419,7 @@ fn load_ordered_with_tail(d: &std::path::Path, n: u32) -> Db {
             adaptive_shape: true,
             seal_bytes: 1 << 20,
             partition_bytes: Some(8 << 20),
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -13176,7 +16503,7 @@ fn an_ordered_tail_handed_at_sync_is_promoted_beside_the_partition() {
         &d,
         Options {
             adaptive_shape: true,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -13250,7 +16577,7 @@ fn a_write_after_a_handed_seal_takes_a_fresh_table_from_whichever_side_swapped()
                 // Never on its own: the whole table is the sync's to hand.
                 seal_bytes: 1 << 40,
                 partition_bytes: Some(64 << 20),
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -13537,7 +16864,7 @@ fn a_writer_freezes_into_room_while_three_seals_are_held() {
 #[test]
 fn a_fourth_freeze_waits_for_the_front_to_land() {
     let key = |k: u32| format!("key-{k:05}");
-    let (mut db, mut m, _) = partitions_under_a_piece("fourth-freeze", Options::default());
+    let (mut db, mut m, _) = partitions_under_a_piece("fourth-freeze", common::options());
     let watch = Watchdog::arm("a freeze waited for a held seal, or the fourth past the release");
     db.hold_seal_landing(true);
     // The durable phase held as well, so once the release lets the front
@@ -13597,7 +16924,7 @@ fn a_handed_tail_freezes_into_room_beside_two_seals() {
         "handed-into-room",
         Options {
             adaptive_shape: true,
-            ..Options::default()
+            ..common::options()
         },
     );
     let watch = Watchdog::arm("a freeze or the write after the hand-off waited for a held seal");
@@ -13671,7 +16998,7 @@ fn copy_store(from: &std::path::Path, to: &std::path::Path) {
 fn a_crash_with_three_seals_in_flight_replays_them_all() {
     for between in [false, true] {
         let name = format!("crash-three-{between}");
-        let (mut db, mut m, src) = partitions_under_a_piece(&name, Options::default());
+        let (mut db, mut m, src) = partitions_under_a_piece(&name, common::options());
         let watch = Watchdog::arm("a freeze waited for a held seal");
         if between {
             db.hold_seal_durable(true);
@@ -13700,7 +17027,7 @@ fn a_crash_with_three_seals_in_flight_replays_them_all() {
         // Opened as the store was made: no merge of the pieces at open.
         let opts = Options {
             l0_trigger: 64,
-            ..Options::default()
+            ..common::options()
         };
         let opened = Db::open(&copy, opts.clone()).unwrap();
         m.check(&opened, &format!("{name}: the crash copy reopened"));
@@ -13729,7 +17056,7 @@ fn readers_on_threads_keep_answering_beside_three_frozen_tables() {
         seal_bytes: 1 << 30,
         partition_bytes: Some(64 << 10),
         l0_trigger: 2,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let keys = 3000u32;
@@ -13887,7 +17214,7 @@ fn a_handed_tables_seal_snapshot_serves_the_state_that_freezes_it() {
                 // the store before its seal: built whatever the reads
                 // (`Options::seal_snapshot_far`).
                 seal_snapshot_far: true,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -13963,7 +17290,7 @@ fn a_hashed_tail_handed_beside_a_seal_in_flight_lands_as_a_piece() {
             sync: supdb::SyncPolicy::EveryN(u32::MAX),
             // Each seal's own WAL, retired by its own landing.
             seal_rotates_wal: true,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -14131,7 +17458,7 @@ fn a_handed_tables_log_is_retired_at_its_landing_and_replays_before_it() {
     let opts = || Options {
         adaptive_shape: true,
         seal_rotates_wal: true,
-        ..Options::default()
+        ..common::options()
     };
     // The hashed tail: updates over a partition, through the WAL.
     {
@@ -14313,7 +17640,7 @@ fn a_landing_that_replaces_the_live_table_carries_no_form() {
         // The writer files at its own commit: the position the forms are
         // current to is the writer's, not a thread's.
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -14409,7 +17736,11 @@ fn a_form_dropped_under_a_landings_carry_is_retracted_at_the_writers_look() {
         commit_forms: true,
         forms_carry: true,
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        // The commit leaves its batch to the look, the shape this state is made in
+        // (`Options::forms_settle_every` and `forms_settle_builds` off).
+        forms_settle_every: false,
+        forms_settle_builds: false,
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -14530,7 +17861,7 @@ fn a_scan_takes_no_form_published_after_the_commit_it_reads_at() {
         scan_cache_bytes: 64 << 20,
         commit_forms: true,
         upkeep: supdb::Upkeep::Inline,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let key = |k: u32| format!("key-{k:05}");
@@ -14616,7 +17947,7 @@ fn an_open_cut_tail_handed_beside_a_seal_in_flight_is_promoted_on_its_keys() {
             adaptive_shape: true,
             seal_bytes: 512 << 10,
             partition_bytes: Some(8 << 20),
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -14704,7 +18035,7 @@ fn an_open_cut_tail_handed_beside_a_seal_in_flight_is_promoted_on_its_keys() {
         &d,
         Options {
             adaptive_shape: true,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -14765,7 +18096,7 @@ fn a_seal_that_keeps_the_wal_retires_files_by_sequence() {
         // Ascending keys would go to ordered ingest, which writes a
         // segment and not the log.
         direct_ingest: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let mut want: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
@@ -14854,7 +18185,7 @@ fn a_rotated_wal_torn_in_its_new_file_reopens_to_a_prefix() {
         // Ascending keys would go to ordered ingest, which writes a
         // segment and not the log.
         direct_ingest: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     // Records until the log has rotated once and before the memtable
@@ -14937,7 +18268,7 @@ fn a_commit_past_the_threshold_keeps_writing_while_the_frozen_list_is_full() {
         // Ascending keys would go to ordered ingest, which writes a
         // segment and not the log.
         direct_ingest: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     // A commit that waited would never return; say so rather than hang.
@@ -15039,7 +18370,7 @@ fn a_commit_seals_whenever_the_sealer_is_idle() {
             seal_max_pct: 0,
             sync: supdb::SyncPolicy::EveryN(u32::MAX),
             direct_ingest: false,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let mut want: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
@@ -15147,7 +18478,7 @@ fn a_fresh_store_under_the_shape_seals_its_first_load_at_the_floor() {
             seal_rotates_wal: false,
             seal_first_floor: floor,
             sync: supdb::SyncPolicy::EveryN(u32::MAX),
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         let n = 30_000u32;
@@ -15196,7 +18527,7 @@ fn a_closed_wal_outlives_a_seal_between_its_phases_and_a_crash_there() {
         seal_max_pct: 0,
         sync: supdb::SyncPolicy::EveryN(u32::MAX),
         direct_ingest: false,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let mut want: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
@@ -15273,7 +18604,7 @@ fn a_flush_publishes_its_seal_before_the_seal_is_durable() {
             Options {
                 publish_in_background: background,
                 direct_ingest: false,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -15358,7 +18689,7 @@ fn the_next_look_carries_the_forms_across_a_freeze_with(
         freeze_settles: false,
         snapshot_carry,
         upkeep,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -15470,7 +18801,7 @@ fn a_commit_that_freezes_leaves_the_carry_to_the_upkeep_thread() {
         forms_settle_backlog_pct: 0,
         freeze_settles: false,
         upkeep: supdb::Upkeep::Background(1),
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -15548,7 +18879,7 @@ fn a_commit_past_the_bound_holds_for_the_thread() {
         upkeep_lag_pct: 7,
         upkeep_batch_pct: 3,
         upkeep: supdb::Upkeep::Background(1),
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -15604,7 +18935,7 @@ fn a_pending_manifest_is_the_store_only_once_its_segment_reads_back_whole() {
                 checksums,
                 ..Default::default()
             },
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts.clone()).unwrap();
         let mut m = ScanModel::default();
@@ -15634,7 +18965,7 @@ fn a_pending_manifest_is_the_store_only_once_its_segment_reads_back_whole() {
         // The crash: nothing of the store runs on, the seal thread parked
         // at its hold; the file is what the page cache held, whole, or
         // with a run of its records lost.
-        std::mem::forget(db);
+        db.crash();
         if torn {
             use std::os::unix::fs::FileExt;
             let f = std::fs::OpenOptions::new().write(true).open(&seg).unwrap();
@@ -15672,7 +19003,7 @@ fn a_clean_close_leaves_no_pending_name() {
     let opts = Options {
         seal_bytes: 1 << 20,
         manifest_pending: true,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     for k in (0..2000u32).rev() {
@@ -15698,7 +19029,7 @@ fn a_store_from_before_the_pending_flags_opens_with_both_slots_rewritten() {
     let d = dir("manifest-upgrade");
     let opts = Options {
         seal_bytes: 1 << 20,
-        ..Options::default()
+        ..common::options()
     };
     let key = |k: u32| format!("key-{k:05}");
     let mut db = Db::create(&d, opts.clone()).unwrap();
@@ -15786,7 +19117,7 @@ fn a_run_whose_keys_the_table_keeps_leaves_the_segment_the_copies_leave() {
         partition_bytes: Some(1 << 20),
         direct_derive_keys: derive,
         direct_keys_in_stream: in_stream,
-        ..Options::default()
+        ..common::options()
     };
     let drive = |d: &std::path::Path, derive: bool, in_stream: bool| {
         let mut db = Db::create(d, opts(derive, in_stream)).unwrap();
@@ -15872,7 +19203,7 @@ fn a_run_whose_keys_the_table_keeps_leaves_the_segment_the_copies_leave() {
 #[test]
 fn a_failed_presync_is_the_flushs_answer() {
     let d = dir("presyncfail");
-    let opts = Options::default();
+    let opts = common::options();
     let mut db = Db::create(&d, opts.clone()).unwrap();
     for c in 0u32..500 {
         db.append(format!("k{c:04}").as_bytes(), &c.to_le_bytes());
@@ -15914,7 +19245,7 @@ fn a_scans_answers_are_the_same_with_the_directory_hint_and_without() {
         let d = dir(&format!("{name}-{}", if hint { "hint" } else { "plain" }));
         let opts = Options {
             seek_prefetch_dir: hint,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         for k in 0..keys {
@@ -16002,7 +19333,7 @@ fn a_scans_answers_are_the_same_with_the_directory_hint_and_without() {
 fn a_seek_counts_its_directory_hint_once_a_scan_and_the_threads_pass_none() {
     // A drained store, one partition: every scan of ten is one seek.
     let d = dir("dirhint-count");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, common::options()).unwrap();
     let key = |k: u32| format!("key-{k:06}").into_bytes();
     for k in 0..5_000u32 {
         db.append(&key(k), b"0");
@@ -16053,7 +19384,7 @@ fn a_seek_counts_its_directory_hint_once_a_scan_and_the_threads_pass_none() {
         upkeep_inline_bursts: true,
         partition_bytes: Some(256 << 10),
         seal_max_pct: 0,
-        ..Options::default()
+        ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let keys = 20_000u32;
@@ -16112,7 +19443,7 @@ fn the_directory_hint_writes_the_segment_and_the_ordered_index_the_default_does(
         });
         let opts = Options {
             seek_prefetch_dir: hint,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         for c in 0u32..3000 {
@@ -16185,7 +19516,7 @@ fn a_load_nobody_reads_files_no_forms() {
             // random writes after it overlay their blocks.
             seal_bytes: 1 << 20,
             forms_settle_far: far,
-            ..Options::default()
+            ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
         // The handle the suite holds from the open, so the forms are
@@ -16225,10 +19556,30 @@ fn a_load_nobody_reads_files_no_forms() {
         db.commit().unwrap();
         db.settle().unwrap();
         let built = db.blocks_built().1 - built0;
+        // What the upkeep did over the stretch, said with either failure.
+        // The arm's forms are built on the upkeep thread, so a count of
+        // none is a schedule of that thread's, and these are what tell
+        // one schedule from another: the hosted x86 runner read none
+        // once, on a tree the same job had passed half an hour before,
+        // and the assertion had only its own sentence to say.
+        let did = format!(
+            "upkeep {:?}, events {:?}, refusals {:?}, abandon {:?}, outran {}",
+            db.upkeep_counts(),
+            db.forms_events(),
+            db.settle_refusals(),
+            db.upkeep_abandon_state(),
+            db.upkeep_outran()
+        );
         if far {
-            assert!(built > 0, "the arm that files far from a scan built forms");
+            assert!(
+                built > 0,
+                "the arm that files far from a scan built no forms: {did}"
+            );
         } else {
-            assert_eq!(built, 0, "a stretch nobody read built {built} blocks");
+            assert_eq!(
+                built, 0,
+                "a stretch nobody read built {built} blocks: {did}"
+            );
         }
         // A scan through the handle and through the writer reads every
         // key with every value in order, forms or none.
@@ -16289,7 +19640,7 @@ fn a_handle_claimed_between_two_scans_leaves_the_writers_scan_whole_before_the_f
             promote: false,
             partition_bytes: Some(1 << 10),
             direct_ingest: false,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -16386,7 +19737,7 @@ fn a_loose_rotation_syncs_nothing_and_a_gap_at_its_boundary_ends_the_log() {
         seal_bytes: 16 << 10,
         // Ascending keys through the log, not a direct run.
         direct_ingest: false,
-        ..Options::default()
+        ..common::options()
     };
     let key = |i: u32| format!("k{i:05}").into_bytes();
     let val = vec![7u8; 100];
@@ -16403,13 +19754,18 @@ fn a_loose_rotation_syncs_nothing_and_a_gap_at_its_boundary_ends_the_log() {
             db.commit().unwrap();
         }
     };
+    // The last frame's last byte cut off, wherever the frames end: a file
+    // pre-written ahead of its tail runs on in zeros past it
+    // (`Options::wal_ahead_bytes`), and a commit frame ends in its kind and
+    // CRC, never in more zeros than a few.
     let tear = |p: &std::path::Path| {
-        let len = std::fs::metadata(p).unwrap().len();
+        let bytes = std::fs::read(p).unwrap();
+        let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
         std::fs::OpenOptions::new()
             .write(true)
             .open(p)
             .unwrap()
-            .set_len(len - 1)
+            .set_len(end as u64 - 1)
             .unwrap();
     };
     let d = dir("loose-rotation");
@@ -16529,7 +19885,7 @@ fn the_first_sync_by_policy_after_a_loose_rotation_syncs_the_closed_file_and_cha
         seal_rotates_wal: false,
         seal_bytes: 16 << 10,
         direct_ingest: false,
-        ..Options::default()
+        ..common::options()
     };
     // Commits of eight records until the log rotates once; how many that
     // takes, counted on a store of its own, so the policy below can sync
@@ -16623,7 +19979,7 @@ fn the_oracle_holds_with_loose_rotations() {
             sync: supdb::SyncPolicy::EveryN(u32::MAX),
             seal_rotates_wal: false,
             seal_bytes: 2 << 10,
-            ..Options::default()
+            ..common::options()
         },
     );
     assert!(w.wal_rotations > 0 && w.rotated_unsynced > 0, "{w:?}");
@@ -16637,12 +19993,15 @@ fn the_oracle_holds_with_loose_rotations() {
 /// commit held for that, the scan after the burst finds nothing left to
 /// settle, and every key reads as written through the writer and through
 /// a handle. A batch over the share, or every batch at zero, is filed in
-/// the commit: nothing is lent and the thread makes no pass.
+/// the commit: nothing is lent and the thread makes no pass. Held for its
+/// filing (`Options::upkeep_pace_holds`), a paced commit returns with the
+/// thread trailing by nothing, where lent within the share it returns
+/// with its own batch unfiled.
 #[test]
 fn a_bursts_batches_after_the_first_are_lent_a_batch_behind_the_thread() {
     // Batches of a thousand over twenty thousand keys: five percent of
     // the store, paced at a share of ten and filed at one.
-    let run = |name: &str, pace_pct: usize| {
+    let run = |name: &str, pace_pct: usize, hold: bool| {
         let pace = pace_pct >= 5;
         let d = dir(name);
         let mut db = Db::create(
@@ -16651,9 +20010,10 @@ fn a_bursts_batches_after_the_first_are_lent_a_batch_behind_the_thread() {
                 sync: supdb::SyncPolicy::EveryN(u32::MAX),
                 upkeep: supdb::Upkeep::Background(1),
                 upkeep_pace_pct: pace_pct,
+                upkeep_pace_holds: hold,
                 partition_bytes: Some(256 << 10),
                 seal_max_pct: 0,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -16704,10 +20064,17 @@ fn a_bursts_batches_after_the_first_are_lent_a_batch_behind_the_thread() {
             if pace && round > 0 {
                 let behind = db.upkeep_behind_writes();
                 let share = keys as u64 * pace_pct as u64 / 100;
-                assert!(
-                    behind <= share,
-                    "commit {round}: the thread trails by at most the share {share}, not {behind}"
-                );
+                if hold {
+                    assert_eq!(
+                        behind, 0,
+                        "commit {round}: held, the thread trails by nothing"
+                    );
+                } else {
+                    assert!(
+                        behind <= share,
+                        "commit {round}: the thread trails by at most the share {share}, not {behind}"
+                    );
+                }
             }
         }
         let after = db.upkeep_counts();
@@ -16722,26 +20089,1619 @@ fn a_bursts_batches_after_the_first_are_lent_a_batch_behind_the_thread() {
         check(&h, &want, "through a handle after the burst");
         (passes, holds, by_scan)
     };
-    let (passes, holds, by_scan) = run("paced-burst", 10);
-    assert!(
-        passes >= 1,
-        "the thread filed the lent batches: {passes} passes"
-    );
-    assert_eq!(holds, 7, "every commit after the first held for the thread");
-    assert_eq!(
-        by_scan, 0,
-        "the scan after the burst found nothing left to settle"
-    );
-    let (passes, holds, by_scan) = run("unpaced-burst", 0);
+    for (name, hold) in [("paced-burst", false), ("held-burst", true)] {
+        let (passes, holds, by_scan) = run(name, 10, hold);
+        assert!(
+            passes >= 1,
+            "{name}: the thread filed the lent batches: {passes} passes"
+        );
+        assert_eq!(
+            holds, 7,
+            "{name}: every commit after the first held for the thread"
+        );
+        assert_eq!(
+            by_scan, 0,
+            "{name}: the scan after the burst found nothing left to settle"
+        );
+    }
+    let (passes, holds, by_scan) = run("unpaced-burst", 0, false);
     assert_eq!(
         (passes, holds, by_scan),
         (0, 0, 0),
         "filed in the commits: no pass, no hold, nothing for the scan"
     );
-    let (passes, holds, by_scan) = run("over-the-share-burst", 1);
+    let (passes, holds, by_scan) = run("over-the-share-burst", 1, false);
     assert_eq!(
         (passes, holds, by_scan),
         (0, 0, 0),
         "a batch over the share is filed in the commit"
     );
+}
+
+/// A syncing commit's paced batch of at least a twentieth of the store is
+/// held until the thread trails by the share alone, so the first scan after
+/// the burst meets nothing of it (`Options::upkeep_pace_syncs_to_share`);
+/// a smaller batch, and every batch with the option off, may leave the
+/// thread up to the batch behind. Every key reads as written after.
+#[test]
+fn a_syncing_commits_large_batch_is_held_to_the_share() {
+    let run = |name: &str, to_share: bool, batch: u32| {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                upkeep: supdb::Upkeep::Background(1),
+                upkeep_pace_syncs_model: false,
+                upkeep_pace_syncs_to_share: to_share,
+                zpages: supdb::ZPages::Off,
+                partition_bytes: Some(256 << 10),
+                seal_max_pct: 0,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        assert!(matches!(db.options().sync, supdb::SyncPolicy::Always));
+        let keys = 10_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: HashMap<u32, String> = HashMap::new();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        let check = |db: &Reader, want: &HashMap<u32, String>, when: &str| {
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                    let expect = want.get(&kn).map_or("0", |s| s.as_str());
+                    assert_eq!(
+                        std::str::from_utf8(v).unwrap(),
+                        expect,
+                        "{name}: key {kn} {when}"
+                    );
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "{name}: every key {when}");
+        };
+        check(&db, &want, "before the burst");
+        let share = keys as u64 * db.options().upkeep_pace_syncs_bp as u64 / 10_000;
+        let held_to_share = to_share && batch as u64 * 20 >= keys as u64 && batch <= 2048;
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut over = 0u32;
+        for round in 0..6u32 {
+            for _ in 0..batch {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), format!("b{round}").as_bytes());
+                want.insert(k, format!("b{round}"));
+            }
+            db.commit().unwrap();
+            let behind = db.upkeep_behind_writes();
+            let bound = if held_to_share {
+                share
+            } else {
+                share.max(batch as u64)
+            };
+            assert!(
+                behind <= bound,
+                "{name}: commit {round}: the thread trails by at most {bound}, not {behind}"
+            );
+            over += u32::from(behind > share);
+        }
+        db.settle().unwrap();
+        check(&db, &want, "after the burst");
+        over
+    };
+    assert_eq!(run("pace-share-large", true, 1000), 0, "held to the share");
+    run("pace-share-small", true, 400);
+    run("pace-share-huge", true, 3000);
+    run("pace-share-off", false, 1000);
+}
+
+/// Under `Options::upkeep_pace_syncs_model` a syncing commit holds for its
+/// batch's filing where a scan is the likelier next operation, by the
+/// store's own runs of commits between scans: once a burst of one commit
+/// followed by a scan is on record, each such commit returns with the
+/// thread caught up, so the scan after it meets nothing to file, and a
+/// small batch is paced as a large one is. With the model off, the commit
+/// returns as soon as the batch is lent and the thread is still filing it.
+/// Every key reads as written after each scan.
+#[test]
+fn a_syncing_commit_a_scan_follows_holds_for_its_filing() {
+    let run = |name: &str, model: bool, batch: u32| -> (u32, u32) {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                upkeep: supdb::Upkeep::Background(1),
+                upkeep_pace_syncs_model: model,
+                upkeep_pace_syncs_to_share: false,
+                zpages: supdb::ZPages::Off,
+                partition_bytes: Some(256 << 10),
+                seal_max_pct: 0,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        assert!(matches!(db.options().sync, supdb::SyncPolicy::Always));
+        let keys = 10_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: HashMap<u32, String> = HashMap::new();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        let check = |db: &Reader, want: &HashMap<u32, String>, when: &str| {
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                    let expect = want.get(&kn).map_or("0", |s| s.as_str());
+                    assert_eq!(
+                        std::str::from_utf8(v).unwrap(),
+                        expect,
+                        "{name}: key {kn} {when}"
+                    );
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "{name}: every key {when}");
+        };
+        check(&db, &want, "before the bursts");
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let (mut caught_up, mut behind_any) = (0u32, 0u32);
+        for round in 0..6u32 {
+            for _ in 0..batch {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), format!("b{round}").as_bytes());
+                want.insert(k, format!("b{round}"));
+            }
+            // With the model off the commit does not wait for the thread,
+            // and the thread is held before its pass here so that "still
+            // filing" is a state the test holds and not a turn it bets on:
+            // unheld, a host whose fsync outlasts the thread's pass found
+            // every batch filed at the commit's return, and the whole
+            // binary failed two runs in five there. A commit that did
+            // wait would never return, which the watchdog says.
+            let held = (!model).then(|| {
+                db.hold_upkeep_pass(true);
+                Watchdog::arm("a commit with the model off waited for the held thread")
+            });
+            db.commit().unwrap();
+            // The first burst has no run on record; from the second on, a
+            // burst of one commit has one.
+            if round > 0 {
+                if db.upkeep_behind_writes() == 0 {
+                    caught_up += 1;
+                } else {
+                    behind_any += 1;
+                }
+            }
+            if held.is_some() {
+                db.hold_upkeep_pass(false);
+            }
+            drop(held);
+            check(&db, &want, &format!("after burst {round}"));
+        }
+        db.settle().unwrap();
+        (caught_up, behind_any)
+    };
+    assert_eq!(
+        run("pace-model-large", true, 1000),
+        (5, 0),
+        "held, large batches"
+    );
+    assert_eq!(
+        run("pace-model-small", true, 100),
+        (5, 0),
+        "held, small batches"
+    );
+    assert_eq!(
+        run("pace-model-off", false, 1000),
+        (0, 5),
+        "with the model off a commit returns with its batch unfiled"
+    );
+}
+
+/// A syncing commit lends every batch to the upkeep thread, which files
+/// it through the fsync; with `Options::upkeep_pace_syncs_bp` a burst's
+/// batch near reads is paced as well while the store is in core, as this
+/// one is: after every such commit the thread
+/// trails by at most the share of the store's keys, every commit of the
+/// burst held for that, and every key reads as written through the
+/// writer and through a handle. Off, the commits lend unpaced and hold
+/// for nothing. In core is every gate but the compact form's
+/// (`Options::upkeep_pace_syncs_census`): the burst holds at the census's
+/// gate as at the raw form's, and at the compact form's holds for nothing;
+/// with the option off the census's gate holds for nothing too. The gate
+/// is set by hand, the controller off so that nothing moves it.
+#[test]
+fn a_syncing_commits_burst_batches_are_paced_behind_the_thread() {
+    // Batches of a thousand over twenty thousand keys, paced within a
+    // tenth of the store: two thousand writes, two batches.
+    let run = |name: &str, bp: usize, gate: u8, census: bool| {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                upkeep: supdb::Upkeep::Background(1),
+                upkeep_pace_syncs_bp: bp,
+                upkeep_pace_syncs_census: census,
+                zpages: supdb::ZPages::Off,
+                partition_bytes: Some(256 << 10),
+                seal_max_pct: 0,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(db.options().sync, supdb::SyncPolicy::Always),
+            "the commits sync: {:?}",
+            db.options().sync
+        );
+        let keys = 20_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: HashMap<u32, String> = HashMap::new();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+        let check = |db: &Reader, want: &HashMap<u32, String>, when: &str| {
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                    let expect = want.get(&kn).map_or("0", |s| s.as_str());
+                    assert_eq!(std::str::from_utf8(v).unwrap(), expect, "key {kn} {when}");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "every key {when}");
+        };
+        // Reads around: a scan over the store.
+        check(&db, &want, "before the burst");
+        db.zgate_set(gate);
+        let paced = bp > 0 && if census { gate != 2 } else { gate == 0 };
+        let before = db.upkeep_counts();
+        let share = keys as u64 * bp as u64 / 10_000;
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for round in 0..8u32 {
+            for _ in 0..1000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), format!("b{round}").as_bytes());
+                want.insert(k, format!("b{round}"));
+            }
+            db.commit().unwrap();
+            if paced {
+                let behind = db.upkeep_behind_writes();
+                assert!(
+                    behind <= share.max(1000),
+                    "commit {round}: the thread trails by at most the share {share}, not {behind}"
+                );
+            }
+        }
+        let after = db.upkeep_counts();
+        let (passes, holds) = (after[0] - before[0], after[4] - before[4]);
+        db.zgate_set(0);
+        db.settle().unwrap();
+        check(&db, &want, "after the burst");
+        let h = db.reader().unwrap();
+        check(&h, &want, "through a handle after the burst");
+        (passes, holds)
+    };
+    for (name, bp, gate, census, want_holds) in [
+        ("paced-sync-burst", 1000, 0u8, true, 8u64),
+        ("paced-sync-burst-census", 1000, 1, true, 8),
+        ("paced-sync-burst-compact", 1000, 2, true, 0),
+        ("paced-sync-burst-raw-only", 1000, 0, false, 8),
+        ("paced-sync-burst-census-raw-only", 1000, 1, false, 0),
+        ("unpaced-sync-burst", 0, 0, true, 0),
+    ] {
+        let (passes, holds) = run(name, bp, gate, census);
+        assert!(
+            passes >= 1,
+            "{name}: the thread filed the lent batches: {passes} passes"
+        );
+        assert_eq!(
+            holds, want_holds,
+            "{name}: gate {gate}, census {census}: the commits that held for the thread"
+        );
+    }
+}
+
+/// Out of core, a scan that starts in a block the writer holds a form for
+/// counts as a reuse under `Options::scan_forms_off_counts_built`: the
+/// forms are given up because a build is repaid only where a later scan
+/// walks the block again, and a built form costs no build. A store with an
+/// update in every block has every block formed by scans in core; then,
+/// with the gate set to the compact form's by hand, uniform starts that no
+/// recent scan started in keep the forms with the option and give them up
+/// without it; a store with an update in a few blocks has the rest marked
+/// clean, which is no build, and gives the forms up with the option too.
+/// Every scan answers as the model in each.
+#[test]
+fn a_form_built_already_is_a_reuse_for_the_forms_off_rule() {
+    // An update every sixteenth key forms every block; every two
+    // thousandth leaves most blocks clean, and a clean mark is no build.
+    for (counts, step) in [(true, 16u32), (false, 16), (true, 2_000)] {
+        let kept = counts && step == 16;
+        let d = dir(&format!("forms-off-built-{counts}-{step}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                scan_forms_off_unreused: true,
+                scan_forms_off_counts_built: counts,
+                scan_forms_off_window: 32,
+                scan_forms_off_ghost_bits: 6,
+                zpages: supdb::ZPages::Off,
+                partition_bytes: Some(256 << 10),
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let keys = 100_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+            want.insert(key(k), "0".into());
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(db.levels().0 > 1, "partitions for the forms to hang on");
+        // An update in every block, and scans in core over the whole store,
+        // so that every block has a form.
+        for k in (0..keys).step_by(step as usize) {
+            db.put(&key(k), b"1");
+            want.insert(key(k), "1".into());
+        }
+        db.commit().unwrap();
+        let check = |r: &Reader, want: &BTreeMap<Vec<u8>, String>, start: u32, n: usize| {
+            let mut got: Vec<(Vec<u8>, String)> = Vec::new();
+            r.scan(
+                &key(start),
+                n,
+                kv(&mut |k, v| {
+                    got.push((k.to_vec(), std::str::from_utf8(v).unwrap().to_string()));
+                }),
+            )
+            .unwrap();
+            let expect: Vec<(Vec<u8>, String)> = want
+                .range(key(start)..)
+                .take(n)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            assert_eq!(got, expect, "counts {counts}: scan from {start}");
+        };
+        let mut start = 0u32;
+        while start < keys {
+            check(&db, &want, start, 2_000);
+            start += 2_000;
+        }
+        let formed = db.block_cache_size().0;
+        assert!(
+            step != 16 || formed > 1_000,
+            "counts {counts}: every block formed: {formed}"
+        );
+        assert_eq!(db.forms_off_counts(), [0, 0, 0], "counts {counts}: in core");
+        // Out of core, starts uniform over the store's blocks in a table of
+        // 64 slots: no recent start recurs, every start's block is formed.
+        db.zgate_set(2);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..256 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            check(&db, &want, (x % keys as u64) as u32, 20);
+        }
+        let c = db.forms_off_counts();
+        if kept {
+            assert_eq!(c[0], 0, "the built forms kept: {c:?}");
+            assert!(
+                db.block_cache_size().0 >= formed,
+                "counts {counts}: no form dropped"
+            );
+        } else {
+            assert!(
+                c[0] >= 1 && c[2] > 0,
+                "counts {counts} step {step}: the forms given up: {c:?}"
+            );
+            assert_eq!(db.block_cache_size().0, 0, "no form kept while off");
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Out of core -- the gate set to the compact form's by hand, the
+/// controller off -- a writer whose scans start in blocks no recent scan
+/// started in gives its forms up and takes the merge path
+/// (`Options::scan_forms_off_unreused`), and its commits build no form
+/// meanwhile; scans that come back to one block take the forms back, and
+/// the block path builds again; a handle the caller claims takes them back
+/// at the writer's next commit, and the writer keeps them while the handle
+/// lives; back in core they are taken back at the next scan. Every scan
+/// answers as the model through every switch, with writes committed
+/// between the scans, through the writer and through a handle.
+#[test]
+fn scans_that_meet_their_blocks_once_out_of_core_keep_no_forms() {
+    let d = dir("forms-off-unreused");
+    let mut db = Db::create(
+        &d,
+        Options {
+            scan_forms_off_unreused: true,
+            scan_forms_off_window: 32,
+            scan_forms_off_ghost_bits: 6,
+            zpages: supdb::ZPages::Off,
+            partition_bytes: Some(256 << 10),
+            ..common::options()
+        },
+    )
+    .unwrap();
+    let keys = 100_000u32;
+    let key = |k: u32| format!("key-{k:06}").into_bytes();
+    let mut want: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+    for k in 0..keys {
+        db.append(&key(k), b"0");
+        want.insert(key(k), "0".into());
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert!(db.levels().0 > 1, "partitions for the forms to hang on");
+    let check = |r: &Reader, want: &BTreeMap<Vec<u8>, String>, start: u32, when: &str| {
+        let mut got: Vec<(Vec<u8>, String)> = Vec::new();
+        r.scan(
+            &key(start),
+            20,
+            kv(&mut |k, v| {
+                got.push((k.to_vec(), std::str::from_utf8(v).unwrap().to_string()));
+            }),
+        )
+        .unwrap();
+        let expect: Vec<(Vec<u8>, String)> = want
+            .range(key(start)..)
+            .take(20)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        assert_eq!(got, expect, "scan from {start} {when}");
+    };
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mut round = 0u32;
+    // Half of a round's writes are updates anywhere, half new keys among
+    // the hot starts below, where the scans after a switch read them.
+    let mut write =
+        |db: &mut Db, want: &mut BTreeMap<Vec<u8>, String>, next: &mut dyn FnMut() -> u64| {
+            round += 1;
+            for i in 0..50 {
+                let k = if i % 2 == 0 {
+                    key((next() % keys as u64) as u32)
+                } else {
+                    let mut k = key(2_000 + (next() % 40) as u32);
+                    k.extend_from_slice(format!("-{round}-{i}").as_bytes());
+                    k
+                };
+                db.put(&k, format!("w{round}").as_bytes());
+                want.insert(k, format!("w{round}"));
+            }
+            db.commit().unwrap();
+        };
+    // In core first: the forms are kept.
+    for i in 0..64 {
+        check(&db, &want, (next() % keys as u64) as u32, "in core");
+        if i % 8 == 0 {
+            write(&mut db, &mut want, &mut next);
+        }
+    }
+    assert_eq!(
+        db.forms_off_counts(),
+        [0, 0, 0],
+        "in core nothing is given up"
+    );
+    // Out of core, starts uniform over 1,500 blocks in a table of 64 slots.
+    db.zgate_set(2);
+    for i in 0..256 {
+        check(
+            &db,
+            &want,
+            (next() % keys as u64) as u32,
+            "uniform out of core",
+        );
+        if i % 8 == 0 {
+            write(&mut db, &mut want, &mut next);
+        }
+    }
+    let c = db.forms_off_counts();
+    assert!(c[0] >= 1 && c[2] > 0, "the forms given up: {c:?}");
+    // While they are off, commits build nothing and the scans keep none.
+    for _ in 0..4 {
+        write(&mut db, &mut want, &mut next);
+        check(&db, &want, (next() % keys as u64) as u32, "forms off");
+    }
+    assert_eq!(db.block_cache_size().0, 0, "no form kept while off");
+    // A handle claimed: the writer's next commit takes the forms back, and
+    // neither the writer nor the handle gives them up while it lives.
+    let h = db.reader().unwrap();
+    let before = db.forms_off_counts();
+    write(&mut db, &mut want, &mut next);
+    let after = db.forms_off_counts();
+    assert_eq!(
+        after[1],
+        before[1] + 1,
+        "taken back for the handle: {after:?}"
+    );
+    for i in 0..128 {
+        check(
+            &db,
+            &want,
+            (next() % keys as u64) as u32,
+            "a handle live, the writer",
+        );
+        check(
+            &h,
+            &want,
+            (next() % keys as u64) as u32,
+            "a handle live, the handle",
+        );
+        if i % 8 == 0 {
+            write(&mut db, &mut want, &mut next);
+        }
+    }
+    assert_eq!(
+        db.forms_off_counts(),
+        after,
+        "nothing given up while it lives"
+    );
+    drop(h);
+    for i in 0..256 {
+        check(
+            &db,
+            &want,
+            (next() % keys as u64) as u32,
+            "uniform, the handle gone",
+        );
+        if i % 8 == 0 {
+            write(&mut db, &mut want, &mut next);
+        }
+    }
+    assert!(
+        db.forms_off_counts()[0] > after[0],
+        "given up again with no handle"
+    );
+    // Scans back in one block: the forms taken back, the block path again.
+    let before = db.forms_off_counts();
+    for i in 0..128 {
+        check(&db, &want, 2_000 + (next() % 30) as u32, "hot out of core");
+        if i % 8 == 0 {
+            write(&mut db, &mut want, &mut next);
+        }
+    }
+    let after = db.forms_off_counts();
+    assert!(
+        after[1] > before[1],
+        "the forms taken back: {before:?} {after:?}"
+    );
+    let merged = after[2];
+    for _ in 0..16 {
+        check(&db, &want, 2_000 + (next() % 30) as u32, "hot, forms on");
+    }
+    assert_eq!(
+        db.forms_off_counts()[2],
+        merged,
+        "the block path serves them"
+    );
+    assert!(db.block_cache_size().0 > 0, "forms built again");
+    // Off once more, then back in core: taken back at the next scan.
+    for i in 0..256 {
+        check(&db, &want, (next() % keys as u64) as u32, "uniform again");
+        if i % 8 == 0 {
+            write(&mut db, &mut want, &mut next);
+        }
+    }
+    let off = db.forms_off_counts();
+    assert!(off[0] >= 2, "given up again: {off:?}");
+    db.zgate_set(0);
+    check(&db, &want, (next() % keys as u64) as u32, "back in core");
+    let back = db.forms_off_counts();
+    assert!(back[1] > off[1], "taken back in core: {off:?} {back:?}");
+    for i in 0..32 {
+        check(&db, &want, (next() % keys as u64) as u32, "in core again");
+        if i % 8 == 0 {
+            write(&mut db, &mut want, &mut next);
+        }
+    }
+    assert_eq!(db.forms_off_counts()[2], back[2], "no scan merged in core");
+    db.settle().unwrap();
+    let h = db.reader().unwrap();
+    for start in (0..keys).step_by(997) {
+        check(&db, &want, start, "after the settle");
+        check(&h, &want, start, "through a handle after the settle");
+    }
+}
+
+/// With the writer's forms given up for the merge path the commit's
+/// maintenance kept nothing, and the first scan after a burst read the
+/// burst's log and built the snapshot of its keys itself. Under
+/// `Options::forms_off_snapshot_kept` the maintenance keeps the merge
+/// path's snapshot to each commit while scans are near: with the upkeep
+/// inline, where a commit's maintenance is done at its return, the scan
+/// after a burst of twenty thousand new keys builds no snapshot and
+/// carries none forward, where without the option it does one or the
+/// other; nothing is kept while the forms are on, since the block path
+/// keeps its own; and nothing far from every scan, the seals' reading of
+/// it, until a scan comes back. Every scan answers as the model, through
+/// the burst with the upkeep lent to its thread as well.
+#[test]
+fn a_burst_with_the_forms_off_has_its_snapshot_kept_for_the_scan_after() {
+    for (case, kept, upkeep) in [
+        ("kept-inline", true, supdb::Upkeep::Inline),
+        ("scan-inline", false, supdb::Upkeep::Inline),
+        ("kept-lent", true, supdb::Upkeep::default()),
+    ] {
+        let d = dir(&format!("forms-off-snap-{case}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                scan_forms_off_unreused: true,
+                scan_forms_off_window: 32,
+                scan_forms_off_ghost_bits: 6,
+                // The reading stands through the small commits below.
+                scan_forms_off_stale_writes: 0,
+                forms_off_snapshot_kept: kept,
+                zpages: supdb::ZPages::Off,
+                partition_bytes: Some(256 << 10),
+                seal_bytes: 2 << 20,
+                upkeep,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let keys = 100_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+            want.insert(key(k), "0".into());
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(db.levels().0 > 1, "{case}: partitions for the forms");
+        let check = |r: &Reader, want: &BTreeMap<Vec<u8>, String>, start: u32, when: &str| {
+            let mut got: Vec<(Vec<u8>, String)> = Vec::new();
+            r.scan(
+                &key(start),
+                20,
+                kv(&mut |k, v| {
+                    got.push((k.to_vec(), std::str::from_utf8(v).unwrap().to_string()));
+                }),
+            )
+            .unwrap();
+            let expect: Vec<(Vec<u8>, String)> = want
+                .range(key(start)..)
+                .take(20)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            assert_eq!(got, expect, "{case}: scan from {start} {when}");
+        };
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut round = 0u32;
+        // A commit of `n` writes: half updates anywhere, half new keys
+        // anywhere, so that a burst of them creates keys the snapshot has
+        // to take in.
+        let mut write = |db: &mut Db,
+                         want: &mut BTreeMap<Vec<u8>, String>,
+                         next: &mut dyn FnMut() -> u64,
+                         n: u32| {
+            round += 1;
+            for i in 0..n {
+                let mut k = key((next() % keys as u64) as u32);
+                if i % 2 == 1 {
+                    k.extend_from_slice(format!("-{round}-{i}").as_bytes());
+                }
+                db.put(&k, format!("w{round}").as_bytes());
+                want.insert(k, format!("w{round}"));
+            }
+            db.commit().unwrap();
+        };
+        // In core the forms are kept and the block path keeps its own
+        // snapshot: the option keeps nothing.
+        for i in 0..64 {
+            check(&db, &want, (next() % keys as u64) as u32, "in core");
+            if i % 8 == 0 {
+                write(&mut db, &mut want, &mut next, 50);
+            }
+        }
+        db.settle().unwrap();
+        assert_eq!(db.forms_off_counts(), [0, 0, 0], "{case}: in core");
+        assert_eq!(
+            db.snapshots_kept(),
+            0,
+            "{case}: nothing kept with the forms on"
+        );
+        // Out of core, starts uniform: the forms given up.
+        db.zgate_set(2);
+        for i in 0..256 {
+            check(&db, &want, (next() % keys as u64) as u32, "uniform");
+            if i % 8 == 0 {
+                write(&mut db, &mut want, &mut next, 50);
+            }
+        }
+        let c = db.forms_off_counts();
+        assert!(c[0] > c[1], "{case}: the forms off: {c:?}");
+        // The burst: forty commits of a thousand writes, five hundred new
+        // keys each, and no scan between them.
+        for _ in 0..40 {
+            write(&mut db, &mut want, &mut next, 1000);
+        }
+        assert_eq!(db.forms_off_counts(), c, "{case}: off through the burst");
+        if kept {
+            if upkeep != supdb::Upkeep::Inline {
+                db.settle().unwrap();
+            }
+            assert!(
+                db.snapshots_kept() >= 30,
+                "{case}: kept at the burst's commits: {}",
+                db.snapshots_kept()
+            );
+        } else {
+            assert_eq!(db.snapshots_kept(), 0, "{case}: the option off");
+        }
+        // The first scan after the burst: with the snapshot kept to the
+        // last commit it builds none and carries none forward.
+        let made = |db: &Db| db.snapshot_builds() + db.snapshot_extends();
+        let before = made(&db);
+        check(&db, &want, (next() % keys as u64) as u32, "after the burst");
+        let by_scan = made(&db) - before;
+        if upkeep == supdb::Upkeep::Inline {
+            if kept {
+                assert_eq!(by_scan, 0, "{case}: the scan found its snapshot kept");
+            } else {
+                assert!(by_scan >= 1, "{case}: the scan made its snapshot");
+            }
+        }
+        for start in (0..keys).step_by(1009) {
+            check(&db, &want, start, "after the burst, everywhere");
+        }
+        // Far from every scan, by the seals' reading: two stores' worth
+        // of writes sealed since the last scan, and nothing is kept until
+        // a scan comes back. Updates alone, so that the store the writes
+        // are counted against stays the size it is.
+        if kept && upkeep == supdb::Upkeep::Inline {
+            let mut rewrite = |db: &mut Db, want: &mut BTreeMap<Vec<u8>, String>, tag: &str| {
+                for _ in 0..1000 {
+                    let k = key((next() % keys as u64) as u32);
+                    db.put(&k, tag.as_bytes());
+                    want.insert(k, tag.to_string());
+                }
+                db.commit().unwrap();
+            };
+            for r in 0..600u32 {
+                rewrite(&mut db, &mut want, &format!("f{r}"));
+            }
+            db.settle().unwrap();
+            let far = db.snapshots_kept();
+            for r in 0..8u32 {
+                rewrite(&mut db, &mut want, &format!("g{r}"));
+            }
+            assert_eq!(
+                db.snapshots_kept(),
+                far,
+                "{case}: nothing kept far from every scan"
+            );
+            assert_eq!(db.forms_off_counts()[..2], c[..2], "{case}: off throughout");
+            check(&db, &want, 77, "a scan again");
+            if db.forms_off_counts()[0] > db.forms_off_counts()[1] {
+                rewrite(&mut db, &mut want, "h");
+                assert!(
+                    db.snapshots_kept() > far,
+                    "{case}: kept again once a scan has come"
+                );
+            }
+            for start in (0..keys).step_by(1009) {
+                check(&db, &want, start, "at the end");
+            }
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// The reading that gave the forms up is of the writer's last window of
+/// scans, and it is stale once the writer has made
+/// `Options::scan_forms_off_stale_writes` writes in a row in small commits
+/// with no scan between them: the commit that crosses the line takes the
+/// forms back, the commits after it file their writes, and the next scan is
+/// the block path's. A scan between the commits starts the count again,
+/// since the regime decides at every scan, and so does a burst's batch,
+/// whose filing would be the writer's to pay; with the line at zero the
+/// forms stay off until a scan, the shape before.
+#[test]
+fn forms_given_up_are_taken_back_by_a_stretch_of_small_commits_with_no_scan() {
+    for (case, stale, upkeep) in [
+        ("stale-inline", 150u32, supdb::Upkeep::Inline),
+        ("stale-lent", 150, supdb::Upkeep::default()),
+        ("kept", 0, supdb::Upkeep::Inline),
+    ] {
+        let d = dir(&format!("forms-off-{case}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                scan_forms_off_unreused: true,
+                scan_forms_off_stale_writes: stale,
+                scan_forms_off_window: 32,
+                scan_forms_off_ghost_bits: 6,
+                zpages: supdb::ZPages::Off,
+                partition_bytes: Some(256 << 10),
+                upkeep,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let keys = 100_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+            want.insert(key(k), "0".into());
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(
+            db.levels().0 > 1,
+            "{case}: partitions for the forms to hang on"
+        );
+        let check = |r: &Reader, want: &BTreeMap<Vec<u8>, String>, start: u32, when: &str| {
+            let mut got: Vec<(Vec<u8>, String)> = Vec::new();
+            r.scan(
+                &key(start),
+                20,
+                kv(&mut |k, v| {
+                    got.push((k.to_vec(), std::str::from_utf8(v).unwrap().to_string()));
+                }),
+            )
+            .unwrap();
+            let expect: Vec<(Vec<u8>, String)> = want
+                .range(key(start)..)
+                .take(20)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            assert_eq!(got, expect, "{case}: scan from {start} {when}");
+        };
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut round = 0u32;
+        // A commit of `n` writes: updates anywhere and new keys among the
+        // starts the scans after the switch read.
+        let mut write = |db: &mut Db,
+                         want: &mut BTreeMap<Vec<u8>, String>,
+                         next: &mut dyn FnMut() -> u64,
+                         n: u32| {
+            round += 1;
+            for i in 0..n {
+                let k = if i % 2 == 0 {
+                    key((next() % keys as u64) as u32)
+                } else {
+                    let mut k = key(2_000 + (next() % 40) as u32);
+                    k.extend_from_slice(format!("-{round}-{i}").as_bytes());
+                    k
+                };
+                db.put(&k, format!("w{round}").as_bytes());
+                want.insert(k, format!("w{round}"));
+            }
+            db.commit().unwrap();
+        };
+        // Out of core, starts uniform over 1,500 blocks in a table of 64
+        // slots: the forms given up.
+        db.zgate_set(2);
+        for i in 0..256 {
+            check(&db, &want, (next() % keys as u64) as u32, "uniform");
+            if i % 8 == 0 {
+                write(&mut db, &mut want, &mut next, 50);
+            }
+        }
+        let off = db.forms_off_counts();
+        assert_eq!(off[0], off[1] + 1, "{case}: the forms given up: {off:?}");
+        // A scan between the commits: the regime is deciding, and nothing
+        // is stale however many writes the commits make.
+        for _ in 0..6 {
+            write(&mut db, &mut want, &mut next, 50);
+            check(
+                &db,
+                &want,
+                (next() % keys as u64) as u32,
+                "off, a scan a commit",
+            );
+        }
+        // A burst's batches with no scan between them leave the reading
+        // standing, and a batch of one starts the small commits' count
+        // again: a hundred writes on either side of it are short of the
+        // line.
+        for _ in 0..3 {
+            write(&mut db, &mut want, &mut next, 300);
+        }
+        write(&mut db, &mut want, &mut next, 50);
+        write(&mut db, &mut want, &mut next, 50);
+        write(&mut db, &mut want, &mut next, 300);
+        write(&mut db, &mut want, &mut next, 50);
+        write(&mut db, &mut want, &mut next, 50);
+        assert_eq!(
+            (db.forms_off_stale_exits(), db.forms_off_counts()),
+            (0, [off[0], off[1], db.forms_off_counts()[2]]),
+            "{case}: nothing stale across scans or a burst's batches"
+        );
+        assert_eq!(db.block_cache_size().0, 0, "{case}: no form kept while off");
+        let filed = db.settle_density()[1];
+        // The third small commit in a row crosses the line.
+        write(&mut db, &mut want, &mut next, 50);
+        let now = db.forms_off_counts();
+        if stale == 0 {
+            assert_eq!(
+                (db.forms_off_stale_exits(), now[1]),
+                (0, off[1]),
+                "{case}: kept off until a scan"
+            );
+        } else {
+            assert_eq!(
+                (db.forms_off_stale_exits(), now[1]),
+                (1, off[1] + 1),
+                "{case}: taken back at the commit that crossed the line"
+            );
+        }
+        // The commits after it file their writes where the forms are back,
+        // with no scan to ask for it; inline, where the commit's own fill
+        // is the filing and the count is exact.
+        for _ in 0..3 {
+            write(&mut db, &mut want, &mut next, 50);
+        }
+        if matches!(upkeep, supdb::Upkeep::Inline) {
+            let after = db.settle_density()[1];
+            assert_eq!(
+                after > filed,
+                stale > 0,
+                "{case}: keys filed at the commits, {filed} then {after}"
+            );
+        }
+        assert_eq!(
+            db.forms_off_stale_exits(),
+            u64::from(stale > 0),
+            "{case}: once, the forms being on"
+        );
+        // And the next scan is the block path's, where it was the merge
+        // path's.
+        let merged = db.forms_off_counts()[2];
+        check(&db, &want, 2_010, "after the stretch");
+        assert_eq!(
+            db.forms_off_counts()[2] == merged,
+            stale > 0,
+            "{case}: the scan after the stretch"
+        );
+        // Every answer the model's, through the writer and a handle.
+        db.settle().unwrap();
+        let h = db.reader().unwrap();
+        for start in (0..keys).step_by(997) {
+            check(&db, &want, start, "after the settle");
+            check(&h, &want, start, "through a handle after the settle");
+        }
+    }
+}
+
+/// The writes since the store's last scan are the live tables' logs, each
+/// write counted once. A landing from the segment work publishes a new
+/// generation over the live table it leaves alone, and counted by the
+/// generation both counts -- the commit's hand-over's, which paces a
+/// burst while scans are around, and the pass's, which files only then --
+/// took the table's whole log again at the commit after every landing.
+/// Over a full rewrite the count passed two stores' worth of writes with
+/// one written: the burst's last commits were neither paced nor filed,
+/// and the first scan after it settled them.
+#[test]
+fn the_writes_since_a_scan_are_counted_once_across_a_landing() {
+    for (name, upkeep) in [
+        ("inline", supdb::Upkeep::Inline),
+        ("thread", supdb::Upkeep::Background(1)),
+    ] {
+        let d = dir(&format!("writes-once-{name}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                scan_block_cache: true,
+                partition_bytes: Some(256 << 10),
+                upkeep,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let keys = 20_000u32;
+        let key = |k: u32| format!("key-{k:08}").into_bytes();
+        for k in 0..keys {
+            db.append(&key(k), &[b'v'; 40]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert!(db.levels().0 >= 2, "partitions: {:?}", db.levels());
+        // Rewrites of keys the store holds, in an order that is no run.
+        let mut at = 7u32;
+        let mut write = |db: &mut Db, n: u32| {
+            for _ in 0..n {
+                at = (at.wrapping_mul(7919).wrapping_add(13)) % keys;
+                db.append(&key(at), &[b'w'; 40]);
+            }
+            db.commit().unwrap();
+        };
+        // A scan, and the commit after it, which both counts start from.
+        let mut seen = 0usize;
+        db.scan(&key(0), 50, kv(&mut |_, _| seen += 1)).unwrap();
+        assert_eq!(seen, 50);
+        write(&mut db, 10);
+        let (hand0, pass0) = db.writes_since_scan();
+        // A batch, the table frozen with its seal held before its landing,
+        // a larger batch into the table after it, the landing -- a publish
+        // over that live table -- and a batch more.
+        let (a, b, c) = (300u32, 2_000u32, 300u32);
+        write(&mut db, a);
+        db.hold_seal_landing(true);
+        db.seal().unwrap();
+        write(&mut db, b);
+        assert!(db.in_flight().0, "the seal is in flight, held");
+        db.hold_seal_landing(false);
+        db.settle().unwrap();
+        write(&mut db, c);
+        let (hand, pass) = db.writes_since_scan();
+        let written = (a + b + c) as u64;
+        assert!(
+            pass - pass0 <= written,
+            "{name}: the pass counted {} of {written} written",
+            pass - pass0
+        );
+        if upkeep == supdb::Upkeep::Inline {
+            // Every commit's own maintenance counts.
+            assert_eq!(pass - pass0, written, "{name}: the pass's count");
+        } else {
+            // Every commit hands over, and its batch is its own.
+            assert_eq!(hand - hand0, written, "{name}: the hand-over's count");
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Every file in a store's directory by name, with its bytes: what a
+/// refused open leaves as it found it.
+fn the_directory(d: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(d)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            let name = e.file_name().to_string_lossy().into_owned();
+            (name, std::fs::read(e.path()).unwrap())
+        })
+        .collect()
+}
+
+/// A second open of a store while the first is alive is refused -- `create`
+/// as much as `open` -- before it changes anything in the directory: an
+/// orphan the open would sweep is still there after it. Each open takes the
+/// lock through a description of its own, so a second open in one process
+/// is refused as a second process's is. Once the first is closed, or
+/// crashed, the store opens.
+#[test]
+fn a_second_open_of_a_store_is_refused_until_the_first_is_gone() {
+    let d = dir("second-open");
+    let mut db = Db::create(&d, common::options()).unwrap();
+    for i in 0..1000u32 {
+        db.append(format!("k{i:05}").as_bytes(), b"v");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    // Under the forced form (the stride group's `SUPDB_TEST_STRIDE`) a
+    // partition's form file is built on demand on the segment work's
+    // thread, and a build still writing its temp name between the two
+    // listings below read as a refused open's change: every partition has
+    // its file or its reason before the first.
+    db.zpages_settle().unwrap();
+    std::fs::write(d.join("seg-00000000000000ff.sup"), b"an orphan").unwrap();
+    let before = the_directory(&d);
+    for (what, e) in [
+        ("open", Db::open(&d, common::options()).err()),
+        ("create", Db::create(&d, common::options()).err()),
+    ] {
+        let e = e.unwrap_or_else(|| panic!("a second {what} of a live store"));
+        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{what}: {e}");
+        assert!(e.to_string().contains("LOCK"), "{what}: {e}");
+    }
+    assert_eq!(
+        the_directory(&d),
+        before,
+        "a refused open changed the directory"
+    );
+    db.append(b"k99999", b"after");
+    db.commit().unwrap();
+    db.close().unwrap();
+    let mut db = Db::open(&d, common::options()).unwrap();
+    assert_eq!(db.count(b"k00500").unwrap(), 1);
+    assert_eq!(db.count(b"k99999").unwrap(), 1);
+    assert!(
+        !d.join("seg-00000000000000ff.sup").exists(),
+        "the open that took the lock swept the orphan"
+    );
+    db.append(b"k99998", b"before the crash");
+    db.commit().unwrap();
+    db.crash();
+    let db = Db::open(&d, common::options()).unwrap();
+    assert_eq!(db.count(b"k99998").unwrap(), 1, "a crashed store opens");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The same refusal from another process: this test binary run again on
+/// this one test, with the store's path in `SUPDB_LOCK_PROBE`, opens the
+/// store and says through its exit code what it got. Refused while the
+/// first process holds the store, opened once it has let go.
+#[test]
+fn a_store_open_in_one_process_is_refused_to_another() {
+    const PROBE: &str = "SUPDB_LOCK_PROBE";
+    const TEST: &str = "a_store_open_in_one_process_is_refused_to_another";
+    if let Some(p) = std::env::var_os(PROBE) {
+        let code = match Db::open(std::path::Path::new(&p), common::options()) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 3,
+            Err(_) => 4,
+            Ok(_) => 5,
+        };
+        std::process::exit(code);
+    }
+    let d = dir("lock-process");
+    let probe = |d: &std::path::Path| {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--test-threads", "1", "--nocapture"])
+            .env(PROBE, d)
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let mut db = Db::create(&d, common::options()).unwrap();
+    db.append(b"k", b"v");
+    db.commit().unwrap();
+    let (code, err) = probe(&d);
+    assert_eq!(
+        code,
+        Some(3),
+        "another process's open of a live store: {err}"
+    );
+    db.close().unwrap();
+    let (code, err) = probe(&d);
+    assert_eq!(
+        code,
+        Some(5),
+        "another process's open once the first closed: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A walk of a source's keys against a partition's block boundaries places
+/// a boundary by its head where the head is not the whole of its key, and
+/// reads the boundary's record only on a tie (`Options::bounds_by_heads`):
+/// the bounds are the vector the walk that reads every record makes, and
+/// every scan answers the model.
+///
+/// The keys run in groups of three that share everything a head covers and
+/// differ in their last byte, so a block's boundary -- every sixty-fourth
+/// rank, the first, the second or the third of its group by turns -- has
+/// neighbours on either side inside its head's bracket. The piece over the
+/// partitions writes a quarter of the groups whole again, the boundary's
+/// own key and the keys beside it under one head, and puts three new keys
+/// into another quarter, below the group, inside it and above it; the rest
+/// it leaves, and those boundaries no key of the piece ties with. So the
+/// walk meets a boundary with a source key below it under its head, one
+/// equal to it, one above it, and none, and a walk that took any tie for
+/// the head's verdict would put a key in the block beside its own. A
+/// table of unsealed keys of the same kinds is walked the same way
+/// (`BuildCtx::snap_bounds`), and held by the scans.
+///
+/// Near reads the landing walks the bounds, through the raw form's records
+/// (`bound_pieces_of`); far from them a handle's tables do, through the
+/// reader's (`BuildCtx::table_bounds`). Both are run.
+#[test]
+fn a_bounds_walk_places_a_boundary_by_its_head_and_reads_its_record_only_on_a_tie() {
+    const TAILS: [&str; 3] = ["tail-of-a-key-a", "tail-of-a-key-c", "tail-of-a-key-e"];
+    const NEW: [&str; 3] = ["tail-of-a-key-0", "tail-of-a-key-b", "tail-of-a-key-z"];
+    let groups = 10_000u32;
+    let key = |g: u32, tail: &str| format!("{g:07}/{tail}").into_bytes();
+    let all = |r: &Reader| {
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        r.scan(
+            b"",
+            usize::MAX,
+            kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+        )
+        .unwrap();
+        got
+    };
+    for near in [true, false] {
+        let mut bounds: Vec<Vec<(usize, usize, Vec<u32>)>> = Vec::new();
+        let mut counts: Vec<(u64, u64)> = Vec::new();
+        for on in [true, false] {
+            let d = dir(&format!("bounds-by-heads-{near}-{on}"));
+            let mut db = Db::create(
+                &d,
+                Options {
+                    zpages: supdb::ZPages::Off,
+                    partition_bytes: Some(64 << 10),
+                    // One seal's pieces stand until the test is done.
+                    seal_bytes: 1 << 30,
+                    l0_trigger: 1 << 20,
+                    scan_block_cache: true,
+                    bounds_by_heads: on,
+                    ..common::options()
+                },
+            )
+            .unwrap();
+            let mut want: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+            for g in 0..groups {
+                for t in TAILS {
+                    db.append(&key(g, t), b"loaded");
+                    want.insert(key(g, t), b"loaded".to_vec());
+                }
+                if g % 500 == 499 {
+                    db.commit().unwrap();
+                }
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+            assert!(db.levels().0 > 4, "partitions: {:?}", db.levels());
+            if near {
+                // A scan, so the seal after it lands near reads.
+                let mut n = 0;
+                db.scan(b"", 5, kv(&mut |_, _| n += 1)).unwrap();
+                assert_eq!(n, 5);
+            }
+            let write = |db: &mut Db, want: &mut BTreeMap<Vec<u8>, Vec<u8>>, round: u32| {
+                let v = format!("round-{round}").into_bytes();
+                for g in 0..groups {
+                    match (g + round) % 4 {
+                        0 => {
+                            for t in TAILS {
+                                db.put(&key(g, t), &v);
+                                want.insert(key(g, t), v.clone());
+                            }
+                        }
+                        2 => {
+                            for t in NEW {
+                                db.put(&key(g, t), &v);
+                                want.insert(key(g, t), v.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                db.commit().unwrap();
+            };
+            write(&mut db, &mut want, 0);
+            let before = db.zpage_counts();
+            db.seal().unwrap();
+            db.settle().unwrap();
+            assert!(db.levels().1 > 0, "a piece stands");
+            let landed = db.zpage_counts();
+            assert_eq!(
+                landed.land_bound_walks > before.land_bound_walks,
+                near,
+                "the landing walks the bounds near reads and not far from them: {landed:?}"
+            );
+            let h = db.reader().unwrap();
+            let expect: Vec<(Vec<u8>, Vec<u8>)> =
+                want.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            assert!(all(&h) == expect, "a handle over the piece, {near} {on}");
+            assert!(all(&db) == expect, "the writer over the piece, {near} {on}");
+            let c = db.zpage_counts();
+            if on {
+                assert!(
+                    c.bounds_by_head > 0 && c.bounds_records > 0,
+                    "boundaries placed by the head, and records read on ties: {c:?}"
+                );
+                // A quarter of the groups written again and a quarter
+                // written into: about half the boundaries tie, and by no
+                // count all of them.
+                assert!(
+                    c.bounds_records < 3 * c.bounds_by_head
+                        && c.bounds_by_head < 3 * c.bounds_records,
+                    "{c:?}"
+                );
+            } else {
+                assert!(
+                    c.bounds_by_head == 0 && c.bounds_records > 0,
+                    "every boundary a record with the option off: {c:?}"
+                );
+            }
+            counts.push((c.bounds_by_head, c.bounds_records));
+            let mut b = h.piece_bounds();
+            b.sort();
+            assert!(
+                b.len() > 4 && b.iter().all(|(_, _, at)| at.len() > 2),
+                "bounds for every partition the piece meets: {}",
+                b.len()
+            );
+            bounds.push(b);
+            // Unsealed keys of the same kinds over the piece: the snapshot's
+            // walk against the same boundaries.
+            write(&mut db, &mut want, 1);
+            let expect: Vec<(Vec<u8>, Vec<u8>)> =
+                want.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            assert!(all(&h) == expect, "a handle over the unsealed, {near} {on}");
+            assert!(
+                all(&db) == expect,
+                "the writer over the unsealed, {near} {on}"
+            );
+            // And from every third boundary's neighbourhood, short windows.
+            for g in (0..groups).step_by(211) {
+                for t in [TAILS[0], NEW[1], TAILS[2]] {
+                    let from = key(g, t);
+                    let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                    h.scan(
+                        &from,
+                        70,
+                        kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+                    )
+                    .unwrap();
+                    let expect: Vec<(Vec<u8>, Vec<u8>)> = want
+                        .range(from.clone()..)
+                        .take(70)
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    assert!(got == expect, "a window from group {g} {t}, {near} {on}");
+                }
+            }
+            drop(h);
+            db.close().unwrap();
+            let _ = std::fs::remove_dir_all(&d);
+        }
+        assert!(
+            bounds[0] == bounds[1],
+            "the bounds by the heads are the bounds by the records, near {near}"
+        );
+        // One store walked twice: what the heads placed and the ties read
+        // are together the records the other walk read.
+        assert_eq!(
+            counts[0].0 + counts[0].1,
+            counts[1].1,
+            "the two walks' boundaries, near {near}: {counts:?}"
+        );
+    }
+}
+
+/// A landing near reads walks its pieces' bounds before it publishes, for
+/// the tables that will read them, and leaves them where no table stands to
+/// (`Options::land_bounds_read`): while the writer has given its block
+/// forms up (`scan_forms_off_unreused`) and no handle is live. A handle
+/// claimed after such a landing walks what its tables need and answers the
+/// model, and a landing beside a live handle walks them as before. Off,
+/// every landing near reads walks them, the writer's forms given up or
+/// not.
+#[test]
+fn a_landing_leaves_its_pieces_bounds_where_no_table_stands_to_read_them() {
+    for on in [true, false] {
+        let d = dir(&format!("land-bounds-read-{on}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                scan_forms_off_unreused: true,
+                scan_forms_off_window: 32,
+                scan_forms_off_ghost_bits: 6,
+                zpages: supdb::ZPages::Off,
+                partition_bytes: Some(256 << 10),
+                seal_bytes: 1 << 30,
+                l0_trigger: 1 << 20,
+                scan_block_cache: true,
+                land_bounds_read: on,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let keys = 100_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+            want.insert(key(k), "0".into());
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        let parts = db.levels().0;
+        assert!(parts > 1, "partitions for the forms to hang on");
+        let check = |r: &Reader, want: &BTreeMap<Vec<u8>, String>, start: u32, when: &str| {
+            let mut got: Vec<(Vec<u8>, String)> = Vec::new();
+            r.scan(
+                &key(start),
+                20,
+                kv(&mut |k, v| {
+                    got.push((k.to_vec(), std::str::from_utf8(v).unwrap().to_string()));
+                }),
+            )
+            .unwrap();
+            let expect: Vec<(Vec<u8>, String)> = want
+                .range(key(start)..)
+                .take(20)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            assert_eq!(got, expect, "scan from {start} {when}, {on}");
+        };
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        // A piece's worth of updates over every partition.
+        let write = |db: &mut Db, want: &mut BTreeMap<Vec<u8>, String>, round: u32| {
+            for k in (round % 7..keys).step_by(7) {
+                db.put(&key(k), format!("w{round}").as_bytes());
+                want.insert(key(k), format!("w{round}"));
+            }
+            db.commit().unwrap();
+        };
+        // In core the writer keeps its forms, and a landing near its
+        // scans walks the bounds its tables read, handle or none.
+        check(&db, &want, 0, "in core");
+        let before = db.zpage_counts();
+        write(&mut db, &mut want, 0);
+        db.seal().unwrap();
+        db.settle().unwrap();
+        assert_eq!(db.levels().1, parts, "a piece over every partition");
+        let after = db.zpage_counts();
+        assert_eq!(
+            (
+                after.land_bound_walks - before.land_bound_walks,
+                after.land_bounds_left - before.land_bounds_left
+            ),
+            (parts as u64, 0),
+            "the writer's forms kept: the landing walks its bounds: {after:?}"
+        );
+        assert_eq!(db.piece_bounds().len(), parts);
+        // Out of core by hand, starts uniform over the blocks: the writer
+        // gives its forms up.
+        db.zgate_set(2);
+        for _ in 0..256 {
+            check(&db, &want, (next() % keys as u64) as u32, "uniform");
+        }
+        let c = db.forms_off_counts();
+        assert!(c[0] >= 1 && c[0] > c[1], "the forms given up: {c:?}");
+        // A seal lands near those scans with nothing to read its bounds.
+        let before = db.zpage_counts();
+        write(&mut db, &mut want, 1);
+        db.seal().unwrap();
+        db.settle().unwrap();
+        assert_eq!(db.levels().1, 2 * parts, "a second piece over each");
+        let c = db.forms_off_counts();
+        assert!(c[0] > c[1], "the forms still given up: {c:?}");
+        let after = db.zpage_counts();
+        let (walked, left) = (
+            after.land_bound_walks - before.land_bound_walks,
+            after.land_bounds_left - before.land_bounds_left,
+        );
+        if on {
+            assert_eq!(
+                (walked, left > 0),
+                (0, true),
+                "the landing left its bounds: {after:?}"
+            );
+            assert_eq!(
+                db.piece_bounds().len(),
+                parts,
+                "no bounds on the pieces it landed"
+            );
+        } else {
+            assert_eq!(
+                (walked, left),
+                (parts as u64, 0),
+                "the landing walked a piece against every partition: {after:?}"
+            );
+        }
+        for _ in 0..16 {
+            check(&db, &want, (next() % keys as u64) as u32, "the merge path");
+        }
+        // A handle claimed: its tables walk what the landing left, and it
+        // answers the model.
+        let h = db.reader().unwrap();
+        for start in (0..keys).step_by(4999) {
+            check(&h, &want, start, "a handle after the landing");
+        }
+        assert!(
+            h.piece_bounds().len() > parts,
+            "the handle's tables walked the bounds they read"
+        );
+        drop(h);
+        // A handle claimed while a seal is in flight, the writer's forms
+        // still given up and no commit of its since to take them back: the
+        // landing walks its bounds for the handle's tables either way.
+        db.hold_seal_landing(true);
+        write(&mut db, &mut want, 2);
+        db.seal().unwrap();
+        assert_eq!(db.frozen_tables(), 1, "the seal in flight");
+        let h = db.reader().unwrap();
+        let c = db.forms_off_counts();
+        assert!(c[0] > c[1], "the writer's forms still given up: {c:?}");
+        let before = db.zpage_counts();
+        db.hold_seal_landing(false);
+        db.settle().unwrap();
+        let after = db.zpage_counts();
+        assert!(
+            after.land_bound_walks > before.land_bound_walks,
+            "a landing beside a live handle walks its bounds: {after:?}"
+        );
+        assert_eq!(
+            after.land_bounds_left, before.land_bounds_left,
+            "and leaves none: {after:?}"
+        );
+        for start in (0..keys).step_by(3331) {
+            check(&h, &want, start, "a handle after the landing beside it");
+            check(&db, &want, start, "the writer after the landing beside it");
+        }
+        drop(h);
+        // The handle gone and the scans back in one block: the writer has
+        // its forms, by its own reading this time, and the landing after
+        // walks its bounds for them.
+        let taken = db.forms_off_counts();
+        for _ in 0..512 {
+            check(&db, &want, 2_000 + (next() % 30) as u32, "hot");
+        }
+        let c = db.forms_off_counts();
+        assert_eq!(c[0], c[1], "the forms kept: {taken:?} {c:?}");
+        let before = db.zpage_counts();
+        write(&mut db, &mut want, 3);
+        db.seal().unwrap();
+        db.settle().unwrap();
+        let after = db.zpage_counts();
+        assert!(
+            after.land_bound_walks > before.land_bound_walks
+                && after.land_bounds_left == before.land_bounds_left,
+            "the forms taken back: the landing walks its bounds: {after:?}"
+        );
+        for start in (0..keys).step_by(2777) {
+            check(&db, &want, start, "the writer after the last landing");
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

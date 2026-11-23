@@ -21,7 +21,7 @@ use crate::gate;
 use crate::hist::Hist;
 use crate::ledger::{Head, Ledger, RepState};
 use crate::row::{Guarantee, Kill, MachineInfo, Measurement, Resumption, Row};
-use crate::workload::{db_key_into, KeyDist, KeyGen, Payload, Permutation, Rng};
+use crate::workload::{db_key_into, KeyDist, KeyGen, KeyMap, KeyShape, Payload, Permutation, Rng};
 use crate::{ladder_from, Scale};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -78,7 +78,7 @@ pub fn threaded_quantity(base: &str, threads: usize) -> String {
 /// single-threaded quantity.
 pub fn threads_of(quantity: &str) -> Option<usize> {
     let (base, count) = quantity.rsplit_once('_')?;
-    if !matches!(base, "reads_per_s" | "entries_per_s") {
+    if !matches!(base, "reads_per_s" | "entries_per_s" | "ops_per_s") {
         return None;
     }
     count.strip_suffix('t')?.parse().ok()
@@ -142,11 +142,25 @@ pub struct Passes {
     pub scan_threaded: bool,
     pub mixes: bool,
     pub scan_mixed: bool,
+    /// The second mix family, `ycsbs-A..F`, after `scan-mixed`.
+    pub mixes_scrambled: bool,
     pub lag: bool,
+    /// The recovery workloads, `recover` and `recover-shuffled`, each on
+    /// a store of its own that a process loaded and was killed over
+    /// (`recover_store`). Absent from a plan written before the
+    /// workloads, where it reads as off.
+    #[serde(default)]
+    pub recover: bool,
+    /// The threaded mixes, `threads-A` and its kin (`THREADED`): gets and
+    /// puts from several threads at once, on a store of their own. In no
+    /// row of the series: off in `all`, and run where `--passes` names
+    /// them, for what they cost every arm (`DESIGN.md`).
+    #[serde(default)]
+    pub mixes_threaded: bool,
 }
 
 impl Passes {
-    pub const NAMES: [&'static str; 8] = [
+    pub const NAMES: [&'static str; 11] = [
         "load",
         "read",
         "read-threaded",
@@ -154,7 +168,10 @@ impl Passes {
         "scan-threaded",
         "mixes",
         "scan-mixed",
+        "mixes-scrambled",
         "lag",
+        "recover",
+        "mixes-threaded",
     ];
 
     pub fn all() -> Passes {
@@ -166,7 +183,20 @@ impl Passes {
             scan_threaded: true,
             mixes: true,
             scan_mixed: true,
+            mixes_scrambled: true,
             lag: true,
+            recover: true,
+            mixes_threaded: false,
+        }
+    }
+
+    /// What a pairing runs where it names no passes (`bench ab`): every
+    /// pass but the recovery workloads, which load two stores more an arm
+    /// a rep and are run by the pairing that asks for them.
+    pub fn paired() -> Passes {
+        Passes {
+            recover: false,
+            ..Passes::all()
         }
     }
 
@@ -181,7 +211,10 @@ impl Passes {
             scan_threaded: false,
             mixes: false,
             scan_mixed: false,
+            mixes_scrambled: false,
             lag: false,
+            recover: false,
+            mixes_threaded: false,
         };
         let mut any = false;
         for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -194,7 +227,10 @@ impl Passes {
                 "scan-threaded" => p.scan_threaded = true,
                 "mixes" => p.mixes = true,
                 "scan-mixed" => p.scan_mixed = true,
+                "mixes-scrambled" => p.mixes_scrambled = true,
                 "lag" => p.lag = true,
+                "recover" => p.recover = true,
+                "mixes-threaded" => p.mixes_threaded = true,
                 other => {
                     return Err(format!(
                         "no pass named {other:?}; the passes are {}",
@@ -261,6 +297,11 @@ pub struct Plan {
     /// 0.0 stores the same number of bytes that nothing can shrink, which is
     /// what a compact form of the records is priced against.
     pub compress: f64,
+    /// What the stores' keys are (`KeyShape`): db_bench's numbered keys in
+    /// every row of the series so far, or random ids, over which the same
+    /// workloads run from the same indexes (`Plan::keymap`).
+    #[serde(default)]
+    pub keys: KeyShape,
     /// The memory bound the run measures under, entered before the plan
     /// was made (`bound::Bound`), or none.
     pub bound: Option<Bound>,
@@ -299,10 +340,23 @@ impl Plan {
                 Scale::Quick | Scale::Full => 1,
             },
             compress: 0.5,
+            keys: KeyShape::Numbered,
             bound: None,
-            passes: Passes::all(),
+            // The recovery workloads are the in-core scales' until a
+            // bounded row is taken with them on purpose: each loads two
+            // stores more a rep, and a bounded roster's hours are counted.
+            passes: if scale == Scale::Ooc {
+                Passes::paired()
+            } else {
+                Passes::all()
+            },
             fresh_process: scale == Scale::Ooc,
         }
+    }
+
+    /// The keys of a store loaded with `size` of them under this plan.
+    pub fn keymap(&self, size: u64) -> KeyMap {
+        KeyMap::new(self.keys, size)
     }
 
     /// `n` operations under `ops_div`: `n` itself at a divisor of one,
@@ -325,10 +379,10 @@ impl Plan {
 
 /// YCSB's core workloads: (letter, read %, update %, insert %, scan %,
 /// read-modify-write %, key distribution). Theta 0.99 for the Zipfian, as
-/// in the original. D's reads are uniform over the loaded keys rather than
-/// skewed to the latest inserts: the latest distribution needs a Zipfian
-/// over a count that grows with every insert, and the cost of tracking
-/// that is not a cost the engines should be charged for.
+/// in the original. This family's Zipfian is over the key space itself, so
+/// its hot keys are the lowest keys, contiguous, and D's reads are uniform
+/// over the loaded keys; it is the family every row so far carries, and it
+/// does not change. `YCSBS` is the family with YCSB's own distributions.
 const YCSB: [(char, u32, u32, u32, u32, u32, KeyDist); 6] = [
     ('A', 50, 50, 0, 0, 0, KeyDist::Zipfian),
     ('B', 95, 5, 0, 0, 0, KeyDist::Zipfian),
@@ -337,12 +391,76 @@ const YCSB: [(char, u32, u32, u32, u32, u32, KeyDist); 6] = [
     ('E', 0, 0, 5, 95, 0, KeyDist::Zipfian),
     ('F', 50, 0, 0, 0, 50, KeyDist::Zipfian),
 ];
+/// The same six mixes with YCSB's key distributions, the workloads
+/// `ycsbs-A..F`: the scrambled Zipfian for A, B, C, E and F, whose hot
+/// keys are spread over the space (`KeyDist::Scrambled`), and the latest
+/// distribution for D, whose reads are skewed to the newest inserts over a
+/// count that grows as they commit (`KeyDist::Latest`). The family runs
+/// after `scan-mixed`, on the store the first family leaves, so every
+/// quantity before it is of the store it was of before the family existed.
+const YCSBS: [(char, u32, u32, u32, u32, u32, KeyDist); 6] = [
+    ('A', 50, 50, 0, 0, 0, KeyDist::Scrambled),
+    ('B', 95, 5, 0, 0, 0, KeyDist::Scrambled),
+    ('C', 100, 0, 0, 0, 0, KeyDist::Scrambled),
+    ('D', 95, 0, 5, 0, 0, KeyDist::Latest),
+    ('E', 0, 0, 5, 95, 0, KeyDist::Scrambled),
+    ('F', 50, 0, 0, 0, 50, KeyDist::Scrambled),
+];
 /// The order the six run in on one store: the read-only mix first, on the
 /// store as loaded, and the two that insert last, so no earlier workload
 /// reads a store another has grown.
 const YCSB_ORDER: [char; 6] = ['C', 'B', 'A', 'F', 'D', 'E'];
+/// The salt on the second family's key seeds; the first family's seeds are
+/// the ones every row so far drew with, unsalted.
+const YCSBS_SEED_SALT: u64 = 0x5300;
 const YCSB_BATCH: usize = 100;
 const YCSB_SCAN: usize = 50;
+
+/// What each operation of a threaded mix is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadedMix {
+    /// Half point reads and half updates, YCSB's A.
+    HalfUpdates,
+    /// Every operation a read-modify-write: the key's value read and then
+    /// replaced.
+    Rmw,
+}
+
+/// The threaded mixes, the workloads `threads-A`, `threads-A-uniform`,
+/// `threads-RMW` and `threads-RMW-uniform`: point gets and puts from
+/// several threads at once, which no other workload here has -- the
+/// threaded passes read with the writer idle, and the mixes write from
+/// one thread. They are the two workloads FASTER's own benchmark runs
+/// (`cc/benchmark-dir`: 50:50 reads and upserts, and 100% read-modify-
+/// write), each under YCSB's Zipfian (`KeyDist::Scrambled`) and uniform,
+/// as that benchmark's key files are. Every key is one the load wrote:
+/// the mixes update and never insert, so the store they leave holds what
+/// it held.
+///
+/// They run on a store of their own, loaded in key order and synced, each
+/// on one thread and then on each count of `Plan::threads`,
+/// `Plan::divided(size)` operations a thread, as the threaded reads run:
+/// the quantities `ops_per_s_1t`, `ops_per_s_2t` and so on. In table
+/// order on the store the one before leaves, so a cell is that workload at
+/// that point of the sequence for every engine alike, and a rate's growth
+/// from one count to the next carries the store's history as well as the
+/// threads: an engine that pays more for a key's first update than for its
+/// later ones pays most of it in the first cells.
+const THREADED: [(&str, ThreadedMix, KeyDist); 4] = [
+    ("A", ThreadedMix::HalfUpdates, KeyDist::Scrambled),
+    ("A-uniform", ThreadedMix::HalfUpdates, KeyDist::Uniform),
+    ("RMW", ThreadedMix::Rmw, KeyDist::Scrambled),
+    ("RMW-uniform", ThreadedMix::Rmw, KeyDist::Uniform),
+];
+const THREADED_MIX_SEED: u64 = 0x7417;
+
+/// The seeds the read and scan passes draw their keys with, named once
+/// since `replay_row` draws the same keys for a model of a store.
+const READ_SEED: u64 = 7;
+const SCAN_SEED: u64 = 11;
+const READ_THREADED_SEED: u64 = 0x7EAD;
+const SCAN_THREADED_SEED: u64 = 0x5CA0;
+const SCAN_MIXED_SEED: u64 = 0x5CA1;
 
 /// A workload's operation count at a rung: a sixth of the keys, so the six
 /// mixes together cost about one read pass. At a third, `quick` took twice
@@ -453,6 +571,39 @@ pub fn thread_switches() -> (u64, u64) {
 }
 
 /// This thread's minor page faults so far.
+/// Major faults so far of this process's threads named `comm`, and of this
+/// thread: `[upkeep, segment work, this thread]` for the lag sweep's
+/// `lagmajflt` line. A thread that has ended took its count with it, so
+/// the two named are the store's long-lived ones and a job's thread, a
+/// seal's or a merge's, is in neither.
+pub fn lag_majflt() -> [u64; 3] {
+    let of = |comm: &str| -> u64 {
+        let Ok(rd) = std::fs::read_dir("/proc/self/task") else {
+            return 0;
+        };
+        let mut total = 0u64;
+        for e in rd.flatten() {
+            let p = e.path();
+            if std::fs::read_to_string(p.join("comm"))
+                .unwrap_or_default()
+                .trim()
+                != comm
+            {
+                continue;
+            }
+            if let Ok(stat) = std::fs::read_to_string(p.join("stat")) {
+                total += stat_majflt(&stat).unwrap_or(0);
+            }
+        }
+        total
+    };
+    [
+        of("supdb-upkeep"),
+        of("supdb-maint"),
+        majflt_self().unwrap_or(0),
+    ]
+}
+
 pub fn minflt_self() -> u64 {
     std::fs::read_to_string("/proc/thread-self/stat").map_or(0, |s| stat_minflt(&s))
 }
@@ -504,7 +655,15 @@ pub fn phase_mark(arm: &str, phase: &str, edge: &str) {
 /// the snapshots and the walks by form, the store's shape after, and the
 /// compact form's reads, decodes, scan walks and groups, memo hits and
 /// misses and prefetch asks over the window, so that a mix's cost under
-/// the form is read beside its time by kind. The lag sweep prints one a
+/// the form is read beside its time by kind, and the upkeep thread's pass
+/// by its steps (`Db::pass_steps`), the fills and the fills cut for the
+/// writer, so that a scan's wait for the pass in flight is read against
+/// the step it waited out, and the fills left for a later pass beside the
+/// passes that were due by one alone (`Db::fill_deferred`,
+/// `Db::fill_owed_due`), and the stride form's reads, first-touch checks,
+/// cursor values and builds over the window beside the stride files the
+/// store holds after it (`zs`), so that a stride arm's cell is read by the
+/// form that served it. The lag sweep prints one a
 /// point (`SUPDB_LAG_COUNTERS`) and the mixes one a mix
 /// (`SUPDB_MIX_COUNTERS`).
 fn counters_line(
@@ -519,7 +678,7 @@ fn counters_line(
     let get = |c: &[(&str, f64)], n: &str| c.iter().find(|(k, _)| *k == n).map_or(0.0, |(_, v)| *v);
     let d = |n: &str| get(c1, n) - get(c0, n);
     eprintln!(
-        "{tag} {arm} {point} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {burst_ms:.1} pass_ms {pass_ms:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p holds {:.0}/{:.1}ms maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0} | z reads {:.0} dec {:.0} scans {:.0} groups {:.0} memo {:.0}/{:.0} pf {:.0}",
+        "{tag} {arm} {point} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {burst_ms:.1} pass_ms {pass_ms:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p holds {:.0}/{:.1}ms maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} stood {:.0} dropped_mb {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0} | z reads {:.0} dec {:.0} scans {:.0} groups {:.0} memo {:.0}/{:.0} pf {:.0} | steps settle {:.1} snap {:.1} fillwalk {:.1} fillbuild {:.1} ms fills {:.0} cuts {:.0} left {:.0} owed {:.0} | zs reads {:.0} checks {:.0} cursor {:.0} builds {:.0} files {:.0}",
         mem_free_mb(),
         d("scan_take_us") / 1e3,
         d("scan_sync_us") / 1e3,
@@ -538,6 +697,8 @@ fn counters_line(
         d("forms_cloned"),
         d("snapshot_builds"),
         d("snapshot_refreshes"),
+        d("snapshots_stood"),
+        d("merge_dropped_mb"),
         d("walk_copy"),
         d("walk_sparse"),
         d("walk_other"),
@@ -552,7 +713,20 @@ fn counters_line(
         d("zpage_scan_groups"),
         d("zpage_memo_hits"),
         d("zpage_memo_misses"),
-        d("zpage_prefetches")
+        d("zpage_prefetches"),
+        d("pass_settle_us") / 1e3,
+        d("pass_snap_us") / 1e3,
+        d("pass_fillwalk_us") / 1e3,
+        d("pass_fillbuild_us") / 1e3,
+        d("fill_passes"),
+        d("fill_cuts"),
+        d("fill_deferred"),
+        d("fill_owed_due"),
+        d("zpage_stride_reads"),
+        d("zpage_stride_page_checks"),
+        d("zpage_stride_cursor_reads"),
+        d("zpage_stride_builds"),
+        get(c1, "zpage_stride_files_at_end")
     );
     // The process's memory beside the structures that count their own: the
     // resident bytes, what the allocator has handed out and what it holds
@@ -601,13 +775,27 @@ fn counters_line(
             "install_slot_skip",
             "fill_from_form",
             "convert_total_us",
+            "pass_settle_us",
+            "pass_snap_us",
+            "pass_fillwalk_us",
+            "pass_fillbuild_us",
+            "fill_walked",
+            "fill_passes",
+            "fill_cuts",
+            "ahead_skip_cold",
             "upkeep_partial",
             "upkeep_skipped",
             "upkeep_passes",
             "forms_rebased",
+            "forms_recut",
+            "deltas_recut",
+            "settle_built",
+            "settle_shed",
+            "settle_sheds_declined",
             "forms_cloned",
             "form_takes",
             "snapshot_builds",
+            "snapshots_stood",
             "snapshot_extends",
             "canon_tried",
             "canon_hit",
@@ -620,29 +808,94 @@ fn counters_line(
             "zpage_decodes",
             "zpage_memo_hits",
             "zpage_memo_misses",
+            // The point reads through it: groups decoded only as far as
+            // their key, the bytes decoded of the bytes they hold, groups
+            // the memo took at a second touch, and reads the key table
+            // sent to their record.
+            "zpage_point_parts",
+            "zpage_point_part_bytes",
+            "zpage_point_part_of",
+            "zpage_point_admits",
+            "zpage_point_key_hits",
+            // The walks' own decodes, and of them the groups decoded only
+            // as far as the walk read, with the bytes decoded of the bytes
+            // they hold.
+            "zpage_walk_owned",
+            "zpage_walk_parts",
+            "zpage_walk_part_bytes",
+            "zpage_walk_part_of",
             "zpage_prefetches",
             "zpage_nopage_scans",
             "zpage_raw_scans",
+            // The stride form's: the reads a stride file answered, the
+            // value pages checked at their first touch, the values the
+            // cursor's stride position handed the block cache and the
+            // merge path, the stride files built, and the builds that
+            // found a partition does not qualify, by reason.
+            "zpage_stride_reads",
+            "zpage_stride_page_checks",
+            "zpage_stride_cursor_reads",
+            "zpage_stride_builds",
+            "zpage_stride_no_not_shaped",
+            "zpage_stride_no_holes",
+            "zpage_stride_no_not_one_value",
+            "zpage_stride_no_width",
+            "zpage_stride_no_tomb",
+            "zpage_stride_no_block_backed",
+            "zpage_stride_no_small",
+            "zpage_stride_no_self_check",
             // The writer's settles over the mix: runs, keys, the blocks
             // the keys grouped into, the blocks dropped for a rebuild, and
             // the keys filed with their cut unresolved against those
             // resolved by a seek (`Db::settle_density`, `Db::lazy_cuts`).
             "settle_runs",
+            // The commits that filed nothing, by why: the forms given
+            // up, far from the scans, no room to build, nothing due
+            // (`Db::settle_refusals`).
+            "settle_off",
+            "settle_far",
+            "settle_noroom",
+            "settle_notdue",
             "settle_keys",
             "settle_blocks",
             "settle_rebuilds",
             "lazy_cuts_filed",
             "lazy_cuts_resolved",
+            "seeks_planned",
+            "patch_asks",
+            // Partitions' ordered-index heads copied into the process's
+            // own memory over the window, and copies given back
+            // (`Db::heads_owned_counts`).
+            "heads_owned",
+            "heads_disowned",
             // The scans' start blocks the start cache named, and the
             // starts it kept (`Db::start_cache_counts`).
             "start_cache_hits",
             "start_cache_puts",
+            // The scans that started in a block scans keep starting in,
+            // and on a copy with no seek (`Db::hot_starts`).
+            "hot_starts",
+            "hot_copy_starts",
             "builds_copy",
             "builds_sparse",
             "builds_wide",
             "builds_clean",
             "recopies",
+            "wide_walks",
+            "wal_ahead_writes",
+            "wal_ahead_wait_us",
             "sheds",
+            // The merges the mix planned and landed, for a policy that
+            // chains them through writes (`Options::merge_chains_writes`).
+            "merge_plans",
+            "merges_landed",
+            // The writer's block forms given up for the merge path and
+            // taken back, and of the times taken back, those at a commit
+            // for a reading of the scans gone stale
+            // (`Db::forms_off_counts`, `Db::forms_off_stale_exits`).
+            "forms_off_entries",
+            "forms_off_exits",
+            "forms_off_stale",
         ];
         let ev: Vec<String> = names.iter().map(|n| format!("{n} {:.0}", d(n))).collect();
         eprintln!("{tag}-events {arm} {point} {}", ev.join(" | "));
@@ -768,6 +1021,17 @@ impl Samples {
             gate::higher_is_better(quantity).is_some(),
             "quantity {quantity:?} has no direction; add it to gate::higher_is_better"
         );
+        // A phase that did not run has no sample. Its rate is the NaN the
+        // pass left where the rate would be: the plan's passes left the
+        // phase out (`bench run --passes`), or the arm cannot run it (one
+        // with no ordered scan has no scan pass). JSON has no NaN, serde
+        // writes one as null, and a null among a row's samples is a row
+        // that `Row::read` refuses whole -- the first quick row with
+        // `faster` in it was written and then read by neither the gate nor
+        // the figures.
+        if v.is_nan() {
+            return;
+        }
         self.map
             .entry((
                 workload.to_string(),
@@ -925,7 +1189,7 @@ fn start_floors(
         let seek = seek_floors(floor, bounded, &mut s, rep)?;
         let mem = mem_floor();
         let (page, held) = page_floor()?;
-        fresh.push(held);
+        hold_floor(plan, fresh, held);
         if rep > 0 {
             s.push(
                 "wal-floor",
@@ -980,6 +1244,12 @@ fn start_floors(
 fn pass_measurements(size: u64, arm: &str, g: Guarantee, one: &OnePass) -> Vec<Measurement> {
     let mut s = Samples::new();
     let sz = Some(size);
+    if let Some(b) = one.bound_start_bytes {
+        s.push(AUDIT_WORKLOAD, sz, arm, g, ("group_bytes", "B"), b as f64);
+    }
+    if let Some(b) = one.start_process_bytes {
+        s.push(AUDIT_WORKLOAD, sz, arm, g, ("process_bytes", "B"), b as f64);
+    }
     s.push("load", sz, arm, g, ("ops_per_s", "ops/s"), one.load_ops_s);
     s.push(
         "load",
@@ -1041,9 +1311,34 @@ fn pass_measurements(size: u64, arm: &str, g: Guarantee, one: &OnePass) -> Vec<M
             *ops_s,
         );
     }
+    for (letter, ops_s) in &one.ycsbs_ops_s {
+        s.push(
+            &format!("ycsbs-{letter}"),
+            sz,
+            arm,
+            g,
+            ("ops_per_s", "ops/s"),
+            *ops_s,
+        );
+    }
     for (threads, v) in &one.scan_mixed_threaded {
         let q = threaded_quantity("entries_per_s", *threads);
         s.push("scan-mixed", sz, arm, g, (q.as_str(), "entries/s"), *v);
+    }
+    for (name, threads, v) in &one.mix_threaded {
+        let q = threaded_quantity("ops_per_s", *threads);
+        let w = format!("threads-{name}");
+        s.push(&w, sz, arm, g, (q.as_str(), "ops/s"), *v);
+    }
+    for (workload, r) in one.recoveries() {
+        s.push(workload, sz, arm, g, ("open_ms", "ms"), r.open_ms);
+        if let Some(us) = r.first_read_us {
+            s.push(workload, sz, arm, g, ("first_read_us", "µs"), us);
+        }
+        if let Some(n) = r.unrecovered_batches {
+            let q = ("unrecovered_batches", "batches");
+            s.push(workload, sz, arm, g, q, n as f64);
+        }
     }
     // The counts around each phase, a bounded row's only.
     for (workload, suffix, c) in &one.phase_counts {
@@ -1318,7 +1613,9 @@ pub fn run(
                 let outcome = if plan.fresh_process {
                     pass_in_child(arm, &dir, size, rep, map_gb, plan)?
                 } else {
-                    PassOutcome::Done(one_pass(arm, &dir, size, map_gb, plan, &payload, None)?)
+                    PassOutcome::Done(Box::new(one_pass(
+                        arm, &dir, size, map_gb, plan, &payload, None,
+                    )?))
                 };
                 let _ = std::fs::remove_dir_all(&dir);
                 match outcome {
@@ -1345,6 +1642,9 @@ pub fn run(
                         killed.push(k);
                     }
                     PassOutcome::Done(one) => {
+                        if let Some(note) = audit_note(arm, size, rep, &one) {
+                            log(&note);
+                        }
                         let frag = if rep > 0 {
                             pass_measurements(size, arm, g, &one)
                         } else {
@@ -1407,7 +1707,7 @@ pub fn run(
             // mark that the rep is whole.
             let mut after = Samples::new();
             let (page, held) = page_floor()?;
-            fresh.push(held);
+            hold_floor(plan, &mut fresh, held);
             if rep > 0 {
                 after.push(
                     "page-floor",
@@ -1522,6 +1822,7 @@ fn row_of(
         measurements: s.measurements(),
         killed: killed.to_vec(),
         resumptions: resumptions.to_vec(),
+        keys: plan.keys,
     }
 }
 
@@ -1585,10 +1886,17 @@ pub struct OnePass {
     reads_s_threaded: Vec<(usize, f64)>,
     scan_entries_s_threaded: Vec<(usize, f64)>,
     ycsb_ops_s: Vec<(char, f64)>,
+    /// The second mix family (`YCSBS`), on the store the first and the
+    /// threaded scans after it leave.
+    ycsbs_ops_s: Vec<(char, f64)>,
     /// The threaded scans again on the store the mixes leave, where the
     /// keys they updated and inserted are unsealed: (threads, aggregate
     /// throughput).
     scan_mixed_threaded: Vec<(usize, f64)>,
+    /// The threaded mixes (`THREADED`): (name, threads, aggregate
+    /// operations a second). Absent from a pass taken before them.
+    #[serde(default)]
+    mix_threaded: Vec<(String, usize, f64)>,
     /// What the engine says it did, rather than how fast; see
     /// `Engine::counters`. Owned names, since a pass crosses a process
     /// boundary as JSON (`pass_in_child`).
@@ -1597,9 +1905,52 @@ pub struct OnePass {
     /// the phase's workload, the suffix its quantities carry (`_3t`,
     /// `_lag10pct`, or none), and the counts. Empty unbounded.
     phase_counts: Vec<(String, String, PhaseCounts)>,
+    /// Under a bound, what the pass's group held at its start and the
+    /// pass's own resident bytes then, read by its process before anything
+    /// else (`one_pass_child`): the audit that the pass was given its bound
+    /// whole, recorded in the row (`AUDIT_WORKLOAD`) and checked against
+    /// `AUDIT_START_BYTES` by the run.
+    #[serde(default)]
+    bound_start_bytes: Option<u64>,
+    #[serde(default)]
+    start_process_bytes: Option<u64>,
+    /// The recovery workloads' readings: the open and the first read of
+    /// the store a killed process left after the ordered load's batches,
+    /// and after the shuffled load's (`recover_store`). None where the
+    /// pass left them out. Boxed, so that a pass's result stays the size
+    /// it is passed around at.
+    #[serde(default)]
+    recovered: Option<Box<[Recovered; 2]>>,
+}
+
+/// What one recovery read (`recover_store`): the open of a store its
+/// writer was killed over, and the first point read through it.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Recovered {
+    /// Milliseconds from the open's call to its return: whatever the
+    /// engine does to make the store it finds the store that was
+    /// acknowledged.
+    open_ms: f64,
+    /// Microseconds of the first point read through the opened store, of
+    /// the last key the dead process committed; none where the store did
+    /// not hold that key, a buffered arm's whose last batches went with
+    /// the process, since a miss is not the read the hits are.
+    first_read_us: Option<f64>,
+    /// A buffered arm's alone: the batches the dead process had been
+    /// acknowledged that the opened store does not hold, the newest of
+    /// them. A durable arm that lost one fails the pass instead.
+    unrecovered_batches: Option<u64>,
 }
 
 impl OnePass {
+    /// The recovery workloads' readings by workload, or none where the
+    /// pass left them out.
+    fn recoveries(&self) -> impl Iterator<Item = (&'static str, &Recovered)> {
+        [RECOVER, RECOVER_SHUFFLED]
+            .into_iter()
+            .zip(self.recovered.iter().flat_map(|r| r.iter()))
+    }
+
     /// Every quantity of the pass under one name, for `ab` to pair. A
     /// phase the plan's passes left out is a NaN here and is skipped, so
     /// a pairing over a subset pairs the subset.
@@ -1615,6 +1966,12 @@ impl OnePass {
             ("scan entries_per_s".into(), self.scan_entries_s),
         ];
         v.retain(|(_, x)| !x.is_nan());
+        if let Some(b) = self.bound_start_bytes {
+            v.push((format!("{AUDIT_WORKLOAD} group_bytes"), b as f64));
+        }
+        if let Some(b) = self.start_process_bytes {
+            v.push((format!("{AUDIT_WORKLOAD} process_bytes"), b as f64));
+        }
         for (pct, x) in &self.scan_lag {
             v.push((format!("scan-lag entries_per_s_lag{pct}pct"), *x));
         }
@@ -1632,6 +1989,18 @@ impl OnePass {
         }
         for (c, x) in &self.ycsb_ops_s {
             v.push((format!("ycsb-{c} ops_per_s"), *x));
+        }
+        for (c, x) in &self.ycsbs_ops_s {
+            v.push((format!("ycsbs-{c} ops_per_s"), *x));
+        }
+        for (workload, r) in self.recoveries() {
+            v.push((format!("{workload} open_ms"), r.open_ms));
+            if let Some(us) = r.first_read_us {
+                v.push((format!("{workload} first_read_us"), us));
+            }
+            if let Some(n) = r.unrecovered_batches {
+                v.push((format!("{workload} unrecovered_batches"), n as f64));
+            }
         }
         for (n, x) in &self.counters {
             v.push((format!("count {n}"), *x));
@@ -2036,8 +2405,10 @@ const Z_RAW_SHARE_MAX_PCT: u64 = 1;
 /// the engine's own decision, counted and printed
 /// (`zpage_declined_small_bytes`), and covers nothing the form is for;
 /// every other partition without a form file was declined for what it holds
-/// or failed, and refuses the pass. `None` is an engine with no such form,
-/// which nothing is asked of.
+/// or failed, and refuses the pass. A forced stride arm (`ZState::stride`)
+/// is held to those rules and, after the ordered load, to at least one
+/// stride file.
+/// `None` is an engine with no such form, which nothing is asked of.
 fn zpages_refusal(arm: &str, size: u64, stage: ZStage, z: Option<ZState>) -> Result<(), String> {
     let Some(z) = z else { return Ok(()) };
     let wrong = |what: String| {
@@ -2085,6 +2456,24 @@ fn zpages_refusal(arm: &str, size: u64, stage: ZStage, z: Option<ZState>) -> Res
              of one of their pages failed, and a partition is read raw from then on",
             z.damaged, z.form_files
         )),
+        // The stride form is asked of every build and falls to the block
+        // form in the same call where a partition does not qualify, so the
+        // coverage rules above hold a stride arm as they hold the block
+        // arm, a declined partition being a block file; what they cannot
+        // see is a store where every partition declined, whose reads are
+        // the block form's under the stride form's name. Asked at the
+        // ordered load, whose keys and values are the shape the form is
+        // for; the shuffled store's partitions are merge outputs, and what
+        // qualifies there is the counts' to say, not this refusal's. Asked
+        // of an arm that forces the form alone: the engine ships the stride
+        // form under its controller, so an arm with the compact form off
+        // carries the option too, and builds no form file of either kind.
+        (ZStage::Loaded, true) if z.stride && z.stride_files == 0 => wrong(format!(
+            "the stride form is forced and none of {} form files is a stride file {when}: \
+             every partition declined it (`zpage_stride_no_*` says why), so the reads \
+             are the block form's",
+            z.form_files
+        )),
         (ZStage::Read, true) if z.reads == 0 => wrong(
             "the form is forced and no point read of the pass was answered from a form file".into(),
         ),
@@ -2113,17 +2502,18 @@ fn read_phase(
     e: &mut dyn Engine,
     arm: &str,
     size: u64,
+    km: &KeyMap,
     reads: u64,
     h: &mut Hist,
     counting: &mut Counting<'_>,
 ) -> Result<f64, String> {
     let mut kb = [0u8; KEY_SIZE];
-    let mut g = KeyGen::new(KeyDist::Uniform, size, 7);
+    let mut g = KeyGen::new(KeyDist::Uniform, size, READ_SEED);
     let c0 = counting.begin();
     phase_mark(arm, "read", "start");
     let t = Instant::now();
     for _ in 0..reads {
-        db_key_into(g.next(), &mut kb);
+        km.key_into(g.next(), &mut kb);
         let t1 = Instant::now();
         e.get(&kb)?;
         h.record(t1.elapsed().as_nanos() as u64);
@@ -2133,6 +2523,26 @@ fn read_phase(
     counting.end(c0, "read", "", None, reads);
     zpages_refusal(arm, size, ZStage::Read, e.zpages_state())?;
     Ok(read_s)
+}
+
+/// The pass's store loaded in key order, its seconds and the device bytes it
+/// wrote returned. Then the question whether a forced arm's form covers it:
+/// the form files are made by the `sync` the load ends in, so a forced arm
+/// that is not covered, or a stride arm with no stride file, is refused here
+/// and not after the hour its reads would take.
+fn ordered_load(
+    e: &mut dyn Engine,
+    arm: &str,
+    size: u64,
+    plan: &Plan,
+    payload: &Payload,
+    counting: &mut Counting<'_>,
+) -> Result<(f64, u64), String> {
+    let c0 = counting.begin();
+    let got = load(e, size, plan, payload, |i| i)?;
+    counting.end(c0, "load", "", None, size);
+    zpages_refusal(arm, size, ZStage::Loaded, e.zpages_state())?;
+    Ok(got)
 }
 
 /// The pass's second store loaded in a shuffled order, its seconds returned.
@@ -2165,7 +2575,10 @@ fn shuffled_load(
 /// once the row is written (`main`), which is the status a bounded run's
 /// wrapper reads.
 pub enum PassOutcome {
-    Done(OnePass),
+    /// Boxed: a pass's result is three times a kill's size, and the
+    /// threaded mixes' rates took it past what the two are passed around
+    /// as one type at.
+    Done(Box<OnePass>),
     Killed(Kill),
 }
 
@@ -2196,9 +2609,55 @@ struct PassSpec {
     out: PathBuf,
 }
 
+/// The workload a bounded row records each pass's start under: what the
+/// pass's group held (`group_bytes`) and the pass's own resident bytes
+/// (`process_bytes`) before the pass did anything. A record and not a
+/// measurement: the gate judges none of it (`gate::is_audit`) and the
+/// figures draw none of it; the run checks it (`audit_note`).
+pub const AUDIT_WORKLOAD: &str = "bound-start";
+
+/// The most a pass's group may hold at its start before the run says so:
+/// a pass in a group of its own starts at its own process's first pages, a
+/// few megabytes, and a group shared with the run's process (`Mode::Shared`)
+/// at the run's too, which is the case this exists to name.
+pub const AUDIT_START_BYTES: u64 = 32 << 20;
+
+/// The line a pass whose group held more than `AUDIT_START_BYTES` at its
+/// start is reported with, or none.
+pub fn audit_note(arm: &str, size: u64, rep: usize, one: &OnePass) -> Option<String> {
+    let b = one.bound_start_bytes?;
+    (b > AUDIT_START_BYTES).then(|| {
+        format!(
+            "AUDIT: the pass of {arm} at {size} keys, rep {rep}, began with {} MB charged to its              bound, over the {} MB a pass in a group of its own begins with",
+            b >> 20,
+            AUDIT_START_BYTES >> 20
+        )
+    })
+}
+
+/// The seam a test holds memory in a run's own process with:
+/// `SUPDB_BENCH_PARENT_BALLAST=<bytes>`, touched and held until the value
+/// returned is dropped. A pass's bound must see none of it.
+pub const PARENT_BALLAST: &str = "SUPDB_BENCH_PARENT_BALLAST";
+
+/// The ballast `PARENT_BALLAST` asks for, every page written so that it is
+/// resident, or none.
+pub fn parent_ballast() -> Option<Vec<u8>> {
+    let bytes: usize = std::env::var(PARENT_BALLAST).ok()?.parse().ok()?;
+    let mut v = vec![0u8; bytes];
+    for i in (0..v.len()).step_by(4096) {
+        v[i] = 1;
+    }
+    Some(std::hint::black_box(v))
+}
+
+/// The number of the next pass group a bounded run makes (`Bound::pass`),
+/// one a pass, so that no two passes of a run share a group's name.
+static PASS_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// `one_pass` in a process of its own (`Plan::fresh_process`): this
-/// binary again, `bench one-pass SPEC`, spawned inside whatever group this
-/// process is in -- a child is born into its parent's cgroup -- with the
+/// binary again, `bench one-pass SPEC`, which under a bound joins a group
+/// of its own before it runs anything (`Bound::pass`), with the
 /// pass's spec in a file beside the store and its result written to
 /// another, since the pass prints its own lines to both streams and the
 /// result must not share one. A child killed by SIGKILL is the bound's
@@ -2214,6 +2673,27 @@ fn pass_in_child(
 ) -> Result<PassOutcome, String> {
     let spec_path = PathBuf::from(format!("{}.spec.json", dir.display()));
     let out = PathBuf::from(format!("{}.pass.json", dir.display()));
+    // Under a bound, the pass's own group (`Bound::pass`), made here with
+    // the limit on it and removed when the pass is done; the pass's process
+    // joins it before it runs anything and is handed it in its spec, so its
+    // counts and its start are its own group's.
+    let group = match &plan.bound {
+        Some(b) => Some(
+            b.pass(PASS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                .map_err(|e| format!("the pass's group: {e}"))?,
+        ),
+        None => None,
+    };
+    let child_plan;
+    let plan = match &group {
+        Some(g) => {
+            let mut p = plan.clone();
+            p.bound = Some(g.bound());
+            child_plan = p;
+            &child_plan
+        }
+        None => plan,
+    };
     let spec = PassSpecRef {
         arm,
         dir,
@@ -2226,14 +2706,22 @@ fn pass_in_child(
     let text = serde_json::to_vec(&spec).map_err(|e| format!("the pass's spec: {e}"))?;
     std::fs::write(&spec_path, text).map_err(|e| format!("writing the pass's spec: {e}"))?;
     let exe = std::env::current_exe().map_err(|e| format!("this binary's own path: {e}"))?;
-    let status = std::process::Command::new(&exe)
-        .arg("one-pass")
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("one-pass")
         .arg(&spec_path)
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+    #[cfg(unix)]
+    if let Some(g) = &group {
+        g.join_before_exec(&mut cmd);
+    }
+    let status = cmd
         .status()
         .map_err(|e| format!("spawning the pass's process: {e}"))?;
     let _ = std::fs::remove_file(&spec_path);
     let mark = PhaseTrace::take(dir);
+    // The group's own figures where the trace left none, read before the
+    // group goes with `group`'s drop.
+    let group_stat = group.as_ref().and_then(|g| g.stat().ok());
     if !status.success() {
         let _ = std::fs::remove_file(&out);
         #[cfg(unix)]
@@ -2245,8 +2733,14 @@ fn pass_in_child(
                     size,
                     rep,
                     after_phase: mark.as_ref().map(|m| m.phase.clone()),
-                    rss_bytes: mark.as_ref().and_then(|m| m.rss_bytes),
-                    cache_bytes: mark.as_ref().and_then(|m| m.cache_bytes),
+                    rss_bytes: mark
+                        .as_ref()
+                        .and_then(|m| m.rss_bytes)
+                        .or(group_stat.map(|s| s.rss)),
+                    cache_bytes: mark
+                        .as_ref()
+                        .and_then(|m| m.cache_bytes)
+                        .or(group_stat.map(|s| s.cache)),
                     utc: crate::row::utc_now(),
                 }));
             }
@@ -2259,7 +2753,7 @@ fn pass_in_child(
         .map_err(|e| format!("the pass's result for {arm} at {size} keys: {e}"))?;
     let _ = std::fs::remove_file(&out);
     serde_json::from_str(&text)
-        .map(PassOutcome::Done)
+        .map(|one| PassOutcome::Done(Box::new(one)))
         .map_err(|e| format!("the pass's result for {arm}: {e}"))
 }
 
@@ -2273,10 +2767,26 @@ pub fn one_pass_child(spec_path: &Path) -> Result<(), String> {
     let spec: PassSpec =
         serde_json::from_str(&text).map_err(|e| format!("the pass's spec: {e}"))?;
     debug_assert!(spec.plan.bound.as_ref().is_none_or(|b| !b.is_owned()));
+    // What the bound held before the pass did anything, and this process's
+    // own resident bytes: the record that the pass was given its bound
+    // whole (`OnePass::bound_start_bytes`). Read before the payload, the
+    // store or a thread exists.
+    let start = spec.plan.bound.as_ref().map(|b| {
+        (
+            b.usage()
+                .map_err(|e| format!("the bound at the pass's start: {e}")),
+            resident_bytes(),
+        )
+    });
+    let start = match start {
+        Some((Ok(group), own)) => Some((group, own)),
+        Some((Err(e), _)) => return Err(e),
+        None => None,
+    };
     let payload = Payload::new(spec.plan.value_size, spec.plan.compress, 0xE1);
     let seam = std::env::var(KILL_AFTER).ok();
     let trace = PhaseTrace::new(&spec.dir, &spec.arm, spec.rep, seam.as_deref());
-    let one = one_pass(
+    let mut one = one_pass(
         &spec.arm,
         &spec.dir,
         spec.size,
@@ -2285,6 +2795,10 @@ pub fn one_pass_child(spec_path: &Path) -> Result<(), String> {
         &payload,
         Some(trace),
     )?;
+    if let Some((group, own)) = start {
+        one.bound_start_bytes = Some(group);
+        one.start_process_bytes = own;
+    }
     let text = serde_json::to_vec(&one).map_err(|e| format!("the pass's result: {e}"))?;
     std::fs::write(&spec.out, text)
         .map_err(|e| format!("writing the pass's result {}: {e}", spec.out.display()))
@@ -2305,18 +2819,23 @@ fn one_pass(
     // read around it (`Counting`), and the plan's passes say which phases
     // run at all; a phase left out leaves a NaN where its rate would be.
     let passes = plan.passes;
+    let km = plan.keymap(size);
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     // The directory first, since the counting finds the device through it.
     let mut counting = Counting::new(plan.bound.as_ref(), dir, trace)?;
     let prime_a = prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
+    engines::set_store_keys(size);
     let mut e = engines::open(arm, dir, map_gb)?;
-    let c0 = counting.begin();
-    let (load_s, wrote) = load(e.as_mut(), size, plan, payload, |i| i)?;
-    counting.end(c0, "load", "", None, size);
-    // The form's form files are made by the `sync` the load ends in: a forced
-    // arm that is not covered is refused here and not after the hour its
-    // reads would take.
-    zpages_refusal(arm, size, ZStage::Loaded, e.zpages_state())?;
+    // An engine with no ordered scan (FASTER's hash store) runs every
+    // workload made of point operations and none of the scans: the scan
+    // passes, the scan-bearing mix (YCSB E) and the scans after each burst
+    // of the lag sweep are left out for it, and its row has no cell there.
+    let can_scan = e.features().ordered_scan;
+    // And an engine whose arm does not reopen a store for writing (FASTER's,
+    // which does not recover from its checkpoint here) runs no recovery
+    // workload, which is a store reopened after its writer was killed.
+    let can_reopen = e.features().reopen_for_write;
+    let (load_s, wrote) = ordered_load(e.as_mut(), arm, size, plan, payload, &mut counting)?;
     let stored = size as f64 * (KEY_SIZE + plan.value_size) as f64;
     // Read here so that this and the device bytes describe one moment: what
     // the engine wrote to get there, and what it occupies having got there.
@@ -2345,7 +2864,7 @@ fn one_pass(
     let mut h = Hist::new();
     let mut read_s = f64::NAN;
     if passes.read {
-        read_s = read_phase(e.as_mut(), arm, size, reads, &mut h, &mut counting)?;
+        read_s = read_phase(e.as_mut(), arm, size, &km, reads, &mut h, &mut counting)?;
     }
 
     // The same reads over each thread count, on the store as loaded and
@@ -2368,7 +2887,8 @@ fn one_pass(
             threads,
             ops,
             size,
-            0x7EAD,
+            &km,
+            READ_THREADED_SEED,
             Op::Get,
             c0.is_some(),
         )?;
@@ -2386,7 +2906,7 @@ fn one_pass(
 
     let scans = plan.divided((size / plan.scan_len as u64).max(1));
     let scan_keys = size.saturating_sub(plan.scan_len as u64).max(1);
-    let mut g2 = KeyGen::new(KeyDist::Uniform, scan_keys, 11);
+    let mut g2 = KeyGen::new(KeyDist::Uniform, scan_keys, SCAN_SEED);
     // With `SUPDB_SCAN_OPS` set, every scan of the pass is timed on its
     // own, for every arm, and the pass line names its first scans beside
     // the rest: a pass of a hundred scans at the smallest rung is a few
@@ -2396,12 +2916,12 @@ fn one_pass(
     let per_op = std::env::var_os("SUPDB_SCAN_OPS").is_some();
     let mut op_us: Vec<f64> = Vec::new();
     let mut scan_s = f64::NAN;
-    if passes.scan {
+    if passes.scan && can_scan {
         let c0 = counting.begin();
         phase_mark(arm, "scan", "start");
         let t = Instant::now();
         for _ in 0..scans {
-            db_key_into(g2.next(), &mut kb);
+            km.key_into(g2.next(), &mut kb);
             if per_op {
                 let t0 = Instant::now();
                 e.range(&kb, plan.scan_len)?;
@@ -2442,12 +2962,20 @@ fn one_pass(
     // every row; the scans run as long now. Every start is at least
     // `scan_len` below the top, so every scan walks `scan_len` loaded
     // entries.
+    // With `SUPDB_SCAN_COUNTERS` set, the store's counters around each
+    // threaded scan pass, here and after the mixes, as `SUPDB_MIX_COUNTERS`
+    // reads them around a mix: one `scancounters` line a pass on stderr,
+    // read before the pass and after it. The read before takes the writer's
+    // upkeep home, so the pass after it meets a store nothing is filing
+    // into; a probe's variable, never set for a row.
+    let scan_counting = std::env::var_os("SUPDB_SCAN_COUNTERS").is_some();
     let mut scan_entries_s_threaded = Vec::with_capacity(plan.threads.len());
     for &threads in &plan.threads {
-        if !passes.scan_threaded {
+        if !passes.scan_threaded || !can_scan {
             break;
         }
         let ops = plan.divided(size) * threads as u64;
+        let sc0 = scan_counting.then(|| e.counters());
         let c0 = counting.begin();
         let got = threaded(
             e.as_ref(),
@@ -2455,11 +2983,24 @@ fn one_pass(
             threads,
             ops,
             scan_keys,
-            0x5CA0,
+            &km,
+            SCAN_THREADED_SEED,
             Op::Range(plan.scan_len),
             c0.is_some(),
         )?;
         counting.end(c0, "scan", &format!("_{threads}t"), Some(got.own), ops);
+        if let Some(sc0) = sc0 {
+            let point = format!("scan-{threads}t ops {ops}");
+            counters_line(
+                "scancounters",
+                arm,
+                &point,
+                (0, 0),
+                (0.0, got.secs * 1e3),
+                &sc0,
+                &e.counters(),
+            );
+        }
         let want = ops * (plan.scan_len as u64).min(size) * plan.value_size as u64;
         if got.bytes != want {
             return Err(format!(
@@ -2471,76 +3012,25 @@ fn one_pass(
         scan_entries_s_threaded.push((threads, (ops * plan.scan_len as u64) as f64 / got.secs));
     }
 
-    let mut ycsb_ops_s = Vec::with_capacity(YCSB.len());
     let mut inserted = 0u64;
     let mix_ops = plan.divided(ycsb_ops(size));
-    // With `SUPDB_MIX_COUNTERS` set, the store's counters around each mix,
-    // as `SUPDB_LAG_COUNTERS` reads them around a lag point: one
-    // `mixcounters` line a mix on stderr, read before the mix and after it
-    // and never between. A mix's commits are inside its timed region, so
-    // the line's burst is zero and its pass is the whole mix.
-    let mix_counting = std::env::var_os("SUPDB_MIX_COUNTERS").is_some();
-    // With `SUPDB_MIX_CENSUS` set, the engine's census of what the process
-    // holds after each mix, one `mixcensus` line a mix, as the lag sweep's
-    // `lagcensus`: the form files' fit beside the process is read there.
-    // Set to `2`, the allocator's bytes by arena and the anonymous mappings
-    // by size follow it, as they follow `lagcensus`: a walk of every free
-    // chunk under each arena's lock, asked for and not given.
-    let mix_census = std::env::var_os("SUPDB_MIX_CENSUS").is_some();
-    let mix_census_detail = std::env::var("SUPDB_MIX_CENSUS").is_ok_and(|v| v == "2");
-    for letter in YCSB_ORDER {
-        if !passes.mixes {
-            break;
-        }
-        let w = YCSB.iter().find(|w| w.0 == letter).unwrap();
-        let c0 = if mix_counting {
-            e.counters()
-        } else {
-            Vec::new()
-        };
-        let (flt_up0, flt_main0) = if mix_counting {
-            (minflt_of("supdb-upkeep"), minflt_self())
-        } else {
-            (0, 0)
-        };
-        let mix = format!("ycsb-{letter}");
-        let cb = counting.begin();
-        phase_mark(arm, &mix, "start");
-        let secs = ycsb(e.as_mut(), arm, w, size, mix_ops, &mut inserted, payload)?;
-        phase_mark(arm, &mix, "end");
-        counting.end(cb, &mix, "", None, mix_ops);
-        ycsb_ops_s.push((letter, mix_ops as f64 / secs));
-        if mix_counting {
-            let c1 = e.counters();
-            counters_line(
-                "mixcounters",
-                arm,
-                &letter.to_string(),
-                (
-                    minflt_of("supdb-upkeep").saturating_sub(flt_up0),
-                    minflt_self().saturating_sub(flt_main0),
-                ),
-                (0.0, secs * 1e3),
-                &c0,
-                &c1,
-            );
-        }
-        // With `SUPDB_MIX_HEAT` set, each form file's decodes over its life
-        // after each mix, by partition (`Engine::zpage_heat`): a reader
-        // differences consecutive mixes for where a mix's decodes land.
-        if std::env::var_os("SUPDB_MIX_HEAT").is_some() {
-            eprintln!("mixheat {arm} {letter} | {}", e.zpage_heat());
-        }
-        if mix_census {
-            census_line(
-                "mixcensus",
-                arm,
-                &letter.to_string(),
-                e.as_ref(),
-                mix_census_detail,
-            );
-        }
-    }
+    let ycsb_ops_s = if passes.mixes {
+        mix_family(
+            e.as_mut(),
+            arm,
+            "ycsb",
+            &YCSB,
+            0,
+            size,
+            &km,
+            mix_ops,
+            &mut inserted,
+            payload,
+            &mut counting,
+        )?
+    } else {
+        Vec::new()
+    };
 
     // The threaded scans again, on the store the mixes leave: the keys
     // they updated and inserted are unsealed, so a handle's pass builds
@@ -2549,12 +3039,23 @@ fn one_pass(
     // store's, since a mix only adds to a key; what an engine adds for
     // an update is its own and is not held to. `size` scans a thread, as
     // above.
+    // A probe's fold before these scans (`SUPDB_SCAN_MIXED_FOLD`,
+    // `Engine::fold`): the store the mixes leave with nothing overlaid, so
+    // that the scans' rate over the files the mixes' merges wrote is read
+    // apart from what a scan pays for the keys left unsealed. Its time on a
+    // `scanfold` line. Never set for a row.
+    if passes.scan_mixed && std::env::var_os("SUPDB_SCAN_MIXED_FOLD").is_some() {
+        let t = std::time::Instant::now();
+        e.fold()?;
+        eprintln!("scanfold {arm} ms {:.0}", t.elapsed().as_secs_f64() * 1e3);
+    }
     let mut scan_mixed_threaded = Vec::with_capacity(plan.threads.len());
     for &threads in &plan.threads {
-        if !passes.scan_mixed {
+        if !passes.scan_mixed || !can_scan {
             break;
         }
         let ops = plan.divided(size) * threads as u64;
+        let sc0 = scan_counting.then(|| e.counters());
         let c0 = counting.begin();
         let got = threaded(
             e.as_ref(),
@@ -2562,7 +3063,8 @@ fn one_pass(
             threads,
             ops,
             scan_keys,
-            0x5CA1,
+            &km,
+            SCAN_MIXED_SEED,
             Op::Range(plan.scan_len),
             c0.is_some(),
         )?;
@@ -2573,6 +3075,18 @@ fn one_pass(
             Some(got.own),
             ops,
         );
+        if let Some(sc0) = sc0 {
+            let point = format!("scan-mixed-{threads}t ops {ops}");
+            counters_line(
+                "scancounters",
+                arm,
+                &point,
+                (0, 0),
+                (0.0, got.secs * 1e3),
+                &sc0,
+                &e.counters(),
+            );
+        }
         let want = ops * (plan.scan_len as u64).min(size) * plan.value_size as u64;
         if got.bytes < want {
             return Err(format!(
@@ -2583,6 +3097,27 @@ fn one_pass(
         }
         scan_mixed_threaded.push((threads, (ops * plan.scan_len as u64) as f64 / got.secs));
     }
+
+    // The second family, with YCSB's own key distributions, on the store
+    // the first family and the threaded scans after it leave (`YCSBS`).
+    let ycsbs_ops_s = if passes.mixes_scrambled {
+        mix_family(
+            e.as_mut(),
+            arm,
+            "ycsbs",
+            &YCSBS,
+            YCSBS_SEED_SALT,
+            size,
+            &km,
+            mix_ops,
+            &mut inserted,
+            payload,
+            &mut counting,
+        )?
+    } else {
+        Vec::new()
+    };
+
     // A pass opens two stores -- this one, and a fresh one below for the
     // shuffled load and the lag sweep -- so the counts of the first are
     // taken before it goes. Read from the second alone they described the
@@ -2604,6 +3139,7 @@ fn one_pass(
     if passes.load || passes.lag {
         prime_b = prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        engines::set_store_keys(size);
         let mut e = engines::open(arm, dir, map_gb)?;
         shuf_s = shuffled_load(e.as_mut(), arm, size, plan, payload, &mut counting)?;
         // What the shuffled load freed, returned before the sweep: its
@@ -2638,7 +3174,75 @@ fn one_pass(
         release_freed_memory();
     }
 
+    // The threaded mixes, on a store of their own that the ordered load
+    // fills and syncs: a cell of theirs is then the same cell whichever
+    // other passes ran, where on the first store it would be of whatever
+    // the mixes before it had left. Each on one thread and then on each
+    // count, the threaded reads' operations a thread. Every key they draw
+    // was loaded and every write is an update of a value of `value_size`
+    // bytes, so every read must hand back exactly that, as the threaded
+    // reads' must. In memory only: no count is read around them, so a
+    // bounded row carries none.
+    let mut mix_threaded = Vec::new();
+    if passes.mixes_threaded && plan.bound.is_none() {
+        prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
+        // The lag store's files are still here where that store was built.
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        engines::set_store_keys(size);
+        let mut e = engines::open(arm, dir, map_gb)?;
+        load(e.as_mut(), size, plan, payload, |i| i)?;
+        release_freed_memory();
+        let per_thread = plan.divided(size);
+        for (i, &(name, mix, dist)) in THREADED.iter().enumerate() {
+            for threads in std::iter::once(1).chain(plan.threads.iter().copied()) {
+                let ops = per_thread * threads as u64;
+                let seed = THREADED_MIX_SEED ^ ((i as u64) << 8) ^ threads as u64;
+                let got = threaded_mix(
+                    e.as_mut(),
+                    &format!("threads-{name}"),
+                    threads,
+                    ops,
+                    size,
+                    &km,
+                    seed,
+                    mix,
+                    dist,
+                    payload,
+                )?;
+                let want = got.reads * plan.value_size as u64;
+                if got.bytes != want {
+                    return Err(format!(
+                        "{arm} at {size}: threads-{name} on {threads} threads read back {} bytes \
+                         over {} reads of keys the store holds at {} bytes each; \
+                         a mix over a different store is not a measurement",
+                        got.bytes, got.reads, plan.value_size
+                    ));
+                }
+                mix_threaded.push((name.to_string(), threads, ops as f64 / got.secs));
+            }
+        }
+        drop(e);
+        release_freed_memory();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // The recovery workloads, each on a store of its own: the ordered
+    // load's batches and then the shuffled load's, committed by a process
+    // that is killed where the last was acknowledged, and the store it
+    // left opened here (`recover_store`).
+    let mut recovered = None;
+    if passes.recover && can_reopen {
+        recovered = Some(Box::new([
+            recover_store(arm, dir, size, map_gb, plan, false)?,
+            recover_store(arm, dir, size, map_gb, plan, true)?,
+        ]));
+    }
+
     Ok(OnePass {
+        recovered,
+        bound_start_bytes: None,
+        start_process_bytes: None,
         prime_us_per_page: prime_a.max(prime_b),
         load_ops_s: if passes.load {
             size as f64 / load_s
@@ -2672,12 +3276,292 @@ fn one_pass(
         reads_s_threaded,
         scan_entries_s_threaded,
         ycsb_ops_s,
+        ycsbs_ops_s,
         scan_mixed_threaded,
+        mix_threaded,
         counters: counters
             .into_iter()
             .map(|(n, v)| (n.to_string(), v))
             .collect(),
         phase_counts: counting.out,
+    })
+}
+
+/// The recovery workloads' names: the store a process loaded in key order
+/// and was killed over, and the one it loaded shuffled.
+pub const RECOVER: &str = "recover";
+pub const RECOVER_SHUFFLED: &str = "recover-shuffled";
+
+/// What the crash load's process prints once its last batch is
+/// acknowledged and its tail staged: the line its parent kills it on.
+const CRASH_READY: &str = "crash-load: staged";
+
+/// The crash load's spec, as its parent writes it and as its own process
+/// reads it (`crash_load`, `crash_load_child`).
+#[derive(Serialize)]
+struct CrashSpecRef<'a> {
+    arm: &'a str,
+    dir: &'a Path,
+    size: u64,
+    map_gb: usize,
+    batch: usize,
+    value_size: usize,
+    compress: f64,
+    shuffled: bool,
+    keys: KeyShape,
+}
+
+#[derive(Deserialize)]
+struct CrashSpec {
+    arm: String,
+    dir: PathBuf,
+    size: u64,
+    map_gb: usize,
+    batch: usize,
+    value_size: usize,
+    compress: f64,
+    shuffled: bool,
+    #[serde(default)]
+    keys: KeyShape,
+}
+
+/// The key the load's `i`-th record carries: `i` in key order, and its
+/// place in the shuffled load's permutation.
+fn load_key(perm: Option<&Permutation>, i: u64) -> u64 {
+    perm.map_or(i, |p| p.at(i))
+}
+
+/// The crash load's own process, `bench crash-load SPEC`: a fresh store
+/// of the arm's, the load's batches committed one by one under the arm's
+/// guarantee -- the same keys, values and batches as `load`, in key order
+/// or shuffled, and no sync behind the last -- then one batch more of keys
+/// above them staged and not committed (`Engine::stage_batch`), and the
+/// line that says so. It never returns: its parent kills it there, with
+/// the store open, every batch acknowledged and the tail in its memory,
+/// which is the crash the recovery workloads recover from.
+pub fn crash_load_child(spec_path: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(spec_path)
+        .map_err(|e| format!("the crash load's spec {}: {e}", spec_path.display()))?;
+    let spec: CrashSpec =
+        serde_json::from_str(&text).map_err(|e| format!("the crash load's spec: {e}"))?;
+    let payload = Payload::new(spec.value_size, spec.compress, 0xE1);
+    std::fs::create_dir_all(&spec.dir).map_err(|e| e.to_string())?;
+    let mut e = engines::open(&spec.arm, &spec.dir, spec.map_gb)?;
+    let perm = spec.shuffled.then(|| Permutation::new(spec.size, 0x5EED));
+    let km = KeyMap::new(spec.keys, spec.size);
+    let mut vrng = Rng::new(0xE1);
+    let mut buf = Batch::with_capacity(spec.batch, payload.value_size());
+    let mut kb = [0u8; KEY_SIZE];
+    for i in 0..spec.size {
+        km.key_into(load_key(perm.as_ref(), i), &mut kb);
+        buf.push(&kb, payload.get(&mut vrng));
+        if buf.len() == spec.batch {
+            buf.flush(e.as_mut())?;
+        }
+    }
+    buf.flush(e.as_mut())?;
+    for i in spec.size..spec.size + spec.batch as u64 {
+        km.key_into(i, &mut kb);
+        buf.push(&kb, payload.get(&mut vrng));
+    }
+    buf.stage(e.as_mut())?;
+    let mut out = std::io::stdout();
+    writeln!(out, "{CRASH_READY}").map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())?;
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+/// A store at `dir` as a crash leaves it: this binary again, `bench
+/// crash-load SPEC`, killed with SIGKILL the moment it says its last
+/// batch is acknowledged and its tail staged. A process's death and not
+/// a machine's: what the process had handed the kernel is there, synced
+/// or not, and the page cache is as it left it.
+fn crash_load(
+    arm: &str,
+    dir: &Path,
+    size: u64,
+    map_gb: usize,
+    plan: &Plan,
+    shuffled: bool,
+) -> Result<(), String> {
+    use std::io::BufRead as _;
+    let spec_path = PathBuf::from(format!("{}.crash.json", dir.display()));
+    let spec = CrashSpecRef {
+        arm,
+        dir,
+        size,
+        map_gb,
+        batch: plan.batch,
+        value_size: plan.value_size,
+        compress: plan.compress,
+        shuffled,
+        keys: plan.keys,
+    };
+    let text = serde_json::to_vec(&spec).map_err(|e| format!("the crash load's spec: {e}"))?;
+    std::fs::write(&spec_path, text).map_err(|e| format!("writing the crash load's spec: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| format!("this binary's own path: {e}"))?;
+    let mut child = std::process::Command::new(&exe)
+        .arg("crash-load")
+        .arg(&spec_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawning the crash load's process: {e}"))?;
+    let mut lines = std::io::BufReader::new(child.stdout.take().expect("a piped stdout"));
+    let mut line = String::new();
+    let ready = loop {
+        line.clear();
+        match lines.read_line(&mut line) {
+            Ok(0) | Err(_) => break false,
+            Ok(_) if line.trim_end() == CRASH_READY => break true,
+            Ok(_) => {}
+        }
+    };
+    // `Child::kill` is SIGKILL: nothing of the process runs after it, no
+    // drop and no close.
+    let _ = child.kill();
+    let status = child
+        .wait()
+        .map_err(|e| format!("the crash load's process: {e}"))?;
+    let _ = std::fs::remove_file(&spec_path);
+    if !ready {
+        return Err(format!(
+            "the crash load of {arm} at {size} keys ended before its batches were acknowledged ({status})"
+        ));
+    }
+    Ok(())
+}
+
+/// A reopened store held to what its dead writer was acknowledged
+/// (`recover_store`): the batches it does not hold, the newest of them,
+/// or the refusal of a store nobody was promised. A batch is read by its
+/// first and last key. The refusals: a batch in part; a batch held behind
+/// one that is not, since what a crash takes is a tail; any batch missing
+/// from a durable arm's store; a key of the staged tail; and a timed read
+/// of the last committed key, `got` bytes, that does not agree with what
+/// this read of the last batch.
+fn unrecovered(
+    e: &mut dyn Engine,
+    who: &str,
+    size: u64,
+    plan: &Plan,
+    perm: Option<&Permutation>,
+    durable: bool,
+    got: usize,
+) -> Result<u64, String> {
+    let mut kb = [0u8; KEY_SIZE];
+    let km = plan.keymap(size);
+    let batch = plan.batch as u64;
+    let batches = size.div_ceil(batch);
+    let whole = [plan.value_size; 2];
+    // The first batch the store does not hold; `batches` while it holds
+    // every one so far.
+    let mut held = batches;
+    for b in 0..batches {
+        let (first, last) = (b * batch, ((b + 1) * batch).min(size) - 1);
+        let mut read = [0usize; 2];
+        for (slot, i) in read.iter_mut().zip([first, last]) {
+            km.key_into(load_key(perm, i), &mut kb);
+            *slot = e.get(&kb)?;
+        }
+        if read == whole {
+            if held != batches {
+                return Err(format!(
+                    "{who} holds batch {b} and not batch {held} before it"
+                ));
+            }
+        } else if read == [0; 2] {
+            held = held.min(b);
+        } else {
+            return Err(format!(
+                "{who} holds batch {b} in part: its first and last keys read back {} and {} \
+                 bytes of {}",
+                read[0], read[1], plan.value_size
+            ));
+        }
+    }
+    let lost = batches - held;
+    if durable && lost > 0 {
+        return Err(format!(
+            "{who} lost {lost} of the {batches} batches a durable arm acknowledged before the \
+             kill, from batch {held}"
+        ));
+    }
+    let hit = got == plan.value_size;
+    if hit != (lost == 0) || (!hit && got != 0) {
+        return Err(format!(
+            "{who} read {got} bytes for the last key committed before the kill, with {lost} of \
+             {batches} batches not held"
+        ));
+    }
+    for i in size..size + batch {
+        km.key_into(i, &mut kb);
+        let n = e.get(&kb)?;
+        if n != 0 {
+            return Err(format!(
+                "{who} read {n} bytes for key {i} of the tail that was staged and never committed"
+            ));
+        }
+    }
+    Ok(lost)
+}
+
+/// One recovery workload: the store a killed process left (`crash_load`),
+/// opened under the arm's own options with the clock around the open, and
+/// then around one point read of the last key the process committed. The
+/// open draws its tables from a primed pool, as every store a pass opens
+/// does.
+///
+/// Then, outside the clock, the store is held to what was acknowledged, a
+/// batch at a time by its first and last key. Under either guarantee the
+/// batches it holds are a prefix of the ones acknowledged, each whole, and
+/// no key of the staged tail is there: a batch in part, a batch behind a
+/// missing one, or a tail that came back is a store nobody was promised,
+/// and fails the pass. A durable arm holds every batch, or fails it. A
+/// buffered arm promised the device nothing, and what a process's death
+/// costs it is the engine's to say: LMDB and RocksDB hand every commit to
+/// the kernel, where it outlives the process, and supdb's ordered ingest
+/// keeps a commit in the writer's buffer until a write piece is whole. So
+/// the batches a buffered arm's store does not hold are counted and
+/// recorded (`unrecovered_batches`), and its first read is recorded only
+/// where it found the key.
+fn recover_store(
+    arm: &str,
+    dir: &Path,
+    size: u64,
+    map_gb: usize,
+    plan: &Plan,
+    shuffled: bool,
+) -> Result<Recovered, String> {
+    let workload = if shuffled { RECOVER_SHUFFLED } else { RECOVER };
+    let durable = engines::guarantee(arm) == Some(Guarantee::Durable);
+    let _ = std::fs::remove_dir_all(dir);
+    crash_load(arm, dir, size, map_gb, plan, shuffled)?;
+    let perm = shuffled.then(|| Permutation::new(size, 0x5EED));
+    let mut kb = [0u8; KEY_SIZE];
+    plan.keymap(size)
+        .key_into(load_key(perm.as_ref(), size.saturating_sub(1)), &mut kb);
+    prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
+    phase_mark(arm, workload, "start");
+    let t = Instant::now();
+    let mut e = engines::reopen(arm, dir, map_gb)?;
+    let open_s = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let got = e.get(&kb)?;
+    let first_s = t.elapsed().as_secs_f64();
+    phase_mark(arm, workload, "end");
+    let who = format!("{arm} at {size}: {workload}");
+    let lost = unrecovered(e.as_mut(), &who, size, plan, perm.as_ref(), durable, got)?;
+    let hit = got == plan.value_size;
+    drop(e);
+    release_freed_memory();
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(Recovered {
+        open_ms: open_s * 1e3,
+        first_read_us: hit.then_some(first_s * 1e6),
+        unrecovered_batches: (!durable).then_some(lost),
     })
 }
 
@@ -2705,6 +3589,7 @@ fn lag_sweep(
     burst_lag: &mut Vec<(u64, f64)>,
 ) -> Result<(), String> {
     let mut kb = [0u8; KEY_SIZE];
+    let km = plan.keymap(size);
     let mut vrng = Rng::new(0x1A5);
     let mut updated = 0u64;
     let mut ug = KeyGen::new(KeyDist::Uniform, size, 0x1A6);
@@ -2735,11 +3620,16 @@ fn lag_sweep(
         } else {
             (0, 0)
         };
+        // The long-lived threads' major faults, read before the burst, at
+        // its end and after the pass (`lagmajflt`): whose reads of the
+        // store's files went to the device, in the burst and in the pass
+        // apart, where `lagdev` has the group's whole count over the pass.
+        let mf0 = if counting_store { lag_majflt() } else { [0; 3] };
         let cb = if wrote > 0 { counting.begin() } else { None };
         let burst_cpu0 = thread_cpu_us();
         let tw = Instant::now();
         while updated < want {
-            db_key_into(ug.next(), &mut kb);
+            km.key_into(ug.next(), &mut kb);
             buf.push(&kb, payload.get(&mut vrng));
             updated += 1;
             if buf.len() == plan.batch {
@@ -2781,6 +3671,7 @@ fn lag_sweep(
                 lag_arenas("lagburstarenas", arm, &pct.to_string());
             }
         }
+        let mf1 = if counting_store { lag_majflt() } else { [0; 3] };
         if pct == 0 {
             // The shuffled load's own tail is drained here and the merge
             // the drain hands to the segment work is joined, so no merge
@@ -2797,6 +3688,34 @@ fn lag_sweep(
             // some reps and not others, and `lagcounters` counts them.
             e.sync()?;
             e.settle()?;
+        }
+        // The burst is timed and kept for an engine with no ordered scan;
+        // the scans after it are not run, and the point has no scan cell.
+        if !e.features().ordered_scan {
+            continue;
+        }
+        // A probe, under `SUPDB_LAG_FORMS`: the block cache by partition
+        // where the pass starts (`Engine::forms_by_partition`). It takes the
+        // writer's upkeep home, which the pass after it would otherwise
+        // wait out or race, so a run that prints it is a probe of where the
+        // forms stand and its rates are not read.
+        let forms_probe = std::env::var_os("SUPDB_LAG_FORMS").is_some();
+        // A probe, under `SUPDB_LAG_TRIM_BEFORE`: the allocator's free pages
+        // returned between the burst and its pass, the anonymous bytes
+        // printed before and after (`lagtrimbefore`). For the question
+        // whether the free chunks a burst leaves are what its pass is short
+        // of; the pass after it is the probe's, and its rates are not read.
+        if std::env::var_os("SUPDB_LAG_TRIM_BEFORE").is_some() {
+            let before = anon_resident_bytes().map_or(0, |b| b >> 20);
+            release_freed_memory();
+            let after = anon_resident_bytes().map_or(0, |b| b >> 20);
+            eprintln!("lagtrimbefore {arm} {pct} anon_mb {before} -> {after}");
+        }
+        if forms_probe {
+            for l in e.forms_by_partition() {
+                eprintln!("lagforms {arm} {pct} start {l}");
+            }
+            eprintln!("lagdrops {arm} {pct} start {}", e.forms_drop_reasons());
         }
         let mut g3 = KeyGen::new(KeyDist::Uniform, scan_keys, 0x1A7);
         // With `SUPDB_SCAN_OPS` set, every scan of the point's pass is timed
@@ -2836,7 +3755,7 @@ fn lag_sweep(
         lag_mark(arm, pct, "start");
         let t = Instant::now();
         for _ in 0..scans {
-            db_key_into(g3.next(), &mut kb);
+            km.key_into(g3.next(), &mut kb);
             if per_op {
                 let t0 = Instant::now();
                 e.range(&kb, plan.scan_len)?;
@@ -2930,6 +3849,23 @@ fn lag_sweep(
                 &c1,
             );
             census_line("lagcensus", arm, &pct.to_string(), e, true);
+            let mf2 = lag_majflt();
+            let d = |a: [u64; 3], b: [u64; 3], i: usize| b[i].saturating_sub(a[i]);
+            eprintln!(
+                "lagmajflt {arm} {pct} burst up {} maint {} main {} | pass up {} maint {} main {}",
+                d(mf0, mf1, 0),
+                d(mf0, mf1, 1),
+                d(mf0, mf1, 2),
+                d(mf1, mf2, 0),
+                d(mf1, mf2, 1),
+                d(mf1, mf2, 2),
+            );
+        }
+        if forms_probe {
+            for l in e.forms_by_partition() {
+                eprintln!("lagforms {arm} {pct} end {l}");
+            }
+            eprintln!("lagdrops {arm} {pct} end {}", e.forms_drop_reasons());
         }
     }
     Ok(())
@@ -2991,6 +3927,10 @@ fn census_line(tag: &str, arm: &str, point: &str, e: &dyn Engine, detail: bool) 
         return;
     }
     lag_arenas("lagarenas", arm, point);
+    // Whose the arenas' bytes were: every thread's peak, by its name and
+    // whether it is still there (`alloc_census`), in the build that counts.
+    #[cfg(feature = "alloc-census")]
+    crate::alloc_census::report("mixthreads", arm, point);
     // The anonymous mappings of a megabyte and more, by size: what is
     // resident in each size class says which allocations they are (a
     // thread's heap, a memtable's arena block, a snapshot's, a slab's).
@@ -3251,7 +4191,9 @@ pub fn ab(
             let outcome = if plan.fresh_process {
                 pass_in_child(arm, &dir, size, rep, map_gb, plan)?
             } else {
-                PassOutcome::Done(one_pass(arm, &dir, size, map_gb, plan, &payload, None)?)
+                PassOutcome::Done(Box::new(one_pass(
+                    arm, &dir, size, map_gb, plan, &payload, None,
+                )?))
             };
             let _ = std::fs::remove_dir_all(&dir);
             let one = match outcome {
@@ -3272,6 +4214,9 @@ pub fn ab(
                     break;
                 }
             };
+            if let Some(note) = audit_note(arm, size, rep, &one) {
+                let _ = writeln!(log, "{note}");
+            }
             if i == 0 {
                 got = one.flat();
             } else if rep > 0 {
@@ -3433,6 +4378,13 @@ fn share(ops: u64, threads: usize, i: usize) -> u64 {
     ops / threads as u64 + u64::from((i as u64) < ops % threads as u64)
 }
 
+/// Thread `i`'s seed under a pass's base seed. Distinct per thread and
+/// deterministic: one multiplicative mix of the base and the thread's
+/// index, so the streams do not start a few steps apart.
+fn thread_seed(seed: u64, i: usize) -> u64 {
+    (seed + i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
 /// `ops` operations of `op`, keys drawn uniformly below `keys`, split
 /// across `threads` threads, each through a reader of its own -- made on
 /// this thread, opened on its own -- and a generator seeded apart from
@@ -3474,6 +4426,7 @@ fn threaded(
     threads: usize,
     ops: u64,
     keys: u64,
+    km: &KeyMap,
     seed: u64,
     op: Op,
     count: bool,
@@ -3496,11 +4449,8 @@ fn threaded(
             .map(|(i, open)| {
                 let barrier = &barrier;
                 let share = share(ops, threads, i);
-                // Distinct per thread and deterministic: one multiplicative
-                // mix of the base and the thread's index, so the streams
-                // do not start a few steps apart.
-                let seed = (seed + i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                s.spawn(move || -> Timed {
+                let seed = thread_seed(seed, i);
+                let work = move || -> Timed {
                     // Every thread reaches the barrier whatever opening
                     // did: one that returned before it would leave the
                     // others and the clock waiting forever, and a panic
@@ -3526,7 +4476,7 @@ fn threaded(
                     let mut r = opened?;
                     let mut bytes = 0u64;
                     for _ in 0..share {
-                        db_key_into(g.next(), &mut kb);
+                        km.key_into(g.next(), &mut kb);
                         bytes += match op {
                             Op::Get => r.get(&kb)?,
                             Op::Range(n) => r.range(&kb, n)?,
@@ -3547,7 +4497,19 @@ fn threaded(
                         (0, 0)
                     };
                     Ok((start, end, bytes, cpu, own))
-                })
+                };
+                // Named in the build that counts allocations by thread
+                // (`alloc_census`), so a reader's are told from a seal's,
+                // whose thread carries the process's name; unnamed
+                // otherwise, as the readers have always been.
+                #[cfg(feature = "alloc-census")]
+                let worker = std::thread::Builder::new()
+                    .name("bench-reader".into())
+                    .spawn_scoped(s, work)
+                    .expect("a reader thread");
+                #[cfg(not(feature = "alloc-census"))]
+                let worker = s.spawn(work);
+                worker
             })
             .collect();
         // The other threads' clocks, read with the readers spawned and
@@ -3555,6 +4517,7 @@ fn threaded(
         if spans {
             sched_before = sched_of_tasks();
         }
+        phase_mark(e.name(), &format!("{pass}-{threads}t"), "start");
         barrier.wait();
         workers
             .into_iter()
@@ -3564,6 +4527,7 @@ fn threaded(
             })
             .collect()
     });
+    phase_mark(e.name(), &format!("{pass}-{threads}t"), "end");
     let sched_after = if spans { sched_of_tasks() } else { Vec::new() };
     let mut timed = Vec::with_capacity(threads);
     let mut bytes = 0u64;
@@ -3644,6 +4608,132 @@ struct Threaded {
     own: (u64, u64),
 }
 
+/// What a threaded mix measured: the span from the first thread's release
+/// to the last's finish, and the reads every thread made with the bytes
+/// they handed back.
+struct ThreadedMixed {
+    secs: f64,
+    reads: u64,
+    bytes: u64,
+}
+
+/// `ops` operations of `mix`, keys drawn by `dist` below `keys`, split
+/// across `threads` threads that read and write the one store at once,
+/// each through a handle of its own (`Engine::thread_writers`) -- made on
+/// this thread, opened on its own -- with a key generator, a coin and a
+/// value stream seeded apart from the others'. A thread's updates are
+/// batched by `YCSB_BATCH` and committed as the mixes commit theirs, its
+/// tail inside its window; an engine with a read-modify-write of its own
+/// runs it, one operation at a time (`ThreadWriter::rmw`). The clock is
+/// `threaded`'s: the threads are released together and the result is the
+/// span from the first release to the last finish.
+///
+/// Nothing syncs inside the window. A buffered arm's commit is in the
+/// kernel when it returns, and what an engine promises less than that is
+/// its arm's to say (`Features`).
+#[allow(clippy::too_many_arguments)]
+fn threaded_mix(
+    e: &mut dyn Engine,
+    pass: &str,
+    threads: usize,
+    ops: u64,
+    keys: u64,
+    km: &KeyMap,
+    seed: u64,
+    mix: ThreadedMix,
+    dist: KeyDist,
+    payload: &Payload,
+) -> Result<ThreadedMixed, String> {
+    if threads == 0 {
+        return Err("a threaded mix needs at least one thread".to_string());
+    }
+    let name = e.name();
+    let openers = e.thread_writers(threads)?;
+    let barrier = std::sync::Barrier::new(threads + 1);
+    type Timed = Result<(Instant, Instant, u64, u64), String>;
+    let results: Vec<Timed> = std::thread::scope(|s| {
+        let workers: Vec<_> = openers
+            .into_iter()
+            .enumerate()
+            .map(|(i, open)| {
+                let barrier = &barrier;
+                let share = share(ops, threads, i);
+                let seed = thread_seed(seed, i);
+                s.spawn(move || -> Timed {
+                    // Every thread reaches the barrier whatever opening
+                    // did, as in `threaded`.
+                    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(open))
+                        .unwrap_or_else(|_| Err("the writer's opener panicked".to_string()));
+                    let mut g = KeyGen::new(dist, keys, seed);
+                    let mut pick = Rng::new(seed ^ 0x5EED);
+                    let mut vrng = Rng::new(seed ^ 0xE2);
+                    let mut kb = [0u8; KEY_SIZE];
+                    let mut wbuf = Batch::with_capacity(YCSB_BATCH, payload.value_size());
+                    barrier.wait();
+                    let start = Instant::now();
+                    let mut w = opened?;
+                    let (mut reads, mut bytes) = (0u64, 0u64);
+                    for _ in 0..share {
+                        km.key_into(g.next(), &mut kb);
+                        match mix {
+                            ThreadedMix::HalfUpdates => {
+                                if pick.below(100) < 50 {
+                                    bytes += w.get(&kb)? as u64;
+                                    reads += 1;
+                                } else {
+                                    wbuf.push(&kb, payload.get(&mut vrng));
+                                }
+                            }
+                            ThreadedMix::Rmw => {
+                                let v = payload.get(&mut vrng);
+                                reads += 1;
+                                match w.rmw(&kb, v) {
+                                    Some(read) => bytes += read? as u64,
+                                    None => {
+                                        bytes += w.get(&kb)? as u64;
+                                        wbuf.push(&kb, v);
+                                    }
+                                }
+                            }
+                        }
+                        if wbuf.len() >= YCSB_BATCH {
+                            wbuf.flush_updates_to(w.as_mut())?;
+                        }
+                    }
+                    wbuf.flush_updates_to(w.as_mut())?;
+                    let end = Instant::now();
+                    Ok((start, end, reads, bytes))
+                })
+            })
+            .collect();
+        phase_mark(name, &format!("{pass}-{threads}t"), "start");
+        barrier.wait();
+        workers
+            .into_iter()
+            .map(|w| {
+                w.join()
+                    .unwrap_or_else(|_| Err("a writer thread panicked".to_string()))
+            })
+            .collect()
+    });
+    phase_mark(name, &format!("{pass}-{threads}t"), "end");
+    let (mut reads, mut bytes) = (0u64, 0u64);
+    let mut first: Option<Instant> = None;
+    let mut last: Option<Instant> = None;
+    for r in results {
+        let (start, end, n, b) = r?;
+        reads += n;
+        bytes += b;
+        first = Some(first.map_or(start, |f| f.min(start)));
+        last = Some(last.map_or(end, |l| l.max(end)));
+    }
+    let secs = match (first, last) {
+        (Some(f), Some(l)) => l.duration_since(f).as_secs_f64(),
+        _ => 0.0,
+    };
+    Ok(ThreadedMixed { secs, reads, bytes })
+}
+
 /// One YCSB workload over a loaded store: `ops` operations (`ycsb_ops`,
 /// divided out of core), writes batched by `YCSB_BATCH` and the tail
 /// flushed inside the timed region, inserts taking fresh keys past the
@@ -3681,10 +4771,10 @@ impl MixKinds {
         }
     }
 
-    fn report(&self, arm: &str, letter: char, size: u64, ops: u64, total: f64) {
+    fn report(&self, arm: &str, mix: &str, size: u64, ops: u64, total: f64) {
         if self.on {
             eprintln!(
-                "mixkinds {arm} {letter} size {size} ops {ops} gets {} {:.3} scans {} {:.3} commits {} {:.3} total {:.3}",
+                "mixkinds {arm} {mix} size {size} ops {ops} gets {} {:.3} scans {} {:.3} commits {} {:.3} total {:.3}",
                 self.gets.0,
                 self.gets.1 * 1e3,
                 self.scans.0,
@@ -3697,47 +4787,177 @@ impl MixKinds {
     }
 }
 
+/// One family of the six mixes, each in `YCSB_ORDER` on the store the one
+/// before leaves: the rate of each, with the counters, census, heat and
+/// fold lines the environment asks for. `prefix` names the family's
+/// workloads (`ycsb`, `ycsbs`) and `seed_salt` its key seeds, and
+/// `inserted` carries the insert count across the families, since both
+/// insert above the loaded keys.
+#[allow(clippy::too_many_arguments)]
+fn mix_family(
+    e: &mut dyn Engine,
+    arm: &str,
+    prefix: &str,
+    table: &[(char, u32, u32, u32, u32, u32, KeyDist); 6],
+    seed_salt: u64,
+    size: u64,
+    km: &KeyMap,
+    mix_ops: u64,
+    inserted: &mut u64,
+    payload: &Payload,
+    counting: &mut Counting,
+) -> Result<Vec<(char, f64)>, String> {
+    let mut ops_s = Vec::with_capacity(table.len());
+    // With `SUPDB_MIX_COUNTERS` set, the store's counters around each mix,
+    // as `SUPDB_LAG_COUNTERS` reads them around a lag point: one
+    // `mixcounters` line a mix on stderr, read before the mix and after it
+    // and never between. A mix's commits are inside its timed region, so
+    // the line's burst is zero and its pass is the whole mix.
+    let mix_counting = std::env::var_os("SUPDB_MIX_COUNTERS").is_some();
+    // With `SUPDB_MIX_CENSUS` set, the engine's census of what the process
+    // holds after each mix, one `mixcensus` line a mix, as the lag sweep's
+    // `lagcensus`: the form files' fit beside the process is read there.
+    // Set to `2`, the allocator's bytes by arena and the anonymous mappings
+    // by size follow it, as they follow `lagcensus`: a walk of every free
+    // chunk under each arena's lock, asked for and not given.
+    let mix_census = std::env::var_os("SUPDB_MIX_CENSUS").is_some();
+    let mix_census_detail = std::env::var("SUPDB_MIX_CENSUS").is_ok_and(|v| v == "2");
+    let can_scan = e.features().ordered_scan;
+    for letter in YCSB_ORDER {
+        let w = table.iter().find(|w| w.0 == letter).unwrap();
+        if w.4 > 0 && !can_scan {
+            continue;
+        }
+        let c0 = if mix_counting {
+            e.counters()
+        } else {
+            Vec::new()
+        };
+        let (flt_up0, flt_main0) = if mix_counting {
+            (minflt_of("supdb-upkeep"), minflt_self())
+        } else {
+            (0, 0)
+        };
+        let mix = format!("{prefix}-{letter}");
+        // A probe's fold before the mixes it names (`SUPDB_MIX_FOLD`, the
+        // letters, `Engine::fold`): the writes before the mix folded into
+        // the store outside its window, its time and the form's cover on a
+        // `mixfold` line. Never set for a row.
+        if std::env::var("SUPDB_MIX_FOLD").is_ok_and(|v| v.contains(letter)) {
+            let t = std::time::Instant::now();
+            e.fold()?;
+            eprintln!(
+                "mixfold {arm} {mix} ms {:.0}",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        let cb = counting.begin();
+        phase_mark(arm, &mix, "start");
+        let secs = ycsb(
+            e, arm, &mix, w, seed_salt, size, km, mix_ops, inserted, payload,
+        )?;
+        phase_mark(arm, &mix, "end");
+        counting.end(cb, &mix, "", None, mix_ops);
+        ops_s.push((letter, mix_ops as f64 / secs));
+        if mix_counting {
+            let c1 = e.counters();
+            counters_line(
+                "mixcounters",
+                arm,
+                &mix,
+                (
+                    minflt_of("supdb-upkeep").saturating_sub(flt_up0),
+                    minflt_self().saturating_sub(flt_main0),
+                ),
+                (0.0, secs * 1e3),
+                &c0,
+                &c1,
+            );
+        }
+        // With `SUPDB_MIX_HEAT` set, each form file's decodes over its life
+        // after each mix, by partition (`Engine::zpage_heat`): a reader
+        // differences consecutive mixes for where a mix's decodes land.
+        if std::env::var_os("SUPDB_MIX_HEAT").is_some() {
+            eprintln!("mixheat {arm} {mix} | {}", e.zpage_heat());
+        }
+        if mix_census {
+            census_line("mixcensus", arm, &mix, &*e, mix_census_detail);
+        }
+    }
+    Ok(ops_s)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn ycsb(
     e: &mut dyn Engine,
     arm: &str,
+    mix: &str,
     w: &(char, u32, u32, u32, u32, u32, KeyDist),
+    seed_salt: u64,
     size: u64,
+    km: &KeyMap,
     ops: u64,
     inserted: &mut u64,
     payload: &Payload,
 ) -> Result<f64, String> {
     let (letter, pread, pupd, pins, pscan, prmw, dist) = *w;
-    let mut keys = KeyGen::new(dist, size, 0x9C5B ^ letter as u64);
+    // The key space each distribution draws over. The latest distribution
+    // is over every key that exists, the loaded ones and the ones the mixes
+    // before this one committed, and grows as this mix's inserts commit.
+    // YCSB's scrambled Zipfian folds onto a space fixed at the mix's start
+    // -- the keys that exist plus twice the inserts expected, YCSB's own
+    // fudge factor -- so which keys are popular does not move as keys are
+    // inserted, and a draw above the last committed key is drawn again, as
+    // YCSB draws it. The first family draws over the loaded keys, as every
+    // row so far has.
+    let keyspace = match dist {
+        KeyDist::Latest => size + *inserted,
+        KeyDist::Scrambled => size + *inserted + 2 * (ops * pins as u64 / 100),
+        _ => size,
+    };
+    let mut keys = KeyGen::new(dist, keyspace, 0x9C5B ^ letter as u64 ^ seed_salt);
+    // The inserts committed so far: every insert of the mixes before this
+    // one, and this one's as its batches flush. A read never targets a key
+    // whose commit has not returned.
+    let mut committed = *inserted;
     let mut pick = Rng::new(0x5EED ^ letter as u64);
     let mut vrng = Rng::new(0xE2);
     let mut kb = [0u8; KEY_SIZE];
     let mut wbuf = Batch::with_capacity(YCSB_BATCH, payload.value_size());
     let mut wbuf_is_insert = false;
     let mut kinds = MixKinds::new();
+    // A key that exists: a draw at or above the committed keys is drawn
+    // again, which only the scrambled family's fixed space can produce.
+    let existing = |keys: &mut KeyGen, committed: u64| loop {
+        let k = keys.next();
+        if k < size + committed {
+            return k;
+        }
+    };
     let t = Instant::now();
     for _ in 0..ops {
         let roll = pick.below(100) as u32;
         if roll < pread {
-            db_key_into(keys.next(), &mut kb);
+            km.key_into(existing(&mut keys, committed), &mut kb);
             let t0 = kinds.start();
             e.get(&kb)?;
             MixKinds::add(&mut kinds.gets, t0);
         } else if roll < pread + pupd {
-            db_key_into(keys.next(), &mut kb);
+            km.key_into(existing(&mut keys, committed), &mut kb);
             wbuf.push(&kb, payload.get(&mut vrng));
             wbuf_is_insert = false;
         } else if roll < pread + pupd + pins {
-            db_key_into(size + *inserted, &mut kb);
+            km.key_into(size + *inserted, &mut kb);
             *inserted += 1;
             wbuf.push(&kb, payload.get(&mut vrng));
             wbuf_is_insert = true;
         } else if roll < pread + pupd + pins + pscan {
-            db_key_into(keys.next(), &mut kb);
+            km.key_into(existing(&mut keys, committed), &mut kb);
             let t0 = kinds.start();
             e.range(&kb, YCSB_SCAN)?;
             MixKinds::add(&mut kinds.scans, t0);
         } else if prmw > 0 {
-            db_key_into(keys.next(), &mut kb);
+            km.key_into(existing(&mut keys, committed), &mut kb);
             let t0 = kinds.start();
             e.get(&kb)?;
             MixKinds::add(&mut kinds.gets, t0);
@@ -3745,16 +4965,23 @@ fn ycsb(
             wbuf_is_insert = false;
         }
         if wbuf.len() >= YCSB_BATCH {
+            let n = wbuf.len() as u64;
             let t0 = kinds.start();
             flush_ycsb(&mut wbuf, e, wbuf_is_insert)?;
             MixKinds::add(&mut kinds.commits, t0);
+            if wbuf_is_insert {
+                committed += n;
+                if dist == KeyDist::Latest {
+                    keys.set_keys(size + committed);
+                }
+            }
         }
     }
     let t0 = kinds.start();
     flush_ycsb(&mut wbuf, e, wbuf_is_insert)?;
     MixKinds::add(&mut kinds.commits, t0);
     let total = t.elapsed().as_secs_f64();
-    kinds.report(arm, letter, size, ops, total);
+    kinds.report(arm, mix, size, ops, total);
     Ok(total)
 }
 
@@ -3764,6 +4991,132 @@ fn flush_ycsb(b: &mut Batch, e: &mut dyn Engine, insert: bool) -> Result<(), Str
     } else {
         b.flush_updates(e)
     }
+}
+
+/// A pass's reads, scans and mixes in the pass's order, over an engine that
+/// models a store and holds none (`bench/examples/formfit.rs`): the read
+/// pass, the threaded reads, the scan pass, the threaded scans, the first
+/// family, the threaded scans again and the second family, each from the
+/// generator and the seed the pass itself draws with and the mixes through
+/// `ycsb` itself, so a model is driven by the suite's own definition of a
+/// workload and not by a copy of it. `phase` is called after each with the
+/// name the row gives it and its operation count.
+///
+/// The threaded passes go to `e` one operation a thread a turn, which is a
+/// model of a schedule: the real threads interleave as the host runs them.
+/// Nothing is timed and nothing loaded; the engine is taken to hold `size`
+/// keys already.
+pub fn replay_row<E: Engine>(
+    e: &mut E,
+    size: u64,
+    plan: &Plan,
+    mut phase: impl FnMut(&mut E, &str, u64),
+) -> Result<(), String> {
+    fn turns(
+        e: &mut dyn Engine,
+        threads: usize,
+        ops: u64,
+        keys: u64,
+        km: &KeyMap,
+        seed: u64,
+        scan: Option<usize>,
+    ) -> Result<(), String> {
+        let mut gens: Vec<(KeyGen, u64)> = (0..threads)
+            .map(|i| {
+                (
+                    KeyGen::new(KeyDist::Uniform, keys, thread_seed(seed, i)),
+                    share(ops, threads, i),
+                )
+            })
+            .collect();
+        let mut kb = [0u8; KEY_SIZE];
+        let mut left = ops;
+        while left > 0 {
+            for (g, mine) in &mut gens {
+                if *mine == 0 {
+                    continue;
+                }
+                *mine -= 1;
+                left -= 1;
+                km.key_into(g.next(), &mut kb);
+                match scan {
+                    None => e.get(&kb)?,
+                    Some(n) => e.range(&kb, n)?,
+                };
+            }
+        }
+        Ok(())
+    }
+    let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
+    let mut kb = [0u8; KEY_SIZE];
+    let km = plan.keymap(size);
+
+    let reads = plan.divided(size);
+    let mut g = KeyGen::new(KeyDist::Uniform, size, READ_SEED);
+    for _ in 0..reads {
+        km.key_into(g.next(), &mut kb);
+        e.get(&kb)?;
+    }
+    phase(e, "read", reads);
+    for &threads in &plan.threads {
+        let ops = reads * threads as u64;
+        turns(e, threads, ops, size, &km, READ_THREADED_SEED, None)?;
+        phase(e, &format!("read_{threads}t"), ops);
+    }
+
+    let scans = plan.divided((size / plan.scan_len as u64).max(1));
+    let scan_keys = size.saturating_sub(plan.scan_len as u64).max(1);
+    let mut g2 = KeyGen::new(KeyDist::Uniform, scan_keys, SCAN_SEED);
+    for _ in 0..scans {
+        km.key_into(g2.next(), &mut kb);
+        e.range(&kb, plan.scan_len)?;
+    }
+    phase(e, "scan", scans);
+    let threaded_scan = |e: &mut E,
+                         name: &str,
+                         seed: u64,
+                         phase: &mut dyn FnMut(&mut E, &str, u64)|
+     -> Result<(), String> {
+        for &threads in &plan.threads {
+            let ops = plan.divided(size) * threads as u64;
+            turns(e, threads, ops, scan_keys, &km, seed, Some(plan.scan_len))?;
+            phase(e, &format!("{name}_{threads}t"), ops);
+        }
+        Ok(())
+    };
+    threaded_scan(e, "scan", SCAN_THREADED_SEED, &mut phase)?;
+
+    let mut inserted = 0u64;
+    let mix_ops = plan.divided(ycsb_ops(size));
+    let mut family = |e: &mut E,
+                      prefix: &str,
+                      table: &[(char, u32, u32, u32, u32, u32, KeyDist); 6],
+                      salt: u64,
+                      phase: &mut dyn FnMut(&mut E, &str, u64)|
+     -> Result<(), String> {
+        for letter in YCSB_ORDER {
+            let w = table.iter().find(|w| w.0 == letter).unwrap();
+            let mix = format!("{prefix}-{letter}");
+            ycsb(
+                e,
+                "replay",
+                &mix,
+                w,
+                salt,
+                size,
+                &km,
+                mix_ops,
+                &mut inserted,
+                &payload,
+            )?;
+            phase(e, &mix, mix_ops);
+        }
+        Ok(())
+    };
+    family(e, "ycsb", &YCSB, 0, &mut phase)?;
+    threaded_scan(e, "scan-mixed", SCAN_MIXED_SEED, &mut phase)?;
+    family(e, "ycsbs", &YCSBS, YCSBS_SEED_SALT, &mut phase)?;
+    Ok(())
 }
 
 /// Load `size` keys through `order`, batched, ending with one `sync` so a
@@ -3779,6 +5132,7 @@ fn load(
     let mut vrng = Rng::new(0xE1);
     let mut buf = Batch::with_capacity(plan.batch, payload.value_size());
     let mut kb = [0u8; KEY_SIZE];
+    let km = plan.keymap(size);
     let io0 = IoCounters::read_now();
     let t = Instant::now();
     let (mut tc, mut tfirst, mut tmax, mut nc) = (0f64, 0f64, 0f64, 0usize);
@@ -3786,7 +5140,7 @@ fn load(
     let cpu0 = thread_cpu_us();
     phase_mark(e.name(), "load", "start");
     for i in 0..size {
-        db_key_into(order(i), &mut kb);
+        km.key_into(order(i), &mut kb);
         buf.push(&kb, payload.get(&mut vrng));
         if buf.len() == plan.batch {
             let t0 = Instant::now();
@@ -4144,6 +5498,22 @@ fn populate_write(_ptr: *mut libc::c_void, _len: usize) -> bool {
 /// this floor came from. It is sampled through the row, not only at its
 /// start, because the price moves within one. Pages a second, and the
 /// mapping for the caller to hold.
+/// The page floor's pages held to the run's end (`FreshPages`), except
+/// where the run's process shares its bound with the passes
+/// (`Mode::Shared`): there every page it holds is a page no pass may use,
+/// and they are given back at once.
+fn hold_floor(plan: &Plan, fresh: &mut Vec<FreshPages>, held: FreshPages) {
+    if plan
+        .bound
+        .as_ref()
+        .is_some_and(|b| b.mode() == crate::bound::Mode::Shared)
+    {
+        drop(held);
+    } else {
+        fresh.push(held);
+    }
+}
+
 fn page_floor() -> Result<(f64, FreshPages), String> {
     // SAFETY: a plain query of the system's page size.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -4398,6 +5768,30 @@ mod tests {
         );
     }
 
+    /// A run's row is of its plan's keys: a run over ids writes rows of
+    /// ids from its first banked rung, in the ids' class, and one over the
+    /// numbered keys a row that says nothing of them.
+    #[test]
+    fn a_row_is_of_its_plans_keys() {
+        let machine = crate::env::capture();
+        for keys in [KeyShape::Numbered, KeyShape::Ids] {
+            let mut plan = Plan::new(Scale::Quick, vec!["supdb".into()], 10_000, 4);
+            plan.keys = keys;
+            let row = row_of(
+                "20260101T000000Z",
+                "0123456789abcdef",
+                "rustc",
+                &machine,
+                &plan,
+                &Samples::new(),
+                &[],
+                &[],
+            );
+            assert_eq!(row.keys, keys);
+            assert_eq!(row.class().ends_with("/kids"), keys == KeyShape::Ids);
+        }
+    }
+
     #[test]
     fn every_quantity_the_runner_records_has_a_direction() {
         for q in [
@@ -4454,7 +5848,8 @@ mod tests {
         assert_eq!(threads_of("reads_per_s"), None);
         assert_eq!(threads_of("entries_per_s"), None);
         assert_eq!(threads_of("p99_us"), None);
-        assert_eq!(threads_of("ops_per_s_2t"), None);
+        assert_eq!(threads_of("ops_per_s_2t"), Some(2));
+        assert_eq!(threads_of("ops_per_s"), None);
     }
 
     /// Every engine's threaded readers read the store the writer loaded:
@@ -4501,7 +5896,18 @@ mod tests {
             // cgroup's; elsewhere the pass counts nothing, as the runner's
             // passes there do.
             let count = cfg!(target_os = "linux");
-            let got = threaded(e.as_ref(), "read", 2, size, size, 1, Op::Get, count).unwrap();
+            let got = threaded(
+                e.as_ref(),
+                "read",
+                2,
+                size,
+                size,
+                &KeyMap::numbered(),
+                1,
+                Op::Get,
+                count,
+            )
+            .unwrap();
             assert_eq!(
                 got.bytes,
                 size * plan.value_size as u64,
@@ -4558,6 +5964,7 @@ mod tests {
                 2,
                 scans,
                 size - plan.scan_len as u64,
+                &KeyMap::numbered(),
                 2,
                 Op::Range(plan.scan_len),
                 false,
@@ -4809,6 +6216,7 @@ mod tests {
                 &mut e,
                 "supdb-nocachezpages",
                 1_000,
+                &KeyMap::numbered(),
                 50,
                 &mut h,
                 &mut counting,
@@ -4901,6 +6309,524 @@ mod tests {
         }))
         .unwrap_err();
         assert!(out.contains("out of service"), "{out}");
+    }
+
+    /// A stride arm is held after the ordered load to a store with a stride
+    /// file in it, beside the coverage rules every forced arm is held to:
+    /// green with one or more, red with none whatever its coverage, and at
+    /// no other stage, since the shuffled store's merge outputs are the
+    /// counts' to read; a block arm, which asks for no stride form, is
+    /// asked for none.
+    #[test]
+    fn a_stride_arm_with_no_stride_file_after_the_load_is_refused() {
+        let covered = ZState {
+            forced: true,
+            stride: true,
+            partitions: 18,
+            form_files: 18,
+            files: 18,
+            stride_files: 18,
+            ..ZState::default()
+        };
+        let run = |stage, z: ZState| zpages_refusal("supdb-nocachezstride", 1_000, stage, Some(z));
+        assert!(run(ZStage::Loaded, covered).is_ok());
+        let some = ZState {
+            stride_files: 1,
+            ..covered
+        };
+        assert!(
+            run(ZStage::Loaded, some).is_ok(),
+            "a partition declined is a block file, and the counts say why"
+        );
+        let none = ZState {
+            stride_files: 0,
+            ..covered
+        };
+        let why = run(ZStage::Loaded, none).unwrap_err();
+        assert!(
+            why.starts_with("supdb-nocachezstride at 1000: ")
+                && why.contains("none of 18 form files is a stride file after the load"),
+            "{why}"
+        );
+        for stage in [ZStage::Read, ZStage::Shuffled] {
+            let z = ZState { reads: 10, ..none };
+            assert!(run(stage, z).is_ok(), "{stage:?}");
+        }
+        // The coverage rules come first, and hold a stride arm as they hold
+        // the block arm.
+        let short = ZState {
+            form_files: 17,
+            files: 17,
+            stride_files: 17,
+            ..covered
+        };
+        assert!(run(ZStage::Loaded, short).unwrap_err().contains("17 of 18"));
+        // A block arm is asked for no stride file.
+        let block = ZState {
+            stride: false,
+            stride_files: 0,
+            ..covered
+        };
+        assert!(run(ZStage::Loaded, block).is_ok());
+        // Nor is an arm with the compact form off, which carries the
+        // engine's stride form as an option nothing of it reaches: no
+        // partition has a form file of either kind, at any stage.
+        let off = ZState {
+            stride: true,
+            partitions: 3,
+            ..ZState::default()
+        };
+        for stage in [ZStage::Loaded, ZStage::Read, ZStage::Shuffled] {
+            assert!(
+                zpages_refusal("supdb-nozpages", 1_000, stage, Some(off)).is_ok(),
+                "{stage:?}"
+            );
+        }
+    }
+
+    /// The ordered load asks, after it, whether a stride arm's store holds
+    /// a stride file -- the call site of a refusal that a real arm reaches
+    /// red only over keys or values the form does not take, so it is asked
+    /// of something that can lie, and then of a real stride arm's store of
+    /// keys with holes in their run, which declines the form in every
+    /// partition and is the state the refusal is for.
+    #[test]
+    fn the_ordered_load_asks_whether_a_stride_arm_built_the_stride_form() {
+        let mut counting = Counting::new(None, Path::new("."), None).unwrap();
+        let plan = Plan::new(Scale::Quick, vec![], 1_000, 4);
+        let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
+        let covered = ZState {
+            forced: true,
+            stride: true,
+            partitions: 3,
+            form_files: 3,
+            files: 3,
+            stride_files: 3,
+            ..ZState::default()
+        };
+        let mut phase = |z: Option<ZState>| {
+            let mut e = Telling { z, gets: 0 };
+            ordered_load(
+                &mut e,
+                "supdb-nocachezstride",
+                1_000,
+                &plan,
+                &payload,
+                &mut counting,
+            )
+        };
+        assert!(phase(Some(covered)).is_ok());
+        assert!(
+            phase(None).is_ok(),
+            "an engine with no form is asked nothing"
+        );
+        let none = phase(Some(ZState {
+            stride_files: 0,
+            ..covered
+        }))
+        .unwrap_err();
+        assert!(none.contains("is a stride file after the load"), "{none}");
+        // The block form's rules are asked at the same site.
+        let raw = phase(Some(ZState {
+            form_files: 0,
+            files: 0,
+            stride_files: 0,
+            ..covered
+        }))
+        .unwrap_err();
+        assert!(raw.contains("none of 3 partitions"), "{raw}");
+
+        // A real stride arm over every other number: the shape and the one
+        // value of one width, and holes in the run.
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-zstrideload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let state = |dir: &str, step: u64| {
+            let d = root.join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            let mut e = engines::open("supdb-nocachezstride", &d, 1).unwrap();
+            let value = [7u8; 100];
+            let mut keys = Vec::new();
+            for i in 0..30_000u64 {
+                let mut k = [0u8; KEY_SIZE];
+                db_key_into(step * i, &mut k);
+                keys.push(k);
+            }
+            for chunk in keys.chunks(1_000) {
+                let items: Vec<(&[u8], &[u8])> =
+                    chunk.iter().map(|k| (&k[..], &value[..])).collect();
+                e.write_batch(&items).unwrap();
+            }
+            e.sync().unwrap();
+            e.zpages_state()
+        };
+        let holed = state("holed", 2);
+        let why =
+            zpages_refusal("supdb-nocachezstride", 30_000, ZStage::Loaded, holed).unwrap_err();
+        assert!(
+            why.contains("is a stride file after the load"),
+            "{holed:?}: {why}"
+        );
+        let run = state("run", 1);
+        assert!(
+            zpages_refusal("supdb-nocachezstride", 30_000, ZStage::Loaded, run).is_ok(),
+            "{run:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An engine that holds the keys it is told to and nothing else: the
+    /// recovery check asked of something that can lie, since a real
+    /// engine's reopened store is never one the refusals are for.
+    struct Holding {
+        /// Keys below this are held, but for `gone`; none at or above it,
+        /// but for `stray`.
+        below: u64,
+        gone: Vec<u64>,
+        stray: Vec<u64>,
+        value: usize,
+    }
+
+    impl Engine for Holding {
+        fn name(&self) -> &'static str {
+            "holding"
+        }
+        fn features(&self) -> engines::Features {
+            engines::Features {
+                durable_commit: true,
+                transactions: false,
+                checksums: false,
+                reopen_for_write: false,
+                read_your_writes: true,
+                ordered_scan: true,
+            }
+        }
+        fn write_batch(&mut self, _: &[(&[u8], &[u8])]) -> engines::Res<()> {
+            Ok(())
+        }
+        fn get(&mut self, key: &[u8]) -> engines::Res<usize> {
+            let k = key_number(key);
+            let held = (k < self.below && !self.gone.contains(&k)) || self.stray.contains(&k);
+            Ok(if held { self.value } else { 0 })
+        }
+        fn range(&mut self, _: &[u8], _: usize) -> engines::Res<usize> {
+            Ok(0)
+        }
+        fn sync(&mut self) -> engines::Res<()> {
+            Ok(())
+        }
+        fn size_bytes(&self) -> u64 {
+            0
+        }
+        fn thread_reader(&self) -> engines::Res<engines::ReaderOpener> {
+            Err("no reader".into())
+        }
+    }
+
+    /// The recovery check counts the tail of batches a store does not hold
+    /// and refuses every store nobody was promised: a durable store short
+    /// of a batch, a batch in part, a batch behind a missing one, a key of
+    /// the staged tail, and a timed read that disagrees with the walk.
+    #[test]
+    fn a_reopened_store_is_held_to_what_was_acknowledged() {
+        let plan = Plan::new(Scale::Quick, vec![], 10_000, 4);
+        let (size, batch, value) = (10_000u64, plan.batch as u64, plan.value_size);
+        assert_eq!(
+            batch, 1_000,
+            "the fixtures below are in batches of a thousand"
+        );
+        let store = |below: u64, gone: &[u64], stray: &[u64]| Holding {
+            below,
+            gone: gone.to_vec(),
+            stray: stray.to_vec(),
+            value,
+        };
+        let ask = |mut e: Holding, durable: bool, got: usize| {
+            unrecovered(&mut e, "holding", size, &plan, None, durable, got)
+        };
+        // Every batch held: nothing lost under either guarantee.
+        assert_eq!(ask(store(size, &[], &[]), true, value), Ok(0));
+        assert_eq!(ask(store(size, &[], &[]), false, value), Ok(0));
+        // The last two batches gone: a buffered store's count, a durable
+        // store's refusal.
+        assert_eq!(ask(store(8_000, &[], &[]), false, 0), Ok(2));
+        let why = ask(store(8_000, &[], &[]), true, 0).unwrap_err();
+        assert!(
+            why.contains("lost 2 of the 10 batches") && why.contains("from batch 8"),
+            "{why}"
+        );
+        // Every batch gone is still a prefix, of none.
+        assert_eq!(ask(store(0, &[], &[]), false, 0), Ok(10));
+        // A batch in part, by either end.
+        for gone in [3_000, 3_999] {
+            let why = ask(store(size, &[gone], &[]), false, value).unwrap_err();
+            assert!(why.contains("holds batch 3 in part"), "{why}");
+        }
+        // A batch held behind one that is not.
+        let why = ask(store(5_000, &[], &[7_000, 7_999]), false, 0).unwrap_err();
+        assert!(why.contains("holds batch 7 and not batch 5"), "{why}");
+        // A key of the staged tail, anywhere in it.
+        for stray in [size, size + batch - 1] {
+            let why = ask(store(size, &[], &[stray]), true, value).unwrap_err();
+            assert!(why.contains(&format!("key {stray} of the tail")), "{why}");
+        }
+        // The first key past the tail is nobody's, and is not asked for.
+        assert_eq!(ask(store(size, &[], &[size + batch]), true, value), Ok(0));
+        // The timed read agrees with the walk: a hit over a store short of
+        // its last batch, a miss over a whole one, and a value of another
+        // length are each refused.
+        for (below, got) in [(8_000, value), (size, 0), (size, value - 1), (8_000, 7)] {
+            let why = ask(store(below, &[], &[]), false, got).unwrap_err();
+            assert!(
+                why.contains("for the last key committed"),
+                "{below} {got}: {why}"
+            );
+        }
+        // A last batch shorter than the others is read by its own ends.
+        let short = |below: u64, durable: bool, got: usize| {
+            let mut e = store(below, &[], &[]);
+            unrecovered(&mut e, "holding", 9_500, &plan, None, durable, got)
+        };
+        assert_eq!(short(9_500, true, value), Ok(0));
+        assert_eq!(short(9_000, false, 0), Ok(1));
+        let why = short(9_400, false, 0).unwrap_err();
+        assert!(why.contains("holds batch 9 in part"), "{why}");
+    }
+
+    /// An engine that records what a mix asks of it, in order: the keys
+    /// read, the keys scans start from, and each batch's keys as it is
+    /// written, so a test can hold every read to the keys committed before
+    /// it.
+    #[derive(Default)]
+    struct Recording {
+        events: Vec<Ev>,
+    }
+
+    enum Ev {
+        Get(u64),
+        Scan(u64),
+        Batch(Vec<u64>),
+    }
+
+    fn key_number(k: &[u8]) -> u64 {
+        std::str::from_utf8(k).unwrap().parse().unwrap()
+    }
+
+    impl Engine for Recording {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+        fn features(&self) -> engines::Features {
+            engines::Features {
+                durable_commit: true,
+                transactions: false,
+                checksums: false,
+                reopen_for_write: false,
+                read_your_writes: true,
+                ordered_scan: true,
+            }
+        }
+        fn write_batch(&mut self, items: &[(&[u8], &[u8])]) -> engines::Res<()> {
+            self.events.push(Ev::Batch(
+                items.iter().map(|(k, _)| key_number(k)).collect(),
+            ));
+            Ok(())
+        }
+        fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> engines::Res<()> {
+            self.write_batch(items)
+        }
+        fn get(&mut self, key: &[u8]) -> engines::Res<usize> {
+            self.events.push(Ev::Get(key_number(key)));
+            Ok(0)
+        }
+        fn range(&mut self, from: &[u8], _: usize) -> engines::Res<usize> {
+            self.events.push(Ev::Scan(key_number(from)));
+            Ok(0)
+        }
+        fn sync(&mut self) -> engines::Res<()> {
+            Ok(())
+        }
+        fn size_bytes(&self) -> u64 {
+            0
+        }
+        fn thread_reader(&self) -> engines::Res<engines::ReaderOpener> {
+            Err("no reader".into())
+        }
+    }
+
+    /// One mix of a family over the recording engine: the keys it read and
+    /// scanned, each with the count of keys committed when it was asked
+    /// (the loaded keys plus the inserts whose batches had been written),
+    /// and the inserts committed by its end.
+    fn recorded_mix(
+        family: &[(char, u32, u32, u32, u32, u32, KeyDist); 6],
+        letter: char,
+        salt: u64,
+        size: u64,
+        ops: u64,
+        inserted: &mut u64,
+    ) -> (Vec<(u64, u64)>, u64) {
+        let w = family.iter().find(|w| w.0 == letter).unwrap();
+        let payload = Payload::new(100, 0.5, 0xE1);
+        let mut e = Recording::default();
+        let mix = format!("{}-{letter}", if salt == 0 { "ycsb" } else { "ycsbs" });
+        let before = *inserted;
+        ycsb(
+            &mut e,
+            "recording",
+            &mix,
+            w,
+            salt,
+            size,
+            &KeyMap::numbered(),
+            ops,
+            inserted,
+            &payload,
+        )
+        .unwrap();
+        let mut committed = size + before;
+        let mut asked = Vec::new();
+        for ev in &e.events {
+            match ev {
+                Ev::Get(k) | Ev::Scan(k) => asked.push((*k, committed)),
+                Ev::Batch(keys) => committed += keys.iter().filter(|&&k| k >= size).count() as u64,
+            }
+        }
+        (asked, committed - size)
+    }
+
+    /// The second family's D reads the latest inserts: every key it reads
+    /// exists -- at or above one, as YCSB draws them, and below the keys
+    /// committed when the read was made, never one still in the batch --
+    /// and the keys this mix inserted take a large share of its reads,
+    /// where the first family's D, uniform over the loaded keys, reads none
+    /// of them. The reads after the family's E, which inserted before it,
+    /// start from every key that exists then.
+    #[test]
+    fn the_latest_mix_reads_the_keys_it_has_committed_and_no_others() {
+        let (size, ops) = (10_000u64, 20_000u64);
+        let mut inserted = 0u64;
+        let (asked, committed) =
+            recorded_mix(&YCSBS, 'D', YCSBS_SEED_SALT, size, ops, &mut inserted);
+        assert!(
+            committed >= ops * 5 / 100 - 100 && committed <= ops * 5 / 100 + 100,
+            "{committed}"
+        );
+        assert_eq!(
+            inserted, committed,
+            "the last batch is flushed at the mix's end"
+        );
+        assert!(
+            asked.len() > ops as usize * 90 / 100,
+            "{} reads",
+            asked.len()
+        );
+        for &(k, committed_then) in &asked {
+            assert!(
+                k >= 1 && k < committed_then,
+                "read {k} with {committed_then} keys committed"
+            );
+        }
+        let newest = asked.iter().filter(|(k, _)| *k >= size).count();
+        assert!(
+            newest > asked.len() / 4,
+            "{newest} of {} reads hit the keys the mix inserted",
+            asked.len()
+        );
+        // The first family's D never reads what it inserted.
+        let mut inserted_u = 0u64;
+        let (asked_u, _) = recorded_mix(&YCSB, 'D', 0, size, ops, &mut inserted_u);
+        assert!(asked_u.iter().all(|(k, _)| *k < size));
+        // A second mix after an inserting one draws over every key that
+        // exists: the loaded keys and the inserts before it.
+        let (asked_after, _) = recorded_mix(&YCSBS, 'D', YCSBS_SEED_SALT, size, ops, &mut inserted);
+        assert!(asked_after.iter().all(|&(k, c)| k >= 1 && k < c));
+        assert!(asked_after
+            .iter()
+            .any(|&(k, _)| k >= size && k < size + committed));
+    }
+
+    /// The scrambled mixes read keys that exist and spread their hot keys:
+    /// the read-only mix's hottest key is where YCSB's hash puts rank 0,
+    /// its lowest hundred keys take about their uniform share, and the
+    /// inserting mix's scans, drawn over a space that holds the inserts it
+    /// expects, start below the keys committed when each was asked.
+    #[test]
+    fn the_scrambled_mixes_read_existing_keys_from_a_spread_head() {
+        let (size, ops) = (10_000u64, 20_000u64);
+        let mut inserted = 0u64;
+        let (asked, committed) =
+            recorded_mix(&YCSBS, 'C', YCSBS_SEED_SALT, size, ops, &mut inserted);
+        assert_eq!(committed, 0);
+        assert_eq!(asked.len(), ops as usize);
+        let mut counts = vec![0u32; size as usize];
+        for &(k, _) in &asked {
+            counts[k as usize] += 1;
+        }
+        let hottest = (0..size).max_by_key(|&k| counts[k as usize]).unwrap();
+        assert_eq!(hottest, crate::workload::fnv64(0) % size);
+        let low: u32 = counts[..size as usize / 100].iter().sum();
+        assert!(
+            low < ops as u32 / 100 * 3,
+            "the lowest 1% took {low} of {ops}"
+        );
+        // The first family's C piles its reads on the lowest keys.
+        let (asked_z, _) = recorded_mix(&YCSB, 'C', 0, size, ops, &mut 0);
+        let low_z = asked_z.iter().filter(|(k, _)| *k < size / 100).count();
+        assert!(
+            low_z > ops as usize / 3,
+            "the plain Zipfian's lowest 1% took {low_z}"
+        );
+        let (scans, committed) =
+            recorded_mix(&YCSBS, 'E', YCSBS_SEED_SALT, size, ops, &mut inserted);
+        assert!(committed > 0);
+        assert!(scans.len() > ops as usize * 90 / 100);
+        for &(k, committed_then) in &scans {
+            assert!(
+                k < committed_then,
+                "a scan from {k} with {committed_then} keys committed"
+            );
+        }
+    }
+
+    /// The second family runs in a pass after the threaded scans on the
+    /// store the mixes leave, and reports a rate for each of its six mixes,
+    /// under its own pass name: a pass without it reports none.
+    #[test]
+    fn the_second_mix_family_reports_six_rates_under_its_pass() {
+        let _pass = TRIM.read().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("supdb-bench-ycsbs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut plan = Plan::new(Scale::Quick, vec![], 30_000, 4);
+        let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
+        plan.passes = Passes::parse("load,mixes,scan-mixed,mixes-scrambled").unwrap();
+        let both = one_pass("supdb", &root.join("both"), 2_000, 1, &plan, &payload, None).unwrap();
+        let flat = both.flat();
+        for family in ["ycsb", "ycsbs"] {
+            for letter in YCSB_ORDER {
+                let name = format!("{family}-{letter} ops_per_s");
+                let rate = flat
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .unwrap_or_else(|| panic!("no {name}"))
+                    .1;
+                assert!(rate.is_finite() && rate > 0.0, "{name} {rate}");
+            }
+        }
+        plan.passes = Passes::parse("load,mixes").unwrap();
+        let first = one_pass(
+            "supdb",
+            &root.join("first"),
+            2_000,
+            1,
+            &plan,
+            &payload,
+            None,
+        )
+        .unwrap();
+        assert!(first.flat().iter().any(|(n, _)| n.starts_with("ycsb-")));
+        assert!(!first.flat().iter().any(|(n, _)| n.starts_with("ycsbs-")));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The pass itself refuses a forced arm over a store with no form file to
@@ -5036,8 +6962,18 @@ mod tests {
     /// refused naming it, and an empty list is refused too.
     #[test]
     fn the_passes_parse_by_name_and_refuse_a_name_they_lack() {
+        // Every name is every pass of a row and the one that is in none
+        // unless it is named.
         let all = Passes::parse(&Passes::NAMES.join(",")).unwrap();
-        assert_eq!(all, Passes::all());
+        assert_eq!(
+            all,
+            Passes {
+                mixes_threaded: true,
+                ..Passes::all()
+            }
+        );
+        assert!(!Passes::all().mixes_threaded && !Passes::paired().mixes_threaded);
+        assert!(Passes::parse("mixes-threaded").unwrap().mixes_threaded);
         let some = Passes::parse("read, scan-threaded,lag").unwrap();
         assert!(some.read && some.scan_threaded && some.lag);
         assert!(!some.load && !some.read_threaded && !some.scan && !some.mixes);
@@ -5046,6 +6982,29 @@ mod tests {
         assert!(err.contains("scna"), "{err}");
         assert!(Passes::parse("").is_err());
         assert!(Passes::parse(" , ").is_err());
+    }
+
+    /// The recovery workloads are a row's in core, and a pairing's or a
+    /// bounded row's only where they are named; and a plan a binary from
+    /// before them wrote names none.
+    #[test]
+    fn the_recovery_workloads_run_in_core_rows_and_elsewhere_by_name() {
+        assert!(Plan::new(Scale::Quick, vec![], 10_000, 4).passes.recover);
+        assert!(Plan::new(Scale::Full, vec![], 10_000, 4).passes.recover);
+        assert!(!Plan::new(Scale::Ooc, vec![], 3_000_000, 4).passes.recover);
+        assert!(!Passes::paired().recover);
+        assert_eq!(
+            Passes {
+                recover: true,
+                ..Passes::paired()
+            },
+            Passes::all()
+        );
+        assert!(Passes::parse("recover").unwrap().recover);
+        let mut old = serde_json::to_value(Passes::all()).unwrap();
+        old.as_object_mut().unwrap().remove("recover").unwrap();
+        let old: Passes = serde_json::from_value(old).unwrap();
+        assert_eq!(old, Passes::paired());
     }
 
     /// The count names: each of the five under no suffix, a thread

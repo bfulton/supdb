@@ -23,19 +23,28 @@ permissions:
 jobs:
   detect:
     runs-on: macos-latest
+    # The job is RocksDB's build and a second of `bench machine`: eight
+    # minutes, and three times that on a slow runner.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain rust-toolchain.toml names, the one the local gate runs
+      # under; no workflow names a version or a channel of its own.
+      - name: The pinned toolchain
+        run: sh scripts/toolchain.sh
       - name: libclang, for bindgen
         run: sh bench/scripts/libclang.sh
+      # FASTER is a comparator too, and not a crate: the script fetches its
+      # sources at the pinned commit and installs the libraries they link.
+      # It does nothing off Linux x86-64, where there is no `faster` arm.
+      - name: FASTER, for the `faster` arm
+        run: sh bench/scripts/faster.sh
+      # `workspace -> target`, the target a path inside its workspace, and
+      # LIBCLANG_PATH in the key: see the `test` job of ci.yml.
       - uses: Swatinem/rust-cache@v2
         with:
-          # rust-cache takes the directory after `->` relative to the
-          # workspace before it, so the suite's is `target`; and libclang's
-          # directory is in the key, since clang-sys's cached build output
-          # names it (the `test` job in ci.yml has the failure).
           workspaces: bench -> target
-          env-vars: LIBCLANG_PATH
+          env-vars: LIBCLANG
       - name: Build
         working-directory: bench
         run: cargo build --release --bin bench

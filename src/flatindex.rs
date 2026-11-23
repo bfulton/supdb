@@ -38,6 +38,15 @@
 
 use crate::index::{Ext, Exts};
 
+/// Sub-phases of `encode`, printed under `SUPDB_CKPT_PHASES`. Here beside
+/// its caller, the writer half this module compiles on every target: in
+/// `format` it was the one item there with no reader behind it.
+fn enc_phase(what: &str, t: std::time::Instant) {
+    if std::env::var_os("SUPDB_CKPT_PHASES").is_some() {
+        eprintln!("      enc:{what} {:.4}s", t.elapsed().as_secs_f64());
+    }
+}
+
 /// "SFIX", little-endian.
 const MAGIC: u32 = 0x5849_4653;
 const VERSION: u32 = 3;
@@ -346,11 +355,26 @@ pub fn verify_pieces(
     shift: u32,
     base: u64,
 ) -> std::result::Result<(), usize> {
+    verify_pieces_with(sec, crc_off, shift, base, |_, _| {})
+}
+
+/// `verify_pieces`, telling `each` the section-relative range of every
+/// piece before it is hashed: the hook a reader asks the kernel ahead of
+/// the walk through (`blob::BlobOptions::read_ahead`), since over a
+/// mapping this walk is the one sequential read of the section.
+pub fn verify_pieces_with(
+    sec: &[u8],
+    crc_off: usize,
+    shift: u32,
+    base: u64,
+    mut each: impl FnMut(usize, usize),
+) -> std::result::Result<(), usize> {
     let n = checksum_row_len(crc_off, shift, base);
     let row = sec
         .get(crc_off..crc_off.checked_add(n).ok_or(usize::MAX)?)
         .ok_or(usize::MAX)?;
     for (i, (a, b)) in pieces(crc_off, shift, base).enumerate() {
+        each(a, b);
         if crate::block::crc32(&sec[a..b]) != piece_crc(row, i).ok_or(usize::MAX)? {
             return Err(i);
         }
@@ -533,6 +557,75 @@ pub fn record_key_next(buf: &[u8], off: usize) -> Option<(&[u8], usize)> {
     let (key, _, _, len) = parse_record(buf, off)?;
     let next = off.checked_add(len)?;
     (next <= buf.len()).then_some((key, next))
+}
+
+/// The common record read in place for a walk: the record at `off` where it
+/// is the compact shape with a fixed run -- one inline extent of `records`
+/// values of one width, the shipped writer's record and the suite's -- as
+/// its key, its run, the count and the offset of the record after it;
+/// `None` for any other shape, for a run whose length is not a multiple of
+/// its count, and for a record cut short, each of which the caller parses
+/// the general way, where `parse_record` judges it. `Blob::scan_at` reads
+/// the raw record region's records so, by the directory's offsets; a
+/// decoded group of the compact form holds the same images end to end, and
+/// its walk read each through `parse_record` and `read_exts`, five hundred
+/// instructions a record against the raw walk's hundred and thirty-five by
+/// callgrind at three hundred thousand keys (`bench/examples/scan_only.rs`).
+#[inline]
+pub(crate) fn compact_fixed_at(buf: &[u8], off: usize) -> Option<(&[u8], &[u8], usize, usize)> {
+    compact_fixed_tomb_at(buf, off).map(|f| (f.key, f.run, f.records, f.next))
+}
+
+/// The compact record with a fixed run, read in place
+/// (`compact_fixed_tomb_at`).
+pub(crate) struct CompactFixed<'a> {
+    pub key: &'a [u8],
+    pub run: &'a [u8],
+    pub records: usize,
+    /// The offset of the record after it.
+    pub next: usize,
+    /// The run's header carries the tombstone flag.
+    pub tomb: bool,
+}
+
+/// `compact_fixed_at`, and whether the run's header carries the tombstone
+/// flag, which that walk reads past: a reader that holds a record's values
+/// without its flag (the stride form, `db::zfile`) has to decline a flagged
+/// record where the walk serves it, and the flag's place is this layout's
+/// to say, once.
+#[inline]
+pub(crate) fn compact_fixed_tomb_at(buf: &[u8], off: usize) -> Option<CompactFixed<'_>> {
+    let h: &[u8; 4] = buf.get(off..off.checked_add(4)?)?.try_into().ok()?;
+    if u16::from_le_bytes([h[2], h[3]]) != COMPACT {
+        return None;
+    }
+    let klen = u16::from_le_bytes([h[0], h[1]]) as usize;
+    let key_at = off + 4;
+    let e_at = align_up(key_at + klen, REC_ALIGN);
+    let cb: &[u8; 4] = buf.get(e_at..e_at + 4)?.try_into().ok()?;
+    let c = u16::from_le_bytes([cb[2], cb[3]]);
+    if c & C_FIXED == 0 {
+        return None;
+    }
+    let elen = u16::from_le_bytes([cb[0], cb[1]]) as usize;
+    let records = (c & !(C_FIXED | C_TOMB)) as usize;
+    // One value is the common record and a multiple of itself: no divide
+    // for it, since a sixteen-bit divide a record, its remainder tested at
+    // once, was a twentieth of the threaded scan pass over the compact form
+    // under the bound, by the profile of its threads.
+    if records == 0 || elen == 0 || (records != 1 && !elen.is_multiple_of(records)) {
+        return None;
+    }
+    let run = buf.get(e_at + 4..e_at + 4 + elen)?;
+    let key = buf.get(key_at..key_at + klen)?;
+    let next = off + record_len_compact(klen, elen);
+    (next <= buf.len()).then_some(CompactFixed {
+        key,
+        run,
+        records,
+        next,
+        tomb: c & C_TOMB != 0,
+    })
 }
 
 #[inline]
@@ -989,6 +1082,40 @@ pub fn stream_trailer<'a>(
     generation: u64,
     lookahead: bool,
 ) -> Option<(Vec<u8>, Vec<u8>, usize)> {
+    stream_trailer_in(Vec::new(), n, recs_len, key_at, each, generation, lookahead)
+}
+
+/// The buffer a trailer is composed in: what `stream_trailer_in` asks of
+/// it. A trailer is the directory's four bytes a key and the hash slots
+/// beside them, twenty to forty bytes a key held from the finish's fill
+/// to its write, so the caller says where that lives.
+pub trait TrailerBuf: std::ops::DerefMut<Target = [u8]> {
+    /// `n` bytes long, the new ones `v`.
+    fn resize(&mut self, n: usize, v: u8);
+    fn extend_from_slice(&mut self, s: &[u8]);
+}
+
+impl TrailerBuf for Vec<u8> {
+    fn resize(&mut self, n: usize, v: u8) {
+        Vec::resize(self, n, v)
+    }
+    fn extend_from_slice(&mut self, s: &[u8]) {
+        Vec::extend_from_slice(self, s)
+    }
+}
+
+/// `stream_trailer` into the caller's buffer `t`, handed over empty and
+/// handed back holding the trailer: the same bytes whatever the buffer.
+pub fn stream_trailer_in<'a, B: TrailerBuf>(
+    mut t: B,
+    n: usize,
+    recs_len: usize,
+    key_at: &dyn Fn(usize) -> &'a [u8],
+    each: &mut dyn FnMut(usize) -> (u32, u64),
+    generation: u64,
+    lookahead: bool,
+) -> Option<(Vec<u8>, B, usize)> {
+    debug_assert!(t.is_empty(), "a trailer composed into an empty buffer");
     if recs_len > MAX_RECS {
         return None;
     }
@@ -996,9 +1123,8 @@ pub fn stream_trailer<'a>(
     let cap = hash_cap_for(n)?;
     let mask = cap - 1;
 
-    let mut t: Vec<u8> = Vec::new();
     let mut at = recs_off + recs_len; // absolute section offset of t's end
-    fn pad_to(t: &mut Vec<u8>, at: &mut usize, align: usize) {
+    fn pad_to<B: TrailerBuf>(t: &mut B, at: &mut usize, align: usize) {
         let want = align_up(*at, align);
         t.resize(t.len() + (want - *at), 0);
         *at = want;
@@ -1419,7 +1545,7 @@ pub fn encode_inline(
 
     // `store` is cfg'd off the wasm build; the timing hook goes with it.
     #[cfg(not(target_family = "wasm"))]
-    crate::format::enc_phase("recs", _t_enc);
+    enc_phase("recs", _t_enc);
     let _t_enc = std::time::Instant::now();
     // The fence: every stride-th key copied out, with one more offset than
     // entries so an entry's key is the span to the next.
@@ -1438,7 +1564,7 @@ pub fn encode_inline(
 
     // `store` is cfg'd off the wasm build; the timing hook goes with it.
     #[cfg(not(target_family = "wasm"))]
-    crate::format::enc_phase("fence", _t_enc);
+    enc_phase("fence", _t_enc);
     let _t_enc = std::time::Instant::now();
     let mask = p.hash_cap - 1;
     // The hash is two thirds of the encode: the probe writes land at random
@@ -1814,9 +1940,30 @@ impl FlatIndex {
         hash_of: fn(&[u8]) -> u64,
         f: impl FnOnce(&[Ext], &'a [u8]) -> R,
     ) -> Option<R> {
+        self.with_lookup_hashed(sec, key, hash_of(key), f)
+    }
+
+    /// Where in the section the first slot a lookup of hash `h` reads
+    /// lies, for a hint to fetch its line ahead of the lookup; `None` for
+    /// an index whose hash region is not inside the section.
+    #[inline]
+    pub fn slot_pos(&self, sec_len: usize, h: u64) -> Option<usize> {
+        let at = self.hash.0 + ((h as usize) & self.mask) * SLOT;
+        (self.hash.1 <= sec_len && at + SLOT <= self.hash.1).then_some(at)
+    }
+
+    /// `with_lookup` for a key whose hash the caller has already taken, as
+    /// a point read over several sources takes it once for all of them.
+    #[inline]
+    pub fn with_lookup_hashed<'a, R>(
+        &self,
+        sec: &'a [u8],
+        key: &[u8],
+        h: u64,
+        f: impl FnOnce(&[Ext], &'a [u8]) -> R,
+    ) -> Option<R> {
         let hash = sec.get(self.hash.0..self.hash.1)?;
         let recs = sec.get(self.recs.0..self.recs.1)?;
-        let h = hash_of(key);
         let tag = ((h >> 56) | 1) & 0xff;
         let mut s = (h as usize) & self.mask;
         for _ in 0..self.hash_cap {
@@ -1847,8 +1994,17 @@ impl FlatIndex {
         key: &[u8],
         hash_of: fn(&[u8]) -> u64,
     ) -> Option<(Exts<'a>, &'a [u8])> {
+        self.lookup_full_hashed(sec, key, hash_of(key))
+    }
+
+    /// `lookup_full` for a key whose hash the caller has already taken.
+    pub fn lookup_full_hashed<'a>(
+        &self,
+        sec: &'a [u8],
+        key: &[u8],
+        h: u64,
+    ) -> Option<(Exts<'a>, &'a [u8])> {
         let hash = sec.get(self.hash.0..self.hash.1)?;
-        let h = hash_of(key);
         let tag = ((h >> 56) | 1) & 0xff;
         let mut s = (h as usize) & self.mask;
         // Bounded by the table size: a full table would otherwise spin here,
@@ -1970,6 +2126,14 @@ impl FlatIndex {
     /// (`db::Seg::foot`).
     pub fn hash_bytes(&self) -> usize {
         self.hash.1.saturating_sub(self.hash.0)
+    }
+
+    /// Where the hash region and the record region lie in the section, as
+    /// offsets: the two populations a raw point read touches a page of each,
+    /// for an ask of their pages ahead of reads sent to the raw form
+    /// (`db::Seg`).
+    pub fn population_spans(&self) -> ((usize, usize), (usize, usize)) {
+        (self.hash, self.recs)
     }
 
     /// Where the records at `rank` and `n` ranks on lie by the directory:

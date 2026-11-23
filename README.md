@@ -51,6 +51,27 @@ on its own where it was not yet the default, and `supdb-nozpages` the raw
 form alone where it is. The rest of the set, every workload and option, is
 under `docs/figures/` by scale and machine class.
 
+### Reproducing a row
+
+The quick ladder runs on a hosted runner from a fork, with no toolchain
+installed anywhere:
+
+1. Fork the repository.
+2. Under Actions, choose the `ci` workflow and run it by hand. Its `arms`
+   input takes a comma-separated list, `supdb,lmdb` for instance, and runs
+   those arms alone in a fraction of the time; empty, it runs every arm.
+3. When the `quick` job ends, download its `quick-row` artifact: one JSON
+   row under `quick/` holding the raw per-rep samples of every quantity and
+   the machine as the row records it, with the gate's verdict in the job's
+   log. [`bench/DESIGN.md`](bench/DESIGN.md) names every quantity and says
+   how it is measured.
+
+A run of every arm takes twenty to thirty minutes on `ubuntu-latest`. The
+row's class is the runner's CPU model, and the hosted runners rotate between
+several, so the gate has a band for a class only once three rows of it are
+committed; the `bank-row` workflow proposes the hosted rows as a pull
+request after each merge, and merging one is a person's decision.
+
 ## Usage
 
 ```toml
@@ -101,6 +122,16 @@ let t = std::thread::spawn(move || {
 });
 db.append(b"user:42", b"logged in");
 db.commit()?;                        // the reader sees this from here on
+```
+
+A checkpoint: the store as of the call, made a store of its own at a path
+that does not exist yet. The segments are hard-linked where the path is on
+the store's filesystem, so it costs a flush and takes no space until the
+live store's merges retire what the two share; elsewhere they are copied.
+
+```rust
+db.checkpoint(std::path::Path::new("./store-backup"))?;
+let backup = Db::open(std::path::Path::new("./store-backup"), Options::default())?;
 ```
 
 A write-once segment: sorted input in, one immutable file out, read by the
@@ -156,7 +187,7 @@ Worker.
 ## Building
 
 ```sh
-sh scripts/deps.sh             # the toolchain pieces the checks need, where missing
+sh scripts/deps.sh             # the pinned toolchain and what else the checks need, where missing
 cargo build --release
 cargo test --profile checked  # the release profile with overflow checks and debug assertions on
 sh scripts/check.sh            # build, test, lint, wasm, bench -- what CI runs
@@ -176,9 +207,19 @@ sh web/build.sh                # the browser module
 
 ## Status
 
-A prototype. The on-disk format is not yet stable: it changes its magic
-whenever an older reader would misread a newer file, and refuses the file
-rather than serving wrong bytes.
+A prototype. A store records its format version in its manifest
+(`supdb::STORE_FORMAT`). A release opens a store of any version
+from `supdb::STORE_FORMAT_OLDEST` to its own, and refuses any other at
+open, naming both versions, before it sweeps, replays or rewrites
+anything; it never opens a store it would misread. Each file also carries
+a magic that moves whenever an older reader would misread it, so a reader
+refuses the file rather than serving wrong bytes.
+
+A store is open in one place at a time. A second open, from another process
+or from the same one, fails at once while the first holds the store's
+`LOCK`, and the lock goes with the process that holds it. A close gives it
+up at once, whether or not a child the process forked still holds a copy of
+its descriptors.
 
 ## License
 

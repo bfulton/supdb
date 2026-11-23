@@ -99,5 +99,6 @@ pub use bytes::{Bytes, SliceBytes, VecBytes};
 #[cfg(not(target_family = "wasm"))]
 pub use db::{
     BackgroundIo, Db, Isolation, Options, ReadAdvice, Reader, SegmentOptions, SegmentWrite,
-    SegmentWriter, SyncPolicy, Txn, Upkeep, ZInject, ZPages,
+    SegmentWriter, SyncPolicy, Txn, Upkeep, ZInject, ZPages, ZStride, MERGE_AHEAD_WINDOW,
+    STORE_FORMAT, STORE_FORMAT_OLDEST,
 };

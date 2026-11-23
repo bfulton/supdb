@@ -16,7 +16,22 @@
 #   build    the crate, release
 #   test     cargo test (unit and integration, every target), optimized
 #            with overflow and invariant checks on
-#   lint     clippy at -D warnings, and the format gate
+#   stride   the tests again with the stride form forced (an EXPERIMENT,
+#            `Options::zpages_stride`): every test that forces the compact
+#            form or names no form, under SUPDB_TEST_STRIDE (tests/common),
+#            and bounded seed ranges of the differential fuzz and of its
+#            readers on threads with the form forced on the store
+#            (ZFUZZ_STRIDE), each failing a range no stride read reached,
+#            and the same two with the store's partitions asked to change
+#            form as they run (ZFUZZ_CONVERT), each failing a range in
+#            which none left the stride form.
+#            The test group's binaries, so it builds nothing of its own. Its
+#            own group because a switch that only a hand ran checked nothing
+#            between two hand runs: the adaptations it made of other tests,
+#            and the stride form under threads and under a checkpoint, ran
+#            in no gate
+#   lint     clippy at -D warnings, for this host and for the macOS target,
+#            and the format gate
 #   wasm     the browser reader and its floor, built for wasm32-unknown-unknown
 #            by web/build.sh
 #   bench    the benchmark suite in bench/: its build, tests and lint, through
@@ -26,12 +41,15 @@
 #            bench/runs/, and the figures. Not in the default set: it is a
 #            timing run and needs the machine to itself
 #
+# Every group runs under the toolchain rust-toolchain.toml names, which
+# scripts/deps.sh installs here and scripts/toolchain.sh in CI.
+#
 # Not here, deliberately: cross-arm, which needs a cross toolchain and qemu
 # and so is CI-only.
 set -eu
 cd "$(dirname "$0")/.."
 
-ALL="build test lint wasm bench"
+ALL="build test stride lint wasm bench"
 # Lowercase because `GROUPS` is a built-in bash variable holding the current
 # user's group ids. Assigning to it does not take, so on any host where
 # /bin/sh is bash -- macOS ships bash 3.2 as /bin/sh -- this loop would have
@@ -51,15 +69,36 @@ for g in $groups; do
       say "test"
       cargo test --profile checked
       ;;
+    stride)
+      say "stride"
+      SUPDB_TEST_STRIDE=1 cargo test --profile checked --no-fail-fast
+      ZFUZZ_ZPAGES=1 ZFUZZ_STRIDE=1 ZFUZZ_FROM=0 ZFUZZ_TO=24 \
+        cargo test --profile checked --test fuzz fuzz_range -- --exact
+      ZFUZZ_ZPAGES=1 ZFUZZ_STRIDE=1 ZFUZZ_FROM=0 ZFUZZ_TO=4 \
+        cargo test --profile checked --test fuzz concurrent_range -- --exact
+      ZFUZZ_ZPAGES=1 ZFUZZ_STRIDE=1 ZFUZZ_CONVERT=1 ZFUZZ_FROM=0 ZFUZZ_TO=24 \
+        cargo test --profile checked --test fuzz fuzz_range -- --exact
+      ZFUZZ_ZPAGES=1 ZFUZZ_STRIDE=1 ZFUZZ_CONVERT=1 ZFUZZ_FROM=0 ZFUZZ_TO=4 \
+        cargo test --profile checked --test fuzz concurrent_range -- --exact
+      ;;
     lint)
       say "lint"
       cargo clippy --release --all-targets -- -D warnings
+      # The macOS side of the tree's cfg guards, type-checked: three test
+      # helpers only Linux's tests call were dead code there, and no Linux
+      # lint could say so. Clippy links nothing, so the target's rust-std,
+      # which rust-toolchain.toml lists, is all it needs. Skipped where the
+      # host is that target and the line above was this one.
+      mac=aarch64-apple-darwin
+      if [ "$(rustc -vV | sed -n 's/^host: //p')" != "$mac" ]; then
+        cargo clippy --release --all-targets --target "$mac" -- -D warnings
+      fi
       sh scripts/fmt.sh --check
       ;;
     wasm)
       say "wasm"
-      # Builds the module and the floor and prints their sizes; the check
-      # is that the module still links.
+      # Builds the module and the floor under -D warnings and prints their
+      # sizes; the check is that the module still links, and builds clean.
       sh web/build.sh
       ;;
     bench)

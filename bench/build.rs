@@ -37,6 +37,77 @@ fn main() {
     }
     println!("cargo:rustc-env=SUPDB_SHA={}", sha());
     println!("cargo:rustc-env=SUPDB_RUSTC={}", rustc());
+    #[cfg(feature = "codecs")]
+    lzav();
+    // FASTER is a comparator like LMDB and RocksDB, built wherever its C++
+    // store is: Linux on x86-64, the one platform it supports that the
+    // suite runs on. The arm is behind `cfg(faster)`, set here, so a build
+    // on macOS or ARM has every other arm and no feature to remember.
+    println!("cargo:rustc-check-cfg=cfg(faster)");
+    let target = |v: &str| std::env::var(v).unwrap_or_default();
+    if target("CARGO_CFG_TARGET_OS") == "linux" && target("CARGO_CFG_TARGET_ARCH") == "x86_64" {
+        faster();
+        println!("cargo:rustc-cfg=faster");
+    }
+}
+
+/// FASTER's C++ store and the shim the `faster` arm calls (`vendor/faster`),
+/// built as FASTER's release build builds it: C++17, `-O3`, `NDEBUG`.
+///
+/// FASTER is Microsoft's and neither a crate nor this repository's:
+/// `scripts/faster.sh` fetches its sources at the commit `vendor/faster/PIN`
+/// names and records what it fetched in `vendor/faster/COMMIT`, as
+/// `scripts/libclang.sh` readies a host for RocksDB's bindgen. A build
+/// without them, or with another commit's, is a failed build and says what
+/// to run: an arm built from some other FASTER would post rates like any
+/// other.
+fn faster() {
+    println!("cargo:rerun-if-changed=vendor/faster");
+    let pin = include_str!("vendor/faster/PIN").trim();
+    let have = std::fs::read_to_string("vendor/faster/COMMIT").unwrap_or_default();
+    let have = have.trim();
+    if have != pin || !std::path::Path::new("vendor/faster/src/core/faster.h").exists() {
+        eprintln!(
+            "error: the suite's `faster` arm needs FASTER's C++ sources at commit {pin} under \
+             bench/vendor/faster/src, and {}. Run `sh bench/scripts/faster.sh` (or \
+             `sh scripts/deps.sh`), which fetches them and installs the libraries they link.",
+            if have.is_empty() {
+                "none has been fetched".to_string()
+            } else if have != pin {
+                format!("the ones there are commit {have}")
+            } else {
+                "the ones there are incomplete".to_string()
+            }
+        );
+        std::process::exit(1);
+    }
+    cc::Build::new()
+        .cpp(true)
+        .std("c++17")
+        .opt_level(3)
+        .define("NDEBUG", None)
+        .warnings(false)
+        .include("vendor/faster/src")
+        .file("vendor/faster/shim.cc")
+        .file("vendor/faster/src/core/address.cc")
+        .file("vendor/faster/src/core/lss_allocator.cc")
+        .file("vendor/faster/src/core/thread.cc")
+        .file("vendor/faster/src/environment/file_linux.cc")
+        .compile("supdb_faster");
+    for lib in ["aio", "tbb", "uuid", "stdc++fs", "pthread"] {
+        println!("cargo:rustc-link-lib={lib}");
+    }
+}
+
+/// LZAV for the codec probe (`examples/zcodec.rs`), from upstream's header
+/// in `vendor/lzav`, at the optimization the release profile asks for.
+#[cfg(feature = "codecs")]
+fn lzav() {
+    println!("cargo:rerun-if-changed=vendor/lzav");
+    cc::Build::new()
+        .file("vendor/lzav/lzav.c")
+        .include("vendor/lzav")
+        .compile("supdb_lzav");
 }
 
 /// The files whose change means HEAD may name a different commit: HEAD, the

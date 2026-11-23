@@ -18,9 +18,13 @@ The workloads below, plus four floors. Each yields one or more quantities.
 | `load-shuffled` | the same keys in shuffled order | ops/s |
 | `read` | uniform point reads over the loaded set, on one thread and again on each of the class's reader-thread counts: two, doubling, one fewer than its cores | reads/s, p99 µs; reads/s per thread count |
 | `scan` | `size/100` scans of 100 entries, from uniform random starts, on one thread; `size` scans a thread again on each of the class's reader-thread counts | entries/s; entries/s per thread count |
-| `ycsb` | core A–F on the loaded store, zipfian, a sixth of the keys in operations per mix | ops/s per mix |
+| `ycsb` | core A–F on the loaded store, a Zipfian over the key space itself (the hot keys the lowest, contiguous) and D's reads uniform, a sixth of the keys in operations per mix | ops/s per mix |
 | `scan-mixed` | the threaded `scan` passes again on the store the six mixes leave | entries/s per thread count |
+| `ycsbs` | core A–F again, on the store `scan-mixed` leaves, with YCSB's own key distributions: its scrambled Zipfian for A, B, C, E and F, and the latest distribution for D | ops/s per mix |
+| `threads` | `threads-A`, `threads-A-uniform`, `threads-RMW` and `threads-RMW-uniform`, on a store of their own, loaded in key order: point reads and updates from several threads at once, half reads and half updates (`A`) or every operation a read-modify-write (`RMW`), under YCSB's scrambled Zipfian or uniform keys; on one thread and then on each of the class's reader-thread counts, a store's worth of operations a thread, each thread's updates committed a hundred at a time. In no row of the series: `bench run --passes mixes-threaded` runs them, and writes its row under `runs/passes/` | ops/s per thread count |
 | `scan-lag` | on the store the shuffled load leaves, the keys updated in slices to 0, 1, 10 and 100% of the store, each slice a burst of batches followed by the `scan` workload's scans with nothing merged between | entries/s of each point's scans; updates/s of each point's burst |
+| `recover` | a fresh store given the `load` workload's batches by a process of its own, each committed under the arm's guarantee with no sync behind the last, and one batch more staged and never committed; the process killed there, and the store it left opened in the run's process | open ms, first read µs; for a buffered arm, acknowledged batches not recovered |
+| `recover-shuffled` | the same after the `load-shuffled` workload's batches | the same |
 | `wal-floor` | framed 1,000-record batches appended to one file, one `fdatasync` each, no engine | ops/s |
 | `scan-floor` | one `mmap` sequential walk of a file the top rung's size (capped at 4 GiB), no engine | bytes/s |
 | `mem-floor` | one dependent load at a time around a permutation of a 64 MiB buffer's cache lines, no engine | chases/s |
@@ -32,6 +36,36 @@ A read or a scan consumes what it returns: every value is copied out, into
 the reading thread's own buffer, on every arm, in the workloads above and in
 the mixes. A caller gets a value to use it, and a read that only measured the
 length of what it was lent priced the lookup and nothing after it.
+
+The keys are a stated parameter, as their distribution is, and a row is of
+one shape of them (`bench run --keys`, `bench ab --keys`,
+`workload::KeyShape`):
+
+- `numbered`, the default, and the shape of every row from before it was a
+  parameter: sixteen decimal digits of the key's index, db_bench's keys. The
+  keys of a store are a dense run of numbers, and the next key is the next
+  number.
+- `ids`: sixteen lowercase hex digits of a 64-bit id, what an application's
+  own identifiers look like to a store. The loaded keys' ids are spread as
+  that many independent uniform draws are -- how many fall in any stretch of
+  the space varies as draws' counts do, which a test holds (`workload::Ids`)
+  -- no key is the successor of another, and a key's bytes give a compressor
+  nothing. The ids ascend with the key's index, so a load in key order is
+  still one, a scan still starts at a drawn key and the unscrambled
+  Zipfian's hot keys are still the lowest and contiguous; a key inserted
+  after the load is a uniform draw of the whole space and falls anywhere
+  among the loaded keys, never above them, so an insert is never an append.
+
+The workloads, the sizes and the quantities are the same over either. What
+differs is what an engine can make of a key, which is part of what is
+measured: a partition whose keys are a run of numbers can have its values
+read by arithmetic on the key, and one of random ids cannot. So the two
+shapes are two series: a row of ids carries its shape (`Row::keys`; a row
+of numbered keys says nothing of them, so the rows before the field read as
+they did), its class ends in `/kids`, the gate holds it to rows of ids of
+its machine and bound alone, and the figures draw it under its own class,
+the `latest` copy staying the numbered keys' newest.
+`KEYS=ids sh scripts/check.sh quick` takes the quick row of ids.
 
 Every workload runs at a ladder of store sizes, not one: keys at 1, 3, 10,
 30 ... × 10⁴ up to the scale's cap. A number is a point on a curve, and the
@@ -153,9 +187,71 @@ scans would credit the first for work they never see it do. The two
 quantities are each a rate, and a change that moves work between them
 is read by both.
 
-YCSB-D reads uniformly over the loaded keys rather than skewed to the latest
-inserts: the latest distribution needs a Zipfian over a count that grows
-with every insert, and tracking that is not a cost to charge the engines.
+The recovery workloads time what an engine does to open a store its
+writer died over. The writer is a process of its own (`bench crash-load`),
+killed with SIGKILL where its last batch was acknowledged and a batch more
+sits staged in its memory, so nothing of it runs after the kill: no close,
+no flush, no join of what it had in flight. That is a process's death and
+not a machine's -- what the process had handed the kernel is there whether
+or not it was synced, and the page cache is as the process left it -- so
+the quantity is the engine's work at the open and not the device's. The
+open is the arm's own, under the options the arm was loaded with, and it
+draws from a primed pool as every store a pass opens does; the first read
+is of the last key the dead process committed. There are two because an
+engine recovers what its write path left, and the two loads leave supdb
+different things: the ordered load a segment open for append, whose
+records the open walks to the last commit marker and whose index it then
+writes behind them, and the shuffled load a log to replay with seals and
+merges cut off in flight.
+LMDB's file is consistent at every commit and its open recovers nothing;
+RocksDB replays its log into a memtable.
+
+Outside the clock the opened store is held to what was acknowledged, a
+batch at a time by its first and last key. Under either guarantee the
+batches it holds are a prefix of the ones acknowledged, each whole, and no
+key of the staged batch is there; a store that fails that fails the run,
+since an open that answered fast for a store nobody was promised measured
+nothing. A durable arm holds every batch, or fails the run the same way.
+A buffered arm promised the device nothing, and what a process's death
+costs it is a quantity and not an assumption: `unrecovered_batches`, the
+acknowledged batches the opened store does not hold, recorded for the
+buffered arms alone. Every engine of the group hands every commit to the
+kernel, where it outlives the process -- LMDB without its sync, RocksDB
+without its sync, and supdb through its log or, for ordered ingest, the
+run's own file -- so the quantity reads zero in every row, and the row
+that reads anything else is the finding: supdb's ordered ingest wrote a
+run's records a write piece at a time once, and the rows from before it
+wrote every commit read two to eight batches there. The first read is
+recorded only where it found its key, since a miss is not the read the
+hits are.
+
+The workloads are the in-core scales'. A pairing or a bounded row runs
+them only when asked (`--passes recover`), each being two loads more an
+arm a rep.
+
+The mixes run twice, as two families of six. The first, `ycsb-A..F`, is the
+one every row so far carries: its Zipfian is over the key space itself, so
+rank 0 is key 0 and the hot keys are the lowest keys and contiguous, and its
+D reads uniformly over the loaded keys. The second, `ycsbs-A..F`, runs the
+same six with YCSB's own distributions. A, B, C, E and F draw from YCSB's
+scrambled Zipfian: a Zipfian over YCSB's ten billion items, hashed with its
+FNV-1a and folded onto a key space fixed at the mix's start (the keys that
+exist plus twice the inserts the mix expects, YCSB's own margin, so which
+keys are popular does not move as keys are inserted; a draw above the last
+committed key is drawn again, as YCSB draws it), so the hot keys are spread
+over the store rather than piled at its head. D draws from YCSB's latest
+distribution: a Zipfian over the keys that exist with the newest the hottest,
+and the count grows as this mix's inserts commit -- one more term of the
+harmonic sum a key, one `powf`, at each insert batch's flush, inside the
+mix's window: about two microseconds for a batch of a hundred, beside a
+commit of at least hundreds. The second family runs
+after `scan-mixed`, on the store the first family and the threaded scans
+leave, so every quantity before it is of the store it was of before the
+family existed; what it reads is the store the first family grew, as
+`scan-mixed` reads it, and that is part of its definition. The first family
+stays as it is because a time series is compared to its own history, and
+its Zipfian's contiguous head is a workload of its own, the one an
+unscrambled key space gives any engine with a sorted layout.
 
 Every workload runs one thread against the engine, and `read` and `scan`
 run again on each reader-thread count of the machine's class -- two,
@@ -211,8 +307,32 @@ comparator a user would otherwise pick.
 
 | guarantee | supdb | comparators |
 |---|---|---|
-| durable per batch | `supdb` (default), `supdb-forms`, `supdb-settle`, `supdb-nosnap`, `supdb-noadvice`, `supdb-nocache`, `supdb-cache256` | `lmdb`, `rocksdb-tuned` |
+| durable per batch | `supdb` (default), `supdb-forms`, `supdb-settle`, `supdb-nosnap`, `supdb-noadvice`, `supdb-nocache`, `supdb-cache256` | `lmdb`, `rocksdb-tuned`, and in the bounded roster `rocksdb-tuned-lz4` |
 | buffered | `supdb-ingest` | `lmdb-nosync`, `rocksdb-tuned-nosync` |
+| in memory until a checkpoint | | `faster`, where it is built |
+
+`faster` is Microsoft's FASTER, its C++ store: the comparator a user would
+otherwise pick for point gets and puts alone, a hash index over a log that
+updates in place. Its promise is weaker than a buffered commit's and it has
+no stronger one to configure. A write is in the process's memory when it
+returns and reaches the device at a checkpoint, so a process that is killed
+loses what it wrote since, where a buffered arm's every commit is in the
+kernel. That is a guarantee of its own with one arm in it: the suite
+compares `faster` with nothing and draws no figure of it, and its cells are
+in the row for a reader who sets them beside the buffered group's and says
+what differs. It has no ordered scan and the arm does not reopen a store, so
+it runs no scan workload, no YCSB E and no recovery workload, and its row
+has no cell there. A load's window ends where the arm's guarantee is met,
+which for FASTER is a checkpoint of its log, written in whole pages of
+32 MiB. Read-modify-write in the `threads` workloads is FASTER's own single
+operation, and a read and then a write for every other arm.
+
+The store is not a crate. `scripts/faster.sh` fetches its sources at the
+commit `vendor/faster/PIN` names and installs the libraries they link, and
+the build fails without them; the upstream repository is no longer
+maintained, so the pin is its last commit. It is built on Linux x86-64
+alone, the one platform the store supports that the suite runs on, and a
+row from an ARM or macOS host has no `faster` cells.
 
 A comparator runs one stated configuration in both groups, the two
 differing in the sync alone: RocksDB as its tuning guide sets it for this
@@ -226,6 +346,27 @@ no Bloom filter) beside the tuned durable arm until the rows banked at
 `b1bd544` on 31 October 2026, so every buffered cell against RocksDB in the
 rows before is against a configuration no deployment would choose; that
 series stops there and the tuned one starts.
+
+RocksDB stores its blocks uncompressed in every arm but `rocksdb-tuned-lz4`,
+the tuned durable arm with LZ4 over its SSTs, which the bounded roster
+(`ooc`) carries: past memory what the device holds is what a read costs, and
+an uncompressed RocksDB there is a shape no deployment would run. Every arm
+runs RocksDB on the system allocator, its own guidance being jemalloc; the
+`rocksdb-alloc` workflow builds the suite with and without the crate's
+prefixed jemalloc, runs `rocksdb-tuned` over the quick ladder from each on
+one hosted runner, and prints the two beside each other with the reps'
+spread. A switch of the suite's RocksDB to jemalloc is a definition step,
+banked with the row that priced it, never a change the table makes alone.
+
+The comparator cells are held to the comparators' own tools once a week
+(`comparators.yml`, by hand as well): db_bench built from the RocksDB
+source the suite links, run with the tuned arm's options, and a C program
+against the LMDB the suite links, on the suite's shapes, beside the
+suite's `rocksdb-tuned` and `lmdb` arms over the quick ladder in the same
+job. The suite's cell must be at least 0.7x the tool's on the load, the
+point reads and the scans at every rung, or the job fails naming the
+quantity; the margin the cells hold is the job's summary (`docs/engine.md`,
+the comparators' check).
 
 What the suite's shape reaches in each engine. Every key holds one
 100-byte value, appended at the load and replaced by a `put` after it, so
@@ -270,7 +411,7 @@ out-of-core regime reached under a memory bound.
 |---|---|---|---|
 | `quick` | 300 000 keys | 5 | every pull request, on a GitHub Actions runner |
 | `full` | the rung at which the store is at least 1.5× the machine's memory | 7 | on demand or scheduled, on a quiet machine |
-| `ooc` | ten million keys, from three million, under `--bound BYTES`: a cgroup of the run's own with that memory limit, the process moved into it before anything is measured | 3 | on demand, on a quiet Linux machine with the cgroup v1 memory controller writable (`scripts/ooc.sh`) |
+| `ooc` | ten million keys, from three million, under `--bound BYTES`: each pass's process in a group of its own with that memory limit, made for the pass and joined before the process runs anything, the run's own process in none of them -- under cgroup v1 under a group the run makes and never enters, under cgroup v2 beside a leaf the run moves itself into in a delegated service (`systemd-run -p Delegate=yes -p MemorySwapMax=0`); a v2 group that is not delegated and has the limit on it is shared by the run and its passes, held to the bound | 3 | on demand, on a quiet Linux machine with the cgroup v1 memory controller writable (`scripts/ooc.sh`), or by hand on a hosted runner (`ooc-hosted.yml`), its own class |
 
 `ooc` exists because every banked row is in-core: `full`'s top was never
 reached. The bound is the row's class (`/b<MiB>m`), since a store past it
@@ -325,8 +466,26 @@ were, and each store opens from nothing; with every pass in a process
 of its own there is no warmup rep, since a warmup warms a process and
 under a bound every rep costs what the first does (`run::first_rep`).
 In core the arms share the process as they always have, so the quick
-and full rows' conditions are unchanged. The roster runs under 1.25 GiB,
-where both engines leave core at ten million keys; the same regime is
+and full rows' conditions are unchanged.
+
+The bound is the pass's and nothing else's: the engine and the workload
+driving it get `--bound` bytes, the run's floors, ledger and samples
+come out of no pass's bound, and no pass starts with what one before it
+left charged. Each pass records what its group held at its start and its
+own resident bytes then (`bound-start`, `group_bytes` and
+`process_bytes`), a record the gate judges none of and the figures draw
+none of, and the run names any pass that began with more than a few
+megabytes charged (`run::audit_note`); a pairing pairs the two like any
+quantity. `--one-process` under a bound is refused, since a pass in the
+run's process would run outside it.
+
+The roster runs twice: under 1.25 GiB at three and ten million keys
+(`sh scripts/ooc.sh 1342177280`), and under 1 GiB at ten million alone
+(`sh scripts/ooc.sh 1073741824 --bottom 10000000`). Under 1.25 GiB the
+comparator's file at ten million keys is the bound's size within a
+percent or two, the edge of fitting, where a few megabytes either way move
+its rates by half; under 1 GiB it is clearly out of core. A cell read at
+the edge is read with the other bound's beside it. The same regimes are
 reached by a pairing (`bench ab --bound`) over the passes that hold one
 store at a time, each pass there in a process of its own too, a killed
 rep's pair lost and the pairing going on.
@@ -495,11 +654,183 @@ re-codes exchange the two without a build (`Options::zpages_recode_keep`);
 partition built at write time, the other beside each served file on the
 builder's thread, and the policy only exchanging them
 (`Options::zpages_both`);
-`supdb-settlebuilds`, `supdb-ingestsettlebuilds` and
-`supdb-cache64tofitautozpagessettlebuilds` are `supdb`, `supdb-ingest` and
-`supdb-cache64tofitautozpages` with every commit near reads filing its batch
-and building the blocks it filed into (`Options::forms_settle_every`,
-`forms_settle_builds`);
+`supdb-nocachezstride` is `supdb-nocachezpages` with every build of a form
+file asking for the stride form -- a partition's values alone at their
+stride, where its keys are one run of numbers at one width and every record
+one inline value of one width -- and making the block form in the same call
+where the partition does not qualify (`Options::zpages_stride` at
+`Forced`); a pass refuses it after the ordered load unless the store holds a
+stride file, beside the forced arm's own rules, and the `zpage_stride_*`
+counters say what the stride files served and why a partition declined;
+`supdb-nocachezstrideprefetch` is it with a walk's pages asked for ahead
+(`Options::zpages_scan_prefetch`), and `supdb-cache64tofitzstride`
+and `supdb-cache64tofitzstrideprefetch` are `supdb-cache64tofitzpages` with
+the stride form, and with the ask beside it;
+`supdb-cache64tofitzstridedrop` is `supdb-cache64tofitzpagesdrop` with the
+stride form, the arm to read a bounded cell from: `supdb-cache64tofitzpages`
+keeps the raw records in the page cache, and under a bound they hold the
+room the stride files need, which then fault at their first touches; no arm
+moves the trust in this
+process's builds (`Options::zpages_stride_trust_built`), which reaches only
+a build whose read-back read the device, and a forced build keeps its pages
+and reads them back from the cache, so the forced form's every arm checks
+the pages it touches, as a file found on disk is checked;
+`supdb-settlelate` and `supdb-ingestsettlelate` are `supdb` and
+`supdb-ingest` with a commit near reads leaving a batch under the backlog
+bound to the scans, the shape before every such commit filed its batch and
+built the blocks it filed into (`Options::forms_settle_every`,
+`forms_settle_builds`), and `supdb-cache64tofitautozpagessettlebuilds` is
+`supdb-cache64tofitautozpages`, which pins that shape, with the two on;
+`supdb-rebasedrops` is `supdb` with a partition's sparse block forms
+dropped at the look that carries its table across the merge that rewrites
+it (`Options::rebase_recuts_sparse` off), `supdb-settleshedunbound` with
+the fills' forms shed where their room goes while the cache's budget is
+not bound (`Options::forms_settle_sheds_unbound`), and
+`supdb-rebasedropsshed` with both, the default as it stood before the two;
+`supdb-settlegallop`, `supdb-settleformnear`, `supdb-settlepatchwhole`,
+`supdb-settlevaluenear` and `supdb-settletablenear` are `supdb` with one of
+a settle's asks ahead taken away -- each raw resolve a gallop over the
+heads where its stride is planned (`Options::settle_seek_ahead`), the next
+form's header read where its buffers are asked for
+(`Options::settle_form_ahead`), a copy patched by its rank asked for whole
+(`Options::settle_patch_at_cut`), a written chunk's header asked for
+without its value (`Options::settle_value_ahead`), the block table's own
+lines not asked for (`Options::settle_table_ahead`) -- and
+`supdb-settlenoahead` with all five, the loops as they stood;
+`supdb-headslook` is `supdb` with one look at a partition's heads'
+residency standing in for a settle's asks of the kernel for a hundred
+milliseconds (`Options::heads_look_ms`);
+`supdb-headsmapped` is `supdb` with the ordered indexes' heads read
+through their mappings throughout, no copy of a raw-served partition's
+held in the process's own memory out of core (`Options::heads_owned`
+off);
+`supdb-zpointwhole` is `supdb` with a point read through a form file
+decoding its group whole into the handle's memo at every miss, no decode
+of a first-touched group only as far as its key and no admission at the
+second touch (`Options::zpages_point_part` off), `supdb-znopointkeys`
+with no table of where the keys read through the memo lie
+(`Options::zpages_point_keys` off), and `supdb-zpointplain` with both
+off, the point read through the form as it stood; `supdb-zscanputs` is
+`supdb` with every decode of a walk through a form file put in the memo,
+no first touch of a group decoded into the cursor's own buffer
+(`Options::zpages_scan_admit` off), and `supdb-zmemoplain` with all three
+off, the memo as it stood; `supdb-zwalkwhole` is `supdb` with every group
+a walk opens through a form file decoded whole, none only as far as the
+walk reads (`Options::zpages_walk_part` off); `supdb-zbulkmemo` is
+`supdb` with every decode of the bulk walk through a form file
+(`ZFile::scan_at`) put in the memo, no first touch decoded into the
+thread's own buffer (`Options::zpages_bulk_admit` off), and
+`supdb-zbulknoahead` with the bulk walk asking for no group's lines ahead
+of its open (`Options::zpages_bulk_ahead` off), `supdb-zbulkpart` with
+its own decode of the group it ends inside made only as far as it reads
+(`Options::zpages_bulk_part` on), and `supdb-zbulkaheadwithin` with its
+ask made for the next group of a page as well as the next page's head
+(`Options::zpages_bulk_ahead_within`), and `supdb-zbulksearch` with the
+fence searched at every page and the memo asked twice a group
+(`Options::zpages_bulk_steps` off), and `supdb-zflatshort` with the flat
+LZ4 decoder lent the fast loop's slack alone, so each group's last
+sequences go the fast loop's way (`Options::zpages_flat_slack` off);
+`supdb-noscanrawahead` is `supdb` with a walk of a partition's raw
+records asking for none of them ahead of it (`Options::scan_raw_ahead`
+off), `supdb-scanrawahead` with the ask made on every store, within the
+last-level cache or past it (`Options::scan_raw_ahead_past_llc` off), and
+`supdb-scanrawpaced` with it made a kilobyte ahead as the walk goes
+(`Options::scan_raw_ahead_lead`); `supdb-settlegated` and `supdb-ingestsettlegated` are `supdb` and
+`supdb-ingest` filing a commit's batch at the write only where the
+partitions' data passes the last-level cache
+(`Options::forms_settle_past_llc`); `supdb-readhashes` and
+`supdb-ingestreadhashes` are `supdb` and `supdb-ingest` with a point read
+hashing its key in each source it consults (`Options::read_hash_once`
+off), and `supdb-readnoahead` and `supdb-ingestreadnoahead` with it asking
+for the memtable's slot alone ahead of its probes
+(`Options::read_lines_ahead` off); `supdb-settlebuildsfiled` and
+`supdb-ingestsettlebuildsfiled` are `supdb` and `supdb-ingest` with a
+burst's batch filed in the commit building the forms its settle filed into
+(`Options::forms_settle_builds_filed`); `supdb-ingestpromote` is
+`supdb-ingest` with a block the reads have taken 256 entries from held as a
+merged copy beside its cheap form (`Options::promote_entries`);
+`supdb-convert16` and `supdb-ingestconvert16` are `supdb` and
+`supdb-ingest` with the upkeep thread's fill converting a sparse form to a
+copy only at the dense count, the shape before a light form of four deltas
+or more converted (`Options::forms_convert_from`), and
+`supdb-densefrom` and `supdb-ingestdensefrom` take the line from
+`DENSEFROM`, with the reads a form takes first from `CONVREADS` and the
+writer's fills, the yields and the walk's crossing from `CONVWRITER`,
+`CONVSTRICT` and `CONVWALK` (`Options::forms_convert_reads`,
+`forms_convert_light_writer`, `forms_convert_light_yields`,
+`forms_convert_at_walk`); `supdb-formahead`, `supdb-sparsespan` and
+`supdb-runsheld`, with their `supdb-ingest` siblings, are the scan's seek
+asking for the first two blocks' form headers
+(`Options::scan_form_ahead`), a sparse form asked for over the walk's share
+of it (`Options::scan_prefetch_sparse_span`) and a partition walk's raw
+runs through one walker (`Options::scan_runs_held`), and
+`supdb-scanlevers` and `supdb-ingestscanlevers` the three together;
+`supdb-widefull` and `supdb-ingestwidefull` merge a wide block's sources
+whole for a scan, where the default stops at the scan's limit
+(`Options::scan_wide_capped`), `supdb-lonetombs` and
+`supdb-ingestlonetombs` search every overlay key's sources for its newest
+tombstone, a lone source's too (`Options::emit_lone_unsearched`), and
+`supdb-widewalks` and `supdb-ingestwidewalks` walk a block wide by its
+count of keys past the end for as long as it is, where the default copies
+it once its walks have paid (`Options::forms_copy_hot_wide`), and
+`supdb-widecopyfixed` and `supdb-ingestwidecopyfixed` copy it at the walk a
+fixed ratio of a walk to a hundred copied keys names, where the default
+copies it once the keys its walks merged reach the entries the copy will
+merge (`Options::forms_copy_wide_priced`);
+`supdb-pacesyncsbatch` holds a syncing commit's paced batch within the
+share or the batch, the larger, and `supdb-pacesyncsthresholds` holds a
+batch of a twentieth of the store and at most 2048 writes within the share
+alone and paces no batch under 256 writes
+(`Options::upkeep_pace_syncs_to_share`), where the default holds a
+commit for its batch's filing where the store's own runs of commits
+between scans make a scan the likelier next operation, and paces every
+other batch within the backlog bound (`Options::upkeep_pace_syncs_model`);
+`supdb-walaheadbeside` writes the log's pre-write on a helper once the
+buying commit has synced, where the default writes it ahead of the
+commit's frames on the writer's path (`Options::wal_ahead_beside`,
+refuted);
+`supdb-probestwice` and `supdb-ingestprobestwice` have a point read over a
+store with tombstones probe every source again after its tombstone pass,
+where the default keeps what the pass found of each source
+(`Options::read_probes_once`);
+`supdb-zhotresident` is `supdb` with the hot-raw fill asking for the
+partitions the reads have not skewed by how much of their records the cache
+holds, most first (`Options::zpages_hot_fill_resident_first`);
+`supdb-zrewarminstall` is `supdb` with the controller's install making a
+rewarm due, so the form files short of resident are asked for at once
+(`Options::zpages_rewarm_at_install`); `supdb-zhotfillquiet` is `supdb` with
+the hot-raw fill's quiet looks taking the growth share into their room
+(`Options::zpages_hot_fill_quiet`);
+`supdb-zpromote` is `supdb`
+with a block that scans have walked a block's worth of entries held as a
+merged copy in its slot under the form file (`Options::promote_entries` at
+sixty-four with `zpages_promote_copies`), and `supdb-zpromotestarts` the
+same with the scan start cache beside it (`Options::scan_start_cache`), so
+that a scan from a key scanned from before finds its block's copy with no
+seek through the form; `supdb-zhotstarts2` and `supdb-zhotstarts3` are
+`supdb` with a scan that starts in a block scans have started in twice,
+or three times, holding the blocks it walks as copies under the form
+(`Options::promote_starts`), and `supdb-nohotstarts` with none held so;
+`supdb-formsoffkept` is `supdb` whose writer, its block forms given up on a
+reading of its scans, keeps them off until its next scan whatever it
+commits meanwhile (`Options::scan_forms_off_stale_writes` at zero), and
+`supdb-settleroomstill` with the room its commits' fills build in closed
+for a second by any growth of the memory group's refaults since the last
+reading, however old (`Options::forms_settle_room_pressure` off);
+`supdb-snapdrops` is `supdb` whose handles, and whose writer on the merge
+paths, drop their scan snapshot at every publish their look has no tables
+to carry across, a merge's or a seal's landing among them
+(`Options::snapshot_stands` off); `supdb-mergedropscovered` with its
+merges dropping behind them the raw records of an input partition its form
+file serves (`Options::merge_drops_covered`), and
+`supdb-sameblocksrecords` with the landing's question whether a rewritten
+partition cuts the same blocks asked of the records whatever the ordered
+indexes hold (`Options::same_blocks_from_index` off), and
+`supdb-mergedropsrecords` with both, the shape the drop was first priced
+in;
+`supdb-zgroup1k` is `supdb` with the form's pages cut into groups of a
+kibibyte of records where the default cuts at two
+(`Options::zpages_group_bytes`);
 `supdb-cache64tofitzpagesdropparse` and `supdb-cache64tofitautozpagesparse`
 are the forced form with the drop and the combined arm with their
 block-coded groups written by the engine's parsing encoder
@@ -510,8 +841,8 @@ own LZ4 decoder (`Options::zpages_own_decoder` off);
 `supdb-cache64tofitautozpagescodingfixed` is the combined arm with the coding
 of its form files the options' block coding wherever the controller builds
 (`Options::zpages_coding_auto` off), where the default's selector picks the
-raw tails where the model predicts that form fits the budget and the block
-coding otherwise;
+raw tails where the model predicts that form fits the fill share of the
+budget (`zselect::FORM_FILL`) and the block coding otherwise;
 `supdb-cache64tofitzpagesrecordrawdecode` is the forced raw-tail form with
 the block cache whose scans decode a group whole before walking it
 (`Options::zpages_inplace_walk` off), where the default reads a raw-tail
