@@ -39,7 +39,7 @@ of the change that produced the text.
 | `src/bytes.rs`, `src/blob.rs` | the read path over any byte source; compiles for wasm |
 | `src/wasmapi.rs` | the C ABI the browser calls; hand-written because the module's size is budgeted |
 | `web/` | the browser reader, its byte sources, the Worker it runs in, and the size control -- `web/README.md` |
-| `tests/` | the engine's contract, the read paths held to each other, the format's damage cases, a checkpoint held to the store it was made of, a crashed store's runs held to its log; `tests/common` holds what more than one file needs |
+| `tests/` | the engine's contract, the read paths held to each other, the format's damage cases, a checkpoint held to the store it was made of, a crashed store's runs held to its log, the store's lock beside a forked child; `tests/common` holds what more than one file needs |
 | `bench/` | the benchmark suite: its own cargo workspace, the arms, the runner, the gate and the figures -- `bench/DESIGN.md` |
 | `experiments/ffi/` | what a C ABI and a Python binding cost a point read, borrowed against copied, beside LMDB's and RocksDB's C APIs; its own manifest and dated results, and not built by the gate -- its `README.md` |
 
@@ -1109,8 +1109,10 @@ landing; and the count of seals
 count of zero is one whose landings the state shows. A store is held by one open at a time, under an exclusive `flock` of
 its `LOCK` taken before the open reads its directory -- an open sweeps the
 segments its manifest does not name, which beside a live store are the
-seals and merges in flight -- and given up last at the close; a test that
-emulates a crash calls `Db::crash`, which gives the lock up as a dead
+seals and merges in flight -- and given up last at the close, by an
+unlock and not by the descriptor's close, since a child the process forked
+holds a copy of the descriptor and the lock with it (`StoreLock`); a test
+that emulates a crash calls `Db::crash`, which gives the lock up as a dead
 process's is given up, since a `mem::forget` keeps it and the reopen is
 refused as a second open. A crash between any
 two of those leaves either a WAL that replays the whole memtable, with a
@@ -2896,10 +2898,24 @@ opened again inside that window was refused as open elsewhere, the
 child's copy holding the lock the close had given up. Once on a hosted
 runner; with the child held 30 ms before its exec, two runs of the binary
 in eight, the same test at the same line; none of thirty without the
-oracle. The tests there hold a lock for read while they open stores and
-the oracle spawns under it for write (`no_fork`). The engine's own answer
-to a caller that forks is the same refusal, for as long as a child takes
-to reach its exec.
+oracle. The tests there were kept apart from the oracle's spawns by a lock of
+their own for a while, and the engine answered a caller that forks with
+the same refusal for as long as the child took to reach its exec, or for
+the child's life where it never does: a `fork` with no exec, which is
+what Python's `multiprocessing` makes of a process holding a store
+through a binding. The close unlocks the `LOCK` now, which gives it up
+for every copy of the descriptor at once, where closing the descriptor
+gave it up only with the last copy (`StoreLock`'s `Drop`). With the
+tests' lock taken out and the child held 30 ms before its exec, the
+binary failed nine runs of thirty before the unlock, at the same test and
+line, and none of sixty with it, nor any of twelve with the child held
+300 ms; the tests' lock stays out, since it would hide the
+close's going back, and `tests/lock.rs` builds the window on purpose, the
+child stopped in `pre_exec` while the store is closed and opened. The
+unlock is the taking process's alone, by its pid: it reaches every copy,
+so a forked child that dropped its copy of a `Db` would give up its
+parent's lock with the parent's store still open, which the unit test
+beside the type forks to hold.
 
 **A call site no real input reaches red.** The suite's refusals after the
 read pass and after the shuffled load were green-side only, because a real

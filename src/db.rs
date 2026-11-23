@@ -22071,7 +22071,24 @@ pub struct Db {
 /// the file holds no bytes, so it costs the store nothing on disk. The name
 /// is the same in every release: two releases must exclude each other as
 /// two processes of one do.
-struct StoreLock(File);
+///
+/// A `flock` belongs to the open file description and not to the
+/// descriptor, and a child this process forks holds a copy of the
+/// descriptor until it execs, or for its whole life where it never does (a
+/// `fork` without an exec, which is what Python's `multiprocessing` makes
+/// of a process holding a store through a binding). Closing the descriptor
+/// here gives the lock up only once every copy is closed, so the close
+/// unlocks it instead (`Drop`), which gives it up for every copy at once:
+/// a store closed and opened again while a child still held a copy was
+/// refused as open elsewhere. The same reach is why the unlock is the
+/// taking process's alone: a forked child that drops its copy of a `Db`
+/// would otherwise give up its parent's lock with the parent's store
+/// still open.
+struct StoreLock {
+    file: File,
+    /// The process that took the lock.
+    pid: u32,
+}
 
 impl StoreLock {
     const NAME: &'static str = "LOCK";
@@ -22088,7 +22105,10 @@ impl StoreLock {
             .truncate(false)
             .open(dir.join(StoreLock::NAME))?;
         match f.try_lock() {
-            Ok(()) => Ok(StoreLock(f)),
+            Ok(()) => Ok(StoreLock {
+                file: f,
+                pid: std::process::id(),
+            }),
             Err(std::fs::TryLockError::WouldBlock) => Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 format!(
@@ -22104,7 +22124,63 @@ impl StoreLock {
     /// The lock given up with its descriptor left open, as a process's
     /// death gives it up: what `Db::crash` leaves.
     fn release(&self) {
-        let _ = self.0.unlock();
+        let _ = self.file.unlock();
+    }
+}
+
+impl Drop for StoreLock {
+    /// The lock given up by an unlock, and not by the descriptor's close
+    /// that follows: see the type.
+    fn drop(&mut self) {
+        if std::process::id() == self.pid {
+            self.release();
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod store_lock_tests {
+    use super::StoreLock;
+
+    /// A forked child that drops its copy of the lock leaves it its
+    /// parent's: the drop's unlock reaches every copy of the descriptor,
+    /// the parent's with the store still open among them, so it is the
+    /// taking process's alone. And the parent's own drop gives it up.
+    #[test]
+    fn a_forked_childs_drop_leaves_its_parents_lock() {
+        let dir =
+            std::env::temp_dir().join(format!("supdb-next-lock-child-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = StoreLock::take(&dir).unwrap();
+        // SAFETY: the child makes three system calls and ends -- the
+        // drop's `getpid` and `close`, and `_exit` -- with no allocation
+        // and no lock of this process's taken between.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            drop(lock);
+            // SAFETY: the child's end, with no destructor of the test
+            // harness's run.
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        // SAFETY: a wait for the child forked above.
+        while unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+            let e = std::io::Error::last_os_error();
+            assert_eq!(e.kind(), std::io::ErrorKind::Interrupted, "waitpid: {e}");
+        }
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "the child's end: {status:#x}"
+        );
+        let e = StoreLock::take(&dir)
+            .err()
+            .expect("the lock taken beside its holder, after a child dropped its copy");
+        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{e}");
+        drop(lock);
+        StoreLock::take(&dir).expect("the lock, once its holder dropped it");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
