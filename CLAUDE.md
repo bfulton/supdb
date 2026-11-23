@@ -2195,6 +2195,43 @@ out-of-core pairing was the last thing run. A line in a plan that says
 why a thing may not pay is an experiment owed before the thing is built
 to completion, since everything built after it is built on its answer.
 
+The stride form went under a cipher the same way round, built and then
+priced, and its first pairing was the plan's line a second time.
+`bench/scripts/pair.sh supdb-cipherzstride supdb-cipher 5000000 --bound
+671088640 --passes read,scan --reps 2 --ops-div 10` at `3ea2aa2`, the
+binary the encrypted comparators' (`bench/DESIGN.md`): point reads at
+0.81-0.83x of the raw form's under a cipher, 0.61 major faults a read
+against 0.47, scans at 1.04-1.22x. A stride page is two chunks as a form
+page is, a read asks the cache for its page, and the envelope is mapped
+for reads far apart, so each chunk's fill waited for the device by
+itself. Asked for together the two come in one read (`Paged::ask_together`):
+against the arm that keeps them apart (`supdb-cipherzstrideapart`, the
+same command at `01b6f0b`, three reps) the reads are 1.28x and 1.33x at
+0.15 major faults against 0.59, the device's bytes the same. With a
+walk's pages asked as it begins beside it, the form reads 1.07x and
+1.11x of the raw form under a cipher and scans 1.35x and 1.37x, and
+against encrypted RocksDB (the same command against `rocksdb-tuned-enc`)
+0.76x and 0.47-0.53x, where the store as shipped had read 0.72-0.77x and
+0.29x. Neither was what the cell turns on. The store keeps half of what
+the process may use for its plaintext and leaves half to the kernel's
+cache of the ciphertext, and the two hold the same chunks, a chunk just
+decrypted being the newest page of both. A scratch build that took the
+cache's size from the environment, at 500 MiB of the 640, held the
+stride form nearly whole, 477 MiB at that store where the raw form is
+669, and read 182-183 thousand reads a second against encrypted
+RocksDB's 56, 3.2x and 3.3x in the two sittings, the scans 0.62-0.68x.
+`scratch/seam/design.md` had the finding already from the raw form,
+misses a read on one line in the plaintext held, as a decision left for
+the layer's last stages. A budget that large is memory the kernel cannot
+take back, which is why it is half, and the budget that follows the room
+is the item now worked first (`ROADMAP.md`). The rules: a cache laid
+over another holds the hot set the one under it holds, so the two are
+priced as one cache and the split between them before any form above
+them is; and a plan's stages are put in order by a pairing against the
+competitor in the cell the bar names, since the two things this plan
+was built around, the form page's two chunks and the load's double
+write, were each worth a fraction of the lever it had left for last.
+
 A plain store's partition is named by its fences, sixteen bytes of two
 keys, so the names cannot go to the directory either: an envelope is named
 by a token drawn for it, the names live in the sealed manifest beside the

@@ -556,34 +556,55 @@ What an engine picker would hit, roughly in order.
   and the store reads the partition raw as a plain store does
   (`a_changed_byte_in_a_form_file_takes_the_form_out_of_service_and_not_the_store`,
   `tests/cipher.rs`, at the attach and in service).
-- [ ] **The stride form under a cipher.** Built, and not yet priced. A
-  stride file is written from a kept segment's records read by the piece
-  (`StrideWalked for Held`), read back and attached through the store's
-  cache, and served by the readers a plain store's is: they index the
-  file's range at its offsets, each page after the page's check, and for
-  a file whose mapping lends nothing whole that check is where the page
-  is asked for, at every read (`ZFile::asks`,
-  `MmapBytes::lend_asked_map`). A store in the clear runs the code it
-  ran: no function moved in the count's three stride probes (`sh
-  scripts/cost.sh 83e63ed read_s scan_s scan_long_s`). Held by the
-  stride oracle under a cipher in a small cache, with the block cache
-  and without (`tests/zpages.rs`); by a stride file's damage and its
-  build's rests (`tests/cipher.rs`); and by the differential fuzz with
-  the form forced there (`ZFUZZ_ZPAGES=1 ZFUZZ_STRIDE=1 ZFUZZ_CIPHER=1
-  ZFUZZ_CIPHERCACHE=16384`, with `ZFUZZ_SPARSE` and `ZFUZZ_CONVERT`, and
-  under `SUPDB_PAGER_GUARD`, where a page read without its ask is a
-  fault). It is the first thing the bounded cells the encrypted
-  comparators win are lost by ("Reads and scans out of core", below),
-  and a read through it asks the cache for a page a value, which nothing
-  has counted. And the borrow its readers index spans the cache's whole
-  range, pages other threads fill among them: it holds by what the
-  readers read, each page asked for first, and not by the borrow's type
-  (`lend_asked_map`'s safety note). Readers generic over a source that
-  hands each range, as `flatindex`'s are over `Sect`, would hold it by
-  type, at a count of the plain store's eight readers. Done when the
-  read and the walk under a cipher are counted beside the plain store's,
-  and an arm that builds the form there is paired against `supdb-cipher`
-  and against `rocksdb-tuned-enc` at five million keys under 640 MiB.
+- [x] **The stride form under a cipher.** A stride file is written from
+  a kept segment's records read by the piece (`StrideWalked for Held`),
+  read back and attached through the store's cache, and served by the
+  readers a plain store's is: they index the file's range at its
+  offsets, each page after the page's check, and for a file whose
+  mapping lends nothing whole that check is where the page is asked for,
+  at every read (`ZFile::asks`, `MmapBytes::lend_asked_map`). A store in
+  the clear runs the code it ran (`sh scripts/cost.sh 83e63ed read_s
+  scan_s scan_long_s`). Held by the stride oracle under a cipher in a
+  small cache (`tests/zpages.rs`), a stride file's damage and its
+  build's rests (`tests/cipher.rs`), and the differential fuzz with the
+  form forced there under `SUPDB_PAGER_GUARD`. Priced in "Reads and
+  scans out of core", below, by `supdb-cipherzstride`. Two things it
+  leaves: a read through it asks the cache for a page a value, an
+  out-of-line call a record of a walk, which in core is the scans at
+  nine tenths of the raw form's under a cipher (`bench ab --arms
+  supdb-cipherzstride,supdb-cipher --size 100000 --reps 3 --passes
+  load,read,scan` at `3ea2aa2`, one sitting) and wants a walk that asks
+  its run once; and
+  the borrow its readers index spans the cache's whole range, pages
+  other threads fill among them, so it holds by what the readers read,
+  each page asked for first, and not by the borrow's type
+  (`lend_asked_map`'s safety note), where readers generic over a source
+  that hands each range, as `flatindex`'s are over `Sect`, would hold it
+  by type at a count of the plain store's eight readers.
+- [ ] **The plaintext a store under a cipher holds follows the room.**
+  The store's cache of plaintext is half of what the process may use,
+  read once at the open, and the other half is left to the kernel's
+  cache of the ciphertext a miss is read from. The two hold the same
+  chunks, a chunk just decrypted being the newest page of both, so their
+  sum is little more than one of them, and the bounded cells are decided
+  by how much plaintext is held ("Reads and scans out of core", below:
+  3.2x of encrypted RocksDB with 500 MiB of 640 given to it, 0.76x at
+  the half). Half is what it is because plaintext in a memory file is
+  memory the kernel cannot take back: a process whose own memory grows
+  beside a cache near the limit is killed, where a plain store's page
+  cache gives way. So the budget is recomputed as the process runs: the
+  group's limit less its anonymous memory, less what the store's own
+  large buffers are about to take (`src/db/blocks.rs` is the one place
+  they are mapped, and can say so before it maps), less the files being
+  written that cannot be given back, less a reserve for the kernel's own
+  use of the group, with the two lines a reader waits at drawn against
+  the same room and not as multiples of a budget. Done when a store
+  under a cipher holds what the room allows through the row's passes
+  under each bound, a load and a lag sweep among them, with no process
+  killed in ten sittings of each, two stores in one process and a caller
+  whose own memory grows beside it; and the controller's model reads the
+  same room (`zpages_under_cipher`, "An envelope whose chunks are whole
+  pages").
 - [ ] **The heads' copy under a cipher.** The copy of a partition's
   ordered-index heads in the process's own memory (`Options::heads_owned`)
   is made from the index's mapping as it lies, which a store under a
@@ -696,16 +717,29 @@ until the run is its own log). What it loses:
   cipher (the same pairing against `supdb`). What loses the cells is that
   a store under a cipher is kept out of the compact forms: the stride
   form was declined there when the pairing ran, and the controller is off
-  because a form page lies across two chunks. The items, in the order
-  they are worked: "The stride form under a cipher", built since and not
-  yet paired, "An envelope whose chunks are whole pages" and the
-  controller on behind it, all under "Engine". One thing is
-  arithmetic and not yet a measurement: the stride file is 500 MB at five
-  million keys, which the bound cannot hold twice, as the kernel's cache
-  of the ciphertext and the store's of the plaintext, so what the stride
-  form buys there depends on which of the two the budget is given to, and
-  holding it once is the page layer's last stage. Done when `supdb-cipher`
-  reads and scans ahead of `rocksdb-tuned-enc` in both sittings.
+  because a form page lies across two chunks. With the stride form built
+  there and forced (`supdb-cipherzstride` in that pairing's place, three
+  reps, at `01b6f0b`), the ciphertext of an ask's chunks asked for
+  together and a walk's pages asked as it begins, encrypted RocksDB
+  reads at 1.31-1.32x and scans at 1.9-2.2x: the form reads 1.07-1.11x
+  of the raw form under a cipher and scans 1.35-1.37x (the same pairing
+  against `supdb-cipher`), and the together ask is 1.28-1.33x of the
+  reads' rate by itself (against `supdb-cipherzstrideapart`). What the
+  cell turns on is the plaintext held. A scratch build of `3ea2aa2` with
+  the together ask and a cache whose size came from the environment, at
+  500 MiB of the 640 where the store takes half of what is free at its
+  open, read the forced stride
+  form at 182-183 thousand reads a second against encrypted RocksDB's
+  56, 3.2x and 3.3x in the two sittings, and scanned at 0.62-0.68x of
+  it; the stride form is 477 MiB at that store where the raw form is
+  669, so it is the form that can be held. The items, in the order they
+  are worked: "The plaintext a store under a cipher holds follows the
+  room", then the scans, which at 500 MiB still take two major faults a
+  scan of a hundred where RocksDB reads the same bytes from the device
+  with none and are not yet taken apart, then the controller on under a
+  cipher, all under
+  "Engine". Done when `supdb-cipher` reads and scans ahead of
+  `rocksdb-tuned-enc` in both sittings.
 - [ ] **The ordered load.** In the row the durable ordered load is behind
   both encrypted comparators at ten thousand keys (0.66x, resolved) and
   lower and unresolved at the three rungs above (0.83-0.94x); the
@@ -748,11 +782,15 @@ until the run is its own log). What it loses:
 
 ### The order of the work
 
-First the two "Engine" items the bounded cells above are lost by: "The
-stride form under a cipher", which is built and is to be priced, and
-then "The heads' copy under a cipher". The pass below cannot be green
-while a mechanism does nothing under a cipher. Then that pass, then the
-layer.
+First the "Engine" items the bounded cells above are lost by, by what
+the pairings against the encrypted comparators put first: "The plaintext
+a store under a cipher holds follows the room", the scans behind it, the
+controller on, and "The heads' copy under a cipher". The pass below
+cannot be green while a mechanism does nothing under a cipher. Then that
+pass, then the layer, whose stages are read again against those
+pairings before one is built: it was designed for the ordered load's
+double write and the two chunks a form page lies across, and the reads
+turned on neither.
 
 - [ ] **Every mechanism held to acting under a cipher.** The seal bars
   a whole borrow at the sites it lists, and a new walk over a section
