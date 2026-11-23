@@ -6269,6 +6269,46 @@ and a fix read in pairings is the row's only once the row's own harness
 has taken it, the rate of a shape the kernel's timing makes being the
 sitting's.
 
+**A cost taken off the reader's path, and paid back by the reader in
+pages.** At ten million keys the writer gives its block forms up for the
+merge path, the commit's maintenance then does nothing, and the first
+scan after a burst sorts every unsealed key itself: by the sweep's own
+phase timers 16-22 ms of the pass after the one-percent burst, 45-115
+after the ten-percent and 42-118 after the full rewrite, a tenth to a
+fifth of each divided pass under either bound, while the upkeep thread
+made nine hundred passes in 1.3 ms. So the maintenance was given the
+scan's preamble to do at each commit (`Options::forms_off_snapshot_kept`,
+`supdb-snapkept`), on a thread that had nothing else to do, with seven
+mutants failing its test and 460 seeds of the fuzz clean. Its counter
+fired 3,700 times a sweep, the scan's snapshot phase read 2-4 ms, 5-18
+and 0.5-8, and no pass was faster. Under 1 GiB the pass after the full
+rewrite read 0.82x and 0.84x, and under 1.25 GiB 0.62x and 0.44x, the
+ten-percent burst 0.87x and 0.89x there (`SUPDB_LAG_COUNTERS=1
+bench/scripts/pair.sh supdb-snapkept supdb 10000000 --bound 1073741824
+--reps 3 --ops-div 10 --passes load,lag`, and under 1342177280, at
+`8876f01`). A snapshot does not stand across a freeze, so the
+maintenance built one from every unsealed key at each: 173 builds and
+120 carried forward in a sweep where the scans make three, fourteen
+seconds of the thread over a rewrite of twenty-eight. And what those
+builds freed stayed the process's: 70-80 MB more anonymous memory at the
+pass, which under 1 GiB was a quarter more major faults on the scanning
+thread, and under 1.25 GiB took a store that had fitted, thirteen faults
+a pass, to 4,400. Off, and the arm stands as the refutation. The rules:
+a lever that moves work off a path is priced under a bound by the
+anonymous memory the work leaves, read at the pass (`lagmem`) beside the
+phase it saved, since at the edge of fitting a megabyte the process
+keeps is a megabyte of the store read from the device; work moved to a
+thread "that is idle anyway" is counted by the events it will run at --
+a build a freeze here, 173 for the scans' three -- before it is called
+free; and a structure that is rebuilt whole when its base changes is not
+kept current by rebuilding it more often. What the refutation named is
+the lever: the same sweep with the allocator told to map every
+allocation of 128 KB or more (`supdb-mmapthr`, which is the host's
+policy and no shape of the engine's) held 110-150 MB less at every
+point, took the scanning thread's faults from 4,300 to 460 after the
+ten-percent burst and from 10,200 to 4,300 after the full rewrite, and
+read that pass 1.22x in both orders.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

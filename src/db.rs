@@ -4333,20 +4333,30 @@ pub struct Options {
     /// (`supdb-formsoffkept`).
     #[doc(hidden)]
     pub scan_forms_off_stale_writes: u32,
-    /// EXPERIMENT: while the writer's forms are given up for the merge
-    /// path (`scan_forms_off_unreused`) and scans are near, the commit's
-    /// maintenance keeps the merge path's scan snapshot to the commit
-    /// (`Reader::keep_merge_snapshot`): the log read and the keys created
-    /// since filed into the snapshot, as a scan's preamble does, on the
-    /// upkeep thread where the upkeep is lent. With the forms off the
-    /// maintenance did nothing -- nine hundred passes of the thread in
-    /// 1.3 ms over the lag sweep's ten-percent burst at ten million keys
-    /// -- and the first scan after a burst sorted every unsealed key
+    /// EXPERIMENT, refuted: while the writer's forms are given up for the
+    /// merge path (`scan_forms_off_unreused`) and scans are near, the
+    /// commit's maintenance keeps the merge path's scan snapshot to the
+    /// commit (`Reader::keep_merge_snapshot`): the log read and the keys
+    /// created since filed into the snapshot, as a scan's preamble does,
+    /// on the upkeep thread where the upkeep is lent. With the forms off
+    /// the maintenance does nothing -- nine hundred passes of the thread
+    /// in 1.3 ms over the lag sweep's ten-percent burst at ten million
+    /// keys -- and the first scan after a burst sorts every unsealed key
     /// itself: 16-22 ms of the pass after the one-percent burst there,
     /// 45-115 after the ten-percent and 42-118 after the full rewrite, a
-    /// tenth to a fifth of each divided pass under either bound, for a
-    /// hundred to three hundred and ninety thousand keys. Off: the first
-    /// scan builds it.
+    /// tenth to a fifth of each divided pass under either bound. Kept, the
+    /// scan's snapshot phase read 2-4 ms, 5-18 and 0.5-8, and the passes
+    /// no faster: a snapshot does not stand across a freeze, so the
+    /// maintenance built one from every unsealed key at each, 173 builds
+    /// and 120 carried forward in a sweep where the scans make three, 14 s
+    /// of the thread over a full rewrite of 28, and what those builds
+    /// freed stayed in the process -- 70-80 MB more anonymous memory at
+    /// the pass after the full rewrite, which under 1 GiB was a quarter
+    /// more major faults on the scanning thread and the pass at 0.82x and
+    /// 0.84x, and under 1.25 GiB took a store that had fitted, thirteen
+    /// faults a pass, to 4,400 and the pass to 0.62x and 0.44x
+    /// (`docs/engine.md`). Off: the first scan builds it.
+    /// `supdb-snapkept` is the arm.
     #[doc(hidden)]
     pub forms_off_snapshot_kept: bool,
     /// The scans a window of `scan_forms_off_unreused`'s share is taken
