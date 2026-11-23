@@ -12119,6 +12119,137 @@ fn raw_resident(dir: &Path) -> (u64, u64) {
     (ps + os, pr + or)
 }
 
+/// A settle that asked for the raw form's files maps what came back
+/// (`Options::zpages_rewarm_raw_maps`). Every partition and ordered index
+/// is put out of the cache and out of the store's page tables; the settle
+/// asks for them and waits, and with the option the partitions' record
+/// regions are mapped when it returns, where without it they are resident
+/// and unmapped, each first touch a fault. With no room in the group
+/// nothing is asked, and nothing is mapped: the mapping reads no region
+/// the ask left out. And a region the scans have faulted in is mapped
+/// either way, which is what the count is of.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_settle_maps_the_raw_files_it_asked_back() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Room {
+        All,
+        Half,
+        /// For half of the ordered indexes and no partition.
+        Indexes,
+        None,
+    }
+    for (maps, room) in [
+        (true, Room::All),
+        (false, Room::All),
+        (true, Room::Half),
+        (true, Room::Indexes),
+        (true, Room::None),
+    ] {
+        let what = format!("raw maps {maps} room {room:?}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-rawmaps-{maps}-{room:?}"),
+            1 << 30,
+            0.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_rewarm_raw = true;
+                o.zpages_rewarm_raw_scans = false;
+                o.zpages_rewarm_raw_maps = maps;
+                o.zpages_hot_raw = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        for _ in 0..3 {
+            advance_tick(&db, std::time::Duration::from_millis(100));
+        }
+        let c = db.zpage_counts();
+        assert_eq!(c.gate, 0, "{what}: the raw form serves: {c:?}");
+        let (size, cold) = evict_raw(&dir);
+        assert!(
+            size > 0 && cold * 10 < size,
+            "{what}: the raw files out of the cache: {cold} of {size}"
+        );
+        inject.set_slack(match room {
+            Room::All => 1 << 30,
+            Room::Half => size / 2,
+            Room::Indexes => resident_under(&dir, "ord-").0 / 2,
+            Room::None => 0,
+        });
+        let (recs, ord) = db.raw_mapped_share().expect("the page tables are readable");
+        assert!(
+            recs < 0.1 && ord < 0.1,
+            "{what}: the files out of the page tables: records {recs:.2}, indexes {ord:.2}"
+        );
+        let mut db = db;
+        db.settle().unwrap();
+        let c = db.zpage_counts();
+        let (recs, ord) = db.raw_mapped_share().unwrap();
+        let warm = raw_resident(&dir).1;
+        match (maps, room) {
+            (true, Room::All) => {
+                assert!(c.raw_settles == 1 && c.raw_maps > 0, "{what}: {c:?}");
+                assert!(
+                    warm * 10 >= size * 9 && recs >= 0.9 && ord >= 0.9,
+                    "{what}: the files back and mapped: {warm} of {size} resident, \
+                     records {recs:.2} and indexes {ord:.2} mapped"
+                );
+            }
+            (false, _) => {
+                assert!(c.raw_settles == 1 && c.raw_maps == 0, "{what}: {c:?}");
+                assert!(
+                    warm * 10 >= size * 9 && recs < 0.1 && ord < 0.1,
+                    "{what}: the files back and nothing of them mapped: {warm} of {size} \
+                     resident, records {recs:.2} and indexes {ord:.2} mapped"
+                );
+            }
+            (true, Room::Half) => {
+                // The ordered indexes are asked first and all come back;
+                // the room ends among the partitions, and a partition the
+                // ask left out is neither read nor mapped.
+                assert!(
+                    c.raw_settles == 1 && c.raw_maps > 0 && c.raw_rewarm_short > 0,
+                    "{what}: {c:?}"
+                );
+                assert!(
+                    warm * 10 < size * 8 && recs > 0.1 && recs < 0.8 && ord >= 0.9,
+                    "{what}: what was asked back is mapped and the rest left out: {warm} of \
+                     {size} resident, records {recs:.2} and indexes {ord:.2} mapped"
+                );
+            }
+            (true, Room::Indexes) => {
+                assert!(
+                    c.raw_settles == 1 && c.raw_maps > 0 && c.raw_rewarm_short > 0,
+                    "{what}: {c:?}"
+                );
+                assert!(
+                    recs < 0.1 && ord > 0.1 && ord < 0.8,
+                    "{what}: the indexes asked back are mapped, and no index or partition \
+                     the ask left out: records {recs:.2} and indexes {ord:.2} mapped"
+                );
+            }
+            (true, Room::None) => {
+                assert!(c.raw_settles == 0 && c.raw_maps == 0, "{what}: {c:?}");
+                assert!(
+                    warm * 10 < size && recs < 0.1 && ord < 0.1,
+                    "{what}: nothing asked beyond the room, and nothing read to be \
+                     mapped: {warm} of {size} resident, records {recs:.2}"
+                );
+            }
+        }
+        // The scans answer the model, and what they read is mapped whatever
+        // the option.
+        check_scan(&db, &model, &what);
+        assert!(
+            db.raw_mapped_share().unwrap().0 > 0.5,
+            "{what}: a scan of the store maps what it reads"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// With the raw form serving -- the store in core, no form installed --
 /// the scans that come back after a stretch without one have the raw files
 /// the page cache has lost asked for (`Options::zpages_rewarm_raw`): every

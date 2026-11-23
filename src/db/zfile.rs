@@ -6402,6 +6402,10 @@ pub(super) struct ZEvents {
     /// and the milliseconds they waited.
     pub raw_settles: AtomicU64,
     pub raw_settle_ms: AtomicU64,
+    /// The segments such a settle mapped after its ask, and the
+    /// milliseconds the mapping took.
+    pub raw_maps: AtomicU64,
+    pub raw_map_ms: AtomicU64,
     /// Re-codes made by exchanging the served form file with the kept one.
     pub recode_flips: AtomicU64,
     /// Spares built and kept (`Options::zpages_both`), and spares that kept

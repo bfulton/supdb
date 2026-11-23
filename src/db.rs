@@ -965,6 +965,11 @@ pub struct ZCounts {
     /// (`Options::zpages_rewarm_raw`), and the milliseconds they waited.
     pub raw_settles: u64,
     pub raw_settle_ms: u64,
+    /// The segments such a settle mapped into the page tables after its
+    /// ask, and the milliseconds the mapping took
+    /// (`Options::zpages_rewarm_raw_maps`).
+    pub raw_maps: u64,
+    pub raw_map_ms: u64,
     /// Block-coded partitions re-parsed while served
     /// (`Options::zpages_reparse`).
     pub reparses: u64,
@@ -6328,6 +6333,22 @@ pub struct Options {
     /// `supdb-zrewarmrawscans` asks there too.
     #[doc(hidden)]
     pub zpages_rewarm_raw_scans: bool,
+    /// EXPERIMENT: a settle that asked for the raw form's files
+    /// (`zpages_rewarm_raw`) maps what came back into the process's page
+    /// tables as well (`MADV_POPULATE_READ`, `Maint::raw_map`): the record
+    /// region and the ordered index of every segment the ask could have
+    /// named, where `HOT_RAW_RESIDENT` of it is resident, so that mapping
+    /// reads at most the tenth the ask left. A page the cache dropped went
+    /// out of the page tables with it, and a page asked back is resident
+    /// and unmapped: at three million keys under 1 GiB the clean store's
+    /// pass after a settle that had asked 178 MB back took 1,400-2,260
+    /// minor faults in 3,000 scans where a store never pushed out takes 621,
+    /// about eight microseconds each under the bound by the fit across
+    /// reps, and ran 17-28 ms where the unpushed store runs 10-14. Counted
+    /// (`ZCounts::raw_maps`, `raw_map_ms`). Off; `supdb-zrewarmrawmaps`
+    /// maps.
+    #[doc(hidden)]
+    pub zpages_rewarm_raw_maps: bool,
     /// A rewarm due (`zpages_rewarm_scans`) is made while merges are in
     /// flight, for the form files of the partitions no merge in flight
     /// holds, where off it waits for the merges to land. It was made beside
@@ -7098,6 +7119,7 @@ impl Default for Options {
             zpages_rewarm_trims: false,
             zpages_rewarm_raw: false,
             zpages_rewarm_raw_scans: false,
+            zpages_rewarm_raw_maps: false,
             zpages_rewarm_beside_merges: false,
             zpages_rewarm_quiet_ms: 250,
             zpages_stride: ZStride::Forced,
@@ -20168,6 +20190,59 @@ fn fadvise_dontneed(file: &std::fs::File) {
 #[cfg(not(target_os = "linux"))]
 fn fadvise_dontneed(_file: &std::fs::File) {}
 
+/// The whole pages inside `bytes`, a range of a file's mapping, mapped into
+/// this process's page tables (`MADV_POPULATE_READ`), reading in whichever
+/// of them the page cache does not hold: true where the kernel took the
+/// advice. A page resident and unmapped costs its first reader a fault,
+/// and under a bound that fault is not the cheap one.
+pub(super) fn populate_read(bytes: &[u8]) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let page = crate::bytes::os_page_size();
+        let start = (bytes.as_ptr() as usize).next_multiple_of(page);
+        let end = (bytes.as_ptr() as usize + bytes.len()) / page * page;
+        if start >= end {
+            return false;
+        }
+        // SAFETY: `start..end` are whole pages inside the mapping `bytes`
+        // borrows for the call; the advice maps pages of a read-only
+        // shared file mapping and changes no byte of them.
+        let rc = unsafe {
+            libc::madvise(
+                start as *mut libc::c_void,
+                end - start,
+                libc::MADV_POPULATE_READ,
+            )
+        };
+        rc == 0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = bytes;
+        false
+    }
+}
+
+/// The share of the pages under `bytes` this process's page tables map
+/// now, by the present bit of `/proc/self/pagemap`; `None` for an empty
+/// range or where the file cannot be read. What `populate_read` changes
+/// and `mincore` cannot see, since a page may be resident and unmapped.
+pub(super) fn mapped_share(bytes: &[u8]) -> Option<f64> {
+    use std::io::{Read, Seek, SeekFrom};
+    if bytes.is_empty() {
+        return None;
+    }
+    let page = crate::bytes::os_page_size();
+    let start = bytes.as_ptr() as usize / page;
+    let end = (bytes.as_ptr() as usize + bytes.len()).div_ceil(page);
+    let mut f = std::fs::File::open("/proc/self/pagemap").ok()?;
+    f.seek(SeekFrom::Start((start * 8) as u64)).ok()?;
+    let mut buf = vec![0u8; (end - start) * 8];
+    f.read_exact(&mut buf).ok()?;
+    let present = buf.chunks_exact(8).filter(|c| c[7] & 0x80 != 0).count();
+    Some(present as f64 / (end - start) as f64)
+}
+
 /// The share of the pages under `bytes`, a range of a file's mapping, that
 /// the kernel holds in memory now, by `mincore`; zero for an empty range
 /// or where the kernel will not say.
@@ -25088,6 +25163,8 @@ impl Reader {
             raw_rewarm_short: get(&ev.raw_rewarm_short),
             raw_settles: get(&ev.raw_settles),
             raw_settle_ms: get(&ev.raw_settle_ms),
+            raw_maps: get(&ev.raw_maps),
+            raw_map_ms: get(&ev.raw_map_ms),
             reparses: get(&ev.reparses),
             recode_flips: get(&ev.recode_flips),
             spare_builds: get(&ev.spare_builds),
@@ -33014,6 +33091,26 @@ impl Reader {
                 .cache_copies_revokes
                 .load(AtomicOrdering::Relaxed),
         )
+    }
+
+    /// A test's: the shares of the partitions' record regions and of their
+    /// ordered indexes that this process's page tables map now
+    /// (`mapped_share`), by bytes; `None` where the kernel will not say.
+    #[doc(hidden)]
+    pub fn raw_mapped_share(&self) -> Option<(f64, f64)> {
+        let _e = self.enter();
+        let (mut recs_at, mut recs_of) = (0f64, 0f64);
+        let (mut ord_at, mut ord_of) = (0f64, 0f64);
+        for s in self.segs().iter().filter(|s| s.level > 0) {
+            if let Some((recs, _)) = s.blob.for_zfile().record_regions() {
+                recs_at += mapped_share(recs)? * recs.len() as f64;
+                recs_of += recs.len() as f64;
+            }
+            let ord = s.ord.mapped();
+            ord_at += mapped_share(ord)? * ord.len() as f64;
+            ord_of += ord.len() as f64;
+        }
+        (recs_of > 0.0 && ord_of > 0.0).then(|| (recs_at / recs_of, ord_at / ord_of))
     }
 
     /// Whether the store reads as far from point reads (`Shared::points_far`).
@@ -50931,6 +51028,39 @@ impl Maint {
                 last as f64 / 1e6,
                 total as f64 / 1e6
             );
+        }
+        drop(maps);
+        if self.opts.zpages_rewarm_raw_maps {
+            self.raw_map();
+        }
+    }
+
+    /// What a settle's ask brought back, mapped
+    /// (`Options::zpages_rewarm_raw_maps`): the record region and the
+    /// ordered index of every segment, through the mappings the readers
+    /// read them by, each only where `HOT_RAW_RESIDENT` of it is resident
+    /// -- a region the ask left out for want of room, or one a form file
+    /// serves in its place, is not read in here, and one the ask brought
+    /// back is read by a tenth at most. The hash slots are left: no scan
+    /// touches them.
+    fn raw_map(&self) {
+        let t = std::time::Instant::now();
+        let _op = self.op();
+        let mut n = 0u64;
+        for s in self.segs().iter() {
+            let mut any = false;
+            if let Some((recs, _)) = s.blob.for_zfile().record_regions() {
+                any |= resident_share(recs) >= HOT_RAW_RESIDENT && populate_read(recs);
+            }
+            let ord = s.ord.mapped();
+            any |= resident_share(ord) >= HOT_RAW_RESIDENT && populate_read(ord);
+            n += u64::from(any);
+        }
+        let ms = t.elapsed().as_millis() as u64;
+        zfile::ZEvents::add(&self.shared.z.raw_maps, n);
+        zfile::ZEvents::add(&self.shared.z.raw_map_ms, ms);
+        if self.z_trace {
+            eprintln!("zrawmap segments {n} ms {ms}");
         }
     }
 

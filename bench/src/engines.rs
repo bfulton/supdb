@@ -957,6 +957,10 @@ pub struct Supdb {
     /// (`Options::zpages_rewarm_raw_scans`), `None` for the engine's
     /// default. `supdb-zrewarmrawscans`.
     rewarmrawscans: Option<bool>,
+    /// With `rewarmraw`, what the settle's ask brought back mapped into the
+    /// page tables (`Options::zpages_rewarm_raw_maps`), `None` for the
+    /// engine's default. `supdb-zrewarmrawmaps`.
+    rewarmrawmaps: Option<bool>,
     /// The block cache granted the raw records' place where its own budget
     /// would bind and no point read is near
     /// (`Options::scan_cache_copies_fit`), `None` for the engine's default.
@@ -2304,6 +2308,10 @@ struct Policy {
     /// (`Options::zpages_rewarm_raw_scans`), `None` for the engine's
     /// default. `supdb-zrewarmrawscans`.
     rewarmrawscans: Option<bool>,
+    /// With `rewarmraw`, what the settle's ask brought back mapped into the
+    /// page tables (`Options::zpages_rewarm_raw_maps`), `None` for the
+    /// engine's default. `supdb-zrewarmrawmaps`.
+    rewarmrawmaps: Option<bool>,
     /// The block cache granted the raw records' place where its own budget
     /// would bind and no point read is near
     /// (`Options::scan_cache_copies_fit`), `None` for the engine's default.
@@ -3105,6 +3113,7 @@ impl Default for Policy {
             rewarmtrim: false,
             rewarmraw: None,
             rewarmrawscans: None,
+            rewarmrawmaps: None,
             copiesfit: None,
             chainuncovered: None,
             formsoffbuilt: None,
@@ -7655,6 +7664,19 @@ impl Supdb {
         )
     }
 
+    /// `supdb-zrewarmraw` with what the settle's ask brought back mapped
+    /// into the page tables (`Options::zpages_rewarm_raw_maps`).
+    pub fn create_zrewarmrawmaps(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                rewarmraw: Some(true),
+                rewarmrawmaps: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with the form's pages cut into groups of a kibibyte of
     /// records where the default cuts at two (`Options::zpages_group_bytes`
     /// 1024): half the decode for a point read's first touch of a group,
@@ -9538,6 +9560,7 @@ impl Supdb {
             rewarmtrim,
             rewarmraw,
             rewarmrawscans,
+            rewarmrawmaps,
             copiesfit,
             chainuncovered,
             formsoffbuilt,
@@ -10040,6 +10063,8 @@ impl Supdb {
             zpages_rewarm_raw: rewarmraw.unwrap_or(supdb::Options::default().zpages_rewarm_raw),
             zpages_rewarm_raw_scans: rewarmrawscans
                 .unwrap_or(supdb::Options::default().zpages_rewarm_raw_scans),
+            zpages_rewarm_raw_maps: rewarmrawmaps
+                .unwrap_or(supdb::Options::default().zpages_rewarm_raw_maps),
             scan_cache_copies_fit: copiesfit
                 .unwrap_or(supdb::Options::default().scan_cache_copies_fit),
             merge_chains_writes_uncovered: chainuncovered
@@ -10515,6 +10540,7 @@ impl Supdb {
             rewarmtrim,
             rewarmraw,
             rewarmrawscans,
+            rewarmrawmaps,
             copiesfit,
             chainuncovered,
             formsoffbuilt,
@@ -12074,6 +12100,9 @@ impl Engine for Supdb {
         if self.rewarmrawscans == Some(true) {
             return "supdb-zrewarmrawscans";
         }
+        if self.rewarmrawmaps == Some(true) {
+            return "supdb-zrewarmrawmaps";
+        }
         match (
             self.copiesfit == Some(false),
             self.chainuncovered == Some(false),
@@ -12825,6 +12854,8 @@ impl Engine for Supdb {
             ("zpage_raw_rewarm_short", z.raw_rewarm_short as f64),
             ("zpage_raw_settles", z.raw_settles as f64),
             ("zpage_raw_settle_ms", z.raw_settle_ms as f64),
+            ("zpage_raw_maps", z.raw_maps as f64),
+            ("zpage_raw_map_ms", z.raw_map_ms as f64),
             ("forms_off_entries", db.forms_off_counts()[0] as f64),
             ("forms_off_exits", db.forms_off_counts()[1] as f64),
             ("forms_off_scans", db.forms_off_counts()[2] as f64),
@@ -13783,6 +13814,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-rewarmtrim"
         | "supdb-zrewarmraw"
         | "supdb-zrewarmrawscans"
+        | "supdb-zrewarmrawmaps"
         | "supdb-nocopiesfit"
         | "supdb-chaincovered"
         | "supdb-nocopiesfitchain"
@@ -15721,6 +15753,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-rewarmtrim" => supdb_arm(Supdb::create_rewarmtrim, dir)?,
         "supdb-zrewarmraw" => supdb_arm(Supdb::create_zrewarmraw, dir)?,
         "supdb-zrewarmrawscans" => supdb_arm(Supdb::create_zrewarmrawscans, dir)?,
+        "supdb-zrewarmrawmaps" => supdb_arm(Supdb::create_zrewarmrawmaps, dir)?,
         "supdb-nocopiesfit" => supdb_arm(Supdb::create_nocopiesfit, dir)?,
         "supdb-chaincovered" => supdb_arm(Supdb::create_chaincovered, dir)?,
         "supdb-nocopiesfitchain" => supdb_arm(Supdb::create_nocopiesfitchain, dir)?,
