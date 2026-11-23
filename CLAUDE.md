@@ -5706,7 +5706,20 @@ everything of it that reads what the test changes next, so it names the
 counter the turn moves last; a fix for a race is held to the race made
 wide before it is believed, since a fix that narrows the window passes
 every run that the unfixed test passes; and a failure met under a switch
-is run without the switch, as many times, before it is the switch's.
+is run without the switch, as many times, before it is the switch's. It
+came again as a count two planners move. The test of a burst the
+writer's forms cover waits for four plans to know its four seals have
+landed, as the test it was written from does, and scans before the seals
+where that one scans after them: the idle planner's look at the scan
+(`Options::merge_plan_idle`) is a plan too, counted with the landings'.
+Counted after the baseline was read, it ended the wait with three seals
+landed, the hold on the first merge came off, and the fourth seal's
+landing found that merge finished and planned the second range itself,
+which the test read as the chain run through a burst it was to leave
+alone: three runs in a hundred alone, and every run with the last
+landing held back. The engine had chained nothing; the idle planner is
+off in that test. A wait copied from a sibling is read against what this
+test does that the sibling does not.
 
 **A lever built for the largest peak known, before a count said whose
 memory stayed.** At ten million keys under 1 GiB the allocator held 57-68
