@@ -8,6 +8,51 @@ and its older sections below are kept because they are still true of what they d
 `scratch/` is session notes kept in the repo so they survive the container. **Remove it before
 any merge or pull request.**
 
+## Upstream merged again, and what was held over it (23 Nov, `b35f519`)
+
+Upstream's head `558606d` (eight commits: the raw rewarm, `scan_forms_off_counts_built`, the
+forms-by-partition and drop-reason probes, a full row of ids) is merged and pushed. The branch
+is current with upstream as of that commit. What the merge took and what was checked:
+
+- **One conflict**, the generated `docs/figures/full/index.html`, taken as upstream's.
+- **Three sites of upstream's new code read what this branch moved behind the seam** and did not
+  compile: `raw_rewarm_ask` (`MmapBytes::open`, the mapping's lent bytes), and
+  `Reader::forms_by_partition` and `Maint::z_raw_settle` (`resident_share` over a whole borrow).
+  They go through `vault::map`, `map_len`, `map_resident_share` and `OrdIndex::resident_share`
+  now. Expect the same at every merge that adds a file mapped by path or a residency read:
+  those are the two things upstream writes that the seam renamed.
+- **The gates, answered in their own terms**: the door's count of `std::thread::` in `db.rs`
+  103 to 104 (`z_raw_settle` sleeps between looks), and three new public probes on lines of
+  `tests/data/cost-entries.txt`; four raises declared in `scripts/raises.txt`. The lists pass
+  against `main` (where every list is new) and against the branch's tip before the merge
+  (`SUPDB_BASE=cb9236a sh scripts/check.sh lists`), where the raises are held.
+- **Under a cipher**: the raw rewarm asks for the envelope behind each file and decrypts
+  nothing; `a_settles_raw_rewarm_under_a_cipher_asks_for_the_envelopes_and_decrypts_nothing`
+  (`tests/zpages.rs`) holds it, and three mutants fail it (no ask, mapped past the door, no
+  wait). Upstream's other two options are bookkeeping of the writer's scans and read no file.
+- **`sh scripts/check.sh` green** on the merged tree, all seven groups.
+- **The fuzz beyond the gate's range**, all with `ZFUZZ_CACHE=all ZFUZZ_OPTVARY=1`, no failure:
+  seeds 1000 to 3000 under a cipher with a 16 KiB cache (3.5 million cache units given back),
+  1000 to 3000 in the clear, 1000 to 2000 under a cipher with the compact form forced (4.5
+  million reads through a form).
+- **Every arm opened once at ten thousand keys**: the roster's thirteen, the bounded roster's
+  three more, the seven cipher arms, the six segment arms, upstream's three new arms. No
+  refusal. The two `dirkey` arms were not opened: no fscrypt filesystem was up.
+- **The count against upstream's head** (`sh scripts/cost.sh
+  origin/claude/e-recode-stride-selector-g5f6hl`, at `b35f519`): every one of the fifteen probes
+  under upstream by its total -- read -39 an operation, read_z -31, scan -383, scan_z -596,
+  the loads -8 to -9, the commits -8, work -23, merge -467, land -346, seal -1, scan_at -373.
+  The script still exits red by function, as at the two merges before: the same gainers
+  (`Db::op`, `WriterOp::drop`, `Reader::leave_looked`, `Blob::key_at` and the rest), each a
+  function upstream's build inlines where ours calls it, beside the caller that lost more.
+  Nothing new gained with these eight commits.
+
+Still owed from before this merge: `sh scripts/cost-red.sh` since `join_seal`'s bound moved to
+0.04 (`594fe3ca`), and that commit's review -- read on 22 Nov by this session and found sound
+(`OrdIndex::whole_key_at`'s plain half indexes `top_eager` within its length for a mapped file,
+`vault::persist`'s pairs are made only under a cipher, the seal's closure borrows), but read by
+one reader only.
+
 ## Correction from the owner, after the note below was written (22 Nov)
 
 The note below reads the owner's "Stay wholly off of upstream" as: never fetch, merge, count
