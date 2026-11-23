@@ -1548,6 +1548,8 @@ impl Vault {
                         kind: Kind::Seg,
                     };
                     let keep = self.keeps(&mem);
+                    #[cfg(test)]
+                    tests::persist_gate(&self.real);
                     self.write_envelope(&mem, &disk, &key, true)?;
                     made = true;
                     if named {
@@ -2957,6 +2959,57 @@ pub(crate) mod tests {
     /// leaves. By path, so a test beside it removing its own files is not
     /// the one that fails.
     static FAIL_AFTER_UNGUARD: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+    /// A test's: a store's directory whose next segment envelope waits,
+    /// just before it is written, until the test lets it go; whether one
+    /// has got there; and whether it has been let go. One store at a time.
+    static PERSIST_GATE: std::sync::Mutex<Option<(PathBuf, bool, bool)>> =
+        std::sync::Mutex::new(None);
+    static PERSIST_GATE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
+
+    /// The gate's wait, in the writer of a segment's envelope
+    /// (`Vault::persist_with`): nothing for a store no test has gated.
+    pub(crate) fn persist_gate(real: &Path) {
+        let mut g = PERSIST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let shut =
+            |g: &Option<(PathBuf, bool, bool)>| g.as_ref().is_some_and(|g| g.0 == real && !g.2);
+        if !shut(&g) {
+            return;
+        }
+        if let Some(g) = g.as_mut() {
+            g.1 = true;
+        }
+        PERSIST_GATE_MOVED.notify_all();
+        while shut(&g) {
+            g = PERSIST_GATE_MOVED
+                .wait(g)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// The store at `real` gated: its next segment envelope waits.
+    pub(crate) fn gate_persists(real: &Path) {
+        *PERSIST_GATE.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((real.to_path_buf(), false, false));
+    }
+
+    /// Whether an envelope of the gated store is waiting at the gate.
+    pub(crate) fn persist_gate_reached(real: &Path) -> bool {
+        PERSIST_GATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|g| g.0 == real && g.1)
+    }
+
+    /// The gate opened for good: the waiting envelope and every one after.
+    pub(crate) fn open_persist_gate(real: &Path) {
+        let mut g = PERSIST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        if g.as_ref().is_some_and(|g| g.0 == real) {
+            *g = None;
+        }
+        PERSIST_GATE_MOVED.notify_all();
+    }
 
     pub(crate) fn fails_after_unguard(path: &Path) -> bool {
         let mut f = FAIL_AFTER_UNGUARD.lock().unwrap_or_else(|e| e.into_inner());

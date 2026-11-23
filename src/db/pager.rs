@@ -148,6 +148,9 @@ thread_local! {
 pub(crate) struct Hold {
     pager: Arc<Pager>,
     at: Arc<AtomicU64>,
+    /// Whether the hold has stood for nothing since it was last asked
+    /// (`idle`, `took_idle`).
+    idled: Cell<bool>,
     /// The thread's own: the debug count of pins is the thread's.
     _thread: std::marker::PhantomData<*const ()>,
 }
@@ -185,6 +188,34 @@ impl Hold {
             self.pager.breathe();
         }
         self.pin();
+    }
+
+    /// `wait` run with the hold standing for nothing, as it does in a
+    /// rest's breath: for a step of the holder's that reads no file of
+    /// the store and takes long -- a merge writing a finished output's
+    /// envelope, fifty megabytes sealed, written and synced on the
+    /// merge's own thread. With the hold left at its era the evictor
+    /// waited the write out, a tenth of a second and more at every output
+    /// of every merge, while the readers beside it filled the cache past
+    /// its budget. Under debug assertions a read of a file inside what was
+    /// called a wait panics (`debug_pinned`), as it does inside
+    /// `db::Reader::unlent`. What the holder was lent before it is asked
+    /// for again after, which `took_idle` is for.
+    pub(crate) fn idle<T>(&self, wait: impl FnOnce() -> T) -> T {
+        self.at.store(0, Ordering::SeqCst);
+        debug_pinned(false);
+        let r = wait();
+        self.pin();
+        debug_pinned(true);
+        self.idled.set(true);
+        r
+    }
+
+    /// Whether the hold has idled since this was last asked, for a walk
+    /// that keeps what it was lent from one step to the next: an idle is
+    /// a rest, after which it asks again.
+    pub(crate) fn took_idle(&self) -> bool {
+        self.idled.replace(false)
     }
 }
 
@@ -581,6 +612,7 @@ impl Pager {
         let h = Hold {
             pager: self.clone(),
             at,
+            idled: Cell::new(false),
             _thread: std::marker::PhantomData,
         };
         h.pin();
@@ -2444,6 +2476,64 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(pager.held() <= pager.budget(), "{:?}", pager.counts());
+        drop(p);
+        pager.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hold idles for a wait and stands again after it (`Hold::idle`):
+    /// through the wait the cache gives back what the holder read before,
+    /// the holder is told it idled, once, and from the wait's end the
+    /// evictor waits for it as it did. A hold left at nothing after its
+    /// wait read on for a walk's next rest with nothing waited for on its
+    /// account, which no test of a merge caught: a unit just read is
+    /// passed over once by the evictor's hand.
+    #[test]
+    fn a_hold_idles_for_a_wait_and_stands_again_after_it() {
+        let dir = scratch("idle");
+        let bytes = plain(8 * 1024 * 1024, 5);
+        envelope(&dir.join("e"), &bytes, 14);
+        let unit = (unit_chunks() * CHUNK) as u64;
+        let pager = Pager::new(unit);
+        let p = sparse(&pager, &dir.join("e"), 14);
+        let h = pager.hold();
+        // Far past the budget, under the hold: nothing goes.
+        assert_eq!(read(&p, 0, bytes.len()).unwrap(), bytes);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(pager.counts().evicted_units, 0);
+        assert!(!h.took_idle(), "a hold that has not idled");
+        // Through the wait the hold stands for nothing, and the cache
+        // comes back to its budget.
+        let (at, held) = h.idle(|| {
+            let t = std::time::Instant::now();
+            while pager.held() > pager.budget() && t.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            (h.at.load(Ordering::SeqCst), pager.held())
+        });
+        assert_eq!(at, 0, "the hold through its wait");
+        assert!(held <= pager.budget(), "{:?}", pager.counts());
+        assert!(h.took_idle(), "the holder is told");
+        assert!(!h.took_idle(), "once");
+        // From the wait's end it holds again: at the era as it stands,
+        // and what it reads now is not given back under it.
+        assert_eq!(
+            h.at.load(Ordering::SeqCst),
+            pager.era.load(Ordering::SeqCst),
+            "the hold after its wait"
+        );
+        let before = pager.counts().evicted_units;
+        assert_eq!(read(&p, 0, bytes.len()).unwrap(), bytes);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            pager.counts().evicted_units,
+            before,
+            "a unit went while its reader held again"
+        );
+        // SAFETY: lent above and held since.
+        let lent = unsafe { std::slice::from_raw_parts(p.base, bytes.len()) };
+        assert_eq!(lent, &bytes[..], "the bytes lent are still the bytes");
+        drop(h);
         drop(p);
         pager.stop();
         let _ = std::fs::remove_dir_all(&dir);

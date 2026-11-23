@@ -18691,6 +18691,12 @@ trait MergeRest: Copy {
     /// The walk's `steps`th step: whether it rested, after which whatever
     /// the walk was lent before is asked for again.
     fn step(self, steps: usize) -> bool;
+
+    /// `wait` run with nothing the walk was lent held, for a step of the
+    /// merge's that reads none of its inputs: an output's envelope
+    /// written (`pager::Hold::idle`). The walk's next `step` says it
+    /// rested. A plain store's is the wait.
+    fn unheld<T>(self, wait: impl FnOnce() -> T) -> T;
 }
 
 /// A plain store's merge: no rest.
@@ -18702,16 +18708,26 @@ impl MergeRest for NoRest {
     fn step(self, _steps: usize) -> bool {
         false
     }
+
+    #[inline(always)]
+    fn unheld<T>(self, wait: impl FnOnce() -> T) -> T {
+        wait()
+    }
 }
 
 impl MergeRest for &pager::Hold {
     #[inline(always)]
     fn step(self, steps: usize) -> bool {
+        let idled = self.took_idle();
         if steps.is_multiple_of(MERGE_REST) {
             self.rest();
             return true;
         }
-        false
+        idled
+    }
+
+    fn unheld<T>(self, wait: impl FnOnce() -> T) -> T {
+        self.idle(wait)
     }
 }
 
@@ -19195,7 +19211,10 @@ struct Piece {
 /// and finished and renamed at its last. The same
 /// emitter serves both ways of finding keys, so the two arms compared
 /// differ only in that.
-struct Emitter<'a> {
+struct Emitter<'a, R: MergeRest> {
+    /// The merge's rest, for the wait an output's envelope is
+    /// (`MergeRest::unheld`).
+    rest: R,
     dir: &'a Path,
     opts: &'a SegmentOptions,
     sync_every: usize,
@@ -19216,7 +19235,7 @@ struct Emitter<'a> {
     helpers: u64,
 }
 
-impl Emitter<'_> {
+impl<R: MergeRest> Emitter<'_, R> {
     /// Validate that the visited rank belongs to the current piece and that
     /// `k`, if given, lies inside its fence; open the piece's writer at its
     /// first rank. Returns the piece's last rank.
@@ -19301,7 +19320,11 @@ impl Emitter<'_> {
             // envelope is the cache's to hold or to let go
             // (`Vault::settled`), and a merge that kept every output in
             // memory until its last would hold what it rewrote, whole.
-            vault::persist_one(self.dir, &p.name)?;
+            // The write is a wait that reads none of the merge's inputs,
+            // and says so: the walk asks for what it was lent again at
+            // its next step (`MergeRest::unheld`).
+            let (dir, name) = (self.dir, p.name.as_str());
+            self.rest.unheld(|| vault::persist_one(dir, name))?;
             self.out.push(p.name.clone());
             // Its form file, from the pages just written, while the merge
             // goes on to the next output.
@@ -19486,6 +19509,7 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<Vec<String>> {
 
     // Pass two: values, in rank order, into one piece per slice.
     let mut em = Emitter {
+        rest,
         dir: &dir,
         opts: &opts,
         sync_every,
@@ -19780,6 +19804,7 @@ fn tier_walk<R: MergeRest>(plan: TierPlan, rest: R) -> Result<Vec<String>> {
     );
     let tmp = dir.join(format!("tier-{id:08}.tmp"));
     let mut em = Emitter {
+        rest,
         dir: &dir,
         opts: &opts,
         sync_every,
@@ -61292,6 +61317,150 @@ mod cipher_looks {
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// A merge gives each output its envelope where the output is
+    /// finished, on the merge's own thread, and the write is a wait that
+    /// holds nothing of the merge's inputs (`MergeRest::unheld`): the cache
+    /// goes on giving back under it. Left under the merge's hold the
+    /// evictor waited every such write out, fifty megabytes sealed and
+    /// synced at a time, and the readers beside the merge filled the
+    /// cache past its budget meanwhile.
+    ///
+    /// The merge is parked just before its first output's envelope is
+    /// written, with every seal landed so that the envelope at the gate
+    /// is the merge's; a handle then reads several times the cache, and
+    /// the cache has to have given most of that back while the merge
+    /// stands there. Its hold left standing, it gives back nothing.
+    #[test]
+    fn a_merge_writing_an_envelope_holds_nothing_of_the_cache() {
+        let dir = std::env::temp_dir().join(format!(
+            "supdb-next-cipher-merge-envelope-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache: u64 = 2 << 20;
+        let opts = Options {
+            encryption: Encryption::Cipher(vault::tests::cipher(6).cache_bytes(cache)),
+            seal_bytes: 256 << 10,
+            partition_bytes: Some(256 << 10),
+            l0_trigger: 2,
+            ..Options::default()
+        };
+        let n = 200_000u32;
+        let key = |i: u32| format!("k{i:08}").into_bytes();
+        let val = |i: u32, round: u8| {
+            let mut v = format!("value {i:08} of round {round} ").into_bytes();
+            v.resize(100, b'x');
+            v
+        };
+        let mut db = Db::create(&dir, opts).unwrap();
+        for i in 0..n {
+            db.append(&key(i), &val(i, 0));
+            if i % 500 == 499 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        db.hold_merge_start(true);
+        for round in 1..=3u8 {
+            for i in (0..n).step_by(41) {
+                db.put(&key(i), &val(i, round));
+                if i % 500 < 41 {
+                    db.commit().unwrap();
+                }
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+        }
+        let wait = |what: &str, done: &dyn Fn() -> bool| {
+            let t = std::time::Instant::now();
+            while !done() {
+                assert!(
+                    t.elapsed() < std::time::Duration::from_secs(60),
+                    "waiting for {what}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        // A merge held before it reads, and no seal left to write an
+        // envelope of its own.
+        wait("a merge over the pieces and the seals' landings", &|| {
+            db.in_flight() == (false, true)
+        });
+        vault::tests::gate_persists(&dir);
+        db.hold_merge_start(false);
+        wait("the merge's first output at its envelope", &|| {
+            vault::tests::persist_gate_reached(&dir)
+        });
+        let pager = db.shared.pager.clone().expect("a store under a cipher");
+        let before = pager.counts();
+        // A handle reads the store's first third, several times the cache.
+        let r = db.reader().unwrap();
+        let mut from = key(0);
+        let mut seen = 0usize;
+        while seen < n as usize / 3 {
+            let mut last = Vec::new();
+            let got = r
+                .scan(&from, 500, |k, _| {
+                    last.clear();
+                    last.extend_from_slice(k);
+                })
+                .unwrap();
+            assert!(got > 0, "the scan ran out at {seen}");
+            seen += got;
+            last.push(0);
+            from = last;
+        }
+        let read = (pager.counts().fills - before.fills) * pager::CHUNK as u64;
+        assert!(
+            read > 3 * cache,
+            "the handle read {read} bytes through the cache, which is no test of it"
+        );
+        // The merge still stands at its gate, and the cache has given back
+        // what the handle read past the budget, or does so now.
+        let t = std::time::Instant::now();
+        let gave = || pager.counts().evicted_bytes - before.evicted_bytes;
+        while gave() < read - 2 * cache && t.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (gave, c) = (gave(), pager.counts());
+        let parked = vault::tests::persist_gate_reached(&dir);
+        vault::tests::open_persist_gate(&dir);
+        assert!(parked, "the merge left its gate");
+        assert!(
+            gave >= read - 2 * cache,
+            "the cache gave back {gave} bytes of the {read} a handle read while a merge wrote \
+             an envelope: {c:?}"
+        );
+        // The merge goes on from where it stood, over inputs whose pages
+        // the cache gave back under it meanwhile: every key it was lent
+        // before the write is asked for again, and the store reads as it
+        // was written.
+        db.settle().unwrap();
+        let mut at = 0u32;
+        let mut from = key(0);
+        while at < n {
+            let mut last = Vec::new();
+            let got = r
+                .scan(&from, 1000, |k, v| {
+                    let round = if at.is_multiple_of(41) { 3 } else { 0 };
+                    assert_eq!(k, key(at).as_slice(), "the key at rank {at}");
+                    assert_eq!(v, val(at, round).as_slice(), "the value of key {at}");
+                    at += 1;
+                    last.clear();
+                    last.extend_from_slice(k);
+                })
+                .unwrap();
+            assert!(got > 0, "the scan ran out at {at}");
+            last.push(0);
+            from = last;
+        }
+        drop(r);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

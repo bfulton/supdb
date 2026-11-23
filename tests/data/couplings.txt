@@ -112,6 +112,7 @@ src/db.rs	Db::wal_durable	vault::real	code	1	S6	the log's pass-by-name surfaced 
 src/db.rs	Db::z_attach	vault::companion	code	1	S6	vault::companion
 src/db.rs	Db::z_on_disk	vault::companion	code	1	S6	vault::companion
 src/db.rs	Direct::<item>	run logged	code	1	S4 (conditional; else stays)	Direct.logged
+src/db.rs	Emitter::<item>	MergeRest/NoRest	code	2	R4	the emitter takes the walk's rest, for the wait an output's envelope is (MergeRest::unheld)
 src/db.rs	Emitter::leave	vault::persist_one	code	1	S6	vault::persist_one
 src/db.rs	Encryption::<item>	cipher	code	2	stays	the public mode enum
 src/db.rs	Encryption::<item>	crypt	code	1	stays	the public mode enum
@@ -203,6 +204,11 @@ src/db.rs	a_close_that_joins_a_merge_holds_nothing_of_the_cache	cipher	test	4	st
 src/db.rs	a_close_that_joins_a_merge_holds_nothing_of_the_cache	crypt	test	2	stays	cipher_looks: the close's joins under a cipher, the cache read through its own handle past the store
 src/db.rs	a_close_that_joins_a_merge_holds_nothing_of_the_cache	pager	test	9	stays	cipher_looks: the close's joins under a cipher, the cache read through its own handle past the store
 src/db.rs	a_close_that_joins_a_merge_holds_nothing_of_the_cache	vault::tests	test	1	stays	cipher_looks: the close's joins under a cipher, the cache read through its own handle past the store
+src/db.rs	a_merge_writing_an_envelope_holds_nothing_of_the_cache	cipher	test	4	stays	cipher_looks: a merge parked at its output's envelope, the cache read through its own handle while it stands there
+src/db.rs	a_merge_writing_an_envelope_holds_nothing_of_the_cache	crypt	test	2	stays	cipher_looks: a merge parked at its output's envelope, the cache read through its own handle while it stands there
+src/db.rs	a_merge_writing_an_envelope_holds_nothing_of_the_cache	envelope	test	4	stays	cipher_looks: a merge parked at its output's envelope, the cache read through its own handle while it stands there
+src/db.rs	a_merge_writing_an_envelope_holds_nothing_of_the_cache	pager	test	7	stays	cipher_looks: a merge parked at its output's envelope, the cache read through its own handle while it stands there
+src/db.rs	a_merge_writing_an_envelope_holds_nothing_of_the_cache	vault::tests	test	5	stays	cipher_looks: a merge parked at its output's envelope, the cache read through its own handle while it stands there
 src/db.rs	check_options	cipher	code	2	stays	an unpinned writer is refused under a cipher, by the mode and in the refusal's words: the rule for an unpinned writer, with the store's cache as the party that frees
 src/db.rs	check_options	crypt	code	2	stays	the same refusal reads the mode out of the options (opts.encryption, Encryption::Cipher)
 src/db.rs	cipher_controller	cipher	code	2	S5	controller off under a cipher
