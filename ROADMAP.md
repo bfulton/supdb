@@ -857,8 +857,36 @@ until the run is its own log). What it loses:
   10`: reads 1.11-1.25x, the threaded scans 1.6-1.7x, the six mixes
   1.2-1.9x, the one-thread scan level). So what the cell wants now is
   the store under a cipher taking the stride form of itself, which is
-  the controller on there, and the scans. Done when `supdb-cipher` reads
-  and scans ahead of `rocksdb-tuned-enc` in both sittings.
+  the controller on there, and the scans. With the controller on
+  (`supdb-cipherauto`) the one-thread scan pass was two major faults a
+  scan, and they were nineteen reads of an ordered index's top level, a
+  head an ask through a cache that had given the heads back, at each
+  partition's first seek (`CLAUDE.md`, a level made late for the open);
+  the level is read a run of heads an ask and by the landing that
+  publishes the index now. After it the cell read in two shapes, by how
+  many partitions had their form file when the load ended, and the
+  builds ahead start past a quarter of the store's own cache now as well
+  (`CLAUDE.md`, a line drawn on the page cache). At `6f04f9e`, with
+  every pair printed (`BIN=$PWD/target-enc/release/bench
+  scripts/pair.sh supdb-cipherauto rocksdb-tuned-enc 5000000 --bound
+  671088640 --passes read,scan --reps 4 --ops-div 10 --pairs _per_s`):
+  reads at 1.9-2.1x of encrypted RocksDB in the four pairs of one sitting
+  and 1.07-2.34x in the other's; scans at 7-19x in the first and at
+  1.02x, 2.6x, 17x and 18x in the second, the two low pairs the slow
+  shape that is left. Done when `supdb-cipher` reads and scans ahead of
+  `rocksdb-tuned-enc` in both sittings: the controller on as shipped
+  under a cipher, which wants its pairings in core and at the other
+  bounds first, and the shape that is left.
+- [ ] **The builds ahead's last cold partition under a cipher.** At five
+  million keys under 640 MiB with the builds ahead started at a quarter
+  of the store's cache, one or two partitions are still found cold in
+  most reps, and in about one rep in eight the load ends with several
+  unbuilt and the reads run beside their builds from the device. Past
+  the selector's line a build ahead takes the oldest partition due first,
+  a cold one among them, and the drain's last partitions, warm, wait
+  behind it until the reads have evicted them too. Taking the warm ones
+  first past the line changes the plain store's order as well, so it is
+  priced on the bounded roster's rungs before it is built.
 - [ ] **The ordered load.** In the row the durable ordered load is behind
   both encrypted comparators at ten thousand keys (0.66x, resolved) and
   lower and unresolved at the three rungs above (0.83-0.94x); the
