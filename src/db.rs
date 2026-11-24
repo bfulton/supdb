@@ -6559,8 +6559,21 @@ pub struct Options {
     /// unsealed keys and the next 80-120 in major faults on form files the
     /// burst had pushed out, while the rewarm read 225 MB of them back
     /// under it, its asks made at the step after the first scan. The look
-    /// is a few loads where nothing is due. `supdb-zrewarmtick` looks at
-    /// the step alone.
+    /// is a few loads where nothing is due, and it fires as designed: the
+    /// rewarm at the full rewrite's pass came 4-30 ms after the pass's
+    /// start where the step's came 32-115. Priced at ten million keys
+    /// (`SUPDB_SCAN_OPS=1 SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh
+    /// supdb-zrewarmturn supdb 10000000 --bound 1073741824 --reps 3
+    /// --ops-div 10 --passes load,lag`, the same under 1342177280, at
+    /// `29fa571`), the ten-percent pass read 1.10x and 1.12x under 1 GiB
+    /// and 1.17x twice under 1.25 GiB; five reps an order under 1 GiB
+    /// (`--reps 5`) read it 22% ahead in one order and level in the other,
+    /// with the clean store's pass and the one-percent pass 6-22% behind
+    /// in both orders where the three-rep sittings had read them level or
+    /// ahead, and the row's whole order (`--reps 2`, both bounds) read
+    /// every cell by the arms' position and the hot-raw policy's coin.
+    /// Unresolved, so off: `supdb-zrewarmturn` looks at every turn, and
+    /// `supdb-zrewarmtick` at the step alone.
     #[doc(hidden)]
     pub zpages_rewarm_every_turn: bool,
     /// Whether a partition's form file may be the stride form (`ZStride`).
