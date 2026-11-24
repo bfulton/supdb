@@ -3686,6 +3686,26 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with its log held in the process, as `supdb-held` holds
+    /// `supdb-ingest`'s: the engine's shape in the bounded roster under
+    /// FASTER's promise, a flush partitioning what it sealed. The held arm
+    /// leaves that to the background, which no bounded row had run: paired
+    /// at ten million keys under 1 GiB it read the lag sweep's scans three
+    /// to six times slower than `supdb` with several times its faults, and
+    /// a bound killed it at the full rewrite in one of two runs
+    /// (`bench ab --arms supdb-held,supdb --size 10000000 --bound
+    /// 1073741824 --ops-div 10 --reps 1 --passes load,lag`).
+    pub fn create_held_part(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                durable: false,
+                held: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// EXPERIMENT: `supdb-ingest` whose `sync` is the durable write
     /// and nothing more -- the WAL's frames written and synced, the
     /// memtable left where it is -- with the seal and the partitioning
@@ -11377,6 +11397,9 @@ impl Engine for Supdb {
             if self.holdmarch {
                 return "supdb-heldmarch";
             }
+            if self.partition {
+                return "supdb-heldpart";
+            }
             return match self.holdcap {
                 None => "supdb-held",
                 Some(c) if c <= 1 << 20 => "supdb-held1m",
@@ -14716,7 +14739,10 @@ pub const ARMS: [&str; 13] = roster!();
 /// weaker configuration. The buffered group is not here: a bounded row is
 /// about reads from the device, and a buffered load reads nothing a
 /// durable one does not. FASTER's group is, where FASTER is built, with
-/// `supdb-held` beside it: a store larger than memory is what FASTER's log
+/// `supdb-heldpart` beside it -- `supdb` under FASTER's promise, the
+/// bounded roster's own shape, where the in-core roster's `supdb-held` is
+/// the buffered arm's (`Supdb::create_held_part`): a store larger than
+/// memory is what FASTER's log
 /// is made for, its tail in memory and the rest read from the device past
 /// the page cache, so its reads past the bound are a different engine's
 /// answer to the same question, with its index and the in-memory part of
@@ -14738,7 +14764,7 @@ macro_rules! ooc_roster {
     };
 }
 #[cfg(faster)]
-pub const OOC_ARMS: [&str; 10] = ooc_roster!("supdb-held", "faster");
+pub const OOC_ARMS: [&str; 10] = ooc_roster!("supdb-heldpart", "faster");
 #[cfg(not(faster))]
 pub const OOC_ARMS: [&str; 8] = ooc_roster!();
 
@@ -15274,9 +15300,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "rocksdb-tuned-nosync" => Guarantee::Buffered,
         // FASTER's promise and no stronger one: a commit is in the process
         // when the call returns and on the device at the next `sync`.
-        "supdb-held" | "supdb-held1m" | "supdb-held8m" | "supdb-heldmarch" | "faster" => {
-            Guarantee::Memory
-        }
+        "supdb-held" | "supdb-held1m" | "supdb-held8m" | "supdb-heldmarch" | "supdb-heldpart"
+        | "faster" => Guarantee::Memory,
         _ => return None,
     })
 }
@@ -15612,6 +15637,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cache256" => supdb_arm(Supdb::create_cache256, dir)?,
         "supdb-ingest" => supdb_arm(Supdb::create_ingest, dir)?,
         "supdb-held" => supdb_arm(|d| Supdb::create_held(d, None), dir)?,
+        "supdb-heldpart" => supdb_arm(Supdb::create_held_part, dir)?,
         "supdb-held1m" => supdb_arm(|d| Supdb::create_held(d, Some(1 << 20)), dir)?,
         "supdb-held8m" => supdb_arm(|d| Supdb::create_held(d, Some(8 << 20)), dir)?,
         "supdb-heldmarch" => supdb_arm(
@@ -17408,6 +17434,33 @@ mod tests {
             for k in &keys {
                 assert_eq!(z.get(k).unwrap(), value.len(), "{arm}: after its sync");
             }
+        }
+        // The bounded roster's held arm: `supdb`'s flush, partitioning what
+        // it sealed, under the held log -- `supdb-held` and that one field.
+        let z = open("supdb-heldpart", &root.join("heldpart"), 1).unwrap();
+        assert_eq!(z.name(), "supdb-heldpart");
+        assert_eq!(guarantee("supdb-heldpart"), Some(Guarantee::Memory));
+        assert_eq!(z.features(), base.features());
+        let full = Supdb::create(&root.join("full")).unwrap();
+        let (p, f, h) = (
+            Supdb::create_held_part(&root.join("heldpart-again")).unwrap(),
+            full.db.as_ref().unwrap().options().clone(),
+            Supdb::create_held(&root.join("held-part-sibling"), None).unwrap(),
+        );
+        let po = p.db.as_ref().unwrap().options().clone();
+        let ho = h.db.as_ref().unwrap().options().clone();
+        assert!(matches!(po.sync, supdb::SyncPolicy::Explicit));
+        assert!(po.partition_on_flush && f.partition_on_flush && !ho.partition_on_flush);
+        assert_eq!(
+            (po.wal_hold_bytes, po.wal_hold_reuses, po.seal_bytes),
+            (ho.wal_hold_bytes, ho.wal_hold_reuses, ho.seal_bytes)
+        );
+        #[cfg(faster)]
+        {
+            assert!(OOC_ARMS.contains(&"supdb-heldpart") && OOC_ARMS.contains(&"faster"));
+            assert!(!OOC_ARMS.contains(&"supdb-held"));
+            let pair = ["supdb-heldpart".to_string(), "faster".to_string()];
+            assert_eq!(check_matched(&pair, &root.join("matched")), Ok(()));
         }
         // The held arm with the drop left where it lay: the one option.
         let dir = root.join("heldmarch");
