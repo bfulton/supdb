@@ -2911,6 +2911,47 @@ the commit speaks; and a pairing of two arms each in two shapes is read
 by its pairs (`--pairs`), since a median over four reps of a bimodal
 cell is whichever shape two reps fell in.
 
+**A first page standing for a window, over a source that holds pages a
+unit at a time.** The pass after the lag sweep's full rewrite at ten
+million keys under 1.25 GiB ran ten to twenty times slower under a
+cipher than the plain store's, and the roadmap first had it down as the
+plain store's own limitation for that pass, made heavier by merges that
+decrypt and seal. Beside the plain store in one sitting, with every
+merge's account printed (`SUPDB_MERGE_TRACE=1`), it was not: the plain
+store met the pass with 41 pieces standing and nothing merging, the
+store under a cipher with 144 and its merges inside the pass, and a
+merge under a cipher moved 50 MB of input a second of its wall against
+the plain store's 126 and took 825,000 major faults over the sweep to its
+2,500 -- about half the pages of ciphertext it read, each a device round
+trip, through an envelope's mapping advised for reads far apart. The
+merge's ask ahead existed, off as shipped because on the plain store the
+device was busy and it moved nothing (`Options::merge_read_ahead`). On
+under a cipher it fired, 382 asks of 1.3 GB, and moved nothing either.
+`Blob::willneed_at` asked a window only where the window's first page
+was not in memory, a test written for a mapped file, whose kernel reads
+ahead in order from a resident page; a source read by the piece holds
+the chunks its cache has not given back, scattered through the window a
+unit at a time, of which the first page says nothing, and the windows
+the test let through came to a fifth of the input. Asked whole, the pager
+asking for what of a window it does not hold: 102 merges over the sweep
+to 56, 74 MB a second, a seventh of the faults, 39 pieces at the pass
+and the pass 4.2 s where it was 10.3-10.6 (`Options::merge_read_ahead_cipher`,
+on; `supdb-cipherautomergeapart` is the shape before). Paired, four
+pairs in both orders (`scripts/pair.sh supdb-cipherauto
+supdb-cipherautomergeapart 10000000 --bound 1342177280 --passes load,lag
+--reps 2 --ops-div 10 --pairs _per_s` at `a19ffc6`): the pass 2.1-2.5x
+and the shuffled load 1.09-1.34x in every pair, the full rewrite's burst
+0.74-0.77x in every pair, its merges beside the writer now, and the
+other passes and bursts level. The rules: a
+lever refuted on one store is tried again where the regime it was
+built for -- here a reader waiting a round trip a page -- is the one in
+front of it, and its counter read before its rate; a residency test
+written for one kind of source is read against every kind that answers
+it, since what a page's residency says of the pages after it is the
+source's to say; and a pass several times the plain store's is first
+taken apart beside the plain store, in one sitting, before it is called
+the plain store's limitation.
+
 The rules: a second way to hold the same bytes is priced on the first
 operation of every pass as well as on its rate, since a mapping's first
 touch is where two kinds of memory differ; a write slower than its cipher

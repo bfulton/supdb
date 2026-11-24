@@ -972,7 +972,16 @@ until the run is its own log). What it loses:
   and the walk, or ciphertext the kernel drops under the bound -- is not
   established; the next reading is the merge's faults by file and offset
   against the cache's evictions of the same units. The CPU half is the
-  cipher's and the cache's fills, and is counted next.
+  cipher's and the cache's fills, and is counted next. The faults were
+  the ask's own test: a window was asked only where its first page was
+  not in memory, which says nothing of a source read by the piece, and a
+  merge under a cipher asks a window ahead, a window whole, as shipped
+  now (`Options::merge_read_ahead_cipher`, `CLAUDE.md`, a first page
+  standing for a window). Paired against the shape before at `a19ffc6`:
+  the pass 2.1-2.5x, the shuffled load 1.09-1.34x, the full rewrite's
+  burst 0.74-0.77x, every pair of four; 39-44 pieces at the pass. What is
+  left to read: the pass against encrypted RocksDB again, and the merge's
+  CPU, 159 MB of input a second against the plain store's 227.
 - [ ] **The builds ahead's last cold partition under a cipher.** At five
   million keys under 640 MiB with the builds ahead started at a quarter
   of the store's cache, one or two partitions are still found cold in
