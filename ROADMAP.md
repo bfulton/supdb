@@ -896,9 +896,19 @@ until the run is its own log). What it loses:
   -f -e trace=fdatasync,fsync -T` over a pass of each, medians 0.43-0.44
   ms against 0.47), and the cache's waits at its crowding line are not the
   writer's and are fewer with the controller on; the cache fills twice the
-  chunks and evicts 1.85x the units over the two loads. The next reading
-  is the writer's time off its core, by reason, in a pass of each. The
-  plain store builds at a merge's finish in a shuffled load as well.
+  chunks and evicts 1.85x the units over the two loads. The writer's
+  scheduler counters around the commits, four pairs (a scratch reading of
+  `/proc/thread-self/schedstat` and the thread's switches beside
+  `loadphases`): in the ordered load its time on a core is the same in
+  both arms (2.77-2.99 s), its wait for a core a few milliseconds in
+  both, and it blocks as often (18,600-19,600 voluntary switches), each
+  block some 26 µs longer on the mean with the controller on -- the half
+  second; in the shuffled load it does a twentieth more work on its core
+  (4.75-5.44 s against 4.63-4.79) and waits longer for one (33-115 ms
+  against 20-32). The next reading is what the ordered load's blocks are
+  waiting on, the log's sync beside the builds' envelopes going to the
+  device or a hand-off to another thread. The plain store builds at a
+  merge's finish in a shuffled load as well.
 - [ ] **The builds ahead's last cold partition under a cipher.** At five
   million keys under 640 MiB with the builds ahead started at a quarter
   of the store's cache, one or two partitions are still found cold in
