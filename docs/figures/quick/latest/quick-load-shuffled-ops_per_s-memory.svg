@@ -21,10 +21,10 @@
 <line x1="67" y1="88.0" x2="72" y2="88.0" stroke="#c8c8c8" stroke-width="1"/>
 <text x="63" y="92.0" font-size="11" text-anchor="end" fill="#6b6b6b">1.5M</text>
 <text x="10" y="80" font-size="11" text-anchor="start" fill="#6b6b6b">ops/s</text>
-<path d="M98.3,360.6 L255.1,338.6 L426.9,284.4 L583.7,201.9 L583.7,258.7 L426.9,331.4 L255.1,351.1 L98.3,363.1 Z" fill="#8c8c8c" fill-opacity="0.10"/>
 <path d="M98.3,184.4 L255.1,175.7 L426.9,169.1 L583.7,149.4 L583.7,176.9 L426.9,199.4 L255.1,240.0 L98.3,226.7 Z" fill="#1b1b1b" fill-opacity="0.10"/>
-<path d="M98.3,362.1 L255.1,345.2 L426.9,291.2 L583.7,238.0 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M98.3,360.6 L255.1,338.6 L426.9,284.4 L583.7,201.9 L583.7,258.7 L426.9,331.4 L255.1,351.1 L98.3,363.1 Z" fill="#8c8c8c" fill-opacity="0.10"/>
 <path d="M98.3,206.4 L255.1,220.6 L426.9,181.1 L583.7,157.6 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M98.3,362.1 L255.1,345.2 L426.9,291.2 L583.7,238.0 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
 <text x="618.0" y="161.6" font-size="11" fill="#1b1b1b">supdb (log held in memory)</text>
 <text x="618.0" y="242.0" font-size="11" fill="#8c8c8c">FASTER</text>
 </svg>
