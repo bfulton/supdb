@@ -971,6 +971,7 @@ mod tests {
                 killed: vec![],
                 resumptions: vec![],
                 keys: Default::default(),
+                build: String::new(),
                 measurements,
             }
         };
