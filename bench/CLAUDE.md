@@ -619,6 +619,74 @@ by the structure and not by holding little, and the bound each pass got
 is read from the kernel at the pass's start; and a quantity that grows
 rep by rep in the parent is a drift in every cell that can feel it.
 
+**A bound under a bound, and a sitting that was the machine's.** A
+roster cut at its first rung read the scan pass after the ten-percent
+burst at three million keys under 1 GiB at 0.71x of LMDB, three reps of
+three, where the row before had it at twice; a pairing the same evening
+read it slow in twelve reps of twelve in both of its arms, the new
+default and the shape before it, and the per-rep history of the cell
+across the day's pairings fell by commit, so two commits were suspected
+in turn. The pass's profile cut to its window (`perf record -e cpu-clock
+-c 25000 -k CLOCK_MONOTONIC`, the samples between the pass's `lagmark`
+lines, by thread and symbol) put the whole excess in the sparse walk's
+reads of the partition's mapped records and the copies of their values,
+with the thread's CPU equal to its wall, no fault of either kind in the
+group, no byte read at the device and every counter of the engine the
+same as a fast pass's. Then the guest was restarted, and the same binary
+read the same pass at a third of its time, 1.8x and 2.1x of LMDB in
+eight pairs of eight (`SUPDB_SCAN_OPS=1 sh scripts/pair.sh supdb
+lmdb-nordahead 3000000 --bound 1073741824 --reps 4 --ops-div 10 --passes
+load,lag`, at `8666eb9`). The shape has not come back, and what it was
+is not known: a cost of memory already mapped and already read, on the
+machine as it stood that evening. What it was not, each by a count: a
+read from the device, a fault, the group's limit (the group stood a third
+under it), either commit, or the first touch of pages read back, which a
+cold start made on purpose leaves that pass as it was
+(`SUPDB_LAG_SQUEEZE_MB=300 SUPDB_LAG_REPEAT=1 SUPDB_SCAN_OPS=1 bench ab
+--arms supdb,supdb --size 3000000 --bound 1073741824 --passes load,lag
+--reps 2 --ops-div 10`). The hunt found two things that were real. A
+page the cache dropped and read back costs its first reader 0.3 to 1.5 µs
+below the guest, the price moving fivefold with the machine's state
+(`examples/firsttouch.rs`: 1.2-1.5 before the restart, 0.3-0.5 after),
+which is the clean store's pass up to a third longer in the reps whose
+load pushed raw files out and nothing at the passes after it. And the pass's
+group is made under the group the run was started in, which on this
+host is the tool's own, limited at 13.35 GiB and hierarchical: after a
+day's builds its page cache stood at the limit, and a group at its limit
+takes pages from every group under it at each charge, however far the
+pass is under its own bound. The first sweep of each of two sittings
+begun so had 37 and 69 MB of its store's files pushed out by its load's
+end where the same sweep under an emptied parent had none (`zrewarm raw
+asked`, under
+`SUPDB_ZPAGES_TRACE=1`, the parent filled by reading the build
+directories twice so that its pages are on the active list); the pass's
+own charges then evict a gigabyte of the parent's cache and the passes
+after it have their room, so it is the first pass of a sitting that was
+squeezed, in every pairing started behind a build. Each pass records the
+least room a limited group above it had at its start now (`bound-start
+room_above_bytes`, `bound::room_above_at`), the run reports a pass that
+began with less than its bound (`run::room_note`), and `scripts/room.sh`
+drops the page cache before a roster or a bounded sitting and reads the
+run's binary back, since the drop takes the binary's pages with the
+rest and the first pass would fault its own code in under its bound.
+The probes stay for the next sitting that reads so: `SUPDB_LAG_REPEAT`
+makes a point's same scans again after its pass, which tells a cost of
+what the scans were first to touch from a cost of the walk;
+`SUPDB_LAG_SQUEEZE_MB` and `SUPDB_LAG_TOUCH` make a cold start and take
+its first touches back out; and `lagops` carries the machine's TLB
+shootdowns and function-call interrupts over the pass. The lag sweep
+draws the same scan keys at every point, so a point's pass reads the
+records the points before it read: a slow pass after a fast one over
+the same keys is not those pages' first touch, which the hunt took
+hours to notice. The rules: a cell lost in both arms of a pairing is the
+sitting's before it is either arm's, and a cell's history by commit is
+also its history by hour, so the baseline's binary is run again in the
+sitting at hand before a commit is suspected; a bound made inside
+another group's is two bounds, and the room above it is read from the
+kernel at the pass's start as the pass's own charge is; and a step that
+makes a measurement's precondition puts back what it took that the
+measurement needs.
+
 **A guarantee matched on one kind of crash.** The buffered group was
 matched on the sync: no arm in it reaches the device at a commit. The
 recovery workloads' first run held each arm's reopened store to every

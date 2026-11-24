@@ -117,8 +117,9 @@ esac
 
 # Room above the bound first (`scripts/room.sh`): the run's group is made
 # under the one this shell is in, and a group above at its limit takes
-# pages from every pass under it.
-sh "$(dirname "$0")/room.sh" >&2
+# pages from every pass under it. The binary is read back after the drop,
+# so that no pass faults its own code in under its bound.
+sh "$(dirname "$0")/room.sh" "$bin" >&2
 
 # The run's stderr is both shown and kept: the group's path is read from
 # it and the banked-rungs line is the verdict. Its status is written by

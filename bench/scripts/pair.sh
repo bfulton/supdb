@@ -66,7 +66,7 @@ for sitting in 1 2; do
   # Under a bound, room above it first (`scripts/room.sh`): a sitting begun
   # with the group above at its limit has its first pass squeezed by it.
   case " $* " in
-    *" --bound "*) sh "$HERE/scripts/room.sh" >&2 ;;
+    *" --bound "*) sh "$HERE/scripts/room.sh" "$BIN" >&2 ;;
   esac
   # shellcheck disable=SC2086
   env $UNSET $SETS "$BIN" ab --arms "$arms" --size "$SIZE" "$@" > "$f.out" 2> "$f.err"

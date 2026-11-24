@@ -8,7 +8,12 @@
 # first pass of a bounded sitting then started with tens of megabytes of
 # its store pushed out that no bound of its own had asked for.
 #
-#   sh scripts/room.sh          # make room, then say what the group holds
+#   sh scripts/room.sh [FILE...]   # make room, read FILEs back, say what the group holds
+#
+# The files named are read back into the cache after the drop: a run's own
+# binary, which the drop takes with everything else, and whose pages the
+# first pass after it would otherwise fault in from the device under its
+# own bound, and be charged for.
 #
 # Making room is dropping the page cache (clean pages only, nothing a
 # process holds is lost), which wants root and a writable sysctl; where
@@ -23,6 +28,9 @@ if [ -w /proc/sys/vm/drop_caches ] && sync && echo 1 > /proc/sys/vm/drop_caches 
 else
   did="page cache NOT dropped (not root, or the sysctl is read-only)"
 fi
+for f in "$@"; do
+  cat "$f" > /dev/null 2>&1 || echo "room.sh: could not read $f back" >&2
+done
 g=$(awk -F: '$2 ~ /(^|,)memory(,|$)/ {print $3}' /proc/self/cgroup 2>/dev/null | head -n 1)
 d=/sys/fs/cgroup/memory$g
 if [ -n "$g" ] && [ -r "$d/memory.limit_in_bytes" ]; then

@@ -759,7 +759,33 @@ zero: the first counts the merge's reads as the pass's, and the second
 is blind to a fault on a page the cache holds and has not read yet,
 which the kernel counts as minor. Read a thread's
 passes per rep there before reading its cell: a thread that ran in
-two reps of five made a cell that read neither shape.
+two reps of five made a cell that read neither shape. The `lagops` line
+carries the machine's TLB shootdowns and function-call interrupts over
+the pass too (`tlb`, `cal`, from `/proc/interrupts`), what other
+threads' unmaps cost the scanning thread and no fault count shows. Three
+probes of a lag point stand beside them, none of them a row's.
+`SUPDB_LAG_REPEAT=1` makes a point's same scans again straight after its
+pass (`lagrepeat`): a pass slow by what its scans were first to touch
+repeats fast, and one slow by its walk repeats as slow.
+`SUPDB_LAG_SQUEEZE_MB=N` reclaims that much of the pass's group between
+the drain and the settle, the cold start a load under pressure leaves,
+made in every rep instead of the reps the host chose. And
+`SUPDB_LAG_TOUCH=settle|all` reads every resident page of the store's
+files before the first point's pass, or every point's, which takes the
+first touches of read-back pages out of the pass: a page the cache
+dropped and the kernel read back is resident, and mapped once the
+settle's rewarm has been over it (`Options::zpages_rewarm_raw_maps`),
+and its first touch still costs 0.3 to 1.5 µs below the guest, by the
+machine's state (`bench/examples/firsttouch.rs`). Squeezed by 300 MB at
+three million keys under 1 GiB, the clean store's pass read 8.2-11.9 ms
+and 8.4-9.1 with the touch (`SUPDB_LAG_SQUEEZE_MB=300 SUPDB_LAG_REPEAT=1
+SUPDB_SCAN_OPS=1 bench ab --arms supdb,supdb --size 3000000 --bound
+1073741824 --passes load,lag --reps 2 --ops-div 10`, and with
+`SUPDB_LAG_TOUCH=settle`, at `8666eb9`), the passes after it the same
+either way: the ceiling of a settle that touched what it asked back, on
+a pass won twice over, and it is not built. The sweep draws the same
+scan keys at every point, so a point's pass reads the records the
+points before it read (`bench/CLAUDE.md`, a bound under a bound).
 
 The threaded scan passes have a counters line of their own
 (`SUPDB_SCAN_COUNTERS=1`, a `scancounters` line a pass, before the mixes
