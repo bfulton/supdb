@@ -856,6 +856,9 @@ take the general read of its sources, where the default reads a partition
 and the live table alone, or the partition, its pieces, the frozen tables
 and the live one in a single pass, wherever each holds the key in its
 common shape (`Options::point_lone`), and
+`supdb-nopool` and `supdb-ingestnopool` unmap every block a table gives
+back at its drop, where the default keeps them for the next tables
+(`Options::blocks_pool_bytes`);
 `supdb-layersasone` and `supdb-ingestlayersasone` have that single pass
 set up for every source before it asks one, where the default asks the
 live table first and ends there at a tombstone, with the pieces over the

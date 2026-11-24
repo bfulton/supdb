@@ -722,6 +722,51 @@ its scrambled A 28-32 against 17-22 and its F 23-25 against 12-17, so in
 the suite's mixes the faults are under a fifth of the distance, and the
 rest is the update's instructions and the gets beside them.
 
+Timed by kind at that rung (`SUPDB_MIX_KINDS=1 bench ab --arms
+supdb-held,faster --size 300000 --reps 4 --passes
+load,read,mixes,mixes-scrambled`), the read-mostly mixes are level with
+FASTER's, gets and commits, and the distance is the write mixes': their
+commits, 6.2 ms against 3.9 in A and 12.9 against 6.8 in the scrambled A,
+11.0 against 2.3 in the scrambled F, where FASTER's read-modify-write
+updates the record it has just read in place; and their gets once the
+table holds writes, 273 ns against 217 in A and 315 against 228 in the
+scrambled D.
+
+The tables' blocks are a lever with a ceiling the tree already had: the
+arm whose blocks come from the heap (`supdb-ingestheapblocks`), which
+keeps a freed block for the next allocation of its size, read the write
+mixes ahead of the buffered arm in both orders, A 1.09x and 1.08x, F
+1.02x and 1.07x, the scrambled A 1.15x and 1.26x, D 1.09x and 1.10x and F
+1.11x and 1.18x, and the read-only mixes level (`pair.sh
+supdb-ingestheapblocks supdb-ingest 300000 --reps 6 --passes
+load,read,read-threaded,mixes,mixes-scrambled`). That arm is the shape the
+mapped blocks replaced for holding hundreds of megabytes at ten million
+keys, so the store keeps a pool of its own (`blocks::BlockPool`,
+`Options::blocks_pool_bytes`): the blocks its tables give back, by exact
+length, up to a cap of 64 MiB or a sixty-fourth of the memory limit the
+store opens under, kept only while the controller's gate is at the raw
+form and given back to the kernel as it leaves it. The live table made at
+a freeze maps its blocks while the frozen one is in flight, so the first
+two tables after a load are fresh and the third takes the first's. Writer
+faults a mix at 300,000 keys, the same run as above with the arm that has
+none (`supdb-ingestnopool`):
+
+| mix | `supdb-ingest` | `supdb-ingestnopool` |
+|---|---|---|
+| A | 1,069-1,084 | 1,069-1,084 |
+| F | 924-1,003 | 1,087-1,089 |
+| scrambled A | 413-569 | 1,410 |
+| scrambled F | 96-97 | 1,274-1,281 |
+| scrambled D | 0-7 | 223-231 |
+
+The first family's A is the first two tables'. The rates resolve less
+than the count at this rung: the arm against itself reads 0.79x to 1.08x
+by position in the same shape (`pair.sh supdb-ingest supdb-ingest
+300000`), and the pool against none read the scrambled A 1.20x and 1.13x,
+the only cell past that in both orders, with the scrambled F, D and F
+1.01x to 1.15x and the read-only scrambled B and C 0.90x to 0.98x, inside
+it.
+
 ### The seal wait
 
 `Db::seal_waits` splits the seal phase the commit thread pays. Under

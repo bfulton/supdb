@@ -1155,6 +1155,10 @@ pub struct Supdb {
     /// before `Options::blocks_mapped`. `supdb-heapblocks`, and
     /// `supdb-ingestheapblocks` buffered.
     heapblocks: bool,
+    /// No pool of the blocks a store's tables gave back, every one
+    /// unmapped at its drop (`Options::blocks_pool_bytes` of zero):
+    /// `supdb-nopool`, and `supdb-ingestnopool` buffered.
+    nopool: bool,
     /// A streamed table keeping a copy of every key, the shape before
     /// `Options::direct_keys_in_stream`. `supdb-keysarena`, and
     /// `supdb-ingestkeysarena` buffered.
@@ -2568,6 +2572,10 @@ struct Policy {
     /// before `Options::blocks_mapped`. `supdb-heapblocks`, and
     /// `supdb-ingestheapblocks` buffered.
     heapblocks: bool,
+    /// No pool of the blocks a store's tables gave back, every one
+    /// unmapped at its drop (`Options::blocks_pool_bytes` of zero):
+    /// `supdb-nopool`, and `supdb-ingestnopool` buffered.
+    nopool: bool,
     /// A streamed table keeping a copy of every key, the shape before
     /// `Options::direct_keys_in_stream`. `supdb-keysarena`, and
     /// `supdb-ingestkeysarena` buffered.
@@ -3336,6 +3344,7 @@ impl Default for Policy {
             zsettleloose: false,
             norecycle: false,
             heapblocks: false,
+            nopool: false,
             keysarena: false,
             noalert: false,
             ordlog: false,
@@ -9998,6 +10007,7 @@ impl Supdb {
             zsettleloose,
             norecycle,
             heapblocks,
+            nopool,
             keysarena,
             noalert,
             ordlog,
@@ -10533,6 +10543,11 @@ impl Supdb {
             direct_derive_keys: !keycopies,
             direct_recycle: !norecycle,
             blocks_mapped: !heapblocks,
+            blocks_pool_bytes: if nopool {
+                0
+            } else {
+                supdb::Options::default().blocks_pool_bytes
+            },
             direct_keys_in_stream: !keysarena,
             upkeep_alert: !noalert,
             direct_log_range: !ordlog,
@@ -11012,6 +11027,7 @@ impl Supdb {
             zsettleloose,
             norecycle,
             heapblocks,
+            nopool,
             keysarena,
             noalert,
             ordlog,
@@ -12810,6 +12826,13 @@ impl Engine for Supdb {
                 "supdb-ingestheapblocks"
             };
         }
+        if self.nopool {
+            return if self.partition {
+                "supdb-nopool"
+            } else {
+                "supdb-ingestnopool"
+            };
+        }
         if self.keysarena {
             return if self.partition {
                 "supdb-keysarena"
@@ -13127,6 +13150,9 @@ impl Engine for Supdb {
             // partition and the live table alone, and the layered read of
             // every source (`Reader::point_lean_reads`); the rest took the
             // general read or a form's.
+            ("pool_bytes", db.block_pool_counts().0 as f64),
+            ("pool_takes", db.block_pool_counts().1 as f64),
+            ("pool_gives", db.block_pool_counts().2 as f64),
             ("reads_lone", db.point_lean_reads().0 as f64),
             ("reads_layers", db.point_lean_reads().1 as f64),
             ("reads_placed", db.point_placed_reads() as f64),
@@ -14914,6 +14940,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zsettleloose"
         | "supdb-norecycle"
         | "supdb-heapblocks"
+        | "supdb-nopool"
         | "supdb-keysarena"
         | "supdb-noalert"
         | "supdb-ordlog"
@@ -15139,6 +15166,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestlatesync"
         | "supdb-ingestnorecycle"
         | "supdb-ingestheapblocks"
+        | "supdb-ingestnopool"
         | "supdb-ingestkeysarena"
         | "supdb-ingestnoalert"
         | "supdb-ingestordlog"
@@ -16990,6 +17018,32 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestnorecycle" => supdb_arm(Supdb::create_ingest_norecycle, dir)?,
         "supdb-heapblocks" => supdb_arm(Supdb::create_heapblocks, dir)?,
         "supdb-ingestheapblocks" => supdb_arm(Supdb::create_ingest_heapblocks, dir)?,
+        "supdb-nopool" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        nopool: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestnopool" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        nopool: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
         "supdb-keysarena" => supdb_arm(Supdb::create_keysarena, dir)?,
         "supdb-ingestkeysarena" => supdb_arm(Supdb::create_ingest_keysarena, dir)?,
         "supdb-noalert" => supdb_arm(Supdb::create_noalert, dir)?,
@@ -19178,6 +19232,21 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.point_lone && b.point_lone);
                 assert!(o.point_fixed, "the one option moved");
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("nopool"),
+                    Policy {
+                        nopool: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-nopool");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.blocks_pool_bytes == 0 && b.blocks_pool_bytes > 0);
+                assert!(o.blocks_mapped, "the one option moved");
             }
             {
                 let z = Supdb::with_policy(

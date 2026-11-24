@@ -188,7 +188,7 @@ fn main() {
             let c = e.counters();
             let g = |n: &str| c.iter().find(|(m, _)| *m == n).map_or(0.0, |x| x.1);
             format!(
-                "parts {:.0} pieces {:.0} unsealed {:.0} seals {:.0} idle {:.0} reads lone {:.0} layers {:.0} placed {:.0}",
+                "parts {:.0} pieces {:.0} unsealed {:.0} seals {:.0} idle {:.0} reads lone {:.0} layers {:.0} placed {:.0} pool takes {:.0} gives {:.0}",
                 g("partitions"),
                 g("pieces"),
                 g("unsealed_keys"),
@@ -196,7 +196,9 @@ fn main() {
                 g("seals_idle"),
                 g("reads_lone"),
                 g("reads_layers"),
-                g("reads_placed")
+                g("reads_placed"),
+                g("pool_takes"),
+                g("pool_gives")
             )
         };
         // The store's shape between the phases, on request: a counter read

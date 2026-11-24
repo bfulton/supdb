@@ -209,6 +209,171 @@ pub(crate) unsafe fn free(p: *mut u8, len: usize, mapped: bool) {
     unsafe { std::alloc::dealloc(p, layout) };
 }
 
+/// Where a structure's blocks come from and go back to: mapped from the
+/// kernel or not (`Options::blocks_mapped`), and for a mapped block the
+/// store's pool first, where it has one (`Options::blocks_pool_bytes`). A
+/// table's arenas, slabs and index each keep one, so a block goes back to
+/// the pool it could have come from, whichever thread drops the table.
+#[derive(Clone)]
+pub(crate) struct Source {
+    pub(crate) mapped: bool,
+    pool: Option<std::sync::Arc<BlockPool>>,
+}
+
+impl Source {
+    pub(crate) fn new(mapped: bool, pool: Option<std::sync::Arc<BlockPool>>) -> Source {
+        Source { mapped, pool }
+    }
+
+    /// `alloc(len, zeroed, mapped)`, a pooled block of the length first:
+    /// its pages touched already, and zeroed here where asked, since a
+    /// pooled block holds what its last table wrote.
+    pub(crate) fn alloc(&self, len: usize, zeroed: bool) -> *mut u8 {
+        if maps(len, self.mapped) {
+            if let Some(p) = self.pool.as_ref().and_then(|pool| pool.take(len)) {
+                if zeroed {
+                    // SAFETY: a block of `len` bytes the pool held, no
+                    // reader's since it was given back.
+                    unsafe { std::ptr::write_bytes(p, 0, len) };
+                }
+                return p;
+            }
+        }
+        alloc(len, zeroed, self.mapped)
+    }
+
+    /// `free(p, len, mapped)`, to the pool where it has room.
+    ///
+    /// # Safety
+    /// As `free`: `p` came from this source's `alloc` with this `len`, and
+    /// nothing reads it after.
+    pub(crate) unsafe fn free(&self, p: *mut u8, len: usize) {
+        if maps(len, self.mapped) {
+            if let Some(pool) = &self.pool {
+                if pool.give(p, len) {
+                    return;
+                }
+            }
+        }
+        // SAFETY: the caller's.
+        unsafe { free(p, len, self.mapped) };
+    }
+}
+
+/// A store's mapped blocks given back by the tables it dropped, kept for
+/// its next tables' blocks of the same lengths instead of unmapped
+/// (`Options::blocks_pool_bytes`). A table's blocks are mapped fresh, and
+/// every page of them is a fault at its first touch -- a microsecond and
+/// more on this guest, half of an update's time where the writer faulted
+/// once every dozen updates -- and the table after it asks for the same
+/// lengths: arena blocks of four megabytes, slab blocks, an index that
+/// doubles from a thousand slots. The pool keeps at most `cap` bytes, the
+/// rest unmapped as before, and none while it is off (`set_on`): what it
+/// holds is resident memory the store's other tenants, the page cache's
+/// among them, cannot have, so the store turns it off out of core. Its
+/// blocks stay mapped and counted (`mapped_bytes`, `LIVE`), and go back to
+/// the kernel when it is turned off or dropped, which is the last table's
+/// drop or the store's, whichever is later.
+pub(crate) struct BlockPool {
+    held: Mutex<Vec<(usize, usize)>>,
+    bytes: AtomicUsize,
+    cap: usize,
+    on: std::sync::atomic::AtomicBool,
+    /// Blocks given out of the pool, and given to it, over its life.
+    takes: AtomicUsize,
+    gives: AtomicUsize,
+}
+
+impl BlockPool {
+    pub(crate) fn new(cap: usize, on: bool) -> BlockPool {
+        BlockPool {
+            held: Mutex::new(Vec::new()),
+            bytes: AtomicUsize::new(0),
+            cap,
+            on: std::sync::atomic::AtomicBool::new(on),
+            takes: AtomicUsize::new(0),
+            gives: AtomicUsize::new(0),
+        }
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, Vec<(usize, usize)>> {
+        self.held.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A held block of exactly `len` bytes, the most recently given first,
+    /// whose pages are the likeliest still in the core's caches.
+    fn take(&self, len: usize) -> Option<*mut u8> {
+        let mut held = self.held();
+        let i = held.iter().rposition(|&(_, n)| n == len)?;
+        let (p, _) = held.remove(i);
+        self.bytes.fetch_sub(len, Ordering::Relaxed);
+        self.takes.fetch_add(1, Ordering::Relaxed);
+        Some(p as *mut u8)
+    }
+
+    /// `p`, a mapped block of `len` bytes, kept where the pool is on and
+    /// has room for it; false, and nothing kept, otherwise.
+    fn give(&self, p: *mut u8, len: usize) -> bool {
+        if !self.on.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut held = self.held();
+        if self.bytes.load(Ordering::Relaxed) + len > self.cap {
+            return false;
+        }
+        held.push((p as usize, len));
+        self.bytes.fetch_add(len, Ordering::Relaxed);
+        self.gives.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// The pool on or off: off, it keeps nothing more and gives back to
+    /// the kernel what it holds.
+    pub(crate) fn set_on(&self, on: bool) {
+        self.on.store(on, Ordering::Relaxed);
+        if !on {
+            self.release();
+        }
+    }
+
+    /// Whether the pool keeps blocks now.
+    pub(crate) fn is_on(&self) -> bool {
+        self.on.load(Ordering::Relaxed)
+    }
+
+    /// Every held block unmapped.
+    fn release(&self) {
+        let blocks: Vec<(usize, usize)> = std::mem::take(&mut *self.held());
+        for (p, len) in blocks {
+            self.bytes.fetch_sub(len, Ordering::Relaxed);
+            // SAFETY: a block a source mapped with this length and gave
+            // here, read by nobody since.
+            unsafe { free(p as *mut u8, len, true) };
+        }
+    }
+
+    /// The bytes held, and the blocks given out and given back over the
+    /// pool's life.
+    pub(crate) fn counts(&self) -> (usize, usize, usize) {
+        (
+            self.bytes.load(Ordering::Relaxed),
+            self.takes.load(Ordering::Relaxed),
+            self.gives.load(Ordering::Relaxed),
+        )
+    }
+}
+
+impl Drop for BlockPool {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+// SAFETY: the held blocks are addresses, owned by the pool and handed to
+// one owner at a time under its lock.
+unsafe impl Send for BlockPool {}
+unsafe impl Sync for BlockPool {}
+
 /// A block from `alloc(old, _, mapped)` made `new` bytes long, its first
 /// `used` bytes kept and the rest unwritten: a mapping moved by the kernel
 /// where both lengths are mappings (`mremap`, the pages changing address
@@ -1323,6 +1488,103 @@ mod tests {
             "nothing of it the pool's"
         );
         assert_eq!(pool.drain(), at_most);
+    }
+
+    /// A pool gives back a block it holds only for a request of the same
+    /// length, the most recently given first, with the bytes its last owner
+    /// wrote unless the request asks for zeros, and the same address; it
+    /// holds no more than its cap, the block past it unmapped as without a
+    /// pool; off, it keeps nothing and has given back what it held; and a
+    /// block under `MAP_FROM` or of a source that does not map never
+    /// reaches it. Its counts are its own, so they are held exactly here,
+    /// where the process's mapped bytes are not (`tests/mapped.rs`).
+    #[test]
+    fn a_pool_gives_a_block_back_to_its_length_and_keeps_its_cap() {
+        const LEN: usize = 4 * MAP_FROM;
+        let pool = std::sync::Arc::new(BlockPool::new(2 * LEN + MAP_FROM, true));
+        let src = Source::new(true, Some(pool.clone()));
+        let a = src.alloc(LEN, false);
+        let b = src.alloc(LEN, false);
+        let c = src.alloc(MAP_FROM, false);
+        // SAFETY: blocks of these lengths, just allocated.
+        unsafe {
+            a.write(7);
+            b.write(8);
+            c.write(9);
+        }
+        assert_eq!(pool.counts(), (0, 0, 0), "nothing given yet");
+        // SAFETY: from this source with these lengths, read no more here.
+        unsafe {
+            src.free(a, LEN);
+            src.free(b, LEN);
+            src.free(c, MAP_FROM);
+        }
+        assert_eq!(pool.counts(), (2 * LEN + MAP_FROM, 0, 3), "all three held");
+        // A fourth over the cap: unmapped, not held.
+        let d = src.alloc(MAP_FROM, false);
+        assert_eq!(pool.counts().1, 1, "the third block given back out");
+        assert_eq!(d, c, "the same block");
+        // SAFETY: as above.
+        assert_eq!(unsafe { d.read() }, 9, "what its last owner wrote");
+        let e = alloc(MAP_FROM, false, true);
+        // SAFETY: as above.
+        unsafe {
+            src.free(d, MAP_FROM);
+            src.free(e, MAP_FROM);
+        }
+        assert_eq!(
+            pool.counts(),
+            (2 * LEN + MAP_FROM, 1, 4),
+            "the pool full, the block past its cap unmapped"
+        );
+        // The most recent of a length first, and zeroed where asked.
+        let f = src.alloc(LEN, true);
+        assert_eq!(f, b, "the block given last");
+        // SAFETY: a block of `LEN` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(f, LEN) };
+        assert!(bytes.iter().all(|&x| x == 0), "zeroed where asked");
+        // No block of a length it does not hold, longer or shorter: a
+        // longer block given out would be freed at the shorter length.
+        let g = src.alloc(2 * LEN, false);
+        assert_eq!(pool.counts().1, 2, "no block of twice the length");
+        let short = src.alloc(2 * MAP_FROM, false);
+        assert_eq!(pool.counts().1, 2, "no block of a shorter length");
+        // SAFETY: as above.
+        unsafe { src.free(short, 2 * MAP_FROM) };
+        assert_eq!(pool.counts().2, 5, "the short block held at its own length");
+        let again = src.alloc(2 * MAP_FROM, false);
+        assert_eq!(again, short, "and given back at it");
+        // SAFETY: as above.
+        unsafe { src.free(again, 2 * MAP_FROM) };
+        // A block too small to map, and a source that does not map.
+        let small = Source::new(true, Some(pool.clone()));
+        let h = small.alloc(64, false);
+        let unmapped = Source::new(false, Some(pool.clone()));
+        let i = unmapped.alloc(LEN, false);
+        let held = pool.counts();
+        // SAFETY: as above.
+        unsafe {
+            small.free(h, 64);
+            unmapped.free(i, LEN);
+        }
+        assert_eq!(pool.counts(), held, "neither reaches the pool");
+        // Off: nothing kept, and what it held gone back.
+        pool.set_on(false);
+        assert!(!pool.is_on());
+        assert_eq!(pool.counts().0, 0, "the held blocks unmapped");
+        // SAFETY: as above.
+        unsafe {
+            src.free(f, LEN);
+            src.free(g, 2 * LEN);
+        }
+        assert_eq!(pool.counts().0, 0, "nothing kept while off");
+        pool.set_on(true);
+        let j = src.alloc(LEN, false);
+        // SAFETY: as above.
+        unsafe { src.free(j, LEN) };
+        assert_eq!(pool.counts().0, LEN, "on again, held again");
+        drop(src);
+        drop(pool);
     }
 
     /// A `BigVec` holds what a `Vec` fed the same calls holds, through

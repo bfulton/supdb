@@ -2338,6 +2338,105 @@ fn a_point_read_hashed_once_answers_as_one_hashed_per_source() {
     }
 }
 
+/// A store's tables take back the blocks the tables before them gave
+/// (`Options::blocks_pool_bytes`): the live table made at a freeze maps its
+/// blocks while the frozen one is in flight, and the tables after the first
+/// two take theirs from the pool. A store of many seals takes blocks from
+/// its pool and answers every key as the model does, with the store
+/// reopened over what it wrote; with the gate away from the raw form the
+/// pool holds nothing and takes nothing; and a store with no pool counts
+/// none. The controller is off, since its every step stores its own gate
+/// over the one a test sets (`Db::zgate_set`).
+#[test]
+fn a_store_takes_back_the_blocks_its_tables_gave() {
+    // The controller's gate at the raw form, and at its census.
+    const RAW: u8 = 0;
+    const CENSUS: u8 = 1;
+    for (name, pool, gate) in [
+        ("blockpool", true, RAW),
+        ("blockpool-census", true, CENSUS),
+        ("blockpool-none", false, RAW),
+    ] {
+        let d = dir(name);
+        // The controller off, so the gate stays where the test sets it:
+        // its step stores its own gate, and the pool's state with it.
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            blocks_pool_bytes: if pool { 64 << 20 } else { 0 },
+            zpages: supdb::ZPages::Off,
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        db.zgate_set(gate);
+        assert_eq!(
+            db.block_pool_on(),
+            pool && gate == RAW,
+            "{name}: the pool on with the raw form alone"
+        );
+        let mut want: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        let key = |k: u32| format!("pool-{:08}", (k as u64 * 2_654_435_761) % 200_000).into_bytes();
+        for round in 0..12u32 {
+            for k in 0..20_000u32 {
+                let v = format!("r{round}-{k}").into_bytes();
+                db.put(&key(k), &v);
+                want.insert(key(k), v);
+            }
+            db.commit().unwrap();
+            db.settle().unwrap();
+        }
+        let (held, takes, gives) = db.block_pool_counts();
+        if pool && gate == RAW {
+            assert!(
+                takes > 0 && gives > 0,
+                "{name}: no block taken back: held {held} takes {takes} gives {gives}"
+            );
+            assert!(held <= 64 << 20, "{name}: the pool past its cap: {held}");
+        } else {
+            assert_eq!(
+                (held, takes),
+                (0, 0),
+                "{name}: a pool that keeps nothing: gives {gives}"
+            );
+        }
+        let check = |db: &Db, when: &str| {
+            for (k, v) in want.iter().step_by(7) {
+                assert_eq!(read_vec(db, k), vec![v.clone()], "{name} {when}");
+            }
+        };
+        check(&db, "after the seals");
+        let census = db.memory_census();
+        let pooled = census
+            .iter()
+            .find(|(k, _)| k == "block_pool")
+            .map(|(_, v)| *v);
+        assert_eq!(
+            pooled,
+            Some(held as u64),
+            "{name}: the census counts the pool"
+        );
+        db.close().unwrap();
+        let db = Db::open(&d, opts).unwrap();
+        check(&db, "reopened");
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    // A store whose form is forced is read out of core from its open: its
+    // pool keeps nothing from the start, before any step of the
+    // controller's could turn it off.
+    let d = dir("blockpool-forced");
+    let db = Db::create(
+        &d,
+        Options {
+            zpages: supdb::ZPages::Always,
+            ..common::options()
+        },
+    )
+    .unwrap();
+    assert!(!db.block_pool_on(), "a forced form's store pools nothing");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// `Options::point_fixed` and `Options::point_lone` change the path a point
 /// read takes and nothing it returns: the fixture's store -- a partition, a
 /// piece with tombstones and a live table over both -- read with each of
