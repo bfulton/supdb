@@ -921,10 +921,37 @@ until the run is its own log). What it loses:
   scans and runs every mix at 2.5x to 40x the store with it off, and its
   lag sweep's scan passes over the clean store and after the one- and
   ten-percent bursts run at 0.4-0.7x of it, the full rewrite's pass ahead
-  (the same command as the other bounds', above, two pairs). Not taken
-  apart yet: what the controller does through the sweep's bursts under a
-  cipher -- builds at the merges' finishes, conversions, the cache's
-  room beside the form files -- read by the trace before any lever.
+  (the same command as the other bounds', above, two pairs). The three
+  are the plain store's out-of-core regime: with the controller on the
+  store reads as out of core, the writer gives its block forms up for
+  scans whose start blocks do not recur (`zformsoff`), and the sweep's
+  scans take the merge path through the block-coded form files, eight
+  groups a scan, at 11.6 and 22 µs a scan after the two smaller bursts;
+  with it off the cache never reads as out of core and the upkeep
+  thread's copies, 109,000 over the ten-percent burst, serve them at 6-7.
+  Against the comparator it is not a cell lost: paired with encrypted
+  RocksDB at the same bound (`BIN=$PWD/target-enc/release/bench
+  scripts/pair.sh supdb-cipherauto rocksdb-tuned-enc 10000000 --bound
+  1342177280 --passes load,read,scan,lag --reps 2 --ops-div 10 --pairs
+  _per_s` at `27e5c5e`) the store with the controller on is ahead on the
+  reads (2-14x) and the scans (2.7-6x) in four pairs of four, on every
+  burst (1.9-3.7x), and on the three lighter lag passes and the ordered
+  load in three of four; it is behind on the shuffled load (0.85-0.93x)
+  and on the pass after the full rewrite (0.21-0.27x), four of four. That
+  pass is the item below.
+- [ ] **The pass after a full rewrite under a cipher, under a bound.**
+  At ten million keys under 1.25 GiB encrypted RocksDB scans the pass
+  after the lag sweep's full rewrite at 400-460 thousand entries a
+  second and the store under a cipher at 90-117 thousand with the
+  controller on, 78-99 with it off. In the pass 138-146 level-0 pieces
+  stand, the scans take some 27 major faults a scan, and the device reads
+  1.1-1.8 GB and writes 0.7-1.0 GB inside it: the burst's merge debt,
+  paid beside the scans, which is the plain store's standing limitation
+  for this pass (`CLAUDE.md`) with merges that decrypt their inputs and
+  seal their outputs. The levers the plain store has for it -- the merge
+  chain while reads are around, the asks ahead of a build's pieces, the
+  rewarm -- are each to be read under a cipher by the counters that say
+  they fired, before any new one.
 - [ ] **The builds ahead's last cold partition under a cipher.** At five
   million keys under 640 MiB with the builds ahead started at a quarter
   of the store's cache, one or two partitions are still found cold in
