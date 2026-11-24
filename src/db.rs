@@ -6548,6 +6548,21 @@ pub struct Options {
     /// microseconds apart, so a quarter of a second is a stretch with no
     /// reader all the same. `supdb-zrewarmwait` keeps the second.
     pub zpages_rewarm_quiet_ms: u32,
+    /// The rewarm's look (`zpages_rewarm_scans`) is taken at every turn of
+    /// the segment work's loop, a hundredth of a second, where off it is
+    /// taken at the controller's step alone, once a census interval
+    /// (`zselect::CENSUS_INTERVAL`): the scans that come back after a quiet
+    /// stretch have their cold form files asked for at the turn after the
+    /// first of them, where the step came 0-100 ms later, 50 on average. At
+    /// ten million keys under 1 GiB the pass after the ten-percent burst
+    /// spent its first 40 ms in the first scan's sort of the burst's
+    /// unsealed keys and the next 80-120 in major faults on form files the
+    /// burst had pushed out, while the rewarm read 225 MB of them back
+    /// under it, its asks made at the step after the first scan. The look
+    /// is a few loads where nothing is due. `supdb-zrewarmtick` looks at
+    /// the step alone.
+    #[doc(hidden)]
+    pub zpages_rewarm_every_turn: bool,
     /// Whether a partition's form file may be the stride form (`ZStride`).
     /// `Forced`, the default, asks every build of a form file for it
     /// (`Options::z_stride_ask`), where the store in it fits
@@ -7268,6 +7283,7 @@ impl Default for Options {
             zpages_rewarm_raw_maps: true,
             zpages_rewarm_beside_merges: false,
             zpages_rewarm_quiet_ms: 250,
+            zpages_rewarm_every_turn: false,
             zpages_stride: ZStride::Forced,
             zpages_stride_below: None,
             zpages_stride_room: true,
@@ -51759,6 +51775,13 @@ impl Maint {
             .z_last_step
             .is_some_and(|t| now.saturating_sub(t) < zselect::CENSUS_INTERVAL)
         {
+            // Between two steps, the rewarm's look where it is taken at every
+            // turn (`Options::zpages_rewarm_every_turn`): the scans that end
+            // a quiet stretch have their cold form files asked for now, not
+            // at the next step.
+            if self.opts.zpages_rewarm_every_turn {
+                self.z_rewarm_look(now);
+            }
             // Between two steps, the builder's turn where a job of its has
             // ended (`Options::zpages_drive_at_job_end`): the job's thread
             // woke this one, and the job is taken in and the next started

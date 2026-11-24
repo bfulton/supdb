@@ -1022,6 +1022,11 @@ pub struct Supdb {
     /// page tables (`Options::zpages_rewarm_raw_maps`), `None` for the
     /// engine's default. `supdb-rewarmrawnomap` asks and maps nothing.
     rewarmrawmaps: Option<bool>,
+    /// The rewarm's look at every turn of the segment work's loop
+    /// (`Options::zpages_rewarm_every_turn`), `None` for the engine's
+    /// default: `supdb-zrewarmturn` looks at every turn, `supdb-zrewarmtick`
+    /// at the controller's step alone.
+    zrewarmturn: Option<bool>,
     /// The partitions' heads copied at the controller's census while the
     /// block cache holds the raw records' place, whatever the model says
     /// of the raw form (`Options::heads_owned_beside_copies`), `None` for
@@ -2396,6 +2401,11 @@ struct Policy {
     /// page tables (`Options::zpages_rewarm_raw_maps`), `None` for the
     /// engine's default. `supdb-rewarmrawnomap` asks and maps nothing.
     rewarmrawmaps: Option<bool>,
+    /// The rewarm's look at every turn of the segment work's loop
+    /// (`Options::zpages_rewarm_every_turn`), `None` for the engine's
+    /// default: `supdb-zrewarmturn` looks at every turn, `supdb-zrewarmtick`
+    /// at the controller's step alone.
+    zrewarmturn: Option<bool>,
     /// The partitions' heads copied at the controller's census while the
     /// block cache holds the raw records' place, whatever the model says
     /// of the raw form (`Options::heads_owned_beside_copies`), `None` for
@@ -3222,6 +3232,7 @@ impl Default for Policy {
             rewarmraw: None,
             rewarmrawscans: None,
             rewarmrawmaps: None,
+            zrewarmturn: None,
             headscopies: None,
             snapkept: None,
             zbuycross: None,
@@ -7833,6 +7844,32 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with the rewarm's look taken at every turn of the segment
+    /// work's loop (`Options::zpages_rewarm_every_turn` on): the scans
+    /// that end a quiet stretch have their cold form files asked for at
+    /// the next turn, not the controller's next step.
+    pub fn create_zrewarmturn(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zrewarmturn: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the rewarm's look at the controller's step alone, once
+    /// a census interval (`Options::zpages_rewarm_every_turn` off).
+    pub fn create_zrewarmtick(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zrewarmturn: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with the merge path's scan snapshot kept to the commit by
     /// the upkeep thread while the writer's forms are given up
     /// (`Options::forms_off_snapshot_kept`): the first scan after a burst
@@ -9790,6 +9827,7 @@ impl Supdb {
             rewarmraw,
             rewarmrawscans,
             rewarmrawmaps,
+            zrewarmturn,
             headscopies,
             snapkept,
             zbuycross,
@@ -10299,6 +10337,8 @@ impl Supdb {
                 .unwrap_or(supdb::Options::default().zpages_rewarm_raw_scans),
             zpages_rewarm_raw_maps: rewarmrawmaps
                 .unwrap_or(supdb::Options::default().zpages_rewarm_raw_maps),
+            zpages_rewarm_every_turn: zrewarmturn
+                .unwrap_or(supdb::Options::default().zpages_rewarm_every_turn),
             heads_owned_beside_copies: headscopies
                 .unwrap_or(supdb::Options::default().heads_owned_beside_copies),
             zpages_buy_crosses: zbuycross.unwrap_or(supdb::Options::default().zpages_buy_crosses),
@@ -10781,6 +10821,7 @@ impl Supdb {
             rewarmraw,
             rewarmrawscans,
             rewarmrawmaps,
+            zrewarmturn,
             headscopies,
             snapkept,
             zbuycross,
@@ -12386,6 +12427,12 @@ impl Engine for Supdb {
         }
         if self.rewarmrawmaps == Some(false) {
             return "supdb-rewarmrawnomap";
+        }
+        if self.zrewarmturn == Some(true) {
+            return "supdb-zrewarmturn";
+        }
+        if self.zrewarmturn == Some(false) {
+            return "supdb-zrewarmtick";
         }
         if self.headscopies == Some(false) {
             return "supdb-headsmodel";
@@ -14535,6 +14582,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-norewarmraw"
         | "supdb-zrewarmrawscans"
         | "supdb-rewarmrawnomap"
+        | "supdb-zrewarmturn"
+        | "supdb-zrewarmtick"
         | "supdb-headsmodel"
         | "supdb-snapkept"
         | "supdb-zbuycross"
@@ -16486,6 +16535,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-norewarmraw" => supdb_arm(Supdb::create_norewarmraw, dir)?,
         "supdb-zrewarmrawscans" => supdb_arm(Supdb::create_zrewarmrawscans, dir)?,
         "supdb-rewarmrawnomap" => supdb_arm(Supdb::create_rewarmrawnomap, dir)?,
+        "supdb-zrewarmturn" => supdb_arm(Supdb::create_zrewarmturn, dir)?,
+        "supdb-zrewarmtick" => supdb_arm(Supdb::create_zrewarmtick, dir)?,
         "supdb-headsmodel" => supdb_arm(Supdb::create_headsmodel, dir)?,
         "supdb-snapkept" => supdb_arm(Supdb::create_snapkept, dir)?,
         "supdb-zbuycross" => supdb_arm(Supdb::create_zbuycross, dir)?,
@@ -18563,6 +18614,17 @@ mod tests {
                 assert!(
                     o.zpages_rewarm_raw && !o.zpages_rewarm_raw_maps && b.zpages_rewarm_raw_maps
                 );
+                for (arm, on) in [("zrewarmturn", true), ("zrewarmtick", false)] {
+                    let z = if on {
+                        Supdb::create_zrewarmturn(&dir(arm)).unwrap()
+                    } else {
+                        Supdb::create_zrewarmtick(&dir(arm)).unwrap()
+                    };
+                    assert_eq!(z.name(), format!("supdb-{arm}"));
+                    assert_eq!(z.features(), base.features());
+                    let o = z.db.as_ref().unwrap().options();
+                    assert_eq!(o.zpages_rewarm_every_turn, on, "{arm}");
+                }
             }
             {
                 let z = Supdb::create_headsmodel(&dir("headsmodel")).unwrap();

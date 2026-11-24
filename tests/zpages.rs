@@ -12995,6 +12995,105 @@ fn a_rewarm_is_made_beside_a_merge_in_flight_after_a_quarter_second() {
     }
 }
 
+/// The rewarm's look taken at every turn of the segment work's loop
+/// (`Options::zpages_rewarm_every_turn`): with the injected clock standing
+/// still past a quiet stretch, the scan that ends it has the cold form
+/// files asked for within a few turns, where without the option the look
+/// waits for the controller's next step, which a clock that does not move
+/// never brings -- and the step, once the clock moves, makes the same one
+/// rewarm. Every form file is out of the cache when the scans come back,
+/// so the one rewarm asks for each of them.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_rewarm_is_asked_for_at_the_turn_after_the_scan_and_not_the_step() {
+    let ms = std::time::Duration::from_millis;
+    for every in [true, false] {
+        let what = format!("rewarm every turn {every}");
+        let (dir, mut db, mut model, inject) = auto_store_with(
+            &format!("auto-rewarm-turn-{every}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_rewarm_every_turn = every;
+                o.zpages_hot_raw = false;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        let n = db.zpage_counts().form_files;
+        assert!(n >= 5, "{what}: form files: {:?}", db.zpage_counts());
+        // Keys written and committed and left unsealed, as a burst leaves
+        // them: a scan of a store with nothing unsealed takes the drained
+        // walk, which the forms' regime does not count, and the look reads
+        // the scans by that count (`Shared::scans_life`).
+        let mut rng = Rng(0x5EED);
+        for k in keys.iter().take(50) {
+            let v = suite_value(&mut rng);
+            db.put(k, &v);
+            model.insert(k.clone(), vec![v]);
+        }
+        db.commit().unwrap();
+        assert_eq!(db.merges_in_flight(), 0, "{what}: nothing merging");
+        // A scan the looks have seen, then every form file out of the
+        // cache and 600 ms of the clock with no scan. The quiet is counted
+        // from the first look that finds no scan since the last, and the
+        // clock here moves 200 ms at a step with no turn between the
+        // steps, so a stretch of two steps measures one of them: 600 ms
+        // is a quarter second's quiet by every look's count.
+        let mut one = 0usize;
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        advance_tick(&db, ms(100));
+        for p in form_files(&dir) {
+            unmap_pages(&p);
+            evict(&p);
+        }
+        for _ in 0..3 {
+            advance_tick(&db, ms(200));
+        }
+        let (r0, f0) = (db.zpage_counts().rewarms, db.zpage_counts().rewarm_files);
+        // The scan that ends the stretch, and the clock left where it is.
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        if every {
+            wait_for(&format!("{what}: the rewarm at a turn"), || {
+                db.zpage_counts().rewarms > r0
+            });
+        } else {
+            // Thirty turns and more of the loop, and no step among them.
+            std::thread::sleep(ms(300));
+            let c = db.zpage_counts();
+            assert_eq!(c.rewarms, r0, "{what}: no look between steps: {c:?}");
+            advance_tick(&db, ms(100));
+        }
+        let c = db.zpage_counts();
+        assert_eq!(c.rewarms - r0, 1, "{what}: one rewarm: {c:?}");
+        let asked = c.rewarm_files - f0;
+        assert!(
+            asked + 1 >= n && asked <= n,
+            "{what}: every cold file, of {n}: {c:?}"
+        );
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Under the controller with the hot-raw policy and the skew read over the
 /// window's looks (`Options::zpages_hot_raw_slack`), a partition read under
 /// the sample floor at every look but steadily across the window's looks is
