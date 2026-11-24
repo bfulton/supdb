@@ -255,6 +255,15 @@ impl StoreCipher {
         self
     }
 
+    /// The cache's size as `cache_bytes` set it, or `None` where the cache
+    /// follows the room: what decides a store's budget, where the budget
+    /// itself is a reading of the room that moves with the process and is
+    /// shared between the stores of the process that follow it.
+    #[doc(hidden)]
+    pub fn cache_bytes_set(&self) -> Option<u64> {
+        self.cache
+    }
+
     /// The cache as it was before it followed the room: half of what the
     /// process may use as its store opens, read once, the other half left
     /// to the kernel's cache of the store's files. The shape the room is

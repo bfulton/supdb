@@ -17705,27 +17705,28 @@ mod tests {
             a.db.as_ref().unwrap().cipher_counts().unwrap().cache.budget
         };
         assert_eq!(budget("supdb-cipher64", Supdb::create_cipher64), 64 << 20);
-        let arm = budget("supdb-cipher", Supdb::create_cipher);
-        assert_ne!(arm, 64 << 20);
-        // `supdb-cipher`'s is the engine's own: the budget a store under the
-        // same cipher with no bound reads, opened beside it. The engine reads
-        // that default off the process's memory at the open, so the two are
-        // held within a quarter of each other and not to the byte.
-        let d = root.join("unbounded");
-        std::fs::create_dir_all(&d).unwrap();
-        let db = supdb::Db::create(
-            &d,
-            supdb::Options {
-                encryption: Encryption::Cipher(supdb::StoreCipher::new(Gcm::new(), Gcm::of)),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let own = db.cipher_counts().unwrap().cache.budget;
-        drop(db);
-        assert!(
-            arm.abs_diff(own) <= arm.max(own) / 4,
-            "supdb-cipher's cache {arm} is the engine's default {own}"
+        // Opened for its name; its budget is the room's, of any size the
+        // floor allows, sixty-four mebibytes among them.
+        let _ = budget("supdb-cipher", Supdb::create_cipher);
+        // `supdb-cipher`'s is the engine's own: the cipher its policy makes
+        // sets no size, so its cache follows the room, where
+        // `supdb-cipher64`'s sets its policy's. Held by the cipher and not
+        // by the budget beside a store opened for the comparison: the
+        // budget is a reading of the room, shared between the stores of
+        // the process that follow it, so another test's store under a
+        // cipher open in the same instant halved it -- 6.8 GB against 13.5
+        // in a gate's bench group, where the two were held within a
+        // quarter of each other. A store keeps no cipher in its options
+        // past its open, so the cipher is the policy's.
+        let size = |cache: u64| match encryption_of(false, true, cache, false, false) {
+            Encryption::Cipher(c) => c.cache_bytes_set(),
+            _ => panic!("a cipher"),
+        };
+        assert_eq!(size(0), None, "supdb-cipher's cache follows the room");
+        assert_eq!(
+            size(64 << 20),
+            Some(64 << 20),
+            "supdb-cipher64's is its policy's"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
