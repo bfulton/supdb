@@ -665,8 +665,9 @@ Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`
 block and rejects any `${{ }}` inside one; it runs in `lint`. It refuses
 `ubuntu-latest` as a job's runner too. That label moved to Ubuntu 26.04
-between two runs of one afternoon, where the libclang lookup finds
-nothing and `qemu-user-static` is not a package, and three jobs of `ci`
+between two runs of one afternoon, where the libclang lookup found
+nothing (it looked in the highest LLVM directory alone, and asks each
+now) and `qemu-user-static` is not a package, and three jobs of `ci`
 failed in their set-up on a tree that had not changed; `ci` was given
 its image by name that day, and the five workflows that run by hand or
 after a merge kept the label for another day, each to fail the same way

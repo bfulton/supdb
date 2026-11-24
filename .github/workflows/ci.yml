@@ -44,8 +44,9 @@ jobs:
     #
     # The Linux runners are named by their image and not as `ubuntu-latest`:
     # that label moved to Ubuntu 26.04 between two runs of one afternoon,
-    # where `bench/scripts/libclang.sh` finds no libclang after installing
-    # it and `qemu-user-static` is no longer a package, and three jobs
+    # where `bench/scripts/libclang.sh` found no libclang after installing
+    # it (it looked in the highest LLVM directory alone, and asks each now)
+    # and `qemu-user-static` is no longer a package, and three jobs
     # failed in their set-up on a tree that had not changed. The image is
     # this workflow's to choose, as the ARM leg's already was; moving to a
     # newer one is a change made here, with the scripts it needs.
