@@ -36,6 +36,19 @@ jobs:
           echo "libclang.sh took $(( $(date +%s) - start )) s"
           grep -E 'LIBCLANG|RUSTFLAGS' "$GITHUB_ENV" || true
           echo "dev packages now: $(dpkg -l 2>/dev/null | grep -c -E '^ii +libclang(-[0-9]+)?-dev' || true)"
+      - name: apt, timed, with the image's own package lists and then with fresh ones
+        if: runner.os == 'Linux'
+        run: |
+          set -u
+          echo "list files on the image: $(ls /var/lib/apt/lists | wc -l)"
+          ls -la --time-style=long-iso /var/lib/apt/lists | grep -v -E 'lock|partial|auxfiles' | sort -k6,7 | tail -n 2
+          dpkg -l 2>/dev/null | grep -E '^ii +(libaio|libtbb|uuid-dev|libuuid)' | awk '{print $2, $3}'
+          start=$(date +%s)
+          sudo apt-get install -y --no-install-recommends libaio-dev libtbb-dev uuid-dev
+          echo "INSTALL WITHOUT UPDATE: exit $? in $(( $(date +%s) - start )) s"
+          start=$(date +%s)
+          sudo timeout 900 apt-get update
+          echo "UPDATE: exit $? in $(( $(date +%s) - start )) s"
       - name: FASTER, for the `faster` arm
         if: matrix.runner != 'ubuntu-26.04'
         run: sh bench/scripts/faster.sh
@@ -46,12 +59,7 @@ jobs:
         run: |
           set -eu
           echo "LIBCLANG_PATH=${LIBCLANG_PATH:-} RUSTFLAGS=${RUSTFLAGS:-}"
-          if [ "$RUNNER_LABEL" = ubuntu-26.04 ]; then
-            cargo build --release --locked -p librocksdb-sys
-          else
-            cargo build --release --locked --bin bench
-            ./target/release/bench machine
-          fi
+          cargo build --release --locked -p librocksdb-sys
           b=$(ls target/release/build/librocksdb-sys*/out/bindings.rs target/release/build/librocksdb-sys/*/out/bindings.rs 2>/dev/null | head -n 1)
           wc -l "$b"
           shasum -a 256 "$b"
