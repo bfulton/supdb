@@ -302,14 +302,15 @@ does beside them.
 ## Arms
 
 Every comparison is guarantee-matched: durable against durable, buffered
-against buffered. An arm is either a shipping supdb configuration or the
-comparator a user would otherwise pick.
+against buffered, held in memory against held in memory. An arm is either
+a shipping supdb configuration or the comparator a user would otherwise
+pick.
 
 | guarantee | supdb | comparators |
 |---|---|---|
 | durable per batch | `supdb` (default), `supdb-forms`, `supdb-settle`, `supdb-nosnap`, `supdb-noadvice`, `supdb-nocache`, `supdb-cache256` | `lmdb`, `rocksdb-tuned`, and in the bounded roster `rocksdb-tuned-lz4` |
 | buffered | `supdb-ingest` | `lmdb-nosync`, `rocksdb-tuned-nosync` |
-| in memory until a checkpoint | `supdb-held`, in no roster | `faster`, where it is built |
+| in memory until a checkpoint | `supdb-held`, where `faster` is built | `faster`, where it is built |
 
 `faster` is Microsoft's FASTER, its C++ store: the comparator a user would
 otherwise pick for point gets and puts alone, a hash index over a log that
@@ -317,12 +318,10 @@ updates in place. Its promise is weaker than a buffered commit's and it has
 no stronger one to configure. A write is in the process's memory when it
 returns and reaches the device at a checkpoint, so a process that is killed
 loses what it wrote since, where a buffered arm's every commit is in the
-kernel. That is a guarantee of its own with one arm in it: the suite
-compares `faster` with nothing and draws no figure of it, and its cells are
-in the row for a reader who sets them beside the buffered group's and says
-what differs. It has no ordered scan and the arm does not reopen a store, so
-it runs no scan workload, no YCSB E and no recovery workload, and its row
-has no cell there. A load's window ends where the arm's guarantee is met,
+kernel. That is a guarantee of its own, `supdb-held` the engine's arm of
+it. It has no ordered scan and the arm does not reopen a store, so it runs
+no scan workload, no YCSB E and no recovery workload, and its row has no
+cell there. A load's window ends where the arm's guarantee is met,
 which for FASTER is a checkpoint of its log, written in whole pages of
 32 MiB. Read-modify-write in the `threads` workloads is FASTER's own single
 operation, and a read and then a write for every other arm.
@@ -330,15 +329,30 @@ operation, and a read and then a write for every other arm.
 `supdb-held` is `supdb-ingest` opened under the one policy of the engine's
 that promises what FASTER does (`SyncPolicy::Explicit`): a commit's frames
 stay in the process, the arm's `sync` is its drain as its sibling's is,
-and a process that is killed loses what it committed since. It is in no
-roster. A row that held it beside `faster` would be refused where a run
-starts, since the two differ on the ordered scan and the reopen, which
-`faster` has not got and the check holds a guarantee's arms to; so the two
-are read by a pairing (`scripts/pair.sh supdb-held faster SIZE`), which is
-a reader's comparison as `faster` beside the buffered group is, with the
-difference this time on the side of the arm that promises more.
+and a process that is killed loses what it committed since. It is in the
+roster where `faster` is and in no other, the pair being what it is
+measured for.
+
+The two differ on the ordered scan and the reopen, which `faster` has not
+got and has no setting for. The check that holds a guarantee's arms to one
+set of features (`engines::check_matched`, where a run starts) refuses
+every difference but the ones written down for it by arm and by axis
+(`engines::ALLOWED_GAPS`): `faster`, those two axes, and only where
+`faster` is the arm without the feature. An arm beside it that lacked a
+scan, a difference on any other axis, and a `faster` that had what its
+neighbour lacked are each refused as before. So the comparison is over the
+workloads both arms have, the loads, the point reads, the mixes without a
+scan and the update bursts, and a figure of the group is drawn where both
+have the cell; `supdb-held` runs the scan workloads, E and the recovery
+workloads as well, with nothing beside it there and no figure, and what a
+killed process cost it is its `unrecovered_batches`: of a shuffled load,
+every batch no seal's manifest covered and no spill wrote, which at a rung
+that seals nothing is all of them; of an ordered load none, a run's
+records going to the run's own file at each commit under every policy.
+
 `supdb-held1m` and `supdb-held8m` pin the bytes the held log spills at
-(`Options::wal_hold_bytes`) where the arm takes the engine's.
+(`Options::wal_hold_bytes`) where the arm takes the engine's, and are in
+no roster.
 
 The store is not a crate. `scripts/faster.sh` fetches its sources at the
 commit `vendor/faster/PIN` names and installs the libraries they link, and
@@ -1215,9 +1229,12 @@ size: a bar hides the knee, and the knee is the finding.
   Tick labels are sparse and in the unit's natural form — 10⁴, 10⁵, not
   10000, 100000 — with the unit stated once on the axis.
 - The title is the message in numbers: supdb's factor against each
-  comparator at the top rung, in whichever direction the quantity is good.
-  The context and the provenance (class, engine commit, date, reps) are
-  the two lines under it.
+  comparator at the top rung, in whichever direction the quantity is good,
+  supdb being the guarantee's own arm of it (`supdb`, `supdb-ingest`,
+  `supdb-held`). The context and the provenance (class, engine commit,
+  date, reps) are the two lines under it.
+- A figure is a comparison: in the memory guarantee, whose two arms do
+  not run the same workloads, a cell one arm has alone is drawn nowhere.
 - One typeface, two sizes. Black on white. A palette that reads in
   greyscale and to a colour-blind reader.
 

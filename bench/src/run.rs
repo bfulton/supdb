@@ -3695,7 +3695,11 @@ fn unrecovered(
 /// keeps a commit in the writer's buffer until a write piece is whole. So
 /// the batches a buffered arm's store does not hold are counted and
 /// recorded (`unrecovered_batches`), and its first read is recorded only
-/// where it found the key.
+/// where it found the key. An arm of the memory guarantee promised less
+/// again, nothing of a commit until a sync or a checkpoint, and is counted
+/// the same way: the held log's arm loses every batch no seal's manifest
+/// covered and no spill wrote, which is its whole shuffled load at a rung
+/// that seals nothing, and that is the quantity and no failure.
 fn recover_store(
     arm: &str,
     dir: &Path,

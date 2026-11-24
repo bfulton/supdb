@@ -844,6 +844,40 @@ arm is `Guarantee::Memory` now, alone there, and the check is as it was.
 Its cells beside the buffered group's are a reader's comparison, made
 with the difference said, never the suite's.
 
+**A difference excused by arm is not an axis dropped.** The engine's arm
+of FASTER's guarantee (`supdb-held`, the log held in the process) differs
+from `faster` on the two axes that first fix skipped: it scans in order
+and reopens a store. A row with both was refused where it starts, as it
+should have been, so the pair was read by pairings alone and no row
+held the engine beside FASTER under one promise. The check takes a list
+now of the differences it lets stand (`engines::ALLOWED_GAPS`): an arm,
+and the axes that arm has no setting for, excused only where that arm is
+the one without the feature. What separates it from the fix above is what
+the next mistake looks like under each. An axis skipped says nothing of
+who may differ on it, so the next arm to differ there passes unseen, in
+any group; an entry names one arm, so a second arm without a scan is
+refused beside `supdb-held` until somebody writes it down and says why no
+setting equalizes it. Three things came with the list. An entry is for
+what an arm cannot have, never for a setting nobody matched: durability,
+checksums and reading one's own writes are on no entry, and a comparator
+that can turn one off turns it off. With a difference excused for one
+arm, matching is no longer transitive -- two arms may each match `faster`
+and not each other -- so the check asks every pair of a group where it
+had asked neighbours. And no real arm makes the check's red inputs, the
+roster being green by construction, so the excusing is a function of two
+names and two feature sets that the test hands hand-built ones: the
+excused pair either way round, the same gap on an arm the list does not
+name, the listed arm with the feature its neighbour lacks, each other
+axis, and the group of three. What the excused arm lacks the other runs
+alone: `supdb-held` has the scans, E and the recoveries in the row with
+nothing beside them and no figure, the group's figures being the cells
+both have, and what a killed process cost it there is a quantity
+(`unrecovered_batches`, its whole shuffled load where nothing sealed),
+where for a durable arm it is a failure. The roster's own test of legend
+names is what said the figures had to know the arm at all
+(`every_roster_arm_has_a_legend_name`): the filtered run of the new tests
+was green with it red.
+
 **A cell an arm cannot have is no sample, not a NaN one.** A phase a
 pass leaves out leaves a NaN where its rate would be, which was every
 phase `bench ab --passes` left out and nothing in a row, since a row was

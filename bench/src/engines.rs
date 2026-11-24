@@ -86,6 +86,20 @@ impl Features {
         v
     }
 
+    /// Whether the engine has the feature `unmatched` names `axis`: what
+    /// `check_matched` asks to learn which of two arms that differ on an
+    /// axis is the one without it (`ALLOWED_GAPS`).
+    fn has(&self, axis: &str) -> bool {
+        match axis {
+            "durable_commit" => self.durable_commit,
+            "checksums" => self.checksums,
+            "read_your_writes" => self.read_your_writes,
+            "ordered_scan" => self.ordered_scan,
+            "reopen_for_write" => self.reopen_for_write,
+            other => unreachable!("`unmatched` names no axis {other:?}"),
+        }
+    }
+
     /// The asymmetry that cannot be equalized, and which way it leans.
     ///
     /// LMDB cannot stop being transactional, so a pair matched on everything
@@ -14510,9 +14524,12 @@ use crate::row::Guarantee;
 ///
 /// `faster` is last, and in the roster where it is built (`cfg(faster)`,
 /// Linux x86-64): the store a user would otherwise pick for point gets and
-/// puts alone. Its guarantee is its own (`Guarantee::Memory`), so the suite
-/// compares it with no other arm, and a reader who sets its cells beside
-/// the buffered group's says what that group promises that it does not.
+/// puts alone. Its guarantee is its own (`Guarantee::Memory`): a write is
+/// in the process until a checkpoint. `supdb-held` is ahead of it, the one
+/// supdb arm of that guarantee (`SyncPolicy::Explicit`), and in the roster
+/// where `faster` is and nowhere else, since the pair is what it is
+/// measured for. The two differ on what FASTER has no setting for, which
+/// the matching check is told by name (`ALLOWED_GAPS`).
 macro_rules! roster {
     ($($also:literal),*) => {
         [
@@ -14534,7 +14551,7 @@ macro_rules! roster {
     };
 }
 #[cfg(faster)]
-pub const ARMS: [&str; 14] = roster!("faster");
+pub const ARMS: [&str; 15] = roster!("supdb-held", "faster");
 #[cfg(not(faster))]
 pub const ARMS: [&str; 13] = roster!();
 
@@ -16927,9 +16944,58 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
     })
 }
 
+/// The differences `check_matched` lets a guarantee's arms hold: for the
+/// arm named, the axes it has no setting for, so that no arm of its group
+/// could be made to match it there and the arms beside it are not asked
+/// to. An entry excuses a difference on one of its axes only where the
+/// arm named is the one without the feature; the other way round, and on
+/// every axis and for every arm not written here, a difference in a group
+/// is refused as it always was.
+///
+/// FASTER has no ordered scan, and its arm does not reopen a store. When
+/// the arm was first added the check was made to skip those two axes for
+/// every arm, which let it sit in the buffered group, whose promise it
+/// does not keep (`bench/CLAUDE.md`); the axes are skipped for nobody
+/// now, and excused for the one arm that cannot have them, in the group
+/// whose promise is its own.
+const ALLOWED_GAPS: &[(&str, &[&str])] = &[("faster", &["ordered_scan", "reopen_for_write"])];
+
+/// The axes two arms of one guarantee differ on that `ALLOWED_GAPS` does
+/// not excuse.
+fn unexcused(a: (&str, &Features), b: (&str, &Features)) -> Vec<&'static str> {
+    let lacks = |(arm, f): (&str, &Features), axis: &str| {
+        !f.has(axis)
+            && ALLOWED_GAPS
+                .iter()
+                .any(|(who, axes)| *who == arm && axes.contains(&axis))
+    };
+    a.1.unmatched(b.1)
+        .into_iter()
+        .filter(|axis| !lacks(a, axis) && !lacks(b, axis))
+        .collect()
+}
+
+/// The first two arms of `list`, one guarantee's, that differ on an axis
+/// nothing excuses, and the axes: every pair is asked, since with a
+/// difference excused for one arm two arms may each match it and not each
+/// other.
+fn first_mismatch(list: &[(String, Features)]) -> Option<(&str, &str, Vec<&'static str>)> {
+    for (i, a) in list.iter().enumerate() {
+        for b in &list[i + 1..] {
+            let gap = unexcused((&a.0, &a.1), (&b.0, &b.1));
+            if !gap.is_empty() {
+                return Some((&a.0, &b.0, gap));
+            }
+        }
+    }
+    None
+}
+
 /// Every arm in a guarantee must promise the same things, or the comparison
 /// is not one. Checked once at the start of a run and fatal if it fails:
-/// a mismatched pair is a bug in this file, not a measurement.
+/// a mismatched pair is a bug in this file, not a measurement. The one
+/// kind of difference let through is written down by arm and axis
+/// (`ALLOWED_GAPS`).
 pub fn check_matched(arms: &[String], dir: &Path) -> Res<()> {
     let mut by_g: std::collections::HashMap<Guarantee, Vec<(String, Features)>> =
         Default::default();
@@ -16943,17 +17009,11 @@ pub fn check_matched(arms: &[String], dir: &Path) -> Res<()> {
         by_g.entry(g).or_default().push((a.clone(), f));
     }
     for (g, list) in by_g {
-        for w in list.windows(2) {
-            let gap = w[0].1.unmatched(&w[1].1);
-            if !gap.is_empty() {
-                return Err(format!(
-                    "{} and {} are both {:?} but differ on {}",
-                    w[0].0,
-                    w[1].0,
-                    g,
-                    gap.join(", ")
-                ));
-            }
+        if let Some((a, b, gap)) = first_mismatch(&list) {
+            return Err(format!(
+                "{a} and {b} are both {g:?} but differ on {}",
+                gap.join(", ")
+            ));
         }
     }
     Ok(())
@@ -17216,6 +17276,137 @@ mod tests {
         assert!(!plain.env_flags().contains(heed::EnvFlags::NO_READ_AHEAD));
         drop(plain);
         drop(off);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The matching check excuses a difference by arm and axis and in one
+    /// direction: FASTER's two missing features beside an arm that has
+    /// them, and nothing else. The same two features missing from an arm
+    /// the list does not name, an arm on the list that has a feature its
+    /// neighbour lacks, and any other axis FASTER might differ on are each
+    /// refused, as every difference was; and every pair of a group is
+    /// asked, since two arms that each match FASTER may not match each
+    /// other.
+    #[test]
+    fn the_matching_check_excuses_what_one_arm_cannot_have_and_nothing_else() {
+        // What the held arm and FASTER's report, written out: the engine's
+        // side has every feature but the durable commit.
+        let full = Features {
+            durable_commit: false,
+            transactions: true,
+            checksums: false,
+            reopen_for_write: true,
+            read_your_writes: true,
+            ordered_scan: true,
+        };
+        let bare = Features {
+            transactions: false,
+            reopen_for_write: false,
+            ordered_scan: false,
+            ..full
+        };
+        let none: Vec<&str> = Vec::new();
+        let both = vec!["ordered_scan", "reopen_for_write"];
+        // Excused, whichever way the pair is written.
+        assert_eq!(unexcused(("supdb-held", &full), ("faster", &bare)), none);
+        assert_eq!(unexcused(("faster", &bare), ("supdb-held", &full)), none);
+        // Not for an arm the list does not name.
+        assert_eq!(
+            unexcused(("supdb-held", &full), ("lmdb-nosync", &bare)),
+            both
+        );
+        // Not where the arm on the list is the one that has the feature.
+        assert_eq!(unexcused(("faster", &full), ("supdb-held", &bare)), both);
+        // One axis of the two excused, the other still a difference to
+        // excuse or refuse on its own.
+        let no_scan = Features {
+            ordered_scan: false,
+            ..full
+        };
+        assert_eq!(unexcused(("supdb-held", &full), ("faster", &no_scan)), none);
+        assert_eq!(
+            unexcused(("supdb-held", &full), ("supdb-ingest", &no_scan)),
+            vec!["ordered_scan"]
+        );
+        // And no other axis, for FASTER or anyone.
+        for (axis, other) in [
+            (
+                "durable_commit",
+                Features {
+                    durable_commit: true,
+                    ..bare
+                },
+            ),
+            (
+                "checksums",
+                Features {
+                    checksums: true,
+                    ..bare
+                },
+            ),
+            (
+                "read_your_writes",
+                Features {
+                    read_your_writes: false,
+                    ..bare
+                },
+            ),
+        ] {
+            assert_eq!(
+                unexcused(("supdb-held", &full), ("faster", &other)),
+                vec![axis],
+                "{axis}"
+            );
+            assert_eq!(unexcused(("faster", &other), ("faster", &bare)), vec![axis]);
+        }
+        // Every axis `unmatched` names is one `has` answers.
+        let flipped = Features {
+            durable_commit: true,
+            transactions: false,
+            checksums: true,
+            reopen_for_write: false,
+            read_your_writes: false,
+            ordered_scan: false,
+        };
+        for axis in full.unmatched(&flipped) {
+            assert!(full.has(axis) != flipped.has(axis), "{axis}");
+        }
+        assert_eq!(full.unmatched(&flipped).len(), 5);
+
+        // A group of three: an arm without the scan that the list does not
+        // name matches FASTER, the held arm matches FASTER, and the two do
+        // not match each other, which only asking every pair finds.
+        let named = |arm: &str, f: Features| (arm.to_string(), f);
+        let group = [
+            named("supdb-held", full),
+            named("faster", bare),
+            named("some-arm", bare),
+        ];
+        assert_eq!(
+            first_mismatch(&group),
+            Some(("supdb-held", "some-arm", both.clone()))
+        );
+        assert_eq!(first_mismatch(&group[..2]), None);
+        assert_eq!(first_mismatch(&group[1..]), None);
+        // And the arms themselves, opened: the pair passes where FASTER is
+        // built, and the held arm beside a buffered comparator's features
+        // would not.
+        let root = std::env::temp_dir().join(format!("supdb-bench-matched-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        #[cfg(faster)]
+        {
+            assert!(ARMS.contains(&"supdb-held") && ARMS.contains(&"faster"));
+            let pair = ["supdb-held".to_string(), "faster".to_string()];
+            assert_eq!(check_matched(&pair, &root), Ok(()));
+        }
+        #[cfg(not(faster))]
+        assert!(
+            !ARMS.contains(&"supdb-held"),
+            "the held arm without its pair"
+        );
+        let whole: Vec<String> = ARMS.iter().map(|a| a.to_string()).collect();
+        assert_eq!(check_matched(&whole, &root), Ok(()), "the roster");
         let _ = std::fs::remove_dir_all(&root);
     }
 

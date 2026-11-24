@@ -7,7 +7,8 @@
 //! What the workload holds the reopened store to -- a prefix of whole
 //! batches and no staged tail, and for a durable arm every batch -- fails
 //! the run, so a row here is a row whose stores passed it; what a buffered
-//! arm's process took with it is a quantity of the row.
+//! arm's process took with it is a quantity of the row, and so is what the
+//! arm that holds its log in the process lost, which is the point of it.
 
 use std::path::Path;
 use std::process::Command;
@@ -59,7 +60,13 @@ fn a_row_carries_both_recoveries_for_every_arm() {
     // is every durable store whole.
     let durable = ["supdb", "lmdb", "rocksdb-tuned"];
     let buffered = ["supdb-ingest", "lmdb-nosync", "rocksdb-tuned-nosync"];
-    let arms = [durable, buffered].concat().join(",");
+    // And the arm of the third guarantee that reopens a store: the log
+    // held in the process until a sync. `faster`, beside it in the roster,
+    // runs no recovery workload.
+    let held = "supdb-held";
+    let mut arms = [durable, buffered].concat();
+    arms.push(held);
+    let arms = arms.join(",");
     let status = bench()
         .args([
             "run", "--scale", "quick", "--top", "10000", "--reps", "1", "--arms", &arms, "--out",
@@ -81,7 +88,7 @@ fn a_row_carries_both_recoveries_for_every_arm() {
             assert_eq!(s.len(), 1, "{workload} {quantity} for {arm}: {s:?}");
             Some(s[0])
         };
-        for arm in durable.iter().chain(&buffered) {
+        for arm in durable.iter().chain(&buffered).chain([&held]) {
             let open = one(arm, "open_ms")
                 .unwrap_or_else(|| panic!("no {workload} open_ms for {arm}: {got:?}"));
             assert!(
@@ -116,6 +123,32 @@ fn a_row_carries_both_recoveries_for_every_arm() {
             assert!(
                 one(arm, "first_read_us").is_some(),
                 "{workload}: no first read for {arm}"
+            );
+        }
+        // The held log's arm is the one whose loss is its guarantee: the
+        // run did not fail on it, the row says how much it was, and the
+        // first read is recorded exactly where the last key came back. Its
+        // shuffled load goes through the log, and at this rung nothing
+        // seals, spills or rotates before the kill, so the process took
+        // the load with it: an arm that lost nothing there wrote its log
+        // at its commits, which is `supdb-ingest` under another name and
+        // no peer of FASTER's. Its ordered load goes to a run's own file,
+        // which this says nothing of.
+        let lost = one(held, "unrecovered_batches")
+            .unwrap_or_else(|| panic!("no {workload} unrecovered_batches for {held}: {got:?}"));
+        assert!(
+            lost.is_finite() && lost >= 0.0,
+            "{workload}: {held} lost {lost}"
+        );
+        assert_eq!(
+            one(held, "first_read_us").is_some(),
+            lost == 0.0,
+            "{workload}: {held} lost {lost} batches and its first read of the last key"
+        );
+        if workload == "recover-shuffled" {
+            assert!(
+                lost > 0.0,
+                "{workload}: {held} was killed holding its log and lost nothing"
             );
         }
     }
