@@ -125,7 +125,12 @@ for n in 10000 30000 100000 300000; do
 done
 rm -rf "$out/tools/dbb" "$out/tools/lmdb"
 
-python3 scripts/comparators.py "$out" | tee "$out/comparators.md"
+# The table's verdict is this script's exit, so the table goes to its file
+# and is shown from there: piped into `tee` its status was tee's, and a
+# cell under the margin, which the table's script answers with 1, left
+# this script and the job at 0 for as long as it was written that way.
+python3 scripts/comparators.py "$out" > "$out/comparators.md"
 status=$?
+cat "$out/comparators.md"
 [ -n "${GITHUB_STEP_SUMMARY:-}" ] && cat "$out/comparators.md" >> "$GITHUB_STEP_SUMMARY"
 exit $status
