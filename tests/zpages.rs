@@ -12557,6 +12557,8 @@ fn a_settle_maps_the_raw_files_it_asked_back() {
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Room {
         All,
+        /// All, the first file asked coming in after the rest.
+        AllLate,
         Half,
         /// For half of the ordered indexes and no partition.
         Indexes,
@@ -12564,6 +12566,7 @@ fn a_settle_maps_the_raw_files_it_asked_back() {
     }
     for (maps, room) in [
         (true, Room::All),
+        (true, Room::AllLate),
         (false, Room::All),
         (true, Room::Half),
         (true, Room::Indexes),
@@ -12595,7 +12598,7 @@ fn a_settle_maps_the_raw_files_it_asked_back() {
             "{what}: the raw files out of the cache: {cold} of {size}"
         );
         inject.set_slack(match room {
-            Room::All => 1 << 30,
+            Room::All | Room::AllLate => 1 << 30,
             Room::Half => size / 2,
             Room::Indexes => resident_under(&dir, "ord-").0 / 2,
             Room::None => 0,
@@ -12605,13 +12608,19 @@ fn a_settle_maps_the_raw_files_it_asked_back() {
             recs < 0.1 && ord < 0.1,
             "{what}: the files out of the page tables: records {recs:.2}, indexes {ord:.2}"
         );
+        // The first file asked, an ordered index, read in after the rest
+        // and inside the wait's stall limit: the wait that ended once the
+        // asked bytes together were back left it unmapped.
+        if room == Room::AllLate {
+            inject.ask_first_late(80);
+        }
         let mut db = db;
         db.settle().unwrap();
         let c = db.zpage_counts();
         let (recs, ord) = db.raw_mapped_share().unwrap();
         let warm = raw_resident(&dir).1;
         match (maps, room) {
-            (true, Room::All) => {
+            (true, Room::All | Room::AllLate) => {
                 assert!(c.raw_settles == 1 && c.raw_maps > 0, "{what}: {c:?}");
                 assert!(
                     warm * 10 >= size * 9 && recs >= 0.9 && ord >= 0.9,

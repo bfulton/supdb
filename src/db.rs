@@ -20565,6 +20565,7 @@ fn raw_rewarm_ask(
     files: Vec<PathBuf>,
     mut room: u64,
     trace: bool,
+    late: Option<std::time::Duration>,
 ) -> Vec<MmapBytes> {
     let (mut asked, mut bytes, mut short) = (0u64, 0u64, 0u64);
     let mut maps = Vec::new();
@@ -20583,7 +20584,21 @@ fn raw_rewarm_ask(
             continue;
         }
         room -= missing;
-        let _ = crate::bytes::Bytes::advise_willneed(&map, 0, len);
+        match late.filter(|_| asked == 0) {
+            // A test's: the first file asked late (`ZInject::ask_first_late`).
+            Some(d) => {
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(d);
+                    if let Ok(m) = MmapBytes::open(&p) {
+                        let _ = crate::bytes::Bytes::advise_willneed(&m, 0, m.0.len());
+                    }
+                });
+            }
+            None => {
+                let _ = crate::bytes::Bytes::advise_willneed(&map, 0, len);
+            }
+        }
         asked += 1;
         bytes += missing;
         maps.push(map);
@@ -51769,7 +51784,7 @@ impl Maint {
                     }
                 }
                 if !raw.is_empty() {
-                    let _ = raw_rewarm_ask(&shared, raw, room, trace);
+                    let _ = raw_rewarm_ask(&shared, raw, room, trace, None);
                 }
             })
             .ok();
@@ -51852,7 +51867,7 @@ impl Maint {
     /// and ran no faster for the faults it saved. The files are asked as a
     /// rewarm asks them, within the group's room, on this thread, and waited
     /// for as the form files are (`z_join_asks`): a look every
-    /// `ASK_JOIN_POLL` until `HOT_RAW_RESIDENT` of what was asked is
+    /// `ASK_JOIN_POLL` until every file asked is `HOT_RAW_RESIDENT`
     /// resident, `ASK_JOIN_STALLS` looks with no page more, or
     /// `ASK_JOIN_CAP`. Counted (`ZCounts::raw_settles`, `raw_settle_ms`).
     fn z_raw_settle(&mut self) {
@@ -51866,24 +51881,34 @@ impl Maint {
         if files.is_empty() {
             return;
         }
-        let maps = raw_rewarm_ask(&self.shared, files, room, self.z_trace);
+        let late = self.opts.zpages_inject.as_ref().and_then(|i| i.late_ask());
+        let maps = raw_rewarm_ask(&self.shared, files, room, self.z_trace, late);
         if maps.is_empty() {
             return;
         }
         let t = std::time::Instant::now();
         let total: u64 = maps.iter().map(|m| m.0.len() as u64).sum();
-        let want = (total as f64 * HOT_RAW_RESIDENT) as u64;
-        let held = |maps: &[MmapBytes]| -> u64 {
-            maps.iter()
-                .map(|m| (resident_share(&m.0[..]) * m.0.len() as f64) as u64)
-                .sum()
+        // What the asked files hold, and whether each is back as the map
+        // after the wait takes one (`raw_map`): the wait ended once the
+        // asked bytes together were nine tenths resident, and a file still
+        // coming in then -- one partition of seven, or the ordered indexes
+        // a hosted runner read in last -- was left unmapped, resident a
+        // moment later and a fault at each first touch.
+        let look = |maps: &[MmapBytes]| -> (u64, bool) {
+            let (mut held, mut back) = (0u64, true);
+            for m in maps {
+                let share = resident_share(&m.0[..]);
+                held += (share * m.0.len() as f64) as u64;
+                back &= share >= HOT_RAW_RESIDENT;
+            }
+            (held, back)
         };
-        let (mut last, mut stalls) = (held(&maps), 0u32);
-        while last < want && t.elapsed() < ASK_JOIN_CAP && stalls < ASK_JOIN_STALLS {
+        let ((mut last, mut back), mut stalls) = (look(&maps), 0u32);
+        while !back && t.elapsed() < ASK_JOIN_CAP && stalls < ASK_JOIN_STALLS {
             std::thread::sleep(ASK_JOIN_POLL);
-            let now = held(&maps);
+            let (now, all) = look(&maps);
             stalls = if now > last { 0 } else { stalls + 1 };
-            last = now;
+            (last, back) = (now, all);
         }
         let ms = t.elapsed().as_millis() as u64;
         zfile::ZEvents::add(&self.shared.z.raw_settles, 1);

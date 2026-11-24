@@ -9193,6 +9193,10 @@ pub struct ZInject {
     /// test's files are a mebibyte and resident before the first look, so
     /// the wait is held to waiting, and to giving up, through this.
     pub asked_holds: AtomicU64,
+    /// The first file a settle's ask for the raw form's files names is
+    /// asked this many milliseconds late, from a thread of its own: a file
+    /// the kernel reads in after the others; 0 for none.
+    pub late_ask_ms: AtomicU64,
     /// What a conversion's build costs, nanoseconds, in place of the
     /// builds' measured wall a byte with its displacement
     /// (`Options::zpages_stride_convert`); 0 for the measured one. A move
@@ -9214,6 +9218,7 @@ impl Default for ZInject {
             records_resident: AtomicU64::new(u64::MAX),
             slack: AtomicU64::new(u64::MAX),
             asked_holds: AtomicU64::new(0),
+            late_ask_ms: AtomicU64::new(0),
             convert_price_ns: AtomicU64::new(0),
         }
     }
@@ -9237,6 +9242,20 @@ impl ZInject {
     /// read nothing resident.
     pub fn hold_asked(&self, looks: u64) {
         self.asked_holds.store(looks, Ordering::Release);
+    }
+
+    /// A settle's ask for the raw form's files names its first file
+    /// `ms` milliseconds late.
+    pub fn ask_first_late(&self, ms: u64) {
+        self.late_ask_ms.store(ms, Ordering::Release);
+    }
+
+    /// How late the first raw file is asked for, if at all.
+    pub(super) fn late_ask(&self) -> Option<Duration> {
+        match self.late_ask_ms.load(Ordering::Acquire) {
+            0 => None,
+            ms => Some(Duration::from_millis(ms)),
+        }
     }
 
     /// One held look taken, if any is left.

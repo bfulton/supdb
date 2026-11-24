@@ -6369,7 +6369,18 @@ hand, never carried from the morning's; a lever refuted by a count is
 counted again in the regime in front of it, the fault's price being the
 regime's and not the mechanism's; and resident is not mapped --
 `mincore` answers the first and `/proc/self/pagemap` the second, and a
-test of the second reads the second.
+test of the second reads the second. The settle's wait ended once the
+files it asked held nine tenths of their bytes together, and the map
+after it takes a file only where that file holds nine tenths of its
+own, so a file still coming in when the others had carried the sum --
+one partition of seven, here one run in four hundred beside a build, or
+the ordered indexes a hosted runner read in last -- was left unmapped and
+resident a moment later. The wait asks what the map asks now, every file
+asked at nine tenths, and its stall and cap still end it; the test asks
+its first file late through a seam (`ZInject::ask_first_late`), inside
+the stall limit, and the wait by the sum fails it every run. A wait and
+the step after it are written against one predicate, since the gap
+between a sum and its parts is exactly the state the step skips.
 
 **A reservation in a budget's arithmetic, read as pages the kernel would
 keep; and a model that took its tenant's bytes for a misfit.** The first
