@@ -798,6 +798,21 @@ divided by the loads had said before anything was built. Price a load by
 the latency the profile's self time over the loads implies, against a
 miss's, before building a lever on the miss.
 
+A load whose address is the arithmetic of another load's contents waits
+for that one, and a structure that keeps a length in its header pays a
+miss after the header's for every field the length places. The segment
+read of the mixes FASTER won was the slot, the record's header and then
+the value: laid on the read's instructions, 34 samples of 225 on the
+slot's load, 107 on the header's and 61 on the value's first load, two
+lines on, and five at most anywhere else. FASTER's record has its value
+at a fixed offset, so the core issues both its lines at once. The value's
+lines asked for as soon as the slot names the record -- the section's
+mean record length is the guess, and a wrong guess asks for a line too
+many or too few -- read the clean read pass a fifth to a third faster
+(`Options::point_record_ahead`, `docs/engine.md`, a record asked for at
+its slot). Before a lever on a read's misses, lay its samples on its
+loads and ask of each which earlier load its address waited for.
+
 A pass that reads bimodal across rounds is two shapes, not noise. The
 run keeper's lag pass at ten thousand keys read 2 µs a scan in four
 rounds and 15-36 in three, and the rounds split on the probe's own

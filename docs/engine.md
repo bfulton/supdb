@@ -818,6 +818,99 @@ ten and a hundred percent of the store. What FASTER keeps is the update
 beside a get of the same keys -- F and the scrambled D and F -- and the
 bursts, which update the whole store at the rate its log appends.
 
+#### A record asked for at its slot
+
+The segment read is three loads, each waiting on the one before: the hash
+slot, the record's header, and the value, whose place is the header's
+arithmetic on the key's length. Sampled over the scrambled D and F mixes
+and F at three hundred thousand keys (`SUPDB_LAG_MARK=1 perf record -e
+cpu-clock -F 4999 -k CLOCK_MONOTONIC` over `bench ab --arms
+supdb-heldnoframes,faster --size 300000 --reps 1 --passes
+load,read,mixes,mixes-scrambled`, at `9b29d26`, the samples of the mix
+thread inside the mixes' marks laid on `read_all_fixed_hashed`'s
+instructions), the slot's load took 34 of the read's 225 samples, the
+header's 107 and the first load from the value -- its last four bytes,
+two lines past the header for the suite's record of 124 bytes -- 61, and
+nothing else in the read took more than five. A record's lines past its
+first are asked for now as soon as the slot names it, out to the
+section's mean record length (`Options::point_record_ahead`,
+`FlatIndex::ask_record`), so the value's lines are fetched beside the
+header's. It costs 14 instructions a clean get and 9 over a written
+store (`point_ops supdb-heldnoframes 100000 1 zipf 1` against
+`supdb-heldnorecordahead`, callgrind on `phase_reads_clean` and
+`phase_reads_dirty`: 523 against 509, 812 against 803). Paired at
+`bb5da0f` (`pair.sh supdb supdb-norecordahead 300000 --passes
+load,read,scan,mixes,mixes-scrambled --reps 8`; the ask over the arm
+without it, the two sittings), the read pass read 1.18x and 1.31x, eight
+pairs of eight in the sitting whose scan pass, which the ask cannot
+reach, read level, and the mixes 1.04-1.44x but A, 0.88x and 0.95x and
+unresolved; under the held log (`supdb-heldnoframes` against
+`supdb-heldnorecordahead`, the same passes at four reps) the read pass
+read 1.27x and 1.34x and the scrambled B, C and F 1.20-1.69x. At ten
+thousand keys, where the records are in the core's cache and the ask can
+only cost, nothing resolved either way.
+
+#### What the scans leave the writes
+
+Paired against FASTER over the row's whole order, the held arm lost cells
+it had held level in the pairing above, which ran no scan pass. Ours over
+FASTER's at three hundred thousand keys, the geometric mean of two
+sittings (`pair.sh supdb-heldnoframes faster 300000 --reps 6 --passes
+load,read,read-threaded,mixes,mixes-scrambled`, and the same with
+`scan,scan-threaded` before the mixes, at `bb5da0f`):
+
+| | no scan pass | scan passes first |
+|---|---|---|
+| A | 0.99x | 0.72x |
+| B | 0.92x | 0.85x |
+| C | 0.95x | 0.81x |
+| D | 1.03x | 1.00x |
+| F | 0.76x | 0.64x |
+| scrambled A, D, F | 0.94x, 0.88x, 0.87x | 0.84x, 0.81x, 0.80x |
+
+Our rates fell between the two and FASTER's did not: A from 3.4M a second
+to 2.5M, F from 2.75M to 2.33M, C from 5.75M to 5.0M, in both orders. The
+same arm without the block cache, after the same scan passes
+(`supdb-heldnfnocache`), read A 0.99x, C 1.03x and the scrambled A 1.19x,
+so what the scans leave is the block cache and its upkeep, which files
+every write into the blocks' forms for the scans to come. Natively a
+probe of the shape puts the cost on the writes (`POINT_OPS_SCAN=1
+point_ops ARM 300000 2 zipf-plain 6`, eight reps alternated, medians):
+an update costs 258 ns with the cache live after a scan pass, 165 ns
+before any scan, 156 ns with the cache off and 158 ns in FASTER. Counted
+under callgrind the filing adds 23 instructions to an update
+(`phase_updates`, 620 against 597), so the 93 ns is waiting and not
+work: the upkeep thread, alert while reads are around
+(`Options::upkeep_alert`), files each batch within a fraction of a
+millisecond, reading the entries, the log and the values the writer is
+about to write again, and every line it reads is one the writer's next
+store to it has to take back. Backed off as before the alert
+(`supdb-heldnoalert`) an update reads 166 ns; with the filing on the
+writer (`supdb-heldinline`) 1,174, since the work itself is about 8,200
+instructions an update -- 4,400 of them the fill, a form for every block
+a write overlays that has none, and 2,500 the settle. The shipping arm,
+whose commits sync, pays the same tax inside an fdatasync and reads
+level for the back-off over the row's order (`pair.sh supdb
+supdb-noalert 300000 --reps 6`): A 1.08x, E 0.96x and the scrambled E
+0.91x, the ones the alert is for. The read-only C falling after the
+scans is not this: its gets count the same instructions either way and
+make no syscall, and in the probe a get read 104 ns with the scan pass
+and without it, so that cell is open.
+
+What the probe's reads over a written store say beside it is a second
+gap, of instructions. Read class by class over a few thousand keys, every
+line cached (`POINT_OPS_CLASSES=1 POINT_OPS_LAND=1 point_ops ARM 100000 1
+zipf-plain 1` under callgrind toggled on `phase_class_live`, `_piece` and
+`_partition`), a get the live table answers counts 785 instructions, one
+a piece answers 918 and one the partition answers under the live table and
+a piece 888, where FASTER counts 416 for each and the clean store's get
+523. The live table's hit is `MemTable::probe` 126, the arena's slices 108
+(two bounds checks and two assertions a slice, four or five slices a
+get), the FNV hash about 90, the partition's slot and the pieces' filters
+asked ahead about 95 -- for a read the live table ends -- and the pin and
+its release 76. The packed-record prototype's get counts 175
+(`supdb_bench::proto::Logged`), harness included.
+
 #### Beside FASTER out of core
 
 A store larger than memory is what FASTER's log is made for, and the
