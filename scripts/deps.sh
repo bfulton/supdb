@@ -12,8 +12,10 @@
 # rust      the toolchain rust-toolchain.toml names, with rustfmt, clippy
 #           and the wasm32 and macOS targets (every group); the one
 #           definition is scripts/toolchain.sh, which CI calls too
-# libclang  bindgen's libclang, for the comparators (bench, quick); the one
-#           definition is bench/scripts/libclang.sh, which CI calls too
+# libclang  bindgen's libclang, for the comparators (bench, quick): a check
+#           that the host has one with clang's own headers, and an install
+#           only where it has not; the one definition is
+#           bench/scripts/libclang.sh, which CI calls too
 # faster    FASTER's sources at the pinned commit and the libraries they
 #           link, for the suite's `faster` arm (bench, quick; Linux x86-64
 #           alone); the one definition is bench/scripts/faster.sh
@@ -26,16 +28,8 @@ cd "$(dirname "$0")/.."
 
 groups="${*:-rust libclang faster}"
 say() { printf '\n== %s ==\n' "$1"; }
-# A container runs as root and may have no sudo; anywhere else, ask for it.
-if [ "$(id -u)" = 0 ]; then root=; else root=sudo; fi
-apt_install() {
-  if ! command -v apt-get >/dev/null; then
-    echo "no apt-get here; install by hand: $*" >&2
-    exit 1
-  fi
-  $root apt-get update -qq >/dev/null
-  $root apt-get install -y -qq --no-install-recommends "$@" >/dev/null
-}
+# One definition of an install, which the suite's set-up scripts call too.
+apt_install() { sh scripts/apt.sh "$@"; }
 
 for g in $groups; do
   case "$g" in
@@ -49,38 +43,17 @@ for g in $groups; do
       ;;
     libclang)
       say libclang
-      # The script installs libclang-dev where nothing unversioned exists.
-      # On Linux that puts libclang.so where clang-sys searches by itself,
-      # so a build needs no variable afterwards and none is kept. macOS
-      # needs its variables at every build (an rpath in RUSTFLAGS), so
-      # there the line to eval is printed.
-      found=$(sh bench/scripts/libclang.sh)
-      echo "$found"
-      if [ "$(uname -s)" = Darwin ]; then
-        echo 'before building: eval "$(sh bench/scripts/libclang.sh)"'
-      fi
-      # clang-sys's build script declares nothing to rerun on, so the
-      # directory it found libclang in at the first build stays in its
-      # cached output for good; once that directory is gone, every later
-      # build fails at the link of RocksDB's build script ("unable to find
-      # library -lclang"). Such an output is cleaned, and the next build
-      # finds libclang afresh and compiles RocksDB again. The output is
-      # cleaned in the profile it was built under, the directory it sits
-      # in (`debug` is the `dev` profile's), since a clean names one.
-      for out in bench/target/*/build/clang-sys-*/output; do
-        [ -f "$out" ] || continue
-        dir=$(echo "$out" | cut -d/ -f3)
-        profile=$dir
-        [ "$dir" = debug ] && profile=dev
-        for d in $(sed -n 's/^cargo:rustc-link-search=\(native=\)\{0,1\}//p' "$out"); do
-          if ! ls "$d"/libclang*.so* >/dev/null 2>&1 \
-            && ! ls "$d"/libclang*.dylib >/dev/null 2>&1; then
-            echo "stale: $out names $d, which holds no libclang; cleaning clang-sys ($profile)"
-            (cd bench && cargo clean -p clang-sys --profile "$profile") || exit 1
-            break
-          fi
-        done
-      done
+      # bindgen loads libclang when RocksDB's build script runs
+      # (`bindgen-runtime`, bench/Cargo.toml) and finds it by itself, so a
+      # build needs no variable on either system and none is kept; the
+      # script says whether the host has what that load needs and installs
+      # it only where it has not. While the build script linked libclang
+      # instead, clang-sys kept the directory it had first found one in for
+      # as long as its output was cached, and a build whose directory had
+      # since gone failed at RocksDB's build script, "unable to find library
+      # -lclang"; this group cleaned such an output. A library opened by
+      # its path at run time leaves no directory in any output.
+      sh bench/scripts/libclang.sh
       ;;
     faster)
       say faster

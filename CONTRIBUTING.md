@@ -11,7 +11,8 @@
 Rust stable with `rustfmt` and `clippy`; the browser reader also wants the
 `wasm32-unknown-unknown` target (`web/build.sh`). The `bench` group builds
 the comparators, which is a ten-minute C++ build the first time and needs
-libclang; `bench/scripts/libclang.sh` names it when cargo cannot.
+libclang; `bench/scripts/libclang.sh` checks the host has one and installs
+it where it has not.
 `scripts/deps.sh` checks for all three and installs what is missing, and
 `sh scripts/deps.sh profile` adds perf and valgrind. CI calls the same
 check script with the same group names, so what passes here passes there.

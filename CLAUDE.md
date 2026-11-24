@@ -60,15 +60,40 @@ caller. Nothing is exempt from the format gate, and everything holds to
 what is missing and ending in an `all deps ready` line to gate on; run it
 first in a fresh container, which has the stable it was made with and not
 the toolchain `rust-toolchain.toml` names, and libclang only as versioned
-files. It names libclang through `bench/scripts/libclang.sh`,
-the one definition CI uses, and keeps no variable. clang-sys's build
-script declares nothing to rerun on, so the directory it found libclang
-in at the first build stays in its cached output for good: a
-`LIBCLANG_PATH` pointed by hand at a symlink in a scratch directory
-built the comparators once, and with the directory gone the next build
-failed at RocksDB's build script, `unable to find library -lclang`.
-`deps.sh` cleans an output that names a directory with no libclang in
-it.
+files. That is enough for the suite's build, which loads libclang when
+RocksDB's build script runs (`bindgen-runtime`, `bench/Cargo.toml`):
+`bench/scripts/libclang.sh`, the one definition CI uses, checks that the
+host has one with clang's own headers beside it and installs a package
+only where it has not, and no variable is kept. The build script linked
+libclang for as long as the suite had turned the `rocksdb` crate's
+defaults off for its compression libraries, the run-time load being one
+of them: the linker wants the unversioned `libclang.so` a -dev package
+ships, so every CI job and every fresh container installed one with apt,
+twenty seconds on a good day and five minutes a job on a slow mirror, and
+clang-sys kept the directory it had first found it in for as long as its
+output was cached, so that a `LIBCLANG_PATH` pointed by hand at a symlink
+in a scratch directory built the comparators once and, the directory
+gone, failed the next build at RocksDB's build script, `unable to find
+library -lclang`. A dependency's defaults turned off for one of them are
+read for the rest: the one dropped here was the reason a host needed
+nothing.
+
+What a host still lacks is installed by `scripts/apt.sh`, the one
+definition of an install for `scripts/deps.sh`, the suite's set-up
+scripts and the workflows: with the package lists the host has, and
+fresh ones only where that fails. Every caller had fetched the lists
+first, thirteen megabytes on a hosted x64 runner ahead of the two thirds
+of a megabyte the `faster` arm's three libraries are, and on a day the
+mirror was slow that step ran eleven seconds in one x64 job and three to
+four minutes in others started beside it, and held one for half an hour
+until the run was cancelled, with nothing in its log: the scripts sent
+apt's output nowhere. The helper says in one line which try installed
+and in how many seconds, and prints what apt said where an install
+fails; the lists are not all of a slow mirror's price, and `cross-arm`'s
+sixty megabytes of cross compiler took eleven minutes in one run and
+twelve seconds in the next. It installs no recommended extras, so a
+package a job needs and another only recommends is named, as `cross-arm`
+names the target's C library.
 
 `sh scripts/check.sh` runs every group -- build, test, stride, lint, wasm, bench --
 and CI calls the same script with the same names, so a green run here is a
@@ -223,9 +248,22 @@ the suite's build in it, and reported both done, while every job built
 RocksDB from its sources twice, half of a test leg's time. It was found
 in the step's own log, which prints the directories it caches, on the
 day somebody read one. `bench/scripts/workflows.sh` holds a cache's
-target to a workspace's own now, and the libclang directory is in the
-cache's key, since a cached clang-sys output naming a directory since
-gone is the failure `scripts/deps.sh` cleans and a workflow does not. A
+target to a workspace's own now. A cached build names nothing of the
+host's libclang, which is loaded as RocksDB's build script runs, so the
+key carries nothing of it.
+Once the step cached the build, the build's size was the next thing
+nobody had read: the action keys a cache by its job's name, so every job
+that builds the suite's release binary kept a copy of the same
+dependencies, and one round of the workflows that run by hand saved that
+build four times over, took the repository past GitHub's ten gigabytes,
+and had two caches a pull request was using evicted, since GitHub evicts
+by last read whoever's the cache is. The jobs that build that binary and
+nothing else share one key now (`shared-key: bench`), which the same
+script holds them to and holds every other job off, since a job that
+restores a key whole saves nothing and what it alone builds would never
+be cached under it; and `pr-caches.yml` deletes a pull request's caches
+at its close, which no other pull request can read and which counted
+against the limit for a week after. A
 second definition of "the checks" is how the next one of those starts.
 
 A change to an engine default lands only once `sh scripts/check.sh`
@@ -2193,7 +2231,16 @@ upkeep, which lends the writer's tables to the thread: a counter read takes
 the upkeep home, waiting for a pass in flight and taking back a commit's
 batch the pass has not begun, so the count was of tables nothing had been
 filed into, one run in thirty; the test runs the commit's own fill inline,
-as its siblings that count what a commit filed already did. The rule is the
+as its siblings that count what a commit filed already did. It came again
+as walks counted store against store: the test of the bounds walk by the
+heads (`Options::bounds_by_heads`) holds what one store's walks placed and
+read to the records the other's read, and near reads one of each store's
+two walks was the thread's, the snapshot's after the round's commit,
+which the seal takes the upkeep back ahead of where the thread has not
+begun it -- two walks in one store and one in the other, once on a
+hosted x64 runner and one run in forty beside seven others, with the
+counts at each stage printed to say whose walk was missing, and none of
+two hundred and forty with the commit's fill inline. The rule is the
 one above, applied to two more states a test cannot see it needs: the
 second a store was finished in, and which side of a hand-off a counter is
 read from. A flake whose trigger is a phase is reproduced by choosing the
