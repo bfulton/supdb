@@ -11055,6 +11055,24 @@ impl AlignedWriter {
         self.write_buf_with(true)
     }
 
+    /// The buffer written as a whole piece, or, where the write fails and
+    /// the writer defers, held with every byte after it for the next sync:
+    /// the writer is stuck (`defer`), and the rest of the write that filled
+    /// the piece is taken whole behind it. Out of line, so that `write`'s
+    /// loop has one call that returns an answer at its boundary, as it had
+    /// before a failure could be held: with the arm that defers written
+    /// into the loop, the loop's latch had a path through two calls to
+    /// rejoin, and the loop reloaded the write's length from the stack at
+    /// every turn for it, an instruction a write (`write_all`, the seal
+    /// probe of `scripts/cost.sh`).
+    #[inline(never)]
+    fn write_piece(&mut self) -> std::io::Result<()> {
+        match self.write_buf() {
+            Ok(()) => Ok(()),
+            Err(e) => self.defer(e),
+        }
+    }
+
     /// `write_buf`, with the writeback hint or without: the head a stream
     /// pushes out ahead of its first piece (`stream_hash`) is hinted with
     /// that piece, as the buffer path's head is, and not on its own -- a
@@ -11574,12 +11592,7 @@ impl std::io::Write for AlignedWriter {
             self.buf.extend_from_slice(&rest[..take]);
             rest = &rest[take..];
             if self.buf.len() == self.to_boundary() {
-                if let Err(e) = self.write_buf() {
-                    // Held, the piece and every byte after it, for the
-                    // next sync: the writer is stuck (`defer`), and the
-                    // rest of this write is taken whole below.
-                    self.defer(e)?;
-                }
+                self.write_piece()?;
             }
         }
         Ok(data.len())

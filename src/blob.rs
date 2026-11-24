@@ -646,6 +646,22 @@ fn open_head<B: Bytes>(src: &B) -> Result<Super> {
 /// passed it, cut at the end. Shared by the open's verification walk
 /// (`BlobOptions::read_ahead`) and the merge's second pass
 /// (`Options::merge_read_ahead`).
+/// A window of a section asked for ahead of a walk over it, where the
+/// window's first page is not resident: the bytes the source says it asked
+/// for. Out of line: written into the open's walk of the key section's
+/// pieces (`verify_pieces_with`), a paged mapping's two answers
+/// (`Paging::resident`, `Paging::willneed`) were two calls through a
+/// pointer in the loop, on an arm a plain store's open takes once a window
+/// at most, and the loop kept two of its values on the stack for them at
+/// every piece, two instructions a piece over the main line's build.
+#[inline(never)]
+fn ask_window<S: Bytes>(src: &S, from: u64, to: u64) -> usize {
+    if src.resident_at(from) == Some(true) {
+        return 0;
+    }
+    src.advise_willneed(from, (to - from) as usize)
+}
+
 pub fn ahead_span(asked_to: u64, end: u64, off: u64, window: u64) -> Option<(u64, u64)> {
     if asked_to >= end || off.saturating_add(window / 2) < asked_to {
         return None;
@@ -1115,12 +1131,10 @@ impl<B: Bytes> Blob<B> {
                             let off = sb.key_off.saturating_add(a as u64);
                             if let Some((from, to)) = ahead_span(asked_to, end, off, window) {
                                 asked_to = to;
-                                if src.resident_at(from) != Some(true) {
-                                    let n = src.advise_willneed(from, (to - from) as usize);
-                                    if n > 0 {
-                                        open_ahead.0 += 1;
-                                        open_ahead.1 += n as u64;
-                                    }
+                                let n = ask_window(&src, from, to);
+                                if n > 0 {
+                                    open_ahead.0 += 1;
+                                    open_ahead.1 += n as u64;
                                 }
                             }
                         },

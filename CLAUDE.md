@@ -9667,6 +9667,35 @@ a move by function with no source behind it is read against the
 profile's unit of optimization before a cause is looked for in the
 function.
 
+It came again with the build. The merge of main's #27 brought the
+suite's build definition (`bench/.cargo/config.toml`: x86-64-v3, where
+the count's probes had been built at the default level), the count gave
+the base the head's file, and against main's head built so two functions
+of this branch read over main's by instructions their sources had not
+gained, where the count before, at the default level, had read them
+level. The writer's `write_all`, one instruction a key in the seal
+probe: the arm that holds a failed piece for the next sync called
+`defer` and rejoined the loop, where main's `write_buf()?` leaves it,
+and the loop's latch, which that path reaches with a register
+clobbered, reloaded the write's length from the stack at every turn;
+the piece's write and its defer are one call out of line now
+(`AlignedWriter::write_piece`), which returns an answer as main's call
+does, and the function counts main's to the instruction. And the open's
+walk of a key section's pieces (`flatindex::verify_pieces_with`), two
+instructions a 16 KiB piece in every probe that opens a segment: the
+closure the walk calls at each piece inlined the paged mapping's
+answers to its ask ahead, two calls through a pointer on an arm a plain
+store takes once a window at most, and the loop kept two values on the
+stack for them; the ask is a function of its own (`blob::ask_window`),
+and the walk counts one a piece under main's. Both were read off each
+build's instructions summed by mnemonic and laid side by side
+(`--dump-instr=yes`), the callers' call counts first, since the same
+count of calls with more instructions a call is the code and more calls
+is the caller. A change to the build definition is a change of
+compiler: the count is taken again under it, every function's gain read
+against the count before, and a base built without the head's
+definition counts the flags.
+
 **One handle's setup, written into the step every handle's constructor
 ends in.** The settle's rest under a cipher wanted a caller's handle to
 look as the writer's does: a byte among its fields and its forms' word
