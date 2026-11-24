@@ -915,10 +915,16 @@ The suite resolves nothing for it: at three hundred thousand keys under the
 held log and under the durable arm, and at ten thousand under the durable,
 each cell that moved by a tenth moved with the arms' order and not with the
 option (`pair.sh supdb-heldnoframes supdb-heldindexzeropage 300000 --reps
-6`, and `supdb supdb-indexzeropage` at 300000 and 10000). It is on by the
-count, since it replaces a fault on the zero page, a copy-on-write fault
-and its flush with one population of pages every index touches at its
-first fill anyway. The rest of the tax is not known. Filing in batches of
+6`, and `supdb supdb-indexzeropage` at 300000 and 10000). The suite's mixes take
+them too, counted over each mix beside its time by kind
+(`SUPDB_MIX_KINDS=1 bench ab --arms supdb-heldnoframes,supdb-heldindexzeropage
+--size 300000 --reps 2 --passes load,read,scan,scan-threaded,mixes`, at
+`b89b1ff`): A 41-64 a mix and F 45-87 unpopulated, 0-6 and 20-28
+populated, the other mixes none -- at the probe's price a tenth of those
+mixes' commits, under what a pairing resolves; the twenty or so left in F
+are not yet laid to a cause. It is on by the count, since it replaces a
+fault on the zero page, a copy-on-write fault and its flush with one
+population of pages every index touches at its first fill anyway. The rest of the tax is not known. Filing in batches of
 a hundredth of the store (`supdb-heldbatch1`, `Options::upkeep_batch_pct`)
 read E 1.13x and 1.12x for whichever arm was listed second, the rest by
 order too (`pair.sh supdb-heldnoframes supdb-heldbatch1 300000 --reps 6`).
@@ -936,6 +942,43 @@ get), the FNV hash about 90, the partition's slot and the pieces' filters
 asked ahead about 95 -- for a read the live table ends -- and the pin and
 its release 76. The packed-record prototype's get counts 175
 (`supdb_bench::proto::Logged`), harness included.
+
+Four of those layers were work done twice or found again at every read,
+and went without changing what a read does: the probe hands back the
+entry its key compare decoded, where the read decoded it again
+(`MemTable::probe_entry`); a chunk's header and value come from one
+lookup of the arena's block, where each was a slice of its own
+(`ByteArena::chunk`); the slice is inlined; and a segment keeps its slot
+table's address from its open, so the ask for the partition's slot is an
+add and a mask where finding the section through the blob took
+thirty-two instructions (`Seg::slot_ask`). Counted the same way at the
+three classes (`POINT_OPS_CLASSES=1 POINT_OPS_LAND=1 point_ops
+supdb-heldnoframes 100000 1 zipf-plain 1` under callgrind toggled on
+`phase_class_live`, `_piece` and `_partition`), a get the live table
+answers went from 758.7 instructions at `b89b1ff` to 675.7, one a piece
+answers from 886.1 to 844.1 and one the partition answers from 849.3 to
+808.2.
+
+The live table's share of the mixes' gets is counted now beside the
+paths (`SUPDB_MIX_COUNTERS=1`, `gets ... live` on the `mixcounters`
+line, `Reader::point_live_ended_reads`): of the held arm's gets at three
+hundred thousand keys a tombstone in the live chain ended 60% of A's, 58%
+of F's and 39% of B's, 21-32% of the scrambled A, B and F, and 1-3% of D
+and the scrambled C and D (`bench ab --arms supdb-heldnoframes,supdb-held
+--size 300000 --reps 1 --passes
+load,read,read-threaded,scan,scan-threaded,mixes,mixes-scrambled`). A
+put leaves a tombstone under its value, so a read of a key written since
+the table's last seal ends there, whatever the store below holds. A and
+B, with no piece standing, take the two-source read, which asks the live
+table first already; F and the scrambled mixes, with pieces, took the
+placed read, which found the partition and asked for its slot and the
+pieces' filters before it probed the live table. Asked first
+(`Options::point_live_first`), the live table ends the read before any
+of that: 598.7 instructions a get it answers, against 676.7 in the same
+binary with the partition placed first (`supdb-heldlivelast`), and 862.1
+and 826.2 a get a piece or the partition answers against 851.1 and
+815.2, the asks for those reads following the live probe instead of
+preceding it.
 
 #### Beside FASTER out of core
 

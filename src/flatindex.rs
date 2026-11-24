@@ -65,6 +65,10 @@ pub(crate) const REC_VERSION: u32 = VERSION;
 pub(crate) const HEADER: usize = 192;
 /// Bytes per hash slot: a tag in the top eight bits, a record offset below.
 const SLOT: usize = 8;
+
+/// A hash slot's bytes, for an ask of a slot's line from outside the
+/// index (`FlatIndex::slot_table`).
+pub(crate) const SLOT_BYTES: usize = SLOT;
 /// The most of a record a point read asks for ahead of its header
 /// (`FlatIndex::ask_record`): four lines, past which a value is read in
 /// order and the core's own prefetch follows it.
@@ -2020,6 +2024,15 @@ impl FlatIndex {
         f: impl FnOnce(&[Ext], &'a [u8]) -> R,
     ) -> Option<R> {
         self.with_lookup_hashed(sec, key, hash_of(key), f)
+    }
+
+    /// The address of the hash region's first slot in `sec`, the section
+    /// this index was parsed from, and the mask a hash takes a slot by:
+    /// what `slot_pos` computes from at every ask, taken once by a
+    /// segment for its reads' asks (`Seg::prefetch_slot`). `None` for an
+    /// index whose hash region is not inside the section.
+    pub fn slot_table(&self, sec: &[u8]) -> Option<(usize, usize)> {
+        (self.hash.1 <= sec.len()).then(|| (sec.as_ptr() as usize + self.hash.0, self.mask))
     }
 
     /// Where in the section the first slot a lookup of hash `h` reads

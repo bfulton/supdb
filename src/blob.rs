@@ -1717,6 +1717,23 @@ impl<B: Bytes> Blob<B> {
         idx.lookup_full_hashed(sec, key, h).map(|(e, _)| e)
     }
 
+    /// The key index's slot table as an address and a mask
+    /// (`FlatIndex::slot_table`), for a reader that asks for slots' lines
+    /// at every read and would otherwise find the section each time.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn slot_table(&self) -> Option<(usize, usize)> {
+        let (sec, idx) = self.flat()?;
+        idx.slot_table(sec)
+    }
+
+    /// The address of the first hash slot a lookup of index hash `h`
+    /// reads, as `prefetch_slot` finds it, for a test of a cached one.
+    #[cfg(all(test, not(target_family = "wasm")))]
+    pub(crate) fn slot_addr(&self, h: u64) -> Option<usize> {
+        let (sec, idx) = self.flat()?;
+        Some(sec.as_ptr() as usize + idx.slot_pos(sec.len(), h)?)
+    }
+
     /// A hint to fetch the line of the first hash slot a lookup of index
     /// hash `h` reads; nothing is read.
     #[cfg(not(target_family = "wasm"))]

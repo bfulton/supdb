@@ -1545,6 +1545,18 @@ pub struct Options {
     /// `read_hash_once`, whose word names the lines. `supdb-readnoahead`
     /// and `supdb-ingestreadnoahead` ask for the memtable's slot alone.
     pub read_lines_ahead: bool,
+    /// The read that places its sources (`Reader::read_placed`) asks the
+    /// live table before it finds the key's partition and asks for its
+    /// lines (`read_lines_ahead`), and finds them only where the live
+    /// table's chain did not end the read: a put leaves a tombstone under
+    /// its value, so a read of a key the table has written since its last
+    /// seal ends there, three in five of the mixes A and F at three
+    /// hundred thousand keys under the held log and a fifth to a third of
+    /// the scrambled A, B and F (`SUPDB_MIX_COUNTERS`, `gets ... live`).
+    /// Off, the partition and the asks come first for every read, the
+    /// asks' lead the live probe: `supdb-livelast`, and
+    /// `supdb-heldlivelast` under the held log with no frames.
+    pub point_live_first: bool,
     /// A point read or a count over a store with tombstones reads each
     /// source once: the pass that finds the newest tombstone, newest source
     /// first, keeps what it found of each source it probed -- the live
@@ -7310,6 +7322,7 @@ impl Default for Options {
             point_lone: true,
             point_layers_lean: true,
             read_lines_ahead: true,
+            point_live_first: true,
             read_probes_once: true,
             point_via_ord: false,
             zpages: ZPages::Auto,
@@ -9852,6 +9865,14 @@ struct Seg {
     /// values alone come to where its keys are one width, as the stride
     /// form asks (`Seg::stride_bytes`).
     key0_len: u32,
+    /// The key index's slot table, the address of its first slot and the
+    /// mask a hash takes a slot by (`Blob::slot_table`), or zeros for an
+    /// index without one: taken at the open, so a read's ask for its slot
+    /// (`Seg::prefetch_slot`) is an add and a mask where finding the
+    /// section through the blob at every read was thirty-two instructions
+    /// of a get. An address and not a pointer: the mapping lives as long
+    /// as the segment, and a hint faults on no address anyway.
+    slot_ask: [usize; 2],
     /// Reads of the raw form while the hot-raw policy holds this partition
     /// there (`zfile::DECLINED_HOT_RAW`), one in sixteen per thread
     /// (`Seg::hot_read`): the partition's heat, as a form file's opens are
@@ -13446,6 +13467,7 @@ impl Seg {
         if advise_ord {
             ord.advise_random();
         }
+        let slot_ask = blob.slot_table().map_or([0, 0], |(a, m)| [a, m]);
         // `pcs-` is a range-ALIGNED L0 piece: a seal split at the live
         // partition boundaries, so it carries a fence like a partition and
         // overlaps only the pieces of its own range. That alignment is what
@@ -13491,6 +13513,7 @@ impl Seg {
                 z_drop_noted: std::sync::atomic::AtomicBool::new(false),
                 z_stride_no: std::sync::atomic::AtomicU8::new(0),
                 key0_len,
+                slot_ask,
                 z_rebuilds: std::sync::atomic::AtomicU8::new(0),
                 z_retry: std::sync::Mutex::new(None),
                 z_backoff: AtomicU64::new(0),
@@ -13539,6 +13562,7 @@ impl Seg {
                 z_drop_noted: std::sync::atomic::AtomicBool::new(false),
                 z_stride_no: std::sync::atomic::AtomicU8::new(0),
                 key0_len,
+                slot_ask,
                 z_rebuilds: std::sync::atomic::AtomicU8::new(0),
                 z_retry: std::sync::Mutex::new(None),
                 z_backoff: AtomicU64::new(0),
@@ -13579,6 +13603,7 @@ impl Seg {
             z_drop_noted: std::sync::atomic::AtomicBool::new(false),
             z_stride_no: std::sync::atomic::AtomicU8::new(0),
             key0_len,
+            slot_ask,
             z_rebuilds: std::sync::atomic::AtomicU8::new(0),
             z_retry: std::sync::Mutex::new(None),
             z_backoff: AtomicU64::new(0),
@@ -13735,8 +13760,28 @@ impl Seg {
     fn prefetch_probe(&self, fnv: u64) {
         match &self.bloom {
             Some(b) => b.prefetch_fnv(fnv),
-            None => self.raw().prefetch_slot(fnv),
+            None => self.prefetch_slot(fnv),
         }
+    }
+
+    /// A hint to fetch the line of the first hash slot a lookup of the
+    /// key with FNV word `fnv` reads, by the address the open took
+    /// (`slot_ask`); nothing is read, and nothing is asked of an index
+    /// without a slot table.
+    #[inline]
+    fn prefetch_slot(&self, fnv: u64) {
+        if let Some(a) = self.slot_addr(fnv) {
+            prefetch_lines(a as *const u8, crate::flatindex::SLOT_BYTES);
+        }
+    }
+
+    /// The address of the first hash slot a lookup of the key with FNV
+    /// word `fnv` reads, by the slot table the open took; `None` for an
+    /// index without one.
+    #[inline(always)]
+    fn slot_addr(&self, fnv: u64) -> Option<usize> {
+        let [base, mask] = self.slot_ask;
+        (base != 0).then(|| base + ((fnv as usize) & mask) * crate::flatindex::SLOT_BYTES)
     }
 
     /// Could this segment hold anything at or after `from`?
@@ -14677,7 +14722,41 @@ impl ByteArena {
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.add(w), bytes.len()) };
     }
 
+    /// Anyone: a memtable chunk's header at `off` (`CHUNK_HDR` bytes: the
+    /// previous chunk and the value's length) and the room after it in
+    /// its block, from one block lookup, where a slice for the header and
+    /// another for the value were two. A chunk is one reservation, and a
+    /// reservation never straddles a block (`reserve`), so a value the
+    /// header names is in the header's block; `ArenaChunk::value` holds it
+    /// to the room.
+    #[inline]
+    fn chunk(&self, off: usize) -> ArenaChunk<'_> {
+        let b = off >> self.shift;
+        let w = off & (self.block_len() - 1);
+        let p = self.blocks[b].load(AtomicOrdering::Acquire);
+        assert!(
+            !p.is_null(),
+            "memtable arena: an offset past what was published"
+        );
+        let room = self.caps[b]
+            .load(AtomicOrdering::Acquire)
+            .checked_sub(w + CHUNK_HDR)
+            .expect("memtable arena: a read past its block");
+        // SAFETY: inside the block, as checked: header bytes the writer
+        // wrote before publishing the offset that names them.
+        let hdr = unsafe { std::slice::from_raw_parts(p.add(w), CHUNK_HDR) };
+        ArenaChunk {
+            prev: u64::from_le_bytes(hdr[..8].try_into().expect("eight bytes")),
+            len: u32::from_le_bytes(hdr[8..].try_into().expect("four bytes")),
+            // SAFETY: the header's end, inside the block.
+            value: unsafe { p.add(w + CHUNK_HDR) },
+            room,
+            _arena: std::marker::PhantomData,
+        }
+    }
+
     /// Anyone: published bytes at `off`.
+    #[inline]
     fn slice(&self, off: usize, len: usize) -> &[u8] {
         let (p, w) = self.block(off, len);
         // SAFETY: inside a block that lives as long as the arena, bytes
@@ -14703,6 +14782,30 @@ impl ByteArena {
 
     fn used(&self) -> usize {
         self.used.load(AtomicOrdering::Relaxed)
+    }
+}
+
+/// A chunk's header as `ByteArena::chunk` read it, with where its value
+/// starts and the bytes its block has from there.
+struct ArenaChunk<'a> {
+    prev: u64,
+    len: u32,
+    value: *const u8,
+    room: usize,
+    _arena: std::marker::PhantomData<&'a ByteArena>,
+}
+
+impl<'a> ArenaChunk<'a> {
+    /// The value the header's length names; not for a tombstone, whose
+    /// length is no value's.
+    #[inline]
+    fn value(&self) -> &'a [u8] {
+        let len = self.len as usize;
+        assert!(len <= self.room, "memtable arena: a read past its block");
+        // SAFETY: inside the chunk's block, as checked; bytes the writer
+        // wrote with the header, before publishing the offset that names
+        // them.
+        unsafe { std::slice::from_raw_parts(self.value, len) }
     }
 }
 
@@ -16632,20 +16735,18 @@ impl MemTable {
         let mut at = MemTable::head(e);
         let mut n = 0;
         while at != NO_CHUNK {
-            let hdr = self.vals.slice(at as usize, CHUNK_HDR);
-            let prev = u64::from_le_bytes(hdr[..8].try_into().expect("eight bytes"));
+            let c = self.vals.chunk(at as usize);
             if at < wm {
-                let len = u32::from_le_bytes(hdr[8..].try_into().expect("four bytes"));
-                if len == TOMB_LEN {
+                if c.len == TOMB_LEN {
                     return Some((n, true));
                 }
                 if n == LIVE_SMALL {
                     return None;
                 }
-                buf[n].write(self.vals.slice(at as usize + CHUNK_HDR, len as usize));
+                buf[n].write(c.value());
                 n += 1;
             }
-            at = prev;
+            at = c.prev;
         }
         Some((n, false))
     }
@@ -16713,9 +16814,9 @@ impl MemTable {
         if self.ordered {
             return self.get(key, upto);
         }
-        self.probe(hash, key)
-            .filter(|&i| i < upto)
-            .map(|i| self.entry(i))
+        self.probe_entry(hash, key)
+            .filter(|&(i, _)| i < upto)
+            .map(|(_, e)| e)
     }
 
     /// The entry number holding `key`, if the table has it among the
@@ -16797,6 +16898,14 @@ impl MemTable {
     }
 
     fn probe(&self, hash: u64, key: &[u8]) -> Option<usize> {
+        self.probe_entry(hash, key).map(|(id, _)| id)
+    }
+
+    /// `probe` with the entry its key compare decoded, which is what a
+    /// read takes next: decoded once where a read that took the number
+    /// decoded it again, twenty-one instructions of a get the live table
+    /// answers (`bench/examples/point_ops.rs`, `POINT_OPS_CLASSES=1`).
+    fn probe_entry(&self, hash: u64, key: &[u8]) -> Option<(usize, Entry<'_>)> {
         let idx = self.index()?;
         let mut i = slot_of(hash, idx.mask);
         loop {
@@ -16809,7 +16918,7 @@ impl MemTable {
                 let id = ((s & 0xffff_ffff) - 1) as usize;
                 let e = self.entry(id);
                 if crate::flatindex::key_eq(self.key_of(e), key) {
-                    return Some(id);
+                    return Some((id, e));
                 }
             }
             i = (i + 1) & idx.mask;
@@ -22338,6 +22447,10 @@ pub struct Reader {
     /// Of `layer_reads`, the ones `read_placed` answered
     /// (`Options::point_layers_lean`).
     placed_reads: std::cell::Cell<u64>,
+    /// Of the lean reads, the ones a tombstone in the live table's chain
+    /// ended: answered by the live table alone, whatever the store below
+    /// it holds (`point_live_ended_reads`).
+    live_ended: std::cell::Cell<u64>,
     ord_declined: std::cell::Cell<u64>,
     /// This handle's memo of decoded groups (`zfile::ZMemo`,
     /// `Options::zpages_memo`), which goes with the handle.
@@ -26721,6 +26834,14 @@ impl Reader {
         self.placed_reads.get()
     }
 
+    /// Of the reads `point_lean_reads` counts, the ones a tombstone in the
+    /// live table's chain ended, so that nothing below the live table was
+    /// read: what share of a workload's gets a path that asked the live
+    /// table first would answer there. A handle's own count.
+    pub fn point_live_ended_reads(&self) -> u64 {
+        self.live_ended.get()
+    }
+
     /// `key`'s values in a partition read through the partition's ordered
     /// index (`Options::point_via_ord`), or `None` where the hash must
     /// answer.
@@ -27780,40 +27901,27 @@ impl Reader {
         if self.opts.zpages != ZPages::Off && self.z_on() {
             return None;
         }
-        let at = if np == 1 {
-            0
-        } else {
-            segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key))
-        };
-        let l0 = st.pieces_placed(at);
-        debug_assert!(
-            std::ptr::eq(l0, st.pieces_over(np, at)),
-            "the pieces a publish placed over a partition are the ones a search finds"
-        );
-        if l0.len() > LAYERS_PIECES {
-            return None;
-        }
         let fnv = crate::flatindex::key_hash(key);
-        if self.opts.read_lines_ahead {
-            // The partition's slot first: it is the read's longest wait
-            // where no tombstone masks the partition, and the tables'
-            // probes and the pieces' filters are the lead for it.
-            if let Some(seg) = segs[..np].get(at) {
-                seg.raw().prefetch_slot(fnv);
-            }
-            for seg in l0 {
-                seg.prefetch_probe(fnv);
-            }
-        }
+        // The key's partition and the pieces over it, and the asks for
+        // the lines their probes will load first: before the live table's
+        // probe, or after it where the live table is asked first and its
+        // chain did not end the read (`Options::point_live_first`).
+        let placed = if self.opts.point_live_first {
+            None
+        } else {
+            Some(Reader::place(&self.opts, st, key, fnv)?)
+        };
         // The live table first: the values of the key's chain newest
         // first, the first `live_n` of `live`. They are slices of the
         // table's arena, which the state holds for the read.
         let mh = mem_hash_of(fnv);
         let mut live = [std::mem::MaybeUninit::<&[u8]>::uninit(); LIVE_SMALL];
         let mut live_n = 0;
-        let found = mem.probe(mh, key).filter(|&i| i < self.len_bound.get());
-        if let Some(i) = found {
-            let (n, tomb) = mem.live_small_hashed(mem.entry(i), self.wm(), &mut live)?;
+        let found = mem
+            .probe_entry(mh, key)
+            .filter(|&(i, _)| i < self.len_bound.get());
+        if let Some((_, e)) = found {
+            let (n, tomb) = mem.live_small_hashed(e, self.wm(), &mut live)?;
             if tomb {
                 // The tombstone masks every older source: the read is
                 // the chain's values after it.
@@ -27823,10 +27931,15 @@ impl Reader {
                 }
                 self.layer_reads.set(self.layer_reads.get() + 1);
                 self.placed_reads.set(self.placed_reads.get() + 1);
+                self.live_ended.set(self.live_ended.get() + 1);
                 return Some(Ok(n as u64));
             }
             live_n = n;
         }
+        let (at, l0) = match placed {
+            Some(p) => p,
+            None => Reader::place(&self.opts, st, key, fnv)?,
+        };
         // The frozen tables newest first, where a seal is in flight: each
         // one's values as the live table's, the first `frozen_n[i]` of
         // `frozen[i]`, and `since` the oldest the pass reached, which is
@@ -27841,8 +27954,8 @@ impl Reader {
                 return None;
             }
             since = i;
-            if let Some(e) = fr.probe(mh, key) {
-                (frozen_n[i], cut) = fr.live_small_hashed(fr.entry(e), SEE_ALL, &mut frozen[i])?;
+            if let Some((_, e)) = fr.probe_entry(mh, key) {
+                (frozen_n[i], cut) = fr.live_small_hashed(e, SEE_ALL, &mut frozen[i])?;
                 if cut {
                     break;
                 }
@@ -28093,7 +28206,50 @@ impl Reader {
             f(mem.value_at(off));
         }
         self.lone_reads.set(self.lone_reads.get() + 1);
+        if tomb {
+            self.live_ended.set(self.live_ended.get() + 1);
+        }
         Some(Ok(below + n as u64))
+    }
+
+    /// The placed read's partition for `key` and the pieces over it, with
+    /// the asks for the lines their probes load first where the options
+    /// ask (`read_lines_ahead`); `None` where the pieces are more than the
+    /// read takes. Inlined at both of the read's places for it, since as a
+    /// closure it was a call and fifty instructions of every read.
+    #[inline(always)]
+    fn place<'s>(
+        opts: &Options,
+        st: &'s State,
+        key: &[u8],
+        fnv: u64,
+    ) -> Option<(usize, &'s [std::sync::Arc<Seg>])> {
+        let (segs, np) = (&st.segs, st.parts);
+        let at = if np == 1 {
+            0
+        } else {
+            segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key))
+        };
+        let l0 = st.pieces_placed(at);
+        debug_assert!(
+            std::ptr::eq(l0, st.pieces_over(np, at)),
+            "the pieces a publish placed over a partition are the ones a search finds"
+        );
+        if l0.len() > LAYERS_PIECES {
+            return None;
+        }
+        if opts.read_lines_ahead {
+            // The partition's slot first: it is the read's longest wait
+            // where no tombstone masks the partition, and the tables'
+            // probes and the pieces' filters are the lead for it.
+            if let Some(seg) = segs[..np].get(at) {
+                seg.prefetch_slot(fnv);
+            }
+            for seg in l0 {
+                seg.prefetch_probe(fnv);
+            }
+        }
+        Some((at, l0))
     }
 
     /// A point read over every source that may hold the key: the
@@ -28147,7 +28303,7 @@ impl Reader {
             }
             if !part_z && tombs {
                 if let Some(seg) = part {
-                    seg.raw().prefetch_slot(fnv);
+                    seg.prefetch_slot(fnv);
                 }
             }
         }
@@ -36239,7 +36395,7 @@ impl Reader {
             }
             if !part_z && tombs {
                 if let Some(seg) = part {
-                    seg.raw().prefetch_slot(fnv);
+                    seg.prefetch_slot(fnv);
                 }
             }
         }
@@ -37152,6 +37308,7 @@ impl Db {
             lone_reads: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
             placed_reads: std::cell::Cell::new(0),
+            live_ended: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -37975,6 +38132,7 @@ impl Db {
             lone_reads: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
             placed_reads: std::cell::Cell::new(0),
+            live_ended: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -40893,6 +41051,7 @@ impl Reader {
             lone_reads: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
             placed_reads: std::cell::Cell::new(0),
+            live_ended: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: self.opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -40936,6 +41095,7 @@ impl Reader {
                 lone_reads: std::cell::Cell::new(0),
                 layer_reads: std::cell::Cell::new(0),
                 placed_reads: std::cell::Cell::new(0),
+                live_ended: std::cell::Cell::new(0),
                 ord_declined: std::cell::Cell::new(0),
                 zmemo: self.opts.handle_memo(),
                 zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -40986,6 +41146,7 @@ impl Reader {
             lone_reads: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
             placed_reads: std::cell::Cell::new(0),
+            live_ended: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: self.opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -44213,6 +44374,7 @@ impl Reader {
             lone_reads: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
             placed_reads: std::cell::Cell::new(0),
+            live_ended: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: self.opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -57791,6 +57953,18 @@ mod landing_facts {
         std::fs::rename(&tmp, dir.join(&name)).unwrap();
         let walked = Seg::open(&dir, &name, false, false, true, true).unwrap();
         let handed = Seg::open_landed(&dir, &name, false, false, true, Some(facts)).unwrap();
+        // The slot a read asks for by the table the open took is the one
+        // the blob finds, for keys it holds and keys it does not: a hint
+        // aimed anywhere else would pass every check of what reads answer.
+        for k in ["key-00000001", "key-00004999", "nope", "key-99999999"] {
+            let fnv = crate::flatindex::key_hash(k.as_bytes());
+            assert!(
+                walked.slot_ask[0] != 0,
+                "a segment's index has a slot table"
+            );
+            assert_eq!(walked.slot_addr(fnv), walked.raw().slot_addr(fnv), "{k}");
+            assert_eq!(handed.slot_addr(fnv), handed.raw().slot_addr(fnv), "{k}");
+        }
         assert_eq!(walked.tombs, handed.tombs);
         assert_eq!(
             walked.bloom.as_ref().unwrap().blocks,

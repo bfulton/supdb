@@ -68,7 +68,8 @@
 //!   rest; and in half of those builds no frames (`Cfg::held_frames`),
 //!   closed at every reopen; and in a quarter of the seeds reads a
 //!   record as it reaches it, no line asked ahead of its header
-//!   (`Cfg::record_ahead`).
+//!   (`Cfg::record_ahead`), and in a quarter finds a point read's
+//!   partition before it asks the live table (`Cfg::live_first`).
 //! - `ZFUZZ_SHAPES`: the key shapes a seed may draw from, as indexes from 0
 //!   to 7 separated by commas.
 //! - `ZFUZZ_SETTLEBUILDS=1`: the `z` store's commits near reads file their
@@ -387,6 +388,11 @@ struct Cfg {
     /// seeds under `ZFUZZ_OPTVARY`, the side generator's draw after the
     /// frames', and on otherwise, as the engine has it.
     record_ahead: bool,
+    /// The read that places its sources asks the live table before it
+    /// finds the partition (`Options::point_live_first`): off in a quarter
+    /// of the seeds under `ZFUZZ_OPTVARY`, the side generator's draw after
+    /// the record ask's, and on otherwise, as the engine has it.
+    live_first: bool,
     /// Under `ZFUZZ_STRIDE`, the stride form's steer; `None` without it.
     stride: Option<StrideSteer>,
 }
@@ -685,6 +691,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let layers_as_one = side.chance(25);
     let no_frames = side.chance(50);
     let ask_off = side.chance(25);
+    let live_last = side.chance(25);
     // A generator of its own, as `side` is, so that the switch moves none
     // of the draws below.
     let stride =
@@ -756,6 +763,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         hold_small: vary && explicit_on && hold_small,
         held_frames: !(vary && explicit_on && no_frames),
         record_ahead: !(vary && ask_off),
+        live_first: !(vary && live_last),
         stride,
     }
 }
@@ -793,6 +801,7 @@ fn opts(c: &Cfg) -> Options {
         point_layers_lean: c.point_layers_lean,
         held_frames: c.held_frames,
         point_record_ahead: c.record_ahead,
+        point_live_first: c.live_first,
         wal_hold_bytes: if c.hold_small {
             2 << 10
         } else {
@@ -2547,6 +2556,7 @@ fn fuzz_range() {
     let mut reads = [0u64; 3];
     let mut frameless = 0u64;
     let mut unasked = 0u64;
+    let mut live_last = 0u64;
     let mut stride = StrideStats::default();
     let ran = seeds.len();
     for seed in seeds {
@@ -2557,6 +2567,9 @@ fn fuzz_range() {
         }
         if !drawn.record_ahead {
             unasked += 1;
+        }
+        if !drawn.live_first {
+            live_last += 1;
         }
         match run_seed(seed, want_cache, verbose) {
             Ok(s) => {
@@ -2586,7 +2599,7 @@ fn fuzz_range() {
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {}, snapshots kept {kept}, log frames dropped {} spilled {}, held logs with no frames {frameless}, reads with no record asked {unasked}, point reads two-source {} layered {} placed {}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {}, snapshots kept {kept}, log frames dropped {} spilled {}, held logs with no frames {frameless}, reads with no record asked {unasked}, live table asked last {live_last}, point reads two-source {} layered {} placed {}, FAILURES {}",
         heads[0],
         heads[1],
         point[0],

@@ -1946,6 +1946,11 @@ pub struct Supdb {
     /// off): `supdb-indexzeropage`, and `supdb-heldindexzeropage` under
     /// the held log with no frames.
     indexzeropage: bool,
+    /// The placed read's partition and asks taken before the live
+    /// table's probe, for every read (`Options::point_live_first` off):
+    /// `supdb-livelast`, and `supdb-heldlivelast` under the held log with
+    /// no frames.
+    livelast: bool,
     /// The upkeep thread's passes batched to this percentage of the
     /// store's keys (`Options::upkeep_batch_pct`) under the held log with
     /// no frames: `supdb-heldbatch1`.
@@ -3204,6 +3209,10 @@ struct Policy {
     /// (`Options::index_populated` off): `supdb-indexzeropage`,
     /// `supdb-heldindexzeropage`.
     indexzeropage: bool,
+    /// The partition before the live table in the placed read
+    /// (`Options::point_live_first` off): `supdb-livelast`,
+    /// `supdb-heldlivelast`.
+    livelast: bool,
     /// The upkeep's passes batched (`Options::upkeep_batch_pct`):
     /// `supdb-heldbatch1`.
     upkeepbatch: Option<usize>,
@@ -3541,6 +3550,7 @@ impl Default for Policy {
             noframes: false,
             norecordahead: false,
             indexzeropage: false,
+            livelast: false,
             upkeepbatch: None,
             defer: false,
             firstfloor: false,
@@ -10249,6 +10259,7 @@ impl Supdb {
             noframes,
             norecordahead,
             indexzeropage,
+            livelast,
             upkeepbatch,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
@@ -10923,6 +10934,7 @@ impl Supdb {
             held_frames: !noframes,
             point_record_ahead: !norecordahead,
             index_populated: !indexzeropage,
+            point_live_first: !livelast,
             ..Default::default()
         };
         let opts = match advice {
@@ -11280,6 +11292,7 @@ impl Supdb {
             noframes,
             norecordahead,
             indexzeropage,
+            livelast,
             upkeepbatch,
             ord_threads: Default::default(),
         })
@@ -11460,6 +11473,8 @@ impl Engine for Supdb {
                     "supdb-heldnorecordahead"
                 } else if self.indexzeropage {
                     "supdb-heldindexzeropage"
+                } else if self.livelast {
+                    "supdb-heldlivelast"
                 } else if self.upkeepbatch.is_some() {
                     "supdb-heldbatch1"
                 } else if self.noalert {
@@ -11484,6 +11499,9 @@ impl Engine for Supdb {
         }
         if self.indexzeropage {
             return "supdb-indexzeropage";
+        }
+        if self.livelast {
+            return "supdb-livelast";
         }
         // The probe's combinations first, which the single fields below
         // would name by one of their parts.
@@ -13258,6 +13276,7 @@ impl Engine for Supdb {
             ("reads_lone", db.point_lean_reads().0 as f64),
             ("reads_layers", db.point_lean_reads().1 as f64),
             ("reads_placed", db.point_placed_reads() as f64),
+            ("reads_live_ended", db.point_live_ended_reads() as f64),
             ("merges_landed", db.seal_waits().merges as f64),
             ("merge_plans", db.seal_waits().plans as f64),
             ("merges_beside", db.seal_waits().merges_beside as f64),
@@ -14880,6 +14899,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-advicerandom"
         | "supdb-norecordahead"
         | "supdb-indexzeropage"
+        | "supdb-livelast"
         | "supdb-nocache"
         | "supdb-nocacheordread"
         | "supdb-nocachezpages"
@@ -15392,6 +15412,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldnoalert"
         | "supdb-heldinline"
         | "supdb-heldindexzeropage"
+        | "supdb-heldlivelast"
         | "supdb-heldbatch1"
         | "faster" => Guarantee::Memory,
         _ => return None,
@@ -15816,6 +15837,34 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         indexzeropage: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldlivelast" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        livelast: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-livelast" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        livelast: true,
                         ..Policy::default()
                     },
                 )
@@ -17771,6 +17820,7 @@ mod tests {
             ("supdb-heldnoalert", |a| !a.upkeep_alert),
             ("supdb-heldinline", |a| a.upkeep == supdb::Upkeep::Inline),
             ("supdb-heldindexzeropage", |a| !a.index_populated),
+            ("supdb-heldlivelast", |a| !a.point_live_first),
             ("supdb-heldbatch1", |a| a.upkeep_batch_pct == 1),
         ] {
             let e = open(arm, &root.join(arm), 1).unwrap();
@@ -17793,6 +17843,10 @@ mod tests {
                 },
                 "supdb-heldindexzeropage" => Policy {
                     indexzeropage: true,
+                    ..Policy::default()
+                },
+                "supdb-heldlivelast" => Policy {
+                    livelast: true,
                     ..Policy::default()
                 },
                 "supdb-heldbatch1" => Policy {
@@ -17831,6 +17885,23 @@ mod tests {
         let e = open("supdb-indexzeropage", &root.join("indexzeropage"), 1).unwrap();
         assert_eq!(e.name(), "supdb-indexzeropage");
         assert_eq!(guarantee("supdb-indexzeropage"), guarantee("supdb"));
+        drop(e);
+        let e = open("supdb-livelast", &root.join("livelast"), 1).unwrap();
+        assert_eq!(e.name(), "supdb-livelast");
+        assert_eq!(guarantee("supdb-livelast"), guarantee("supdb"));
+        drop(e);
+        let ll = Supdb::with_policy(
+            &root.join("livelast-policy"),
+            Policy {
+                livelast: true,
+                ..Policy::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ll.name(), "supdb-livelast");
+        assert!(!ll.db.as_ref().unwrap().options().point_live_first);
+        drop(ll);
+        let e = open("supdb", &root.join("livefirst"), 1).unwrap();
         drop((e, nof));
         assert!(
             matches!(mo.sync, supdb::SyncPolicy::Explicit) && mo.wal_hold_bytes == o.wal_hold_bytes

@@ -663,9 +663,10 @@ pub fn phase_mark(arm: &str, phase: &str, edge: &str) {
 /// `Db::fill_owed_due`), and the stride form's reads, first-touch checks,
 /// cursor values and builds over the window beside the stride files the
 /// store holds after it (`zs`), so that a stride arm's cell is read by the
-/// form that served it. The lag sweep prints one a
-/// point (`SUPDB_LAG_COUNTERS`) and the mixes one a mix
-/// (`SUPDB_MIX_COUNTERS`).
+/// form that served it, and the writer's point reads by the path that
+/// answered them, with the ones a tombstone in the live table's chain ended
+/// (`gets`). The lag sweep prints one a point (`SUPDB_LAG_COUNTERS`) and
+/// the mixes one a mix (`SUPDB_MIX_COUNTERS`).
 fn counters_line(
     tag: &str,
     arm: &str,
@@ -678,7 +679,7 @@ fn counters_line(
     let get = |c: &[(&str, f64)], n: &str| c.iter().find(|(k, _)| *k == n).map_or(0.0, |(_, v)| *v);
     let d = |n: &str| get(c1, n) - get(c0, n);
     eprintln!(
-        "{tag} {arm} {point} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {burst_ms:.1} pass_ms {pass_ms:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p holds {:.0}/{:.1}ms maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} stood {:.0} dropped_mb {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0} | z reads {:.0} dec {:.0} scans {:.0} groups {:.0} memo {:.0}/{:.0} pf {:.0} | steps settle {:.1} snap {:.1} fillwalk {:.1} fillbuild {:.1} ms fills {:.0} cuts {:.0} left {:.0} owed {:.0} | zs reads {:.0} checks {:.0} cursor {:.0} builds {:.0} files {:.0}",
+        "{tag} {arm} {point} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {burst_ms:.1} pass_ms {pass_ms:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p holds {:.0}/{:.1}ms maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} stood {:.0} dropped_mb {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0} | z reads {:.0} dec {:.0} scans {:.0} groups {:.0} memo {:.0}/{:.0} pf {:.0} | steps settle {:.1} snap {:.1} fillwalk {:.1} fillbuild {:.1} ms fills {:.0} cuts {:.0} left {:.0} owed {:.0} | zs reads {:.0} checks {:.0} cursor {:.0} builds {:.0} files {:.0} | gets lone {:.0} layers {:.0} placed {:.0} live {:.0}",
         mem_free_mb(),
         d("scan_take_us") / 1e3,
         d("scan_sync_us") / 1e3,
@@ -726,7 +727,11 @@ fn counters_line(
         d("zpage_stride_page_checks"),
         d("zpage_stride_cursor_reads"),
         d("zpage_stride_builds"),
-        get(c1, "zpage_stride_files_at_end")
+        get(c1, "zpage_stride_files_at_end"),
+        d("reads_lone"),
+        d("reads_layers"),
+        d("reads_placed"),
+        d("reads_live_ended")
     );
     // The process's memory beside the structures that count their own: the
     // resident bytes, what the allocator has handed out and what it holds
