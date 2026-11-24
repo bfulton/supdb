@@ -18645,6 +18645,11 @@ struct MergePlan {
 /// resident (`Blob::willneed_at`), so that in core a pass costs one
 /// residency probe a window and no advice. The asks and their bytes go to
 /// the store's counters at the drop.
+/// How many ranks of an input a merge's walk passes between two looks at
+/// its ask ahead (`MergeAhead::at`): a few kilobytes of records, against a
+/// window asked half a window ahead.
+const AHEAD_EVERY: usize = 64;
+
 struct MergeAhead {
     window: u64,
     asked_to: Vec<u64>,
@@ -18680,8 +18685,16 @@ impl MergeAhead {
         })
     }
 
-    /// The walk of input `i` stands at `rank`.
+    /// The walk of input `i` stands at `rank`. Looked at every
+    /// `AHEAD_EVERY` ranks: the walk visits every rank of every input in
+    /// turn, the next window is asked half a window before the frontier,
+    /// and a record's offset is a look into the input's directory, which
+    /// under a cipher is an ask by the piece -- made at every step, it was
+    /// a twenty-eighth of a merge's CPU there.
     fn at(&mut self, blobs: &[&Blob<MmapBytes>], i: usize, rank: usize) {
+        if !rank.is_multiple_of(AHEAD_EVERY) {
+            return;
+        }
         let Some(off) = blobs[i].record_offset(rank) else {
             return;
         };
@@ -18741,6 +18754,12 @@ trait MergeRest: Copy {
     /// written (`pager::Hold::idle`). The walk's next `step` says it
     /// rested. A plain store's is the wait.
     fn unheld<T>(self, wait: impl FnOnce() -> T) -> T;
+
+    /// The input at `path`: a plain store's mapping; under a cipher, read
+    /// beside the store's cache under the hold where the store's cipher
+    /// says so (`StoreCipher::merges_beside_cache`, `pager::Stream`), else
+    /// the cache's view.
+    fn open_input(self, path: &Path) -> Result<MmapBytes>;
 }
 
 /// A plain store's merge: no rest.
@@ -18757,6 +18776,11 @@ impl MergeRest for NoRest {
     fn unheld<T>(self, wait: impl FnOnce() -> T) -> T {
         wait()
     }
+
+    #[inline(always)]
+    fn open_input(self, path: &Path) -> Result<MmapBytes> {
+        vault::map(path)
+    }
 }
 
 impl MergeRest for &pager::Hold {
@@ -18768,6 +18792,14 @@ impl MergeRest for &pager::Hold {
             return true;
         }
         idled
+    }
+
+    fn open_input(self, path: &Path) -> Result<MmapBytes> {
+        if self.beside() {
+            vault::stream(path, self)
+        } else {
+            vault::map(path)
+        }
     }
 
     fn unheld<T>(self, wait: impl FnOnce() -> T) -> T {
@@ -19476,6 +19508,7 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<Vec<String>> {
         read_ahead,
         counts.as_deref(),
         "compact",
+        rest,
     )?;
     let blobs: Vec<&Blob<MmapBytes>> = opened.iter().collect();
     steps.step("open");
@@ -19774,7 +19807,8 @@ struct TierPlan {
 /// sequential read of its inputs (`Options::merge_verifies_inputs`,
 /// refuted off, said so), and out of core it faulted one kernel readahead
 /// window a wait behind the readers.
-fn merge_open_inputs(
+#[allow(clippy::too_many_arguments)]
+fn merge_open_inputs<R: MergeRest>(
     dir: &Path,
     inputs: &[String],
     opts: &SegmentOptions,
@@ -19782,11 +19816,12 @@ fn merge_open_inputs(
     read_ahead: usize,
     counts: Option<&Shared>,
     what: &str,
+    rest: R,
 ) -> Result<Vec<Blob<MmapBytes>>> {
     let mut blobs = Vec::with_capacity(inputs.len());
     for name in inputs {
         let b = Blob::open_with(
-            vault::map(dir.join(name))?,
+            rest.open_input(&dir.join(name))?,
             crate::blob::BlobOptions {
                 verify_checksums: opts.checksums,
                 verify_index: verify,
@@ -19854,6 +19889,7 @@ fn tier_walk<R: MergeRest>(plan: TierPlan, rest: R) -> Result<Vec<String>> {
         read_ahead,
         counts.as_deref(),
         "tier",
+        rest,
     )?;
     let blobs: Vec<&Blob<MmapBytes>> = opened.iter().collect();
     let mut total = 0usize;

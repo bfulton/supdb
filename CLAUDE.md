@@ -132,7 +132,7 @@ owner's:
 | `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`); and the stride form (`Options::zpages_stride`; `zpages_stride_room` keeps it to the builds made while the store in it fits, `zpages_stride_convert` moves a served partition between it and the block form, and `zpages_stride_below`, an arm's, keeps it to the partitions under a key), a partition's values alone at their stride where its keys are one run of numbers -- the module's own docs, and `docs/engine.md` for where it wins and where it does not fit |
 | `src/db/dirkey.rs` | a live store's directory under a key, encrypted by the kernel (`Encryption::Kernel`): the requests of Linux's file encryption, what `create` and `open` hold a directory to, and `lock`, with no cipher and no byte of a read path in it -- the module's own docs, and `scripts/fscrypt.sh` for a filesystem to test it on |
 | `src/db/vault.rs` | a live store under a cipher the caller supplies (`Encryption::Cipher`): the door every file operation of the engine goes through, which is the standard library's call for a plain store; a file as a memory file while it is written and as its envelope in the directory after; the marker and the keys, the caller's wrapping the store's and the store's wrapping a key a file; the manifest's slot and the log's record sealed, with no cipher in the crate -- the module's own docs, `tests/cipher.rs`, and `ZFUZZ_CIPHER=1` for the differential fuzz |
-| `src/db/pager.rs` | the cache a store under a cipher reads its files through: a file as address space its plaintext's length, a chunk of it decrypted where it is first asked for and a megabyte given back at a time once the cache is past its budget and no reader could hold it; the holds and rests of the threads that read with no slot of the reader table, the two lines past the budget at which the store's own work and then a caller's read wait, and the failure a read remembers, with no cipher in it and no reader of the format -- the module's own docs, and `tests/cipher.rs` for a store several times its cache |
+| `src/db/pager.rs` | the cache a store under a cipher reads its files through: a file as address space its plaintext's length, a chunk of it decrypted where it is first asked for and a megabyte given back at a time once the cache is past its budget and no reader could hold it; the holds and rests of the threads that read with no slot of the reader table, the two lines past the budget at which the store's own work and then a caller's read wait, the failure a read remembers, and the view a merge reads its inputs through beside the cache (`Stream`), with no cipher in it and no reader of the format -- the module's own docs, and `tests/cipher.rs` for a store several times its cache |
 | `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, the replays that hold it, the model of a cache's faults over populations of pages (`model_populations`), and what the reads of a store in two forms cost with the moves between the forms that pay (`forms_cost`, `conversions`) -- the module's own docs |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
 | `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index -- `docs/index-theory.md` |
@@ -2951,6 +2951,47 @@ it, since what a page's residency says of the pages after it is the
 source's to say; and a pass several times the plain store's is first
 taken apart beside the plain store, in one sitting, before it is called
 the plain store's limitation.
+
+**A reader that reads past the cache, priced by the passes after it.**
+With the ask fixed the same pass still met six merges and seven form
+builds of the store under a cipher where the plain store met none, its
+merges at 161 MB of input a CPU-second in the burst against 347, and the
+profiles of the two bursts by function, beside each other, put two
+thirds of the difference in the cache's fills of the merges' inputs,
+seven tenths of a fill faults on a fresh page of a memory file and on
+the envelope's. A merge reads each input once, which is why a store that
+keeps a cache of blocks compacts past it; one that reads into a buffer
+of its own, written again at its rests (`pager::Stream`,
+`StoreCipher::merges_beside_cache`), cut a merge's CPU by a fifth on the
+probe (`bench/examples/merge_cipher.rs`), and its first version, paired
+in the sweep, read the loads' merges worse by a third with three times
+the major faults: an input just written has its plaintext whole in the
+cache, and the stream decrypted it again from an envelope the bound had
+taken out of the kernel's cache, where the cache would have lent it for
+nothing. It copies what the cache holds now. Its own counts were wrong
+twice before that, and each was found by counting the stream's decrypts
+against the distinct chunks it was asked for, one input at a time: a
+rest let the ring write over the chunk the walk stood on, which it then
+asked for again, and an input is read in two places, its directory and
+its records, so the run a record across two chunks begins in was seldom
+the one that could grow. Paired again, the pass it was built for read
+1.24x and the clean store's pass 0.72x, both pairs, because the cache
+the load leaves held the merges' outputs whole where their inputs had
+been given back behind them, and the kernel had less room for the clean
+pass's ciphertext. Off; the arm is `supdb-cipherautomergestream`. Its
+switch was first a field of `Options`, which grew from 1,000 bytes to
+1,008, and the count of the plain store read one `memcmp` of the stride
+form's long scan four instructions longer, a fifth of that function's
+count, with nothing of the change on the path: the same tree with the
+field taken out counted level. It is the cipher's knob now
+(`StoreCipher::merges_beside_cache`), beside the cipher's others. The
+rules: a reader that reads past a cache asks the cache first, since what
+it skips is the cache's to lend for nothing; a lever that changes what a
+cache holds is priced on the passes after the phase it runs in, by what
+the cache holds when they begin; a structure's count of its own work is
+held to the distinct work it was asked for before its rate is read; and
+a knob one mode reads lives in that mode's builder, since a field of
+`Options` is in every store's layout and the count reads the layout.
 
 The rules: a second way to hold the same bytes is priced on the first
 operation of every pass as well as on its rate, since a mapping's first

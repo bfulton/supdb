@@ -230,6 +230,19 @@ What an engine picker would hit, roughly in order.
   does by default; a checkpoint that leaves the memtable where it is and
   carries the log would be the cheaper one for a store that writes
   between them.
+- [ ] **A write's first touch of the memtable's index, priced across
+  every core.** A profile of the writer through the lag sweep's full
+  rewrite at ten million keys under 1.25 GiB (`perf record -a -g`, cut to
+  the burst by `SUPDB_LAG_MARK`, at `b7a1177`) put 12.5% of the plain
+  store's writer in `smp_call_function_many_cond` under
+  `MemTable::index_insert`, by way of `ptep_clear_flush`: a page of the
+  hash index read by the probe before the insert writes it maps the
+  shared zero page, and the write copies it and flushes the page table
+  entry from every CPU the process runs on, which on this guest is an
+  interrupt to each. A store under a cipher pays the same, 15%. Not
+  priced against a shape that writes the index's pages before it reads
+  them; the probe of a slot that has never been written is the
+  question.
 - [ ] **Range delete.** Deleting a key range without a tombstone per key.
 - [ ] **Reverse and bounded scans.** `scan` is forward-only from a start key
   with a count; add an end bound and reverse order.
@@ -681,7 +694,13 @@ What an engine picker would hit, roughly in order.
     form file built at a merge's finish; and a merge's own arrays. Each
     reaches the room a reading late, as a merge's output did. A lever
     for one of them waits for a peak that names it, read on the group's
-    memory by kind through the pass, kill or none.
+    memory by kind through the pass, kill or none. One came at ten
+    million keys under 1.25 GiB at `b7a1177`, `supdb-cipherauto` in the
+    shuffled load of a pairing's first rep (the item on the pass after a
+    full rewrite has the command): the kernel's record of the kill put
+    1,053 MB of shared memory in the group where the process mapped 850,
+    so some 200 MB of memory files no view had taken, beside 266 MB of
+    the process's own; which writers they were was not read.
   - The evictor's waits, of which the long ones were a merge's. A merge
     wrote each output's envelope under its hold of the cache, and writes
     it unheld now (`CLAUDE.md`, the trace that named the close;
@@ -986,10 +1005,39 @@ until the run is its own log). What it loses:
   pairs of four where it was behind in four, the ordered load 1.01-1.15x,
   reads 2.1-21x, scans 2.9-7x, the clean store's pass 1.08-1.41x and every
   burst 1.5-4x; the passes after the one- and ten-percent bursts ahead in
-  two pairs and three of four. What is left of the pass is read next by
-  its counters beside the plain store's, whose pass meets about as many
-  pieces and nothing merging; and the merge's CPU, 159 MB of input a
-  second against the plain store's 227.
+  two pairs and three of four. Read beside the plain store's at `b7a1177`
+  (`SUPDB_LAG_COUNTERS=1 SUPDB_MERGE_TRACE=1 SUPDB_LAG_MARK=1`, one sweep
+  of each, and `perf record -a -g` cut to the burst and to the pass by
+  the marks): both meet the pass with 34 pieces, and the plain store's
+  merges are done before it (0.5 s, 184 major faults) where six merges
+  and seven form builds of the store under a cipher run inside it (4.7
+  s, 29,000 major faults, 600 MB written). In the burst the plain store's
+  merges move 347 MB of input a CPU-second and 117 a wall-second, under
+  a cipher 161 and 59, and the profiles by function put two thirds of
+  what the cipher adds to a merge in the cache's fills of its inputs,
+  seven tenths of a fill being faults on a fresh page of a memory file
+  and on the envelope's page; the form builds at a merge's finish are
+  the same CPU in both stores. A merge reading its inputs beside the
+  cache (`StoreCipher::merges_beside_cache`, `pager::Stream`: each chunk
+  decrypted into a buffer of the merge's own that its rests write again,
+  a chunk the cache holds copied from it) moves 181-187 MB of input a
+  CPU-second in the burst, and paired against the shape before at
+  `b7a1177` with it in the tree (`bench ab --arms
+  supdb-cipherautomergestream,supdb-cipherauto --size 10000000 --bound
+  1342177280 --passes load,lag --reps 2 --ops-div 10 --pairs _per_s`):
+  the pass after the full rewrite 1.24x in both pairs, and the clean
+  store's pass 0.72x and the one-percent burst 0.70x, both pairs, the
+  loads level. The two losses are the cache's state after the load:
+  with the merges no longer filling it, it holds their outputs whole,
+  1,017-1,022 MB against 603-704, and the kernel has less room for the
+  ciphertext the clean pass reads. Off as shipped; what is left of a
+  merge under it is spread over the envelope's copies and faults, the
+  cipher, the output's memory file and the reads by the piece, none of
+  them a lever that finishes the merges before the pass. The first rep
+  of that pairing lost `supdb-cipherauto` to the bound in the shuffled
+  load, 1,053 MB of shared memory charged where the process mapped 850:
+  the writes no reading of the room sees ("A store under a cipher under
+  a bound").
 - [ ] **The builds ahead's last cold partition under a cipher.** At five
   million keys under 640 MiB with the builds ahead started at a quarter
   of the store's cache, one or two partitions are still found cold in

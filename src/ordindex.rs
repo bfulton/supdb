@@ -2228,6 +2228,16 @@ mod tests {
             off.checked_add(len as u64)
                 .is_some_and(|e| e <= self.size() && !(off < self.4.end && self.4.start < e))
         }
+        fn place(&self, off: u64, len: usize) -> Option<*const u8> {
+            self.ensure(off, len)
+                .then(|| self.0.as_ptr().wrapping_add(off as usize))
+        }
+        fn place_piece(&self, off: u64) -> Option<(*const u8, usize)> {
+            match self.piece_from(off) {
+                0 => None,
+                n => Some((self.0.as_ptr().wrapping_add(off as usize), n)),
+            }
+        }
         fn piece_end(&self, _: u64) -> u64 {
             self.size()
         }

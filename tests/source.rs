@@ -6309,6 +6309,7 @@ src/ordindex.rs | InMemory::base_address    | base_address BaseAddressToken
 src/db/zfile.rs | mod lend_seal             | lend_seal
 src/db.rs       | <item>                    | lend_seal StrideLendToken
 src/db/pager.rs | Paged::base_address       | base_address BaseAddressToken
+src/db/pager.rs | Stream::base_address      | base_address BaseAddressToken
 src/bytes.rs    | <item>                    | lend_seal LendToken OrdLendToken StrideLendToken
 src/bytes.rs    | <item>                    | whole_map_readers
 src/bytes.rs    | mod whole_map_readers     | whole_map_readers

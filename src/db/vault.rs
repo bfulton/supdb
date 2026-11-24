@@ -198,6 +198,7 @@ pub struct StoreCipher {
     cache: Option<u64>,
     apart: bool,
     half: bool,
+    beside: bool,
     room: Option<Arc<RoomFn>>,
 }
 
@@ -222,6 +223,7 @@ impl StoreCipher {
             cache: None,
             apart: false,
             half: false,
+            beside: false,
             room: None,
         }
     }
@@ -297,6 +299,26 @@ impl StoreCipher {
     pub fn chunks_apart(mut self, apart: bool) -> StoreCipher {
         self.apart = apart;
         self
+    }
+
+    /// Whether a merge reads its inputs beside the store's cache: each
+    /// chunk decrypted into a buffer of the merge's own, which its rests
+    /// write again, a chunk the cache holds copied from it, and nothing of
+    /// the inputs put into the cache or given back from it. As shipped,
+    /// off: priced against the shape that reads them through the cache it
+    /// read the pass after a full rewrite better and the passes after the
+    /// load worse, the cache coming out of the load holding the merges'
+    /// outputs where it had held their inputs (`ROADMAP.md`).
+    #[doc(hidden)]
+    pub fn merges_beside_cache(mut self, on: bool) -> StoreCipher {
+        self.beside = on;
+        self
+    }
+
+    /// Whether `merges_beside_cache` is set: a test's look at an arm.
+    #[doc(hidden)]
+    pub fn merges_beside_cache_set(&self) -> bool {
+        self.beside
     }
 
     /// The caller's name for its key, written in the store's marker in the
@@ -1065,6 +1087,7 @@ impl Vault {
                     ))),
                 };
                 pager.keep_apart(cipher.apart);
+                pager.merge_beside(cipher.beside);
                 pager
             },
             coming,
@@ -1212,6 +1235,25 @@ impl Vault {
             .unwrap(&Vault::file_aad(&disk.token), &disk.wrapped)
             .ok_or_else(|| refused("a file's key does not unwrap under the store's"))?;
         Back::open(&self.real.join(disk.name()), (self.data)(&key.0))
+    }
+
+    /// A view of the file beside the cache, read in order under `hold`
+    /// (`pager::Stream`), where the file has its envelope; `None` where it
+    /// has not, and is read through the cache.
+    fn stream_of(&self, name: &str, hold: &pager::Hold) -> Result<Option<Arc<pager::Stream>>> {
+        let (disk, cached) = {
+            let files = lock(&self.files);
+            let e = files
+                .get(name)
+                .ok_or_else(|| Error::from(ErrorKind::NotFound))?;
+            match (&e.disk, &e.mem, &e.page) {
+                // In its writer's memory file still, or with no envelope:
+                // the cache holds it whole, or will once it is viewed.
+                (None, _, _) | (Some(_), Some(_), None) => return Ok(None),
+                (Some(d), _, page) => (d.clone(), page.clone()),
+            }
+        };
+        Ok(Some(hold.stream(self.back_of(&disk)?, cached, name)?))
     }
 
     /// The file as it is read: the cache's view of it, made here if it has
@@ -3030,6 +3072,22 @@ pub(crate) fn map(path: impl AsRef<Path>) -> Result<MmapBytes> {
         Some((v, name)) if passes(&name) => MmapBytes::open(&v.real.join(name)),
         Some((v, name)) => Ok(MmapBytes::paged(v.page_of(&name)?)),
     }
+}
+
+/// A file of the store in `dir` read once and in order under `hold`, beside
+/// the store's cache (`pager::Stream`): a merge's input. A file with no
+/// envelope yet is read through the cache, which holds it whole, and a
+/// plain store's file is its mapping, as `map` answers.
+pub(crate) fn stream(path: impl AsRef<Path>, hold: &pager::Hold) -> Result<MmapBytes> {
+    let path = path.as_ref();
+    if let Some((v, name)) = locate(path) {
+        if !passes(&name) {
+            if let Some(s) = v.stream_of(&name, hold)? {
+                return Ok(MmapBytes::paged(s));
+            }
+        }
+    }
+    map(path)
 }
 
 /// Whether every file of the store in `dir` has read so far: the failure a

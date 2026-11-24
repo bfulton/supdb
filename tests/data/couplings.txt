@@ -124,6 +124,7 @@ src/db.rs	Entered::finish	attn/rest word	code	1	stays	the handle bit (ATTN_PAGED
 src/db.rs	Hold::<item>	MergeRest/NoRest	code	1	R4	impl MergeRest for &pager::Hold
 src/db.rs	Hold::<item>	impl of a seam or encryption type	code	1	R4	impl MergeRest for &pager::Hold: a form's trait on a pager type; new token (round 2)
 src/db.rs	Hold::<item>	pager	code	1	R4	impl MergeRest for &pager::Hold
+src/db.rs	Hold::<item>	vault::stream	code	1	stays	the hold opens a merge's input beside the store's cache where the merge asks it to (MergeRest::open_input, Options::merge_streams_inputs): a plain store's NoRest maps it
 src/db.rs	Maint::answer	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
 src/db.rs	Maint::join_merge	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
 src/db.rs	Maint::join_seal	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
@@ -255,6 +256,7 @@ src/db.rs	manifest_image	vault::under	code	1	S6	v.persist + seal_manifest (token
 src/db.rs	manifest_open	sealed log/manifest	code	2	S6	open_manifest + adopt_all (tokens part goes at S3)
 src/db.rs	manifest_open	vault::under	code	1	S6	open_manifest + adopt_all (tokens part goes at S3)
 src/db.rs	merge_keys	MergeRest/NoRest	code	1	R4	R: MergeRest
+src/db.rs	merge_open_inputs	MergeRest/NoRest	code	1	R4	R: MergeRest: the walk's rest opens its inputs (MergeRest::open_input)
 src/db.rs	merge_ranks	MergeRest/NoRest	code	1	R4	R: MergeRest
 src/db.rs	mod cipher_looks	cipher	test	1	stays	cipher_looks: the plain/cipher look words of the plumbing
 src/db.rs	mod dirkey	dirkey	code	1	stays	module declaration
@@ -327,6 +329,7 @@ src/db/vault.rs	companion	seg/ord/form ident	code	4	S6	envelope naming by kind, 
 src/db/vault.rs	const RECORD_HEAD	log record	code	1	S6	
 src/db/vault.rs	create	passes(	code	1	S6	the log, the spare and the manifest pass to the directory by name
 src/db/vault.rs	create_rw	passes(	code	1	S6	the log, the spare and the manifest pass to the directory by name
+src/db/vault.rs	stream	passes(	code	1	S6	the log, the spare and the manifest pass to the directory by name
 src/db/vault.rs	default_cache	form module path	code	1	G3	zfile::read_budget: the budget moves behind Memory (R12)
 src/db/vault.rs	default_cache	path out of the encryption modules	code	1	G3	super::zfile::read_budget: the budget moves behind Memory (R12); new token (round 2)
 src/db/vault.rs	PlatformRoom::read	form module path	code	1	G3	zfile::unreclaimable_slack: what the cache's budget follows is the platform's reading, which the form side reads; the budget moves behind Memory (R12)

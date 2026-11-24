@@ -48,6 +48,14 @@
 //! at the same place: a reader that rests (`Hold::rest`) may keep a borrow
 //! across it as long as it asks for the range again before it reads it.
 //!
+//! A merge may read its inputs beside the cache instead (`Stream`,
+//! `StoreCipher::merges_beside_cache`): each chunk decrypted into a buffer of
+//! the merge's own, which the cache neither holds nor gives back, and
+//! which the merge's rests write again. There a range asked for again
+//! after a rest is the same bytes at another address, and what is read
+//! after a rest is only what was asked for after it, which is how every
+//! walk of a merge reads (`db::merge_ranks`).
+//!
 //! ## Who waits
 //!
 //! The evictor waits for readers, so a cache can run past its budget for
@@ -151,6 +159,10 @@ pub(crate) struct Hold {
     /// Whether the hold has stood for nothing since it was last asked
     /// (`idle`, `took_idle`).
     idled: Cell<bool>,
+    /// How many times the holder has rested or idled: points at which it
+    /// holds nothing it was lent, after which a view read in order under
+    /// this hold writes its buffer again (`Stream`).
+    rests: Arc<AtomicU64>,
     /// The thread's own: the debug count of pins is the thread's.
     _thread: std::marker::PhantomData<*const ()>,
 }
@@ -183,6 +195,7 @@ impl Hold {
     /// whenever the evictor waited fifty milliseconds for some reader the
     /// merges beside it had read the store into the cache.
     pub(crate) fn rest(&self) {
+        self.rests.fetch_add(1, Ordering::Relaxed);
         if self.pager.crowded() {
             self.at.store(0, Ordering::SeqCst);
             self.pager.breathe();
@@ -202,6 +215,7 @@ impl Hold {
     /// `db::Reader::unlent`. What the holder was lent before it is asked
     /// for again after, which `took_idle` is for.
     pub(crate) fn idle<T>(&self, wait: impl FnOnce() -> T) -> T {
+        self.rests.fetch_add(1, Ordering::Relaxed);
         self.at.store(0, Ordering::SeqCst);
         debug_pinned(false);
         let r = wait();
@@ -216,6 +230,24 @@ impl Hold {
     /// a rest, after which it asks again.
     pub(crate) fn took_idle(&self) -> bool {
         self.idled.replace(false)
+    }
+
+    /// Whether the holder, a merge, reads its inputs beside the cache
+    /// (`StoreCipher::merges_beside_cache`).
+    pub(crate) fn beside(&self) -> bool {
+        self.pager.beside.load(Ordering::Relaxed)
+    }
+
+    /// A view of the file whose envelope is `back`, read in order under
+    /// this hold and kept out of the store's cache (`Stream`), taking the
+    /// chunks the cache's view `cached` holds from it.
+    pub(crate) fn stream(
+        &self,
+        back: Back,
+        cached: Option<Arc<Paged>>,
+        label: &str,
+    ) -> Result<Arc<Stream>> {
+        Stream::new(&self.pager, back, cached, self.rests.clone(), label)
     }
 }
 
@@ -275,6 +307,7 @@ struct Counts {
     rooms: AtomicU64,
     gave_way: AtomicU64,
     spared: AtomicU64,
+    streamed: AtomicU64,
 }
 
 /// The longest a reader waits for a crowded cache (`Pager::breathe`).
@@ -325,6 +358,9 @@ pub struct PagerCounts {
     /// What the last reading of the room kept back from the budget for
     /// the cache's own overshoot, bytes.
     pub spared: u64,
+    /// Chunks decrypted by views read in order beside the cache (a merge's
+    /// inputs, `Stream`), which the cache neither holds nor counts.
+    pub streamed: u64,
 }
 
 /// What a cache whose budget follows the room asks of the platform
@@ -427,6 +463,8 @@ pub(crate) struct Pager {
     peak: AtomicU64,
     /// `StoreCipher::chunks_apart`.
     apart: AtomicBool,
+    /// `StoreCipher::merges_beside_cache`.
+    beside: AtomicBool,
     files: Mutex<Vec<Weak<Paged>>>,
     /// The era the holds stand in (`Hold`), and the holds.
     era: AtomicU64,
@@ -480,6 +518,7 @@ impl Pager {
             unbacked: AtomicU64::new(0),
             peak: AtomicU64::new(0),
             apart: AtomicBool::new(false),
+            beside: AtomicBool::new(false),
             files: Mutex::new(Vec::new()),
             era: AtomicU64::new(1),
             holds: Mutex::new(Vec::new()),
@@ -613,6 +652,7 @@ impl Pager {
             pager: self.clone(),
             at,
             idled: Cell::new(false),
+            rests: Arc::new(AtomicU64::new(0)),
             _thread: std::marker::PhantomData,
         };
         h.pin();
@@ -665,6 +705,12 @@ impl Pager {
         self.apart.store(apart, Ordering::Relaxed);
     }
 
+    /// Whether a merge reads its inputs beside the cache
+    /// (`StoreCipher::merges_beside_cache`).
+    pub(crate) fn merge_beside(&self, on: bool) {
+        self.beside.store(on, Ordering::Relaxed);
+    }
+
     pub(crate) fn counts(&self) -> PagerCounts {
         let c = &self.counts;
         let r = |a: &AtomicU64| a.load(Ordering::Relaxed);
@@ -687,6 +733,7 @@ impl Pager {
             rooms: r(&c.rooms),
             gave_way: r(&c.gave_way),
             spared: r(&c.spared),
+            streamed: r(&c.streamed),
         }
     }
 
@@ -1037,6 +1084,43 @@ impl Back {
     pub(crate) fn plain_len(&self) -> u64 {
         self.hdr.plain_len()
     }
+
+    /// Chunk `c`'s plaintext into `dst`, its length: `stored` is the
+    /// chunk's ciphertext and tag as the envelope holds them. A chunk that
+    /// fails its check leaves `dst` zeroed.
+    fn open_chunk(&self, c: usize, stored: &[u8], dst: &mut [u8], label: &str) -> Result<()> {
+        let n = dst.len();
+        dst.copy_from_slice(&stored[..n]);
+        let tag: [u8; TAG] = stored[n..].try_into().expect("a tag's length");
+        if !self
+            .aead
+            .decrypt(&self.hdr.nonce(c as u64), &self.aad, dst, &tag)
+        {
+            // Whatever the cipher left there is not plaintext anyone may
+            // see.
+            dst.fill(0);
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "{label}: chunk {c} failed its check: the store's files were changed, or the \
+                     key is not theirs"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Chunk `c`'s ciphertext and tag, `n` bytes of plaintext long, as the
+    /// envelope holds them.
+    fn stored(&self, c: usize, n: usize, label: &str) -> Result<&[u8]> {
+        let at = self.hdr.stored_off(c as u64) as usize;
+        self.map.get(at..at + n + TAG).ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnexpectedEof,
+                format!("{label}: its envelope is shorter than its header says"),
+            )
+        })
+    }
 }
 
 /// One file of a store under a cipher, read by the piece.
@@ -1290,25 +1374,7 @@ impl Paged {
             };
         }
         let dst = unsafe { std::slice::from_raw_parts_mut(self.base.add(c * CHUNK), n) };
-        dst.copy_from_slice(&stored[..n]);
-        let tag: [u8; TAG] = stored[n..].try_into().expect("a tag's length");
-        if !back
-            .aead
-            .decrypt(&back.hdr.nonce(c as u64), &back.aad, dst, &tag)
-        {
-            // Whatever the cipher left there is not plaintext anyone may
-            // see.
-            dst.fill(0);
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!(
-                    "{}: chunk {c} failed its check: the store's files were changed, or the key \
-                     is not theirs",
-                    self.label
-                ),
-            ));
-        }
-        Ok(())
+        back.open_chunk(c, stored, dst, &self.label)
     }
 
     /// The ciphertext of chunks `c..=b` asked of the kernel in one piece,
@@ -1361,6 +1427,27 @@ impl Paged {
         let first = gone.next()?;
         let last = gone.next_back()?;
         Some((first, last))
+    }
+
+    /// Chunk `c` copied into `dst`, its length, where the cache holds it:
+    /// for a reader under a hold that keeps its own copy (`Stream`), which
+    /// leaves the chunk's recency as it found it. A chunk seen held is
+    /// one the evictor had not marked when the holder last stood at its
+    /// era, so the evictor waits for the holder's next rest before it
+    /// gives the chunk back, and the copy is made before then.
+    fn copy_present(&self, c: usize, dst: &mut [u8]) -> bool {
+        if !matches!(
+            self.state.get(c).map(|s| s.load(Ordering::SeqCst)),
+            Some(HOT | COLD)
+        ) {
+            return false;
+        }
+        // SAFETY: a chunk present, inside the mapping, `dst.len()` its
+        // length, and not given back before the holder rests (above).
+        dst.copy_from_slice(unsafe {
+            std::slice::from_raw_parts(self.base.add(c * CHUNK), dst.len())
+        });
+        true
     }
 
     /// `ensure` for a chunk that is not `HOT`.
@@ -1652,6 +1739,22 @@ impl Paging for Paged {
     }
 
     #[inline]
+    fn place(&self, off: u64, len: usize) -> Option<*const u8> {
+        // Inside the mapping: the caller holds the range to the file's
+        // length.
+        self.ensure(off, len)
+            .then(|| self.base.wrapping_add(off as usize).cast_const())
+    }
+
+    #[inline]
+    fn place_piece(&self, off: u64) -> Option<(*const u8, usize)> {
+        match self.piece_from(off) {
+            0 => None,
+            n => Some((self.base.wrapping_add(off as usize).cast_const(), n)),
+        }
+    }
+
+    #[inline]
     fn ensure(&self, off: u64, len: usize) -> bool {
         if len == 0 {
             return true;
@@ -1939,6 +2042,497 @@ impl Paging for Paged {
     }
 }
 
+/// A file of a store under a cipher read once and in order by one thread
+/// under a hold, a merge over its inputs: its chunks decrypted into a
+/// buffer of the view's own and lent from there, and nothing of it in the
+/// store's cache.
+///
+/// Read through the cache, a merge filled a fresh page of a memory file
+/// for every chunk of its inputs, a fault on that page and one on the
+/// envelope's, and the cache gave the units back behind it, a megabyte at
+/// a time across every core's page tables, while the scans beside it lost
+/// what the merge's reads had put out: in the lag sweep's full rewrite at
+/// ten million keys under 1.25 GiB the fills were two thirds of what the
+/// cipher added to a merge, and seven tenths of a fill was faults. A
+/// compaction of a store that keeps a cache of blocks reads past the cache
+/// for the same reason. Here the buffer's pages are touched once and
+/// written again at every rest of the holder: a lend stands until the
+/// holder next rests or idles (`Hold::rest`, `Hold::idle`), where by the
+/// hold's contract it holds nothing it was lent, and the first ask after
+/// that writes the buffer from its start. So unlike the cache's, a range
+/// asked for again after a rest is the same bytes at another address, and
+/// a walk read under a stream reads only what it asked for since its last
+/// rest -- which every walk of a merge does, asking for each input's key
+/// again at the step after a rest (`db::merge_ranks`).
+///
+/// One thread's: the hold it was made under is, and a stream is used by
+/// that thread alone (checked under debug assertions).
+pub(crate) struct Stream {
+    pager: Arc<Pager>,
+    back: Back,
+    /// The cache's view of the file, where it has one: a chunk it holds is
+    /// copied from it and not decrypted again, which for a file just
+    /// written is every chunk, its plaintext still whole in the cache and
+    /// its envelope, under a bound, out of the kernel's.
+    cached: Option<Arc<Paged>>,
+    len: u64,
+    /// Address space the file's length mapped with no access, which is
+    /// what `base_address` answers: nothing reads a stream through it.
+    base: *mut u8,
+    mapped: usize,
+    /// The holder's rests (`Hold::rests`).
+    rests: Arc<AtomicU64>,
+    ring: std::cell::UnsafeCell<Ring>,
+    label: String,
+    #[cfg(debug_assertions)]
+    owner: usize,
+}
+
+/// This thread, as a stream's debug check of its reader tells threads
+/// apart: the address of a value of the thread's own.
+#[cfg(debug_assertions)]
+fn this_thread() -> usize {
+    thread_local!(static MARK: u8 = const { 0 });
+    MARK.with(|m| std::ptr::from_ref(m) as usize)
+}
+
+// SAFETY: a stream is read by the one thread whose hold made it (checked
+// under debug assertions); `base` is address space nothing reads and the
+// ring's buffers are the stream's own.
+unsafe impl Send for Stream {}
+// SAFETY: as above; `Paging` asks for `Sync` because the cache's views are
+// shared, and a stream is not.
+unsafe impl Sync for Stream {}
+
+/// What a stream has decrypted over its holder's last two stretches
+/// between rests: buffers it writes in order, and the runs of chunks in
+/// them, each a run of the file's chunks one after another. A buffer
+/// written in the stretch before the last one is free to write again, and
+/// a run is lent from while it is in this stretch or the one before: what
+/// the walk asks for again after a rest is where the last stretch left it,
+/// the chunk each input's walk stands on, and is found there rather than
+/// decrypted again. A rest is a promise that nothing lent before it is
+/// read, so a buffer of the stretch before is not written while a lend of
+/// it could be wanted, and nothing of it is read that was not lent again.
+struct Ring {
+    /// The holder's rests as the ring last saw them: the stretch it is in.
+    rest: u64,
+    /// Each buffer: where, how long, how much of it is written, and the
+    /// last stretch it was written in.
+    bufs: Vec<Buf>,
+    /// The buffer being written.
+    buf: usize,
+    /// The runs most lately written: the first chunk, the chunk after the
+    /// last, where the first lies, its buffer and the last stretch it grew
+    /// in.
+    runs: [Run; STREAM_RUNS],
+    newest: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Buf {
+    at: *mut u8,
+    cap: usize,
+    used: usize,
+    rest: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Run {
+    first: u64,
+    end: u64,
+    at: *const u8,
+    buf: usize,
+    rest: u64,
+}
+
+impl Run {
+    const NONE: Run = Run {
+        first: 0,
+        end: 0,
+        at: std::ptr::null(),
+        buf: 0,
+        rest: 0,
+    };
+
+    /// Lent from in stretch `rest`: written in it or the one before.
+    fn lends(&self, rest: u64) -> bool {
+        !self.at.is_null() && self.rest + 1 >= rest
+    }
+}
+
+/// The runs a stream remembers: an input of a merge is asked for at a key,
+/// its extents and its values, a few places a step, and the runs since the
+/// last rest are few.
+const STREAM_RUNS: usize = 8;
+
+/// A stream's buffer: what a merge reads of one input between two rests is
+/// a few chunks, and a range longer than this has a buffer of its own.
+const STREAM_BUF: usize = 64 << 10;
+
+impl Stream {
+    fn new(
+        pager: &Arc<Pager>,
+        back: Back,
+        cached: Option<Arc<Paged>>,
+        rests: Arc<AtomicU64>,
+        label: &str,
+    ) -> Result<Arc<Stream>> {
+        let len = back.plain_len();
+        let size = usize::try_from(len)
+            .map_err(|_| Error::new(ErrorKind::InvalidInput, "a file longer than an address"))?;
+        let page = page_size();
+        let mapped = size.div_ceil(page) * page;
+        let base = if mapped == 0 {
+            std::ptr::NonNull::<u8>::dangling().as_ptr()
+        } else {
+            // SAFETY: a new mapping of address space the kernel places,
+            // with no access and no memory behind it.
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    mapped,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            if p == libc::MAP_FAILED {
+                return Err(Error::last_os_error());
+            }
+            p.cast()
+        };
+        Ok(Arc::new(Stream {
+            pager: pager.clone(),
+            back,
+            cached,
+            len,
+            base,
+            mapped,
+            ring: std::cell::UnsafeCell::new(Ring {
+                rest: rests.load(Ordering::Relaxed),
+                bufs: Vec::new(),
+                buf: 0,
+                runs: [Run::NONE; STREAM_RUNS],
+                newest: 0,
+            }),
+            rests,
+            label: label.to_string(),
+            #[cfg(debug_assertions)]
+            owner: this_thread(),
+        }))
+    }
+
+    fn chunk_len(&self, c: u64) -> usize {
+        (self.len - c * CHUNK as u64).min(CHUNK as u64) as usize
+    }
+
+    /// Chunks `a..=b` lent from where the ring holds them, decrypting what
+    /// it does not hold since the holder's last rest.
+    fn chunks(&self, a: u64, b: u64) -> Option<*const u8> {
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            this_thread(),
+            self.owner,
+            "{}: a stream read by a thread other than its holder's",
+            self.label
+        );
+        // SAFETY: the ring is this thread's alone (above), and no borrow of
+        // it outlives this call: what is lent is the buffers' bytes, which
+        // the ring's own fields do not alias.
+        let ring = unsafe { &mut *self.ring.get() };
+        let rest = self.rests.load(Ordering::Relaxed);
+        if rest != ring.rest {
+            ring.restart(rest);
+        }
+        for i in 0..STREAM_RUNS {
+            let r = ring.runs[i];
+            if r.lends(rest) && r.first <= a && b < r.end {
+                // Lent in this stretch: its buffer is kept through the
+                // next, and the run with it.
+                if r.rest < rest {
+                    ring.runs[i].rest = rest;
+                    ring.bufs[r.buf].rest = rest;
+                }
+                return Some(r.at.wrapping_add((a - r.first) as usize * CHUNK));
+            }
+        }
+        // The run written last, where the ask goes on from its end or from
+        // inside it, and nothing has been written after it in its buffer:
+        // the walk reads in order, and the run grows.
+        let r = ring.runs[ring.newest];
+        let grows = r.lends(rest)
+            && r.first <= a
+            && a <= r.end
+            && b >= r.end
+            && ring.buf == r.buf
+            && ring.bufs.get(r.buf).is_some_and(|s| {
+                r.at.wrapping_add((r.end - r.first) as usize * CHUNK)
+                    == s.at.wrapping_add(s.used).cast_const()
+                    && s.used + (b + 1 - r.end) as usize * CHUNK <= s.cap
+            });
+        let (from, dst) = if grows {
+            (r.end, ring.take((b + 1 - r.end) as usize * CHUNK))
+        } else {
+            (a, ring.take((b + 1 - a) as usize * CHUNK))
+        };
+        let mut put = dst;
+        for c in from..=b {
+            let n = self.chunk_len(c);
+            // SAFETY: `n` bytes of a buffer the ring has just handed out,
+            // which nothing lent in this stretch or the one before
+            // overlaps.
+            let into = unsafe { std::slice::from_raw_parts_mut(put, n) };
+            // A chunk a run holds is copied from it: a record across two
+            // chunks asks for both, and the run that holds the first is
+            // seldom the one that can grow, an input's directory being
+            // read beside its records.
+            if let Some(r) = ring
+                .runs
+                .iter()
+                .find(|r| r.lends(rest) && r.first <= c && c < r.end)
+            {
+                // SAFETY: `n` bytes of a run lent in this stretch or the
+                // one before, which no buffer handed out since overlaps.
+                into.copy_from_slice(unsafe {
+                    std::slice::from_raw_parts(r.at.wrapping_add((c - r.first) as usize * CHUNK), n)
+                });
+                put = put.wrapping_add(CHUNK);
+                continue;
+            }
+            if self
+                .cached
+                .as_ref()
+                .is_some_and(|p| p.copy_present(c as usize, into))
+            {
+                put = put.wrapping_add(CHUNK);
+                continue;
+            }
+            let got = self
+                .back
+                .stored(c as usize, n, &self.label)
+                .and_then(|s| self.back.open_chunk(c as usize, s, into, &self.label));
+            if let Err(e) = got {
+                ring.runs = [Run::NONE; STREAM_RUNS];
+                self.pager.poison(&e.to_string());
+                return None;
+            }
+            Counts::bump(&self.pager.counts.streamed);
+            put = put.wrapping_add(CHUNK);
+        }
+        if grows {
+            let r = &mut ring.runs[ring.newest];
+            r.end = b + 1;
+            r.rest = rest;
+            Some(r.at.wrapping_add((a - r.first) as usize * CHUNK))
+        } else {
+            ring.newest = (ring.newest + 1) % STREAM_RUNS;
+            ring.runs[ring.newest] = Run {
+                first: a,
+                end: b + 1,
+                at: dst.cast_const(),
+                buf: ring.buf,
+                rest,
+            };
+            Some(dst.cast_const())
+        }
+    }
+}
+
+impl Ring {
+    /// The holder has rested: the stretch it was in is now the one before,
+    /// lent from still, and what was written before it is free.
+    fn restart(&mut self, rest: u64) {
+        self.rest = rest;
+        if guard_on() {
+            // What a stale borrow of a free buffer would read, made plain:
+            // not plaintext.
+            for s in &self.bufs {
+                if s.rest + 1 < rest {
+                    // SAFETY: a buffer of the ring's, `cap` bytes long,
+                    // that nothing lent in the last two stretches lies in.
+                    unsafe { std::ptr::write_bytes(s.at, 0xA5, s.cap) };
+                }
+            }
+        }
+    }
+
+    /// `n` bytes of buffer nothing lent in this stretch or the one before
+    /// lies in: the rest of the buffer being written, a free one, or a new
+    /// one. The buffer it is in is marked as written in this stretch.
+    fn take(&mut self, n: usize) -> *mut u8 {
+        let rest = self.rest;
+        if let Some(s) = self.bufs.get_mut(self.buf) {
+            if s.rest + 1 >= rest && s.used + n <= s.cap {
+                let at = s.at.wrapping_add(s.used);
+                s.used += n;
+                s.rest = rest;
+                return at;
+            }
+        }
+        if let Some((i, s)) = self
+            .bufs
+            .iter_mut()
+            .enumerate()
+            .find(|(_, s)| s.rest + 1 < rest && s.cap >= n)
+        {
+            s.used = n;
+            s.rest = rest;
+            self.buf = i;
+            return s.at;
+        }
+        let cap = n.max(STREAM_BUF);
+        let at = Box::into_raw(vec![0u8; cap].into_boxed_slice()).cast::<u8>();
+        self.bufs.push(Buf {
+            at,
+            cap,
+            used: n,
+            rest,
+        });
+        self.buf = self.bufs.len() - 1;
+        at
+    }
+}
+
+impl Drop for Ring {
+    fn drop(&mut self) {
+        for s in &self.bufs {
+            // SAFETY: each a boxed slice of `cap` bytes made in `take`, and
+            // the stream that lent from it is going.
+            drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(s.at, s.cap)) });
+        }
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        if self.mapped > 0 {
+            // SAFETY: the address space made in `new`, read by nobody.
+            unsafe { libc::munmap(self.base.cast(), self.mapped) };
+        }
+    }
+}
+
+impl Paging for Stream {
+    fn base_address(&self, _: crate::bytes::BaseAddressToken) -> *const u8 {
+        // Address space with no access: a stream lends by `place` alone.
+        self.base.cast_const()
+    }
+
+    fn size(&self) -> u64 {
+        self.len
+    }
+
+    /// Nothing is made present where the mapping is: a stream lends from
+    /// its ring, by `place`.
+    fn ensure(&self, _: u64, _: usize) -> bool {
+        false
+    }
+
+    fn place(&self, off: u64, len: usize) -> Option<*const u8> {
+        if len == 0 {
+            return Some(self.base.cast_const());
+        }
+        let end = off.checked_add(len as u64).filter(|&e| e <= self.len)?;
+        let (a, b) = (off / CHUNK as u64, (end - 1) / CHUNK as u64);
+        let at = self.chunks(a, b)?;
+        Some(at.wrapping_add((off - a * CHUNK as u64) as usize))
+    }
+
+    fn place_piece(&self, off: u64) -> Option<(*const u8, usize)> {
+        if off >= self.len {
+            return None;
+        }
+        let c = off / CHUNK as u64;
+        let at = self.chunks(c, c)?;
+        let n = (((c + 1) * CHUNK as u64).min(self.len) - off) as usize;
+        Some((at.wrapping_add((off - c * CHUNK as u64) as usize), n))
+    }
+
+    fn piece_end(&self, off: u64) -> u64 {
+        ((off / CHUNK as u64 + 1) * CHUNK as u64).min(self.len)
+    }
+
+    fn piece_from(&self, off: u64) -> usize {
+        self.place_piece(off).map_or(0, |(_, n)| n)
+    }
+
+    fn advise(&self, random: bool) {
+        let _ = self.back.map.advise(if random {
+            memmap2::Advice::Random
+        } else {
+            memmap2::Advice::Normal
+        });
+    }
+
+    /// Nothing of a stream stays: a read finds in memory only the
+    /// envelope's pages the kernel holds, which a stream does not ask
+    /// after.
+    fn resident(&self, _: u64, _: usize) -> f64 {
+        0.0
+    }
+
+    fn forget(&self, off: u64, len: usize) {
+        let Some((from, to)) = self.stored_span(off, len) else {
+            return;
+        };
+        // SAFETY: an advice over whole pages of a read-only shared mapping
+        // of a file this view holds: no byte changes.
+        unsafe {
+            libc::madvise(
+                self.back.map.as_ptr().add(from).cast_mut().cast(),
+                to - from,
+                libc::MADV_DONTNEED,
+            );
+        }
+    }
+
+    fn willneed(&self, off: u64, len: usize) -> usize {
+        let Some((from, to)) = self.stored_span(off, len) else {
+            return 0;
+        };
+        let mut at = from;
+        while at < to {
+            let n = (to - at).min(crate::bytes::WILLNEED_PIECE);
+            // SAFETY: an advice over pages of the envelope's mapping.
+            unsafe {
+                libc::madvise(
+                    self.back.map.as_ptr().add(at).cast_mut().cast(),
+                    n,
+                    libc::MADV_WILLNEED,
+                );
+            }
+            at += n;
+        }
+        to - from
+    }
+
+    fn populate(&self, _: u64, _: usize) -> bool {
+        false
+    }
+
+    fn mapped(&self, _: u64, _: usize) -> Option<f64> {
+        None
+    }
+}
+
+impl Stream {
+    /// The envelope's whole pages for the chunks of `len` bytes at `off`.
+    fn stored_span(&self, off: u64, len: usize) -> Option<(usize, usize)> {
+        if len == 0 || off >= self.len {
+            return None;
+        }
+        let ps = page_size();
+        let a = off / CHUNK as u64;
+        let b = ((off + len as u64).min(self.len) - 1) / CHUNK as u64;
+        let from = self.back.hdr.stored_off(a) as usize / ps * ps;
+        let to = (self.back.hdr.stored_off(b) as usize + self.chunk_len(b) + TAG)
+            .min(self.back.map.len());
+        (from < to).then_some((from, to))
+    }
+}
+
 impl Paged {
     /// The envelope and the pages of it that hold the chunks of `len`
     /// bytes at `off`: the pages wholly inside those chunks' stored bytes
@@ -2132,6 +2726,264 @@ mod tests {
             // SAFETY: made present by `ensure`, under the caller's hold.
             unsafe { std::slice::from_raw_parts(p.base.add(off as usize), len) }.to_vec()
         })
+    }
+
+    /// A stream of `path`'s envelope under `hold`, as a merge reads one.
+    fn stream_of(hold: &Hold, path: &std::path::Path, key: u64) -> crate::bytes::MmapBytes {
+        let back = Back::open(path, Box::new(Toy(key))).unwrap();
+        crate::bytes::MmapBytes::paged(hold.stream(back, None, "test").unwrap())
+    }
+
+    /// A stream lends the plaintext of any range of its file -- inside a
+    /// chunk, across chunks, longer than its buffer, empty, a piece -- and
+    /// refuses a range past the end, and the store's cache neither holds
+    /// nor counts any of it.
+    #[test]
+    fn a_stream_lends_any_range_and_holds_nothing_in_the_cache() {
+        use crate::bytes::Bytes;
+        let dir = scratch("stream-ranges");
+        let bytes = plain(3 * STREAM_BUF + 12_345, 5);
+        let path = dir.join("e");
+        envelope(&path, &bytes, 4);
+        let pager = Pager::new(u64::MAX);
+        let hold = pager.hold();
+        let m = stream_of(&hold, &path, 4);
+        let len = bytes.len() as u64;
+        assert_eq!(m.len(), len);
+        let mut s = 99u64;
+        let mut next = |n: u64| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s % n
+        };
+        let mut ranges: Vec<(u64, usize)> = vec![
+            (0, 0),
+            (0, 1),
+            (CHUNK as u64 - 3, 7),
+            (len - 1, 1),
+            (5 * CHUNK as u64, 2 * STREAM_BUF),
+            (0, bytes.len()),
+        ];
+        for _ in 0..400 {
+            let off = next(len);
+            let n = next((len - off).min(3 * CHUNK as u64) + 1) as usize;
+            ranges.push((off, n));
+        }
+        for (i, &(off, n)) in ranges.iter().enumerate() {
+            if i % 37 == 0 {
+                hold.rest();
+            }
+            let got = m.slice_at(off, n).expect("a range inside the file");
+            assert_eq!(got, &bytes[off as usize..off as usize + n], "{off}+{n}");
+        }
+        assert!(m.slice_at(len - 1, 2).is_none(), "past the end");
+        assert!(m.slice_at(len, 1).is_none(), "past the end");
+        let p = m.piece_at(2 * CHUNK as u64 + 10).expect("a piece");
+        assert_eq!(p, &bytes[2 * CHUNK + 10..3 * CHUNK]);
+        assert_eq!(pager.held(), 0, "nothing in the cache");
+        assert!(
+            pager.counts().streamed > 0,
+            "the chunks counted as streamed"
+        );
+        assert_eq!(pager.counts().fills, 0, "and not as the cache's fills");
+        assert!(pager.check().is_ok());
+    }
+
+    /// What a stream lends stands until its holder rests or idles, however
+    /// much is asked for meanwhile, and a walk in order decrypts each chunk
+    /// once. After a rest the walk asks again for where it stood, which is
+    /// lent from the stretch before without decrypting it again and kept
+    /// another stretch for being found; what nothing asks for through two
+    /// rests is written over, from the first buffer, and a chunk of it is
+    /// decrypted again. An idle is a rest.
+    #[test]
+    fn a_stream_keeps_its_lends_until_a_rest_and_the_stretch_before_until_the_next() {
+        use crate::bytes::Bytes;
+        let dir = scratch("stream-rests");
+        let bytes = plain(4 * STREAM_BUF, 6);
+        let path = dir.join("e");
+        envelope(&path, &bytes, 2);
+        let pager = Pager::new(u64::MAX);
+        let hold = pager.hold();
+        let m = stream_of(&hold, &path, 2);
+        let chunks = bytes.len().div_ceil(CHUNK) as u64;
+        // A walk in order, in asks that cross chunks, every lend kept.
+        let mut kept: Vec<(usize, &[u8])> = Vec::new();
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let n = 300.min(bytes.len() - off);
+            kept.push((off, m.slice_at(off as u64, n).unwrap()));
+            off += n;
+        }
+        for &(off, got) in &kept {
+            assert_eq!(got, &bytes[off..off + got.len()], "a lend at {off} kept");
+        }
+        // Each chunk once, but where a run reaches the end of a buffer: the
+        // ask across it starts the run again in the next, with the chunk
+        // the last one ended on.
+        let walked = pager.counts().streamed;
+        let buffers = (chunks as usize * CHUNK).div_ceil(STREAM_BUF) as u64;
+        assert!(
+            (chunks..chunks + buffers).contains(&walked),
+            "{walked} chunks decrypted for {chunks} in {buffers} buffers"
+        );
+        let first = kept[0].1.as_ptr();
+        let (last, tail) = *kept.last().unwrap();
+        let tail = tail.as_ptr();
+        drop(kept);
+        let count = || pager.counts().streamed;
+        // A rest: where the walk stood is lent again as it lies, and found
+        // so it is kept through the next rest too.
+        hold.rest();
+        let again = m.slice_at(last as u64, bytes.len() - last).unwrap();
+        assert_eq!(again, &bytes[last..]);
+        assert_eq!(again.as_ptr(), tail, "the stretch before lent from");
+        assert_eq!(count(), walked, "and nothing decrypted again");
+        hold.rest();
+        let again = m.slice_at(last as u64, bytes.len() - last).unwrap();
+        assert_eq!(again.as_ptr(), tail, "a run found is kept another stretch");
+        assert_eq!(count(), walked);
+        // Two rests with nothing asked: the first buffer is free, and is
+        // written again.
+        hold.rest();
+        hold.rest();
+        let fresh = m.slice_at(0, 300).unwrap();
+        assert_eq!(fresh, &bytes[..300]);
+        assert_eq!(fresh.as_ptr(), first, "the first buffer written again");
+        assert_eq!(count(), walked + 1);
+        // An idle is a rest: the stretch before is lent from, and then not.
+        hold.idle(|| ());
+        assert_eq!(m.slice_at(0, 300).unwrap(), &bytes[..300]);
+        assert_eq!(count(), walked + 1, "lent from the stretch before an idle");
+        hold.idle(|| ());
+        hold.idle(|| ());
+        assert_eq!(m.slice_at(0, 300).unwrap(), &bytes[..300]);
+        assert_eq!(count(), walked + 2, "decrypted again two idles on");
+        // And between two rests nothing is decrypted twice.
+        let _ = m.slice_at(100, 200).unwrap();
+        assert_eq!(count(), walked + 2);
+    }
+
+    /// A stream's ring writes no buffer written in this stretch or the one
+    /// before, which is what a walk may still be lent after a rest, and
+    /// writes again one written two rests ago.
+    #[test]
+    fn a_rings_buffer_is_written_again_two_rests_after_it_was_written() {
+        let mut ring = Ring {
+            rest: 0,
+            bufs: Vec::new(),
+            buf: 0,
+            runs: [Run::NONE; STREAM_RUNS],
+            newest: 0,
+        };
+        let a = ring.take(STREAM_BUF);
+        let b = ring.take(STREAM_BUF);
+        assert_ne!(a, b);
+        ring.restart(1);
+        let c = ring.take(STREAM_BUF);
+        assert!(
+            c != a && c != b,
+            "a buffer of the stretch before written over"
+        );
+        ring.restart(2);
+        let d = ring.take(STREAM_BUF);
+        assert!(d == a || d == b, "a buffer two rests old not written again");
+        let e = ring.take(STREAM_BUF);
+        assert!(e == a || e == b, "the other one either");
+        assert_ne!(d, e);
+        assert_eq!(ring.bufs.len(), 3);
+    }
+
+    /// An input of a merge is read in two places at once, its directory
+    /// and its records, so the run a record across two chunks starts in is
+    /// seldom the one written last: the chunk it already holds is copied
+    /// from it, and no chunk the walk touches is decrypted twice.
+    #[test]
+    fn a_stream_read_in_two_places_decrypts_each_chunk_once() {
+        use crate::bytes::Bytes;
+        let dir = scratch("stream-two");
+        let bytes = plain(40 * CHUNK, 8);
+        let path = dir.join("e");
+        envelope(&path, &bytes, 5);
+        let pager = Pager::new(u64::MAX);
+        let hold = pager.hold();
+        let m = stream_of(&hold, &path, 5);
+        let dir_at = 36 * CHUNK;
+        let mut touched = std::collections::BTreeSet::new();
+        let mut rec = 0usize;
+        let mut i = 0usize;
+        while rec + 300 < 30 * CHUNK {
+            let d = dir_at + 8 * i;
+            assert_eq!(m.slice_at(d as u64, 8).unwrap(), &bytes[d..d + 8]);
+            assert_eq!(m.slice_at(rec as u64, 300).unwrap(), &bytes[rec..rec + 300]);
+            for at in [d, d + 7, rec, rec + 299] {
+                touched.insert(at / CHUNK);
+            }
+            rec += 300;
+            i += 1;
+        }
+        assert_eq!(
+            pager.counts().streamed,
+            touched.len() as u64,
+            "each chunk touched decrypted once"
+        );
+    }
+
+    /// A stream over a file the cache holds part of takes those chunks from
+    /// the cache's view, as they lie and without touching their recency,
+    /// and decrypts the rest.
+    #[test]
+    fn a_stream_takes_what_the_cache_holds_from_it() {
+        use crate::bytes::Bytes;
+        let dir = scratch("stream-cached");
+        let bytes = plain(30 * CHUNK, 9);
+        let path = dir.join("e");
+        envelope(&path, &bytes, 6);
+        let pager = Pager::new(u64::MAX);
+        let hold = pager.hold();
+        let view = sparse(&pager, &path, 6);
+        for c in [3usize, 4, 10, 29] {
+            read(&view, (c * CHUNK) as u64, 10).unwrap();
+        }
+        let fills = pager.counts().fills;
+        let back = Back::open(&path, Box::new(Toy(6))).unwrap();
+        let m = crate::bytes::MmapBytes::paged(hold.stream(back, Some(view.clone()), "t").unwrap());
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let n = 500.min(bytes.len() - off);
+            assert_eq!(m.slice_at(off as u64, n).unwrap(), &bytes[off..off + n]);
+            off += n;
+        }
+        assert_eq!(pager.counts().streamed, 30 - 4, "the cache's four copied");
+        assert_eq!(pager.counts().fills, fills, "and nothing filled into it");
+    }
+
+    /// A chunk a stream reads that fails its check is the store's failure,
+    /// as a fill's is: the read answers nothing and every read of the
+    /// store after answers the failure (`Pager::check`).
+    #[test]
+    fn a_chunk_that_fails_its_check_through_a_stream_poisons_the_store() {
+        use crate::bytes::Bytes;
+        let dir = scratch("stream-damage");
+        let bytes = plain(10 * CHUNK, 7);
+        let path = dir.join("e");
+        envelope(&path, &bytes, 3);
+        let mut env = std::fs::read(&path).unwrap();
+        let hdr = Header::parse(&env[..Header::LEN]).unwrap();
+        let at = hdr.stored_off(4) as usize + 9;
+        env[at] ^= 1;
+        std::fs::write(&path, &env).unwrap();
+        let pager = Pager::new(u64::MAX);
+        let hold = pager.hold();
+        let m = stream_of(&hold, &path, 3);
+        assert_eq!(m.slice_at(0, 10).unwrap(), &bytes[..10], "a chunk whole");
+        assert!(pager.check().is_ok());
+        assert!(
+            m.slice_at(4 * CHUNK as u64 + 1, 5).is_none(),
+            "the chunk changed"
+        );
+        assert!(pager.check().is_err(), "the store refuses from then on");
     }
 
     /// A view says what of a range is in memory, here or in the kernel's

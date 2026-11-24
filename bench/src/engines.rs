@@ -523,6 +523,8 @@ pub struct Supdb {
     cipher_land_model: bool,
     /// `Policy::cipher_merge_apart`.
     cipher_merge_apart: bool,
+    /// `Policy::cipher_merge_stream`.
+    cipher_merge_stream: bool,
     /// False for the ingest-first arm: a flush stops partitioning what it
     /// sealed and leaves that to the background -- promotion at once, a
     /// merge for the rest (`Options::flush_schedules`). Both arms exist so
@@ -1978,6 +1980,11 @@ struct Policy {
     /// a window ahead, a window whole: `supdb-cipherautomergeapart`, beside
     /// `supdb-cipherauto`, the shape before.
     cipher_merge_apart: bool,
+    /// The store under a cipher with the controller on and its merges
+    /// reading their inputs beside the store's cache
+    /// (`StoreCipher::merges_beside_cache`): `supdb-cipherautomergestream`,
+    /// beside `supdb-cipherauto`, which reads them through it.
+    cipher_merge_stream: bool,
     partition: bool,
     drain: bool,
     advice: Option<supdb::ReadAdvice>,
@@ -3153,6 +3160,7 @@ impl Default for Policy {
             cipher_half: false,
             cipher_land_model: false,
             cipher_merge_apart: false,
+            cipher_merge_stream: false,
             partition: true,
             drain: true,
             advice: None,
@@ -3614,13 +3622,15 @@ fn encryption_of(
     cipher_cache: u64,
     cipher_apart: bool,
     cipher_half: bool,
+    cipher_merge_stream: bool,
 ) -> supdb::Encryption {
     match (dir_key, cipher) {
         (true, _) => supdb::Encryption::Kernel(supdb::DirKey::new([0x5a; 32])),
         (false, true) => {
             let c = supdb::StoreCipher::new(Gcm::new(), Gcm::of)
                 .chunks_apart(cipher_apart)
-                .cache_half_at_open(cipher_half);
+                .cache_half_at_open(cipher_half)
+                .merges_beside_cache(cipher_merge_stream);
             supdb::Encryption::Cipher(match cipher_cache {
                 0 => c,
                 bytes => c.cache_bytes(bytes),
@@ -3735,6 +3745,21 @@ impl Supdb {
                 cipher: true,
                 cipher_auto: true,
                 cipher_land_model: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherauto` with its merges reading their inputs beside the
+    /// store's cache (`Policy::cipher_merge_stream`):
+    /// `supdb-cipherautomergestream`.
+    pub fn create_cipherauto_mergestream(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: true,
+                cipher_merge_stream: true,
                 ..Policy::default()
             },
         )
@@ -9901,6 +9926,7 @@ impl Supdb {
             cipher_half,
             cipher_land_model,
             cipher_merge_apart,
+            cipher_merge_stream,
             partition,
             drain,
             advice,
@@ -10895,7 +10921,14 @@ impl Supdb {
                 opts.direct_ingest = false;
             }
         }
-        opts.encryption = encryption_of(dir_key, cipher, cipher_cache, cipher_apart, cipher_half);
+        opts.encryption = encryption_of(
+            dir_key,
+            cipher,
+            cipher_cache,
+            cipher_apart,
+            cipher_half,
+            cipher_merge_stream,
+        );
         let db = if REOPEN.with(|r| r.get()) {
             supdb::Db::open(path, opts)
         } else {
@@ -10914,6 +10947,7 @@ impl Supdb {
             cipher_half,
             cipher_land_model,
             cipher_merge_apart,
+            cipher_merge_stream,
             partition,
             drain,
             advice,
@@ -11354,6 +11388,9 @@ impl Engine for Supdb {
                 false if self.cipher_log => "supdb-ingestcipherlog",
                 true if self.cipher_auto && self.cipher_land_model => "supdb-cipherautolandmodel",
                 true if self.cipher_auto && self.cipher_merge_apart => "supdb-cipherautomergeapart",
+                true if self.cipher_auto && self.cipher_merge_stream => {
+                    "supdb-cipherautomergestream"
+                }
                 true if self.cipher_auto => "supdb-cipherauto",
                 false if self.cipher_auto => "supdb-ingestcipherauto",
                 true if self.cipher_cache != 0 => "supdb-cipher64",
@@ -14970,6 +15007,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cipherauto"
         | "supdb-cipherautolandmodel"
         | "supdb-cipherautomergeapart"
+        | "supdb-cipherautomergestream"
         | "supdb-cipherzpages"
         | "supdb-cipherzstride"
         | "supdb-cipherzstrideapart"
@@ -15574,6 +15612,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cipherauto" => supdb_arm(Supdb::create_cipherauto, dir)?,
         "supdb-cipherautolandmodel" => supdb_arm(Supdb::create_cipherauto_landmodel, dir)?,
         "supdb-cipherautomergeapart" => supdb_arm(Supdb::create_cipherauto_mergeapart, dir)?,
+        "supdb-cipherautomergestream" => supdb_arm(Supdb::create_cipherauto_mergestream, dir)?,
         "supdb-cipherzpages" => supdb_arm(Supdb::create_cipher_zpages, dir)?,
         "supdb-cipherzstride" => supdb_arm(Supdb::create_cipher_zstride, dir)?,
         "supdb-cipherzstrideapart" => supdb_arm(Supdb::create_cipher_zstride_apart, dir)?,
@@ -17709,6 +17748,29 @@ mod tests {
             guarantee("supdb-cipher")
         );
         drop(apart);
+        let stream = arm(
+            "supdb-cipherautomergestream",
+            Supdb::create_cipherauto_mergestream,
+        );
+        assert!(
+            under(&stream),
+            "supdb-cipherautomergestream: under a cipher"
+        );
+        let m = o(&stream);
+        assert!(m.zpages_under_cipher, "supdb-cipherautomergestream");
+        // What it changes is the cipher's, which the options hand to the
+        // store: the arm's policy, held to the cipher it makes below
+        // (`the_dirkey_arm_asks_the_kernel_and_the_cipher_arms_a_cipher`).
+        assert!(
+            !auto.cipher_merge_stream && stream.cipher_merge_stream,
+            "supdb-cipherautomergestream reads its merges' inputs beside the cache"
+        );
+        assert_eq!(m.merge_read_ahead_cipher, z.merge_read_ahead_cipher);
+        assert_eq!(
+            guarantee("supdb-cipherautomergestream"),
+            guarantee("supdb-cipher")
+        );
+        drop(stream);
         drop((plain, cipher, log, auto, zblock, zstride));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -17721,25 +17783,32 @@ mod tests {
     fn the_dirkey_arm_asks_the_kernel_and_the_cipher_arms_a_cipher() {
         use supdb::Encryption;
         assert!(matches!(
-            encryption_of(true, false, 0, false, false),
+            encryption_of(true, false, 0, false, false, false),
             Encryption::Kernel(_)
         ));
         assert!(matches!(
-            encryption_of(true, true, 0, false, false),
+            encryption_of(true, true, 0, false, false, false),
             Encryption::Kernel(_)
         ));
         assert!(matches!(
-            encryption_of(false, true, 0, false, false),
+            encryption_of(false, true, 0, false, false, false),
             Encryption::Cipher(_)
         ));
         assert!(matches!(
-            encryption_of(false, true, 64 << 20, false, false),
+            encryption_of(false, true, 64 << 20, false, false, false),
             Encryption::Cipher(_)
         ));
         assert!(matches!(
-            encryption_of(false, false, 0, false, false),
+            encryption_of(false, false, 0, false, false, false),
             Encryption::None
         ));
+        // The merges' reads beside the cache are the cipher's knob.
+        let beside = |e: Encryption| match e {
+            Encryption::Cipher(c) => c.merges_beside_cache_set(),
+            _ => false,
+        };
+        assert!(beside(encryption_of(false, true, 0, false, false, true)));
+        assert!(!beside(encryption_of(false, true, 0, false, false, false)));
         // And the bound reaches the store: `supdb-cipher64`'s cache is its
         // policy's sixty-four mebibytes, `supdb-cipher`'s the engine's own.
         let root =
@@ -17766,7 +17835,7 @@ mod tests {
         // in a gate's bench group, where the two were held within a
         // quarter of each other. A store keeps no cipher in its options
         // past its open, so the cipher is the policy's.
-        let size = |cache: u64| match encryption_of(false, true, cache, false, false) {
+        let size = |cache: u64| match encryption_of(false, true, cache, false, false, false) {
             Encryption::Cipher(c) => c.cache_bytes_set(),
             _ => panic!("a cipher"),
         };

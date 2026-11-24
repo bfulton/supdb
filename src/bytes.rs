@@ -411,6 +411,16 @@ pub(crate) trait Paging: Send + Sync {
     /// range past the end, bytes that fail their check, a read that
     /// failed), in which case nothing of the range may be read.
     fn ensure(&self, off: u64, len: usize) -> bool;
+    /// `len` bytes at `off` made present, and where they lie: in the
+    /// mapping at its base and `off` for the pager's cache, which a range
+    /// asked for again finds in the same place, or wherever a view read
+    /// in order keeps them (`pager::Stream`), which recycles its buffer
+    /// at its holder's rests and so lends a range until then and no
+    /// longer. `None` where `ensure` would answer false.
+    fn place(&self, off: u64, len: usize) -> Option<*const u8>;
+    /// `piece_from`, and where the piece's bytes from `off` lie, as
+    /// `place` says.
+    fn place_piece(&self, off: u64) -> Option<(*const u8, usize)>;
     /// Where the piece holding `off` ends.
     fn piece_end(&self, off: u64) -> u64;
     /// The piece holding `off` made present from `off` to its end, and how
@@ -595,11 +605,13 @@ impl MmapBytes {
         let Own::Paged(p) = &self.own else {
             return None;
         };
-        if off.checked_add(len as u64)? > self.len || !p.ensure(off, len) {
+        if off.checked_add(len as u64)? > self.len {
             return None;
         }
-        // SAFETY: inside the mapping, and made present by `ensure`.
-        Some(unsafe { std::slice::from_raw_parts(self.ptr.add(off as usize), len) })
+        let at = p.place(off, len)?;
+        // SAFETY: `len` bytes made present by `place` where it says they
+        // lie, for as long as the pin or the hold they were asked under.
+        Some(unsafe { std::slice::from_raw_parts(at, len) })
     }
 
     /// How many of the system pages that `len` bytes at `off` of a mapped
@@ -718,12 +730,12 @@ impl Bytes for MmapBytes {
                 let end = off.saturating_add(4096).min(self.len);
                 self.slice_at(off, usize::try_from(end.checked_sub(off)?).ok()?)
             }
-            Own::Paged(p) => match p.piece_from(off) {
-                0 => None,
-                // SAFETY: inside the mapping, and made present by
-                // `piece_from`.
-                n => Some(unsafe { std::slice::from_raw_parts(self.ptr.add(off as usize), n) }),
-            },
+            Own::Paged(p) => {
+                let (at, n) = p.place_piece(off)?;
+                // SAFETY: `n` bytes made present by `place_piece` where it
+                // says they lie.
+                Some(unsafe { std::slice::from_raw_parts(at, n) })
+            }
         }
     }
     fn advise_random(&self) {
