@@ -784,6 +784,40 @@ is an update's instructions, 801 against 555, and FASTER's
 read-modify-write, which updates the record its read found in place
 where ours adds a tombstone and a value to the key's chain.
 
+#### A held log with no frames
+
+What was left of an update's instructions at `334f00e`, counted by
+function (`point_ops supdb-held 100000 1 zipf 1` under callgrind toggled on
+`point_ops::phase_updates`), was 808, and the largest single part was the
+log: 120 building a put's two frames into the held buffer and 30 the
+batch's CRC at the commit, for frames the drain that covers them drops
+unwritten -- the suite's `sync` for the arm is its drain. With the log
+building no frames (`Options::held_frames` off, `supdb-heldnoframes`) an
+update counts 597, against FASTER's 555, and the reads count what they did
+to the instruction.
+
+Paired at three hundred thousand keys against the held arm (`pair.sh
+supdb-heldnoframes supdb-held 300000 --reps 4 --passes
+load,read,read-threaded,mixes,mixes-scrambled,lag`, at `334f00e`; ours over
+the held arm's, both sittings): A 1.13x and 1.12x, F 1.20x and 1.12x, the
+scrambled A, D and F 1.07-1.31x, D 1.06x and 1.10x, and the update bursts
+1.12-1.14x by the sittings' geometric mean. The read-only mix and the
+threaded reads read 0.90-0.94x in both orders over code that counts the
+same to the instruction, the arms differing in the held log's buffer of 64
+MiB reserved at the open and nothing else before those passes: placement,
+unresolved, and the writes' gain is read against it.
+
+Beside FASTER in the same sitting (`pair.sh supdb-heldnoframes faster
+300000`, the same passes; the geometric mean of the two sittings, ours
+over FASTER's, since the read-only mix C, which no write reaches, read
+0.82x with the arm listed first and 1.25x with it second): A 1.08x, B 0.99x,
+C 1.01x, D 1.06x, F 0.82x; the scrambled A, B and C 1.00-1.02x, D 0.81x and
+F 0.81x; the read pass 1.07x, 1.15x on two threads and 1.14x on three; the
+loads 4.0x and 2.1x; and the update bursts 0.48x, 0.38x and 0.30x at one,
+ten and a hundred percent of the store. What FASTER keeps is the update
+beside a get of the same keys -- F and the scrambled D and F -- and the
+bursts, which update the whole store at the rate its log appends.
+
 #### Beside FASTER out of core
 
 A store larger than memory is what FASTER's log is made for, and the

@@ -44,7 +44,9 @@ const BOTTOM: f64 = 48.0;
 /// the second dashed.
 fn style(arm: &str) -> (&'static str, &'static str) {
     match arm {
-        "supdb" | "supdb-ingest" | "supdb-held" | "supdb-heldpart" => (INK, ""),
+        "supdb" | "supdb-ingest" | "supdb-held" | "supdb-heldnoframes" | "supdb-heldpart" => {
+            (INK, "")
+        }
         "supdb-noadvice" => (ACCENT, ""),
         "supdb-nocache" => (ACCENT, "7,4"),
         "supdb-forms" => (ACCENT, "4,2"),
@@ -74,6 +76,7 @@ fn pretty(arm: &str) -> &'static str {
         "supdb-ingest" => "supdb (buffered)",
         "supdb-held" => "supdb (log held in memory)",
         "supdb-heldpart" => "supdb (log held in memory)",
+        "supdb-heldnoframes" => "supdb (in memory until a sync)",
         "lmdb" => "LMDB",
         "lmdb-nordahead" => "LMDB (no readahead)",
         "lmdb-nosync" => "LMDB (nosync)",
@@ -615,6 +618,7 @@ fn message(
     // the one arm the engine has in each of the other two.
     let mine = at("supdb")
         .or_else(|| at("supdb-ingest"))
+        .or_else(|| at("supdb-heldnoframes"))
         .or_else(|| at("supdb-held"))
         .or_else(|| at("supdb-heldpart"));
     let noun = workload_noun(workload);

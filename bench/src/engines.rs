@@ -14728,7 +14728,7 @@ macro_rules! roster {
     };
 }
 #[cfg(faster)]
-pub const ARMS: [&str; 15] = roster!("supdb-held", "faster");
+pub const ARMS: [&str; 15] = roster!("supdb-heldnoframes", "faster");
 #[cfg(not(faster))]
 pub const ARMS: [&str; 13] = roster!();
 
@@ -17805,13 +17805,14 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         #[cfg(faster)]
         {
-            assert!(ARMS.contains(&"supdb-held") && ARMS.contains(&"faster"));
-            let pair = ["supdb-held".to_string(), "faster".to_string()];
+            assert!(ARMS.contains(&"supdb-heldnoframes") && ARMS.contains(&"faster"));
+            assert!(!ARMS.contains(&"supdb-held"), "both held arms in the roster");
+            let pair = ["supdb-heldnoframes".to_string(), "faster".to_string()];
             assert_eq!(check_matched(&pair, &root), Ok(()));
         }
         #[cfg(not(faster))]
         assert!(
-            !ARMS.contains(&"supdb-held"),
+            !ARMS.contains(&"supdb-heldnoframes") && !ARMS.contains(&"supdb-held"),
             "the held arm without its pair"
         );
         let whole: Vec<String> = ARMS.iter().map(|a| a.to_string()).collect();

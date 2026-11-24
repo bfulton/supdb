@@ -60,10 +60,10 @@ fn a_row_carries_both_recoveries_for_every_arm() {
     // is every durable store whole.
     let durable = ["supdb", "lmdb", "rocksdb-tuned"];
     let buffered = ["supdb-ingest", "lmdb-nosync", "rocksdb-tuned-nosync"];
-    // And the arm of the third guarantee that reopens a store: the log
-    // held in the process until a sync. `faster`, beside it in the roster,
-    // runs no recovery workload.
-    let held = "supdb-held";
+    // And the arm of the third guarantee that reopens a store: nothing
+    // promised until a sync, the roster's arm of it. `faster`, beside it in
+    // the roster, runs no recovery workload.
+    let held = "supdb-heldnoframes";
     let mut arms = [durable, buffered].concat();
     arms.push(held);
     let arms = arms.join(",");

@@ -310,7 +310,7 @@ pick.
 |---|---|---|
 | durable per batch | `supdb` (default), `supdb-forms`, `supdb-settle`, `supdb-nosnap`, `supdb-noadvice`, `supdb-nocache`, `supdb-cache256` | `lmdb`, `rocksdb-tuned`, and in the bounded roster `rocksdb-tuned-lz4` |
 | buffered | `supdb-ingest` | `lmdb-nosync`, `rocksdb-tuned-nosync` |
-| in memory until a checkpoint | `supdb-held`, and in the bounded roster `supdb-heldpart`, where `faster` is built | `faster`, where it is built |
+| in memory until a checkpoint | `supdb-heldnoframes`, and in the bounded roster `supdb-heldpart`, where `faster` is built | `faster`, where it is built |
 
 `faster` is Microsoft's FASTER, its C++ store: the comparator a user would
 otherwise pick for point gets and puts alone, a hash index over a log that
@@ -326,12 +326,16 @@ which for FASTER is a checkpoint of its log, written in whole pages of
 32 MiB. Read-modify-write in the `threads` workloads is FASTER's own single
 operation, and a read and then a write for every other arm.
 
-`supdb-held` is `supdb-ingest` opened under the one policy of the engine's
-that promises what FASTER does (`SyncPolicy::Explicit`): a commit's frames
-stay in the process, the arm's `sync` is its drain as its sibling's is,
-and a process that is killed loses what it committed since. It is in the
-roster where `faster` is and in no other, the pair being what it is
-measured for.
+`supdb-heldnoframes` is `supdb-ingest` opened under the one policy of the
+engine's that promises what FASTER does (`SyncPolicy::Explicit`) with its
+log building no frames (`Options::held_frames` off): a commit is in the
+memtable alone, the arm's `sync` is its drain as its sibling's is, and a
+process that is killed loses what it committed since. It is in the roster
+where `faster` is and in no other, the pair being what it is measured for.
+`supdb-held` is the same arm with the frames the log holds, which the drain
+that covers them drops unwritten: the roster's arm of the guarantee until
+the frames were priced at a quarter of an update's instructions, and kept
+for pricing.
 
 The two differ on the ordered scan and the reopen, which `faster` has not
 got and has no setting for. The check that holds a guarantee's arms to one
@@ -343,10 +347,10 @@ scan, a difference on any other axis, and a `faster` that had what its
 neighbour lacked are each refused as before. So the comparison is over the
 workloads both arms have, the loads, the point reads, the mixes without a
 scan and the update bursts, and a figure of the group is drawn where both
-have the cell; `supdb-held` runs the scan workloads, E and the recovery
+have the cell; `supdb-heldnoframes` runs the scan workloads, E and the recovery
 workloads as well, with nothing beside it there and no figure, and what a
 killed process cost it is its `unrecovered_batches`: of a shuffled load,
-every batch no seal's manifest covered and no spill wrote, which at a rung
+every batch no seal's manifest covered, which at a rung
 that seals nothing is all of them; of an ordered load none, a run's
 records going to the run's own file at each commit under every policy.
 
