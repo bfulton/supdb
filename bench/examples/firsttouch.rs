@@ -25,15 +25,32 @@
 //!
 //! `--wait` sleeps between the drop and the read back, for a host that
 //! takes freed pages away after a delay.
+//!
+//! The cache it probes is Linux's and so are its calls (`posix_fadvise`,
+//! `readahead`, `MADV_POPULATE_READ`, a thread's own `rusage`), so every
+//! item is Linux's alone and elsewhere the example says so and does
+//! nothing: the suite's lint type-checks every example on every host.
+#[cfg(target_os = "linux")]
 use std::io::Write as _;
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd as _;
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::time::Instant;
 
+#[cfg(target_os = "linux")]
 const PAGE: usize = 4096;
+#[cfg(target_os = "linux")]
 const MADV_POPULATE_READ: libc::c_int = 22;
 
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("firsttouch: a probe of Linux's page cache, and nothing to run on this host");
+}
+
 /// This thread's CPU time in milliseconds and its minor and major faults.
+#[cfg(target_os = "linux")]
 fn thread_counts() -> (f64, i64, i64) {
     // SAFETY: plain reads into values on the stack.
     unsafe {
@@ -50,6 +67,7 @@ fn thread_counts() -> (f64, i64, i64) {
 }
 
 /// The pages of `len` bytes at `p` that the page cache holds.
+#[cfg(target_os = "linux")]
 fn resident(p: *mut libc::c_void, len: usize) -> usize {
     let mut vec = vec![0u8; len.div_ceil(PAGE)];
     // SAFETY: `p..p+len` is one live mapping and `vec` has a byte a page.
@@ -61,6 +79,7 @@ fn resident(p: *mut libc::c_void, len: usize) -> usize {
 
 /// One byte of every `stride`th page read once, the pages taken in a
 /// scattered order as scans at random starts would take them.
+#[cfg(target_os = "linux")]
 fn pass(tag: &str, p: *const u8, len: usize, stride: usize) {
     let n = len / PAGE;
     let (cpu0, min0, maj0) = thread_counts();
@@ -87,6 +106,7 @@ fn pass(tag: &str, p: *const u8, len: usize, stride: usize) {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn main() {
     let mut dir = std::env::temp_dir();
     let (mut mb, mut wait) = (256usize, 0u64);
