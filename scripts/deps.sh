@@ -28,16 +28,8 @@ cd "$(dirname "$0")/.."
 
 groups="${*:-rust libclang faster}"
 say() { printf '\n== %s ==\n' "$1"; }
-# A container runs as root and may have no sudo; anywhere else, ask for it.
-if [ "$(id -u)" = 0 ]; then root=; else root=sudo; fi
-apt_install() {
-  if ! command -v apt-get >/dev/null; then
-    echo "no apt-get here; install by hand: $*" >&2
-    exit 1
-  fi
-  $root apt-get update -qq >/dev/null
-  $root apt-get install -y -qq --no-install-recommends "$@" >/dev/null
-}
+# One definition of an install, which the suite's set-up scripts call too.
+apt_install() { sh scripts/apt.sh "$@"; }
 
 for g in $groups; do
   case "$g" in

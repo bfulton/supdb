@@ -78,6 +78,20 @@ library -lclang`. A dependency's defaults turned off for one of them are
 read for the rest: the one dropped here was the reason a host needed
 nothing.
 
+What a host still lacks is installed by `scripts/apt.sh`, the one
+definition of an install for `scripts/deps.sh`, the suite's set-up
+scripts and the workflows: with the package lists the host has, and
+fresh ones only where that fails. Every caller had fetched the lists
+first, thirteen megabytes on a hosted x64 runner ahead of the two thirds
+of a megabyte the `faster` arm's three libraries are, and on a day the
+mirror was slow that step ran eleven seconds in one x64 job and three to
+four minutes in others started beside it, and held one for half an hour
+until the run was cancelled, with nothing in its log: the scripts sent
+apt's output nowhere, and the helper prints it where an install fails.
+It installs no recommended extras, so a package
+a job needs and another only recommends is named, as `cross-arm` names
+the target's C library.
+
 `sh scripts/check.sh` runs every group -- build, test, stride, lint, wasm, bench --
 and CI calls the same script with the same names, so a green run here is a
 green run there. Every group denies warnings, the wasm group since it was

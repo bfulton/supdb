@@ -162,8 +162,10 @@ jobs:
       - name: The pinned toolchain
         run: sh scripts/toolchain.sh aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
+      # The target's C library is named: the compiler's package only
+      # recommends it, and scripts/apt.sh installs no recommended extras.
       - name: Cross toolchain
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu qemu-user-static
+        run: sh scripts/apt.sh gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user-static
       # The linker and the emulator belong to this job, not to the
       # repository: `.cargo/config.toml` set them for the aarch64 target,
       # which is also the *host* target on the native ARM runner, so that

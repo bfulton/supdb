@@ -112,12 +112,10 @@ case "$(uname -s)" in
       exit 0
     fi
     # No libclang with its headers anywhere. On a Debian-family host
-    # libclang-dev brings both; install it when we may. A container runs as
-    # root and may have no sudo, and needs none.
-    if [ "$(id -u)" = 0 ]; then root=; else root=sudo; fi
-    if command -v apt-get >/dev/null && { [ -z "$root" ] || command -v sudo >/dev/null; }; then
-      $root apt-get update -qq >/dev/null
-      $root apt-get install -y -qq --no-install-recommends libclang-dev >/dev/null
+    # libclang-dev brings both; install it where the host has apt, by the
+    # engine's scripts/apt.sh.
+    if command -v apt-get >/dev/null; then
+      sh "$(dirname "$0")/../../scripts/apt.sh" libclang-dev
       if d=$(find_dir); then
         emit LIBCLANG_PATH "$d"
         exit 0

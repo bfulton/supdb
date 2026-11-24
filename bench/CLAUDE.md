@@ -785,7 +785,8 @@ is the other comparator a host has to be readied for, and
 `scripts/faster.sh` is its one definition, called wherever
 `scripts/libclang.sh` is: it is not a crate, so the script fetches its
 sources at the commit `vendor/faster/PIN` names into a directory git
-ignores and installs the three libraries they link, and `build.rs` fails
+ignores and installs the three libraries they link, by the engine's
+`scripts/apt.sh` and so with the package lists the host has, and `build.rs` fails
 the build where they are missing or another commit's. The arm exists on
 Linux x86-64 alone (`cfg(faster)`, set by `build.rs`), so nothing on
 macOS or ARM builds or needs it. Cargo takes profiles from the root of the workspace being

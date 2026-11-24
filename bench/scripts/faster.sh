@@ -29,15 +29,10 @@ missing=
 [ -f /usr/include/tbb/concurrent_queue.h ] || missing="$missing libtbb-dev"
 [ -f /usr/include/uuid/uuid.h ] || missing="$missing uuid-dev"
 if [ -n "$missing" ]; then
-  # A container runs as root and may have no sudo, and needs none.
-  if [ "$(id -u)" = 0 ]; then root=; else root=sudo; fi
-  if ! command -v apt-get >/dev/null; then
-    echo "faster: no apt-get here; install by hand:$missing" >&2
-    exit 1
-  fi
-  $root apt-get update -qq >/dev/null
+  # With the package lists the host has, and fresh ones only where those
+  # fail: the engine's scripts/apt.sh, which says why.
   # shellcheck disable=SC2086 # a list of package names
-  $root apt-get install -y -qq --no-install-recommends $missing >/dev/null
+  sh "$bench/../scripts/apt.sh" $missing
 fi
 
 dest=$bench/vendor/faster
