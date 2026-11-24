@@ -12,7 +12,7 @@ use supdb::{Db, Isolation, Options, ReadAdvice, Reader};
 mod common;
 #[cfg(target_os = "linux")]
 use common::cached_pages;
-use common::{dead_arena, kv, vf, without_the_clock};
+use common::{kv, vf, without_the_clock};
 
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-{name}-{}", std::process::id()));
@@ -6383,65 +6383,6 @@ fn an_upkeep_pass_end_asks_the_trim_thread_to_look() {
     };
     assert_eq!(run(false), 0, "without the option no pass asks for a look");
     assert!(run(true) > 0, "with the option a pass end asked for a look");
-}
-
-/// The trim thread counting by the resident bytes (`Options::trim_by_resident`)
-/// trims again when a dead arena's pages come back resident, which the free
-/// count never sees, since the pages come back under chunks already free. A
-/// store with the look at every pass end and a stride of eight megabytes,
-/// beside a dead arena of thirty-two: its first look trims, the floor
-/// starting at zero; a thread then re-touches the arena and frees it, and a
-/// pass's look trims again. The positive alone, since what the allocator
-/// holds is the whole process's; the free count's standing still is
-/// `trim_due`'s arithmetic over the census's readings.
-#[test]
-fn the_trim_thread_counting_by_resident_bytes_trims_a_dead_arena_again() {
-    if !Db::trim_supported() {
-        return;
-    }
-    let _trims = trim_lock();
-    let keeper = dead_arena(32 << 20);
-    let name = "trim-resident";
-    let (mut db, mut m) = burst_into_forms_with(name, 8 << 10, true, |o| {
-        o.upkeep = supdb::Upkeep::Background(1);
-        o.upkeep_inline_bursts = false;
-        o.forms_trim_bytes = 8 << 20;
-        o.upkeep_trim_look = true;
-        o.trim_by_resident = true;
-    });
-    let mut rounds = 0u32;
-    while db.forms_trims() == 0 {
-        assert!(
-            rounds < 400,
-            "no first trim: {} looks, held {:?}",
-            db.forms_trim_looks(),
-            db.trim_held_bytes()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        rounds += 1;
-    }
-    let first = db.forms_trims();
-    let keeper2 = dead_arena(32 << 20);
-    let mut rounds = 0u32;
-    while db.forms_trims() <= first {
-        assert!(
-            rounds < 400,
-            "no second trim: {} trims, {} looks, held {:?}",
-            db.forms_trims(),
-            db.forms_trim_looks(),
-            db.trim_held_bytes()
-        );
-        m.append(
-            &mut db,
-            &format!("key-{:05}", 3000 + rounds),
-            "v3-0123456789",
-        );
-        db.commit().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        rounds += 1;
-    }
-    m.check(&db, name);
-    drop((keeper, keeper2));
 }
 
 /// A trim in progress holds nothing of the segment work: the trim is a

@@ -3008,7 +3008,10 @@ allocate, and the count of anonymous bytes resident beyond the allocator's
 use is lowered by any allocation from a free chunk already resident: a
 dead arena of thirty-two megabytes read as nine in one run of the whole
 `db` binary, so that test has a binary of its own (`tests/resident.rs`), as
-the allocation count has (`tests/leak.rs`). A fork is such an effect on
+the allocation count has (`tests/leak.rs`); the trim thread's test that
+counts by the same quantity joined it once a hosted ARM run of the `db`
+binary read 211 MB resident beyond use and waited four hundred looks for
+the second trim its dead arena was to cause. A fork is such an effect on
 every descriptor the process holds. The crash oracle in `tests/runlog.rs`
 spawns its writers beside tests that open stores, a child holds a copy of
 each store's `LOCK` from its fork to its exec, and a `flock` is the open
