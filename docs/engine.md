@@ -417,7 +417,7 @@ With those, the same counts read 539 for the clean get and 979 for the
 update. Paired in the suite at a hundred thousand keys, the binary before
 and the binary after alternated three times, each against FASTER in both
 orders (`bench/scripts/pair.sh supdb-ingest faster 100000 --reps 6 --passes
-load,read,read-threaded,mixes,mixes-scrambled`, at `0053be5` and at
+load,read,read-threaded,mixes,mixes-scrambled`, at `ab8a754` and at
 `ca2306e`), the buffered arm's rate over FASTER's read, at the median of
 the six sittings: the read pass 0.97x before and 1.11x after, on two
 reader threads 0.95x and 1.07x, on three 0.86x and 1.00x; the read-only
@@ -492,7 +492,7 @@ medians of the last three reps).
 In the suite it reads level. Paired with the buffered arm at ten thousand,
 a hundred thousand and three hundred thousand keys (`bench/scripts/pair.sh
 supdb-held supdb-ingest SIZE --reps 6 --passes
-load,read,read-threaded,mixes,mixes-scrambled`, at `1090033`), no cell is
+load,read,read-threaded,mixes,mixes-scrambled`, at `03a59d7`), no cell is
 further from level than 0.84x or 1.13x in either sitting, and the ones
 that lean furthest in both are the read passes on two and three threads,
 1.03-1.13x at the two larger rungs, over a drained store the policy cannot
@@ -564,7 +564,7 @@ The scrambled mix family runs wholly on such a store, and F, which
 follows A's updates, from its start.
 
 Counted with the seal landed (`POINT_OPS_LAND=1` and callgrind toggled on
-`point_ops::phase_reads_dirty`, as above, at `4629b8f`), a get there was
+`point_ops::phase_reads_dirty`, as above, at `95d2404`), a get there was
 1,052 instructions, against 497 for a get of the store just loaded and
 417 for FASTER's, and no line of it held three in a hundred: the same
 shape the clean read had had, a layer set up for every case the store
@@ -609,7 +609,7 @@ live table's probe ahead of the partition's is a branch no predictor
 learns, three in ten one way. Sampled by phase (`POINT_OPS_LAND=1 perf
 record -e cpu-clock -F 10000 --call-graph dwarf` over `point_ops ARM
 100000 1 uniform 40`, the samples laid to the phase function on each
-stack, twice an arm, at `4629b8f`), the read before spent 341 and 384
+stack, twice an arm, at `95d2404`), the read before spent 341 and 384
 samples at the load of a partition's slot in the phase after the
 updates and 110 and 131 in the phase before them, and 526 and 589 at
 the record's against 418 and 424, for five sixths as many reads of the
@@ -630,7 +630,7 @@ hundred, the partition's read at a hundred and ten.
 
 In the suite (`bench/scripts/pair.sh supdb-ingest supdb-ingestlayersasone
 300000 --reps 6 --passes load,read,read-threaded,mixes,mixes-scrambled`,
-at `4629b8f`, the default's rate over the arm's in the two sittings):
+at `95d2404`, the default's rate over the arm's in the two sittings):
 the scrambled B 1.10x and 1.15x, C 1.05x and 1.15x, D 1.11x and 1.21x, F
 1.08x and 1.13x, A 0.98x and 1.08x; the first family's D 1.00x and 1.14x
 and F 0.98x and 1.09x; and the loads, the read passes and the mixes that
@@ -642,7 +642,7 @@ The durable arm's pairing at that rung (`pair.sh supdb supdb-layersasone
 with the sittings on opposite sides.
 
 Beside FASTER (`pair.sh supdb-held faster 300000`, the same passes, at
-`4629b8f`, both sittings): the scrambled B 0.91x and 0.86x and C 0.87x
+`95d2404`, both sittings): the scrambled B 0.91x and 0.86x and C 0.87x
 and 0.84x, where the table above reads 0.75-0.81x; the scrambled D 0.70x
 and 0.73x, A 0.68x and 0.63x and F 0.57x and 0.58x; and the first family
 as it was, C 0.90x and 0.94x, B 0.86x and 0.82x, D 0.83x and 0.88x, A
@@ -658,7 +658,7 @@ read shares.
 #### Updates beside FASTER's
 
 Counted the same way (`point_ops ARM 100000 1 zipf 1` under callgrind
-toggled on `point_ops::phase_updates`, at `ebe21ad`), an update of the held
+toggled on `point_ops::phase_updates`, at `33d6e8c`), an update of the held
 arm is 978 instructions and FASTER's 555. FASTER's is not lean everywhere:
 104 of its instructions hash the key a byte at a time and 76 are its
 thread-local and thread-id checks. Ours is 904 inside `Db::put_batch`:
@@ -764,7 +764,7 @@ than the count at this rung: the arm against itself reads 0.79x to 1.08x
 by position in the same shape (`pair.sh supdb-ingest supdb-ingest
 300000`). At the commit that made the pool the default (`pair.sh supdb
 supdb-nopool 300000 --reps 6 --passes
-load,read,read-threaded,mixes,mixes-scrambled`, at `4ff31ef`) the durable
+load,read,read-threaded,mixes,mixes-scrambled`, at `1ef6f05`) the durable
 arm with it read the scrambled A 1.11x and 1.33x, the only cell past that
 floor in both orders, and the rest 0.93x to 1.17x either way. Under a
 bound it holds nothing where it matters: three million keys under 1 GiB,
@@ -774,8 +774,8 @@ pass killed (`SUPDB_LAG_COUNTERS=1 bench ab --arms supdb,supdb-nopool
 load,lag`).
 
 Beside FASTER after both (`pair.sh supdb-held faster 300000`, the same
-passes, at `4ff31ef`, both sittings): the scrambled F 0.77x and 0.77x where
-it read 0.55x and 0.59x at `afd58c9`, the scrambled A 0.76x and 0.84x for
+passes, at `1ef6f05`, both sittings): the scrambled F 0.77x and 0.77x where
+it read 0.55x and 0.59x at `88705d0`, the scrambled A 0.76x and 0.84x for
 0.59x and 0.64x, the scrambled D 0.85x and 0.75x for 0.73x and 0.70x; the
 first family's A at 0.77x and 0.80x and F at 0.61x and 0.66x, where its
 first two tables are fresh and they read as before; and the read passes,
@@ -786,7 +786,7 @@ where ours adds a tombstone and a value to the key's chain.
 
 #### A held log with no frames
 
-What was left of an update's instructions at `334f00e`, counted by
+What was left of an update's instructions at `f0f01e6`, counted by
 function (`point_ops supdb-held 100000 1 zipf 1` under callgrind toggled on
 `point_ops::phase_updates`), was 808, and the largest single part was the
 log: 120 building a put's two frames into the held buffer and 30 the
@@ -798,7 +798,7 @@ to the instruction.
 
 Paired at three hundred thousand keys against the held arm (`pair.sh
 supdb-heldnoframes supdb-held 300000 --reps 4 --passes
-load,read,read-threaded,mixes,mixes-scrambled,lag`, at `334f00e`; ours over
+load,read,read-threaded,mixes,mixes-scrambled,lag`, at `f0f01e6`; ours over
 the held arm's, both sittings): A 1.13x and 1.12x, F 1.20x and 1.12x, the
 scrambled A, D and F 1.07-1.31x, D 1.06x and 1.10x, and the update bursts
 1.12-1.14x by the sittings' geometric mean. The read-only mix and the
@@ -826,7 +826,7 @@ arithmetic on the key's length. Sampled over the scrambled D and F mixes
 and F at three hundred thousand keys (`SUPDB_LAG_MARK=1 perf record -e
 cpu-clock -F 4999 -k CLOCK_MONOTONIC` over `bench ab --arms
 supdb-heldnoframes,faster --size 300000 --reps 1 --passes
-load,read,mixes,mixes-scrambled`, at `9b29d26`, the samples of the mix
+load,read,mixes,mixes-scrambled`, at `2ce2ccf`, the samples of the mix
 thread inside the mixes' marks laid on `read_all_fixed_hashed`'s
 instructions), the slot's load took 34 of the read's 225 samples, the
 header's 107 and the first load from the value -- its last four bytes,
@@ -839,7 +839,7 @@ header's. It costs 14 instructions a clean get and 9 over a written
 store (`point_ops supdb-heldnoframes 100000 1 zipf 1` against
 `supdb-heldnorecordahead`, callgrind on `phase_reads_clean` and
 `phase_reads_dirty`: 523 against 509, 812 against 803). Paired at
-`bb5da0f` (`pair.sh supdb supdb-norecordahead 300000 --passes
+`2c110bf` (`pair.sh supdb supdb-norecordahead 300000 --passes
 load,read,scan,mixes,mixes-scrambled --reps 8`; the ask over the arm
 without it, the two sittings), the read pass read 1.18x and 1.31x, eight
 pairs of eight in the sitting whose scan pass, which the ask cannot
@@ -857,7 +857,7 @@ it had held level in the pairing above, which ran no scan pass. Ours over
 FASTER's at three hundred thousand keys, the geometric mean of two
 sittings (`pair.sh supdb-heldnoframes faster 300000 --reps 6 --passes
 load,read,read-threaded,mixes,mixes-scrambled`, and the same with
-`scan,scan-threaded` before the mixes, at `bb5da0f`):
+`scan,scan-threaded` before the mixes, at `2c110bf`):
 
 | | no scan pass | scan passes first |
 |---|---|---|
@@ -920,7 +920,7 @@ bound (`bench/DESIGN.md`). At ten million keys under 1 GiB FASTER holds a
 256 MiB index and a 448 MiB tail of 1.36 GB of records, and reads the rest
 from the device past the page cache (`bench ab --arms supdb-heldpart,faster
 --size 10000000 --bound 1073741824 --ops-div 10 --reps 2 --passes
-load,read,read-threaded,mixes,mixes-scrambled,lag`, at `5613434`; FASTER's
+load,read,read-threaded,mixes,mixes-scrambled,lag`, at `49db8b5`; FASTER's
 rate over ours, both pairs):
 
 | | FASTER over supdb-heldpart |

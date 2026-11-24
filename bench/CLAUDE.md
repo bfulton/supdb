@@ -324,7 +324,7 @@ the value out itself, copies a constant hundred bytes into a fixed array
 and paid none of it. Counted by callgrind over the clean point reads of
 `examples/point_ops.rs` (`valgrind --tool=callgrind --collect-atstart=no
 --toggle-collect='point_ops::phase_reads_clean'
-target/release/examples/point_ops ARM 100000 1 zipf 1`, at `69b3b63` and
+target/release/examples/point_ops ARM 100000 1 zipf 1`, at `d4aabaf` and
 at the commit of this entry), the bookkeeping was 42 instructions of
 `supdb-ingest`'s 539 a read and 38 of `lmdb-nosync`'s 1,895, beside
 FASTER's 415: a thirteenth of supdb's read, and a third of what
