@@ -700,7 +700,22 @@ What an engine picker would hit, roughly in order.
     full rewrite has the command): the kernel's record of the kill put
     1,053 MB of shared memory in the group where the process mapped 850,
     so some 200 MB of memory files no view had taken, beside 266 MB of
-    the process's own; which writers they were was not read.
+    the process's own. The loads alone, three reps of the arm against
+    itself with the cache's trace and the group sampled
+    (`SUPDB_PAGER_TRACE=1 SUPDB_LAG_MARK=1 bench ab --arms
+    supdb-cipherauto,supdb-cipherauto --size 10000000 --bound 1342177280
+    --passes load --reps 3 --ops-div 10` beside `scripts/groupmem.py
+    sample`, at `5c2f645`), none killed: each pass's most the kernel could
+    not take back was 1,189-1,247 MiB of the 1,280, the process's own
+    memory 62-351 of it, and the cache's reading of its slack at that
+    instant -33 to 28 MiB. The files being written there were 20-151 MB:
+    a seal's pieces, some thirty of a few megabytes each, written before
+    any has its envelope; a merge's output, announced; a form file built
+    at a merge's finish; an ordered run's file. Announced where each is
+    made, a seal's piece would move the room by its few megabytes, since
+    the pieces at the peak are written already and in the readings; the
+    peak is the cache at its budget when the process's own memory rises
+    by a hundred megabytes and more between two of its readings.
   - The evictor's waits, of which the long ones were a merge's. A merge
     wrote each output's envelope under its hold of the cache, and writes
     it unheld now (`CLAUDE.md`, the trace that named the close;
