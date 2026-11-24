@@ -110,7 +110,10 @@ required-features = ["codecs"]
 # is repeated -- opt-level 3, fat LTO, one codegen unit -- so what is
 # measured is what a user gets. Debug info is the one that differs on
 # purpose: the engine asks for all of it, this asks for line tables, which
-# is what a profiler needs to name a frame. Neither changes a byte of code.
+# is what a profiler needs to name a frame. Neither changes a byte of Rust;
+# in the C and C++ the comparators are built from, `cc` takes debug info as
+# a reason to keep frame pointers, which `.cargo/config.toml` overrides with
+# the rest of the one build every engine is compiled to.
 [profile.release]
 opt-level = 3
 lto = true

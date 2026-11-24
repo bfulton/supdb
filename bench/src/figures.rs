@@ -843,6 +843,7 @@ mod tests {
                 killed: vec![],
                 resumptions: vec![],
                 keys: Default::default(),
+                build: String::new(),
                 measurements: vec![m("supdb", 2.0e6), m("lmdb", 1.0e6)],
             }
         };
