@@ -951,7 +951,7 @@ fn a_log_with_no_frames_writes_nothing_and_its_sync_drains() {
     assert_eq!(log_frames(&d), 0, "a sync or a commit wrote the log");
     db.crash();
 
-    let mut db = Db::open(&d, opts()).unwrap();
+    let db = Db::open(&d, opts()).unwrap();
     for b in 0..3 {
         assert!(logged(&db, b), "batch {b}, drained by the sync, is gone");
     }
