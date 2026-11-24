@@ -858,6 +858,80 @@ save step of its own, since the one cache action that does both saves
 only where the job passed, and a job that fails on its table had built
 the tool for nothing.
 
+**One profile, two builds.** The engine's Rust and the comparators' C and
+C++ were compiled under one release profile, which was taken for one build,
+and the comparators' objects said otherwise (GCC records what it was handed
+in each object's `DW_AT_producer`). `cc` keeps frame pointers in every C
+and C++ function, leaf ones included, wherever the profile has debug info,
+and the profile has line tables for the profiler; Ubuntu's GCC adds a stack
+protector, CET's `endbr64` and `_FORTIFY_SOURCE=3` to C and C++ alone; and
+RocksDB picks its CRC32C instruction when it is compiled where the engine
+picks its own when it runs, so at the default x86-64 target RocksDB
+checksummed every log record with tables (`ExtendImpl<DefaultCRC32>`, no
+`crc32` in the binary but the engine's `crc32c_hw`), and on ARM Linux it did
+so whatever the CPU, since its runtime check reads the CPU only where
+getauxval is named present and `librocksdb-sys` does not name it. rustc
+gives the engine none of it. Counted under callgrind at thirty thousand
+keys, collection on inside each arm's `get`, `write_batch` and `range`
+alone (`valgrind --tool=callgrind --collect-atstart=no
+--toggle-collect='<supdb_bench::engines::Rocks as
+supdb_bench::engines::Engine>::get'` and its siblings, around `bench ab
+--arms rocksdb-tuned,lmdb --size 30000 --passes load,read,scan --reps 1`,
+the variants built by `CFLAGS_x86_64_unknown_linux_gnu`,
+`CXXFLAGS_x86_64_unknown_linux_gnu` and `RUSTFLAGS` in the environment,
+at `888ba37`): the frame pointers were 4-6% of RocksDB's instructions an
+operation and 2-5% of LMDB's, the CPU level a further 8% of RocksDB's
+writes, and the protections 6-12% of RocksDB's, 3-6% of LMDB's and 4-7% of
+FASTER's, with the engine within 0.6% throughout. The rates bore the large
+part out and nothing smaller: alternated in two sittings, RocksDB's buffered
+load read 1.18x the old build in eight rounds of eight at ten thousand keys
+and 1.2-1.3x at the rungs above in five or six rounds of six, its durable
+load 1.03-1.15x, and every cell of the engine moved by up to a tenth either
+way between binaries whose engine code was byte for byte the same -- one
+of them differed from the other in the C and C++ protections alone --
+which is what a rebuild does to a cell by layout, and the floor any reading
+of this change sits on.
+`.cargo/config.toml` is the build now: one machine level for every engine
+(x86-64-v3 with PCLMUL, ARMv8 with CRC and crypto), and the C and C++ with
+frame pointers as rustc has them for the target -- omitted on x86-64,
+non-leaf on ARM Linux and macOS, read off rustc's assembly for each, since a
+single setting for all three would have been wrong on two -- and none of
+the protections, the stack-clash probes rustc also emits kept. `build.rs`
+refuses a build the file did not reach and stamps the flags into every row
+(`build`), and the comparators' check compiles its db_bench and LMDB tool
+with the same flags. A check that the binary fits its host was written into
+`main` first, and qemu as a Nehalem died before it, in RocksDB's C++ static
+initialisers on a VEX `vmovq`: the check is a constructor `build.rs` writes
+in C at the earliest priority, compiled for baseline x86-64 by a function
+attribute whatever `-march` the environment gives, and it names what the
+host lacks. The rows before the field are of the other build; the first row
+with it is a definition step. The rules: a comparison is compiled to one set
+of rules for every side, read off what each compiler was handed and not off
+the profile that started the build; where one side picks its instructions at
+run time and the other when it is compiled, the build gives the second what
+the first finds; a setting that is "the same for every engine" is read per
+target, since the engine's own compiler differs by target; and a check that
+a binary fits its host runs before the first instruction that does not,
+which in a program that links C++ is before `main`. A fourth difference was
+in a flag nobody in the build had chosen for code generation: `cc` compiles
+every library with `-fPIC`, under which GCC takes every non-inline global
+function for one another object may replace when the program loads, and
+inlines none of them, not even into a caller in its own file. Clang inlines
+them, on Linux and on macOS, and rustc's LTO makes every function of the
+binary internal, so GCC alone was held off: RocksDB's `DBImpl::GetImpl`,
+`GetAndRefSuperVersion` and `WriteBatch::Iterate` were calls of their own.
+Counted the same way at `f3bc29c`, with `-fno-semantic-interposition` in
+the two variables, RocksDB's `get` took 1.3% fewer instructions, its
+`range` 0.8% fewer and its `write_batch` 0.7% more, and LMDB's and FASTER's
+moved by under a twentieth of a percent, LMDB's internals being `static`
+already. Six alternated rounds of the quick ladder resolved none of it: the
+engine's cells, its code the same in both binaries, moved 0.94x to 1.20x
+between them. The GCC targets are given the flag now. The corollary: a
+flag a build tool chose for its own reasons -- debug info for the profiler,
+position independence for a library -- is read for what each compiler
+infers from it, by compiling one function both ways under each, before the
+build is called one policy.
+
 ## One repository
 
 The suite was a separate repository carrying the engine as a submodule for
