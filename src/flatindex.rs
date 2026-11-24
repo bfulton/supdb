@@ -2061,7 +2061,7 @@ impl FlatIndex {
             }
         }
         #[cfg(not(target_arch = "x86_64"))]
-        let _ = (recs, off);
+        let _ = (recs, off, self.ask_span);
     }
 
     /// `with_lookup` for a key whose hash the caller has already taken, as
