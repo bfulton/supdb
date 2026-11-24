@@ -20,6 +20,12 @@ on:
 permissions:
   contents: read
 
+# As every workflow that builds the suite sets it. The cache's key hashes
+# the environment's CARGO_* variables, so a job without this one has a key
+# no other job's matches, whatever the key is named.
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   detect:
     runs-on: macos-latest
@@ -40,11 +46,14 @@ jobs:
       - name: FASTER, for the `faster` arm
         run: sh bench/scripts/faster.sh
       # `workspace -> target`, the target a path inside its workspace, and
-      # LIBCLANG_PATH in the key: see the `test` job of ci.yml.
+      # LIBCLANG_PATH in the key: see the `test` job of ci.yml. The key is
+      # the one every job that builds the suite's binary alone shares: see
+      # the `quick` job there.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: bench -> target
           env-vars: LIBCLANG
+          shared-key: bench
       - name: Build
         working-directory: bench
         run: cargo build --release --bin bench

@@ -124,11 +124,23 @@ jobs:
       - name: FASTER, for the `faster` arm
         run: sh bench/scripts/faster.sh
       # `workspace -> target`, the target a path inside its workspace, and
-      # LIBCLANG_PATH in the key: see the `test` job of ci.yml.
+      # LIBCLANG_PATH in the key: see the `test` job. The key is shared.
+      # Every job that builds the suite's release binary and nothing else
+      # builds the same dependencies, and under the action's default, a key
+      # by the job's name, each kept a copy of them: one round of the
+      # workflows that run by hand saved that build four times, the
+      # repository passed GitHub's ten gigabytes, and what GitHub evicted,
+      # by last read, included two caches a pull request was using. Under
+      # one key the first of those jobs to run saves the cache and the rest
+      # restore it. A job that restores a key whole saves nothing, so a job
+      # that builds anything beside the binary keeps a key of its own, as
+      # `rocksdb-alloc` does, or what it alone builds would never be
+      # cached. `bench/scripts/workflows.sh` holds both.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: bench -> target
           env-vars: LIBCLANG
+          shared-key: bench
       - name: One quick-scale run of every arm
         env:
           ARMS: ${{ inputs.arms }}

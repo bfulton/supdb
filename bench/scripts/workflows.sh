@@ -13,7 +13,7 @@
 # start, and the only thing that would ever have said so was a dispatch on a
 # day the runner was down -- the day the watchdog is the thing you need.
 #
-# Three rules, then:
+# Five rules, then:
 #
 #   1. Every `run:` block parses as bash.
 #   2. No `run:` block contains a `${{ }}` expression. GitHub substitutes
@@ -39,6 +39,17 @@
 #      both as done, while RocksDB was built from its sources twice in every
 #      job. A target is held to sitting directly in a directory with a
 #      Cargo.toml, which is what a workspace's own target directory does.
+#   5. The suite's build alone is one cache. Every job whose cache step
+#      names `bench -> target` and nothing else builds the same
+#      dependencies, `cargo build --release --bin bench`, and under the
+#      action's default key, the job's name, each kept its own copy: one
+#      round of the workflows that run by hand saved that build four times,
+#      the repository passed GitHub's ten gigabytes, and what was evicted,
+#      by last read, included two caches a pull request was using. Such a
+#      step carries `shared-key: bench`, so the first of those jobs to run
+#      saves the cache and the rest restore it. No other step carries it:
+#      a job that restores a key whole saves nothing, so what only one job
+#      builds beside the binary would never be cached under it.
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -49,6 +60,7 @@ trap 'rm -rf "$work"' EXIT
 status=0
 total=0
 maps=0
+shared=0
 for wf in ../.github/workflows/*.yml; do
   rm -rf "$work"/blocks
   mkdir -p "$work"/blocks
@@ -119,6 +131,54 @@ for wf in ../.github/workflows/*.yml; do
     fi
   done < "$work"/maps
 
+  # The fifth rule, over each rust-cache step: its lines run from `uses:`
+  # to the next line indented no deeper than the step's own dash.
+  if ! awk -v wf="$wf" -v count="$work/shared" '
+    function close_step() {
+      if (!instep) return
+      instep = 0
+      alone = (nmaps == 1 && map == "bench -> target")
+      if (alone) n += 1
+      if (alone && key != "bench") {
+        printf "%s:%d: the step caches bench/target alone under a key of its own (%s);\n", wf, at, (key == "" ? "the job name" : key)
+        printf "  give it `shared-key: bench`, the one cache every such job restores\n"
+        bad = 1
+      }
+      if (!alone && key == "bench") {
+        printf "%s:%d: the step takes `shared-key: bench` and does not cache bench/target alone;\n", wf, at
+        printf "  a job that restores that key whole saves nothing, so what it builds beside the binary is never cached\n"
+        bad = 1
+      }
+    }
+    {
+      blank = ($0 ~ /^[[:space:]]*$/)
+      ind = 0
+      if (!blank) { match($0, /[^ ]/); ind = RSTART - 1 }
+    }
+    instep && !blank && ind <= stepind { close_step() }
+    /^[[:space:]]*(- )?uses:[[:space:]]*Swatinem\/rust-cache@/ {
+      close_step()
+      instep = 1; at = NR; nmaps = 0; map = ""; key = ""
+      stepind = ($0 ~ /^[[:space:]]*- /) ? ind : ind - 2
+      next
+    }
+    instep && !blank && $0 !~ /^[[:space:]]*#/ {
+      line = $0
+      sub(/^[[:space:]]*/, "", line); sub(/[[:space:]]*$/, "", line)
+      if (line ~ / -> /) {
+        sub(/^workspaces:[[:space:]]*/, "", line)
+        nmaps += 1; map = line
+      } else if (line ~ /^shared-key:/) {
+        sub(/^shared-key:[[:space:]]*/, "", line)
+        key = line
+      }
+    }
+    END { close_step(); print n + 0 > count; exit bad }
+  ' "$wf" >&2; then
+    status=1
+  fi
+  shared=$((shared + $(cat "$work"/shared)))
+
   # The third rule, over the file's lines that are not comments.
   if floating=$(grep -n 'ubuntu-latest' "$wf" | grep -v '^[0-9]*:[[:space:]]*#'); then
     echo "$wf: a job runs on ubuntu-latest; name the image (ubuntu-24.04)" >&2
@@ -134,4 +194,8 @@ if [ "$maps" -eq 0 ]; then
   echo "workflows: no \`workspace -> target\` line was found to check; the fourth rule ran over nothing" >&2
   exit 1
 fi
-echo "workflows: every run block parses, none interpolates ($total blocks); every Linux job names its image; every cache's target is a workspace's ($maps)"
+if [ "$shared" -eq 0 ]; then
+  echo "workflows: no cache step of bench/target alone was found to check; the fifth rule ran over nothing" >&2
+  exit 1
+fi
+echo "workflows: every run block parses, none interpolates ($total blocks); every Linux job names its image; every cache's target is a workspace's ($maps); the suite's build alone is one cache ($shared steps)"

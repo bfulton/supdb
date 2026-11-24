@@ -679,6 +679,12 @@ the action takes the target as a path inside the workspace, and the step
 cached a directory that does not exist while each job built RocksDB from
 its sources twice (the engine's `CLAUDE.md`, running the checks). A
 setting whose effect nothing reads is held to the thing it names existing.
+And it holds every cache step of `bench -> target` alone to one shared
+key, and every other step off it: keyed by their jobs' names, the jobs
+that build the suite's release binary each kept a copy of one build,
+four from one round of the workflows that run by hand, and the
+repository passed the ten gigabytes GitHub allows it (the same
+paragraph of the engine's notes).
 
 **A generator more regular than the thing it stood for.** The first
 ids were one to a stratum of the whole 64-bit space, key `n` a random

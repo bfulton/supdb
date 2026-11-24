@@ -225,7 +225,20 @@ in the step's own log, which prints the directories it caches, on the
 day somebody read one. `bench/scripts/workflows.sh` holds a cache's
 target to a workspace's own now, and the libclang directory is in the
 cache's key, since a cached clang-sys output naming a directory since
-gone is the failure `scripts/deps.sh` cleans and a workflow does not. A
+gone is the failure `scripts/deps.sh` cleans and a workflow does not.
+Once the step cached the build, the build's size was the next thing
+nobody had read: the action keys a cache by its job's name, so every job
+that builds the suite's release binary kept a copy of the same
+dependencies, and one round of the workflows that run by hand saved that
+build four times over, took the repository past GitHub's ten gigabytes,
+and had two caches a pull request was using evicted, since GitHub evicts
+by last read whoever's the cache is. The jobs that build that binary and
+nothing else share one key now (`shared-key: bench`), which the same
+script holds them to and holds every other job off, since a job that
+restores a key whole saves nothing and what it alone builds would never
+be cached under it; and `pr-caches.yml` deletes a pull request's caches
+at its close, which no other pull request can read and which counted
+against the limit for a week after. A
 second definition of "the checks" is how the next one of those starts.
 
 A change to an engine default lands only once `sh scripts/check.sh`
