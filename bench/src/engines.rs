@@ -17806,7 +17806,10 @@ mod tests {
         #[cfg(faster)]
         {
             assert!(ARMS.contains(&"supdb-heldnoframes") && ARMS.contains(&"faster"));
-            assert!(!ARMS.contains(&"supdb-held"), "both held arms in the roster");
+            assert!(
+                !ARMS.contains(&"supdb-held"),
+                "both held arms in the roster"
+            );
             let pair = ["supdb-heldnoframes".to_string(), "faster".to_string()];
             assert_eq!(check_matched(&pair, &root), Ok(()));
         }
