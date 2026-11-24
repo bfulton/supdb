@@ -35,7 +35,7 @@ jobs:
     # minutes, and three times that on a slow runner.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The toolchain rust-toolchain.toml names, the one the local gate runs
       # under; no workflow names a version or a channel of its own.
       - name: The pinned toolchain

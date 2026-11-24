@@ -104,7 +104,7 @@ jobs:
     # days; this is three, and the pickup watchdog still bounds the queue.
     timeout-minutes: 4320
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The toolchain rust-toolchain.toml names where this machine's cargo
       # is rustup's, which reads the file whatever this step does; a cargo
       # from anywhere else never sees the file, and the row is that
@@ -148,7 +148,7 @@ jobs:
       # the timeout or cancelled by hand still has the rungs that completed
       # on disk -- and this step being conditional on success is what threw
       # them away twice. `always()` covers cancellation too.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: full-row

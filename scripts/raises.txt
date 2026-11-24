@@ -77,3 +77,4 @@ tests/data/cost-entries.txt	Db::zpage_hot_asks_in	0	1	upstream d57f8c4: a test's
 tests/data/door.txt	thread src/db.rs *	104	106	upstream 7fda1f9: a test seam of the settle's raw asks (ZInject::ask_first_late) asks its first file late from a thread of its own, a spawn and a sleep; the file is mapped through the vault's door (vault::map) where upstream mapped it by path
 tests/data/cost-entries.txt	Reader::drop_forms	0	1	upstream 54fecff: a test seam that drops the writer's block forms as a refused rebase does, in an operation of its own
 tests/data/cost-entries.txt	Reader::forget_forms_unretracted	0	1	upstream 54fecff: a test seam that drops the writer's block forms and leaves what the state published of them, the state a drop in an older state left
+tests/data/cost-entries.txt	Db::zpage_build_held	0	1	main 5b8d64a (#28): a test's read of whether the builder's thread is parked at a hold still set, before it moves an injected clock

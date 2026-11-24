@@ -42,7 +42,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The toolchain rust-toolchain.toml names, the one the local gate runs
       # under; no workflow names a version or a channel of its own.
       - name: The pinned toolchain
@@ -107,7 +107,7 @@ jobs:
       - name: The figures from the row
         working-directory: bench
         run: ./target/release/bench figures --runs runs-ci --out runs-ci/figures --scale ooc
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: ooc-row

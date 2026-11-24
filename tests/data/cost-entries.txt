@@ -237,6 +237,7 @@ Db::hold_zpage_build	-	a test seam or a counter: reads or sets the store's bookk
 Db::hold_zpage_rename	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::hold_zpage_after_settle	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::zpage_build_waiting	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::zpage_build_held	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::zpage_last_reject	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::zpage_form_files	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::maint_cpu_us	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation

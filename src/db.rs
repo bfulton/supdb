@@ -855,6 +855,19 @@ pub struct ZCounts {
     /// builder's (a finish's `builds`) and not at all for some outcomes (a
     /// decline, an install refused).
     pub build_collected: u64,
+    /// Warms started on the builder's thread (`Options::zpages_warm`) and
+    /// taken in, each counted once whatever came of it; and the builder's
+    /// jobs whose thread has returned, builds and warms alike, a spawn that
+    /// failed counted with them. A job is running while `build_starts +
+    /// warm_starts` is past `job_ends`, and ended and not yet taken in while
+    /// `job_ends` is past `build_collected + warm_collected`. The jobs run
+    /// at the idle CPU class, so on a host whose cores are busy a job of
+    /// milliseconds takes seconds of the wall; a test that moves the
+    /// injected clock holds it while a job runs, or the job's wall on that
+    /// clock -- which the dwell is drawn from -- is the test's own pace.
+    pub warm_starts: u64,
+    pub warm_collected: u64,
+    pub job_ends: u64,
     /// Form files built ahead of the controller's decision and left on
     /// disk unattached (`Options::zpages_prebuild`).
     pub prebuilt: u64,
@@ -28237,6 +28250,9 @@ impl Reader {
             declined_damage: get(&ev.declined_damage),
             build_starts: get(&ev.build_starts),
             build_collected: get(&ev.build_collected),
+            warm_starts: get(&ev.warm_starts),
+            warm_collected: get(&ev.warm_collected),
+            job_ends: get(&ev.job_ends),
             build_io_class: get(&ev.build_io_class),
             build_ahead_bytes: get(&ev.build_ahead_bytes),
             build_cancelled: get(&ev.build_cancelled),
@@ -46491,6 +46507,17 @@ impl Db {
         self.shared.zbuild_hold.load(AtomicOrdering::Acquire) & at != 0
     }
 
+    /// Whether the builder's thread is parked at a hold that is still set.
+    /// A hold lifted leaves its thread's waiting bit standing until the
+    /// thread wakes, which at the idle class can be a while: a test that
+    /// reads such a build as held, and moves the injected clock under it as
+    /// it may under a held one, moves it under a build about to run.
+    #[doc(hidden)]
+    pub fn zpage_build_held(&self) -> bool {
+        let h = self.shared.zbuild_hold.load(AtomicOrdering::Acquire);
+        (h >> ZHOLD_WAITING) & h & (ZHOLD_START | ZHOLD_RENAME) != 0
+    }
+
     fn set_zhold(hold: &std::sync::atomic::AtomicU8, bit: u8, on: bool) {
         if on {
             hold.fetch_or(bit, AtomicOrdering::AcqRel);
@@ -60880,6 +60907,9 @@ impl Maint {
                 } else {
                     zfile::build_file(file, &seg_path, &out, id, end, &plan)
                 };
+                // Counted before the wake, so that a turn the wake brings
+                // finds the job ended (`ZCounts::job_ends`).
+                zfile::ZEvents::add(&io_ev.z.job_ends, 1);
                 if let Some(t) = wake {
                     t.unpark();
                 }
@@ -60902,6 +60932,7 @@ impl Maint {
             }
             Err(_) => {
                 failed(zfile::DECLINED_FAILED);
+                zfile::ZEvents::add(&ev.job_ends, 1);
                 zfile::ZEvents::add(&ev.build_collected, 1);
             }
         }
@@ -60935,6 +60966,7 @@ impl Maint {
                 if let Ok(Ok(w)) = h.join() {
                     ev.warmed(&w);
                 }
+                zfile::ZEvents::add(&ev.warm_collected, 1);
                 return;
             }
         };
@@ -61326,6 +61358,10 @@ impl Maint {
         let flag = cancel.clone();
         let wake = self.wake.clone();
         let io_idle = self.opts.zpages_io_idle;
+        // Counted started before the thread exists, and ended by the thread
+        // before its wake, as a build is (`ZCounts::job_ends`).
+        zfile::ZEvents::add(&self.shared.z.warm_starts, 1);
+        let shared = self.shared.clone();
         let spawned = std::thread::Builder::new()
             .name("supdb-zwarm".into())
             .spawn(move || {
@@ -61334,11 +61370,16 @@ impl Maint {
                 }
                 idle_cpu_priority();
                 let r = zfile::warm_file(&path, Some(&flag));
+                zfile::ZEvents::add(&shared.z.job_ends, 1);
                 if let Some(t) = wake {
                     t.unpark();
                 }
                 r
             });
+        if spawned.is_err() {
+            zfile::ZEvents::add(&self.shared.z.job_ends, 1);
+            zfile::ZEvents::add(&self.shared.z.warm_collected, 1);
+        }
         if let Ok(handle) = spawned {
             self.zbuild = Some(ZBuild {
                 seg,

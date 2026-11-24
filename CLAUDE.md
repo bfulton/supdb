@@ -30,9 +30,12 @@ of the change that produced the text.
 
 This branch carries the encryption feature -- `Encryption::Cipher`,
 `Encryption::Kernel`, `supdb::crypt` -- and the crash-safety fixes found
-building it, on top of a line of the owner's engine work that is not on
-the main line yet (`origin/claude/e-recode-stride-selector-g5f6hl`,
-"upstream" here and in the notes). What is left of it is in `ROADMAP.md`
+building it, on top of the main line. It was built beside a line of the
+owner's engine work (`claude/e-recode-stride-selector-g5f6hl`, "upstream"
+in the notes), merged into it as it went, which went to the main line as
+#27, squashed: its commits the notes cite are in that pull request's
+history (`refs/pull/27/head`), and from #27 on the line this branch
+merges is `main`. What is left of it is in `ROADMAP.md`
 ("Encryption: what is left before it merges"). What it is held to is the
 owner's:
 
@@ -41,7 +44,7 @@ owner's:
   unencrypted runs, and beating competitors on added encryption
   benchmarks." The first is the count, by function, against the commit
   before each change (`scripts/cost.sh`), with timing rows against
-  upstream before a merge is proposed, since a count sees no stall. The
+  the main line before a merge is proposed, since a count sees no stall. The
   second is the encrypted roster (`bench run --arms enc`,
   `bench/DESIGN.md`), read cell by cell (`bench/scripts/encrow.py`).
   Bytes on disk is no cell of it ("I don't care much about bytes on
@@ -58,19 +61,30 @@ owner's:
   encryption feature which is reliable, performant, and not fragile to
   maintain." A bug or a flaky test met on the way is fixed where it is
   met, whichever line wrote it.
-- **Upstream is merged here and never written to.** Fetch it, merge it
-  into this branch, build it and count against it; never push to it or
-  to `main`. Push here whenever there is a commit: the gate is for what
-  a commit claims, not for the push. No pull request until the owner
-  asks for one. "Stay wholly off of upstream" was read for half a day as
-  never fetch, merge or count against it, where it meant never modify
-  it: an instruction about another line is said back as the operations
-  it forbids before the widest reading is acted on.
+- **The main line is merged here and never written to**, as upstream
+  was. Fetch it, merge it into this branch, build it and count against
+  it; never push to it or to another line. Push here whenever there is
+  a commit: the gate is for what a commit claims, not for the push. No
+  pull request until the owner asks for one. "Stay wholly off of
+  upstream" was read for half a day as never fetch, merge or count
+  against it, where it meant never modify it: an instruction about
+  another line is said back as the operations it forbids before the
+  widest reading is acted on. "Let's also rebase on main" was the same
+  kind: the branch is two hundred commits through eleven merges, and
+  twenty-four commits the docs cite are on it alone, so a rewrite would
+  have pointed their citations at nothing; it was said back as a merge
+  or a rewrite with that count, and is merged. A squash of what the
+  branch already holds -- #27 was upstream's `7fda1f9` to the byte -- is
+  merged with the squashed line's last commit as the base
+  (`git read-tree -m -u <that commit> HEAD <main's head>`), so the merge
+  carries what is new on the main line and nothing the branch has
+  already changed is offered back to it as a conflict.
 - **A report to the owner is short and says where things stand.** The
   owner reads this branch from outside it, and has said that they lost
   its thread and that its size worries them: the bar and what stands
   against it first, in plain sentences, and the detail where it lives.
-- **A merge of upstream is held to more than its conflicts.** Its text
+- **A merge of upstream or the main line is held to more than its
+  conflicts.** Its text
   merges nearly clean each time and is wrong in the same places:
   upstream's new code maps a file by its path (`MmapBytes::open`) or
   reads residency over a mapping's lent bytes, the two things this
@@ -83,11 +97,17 @@ owner's:
   conflicts: that merge gave a set-up step upstream's suite had come to
   need (FASTER's sources, which its build script stops without) to
   upstream's CI jobs and to neither job this branch had added that
-  builds the suite, nor to the worktree the count builds its base in.
+  builds the suite, nor to the worktree the count builds its base in;
+  and at the merge of #27 the suite's build became a file
+  (`bench/.cargo/config.toml`, one machine level and one set of C and
+  C++ flags for every engine) read from the directory a build starts in,
+  which a worktree of the commit before it does not have, so the count's
+  base would have been compiled at the default level beside a head at
+  x86-64-v3 and every function's count been the flags' as well: the
+  count gives the base the head's file as it gives it the head's probes.
   What each merge is shown to hold: nothing of either side lost, every
   function both sides touched read once in its merged body; the
-  toolchain the runners use (`rustup update stable`, upstream's own
-  note), under which the lint and the count are the runner's (the entry
+  toolchain the runners use (`rust-toolchain.toml`), under which the lint and the count are the runner's (the entry
   on a count held under one compiler, below); this branch's gates over
   upstream's new code, each answered in its own terms (a count raised in
   its list with the raise declared in `scripts/raises.txt`, and the
@@ -104,8 +124,8 @@ owner's:
   group, and a forced arm at a rung the harness takes it at (at three
   hundred thousand keys upstream's own build refuses one: a partition
   under the form's floor holds over a hundredth of the keys);
-  `sh scripts/cost.sh <upstream's head>`, every probe at or under
-  upstream by its total and no function's gain new (it exits red by
+  `sh scripts/cost.sh <its head>`, every probe at or under
+  that head by its total and no function's gain new (it exits red by
   function there, on moves: `ROADMAP.md`); and the whole gate.
 - **`scratch/` is this branch's working records, and comes off before a
   merge or a pull request**, as it came off PR #6. The layer's design
@@ -6594,6 +6614,51 @@ stalled run, every segment work thread idle in its sleep and none blocked,
 is what said the wait and not the engine was wrong. The count is read
 before the clock moves now (`advance_tick`). The rule: a wait reads its
 baseline before it causes the event, never after.
+
+**A clock moved under a job that runs when nothing else does.** The
+controller's builds and warms run at the idle CPU class, and the zpages
+tests step the controller by an injected clock, a tick a tenth of a second
+of it, each waited for. Four copies of the test binary at once -- every
+core busy, as under the gate's stress or on a slow hosted runner -- failed
+one to five tests a copy at eight sites, and every failure but one had a
+build in flight: a wait of four hundred ticks ran out with the build still
+running, a build of milliseconds having taken thirteen seconds of the wall,
+and one waited for by the wall ran past thirty. The one without a build in
+flight was the same thing a step later: the trial waits out a dwell of ten
+times the last build's wall on the injected clock, the waits had ticked
+through the starved build, its wall on that clock was some thirty-eight
+seconds, and the test's minute was a sixth of the dwell. A count of ticks
+is no bound on a job the host schedules last, and a clock moved under the
+job makes it as long as the host is slow. The clock moves now only once no
+job of the builder's is pending (`advance_tick`, `jobs_ended`, from
+`ZCounts::warm_starts`, `warm_collected` and `job_ends` beside the builds'
+counts), each wait reads its condition on the wall while one is
+(`settled_or`), so that a state that stands only while a job runs is read
+as the old waits read it by ticking through the job, and every wait on such
+a job is bounded by `JOB_WALL`, five minutes. Holding the clock turned up
+the tests that had leaned on its moving. One counted the steps from a
+crossing to the buy, which waits for the partitions to have stood still two
+seconds of the clock (`zselect::EAGER_SETTLE`), and the builds ahead had
+used those seconds up; it lets the store stand now. One read which came
+first after a build ahead, the sample or the next build, at the next tick,
+after however far the chain had run, and it failed under load before the
+change as well, two runs in twenty; it holds the next build at its start and
+reads the choice. And a hold lifted leaves the thread's waiting bit standing
+until the thread wakes, which at the idle class is a while, so a build just
+released read as held and the clock moved under it, once in 928 tests:
+`Db::zpage_build_held` asks for a hold still set. Beside them the census
+test compared two stores' busy wall a read, measured one after the other --
+two stretches of a loaded host -- and read 4.03 against its bound of 4; the
+stores' windows alternate now and each is read by its median. The rules: a
+test that moves its own clock holds it while a job of the system's runs,
+since the job's wall on that clock is whatever the host makes it and
+anything drawn from it -- a dwell, a settle -- moves with the host; a wait
+bounded by a count of steps is bounded by the steps' pace and not the
+job's; a state a test reads while a job runs is held, or read on the wall
+as the job runs, never at the next step; a flag that says a thread is held
+is read for whether the hold stands, not whether the thread has noticed it
+lifted; and two quantities a test compares are measured in the same stretch
+of the host.
 
 **A bet whose loss cost what it was placed beside.** The builds ahead at
 landing bet that a store passing a share of its budget will pass the

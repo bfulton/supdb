@@ -6635,6 +6635,12 @@ pub(super) struct ZEvents {
     /// Builds started on the builder's thread and taken in, whatever came
     /// of them (`ZCounts::build_collected`).
     pub build_collected: AtomicU64,
+    /// Warms started on the builder's thread and taken in, and the
+    /// builder's jobs whose thread has returned, builds and warms alike
+    /// (`ZCounts::job_ends`).
+    pub warm_starts: AtomicU64,
+    pub warm_collected: AtomicU64,
+    pub job_ends: AtomicU64,
     /// Builds collected dormant, ahead of the controller's decision
     /// (`ZCounts::prebuilt`).
     pub prebuilt: AtomicU64,

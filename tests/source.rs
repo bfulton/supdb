@@ -4732,16 +4732,16 @@ const CI_APT: &str = "sh scripts/apt.sh ";
 /// Actions a step may use, matched whole: each fetches, installs or
 /// publishes, and none checks.
 const CI_ACTIONS: &[(&str, &str)] = &[
-    ("actions/checkout@v4", "the tree"),
+    ("actions/checkout@v7", "the tree"),
     ("Swatinem/rust-cache@v2", "the build cache"),
-    ("actions/upload-artifact@v4", "publishes the quick row"),
+    ("actions/upload-artifact@v7", "publishes the quick row"),
 ];
 
 /// Inputs an action may be given, matched by action and name: none
 /// chooses what is checked.
 const CI_WITH: &[(&str, &str, &str)] = &[
     (
-        "actions/checkout@v4",
+        "actions/checkout@v7",
         "fetch-depth",
         "the whole history, which the base needs",
     ),
@@ -4755,13 +4755,13 @@ const CI_WITH: &[(&str, &str, &str)] = &[
         "shared-key",
         "the one key every job that builds the suite's binary alone restores",
     ),
-    ("actions/upload-artifact@v4", "name", "the artifact's name"),
+    ("actions/upload-artifact@v7", "name", "the artifact's name"),
     (
-        "actions/upload-artifact@v4",
+        "actions/upload-artifact@v7",
         "if-no-files-found",
         "a run that wrote no row publishes nothing",
     ),
-    ("actions/upload-artifact@v4", "path", "what is published"),
+    ("actions/upload-artifact@v7", "path", "what is published"),
 ];
 
 /// The environment a workflow, a job or a step may set, matched whole,
@@ -4802,7 +4802,7 @@ const CI_ENV: &[(&str, &str, &str)] = &[
 /// check runs.
 const CI_IF: &[(&str, &str, &str)] = &[(
     "always()",
-    "actions/upload-artifact@v4",
+    "actions/upload-artifact@v7",
     "the quick row is published whether or not the run passed: it decides nothing",
 )];
 
@@ -5815,7 +5815,7 @@ fn a_workflow_the_test_does_not_hold_fails() {
     };
     // A new workflow, a check of every pull request outside check.sh, and
     // one that checks nothing: both unlisted.
-    let extra = "name: extra\non:\n  pull_request:\njobs:\n  t:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/checkout@v4\n      - run: cargo test\n";
+    let extra = "name: extra\non:\n  pull_request:\njobs:\n  t:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/checkout@v7\n      - run: cargo test\n";
     for (name, t) in [
         (".github/workflows/extra.yml", extra),
         (".github/workflows/nested/extra.yml", extra),
@@ -6060,8 +6060,8 @@ fn a_ci_step_that_checks_outside_check_sh_fails() {
         ("  wasm:\n", "  wasm:\n    env:\n      COST_BASE: HEAD\n", "the environment `COST_BASE: HEAD`"),
         ("  wasm:\n", "  wasm:\n    defaults:\n      run:\n        working-directory: bench\n", "the key `defaults`"),
         (lists, "        working-directory: bench\n        run: sh scripts/check.sh lists\n", "the key `working-directory`"),
-        ("        with:\n          fetch-depth: 0\n", "        with:\n          fetch-depth: 0\n          ref: HEAD~1\n", "the input `ref` of `actions/checkout@v4`"),
-        (lists, "        uses: actions/checkout@v4\n        run: sh scripts/check.sh lists\n", "both a run and an action"),
+        ("        with:\n          fetch-depth: 0\n", "        with:\n          fetch-depth: 0\n          ref: HEAD~1\n", "the input `ref` of `actions/checkout@v7`"),
+        (lists, "        uses: actions/checkout@v7\n        run: sh scripts/check.sh lists\n", "both a run and an action"),
         (cross, "      - <<: *anchor\n      - name: Build and test under emulation\n", "a step the test cannot read"),
         (cross, "      - name: x\n        <<: *anchor\n        run: cargo test\n      - name: Build and test under emulation\n", "a step the test cannot read"),
         (cross, "      - name: &a x\n      - name: Build and test under emulation\n", "a step the test cannot read"),
@@ -6070,7 +6070,7 @@ fn a_ci_step_that_checks_outside_check_sh_fails() {
         // A name the test lists, with a value it does not.
         ("          SUPDB_PR_BASE: ${{ github.event.pull_request.base.sha }}\n", "          SUPDB_PR_BASE: HEAD~1\n", "the environment `SUPDB_PR_BASE: HEAD~1`"),
         // An input the test lists for another action.
-        ("        with:\n          fetch-depth: 0\n", "        with:\n          fetch-depth: 0\n          path: elsewhere\n", "the input `path` of `actions/checkout@v4`"),
+        ("        with:\n          fetch-depth: 0\n", "        with:\n          fetch-depth: 0\n          path: elsewhere\n", "the input `path` of `actions/checkout@v7`"),
         // A list where the workflow has none, and a step's keys with no step.
         ("env:\n  CARGO_TERM_COLOR: always\n", "env:\n  - CARGO_TERM_COLOR: always\n", "a list outside a job's steps"),
         ("  wasm:\n", "  wasm:\n    steps:\n      name: x\n", "a key before any step"),
