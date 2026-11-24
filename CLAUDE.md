@@ -2324,7 +2324,20 @@ pinned beside the rounds, its thread off its core on a loaded runner
 for as long as the reads -- the last round's forms waiting for that pin,
 rightly, once on a hosted macOS runner and one run in a hundred beside
 five others; the pins in the table at the failure named the slot, and
-the test's segment work runs inside the writer's operations now. The
+the test's segment work runs inside the writer's operations now. And as a sum over two stores: the bounds
+walk test (`a_bounds_walk_places_a_boundary_by_its_head_and_reads_its_record_only_on_a_tie`)
+holds one store's boundaries placed by head plus records read to the
+other store's records, from counters every walk of a store adds to, and
+near reads two walks of the same boundaries race inside the seal: the
+landing's of the piece, and the upkeep thread's of the unsealed keys,
+which are the piece's keys. Where the landing published first the pass
+found nothing unsealed and walked nothing, so a store counted one walk
+or two by the thread's turn: eight runs of 240 beside eight busy loops,
+either store, against none of 240 with the fix under the same load. A scratch line at each of the three
+walks' call sites named the two, and holding the upkeep's pass across
+the landing (`hold_upkeep_pass`) gave the gate's exact numbers every
+run. The test settles the store before the seal now, so the pass is done
+in both stores before anything races it. The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; a state the test needs only to have

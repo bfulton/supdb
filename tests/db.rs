@@ -22040,6 +22040,14 @@ fn a_bounds_walk_places_a_boundary_by_its_head_and_reads_its_record_only_on_a_ti
                 db.commit().unwrap();
             };
             write(&mut db, &mut want, 0);
+            // The upkeep thread's pass for the write, done before the seal.
+            // Near reads it walks the unsealed keys against the same
+            // boundaries the landing walks the piece against, the same
+            // keys, so the two count alike; left to race the seal it walked
+            // in one store and found the table landed and nothing to walk
+            // in the other, and the two stores' counts were one walk and
+            // two, one run in thirty beside eight busy loops.
+            db.settle().unwrap();
             let before = db.zpage_counts();
             db.seal().unwrap();
             db.settle().unwrap();
