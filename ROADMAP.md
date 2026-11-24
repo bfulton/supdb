@@ -979,9 +979,17 @@ until the run is its own log). What it loses:
   now (`Options::merge_read_ahead_cipher`, `CLAUDE.md`, a first page
   standing for a window). Paired against the shape before at `a19ffc6`:
   the pass 2.1-2.5x, the shuffled load 1.09-1.34x, the full rewrite's
-  burst 0.74-0.77x, every pair of four; 39-44 pieces at the pass. What is
-  left to read: the pass against encrypted RocksDB again, and the merge's
-  CPU, 159 MB of input a second against the plain store's 227.
+  burst 0.74-0.77x, every pair of four; 39-44 pieces at the pass.
+  Against encrypted RocksDB again at `7675d82` (the command in the item
+  above, `--reps 2`, four pairs): the pass at 0.45-0.62x where it was
+  0.21-0.27x, and with it the shuffled load ahead, 1.04-1.15x in four
+  pairs of four where it was behind in four, the ordered load 1.01-1.15x,
+  reads 2.1-21x, scans 2.9-7x, the clean store's pass 1.08-1.41x and every
+  burst 1.5-4x; the passes after the one- and ten-percent bursts ahead in
+  two pairs and three of four. What is left of the pass is read next by
+  its counters beside the plain store's, whose pass meets about as many
+  pieces and nothing merging; and the merge's CPU, 159 MB of input a
+  second against the plain store's 227.
 - [ ] **The builds ahead's last cold partition under a cipher.** At five
   million keys under 640 MiB with the builds ahead started at a quarter
   of the store's cache, one or two partitions are still found cold in
