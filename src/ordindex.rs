@@ -616,9 +616,11 @@ impl OrdIndex {
             match self.map.slice_at((HEADER + i * HEAD) as u64, run * HEAD) {
                 Some(heads) => top.extend(
                     heads
-                        .chunks_exact(HEAD)
+                        .as_chunks::<HEAD>()
+                        .0
+                        .iter()
                         .step_by(TOP_STRIDE)
-                        .map(|h| u64::from_be_bytes(h.try_into().expect("eight bytes"))),
+                        .map(|h| u64::from_be_bytes(*h)),
                 ),
                 None => top.extend((i..i + run).step_by(TOP_STRIDE).map(|j| self.head(j))),
             }
