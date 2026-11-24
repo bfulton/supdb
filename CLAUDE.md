@@ -671,14 +671,64 @@ whole gone once the common store had a read of its own (`docs/engine.md`,
 point gets and puts beside FASTER). Three things about the instrument
 cost an hour each. The linker folds identical functions, so three phase
 functions with one body were one symbol and one toggle; each holds a
-constant of its own now. Valgrind's clock is fifty times slow, so a timer
-the engine runs by fires inside a phase it never fires in natively: an
-idle seal put a piece under a phase's gets and its count moved by a fifth
+constant of its own now. Valgrind runs one thread at a time and its
+clock fifty times slow, so the store a phase meets under it is not the
+native one: the count of the gets after the updates moved by a fifth
 between builds, which read as the build's. And a phase of a sixth of a
 small store's keys is two milliseconds, where this host's two speeds are a
 quarter apart: the read phases go over their keys several times, and a
 rate is the median of alternated runs of two binaries, never one run of
 each.
+
+That moving count was then explained without a count, and the
+explanation stood in two files: an idle seal firing under
+the slowed clock, a piece under gets that natively have none, so the
+phase was set aside as valgrind's and its gets were not looked at. The
+probe's shape line of the time printed the pieces standing, and read
+none natively. It printed no frozen table, and a seal in flight is one.
+Given a count of the reads by the read that answered them
+(`POINT_OPS_SHAPE=1`, `Reader::point_lean_reads`,
+`point_placed_reads`), one native run said every get of that phase is
+the layered read's and no idle seal fires in either run: the updates
+cross the seal cap, a tenth of the store, natively too; the seal lands
+a few milliseconds into the phase, and under valgrind never inside it.
+So the phase the notes had excused was the store every scrambled mix
+and every F reads, and its get was 1,052 instructions to FASTER's 417
+(`docs/engine.md`, gets over a written store). The rules: a difference
+between the native store and valgrind's is established by counting both,
+never by reasoning from the clock; a shape line prints every source a
+read may consult, the ones in flight too, or it reads "none" off the one
+it leaves out; and a count is taken of the store the native run has
+(`POINT_OPS_LAND=1` joins the seal first), with the native share of each
+path read beside it. The same counter refuted the first fix in one run:
+the lean read left a store with a frozen table to the old one, as a
+state that lasts milliseconds, and two fifths of a short phase's gets
+went there, a seal's milliseconds being most of the time between two
+seals at that size.
+
+And an instruction count is half of a get's price where the keys are
+cold. Read class by class over a few thousand keys, every line cached
+and every branch learned, the layered get was within a third of
+FASTER's; in the phase, over a sixth of the store in no order, it was
+two thirds behind where the clean get is level. No count shows that and
+no single timing resolves it here, the same binary reading 128 to 250 ns
+between runs. What showed it was the samples of one run laid to the
+phase they fell in (`perf record --call-graph dwarf`, the phase's
+function on each stack): the load of a partition's slot took three
+times the samples a read in the layered phase that it takes in the
+clean one, and the record's half again. A get waits on those two lines
+and a loop of gets overlaps one get's waits with the next one's as far
+as the core's window reaches, so a longer path with an unpredictable
+branch ahead of the partition's lookup costs its instructions and then
+the overlap. The slot asked for at the top of the read took its wait
+back to the clean read's, 11% of the phase, measured by a scratch
+toggle alternated eighteen times a side with the phases it cannot reach
+level. By their times over their counts, three programs ran within a
+sixth of one rate of instructions a cycle there, over 417, 497 and 838
+instructions, so past the first prefetch the lever on a cold get is its
+length. Price a read path warm
+by class and cold in the mix, both, before its count is read as its
+cost.
 
 A decoder timed on one input is timed on an input it has learned. The
 form's LZ4 decode read 1.1 µs a page decoding one page over and over

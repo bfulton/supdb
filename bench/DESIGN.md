@@ -852,7 +852,12 @@ fixed run, from the record where it lies (`Options::point_fixed`), and
 take the general read of its sources, where the default reads a partition
 and the live table alone, or the partition, its pieces, the frozen tables
 and the live one in a single pass, wherever each holds the key in its
-common shape (`Options::point_lone`);
+common shape (`Options::point_lone`), and
+`supdb-layersasone` and `supdb-ingestlayersasone` have that single pass
+set up for every source before it asks one, where the default asks the
+live table first and ends there at a tombstone, with the pieces over the
+key's partition placed at the state's publish
+(`Options::point_layers_lean`);
 `supdb-zhotresident` is `supdb` with the hot-raw fill asking for the
 partitions the reads have not skewed by how much of their records the cache
 holds, most first (`Options::zpages_hot_fill_resident_first`);

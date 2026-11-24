@@ -1612,11 +1612,12 @@ pub struct Options {
     /// store a write mix has sealed once is a partition, a piece and a
     /// live table for as long as the piece waits for its merge, with a
     /// frozen table beside them for the milliseconds of each seal, and
-    /// `read_layers` over it executed 1,008 instructions a get where the
+    /// `read_layers` over it executes 1,052 instructions a get where the
     /// read of a store just loaded executes 497 and FASTER's whole get
     /// 417, by callgrind at a hundred thousand keys with the seal landed
     /// (`bench/examples/point_ops.rs` under `POINT_OPS_LAND=1`, the
-    /// `reads_dirty` phase), and no line of it over three in a hundred:
+    /// `reads_dirty` phase, `supdb-ingestlayersasone`; this read 838),
+    /// and no line of it over three in a hundred:
     /// the partitions counted and the key's found by two searches of the
     /// segments, the pieces over it by two more, a frame of eight hundred
     /// bytes cleared for three frozen tables and eight pieces where one

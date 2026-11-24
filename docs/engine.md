@@ -441,13 +441,19 @@ again. The pin is a locked store on every read, a full fence FASTER's reads
 do not have, and it was taken for what kept consecutive reads' misses from
 overlapping; the arm without the fence (`supdb-asympin`) read level with
 the default at 959 instructions and again at 530, in both sittings each.
-And a count taken under callgrind is of the store the slowed clock makes:
-an idle seal fired inside the phase after the updates, the gets went
-through a piece that the native run does not have, and the counts of that
-phase moved by a fifth between builds with nothing changed in its path.
-The store's shape is read natively before a phase's count is believed
-(`POINT_OPS_SHAPE=1`), and the counts quoted here are of the two phases
-whose store the clock does not shape.
+And a count taken under callgrind is of the store valgrind's threads
+make. The phase after the updates moved by a fifth between builds with
+nothing changed in its path, and was read as an idle seal that fired
+under the slowed clock and put a piece under gets that natively have
+none. Neither half of that was so, and a count by path said it later
+(`POINT_OPS_SHAPE=1`, the reads by the read that answered them): the
+updates cross the seal cap, a tenth of the store, in both runs, and no
+idle seal fires in either; natively the seal lands a few milliseconds
+into the phase and its gets are over a piece, and under valgrind, which
+runs one thread at a time, it stays in flight for the phase and they are
+over a frozen table. The shape line of the time counted pieces and not
+frozen tables, and read "none" off a seal in flight. The section below
+is that phase's.
 
 What is left is the write path and the gets beside it. A get of a key the
 live table holds reads the table's slot, its entry, its key and its chunk,
@@ -544,6 +550,110 @@ is what the paragraph above this section names. The bursts, where an
 update of ours costs a microsecond and a half against the quarter to half
 of one a mix's does, have not been taken apart beside FASTER's yet, and
 are the next thing to count.
+
+#### Gets over a written store
+
+A store that has been written is not the store a load leaves. The table
+seals at a tenth of the store (`Options::seal_max_pct`), so after a sixth
+of the keys are rewritten a get meets a partition, a piece that waits for
+its merge and a live table, and for the milliseconds of each seal a
+frozen table beside them. Every get there took the layered read: counted
+by path (`POINT_OPS_SHAPE=1 point_ops supdb-ingest 100000 1 zipf`), all of
+the phase's gets after the updates and all of the half-and-half phase's.
+The scrambled mix family runs wholly on such a store, and F, which
+follows A's updates, from its start.
+
+Counted with the seal landed (`POINT_OPS_LAND=1` and callgrind toggled on
+`point_ops::phase_reads_dirty`, as above, at `4629b8f`), a get there was
+1,052 instructions, against 497 for a get of the store just loaded and
+417 for FASTER's, and no line of it held three in a hundred: the same
+shape the clean read had had, a layer set up for every case the store
+was not in. `Reader::read_placed` (`Options::point_layers_lean`) reads
+the same sources in the order of what each costs: the partition and its
+pieces placed by the state, which took the placement once at its publish
+(`State::placing`); the live table asked first, a tombstone there ending
+the read, which is three gets in ten under the scrambled Zipfian; the
+frozen tables the same way; then the pieces and the partition. It counts
+838, and `supdb-layersasone` and `supdb-ingestlayersasone` keep the read
+before. The first version left a store with a frozen table to the old
+read, on the reasoning that a seal is in flight for milliseconds, and
+the counter of its own reads said a third of the half-and-half phase's
+gets and two fifths of the phase after the updates, at one round a
+phase, had gone there: at this size a seal's milliseconds are a large
+share of the time between two seals.
+
+The count is not the whole of it. Timed by the source that answers
+(`POINT_OPS_LAND=1 POINT_OPS_CLASSES=1 point_ops ARM 100000 2 zipf`), each
+class of key read over and over so that every line is in the cache and
+every branch learned, a get costs, in nanoseconds:
+
+| the key is answered by | `supdb-ingest` | `supdb-ingestlayersasone` | `faster` |
+|---|---|---|---|
+| the live table | 60 | 80-85 | 47-49 |
+| the piece | 72 | 80-84 | 47-50 |
+| the partition | 90-96 | 105-140 | 62-66 |
+
+In the phase itself, where the keys are a sixth of the store drawn in no
+order, the same gets cost 177 ns under the scrambled Zipfian and 203
+under uniform keys, against 214 and 244 for the read before and 109 and
+118 for FASTER (`point_ops ARM 100000 4 DIST`, the three arms alternated
+six times, the median of the eighteen reps after each run's first; the
+phases the change cannot reach read 166 and 164, 111 and 112, 310 and
+316). Warm, the layered get is within a third of FASTER's; over keys the
+cache does not hold it is two thirds behind, where the clean get is
+level. The difference is how far two gets overlap. A get waits on two
+lines of the partition, its slot and then its record, and in a loop of
+gets the next one's waits begin while this one's are outstanding, as
+far as the core's window reaches. The layered get is longer, and the
+live table's probe ahead of the partition's is a branch no predictor
+learns, three in ten one way. Sampled by phase (`POINT_OPS_LAND=1 perf
+record -e cpu-clock -F 10000 --call-graph dwarf` over `point_ops ARM
+100000 1 uniform 40`, the samples laid to the phase function on each
+stack, twice an arm, at `4629b8f`), the read before spent 341 and 384
+samples at the load of a partition's slot in the phase after the
+updates and 110 and 131 in the phase before them, and 526 and 589 at
+the record's against 418 and 424, for five sixths as many reads of the
+partition. So `read_placed` asks for the partition's slot as soon as
+the key is hashed, ahead of the tables and the filters, and the same
+sampling reads its slot at 127 and 169 against 115 and 120, the clean
+read's again, with the record's at 530 and 557 against 385 and 390,
+still two fifths more for fewer reads. A scratch build that left the
+ask out, alternated with one that made it, read the phase 240 ns and
+212 under uniform keys and 196 and 174 under the Zipfian, with the
+other phases level. The record's wait cannot be asked for ahead, its
+line being what the slot says; what shortens it is the next get
+starting sooner. FASTER, our clean get and our layered get each run at
+about the same instructions a cycle, 1.7 to 2.0, over 417, 497 and 838
+instructions, and the 838 has in it the generality the clean read's
+497 still has: the pin's two calls at sixty, the read's shell at a
+hundred, the partition's read at a hundred and ten.
+
+In the suite (`bench/scripts/pair.sh supdb-ingest supdb-ingestlayersasone
+300000 --reps 6 --passes load,read,read-threaded,mixes,mixes-scrambled`,
+at `4629b8f`, the default's rate over the arm's in the two sittings):
+the scrambled B 1.10x and 1.15x, C 1.05x and 1.15x, D 1.11x and 1.21x, F
+1.08x and 1.13x, A 0.98x and 1.08x; the first family's D 1.00x and 1.14x
+and F 0.98x and 1.09x; and the loads, the read passes and the mixes that
+run before a seal within 0.94x and 1.03x. At a hundred thousand keys the
+same pairing's sittings disagree by more than its cells differ, the
+read-only mix that no layered read is in among them at 1.21x and 1.05x.
+The durable arm's pairing at that rung (`pair.sh supdb supdb-layersasone
+100000`, the same passes) resolves nothing either way, 0.86x to 1.35x
+with the sittings on opposite sides.
+
+Beside FASTER (`pair.sh supdb-held faster 300000`, the same passes, at
+`4629b8f`, both sittings): the scrambled B 0.91x and 0.86x and C 0.87x
+and 0.84x, where the table above reads 0.75-0.81x; the scrambled D 0.70x
+and 0.73x, A 0.68x and 0.63x and F 0.57x and 0.58x; and the first family
+as it was, C 0.90x and 0.94x, B 0.86x and 0.82x, D 0.83x and 0.88x, A
+0.74x and 0.70x, F 0.60x in both. The mixes that mostly read have closed
+a third of their distance, and the mixes that write have not moved: by
+kind (`SUPDB_MIX_KINDS=1 bench ab --arms supdb-held,faster --size 100000
+--reps 3 --passes load,read,mixes,mixes-scrambled`) an update of ours is
+230 to 500 ns in A and F and their scrambled twins against FASTER's 66
+to 184, and half of those mixes' operations are updates. The write path
+is the larger distance now, and the gets' is the path length the clean
+read shares.
 
 ### The seal wait
 
