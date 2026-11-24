@@ -7,7 +7,9 @@
 //!   point_ops ARM [SIZE] [REPS] [DIST] [ROUNDS]
 //!
 //! `ARM` is any of the suite's, or `proto`: the probe's own table of records
-//! written in place (`supdb_bench::proto`), driven as the arms are.
+//! written in place (`supdb_bench::proto`), driven as the arms are; or
+//! `proto-log`, the same code over FASTER's layout, an index of words over
+//! records packed at their own lengths.
 //!
 //! The phases, each `OPS` operations (a sixth of the keys, the mixes'
 //! count, and at least a thousand), in the order a pass runs them:
@@ -147,6 +149,8 @@ fn main() {
         // the suite's arms are.
         let mut e: Box<dyn Engine> = if arm == "proto" {
             Box::new(supdb_bench::proto::Hot::create(size))
+        } else if arm == "proto-log" {
+            Box::new(supdb_bench::proto::Logged::create(size))
         } else {
             engines::open(&arm, &dir, 1).unwrap()
         };

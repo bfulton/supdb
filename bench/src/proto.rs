@@ -282,6 +282,266 @@ impl Engine for Hot {
     }
 }
 
+/// FASTER's layout with the inline table's code: an index of 8-byte words,
+/// each a 16-bit tag and a record's address, over records packed in an
+/// arena at their own lengths -- a 16-byte header (the sequence word, the
+/// key's length and the value's), the key, the value, rounded to eight. A
+/// cold get takes the slot's line and then the record's, as FASTER's does,
+/// and nothing in it depends on the record's size: the key is compared at
+/// its length and the value copied at its own. An overwrite of the same
+/// length is in place under the record's sequence word; any other is a new
+/// record at the arena's end and a store of the slot. So the inline
+/// table's lead over FASTER is the slot's layout only as far as this one
+/// gives it back.
+struct Packed {
+    slots: Box<[AtomicU64]>,
+    shift: u32,
+    arena: *mut u8,
+    arena_cap: usize,
+    tail: AtomicUsize,
+    len: AtomicUsize,
+}
+
+unsafe impl Send for Packed {}
+unsafe impl Sync for Packed {}
+
+impl Drop for Packed {
+    fn drop(&mut self) {
+        unsafe {
+            std::alloc::dealloc(
+                self.arena,
+                std::alloc::Layout::from_size_align(self.arena_cap, 64).unwrap(),
+            )
+        }
+    }
+}
+
+const ADDR: u64 = (1 << 48) - 1;
+const HDR: usize = 16;
+
+#[repr(C)]
+struct RecHdr {
+    seq: AtomicU64,
+    klen: u32,
+    vlen: u32,
+}
+
+impl Packed {
+    fn new(keys: usize, x: f64) -> Packed {
+        let cap = ((keys as f64 * x) as usize).next_power_of_two().max(1024);
+        // Room for every key's record twice over: the probe's loads and
+        // inserts, and an overwrite of another length, never fill it.
+        let arena_cap = (keys.max(1024) * (HDR + 16 + VALUE + 8) * 2).next_multiple_of(4096);
+        let arena = unsafe {
+            std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(arena_cap, 64).unwrap())
+        };
+        assert!(!arena.is_null());
+        Packed {
+            slots: (0..cap).map(|_| AtomicU64::new(0)).collect(),
+            shift: 64 - cap.trailing_zeros(),
+            arena,
+            arena_cap,
+            tail: AtomicUsize::new(0),
+            len: AtomicUsize::new(0),
+        }
+    }
+
+    #[inline(always)]
+    fn rec(&self, at: u64) -> *mut RecHdr {
+        unsafe { self.arena.add((at - 1) as usize) as *mut RecHdr }
+    }
+
+    /// The key's record and its slot, or the empty slot its walk ended at.
+    #[inline(always)]
+    fn walk(&self, key: &[u8]) -> (usize, Option<*mut RecHdr>, u64) {
+        let (a, b) = if key.len() >= 16 {
+            words(key)
+        } else {
+            let mut kb = [0u8; 16];
+            kb[..key.len()].copy_from_slice(key);
+            words(&kb)
+        };
+        let h = hash(a ^ key.len() as u64, b);
+        let tag = (h & 0xffff) << 48;
+        let mask = self.slots.len() - 1;
+        let mut i = (h >> self.shift) as usize;
+        loop {
+            let s = self.slots[i].load(Acquire);
+            if s == 0 {
+                return (i, None, tag);
+            }
+            if s & !ADDR == tag {
+                let r = self.rec(s & ADDR);
+                let k = unsafe {
+                    std::slice::from_raw_parts((r as *const u8).add(HDR), (*r).klen as usize)
+                };
+                if k == key {
+                    return (i, Some(r), tag);
+                }
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    #[inline(always)]
+    fn read(&self, key: &[u8], out: &mut [u8; VALUE]) -> Option<usize> {
+        let (_, r, _) = self.walk(key);
+        let r = r?;
+        unsafe {
+            loop {
+                let q1 = (*r).seq.load(Acquire);
+                if q1 & 1 == 1 {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                let (klen, vlen) = ((*r).klen as usize, (*r).vlen as usize);
+                let n = vlen.min(VALUE);
+                std::ptr::copy_nonoverlapping(
+                    (r as *const u8).add(HDR + klen),
+                    out.as_mut_ptr(),
+                    n,
+                );
+                fence(Acquire);
+                if (*r).seq.load(Relaxed) == q1 {
+                    return Some(n);
+                }
+            }
+        }
+    }
+
+    fn append(&self, key: &[u8], v: &[u8]) -> Res<u64> {
+        let need = (HDR + key.len() + v.len()).next_multiple_of(8);
+        let at = self.tail.load(Relaxed);
+        if at + need > self.arena_cap {
+            return Err("the probe's arena is full".to_string());
+        }
+        unsafe {
+            let r = self.arena.add(at) as *mut RecHdr;
+            (*r).klen = key.len() as u32;
+            (*r).vlen = v.len() as u32;
+            let p = (r as *mut u8).add(HDR);
+            std::ptr::copy_nonoverlapping(key.as_ptr(), p, key.len());
+            std::ptr::copy_nonoverlapping(v.as_ptr(), p.add(key.len()), v.len());
+            (*r).seq.store(2, Relaxed);
+        }
+        self.tail.store(at + need, Relaxed);
+        Ok(at as u64 + 1)
+    }
+
+    fn upsert(&self, key: &[u8], v: &[u8]) -> Res<()> {
+        let (i, r, tag) = self.walk(key);
+        match r {
+            Some(r) if unsafe { (*r).vlen } as usize == v.len() => unsafe {
+                let q = (*r).seq.load(Relaxed);
+                (*r).seq.store(q + 1, Relaxed);
+                fence(Release);
+                let p = (r as *mut u8).add(HDR + key.len());
+                std::ptr::copy_nonoverlapping(v.as_ptr(), p, v.len());
+                (*r).seq.store(q + 2, Release);
+            },
+            Some(_) => {
+                let at = self.append(key, v)?;
+                self.slots[i].store(tag | at, Release);
+            }
+            None => {
+                if (self.len.load(Relaxed) + 1) * 8 > self.slots.len() * 7 {
+                    return Err("the probe's index is full".to_string());
+                }
+                let at = self.append(key, v)?;
+                self.slots[i].store(tag | at, Release);
+                self.len.fetch_add(1, Relaxed);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[inline(always)]
+fn packed_get(t: &Packed, key: &[u8]) -> Res<usize> {
+    OUT.with(|o| {
+        let mut o = o.borrow_mut();
+        match t.read(key, &mut o) {
+            Some(n) => {
+                std::hint::black_box(o.as_slice());
+                Ok(n)
+            }
+            None => Ok(0),
+        }
+    })
+}
+
+/// The packed layout as an engine of the suite's (`point_ops proto-log`).
+pub struct Logged {
+    t: Arc<Packed>,
+}
+
+impl Logged {
+    /// An index of twice as many slots as `keys`, rounded up to a power of
+    /// two, or `PROTO_CAP_X` times as many where that is set.
+    pub fn create(keys: u64) -> Logged {
+        let x: f64 = std::env::var("PROTO_CAP_X")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2.0);
+        Logged {
+            t: Arc::new(Packed::new(keys as usize, x)),
+        }
+    }
+}
+
+struct LoggedReader {
+    t: Arc<Packed>,
+}
+
+impl ThreadReader for LoggedReader {
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        packed_get(&self.t, key)
+    }
+    fn range(&mut self, _from: &[u8], _n: usize) -> Res<usize> {
+        Err("the probe's table has no ordered scan".to_string())
+    }
+}
+
+impl Engine for Logged {
+    fn name(&self) -> &'static str {
+        "proto-log"
+    }
+    fn features(&self) -> Features {
+        Hot::create(0).features()
+    }
+    fn write_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
+        for &(k, v) in items {
+            self.t.upsert(k, v)?;
+        }
+        Ok(())
+    }
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        packed_get(&self.t, key)
+    }
+    fn range(&mut self, _from: &[u8], _n: usize) -> Res<usize> {
+        Err("the probe's table has no ordered scan".to_string())
+    }
+    fn sync(&mut self) -> Res<()> {
+        Ok(())
+    }
+    fn size_bytes(&self) -> u64 {
+        (self.t.slots.len() * 8 + self.t.tail.load(Relaxed)) as u64
+    }
+    fn thread_reader(&self) -> Res<ReaderOpener> {
+        let t = self.t.clone();
+        Ok(Box::new(move || {
+            Ok(Box::new(LoggedReader { t }) as Box<dyn ThreadReader>)
+        }))
+    }
+    fn counters(&self) -> Vec<(&'static str, f64)> {
+        vec![
+            ("proto_keys", self.t.len.load(Relaxed) as f64),
+            ("proto_slots", self.t.slots.len() as f64),
+            ("proto_arena_bytes", self.t.tail.load(Relaxed) as f64),
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +563,30 @@ mod tests {
         }
         crate::workload::db_key_into(5000, &mut kb);
         assert_eq!(h.get(&kb).unwrap(), 0);
+        assert_eq!(h.t.len.load(Relaxed), 1000);
+    }
+
+    #[test]
+    fn the_packed_layout_reads_back_values_of_any_length() {
+        // Keys of eight to sixteen bytes, each distinct at its own length.
+        let key = |j: u64| format!("key{j:05}{}", "x".repeat((j % 9) as usize)).into_bytes();
+        let mut h = Logged::create(1000);
+        for i in 0..1500u64 {
+            let len = if i >= 1000 && i % 3 == 0 { 40 } else { VALUE };
+            let v = vec![(i % 251) as u8; len];
+            h.write_batch(&[(&key(i % 1000), &v)]).unwrap();
+        }
+        for j in 0..1000u64 {
+            let last = if j < 500 { j + 1000 } else { j };
+            let len = if last >= 1000 && last % 3 == 0 {
+                40
+            } else {
+                VALUE
+            };
+            assert_eq!(h.get(&key(j)).unwrap(), len, "key {j}");
+            OUT.with(|o| assert_eq!(o.borrow()[..len], vec![(last % 251) as u8; len][..]));
+        }
+        assert_eq!(h.get(b"nope").unwrap(), 0);
         assert_eq!(h.t.len.load(Relaxed), 1000);
     }
 }
