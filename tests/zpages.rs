@@ -8672,6 +8672,82 @@ fn form_files_on_disk_are_dormant_under_auto_and_attached_when_the_form_is_wante
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A build parked at its hold reads as held while the hold stands and as
+/// not held the moment the hold is lifted (`Db::zpage_build_held`), where
+/// its waiting bit stands until the thread wakes (`Db::zpage_build_waiting`),
+/// which at the idle class can be long enough for a wait to move the
+/// injected clock under a build about to run; and once the controller is at
+/// rest every job of the builder's it started has returned and been taken
+/// in, the warms after the install as well as the builds
+/// (`ZCounts::warm_starts`, `warm_collected`, `job_ends`): the sums the
+/// waits here read a job in flight by, so a job counted started and never
+/// ended would hold every wait in this file for `JOB_WALL`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_lifted_hold_holds_nothing_and_the_builders_jobs_balance_at_rest() {
+    let (dir, db, model, inject) = auto_store_with(
+        "auto-held",
+        1 << 20,
+        1_000_000.0,
+        FAULT_1MS,
+        |o| {
+            o.zpages_prebuild = true;
+            o.zpages_cover_resident = false;
+            o.zpages_suspect_at_crossing = false;
+        },
+        |db| db.hold_zpage_build(true),
+    );
+    for _ in 0..400 {
+        if db.zpage_build_waiting() {
+            break;
+        }
+        wait_steps(&db, 1);
+    }
+    let c = db.zpage_counts();
+    assert!(
+        db.zpage_build_waiting() && db.zpage_build_held(),
+        "a build at its hold, held: {c:?}"
+    );
+    assert!(
+        c.build_starts > c.job_ends,
+        "the held build has not returned: {c:?}"
+    );
+    db.hold_zpage_build(false);
+    assert!(!db.zpage_build_held(), "a lifted hold holds nothing");
+    assert!(
+        tick_until(&db, 400, |c| c.prebuilt >= c.partitions && c.partitions > 0),
+        "built ahead: {:?}",
+        db.zpage_counts()
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+        "COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    assert!(
+        tick_until(&db, 400, |c| c.attached >= c.partitions
+            && c.warms >= c.partitions),
+        "every file attached and warmed: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert!(
+        c.warm_starts >= c.partitions,
+        "the warms counted started: {c:?}"
+    );
+    assert_eq!(
+        (c.build_starts + c.warm_starts, c.job_ends),
+        (c.job_ends, c.build_collected + c.warm_collected),
+        "every job started returned and was taken in: {c:?}"
+    );
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A store past its budget with the builds ahead on
 /// (`Options::zpages_prebuild`): every partition's form file is built and
 /// left on disk unattached while the controller is in SUSPECT, the raw
