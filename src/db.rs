@@ -28080,6 +28080,29 @@ impl Reader {
                 t.filed = 0;
             }
         }
+        // A partition this handle carries no table to holds no form of
+        // its own, so whatever `st` publishes for it is withdrawn, as the
+        // loop above withdraws a form a carried table holds none for. A
+        // drop withdraws from the state its operation holds, and the
+        // upkeep thread's pass may have published into a later one -- a
+        // landing's, which the writer's operation had not reached when its
+        // look was refused and dropped -- or a landing carried the forms
+        // on from it: this look then rebased with every table gone and
+        // kept them, and a handle took them as the blocks once the next
+        // publish moved the forms' position past them.
+        for (p, cell) in tables.iter().take(np).enumerate() {
+            if cell.borrow().is_some() {
+                continue;
+            }
+            let Some(forms) = st.forms.get(p) else {
+                continue;
+            };
+            for (b, slot) in forms.iter().enumerate() {
+                if !slot.load(AtomicOrdering::Acquire).is_null() {
+                    self.publish_marker(p, b);
+                }
+            }
+        }
         // Dirty whatever was marked: `st` vouches for no commit until
         // this handle publishes into it, and a publish with nothing
         // marked dirty stamps nothing.
@@ -28314,6 +28337,17 @@ impl Reader {
         self.note_freed(self.fs().cache_bytes.get());
         for t in self.fs().tables.borrow().iter() {
             *t.borrow_mut() = None;
+        }
+        // The writer's forms go, and with them what the state publishes
+        // of them: a block the writer holds no form for has none
+        // published as the block. Left standing, the copies were the
+        // block for every handle once the writer's next publish moved the
+        // forms' position past them, current to nothing it filed after
+        // the drop -- the look whose rebase is refused drops here, and a
+        // handle's scan read a key's value from before its last write
+        // while the point read beside it, through the memtable, was right.
+        if self.slot.is_none() && self.opts.commit_forms {
+            self.retract_published();
         }
         self.fs().dirty_any.set(false);
         self.fs().tables_complete.set(false);
@@ -29031,12 +29065,19 @@ impl Reader {
             self.shared
                 .upkeep_lives
                 .store(u64::MAX, AtomicOrdering::Relaxed);
-            let st = self.state();
-            for (p, forms) in st.forms.iter().enumerate() {
-                for (b, slot) in forms.iter().enumerate() {
-                    if !slot.load(AtomicOrdering::Acquire).is_null() {
-                        self.publish_marker(p, b);
-                    }
+            self.retract_published();
+        }
+    }
+
+    /// Every form the state publishes as a block, replaced by the mark
+    /// that says to build it: for the writer, whose forms they were, once
+    /// it holds none of them.
+    fn retract_published(&self) {
+        let st = self.state();
+        for (p, forms) in st.forms.iter().enumerate() {
+            for (b, slot) in forms.iter().enumerate() {
+                if !slot.load(AtomicOrdering::Acquire).is_null() {
+                    self.publish_marker(p, b);
                 }
             }
         }
@@ -29239,9 +29280,46 @@ impl Reader {
         }
         let at = mem.committed_log();
         if self.publish_dirty(true, at) && !self.forms_position_held() {
+            #[cfg(debug_assertions)]
+            self.check_published(st, at);
             st.forms_complete
                 .store(self.fs().tables_complete.get(), AtomicOrdering::Release);
             st.forms_at.store(at, AtomicOrdering::Release);
+        }
+    }
+
+    /// A publish of the forms' position, held in a checked build to what
+    /// it vouches for: every form the state holds as a block is the form
+    /// the writer holds for that block, since a reader at the position
+    /// takes it as the block. A form the writer dropped and left standing
+    /// is current to nothing it filed after the drop.
+    #[cfg(debug_assertions)]
+    fn check_published(&self, st: &State, at: usize) {
+        let tables = self.fs().tables.borrow();
+        for (p, slots) in st.forms.iter().enumerate() {
+            for (b, s) in slots.iter().enumerate() {
+                let cur = s.load(AtomicOrdering::Acquire);
+                if cur.is_null() {
+                    continue;
+                }
+                // SAFETY: the caller's state is held and pinned.
+                let cf = unsafe { &*cur };
+                if matches!(*cf.form, Cached::Wide(_)) {
+                    continue;
+                }
+                let held = tables.get(p).map(|c| c.borrow());
+                let own = held
+                    .as_ref()
+                    .and_then(|h| h.as_ref())
+                    .and_then(|t| t.slots.get(b))
+                    .and_then(|f| f.as_ref());
+                assert!(
+                    own.is_some_and(|o| std::sync::Arc::ptr_eq(o, &cf.form)),
+                    "a publish at {at} vouches for the form of block ({p}, {b}) published at {}, \
+                     which the writer does not hold",
+                    cf.at
+                );
+            }
         }
     }
 
@@ -30251,6 +30329,8 @@ impl Reader {
             && self.publish_dirty(false, at)
             && !self.forms_position_held()
         {
+            #[cfg(debug_assertions)]
+            self.check_published(st, at);
             st.forms_complete
                 .store(self.fs().tables_complete.get(), AtomicOrdering::Release);
             st.forms_at.store(at, AtomicOrdering::Release);
@@ -33589,6 +33669,37 @@ impl Reader {
         let done = self.maintain_forms();
         drop(op);
         done
+    }
+
+    /// A test's: the writer's block forms dropped as a look whose rebase
+    /// is refused drops them (`drop_blocks`), in an operation of its own.
+    #[doc(hidden)]
+    pub fn drop_forms(&mut self) {
+        std::mem::forget(self.enter());
+        let op = Op(self);
+        self.drop_blocks_for(9);
+        drop(op);
+    }
+
+    /// A test's: the writer's block forms dropped with the forms the
+    /// state publishes of them left standing, as a drop leaves them that
+    /// is made in an operation holding a state older than the one they
+    /// were published into -- the upkeep thread's pass publishing into a
+    /// landing's state the writer's operation had not reached -- and the
+    /// cache still in use, as the commit's fill after it marks it.
+    #[doc(hidden)]
+    pub fn forget_forms_unretracted(&mut self) {
+        std::mem::forget(self.enter());
+        let op = Op(self);
+        for t in self.fs().tables.borrow().iter() {
+            *t.borrow_mut() = None;
+        }
+        self.note_freed(self.fs().cache_bytes.get());
+        self.fs().cache_bytes.set(0);
+        self.fs().built.borrow_mut().clear();
+        self.fs().dirty_any.set(false);
+        self.fs().tables_complete.set(false);
+        drop(op);
     }
 
     /// PROTOTYPE: the cache's size, for a measurement: blocks held and

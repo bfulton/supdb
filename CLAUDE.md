@@ -2198,7 +2198,28 @@ were listed, a partition merged or held by a job among them, and a word
 left standing would have every later look wait on pages nobody had asked
 for, the raw records of a partition whose form is installed over them
 again among them, which the install drops. It is written from the
-policy's own lists after every look now, one site. The
+policy's own lists after every look now, one site. And as a writer's
+forms and a lent batch, in the reader threads' test: its close held
+that a quiet writer had maintained forms and that the upkeep thread had
+made a pass, and both were the threads' timing once a commit that files
+writes stopped filling (`Options::forms_settle_builds_filed`) and a
+buffered commit after a scan began settling its own batch
+(`Options::upkeep_settle_after_scans`): one run in thirty the writer's
+tables, dropped at a look the flush's last landing refused, were never
+built again before the close, every commit after them filing writes,
+and in a few hundred no commit came without a scan before it, so the
+thread was lent nothing; main, which filled at every commit, failed the
+second three runs in a hundred. The quiet writer walks its store before
+the close now, and halfway through the rounds the threads stop scanning
+across two commits and the pass the second lends is waited for by its
+count. And as a pin: the sweep's test held that four hundred point
+reads after a handle's pin is lifted free what waited under it, and
+under the compact form forced the segment work's looks and collections
+pinned beside the rounds, its thread off its core on a loaded runner
+for as long as the reads -- the last round's forms waiting for that pin,
+rightly, once on a hosted macOS runner and one run in a hundred beside
+five others; the pins in the table at the failure named the slot, and
+the test's segment work runs inside the writer's operations now. The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; a state the test needs only to have
@@ -6623,6 +6644,43 @@ invariant of the structure fixes is not made; and a phase that allocates
 under a bound is priced by its fresh bytes before its instructions, by a
 timer of its steps and not by a profile whose own cost lands on the same
 faults.
+
+**A drop that withdrew nothing from the state it dropped beside.** The
+writer's look at a new generation rebases its tables across it, and
+where the rebase is refused -- the frozen tables neither the ones it
+kept nor those less the landed -- drops them all (`drop_blocks`), and the
+drop took the writer's forms and left what the state published of them.
+Nothing read them while the forms' position stood; the writer's next
+publish moved it past them, the blocks were ones the writer filed
+nothing into any more, and a handle took a copy as the block: the
+buffered reader threads' test read a key's value from before its last
+write while the point read beside it, through the memtable, was right,
+once on a hosted macOS runner and one run in three hundred here, and the
+settle's check that a block the writer holds no form for has none
+published fired in the runs where the writer wrote into such a block
+before a handle read it. The drop withdraws now, as the shed's branches
+and the forms-off drop did already. A trace of every drop and every
+publish named a second way to the same state: the upkeep thread's pass
+had published 48 forms into a landing's state the writer's operation
+had not reached, the writer's look was refused in the older state and
+dropped there, where nothing stood, and its next look, at the landing's
+state, rebased with every table gone -- the commit's fill marks the
+cache in use before any table exists -- and kept the forms. The look
+withdraws what the state publishes for every partition it carries no
+table to (`rebase_tables`), as it withdrew a form a carried table holds
+none for. A publish of the forms' position asserts in a checked build
+that every form the state holds as a block is the writer's own
+(`check_published`), which caught both at the publish where the wrong
+answer had waited for a reader, four runs in four hundred, and costs the
+`db` binary nothing measurable; `tests/db.rs` builds each case through
+a seam (`drop_forms`, `forget_forms_unretracted`), each test failing
+without its half. Main had both; its timing reached neither in 2,600
+runs. The rules: whatever drops the things an absence is about withdraws
+what stands for them in the state it holds, and the look that arrives
+in a later state checks every claim it finds there against what it
+holds, since a drop made in one state cannot reach the next; and an
+invariant a reader leans on is asserted where it is published, not only
+at a write that a stale form need never meet.
 
 ## Standing limitations
 
