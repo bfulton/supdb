@@ -206,6 +206,10 @@ const HEAD: usize = 8;
 /// cache lines the prefetcher walks, so a seek's cold probes fall in one
 /// run instead of across the file.
 pub(crate) const TOP_STRIDE: usize = 64;
+/// The heads one ask of the top level's late read takes (`read_top`): a
+/// whole number of the level's strides, and the bytes one request of the
+/// device carries on the hosts this runs on (`bytes::WILLNEED_PIECE`).
+const TOP_RUN: usize = crate::bytes::WILLNEED_PIECE / HEAD;
 /// Header word: one more than the keys' common length when every key has
 /// one length and it is at most `pfx + HEAD`, so a head is a whole key and
 /// a seek needs no record; 0 otherwise, and in every file from before the
@@ -573,12 +577,54 @@ impl OrdIndex {
         if self.n == 0 {
             return &self.top_eager;
         }
-        self.top_late.get_or_init(|| {
-            (0..self.n)
-                .step_by(TOP_STRIDE)
-                .map(|i| self.head(i))
-                .collect()
-        })
+        self.top_late.get_or_init(|| self.read_top())
+    }
+
+    /// The top level read now where a first seek would read it
+    /// (`top_late`): for whoever publishes a segment it has just written,
+    /// whose index a store under a cipher still holds in its cache, so
+    /// that the read is of memory and no reader's first seek waits for it.
+    /// Nothing for a mapped file, whose level its open read.
+    pub(crate) fn top_now(&self) {
+        let _ = self.top();
+    }
+
+    /// Whether the top level is in memory: read at the open, or since.
+    #[cfg(test)]
+    pub(crate) fn top_is_read(&self) -> bool {
+        self.n == 0 || !self.top_eager.is_empty() || self.top_late.get().is_some()
+    }
+
+    /// The top level of a mapping that lends by the piece, read from its
+    /// heads a run of them an ask (`TOP_RUN`). A sample lies in every
+    /// piece of the heads, eight of them in four kilobytes, so the level
+    /// is the heads read whole; asked for a head at a time each piece was
+    /// made present by itself, and where the store's cache had given the
+    /// heads back that was a wait for the device a piece: twenty-six
+    /// milliseconds for an index of two hundred thousand keys, at the
+    /// first seek of every partition, which was nine tenths of the suite's
+    /// one-thread scan pass under a cipher at five million keys under 640
+    /// MiB. A run asked for at once has its pieces' bytes asked of the
+    /// device together (`db::pager`). A run that does not lend is read a
+    /// head at a time, where a head that does not read answers zero and
+    /// its source records what failed (`head_absent`).
+    fn read_top(&self) -> Vec<u64> {
+        let mut top = Vec::with_capacity(self.n.div_ceil(TOP_STRIDE));
+        let mut i = 0;
+        while i < self.n {
+            let run = (self.n - i).min(TOP_RUN);
+            match self.map.slice_at((HEADER + i * HEAD) as u64, run * HEAD) {
+                Some(heads) => top.extend(
+                    heads
+                        .chunks_exact(HEAD)
+                        .step_by(TOP_STRIDE)
+                        .map(|h| u64::from_be_bytes(h.try_into().expect("eight bytes"))),
+                ),
+                None => top.extend((i..i + run).step_by(TOP_STRIDE).map(|j| self.head(j))),
+            }
+            i += run;
+        }
+        top
     }
 
     /// A head that did not read: past the heads of a mapped file, which is
@@ -2158,8 +2204,16 @@ mod tests {
 
     /// A paged mapping over bytes held in memory, which says the share it
     /// is given of any range that meets its cold range is resident and all
-    /// of any other: what a mapping read by the piece is to an index.
-    struct InMemory(Vec<u8>, f64, std::ops::Range<u64>);
+    /// of any other: what a mapping read by the piece is to an index. It
+    /// counts what it is asked to make present, and refuses any range
+    /// that meets its last field's.
+    struct InMemory(
+        Vec<u8>,
+        f64,
+        std::ops::Range<u64>,
+        std::sync::atomic::AtomicUsize,
+        std::ops::Range<u64>,
+    );
     impl crate::bytes::Paging for InMemory {
         fn base_address(&self, _: crate::bytes::BaseAddressToken) -> *const u8 {
             self.0.as_ptr()
@@ -2168,8 +2222,9 @@ mod tests {
             self.0.len() as u64
         }
         fn ensure(&self, off: u64, len: usize) -> bool {
+            self.3.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             off.checked_add(len as u64)
-                .is_some_and(|e| e <= self.size())
+                .is_some_and(|e| e <= self.size() && !(off < self.4.end && self.4.start < e))
         }
         fn piece_end(&self, _: u64) -> u64 {
             self.size()
@@ -2201,7 +2256,13 @@ mod tests {
     /// `bytes` as an index's mapping read by the piece, `share` of any
     /// range of it that meets `cold` said to be resident.
     fn in_memory(bytes: Vec<u8>, share: f64, cold: std::ops::Range<u64>) -> MmapBytes {
-        MmapBytes::paged(std::sync::Arc::new(InMemory(bytes, share, cold)))
+        MmapBytes::paged(std::sync::Arc::new(InMemory(
+            bytes,
+            share,
+            cold,
+            std::sync::atomic::AtomicUsize::new(0),
+            0..0,
+        )))
     }
 
     /// Whether every head is in memory is asked of the source, for either
@@ -2291,6 +2352,87 @@ mod tests {
                 assert_eq!(by_piece.seek_exact_planned(pp, k, resolver(&keys)), want);
             }
         }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The top level an index read by the piece reads late is the mapped
+    /// one's, sample for sample, and is asked of its source a run of heads
+    /// at a time (`TOP_RUN`): three asks for an index of two runs and a
+    /// part of one, where a head an ask was six hundred and more, each a
+    /// piece of the heads made present by itself. `top_now` is that read,
+    /// made once, and a seek after it asks for its stride alone. A run the
+    /// source cannot lend is read a head at a time, where a head that
+    /// does not read answers zero and every other sample is right.
+    #[test]
+    fn a_top_level_read_late_is_asked_for_a_run_at_a_time() {
+        let n = 2 * TOP_RUN + 6_037;
+        let owned: Vec<Vec<u8>> = (0..n as u64)
+            .map(|i| format!("{:016}", i * 3 + 1).into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let p = write(&build(&keys), "top-by-runs");
+        let mut mapped = OrdIndex::open(&p, n).expect("opens");
+        mapped.learn_prefix(keys[0]);
+        let want = mapped.top().to_vec();
+        assert_eq!(want.len(), n.div_ceil(TOP_STRIDE));
+        let over = |no: std::ops::Range<u64>| {
+            let src = std::sync::Arc::new(InMemory(
+                std::fs::read(&p).expect("reads"),
+                1.0,
+                0..0,
+                std::sync::atomic::AtomicUsize::new(0),
+                no,
+            ));
+            let mut idx =
+                OrdIndex::over(MmapBytes::paged(src.clone()), n).expect("opens by the piece");
+            idx.learn_prefix(keys[0]);
+            (idx, src)
+        };
+        let asked = |src: &InMemory| src.3.load(std::sync::atomic::Ordering::Relaxed);
+
+        let (idx, src) = over(0..0);
+        let at_open = asked(&src);
+        idx.top_now();
+        assert_eq!(asked(&src) - at_open, 3, "an ask a run of heads");
+        assert_eq!(idx.top(), &want[..], "the mapped index's samples");
+        idx.top_now();
+        assert_eq!(asked(&src) - at_open, 3, "read once");
+        let read = asked(&src);
+        let mut t = usize::MAX;
+        let plan = idx
+            .plan_seek(keys[n / 2], &mut t)
+            .expect("a key of the index plans");
+        let got = idx.seek_exact_planned(plan, keys[n / 2], resolver(&keys));
+        assert_eq!(got, mapped.seek_exact(keys[n / 2], resolver(&keys)));
+        assert!(
+            asked(&src) - read <= TOP_STRIDE + 2,
+            "a seek after the level is read asks for its stride: {}",
+            asked(&src) - read
+        );
+
+        // A byte of the second run that does not read: the run is refused
+        // whole and asked for again a head at a time, where the one head
+        // over that byte answers zero and every other sample is the
+        // mapped index's.
+        let second = (HEADER + TOP_RUN * HEAD) as u64;
+        let (idx, src) = over(second..second + 1);
+        let at_open = asked(&src);
+        let top = idx.top().to_vec();
+        let per_run = TOP_RUN / TOP_STRIDE;
+        assert_eq!(top.len(), want.len());
+        assert_eq!(top[per_run], 0, "the head that did not read");
+        assert_ne!(want[per_run], 0);
+        assert_eq!(&top[..per_run], &want[..per_run], "the run before it");
+        assert_eq!(
+            &top[per_run + 1..],
+            &want[per_run + 1..],
+            "every sample after it"
+        );
+        assert_eq!(
+            asked(&src) - at_open,
+            3 + per_run,
+            "the run refused is asked for again a head at a time"
+        );
         let _ = std::fs::remove_file(&p);
     }
 

@@ -53126,6 +53126,9 @@ impl Maint {
     /// at all, and its re-opened partition has a new id. Nothing where
     /// the block cache is off, since nothing reads them then.
     fn rank_before_publish(&self, segs: &[std::sync::Arc<Seg>]) -> Result<()> {
+        if self.shared.pager.is_some() {
+            self.tops_before_publish(segs);
+        }
         // Far from reads the pieces go without, and a reader that comes
         // takes them (`Options::land_ranks_far`).
         let near = self.opts.land_ranks_far || self.shared.reads_near.load(AtomicOrdering::Acquire);
@@ -53156,6 +53159,23 @@ impl Maint {
             bound_pieces_of(segs, ask, by_heads, &self.shared.asks.land_bounds)?;
         }
         Ok(())
+    }
+
+    /// The ordered indexes' top levels read before the publish that makes
+    /// `segs` the live set, in a store under a cipher, where an index's
+    /// level is read at its first seek and not at its open
+    /// (`OrdIndex::top_now`). A landing's segments were written a moment
+    /// ago and their indexes are in the store's cache still, so the read
+    /// is of memory; left to the first seek it fell where the cache had
+    /// given the heads back, on a reader, a wait for the device a
+    /// partition at the start of every pass that seeks. A segment whose
+    /// level is read already is one load.
+    #[cold]
+    #[inline(never)]
+    fn tops_before_publish(&self, segs: &[std::sync::Arc<Seg>]) {
+        for seg in segs {
+            seg.ord.top_now();
+        }
     }
 
     /// Phase D of a seal's landing, once its thread has returned with the
@@ -61296,6 +61316,104 @@ mod cipher_looks {
             assert!(db.r.abandon_forms());
             assert_eq!(db.r.fs().abandoned.get(), word, "after the forms went");
             assert!(!db.r.abandon_pending());
+        }
+    }
+
+    /// A landing reads the top levels of the ordered indexes it publishes
+    /// in a store under a cipher (`Maint::tops_before_publish`), where an
+    /// index's level is read at its first seek and not at its open: every
+    /// live segment's is in memory once the store has settled, after an
+    /// ordered load, whose runs' pieces are promoted, and after rewrites
+    /// that seal pieces and merge them, with nothing having sought yet.
+    /// Left to the first seek, the level was read on a reader after the
+    /// cache had given the heads back. With the segment work on its
+    /// thread and inline. A store reopened reads none at its open, which
+    /// is why the read is late there at all, and a seek reads the one it
+    /// needs.
+    #[test]
+    fn a_landing_reads_its_indexes_top_levels_under_a_cipher() {
+        for away in [true, false] {
+            let dir = std::env::temp_dir().join(format!(
+                "supdb-next-cipher-tops-{away}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let opts = || Options {
+                encryption: Encryption::Cipher(vault::tests::cipher(11).cache_bytes(1 << 20)),
+                seal_bytes: 256 << 10,
+                partition_bytes: Some(256 << 10),
+                l0_trigger: 2,
+                publish_in_background: away,
+                ..Options::default()
+            };
+            let n = 60_000u32;
+            let key = |i: u32| format!("k{i:08}").into_bytes();
+            let val = |i: u32, round: u8| {
+                let mut v = format!("value {i:08} of round {round} ").into_bytes();
+                v.resize(100, b'x');
+                v
+            };
+            // The live segments, and those whose level is not read.
+            fn tops(db: &Db) -> (usize, Vec<String>) {
+                let _op = db.op();
+                let segs = db.r.segs();
+                let unread = segs
+                    .iter()
+                    .filter(|s| !s.ord.top_is_read())
+                    .map(|s| s.name.clone())
+                    .collect();
+                (segs.len(), unread)
+            }
+            let mut db = Db::create(&dir, opts()).unwrap();
+            for i in 0..n {
+                db.append(&key(i), &val(i, 0));
+                if i % 500 == 499 {
+                    db.commit().unwrap();
+                }
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+            db.settle().unwrap();
+            let (live, unread) = tops(&db);
+            assert!(live > 4, "away {away}: several partitions: {live}");
+            assert!(
+                unread.is_empty(),
+                "away {away}: after an ordered load, unread: {unread:?}"
+            );
+            for round in 1..=3u8 {
+                for j in 0..n / 5 {
+                    let i = (j * 7_919 + u32::from(round) * 13) % n;
+                    db.put(&key(i), &val(i, round));
+                    if j % 500 == 499 {
+                        db.commit().unwrap();
+                    }
+                }
+                db.commit().unwrap();
+                db.flush().unwrap();
+                db.settle().unwrap();
+                let (_, unread) = tops(&db);
+                assert!(
+                    unread.is_empty(),
+                    "away {away}: after round {round} of rewrites, unread: {unread:?}"
+                );
+            }
+            let merges = db.seal_waits().merges;
+            assert!(merges > 0, "away {away}: merges landed: {merges}");
+            drop(db);
+            let db = Db::open(&dir, opts()).unwrap();
+            let (live, unread) = tops(&db);
+            assert_eq!(unread.len(), live, "away {away}: an open reads no level");
+            let mut got = 0usize;
+            db.scan(&key(n / 2), 3, |_, _| got += 1).unwrap();
+            assert_eq!(got, 3);
+            let (_, unread) = tops(&db);
+            assert_eq!(
+                unread.len(),
+                live - 1,
+                "away {away}: a seek reads the level of the index it seeks"
+            );
+            drop(db);
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 

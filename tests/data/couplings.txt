@@ -129,6 +129,7 @@ src/db.rs	Maint::join_seal	unlent/unlend	code	1	S1	a wait under no pin: pin::idl
 src/db.rs	Maint::join_tier	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
 src/db.rs	Maint::land_front	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
 src/db.rs	Maint::publish	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
+src/db.rs	Maint::rank_before_publish	pager	code	1	stays	a landing under a cipher reads the top levels of the indexes it publishes (tops_before_publish): one test a landing, of whether the store has a cache
 src/db.rs	Maint::retire_covered	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
 src/db.rs	Maint::retire_seg	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
 src/db.rs	Maint::sync_owed_slot	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
@@ -206,6 +207,9 @@ src/db.rs	a_close_that_joins_a_merge_holds_nothing_of_the_cache	cipher	test	4	st
 src/db.rs	a_close_that_joins_a_merge_holds_nothing_of_the_cache	crypt	test	2	stays	cipher_looks: the close's joins under a cipher, the cache read through its own handle past the store
 src/db.rs	a_close_that_joins_a_merge_holds_nothing_of_the_cache	pager	test	9	stays	cipher_looks: the close's joins under a cipher, the cache read through its own handle past the store
 src/db.rs	a_close_that_joins_a_merge_holds_nothing_of_the_cache	vault::tests	test	1	stays	cipher_looks: the close's joins under a cipher, the cache read through its own handle past the store
+src/db.rs	a_landing_reads_its_indexes_top_levels_under_a_cipher	cipher	test	4	stays	cipher_looks: every live index's top level read by its landing, after an ordered load and after rewrites, and none by an open
+src/db.rs	a_landing_reads_its_indexes_top_levels_under_a_cipher	crypt	test	2	stays	cipher_looks: every live index's top level read by its landing, after an ordered load and after rewrites, and none by an open
+src/db.rs	a_landing_reads_its_indexes_top_levels_under_a_cipher	vault::tests	test	1	stays	cipher_looks: every live index's top level read by its landing, after an ordered load and after rewrites, and none by an open
 src/db.rs	a_look_rests_in_a_handles_outermost_read_and_in_no_read_inside_it	attn/rest word	test	1	stays	cipher_looks: where a look inside a read rests, by the slot's page at depth one and at depth two
 src/db.rs	a_look_rests_in_a_handles_outermost_read_and_in_no_read_inside_it	cipher	test	3	stays	cipher_looks: where a look inside a read rests, by the slot's page at depth one and at depth two
 src/db.rs	a_look_rests_in_a_handles_outermost_read_and_in_no_read_inside_it	crypt	test	2	stays	cipher_looks: where a look inside a read rests, by the slot's page at depth one and at depth two
@@ -380,5 +384,6 @@ src/ordindex.rs	OrdIndex::head_absent	piecewise/ASK_PIECES	code	1	stays	the lazy
 src/ordindex.rs	OrdIndex::mapped_heads	piecewise/ASK_PIECES	code	1	stays	no heads lent from a mapping read by the piece (R2's dispatch)
 src/ordindex.rs	OrdIndex::over	piecewise/ASK_PIECES	code	1	stays	the CRC skip and lazy top for a piecewise map; right for every source vault::map gives (G1-5 leaves it)
 src/ordindex.rs	InMemory::<item>	paged	test	1	stays	a test of the reader over the seam's Paging
+src/ordindex.rs	a_top_level_read_late_is_asked_for_a_run_at_a_time	paged	test	1	stays	a test of the reader over the seam's Paging: a source that counts its asks
 src/ordindex.rs	in_memory	paged	test	1	stays	a test of the reader over the seam's Paging
 src/ordindex.rs	an_index_read_by_the_piece_seeks_as_the_mapped_one	piecewise/ASK_PIECES	test	1	stays	a test of the reader over the seam's Paging
