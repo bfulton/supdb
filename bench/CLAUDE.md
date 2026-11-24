@@ -912,7 +912,25 @@ run time and the other when it is compiled, the build gives the second what
 the first finds; a setting that is "the same for every engine" is read per
 target, since the engine's own compiler differs by target; and a check that
 a binary fits its host runs before the first instruction that does not,
-which in a program that links C++ is before `main`.
+which in a program that links C++ is before `main`. A fourth difference was
+in a flag nobody in the build had chosen for code generation: `cc` compiles
+every library with `-fPIC`, under which GCC takes every non-inline global
+function for one another object may replace when the program loads, and
+inlines none of them, not even into a caller in its own file. Clang inlines
+them, on Linux and on macOS, and rustc's LTO makes every function of the
+binary internal, so GCC alone was held off: RocksDB's `DBImpl::GetImpl`,
+`GetAndRefSuperVersion` and `WriteBatch::Iterate` were calls of their own.
+Counted the same way at `f3bc29c`, with `-fno-semantic-interposition` in
+the two variables, RocksDB's `get` took 1.3% fewer instructions, its
+`range` 0.8% fewer and its `write_batch` 0.7% more, and LMDB's and FASTER's
+moved by under a twentieth of a percent, LMDB's internals being `static`
+already. Six alternated rounds of the quick ladder resolved none of it: the
+engine's cells, its code the same in both binaries, moved 0.94x to 1.20x
+between them. The GCC targets are given the flag now. The corollary: a
+flag a build tool chose for its own reasons -- debug info for the profiler,
+position independence for a library -- is read for what each compiler
+infers from it, by compiling one function both ways under each, before the
+build is called one policy.
 
 ## One repository
 

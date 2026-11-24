@@ -408,7 +408,11 @@ C and C++ alike. x86-64 Linux is held at x86-64-v3 with PCLMUL and ARM Linux
 at ARMv8 with CRC and the crypto extensions; macOS takes Apple's default CPU.
 The C and C++ have frame pointers as rustc has them for the target, and none
 of the stack protector, CET or fortified string calls a host compiler may add
-to C and C++ alone, which rustc does not add to the engine. Rows before the
+to C and C++ alone, which rustc does not add to the engine. GCC is told that
+no global function of a library is replaced when the program loads, which
+the position-independent code `cc` compiles otherwise makes it assume and
+which keeps it from inlining them; clang and rustc assume nothing of the
+kind. Rows before the
 row's `build` field had the comparators' C and C++ with frame pointers and
 those protections, and RocksDB checksumming its log with a table where the
 engine used the CRC instruction; the first row with the field is a
