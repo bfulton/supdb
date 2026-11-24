@@ -75,5 +75,40 @@ fn a_pass_bound_sees_nothing_the_run_holds() {
             "a pass began with {b} bytes charged to its bound, with {ballast} held by the run: {line}"
         );
     }
+    // The room the groups above the passes' left them is recorded beside
+    // it wherever one above is limited (`bound::room_above_at`, read here
+    // from this process's own group, under which the pairing made its
+    // own), and a pass that began with less of it than its bound is
+    // reported, as the gate's own run of this test is where the builds
+    // before it have filled the group above.
+    let own = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|t| supdb_bench::bound::parse_cgroup_path(&t))
+        .map(|g| std::path::Path::new("/sys/fs/cgroup/memory").join(g.trim_start_matches('/')));
+    let limited = own
+        .as_ref()
+        .is_some_and(|g| supdb_bench::bound::room_above_at(&g.join("pass"), false).is_some());
+    let room = stdout
+        .lines()
+        .find(|l| l.starts_with("bound-start room_above_bytes"));
+    assert_eq!(
+        room.is_some(),
+        limited,
+        "the room above is recorded where a group above is limited ({limited}):\n{stdout}"
+    );
+    if let Some(line) = room {
+        let f: Vec<f64> = line
+            .split_whitespace()
+            .skip(2)
+            .take(2)
+            .map(|x| x.parse().unwrap())
+            .collect();
+        let short = f.iter().any(|b| *b < (256u64 << 20) as f64);
+        assert_eq!(
+            stderr.contains("of room in the groups above its own"),
+            short,
+            "a pass short of room above its bound is reported, and no other: {line}\n{stderr}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&tmp);
 }
