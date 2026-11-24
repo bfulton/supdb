@@ -39,7 +39,7 @@ of the change that produced the text.
 | `src/bytes.rs`, `src/blob.rs` | the read path over any byte source; compiles for wasm |
 | `src/wasmapi.rs` | the C ABI the browser calls; hand-written because the module's size is budgeted |
 | `web/` | the browser reader, its byte sources, the Worker it runs in, and the size control -- `web/README.md` |
-| `tests/` | the engine's contract, the read paths held to each other, the format's damage cases, a checkpoint held to the store it was made of, a crashed store's runs held to its log; `tests/common` holds what more than one file needs |
+| `tests/` | the engine's contract, the read paths held to each other, the format's damage cases, a checkpoint held to the store it was made of, a crashed store's runs held to its log, the store's lock beside a forked child; `tests/common` holds what more than one file needs |
 | `bench/` | the benchmark suite: its own cargo workspace, the arms, the runner, the gate and the figures -- `bench/DESIGN.md` |
 | `experiments/ffi/` | what a C ABI and a Python binding cost a point read, borrowed against copied, beside LMDB's and RocksDB's C APIs; its own manifest and dated results, and not built by the gate -- its `README.md` |
 
@@ -58,8 +58,9 @@ caller. Nothing is exempt from the format gate, and everything holds to
 
 `sh scripts/deps.sh` readies a host for every group, installing only
 what is missing and ending in an `all deps ready` line to gate on; run it
-first in a fresh container, which has no wasm target and libclang only as
-versioned files. It names libclang through `bench/scripts/libclang.sh`,
+first in a fresh container, which has the stable it was made with and not
+the toolchain `rust-toolchain.toml` names, and libclang only as versioned
+files. It names libclang through `bench/scripts/libclang.sh`,
 the one definition CI uses, and keeps no variable. clang-sys's build
 script declares nothing to rerun on, so the directory it found libclang
 in at the first build stays in its cached output for good: a
@@ -87,20 +88,41 @@ timing run needs the machine to itself, and CI gives it a job of its own. The
 check run in the `bench` group (`sh bench/scripts/check.sh lint` by
 itself, a minute), and a commit that touched `bench/` alone went out
 behind a green `lint` with a doubled `#[allow]` that clippy refuses.
-And a green `lint` here is the runner's only under the runner's
-toolchain: CI installs the stable of the day and a container keeps the
-one it was made with, which `scripts/deps.sh` leaves as it finds it. Two
-`chunks_exact` calls over a constant passed here under 1.97 and failed on
-every hosted leg under 1.100, whose clippy asks for `as_chunks`, and
-nothing had said so, CI running on a pull request and none having run it
-over the branch since they were written. `rustup update stable` before
-the gate, or the group under the runner's version
-(`RUSTUP_TOOLCHAIN=1.100.0 sh scripts/check.sh lint`). The macOS leg's
-lint is another the gate here does not run: three helpers in
-`tests/zpages.rs` that only Linux's tests call were dead code there. It
-type-checks without a cross toolchain, once
-`rustup target add aarch64-apple-darwin`: `cargo clippy --release
---all-targets --target aarch64-apple-darwin -- -D warnings`.
+And a green `lint` here is the runner's because the toolchain is one:
+`rust-toolchain.toml` names the version, with clippy, rustfmt and the
+wasm and macOS targets, `scripts/toolchain.sh` installs what the file
+names and holds the active rustc to it, and `scripts/deps.sh` and every
+workflow call that script, so no workflow names a channel. Before the pin
+CI installed the stable of the day and a container kept the one it was
+made with: two `chunks_exact` calls over a constant passed here under
+1.97 and failed on every hosted leg under 1.100, whose clippy asks for
+`as_chunks`, and nothing had said so, CI running on a pull request and
+none having run it over the branch since they were written. Moving the
+version is a change to that one file, with whatever the new clippy asks
+for fixed in the same commit and the whole gate run under it; the
+manifests' `rust-version` is the oldest toolchain the crates build with
+and does not move with it. A `RUSTUP_TOOLCHAIN` in the environment
+outranks the file, which the script refuses and a bare `cargo` does not.
+The lint group type-checks the engine for the macOS target too (`cargo
+clippy --release --all-targets --target aarch64-apple-darwin -- -D
+warnings`, which needs the target's rust-std and no cross toolchain):
+three helpers in `tests/zpages.rs` that only Linux's tests call were dead
+code there, and no lint on Linux could say so. The suite has no such
+leg: its comparators compile C in their build scripts, the first of them
+to run (`lz4-sys`'s) hands the host's `cc` `-arch arm64`, and a Linux
+`cc` refuses it, so the suite's would take a cross compiler. What is left
+for the hosted runners alone to show is timing on their hardware and the
+tests run, not only type-checked, on ARM and macOS.
+
+A hosted job's log cannot be read while the job runs, so one that is
+overdue is read by its groups once it ends before it is called anything:
+the macOS leg ran fifty-five minutes where it had run twenty-five, was
+taken for a hang in the fork tests that were new to it, and had spent the
+excess in RocksDB's two builds, the same sources on the same image at
+three times their time, with the tests a quarter slower beside them. A
+runner is that much slower some days. Every job of `ci` has a
+`timeout-minutes` a few times its longest run, since a job without one
+runs to GitHub's six hours, as `cross-arm` did once inside its `apt-get`.
 
 The tests leave their stores under the temp directory, one per test and
 process (`supdb-next-<name>-<pid>`), so a day of test runs on one box is
@@ -193,8 +215,18 @@ wrapped, passed every check green, and panicked in the first debug build
 that reached it; the tests now run under `profile.checked`, the release
 profile with both on, and the wasm module and the suite's binaries keep the
 release profile because the checks cost code size there and time in a
-measurement. A second definition of "the checks" is how the next one of
-those starts.
+measurement. The workflows' cache step named the suite's target directory
+as `bench -> bench/target`, which `rust-cache` reads as bench/bench/target,
+a path inside the workspace: no such directory, so for as long as the
+suite has been in CI the step restored nothing, saved a cache with none of
+the suite's build in it, and reported both done, while every job built
+RocksDB from its sources twice, half of a test leg's time. It was found
+in the step's own log, which prints the directories it caches, on the
+day somebody read one. `bench/scripts/workflows.sh` holds a cache's
+target to a workspace's own now, and the libclang directory is in the
+cache's key, since a cached clang-sys output naming a directory since
+gone is the failure `scripts/deps.sh` cleans and a workflow does not. A
+second definition of "the checks" is how the next one of those starts.
 
 A change to an engine default lands only once `sh scripts/check.sh`
 has passed with the new default in place.
@@ -1097,8 +1129,10 @@ landing; and the count of seals
 count of zero is one whose landings the state shows. A store is held by one open at a time, under an exclusive `flock` of
 its `LOCK` taken before the open reads its directory -- an open sweeps the
 segments its manifest does not name, which beside a live store are the
-seals and merges in flight -- and given up last at the close; a test that
-emulates a crash calls `Db::crash`, which gives the lock up as a dead
+seals and merges in flight -- and given up last at the close, by an
+unlock and not by the descriptor's close, since a child the process forked
+holds a copy of the descriptor and the lock with it (`StoreLock`); a test
+that emulates a crash calls `Db::crash`, which gives the lock up as a dead
 process's is given up, since a `mem::forget` keeps it and the reopen is
 refused as a second open. A crash between any
 two of those leaves either a WAL that replays the whole memtable, with a
@@ -2079,14 +2113,40 @@ merge, and sat out its ten seconds: one run in 240 beside seven other
 processes, the first run on a hosted runner, and every run with the wait
 made 300 ms late. The wait reads the merges landed since the seal beside
 the one in flight (`wait_for_merge`), which a merge that came and went
-satisfies as one caught does. The
+satisfies as one caught does. And as a clock: the hot-raw policy gives
+an ask for a partition's pages two seconds of the store's clock and
+drops it where under half of them have come when the wait is out, and
+its tests move an injected clock a fifth of a second a look, so ten
+looks ran through the whole wait in the tens of milliseconds they take
+while the kernel read the pages in its own time. On a hosted ARM runner
+the read lost once, on a re-run of a commit that had passed there: the
+ask was dropped, eighteen looks and no release, and a test of the
+release failed with the engine right. Each look waits first for the
+kernel's count of what the policy asked for (`Db::zpage_hot_asks_in`,
+over the asks the last look left in flight, which the look says on
+their partitions, `Maint::z_hot_asks_say`), and the test holds the race
+wide: the asked pages put out of the cache and read back a third of a
+second on, which looks that do not wait failed ten runs of ten, no
+release made, and looks that wait none of ten. The word of an ask was
+first stored at each ask and cleared at each end of one, and a mutant
+without one of the clears passed: a look ends an ask in more places than
+were listed, a partition merged or held by a job among them, and a word
+left standing would have every later look wait on pages nobody had asked
+for, the raw records of a partition whose form is installed over them
+again among them, which the install drops. It is written from the
+policy's own lists after every look now, one site. The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; a state the test needs only to have
 happened is waited for by the count it leaves behind, never by catching
-it; and a test that passes is read for
+it; a test that passes is read for
 the path that passed it, since a fallback that does the same work
-passes it too.
+passes it too; an injected clock moves the engine's side of a wait
+alone, so whatever the wait is for that the kernel does in its own time
+is waited for before the clock is moved; and a copy of a state kept for
+a reader is written from the state at one place, since a copy kept in
+step at every site that changes the state is wrong at the site nobody
+listed.
 
 **A test whose answer was a function of the clock, or of a thread's
 turn.** The superblock records the second a segment finished in, in each
@@ -2884,10 +2944,24 @@ opened again inside that window was refused as open elsewhere, the
 child's copy holding the lock the close had given up. Once on a hosted
 runner; with the child held 30 ms before its exec, two runs of the binary
 in eight, the same test at the same line; none of thirty without the
-oracle. The tests there hold a lock for read while they open stores and
-the oracle spawns under it for write (`no_fork`). The engine's own answer
-to a caller that forks is the same refusal, for as long as a child takes
-to reach its exec.
+oracle. The tests there were kept apart from the oracle's spawns by a lock of
+their own for a while, and the engine answered a caller that forks with
+the same refusal for as long as the child took to reach its exec, or for
+the child's life where it never does: a `fork` with no exec, which is
+what Python's `multiprocessing` makes of a process holding a store
+through a binding. The close unlocks the `LOCK` now, which gives it up
+for every copy of the descriptor at once, where closing the descriptor
+gave it up only with the last copy (`StoreLock`'s `Drop`). With the
+tests' lock taken out and the child held 30 ms before its exec, the
+binary failed nine runs of thirty before the unlock, at the same test and
+line, and none of sixty with it, nor any of twelve with the child held
+300 ms; the tests' lock stays out, since it would hide the
+close's going back, and `tests/lock.rs` builds the window on purpose, the
+child stopped in `pre_exec` while the store is closed and opened. The
+unlock is the taking process's alone, by its pid: it reaches every copy,
+so a forked child that dropped its copy of a `Db` would give up its
+parent's lock with the parent's store still open, which the unit test
+beside the type forks to hold.
 
 **A call site no real input reaches red.** The suite's refusals after the
 read pass and after the shuffled load were green-side only, because a real

@@ -34,9 +34,15 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.runner }}
+    # As `quick` in ci.yml, whose work this is: a job with no limit runs to
+    # GitHub's six hours.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain rust-toolchain.toml names, the one the local gate runs
+      # under; no workflow names a version or a channel of its own.
+      - name: The pinned toolchain
+        run: sh scripts/toolchain.sh
       - name: libclang, for bindgen
         run: sh bench/scripts/libclang.sh
       # FASTER is a comparator too, and not a crate: the script fetches its
@@ -44,9 +50,12 @@ jobs:
       # It does nothing off Linux x86-64, where there is no `faster` arm.
       - name: FASTER, for the `faster` arm
         run: sh bench/scripts/faster.sh
+      # `workspace -> target`, the target a path inside its workspace, and
+      # LIBCLANG_PATH in the key: see the `test` job of ci.yml.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: bench -> bench/target
+          workspaces: bench -> target
+          env-vars: LIBCLANG
       # The run and the gate apart, and the gate's exit not the step's: a
       # verdict against the series is what the pull request carries, not a
       # reason to lose the row.
@@ -70,9 +79,13 @@ jobs:
     needs: row
     if: always()
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain rust-toolchain.toml names, the one the local gate runs
+      # under; no workflow names a version or a channel of its own.
+      - name: The pinned toolchain
+        run: sh scripts/toolchain.sh
       - name: libclang, for bindgen
         run: sh bench/scripts/libclang.sh
       # FASTER is a comparator too, and not a crate: the script fetches its
@@ -80,9 +93,12 @@ jobs:
       # It does nothing off Linux x86-64, where there is no `faster` arm.
       - name: FASTER, for the `faster` arm
         run: sh bench/scripts/faster.sh
+      # `workspace -> target`, the target a path inside its workspace, and
+      # LIBCLANG_PATH in the key: see the `test` job of ci.yml.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: bench -> bench/target
+          workspaces: bench -> target
+          env-vars: LIBCLANG
       - uses: actions/download-artifact@v4
         with:
           pattern: row-*

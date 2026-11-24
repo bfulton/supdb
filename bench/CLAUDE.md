@@ -672,6 +672,12 @@ its image by name that day, and the five workflows that run by hand or
 after a merge kept the label for another day, each to fail the same way
 the first time it was wanted. A workflow nobody runs is fixed with the
 ones that ran, by a rule the lint holds, and not when it is next needed.
+And it holds a cache step's `workspace -> target` to a target that is a
+workspace's own directory: every workflow said `bench -> bench/target`,
+the action takes the target as a path inside the workspace, and the step
+cached a directory that does not exist while each job built RocksDB from
+its sources twice (the engine's `CLAUDE.md`, running the checks). A
+setting whose effect nothing reads is held to the thing it names existing.
 
 **A generator more regular than the thing it stood for.** The first
 ids were one to a stratum of the whole 64-bit space, key `n` a random

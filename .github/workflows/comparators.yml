@@ -27,7 +27,10 @@ jobs:
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain rust-toolchain.toml names, the one the local gate runs
+      # under; no workflow names a version or a channel of its own.
+      - name: The pinned toolchain
+        run: sh scripts/toolchain.sh
       - name: libclang, for bindgen
         run: sh bench/scripts/libclang.sh
       # FASTER is a comparator too, and not a crate: the script fetches its
@@ -40,9 +43,12 @@ jobs:
           set -eu
           sudo apt-get update
           sudo apt-get install -y cmake libgflags-dev
+      # `workspace -> target`, the target a path inside its workspace, and
+      # LIBCLANG_PATH in the key: see the `test` job of ci.yml.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: bench -> bench/target
+          workspaces: bench -> target
+          env-vars: LIBCLANG
       - name: The tools, the suite's two arms, and the table
         run: sh bench/scripts/comparators.sh comparators-ci
       - uses: actions/upload-artifact@v4

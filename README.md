@@ -187,7 +187,7 @@ Worker.
 ## Building
 
 ```sh
-sh scripts/deps.sh             # the toolchain pieces the checks need, where missing
+sh scripts/deps.sh             # the pinned toolchain and what else the checks need, where missing
 cargo build --release
 cargo test --profile checked  # the release profile with overflow checks and debug assertions on
 sh scripts/check.sh            # build, test, lint, wasm, bench -- what CI runs
@@ -217,7 +217,9 @@ refuses the file rather than serving wrong bytes.
 
 A store is open in one place at a time. A second open, from another process
 or from the same one, fails at once while the first holds the store's
-`LOCK`, and the lock goes with the process that holds it.
+`LOCK`, and the lock goes with the process that holds it. A close gives it
+up at once, whether or not a child the process forked still holds a copy of
+its descriptors.
 
 ## License
 
