@@ -668,7 +668,14 @@ What an engine picker would hit, roughly in order.
   - The other bounds of the bounded roster, three and ten million keys
     under 1 GiB and 1.25 GiB, ten sittings each of the lag sweep and of
     the mixes, over numbered keys and over ids, with
-    `scripts/stallwatch.py` beside them. Done when none is killed.
+    `scripts/stallwatch.py` beside them. Done when none is killed. Begun
+    at `5112f9a` over numbered keys, both cipher arms, every pass, two
+    pairs a bound (`bench ab --arms supdb-cipherauto,supdb-cipher --size
+    3000000 --bound 1073741824 --reps 2 --ops-div 10`, and `--size
+    10000000 --bound 1342177280`): none killed and the watcher with
+    nothing to dump; at ten million keys each pass's most the kernel
+    could not take back was 1,228-1,251 MiB of the 1,280, so that bound
+    has some forty mebibytes in hand.
   - What is written unannounced: a seal's output, whose size is its
     table's; an ordered run's file, which grows a commit at a time; a
     form file built at a merge's finish; and a merge's own arrays. Each
@@ -909,6 +916,15 @@ until the run is its own log). What it loses:
   waiting on, the log's sync beside the builds' envelopes going to the
   device or a hand-off to another thread. The plain store builds at a
   merge's finish in a shuffled load as well.
+- [ ] **The lag sweep with the controller on under a cipher.** At ten
+  million keys under 1.25 GiB the store with the controller on reads,
+  scans and runs every mix at 2.5x to 40x the store with it off, and its
+  lag sweep's scan passes over the clean store and after the one- and
+  ten-percent bursts run at 0.4-0.7x of it, the full rewrite's pass ahead
+  (the same command as the other bounds', above, two pairs). Not taken
+  apart yet: what the controller does through the sweep's bursts under a
+  cipher -- builds at the merges' finishes, conversions, the cache's
+  room beside the form files -- read by the trace before any lever.
 - [ ] **The builds ahead's last cold partition under a cipher.** At five
   million keys under 640 MiB with the builds ahead started at a quarter
   of the store's cache, one or two partitions are still found cold in
