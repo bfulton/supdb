@@ -648,11 +648,33 @@ What an engine picker would hit, roughly in order.
   passes sat at 629-630 for six to twelve seconds; and the row's other
   passes with both mix families in ten of ten (`... --passes
   load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
-  --reps 5`). What is left:
+  --reps 5`). Over ids at the same store and bound (`--keys ids`) it was
+  killed twice more, and neither was the writer either: a read's settle
+  ahead of its walk, one pin as long as the backlog the write mixes had
+  left, which killed the store as shipped in a scan mix in four reps of
+  five; and, with the controller on, a merge's output written into a
+  cache steered to its margin before a reading of the room had seen it,
+  one rep in three. The settle's look rests in a handle's outermost read
+  and a merge says what each output is to hold where it opens it
+  (`CLAUDE.md`, both, with their tests in `cipher_looks` and the
+  vault's). With them, at `39ecdd7` (`bench ab --arms
+  supdb-cipherauto,supdb-cipher --size 5000000 --bound 671088640 --keys
+  ids --passes
+  load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+  --reps 5 --ops-div 10`): neither arm killed in five reps of five, the
+  most the kernel could not take back 581-595 MiB in every pass where
+  the run before the announcement had 621-636 in four of five. What is
+  left:
   - The other bounds of the bounded roster, three and ten million keys
     under 1 GiB and 1.25 GiB, ten sittings each of the lag sweep and of
-    the mixes, with `scripts/stallwatch.py` beside them. Done when none
-    is killed.
+    the mixes, over numbered keys and over ids, with
+    `scripts/stallwatch.py` beside them. Done when none is killed.
+  - What is written unannounced: a seal's output, whose size is its
+    table's; an ordered run's file, which grows a commit at a time; a
+    form file built at a merge's finish; and a merge's own arrays. Each
+    reaches the room a reading late, as a merge's output did. A lever
+    for one of them waits for a peak that names it, read on the group's
+    memory by kind through the pass, kill or none.
   - The evictor's waits, of which the long ones were a merge's. A merge
     wrote each output's envelope under its hold of the cache, and writes
     it unheld now (`CLAUDE.md`, the trace that named the close;
@@ -664,12 +686,13 @@ What an engine picker would hit, roughly in order.
     between two rests (a merge's `MERGE_REST` steps through the device,
     the ordered index's top level built by the piece at a first seek),
     and the upkeep thread freeing its forms under its pin.
-  - What that did not move. The most the kernel could not take back is
-    where it was, 581-612 MiB a sitting, each peak a tenth of a second
-    in a load: an ordered run's file in flight beside the cache with the
-    process at 50 MiB, or a shuffled load's tables at 400 beside 200 of
-    plaintext. The budget follows the room at twenty milliseconds, and
-    what the writer puts in flight between two readings is the excursion.
+  - What that did not move. Over numbered keys the most the kernel
+    could not take back is where it was, 581-612 MiB a sitting, each
+    peak a tenth of a second in a load: an ordered run's file in flight
+    beside the cache with the process at 50 MiB, or a shuffled load's
+    tables at 400 beside 200 of plaintext. The budget follows the room
+    at twenty milliseconds, and what the writer puts in flight between
+    two readings and does not announce is the excursion.
   - The margin. At its worst instants the group had 25-58 MiB between
     what the kernel cannot take back and its limit, and what puts it
     there is the process's own memory beside the cache: 330-405 MiB at

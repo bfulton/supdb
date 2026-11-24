@@ -2785,6 +2785,42 @@ that fill it and over each shape of key, the shape deciding what a
 resolve reads; and a mode's roster run under one kind of key has not run
 the mode.
 
+And what the budget cannot see until it is there is a file being
+written. With the controller on over ids (`supdb-cipherauto`, the same
+command) the store was killed in the scrambled F mix, one rep in five
+before the settle's rest and one in three after it: the group's memory
+by kind, every ten milliseconds up to the kill, had 232 MiB of the
+process's own and 388 shared, and the cache's trace beside it a merge's
+output of fifty-nine megabytes written in a fifth of a second, with the
+output's form file and the merge's arrays, on a cache steered to within
+its margin of the limit. A memory file is memory the kernel cannot take
+back and is in no count of the cache's, and the platform's reading sees
+it a page at a time as it is written, a reading late. A merge says what
+each output is to hold where it opens it (`vault::expect`: its share of
+the inputs' bytes by its ranks), and the bytes still to come are out of
+the room from then (`vault::Coming`): what was said less what the file
+holds, nothing once the file has its envelope or has gone, and between
+two readings the cache gives way to it at once, as it does to the
+buffers the process has mapped (`Room::claimed`). Nothing is asked of a
+plain store's merge but the door's one load. Eight mutants, and two of
+them hung the merge's test where they should have failed it: the
+assertion fired while the merge stood at the vault's test gate, and the
+store's drop joined a merge nothing would let go. The gate is a guard
+that opens at its drop now, the rule this file already had for a test
+that parks a thread. With it, the same command at `39ecdd7`: neither arm
+killed in five reps of five, and the most the kernel could not take back
+581-595 MiB of the 640 in every pass of the ten, where the run before it
+had 621-636 in four passes of five, the killed one among them (`rss`,
+`shmem` and the kernel's own, sampled from the group every ten
+milliseconds). What is still written unannounced is a seal's output, an
+ordered run's file, a form file built at a merge's finish and the
+merge's own arrays (`ROADMAP.md`). The rules:
+a budget steered by a reading is late by what is written between two
+readings, so a writer that knows the size of what it is about to write
+says so before the first byte; and a kill one rep in three is a peak
+every rep comes near, so the fix is read on each pass's peak, by the
+group's own count, and not on the kills alone.
+
 The rules: a second way to hold the same bytes is priced on the first
 operation of every pass as well as on its rate, since a mapping's first
 touch is where two kinds of memory differ; a write slower than its cipher
