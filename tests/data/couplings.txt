@@ -204,6 +204,9 @@ src/db.rs	Wal::resume	sealed log/manifest	code	3	S6	log_resume
 src/db.rs	Wal::resume	vault::LogCipher	code	1	S6	log_resume
 src/db.rs	Wal::resume	vault::Vault	code	1	S6	log_resume
 src/db.rs	Wal::write_sealed	sealed log/manifest	code	1	S6	enc.seal_into, split out of Wal::write
+src/db.rs	a_census_window_is_given_up_when_the_gate_returns_raw_under_a_cipher	cipher	test	5	stays	cipher_looks: a census window opened under the census gate and given up when the gate returns raw, in the clear and under a cipher, where every read starts out of line for the cipher's looks
+src/db.rs	a_census_window_is_given_up_when_the_gate_returns_raw_under_a_cipher	crypt	test	3	stays	cipher_looks: a census window opened under the census gate and given up when the gate returns raw, in the clear and under a cipher, where every read starts out of line for the cipher's looks
+src/db.rs	a_census_window_is_given_up_when_the_gate_returns_raw_under_a_cipher	vault::tests	test	1	stays	cipher_looks: a census window opened under the census gate and given up when the gate returns raw, in the clear and under a cipher, where every read starts out of line for the cipher's looks
 src/db.rs	a_close_that_joins_a_merge_holds_nothing_of_the_cache	cipher	test	4	stays	cipher_looks: the close's joins under a cipher, the cache read through its own handle past the store
 src/db.rs	a_close_that_joins_a_merge_holds_nothing_of_the_cache	crypt	test	2	stays	cipher_looks: the close's joins under a cipher, the cache read through its own handle past the store
 src/db.rs	a_close_that_joins_a_merge_holds_nothing_of_the_cache	pager	test	9	stays	cipher_looks: the close's joins under a cipher, the cache read through its own handle past the store

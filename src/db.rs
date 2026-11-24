@@ -26480,23 +26480,38 @@ impl Reader {
         // but for a snapshot's handle or a cache far past its budget,
         // which two loads tell.
         let mut outer = false;
-        if self.attn & ATTN_PAGED != 0 && self.depth.get() == 1 {
-            outer = true;
-            if let Some(p) = self.shared.pager.as_ref() {
-                let snap = self.page_snap.get();
-                if snap || p.swamped() {
-                    self.paged_begin(p, snap);
-                }
-                #[cfg(debug_assertions)]
-                if !snap {
-                    if let Some(slot) = self.slot {
-                        debug_assert!(
-                            !self.shared.readers.page_is_idle(slot),
-                            "a read begins with its slot saying it holds nothing"
-                        );
+        if self.attn & ATTN_PAGED != 0 {
+            if self.depth.get() == 1 {
+                outer = true;
+                if let Some(p) = self.shared.pager.as_ref() {
+                    let snap = self.page_snap.get();
+                    if snap || p.swamped() {
+                        self.paged_begin(p, snap);
+                    }
+                    #[cfg(debug_assertions)]
+                    if !snap {
+                        if let Some(slot) = self.slot {
+                            debug_assert!(
+                                !self.shared.readers.page_is_idle(slot),
+                                "a read begins with its slot saying it holds nothing"
+                            );
+                        }
                     }
                 }
             }
+            // Every read of a store under a cipher comes here, for the
+            // cipher's looks, so the census is asked here what the inline
+            // test asks it for a store in the clear: a window open on the
+            // handle, or the gate away from raw. Called for every read, it
+            // was twenty-three instructions a point read in memory, where
+            // the controller is in FITS and the call returns at once.
+            if self.attn & ATTN_CENSUS != 0
+                && (self.attn_open.get() & ATTN_OPEN != 0
+                    || self.shared.zgate.load() != zselect::GATE_RAW)
+            {
+                self.zcensus_begin_slow(scan);
+            }
+            return outer;
         }
         if self.attn & ATTN_CENSUS != 0 {
             self.zcensus_begin_slow(scan);
@@ -61370,6 +61385,68 @@ mod cipher_looks {
             assert!(db.r.abandon_forms());
             assert_eq!(db.r.fs().abandoned.get(), word, "after the forms went");
             assert!(!db.r.abandon_pending());
+        }
+    }
+
+    /// A handle's census window opens under the census gate and is given up
+    /// at the first read after the gate returns to raw, in a store under a
+    /// cipher as in one in the clear. Under a cipher every read starts out
+    /// of line for the cipher's looks, and the census is asked there what
+    /// the inline test asks it in the clear (`Reader::begin_slow`): a read
+    /// under the raw gate with no window open asks it nothing, one with a
+    /// window open gives the window up.
+    #[test]
+    fn a_census_window_is_given_up_when_the_gate_returns_raw_under_a_cipher() {
+        for paged in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "supdb-next-cipher-census-{paged}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let opts = Options {
+                encryption: if paged {
+                    Encryption::Cipher(vault::tests::cipher(12))
+                } else {
+                    Encryption::None
+                },
+                zpages: ZPages::Auto,
+                zpages_under_cipher: true,
+                ..Options::default()
+            };
+            let mut db = Db::create(&dir, opts).unwrap();
+            for i in 0..2_000u32 {
+                db.put(format!("k{i:08}").as_bytes(), b"v");
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+            db.settle().unwrap();
+            let h = db.reader().unwrap();
+            assert_ne!(
+                h.attn & ATTN_CENSUS,
+                0,
+                "paged {paged}: the handle is counted"
+            );
+            let read = |k: u32| {
+                let mut n = 0;
+                h.read_all(format!("k{k:08}").as_bytes(), |_| n += 1)
+                    .unwrap();
+                assert_eq!(n, 1);
+            };
+            let open = |h: &Reader| h.attn_open.get() & ATTN_OPEN != 0;
+            read(1);
+            assert!(!open(&h), "paged {paged}: no window under the raw gate");
+            db.shared.zgate.store(zselect::GATE_CENSUS);
+            read(2);
+            assert!(open(&h), "paged {paged}: a window under the census gate");
+            db.shared.zgate.store(zselect::GATE_RAW);
+            read(3);
+            assert!(
+                !open(&h),
+                "paged {paged}: the window given up under the raw gate"
+            );
+            drop(h);
+            drop(db);
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
