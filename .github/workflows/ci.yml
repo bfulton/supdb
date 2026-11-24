@@ -9,7 +9,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, claude/funny-faraday-1ipfti]
     tags: ['*']
   pull_request:
   workflow_dispatch:

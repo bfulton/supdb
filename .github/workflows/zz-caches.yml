@@ -1,0 +1,52 @@
+name: zz-caches
+
+# Throwaway, on this branch only: every cache listed, pr-caches.yml's step,
+# word for word, for this branch's own ref, and every cache listed again.
+
+on:
+  push:
+    branches: [claude/funny-faraday-1ipfti]
+    paths: ['.github/workflows/zz-caches.yml']
+
+permissions:
+  actions: write
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Every cache, oldest read first
+        run: |
+          gh cache list --limit 1000 --sort last_accessed_at --order asc \
+            --json ref,key,sizeInBytes,lastAccessedAt \
+            --jq '.[] | [.ref, .key, ((.sizeInBytes / 1048576 | floor | tostring) + " MB"), .lastAccessedAt] | @tsv'
+          gh cache list --limit 1000 --json sizeInBytes \
+            --jq '"total: \(length) caches, \(([.[].sizeInBytes] | add // 0) / 1073741824 * 100 | floor / 100) GB"'
+      - name: The step of pr-caches.yml, for this branch
+        env:
+          REF: refs/heads/claude/funny-faraday-1ipfti
+        run: |
+          set -eu
+          ids=$(gh cache list --ref "$REF" --limit 100 --json id --jq '.[].id')
+          deleted=0
+          failed=0
+          for id in $ids; do
+            if gh cache delete "$id"; then
+              deleted=$((deleted + 1))
+            else
+              failed=$((failed + 1))
+            fi
+          done
+          echo "under $REF: $deleted deleted, $failed not"
+          test "$failed" -eq 0
+      - name: Every cache after it
+        run: |
+          gh cache list --limit 1000 --sort last_accessed_at --order asc \
+            --json ref,key,sizeInBytes,lastAccessedAt \
+            --jq '.[] | [.ref, .key, ((.sizeInBytes / 1048576 | floor | tostring) + " MB"), .lastAccessedAt] | @tsv'
+          gh cache list --limit 1000 --json sizeInBytes \
+            --jq '"total: \(length) caches, \(([.[].sizeInBytes] | add // 0) / 1073741824 * 100 | floor / 100) GB"'

@@ -1,0 +1,57 @@
+name: zz-probe
+
+# Throwaway, on this branch only: what libclang each image has, what
+# bench/scripts/libclang.sh does there and how long it takes, and the
+# suite's build from nothing with no cache.
+
+on:
+  push:
+    branches: [claude/funny-faraday-1ipfti]
+    paths: ['.github/workflows/zz-probe.yml']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest, ubuntu-26.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: libclang on the image, before anything
+        run: |
+          ls -la /usr/lib/llvm-*/lib/libclang*.so* /usr/lib/*-linux-gnu/libclang*.so* 2>/dev/null || true
+          ls -d /usr/lib/llvm-*/lib/clang/*/include /usr/lib/clang/*/include 2>/dev/null || true
+          dpkg -l 2>/dev/null | grep -E '^ii +(libclang|clang)' | awk '{print $2, $3}' || true
+      - name: The pinned toolchain
+        run: sh scripts/toolchain.sh
+      - name: libclang.sh, timed, and what it named
+        run: |
+          start=$(date +%s)
+          sh bench/scripts/libclang.sh
+          echo "libclang.sh took $(( $(date +%s) - start )) s"
+          grep -E 'LIBCLANG|RUSTFLAGS' "$GITHUB_ENV" || true
+          echo "dev packages now: $(dpkg -l 2>/dev/null | grep -c -E '^ii +libclang(-[0-9]+)?-dev' || true)"
+      - name: FASTER, for the `faster` arm
+        if: matrix.runner != 'ubuntu-26.04'
+        run: sh bench/scripts/faster.sh
+      - name: The suite's build from nothing
+        working-directory: bench
+        env:
+          RUNNER_LABEL: ${{ matrix.runner }}
+        run: |
+          set -eu
+          echo "LIBCLANG_PATH=${LIBCLANG_PATH:-} RUSTFLAGS=${RUSTFLAGS:-}"
+          if [ "$RUNNER_LABEL" = ubuntu-26.04 ]; then
+            cargo build --release --locked -p librocksdb-sys
+          else
+            cargo build --release --locked --bin bench
+            ./target/release/bench machine
+          fi
+          b=$(ls target/release/build/librocksdb-sys*/out/bindings.rs target/release/build/librocksdb-sys/*/out/bindings.rs 2>/dev/null | head -n 1)
+          wc -l "$b"
+          shasum -a 256 "$b"
