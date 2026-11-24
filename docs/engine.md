@@ -784,6 +784,33 @@ is an update's instructions, 801 against 555, and FASTER's
 read-modify-write, which updates the record its read found in place
 where ours adds a tombstone and a value to the key's chain.
 
+#### Beside FASTER out of core
+
+A store larger than memory is what FASTER's log is made for, and the
+bounded roster runs it beside `supdb-heldpart`, `supdb` under the held
+log, with its index and the in-memory tail of its log divided from the
+bound (`bench/DESIGN.md`). At ten million keys under 1 GiB FASTER holds a
+256 MiB index and a 448 MiB tail of 1.36 GB of records, and reads the rest
+from the device past the page cache (`bench ab --arms supdb-heldpart,faster
+--size 10000000 --bound 1073741824 --ops-div 10 --reps 2 --passes
+load,read,read-threaded,mixes,mixes-scrambled,lag`, at `5613434`; FASTER's
+rate over ours, both pairs):
+
+| | FASTER over supdb-heldpart |
+|---|---|
+| ordered load | 0.40x |
+| shuffled load | 2.6x |
+| read pass, one, two and three threads | 0.27x, 0.07x, 0.06x |
+| A, B, C, D, F | 0.09x, 0.02x, 0.02x, 0.09x, 0.07x |
+| scrambled A, B, C, D, F | 0.17x, 0.09x, 0.06x, 0.47x, 0.19x |
+| update bursts at 1, 10 and 100% | 1.15x, 1.96x, 1.48x |
+
+Every read of FASTER's that misses its tail is a synchronous read of the
+device, 450 bytes an operation, where the compact form keeps the store's
+point-read population in the page cache. What FASTER keeps is the blind
+write: an upsert appends at the tail of its log and reads nothing, where
+ours seals and merges what the bound will not hold.
+
 ### The seal wait
 
 `Db::seal_waits` splits the seal phase the commit thread pays. Under

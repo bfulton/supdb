@@ -891,6 +891,33 @@ of some passes (`bench run --passes`) both write rows the gate and the
 figures read. The check that found it was the quick group, the only one
 that reads a row it has just written.
 
+**An arm sized for the roster it was written in, run in another.** The
+bounded roster had no FASTER, and nothing said why: its arm sized FASTER's
+index and in-memory log for the store alone, a log of at least 1 GiB, so
+no bound the bounded rows use could hold it. FASTER allocates both at open,
+reads its log's files with `O_DIRECT` and reads nothing of the group it
+runs in, so the pass tells it the bound beside the key count
+(`engines::set_store_bound`) and it divides the bound
+(`engines::faster_sizes`). The first division left an eighth of the bound
+for the process and was killed seven seconds into the load at ten million
+keys under 1 GiB; the process's mappings mid-load, read beside FASTER's
+source, named the 64 MiB page of overflow buckets the index allocates and
+zeroes at open, which the division had not counted, and the probe's whole
+process held 140-170 MiB beyond the index and the log
+(`POINT_OPS_BOUND=1073741824 point_ops faster 10000000 1`). With the page
+counted and a quarter left, its passes peaked at 876-877 MiB of 1,024
+(`memory.max_usage_in_bytes` of each pass's group, read from outside the
+run). The engine's arm beside it came with the same assumption the other
+way: `supdb-held` is the buffered arm under FASTER's promise, the buffered
+arm leaves partitioning a flush to the background, and no bounded row had
+run that shape -- beside `supdb` it read the lag sweep's scans three to six
+times slower, and the bound killed it at the full rewrite in one run of
+two. The bounded roster has `supdb-heldpart`, `supdb` under the held log.
+The rule: an arm moved into a roster is run there before it is believed to
+fit, its memory is sized from what the process measures to hold and never
+from a share chosen beforehand, and the engine's arm of a guarantee is the
+shape the roster it sits in runs everywhere else.
+
 **A comparator's own benchmark can be the broken one.** FASTER's C++
 benchmark at the pinned commit tests `result == Status::Ok` after an
 upsert (`cc/benchmark-dir/benchmark.h`, since a commit of February 2025)

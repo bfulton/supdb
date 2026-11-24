@@ -310,7 +310,7 @@ pick.
 |---|---|---|
 | durable per batch | `supdb` (default), `supdb-forms`, `supdb-settle`, `supdb-nosnap`, `supdb-noadvice`, `supdb-nocache`, `supdb-cache256` | `lmdb`, `rocksdb-tuned`, and in the bounded roster `rocksdb-tuned-lz4` |
 | buffered | `supdb-ingest` | `lmdb-nosync`, `rocksdb-tuned-nosync` |
-| in memory until a checkpoint | `supdb-held`, where `faster` is built | `faster`, where it is built |
+| in memory until a checkpoint | `supdb-held`, and in the bounded roster `supdb-heldpart`, where `faster` is built | `faster`, where it is built |
 
 `faster` is Microsoft's FASTER, its C++ store: the comparator a user would
 otherwise pick for point gets and puts alone, a hash index over a log that
@@ -470,7 +470,20 @@ raw form alone (`supdb-nozpages`), the shape the engine shipped before
 the compact form's controller was its default, and the durable
 comparators: LMDB with its
 readahead off (`lmdb-nordahead`), as LMDB's documentation configures a
-store larger than memory, and RocksDB tuned. The bound is chosen so that
+store larger than memory, and RocksDB tuned; and, where FASTER is built,
+FASTER beside `supdb-heldpart`, which is `supdb` under FASTER's promise.
+A store larger than memory is what FASTER's log is made for -- its tail
+in memory, the rest read from the device with `O_DIRECT`, past the page
+cache -- and it sizes its index and that tail at open and reads nothing
+of the group it runs in, so the pass tells it the bound beside the key
+count and it divides the bound as a user of it would
+(`engines::faster_sizes`): the index at its own benchmark's ratio rounded
+down, the 64 MiB page of overflow buckets it allocates at open, a quarter
+of the bound for the process, and the rest to the log in whole pages.
+The in-core roster's arm of the guarantee, `supdb-held`, is the buffered
+arm's shape, which leaves partitioning a flush to the background and had
+never run under a bound, so the bounded roster has the shape it runs
+everywhere else. The bound is chosen so that
 the top rung is out of core for every engine: a store of ten million keys
 is 1.3 GB in LMDB and 1.4 in supdb's raw form, so under 1.5 GiB LMDB's
 fits and supdb's sits at the edge of its budget, and under 1.25 GiB both
