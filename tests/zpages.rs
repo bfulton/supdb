@@ -4004,7 +4004,17 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
         ModelAlone,
         /// The option, the grant taken back by a point read.
         TakenBack,
+        /// The option, and no grant: the cache's own budget never binds,
+        /// and the misfit is its bytes all the same.
+        NoGrant,
+        /// No grant, the misfit the cache's, and a point read near.
+        NoGrantNear,
+        /// No grant, far from point reads, and a misfit the cache's
+        /// bytes given back would not mend.
+        NotTheCaches,
     }
+    let no_grant = |c: Case| matches!(c, Case::NoGrant | Case::NoGrantNear | Case::NotTheCaches);
+    let copies = |c: Case| matches!(c, Case::Beside | Case::NoGrant);
     // What the bound leaves beside the raw form, to begin with.
     const SLACK: u64 = 64 << 10;
     let run = |name: &str, case: Case| {
@@ -4021,9 +4031,9 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
                 o.scan_cache_ahead = false;
                 o.commit_forms = true;
                 o.forms_settle_backlog_pct = 0;
-                o.scan_cache_auto_bytes = 1 << 10;
+                o.scan_cache_auto_bytes = if no_grant(case) { 1 << 30 } else { 1 << 10 };
                 o.scan_cache_auto_room = true;
-                o.scan_cache_copies_fit = true;
+                o.scan_cache_copies_fit = !no_grant(case);
                 o.heads_owned = true;
                 o.heads_owned_beside_copies = case != Case::ModelAlone;
                 o.upkeep = supdb::Upkeep::Inline;
@@ -4053,8 +4063,11 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
         // Twenty blocks, a key of each a round, until every one is dense
         // and a copy: the first crossing of the cache's budget grows into
         // the slack, and the second is granted the records' place.
+        // A cache of two rounds is a sliver of the raw form, for the case
+        // whose misfit its bytes are not to cover.
+        let rounds = if case == Case::NotTheCaches { 2 } else { 24 };
         let mut rng = Rng(0xBE51DE);
-        for round in 1..=24usize {
+        for round in 1..=rounds {
             for b in 0..20usize {
                 let k = spaced_key(b * 64 + 1 + round % 24);
                 let v = suite_value(&mut rng);
@@ -4067,10 +4080,11 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
         }
         assert_eq!(
             db.cache_copies_grants(),
-            (1, 0),
-            "{name}: the records' place granted, {} B held",
+            (u64::from(!no_grant(case)), 0),
+            "{name}: the records' place granted or not, {} B held",
             db.block_cache_bytes()
         );
+        assert!(db.block_cache_bytes() > 0, "{name}: copies held");
         assert_eq!(
             db.heads_owned_counts(),
             (0, 0, 0),
@@ -4088,14 +4102,28 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
             db.commit().unwrap();
             assert_eq!(db.cache_copies_grants(), (1, 1), "{name}: taken back");
         }
+        if case == Case::NoGrantNear {
+            let last = spaced_key(2999);
+            assert_eq!(db.count(&last).unwrap(), 1);
+            assert!(!db.points_far(), "{name}: a point read is near");
+            let k = spaced_key(2);
+            let v = suite_value(&mut rng);
+            db.append(&k, &v);
+            model.get_mut(&k).unwrap().push(v);
+            db.commit().unwrap();
+        }
         // The model's misfit, held at the census by the group's pressure.
         // The misfit a grant made goes with the copies a taking back
         // sheds, so there the seam says one for the model to read.
-        let seam = if case == Case::TakenBack {
+        let seam = if matches!(case, Case::TakenBack | Case::NotTheCaches) {
             SLACK
         } else {
             budget(&db)
         };
+        assert!(
+            case != Case::NotTheCaches || SLACK + (db.block_cache_bytes() as u64) < raw,
+            "{name}: a misfit the cache's bytes do not cover"
+        );
         inject.set_budget(seam);
         inject.set_refault_rate(1_000_000.0);
         wait_secs(&db, 3, 1);
@@ -4107,25 +4135,22 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
         );
         scan(&db, &model, "the census");
         let t = std::time::Instant::now();
-        while case == Case::Beside
-            && db.heads_owned_counts().0 < parts
-            && t.elapsed().as_secs() < 20
-        {
+        while copies(case) && db.heads_owned_counts().0 < parts && t.elapsed().as_secs() < 20 {
             wait_secs(&db, 1, 1);
         }
-        if case != Case::Beside {
+        if !copies(case) {
             wait_secs(&db, 3, 1);
         }
         let c = db.zpage_counts();
         assert_eq!((c.phase, c.gate), (1, 1), "{name}: still SUSPECT: {c:?}");
         let (made, given, bytes) = db.heads_owned_counts();
-        if case == Case::Beside {
+        if copies(case) {
             assert_eq!((made, given), (parts, 0), "{name}: every partition's heads");
             assert_eq!(bytes, 8 * model.len() as u64, "{name}: eight bytes a key");
             assert_eq!(
                 db.heads_beside_copies(),
                 parts,
-                "{name}: each for the grant alone, the model saying misfit"
+                "{name}: each for the cache in the records' place, the model saying misfit"
             );
         } else {
             assert_eq!(
@@ -4142,6 +4167,9 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
     run("heads-beside-copies", Case::Beside);
     run("heads-beside-model", Case::ModelAlone);
     run("heads-beside-taken-back", Case::TakenBack);
+    run("heads-beside-no-grant", Case::NoGrant);
+    run("heads-beside-no-grant-near", Case::NoGrantNear);
+    run("heads-beside-not-the-caches", Case::NotTheCaches);
 }
 
 /// At the census under the controller a copy is for a store the model says
@@ -10808,6 +10836,94 @@ fn an_attach_of_form_files_built_ahead_is_bought_on_the_prediction() {
     }
 }
 
+/// A store bought before the land look has found it past the selector's
+/// line makes the crossing at the buy (`Options::zpages_buy_crosses`).
+/// Built ahead under its budget, the records kept and the files dropped
+/// as they were written; then two percent past it under the group's
+/// pressure, where the model's saving is under the line to enter, the
+/// look crosses nothing and nothing is bought on the prediction; then
+/// bought on what its reads measure. With the option the buy swaps every
+/// partition built ahead, once and before it attaches any -- a crossing
+/// that came after the attaches would find none to swap -- and without
+/// it the buy attaches the files as they lie and nothing is swapped. A
+/// store the look took past the line first makes its crossing there, and
+/// its buy makes none.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_buy_before_the_crossing_makes_the_crossing() {
+    for (on, far) in [(true, false), (false, false), (true, true)] {
+        let what = format!("buy crosses {on}, far {far}");
+        let (dir, db, model, inject, raw) =
+            land_store_with(&format!("auto-buy-cross-{on}-{far}"), 50, |o| {
+                o.partition_bytes = Some(160 << 10);
+                o.zpages_buy_crosses = on;
+            });
+        inject.set_budget(raw * 3 / 2);
+        assert!(
+            tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+            "{what}: built ahead: {:?}",
+            db.zpage_counts()
+        );
+        let n = db.zpage_counts().partitions;
+        assert!(n >= 4, "{what}: partitions: {n}");
+        inject.set_budget(if far { raw * 2 / 3 } else { raw * 98 / 100 });
+        inject.set_refault_rate(1_000_000.0);
+        if far {
+            assert!(
+                tick_until(&db, 200, |c| c.ahead_swapped >= c.partitions),
+                "{what}: crossed by the look: {:?}",
+                db.zpage_counts()
+            );
+        } else {
+            wait_steps(&db, 30);
+            let c = db.zpage_counts();
+            assert_eq!(
+                (
+                    c.phase,
+                    c.ahead_swapped,
+                    c.buy_crosses,
+                    c.attached,
+                    c.prebuilt
+                ),
+                (1, 0, 0, 0, n),
+                "{what}: SUSPECT under the line, nothing crossed or bought: {c:?}"
+            );
+        }
+        // The reads' faults are the evidence, and the buy.
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= n),
+            "{what}: every partition attached: {:?}",
+            db.zpage_counts()
+        );
+        wait_steps(&db, 10);
+        let c = db.zpage_counts();
+        let want = match (far, on) {
+            (true, _) => (0, n),
+            (false, true) => (1, n),
+            (false, false) => (0, 0),
+        };
+        assert_eq!(
+            (c.buy_crosses, c.ahead_swapped),
+            want,
+            "{what}: the crossing and what it swapped: {c:?}"
+        );
+        let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+        check(&r, &model, &some, &what);
+        assert!(db.zpage_counts().reads > 0, "{what}: through the form");
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The reading at the crossing comes from the form files on disk where
 /// they cover the keys the install needs (`Options::zpages_reading_from_files`):
 /// no fill sample runs, the reading stands in the tick that wanted it, and
@@ -11878,9 +11994,26 @@ fn the_controller_recodes_the_hottest_partition_within_the_budget() {
 /// The hot-raw policy's next look waited for (`Options::zpages_hot_raw`):
 /// the injected clock moved `by`, and the counts read once the segment
 /// work's turn has looked at it.
+///
+/// The pages of whatever the policy has asked the kernel for are waited
+/// for first, in this process's own time (`Db::zpage_hot_asks_in`). The
+/// policy gives an ask two seconds of the store's clock, which ten of
+/// these looks move it through in some tens of milliseconds, and drops a
+/// release whose pages are under half there when they are out: the looks
+/// were a bet that the kernel's read would win, and on a hosted runner it
+/// lost once, `hot_dropped` one where every test here holds it to none.
 #[cfg(target_os = "linux")]
 fn hot_look(db: &Db, by: std::time::Duration) {
     let inject = db.options().zpages_inject.clone().unwrap();
+    let asked = std::time::Instant::now();
+    while !db.zpage_hot_asks_in() {
+        assert!(
+            asked.elapsed().as_secs() < 60,
+            "the kernel brought in the pages the hot-raw policy asked for: {:?}",
+            db.zpage_counts()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     let was = db.zpage_counts().hot_looks;
     inject.advance(by);
     let t = std::time::Instant::now();
@@ -11904,6 +12037,60 @@ fn hot_until(db: &Db, max: u32, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> b
         hot_look(db, std::time::Duration::from_millis(200));
     }
     cond(&db.zpage_counts())
+}
+
+/// The store's partitions: each put out of this process's page tables and
+/// out of the cache where `out`, and read back into the cache otherwise.
+#[cfg(target_os = "linux")]
+fn partitions_cached(dir: &Path, out: bool) {
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        if !p.file_name().unwrap().to_string_lossy().starts_with("par-") {
+            continue;
+        }
+        if out {
+            unmap_pages(&p);
+            evict(&p);
+        } else {
+            drop(std::fs::read(&p).unwrap());
+        }
+    }
+}
+
+/// What a look waits for is the kernel's own count of the pages the policy
+/// asked for (`Db::zpage_hot_asks_in`), not a word the engine keeps of
+/// having asked. With a release's ask in flight (`asked`): once the ask's
+/// read is in, the partitions out of the cache again read as not in, and
+/// read back as in. With none: the partitions out of the cache are nobody's
+/// to wait for, the word of an ask being taken back at the look that ends
+/// it. The partitions are left in the cache either way, as an ask met
+/// leaves the asked one.
+#[cfg(target_os = "linux")]
+fn hot_asks_follow_the_kernel(db: &Db, dir: &Path, asked: bool, what: &str) {
+    let came = std::time::Instant::now();
+    while !db.zpage_hot_asks_in() {
+        assert!(
+            came.elapsed().as_secs() < 60,
+            "{what}: the asked partition's pages came: {:?}",
+            db.zpage_counts()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    partitions_cached(dir, true);
+    assert_eq!(
+        db.zpage_hot_asks_in(),
+        !asked,
+        "{what}: the partitions out of the cache, an ask in flight {asked}: {:?} {:?}",
+        resident_under(dir, "par-"),
+        db.zpage_counts()
+    );
+    partitions_cached(dir, false);
+    assert!(
+        db.zpage_hot_asks_in(),
+        "{what}: the partitions read back: {:?} {:?}",
+        resident_under(dir, "par-"),
+        db.zpage_counts()
+    );
 }
 
 /// Under the controller with the hot-raw policy (`Options::zpages_hot_raw`),
@@ -11999,11 +12186,28 @@ fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
                 (1, 0, partitions),
                 "{what}: asked, still served: {c:?}"
             );
+            hot_asks_follow_the_kernel(&db, &dir, true, &format!("{what}: asked"));
+            // And the looks wait for it (`hot_look`). The asked pages are
+            // put out of the cache again and come back a third of a second
+            // on, a kernel slower than the looks by more than the hosted
+            // runner's was: ten looks take some tens of milliseconds and
+            // move the store's clock through the whole of the ask's wait,
+            // so looks that did not wait would find the pages gone when it
+            // is out and drop the ask.
+            partitions_cached(&dir, true);
+            let late = {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    partitions_cached(&dir, false);
+                })
+            };
             assert!(
                 hot_until(&db, 10, |c| c.hot_raw >= 1),
                 "{what}: the hot partition released: {:?}",
                 db.zpage_counts()
             );
+            late.join().unwrap();
             let c = db.zpage_counts();
             assert_eq!(
                 (
@@ -12016,6 +12220,7 @@ fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
                 (1, 0, 1, 1, partitions - 1),
                 "{what}: the hot partition released: {c:?}"
             );
+            hot_asks_follow_the_kernel(&db, &dir, false, &format!("{what}: released"));
             assert_eq!(c.hot_back, 0, "{what}: {c:?}");
             // Its reads go raw and are counted; the others' still through
             // the form. Every value as the model has it.
@@ -12087,8 +12292,40 @@ fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
                     after.rawserves > before.rawserves,
                     "{what}: read raw while asked: {before:?} {after:?}"
                 );
-                // The pages come by the ask, well inside the wait's ten
-                // looks, and the file is attached with them there.
+                // What a look waits for is the kernel's own count of the
+                // asked file (`Db::zpage_hot_asks_in`), not a word the
+                // engine keeps of having asked: once the ask's read is in,
+                // the file out of the cache again reads as not in, and
+                // read back as in.
+                let zpgs = || {
+                    std::fs::read_dir(&dir)
+                        .unwrap()
+                        .map(|e| e.unwrap().path())
+                        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("zpg-"))
+                };
+                let came = std::time::Instant::now();
+                while !db.zpage_hot_asks_in() {
+                    assert!(
+                        came.elapsed().as_secs() < 60,
+                        "{what}: the asked file's pages came: {:?}",
+                        db.zpage_counts()
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                zpgs().for_each(|p| evict(&p));
+                assert!(
+                    !db.zpage_hot_asks_in(),
+                    "{what}: the asked file out of the cache reads as not in: {:?}",
+                    resident_under(&dir, "zpg-")
+                );
+                zpgs().for_each(|p| drop(std::fs::read(&p).unwrap()));
+                assert!(
+                    db.zpage_hot_asks_in(),
+                    "{what}: the asked file read back reads as in: {:?}",
+                    resident_under(&dir, "zpg-")
+                );
+                // The pages are there at the next look, which waits for
+                // them (`hot_look`), and the file is attached with them.
                 assert!(
                     hot_until(&db, 8, |c| c.hot_back >= 1),
                     "{what}: the way back taken: {:?}",
@@ -13366,6 +13603,7 @@ fn the_hot_raw_fill_releases_partitions_read_alike_into_the_room_and_gives_them_
             let asks = db.zpage_counts().hot_asks - before;
             if asks > 0 && first.is_none() {
                 first = Some(asks);
+                hot_asks_follow_the_kernel(&db, &dir, true, &format!("{what}: the fill's asks"));
             }
         }
         if !on {

@@ -2113,14 +2113,40 @@ merge, and sat out its ten seconds: one run in 240 beside seven other
 processes, the first run on a hosted runner, and every run with the wait
 made 300 ms late. The wait reads the merges landed since the seal beside
 the one in flight (`wait_for_merge`), which a merge that came and went
-satisfies as one caught does. The
+satisfies as one caught does. And as a clock: the hot-raw policy gives
+an ask for a partition's pages two seconds of the store's clock and
+drops it where under half of them have come when the wait is out, and
+its tests move an injected clock a fifth of a second a look, so ten
+looks ran through the whole wait in the tens of milliseconds they take
+while the kernel read the pages in its own time. On a hosted ARM runner
+the read lost once, on a re-run of a commit that had passed there: the
+ask was dropped, eighteen looks and no release, and a test of the
+release failed with the engine right. Each look waits first for the
+kernel's count of what the policy asked for (`Db::zpage_hot_asks_in`,
+over the asks the last look left in flight, which the look says on
+their partitions, `Maint::z_hot_asks_say`), and the test holds the race
+wide: the asked pages put out of the cache and read back a third of a
+second on, which looks that do not wait failed ten runs of ten, no
+release made, and looks that wait none of ten. The word of an ask was
+first stored at each ask and cleared at each end of one, and a mutant
+without one of the clears passed: a look ends an ask in more places than
+were listed, a partition merged or held by a job among them, and a word
+left standing would have every later look wait on pages nobody had asked
+for, the raw records of a partition whose form is installed over them
+again among them, which the install drops. It is written from the
+policy's own lists after every look now, one site. The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; a state the test needs only to have
 happened is waited for by the count it leaves behind, never by catching
-it; and a test that passes is read for
+it; a test that passes is read for
 the path that passed it, since a fallback that does the same work
-passes it too.
+passes it too; an injected clock moves the engine's side of a wait
+alone, so whatever the wait is for that the kernel does in its own time
+is waited for before the clock is moved; and a copy of a state kept for
+a reader is written from the state at one place, since a copy kept in
+step at every site that changes the state is wrong at the site nobody
+listed.
 
 **A test whose answer was a function of the clock, or of a thread's
 turn.** The superblock records the second a segment finished in, in each
@@ -6357,6 +6383,142 @@ point, took the scanning thread's faults from 4,300 to 460 after the
 ten-percent burst and from 10,200 to 4,300 after the full rewrite, and
 read that pass 1.22x in both orders.
 
+**Two lines for one decision, and the step between them that nobody
+swapped at.** The crossing -- the look that turns the partitions built
+ahead into what an install needs, their records dropped and their form
+files asked back (`Maint::z_cross`) -- runs where the land look's model
+reads the store past the selector's line to enter, and that look prices
+the line as the selector does before it holds any reading: by the priors,
+0.133 faults a read. The selector buys by the line as it stands once a
+reading has priced the form, and a reading over stride files prices it at
+the floor, 0.033. A store whose model sits between the two is bought under
+the look's line: the buy attaches every file, the look crosses a tick
+later with the reading's costs in hand, and a crossing swaps only
+partitions with no form attached, so it finds none. At ten million keys
+under 1.25 GiB the default's model reads 0.133 to 0.138 at the load's end
+and the look crosses first; with thirty megabytes less in the process
+(`supdb-jobsmapped`) it reads 0.104 to 0.128, and in four reps of six the
+twenty-four files, dropped at their builds, were attached cold and came in
+under the reads through the warm job and the reads' own faults, the
+one-thread read pass 3.8 to 4.8 s where the others ran 1.0 to 1.4. The
+pairing that found it was of another option, and its table said only that
+the read pass leaned against in both orders, beside a cell ahead by twice:
+the counts that differed the same way in both sittings named the
+controller (ten samples against three, 458 MB warmed against none), and
+one traced rep an arm put the buy before the crossing and `swapped 0 of 5`
+on one line. The selector's first buy makes the crossing itself where the
+look has not (`Options::zpages_buy_crosses`), ahead of the attaches: the
+same six reps read 1.0 to 1.8 s with nothing warmed, and on the default
+the option fired in no rep of six. What it does not move is the read
+pass's two shapes, which the same trace laid to something else: the load's
+last five partitions land in one burst at its end in half the default's
+reps, the store is past no line before them, and a crossing then takes a
+third of a second on the thread every landing goes through with the reads
+already running, 1.4 to 1.7 s against 0.9 to 1.1 where the twenty-eighth
+landing came a tick before the drain's answer. The rules: where one
+decision is drawn at a line by two parties, each prices the line from what
+it holds at its own moment, so the later party's line is the one the
+earlier party's step is checked against, and whatever the first skipped
+the second does; a mechanism that acts on things in one state (here,
+partitions with no form attached) is read for who can move them out of
+that state before it runs; and an option's pairing is read for the cells
+it cannot reach before the cells it can, since the cell that leaned here
+was the controller's and the option was the allocator's.
+
+**Memory given back, and the three things that had been standing on it.**
+The lever was the one the snapshot's refutation named: the jobs' large
+arrays -- a seal's sort, a writer's keys, a merge's key list -- come from
+the allocator on threads that end with the job, and the arenas keep what
+the threads held, 110-150 MB at every lag point at ten million keys under
+1 GiB. Mapped by the engine and unmapped at the job's end
+(`Options::jobs_mapped`) they are nobody's afterwards, and the two passes
+that row loses read 1.3-1.6x and 1.2-1.6x of the default's in three
+pairings, the scanning thread's faults a quarter and two thirds of what
+they were (`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh supdb-jobsmapped
+supdb 10000000 --bound 1073741824 --reps 2 --ops-div 10`, and with
+`--passes load,lag` at three reps, at `ca2306e`). Three things moved with
+the memory, none of them the lever's own, and each was read as the lever's
+first. Under 1.25 GiB the one-thread read pass leaned 0.70x and 0.89x: the
+controller's budget is the limit less the process, the store's model sat
+thirty megabytes under a line it had been thirty megabytes over, and the
+buy came before the crossing (the entry before this one). At three million
+keys under 1 GiB the one-percent burst, which the row loses to RocksDB,
+ran in two shapes in the default all along, 40-56 ms and 78-120, eight
+reps of twenty-four in the long one, and in none of twelve with the jobs
+mapped: the store's raw bytes, 432 MB, are half its budget where the
+process holds 96 MB, half is where the builds ahead at landing start
+(`Options::zpages_land_pct`), and with the allocator's retention the
+load's end started one or two of them, six to eight hundred milliseconds
+each, through the clean store's pass and the burst after it. Every long
+burst of six traced sweeps had a build ahead collected at its end
+(`SUPDB_ZPAGES_TRACE` beside `SUPDB_LAG_MARK`, the row's shape at
+`b2d0dfc`), and the arm without those builds ran twelve of twelve short
+where the default beside it ran seven (`SUPDB_LAG_COUNTERS=1
+bench/scripts/pair.sh supdb-noland supdb 3000000 --bound 1073741824 --reps
+6 --ops-div 10 --passes load,lag`, at `c7570a9`). With the jobs mapped the
+process holds 21-30 MB after that load and the store is eighteen megabytes
+off the line: against LMDB in the row's shape the pass after the
+one-percent burst read 1.36x where the row had 0.88x, and the burst ran at
+725,000 updates a second where the row's ran at 309,000 (`SUPDB_SCAN_OPS=1
+bench/scripts/pair.sh supdb-jobsmappedbuycross lmdb-nordahead 3000000
+--bound 1073741824 --reps 6 --ops-div 10 --passes load,lag`, one sitting,
+at `c7570a9`). The misfire is moved and not mended: a store a tenth larger
+sits on the line again. And the third thing was a pool. The mapped arrays
+had cost in-memory loads a fourteenth when they were first priced, so a
+pool was built to keep a job's buffers for the next job while the store's
+raw form fits its budget and to empty where it does not
+(`Options::jobs_pooled`, `blocks::Pool`), with thirty-two mutants behind
+its tests. Priced, the cost it was built against was not there -- mapped
+alone read in-memory loads 0.98-1.08x at three hundred thousand and three
+million keys, inside a floor where the default beside itself moves cells
+by a fifth -- and at three million keys under 1 GiB the pool held 110-140
+MB after the load, since a store whose raw form fits is not one with
+memory to spare while its load has the group at its limit: the long burst
+in nine reps of twelve, the clean pass 0.94x and 0.77x. It is off and
+stands as the refutation. The rules: a lever that returns memory is read,
+in every cell it moves, against whatever reads the process's size -- a
+budget, a line, a room -- before the cell is called the lever's, since a
+store parked at a threshold moves with anything; a cost a lever was once
+priced at is priced again in the tree at hand before anything is built to
+buy it back, which here was two pairings of five minutes against a day's
+building; a bet's line that the engine's own transient memory can move is
+a line the engine crosses by accident, and the count of its bets
+(`zpage_prebuilt` less the builds at a merge's finish) is read per rep
+beside the cell that reads two shapes; and "the raw form fits the budget"
+is a statement about a store at rest, which a store being loaded under a
+bound is not.
+
+**A fix keyed on the road into a state, and the next change took another
+road.** The heads of a partition landed beside a block cache in the raw
+records' place were left in a mapping because the controller's model
+charges the cache's copies and the records they stand in for both, and the
+fix of the morning read "a grant of the records' place stands" as the
+store left raw (`Options::heads_owned_beside_copies`). A grant is made
+where the cache's own budget binds. With the jobs' arrays mapped the
+process has a hundred megabytes less beside the cache, the budget grows
+into the room and never binds, and no grant was made in six sweeps of six:
+the cache held the same 436 MB of copies, the model read the same misfit,
+thirteen partitions of twenty had their heads copied, and the pass after
+the full rewrite at three million keys under 1 GiB took 49 and 178 major
+faults on the late indexes in two reps of six, 47 and 55 ms where the
+others ran 16 to 23 -- the cell of the morning, 0.76x of the allocator's
+arm in both orders, in the pairing that was to confirm the new default
+(`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh supdb supdb-jobsheap 3000000
+--bound 1073741824 --reps 3 --ops-div 10`, at `a4dc700`). The count that
+named it was the first fix's own: `heads_beside_copies` at nothing, beside
+`cache_copies_grants` at nothing. The look asks the state now: whether the
+misfit the model reads is the cache's bytes, the raw populations within
+the budget once those bytes are given back to it, with no point read near
+(`Maint::z_misfit_is_the_caches`), grant or none. The rules: a fix is
+keyed on the state that is wrong and not on the event that led to it when
+it was found, since the next change reaches the state another way; a
+default's confirming pairing is read for the counts of every earlier fix
+on the cells it touches before its rates, a fix that has stopped firing
+reading as a loss of the new change; and a guard written beside such a
+predicate is held to a mutant like the rest -- a test for the cache
+holding nothing survived its own removal, the model answering the same
+without it, and came out.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
@@ -6400,6 +6562,29 @@ in the suite's figures, at `full` scale where it says so:
   the pieces standing, the unsealed keys -- and the merge path's user time
   over them; the idle I/O class for the merges and their inputs asked ahead
   were priced on it and refuted.
+- The builds ahead at landing start where the store's raw bytes pass half
+  its budget (`Options::zpages_land_pct`), and the budget is the limit less
+  the process, so a store that ends its load at that line is bet on or not
+  by what the process happens to hold: at three million keys under 1 GiB the
+  allocator's retention put it over and one or two builds ran through the
+  first burst, twice its length, in a third of the default's reps before the
+  jobs' arrays were mapped (`Options::jobs_mapped`), which holds that store
+  eighteen megabytes under. A store a tenth larger is on the line again. The
+  levers: the bet called off where scans or commits come while the store is
+  under the selector's line, a build in flight cancelled; or the line drawn
+  against a budget the engine's own transient memory does not move. Neither
+  is built, and which syscall of a build stalls a commit beside it, the
+  file's sync or its writeback, has not been traced.
+- The one-thread read pass straight after a load under a bound reads in
+  two shapes by when the load's last partitions land: at ten million keys
+  under 1.25 GiB the last five land in one burst at the load's end in half
+  the reps, the store is past no line before them, and the crossing's third
+  of a second on the thread every landing goes through runs with the reads
+  already going, 1.4-1.7 s for a million reads against 0.9-1.1 where the
+  twenty-eighth landing came a tick before the drain's answer. Twice LMDB's
+  rate in the long shape. The lever is the crossing's asks made off that
+  thread, so the buy and the install are not held behind them, and is not
+  built.
 - The frozen tables are held to a count (`FROZEN_CAP`, three) and not to
   bytes. A table freezes at the seal's threshold, 109 MB of memtable at
   ten million keys, and near reads its seal makes a snapshot copy of it,

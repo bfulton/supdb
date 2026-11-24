@@ -58,7 +58,7 @@ pub fn with_stride(mut o: supdb::Options) -> supdb::Options {
 /// and nothing it says, so a field a test sets is the test's.
 pub fn options() -> supdb::Options {
     let o = supdb::Options {
-        jobs_mapped: jobs_mapped_switch(),
+        jobs_mapped: !jobs_heap_switch(),
         ..supdb::Options::default()
     };
     if !stride_switch() {
@@ -71,14 +71,14 @@ pub fn options() -> supdb::Options {
     })
 }
 
-/// Whether the tests' stores map their jobs' large arrays
-/// (`Options::jobs_mapped`): `SUPDB_TEST_JOBSMAPPED=1`, read once. The
-/// option is off in the engine, so a run of the tests under the switch is
-/// the one run that takes every seal, merge and close of theirs through
-/// the mapped buffers.
-pub fn jobs_mapped_switch() -> bool {
+/// Whether the tests' stores take their jobs' large arrays from the
+/// allocator (`Options::jobs_mapped` off): `SUPDB_TEST_JOBSHEAP=1`, read
+/// once. The option is on in the engine, so a run of the tests under the
+/// switch is the one run that takes every seal, merge and close of theirs
+/// through the allocator's buffers, the shape before and the arm's.
+pub fn jobs_heap_switch() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SUPDB_TEST_JOBSMAPPED").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("SUPDB_TEST_JOBSHEAP").is_ok_and(|v| v == "1"))
 }
 
 /// A segment file without the part of it that is a function of when it was

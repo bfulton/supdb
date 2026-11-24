@@ -412,8 +412,8 @@ fn where_the_writers_arrays_live_changes_nothing_of_the_segment() {
                 let made = count(site) - was;
                 if mapped {
                     assert_eq!(made, 1, "{layout}: the {site} array a mapping");
-                } else if !common::jobs_mapped_switch() {
-                    // Under the switch the stores of the tests beside
+                } else if common::jobs_heap_switch() {
+                    // But under the switch the stores of the tests beside
                     // this one map theirs, and the count is the process's.
                     assert_eq!(made, 0, "{layout}: off, {site} is no mapping");
                 }
