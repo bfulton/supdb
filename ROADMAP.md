@@ -948,10 +948,31 @@ until the run is its own log). What it loses:
   1.1-1.8 GB and writes 0.7-1.0 GB inside it: the burst's merge debt,
   paid beside the scans, which is the plain store's standing limitation
   for this pass (`CLAUDE.md`) with merges that decrypt their inputs and
-  seal their outputs. The levers the plain store has for it -- the merge
-  chain while reads are around, the asks ahead of a build's pieces, the
-  rewarm -- are each to be read under a cipher by the counters that say
-  they fired, before any new one.
+  seal their outputs. The plain store at the same bound reads the pass
+  at 0.9-2.2 million entries a second (the bounded rows at `a728c4c`),
+  so under a cipher it is ten to twenty times slower, and the plain
+  store's limitation is not the account of it. Beside the plain store in
+  one sitting (`bench ab --arms supdb,supdb-cipherauto --size 10000000
+  --bound 1342177280 --passes load,lag --reps 1 --ops-div 10`, with
+  `SUPDB_LAG_COUNTERS=1 SUPDB_SCAN_OPS=1`, at `27e5c5e`): the plain store
+  meets the pass with 41 pieces standing and nothing merging, 26 major
+  faults and 138 MB read in it, 508 ms; under a cipher 144 pieces and its
+  merges inside the pass, 259,000 major faults, 1.1 GB read and 1.0 GB
+  written, 10.3 s, having landed 65 merges over the sweep to the plain
+  store's 98. Each merge's own account (`SUPDB_MERGE_TRACE=1`) says why:
+  under a cipher a merge moves 50 MB of input a second of its wall and
+  109 of its CPU, against the plain store's 126 and 227, and takes 825,000
+  major faults over the sweep to the plain store's 2,500 -- about half the
+  pages of ciphertext it reads, each a device round trip. The merge's ask
+  ahead (`Options::merge_read_ahead`, four mebibytes, by a scratch switch
+  on the arm) fired, 382 asks of 1.3 GB, and moved neither the faults
+  (661,000) nor the rate (49 MB/s): it asks a window only where the
+  window's first page is not in memory, and covered a fifth of the input.
+  Why the rest faults -- plaintext the cache gives back between the ask
+  and the walk, or ciphertext the kernel drops under the bound -- is not
+  established; the next reading is the merge's faults by file and offset
+  against the cache's evictions of the same units. The CPU half is the
+  cipher's and the cache's fills, and is counted next.
 - [ ] **The builds ahead's last cold partition under a cipher.** At five
   million keys under 640 MiB with the builds ahead started at a quarter
   of the store's cache, one or two partitions are still found cold in
