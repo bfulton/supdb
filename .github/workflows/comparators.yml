@@ -53,20 +53,26 @@ jobs:
       # binary in the directory this step carries from run to run, under a
       # key made of the three. GitHub removes a cache nothing has read for
       # seven days and this job's schedule is weekly, so a scheduled run
-      # may find it gone and build.
-      - uses: actions/cache@v4
+      # may find it gone and build. Restored here and saved by a step of
+      # its own after the table: the one action that does both saves only
+      # where the job passed, and a cell under the margin fails the job.
+      - uses: actions/cache/restore@v4
         id: tools
         with:
           path: bench/comparators-tools
           key: comparators-tools-${{ matrix.runner }}-${{ runner.arch }}-${{ hashFiles('bench/Cargo.lock', 'bench/scripts/comparators.sh') }}
       # Only where db_bench is to be built: a kept one has gflags linked
-      # into it and needs neither.
+      # into it and needs neither. cmake is on the image, and is installed
+      # only where it is not.
       - name: cmake and gflags, for db_bench
         if: steps.tools.outputs.cache-hit != 'true'
         run: |
           set -eu
-          sudo apt-get update
-          sudo apt-get install -y cmake libgflags-dev
+          if command -v cmake >/dev/null; then
+            sh scripts/apt.sh libgflags-dev
+          else
+            sh scripts/apt.sh cmake libgflags-dev
+          fi
       # `workspace -> target`, the target a path inside its workspace: see
       # the `test` job of ci.yml. The key is the one every job that builds
       # the suite's binary alone shares: see the `quick` job there.
@@ -78,6 +84,12 @@ jobs:
         env:
           COMPARATORS_TOOLS: ${{ github.workspace }}/bench/comparators-tools
         run: sh bench/scripts/comparators.sh comparators-ci
+      # The db_bench this run built, whatever the table said of the cells.
+      - uses: actions/cache/save@v4
+        if: always() && steps.tools.outputs.cache-hit != 'true' && hashFiles('bench/comparators-tools/db_bench-*') != ''
+        with:
+          path: bench/comparators-tools
+          key: ${{ steps.tools.outputs.cache-primary-key }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
