@@ -34,6 +34,12 @@ row from that, so a run that was cut is resumed rather than repeated;
 a bounded row with a pass the bound killed lands under `runs/killed/`
 instead, with the kill named, and the command exits 137.
 
+Build from `bench/`. Its `.cargo/config.toml` compiles every engine, the
+Rust and the comparators' C and C++, to one machine level and one
+code-generation policy, and cargo reads that file from the directory it runs
+in; a build that did not get it refuses to finish, and `bench` refuses a host
+without the level. On x86-64 the level is x86-64-v3 with PCLMUL.
+
 Building the RocksDB comparator runs bindgen, which loads the libclang
 shared library as the build runs and needs clang's own headers beside it.
 A host with clang installed has both and needs nothing set.

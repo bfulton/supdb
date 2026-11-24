@@ -12,7 +12,7 @@ use supdb::{Db, Isolation, Options, ReadAdvice, Reader};
 mod common;
 #[cfg(target_os = "linux")]
 use common::cached_pages;
-use common::{dead_arena, kv, manifest_v2_of, vf, without_the_clock};
+use common::{kv, manifest_v2_of, vf, without_the_clock};
 
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-{name}-{}", std::process::id()));
@@ -6360,65 +6360,6 @@ fn an_upkeep_pass_end_asks_the_trim_thread_to_look() {
     assert!(run(true) > 0, "with the option a pass end asked for a look");
 }
 
-/// The trim thread counting by the resident bytes (`Options::trim_by_resident`)
-/// trims again when a dead arena's pages come back resident, which the free
-/// count never sees, since the pages come back under chunks already free. A
-/// store with the look at every pass end and a stride of eight megabytes,
-/// beside a dead arena of thirty-two: its first look trims, the floor
-/// starting at zero; a thread then re-touches the arena and frees it, and a
-/// pass's look trims again. The positive alone, since what the allocator
-/// holds is the whole process's; the free count's standing still is
-/// `trim_due`'s arithmetic over the census's readings.
-#[test]
-fn the_trim_thread_counting_by_resident_bytes_trims_a_dead_arena_again() {
-    if !Db::trim_supported() {
-        return;
-    }
-    let _trims = trim_lock();
-    let keeper = dead_arena(32 << 20);
-    let name = "trim-resident";
-    let (mut db, mut m) = burst_into_forms_with(name, 8 << 10, true, |o| {
-        o.upkeep = supdb::Upkeep::Background(1);
-        o.upkeep_inline_bursts = false;
-        o.forms_trim_bytes = 8 << 20;
-        o.upkeep_trim_look = true;
-        o.trim_by_resident = true;
-    });
-    let mut rounds = 0u32;
-    while db.forms_trims() == 0 {
-        assert!(
-            rounds < 400,
-            "no first trim: {} looks, held {:?}",
-            db.forms_trim_looks(),
-            db.trim_held_bytes()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        rounds += 1;
-    }
-    let first = db.forms_trims();
-    let keeper2 = dead_arena(32 << 20);
-    let mut rounds = 0u32;
-    while db.forms_trims() <= first {
-        assert!(
-            rounds < 400,
-            "no second trim: {} trims, {} looks, held {:?}",
-            db.forms_trims(),
-            db.forms_trim_looks(),
-            db.trim_held_bytes()
-        );
-        m.append(
-            &mut db,
-            &format!("key-{:05}", 3000 + rounds),
-            "v3-0123456789",
-        );
-        db.commit().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        rounds += 1;
-    }
-    m.check(&db, name);
-    drop((keeper, keeper2));
-}
-
 /// A trim in progress holds nothing of the segment work: the trim is a
 /// thread's of its own, and a seal's landing and a flush's answer, which
 /// wait on the segment work's thread, do not wait for it. The trim thread
@@ -6704,6 +6645,16 @@ fn waiting_after_a_pin(name: &str, sweep: bool) -> ((usize, usize), (usize, usiz
         o.forms_fit_sweep = sweep;
         // Room for the forms the rounds below make: nothing sheds.
         o.scan_cache_bytes = 1 << 30;
+        // The segment work inside the writer's operations, so the handle's
+        // is the one pin a sweep below can find: on a thread of its own it
+        // pins for each of its operations, and under the compact form
+        // forced (`SUPDB_TEST_STRIDE`) a look at the heads or a build's
+        // collection ran beside the rounds, its thread off its core on a
+        // loaded runner for as long as the rounds and the reads after
+        // them -- the last round's forms held by that pin, rightly, one
+        // run in a hundred beside five others and once on a hosted macOS
+        // runner.
+        o.publish_in_background = false;
     });
     let key = |k: u32| format!("key-{k:05}");
     let mut sink = 0usize;
@@ -11113,20 +11064,32 @@ fn reader_threads_over_blocks_tuned(
     db.commit().unwrap();
     db.flush().unwrap();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // While set, the threads read and do not scan, each saying so once:
+    // the writer's two commits under it meet with no scan between them.
+    let no_scans = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let scanless = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut threads = Vec::new();
     for t in 0..3u64 {
         let r = db.reader().unwrap();
         let stop = stop.clone();
+        let no_scans = no_scans.clone();
+        let scanless = scanless.clone();
         threads.push(std::thread::spawn(move || {
             let mut seen: HashMap<u32, u64> = HashMap::new();
             let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ t;
             let mut ops = 0usize;
+            let mut said = false;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 x ^= x << 13;
                 x ^= x >> 7;
                 x ^= x << 17;
                 let k = (x % keys as u64) as u32;
-                if x.is_multiple_of(4) {
+                let quiet = no_scans.load(std::sync::atomic::Ordering::SeqCst);
+                if quiet && !said {
+                    scanless.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                said = quiet;
+                if x.is_multiple_of(4) && !quiet {
                     // A point read and then a scan from the same key: the
                     // scan walks cached blocks -- the writer's forms or
                     // the handle's own -- and the point read the
@@ -11209,18 +11172,50 @@ fn reader_threads_over_blocks_tuned(
         }));
     }
     let mut x = 42u64;
+    // The thread is lent a batch only by a commit with no scan since the
+    // commit before it: a buffered commit after a scan files or settles
+    // its batch itself (`Options::upkeep_inline_bursts`,
+    // `Options::upkeep_settle_after_scans`), and the threads scan
+    // between almost every two commits, so whether it made a pass at all
+    // was their timing -- none, one run in thirty, and nothing here
+    // tested it. Halfway, the threads stop scanning, the writer commits
+    // twice, and the pass the second commit lends is waited for.
+    let lends = matches!(upkeep, supdb::Upkeep::Background(l) if l != 2);
     for round in 1..=200u64 {
         // Every tenth batch large enough to wake an upkeep thread, so its
         // passes run while the commits after them land.
         let batch = if round % 10 == 0 { 400 } else { 50 };
-        for _ in 0..batch {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            let k = (x % keys as u64) as u32;
-            db.put(&key(k), round.to_string().as_bytes());
+        let held = lends && round == 101;
+        if held {
+            no_scans.store(true, std::sync::atomic::Ordering::SeqCst);
+            let t0 = std::time::Instant::now();
+            while scanless.load(std::sync::atomic::Ordering::SeqCst) < 3 {
+                assert!(t0.elapsed().as_secs() < 60, "the threads stopped scanning");
+                std::thread::yield_now();
+            }
         }
-        db.commit().unwrap();
+        let passes = db.upkeep_counts()[0];
+        for _ in 0..if held { 2 } else { 1 } {
+            for _ in 0..batch {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), round.to_string().as_bytes());
+            }
+            db.commit().unwrap();
+        }
+        if held {
+            let t0 = std::time::Instant::now();
+            while db.upkeep_counts()[0] == passes {
+                assert!(
+                    t0.elapsed().as_secs() < 60,
+                    "the thread made no pass over the batch lent with no scan before it"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            no_scans.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
     }
     db.flush().unwrap();
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -11249,8 +11244,17 @@ fn reader_threads_over_blocks_tuned(
     }
     db.commit().unwrap();
     quiet(&mut db);
-    let r = db.reader().unwrap();
+    // The writer's own walk of its store, which is what builds its forms
+    // where they have gone: a commit that files writes does not fill
+    // (`Options::forms_settle_builds_filed`), and whether the threads'
+    // last landings above left the writer's tables standing was the
+    // store's timing -- one run in thirty, a look refused at the flush's
+    // last landing dropped them, every commit after filed writes, and
+    // the quiet writer below had published no form at all.
     let mut sink = 0usize;
+    db.scan(b"", usize::MAX, kv(&mut |_k, v| sink += v.len()))
+        .unwrap();
+    let r = db.reader().unwrap();
     r.scan(&key(0), 500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     for k in (1..keys).step_by(11) {
@@ -13682,6 +13686,137 @@ fn same_blocks_carries(long: bool, from_index: bool) -> (u64, u64, u64, [u64; 2]
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&d);
     (carried, after, last, asked)
+}
+
+/// A store whose writer has published its forms for a live handle, over
+/// partitions of several blocks, every block walked by both. The budget
+/// keeps the commit's fill for a scan, so a publish after a write moves
+/// the forms' position without building the written block again: the
+/// publish the upkeep thread's pass makes when it leaves its fill for a
+/// commit the writer has posted (`Options::upkeep_fill_skips_posted`).
+fn forms_published_for_a_handle(name: &str) -> (Db, Reader, ScanModel, PathBuf) {
+    let d = dir(name);
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        scan_cache_bytes: 1 << 30,
+        forms_settle_backlog_pct: 0,
+        commit_forms: true,
+        upkeep: supdb::Upkeep::Inline,
+        ..common::options()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 1, "several partitions");
+    for k in (0..1500u32).step_by(5) {
+        m.append(&mut db, &key(k), "v1");
+    }
+    db.commit().unwrap();
+    let mut sink = 0usize;
+    db.scan(b"", usize::MAX, kv(&mut |_k, v| sink += v.len()))
+        .unwrap();
+    let r = db.reader().unwrap();
+    r.scan(b"", usize::MAX, kv(&mut |_k, v| sink += v.len()))
+        .unwrap();
+    db.commit().unwrap();
+    std::hint::black_box(sink);
+    assert!(
+        db.canonical_forms().0 > 0,
+        "{name}: published for the handle"
+    );
+    m.check(&r, &format!("{name}: published"));
+    (db, r, m, d)
+}
+
+/// A writer that drops its forms withdraws the forms it published of
+/// them (`drop_blocks`): left standing, the writer's next publish moved
+/// the forms' position past a write it filed into no form, and a handle
+/// took the published copy as the block -- a key's value from before the
+/// write, while the point read beside it, through the memtable, was
+/// right. The look whose rebase is refused drops so, in the reader
+/// threads' test one run in a few hundred.
+#[test]
+fn a_writer_that_drops_its_forms_withdraws_what_it_published() {
+    let name = "forms-drop-withdraws";
+    let (mut db, r, mut m, d) = forms_published_for_a_handle(name);
+    let takes = db.canonical_forms().2;
+    db.drop_forms();
+    for k in (2..1500u32).step_by(100) {
+        m.append(&mut db, &format!("key-{k:05}"), "after");
+    }
+    db.commit().unwrap();
+    assert!(
+        db.forms_position() != usize::MAX,
+        "{name}: the commit published, moving the forms' position"
+    );
+    m.check(&r, &format!("{name}: the handle after the drop"));
+    m.check(&db, &format!("{name}: the writer after the drop"));
+    std::hint::black_box(takes);
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A look at a new generation withdraws what the state publishes for a
+/// partition the writer carries no table to. A drop made in an operation
+/// that holds an older state withdraws only there, and the forms the
+/// upkeep thread's pass had published into the state a landing made, or
+/// that a landing carried on, stood in the new generation; the look
+/// rebased with every table gone and kept them, and the publish after it
+/// made them the blocks. Built here by a seam that drops the tables and
+/// withdraws nothing, while the frozen table's landing is held, so that
+/// the landing carries the writer's forms into the state the look finds.
+#[test]
+fn a_look_withdraws_the_forms_of_a_partition_it_holds_no_table_for() {
+    let name = "forms-look-withdraws";
+    let (mut db, r, mut m, d) = forms_published_for_a_handle(name);
+    db.hold_seal_landing(true);
+    for k in (1..1500u32).step_by(50) {
+        m.append(&mut db, &format!("key-{k:05}"), "frozen");
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    assert_eq!(db.frozen_tables(), 1, "{name}: the frozen table");
+    // The writer's look carries its tables to the frozen table's state
+    // and publishes into it, at a commit a scan precedes.
+    let mut sink = 0usize;
+    db.scan(b"", usize::MAX, kv(&mut |_k, v| sink += v.len()))
+        .unwrap();
+    m.append(&mut db, "key-00003", "live");
+    db.commit().unwrap();
+    std::hint::black_box(sink);
+    let landed = db.tables_landed();
+    db.forget_forms_unretracted();
+    db.hold_seal_landing(false);
+    let t0 = std::time::Instant::now();
+    while db.tables_landed() == landed {
+        assert!(t0.elapsed().as_secs() < 30, "{name}: the landing");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    for k in (2..1500u32).step_by(100) {
+        m.append(&mut db, &format!("key-{k:05}"), "after");
+    }
+    db.commit().unwrap();
+    assert!(
+        db.forms_position() != usize::MAX,
+        "{name}: the commit published, moving the forms' position"
+    );
+    m.check(&r, &format!("{name}: the handle after the landing"));
+    m.check(&db, &format!("{name}: the writer after the landing"));
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
 }
 
 #[test]

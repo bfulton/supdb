@@ -37,6 +37,14 @@ fn main() {
     }
     println!("cargo:rustc-env=SUPDB_SHA={}", sha());
     println!("cargo:rustc-env=SUPDB_RUSTC={}", rustc());
+    match build_flags() {
+        Ok(stamp) => println!("cargo:rustc-env=SUPDB_BUILD={stamp}"),
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
+    level_check();
     #[cfg(feature = "codecs")]
     lzav();
     #[cfg(feature = "enc")]
@@ -78,8 +86,204 @@ fn enc_shims() {
     println!("cargo:rustc-link-lib=crypto");
 }
 
+/// The Rust target features each target the suite runs on is held to by
+/// `.cargo/config.toml`, by the names `CARGO_CFG_TARGET_FEATURE` and the
+/// standard library's detection macros give them: x86-64-v3 with PCLMUL, and
+/// ARMv8 with CRC and the crypto extensions. A target that is not here takes
+/// rustc's default and is held to nothing. The one list: the build's check
+/// below and the binary's check of its host (`env::level_missing`) are both
+/// made from it.
+const LEVELS: &[(&str, &[&str])] = &[
+    (
+        "x86_64-unknown-linux-gnu",
+        &[
+            "avx",
+            "avx2",
+            "bmi1",
+            "bmi2",
+            "f16c",
+            "fma",
+            "lzcnt",
+            "movbe",
+            "pclmulqdq",
+            "popcnt",
+            "sse4.2",
+            "xsave",
+        ],
+    ),
+    ("aarch64-unknown-linux-gnu", &["aes", "crc", "sha2"]),
+    ("aarch64-apple-darwin", &[]),
+];
+
+/// The flags every engine of this build was compiled with, as the row's
+/// `build` records them: the Rust flags cargo passed and the C and C++ flags
+/// `cc` read for the target. Refused where `.cargo/config.toml` did not
+/// reach the build -- its flags absent, or the level missing from the Rust
+/// side because a `RUSTFLAGS` replaced them -- for a target it names: such a
+/// build compiles the C and C++ comparators with `cc`'s frame pointers and the
+/// host compiler's protections, and RocksDB without the CRC instruction the
+/// engine uses, and its rows would be read as this suite's.
+fn build_flags() -> Result<String, String> {
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let under = target.replace('-', "_");
+    let (cflags, cxxflags) = (format!("CFLAGS_{under}"), format!("CXXFLAGS_{under}"));
+    for v in [&cflags, &cxxflags] {
+        println!("cargo:rerun-if-env-changed={v}");
+    }
+    println!("cargo:rerun-if-changed=.cargo/config.toml");
+    let get = |v: &str| std::env::var(v).unwrap_or_default();
+    let rustflags = get("CARGO_ENCODED_RUSTFLAGS").replace('\x1f', " ");
+    let stamp = format!(
+        "rustflags: {rustflags}; {cflags}: {}; {cxxflags}: {}",
+        get(&cflags),
+        get(&cxxflags)
+    );
+    let Some((_, features)) = LEVELS.iter().find(|(t, _)| *t == target) else {
+        return Ok(stamp);
+    };
+    let have = get("CARGO_CFG_TARGET_FEATURE");
+    let have: Vec<&str> = have.split(',').collect();
+    let missing: Vec<&str> = features
+        .iter()
+        .copied()
+        .filter(|f| !have.contains(f))
+        .collect();
+    let why = if get(&cflags).is_empty() || get(&cxxflags).is_empty() {
+        format!("{cflags} and {cxxflags} are not set")
+    } else if !missing.is_empty() {
+        format!(
+            "the Rust side lacks {} (a RUSTFLAGS in the environment replaces the file's; \
+             name the file's flags in it too)",
+            missing.join(", ")
+        )
+    } else {
+        return Ok(stamp);
+    };
+    Err(format!(
+        "the suite is built as bench/.cargo/config.toml defines, and {why}. Cargo reads that \
+         file from the directory it runs in: run it from bench/, as every script and workflow \
+         does, not with --manifest-path from elsewhere."
+    ))
+}
+
+/// The host's check against the level, written from `LEVELS` for the target:
+/// `env::level_missing`, which `bench` asks before anything, and on x86-64 a
+/// C constructor that runs before it. A binary of instructions its host
+/// lacks dies of an illegal instruction wherever the first one is, which
+/// names nothing, and on x86-64 the first one is in RocksDB's C++ static
+/// initialisers, which run before `main`: a Nehalem under qemu died in
+/// `cache.cc`'s on a VEX `vmovq`. So the constructor runs at the earliest
+/// priority a program may use, is compiled for baseline x86-64 whatever
+/// `-march` the environment gives (`target("arch=x86-64")`), and names what
+/// is missing and exits; `level_missing` calls into it, which is what keeps
+/// its object in the link.
+fn level_check() {
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let features = LEVELS
+        .iter()
+        .find(|(t, _)| *t == target)
+        .map_or(&[][..], |(_, f)| *f);
+    let x86 = target.starts_with("x86_64");
+    let detect = if x86 {
+        "is_x86_feature_detected"
+    } else {
+        "is_aarch64_feature_detected"
+    };
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    let constructor = x86 && !features.is_empty();
+    let mut body = String::new();
+    if constructor {
+        body.push_str(
+            "    // SAFETY: a C function of no arguments that reads the CPU's\n\
+             \x20   // identification and returns a count.\n\
+             \x20   let _ = unsafe { supdb_bench_level_missing() };\n",
+        );
+    }
+    if features.is_empty() {
+        body.push_str("    Vec::new()\n");
+    } else {
+        body.push_str("    let mut missing = Vec::new();\n");
+        for f in features {
+            body.push_str(&format!(
+                "    if !std::arch::{detect}!(\"{f}\") {{\n        missing.push(\"{f}\");\n    }}\n"
+            ));
+        }
+        body.push_str("    missing\n");
+    }
+    let decl = if constructor {
+        "extern \"C\" {\n    fn supdb_bench_level_missing() -> i32;\n}\n\n"
+    } else {
+        ""
+    };
+    let code = format!(
+        "{decl}/// The features of the machine level this binary was compiled to\n\
+         /// ({target}, `build.rs`'s `LEVELS`) that the host lacks.\n\
+         pub fn level_missing() -> Vec<&'static str> {{\n{body}}}\n"
+    );
+    std::fs::write(out.join("level.rs"), code).expect("level.rs");
+    if !constructor {
+        return;
+    }
+    // The feature names `__builtin_cpu_supports` takes, where they differ.
+    fn gcc(f: &str) -> &str {
+        match f {
+            "bmi1" => "bmi",
+            "pclmulqdq" => "pclmul",
+            f => f,
+        }
+    }
+    let mut checks = String::new();
+    for f in features {
+        checks.push_str(&format!(
+            "    if (!__builtin_cpu_supports(\"{}\")) {{\n        lacks(n++, \"{f}\");\n    }}\n",
+            gcc(f)
+        ));
+    }
+    let c = format!(
+        "/* Written by build.rs from LEVELS for {target}. */\n\
+         #include <string.h>\n\
+         #include <unistd.h>\n\
+         \n\
+         static int counted = -1;\n\
+         \n\
+         __attribute__((target(\"arch=x86-64\")))\n\
+         static void say(const char *s) {{\n\
+         \x20   if (write(2, s, strlen(s)) < 0) {{\n\
+         \x20   }}\n\
+         }}\n\
+         \n\
+         __attribute__((target(\"arch=x86-64\")))\n\
+         static void lacks(int before, const char *feature) {{\n\
+         \x20   say(before == 0 ? \"bench: this binary is compiled to a machine level this host lacks:\" : \",\");\n\
+         \x20   say(\" \");\n\
+         \x20   say(feature);\n\
+         }}\n\
+         \n\
+         __attribute__((constructor(101), target(\"arch=x86-64\")))\n\
+         static void supdb_bench_level(void) {{\n\
+         \x20   int n = 0;\n\
+         \x20   __builtin_cpu_init();\n\
+         {checks}\
+         \x20   counted = n;\n\
+         \x20   if (n > 0) {{\n\
+         \x20       say(\"; the suite's level is bench/.cargo/config.toml's\\n\");\n\
+         \x20       _exit(2);\n\
+         \x20   }}\n\
+         }}\n\
+         \n\
+         int supdb_bench_level_missing(void) {{\n\
+         \x20   return counted;\n\
+         }}\n"
+    );
+    let file = out.join("level.c");
+    std::fs::write(&file, c).expect("level.c");
+    cc::Build::new().file(&file).compile("supdb_bench_level");
+}
+
 /// FASTER's C++ store and the shim the `faster` arm calls (`vendor/faster`),
-/// built as FASTER's release build builds it: C++17, `-O3`, `NDEBUG`.
+/// built as FASTER's release build builds it: C++17, `-O3`, `NDEBUG`; and
+/// with the C++ flags every engine of the suite takes (`.cargo/config.toml`),
+/// which `cc` reads from the environment after these.
 ///
 /// FASTER is Microsoft's and neither a crate nor this repository's:
 /// `scripts/faster.sh` fetches its sources at the commit `vendor/faster/PIN`

@@ -177,6 +177,21 @@ impl Args {
 }
 
 fn main() {
+    // The machine level the suite is compiled to (`.cargo/config.toml`)
+    // against the host's, before anything runs: a binary of instructions
+    // its host lacks dies of an illegal instruction wherever the first one
+    // is, which names nothing. On x86-64 a constructor `build.rs` writes
+    // has asked already, since RocksDB's C++ static initialisers run before
+    // this and are the first such instructions; this is the answer on ARM.
+    let missing = env::level_missing();
+    if !missing.is_empty() {
+        eprintln!(
+            "bench: this binary is compiled to a machine level this host lacks ({}); the \
+             suite's level is bench/.cargo/config.toml's",
+            missing.join(", ")
+        );
+        std::process::exit(2);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(|s| s.as_str()) {
         Some("run") => cmd_run(Args(args[1..].to_vec())),
@@ -213,11 +228,12 @@ fn main() {
         Some("gate") => cmd_gate(Args(args[1..].to_vec())),
         Some("figures") => cmd_figures(Args(args[1..].to_vec())),
         Some("machine") => cmd_machine(),
-        // The binary's stamp of the engine it was built from and of its
-        // compiler, as every row carries them: for a script that will not
+        // The binary's stamp of the engine it was built from, of its
+        // compiler and of the flags its engines were compiled with, as every
+        // row carries them, the engine's first: for a script that will not
         // bank a row of a tree with uncommitted changes (`scripts/ooc.sh`).
         Some("stamp") => {
-            println!("{} {}", run::sha(), run::rustc());
+            println!("{} {}; {}", run::sha(), run::rustc(), run::build());
             0
         }
         _ => {
@@ -246,6 +262,7 @@ fn cmd_machine() -> i32 {
         killed: vec![],
         resumptions: vec![],
         keys: Default::default(),
+        build: String::new(),
         measurements: vec![],
     };
     println!("class: {}", probe.class());
@@ -692,7 +709,7 @@ fn cmd_resume(dir: &Path, a: Args) -> i32 {
     };
     let mut machine = env::capture();
     machine.mem_limit_bytes = bound.as_ref().map(Bound::limit);
-    if let Some(why) = ledger::refusal(&head, run::sha(), run::rustc(), &machine) {
+    if let Some(why) = ledger::refusal(&head, run::sha(), run::rustc(), run::build(), &machine) {
         eprintln!("bench run: refused: {why}");
         let _ = std::fs::remove_dir_all(&root);
         return 1;

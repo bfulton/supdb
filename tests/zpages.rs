@@ -13106,6 +13106,8 @@ fn a_settle_maps_the_raw_files_it_asked_back() {
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Room {
         All,
+        /// All, the first file asked coming in after the rest.
+        AllLate,
         Half,
         /// For half of the ordered indexes and no partition.
         Indexes,
@@ -13113,6 +13115,7 @@ fn a_settle_maps_the_raw_files_it_asked_back() {
     }
     for (maps, room) in [
         (true, Room::All),
+        (true, Room::AllLate),
         (false, Room::All),
         (true, Room::Half),
         (true, Room::Indexes),
@@ -13144,7 +13147,7 @@ fn a_settle_maps_the_raw_files_it_asked_back() {
             "{what}: the raw files out of the cache: {cold} of {size}"
         );
         inject.set_slack(match room {
-            Room::All => 1 << 30,
+            Room::All | Room::AllLate => 1 << 30,
             Room::Half => size / 2,
             Room::Indexes => resident_under(&dir, "ord-").0 / 2,
             Room::None => 0,
@@ -13154,13 +13157,19 @@ fn a_settle_maps_the_raw_files_it_asked_back() {
             recs < 0.1 && ord < 0.1,
             "{what}: the files out of the page tables: records {recs:.2}, indexes {ord:.2}"
         );
+        // The first file asked, an ordered index, read in after the rest
+        // and inside the wait's stall limit: the wait that ended once the
+        // asked bytes together were back left it unmapped.
+        if room == Room::AllLate {
+            inject.ask_first_late(80);
+        }
         let mut db = db;
         db.settle().unwrap();
         let c = db.zpage_counts();
         let (recs, ord) = db.raw_mapped_share().unwrap();
         let warm = raw_resident(&dir).1;
         match (maps, room) {
-            (true, Room::All) => {
+            (true, Room::All | Room::AllLate) => {
                 assert!(c.raw_settles == 1 && c.raw_maps > 0, "{what}: {c:?}");
                 assert!(
                     warm * 10 >= size * 9 && recs >= 0.9 && ord >= 0.9,
@@ -13419,17 +13428,24 @@ fn scans_after_a_quiet_stretch_have_the_cold_raw_files_asked_for() {
 /// resident and no more mapped than the open left them, and where nothing
 /// was asked nothing is mapped. A map made of the bytes a paged mapping
 /// lends unasked would have mapped none either; it decrypts nothing.
+///
+/// And the first envelope asked coming in late (`ZInject::ask_first_late`)
+/// is waited for and mapped with the rest: the late ask is a mapping of the
+/// file by its name, which under a cipher is the vault's (`vault::map`),
+/// since a mapping by the path alone opens nothing in a directory that
+/// cannot exist and asks for nothing.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_settles_raw_rewarm_under_a_cipher_asks_for_the_envelopes_and_decrypts_nothing() {
-    for (on, room, maps) in [
-        (true, 1u64 << 30, true),
-        (true, 1 << 30, false),
-        (true, 0, true),
-        (false, 1 << 30, true),
+    for (on, room, maps, late) in [
+        (true, 1u64 << 30, true, false),
+        (true, 1 << 30, true, true),
+        (true, 1 << 30, false, false),
+        (true, 0, true, false),
+        (false, 1 << 30, true, false),
     ] {
-        let what = format!("raw rewarm under a cipher {on} room {room} maps {maps}");
-        let dir = scratch(&format!("rawrewarm-cipher-{on}-{room}-{maps}"));
+        let what = format!("raw rewarm under a cipher {on} room {room} maps {maps} late {late}");
+        let dir = scratch(&format!("rawrewarm-cipher-{on}-{room}-{maps}-{late}"));
         let inject = std::sync::Arc::new(supdb::ZInject::new());
         inject.set_budget(1 << 30);
         inject.set_slack(room);
@@ -13486,6 +13502,9 @@ fn a_settles_raw_rewarm_under_a_cipher_asks_for_the_envelopes_and_decrypts_nothi
             recs0 < 0.5,
             "{what}: the records' ciphertext all but out of the page tables: {recs0:.2}"
         );
+        if late {
+            inject.ask_first_late(80);
+        }
         db.settle().unwrap();
         let c = db.zpage_counts();
         let (_, warm) = resident_under(&dir, "x-");

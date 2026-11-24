@@ -583,6 +583,7 @@ mod tests {
             killed: vec![],
             resumptions: vec![],
             keys: Default::default(),
+            build: String::new(),
             measurements: vec![m("reads_per_s", "reads/s", reads), m("p99_us", "µs", p99)],
         }
     }
@@ -706,6 +707,7 @@ mod tests {
                 killed: vec![],
                 resumptions: vec![],
                 keys: Default::default(),
+                build: String::new(),
                 measurements: vec![
                     q("scan", "supdb", "entries_per_s", "entries/s", scan_supdb),
                     q("scan", "lmdb", "entries_per_s", "entries/s", scan_lmdb),
@@ -778,6 +780,7 @@ mod tests {
                 killed: vec![],
                 resumptions: vec![],
                 keys: Default::default(),
+                build: String::new(),
                 measurements: vec![q("supdb", 100.0), q("lmdb", lmdb)],
             }
         };

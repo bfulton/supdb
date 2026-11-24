@@ -491,6 +491,23 @@ thousand keys and a million (`src/enc.rs`, with the test that reproduces
 it on LMDB's C API alone). So the encrypted roster runs to the quick
 scale's top, and past it the encrypted comparator is RocksDB's.
 
+Every arm is compiled to one build (`.cargo/config.toml`): one machine level
+and one code-generation policy for the engine's Rust and the comparators'
+C and C++ alike. x86-64 Linux is held at x86-64-v3 with PCLMUL and ARM Linux
+at ARMv8 with CRC and the crypto extensions; macOS takes Apple's default CPU.
+The C and C++ have frame pointers as rustc has them for the target, and none
+of the stack protector, CET or fortified string calls a host compiler may add
+to C and C++ alone, which rustc does not add to the engine. GCC is told that
+no global function of a library is replaced when the program loads, which
+the position-independent code `cc` compiles otherwise makes it assume and
+which keeps it from inlining them; clang and rustc assume nothing of the
+kind. Rows before the
+row's `build` field had the comparators' C and C++ with frame pointers and
+those protections, and RocksDB checksumming its log with a table where the
+engine used the CRC instruction; the first row with the field is a
+definition step, banked on its controls. `bench` refuses a host without the
+level, and the build refuses to run where the file did not reach it.
+
 ## Scale
 
 Three. `quick` gates pull requests; `full` is the number; `ooc` is the
@@ -1134,7 +1151,7 @@ which is long enough that the rungs below it must not depend on it. The file is 
 its shape in outline:
 
 ```
-utc, sha, rustc, scale
+utc, sha, rustc, build, scale
 machine:
   arch, cpu_model, cpus, mem_total_kb, page_size,
   cache_line, cache_line_detected, l1d, l2, l3,
@@ -1145,6 +1162,10 @@ measurements[]:
 ```
 
 `size` is the ladder rung in keys. The floors carry no size.
+
+`build` is the flags every engine was compiled with: the Rust flags cargo
+passed and the C and C++ flags the comparators' builds read. A resume is held
+to it as it is to `sha` and `rustc`.
 
 `samples` is the raw per-rep values — three, five or seven floats. Median,
 confidence interval (CI) and spread are computed when the series is read, so a change to the statistic

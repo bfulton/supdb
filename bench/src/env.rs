@@ -3,6 +3,9 @@
 use crate::machine::Machine;
 use crate::row::MachineInfo;
 
+// `level_missing`: written by `build.rs` from its `LEVELS` for the target.
+include!(concat!(env!("OUT_DIR"), "/level.rs"));
+
 fn read(p: &str) -> Option<String> {
     std::fs::read_to_string(p).ok()
 }

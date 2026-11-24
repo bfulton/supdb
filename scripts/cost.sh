@@ -2,8 +2,9 @@
 # What a store in the clear pays an operation, counted by function: the
 # bench probes built at BASE and at this tree, each run under callgrind
 # with the toggle CLAUDE.md names, and every function's own instructions
-# printed side by side (scripts/cost-diff.py). The probes' sources are the
-# head's in both builds, so the two differ in the engine alone.
+# printed side by side (scripts/cost-diff.py). The probes' sources and the
+# suite's build definition (bench/.cargo/config.toml) are the head's in both
+# builds, so the two differ in the engine alone.
 #
 #   sh scripts/cost.sh BASE [probe ...]
 #
@@ -152,6 +153,20 @@ for e in $EX; do
     cp "$HEAD_TREE/bench/examples/$e.rs" "$W/base/bench/examples/$e.rs" ||
         { echo "cost: the head's probe $e could not be copied into the base"; exit 2; }
 done
+# The head's build in the base, so the two sides are compiled alike:
+# bench/.cargo/config.toml is the machine level and the code-generation
+# policy every engine of the suite is built with, read from the directory
+# cargo runs in, and a base from before it -- or from before a change to
+# it -- would be counted at another level than the head, every function's
+# instructions the flags' as well as the engine's. A head without the file
+# builds the base without it too.
+if [ -f "$HEAD_TREE/bench/.cargo/config.toml" ]; then
+    mkdir -p "$W/base/bench/.cargo"
+    cp "$HEAD_TREE/bench/.cargo/config.toml" "$W/base/bench/.cargo/config.toml" ||
+        { echo "cost: the head's build definition could not be copied into the base"; exit 2; }
+else
+    rm -f "$W/base/bench/.cargo/config.toml"
+fi
 # FASTER's sources, for a side whose suite builds the `faster` arm
 # (bench/build.rs): they are fetched and never the repository's
 # (bench/scripts/faster.sh), so a worktree of the base and a scratch copy of

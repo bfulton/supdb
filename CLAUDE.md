@@ -141,7 +141,7 @@ owner's:
 | `src/wasmapi.rs` | the C ABI the browser calls; hand-written because the module's size is budgeted |
 | `web/` | the browser reader, its byte sources, the fetcher that decrypts, the Worker it runs in, and the size control -- `web/README.md` |
 | `tests/` | the engine's contract, the read paths held to each other, the format's damage cases, a checkpoint held to the store it was made of, a crashed store's runs held to its log, the store's lock beside a forked child; `tests/common` holds what more than one file needs, and `tests/data` the envelope on record |
-| `bench/` | the benchmark suite: its own cargo workspace, the arms, the runner, the gate and the figures -- `bench/DESIGN.md` |
+| `bench/` | the benchmark suite: its own cargo workspace and the one build every engine in it is compiled to (`bench/.cargo/config.toml`), the arms, the runner, the gate and the figures -- `bench/DESIGN.md` |
 | `tests/source.rs` | the gates over the tree's own text, over a lexer in `tests/lex/`: the wall between the forms and the encryption modules (`tests/data/couplings.txt`), what the door's clippy run cannot see (`tests/data/door.txt`, `door-libc.txt`), every public entry point of `Reader`, `Db` and `Blob` to a cost probe or a reason (`tests/data/cost-entries.txt`), the seal's tokens to the calls they are made for, and every workflow under `.github/workflows` to the groups of `scripts/check.sh` |
 | `scripts/door/` | the door by symbol: a clippy run of its own over the library with the barred calls in `clippy.toml` (`run.sh`, in the `lint` group), and its red input (`red.sh`) |
 | `scripts/cost.sh`, `cost-diff.py`, `cost-hot.txt`, `cost-red.sh` | what a store in the clear pays, counted: the probes built at a base and at the tree under callgrind and compared by function, and the count's red input -- the `cost` group |
@@ -4802,7 +4802,28 @@ were listed, a partition merged or held by a job among them, and a word
 left standing would have every later look wait on pages nobody had asked
 for, the raw records of a partition whose form is installed over them
 again among them, which the install drops. It is written from the
-policy's own lists after every look now, one site. The
+policy's own lists after every look now, one site. And as a writer's
+forms and a lent batch, in the reader threads' test: its close held
+that a quiet writer had maintained forms and that the upkeep thread had
+made a pass, and both were the threads' timing once a commit that files
+writes stopped filling (`Options::forms_settle_builds_filed`) and a
+buffered commit after a scan began settling its own batch
+(`Options::upkeep_settle_after_scans`): one run in thirty the writer's
+tables, dropped at a look the flush's last landing refused, were never
+built again before the close, every commit after them filing writes,
+and in a few hundred no commit came without a scan before it, so the
+thread was lent nothing; main, which filled at every commit, failed the
+second three runs in a hundred. The quiet writer walks its store before
+the close now, and halfway through the rounds the threads stop scanning
+across two commits and the pass the second lends is waited for by its
+count. And as a pin: the sweep's test held that four hundred point
+reads after a handle's pin is lifted free what waited under it, and
+under the compact form forced the segment work's looks and collections
+pinned beside the rounds, its thread off its core on a loaded runner
+for as long as the reads -- the last round's forms waiting for that pin,
+rightly, once on a hosted macOS runner and one run in a hundred beside
+five others; the pins in the table at the failure named the slot, and
+the test's segment work runs inside the writer's operations now. The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; a state the test needs only to have
@@ -5948,7 +5969,10 @@ allocate, and the count of anonymous bytes resident beyond the allocator's
 use is lowered by any allocation from a free chunk already resident: a
 dead arena of thirty-two megabytes read as nine in one run of the whole
 `db` binary, so that test has a binary of its own (`tests/resident.rs`), as
-the allocation count has (`tests/leak.rs`). It came back as a record:
+the allocation count has (`tests/leak.rs`); the trim thread's test that
+counts by the same quantity joined it once a hosted ARM run of the `db`
+binary read 211 MB resident beyond use and waited four hundred looks for
+the second trim its dead arena was to cause. It came back as a record:
 the calls the open's tests read off (`Db::trace_dir_io`) were kept
 process-wide, the record stayed on once any test had turned it on, and
 it grew with every recorded call of every test in the binary while each
@@ -9501,7 +9525,18 @@ hand, never carried from the morning's; a lever refuted by a count is
 counted again in the regime in front of it, the fault's price being the
 regime's and not the mechanism's; and resident is not mapped --
 `mincore` answers the first and `/proc/self/pagemap` the second, and a
-test of the second reads the second.
+test of the second reads the second. The settle's wait ended once the
+files it asked held nine tenths of their bytes together, and the map
+after it takes a file only where that file holds nine tenths of its
+own, so a file still coming in when the others had carried the sum --
+one partition of seven, here one run in four hundred beside a build, or
+the ordered indexes a hosted runner read in last -- was left unmapped and
+resident a moment later. The wait asks what the map asks now, every file
+asked at nine tenths, and its stall and cap still end it; the test asks
+its first file late through a seam (`ZInject::ask_first_late`), inside
+the stall limit, and the wait by the sum fails it every run. A wait and
+the step after it are written against one predicate, since the gap
+between a sum and its parts is exactly the state the step skips.
 
 **A mutant's binary, kept by the restore that undid the mutant.** A
 mutant runner copies a source file aside, writes the mutant, runs the
@@ -9878,6 +9913,43 @@ invariant of the structure fixes is not made; and a phase that allocates
 under a bound is priced by its fresh bytes before its instructions, by a
 timer of its steps and not by a profile whose own cost lands on the same
 faults.
+
+**A drop that withdrew nothing from the state it dropped beside.** The
+writer's look at a new generation rebases its tables across it, and
+where the rebase is refused -- the frozen tables neither the ones it
+kept nor those less the landed -- drops them all (`drop_blocks`), and the
+drop took the writer's forms and left what the state published of them.
+Nothing read them while the forms' position stood; the writer's next
+publish moved it past them, the blocks were ones the writer filed
+nothing into any more, and a handle took a copy as the block: the
+buffered reader threads' test read a key's value from before its last
+write while the point read beside it, through the memtable, was right,
+once on a hosted macOS runner and one run in three hundred here, and the
+settle's check that a block the writer holds no form for has none
+published fired in the runs where the writer wrote into such a block
+before a handle read it. The drop withdraws now, as the shed's branches
+and the forms-off drop did already. A trace of every drop and every
+publish named a second way to the same state: the upkeep thread's pass
+had published 48 forms into a landing's state the writer's operation
+had not reached, the writer's look was refused in the older state and
+dropped there, where nothing stood, and its next look, at the landing's
+state, rebased with every table gone -- the commit's fill marks the
+cache in use before any table exists -- and kept the forms. The look
+withdraws what the state publishes for every partition it carries no
+table to (`rebase_tables`), as it withdrew a form a carried table holds
+none for. A publish of the forms' position asserts in a checked build
+that every form the state holds as a block is the writer's own
+(`check_published`), which caught both at the publish where the wrong
+answer had waited for a reader, four runs in four hundred, and costs the
+`db` binary nothing measurable; `tests/db.rs` builds each case through
+a seam (`drop_forms`, `forget_forms_unretracted`), each test failing
+without its half. Main had both; its timing reached neither in 2,600
+runs. The rules: whatever drops the things an absence is about withdraws
+what stands for them in the state it holds, and the look that arrives
+in a later state checks every claim it finds there against what it
+holds, since a drop made in one state cannot reach the next; and an
+invariant a reader leans on is asserted where it is published, not only
+at a write that a stale form need never meet.
 
 ## Standing limitations
 

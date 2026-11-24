@@ -46,6 +46,10 @@ pub struct Head {
     pub utc: String,
     pub sha: String,
     pub rustc: String,
+    /// The flags the run's binary was built with (`run::build`): empty for
+    /// a ledger from before the field, which no binary since may resume.
+    #[serde(default)]
+    pub build: String,
     pub machine: MachineInfo,
     pub plan: Plan,
     /// The sittings after the first, one per resume that ran a pass.
@@ -57,9 +61,17 @@ pub struct Head {
 /// nothing. The stamp is the binary's `SUPDB_SHA`, `-dirty` and all: two
 /// dirty trees read the same under it and may not be the same code,
 /// which is as much as the stamp can say, and a row of a dirty tree was
-/// never the series' anyway. The class carries the bound (`Row::class`),
-/// so a resume under another bound is refused here too.
-pub fn refusal(head: &Head, sha: &str, rustc: &str, machine: &MachineInfo) -> Option<String> {
+/// never the series' anyway. The build's flags are the stamp's too: the
+/// same sources built for another machine level, or with the C and C++
+/// compiled otherwise, are another measurement. The class carries the bound
+/// (`Row::class`), so a resume under another bound is refused here too.
+pub fn refusal(
+    head: &Head,
+    sha: &str,
+    rustc: &str,
+    build: &str,
+    machine: &MachineInfo,
+) -> Option<String> {
     if head.sha != sha {
         return Some(format!(
             "the ledger is of {} and this binary is {sha}; a resumed run is the same engine",
@@ -70,6 +82,12 @@ pub fn refusal(head: &Head, sha: &str, rustc: &str, machine: &MachineInfo) -> Op
         return Some(format!(
             "the ledger's binary was built by {:?} and this one by {rustc:?}",
             head.rustc
+        ));
+    }
+    if head.build != build {
+        return Some(format!(
+            "the ledger's binary was built with {:?} and this one with {build:?}",
+            head.build
         ));
     }
     let (was, now) = (head.machine.class(), machine.class());
@@ -309,6 +327,7 @@ mod tests {
             utc: "20260101T000000Z".into(),
             sha: "abc1234def".into(),
             rustc: "rustc 1.0".into(),
+            build: "rustflags: a".into(),
             machine: machine(),
             plan: Plan::new(
                 Scale::Ooc,
@@ -340,26 +359,34 @@ mod tests {
         d
     }
 
-    /// The resume is held to the stamp and the class, each named in the
-    /// refusal, and a bound is a class.
+    /// The resume is held to the stamp, the build's flags and the class,
+    /// each named in the refusal, and a bound is a class.
     #[test]
-    fn a_resume_is_refused_by_stamp_or_class_and_names_which() {
+    fn a_resume_is_refused_by_stamp_build_or_class_and_names_which() {
         let h = head();
-        assert_eq!(refusal(&h, "abc1234def", "rustc 1.0", &machine()), None);
-        let sha = refusal(&h, "ffff", "rustc 1.0", &machine()).unwrap();
+        assert_eq!(
+            refusal(&h, "abc1234def", "rustc 1.0", "rustflags: a", &machine()),
+            None
+        );
+        let sha = refusal(&h, "ffff", "rustc 1.0", "rustflags: a", &machine()).unwrap();
         assert!(sha.contains("abc1234def") && sha.contains("ffff"), "{sha}");
-        let rustc = refusal(&h, "abc1234def", "rustc 2.0", &machine()).unwrap();
+        let rustc = refusal(&h, "abc1234def", "rustc 2.0", "rustflags: a", &machine()).unwrap();
         assert!(rustc.contains("rustc 2.0"), "{rustc}");
+        let build = refusal(&h, "abc1234def", "rustc 1.0", "rustflags: b", &machine()).unwrap();
+        assert!(
+            build.contains("rustflags: a") && build.contains("rustflags: b"),
+            "{build}"
+        );
         let mut other = machine();
         other.mem_limit_bytes = Some(2 << 30);
-        let class = refusal(&h, "abc1234def", "rustc 1.0", &other).unwrap();
+        let class = refusal(&h, "abc1234def", "rustc 1.0", "rustflags: a", &other).unwrap();
         assert!(
             class.contains("/b1024m") && class.contains("/b2048m"),
             "{class}"
         );
         let mut cpus = machine();
         cpus.cpus = 8;
-        assert!(refusal(&h, "abc1234def", "rustc 1.0", &cpus).is_some());
+        assert!(refusal(&h, "abc1234def", "rustc 1.0", "rustflags: a", &cpus).is_some());
     }
 
     /// A rep is whole by its own file and by nothing else, a cut rep names

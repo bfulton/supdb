@@ -1217,6 +1217,12 @@ pub fn rustc() -> &'static str {
     option_env!("SUPDB_RUSTC").unwrap_or("unknown")
 }
 
+/// The flags every engine of this binary was compiled with, the row's
+/// `build` (`build.rs`, `.cargo/config.toml`), which a resume is held to.
+pub fn build() -> &'static str {
+    option_env!("SUPDB_BUILD").unwrap_or("unknown")
+}
+
 /// A run taken up from its ledger (`bench run --resume DIR`): the ledger
 /// and its head, and whether a cut rep keeps the passes it holds
 /// (`--resume-passes`) rather than being taken again whole.
@@ -1547,6 +1553,7 @@ pub fn run(
                         utc: utc.clone(),
                         sha: sha().to_string(),
                         rustc: rustc().to_string(),
+                        build: build().to_string(),
                         machine: machine.clone(),
                         plan: plan.clone(),
                         resumptions: Vec::new(),
@@ -1638,6 +1645,7 @@ pub fn run(
                     utc: utc.clone(),
                     sha: sha.clone(),
                     rustc: rustc.clone(),
+                    build: build().to_string(),
                     machine: machine.clone(),
                     plan: plan.clone(),
                     resumptions: resumptions.clone(),
@@ -1963,6 +1971,7 @@ fn row_of(
         killed: killed.to_vec(),
         resumptions: resumptions.to_vec(),
         keys: plan.keys,
+        build: build().to_string(),
     }
 }
 
@@ -6069,7 +6078,7 @@ mod tests {
     /// ids from its first banked rung, in the ids' class, and one over the
     /// numbered keys a row that says nothing of them.
     #[test]
-    fn a_row_is_of_its_plans_keys() {
+    fn a_row_is_of_its_plans_keys_and_its_build() {
         let machine = crate::env::capture();
         for keys in [KeyShape::Numbered, KeyShape::Ids] {
             let mut plan = Plan::new(Scale::Quick, vec!["supdb".into()], 10_000, 4);
@@ -6086,6 +6095,9 @@ mod tests {
             );
             assert_eq!(row.keys, keys);
             assert_eq!(row.class().ends_with("/kids"), keys == KeyShape::Ids);
+            // And of the binary's build, which `build.rs` stamps.
+            assert!(row.build.starts_with("rustflags:"), "{}", row.build);
+            assert_eq!(row.build, build());
         }
     }
 
