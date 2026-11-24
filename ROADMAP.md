@@ -877,6 +877,28 @@ until the run is its own log). What it loses:
   `rocksdb-tuned-enc` in both sittings: the controller on as shipped
   under a cipher, which wants its pairings in core and at the other
   bounds first, and the shape that is left.
+- [ ] **The loads with the controller on under a cipher.** At five
+  million keys under 640 MiB the controller's builds during a load -- the
+  builds ahead at landing in the ordered load, the builds at a merge's
+  finish in the shuffled load's drain, twenty-two of them there for
+  nineteen partitions, most superseded by the next merge -- cost the
+  loads about a twentieth against the same store with the controller off
+  (`scripts/pair.sh SUPDB_LOAD_PHASES=1 supdb-cipherauto supdb-cipher
+  5000000 --bound 671088640 --passes load --reps 4 --pairs _per_s` at
+  `acbc5ae`): the ordered load's commits half a second longer at the same
+  CPU, the shuffled load's drain a second longer. Against encrypted
+  RocksDB the ordered load is still ahead with it (1.08-1.21x in eight
+  pairs of eight) and the shuffled load is not (0.82-1.04x, behind in
+  seven of eight, where the store with the controller off is level, 0.91-1.07x;
+  `BIN=$PWD/target-enc/release/bench scripts/pair.sh supdb-cipherauto
+  rocksdb-tuned-enc ... --passes load`). What the writer waits on is not
+  known: the writer's fdatasyncs are no slower beside the builds (`strace
+  -f -e trace=fdatasync,fsync -T` over a pass of each, medians 0.43-0.44
+  ms against 0.47), and the cache's waits at its crowding line are not the
+  writer's and are fewer with the controller on; the cache fills twice the
+  chunks and evicts 1.85x the units over the two loads. The next reading
+  is the writer's time off its core, by reason, in a pass of each. The
+  plain store builds at a merge's finish in a shuffled load as well.
 - [ ] **The builds ahead's last cold partition under a cipher.** At five
   million keys under 640 MiB with the builds ahead started at a quarter
   of the store's cache, one or two partitions are still found cold in
