@@ -43,14 +43,12 @@ jobs:
           set -eu
           sudo apt-get update
           sudo apt-get install -y cmake libgflags-dev
-      # `workspace -> target`, the target a path inside its workspace, and
-      # LIBCLANG_PATH in the key: see the `test` job of ci.yml. The key is
-      # the one every job that builds the suite's binary alone shares: see
-      # the `quick` job there.
+      # `workspace -> target`, the target a path inside its workspace: see
+      # the `test` job of ci.yml. The key is the one every job that builds
+      # the suite's binary alone shares: see the `quick` job there.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: bench -> target
-          env-vars: LIBCLANG
           shared-key: bench
       - name: The tools, the suite's two arms, and the table
         run: sh bench/scripts/comparators.sh comparators-ci

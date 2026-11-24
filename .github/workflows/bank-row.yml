@@ -50,14 +50,12 @@ jobs:
       # It does nothing off Linux x86-64, where there is no `faster` arm.
       - name: FASTER, for the `faster` arm
         run: sh bench/scripts/faster.sh
-      # `workspace -> target`, the target a path inside its workspace, and
-      # LIBCLANG_PATH in the key: see the `test` job of ci.yml. The key is
-      # the one every job that builds the suite's binary alone shares: see
-      # the `quick` job there.
+      # `workspace -> target`, the target a path inside its workspace: see
+      # the `test` job of ci.yml. The key is the one every job that builds
+      # the suite's binary alone shares: see the `quick` job there.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: bench -> target
-          env-vars: LIBCLANG
           shared-key: bench
       # The run and the gate apart, and the gate's exit not the step's: a
       # verdict against the series is what the pull request carries, not a
@@ -96,14 +94,12 @@ jobs:
       # It does nothing off Linux x86-64, where there is no `faster` arm.
       - name: FASTER, for the `faster` arm
         run: sh bench/scripts/faster.sh
-      # `workspace -> target`, the target a path inside its workspace, and
-      # LIBCLANG_PATH in the key: see the `test` job of ci.yml. The key is
-      # the one every job that builds the suite's binary alone shares: see
-      # the `quick` job there.
+      # `workspace -> target`, the target a path inside its workspace: see
+      # the `test` job of ci.yml. The key is the one every job that builds
+      # the suite's binary alone shares: see the `quick` job there.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: bench -> target
-          env-vars: LIBCLANG
           shared-key: bench
       - uses: actions/download-artifact@v4
         with:

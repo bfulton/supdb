@@ -38,10 +38,17 @@ heed = "0.20"
 # jemalloc: the `rocksdb-jemalloc` feature below builds it on the prefixed
 # jemalloc the crate links, which touches no Rust allocation, and the
 # `rocksdb-alloc` workflow pairs the two builds. The build needs libclang
-# for bindgen; on a host where clang-sys does not find one,
-# `scripts/libclang.sh` names the directory holding it (libclang.so, or
-# libclang.dylib on macOS).
-rocksdb = { version = "0.23", default-features = false, features = ["lz4"] }
+# for bindgen, and loads it when the build script runs (`bindgen-runtime`):
+# that is the crate's default, and it went with the compression libraries
+# when the defaults were turned off, so the build script linked libclang
+# instead, which wants the unversioned `libclang.so` only a -dev package
+# ships. A host with libclang's runtime library alone, which every hosted
+# runner and a fresh container is, could not build the suite until that
+# package was installed, and every CI job installed it with apt, twenty
+# seconds on a good day and five minutes on a slow mirror. Loaded at run
+# time, any libclang the loader can open will do; `scripts/libclang.sh`
+# names the directory holding one.
+rocksdb = { version = "0.23", default-features = false, features = ["lz4", "bindgen-runtime"] }
 
 # liblz4's decoder, for the probe that prices it against `lz4_flex` on the
 # form's own pages (`examples/zdecode.rs`, `--features lz4-c`). Optional, so

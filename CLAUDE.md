@@ -60,15 +60,23 @@ caller. Nothing is exempt from the format gate, and everything holds to
 what is missing and ending in an `all deps ready` line to gate on; run it
 first in a fresh container, which has the stable it was made with and not
 the toolchain `rust-toolchain.toml` names, and libclang only as versioned
-files. It names libclang through `bench/scripts/libclang.sh`,
-the one definition CI uses, and keeps no variable. clang-sys's build
-script declares nothing to rerun on, so the directory it found libclang
-in at the first build stays in its cached output for good: a
-`LIBCLANG_PATH` pointed by hand at a symlink in a scratch directory
-built the comparators once, and with the directory gone the next build
-failed at RocksDB's build script, `unable to find library -lclang`.
-`deps.sh` cleans an output that names a directory with no libclang in
-it.
+files. That is enough for the suite's build, which loads libclang when
+RocksDB's build script runs (`bindgen-runtime`, `bench/Cargo.toml`):
+`bench/scripts/libclang.sh`, the one definition CI uses, checks that the
+host has one with clang's own headers beside it and installs a package
+only where it has not, and no variable is kept. The build script linked
+libclang for as long as the suite had turned the `rocksdb` crate's
+defaults off for its compression libraries, the run-time load being one
+of them: the linker wants the unversioned `libclang.so` a -dev package
+ships, so every CI job and every fresh container installed one with apt,
+twenty seconds on a good day and five minutes a job on a slow mirror, and
+clang-sys kept the directory it had first found it in for as long as its
+output was cached, so that a `LIBCLANG_PATH` pointed by hand at a symlink
+in a scratch directory built the comparators once and, the directory
+gone, failed the next build at RocksDB's build script, `unable to find
+library -lclang`. A dependency's defaults turned off for one of them are
+read for the rest: the one dropped here was the reason a host needed
+nothing.
 
 `sh scripts/check.sh` runs every group -- build, test, stride, lint, wasm, bench --
 and CI calls the same script with the same names, so a green run here is a
@@ -223,9 +231,9 @@ the suite's build in it, and reported both done, while every job built
 RocksDB from its sources twice, half of a test leg's time. It was found
 in the step's own log, which prints the directories it caches, on the
 day somebody read one. `bench/scripts/workflows.sh` holds a cache's
-target to a workspace's own now, and the libclang directory is in the
-cache's key, since a cached clang-sys output naming a directory since
-gone is the failure `scripts/deps.sh` cleans and a workflow does not.
+target to a workspace's own now. A cached build names nothing of the
+host's libclang, which is loaded as RocksDB's build script runs, so the
+key carries nothing of it.
 Once the step cached the build, the build's size was the next thing
 nobody had read: the action keys a cache by its job's name, so every job
 that builds the suite's release binary kept a copy of the same

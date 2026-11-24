@@ -23,9 +23,10 @@
 #   3. No job runs on `ubuntu-latest`. The label is whichever image GitHub
 #      says it is that week: it moved to Ubuntu 26.04 between two runs of one
 #      afternoon, where `scripts/libclang.sh` found no libclang after
-#      installing it (it looked in the highest LLVM directory alone, and
-#      asks each now) and `qemu-user-static` is no longer a package, and three
-#      jobs of `ci` failed in their set-up on a tree that had not changed.
+#      installing it (it wanted a -dev package's name for one then, and
+#      looked in the highest LLVM directory alone; it takes the image's own
+#      now) and `qemu-user-static` is no longer a package, and three jobs
+#      of `ci` failed in their set-up on a tree that had not changed.
 #      `ci` was given its image by name that day and the five workflows that
 #      run by hand or after a merge were left with the label, to fail the
 #      same way on the day somebody needed one. A Linux job names its image,

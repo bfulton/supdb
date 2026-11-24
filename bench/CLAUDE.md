@@ -666,7 +666,8 @@ pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`
 block and rejects any `${{ }}` inside one; it runs in `lint`. It refuses
 `ubuntu-latest` as a job's runner too. That label moved to Ubuntu 26.04
 between two runs of one afternoon, where the libclang lookup found
-nothing (it looked in the highest LLVM directory alone, and asks each
+nothing (it wanted a -dev package's name for the library then, and
+looked in the highest LLVM directory alone; it takes the image's own
 now) and `qemu-user-static` is not a package, and three jobs of `ci`
 failed in their set-up on a tree that had not changed; `ci` was given
 its image by name that day, and the five workflows that run by hand or
@@ -765,10 +766,22 @@ and the row's one `sha` names both.
 Building RocksDB runs bindgen, which needs libclang, and every workflow
 calls `scripts/libclang.sh` for it -- one definition. The first CI run that
 built RocksDB at all failed on both Linux (only a versioned `.so` on the
-image) and macOS (dyld could not find `@rpath/libclang.dylib` at run time);
-naming the directory fixed Linux and not macOS, because SIP strips `DYLD_*`
-before a workflow step's shell starts, so on macOS the script adds an rpath
-to `RUSTFLAGS`. FASTER is the other comparator a host has to be readied for, and
+image) and macOS (dyld could not find `@rpath/libclang.dylib` at run time),
+and each got a workaround: a -dev package installed with apt in every
+Linux job, for the unversioned name the linker wants, and on macOS an
+rpath in `RUSTFLAGS`, since SIP strips `DYLD_*` before a workflow step's
+shell starts. Both were the price of one line of `Cargo.toml`: the
+`rocksdb` crate loads libclang when its build script runs by default, the
+suite had turned the crate's defaults off for the compression libraries,
+and the build script linked libclang instead. With `bindgen-runtime` named
+again the library is opened by its path, the runtime library an image
+already has will do, and the script checks for it, with clang's own
+headers, and installs nothing where it is there: the apt step had been
+twenty seconds of every Linux job and, on a day the mirror was slow, five
+minutes, as long as the build the cache had just saved. Two libclang
+packages are not one: without clang's headers beside the library bindgen
+ends at `'stdbool.h' file not found`, so the script asks for both. FASTER
+is the other comparator a host has to be readied for, and
 `scripts/faster.sh` is its one definition, called wherever
 `scripts/libclang.sh` is: it is not a crate, so the script fetches its
 sources at the commit `vendor/faster/PIN` names into a directory git
