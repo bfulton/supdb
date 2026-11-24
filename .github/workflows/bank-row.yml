@@ -17,12 +17,12 @@ name: bank-row
 
 on:
   push:
-    branches: [main, claude/funny-faraday-1ipfti]
-    paths: ['.github/workflows/bank-row.yml']
+    branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -139,7 +139,7 @@ jobs:
           sh bench/scripts/figures.sh
           sh bench/scripts/figures.sh --check
       - name: Propose the rows as a pull request
-        if: false
+        if: steps.rows.outputs.rows != '0'
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}

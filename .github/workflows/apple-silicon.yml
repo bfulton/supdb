@@ -10,9 +10,6 @@ name: apple-silicon
 # Timing on Apple Silicon is `quiet-bench`, on a self-hosted Mac.
 
 on:
-  push:
-    branches: [claude/funny-faraday-1ipfti]
-    paths: ['.github/workflows/apple-silicon.yml']
   pull_request:
     paths:
       - 'bench/src/machine.rs'
