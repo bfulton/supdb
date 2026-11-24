@@ -2202,7 +2202,16 @@ upkeep, which lends the writer's tables to the thread: a counter read takes
 the upkeep home, waiting for a pass in flight and taking back a commit's
 batch the pass has not begun, so the count was of tables nothing had been
 filed into, one run in thirty; the test runs the commit's own fill inline,
-as its siblings that count what a commit filed already did. The rule is the
+as its siblings that count what a commit filed already did. It came again
+as walks counted store against store: the test of the bounds walk by the
+heads (`Options::bounds_by_heads`) holds what one store's walks placed and
+read to the records the other's read, and near reads one of each store's
+two walks was the thread's, the snapshot's after the round's commit,
+which the seal takes the upkeep back ahead of where the thread has not
+begun it -- two walks in one store and one in the other, once on a
+hosted x64 runner and one run in forty beside seven others, with the
+counts at each stage printed to say whose walk was missing, and none of
+two hundred and forty with the commit's fill inline. The rule is the
 one above, applied to two more states a test cannot see it needs: the
 second a store was finished in, and which side of a hand-off a counter is
 read from. A flake whose trigger is a phase is reproduced by choosing the
