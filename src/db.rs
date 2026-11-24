@@ -26377,28 +26377,8 @@ impl Reader {
         if self.shared.pager.is_some() {
             self.attn |= ATTN_PAGED;
             self.attn_open.set(self.attn_open.get() | ATTN_PAGED);
-            self.reader_rests();
         }
         self
-    }
-
-    /// A handle with forms of its own looks as the writer's does under a
-    /// cipher, for the rest a look is ahead of a read's walk: the word
-    /// its forms have for "not asked" is the cipher's (`not_asked`). Out
-    /// of line: written into `paged_bits`, which every handle's
-    /// constructor ends in, it changed what the compiler kept in
-    /// registers through the writer's round of a plain store, two and a
-    /// half instructions a key by the count (`sh scripts/cost.sh 884443b
-    /// work` at `c1eeafb`), in a function no line of it runs.
-    #[cold]
-    #[inline(never)]
-    fn reader_rests(&mut self) {
-        if self.looks == LOOKS_NONE {
-            if let Some(f) = self.fs.0.get_mut() {
-                self.looks = LOOKS_READER_RESTS;
-                f.abandoned.set(REST_HERE);
-            }
-        }
     }
 
     /// The writer's own handle, after `paged_bits`: in a store under a
@@ -43463,11 +43443,29 @@ impl Reader {
                 .fetch_add(1, AtomicOrdering::Relaxed);
             self.publish_for_handle();
         }
-        Ok(Reader {
+        // A handle made here looks as the writer's does in a store under a
+        // cipher, for the rest a look is ahead of a read's walk
+        // (`Reader::abandon_slow`), and its forms' word for "not asked" is
+        // the cipher's from their first look: a caller's, whose reads
+        // settle and install, and the builder ahead's and the keeper's
+        // with it, which reach no look. Both are written here, with the
+        // handle's other fields, and by no step every handle's
+        // constructor shares: set on the handle after it was made, in
+        // `paged_bits`, they cost a store in the clear a copy of the
+        // handle at every seal, whose thread makes one (`sh scripts/cost.sh
+        // 884443b land` at `72e04f9`, `Db::seal`), and before that two and
+        // a half instructions a key of the writer's round, in a function
+        // no line of it runs (the same count's `work` at `c1eeafb`).
+        let rests = self.shared.pager.is_some();
+        let r = Reader {
             shared: self.shared.clone(),
             counted,
             understudy: false,
-            looks: LOOKS_NONE,
+            looks: if rests {
+                LOOKS_READER_RESTS
+            } else {
+                LOOKS_NONE
+            },
             scan_ns: std::cell::Cell::new([0; 6]),
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
@@ -43495,7 +43493,11 @@ impl Reader {
             filing: std::cell::Cell::new(false),
         }
         .paged_bits()
-        .tallied())
+        .tallied();
+        if rests {
+            r.fs().abandoned.set(r.not_asked());
+        }
+        Ok(r)
     }
 }
 
