@@ -2,6 +2,9 @@
 name = "supdb"
 version = "0.1.0"
 edition = "2021"
+# The newest thing the code asks of the standard library is the atomics'
+# `try_update`; clippy holds the code to this floor (`incompatible_msrv`).
+rust-version = "1.95"
 description = "A read-optimized embedded key-multivalue store"
 license = "MIT"
 repository = "https://github.com/bfulton/supdb"

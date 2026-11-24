@@ -1,0 +1,156 @@
+#!/bin/sh
+# The suite's comparator cells held to the comparators' own tools, on one
+# machine in one job (`comparators.yml`; the rule is registered in
+# docs/engine.md, the comparators' check): RocksDB's db_bench built from the
+# very tree the suite links -- the source `librocksdb-sys` vendors, at the
+# version Cargo.lock pins -- with the tuned arm's options, and a C program
+# of a hundred lines against the LMDB `lmdb-master-sys` vendors
+# (tools/lmdb_bench.c), since LMDB ships no tool; then the suite's own
+# `rocksdb-tuned` and `lmdb` arms over the quick ladder, and the table
+# scripts/comparators.py draws of the suite's cell against the tool's on
+# the load, the point reads and the scans at every rung.
+#
+#   sh bench/scripts/comparators.sh [OUT]    # OUT defaults to comparators-ci
+#
+#   COMPARATORS_TOOLS=DIR sh bench/scripts/comparators.sh [OUT]
+#                                           # db_bench kept in DIR between runs
+#
+# Needs cmake, a C and C++ toolchain, gflags (libgflags-dev) and the Rust
+# toolchain. Gated on explicit tests and never on `set -e`, which this
+# environment's shell walks past (CLAUDE.md).
+cd "$(dirname "$0")/.." || exit 2
+out=${1:-comparators-ci}
+rm -rf "$out"
+mkdir -p "$out/tools" || exit 2
+
+# The vendored sources, fetched into the registry if they are not there.
+cargo fetch >/dev/null 2>&1 || { echo "comparators: cargo fetch failed" >&2; exit 2; }
+reg=$(ls -d "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/ 2>/dev/null | head -n 1)
+rocks_ver=$(awk '/^name = "librocksdb-sys"/ {getline; sub(/.*\+/, ""); gsub(/"/, ""); print}' Cargo.lock)
+rocks_src=$(ls -d "$reg"librocksdb-sys-*+"$rocks_ver"/rocksdb 2>/dev/null | head -n 1)
+lmdb_src=$(ls -d "$reg"lmdb-master-sys-*/lmdb/libraries/liblmdb 2>/dev/null | head -n 1)
+if [ -z "$rocks_src" ] || [ -z "$lmdb_src" ]; then
+  echo "comparators: the vendored sources are not in the registry (rocksdb $rocks_ver: '$rocks_src'; lmdb: '$lmdb_src')" >&2
+  exit 2
+fi
+echo "comparators: RocksDB $rocks_ver from $rocks_src"
+echo "comparators: LMDB from $lmdb_src"
+
+# db_bench, from the vendored tree, with no compression library, as the
+# suite's build has none. It is five minutes of RocksDB's C++, a third of
+# the job, and a function of three things: the tree, the flags below and
+# the host's compiler. So where COMPARATORS_TOOLS names a directory the
+# binary is kept there under a name made of the first two, a run that finds
+# it builds nothing, and the directory is the host's to keep: a workflow
+# caches it under a key that names its image. A kept binary one of whose
+# libraries the host no longer has is built again. gflags is linked into
+# it (GFLAGS_SHARED off, which the gflags package's own cmake file reads),
+# so that a host needs the gflags package to build the tool and nothing to
+# run a kept one.
+# The tools are compiled as the suite's comparators are, with the C and C++
+# flags bench/.cargo/config.toml gives this host's target (the machine level,
+# frame pointers as rustc has them, none of the host compiler's protections),
+# so that the check reads the harness and not two builds. db_bench takes them
+# in the release flags, which its CMake places after its own frame-pointer
+# flags, and PORTABLE=1 keeps it from adding the host's own -march.
+host=$(rustc -vV 2>/dev/null | sed -n 's/^host: //p' | tr - _)
+cfg_flags() { sed -n "s/^$1_$host *= *\"\(.*\)\"\$/\1/p" .cargo/config.toml; }
+cflags=$(cfg_flags CFLAGS)
+cxxflags=$(cfg_flags CXXFLAGS)
+if [ -z "$cflags" ] || [ -z "$cxxflags" ]; then
+  echo "comparators: .cargo/config.toml gives no C or C++ flags for the target $host" >&2
+  exit 2
+fi
+echo "comparators: the tools' C flags: $cflags"
+echo "comparators: the tools' C++ flags: $cxxflags"
+flags="-DCMAKE_BUILD_TYPE=Release -DWITH_BENCHMARK_TOOLS=ON -DWITH_GFLAGS=ON -DWITH_TESTS=OFF"
+flags="$flags -DWITH_TOOLS=OFF -DWITH_CORE_TOOLS=OFF -DWITH_TRACE_TOOLS=OFF -DWITH_SNAPPY=OFF"
+flags="$flags -DWITH_LZ4=OFF -DWITH_ZLIB=OFF -DWITH_ZSTD=OFF -DWITH_BZ2=OFF -DPORTABLE=1"
+flags="$flags -DFAIL_ON_WARNINGS=OFF -DROCKSDB_BUILD_SHARED=OFF -DGFLAGS_SHARED=OFF"
+kept=
+if [ -n "${COMPARATORS_TOOLS:-}" ]; then
+  mkdir -p "$COMPARATORS_TOOLS" || exit 2
+  tree=$(basename "$(dirname "$rocks_src")")
+  kept="$COMPARATORS_TOOLS/db_bench-$tree-$(printf '%s %s' "$flags" "$cxxflags" | cksum | cut -d' ' -f1)"
+fi
+if [ -n "$kept" ] && [ -x "$kept" ] && ! ldd "$kept" 2>/dev/null | grep -q 'not found'; then
+  echo "comparators: db_bench as kept, $kept"
+  db_bench=$kept
+else
+  # shellcheck disable=SC2086 # a list of flags
+  if ! cmake -S "$rocks_src" -B "$out/rocksdb-build" $flags \
+      "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG $cxxflags" "-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG $cflags" \
+      > "$out/tools/cmake.log" 2>&1; then
+    echo "comparators: cmake failed" >&2
+    tail -n 30 "$out/tools/cmake.log" >&2
+    exit 2
+  fi
+  if ! cmake --build "$out/rocksdb-build" --target db_bench -j"$(nproc 2>/dev/null || echo 4)" > "$out/tools/build.log" 2>&1; then
+    echo "comparators: building db_bench failed" >&2
+    tail -n 30 "$out/tools/build.log" >&2
+    exit 2
+  fi
+  db_bench="$out/rocksdb-build/db_bench"
+  [ -x "$db_bench" ] || { echo "comparators: no db_bench at $db_bench" >&2; exit 2; }
+  if [ -n "$kept" ]; then
+    # Under a name of its own first, so that a run cut here leaves no
+    # half-written binary under the name the next run trusts.
+    cp "$db_bench" "$kept.new" && mv "$kept.new" "$kept" || exit 2
+    echo "comparators: db_bench built and kept, $kept"
+  fi
+fi
+
+# The LMDB tool, against the vendored LMDB, at the level the suite's LMDB is
+# compiled at (`cc` with the release profile's opt-level) and its flags.
+# shellcheck disable=SC2086 # a list of flags
+if ! cc -O3 $cflags -o "$out/tools/lmdb_bench" tools/lmdb_bench.c "$lmdb_src/mdb.c" "$lmdb_src/midl.c" \
+    -I"$lmdb_src" -lpthread 2> "$out/tools/cc.log"; then
+  echo "comparators: building lmdb_bench failed" >&2
+  cat "$out/tools/cc.log" >&2
+  exit 2
+fi
+
+# The suite's two comparator arms over the quick ladder.
+cargo build --release --bin bench || exit 2
+./target/release/bench run --scale quick --out "$out" --arms rocksdb-tuned,lmdb || exit 2
+
+# The tools at the quick ladder's rungs. db_bench: the tuned arm's options
+# (compression off, a 256 MB block cache with the index and filter blocks
+# in it, ten Bloom bits a key, 128 MB write buffers four deep merged two
+# at a time, level 0 compacting at eight files, four background jobs), the
+# load in synced batches of a thousand, N point reads, and seeks with 99
+# nexts each for the suite's scans of a hundred entries. lmdb_bench: the
+# suite's map size and shapes, in its own doc.
+for n in 10000 30000 100000 300000; do
+  rm -rf "$out/tools/dbb"
+  if ! "$db_bench" --benchmarks=fillseq,readrandom,seekrandom --num="$n" --reads="$n" \
+      --key_size=16 --value_size=100 --batch_size=1000 --sync=1 --seek_nexts=99 \
+      --compression_type=none --cache_size=268435456 --bloom_bits=10 \
+      --cache_index_and_filter_blocks=1 --write_buffer_size=134217728 \
+      --max_write_buffer_number=4 --min_write_buffer_number_to_merge=2 \
+      --level0_file_num_compaction_trigger=8 --max_background_jobs=4 --threads=1 \
+      --verify_checksum=0 --statistics=0 --histogram=0 --db="$out/tools/dbb" \
+      --use_existing_db=0 > "$out/tools/rocksdb-$n.txt" 2>&1; then
+    echo "comparators: db_bench failed at $n" >&2
+    tail -n 20 "$out/tools/rocksdb-$n.txt" >&2
+    exit 2
+  fi
+  rm -rf "$out/tools/lmdb" && mkdir -p "$out/tools/lmdb" || exit 2
+  # `lmdb_map_gb`: three times the payload, at least 8 GB; 8 at every quick rung.
+  if ! "$out/tools/lmdb_bench" "$out/tools/lmdb" "$n" 8 1000 100 > "$out/tools/lmdb-$n.txt" 2>&1; then
+    echo "comparators: lmdb_bench failed at $n" >&2
+    cat "$out/tools/lmdb-$n.txt" >&2
+    exit 2
+  fi
+done
+rm -rf "$out/tools/dbb" "$out/tools/lmdb"
+
+# The table's verdict is this script's exit, so the table goes to its file
+# and is shown from there: piped into `tee` its status was tee's, and a
+# cell under the margin, which the table's script answers with 1, left
+# this script and the job at 0 for as long as it was written that way.
+python3 scripts/comparators.py "$out" > "$out/comparators.md"
+status=$?
+cat "$out/comparators.md"
+[ -n "${GITHUB_STEP_SUMMARY:-}" ] && cat "$out/comparators.md" >> "$GITHUB_STEP_SUMMARY"
+exit $status

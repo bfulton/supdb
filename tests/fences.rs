@@ -65,7 +65,13 @@ fn a_merge_planned_with_fences_a_landing_old_takes_the_partitions_standing_after
             seal_bytes: 32 << 10,
             partition_bytes: Some(32 << 10),
             l0_trigger: 2,
-            ..Options::default()
+            // One merge in flight: the planner joins the held merge only
+            // where it has no room for a second.
+            merge_parallel: 1,
+            // No third merge in a write-only stretch: the room is the
+            // test's (`Options::merge_parallel_quiet`).
+            merge_parallel_quiet: 0,
+            ..common::options()
         },
     )
     .unwrap();
@@ -139,7 +145,7 @@ fn the_first_partitioning_holds_its_fences_when_a_bound_cuts_nothing() {
             partition_bytes: Some(1024),
             partition_on_flush: true,
             publish_in_background: false,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -178,7 +184,7 @@ fn a_partition_rewrite_joins_its_sub_pieces_where_a_fence_can_separate_them() {
             partition_on_flush: true,
             publish_in_background: false,
             l0_trigger: 2,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -233,7 +239,7 @@ fn a_promotion_never_closes_a_partition_at_its_own_lower_fence() {
             scan_block_cache: false,
             l0_trigger: 2,
             promote: true,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -353,7 +359,7 @@ fn a_merge_writes_an_empty_partition_for_a_fence_no_input_key_lies_in() {
             l0_trigger: 2,
             promote: true,
             compact: true,
-            ..Options::default()
+            ..common::options()
         },
     )
     .unwrap();
@@ -488,7 +494,7 @@ fn a_merges_first_pass_over_the_heads_writes_what_the_records_write() {
                     partition_bytes: Some(32 << 10),
                     l0_trigger: 2,
                     merge_keys_by_heads: heads,
-                    ..Options::default()
+                    ..common::options()
                 },
             )
             .unwrap();
@@ -577,7 +583,14 @@ fn a_merges_walk_with_its_keys_kept_writes_what_a_walk_reading_every_input_write
                     l0_trigger: l0,
                     tier_pieces: tier,
                     merge_walk_cached: cached,
-                    ..Options::default()
+                    // The scan that reads the answers below has the segment
+                    // work's loop plan a merge with none in flight
+                    // (`Options::merge_plan_idle`), and the piece merge it
+                    // starts lands before the close's drain or not by the
+                    // loop's timing, which the forced form's builds, turning
+                    // the loop, make a race.
+                    merge_plan_idle: false,
+                    ..common::options()
                 },
             )
             .unwrap();
@@ -682,7 +695,7 @@ fn a_merge_drops_its_inputs_pages_behind_its_second_pass() {
                 // A drop every sixteen kilobytes, so a store of kilobytes
                 // reaches one.
                 merge_drop_chunk: 16 << 10,
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -732,6 +745,100 @@ fn a_merge_drops_its_inputs_pages_behind_its_second_pass() {
     }
 }
 
+/// A merge's writers sync their output behind them every
+/// `Options::merge_sync_ahead` bytes, on the writer's helper thread, which
+/// the writer starts the first time its output passes the stride: at
+/// sixty-four kilobytes every output of a merge that writes megabytes
+/// starts one (`Db::merge_helpers`), and at zero, the segment's own eight
+/// megabytes, no output of fewer does, and none syncs. The helpers' syncs
+/// themselves are not held to a count: the helper takes its turns when
+/// the scheduler gives it them, and under the gate's load it took none
+/// before the finish asked it to stop. The syncs move no byte: both
+/// stores' segments are the same.
+#[test]
+fn a_merges_writers_sync_behind_them_at_the_merges_own_stride() {
+    let mut dirs = Vec::new();
+    for stride in [64u64 << 10, 0] {
+        let d = scratch(&format!("merge-sync-{stride}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 1 << 20,
+                partition_bytes: Some(4 << 20),
+                l0_trigger: 2,
+                merge_sync_ahead: stride,
+                // Pieces of sixty-four kilobytes, so a merge's writer hands
+                // its helper pieces at this store's size; the segment's
+                // megabyte is more than a merge output here holds before
+                // its finish, and the helper starts at the first piece.
+                segment: supdb::SegmentOptions {
+                    write_piece: 64 << 10,
+                    ..supdb::SegmentOptions::default()
+                },
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let key = |k: u32| format!("key-{k:05}").into_bytes();
+        // Bytes that do not compress, so a merge writes its values whole.
+        let value = |k: u32, round: u32| {
+            let mut x = (u64::from(k) << 8 | u64::from(round)) | 1;
+            let mut v = format!("{round}-{k:05}-").into_bytes();
+            while v.len() < 1500 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                v.extend_from_slice(&x.to_le_bytes());
+            }
+            v
+        };
+        for k in 0..4000u32 {
+            db.append(&key(k), &value(k, 0));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        for round in 1..=2u32 {
+            for k in (0..4000u32).step_by(2) {
+                db.put(&key(k + round - 1), &value(k, round));
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+        }
+        db.settle().unwrap();
+        let (by_heads, by_records) = db.merge_key_sources();
+        assert!(by_heads + by_records > 0, "a merge ran");
+        let (helpers, syncs) = (db.merge_helpers(), db.merge_syncs());
+        if stride > 0 {
+            assert!(
+                helpers > 0,
+                "the merges' writers started their helpers: {helpers}"
+            );
+        } else {
+            assert_eq!(
+                (helpers, syncs),
+                (0, 0),
+                "no merge output reached eight megabytes"
+            );
+        }
+        db.close().unwrap();
+        dirs.push(d);
+    }
+    let names: Vec<Vec<String>> = dirs.iter().map(|d| seg_names(d)).collect();
+    assert_eq!(names[0], names[1], "the same segments");
+    for n in &names[0] {
+        let a = std::fs::read(dirs[0].join(n)).unwrap();
+        let b = std::fs::read(dirs[1].join(n)).unwrap();
+        assert_eq!(
+            without_the_clock(&a),
+            without_the_clock(&b),
+            "{n} differs between the two strides"
+        );
+    }
+    for d in &dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
 /// The segment work's loop plans a merge when none is in flight and a scan
 /// has come since its last look (`Options::merge_plan_idle`): the chain
 /// plans only at a landing, so a range left due when the last merge landed
@@ -753,7 +860,19 @@ fn a_store_read_with_no_merge_in_flight_plans_one_in_its_loop() {
                 merge_chains: true,
                 merge_bytes_cap: 0,
                 merge_plan_idle: idle,
-                ..Options::default()
+                // One merge in flight, so the second range waits for the
+                // held one's landing as the shape this is about does.
+                merge_parallel: 1,
+                // No third merge in a write-only stretch: the room is the
+                // test's (`Options::merge_parallel_quiet`).
+                merge_parallel_quiet: 0,
+                // The in-core shape: a landing chains without a scan where
+                // the gate is away from the raw form
+                // (`Options::merge_chains_writes`), as it is under the
+                // forced form, and the held merge's landing would plan
+                // the range this leaves to the loop.
+                merge_chains_writes: false,
+                ..common::options()
             },
         )
         .unwrap();
@@ -874,13 +993,20 @@ fn a_merges_landing_plans_the_next_and_a_cap_lands_a_range_at_a_time() {
                 merge_chains: chain,
                 merge_bytes_cap: cap,
                 merge_chains_writes: writes,
+                // One merge in flight, which the counts below are of: with
+                // two, the landing that finds the held merge running plans
+                // a second over the other range.
+                merge_parallel: 1,
+                // No third merge in a write-only stretch: the room is the
+                // test's (`Options::merge_parallel_quiet`).
+                merge_parallel_quiet: 0,
                 // The gate is the test's to set where it is not raw.
                 zpages: if gate == 0 {
                     supdb::ZPages::default()
                 } else {
                     supdb::ZPages::Off
                 },
-                ..Options::default()
+                ..common::options()
             },
         )
         .unwrap();
@@ -980,6 +1106,354 @@ fn a_merges_landing_plans_the_next_and_a_cap_lands_a_range_at_a_time() {
     }
 }
 
+/// The chain through a write-only stretch runs only where the writer's
+/// block forms do not cover the store
+/// (`Options::merge_chains_writes_uncovered`). The store is out of core by
+/// the test's gate and chains through writes; two ranges are made due in
+/// turn with the first merge held before its landing, and nothing reads
+/// between the last seal's landing and the merge's, so the landing plans
+/// the second range's merge only through the chain. A writer that has
+/// scanned and holds a form for every block its pieces overlay leaves the
+/// second range to the seals' plans; one whose store was never scanned, has
+/// no block cache or files none at its commits, has a budget given or its
+/// own bound, has given its forms up for the merge path, or has a point
+/// read near, chains as before, as does every store with the option off.
+#[test]
+fn a_burst_the_writers_forms_cover_is_not_chained_through() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Store {
+        Covered,
+        NeverScanned,
+        NoCache,
+        NoCommitForms,
+        /// No form filed at a commit, and a keeper that counts the scans.
+        NoCommitFormsKeeper,
+        BudgetGiven,
+        BudgetBound,
+        FormsOff,
+        /// Covered, and a point read made before the burst.
+        PointRead,
+    }
+    for (opt, store, left, merges) in [
+        (false, Store::Covered, 0usize, 2u64),
+        (true, Store::Covered, 2, 1),
+        (true, Store::NeverScanned, 0, 2),
+        (true, Store::NoCache, 0, 2),
+        (true, Store::NoCommitForms, 0, 2),
+        (true, Store::NoCommitFormsKeeper, 0, 2),
+        (true, Store::BudgetGiven, 0, 2),
+        (true, Store::BudgetBound, 0, 2),
+        (true, Store::FormsOff, 0, 2),
+        (true, Store::PointRead, 0, 2),
+    ] {
+        let d = scratch(&format!("chain-covered-{opt}-{store:?}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 32 << 10,
+                partition_bytes: Some(32 << 10),
+                l0_trigger: 2,
+                merge_chains: true,
+                merge_chains_writes: true,
+                merge_chains_writes_uncovered: opt,
+                // The planners here are the seals' landings and the chain.
+                // The scans below would have the segment work's loop plan
+                // as well (`Options::merge_plan_idle`), and its plan is
+                // counted with the landings': where it was counted after
+                // `plans0` was read, the wait for four plans ended with
+                // three seals landed, the hold came off, and the last
+                // seal's landing found the first merge finished and planned
+                // the second range itself -- three runs in a hundred of the
+                // covered store under the option, alone, and every run with
+                // the last landing held back.
+                merge_plan_idle: false,
+                merge_parallel: 1,
+                merge_parallel_quiet: 0,
+                zpages: supdb::ZPages::Off,
+                scan_block_cache: store != Store::NoCache,
+                scan_cache_ahead: false,
+                commit_forms: !matches!(store, Store::NoCommitForms | Store::NoCommitFormsKeeper),
+                snapshot_keeper: store == Store::NoCommitFormsKeeper,
+                scan_cache_bytes: if store == Store::BudgetGiven {
+                    1 << 20
+                } else {
+                    0
+                },
+                // A kilobyte the first forms pass, and no room to grow into.
+                scan_cache_auto_bytes: if store == Store::BudgetBound {
+                    1 << 10
+                } else {
+                    0
+                },
+                scan_cache_auto_room: store != Store::BudgetBound,
+                // Two scans a window, and the regime flips at its end.
+                scan_forms_off_window: 2,
+                scan_forms_off_flip: store == Store::FormsOff,
+                scan_forms_off_stale_writes: 0,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        // Out of core by the census, or by the compact form's gate where
+        // the writer is to give its forms up, which it does only there.
+        db.zgate_set(if store == Store::FormsOff { 2 } else { 1 });
+        let key = |k: u32| format!("key-{k:05}").into_bytes();
+        let mut keys: Vec<Vec<u8>> = (0..3000).map(key).collect();
+        for k in &keys {
+            db.append(k, b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let fences = partition_fences(&d);
+        assert!(fences.len() >= 3, "partitions: {fences:?}");
+        let scan = |db: &Db| {
+            let mut seen = 0usize;
+            db.scan(b"", 3000, kv(&mut |_, _| seen += 1)).unwrap();
+            assert!(seen >= 3000);
+        };
+        if store != Store::NeverScanned {
+            scan(&db);
+        }
+        // A point read probes every piece over its key, forms or none.
+        if store == Store::PointRead {
+            assert_eq!(db.count(&key(7)).unwrap(), 1);
+        }
+        let (merges0, plans0) = (db.seal_waits().merges, db.seal_waits().plans);
+        let in_range = |r: usize, round: u32, i: u32| -> Vec<u8> {
+            let (lo, hi) = &fences[r];
+            let k = [lo.as_slice(), format!("-{round}{i:03}").as_bytes()].concat();
+            assert!(k.as_slice() > lo.as_slice(), "{k:?} above {lo:?}");
+            if let Some(h) = hi {
+                assert!(k.as_slice() < h.as_slice(), "{k:?} below {h:?}");
+            }
+            k
+        };
+        db.hold_merge_landing(true);
+        let rounds = [1usize, 1, 2, 2];
+        for (round, &r) in rounds.iter().enumerate() {
+            for i in 0..200u32 {
+                let k = in_range(r, round as u32, i);
+                db.append(&k, b"n");
+                keys.push(k);
+            }
+            db.commit().unwrap();
+            // A scan over the first round's writes, before its seal: the
+            // writer's forms for the blocks they fall in, and the second
+            // scan of the window that puts the forms off where it flips.
+            // Every seal's landing after it finds the scan life it left.
+            if round == 0 && store != Store::NeverScanned {
+                scan(&db);
+            }
+            db.seal().unwrap();
+        }
+        let t = std::time::Instant::now();
+        while db.seal_waits().plans < plans0 + rounds.len() as u64 {
+            assert!(
+                t.elapsed().as_secs() < 30,
+                "the seals' landings never planned"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(db.seal_waits().merges, merges0, "nothing landed while held");
+        // The premise of the cases a state of the cache makes.
+        match store {
+            Store::BudgetBound => assert!(
+                db.cache_bindings() > 0,
+                "{store:?}: the writer's budget bound"
+            ),
+            Store::FormsOff => assert!(
+                db.forms_off_counts()[0] > 0,
+                "{store:?}: the writer gave its forms up: {:?}",
+                db.forms_off_counts()
+            ),
+            Store::Covered => assert_eq!(
+                (db.cache_bindings(), db.forms_off_counts()[0]),
+                (0, 0),
+                "{store:?}: nothing bound and no forms given up"
+            ),
+            _ => {}
+        }
+        db.hold_merge_landing(false);
+        let t = std::time::Instant::now();
+        while db.seal_waits().merges < merges0 + merges {
+            assert!(
+                t.elapsed().as_secs() < 30,
+                "option {opt} {store:?}: {} merges landed, {merges} expected",
+                db.seal_waits().merges - merges0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        db.settle().unwrap();
+        let pieces = seg_names(&d)
+            .iter()
+            .filter(|n| !n.starts_with("par-"))
+            .count();
+        assert_eq!(
+            pieces, left,
+            "option {opt} {store:?}: pieces left after the landings"
+        );
+        assert_eq!(
+            db.seal_waits().merges - merges0,
+            merges,
+            "option {opt} {store:?}: merges landed"
+        );
+        hold_to(&db, &keys);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A third merge in flight only while the writer's commits see no read
+/// and the compact form is installed (`Options::merge_parallel_quiet` at
+/// three over `merge_parallel` at two). Three ranges are made due in turn
+/// with every merge held before its landing: with the commits of a
+/// write-only stretch under the forced form the third starts beside the
+/// two, and it does not where the option is off, where a point read comes
+/// before every commit, where a read through the writer or a handle comes
+/// after the last commit and before the seal whose landing would plan it,
+/// or where the store reads the raw form -- unless the room is asked for
+/// at any gate (`Options::merge_quiet_any_gate`). Released, every merge
+/// lands, the partitions tile, and every key reads back.
+#[test]
+fn a_third_merge_runs_only_in_a_stretch_of_writes_nobody_reads() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Reads {
+        Off,
+        None,
+        BeforeEachCommit,
+        WriterAfterLastCommit,
+        HandleAfterLastCommit,
+        RawForm,
+        RawFormAnyGate,
+    }
+    for case in [
+        Reads::Off,
+        Reads::None,
+        Reads::BeforeEachCommit,
+        Reads::WriterAfterLastCommit,
+        Reads::HandleAfterLastCommit,
+        Reads::RawForm,
+        Reads::RawFormAnyGate,
+    ] {
+        let raw = matches!(case, Reads::RawForm | Reads::RawFormAnyGate);
+        let d = scratch(&format!("merge-quiet-{case:?}"));
+        let opts = || Options {
+            seal_bytes: 32 << 10,
+            partition_bytes: Some(32 << 10),
+            l0_trigger: 2,
+            merge_parallel: 2,
+            merge_parallel_quiet: if case == Reads::Off { 0 } else { 3 },
+            merge_quiet_any_gate: case == Reads::RawFormAnyGate,
+            zpages: if raw {
+                supdb::ZPages::Off
+            } else {
+                supdb::ZPages::Always
+            },
+            zpages_min_bytes: 0,
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts()).unwrap();
+        let key = |k: u32| format!("key-{k:05}").into_bytes();
+        let mut keys: Vec<Vec<u8>> = (0..4000).map(key).collect();
+        for k in &keys {
+            db.append(k, b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let fences = partition_fences(&d);
+        assert!(fences.len() >= 4, "partitions: {fences:?}");
+        let (merges0, plans0) = (db.seal_waits().merges, db.seal_waits().plans);
+        let quiet0 = db.seal_waits().merges_quiet;
+        let in_range = |r: usize, round: u32, i: u32| -> Vec<u8> {
+            let (lo, hi) = &fences[r];
+            let k = [lo.as_slice(), format!("-{round}{i:03}").as_bytes()].concat();
+            if let Some(h) = hi {
+                assert!(k.as_slice() < h.as_slice(), "{k:?} below {h:?}");
+            }
+            k
+        };
+        let handle = db.reader().unwrap();
+        db.hold_merge_landing(true);
+        // Ranges 1, 2 and 3 twice each: each second seal makes one due.
+        let rounds = [1usize, 1, 2, 2, 3, 3];
+        for (round, &r) in rounds.iter().enumerate() {
+            for i in 0..200u32 {
+                let k = in_range(r, round as u32, i);
+                db.append(&k, b"n");
+                keys.push(k);
+            }
+            if case == Reads::BeforeEachCommit {
+                let mut n = 0;
+                db.read_all(&keys[0], vf(&mut |_| n += 1)).unwrap();
+                assert_eq!(n, 1);
+            }
+            db.commit().unwrap();
+            if round == rounds.len() - 1 {
+                let mut n = 0;
+                match case {
+                    Reads::WriterAfterLastCommit => {
+                        db.read_all(&keys[1], vf(&mut |_| n += 1)).unwrap();
+                        assert_eq!(n, 1);
+                    }
+                    Reads::HandleAfterLastCommit => {
+                        handle.read_all(&keys[1], vf(&mut |_| n += 1)).unwrap();
+                        assert_eq!(n, 1);
+                    }
+                    _ => {}
+                }
+            }
+            db.seal().unwrap();
+        }
+        let t = std::time::Instant::now();
+        while db.seal_waits().plans < plans0 + rounds.len() as u64 {
+            assert!(
+                t.elapsed().as_secs() < 30,
+                "{case:?}: the seals' landings never planned"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let want = if matches!(case, Reads::None | Reads::RawFormAnyGate) {
+            3
+        } else {
+            2
+        };
+        assert_eq!(
+            db.merges_in_flight(),
+            want,
+            "{case:?}: merges in flight while held"
+        );
+        assert_eq!(
+            db.seal_waits().merges_quiet - quiet0,
+            want as u64 - 2,
+            "{case:?}: merges started past the two"
+        );
+        assert_eq!(
+            db.seal_waits().merges,
+            merges0,
+            "{case:?}: nothing landed while held"
+        );
+        db.hold_merge_landing(false);
+        drop(handle);
+        db.settle().unwrap();
+        assert_eq!(db.merges_in_flight(), 0, "{case:?}: settled");
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let after = partition_fences(&d);
+        for w in after.windows(2) {
+            assert_eq!(
+                w[0].1.as_ref(),
+                Some(&w[1].0),
+                "{case:?}: the partitions tile: {after:?}"
+            );
+        }
+        hold_to(&db, &keys);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 /// Merges in flight beside each other (`Options::merge_parallel`). A
 /// merge held before its landing over one range, and a second range made
 /// due while it runs: at one the second waits, at two it starts beside the
@@ -996,7 +1470,10 @@ fn a_second_merge_runs_beside_the_first_over_ranges_it_does_not_hold() {
             partition_bytes: Some(32 << 10),
             l0_trigger: 2,
             merge_parallel: par,
-            ..Options::default()
+            // No third merge in a write-only stretch: the room is the
+            // test's (`Options::merge_parallel_quiet`).
+            merge_parallel_quiet: 0,
+            ..common::options()
         };
         let mut db = Db::create(&d, opts()).unwrap();
         let key = |k: u32| format!("key-{k:05}").into_bytes();
@@ -1081,4 +1558,171 @@ fn a_second_merge_runs_beside_the_first_over_ranges_it_does_not_hold() {
         drop(db);
         let _ = std::fs::remove_dir_all(&d);
     }
+}
+
+/// Every value a key holds, read through the writer.
+fn values_of(db: &Db, k: &[u8]) -> Vec<Vec<u8>> {
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    db.read_all(k, vf(&mut |v| got.push(v.to_vec())))
+        .unwrap_or_else(|e| panic!("read of {:?}: {e}", String::from_utf8_lossy(k)));
+    got
+}
+
+/// Waits for `done` or fails the test with `what` after a minute.
+fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let t = std::time::Instant::now();
+    while !done() {
+        assert!(t.elapsed().as_secs() < 60, "never came: {what}");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// A piece cut at fences a re-cut replaced, beside a newer piece cut at
+/// the new ones. The first partitioning is planned against an
+/// unpartitioned store, and the merge it starts joins a merge in flight
+/// first, whose landing is a first partitioning of its own: the plan goes
+/// on with no fences, and cuts the store again from every key at fences
+/// that are no refinement of the ones standing. A piece sealed while it
+/// runs is cut at the old fences; a piece sealed after its landing, at the
+/// new; and a new range opens below the old piece's fence, so the two
+/// sorted by fence put the newer piece ahead of the older one, a read took
+/// the older piece's tombstone as the newest source and answered the value
+/// before the last put, and the merge that folded the two wrote it, which
+/// is the wrong answer the differential fuzz found under load. Built here by
+/// holding the first merge before its landing, making the planner join it,
+/// and holding the re-cut before it reads anything while the old piece is
+/// sealed: every key reads its last put through the writer, a handle and
+/// a scan, before the merge that folds the pieces, after it and after a
+/// reopen.
+#[test]
+fn a_piece_cut_at_fences_a_re_cut_replaced_reads_older_than_the_pieces_after_it() {
+    let d = scratch("re-cut");
+    let opts = || Options {
+        // Seals where the test asks for them, and partitions of a few
+        // dozen kilobytes, so that a merge from every key cuts by its
+        // inputs' bytes and the re-cut, whose inputs are one copy of the
+        // keys where the first partitioning's are two, cuts coarser.
+        seal_bytes: 64 << 20,
+        partition_bytes: Some(64 << 10),
+        l0_trigger: 2,
+        // One merge in flight, a merge where the store has none, and no
+        // merge planned at a merge's landing: what plans is the seal the
+        // test asks for.
+        merge_parallel: 1,
+        // No third merge in a write-only stretch: the room is the
+        // test's (`Options::merge_parallel_quiet`).
+        merge_parallel_quiet: 0,
+        promote: false,
+        merge_chains: false,
+        // The keys go to the memtable, not to a run of ordered ingest.
+        direct_ingest: false,
+        ..common::options()
+    };
+    let mut db = Db::create(&d, opts()).unwrap();
+    let n = 4000u32;
+    let key = |k: u32| format!("key-{k:05}").into_bytes();
+    let val = |tag: &str| format!("{tag:-<64}").into_bytes();
+    // Two pieces of every key, a scrambled order, and the second piece's
+    // landing starts the first partitioning, held before its landing.
+    db.hold_merge_landing(true);
+    for tag in ["a", "b"] {
+        for i in 0..n {
+            db.put(&key((i * 7919) % n), &val(tag));
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+    }
+    wait_for("the first partitioning", || db.merges_in_flight() == 1);
+    // A third piece, sealed with the store unpartitioned: its landing plans
+    // the first partitioning again and joins the one in flight first.
+    for i in (0..n).step_by(97) {
+        db.put(&key(i), &val("c"));
+    }
+    db.commit().unwrap();
+    db.plan_joins_merge(true);
+    db.seal().unwrap();
+    wait_for("the planner's join", || db.merge_plan_joining());
+    db.hold_merge_start(true);
+    db.hold_merge_landing(false);
+    wait_for("the re-cut started after the first landed", || {
+        !db.merge_plan_joining() && db.merges_in_flight() == 1
+    });
+    db.plan_joins_merge(false);
+    let old = partition_fences(&d);
+    assert!(old.len() >= 4, "the first partitioning: {old:?}");
+    assert_eq!(
+        db.levels(),
+        (old.len(), 1),
+        "the partitions and the third piece"
+    );
+    // A key at each old partition's lower fence, put while the re-cut holds,
+    // in a piece cut at the old fences.
+    let probes: Vec<Vec<u8>> = old.iter().skip(1).map(|f| f.0.clone()).collect();
+    let plans = db.seal_waits().plans;
+    for k in &probes {
+        db.put(k, &val("old"));
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    wait_for("the old piece's landing", || db.seal_waits().plans > plans);
+    // Counted once the landing has published and retired its inputs.
+    let merges = db.seal_waits().merges;
+    db.hold_merge_start(false);
+    wait_for("the re-cut's landing", || db.seal_waits().merges > merges);
+    let new = partition_fences(&d);
+    let straddled: Vec<&Vec<u8>> = probes
+        .iter()
+        .filter(|k| !new.iter().any(|f| &f.0 == *k))
+        .collect();
+    assert!(
+        !straddled.is_empty(),
+        "a new partition opens below an old fence: old {old:?}, new {new:?}"
+    );
+    // The same keys put again, in a piece cut at the new fences; its landing
+    // plans the merge that folds the two, held before it reads anything.
+    db.hold_merge_start(true);
+    let plans = db.seal_waits().plans;
+    for k in &probes {
+        db.put(k, &val("new"));
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    wait_for("the new piece's landing", || db.seal_waits().plans > plans);
+    let want = vec![val("new")];
+    let read_back = |db: &Db, when: &str| {
+        let h = db.reader().unwrap();
+        for k in &probes {
+            let name = String::from_utf8_lossy(k).into_owned();
+            assert_eq!(
+                values_of(db, k),
+                want,
+                "{when}: the writer's read of {name}"
+            );
+            let mut got: Vec<Vec<u8>> = Vec::new();
+            h.read_all(k, vf(&mut |v| got.push(v.to_vec()))).unwrap();
+            assert_eq!(got, want, "{when}: a handle's read of {name}");
+            let mut scanned: Vec<Vec<u8>> = Vec::new();
+            db.scan(
+                k,
+                1,
+                kv(&mut |sk, v| {
+                    assert_eq!(sk, k.as_slice(), "{when}: the scan from {name}");
+                    scanned.push(v.to_vec());
+                }),
+            )
+            .unwrap();
+            assert_eq!(scanned, want, "{when}: the scan from {name}");
+        }
+    };
+    read_back(&db, "beside the old piece");
+    db.hold_merge_start(false);
+    db.settle().unwrap();
+    read_back(&db, "the pieces folded");
+    db.flush().unwrap();
+    read_back(&db, "flushed");
+    drop(db);
+    let db = Db::open(&d, opts()).unwrap();
+    read_back(&db, "reopened");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
 }

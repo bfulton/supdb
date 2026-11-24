@@ -6,17 +6,24 @@ use supdb_bench::bound::Bound;
 use supdb_bench::ledger::{self, Ledger};
 use supdb_bench::{engines, env, figures, gate, row, run, Scale};
 
+/// Every allocation counted by its thread (`alloc_census`), in a build
+/// made to ask whose memory the allocator kept and in no other.
+#[cfg(feature = "alloc-census")]
+#[global_allocator]
+static ALLOC: supdb_bench::alloc_census::Counting = supdb_bench::alloc_census::Counting;
+
 const USAGE: &str = "\
 usage:
   bench run --scale quick|full [--out DIR] [--arms a,b,...] [--top KEYS] [--bottom KEYS] [--reps N]
-            [--fresh-process|--one-process]
+            [--keys numbered|ids] [--fresh-process|--one-process] [--passes a,b,...]
   bench run --scale ooc --bound BYTES [--ops-div N] [the options above]
   bench run --resume DIR [--reps N] [--resume-passes]
   bench ab --arms A,B [--size KEYS] [--reps N] [--len ENTRIES] [--pairs TEXT] [--bound BYTES] [--passes a,b,...]
-           [--ops-div N] [--compress FRACTION] [--fresh-process|--one-process]
+           [--ops-div N] [--compress FRACTION] [--keys numbered|ids] [--fresh-process|--one-process]
   bench gate ROW.json [--runs DIR]
   bench figures [--runs DIR] [--out DIR] [--scale quick|full|ooc]
   bench machine
+  bench stamp
 
 run    measures every arm over the size ladder and writes runs/<scale>/<utc>-<sha7>.json
        --out   directory holding runs/ (default: runs)
@@ -27,12 +34,22 @@ run    measures every arm over the size ladder and writes runs/<scale>/<utc>-<sh
                ooc 10000000)
        --bottom the ladder's bottom rung in keys (default: the whole ladder from 10000; ooc 3000000)
        --reps  repetitions per size and arm (default: quick 5, full 7, ooc 3)
-       --bound the memory the run may use, in bytes, enforced by a cgroup of the run's own:
-               required at ooc, refused at quick and full. The process is moved into the
-               group before anything is measured, the limit as read back goes into the row's
-               class, and a bound too small for the floors is refused before the floors
+       --keys  what the stores' keys are (default numbered: sixteen digits of the key's index,
+               a dense run of numbers; ids: sixteen hex digits of a random 64-bit id). A row
+               of ids is a series of its own: its class ends in /kids, and the gate and the
+               figures read it beside the numbered rows of the same machine, never with them
+       --bound the memory the run may use, in bytes, enforced by a cgroup: required at ooc,
+               refused at quick and full. Under cgroup v1 the run makes a group of its own
+               and moves into it before anything is measured; under v2 alone it attaches to
+               the group it was started in, whose limit has to be this number (systemd-run
+               -p MemoryMax=BYTES -p MemorySwapMax=0). The limit as read back goes into the
+               row's class, and a bound too small for the floors is refused before the floors
        --ops-div what the read passes' operation counts are divided by at ooc (default 10);
                loads and bursts are never divided, and no divided count goes below 1000
+       --passes as for ab: the passes the row is made of, where it is not to be the series'
+               whole row; it is then written under <out>/passes/<scale>/, which neither the
+               gate nor the figures read. mixes-threaded, the gets and puts from several
+               threads at once, is in no row unless named here
        --resume DIR  take up the run whose ledger is DIR (<out>/inflight/<utc>-<sha7>, what a run
                that was cut leaves): the same binary, class and bound, the plan the ledger's,
                every whole rep kept and a cut rep taken again whole. --reps may raise the
@@ -52,12 +69,17 @@ ab     two arms in one process, alternating and paired rep by rep, for choosing
        --bound as for run: the pairing under a memory bound, with the counts per
                operation a bounded row records paired like any other quantity.
        --passes a comma-separated subset of load,read,read-threaded,scan,scan-threaded,
-               mixes,scan-mixed,lag (default: all), for a question one phase answers
-               at a rung where the whole pass is an hour.
+               mixes,scan-mixed,mixes-scrambled,lag,recover,mixes-threaded (default: all but
+               recover and mixes-threaded),
+               for a question one phase answers at a rung where the whole pass is an hour.
        --ops-div as for run, here at any scale (default 1): the read passes' counts
                divided, for a pairing at a rung where the whole pass is an hour.
        --compress the fraction of each value that is a repeated phrase (default 0.5,
                the suite's); 0.0 is the incompressible control for a compact form.
+       --keys  what the stores' keys are: numbered, db_bench's sixteen decimal digits of the
+               key's index and every row's (the default), or ids, sixteen hex digits of a
+               random 64-bit id that ascends with the index, so no key is the next number
+               after another and a key inserted later falls among the loaded ones.
        --fresh-process each pass in a process of its own, --one-process both arms in this one
                (default: fresh under a bound, one in core); a pass killed under the bound
                loses its rep's pair, the pairing goes on, and the command exits 137.
@@ -115,9 +137,25 @@ fn enter_bound(bytes: u64) -> Result<Bound, String> {
         b.limit(),
         b.group().display()
     );
+    eprintln!(
+        "bench: {}",
+        match b.mode() {
+            supdb_bench::bound::Mode::PerPass =>
+                "each pass in a group of its own with the bound on it, this process in none",
+            supdb_bench::bound::Mode::Shared =>
+                "the passes share this process's group, which a wrapper bounded (cgroup v2, \
+                 not delegated): each pass records what the group held at its start",
+        }
+    );
     run::probe_counts(&b).map_err(|e| format!("refused: {e}"))?;
     Ok(b)
 }
+
+/// The refusal of `--one-process` under `--bound`: a bound is each pass's
+/// own process's (`bound::Bound::pass`), and a pass in this process has none.
+const ONE_PROCESS_BOUND: &str =
+    "refused: --one-process under --bound: the bound is each pass's own process's, and a pass in \
+     this process would run outside it";
 
 struct Args(Vec<String>);
 impl Args {
@@ -137,9 +175,39 @@ impl Args {
 }
 
 fn main() {
+    // The machine level the suite is compiled to (`.cargo/config.toml`)
+    // against the host's, before anything runs: a binary of instructions
+    // its host lacks dies of an illegal instruction wherever the first one
+    // is, which names nothing. On x86-64 a constructor `build.rs` writes
+    // has asked already, since RocksDB's C++ static initialisers run before
+    // this and are the first such instructions; this is the answer on ARM.
+    let missing = env::level_missing();
+    if !missing.is_empty() {
+        eprintln!(
+            "bench: this binary is compiled to a machine level this host lacks ({}); the \
+             suite's level is bench/.cargo/config.toml's",
+            missing.join(", ")
+        );
+        std::process::exit(2);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(|s| s.as_str()) {
         Some("run") => cmd_run(Args(args[1..].to_vec())),
+        // The recovery workloads' writer (`run::crash_load_child`), spawned
+        // by a pass and killed by it: it returns only where it failed.
+        Some("crash-load") => match args.get(1) {
+            Some(spec) => match run::crash_load_child(std::path::Path::new(spec)) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("crash-load failed: {e}");
+                    2
+                }
+            },
+            None => {
+                eprintln!("crash-load SPEC: the spec file a pass wrote is required");
+                2
+            }
+        },
         // A pass's own process (`run::one_pass_child`), spawned by `run`.
         Some("one-pass") => match args.get(1) {
             Some(spec) => match run::one_pass_child(std::path::Path::new(spec)) {
@@ -158,6 +226,14 @@ fn main() {
         Some("gate") => cmd_gate(Args(args[1..].to_vec())),
         Some("figures") => cmd_figures(Args(args[1..].to_vec())),
         Some("machine") => cmd_machine(),
+        // The binary's stamp of the engine it was built from, of its
+        // compiler and of the flags its engines were compiled with, as every
+        // row carries them, the engine's first: for a script that will not
+        // bank a row of a tree with uncommitted changes (`scripts/ooc.sh`).
+        Some("stamp") => {
+            println!("{} {}; {}", run::sha(), run::rustc(), run::build());
+            0
+        }
         _ => {
             eprintln!("{USAGE}");
             2
@@ -183,6 +259,8 @@ fn cmd_machine() -> i32 {
         machine: m,
         killed: vec![],
         resumptions: vec![],
+        keys: Default::default(),
+        build: String::new(),
         measurements: vec![],
     };
     println!("class: {}", probe.class());
@@ -296,7 +374,10 @@ fn cmd_ab(a: Args) -> i32 {
                 return 2;
             }
         },
-        None => run::Passes::all(),
+        // Every pass a pairing has always run: the recovery workloads are
+        // two stores more an arm a rep, and a pairing runs them when it
+        // names them.
+        None => run::Passes::paired(),
     };
     // The bound first, before the machine capture and the plan's threads:
     // a cgroup v1 move takes the whole thread group, and the pairing's
@@ -326,6 +407,14 @@ fn cmd_ab(a: Args) -> i32 {
     } else if a.has("--one-process") {
         plan.fresh_process = false;
     }
+    if plan.bound.is_some() && !plan.fresh_process {
+        eprintln!("bench ab: {ONE_PROCESS_BOUND}");
+        return 2;
+    }
+    // The test's seam: memory this process touches and holds for the
+    // pairing's length, which no pass's bound may see
+    // (`tests/bound_isolation.rs`).
+    let _ballast = run::parent_ballast();
     if let Some(l) = a.num("--len") {
         plan.scan_len = (l as usize).max(1);
     }
@@ -347,8 +436,21 @@ fn cmd_ab(a: Args) -> i32 {
             }
         }
     }
+    if let Some(text) = a.get("--keys") {
+        match supdb_bench::workload::KeyShape::parse(text) {
+            Some(k) => plan.keys = k,
+            None => {
+                eprintln!("--keys takes numbered or ids\n\n{USAGE}");
+                return 2;
+            }
+        }
+    }
     eprintln!(
-        "bench ab: {a0} against {b0} at {size} keys, scans of {}, {reps} pairs{}{}{}{}{}",
+        "bench ab: {a0} against {b0} at {size} keys{}, scans of {}, {reps} pairs{}{}{}{}{}",
+        match plan.keys {
+            supdb_bench::workload::KeyShape::Numbered => String::new(),
+            k => format!(" ({} for keys)", k.name()),
+        },
         plan.scan_len,
         if plan.fresh_process {
             ", each pass in a process of its own"
@@ -359,7 +461,7 @@ fn cmd_ab(a: Args) -> i32 {
             Some(b) => format!(", under a bound of {b} bytes"),
             None => String::new(),
         },
-        if plan.passes == run::Passes::all() {
+        if plan.passes == run::Passes::paired() {
             String::new()
         } else {
             format!(", passes {}", a.get("--passes").unwrap_or_default())
@@ -515,6 +617,7 @@ fn cmd_resume(dir: &Path, a: Args) -> i32 {
         "--top",
         "--bottom",
         "--ops-div",
+        "--keys",
         "--fresh-process",
         "--one-process",
     ] {
@@ -604,7 +707,7 @@ fn cmd_resume(dir: &Path, a: Args) -> i32 {
     };
     let mut machine = env::capture();
     machine.mem_limit_bytes = bound.as_ref().map(Bound::limit);
-    if let Some(why) = ledger::refusal(&head, run::sha(), run::rustc(), &machine) {
+    if let Some(why) = ledger::refusal(&head, run::sha(), run::rustc(), run::build(), &machine) {
         eprintln!("bench run: refused: {why}");
         let _ = std::fs::remove_dir_all(&root);
         return 1;
@@ -691,6 +794,18 @@ fn cmd_run(a: Args) -> i32 {
             }
         },
         None => run::OOC_OPS_DIV,
+    };
+    // The keys' shape, refused here with the other options: an unknown one
+    // would otherwise be a row of numbered keys under a flag that said not.
+    let keys = match a.get("--keys") {
+        Some(text) => match supdb_bench::workload::KeyShape::parse(text) {
+            Some(k) => k,
+            None => {
+                eprintln!("--keys takes numbered or ids\n\n{USAGE}");
+                return 2;
+            }
+        },
+        None => supdb_bench::workload::KeyShape::Numbered,
     };
     // The bound's number, checked before anything is written: a bound
     // that is refused costs no scan floor's file, and the floor file is
@@ -809,10 +924,31 @@ fn cmd_run(a: Args) -> i32 {
     if let Some(r) = reps {
         plan.reps = r as usize;
     }
+    plan.keys = keys;
+    // A row of some passes is not a row of the series: the gate's window
+    // and the figures read `<out>/<scale>/`, and a row there that lacks most
+    // of its quantities would stand in both as one of the last ten. It is
+    // written under `<out>/passes/<scale>/`, its ledger beside it.
+    let out = if let Some(list) = a.get("--passes") {
+        match run::Passes::parse(list) {
+            Ok(p) => plan.passes = p,
+            Err(e) => {
+                eprintln!("{e}\n\n{USAGE}");
+                return 2;
+            }
+        }
+        out.join("passes")
+    } else {
+        out
+    };
     if a.has("--fresh-process") {
         plan.fresh_process = true;
     } else if a.has("--one-process") {
         plan.fresh_process = false;
+    }
+    if plan.bound.is_some() && !plan.fresh_process {
+        eprintln!("bench run: {ONE_PROCESS_BOUND}");
+        return 2;
     }
 
     // The rungs, not just the top: with a bottom set, the top alone does not
@@ -820,7 +956,7 @@ fn cmd_run(a: Args) -> i32 {
     // run that never finishes leaves behind.
     let rungs = supdb_bench::ladder_from(plan.bottom, top);
     eprintln!(
-        "bench run: scale {} on {} ({} reps, rungs {}, arms {}{})",
+        "bench run: scale {} on {} ({} reps, rungs {}, arms {}{}{})",
         scale.as_str(),
         machine.cpu_model,
         plan.reps,
@@ -833,6 +969,10 @@ fn cmd_run(a: Args) -> i32 {
         match machine.mem_limit_bytes {
             Some(b) => format!(", bound {b} bytes, ops divided by {}", plan.ops_div),
             None => String::new(),
+        },
+        match plan.keys {
+            supdb_bench::workload::KeyShape::Numbered => String::new(),
+            k => format!(", {} for keys", k.name()),
         }
     );
     let mut log = |s: &str| eprintln!("{s}");

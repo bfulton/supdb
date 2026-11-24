@@ -25,6 +25,33 @@ fn shape(c: &[(&'static str, f64)]) -> String {
     )
 }
 
+/// The second form as the counters hold it: the partitions, the form files
+/// and the stride files among them, the reads a form file answered and the
+/// stride files' share, the pages those checked at a first touch, and the
+/// builds, the stride builds and the stride form's declines by reason -- so
+/// a forced arm's pass is read for the form that served it before its rate.
+fn form(c: &[(&'static str, f64)]) -> String {
+    let declined: Vec<String> = c
+        .iter()
+        .filter(|(n, v)| n.starts_with("zpage_stride_no_") && *v > 0.0)
+        .map(|(n, v)| format!("{}={v:.0}", &n["zpage_stride_no_".len()..]))
+        .collect();
+    format!(
+        "parts {:.0} files {:.0} stride_files {:.0} reads {:.0} stride_reads {:.0} checks {:.0} cursor {:.0} raw {:.0} builds {:.0} stride_builds {:.0} declined [{}]",
+        get(c, "zpage_partitions_at_end"),
+        get(c, "zpage_form files_at_end"),
+        get(c, "zpage_stride_files_at_end"),
+        get(c, "zpage_reads"),
+        get(c, "zpage_stride_reads"),
+        get(c, "zpage_stride_page_checks"),
+        get(c, "zpage_stride_cursor_reads"),
+        get(c, "zpage_rawserves"),
+        get(c, "zpage_builds"),
+        get(c, "zpage_stride_builds"),
+        declined.join(" "),
+    )
+}
+
 /// This thread's minor and major faults, user and system ticks, and its
 /// voluntary and involuntary context switches, from procfs.
 fn usage() -> [u64; 6] {
@@ -150,6 +177,8 @@ fn main() {
         println!("  pass 1 {r1:.2}M/s [{}]  {}", f(&w1), fmt_usage(&u1));
         println!("  pass 2 {r2:.2}M/s [{}]  {}", f(&w2), fmt_usage(&u2));
         println!("  after: {}", shape(&c3));
+        println!("  form after sync: {}", form(&c0));
+        println!("  form after:      {}", form(&c3));
         drop(e);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -175,7 +175,10 @@
 //!   the form is served as it stands.
 //!
 //! The model's arithmetic (S1) is here too, as pure functions of byte counts:
-//! [`model_raw`], [`model_z`] and [`ski_rental_price`].
+//! [`model_raw`], [`model_z`] and [`ski_rental_price`]. [`model_populations`]
+//! is the first of them over any populations of pages, each read at its own
+//! rate, which is what a choice of form a partition would be priced by; the
+//! selector reads it for the raw form's two regions and nothing else yet.
 
 use std::time::Duration;
 
@@ -353,41 +356,51 @@ pub const PRIOR_T_Z_SCAN: f64 = 11.3e-6;
 
 // ---- S1's arithmetic ----------------------------------------------------
 
-/// The raw form's faults a point read, by Che's approximation to LRU over the
-/// two populations a read touches uniformly: one page of the hash region and
-/// one page of the record region.
+/// A population of pages read uniformly: its bytes, and the touches a page
+/// of it takes in whatever unit the caller counts in -- one a read for a
+/// region every read touches a page of, a partition's reads in a window for
+/// that partition's part of a form.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Population {
+    pub bytes: u64,
+    pub touches: f64,
+}
+
+/// The faults of a cache of `budget` bytes over populations each read
+/// uniformly at its own rate, by Che's approximation to LRU, in the unit the
+/// touches are counted in.
 ///
-/// `T` solves `n_h (1 - e^(-T/n_h)) + n_r (1 - e^(-T/n_r)) = B / 4096` for
-/// `n_h = hash / 4096` and `n_r = records / 4096`, and the rate is
-/// `e^(-T/n_h) + e^(-T/n_r)`. It is 0 while both fit, and it exceeds 1 once
-/// the hash stops fitting: a model with one population saturates at one fault
-/// a read, and a store far past its cache would then look as if the compact
-/// form saved nothing, when the raw form is taking two faults a read.
-pub fn model_raw(budget: u64, hash: u64, records: u64) -> f64 {
+/// `T` solves `sum n_i (1 - e^(-r_i T / n_i)) = B / 4096` for `n_i` the
+/// population's pages and `r_i` its touches, and the faults are
+/// `sum r_i e^(-r_i T / n_i)`: a page is in the cache while it was touched
+/// within `T`, the time in which the touched pages fill it. It is 0 while
+/// the populations that are touched at all fit, and a population nobody
+/// touches takes no room. What it does not see is skew inside a population,
+/// which it reads as uniform and so over-counts, and what the cache held
+/// before the rates were what they are: it is the steady state's rate
+/// (`bench/examples/formfit.rs` holds it to an exact cache over the suite's
+/// passes).
+pub fn model_populations(budget: u64, pops: &[Population]) -> f64 {
     let page = PAGE as f64;
-    let (c, nh, nr) = (
-        budget as f64 / page,
-        hash as f64 / page,
-        records as f64 / page,
-    );
-    if nh + nr <= c {
+    let c = budget as f64 / page;
+    let live = || {
+        pops.iter()
+            .filter(|p| p.bytes > 0 && p.touches > 0.0)
+            .map(|p| (p.bytes as f64 / page, p.touches))
+    };
+    if live().map(|p| p.0).sum::<f64>() <= c {
         return 0.0;
     }
-    let populations = f64::from(u8::from(nh > 0.0)) + f64::from(u8::from(nr > 0.0));
+    let all: f64 = live().map(|p| p.1).sum();
     if c <= 0.0 {
-        return populations;
+        return all;
     }
     let filled = |t: f64| {
-        let part = |n: f64| {
-            if n > 0.0 {
-                n * (1.0 - (-t / n).exp())
-            } else {
-                0.0
-            }
-        };
-        part(nh) + part(nr)
+        live()
+            .map(|(n, r)| n * (1.0 - (-r * t / n).exp()))
+            .sum::<f64>()
     };
-    // The bracket: `filled` rises from 0 to nh + nr, which is over `c`.
+    // The bracket: `filled` rises from 0 to the live pages, which are over `c`.
     let (mut lo, mut hi) = (0.0f64, c.max(1.0));
     for _ in 0..200 {
         if filled(hi) >= c {
@@ -405,8 +418,26 @@ pub fn model_raw(budget: u64, hash: u64, records: u64) -> f64 {
         }
     }
     let t = 0.5 * (lo + hi);
-    let miss = |n: f64| if n > 0.0 { (-t / n).exp() } else { 0.0 };
-    (miss(nh) + miss(nr)).clamp(0.0, populations)
+    live()
+        .map(|(n, r)| r * (-r * t / n).exp())
+        .sum::<f64>()
+        .clamp(0.0, all)
+}
+
+/// The raw form's faults a point read: [`model_populations`] over the two
+/// populations a read touches a page of uniformly, the hash region and the
+/// record region.
+///
+/// It is 0 while both fit, and it exceeds 1 once the hash stops fitting: a
+/// model with one population saturates at one fault a read, and a store far
+/// past its cache would then look as if the compact form saved nothing, when
+/// the raw form is taking two faults a read.
+pub fn model_raw(budget: u64, hash: u64, records: u64) -> f64 {
+    let region = |bytes| Population {
+        bytes,
+        touches: 1.0,
+    };
+    model_populations(budget, &[region(hash), region(records)])
 }
 
 /// The compact form's faults a point read: one population read uniformly,
@@ -441,22 +472,332 @@ pub struct FormSize {
     pub resident: u64,
 }
 
+/// The share of the budget a form the selector builds may fill, the rest
+/// left to the page cache's other tenants -- the partitions the form does
+/// not cover yet, the files a write mix lands, the indexes -- and to the
+/// budget's own fall through a mix as the process's memory grows, which
+/// the next sample subtracts and the pick's sample cannot: at ten million
+/// keys under 1.25 GiB the budget read 1.2 GB at the load's end and 0.87
+/// through E. One line for the coding's pick ([`choose_coding`]) and the
+/// re-code policy's fill (`Options::zpages_recode_auto`).
+pub const FORM_FILL: f64 = 0.85;
+
+/// [`FORM_FILL`] of a budget, in bytes.
+pub fn form_fill(budget: u64) -> u64 {
+    (budget as f64 * FORM_FILL) as u64
+}
+
 /// The coding to build in, with the raw-tail form sized: the raw tails where
-/// [`model_z`] predicts that form faults nothing against the budget, the
-/// block coding otherwise. The line is at no predicted fault at all, since a
-/// form that faults a little loses more than it wins: at five million keys
-/// under 640 MiB the raw-tail form's 556 MB against a budget of about 490 MiB
-/// (the limit less the process's 90 and the margin's 64) predicts about a
-/// tenth of a fault a read and took 0.02-0.03, with D and E 1.4-1.5x slower
-/// for them where the point-read mixes read 1.3x faster, and the block
-/// form's 360 MB predicts none and took none. A size of zero is a form the
-/// sampler declined, and the block coding stands for it.
+/// [`model_z`] predicts that form faults nothing against [`FORM_FILL`] of
+/// the budget, the block coding otherwise. The line is at no predicted
+/// fault at all, since a form that faults a little loses more than it wins:
+/// at five million keys under 640 MiB the raw-tail form's 556 MB against a
+/// budget of about 490 MiB (the limit less the process's 90 and the
+/// margin's 64) predicts about a tenth of a fault a read and took
+/// 0.02-0.03, with D and E 1.4-1.5x slower for them where the point-read
+/// mixes read 1.3x faster, and the block form's 360 MB predicts none and
+/// took none. And it is drawn at the fill share and not at the budget
+/// itself, since a pick holds for the builds after it while the budget
+/// moves: at ten million keys under 1.25 GiB the raw-tail form sat at
+/// 97-99% of the budget, the sampler counted 28 partitions with one in
+/// flight in one pass of four and 29 in the others, and a line at the
+/// budget flipped with the count -- the pass that bought the raw tails
+/// refaulted through every mix, C and E at 2.6-2.8 and 2.0-2.3 times the
+/// others' (`docs/engine.md`). A size of zero is a form the sampler
+/// declined, and the block coding stands for it.
 pub fn choose_coding(budget: u64, raw_tails: FormSize) -> Coding {
-    if raw_tails.w_z > 0 && model_z(budget, raw_tails.resident, raw_tails.w_z) <= 0.0 {
+    let fill = form_fill(budget);
+    if raw_tails.w_z > 0 && model_z(fill, raw_tails.resident, raw_tails.w_z) <= 0.0 {
         Coding::RawTails
     } else {
         Coding::Block
     }
+}
+
+/// Whether a store whose partitions' values alone are `stride` bytes, the
+/// stride form's size, fits `budget` beside `other`, the bytes of what its
+/// reads touch that is no form's: the level-0 pieces a scan reads a page of
+/// in every block. The whole store and not the partition a build is of,
+/// since a partition's stride form fits or does not with the rest of the
+/// store's, and the budget as it is where the question is asked, since a
+/// rewriting burst's pieces and the process's own memory take from it what
+/// they hold then (`Options::zpages_stride_room`).
+pub fn stride_fits(budget: u64, stride: u64, other: u64) -> bool {
+    stride.saturating_add(other) <= budget
+}
+
+/// One partition a form file serves, as the choice between the block form
+/// and the stride form sees it (`Options::zpages_stride_convert`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FormPart {
+    /// Served in the stride form now; in the block form otherwise.
+    pub stride: bool,
+    /// Whether it may be asked for the stride form: a partition the form
+    /// declined keeps the reason and is not asked again.
+    pub can_stride: bool,
+    /// What it holds of the page cache in the block form, its form file
+    /// and the heads its scans seek, and in the stride form, its values.
+    pub block_bytes: u64,
+    pub stride_bytes: u64,
+    /// Its reads a second as the groups of the block form they open: a
+    /// block file's decodes and opens, and a stride file's reads counted as
+    /// the groups a block file would have opened for them. The two are not
+    /// quite one unit -- a block file's read the memo of decoded groups
+    /// answers decodes nothing and counts nothing, and a stride file counts
+    /// every read -- so a partition reads hotter in the stride form than
+    /// the same reads would in the block form, which holds it there.
+    pub touches: f64,
+}
+
+impl FormPart {
+    fn bytes(&self, stride: bool) -> u64 {
+        if stride {
+            self.stride_bytes
+        } else {
+            self.block_bytes
+        }
+    }
+
+    /// The touches a byte the stride form costs over the block form: what
+    /// the partitions are ranked by, the most first into the stride form
+    /// and the least first out of it. A stride form no larger than the
+    /// block form ranks before every other.
+    fn density(&self) -> f64 {
+        let extra = self.stride_bytes.saturating_sub(self.block_bytes);
+        if extra == 0 {
+            f64::INFINITY
+        } else {
+            self.touches / extra as f64
+        }
+    }
+}
+
+/// What the two forms' reads cost, seconds: a touch through the block form
+/// over one through the stride form, which is the decode, and a fault.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FormCosts {
+    pub t_decode: f64,
+    pub t_fault: f64,
+}
+
+/// A partition's move between the two forms, by its place in the parts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Conversion {
+    ToStride(usize),
+    ToBlock(usize),
+}
+
+/// What the reads of `parts` as they stand cost a second of wall, seconds,
+/// in a cache of `capacity` bytes: the decodes of the partitions in the
+/// block form and the faults [`model_populations`] predicts over every
+/// partition's bytes in the form it is in.
+pub fn forms_cost(capacity: u64, parts: &[FormPart], costs: FormCosts) -> f64 {
+    let pops: Vec<Population> = parts
+        .iter()
+        .map(|p| Population {
+            bytes: p.bytes(p.stride),
+            touches: p.touches,
+        })
+        .collect();
+    let decodes: f64 = parts
+        .iter()
+        .filter(|p| !p.stride)
+        .map(|p| p.touches * costs.t_decode)
+        .sum();
+    decodes + costs.t_fault * model_populations(capacity, &pops)
+}
+
+/// How many times the reads a period held are of what the touches the
+/// periods have left say: `now`, the period's touches a second, over
+/// `smoothed`, those partitions' smoothed touches, and nothing where there
+/// is nothing to go by. [`forms_cost`] is the touches' in the first degree
+/// -- the decodes are a sum over them, and the model's faults at touches
+/// `k` times as many are `k` times the faults, its characteristic time a
+/// `k`th -- so a gain priced over the smoothed touches times this is the
+/// gain at the period's own reads in the shares the smoothed touches give
+/// the partitions. What a move would have saved over a period is that: the
+/// smoothed touches alone say a tenth of a pass's reads a second into it
+/// and a tenth of them still a time constant after its end.
+pub fn intensity(now: f64, smoothed: f64) -> f64 {
+    if smoothed > 0.0 && now.is_finite() && now > 0.0 {
+        now / smoothed
+    } else {
+        0.0
+    }
+}
+
+/// The cache [`conversions`] judges a move out in and the one it judges a
+/// move in in, bytes, for a budget of `budget` with `other` bytes standing
+/// in the cache beside the forms -- the level-0 pieces' payload, the raw
+/// form of a partition no form file serves: the budget less them, and
+/// [`FORM_FILL`] of the budget less them.
+pub fn conversion_room(budget: u64, other: u64) -> (u64, u64) {
+    (
+        budget.saturating_sub(other),
+        form_fill(budget).saturating_sub(other),
+    )
+}
+
+/// Whether a saving of `gain` on a cost of `cost` is one: more than the
+/// rounding two sums of the same terms in another order differ by.
+fn pays(gain: f64, cost: f64) -> bool {
+    gain > 1e-9 * cost
+}
+
+/// The most candidates a side of [`conversions`] prices through the model.
+const CONVERSION_CANDIDATES: usize = 16;
+
+/// A partition's move between the two forms as [`conversions_priced`]
+/// prices it: what it would save a second of wall, seconds, with the moves
+/// priced before it that pay made -- less than nothing where the partition
+/// is better as it is -- and whether it pays.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PricedMove {
+    pub conv: Conversion,
+    pub gain: f64,
+    pub pays: bool,
+}
+
+/// The moves between the two forms that [`forms_cost`] says pay, each with
+/// what it saves a second of wall, seconds: [`conversions_priced`]'s that
+/// pay, in its order.
+pub fn conversions(
+    capacity: u64,
+    fill: u64,
+    parts: &[FormPart],
+    costs: FormCosts,
+) -> Vec<(Conversion, f64)> {
+    conversions_priced(capacity, fill, parts, costs)
+        .into_iter()
+        .filter(|m| m.pays)
+        .map(|m| (m.conv, m.gain))
+        .collect()
+}
+
+/// Every move between the two forms that is priced, with what it would
+/// save a second of wall and whether it pays.
+///
+/// Into the stride form, judged in a cache of `fill` bytes: a partition in
+/// the block form that may be asked, the most touches a byte of the stride
+/// form's extra first, and of those that tie the lowest in key order. Out
+/// of it, judged in a cache of `capacity` bytes: a partition in the stride
+/// form, the fewest touches a byte first, and of those that tie the highest
+/// in key order -- the reads say nothing between partitions read alike, and
+/// the two orders at least do not undo each other. `fill`
+/// under `capacity` is the headroom a move in is made with, so that the
+/// capacity's own fall does not take it back at once.
+///
+/// Each side's moves are priced one after another, each with the moves
+/// before it that pay made: a move in pays only where it still does with
+/// every hotter one in, so that a cold partition is not offered the room a
+/// hot one is about to take, and a move out only where it still does with
+/// every colder one out, so that no more leave than the room is short by.
+/// A move that does not pay is priced all the same, at what it would lose:
+/// a partition in the stride form of a store that fits would cost its
+/// decodes in the block form, and whoever keeps a balance of what a move
+/// would have saved takes that from it, so that the balance is of the
+/// reads as they were and not of the times the move was offered.
+///
+/// Where no move pays alone and the hottest partition in the block form
+/// would pay in the room the coldest in the stride form holds, that one's
+/// move out pays, at half the saving of the pair, since the saving takes
+/// both builds; with it made, the hot one is the first offered in. The
+/// pair is priced with the cold one's block form in the share of its
+/// stride form that the hot one's is of its own: the hot one's two sizes
+/// are both known, the cold one's block form is an estimate, and priced
+/// at the estimate an exchange of two partitions of one size read the
+/// estimate's error as room made -- a store that had moved one partition
+/// out and fitted moved a second for it.
+///
+/// Nothing moves in where `fill` is nothing: the model reads every touch of
+/// a cache of no bytes as a fault whatever the forms, so a move in would
+/// read as its decodes saved for nothing, in a room that is not there.
+///
+/// A side prices at most [`CONVERSION_CANDIDATES`] partitions, in that
+/// order, since each price is a solve of the model over every part.
+pub fn conversions_priced(
+    capacity: u64,
+    fill: u64,
+    parts: &[FormPart],
+    costs: FormCosts,
+) -> Vec<PricedMove> {
+    let mut ins: Vec<usize> = (0..parts.len())
+        .filter(|&i| !parts[i].stride && parts[i].can_stride && parts[i].touches > 0.0)
+        .collect();
+    ins.sort_by(|&a, &b| parts[b].density().total_cmp(&parts[a].density()));
+    let mut outs: Vec<usize> = (0..parts.len())
+        .rev()
+        .filter(|&i| parts[i].stride)
+        .collect();
+    outs.sort_by(|&a, &b| parts[a].density().total_cmp(&parts[b].density()));
+    let mut moves = Vec::new();
+    let now_fill = forms_cost(fill, parts, costs);
+    if fill > 0 {
+        let mut made = parts.to_vec();
+        let mut cost = now_fill;
+        for &i in ins.iter().take(CONVERSION_CANDIDATES) {
+            made[i].stride = true;
+            let after = forms_cost(fill, &made, costs);
+            let gain = cost - after;
+            let pays = pays(gain, cost);
+            moves.push(PricedMove {
+                conv: Conversion::ToStride(i),
+                gain,
+                pays,
+            });
+            if pays {
+                cost = after;
+            } else {
+                made[i].stride = false;
+            }
+        }
+    }
+    let mut made = parts.to_vec();
+    let mut cost = forms_cost(capacity, parts, costs);
+    for &i in outs.iter().take(CONVERSION_CANDIDATES) {
+        made[i].stride = false;
+        let after = forms_cost(capacity, &made, costs);
+        let gain = cost - after;
+        let pays = pays(gain, cost);
+        moves.push(PricedMove {
+            conv: Conversion::ToBlock(i),
+            gain,
+            pays,
+        });
+        if pays {
+            cost = after;
+        } else {
+            made[i].stride = true;
+        }
+    }
+    if moves.iter().all(|m| !m.pays) && fill > 0 {
+        if let (Some(&hot), Some(&cold)) = (ins.first(), outs.first()) {
+            let mut swapped = parts.to_vec();
+            swapped[hot].stride = true;
+            swapped[cold].stride = false;
+            if parts[hot].stride_bytes > 0 {
+                swapped[cold].block_bytes =
+                    (parts[cold].stride_bytes as f64 * parts[hot].block_bytes as f64
+                        / parts[hot].stride_bytes as f64) as u64;
+            }
+            let gain = now_fill - forms_cost(fill, &swapped, costs);
+            if pays(gain, now_fill) {
+                let swap = PricedMove {
+                    conv: Conversion::ToBlock(cold),
+                    gain: gain / 2.0,
+                    pays: true,
+                };
+                match moves
+                    .iter_mut()
+                    .find(|m| m.conv == Conversion::ToBlock(cold))
+                {
+                    Some(m) => *m = swap,
+                    None => moves.push(swap),
+                }
+            }
+        }
+    }
+    moves
 }
 
 /// `C_build`, seconds: what buying the form costs, the CPU the build is
@@ -650,6 +991,23 @@ impl Sampler {
     fn sanitized(self) -> Option<Sampler> {
         (self.c_build.is_finite() && self.c_build >= 0.0).then_some(self)
     }
+}
+
+/// What the build clause reads at a step, for the trace
+/// ([`ZSelect::buy_state`]): the rent, the sampler's reading as (price,
+/// attach, generation) where one stands, whether the partitions have stood
+/// for the settle, whether the eager purchase is spent, whether building is
+/// suspended, and whether a switch is allowed. The suspension is what the
+/// first line of it named: a store with a file beside every partition read
+/// raw through a sweep with `suspended` true from its load's end.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BuyState {
+    pub excess: f64,
+    pub reading: Option<(f64, bool, u64)>,
+    pub stood: bool,
+    pub eager_spent: bool,
+    pub suspended: bool,
+    pub switch_allowed: bool,
 }
 
 /// One census interval: S2, summed over the handles' valid windows.
@@ -857,6 +1215,18 @@ pub struct Decision {
     /// Pulse: the transition this step made; a cancel is the event
     /// [`Event::BuildCancelled`] or [`Event::BuildAbandoned`].
     pub event: Option<Event>,
+}
+
+impl Decision {
+    /// The decision without its pulses: what holds between two steps, for
+    /// whoever acts on it again before the next.
+    pub fn levels(self) -> Decision {
+        Decision {
+            retire: false,
+            event: None,
+            ..self
+        }
+    }
 }
 
 /// Counters of what the selector has done, for the engine's own counters and
@@ -1129,6 +1499,14 @@ pub struct ZSelect {
     /// that could buy again after every exit would buy a form that does not
     /// pay once a dwell, forever, where the rent asks the evidence each time.
     eager_spent: bool,
+    /// Whether the purchase under way is an attach: the sampler's reading
+    /// said the form files on disk cover the keys ([`Sampler::attach`]),
+    /// so what it builds is at most the rest. The wasted-build budget holds
+    /// off builds and never an attach, which wastes no build: the
+    /// suspension a load's merge chain set, a dwell long, kept a store with
+    /// a file beside every partition reading raw through a sweep of scans
+    /// (`Options::zpages_build_at_finish`).
+    attach_bought: bool,
     /// When the generation last changed, for the settle.
     gen_changed_at: Duration,
     /// The wall time of the last build or cancelled build; the dwell and the
@@ -1189,6 +1567,7 @@ impl ZSelect {
             attach_on_reads: false,
             reads_now: false,
             eager_spent: false,
+            attach_bought: false,
             gen_changed_at: Duration::ZERO,
             last_build_wall: Duration::ZERO,
             build_started: Duration::ZERO,
@@ -1243,6 +1622,18 @@ impl ZSelect {
             self.footprint,
             self.dwell(),
         )
+    }
+
+    /// For the trace: what the build clause reads at `now`.
+    pub fn buy_state(&self, now: Duration) -> BuyState {
+        BuyState {
+            excess: self.excess,
+            reading: self.sampler.map(|s| (s.c_build, s.attach, s.generation)),
+            stood: now.saturating_sub(self.gen_changed_at) >= EAGER_SETTLE,
+            eager_spent: self.eager_spent,
+            suspended: self.suspended(now),
+            switch_allowed: self.switch_allowed(now),
+        }
     }
 
     /// For the trace: the last interval's evidence, the measured saving by
@@ -1336,6 +1727,11 @@ impl ZSelect {
     /// the settle after an ordered load's drain came two seconds into the
     /// reads it was for. Work in flight still holds it, as it holds the
     /// settle, and every other clause of the buy stands.
+    /// The attach flag of the sampler's reading, where one stands.
+    pub fn sampler_attach(&self) -> Option<bool> {
+        self.sampler.map(|s| s.attach)
+    }
+
     pub fn set_attach_on_reads(&mut self, on: bool) {
         self.attach_on_reads = on;
     }
@@ -1786,6 +2182,7 @@ impl ZSelect {
             self.vanished = 0;
             self.retain_until = None;
             self.counts.builds += 1;
+            self.attach_bought = self.sampler.is_some_and(|s| s.attach);
             return Some(Event::BuildStart);
         }
         None
@@ -1796,8 +2193,11 @@ impl ZSelect {
         let (Some(m), Some(s)) = (self.model, self.sampler) else {
             return false;
         };
-        // (e), and the budget: the sampler declined, or building is held off.
-        if s.declined || self.suspended(now) {
+        // (e), and the budget: the sampler declined, or building is held
+        // off -- and an attach is not a build: with the files on disk the
+        // purchase builds at most a tenth of the keys, and the suspension
+        // is for the builder's wasted CPU.
+        if s.declined || (self.suspended(now) && !s.attach) {
             return false;
         }
         // (d)
@@ -1871,6 +2271,12 @@ impl ZSelect {
             return Some(installed);
         }
         if tripped {
+            if self.attach_bought {
+                // The files are on disk and nothing of theirs is wasted:
+                // what the budget holds off is the building of the rest.
+                self.suspend(now);
+                return Some(Event::BuildsSuspended);
+            }
             return Some(self.cancel(now, Cancel::Budget));
         }
         if ev.any() {
@@ -1892,6 +2298,7 @@ impl ZSelect {
     fn install(&mut self, now: Duration) -> Event {
         self.last_build_wall = now.saturating_sub(self.build_started);
         self.phase = Phase::Compact;
+        self.attach_bought = false;
         self.last_switch = Some(now);
         self.retain_until = None;
         self.z_realized = None;
@@ -1912,6 +2319,7 @@ impl ZSelect {
     /// the partitions (and the build clause refuses them until it does not).
     fn cancel(&mut self, now: Duration, why: Cancel) -> Event {
         self.eager_spent = true;
+        self.attach_bought = false;
         self.last_build_wall = now.saturating_sub(self.build_started);
         self.last_switch = Some(now);
         self.counts.switches += 1;
@@ -2227,6 +2635,9 @@ pub struct Budget {
     pub anon: u64,
     pub refaults: Option<u64>,
     pub budget: u64,
+    /// The file pages the group holds now, `None` where the platform does
+    /// not say: what `slack` is read from.
+    pub cache: Option<u64>,
 }
 
 /// A twentieth of the limit, and sixty-four mebibytes at least: what the
@@ -2242,7 +2653,28 @@ impl Budget {
             anon,
             refaults,
             budget: limit.saturating_sub(anon).saturating_sub(margin(limit)),
+            cache: None,
         }
+    }
+
+    /// The budget with the group's file pages read beside it.
+    pub fn with_cache(self, cache: Option<u64>) -> Budget {
+        Budget { cache, ..self }
+    }
+
+    /// The group's unused memory less the margin: its limit less its
+    /// anonymous memory, its page cache and the margin, `None` where the
+    /// cache is not known. The budget's shares price what the form files
+    /// and the raw partitions would hold against a model of the rest; this
+    /// is what the group has not got, which is what a partition released to
+    /// the raw form brings in (`Options::zpages_hot_raw_slack`).
+    pub fn slack(&self) -> Option<u64> {
+        self.cache.map(|c| {
+            self.limit
+                .saturating_sub(self.anon)
+                .saturating_sub(c)
+                .saturating_sub(margin(self.limit))
+        })
     }
 
     /// The budget held under the machine's `MemAvailable` less the margin:
@@ -2262,6 +2694,68 @@ impl Budget {
             budget: self.budget.min(avail.saturating_sub(margin(self.limit))),
             ..self
         }
+    }
+
+    /// The budget as it would read with the process holding `anon` bytes of
+    /// anonymous memory, where that is more than it holds now: the limit
+    /// less that and the margin, and no more than the budget as read. What
+    /// a choice that stands through the process's growth is made against,
+    /// with `anon` the most the process has lately held
+    /// (`Options::zpages_stride_convert`, [`WindowMax`]): a load's
+    /// memtables and tables in flight are what a write mix brings back, and
+    /// a budget read between the two, with the process at its smallest, is
+    /// the largest the store will see.
+    pub fn held_at(&self, anon: u64) -> u64 {
+        self.budget.min(
+            self.limit
+                .saturating_sub(anon.max(self.anon))
+                .saturating_sub(margin(self.limit)),
+        )
+    }
+}
+
+/// The most a quantity has read over the last one to two spans: the most of
+/// the span in progress and of the one before it, so that a reading stands
+/// for at least a span and at most two, and one spike does not stand for
+/// the process's life.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowMax {
+    span: Duration,
+    since: Option<Duration>,
+    cur: u64,
+    prev: u64,
+}
+
+impl WindowMax {
+    pub fn new(span: Duration) -> WindowMax {
+        WindowMax {
+            span,
+            since: None,
+            cur: 0,
+            prev: 0,
+        }
+    }
+
+    /// `v` read at `now`, which does not go back.
+    pub fn note(&mut self, now: Duration, v: u64) {
+        let since = *self.since.get_or_insert(now);
+        let gone = now.saturating_sub(since);
+        if gone >= self.span {
+            // The span in progress becomes the one before, unless a whole
+            // span passed with nothing read: then nothing before stands.
+            self.prev = if gone >= self.span.saturating_mul(2) {
+                0
+            } else {
+                self.cur
+            };
+            self.cur = 0;
+            self.since = Some(now);
+        }
+        self.cur = self.cur.max(v);
+    }
+
+    pub fn get(&self) -> u64 {
+        self.cur.max(self.prev)
     }
 }
 
@@ -2321,6 +2815,8 @@ pub struct StatV1 {
     pub rss: u64,
     pub rss_huge: u64,
     pub refaults: Option<u64>,
+    /// The page cache the group holds (`cache`), `None` where absent.
+    pub cache: Option<u64>,
 }
 
 pub fn parse_stat_v1(text: &str) -> StatV1 {
@@ -2335,6 +2831,7 @@ pub fn parse_stat_v1(text: &str) -> StatV1 {
             "hierarchical_memory_limit" => s.limit = Some(v),
             "rss" => s.rss = v,
             "rss_huge" => s.rss_huge = v,
+            "cache" => s.cache = Some(v),
             "workingset_refault_file" | "workingset_refault" => s.refaults = Some(v),
             _ => {}
         }
@@ -2348,6 +2845,8 @@ pub fn parse_stat_v1(text: &str) -> StatV1 {
 pub struct StatV2 {
     pub anon: u64,
     pub refaults: Option<u64>,
+    /// The file-backed pages the group holds (`file`), `None` where absent.
+    pub file: Option<u64>,
 }
 
 pub fn parse_stat_v2(text: &str) -> StatV2 {
@@ -2360,6 +2859,7 @@ pub fn parse_stat_v2(text: &str) -> StatV2 {
         let Ok(v) = v.parse::<u64>() else { continue };
         match k {
             "anon" => s.anon = v,
+            "file" => s.file = Some(v),
             "workingset_refault_file" | "workingset_refault" => s.refaults = Some(v),
             _ => {}
         }
@@ -2408,14 +2908,23 @@ mod tests {
     use super::*;
 
     /// The coding the selector chooses is the raw tails exactly where the
-    /// model predicts that form faults nothing, and the block coding
-    /// otherwise: the two measured points (five million keys under 640 MiB,
-    /// where the raw-tail form missed and the block form fit, and three
-    /// million under the same bound, where both fit), the line itself, a
-    /// budget of nothing, and a form the sampler declined.
+    /// model predicts that form faults nothing against `FORM_FILL` of the
+    /// budget, and the block coding otherwise: the measured points (five
+    /// million keys under 640 MiB, where the raw-tail form missed and the
+    /// block form fit; three million under the same bound, where both fit;
+    /// ten million under 1.25 GiB at the two partition counts the sampler
+    /// read, where the raw-tail form sat within the budget at one count and
+    /// a hair over it at the other, and over the fill share at both), the
+    /// line itself, the share the docs name, a budget of nothing, and a
+    /// form the sampler declined.
     #[test]
-    fn the_coding_is_the_raw_tails_only_where_that_form_is_predicted_to_fault_nothing() {
+    fn the_coding_is_the_raw_tails_only_where_that_form_fits_the_fill_share_of_the_budget() {
         let mb = |n: u64| n << 20;
+        let fill = form_fill(mb(1000));
+        assert!(
+            fill.abs_diff(mb(850)) <= 1,
+            "the fill share the docs name, 85% (`docs/engine.md`): {fill}"
+        );
         let budget = Budget::of(mb(640), mb(90), None).budget;
         let raw = FormSize {
             w_z: mb(530),
@@ -2439,8 +2948,9 @@ mod tests {
             w_z: mb(318),
             resident: mb(6),
         };
+        assert!(smaller.w_z + smaller.resident <= form_fill(budget));
         assert_eq!(choose_coding(budget, smaller), Coding::RawTails);
-        let room = budget - raw.resident;
+        let room = form_fill(budget) - raw.resident;
         assert_eq!(
             choose_coding(
                 budget,
@@ -2450,7 +2960,7 @@ mod tests {
                 }
             ),
             Coding::RawTails,
-            "the line: the form exactly the room"
+            "the line: the form exactly the fill share"
         );
         assert_eq!(
             choose_coding(
@@ -2461,8 +2971,40 @@ mod tests {
                 }
             ),
             Coding::Block,
-            "one byte over the room"
+            "one byte over the fill share"
         );
+        // Ten million keys under 1.25 GiB, the sampler's two readings: 28
+        // partitions with one in flight, 1168 MB within a budget of 1199,
+        // and 29, 1190 MB a hair over a budget of 1198. A line at the
+        // budget itself picked them apart; the fill share picks the block
+        // coding for both, so a partition in flight moves no pick.
+        let at_28 = (
+            1_199_144_960u64,
+            FormSize {
+                w_z: 1_168_282_048,
+                resident: 19_009_984,
+            },
+        );
+        let at_29 = (
+            1_197_764_608u64,
+            FormSize {
+                w_z: 1_189_696_232,
+                resident: 16_979_608,
+            },
+        );
+        assert_eq!(
+            model_z(at_28.0, at_28.1.resident, at_28.1.w_z),
+            0.0,
+            "within the budget whole"
+        );
+        assert!(
+            model_z(at_29.0, at_29.1.resident, at_29.1.w_z) > 0.0,
+            "a hair over it"
+        );
+        for (budget, form) in [at_28, at_29] {
+            assert!(form.w_z > form_fill(budget), "over the fill share");
+            assert_eq!(choose_coding(budget, form), Coding::Block);
+        }
         assert_eq!(
             choose_coding(0, raw),
             Coding::Block,
@@ -2515,6 +3057,7 @@ mod tests {
                 rss: 2048,
                 rss_huge: 4096,
                 refaults: Some(99),
+                cache: Some(1024),
             }
         );
         assert_eq!(parse_stat_v1("rss 5\n").refaults, None);
@@ -2522,7 +3065,8 @@ mod tests {
             parse_stat_v2("anon 123\nfile 9\nworkingset_refault_file 4\n"),
             StatV2 {
                 anon: 123,
-                refaults: Some(4)
+                refaults: Some(4),
+                file: Some(9),
             }
         );
         assert_eq!(parse_limit("max\n"), None);
@@ -3320,6 +3864,478 @@ mod tests {
         assert_eq!(model_z(0, 0, 0), 0.0);
         assert_eq!(model_z(10, 20, 100), 1.0);
         assert_eq!(model_z(u64::MAX, 0, 1 << 30), 0.0);
+    }
+
+    #[test]
+    fn the_stride_form_fits_with_what_stands_beside_it() {
+        // The whole budget and no more, and the pieces beside the form are
+        // counted against it as the form's own bytes are.
+        assert!(stride_fits(1000, 1000, 0));
+        assert!(!stride_fits(1000, 1001, 0));
+        assert!(stride_fits(1000, 700, 300));
+        assert!(!stride_fits(1000, 700, 301));
+        // No budget holds nothing but nothing, and a sum past the type's
+        // range does not wrap into fitting.
+        assert!(stride_fits(0, 0, 0));
+        assert!(!stride_fits(0, 1, 0));
+        assert!(!stride_fits(u64::MAX - 1, u64::MAX, u64::MAX));
+    }
+
+    /// The moves between the block form and the stride form
+    /// (`conversions`): a partition of 60 MB in the block form and 100 in
+    /// the stride form, a decode at a microsecond and a fault at forty.
+    #[test]
+    fn a_partition_moves_to_the_form_its_reads_and_the_room_pay_for() {
+        let mb = 1u64 << 20;
+        let part = |stride: bool, touches: f64| FormPart {
+            stride,
+            can_stride: true,
+            block_bytes: 60 * mb,
+            stride_bytes: 100 * mb,
+            touches,
+        };
+        let costs = FormCosts {
+            t_decode: 1e-6,
+            t_fault: 40e-6,
+        };
+        let near = |a: f64, b: f64| (a - b).abs() <= 1e-9 * b.abs().max(1.0);
+        // Room for every partition in the stride form: each read one pays
+        // its decodes, exactly, the most touches a byte first, and none is
+        // moved out.
+        let parts = [part(false, 1000.0), part(false, 50_000.0), part(true, 10.0)];
+        let moves = conversions(400 * mb, 400 * mb, &parts, costs);
+        assert_eq!(moves.len(), 2, "{moves:?}");
+        assert_eq!(moves[0].0, Conversion::ToStride(1));
+        assert!(near(moves[0].1, 50_000.0 * 1e-6), "{moves:?}");
+        assert_eq!(moves[1].0, Conversion::ToStride(0));
+        assert!(near(moves[1].1, 1000.0 * 1e-6), "{moves:?}");
+        // The cost is the decodes of the block form's partitions where
+        // everything fits, and a store whole in the stride form costs none.
+        assert!(near(forms_cost(400 * mb, &parts, costs), 51_000.0 * 1e-6));
+        assert_eq!(
+            forms_cost(400 * mb, &[part(true, 9.0), part(true, 7.0)], costs),
+            0.0
+        );
+        // A partition the form declined is not offered, nor one nobody
+        // reads, which pays nothing.
+        let mut declined = parts;
+        declined[1].can_stride = false;
+        declined[0].touches = 0.0;
+        assert!(conversions(400 * mb, 400 * mb, &declined, costs).is_empty());
+        // The fill a quarter short of the two in the stride form: a move in
+        // would fault on a quarter of the touches, forty microseconds each
+        // against the one a decode saves, and none is offered; with a fault
+        // at a hundredth of a decode the same move pays.
+        let parts = [part(true, 5000.0), part(false, 5000.0)];
+        let fill = 150 * mb;
+        assert!(conversions(200 * mb, fill, &parts, costs).is_empty());
+        let cheap = FormCosts {
+            t_decode: 1e-6,
+            t_fault: 1e-8,
+        };
+        let moves = conversions(200 * mb, fill, &parts, cheap);
+        assert_eq!(moves.len(), 1, "{moves:?}");
+        assert_eq!(moves[0].0, Conversion::ToStride(1));
+        // Between the fill and the capacity nothing moves either way: the
+        // partitions in the stride form, which fit the capacity with the
+        // one in the block form beside them, stay, and that one is not
+        // moved in, the fill being under what the store holds already.
+        let parts = [part(true, 5000.0), part(true, 5000.0), part(false, 5000.0)];
+        assert!(conversions(260 * mb, 221 * mb, &parts, costs).is_empty());
+        // The capacity under the store: the partition with the fewest
+        // touches a byte goes out, where the faults it ends cost more than
+        // its decodes will, and by what the model says the difference is.
+        let parts = [part(true, 5000.0), part(true, 500.0), part(false, 100.0)];
+        let cap = 230 * mb;
+        let moves = conversions(cap, cap, &parts, costs);
+        assert_eq!(moves.len(), 1, "{moves:?}");
+        let cold = moves
+            .iter()
+            .find(|m| m.0 == Conversion::ToBlock(1))
+            .expect("the cold one out");
+        let mut after = parts;
+        after[1].stride = false;
+        let want = forms_cost(cap, &parts, costs) - forms_cost(cap, &after, costs);
+        assert!(want > 0.0 && near(cold.1, want), "{moves:?} {want}");
+        assert!(near(forms_cost(cap, &after, costs), 600.0 * 1e-6));
+        // The hot one's move out would end the faults too and cost ten
+        // times the decodes: it does not pay, and is not offered.
+        let mut hot = parts;
+        hot[0].stride = false;
+        assert!(forms_cost(cap, &hot, costs) > forms_cost(cap, &parts, costs));
+        // A swap: the store full, the partition in the block form five
+        // times hotter than the one in the stride form. Neither moves
+        // alone -- the hot one's move in would put the other's pages out
+        // at forty times a decode each -- and the cold one's move out is
+        // offered at half the pair's saving.
+        let parts = [part(true, 1000.0), part(false, 5000.0)];
+        let cap = 160 * mb;
+        let moves = conversions(cap, cap, &parts, costs);
+        assert_eq!(moves.len(), 1, "{moves:?}");
+        assert_eq!(moves[0].0, Conversion::ToBlock(0));
+        assert!(
+            near(moves[0].1, (5000.0 - 1000.0) * 1e-6 / 2.0),
+            "{moves:?}"
+        );
+        // Fifty times hotter, the hot one pays its way in alone: the pages
+        // it puts out are the cold one's, whose faults cost less than its
+        // decodes did.
+        let parts = [part(true, 100.0), part(false, 5000.0)];
+        let moves = conversions(cap, cap, &parts, costs);
+        assert_eq!(moves.len(), 1, "{moves:?}");
+        assert_eq!(moves[0].0, Conversion::ToStride(1));
+        assert!(moves[0].1 < 5000.0 * 1e-6, "{moves:?}");
+        let parts = [part(true, 1000.0), part(false, 5000.0)];
+        // And no swap where the two read alike.
+        assert_eq!(conversions(cap, cap, &parts, costs).len(), 1);
+        let parts = [part(true, 5000.0), part(false, 5000.0)];
+        assert!(conversions(cap, cap, &parts, costs).is_empty());
+        // No more than the candidates' count is priced a side.
+        let many: Vec<FormPart> = (0..40).map(|i| part(false, 100.0 + i as f64)).collect();
+        let moves = conversions(8000 * mb, 8000 * mb, &many, costs);
+        assert_eq!(moves.len(), CONVERSION_CANDIDATES, "{moves:?}");
+        assert_eq!(moves[0].0, Conversion::ToStride(39));
+        // Partitions read alike tie: the lowest in key order first in, the
+        // highest first out.
+        let alike = [part(false, 100.0), part(false, 100.0), part(false, 100.0)];
+        let moves = conversions(8000 * mb, 8000 * mb, &alike, costs);
+        assert_eq!(
+            moves.iter().map(|m| m.0).collect::<Vec<_>>(),
+            [0, 1, 2].map(Conversion::ToStride)
+        );
+        // And no more leave than the room is short by: three of a hundred
+        // megabytes in two hundred and fifty, and the third stays once two
+        // are out, where each alone would have paid.
+        let alike = [part(true, 100.0), part(true, 100.0), part(true, 100.0)];
+        let moves = conversions(250 * mb, 250 * mb, &alike, costs);
+        assert_eq!(
+            moves.iter().map(|m| m.0).collect::<Vec<_>>(),
+            [2, 1].map(Conversion::ToBlock)
+        );
+        let mut one = alike;
+        one[0].stride = false;
+        one[1].stride = false;
+        assert!(
+            forms_cost(250 * mb, &one, costs) < forms_cost(250 * mb, &alike, costs),
+            "the third's move out alone pays"
+        );
+        // A swap's second half: the cold one out, both in the block form,
+        // and room for one. The hot one is offered and the cold one is not,
+        // though its move alone would pay and it is the cheaper to make.
+        let parts = [part(false, 1000.0), part(false, 5000.0)];
+        let moves = conversions(160 * mb, 160 * mb, &parts, costs);
+        assert_eq!(moves.len(), 1, "{moves:?}");
+        assert_eq!(moves[0].0, Conversion::ToStride(1));
+        let mut cold_in = parts;
+        cold_in[0].stride = true;
+        assert!(forms_cost(160 * mb, &cold_in, costs) < forms_cost(160 * mb, &parts, costs));
+        // No room at all: nothing moves in, whatever it reads, and nothing
+        // out, since the model reads every touch of no cache as a fault in
+        // either form.
+        let parts = [part(false, 5000.0), part(true, 5000.0)];
+        assert!(conversions(0, 0, &parts, costs).is_empty());
+        assert!(conversions(400 * mb, 0, &parts, costs).is_empty());
+    }
+
+    /// The room the moves are judged in (`conversion_room`): what stands
+    /// beside the forms comes off the budget for a move out and off its
+    /// fill share for a move in, and neither goes under nothing.
+    #[test]
+    fn the_room_for_a_move_is_the_budget_less_what_stands_beside_the_forms() {
+        assert_eq!(conversion_room(1000, 0), (1000, 850));
+        assert_eq!(conversion_room(1000, 100), (900, 750));
+        assert_eq!(conversion_room(1000, 850), (150, 0));
+        assert_eq!(conversion_room(1000, 900), (100, 0));
+        assert_eq!(conversion_room(1000, 2000), (0, 0));
+    }
+
+    /// A decision's levels (`Decision::levels`): the phase, the gate and
+    /// what is wanted as the step left them, and neither pulse.
+    #[test]
+    fn a_decisions_levels_carry_no_pulse() {
+        let d = Decision {
+            phase: Phase::Compact,
+            gate: GATE_Z,
+            census: true,
+            sample: true,
+            build: true,
+            retire: true,
+            event: Some(Event::Install),
+        };
+        assert_eq!(
+            d.levels(),
+            Decision {
+                retire: false,
+                event: None,
+                ..d
+            }
+        );
+        let quiet = Decision {
+            retire: false,
+            event: None,
+            ..d
+        };
+        assert_eq!(quiet.levels(), quiet);
+    }
+
+    /// Every priced move with what it would save or lose
+    /// (`conversions_priced`): a partition in the stride form of a store
+    /// that fits is priced at the decodes its block form would cost, to
+    /// the microsecond, and does not pay; and an exchange of two
+    /// partitions is priced with the cold one's block form in the share
+    /// the hot one's is of its stride form, so that an estimate of it that
+    /// is short does not read as room made.
+    #[test]
+    fn a_move_that_does_not_pay_is_priced_at_what_it_would_lose() {
+        let mb = 1u64 << 20;
+        let costs = FormCosts {
+            t_decode: 1e-6,
+            t_fault: 40e-6,
+        };
+        let part = |stride: bool, block: u64, touches: f64| FormPart {
+            stride,
+            can_stride: true,
+            block_bytes: block * mb,
+            stride_bytes: 100 * mb,
+            touches,
+        };
+        let near = |a: f64, b: f64| (a - b).abs() <= 1e-9 * b.abs().max(1e-12);
+        // A store that fits: each partition in the stride form would cost
+        // its decodes, the coldest priced first, and nothing pays.
+        let parts = [part(true, 60, 3000.0), part(true, 60, 500.0)];
+        let priced = conversions_priced(400 * mb, 340 * mb, &parts, costs);
+        assert_eq!(priced.len(), 2, "{priced:?}");
+        assert_eq!(priced[0].conv, Conversion::ToBlock(1));
+        assert!(
+            !priced[0].pays && near(priced[0].gain, -500.0 * 1e-6),
+            "{priced:?}"
+        );
+        assert_eq!(priced[1].conv, Conversion::ToBlock(0));
+        assert!(
+            !priced[1].pays && near(priced[1].gain, -3000.0 * 1e-6),
+            "{priced:?}"
+        );
+        assert!(conversions(400 * mb, 340 * mb, &parts, costs).is_empty());
+        // Two partitions read alike, one in each form, in a fill neither
+        // move has room in. The stride one's block form is on record as
+        // two thirds of what the block one's is: priced at that, the
+        // exchange would read forty megabytes of room made; priced in the
+        // block one's own share it changes nothing, and does not pay.
+        let parts = [part(false, 60, 4000.0), part(true, 40, 4000.0)];
+        let (capacity, fill) = (200 * mb, 150 * mb);
+        let priced = conversions_priced(capacity, fill, &parts, costs);
+        assert!(priced.iter().all(|m| !m.pays), "{priced:?}");
+        let mut at_estimate = parts;
+        at_estimate.swap(0, 1);
+        at_estimate[0].stride = false;
+        at_estimate[1].stride = true;
+        assert!(
+            forms_cost(fill, &parts, costs) - forms_cost(fill, &at_estimate, costs) > 1e-3,
+            "the estimate's shortfall alone is a saving the model would read"
+        );
+        // The block one read three times as much, in a fill the two hold
+        // as they stand and would not with both in the stride form: the
+        // exchange pays, as the stride one's move out, at half the pair's
+        // saving, which is the decodes the hot one's reads no longer make
+        // less the cold one's that do.
+        let parts = [part(false, 60, 12_000.0), part(true, 40, 4000.0)];
+        let fill = 160 * mb;
+        let priced = conversions_priced(capacity, fill, &parts, costs);
+        let pay: Vec<&PricedMove> = priced.iter().filter(|m| m.pays).collect();
+        assert_eq!(pay.len(), 1, "{priced:?}");
+        assert_eq!(pay[0].conv, Conversion::ToBlock(1));
+        let mut swapped = parts;
+        swapped[0].stride = true;
+        swapped[1].stride = false;
+        swapped[1].block_bytes = 60 * mb;
+        let pair = forms_cost(fill, &parts, costs) - forms_cost(fill, &swapped, costs);
+        assert!(near(pair, 8000.0 * 1e-6), "{pair}");
+        assert!(near(pay[0].gain, pair / 2.0), "{priced:?}");
+        assert_eq!(
+            priced
+                .iter()
+                .filter(|m| m.conv == Conversion::ToBlock(1))
+                .count(),
+            1,
+            "priced once: {priced:?}"
+        );
+    }
+
+    /// What a period's reads are of the smoothed touches (`intensity`), and
+    /// what the scaling of a gain by it rests on: the cost of a store's
+    /// reads, and so every move's gain, at touches some number of times as
+    /// many is that many times itself, where the store fits and where it
+    /// faults, so a gain priced over smoothed touches times the intensity
+    /// is the gain at the period's own.
+    #[test]
+    fn a_gain_at_the_periods_reads_is_the_smoothed_gain_times_their_intensity() {
+        assert_eq!(intensity(300.0, 100.0), 3.0);
+        assert_eq!(intensity(0.0, 100.0), 0.0, "a period nobody read in");
+        assert_eq!(intensity(50.0, 0.0), 0.0, "nothing to go by");
+        assert_eq!(intensity(f64::NAN, 100.0), 0.0);
+        assert_eq!(intensity(-1.0, 100.0), 0.0);
+        let mb = 1u64 << 20;
+        let part = |stride: bool, touches: f64| FormPart {
+            stride,
+            can_stride: true,
+            block_bytes: 60 * mb,
+            stride_bytes: 100 * mb,
+            touches,
+        };
+        let costs = FormCosts {
+            t_decode: 1e-6,
+            t_fault: 40e-6,
+        };
+        let near = |a: f64, b: f64| (a - b).abs() <= 1e-6 * b.abs().max(1e-12);
+        // A store that fits, one over its room with moves out to make, and
+        // one with a move in: the smoothed touches a fortieth of the
+        // period's, as they stand a period into a pass.
+        let shapes: [(u64, u64, Vec<FormPart>); 3] = [
+            (
+                400 * mb,
+                400 * mb,
+                vec![part(false, 1000.0), part(false, 50_000.0), part(true, 10.0)],
+            ),
+            (
+                230 * mb,
+                200 * mb,
+                vec![part(true, 4000.0), part(true, 9000.0), part(true, 700.0)],
+            ),
+            (
+                300 * mb,
+                280 * mb,
+                vec![part(true, 5000.0), part(false, 8000.0), part(false, 20.0)],
+            ),
+        ];
+        for (capacity, fill, now) in &shapes {
+            let k = 40.0;
+            let smoothed: Vec<FormPart> = now
+                .iter()
+                .map(|p| FormPart {
+                    touches: p.touches / k,
+                    ..*p
+                })
+                .collect();
+            let x = intensity(
+                now.iter().map(|p| p.touches).sum(),
+                smoothed.iter().map(|p| p.touches).sum(),
+            );
+            assert!(near(x, k), "{x}");
+            assert!(
+                near(
+                    forms_cost(*capacity, now, costs),
+                    x * forms_cost(*capacity, &smoothed, costs)
+                ),
+                "the cost is the touches' in the first degree"
+            );
+            let (at_now, at_smoothed) = (
+                conversions(*capacity, *fill, now, costs),
+                conversions(*capacity, *fill, &smoothed, costs),
+            );
+            assert!(!at_now.is_empty(), "a shape with a move to price");
+            assert_eq!(
+                at_now.len(),
+                at_smoothed.len(),
+                "{at_now:?} {at_smoothed:?}"
+            );
+            for (a, b) in at_now.iter().zip(&at_smoothed) {
+                assert_eq!(a.0, b.0, "the same moves in the same order");
+                assert!(near(a.1, x * b.1), "{at_now:?} {at_smoothed:?}");
+            }
+        }
+    }
+
+    /// The most a quantity read over the last one to two spans
+    /// (`WindowMax`): a reading stands through the span it was read in and
+    /// the one after, and is gone by the one after that; a span with
+    /// nothing read in it ends what stood before it.
+    #[test]
+    fn a_windowed_most_stands_for_a_span_and_no_more_than_two() {
+        let s = Duration::from_secs;
+        let mut w = WindowMax::new(s(10));
+        assert_eq!(w.get(), 0);
+        w.note(s(100), 7);
+        w.note(s(103), 3);
+        assert_eq!(w.get(), 7, "the most of the span");
+        w.note(s(110), 2);
+        assert_eq!(w.get(), 7, "stands through the next span");
+        w.note(s(119), 4);
+        assert_eq!(w.get(), 7);
+        w.note(s(120), 1);
+        assert_eq!(
+            w.get(),
+            4,
+            "gone by the span after, the next span's most in its place"
+        );
+        w.note(s(130), 1);
+        assert_eq!(w.get(), 1);
+        // A span with nothing read: nothing before it stands.
+        w.note(s(131), 9);
+        w.note(s(160), 2);
+        assert_eq!(w.get(), 2);
+    }
+
+    /// A budget held at the most the process has held (`Budget::held_at`):
+    /// the limit less that and the margin where the process holds less now,
+    /// the budget as read where it holds as much or more, and never more
+    /// than the budget the machine's available memory left.
+    #[test]
+    fn a_budget_is_held_at_the_most_the_process_has_held() {
+        let gib = 1u64 << 30;
+        let b = Budget::of(gib, 60 << 20, None);
+        assert_eq!(b.budget, gib - (60 << 20) - (64 << 20));
+        assert_eq!(b.held_at(0), b.budget);
+        assert_eq!(b.held_at(60 << 20), b.budget);
+        assert_eq!(b.held_at(200 << 20), gib - (200 << 20) - (64 << 20));
+        assert_eq!(b.held_at(2 * gib), 0);
+        let tight = b.within_available(Some(500 << 20));
+        assert_eq!(tight.budget, (500 << 20) - (64 << 20));
+        assert_eq!(tight.held_at(100 << 20), tight.budget);
+        assert_eq!(tight.held_at(900 << 20), gib - (900 << 20) - (64 << 20));
+    }
+
+    /// The model over any populations: one population is the compact form's
+    /// line, the faults are the cold population's where a hot one shares the
+    /// cache, a population nobody reads takes no room, and the faults are in
+    /// the unit the touches are counted in.
+    #[test]
+    fn the_model_over_populations_charges_the_cold_one() {
+        let pop = |bytes, touches| Population { bytes, touches };
+        let gb = 1u64 << 30;
+        // One population read uniformly misses on the share that is out.
+        for cache in [gb / 4, gb / 2, gb * 3 / 4] {
+            let one = model_populations(cache, &[pop(gb, 1.0)]);
+            assert!((one - model_z(cache, 0, gb)).abs() < 1e-9, "{cache}: {one}");
+        }
+        // A tenth of the pages taking nine tenths of the touches, in a cache
+        // of half the pages: the hot tenth stays, and the misses are the cold
+        // population's, under its share of the touches and far under the
+        // half a uniform read of the same pages would miss on.
+        let (hot, cold) = (pop(gb / 10, 0.9), pop(gb * 9 / 10, 0.1));
+        let skewed = model_populations(gb / 2, &[hot, cold]);
+        let hot_alone = model_populations(gb / 2, &[hot]);
+        assert_eq!(hot_alone, 0.0, "the hot population alone fits");
+        assert!(skewed > 0.04 && skewed < 0.1, "{skewed}");
+        assert!(skewed < 0.2 * model_populations(gb / 2, &[pop(gb, 1.0)]));
+        // The order the populations come in is nothing.
+        assert!((skewed - model_populations(gb / 2, &[cold, hot])).abs() < 1e-12);
+        // A population nobody reads is not in the cache: the one that is
+        // read fits beside it, whatever its size.
+        assert_eq!(
+            model_populations(gb / 2, &[pop(gb / 4, 1.0), pop(8 * gb, 0.0)]),
+            0.0
+        );
+        // Touches a second or touches a window: the faults scale with them.
+        let per_s = model_populations(gb / 2, &[pop(gb / 10, 900.0), pop(gb * 9 / 10, 100.0)]);
+        assert!((per_s - 1000.0 * skewed).abs() < 1e-6 * per_s, "{per_s}");
+        // Nothing fits in no cache, and nothing misses with nothing read.
+        assert!((model_populations(0, &[hot, cold]) - 1.0).abs() < 1e-12);
+        assert_eq!(model_populations(gb, &[]), 0.0);
+        // The raw form's model is this one over its two regions.
+        assert_eq!(
+            model_raw(gb / 2, gb / 10, gb),
+            model_populations(gb / 2, &[pop(gb / 10, 1.0), pop(gb, 1.0)])
+        );
     }
 
     #[test]
@@ -6432,6 +7448,74 @@ mod tests {
         assert_eq!(kinds(&drive(&mut calm, 5, |_| (0.0, 0.0))), [Event::Relax]);
         let mut hot = sel.clone();
         assert!(drive(&mut hot, 60, |_| (1.1 * floor_sus, 0.0)).is_empty());
+    }
+
+    /// The wasted-build budget's suspension holds off a build and never an
+    /// attach: under it a reading that says the form files on disk cover
+    /// the keys is bought, and one that says they do not waits it out. The
+    /// suspension a load's merge chain set kept a store with a file beside
+    /// every partition reading raw through a sweep of scans.
+    #[test]
+    fn a_suspension_holds_off_a_build_and_not_an_attach() {
+        for attach in [true, false] {
+            let (mut sel, step) = suspect_by_hand();
+            sel.set_attach_eager(true);
+            sel.suspend(DT * step as u32);
+            assert!(sel.suspended(DT * step as u32));
+            let mut s = reading(0.2, false, 0);
+            s.attach = attach;
+            let bought = (1..=60)
+                .any(|i| hand(&mut sel, step + i, 0, Some(s)).event == Some(Event::BuildStart));
+            assert_eq!(bought, attach, "attach {attach}: {:?}", sel.phase());
+            assert_eq!(sel.phase() == Phase::Building, attach);
+        }
+    }
+
+    /// The budget tripped while a purchase is under way: an attach keeps
+    /// going, with building suspended behind it, where a build is cancelled.
+    #[test]
+    fn a_trip_during_an_attach_suspends_building_and_keeps_the_attach() {
+        for attach in [true, false] {
+            let (mut sel, step) = suspect_by_hand();
+            if attach {
+                sel.set_attach_eager(true);
+            } else {
+                sel.set_eager(true);
+            }
+            let mut s = reading(0.2, false, 0);
+            s.attach = attach;
+            let at = (1..=60)
+                .find(|&i| hand(&mut sel, step + i, 0, Some(s)).event == Some(Event::BuildStart))
+                .map(|i| step + i)
+                .expect("the purchase made");
+            let d = sel.step(&Input {
+                now: DT * (at + 1) as u32,
+                census: Census {
+                    reads: Window {
+                        ops: 5000,
+                        faults: 2000,
+                    },
+                    refaults: Some(2000),
+                    ..Census::default()
+                },
+                build: Build {
+                    coverage: 0.5,
+                    superseded: BUDGET_SUPERSEDED + 1,
+                    ..Build::default()
+                },
+                sampler: Some(s),
+                generation: 0,
+                ..Input::default()
+            });
+            if attach {
+                assert_eq!(d.event, Some(Event::BuildsSuspended), "attach {attach}");
+                assert_eq!(sel.phase(), Phase::Building);
+            } else {
+                assert_eq!(d.event, Some(Event::BuildAbandoned), "attach {attach}");
+                assert_ne!(sel.phase(), Phase::Building);
+            }
+            assert!(sel.suspended(DT * (at + 1) as u32));
+        }
     }
 
     /// A selector fed by hand in SUSPECT with a hot model, a census that has

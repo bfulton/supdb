@@ -42,7 +42,7 @@ jobs:
   pickup-watchdog:
     needs: [check]
     if: needs.check.outputs.runner == 'self-hosted'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Wait for a self-hosted runner to claim the run
         env:
@@ -83,7 +83,7 @@ jobs:
   require-quiet-machine:
     needs: [check]
     if: needs.check.outputs.runner != 'self-hosted'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Refuse to measure on a hosted runner
         env:
@@ -105,13 +105,27 @@ jobs:
     timeout-minutes: 4320
     steps:
       - uses: actions/checkout@v4
-      - name: Use the toolchain this machine already has
+      # The toolchain rust-toolchain.toml names where this machine's cargo
+      # is rustup's, which reads the file whatever this step does; a cargo
+      # from anywhere else never sees the file, and the row is that
+      # compiler's, so its version is printed either way.
+      - name: The pinned toolchain, or the one this machine has
         run: |
           set -eu
           command -v cargo >/dev/null || { echo "::error::no cargo on this runner"; exit 1; }
+          if command -v rustup >/dev/null; then
+            sh scripts/toolchain.sh
+          else
+            echo "::warning::no rustup on this runner; rust-toolchain.toml is not in force"
+          fi
           cargo --version
       - name: libclang, for bindgen
         run: sh bench/scripts/libclang.sh
+      # FASTER is a comparator too, and not a crate: the script fetches its
+      # sources at the pinned commit and installs the libraries they link.
+      # It does nothing off Linux x86-64, where there is no `faster` arm.
+      - name: FASTER, for the `faster` arm
+        run: sh bench/scripts/faster.sh
       - name: Build
         working-directory: bench
         run: cargo build --release --bin bench

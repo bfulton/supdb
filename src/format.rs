@@ -53,10 +53,3 @@ pub(crate) const SLOT: u64 = 512;
 /// the checksum -- a format change that presented itself as "no valid supdb
 /// checkpoint" on a healthy file.
 pub(crate) const SUPER_BYTES: usize = 144;
-
-/// Sub-phases of `flatindex::encode`, printed under `SUPDB_CKPT_PHASES`.
-pub(crate) fn enc_phase(what: &str, t: std::time::Instant) {
-    if std::env::var_os("SUPDB_CKPT_PHASES").is_some() {
-        eprintln!("      enc:{what} {:.4}s", t.elapsed().as_secs_f64());
-    }
-}

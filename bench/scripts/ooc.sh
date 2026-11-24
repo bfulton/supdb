@@ -7,7 +7,8 @@
 #   sh scripts/ooc.sh --prove-red                     # the gate, proved on a known-red input
 #
 # The run makes a cgroup of its own under the group this shell is in,
-# moves itself into it and removes it when it is done (`bound::Bound`).
+# stays out of it, gives each pass a group under it with the bound on it,
+# and removes them when it is done (`bound::Bound`).
 # A run the kernel kills for exceeding the bound never gets there: its
 # group stays, named on stderr by the run's own `bench: bound ... in
 # group PATH` line, and the next run removes a stale sibling only where
@@ -53,6 +54,11 @@ cleanup() {
     group=$(sed -n 's/^bench: bound [0-9]* bytes in group //p' "$err" | tail -n 1)
   fi
   if [ -n "$group" ] && [ -d "$group" ]; then
+    # The pass groups first: a cgroup directory goes only once the groups
+    # under it have, and a pass cut by the exit leaves its own.
+    for p in "$group"/pass-*; do
+      [ -d "$p" ] && rmdir "$p" 2>/dev/null
+    done
     if rmdir "$group" 2>/dev/null; then
       echo "ooc.sh: removed the run's group $group" >&2
     else
@@ -87,6 +93,33 @@ case "$L" in
     ;;
 esac
 shift
+
+# The binary's stamp is the build's, not the tree's at the run: a binary
+# built with anything uncommitted -- a doc of the batch still in the
+# working tree is enough -- stamps its row `-dirty`, and a row of a dirty
+# tree is not the series'. A roster of two hours was built so and found
+# out when its row was read. Refused here before anything is measured;
+# OOC_DIRTY=1 runs one anyway, for a look that will not be banked.
+stamp=$("$bin" stamp 2>/dev/null | cut -d' ' -f1)
+case "$stamp" in
+  '')
+    echo "ooc.sh: $bin does not say its stamp (bench stamp); rebuild it" >&2
+    exit 2
+    ;;
+  *-dirty|unknown)
+    if [ "${OOC_DIRTY:-}" != 1 ]; then
+      echo "ooc.sh: refused: $bin is stamped $stamp; commit or stash, rebuild, and run again (OOC_DIRTY=1 for a row that will not be banked)" >&2
+      exit 2
+    fi
+    echo "ooc.sh: $bin is stamped $stamp: this row is not the series'" >&2
+    ;;
+esac
+
+# Room above the bound first (`scripts/room.sh`): the run's group is made
+# under the one this shell is in, and a group above at its limit takes
+# pages from every pass under it. The binary is read back after the drop,
+# so that no pass faults its own code in under its bound.
+sh "$(dirname "$0")/room.sh" "$bin" >&2
 
 # The run's stderr is both shown and kept: the group's path is read from
 # it and the banked-rungs line is the verdict. Its status is written by

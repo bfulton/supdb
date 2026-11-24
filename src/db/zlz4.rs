@@ -42,6 +42,10 @@ const MAX_DISTANCE: usize = 65_535;
 const HASH_LOG: u32 = 13;
 /// How far short of a long match's end the search resumes.
 const RESUME: usize = 3;
+/// The run of positions with no match after which the greedy parse
+/// (`Effort::greedy`) steps two at a time, then three: liblz4's skip
+/// trigger.
+const ACCEL_SHIFT: usize = 6;
 /// The largest group the encoder takes, the form's largest decoded group.
 pub const MAX_INPUT: usize = 64 * 1024;
 
@@ -63,6 +67,27 @@ pub struct Effort {
     /// positions starts a longer one, and the positions it covers only
     /// inserted, searched by nothing.
     pub lazy: u32,
+    /// Under the lazy parse, the positions inside a match of `skip_min` or
+    /// more taken are not inserted either, but for the last [`RESUME`]
+    /// it covers: the chains hold fewer positions, a later match into the
+    /// inside of a long one is found from its end or not at all, and the
+    /// insert of every byte the match covers, most of the parse's cost on
+    /// a group of long matches, is not paid. Priced on the form's own
+    /// groups at sixteen positions (`bench/examples/zdecode.rs`, `--rhc
+    /// 16:0:8:1:1`): 6.3 µs a group to encode against 8.7, 54.8 sequences
+    /// a group against 51.9 and the cold decode 0.64 µs against 0.59, the
+    /// greedy encoder at 2.0 and about 62 -- the parse's price is its
+    /// search, so this saves little of it and gives back part of the
+    /// decode. Off in [`Effort::SHIPPED`].
+    pub sparse: bool,
+    /// A greedy parse over the hash chains in place of the lazy or the
+    /// shortest-path one: at each position not inside a match taken, the
+    /// longest match the first `attempts` positions of its chain hold,
+    /// taken at once; the positions it covers joined to their chains only
+    /// for the last [`RESUME`], and a run of positions with no match
+    /// stepped over faster the longer it runs (`ACCEL_SHIFT`), as the
+    /// greedy encoders do. `lazy` and `sparse` are not read under it.
+    pub greedy: bool,
 }
 
 impl Effort {
@@ -81,7 +106,29 @@ impl Effort {
         seq_cost: 0,
         skip_min: 8,
         lazy: 1,
+        sparse: false,
+        greedy: false,
     };
+
+    /// The search a build asks for by its chain depth
+    /// (`Options::zpages_parse_chains`): zero the shipped lazy parse
+    /// ([`Effort::SHIPPED`]), else the greedy parse over `chains` positions
+    /// of each position's chain. Priced on the form's own groups
+    /// (`bench/examples/zdecode.rs`, `--rhc N:0:8:1:0:1`): at two and four
+    /// positions 0.93 and 0.91 of the greedy encoder's sequences in about
+    /// 2.1 and 2.2 times its encode, where the shipped parse writes 0.84 in
+    /// 4.2.
+    pub fn of_chains(chains: u32) -> Effort {
+        if chains == 0 {
+            Effort::SHIPPED
+        } else {
+            Effort {
+                attempts: chains,
+                greedy: true,
+                ..Effort::SHIPPED
+            }
+        }
+    }
 }
 
 /// The encoder's tables and scratch, kept across groups so that a group's
@@ -141,6 +188,10 @@ impl Encoder {
     fn parse(&mut self, input: &[u8], e: Effort) {
         self.seqs.clear();
         if input.len() < MFLIMIT + 1 || e.attempts == 0 {
+            return;
+        }
+        if e.greedy {
+            self.greedy(input, e);
             return;
         }
         if e.lazy > 0 {
@@ -208,6 +259,80 @@ impl Encoder {
             self.seqs
                 .push((anchor as u32, (s - anchor) as u32, off as u16, len as u32));
             s += len;
+            anchor = s;
+            if e.sparse && len >= e.skip_min as usize {
+                ins = ins.max(s.saturating_sub(RESUME));
+            }
+        }
+        self.seqs.reverse();
+    }
+
+    /// The greedy parse over the chains (`Effort::greedy`), its sequences
+    /// left in `seqs`, last first.
+    #[inline(never)]
+    fn greedy(&mut self, input: &[u8], e: Effort) {
+        let n = input.len();
+        if self.base as usize > u32::MAX as usize - 2 * MAX_INPUT - 2 {
+            self.head.iter_mut().for_each(|h| *h = 0);
+            self.base = 0;
+        }
+        let base = self.base;
+        self.base += n as u32 + 1;
+        if self.chain.len() < n {
+            self.chain.resize(n, 0);
+        }
+        let head = &mut self.head[..];
+        let chain = &mut self.chain[..n];
+        let last_start = n - MFLIMIT;
+        let limit = n - LASTLITERALS;
+        let (mut s, mut anchor) = (0usize, 0usize);
+        let mut misses = 0usize;
+        while s <= last_start {
+            let v = read_u32(input, s);
+            let h = hash(v);
+            let max_len = limit - s;
+            let (mut best_len, mut best_off) = (MINMATCH - 1, 0usize);
+            let mut cand = head[h];
+            let mut tries = e.attempts;
+            while cand > base && tries > 0 {
+                let q = (cand - base - 1) as usize;
+                tries -= 1;
+                if input[q + best_len] == input[s + best_len] && read_u32(input, q) == v {
+                    let l = common(input, q, s, max_len);
+                    if l > best_len {
+                        best_len = l;
+                        best_off = s - q;
+                        if l == max_len {
+                            break;
+                        }
+                    }
+                }
+                let c = chain[q];
+                if c == 0 {
+                    break;
+                }
+                cand -= c as u32;
+            }
+            insert(head, chain, s, h, base);
+            if best_len < MINMATCH {
+                misses += 1;
+                s += 1 + (misses >> ACCEL_SHIFT);
+                continue;
+            }
+            misses = 0;
+            self.seqs.push((
+                anchor as u32,
+                (s - anchor) as u32,
+                best_off as u16,
+                best_len as u32,
+            ));
+            let end = s + best_len;
+            // The last positions the match covers join their chains, where
+            // a later match into its inside is found from.
+            for q in end.saturating_sub(RESUME).max(s + 1)..end.min(last_start + 1) {
+                insert(head, chain, q, hash(read_u32(input, q)), base);
+            }
+            s = end;
             anchor = s;
         }
         self.seqs.reverse();
@@ -573,6 +698,16 @@ pub struct DecodeError;
 /// careful loop. The bytes written there are not the block's.
 pub const DECODE_SLACK: usize = 64;
 
+/// The output past a block's decoded end the flat loop runs to the block's
+/// end in (`Dec::FlatEnd`): a flat turn writes up to `FLAT_OUT` bytes
+/// from where it starts and the fast loop's `FAST_OUT` after it, so with
+/// `DECODE_SLACK` alone the flat loop stopped a turn's room short of the
+/// end and the block's last sequences went the fast loop's branchy way --
+/// a seventh of the decoder's time in a profile of the threaded scans at
+/// ten million keys under 1.25 GiB, for the last few dozen bytes of each
+/// group. The bytes written there are not the block's.
+pub const FLAT_SLACK: usize = FLAT_OUT + FAST_OUT;
+
 /// The input a fast turn may read from its token: the token, a move of
 /// sixteen literals, and an offset after fewer than fifteen of them, which
 /// end inside the sixteen moved and a byte past them. A longer run checks
@@ -616,6 +751,69 @@ pub fn decompress_into(src: &[u8], dst: &mut [u8]) -> Result<usize, DecodeError>
 /// length bytes read inside the block. One that ends its buffer leaves its
 /// last `FAST_IN` bytes to the careful loop.
 pub fn decompress_in(src: &[u8], len: usize, dst: &mut [u8]) -> Result<usize, DecodeError> {
+    decompress_in_with::<FLAT_NONE>(src, len, dst)
+}
+
+/// The instructions the flat loop's moves are compiled to: the target's
+/// baseline, or the widest the CPU running it offers, found once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlatIsa {
+    /// The target's baseline: sixteen-byte moves on x86-64.
+    Base,
+    /// Thirty-two-byte moves.
+    Avx2,
+    /// Sixty-four-byte moves.
+    Avx512,
+}
+
+/// The widest flat loop this CPU runs.
+pub fn flat_isa() -> FlatIsa {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            return FlatIsa::Avx512;
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return FlatIsa::Avx2;
+        }
+    }
+    FlatIsa::Base
+}
+
+/// [`decompress_in`] with the flat loop ahead of the fast one where the
+/// block is padded (`flat_loop`), compiled for the widest moves the CPU
+/// has: the same bytes and the same refusals, for every input.
+pub fn decompress_in_flat(src: &[u8], len: usize, dst: &mut [u8]) -> Result<usize, DecodeError> {
+    decompress_in_flat_on(flat_isa(), src, len, dst)
+}
+
+/// [`decompress_in_flat`] with the flat loop compiled for `isa`, which the
+/// CPU must have: [`flat_isa`] or narrower.
+pub fn decompress_in_flat_on(
+    isa: FlatIsa,
+    src: &[u8],
+    len: usize,
+    dst: &mut [u8],
+) -> Result<usize, DecodeError> {
+    match isa {
+        FlatIsa::Base => decompress_in_with::<FLAT_BASE>(src, len, dst),
+        FlatIsa::Avx2 => decompress_in_with::<FLAT_AVX2>(src, len, dst),
+        FlatIsa::Avx512 => decompress_in_with::<FLAT_AVX512>(src, len, dst),
+    }
+}
+
+/// The decoders' loops by their const parameter: the fast loop alone, or
+/// the flat loop ahead of it compiled for one of [`FlatIsa`].
+const FLAT_NONE: u8 = 0;
+const FLAT_BASE: u8 = 1;
+const FLAT_AVX2: u8 = 2;
+const FLAT_AVX512: u8 = 3;
+
+fn decompress_in_with<const FLAT: u8>(
+    src: &[u8],
+    len: usize,
+    dst: &mut [u8],
+) -> Result<usize, DecodeError> {
     if len > src.len() {
         return Err(DecodeError);
     }
@@ -631,10 +829,12 @@ pub fn decompress_in(src: &[u8], len: usize, dst: &mut [u8]) -> Result<usize, De
         // checks its own room first. `src` and `dst` are different buffers,
         // and a match reads `dst` behind what it writes.
         let done = if readable - len >= PAD_IN {
-            unsafe { fast_loop::<true>(src, len, dst, &mut ip, &mut op, 0, olim)? }
+            // SAFETY: as the fast loop's, padded.
+            (unsafe { flat_on::<FLAT>(src, len, dst, &mut ip, &mut op, olim, olim)? })
+                || unsafe { fast_loop::<true>(src, len, dst, &mut ip, &mut op, 0, olim, olim)? }
         } else if readable >= FAST_IN {
             let ilim = (readable - FAST_IN).min(len - 1);
-            unsafe { fast_loop::<false>(src, len, dst, &mut ip, &mut op, ilim, olim)? }
+            unsafe { fast_loop::<false>(src, len, dst, &mut ip, &mut op, ilim, olim, olim)? }
         } else {
             false
         };
@@ -651,16 +851,150 @@ pub fn decompress_in(src: &[u8], len: usize, dst: &mut [u8]) -> Result<usize, De
     Err(DecodeError)
 }
 
-/// The fast loop over the block `src[..len]`: turns while `op <= olim` and,
+/// Where a block's decode stands between two calls of [`decompress_more`]:
+/// the input read and the output written, at a sequence's boundary, and
+/// whether the block has ended. The default is a block not begun.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Part {
+    pub ip: usize,
+    pub op: usize,
+    pub done: bool,
+}
+
+/// [`decompress_in`] a part at a time: the block `src[..len]` decoded on
+/// into `dst` from where `st` stands until its output passes `stop` bytes
+/// or the block ends, `st` left at the sequence boundary reached. The
+/// bytes of `dst` before `st.op` are the block's first `st.op`, the same a
+/// whole decode writes there; the bytes past it are not the block's yet,
+/// the fast loop's wide copies landing in them. Called again with a larger
+/// `stop` it goes on, and a caller that stops asking has decoded a prefix
+/// and nothing has to be undone.
+///
+/// A point read wants one record of a group and the decoder is sequential,
+/// so the read decodes as far as its record and no further: a group read
+/// for one key and not again is the common read of a store larger than its
+/// caches, and a decode's cost is its tokens, a branch or two each that the
+/// predictor has never seen (`CLAUDE.md`, a decoder timed on one input).
+///
+/// `dst` is the same buffer at every call for one block, and `st` the
+/// state the last call left: a state from another block or another buffer
+/// decodes garbage or is refused, and writes nothing outside `dst` either
+/// way, since every bound is checked against the buffers given here.
+pub fn decompress_more(
+    src: &[u8],
+    len: usize,
+    dst: &mut [u8],
+    st: &mut Part,
+    stop: usize,
+) -> Result<(), DecodeError> {
+    decompress_more_with::<FLAT_NONE>(src, len, dst, st, stop)
+}
+
+/// [`decompress_more`] with the flat loop ahead of the fast one where the
+/// block is padded, as [`decompress_in_flat`].
+pub fn decompress_more_flat(
+    src: &[u8],
+    len: usize,
+    dst: &mut [u8],
+    st: &mut Part,
+    stop: usize,
+) -> Result<(), DecodeError> {
+    decompress_more_flat_on(flat_isa(), src, len, dst, st, stop)
+}
+
+/// [`decompress_more_flat`] with the flat loop compiled for `isa`, as
+/// [`decompress_in_flat_on`].
+pub fn decompress_more_flat_on(
+    isa: FlatIsa,
+    src: &[u8],
+    len: usize,
+    dst: &mut [u8],
+    st: &mut Part,
+    stop: usize,
+) -> Result<(), DecodeError> {
+    match isa {
+        FlatIsa::Base => decompress_more_with::<FLAT_BASE>(src, len, dst, st, stop),
+        FlatIsa::Avx2 => decompress_more_with::<FLAT_AVX2>(src, len, dst, st, stop),
+        FlatIsa::Avx512 => decompress_more_with::<FLAT_AVX512>(src, len, dst, st, stop),
+    }
+}
+
+fn decompress_more_with<const FLAT: u8>(
+    src: &[u8],
+    len: usize,
+    dst: &mut [u8],
+    st: &mut Part,
+    stop: usize,
+) -> Result<(), DecodeError> {
+    if len > src.len() || st.ip > len || st.op > dst.len() {
+        return Err(DecodeError);
+    }
+    if st.done {
+        return Ok(());
+    }
+    let (readable, oend) = (src.len(), dst.len());
+    let (mut ip, mut op) = (st.ip, st.op);
+    let block = &src[..len];
+    while op <= stop {
+        if len > 0 && oend >= FAST_OUT && op <= oend - FAST_OUT {
+            let olim = oend - FAST_OUT;
+            let ostop = stop.min(olim);
+            // SAFETY: as `decompress_in`'s, with the turns ended at `ostop
+            // <= olim` and the room still `olim`; a turn starts at `op <=
+            // ostop` and, unpadded, at `ip <= ilim`.
+            let done = if readable - len >= PAD_IN {
+                // SAFETY: as the fast loop's, padded.
+                (unsafe { flat_on::<FLAT>(src, len, dst, &mut ip, &mut op, olim, ostop)? })
+                    || unsafe {
+                        fast_loop::<true>(src, len, dst, &mut ip, &mut op, 0, olim, ostop)?
+                    }
+            } else if readable >= FAST_IN {
+                let ilim = (readable - FAST_IN).min(len - 1);
+                unsafe { fast_loop::<false>(src, len, dst, &mut ip, &mut op, ilim, olim, ostop)? }
+            } else {
+                false
+            };
+            if done {
+                *st = Part { ip, op, done: true };
+                return Ok(());
+            }
+            if op > stop {
+                break;
+            }
+        }
+        // A turn lacked its room, or the block is at its last bytes: one
+        // sequence with every bound checked, and the fast loop again.
+        if ip >= len {
+            return Err(DecodeError);
+        }
+        if careful_sequence(block, dst, &mut ip, &mut op)? {
+            *st = Part { ip, op, done: true };
+            return Ok(());
+        }
+    }
+    *st = Part {
+        ip,
+        op,
+        done: false,
+    };
+    Ok(())
+}
+
+/// The fast loop over the block `src[..len]`: turns while `op <= ostop` and,
 /// unless `PADDED`, `ip <= ilim`; `true` where the block ended in it, else
-/// the rest left to the careful loop where a turn lacked its room. Every
-/// length byte is read inside the block, so a turn starts at most a byte
-/// past it.
+/// the rest left to the caller where a turn lacked its room or the output
+/// passed `ostop`. Every length byte is read inside the block, so a turn
+/// starts at most a byte past it. `ostop` is where the turns end and `olim`
+/// the room they are given: a whole decode passes the room for both, and a
+/// decode that stops early (`decompress_more`) a smaller `ostop`, so that a
+/// run of literals longer than what is left to its stop is still moved by
+/// the fast loop, into the room past it.
 ///
 /// # Safety
-/// `olim + FAST_OUT == dst.len()`, `len <= src.len()`, and either `PADDED`
-/// and `len + PAD_IN <= src.len()`, or `ilim + FAST_IN <= src.len()` and
-/// `ilim < len`.
+/// `ostop <= olim`, `olim + FAST_OUT <= dst.len()`, `len <= src.len()`, and
+/// either `PADDED` and `len + PAD_IN <= src.len()`, or `ilim + FAST_IN <=
+/// src.len()` and `ilim < len`.
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 unsafe fn fast_loop<const PADDED: bool>(
     src: &[u8],
@@ -670,6 +1004,7 @@ unsafe fn fast_loop<const PADDED: bool>(
     opr: &mut usize,
     ilim: usize,
     olim: usize,
+    ostop: usize,
 ) -> Result<bool, DecodeError> {
     let (iend, oend) = (src.len(), dst.len());
     let block = &src[..len];
@@ -682,7 +1017,7 @@ unsafe fn fast_loop<const PADDED: bool>(
     // in `dst` ends at or before its destination starts (`offset >= 8` for
     // a move of eight, `>= 16` for sixteen, `step >= 8` in `near_copy`).
     unsafe {
-        while op <= olim && (PADDED || ip <= ilim) {
+        while op <= ostop && (PADDED || ip <= ilim) {
             let token = *sp.add(ip);
             ip += 1;
             // The run. Under fifteen literals, one move of sixteen inside
@@ -802,6 +1137,220 @@ unsafe fn fast_loop<const PADDED: bool>(
     *ipr = ip;
     *opr = op;
     Ok(false)
+}
+
+/// The flat loop for the decoder's const parameter: none, or compiled for
+/// the moves it names. `false`, the block not ended, where there is none.
+///
+/// # Safety
+/// `flat_loop`'s, and the CPU has the instructions `FLAT` names.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn flat_on<const FLAT: u8>(
+    src: &[u8],
+    len: usize,
+    dst: &mut [u8],
+    ipr: &mut usize,
+    opr: &mut usize,
+    olim: usize,
+    ostop: usize,
+) -> Result<bool, DecodeError> {
+    // SAFETY: the caller's.
+    unsafe {
+        match FLAT {
+            FLAT_BASE => flat_loop(src, len, dst, ipr, opr, olim, ostop),
+            #[cfg(target_arch = "x86_64")]
+            FLAT_AVX2 => flat_loop_avx2(src, len, dst, ipr, opr, olim, ostop),
+            #[cfg(target_arch = "x86_64")]
+            FLAT_AVX512 => flat_loop_avx512(src, len, dst, ipr, opr, olim, ostop),
+            #[cfg(not(target_arch = "x86_64"))]
+            FLAT_AVX2 | FLAT_AVX512 => flat_loop(src, len, dst, ipr, opr, olim, ostop),
+            _ => Ok(false),
+        }
+    }
+}
+
+/// One turn of the padded fast loop from `*ipr`, `*opr`: the flat loop's
+/// rare sequence. Out of line, so that the flat loop's registers are its
+/// own turn's and the turn's state is not spilled around the rare one's.
+///
+/// # Safety
+/// `fast_loop::<true>`'s, with `*opr <= olim`.
+#[inline(never)]
+unsafe fn fast_turn(
+    src: &[u8],
+    len: usize,
+    dst: &mut [u8],
+    ipr: &mut usize,
+    opr: &mut usize,
+    olim: usize,
+) -> Result<bool, DecodeError> {
+    let one = *opr;
+    // SAFETY: the caller's; a stop at the turn's start ends it after one.
+    unsafe { fast_loop::<true>(src, len, dst, ipr, opr, 0, olim, one) }
+}
+
+/// `flat_loop` compiled with thirty-two-byte moves.
+///
+/// # Safety
+/// `flat_loop`'s, on a CPU with AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+unsafe fn flat_loop_avx2(
+    src: &[u8],
+    len: usize,
+    dst: &mut [u8],
+    ipr: &mut usize,
+    opr: &mut usize,
+    olim: usize,
+    ostop: usize,
+) -> Result<bool, DecodeError> {
+    // SAFETY: the caller's.
+    unsafe { flat_loop(src, len, dst, ipr, opr, olim, ostop) }
+}
+
+/// `flat_loop` compiled with sixty-four-byte moves.
+///
+/// # Safety
+/// `flat_loop`'s, on a CPU with AVX-512F.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[inline(never)]
+unsafe fn flat_loop_avx512(
+    src: &[u8],
+    len: usize,
+    dst: &mut [u8],
+    ipr: &mut usize,
+    opr: &mut usize,
+    olim: usize,
+    ostop: usize,
+) -> Result<bool, DecodeError> {
+    // SAFETY: the caller's.
+    unsafe { flat_loop(src, len, dst, ipr, opr, olim, ostop) }
+}
+
+/// The output a flat turn may write past where it starts: a move of
+/// sixty-four literals, and a move of sixty-four match bytes from where
+/// the literals end.
+const FLAT_OUT: usize = 128;
+
+/// The flat loop over a padded block: while `op <= ostop` and the output
+/// has a flat turn's room, a turn a sequence with no branch on its
+/// lengths. The one length byte a run or a match of fifteen or more
+/// carries is read whether or not the token asks for it and added under a
+/// mask, the run is one move of sixty-four and the match two of thirty-two,
+/// so a sequence costs its loads and moves and not the predictor's guess
+/// at which path its lengths take -- the fast loop's tests of a run under
+/// fifteen, a match under nineteen and one over thirty-two, which a group
+/// of the form's records answers at random, a miss a sequence on a cold
+/// group (`CLAUDE.md`, a decoder timed on one input). A sequence outside
+/// that shape -- a run or a match over sixty-four, which a second length
+/// byte would make, or a match from under thirty-two back -- and any
+/// sequence that is not a block's is one turn of `fast_loop`, which
+/// decodes or refuses it; `true` where the block ended, else the rest
+/// left to the caller where a turn lacked its room or the output passed
+/// `ostop`.
+///
+/// # Safety
+/// `ostop <= olim`, `olim + FAST_OUT <= dst.len()`, `len + PAD_IN <=
+/// src.len()`.
+#[inline(always)]
+unsafe fn flat_loop(
+    src: &[u8],
+    len: usize,
+    dst: &mut [u8],
+    ipr: &mut usize,
+    opr: &mut usize,
+    olim: usize,
+    ostop: usize,
+) -> Result<bool, DecodeError> {
+    let oend = dst.len();
+    if oend < FLAT_OUT {
+        return Ok(false);
+    }
+    let flim = (oend - FLAT_OUT).min(ostop);
+    let (mut ip, mut op) = (*ipr, *opr);
+    loop {
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        // SAFETY, for the turns: a turn starts at `op <= flim`, so its run's
+        // move ends at `op + 64` and its match's at `op + lit + 64`, inside
+        // `dst` with `lit <= 64`; it reads at most four bytes past its token
+        // before the run is bounded, and its run's move ends sixty-four past
+        // where the run starts, which is inside the block; a turn starts at
+        // most three bytes past the block, so every read is inside the
+        // padding (`PAD_IN`). The match's source is `offset >= 32` behind
+        // each move's destination, and inside `dst`.
+        let rare = unsafe {
+            loop {
+                if op > flim {
+                    *ipr = ip;
+                    *opr = op;
+                    return Ok(false);
+                }
+                let token = *sp.add(ip) as usize;
+                let litn = token >> 4;
+                let e1 = *sp.add(ip + 1) as usize;
+                // The run's end both ways, short and with its one length
+                // byte, and a select between them: the next token's place
+                // waits on the token's load, a shift, an add and a move,
+                // not on a mask built from the token.
+                let long = litn == 15;
+                let oip = std::hint::select_unpredictable(long, ip + 2 + 15 + e1, ip + 1 + litn);
+                let lit = std::hint::select_unpredictable(long, 15 + e1, litn);
+                let lip = oip - lit;
+                if oip > len {
+                    return Err(DecodeError);
+                }
+                if oip == len {
+                    // The block's last sequence, literals alone.
+                    if lit > 64 {
+                        break true;
+                    }
+                    std::ptr::copy_nonoverlapping(sp.add(lip), dp.add(op), 64);
+                    *ipr = oip;
+                    *opr = op + lit;
+                    return Ok(true);
+                }
+                let offset =
+                    u16::from_le(std::ptr::read_unaligned(sp.add(oip).cast::<u16>())) as usize;
+                let mln = token & 15;
+                let ml_long = usize::from(mln == 15);
+                let ml = std::hint::select_unpredictable(
+                    mln == 15,
+                    15 + MINMATCH + *sp.add(oip + 2) as usize,
+                    mln + MINMATCH,
+                );
+                let op2 = op + lit;
+                if (lit | ml) > 64 || offset < 32 || offset > op2 {
+                    break true;
+                }
+                std::ptr::copy_nonoverlapping(sp.add(lip), dp.add(op), 64);
+                let m = op2 - offset;
+                std::ptr::copy_nonoverlapping(dp.add(m), dp.add(op2), 32);
+                std::ptr::copy_nonoverlapping(dp.add(m + 32), dp.add(op2 + 32), 32);
+                op = op2 + ml;
+                ip = oip + 2 + ml_long;
+            }
+        };
+        debug_assert!(rare);
+        // One turn of the fast loop for the sequence the flat turn does not
+        // take: it decodes or refuses it, or lacks its room and goes back
+        // to its token.
+        let at = ip;
+        // SAFETY: the caller's, with `op <= flim <= ostop <= olim`.
+        if unsafe { fast_turn(src, len, dst, &mut ip, &mut op, olim)? } {
+            *ipr = ip;
+            *opr = op;
+            return Ok(true);
+        }
+        if ip == at {
+            *ipr = ip;
+            *opr = op;
+            return Ok(false);
+        }
+    }
 }
 
 /// `len` bytes from `s` to `d` in moves of `N`, the last move's overrun
@@ -1071,12 +1620,16 @@ mod tests {
                 seq_cost: 0,
                 skip_min: 8,
                 lazy: 0,
+                sparse: false,
+                greedy: false,
             },
             Effort {
                 attempts: 1,
                 seq_cost: 0,
                 skip_min: 8,
                 lazy: 0,
+                sparse: false,
+                greedy: false,
             },
             Effort::SHIPPED,
             Effort {
@@ -1084,12 +1637,16 @@ mod tests {
                 seq_cost: 0,
                 skip_min: 8,
                 lazy: 0,
+                sparse: false,
+                greedy: false,
             },
             Effort {
                 attempts: 64,
                 seq_cost: 6,
                 skip_min: 8,
                 lazy: 0,
+                sparse: false,
+                greedy: false,
             },
             Effort {
                 lazy: 1,
@@ -1102,6 +1659,31 @@ mod tests {
             Effort {
                 attempts: 1,
                 lazy: 3,
+                ..Effort::SHIPPED
+            },
+            Effort {
+                sparse: true,
+                ..Effort::SHIPPED
+            },
+            Effort {
+                attempts: 4,
+                skip_min: 4,
+                sparse: true,
+                ..Effort::SHIPPED
+            },
+            Effort {
+                attempts: 1,
+                greedy: true,
+                ..Effort::SHIPPED
+            },
+            Effort {
+                attempts: 4,
+                greedy: true,
+                ..Effort::SHIPPED
+            },
+            Effort {
+                attempts: 64,
+                greedy: true,
                 ..Effort::SHIPPED
             },
         ] {
@@ -1191,6 +1773,8 @@ mod tests {
                     seq_cost: 8,
                     skip_min: 8,
                     lazy: 0,
+                    sparse: false,
+                    greedy: false,
                 },
             )
             .unwrap();
@@ -1199,9 +1783,35 @@ mod tests {
         assert!(priced >= plain, "{priced} against {plain}");
     }
 
+    /// The whole decode, with the flat loop where `flat`.
+    fn dec_in(flat: bool, src: &[u8], len: usize, dst: &mut [u8]) -> Result<usize, DecodeError> {
+        if flat {
+            decompress_in_flat(src, len, dst)
+        } else {
+            decompress_in(src, len, dst)
+        }
+    }
+
+    /// A part's decode, with the flat loop where `flat`.
+    fn dec_more(
+        flat: bool,
+        src: &[u8],
+        len: usize,
+        dst: &mut [u8],
+        st: &mut Part,
+        stop: usize,
+    ) -> Result<(), DecodeError> {
+        if flat {
+            decompress_more_flat(src, len, dst, st, stop)
+        } else {
+            decompress_more(src, len, dst, st, stop)
+        }
+    }
+
     /// `block` decoded by this module into an output of exactly `n` bytes
     /// and into one with the slack the fast loop runs to the end in, both
-    /// held to `want`.
+    /// held to `want`, and followed by bytes not its own with and without
+    /// the flat loop.
     fn decodes_to(block: &[u8], want: &[u8]) {
         let mut exact = vec![0u8; want.len()];
         assert_eq!(decompress_into(block, &mut exact), Ok(want.len()), "exact");
@@ -1223,17 +1833,19 @@ mod tests {
             let mut src = block.to_vec();
             src.extend((0..tail).map(|i| (i * 131 + 7) as u8));
             for room in [want.len(), want.len() + DECODE_SLACK] {
-                let mut out = vec![0x5Au8; room];
-                assert_eq!(
-                    decompress_in(&src, block.len(), &mut out),
-                    Ok(want.len()),
-                    "tail {tail}, room {room}"
-                );
-                assert!(
-                    &out[..want.len()] == want,
-                    "{} bytes: decoded differently, tail {tail}, room {room}",
-                    want.len()
-                );
+                for flat in [false, true] {
+                    let mut out = vec![0x5Au8; room];
+                    assert_eq!(
+                        dec_in(flat, &src, block.len(), &mut out),
+                        Ok(want.len()),
+                        "tail {tail}, room {room}, flat {flat}"
+                    );
+                    assert!(
+                        &out[..want.len()] == want,
+                        "{} bytes: decoded differently, tail {tail}, room {room}, flat {flat}",
+                        want.len()
+                    );
+                }
             }
         }
     }
@@ -1257,6 +1869,8 @@ mod tests {
                     seq_cost: 0,
                     skip_min: 8,
                     lazy: 0,
+                    sparse: false,
+                    greedy: false,
                 },
             ] {
                 let mut out = vec![0u8; max_output(c.len())];
@@ -1351,16 +1965,21 @@ mod tests {
                     ] {
                         let mut padded = d.clone();
                         padded.extend(std::iter::repeat_n(fill, tail));
-                        let mut tailed = vec![0u8; room];
-                        let t = decompress_in(&padded, d.len(), &mut tailed);
-                        assert_eq!(
-                            t.is_ok(),
-                            a.is_ok(),
-                            "a tail changes no verdict: {tail} of {fill:#x}"
-                        );
-                        if let (Ok(n), Ok(m)) = (a, t) {
-                            assert_eq!(n, m);
-                            assert!(ours[..n] == tailed[..m], "a tail changes no byte");
+                        for flat in [false, true] {
+                            let mut tailed = vec![0u8; room];
+                            let t = dec_in(flat, &padded, d.len(), &mut tailed);
+                            assert_eq!(
+                                t.is_ok(),
+                                a.is_ok(),
+                                "a tail changes no verdict: {tail} of {fill:#x}, flat {flat}"
+                            );
+                            if let (Ok(n), Ok(m)) = (a, t) {
+                                assert_eq!(n, m);
+                                assert!(
+                                    ours[..n] == tailed[..m],
+                                    "a tail changes no byte, flat {flat}"
+                                );
+                            }
                         }
                     }
                 }
@@ -1370,6 +1989,284 @@ mod tests {
             cfg!(miri) || both > tried / 20,
             "the damage left some blocks decodable: {both} of {tried}"
         );
+    }
+
+    /// `block` decoded a part at a time, the stop moved on by `step` a call:
+    /// at every call the output's first `op` bytes are the block's, `op`
+    /// has passed the stop or the block has ended, and at its end the
+    /// whole of `want` is there.
+    fn decodes_in_parts(flat: bool, src: &[u8], len: usize, want: &[u8], room: usize, step: usize) {
+        let mut out = vec![0xC3u8; room];
+        let mut st = Part::default();
+        let (mut stop, mut calls) = (0usize, 0usize);
+        loop {
+            let before = st;
+            assert_eq!(
+                dec_more(flat, src, len, &mut out, &mut st, stop),
+                Ok(()),
+                "step {step}, stop {stop}, room {room}, flat {flat}"
+            );
+            calls += 1;
+            assert!(st.op >= before.op && st.ip >= before.ip, "a call goes on");
+            assert!(st.op <= want.len(), "no byte past the block's");
+            assert!(
+                out[..st.op] == want[..st.op],
+                "step {step}: the first {} bytes differ",
+                st.op
+            );
+            if st.done {
+                assert_eq!(st.op, want.len(), "the block's end");
+                assert_eq!(st.ip, len, "the input's end");
+                break;
+            }
+            assert!(st.op > stop, "a call that has not ended passes its stop");
+            stop = st.op.max(stop) + step;
+            assert!(calls <= want.len() + 2, "a call a byte at most");
+        }
+        // Asked again at its end it stands, whatever the stop.
+        let end = st;
+        assert_eq!(
+            dec_more(flat, src, len, &mut out, &mut st, usize::MAX),
+            Ok(())
+        );
+        assert_eq!(st, end);
+    }
+
+    #[test]
+    fn a_block_decoded_a_part_at_a_time_writes_the_whole_decodes_bytes_at_every_stop() {
+        let mut enc = Encoder::new();
+        let steps: &[usize] = if cfg!(miri) {
+            &[1, 64, 256]
+        } else {
+            &[1, 2, 7, 63, 64, 65, 192, 256, 1000, 100_000]
+        };
+        for c in decode_cases() {
+            if c.is_empty() {
+                continue;
+            }
+            let mut blocks = Vec::new();
+            let mut out = vec![0u8; max_output(c.len())];
+            let n = enc.compress_into(&c, &mut out, Effort::SHIPPED).unwrap();
+            blocks.push(out[..n].to_vec());
+            blocks.push(lz4_flex::block::compress(&c));
+            for b in &blocks {
+                for &step in steps {
+                    // A long case a byte at a time is its length in calls,
+                    // each a compare of the prefix: the short steps on the
+                    // short cases.
+                    if step < 7 && c.len() > 1000 {
+                        continue;
+                    }
+                    for tail in [0usize, 17, 18, 63, 64, 200] {
+                        let mut src = b.clone();
+                        src.extend((0..tail).map(|i| (i * 131 + 7) as u8));
+                        for room in [
+                            c.len(),
+                            c.len() + DECODE_SLACK,
+                            c.len() + FLAT_SLACK,
+                            c.len() + 4096,
+                        ] {
+                            for flat in [false, true] {
+                                decodes_in_parts(flat, &src, b.len(), &c, room, step);
+                            }
+                        }
+                    }
+                }
+                // One call with no stop is the whole decode.
+                let mut all = vec![0u8; c.len() + DECODE_SLACK];
+                let mut st = Part::default();
+                assert_eq!(
+                    decompress_more(b, b.len(), &mut all, &mut st, usize::MAX),
+                    Ok(())
+                );
+                assert!(st.done && st.op == c.len() && all[..c.len()] == c[..]);
+            }
+        }
+    }
+
+    /// A part asked with its stop where it stands decodes one sequence and
+    /// no more: a block takes as many such asks as it has sequences, on the
+    /// fast path and on the careful one alike. A short block, whose output
+    /// has no room for the fast loop's strides, is decoded by the careful
+    /// path alone, which is where a loop that ran on past its stop to the
+    /// block's end would be every byte right and no part at all.
+    #[test]
+    fn a_part_asked_where_it_stands_decodes_one_sequence() {
+        let mut enc = Encoder::new();
+        let short: Vec<u8> = b"abcdabcdabcdXYZWabcdabcdQRSTabcdabcdabcd-end".to_vec();
+        assert!(short.len() < FAST_OUT);
+        let mut careful_many = false;
+        for c in decode_cases().chain(std::iter::once(short)) {
+            if c.is_empty() {
+                continue;
+            }
+            let mut out = vec![0u8; max_output(c.len())];
+            let n = enc.compress_into(&c, &mut out, Effort::SHIPPED).unwrap();
+            for b in [out[..n].to_vec(), lz4_flex::block::compress(&c)] {
+                let want = sequences(&b).expect("a block");
+                // Followed by bytes not its own, the flat loop's case.
+                let mut padded = b.clone();
+                padded.extend(std::iter::repeat_n(0xEEu8, PAD_IN));
+                for (src, room, flat) in [
+                    (&b, c.len(), false),
+                    (&b, c.len() + DECODE_SLACK, false),
+                    (&padded, c.len() + DECODE_SLACK, false),
+                    (&padded, c.len() + DECODE_SLACK, true),
+                ] {
+                    let mut dst = vec![0u8; room];
+                    let (mut st, mut asks) = (Part::default(), 0usize);
+                    while !st.done {
+                        let stop = st.op;
+                        assert_eq!(
+                            dec_more(flat, src, b.len(), &mut dst, &mut st, stop),
+                            Ok(())
+                        );
+                        asks += 1;
+                        assert!(asks <= want, "more asks than sequences: {asks} of {want}");
+                    }
+                    assert_eq!(asks, want, "an ask a sequence, {} bytes", c.len());
+                    assert!(dst[..c.len()] == c[..]);
+                    careful_many |= room < FAST_OUT && want >= 3;
+                }
+            }
+        }
+        assert!(
+            careful_many,
+            "a block of several sequences the careful path decodes alone"
+        );
+    }
+
+    #[test]
+    fn a_damaged_block_decoded_in_parts_has_the_whole_decodes_verdict_and_bytes() {
+        // The damage of the test above, each block decoded whole and then a
+        // part at a time into an output of the same room: the parts end in
+        // the whole decode's verdict, and where it decodes, in its bytes; a
+        // prefix the parts wrote before a refusal is the whole decode's
+        // too, where the whole decode got so far. Nothing panics and, under
+        // Miri, nothing is read or written outside the buffers.
+        let mut r = Rng(0x9A27_DEC0);
+        let mut enc = Encoder::new();
+        let mut blocks = Vec::new();
+        for c in decode_cases() {
+            if c.len() < 20 || c.len() > 10_000 {
+                continue;
+            }
+            let mut out = vec![0u8; max_output(c.len())];
+            let n = enc.compress_into(&c, &mut out, Effort::SHIPPED).unwrap();
+            blocks.push((out[..n].to_vec(), c.len()));
+            blocks.push((lz4_flex::block::compress(&c), c.len()));
+        }
+        let (mut decoded, mut refused) = (0u64, 0u64);
+        for (b, ulen) in &blocks {
+            for t in 0..if cfg!(miri) { 6 } else { 30 } {
+                let mut d = b.clone();
+                match t % 4 {
+                    0 => {
+                        let i = r.below(d.len() as u64) as usize;
+                        d[i] ^= 1 << r.below(8);
+                    }
+                    1 => {
+                        let i = r.below(d.len() as u64) as usize;
+                        d[i] = r.below(256) as u8;
+                    }
+                    2 => d.truncate(r.below(d.len() as u64) as usize),
+                    _ => {
+                        let n = r.below(64) as usize;
+                        d = (0..n).map(|_| r.below(256) as u8).collect();
+                    }
+                }
+                for tail in [0usize, 80] {
+                    let mut src = d.clone();
+                    src.extend(std::iter::repeat_n(0xEEu8, tail));
+                    for (room, flat) in [
+                        (*ulen, false),
+                        (ulen + DECODE_SLACK, false),
+                        (ulen + DECODE_SLACK, true),
+                        (ulen + FLAT_SLACK, true),
+                        (ulen + 300, true),
+                    ] {
+                        let mut whole = vec![0u8; room];
+                        let a = dec_in(flat, &src, d.len(), &mut whole);
+                        let mut plain = vec![0u8; room];
+                        assert_eq!(
+                            decompress_in(&src, d.len(), &mut plain),
+                            a,
+                            "the flat loop's verdict is the fast loop's: room {room}, tail {tail}"
+                        );
+                        if let Ok(n) = a {
+                            assert!(plain[..n] == whole[..n], "the flat loop's bytes");
+                        }
+                        for step in [1usize, 64, 256] {
+                            let mut parts = vec![0u8; room];
+                            let mut st = Part::default();
+                            let mut stop = 0usize;
+                            let verdict = loop {
+                                match dec_more(flat, &src, d.len(), &mut parts, &mut st, stop) {
+                                    Err(e) => break Err(e),
+                                    Ok(()) if st.done => break Ok(st.op),
+                                    Ok(()) => {
+                                        assert!(st.op > stop);
+                                        stop = st.op + step;
+                                    }
+                                }
+                            };
+                            assert_eq!(
+                                verdict, a,
+                                "the parts' verdict is the whole decode's: step {step}, room {room}, tail {tail}"
+                            );
+                            match a {
+                                Ok(n) => {
+                                    decoded += 1;
+                                    assert!(parts[..n] == whole[..n], "the decoded bytes");
+                                }
+                                Err(_) => refused += 1,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            cfg!(miri) || (decoded > 100 && refused > 100),
+            "both verdicts reached: {decoded} decoded, {refused} refused"
+        );
+    }
+
+    #[test]
+    fn a_part_state_that_is_not_the_buffers_is_refused() {
+        let input: Vec<u8> = (0..600).map(|i| (i % 11) as u8).collect();
+        let b = lz4_flex::block::compress(&input);
+        let mut out = vec![0u8; 600 + DECODE_SLACK];
+        for bad in [
+            Part {
+                ip: b.len() + 1,
+                op: 0,
+                done: false,
+            },
+            Part {
+                ip: 0,
+                op: out.len() + 1,
+                done: false,
+            },
+        ] {
+            let mut st = bad;
+            assert_eq!(
+                decompress_more(&b, b.len(), &mut out, &mut st, 10),
+                Err(DecodeError)
+            );
+        }
+        let mut st = Part::default();
+        assert_eq!(
+            decompress_more(&b, b.len() + 1, &mut out, &mut st, 10),
+            Err(DecodeError)
+        );
+        // A stop already passed decodes nothing more.
+        let mut st = Part::default();
+        decompress_more(&b, b.len(), &mut out, &mut st, 100).unwrap();
+        let at = st;
+        assert!(at.op > 100 && !at.done);
+        decompress_more(&b, b.len(), &mut out, &mut st, 50).unwrap();
+        assert_eq!(st, at);
     }
 
     #[test]

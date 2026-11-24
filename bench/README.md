@@ -34,13 +34,26 @@ row from that, so a run that was cut is resumed rather than repeated;
 a bounded row with a pass the bound killed lands under `runs/killed/`
 instead, with the kill named, and the command exits 137.
 
-Building the RocksDB comparator runs bindgen, which needs the libclang
-shared library (`libclang.so` on Linux, `libclang.dylib` on macOS). If the
-build cannot find one, `eval "$(sh scripts/libclang.sh)"` exports what the
-host needs: the toolchain's directory, and on macOS a run-time search path
-for it (on a Debian-family host it installs `libclang-dev` when nothing
-unversioned exists). CI runs the same script, and so does the engine's
-`scripts/deps.sh`, which readies a host for every check.
+Build from `bench/`. Its `.cargo/config.toml` compiles every engine, the
+Rust and the comparators' C and C++, to one machine level and one
+code-generation policy, and cargo reads that file from the directory it runs
+in; a build that did not get it refuses to finish, and `bench` refuses a host
+without the level. On x86-64 the level is x86-64-v3 with PCLMUL.
+
+Building the RocksDB comparator runs bindgen, which loads the libclang
+shared library as the build runs and needs clang's own headers beside it.
+A host with clang installed has both and needs nothing set.
+`sh scripts/libclang.sh` checks for them and names the directory it found;
+on a Debian-family host with neither it installs `libclang-dev`. CI runs
+the same script, and so does the engine's `scripts/deps.sh`, which readies
+a host for every check.
+
+The FASTER comparator is Microsoft's C++ store, which is not a crate and
+whose sources are not in this repository. `sh scripts/faster.sh` fetches
+them at the pinned commit (`vendor/faster/PIN`) and, on a Debian-family
+host, installs the libraries they link (libaio, TBB, uuid); the build fails
+until it has run. CI and `scripts/deps.sh` run it too. The arm is built on
+Linux x86-64 alone, and the script does nothing anywhere else.
 
 ## What is measured
 
@@ -53,6 +66,7 @@ unversioned exists). CI runs the same script, and so does the engine's
 | `scan-lag` | scans after a burst of updates over 1%, 10% and 100% of the keys, before the engine has caught up, and the bursts' own rates |
 | `ycsb-A` … `ycsb-F` | the YCSB core mixes on the loaded store |
 | `scan-mixed` | threaded scans on the store the mixes leave |
+| `threads-A`, `threads-RMW` | point reads and updates from several threads at once, with Zipfian and uniform keys; only where `--passes mixes-threaded` asks |
 | `wal-floor`, `scan-floor`, `mem-floor`, `page-floor` | what the host does with no engine in the way |
 
 `DESIGN.md` has every workload and quantity, and the bounded scale's
@@ -61,8 +75,10 @@ floors.
 Arms: `supdb`, `supdb-forms`, `supdb-settle`, `supdb-nosnap`,
 `supdb-noadvice`, `supdb-nocache`, `supdb-cache256`, `lmdb`, `rocksdb-tuned`
 (durable per batch); `supdb-ingest`, `lmdb-nosync`, `rocksdb-tuned-nosync`
-(buffered). Every comparison is within a guarantee, and a comparator differs
-between the two groups in the sync alone (`DESIGN.md`, Arms).
+(buffered); `faster` (in memory until a checkpoint; Linux x86-64). Every
+comparison is within a guarantee, and a comparator differs between the first
+two groups in the sync alone; `faster` is alone in the third and compared
+with nothing (`DESIGN.md`, Arms).
 
 ## Checks
 

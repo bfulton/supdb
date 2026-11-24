@@ -20,6 +20,67 @@ pub fn vf(f: &mut dyn FnMut(&[u8])) -> &mut dyn FnMut(&[u8]) {
     f
 }
 
+/// The switch that runs the tests which hold a store's answers whatever form
+/// serves it with the stride form forced: `SUPDB_TEST_STRIDE=1`, read here
+/// and nowhere else. Off, the default, it changes nothing and the gate runs
+/// the tests as they are written. The stride form is asked for only by a
+/// build of a form file, and those run only where the compact form is
+/// forced, so a switch that set `ZStride::Forced` alone would leave every
+/// test that names no form in the controller's FITS, raw, with the stride
+/// code never reached; so where a test forces the compact form the switch
+/// adds the stride form beside it (`with_stride`), and where a test names
+/// no form it starts from the compact form forced as well (`options`).
+pub fn stride_switch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SUPDB_TEST_STRIDE").is_ok_and(|v| v == "1"))
+}
+
+/// `o` with the form a build of a form file asks for named: the stride form
+/// under the switch (`stride_switch`), and the block form without it,
+/// whichever the engine ships. For a test that forces the compact form
+/// itself, at the site where it does: such a test is written against the
+/// block form's files, counts and codings, and the switch is what runs it
+/// over the stride form.
+pub fn with_stride(mut o: supdb::Options) -> supdb::Options {
+    o.zpages_stride = if stride_switch() {
+        supdb::ZStride::Forced
+    } else {
+        supdb::ZStride::Off
+    };
+    o
+}
+
+/// The options a test builds on in place of `Options::default()`: the
+/// default, and under the switch (`stride_switch`) the compact form forced
+/// (`ZPages::Always`) with its floor lowered, since the floor declines every
+/// partition a test can afford to write, and the stride form asked for. A
+/// test that names a form keeps it: the switch moves what a test builds on
+/// and nothing it says, so a field a test sets is the test's.
+pub fn options() -> supdb::Options {
+    let o = supdb::Options {
+        jobs_mapped: !jobs_heap_switch(),
+        ..supdb::Options::default()
+    };
+    if !stride_switch() {
+        return o;
+    }
+    with_stride(supdb::Options {
+        zpages: supdb::ZPages::Always,
+        zpages_min_bytes: 0,
+        ..o
+    })
+}
+
+/// Whether the tests' stores take their jobs' large arrays from the
+/// allocator (`Options::jobs_mapped` off): `SUPDB_TEST_JOBSHEAP=1`, read
+/// once. The option is on in the engine, so a run of the tests under the
+/// switch is the one run that takes every seal, merge and close of theirs
+/// through the allocator's buffers, the shape before and the arm's.
+pub fn jobs_heap_switch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SUPDB_TEST_JOBSHEAP").is_ok_and(|v| v == "1"))
+}
+
 /// A segment file without the part of it that is a function of when it was
 /// written.
 ///
@@ -104,6 +165,28 @@ pub fn zpg_mappings(dir: &std::path::Path) -> Vec<String> {
         .filter_map(maps_path)
         .filter(|p| p.starts_with(&*prefix))
         .map(str::to_owned)
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// `zpg_mappings` with the inode each mapping is of, read from its line's
+/// fifth field: a mapped file renamed to a dead name and unlinked is still
+/// the inode it was under its live name, which is how a test names the
+/// files it began with among every retired one a pin holds.
+#[cfg(target_os = "linux")]
+pub fn zpg_mapped_inodes(dir: &std::path::Path) -> Vec<(u64, String)> {
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+    let prefix = dir.join("zpg-");
+    let prefix = prefix.to_string_lossy();
+    let mut v: Vec<(u64, String)> = maps
+        .lines()
+        .filter_map(|line| {
+            let path = maps_path(line)?;
+            let ino = line.split_whitespace().nth(4)?.parse().ok()?;
+            path.starts_with(&*prefix).then(|| (ino, path.to_owned()))
+        })
         .collect();
     v.sort();
     v.dedup();
