@@ -519,6 +519,8 @@ pub struct Supdb {
     cipher_apart: bool,
     /// `Policy::cipher_half`.
     cipher_half: bool,
+    /// `Policy::cipher_land_model`.
+    cipher_land_model: bool,
     /// False for the ingest-first arm: a flush stops partitioning what it
     /// sealed and leaves that to the background -- promotion at once, a
     /// merge for the rest (`Options::flush_schedules`). Both arms exist so
@@ -1961,6 +1963,13 @@ struct Policy {
     /// follows the room as the process runs: `supdb-cipherzstridehalf`,
     /// beside `supdb-cipherzstride`.
     cipher_half: bool,
+    /// The store under a cipher with the controller on and its builds
+    /// ahead at landing started by the controller's budget alone
+    /// (`Options::zpages_land_by_cache` off), where the engine starts them
+    /// past the same share of the store's own cache as well:
+    /// `supdb-cipherautolandmodel`, beside `supdb-cipherauto`, the shape
+    /// before.
+    cipher_land_model: bool,
     partition: bool,
     drain: bool,
     advice: Option<supdb::ReadAdvice>,
@@ -3134,6 +3143,7 @@ impl Default for Policy {
             cipher_log: false,
             cipher_apart: false,
             cipher_half: false,
+            cipher_land_model: false,
             partition: true,
             drain: true,
             advice: None,
@@ -3701,6 +3711,21 @@ impl Supdb {
             Policy {
                 cipher: true,
                 cipher_auto: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherauto` with its builds ahead at landing started by the
+    /// controller's budget alone (`Policy::cipher_land_model`):
+    /// `supdb-cipherautolandmodel`.
+    pub fn create_cipherauto_landmodel(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: true,
+                cipher_land_model: true,
                 ..Policy::default()
             },
         )
@@ -9851,6 +9876,7 @@ impl Supdb {
             cipher_log,
             cipher_apart,
             cipher_half,
+            cipher_land_model,
             partition,
             drain,
             advice,
@@ -10835,6 +10861,9 @@ impl Supdb {
         // and the compact form's controller on, the shape not shipped.
         if cipher {
             opts.zpages_under_cipher = cipher_auto;
+            if cipher_land_model {
+                opts.zpages_land_by_cache = false;
+            }
             if cipher_log {
                 opts.direct_ingest = false;
             }
@@ -10856,6 +10885,7 @@ impl Supdb {
             cipher_log,
             cipher_apart,
             cipher_half,
+            cipher_land_model,
             partition,
             drain,
             advice,
@@ -11294,6 +11324,7 @@ impl Engine for Supdb {
                 true if self.zpages => "supdb-cipherzpages",
                 true if self.cipher_log => "supdb-cipherlog",
                 false if self.cipher_log => "supdb-ingestcipherlog",
+                true if self.cipher_auto && self.cipher_land_model => "supdb-cipherautolandmodel",
                 true if self.cipher_auto => "supdb-cipherauto",
                 false if self.cipher_auto => "supdb-ingestcipherauto",
                 true if self.cipher_cache != 0 => "supdb-cipher64",
@@ -14908,6 +14939,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cipher64"
         | "supdb-cipherlog"
         | "supdb-cipherauto"
+        | "supdb-cipherautolandmodel"
         | "supdb-cipherzpages"
         | "supdb-cipherzstride"
         | "supdb-cipherzstrideapart"
@@ -15510,6 +15542,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cipherlog" => supdb_arm(Supdb::create_cipherlog, dir)?,
         "supdb-ingestcipherlog" => supdb_arm(Supdb::create_ingest_cipherlog, dir)?,
         "supdb-cipherauto" => supdb_arm(Supdb::create_cipherauto, dir)?,
+        "supdb-cipherautolandmodel" => supdb_arm(Supdb::create_cipherauto_landmodel, dir)?,
         "supdb-cipherzpages" => supdb_arm(Supdb::create_cipher_zpages, dir)?,
         "supdb-cipherzstride" => supdb_arm(Supdb::create_cipher_zstride, dir)?,
         "supdb-cipherzstrideapart" => supdb_arm(Supdb::create_cipher_zstride_apart, dir)?,
@@ -17606,6 +17639,28 @@ mod tests {
             "supdb-cipherauto lets the controller in"
         );
         assert_eq!(z.direct_ingest, c.direct_ingest, "supdb-cipherauto");
+        // The controller's arm with its builds ahead's line as it was:
+        // its sibling but for the one option.
+        let landmodel = arm(
+            "supdb-cipherautolandmodel",
+            Supdb::create_cipherauto_landmodel,
+        );
+        assert!(
+            under(&landmodel),
+            "supdb-cipherautolandmodel: under a cipher"
+        );
+        let m = o(&landmodel);
+        assert!(m.zpages_under_cipher, "supdb-cipherautolandmodel");
+        assert!(
+            z.zpages_land_by_cache && !m.zpages_land_by_cache,
+            "supdb-cipherautolandmodel starts its builds ahead by the controller's budget alone"
+        );
+        assert_eq!(m.zpages_land_pct, z.zpages_land_pct);
+        assert_eq!(
+            guarantee("supdb-cipherautolandmodel"),
+            guarantee("supdb-cipher")
+        );
+        drop(landmodel);
         drop((plain, cipher, log, auto, zblock, zstride));
         let _ = std::fs::remove_dir_all(&root);
     }

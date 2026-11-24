@@ -9379,6 +9379,79 @@ fn builds_ahead_under_a_cipher_seal_their_form_files_and_keep_them_cold() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Under a cipher the builds ahead start past the percent of the store's
+/// own cache of plaintext as well (`Options::zpages_land_by_cache`): a
+/// store whose populations are nowhere near the percent of the
+/// controller's budget, and whose partitions' files come to more than the
+/// percent of its cache's, builds their form files ahead. With the option off
+/// it builds none, the controller's budget being the only line; and with
+/// a cache the store is a small part of it builds none either, the
+/// option on. The records a build reads back are the kernel's to answer
+/// for where the store's cache has given them up, so none is cold here.
+#[cfg(target_os = "linux")]
+#[test]
+fn builds_ahead_under_a_cipher_start_past_the_percent_of_the_stores_own_cache() {
+    for (by_cache, cache, builds) in [
+        (true, 1u64 << 20, true),
+        (false, 1 << 20, false),
+        (true, 1 << 30, false),
+    ] {
+        let what = format!("by the cache {by_cache}, a cache of {} MiB", cache >> 20);
+        let (dir, db, _model, _inject) = auto_store_loaded(
+            &format!("auto-ahead-cipher-by-cache-{by_cache}-{}", cache >> 20),
+            1 << 40,
+            0.0,
+            FAULT_40US,
+            |o| {
+                o.encryption = supdb::Encryption::Cipher(
+                    supdb::StoreCipher::new(common::Gcm::new(&[0x5b; 32]), common::Gcm::new)
+                        .cache_bytes(cache),
+                );
+                o.zpages_under_cipher = true;
+                o.zpages_land_pct = 50;
+                o.zpages_land_by_cache = by_cache;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+            |db| ordered_load(db, 20_000, 0x4AA),
+        );
+        let c = db.zpage_counts();
+        assert!(c.partitions >= 3, "{what}: {c:?}");
+        // The store is several times the small cache and a small part of
+        // the large one, by the populations alone.
+        let raw = c.model_hash_bytes + c.model_record_bytes;
+        assert_eq!(raw > cache, cache == 1 << 20, "{what}: {raw} of raw form");
+        assert_eq!(
+            db.cipher_counts().expect("under a cipher").cache.budget,
+            cache,
+            "{what}"
+        );
+        if builds {
+            assert!(
+                tick_until_built(&db, |c| c.prebuilt >= c.partitions),
+                "{what}: built ahead: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.phase, c.attached),
+                (0, 0),
+                "{what}: nothing bought: {c:?}"
+            );
+        } else {
+            wait_steps(&db, 30);
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.build_starts, c.prebuilt),
+                (0, 0),
+                "{what}: nothing built ahead: {c:?}"
+            );
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// A build started on the builder's thread is taken in once whatever comes
 /// of it, and counted so (`ZCounts::build_collected`): builds ahead of
 /// partitions under the floor each decline, which the counts of the

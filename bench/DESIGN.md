@@ -428,7 +428,11 @@ under a cipher against itself: `supdb-cipherlog` and
 `supdb-ingestcipherlog`, an ordered load through the log with no run,
 which is the shape before the run was kept there; and `supdb-cipherauto`
 and `supdb-ingestcipherauto`, the controller on
-(`Options::zpages_under_cipher`). And two that force the compact form
+(`Options::zpages_under_cipher`), with `supdb-cipherautolandmodel` the
+first of those with its builds ahead at landing started by the
+controller's budget alone (`Options::zpages_land_by_cache` off), where
+the engine starts them past the same share of the store's own cache as
+well. And two that force the compact form
 there, each coding priced by itself: `supdb-cipherzpages`, every
 partition's form file in the block coding, and `supdb-cipherzstride`,
 every build asking for the stride form; `supdb-cipherzstrideapart` is the

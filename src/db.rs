@@ -2603,6 +2603,17 @@ pub struct Options {
     /// bar past the line too.
     #[doc(hidden)]
     pub zpages_land_cold_past: bool,
+    /// Under a cipher the builds ahead at landing start past the percent
+    /// (`zpages_land_pct`) of the store's own cache of plaintext as well,
+    /// by what its partitions' files come to against the cache's budget,
+    /// whichever line is met first. The percent of the controller's budget is of the kernel's
+    /// page cache by the raw form's populations, which is where a plain
+    /// store's records leave memory; a store under a cipher's leave where
+    /// its own cache gives them back, which holds every file whole and
+    /// each form file a build ahead is writing beside them, and the
+    /// kernel has let their ciphertext go long before.
+    #[doc(hidden)]
+    pub zpages_land_by_cache: bool,
     /// The crossing asks for the raw pages of the partitions
     /// it has no form file for, ahead of the form files it asks back
     /// (`zpages_land_drop_past`, `Maint::z_cross`). A partition whose
@@ -7193,6 +7204,7 @@ impl Default for Options {
             zpages_land_drop_past: true,
             zpages_build_sync: true,
             zpages_land_cold_past: true,
+            zpages_land_by_cache: true,
             zpages_ask_dropped: true,
             zpages_hot_raw_beside_stride: true,
             zpages_drive_at_job_end: true,
@@ -13978,6 +13990,12 @@ impl Seg {
             raw.hash_region_bytes() as u64,
             raw.record_region_bytes() as u64,
         )
+    }
+
+    /// The segment's file, bytes of plaintext: what a cache that holds the
+    /// file whole holds of it.
+    fn file_bytes(&self) -> u64 {
+        crate::bytes::Bytes::len(self.blob.for_zfile().source())
     }
 
     /// The share of the record region a read would find in memory now,
@@ -58973,6 +58991,31 @@ impl Maint {
         }
     }
 
+    /// Whether the partitions' files of a store under a cipher come to more
+    /// than `pct` percent of its own cache's budget
+    /// (`Options::zpages_land_by_cache`): the builds ahead's other line
+    /// there. The files whole, since the cache holds a file it has just
+    /// been handed whole, and their lengths and not what the cache holds
+    /// at this instant, which is nothing just after it has given a pass's
+    /// worth back. Nothing for a plain store. Read under the caller's
+    /// tick, with a pin of its own for the segments.
+    fn z_land_cache_due(&self, pct: u128) -> bool {
+        if !self.opts.zpages_land_by_cache {
+            return false;
+        }
+        let Some(cache) = self.shared.pager.as_ref().map(|p| p.budget()) else {
+            return false;
+        };
+        let files = {
+            let _op = self.op();
+            self.segs()
+                .iter()
+                .filter(|s| s.level > 0)
+                .fold(0u64, |n, s| n.saturating_add(s.file_bytes()))
+        };
+        u128::from(files) * 100 > u128::from(cache) * pct
+    }
+
     /// The line the builds ahead at landing start past
     /// (`Options::zpages_land_pct`): the raw populations against the
     /// percent of the budget, read at every tick until the first install
@@ -59000,7 +59043,8 @@ impl Maint {
                 })
         };
         let raw = hash.saturating_add(records);
-        self.z_land_due = u128::from(raw) * 100 > u128::from(budget) * pct;
+        self.z_land_due =
+            u128::from(raw) * 100 > u128::from(budget) * pct || self.z_land_cache_due(pct);
         self.z_past_budget = raw > budget;
         // Past the budget by a few percent the raw form still holds nearly
         // all of itself, and a store of three million keys under 640 MiB
