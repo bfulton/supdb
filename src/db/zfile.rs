@@ -9210,6 +9210,14 @@ pub struct ZInject {
     /// of a few hundred kilobytes at whatever the host gives them, so the
     /// look a move falls at is the host's without this.
     pub convert_price_ns: AtomicU64,
+    /// The wall of an operation the census stamps, nanoseconds, in place of
+    /// the one it took (`Options::zpages_census_sample`); 0 for the measured
+    /// one. The census scales its stamps' wall to the window's operations,
+    /// one in sixteen of them stamped, so one stamped read the host stalled
+    /// for two milliseconds read as thirty in a window of three thousand,
+    /// and the test that holds the scaling to the wall every stamp gives
+    /// failed under the gate's load, once in several runs.
+    pub op_wall_ns: AtomicU64,
 }
 
 impl Default for ZInject {
@@ -9220,6 +9228,7 @@ impl Default for ZInject {
             clock_ns: AtomicU64::new(0),
             faults: AtomicU64::new(0),
             fault_cost_ns: AtomicU64::new(0),
+            op_wall_ns: AtomicU64::new(0),
             decode_cost_ns: AtomicU64::new(0),
             records_resident: AtomicU64::new(u64::MAX),
             slack: AtomicU64::new(u64::MAX),
@@ -9333,6 +9342,14 @@ impl ZInject {
     }
 
     /// The injected price of a fault, if one is set.
+    /// The seam's wall of a stamped operation, or `None` for the measured.
+    pub fn op_wall(&self) -> Option<Duration> {
+        match self.op_wall_ns.load(Ordering::Acquire) {
+            0 => None,
+            ns => Some(Duration::from_nanos(ns)),
+        }
+    }
+
     pub fn fault_cost(&self) -> Option<Duration> {
         match self.fault_cost_ns.load(Ordering::Acquire) {
             0 => None,

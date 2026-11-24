@@ -25225,9 +25225,13 @@ impl Reader {
     fn zcensus_end(&self) {
         let mut w = self.zwin.get();
         debug_assert!(w.counting);
+        let wall = match self.opts.zpages_inject.as_ref().and_then(|i| i.op_wall()) {
+            Some(d) => d,
+            None => w.t0.elapsed(),
+        };
         w.busy = w
             .busy
-            .saturating_add(w.t0.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            .saturating_add(wall.as_nanos().min(u64::MAX as u128) as u64);
         w.counting = false;
         self.zwin_counting.set(false);
         self.zwin.set(w);

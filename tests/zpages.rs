@@ -14999,12 +14999,16 @@ fn a_form_the_parsing_encoder_wrote_answers_as_the_greedy_ones_in_fewer_bytes() 
 /// small store, whatever length the drive to COMPACT left; windows closed
 /// through the ticks after it then stamp one read in sixteen with the
 /// option and every read without, and the busy wall a read, scaled from
-/// the stamps, is within a factor of four of the wall every stamp gives,
-/// since a wall left unscaled would be a sixteenth of it. The two stores
-/// are open at once and their windows alternate, and each store's figure
-/// is its median window's: measured one store after the other, the
-/// figures were of two stretches of a loaded host, and the option's read
-/// 1561 ns against 387 once beside three other copies of this binary.
+/// the stamps, is within a tenth of the wall every stamp gives, since a
+/// wall left unscaled would be a sixteenth of it. Each stamp is priced
+/// by the seam (`ZInject::op_wall_ns`), so the figures are the scaling's
+/// and not the host's: measured, one read the host stalled for a few
+/// milliseconds among the sampled store's two hundred stamps read it at
+/// thirty times the other, once in a gate run. The two stores are open
+/// at once and their windows alternate, and each store's figure is its
+/// median window's: measured one store after the other, the figures
+/// were of two stretches of a loaded host, and the option's read 1561 ns
+/// against 387 once beside three other copies of this binary.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_census_stamps_a_long_windows_wall_on_one_operation_in_sixteen() {
@@ -15021,6 +15025,11 @@ fn the_census_stamps_a_long_windows_wall_on_one_operation_in_sixteen() {
             inject
                 .fault_cost_ns
                 .store(0, std::sync::atomic::Ordering::Release);
+            // And each stamp priced, so a window's busy wall is the
+            // scaling's and not the host's.
+            inject
+                .op_wall_ns
+                .store(500, std::sync::atomic::Ordering::Release);
             (on, dir, db, inject, r, keys, at)
         })
         .collect();
@@ -15088,7 +15097,7 @@ fn the_census_stamps_a_long_windows_wall_on_one_operation_in_sixteen() {
     }
     let ratio = per_read[0] / per_read[1];
     assert!(
-        (0.25..=4.0).contains(&ratio),
+        (0.9..=1.1).contains(&ratio),
         "the scaled busy wall a read against every read stamped: {:.0} ns against {:.0} ns; {windows:?}",
         per_read[0],
         per_read[1]

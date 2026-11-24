@@ -4903,7 +4903,17 @@ the seam's cost where one is set, publishes the price it carried
 the price to the seam's. The rule is the one the decode's seam was written
 for, read across the path: every measured cost a test's premise depends
 on goes through the seam, and a path that takes two costs from one timing
-takes both from it.
+takes both from it. It came again as a sample: the census's busy wall
+stamps one operation in sixteen and scales the stamps to the window
+(`Options::zpages_census_sample`), and the test that holds the scaling to
+the wall every stamp gives read the sampled arm at thirty times the other
+once in a gate run, a single stamped read stalled a few milliseconds among
+two hundred and multiplied by sixteen; it passed alone, in the whole binary
+and beside eight busy loops. The stamp's wall comes through the seam now
+(`ZInject::op_wall_ns`), and the test holds the ratio to a tenth of one,
+where a wall left unscaled reads a sixteenth. An estimate that multiplies
+a sample is an outlier's amplifier, so a test of the estimate prices the
+sample.
 
 **A regime read off a state the regulated work can enter.** The pace that
 holds a syncing commit behind the upkeep thread is for a store in core, and
