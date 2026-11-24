@@ -37,12 +37,11 @@ jobs:
       # `workspace -> target`, the target a path inside its workspace: see
       # the `test` job of ci.yml. Both of this job's target directories are
       # named: the second build's was not, so RocksDB on jemalloc was built
-      # from its sources at every run. The key
-      # is this job's own and not the one the suite's other jobs share (the
-      # `quick` job of ci.yml), since none of them builds the second
-      # directory. GitHub removes a cache nothing has read for seven days
-      # and this job's schedule is weekly, so a scheduled run may find its
-      # cache gone and build both.
+      # from its sources at every run. The key is this job's own and not
+      # the one the suite's other jobs share (the `quick` job of ci.yml),
+      # since none of them builds the second directory. GitHub removes a
+      # cache nothing has read for seven days and this job's schedule is
+      # weekly, so a scheduled run may find its cache gone and build both.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
