@@ -24,6 +24,27 @@
 //! `DIST` is `uniform` (the default), `zipf` (YCSB's scrambled Zipfian) or
 //! `zipf-plain` (the Zipfian unscrambled, the first mix family's). A get's
 //! key never depends on the get before it, as the suite's do not.
+//!
+//! The updates cross the engine's seal cap, a tenth of the store, so the
+//! reads after them are of a store with a seal in flight and then a piece:
+//! natively the seal lands a few milliseconds into `reads-dirty`, and under
+//! valgrind, whose seal thread runs fifty times slow, it never does, so a
+//! count taken there is of a frozen table where the native reads are over
+//! a piece. From the environment:
+//!
+//!   POINT_OPS_LAND=1     the seal joined before `reads-dirty`: the store
+//!                        with its piece, for a count or a profile of it
+//!   POINT_OPS_SHAPE=1    the store's shape and the reads by the path that
+//!                        answered them, after each phase, on stderr; a
+//!                        counter read takes the writer's upkeep home, so
+//!                        the run's rates are not read
+//!   POINT_OPS_ROUNDS=1   `reads-dirty` timed a round at a time, for a
+//!                        cost its first round pays once
+//!   POINT_OPS_CLASSES=1  after `reads-dirty`, gets of the keys the live
+//!                        table answers, of the keys the piece answers
+//!                        (with `POINT_OPS_LAND`) and of the keys no update
+//!                        wrote, each class read over and over: what a get
+//!                        of each costs warm and with every branch learned
 use std::time::Instant;
 use supdb_bench::engines::{self, Engine};
 use supdb_bench::workload::{db_key_into, KeyDist, KeyGen, Payload, Rng};
@@ -155,22 +176,104 @@ fn main() {
             let c = e.counters();
             let g = |n: &str| c.iter().find(|(m, _)| *m == n).map_or(0.0, |x| x.1);
             format!(
-                "parts {:.0} pieces {:.0} unsealed {:.0}",
+                "parts {:.0} pieces {:.0} unsealed {:.0} seals {:.0} idle {:.0} reads lone {:.0} layers {:.0} placed {:.0}",
                 g("partitions"),
                 g("pieces"),
-                g("unsealed_keys")
+                g("unsealed_keys"),
+                g("seals"),
+                g("seals_idle"),
+                g("reads_lone"),
+                g("reads_layers"),
+                g("reads_placed")
             )
         };
         // The store's shape between the phases, on request: a counter read
         // takes the writer's upkeep home, so a run that prints it is not
         // one whose rates are read.
         let shapes = std::env::var_os("POINT_OPS_SHAPE").is_some();
+        // A seal the updates began landed before the reads, on request
+        // (`POINT_OPS_LAND=1`): natively it lands a few milliseconds into
+        // them, and under valgrind, whose seal thread is fifty times slow,
+        // never, so a count of the reads over the piece asks for it.
+        if std::env::var_os("POINT_OPS_LAND").is_some() {
+            e.settle().unwrap();
+        }
         if shapes {
             eprintln!("shape after updates: {}", shape(e.as_ref()));
         }
+        // The dirty reads a round at a time, on request
+        // (`POINT_OPS_ROUNDS=1`): a phase slower than its gets is read for
+        // a cost its first round pays once before its rate is the gets'.
+        let by_round = std::env::var_os("POINT_OPS_ROUNDS").is_some();
         let t = Instant::now();
-        let b2 = phase_reads_dirty(e.as_mut(), &k3, rounds);
+        let b2 = if by_round {
+            let mut b = 0;
+            let mut line = String::from("dirty rounds:");
+            for _ in 0..rounds {
+                let t = Instant::now();
+                b += phase_reads_dirty(e.as_mut(), &k3, 1);
+                line.push_str(&format!(" {:.0}", ns(t, ops)));
+            }
+            eprintln!("{line} ns a get");
+            b
+        } else {
+            phase_reads_dirty(e.as_mut(), &k3, rounds)
+        };
         let r2 = ns(t, ops * rounds);
+        if shapes {
+            eprintln!("shape after reads-dirty: {}", shape(e.as_ref()));
+        }
+        // The dirty reads by where their key is answered, on request
+        // (`POINT_OPS_CLASSES=1`): keys the last updates wrote, which the
+        // live table holds; keys only the first updates wrote, which the
+        // piece holds where a seal has landed (`POINT_OPS_LAND`); and keys
+        // no update wrote, the partition's. Each class read over and over,
+        // its time a get and how many keys it is.
+        if std::env::var_os("POINT_OPS_CLASSES").is_some() {
+            let tail = k2.len() / 8;
+            let late: std::collections::HashSet<[u8; 16]> =
+                k2[k2.len() - tail..].iter().copied().collect();
+            let all: std::collections::HashSet<[u8; 16]> = k2.iter().copied().collect();
+            let early: std::collections::HashSet<[u8; 16]> = k2[..k2.len() / 4]
+                .iter()
+                .copied()
+                .filter(|k| !k2[k2.len() / 4..].contains(k))
+                .collect();
+            let untouched: Vec<[u8; 16]> = k0
+                .iter()
+                .copied()
+                .filter(|k| !all.contains(k))
+                .take(4096)
+                .collect();
+            let mut classes: Vec<(&str, Vec<[u8; 16]>)> = vec![
+                ("live", late.into_iter().collect()),
+                ("piece", early.into_iter().collect()),
+                ("partition", untouched),
+            ];
+            for (_, ks) in classes.iter_mut() {
+                ks.sort_unstable();
+                // A fixed shuffle, so the reads are in no key order.
+                let mut r = Rng::new(0xC1A5);
+                for i in (1..ks.len()).rev() {
+                    ks.swap(i, (r.next() % (i as u64 + 1)) as usize);
+                }
+            }
+            for round in 0..3 {
+                for (name, ks) in &classes {
+                    let reps = (200_000 / ks.len().max(1)).max(1);
+                    let t = Instant::now();
+                    let b = reads(e.as_mut(), ks, reps);
+                    eprintln!(
+                        "class {name} round {round}: {} keys, {:.0} ns a get ({b} bytes)",
+                        ks.len(),
+                        ns(t, ks.len() * reps)
+                    );
+                }
+            }
+            if shapes {
+                eprintln!("shape after the classes: {}", shape(e.as_ref()));
+            }
+        }
         let t = Instant::now();
         let b3 = phase_half(e.as_mut(), &k4, &vals);
         let h = ns(t, ops);

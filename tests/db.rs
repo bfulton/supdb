@@ -2349,24 +2349,44 @@ fn a_point_read_hashed_once_answers_as_one_hashed_per_source() {
 /// layered one while a piece or a frozen table stands, the two-source one
 /// over the partition alone, and neither with the option off -- a store
 /// read by the general path alone would pass every comparison here.
+///
+/// `Options::point_layers_lean` is a third setting of the same kind, over
+/// the layered read alone: with it every layered read is the one that
+/// places its sources first (`Reader::point_placed_reads`), over a piece,
+/// with one frozen table and with two, and without it none is, so the two
+/// layered reads are each held to the model in every state here and
+/// neither passes on the other's answers. A key of more live values than
+/// either keeps on its frame, in the live table and in a frozen one, is
+/// the general read's under every setting, and a key of exactly as many is
+/// not.
 #[test]
 fn a_lean_point_read_answers_as_the_general_one() {
     let d = Options::default();
-    assert!(d.point_fixed && d.point_lone, "the default");
+    assert!(
+        d.point_fixed && d.point_lone && d.point_layers_lean,
+        "the default"
+    );
     for shape in [
         OrdShape::Short,
         OrdShape::Mixed,
         OrdShape::Wide,
         OrdShape::Binary,
     ] {
-        for (fixed, lone) in [(true, true), (true, false), (false, true), (false, false)] {
-            let name = format!("leanread-{shape:?}-{fixed}-{lone}");
+        for (fixed, lone, first) in [
+            (true, true, true),
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+            (false, false, true),
+        ] {
+            let name = format!("leanread-{shape:?}-{fixed}-{lone}-{first}");
             let mut fx = ord_fixture_with(
                 &name,
                 shape,
                 Options {
                     point_fixed: fixed,
                     point_lone: lone,
+                    point_layers_lean: first,
                     ..common::options()
                 },
             );
@@ -2374,10 +2394,14 @@ fn a_lean_point_read_answers_as_the_general_one() {
             let show = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
             let probes = ord_probes(shape);
             // Every probe through the writer and through a handle, and what
-            // the two made of them: (two-source, layered) reads.
+            // the two made of them: (two-source, layered) reads, and of
+            // the layered ones those the read that places its sources
+            // first answered, which is all of them with its option on and
+            // none with it off.
             let check = |fx: &OrdFixture, when: &str| -> (u64, u64) {
                 let h = fx.db.reader().unwrap();
                 let before = fx.db.point_lean_reads();
+                let placed_before = fx.db.point_placed_reads();
                 for p in &probes {
                     let want = fx.model.get(p).cloned().unwrap_or_default();
                     assert_eq!(read_vec(&fx.db, p), want, "{name} {when}: {}", show(p));
@@ -2393,6 +2417,17 @@ fn a_lean_point_read_answers_as_the_general_one() {
                     h.point_lean_reads(),
                     (after.0 - before.0, after.1 - before.1),
                     "{name} {when}: a handle takes the path the writer takes"
+                );
+                let placed = fx.db.point_placed_reads() - placed_before;
+                assert_eq!(
+                    h.point_placed_reads(),
+                    placed,
+                    "{name} {when}: a handle's layered reads are the writer's kind"
+                );
+                assert_eq!(
+                    placed,
+                    if first { after.1 - before.1 } else { 0 },
+                    "{name} {when}: which layered read answered"
                 );
                 (after.0 - before.0, after.1 - before.1)
             };
@@ -2428,10 +2463,44 @@ fn a_lean_point_read_answers_as_the_general_one() {
                     fx.model.entry(key(k)).or_default().push(v);
                 }
             }
+            // Chains as long as a lean read's frame holds and one value
+            // longer, in the table about to freeze and then in the live
+            // one: under a put, so that the chain is the key's whole
+            // answer and its length the count.
+            let long = |fx: &mut OrdFixture, tag: &str, k: u32, n: usize| {
+                fx.db.put(&key(k), format!("{tag}0-{k}").as_bytes());
+                fx.model
+                    .insert(key(k), vec![format!("{tag}0-{k}").into_bytes()]);
+                for i in 1..n {
+                    let v = format!("{tag}{i}-{k}").into_bytes();
+                    fx.db.append(&key(k), &v);
+                    fx.model.entry(key(k)).or_default().push(v);
+                }
+            };
+            long(&mut fx, "f8", 600, 8);
+            long(&mut fx, "f9", 601, 9);
             fx.db.commit().unwrap();
             fx.db.hold_seal_landing(true);
             fx.db.seal().unwrap();
             assert!(fx.db.frozen_tables() >= 1, "{name}: a frozen table");
+            long(&mut fx, "l8", 602, 8);
+            long(&mut fx, "l9", 603, 9);
+            fx.db.commit().unwrap();
+            for (k, n, lean_reads) in [(600, 8, 1), (601, 9, 0), (602, 8, 1), (603, 9, 0)] {
+                let before = fx.db.point_lean_reads().1;
+                let got = read_vec(&fx.db, &key(k));
+                assert_eq!(got.len(), n, "{name}: the chain of key {k}");
+                assert_eq!(
+                    &got,
+                    fx.model.get(&key(k)).unwrap(),
+                    "{name}: the chain of key {k}"
+                );
+                assert_eq!(
+                    fx.db.point_lean_reads().1 - before,
+                    if lean { lean_reads } else { 0 },
+                    "{name}: a chain of {n} values and the layered reads"
+                );
+            }
             for k in (1u32..4_010).step_by(9) {
                 if k.is_multiple_of(2) {
                     fx.db.delete(&key(k));

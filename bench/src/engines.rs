@@ -1442,6 +1442,10 @@ pub struct Supdb {
     /// the two-source and the layered reads off (`Options::point_lone`
     /// off): `supdb-pointsources` and `supdb-ingestpointsources`.
     pointsources: bool,
+    /// A store with pieces read by the layered read that sets up for every
+    /// source before it asks one (`Options::point_layers_lean` off):
+    /// `supdb-layersasone` and `supdb-ingestlayersasone`.
+    layersasone: bool,
     /// EXPERIMENT: the deltas from which the upkeep thread converts a sparse
     /// form the walks have read `CONVREADS` entries of to a copy
     /// (`Options::forms_convert_from`, `forms_convert_reads`), from
@@ -2798,6 +2802,8 @@ struct Policy {
     pointexts: bool,
     /// Every point read the general one: `...pointsources`.
     pointsources: bool,
+    /// The layered read as one pass over every source: `...layersasone`.
+    layersasone: bool,
     /// A filed burst's builds in the commit: `...settlebuildsfiled`.
     settlebuildsfiled: bool,
     /// The walk's own decodes: `supdb-zwalkowns`.
@@ -3381,6 +3387,7 @@ impl Default for Policy {
             probestwice: false,
             pointexts: false,
             pointsources: false,
+            layersasone: false,
             settlebuildsfiled: false,
             zwalkowns: false,
             zviewperopen: false,
@@ -10062,6 +10069,7 @@ impl Supdb {
             probestwice,
             pointexts,
             pointsources,
+            layersasone,
             settlebuildsfiled,
             zwalkowns,
             zviewperopen,
@@ -10694,6 +10702,7 @@ impl Supdb {
             read_probes_once: !probestwice,
             point_fixed: !pointexts,
             point_lone: !pointsources,
+            point_layers_lean: !layersasone,
             forms_settle_builds_filed: settlebuildsfiled,
             zpages_rewarm_quiet_ms: if zrewarmwait {
                 supdb::db::REWARM_QUIET_BEFORE_MS
@@ -11072,6 +11081,7 @@ impl Supdb {
             probestwice,
             pointexts,
             pointsources,
+            layersasone,
             settlebuildsfiled,
             zwalkowns,
             zviewperopen,
@@ -12085,6 +12095,13 @@ impl Engine for Supdb {
                 "supdb-ingestpointsources"
             };
         }
+        if self.layersasone {
+            return if self.partition {
+                "supdb-layersasone"
+            } else {
+                "supdb-ingestlayersasone"
+            };
+        }
         if self.widewalks {
             return if self.partition {
                 "supdb-widewalks"
@@ -13092,6 +13109,13 @@ impl Engine for Supdb {
                 db.merge_dropped_bytes() as f64 / 1048576.0,
             ),
             ("unsealed_keys", db.unsealed_keys() as f64),
+            // The writer's point reads by the path that answered them: the
+            // partition and the live table alone, and the layered read of
+            // every source (`Reader::point_lean_reads`); the rest took the
+            // general read or a form's.
+            ("reads_lone", db.point_lean_reads().0 as f64),
+            ("reads_layers", db.point_lean_reads().1 as f64),
+            ("reads_placed", db.point_placed_reads() as f64),
             ("merges_landed", db.seal_waits().merges as f64),
             ("merge_plans", db.seal_waits().plans as f64),
             ("merges_beside", db.seal_waits().merges_beside as f64),
@@ -14943,6 +14967,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestpointexts"
         | "supdb-pointsources"
         | "supdb-ingestpointsources"
+        | "supdb-layersasone"
+        | "supdb-ingestlayersasone"
         | "supdb-settlebuildsfiled"
         | "supdb-ingestsettlebuildsfiled"
         | "supdb-ingestpromote"
@@ -15726,6 +15752,32 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         pointsources: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-layersasone" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        layersasone: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestlayersasone" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        layersasone: true,
                         ..Policy::default()
                     },
                 )
@@ -19069,6 +19121,21 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.point_lone && b.point_lone);
                 assert!(o.point_fixed, "the one option moved");
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("layersasone"),
+                    Policy {
+                        layersasone: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-layersasone");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.point_layers_lean && b.point_layers_lean);
+                assert!(o.point_lone && o.point_fixed, "the one option moved");
             }
             {
                 let z = Supdb::with_policy(

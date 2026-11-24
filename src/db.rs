@@ -1606,6 +1606,56 @@ pub struct Options {
     /// `point_fixed`. Off: `supdb-pointsources`, and
     /// `supdb-ingestpointsources` buffered.
     pub point_lone: bool,
+    /// The layered read asks its sources in the order of what each costs,
+    /// sets up for none it does not reach, and asks for the partition's
+    /// first line before it reads anything (`Reader::read_placed`). A
+    /// store a write mix has sealed once is a partition, a piece and a
+    /// live table for as long as the piece waits for its merge, with a
+    /// frozen table beside them for the milliseconds of each seal, and
+    /// `read_layers` over it executed 1,008 instructions a get where the
+    /// read of a store just loaded executes 497 and FASTER's whole get
+    /// 417, by callgrind at a hundred thousand keys with the seal landed
+    /// (`bench/examples/point_ops.rs` under `POINT_OPS_LAND=1`, the
+    /// `reads_dirty` phase), and no line of it over three in a hundred:
+    /// the partitions counted and the key's found by two searches of the
+    /// segments, the pieces over it by two more, a frame of eight hundred
+    /// bytes cleared for three frozen tables and eight pieces where one
+    /// piece stood, each chunk of a table's chain reached by three
+    /// lookups of its block, and all of it ahead of the one probe that
+    /// answers three reads in ten, the live table's, whose tombstone
+    /// masks everything older.
+    ///
+    /// Here the partitions' count and each one's run of pieces are the
+    /// state's, taken at its publish (`State::placing`), and a store of
+    /// one partition is not searched; the live table is asked first, and
+    /// a tombstone there ends the read with the table's own values; the
+    /// frozen tables are asked after it, newest first, the same way; a
+    /// chunk's header is one lookup and its value another
+    /// (`MemTable::live_small_hashed`); and the pieces' records and the
+    /// tables' values are kept in the order found, on a frame nothing
+    /// clears. The same values in the same order as `read_layers` hands
+    /// over, from the same sources.
+    ///
+    /// And the partition's first hash slot is asked for as soon as the
+    /// key is hashed, ahead of the tables' probes and the pieces' filters
+    /// (under `read_lines_ahead`). A get over keys the cache does not
+    /// hold waits on two lines of the partition, the slot and then the
+    /// record, and what a loop of gets costs is how far those waits
+    /// overlap from one get to the next: sampled by phase
+    /// (`perf record --call-graph dwarf` over the same probe), the load
+    /// of a partition's record took half again the samples a read in the
+    /// layered read that it takes in the read of a store just loaded,
+    /// behind a longer path and the live table's probe, whose branch no
+    /// predictor learns. The ask starts the first wait before either.
+    ///
+    /// A store whose merges follow its reads (`adaptive_cap`,
+    /// `adaptive_trigger`), which counts a read a piece consulted, and a
+    /// frozen table that was a run of ordered ingest are `read_layers`'
+    /// still, with everything it leaves to the general read.
+    /// `Reader::point_placed_reads` counts the reads this one answered.
+    /// Needs `point_lone`. Off: `supdb-layersasone`, and
+    /// `supdb-ingestlayersasone` buffered.
+    pub point_layers_lean: bool,
     /// EXPERIMENT: a point read of a partition whose ordered index holds
     /// whole keys (`OrdIndex::uniform`: every key one length, no longer
     /// than the common prefix and eight bytes) finds its rank through the
@@ -7146,6 +7196,7 @@ impl Default for Options {
             read_hash_once: true,
             point_fixed: true,
             point_lone: true,
+            point_layers_lean: true,
             read_lines_ahead: true,
             read_probes_once: true,
             point_via_ord: false,
@@ -8794,6 +8845,9 @@ const BLOOM_BITS_PER_KEY: u32 = 10;
 #[derive(Clone)]
 pub(crate) struct BlockedBloom {
     blocks: Vec<[u64; 8]>,
+    /// What `block_of` takes a hash's remainder by the block count with
+    /// (`BlockedBloom::magic_for`).
+    magic: u64,
 }
 
 /// A Bloom built from FNV words as they come: `add` takes each word and,
@@ -8863,9 +8917,43 @@ impl BlockedBloom {
     }
 
     fn with_capacity(n: usize) -> BlockedBloom {
-        BlockedBloom {
-            blocks: vec![[0u64; 8]; BlockedBloom::blocks_for(n)],
+        BlockedBloom::of_blocks(vec![[0u64; 8]; BlockedBloom::blocks_for(n)])
+    }
+
+    fn of_blocks(blocks: Vec<[u64; 8]>) -> BlockedBloom {
+        let magic = BlockedBloom::magic_for(blocks.len());
+        BlockedBloom { blocks, magic }
+    }
+
+    /// The multiplier `block_of` reduces by for `n` blocks: the ceiling of
+    /// 2^64 over `n`, which for one block wraps to nothing and reduces
+    /// every hash to block zero.
+    fn magic_for(n: usize) -> u64 {
+        (u64::MAX / (n as u64).max(1)).wrapping_add(1)
+    }
+
+    /// The block a hash's high half names: that half's remainder by the
+    /// block count, the mapping `BLOOM_SIG` covers, taken by two
+    /// multiplies where it was a divide (Lemire's remainder, exact for a
+    /// dividend and a divisor of thirty-two bits each). A point read over
+    /// a piece took the divide twice, at the hint for the block and at
+    /// the test of it, twenty-odd cycles each behind which the test's
+    /// answer waits. A filter of more blocks than thirty-two bits count,
+    /// which is more than a quarter of a terabyte of filter, keeps the
+    /// half as it is, every value of it being under the count.
+    #[inline(always)]
+    fn block_of(&self, h: u64) -> usize {
+        BlockedBloom::reduce(h >> 32, self.blocks.len() as u64, self.magic)
+    }
+
+    /// `a`'s remainder by `n`, for `a` under 2^32 and `magic` the
+    /// multiplier `magic_for(n)` gives (`block_of`).
+    #[inline(always)]
+    fn reduce(a: u64, n: u64, magic: u64) -> usize {
+        if n > u64::from(u32::MAX) {
+            return a as usize;
         }
+        ((u128::from(magic.wrapping_mul(a)) * u128::from(n)) >> 64) as usize
     }
 
     /// The hash's first half: the word `flatindex::key_hash` computes
@@ -8906,7 +8994,7 @@ impl BlockedBloom {
     /// A hint to fetch the block `add_fnv(h)` sets bits in; nothing is read.
     #[inline]
     fn prefetch_fnv(&self, h: u64) {
-        let bi = (BlockedBloom::finalize(h) >> 32) as usize % self.blocks.len();
+        let bi = self.block_of(BlockedBloom::finalize(h));
         prefetch_lines(self.blocks[bi].as_ptr() as *const u8, 64);
     }
 
@@ -8923,7 +9011,7 @@ impl BlockedBloom {
     }
 
     fn slots_of(&self, h: u64) -> (usize, [(usize, u64); BLOOM_PROBES as usize]) {
-        let bi = (h >> 32) as usize % self.blocks.len();
+        let bi = self.block_of(h);
         let mut probes = [(0usize, 0u64); BLOOM_PROBES as usize];
         let mut x = h;
         for p in &mut probes {
@@ -8960,7 +9048,7 @@ impl BlockedBloom {
     /// is read.
     #[inline]
     fn prefetch_hash(&self, h: u64) {
-        let bi = (h >> 32) as usize % self.blocks.len();
+        let bi = self.block_of(h);
         prefetch_lines(self.blocks[bi].as_ptr() as *const u8, 64);
     }
 
@@ -9002,7 +9090,7 @@ impl BlockedBloom {
                 b
             })
             .collect();
-        Some(BlockedBloom { blocks })
+        Some(BlockedBloom::of_blocks(blocks))
     }
 }
 
@@ -16282,6 +16370,49 @@ impl MemTable {
         Some((n, false))
     }
 
+    /// `live_offs_small` for a hashed table, the values themselves where
+    /// that finds their offsets: the key's live values newest first in
+    /// `buf`, how many, and whether a tombstone cut the chain; `None` for
+    /// more live values than `buf` holds. A hashed table's every chunk is
+    /// in `vals` under its plain offset, so a chunk's header is one
+    /// lookup of its block, its predecessor and its length together, and
+    /// its value a second, where the offsets' walk and `value_at` behind
+    /// it looked the block up for the length, for the predecessor, and
+    /// for the length again before the value: five lookups of a block for
+    /// a key a `put` wrote, a value and the tombstone under it, where
+    /// this makes three.
+    #[inline(always)]
+    fn live_small_hashed<'t>(
+        &'t self,
+        e: Entry<'t>,
+        wm: u64,
+        buf: &mut [std::mem::MaybeUninit<&'t [u8]>; LIVE_SMALL],
+    ) -> Option<(usize, bool)> {
+        debug_assert!(
+            !self.ordered && !self.stream && !self.refs,
+            "a hashed table's chunks are in its arena, under plain offsets"
+        );
+        let mut at = MemTable::head(e);
+        let mut n = 0;
+        while at != NO_CHUNK {
+            let hdr = self.vals.slice(at as usize, CHUNK_HDR);
+            let prev = u64::from_le_bytes(hdr[..8].try_into().expect("eight bytes"));
+            if at < wm {
+                let len = u32::from_le_bytes(hdr[8..].try_into().expect("four bytes"));
+                if len == TOMB_LEN {
+                    return Some((n, true));
+                }
+                if n == LIVE_SMALL {
+                    return None;
+                }
+                buf[n].write(self.vals.slice(at as usize + CHUNK_HDR, len as usize));
+                n += 1;
+            }
+            at = prev;
+        }
+        Some((n, false))
+    }
+
     /// Whether a tombstone sits anywhere in the key's chain below `wm`.
     fn has_tomb(&self, e: Entry<'_>, wm: u64) -> bool {
         let mut at = MemTable::head(e);
@@ -20131,6 +20262,16 @@ struct State {
     /// binary search instead of a walk over all of them; see
     /// `pieces_over`. Refreshed by `sort_segs`.
     l0_aligned: bool,
+    /// How many of `segs` are partitions, which sort first.
+    parts: usize,
+    /// Each partition's run of pieces in `segs[parts..]`, by the
+    /// partition's place, where every piece is aligned to one
+    /// (`l0_aligned`); empty where no piece stands or one is unaligned,
+    /// and then a read consults them all. What `pieces_aligned_over`
+    /// finds by two searches of the pieces, taken once where the segments
+    /// are published (`State::placing`) for the point read that asks at
+    /// every key (`pieces_placed`, `Options::point_layers_lean`).
+    piece_runs: Vec<(u32, u32)>,
     /// Whether any live segment holds a tombstone, found once here: a
     /// read asked it of every segment, forty-one pointer chases a read
     /// at thirty million keys.
@@ -21928,6 +22069,9 @@ pub struct Reader {
     /// store took (`point_lean_reads`).
     lone_reads: std::cell::Cell<u64>,
     layer_reads: std::cell::Cell<u64>,
+    /// Of `layer_reads`, the ones `read_placed` answered
+    /// (`Options::point_layers_lean`).
+    placed_reads: std::cell::Cell<u64>,
     ord_declined: std::cell::Cell<u64>,
     /// This handle's memo of decoded groups (`zfile::ZMemo`,
     /// `Options::zpages_memo`), which goes with the handle.
@@ -25313,18 +25457,53 @@ impl State {
         l0: &'a [std::sync::Arc<Seg>],
         at: usize,
     ) -> &'a [std::sync::Arc<Seg>] {
+        let (from, to) = State::aligned_run(self.segs[at].lo.as_slice(), l0);
+        &l0[from..to]
+    }
+
+    /// The run of `l0`, pieces each aligned to a partition, over the
+    /// partition whose lower fence is `lo`: the one definition, which
+    /// `pieces_aligned_over` asks at a read and `placing` at a publish.
+    fn aligned_run(lo: &[u8], l0: &[std::sync::Arc<Seg>]) -> (usize, usize) {
         // The first partition's lower fence is empty, and so is that of
         // every piece aligned to it; see `below_lo` for why an empty fence
         // is never handed to a compare.
-        let lo = self.segs[at].lo.as_slice();
         let before =
             |s: &std::sync::Arc<Seg>| !lo.is_empty() && (s.lo.is_empty() || s.lo.as_slice() < lo);
         let same = |s: &std::sync::Arc<Seg>| {
             s.lo.is_empty() == lo.is_empty() && (lo.is_empty() || s.lo.as_slice() == lo)
         };
         let from = l0.partition_point(before);
-        let to = from + l0[from..].partition_point(same);
-        &l0[from..to]
+        (from, from + l0[from..].partition_point(same))
+    }
+
+    /// `parts` and `piece_runs` for sorted segments and their
+    /// `l0_aligned`.
+    fn placing(segs: &[std::sync::Arc<Seg>], l0_aligned: bool) -> (usize, Vec<(u32, u32)>) {
+        let np = segs.partition_point(|s| s.level > 0);
+        let l0 = &segs[np..];
+        if l0.is_empty() || !l0_aligned {
+            return (np, Vec::new());
+        }
+        let runs = segs[..np]
+            .iter()
+            .map(|p| {
+                let (from, to) = State::aligned_run(p.lo.as_slice(), l0);
+                (from as u32, to as u32)
+            })
+            .collect();
+        (np, runs)
+    }
+
+    /// `pieces_over(self.parts, at)` by the runs the publish took
+    /// (`piece_runs`): a load where that is two searches of the pieces.
+    #[inline(always)]
+    fn pieces_placed(&self, at: usize) -> &[std::sync::Arc<Seg>] {
+        let l0 = &self.segs[self.parts..];
+        match self.piece_runs.get(at) {
+            Some(&(from, to)) => &l0[from as usize..to as usize],
+            None => l0,
+        }
     }
 }
 
@@ -26256,6 +26435,14 @@ impl Reader {
     /// handle's own count, as `ord_point_reads` is.
     pub fn point_lean_reads(&self) -> (u64, u64) {
         (self.lone_reads.get(), self.layer_reads.get())
+    }
+
+    /// Of the layered reads `point_lean_reads` counts, the ones the read
+    /// that places its sources first answered
+    /// (`Options::point_layers_lean`, `Reader::read_placed`); the rest
+    /// were `read_layers`'. A handle's own count.
+    pub fn point_placed_reads(&self) -> u64 {
+        self.placed_reads.get()
     }
 
     /// `key`'s values in a partition read through the partition's ordered
@@ -27272,10 +27459,170 @@ impl Reader {
         if let Some(n) = self.read_lone(st, key, &mut f) {
             return n;
         }
+        if let Some(n) = self.read_placed(st, key, &mut f) {
+            return n;
+        }
         if let Some(n) = self.read_layers(st, key, &mut f) {
             return n;
         }
         self.read_sources(st, key, f)
+    }
+
+    /// `read_layers` with its sources asked in the order of what each
+    /// costs (`Options::point_layers_lean`): `None`, with nothing handed to
+    /// `f`, for every store and key that read leaves to the general one,
+    /// and for a store whose merges follow its reads or with a frozen
+    /// table that was a run of ordered ingest, which are that read's.
+    ///
+    /// The key's partition and the pieces over it come from the state
+    /// (`State::parts`, `pieces_placed`), and the partition's first hash
+    /// slot and the pieces' filter blocks are asked for before anything
+    /// is read. Then the live table: a tombstone in the key's chain masks
+    /// every older source, and the read ends with the chain's values
+    /// after it. Then the frozen tables newest first, the same way, and
+    /// the pieces newest first, each that may hold the key asked once for
+    /// its record, to the newest tombstone; the partition where none
+    /// masks it; and the values oldest first, the partition's, the
+    /// pieces', the frozen tables' and the live one's, as `read_layers`
+    /// hands them over. Nothing is handed to `f` before the last source
+    /// is asked, so a `None` from any of them hands over nothing.
+    #[inline(never)]
+    fn read_placed<F: FnMut(&[u8])>(
+        &self,
+        st: &State,
+        key: &[u8],
+        f: &mut F,
+    ) -> Option<Result<u64>> {
+        if !self.opts.point_layers_lean || !self.opts.point_lone_on() {
+            return None;
+        }
+        let (segs, mem) = (&st.segs, &*st.mem);
+        let (np, nf) = (st.parts, st.frozen.len());
+        if np == 0 || mem.ordered || nf > FROZEN_CAP || self.lag_adapts() {
+            return None;
+        }
+        if self.opts.zpages != ZPages::Off && self.z_on() {
+            return None;
+        }
+        let at = if np == 1 {
+            0
+        } else {
+            segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key))
+        };
+        let l0 = st.pieces_placed(at);
+        debug_assert!(
+            std::ptr::eq(l0, st.pieces_over(np, at)),
+            "the pieces a publish placed over a partition are the ones a search finds"
+        );
+        if l0.len() > LAYERS_PIECES {
+            return None;
+        }
+        let fnv = crate::flatindex::key_hash(key);
+        if self.opts.read_lines_ahead {
+            // The partition's slot first: it is the read's longest wait
+            // where no tombstone masks the partition, and the tables'
+            // probes and the pieces' filters are the lead for it.
+            if let Some(seg) = segs[..np].get(at) {
+                seg.raw().prefetch_slot(fnv);
+            }
+            for seg in l0 {
+                seg.prefetch_probe(fnv);
+            }
+        }
+        // The live table first: the values of the key's chain newest
+        // first, the first `live_n` of `live`. They are slices of the
+        // table's arena, which the state holds for the read.
+        let mh = mem_hash_of(fnv);
+        let mut live = [std::mem::MaybeUninit::<&[u8]>::uninit(); LIVE_SMALL];
+        let mut live_n = 0;
+        let found = mem.probe(mh, key).filter(|&i| i < self.len_bound.get());
+        if let Some(i) = found {
+            let (n, tomb) = mem.live_small_hashed(mem.entry(i), self.wm(), &mut live)?;
+            if tomb {
+                // The tombstone masks every older source: the read is
+                // the chain's values after it.
+                for v in live[..n].iter().rev() {
+                    // SAFETY: the first `n` are written.
+                    f(unsafe { v.assume_init() });
+                }
+                self.layer_reads.set(self.layer_reads.get() + 1);
+                self.placed_reads.set(self.placed_reads.get() + 1);
+                return Some(Ok(n as u64));
+            }
+            live_n = n;
+        }
+        // The frozen tables newest first, where a seal is in flight: each
+        // one's values as the live table's, the first `frozen_n[i]` of
+        // `frozen[i]`, and `since` the oldest the pass reached, which is
+        // the one a tombstone cut it at where one did.
+        let mut frozen = [[std::mem::MaybeUninit::<&[u8]>::uninit(); LIVE_SMALL]; FROZEN_CAP];
+        let mut frozen_n = [0usize; FROZEN_CAP];
+        let mut since = nf;
+        let mut cut = false;
+        for i in (0..nf).rev() {
+            let fr = &*st.frozen[i];
+            if fr.ordered {
+                return None;
+            }
+            since = i;
+            if let Some(e) = fr.probe(mh, key) {
+                (frozen_n[i], cut) = fr.live_small_hashed(fr.entry(e), SEE_ALL, &mut frozen[i])?;
+                if cut {
+                    break;
+                }
+            }
+        }
+        // The pieces newest first, to the newest tombstone, where no
+        // table cut the read: the records found, newest first, the first
+        // `held` of `runs`.
+        let mut runs = [std::mem::MaybeUninit::<(&[u8], usize)>::uninit(); LAYERS_PIECES];
+        let mut held = 0;
+        if !cut {
+            for seg in l0.iter().rev() {
+                if !seg.may_hold_fnv(key, fnv) {
+                    continue;
+                }
+                if let Some(c) = seg.raw().find_fixed_hashed(key, fnv)? {
+                    runs[held].write((c.run, c.records));
+                    held += 1;
+                    if c.tomb {
+                        cut = true;
+                        break;
+                    }
+                }
+            }
+        }
+        // Oldest first from the tombstone on: the partition where nothing
+        // masks it, the pieces, the frozen tables the pass reached and the
+        // live one.
+        let mut n = live_n as u64;
+        if !cut {
+            if let Some(seg) = segs[..np].get(at).filter(|s| s.may_hold_fnv(key, fnv)) {
+                match seg.raw().read_all_fixed_hashed(key, fnv, f) {
+                    Ok(k) => n += k,
+                    Err(e) => return Some(Err(err(&format!("segment read: {e}")))),
+                }
+            }
+        }
+        for r in runs[..held].iter().rev() {
+            // SAFETY: the first `held` are written.
+            let (run, records) = unsafe { r.assume_init() };
+            n += crate::flatindex::each_fixed(run, records, f);
+        }
+        for (vals, &k) in frozen[since..nf].iter().zip(&frozen_n[since..nf]) {
+            for v in vals[..k].iter().rev() {
+                // SAFETY: the first `frozen_n[i]` of table `i` are written.
+                f(unsafe { v.assume_init() });
+            }
+            n += k as u64;
+        }
+        for v in live[..live_n].iter().rev() {
+            // SAFETY: the first `live_n` are written.
+            f(unsafe { v.assume_init() });
+        }
+        self.layer_reads.set(self.layer_reads.get() + 1);
+        self.placed_reads.set(self.placed_reads.get() + 1);
+        Some(Ok(n))
     }
 
     /// A point read over a partition, the pieces over its range, the
@@ -36302,6 +36649,7 @@ impl Db {
         let data_bytes = 0;
         let l0_aligned = false;
         let segs_tombs = false;
+        let (parts, piece_runs) = State::placing(&segs, l0_aligned);
         let layout = segs
             .iter()
             .take_while(|s| s.level > 0)
@@ -36326,6 +36674,8 @@ impl Db {
             store_bytes,
             data_bytes,
             l0_aligned,
+            parts,
+            piece_runs,
             segs_tombs,
             layout,
         };
@@ -36490,6 +36840,7 @@ impl Db {
             ord_served: std::cell::Cell::new(0),
             lone_reads: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
+            placed_reads: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -36942,6 +37293,7 @@ impl Db {
         let mut segs: Vec<std::sync::Arc<Seg>> =
             segs.into_iter().map(std::sync::Arc::new).collect();
         let l0_aligned = sort_segs(&mut segs);
+        let (parts, piece_runs) = State::placing(&segs, l0_aligned);
         // A store reopened under `Always` attaches the form files it finds
         // for its partitions. One that does not check out is counted and
         // the partition is read from the raw form until a settle builds it
@@ -37142,6 +37494,8 @@ impl Db {
             store_bytes,
             data_bytes,
             l0_aligned,
+            parts,
+            piece_runs,
             segs_tombs,
             layout,
         };
@@ -37306,6 +37660,7 @@ impl Db {
             ord_served: std::cell::Cell::new(0),
             lone_reads: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
+            placed_reads: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -39564,6 +39919,8 @@ impl Db {
             store_bytes: cur.store_bytes,
             data_bytes: cur.data_bytes,
             l0_aligned: cur.l0_aligned,
+            parts: cur.parts,
+            piece_runs: cur.piece_runs.clone(),
             segs_tombs: cur.segs_tombs,
             layout: cur.layout.clone(),
         }
@@ -39818,6 +40175,8 @@ impl Db {
                 store_bytes: cur.store_bytes,
                 data_bytes: cur.data_bytes,
                 l0_aligned: cur.l0_aligned,
+                parts: cur.parts,
+                piece_runs: cur.piece_runs.clone(),
                 segs_tombs: cur.segs_tombs,
                 layout: cur.layout.clone(),
             };
@@ -40207,6 +40566,7 @@ impl Reader {
             ord_served: std::cell::Cell::new(0),
             lone_reads: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
+            placed_reads: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: self.opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -40249,6 +40609,7 @@ impl Reader {
                 ord_served: std::cell::Cell::new(0),
                 lone_reads: std::cell::Cell::new(0),
                 layer_reads: std::cell::Cell::new(0),
+                placed_reads: std::cell::Cell::new(0),
                 ord_declined: std::cell::Cell::new(0),
                 zmemo: self.opts.handle_memo(),
                 zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -40298,6 +40659,7 @@ impl Reader {
             ord_served: std::cell::Cell::new(0),
             lone_reads: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
+            placed_reads: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: self.opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -43504,6 +43866,7 @@ impl Reader {
             ord_served: std::cell::Cell::new(0),
             lone_reads: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
+            placed_reads: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: self.opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -49523,6 +49886,7 @@ impl Maint {
         landed: Option<&std::sync::Arc<MemTable>>,
     ) {
         let l0_aligned = sort_segs(&mut segs);
+        let (parts, piece_runs) = State::placing(&segs, l0_aligned);
         // One fresh table for every attempt: a landing that lost the swap
         // installs the same empty table on its retry.
         let fresh = landed.map(|_| std::sync::Arc::new(MemTable::new(self.opts.block_shape())));
@@ -49621,6 +49985,8 @@ impl Maint {
                 store_bytes,
                 data_bytes,
                 l0_aligned,
+                parts,
+                piece_runs: piece_runs.clone(),
                 segs_tombs,
             };
             let rebases = if swapped_live {
@@ -57119,6 +57485,84 @@ mod landing_facts {
             let plain = BlockedBloom::from_fnv(&hashes[..n], false);
             let ahead = BlockedBloom::from_fnv(&hashes[..n], true);
             assert_eq!(plain.blocks, ahead.blocks, "{n} words, asked ahead");
+        }
+    }
+
+    /// The block a hash names is its high half's remainder by the block
+    /// count, the mapping a stored filter's words were set under
+    /// (`BLOOM_SIG`), whatever takes the remainder: `reduce`, which takes
+    /// it by two multiplies, is held to the divide it stands in for, at
+    /// block counts of one, of powers of two and either side of them, of
+    /// primes, at the last count thirty-two bits hold and past it, and at
+    /// dividends at each count's edges, at the half's own and across it.
+    #[test]
+    fn the_block_a_hash_names_is_the_remainder_a_divide_gives() {
+        let top = u64::from(u32::MAX);
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut counts = vec![
+            1u64,
+            2,
+            3,
+            5,
+            7,
+            8,
+            63,
+            64,
+            65,
+            1000,
+            4096,
+            4097,
+            123_457,
+            1 << 20,
+            (1 << 20) + 1,
+            (1 << 31) - 1,
+            1 << 31,
+            (1 << 31) + 1,
+            top - 1,
+            top,
+            top + 1,
+            1 << 40,
+        ];
+        for _ in 0..200 {
+            counts.push(next() % top + 1);
+        }
+        for n in counts {
+            let magic = BlockedBloom::magic_for(n as usize);
+            let mut halves = vec![0u64, 1, 2, top - 1, top, top / 2, top / 2 + 1];
+            for edge in [n.saturating_sub(1), n, n + 1, 2 * n, 2 * n + 1, 3 * n - 1] {
+                if edge <= top {
+                    halves.push(edge);
+                }
+            }
+            for _ in 0..2000 {
+                halves.push(next() >> 32);
+            }
+            for a in halves {
+                assert_eq!(
+                    BlockedBloom::reduce(a, n, magic) as u64,
+                    a % n,
+                    "{a} by {n}"
+                );
+            }
+        }
+        // And a filter's own: every key's block is the one the divide
+        // names, so its words are the ones a stored filter holds.
+        for keys in [1usize, 7, 51, 52, 1000, 5000] {
+            let b = BlockedBloom::with_capacity(keys);
+            assert_eq!(b.magic, BlockedBloom::magic_for(b.blocks.len()));
+            for _ in 0..2000 {
+                let h = next();
+                assert_eq!(b.block_of(h), (h >> 32) as usize % b.blocks.len());
+            }
+            let words = b.words();
+            let back = BlockedBloom::from_words(&words).expect("whole blocks");
+            assert_eq!(back.magic, b.magic, "a filter read back reduces as it did");
         }
     }
 }

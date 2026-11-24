@@ -361,6 +361,11 @@ struct Cfg {
     /// the model beside the reads that stand in for it.
     point_fixed: bool,
     point_lone: bool,
+    /// The layered read that places its sources first
+    /// (`Options::point_layers_lean`): off in a quarter of the seeds under
+    /// `ZFUZZ_OPTVARY`, so both layered reads meet the fuzz's stores, with
+    /// their pieces, their seals in flight and their chains of appends.
+    point_layers_lean: bool,
     /// The log held in the process (`SyncPolicy::Explicit`, which `sync`
     /// then is) in a quarter of the seeds under `ZFUZZ_OPTVARY`, and in
     /// half of those to a cap of two kibibytes (`Options::wal_hold_bytes`),
@@ -663,6 +668,8 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let quiet_any = side.chance(50);
     let (fixed_off, lone_off) = (side.chance(25), side.chance(25));
     let (explicit_on, hold_small) = (side.chance(25), side.chance(50));
+    // After every draw before it, so that it moves none of them.
+    let layers_as_one = side.chance(25);
     // A generator of its own, as `side` is, so that the switch moves none
     // of the draws below.
     let stride =
@@ -730,6 +737,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         merge_quiet_any: vary && !quiet_on && quiet_any,
         point_fixed: !(vary && fixed_off),
         point_lone: !(vary && lone_off),
+        point_layers_lean: !(vary && layers_as_one),
         hold_small: vary && explicit_on && hold_small,
         stride,
     }
@@ -765,6 +773,7 @@ fn opts(c: &Cfg) -> Options {
         merge_quiet_any_gate: c.merge_quiet_any,
         point_fixed: c.point_fixed,
         point_lone: c.point_lone,
+        point_layers_lean: c.point_layers_lean,
         wal_hold_bytes: if c.hold_small {
             2 << 10
         } else {
@@ -1732,6 +1741,12 @@ struct Stats {
     /// summed as `abandons` is: what says a run under `ZFUZZ_OPTVARY`
     /// reached each.
     held: [u64; 2],
+    /// The point reads either store's writer answered by the two-source
+    /// read, by a layered read, and of those by the one that places its
+    /// sources first (`Options::point_lone`, `point_layers_lean`), summed
+    /// as `abandons` is: what says a range reached each, since the general
+    /// read answers every key they decline and the model cannot tell.
+    reads: [u64; 3],
     /// Through either store's form files: groups a point read decoded in
     /// part, groups the memo took at a second touch, reads the key table
     /// sent to their record, groups a walk decoded into its own buffer and
@@ -1904,6 +1919,10 @@ fn count_heads(st: &mut Stats, db: &Db) {
     let h = db.wal_held();
     st.held[0] += h.dropped;
     st.held[1] += h.spilled;
+    let (lone, layered) = db.point_lean_reads();
+    st.reads[0] += lone;
+    st.reads[1] += layered;
+    st.reads[2] += db.point_placed_reads();
 }
 
 fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
@@ -2057,6 +2076,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         recuts: 0,
         heads: [0; 2],
         held: [0; 2],
+        reads: [0; 3],
         point: [0; 12],
         stride: StrideStats::default(),
     };
@@ -2502,6 +2522,7 @@ fn fuzz_range() {
     let mut point = [0u64; 12];
     let mut heads = [0u64; 2];
     let mut held = [0u64; 2];
+    let mut reads = [0u64; 3];
     let mut stride = StrideStats::default();
     let ran = seeds.len();
     for seed in seeds {
@@ -2525,12 +2546,15 @@ fn fuzz_range() {
                 heads[1] += s.heads[1];
                 held[0] += s.held[0];
                 held[1] += s.held[1];
+                for (a, b) in reads.iter_mut().zip(s.reads) {
+                    *a += b;
+                }
             }
             Err(e) => bad.push(format!("seed {seed}: {e}")),
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {}, snapshots kept {kept}, log frames dropped {} spilled {}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {}, snapshots kept {kept}, log frames dropped {} spilled {}, point reads two-source {} layered {} placed {}, FAILURES {}",
         heads[0],
         heads[1],
         point[0],
@@ -2547,6 +2571,9 @@ fn fuzz_range() {
         point[11],
         held[0],
         held[1],
+        reads[0],
+        reads[1],
+        reads[2],
         bad.len()
     );
     if stride_on() {
