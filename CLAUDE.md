@@ -87,10 +87,13 @@ of a megabyte the `faster` arm's three libraries are, and on a day the
 mirror was slow that step ran eleven seconds in one x64 job and three to
 four minutes in others started beside it, and held one for half an hour
 until the run was cancelled, with nothing in its log: the scripts sent
-apt's output nowhere, and the helper prints it where an install fails.
-It installs no recommended extras, so a package
-a job needs and another only recommends is named, as `cross-arm` names
-the target's C library.
+apt's output nowhere. The helper says in one line which try installed
+and in how many seconds, and prints what apt said where an install
+fails; the lists are not all of a slow mirror's price, and `cross-arm`'s
+sixty megabytes of cross compiler took eleven minutes in one run and
+twelve seconds in the next. It installs no recommended extras, so a
+package a job needs and another only recommends is named, as `cross-arm`
+names the target's C library.
 
 `sh scripts/check.sh` runs every group -- build, test, stride, lint, wasm, bench --
 and CI calls the same script with the same names, so a green run here is a

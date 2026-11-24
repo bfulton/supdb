@@ -11,10 +11,14 @@
 # package, twenty times the three packages the `faster` arm's set-up wants.
 # On a day the mirror was slow that step ran three to four minutes in x64
 # jobs and held one for half an hour. A host with no lists at all, a fresh
-# container, fails the first try at once and takes the second. Quiet unless
-# it fails, when it says what apt said: the scripts that called apt-get
-# themselves sent its output nowhere, and a step that sat for minutes or
-# failed had nothing in its log.
+# container, fails the first try at once and takes the second.
+#
+# One line on stderr says what was installed, by which of the two tries and
+# in how many seconds, and where an install fails, what apt said: the
+# scripts that called apt-get themselves sent its output nowhere, and a
+# step that sat for minutes or failed had nothing in its log. Nothing goes
+# to stdout, which a caller may be reading for something of its own
+# (bench/scripts/libclang.sh prints an `export` line there).
 set -eu
 if [ $# -eq 0 ]; then
   echo "usage: sh scripts/apt.sh PKG..." >&2
@@ -35,14 +39,17 @@ else
 fi
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
+t0=$(date +%s)
 if $root apt-get install -y -qq --no-install-recommends "$@" > "$log" 2>&1; then
+  echo "apt: $* installed in $(($(date +%s) - t0)) s, with the lists the host had" >&2
   exit 0
 fi
 echo "--- the lists fetched afresh, after:" >> "$log"
 if $root apt-get update -qq >> "$log" 2>&1 \
   && $root apt-get install -y -qq --no-install-recommends "$@" >> "$log" 2>&1; then
+  echo "apt: $* installed in $(($(date +%s) - t0)) s, with the lists fetched afresh" >&2
   exit 0
 fi
-echo "apt could not install: $*" >&2
+echo "apt could not install: $* ($(($(date +%s) - t0)) s)" >&2
 tail -n 40 "$log" >&2
 exit 1
