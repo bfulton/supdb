@@ -55,6 +55,7 @@ pub fn higher_is_better(quantity: &str) -> Option<bool> {
         "open_ms" | "first_read_us" | "unrecovered_batches" => false,
         // The audit's (`is_audit`): named, and judged by nobody.
         "group_bytes" | "process_bytes" => false,
+        "room_above_bytes" => true,
         _ => return None,
     })
 }

@@ -39,6 +39,46 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// A v1 limit at or over this is no limit: the kernel writes "unlimited"
+/// as the largest whole number of pages a signed count holds.
+const V1_UNLIMITED: u64 = 1 << 60;
+
+/// The least room the groups above `group` leave it: over each directory
+/// above it that carries the controller's limit file with a number under
+/// "unlimited" in it, that limit less what the directory's group is
+/// charged, and `None` where no group above is limited. The walk ends at
+/// the first directory without the file, which is the mount's parent under
+/// v1 and the mount's own root under v2. A group above at its limit takes
+/// pages from every group under it at each charge, the pass's among them
+/// and whatever the pass's own limit, so a pass under one has run under a
+/// bound nobody chose: on this host the pass's group is made under the
+/// tool's own, which a day's builds fill with page cache.
+pub fn room_above_at(group: &Path, v2: bool) -> Option<u64> {
+    let (limit_file, usage_file) = if v2 {
+        ("memory.max", "memory.current")
+    } else {
+        ("memory.limit_in_bytes", "memory.usage_in_bytes")
+    };
+    let mut least: Option<u64> = None;
+    let mut dir = group.parent();
+    while let Some(d) = dir {
+        let Ok(text) = std::fs::read_to_string(d.join(limit_file)) else {
+            break;
+        };
+        // v2 writes no limit as `max`, which is not a number.
+        if let Ok(limit) = text.trim().parse::<u64>() {
+            if limit < V1_UNLIMITED {
+                if let Ok(used) = read_u64(&d.join(usage_file)) {
+                    let room = limit.saturating_sub(used);
+                    least = Some(least.map_or(room, |l| l.min(room)));
+                }
+            }
+        }
+        dir = d.parent();
+    }
+    least
+}
+
 /// The group's name under the parent, with the pid so that a run that
 /// died leaves a name its successor recognises as stale and removes.
 const PREFIX: &str = "supdb-bench-";
@@ -617,6 +657,36 @@ impl Bound {
         } else {
             read_u64(&self.group.join("memory.usage_in_bytes"))
         }
+    }
+
+    /// The least room the groups above this one leave it
+    /// (`room_above_at`): what a pass reads at its start beside what its own
+    /// group holds, since a limit on a group above is a second bound on the
+    /// pass that the row's class does not name.
+    pub fn room_above(&self) -> Option<u64> {
+        room_above_at(&self.group, self.v2)
+    }
+
+    /// A probe's squeeze (`SUPDB_LAG_SQUEEZE_MB`): `bytes` of what the
+    /// group holds taken out by the kernel now, and the limit as it was
+    /// after. Under v1 a limit written under the group's usage is the
+    /// kernel's order to reclaim down to it, and where it cannot get there
+    /// the write fails busy with whatever it did reclaim gone; under v2
+    /// `memory.reclaim` names the bytes. With no swap what goes is page
+    /// cache, the pages written once and never read first, which is what a
+    /// load under pressure loses. Returns the bytes the group's usage fell
+    /// by, read from the kernel and not taken from what was asked.
+    pub fn squeeze(&self, bytes: u64) -> io::Result<u64> {
+        let before = self.usage()?;
+        if self.v2 {
+            let _ = std::fs::write(self.group.join("memory.reclaim"), format!("{bytes}\n"));
+        } else {
+            let file = self.group.join("memory.limit_in_bytes");
+            let low = before.saturating_sub(bytes).max(1 << 20);
+            let _ = std::fs::write(&file, low.to_string());
+            write_to(&file, &self.limit.to_string())?;
+        }
+        Ok(before.saturating_sub(self.usage()?))
     }
 
     /// The group's counters now, or the error naming the file that could
@@ -1207,5 +1277,91 @@ mod attached {
             "owned is this process's own and never travels: {text}"
         );
         drop(b);
+    }
+}
+
+#[cfg(test)]
+mod room {
+    use super::{room_above_at, Bound};
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("supdb-next-room-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The room above a group is the least a limited group above it has
+    /// left: an unlimited group above counts for nothing, a limited one for
+    /// its limit less its usage, the tightest of several wins, a group at
+    /// or past its limit leaves none, and the group's own limit is not
+    /// asked at all. v1's files and v2's, over directories of plain files.
+    #[test]
+    fn the_room_above_a_group_is_the_tightest_limit_above_it() {
+        for v2 in [false, true] {
+            let (lim, cur, none) = if v2 {
+                ("memory.max", "memory.current", "max")
+            } else {
+                (
+                    "memory.limit_in_bytes",
+                    "memory.usage_in_bytes",
+                    "9223372036854771712",
+                )
+            };
+            let root = scratch(if v2 { "v2" } else { "v1" });
+            let (a, b, c) = (root.join("a"), root.join("a/b"), root.join("a/b/c"));
+            std::fs::create_dir_all(&c).unwrap();
+            let set = |d: &std::path::Path, limit: &str, used: u64| {
+                std::fs::write(d.join(lim), format!("{limit}\n")).unwrap();
+                std::fs::write(d.join(cur), format!("{used}\n")).unwrap();
+            };
+            // Nothing above is limited: the pass's own limit is not the
+            // question, however tight.
+            set(&a, none, 5 << 30);
+            set(&b, none, 5 << 30);
+            set(&c, "1048576", 1 << 20);
+            assert_eq!(room_above_at(&c, v2), None, "v2 {v2}");
+            // One limited group above, with room.
+            set(&a, &(10u64 << 30).to_string(), 4 << 30);
+            assert_eq!(room_above_at(&c, v2), Some(6 << 30), "v2 {v2}");
+            // A tighter one nearer wins, and the order does not matter.
+            set(&b, &(3u64 << 30).to_string(), 2 << 30);
+            assert_eq!(room_above_at(&c, v2), Some(1 << 30), "v2 {v2}");
+            set(&a, &(10u64 << 30).to_string(), (10u64 << 30) - 4096);
+            assert_eq!(room_above_at(&c, v2), Some(4096), "v2 {v2}");
+            // At its limit, and past it by what a charge in flight leaves.
+            set(&a, &(10u64 << 30).to_string(), 10 << 30);
+            assert_eq!(room_above_at(&c, v2), Some(0), "v2 {v2}");
+            set(&a, &(10u64 << 30).to_string(), (10u64 << 30) + 8192);
+            assert_eq!(room_above_at(&c, v2), Some(0), "v2 {v2}");
+            // The walk starts above the group: `b`'s own limit is not `b`'s
+            // room, and the mount's parent, with no file, ends it.
+            assert_eq!(room_above_at(&b, v2), Some(0), "v2 {v2}");
+            set(&a, none, 10 << 30);
+            assert_eq!(room_above_at(&b, v2), None, "v2 {v2}");
+            assert_eq!(room_above_at(&a, v2), None, "v2 {v2}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// A squeeze leaves the group's limit as it found it: over a directory
+    /// of plain files, which reclaim nothing, the limit file reads the
+    /// bound's own limit after it and the bytes taken are none.
+    #[test]
+    fn a_squeeze_puts_the_limit_back() {
+        let root = scratch("squeeze");
+        std::fs::write(root.join("memory.limit_in_bytes"), "1073741824\n").unwrap();
+        std::fs::write(root.join("memory.usage_in_bytes"), "536870912\n").unwrap();
+        let b: Bound = serde_json::from_str(&format!(
+            r#"{{"group":{:?},"parent":{:?},"limit":1073741824}}"#,
+            root, root
+        ))
+        .unwrap();
+        assert_eq!(b.squeeze(100 << 20).unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(root.join("memory.limit_in_bytes")).unwrap(),
+            "1073741824"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

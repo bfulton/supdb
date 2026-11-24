@@ -902,6 +902,110 @@ fn counters_line(
     }
 }
 
+/// The machine's TLB shootdowns and function-call interrupts so far, every
+/// CPU's together, from `/proc/interrupts` (the `TLB` and `CAL` rows): what
+/// a pass's window of them says other threads' unmaps and advice cost the
+/// scanning thread in interrupts, which no fault count and no CPU clock
+/// shows. Zeros where the file or a row cannot be read.
+fn irq_counts() -> [u64; 2] {
+    let Ok(text) = std::fs::read_to_string("/proc/interrupts") else {
+        return [0; 2];
+    };
+    let row = |name: &str| -> u64 {
+        text.lines()
+            .find(|l| l.trim_start().starts_with(name))
+            .map(|l| {
+                l.split_whitespace()
+                    .skip(1)
+                    .map_while(|f| f.parse::<u64>().ok())
+                    .sum()
+            })
+            .unwrap_or(0)
+    };
+    [row("TLB:"), row("CAL:")]
+}
+
+/// `SUPDB_LAG_SQUEEZE_MB`'s megabytes, where it is set to a number.
+fn lag_squeeze_mb() -> Option<u64> {
+    std::env::var("SUPDB_LAG_SQUEEZE_MB").ok()?.parse().ok()
+}
+
+/// Every page of every file under `dir` that the page cache holds, read
+/// once through a mapping made here: the files, the pages read and the
+/// pages the cache did not hold, which are left where they are -- a touch
+/// of one would be a read from the device, and the probe is of the pages
+/// already back. `mincore` says which, and nothing is faulted in to ask.
+fn touch_resident(dir: &Path) -> (u64, u64, u64) {
+    let (mut files, mut touched, mut absent) = (0u64, 0u64, 0u64);
+    let page = 4096usize;
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return (0, 0, 0);
+    };
+    let mut sum = 0u64;
+    for ent in rd.flatten() {
+        let path = ent.path();
+        if path.is_dir() {
+            let (f, t, a) = touch_resident(&path);
+            files += f;
+            touched += t;
+            absent += a;
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+        if len == 0 {
+            continue;
+        }
+        use std::os::unix::io::AsRawFd as _;
+        // SAFETY: a private read-only mapping of a file this process holds
+        // open, checked for failure, read only inside its length and
+        // unmapped before the file closes.
+        unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            );
+            if p == libc::MAP_FAILED {
+                continue;
+            }
+            let pages = len.div_ceil(page);
+            let mut vec = vec![0u8; pages];
+            if libc::mincore(p, len, vec.as_mut_ptr()) == 0 {
+                files += 1;
+                for (i, v) in vec.iter().enumerate() {
+                    if v & 1 == 0 {
+                        absent += 1;
+                        continue;
+                    }
+                    sum += u64::from(std::ptr::read_volatile((p as *const u8).add(i * page)));
+                    touched += 1;
+                }
+            }
+            libc::munmap(p, len);
+        }
+    }
+    std::hint::black_box(sum);
+    (files, touched, absent)
+}
+
+/// `SUPDB_LAG_TOUCH`'s line for a point: what `touch_resident` read and
+/// how long it took, the price of a page being the line's own quotient.
+fn lag_touch(arm: &str, pct: u64, dir: &Path) {
+    let t = Instant::now();
+    let (files, touched, absent) = touch_resident(dir);
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    eprintln!(
+        "lagtouch {arm} {pct} files {files} pages {touched} absent {absent} ms {ms:.1} us_per_page {:.3}",
+        if touched > 0 { ms * 1e3 / touched as f64 } else { 0.0 }
+    );
+}
+
 pub fn lag_mark(arm: &str, pct: u64, edge: &str) {
     if std::env::var_os("SUPDB_LAG_MARK").is_none() {
         return;
@@ -1249,6 +1353,16 @@ fn pass_measurements(size: u64, arm: &str, g: Guarantee, one: &OnePass) -> Vec<M
     }
     if let Some(b) = one.start_process_bytes {
         s.push(AUDIT_WORKLOAD, sz, arm, g, ("process_bytes", "B"), b as f64);
+    }
+    if let Some(b) = one.bound_room_above {
+        s.push(
+            AUDIT_WORKLOAD,
+            sz,
+            arm,
+            g,
+            ("room_above_bytes", "B"),
+            b as f64,
+        );
     }
     s.push("load", sz, arm, g, ("ops_per_s", "ops/s"), one.load_ops_s);
     s.push(
@@ -1645,6 +1759,10 @@ pub fn run(
                         if let Some(note) = audit_note(arm, size, rep, &one) {
                             log(&note);
                         }
+                        let limit = plan.bound.as_ref().map(|b| b.limit());
+                        if let Some(note) = room_note(arm, size, rep, one.bound_room_above, limit) {
+                            log(&note);
+                        }
                         let frag = if rep > 0 {
                             pass_measurements(size, arm, g, &one)
                         } else {
@@ -1914,6 +2032,12 @@ pub struct OnePass {
     bound_start_bytes: Option<u64>,
     #[serde(default)]
     start_process_bytes: Option<u64>,
+    /// Under a bound, the least room the groups above the pass's left it at
+    /// its start (`Bound::room_above`), `None` where none above is limited:
+    /// recorded in the row with the two above and held against the bound by
+    /// the run (`room_note`).
+    #[serde(default)]
+    bound_room_above: Option<u64>,
     /// The recovery workloads' readings: the open and the first read of
     /// the store a killed process left after the ordered load's batches,
     /// and after the shuffled load's (`recover_store`). None where the
@@ -1971,6 +2095,9 @@ impl OnePass {
         }
         if let Some(b) = self.start_process_bytes {
             v.push((format!("{AUDIT_WORKLOAD} process_bytes"), b as f64));
+        }
+        if let Some(b) = self.bound_room_above {
+            v.push((format!("{AUDIT_WORKLOAD} room_above_bytes"), b as f64));
         }
         for (pct, x) in &self.scan_lag {
             v.push((format!("scan-lag entries_per_s_lag{pct}pct"), *x));
@@ -2635,6 +2762,32 @@ pub fn audit_note(arm: &str, size: u64, rep: usize, one: &OnePass) -> Option<Str
     })
 }
 
+/// The line a pass that began with less room above its group than its
+/// bound is reported with, or none: `limit` is the bound, and the room is
+/// `room` what the groups above the pass's had left
+/// (`OnePass::bound_room_above`).
+/// Such a pass can be made to give pages up before it reaches its own
+/// limit, by a limit nobody set for it.
+pub fn room_note(
+    arm: &str,
+    size: u64,
+    rep: usize,
+    room: Option<u64>,
+    limit: Option<u64>,
+) -> Option<String> {
+    let (room, limit) = (room?, limit?);
+    (room < limit).then(|| {
+        format!(
+            "AUDIT: the pass of {arm} at {size} keys, rep {rep}, began with {} MB of room in the \
+             groups above its own for a bound of {} MB: a group above was that near its limit, \
+             and takes pages from the pass as it fills (free that group's page cache first: as \
+             root, sync; echo 1 > /proc/sys/vm/drop_caches)",
+            room >> 20,
+            limit >> 20
+        )
+    })
+}
+
 /// The seam a test holds memory in a run's own process with:
 /// `SUPDB_BENCH_PARENT_BALLAST=<bytes>`, touched and held until the value
 /// returned is dropped. A pass's bound must see none of it.
@@ -2783,6 +2936,7 @@ pub fn one_pass_child(spec_path: &Path) -> Result<(), String> {
         Some((Err(e), _)) => return Err(e),
         None => None,
     };
+    let room = spec.plan.bound.as_ref().and_then(|b| b.room_above());
     let payload = Payload::new(spec.plan.value_size, spec.plan.compress, 0xE1);
     let seam = std::env::var(KILL_AFTER).ok();
     let trace = PhaseTrace::new(&spec.dir, &spec.arm, spec.rep, seam.as_deref());
@@ -2798,6 +2952,7 @@ pub fn one_pass_child(spec_path: &Path) -> Result<(), String> {
     if let Some((group, own)) = start {
         one.bound_start_bytes = Some(group);
         one.start_process_bytes = own;
+        one.bound_room_above = room;
     }
     let text = serde_json::to_vec(&one).map_err(|e| format!("the pass's result: {e}"))?;
     std::fs::write(&spec.out, text)
@@ -3154,6 +3309,7 @@ fn one_pass(
             lag_sweep(
                 e.as_mut(),
                 arm,
+                dir,
                 size,
                 scans,
                 scan_keys,
@@ -3243,6 +3399,7 @@ fn one_pass(
         recovered,
         bound_start_bytes: None,
         start_process_bytes: None,
+        bound_room_above: None,
         prime_us_per_page: prime_a.max(prime_b),
         load_ops_s: if passes.load {
             size as f64 / load_s
@@ -3579,6 +3736,7 @@ fn recover_store(
 fn lag_sweep(
     e: &mut dyn Engine,
     arm: &str,
+    dir: &Path,
     size: u64,
     scans: u64,
     scan_keys: u64,
@@ -3687,7 +3845,34 @@ fn lag_sweep(
             // background leaves below its trigger still stand here, in
             // some reps and not others, and `lagcounters` counts them.
             e.sync()?;
+            // A probe, under `SUPDB_LAG_SQUEEZE_MB`: that many megabytes of
+            // the pass's group reclaimed here, between the drain and the
+            // settle (`Bound::squeeze`). It makes on purpose the start a
+            // sweep has in some sittings and not in others, a store whose
+            // files the load's own pressure pushed out of the page cache,
+            // so that what the settle and the passes after it do about it
+            // is priced in every rep and not in the reps the host chose.
+            if let (Some(mb), Some(b)) = (lag_squeeze_mb(), counting.bound) {
+                match b.squeeze(mb << 20) {
+                    Ok(got) => eprintln!("lagsqueeze {arm} asked_mb {mb} took_mb {}", got >> 20),
+                    Err(err) => eprintln!("lagsqueeze {arm} asked_mb {mb} failed: {err}"),
+                }
+            }
             e.settle()?;
+        }
+        // A probe, under `SUPDB_LAG_TOUCH`: every page of the store's files
+        // the page cache holds read once here, through mappings of the
+        // harness's own, before the point's pass (`touch_resident`) -- at
+        // the sweep's first point alone under `settle`, at every point
+        // under `all`. A page read back from the device costs its first
+        // reader a fault below the guest that no counter here shows; the
+        // probe takes those out of the pass, which prices what an engine
+        // that touched what it asked back would have left to gain. The pass
+        // after it is the probe's, and its rates are not read.
+        match std::env::var("SUPDB_LAG_TOUCH").as_deref() {
+            Ok("all") | Ok("settle") if pct == 0 => lag_touch(arm, pct, dir),
+            Ok("all") => lag_touch(arm, pct, dir),
+            _ => {}
         }
         // The burst is timed and kept for an engine with no ordered scan;
         // the scans after it are not run, and the point has no scan cell.
@@ -3734,6 +3919,7 @@ fn lag_sweep(
         } else {
             (0, (0, 0))
         };
+        let irq0 = if per_op { irq_counts() } else { [0; 2] };
         // With `SUPDB_LAG_COUNTERS`, the device's and the group's side of
         // the pass: sectors the device read and wrote while the scans ran,
         // the process's own read and write bytes, and the group's dirty and
@@ -3822,8 +4008,9 @@ fn lag_sweep(
             let mut sorted = op_us.clone();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let head: Vec<String> = op_us.iter().take(4).map(|u| format!("{u:.0}")).collect();
+            let irq1 = irq_counts();
             eprintln!(
-                "lagops {arm} {pct} scans {n} first {} med {:.1} max {:.0} sum_ms {:.1} pass_ms {:.1} cpu_ms {cpu_ms:.1} vcsw {} nvcsw {} tenths {}",
+                "lagops {arm} {pct} scans {n} first {} med {:.1} max {:.0} sum_ms {:.1} pass_ms {:.1} cpu_ms {cpu_ms:.1} vcsw {} nvcsw {} tlb {} cal {} tenths {}",
                 head.join("/"),
                 sorted[n / 2],
                 sorted[n - 1],
@@ -3831,7 +4018,36 @@ fn lag_sweep(
                 secs * 1e3,
                 sw1.0.saturating_sub(sw0.0),
                 sw1.1.saturating_sub(sw0.1),
+                irq1[0].saturating_sub(irq0[0]),
+                irq1[1].saturating_sub(irq0[1]),
                 tenths.join("/")
+            );
+        }
+        // A probe, under `SUPDB_LAG_REPEAT`: the point's same scans made
+        // again straight after its pass, the same keys in the same order,
+        // every one timed (`lagrepeat`). A pass slow by what its scans were
+        // the first to touch repeats fast; one slow by the walk it takes
+        // repeats as slow. The scans count toward everything the store
+        // counts, so the points after it are the probe's.
+        if std::env::var_os("SUPDB_LAG_REPEAT").is_some() {
+            let mut g4 = KeyGen::new(KeyDist::Uniform, scan_keys, 0x1A7);
+            let mut us: Vec<f64> = Vec::with_capacity(scans as usize);
+            let cpu = thread_cpu_us();
+            let t = Instant::now();
+            for _ in 0..scans {
+                km.key_into(g4.next(), &mut kb);
+                let t0 = Instant::now();
+                e.range(&kb, plan.scan_len)?;
+                us.push(t0.elapsed().as_secs_f64() * 1e6);
+            }
+            let again = t.elapsed().as_secs_f64();
+            let cpu_ms = thread_cpu_us().saturating_sub(cpu) as f64 / 1e3;
+            us.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            eprintln!(
+                "lagrepeat {arm} {pct} first_pass_ms {:.1} repeat_ms {:.1} cpu_ms {cpu_ms:.1} med {:.1}",
+                secs * 1e3,
+                again * 1e3,
+                us.get(us.len() / 2).copied().unwrap_or(0.0)
             );
         }
         if counting_store {
@@ -4215,6 +4431,10 @@ pub fn ab(
                 }
             };
             if let Some(note) = audit_note(arm, size, rep, &one) {
+                let _ = writeln!(log, "{note}");
+            }
+            let limit = plan.bound.as_ref().map(|b| b.limit());
+            if let Some(note) = room_note(arm, size, rep, one.bound_room_above, limit) {
                 let _ = writeln!(log, "{note}");
             }
             if i == 0 {
@@ -5644,6 +5864,58 @@ pub fn full_top(mem_total_kb: u64, value_size: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// A bounded pass's start enters the row with the rest of the pass
+    /// (`pass_measurements`), through the one push that refuses a quantity
+    /// the gate has no direction for: a pass with all three of its start's
+    /// records set comes through it, each under the audit's workload. The
+    /// first roster after the room above was recorded died at this push
+    /// three seconds in, behind a green gate that had never sent a bounded
+    /// pass's start through it.
+    #[test]
+    fn a_bounded_passes_start_enters_the_row() {
+        let root = std::env::temp_dir().join(format!("supdb-next-auditrow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut plan = Plan::new(Scale::Quick, vec![], 30_000, 4);
+        plan.passes = Passes::parse("load").unwrap();
+        let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
+        let mut one = one_pass("supdb", &root.join("s"), 5_000, 1, &plan, &payload, None).unwrap();
+        one.bound_start_bytes = Some(1 << 20);
+        one.start_process_bytes = Some(12 << 20);
+        one.bound_room_above = Some(13 << 30);
+        let ms = pass_measurements(5_000, "supdb", Guarantee::Durable, &one);
+        for q in ["group_bytes", "process_bytes", "room_above_bytes"] {
+            let m = ms
+                .iter()
+                .find(|m| m.workload == AUDIT_WORKLOAD && m.quantity == q)
+                .unwrap_or_else(|| panic!("no {q} under {AUDIT_WORKLOAD}"));
+            assert_eq!(m.samples.len(), 1, "{q}");
+            assert!(crate::gate::higher_is_better(q).is_some(), "{q}");
+        }
+        assert!(one
+            .flat()
+            .iter()
+            .any(|(n, v)| n == "bound-start room_above_bytes" && *v == (13u64 << 30) as f64));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A pass is reported where the groups above its own began with less
+    /// room than its bound, and not where they had the bound or more, no
+    /// limit above at all, or no bound.
+    #[test]
+    fn a_pass_short_of_room_above_its_bound_is_reported() {
+        let limit = Some(1u64 << 30);
+        let note = super::room_note("supdb", 3_000_000, 2, Some(900 << 20), limit).unwrap();
+        assert!(note.starts_with("AUDIT: the pass of supdb at 3000000 keys, rep 2,"));
+        assert!(note.contains("900 MB of room") && note.contains("a bound of 1024 MB"));
+        assert!(super::room_note("supdb", 1, 1, Some(0), limit).is_some());
+        assert!(super::room_note("supdb", 1, 1, Some((1 << 30) - 1), limit).is_some());
+        assert!(super::room_note("supdb", 1, 1, Some(1 << 30), limit).is_none());
+        assert!(super::room_note("supdb", 1, 1, Some(8 << 30), limit).is_none());
+        assert!(super::room_note("supdb", 1, 1, None, limit).is_none());
+        assert!(super::room_note("supdb", 1, 1, Some(0), None).is_none());
+    }
+
     use super::*;
 
     /// A run whose passes have processes of their own runs no warmup rep,
