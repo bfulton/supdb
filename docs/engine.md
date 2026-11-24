@@ -762,10 +762,27 @@ none (`supdb-ingestnopool`):
 The first family's A is the first two tables'. The rates resolve less
 than the count at this rung: the arm against itself reads 0.79x to 1.08x
 by position in the same shape (`pair.sh supdb-ingest supdb-ingest
-300000`), and the pool against none read the scrambled A 1.20x and 1.13x,
-the only cell past that in both orders, with the scrambled F, D and F
-1.01x to 1.15x and the read-only scrambled B and C 0.90x to 0.98x, inside
-it.
+300000`). At the commit that made the pool the default (`pair.sh supdb
+supdb-nopool 300000 --reps 6 --passes
+load,read,read-threaded,mixes,mixes-scrambled`, at `4ff31ef`) the durable
+arm with it read the scrambled A 1.11x and 1.33x, the only cell past that
+floor in both orders, and the rest 0.93x to 1.17x either way. Under a
+bound it holds nothing where it matters: three million keys under 1 GiB,
+the lag sweep's every point, the pool's bytes in the census nil and no
+pass killed (`SUPDB_LAG_COUNTERS=1 bench ab --arms supdb,supdb-nopool
+--size 3000000 --bound 1073741824 --reps 1 --ops-div 10 --passes
+load,lag`).
+
+Beside FASTER after both (`pair.sh supdb-held faster 300000`, the same
+passes, at `4ff31ef`, both sittings): the scrambled F 0.77x and 0.77x where
+it read 0.55x and 0.59x at `afd58c9`, the scrambled A 0.76x and 0.84x for
+0.59x and 0.64x, the scrambled D 0.85x and 0.75x for 0.73x and 0.70x; the
+first family's A at 0.77x and 0.80x and F at 0.61x and 0.66x, where its
+first two tables are fresh and they read as before; and the read passes,
+C and B level or a tenth either way. What separates the write mixes now
+is an update's instructions, 801 against 555, and FASTER's
+read-modify-write, which updates the record its read found in place
+where ours adds a tombstone and a value to the key's chain.
 
 ### The seal wait
 
