@@ -2992,6 +2992,7 @@ fn one_pass(
     let mut counting = Counting::new(plan.bound.as_ref(), dir, trace)?;
     let prime_a = prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
     engines::set_store_keys(size);
+    engines::set_store_bound(plan.bound_bytes());
     let mut e = engines::open(arm, dir, map_gb)?;
     // An engine with no ordered scan (FASTER's hash store) runs every
     // workload made of point operations and none of the scans: the scan
@@ -3307,6 +3308,7 @@ fn one_pass(
         prime_b = prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         engines::set_store_keys(size);
+        engines::set_store_bound(plan.bound_bytes());
         let mut e = engines::open(arm, dir, map_gb)?;
         shuf_s = shuffled_load(e.as_mut(), arm, size, plan, payload, &mut counting)?;
         // What the shuffled load freed, returned before the sweep: its
@@ -3358,6 +3360,7 @@ fn one_pass(
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         engines::set_store_keys(size);
+        engines::set_store_bound(plan.bound_bytes());
         let mut e = engines::open(arm, dir, map_gb)?;
         load(e.as_mut(), size, plan, payload, |i| i)?;
         release_freed_memory();

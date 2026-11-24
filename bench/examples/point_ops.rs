@@ -45,6 +45,9 @@
 //!                        the run's rates are not read
 //!   POINT_OPS_ROUNDS=1   `reads-dirty` timed a round at a time, for a
 //!                        cost its first round pays once
+//!   POINT_OPS_BOUND=N    the store sized for a memory bound of N bytes
+//!                        and run without one (FASTER's index and log,
+//!                        `engines::faster_sizes`), for its peak memory
 //!   POINT_OPS_CLASSES=1  after `reads-dirty`, gets of the keys the live
 //!                        table answers, of the keys the piece answers
 //!                        (with `POINT_OPS_LAND`) and of the keys no update
@@ -145,6 +148,15 @@ fn main() {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         engines::set_store_keys(size);
+        // A bound the engine sizes itself for, without one being entered
+        // (`POINT_OPS_BOUND=BYTES`): FASTER divides it between its index and
+        // its log (`engines::faster_sizes`), so its peak memory under that
+        // division can be read off a run nothing kills.
+        engines::set_store_bound(
+            std::env::var("POINT_OPS_BOUND")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+        );
         // `proto` is the probe's own table (`supdb_bench::proto`), driven as
         // the suite's arms are.
         let mut e: Box<dyn Engine> = if arm == "proto" {

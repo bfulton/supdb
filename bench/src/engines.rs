@@ -14298,11 +14298,93 @@ pub fn set_store_keys(n: u64) {
     STORE_KEYS.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The memory bound the store is about to be opened under, set by the pass
+/// beside the keys, for an engine that sizes its own memory up front:
+/// FASTER's index and the in-memory part of its log are allocated at open
+/// and read nothing of the group they run in, where supdb reads its budget
+/// from the group itself. Zero: no bound.
+static STORE_BOUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Said by the pass before each store it opens (`run.rs`), `None` in core.
+pub fn set_store_bound(bytes: Option<u64>) {
+    STORE_BOUND.store(bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// FASTER's sizes for a store of `keys` keys: its hash index's buckets, the
+/// bytes of its log held in memory, and the fraction of those pages it
+/// updates in place, the rest read-only and copied to the tail on update.
+///
+/// In core, what its own benchmark does (`cc/benchmark-dir/benchmark.cc`):
+/// half as many 64-byte buckets as keys, rounded up to the power of two the
+/// index requires, and a log four times the records' bytes, so the whole
+/// store is in memory and in its mutable region, at the default fraction of
+/// 0.9 -- which needs four read-only pages of 32 MiB beside the mutable
+/// ones, so a log of at least 1 GiB.
+///
+/// Under a bound, the division a user of it would make, since FASTER
+/// allocates both at open, reads its log's files with `O_DIRECT` and so has
+/// no page cache to lean on, and is killed past the bound: the index at the
+/// same ratio rounded down instead, so it never takes the half of a bound a
+/// rounding up gives it at ten million keys (512 MiB); the page of overflow
+/// buckets the index allocates and zeroes at open, 2^20 of them at 64 bytes
+/// (`MallocFixedPageSize`), 64 MiB whatever the keys; a quarter of the bound
+/// left for the process around it; and the rest to the log, in whole pages,
+/// at the default fraction or less, to keep the four read-only pages the
+/// log needs. The quarter is measured, not chosen: sized with an eighth and
+/// no overflow page, the arm was killed seven seconds into its load at ten
+/// million keys under 1 GiB, and the probe's own process held 1,034-1,066
+/// MiB through the same load where the index and the log were 896
+/// (`POINT_OPS_BOUND`). A bound too small for that is refused rather than
+/// sized into a store that cannot hold its own minimum.
+pub fn faster_sizes(keys: u64, bound: Option<u64>) -> Res<(u64, u64, f64)> {
+    const BUCKET: u64 = 64;
+    const PAGE: u64 = 32 << 20;
+    const HEAD_PAGES: u64 = 4;
+    const FRACTION: f64 = 0.9;
+    let Some(bound) = bound else {
+        let table = (keys / 2).max(1024).next_power_of_two();
+        // A record is an 8-byte header, the key, the generation word and the
+        // value, rounded to eight: 136 bytes.
+        let record = (8 + 16 + 8 + FASTER_VALUE as u64).div_ceil(8) * 8;
+        let gib = 1u64 << 30;
+        let log = (keys * record * 4).div_ceil(gib).max(1) * gib;
+        return Ok((table, log, FRACTION));
+    };
+    let half = (keys / 2).max(1024);
+    let table = if half.is_power_of_two() {
+        half
+    } else {
+        half.next_power_of_two() / 2
+    };
+    const OVERFLOW_PAGE: u64 = (1 << 20) * BUCKET;
+    let left = bound
+        .checked_sub(table * BUCKET + OVERFLOW_PAGE + bound / 4)
+        .ok_or_else(|| format!("a bound of {bound} bytes leaves FASTER no log beside its index"))?;
+    let pages = left / PAGE;
+    // At least two mutable pages beside the read-only ones.
+    if pages < HEAD_PAGES + 2 {
+        return Err(format!(
+            "a bound of {bound} bytes leaves FASTER {pages} log pages beside its index of \
+             {table} buckets, short of the {} it needs",
+            HEAD_PAGES + 2
+        ));
+    }
+    // FASTER takes the mutable pages as the fraction times the pages,
+    // truncated: half a page over leaves exactly the four read-only ones.
+    let mutable = FRACTION.min((pages - HEAD_PAGES) as f64 / pages as f64 + 0.5 / pages as f64);
+    Ok((table, pages * PAGE, mutable))
+}
+
 #[cfg(faster)]
 mod faster_ffi {
     use std::os::raw::{c_char, c_int, c_void};
     extern "C" {
-        pub fn fkv_open(dir: *const c_char, table_size: u64, log_bytes: u64) -> *mut c_void;
+        pub fn fkv_open(
+            dir: *const c_char,
+            table_size: u64,
+            log_bytes: u64,
+            mutable_fraction: f64,
+        ) -> *mut c_void;
         pub fn fkv_close(h: *mut c_void);
         pub fn fkv_start_session(h: *mut c_void);
         pub fn fkv_stop_session(h: *mut c_void);
@@ -14357,7 +14439,6 @@ unsafe impl Send for FasterHandle {}
 #[cfg(faster)]
 unsafe impl Sync for FasterHandle {}
 
-#[cfg(faster)]
 const FASTER_VALUE: usize = 100;
 
 #[cfg(faster)]
@@ -14377,16 +14458,11 @@ impl Faster {
             0 => 1 << 20,
             n => n,
         };
-        let table = (keys / 2).max(1024).next_power_of_two();
-        // A record is an 8-byte header, the key, the generation word and the
-        // value, rounded to eight: 136 bytes.
-        let record = 8 + 16 + 8 + FASTER_VALUE as u64;
-        let record = record.div_ceil(8) * 8;
-        let gib = 1u64 << 30;
-        let log = (keys * record * 4).div_ceil(gib).max(1) * gib;
+        let bound = STORE_BOUND.load(std::sync::atomic::Ordering::Relaxed);
+        let (table, log, mutable) = faster_sizes(keys, (bound > 0).then_some(bound))?;
         let dir =
             std::ffi::CString::new(path.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
-        let h = unsafe { faster_ffi::fkv_open(dir.as_ptr(), table, log) };
+        let h = unsafe { faster_ffi::fkv_open(dir.as_ptr(), table, log, mutable) };
         if h.is_null() {
             return Err(format!(
                 "FASTER would not open a store at {}",
@@ -14639,17 +14715,32 @@ pub const ARMS: [&str; 13] = roster!();
 /// while, a second comparison that read the same question against a
 /// weaker configuration. The buffered group is not here: a bounded row is
 /// about reads from the device, and a buffered load reads nothing a
-/// durable one does not. `--arms` overrides it as it does `ARMS`.
-pub const OOC_ARMS: [&str; 8] = [
-    "supdb",
-    "supdb-nocache",
-    "supdb-cache256tofit",
-    "supdb-noadvice",
-    "supdb-nozpages",
-    "lmdb-nordahead",
-    "rocksdb-tuned",
-    "rocksdb-tuned-lz4",
-];
+/// durable one does not. FASTER's group is, where FASTER is built, with
+/// `supdb-held` beside it: a store larger than memory is what FASTER's log
+/// is made for, its tail in memory and the rest read from the device past
+/// the page cache, so its reads past the bound are a different engine's
+/// answer to the same question, with its index and the in-memory part of
+/// its log divided from the bound as a user of it would divide them
+/// (`faster_sizes`). `--arms` overrides it as it does `ARMS`.
+macro_rules! ooc_roster {
+    ($($also:literal),*) => {
+        [
+            "supdb",
+            "supdb-nocache",
+            "supdb-cache256tofit",
+            "supdb-noadvice",
+            "supdb-nozpages",
+            "lmdb-nordahead",
+            "rocksdb-tuned",
+            "rocksdb-tuned-lz4",
+            $($also),*
+        ]
+    };
+}
+#[cfg(faster)]
+pub const OOC_ARMS: [&str; 10] = ooc_roster!("supdb-held", "faster");
+#[cfg(not(faster))]
+pub const OOC_ARMS: [&str; 8] = ooc_roster!();
 
 pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
@@ -17450,6 +17541,47 @@ mod tests {
     /// refused, as every difference was; and every pair of a group is
     /// asked, since two arms that each match FASTER may not match each
     /// other.
+    #[test]
+    fn faster_divides_a_bound_between_its_index_and_its_log() {
+        const MIB: u64 = 1 << 20;
+        // In core, its own benchmark's sizes, unchanged.
+        assert_eq!(
+            faster_sizes(300_000, None).unwrap(),
+            (262_144, 1 << 30, 0.9)
+        );
+        assert_eq!(
+            faster_sizes(10_000_000, None).unwrap(),
+            (8_388_608, 6 << 30, 0.9)
+        );
+        // Under a bound: the index rounded down, its overflow page, a quarter
+        // left, and the rest in whole pages with exactly four read-only ones
+        // where the default fraction would leave fewer, as FASTER counts them.
+        for (keys, bound, table, pages) in [
+            (10_000_000u64, 1024 * MIB, 4_194_304u64, 14u64),
+            (10_000_000, 1280 * MIB, 4_194_304, 20),
+            (3_000_000, 1024 * MIB, 1_048_576, 20),
+            (1_000_000, 4096 * MIB, 262_144, 93),
+            (10_000_000, 768 * MIB, 4_194_304, 8),
+        ] {
+            let (t, log, f) = faster_sizes(keys, Some(bound)).unwrap();
+            assert_eq!((t, log), (table, pages * 32 * MIB), "{keys} under {bound}");
+            assert!(t * 64 + 64 * MIB + log + bound / 4 <= bound);
+            let mutable = (f * pages as f64) as u64;
+            assert!(
+                mutable >= 2 && pages - mutable >= 4,
+                "{keys}: {mutable} of {pages}"
+            );
+            if pages >= 40 {
+                assert_eq!(f, 0.9);
+            } else {
+                assert_eq!(pages - mutable, 4, "{keys} under {bound}");
+            }
+        }
+        // A bound with no room for six pages beside the index is refused.
+        assert!(faster_sizes(10_000_000, Some(400 * MIB)).is_err());
+        assert!(faster_sizes(1_000_000, Some(200 * MIB)).is_err());
+    }
+
     #[test]
     fn the_matching_check_excuses_what_one_arm_cannot_have_and_nothing_else() {
         // What the held arm and FASTER's report, written out: the engine's
