@@ -35,10 +35,19 @@ jobs:
       - name: FASTER, for the `faster` arm
         run: sh bench/scripts/faster.sh
       # `workspace -> target`, the target a path inside its workspace, and
-      # LIBCLANG_PATH in the key: see the `test` job of ci.yml.
+      # LIBCLANG_PATH in the key: see the `test` job of ci.yml. Both of this
+      # job's target directories are named: the second build's was not, so
+      # RocksDB on jemalloc was built from its sources at every run. The key
+      # is this job's own and not the one the suite's other jobs share (the
+      # `quick` job of ci.yml), since none of them builds the second
+      # directory. GitHub removes a cache nothing has read for seven days
+      # and this job's schedule is weekly, so a scheduled run may find its
+      # cache gone and build both.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: bench -> target
+          workspaces: |
+            bench -> target
+            bench -> target-jemalloc
           env-vars: LIBCLANG
       - name: RocksDB on glibc malloc
         working-directory: bench
