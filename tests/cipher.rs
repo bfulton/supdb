@@ -2671,17 +2671,20 @@ fn a_store_handed_to_another_key_opens_under_that_one() {
 }
 
 /// A merge under a cipher asks ahead for what stands behind its cold
-/// inputs (`Options::merge_read_ahead`), as it does over a plain store's
-/// files: the record region's place is read from the section's header
-/// however the reader holds the section, where it was a span of the
-/// mapping's lent bytes, which a file read through the store's cache has
-/// none of, so every window was empty and nothing was asked. The inputs
-/// are made cold by a cache a twentieth of them, which gives their chunks
-/// back, and by the drop of their ciphertext from the kernel's cache.
+/// inputs (`Options::merge_read_ahead_cipher`, on as shipped), as one over
+/// a plain store's files does where it is asked to: the record region's
+/// place is read from the section's header however the reader holds the
+/// section, where it was a span of the mapping's lent bytes, which a file
+/// read through the store's cache has none of, so every window was empty
+/// and nothing was asked. The inputs are made cold by a cache a twentieth
+/// of them, which gives their chunks back, and by the drop of their
+/// ciphertext from the kernel's cache. The window is the cipher's own
+/// option: the plain store's (`merge_read_ahead`) set beside a cipher's of
+/// zero asks nothing.
 #[test]
 fn a_merge_under_a_cipher_asks_ahead_for_its_cold_inputs() {
     let _quiet = one_at_a_time();
-    let build = |name: &str, window: usize| -> (u64, u64, u64) {
+    let build = |name: &str, window: Option<usize>, plain: usize| -> (u64, u64, u64) {
         let d = scratch(name);
         let mut db = Db::create(
             &d,
@@ -2690,7 +2693,9 @@ fn a_merge_under_a_cipher_asks_ahead_for_its_cold_inputs() {
                 seal_bytes: 4 << 20,
                 partition_bytes: None,
                 l0_trigger: 1,
-                merge_read_ahead: window,
+                merge_read_ahead: plain,
+                merge_read_ahead_cipher: window
+                    .unwrap_or(Options::default().merge_read_ahead_cipher),
                 ..Options::default()
             },
         )
@@ -2721,12 +2726,24 @@ fn a_merge_under_a_cipher_asks_ahead_for_its_cold_inputs() {
         let _ = std::fs::remove_dir_all(&d);
         (dropped, after.0 - before.0, after.1 - before.1)
     };
-    let (dropped, asks, bytes) = build("mergeahead-cold", 1 << 20);
-    assert!(dropped > 6 << 20, "dropped {dropped} bytes of records");
-    assert!(
-        asks > 0 && bytes > 0,
-        "cold inputs: {asks} asks of {bytes} bytes"
+    for (name, window) in [
+        ("mergeahead-cold", Some(1 << 20)),
+        ("mergeahead-default", None),
+    ] {
+        let (dropped, asks, bytes) = build(name, window, 0);
+        assert!(
+            dropped > 6 << 20,
+            "{name}: dropped {dropped} bytes of records"
+        );
+        assert!(
+            asks > 0 && bytes > 0,
+            "{name}: cold inputs: {asks} asks of {bytes} bytes"
+        );
+    }
+    let (_, asks, bytes) = build("mergeahead-off", Some(0), 4 << 20);
+    assert_eq!(
+        (asks, bytes),
+        (0, 0),
+        "the cipher's option off asked, the plain store's set beside it"
     );
-    let (_, asks, bytes) = build("mergeahead-off", 0);
-    assert_eq!((asks, bytes), (0, 0), "the option off asked");
 }

@@ -521,6 +521,8 @@ pub struct Supdb {
     cipher_half: bool,
     /// `Policy::cipher_land_model`.
     cipher_land_model: bool,
+    /// `Policy::cipher_merge_apart`.
+    cipher_merge_apart: bool,
     /// False for the ingest-first arm: a flush stops partitioning what it
     /// sealed and leaves that to the background -- promotion at once, a
     /// merge for the rest (`Options::flush_schedules`). Both arms exist so
@@ -1970,6 +1972,12 @@ struct Policy {
     /// `supdb-cipherautolandmodel`, beside `supdb-cipherauto`, the shape
     /// before.
     cipher_land_model: bool,
+    /// The store under a cipher with the controller on and its merges
+    /// asking nothing ahead of their walks of their inputs
+    /// (`Options::merge_read_ahead_cipher` at zero), where the engine asks
+    /// a window ahead, a window whole: `supdb-cipherautomergeapart`, beside
+    /// `supdb-cipherauto`, the shape before.
+    cipher_merge_apart: bool,
     partition: bool,
     drain: bool,
     advice: Option<supdb::ReadAdvice>,
@@ -3144,6 +3152,7 @@ impl Default for Policy {
             cipher_apart: false,
             cipher_half: false,
             cipher_land_model: false,
+            cipher_merge_apart: false,
             partition: true,
             drain: true,
             advice: None,
@@ -3726,6 +3735,20 @@ impl Supdb {
                 cipher: true,
                 cipher_auto: true,
                 cipher_land_model: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherauto` with its merges asking nothing ahead of their
+    /// walks (`Policy::cipher_merge_apart`): `supdb-cipherautomergeapart`.
+    pub fn create_cipherauto_mergeapart(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: true,
+                cipher_merge_apart: true,
                 ..Policy::default()
             },
         )
@@ -9877,6 +9900,7 @@ impl Supdb {
             cipher_apart,
             cipher_half,
             cipher_land_model,
+            cipher_merge_apart,
             partition,
             drain,
             advice,
@@ -10864,6 +10888,9 @@ impl Supdb {
             if cipher_land_model {
                 opts.zpages_land_cache_pct = 0;
             }
+            if cipher_merge_apart {
+                opts.merge_read_ahead_cipher = 0;
+            }
             if cipher_log {
                 opts.direct_ingest = false;
             }
@@ -10886,6 +10913,7 @@ impl Supdb {
             cipher_apart,
             cipher_half,
             cipher_land_model,
+            cipher_merge_apart,
             partition,
             drain,
             advice,
@@ -11325,6 +11353,7 @@ impl Engine for Supdb {
                 true if self.cipher_log => "supdb-cipherlog",
                 false if self.cipher_log => "supdb-ingestcipherlog",
                 true if self.cipher_auto && self.cipher_land_model => "supdb-cipherautolandmodel",
+                true if self.cipher_auto && self.cipher_merge_apart => "supdb-cipherautomergeapart",
                 true if self.cipher_auto => "supdb-cipherauto",
                 false if self.cipher_auto => "supdb-ingestcipherauto",
                 true if self.cipher_cache != 0 => "supdb-cipher64",
@@ -14940,6 +14969,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cipherlog"
         | "supdb-cipherauto"
         | "supdb-cipherautolandmodel"
+        | "supdb-cipherautomergeapart"
         | "supdb-cipherzpages"
         | "supdb-cipherzstride"
         | "supdb-cipherzstrideapart"
@@ -15543,6 +15573,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestcipherlog" => supdb_arm(Supdb::create_ingest_cipherlog, dir)?,
         "supdb-cipherauto" => supdb_arm(Supdb::create_cipherauto, dir)?,
         "supdb-cipherautolandmodel" => supdb_arm(Supdb::create_cipherauto_landmodel, dir)?,
+        "supdb-cipherautomergeapart" => supdb_arm(Supdb::create_cipherauto_mergeapart, dir)?,
         "supdb-cipherzpages" => supdb_arm(Supdb::create_cipher_zpages, dir)?,
         "supdb-cipherzstride" => supdb_arm(Supdb::create_cipher_zstride, dir)?,
         "supdb-cipherzstrideapart" => supdb_arm(Supdb::create_cipher_zstride_apart, dir)?,
@@ -17661,6 +17692,23 @@ mod tests {
             guarantee("supdb-cipher")
         );
         drop(landmodel);
+        let apart = arm(
+            "supdb-cipherautomergeapart",
+            Supdb::create_cipherauto_mergeapart,
+        );
+        assert!(under(&apart), "supdb-cipherautomergeapart: under a cipher");
+        let a = o(&apart);
+        assert!(a.zpages_under_cipher, "supdb-cipherautomergeapart");
+        assert!(
+            z.merge_read_ahead_cipher > 0 && a.merge_read_ahead_cipher == 0,
+            "supdb-cipherautomergeapart asks nothing ahead of its merges' walks"
+        );
+        assert_eq!(a.zpages_land_cache_pct, z.zpages_land_cache_pct);
+        assert_eq!(
+            guarantee("supdb-cipherautomergeapart"),
+            guarantee("supdb-cipher")
+        );
+        drop(apart);
         drop((plain, cipher, log, auto, zblock, zstride));
         let _ = std::fs::remove_dir_all(&root);
     }

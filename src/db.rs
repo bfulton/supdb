@@ -1589,7 +1589,23 @@ pub struct Options {
     /// controller's build had before `zpages_build_ahead`. Zero asks
     /// nothing; `supdb-mergeahead` is the arm with a window of
     /// `MERGE_AHEAD_WINDOW`; the asks are counted (`Db::merge_ahead`).
+    /// A plain store's: a store under a cipher's merges ask by
+    /// `merge_read_ahead_cipher`.
     pub merge_read_ahead: usize,
+    /// `merge_read_ahead` for a store under a cipher: on, at
+    /// `MERGE_AHEAD_WINDOW`. A merge there reads its inputs through the
+    /// store's cache, which fills a chunk from the envelope's mapping, and
+    /// the mapping is advised for reads far apart, so with nothing asked
+    /// each page of ciphertext a merge read that the kernel did not hold
+    /// was a device round trip of its own: at ten million keys under 1.25
+    /// GiB the full rewrite's merges moved 50 MB of input a second with a
+    /// major fault for half the pages they read, and the pass after the
+    /// burst met 144 pieces still being merged where a plain store meets
+    /// 41 and nothing merging. Asked a window ahead, a window whole
+    /// (`Blob::willneed_at`), 74 MB a second, a seventh of the faults, and
+    /// 39 pieces. Zero asks nothing; `supdb-cipherautomergeapart` is the
+    /// shape before.
+    pub merge_read_ahead_cipher: usize,
     /// A merge's writer syncs its output behind it every this many bytes
     /// (`SegmentOptions::sync_ahead` for the merge's writers alone), zero
     /// for the segment's own. The writer's hint moves a piece to the
@@ -7134,6 +7150,7 @@ impl Default for Options {
             same_blocks_from_index: true,
             merge_drop_chunk: 2 << 20,
             merge_read_ahead: 0,
+            merge_read_ahead_cipher: MERGE_AHEAD_WINDOW,
             merge_sync_ahead: 0,
             background_io: BackgroundIo::Normal,
             seal_sync_every: 0,
@@ -53203,6 +53220,17 @@ impl Maint {
         Ok(())
     }
 
+    /// The window a merge asks ahead of its walk of each input: the plain
+    /// store's (`Options::merge_read_ahead`) or a store under a cipher's
+    /// (`Options::merge_read_ahead_cipher`).
+    fn merge_window(&self) -> usize {
+        if self.shared.pager.is_some() {
+            self.opts.merge_read_ahead_cipher
+        } else {
+            self.opts.merge_read_ahead
+        }
+    }
+
     /// The ordered indexes' top levels read before the publish that makes
     /// `segs` the live set, in a store under a cipher, where an index's
     /// level is read at its first seek and not at its open
@@ -53727,7 +53755,7 @@ impl Maint {
             ord_durable: self.opts.ord_durable,
             walk_cached: self.opts.merge_walk_cached,
             verify_inputs: self.opts.merge_verifies_inputs,
-            read_ahead: self.opts.merge_read_ahead,
+            read_ahead: self.merge_window(),
             counts: Some(self.shared.clone()),
             zfinish: self.z_finish_plan_repicked(),
         };
@@ -60632,7 +60660,7 @@ impl Maint {
         let drop_chunk = self.opts.merge_drop_chunk;
         let walk_cached = self.opts.merge_walk_cached;
         let verify_inputs = self.opts.merge_verifies_inputs;
-        let read_ahead = self.opts.merge_read_ahead;
+        let read_ahead = self.merge_window();
         let zfinish = self.z_finish_plan_repicked();
         let job_inputs = inputs.clone();
         let kept_fences = fences.clone();

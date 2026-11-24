@@ -1526,10 +1526,17 @@ impl<B: Bytes> Blob<B> {
     /// of a walk that will read them (`Bytes::advise_willneed`), unless the
     /// span's first page is resident already (`Bytes::resident_at`), where
     /// an ask would cost the kernel's walk of resident pages for nothing:
-    /// the bytes submitted.
+    /// the bytes submitted. A source that lends by the piece is asked for
+    /// the span whatever its first page is: such a source answers an ask
+    /// for what of the span it does not hold present, and asks nothing
+    /// where it holds all of it, and what it holds of a span is the
+    /// chunks its cache has not given back, scattered through the span a
+    /// unit at a time, of which the first page says nothing. A merge under
+    /// a cipher took a major fault for half the pages of ciphertext it
+    /// read with the first page standing for the window.
     #[cfg(not(target_family = "wasm"))]
     pub fn willneed_at(&self, off: u64, len: usize) -> usize {
-        if len == 0 || self.src.resident_at(off) == Some(true) {
+        if len == 0 || !self.src.piecewise() && self.src.resident_at(off) == Some(true) {
             return 0;
         }
         self.src.advise_willneed(off, len)

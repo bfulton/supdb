@@ -432,7 +432,9 @@ and `supdb-ingestcipherauto`, the controller on
 first of those with its builds ahead at landing started by the
 controller's budget alone (`Options::zpages_land_cache_pct` at zero),
 where the engine starts them past a share of the store's own cache as
-well. And two that force the compact form
+well. `supdb-cipherautomergeapart` is `supdb-cipherauto` with
+its merges asking nothing ahead of their walks of their inputs
+(`Options::merge_read_ahead_cipher` at zero), the shape before. And two that force the compact form
 there, each coding priced by itself: `supdb-cipherzpages`, every
 partition's form file in the block coding, and `supdb-cipherzstride`,
 every build asking for the stride form; `supdb-cipherzstrideapart` is the

@@ -19,6 +19,7 @@
 src/blob.rs	Blob::scan_at	piecewise/ASK_PIECES	code	2	stays	the dispatch on the source kind (R2 keeps it in blob)
 src/blob.rs	Blob::scan_at_in	piecewise/ASK_PIECES	code	1	stays	the dispatch on the source kind (R2 keeps it in blob); new since 682b2c09
 src/blob.rs	Blob::scan_refused	piecewise/ASK_PIECES	code	1	stays	the dispatch on the source kind (R2 keeps it in blob)
+src/blob.rs	Blob::willneed_at	piecewise/ASK_PIECES	code	1	stays	an ask ahead over a source that lends by the piece is the span whole, the source asking for what of it it does not hold; a source that lends whole keeps the first page's test
 src/blob.rs	Sec::pieces	piecewise/ASK_PIECES	code	1	stays	the dispatch on the source kind (R2 keeps it in blob)
 src/blob.rs	Sec::read	piecewise/ASK_PIECES	code	1	stays	the dispatch on the source kind (R2 keeps it in blob)
 src/blob.rs	not_lent	piecewise/ASK_PIECES	code	1	stays	the dispatch on the source kind (R2 keeps it in blob)
@@ -130,6 +131,8 @@ src/db.rs	Maint::join_tier	unlent/unlend	code	1	S1	a wait under no pin: pin::idl
 src/db.rs	Maint::land_front	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
 src/db.rs	Maint::publish	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
 src/db.rs	Maint::rank_before_publish	pager	code	1	stays	a landing under a cipher reads the top levels of the indexes it publishes (tops_before_publish): one test a landing, of whether the store has a cache
+src/db.rs	Maint::merge_window	cipher	code	1	stays	the window a merge asks ahead of its inputs, the plain store's option or the cipher's (merge_read_ahead_cipher), chosen once a merge by whether the store has a cache
+src/db.rs	Maint::merge_window	pager	code	1	stays	the same: whether the store has a cache, once a merge
 src/db.rs	Maint::z_land_cache_due	pager	code	1	stays	the builds ahead's line under a cipher: the partitions' files against the budget of the store's own cache (Options::zpages_land_cache_pct), asked a tick
 src/db.rs	Maint::retire_covered	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
 src/db.rs	Maint::retire_seg	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
@@ -138,9 +141,9 @@ src/db.rs	Maint::z_sample_start	vault::hold	code	1	S1	vault::hold -> pin::hold
 src/db.rs	MemTable::logged	run logged	code	2	S4 (conditional; else stays)	
 src/db.rs	MergeRest::<item>	MergeRest/NoRest	code	1	R4	the lease
 src/db.rs	NoRest::<item>	MergeRest/NoRest	code	2	R4	Free
-src/db.rs	Options::<item>	cipher	code	1	S5	zpages_under_cipher
+src/db.rs	Options::<item>	cipher	code	2	S5	zpages_under_cipher
 src/db.rs	Options::<item>	crypt	code	2	stays	Options.encryption
-src/db.rs	Options::default	cipher	code	1	S5	zpages_under_cipher
+src/db.rs	Options::default	cipher	code	2	S5	zpages_under_cipher
 src/db.rs	Options::default	crypt	code	2	stays	Options.encryption
 src/db.rs	PagerGrace::<item>	pager	code	2	stays	impl pager::Grace
 src/db.rs	Reader::abandon_forms	attn/rest word	code	1	stays	Reader read path: ATTN_PAGED, rests, pager waits (forms.md R4: runtime split stays)

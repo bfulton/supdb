@@ -930,6 +930,60 @@ fn the_advice_by_rank_answers_the_same_for_a_source_by_the_piece() {
     }
 }
 
+/// An ask ahead over a span (`Blob::willneed_at`) is skipped where the
+/// span's first page is resident for a source that lends whole, whose
+/// pages the kernel reads ahead in order from there, and is the span
+/// whatever its first page for one that lends by the piece, which answers
+/// an ask for what of the span it does not hold and holds what its cache
+/// has not given back, a unit here and there: a merge under a cipher read
+/// half its ciphertext a page a fault with the first page standing for
+/// the window.
+#[test]
+fn an_ask_ahead_over_a_source_by_the_piece_is_the_span_whatever_its_first_page() {
+    fn ask<B: Bytes>(
+        blob: &Blob<Advised<B>>,
+        at: u64,
+        len: usize,
+        first: bool,
+    ) -> (usize, Vec<Advice>) {
+        let src = blob_source(blob);
+        let _ = src.take();
+        src.resident(if first { at } else { 0 }, if first { at + 1 } else { 0 });
+        let n = blob.willneed_at(at, len);
+        src.resident(0, 0);
+        (n, src.take())
+    }
+    let path = scratch("ask-whole");
+    build_opts(&path, 600, false, 256, false);
+    let raw = std::fs::read(&path).unwrap();
+    let whole = Blob::open(Advised::new(VecBytes(raw.clone()))).expect("open whole");
+    let pieces =
+        Blob::open(Advised::new(Piecewise::new(raw.clone(), 4080))).expect("open by the piece");
+    assert!(blob_source(&pieces).piecewise() && !blob_source(&whole).piecewise());
+    let (at, len) = whole.record_region_place().expect("a record region");
+    let len = len.min(1 << 20);
+    assert!(len > 8192, "a span of several pages: {len}");
+    assert_eq!(
+        ask(&whole, at, len, true),
+        (0, vec![]),
+        "whole, first page resident"
+    );
+    assert_eq!(
+        ask(&whole, at, len, false),
+        (len, vec![Advice::Willneed(at, len)]),
+        "whole, nothing resident"
+    );
+    for first in [true, false] {
+        assert_eq!(
+            ask(&pieces, at, len, first),
+            (len, vec![Advice::Willneed(at, len)]),
+            "by the piece, first page resident {first}"
+        );
+    }
+    assert_eq!(ask(&pieces, at, 0, false), (0, vec![]), "an empty span");
+    let _ = std::fs::remove_file(&path);
+}
+
 /// A reader's answers held to the file they are about: each record's key
 /// at its offset, the offsets a mapped reader answers, the region's place
 /// its span, every ask over ranks inside the region and each directory ask
