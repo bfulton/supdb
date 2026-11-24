@@ -532,7 +532,13 @@ pub struct Supdb {
     /// because the option is on by default; the arm that turns it off
     /// runs interleaved with it, which is the only way to price it, and
     /// with LMDB, whose in-place tree is what the cache is measured
-    /// against on the scan mixes.
+    /// against on the scan mixes. Off under the held log with no frames,
+    /// `supdb-heldnfnocache`: what the upkeep's filing costs the write
+    /// mixes beside FASTER, which keeps nothing for a scan; and the same
+    /// arm with its upkeep thread backed off as before
+    /// `Options::upkeep_alert` (`supdb-heldnoalert`) or with no thread
+    /// (`Upkeep::Inline`, `supdb-heldinline`), which say whether the
+    /// writer pays for the filing's work or for working beside it.
     block_cache: bool,
     /// A read advice pinned against the engine's own default, or `None` to
     /// take whatever the default is.
@@ -1930,6 +1936,11 @@ pub struct Supdb {
     holdcap: Option<usize>,
     holdmarch: bool,
     noframes: bool,
+    /// A point read that reads a segment's record as it reaches it, no
+    /// line asked ahead of the header (`Options::point_record_ahead`
+    /// off): `supdb-norecordahead`, and `supdb-heldnorecordahead` under
+    /// the held log with no frames.
+    norecordahead: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -3177,6 +3188,9 @@ struct Policy {
     /// builds none, and the arm's `sync`, its drain, is the store's.
     /// `supdb-heldnoframes`.
     noframes: bool,
+    /// No record asked ahead of its header (`Options::point_record_ahead`
+    /// off): `supdb-norecordahead`, `supdb-heldnorecordahead`.
+    norecordahead: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -3509,6 +3523,7 @@ impl Default for Policy {
             holdcap: None,
             holdmarch: false,
             noframes: false,
+            norecordahead: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -10214,6 +10229,7 @@ impl Supdb {
             holdcap,
             holdmarch,
             noframes,
+            norecordahead,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -10881,6 +10897,7 @@ impl Supdb {
             wal_hold_bytes: holdcap.unwrap_or(supdb::Options::default().wal_hold_bytes),
             wal_hold_reuses: !holdmarch,
             held_frames: !noframes,
+            point_record_ahead: !norecordahead,
             ..Default::default()
         };
         let opts = match advice {
@@ -11236,6 +11253,7 @@ impl Supdb {
             holdcap,
             holdmarch,
             noframes,
+            norecordahead,
             ord_threads: Default::default(),
         })
     }
@@ -11409,7 +11427,17 @@ impl Engine for Supdb {
                 return "supdb-heldmarch";
             }
             if self.noframes {
-                return "supdb-heldnoframes";
+                return if !self.block_cache {
+                    "supdb-heldnfnocache"
+                } else if self.norecordahead {
+                    "supdb-heldnorecordahead"
+                } else if self.noalert {
+                    "supdb-heldnoalert"
+                } else if self.upkeep == Some(supdb::Upkeep::Inline) {
+                    "supdb-heldinline"
+                } else {
+                    "supdb-heldnoframes"
+                };
             }
             if self.partition {
                 return "supdb-heldpart";
@@ -11419,6 +11447,9 @@ impl Engine for Supdb {
                 Some(c) if c <= 1 << 20 => "supdb-held1m",
                 Some(_) => "supdb-held8m",
             };
+        }
+        if self.norecordahead {
+            return "supdb-norecordahead";
         }
         // The probe's combinations first, which the single fields below
         // would name by one of their parts.
@@ -14813,6 +14844,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nosnap"
         | "supdb-noadvice"
         | "supdb-advicerandom"
+        | "supdb-norecordahead"
         | "supdb-nocache"
         | "supdb-nocacheordread"
         | "supdb-nocachezpages"
@@ -15314,8 +15346,17 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "rocksdb-tuned-nosync" => Guarantee::Buffered,
         // FASTER's promise and no stronger one: a commit is in the process
         // when the call returns and on the device at the next `sync`.
-        "supdb-held" | "supdb-held1m" | "supdb-held8m" | "supdb-heldmarch" | "supdb-heldpart"
-        | "supdb-heldnoframes" | "faster" => Guarantee::Memory,
+        "supdb-held"
+        | "supdb-held1m"
+        | "supdb-held8m"
+        | "supdb-heldmarch"
+        | "supdb-heldpart"
+        | "supdb-heldnoframes"
+        | "supdb-heldnfnocache"
+        | "supdb-heldnorecordahead"
+        | "supdb-heldnoalert"
+        | "supdb-heldinline"
+        | "faster" => Guarantee::Memory,
         _ => return None,
     })
 }
@@ -15678,6 +15719,84 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         durable: false,
                         held: true,
                         noframes: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldnorecordahead" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        norecordahead: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-norecordahead" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        norecordahead: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldinline" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        upkeep: Some(supdb::Upkeep::Inline),
+                        noalert: false,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldnoalert" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        upkeep: None,
+                        noalert: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldnfnocache" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        block_cache: false,
                         ..Policy::default()
                     },
                 )
@@ -17544,6 +17663,78 @@ mod tests {
             (o.wal_hold_reuses, o.wal_hold_bytes)
         );
         drop((n, np));
+        // The arms beside the held log with no frames, each that arm but for
+        // its one option: by name, its guarantee, and the options it opened
+        // with set against that arm's.
+        let nof = Supdb::with_policy(
+            &root.join("heldnoframes-base"),
+            Policy {
+                partition: false,
+                durable: false,
+                held: true,
+                noframes: true,
+                ..Policy::default()
+            },
+        )
+        .unwrap();
+        let fo = nof.db.as_ref().unwrap().options().clone();
+        assert!(fo.point_record_ahead && fo.scan_block_cache && fo.upkeep_alert);
+        for (arm, differs) in [
+            (
+                "supdb-heldnorecordahead",
+                (|a: &supdb::Options| !a.point_record_ahead) as fn(&supdb::Options) -> bool,
+            ),
+            ("supdb-heldnfnocache", |a| !a.scan_block_cache),
+            ("supdb-heldnoalert", |a| !a.upkeep_alert),
+            ("supdb-heldinline", |a| a.upkeep == supdb::Upkeep::Inline),
+        ] {
+            let e = open(arm, &root.join(arm), 1).unwrap();
+            assert_eq!(e.name(), arm);
+            assert_eq!(guarantee(arm), Some(Guarantee::Memory), "{arm}");
+            assert_eq!(e.features(), base.features(), "{arm}");
+            drop(e);
+            let a = match arm {
+                "supdb-heldnorecordahead" => Policy {
+                    norecordahead: true,
+                    ..Policy::default()
+                },
+                "supdb-heldnfnocache" => Policy {
+                    block_cache: false,
+                    ..Policy::default()
+                },
+                "supdb-heldnoalert" => Policy {
+                    noalert: true,
+                    ..Policy::default()
+                },
+                _ => Policy {
+                    upkeep: Some(supdb::Upkeep::Inline),
+                    ..Policy::default()
+                },
+            };
+            let a = Supdb::with_policy(
+                &root.join(format!("{arm}-policy")),
+                Policy {
+                    partition: false,
+                    durable: false,
+                    held: true,
+                    noframes: true,
+                    ..a
+                },
+            )
+            .unwrap();
+            assert_eq!(a.name(), arm);
+            let ao = a.db.as_ref().unwrap().options().clone();
+            assert!(differs(&ao) && !differs(&fo), "{arm}: its option");
+            assert!(
+                !ao.held_frames && matches!(ao.sync, supdb::SyncPolicy::Explicit),
+                "{arm}"
+            );
+        }
+        // And the default arm's: the record read as it is reached.
+        let e = open("supdb-norecordahead", &root.join("norecordahead"), 1).unwrap();
+        assert_eq!(e.name(), "supdb-norecordahead");
+        assert_eq!(guarantee("supdb-norecordahead"), guarantee("supdb"));
+        drop((e, nof));
         assert!(
             matches!(mo.sync, supdb::SyncPolicy::Explicit) && mo.wal_hold_bytes == o.wal_hold_bytes
         );

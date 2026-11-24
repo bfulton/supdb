@@ -48,6 +48,10 @@
 //!   POINT_OPS_BOUND=N    the store sized for a memory bound of N bytes
 //!                        and run without one (FASTER's index and log,
 //!                        `engines::faster_sizes`), for its peak memory
+//!   POINT_OPS_SCAN=1     after `read-pass`, the suite's scan pass: a scan
+//!                        of a hundred entries from every hundredth key in
+//!                        no order, which builds the block cache a scan
+//!                        pass leaves behind for the mixes after it
 //!   POINT_OPS_CLASSES=1  after `reads-dirty`, gets of the keys the live
 //!                        table answers, of the keys the piece answers
 //!                        (with `POINT_OPS_LAND`) and of the keys no update
@@ -94,6 +98,21 @@ fn phase_reads_clean(e: &mut dyn Engine, ks: &[[u8; 16]], rounds: usize) -> usiz
 #[inline(never)]
 fn phase_reads_dirty(e: &mut dyn Engine, ks: &[[u8; 16]], rounds: usize) -> usize {
     reads(e, ks, rounds) + std::hint::black_box(3) - 3
+}
+
+// The classes' reads, one function a class (`POINT_OPS_CLASSES`), so that
+// callgrind can be toggled on each.
+#[inline(never)]
+fn phase_class_live(e: &mut dyn Engine, ks: &[[u8; 16]], rounds: usize) -> usize {
+    reads(e, ks, rounds) + std::hint::black_box(4) - 4
+}
+#[inline(never)]
+fn phase_class_piece(e: &mut dyn Engine, ks: &[[u8; 16]], rounds: usize) -> usize {
+    reads(e, ks, rounds) + std::hint::black_box(5) - 5
+}
+#[inline(never)]
+fn phase_class_partition(e: &mut dyn Engine, ks: &[[u8; 16]], rounds: usize) -> usize {
+    reads(e, ks, rounds) + std::hint::black_box(6) - 6
 }
 
 #[inline(never)]
@@ -191,6 +210,16 @@ fn main() {
         let t = Instant::now();
         let b0 = phase_read_pass(e.as_mut(), &k0);
         let r0 = ns(t, k0.len());
+        // The scan pass the suite runs before its mixes, on request
+        // (`POINT_OPS_SCAN=1`), outside every phase's clock and toggle.
+        if std::env::var_os("POINT_OPS_SCAN").is_some() {
+            let starts = keys(KeyDist::Uniform, size, 0x5C, (size / 100).max(1) as usize);
+            let mut n = 0usize;
+            for k in &starts {
+                n += e.range(k, 100).unwrap();
+            }
+            std::hint::black_box(n);
+        }
         let t = Instant::now();
         let b1 = phase_reads_clean(e.as_mut(), &k1, rounds);
         let r1 = ns(t, ops * rounds);
@@ -301,7 +330,11 @@ fn main() {
                 for (name, ks) in &classes {
                     let reps = (200_000 / ks.len().max(1)).max(1);
                     let t = Instant::now();
-                    let b = reads(e.as_mut(), ks, reps);
+                    let b = match *name {
+                        "live" => phase_class_live(e.as_mut(), ks, reps),
+                        "piece" => phase_class_piece(e.as_mut(), ks, reps),
+                        _ => phase_class_partition(e.as_mut(), ks, reps),
+                    };
                     eprintln!(
                         "class {name} round {round}: {} keys, {:.0} ns a get ({b} bytes)",
                         ks.len(),

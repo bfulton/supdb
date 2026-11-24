@@ -1674,10 +1674,11 @@ impl<B: Bytes> Blob<B> {
         &self,
         key: &[u8],
         h: u64,
+        ahead: bool,
         f: &mut F,
     ) -> Result<u64> {
         if let Some((sec, idx)) = self.flat() {
-            if let Some(n) = idx.read_fixed_hashed(sec, key, h, f) {
+            if let Some(n) = idx.read_fixed_hashed(sec, key, h, ahead, f) {
                 return Ok(n);
             }
         }
@@ -1695,9 +1696,10 @@ impl<B: Bytes> Blob<B> {
         &self,
         key: &[u8],
         h: u64,
+        ahead: bool,
     ) -> Option<Option<crate::flatindex::CompactFixed<'_>>> {
         let (sec, idx) = self.flat()?;
-        idx.find_fixed_hashed(sec, key, h)
+        idx.find_fixed_hashed(sec, key, h, ahead)
     }
 
     /// `read_all_hashed`, never inlined (`read_all_fixed_hashed`).

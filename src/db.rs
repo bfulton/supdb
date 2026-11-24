@@ -1575,6 +1575,19 @@ pub struct Options {
     /// record is read through its extents: `supdb-pointexts`, and
     /// `supdb-ingestpointexts` buffered.
     pub point_fixed: bool,
+    /// A point read of a segment asks for the lines of the key's record
+    /// past its first as soon as the slot names the record, out to the
+    /// section's mean record length (`FlatIndex::ask_record`), and reads
+    /// the header beside them. The value's place is the header's
+    /// arithmetic, so a read without the ask waits on the slot, then on
+    /// the header's line, then on the value's lines: by the samples of
+    /// the scrambled D and F mixes at three hundred thousand keys, the
+    /// slot's load took 34 of the segment read's 225, the header's 107
+    /// and the value's last line 61, and almost none of the rest were
+    /// instructions. Off, the record is read as it is reached:
+    /// `supdb-norecordahead`, and `supdb-heldnorecordahead` under the
+    /// held log.
+    pub point_record_ahead: bool,
     /// A point read of a store whose sources hold the key in their common
     /// shape reads them in one pass, newest first, on its own frame. Two
     /// reads stand in for the general one. A store with no frozen table
@@ -7272,6 +7285,7 @@ impl Default for Options {
             exts_by_value: false,
             read_hash_once: true,
             point_fixed: true,
+            point_record_ahead: true,
             point_lone: true,
             point_layers_lean: true,
             read_lines_ahead: true,
@@ -27812,7 +27826,10 @@ impl Reader {
                 if !seg.may_hold_fnv(key, fnv) {
                     continue;
                 }
-                if let Some(c) = seg.raw().find_fixed_hashed(key, fnv)? {
+                if let Some(c) =
+                    seg.raw()
+                        .find_fixed_hashed(key, fnv, self.opts.point_record_ahead)?
+                {
                     runs[held].write((c.run, c.records));
                     held += 1;
                     if c.tomb {
@@ -27828,7 +27845,10 @@ impl Reader {
         let mut n = live_n as u64;
         if !cut {
             if let Some(seg) = segs[..np].get(at).filter(|s| s.may_hold_fnv(key, fnv)) {
-                match seg.raw().read_all_fixed_hashed(key, fnv, f) {
+                match seg
+                    .raw()
+                    .read_all_fixed_hashed(key, fnv, self.opts.point_record_ahead, f)
+                {
                     Ok(k) => n += k,
                     Err(e) => return Some(Err(err(&format!("segment read: {e}")))),
                 }
@@ -27942,7 +27962,10 @@ impl Reader {
                 if !seg.may_hold_fnv(key, fnv) {
                     continue;
                 }
-                if let Some(c) = seg.raw().find_fixed_hashed(key, fnv)? {
+                if let Some(c) =
+                    seg.raw()
+                        .find_fixed_hashed(key, fnv, self.opts.point_record_ahead)?
+                {
                     runs[i] = (c.run, c.records);
                     if c.tomb {
                         cut = true;
@@ -27955,7 +27978,10 @@ impl Reader {
         let mut n = 0u64;
         if !cut {
             if let Some(seg) = segs[..np].get(at).filter(|s| s.may_hold_fnv(key, fnv)) {
-                match seg.raw().read_all_fixed_hashed(key, fnv, f) {
+                match seg
+                    .raw()
+                    .read_all_fixed_hashed(key, fnv, self.opts.point_record_ahead, f)
+                {
                     Ok(k) => n += k,
                     Err(e) => return Some(Err(err(&format!("segment read: {e}")))),
                 }
@@ -28022,7 +28048,10 @@ impl Reader {
                 segs.partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key))
             };
             if let Some(seg) = segs.get(at).filter(|s| s.may_hold_fnv(key, fnv)) {
-                match seg.raw().read_all_fixed_hashed(key, fnv, f) {
+                match seg
+                    .raw()
+                    .read_all_fixed_hashed(key, fnv, self.opts.point_record_ahead, f)
+                {
                     Ok(k) => below = k,
                     Err(e) => return Some(Err(err(&format!("segment read: {e}")))),
                 }
@@ -28118,11 +28147,12 @@ impl Reader {
         // takes them by value, the shape before (`Options::exts_by_value`).
         let by_value = self.opts.exts_by_value;
         let fixed = self.opts.point_fixed;
+        let ahead = self.opts.point_record_ahead;
         let seg_read = |seg: &Seg, f: &mut F| {
             if by_value {
                 seg.raw().read_all_by_value(key, f)
             } else if once && fixed {
-                seg.raw().read_all_fixed_hashed(key, fnv, f)
+                seg.raw().read_all_fixed_hashed(key, fnv, ahead, f)
             } else if once {
                 seg.raw().read_all_hashed(key, fnv, f)
             } else {

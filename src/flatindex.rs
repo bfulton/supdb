@@ -65,6 +65,31 @@ pub(crate) const REC_VERSION: u32 = VERSION;
 pub(crate) const HEADER: usize = 192;
 /// Bytes per hash slot: a tag in the top eight bits, a record offset below.
 const SLOT: usize = 8;
+/// The most of a record a point read asks for ahead of its header
+/// (`FlatIndex::ask_record`): four lines, past which a value is read in
+/// order and the core's own prefetch follows it.
+const ASK_RECORD_MAX: usize = 256;
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static RECORDS_ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The records this thread's point reads asked for ahead of their headers
+/// (`FlatIndex::ask_record`, `Options::point_record_ahead`), counted in a
+/// build with debug assertions -- the tests' -- and zero in every other,
+/// so that a read pays nothing for the count: what holds the option to
+/// firing, since an ask changes no answer.
+pub fn records_asked() -> u64 {
+    #[cfg(debug_assertions)]
+    {
+        RECORDS_ASKED.with(|c| c.get())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        0
+    }
+}
 /// The most of the hash table that may be occupied: three quarters.
 const HASH_LOAD_NUM: usize = 3;
 const HASH_LOAD_DEN: usize = 4;
@@ -1671,6 +1696,10 @@ pub struct FlatIndex {
     /// (`Blob::prefetch_ranks_est`). Taken once here and never divided
     /// for on a scan.
     mean_record_len: usize,
+    /// The bytes past a record's first that a point read asks for ahead
+    /// of its header (`ask_record`): the mean record length less one,
+    /// at most `ASK_RECORD_MAX` less one. Taken once here.
+    ask_span: usize,
     /// Absolute offset of the record region within the section, and how much
     /// of it is reserved. `bump` is where the next in-place update lands.
     recs_off: usize,
@@ -1921,6 +1950,7 @@ impl FlatIndex {
             mask: hash_cap - 1,
             nkeys,
             mean_record_len: (recs_len / nkeys.max(1)).max(1),
+            ask_span: (recs_len / nkeys.max(1)).clamp(1, ASK_RECORD_MAX) - 1,
             recs_off,
             recs_cap,
             bump,
@@ -2001,6 +2031,39 @@ impl FlatIndex {
         (self.hash.1 <= sec_len && at + SLOT <= self.hash.1).then_some(at)
     }
 
+    /// A hint to fetch the lines of the record at `off` in `recs` past
+    /// the line it starts on, out to the region's mean record length and
+    /// at most `ASK_RECORD_MAX` bytes; nothing is read, and an address the
+    /// hint names stays inside `recs`. A record shorter than the mean asks
+    /// for a line of the next record at most, and one longer is read past
+    /// the hint as before.
+    #[inline(always)]
+    pub(crate) fn ask_record(&self, recs: &[u8], off: usize) {
+        #[cfg(debug_assertions)]
+        RECORDS_ASKED.with(|c| c.set(c.get() + 1));
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            // A slot names an offset under 2^56, so neither sum wraps; an
+            // empty region's `last` does, and a slot into one fails the
+            // record's read after the hint.
+            let end = (off + self.ask_span).min(recs.len().wrapping_sub(1));
+            let p = recs.as_ptr();
+            let mut a = off + 64;
+            // SAFETY: a prefetch is a hint that faults on no address; the
+            // ones named are inside `recs` wherever it holds the record.
+            unsafe {
+                while a < end {
+                    _mm_prefetch(p.wrapping_add(a) as *const i8, _MM_HINT_T0);
+                    a += 64;
+                }
+                _mm_prefetch(p.wrapping_add(end) as *const i8, _MM_HINT_T0);
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = (recs, off);
+    }
+
     /// `with_lookup` for a key whose hash the caller has already taken, as
     /// a point read over several sources takes it once for all of them.
     #[inline]
@@ -2049,12 +2112,19 @@ impl FlatIndex {
     /// store just loaded, by callgrind at a hundred thousand keys
     /// (`bench/examples/point_ops.rs`), for one slot, one key compare and
     /// one slice.
+    ///
+    /// With `ahead`, the record's lines past its first are asked for the
+    /// moment its slot names it, out to the region's mean record length
+    /// (`ask_record`): the value's place is the header's arithmetic, so
+    /// without the ask the value's lines are a third miss behind the
+    /// slot's and the header's (`Options::point_record_ahead`).
     #[inline(always)]
     pub(crate) fn find_fixed_hashed<'a>(
         &self,
         sec: &'a [u8],
         key: &[u8],
         h: u64,
+        ahead: bool,
     ) -> Option<Option<CompactFixed<'a>>> {
         let hash = sec.get(self.hash.0..self.hash.1)?;
         let recs = sec.get(self.recs.0..self.recs.1)?;
@@ -2067,6 +2137,9 @@ impl FlatIndex {
             }
             if packed >> 56 == tag {
                 let off = (packed & 0x00ff_ffff_ffff_ffff) as usize;
+                if ahead {
+                    self.ask_record(recs, off);
+                }
                 let c = compact_fixed_tomb_at(recs, off)?;
                 if key_eq(c.key, key) {
                     return Some(Some(c));
@@ -2091,9 +2164,10 @@ impl FlatIndex {
         sec: &[u8],
         key: &[u8],
         h: u64,
+        ahead: bool,
         f: &mut impl FnMut(&[u8]),
     ) -> Option<u64> {
-        Some(match self.find_fixed_hashed(sec, key, h)? {
+        Some(match self.find_fixed_hashed(sec, key, h, ahead)? {
             Some(c) => each_fixed(c.run, c.records, f),
             None => 0,
         })
