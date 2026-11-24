@@ -5864,6 +5864,41 @@ pub fn full_top(mem_total_kb: u64, value_size: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// A bounded pass's start enters the row with the rest of the pass
+    /// (`pass_measurements`), through the one push that refuses a quantity
+    /// the gate has no direction for: a pass with all three of its start's
+    /// records set comes through it, each under the audit's workload. The
+    /// first roster after the room above was recorded died at this push
+    /// three seconds in, behind a green gate that had never sent a bounded
+    /// pass's start through it.
+    #[test]
+    fn a_bounded_passes_start_enters_the_row() {
+        let root = std::env::temp_dir().join(format!("supdb-next-auditrow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut plan = Plan::new(Scale::Quick, vec![], 30_000, 4);
+        plan.passes = Passes::parse("load").unwrap();
+        let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
+        let mut one = one_pass("supdb", &root.join("s"), 5_000, 1, &plan, &payload, None).unwrap();
+        one.bound_start_bytes = Some(1 << 20);
+        one.start_process_bytes = Some(12 << 20);
+        one.bound_room_above = Some(13 << 30);
+        let ms = pass_measurements(5_000, "supdb", Guarantee::Durable, &one);
+        for q in ["group_bytes", "process_bytes", "room_above_bytes"] {
+            let m = ms
+                .iter()
+                .find(|m| m.workload == AUDIT_WORKLOAD && m.quantity == q)
+                .unwrap_or_else(|| panic!("no {q} under {AUDIT_WORKLOAD}"));
+            assert_eq!(m.samples.len(), 1, "{q}");
+            assert!(crate::gate::higher_is_better(q).is_some(), "{q}");
+        }
+        assert!(one
+            .flat()
+            .iter()
+            .any(|(n, v)| n == "bound-start room_above_bytes" && *v == (13u64 << 30) as f64));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A pass is reported where the groups above its own began with less
     /// room than its bound, and not where they had the bound or more, no
     /// limit above at all, or no bound.

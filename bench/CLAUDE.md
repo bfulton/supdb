@@ -669,6 +669,15 @@ began with less than its bound (`run::room_note`), and `scripts/room.sh`
 drops the page cache before a roster or a bounded sitting and reads the
 run's binary back, since the drop takes the binary's pages with the
 rest and the first pass would fault its own code in under its bound.
+The record's own first roster died three seconds in, behind a green
+gate: the new quantity had no direction in the gate's list, the one push
+that refuses such a quantity (`Samples::push`) is on `run`'s path and not
+on `ab`'s, and no test had sent a bounded pass's start through it. One
+does now (`a_bounded_passes_start_enters_the_row`), and a bounded `run`
+at one small rung is the ten-second smoke before a roster of three hours
+(`bench run --scale ooc --bound 268435456 --top 30000 --bottom 30000
+--reps 1 --ops-div 10 --passes load,read,lag --arms supdb,lmdb-nordahead
+--out DIR`).
 The probes stay for the next sitting that reads so: `SUPDB_LAG_REPEAT`
 makes a point's same scans again after its pass, which tells a cost of
 what the scans were first to touch from a cost of the walk;
