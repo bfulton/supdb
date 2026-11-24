@@ -47,6 +47,22 @@ echo "comparators: LMDB from $lmdb_src"
 # it (GFLAGS_SHARED off, which the gflags package's own cmake file reads),
 # so that a host needs the gflags package to build the tool and nothing to
 # run a kept one.
+# The tools are compiled as the suite's comparators are, with the C and C++
+# flags bench/.cargo/config.toml gives this host's target (the machine level,
+# frame pointers as rustc has them, none of the host compiler's protections),
+# so that the check reads the harness and not two builds. db_bench takes them
+# in the release flags, which its CMake places after its own frame-pointer
+# flags, and PORTABLE=1 keeps it from adding the host's own -march.
+host=$(rustc -vV 2>/dev/null | sed -n 's/^host: //p' | tr - _)
+cfg_flags() { sed -n "s/^$1_$host *= *\"\(.*\)\"\$/\1/p" .cargo/config.toml; }
+cflags=$(cfg_flags CFLAGS)
+cxxflags=$(cfg_flags CXXFLAGS)
+if [ -z "$cflags" ] || [ -z "$cxxflags" ]; then
+  echo "comparators: .cargo/config.toml gives no C or C++ flags for the target $host" >&2
+  exit 2
+fi
+echo "comparators: the tools' C flags: $cflags"
+echo "comparators: the tools' C++ flags: $cxxflags"
 flags="-DCMAKE_BUILD_TYPE=Release -DWITH_BENCHMARK_TOOLS=ON -DWITH_GFLAGS=ON -DWITH_TESTS=OFF"
 flags="$flags -DWITH_TOOLS=OFF -DWITH_CORE_TOOLS=OFF -DWITH_TRACE_TOOLS=OFF -DWITH_SNAPPY=OFF"
 flags="$flags -DWITH_LZ4=OFF -DWITH_ZLIB=OFF -DWITH_ZSTD=OFF -DWITH_BZ2=OFF -DPORTABLE=1"
@@ -55,14 +71,16 @@ kept=
 if [ -n "${COMPARATORS_TOOLS:-}" ]; then
   mkdir -p "$COMPARATORS_TOOLS" || exit 2
   tree=$(basename "$(dirname "$rocks_src")")
-  kept="$COMPARATORS_TOOLS/db_bench-$tree-$(printf %s "$flags" | cksum | cut -d' ' -f1)"
+  kept="$COMPARATORS_TOOLS/db_bench-$tree-$(printf '%s %s' "$flags" "$cxxflags" | cksum | cut -d' ' -f1)"
 fi
 if [ -n "$kept" ] && [ -x "$kept" ] && ! ldd "$kept" 2>/dev/null | grep -q 'not found'; then
   echo "comparators: db_bench as kept, $kept"
   db_bench=$kept
 else
   # shellcheck disable=SC2086 # a list of flags
-  if ! cmake -S "$rocks_src" -B "$out/rocksdb-build" $flags > "$out/tools/cmake.log" 2>&1; then
+  if ! cmake -S "$rocks_src" -B "$out/rocksdb-build" $flags \
+      "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG $cxxflags" "-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG $cflags" \
+      > "$out/tools/cmake.log" 2>&1; then
     echo "comparators: cmake failed" >&2
     tail -n 30 "$out/tools/cmake.log" >&2
     exit 2
@@ -82,8 +100,10 @@ else
   fi
 fi
 
-# The LMDB tool, against the vendored LMDB.
-if ! cc -O2 -o "$out/tools/lmdb_bench" tools/lmdb_bench.c "$lmdb_src/mdb.c" "$lmdb_src/midl.c" \
+# The LMDB tool, against the vendored LMDB, at the level the suite's LMDB is
+# compiled at (`cc` with the release profile's opt-level) and its flags.
+# shellcheck disable=SC2086 # a list of flags
+if ! cc -O3 $cflags -o "$out/tools/lmdb_bench" tools/lmdb_bench.c "$lmdb_src/mdb.c" "$lmdb_src/midl.c" \
     -I"$lmdb_src" -lpthread 2> "$out/tools/cc.log"; then
   echo "comparators: building lmdb_bench failed" >&2
   cat "$out/tools/cc.log" >&2

@@ -158,6 +158,13 @@ pub struct Row {
     /// those rows' bytes stand as they were written.
     #[serde(default, skip_serializing_if = "KeyShape::is_numbered")]
     pub keys: KeyShape,
+    /// The flags every engine was compiled with (`run::build`): absent from
+    /// the file for the rows before it, whose C and C++ comparators had
+    /// `cc`'s frame pointers and the host compiler's protections that the
+    /// engine's Rust did not, and whose RocksDB had no CRC instruction
+    /// (`bench/.cargo/config.toml`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub build: String,
 }
 
 impl Row {
@@ -342,6 +349,7 @@ mod tests {
             killed: vec![],
             resumptions: vec![],
             keys: KeyShape::Numbered,
+            build: "rustflags: -Ctarget-cpu=x86-64-v3".into(),
             measurements: vec![Measurement {
                 workload: "read".into(),
                 arm: "supdb".into(),
@@ -390,6 +398,19 @@ mod tests {
         assert_eq!(row.class(), format!("{base}/b1536m/kids"));
         row.keys = KeyShape::Numbered;
         assert_eq!(row.class(), format!("{base}/b1536m"));
+    }
+
+    /// A row from before the build was recorded reads with none and writes
+    /// none, so its bytes stand as they were written; a row with one keeps
+    /// it through a write and a read.
+    #[test]
+    fn a_rows_build_is_absent_before_the_field_and_kept_after() {
+        let mut row = Row::read(&first_banked_row()).unwrap();
+        assert_eq!(row.build, "", "a row from before the field");
+        assert!(!serde_json::to_string(&row).unwrap().contains("\"build\""));
+        row.build = "rustflags: -Ctarget-cpu=x86-64-v3".into();
+        let back: Row = serde_json::from_str(&serde_json::to_string(&row).unwrap()).unwrap();
+        assert_eq!(back.build, row.build);
     }
 
     /// A bound is a class of its own, in exact mebibytes, and two bounds

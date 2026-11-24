@@ -1,0 +1,51 @@
+# The build every measurement is made from. Every engine the suite links is
+# compiled to one machine level and one code-generation policy, the Rust and
+# the C/C++ alike, so that a cell compares the engines and not the flags each
+# was handed. `build.rs` refuses a build this file did not reach -- cargo
+# reads it from the directory it runs in, so a build started elsewhere with
+# `--manifest-path` never sees it -- and stamps the flags it got into every
+# row (`build`); `bench` refuses a host without the level before it
+# measures anything.
+#
+# The level. The engine picks its CRC32C instruction when it runs and RocksDB
+# only when it is compiled ("runtime detection no longer supported on x86",
+# util/crc32c.cc), so at the default target RocksDB checksummed every log
+# record with tables while the engine used the instruction beside it. x86-64
+# is held at x86-64-v3 with PCLMUL, which RocksDB's three-stream CRC needs and
+# every x86 host the suite has run on has: the Firecracker guests' Xeons and
+# the hosted runners' EPYCs. ARM Linux is held at ARMv8 with the CRC and
+# crypto extensions, as RocksDB's own build compiles it there, with getauxval
+# named present, which RocksDB's runtime check reads and `librocksdb-sys` does
+# not say. macOS takes Apple's default CPU on both sides already.
+#
+# The policy. `cc` compiles every C and C++ library with frame pointers, leaf
+# functions included, wherever the profile has debug info, and the release
+# profile has line tables for the profiler; Ubuntu's compilers add a stack
+# protector, CET and fortified string calls to C and C++ alone. rustc does
+# none of these for the engine, and keeps or omits frame pointers by target:
+# it omits them on x86-64 Linux and keeps them in non-leaf functions on ARM.
+# So the C and C++ are compiled to the same: frame pointers as rustc has them
+# for the target, no stack protector, no CET and no fortify. The stack-clash
+# probes rustc also emits stay, and the line tables, which change no
+# instruction. And `cc` compiles every library position-independent, under
+# which GCC takes every global function for one another object may replace
+# when the program loads, and inlines none of them, not even into a caller in
+# its own file; clang inlines them, on Linux and macOS, and rustc's LTO makes
+# every function of the binary internal. So GCC is told the same
+# (`-fno-semantic-interposition`), and Apple's clang needs nothing.
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-Ctarget-cpu=x86-64-v3", "-Ctarget-feature=+pclmulqdq"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-Ctarget-feature=+crc,+aes,+sha2"]
+
+# `cc` reads these by target, after its own flags, so each overrides what
+# `cc` set. The RocksDB macro is C++ alone.
+[env]
+CFLAGS_x86_64_unknown_linux_gnu = "-march=x86-64-v3 -mpclmul -fomit-frame-pointer -momit-leaf-frame-pointer -fno-stack-protector -fcf-protection=none -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-semantic-interposition"
+CXXFLAGS_x86_64_unknown_linux_gnu = "-march=x86-64-v3 -mpclmul -fomit-frame-pointer -momit-leaf-frame-pointer -fno-stack-protector -fcf-protection=none -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-semantic-interposition"
+CFLAGS_aarch64_unknown_linux_gnu = "-march=armv8-a+crc+crypto -fno-omit-frame-pointer -momit-leaf-frame-pointer -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-semantic-interposition"
+CXXFLAGS_aarch64_unknown_linux_gnu = "-march=armv8-a+crc+crypto -fno-omit-frame-pointer -momit-leaf-frame-pointer -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-semantic-interposition -DROCKSDB_AUXV_GETAUXVAL_PRESENT"
+CFLAGS_aarch64_apple_darwin = "-fno-omit-frame-pointer -momit-leaf-frame-pointer -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+CXXFLAGS_aarch64_apple_darwin = "-fno-omit-frame-pointer -momit-leaf-frame-pointer -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
