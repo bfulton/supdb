@@ -10,6 +10,9 @@ name: rocksdb-alloc
 # The jemalloc is prefixed, so only RocksDB's allocations move.
 
 on:
+  push:
+    branches: [claude/funny-faraday-1ipfti]
+    paths: ['.github/workflows/rocksdb-alloc.yml']
   workflow_dispatch:
   schedule:
     - cron: '41 7 * * 1'
