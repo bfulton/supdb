@@ -38,7 +38,7 @@ jobs:
     # GitHub's six hours.
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The toolchain rust-toolchain.toml names, the one the local gate runs
       # under; no workflow names a version or a channel of its own.
       - name: The pinned toolchain
@@ -69,7 +69,7 @@ jobs:
           ./target/release/bench run --scale quick --out runs-ci
           ./target/release/bench gate runs-ci/quick/*.json --runs runs > runs-ci/gate.txt 2>&1 || true
           cat runs-ci/gate.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: row-${{ matrix.runner }}
@@ -82,7 +82,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The toolchain rust-toolchain.toml names, the one the local gate runs
       # under; no workflow names a version or a channel of its own.
       - name: The pinned toolchain
@@ -101,7 +101,7 @@ jobs:
         with:
           workspaces: bench -> target
           shared-key: bench
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: row-*
           path: rows
