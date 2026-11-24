@@ -15,6 +15,13 @@
  * rates, as the suite's row has them: keys a second loaded, reads a second,
  * entries a second scanned. The environment's map is MAP_GB gibibytes, the
  * suite's `lmdb_map_gb`, and readahead is left on, as the `lmdb` arm's is.
+ *
+ * Every value read is copied whole out of the map, as the suite's harness
+ * copies every value an arm reads into its sink and as db_bench copies the
+ * value at every step of its seekrandom. Reading one byte of each, as this
+ * did first, scanned a tenth to a quarter faster at the rungs to a hundred
+ * thousand keys, and that was most of what the suite's scan cells ran
+ * under this tool's by.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -36,6 +43,19 @@ static uint64_t next_u64(void) {
     rng ^= rng >> 7;
     rng ^= rng << 17;
     return rng;
+}
+
+/* Where a value read is copied, and the copy: the C library's memcpy,
+ * called through a pointer the compiler has to load, so that it is the
+ * library's routine, the one the suite's own copy reaches, and neither
+ * left out nor compiled in place as some other loop. */
+static unsigned char value_buffer[4096];
+static void *(*volatile copy_out)(void *, const void *, size_t) = memcpy;
+
+static uint64_t consume(const MDB_val *v) {
+    size_t len = v->mv_size < sizeof value_buffer ? v->mv_size : sizeof value_buffer;
+    copy_out(value_buffer, v->mv_data, len);
+    return v->mv_size + value_buffer[0];
 }
 
 static void key_into(uint64_t n, unsigned char *buf) {
@@ -104,7 +124,7 @@ int main(int argc, char **argv) {
         key_into(next_u64() % n, kb);
         MDB_val got;
         if ((rc = mdb_get(rt, dbi, &k, &got))) return fail("get", rc);
-        sink += got.mv_size + ((unsigned char *)got.mv_data)[0];
+        sink += consume(&got);
     }
     double read_s = now_s() - t0;
 
@@ -121,7 +141,7 @@ int main(int argc, char **argv) {
         MDB_val ck = {16, kb}, cv;
         rc = mdb_cursor_get(cur, &ck, &cv, MDB_SET_RANGE);
         for (uint64_t e = 0; e < scan && rc == 0; e++) {
-            sink += cv.mv_size + ((unsigned char *)cv.mv_data)[0];
+            sink += consume(&cv);
             entries++;
             rc = mdb_cursor_get(cur, &ck, &cv, MDB_NEXT);
         }

@@ -752,6 +752,35 @@ tool is held to the tool as somebody last ran it; read the loop before
 the rate. The upstream repository is no longer maintained, which is why
 the pin is its last commit and why nobody else will have met this.
 
+**A verdict that was its pipe's, and a yardstick that did less than the
+arm.** `scripts/comparators.sh` printed its table through `tee`, and a
+pipe's status is its last command's: the table's script answered a cell
+under the margin with 1 and the job passed, for as long as the check had
+run. With the exit the table's, the cells were under 0.7x in four runs of
+five, hosted and here, and all but one of the cells were LMDB's scans,
+near 0.8x of the tool where RocksDB's scans read above db_bench's. The
+loops said why. The harness copies every value an arm
+reads into its sink, db_bench's seekrandom copies its iterator's value
+at every step ("to make sure we read them"), and the C program that
+stands in for LMDB's tool read one byte of each. Copying the value, the
+program scans a tenth to a fifth slower at the rungs to a hundred
+thousand keys, eleven alternated runs of each build, and the scan cells
+read 0.92-1.33x of it in the two runs after; a cursor opened by every
+scan, as the arm's range iterator opens one, moved nothing. The copy is
+the C library's, called through a pointer the compiler has to load:
+written as a plain `memcpy` of a run-time length the compiler made it a
+`rep movs` in place, and that build scanned at a third to a half of the
+rate, a yardstick wrong the other way. The rules: a script's verdict is its own
+exit, and a red input is run through the job once to see it fail; a
+tool written here to stand beside an arm is read against the harness's
+loop line by line, since one that does less work reads as an arm driven
+badly; and a copy in a benchmark is the routine the thing measured
+calls, read in the disassembly, never whatever the compiler makes of
+the source line. The job keeps its db_bench by a restore step and a
+save step of its own, since the one cache action that does both saves
+only where the job passed, and a job that fails on its table had built
+the tool for nothing.
+
 ## One repository
 
 The suite was a separate repository carrying the engine as a submodule for
