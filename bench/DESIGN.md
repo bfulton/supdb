@@ -351,8 +351,11 @@ that seals nothing is all of them; of an ordered load none, a run's
 records going to the run's own file at each commit under every policy.
 
 `supdb-held1m` and `supdb-held8m` pin the bytes the held log spills at
-(`Options::wal_hold_bytes`) where the arm takes the engine's, and are in
-no roster.
+(`Options::wal_hold_bytes`) where the arm takes the engine's, and
+`supdb-heldmarch` has the held log leave the bytes it dropped where they
+lay whenever much is held behind them, so its frames go on into fresh
+pages where the default's write over the dropped ones
+(`Options::wal_hold_reuses`); all three are in no roster.
 
 The store is not a crate. `scripts/faster.sh` fetches its sources at the
 commit `vendor/faster/PIN` names and installs the libraries they link, and

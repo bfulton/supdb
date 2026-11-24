@@ -1917,9 +1917,12 @@ pub struct Supdb {
     /// commit (`SyncPolicy::Explicit`): what FASTER promises between two
     /// checkpoints, and the one supdb arm of its guarantee, `supdb-held`;
     /// and the cap its log spills at where the arm pins one
-    /// (`Options::wal_hold_bytes`), `supdb-held1m` and `supdb-held8m`.
+    /// (`Options::wal_hold_bytes`), `supdb-held1m` and `supdb-held8m`;
+    /// and the held log that leaves a drop where it lay whenever much is
+    /// held behind it (`Options::wal_hold_reuses` off), `supdb-heldmarch`.
     held: bool,
     holdcap: Option<usize>,
+    holdmarch: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -3155,6 +3158,10 @@ struct Policy {
     /// The bytes the held log spills at (`Options::wal_hold_bytes`), the
     /// engine's where the arm pins none: `supdb-held1m`, `supdb-held8m`.
     holdcap: Option<usize>,
+    /// The held log's dropped bytes left where they lay whenever much is
+    /// held behind them (`Options::wal_hold_reuses` off):
+    /// `supdb-heldmarch`.
+    holdmarch: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -3484,6 +3491,7 @@ impl Default for Policy {
             zmemoslab: false,
             held: false,
             holdcap: None,
+            holdmarch: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -10166,6 +10174,7 @@ impl Supdb {
             zmemoslab,
             held,
             holdcap,
+            holdmarch,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -10826,6 +10835,7 @@ impl Supdb {
                 supdb::SyncPolicy::EveryN(u32::MAX)
             },
             wal_hold_bytes: holdcap.unwrap_or(supdb::Options::default().wal_hold_bytes),
+            wal_hold_reuses: !holdmarch,
             ..Default::default()
         };
         let opts = match advice {
@@ -11178,6 +11188,7 @@ impl Supdb {
             zmemoslab,
             held,
             holdcap,
+            holdmarch,
             ord_threads: Default::default(),
         })
     }
@@ -11347,6 +11358,9 @@ impl Engine for Supdb {
         // The guarantee first: an arm that holds its log is no shape of
         // `supdb-ingest`, whose name the fields below would give it.
         if self.held {
+            if self.holdmarch {
+                return "supdb-heldmarch";
+            }
             return match self.holdcap {
                 None => "supdb-held",
                 Some(c) if c <= 1 << 20 => "supdb-held1m",
@@ -15141,7 +15155,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "rocksdb-tuned-nosync" => Guarantee::Buffered,
         // FASTER's promise and no stronger one: a commit is in the process
         // when the call returns and on the device at the next `sync`.
-        "supdb-held" | "supdb-held1m" | "supdb-held8m" | "faster" => Guarantee::Memory,
+        "supdb-held" | "supdb-held1m" | "supdb-held8m" | "supdb-heldmarch" | "faster" => {
+            Guarantee::Memory
+        }
         _ => return None,
     })
 }
@@ -15479,6 +15495,21 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-held" => supdb_arm(|d| Supdb::create_held(d, None), dir)?,
         "supdb-held1m" => supdb_arm(|d| Supdb::create_held(d, Some(1 << 20)), dir)?,
         "supdb-held8m" => supdb_arm(|d| Supdb::create_held(d, Some(8 << 20)), dir)?,
+        "supdb-heldmarch" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        holdmarch: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
         "supdb-ingestleave" => supdb_arm(Supdb::create_ingest_leave, dir)?,
         "supdb-l0" => supdb_arm(Supdb::create_l0, dir)?,
         "supdb-nopin" => supdb_arm(Supdb::create_nopin, dir)?,
@@ -17191,6 +17222,7 @@ mod tests {
             let o = z.db.as_ref().unwrap().options().clone();
             assert!(matches!(o.sync, supdb::SyncPolicy::Explicit), "{arm}");
             assert_eq!(o.wal_hold_bytes, cap.unwrap_or(b.wal_hold_bytes), "{arm}");
+            assert!(o.wal_hold_reuses && b.wal_hold_reuses, "{arm}");
             // The sibling's shape otherwise, on the options a commit's and
             // a drain's paths turn on.
             assert_eq!(
@@ -17232,6 +17264,31 @@ mod tests {
                 assert_eq!(z.get(k).unwrap(), value.len(), "{arm}: after its sync");
             }
         }
+        // The held arm with the drop left where it lay: the one option.
+        let dir = root.join("heldmarch");
+        let z = open("supdb-heldmarch", &dir, 1).unwrap();
+        assert_eq!(z.name(), "supdb-heldmarch");
+        assert_eq!(guarantee("supdb-heldmarch"), Some(Guarantee::Memory));
+        assert_eq!(z.features(), base.features());
+        let held = Supdb::create_held(&root.join("held-again"), None).unwrap();
+        let o = held.db.as_ref().unwrap().options().clone();
+        let m = Supdb::with_policy(
+            &root.join("heldmarch-policy"),
+            Policy {
+                partition: false,
+                durable: false,
+                held: true,
+                holdmarch: true,
+                ..Policy::default()
+            },
+        )
+        .unwrap();
+        let mo = m.db.as_ref().unwrap().options().clone();
+        assert!(o.wal_hold_reuses && !mo.wal_hold_reuses);
+        assert!(
+            matches!(mo.sync, supdb::SyncPolicy::Explicit) && mo.wal_hold_bytes == o.wal_hold_bytes
+        );
+        drop((z, held, m));
         drop(base);
         let _ = std::fs::remove_dir_all(&root);
     }

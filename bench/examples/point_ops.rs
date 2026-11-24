@@ -169,9 +169,21 @@ fn main() {
         let t = Instant::now();
         let b1 = phase_reads_clean(e.as_mut(), &k1, rounds);
         let r1 = ns(t, ops * rounds);
+        // The writer's minor faults by phase, on request
+        // (`POINT_OPS_FAULTS=1`): the writer thread's own, read from
+        // `/proc/thread-self/stat` around each phase.
+        let faults = std::env::var_os("POINT_OPS_FAULTS").is_some();
+        let f0 = supdb_bench::run::minflt_self();
         let t = Instant::now();
         phase_updates(e.as_mut(), &k2, &vals);
         let w = ns(t, ops);
+        if faults {
+            eprintln!(
+                "faults: updates {} on the writer, {:.3} a write",
+                supdb_bench::run::minflt_self() - f0,
+                (supdb_bench::run::minflt_self() - f0) as f64 / ops as f64
+            );
+        }
         let shape = |e: &dyn Engine| {
             let c = e.counters();
             let g = |n: &str| c.iter().find(|(m, _)| *m == n).map_or(0.0, |x| x.1);

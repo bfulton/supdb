@@ -561,7 +561,21 @@ count of pages a load first-touches is the engine's lever
 (`docs/engine.md`, the pages a load touches). Count the pages per key
 before the instructions per key: the writer's two key copies cost 64
 bytes a key of fresh memory and a few nanoseconds of CPU, and the pages
-were the loss. And a derivation moved to the finish is one pass -- the
+were the loss. It came again on the update beside FASTER's: a fifth of
+its instructions taken out moved its time by a twentieth, and the
+samples of the phase split by the kernel's fault path and the rest said
+why before anything else was built -- half of the update was faults,
+0.09 a write, where FASTER takes none (`docs/engine.md`, updates beside
+FASTER's). The faults were the held log's own buffer marching through
+fresh pages, which the rule that compacts it had left to do so for a
+whole run, so the count of what a structure first-touches is read for
+the structures built this session too, not only for the old ones. And a
+callgrind file counts calls made while collection was off: a toggled
+phase showed half again the calls of the phase's updates, and FASTER's
+upsert a hundred and twenty-five thousand for a phase of seventeen, the
+load and the phase after among them; a phase's figure a call is its
+collected instructions over the phase's own operations, never over the
+calls the file lists. And a derivation moved to the finish is one pass -- the
 first version of the derived close read the entries five times and the
 keys three, and gave back at the drain what it had saved at the commits.
 

@@ -655,6 +655,73 @@ to 184, and half of those mixes' operations are updates. The write path
 is the larger distance now, and the gets' is the path length the clean
 read shares.
 
+#### Updates beside FASTER's
+
+Counted the same way (`point_ops ARM 100000 1 zipf 1` under callgrind
+toggled on `point_ops::phase_updates`, at `ebe21ad`), an update of the held
+arm is 978 instructions and FASTER's 555. FASTER's is not lean everywhere:
+104 of its instructions hash the key a byte at a time and 76 are its
+thread-local and thread-id checks. Ours is 904 inside `Db::put_batch`:
+the key's entry in a table that does not hold it yet, 191, which is
+seven updates in ten after a seal has emptied the table; the two log
+frames a put is, a delete and an append, 120 with their CRC at the
+commit; the value's chunk, 110; the index's insert, 74, and the probe
+before it, 69; the hash, 62; and the table's write log, 32. A key the
+table did not hold took the long way through all of them: its entry was
+made with a tombstone (`new_entry`) and the value laid down over it
+after (`push_chunk`), two reservations and five lookups of a block where
+`push_tomb_chunk` takes one of each, and its insert walked the index's
+slots again from the top to the vacant slot the probe had just found.
+`MemTable::put` takes the one reservation (`new_put_entry`) and the slot
+the probe found (`probe_or_vacant`, `index_insert_at`), and a chunk's
+header and value go in with one lookup of the block (`push_chunk`,
+`push_tomb`): the same bytes in the same places. It counts 801.
+
+The time moved a little: alternated, the held arm's updates read 296 ns
+and 286 under the scrambled Zipfian, the buffered arm's 327 and 313, and
+uniform keys level. An update was waiting on something other than its
+instructions, at 1.3 of them a cycle, and the kernel says what: the
+writer took 0.087-0.094 minor faults an update in the held arm, 0.046-0.053
+in the buffered one and none in FASTER's (`POINT_OPS_FAULTS=1`, the
+writer thread's own count around the phase), and sampled by phase (`perf
+record -e cpu-clock --call-graph dwarf`, the stacks with
+`point_ops::phase_updates` on them), 49% of the held arm's phase was the
+kernel's fault path against FASTER's 0.3%. What is left of the user's
+half is 1.34 times FASTER's whole phase. So the fresh pages are most of
+the distance in an update, at about 1.6 µs a page here, and the
+instructions are the rest.
+
+Two things first-touch them. A held log's buffer took every frame into
+pages nobody had touched: it closed the gap its dropped batches leave
+only where under 64 KB was held behind them, and a seal's landing leaves
+behind it whatever was committed while the seal ran, so new frames went
+on into the buffer's untouched reservation for the whole of a run, a
+page every two dozen updates of the suite's. It closes the gap now
+whenever the gap is at least what is held behind it
+(`Options::wal_hold_reuses`; `supdb-heldmarch` is the rule before).
+And every table's blocks are mapped fresh from the kernel and unmapped
+when it lands (`Options::blocks_mapped`), which is the buffered arm's
+whole count and the held arm's other half. Counted by mix in the suite's
+own shape (`SUPDB_MIX_COUNTERS=1 bench run --scale quick --top 300000
+--bottom 300000 --reps 2 --arms supdb-held,supdb-heldmarch,supdb-ingest,faster
+--passes load,read,mixes,mixes-scrambled`), writer faults a mix:
+
+| mix | `supdb-held` | `supdb-heldmarch` | `supdb-ingest` | `faster` |
+|---|---|---|---|---|
+| A | 2,093 | 2,093-2,108 | 1,069-1,084 | 0 |
+| F | 1,649-1,741 | 2,117-2,125 | 1,087-1,091 | 0 |
+| scrambled A | 1,527-1,821 | 2,431-2,434 | 1,410-1,412 | 0 |
+| scrambled F | 1,274-1,281 | 2,305-2,313 | 1,274-1,282 | 0 |
+
+A mix there is 25,000 updates. The held log's faults go once its buffer
+has lapped, by the third write mix, and what stays is the tables'
+blocks: a fault every twenty updates in every arm, two milliseconds or so
+of a mix of twenty to thirty-five. The mixes' times are a different
+matter: the held arm's scrambled F is 32-37 ms where FASTER's is 17-22,
+its scrambled A 28-32 against 17-22 and its F 23-25 against 12-17, so in
+the suite's mixes the faults are under a fifth of the distance, and the
+rest is the update's instructions and the gets beside them.
+
 ### The seal wait
 
 `Db::seal_waits` splits the seal phase the commit thread pays. Under

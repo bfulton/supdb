@@ -5965,6 +5965,24 @@ pub struct Options {
     /// up with its writes reaches the cap in a burst alone. Nothing under
     /// the other policies.
     pub wal_hold_bytes: usize,
+    /// A holding log closes the gap its dropped batches leave whenever the
+    /// gap is at least as large as what it still holds behind it, and the
+    /// commits after write over pages already touched (`Wal::drop_covered`,
+    /// `SyncPolicy::Explicit`). Off, it closes the gap only where less
+    /// than `HOLD_COMPACT` is held behind it, and otherwise leaves the
+    /// dropped bytes where they lay until the buffer empties, so new
+    /// frames go on into the buffer's untouched reservation. A seal's
+    /// landing leaves held behind it what was committed while the seal
+    /// ran, which at a hundred thousand keys and up is more than that,
+    /// and the buffer went through fresh pages for the whole of a run: a
+    /// page every two dozen updates of the suite's, half of the held
+    /// arm's writer faults in the write mixes, and half of an update's
+    /// time, the kernel's fault path, by samples of the update phase
+    /// (`docs/engine.md`, a log held in the process). Moving a byte costs
+    /// a tenth of a nanosecond, a fresh page's byte here four tenths, and
+    /// a frame is moved about once in its life, since a seal's landing
+    /// comes about once a frame's. Off: `supdb-heldmarch`.
+    pub wal_hold_reuses: bool,
     /// How many of the controller's builds ahead run at once
     /// (`zpages_land_pct`): the second in a slot of its own beside the
     /// builder's, which the controller's own jobs keep. An ordered load of
@@ -7468,6 +7486,7 @@ impl Default for Options {
             forms_fit_when_short: true,
             wal_drop_bytes: 1 << 20,
             wal_hold_bytes: 64 << 20,
+            wal_hold_reuses: true,
             zpages_ahead_builders: 2,
             zpages_sample_between: false,
             zpages_cover_resident: true,
@@ -7623,6 +7642,9 @@ struct Wal {
     /// them out (`Options::wal_hold_bytes`); none under a policy that
     /// writes every commit.
     hold: Option<usize>,
+    /// Whether a drop closes its gap whenever the gap is the larger
+    /// (`Options::wal_hold_reuses`).
+    hold_reuses: bool,
     /// What this file's held batches came to: the bytes dropped unwritten
     /// as covered, the bytes written out by a spill, and the spills
     /// (`Db::wal_held`).
@@ -7724,8 +7746,8 @@ const HOLD_COMPACT: usize = 64 << 10;
 /// the policy is to hold them (`SyncPolicy::Explicit`,
 /// `Options::wal_hold_bytes`); none under a policy that writes every
 /// commit.
-fn wal_hold(opts: &Options) -> Option<usize> {
-    matches!(opts.sync, SyncPolicy::Explicit).then_some(opts.wal_hold_bytes)
+fn wal_hold(opts: &Options) -> Option<(usize, bool)> {
+    matches!(opts.sync, SyncPolicy::Explicit).then_some((opts.wal_hold_bytes, opts.wal_hold_reuses))
 }
 
 /// The largest commit that pre-writes, and that counts toward a run
@@ -7938,6 +7960,7 @@ impl Wal {
             touched: 0,
             marks: std::collections::VecDeque::new(),
             hold: None,
+            hold_reuses: false,
             held_dropped: 0,
             held_spilled: 0,
             spills: 0,
@@ -8018,6 +8041,7 @@ impl Wal {
             touched: 0,
             marks: std::collections::VecDeque::new(),
             hold: None,
+            hold_reuses: false,
             held_dropped: 0,
             held_spilled: 0,
             spills: 0,
@@ -8126,6 +8150,7 @@ impl Wal {
             touched: 0,
             marks: std::collections::VecDeque::new(),
             hold: None,
+            hold_reuses: false,
             held_dropped: 0,
             held_spilled: 0,
             spills: 0,
@@ -8212,8 +8237,9 @@ impl Wal {
     /// buffer left to grow copied everything it held each time it
     /// doubled, fourteen megabytes inside one mix of the suite's, whose
     /// commits ran a third longer for it than with the log written.
-    fn set_hold(&mut self, cap: usize) {
+    fn set_hold(&mut self, cap: usize, reuses: bool) {
         self.hold = Some(cap);
+        self.hold_reuses = reuses;
         self.pending.reserve(cap.min(HOLD_RESERVE_MAX) + HOLD_ROOM);
     }
 
@@ -8296,10 +8322,12 @@ impl Wal {
         self.held_from = cut;
         self.held_dropped += dropped as u64;
         // What is left behind the dropped batches goes to the buffer's
-        // head where it is little, and the commits to come write over
+        // head where it is little, or no more than the gap
+        // (`Options::wal_hold_reuses`), and the commits to come write over
         // pages already touched; where it is much, it stays, and the
         // dropped bytes with it (`HOLD_COMPACT`).
-        if self.pending.len() - cut <= HOLD_COMPACT {
+        let behind = self.pending.len() - cut;
+        if behind <= HOLD_COMPACT || (self.hold_reuses && behind <= cut) {
             self.pending.drain(..cut);
             for m in &mut self.marks {
                 m.1 -= cut;
@@ -15658,22 +15686,29 @@ impl MemTable {
     /// A tombstone and then `value` on `key`'s chain, one probe for both:
     /// what a put is, and half the misses of a delete then an append at
     /// thirty million keys.
+    ///
+    /// A key the table does not hold yet, which is most of a write mix's
+    /// puts after a seal has emptied the table, gets its entry with both
+    /// chunks laid down in one reservation (`new_put_entry`), where a
+    /// tombstone's entry and then the value's chunk were two reservations
+    /// and five lookups of a block, and goes into the index at the slot
+    /// where the probe for it found none (`index_insert_at`), where the
+    /// insert walked the probe's slots again.
     fn put(&self, hash: u64, key: &[u8], value: &[u8], rd: &Readers) {
         assert!(!self.ordered, "a put never reaches an ordered memtable");
-        if let Some(id) = self.probe(hash, key) {
-            let e = self.fat(id);
-            let off = self.push_tomb_chunk(e.chain_head(), value);
-            e.head.store(off + 1, AtomicOrdering::Release);
-            e.count.store(1, AtomicOrdering::Relaxed);
-            self.log_write(id, false);
-            return;
-        }
-        let id = self.new_entry(hash, key, None);
-        let e = self.fat(id);
-        let off = self.push_chunk(e.chain_head(), value);
-        e.head.store(off + 1, AtomicOrdering::Release);
-        e.count.store(1, AtomicOrdering::Relaxed);
-        self.index_insert(hash, id, rd);
+        let vacant = match self.probe_or_vacant(hash, key) {
+            Ok(id) => {
+                let e = self.fat(id);
+                let off = self.push_tomb_chunk(e.chain_head(), value);
+                e.head.store(off + 1, AtomicOrdering::Release);
+                e.count.store(1, AtomicOrdering::Relaxed);
+                self.log_write(id, false);
+                return;
+            }
+            Err(slot) => slot,
+        };
+        let id = self.new_put_entry(hash, key, value);
+        self.index_insert_at(hash, id, vacant, rd);
         self.log_write(id, true);
     }
 
@@ -15692,19 +15727,7 @@ impl MemTable {
     /// Writer: a new entry, its key and first chunk written, published by
     /// the slab's length; the index is the caller's.
     fn new_entry(&self, hash: u64, key: &[u8], value: Option<&[u8]>) -> usize {
-        // A copy in `keys`, marked as one where the table's keys are
-        // otherwise read in the stream.
-        let copy = || -> u32 {
-            let key_off = self.keys.reserve(key.len());
-            self.keys.write(key_off, key);
-            let off = u32::try_from(key_off).expect("a memtable's keys stay under four gigabytes");
-            debug_assert!(off & KEYS_BIAS == 0 || !self.keys_in_stream);
-            if self.keys_in_stream {
-                off | KEYS_BIAS
-            } else {
-                off
-            }
-        };
+        let copy = || self.copy_key(key);
         let (off, count, key_off) = match value {
             Some(v) if self.stream => {
                 let (head, rec) = self.push_record(key, v);
@@ -15753,6 +15776,46 @@ impl MemTable {
         })
     }
 
+    /// Writer: `key` copied into `keys`, and the span's offset, marked as a
+    /// copy where the table's keys are otherwise read in the stream.
+    fn copy_key(&self, key: &[u8]) -> u32 {
+        let key_off = self.keys.reserve(key.len());
+        self.keys.write(key_off, key);
+        let off = u32::try_from(key_off).expect("a memtable's keys stay under four gigabytes");
+        debug_assert!(off & KEYS_BIAS == 0 || !self.keys_in_stream);
+        if self.keys_in_stream {
+            off | KEYS_BIAS
+        } else {
+            off
+        }
+    }
+
+    /// Writer: the entry a put makes of a key the table does not hold, its
+    /// tombstone and its value over it laid down in one reservation
+    /// (`push_tomb_chunk`), its key copied, published by the slab's
+    /// length; the index is the caller's. The entry `new_entry` makes with
+    /// a tombstone and `push_chunk` then gives its value, the two chunks
+    /// side by side wherever a block's end does not part them.
+    fn new_put_entry(&self, hash: u64, key: &[u8], value: &[u8]) -> usize {
+        debug_assert!(
+            !self.ordered && !self.stream && !self.refs && !self.slim_entries,
+            "a put's entry is a hashed table's"
+        );
+        debug_assert!(
+            key.len() <= usize::from(u16::MAX),
+            "a key fits a record's length word"
+        );
+        let off = self.push_tomb_chunk(NO_CHUNK, value);
+        let key_off = self.copy_key(key);
+        self.entries.push(MemEntry {
+            hash: (hash >> 32) as u32,
+            key_off,
+            klen: key.len() as u16,
+            head: AtomicU64::new(off + 1),
+            count: AtomicU32::new(1),
+        })
+    }
+
     /// The slim word for a stream record whose head is `head`, whose key
     /// is at `key_off` and `klen` long; `None` where the record needs the
     /// fat entry: a key copied (`KEYS_BIAS`), a value copied across a
@@ -15784,6 +15847,24 @@ impl MemTable {
             i = (i + 1) & idx.mask;
         }
         idx.slots[i].store(Index::word(hash, id), AtomicOrdering::Release);
+    }
+
+    /// Writer: entry `id` into the index at `vacant`, the slot where a
+    /// probe for its key just found none (`probe_or_vacant`), which is the
+    /// slot `index_insert` would walk to: only the writer inserts, and
+    /// nothing has since. A table at half load is rebuilt and inserted
+    /// into by `index_insert`.
+    fn index_insert_at(&self, hash: u64, id: usize, vacant: usize, rd: &Readers) {
+        let idx = self.index().expect("a hashed table has an index");
+        if self.len() * 2 > idx.slots.len() {
+            return self.index_insert(hash, id, rd);
+        }
+        debug_assert_eq!(
+            idx.slots[vacant].load(AtomicOrdering::Relaxed),
+            0,
+            "the probe's vacant slot is vacant at the insert"
+        );
+        idx.slots[vacant].store(Index::word(hash, id), AtomicOrdering::Release);
     }
 
     /// Writer: a table twice the size with every entry reinserted,
@@ -15835,11 +15916,15 @@ impl MemTable {
             a.write(off + CHUNK_HDR, value);
             return off as u64 | REF_STAGED | if sel == 1 { REF_ARENA2 } else { 0 };
         }
-        let off = self.vals.reserve(CHUNK_HDR + value.len());
-        self.vals.write(off, &prev.to_le_bytes());
-        self.vals
-            .write(off + 8, &(value.len() as u32).to_le_bytes());
-        self.vals.write(off + CHUNK_HDR, value);
+        // One lookup of the block for the header and the value, where a
+        // `write` each was three.
+        let len = CHUNK_HDR + value.len();
+        let off = self.vals.reserve(len);
+        self.vals.fill(off, len, |b| {
+            b[..8].copy_from_slice(&prev.to_le_bytes());
+            b[8..CHUNK_HDR].copy_from_slice(&(value.len() as u32).to_le_bytes());
+            b[CHUNK_HDR..].copy_from_slice(value);
+        });
         off as u64
     }
 
@@ -16087,8 +16172,10 @@ impl MemTable {
 
     fn push_tomb(&self, prev: u64) -> u64 {
         let off = self.vals.reserve(CHUNK_HDR);
-        self.vals.write(off, &prev.to_le_bytes());
-        self.vals.write(off + 8, &TOMB_LEN.to_le_bytes());
+        self.vals.fill(off, CHUNK_HDR, |b| {
+            b[..8].copy_from_slice(&prev.to_le_bytes());
+            b[8..].copy_from_slice(&TOMB_LEN.to_le_bytes());
+        });
         self.note_tomb();
         off as u64
     }
@@ -16537,6 +16624,27 @@ impl MemTable {
             prefetch_lines(idx.slots[i..].as_ptr() as *const u8, 64);
         }
         hash
+    }
+
+    /// `probe` for the writer's put: the entry holding `key`, or the vacant
+    /// slot its probe ended at, for `index_insert_at`.
+    fn probe_or_vacant(&self, hash: u64, key: &[u8]) -> std::result::Result<usize, usize> {
+        let idx = self.index().expect("a hashed table has an index");
+        let mut i = slot_of(hash, idx.mask);
+        loop {
+            let s = idx.slots[i].load(AtomicOrdering::Acquire);
+            if s == 0 {
+                return Err(i);
+            }
+            if s >> 32 == hash >> 32 {
+                let id = ((s & 0xffff_ffff) - 1) as usize;
+                let e = self.entry(id);
+                if crate::flatindex::key_eq(self.key_of(e), key) {
+                    return Ok(id);
+                }
+            }
+            i = (i + 1) & idx.mask;
+        }
     }
 
     fn probe(&self, hash: u64, key: &[u8]) -> Option<usize> {
@@ -36438,8 +36546,8 @@ impl Db {
     /// which a create would truncate and a retirement would delete.
     fn next_wal(&mut self, id: u64, kind: u8) -> Result<Wal> {
         let mut wal = self.next_wal_file(id, kind)?;
-        if let Some(cap) = wal_hold(&self.opts) {
-            wal.set_hold(cap);
+        if let Some((cap, reuses)) = wal_hold(&self.opts) {
+            wal.set_hold(cap, reuses);
         }
         Ok(wal)
     }
@@ -36605,8 +36713,8 @@ impl Db {
         std::fs::create_dir_all(dir)?;
         let lock = StoreLock::take(dir)?;
         let mut wal = Wal::create(&Db::wal_path(dir, 0), 0, WAL_CHAINED)?;
-        if let Some(cap) = wal_hold(&opts) {
-            wal.set_hold(cap);
+        if let Some((cap, reuses)) = wal_hold(&opts) {
+            wal.set_hold(cap, reuses);
         }
         let mut spare_wal: *mut PathBuf = std::ptr::null_mut();
         let next_seg = 0u64;
@@ -37443,8 +37551,8 @@ impl Db {
             }
         }
         let mut wal = Wal::open_append(&wal_path, wal_id, from)?;
-        if let Some(cap) = wal_hold(&opts) {
-            wal.set_hold(cap);
+        if let Some((cap, reuses)) = wal_hold(&opts) {
+            wal.set_hold(cap, reuses);
         }
         if let Some((ahead, runs, cap)) = wal_ahead(&opts) {
             wal.set_ahead(
@@ -57732,6 +57840,116 @@ mod threading {
 }
 
 #[cfg(test)]
+mod put_index {
+    use super::*;
+
+    fn table() -> MemTable {
+        MemTable::new(BlockShape {
+            prefault: false,
+            mapped: true,
+        })
+    }
+
+    /// A key's live values in the table as a reader takes them, oldest
+    /// first, and whether a tombstone ends its chain.
+    fn values(m: &MemTable, key: &[u8]) -> Option<(Vec<Vec<u8>>, bool)> {
+        let e = m.get(key, MemTable::ALL)?;
+        let (offs, tomb) = m.live_chain(e, SEE_ALL);
+        Some((offs.iter().map(|&o| m.value_at(o).to_vec()).collect(), tomb))
+    }
+
+    /// A table that takes nothing but puts of keys it does not hold grows
+    /// its index as one that takes appends does, before it is half full,
+    /// since a put inserts at the slot its probe found (`index_insert_at`)
+    /// and the insert that rebuilds is reached only at half load: twenty
+    /// thousand keys, nineteen doublings of none, and every key a put of a
+    /// value over a tombstone, read back. A put that missed the rebuild
+    /// would fill the index and probe for a vacant slot for ever.
+    #[test]
+    fn a_table_of_puts_alone_grows_its_index_at_half_load() {
+        let rd = Readers::new(false, true);
+        let m = table();
+        let key = |i: u32| format!("put-{i:011}").into_bytes();
+        let mut grew = 0;
+        let mut slots = m.index().unwrap().slots.len();
+        for i in 0..20_000u32 {
+            let k = key(i);
+            m.put(mem_hash(&k), &k, format!("v{i}").as_bytes(), &rd);
+            let now = m.index().unwrap().slots.len();
+            if now != slots {
+                grew += 1;
+                slots = now;
+            }
+            assert!(
+                m.len() * 2 <= slots,
+                "{} entries in an index of {slots} slots",
+                m.len()
+            );
+        }
+        assert!(grew >= 4, "the index grew {grew} times");
+        for i in 0..20_000u32 {
+            assert_eq!(
+                values(&m, &key(i)),
+                Some((vec![format!("v{i}").into_bytes()], true)),
+                "key {i}"
+            );
+        }
+        // Again over every key: the put of a key the table holds.
+        for i in (0..20_000u32).step_by(3) {
+            let k = key(i);
+            m.put(mem_hash(&k), &k, format!("w{i}").as_bytes(), &rd);
+        }
+        for i in 0..20_000u32 {
+            let want = if i % 3 == 0 { "w" } else { "v" };
+            assert_eq!(
+                values(&m, &key(i)),
+                Some((vec![format!("{want}{i}").into_bytes()], true)),
+                "key {i} after the second put"
+            );
+        }
+        assert_eq!(m.len(), 20_000, "a second put makes no entry");
+    }
+
+    /// Two keys whose hashes share the half an index slot keeps, found by
+    /// search, are two entries: the put's probe tells a key from another
+    /// that shares its tag by the key, as a reader's does, and the second
+    /// key's put lands at the vacant slot after the first's. A compare the
+    /// probe reaches only on such a pair is tested with the pair built.
+    #[test]
+    fn two_keys_that_share_a_tag_are_two_entries() {
+        let key = |i: u32| format!("k{i:015}").into_bytes();
+        let mut seen: std::collections::HashMap<u32, u32> = Default::default();
+        let (a, b) = (0u32..4_000_000)
+            .find_map(|i| {
+                let tag = (mem_hash(&key(i)) >> 32) as u32;
+                seen.insert(tag, i).map(|j| (j, i))
+            })
+            .expect("two keys of one tag among four million");
+        let (ka, kb) = (key(a), key(b));
+        assert_ne!(ka, kb);
+        assert_eq!(mem_hash(&ka) >> 32, mem_hash(&kb) >> 32, "one tag");
+        let rd = Readers::new(false, true);
+        let m = table();
+        m.put(mem_hash(&ka), &ka, b"a1", &rd);
+        m.put(mem_hash(&kb), &kb, b"b1", &rd);
+        assert_eq!(m.len(), 2, "two keys, two entries");
+        assert_eq!(values(&m, &ka), Some((vec![b"a1".to_vec()], true)));
+        assert_eq!(values(&m, &kb), Some((vec![b"b1".to_vec()], true)));
+        let (ia, ib) = (
+            m.probe_or_vacant(mem_hash(&ka), &ka),
+            m.probe_or_vacant(mem_hash(&kb), &kb),
+        );
+        assert!(ia.is_ok() && ib.is_ok() && ia != ib, "{ia:?} {ib:?}");
+        // A second put of each lands on its own chain.
+        m.put(mem_hash(&kb), &kb, b"b2", &rd);
+        m.put(mem_hash(&ka), &ka, b"a2", &rd);
+        assert_eq!(m.len(), 2);
+        assert_eq!(values(&m, &ka), Some((vec![b"a2".to_vec()], true)));
+        assert_eq!(values(&m, &kb), Some((vec![b"b2".to_vec()], true)));
+    }
+}
+
+#[cfg(test)]
 mod lockfree {
     use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
     use std::sync::Arc;
@@ -58201,7 +58419,7 @@ mod wal_frames {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("wal-00000007");
         let mut w = Wal::create(&path, 7, WAL_CHAINED).unwrap();
-        w.set_hold(16 << 20);
+        w.set_hold(16 << 20, true);
         (path, w)
     }
 
@@ -58318,7 +58536,7 @@ mod wal_frames {
     fn a_holding_log_spills_at_its_cap_and_at_its_drop() {
         let (path, mut w) = held_log("wal-cap");
         let header = WAL_MAGIC.len() as u64;
-        w.set_hold(64);
+        w.set_hold(64, true);
         w.append(b"a", b"1");
         w.mark_commit();
         w.write().unwrap();
@@ -58350,7 +58568,7 @@ mod wal_frames {
             "the drop wrote what was held"
         );
         let mut w = Wal::open_append(&path, 7, seq).unwrap();
-        w.set_hold(16 << 20);
+        w.set_hold(16 << 20, true);
         w.append(b"d", b"4");
         w.mark_commit();
         w.write().unwrap();
@@ -58363,15 +58581,17 @@ mod wal_frames {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// A batch dropped with much still held behind it is left where it
-    /// lay and nothing is moved: the held batches begin past it, a second
-    /// drop counts from the first, a spill writes from where they begin
-    /// and no byte of what was dropped, and the buffer starts over at its
-    /// head once it is empty, in the memory it reserved at the start,
-    /// which it never outgrew.
+    /// Under the rule before `Options::wal_hold_reuses`: a batch dropped
+    /// with much still held behind it is left where it lay and nothing is
+    /// moved: the held batches begin past it, a second drop counts from
+    /// the first, a spill writes from where they begin and no byte of what
+    /// was dropped, and the buffer starts over at its head once it is
+    /// empty, in the memory it reserved at the start, which it never
+    /// outgrew.
     #[test]
     fn a_holding_log_leaves_a_large_drop_where_it_lay() {
         let (path, mut w) = held_log("wal-dead");
+        w.hold_reuses = false;
         let header = WAL_MAGIC.len() as u64;
         let (at, cap) = (w.pending.as_ptr(), w.pending.capacity());
         assert!(cap >= 16 << 20, "the buffer is reserved at its cap");
@@ -58432,6 +58652,66 @@ mod wal_frames {
             "what the buffer was written into is counted"
         );
         drop(w);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A drop that leaves no more held behind it than it dropped moves
+    /// what is held to the buffer's head, whatever its size
+    /// (`Options::wal_hold_reuses`), so the commits after it write over
+    /// pages the dropped batches touched; one that leaves more holds it
+    /// where it lay, as the rule before did. The marks, the batch and the
+    /// counts follow the move, the spill writes exactly the held batches,
+    /// and a replay reads them, the buffer never reallocated.
+    #[test]
+    fn a_holding_log_moves_what_it_holds_behind_a_larger_drop() {
+        let (path, mut w) = held_log("wal-reuse");
+        let header = WAL_MAGIC.len() as u64;
+        let at = w.pending.as_ptr();
+        // Each batch more than the rule before moved.
+        let big = vec![b'v'; HOLD_COMPACT];
+        let mut ends = Vec::new();
+        for k in [b"a", b"b", b"c"] {
+            w.append(k, &big);
+            w.mark_commit();
+            w.write().unwrap();
+            ends.push((w.seq, w.batch_at));
+        }
+        let (held, len) = (w.batch_at, w.pending.len());
+        let (one, two) = (ends[0].1, ends[1].1);
+        // One batch dropped, two behind it: they stay.
+        assert_eq!(w.drop_covered(ends[0].0), one);
+        assert_eq!(
+            (w.held_from, w.batch_at, w.pending.len()),
+            (one, held, len),
+            "more held behind the drop than it dropped: left where it lay"
+        );
+        // Two dropped, one behind: the one goes to the head.
+        assert_eq!(w.drop_covered(ends[1].0), two - one);
+        assert_eq!(
+            (w.held_from, w.batch_at, w.pending.len()),
+            (0, held - two, len - two),
+            "no more held behind the drop than it dropped: moved"
+        );
+        assert_eq!(
+            w.marks.iter().map(|m| m.1).collect::<Vec<_>>(),
+            vec![held - two],
+            "the held batch's mark moved with it"
+        );
+        assert_eq!(w.held_dropped, two as u64, "the drops counted once");
+        assert!(w.frames_unsynced() && !w.holds_no_frame());
+        // A batch staged behind it, and the spill: the third batch alone
+        // reaches the file, from the head.
+        w.append(b"d", &big);
+        let staged = w.pending.len() - (len - two);
+        w.spill().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            header + (held - two) as u64,
+            "a spill wrote the held batch and nothing dropped"
+        );
+        assert!(w.staged() && w.pending.len() == staged);
+        assert_eq!(replayed(&path, ends[1].0).unwrap().len(), 1);
+        assert_eq!(w.pending.as_ptr(), at, "the buffer never reallocated");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
