@@ -891,6 +891,118 @@ fn a_held_commit_is_in_no_file_until_a_sync() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// A held log with no frames (`Options::held_frames` off): a commit builds
+/// none, so nothing reaches the log's file and nothing is held; the store
+/// reads its commits; a process's death takes everything no drain covered,
+/// whole; a `sync` is a drain, and the store reopens with everything before
+/// it. A run of ordered ingest begun over a commit no drain covered does not
+/// say everything before it was synced: a crash takes the commit and the
+/// run, and the store opens, where a note that said so would have the open
+/// refuse a store with a record lost before the run. Under any other policy
+/// the option is refused, since their promise is the log.
+#[test]
+fn a_log_with_no_frames_writes_nothing_and_its_sync_drains() {
+    for sync in [SyncPolicy::Always, SyncPolicy::EveryN(4)] {
+        let d = dir("frameless-refused");
+        let o = Options {
+            held_frames: false,
+            sync,
+            ..common::options()
+        };
+        assert!(
+            Db::create(&d, o).is_err(),
+            "{sync:?} took a log with no frames"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    let opts = || Options {
+        held_frames: false,
+        ..inline(explicit())
+    };
+    let d = dir("frameless");
+    let mut db = Db::create(&d, opts()).unwrap();
+    for b in 0..3 {
+        logged_batch(&mut db, b);
+    }
+    let h = db.wal_held();
+    assert_eq!(
+        (h.held, h.dropped, h.spilled, h.spills),
+        (0, 0, 0, 0),
+        "{h:?}"
+    );
+    assert_eq!(log_frames(&d), 0, "a commit reached the log's file");
+    for b in 0..3 {
+        assert!(logged(&db, b), "the store does not read its own batch {b}");
+    }
+    db.crash();
+
+    let mut db = Db::open(&d, opts()).unwrap();
+    for b in 0..3 {
+        assert!(
+            !logged(&db, b),
+            "batch {b} outlived the process that held it"
+        );
+    }
+    for b in 0..3 {
+        logged_batch(&mut db, b);
+    }
+    db.sync().unwrap();
+    logged_batch(&mut db, 3);
+    assert_eq!(log_frames(&d), 0, "a sync or a commit wrote the log");
+    db.crash();
+
+    let mut db = Db::open(&d, opts()).unwrap();
+    for b in 0..3 {
+        assert!(logged(&db, b), "batch {b}, drained by the sync, is gone");
+    }
+    assert!(!logged(&db, 3), "batch 3 was never synced and is there");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+
+    // A run of ordered ingest over a commit no drain covers, on a fresh
+    // store, where nothing else makes a sync owed: a reopened store's
+    // older log files wait for one (`Db::owes_sync`), and a run begun after
+    // a reopen says nothing of what is before it whatever the log holds.
+    // The seal held before its landing empties the table, so the batch
+    // above every key opens a run, and leaves batch 4 under no manifest.
+    let d = dir("frameless-run");
+    let mut db = Db::create(&d, opts()).unwrap();
+    logged_batch(&mut db, 4);
+    db.hold_seal_landing(true);
+    db.seal().unwrap();
+    ordered_batch(&mut db, 2_000);
+    assert!(db.runs_unsynced().0.is_some(), "the batch opened no run");
+    assert!(holds(&db, 2_000), "the store does not read its run");
+    db.crash();
+    let db = Db::open(&d, opts()).unwrap_or_else(|e| {
+        panic!("a run begun over a commit no drain covered was taken for one behind a sync: {e}")
+    });
+    assert!(
+        !logged(&db, 4),
+        "a commit no drain covered outlived the process"
+    );
+    assert!(
+        !holds(&db, 2_000),
+        "a run over a lost commit is there without it"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+
+    // And behind a drain the run says so, and stands.
+    let d = dir("frameless-chained");
+    let mut db = Db::create(&d, opts()).unwrap();
+    logged_batch(&mut db, 4);
+    db.sync().unwrap();
+    ordered_batch(&mut db, 2_000);
+    assert!(db.runs_unsynced().0.is_some(), "the batch opened no run");
+    db.crash();
+    let db = Db::open(&d, opts()).unwrap();
+    assert!(logged(&db, 4), "a drained commit is gone");
+    assert!(holds(&db, 2_000), "a run behind a drain is gone");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// The frames a seal has made durable are dropped from what the log holds
 /// and never written, and the log's file is left with a gap where they
 /// would have stood: frames a sync wrote before them, and frames a sync

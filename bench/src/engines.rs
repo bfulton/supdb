@@ -1923,10 +1923,13 @@ pub struct Supdb {
     /// and the cap its log spills at where the arm pins one
     /// (`Options::wal_hold_bytes`), `supdb-held1m` and `supdb-held8m`;
     /// and the held log that leaves a drop where it lay whenever much is
-    /// held behind it (`Options::wal_hold_reuses` off), `supdb-heldmarch`.
+    /// held behind it (`Options::wal_hold_reuses` off), `supdb-heldmarch`;
+    /// and the held log that builds no frames (`Options::held_frames`
+    /// off), `supdb-heldnoframes`.
     held: bool,
     holdcap: Option<usize>,
     holdmarch: bool,
+    noframes: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -3170,6 +3173,10 @@ struct Policy {
     /// held behind them (`Options::wal_hold_reuses` off):
     /// `supdb-heldmarch`.
     holdmarch: bool,
+    /// The held log with no frames (`Options::held_frames` off): a commit
+    /// builds none, and the arm's `sync`, its drain, is the store's.
+    /// `supdb-heldnoframes`.
+    noframes: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -3501,6 +3508,7 @@ impl Default for Policy {
             held: false,
             holdcap: None,
             holdmarch: false,
+            noframes: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -10205,6 +10213,7 @@ impl Supdb {
             held,
             holdcap,
             holdmarch,
+            noframes,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -10871,6 +10880,7 @@ impl Supdb {
             },
             wal_hold_bytes: holdcap.unwrap_or(supdb::Options::default().wal_hold_bytes),
             wal_hold_reuses: !holdmarch,
+            held_frames: !noframes,
             ..Default::default()
         };
         let opts = match advice {
@@ -11225,6 +11235,7 @@ impl Supdb {
             held,
             holdcap,
             holdmarch,
+            noframes,
             ord_threads: Default::default(),
         })
     }
@@ -11396,6 +11407,9 @@ impl Engine for Supdb {
         if self.held {
             if self.holdmarch {
                 return "supdb-heldmarch";
+            }
+            if self.noframes {
+                return "supdb-heldnoframes";
             }
             if self.partition {
                 return "supdb-heldpart";
@@ -15301,7 +15315,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         // FASTER's promise and no stronger one: a commit is in the process
         // when the call returns and on the device at the next `sync`.
         "supdb-held" | "supdb-held1m" | "supdb-held8m" | "supdb-heldmarch" | "supdb-heldpart"
-        | "faster" => Guarantee::Memory,
+        | "supdb-heldnoframes" | "faster" => Guarantee::Memory,
         _ => return None,
     })
 }
@@ -15649,6 +15663,21 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         durable: false,
                         held: true,
                         holdmarch: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldnoframes" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
                         ..Policy::default()
                     },
                 )
@@ -17483,6 +17512,38 @@ mod tests {
         .unwrap();
         let mo = m.db.as_ref().unwrap().options().clone();
         assert!(o.wal_hold_reuses && !mo.wal_hold_reuses);
+        // The held log with no frames: the one option, under the same
+        // policy, and a commit holds nothing.
+        let mut n = open("supdb-heldnoframes", &root.join("heldnoframes"), 1).unwrap();
+        assert_eq!(n.name(), "supdb-heldnoframes");
+        assert_eq!(guarantee("supdb-heldnoframes"), Some(Guarantee::Memory));
+        assert_eq!(n.features(), base.features());
+        n.update_batch(&pairs).unwrap();
+        let held = n
+            .counters()
+            .into_iter()
+            .find(|(k, _)| *k == "wal_held")
+            .map(|x| x.1);
+        assert_eq!(held, Some(0.0), "a commit with no frames held some");
+        let np = Supdb::with_policy(
+            &root.join("heldnoframes-policy"),
+            Policy {
+                partition: false,
+                durable: false,
+                held: true,
+                noframes: true,
+                ..Policy::default()
+            },
+        )
+        .unwrap();
+        let no = np.db.as_ref().unwrap().options().clone();
+        assert!(o.held_frames && !no.held_frames);
+        assert!(matches!(no.sync, supdb::SyncPolicy::Explicit));
+        assert_eq!(
+            (no.wal_hold_reuses, no.wal_hold_bytes),
+            (o.wal_hold_reuses, o.wal_hold_bytes)
+        );
+        drop((n, np));
         assert!(
             matches!(mo.sync, supdb::SyncPolicy::Explicit) && mo.wal_hold_bytes == o.wal_hold_bytes
         );
