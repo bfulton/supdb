@@ -227,15 +227,24 @@ fn main() {
         // (`POINT_OPS_FAULTS=1`): the writer thread's own, read from
         // `/proc/thread-self/stat` around each phase.
         let faults = std::env::var_os("POINT_OPS_FAULTS").is_some();
+        // With them the machine's TLB shootdowns over the phase, every
+        // CPU's (`run::irq_counts`): a store to a page a load mapped to the
+        // kernel's shared zero page is a copy-on-write fault that flushes
+        // every CPU the process runs on (`Options::index_populated`).
         let f0 = supdb_bench::run::minflt_self();
+        let i0 = supdb_bench::run::irq_counts();
         let t = Instant::now();
         phase_updates(e.as_mut(), &k2, &vals);
         let w = ns(t, ops);
         if faults {
+            let i1 = supdb_bench::run::irq_counts();
+            let f = supdb_bench::run::minflt_self() - f0;
             eprintln!(
-                "faults: updates {} on the writer, {:.3} a write",
-                supdb_bench::run::minflt_self() - f0,
-                (supdb_bench::run::minflt_self() - f0) as f64 / ops as f64
+                "faults: updates {} on the writer, {:.3} a write; tlb shootdowns {} call irqs {}",
+                f,
+                f as f64 / ops as f64,
+                i1[0] - i0[0],
+                i1[1] - i0[1]
             );
         }
         let shape = |e: &dyn Engine| {

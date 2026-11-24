@@ -597,6 +597,24 @@ verdict and the rate is noted as unresolved -- the record path
 (`Options::direct_put_one`) took the commits a tenth lower in both
 sittings while the rate read 1.12x and then 0.98x.
 
+A fresh page first touched by a load costs a second fault and a flush
+when the store comes. The load maps the kernel's shared zero page
+read-only, and the store after it replaces that mapping by copy on write,
+which flushes the TLB on every CPU a thread of the process is busy on: an
+IPI to each through the hypervisor. A hash table probes its slot before it
+writes it, so every page of a memtable's index, mapped zeroed at each
+doubling, took that shape, and the writer paid nothing visible until the
+upkeep thread was kept alert beside it after the scans: the updates of the
+point probe then took 157-165 shootdowns a run, a third of an update's
+samples in the flush's wait, where an index populated for writing as it is
+mapped takes 0-4 (`Options::index_populated`; the probe's
+`POINT_OPS_FAULTS=1` prints the shootdowns from `/proc/interrupts`). A
+fault count does not show it -- the extra faults were a twentieth -- and
+the price of each is set by what the other cores are doing, so a buffer
+that is read before it is written is mapped for writing first, and a write
+that slows when another thread wakes is read beside the machine's
+shootdowns.
+
 An instrument in the measured path is priced by taking it away in the
 suite, and the pairing that prices it has to differ in the instrument.
 The scan path timed its six phases before the walk on every scan, ten

@@ -4868,6 +4868,26 @@ pub struct Options {
     /// `blocks_mapped` exists. Under `blocks_mapped` alone; zero:
     /// `supdb-nopool`, and `supdb-ingestnopool` buffered.
     pub blocks_pool_bytes: usize,
+    /// A memtable's hash index, a zeroed block mapped fresh at every
+    /// doubling, is populated for writing as it is mapped
+    /// (`blocks::Source::alloc`, `MADV_POPULATE_WRITE`), so that the
+    /// first touch of each of its pages is a write. An insert probes its
+    /// slot with a load before its store, and a load is a fresh page's
+    /// first touch: it maps the kernel's shared zero page, read-only, and
+    /// the store after it is a copy-on-write fault that replaces a PTE
+    /// already present, which flushes the TLB of every CPU the process
+    /// runs on. With the upkeep thread alert on another core that flush is
+    /// an IPI and its answer through the hypervisor: after a scan pass at
+    /// three hundred thousand keys the updates over the fresh table took
+    /// 157-165 shootdowns in every run unpopulated and 0-4 populated, and
+    /// an update read 182-246 ns populated against 186-337, five pairs of
+    /// six run in both orders (`POINT_OPS_FAULTS=1 POINT_OPS_SCAN=1
+    /// point_ops supdb-heldnoframes 300000 1 zipf-plain 6` beside
+    /// `supdb-heldindexzeropage`). FASTER zeroes its index at its open.
+    /// Off, the index's pages fault as they are probed:
+    /// `supdb-indexzeropage`, and `supdb-heldindexzeropage` under the held
+    /// log with no frames.
+    pub index_populated: bool,
     /// A job's large per-key arrays -- a seal's sort of its
     /// table, a segment writer's copy of every key with its span, its
     /// record's offset and its hash, the ordered index builder's keys, a
@@ -7208,6 +7228,7 @@ impl Options {
     fn block_shape(&self, pool: &Option<std::sync::Arc<blocks::BlockPool>>) -> BlockShape {
         BlockShape {
             prefault: self.prefault,
+            index_populated: self.index_populated,
             mapped: self.blocks_mapped,
             pool: pool.clone(),
         }
@@ -7492,6 +7513,7 @@ impl Default for Options {
             upkeep_fill_skips_posted: true,
             blocks_mapped: true,
             blocks_pool_bytes: 64 << 20,
+            index_populated: true,
             jobs_mapped: true,
             jobs_mapped_when_short: false,
             jobs_pooled: false,
@@ -13769,6 +13791,9 @@ struct CommitMark {
 #[derive(Clone)]
 struct BlockShape {
     prefault: bool,
+    /// The hash index populated for writing as it is mapped
+    /// (`Options::index_populated`).
+    index_populated: bool,
     mapped: bool,
     /// The store's pool of blocks its tables gave back
     /// (`Options::blocks_pool_bytes`); none where it keeps none.
@@ -15388,6 +15413,7 @@ impl MemTable {
     fn new(shape: BlockShape) -> MemTable {
         let BlockShape {
             prefault,
+            index_populated,
             mapped,
             pool,
         } = shape;
@@ -15395,7 +15421,10 @@ impl MemTable {
         MemTable {
             mapped,
             entries: Slab::new(src()),
-            index: AtomicPtr::new(Box::into_raw(Box::new(Index::with_slots(1024, src())))),
+            index: AtomicPtr::new(Box::into_raw(Box::new(Index::with_slots(
+                1024,
+                src().populated(index_populated),
+            )))),
             ordered: false,
             refs: false,
             stream: false,
@@ -15437,8 +15466,11 @@ impl MemTable {
         log_range: bool,
         slim_entries: bool,
     ) -> MemTable {
+        // An ordered table keeps no hash index, the one block a shape's
+        // population is for.
         let BlockShape {
             prefault,
+            index_populated: _,
             mapped,
             pool,
         } = shape;
@@ -57661,6 +57693,7 @@ mod streaming_writes {
                 false,
                 BlockShape {
                     prefault: false,
+                    index_populated: true,
                     mapped: true,
                     pool: None,
                 },
@@ -58017,6 +58050,7 @@ mod threading {
         want.insert(0usize, (0usize, 0u64));
         let dry = super::MemTable::new(super::BlockShape {
             prefault: false,
+            index_populated: true,
             mapped: true,
             pool: None,
         });
@@ -58029,6 +58063,7 @@ mod threading {
         );
         let mem = super::MemTable::new(super::BlockShape {
             prefault: false,
+            index_populated: true,
             mapped: true,
             pool: None,
         });
@@ -58065,9 +58100,43 @@ mod put_index {
     fn table() -> MemTable {
         MemTable::new(BlockShape {
             prefault: false,
+            index_populated: true,
             mapped: true,
             pool: None,
         })
+    }
+
+    /// The hash index's population (`Options::index_populated`) goes from
+    /// the options to the table's shape, from the shape to the index's
+    /// source, and from that source to every index the table doubles into,
+    /// whose source is the one before's: on by default, and off where the
+    /// option is.
+    #[test]
+    fn the_index_population_reaches_every_index_a_table_grows() {
+        assert!(Options::default().index_populated, "the default");
+        let rd = Readers::new(false, true);
+        for on in [true, false] {
+            let opts = Options {
+                index_populated: on,
+                ..Options::default()
+            };
+            let shape = opts.block_shape(&None);
+            assert_eq!(shape.index_populated, on);
+            let m = MemTable::new(shape);
+            assert_eq!(
+                m.index().unwrap().slots.src.populates(),
+                on,
+                "the first index"
+            );
+            let first = m.index().unwrap().slots.len();
+            for i in 0..4_000u32 {
+                let k = format!("pop-{i:08}").into_bytes();
+                m.put(mem_hash(&k), &k, b"v", &rd);
+            }
+            let ix = m.index().unwrap();
+            assert!(ix.slots.len() > first, "the index grew");
+            assert_eq!(ix.slots.src.populates(), on, "a grown index");
+        }
     }
 
     /// A key's live values in the table as a reader takes them, oldest

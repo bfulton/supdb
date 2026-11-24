@@ -907,7 +907,7 @@ fn counters_line(
 /// a pass's window of them says other threads' unmaps and advice cost the
 /// scanning thread in interrupts, which no fault count and no CPU clock
 /// shows. Zeros where the file or a row cannot be read.
-fn irq_counts() -> [u64; 2] {
+pub fn irq_counts() -> [u64; 2] {
     let Ok(text) = std::fs::read_to_string("/proc/interrupts") else {
         return [0; 2];
     };
@@ -4981,21 +4981,27 @@ fn threaded_mix(
 /// the reads, the scans and the commits -- summed over the mix and printed
 /// as one `mixkinds` line a mix on stderr, for both arms alike, since the
 /// clock reads around every operation are a cost the rows must not carry.
-/// A mix's rate names none of its kinds; this names each.
+/// A mix's rate names none of its kinds; this names each. Beside them
+/// the machine's TLB shootdowns and function-call interrupts over the mix
+/// (`irq_counts`), which a store to a page a load mapped to the kernel's
+/// zero page costs every busy CPU, and which no time by kind shows.
 struct MixKinds {
     on: bool,
     gets: (u64, f64),
     scans: (u64, f64),
     commits: (u64, f64),
+    irq0: [u64; 2],
 }
 
 impl MixKinds {
     fn new() -> MixKinds {
+        let on = std::env::var_os("SUPDB_MIX_KINDS").is_some();
         MixKinds {
-            on: std::env::var_os("SUPDB_MIX_KINDS").is_some(),
+            on,
             gets: (0, 0.0),
             scans: (0, 0.0),
             commits: (0, 0.0),
+            irq0: if on { irq_counts() } else { [0; 2] },
         }
     }
 
@@ -5012,15 +5018,18 @@ impl MixKinds {
 
     fn report(&self, arm: &str, mix: &str, size: u64, ops: u64, total: f64) {
         if self.on {
+            let irq = irq_counts();
             eprintln!(
-                "mixkinds {arm} {mix} size {size} ops {ops} gets {} {:.3} scans {} {:.3} commits {} {:.3} total {:.3}",
+                "mixkinds {arm} {mix} size {size} ops {ops} gets {} {:.3} scans {} {:.3} commits {} {:.3} total {:.3} tlb {} cal {}",
                 self.gets.0,
                 self.gets.1 * 1e3,
                 self.scans.0,
                 self.scans.1 * 1e3,
                 self.commits.0,
                 self.commits.1 * 1e3,
-                total * 1e3
+                total * 1e3,
+                irq[0] - self.irq0[0],
+                irq[1] - self.irq0[1]
             );
         }
     }

@@ -897,6 +897,32 @@ scans is not this: its gets count the same instructions either way and
 make no syscall, and in the probe a get read 104 ns with the scan pass
 and without it, so that cell is open.
 
+The lines were the guess, and the first cause counted was the index's
+pages. A memtable's hash index is a zeroed block mapped fresh at each
+doubling, and an insert probes its slot with a load before it stores: the
+load is the page's first touch and maps the kernel's shared zero page
+read-only, and the store after it is a copy-on-write fault that replaces a
+mapping already present, which flushes the TLB of every CPU the process
+runs on -- an IPI and its answer through the hypervisor for each CPU a
+thread of ours keeps busy, the alert upkeep thread's among them. The probe
+prints the machine's shootdowns over its updates beside the writer's faults
+(`POINT_OPS_FAULTS=1 POINT_OPS_SCAN=1 point_ops ARM 300000 1 zipf-plain
+6`, from `/proc/interrupts`): 157-165 in every run with the pages left to
+fault (`supdb-heldindexzeropage`), and 0-4 with each index populated for
+writing as it is mapped (`Options::index_populated`, `MADV_POPULATE_WRITE`),
+an update 182-246 ns against 186-337, five pairs of six run in both orders.
+The suite resolves nothing for it: at three hundred thousand keys under the
+held log and under the durable arm, and at ten thousand under the durable,
+each cell that moved by a tenth moved with the arms' order and not with the
+option (`pair.sh supdb-heldnoframes supdb-heldindexzeropage 300000 --reps
+6`, and `supdb supdb-indexzeropage` at 300000 and 10000). It is on by the
+count, since it replaces a fault on the zero page, a copy-on-write fault
+and its flush with one population of pages every index touches at its
+first fill anyway. The rest of the tax is not known. Filing in batches of
+a hundredth of the store (`supdb-heldbatch1`, `Options::upkeep_batch_pct`)
+read E 1.13x and 1.12x for whichever arm was listed second, the rest by
+order too (`pair.sh supdb-heldnoframes supdb-heldbatch1 300000 --reps 6`).
+
 What the probe's reads over a written store say beside it is a second
 gap, of instructions. Read class by class over a few thousand keys, every
 line cached (`POINT_OPS_CLASSES=1 POINT_OPS_LAND=1 point_ops ARM 100000 1

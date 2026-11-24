@@ -1941,6 +1941,15 @@ pub struct Supdb {
     /// off): `supdb-norecordahead`, and `supdb-heldnorecordahead` under
     /// the held log with no frames.
     norecordahead: bool,
+    /// A memtable's hash index left to fault as it is probed, its pages'
+    /// first touches loads of the zero page (`Options::index_populated`
+    /// off): `supdb-indexzeropage`, and `supdb-heldindexzeropage` under
+    /// the held log with no frames.
+    indexzeropage: bool,
+    /// The upkeep thread's passes batched to this percentage of the
+    /// store's keys (`Options::upkeep_batch_pct`) under the held log with
+    /// no frames: `supdb-heldbatch1`.
+    upkeepbatch: Option<usize>,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -3191,6 +3200,13 @@ struct Policy {
     /// No record asked ahead of its header (`Options::point_record_ahead`
     /// off): `supdb-norecordahead`, `supdb-heldnorecordahead`.
     norecordahead: bool,
+    /// The hash index left to its zero-page faults
+    /// (`Options::index_populated` off): `supdb-indexzeropage`,
+    /// `supdb-heldindexzeropage`.
+    indexzeropage: bool,
+    /// The upkeep's passes batched (`Options::upkeep_batch_pct`):
+    /// `supdb-heldbatch1`.
+    upkeepbatch: Option<usize>,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -3524,6 +3540,8 @@ impl Default for Policy {
             holdmarch: false,
             noframes: false,
             norecordahead: false,
+            indexzeropage: false,
+            upkeepbatch: None,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -10230,6 +10248,8 @@ impl Supdb {
             holdmarch,
             noframes,
             norecordahead,
+            indexzeropage,
+            upkeepbatch,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -10358,7 +10378,11 @@ impl Supdb {
             // a twelfth: the bound and the batch of the cost model, as
             // the shares the sweep at a hundred thousand keys settled on.
             upkeep_lag_pct: if bglag { 16 } else { 0 },
-            upkeep_batch_pct: if bglag { 8 } else { 0 },
+            upkeep_batch_pct: if bglag {
+                8
+            } else {
+                upkeepbatch.unwrap_or(supdb::Options::default().upkeep_batch_pct)
+            },
             forms_rebase: !norebase,
             // The seal sized by the file, as it was before the store's
             // payload was recorded.
@@ -10898,6 +10922,7 @@ impl Supdb {
             wal_hold_reuses: !holdmarch,
             held_frames: !noframes,
             point_record_ahead: !norecordahead,
+            index_populated: !indexzeropage,
             ..Default::default()
         };
         let opts = match advice {
@@ -11254,6 +11279,8 @@ impl Supdb {
             holdmarch,
             noframes,
             norecordahead,
+            indexzeropage,
+            upkeepbatch,
             ord_threads: Default::default(),
         })
     }
@@ -11431,6 +11458,10 @@ impl Engine for Supdb {
                     "supdb-heldnfnocache"
                 } else if self.norecordahead {
                     "supdb-heldnorecordahead"
+                } else if self.indexzeropage {
+                    "supdb-heldindexzeropage"
+                } else if self.upkeepbatch.is_some() {
+                    "supdb-heldbatch1"
                 } else if self.noalert {
                     "supdb-heldnoalert"
                 } else if self.upkeep == Some(supdb::Upkeep::Inline) {
@@ -11450,6 +11481,9 @@ impl Engine for Supdb {
         }
         if self.norecordahead {
             return "supdb-norecordahead";
+        }
+        if self.indexzeropage {
+            return "supdb-indexzeropage";
         }
         // The probe's combinations first, which the single fields below
         // would name by one of their parts.
@@ -14845,6 +14879,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-noadvice"
         | "supdb-advicerandom"
         | "supdb-norecordahead"
+        | "supdb-indexzeropage"
         | "supdb-nocache"
         | "supdb-nocacheordread"
         | "supdb-nocachezpages"
@@ -15356,6 +15391,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldnorecordahead"
         | "supdb-heldnoalert"
         | "supdb-heldinline"
+        | "supdb-heldindexzeropage"
+        | "supdb-heldbatch1"
         | "faster" => Guarantee::Memory,
         _ => return None,
     })
@@ -15735,6 +15772,50 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         held: true,
                         noframes: true,
                         norecordahead: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldbatch1" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        upkeepbatch: Some(1),
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldindexzeropage" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        indexzeropage: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-indexzeropage" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        indexzeropage: true,
                         ..Policy::default()
                     },
                 )
@@ -17678,7 +17759,9 @@ mod tests {
         )
         .unwrap();
         let fo = nof.db.as_ref().unwrap().options().clone();
-        assert!(fo.point_record_ahead && fo.scan_block_cache && fo.upkeep_alert);
+        assert!(
+            fo.point_record_ahead && fo.scan_block_cache && fo.upkeep_alert && fo.index_populated
+        );
         for (arm, differs) in [
             (
                 "supdb-heldnorecordahead",
@@ -17687,6 +17770,8 @@ mod tests {
             ("supdb-heldnfnocache", |a| !a.scan_block_cache),
             ("supdb-heldnoalert", |a| !a.upkeep_alert),
             ("supdb-heldinline", |a| a.upkeep == supdb::Upkeep::Inline),
+            ("supdb-heldindexzeropage", |a| !a.index_populated),
+            ("supdb-heldbatch1", |a| a.upkeep_batch_pct == 1),
         ] {
             let e = open(arm, &root.join(arm), 1).unwrap();
             assert_eq!(e.name(), arm);
@@ -17704,6 +17789,14 @@ mod tests {
                 },
                 "supdb-heldnoalert" => Policy {
                     noalert: true,
+                    ..Policy::default()
+                },
+                "supdb-heldindexzeropage" => Policy {
+                    indexzeropage: true,
+                    ..Policy::default()
+                },
+                "supdb-heldbatch1" => Policy {
+                    upkeepbatch: Some(1),
                     ..Policy::default()
                 },
                 _ => Policy {
@@ -17734,6 +17827,10 @@ mod tests {
         let e = open("supdb-norecordahead", &root.join("norecordahead"), 1).unwrap();
         assert_eq!(e.name(), "supdb-norecordahead");
         assert_eq!(guarantee("supdb-norecordahead"), guarantee("supdb"));
+        drop(e);
+        let e = open("supdb-indexzeropage", &root.join("indexzeropage"), 1).unwrap();
+        assert_eq!(e.name(), "supdb-indexzeropage");
+        assert_eq!(guarantee("supdb-indexzeropage"), guarantee("supdb"));
         drop((e, nof));
         assert!(
             matches!(mo.sync, supdb::SyncPolicy::Explicit) && mo.wal_hold_bytes == o.wal_hold_bytes

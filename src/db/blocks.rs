@@ -186,6 +186,35 @@ pub(crate) fn alloc(len: usize, zeroed: bool, mapped: bool) -> *mut u8 {
     p
 }
 
+/// The pages of the `len` bytes at `p`, a fresh mapping, populated for
+/// writing: each mapped to a page of its own, so that a load before the
+/// first store finds the page and not the kernel's shared zero page,
+/// whose replacement at that store is a copy-on-write fault and a flush of
+/// the TLB on every CPU the process runs on, an IPI beside a thread on
+/// another core. `MADV_POPULATE_WRITE` does it in one call where the
+/// kernel has it, and a store of a zero on each page does it where not;
+/// the bytes stay zero either way.
+///
+/// # Safety
+/// `[p, p + len)` is a writable mapping of zeroed bytes nobody else reads
+/// or writes yet.
+unsafe fn populate_write(p: *mut u8, len: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: the caller's range; the advice changes no byte's value.
+        let r = unsafe { libc::madvise(p as *mut libc::c_void, len, libc::MADV_POPULATE_WRITE) };
+        if r == 0 {
+            return;
+        }
+    }
+    let mut off = 0;
+    while off < len {
+        // SAFETY: inside the caller's range, a zero over a zero.
+        unsafe { std::ptr::write_volatile(p.add(off), 0) };
+        off += 4096;
+    }
+}
+
 /// A block from `alloc(len, _, mapped)` given back.
 ///
 /// # Safety
@@ -218,11 +247,32 @@ pub(crate) unsafe fn free(p: *mut u8, len: usize, mapped: bool) {
 pub(crate) struct Source {
     pub(crate) mapped: bool,
     pool: Option<std::sync::Arc<BlockPool>>,
+    /// A zeroed block mapped fresh is populated for writing before it is
+    /// handed out (`Options::index_populated`, `populate_write`).
+    populate: bool,
 }
 
 impl Source {
     pub(crate) fn new(mapped: bool, pool: Option<std::sync::Arc<BlockPool>>) -> Source {
-        Source { mapped, pool }
+        Source {
+            mapped,
+            pool,
+            populate: false,
+        }
+    }
+
+    /// This source with its zeroed mapped blocks populated for writing or
+    /// not (`Options::index_populated`); a clone keeps the setting, so an
+    /// index's next doubling takes its source's.
+    pub(crate) fn populated(mut self, on: bool) -> Source {
+        self.populate = on;
+        self
+    }
+
+    /// Whether this source populates its zeroed mapped blocks.
+    #[cfg(test)]
+    pub(crate) fn populates(&self) -> bool {
+        self.populate
     }
 
     /// `alloc(len, zeroed, mapped)`, a pooled block of the length first:
@@ -238,6 +288,12 @@ impl Source {
                 }
                 return p;
             }
+            let p = alloc(len, zeroed, true);
+            if zeroed && self.populate {
+                // SAFETY: the `len` bytes just mapped, nobody's yet.
+                unsafe { populate_write(p, len) };
+            }
+            return p;
         }
         alloc(len, zeroed, self.mapped)
     }
@@ -1184,6 +1240,43 @@ unsafe fn unmap(p: *mut u8, len: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A source that populates hands out a zeroed block it maps with every
+    /// page resident and zero, the pages made by writes before anything
+    /// reads them; one that does not hands it out with no page touched, as
+    /// a mapping is, so a probe's load maps the zero page; and a block not
+    /// asked zeroed, or under `MAP_FROM`, is no business of the population.
+    /// Read off `mincore`, which counts a page the mapping has a page for.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_populating_source_maps_a_zeroed_block_written_and_no_other() {
+        let len = 4 * MAP_FROM;
+        for (populate, zeroed, resident) in [(true, true, len), (false, true, 0), (true, false, 0)]
+        {
+            let src = Source::new(true, None).populated(populate);
+            assert_eq!(src.clone().populates(), populate, "a clone keeps it");
+            let p = src.alloc(len, zeroed);
+            assert_eq!(
+                resident_of(p, len),
+                resident,
+                "populate {populate}, zeroed {zeroed}"
+            );
+            if zeroed {
+                // SAFETY: `len` bytes just allocated.
+                let s = unsafe { std::slice::from_raw_parts(p, len) };
+                assert!(s.iter().all(|&b| b == 0), "populate {populate}: not zeroed");
+            }
+            // SAFETY: from this source's `alloc` with this length.
+            unsafe { src.free(p, len) };
+        }
+        let small = Source::new(true, None).populated(true);
+        let p = small.alloc(MAP_FROM / 2, true);
+        // SAFETY: the bytes just allocated, from the heap under `MAP_FROM`.
+        let s = unsafe { std::slice::from_raw_parts(p, MAP_FROM / 2) };
+        assert!(s.iter().all(|&b| b == 0), "a heap block zeroed");
+        // SAFETY: as above.
+        unsafe { small.free(p, MAP_FROM / 2) };
+    }
 
     /// A block of either kind is cache-line aligned, zero where asked,
     /// writable through, and given back; a block under `MAP_FROM` is never
