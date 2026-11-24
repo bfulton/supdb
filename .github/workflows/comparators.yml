@@ -17,7 +17,7 @@ on:
   push:
     branches: [claude/funny-faraday-1ipfti]
     paths: ['.github/workflows/comparators.yml']
-    # second throwaway run: the script exits with its table's verdict
+    # third throwaway run: the tool that copies, beside the kept db_bench
   workflow_dispatch:
   schedule:
     - cron: '17 6 * * 1'
