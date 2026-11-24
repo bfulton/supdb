@@ -2744,6 +2744,47 @@ again over the next sitting's lines before the figure it explains is
 left as the machine's; and a guard that protects a reader for a window
 its test cannot open is held where the guard is, by its own state.
 
+It came again as a read, over keys the roster had not run under a
+cipher. At five million ids under 640 MiB (`bench ab --arms
+supdb-cipherauto,supdb-cipher --size 5000000 --bound 671088640 --keys ids
+--passes load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+--reps 5 --ops-div 10`, at `884443b`) the store as shipped was killed in
+a scan mix in four reps of five, E in three and the scrambled E in one,
+where forty-six sittings over numbered keys had killed none. The mix's first scan settles what the write mixes
+before it left unfiled, some fifty thousand scattered writes, and over
+keys whose heads are not the whole of them each resolve reads an index's
+stride and a record through the store's cache, all of it ahead of the
+scan's walk and under the scan's one pin: the cache took in a hundred and
+thirty megabytes in half a second. The stack was had as the merge's was,
+by stopping the process from inside the evictor's wait: the writer in
+`settle_each` under `Reader::scan`. The settle's look, every sixty-four
+keys, was a rest for the upkeep thread and for the writer inside one of
+its own operations and for no read, on this file's argument about a read
+nested in a scan's callback, which is an argument about a nested read and
+had been applied to every read. Every look a read reaches falls ahead of
+the read's walk (`settle_each`, `install_ahead`), where it has lent its
+caller nothing and holds nothing it was lent, so in a handle's outermost
+read the look rests (`Reader::rest_ahead`, `read_rest`, at the line a
+caller's read waits at), and a read inside another's callback rests
+nothing as before. A handle `new_reader` makes looks as the writer's does
+for it (`LOOKS_READER_RESTS`). The tests, in `cipher_looks`: one scan's
+settle of a backlog several times the cache, through the writer and
+through a handle, the cache's peak held to its budget and a read's slack
+(`a_reads_settle_ahead_of_its_walk_gives_the_cache_back`); where a look
+rests, by the slot's page at depth one and at depth two, since the test
+that put a read inside a callback read no byte through a settle there;
+and the rest's wait counted as a breath where another reader holds the
+cache, the test the sixth mutant needed, a rest that never waits having
+passed the first two. With it the store as shipped ran the same passes in
+three reps of three. The rules: an argument that a path may not rest is
+an argument about the state the path is in, here a read's depth, and is
+checked against each state that reaches the function before it is
+written as the function's; what one read does under its pin is the
+backlog the passes before it left, so a pin is priced after the passes
+that fill it and over each shape of key, the shape deciding what a
+resolve reads; and a mode's roster run under one kind of key has not run
+the mode.
+
 The rules: a second way to hold the same bytes is priced on the first
 operation of every pass as well as on its rate, since a mapping's first
 touch is where two kinds of memory differ; a write slower than its cipher
@@ -9157,6 +9198,44 @@ not, and the bisect that cleared them is the count they were owed; and
 a move by function with no source behind it is read against the
 profile's unit of optimization before a cause is looked for in the
 function.
+
+**One handle's setup, written into the step every handle's constructor
+ends in.** The settle's rest under a cipher wanted a caller's handle to
+look as the writer's does: a byte among its fields and its forms' word
+for "not asked". Every handle's constructor ends in `paged_bits`, the
+step that sets the cipher's bit, and the two went there, behind the test
+the step already made. The count against the commit before (`sh
+scripts/cost.sh 884443b merge land work scan scan_long read`, at
+`38eff95`) read red in two functions no line of the change runs: the
+writer's round, 250,037 instructions over the probe's `main`, two and a
+half a key, and 280 over the landing probe's run in `Db::seal`, thirty-five
+a seal. Summed by mnemonic the round's gain was moves and address
+computations, the same loop under another register allocation. It was
+found by building, not by reading: the count at each of the two commits
+since the base named the first, and that commit built twice more, each
+with one of its hunks taken out, named the hunk -- the one in
+`paged_bits`, where taking out a refactor of the scan's rest beside it
+moved nothing. The first fix put the two stores in a cold function of
+their own, called on the handle from `paged_bits`: the round read level
+and `Db::seal` still 88 over, eleven a seal with a `memcpy` among them.
+The seal's thread makes a handle, and a call that takes a value by
+reference while it is being built by value has the value built in memory
+and copied to its place, in a store with no cipher. The two are written
+now by the one constructor whose handles look (`new_reader`): the byte
+among the handle's fields and the word through the handle's own
+`not_asked`, behind one test of whether the store has a cache, at a
+handle made; `paged_bits` and every other constructor are the text they
+were, and the count reads level (the same command at `f2640ea`). A third
+condition written with it, that only a counted handle rests, outlived
+both tests under its mutant: the builder ahead's and the keeper's handles
+reach no look, so nothing could hold it, and it came out. The rules: a
+step every constructor shares is in every function a constructor is
+inlined into, so what one kind of handle needs is written in that
+kind's constructor, among its fields; a method called by reference on a
+value still being built is a copy of the value, cold or not; and a red
+count in a function the change does not run is bisected before it is
+read -- by commit, then by hunk, a build with each hunk out -- since the
+listing says what moved and only the builds say what moved it.
 
 ## Standing limitations
 
