@@ -44,8 +44,10 @@ jobs:
     #
     # The Linux runners are named by their image and not as `ubuntu-latest`:
     # that label moved to Ubuntu 26.04 between two runs of one afternoon,
-    # where `bench/scripts/libclang.sh` finds no libclang after installing
-    # it and `qemu-user-static` is no longer a package, and three jobs
+    # where `bench/scripts/libclang.sh` found no libclang after installing
+    # it (it wanted a -dev package's name for one then, and looked in the
+    # highest LLVM directory alone; it takes the image's own now) and
+    # `qemu-user-static` is no longer a package, and three jobs
     # failed in their set-up on a tree that had not changed. The image is
     # this workflow's to choose, as the ARM leg's already was; moving to a
     # newer one is a change made here, with the scripts it needs.
@@ -67,9 +69,9 @@ jobs:
       # under; no workflow names a version or a channel of its own.
       - name: The pinned toolchain
         run: sh scripts/toolchain.sh
-      # The comparators' build runs bindgen, which needs libclang; the script
-      # names it for this host and, on macOS, the rpath the build script
-      # needs to load it.
+      # The comparators' build runs bindgen, which loads libclang as
+      # RocksDB's build script runs; the script names this host's, and
+      # installs one only on a host that has none.
       - name: libclang, for bindgen
         run: sh bench/scripts/libclang.sh
       # FASTER is a comparator too, and not a crate: the script fetches its
@@ -81,18 +83,16 @@ jobs:
       # its workspace: `bench -> bench/target` named bench/bench/target,
       # which is no directory, so the step saved a cache at every run with
       # nothing of the suite's build in it and RocksDB was built from its
-      # sources in every job. LIBCLANG_PATH is in the key (`env-vars` adds
-      # a prefix to the ones the action hashes) because clang-sys keeps the
-      # directory it first found libclang in for as long as its output is
-      # cached: a restored build that names a directory since gone fails at
-      # RocksDB's build script, `unable to find library -lclang`, and
-      # nothing in a workflow cleans it as `scripts/deps.sh` does.
+      # sources in every job. The key carries nothing of the host's
+      # libclang, and needs nothing: it is loaded when RocksDB's build
+      # script runs (`bindgen-runtime`, bench/Cargo.toml), so no cached
+      # output names its directory. While the build script linked it, one
+      # did, and a restored build whose directory had gone failed there.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             . -> target
             bench -> target
-          env-vars: LIBCLANG
       # `scripts/check.sh` is the single definition of what this project
       # checks, so a contributor running it locally runs exactly this.
       - name: Build, test and lint the engine and the suite
@@ -122,12 +122,23 @@ jobs:
       # It does nothing off Linux x86-64, where there is no `faster` arm.
       - name: FASTER, for the `faster` arm
         run: sh bench/scripts/faster.sh
-      # `workspace -> target`, the target a path inside its workspace, and
-      # LIBCLANG_PATH in the key: see the `test` job of ci.yml.
+      # `workspace -> target`, the target a path inside its workspace: see
+      # the `test` job. The key is shared.
+      # Every job that builds the suite's release binary and nothing else
+      # builds the same dependencies, and under the action's default, a key
+      # by the job's name, each kept a copy of them: one round of the
+      # workflows that run by hand saved that build four times, the
+      # repository passed GitHub's ten gigabytes, and what GitHub evicted,
+      # by last read, included two caches a pull request was using. Under
+      # one key the first of those jobs to run saves the cache and the rest
+      # restore it. A job that restores a key whole saves nothing, so a job
+      # that builds anything beside the binary keeps a key of its own, as
+      # `rocksdb-alloc` does, or what it alone builds would never be
+      # cached. `bench/scripts/workflows.sh` holds both.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: bench -> target
-          env-vars: LIBCLANG
+          shared-key: bench
       - name: One quick-scale run of every arm
         env:
           ARMS: ${{ inputs.arms }}
@@ -151,8 +162,10 @@ jobs:
       - name: The pinned toolchain
         run: sh scripts/toolchain.sh aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
+      # The target's C library is named: the compiler's package only
+      # recommends it, and scripts/apt.sh installs no recommended extras.
       - name: Cross toolchain
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu qemu-user-static
+        run: sh scripts/apt.sh gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user-static
       # The linker and the emulator belong to this job, not to the
       # repository: `.cargo/config.toml` set them for the aarch64 target,
       # which is also the *host* target on the native ARM runner, so that

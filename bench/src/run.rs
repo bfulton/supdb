@@ -976,7 +976,10 @@ fn touch_resident(dir: &Path) -> (u64, u64, u64) {
             }
             let pages = len.div_ceil(page);
             let mut vec = vec![0u8; pages];
-            if libc::mincore(p, len, vec.as_mut_ptr()) == 0 {
+            // The vector's element is the platform's: an unsigned byte on
+            // Linux and a `c_char` on macOS, so the pointer is cast, as
+            // the engine's own calls cast it.
+            if libc::mincore(p, len, vec.as_mut_ptr().cast()) == 0 {
                 files += 1;
                 for (i, v) in vec.iter().enumerate() {
                     if v & 1 == 0 {

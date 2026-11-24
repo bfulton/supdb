@@ -12,6 +12,9 @@
 #
 #   sh bench/scripts/comparators.sh [OUT]    # OUT defaults to comparators-ci
 #
+#   COMPARATORS_TOOLS=DIR sh bench/scripts/comparators.sh [OUT]
+#                                           # db_bench kept in DIR between runs
+#
 # Needs cmake, a C and C++ toolchain, gflags (libgflags-dev) and the Rust
 # toolchain. Gated on explicit tests and never on `set -e`, which this
 # environment's shell walks past (CLAUDE.md).
@@ -34,23 +37,50 @@ echo "comparators: RocksDB $rocks_ver from $rocks_src"
 echo "comparators: LMDB from $lmdb_src"
 
 # db_bench, from the vendored tree, with no compression library, as the
-# suite's build has none.
-if ! cmake -S "$rocks_src" -B "$out/rocksdb-build" -DCMAKE_BUILD_TYPE=Release \
-    -DWITH_BENCHMARK_TOOLS=ON -DWITH_GFLAGS=ON -DWITH_TESTS=OFF -DWITH_TOOLS=OFF \
-    -DWITH_CORE_TOOLS=OFF -DWITH_TRACE_TOOLS=OFF -DWITH_SNAPPY=OFF -DWITH_LZ4=OFF \
-    -DWITH_ZLIB=OFF -DWITH_ZSTD=OFF -DWITH_BZ2=OFF -DPORTABLE=1 -DFAIL_ON_WARNINGS=OFF \
-    -DROCKSDB_BUILD_SHARED=OFF > "$out/tools/cmake.log" 2>&1; then
-  echo "comparators: cmake failed" >&2
-  tail -n 30 "$out/tools/cmake.log" >&2
-  exit 2
+# suite's build has none. It is five minutes of RocksDB's C++, a third of
+# the job, and a function of three things: the tree, the flags below and
+# the host's compiler. So where COMPARATORS_TOOLS names a directory the
+# binary is kept there under a name made of the first two, a run that finds
+# it builds nothing, and the directory is the host's to keep: a workflow
+# caches it under a key that names its image. A kept binary one of whose
+# libraries the host no longer has is built again. gflags is linked into
+# it (GFLAGS_SHARED off, which the gflags package's own cmake file reads),
+# so that a host needs the gflags package to build the tool and nothing to
+# run a kept one.
+flags="-DCMAKE_BUILD_TYPE=Release -DWITH_BENCHMARK_TOOLS=ON -DWITH_GFLAGS=ON -DWITH_TESTS=OFF"
+flags="$flags -DWITH_TOOLS=OFF -DWITH_CORE_TOOLS=OFF -DWITH_TRACE_TOOLS=OFF -DWITH_SNAPPY=OFF"
+flags="$flags -DWITH_LZ4=OFF -DWITH_ZLIB=OFF -DWITH_ZSTD=OFF -DWITH_BZ2=OFF -DPORTABLE=1"
+flags="$flags -DFAIL_ON_WARNINGS=OFF -DROCKSDB_BUILD_SHARED=OFF -DGFLAGS_SHARED=OFF"
+kept=
+if [ -n "${COMPARATORS_TOOLS:-}" ]; then
+  mkdir -p "$COMPARATORS_TOOLS" || exit 2
+  tree=$(basename "$(dirname "$rocks_src")")
+  kept="$COMPARATORS_TOOLS/db_bench-$tree-$(printf %s "$flags" | cksum | cut -d' ' -f1)"
 fi
-if ! cmake --build "$out/rocksdb-build" --target db_bench -j"$(nproc 2>/dev/null || echo 4)" > "$out/tools/build.log" 2>&1; then
-  echo "comparators: building db_bench failed" >&2
-  tail -n 30 "$out/tools/build.log" >&2
-  exit 2
+if [ -n "$kept" ] && [ -x "$kept" ] && ! ldd "$kept" 2>/dev/null | grep -q 'not found'; then
+  echo "comparators: db_bench as kept, $kept"
+  db_bench=$kept
+else
+  # shellcheck disable=SC2086 # a list of flags
+  if ! cmake -S "$rocks_src" -B "$out/rocksdb-build" $flags > "$out/tools/cmake.log" 2>&1; then
+    echo "comparators: cmake failed" >&2
+    tail -n 30 "$out/tools/cmake.log" >&2
+    exit 2
+  fi
+  if ! cmake --build "$out/rocksdb-build" --target db_bench -j"$(nproc 2>/dev/null || echo 4)" > "$out/tools/build.log" 2>&1; then
+    echo "comparators: building db_bench failed" >&2
+    tail -n 30 "$out/tools/build.log" >&2
+    exit 2
+  fi
+  db_bench="$out/rocksdb-build/db_bench"
+  [ -x "$db_bench" ] || { echo "comparators: no db_bench at $db_bench" >&2; exit 2; }
+  if [ -n "$kept" ]; then
+    # Under a name of its own first, so that a run cut here leaves no
+    # half-written binary under the name the next run trusts.
+    cp "$db_bench" "$kept.new" && mv "$kept.new" "$kept" || exit 2
+    echo "comparators: db_bench built and kept, $kept"
+  fi
 fi
-db_bench="$out/rocksdb-build/db_bench"
-[ -x "$db_bench" ] || { echo "comparators: no db_bench at $db_bench" >&2; exit 2; }
 
 # The LMDB tool, against the vendored LMDB.
 if ! cc -O2 -o "$out/tools/lmdb_bench" tools/lmdb_bench.c "$lmdb_src/mdb.c" "$lmdb_src/midl.c" \
@@ -95,7 +125,12 @@ for n in 10000 30000 100000 300000; do
 done
 rm -rf "$out/tools/dbb" "$out/tools/lmdb"
 
-python3 scripts/comparators.py "$out" | tee "$out/comparators.md"
+# The table's verdict is this script's exit, so the table goes to its file
+# and is shown from there: piped into `tee` its status was tee's, and a
+# cell under the margin, which the table's script answers with 1, left
+# this script and the job at 0 for as long as it was written that way.
+python3 scripts/comparators.py "$out" > "$out/comparators.md"
 status=$?
+cat "$out/comparators.md"
 [ -n "${GITHUB_STEP_SUMMARY:-}" ] && cat "$out/comparators.md" >> "$GITHUB_STEP_SUMMARY"
 exit $status

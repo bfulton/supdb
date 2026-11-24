@@ -21374,6 +21374,12 @@ fn a_bounds_walk_places_a_boundary_by_its_head_and_reads_its_record_only_on_a_ti
                     l0_trigger: 1 << 20,
                     scan_block_cache: true,
                     bounds_by_heads: on,
+                    // The commit's own maintenance: the walks are counted
+                    // store against store below, and on the thread the
+                    // snapshot's walk after the round's commit is one the
+                    // seal may take the upkeep back ahead of, a walk in
+                    // one store and none in the other.
+                    upkeep: supdb::Upkeep::Inline,
                     ..common::options()
                 },
             )
