@@ -23,7 +23,12 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-24.04
+    # One image, named once: the key of the kept db_bench below carries it,
+    # since the binary is that image's compiler's.
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
@@ -38,7 +43,22 @@ jobs:
       # It does nothing off Linux x86-64, where there is no `faster` arm.
       - name: FASTER, for the `faster` arm
         run: sh bench/scripts/faster.sh
+      # db_bench is five minutes of RocksDB's C++, a third of this job, and
+      # a function of the tree the lockfile pins, the flags in
+      # comparators.sh and this image's compiler: the script keeps the
+      # binary in the directory this step carries from run to run, under a
+      # key made of the three. GitHub removes a cache nothing has read for
+      # seven days and this job's schedule is weekly, so a scheduled run
+      # may find it gone and build.
+      - uses: actions/cache@v4
+        id: tools
+        with:
+          path: bench/comparators-tools
+          key: comparators-tools-${{ matrix.runner }}-${{ runner.arch }}-${{ hashFiles('bench/Cargo.lock', 'bench/scripts/comparators.sh') }}
+      # Only where db_bench is to be built: a kept one has gflags linked
+      # into it and needs neither.
       - name: cmake and gflags, for db_bench
+        if: steps.tools.outputs.cache-hit != 'true'
         run: |
           set -eu
           sudo apt-get update
@@ -51,6 +71,8 @@ jobs:
           workspaces: bench -> target
           shared-key: bench
       - name: The tools, the suite's two arms, and the table
+        env:
+          COMPARATORS_TOOLS: ${{ github.workspace }}/bench/comparators-tools
         run: sh bench/scripts/comparators.sh comparators-ci
       - uses: actions/upload-artifact@v4
         if: always()
