@@ -2826,3 +2826,38 @@ fn a_merge_under_a_cipher_asks_ahead_for_its_cold_inputs() {
         "the cipher's option off asked, the plain store's set beside it"
     );
 }
+
+/// An open refused beside a live store writes nothing in its directory:
+/// the marker's temp name, which a creation's crash or a rewrap leaves, is
+/// removed by an open that holds the store, at its sweep, and not by one
+/// refused as a second open -- under a cipher the store's registry of its
+/// open vaults refuses that one before it reaches the lock, by its words.
+#[test]
+fn a_refused_second_open_leaves_the_markers_temp_name_and_the_open_after_clears_it() {
+    let d = scratch("second-open-marker-tmp");
+    let mut db = Db::create(&d, under(3)).unwrap();
+    db.append(b"k", b"v");
+    db.commit().unwrap();
+    let tmp = d.join("supdb.cipher.tmp");
+    std::fs::write(&tmp, b"a rewrap's half-written marker").unwrap();
+    let e = Db::open(&d, under(3)).err().expect("a second open refused");
+    assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e}");
+    assert!(
+        e.to_string().contains("open in this process already"),
+        "{e}"
+    );
+    assert!(
+        tmp.exists(),
+        "a refused open removed the marker's temp name"
+    );
+    db.close().unwrap();
+    assert!(tmp.exists(), "the close removed the marker's temp name");
+    let db = Db::open(&d, under(3)).unwrap();
+    assert!(
+        !tmp.exists(),
+        "the open that holds the store left the temp name"
+    );
+    assert_eq!(db.count(b"k").unwrap(), 1);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}

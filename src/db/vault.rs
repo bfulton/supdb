@@ -1162,9 +1162,6 @@ impl Vault {
                      was changed",
             )
         })?;
-        // A temp name a creation's crash left, which holds nothing a
-        // marker does not.
-        let _ = std::fs::remove_file(real.join(format!("{MARKER}.tmp")));
         Vault::new(real, (cipher.data)(&key.0), cipher)?.register()
     }
 
@@ -1958,7 +1955,17 @@ impl Vault {
     /// removed: one a crash came after and no manifest named, as a plain
     /// store sweeps a segment its manifest does not name. For the open,
     /// once the manifests have been read.
+    ///
+    /// And the marker's temp name, which a creation's crash or a rewrap
+    /// leaves and which holds nothing a marker does not: here, where the
+    /// open holds the store's lock and has checked its slots, and not in
+    /// `open`, which runs before the lock, so that an open refused beside
+    /// a live store writes nothing in its directory. A rewrap holds no lock
+    /// (`rewrap`), so one that runs in another process while a store opens
+    /// can have its temp name removed under it, and fails at its rename
+    /// with the marker as it was.
     pub(crate) fn sweep(&self) -> Result<usize> {
+        let _ = std::fs::remove_file(self.real.join(format!("{MARKER}.tmp")));
         let files = lock(&self.files);
         let mut swept = 0;
         for entry in std::fs::read_dir(&self.real)? {

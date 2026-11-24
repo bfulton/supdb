@@ -22,12 +22,24 @@ on:
 permissions:
   contents: read
 
+# As every workflow that builds the suite sets it. The cache's key hashes
+# the environment's CARGO_* variables, so a job without this one has a key
+# no other job's matches, whatever the key is named.
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   detect:
     runs-on: macos-latest
+    # The job is RocksDB's build and a second of `bench machine`: eight
+    # minutes, and three times that on a slow runner.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain rust-toolchain.toml names, the one the local gate runs
+      # under; no workflow names a version or a channel of its own.
+      - name: The pinned toolchain
+        run: sh scripts/toolchain.sh
       - name: libclang, for bindgen
         run: sh bench/scripts/libclang.sh
       # FASTER is a comparator too, and not a crate: the script fetches its
@@ -35,8 +47,12 @@ jobs:
       # It does nothing off Linux x86-64, where there is no `faster` arm.
       - name: FASTER, for the `faster` arm
         run: sh bench/scripts/faster.sh
+      # `workspace -> target`, the target a path inside its workspace: see
+      # the `test` job of ci.yml. The key is the one every job that builds
+      # the suite's binary alone shares: see the `quick` job there.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: bench -> bench/target
+          workspaces: bench -> target
+          shared-key: bench
       - name: The machine capture, read
         run: sh scripts/check.sh machine

@@ -565,7 +565,14 @@ own resident bytes then (`bound-start`, `group_bytes` and
 `process_bytes`), a record the gate judges none of and the figures draw
 none of, and the run names any pass that began with more than a few
 megabytes charged (`run::audit_note`); a pairing pairs the two like any
-quantity. `--one-process` under a bound is refused, since a pass in the
+quantity. The pass's group is made under the group the run was started
+in, and a limit on a group above is a second bound on the pass, so each
+pass records the least room a limited group above it had at its start
+beside them (`room_above_bytes`, absent where none above is limited), and
+the run names any pass that began with less of it than its bound
+(`run::room_note`); `scripts/room.sh`, which the roster's and a bounded
+pairing's scripts call first, drops the page cache to make that room and
+reads the run's binary back. `--one-process` under a bound is refused, since a pass in the
 run's process would run outside it.
 
 The roster runs twice: under 1.25 GiB at three and ten million keys

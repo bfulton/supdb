@@ -69,3 +69,8 @@ tests/data/couplings.txt	src/db.rs pager code	40	41	Maint::merge_window asks whe
 tests/data/couplings.txt	src/db.rs MergeRest/NoRest code	13	14	a merge's inputs are opened by its walk's rest (MergeRest::open_input): a plain store's maps them as before, and under a cipher the hold opens them beside the store's cache where the merge asks it to (Options::merge_streams_inputs, pager::Stream)
 tests/data/couplings.txt	src/db.rs vault::stream code	0	1	the same: the hold's opener of a merge's input beside the store's cache
 tests/data/couplings.txt	src/db/vault.rs passes( code	26	27	vault::stream, the opener of a merge's input beside the store's cache, passes the log, the spare and the manifest to the directory by name as every door verb does
+tests/data/cost-entries.txt	Db::job_pool_counts	0	1	upstream c7570a9: a probe's counts of the jobs' pool (Options::jobs_pooled), process-wide, read by tests/jobs_pooled.rs, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::job_pool_takes	0	1	upstream c7570a9: the same pool's takes by array, read by the same tests
+tests/data/cost-entries.txt	Db::snapshot_lean_builds	0	1	upstream d0f91e5: a counter of the snapshot builds that took the lean path (Options::snapshot_build_lean), read by tests
+tests/data/cost-entries.txt	Db::snapshots_kept	0	1	upstream 8876f01: a counter of the commits whose maintenance kept the merge path's snapshot (Options::forms_off_snapshot_kept), read by tests and the fuzz
+tests/data/cost-entries.txt	Db::zpage_hot_asks_in	0	1	upstream d57f8c4: a test's wait for the kernel's count of the hot-raw policy's asks, before it moves an injected clock; here its form file is mapped through the vault's door (vault::map) where upstream mapped it by path

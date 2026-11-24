@@ -1174,6 +1174,48 @@ unsafe impl Sync for Paged {}
 
 /// A memory file: anonymous, the process's, gone with its last handle and
 /// its last mapping.
+/// The page cache's clean pages of `len` bytes of the file at `path` from
+/// `from` dropped (`POSIX_FADV_DONTNEED`): Linux's advice, and nothing
+/// elsewhere, where no store under a cipher is made (`memfile`).
+#[cfg(target_os = "linux")]
+fn drop_cached(path: &std::path::Path, from: usize, len: usize) {
+    if let Ok(f) = File::open(path) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: an advice over a descriptor this call holds.
+        unsafe {
+            libc::posix_fadvise(
+                f.as_raw_fd(),
+                from as libc::off_t,
+                len as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn drop_cached(_path: &std::path::Path, _from: usize, _len: usize) {}
+
+/// The `len` bytes of a read-only mapping at `p` mapped into this
+/// process's page tables (`MADV_POPULATE_READ`), and whether the kernel
+/// did so: Linux's advice, and nothing elsewhere.
+///
+/// # Safety
+/// `p` is the start of a page of a mapping of at least `len` bytes that
+/// lives through the call; the advice changes no byte.
+#[cfg(target_os = "linux")]
+unsafe fn populate_read(p: *const u8, len: usize) -> bool {
+    // SAFETY: the caller's, above.
+    unsafe { libc::madvise(p.cast_mut().cast(), len, libc::MADV_POPULATE_READ) == 0 }
+}
+
+/// # Safety
+/// As the Linux one's.
+#[cfg(not(target_os = "linux"))]
+unsafe fn populate_read(_p: *const u8, _len: usize) -> bool {
+    false
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn memfile() -> Result<File> {
     use std::os::fd::FromRawFd;
@@ -1909,18 +1951,7 @@ impl Paging for Paged {
                 libc::MADV_DONTNEED,
             );
         }
-        if let Ok(f) = File::open(&back.path) {
-            use std::os::fd::AsRawFd;
-            // SAFETY: an advice over a descriptor this call holds.
-            unsafe {
-                libc::posix_fadvise(
-                    f.as_raw_fd(),
-                    from as libc::off_t,
-                    (to - from) as libc::off_t,
-                    libc::POSIX_FADV_DONTNEED,
-                );
-            }
-        }
+        drop_cached(&back.path, from, to - from);
     }
 
     /// The envelope's bytes for the range asked of the kernel, in the
@@ -1986,16 +2017,9 @@ impl Paging for Paged {
             let hi = (back.hdr.stored_off(c as u64 - 1) as usize + self.chunk_len(c - 1) + TAG)
                 .min(back.map.len());
             if lo < hi {
-                // SAFETY: an advice over pages of the envelope's read-only
-                // mapping, which lives as long as this view: it maps them
-                // and changes no byte.
-                any |= unsafe {
-                    libc::madvise(
-                        back.map.as_ptr().add(lo).cast_mut().cast(),
-                        hi - lo,
-                        libc::MADV_POPULATE_READ,
-                    )
-                } == 0;
+                // SAFETY: pages of the envelope's read-only mapping, which
+                // lives as long as this view.
+                any |= unsafe { populate_read(back.map.as_ptr().add(lo), hi - lo) };
             }
         }
         any

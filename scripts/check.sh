@@ -46,11 +46,13 @@
 #            between two hand runs: the adaptations it made of other tests,
 #            and the stride form under threads and under a checkpoint, ran
 #            in no gate
-#   lint     clippy at -D warnings, the format gate, on Linux the
-#            door (scripts/door: the library's file, mapping and advice
-#            calls by symbol) with its red input, and the seal's red input
-#            (scripts/seal-red.sh: the whole borrows of the read path
-#            refused by the compiler outside their readers)
+#   lint     clippy at -D warnings, for this host and for the macOS target
+#            (the library alone from a host that is not a Mac), the format
+#            gate, on Linux the door (scripts/door: the
+#            library's file, mapping and advice calls by symbol) with its
+#            red input, and the seal's red input (scripts/seal-red.sh: the
+#            whole borrows of the read path refused by the compiler outside
+#            their readers)
 #   wasm     the browser reader and its floor, built for wasm32-unknown-unknown
 #            by web/build.sh, and the browser's decrypter held under Node to
 #            the envelope the Rust tests hold the writer to
@@ -125,6 +127,9 @@
 # lists, the cost) takes that commit from scripts/base.sh alone, which
 # decides it from an override and the event's values CI passes, the same
 # way on a contributor's clone.
+#
+# Every group runs under the toolchain rust-toolchain.toml names, which
+# scripts/deps.sh installs here and scripts/toolchain.sh in CI.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -163,6 +168,20 @@ for g in $groups; do
     lint)
       say "lint"
       cargo clippy --release --all-targets -- -D warnings
+      # The macOS side of the tree's cfg guards, type-checked: three test
+      # helpers only Linux's tests call were dead code there, and no Linux
+      # lint could say so. Clippy links nothing, so the target's rust-std,
+      # which rust-toolchain.toml lists, is all it needs. Skipped where the
+      # host is that target and the line above was this one. The library
+      # and its binaries alone from any other host: the tests' and the
+      # examples' cipher (`ring`, a dev-dependency) compiles C and assembly
+      # in its build script, which this host's compilers cannot make for
+      # macOS without Apple's headers, and every target of the tree is
+      # linted on the macOS leg of CI, where the line above is that host's.
+      mac=aarch64-apple-darwin
+      if [ "$(rustc -vV | sed -n 's/^host: //p')" != "$mac" ]; then
+        cargo clippy --release --lib --bins --target "$mac" -- -D warnings
+      fi
       sh scripts/fmt.sh --check
       # The door, by symbol, and its red input (scripts/door/run.sh).
       say "door"

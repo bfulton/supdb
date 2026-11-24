@@ -896,6 +896,10 @@ pub struct ZCounts {
     /// Partitions with no form file whose raw pages the crossing asked for
     /// (`Options::zpages_cross_asks_raw`).
     pub cross_raw_asks: u64,
+    /// Crossings made at the selector's buy, the land look not having
+    /// found the store past its line by then
+    /// (`Options::zpages_buy_crosses`): one a store at most.
+    pub buy_crosses: u64,
     /// Served partitions whose ordered index was dropped a second time
     /// (`Options::zpages_drop_again`), and the bytes of those indexes the
     /// page cache held before the second drop and after it.
@@ -2662,6 +2666,36 @@ pub struct Options {
     /// On; `supdb-znocrossraw` asks for the form files alone.
     #[doc(hidden)]
     pub zpages_cross_asks_raw: bool,
+    /// The selector's first buy makes the crossing where the
+    /// land look has not (`Maint::z_cross`, `zpages_land_drop_past`),
+    /// before the buy attaches anything. The crossing is what turns the
+    /// partitions built ahead under the line -- records kept, form files
+    /// dropped as they were written -- into what the form's install
+    /// needs, the records dropped and the files asked back, and it runs
+    /// where the land look's model reads the store past the line to
+    /// enter. The selector buys by its own rule, on what the reads
+    /// measured or on the prediction priced with the reading's costs,
+    /// and a store whose model sits at that line is bought under it: at
+    /// ten million keys under 1.25 GiB the model reads 0.133 faults a
+    /// read at the load's end and the line was crossed half a second
+    /// before the buy, and with thirty megabytes less in the process
+    /// (`supdb-jobsmapped`) it reads 0.121-0.124, the selector suspected,
+    /// read its files and bought in a third of a second, and the land
+    /// look crossed a quarter second after the attach, where it found
+    /// five partitions without a form file and none of the twenty-four
+    /// attached to swap. Their files, dropped at their builds, came in
+    /// through the warm job one at a time and through the reads' own
+    /// faults, 0.06 major faults a read against 0.005 and the one-thread
+    /// read pass at 255,000 reads a second against 980,000 in the slow
+    /// shape (`SUPDB_ZPAGES_TRACE=1 SUPDB_LAG_MARK=1 bench/scripts/pair.sh
+    /// supdb-jobsmapped supdb 10000000 --bound 1342177280 --reps 2
+    /// --ops-div 10 --passes load,read,read-threaded`, at `ca2306e`). A
+    /// buy is the selector's own word that the store is past the line,
+    /// whatever the look's model reads. Counted
+    /// (`ZCounts::buy_crosses`). On; `supdb-nobuycross` leaves the
+    /// crossing to the look.
+    #[doc(hidden)]
+    pub zpages_buy_crosses: bool,
     /// The drop of a served partition's ordered index from the
     /// page cache (`zpages_drop_raw`) is made again a second later, for the
     /// pages that were dirty at the first. The index is written unsynced
@@ -4609,6 +4643,32 @@ pub struct Options {
     /// (`supdb-formsoffkept`).
     #[doc(hidden)]
     pub scan_forms_off_stale_writes: u32,
+    /// EXPERIMENT, refuted: while the writer's forms are given up for the
+    /// merge path (`scan_forms_off_unreused`) and scans are near, the
+    /// commit's maintenance keeps the merge path's scan snapshot to the
+    /// commit (`Reader::keep_merge_snapshot`): the log read and the keys
+    /// created since filed into the snapshot, as a scan's preamble does,
+    /// on the upkeep thread where the upkeep is lent. With the forms off
+    /// the maintenance does nothing -- nine hundred passes of the thread
+    /// in 1.3 ms over the lag sweep's ten-percent burst at ten million
+    /// keys -- and the first scan after a burst sorts every unsealed key
+    /// itself: 16-22 ms of the pass after the one-percent burst there,
+    /// 45-115 after the ten-percent and 42-118 after the full rewrite, a
+    /// tenth to a fifth of each divided pass under either bound. Kept, the
+    /// scan's snapshot phase read 2-4 ms, 5-18 and 0.5-8, and the passes
+    /// no faster: a snapshot does not stand across a freeze, so the
+    /// maintenance built one from every unsealed key at each, 173 builds
+    /// and 120 carried forward in a sweep where the scans make three, 14 s
+    /// of the thread over a full rewrite of 28, and what those builds
+    /// freed stayed in the process -- 70-80 MB more anonymous memory at
+    /// the pass after the full rewrite, which under 1 GiB was a quarter
+    /// more major faults on the scanning thread and the pass at 0.82x and
+    /// 0.84x, and under 1.25 GiB took a store that had fitted, thirteen
+    /// faults a pass, to 4,400 and the pass to 0.62x and 0.44x
+    /// (`docs/engine.md`). Off: the first scan builds it.
+    /// `supdb-snapkept` is the arm.
+    #[doc(hidden)]
+    pub forms_off_snapshot_kept: bool,
     /// The scans a window of `scan_forms_off_unreused`'s share is taken
     /// over. A test sets a few.
     #[doc(hidden)]
@@ -4658,6 +4718,53 @@ pub struct Options {
     /// pass, where the chain landed inside it (`docs/engine.md`). Off
     /// drops it at every publish; `supdb-snapdrops` is the arm.
     pub snapshot_stands: bool,
+    /// The snapshot's extension pushes each key of its batch without
+    /// comparing it with the key before it (`Snapshot::extend`). The
+    /// compare was for a fold that cannot happen there: the batch and the
+    /// run it is merged into are entries of one live table, which gives a
+    /// key one slot, so no two of them hold the same key. The batch's keys
+    /// are appended to the arena in the table's order and pushed in key
+    /// order, so each compare read two arena slices at random: at the lag
+    /// sweep's ten-percent point at ten million keys under 1 GiB, the first
+    /// scan extends an empty run by 309,000 keys, and the merge loop was
+    /// two fifths of the scanning thread's samples over that scan, the
+    /// radix a fifth and the rest fresh pages. The batch key's own bytes
+    /// are read now only while the run has entries left to walk past. At
+    /// the one-percent point, whose first scan extends an empty run by
+    /// 99,500 keys, the merge took 1.4 ms against 6.2, and over the full
+    /// rewrite at three million keys, where the run and the batch are
+    /// alike in size and the walk reads the run's keys, 222 ms of the
+    /// extensions' merges against 246. Off is the compare;
+    /// `supdb-snapfolded` is the arm, and `supdb-snapold` the arm with
+    /// `snapshot_build_lean` off too.
+    pub snapshot_extend_unfolded: bool,
+    /// The snapshot's build and extension keep a key's place as one
+    /// offset word where they kept a pending entry of six, and the build
+    /// copies the keys in the table's entry order. It sorted the entries
+    /// by their keys' offsets first, from when the table was walked in
+    /// the order of its hash slots, whose keys lie at random; the entries
+    /// are walked in the order they were made now, which for a hash
+    /// table is the order its keys were copied in, so the sort was three
+    /// radix passes and two arrays of twelve bytes a key over an order
+    /// the entries already had, and both paths kept a twenty-four-byte
+    /// entry a key beside the records they sort. Where a snapshot puts a
+    /// key in its own arena says nothing about its order, which the
+    /// records' sort gives, so an ordered table, whose straddling keys
+    /// are copied apart from its stream, takes the same path. Under a
+    /// bound every byte of that is a fresh page the group reclaims a
+    /// cached one for: at the lag sweep's ten-percent point at ten
+    /// million keys under 1 GiB the first scan's sort of 309,000 keys
+    /// took 41 ms, about 25 of them in the first touches of 42 MB, and
+    /// this takes 13.6 MB of them away. A snapshot that copies the runs
+    /// (`snapshot_runs`) builds as before. With the extension unfolded,
+    /// the first scans' snapshot phase there read 30 ms at the median of
+    /// six against 54, at the one-percent point 10.6 against 16.8 and
+    /// after the full rewrite 47 against 56, and the ten-percent pass
+    /// ahead in both orders (`pair.sh supdb supdb-snapold 10000000 --bound
+    /// 1073741824 --reps 3 --ops-div 10 --passes load,lag` under
+    /// `SUPDB_LAG_COUNTERS=1`). Off is the shape before; `supdb-snapfat`
+    /// is the arm.
+    pub snapshot_build_lean: bool,
     /// A frozen table keeps its own sorted snapshot (`FrozenSnaps`): the
     /// seal, a freeze's carry, the keeper or the first scan sets it, and
     /// every later reader of the table -- the seal for its records, a
@@ -4865,7 +4972,7 @@ pub struct Options {
     /// were touched before. `supdb-heapblocks` is the arm that keeps the
     /// heap shape.
     pub blocks_mapped: bool,
-    /// EXPERIMENT: a job's large per-key arrays -- a seal's sort of its
+    /// A job's large per-key arrays -- a seal's sort of its
     /// table, a segment writer's copy of every key with its span, its
     /// record's offset and its hash, the ordered index builder's keys, a
     /// merge's key list and the trailer a finish composes -- are mapped
@@ -4881,7 +4988,17 @@ pub struct Options {
     /// each, beside a group at its limit whose form files' pages then
     /// faulted (`docs/engine.md`, which form a workload calls for). A
     /// mapping's pages are fresh at every job, where the arena's were
-    /// touched by the job before. Off; `supdb-jobsmapped` turns it on.
+    /// touched by the job before, and priced in memory that costs
+    /// nothing a pairing resolves: loads 0.98-1.08x at three hundred
+    /// thousand and three million keys, where the default beside itself
+    /// stood 0.83-1.19x apart cell by cell. Under 1 GiB at ten million
+    /// keys the scan passes after the ten-percent burst and after the
+    /// full rewrite read 1.3-1.6x and 1.2-1.6x with a quarter and two
+    /// thirds of the scanning thread's major faults, and at three million
+    /// the process holds 21-30 MB after its load for the allocator's
+    /// 45-108, which is what keeps that store under the line the builds
+    /// ahead start at (`zpages_land_pct`; `docs/engine.md` has the
+    /// pairings). On; `supdb-jobsheap` keeps the allocator's.
     #[doc(hidden)]
     pub jobs_mapped: bool,
     /// EXPERIMENT: `jobs_mapped` only while the store is short of memory,
@@ -4897,6 +5014,40 @@ pub struct Options {
     /// `supdb-jobsshort` turns both on.
     #[doc(hidden)]
     pub jobs_mapped_when_short: bool,
+    /// EXPERIMENT: with `jobs_mapped`, a job's mapped buffer goes to a
+    /// pool at the job's end and the next job's array of the same kind
+    /// takes it (`blocks::Maps::Pooled`, `blocks::Pool`), for as long as
+    /// the store does not read short of memory; the look that finds it
+    /// short empties the pool and holds it off (`Maint::short_look`), and
+    /// from then a job maps its arrays and unmaps them, as `jobs_mapped`
+    /// alone has every job do. The pool keeps of each array no more than
+    /// the jobs have held of it at once, and no buffer longer than the
+    /// allocator itself keeps warm (`blocks::KEEP_MAX`). The allocator's arena keeps a job's arrays warm
+    /// for the next job and keeps them when the store has no room for
+    /// them, a hundred megabytes and more of a bound of a thousand at ten
+    /// million keys, which nothing a library can call gives back; a
+    /// mapping of the job's own is fresh at every job, a fourteenth of an
+    /// ordered load in memory; and mapping only once the store reads
+    /// short (`jobs_mapped_when_short`) leaves in the arenas what the
+    /// jobs before then kept. The pool is the arena's warmth where memory
+    /// is spare and the mapping's return where it is not, with what was
+    /// kept before returned at the crossing. Refuted on both counts.
+    /// The fresh mappings' cost in memory, which the pool was built to
+    /// buy back, is none a pairing resolves (`jobs_mapped`), and the pool
+    /// read no better there. And "the raw form fits the budget" is no
+    /// word on memory to spare while a load has the group at its limit:
+    /// at three million keys under 1 GiB the pool held 110-140 MB after
+    /// the load, the store sat over the line the builds ahead start at,
+    /// and the one-percent burst ran 78-97 ms in nine reps of twelve
+    /// where the mapped arrays alone ran 40-65 in twelve of twelve
+    /// (`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh
+    /// supdb-jobspooledbuycross supdb 3000000 --bound 1073741824 --reps 6
+    /// --ops-div 10 --passes load,lag`, at `c7570a9`). At ten million
+    /// keys, where the store reads short from the middle of its load, it
+    /// is the mapped arrays and no more. Off, and nothing without
+    /// `jobs_mapped`; `supdb-jobspooled` is the arm.
+    #[doc(hidden)]
+    pub jobs_pooled: bool,
     /// Whether a fill on the upkeep thread leaves the rest of its
     /// conversions of dense forms the moment a newer commit is posted or
     /// the writer wants the upkeep back, so that through a burst the
@@ -6335,10 +6486,10 @@ pub struct Options {
     /// through its own cache (`OrdIndex::mapped_heads`).
     /// `supdb-headsmapped` reads the mapping throughout.
     pub heads_owned: bool,
-    /// EXPERIMENT: whether the heads are copied (`heads_owned`) at the
-    /// controller's census while the block cache holds the raw records'
-    /// place (`scan_cache_copies_fit`), whatever the controller's model
-    /// says of the raw form. At the census a copy is made while the model
+    /// Whether the heads are copied (`heads_owned`) at the controller's
+    /// census while the block cache holds the raw records' place
+    /// (`scan_cache_copies_fit`), whatever the controller's model says of
+    /// the raw form. At the census a copy is made while the model
     /// says the raw form fits and none while it says it does not, since a
     /// misfit there is the stretch between a crossing and the install its
     /// reads' faults buy (`Maint::z_heads_look`). A grant of the records'
@@ -6358,8 +6509,19 @@ pub struct Options {
     /// such index, nine to thirty-six a pass and a hundred and ninety in
     /// the slowest of twelve paired, a hundred and fifty to a hundred and
     /// eighty in the two slow reps of three a row took. Under this option
-    /// a grant standing reads as the store left raw. Off: the model
-    /// alone.
+    /// a grant standing reads as the store left raw: the scanning thread
+    /// took a fault at most in twenty-four passes paired, where the
+    /// model's word alone left passes of sixty-three to a hundred and
+    /// ninety. A process with less beside the cache has room for every
+    /// copy with no grant, the cache's own budget never binding, and the
+    /// same misfit by the same count: with the jobs' arrays mapped
+    /// (`jobs_mapped`) no grant was made in six sweeps of six, thirteen
+    /// partitions of twenty had their heads copied, and two passes of six
+    /// took 49 and 178 faults on the late indexes, 47 and 55 ms where the
+    /// others ran 16 to 23. So the look asks the model's question with
+    /// the cache's bytes given back to the budget
+    /// (`Maint::z_misfit_is_the_caches`), far from point reads, grant or
+    /// none. On; `supdb-headsmodel` is the model's word alone.
     #[doc(hidden)]
     pub heads_owned_beside_copies: bool,
     /// The hot-raw policy's skew bar read against the room
@@ -6747,6 +6909,34 @@ pub struct Options {
     /// microseconds apart, so a quarter of a second is a stretch with no
     /// reader all the same. `supdb-zrewarmwait` keeps the second.
     pub zpages_rewarm_quiet_ms: u32,
+    /// The rewarm's look (`zpages_rewarm_scans`) is taken at every turn of
+    /// the segment work's loop, a hundredth of a second, where off it is
+    /// taken at the controller's step alone, once a census interval
+    /// (`zselect::CENSUS_INTERVAL`): the scans that come back after a quiet
+    /// stretch have their cold form files asked for at the turn after the
+    /// first of them, where the step came 0-100 ms later, 50 on average. At
+    /// ten million keys under 1 GiB the pass after the ten-percent burst
+    /// spent its first 40 ms in the first scan's sort of the burst's
+    /// unsealed keys and the next 80-120 in major faults on form files the
+    /// burst had pushed out, while the rewarm read 225 MB of them back
+    /// under it, its asks made at the step after the first scan. The look
+    /// is a few loads where nothing is due, and it fires as designed: the
+    /// rewarm at the full rewrite's pass came 4-30 ms after the pass's
+    /// start where the step's came 32-115. Priced at ten million keys
+    /// (`SUPDB_SCAN_OPS=1 SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh
+    /// supdb-zrewarmturn supdb 10000000 --bound 1073741824 --reps 3
+    /// --ops-div 10 --passes load,lag`, the same under 1342177280, at
+    /// `29fa571`), the ten-percent pass read 1.10x and 1.12x under 1 GiB
+    /// and 1.17x twice under 1.25 GiB; five reps an order under 1 GiB
+    /// (`--reps 5`) read it 22% ahead in one order and level in the other,
+    /// with the clean store's pass and the one-percent pass 6-22% behind
+    /// in both orders where the three-rep sittings had read them level or
+    /// ahead, and the row's whole order (`--reps 2`, both bounds) read
+    /// every cell by the arms' position and the hot-raw policy's coin.
+    /// Unresolved, so off: `supdb-zrewarmturn` looks at every turn, and
+    /// `supdb-zrewarmtick` at the step alone.
+    #[doc(hidden)]
+    pub zpages_rewarm_every_turn: bool,
     /// Whether a partition's form file may be the stride form (`ZStride`).
     /// `Forced`, the default, asks every build of a form file for it
     /// (`Options::z_stride_ask`), where the store in it fits
@@ -7235,6 +7425,7 @@ impl Default for Options {
             zpages_hot_raw_beside_stride: true,
             zpages_drive_at_job_end: true,
             zpages_cross_asks_raw: true,
+            zpages_buy_crosses: true,
             zpages_drop_again: true,
             zpages_ahead_past_scans: false,
             zpages_build_at_finish: true,
@@ -7348,12 +7539,15 @@ impl Default for Options {
             upkeep_pass_pct: 0,
             snapshot_carry: false,
             snapshot_stands: true,
+            snapshot_extend_unfolded: true,
+            snapshot_build_lean: true,
             frozen_snaps: true,
             overlay_merge: true,
             scan_lazy_snapshot: false,
             scan_forms_off_unreused: true,
             scan_forms_off_counts_built: false,
             scan_forms_off_stale_writes: 512,
+            forms_off_snapshot_kept: false,
             scan_forms_off_window: 512,
             scan_forms_off_ghost_bits: 10,
             scan_forms_off_flip: false,
@@ -7369,8 +7563,9 @@ impl Default for Options {
             upkeep_fill_yields: true,
             upkeep_fill_skips_posted: true,
             blocks_mapped: true,
-            jobs_mapped: false,
+            jobs_mapped: true,
             jobs_mapped_when_short: false,
+            jobs_pooled: false,
             forms_convert_yield: true,
             forms_convert_behind: usize::MAX,
             convert_from_form: true,
@@ -7463,7 +7658,7 @@ impl Default for Options {
             settle_table_ahead: 12,
             heads_look_ms: 0,
             heads_owned: true,
-            heads_owned_beside_copies: false,
+            heads_owned_beside_copies: true,
             zpages_hot_skew_room: false,
             zpages_hot_room_margin_pct: 0,
             zpages_walk_owns_decodes: false,
@@ -7479,6 +7674,7 @@ impl Default for Options {
             zpages_rewarm_raw_maps: true,
             zpages_rewarm_beside_merges: false,
             zpages_rewarm_quiet_ms: 250,
+            zpages_rewarm_every_turn: false,
             zpages_stride: ZStride::Forced,
             zpages_stride_below: None,
             zpages_stride_room: true,
@@ -9784,6 +9980,14 @@ struct Seg {
     /// reads to tell a sliver left raw for its size from one that could not
     /// be covered.
     z_declined: std::sync::atomic::AtomicU8,
+    /// Which of this partition's pages the hot-raw policy had asked the
+    /// kernel for and not yet acted on at its last look: `HOT_ASKED_RAW`
+    /// its raw records, ahead of a release, `HOT_ASKED_FILE` its form file,
+    /// ahead of the way back, or zero (`Maint::z_hot_asks_say`). Read by
+    /// nothing in the engine: `Db::zpage_hot_asks_in` answers a test from
+    /// it, which waits there for the kernel in its own time before it moves
+    /// an injected clock toward the policy's wait.
+    z_hot_asked: std::sync::atomic::AtomicU8,
     /// Set where this partition's raw file and ordered index were dropped
     /// from the page cache (`drop_raw_pages`) and the segment work has not
     /// yet noted the drop: its look takes the flag and owes the ordered
@@ -11625,9 +11829,10 @@ pub struct SegmentWriter {
     /// the arrays, as a seal's writer does.
     deferred: Option<usize>,
     last_key: Vec<u8>,
-    /// `SegmentOptions::buffers_mapped`: where the per-key arrays above
-    /// and the finish's trailer live once they are large.
-    buffers_mapped: bool,
+    /// `SegmentOptions::buffers_mapped` and `buffers_pooled`: where the
+    /// per-key arrays above and the finish's trailer live once they are
+    /// large.
+    buffers_mapped: blocks::Maps,
 }
 
 /// The two layouts the writer produces. Same format, same readers, one
@@ -11826,12 +12031,12 @@ impl SegmentWriter {
             lookahead: opts.lookahead,
             deferred: None,
             last_key: Vec::new(),
-            buffers_mapped: opts.buffers_mapped,
+            buffers_mapped: opts.maps(),
             builder: BlockBuilder::new(block_size),
             block_size,
             blocks: Vec::new(),
-            key_arena: blocks::BigVec::new(blocks::Site::WriterKeys, opts.buffers_mapped),
-            spans: blocks::BigVec::new(blocks::Site::WriterSpans, opts.buffers_mapped),
+            key_arena: blocks::BigVec::new(blocks::Site::WriterKeys, opts.maps()),
+            spans: blocks::BigVec::new(blocks::Site::WriterSpans, opts.maps()),
             exts: Vec::new(),
             open_key: None,
             run: Vec::new(),
@@ -11857,8 +12062,8 @@ impl SegmentWriter {
             tail_spans: Vec::new(),
             mode: None,
             recs_len: 0,
-            rec_offs: blocks::BigVec::new(blocks::Site::WriterOffs, opts.buffers_mapped),
-            hashes: blocks::BigVec::new(blocks::Site::WriterHashes, opts.buffers_mapped),
+            rec_offs: blocks::BigVec::new(blocks::Site::WriterOffs, opts.maps()),
+            hashes: blocks::BigVec::new(blocks::Site::WriterHashes, opts.maps()),
             rec_buf: Vec::new(),
             batch_buf: Vec::new(),
             pending_blocks: Vec::new(),
@@ -13425,6 +13630,19 @@ pub struct SegmentOptions {
     /// which a `Db` sets this from. Off.
     #[doc(hidden)]
     pub buffers_mapped: bool,
+    /// EXPERIMENT: with `buffers_mapped`, those mappings come from the
+    /// engine's pool and go back to it (`Options::jobs_pooled`, which a
+    /// `Db` sets this from). Off.
+    #[doc(hidden)]
+    pub buffers_pooled: bool,
+}
+
+impl SegmentOptions {
+    /// Where this writer's large arrays get their buffers
+    /// (`buffers_mapped`, `buffers_pooled`).
+    fn maps(&self) -> blocks::Maps {
+        blocks::Maps::of(self.buffers_mapped, self.buffers_pooled)
+    }
 }
 
 /// A test's stand-in for a writeback error on a segment's file, met by its
@@ -13623,6 +13841,7 @@ impl Default for SegmentOptions {
             fail_helper_syncs: None,
             helper_fault: None,
             buffers_mapped: false,
+            buffers_pooled: false,
         }
     }
 }
@@ -13653,7 +13872,7 @@ impl PieceWriter {
         w.set_inline_max(inline_max);
         Ok(PieceWriter(
             Box::new(w),
-            crate::ordindex::Builder::new_in(opts.buffers_mapped),
+            crate::ordindex::Builder::new_in(opts.maps()),
             false,
             false,
         ))
@@ -14209,6 +14428,7 @@ impl Seg {
                 z_spare: zfile::ZCell::new(),
                 hot_reads16: AtomicU64::new(0),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
+                z_hot_asked: std::sync::atomic::AtomicU8::new(0),
                 z_drop_noted: std::sync::atomic::AtomicBool::new(false),
                 z_stride_no: std::sync::atomic::AtomicU8::new(0),
                 key0_len,
@@ -14256,6 +14476,7 @@ impl Seg {
                 z_spare: zfile::ZCell::new(),
                 hot_reads16: AtomicU64::new(0),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
+                z_hot_asked: std::sync::atomic::AtomicU8::new(0),
                 z_drop_noted: std::sync::atomic::AtomicBool::new(false),
                 z_stride_no: std::sync::atomic::AtomicU8::new(0),
                 key0_len,
@@ -14295,6 +14516,7 @@ impl Seg {
             z_spare: zfile::ZCell::new(),
             hot_reads16: AtomicU64::new(0),
             z_declined: std::sync::atomic::AtomicU8::new(0),
+            z_hot_asked: std::sync::atomic::AtomicU8::new(0),
             z_drop_noted: std::sync::atomic::AtomicBool::new(false),
             z_stride_no: std::sync::atomic::AtomicU8::new(0),
             key0_len,
@@ -17210,7 +17432,7 @@ impl MemTable {
     /// `mapped` is where the sort's two arrays of a record a key and the
     /// order it answers live (`Options::jobs_mapped`): fifty-two bytes a
     /// key between them, on the seal's thread, for the length of the sort.
-    fn slots_in_key_order(&self, mapped: bool) -> blocks::BigVec<u32> {
+    fn slots_in_key_order(&self, mapped: blocks::Maps) -> blocks::BigVec<u32> {
         let n = self.len();
         let mut recs: blocks::BigVec<(u64, u64, u32)> =
             blocks::BigVec::with_capacity(n, blocks::Site::SortRecs, mapped);
@@ -18856,7 +19078,7 @@ struct KeyList {
 impl KeyList {
     /// An empty list; `mapped` is where its buffers live once they are
     /// large (`Options::jobs_mapped`).
-    fn new(mapped: bool) -> KeyList {
+    fn new(mapped: blocks::Maps) -> KeyList {
         let mut offs = blocks::BigVec::new(blocks::Site::ListOffs, mapped);
         offs.push(0);
         KeyList {
@@ -18924,15 +19146,20 @@ struct Slicer<'a> {
     from: usize,
     /// Its keys cut to the fence's length; every key, with no fences.
     held: KeyList,
-    /// `Options::jobs_mapped`, for the lists it makes.
-    mapped: bool,
+    /// `Options::jobs_mapped` and `jobs_pooled`, for the lists it makes.
+    mapped: blocks::Maps,
     total: usize,
     slices: Vec<(usize, usize)>,
     given: Vec<Fence>,
 }
 
 impl<'a> Slicer<'a> {
-    fn new(fences: Option<&'a [Fence]>, parts: usize, max_keys: usize, mapped: bool) -> Slicer<'a> {
+    fn new(
+        fences: Option<&'a [Fence]>,
+        parts: usize,
+        max_keys: usize,
+        mapped: blocks::Maps,
+    ) -> Slicer<'a> {
         Slicer {
             fences,
             parts,
@@ -19545,7 +19772,7 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<Vec<String>> {
 
     // Pass one: every distinct key once, in order, into the slicer, which
     // holds only what the slices are taken from (`Slicer`).
-    let mut slicer = Slicer::new(fences.as_deref(), parts, max_keys, opts.buffers_mapped);
+    let mut slicer = Slicer::new(fences.as_deref(), parts, max_keys, opts.maps());
     let all: Vec<Vec<u8>> = if cursors {
         merge_keys(&blobs, &ords, walk_cached, rest, |k, _| {
             slicer.push(k);
@@ -22312,6 +22539,10 @@ struct Shared {
     /// run rather than sorting everything again; the count that should
     /// rise where `snap_builds` stops.
     snap_extends: AtomicU64,
+    /// Builds that kept a key's place as an offset and copied the keys
+    /// in the table's order (`Options::snapshot_build_lean`), of
+    /// `snap_builds`.
+    snap_lean_builds: AtomicU64,
     /// Snapshots republished with their stale runs copied again
     /// (`Snapshot::refreshed`).
     snap_refreshes: AtomicU64,
@@ -22352,6 +22583,11 @@ struct Shared {
     /// over the budget, as the segment work last looked
     /// (`Options::forms_fit_when_short`).
     forms_short: std::sync::atomic::AtomicBool,
+    /// Whether this store holds the jobs' pool off (`blocks::Pool::hold`,
+    /// `Options::jobs_pooled`): taken by the look that finds the store
+    /// short of memory, let go by the look that finds it no longer is,
+    /// and by the store's close.
+    pool_held: std::sync::atomic::AtomicBool,
     /// A test's: bits under which a seal thread waits, so a test can hold
     /// the store at a point of the seal and ask what it sees there.
     /// `SEAL_HOLD_LANDING` holds it before its segments are renamed into
@@ -22458,6 +22694,9 @@ struct Shared {
     /// PROTOTYPE: handles that took the published snapshot over their
     /// own under the keeper's rule; for a test.
     snap_switched: AtomicU64,
+    /// The times a commit's maintenance kept the merge path's snapshot to
+    /// its commit with the forms off (`Options::forms_off_snapshot_kept`).
+    snaps_kept: AtomicU64,
     /// Snapshots the seal thread published over the frozen table it was
     /// writing (`Options::seal_snapshot`); for a test.
     snap_sealed: AtomicU64,
@@ -22495,6 +22734,11 @@ struct Shared {
     /// work's look at the heads (`Options::heads_owned_beside_copies`),
     /// which cannot read the writer's own record of it.
     copies_stand: std::sync::atomic::AtomicBool,
+    /// The writer's block cache, bytes, as its last commit's maintenance
+    /// counted it (`Reader::maintain_forms`): what the controller's tick
+    /// gives back to the model's budget to ask whose the misfit is
+    /// (`Maint::z_misfit_is_the_caches`).
+    cache_seen: AtomicUsize,
     /// Whether the store reads as far from point reads: none in its life,
     /// or two stores' worth of writes since the last, as scans are read
     /// (`reads_around`). Published by the writer's commit
@@ -23276,6 +23520,15 @@ impl Shared {
     fn jobs_map(&self, opts: &Options) -> bool {
         opts.jobs_mapped
             && (!opts.jobs_mapped_when_short || self.forms_short.load(AtomicOrdering::Relaxed))
+    }
+
+    /// A job's writer told where its large arrays get their buffers, as
+    /// the job starts: mapped by `jobs_map`, and from the pool under
+    /// `Options::jobs_pooled`. The one place a job's options take either
+    /// from the store.
+    fn job_buffers(&self, opts: &Options, s: &mut SegmentOptions) {
+        s.buffers_mapped = self.jobs_map(opts);
+        s.buffers_pooled = opts.jobs_pooled;
     }
 
     /// Every scan over the store, the block path's and the merge path's:
@@ -24509,7 +24762,24 @@ pub struct Db {
 /// the file holds no bytes, so it costs the store nothing on disk. The name
 /// is the same in every release: two releases must exclude each other as
 /// two processes of one do.
-struct StoreLock(File);
+///
+/// A `flock` belongs to the open file description and not to the
+/// descriptor, and a child this process forks holds a copy of the
+/// descriptor until it execs, or for its whole life where it never does (a
+/// `fork` without an exec, which is what Python's `multiprocessing` makes
+/// of a process holding a store through a binding). Closing the descriptor
+/// here gives the lock up only once every copy is closed, so the close
+/// unlocks it instead (`Drop`), which gives it up for every copy at once:
+/// a store closed and opened again while a child still held a copy was
+/// refused as open elsewhere. The same reach is why the unlock is the
+/// taking process's alone: a forked child that drops its copy of a `Db`
+/// would otherwise give up its parent's lock with the parent's store
+/// still open.
+struct StoreLock {
+    file: File,
+    /// The process that took the lock.
+    pid: u32,
+}
 
 impl StoreLock {
     const NAME: &'static str = "LOCK";
@@ -24521,7 +24791,10 @@ impl StoreLock {
     fn take(dir: &Path) -> Result<StoreLock> {
         let f = vault::open_lock(dir.join(StoreLock::NAME))?;
         match f.try_lock() {
-            Ok(()) => Ok(StoreLock(f)),
+            Ok(()) => Ok(StoreLock {
+                file: f,
+                pid: std::process::id(),
+            }),
             Err(std::fs::TryLockError::WouldBlock) => Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 format!(
@@ -24537,7 +24810,63 @@ impl StoreLock {
     /// The lock given up with its descriptor left open, as a process's
     /// death gives it up: what `Db::crash` leaves.
     fn release(&self) {
-        let _ = self.0.unlock();
+        let _ = self.file.unlock();
+    }
+}
+
+impl Drop for StoreLock {
+    /// The lock given up by an unlock, and not by the descriptor's close
+    /// that follows: see the type.
+    fn drop(&mut self) {
+        if std::process::id() == self.pid {
+            self.release();
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod store_lock_tests {
+    use super::StoreLock;
+
+    /// A forked child that drops its copy of the lock leaves it its
+    /// parent's: the drop's unlock reaches every copy of the descriptor,
+    /// the parent's with the store still open among them, so it is the
+    /// taking process's alone. And the parent's own drop gives it up.
+    #[test]
+    fn a_forked_childs_drop_leaves_its_parents_lock() {
+        let dir =
+            std::env::temp_dir().join(format!("supdb-next-lock-child-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = StoreLock::take(&dir).unwrap();
+        // SAFETY: the child makes three system calls and ends -- the
+        // drop's `getpid` and `close`, and `_exit` -- with no allocation
+        // and no lock of this process's taken between.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            drop(lock);
+            // SAFETY: the child's end, with no destructor of the test
+            // harness's run.
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        // SAFETY: a wait for the child forked above.
+        while unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+            let e = std::io::Error::last_os_error();
+            assert_eq!(e.kind(), std::io::ErrorKind::Interrupted, "waitpid: {e}");
+        }
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "the child's end: {status:#x}"
+        );
+        let e = StoreLock::take(&dir)
+            .err()
+            .expect("the lock taken beside its holder, after a child dropped its copy");
+        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{e}");
+        drop(lock);
+        StoreLock::take(&dir).expect("the lock, once its holder dropped it");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -25624,7 +25953,14 @@ impl Snapshot {
     /// over one burst of writes. Only for a run with nothing filed into
     /// it: a handle's side runs are that handle's own and are not what
     /// gets published.
-    fn extend(&self, mem: &MemTable, to: usize, runs: bool) -> Snapshot {
+    fn extend(
+        &self,
+        mem: &MemTable,
+        to: usize,
+        runs: bool,
+        unfolded: bool,
+        lean: bool,
+    ) -> Snapshot {
         debug_assert!(
             self.ents.iter().all(|e| e.frozen == u32::MAX),
             "an extension is of live runs; a frozen table's own is a base"
@@ -25635,7 +25971,12 @@ impl Snapshot {
         let log_at = mem.log_len();
         let arena = self.arena.clone();
         let mut rscratch: Vec<(u64, u32)> = Vec::new();
-        let mut batch: Vec<SnapKey> = Vec::with_capacity(to - from);
+        // Under `snapshot_build_lean` a batch key's place is one offset
+        // word, its keys back to back in one reservation, its length the
+        // next offset less its own and its slot its place in the batch.
+        let lean = lean && !runs;
+        let mut batch: Vec<SnapKey> = Vec::with_capacity(if lean { 0 } else { to - from });
+        let mut offs: Vec<u32> = Vec::with_capacity(if lean { to - from + 1 } else { 0 });
         // The batch's order from its keys' prefix words, as the build
         // takes it: the sort that compared the keys through the arena
         // was two block lookups a compare, a millisecond for five
@@ -25643,25 +25984,56 @@ impl Snapshot {
         // words touches the arena only for keys alike through sixteen
         // bytes.
         let mut recs: Vec<(u64, u64, u32)> = Vec::with_capacity(to - from);
-        for i in from..to {
-            let e = mem.entry(i);
-            let key = mem.key_of(e);
-            let (a, b) = key_prefix(key);
-            recs.push((a, b, batch.len() as u32));
-            let lrun = if runs {
-                arena.copy_run(mem, e, &mut rscratch)
-            } else {
-                NO_RUN
-            };
-            batch.push(SnapKey {
-                off: arena.append(key),
-                len: key.len() as u32,
-                mem: i as u32,
-                frozen: u32::MAX,
-                lrun,
-                frun: NO_RUN,
-            });
+        if lean {
+            let total: usize = (from..to).map(|i| mem.entry(i).key_len() as usize).sum();
+            let (mut at, mut room) = arena.reserve_bytes(total);
+            for i in from..to {
+                let key = mem.key_of(mem.entry(i));
+                let (a, b) = key_prefix(key);
+                recs.push((a, b, offs.len() as u32));
+                let (head, rest) = std::mem::take(&mut room).split_at_mut(key.len());
+                head.copy_from_slice(key);
+                room = rest;
+                offs.push(at);
+                at += key.len() as u32;
+            }
+            offs.push(at);
+        } else {
+            for i in from..to {
+                let e = mem.entry(i);
+                let key = mem.key_of(e);
+                let (a, b) = key_prefix(key);
+                recs.push((a, b, batch.len() as u32));
+                let lrun = if runs {
+                    arena.copy_run(mem, e, &mut rscratch)
+                } else {
+                    NO_RUN
+                };
+                batch.push(SnapKey {
+                    off: arena.append(key),
+                    len: key.len() as u32,
+                    mem: i as u32,
+                    frozen: u32::MAX,
+                    lrun,
+                    frun: NO_RUN,
+                });
+            }
         }
+        let batch_at = |j: usize| -> SnapKey {
+            if lean {
+                SnapKey {
+                    off: offs[j],
+                    len: offs[j + 1] - offs[j],
+                    mem: (from + j) as u32,
+                    frozen: u32::MAX,
+                    lrun: NO_RUN,
+                    frun: NO_RUN,
+                }
+            } else {
+                batch[j]
+            }
+        };
+        let count = to - from;
         let key_at = |e: &SnapKey| arena.slice(e.off, e.len);
         if recs.len() > 1 {
             let mut pscratch: Vec<(u64, u64, u32)> = Vec::new();
@@ -25677,8 +26049,8 @@ impl Snapshot {
                     // A batch holds each key once, so the index only
                     // settles what the keys cannot, as the build's does.
                     recs[i..j].sort_by(|x, y| {
-                        key_at(&batch[x.2 as usize])
-                            .cmp(key_at(&batch[y.2 as usize]))
+                        key_at(&batch_at(x.2 as usize))
+                            .cmp(key_at(&batch_at(y.2 as usize)))
                             .then(x.2.cmp(&y.2))
                     });
                 }
@@ -25689,7 +26061,7 @@ impl Snapshot {
             arena: self.arena.clone(),
             runs,
             bases: self.bases.clone(),
-            ents: Vec::with_capacity(self.ents.len() + batch.len()),
+            ents: Vec::with_capacity(self.ents.len() + count),
             log_at,
             live_len: to,
             side: Vec::new(),
@@ -25710,24 +26082,42 @@ impl Snapshot {
         // a key -- fourteen for a thousand keys over ten thousand, two
         // milliseconds of a scan pass of four at a hundred thousand --
         // and the gallop alone still seven.
-        let sparse = self.ents.len() > 64 * batch.len();
+        let sparse = self.ents.len() > 64 * count;
         let mut i = 0usize;
         for r in &recs {
-            let b = batch[r.2 as usize];
-            let key = key_at(&b);
-            let below = |a: &SnapKey| self.key_of(a) <= key;
-            let at = if sparse {
-                i + gallop_point(&self.ents[i..], below)
+            let b = batch_at(r.2 as usize);
+            // With the run walked to its end the key is not read at all
+            // under `snapshot_extend_unfolded`: what is left of the batch
+            // follows the run whole.
+            let at = if unfolded && i == self.ents.len() {
+                i
             } else {
-                let mut at = i;
-                while at < self.ents.len() && below(&self.ents[at]) {
-                    at += 1;
+                let key = key_at(&b);
+                let below = |a: &SnapKey| self.key_of(a) <= key;
+                if sparse {
+                    i + gallop_point(&self.ents[i..], below)
+                } else {
+                    let mut at = i;
+                    while at < self.ents.len() && below(&self.ents[at]) {
+                        at += 1;
+                    }
+                    at
                 }
-                at
             };
             out.ents.extend_from_slice(&self.ents[i..at]);
             i = at;
-            out.push_sorted(b);
+            if unfolded {
+                // One table's entries: a key is in one of them, so the
+                // fold `push_sorted` asks after never happens here, and
+                // the order the merge made is what a checked build holds.
+                debug_assert!(
+                    out.ents.last().is_none_or(|l| self.key_of(l) < key_at(&b)),
+                    "an extension's batch key at or below the entry before it"
+                );
+                out.push_folded(b, false);
+            } else {
+                out.push_sorted(b);
+            }
         }
         out.ents.extend_from_slice(&self.ents[i..]);
         // A run written again since this snapshot copied it, found by
@@ -27850,6 +28240,7 @@ impl Reader {
             convert_dropped: get(&ev.convert_dropped),
             job_end_drives: get(&ev.job_end_drives),
             cross_raw_asks: get(&ev.cross_raw_asks),
+            buy_crosses: get(&ev.buy_crosses),
             raw_redrops: get(&ev.raw_redrops),
             raw_redrop_before: get(&ev.raw_redrop_before),
             raw_redrop_after: get(&ev.raw_redrop_after),
@@ -29293,7 +29684,106 @@ impl Reader {
             bounds: Default::default(),
         };
         let mut rscratch: Vec<(u64, u32)> = Vec::new();
-        if self.opts.scan_snapshot_arena {
+        // The tables in the order the build takes them, the frozen one's
+        // entries first, and the key bytes each will copy
+        // (`snapshot_build_lean`).
+        let tables = [
+            (frozen, frozen.map_or(0, |f| f.len())),
+            (live.map(|(m, _)| m), live_len),
+        ];
+        let lean = self.opts.snapshot_build_lean && self.opts.scan_snapshot_arena && !runs;
+        if lean {
+            let mut bytes = [0usize; 2];
+            for (t, &(m, upto)) in tables.iter().enumerate() {
+                if let Some(m) = m {
+                    bytes[t] = (0..upto).map(|i| m.entry(i).key_len() as usize).sum();
+                }
+            }
+            self.shared
+                .snap_lean_builds
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            // One offset a key, in the arena's order, the frozen table's
+            // keys and then the live one's, each table's back to back in
+            // a reservation of its own as the radix build copies them; a
+            // key's length is the next offset less its own.
+            let mut offs: Vec<u32> = Vec::with_capacity(n + 1);
+            let mut recs: Vec<(u64, u64, u32)> = Vec::with_capacity(n);
+            let mut ends: Vec<(usize, u32)> = Vec::with_capacity(2);
+            for (t, &(m, upto)) in tables.iter().enumerate() {
+                let Some(m) = m else { continue };
+                let (mut at, mut room) = snap.arena.reserve_bytes(bytes[t]);
+                for i in 0..upto {
+                    let e = m.entry(i);
+                    let k = m.key_at(e.key_off, e.key_len());
+                    let (a, b) = key_prefix(k);
+                    recs.push((a, b, offs.len() as u32));
+                    let (head, rest) = std::mem::take(&mut room).split_at_mut(k.len());
+                    head.copy_from_slice(k);
+                    room = rest;
+                    offs.push(at);
+                    at += k.len() as u32;
+                }
+                ends.push((offs.len(), at));
+            }
+            // A key's place: its offset, its length to the next offset or
+            // to its table's end, and its slot in its table.
+            let fr_n = tables[0].1;
+            let key_of = |j: usize| -> SnapKey {
+                let off = offs[j];
+                let end = ends
+                    .iter()
+                    .find(|&&(upto, _)| j + 1 == upto)
+                    .map_or_else(|| offs[j + 1], |&(_, end)| end);
+                let (mem, frozen) = if frozen.is_some() && j < fr_n {
+                    (u32::MAX, j as u32)
+                } else {
+                    let i = if frozen.is_some() { j - fr_n } else { j };
+                    (i as u32, u32::MAX)
+                };
+                SnapKey {
+                    off,
+                    len: end - off,
+                    mem,
+                    frozen,
+                    lrun: NO_RUN,
+                    frun: NO_RUN,
+                }
+            };
+            let mut rscratch2: Vec<(u64, u64, u32)> = Vec::new();
+            radix_by_prefix(&mut recs, &mut rscratch2);
+            drop(rscratch2);
+            let arena = &snap.arena;
+            let mut i = 0;
+            while i < recs.len() {
+                let mut j = i + 1;
+                while j < recs.len() && (recs[j].0, recs[j].1) == (recs[i].0, recs[i].1) {
+                    j += 1;
+                }
+                if j - i > 1 {
+                    recs[i..j].sort_by(|x, y| {
+                        let (kx, ky) = (key_of(x.2 as usize), key_of(y.2 as usize));
+                        arena
+                            .slice(kx.off, kx.len)
+                            .cmp(arena.slice(ky.off, ky.len))
+                            .then(x.2.cmp(&y.2))
+                    });
+                }
+                i = j;
+            }
+            let mut last: Option<(u64, u64, u32)> = None;
+            for r in recs {
+                let e = key_of(r.2 as usize);
+                let same = last.is_some_and(|(a, b, len)| {
+                    (a, b, len) == (r.0, r.1, e.len)
+                        && (len <= 16
+                            || snap.ents.last().is_some_and(|l| {
+                                snap.arena.slice(l.off, l.len) == snap.arena.slice(e.off, e.len)
+                            }))
+                });
+                snap.push_folded(e, same);
+                last = Some((r.0, r.1, e.len));
+            }
+        } else if self.opts.scan_snapshot_arena {
             // Arena build. The hash table is walked in slot order, which
             // visits the key bytes in random order -- one cache miss a key,
             // and at 428k keys that walk, not the sort, was most of the
@@ -31195,7 +31685,13 @@ impl Reader {
                 self.shared
                     .snap_extends
                     .fetch_add(1, AtomicOrdering::Relaxed);
-                std::sync::Arc::new(s.extend(self.mem(), to, self.opts.snapshot_runs))
+                std::sync::Arc::new(s.extend(
+                    self.mem(),
+                    to,
+                    self.opts.snapshot_runs,
+                    self.opts.snapshot_extend_unfolded,
+                    self.opts.snapshot_build_lean,
+                ))
             }
             None => std::sync::Arc::new(self.build_snapshot(to)),
         };
@@ -32407,10 +32903,47 @@ impl Reader {
     /// may be shed.
     fn maintain_forms(&self) -> Result<()> {
         self.hold_copies_look();
+        // The cache as it stands, for the controller's tick
+        // (`Maint::z_misfit_is_the_caches`); the writer's alone.
+        if self.slot.is_none() {
+            self.shared
+                .cache_seen
+                .store(self.fs().cache_bytes.get(), AtomicOrdering::Relaxed);
+        }
+        self.keep_merge_snapshot();
         if self.settle_due(true) != Some(true) {
             return Ok(());
         }
         self.fill_forms()
+    }
+
+    /// The merge path's scan snapshot kept to this commit while the
+    /// writer's forms are given up (`Options::forms_off_snapshot_kept`):
+    /// what a scan's preamble does before its walk -- the log read to the
+    /// commit, the keys created since the snapshot filed into its side
+    /// runs, or the snapshot carried forward or built where it is behind
+    /// or absent (`refresh_snapshot`) -- done at the commit's maintenance,
+    /// so that the first scan after a burst reads the log from where the
+    /// last pass left it and files that much. Only while scans are near,
+    /// by the seals' reading of it (`Shared::scans_far_at`): a store
+    /// nobody scans keeps nothing. The writer's own upkeep alone: a handle
+    /// keeps no forms to give up.
+    fn keep_merge_snapshot(&self) {
+        if !self.opts.forms_off_snapshot_kept || self.slot.is_some() || !self.fs().forms_off.get() {
+            return;
+        }
+        // The forms go off at a scan, so the store has been scanned: far
+        // is the seals' mark at the scan count as it stands.
+        let life = self.shared.scans_life.load(AtomicOrdering::Relaxed)
+            + self.shared.scans_merged.load(AtomicOrdering::Relaxed);
+        if self.shared.scans_far_at.load(AtomicOrdering::Acquire) == life {
+            return;
+        }
+        let gen = self.state().gen;
+        if self.sync_log() {
+            self.refresh_snapshot(gen, false, true);
+            self.shared.snaps_kept.fetch_add(1, AtomicOrdering::Relaxed);
+        }
     }
 
     /// Under `forms_pieces_only`, on the writer's upkeep: once a
@@ -37486,6 +38019,39 @@ impl Db {
         }
     }
 
+    /// A test's: whether the kernel holds the pages of every ask the
+    /// hot-raw policy's last look left in flight, by the count the look
+    /// itself reads (`mincore`, against `HOT_RAW_RESIDENT`): a partition's
+    /// raw records ahead of its release, and a released one's form file
+    /// ahead of its way back. True with no ask in flight.
+    ///
+    /// The policy gives an ask `HOT_RAW_ASK_WAIT` on the store's clock and
+    /// drops a release whose pages are under half there when it is out. A
+    /// test's clock is injected and runs through that wait in the time its
+    /// looks take, tens of milliseconds, while the kernel reads the pages
+    /// in in its own: on a hosted runner the read lost once, the ask was
+    /// dropped, and a test of the release failed with the engine right. A
+    /// test waits here before each look, so the wait it moves its clock
+    /// through is one the pages have already met.
+    #[doc(hidden)]
+    pub fn zpage_hot_asks_in(&self) -> bool {
+        let _entered = self.enter();
+        self.segs().iter().filter(|s| s.level > 0).all(|seg| {
+            match seg.z_hot_asked.load(AtomicOrdering::Relaxed) {
+                HOT_ASKED_RAW => seg.records_resident() >= HOT_RAW_RESIDENT,
+                HOT_ASKED_FILE => {
+                    let name = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name));
+                    let (Some(id), Some(end)) = name else {
+                        return true;
+                    };
+                    vault::map(self.dir.join(zfile::zpg_name(id, end)))
+                        .map_or(true, |map| map_resident_share(&map) >= HOT_RAW_RESIDENT)
+                }
+                _ => true,
+            }
+        })
+    }
+
     /// A test's seam: every live segment's pages dropped from this
     /// process's mapping and then from the file's cache, as the drop of a
     /// served raw form does (`Options::zpages_drop_raw`), so that a merge
@@ -38192,6 +38758,7 @@ impl Db {
         // a store that maps only while short asks the store
         // (`Shared::jobs_map`).
         s.buffers_mapped = opts.jobs_mapped && !opts.jobs_mapped_when_short;
+        s.buffers_pooled = opts.jobs_pooled;
         s
     }
 
@@ -38397,6 +38964,7 @@ impl Db {
             blk_upkeep: AtomicU64::new(0),
             forms_events: Default::default(),
             snap_extends: AtomicU64::new(0),
+            snap_lean_builds: AtomicU64::new(0),
             snap_refreshes: AtomicU64::new(0),
             keeper_thread: std::sync::OnceLock::new(),
             next_seg: AtomicU64::new(next_seg),
@@ -38405,6 +38973,7 @@ impl Db {
             in_seal: AtomicUsize::new(0),
             in_merge: AtomicUsize::new(0),
             forms_short: std::sync::atomic::AtomicBool::new(false),
+            pool_held: std::sync::atomic::AtomicBool::new(false),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
             owed_slots_held: AtomicU64::new(0),
             merge_hold: std::sync::atomic::AtomicU8::new(0),
@@ -38433,6 +39002,7 @@ impl Db {
             snap_kept: AtomicU64::new(0),
             snap_carried: AtomicU64::new(0),
             snap_switched: AtomicU64::new(0),
+            snaps_kept: AtomicU64::new(0),
             snap_sealed: AtomicU64::new(0),
             snap_on_table: AtomicU64::new(0),
             upkeep: Lend::default(),
@@ -38444,6 +39014,7 @@ impl Db {
             cache_copies_grants: AtomicU64::new(0),
             cache_copies_revokes: AtomicU64::new(0),
             copies_stand: std::sync::atomic::AtomicBool::new(false),
+            cache_seen: AtomicUsize::new(0),
             points_far: std::sync::atomic::AtomicBool::new(true),
             cache_bound_any: std::sync::atomic::AtomicBool::new(false),
             abandon_at: AtomicU64::new(u64::MAX),
@@ -38967,7 +39538,8 @@ impl Db {
         }
         // Under a cipher the segments the directory holds are known by the
         // slots that name them, and an envelope neither slot names is
-        // nobody's and goes here.
+        // nobody's and goes here, with a temp name of the marker's that a
+        // creation's crash or a rewrap left.
         if let Some(h) = &held {
             h.vault().sweep()?;
         }
@@ -39673,6 +40245,7 @@ impl Db {
             blk_upkeep: AtomicU64::new(0),
             forms_events: Default::default(),
             snap_extends: AtomicU64::new(0),
+            snap_lean_builds: AtomicU64::new(0),
             snap_refreshes: AtomicU64::new(0),
             keeper_thread: std::sync::OnceLock::new(),
             next_seg: AtomicU64::new(next_seg),
@@ -39681,6 +40254,7 @@ impl Db {
             in_seal: AtomicUsize::new(0),
             in_merge: AtomicUsize::new(0),
             forms_short: std::sync::atomic::AtomicBool::new(false),
+            pool_held: std::sync::atomic::AtomicBool::new(false),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
             owed_slots_held: AtomicU64::new(0),
             merge_hold: std::sync::atomic::AtomicU8::new(0),
@@ -39709,6 +40283,7 @@ impl Db {
             snap_kept: AtomicU64::new(0),
             snap_carried: AtomicU64::new(0),
             snap_switched: AtomicU64::new(0),
+            snaps_kept: AtomicU64::new(0),
             snap_sealed: AtomicU64::new(0),
             snap_on_table: AtomicU64::new(0),
             upkeep: Lend::default(),
@@ -39720,6 +40295,7 @@ impl Db {
             cache_copies_grants: AtomicU64::new(0),
             cache_copies_revokes: AtomicU64::new(0),
             copies_stand: std::sync::atomic::AtomicBool::new(false),
+            cache_seen: AtomicUsize::new(0),
             points_far: std::sync::atomic::AtomicBool::new(true),
             cache_bound_any: std::sync::atomic::AtomicBool::new(false),
             abandon_at: AtomicU64::new(u64::MAX),
@@ -40986,7 +41562,7 @@ impl Db {
                 SealCounts::add(&self.shared.seal_counts.run_spares, 1);
             }
             let mut opts = Db::segment_opts(&self.opts);
-            opts.buffers_mapped = self.shared.jobs_map(&self.opts);
+            self.shared.job_buffers(&self.opts, &mut opts);
             let mut w = PieceWriter::create(&tmp, &opts, 0, self.opts.inline_bytes)?;
             // Where the run stands in the history: its records take the
             // sequence numbers from here, one each, as they commit. And
@@ -41825,7 +42401,7 @@ impl Db {
             .fetch_add(fences.len().max(1) as u64, AtomicOrdering::Relaxed);
         let dir = self.dir.clone();
         let mut opts = Db::segment_opts(&self.opts);
-        opts.buffers_mapped = self.shared.jobs_map(&self.opts);
+        self.shared.job_buffers(&self.opts, &mut opts);
         let background_io = self.opts.background_io;
         let sync_every = self.opts.seal_sync_every;
         let inline_max = self.opts.inline_bytes;
@@ -41890,7 +42466,8 @@ impl Db {
             near || self.opts.seal_snapshot_far
         };
         let put_one = self.opts.seal_put_one;
-        let jobs_mapped = self.shared.jobs_map(&self.opts);
+        // As the seal's writer has them (`Shared::job_buffers`, above).
+        let jobs_mapped = opts.maps();
         let job = move |readable: &SealReadable| -> Result<Vec<String>> {
             if background_io == BackgroundIo::Idle {
                 idle_io_priority();
@@ -43150,8 +43727,21 @@ impl Db {
         self.shared.snap_extends.load(AtomicOrdering::Relaxed)
     }
 
+    /// Snapshot builds that took the lean path
+    /// (`Options::snapshot_build_lean`), of `snapshot_builds`.
+    pub fn snapshot_lean_builds(&self) -> u64 {
+        self.shared.snap_lean_builds.load(AtomicOrdering::Relaxed)
+    }
+
     /// EXPERIMENT: snapshots republished with their stale runs copied
     /// again; see `Snapshot::refreshed`.
+    /// The times a commit's maintenance kept the merge path's snapshot to
+    /// its commit with the forms off (`Options::forms_off_snapshot_kept`).
+    #[doc(hidden)]
+    pub fn snapshots_kept(&self) -> u64 {
+        self.shared.snaps_kept.load(AtomicOrdering::Relaxed)
+    }
+
     pub fn snapshot_refreshes(&self) -> u64 {
         self.shared.snap_refreshes.load(AtomicOrdering::Relaxed)
     }
@@ -46651,7 +47241,13 @@ impl Reader {
                 self.shared
                     .snap_extends
                     .fetch_add(1, AtomicOrdering::Relaxed);
-                std::sync::Arc::new(s.extend(mem, len, self.opts.snapshot_runs))
+                std::sync::Arc::new(s.extend(
+                    mem,
+                    len,
+                    self.opts.snapshot_runs,
+                    self.opts.snapshot_extend_unfolded,
+                    self.opts.snapshot_build_lean,
+                ))
             }
             None => std::sync::Arc::new(self.build_snapshot(len)),
         };
@@ -46770,7 +47366,13 @@ impl Reader {
             self.shared
                 .snap_extends
                 .fetch_add(1, AtomicOrdering::Relaxed);
-            std::sync::Arc::new(s.extend(live, live.len(), s.runs))
+            std::sync::Arc::new(s.extend(
+                live,
+                live.len(),
+                s.runs,
+                self.opts.snapshot_extend_unfolded,
+                self.opts.snapshot_build_lean,
+            ))
         } else {
             s
         };
@@ -48656,6 +49258,22 @@ impl Db {
     #[doc(hidden)]
     pub fn job_buffers_mapped() -> Vec<(&'static str, usize)> {
         blocks::big_maps()
+    }
+
+    /// The jobs' pool (`Options::jobs_pooled`), process-wide: buffers a
+    /// job took from it, buffers it kept and buffers it unmapped, ever,
+    /// and the bytes it holds now.
+    #[doc(hidden)]
+    pub fn job_pool_counts() -> [usize; 4] {
+        blocks::POOL.counts()
+    }
+
+    /// The buffers the jobs' arrays have taken from the pool
+    /// (`Options::jobs_pooled`), process-wide and ever, by which array
+    /// took each, as `job_buffers_mapped` names them.
+    #[doc(hidden)]
+    pub fn job_pool_takes() -> Vec<(&'static str, usize)> {
+        blocks::POOL.takes()
     }
 
     /// How many cells the handles' memos have taken of their slabs
@@ -51657,6 +52275,10 @@ pub const HOT_RAW_WINDOW: usize = 8;
 /// raw reads would queue behind it -- and no ask is made again for this
 /// long.
 const HOT_RAW_RESIDENT: f64 = 0.9;
+/// `Seg::z_hot_asked`: the raw records asked for ahead of a release, and
+/// the form file asked for ahead of the way back.
+const HOT_ASKED_RAW: u8 = 1;
+const HOT_ASKED_FILE: u8 = 2;
 /// A settle's wait for the form files the store asked the kernel for
 /// (`Options::zpages_settle_joins_asks`): how often it looks at their
 /// residency, how many looks in a row with no page more end it once it has
@@ -51977,6 +52599,10 @@ struct Maint {
     /// Whether the controller leaves the store raw at the census by its
     /// last steps (`heads_left_raw`): what `z_heads_look` copies heads on.
     z_leaves_raw: bool,
+    /// Whether the misfit the model last read is the block cache's own
+    /// bytes (`z_misfit_is_the_caches`): with no point read near, the
+    /// store reads as left raw for `z_heads_look` all the same.
+    z_misfit_caches: bool,
     /// The coding the selector chose at its last reading
     /// (`Options::zpages_coding_auto`, `zselect::choose_coding`), which the
     /// builds after it are planned in; none until a reading with both
@@ -52791,6 +53417,7 @@ impl Maint {
             z_handed_gen: u64::MAX,
             z_refresh_due: false,
             z_leaves_raw: false,
+            z_misfit_caches: false,
             z_coding_pick: None,
             z_pick_size: None,
             z_ops_life: 0,
@@ -52920,7 +53547,7 @@ impl Maint {
     /// mapped where a job that starts now has them so (`Shared::jobs_map`).
     fn merge_opts(&self) -> SegmentOptions {
         let mut s = Db::merge_segment_opts(&self.opts);
-        s.buffers_mapped = self.shared.jobs_map(&self.opts);
+        self.shared.job_buffers(&self.opts, &mut s);
         s
     }
 
@@ -54693,8 +55320,13 @@ impl Maint {
         // (`Options::heads_owned_beside_copies`): the model's misfit is
         // then the grant's own bytes, and it stands only far from the
         // point reads whose faults would buy a form.
+        // And so does a cache that holds that place with no grant, its
+        // own budget never having bound: the misfit is its bytes either
+        // way (`z_misfit_is_the_caches`), and no point read is near to
+        // buy anything.
         let beside = self.opts.heads_owned_beside_copies
-            && self.shared.copies_stand.load(AtomicOrdering::Acquire);
+            && (self.shared.copies_stand.load(AtomicOrdering::Acquire)
+                || (self.z_misfit_caches && self.shared.points_far.load(AtomicOrdering::Acquire)));
         let model_raw = !self.z_auto || self.z_leaves_raw;
         let census_raw = model_raw || beside;
         let _op = self.op();
@@ -55954,8 +56586,9 @@ impl Maint {
 
     /// The hot-raw policy's turn (`Options::zpages_hot_raw`), with the form
     /// installed and nothing to build: once a `HOT_RAW_PERIOD`, a look
-    /// (`z_hot_look`), counted once it is done so that a test that waits for
-    /// one reads the decision it made.
+    /// (`z_hot_look`), counted once it is done and the asks it left in
+    /// flight are said (`z_hot_asks_say`), so that a test that waits for one
+    /// reads the decision it made.
     fn z_hot_raw_tick(&mut self) {
         let now = self.z_now();
         if self
@@ -55967,7 +56600,38 @@ impl Maint {
         let dt = self.z_hot_last.map(|t| now.saturating_sub(t));
         self.z_hot_last = Some(now);
         self.z_hot_look(now, dt);
+        self.z_hot_asks_say();
         zfile::ZEvents::add(&self.shared.z.hot_looks, 1);
+    }
+
+    /// The asks a look left in flight, said on the partitions they are of
+    /// (`Seg::z_hot_asked`) for a test's wait (`Db::zpage_hot_asks_in`):
+    /// every partition's word written from the lists the next look will
+    /// read, after every look. Not a word stored at each ask and cleared
+    /// at each end: a look ends an ask by a release, by a drop, and by
+    /// forgetting it where its partition was merged or is held by a job,
+    /// and a word left standing at any of those is a wait for pages nobody
+    /// asked for -- the raw records of a partition whose form was
+    /// installed over them since, which the install drops.
+    fn z_hot_asks_say(&self) {
+        let _op = self.op();
+        for seg in self.segs().iter().filter(|s| s.level > 0) {
+            let of = |lo: &Vec<u8>| *lo == seg.lo;
+            let word = if self.z_hot_ask.as_ref().is_some_and(|(lo, _)| of(lo))
+                || self.z_hot_fill_asks.iter().any(|(lo, _)| of(lo))
+            {
+                HOT_ASKED_RAW
+            } else if self.z_hot_back_ask.as_ref().is_some_and(|(lo, ..)| of(lo)) {
+                HOT_ASKED_FILE
+            } else {
+                0
+            };
+            // A store only where the word moves: the line is the
+            // segment's, which every read of the partition loads.
+            if seg.z_hot_asked.load(AtomicOrdering::Relaxed) != word {
+                seg.z_hot_asked.store(word, AtomicOrdering::Relaxed);
+            }
+        }
     }
 
     /// One look of the hot-raw policy at `now`, `dt` after the last one
@@ -56868,6 +57532,28 @@ impl Maint {
             .ok();
     }
 
+    /// Whether the misfit the model reads under `budget` is the block
+    /// cache's own bytes (`Options::heads_owned_beside_copies`): the raw
+    /// populations within the budget once what the writer's cache holds
+    /// is given back to it. The model's budget is the limit less the
+    /// process's anonymous memory, the cache's copies are in that memory,
+    /// and a copy stands in for its block's records for every scan, so a
+    /// store only scanned is charged for both; with the cache's bytes
+    /// given back the model is asked the question the heads' look has,
+    /// whether anything is to be bought. A grant of the records' place is
+    /// the case where the cache's own budget bound first
+    /// (`Shared::copies_stand`); a process with less beside the cache has
+    /// room for the copies without one, and the same misfit. Asked where
+    /// the model is read, once a second, with the populations it read.
+    fn z_misfit_is_the_caches(&self, budget: u64) -> bool {
+        let cache = self.shared.cache_seen.load(AtomicOrdering::Relaxed) as u64;
+        let z = &self.shared.z;
+        let hash = z.model_hash.load(AtomicOrdering::Relaxed);
+        let records = z.model_records.load(AtomicOrdering::Relaxed);
+        zselect::model_raw(budget.saturating_add(cache), hash, records)
+            < self.zsel.theta_sus(zselect::Class::Read)
+    }
+
     /// The room a rewarm's asks for the raw form's files may take
     /// (`Options::zpages_rewarm_raw`): the group's unused memory less the
     /// margin, the seam's where a test set the budget, else the platform's;
@@ -57215,6 +57901,13 @@ impl Maint {
             .z_last_step
             .is_some_and(|t| now.saturating_sub(t) < zselect::CENSUS_INTERVAL)
         {
+            // Between two steps, the rewarm's look where it is taken at every
+            // turn (`Options::zpages_rewarm_every_turn`): the scans that end
+            // a quiet stretch have their cold form files asked for now, not
+            // at the next step.
+            if self.opts.zpages_rewarm_every_turn {
+                self.z_rewarm_look(now);
+            }
             // Between two steps, the builder's turn where a job of its has
             // ended (`Options::zpages_drive_at_job_end`): the job's thread
             // woke this one, and the job is taken in and the next started
@@ -57287,6 +57980,20 @@ impl Maint {
                 || !self.sealing.is_empty(),
         };
         let d = self.zsel.step(&input);
+        // The buy before the crossing (`Options::zpages_buy_crosses`):
+        // the crossing made now, ahead of the attaches this step's drive
+        // makes, since a partition with its form attached is none the
+        // crossing swaps.
+        if self.opts.zpages_buy_crosses
+            && self.opts.zpages_land_drop_past
+            && !self.z_crossed
+            && matches!(d.event, Some(zselect::Event::BuildStart))
+        {
+            self.z_crossed = true;
+            self.z_cross();
+            self.z_ask_pending = true;
+            zfile::ZEvents::add(&self.shared.z.buy_crosses, 1);
+        }
         // Whether the controller is leaving the store raw at the census
         // (`z_heads_look`): a step that had the model's reading and asked
         // for neither a sample nor a build says so, a step that asks for
@@ -57295,6 +58002,11 @@ impl Maint {
         // crossing's first and its buy are of the last kind or ask.
         self.z_leaves_raw =
             heads_left_raw(self.z_leaves_raw, &d, model.as_ref().map(|m| m.phi_raw));
+        // And whose the misfit is, where the model was read
+        // (`Options::heads_owned_beside_copies`).
+        if let Some(m) = model.as_ref() {
+            self.z_misfit_caches = self.z_misfit_is_the_caches(m.budget);
+        }
         self.z_apply(&d, model.as_ref(), &input);
         // The form installed is the form every read is served from, so its
         // files' cold pages are asked for now and not a fault at a time
@@ -59385,7 +60097,10 @@ impl Maint {
         // (`Options::jobs_mapped_when_short`); the trim thread is the
         // fit's alone.
         let jobs = self.opts.jobs_mapped && self.opts.jobs_mapped_when_short;
-        if !self.opts.forms_fit_when_short && !jobs {
+        // And by the jobs' pool (`Options::jobs_pooled`), which a store
+        // that reads short empties and holds off.
+        let pooled = self.opts.jobs_mapped && self.opts.jobs_pooled;
+        if !self.opts.forms_fit_when_short && !jobs && !pooled {
             return;
         }
         let now = std::time::Instant::now();
@@ -59411,6 +60126,12 @@ impl Maint {
         // store short and asks for a trim finds a thread to ask.
         if short && self.opts.forms_fit_when_short {
             start_trimmer(&self.shared, &self.opts);
+        }
+        // The pool before the word, emptied and held off where the store
+        // has come short and let go where it no longer is, so that whoever
+        // reads the word finds the pool as this look left it.
+        if pooled && self.shared.pool_held.swap(short, AtomicOrdering::AcqRel) != short {
+            blocks::POOL.hold(short);
         }
         self.shared
             .forms_short
@@ -60925,6 +61646,15 @@ impl Drop for Db {
             let _ = vault::remove_file(&s.tmp);
         }
         vault::unwatch_dir(&self.dir);
+        // The jobs' pool (`Options::jobs_pooled`): this store's hold on it
+        // let go, and what its jobs left in it unmapped, every one of them
+        // having ended above.
+        if self.shared.pool_held.swap(false, AtomicOrdering::AcqRel) {
+            blocks::POOL.hold(false);
+        }
+        if self.opts.jobs_mapped && self.opts.jobs_pooled {
+            blocks::POOL.drain();
+        }
     }
 }
 

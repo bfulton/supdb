@@ -4700,6 +4700,14 @@ fn the_cost_job_names_its_probes_as_the_test_reads_them() {
 /// Run steps that set up and check nothing, matched whole.
 const CI_SETUP: &[(&str, &str)] = &[
     (
+        "sh scripts/toolchain.sh",
+        "installs the toolchain rust-toolchain.toml names, and fails where another is active",
+    ),
+    (
+        "sh scripts/toolchain.sh aarch64-unknown-linux-gnu",
+        "the pinned toolchain and the target the cross-arm group builds for",
+    ),
+    (
         "sh bench/scripts/libclang.sh",
         "installs libclang for bindgen and names it to the build",
     ),
@@ -4719,13 +4727,12 @@ const CI_SETUP: &[(&str, &str)] = &[
 ];
 
 /// A package install: this prefix, then package names alone.
-const CI_APT: &str = "sudo apt-get update -qq && sudo apt-get install -y -qq ";
+const CI_APT: &str = "sh scripts/apt.sh ";
 
 /// Actions a step may use, matched whole: each fetches, installs or
 /// publishes, and none checks.
 const CI_ACTIONS: &[(&str, &str)] = &[
     ("actions/checkout@v4", "the tree"),
-    ("dtolnay/rust-toolchain@stable", "the toolchain"),
     ("Swatinem/rust-cache@v2", "the build cache"),
     ("actions/upload-artifact@v4", "publishes the quick row"),
 ];
@@ -4739,19 +4746,14 @@ const CI_WITH: &[(&str, &str, &str)] = &[
         "the whole history, which the base needs",
     ),
     (
-        "dtolnay/rust-toolchain@stable",
-        "components",
-        "rustfmt and clippy, which the lint group runs",
-    ),
-    (
-        "dtolnay/rust-toolchain@stable",
-        "targets",
-        "the targets the wasm and cross-arm groups build for",
-    ),
-    (
         "Swatinem/rust-cache@v2",
         "workspaces",
         "which target directories to cache",
+    ),
+    (
+        "Swatinem/rust-cache@v2",
+        "shared-key",
+        "the one key every job that builds the suite's binary alone restores",
     ),
     ("actions/upload-artifact@v4", "name", "the artifact's name"),
     (
@@ -5249,6 +5251,10 @@ const CI_OTHER: &[(&str, &str)] = &[
         "a bounded measurement, by hand: its row is an artifact for a person to bank",
     ),
     (
+        ".github/workflows/pr-caches.yml",
+        "deletes a pull request's build caches once it closes: the closing is no change to check",
+    ),
+    (
         ".github/workflows/quiet-bench.yml",
         "a full-scale measurement on a self-hosted Mac, by hand",
     ),
@@ -5305,7 +5311,9 @@ fn other_triggers(name: &str, yaml: &str) -> Vec<String> {
         let key = t.split(':').next().unwrap_or("").trim();
         if d == first {
             trig = key.to_string();
-            if !["workflow_dispatch", "schedule", "push"].contains(&key) || t.starts_with('-') {
+            if !["workflow_dispatch", "schedule", "push", "pull_request"].contains(&key)
+                || t.starts_with('-')
+            {
                 errs.push(format!(
                     "{name} line {}: the trigger `{t}` is a change's event, or one the test does not know: a workflow that checks a change is on CI_CHECKS",
                     i + 1
@@ -5326,7 +5334,33 @@ fn other_triggers(name: &str, yaml: &str) -> Vec<String> {
                 "{name} line {}: a push to anything but main is a change's event: {t}",
                 i + 1
             ));
+        } else if trig == "pull_request" && t != "types: [closed]" {
+            errs.push(format!(
+                "{name} line {}: a pull request's event other than its closing alone is a change's: {t}",
+                i + 1
+            ));
         }
+    }
+    // A pull request closed is no change to check (`pr-caches.yml` deletes
+    // its caches), and its every other event is: the trigger is held to
+    // naming that one type, under the one key the test reads.
+    let under = |key: &str, line: &str| -> bool {
+        let mut it = lines[*at + 1..end]
+            .iter()
+            .skip_while(|l| l.trim() != format!("{key}:"));
+        it.next().is_some()
+            && it
+                .take_while(|l| l.len() > l.trim_start().len() + 2)
+                .any(|l| l.trim() == line)
+    };
+    if lines[*at + 1..end]
+        .iter()
+        .any(|l| l.trim() == "pull_request:")
+        && !under("pull_request", "types: [closed]")
+    {
+        errs.push(format!(
+            "{name}: a pull request's every event is a change's, and only its closing is not"
+        ));
     }
     if ind.is_none() {
         errs.push(format!("{name}: an `on:` with no trigger"));
@@ -5560,7 +5594,9 @@ fn ci_checks_only_through_check_sh_and_runs_every_group() {
     let files = ci_workflows();
     assert!(files.iter().any(|(n, _)| n == CI_YML), "{files:?}");
     let r = root();
-    for (n, _) in CI_SETUP {
+    // The packages' installer is a set-up script too, run by every
+    // `CI_APT` line.
+    for (n, _) in CI_SETUP.iter().chain([&(CI_APT.trim_end(), "")]) {
         if let Some(script) = ci_setup_script(n) {
             let text =
                 std::fs::read_to_string(r.join(script)).unwrap_or_else(|e| panic!("{script}: {e}"));
@@ -5877,6 +5913,23 @@ fn a_workflow_the_test_does_not_hold_fails() {
             ci_check_files(&with(other, &ci_edit(&ot, from, to)), &sh, CI_NOT_RUN).expect_err(to);
         assert!(e.contains(other), "{to}: {e}");
     }
+    // A pull request's events but its closing, on a workflow that deletes
+    // its caches.
+    let caches = ".github/workflows/pr-caches.yml";
+    let ct = text(caches);
+    for (from, to) in [
+        ("    types: [closed]\n", ""),
+        ("    types: [closed]\n", "    types: [opened, closed]\n"),
+        (
+            "    types: [closed]\n",
+            "    types: [closed]\n    branches: [main]\n",
+        ),
+        ("    types: [closed]\n", "    types: [synchronize]\n"),
+    ] {
+        let e =
+            ci_check_files(&with(caches, &ci_edit(&ct, from, to)), &sh, CI_NOT_RUN).expect_err(to);
+        assert!(e.contains(caches), "{to}: {e}");
+    }
     // A push to main is not a change's event, and bank-row's is that.
     let ok = ci_edit(
         &ot,
@@ -5943,24 +5996,12 @@ fn a_ci_step_that_checks_outside_check_sh_fails() {
     );
     // Set-up that hides a check, and a package list that runs something.
     red("run: sh bench/scripts/libclang.sh && cargo test", outside);
-    red(
-        "run: sudo apt-get update -qq && sudo apt-get install -y -qq valgrind && make",
-        outside,
-    );
+    red("run: sh scripts/apt.sh valgrind && make", outside);
     // A package name is a name: a `;` or a `&` inside one word runs what
     // follows it.
-    red(
-        "run: sudo apt-get update -qq && sudo apt-get install -y -qq valgrind;cargo test",
-        outside,
-    );
-    red(
-        "run: sudo apt-get update -qq && sudo apt-get install -y -qq valgrind&&cargo test",
-        outside,
-    );
-    red(
-        "run: sudo apt-get update -qq && sudo apt-get install -y -qq valgrind|sh",
-        outside,
-    );
+    red("run: sh scripts/apt.sh valgrind;cargo test", outside);
+    red("run: sh scripts/apt.sh valgrind&&cargo test", outside);
+    red("run: sh scripts/apt.sh valgrind|sh", outside);
     red(
         "run: sh scripts/check.sh wasm\n        shell: python3 {0}",
         "a shell of the step's own",

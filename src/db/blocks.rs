@@ -257,6 +257,246 @@ pub(crate) unsafe fn regrow(
     q
 }
 
+/// Where a job's large array gets its buffer once the buffer is large
+/// (`BigVec`): from the allocator; from a mapping of its own, unmapped at
+/// its drop (`Options::jobs_mapped`); or from a mapping taken from the
+/// pool and given back to it (`Options::jobs_pooled`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Maps {
+    Heap,
+    Fresh,
+    Pooled,
+}
+
+impl Maps {
+    /// The mode two options name: mapped at all, and pooled where mapped.
+    pub(crate) fn of(mapped: bool, pooled: bool) -> Maps {
+        match (mapped, pooled) {
+            (false, _) => Maps::Heap,
+            (true, false) => Maps::Fresh,
+            (true, true) => Maps::Pooled,
+        }
+    }
+}
+
+impl From<bool> for Maps {
+    /// A mapping of its own where `mapped`, the allocator's otherwise.
+    fn from(mapped: bool) -> Maps {
+        Maps::of(mapped, false)
+    }
+}
+
+/// The longest buffer the pool keeps: glibc's own largest threshold for
+/// serving a chunk from a mapping of its own, unmapped at its free
+/// (`DEFAULT_MMAP_THRESHOLD_MAX`, thirty-two megabytes on a 64-bit
+/// machine). An array longer than this the allocator maps and unmaps at
+/// every job, and so does the pool; one shorter the allocator keeps warm
+/// in an arena, and the pool keeps it warm in its place.
+pub(crate) const KEEP_MAX: usize = 32 << 20;
+
+/// The mapped buffers jobs have given back and none has taken again
+/// (`Options::jobs_pooled`). A job's arrays from the allocator stay warm
+/// in the arena of the thread that freed them, which is what makes the
+/// next job's cheap and what a memory bound cannot afford: the arena
+/// keeps them whether the store has room or not, and nothing a library
+/// can call gives the top of another thread's arena back. A mapping of
+/// the job's own goes back at the job's end and comes fresh at the next,
+/// a fault and a zeroed page for every page of every job. The pool is the
+/// arena's warmth with the engine's hand on it: a buffer given back is
+/// kept under the array it was (`Site`), the next job's array of that
+/// kind takes it, the last job's being the best word there is on how
+/// long this one's will grow, and a store that reads short of memory
+/// empties the pool and holds it off (`hold`), so that what the jobs
+/// before kept is the page cache's from then on. It keeps of each array
+/// no more than the jobs have held of it at once, and no buffer longer
+/// than the allocator would have kept (`KEEP_MAX`). A pooled buffer is
+/// still a mapping alive, counted in `mapped_bytes` and listed in `LIVE`
+/// until it is unmapped.
+pub(crate) struct Pool {
+    /// The buffers kept, each by its address, its length and the array
+    /// it was.
+    kept: Mutex<Vec<(usize, usize, Site)>>,
+    /// The bytes kept, of every array.
+    bytes: AtomicUsize,
+    /// By array, as `BIG_MAPS` is: the bytes in jobs' hands, and the most
+    /// those have been at once, which is what the pool and the jobs
+    /// together may hold of that array.
+    lent: [AtomicUsize; 13],
+    peak: [AtomicUsize; 13],
+    /// The stores holding the pool off.
+    holds: AtomicUsize,
+    /// Buffers taken from it, buffers kept by it, and buffers it
+    /// unmapped, ever; and the buffers taken, by array.
+    counts: [AtomicUsize; 3],
+    takes: [AtomicUsize; 13],
+}
+
+/// The process's pool: every store's jobs give to it and take from it.
+pub(crate) static POOL: Pool = Pool::new();
+
+impl Pool {
+    pub(crate) const fn new() -> Pool {
+        Pool {
+            kept: Mutex::new(Vec::new()),
+            bytes: AtomicUsize::new(0),
+            lent: [const { AtomicUsize::new(0) }; 13],
+            peak: [const { AtomicUsize::new(0) }; 13],
+            holds: AtomicUsize::new(0),
+            counts: [const { AtomicUsize::new(0) }; 3],
+            takes: [const { AtomicUsize::new(0) }; 13],
+        }
+    }
+
+    fn kept(&self) -> std::sync::MutexGuard<'_, Vec<(usize, usize, Site)>> {
+        self.kept.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Buffers taken from the pool, kept by it and unmapped by it, ever,
+    /// and the bytes it holds now.
+    pub(crate) fn counts(&self) -> [usize; 4] {
+        [
+            self.counts[0].load(Ordering::Relaxed),
+            self.counts[1].load(Ordering::Relaxed),
+            self.counts[2].load(Ordering::Relaxed),
+            self.bytes.load(Ordering::Relaxed),
+        ]
+    }
+
+    /// The buffers taken from the pool, by the array that took each, as
+    /// `Site::ALL` names them: what a test holds `Options::jobs_pooled`
+    /// to having reached each array and not only some.
+    pub(crate) fn takes(&self) -> Vec<(&'static str, usize)> {
+        Site::ALL
+            .iter()
+            .map(|&(s, name)| (name, self.takes[s as usize].load(Ordering::Relaxed)))
+            .collect()
+    }
+
+    /// A kept buffer of `site`'s, taken out: its address and its length.
+    /// The smallest of at least `bytes`, which may be more than was
+    /// asked; and where none is that long, the largest where
+    /// `or_largest`, for a vector with no buffer yet to grow, its pages
+    /// kept, and none otherwise, a vector with a buffer of its own
+    /// growing that one.
+    fn take(&self, site: Site, bytes: usize, or_largest: bool) -> Option<(*mut u8, usize)> {
+        let mut kept = self.kept();
+        let (mut fit, mut largest): (Option<usize>, Option<usize>) = (None, None);
+        for (i, &(_, len, s)) in kept.iter().enumerate() {
+            if s != site {
+                continue;
+            }
+            if len >= bytes && fit.is_none_or(|j| len < kept[j].1) {
+                fit = Some(i);
+            }
+            if largest.is_none_or(|j| len > kept[j].1) {
+                largest = Some(i);
+            }
+        }
+        let i = fit.or(if or_largest { largest } else { None })?;
+        let (p, len, _) = kept.swap_remove(i);
+        self.bytes.fetch_sub(len, Ordering::Relaxed);
+        self.counts[0].fetch_add(1, Ordering::Relaxed);
+        self.takes[site as usize].fetch_add(1, Ordering::Relaxed);
+        Some((p as *mut u8, len))
+    }
+
+    /// `bytes` more of `site`'s in a job's hands: a buffer taken or
+    /// mapped for it, or one of its buffers grown by that much.
+    fn lend(&self, site: Site, bytes: usize) {
+        let lent = self.lent[site as usize].fetch_add(bytes, Ordering::Relaxed) + bytes;
+        self.peak[site as usize].fetch_max(lent, Ordering::Relaxed);
+    }
+
+    /// A job's mapped buffer given back: kept for the next job's array
+    /// of its kind unless a store holds the pool off or it is longer
+    /// than the pool keeps (`KEEP_MAX`), and what the pool keeps of that
+    /// array then brought down to the most the jobs have held of it at
+    /// once less what they hold now, its smallest buffers unmapped
+    /// first, so that the pool and the jobs together keep no more of an
+    /// array than the jobs alone once did.
+    ///
+    /// # Safety
+    /// `p` is a mapping of `len` bytes from `alloc` or `regrow`, counted
+    /// by `lend` under `site` to that length, and nothing reads it after.
+    unsafe fn give(&self, site: Site, p: *mut u8, len: usize) {
+        let lent = self.lent[site as usize].fetch_sub(len, Ordering::Relaxed) - len;
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        {
+            let mut kept = self.kept();
+            // Read under the lock `hold` counts itself under: a give that
+            // reads the pool free is in it before the hold's drain, and
+            // none is kept behind one.
+            if self.holds.load(Ordering::Acquire) != 0 || len > KEEP_MAX {
+                out.push((p as usize, len));
+            } else {
+                kept.push((p as usize, len, site));
+                self.bytes.fetch_add(len, Ordering::Relaxed);
+                self.counts[1].fetch_add(1, Ordering::Relaxed);
+                let room = self.peak[site as usize]
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(lent);
+                let mut of_site: usize = kept
+                    .iter()
+                    .filter(|&&(_, _, s)| s == site)
+                    .map(|&(_, l, _)| l)
+                    .sum();
+                while of_site > room {
+                    let Some(i) = kept
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, &(_, _, s))| s == site)
+                        .min_by_key(|(_, &(_, l, _))| l)
+                        .map(|(i, _)| i)
+                    else {
+                        break;
+                    };
+                    let (a, l, _) = kept.swap_remove(i);
+                    self.bytes.fetch_sub(l, Ordering::Relaxed);
+                    of_site -= l;
+                    out.push((a, l));
+                }
+            }
+        }
+        for (a, l) in out {
+            self.counts[2].fetch_add(1, Ordering::Relaxed);
+            // SAFETY: a mapping of `l` bytes from `alloc` or `regrow`,
+            // out of the pool or never in it, and nobody's.
+            unsafe { free(a as *mut u8, l, true) };
+        }
+    }
+
+    /// Every kept buffer unmapped: the bytes given back to the kernel.
+    pub(crate) fn drain(&self) -> usize {
+        let all: Vec<(usize, usize, Site)> = std::mem::take(&mut *self.kept());
+        let mut bytes = 0;
+        for (a, l, _) in all {
+            self.bytes.fetch_sub(l, Ordering::Relaxed);
+            self.counts[2].fetch_add(1, Ordering::Relaxed);
+            bytes += l;
+            // SAFETY: a mapping of `l` bytes given to the pool, taken out
+            // of it under its lock, and nobody's.
+            unsafe { free(a as *mut u8, l, true) };
+        }
+        bytes
+    }
+
+    /// A store's hold on the pool, taken where it reads short of memory
+    /// and let go where it no longer does or closes: while any store
+    /// holds it nothing is kept, and what was kept is unmapped at the
+    /// hold.
+    pub(crate) fn hold(&self, on: bool) {
+        if !on {
+            self.holds.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+        {
+            let _kept = self.kept();
+            self.holds.fetch_add(1, Ordering::AcqRel);
+        }
+        self.drain();
+    }
+}
+
 /// A job's large array: a vector of plain values that is a `Vec` and
 /// nothing else until, where `mapped` says so, its buffer would be
 /// `MAP_FROM` bytes or more, and from there a mapping of the engine's
@@ -281,7 +521,13 @@ pub(crate) struct BigVec<T: Copy> {
     map: *mut T,
     len: usize,
     cap: usize,
+    /// The mapping's length in bytes: `cap` values and, where the buffer
+    /// came from a pool, whatever is left of the buffer past them.
+    bytes: usize,
     mapped: bool,
+    /// The pool the mapping is taken from and given back to
+    /// (`Maps::Pooled`); none, and it is this vector's own.
+    pool: Option<&'static Pool>,
     site: Site,
 }
 
@@ -296,22 +542,35 @@ impl<T: Copy> BigVec<T> {
 
     /// No buffer yet; `mapped` is whether a large one will be a mapping,
     /// and `site` which of a job's arrays this is.
-    pub(crate) fn new(site: Site, mapped: bool) -> BigVec<T> {
+    pub(crate) fn new(site: Site, maps: impl Into<Maps>) -> BigVec<T> {
+        let maps = maps.into();
+        Self::new_in(
+            site,
+            maps != Maps::Heap,
+            (maps == Maps::Pooled).then_some(&POOL),
+        )
+    }
+
+    /// `new`, with the pool named: the process's for a job, and a test's
+    /// own for a test of the vector against one.
+    fn new_in(site: Site, mapped: bool, pool: Option<&'static Pool>) -> BigVec<T> {
         let () = Self::FITS;
         BigVec {
             heap: Vec::new(),
             map: std::ptr::null_mut(),
             len: 0,
             cap: 0,
+            bytes: 0,
             mapped,
+            pool,
             site,
         }
     }
 
     /// Room for `n` values, none of it touched: a mapping from the start
     /// where that is large and `mapped`.
-    pub(crate) fn with_capacity(n: usize, site: Site, mapped: bool) -> BigVec<T> {
-        let mut v = BigVec::new(site, mapped);
+    pub(crate) fn with_capacity(n: usize, site: Site, maps: impl Into<Maps>) -> BigVec<T> {
+        let mut v = BigVec::new(site, maps);
         if !v.become_mapping(n) {
             v.heap = Vec::with_capacity(n);
         }
@@ -346,13 +605,29 @@ impl<T: Copy> BigVec<T> {
         if !maps(bytes, self.mapped) {
             return false;
         }
-        let p = alloc(bytes, false, true) as *mut T;
-        // SAFETY: `p` is `cap` values just mapped, `cap` at least the
-        // `Vec`'s length by every caller's choice of it, and apart from
-        // the `Vec`'s buffer.
+        // The buffer the last such array left in the pool, where there
+        // is a pool and it has one, and a mapping of its own otherwise.
+        // A pooled buffer may be longer than was asked, and every value
+        // of it is this vector's room; one shorter is grown, its pages
+        // kept.
+        let (p, bytes) = match self.pool.and_then(|pool| pool.take(self.site, bytes, true)) {
+            Some((p, len)) if len >= bytes => (p as *mut T, len),
+            // SAFETY: `p` is a mapping of `len` bytes out of the pool,
+            // nobody's, none of it this vector's values yet.
+            Some((p, len)) => (unsafe { regrow(p, len, bytes, 0, true) } as *mut T, bytes),
+            None => (alloc(bytes, false, true) as *mut T, bytes),
+        };
+        if let Some(pool) = self.pool {
+            pool.lend(self.site, bytes);
+        }
+        let cap = bytes / size;
+        // SAFETY: `p` is `cap` values mapped, `cap` at least the `Vec`'s
+        // length by every caller's choice of it, and apart from the
+        // `Vec`'s buffer.
         unsafe { std::ptr::copy_nonoverlapping(self.heap.as_ptr(), p, self.heap.len()) };
         self.len = self.heap.len();
         self.cap = cap;
+        self.bytes = bytes;
         self.map = p;
         self.heap = Vec::new();
         BIG_MAPS[self.site as usize].fetch_add(1, Ordering::Relaxed);
@@ -380,20 +655,45 @@ impl<T: Copy> BigVec<T> {
         let size = std::mem::size_of::<T>();
         let cap = want.max(self.cap.saturating_mul(2));
         let bytes = cap.checked_mul(size).expect("BigVec: capacity overflow");
-        // SAFETY: the mapping is `self.cap * size` bytes from `alloc` or
-        // `regrow`, mapped, its first `self.len` values written, and
-        // `self.map` is replaced below.
+        // A larger buffer of this array's from the pool where it has
+        // one, the values copied into it and this one given back: the
+        // pool's buffers are the lengths the jobs before grew to, so a
+        // vector that grows as one of theirs did ends in the buffer
+        // theirs ended in.
+        if let Some(pool) = self.pool {
+            if let Some((q, len)) = pool.take(self.site, bytes, false) {
+                pool.lend(self.site, len);
+                // SAFETY: `q` is `len` bytes out of the pool, at least
+                // `bytes` and so past the `self.len` values copied, and
+                // apart from this mapping, which is given back whole.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(self.map, q as *mut T, self.len);
+                    pool.give(self.site, self.map as *mut u8, self.bytes);
+                }
+                self.map = q as *mut T;
+                self.cap = len / size;
+                self.bytes = len;
+                return;
+            }
+        }
+        // SAFETY: the mapping is `self.bytes` bytes from `alloc`,
+        // `regrow` or a pool, mapped, its first `self.len` values
+        // written, and `self.map` is replaced below.
         let p = unsafe {
             regrow(
                 self.map as *mut u8,
-                self.cap * size,
+                self.bytes,
                 bytes,
                 self.len * size,
                 true,
             )
         };
+        if let Some(pool) = self.pool {
+            pool.lend(self.site, bytes - self.bytes);
+        }
         self.map = p as *mut T;
         self.cap = cap;
+        self.bytes = bytes;
     }
 
     /// Room for `more` values past the length.
@@ -503,15 +803,14 @@ impl<T: Copy> std::ops::DerefMut for BigVec<T> {
 impl<T: Copy> Drop for BigVec<T> {
     fn drop(&mut self) {
         if !self.map.is_null() {
-            // SAFETY: the mapping is `self.cap` values from `alloc` or
-            // `regrow`, mapped, and nothing reads it after.
+            // SAFETY: the mapping is `self.bytes` bytes from `alloc`,
+            // `regrow` or a pool, mapped, and nothing reads it after.
             unsafe {
-                free(
-                    self.map as *mut u8,
-                    self.cap * std::mem::size_of::<T>(),
-                    true,
-                )
-            };
+                match self.pool {
+                    Some(pool) => pool.give(self.site, self.map as *mut u8, self.bytes),
+                    None => free(self.map as *mut u8, self.bytes, true),
+                }
+            }
         }
     }
 }
@@ -755,6 +1054,278 @@ mod tests {
         assert!(maps(MAP_FROM, true));
         assert!(!maps(MAP_FROM - 1, true));
         assert!(!maps(MAP_FROM, false));
+    }
+
+    /// A pool keeps what it is given under the array it was and lends
+    /// that array's smallest buffer that holds what is asked, or its
+    /// largest to a vector that has none yet, and nothing of another
+    /// array's; of each array it keeps, with what is lent of it, no more
+    /// than the most that was ever lent of it at once, the smallest
+    /// going first, whatever the other arrays hold; held off it keeps
+    /// nothing and gives back what it had; let go it keeps again; and a
+    /// buffer longer than the allocator would have kept it never keeps.
+    /// A pool of the test's own: the process's is every store's.
+    #[test]
+    fn a_pool_lends_a_sites_smallest_fit_keeps_to_its_peak_and_empties_at_a_hold() {
+        let pool = Pool::new();
+        let m = MAP_FROM;
+        let (t, other) = (Site::Test, Site::SortRecs);
+        let lent = |site: Site, n: usize| {
+            let p = alloc(n, false, true);
+            pool.lend(site, n);
+            p
+        };
+        // Three lent at once, which is the array's peak, and all kept.
+        let (a, b, c) = (lent(t, m), lent(t, 2 * m), lent(t, 4 * m));
+        // SAFETY: here and below, each buffer is a mapping of the length
+        // it is given back with, lent to that length under the array it
+        // is given back as, and read no more.
+        unsafe {
+            pool.give(t, a, m);
+            pool.give(t, b, 2 * m);
+            pool.give(t, c, 4 * m);
+        }
+        assert_eq!(pool.counts(), [0, 3, 0, 7 * m], "all three kept");
+        // Another array's vector takes none of them, to grow or not.
+        assert!(pool.take(other, 1, true).is_none(), "another array's");
+        // The smallest that holds what is asked; and where none does,
+        // none for a vector that has a buffer to grow.
+        assert!(
+            pool.take(t, 4 * m + 1, false).is_none(),
+            "nothing that long"
+        );
+        assert_eq!(pool.counts(), [0, 3, 0, 7 * m], "and nothing taken");
+        assert_eq!(
+            pool.take(t, m + 1, false),
+            Some((b, 2 * m)),
+            "the smaller of two"
+        );
+        pool.lend(t, 2 * m);
+        assert_eq!(pool.take(t, 1, true), Some((a, m)), "the smallest of all");
+        pool.lend(t, m);
+        assert_eq!(pool.counts(), [2, 3, 0, 4 * m]);
+        // Three lent of a peak of seven: room for four, which the one
+        // kept fills, so a fourth buffer given back goes at once, being
+        // the smallest, and the larger one stays.
+        let d = lent(t, 2 * m);
+        unsafe { pool.give(t, d, 2 * m) };
+        assert_eq!(pool.counts(), [2, 4, 1, 4 * m], "kept to the peak");
+        // The largest, where none is as long as is asked and the vector
+        // has no buffer yet.
+        assert_eq!(
+            pool.take(t, 8 * m, true),
+            Some((c, 4 * m)),
+            "the largest, to grow"
+        );
+        pool.lend(t, 4 * m);
+        // Another array's buffer is kept by that array's room: this one
+        // is all lent, at its peak, and has none.
+        let x = lent(other, 2 * m);
+        unsafe { pool.give(other, x, 2 * m) };
+        assert_eq!(pool.counts(), [3, 5, 1, 2 * m], "each array its own room");
+        assert!(
+            pool.take(t, 1, true).is_none(),
+            "and none of it this array's"
+        );
+        assert_eq!(
+            pool.take(other, 1, false),
+            Some((x, 2 * m)),
+            "its own array's"
+        );
+        pool.lend(other, 2 * m);
+        unsafe {
+            pool.give(other, x, 2 * m);
+            pool.give(t, a, m);
+            pool.give(t, b, 2 * m);
+            pool.give(t, c, 4 * m);
+        }
+        assert_eq!(pool.counts(), [4, 9, 1, 9 * m]);
+        let takes = pool.takes();
+        assert_eq!(takes.len(), Site::ALL.len());
+        assert_eq!(
+            takes.iter().find(|(n, _)| *n == "sort records").unwrap().1,
+            1,
+            "the takes counted by the array that took"
+        );
+        assert_eq!(takes.iter().map(|&(_, n)| n).sum::<usize>(), 1);
+        // Held off: emptied, and a buffer given back is not kept.
+        pool.hold(true);
+        assert_eq!(pool.counts(), [4, 9, 5, 0], "emptied at the hold");
+        assert!(pool.take(t, 1, true).is_none());
+        let e = lent(t, m);
+        unsafe { pool.give(t, e, m) };
+        assert_eq!(pool.counts(), [4, 9, 6, 0], "nothing kept behind a hold");
+        // A second store's hold, and the first let go: still held.
+        pool.hold(true);
+        pool.hold(false);
+        let f = lent(t, m);
+        unsafe { pool.give(t, f, m) };
+        assert_eq!(pool.counts(), [4, 9, 7, 0], "held while any store holds");
+        // Let go: kept again, and drained for the bytes it held.
+        pool.hold(false);
+        let g = lent(t, m);
+        unsafe { pool.give(t, g, m) };
+        assert_eq!(pool.counts(), [4, 10, 7, m]);
+        assert_eq!(pool.drain(), m);
+        assert_eq!(pool.counts(), [4, 10, 8, 0]);
+        assert_eq!(pool.drain(), 0, "nothing left to give back");
+        // A buffer longer than the allocator would have kept is unmapped
+        // as it comes back, and one as long as that is kept.
+        let long = lent(t, KEEP_MAX + m);
+        unsafe { pool.give(t, long, KEEP_MAX + m) };
+        assert_eq!(pool.counts(), [4, 10, 9, 0], "too long to keep");
+        let most = lent(t, KEEP_MAX);
+        unsafe { pool.give(t, most, KEEP_MAX) };
+        assert_eq!(pool.counts(), [4, 11, 9, KEEP_MAX], "the longest kept");
+        assert_eq!(pool.drain(), KEEP_MAX);
+        // An array past its room gives up its own buffers, the smallest
+        // first, and none of another array's, however small that is.
+        let third = Site::SortOrder;
+        let small = lent(other, m);
+        unsafe { pool.give(other, small, m) };
+        let (p1, p2) = (lent(third, 2 * m), lent(third, 4 * m));
+        unsafe {
+            pool.give(third, p1, 2 * m);
+            pool.give(third, p2, 4 * m);
+        }
+        assert_eq!(pool.counts(), [4, 14, 10, 7 * m]);
+        let p3 = lent(third, 4 * m);
+        unsafe { pool.give(third, p3, 4 * m) };
+        assert_eq!(
+            pool.counts(),
+            [4, 15, 12, 5 * m],
+            "two of its own went, the smaller and one of the larger"
+        );
+        assert_eq!(
+            pool.take(other, 1, false),
+            Some((small, m)),
+            "the other array's smaller buffer stayed"
+        );
+        pool.lend(other, m);
+        unsafe { pool.give(other, small, m) };
+        assert_eq!(pool.drain(), 5 * m);
+    }
+
+    /// A vector with a pool has its buffer from it and gives it back: the
+    /// next vector of its kind fed as the first was ends in the buffer
+    /// the first ended in, having moved into it where it outgrew a
+    /// smaller one the pool lent it first, and holds what it was fed
+    /// whatever the buffer held before; one that asks more than any kept
+    /// buffer holds takes the largest and grows it; and a vector of
+    /// another kind, or with no pool, takes nothing.
+    #[test]
+    fn a_pooled_bigvec_takes_gives_back_and_grows_into_what_the_pool_keeps() {
+        let pool: &'static Pool = Box::leak(Box::new(Pool::new()));
+        type V = (u64, u64, u32);
+        let size = std::mem::size_of::<V>();
+        let n = 40_000u64;
+        // Two alive at once: one of ten thousand values from the start,
+        // and one grown a push at a time to forty thousand.
+        let (small, large) = {
+            let mut s: BigVec<V> = BigVec::new_in(Site::Test, true, Some(pool));
+            s.reserve(10_000);
+            s.push((1, 2, 3));
+            let mut l: BigVec<V> = BigVec::new_in(Site::Test, true, Some(pool));
+            for i in 0..n {
+                l.push((i, !i, i as u32));
+            }
+            assert!(s.is_mapped() && l.is_mapped());
+            assert_eq!(
+                pool.counts(),
+                [0, 0, 0, 0],
+                "nothing to take, nothing given yet"
+            );
+            (
+                (s.as_ptr() as usize, s.capacity()),
+                (l.as_ptr() as usize, l.capacity()),
+            )
+        };
+        assert_eq!(small.1, 10_000);
+        assert!(large.1 >= 2 * small.1, "the grown one the larger by twice");
+        let kept = (small.1 + large.1) * size;
+        assert_eq!(pool.counts(), [0, 2, 0, kept], "both kept at their drop");
+        // The next vector: a `Vec` until its buffer would be a mapping,
+        // then the smaller kept buffer, which holds what it asks first,
+        // then the larger, where it outgrows that one.
+        let mut b: BigVec<V> = BigVec::new_in(Site::Test, true, Some(pool));
+        let mut v: Vec<V> = Vec::new();
+        for i in 0..n {
+            b.push((!i, i, 7));
+            v.push((!i, i, 7));
+            if i == 9_000 {
+                assert_eq!(
+                    (b.as_ptr() as usize, b.capacity()),
+                    small,
+                    "in the smaller buffer first"
+                );
+                assert_eq!(pool.counts(), [1, 2, 0, large.1 * size]);
+            }
+        }
+        assert_eq!(
+            (b.as_ptr() as usize, b.capacity()),
+            large,
+            "then the larger"
+        );
+        assert_eq!(&b[..], &v[..], "what it was fed, whatever the buffer held");
+        assert_eq!(
+            pool.counts(),
+            [2, 3, 0, small.1 * size],
+            "taken twice, and the smaller given back at the move"
+        );
+        drop(b);
+        assert_eq!(pool.counts(), [2, 4, 0, kept]);
+        // A vector that asks more than either holds: the largest, grown.
+        let more = 2 * large.1;
+        let mut big: BigVec<V> = BigVec::new_in(Site::Test, true, Some(pool));
+        big.reserve(more);
+        assert!(big.is_mapped());
+        assert_eq!(big.capacity(), more);
+        assert_eq!(
+            pool.counts(),
+            [3, 4, 0, small.1 * size],
+            "the larger taken to grow"
+        );
+        for i in 0..more as u64 {
+            big.push((i, 1, 2));
+        }
+        assert_eq!(big.capacity(), more, "and long enough as grown");
+        assert!(big.iter().enumerate().all(|(i, &x)| x == (i as u64, 1, 2)));
+        // A vector of another kind takes nothing of the pool's.
+        let mut other: BigVec<V> = BigVec::new_in(Site::SortRecs, true, Some(pool));
+        for i in 0..n {
+            other.push((i, i, 1));
+        }
+        assert!(other.is_mapped());
+        assert_eq!(pool.counts(), [3, 4, 0, small.1 * size], "another array's");
+        // Given back: the other kind's is kept, the first of its kind;
+        // and of this kind the grown one, the most ever lent of it at
+        // once, is kept and the small one goes for it.
+        drop(other);
+        assert_eq!(
+            pool.counts(),
+            [3, 5, 0, (small.1 + large.1) * size],
+            "the other array's kept by its own room"
+        );
+        drop(big);
+        let at_most = (more + large.1) * size;
+        assert_eq!(
+            pool.counts(),
+            [3, 6, 1, at_most],
+            "the smallest of its kind went"
+        );
+        // With no pool the same vector's buffer is its own, and goes.
+        let mut own: BigVec<V> = BigVec::new_in(Site::Test, true, None);
+        for i in 0..n {
+            own.push((i, i, 1));
+        }
+        assert!(own.is_mapped());
+        drop(own);
+        assert_eq!(
+            pool.counts(),
+            [3, 6, 1, at_most],
+            "nothing of it the pool's"
+        );
+        assert_eq!(pool.drain(), at_most);
     }
 
     /// A `BigVec` holds what a `Vec` fed the same calls holds, through

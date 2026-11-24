@@ -1051,11 +1051,38 @@ pub struct Supdb {
     /// page tables (`Options::zpages_rewarm_raw_maps`), `None` for the
     /// engine's default. `supdb-rewarmrawnomap` asks and maps nothing.
     rewarmrawmaps: Option<bool>,
+    /// The rewarm's look at every turn of the segment work's loop
+    /// (`Options::zpages_rewarm_every_turn`), `None` for the engine's
+    /// default: `supdb-zrewarmturn` looks at every turn, `supdb-zrewarmtick`
+    /// at the controller's step alone.
+    zrewarmturn: Option<bool>,
+    /// The snapshot's extension pushing its batch without the fold's
+    /// compare (`Options::snapshot_extend_unfolded`), `None` for the
+    /// engine's default: `supdb-snapfolded` compares each key with the
+    /// one before it.
+    snapunfolded: Option<bool>,
+    /// The snapshot's build and extension keeping a key's place as an
+    /// offset word and copying the keys in the table's order
+    /// (`Options::snapshot_build_lean`), `None` for the engine's default:
+    /// `supdb-snapfat` is the shape before, and `supdb-snapold` the shape
+    /// before of both.
+    snaplean: Option<bool>,
     /// The partitions' heads copied at the controller's census while the
     /// block cache holds the raw records' place, whatever the model says
     /// of the raw form (`Options::heads_owned_beside_copies`), `None` for
-    /// the engine's default. `supdb-headscopies` copies them.
+    /// the engine's default. `supdb-headsmodel` copies them by the model's
+    /// word alone.
     headscopies: Option<bool>,
+    /// The merge path's scan snapshot kept to the commit by the commit's
+    /// maintenance while the writer's forms are given up
+    /// (`Options::forms_off_snapshot_kept`), `None` for the engine's
+    /// default. `supdb-snapkept` keeps it.
+    snapkept: Option<bool>,
+    /// The selector's first buy makes the crossing where the land look
+    /// has not (`Options::zpages_buy_crosses`), `None` for the engine's
+    /// default: `supdb-zbuycross`, and beside the jobs' mapped arrays
+    /// `supdb-jobsmappedbuycross` and `supdb-jobspooledbuycross`.
+    zbuycross: Option<bool>,
     /// The block cache granted the raw records' place where its own budget
     /// would bind and no point read is near
     /// (`Options::scan_cache_copies_fit`), `None` for the engine's default.
@@ -1876,6 +1903,13 @@ pub struct Supdb {
     /// (`Options::jobs_mapped_when_short`, with `jobsmapped`):
     /// `supdb-jobsshort`, `supdb-zslabjobs`, `supdb-zstrideallslabjobs`.
     jobsshort: bool,
+    /// The jobs' arrays from the allocator, the engine's shape before
+    /// (`Options::jobs_mapped` off): `supdb-jobsheap`.
+    jobsheap: bool,
+    /// The jobs' mapped arrays kept in a pool between jobs while the
+    /// store has room and given back where it reads short
+    /// (`Options::jobs_pooled`, with `jobsmapped`): `supdb-jobspooled`.
+    jobspooled: bool,
     /// A handle's memo of decoded groups in a slab of its own, mapped by
     /// the engine and unmapped with the handle
     /// (`Options::zpages_memo_slab`): `supdb-zmemoslab`,
@@ -2474,11 +2508,38 @@ struct Policy {
     /// page tables (`Options::zpages_rewarm_raw_maps`), `None` for the
     /// engine's default. `supdb-rewarmrawnomap` asks and maps nothing.
     rewarmrawmaps: Option<bool>,
+    /// The rewarm's look at every turn of the segment work's loop
+    /// (`Options::zpages_rewarm_every_turn`), `None` for the engine's
+    /// default: `supdb-zrewarmturn` looks at every turn, `supdb-zrewarmtick`
+    /// at the controller's step alone.
+    zrewarmturn: Option<bool>,
+    /// The snapshot's extension pushing its batch without the fold's
+    /// compare (`Options::snapshot_extend_unfolded`), `None` for the
+    /// engine's default: `supdb-snapfolded` compares each key with the
+    /// one before it.
+    snapunfolded: Option<bool>,
+    /// The snapshot's build and extension keeping a key's place as an
+    /// offset word and copying the keys in the table's order
+    /// (`Options::snapshot_build_lean`), `None` for the engine's default:
+    /// `supdb-snapfat` is the shape before, and `supdb-snapold` the shape
+    /// before of both.
+    snaplean: Option<bool>,
     /// The partitions' heads copied at the controller's census while the
     /// block cache holds the raw records' place, whatever the model says
     /// of the raw form (`Options::heads_owned_beside_copies`), `None` for
-    /// the engine's default. `supdb-headscopies` copies them.
+    /// the engine's default. `supdb-headsmodel` copies them by the model's
+    /// word alone.
     headscopies: Option<bool>,
+    /// The merge path's scan snapshot kept to the commit by the commit's
+    /// maintenance while the writer's forms are given up
+    /// (`Options::forms_off_snapshot_kept`), `None` for the engine's
+    /// default. `supdb-snapkept` keeps it.
+    snapkept: Option<bool>,
+    /// The selector's first buy makes the crossing where the land look
+    /// has not (`Options::zpages_buy_crosses`), `None` for the engine's
+    /// default: `supdb-zbuycross`, and beside the jobs' mapped arrays
+    /// `supdb-jobsmappedbuycross` and `supdb-jobspooledbuycross`.
+    zbuycross: Option<bool>,
     /// The block cache granted the raw records' place where its own budget
     /// would bind and no point read is near
     /// (`Options::scan_cache_copies_fit`), `None` for the engine's default.
@@ -3131,6 +3192,14 @@ struct Policy {
     /// `supdb-jobsmapped`, and with the memos' slabs in `supdb-zslabjobs`
     /// and `supdb-zstrideallslabjobs`.
     jobsshort: bool,
+    /// The jobs' arrays from the allocator (`Options::jobs_mapped` off):
+    /// `supdb-jobsheap` beside `supdb`.
+    jobsheap: bool,
+    /// The jobs' mapped arrays from a pool that keeps them between jobs
+    /// while the store has room and gives them back where it reads short
+    /// of memory (`Options::jobs_pooled`): `supdb-jobspooled` beside
+    /// `supdb-jobsmapped` and `supdb`.
+    jobspooled: bool,
     /// The handles' memos in slabs of their own
     /// (`Options::zpages_memo_slab`): `supdb-zmemoslab` beside `supdb`, and
     /// `supdb-zstrideallslab` beside `supdb-zstridealldropagain`.
@@ -3292,7 +3361,12 @@ impl Default for Policy {
             rewarmraw: None,
             rewarmrawscans: None,
             rewarmrawmaps: None,
+            zrewarmturn: None,
+            snapunfolded: None,
+            snaplean: None,
             headscopies: None,
+            snapkept: None,
+            zbuycross: None,
             copiesfit: None,
             chainuncovered: None,
             formsoffbuilt: None,
@@ -3462,6 +3536,8 @@ impl Default for Policy {
             zstridestep: None,
             jobsmapped: false,
             jobsshort: false,
+            jobsheap: false,
+            jobspooled: false,
             zmemoslab: false,
             defer: false,
             firstfloor: false,
@@ -4572,6 +4648,48 @@ impl Supdb {
             Policy {
                 jobsmapped: true,
                 jobsshort: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose jobs' large per-key arrays come from the allocator,
+    /// the engine's shape before (`Options::jobs_mapped` off): the arenas
+    /// of the jobs' threads keep what the jobs held, a hundred megabytes
+    /// and more under a bound. `supdb-jobsheap`.
+    pub fn create_jobsheap(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                jobsheap: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose crossing is left to the land look
+    /// (`Options::zpages_buy_crosses` off): a store bought under the
+    /// look's line has its form files attached cold. `supdb-nobuycross`.
+    pub fn create_nobuycross(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zbuycross: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-jobsmapped` with the mappings kept in a pool between jobs
+    /// while the store has room, and the pool emptied and held off where
+    /// it reads short of memory (`Options::jobs_pooled`):
+    /// `supdb-jobspooled`.
+    pub fn create_jobspooled(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                jobsmapped: true,
+                jobspooled: true,
                 ..Policy::default()
             },
         )
@@ -8147,17 +8265,139 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with the partitions' heads copied at the controller's census
-    /// while the block cache holds the raw records' place
-    /// (`Options::heads_owned_beside_copies`): a partition a merge lands
-    /// after the grant has its heads in memory at the scans after the
-    /// burst, where the default reads them through a mapping the burst's
-    /// writes pushed out.
-    pub fn create_headscopies(path: &Path) -> Res<Supdb> {
+    /// `supdb` with the rewarm's look taken at every turn of the segment
+    /// work's loop (`Options::zpages_rewarm_every_turn` on): the scans
+    /// that end a quiet stretch have their cold form files asked for at
+    /// the next turn, not the controller's next step.
+    pub fn create_zrewarmturn(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                headscopies: Some(true),
+                zrewarmturn: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the rewarm's look at the controller's step alone, once
+    /// a census interval (`Options::zpages_rewarm_every_turn` off).
+    pub fn create_zrewarmtick(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zrewarmturn: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the snapshot's extension comparing each batch key with
+    /// the one before it for a fold (`Options::snapshot_extend_unfolded`
+    /// off).
+    pub fn create_snapfolded(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                snapunfolded: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the snapshot's build and extension as they were
+    /// (`Options::snapshot_build_lean` off).
+    pub fn create_snapfat(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                snaplean: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the snapshot's build and extension both as they were
+    /// (`Options::snapshot_build_lean` and
+    /// `Options::snapshot_extend_unfolded` off).
+    pub fn create_snapold(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                snaplean: Some(false),
+                snapunfolded: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the merge path's scan snapshot kept to the commit by
+    /// the upkeep thread while the writer's forms are given up
+    /// (`Options::forms_off_snapshot_kept`): the first scan after a burst
+    /// files the thread's trail, where the default sorts every unsealed
+    /// key.
+    pub fn create_snapkept(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                snapkept: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose selector makes the crossing at its first buy where
+    /// the land look has not by then (`Options::zpages_buy_crosses`): the
+    /// form files built ahead are asked back before they are attached,
+    /// where the default attaches them cold in a store bought under the
+    /// look's line.
+    pub fn create_zbuycross(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zbuycross: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-jobsmapped` with the crossing made at the buy
+    /// (`Options::zpages_buy_crosses`): `supdb-jobsmappedbuycross`.
+    pub fn create_jobsmapped_buycross(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                jobsmapped: true,
+                zbuycross: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-jobspooled` with the crossing made at the buy
+    /// (`Options::zpages_buy_crosses`): `supdb-jobspooledbuycross`.
+    pub fn create_jobspooled_buycross(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                jobsmapped: true,
+                jobspooled: true,
+                zbuycross: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the partitions' heads copied at the controller's census
+    /// by the model's word alone (`Options::heads_owned_beside_copies`
+    /// off): a partition a merge lands after the block cache was granted
+    /// the raw records' place keeps its heads in a mapping, which the
+    /// burst's writes push out and the scans after it read back a page a
+    /// fault.
+    pub fn create_headsmodel(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                headscopies: Some(false),
                 ..Policy::default()
             },
         )
@@ -10058,7 +10298,12 @@ impl Supdb {
             rewarmraw,
             rewarmrawscans,
             rewarmrawmaps,
+            zrewarmturn,
+            snapunfolded,
+            snaplean,
             headscopies,
+            snapkept,
+            zbuycross,
             copiesfit,
             chainuncovered,
             formsoffbuilt,
@@ -10249,6 +10494,8 @@ impl Supdb {
             zstridestep,
             jobsmapped,
             jobsshort,
+            jobsheap,
+            jobspooled,
             zmemoslab,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
@@ -10564,8 +10811,16 @@ impl Supdb {
                 .unwrap_or(supdb::Options::default().zpages_rewarm_raw_scans),
             zpages_rewarm_raw_maps: rewarmrawmaps
                 .unwrap_or(supdb::Options::default().zpages_rewarm_raw_maps),
+            zpages_rewarm_every_turn: zrewarmturn
+                .unwrap_or(supdb::Options::default().zpages_rewarm_every_turn),
+            snapshot_extend_unfolded: snapunfolded
+                .unwrap_or(supdb::Options::default().snapshot_extend_unfolded),
+            snapshot_build_lean: snaplean.unwrap_or(supdb::Options::default().snapshot_build_lean),
             heads_owned_beside_copies: headscopies
                 .unwrap_or(supdb::Options::default().heads_owned_beside_copies),
+            zpages_buy_crosses: zbuycross.unwrap_or(supdb::Options::default().zpages_buy_crosses),
+            forms_off_snapshot_kept: snapkept
+                .unwrap_or(supdb::Options::default().forms_off_snapshot_kept),
             scan_cache_copies_fit: copiesfit
                 .unwrap_or(supdb::Options::default().scan_cache_copies_fit),
             merge_chains_writes_uncovered: chainuncovered
@@ -10841,8 +11096,9 @@ impl Supdb {
                 .unwrap_or(supdb::Options::default().merge_quiet_any_gate),
             zpages_stride_step_direct: zstridestep
                 .unwrap_or(supdb::Options::default().zpages_stride_step_direct),
-            jobs_mapped: jobsmapped,
+            jobs_mapped: !jobsheap && (jobsmapped || supdb::Options::default().jobs_mapped),
             jobs_mapped_when_short: jobsshort,
+            jobs_pooled: jobspooled,
             zpages_memo_slab: zmemoslab,
             zpages_seek_ord: if zpages_heads {
                 true
@@ -11079,7 +11335,12 @@ impl Supdb {
             rewarmraw,
             rewarmrawscans,
             rewarmrawmaps,
+            zrewarmturn,
+            snapunfolded,
+            snaplean,
             headscopies,
+            snapkept,
+            zbuycross,
             copiesfit,
             chainuncovered,
             formsoffbuilt,
@@ -11270,6 +11531,8 @@ impl Supdb {
             zstridestep,
             jobsmapped,
             jobsshort,
+            jobsheap,
+            jobspooled,
             zmemoslab,
             ord_threads: Default::default(),
         })
@@ -11757,8 +12020,24 @@ impl Engine for Supdb {
                 "supdb-zmemoslab"
             };
         }
+        if self.jobsheap {
+            return "supdb-jobsheap";
+        }
         if self.jobsshort {
             return "supdb-jobsshort";
+        }
+        if self.jobspooled {
+            return if self.zbuycross == Some(true) {
+                "supdb-jobspooledbuycross"
+            } else {
+                "supdb-jobspooled"
+            };
+        }
+        if self.jobsmapped
+            && self.zbuycross == Some(true)
+            && self.zstride != Some(supdb::ZStride::Forced)
+        {
+            return "supdb-jobsmappedbuycross";
         }
         if self.jobsmapped {
             return if self.zstride == Some(supdb::ZStride::Forced) {
@@ -12699,8 +12978,32 @@ impl Engine for Supdb {
         if self.rewarmrawmaps == Some(false) {
             return "supdb-rewarmrawnomap";
         }
-        if self.headscopies == Some(true) {
-            return "supdb-headscopies";
+        if self.zrewarmturn == Some(true) {
+            return "supdb-zrewarmturn";
+        }
+        if self.zrewarmturn == Some(false) {
+            return "supdb-zrewarmtick";
+        }
+        if self.snaplean == Some(false) && self.snapunfolded == Some(false) {
+            return "supdb-snapold";
+        }
+        if self.snapunfolded == Some(false) {
+            return "supdb-snapfolded";
+        }
+        if self.snaplean == Some(false) {
+            return "supdb-snapfat";
+        }
+        if self.headscopies == Some(false) {
+            return "supdb-headsmodel";
+        }
+        if self.snapkept == Some(true) {
+            return "supdb-snapkept";
+        }
+        if self.zbuycross == Some(true) {
+            return "supdb-zbuycross";
+        }
+        if self.zbuycross == Some(false) {
+            return "supdb-nobuycross";
         }
         match (
             self.copiesfit == Some(false),
@@ -13032,6 +13335,7 @@ impl Engine for Supdb {
             ("snapshots_stood", db.snapshots_stood() as f64),
             ("snapshot_extends", db.snapshot_extends() as f64),
             ("snapshot_refreshes", db.snapshot_refreshes() as f64),
+            ("snapshots_kept", db.snapshots_kept() as f64),
             ("form_takes", db.form_takes() as f64),
             ("blk_by_reader", db.blocks_built().0 as f64),
             ("blk_by_engine", db.blocks_built().1 as f64),
@@ -13184,6 +13488,14 @@ impl Engine for Supdb {
             ("heads_disowned", db.heads_owned_counts().1 as f64),
             ("heads_owned_mb", (db.heads_owned_counts().2 >> 20) as f64),
             ("heads_beside_copies", db.heads_beside_copies() as f64),
+            // The jobs' pool, process-wide and ever (`Options::jobs_pooled`).
+            ("job_pool_takes", supdb::Db::job_pool_counts()[0] as f64),
+            ("job_pool_keeps", supdb::Db::job_pool_counts()[1] as f64),
+            ("job_pool_unmaps", supdb::Db::job_pool_counts()[2] as f64),
+            (
+                "job_pool_mb",
+                (supdb::Db::job_pool_counts()[3] >> 20) as f64,
+            ),
             ("form_heads_ahead", db.settle_ahead_asks()[0] as f64),
             ("table_lines_ahead", db.settle_ahead_asks()[1] as f64),
             // The writer's settles: see `Db::settle_density`.
@@ -13430,6 +13742,7 @@ impl Engine for Supdb {
             ("zpage_dropped_asks", z.dropped_asks as f64),
             ("zpage_job_end_drives", z.job_end_drives as f64),
             ("zpage_cross_raw_asks", z.cross_raw_asks as f64),
+            ("zpage_buy_crosses", z.buy_crosses as f64),
             ("zpage_raw_redrops", z.raw_redrops as f64),
             (
                 "zpage_raw_redrop_before_kb",
@@ -15234,7 +15547,16 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-norewarmraw"
         | "supdb-zrewarmrawscans"
         | "supdb-rewarmrawnomap"
-        | "supdb-headscopies"
+        | "supdb-zrewarmturn"
+        | "supdb-zrewarmtick"
+        | "supdb-snapfolded"
+        | "supdb-snapfat"
+        | "supdb-snapold"
+        | "supdb-headsmodel"
+        | "supdb-snapkept"
+        | "supdb-zbuycross"
+        | "supdb-jobsmappedbuycross"
+        | "supdb-jobspooledbuycross"
         | "supdb-nocopiesfit"
         | "supdb-chaincovered"
         | "supdb-nocopiesfitchain"
@@ -15366,6 +15688,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zmemoslab"
         | "supdb-zstrideallslab"
         | "supdb-jobsshort"
+        | "supdb-jobsheap"
+        | "supdb-nobuycross"
+        | "supdb-jobspooled"
         | "supdb-zslabjobs"
         | "supdb-zstrideallslabjobs"
         | "supdb-zdriveend"
@@ -16455,6 +16780,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zmemoslab" => supdb_arm(Supdb::create_zmemoslab, dir)?,
         "supdb-zstrideallslab" => supdb_arm(Supdb::create_zstride_all_slab, dir)?,
         "supdb-jobsshort" => supdb_arm(Supdb::create_jobsshort, dir)?,
+        "supdb-jobsheap" => supdb_arm(Supdb::create_jobsheap, dir)?,
+        "supdb-nobuycross" => supdb_arm(Supdb::create_nobuycross, dir)?,
+        "supdb-jobspooled" => supdb_arm(Supdb::create_jobspooled, dir)?,
         "supdb-zslabjobs" => supdb_arm(Supdb::create_zslabjobs, dir)?,
         "supdb-zstrideallslabjobs" => supdb_arm(Supdb::create_zstride_all_slab_jobs, dir)?,
         "supdb-zstridealldropagainjobs" => {
@@ -17208,7 +17536,16 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-norewarmraw" => supdb_arm(Supdb::create_norewarmraw, dir)?,
         "supdb-zrewarmrawscans" => supdb_arm(Supdb::create_zrewarmrawscans, dir)?,
         "supdb-rewarmrawnomap" => supdb_arm(Supdb::create_rewarmrawnomap, dir)?,
-        "supdb-headscopies" => supdb_arm(Supdb::create_headscopies, dir)?,
+        "supdb-zrewarmturn" => supdb_arm(Supdb::create_zrewarmturn, dir)?,
+        "supdb-zrewarmtick" => supdb_arm(Supdb::create_zrewarmtick, dir)?,
+        "supdb-snapfolded" => supdb_arm(Supdb::create_snapfolded, dir)?,
+        "supdb-snapfat" => supdb_arm(Supdb::create_snapfat, dir)?,
+        "supdb-snapold" => supdb_arm(Supdb::create_snapold, dir)?,
+        "supdb-headsmodel" => supdb_arm(Supdb::create_headsmodel, dir)?,
+        "supdb-snapkept" => supdb_arm(Supdb::create_snapkept, dir)?,
+        "supdb-zbuycross" => supdb_arm(Supdb::create_zbuycross, dir)?,
+        "supdb-jobsmappedbuycross" => supdb_arm(Supdb::create_jobsmapped_buycross, dir)?,
+        "supdb-jobspooledbuycross" => supdb_arm(Supdb::create_jobspooled_buycross, dir)?,
         "supdb-nocopiesfit" => supdb_arm(Supdb::create_nocopiesfit, dir)?,
         "supdb-chaincovered" => supdb_arm(Supdb::create_chaincovered, dir)?,
         "supdb-nocopiesfitchain" => supdb_arm(Supdb::create_nocopiesfitchain, dir)?,
@@ -19572,14 +19909,74 @@ mod tests {
                 assert!(
                     o.zpages_rewarm_raw && !o.zpages_rewarm_raw_maps && b.zpages_rewarm_raw_maps
                 );
-            }
-            {
-                let z = Supdb::create_headscopies(&dir("headscopies")).unwrap();
-                assert_eq!(z.name(), "supdb-headscopies");
+                for (arm, on) in [("zrewarmturn", true), ("zrewarmtick", false)] {
+                    let z = if on {
+                        Supdb::create_zrewarmturn(&dir(arm)).unwrap()
+                    } else {
+                        Supdb::create_zrewarmtick(&dir(arm)).unwrap()
+                    };
+                    assert_eq!(z.name(), format!("supdb-{arm}"));
+                    assert_eq!(z.features(), base.features());
+                    let o = z.db.as_ref().unwrap().options();
+                    assert_eq!(o.zpages_rewarm_every_turn, on, "{arm}");
+                }
+                assert!(b.snapshot_extend_unfolded && b.snapshot_build_lean);
+                let z = Supdb::create_snapfolded(&dir("snapfolded")).unwrap();
+                assert_eq!(z.name(), "supdb-snapfolded");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(o.heads_owned_beside_copies && !b.heads_owned_beside_copies);
+                assert!(!o.snapshot_extend_unfolded && o.snapshot_build_lean);
+                let z = Supdb::create_snapfat(&dir("snapfat")).unwrap();
+                assert_eq!(z.name(), "supdb-snapfat");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.snapshot_extend_unfolded && !o.snapshot_build_lean);
+                let z = Supdb::create_snapold(&dir("snapold")).unwrap();
+                assert_eq!(z.name(), "supdb-snapold");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.snapshot_extend_unfolded && !o.snapshot_build_lean);
+            }
+            {
+                let z = Supdb::create_headsmodel(&dir("headsmodel")).unwrap();
+                assert_eq!(z.name(), "supdb-headsmodel");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.heads_owned_beside_copies && b.heads_owned_beside_copies);
                 assert!(o.heads_owned && o.scan_cache_copies_fit);
+                let z = Supdb::create_snapkept(&dir("snapkept")).unwrap();
+                assert_eq!(z.name(), "supdb-snapkept");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.forms_off_snapshot_kept && !b.forms_off_snapshot_kept);
+                // The crossing made at the buy, alone and beside the jobs'
+                // mapped and pooled arrays.
+                assert!(b.zpages_buy_crosses && b.jobs_mapped);
+                let z = Supdb::create_nobuycross(&dir("nobuycross")).unwrap();
+                assert_eq!(z.name(), "supdb-nobuycross");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.zpages_buy_crosses && o.jobs_mapped && !o.jobs_pooled);
+                let z = Supdb::create_jobsheap(&dir("jobsheap")).unwrap();
+                assert_eq!(z.name(), "supdb-jobsheap");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_buy_crosses && !o.jobs_mapped && !o.jobs_pooled);
+                let z = Supdb::create_zbuycross(&dir("zbuycross")).unwrap();
+                assert_eq!(z.name(), "supdb-zbuycross");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_buy_crosses && o.jobs_mapped && !o.jobs_pooled);
+                let z = Supdb::create_jobsmapped_buycross(&dir("jobsmappedbuycross")).unwrap();
+                assert_eq!(z.name(), "supdb-jobsmappedbuycross");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_buy_crosses && o.jobs_mapped && !o.jobs_pooled);
+                let z = Supdb::create_jobspooled_buycross(&dir("jobspooledbuycross")).unwrap();
+                assert_eq!(z.name(), "supdb-jobspooledbuycross");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_buy_crosses && o.jobs_mapped && o.jobs_pooled);
             }
             {
                 let z = Supdb::create_nocopiesfit(&dir("nocopiesfit")).unwrap();
@@ -20035,7 +20432,7 @@ mod tests {
                 assert_eq!(z.name(), "supdb-zstridealldropagain");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_drop_again && !o.jobs_mapped && !b.jobs_mapped);
+                assert!(o.zpages_drop_again && o.jobs_mapped == b.jobs_mapped);
                 assert_eq!(seven(o), (Forced, true, true, true, true, true, true));
                 assert!(!o.zpages_convert_drops_output);
                 // A conversion's file dropped as it is written and asked
@@ -20196,13 +20593,15 @@ mod tests {
                 assert_eq!(z.name(), "supdb-zmemoslab");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_memo_slab && !o.jobs_mapped && two(o) == two(b));
+                assert!(o.zpages_memo_slab && o.jobs_mapped == b.jobs_mapped && two(o) == two(b));
                 assert_eq!(seven(o), seven(b));
                 let z = Supdb::create_zstride_all_slab(&dir("zstrideallslab")).unwrap();
                 assert_eq!(z.name(), "supdb-zstrideallslab");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_memo_slab && o.zpages_drop_again && !o.jobs_mapped);
+                assert!(
+                    o.zpages_memo_slab && o.zpages_drop_again && o.jobs_mapped == b.jobs_mapped
+                );
                 assert_eq!(seven(o), (Forced, true, true, true, true, true, true));
                 // The jobs' arrays mapped only while the store is short,
                 // alone and with the memos' slabs, on both arms.
@@ -20212,6 +20611,16 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.jobs_mapped && o.jobs_mapped_when_short && !o.zpages_memo_slab);
+                assert!(!o.jobs_pooled);
+                assert_eq!(seven(o), seven(b));
+                // The jobs' mapped arrays from the pool, on the default.
+                assert!(!b.jobs_pooled);
+                let z = Supdb::create_jobspooled(&dir("jobspooled")).unwrap();
+                assert_eq!(z.name(), "supdb-jobspooled");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.jobs_mapped && o.jobs_pooled && !o.jobs_mapped_when_short);
+                assert!(!o.zpages_memo_slab);
                 assert_eq!(seven(o), seven(b));
                 let z = Supdb::create_zslabjobs(&dir("zslabjobs")).unwrap();
                 assert_eq!(z.name(), "supdb-zslabjobs");

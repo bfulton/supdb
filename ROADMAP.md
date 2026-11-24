@@ -690,9 +690,16 @@ What an engine picker would hit, roughly in order.
     could not take back was 1,228-1,251 MiB of the 1,280, so that bound
     has some forty mebibytes in hand.
   - What is written unannounced: a seal's output, whose size is its
-    table's; an ordered run's file, which grows a commit at a time; a
-    form file built at a merge's finish; and a merge's own arrays. Each
-    reaches the room a reading late, as a merge's output did. A lever
+    table's; an ordered run's file, which grows a commit at a time; and
+    a form file built at a merge's finish. Each reaches the room a
+    reading late, as a merge's output did. A merge's own arrays, and a
+    seal's sort and its writer's, are the engine's mappings since the
+    merge of upstream's `59454e0` (`Options::jobs_mapped`, on), which the
+    room counts while they are mapped and not yet touched
+    (`zfile::unreclaimable_slack`, `blocks::mapped_bytes`): they reach it
+    as they are mapped, ahead of their writes. Whether that takes the
+    rise of the process's own memory between two readings, below, out of
+    the loads' peaks is not measured. A lever
     for one of them waits for a peak that names it, read on the group's
     memory by kind through the pass, kill or none. One came at ten
     million keys under 1.25 GiB at `b7a1177`, `supdb-cipherauto` in the

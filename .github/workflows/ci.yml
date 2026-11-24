@@ -44,8 +44,10 @@ jobs:
     #
     # The Linux runners are named by their image and not as `ubuntu-latest`:
     # that label moved to Ubuntu 26.04 between two runs of one afternoon,
-    # where `bench/scripts/libclang.sh` finds no libclang after installing
-    # it and `qemu-user-static` is no longer a package, and three jobs
+    # where `bench/scripts/libclang.sh` found no libclang after installing
+    # it (it wanted a -dev package's name for one then, and looked in the
+    # highest LLVM directory alone; it takes the image's own now) and
+    # `qemu-user-static` is no longer a package, and three jobs
     # failed in their set-up on a tree that had not changed. The image is
     # this workflow's to choose, as the ARM leg's already was; moving to a
     # newer one is a change made here, with the scripts it needs.
@@ -54,14 +56,22 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.runner }}
+    # Every job here has a limit, since one without runs to GitHub's six
+    # hours: `cross-arm` sat that long in its `apt-get` once, and the run
+    # stayed open until the limit cancelled it. Each is a few times its
+    # job's longest run on a hosted runner: this one takes twenty-five to
+    # thirty-five minutes, and fifty-five on a macOS runner three times
+    # slower than usual at RocksDB's build.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      # The comparators' build runs bindgen, which needs libclang; the script
-      # names it for this host and, on macOS, the rpath the build script
-      # needs to load it.
+      # The toolchain rust-toolchain.toml names, the one the local gate runs
+      # under; no workflow names a version or a channel of its own.
+      - name: The pinned toolchain
+        run: sh scripts/toolchain.sh
+      # The comparators' build runs bindgen, which loads libclang as
+      # RocksDB's build script runs; the script names this host's, and
+      # installs one only on a host that has none.
       - name: libclang, for bindgen
         run: sh bench/scripts/libclang.sh
       # FASTER is a comparator too, and not a crate: the script fetches its
@@ -69,11 +79,20 @@ jobs:
       # It does nothing off Linux x86-64, where there is no `faster` arm.
       - name: FASTER, for the `faster` arm
         run: sh bench/scripts/faster.sh
+      # Each line is `workspace -> target`, and the target is a path inside
+      # its workspace: `bench -> bench/target` named bench/bench/target,
+      # which is no directory, so the step saved a cache at every run with
+      # nothing of the suite's build in it and RocksDB was built from its
+      # sources in every job. The key carries nothing of the host's
+      # libclang, and needs nothing: it is loaded when RocksDB's build
+      # script runs (`bindgen-runtime`, bench/Cargo.toml), so no cached
+      # output names its directory. While the build script linked it, one
+      # did, and a restored build whose directory had gone failed there.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             . -> target
-            bench -> bench/target
+            bench -> target
       # `scripts/check.sh` is the single definition of what this project
       # checks, so a contributor running it locally runs exactly this.
       - name: Build, test and lint the engine and the suite
@@ -89,9 +108,13 @@ jobs:
     # work end to end. The row and the figures are published as artifacts;
     # committing a row is a person's decision.
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain rust-toolchain.toml names, the one the local gate runs
+      # under; no workflow names a version or a channel of its own.
+      - name: The pinned toolchain
+        run: sh scripts/toolchain.sh
       - name: libclang, for bindgen
         run: sh bench/scripts/libclang.sh
       # FASTER is a comparator too, and not a crate: the script fetches its
@@ -99,9 +122,23 @@ jobs:
       # It does nothing off Linux x86-64, where there is no `faster` arm.
       - name: FASTER, for the `faster` arm
         run: sh bench/scripts/faster.sh
+      # `workspace -> target`, the target a path inside its workspace: see
+      # the `test` job. The key is shared.
+      # Every job that builds the suite's release binary and nothing else
+      # builds the same dependencies, and under the action's default, a key
+      # by the job's name, each kept a copy of them: one round of the
+      # workflows that run by hand saved that build four times, the
+      # repository passed GitHub's ten gigabytes, and what GitHub evicted,
+      # by last read, included two caches a pull request was using. Under
+      # one key the first of those jobs to run saves the cache and the rest
+      # restore it. A job that restores a key whole saves nothing, so a job
+      # that builds anything beside the binary keeps a key of its own, as
+      # `rocksdb-alloc` does, or what it alone builds would never be
+      # cached. `bench/scripts/workflows.sh` holds both.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: bench -> bench/target
+          workspaces: bench -> target
+          shared-key: bench
       - name: One quick-scale run of every arm
         env:
           ARMS: ${{ inputs.arms }}
@@ -128,7 +165,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain rust-toolchain.toml names, the one the local gate runs
+      # under; no workflow names a version or a channel of its own.
+      - name: The pinned toolchain
+        run: sh scripts/toolchain.sh
       - name: libclang, for bindgen
         run: sh bench/scripts/libclang.sh
       # FASTER is a comparator too, and not a crate: the suite's build needs
@@ -136,10 +176,16 @@ jobs:
       - name: FASTER, for the `faster` arm
         run: sh bench/scripts/faster.sh
       - name: valgrind
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq valgrind
+        run: sh scripts/apt.sh valgrind
+      # `workspace -> target`, the target a path inside its workspace: see
+      # the `test` job. The key every job that builds the suite's binary
+      # shares (see the `quick` job): the probes build on the binary's
+      # dependencies, RocksDB's among them, which the key restores, and
+      # what they build beside it is the job's own each run.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: bench -> bench/target
+          workspaces: bench -> target
+          shared-key: bench
       # The event's values, and nothing decided here: scripts/base.sh takes
       # the base from them, as it does on a contributor's clone.
       - name: The plain store's cost, by function
@@ -155,6 +201,7 @@ jobs:
     # test job see one tree; this job sees the base as well, so it needs
     # the whole history.
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -168,14 +215,18 @@ jobs:
   cross-arm:
     # Proves the ARM paths build and pass before any ARM hardware is involved.
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
+      # The toolchain rust-toolchain.toml names, the one the local gate runs
+      # under; no workflow names a version or a channel of its own.
+      - name: The pinned toolchain
+        run: sh scripts/toolchain.sh aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
+      # The target's C library is named: the compiler's package only
+      # recommends it, and scripts/apt.sh installs no recommended extras.
       - name: Cross toolchain
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu qemu-user-static
+        run: sh scripts/apt.sh gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user-static
       # The linker, the emulator and `--cfg supdb_emulated` are the
       # group's (scripts/check.sh cross-arm), not the repository's:
       # `.cargo/config.toml` set the first two for the aarch64 target, which
@@ -192,11 +243,15 @@ jobs:
     # compiles: the arms' tests, and every arm of the encrypted roster run
     # once.
     runs-on: ubuntu-24.04
+    # Two builds of the comparators, the suite's and the encrypted one's,
+    # from a cold cache: a test leg's RocksDB build twice over.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # The toolchain rust-toolchain.toml names, the one the local gate runs
+      # under; no workflow names a version or a channel of its own.
+      - name: The pinned toolchain
+        run: sh scripts/toolchain.sh
       - name: libclang, for bindgen
         run: sh bench/scripts/libclang.sh
       # FASTER is a comparator too, and not a crate: the suite's build needs
@@ -204,10 +259,12 @@ jobs:
       - name: FASTER, for the `faster` arm
         run: sh bench/scripts/faster.sh
       - name: OpenSSL's headers, for the comparators' ciphers
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libssl-dev
+        run: sh scripts/apt.sh libssl-dev
+      # The encrypted build's own target directory, under a key of its own:
+      # nothing else builds it.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: bench -> bench/target-enc
+          workspaces: bench -> target-enc
       - name: The encrypted comparators, built, tested and run once
         run: sh scripts/check.sh enc
 
@@ -218,9 +275,13 @@ jobs:
     # it, and runs the half of tests/dirkey.rs that reads what the device
     # holds. As the runner's user, which is who hands the kernel the key.
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain rust-toolchain.toml names, the one the local gate runs
+      # under; no workflow names a version or a channel of its own.
+      - name: The pinned toolchain
+        run: sh scripts/toolchain.sh
       - uses: Swatinem/rust-cache@v2
       - name: A filesystem that can encrypt
         run: sudo sh scripts/fscrypt.sh up /mnt/supdb-fscrypt "$(id -u):$(id -g)" >> "$GITHUB_ENV"
@@ -234,11 +295,13 @@ jobs:
     # symbol: supdb_host_read") and no CI run noticed, because no CI run had
     # ever built it.
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
+      # The toolchain rust-toolchain.toml names, the one the local gate runs
+      # under; no workflow names a version or a channel of its own.
+      - name: The pinned toolchain
+        run: sh scripts/toolchain.sh
       - uses: Swatinem/rust-cache@v2
       # The group also runs web/crypt.test.mjs under the runner's own Node:
       # the browser's decrypter against the envelope the Rust tests hold the

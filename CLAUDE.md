@@ -140,7 +140,7 @@ owner's:
 | `src/crypt.rs` | a finished file published encrypted and read through the `Bytes` seam: the envelope, the hook a caller's cipher fits (`Aead`), `Encrypted` as a byte source over the stored object and `encrypt` as its writer, with no cipher in the crate; compiles for wasm and nothing in the module links it -- the module's own docs, `examples/crypt.rs` for the adapter, and `web/crypt.mjs` for the browser's half |
 | `src/wasmapi.rs` | the C ABI the browser calls; hand-written because the module's size is budgeted |
 | `web/` | the browser reader, its byte sources, the fetcher that decrypts, the Worker it runs in, and the size control -- `web/README.md` |
-| `tests/` | the engine's contract, the read paths held to each other, the format's damage cases, a checkpoint held to the store it was made of, a crashed store's runs held to its log; `tests/common` holds what more than one file needs, and `tests/data` the envelope on record |
+| `tests/` | the engine's contract, the read paths held to each other, the format's damage cases, a checkpoint held to the store it was made of, a crashed store's runs held to its log, the store's lock beside a forked child; `tests/common` holds what more than one file needs, and `tests/data` the envelope on record |
 | `bench/` | the benchmark suite: its own cargo workspace, the arms, the runner, the gate and the figures -- `bench/DESIGN.md` |
 | `tests/source.rs` | the gates over the tree's own text, over a lexer in `tests/lex/`: the wall between the forms and the encryption modules (`tests/data/couplings.txt`), what the door's clippy run cannot see (`tests/data/door.txt`, `door-libc.txt`), every public entry point of `Reader`, `Db` and `Blob` to a cost probe or a reason (`tests/data/cost-entries.txt`), the seal's tokens to the calls they are made for, and every workflow under `.github/workflows` to the groups of `scripts/check.sh` |
 | `scripts/door/` | the door by symbol: a clippy run of its own over the library with the barred calls in `clippy.toml` (`run.sh`, in the `lint` group), and its red input (`red.sh`) |
@@ -169,16 +169,42 @@ exempt from the format gate, and everything holds to `-D warnings`.
 
 `sh scripts/deps.sh` readies a host for every group, installing only
 what is missing and ending in an `all deps ready` line to gate on; run it
-first in a fresh container, which has no wasm target and libclang only as
-versioned files. It names libclang through `bench/scripts/libclang.sh`,
-the one definition CI uses, and keeps no variable. clang-sys's build
-script declares nothing to rerun on, so the directory it found libclang
-in at the first build stays in its cached output for good: a
-`LIBCLANG_PATH` pointed by hand at a symlink in a scratch directory
-built the comparators once, and with the directory gone the next build
-failed at RocksDB's build script, `unable to find library -lclang`.
-`deps.sh` cleans an output that names a directory with no libclang in
-it.
+first in a fresh container, which has the stable it was made with and not
+the toolchain `rust-toolchain.toml` names, and libclang only as versioned
+files. That is enough for the suite's build, which loads libclang when
+RocksDB's build script runs (`bindgen-runtime`, `bench/Cargo.toml`):
+`bench/scripts/libclang.sh`, the one definition CI uses, checks that the
+host has one with clang's own headers beside it and installs a package
+only where it has not, and no variable is kept. The build script linked
+libclang for as long as the suite had turned the `rocksdb` crate's
+defaults off for its compression libraries, the run-time load being one
+of them: the linker wants the unversioned `libclang.so` a -dev package
+ships, so every CI job and every fresh container installed one with apt,
+twenty seconds on a good day and five minutes a job on a slow mirror, and
+clang-sys kept the directory it had first found it in for as long as its
+output was cached, so that a `LIBCLANG_PATH` pointed by hand at a symlink
+in a scratch directory built the comparators once and, the directory
+gone, failed the next build at RocksDB's build script, `unable to find
+library -lclang`. A dependency's defaults turned off for one of them are
+read for the rest: the one dropped here was the reason a host needed
+nothing.
+
+What a host still lacks is installed by `scripts/apt.sh`, the one
+definition of an install for `scripts/deps.sh`, the suite's set-up
+scripts and the workflows: with the package lists the host has, and
+fresh ones only where that fails. Every caller had fetched the lists
+first, thirteen megabytes on a hosted x64 runner ahead of the two thirds
+of a megabyte the `faster` arm's three libraries are, and on a day the
+mirror was slow that step ran eleven seconds in one x64 job and three to
+four minutes in others started beside it, and held one for half an hour
+until the run was cancelled, with nothing in its log: the scripts sent
+apt's output nowhere. The helper says in one line which try installed
+and in how many seconds, and prints what apt said where an install
+fails; the lists are not all of a slow mirror's price, and `cross-arm`'s
+sixty megabytes of cross compiler took eleven minutes in one run and
+twelve seconds in the next. It installs no recommended extras, so a
+package a job needs and another only recommends is named, as `cross-arm`
+names the target's C library.
 
 `sh scripts/check.sh` runs every group -- build, test, stride, lint, wasm, bench,
 lists -- and CI calls the same script with the same names, so a green run
@@ -246,20 +272,44 @@ timing run needs the machine to itself, and CI gives it a job of its own. The
 check run in the `bench` group (`sh bench/scripts/check.sh lint` by
 itself, a minute), and a commit that touched `bench/` alone went out
 behind a green `lint` with a doubled `#[allow]` that clippy refuses.
-And a green `lint` here is the runner's only under the runner's
-toolchain: CI installs the stable of the day and a container keeps the
-one it was made with, which `scripts/deps.sh` leaves as it finds it. Two
-`chunks_exact` calls over a constant passed here under 1.97 and failed on
-every hosted leg under 1.100, whose clippy asks for `as_chunks`, and
-nothing had said so, CI running on a pull request and none having run it
-over the branch since they were written. `rustup update stable` before
-the gate, or the group under the runner's version
-(`RUSTUP_TOOLCHAIN=1.100.0 sh scripts/check.sh lint`). The macOS leg's
-lint is another the gate here does not run: three helpers in
-`tests/zpages.rs` that only Linux's tests call were dead code there. It
-type-checks without a cross toolchain, once
-`rustup target add aarch64-apple-darwin`: `cargo clippy --release
---all-targets --target aarch64-apple-darwin -- -D warnings`.
+And a green `lint` here is the runner's because the toolchain is one:
+`rust-toolchain.toml` names the version, with clippy, rustfmt and the
+wasm and macOS targets, `scripts/toolchain.sh` installs what the file
+names and holds the active rustc to it, and `scripts/deps.sh` and every
+workflow call that script, so no workflow names a channel. Before the pin
+CI installed the stable of the day and a container kept the one it was
+made with: two `chunks_exact` calls over a constant passed here under
+1.97 and failed on every hosted leg under 1.100, whose clippy asks for
+`as_chunks`, and nothing had said so, CI running on a pull request and
+none having run it over the branch since they were written. Moving the
+version is a change to that one file, with whatever the new clippy asks
+for fixed in the same commit and the whole gate run under it; the
+manifests' `rust-version` is the oldest toolchain the crates build with
+and does not move with it. A `RUSTUP_TOOLCHAIN` in the environment
+outranks the file, which the script refuses and a bare `cargo` does not.
+The lint group type-checks the engine for the macOS target too (`cargo
+clippy --release --lib --bins --target aarch64-apple-darwin -- -D
+warnings`, which needs the target's rust-std and no cross toolchain):
+three helpers in `tests/zpages.rs` that only Linux's tests call were dead
+code there, and no lint on Linux could say so. The suite has no such
+leg: its comparators compile C in their build scripts, the first of them
+to run (`lz4-sys`'s) hands the host's `cc` `-arch arm64`, and a Linux
+`cc` refuses it, so the suite's would take a cross compiler. On this
+branch the engine's tests and examples are in the same case: their
+cipher (`ring`, a dev-dependency) compiles C and assembly for the target
+in its build script, and clang here, given the target, wants Apple's
+headers (`TargetConditionals.h`, then the C library's), so the check from
+a Linux host is of the library and its binaries, and every target is
+linted on the macOS leg of CI, where the host is the target. Its first
+run here found the library itself not compiling for macOS: two of the
+cache's advices under a cipher (`posix_fadvise` and `MADV_POPULATE_READ`,
+in `pager.rs`) were Linux's alone with no guard, from two commits that no
+macOS build had seen, CI having run on no pull request of this branch.
+They are behind `cfg(target_os = "linux")` now, nothing elsewhere, where
+no store under a cipher is made (`pager::memfile`). What is left
+for the hosted runners alone to show is timing on their hardware and the
+tests run, not only type-checked, on ARM and macOS.
+
 The `cross-arm` group died in two runs of five with "QEMU internal
 SIGSEGV" and no test failed, and the first reading put it on the
 tests added since the last green run. It was the shell's
@@ -284,6 +334,16 @@ filter and the group ran no test and exited 0, so the case holds its run
 to `0 filtered out`. A fix that rests on an input is held where the input
 can be undone, and a group's verdict by exit status is held to the count
 of what it ran.
+
+A hosted job's log cannot be read while the job runs, so one that is
+overdue is read by its groups once it ends before it is called anything:
+the macOS leg ran fifty-five minutes where it had run twenty-five, was
+taken for a hang in the fork tests that were new to it, and had spent the
+excess in RocksDB's two builds, the same sources on the same image at
+three times their time, with the tests a quarter slower beside them. A
+runner is that much slower some days. Every job of `ci` has a
+`timeout-minutes` a few times its longest run, since a job without one
+runs to GitHub's six hours, as `cross-arm` did once inside its `apt-get`.
 
 The forms and the encryption are kept apart by two gates, so that a change
 to a form needs no change under the cipher and one that would be wrong
@@ -413,8 +473,31 @@ wrapped, passed every check green, and panicked in the first debug build
 that reached it; the tests now run under `profile.checked`, the release
 profile with both on, and the wasm module and the suite's binaries keep the
 release profile because the checks cost code size there and time in a
-measurement. A second definition of "the checks" is how the next one of
-those starts.
+measurement. The workflows' cache step named the suite's target directory
+as `bench -> bench/target`, which `rust-cache` reads as bench/bench/target,
+a path inside the workspace: no such directory, so for as long as the
+suite has been in CI the step restored nothing, saved a cache with none of
+the suite's build in it, and reported both done, while every job built
+RocksDB from its sources twice, half of a test leg's time. It was found
+in the step's own log, which prints the directories it caches, on the
+day somebody read one. `bench/scripts/workflows.sh` holds a cache's
+target to a workspace's own now. A cached build names nothing of the
+host's libclang, which is loaded as RocksDB's build script runs, so the
+key carries nothing of it.
+Once the step cached the build, the build's size was the next thing
+nobody had read: the action keys a cache by its job's name, so every job
+that builds the suite's release binary kept a copy of the same
+dependencies, and one round of the workflows that run by hand saved that
+build four times over, took the repository past GitHub's ten gigabytes,
+and had two caches a pull request was using evicted, since GitHub evicts
+by last read whoever's the cache is. The jobs that build that binary and
+nothing else share one key now (`shared-key: bench`), which the same
+script holds them to and holds every other job off, since a job that
+restores a key whole saves nothing and what it alone builds would never
+be cached under it; and `pr-caches.yml` deletes a pull request's caches
+at its close, which no other pull request can read and which counted
+against the limit for a week after. A
+second definition of "the checks" is how the next one of those starts.
 
 A change to an engine default lands only once the suite has read it
 better (the owner's rule: a default changes after benchmarks confirm it,
@@ -953,7 +1036,33 @@ zero: the first counts the merge's reads as the pass's, and the second
 is blind to a fault on a page the cache holds and has not read yet,
 which the kernel counts as minor. Read a thread's
 passes per rep there before reading its cell: a thread that ran in
-two reps of five made a cell that read neither shape.
+two reps of five made a cell that read neither shape. The `lagops` line
+carries the machine's TLB shootdowns and function-call interrupts over
+the pass too (`tlb`, `cal`, from `/proc/interrupts`), what other
+threads' unmaps cost the scanning thread and no fault count shows. Three
+probes of a lag point stand beside them, none of them a row's.
+`SUPDB_LAG_REPEAT=1` makes a point's same scans again straight after its
+pass (`lagrepeat`): a pass slow by what its scans were first to touch
+repeats fast, and one slow by its walk repeats as slow.
+`SUPDB_LAG_SQUEEZE_MB=N` reclaims that much of the pass's group between
+the drain and the settle, the cold start a load under pressure leaves,
+made in every rep instead of the reps the host chose. And
+`SUPDB_LAG_TOUCH=settle|all` reads every resident page of the store's
+files before the first point's pass, or every point's, which takes the
+first touches of read-back pages out of the pass: a page the cache
+dropped and the kernel read back is resident, and mapped once the
+settle's rewarm has been over it (`Options::zpages_rewarm_raw_maps`),
+and its first touch still costs 0.3 to 1.5 µs below the guest, by the
+machine's state (`bench/examples/firsttouch.rs`). Squeezed by 300 MB at
+three million keys under 1 GiB, the clean store's pass read 8.2-11.9 ms
+and 8.4-9.1 with the touch (`SUPDB_LAG_SQUEEZE_MB=300 SUPDB_LAG_REPEAT=1
+SUPDB_SCAN_OPS=1 bench ab --arms supdb,supdb --size 3000000 --bound
+1073741824 --passes load,lag --reps 2 --ops-div 10`, and with
+`SUPDB_LAG_TOUCH=settle`, at `8666eb9`), the passes after it the same
+either way: the ceiling of a settle that touched what it asked back, on
+a pass won twice over, and it is not built. The sweep draws the same
+scan keys at every point, so a point's pass reads the records the
+points before it read (`bench/CLAUDE.md`, a bound under a bound).
 
 The threaded scan passes have a counters line of their own
 (`SUPDB_SCAN_COUNTERS=1`, a `scancounters` line a pass, before the mixes
@@ -3224,8 +3333,10 @@ landing; and the count of seals
 count of zero is one whose landings the state shows. A store is held by one open at a time, under an exclusive `flock` of
 its `LOCK` taken before the open reads its directory -- an open sweeps the
 segments its manifest does not name, which beside a live store are the
-seals and merges in flight -- and given up last at the close; a test that
-emulates a crash calls `Db::crash`, which gives the lock up as a dead
+seals and merges in flight -- and given up last at the close, by an
+unlock and not by the descriptor's close, since a child the process forked
+holds a copy of the descriptor and the lock with it (`StoreLock`); a test
+that emulates a crash calls `Db::crash`, which gives the lock up as a dead
 process's is given up, since a `mem::forget` keeps it and the reopen is
 refused as a second open. A crash between any
 two of those leaves either a WAL that replays the whole memtable, with a
@@ -4670,15 +4781,41 @@ merge, and sat out its ten seconds: one run in 240 beside seven other
 processes, the first run on a hosted runner, and every run with the wait
 made 300 ms late. The wait reads the merges landed since the seal beside
 the one in flight (`wait_for_merge`), which a merge that came and went
-satisfies as one caught does. The
+satisfies as one caught does. And as a clock: the hot-raw policy gives
+an ask for a partition's pages two seconds of the store's clock and
+drops it where under half of them have come when the wait is out, and
+its tests move an injected clock a fifth of a second a look, so ten
+looks ran through the whole wait in the tens of milliseconds they take
+while the kernel read the pages in its own time. On a hosted ARM runner
+the read lost once, on a re-run of a commit that had passed there: the
+ask was dropped, eighteen looks and no release, and a test of the
+release failed with the engine right. Each look waits first for the
+kernel's count of what the policy asked for (`Db::zpage_hot_asks_in`,
+over the asks the last look left in flight, which the look says on
+their partitions, `Maint::z_hot_asks_say`), and the test holds the race
+wide: the asked pages put out of the cache and read back a third of a
+second on, which looks that do not wait failed ten runs of ten, no
+release made, and looks that wait none of ten. The word of an ask was
+first stored at each ask and cleared at each end of one, and a mutant
+without one of the clears passed: a look ends an ask in more places than
+were listed, a partition merged or held by a job among them, and a word
+left standing would have every later look wait on pages nobody had asked
+for, the raw records of a partition whose form is installed over them
+again among them, which the install drops. It is written from the
+policy's own lists after every look now, one site. The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
-thing it bets against gets faster; a mutant's kill is read again once a
-race under the killing test is found, since the race kills mutants too;
-a state the test needs only to have happened is waited for by the count
-it leaves behind, never by catching it; and a test that passes is read
-for the path that passed it, since a fallback that does the same work
-passes it too.
+thing it bets against gets faster; a state the test needs only to have
+happened is waited for by the count it leaves behind, never by catching
+it; a mutant's kill is read again once a race under the killing test is
+found, since the race kills mutants too; a test that passes is read for
+the path that passed it, since a fallback that does the same work
+passes it too; an injected clock moves the engine's side of a wait
+alone, so whatever the wait is for that the kernel does in its own time
+is waited for before the clock is moved; and a copy of a state kept for
+a reader is written from the state at one place, since a copy kept in
+step at every site that changes the state is wrong at the site nobody
+listed.
 
 **A test whose answer was a function of the clock, or of a thread's
 turn.** The superblock records the second a segment finished in, in each
@@ -4699,7 +4836,16 @@ upkeep, which lends the writer's tables to the thread: a counter read takes
 the upkeep home, waiting for a pass in flight and taking back a commit's
 batch the pass has not begun, so the count was of tables nothing had been
 filed into, one run in thirty; the test runs the commit's own fill inline,
-as its siblings that count what a commit filed already did. The rule is the
+as its siblings that count what a commit filed already did. It came again
+as walks counted store against store: the test of the bounds walk by the
+heads (`Options::bounds_by_heads`) holds what one store's walks placed and
+read to the records the other's read, and near reads one of each store's
+two walks was the thread's, the snapshot's after the round's commit,
+which the seal takes the upkeep back ahead of where the thread has not
+begun it -- two walks in one store and one in the other, once on a
+hosted x64 runner and one run in forty beside seven others, with the
+counts at each stage printed to say whose walk was missing, and none of
+two hundred and forty with the commit's fill inline. The rule is the
 one above, applied to two more states a test cannot see it needs: the
 second a store was finished in, and which side of a hand-off a counter is
 read from. A flake whose trigger is a phase is reproduced by choosing the
@@ -5818,10 +5964,24 @@ opened again inside that window was refused as open elsewhere, the
 child's copy holding the lock the close had given up. Once on a hosted
 runner; with the child held 30 ms before its exec, two runs of the binary
 in eight, the same test at the same line; none of thirty without the
-oracle. The tests there hold a lock for read while they open stores and
-the oracle spawns under it for write (`no_fork`). The engine's own answer
-to a caller that forks is the same refusal, for as long as a child takes
-to reach its exec. And it came back as a claim. The cache of a store
+oracle. The tests there were kept apart from the oracle's spawns by a lock of
+their own for a while, and the engine answered a caller that forks with
+the same refusal for as long as the child took to reach its exec, or for
+the child's life where it never does: a `fork` with no exec, which is
+what Python's `multiprocessing` makes of a process holding a store
+through a binding. The close unlocks the `LOCK` now, which gives it up
+for every copy of the descriptor at once, where closing the descriptor
+gave it up only with the last copy (`StoreLock`'s `Drop`). With the
+tests' lock taken out and the child held 30 ms before its exec, the
+binary failed nine runs of thirty before the unlock, at the same test and
+line, and none of sixty with it, nor any of twelve with the child held
+300 ms; the tests' lock stays out, since it would hide the
+close's going back, and `tests/lock.rs` builds the window on purpose, the
+child stopped in `pre_exec` while the store is closed and opened. The
+unlock is the taking process's alone, by its pid: it reaches every copy,
+so a forked child that dropped its copy of a `Db` would give up its
+parent's lock with the parent's store still open, which the unit test
+beside the type forks to hold. And it came back as a claim. The cache of a store
 under a cipher gives way, between two readings of its room, to what the
 process's large buffers have mapped and not yet touched
 (`pager::Room::claimed`), a count of every store in the process; the
@@ -9445,6 +9605,280 @@ count in a function the change does not run is bisected before it is
 read -- by commit, then by hunk, a build with each hunk out -- since the
 listing says what moved and only the builds say what moved it.
 
+**A reservation in a budget's arithmetic, read as pages the kernel would
+keep; and a model that took its tenant's bytes for a misfit.** The first
+bounded row taken with the cache in the raw records' place read the cell
+it was built for, the pass after the lag sweep's full rewrite at three
+million keys under 1 GiB, at 0.52x of LMDB: two reps of three at 57-70 ms
+where the pairings of the fix had read 14-27 in eleven reps of twelve.
+The row said what kind of thing it was before any trace. Its per-rep
+quantities put 146-183 major faults on the scanning thread in the slow
+reps and one in the fast, at 220-340 µs a read behind 50-60 MB that other
+threads read; and the arm that advises nothing (`supdb-noadvice`), whose
+every fault brings a readahead window, took none in three reps of three
+and read the cell at 1.6-2x. Traced in the row's shape (`perf record -e
+major-faults -c 1 -d` over `bench ab --arms supdb,supdb --size 3000000
+--bound 1073741824 --reps 3 --ops-div 10` under `SUPDB_LAG_MARK` and
+`SUPDB_ZPAGES_TRACE`, at `b2d0dfc`), every major fault of the scanning
+thread in six passes but one was `Reader::scan_seek` on the ordered index
+of one partition a merge had landed a second and a half before the pass,
+and the upkeep thread took twenty to seventy on each index landed in the
+burst, a second or so after its landing. The place the cache is granted
+is the budget "less each unserved partition's ordered index, which a
+scan's start seeks whatever holds its blocks": bytes left for the index
+in an arithmetic, and no page held by it. What holds them is the heads'
+copy (`Options::heads_owned`), and at the census a copy is made only
+while the controller's model says the raw form fits, a misfit there being
+the stretch before a purchase. The model's budget is the limit less the
+process's anonymous memory: the grant put 265 MB of copies into that
+memory, the records they stand in for stayed in the populations the
+budget is held against, and the model read 0.39-0.43 faults a read from
+the third second of the burst on, under a budget of 262-276 MB against
+records of 372, of a store nothing would be bought for, the grant
+standing only far from the point reads whose faults buy a form. It is the
+double count of the room that reserved the thing its tenant replaces,
+fixed there for the cache's own budget and left standing in the next
+reader of the same budget. Every partition landed after the grant kept
+its heads in a mapping, eight megabytes of them at the pass. A grant
+standing reads as the store left raw now
+(`Options::heads_owned_beside_copies`; `supdb-headsmodel` is the model's
+word alone). Paired at `15178d9` with the arm as it was then named
+(`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh supdb-headscopies supdb
+3000000 --bound 1073741824 --reps 8 --ops-div 10 --passes load,lag`, and
+the row's whole order at four reps): seven copies a sweep made for the
+grant alone, the scanning thread's major faults one at most in
+twenty-four passes where the model's word left passes of 63 to 190 in
+four of thirty-six, and the lag-only pass 16.5 ms against 22 at the
+median;
+under 1.25 GiB at that rung and at ten million keys under either bound no
+grant is made and the count is nothing. The pairings had not shown the
+row's two reps in three: the heavy shape was a rep in eight to twelve of
+theirs, at a hundred microseconds a fault where the row's took two to
+three hundred, and which index's pages the kernel takes just before a
+pass is the host's. The same trace named two costs of the burst that are
+not fixed: the upkeep thread took 8,000-46,000 major faults a burst
+building copies from raw records the cache had let go (`Blob::scan_at_in`
+under `BuildCtx`, its copies, `prefetch_ranks`), the burst 6.9 s at the
+first count and 9.3 at the second, and the controller's sampler
+2,800-4,300 more, sampling at every landing for a purchase no read was
+near to make. The rules: bytes a budget's arithmetic leaves for a
+structure are a claim about the kernel, held to the structure's
+residency at the pass that reads it (`scripts/resident.py`) or made true
+by holding the pages; when a double count is found in one reader of a
+quantity, every other reader of it is read the same day -- the model,
+the builds' line and the form's room all read the budget the cache had
+just been found charged twice in; a row's per-rep quantities and its
+sibling arms are read before a trace is cut, since the arm that differs
+in one option and does not show the shape names the mechanism's kind;
+and a fix read in pairings is the row's only once the row's own harness
+has taken it, the rate of a shape the kernel's timing makes being the
+sitting's.
+
+**A cost taken off the reader's path, and paid back by the reader in
+pages.** At ten million keys the writer gives its block forms up for the
+merge path, the commit's maintenance then does nothing, and the first
+scan after a burst sorts every unsealed key itself: by the sweep's own
+phase timers 16-22 ms of the pass after the one-percent burst, 45-115
+after the ten-percent and 42-118 after the full rewrite, a tenth to a
+fifth of each divided pass under either bound, while the upkeep thread
+made nine hundred passes in 1.3 ms. So the maintenance was given the
+scan's preamble to do at each commit (`Options::forms_off_snapshot_kept`,
+`supdb-snapkept`), on a thread that had nothing else to do, with seven
+mutants failing its test and 460 seeds of the fuzz clean. Its counter
+fired 3,700 times a sweep, the scan's snapshot phase read 2-4 ms, 5-18
+and 0.5-8, and no pass was faster. Under 1 GiB the pass after the full
+rewrite read 0.82x and 0.84x, and under 1.25 GiB 0.62x and 0.44x, the
+ten-percent burst 0.87x and 0.89x there (`SUPDB_LAG_COUNTERS=1
+bench/scripts/pair.sh supdb-snapkept supdb 10000000 --bound 1073741824
+--reps 3 --ops-div 10 --passes load,lag`, and under 1342177280, at
+`8876f01`). A snapshot does not stand across a freeze, so the
+maintenance built one from every unsealed key at each: 173 builds and
+120 carried forward in a sweep where the scans make three, fourteen
+seconds of the thread over a rewrite of twenty-eight. And what those
+builds freed stayed the process's: 70-80 MB more anonymous memory at the
+pass, which under 1 GiB was a quarter more major faults on the scanning
+thread, and under 1.25 GiB took a store that had fitted, thirteen faults
+a pass, to 4,400. Off, and the arm stands as the refutation. The rules:
+a lever that moves work off a path is priced under a bound by the
+anonymous memory the work leaves, read at the pass (`lagmem`) beside the
+phase it saved, since at the edge of fitting a megabyte the process
+keeps is a megabyte of the store read from the device; work moved to a
+thread "that is idle anyway" is counted by the events it will run at --
+a build a freeze here, 173 for the scans' three -- before it is called
+free; and a structure that is rebuilt whole when its base changes is not
+kept current by rebuilding it more often. What the refutation named is
+the lever: the same sweep with the allocator told to map every
+allocation of 128 KB or more (`supdb-mmapthr`, which is the host's
+policy and no shape of the engine's) held 110-150 MB less at every
+point, took the scanning thread's faults from 4,300 to 460 after the
+ten-percent burst and from 10,200 to 4,300 after the full rewrite, and
+read that pass 1.22x in both orders.
+
+**Two lines for one decision, and the step between them that nobody
+swapped at.** The crossing -- the look that turns the partitions built
+ahead into what an install needs, their records dropped and their form
+files asked back (`Maint::z_cross`) -- runs where the land look's model
+reads the store past the selector's line to enter, and that look prices
+the line as the selector does before it holds any reading: by the priors,
+0.133 faults a read. The selector buys by the line as it stands once a
+reading has priced the form, and a reading over stride files prices it at
+the floor, 0.033. A store whose model sits between the two is bought under
+the look's line: the buy attaches every file, the look crosses a tick
+later with the reading's costs in hand, and a crossing swaps only
+partitions with no form attached, so it finds none. At ten million keys
+under 1.25 GiB the default's model reads 0.133 to 0.138 at the load's end
+and the look crosses first; with thirty megabytes less in the process
+(`supdb-jobsmapped`) it reads 0.104 to 0.128, and in four reps of six the
+twenty-four files, dropped at their builds, were attached cold and came in
+under the reads through the warm job and the reads' own faults, the
+one-thread read pass 3.8 to 4.8 s where the others ran 1.0 to 1.4. The
+pairing that found it was of another option, and its table said only that
+the read pass leaned against in both orders, beside a cell ahead by twice:
+the counts that differed the same way in both sittings named the
+controller (ten samples against three, 458 MB warmed against none), and
+one traced rep an arm put the buy before the crossing and `swapped 0 of 5`
+on one line. The selector's first buy makes the crossing itself where the
+look has not (`Options::zpages_buy_crosses`), ahead of the attaches: the
+same six reps read 1.0 to 1.8 s with nothing warmed, and on the default
+the option fired in no rep of six. What it does not move is the read
+pass's two shapes, which the same trace laid to something else: the load's
+last five partitions land in one burst at its end in half the default's
+reps, the store is past no line before them, and a crossing then takes a
+third of a second on the thread every landing goes through with the reads
+already running, 1.4 to 1.7 s against 0.9 to 1.1 where the twenty-eighth
+landing came a tick before the drain's answer. The rules: where one
+decision is drawn at a line by two parties, each prices the line from what
+it holds at its own moment, so the later party's line is the one the
+earlier party's step is checked against, and whatever the first skipped
+the second does; a mechanism that acts on things in one state (here,
+partitions with no form attached) is read for who can move them out of
+that state before it runs; and an option's pairing is read for the cells
+it cannot reach before the cells it can, since the cell that leaned here
+was the controller's and the option was the allocator's.
+
+**Memory given back, and the three things that had been standing on it.**
+The lever was the one the snapshot's refutation named: the jobs' large
+arrays -- a seal's sort, a writer's keys, a merge's key list -- come from
+the allocator on threads that end with the job, and the arenas keep what
+the threads held, 110-150 MB at every lag point at ten million keys under
+1 GiB. Mapped by the engine and unmapped at the job's end
+(`Options::jobs_mapped`) they are nobody's afterwards, and the two passes
+that row loses read 1.3-1.6x and 1.2-1.6x of the default's in three
+pairings, the scanning thread's faults a quarter and two thirds of what
+they were (`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh supdb-jobsmapped
+supdb 10000000 --bound 1073741824 --reps 2 --ops-div 10`, and with
+`--passes load,lag` at three reps, at `ca2306e`). Three things moved with
+the memory, none of them the lever's own, and each was read as the lever's
+first. Under 1.25 GiB the one-thread read pass leaned 0.70x and 0.89x: the
+controller's budget is the limit less the process, the store's model sat
+thirty megabytes under a line it had been thirty megabytes over, and the
+buy came before the crossing (the entry before this one). At three million
+keys under 1 GiB the one-percent burst, which the row loses to RocksDB,
+ran in two shapes in the default all along, 40-56 ms and 78-120, eight
+reps of twenty-four in the long one, and in none of twelve with the jobs
+mapped: the store's raw bytes, 432 MB, are half its budget where the
+process holds 96 MB, half is where the builds ahead at landing start
+(`Options::zpages_land_pct`), and with the allocator's retention the
+load's end started one or two of them, six to eight hundred milliseconds
+each, through the clean store's pass and the burst after it. Every long
+burst of six traced sweeps had a build ahead collected at its end
+(`SUPDB_ZPAGES_TRACE` beside `SUPDB_LAG_MARK`, the row's shape at
+`b2d0dfc`), and the arm without those builds ran twelve of twelve short
+where the default beside it ran seven (`SUPDB_LAG_COUNTERS=1
+bench/scripts/pair.sh supdb-noland supdb 3000000 --bound 1073741824 --reps
+6 --ops-div 10 --passes load,lag`, at `c7570a9`). With the jobs mapped the
+process holds 21-30 MB after that load and the store is eighteen megabytes
+off the line: against LMDB in the row's shape the pass after the
+one-percent burst read 1.36x where the row had 0.88x, and the burst ran at
+725,000 updates a second where the row's ran at 309,000 (`SUPDB_SCAN_OPS=1
+bench/scripts/pair.sh supdb-jobsmappedbuycross lmdb-nordahead 3000000
+--bound 1073741824 --reps 6 --ops-div 10 --passes load,lag`, one sitting,
+at `c7570a9`). The misfire is moved and not mended: a store a tenth larger
+sits on the line again. And the third thing was a pool. The mapped arrays
+had cost in-memory loads a fourteenth when they were first priced, so a
+pool was built to keep a job's buffers for the next job while the store's
+raw form fits its budget and to empty where it does not
+(`Options::jobs_pooled`, `blocks::Pool`), with thirty-two mutants behind
+its tests. Priced, the cost it was built against was not there -- mapped
+alone read in-memory loads 0.98-1.08x at three hundred thousand and three
+million keys, inside a floor where the default beside itself moves cells
+by a fifth -- and at three million keys under 1 GiB the pool held 110-140
+MB after the load, since a store whose raw form fits is not one with
+memory to spare while its load has the group at its limit: the long burst
+in nine reps of twelve, the clean pass 0.94x and 0.77x. It is off and
+stands as the refutation. The rules: a lever that returns memory is read,
+in every cell it moves, against whatever reads the process's size -- a
+budget, a line, a room -- before the cell is called the lever's, since a
+store parked at a threshold moves with anything; a cost a lever was once
+priced at is priced again in the tree at hand before anything is built to
+buy it back, which here was two pairings of five minutes against a day's
+building; a bet's line that the engine's own transient memory can move is
+a line the engine crosses by accident, and the count of its bets
+(`zpage_prebuilt` less the builds at a merge's finish) is read per rep
+beside the cell that reads two shapes; and "the raw form fits the budget"
+is a statement about a store at rest, which a store being loaded under a
+bound is not.
+
+**A fix keyed on the road into a state, and the next change took another
+road.** The heads of a partition landed beside a block cache in the raw
+records' place were left in a mapping because the controller's model
+charges the cache's copies and the records they stand in for both, and the
+fix of the morning read "a grant of the records' place stands" as the
+store left raw (`Options::heads_owned_beside_copies`). A grant is made
+where the cache's own budget binds. With the jobs' arrays mapped the
+process has a hundred megabytes less beside the cache, the budget grows
+into the room and never binds, and no grant was made in six sweeps of six:
+the cache held the same 436 MB of copies, the model read the same misfit,
+thirteen partitions of twenty had their heads copied, and the pass after
+the full rewrite at three million keys under 1 GiB took 49 and 178 major
+faults on the late indexes in two reps of six, 47 and 55 ms where the
+others ran 16 to 23 -- the cell of the morning, 0.76x of the allocator's
+arm in both orders, in the pairing that was to confirm the new default
+(`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh supdb supdb-jobsheap 3000000
+--bound 1073741824 --reps 3 --ops-div 10`, at `a4dc700`). The count that
+named it was the first fix's own: `heads_beside_copies` at nothing, beside
+`cache_copies_grants` at nothing. The look asks the state now: whether the
+misfit the model reads is the cache's bytes, the raw populations within
+the budget once those bytes are given back to it, with no point read near
+(`Maint::z_misfit_is_the_caches`), grant or none. The rules: a fix is
+keyed on the state that is wrong and not on the event that led to it when
+it was found, since the next change reaches the state another way; a
+default's confirming pairing is read for the counts of every earlier fix
+on the cells it touches before its rates, a fix that has stopped firing
+reading as a loss of the new change; and a guard written beside such a
+predicate is held to a mutant like the rest -- a test for the cache
+holding nothing survived its own removal, the model answering the same
+without it, and came out.
+
+**A sort kept for an order the walk no longer lacked, and a compare for
+a fold that could not happen.** The scan snapshot's build sorted a
+table's entries by their keys' offsets before it copied the keys, from
+when the table was walked in the order of its hash slots, whose keys lie
+at random; the entries are walked in the order they were made now, which
+is the order their keys were copied in, so the sort was three radix
+passes and two arrays of twelve bytes a key over an order the entries
+already had, and the build and the extension each kept a twenty-four-byte
+entry a key beside the records they sort where an offset word does. The
+extension compared every key it pushed with the one before it, for a
+fold that cannot happen between entries of one table, and its batch lies
+in the arena in the table's order while it is pushed in key order, so
+each compare was a random read. Under a bound every byte a build touches
+is a fresh page the group reclaims a cached one for: the first scan after
+the lag sweep's ten-percent burst at ten million keys under 1 GiB sorted
+309,000 keys in 41-82 ms, 25 of 41 in the first touches of 42 MB, and
+with the offsets kept and the compare gone read 30 ms at the median of
+six against 54 (`Options::snapshot_build_lean`,
+`Options::snapshot_extend_unfolded`; `supdb-snapold` is both before). A
+profile of that scan under perf's fault events read it eight times longer
+and named the merge loop, and one under its sampling alone five times
+longer; a timer of the build's steps in a run nothing profiled named the
+fresh pages. The rules: when the order a loop walks in changes, the work
+that recovered the old order is read again; a compare whose answer an
+invariant of the structure fixes is not made; and a phase that allocates
+under a bound is priced by its fresh bytes before its instructions, by a
+timer of its steps and not by a profile whose own cost lands on the same
+faults.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
@@ -9488,6 +9922,29 @@ in the suite's figures, at `full` scale where it says so:
   the pieces standing, the unsealed keys -- and the merge path's user time
   over them; the idle I/O class for the merges and their inputs asked ahead
   were priced on it and refuted.
+- The builds ahead at landing start where the store's raw bytes pass half
+  its budget (`Options::zpages_land_pct`), and the budget is the limit less
+  the process, so a store that ends its load at that line is bet on or not
+  by what the process happens to hold: at three million keys under 1 GiB the
+  allocator's retention put it over and one or two builds ran through the
+  first burst, twice its length, in a third of the default's reps before the
+  jobs' arrays were mapped (`Options::jobs_mapped`), which holds that store
+  eighteen megabytes under. A store a tenth larger is on the line again. The
+  levers: the bet called off where scans or commits come while the store is
+  under the selector's line, a build in flight cancelled; or the line drawn
+  against a budget the engine's own transient memory does not move. Neither
+  is built, and which syscall of a build stalls a commit beside it, the
+  file's sync or its writeback, has not been traced.
+- The one-thread read pass straight after a load under a bound reads in
+  two shapes by when the load's last partitions land: at ten million keys
+  under 1.25 GiB the last five land in one burst at the load's end in half
+  the reps, the store is past no line before them, and the crossing's third
+  of a second on the thread every landing goes through runs with the reads
+  already going, 1.4-1.7 s for a million reads against 0.9-1.1 where the
+  twenty-eighth landing came a tick before the drain's answer. Twice LMDB's
+  rate in the long shape. The lever is the crossing's asks made off that
+  thread, so the buy and the install are not held behind them, and is not
+  built.
 - The frozen tables are held to a count (`FROZEN_CAP`, three) and not to
   bytes. A table freezes at the seal's threshold, 109 MB of memtable at
   ten million keys, and near reads its seal makes a snapshot copy of it,

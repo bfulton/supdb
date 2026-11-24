@@ -7,7 +7,8 @@
 # between the sittings and not as an effect (`bench ab`, DESIGN.md); under
 # a bound each pass has a process of its own, as a bounded row's, and a
 # pass the bound kills loses its rep's pair and ends the sitting with 137
-# once the table is printed. Options
+# once the table is printed, and each sitting begins by making room above
+# the bound (`scripts/room.sh`). Options
 # after SIZE go to `bench ab` unchanged: `--bound BYTES` for a bounded
 # pairing, `--passes`, `--reps`, `--ops-div`, `--len`, `--pairs`.
 #
@@ -62,6 +63,11 @@ for sitting in 1 2; do
     continue
   fi
   echo "pair.sh: sitting $sitting, $arms, $(date -u +%T)"
+  # Under a bound, room above it first (`scripts/room.sh`): a sitting begun
+  # with the group above at its limit has its first pass squeezed by it.
+  case " $* " in
+    *" --bound "*) sh "$HERE/scripts/room.sh" "$BIN" >&2 ;;
+  esac
   # shellcheck disable=SC2086
   env $UNSET $SETS "$BIN" ab --arms "$arms" --size "$SIZE" "$@" > "$f.out" 2> "$f.err"
   rc=$?

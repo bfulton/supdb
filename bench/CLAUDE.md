@@ -619,6 +619,83 @@ by the structure and not by holding little, and the bound each pass got
 is read from the kernel at the pass's start; and a quantity that grows
 rep by rep in the parent is a drift in every cell that can feel it.
 
+**A bound under a bound, and a sitting that was the machine's.** A
+roster cut at its first rung read the scan pass after the ten-percent
+burst at three million keys under 1 GiB at 0.71x of LMDB, three reps of
+three, where the row before had it at twice; a pairing the same evening
+read it slow in twelve reps of twelve in both of its arms, the new
+default and the shape before it, and the per-rep history of the cell
+across the day's pairings fell by commit, so two commits were suspected
+in turn. The pass's profile cut to its window (`perf record -e cpu-clock
+-c 25000 -k CLOCK_MONOTONIC`, the samples between the pass's `lagmark`
+lines, by thread and symbol) put the whole excess in the sparse walk's
+reads of the partition's mapped records and the copies of their values,
+with the thread's CPU equal to its wall, no fault of either kind in the
+group, no byte read at the device and every counter of the engine the
+same as a fast pass's. Then the guest was restarted, and the same binary
+read the same pass at a third of its time, 1.8x and 2.1x of LMDB in
+eight pairs of eight (`SUPDB_SCAN_OPS=1 sh scripts/pair.sh supdb
+lmdb-nordahead 3000000 --bound 1073741824 --reps 4 --ops-div 10 --passes
+load,lag`, at `8666eb9`). The shape has not come back, and what it was
+is not known: a cost of memory already mapped and already read, on the
+machine as it stood that evening. What it was not, each by a count: a
+read from the device, a fault, the group's limit (the group stood a third
+under it), either commit, or the first touch of pages read back, which a
+cold start made on purpose leaves that pass as it was
+(`SUPDB_LAG_SQUEEZE_MB=300 SUPDB_LAG_REPEAT=1 SUPDB_SCAN_OPS=1 bench ab
+--arms supdb,supdb --size 3000000 --bound 1073741824 --passes load,lag
+--reps 2 --ops-div 10`). The hunt found two things that were real. A
+page the cache dropped and read back costs its first reader 0.3 to 1.5 µs
+below the guest, the price moving fivefold with the machine's state
+(`examples/firsttouch.rs`: 1.2-1.5 before the restart, 0.3-0.5 after),
+which is the clean store's pass up to a third longer in the reps whose
+load pushed raw files out and nothing at the passes after it. And the pass's
+group is made under the group the run was started in, which on this
+host is the tool's own, limited at 13.35 GiB and hierarchical: after a
+day's builds its page cache stood at the limit, and a group at its limit
+takes pages from every group under it at each charge, however far the
+pass is under its own bound. The first sweep of each of two sittings
+begun so had 37 and 69 MB of its store's files pushed out by its load's
+end where the same sweep under an emptied parent had none (`zrewarm raw
+asked`, under
+`SUPDB_ZPAGES_TRACE=1`, the parent filled by reading the build
+directories twice so that its pages are on the active list); the pass's
+own charges then evict a gigabyte of the parent's cache and the passes
+after it have their room, so it is the first pass of a sitting that was
+squeezed, in every pairing started behind a build. Each pass records the
+least room a limited group above it had at its start now (`bound-start
+room_above_bytes`, `bound::room_above_at`), the run reports a pass that
+began with less than its bound (`run::room_note`), and `scripts/room.sh`
+drops the page cache before a roster or a bounded sitting and reads the
+run's binary back, since the drop takes the binary's pages with the
+rest and the first pass would fault its own code in under its bound.
+The record's own first roster died three seconds in, behind a green
+gate: the new quantity had no direction in the gate's list, the one push
+that refuses such a quantity (`Samples::push`) is on `run`'s path and not
+on `ab`'s, and no test had sent a bounded pass's start through it. One
+does now (`a_bounded_passes_start_enters_the_row`), and a bounded `run`
+at one small rung is the ten-second smoke before a roster of three hours
+(`bench run --scale ooc --bound 268435456 --top 30000 --bottom 30000
+--reps 1 --ops-div 10 --passes load,read,lag --arms supdb,lmdb-nordahead
+--out DIR`).
+The probes stay for the next sitting that reads so: `SUPDB_LAG_REPEAT`
+makes a point's same scans again after its pass, which tells a cost of
+what the scans were first to touch from a cost of the walk;
+`SUPDB_LAG_SQUEEZE_MB` and `SUPDB_LAG_TOUCH` make a cold start and take
+its first touches back out; and `lagops` carries the machine's TLB
+shootdowns and function-call interrupts over the pass. The lag sweep
+draws the same scan keys at every point, so a point's pass reads the
+records the points before it read: a slow pass after a fast one over
+the same keys is not those pages' first touch, which the hunt took
+hours to notice. The rules: a cell lost in both arms of a pairing is the
+sitting's before it is either arm's, and a cell's history by commit is
+also its history by hour, so the baseline's binary is run again in the
+sitting at hand before a commit is suspected; a bound made inside
+another group's is two bounds, and the room above it is read from the
+kernel at the pass's start as the pass's own charge is; and a step that
+makes a measurement's precondition puts back what it took that the
+measurement needs.
+
 **A guarantee matched on one kind of crash.** The buffered group was
 matched on the sync: no arm in it reaches the device at a commit. The
 recovery workloads' first run held each arm's reopened store to every
@@ -665,13 +742,27 @@ Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`
 block and rejects any `${{ }}` inside one; it runs in `lint`. It refuses
 `ubuntu-latest` as a job's runner too. That label moved to Ubuntu 26.04
-between two runs of one afternoon, where the libclang lookup finds
-nothing and `qemu-user-static` is not a package, and three jobs of `ci`
+between two runs of one afternoon, where the libclang lookup found
+nothing (it wanted a -dev package's name for the library then, and
+looked in the highest LLVM directory alone; it takes the image's own
+now) and `qemu-user-static` is not a package, and three jobs of `ci`
 failed in their set-up on a tree that had not changed; `ci` was given
 its image by name that day, and the five workflows that run by hand or
 after a merge kept the label for another day, each to fail the same way
 the first time it was wanted. A workflow nobody runs is fixed with the
 ones that ran, by a rule the lint holds, and not when it is next needed.
+And it holds a cache step's `workspace -> target` to a target that is a
+workspace's own directory: every workflow said `bench -> bench/target`,
+the action takes the target as a path inside the workspace, and the step
+cached a directory that does not exist while each job built RocksDB from
+its sources twice (the engine's `CLAUDE.md`, running the checks). A
+setting whose effect nothing reads is held to the thing it names existing.
+And it holds every cache step of `bench -> target` alone to one shared
+key, and every other step off it: keyed by their jobs' names, the jobs
+that build the suite's release binary each kept a copy of one build,
+four from one round of the workflows that run by hand, and the
+repository passed the ten gigabytes GitHub allows it (the same
+paragraph of the engine's notes).
 
 **A generator more regular than the thing it stood for.** The first
 ids were one to a stratum of the whole 64-bit space, key `n` a random
@@ -773,6 +864,35 @@ measured where it runs and said to stop where it stops, never reshaped
 until it passes; and a search of the device for plaintext has its control,
 the plain twin's files, which has to find it.
 
+**A verdict that was its pipe's, and a yardstick that did less than the
+arm.** `scripts/comparators.sh` printed its table through `tee`, and a
+pipe's status is its last command's: the table's script answered a cell
+under the margin with 1 and the job passed, for as long as the check had
+run. With the exit the table's, the cells were under 0.7x in four runs of
+five, hosted and here, and all but one of the cells were LMDB's scans,
+near 0.8x of the tool where RocksDB's scans read above db_bench's. The
+loops said why. The harness copies every value an arm
+reads into its sink, db_bench's seekrandom copies its iterator's value
+at every step ("to make sure we read them"), and the C program that
+stands in for LMDB's tool read one byte of each. Copying the value, the
+program scans a tenth to a fifth slower at the rungs to a hundred
+thousand keys, eleven alternated runs of each build, and the scan cells
+read 0.92-1.33x of it in the two runs after; a cursor opened by every
+scan, as the arm's range iterator opens one, moved nothing. The copy is
+the C library's, called through a pointer the compiler has to load:
+written as a plain `memcpy` of a run-time length the compiler made it a
+`rep movs` in place, and that build scanned at a third to a half of the
+rate, a yardstick wrong the other way. The rules: a script's verdict is its own
+exit, and a red input is run through the job once to see it fail; a
+tool written here to stand beside an arm is read against the harness's
+loop line by line, since one that does less work reads as an arm driven
+badly; and a copy in a benchmark is the routine the thing measured
+calls, read in the disassembly, never whatever the compiler makes of
+the source line. The job keeps its db_bench by a restore step and a
+save step of its own, since the one cache action that does both saves
+only where the job passed, and a job that fails on its table had built
+the tool for nothing.
+
 ## One repository
 
 The suite was a separate repository carrying the engine as a submodule for
@@ -787,14 +907,27 @@ and the row's one `sha` names both.
 Building RocksDB runs bindgen, which needs libclang, and every workflow
 calls `scripts/libclang.sh` for it -- one definition. The first CI run that
 built RocksDB at all failed on both Linux (only a versioned `.so` on the
-image) and macOS (dyld could not find `@rpath/libclang.dylib` at run time);
-naming the directory fixed Linux and not macOS, because SIP strips `DYLD_*`
-before a workflow step's shell starts, so on macOS the script adds an rpath
-to `RUSTFLAGS`. FASTER is the other comparator a host has to be readied for, and
+image) and macOS (dyld could not find `@rpath/libclang.dylib` at run time),
+and each got a workaround: a -dev package installed with apt in every
+Linux job, for the unversioned name the linker wants, and on macOS an
+rpath in `RUSTFLAGS`, since SIP strips `DYLD_*` before a workflow step's
+shell starts. Both were the price of one line of `Cargo.toml`: the
+`rocksdb` crate loads libclang when its build script runs by default, the
+suite had turned the crate's defaults off for the compression libraries,
+and the build script linked libclang instead. With `bindgen-runtime` named
+again the library is opened by its path, the runtime library an image
+already has will do, and the script checks for it, with clang's own
+headers, and installs nothing where it is there: the apt step had been
+twenty seconds of every Linux job and, on a day the mirror was slow, five
+minutes, as long as the build the cache had just saved. Two libclang
+packages are not one: without clang's headers beside the library bindgen
+ends at `'stdbool.h' file not found`, so the script asks for both. FASTER
+is the other comparator a host has to be readied for, and
 `scripts/faster.sh` is its one definition, called wherever
 `scripts/libclang.sh` is: it is not a crate, so the script fetches its
 sources at the commit `vendor/faster/PIN` names into a directory git
-ignores and installs the three libraries they link, and `build.rs` fails
+ignores and installs the three libraries they link, by the engine's
+`scripts/apt.sh` and so with the package lists the host has, and `build.rs` fails
 the build where they are missing or another commit's. The arm exists on
 Linux x86-64 alone (`cfg(faster)`, set by `build.rs`), so nothing on
 macOS or ARM builds or needs it. Cargo takes profiles from the root of the workspace being

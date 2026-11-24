@@ -256,7 +256,8 @@ impl Builder {
 
     /// `new`, its copies of the keys the engine's own mappings once they
     /// are large where `mapped` (`Options::jobs_mapped`).
-    pub(crate) fn new_in(mapped: bool) -> Builder {
+    pub(crate) fn new_in(mapped: impl Into<crate::db::blocks::Maps>) -> Builder {
+        let mapped = mapped.into();
         Builder {
             starts: crate::db::blocks::BigVec::new(crate::db::blocks::Site::IndexStarts, mapped),
             bytes: crate::db::blocks::BigVec::new(crate::db::blocks::Site::IndexKeys, mapped),

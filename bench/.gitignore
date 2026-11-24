@@ -12,6 +12,11 @@ perf.data*
 # rows worth keeping are copied into runs/ and committed by a person.
 /runs-ci
 
+# What `scripts/comparators.sh` writes, the tools' output and the table, and
+# the directory a workflow keeps its db_bench in between runs.
+/comparators-ci
+/comparators-tools
+
 # The ledger of a run in flight (`ledger`): what a run has measured so far,
 # composed into its row and removed when the row is written. One left behind
 # is a run that was cut, for `bench run --resume` to take up, never a row.
