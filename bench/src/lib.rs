@@ -16,6 +16,7 @@ pub mod gate;
 pub mod hist;
 pub mod ledger;
 pub mod machine;
+pub mod proto;
 pub mod row;
 pub mod run;
 pub mod stats;

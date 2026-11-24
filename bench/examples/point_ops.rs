@@ -6,6 +6,9 @@
 //!
 //!   point_ops ARM [SIZE] [REPS] [DIST] [ROUNDS]
 //!
+//! `ARM` is any of the suite's, or `proto`: the probe's own table of records
+//! written in place (`supdb_bench::proto`), driven as the arms are.
+//!
 //! The phases, each `OPS` operations (a sixth of the keys, the mixes'
 //! count, and at least a thousand), in the order a pass runs them:
 //!
@@ -140,7 +143,13 @@ fn main() {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         engines::set_store_keys(size);
-        let mut e = engines::open(&arm, &dir, 1).unwrap();
+        // `proto` is the probe's own table (`supdb_bench::proto`), driven as
+        // the suite's arms are.
+        let mut e: Box<dyn Engine> = if arm == "proto" {
+            Box::new(supdb_bench::proto::Hot::create(size))
+        } else {
+            engines::open(&arm, &dir, 1).unwrap()
+        };
         let mut vrng = Rng::new(0xE1);
         let mut kb = [0u8; 16];
         let mut buf = engines::Batch::with_capacity(1000, payload.value_size());
