@@ -2821,6 +2821,96 @@ says so before the first byte; and a kill one rep in three is a peak
 every rep comes near, so the fix is read on each pass's peak, by the
 group's own count, and not on the kills alone.
 
+**A level made late for the open, read a head an ask where the first
+seek fell.** A store under a cipher reads an ordered index's top level
+at its first seek and not at its open, which is what keeps an open to a
+handful of chunks a file. The level is every sixty-fourth head, so a
+sample lies in every piece of the heads, eight of them in four
+kilobytes, and the late read asked for it a head at a time: each piece
+made present by itself, and once the cache had given the heads back, a
+wait for the device a piece, 26 ms for a partition of two hundred
+thousand keys, at the first seek of every partition. The suite's
+one-thread scan pass at five million keys under 640 MiB is five thousand
+scans. With the controller on its median scan was 4-7.5 µs and the pass
+525-595 ms, and nineteen of those reads were 473-488 ms of it, by a
+timer put in the read for the count and taken out. It had stood in
+`ROADMAP.md` as "two major faults a scan of a hundred ... not yet taken
+apart", the cell the store lost to encrypted RocksDB at 0.41-0.43x while
+it read at 1.75-1.96x of it (`BIN=$PWD/target-enc/release/bench
+scripts/pair.sh supdb-cipherauto rocksdb-tuned-enc 5000000 --bound
+671088640 --passes read,scan --reps 3 --ops-div 10` at `52d9cb7`), and a
+pass's faults divided by its scans is what made nineteen stalls read as
+a property of every scan: `SUPDB_SCAN_OPS=1` printed the first four
+scans at 23-103 ms beside the median in the first run it was asked for.
+The late read asks for the heads a run at a time now
+(`OrdIndex::read_top`, `TOP_RUN`), whose pieces the cache asks of the
+device together, and the pass was 169 ms; and the landing that publishes
+a segment reads its level first (`Maint::tops_before_publish`), while
+the index it has just written is in the cache still: 23.5 ms, twenty-one
+million entries a second with no fault. A plain store is asked one test
+a landing, thirty instructions over the landing probe's run. What a
+landing pays under a cipher was timed the same way: 109-129 ms over the
+80-85 landings of two loads and a lag sweep, most of them microseconds,
+the longest 34 ms where a merge's outputs had lost their heads before
+they landed (`ROADMAP.md`). The rules: a per-operation average over a
+pass of a few thousand operations is read as the first operations beside
+the median before it is read as each operation's, which is this file's
+rule for the smallest rung and holds at five million keys wherever the
+pass is the short thing; a read made late for one path's sake is priced
+where its first use falls and in the unit it asks by, since late and a
+sample an ask was the whole section at a round trip a piece; and what
+was made late for the open is made early again where it is free, at the
+landing that wrote it.
+
+**A line drawn on the page cache, for a store whose records leave its
+own cache.** With the controller on under a cipher the same five million
+keys under 640 MiB read in two shapes after the load, by how many
+partitions had their form file when it ended: all or all but one, and
+the read pass took 4.0-4.8 s and the scan pass 22-25 ms; eleven to
+sixteen, and the controller built the rest from the device beside the
+reads, its conversion policy offered moves out of the stride form, and
+the passes ran 5-13 s and 0.3-0.6 s, a third of the reps and more. The
+builds ahead at landing start past half the controller's budget, which
+is of the kernel's page cache by the raw form's populations, and that is
+where a plain store's records leave memory. A store under a cipher's
+leave where its own cache gives them back. A line of what each file's
+view held, beside the cache's trace for the count and taken out, read
+every partition's plaintext whole in the cache as the builds became due,
+the cache at four fifths of its budget, and a fraction of a second later,
+the builds' own form files in flight beside the load's run files, the
+cache's first pass giving back the plaintext of the partitions the
+builder had not reached, twenty-two mebibytes of one down to three, their
+ciphertext long reclaimed: the partition cold, skipped, and left for the
+crossing. Whether the crossing came inside the load was the coin: inside
+it, the cold partitions were built from the device with nothing reading;
+after it, the builder took them oldest first beside the read pass, a
+second to four each, and the drain's last three partitions, warm, waited
+behind them until the reads had evicted them too, one built in sixteen
+seconds through two thousand faults. The builds ahead start past a
+quarter of the store's own cache as well now, by its partitions' files
+against the cache's budget (`Options::zpages_land_cache_pct`; at zero,
+`supdb-cipherautolandmodel`, the shape before), whichever line is met
+first, and eight traced reps read the fast shape in eight. A first
+version drew it at the same half as the controller's line, by what the
+cache held at the instant, and read the fast shape in seven reps of
+eight; its test found the cache's holding nothing after a settle, the
+line was moved to the files for the test's sake, and the commit that
+shipped it quoted the eight reps of the version before the move. Paired
+then, the moved line read like the shape before, both arms in two shapes
+(`bench ab --arms supdb-cipherauto,supdb-cipherautolandmodel --size
+5000000 --bound 671088640 --passes load,read,read-threaded,scan,scan-threaded,mixes
+--reps 4 --ops-div 10` at `52c0286`), since half the cache in files is
+about four fifths of it in all, one or two partitions later than the
+holding, and a quarter is where the builder starts with no backlog. The
+rules: a line a mechanism starts at is drawn on the store that pays for
+the mechanism's absence, which for a store under a cipher is its own
+cache and not the page cache; a measurement quoted for a change is of
+the code the change commits, so whatever moves the code after the
+measurement, a test's convenience included, is measured again before
+the commit speaks; and a pairing of two arms each in two shapes is read
+by its pairs (`--pairs`), since a median over four reps of a bimodal
+cell is whichever shape two reps fell in.
+
 The rules: a second way to hold the same bytes is priced on the first
 operation of every pass as well as on its rate, since a mapping's first
 touch is where two kinds of memory differ; a write slower than its cipher

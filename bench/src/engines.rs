@@ -1965,8 +1965,8 @@ struct Policy {
     cipher_half: bool,
     /// The store under a cipher with the controller on and its builds
     /// ahead at landing started by the controller's budget alone
-    /// (`Options::zpages_land_by_cache` off), where the engine starts them
-    /// past the same share of the store's own cache as well:
+    /// (`Options::zpages_land_cache_pct` at zero), where the engine starts
+    /// them past a share of the store's own cache as well:
     /// `supdb-cipherautolandmodel`, beside `supdb-cipherauto`, the shape
     /// before.
     cipher_land_model: bool,
@@ -10862,7 +10862,7 @@ impl Supdb {
         if cipher {
             opts.zpages_under_cipher = cipher_auto;
             if cipher_land_model {
-                opts.zpages_land_by_cache = false;
+                opts.zpages_land_cache_pct = 0;
             }
             if cipher_log {
                 opts.direct_ingest = false;
@@ -17652,7 +17652,7 @@ mod tests {
         let m = o(&landmodel);
         assert!(m.zpages_under_cipher, "supdb-cipherautolandmodel");
         assert!(
-            z.zpages_land_by_cache && !m.zpages_land_by_cache,
+            z.zpages_land_cache_pct > 0 && m.zpages_land_cache_pct == 0,
             "supdb-cipherautolandmodel starts its builds ahead by the controller's budget alone"
         );
         assert_eq!(m.zpages_land_pct, z.zpages_land_pct);

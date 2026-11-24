@@ -9379,11 +9379,11 @@ fn builds_ahead_under_a_cipher_seal_their_form_files_and_keep_them_cold() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Under a cipher the builds ahead start past the percent of the store's
-/// own cache of plaintext as well (`Options::zpages_land_by_cache`): a
+/// Under a cipher the builds ahead start past a percent of the store's
+/// own cache of plaintext as well (`Options::zpages_land_cache_pct`): a
 /// store whose populations are nowhere near the percent of the
 /// controller's budget, and whose partitions' files come to more than the
-/// percent of its cache's, builds their form files ahead. With the option off
+/// percent of its cache's, builds their form files ahead. With the percent at zero
 /// it builds none, the controller's budget being the only line; and with
 /// a cache the store is a small part of it builds none either, the
 /// option on. The records a build reads back are the kernel's to answer
@@ -9391,14 +9391,14 @@ fn builds_ahead_under_a_cipher_seal_their_form_files_and_keep_them_cold() {
 #[cfg(target_os = "linux")]
 #[test]
 fn builds_ahead_under_a_cipher_start_past_the_percent_of_the_stores_own_cache() {
-    for (by_cache, cache, builds) in [
-        (true, 1u64 << 20, true),
-        (false, 1 << 20, false),
-        (true, 1 << 30, false),
+    for (pct, cache, builds) in [
+        (25, 1u64 << 20, true),
+        (0, 1 << 20, false),
+        (25, 1 << 30, false),
     ] {
-        let what = format!("by the cache {by_cache}, a cache of {} MiB", cache >> 20);
+        let what = format!("past {pct} percent of a cache of {} MiB", cache >> 20);
         let (dir, db, _model, _inject) = auto_store_loaded(
-            &format!("auto-ahead-cipher-by-cache-{by_cache}-{}", cache >> 20),
+            &format!("auto-ahead-cipher-by-cache-{pct}-{}", cache >> 20),
             1 << 40,
             0.0,
             FAULT_40US,
@@ -9409,7 +9409,7 @@ fn builds_ahead_under_a_cipher_start_past_the_percent_of_the_stores_own_cache() 
                 );
                 o.zpages_under_cipher = true;
                 o.zpages_land_pct = 50;
-                o.zpages_land_by_cache = by_cache;
+                o.zpages_land_cache_pct = pct;
                 o.partition_bytes = Some(400 << 10);
             },
             |_| {},

@@ -2603,17 +2603,26 @@ pub struct Options {
     /// bar past the line too.
     #[doc(hidden)]
     pub zpages_land_cold_past: bool,
-    /// Under a cipher the builds ahead at landing start past the percent
-    /// (`zpages_land_pct`) of the store's own cache of plaintext as well,
-    /// by what its partitions' files come to against the cache's budget,
-    /// whichever line is met first. The percent of the controller's budget is of the kernel's
-    /// page cache by the raw form's populations, which is where a plain
-    /// store's records leave memory; a store under a cipher's leave where
-    /// its own cache gives them back, which holds every file whole and
-    /// each form file a build ahead is writing beside them, and the
-    /// kernel has let their ciphertext go long before.
+    /// Under a cipher the builds ahead at landing start past this percent
+    /// of the store's own cache of plaintext as well, by what its
+    /// partitions' files come to against the cache's budget, whichever
+    /// line is met first; zero for the controller's budget alone. That
+    /// budget is of the kernel's page cache by the raw form's populations,
+    /// which is where a plain store's records leave memory; a store under a
+    /// cipher's leave where its own cache gives them back, and the kernel
+    /// has let their ciphertext go long before. The cache holds the
+    /// partitions whole and beside them what is in flight -- a run's file,
+    /// a merge's outputs, the builds' own form files until their envelopes
+    /// -- so it reaches its budget with some four fifths of it in
+    /// partitions; and a percent of the controller's budget is a percent
+    /// of a page cache the store's own cache stands in. At five million
+    /// keys under 640 MiB, started at half the cache the builder met a
+    /// backlog of eight to twelve partitions as the cache first gave back
+    /// and the store read in two shapes, by whether the selector's
+    /// crossing came inside the load (`CLAUDE.md`, a line drawn on the page
+    /// cache); at a quarter, in one.
     #[doc(hidden)]
-    pub zpages_land_by_cache: bool,
+    pub zpages_land_cache_pct: u32,
     /// The crossing asks for the raw pages of the partitions
     /// it has no form file for, ahead of the form files it asks back
     /// (`zpages_land_drop_past`, `Maint::z_cross`). A partition whose
@@ -7204,7 +7213,7 @@ impl Default for Options {
             zpages_land_drop_past: true,
             zpages_build_sync: true,
             zpages_land_cold_past: true,
-            zpages_land_by_cache: true,
+            zpages_land_cache_pct: 25,
             zpages_ask_dropped: true,
             zpages_hot_raw_beside_stride: true,
             zpages_drive_at_job_end: true,
@@ -58992,15 +59001,16 @@ impl Maint {
     }
 
     /// Whether the partitions' files of a store under a cipher come to more
-    /// than `pct` percent of its own cache's budget
-    /// (`Options::zpages_land_by_cache`): the builds ahead's other line
+    /// than a percent of its own cache's budget
+    /// (`Options::zpages_land_cache_pct`): the builds ahead's other line
     /// there. The files whole, since the cache holds a file it has just
     /// been handed whole, and their lengths and not what the cache holds
     /// at this instant, which is nothing just after it has given a pass's
     /// worth back. Nothing for a plain store. Read under the caller's
     /// tick, with a pin of its own for the segments.
-    fn z_land_cache_due(&self, pct: u128) -> bool {
-        if !self.opts.zpages_land_by_cache {
+    fn z_land_cache_due(&self) -> bool {
+        let pct = u128::from(self.opts.zpages_land_cache_pct);
+        if pct == 0 {
             return false;
         }
         let Some(cache) = self.shared.pager.as_ref().map(|p| p.budget()) else {
@@ -59044,7 +59054,7 @@ impl Maint {
         };
         let raw = hash.saturating_add(records);
         self.z_land_due =
-            u128::from(raw) * 100 > u128::from(budget) * pct || self.z_land_cache_due(pct);
+            u128::from(raw) * 100 > u128::from(budget) * pct || self.z_land_cache_due();
         self.z_past_budget = raw > budget;
         // Past the budget by a few percent the raw form still holds nearly
         // all of itself, and a store of three million keys under 640 MiB

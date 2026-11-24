@@ -130,7 +130,7 @@ src/db.rs	Maint::join_tier	unlent/unlend	code	1	S1	a wait under no pin: pin::idl
 src/db.rs	Maint::land_front	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
 src/db.rs	Maint::publish	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
 src/db.rs	Maint::rank_before_publish	pager	code	1	stays	a landing under a cipher reads the top levels of the indexes it publishes (tops_before_publish): one test a landing, of whether the store has a cache
-src/db.rs	Maint::z_land_cache_due	pager	code	1	stays	the builds ahead's line under a cipher: the partitions' files against the budget of the store's own cache (Options::zpages_land_by_cache), asked a tick
+src/db.rs	Maint::z_land_cache_due	pager	code	1	stays	the builds ahead's line under a cipher: the partitions' files against the budget of the store's own cache (Options::zpages_land_cache_pct), asked a tick
 src/db.rs	Maint::retire_covered	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
 src/db.rs	Maint::retire_seg	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
 src/db.rs	Maint::sync_owed_slot	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
